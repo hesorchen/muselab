@@ -139,7 +139,13 @@ def test_client_error_rate_limited(client):
     # Reset bucket state so previous tests don't interfere.
     m._CLIENT_ERR_BUCKETS.clear()
     cap = m._CLIENT_ERR_PER_WINDOW
-    payload = {"msg": "test error"}
+    payload = {
+        "kind": "error",
+        "name": "TypeError",
+        "message": "synthetic browser error",
+        "lineno": 12,
+        "colno": 3,
+    }
     # First `cap` requests should pass through.
     for _ in range(cap):
         r = client.post("/api/log/client-error", json=payload)

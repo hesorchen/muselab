@@ -39,6 +39,39 @@
     return [rec.kind, rec.message || "", rec.filename || "", rec.lineno || ""].join("|");
   }
 
+  function _clientErrorWireRecord(rec) {
+    const kind = String((rec && rec.kind) || "");
+    if (kind === "message_render_key" || kind === "frontend_diagnostic") {
+      const allowedIssues = new Set(["duplicate", "missing"]);
+      const issues = [];
+      for (const item of ((rec && rec.issues) || []).slice(0, 32)) {
+        const issue = String((item && item.issue) || "");
+        const count = Number(item && item.count);
+        if (allowedIssues.has(issue) && Number.isInteger(count) && count > 0) {
+          issues.push({ issue, count: Math.min(count, 100_000) });
+        }
+      }
+      return issues.length ? { kind, issues } : null;
+    }
+
+    if (!["error", "unhandledrejection", "resource"].includes(kind)) return null;
+    const record = {
+      kind,
+      name: String((rec && rec.name) || "").slice(0, 64),
+      lineno: Math.max(0, Math.min(Number(rec && rec.lineno) || 0, 10_000_000)),
+      colno: Math.max(0, Math.min(Number(rec && rec.colno) || 0, 10_000_000)),
+    };
+    const method = String((rec && rec.lastFetch && rec.lastFetch.method) || "")
+      .toUpperCase();
+    if (["DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT"].includes(method)) {
+      record.lastFetch = { method };
+    }
+    if (kind === "resource") {
+      record.tagName = String((rec && rec.tagName) || "").toUpperCase().slice(0, 16);
+    }
+    return record;
+  }
+
   function _deliverClientErrorRecord(rec, targetRing, label, consoleMethod = "error") {
     targetRing.push(rec);
     if (targetRing.length > RING_MAX) targetRing.shift();
@@ -48,7 +81,12 @@
     // supports it. Falls back to fetch+keepalive if sendBeacon refuses
     // the blob (rare; some Safari versions reject non-form blobs).
     try {
-      const body = JSON.stringify(rec);
+      // Keep rich diagnostics local. The wire record deliberately excludes
+      // URL, UA, filename, message, stack, resource src and request target;
+      // reverse proxies may retain request bodies before MuseLab sees them.
+      const wireRecord = _clientErrorWireRecord(rec);
+      if (!wireRecord) return;
+      const body = JSON.stringify(wireRecord);
       const ok = navigator.sendBeacon &&
                  navigator.sendBeacon("/api/log/client-error",
                                       new Blob([body], { type: "application/json" }));
@@ -886,6 +924,9 @@ function portal() {
     slashShow: false,
     slashIdx: 0,
     slashAnchor: -1,      // input position where the leading '/' is
+    // Defined in /static/data/constants.js. Slash stays dormant when the
+    // feature flag is false; `/...` then follows the ordinary message path.
+    SLASH_ENABLED: window.MUSELAB_SLASH_ENABLED === true,
     // Defined in /static/data/constants.js (window.MUSELAB_SLASH_CMDS). Kept
     // as a component property so `this.SLASH_CMDS` references throughout the
     // file keep working without changes.
@@ -933,6 +974,9 @@ function portal() {
     // scroll-up, never on layout-induced scroll events. See _userScrollIntent.
     _userScrollAt: 0,
     theme: "dark",
+    // Eyecare level 2 is the historical palette, so existing users keep the
+    // exact same appearance until they deliberately choose softer/warmer.
+    eyecareLevel: 2,
     accent: "#6093ff",
     ACCENT_PRESETS,
 
@@ -2110,8 +2154,8 @@ function portal() {
         setTimeout(() => {
           this.toast(
             this.lang === "zh"
-              ? "Tip：⌘K 命令面板 · / 斜杠命令 · @ 引用文件或目录 · ↑ 回滚上一条"
-              : "Tip: ⌘K command palette · / slash commands · @ to reference files or folders · ↑ to recall last message",
+              ? "Tip：⌘K 命令面板 · @ 引用文件或目录 · ↑ 回滚上一条"
+              : "Tip: ⌘K command palette · @ to reference files or folders · ↑ to recall last message",
             "info", 7000);
           this._setLS("muselab_seen_help", "1");
         }, 1500);
@@ -2660,6 +2704,10 @@ function portal() {
       } else if (window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches) {
         this.theme = "light";
       }
+      const savedEyecareLevel = Number(localStorage.getItem("muselab_eyecare_level"));
+      if (Number.isInteger(savedEyecareLevel) && savedEyecareLevel >= 1 && savedEyecareLevel <= 3) {
+        this.eyecareLevel = savedEyecareLevel;
+      }
       const savedAccent = localStorage.getItem("muselab_accent");
       if (savedAccent) this.accent = savedAccent;
       this.applyTheme();
@@ -2681,6 +2729,7 @@ function portal() {
     },
     applyTheme() {
       document.documentElement.setAttribute("data-theme", this.theme);
+      document.documentElement.setAttribute("data-eyecare-level", String(this.eyecareLevel));
       const link = document.getElementById("hljs-theme");
       if (link) {
         // Eyecare is still a light-background theme. Reusing the dark syntax
@@ -2702,7 +2751,10 @@ function portal() {
       // manually picks dark/eyecare would get a mismatched status bar. Force
       // every theme-color meta to the active in-app theme so whichever one the
       // browser picks agrees with what's actually rendered.
-      const themeColor = ({ light: "#ffffff", dark: "#0f1115", eyecare: "#f5f0e0" })[this.theme] || "#0f1115";
+      // Read the active surface token instead of maintaining a second color
+      // table here; CSS is the single source of truth for every intensity.
+      const themeColor = getComputedStyle(document.documentElement)
+        .getPropertyValue("--c-bg-0").trim() || "#0f1115";
       document.querySelectorAll('meta[name="theme-color"]').forEach(m => {
         m.setAttribute("content", themeColor);
       });
@@ -2906,15 +2958,23 @@ function portal() {
       const idx = order.indexOf(this.theme);
       this.setTheme(order[(idx + 1) % order.length]);
     },
-    // Direct theme set — used by the Settings → Appearance picker. Mobile
-    // hides the files-pane-head toggle (styles.css), so Settings is the
-    // ONLY theme entry point on phones; this backs it.
+    // Direct theme set — used by Settings → Appearance and by the global
+    // one-tap theme cycle. Intensity stays in Settings so the quick action's
+    // long-standing light → dark → eyecare behavior remains predictable.
     setTheme(t) {
       if (!["light", "dark", "eyecare"].includes(t)) return;
       this.theme = t;
       this.applyTheme();
       this.applyAccent();   // 派生色对深浅敏感，重算
       this._setLS("muselab_theme", this.theme);
+      if (this._terminal) this._terminal.options.theme = this._terminalTheme();
+    },
+    setEyecareLevel(level) {
+      const next = Number(level);
+      if (!Number.isInteger(next) || next < 1 || next > 3) return;
+      this.eyecareLevel = next;
+      this._setLS("muselab_eyecare_level", String(next));
+      this.applyTheme();
       if (this._terminal) this._terminal.options.theme = this._terminalTheme();
     },
 
@@ -4096,7 +4156,8 @@ function portal() {
       const m = arr[i];
       if (!m || m.role === "user") return false;
       const next = arr[i + 1];
-      return !next || next.role === "user";
+      return !next || next.role === "user"
+        || next.display_kind === "runtime_continuation";
     },
     // Resolve a persisted message UUID for a footer mounted on the actual turn
     // tail. Agentic turns often end in a tool_result/status bubble; the backend
@@ -4109,8 +4170,11 @@ function portal() {
       if (i < 0 || i >= arr.length) return "";
       const tail = arr[i];
       if (!tail || tail.role === "user") return "";
+      if (tail.display_kind === "runtime_continuation"
+          || tail.forkable === false || tail.presentation_only) return "";
       const next = arr[i + 1];
-      if (next && next.role !== "user") return "";
+      if (next && next.role !== "user"
+          && next.display_kind !== "runtime_continuation") return "";
       for (let k = i; k >= 0; k -= 1) {
         const message = arr[k];
         if (!message || message.role === "user") break;
@@ -5279,82 +5343,6 @@ function portal() {
       try { t.action && t.action.onClick && t.action.onClick(); }
       finally { this.dismissToast(t.id); }
     },
-    // ── Background-task settle feedback ────────────────────────────────────
-    // One agentic turn can settle dozens of Agent/Bash background tasks within
-    // a couple of seconds. Toasting each one unconditionally (the pre-2026-08-04
-    // behaviour) overflowed MAX_TOASTS instantly: the user saw a wall of
-    // identical "后台任务已完成" cards, the useful ones (failures) scrolled out
-    // of the stack, and every push+splice re-rendered the fixed overlay. Two
-    // guards here:
-    //   1. per-task_id dedup — a terminal state is reported at most once, so a
-    //      replayed continuation broadcast or a duplicate backend publisher
-    //      cannot re-toast the same task;
-    //   2. a short coalescing window — settles landing inside it collapse into
-    //      ONE toast that counts them by outcome.
-    // The task CARD is unaffected: applyTaskStatus still flips every card
-    // individually and immediately. This only governs the transient overlay.
-    _noteBackgroundTaskSettled(taskId, state, alreadyReported = false) {
-      const zh = this.lang === "zh";
-      // Terminal-state names as they arrive from the SSE payload; anything
-      // unrecognized is bucketed as a plain completion ("done").
-      const bucket = state === "failed" ? "failed"
-        : state === "stopped" ? "stopped" : "completed";
-      if (taskId) {
-        this._bgToastSeen = this._bgToastSeen || new Map();
-        if (this._bgToastSeen.has(taskId)) return;
-        this._bgToastSeen.set(taskId, bucket);
-        // Bound the dedup ledger. Terminal states never revert, so evicting
-        // the oldest entries can only re-admit a task that settled hundreds of
-        // tasks ago — long past any replay window.
-        if (this._bgToastSeen.size > 500) {
-          const drop = this._bgToastSeen.size - 500;
-          let i = 0;
-          for (const k of this._bgToastSeen.keys()) {
-            if (i++ >= drop) break;
-            this._bgToastSeen.delete(k);
-          }
-        }
-      } else if (alreadyReported) {
-        // No id to dedup on, but the server already published this exact
-        // transition through its other publisher — don't double-count it.
-        return;
-      }
-      this._bgToastBatch = this._bgToastBatch
-        || { completed: 0, failed: 0, stopped: 0 };
-      this._bgToastBatch[bucket] += 1;
-      if (this._bgToastTimer) return;
-      this._bgToastTimer = setTimeout(() => {
-        this._bgToastTimer = null;
-        const batch = this._bgToastBatch
-          || { completed: 0, failed: 0, stopped: 0 };
-        this._bgToastBatch = null;
-        const total = batch.completed + batch.failed + batch.stopped;
-        if (!total) return;
-        if (total === 1) {
-          const label = batch.failed ? (zh ? "后台任务失败" : "Background task failed")
-            : batch.stopped ? (zh ? "后台任务已停止" : "Background task stopped")
-              : (zh ? "后台任务已完成" : "Background task finished");
-          this.toast(label, batch.failed ? "error" : "info");
-          return;
-        }
-        const parts = [];
-        if (batch.completed) {
-          parts.push(zh ? `${batch.completed} 个已完成`
-            : `${batch.completed} finished`);
-        }
-        if (batch.failed) {
-          parts.push(zh ? `${batch.failed} 个失败` : `${batch.failed} failed`);
-        }
-        if (batch.stopped) {
-          parts.push(zh ? `${batch.stopped} 个已停止` : `${batch.stopped} stopped`);
-        }
-        const body = zh
-          ? `后台任务：${parts.join("、")}`
-          : `Background tasks: ${parts.join(", ")}`;
-        this.toast(body, batch.failed ? "error" : "info");
-      }, 700);
-    },
-
     // Enter pressed while a CJK IME is composing confirms the highlighted
     // candidate; it must not also submit the surrounding prompt or rename.
     // `isComposing` is the standard signal, while keyCode/which 229 and
@@ -7121,6 +7109,7 @@ function portal() {
         messagesReady: true,
         messagesLoading: false,
         historyGeneration: "",
+        runtimeUiRevision: "",
         // Bubble offsets are meaningful only inside one server order. Normal
         // tail loads use the active chain; outline/around windows use full
         // file order (including pre-compact history).
@@ -7355,6 +7344,7 @@ function portal() {
       if (st.messagesReady === undefined) st.messagesReady = true;
       if (st.messagesLoading === undefined) st.messagesLoading = false;
       if (st.historyGeneration === undefined) st.historyGeneration = "";
+      if (st.runtimeUiRevision === undefined) st.runtimeUiRevision = "";
       if (st._historyOrder !== "full") st._historyOrder = "normal";
       if (st._hasServerLater === undefined) st._hasServerLater = false;
       if (st._fetchingLater === undefined) st._fetchingLater = false;
@@ -7820,6 +7810,7 @@ function portal() {
       child.messagesReady = sourceState.messagesReady !== false;
       child.messagesLoading = false;
       child.historyGeneration = sourceState.historyGeneration || "";
+      child.runtimeUiRevision = sourceState.runtimeUiRevision || "";
       child._historyOrder = sourceState._historyOrder || "normal";
       child._hasServerLater = !!sourceState._hasServerLater;
       child._loadedOffset = Number(sourceState._loadedOffset) || 0;
@@ -8027,23 +8018,41 @@ function portal() {
       const st = childSid && this.tabState[childSid];
       if (!st || !sourceSid || st._inheritedTaskPoller) return;
       let ticksLeft = 1810;
+      let inFlight = false;
+      let stopped = false;
+      let epoch = 0;
+      let activeController = null;
       const stop = () => {
+        if (stopped) return;
+        stopped = true;
+        epoch += 1;
+        if (activeController) {
+          try { activeController.abort(); } catch (_) {}
+          activeController = null;
+        }
         if (st._inheritedTaskPoller) clearInterval(st._inheritedTaskPoller);
         st._inheritedTaskPoller = null;
       };
-      const tick = async () => {
-        if (this.tabState[childSid] !== st || ticksLeft-- <= 0) {
-          stop();
-          return;
-        }
+      const runTick = async tickEpoch => {
         let status = null;
+        const controller = new AbortController();
+        activeController = controller;
+        const timeout = setTimeout(
+          () => controller.abort(),
+          Math.max(100, Number(this._sessionListTimeoutMs) || 8000),
+        );
         try {
           const r = await fetch(
             `/api/chat/sessions/${encodeURIComponent(sourceSid)}/active`,
-            { headers: this.hdr() },
+            { headers: this.hdr(), signal: controller.signal },
           );
           if (r.ok) status = await r.json();
         } catch (_) { return; }
+        finally {
+          clearTimeout(timeout);
+          if (activeController === controller) activeController = null;
+        }
+        if (stopped || epoch !== tickEpoch || this.tabState[childSid] !== st) return;
         if (!status) return;
         // On a second rollover, `sourceSid` can itself be a visible successor
         // whose inherited task is owned by an older hidden runtime. Its local
@@ -8054,25 +8063,89 @@ function portal() {
           status.runtime_background_tasks_pending
           ?? status.background_tasks_pending,
         );
+        const continuationPending = !!status.runtime_continuation_pending;
+        const desiredRevision = String(status.runtime_ui_revision || "");
+        const revisionBeforeAdoption = String(st.runtimeUiRevision || "");
+        let adoptedRevision = desiredRevision
+          ? revisionBeforeAdoption === desiredRevision
+          : true;
+        let loadedCanonicalThisTick = false;
+        // More than one task can finish at different times. Adopt every ready
+        // Agent continuation revision even while a sibling task is still
+        // running; task count and reply readiness are independent signals.
+        if (!adoptedRevision && !st.streaming && !st.es && !st.compacting) {
+          const continuationEventIdsBefore = new Set(
+            this._allPaneMessages(st)
+              .filter(message => message
+                && message.display_kind === "runtime_continuation"
+                && message.runtime_event_id)
+              .map(message => String(message.runtime_event_id)),
+          );
+          const loaded = await this._reloadSessionCoalesced(childSid, {
+            quiet: true, probeActive: false,
+          });
+          if (stopped || epoch !== tickEpoch || this.tabState[childSid] !== st) return;
+          if (!loaded) return;
+          loadedCanonicalThisTick = true;
+          adoptedRevision = st.runtimeUiRevision === desiredRevision;
+          const hasNewRuntimeContinuation = this._allPaneMessages(st).some(
+            message => message
+              && message.display_kind === "runtime_continuation"
+              && message.runtime_event_id
+              && !continuationEventIdsBefore.has(
+                String(message.runtime_event_id)),
+          );
+          // A projected continuation is an ordinary new Agent reply. Mirror
+          // normal background completion semantics when it lands off-screen,
+          // but do not badge the tab for a task-overlay-only terminal reload
+          // or for a cancelled/failed snapshot that shares the broader
+          // runtime_ui_revision digest.
+          if (adoptedRevision
+              && revisionBeforeAdoption !== desiredRevision
+              && hasNewRuntimeContinuation
+              && childSid !== this.currentId) {
+            st.unread = true;
+          }
+        }
         if (Number.isFinite(reported) && reported > 0) {
           st.inheritedBackgroundTaskCount = Math.floor(reported);
           return;
         }
-        // The source can keep an already-finished, unconsumed continuation in
-        // its grace cache for about a minute. `active` therefore is NOT the
-        // terminal signal here; the authoritative inherited-task count is.
+        // The task overlay becomes terminal before Claude's automatic Agent
+        // continuation has finished. Keep polling through that zero-count gap
+        // until the durable UI-only projection is READY on the visible leaf.
+        if (continuationPending) return;
         if (!Number.isFinite(reported) || reported !== 0) return;
-        // Adopt the backend's child overlay once no child turn can be disturbed
-        // by reconciliation. The source continuation is intentionally never
-        // subscribed from this successor.
         if (st.streaming || st.es || st.compacting) return;
-        const loaded = await this.loadSession(childSid, {
-          quiet: true, probeActive: false,
-        });
+        // If no revision changed, this final reload still adopts the task
+        // card's completed/stopped overlay. The source continuation itself is
+        // never cross-subscribed; its ordinary assistant bubble now arrives
+        // through the successor's durable presentation history.
+        const loaded = adoptedRevision && !loadedCanonicalThisTick
+          ? await this._reloadSessionCoalesced(childSid, {
+              quiet: true, probeActive: false,
+            })
+          : true;
+        if (stopped || epoch !== tickEpoch || this.tabState[childSid] !== st) return;
         if (!loaded || this.tabState[childSid] !== st) return;
+        if (desiredRevision && st.runtimeUiRevision !== desiredRevision) return;
         st.inheritedBackgroundTaskCount = 0;
         st.inheritedBackgroundOwner = "";
         stop();
+      };
+      const tick = async () => {
+        if (stopped || inFlight) return;
+        if (this.tabState[childSid] !== st || ticksLeft-- <= 0) {
+          stop();
+          return;
+        }
+        inFlight = true;
+        const tickEpoch = epoch;
+        try {
+          await runTick(tickEpoch);
+        } finally {
+          inFlight = false;
+        }
       };
       st._inheritedTaskPoller = setInterval(tick, 2000);
       tick();
@@ -9773,9 +9846,8 @@ function portal() {
         let succeeded = false;
         const task = (async () => {
           try {
-            const loaded = this._sessionLoadPromises[sid]
-              ? await this._sessionLoadPromises[sid]
-              : await this.loadSession(sid, { quiet: true });
+            const loaded = await this._reloadSessionCoalesced(
+              sid, { quiet: true });
             if (!loaded) {
               st._pendingExternalUpdate = true;
               return;
@@ -13710,14 +13782,23 @@ function portal() {
         // /active; otherwise an ancestor-owned card stays "running" forever
         // with no yellow dot until the user refreshes again after settlement.
         const inheritedPending = Number(d.runtime_background_tasks_pending);
+        const runtimeContinuationPending = !!d.runtime_continuation_pending;
+        const remoteRuntimeUiRevision = String(d.runtime_ui_revision || "");
+        const runtimeRevisionBehind = !!remoteRuntimeUiRevision
+          && st.runtimeUiRevision !== remoteRuntimeUiRevision;
         const sessionMeta = (this.sessions || []).find(row => row.id === sid);
         const predecessorSid = String(
           (sessionMeta && sessionMeta.runtime_predecessor) || "",
         );
-        if (Number.isFinite(inheritedPending) && inheritedPending > 0
-            && predecessorSid) {
+        if (predecessorSid && (
+          (Number.isFinite(inheritedPending) && inheritedPending > 0)
+          || runtimeContinuationPending
+          || runtimeRevisionBehind
+        )) {
           st.inheritedBackgroundOwner = predecessorSid;
-          st.inheritedBackgroundTaskCount = Math.floor(inheritedPending);
+          st.inheritedBackgroundTaskCount = Number.isFinite(inheritedPending)
+            ? Math.max(0, Math.floor(inheritedPending))
+            : Number(st.inheritedBackgroundTaskCount) || 0;
           this._ensureInheritedTaskPoller(sid, predecessorSid);
         }
         if (d.active && d.background && d.attachable === false) {
@@ -13873,6 +13954,7 @@ function portal() {
         ? !!opts.probeActive : !quiet;
       const st = this._ensureTabState(sid);
       const runtimeSettingsGenerationAtLoad = st._runtimeSettingsGeneration;
+      const runtimeUiRevisionAtLoad = String(st.runtimeUiRevision || "");
       // A live stream owns st.messages and every SSE closure points directly at
       // objects inside that array. No load mode may clear/splice it while the
       // owner is active — continuation text otherwise keeps mutating an orphaned
@@ -13963,6 +14045,17 @@ function portal() {
         const s = this._retainExpectedSessionSettings(await r.json());
         if (this.tabState[sid] !== st) return false;
         if (st.streaming || st.es) return true;
+        const loadedRuntimeUiRevision = String(s.runtime_ui_revision || "");
+        const currentRuntimeUiRevision = String(st.runtimeUiRevision || "");
+        // A different load for this same tab adopted another presentation
+        // revision while this request was in flight.  Never let the older
+        // response remove that bubble and roll the local watermark backward.
+        // Equal responses remain safe to coalesce, while a genuinely newer
+        // server revision is picked up by the existing poll/reconcile retry.
+        if (currentRuntimeUiRevision !== runtimeUiRevisionAtLoad
+            && currentRuntimeUiRevision !== loadedRuntimeUiRevision) {
+          return true;
+        }
         const loadedUpdated = Number(s.updated_at) || 0;
         // Build a lookup of blob preview URLs from the current in-memory
         // messages so we can carry them over after the server rebuild.
@@ -14140,6 +14233,7 @@ function portal() {
         st._earlierMessages = earlier;
         st._laterMessages = [];
         st.historyGeneration = s.history_generation || s.historyGeneration || "";
+        st.runtimeUiRevision = loadedRuntimeUiRevision;
         st._historyOrder = (s.history_order === "full" || full) ? "full" : "normal";
         st._hasServerLater = !!s.has_later;
         if (sid === this.currentId) this.historyGeneration = st.historyGeneration;
@@ -14535,6 +14629,14 @@ function portal() {
         if (value === undefined || value === null || value === "") return;
         out.push(role + ":" + kind + ":" + this._stableHash(String(value)));
       };
+      // Presentation-only runtime replies may legitimately have identical
+      // prose (for example two "后台任务已完成" continuations). Their durable
+      // event id is the sole identity; text fallback would reuse the older DOM
+      // object/key and collapse two distinct Agent turns during quiet reload.
+      if (m.display_kind === "runtime_continuation") {
+        push("runtime-event", m.runtime_event_id);
+        return out;
+      }
       // Tool/task identifiers survive the live → canonical boundary. UUID is
       // also useful for canonical → canonical refreshes, but a live assistant
       // bubble usually has no UUID yet, so text remains a required fallback.
@@ -14624,7 +14726,8 @@ function portal() {
       // The footer still belongs to the canonical tail, so carry its immediate
       // done-time stamp across without overwriting authoritative fields.
       const canonicalTail = result[result.length - 1];
-      if (liveFooter && canonicalTail && canonicalTail.role !== "user") {
+      if (liveFooter && canonicalTail && canonicalTail.role !== "user"
+          && canonicalTail.display_kind !== "runtime_continuation") {
         if (!canonicalTail.ts && liveFooter.ts) canonicalTail.ts = liveFooter.ts;
         if (!canonicalTail.elapsed && liveFooter.elapsed) {
           canonicalTail.elapsed = liveFooter.elapsed;
@@ -22587,6 +22690,12 @@ function portal() {
       this.dismissPreviewQuote(true);
       if (this._isMobileLayout()) this.setMobileTab("chat");
       this.$nextTick(() => {
+        // Do not let this delayed convenience-focus steal a newer selection.
+        // A fast user (or a busy renderer) can begin selecting another bubble
+        // before Alpine reaches this tick; focusing the textarea would then
+        // collapse that fresh range and the selection actions never appear.
+        const selection = window.getSelection && window.getSelection();
+        if (selection && selection.rangeCount && !selection.isCollapsed) return;
         const ta = this.$refs.chatInput;
         if (ta) ta.focus();
       });
@@ -24845,7 +24954,128 @@ function portal() {
     },
 
     // ===== slash commands =====
-    slashResults: [],   // filled by onChatInput
+    // Every entry comes from MUSELAB_SLASH_CMDS. The palette, aliases, busy
+    // policy and execution path deliberately share that registry so a mouse
+    // click cannot behave differently from Enter, Tab or the send button.
+    slashResults: [],   // command rows or second-stage argument rows
+    slashStage: "command",
+    _slashDispatching: false,
+    _resolveSlashCommand(rawName) {
+      const name = String(rawName || "").trim().toLowerCase();
+      if (!name) return null;
+      return this.SLASH_CMDS.find(command => command.name === name
+        || (command.aliases || []).includes(name)) || null;
+    },
+    _slashCommandResults(rawQuery) {
+      const query = String(rawQuery || "").toLowerCase();
+      const rows = [];
+      for (const command of this.SLASH_CMDS) {
+        const names = [command.name, ...(command.aliases || [])];
+        const displayName = names.find(name => name.startsWith(query));
+        if (!displayName) continue;
+        rows.push({
+          ...command,
+          _kind: "command",
+          _displayName: displayName,
+          _key: `command:${displayName}`,
+        });
+      }
+      return rows;
+    },
+    _slashArgumentResults(command, rawQuery) {
+      if (!command || !command.argKind) return [];
+      const query = String(rawQuery || "").trim().toLowerCase();
+      const current = {
+        model: this.model,
+        permission: this.permission,
+        effort: this.effort,
+        session: this.currentId,
+      }[command.argKind] || "";
+      const row = (value, label, hint = "", searchExtra = "") => ({
+        _kind: "argument",
+        _key: `argument:${command.name}:${value}`,
+        command: command.name,
+        value: String(value),
+        label: String(label || value),
+        hint: String(hint || ""),
+        current: String(value) === String(current),
+        _search: `${value} ${label || ""} ${hint || ""} ${searchExtra || ""}`.toLowerCase(),
+      });
+      let rows = [];
+      if (command.argKind === "model") {
+        rows = (this.availableModels || []).map(model => row(
+          model.model,
+          model.label || model.model,
+          model.group || "",
+          model.model,
+        ));
+      } else if (command.argKind === "permission") {
+        rows = [
+          row("bypassPermissions", "bypass", "bypassPermissions"),
+          row("acceptEdits", "acceptEdits"),
+          row("default", "default"),
+          row("dontAsk", "dontAsk"),
+          row("auto", "auto"),
+          row("plan", "plan"),
+        ];
+      } else if (command.argKind === "effort") {
+        rows = this.effortChoices(this.model).map(option => row(
+          option.value,
+          this.t(option.labelKey),
+        ));
+      } else if (command.argKind === "session") {
+        rows = (this.sessions || []).slice(0, 50).map(session => row(
+          session.id,
+          session.name || session.id.slice(0, 8),
+          `${session.id.slice(0, 8)} · ${session.turn_count
+            ?? Math.floor((session.message_count || 0) / 2)}t`,
+          session.first_prompt || "",
+        ));
+      }
+      if (query) rows = rows.filter(item => item._search.includes(query));
+      return rows.slice(0, 30);
+    },
+    _refreshSlashPalette(prefix = this.input) {
+      const text = String(prefix || "");
+      if (!text.startsWith("/")) {
+        this.slashShow = false;
+        return false;
+      }
+      const raw = text.slice(1);
+      const splitAt = raw.search(/\s/);
+      if (splitAt < 0) {
+        this.slashStage = "command";
+        this.slashResults = this._slashCommandResults(raw);
+      } else {
+        const command = this._resolveSlashCommand(raw.slice(0, splitAt));
+        this.slashStage = "argument";
+        this.slashResults = command
+          ? this._slashArgumentResults(command, raw.slice(splitAt + 1))
+          : [];
+      }
+      this.slashIdx = 0;
+      // Keep the shell visible for a zero-result query so the user gets the
+      // promised "no matching command/value" feedback instead of a blink.
+      this.slashShow = true;
+      this.slashAnchor = 0;
+      return true;
+    },
+    _setSlashComposerValue(value, refreshPalette = false) {
+      const sid = this.currentId;
+      const next = this._setChatInput(value);
+      const st = sid && this._ensureTabState(sid);
+      if (st && st.draft) st.draft.input = next;
+      if (sid) this._persistChatDraft(sid, next);
+      this.$nextTick(() => {
+        const input = this.$refs.chatInput;
+        if (!input || this.currentId !== sid) return;
+        input.focus();
+        input.setSelectionRange(next.length, next.length);
+        this.autoGrow(input);
+        if (refreshPalette) this._refreshSlashPalette(next);
+      });
+      return next;
+    },
     _navPop(delta) {
       // shared up/down handler for either @ mention or / slash popup
       if (this.slashShow) {
@@ -24860,27 +25090,199 @@ function portal() {
       }
       return false;
     },
-    pickSlash(i) {
-      const c = this.slashResults[i];
-      if (!c) return;
-      // Replace current input with the canonical form so user sees what's submitted
-      this._setChatInput("/" + c.name
-        + (c.name === "model" || c.name === "resume" ? " " : ""));
+    pickSlash(i = this.slashIdx) {
+      const item = this.slashResults[i];
+      if (!item) return false;
+      if (item._kind === "argument") {
+        const command = this._resolveSlashCommand(item.command);
+        if (!command) return false;
+        const submitted = this._setSlashComposerValue(
+          `/${command.name} ${item.value}`,
+        );
+        this.slashShow = false;
+        void this._dispatchSlash(command.name, item.value, { submitted });
+        return true;
+      }
+
+      const command = this._resolveSlashCommand(item.name);
+      if (!command) return false;
+      if (command.argKind) {
+        this._setSlashComposerValue(`/${command.name} `, true);
+        return true;
+      }
+      const submitted = this._setSlashComposerValue(`/${command.name}`);
       this.slashShow = false;
-      if (this.$refs.chatInput) this.$refs.chatInput.focus();
-      // For commands with NO argument needed, auto-execute on selection
-      if (!["model", "resume"].includes(c.name)) {
-        this._runSlash(c.name, "");
-        this._setChatInput("");
+      void this._dispatchSlash(command.name, "", { submitted });
+      return true;
+    },
+
+    onSlashTab(ev) {
+      if (!this.slashShow || !this.slashResults.length
+          || this._isImeComposingEvent(ev)) return false;
+      ev.preventDefault();
+      this.pickSlash();
+      return true;
+    },
+
+    _slashDraftHasAttachments(sid = this.currentId) {
+      const st = sid && this.tabState && this.tabState[sid];
+      const draft = st && st.draft;
+      if (!draft) return false;
+      return !!((draft.pendingImages && draft.pendingImages.length)
+        || (draft.pendingDocs && draft.pendingDocs.length)
+        || (draft.pendingQuotes && draft.pendingQuotes.length));
+    },
+
+    async _dispatchSlash(rawCommand, rawArg, opts = {}) {
+      const command = this._resolveSlashCommand(rawCommand);
+      if (!command) {
+        this.toast(this.t("slash.unknown", { cmd: rawCommand }), "warn", 2000);
+        return false;
+      }
+      const ownsDispatchLock = command.policy !== "immediate";
+      if (this._slashDispatching && ownsDispatchLock) return false;
+      const sid = this.currentId;
+      const ownerState = sid && this._ensureTabState(sid);
+      const submitted = opts.submitted == null
+        ? String(this.input || "") : String(opts.submitted);
+      const arg = String(rawArg || "").trim();
+
+      if (!command.argKind && arg) {
+        this.toast(this.t("slash.no_args_allowed", { cmd: command.name }), "warn", 2500);
+        return false;
+      }
+
+      // Slash controls and chat attachments have different ownership/lifetime.
+      // Refuse the mixed draft before clearing anything so neither the command
+      // text nor an uploaded attachment disappears unexpectedly.
+      if (this._slashDraftHasAttachments(sid)) {
+        this.toast(this.t("slash.attachments_blocked"), "warn", 3000);
+        return false;
+      }
+
+      if (ownsDispatchLock) this._slashDispatching = true;
+      try {
+        if (command.policy === "stateful") {
+          const st = sid && this._ensureTabState(sid);
+          if (await this._confirmSessionBusy(sid, st)) {
+            this.toast(this.t("queue.slash_blocked"), "warn", 3000);
+            return false;
+          }
+        }
+        const handled = await this._runSlashHandler(
+          command.name,
+          arg,
+        );
+        // Only clear the exact draft that launched this command. A handler can
+        // show a confirm, switch sessions, or take long enough for the user to
+        // type again; none of those may erase newer input.
+        if (handled !== false && sid && this.tabState[sid] === ownerState
+            && ownerState.draft && ownerState.draft.input === submitted) {
+          ownerState.draft.input = "";
+          this._resetChatInputHistory(ownerState.draft);
+          this._persistChatDraft(sid, "");
+          if (this.currentId === sid && this.input === submitted) {
+            this._setChatInput("");
+            this.$nextTick(() => {
+              if (this.currentId === sid && this.$refs.chatInput) {
+                this.autoGrow(this.$refs.chatInput);
+              }
+            });
+          }
+          this.slashShow = false;
+        }
+        return handled !== false;
+      } catch (error) {
+        this.toast(this.t("slash.failed"), "error", 3000);
+        return false;
+      } finally {
+        if (ownsDispatchLock) this._slashDispatching = false;
       }
     },
 
-    async _runSlash(cmd, arg) {
-      arg = (arg || "").trim();
+    async _runSlashHandler(cmd, arg) {
       switch (cmd) {
+        case "context":
+          await this.showCtxBreakdown();
+          return true;
+        case "compact":
+          await this.runCompact();
+          return true;
+        case "model": {
+          if (!arg) {
+            const list = (this.availableModels || [])
+              .map(model => `- ${model.group || ""} · **${model.model}**`)
+              .join("\n");
+            this._injectAssistantNote(this.t("slash.model_list_title") + "\n\n" + list);
+            return true;
+          }
+          const found = (this.availableModels || []).find(model => model.model === arg);
+          if (!found) {
+            this.toast(this.t("slash.model_unknown", { id: arg }), "warn", 3000);
+            return false;
+          }
+          this.model = found.model;
+          return (await this.onModelChange()) !== false;
+        }
+        case "permission": {
+          if (!arg) {
+            this._injectAssistantNote(this.t("slash.permission_list"));
+            return true;
+          }
+          const aliases = { bypass: "bypassPermissions" };
+          const value = aliases[arg] || arg;
+          if (!this._normalizePermissionMode(value)) {
+            this.toast(this.t("slash.permission_unknown", { mode: arg }), "warn", 3000);
+            return false;
+          }
+          this.permission = value;
+          return (await this.onPermissionChange()) !== false;
+        }
+        case "mcp":
+          if (!this.mcpDrawerOpen) this.toggleMcpDrawer();
+          else await this.fetchMcp();
+          return true;
+        case "stop":
+          if (this.isTabStreaming(this.currentId)) await this.stop();
+          else this.toast(this.t("slash.stop_idle"), "info", 1800);
+          return true;
+        case "usage": {
+          await this.fetchStats();
+          const s = this.stats;
+          const lines = [
+            `**${this.t("slash.cost_title")}**`,
+            `- ${this.t("cost.total")}: $${s.total_cost_usd.toFixed(4)}`,
+            `- ${this.t("cost.in_out")}: ${s.total_input_tokens.toLocaleString()} in / ${s.total_output_tokens.toLocaleString()} out`,
+            `- ${this.t("cost.cache_hit")}: ${s.cache_hit_pct}% (${s.total_cache_read_tokens.toLocaleString()} cached read)`,
+            s.budget_usd > 0
+              ? `- ${this.t("cost.budget")}: $${s.budget_usd} (${s.budget_used_pct}% used)`
+              : `- ${this.t("cost.no_budget")}`,
+            `- ${this.t("cost.context")}: ${((this.sessionUsage.context_used || this.sessionUsage.input_tokens || 0) / 1000).toFixed(1)}K / ${(this.sessionUsage.context_limit / 1000).toFixed(0)}K (${this.sessionUsage.context_used_pct}%)`,
+          ];
+          this._injectAssistantNote(lines.join("\n"));
+          return true;
+        }
+        case "effort": {
+          if (!arg) {
+            const levels = this._effortLevels(this.model).join(" / ");
+            this._injectAssistantNote(this.t("slash.effort_list", { levels }));
+            return true;
+          }
+          const value = this._normalizeEffort(arg);
+          if (value !== arg || !this._effortAllowed(value, this.model)) {
+            this.toast(this.t("slash.effort_unknown", { level: arg }), "warn", 3000);
+            return false;
+          }
+          this.effort = value;
+          return (await this.onEffortChange()) !== false;
+        }
         case "help": {
           const cmds = this.SLASH_CMDS
-            .map(c => `**/${c.name}** — ${c.desc[this.lang] || c.desc.zh}`)
+            .map(command => {
+              const aliases = (command.aliases || []).length
+                ? ` (/${command.aliases.join(", /")})` : "";
+              return `**/${command.name}**${aliases} — ${command.desc[this.lang] || command.desc.zh}`;
+            })
             .join("\n");
           const md = [
             `## ${this.t("slash.help_title")}`,
@@ -24897,10 +25299,10 @@ function portal() {
             `${this.t("help.docs_link")} → [README.md](README.md)`,
           ].join("\n");
           this._injectAssistantNote(md);
-          return;
+          return true;
         }
         case "clear": {
-          if (!this.currentId) return;
+          if (!this.currentId) return false;
           // /clear permanently DELETEs the session (CLI JSONL + sidecar +
           // uploaded attachments), no trash, no undo — despite the CLI-muscle-
           // memory expectation that /clear just resets context. Gate it behind
@@ -24914,7 +25316,7 @@ function portal() {
             danger: true,
             okText: zh ? "删除并新建" : "Delete & start fresh",
           });
-          if (!ok) return;
+          if (!ok) return true;
           const oldId = this.currentId;
           // Token via header (not query) so it never lands in access / proxy
           // logs or browser history. /reset accepts header-or-query backend-side.
@@ -24926,7 +25328,7 @@ function portal() {
             // Network failure mid-clear — surface it rather than throwing an
             // unhandledrejection and leaving the user staring at the old session.
             this.errToast("delete", String((e && e.message) || e));
-            return;
+            return false;
           }
           await this.refreshSessions();
           // Drop the old session's tab + cached state, then open a fresh one
@@ -24936,35 +25338,7 @@ function portal() {
           this.openTabIds = this.openTabIds.filter(x => x !== oldId);
           await this.newSession();
           this.toast(this.t("slash.cleared"), "success", 1500);
-          return;
-        }
-        case "compact": {
-          if (!this.currentId) return;
-          const r = await fetch(`/api/chat/sessions/${this.currentId}/compact`,
-                                  { method: "POST", headers: this.hdr() });
-          if (!r.ok) { this.toast(this.t("slash.failed"), "error"); return; }
-          const meta = await r.json();
-          await this.refreshSessions();
-          this._captureChatPosition(this.currentId);
-          this.currentId = meta.id;
-          this._activateTabState(meta.id);
-          await this.loadSession(meta.id);
-          // Pre-fill input with the compact prompt — user reviews then sends
-          this._setChatInput(this.t("slash.compact_prompt"));
-          this.toast(this.t("slash.compact_ok"), "success", 2500);
-          return;
-        }
-        case "model": {
-          if (!arg) {
-            const list = (this.availableModels || []).map(m => `- ${m.group} · **${m.model}**`).join("\n");
-            this._injectAssistantNote(this.t("slash.model_list_title") + "\n\n" + list);
-            return;
-          }
-          const found = (this.availableModels || []).find(m => m.model === arg);
-          if (!found) { this.toast(this.t("slash.model_unknown", { id: arg }), "warn", 3000); return; }
-          this.model = arg;
-          this.toast(this.t("slash.model_switched", { id: arg }), "success", 1500);
-          return;
+          return true;
         }
         case "resume": {
           if (!arg) {
@@ -24974,40 +25348,31 @@ function portal() {
                 return `- **${s.name}** (${turns}t, ${s.id.slice(0, 8)})`;
               }).join("\n");
             this._injectAssistantNote(this.t("slash.resume_list_title") + "\n\n" + list);
-            return;
+            return true;
           }
           const q = arg.toLowerCase();
           const hit = (this.sessions || []).find(s =>
             s.id.startsWith(arg) || s.name.toLowerCase().includes(q));
-          if (!hit) { this.toast(this.t("slash.resume_no_match"), "warn", 2000); return; }
+          if (!hit) { this.toast(this.t("slash.resume_no_match"), "warn", 2000); return false; }
           this._captureChatPosition(this.currentId);
           this.currentId = hit.id;
           this._activateTabState(hit.id);
           await this.loadSession(hit.id);
           this.toast(this.t("slash.resumed", { name: hit.name }), "success", 1500);
-          return;
+          return true;
         }
-        case "cost": {
-          await this.fetchStats();
-          const s = this.stats;
-          const lines = [
-            `**${this.t("slash.cost_title")}**`,
-            `- ${this.t("cost.total")}: $${s.total_cost_usd.toFixed(4)}`,
-            `- ${this.t("cost.in_out")}: ${s.total_input_tokens.toLocaleString()} in / ${s.total_output_tokens.toLocaleString()} out`,
-            `- ${this.t("cost.cache_hit")}: ${s.cache_hit_pct}% (${s.total_cache_read_tokens.toLocaleString()} cached read)`,
-            s.budget_usd > 0
-              ? `- ${this.t("cost.budget")}: $${s.budget_usd} (${s.budget_used_pct}% used)`
-              : `- ${this.t("cost.no_budget")}`,
-            `- ${this.t("cost.context")}: ${((this.sessionUsage.context_used || this.sessionUsage.input_tokens || 0)/1000).toFixed(1)}K / ${(this.sessionUsage.context_limit/1000).toFixed(0)}K (${this.sessionUsage.context_used_pct}%)`,
-          ];
-          this._injectAssistantNote(lines.join("\n"));
-          return;
-        }
-        case "config": this.openSettings(); return;
-        case "stop":   if (this.isTabStreaming(this.currentId)) await this.stop(); return;
+        case "config": this.openSettings(); return true;
         default:
           this.toast(this.t("slash.unknown", { cmd }), "warn", 2000);
+          return false;
       }
+    },
+
+    // Compatibility entry point for extensions that used the old private
+    // helper. It intentionally delegates to the dispatcher rather than
+    // bypassing attachment and busy-state policy.
+    async _runSlash(cmd, arg) {
+      return this._dispatchSlash(cmd, arg);
     },
 
     // Inject a synthetic assistant bubble (markdown rendered) for slash output.
@@ -25519,17 +25884,11 @@ function portal() {
       const pos = ta.selectionStart;
       const text = this.input.slice(0, pos);
 
-      // Slash command palette — only when input starts with '/' (no leading space).
-      if (text.startsWith("/")) {
-        const q = text.slice(1).toLowerCase();
-        // Hide once user typed a space (means they're past the command name)
-        if (/\s/.test(q)) { this.slashShow = false; }
-        else {
-          this.slashResults = this.SLASH_CMDS.filter(c => c.name.startsWith(q));
-          this.slashIdx = 0;
-          this.slashShow = this.slashResults.length > 0;
-          this.slashAnchor = 0;
-        }
+      // Slash command palette — only when input starts with '/' (no leading
+      // space). `_refreshSlashPalette` also owns the second-stage argument
+      // results, aliases and zero-match shell.
+      if (this.SLASH_ENABLED && text.startsWith("/")) {
+        this._refreshSlashPalette(text);
         this._cancelMentionLookup();
         return;
       } else {
@@ -25638,6 +25997,10 @@ function portal() {
       // claimed this draft, later repeats must not become duplicate sends.
       if (ev.repeat) return;
       if (this.mentionShow) { this.pickMention(); return; }
+      if (this.slashShow && this.slashResults.length) {
+        this.pickSlash();
+        return;
+      }
       // Newline-at-cursor for: Shift+Enter, Ctrl+Enter, Meta+Enter, and
       // touch devices (where bare Enter is a newline because send is via
       // the on-screen button). Inserting at selectionStart/End preserves
@@ -25971,6 +26334,25 @@ function portal() {
       const sendState = this._ensureTabState(sendSid);
       const isComposerSubmission = !opts.reconnect && !opts.resumedItem
         && typeof opts.detachedText !== "string";
+      // Slash controls must stay responsive even while a turn/background task
+      // is active or a runtime-setting PATCH is settling. Detect the exact
+      // composer draft before the regular send gates; `_dispatchSlash` applies
+      // the registry's per-command policy and preserves mixed attachment
+      // drafts. Queue drains/reconnects never contain slash controls.
+      if (this.SLASH_ENABLED && isComposerSubmission) {
+        const slashDraft = String((sendState.draft && sendState.draft.input) || "");
+        const slashText = slashDraft.trim();
+        if (slashText.startsWith("/")) {
+          const match = slashText.match(/^\/([^\s]+)(?:\s+([\s\S]*))?$/);
+          if (match) {
+            return await this._dispatchSlash(match[1], match[2] || "", {
+              submitted: slashDraft,
+            });
+          }
+          this.toast(this.t("slash.unknown", { cmd: slashText.slice(1) }), "warn", 2000);
+          return false;
+        }
+      }
       // Keep the ownership token primitive. Alpine proxies objects assigned to
       // reactive state, which would break identity comparison in finally and
       // leave the send button permanently locked after a successful submit.
@@ -26141,69 +26523,19 @@ function portal() {
       // the item (NOT from this.input / this.pendingImages — those may
       // hold a different draft the user has typed since enqueue).
       const resumed = opts.resumedItem || null;
-      // No-provider gate: with zero configured models every send would 401
-      // the Anthropic auth pre-check AND lock the session to the unreachable
-      // claude fallback on first send. Refuse the turn and route the user to
-      // Settings instead. Reconnect (attach to an in-flight turn) is exempt —
-      // it adds no new turn. This is the frontend half of the fix; the
-      // backend leaves new sessions' model empty until a provider exists.
+      let text;
+      if (isReconnect) text = "";
+      else if (resumed) text = (resumed.text || "").trim();
+      else text = composerText.trim();
+      // No-provider gate: with zero configured models every regular send would
+      // 401 the auth pre-check and pin the first turn to an unreachable
+      // fallback. Reconnects and the slash controls above are exempt.
       if (!isReconnect && (!this.availableModels || !this.availableModels.length)) {
         this.toast(
           this.lang === "zh" ? "请先在设置里配置一个模型" : "Configure a model in Settings first",
           "warn", 3000);
         this.openSettings();
         return;
-      }
-      let text;
-      if (isReconnect) text = "";
-      else if (resumed) text = (resumed.text || "").trim();
-      else text = composerText.trim();
-      // Slash command: intercept BEFORE hitting the SDK. /word or /word arg.
-      // Resumed items can't reach the slash branch — slash is processed
-      // before enqueue, so a queued item is always plain text. While
-      // busy (streaming/compacting), slash commands are intentionally NOT
-      // enqueued — they're meta-actions (/clear, /compact, /export) that
-      // depend on session state at execution time, not user intent at
-      // type time. We toast "wait for this turn to finish" instead.
-      if (!isReconnect && !resumed && !hasDetachedText && text.startsWith("/")) {
-        const m = text.match(/^\/(\w+)(?:\s+(.*))?$/);
-        if (m) {
-          const slashBusy = await this._confirmSessionBusy(sendSid, sendState);
-          if (slashBusy && !sendState.streaming && !sendState.compacting
-              && sendState.backgroundActive
-              && !opts._backgroundRolloverAttempted) {
-            const childSid = await this._handoffBackgroundSession(
-              sendSid, sendState);
-            if (childSid && childSid.sessionId) {
-              // Slash commands are stateful local operations and are never
-              // durable queue items. Do not let one overtake already accepted
-              // prompts migrated to the successor.
-              if (this._claimDetachedRolloverSlot(childSid)) {
-                this.toast(this.t("queue.slash_blocked"), "warn", 3000);
-                return false;
-              }
-              return await this.send({
-                ...opts,
-                sessionId: childSid.sessionId,
-                _backgroundRolloverAttempted: true,
-                _composerSubmitToken: composerSubmitToken,
-              });
-            }
-          }
-          if (slashBusy) {
-            this.toast(this.t("queue.slash_blocked"), "warn", 3000);
-            return;
-          }
-          if (ownsSendDraft() && sendDraft.input === composerInput) {
-            sendDraft.input = "";
-            this._resetChatInputHistory(sendDraft);
-            if (this.currentId === sendSid) this._setChatInput("");
-            this._persistChatDraft(sendSid, "");
-          }
-          this.$nextTick(() => { if (this.currentId === sendSid && this.$refs.chatInput) this.autoGrow(this.$refs.chatInput); });
-          await this._runSlash(m[1], m[2] || "");
-          return;
-        }
       }
       let readyImages = [], readyDocs = [];
       if (isReconnect) {
@@ -27206,20 +27538,9 @@ function portal() {
         if (isContinuation && (!Number.isFinite(remaining) || remaining <= 0)) {
           _setContinuationAwaitingReaction(true);
         }
-        // User-perceivable settle feedback (mirrors the server's
-        // _on_task_settled which handles the away-from-screen case via
-        // presence-gated Web Push; this branch covers the at-screen case):
-        //   - toast, so a completion is noticed even when the card has
-        //     scrolled far off-screen;
-        //   - green unread dot when the launching session isn't the tab
-        //     being viewed (same affordance as a turn finishing elsewhere).
-        // Deduped per task_id and coalesced across a burst — see
-        // _noteBackgroundTaskSettled.
-        this._noteBackgroundTaskSettled(d.task_id, st, !!d.already_reported);
-        if (streamSid !== this.currentId) {
-          const ts = this.tabState[streamSid];
-          if (ts && !ts.streaming) ts.unread = true;
-        }
+        // A task notification only updates its existing card. User-visible
+        // completion feedback is the durable Agent continuation bubble; its
+        // revision adoption owns the off-screen unread dot exactly once.
         _scrollIfActiveSoon();
       });
       es.addEventListener("rate_limit", ev => {

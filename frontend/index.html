@@ -2825,7 +2825,11 @@
                    ~20px apart. -->
               <div class="turn-footer"
                    x-show="(m.role !== 'user' || m.turn_status || m._interrupted || m._failed)
-                     && (i === paneMsgs.length - 1 || (paneMsgs[i + 1] && paneMsgs[i + 1].role === 'user'))
+                     && (i === paneMsgs.length - 1
+                       || (paneMsgs[i + 1] && (
+                         paneMsgs[i + 1].role === 'user'
+                         || paneMsgs[i + 1].display_kind === 'runtime_continuation'
+                       )))
                      && turnFooterStatus(m, pane)
                      && (
                        turnFooterTime(m, pane)
@@ -3227,16 +3231,24 @@
           </label>
         </div>
         <!-- / slash command palette -->
-        <div class="mention-pop slash-pop" x-show="slashShow" x-transition.opacity>
-          <div class="mention-hint" x-text="t('slash.hint')"></div>
-          <template x-for="(c, i) in slashResults" :key="c.name">
+        <div class="mention-pop slash-pop" x-show="SLASH_ENABLED && slashShow" x-transition.opacity
+             @click.outside="slashShow=false">
+          <div class="mention-hint"
+               x-text="slashStage === 'argument' ? t('slash.arg_hint') : t('slash.hint')"></div>
+          <template x-for="(c, i) in slashResults" :key="c._key">
             <div :class="'mention-item ' + (slashIdx===i?'sel':'')"
                  @mousedown.prevent="pickSlash(i)" @mouseenter="slashIdx=i">
-              <span class="slash-name mono" x-text="'/' + c.name"></span>
-              <span class="slash-desc" x-text="c.desc[lang] || c.desc.zh"></span>
+              <span class="slash-name mono"
+                    x-text="c._kind === 'argument' ? c.label : '/' + (c._displayName || c.name)"></span>
+              <span class="slash-current" x-show="c.current" x-text="t('slash.current')"></span>
+              <span class="slash-desc"
+                    x-text="c._kind === 'argument'
+                      ? ([c.value !== c.label ? c.value : '', c.hint].filter(Boolean).join(' · '))
+                      : (c.desc[lang] || c.desc.zh)"></span>
             </div>
           </template>
-          <div class="hint-row" x-show="!slashResults.length" x-text="t('slash.none')"></div>
+          <div class="hint-row" x-show="!slashResults.length"
+               x-text="slashStage === 'argument' ? t('slash.no_arg') : t('slash.none')"></div>
         </div>
         <!-- @ mention -->
         <div class="mention-pop" x-show="mentionShow" x-transition.opacity>
@@ -3381,7 +3393,7 @@
           <textarea x-ref="chatInput"
                     x-effect="_syncChatInputDom(input, { target: $el })"
                     rows="1"
-                    :disabled="!availableModels.length || workspaceSwitching"
+                    :disabled="workspaceSwitching || !availableModels.length"
                     class="chat-input-textarea"
                     name="muselab-chat-message"
                     inputmode="text"
@@ -3390,6 +3402,7 @@
                     enterkeyhint="enter"
                     data-1p-ignore="" data-lpignore="true" data-form-type="other"
                     @keydown.enter="onEnter($event)"
+                    @keydown.tab="onSlashTab($event)"
                     @keydown="onImeKeydown($event)"
                     @keyup.enter="onImeEnterKeyup($event)"
                     @keydown.escape="mentionShow=false; slashShow=false"
@@ -4749,9 +4762,33 @@
           <div class="settings-row">
             <label x-text="t('set.label.theme')"></label>
             <div class="theme-picker">
-              <button class="btn-ghost" :class="{active: theme==='light'}" @click="setTheme('light')" x-text="t('set.theme.light')"></button>
-              <button class="btn-ghost" :class="{active: theme==='dark'}" @click="setTheme('dark')" x-text="t('set.theme.dark')"></button>
-              <button class="btn-ghost" :class="{active: theme==='eyecare'}" @click="setTheme('eyecare')" x-text="t('set.theme.eyecare')"></button>
+              <button type="button" class="btn-ghost" :class="{active: theme==='light'}" @click="setTheme('light')" x-text="t('set.theme.light')"></button>
+              <button type="button" class="btn-ghost" :class="{active: theme==='dark'}" @click="setTheme('dark')" x-text="t('set.theme.dark')"></button>
+              <button type="button" class="btn-ghost" :class="{active: theme==='eyecare'}" @click="setTheme('eyecare')" x-text="t('set.theme.eyecare')"></button>
+            </div>
+          </div>
+          <div class="settings-row eyecare-level-row" x-show="theme === 'eyecare'" x-cloak>
+            <label x-text="t('set.label.eyecare_level')"></label>
+            <div class="settings-row-col">
+              <div class="eyecare-level-picker" role="group"
+                   :aria-label="t('set.label.eyecare_level')">
+                <button type="button" class="btn-ghost"
+                        :class="{active: eyecareLevel===1}"
+                        :aria-pressed="eyecareLevel===1"
+                        @click="setEyecareLevel(1)"
+                        x-text="t('set.eyecare.soft')"></button>
+                <button type="button" class="btn-ghost"
+                        :class="{active: eyecareLevel===2}"
+                        :aria-pressed="eyecareLevel===2"
+                        @click="setEyecareLevel(2)"
+                        x-text="t('set.eyecare.balanced')"></button>
+                <button type="button" class="btn-ghost"
+                        :class="{active: eyecareLevel===3}"
+                        :aria-pressed="eyecareLevel===3"
+                        @click="setEyecareLevel(3)"
+                        x-text="t('set.eyecare.deep')"></button>
+              </div>
+              <div class="settings-hint" x-text="t('set.eyecare.hint')"></div>
             </div>
           </div>
           <div class="settings-row">
@@ -5413,10 +5450,6 @@
             <tr>
               <td><span class="kbd">@</span></td>
               <td x-text="lang==='zh' ? '在输入框引用工作区文件或目录（自动补全）' : 'Mention a workspace file or folder in input (autocomplete)'"></td>
-            </tr>
-            <tr>
-              <td><span class="kbd">/</span></td>
-              <td x-text="lang==='zh' ? '在输入框开头：slash 命令（/help /compact ...）' : 'At input start: slash commands (/help /compact …)'"></td>
             </tr>
             <tr>
               <td><span class="kbd">↑</span></td>

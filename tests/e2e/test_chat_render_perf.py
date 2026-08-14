@@ -4831,10 +4831,146 @@ def test_background_task_gap_leaves_composer_usable_without_empty_reconnect(
     _assert_no_browser_errors(page, errors)
 
 
+def test_inherited_projection_unread_requires_new_runtime_event(
+    page: Page, backend_url, auth_token,
+):
+    """A revision digest alone is not proof that a new Agent reply arrived."""
+    errors = _capture_browser_errors(page)
+    _login(page, backend_url, auth_token)
+
+    result = _app_eval(
+        page,
+        """
+        return (async () => {
+          const originalFetch = window.fetch;
+          const originalReload = app._reloadSessionCoalesced;
+          const originalCurrent = app.currentId;
+          const cases = [
+            {
+              name: "overlay-only", before: "same", desired: "same",
+              append: null, current: false,
+            },
+            {
+              name: "cancelled-snapshot", before: "old-cancel", desired: "new-cancel",
+              append: { role: "assistant", display_kind: "cancelled_turn" },
+              current: false,
+            },
+            {
+              name: "runtime-offscreen", before: "old-runtime", desired: "new-runtime",
+              append: {
+                role: "assistant", display_kind: "runtime_continuation",
+                runtime_event_id: "runtime-new-offscreen",
+              },
+              current: false,
+            },
+            {
+              name: "runtime-current", before: "old-current", desired: "new-current",
+              append: {
+                role: "assistant", display_kind: "runtime_continuation",
+                runtime_event_id: "runtime-new-current",
+              },
+              current: true,
+            },
+          ];
+          const specs = new Map();
+          try {
+            app._reloadSessionCoalesced = async sid => {
+              const spec = specs.get(sid);
+              spec.loads += 1;
+              if (spec.append) {
+                spec.st.messages.push({
+                  ...spec.append,
+                  text: spec.name,
+                  _k: `${sid}:idx:${spec.name}`,
+                  _noAnim: true,
+                });
+              }
+              spec.st.runtimeUiRevision = spec.desired;
+              return true;
+            };
+            const outcomes = [];
+            for (const item of cases) {
+              const child = `unread-child-${item.name}`;
+              const source = `unread-source-${item.name}`;
+              const st = app._blankTabState();
+              st._sid = child;
+              st._loaded = true;
+              st.runtimeUiRevision = item.before;
+              // An already-visible runtime event must not make an unrelated
+              // cancelled snapshot look like a newly-arrived continuation.
+              st.messages.push({
+                role: "assistant",
+                display_kind: "runtime_continuation",
+                runtime_event_id: `runtime-existing-${item.name}`,
+                text: "existing",
+                _k: `${child}:idx:runtime-existing-${item.name}`,
+                _noAnim: true,
+              });
+              app.tabState[child] = st;
+              specs.set(child, { ...item, st, loads: 0 });
+              app.currentId = item.current ? child : "different-visible-tab";
+              window.fetch = async (input, init) => {
+                const url = String((input && input.url) || input || "");
+                if (url.includes(`/sessions/${encodeURIComponent(source)}/active`)) {
+                  return {
+                    ok: true,
+                    json: async () => ({
+                      runtime_background_tasks_pending: 0,
+                      runtime_continuation_pending: false,
+                      runtime_ui_revision: item.desired,
+                    }),
+                  };
+                }
+                return originalFetch(input, init);
+              };
+              app._ensureInheritedTaskPoller(child, source);
+              const deadline = performance.now() + 1000;
+              while (st._inheritedTaskPoller && performance.now() < deadline) {
+                await new Promise(resolve => setTimeout(resolve, 5));
+              }
+              const spec = specs.get(child);
+              outcomes.push({
+                name: item.name,
+                unread: !!st.unread,
+                revision: st.runtimeUiRevision,
+                loads: spec.loads,
+              });
+              if (st._inheritedTaskPoller) clearInterval(st._inheritedTaskPoller);
+              delete app.tabState[child];
+              specs.delete(child);
+            }
+            return outcomes;
+          } finally {
+            window.fetch = originalFetch;
+            app._reloadSessionCoalesced = originalReload;
+            app.currentId = originalCurrent;
+          }
+        })();
+        """,
+    )
+
+    assert result == [
+        {"name": "overlay-only", "unread": False, "revision": "same", "loads": 1},
+        {
+            "name": "cancelled-snapshot", "unread": False,
+            "revision": "new-cancel", "loads": 1,
+        },
+        {
+            "name": "runtime-offscreen", "unread": True,
+            "revision": "new-runtime", "loads": 1,
+        },
+        {
+            "name": "runtime-current", "unread": False,
+            "revision": "new-current", "loads": 1,
+        },
+    ]
+    _assert_no_browser_errors(page, errors)
+
+
 def test_background_completion_no_active_fallback_never_blanks_visible_messages(
     page: Page, backend_url, auth_token,
 ):
-    """A settled continuation may race out of /active after its completion toast."""
+    """A settled continuation may race out of /active after its card update."""
     errors = _capture_browser_errors(page)
     page.set_viewport_size({"width": 1440, "height": 900})
     _install_fake_event_source(page)
@@ -4986,13 +5122,32 @@ def test_background_completion_no_active_fallback_never_blanks_visible_messages(
         })"""
     )
     page.wait_for_function(
-        """() => {
+        """sid => {
           const app = document.querySelector("#app")._x_dataStack[0];
-          return app.toasts.some(toast => /后台任务已完成|Background task finished/
-            .test(toast.msg || toast.message || ""));
+          const task = app.tabState[sid].messages.find(
+            m => m.id === "background-completion-tool");
+          return task?.task_status?.state === "completed";
         }""",
+        arg=sid,
         timeout=5000,
     )
+    # task_notification owns only the original task card. Give the former
+    # 700 ms toast batch window time to elapse, then prove neither a transient
+    # completion toast nor an eager unread dot was emitted.
+    page.wait_for_timeout(800)
+    settle_feedback = page.evaluate(
+        """sid => {
+          const app = document.querySelector("#app")._x_dataStack[0];
+          return {
+            unread: !!app.tabState[sid].unread,
+            completionToast: app.toasts.some(
+              toast => /后台任务已完成|Background task finished/
+                .test(toast.msg || toast.message || "")),
+          };
+        }""",
+        sid,
+    )
+    assert settle_feedback == {"unread": False, "completionToast": False}
 
     result = page.evaluate(
         """async ({ sid, finalText }) => {

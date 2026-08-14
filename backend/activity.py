@@ -622,6 +622,7 @@ class ActivityService:
         *,
         activity_source: str = "",
         owner_id: str = "",
+        mark_read: bool | None = None,
     ) -> dict[str, Any]:
         self.initialize_runtime_state()
         state = "completed" if status == "completed" else (
@@ -665,7 +666,18 @@ class ActivityService:
             # duplicate SSE revision. A different terminal state is still
             # allowed to correct later authoritative information.
             if item.get("state") == state and state in _TERMINAL:
-                if owner_revoked:
+                mark_read_changed = bool(
+                    mark_read is True and not item.get("read")
+                )
+                if mark_read_changed:
+                    # A retry may observe a terminal row written by an earlier
+                    # cleanup before the background path supplied its atomic-read
+                    # intent.  Repair only the read bit; retain the original
+                    # terminal timestamp/order and publish one coherent state.
+                    item.update(read=True, needs_attention=False)
+                    self._save()
+                    self._publish_locked(item=item)
+                elif owner_revoked:
                     # Persist only the ownership revocation. Do not change the
                     # timestamp/read bit or publish another SSE revision: the
                     # terminal state itself is still an idempotent no-op.
@@ -674,8 +686,18 @@ class ActivityService:
             now = time.time()
             if activity_source:
                 item["activity_source"] = activity_source[:40]
+            # Background logical turns surface their result as a normal Agent
+            # bubble in chat.  Their Activity row remains useful history, but
+            # must become terminal+read in this same locked mutation: publishing
+            # an unread finish and ACKing it afterwards exposes a transient red
+            # badge to SSE clients.  Other callers retain the established unread
+            # completion/failure semantics by leaving ``mark_read`` unspecified.
+            terminal_read = (
+                bool(mark_read) if mark_read is not None
+                else state == "cancelled"
+            )
             item.update(state=state, finished_at=now, updated_at=now,
-                        needs_attention=False, read=state == "cancelled",
+                        needs_attention=False, read=terminal_read,
                         status_detail={"completed": "Task completed",
                                        "failed": "Task failed",
                                        "cancelled": "Task cancelled"}[state])

@@ -39,15 +39,21 @@ for name in \
     PATH HOME USER LOGNAME SHELL TERM TMPDIR LANG TZ \
     XDG_RUNTIME_DIR XDG_CONFIG_HOME XDG_CACHE_HOME XDG_DATA_HOME \
     SSL_CERT_FILE SSL_CERT_DIR REQUESTS_CA_BUNDLE NODE_EXTRA_CA_CERTS \
-    DUCC_AUTH_SOURCE; do
+    DUCC_AUTH_SOURCE \
+    LC_ALL LC_CTYPE LC_NUMERIC LC_TIME LC_COLLATE LC_MONETARY LC_MESSAGES \
+    LC_PAPER LC_NAME LC_ADDRESS LC_TELEPHONE LC_MEASUREMENT \
+    LC_IDENTIFICATION; do
     append_if_set "$name"
 done
 
-# Locale variables are configuration, not credentials, and can be named
-# beyond LC_ALL/LC_CTYPE.  Preserve only that closed prefix.
-while IFS= read -r name; do
-    [[ "$name" == LC_* ]] && append_if_set "$name"
-done < <(compgen -e)
+# This host signal is intentionally data-minimal.  Do not let an operator's
+# arbitrary ambient value cross the env -i boundary under an allowlisted name;
+# MuseLab emits a canonical ISO timestamp and direct invocations must match the
+# same timestamp-only shape.
+resume_source_alive="${CLAUDE_CODE_RESUME_SOURCE_ALIVE:-}"
+if [[ "$resume_source_alive" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]{1,6})?Z$ ]]; then
+    safe_env+=("CLAUDE_CODE_RESUME_SOURCE_ALIVE=$resume_source_alive")
+fi
 
 # Keep credential-free proxy compatibility.  A URL containing userinfo would
 # hand a reusable proxy password to every tool DUCC launches, so omit it.

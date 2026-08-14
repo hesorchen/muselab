@@ -155,6 +155,114 @@ def test_watch_resource_errors_switch_to_bounded_polling(
 
 
 @pytest.mark.asyncio
+async def test_bootstrap_and_delta_perf_events_are_bounded_and_selective(
+    app_module,
+    temp_root,
+    monkeypatch,
+):
+    import backend.file_events as file_events
+
+    class FakeStore:
+        delta_payload = {
+            "cursor": 1,
+            "changes": [{"path": "private-delta.txt"}],
+            "resync": False,
+            "has_more": False,
+        }
+
+        def bootstrap(self, *_args, **_kwargs):
+            return {
+                "entries": [
+                    {"path": "private-one.txt"},
+                    {"path": "private-two.txt"},
+                ],
+                "partial": True,
+            }
+
+        def delta(self, *_args, **_kwargs):
+            return dict(self.delta_payload)
+
+    store = FakeStore()
+    manager = file_events.FileWatchManager(store)
+    state = file_events._WatchState(
+        root=temp_root,
+        workspace_id="workspace-sensitive-identifier",
+        initialized=True,
+    )
+
+    async def ensure_workspace(_root):
+        return state
+
+    async def await_baseline(_state):
+        return None
+
+    events = []
+    monkeypatch.setattr(manager, "ensure_workspace", ensure_workspace)
+    monkeypatch.setattr(manager, "_await_baseline", await_baseline)
+    monkeypatch.setattr(file_events, "is_slow", lambda _duration: False)
+    monkeypatch.setattr(
+        file_events,
+        "perf_event",
+        lambda event, **fields: events.append((event, fields)),
+    )
+
+    payload = await manager.bootstrap(temp_root, parents=[])
+    assert len(payload["entries"]) == 2
+    assert events[0][0] == "files.bootstrap"
+    assert events[0][1] == {
+        "workspace": "workspac",
+        "status": "ok",
+        "total_ms": events[0][1]["total_ms"],
+        "entries": 2,
+        "partial": True,
+    }
+
+    # A normal fast delta is intentionally silent.
+    await manager.delta(temp_root, 0)
+    assert [event for event, _fields in events] == ["files.bootstrap"]
+
+    store.delta_payload = {
+        **store.delta_payload,
+        "resync": True,
+        "changes": [],
+    }
+    await manager.delta(temp_root, 0)
+    store.delta_payload = {
+        **store.delta_payload,
+        "resync": False,
+        "has_more": True,
+    }
+    await manager.delta(temp_root, 0)
+    monkeypatch.setattr(file_events, "is_slow", lambda _duration: True)
+    store.delta_payload = {
+        **store.delta_payload,
+        "has_more": False,
+    }
+    await manager.delta(temp_root, 0)
+
+    assert [event for event, _fields in events] == [
+        "files.bootstrap",
+        "files.delta",
+        "files.delta",
+        "files.delta",
+    ]
+    assert [fields["resync"] for _, fields in events[1:]] == [
+        True,
+        False,
+        False,
+    ]
+    assert [fields["has_more"] for _, fields in events[1:]] == [
+        False,
+        True,
+        False,
+    ]
+    captured = repr(events)
+    assert str(temp_root) not in captured
+    assert "private-one.txt" not in captured
+    assert "private-delta.txt" not in captured
+
+
+@pytest.mark.asyncio
 async def test_watch_limit_fallback_polls_only_indexed_shallow_directories(
     app_module,
     temp_root,
@@ -172,7 +280,7 @@ async def test_watch_limit_fallback_polls_only_indexed_shallow_directories(
 
     async def fake_awatch(*paths, **options):
         calls.append((tuple(Path(path) for path in paths), options))
-        if len(calls) == 1:
+        if len(calls) <= 2:
             raise RuntimeError(
                 "No space left on device (os error 28)"
             )
@@ -181,6 +289,12 @@ async def test_watch_limit_fallback_polls_only_indexed_shallow_directories(
 
     monkeypatch.setattr(file_events, "awatch", fake_awatch)
     monkeypatch.setattr(file_events, "_WATCH_RETRY_S", 0)
+    perf_events = []
+    monkeypatch.setattr(
+        file_events,
+        "perf_event",
+        lambda event, **fields: perf_events.append((event, fields)),
+    )
     manager = file_events.FileWatchManager(store)
     state = file_events._WatchState(
         root=temp_root,
@@ -198,6 +312,17 @@ async def test_watch_limit_fallback_polls_only_indexed_shallow_directories(
     assert temp_root in polling_paths
     assert temp_root / "notes" in polling_paths
     assert opaque not in polling_paths
+    assert perf_events == [
+        (
+            "files.watcher_mode",
+            {
+                "workspace": file_events.short_id(workspace_id),
+                "mode": "polling",
+                "reason": "resource_exhaustion",
+                "error_type": "RuntimeError",
+            },
+        ),
+    ]
     await manager.shutdown()
 
 
@@ -500,6 +625,74 @@ async def test_failed_generation_reconciles_only_after_retry_is_armed(
             row["path"]
             for row in store.delta(workspace_id, baseline)["changes"]
         }
+    await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_reconcile_perf_event_splits_wait_scan_and_replay(
+    app_module,
+    temp_root,
+    monkeypatch,
+):
+    import backend.file_events as file_events
+
+    class FakeStore:
+        def current_cursor(self, _workspace_id):
+            return 9
+
+        def reconcile(self, *_args, **_kwargs):
+            return 9
+
+        def delta(self, *_args, **_kwargs):
+            return {
+                "cursor": 9,
+                "changes": [{"path": "private-replay.txt"}],
+                "resync": False,
+                "has_more": True,
+            }
+
+        def close(self):
+            return None
+
+    events = []
+    monkeypatch.setattr(
+        file_events,
+        "perf_event",
+        lambda event, **fields: events.append((event, fields)),
+    )
+    manager = file_events.FileWatchManager(FakeStore())
+    state = file_events._WatchState(
+        root=temp_root,
+        workspace_id="workspace-sensitive-identifier",
+        initialized=True,
+    )
+
+    # Exercise both independent queueing stages without making the test slow.
+    await manager._reconcile_semaphore.acquire()
+    await state.mutation_lock.acquire()
+    task = asyncio.create_task(manager._reconcile_and_broadcast(state))
+    await asyncio.sleep(0.02)
+    manager._reconcile_semaphore.release()
+    await asyncio.sleep(0.02)
+    state.mutation_lock.release()
+    await asyncio.wait_for(task, timeout=1)
+
+    assert len(events) == 1
+    event, fields = events[0]
+    assert event == "files.reconcile"
+    assert fields["workspace"] == "workspac"
+    assert fields["status"] == "ok"
+    assert fields["error_type"] is None
+    assert fields["scan_slot_wait_ms"] >= 10
+    assert fields["mutation_lock_wait_ms"] >= 10
+    assert fields["scan_ms"] >= 0
+    assert fields["replay_ms"] >= 0
+    assert fields["changes"] == 1
+    assert fields["resync"] is True
+    assert fields["total_ms"] >= 30
+    captured = repr(events)
+    assert str(temp_root) not in captured
+    assert "private-replay.txt" not in captured
     await manager.shutdown()
 
 
@@ -1603,11 +1796,26 @@ def test_unchanged_reconcile_does_not_bulk_reinsert(
     }
 
 
-def test_slow_subscriber_is_collapsed_to_resync(app_module, temp_root):
+def test_slow_subscriber_is_collapsed_to_resync(
+    app_module,
+    temp_root,
+    monkeypatch,
+):
     from backend.file_events import FileWatchManager, _WatchState
+    import backend.file_events as file_events
 
+    events = []
+    monkeypatch.setattr(
+        file_events,
+        "perf_event",
+        lambda event, **fields: events.append((event, fields)),
+    )
     queue: asyncio.Queue = asyncio.Queue(maxsize=1)
-    state = _WatchState(root=temp_root, subscribers={queue})
+    state = _WatchState(
+        root=temp_root,
+        workspace_id="workspace-sensitive-identifier",
+        subscribers={queue},
+    )
     FileWatchManager._broadcast(
         state,
         {"changes": [{"type": "added", "path": "first"}]},
@@ -1616,4 +1824,19 @@ def test_slow_subscriber_is_collapsed_to_resync(app_module, temp_root):
         state,
         {"changes": [{"type": "added", "path": "second"}]},
     )
+    FileWatchManager._broadcast(
+        state,
+        {"changes": [{"type": "added", "path": "third"}]},
+    )
     assert queue.get_nowait() == {"resync": True, "changes": []}
+    assert events == [
+        (
+            "files.watcher_queue_overflow",
+            {
+                "workspace": "workspac",
+                "subscribers": 1,
+                "overflowed": 1,
+            },
+        ),
+    ]
+    assert str(temp_root) not in repr(events)

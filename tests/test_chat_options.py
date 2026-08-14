@@ -1,4 +1,5 @@
 import asyncio
+from datetime import datetime
 
 import pytest
 
@@ -96,6 +97,120 @@ def test_third_party_provider_enables_sdk_skills(app_module, monkeypatch, tmp_pa
         assert captured["env"][f"ANTHROPIC_DEFAULT_{tier}_MODEL"] == "deepseek-v4-pro"
 
 
+def test_runtime_successor_marks_live_resume_source_without_losing_provider_env(
+    app_module, monkeypatch,
+):
+    from backend import chat as chat_mod
+    from backend import endpoints, sessions as sess
+
+    ambient = "ambient-value-must-not-leak"
+    monkeypatch.setenv("CLAUDE_CODE_RESUME_SOURCE_ALIVE", ambient)
+    monkeypatch.setattr(
+        endpoints,
+        "env_override",
+        lambda _model: {
+            "ANTHROPIC_API_KEY": "provider-secret",
+            "ANTHROPIC_BASE_URL": "https://provider.invalid",
+            "PROVIDER_SENTINEL": "preserved",
+        },
+    )
+    source = sess.create_session("runtime source", model="deepseek-v4-pro")
+    fork_boundary = "2026-08-14T09:21:38.123Z"
+    successor = sess.register_session(
+        "11111111-2222-4333-8444-555555555555",
+        name="runtime successor",
+        model="deepseek-v4-pro",
+        runtime_predecessor=source["id"],
+        runtime_fork_boundary_at=fork_boundary,
+    )
+    assert sess.link_runtime_successor(source["id"], successor["id"])
+    captured = _capture_build_options(chat_mod, monkeypatch)
+    # Exercise the resume path: this marker exists specifically to tell the
+    # resumed CLI that the predecessor process still owns inherited tasks.
+    monkeypatch.setattr(
+        chat_mod, "_find_session_jsonl", lambda _sid: "/fake/session.jsonl")
+
+    asyncio.run(chat_mod._build_and_connect_client(
+        successor["id"], "deepseek-v4-pro", "bypassPermissions", ""))
+
+    assert captured["resume"] == successor["id"]
+    provider_env = captured["env"]
+    assert provider_env["ANTHROPIC_API_KEY"] == "provider-secret"
+    assert provider_env["ANTHROPIC_BASE_URL"] == "https://provider.invalid"
+    assert provider_env["PROVIDER_SENTINEL"] == "preserved"
+    marker = provider_env["CLAUDE_CODE_RESUME_SOURCE_ALIVE"]
+    assert marker
+    assert marker != ambient
+    parsed = datetime.fromisoformat(marker.replace("Z", "+00:00"))
+    assert parsed.tzinfo is not None
+    assert parsed == datetime.fromisoformat(
+        fork_boundary.replace("Z", "+00:00"))
+
+
+def test_ordinary_resume_neutralizes_ambient_live_source_marker(
+    app_module, monkeypatch,
+):
+    from backend import chat as chat_mod
+    from backend import endpoints, sessions as sess
+
+    monkeypatch.setenv(
+        "CLAUDE_CODE_RESUME_SOURCE_ALIVE", "ambient-value-must-not-leak")
+    monkeypatch.setattr(
+        endpoints,
+        "env_override",
+        lambda _model: {
+            "ANTHROPIC_API_KEY": "provider-secret",
+            "ANTHROPIC_BASE_URL": "https://provider.invalid",
+            "PROVIDER_SENTINEL": "preserved",
+        },
+    )
+    ordinary = sess.create_session("ordinary", model="deepseek-v4-pro")
+    captured = _capture_build_options(chat_mod, monkeypatch)
+    monkeypatch.setattr(
+        chat_mod, "_find_session_jsonl", lambda _sid: "/fake/session.jsonl")
+
+    asyncio.run(chat_mod._build_and_connect_client(
+        ordinary["id"], "deepseek-v4-pro", "bypassPermissions", ""))
+
+    assert captured["resume"] == ordinary["id"]
+    assert captured["env"]["PROVIDER_SENTINEL"] == "preserved"
+    assert captured["env"]["CLAUDE_CODE_RESUME_SOURCE_ALIVE"] == ""
+
+
+def test_runtime_task_context_uses_authoritative_state_without_private_output(
+    app_module,
+):
+    from backend import chat as chat_mod
+    from backend import sessions as sess
+
+    source = sess.create_session("runtime source")
+    child = sess.create_session("runtime successor")
+    assert sess.link_runtime_successor(source["id"], child["id"])
+    assert sess.set_runtime_task_overlay(
+        source["id"],
+        "task-safe-id",
+        owner_session_id=source["id"],
+        state="completed",
+        updated_at=123456,
+        summary="private task result must stay out",
+        output_file="/private/workspace/result.txt",
+        description="private command description",
+    )
+
+    hook = chat_mod._build_runtime_task_context_hook(child["id"])
+    result = asyncio.run(hook({}, None, None))
+    context = result["hookSpecificOutput"]["additionalContext"]
+
+    assert "task-safe-id" in context
+    assert "state=completed" in context
+    assert "updated_at_ms=123456" in context
+    assert "private task result" not in context
+    assert "/private/workspace" not in context
+    assert "private command description" not in context
+    assert source["id"] not in context
+    assert child["id"] not in context
+
+
 def test_ducc_model_uses_real_cli_runtime_without_native_auth(
     app_module, monkeypatch, tmp_path,
 ):
@@ -191,6 +306,111 @@ def test_ducc_stderr_is_categorized_without_persisting_raw_detail(app_module):
     assert notice == "authentication detail suppressed for privacy"
     assert "synthetic-secret" not in notice
     assert "synthetic-private-prompt" not in notice
+
+
+def test_regular_cli_stderr_is_private_and_deduplicated_per_client(
+    app_module, monkeypatch, tmp_path, capsys,
+):
+    from backend import chat as chat_mod
+    from backend import endpoints
+
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    monkeypatch.setattr(endpoints, "_VENDOR_CONFIG_DIR", tmp_path / "vendor-cfg")
+    captured = _capture_build_options(chat_mod, monkeypatch)
+
+    asyncio.run(chat_mod._build_and_connect_client(
+        "12345678-private-session", "deepseek-v4-pro",
+        "bypassPermissions", ""))
+    stderr_sink = captured["stderr"]
+    capsys.readouterr()
+    private_auth = (
+        "authentication failed token=synthetic-secret "
+        "prompt=synthetic-private-prompt /private/workspace/file.py"
+    )
+    stderr_sink(private_auth)
+    stderr_sink(private_auth)
+    stderr_sink("network timeout contacting https://private.invalid/api")
+    stderr_sink("network timeout contacting https://private.invalid/api")
+    logged = capsys.readouterr().err
+
+    assert logged.count("category=authentication") == 1
+    assert logged.count("category=network") == 1
+    assert "sid=12345678" in logged
+    assert "synthetic-secret" not in logged
+    assert "synthetic-private-prompt" not in logged
+    assert "/private/workspace" not in logged
+    assert "private.invalid" not in logged
+
+
+def test_turn_perf_summary_is_emitted_once_without_content(
+    app_module, monkeypatch,
+):
+    from backend import chat as chat_mod
+
+    events = []
+    monkeypatch.setattr(
+        chat_mod.obs,
+        "perf_event",
+        lambda event, **fields: events.append((event, fields)),
+    )
+    broadcast = chat_mod.TurnBroadcast(
+        "12345678-private-session", model="codex:gpt-5.6-sol")
+    broadcast.user_text = "synthetic-private-prompt"
+    broadcast.perf_client = "warm"
+    broadcast.perf_client_ms = 4
+    broadcast.perf_preflight_ms = 7
+    broadcast.perf_query_started = chat_mod.obs.monotonic()
+    broadcast.publish({
+        "event": "text",
+        "data": '{"text":"synthetic-private-response"}',
+    })
+    broadcast.perf_result_ms = 11
+    broadcast.perf_post_started = chat_mod.obs.monotonic()
+    broadcast.perf_status = "completed"
+    broadcast.perf_background_count = 2
+
+    broadcast.finish()
+    broadcast.finish()
+
+    assert len(events) == 1
+    event, fields = events[0]
+    assert event == "chat.turn"
+    assert fields["sid8"] == "12345678"
+    assert len(fields["turn8"]) == 8
+    assert fields["source"] == "direct"
+    assert fields["client"] == "warm"
+    assert fields["status"] == "completed"
+    assert fields["background_count"] == 2
+    rendered = repr(fields)
+    assert "synthetic-private-prompt" not in rendered
+    assert "synthetic-private-response" not in rendered
+    assert "private-session" not in rendered
+
+
+def test_context_probe_failure_log_is_deduplicated_and_private(
+    app_module, capsys,
+):
+    from backend import chat as chat_mod
+
+    chat_mod._CONTEXT_PROBE_LOG_STATE.clear()
+    capsys.readouterr()
+    error = TimeoutError(
+        "synthetic-secret https://private.invalid /private/workspace")
+    chat_mod._log_context_probe_failure("codex:gpt-5.6-sol", error)
+    chat_mod._log_context_probe_failure("codex:gpt-5.6-sol", error)
+    failed = capsys.readouterr().err
+
+    assert failed.count("gateway context probe unavailable") == 1
+    assert "exc=TimeoutError" in failed
+    assert "synthetic-secret" not in failed
+    assert "private.invalid" not in failed
+    assert "/private/workspace" not in failed
+
+    chat_mod._log_context_probe_recovery("codex:gpt-5.6-sol")
+    recovered = capsys.readouterr().err
+    assert recovered.count("gateway context probe recovered") == 1
+    assert "suppressed=1" in recovered
+    chat_mod._CONTEXT_PROBE_LOG_STATE.clear()
 
 
 def test_non_bypass_runtime_installs_permission_resolver(

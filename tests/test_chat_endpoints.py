@@ -251,6 +251,49 @@ def test_permission_patch_enters_plan_and_rebuilds_client(chat_mod, client):
     assert current["plan_return_permission"] == before["permission"]
 
 
+def test_context_breakdown_uses_sdk_control_channel(chat_mod, client):
+    """The /context UI must use the typed SDK control request on the pooled
+    client; it must not open a second receive iterator on the chat stream."""
+    sid = _make_compact_session(client)
+    chat_mod.sess.update_model(sid, "claude-sonnet-4-6")
+
+    class ContextClient(_FakeSDKClient):
+        def __init__(self):
+            super().__init__()
+            self.context_calls = 0
+
+        async def get_context_usage(self):
+            self.context_calls += 1
+            return {
+                "categories": [
+                    {"name": "Messages", "tokens": 1234, "color": "blue"},
+                ],
+                "totalTokens": 1234,
+                "maxTokens": 200_000,
+                "percentage": 0.6,
+                "model": "claude-sonnet-4-6",
+                "apiUsage": {"inputTokens": 1234, "outputTokens": 56},
+            }
+
+    sdk_client = ContextClient()
+    _seed(
+        chat_mod,
+        (sid, "claude-sonnet-4-6", "auto", ""),
+        client=sdk_client,
+    )
+
+    response = client.get(
+        f"/api/chat/context-breakdown/{sid}",
+        headers={"X-Auth-Token": TEST_TOKEN},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["totalTokens"] == 1234
+    assert response.json()["categories"][0]["name"] == "Messages"
+    assert response.json()["apiUsage"]["outputTokens"] == 56
+    assert sdk_client.context_calls == 1
+
+
 @pytest.mark.asyncio
 async def test_runtime_rebuild_defers_while_turn_is_reserved(chat_mod):
     sid = "sid-deferred-rebuild"
@@ -354,6 +397,47 @@ def test_interrupt_swallows_sdk_error_but_still_marks_pending(chat_mod, client):
     assert "sid-boom" in chat_mod._pending_interrupts
 
 
+def test_stop_background_task_uses_sdk_control_channel(chat_mod, client):
+    """Stopping a named background task is distinct from interrupting the
+    foreground turn and delegates to ClaudeAgentSDK.stop_task()."""
+    sid = "sid-task-stop"
+
+    class TaskClient(_FakeSDKClient):
+        def __init__(self):
+            super().__init__()
+            self.stopped_tasks = []
+
+        async def stop_task(self, task_id):
+            self.stopped_tasks.append(task_id)
+
+    sdk_client = TaskClient()
+    _seed(
+        chat_mod,
+        (sid, "claude-sonnet-4-6", "auto", ""),
+        client=sdk_client,
+    )
+
+    response = client.post(
+        f"/api/chat/sessions/{sid}/tasks/task-123/stop",
+        headers={"X-Auth-Token": TEST_TOKEN},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"ok": True, "task_id": "task-123"}
+    assert sdk_client.stopped_tasks == ["task-123"]
+    assert sdk_client.interrupted is False
+
+
+def test_stop_background_task_without_live_owner_is_conflict(chat_mod, client):
+    response = client.post(
+        "/api/chat/sessions/missing/tasks/task-123/stop",
+        headers={"X-Auth-Token": TEST_TOKEN},
+    )
+
+    assert response.status_code == 409, response.text
+    assert "no live client" in response.json()["detail"]
+
+
 def test_interrupt_does_not_inherit_sdk_60_second_ack_timeout(
         chat_mod, client, monkeypatch):
     """A wedged SDK control request must not make the Stop button wait."""
@@ -409,7 +493,7 @@ async def test_interrupt_cancels_cold_client_startup_immediately(
     monkeypatch.setattr(
         activity_module.activity,
         "finish",
-        lambda activity_sid, status, *, activity_source="", owner_id="": activity_transitions.append(
+        lambda activity_sid, status, *, activity_source="", owner_id="", mark_read=None: activity_transitions.append(
             ("finish", activity_sid, status)),
     )
 
@@ -463,7 +547,14 @@ async def test_request_cancel_during_activity_start_releases_queue_claim(
         assert release_activity.wait(timeout=2)
         transitions.append(("start", activity_sid, summary, activity_source))
 
-    def finish(activity_sid, status, *, activity_source="", owner_id=""):
+    def finish(
+        activity_sid,
+        status,
+        *,
+        activity_source="",
+        owner_id="",
+        mark_read=None,
+    ):
         transitions.append(("finish", activity_sid, status, activity_source))
 
     async def no_watcher(_sid):
@@ -714,13 +805,13 @@ async def test_async_purge_keeps_runtime_mutation_on_event_loop(
     monkeypatch.setattr(chat_mod, "disconnect_client", no_disconnect)
     monkeypatch.setattr(
         chat_mod,
-        "purge_session_storage",
+        "_purge_single_session_storage",
         lambda _sid: True,
     )
     monkeypatch.setattr(
         activity_module.activity,
         "finish",
-        lambda activity_sid, status, *, activity_source="", owner_id="":
+        lambda activity_sid, status, *, activity_source="", owner_id="", mark_read=None:
             activity_finishes.append((activity_sid, status, activity_source)),
     )
     chat_mod._background_activity_finishes[sid] = (
@@ -947,7 +1038,8 @@ async def test_async_purge_joins_scheduler_run_before_disk_delete(
         return None
 
     monkeypatch.setattr(chat_mod, "disconnect_client", no_disconnect)
-    monkeypatch.setattr(chat_mod, "purge_session_storage", disk_purge)
+    monkeypatch.setattr(
+        chat_mod, "_purge_single_session_storage", disk_purge)
 
     assert await chat_mod.purge_session_storage_async(sid) is True
     assert running.cancelled()
@@ -1008,7 +1100,8 @@ async def test_async_purge_joins_future_startup_cleanup_before_disk_delete(
     monkeypatch.setattr(chat_mod, "_handoff_task_watcher", no_watcher)
     monkeypatch.setattr(chat_mod, "disconnect_client", no_disconnect)
     monkeypatch.setattr(chat_mod, "_finish_activity", blocked_finish)
-    monkeypatch.setattr(chat_mod, "purge_session_storage", disk_purge)
+    monkeypatch.setattr(
+        chat_mod, "_purge_single_session_storage", disk_purge)
     monkeypatch.setattr(activity_module.activity, "start", activity_start)
     monkeypatch.setattr(
         activity_module.activity,
@@ -1037,6 +1130,142 @@ async def test_async_purge_joins_future_startup_cleanup_before_disk_delete(
     assert broadcast.activity_started is False
     assert sid not in chat_mod._active_turns
     assert sid not in chat_mod._recent_turns
+
+
+def test_sync_purge_rechecks_late_successor_after_delete_fence(
+        chat_mod, monkeypatch):
+    source_sid = "late-source"
+    late_sid = "late-successor"
+    fenced = []
+    purged = []
+
+    monkeypatch.setattr(
+        chat_mod.sess, "runtime_lineage", lambda _sid: [source_sid])
+    monkeypatch.setattr(
+        chat_mod.sess,
+        "begin_session_delete",
+        lambda runtime_sid: fenced.append(runtime_sid),
+    )
+    monkeypatch.setattr(
+        chat_mod.sess,
+        "get_session_meta",
+        lambda runtime_sid: {
+            "runtime_successor": late_sid if runtime_sid == source_sid else "",
+        },
+    )
+    monkeypatch.setattr(
+        chat_mod,
+        "_purge_single_session_storage",
+        lambda runtime_sid: purged.append(runtime_sid) or True,
+    )
+
+    assert chat_mod.purge_session_storage(source_sid) is True
+    assert fenced == [source_sid, late_sid]
+    assert purged == [source_sid, late_sid]
+
+
+def test_sync_purge_fails_closed_for_live_runtime(chat_mod, monkeypatch):
+    sid = "sync-live-runtime"
+    monkeypatch.setattr(chat_mod.sess, "runtime_lineage", lambda _sid: [sid])
+    active = chat_mod.TurnBroadcast(sid)
+    chat_mod._active_turns[sid] = active
+    try:
+        with pytest.raises(RuntimeError, match="purge_session_storage_async"):
+            chat_mod.purge_session_storage(sid)
+    finally:
+        chat_mod._active_turns.pop(sid, None)
+        active.close()
+
+
+def test_sync_purge_rechecks_live_owner_after_delete_fence(
+        chat_mod, monkeypatch):
+    sid = "sync-reservation-race"
+    active = chat_mod.TurnBroadcast(sid)
+    disk_purged = False
+
+    monkeypatch.setattr(chat_mod.sess, "runtime_lineage", lambda _sid: [sid])
+
+    def fence(_sid):
+        chat_mod._active_turns[sid] = active
+
+    def must_not_purge(_sid):
+        nonlocal disk_purged
+        disk_purged = True
+        return True
+
+    monkeypatch.setattr(chat_mod.sess, "begin_session_delete", fence)
+    monkeypatch.setattr(
+        chat_mod.sess, "get_session_meta", lambda _sid: {})
+    monkeypatch.setattr(
+        chat_mod, "_purge_single_session_storage", must_not_purge)
+    try:
+        with pytest.raises(RuntimeError, match="purge_session_storage_async"):
+            chat_mod.purge_session_storage(sid)
+        assert disk_purged is False
+    finally:
+        chat_mod._active_turns.pop(sid, None)
+        active.close()
+
+
+@pytest.mark.asyncio
+async def test_sync_and_async_purge_from_leaf_clear_full_runtime_lineage(
+        chat_mod, monkeypatch):
+    def missing_sdk(*_args, **_kwargs):
+        raise FileNotFoundError
+
+    def register_lineage(ids):
+        for index, runtime_sid in enumerate(ids):
+            chat_mod.sess.register_session(
+                runtime_sid,
+                name=f"runtime-{index}",
+                model="claude-sonnet-4-6",
+                runtime_predecessor=ids[index - 1] if index else "",
+            )
+            if index:
+                assert chat_mod.sess.link_runtime_successor(
+                    ids[index - 1], runtime_sid)
+
+    def seed_private_artifacts(ids):
+        outbox = chat_mod._runtime_continuation_outbox_path(
+            ids[0], "abababab-cdcd-4efe-8a8a-010101010101")
+        snapshot = chat_mod._cancelled_turn_snapshot_path(
+            ids[-1], "bcbcbcbc-dede-4faf-8b8b-020202020202")
+        for path in (outbox, snapshot):
+            assert path is not None
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("{}", encoding="utf-8")
+        return outbox, snapshot
+
+    monkeypatch.setattr(chat_mod, "sdk_delete_session", missing_sdk)
+    sync_ids = [
+        "56565656-7878-49ab-8ccd-efefefefefef",
+        "67676767-8989-4abc-8dde-f0f0f0f0f0f0",
+        "78787878-9a9a-4bcd-8eef-010101010101",
+    ]
+    register_lineage(sync_ids)
+    sync_outbox, sync_snapshot = seed_private_artifacts(sync_ids)
+    assert chat_mod.purge_session_storage(sync_ids[-1]) is True
+    assert all(
+        chat_mod.sess.get_session_meta(runtime_sid) is None
+        for runtime_sid in sync_ids
+    )
+    assert not sync_outbox.exists()
+    assert not sync_snapshot.exists()
+
+    async_ids = [
+        "89898989-abab-4cde-8ff0-121212121212",
+        "9a9a9a9a-bcbc-4def-8011-232323232323",
+        "abababab-cdcd-4ef0-8122-343434343434",
+    ]
+    register_lineage(async_ids)
+    async_outbox, async_snapshot = seed_private_artifacts(async_ids)
+    assert await chat_mod.purge_session_storage_async(async_ids[-1]) is True
+    assert all(
+        chat_mod.sess.get_session_meta(runtime_sid) is None
+        for runtime_sid in async_ids
+    )
+    assert not async_outbox.exists()
+    assert not async_snapshot.exists()
 
 
 @pytest.mark.asyncio
@@ -1515,7 +1744,12 @@ def test_continue_detached_forks_once_hides_source_and_migrates_queue(
     assert len(fork_calls) == 1
     assert fork_calls[0][1]["up_to_message_id"] == boundary
     assert chat_mod.sess.get_session_meta(sid)["runtime_shadow"] is True
-    assert chat_mod.sess.get_session_meta(child_sid)["runtime_predecessor"] == sid
+    child_meta = chat_mod.sess.get_session_meta(child_sid)
+    assert child_meta["runtime_predecessor"] == sid
+    assert child_meta["runtime_fork_boundary_at"].endswith("Z")
+    assert chat_mod.sess.normalize_runtime_fork_boundary_at(
+        child_meta["runtime_fork_boundary_at"]
+    ) == child_meta["runtime_fork_boundary_at"]
     listed = {row["id"] for row in chat_mod.sess.list_sessions()}
     assert sid not in listed
     assert child_sid in listed
@@ -1893,6 +2127,20 @@ def test_runtime_task_terminal_overlay_reaches_every_successor(chat_mod):
     chat_mod._record_background_task_launch(
         source["id"], "task-a", tool_use_id="tool-a", description="sleep")
 
+    # A resumed successor can receive a synthetic orphan notification for the
+    # predecessor-owned task. It is not lifecycle truth: it must neither
+    # release the source pin nor poison any persisted/UI state.
+    assert chat_mod._on_task_settled(
+        child["id"], "task-a", status="stopped",
+        summary="No completion record was found in the previous session.",
+    ) is None
+    assert "task-a" in chat_mod._sessions_with_inflight_tasks[source["id"]]
+    for sid in (source["id"], child["id"], grandchild["id"]):
+        overlay = chat_mod.sess.get_runtime_task_overlays(sid)["task-a"]
+        assert overlay["state"] == "running"
+        assert overlay["owner_session_id"] == source["id"]
+        assert "summary" not in overlay
+
     assert chat_mod._on_task_settled(
         source["id"], "task-a", status="completed",
         tool_use_id="tool-a", summary="done", output_file="/tmp/a.output",
@@ -1903,6 +2151,12 @@ def test_runtime_task_terminal_overlay_reaches_every_successor(chat_mod):
         source["id"], "task-a", status="completed",
     ) is False
 
+    # Even after the source pin is gone, durable owner authority and terminal
+    # monotonicity reject the successor's late synthetic stop.
+    assert chat_mod._on_task_settled(
+        child["id"], "task-a", status="stopped", summary="synthetic stop",
+    ) is None
+
     for sid in (source["id"], child["id"], grandchild["id"]):
         overlay = chat_mod.sess.get_runtime_task_overlays(sid)["task-a"]
         assert overlay["state"] == "completed"
@@ -1910,6 +2164,10 @@ def test_runtime_task_terminal_overlay_reaches_every_successor(chat_mod):
         assert overlay["tool_use_id"] == "tool-a"
         assert overlay["summary"] == "done"
         assert overlay["output_file"] == "/tmp/a.output"
+    assert chat_mod._record_background_task_launch(
+        source["id"], "task-a", tool_use_id="tool-a",
+    ) is False
+    assert source["id"] not in chat_mod._sessions_with_inflight_tasks
 
 
 def test_native_compact_rejects_success_without_token_drop(chat_mod, client, monkeypatch):

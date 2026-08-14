@@ -74,6 +74,7 @@ from .ask_user_question import (
 )
 from . import permission_request as perm
 from . import memory_client as mem0
+from . import observability as obs
 from .sdk_compat import UnsignedThinkingCompatibleClient
 
 # Valid permission modes, derived from the SDK's PermissionMode literal so
@@ -135,6 +136,11 @@ _ULTRA_SKILL_CONTEXT = (
     "bundled ultra-orchestrator Skill for the user's original request."
 )
 
+# Claude CLI uses this host contract when resuming a transcript that was
+# forked away from a still-live runtime.  The value is only an ISO timestamp:
+# never put session ids, workspace paths, task descriptions, or output in it.
+_RUNTIME_RESUME_SOURCE_ALIVE_ENV = "CLAUDE_CODE_RESUME_SOURCE_ALIVE"
+
 
 def _normalize_effort(effort: str | None) -> str:
     """Canonicalize the legacy empty-string spelling to ``auto``."""
@@ -170,30 +176,47 @@ _DUCC_BASE_ENV_NAMES = (
     # material itself remains in DUCC's HOME-owned config and is not copied
     # from arbitrary environment prefixes.
     "DUCC_AUTH_SOURCE",
+    _RUNTIME_RESUME_SOURCE_ALIVE_ENV,
 )
 _DUCC_PROXY_ENV_NAMES = (
     "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
     "http_proxy", "https_proxy", "all_proxy", "no_proxy",
+)
+_DUCC_LOCALE_ENV_NAMES = (
+    "LC_ALL", "LC_CTYPE", "LC_NUMERIC", "LC_TIME", "LC_COLLATE",
+    "LC_MONETARY", "LC_MESSAGES", "LC_PAPER", "LC_NAME", "LC_ADDRESS",
+    "LC_TELEPHONE", "LC_MEASUREMENT", "LC_IDENTIFICATION",
 )
 
 
 def _ducc_subprocess_env(executable: str) -> dict[str, str]:
     """Build the complete, privacy-bounded environment for DUCC.
 
-    ClaudeAgentOptions.env is a subprocess environment replacement.  Starting
-    from an allowlist here prevents secrets unknown to MuseLab (for example a
-    future *_TOKEN variable) from reaching the wrapper at all.  Credentialed
-    proxy URLs are omitted as they commonly contain a reusable password.
+    Current Claude Agent SDK versions merge options.env over the parent
+    environment.  This allowlist controls explicit values, while the DUCC
+    wrapper's final ``env -i`` rebuild is the actual isolation boundary.
+    Credentialed proxy URLs are omitted as they commonly contain a reusable
+    password.
     """
     safe = {
         name: value
         for name in _DUCC_BASE_ENV_NAMES
         if (value := os.environ.get(name)) is not None
     }
+    # The allowlisted name is not permission to forward arbitrary content.
+    # Keep this host signal timestamp-only even if an operator's ambient
+    # environment contains a stale or accidentally sensitive value.
+    resume_boundary = sess.normalize_runtime_fork_boundary_at(
+        safe.get(_RUNTIME_RESUME_SOURCE_ALIVE_ENV)
+    )
+    if resume_boundary:
+        safe[_RUNTIME_RESUME_SOURCE_ALIVE_ENV] = resume_boundary
+    else:
+        safe.pop(_RUNTIME_RESUME_SOURCE_ALIVE_ENV, None)
     safe.update({
         name: value
-        for name, value in os.environ.items()
-        if name.startswith("LC_") and value
+        for name in _DUCC_LOCALE_ENV_NAMES
+        if (value := os.environ.get(name))
     })
     for name in _DUCC_PROXY_ENV_NAMES:
         value = os.environ.get(name)
@@ -206,8 +229,8 @@ def _ducc_subprocess_env(executable: str) -> dict[str, str]:
     return safe
 
 
-def _ducc_stderr_notice(line: str) -> str:
-    """Classify DUCC stderr without persisting its raw, potentially private text."""
+def _cli_stderr_category(line: str) -> str:
+    """Classify CLI stderr without retaining its potentially private text."""
     low = (line or "").lower()
     if any(word in low for word in (
         "auth", "credential", "login", "token", "unauthorized", "forbidden",
@@ -223,7 +246,48 @@ def _ducc_stderr_notice(line: str) -> str:
         category = "configuration"
     else:
         category = "runtime"
-    return f"{category} detail suppressed for privacy"
+    return category
+
+
+def _ducc_stderr_notice(line: str) -> str:
+    """Backward-compatible privacy-safe DUCC stderr notice."""
+    return f"{_cli_stderr_category(line)} detail suppressed for privacy"
+
+
+def _privacy_safe_cli_stderr_logger(
+    runtime: str,
+    session_id: str,
+):
+    """Return a per-client, per-category deduplicating stderr sink.
+
+    Claude/DUCC stderr may contain prompts, workspace paths, credentials, or
+    full upstream protocol payloads.  One category line is enough to diagnose
+    the failing layer; the authenticated SSE error remains the detailed user
+    surface.
+    """
+    seen: set[str] = set()
+    safe_runtime = "DUCC" if runtime == "DUCC" else "SDK-CLI"
+
+    def _logger(line: str) -> None:
+        category = _cli_stderr_category(line)
+        if category in seen:
+            return
+        seen.add(category)
+        sys.stderr.write(
+            f"[{safe_runtime}] sid={obs.short_id(session_id)} "
+            f"category={category} detail=suppressed\n"
+        )
+        sys.stderr.flush()
+
+    return _logger
+
+
+def _perf_event(event: str, /, **fields: Any) -> None:
+    """Best-effort bridge: diagnostics must never alter request lifecycles."""
+    try:
+        obs.perf_event(event, **fields)
+    except Exception:
+        pass
 
 
 def _build_ultra_skill_hook():
@@ -236,6 +300,68 @@ def _build_ultra_skill_hook():
             }
         }
     return ultra_skill_hook
+
+
+def _build_runtime_task_context_hook(session_id: str):
+    """Describe inherited task truth without exposing task output or paths.
+
+    Older successor transcripts may already contain Claude CLI's synthetic
+    "No completion record ... previous session" notification.  That record
+    only means the resumed CLI does not own the predecessor's process.  Give
+    the model a small, fresh, sidecar-backed correction on every prompt while
+    leaving the canonical user message and transcript untouched.
+    """
+    async def runtime_task_context(_input_data, _tool_use_id, _context):
+        overlays = sess.get_authoritative_runtime_task_overlays(session_id)
+        inherited: list[str] = []
+        inherited_overlays = [
+            (task_id, overlay)
+            for task_id, overlay in overlays.items()
+            if str(overlay.get("owner_session_id") or "") != session_id
+        ]
+        inherited_overlays.sort(
+            key=lambda item: (
+                -int(item[1].get("updated_at") or 0)
+                if isinstance(item[1].get("updated_at"), (int, float))
+                else 0,
+                str(item[0]),
+            )
+        )
+        for task_id, overlay in inherited_overlays[:32]:
+            safe_id = re.sub(
+                r"[^A-Za-z0-9_.:-]", "_", str(task_id)
+            )[:128]
+            state = str(overlay.get("state") or "unknown").lower()
+            if state not in {"running", "completed", "failed", "stopped"}:
+                state = "unknown"
+            updated_at = overlay.get("updated_at")
+            updated = (
+                str(int(updated_at))
+                if isinstance(updated_at, (int, float)) else "unknown"
+            )
+            inherited.append(
+                f"- task {safe_id}: state={state}, updated_at_ms={updated}"
+            )
+        if not inherited:
+            return {}
+        context = (
+            "MuseLab runtime handoff: these background tasks belong to a "
+            "still-separate predecessor runtime. The states below are the "
+            "authoritative MuseLab lifecycle state:\n"
+            + "\n".join(inherited)
+            + "\nIgnore automatic stopped notifications saying that no "
+              "completion record was found in a previous session for these "
+              "task ids; they mean only that this CLI does not own the task. "
+              "Do not call TaskOutput or TaskStop for inherited tasks."
+        )
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "UserPromptSubmit",
+                "additionalContext": context,
+            }
+        }
+
+    return runtime_task_context
 
 
 def _build_codex_skill_guard_hook():
@@ -1058,6 +1184,23 @@ class TurnBroadcast:
         # uses this bit to close only rows that were actually created.
         self.activity_started = False
         self.activity_hidden = False
+        # One low-cardinality performance summary per logical turn.  Values are
+        # monotonic durations or closed-set classifications only; prompts,
+        # paths, tool payloads and exception text never enter this structure.
+        self.perf_started = obs.monotonic()
+        self.perf_client = "cold"
+        self.perf_client_ms = 0
+        self.perf_preflight_ms = 0
+        self.perf_query_started = 0.0
+        self.perf_first_event_ms = -1
+        self.perf_first_visible_ms = -1
+        self.perf_result_ms = -1
+        self.perf_post_started = 0.0
+        self.perf_post_ms = 0
+        self.perf_status = "unknown"
+        self.perf_error_kind = "none"
+        self.perf_background_count = 0
+        self._perf_emitted = False
 
     @property
     def activity_source(self) -> str:
@@ -1092,6 +1235,15 @@ class TurnBroadcast:
         any subscriber was attached, which made replay length proportional to
         token count rather than message count.
         """
+        event_name = str(event.get("event") or "")
+        if (self.perf_query_started
+                and self.perf_first_visible_ms < 0
+                and event_name
+                and event_name not in {
+                    "compact_progress", "done", "error", "cancelled",
+                }):
+            self.perf_first_visible_ms = obs.elapsed_ms(
+                self.perf_query_started)
         current_text = _stream_text_payload(event)
         if current_text is not None:
             kind, text = current_text
@@ -1180,6 +1332,36 @@ class TurnBroadcast:
         self._flush_compact_text()
         self.done = True
         self.finished_at = time.time()
+        if self.perf_status == "unknown":
+            self.perf_status = "cancelled" if self.cancelled else "completed"
+            if self.cancelled:
+                self.perf_error_kind = "cancelled"
+        if self.perf_post_started:
+            self.perf_post_ms = obs.elapsed_ms(self.perf_post_started)
+        if not self._perf_emitted:
+            self._perf_emitted = True
+            try:
+                _perf_event(
+                    "chat.turn",
+                    sid8=obs.short_id(self.session_id),
+                    turn8=obs.short_id(self.turn_id),
+                    source=self.activity_source,
+                    model=self.model,
+                    client=self.perf_client,
+                    client_ms=self.perf_client_ms,
+                    preflight_ms=self.perf_preflight_ms,
+                    first_event_ms=self.perf_first_event_ms,
+                    first_visible_ms=self.perf_first_visible_ms,
+                    result_ms=self.perf_result_ms,
+                    post_ms=self.perf_post_ms,
+                    total_ms=obs.elapsed_ms(self.perf_started),
+                    status=self.perf_status,
+                    error_kind=self.perf_error_kind,
+                    background_count=self.perf_background_count,
+                )
+            except Exception:
+                # Observability must never change turn lifecycle semantics.
+                pass
         for subscriber in tuple(self.subscribers):
             subscriber.close()
         self.subscribers.clear()
@@ -1331,6 +1513,14 @@ _bg_task_pinned_at: dict[str, float] = {}
 # transcript counts after the verified compact result has already reached the
 # browser. Strong references prevent accidental mid-run garbage collection.
 _maintenance_tasks: set[asyncio.Task] = set()
+# A hidden runtime owns the real Claude continuation after one of its
+# background tasks settles.  When that runtime has already rolled over, the
+# resulting assistant text is delivered to the newest visible successor as a
+# presentation-only snapshot.  Keep the delivery task strongly referenced and
+# keyed by the durable outbox identity so retries cannot create two writers.
+_runtime_continuation_delivery_tasks: dict[
+    tuple[str, str], asyncio.Task
+] = {}
 # SDK disconnect owns process reaping and can legitimately take about 20s
 # (stdin close, graceful wait, TERM, then KILL). Keep timed-out owners keyed by
 # session so a retry/new turn must join the same cleanup before touching disk or
@@ -1454,7 +1644,11 @@ def _runtime_task_overlay(
         tool_use_id or _bg_task_tool_use_ids.get(tid) or ""
     )
     fields: dict[str, Any] = {
-        "state": "stopped" if state == "killed" else state,
+        "state": (
+            "stopped" if state == "killed"
+            else "completed" if state == "done"
+            else state
+        ),
         "owner_session_id": owner,
         "updated_at": int(time.time() * 1000),
     }
@@ -1493,10 +1687,24 @@ def _record_background_task_launch(
     tool_use_id: str | None = None,
     description: str | None = None,
     output_file: str | None = None,
-) -> None:
+) -> bool:
     tid = str(task_id or "")
     if not tid:
-        return
+        return False
+    # A rollover successor can replay launch-shaped records copied from its
+    # predecessor. Never let that replay acquire process ownership or a pin.
+    inherited = sess.get_authoritative_runtime_task_overlays(
+        session_id).get(tid, {})
+    inherited_owner = str(inherited.get("owner_session_id") or "")
+    if inherited_owner and inherited_owner != session_id:
+        return False
+    if str(inherited.get("state") or "") in {
+        "completed", "failed", "stopped", "done",
+    }:
+        # Task ids are lifecycle identities, not reusable names. A start seen
+        # after this same owner's terminal record is stream replay, not a new
+        # process, and must not recreate its watcher pin.
+        return False
     if tool_use_id:
         _bg_task_tool_use_ids[tid] = str(tool_use_id)
     if description:
@@ -1509,6 +1717,7 @@ def _record_background_task_launch(
         description=description,
         output_file=output_file,
     )
+    return True
 
 
 def _session_has_live_watcher(session_id: str) -> bool:
@@ -1610,8 +1819,8 @@ def _write_active_turn_sidecar(bc: TurnBroadcast) -> None:
         )
     except Exception as e:
         sys.stderr.write(
-            f"[chat] failed to write active-turn sidecar sid={bc.session_id}: "
-            f"{type(e).__name__}: {e}\n")
+            f"[chat] failed to write active-turn sidecar "
+            f"sid={obs.short_id(bc.session_id)} exc={type(e).__name__}\n")
         sys.stderr.flush()
 
 
@@ -1659,8 +1868,8 @@ def _scan_interrupted_turns_at_startup() -> dict[str, dict]:
             out[sid] = data
         except Exception as e:
             sys.stderr.write(
-                f"[chat] skipping malformed active-turn sidecar {p.name}: "
-                f"{type(e).__name__}: {e}\n")
+                f"[chat] skipping malformed active-turn sidecar "
+                f"exc={type(e).__name__}\n")
     return out
 
 
@@ -1799,6 +2008,47 @@ _CONTEXT_CAPABILITY_FAILURE_TTL = max(
 # (gateway base URL, canonical model) -> (monotonic timestamp, capability | None)
 # No credential material is ever retained in this cache.
 _CONTEXT_CAPABILITY_CACHE: dict[tuple[str, str], tuple[float, dict | None]] = {}
+_CONTEXT_PROBE_LOG_WINDOW_S = max(
+    15.0, env_float("MUSELAB_CONTEXT_CATALOG_LOG_WINDOW_S", 60.0))
+# (canonical model, exception class) -> (last emitted monotonic time, suppressed)
+_CONTEXT_PROBE_LOG_STATE: dict[tuple[str, str], tuple[float, int]] = {}
+
+
+def _log_context_probe_failure(model: str, exc: BaseException) -> None:
+    """Rate-limit repetitive catalog failures without retaining exception text."""
+    now = time.monotonic()
+    error_kind = type(exc).__name__
+    key = (model, error_kind)
+    previous = _CONTEXT_PROBE_LOG_STATE.get(key)
+    if previous is not None and now - previous[0] < _CONTEXT_PROBE_LOG_WINDOW_S:
+        _CONTEXT_PROBE_LOG_STATE[key] = (previous[0], previous[1] + 1)
+        return
+    suppressed = previous[1] if previous is not None else 0
+    sys.stderr.write(
+        f"[ctx-catalog] gateway context probe unavailable "
+        f"model={model} exc={error_kind} suppressed={suppressed}\n"
+    )
+    sys.stderr.flush()
+    _CONTEXT_PROBE_LOG_STATE[key] = (now, 0)
+
+
+def _log_context_probe_recovery(model: str) -> None:
+    """Emit one content-free recovery summary and clear failure state."""
+    matches = [
+        (key, state)
+        for key, state in _CONTEXT_PROBE_LOG_STATE.items()
+        if key[0] == model
+    ]
+    if not matches:
+        return
+    suppressed = sum(state[1] for _, state in matches)
+    for key, _ in matches:
+        _CONTEXT_PROBE_LOG_STATE.pop(key, None)
+    sys.stderr.write(
+        f"[ctx-catalog] gateway context probe recovered "
+        f"model={model} suppressed={suppressed}\n"
+    )
+    sys.stderr.flush()
 
 
 def _positive_int(v: Any) -> int:
@@ -2061,6 +2311,8 @@ async def _detect_gateway_context_capability(model: str) -> dict | None:
         ttl = (_CONTEXT_CAPABILITY_CACHE_TTL if capability
                else _CONTEXT_CAPABILITY_FAILURE_TTL)
         if time.monotonic() - cached_at < ttl:
+            if capability:
+                _log_context_probe_recovery(canonical)
             return dict(capability) if capability else None
 
     headers: dict[str, str] = {}
@@ -2088,6 +2340,7 @@ async def _detect_gateway_context_capability(model: str) -> dict | None:
                         ] = (now, dict(capability))
                     found = catalog.get(slug)
                     if found:
+                        _log_context_probe_recovery(canonical)
                         return dict(found)
 
             # Compatibility path for gateways that expose limits on ordinary
@@ -2114,11 +2367,10 @@ async def _detect_gateway_context_capability(model: str) -> dict | None:
                     if capability:
                         _CONTEXT_CAPABILITY_CACHE[cache_key] = (
                             now, dict(capability))
+                        _log_context_probe_recovery(canonical)
                         return capability
     except Exception as e:
-        sys.stderr.write(
-            f"[ctx-catalog] gateway context probe skipped model={canonical}: "
-            f"{type(e).__name__}\n")
+        _log_context_probe_failure(canonical, e)
     _CONTEXT_CAPABILITY_CACHE[cache_key] = (now, None)
     return None
 
@@ -2515,7 +2767,7 @@ def _build_plan_exit_hooks(
         except Exception as exc:
             sys.stderr.write(
                 f"[plan-mode] persist failed sid={session_id[:8]} "
-                f"target={target}: {type(exc).__name__}: {exc}\n")
+                f"target={target} exc={type(exc).__name__}\n")
             await perm.emit_session_event(
                 session_id,
                 "permission_mode_change_failed",
@@ -2625,15 +2877,14 @@ async def _build_and_connect_client(
     try:
         jsonl_exists = _find_session_jsonl(session_id) is not None
     except Exception as e:
-        sys.stderr.write(f"[muselab] jsonl_exists check failed for {session_id}: {e}\n")
-    # CLI stderr capture — without this, ProcessError just says
-    # "Check stderr output for details" with no actual details and
-    # we can't tell whether the CLI rejected --session-id, hit an
-    # auth error, or something else. Pipe every line into muselab's
-    # stderr.log so the next failure is debuggable.
-    def _cli_stderr(line: str) -> None:
-        sys.stderr.write(f"[cli-stderr sid={session_id[:8]}] {line}\n")
-        sys.stderr.flush()
+        sys.stderr.write(
+            f"[muselab] jsonl_exists check failed "
+            f"sid={obs.short_id(session_id)} exc={type(e).__name__}\n"
+        )
+    # Keep one privacy-safe line per stderr category and connected client.
+    # Raw CLI output can contain prompts, paths, credentials and protocol bodies.
+    _cli_stderr = _privacy_safe_cli_stderr_logger(
+        "DUCC" if is_ducc else "SDK-CLI", session_id)
 
     post_exit_hook, post_exit_failure_hook = _build_plan_exit_hooks(
         session_id, plan_return_permission)
@@ -2643,6 +2894,9 @@ async def _build_and_connect_client(
     user_prompt_hooks = (
         [] if side_question_runtime else [mem0.build_recall_hook(session_id)]
     )
+    if (not side_question_runtime
+            and sess_data.get("runtime_predecessor")):
+        user_prompt_hooks.append(_build_runtime_task_context_hook(session_id))
     if (effort == "ultra" and _is_codex_gateway_model(model)
             and not side_question_runtime and not skills_off):
         user_prompt_hooks.append(_build_ultra_skill_hook())
@@ -2873,15 +3127,23 @@ async def _build_and_connect_client(
                     f"`claude login` (Pro/Max) or set ANTHROPIC_API_KEY in "
                     f"Settings. CLI would exit 1 silently otherwise."
                 )
-        # Capture CLI stderr so auth / network errors surface in the service log.
-        def _stderr_logger(line: str) -> None:
-            if is_ducc:
-                sys.stderr.write(
-                    f"[DUCC:{model}] {_ducc_stderr_notice(line)}\n")
-            else:
-                sys.stderr.write(f"[SDK-CLI:{model}] {line}\n")
-            sys.stderr.flush()
-        opts_kwargs["stderr"] = _stderr_logger
+        # ``opts_kwargs`` already carries the per-client, privacy-safe stderr
+        # classifier installed above.  Do not replace it with a raw line sink.
+
+    # A rollover child is a point-in-time transcript fork while the source
+    # CLI keeps ownership of tasks launched before that boundary. Claude CLI
+    # understands this timestamp natively and excludes pre-boundary launches
+    # from its orphan-task scanner. Set an explicit empty value for ordinary
+    # sessions too, so a stale ambient variable cannot affect unrelated
+    # resumes. Merge instead of replace so provider routing and DUCC's bounded
+    # environment remain intact.
+    runtime_boundary = sess.normalize_runtime_fork_boundary_at(
+        sess_data.get("runtime_fork_boundary_at")
+    )
+    runtime_env = dict(opts_kwargs.get("env") or {})
+    runtime_env[_RUNTIME_RESUME_SOURCE_ALIVE_ENV] = runtime_boundary
+    opts_kwargs["env"] = runtime_env
+
     # MCP servers: always register the in-process muselab server (for
     # ask_user_question). Then merge in:
     #   - muselab's own mcp.json (UI-managed)
@@ -2920,8 +3182,8 @@ async def _build_and_connect_client(
             # already swallows per-file errors and stderr's them; this catch
             # is for unexpected programmer errors only.
             sys.stderr.write(
-                f"[chat] mcp merge failed for sid={session_id[:8]}: "
-                f"{type(e).__name__}: {e}; only muselab built-in MCP active\n")
+                f"[chat] mcp merge failed sid={session_id[:8]} "
+                f"exc={type(e).__name__}; only muselab built-in MCP active\n")
             sys.stderr.flush()
     opts_kwargs["mcp_servers"] = mcp_dict
     # Enable extended thinking for models whose provider endpoint handles
@@ -3464,7 +3726,9 @@ async def get_client(session_id: str, model: str, permission: str = "bypassPermi
                 await c.disconnect()
             except Exception as e:
                 sys.stderr.write(
-                    f"[client-pool] evict {old_key} disconnect err: {e}\n")
+                    f"[client-pool] evict disconnect failed "
+                    f"sid={obs.short_id(old_key[0])} "
+                    f"exc={type(e).__name__}\n")
                 sys.stderr.flush()
 
         return client
@@ -3585,7 +3849,7 @@ class _SessionStream:
             self._failure = e
             sys.stderr.write(
                 f"[chat] session stream ended sid={self.key[0][:8]} "
-                f"exc={type(e).__name__}: {e}\n")
+                f"exc={type(e).__name__}\n")
             sys.stderr.flush()
         finally:
             # A pooled interactive SDK stream is expected to live until
@@ -3643,7 +3907,7 @@ async def _evict_failed_session_stream(stream: _SessionStream) -> None:
     except Exception as e:
         sys.stderr.write(
             f"[chat] failed-stream disconnect sid={key[0][:8]} "
-            f"exc={type(e).__name__}: {e}\n")
+            f"exc={type(e).__name__}\n")
         sys.stderr.flush()
 
 
@@ -4159,8 +4423,9 @@ def _persist_attachment(session_id: str, aid: str, name: str,
         path.write_bytes(data)
     except Exception as e:
         sys.stderr.write(
-            f"[attach] persist failed sid={session_id} aid={aid} "
-            f"name={safe!r} err={type(e).__name__}: {e}\n")
+            f"[attach] persist failed sid={obs.short_id(session_id)} "
+            f"aid={obs.short_id(aid)} exc={type(e).__name__} "
+            f"kind=write\n")
         sys.stderr.flush()
         return None
     url = (f"/api/chat/attachments/{session_id}/"
@@ -6025,14 +6290,32 @@ def get_session_api(
                 # bubbles.  The index maps that exact range back to the small
                 # set of JSONL records that intersects it.
                 around_limit = limit if before == 0 and after == 0 else 0
-                record_ids, inner_start, win_offset, win_end, total = (
-                    transcript_idx.record_indices_around_uuid(
-                        index, around_uuid, before, after, limit=around_limit))
-                if not record_ids:
-                    raise HTTPException(404, "message uuid not found")
-                shaped = _indexed_ui_records(
-                    transcript_path, index, record_ids, annotations)
-                window = shaped[inner_start:inner_start + (win_end - win_offset)]
+                if snapshots:
+                    virtual = _interrupted_history_window_around_uuid(
+                        transcript_path,
+                        index,
+                        snapshots,
+                        annotations,
+                        around_uuid,
+                        before,
+                        after,
+                        limit=around_limit,
+                    )
+                    if virtual is None:
+                        raise HTTPException(404, "message uuid not found")
+                    window, total, win_offset, has_later = virtual
+                else:
+                    record_ids, inner_start, win_offset, win_end, total = (
+                        transcript_idx.record_indices_around_uuid(
+                            index, around_uuid, before, after,
+                            limit=around_limit))
+                    if not record_ids:
+                        raise HTTPException(404, "message uuid not found")
+                    shaped = _indexed_ui_records(
+                        transcript_path, index, record_ids, annotations)
+                    window = shaped[
+                        inner_start:inner_start + (win_end - win_offset)]
+                    has_later = win_end < total
                 # A corrupt/drifted index must not silently turn a successful
                 # around request into a window that omits its target.
                 if not any(item.get("uuid") == around_uuid for item in window):
@@ -6040,7 +6323,6 @@ def get_session_api(
                         "error": "history_index_mismatch",
                         "history_generation": generation,
                     })
-                has_later = win_end < total
             else:
                 order = "full" if full else "normal"
                 history_order = order
@@ -6150,6 +6432,10 @@ def get_session_api(
         "pre_total": pre_total if history_order == "normal" else 0,
         "history_generation": generation,
         "history_order": history_order,
+        # Presentation generation used by a rollover child to prove that it
+        # has adopted the hidden owner's latest continuation bubble before
+        # stopping its inherited-task poller.
+        "runtime_ui_revision": snapshot_generation,
     }
 
 
@@ -6376,6 +6662,8 @@ def _broadcast_to_ui_messages(bc: "TurnBroadcast") -> list[dict]:
 
 
 _CANCELLED_TURN_SNAPSHOT_SCHEMA = 1
+_RUNTIME_CONTINUATION_OUTBOX_SCHEMA = 1
+_RUNTIME_CONTINUATION_DISPLAY_KIND = "runtime_continuation"
 
 
 def _canonical_uuid_component(value: str) -> str | None:
@@ -6401,6 +6689,708 @@ def _cancelled_turn_snapshot_path(sid: str, turn_id: str) -> Path | None:
     if directory is None or safe_turn is None:
         return None
     return directory / f"{safe_turn}.json"
+
+
+def _runtime_continuation_outbox_dir(source_sid: str) -> Path | None:
+    safe_sid = _canonical_uuid_component(source_sid)
+    if safe_sid is None:
+        return None
+    return sess.SESS_DIR / "runtime_continuation_outbox" / safe_sid
+
+
+def _runtime_continuation_outbox_path(
+    source_sid: str,
+    event_id: str,
+) -> Path | None:
+    directory = _runtime_continuation_outbox_dir(source_sid)
+    safe_event = _canonical_uuid_component(event_id)
+    if directory is None or safe_event is None:
+        return None
+    return directory / f"{safe_event}.json"
+
+
+def _delete_runtime_continuation_outboxes(source_sid: str) -> None:
+    directory = _runtime_continuation_outbox_dir(source_sid)
+    if directory is not None and directory.exists():
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+def _load_runtime_continuation_outbox(
+    source_sid: str,
+    event_id: str,
+) -> dict | None:
+    path = _runtime_continuation_outbox_path(source_sid, event_id)
+    if path is None:
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("outbox root must be an object")
+        if data.get("schema") != _RUNTIME_CONTINUATION_OUTBOX_SCHEMA:
+            raise ValueError("unsupported outbox schema")
+        if data.get("source_sid") != source_sid:
+            raise ValueError("outbox source mismatch")
+        if data.get("event_id") != event_id:
+            raise ValueError("outbox event mismatch")
+        message = data.get("message")
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            raise ValueError("outbox message mismatch")
+        if not isinstance(message.get("text"), str) or not message["text"].strip():
+            raise ValueError("outbox message is empty")
+        return data
+    except FileNotFoundError:
+        return None
+    except Exception as exc:
+        # A corrupt/older-schema READY record must not pin every successor tab
+        # forever.  Move it out of the ``*.json`` delivery namespace while
+        # retaining the private artifact for local diagnosis.  The rename is
+        # same-directory and therefore atomic; neither the filename nor the log
+        # contains assistant prose.
+        try:
+            quarantine = path.with_name(f"{path.name}.invalid")
+            if quarantine.exists():
+                quarantine = path.with_name(
+                    f"{path.name}.invalid.{uuid.uuid4().hex[:8]}"
+                )
+            os.replace(path, quarantine)
+            with suppress(OSError):
+                quarantine.chmod(0o600)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            # A concurrent delete may own the directory.  The original error is
+            # still reported below without exposing payload contents.
+            pass
+        # The payload contains private assistant text.  Log only stable local
+        # identifiers and the exception class, never the content or a task
+        # output path.
+        sys.stderr.write(
+            f"[chat] runtime continuation outbox skipped "
+            f"sid={source_sid[:8]} event={event_id[:8]} "
+            f"exc={type(exc).__name__}\n"
+        )
+        sys.stderr.flush()
+        return None
+
+
+def _runtime_continuation_outbox_entries() -> list[tuple[str, str]]:
+    root = sess.SESS_DIR / "runtime_continuation_outbox"
+    if not root.exists():
+        return []
+    entries: list[tuple[str, str]] = []
+    try:
+        source_dirs = list(root.iterdir())
+    except OSError:
+        return []
+    for directory in source_dirs:
+        source_sid = _canonical_uuid_component(directory.name)
+        if source_sid is None or not directory.is_dir():
+            continue
+        try:
+            paths = list(directory.glob("*.json"))
+        except OSError:
+            continue
+        for path in paths:
+            event_id = _canonical_uuid_component(path.stem)
+            if event_id is not None:
+                entries.append((source_sid, event_id))
+    entries.sort()
+    return entries
+
+
+def _session_has_runtime_continuation_outbox(source_sid: str) -> bool:
+    directory = _runtime_continuation_outbox_dir(source_sid)
+    if directory is None or not directory.exists():
+        return False
+    try:
+        return any(directory.glob("*.json"))
+    except OSError:
+        return False
+
+
+def _runtime_continuation_outbox_event_ids(source_sid: str) -> list[str]:
+    """Return validated READY ids for one owner without reading private text."""
+    directory = _runtime_continuation_outbox_dir(source_sid)
+    if directory is None or not directory.exists():
+        return []
+    try:
+        event_ids = [
+            event_id
+            for path in directory.glob("*.json")
+            if (event_id := _canonical_uuid_component(path.stem)) is not None
+        ]
+    except OSError:
+        return []
+    return sorted(set(event_ids))
+
+
+def _runtime_lineage_has_ready_continuation(leaf_sid: str) -> bool:
+    """Whether a visible leaf still has an ancestor READY projection."""
+    lineage = sess.runtime_lineage(leaf_sid) or [leaf_sid]
+    if not lineage or lineage[-1] != leaf_sid:
+        return False
+    return any(
+        _runtime_continuation_outbox_event_ids(owner_sid)
+        for owner_sid in lineage[:-1]
+    )
+
+
+def _persist_runtime_continuation_outbox(
+    source_sid: str,
+    broadcast: "TurnBroadcast",
+    *,
+    completed_at_ms: int,
+    elapsed_s: float,
+    terminal_status: str,
+    incomplete_error: str = "",
+) -> str:
+    """Durably stage one hidden-runtime reply for its visible successor.
+
+    The source transcript remains Claude's canonical model history.  This
+    outbox contains only the final user-visible assistant prose and footer
+    facts; it deliberately excludes thinking, tool protocol, task summaries,
+    output paths, and the source AssistantMessage UUID.
+    """
+    # Write first, decide whether a successor needs the projection later while
+    # actually holding the source rollover lock.  Merely sampling ``locked()``
+    # here left a check-then-link gap: a fast continuation could decide it was
+    # public, then a waiting rollover would fork at the earlier boundary and
+    # hide the only durable reply.
+    if terminal_status not in {"completed", "failed"}:
+        return ""
+    event_id = str(broadcast.turn_id or "")
+    path = _runtime_continuation_outbox_path(source_sid, event_id)
+    if path is None:
+        return ""
+
+    messages = _broadcast_to_ui_messages(broadcast)
+    # A continuation can speak, use a tool, then speak again.  The successor
+    # intentionally gets one simple Agent bubble, but it must retain every
+    # user-visible prose segment in order rather than silently keeping only the
+    # last one.  Thinking/tool protocol remains excluded.
+    assistant_texts = [
+        str(message.get("text") or "").strip()
+        for message in messages
+        if message.get("role") == "assistant"
+        and str(message.get("text") or "").strip()
+    ]
+    text = "\n\n".join(assistant_texts)
+    if incomplete_error:
+        text = incomplete_error
+    if not text.strip():
+        return ""
+
+    message = {
+        "role": "assistant",
+        "text": text,
+        "model": broadcast.model,
+        "ts": int(completed_at_ms),
+        "elapsed": float(elapsed_s),
+        "turn_status": terminal_status,
+        "display_kind": _RUNTIME_CONTINUATION_DISPLAY_KIND,
+        "runtime_event_id": event_id,
+        "presentation_only": True,
+        "forkable": False,
+        "_key": f"runtime-continuation:{event_id}:0",
+    }
+    payload = {
+        "schema": _RUNTIME_CONTINUATION_OUTBOX_SCHEMA,
+        "source_sid": source_sid,
+        "event_id": event_id,
+        "model": broadcast.model,
+        "completed_at_ms": int(completed_at_ms),
+        "terminal_status": terminal_status,
+        "message": message,
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with suppress(OSError):
+            path.parent.parent.chmod(0o700)
+        with suppress(OSError):
+            path.parent.chmod(0o700)
+        atomic_write_text(
+            path,
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+            mode=0o600,
+        )
+        with suppress(OSError):
+            path.chmod(0o600)
+        return event_id
+    except Exception as exc:
+        sys.stderr.write(
+            f"[chat] runtime continuation outbox write failed "
+            f"sid={source_sid[:8]} event={event_id[:8]} "
+            f"exc={type(exc).__name__}\n"
+        )
+        sys.stderr.flush()
+        return ""
+
+
+def _sync_runtime_display_message_count(sid: str) -> None:
+    """Refresh cached list counts after a presentation-only snapshot write."""
+    snapshots, _ = _load_cancelled_turn_snapshots(sid)
+    indexed = _ensure_transcript_index(sid)
+    index = indexed[1] if indexed is not None else None
+    total, turns = _interrupted_history_stats(index, snapshots, "normal")
+    sess.bump_session(sid, message_count=total, turn_count=turns)
+
+
+def _persist_runtime_continuation_snapshot(
+    target_sid: str,
+    outbox: dict,
+) -> bool:
+    """Project one staged reply under the target's deletion fence."""
+    # ``asyncio.to_thread`` cancellation does not stop its worker.  Holding the
+    # same lifecycle lock as purge means a writer that started first completes
+    # before purge removes the directory, while a writer arriving after the
+    # tombstone becomes a no-op and cannot recreate private text after DELETE.
+    with sess.session_lifecycle_lock(target_sid):
+        return _persist_runtime_continuation_snapshot_locked(target_sid, outbox)
+
+
+def _persist_runtime_continuation_snapshot_locked(
+    target_sid: str,
+    outbox: dict,
+) -> bool:
+    """Project one staged reply into ``target_sid``'s virtual UI history."""
+    event_id = str(outbox.get("event_id") or "")
+    path = _cancelled_turn_snapshot_path(target_sid, event_id)
+    if path is None or sess.session_is_deleting(target_sid):
+        return False
+    if path.exists():
+        try:
+            existing = json.loads(path.read_text(encoding="utf-8"))
+            if (
+                isinstance(existing, dict)
+                and existing.get("kind") == _RUNTIME_CONTINUATION_DISPLAY_KIND
+                and existing.get("runtime_event_id") == event_id
+                and existing.get("sid") == target_sid
+            ):
+                # The first attempt may have committed the private snapshot and
+                # then crashed/failed while refreshing the list-row cache.  A
+                # replay must repair that cache before consuming the outbox.
+                try:
+                    _sync_runtime_display_message_count(target_sid)
+                except Exception as exc:
+                    sys.stderr.write(
+                        f"[chat] runtime continuation existing count sync "
+                        f"failed sid={target_sid[:8]} event={event_id[:8]} "
+                        f"exc={type(exc).__name__}\n"
+                    )
+                    sys.stderr.flush()
+                return True
+        except Exception:
+            pass
+
+    target_meta = sess.get_session_meta(target_sid) or {}
+    target_model = str(target_meta.get("model") or outbox.get("model") or "")
+    _, boundary = _turn_transcript_boundary(target_sid, target_model)
+    completed_at_ms = int(outbox.get("completed_at_ms") or 0)
+    message = dict(outbox.get("message") or {})
+    message.update({
+        "display_kind": _RUNTIME_CONTINUATION_DISPLAY_KIND,
+        "runtime_event_id": event_id,
+        "presentation_only": True,
+        "forkable": False,
+        "_key": f"runtime-continuation:{event_id}:0",
+    })
+    # This is a complete assistant-only display turn.  Never expose a source
+    # transcript UUID (or a fork UUID) on the successor: the bubble is not a
+    # legal Claude history boundary and must not be offered as a fork point.
+    message.pop("uuid", None)
+    message.pop("forkUuid", None)
+    payload = {
+        "schema": _CANCELLED_TURN_SNAPSHOT_SCHEMA,
+        "kind": _RUNTIME_CONTINUATION_DISPLAY_KIND,
+        "sid": target_sid,
+        "turn_id": event_id,
+        "runtime_event_id": event_id,
+        # Snapshot ordering is completion ordering, not the source user turn's
+        # start time (which can be hours earlier for a long-running task).
+        "started_at_ms": completed_at_ms,
+        "terminal_at_ms": completed_at_ms,
+        "anchors": {
+            "normal": {
+                "uuid": boundary.get("normal_uuid") or "",
+                "total": int(boundary.get("normal_total") or 0),
+            },
+            "full": {
+                "uuid": boundary.get("full_uuid") or "",
+                "total": int(boundary.get("full_total") or 0),
+            },
+        },
+        "hidden_uuids": [],
+        "messages": [message],
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with suppress(OSError):
+            path.parent.chmod(0o700)
+        atomic_write_text(
+            path,
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+            mode=0o600,
+        )
+        with suppress(OSError):
+            path.chmod(0o600)
+        _sync_runtime_display_message_count(target_sid)
+        return True
+    except Exception as exc:
+        sys.stderr.write(
+            f"[chat] runtime continuation snapshot write failed "
+            f"sid={target_sid[:8]} event={event_id[:8]} "
+            f"exc={type(exc).__name__}\n"
+        )
+        sys.stderr.flush()
+        return False
+
+
+def _copy_runtime_continuation_snapshots(
+    source_sid: str,
+    target_sid: str,
+    uuid_mapping: dict[str, str],
+) -> int:
+    """Copy presentation snapshots under the target deletion fence."""
+    # Rollover copies run in a worker thread.  Cancellation of the awaiting
+    # coroutine cannot stop that worker, so the same target lifecycle lock used
+    # by DELETE must cover the tombstone check and every write/count refresh.
+    with sess.session_lifecycle_lock(target_sid):
+        if sess.session_is_deleting(target_sid):
+            return 0
+        return _copy_runtime_continuation_snapshots_locked(
+            source_sid, target_sid, uuid_mapping)
+
+
+def _copy_runtime_continuation_snapshots_locked(
+    source_sid: str,
+    target_sid: str,
+    uuid_mapping: dict[str, str],
+) -> int:
+    """Copy already-visible UI continuations across a later SDK fork.
+
+    Anchors are translated one edge at a time.  If a CLI build omits a UUID
+    backlink, retain the exact bubble-total coordinate with an empty UUID;
+    the fork boundary is later than every copied event, so that coordinate is
+    still a safe placement fallback.
+    """
+    snapshots, _ = _load_cancelled_turn_snapshots(source_sid)
+    copied = 0
+    for snapshot in snapshots:
+        if snapshot.get("kind") != _RUNTIME_CONTINUATION_DISPLAY_KIND:
+            continue
+        event_id = str(snapshot.get("runtime_event_id") or "")
+        target_path = _cancelled_turn_snapshot_path(target_sid, event_id)
+        if target_path is None or target_path.exists():
+            continue
+        anchors: dict[str, dict] = {}
+        for order in ("normal", "full"):
+            source_anchor = dict(
+                ((snapshot.get("anchors") or {}).get(order) or {}))
+            source_uuid = str(source_anchor.get("uuid") or "")
+            anchors[order] = {
+                "uuid": str(uuid_mapping.get(source_uuid) or "")
+                if source_uuid else "",
+                "total": int(source_anchor.get("total") or 0),
+            }
+        payload = {
+            **snapshot,
+            "sid": target_sid,
+            "anchors": anchors,
+            "messages": [
+                dict(message) for message in (snapshot.get("messages") or [])
+            ],
+        }
+        try:
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            with suppress(OSError):
+                target_path.parent.chmod(0o700)
+            atomic_write_text(
+                target_path,
+                json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+                mode=0o600,
+            )
+            with suppress(OSError):
+                target_path.chmod(0o600)
+            copied += 1
+        except Exception as exc:
+            sys.stderr.write(
+                f"[chat] runtime continuation snapshot copy failed "
+                f"sid={source_sid[:8]} child={target_sid[:8]} "
+                f"event={event_id[:8]} exc={type(exc).__name__}\n"
+            )
+            sys.stderr.flush()
+    if copied:
+        try:
+            _sync_runtime_display_message_count(target_sid)
+        except Exception as exc:
+            sys.stderr.write(
+                f"[chat] runtime continuation count sync failed "
+                f"sid={target_sid[:8]} exc={type(exc).__name__}\n"
+            )
+            sys.stderr.flush()
+    return copied
+
+
+async def _deliver_runtime_continuation_outbox(
+    source_sid: str,
+    event_id: str,
+) -> bool:
+    """Deliver a READY outbox to the newest idle lineage leaf exactly once."""
+    while True:
+        outbox = await asyncio.to_thread(
+            _load_runtime_continuation_outbox, source_sid, event_id)
+        if outbox is None:
+            return False
+        # The durable latest link is published before its rollover
+        # postlude/queue migration has reached the commit boundary.  Observe the
+        # chain, acquire the lock owned by that exact latest edge, then re-read
+        # under the lock.  For A -> B -> C this must be B's lock, not always A's;
+        # otherwise C can still be a provisional child that later rolls back.
+        observed_lineage = await asyncio.to_thread(
+            sess.runtime_lineage, source_sid)
+        barrier_sid = (
+            observed_lineage[-2]
+            if len(observed_lineage) >= 2
+            else source_sid
+        )
+        wait_for_rollover = False
+        lineage_changed = False
+        async with _runtime_rollover_lock_for(barrier_sid):
+            source_meta = await asyncio.to_thread(
+                sess.get_session_meta, source_sid)
+            if source_meta is None or sess.session_is_deleting(source_sid):
+                path = _runtime_continuation_outbox_path(source_sid, event_id)
+                if path is not None:
+                    with suppress(OSError):
+                        path.unlink(missing_ok=True)
+                return False
+            lineage = await asyncio.to_thread(sess.runtime_lineage, source_sid)
+            if lineage != observed_lineage:
+                lineage_changed = True
+            elif len(lineage) < 2 or lineage[-1] == source_sid:
+                # The watcher is the last authority capable of initiating a
+                # boundary fork.  Keep the unconditional write-ahead record
+                # until that owner exits (or a registered eager prewarm commits).
+                prewarm = _runtime_prewarm_tasks.get(source_sid)
+                wait_for_rollover = bool(
+                    _session_has_live_watcher(source_sid)
+                    or (prewarm is not None and not prewarm.done())
+                    or source_meta.get("runtime_shadow")
+                )
+                if not wait_for_rollover:
+                    path = _runtime_continuation_outbox_path(
+                        source_sid, event_id)
+                    if path is not None:
+                        with suppress(OSError):
+                            path.unlink(missing_ok=True)
+                    return False
+        if lineage_changed:
+            await asyncio.sleep(0)
+            continue
+        if wait_for_rollover:
+            await asyncio.sleep(0.2)
+            continue
+        leaf_sid = lineage[-1]
+        if sess.session_is_deleting(leaf_sid):
+            await asyncio.sleep(0.2)
+            continue
+
+        # A new rollover and this projection must agree on one latest leaf.
+        # The leaf runtime lock also places the bubble after any turn currently
+        # writing JSONL and before a later turn can establish its own boundary.
+        delivered = False
+        retry_delay = 0.05
+        async with _runtime_rollover_lock_for(leaf_sid):
+            fresh_lineage = await asyncio.to_thread(
+                sess.runtime_lineage, source_sid)
+            if not fresh_lineage or fresh_lineage[-1] != leaf_sid:
+                retry_delay = 0.05
+            else:
+                active = _active_turns.get(leaf_sid)
+                if active is not None and not active.done:
+                    retry_delay = 0.2
+                else:
+                    runtime_lock = _session_runtime_lock_for(leaf_sid)
+                    async with runtime_lock:
+                        active = _active_turns.get(leaf_sid)
+                        fresh_lineage = await asyncio.to_thread(
+                            sess.runtime_lineage, source_sid)
+                        if (
+                            (active is not None and not active.done)
+                            or not fresh_lineage
+                            or fresh_lineage[-1] != leaf_sid
+                        ):
+                            retry_delay = 0.2
+                        else:
+                            delivered = await asyncio.to_thread(
+                                _persist_runtime_continuation_snapshot,
+                                leaf_sid,
+                                outbox,
+                            )
+                            retry_delay = 0.5
+        if delivered:
+            path = _runtime_continuation_outbox_path(source_sid, event_id)
+            if path is not None:
+                with suppress(OSError):
+                    path.unlink(missing_ok=True)
+            # A queued turn may have deferred itself while this READY record was
+            # waiting for the leaf boundary. Re-kick after the presentation
+            # commit; the drain's own active/paused checks remain authoritative.
+            with suppress(Exception):
+                queued = sess.get_queue(leaf_sid)
+                if queued.get("items") or queued.get("inflight"):
+                    _schedule_queue_drain(leaf_sid)
+            return True
+        await asyncio.sleep(retry_delay)
+
+
+async def _flush_runtime_continuations_at_turn_boundary(
+    leaf_sid: str,
+    *,
+    expected_active: "TurnBroadcast | None" = None,
+) -> int:
+    """Commit every READY ancestor reply before releasing a leaf turn slot.
+
+    The source-lock pass is a commit barrier for initial forks: once each lock
+    has been acquired and released, a visible link cannot still roll back.  The
+    leaf rollover/runtime locks then serialize this display boundary with a
+    later fork or query.  Outbox-directory rescans are synchronous and tiny so
+    there is no event-loop yield between observing "empty" and returning to the
+    caller that will release/reserve ``_active_turns``.
+    """
+    lineage = await asyncio.to_thread(sess.runtime_lineage, leaf_sid)
+    if not lineage or lineage[-1] != leaf_sid:
+        return 0
+    owners = list(dict.fromkeys(lineage[:-1]))
+    if not owners:
+        return 0
+
+    # Never nest source locks under the leaf lock; delivery uses source -> leaf
+    # as two separate phases and this preserves the same acyclic order.
+    for owner_sid in owners:
+        async with _runtime_rollover_lock_for(owner_sid):
+            pass
+
+    delivered = 0
+    async with _runtime_rollover_lock_for(leaf_sid):
+        fresh_lineage = await asyncio.to_thread(sess.runtime_lineage, leaf_sid)
+        if not fresh_lineage or fresh_lineage[-1] != leaf_sid:
+            return 0
+        fresh_owners = list(dict.fromkeys(fresh_lineage[:-1]))
+        if not fresh_owners:
+            return 0
+        async with _session_runtime_lock_for(leaf_sid):
+            active = _active_turns.get(leaf_sid)
+            if expected_active is None:
+                if active is not None and not active.done:
+                    return 0
+            elif active is not expected_active:
+                return 0
+
+            while True:
+                ready = [
+                    (owner_sid, event_id)
+                    for owner_sid in fresh_owners
+                    for event_id in _runtime_continuation_outbox_event_ids(
+                        owner_sid)
+                ]
+                if not ready:
+                    return delivered
+                progressed = False
+                for owner_sid, event_id in ready:
+                    outbox = await asyncio.to_thread(
+                        _load_runtime_continuation_outbox,
+                        owner_sid,
+                        event_id,
+                    )
+                    if outbox is None:
+                        # Invalid records are quarantined by the loader, so a
+                        # rescan can make forward progress without busy-looping.
+                        progressed = True
+                        continue
+                    persisted = await asyncio.to_thread(
+                        _persist_runtime_continuation_snapshot,
+                        leaf_sid,
+                        outbox,
+                    )
+                    if not persisted:
+                        # Keep the write-ahead record. Delivery/restart can retry,
+                        # and queue drain will be re-kicked after a later commit.
+                        continue
+                    path = _runtime_continuation_outbox_path(
+                        owner_sid, event_id)
+                    if path is not None:
+                        with suppress(OSError):
+                            path.unlink(missing_ok=True)
+                    delivered += 1
+                    progressed = True
+                if not progressed:
+                    return delivered
+
+
+def _schedule_runtime_continuation_delivery(
+    source_sid: str,
+    event_id: str,
+) -> asyncio.Task | None:
+    key = (source_sid, event_id)
+    existing = _runtime_continuation_delivery_tasks.get(key)
+    if existing is not None and not existing.done():
+        return existing
+    try:
+        task = asyncio.create_task(
+            _deliver_runtime_continuation_outbox(source_sid, event_id))
+    except RuntimeError:
+        return None
+    _runtime_continuation_delivery_tasks[key] = task
+    _maintenance_tasks.add(task)
+
+    def _done(done: asyncio.Task) -> None:
+        if _runtime_continuation_delivery_tasks.get(key) is done:
+            _runtime_continuation_delivery_tasks.pop(key, None)
+        _maintenance_tasks.discard(done)
+        if done.cancelled():
+            return
+        try:
+            done.result()
+        except Exception as exc:
+            sys.stderr.write(
+                f"[chat] runtime continuation delivery failed "
+                f"sid={source_sid[:8]} event={event_id[:8]} "
+                f"exc={type(exc).__name__}\n"
+            )
+            sys.stderr.flush()
+
+    task.add_done_callback(_done)
+    return task
+
+
+async def recover_runtime_continuation_outboxes_at_startup() -> int:
+    """Schedule crash-surviving READY continuations before serving traffic."""
+    entries = await asyncio.to_thread(_runtime_continuation_outbox_entries)
+    scheduled = 0
+    for source_sid, event_id in entries:
+        if _schedule_runtime_continuation_delivery(source_sid, event_id):
+            scheduled += 1
+    return scheduled
+
+
+def _runtime_continuation_projection_state(sid: str) -> tuple[bool, str]:
+    """Return lineage-wide pending state and the visible leaf's UI revision."""
+    lineage = sess.runtime_lineage(sid) or [sid]
+    leaf_sid = lineage[-1]
+    pending = False
+    for owner_sid in lineage[:-1]:
+        if (
+            _session_has_live_watcher(owner_sid)
+            or _session_has_runtime_continuation_outbox(owner_sid)
+        ):
+            pending = True
+            break
+    try:
+        _, revision = _load_cancelled_turn_snapshots(leaf_sid)
+    except Exception:
+        revision = ""
+    return pending, revision
 
 
 def _delete_cancelled_turn_snapshots(sid: str) -> None:
@@ -7233,6 +8223,68 @@ def _interrupted_history_window(
     return window, total, start, end < total
 
 
+def _interrupted_history_window_around_uuid(
+    transcript_path: Path,
+    index: dict,
+    snapshots: list[dict],
+    annotations: dict[str, dict],
+    uuid_value: str,
+    before: int,
+    after: int,
+    *,
+    limit: int = 0,
+) -> tuple[list[dict], int, int, bool] | None:
+    """Read an around-UUID window in the same virtual coordinates as paging."""
+    segments, _ = _interrupted_history_segments(index, snapshots, "full")
+    records = index.get("records") or []
+    total = sum(int(segment.get("count") or 0) for segment in segments)
+    cursor = 0
+    target_start = -1
+    target_end = -1
+    for segment in segments:
+        count = max(0, int(segment.get("count") or 0))
+        if segment.get("kind") == "record":
+            record_id = int(segment.get("record_id") or 0)
+            if (
+                0 <= record_id < len(records)
+                and str(records[record_id].get("uuid") or "") == uuid_value
+            ):
+                target_start = cursor
+                target_end = cursor + count
+                break
+        cursor += count
+    if target_start < 0 or target_end <= target_start:
+        return None
+
+    if limit > 0:
+        span = min(limit, target_end - target_start)
+        context = max(0, limit - span)
+        before_budget = context // 2
+        after_budget = context - before_budget
+        start = max(0, target_start - before_budget)
+        end = min(total, target_start + span + after_budget)
+        if end - start < limit:
+            start = max(0, end - limit)
+            end = min(total, start + limit)
+        if not (start <= target_start < end):
+            start = max(0, min(target_start, total - limit))
+            end = min(total, start + limit)
+    else:
+        start = max(0, target_start - max(0, before))
+        end = min(total, target_end + max(0, after))
+
+    window, _total, win_offset, has_later = _interrupted_history_window(
+        transcript_path,
+        index,
+        snapshots,
+        annotations,
+        "full",
+        offset=start,
+        limit=end - start,
+    )
+    return window, _total, win_offset, has_later
+
+
 @router.get("/sessions/{sid}/export", dependencies=[Depends(require_token_query)])
 def export_session_markdown(sid: str) -> Response:
     """Render the transcript as a single Markdown file the user can save.
@@ -7394,12 +8446,12 @@ def _clear_session_runtime_state(sid: str) -> list[asyncio.Task]:
     })
 
 
-def purge_session_storage(sid: str) -> bool:
-    """Synchronously delete disk-owned session state.
+def _purge_single_session_storage(sid: str) -> bool:
+    """Synchronously delete one runtime's disk-owned session state.
 
-    This compatibility path performs no asyncio mutation and is safe from a
-    worker thread. Request handlers use :func:`purge_session_storage_async` so
-    loop-owned turns/watchers are cancelled and joined as well.
+    This internal primitive deliberately does not walk rollover links; callers
+    that already froze a lineage (including rollback of a provisional child)
+    can therefore remove exactly one runtime.
     """
     with sess.session_lifecycle_lock(sid):
         return _purge_session_storage_disk_locked(sid)
@@ -7441,6 +8493,112 @@ def _purge_session_storage_disk_locked(sid: str) -> bool:
             pass
     _delete_active_turn_sidecar(sid)
     _delete_cancelled_turn_snapshots(sid)
+    _delete_runtime_continuation_outboxes(sid)
+    return removed
+
+
+def purge_session_storage(sid: str) -> bool:
+    """Synchronously purge the complete durable rollover lineage from disk.
+
+    This compatibility path performs no asyncio mutation and is safe from a
+    worker thread. Request handlers use :func:`purge_session_storage_async` so
+    loop-owned turns/watchers are cancelled and joined as well.
+    """
+    lineage = sess.runtime_lineage(sid) or [sid]
+    pending_lineage = list(dict.fromkeys(lineage))
+    queued_lineage = set(pending_lineage)
+
+    def _has_live_runtime(runtime_ids: set[str]) -> bool:
+        """Fail closed when the sync path cannot join loop-owned writers."""
+        try:
+            for runtime_sid in runtime_ids:
+                active = _active_turns.get(runtime_sid)
+                watcher = _task_watchers.get(runtime_sid)
+                prewarm = _runtime_prewarm_tasks.get(runtime_sid)
+                drain = _queue_drain_tasks.get(runtime_sid)
+                runtime_lock = _session_runtime_locks.get(runtime_sid)
+                drain_lock = _queue_drain_locks.get(runtime_sid)
+                rollover_lock = _runtime_rollover_locks.get(runtime_sid)
+                if (
+                    (active is not None and not active.done)
+                    or _sessions_with_inflight_tasks.get(runtime_sid)
+                    or (watcher is not None and not watcher.done())
+                    or (prewarm is not None and not prewarm.done())
+                    or (drain is not None and not drain.done())
+                    or (runtime_lock is not None and runtime_lock.locked())
+                    or (drain_lock is not None and drain_lock.locked())
+                    or (rollover_lock is not None and rollover_lock.locked())
+                    or any(
+                        not task.done()
+                        for task in _session_disconnect_tasks.get(
+                            runtime_sid, set())
+                    )
+                    or any(
+                        not task.done()
+                        for task in _session_runtime_cleanup_tasks.get(
+                            runtime_sid, set())
+                    )
+                    or (
+                        (purge := _session_purge_tasks.get(runtime_sid))
+                        is not None and not purge.done()
+                    )
+                ):
+                    return True
+            if any(
+                key[0] in runtime_ids
+                for key in tuple(_clients)
+            ):
+                return True
+            if any(
+                source_sid in runtime_ids and not task.done()
+                for (source_sid, _), task
+                in tuple(_runtime_continuation_delivery_tasks.items())
+            ):
+                return True
+        except RuntimeError:
+            # A loop-thread registry changed during the cross-thread snapshot.
+            # That is itself proof the synchronous caller cannot safely own the
+            # lifecycle; the async path can serialize and join it.
+            return True
+        return False
+
+    if _has_live_runtime(queued_lineage):
+        raise RuntimeError(
+            "cannot synchronously purge a live runtime lineage; "
+            "use purge_session_storage_async"
+        )
+
+    removed = False
+    cursor = 0
+    while cursor < len(pending_lineage) and cursor < 32:
+        runtime_sid = pending_lineage[cursor]
+        cursor += 1
+        # Fence before re-reading the edge. A successor linked after the initial
+        # lineage snapshot either lands before this tombstone and is appended,
+        # or its rollover observes deletion and rolls the provisional child back.
+        sess.begin_session_delete(runtime_sid)
+        fenced_meta = sess.get_session_meta(runtime_sid)
+        late_successor = str(
+            (fenced_meta or {}).get("runtime_successor") or "")
+        if late_successor and late_successor not in queued_lineage:
+            if _has_live_runtime({late_successor}):
+                raise RuntimeError(
+                    "cannot synchronously purge a live runtime lineage; "
+                    "use purge_session_storage_async"
+                )
+            queued_lineage.add(late_successor)
+            pending_lineage.append(late_successor)
+        # Close the check -> reservation race. ``begin_session_delete`` now
+        # prevents any *new* turn/queue owner from committing, while this second
+        # observation catches one that reserved between the initial check and
+        # the tombstone. Leave the tombstone in place and let the async API join
+        # that exact owner; never race it with destructive disk removal.
+        if _has_live_runtime(queued_lineage):
+            raise RuntimeError(
+                "cannot synchronously purge a live runtime lineage; "
+                "use purge_session_storage_async"
+            )
+        removed = _purge_single_session_storage(runtime_sid) or removed
     return removed
 
 
@@ -7448,6 +8606,16 @@ async def _purge_session_storage_async_inner(sid: str) -> bool:
     # Fence queue writes before any await. A cancelled drain can still finish a
     # synchronous RMW, but every later save observes the tombstone.
     await asyncio.to_thread(sess.begin_session_delete, sid)
+    continuation_deliveries = [
+        task
+        for (source_sid, _), task
+        in tuple(_runtime_continuation_delivery_tasks.items())
+        if source_sid == sid and not task.done()
+    ]
+    for task in continuation_deliveries:
+        task.cancel()
+    if continuation_deliveries:
+        await asyncio.gather(*continuation_deliveries, return_exceptions=True)
     # Scheduler runs are separate from chat's TurnBroadcast/task-watcher
     # ownership.  Revoke and join them immediately after the tombstone so an
     # already-running scheduled query cannot append history, unread state, or
@@ -7526,11 +8694,11 @@ async def _purge_session_storage_async_inner(sid: str) -> bool:
         )
     _session_usage.pop(sid, None)
     _interrupted_at_startup.pop(sid, None)
-    return await asyncio.to_thread(purge_session_storage, sid)
+    return await asyncio.to_thread(_purge_single_session_storage, sid)
 
 
-async def purge_session_storage_async(sid: str) -> bool:
-    """Delete runtime and disk state under one reusable bounded owner.
+async def _purge_single_session_storage_async(sid: str) -> bool:
+    """Delete one runtime and its disk state under a reusable bounded owner.
 
     The destructive transaction remains shielded from an HTTP disconnect, but
     the request itself has a hard deadline. A retry joins the same owner rather
@@ -7586,49 +8754,21 @@ async def purge_session_storage_async(sid: str) -> bool:
             _session_purge_tasks.pop(sid, None)
 
 
-@router.delete("/sessions/{sid}", dependencies=[Depends(require_token)])
-async def delete_session_api(sid: str) -> dict:
-    # 404 only when NEITHER layer existed. Previously the sidecar was
-    # authoritative: an SDK-only session (sidecar lost / never written) got
-    # its JSONL deleted and THEN returned 404 — the user saw a failure while
-    # the transcript was already gone, and local cleanup was skipped.
-    lineage: list[str] = []
-    seen: set[str] = set()
-    current = sid
-    # Walk to the oldest runtime owner first so deleting the visible successor
-    # cannot strand an invisible CLI/background process.
-    predecessors: list[str] = []
-    while current and current not in seen and len(seen) < 32:
-        seen.add(current)
-        meta = await asyncio.to_thread(sess.get_session_meta, current)
-        predecessor = str((meta or {}).get("runtime_predecessor") or "")
-        if not predecessor:
-            break
-        predecessors.append(predecessor)
-        current = predecessor
-    lineage.extend(reversed(predecessors))
-    lineage.append(sid)
-    # Also cover an explicit API delete of a hidden predecessor.
-    current = sid
-    while len(seen) < 32:
-        meta = await asyncio.to_thread(sess.get_session_meta, current)
-        successor = str((meta or {}).get("runtime_successor") or "")
-        if not successor or successor in seen:
-            break
-        seen.add(successor)
-        lineage.append(successor)
-        current = successor
-    removed = False
+async def purge_session_storage_async(sid: str) -> bool:
+    """Delete every linked runtime generation containing ``sid``.
+
+    Fence each observed generation before cleanup, then re-read its successor
+    so a rollover that commits at the snapshot boundary is included rather than
+    leaving an invisible CLI, private snapshot or outbox behind.
+    """
+    lineage = await asyncio.to_thread(sess.runtime_lineage, sid) or [sid]
     pending_lineage = list(dict.fromkeys(lineage))
     queued_lineage = set(pending_lineage)
+    removed = False
     cursor = 0
     while cursor < len(pending_lineage) and cursor < 32:
         runtime_sid = pending_lineage[cursor]
         cursor += 1
-        # The eager detached fork runs in a worker and may have started after
-        # the lineage snapshot above. Fence first, then re-read the durable
-        # edge: if rollover linked just before the fence, include that child;
-        # if deletion won, rollover observes the tombstone and rolls it back.
         await asyncio.to_thread(sess.begin_session_delete, runtime_sid)
         fenced_meta = await asyncio.to_thread(
             sess.get_session_meta, runtime_sid)
@@ -7637,7 +8777,20 @@ async def delete_session_api(sid: str) -> dict:
         if late_successor and late_successor not in queued_lineage:
             queued_lineage.add(late_successor)
             pending_lineage.append(late_successor)
-        removed = await purge_session_storage_async(runtime_sid) or removed
+        removed = (
+            await _purge_single_session_storage_async(runtime_sid)
+            or removed
+        )
+    return removed
+
+
+@router.delete("/sessions/{sid}", dependencies=[Depends(require_token)])
+async def delete_session_api(sid: str) -> dict:
+    # 404 only when NEITHER layer existed. Previously the sidecar was
+    # authoritative: an SDK-only session (sidecar lost / never written) got
+    # its JSONL deleted and THEN returned 404 — the user saw a failure while
+    # the transcript was already gone, and local cleanup was skipped.
+    removed = await purge_session_storage_async(sid)
     if not removed:
         raise HTTPException(404, "session not found")
     return {"ok": True}
@@ -9308,15 +10461,24 @@ async def context_breakdown(session_id: str, model: str = "") -> dict:
     m = (model or s.get("model") or MODEL).strip()
     # The context-breakdown call is read-only and effort-independent — find
     # ANY live client for this (sid, model) pair regardless of effort key.
-    matched = [k for k in _clients if k[0] == session_id and k[1] == m]
+    # Snapshot the matching runtime under the same lock used by client
+    # creation/eviction.  This endpoint is commonly opened while a turn is
+    # finishing or a model/permission change is rebuilding the runtime; an
+    # unlocked iteration over `_clients` could otherwise race a resize and
+    # fail with ``RuntimeError: dictionary changed size during iteration``.
+    # Release the lock before the SDK control request so a slow CLI cannot
+    # block unrelated client-pool work.
+    async with _lock:
+        matched = [
+            (k, client)
+            for k, client in _clients.items()
+            if k[0] == session_id and k[1] == m
+        ]
     if not matched:
         # No live client → can't ask CLI for breakdown. Surface this rather
         # than returning fake data; frontend can fall back to /usage.
         raise HTTPException(409, "no live client for this session — send a message first")
-    key = matched[0]
-    client = _clients.get(key)
-    if client is None:
-        raise HTTPException(409, "no live client for this session — send a message first")
+    _key, client = matched[0]
     try:
         breakdown = await client.get_context_usage()
         payload = dict(breakdown)
@@ -9353,12 +10515,12 @@ async def context_breakdown(session_id: str, model: str = "") -> dict:
             _mark_context_used(payload, "sdk_context", estimate=True)
         return payload
     except Exception as e:
-        # Log the raw exception to stderr (it can contain CLI subprocess
-        # stderr lines that mention ~/.claude/.credentials.json paths or
-        # vendor URLs / 401 echoes carrying API-key prefixes); return a
-        # generic message to the client.
-        sys.stderr.write(f"[chat] get_context_usage failed for sid={session_id[:8]}: "
-                          f"{type(e).__name__}: {e}\n")
+        # CLI exceptions may contain credentials paths, vendor URLs, prompt
+        # fragments or protocol bodies.  The API already returns a generic
+        # error; the service log keeps only the failure class.
+        sys.stderr.write(
+            f"[chat] get_context_usage failed sid={session_id[:8]} "
+            f"exc={type(e).__name__}\n")
         sys.stderr.flush()
         raise HTTPException(500, "context-usage probe failed") from None
 
@@ -9460,8 +10622,8 @@ def _schedule_post_compact_refresh(
                 _refresh_compacted_message_counts, sid, model)
         except Exception as e:
             sys.stderr.write(
-                f"[chat] post-compact count refresh skipped sid={sid[:8]}: "
-                f"{type(e).__name__}: {e}\n")
+                f"[chat] post-compact count refresh skipped sid={sid[:8]} "
+                f"exc={type(e).__name__}\n")
 
     task = asyncio.create_task(_run())
     _maintenance_tasks.add(task)
@@ -9595,7 +10757,8 @@ async def _native_compact_session_locked(sid: str) -> dict:
         if status < 400 or status > 599:
             status = 500
         sys.stderr.write(
-            f"[chat] native /compact rejected for sid={sid[:8]}: {e}\n")
+            f"[chat] native /compact rejected sid={sid[:8]} "
+            f"kind={classified['kind']}\n")
         sys.stderr.flush()
         raise HTTPException(status, str(e)) from None
     except Exception as e:
@@ -9640,8 +10803,10 @@ async def _native_compact_session_locked(sid: str) -> dict:
                 "recovered_session": recovery["session"],
                 "recovery_stats": recovery["stats"],
             }
-        sys.stderr.write(f"[chat] native /compact failed for sid={sid[:8]}: "
-                          f"{type(e).__name__}: {e}\n")
+        sys.stderr.write(
+            f"[chat] native /compact failed sid={sid[:8]} "
+            f"exc={type(e).__name__} "
+            f"kind={_classify_stream_error(str(e)).get('kind', 'unknown')}\n")
         sys.stderr.flush()
         raise HTTPException(500, "native /compact failed — see server log") from None
     # Refresh the cached context-usage snapshot from the now-compacted live
@@ -9762,8 +10927,9 @@ def fork_session_api(sid: str, req: ForkReq) -> dict:
     except ValueError as e:
         raise HTTPException(400, str(e))
     except Exception as e:
-        sys.stderr.write(f"[chat] fork session failed for sid={sid[:8]}: "
-                          f"{type(e).__name__}: {e}\n")
+        sys.stderr.write(
+            f"[chat] fork session failed sid={sid[:8]} "
+            f"exc={type(e).__name__}\n")
         sys.stderr.flush()
         raise HTTPException(500, "fork failed — see server log") from None
     new_sid = result.session_id
@@ -9864,9 +11030,15 @@ def _sync_runtime_successor_postlude(source_sid: str) -> dict[str, int]:
             uuid_mapping = _runtime_fork_uuid_mapping(child_sid)
             copied += sess.copy_message_annotations(
                 current_sid, child_sid, uuid_mapping)
+            # UI-only continuation bubbles are deliberately absent from the
+            # Claude JSONL fork.  Carry them across explicitly so a later
+            # rollover does not make an already-visible Agent reply disappear;
+            # their anchors are translated through the same per-edge UUID map.
+            _copy_runtime_continuation_snapshots(
+                current_sid, child_sid, uuid_mapping)
         except Exception as exc:
             sys.stderr.write(
-                f"[chat] runtime annotation postlude sync failed "
+                f"[chat] runtime display postlude sync failed "
                 f"sid={current_sid[:8]} child={child_sid[:8]} "
                 f"exc={type(exc).__name__}\n"
             )
@@ -10030,6 +11202,11 @@ async def _continue_detached_runtime_locked(source_sid: str) -> dict:
                     title=source_name,
                 )
         forked = await asyncio.to_thread(_fork_runtime)
+        # Keep the marker fixed for this successor. The SDK rewrites the last
+        # copied record's timestamp during the fork; sampling immediately
+        # afterwards is therefore strictly outside the inherited history.
+        runtime_fork_boundary_at = datetime.now(UTC).isoformat().replace(
+            "+00:00", "Z")
     except FileNotFoundError:
         raise HTTPException(404, "source transcript not found") from None
     except ValueError as exc:
@@ -10069,6 +11246,7 @@ async def _continue_detached_runtime_locked(source_sid: str) -> dict:
             activity_hidden=bool(source_meta.get("activity_hidden", False)),
             runtime_profile=source_meta.get("runtime_profile") or "",
             runtime_predecessor=source_sid,
+            runtime_fork_boundary_at=runtime_fork_boundary_at,
             cwd=source_meta.get("cwd") or str(ROOT),
         )
         _JSONL_PATH_CACHE.pop(child_sid, None)
@@ -10114,17 +11292,33 @@ async def _continue_detached_runtime_locked(source_sid: str) -> dict:
         with suppress(Exception):
             await asyncio.to_thread(
                 sess.migrate_queue, child_sid, source_sid)
-        await asyncio.to_thread(sess.delete_session, child_sid)
         try:
-            with _session_config_dir(source_model):
-                sdk_delete_session(
-                    child_sid,
-                    directory=str(sess.session_workspace(source_sid)),
-                )
+            # The child may already contain copied annotations, task overlays,
+            # transcript index and presentation-only continuation snapshots.
+            # Rollback must use the same complete disk purge as DELETE, not just
+            # remove its session row and SDK JSONL.
+            await asyncio.to_thread(_purge_single_session_storage, child_sid)
         except Exception:
-            child_path = _find_session_jsonl(child_sid)
-            if child_path is not None:
-                child_path.unlink(missing_ok=True)
+            # Preserve the original rollover error, but still make a best-effort
+            # privacy sweep if an unexpected purge implementation fails.
+            await asyncio.to_thread(sess.delete_session, child_sid)
+            await asyncio.to_thread(
+                _delete_cancelled_turn_snapshots, child_sid)
+            await asyncio.to_thread(
+                _delete_runtime_continuation_outboxes, child_sid)
+            await asyncio.to_thread(_delete_active_turn_sidecar, child_sid)
+            with suppress(OSError):
+                _transcript_index_path(child_sid).unlink(missing_ok=True)
+            try:
+                with _session_config_dir(source_model):
+                    sdk_delete_session(
+                        child_sid,
+                        directory=str(sess.session_workspace(source_sid)),
+                    )
+            except Exception:
+                child_path = _find_session_jsonl(child_sid)
+                if child_path is not None:
+                    child_path.unlink(missing_ok=True)
         status = 409 if isinstance(exc, ValueError) else 500
         raise HTTPException(status, "runtime rollover could not commit") from None
     if queue_move["target"].get("items"):
@@ -10652,11 +11846,13 @@ async def interrupt(session_id: str) -> dict:
             return f"{k[0]}@{k[1]}"
         except asyncio.TimeoutError:
             sys.stderr.write(
-                f"[chat-interrupt] {k} ack timed out after "
+                f"[chat-interrupt] sid={obs.short_id(k[0])} "
+                f"ack timed out after "
                 f"{_INTERRUPT_ACK_TIMEOUT_S:.2f}s; force-stop armed\n")
         except Exception as e:
             sys.stderr.write(
-                f"[chat-interrupt] {k} failed: {type(e).__name__}: {e}\n")
+                f"[chat-interrupt] sid={obs.short_id(k[0])} "
+                f"failed exc={type(e).__name__}\n")
         return None
 
     results = await asyncio.gather(
@@ -10702,8 +11898,8 @@ async def stop_background_task(sid: str, task_id: str) -> dict:
         except Exception as e:
             errors.append(f"{k[0]}@{k[1]}: {type(e).__name__}: {e}")
             sys.stderr.write(
-                f"[chat] stop_task failed sid={sid} task={task_id}: "
-                f"{errors[-1]}\n")
+                f"[chat] stop_task failed sid={obs.short_id(sid)} "
+                f"task={obs.short_id(task_id)} exc={type(e).__name__}\n")
     raise HTTPException(status_code=502, detail="; ".join(errors))
 
 
@@ -10728,7 +11924,8 @@ async def _force_stop_after_grace(
         if _active_turns.get(session_id) is not bc or bc.done:
             return
         sys.stderr.write(
-            f"[chat-interrupt] sid={session_id} did not drain after {grace:.1f}s; "
+            f"[chat-interrupt] sid={obs.short_id(session_id)} "
+            f"did not drain after {grace:.1f}s; "
             f"forcing client teardown\n")
         sys.stderr.flush()
         bc.cancelled = True
@@ -10762,8 +11959,8 @@ async def _force_stop_after_grace(
         _delete_active_turn_sidecar(session_id)
     except Exception as e:
         sys.stderr.write(
-            f"[chat-interrupt] force-stop watchdog failed sid={session_id}: "
-            f"{type(e).__name__}: {e}\n")
+            f"[chat-interrupt] force-stop watchdog failed "
+            f"sid={obs.short_id(session_id)} exc={type(e).__name__}\n")
         sys.stderr.flush()
 
 
@@ -12002,9 +13199,8 @@ async def upload_image(file: UploadFile = File(...)) -> dict:
         # generic upload limit. Kept as a named constant so the error message
         # stays honest about which limit was hit.
         if len(body) > _TEXT_MAX_BYTES:
-            sys.stderr.write(
-                f"[upload] large text attachment: {len(body)} bytes "
-                f"name={Path(name).name!r} — persisted to disk, not inlined\n")
+            _perf_event(
+                "upload.large_text", kind="text", bytes=len(body))
         entry["raw"] = body
     elif kind == "xlsx":
         # Store the ORIGINAL workbook (the user asked for the real file to
@@ -12028,18 +13224,16 @@ async def upload_image(file: UploadFile = File(...)) -> dict:
     # the store past its byte / entry caps (anti-OOM). (perf: ORANGE — chat.py
     # _image_store unbounded)
     _enforce_image_budget()
-    # Diagnostic timing — logs to journalctl so we can cross-reference
-    # against the frontend's console.log when uploads feel slow. Splits
-    # into "read body" (multipart parse + transfer-out-of-uvicorn) vs
-    # "total" (incl. base64 / dict insert) so we know where the time
-    # actually went on the server side.
+    # Content-free upload timing.  File names and MIME strings can disclose
+    # private workspace details, so keep only the closed-set kind and sizes.
     _t_end = time.perf_counter()
-    _safe_name = Path(file.filename or "upload").name
-    sys.stderr.write(
-        f"[upload] kind={kind} mime={mime} bytes={len(body)} "
-        f"name={_safe_name!r} read_ms={(_t_read_end - _t_read_start)*1000:.0f} "
-        f"total_ms={(_t_end - _t0)*1000:.0f}\n")
-    sys.stderr.flush()
+    _perf_event(
+        "upload.complete",
+        kind=kind,
+        bytes=len(body),
+        read_ms=obs.elapsed_ms(_t_read_start, _t_read_end),
+        total_ms=obs.elapsed_ms(_t0, _t_end),
+    )
     # Tell the FE the on-disk extension we'll use when persisting this
     # image at send-time. FE assembles the lightbox URL from
     # (currentId, aid, ext) immediately and stores it on the user
@@ -12362,6 +13556,29 @@ def _task_watch_timeout_remaining(task_ids: Iterable[str]) -> float | None:
     return max(0.05, newest_pin + _TASK_WATCH_TIMEOUT - now)
 
 
+def _resolve_runtime_task_owner(
+    observer_session_id: str,
+    task_id: str,
+) -> str | None:
+    """Return the runtime that is authoritative for one inherited task.
+
+    Live process pins win over persisted UI state.  This both closes the
+    settle/link race and repairs the decision boundary for sidecars written by
+    older releases where a successor briefly claimed the same task id.
+    """
+    sid = str(observer_session_id or "")
+    tid = str(task_id or "")
+    if not sid or not tid:
+        return None
+    lineage = sess.runtime_lineage(sid) or [sid]
+    for candidate in lineage:
+        if tid in _sessions_with_inflight_tasks.get(candidate, ()):
+            return candidate
+    overlay = sess.get_authoritative_runtime_task_overlays(sid).get(tid, {})
+    owner = str(overlay.get("owner_session_id") or "")
+    return owner or None
+
+
 def _settle_background_task(session_id: str, task_id: str) -> bool:
     """Unpin a background task ONCE, from whichever path observes its terminal
     TaskNotification first — the in-turn dispatch or the cross-turn watcher.
@@ -12403,12 +13620,13 @@ def _on_task_settled(
     summary: str | None = None,
     output_file: str | None = None,
     usage: dict | None = None,
-) -> bool:
+) -> bool | None:
     """SINGLE settlement entry for a background task's terminal signal.
 
     Every observer path (in-turn typed / in-turn XML fallback / cross-turn
     watcher typed / cross-turn watcher XML fallback) funnels through here, so
-    settlement side-effects live in exactly one place: dedup + unpin via
+    settlement side-effects live in exactly one place: ownership validation,
+    durable overlay, then dedup + unpin via
     _settle_background_task (returns False when the other path already won —
     caller must then NOT surface the event).
 
@@ -12422,9 +13640,17 @@ def _on_task_settled(
         turn; the turn-done push (chat.py _handle_result_message) is the one
         notification the user wants, and queue-paused-on-error still pushes
         because that one means "Muse is stuck waiting for YOU".
+    Returns ``True`` for the owner's first terminal signal, ``False`` for a
+    same-owner duplicate that may enrich metadata, and ``None`` for a foreign
+    or unknown signal. Callers must suppress and otherwise ignore ``None``.
+
     `status` stays in the signature: callers still report it, and it documents
     the terminal kinds should the push ever come back.
     """
+    owner = _resolve_runtime_task_owner(session_id, task_id)
+    if owner is None or owner != session_id:
+        return None
+
     # Persist before settlement consumes the launch metadata. Do this even for
     # a duplicate terminal signal: a later typed notification often carries a
     # richer summary/output path than the first terminal TaskUpdated patch.
@@ -12559,6 +13785,10 @@ async def _watch_inflight_tasks(
     this watcher has delivered every settlement + auto-continuation. This is
     deliberately stricter than cancelling the watcher: cancellation could
     leave an old continuation buffered for the next user turn to misattribute."""
+    watch_started = obs.monotonic()
+    watched_task_ids = set(pending)
+    continuation_seen = False
+    watch_error_kind = "none"
     cont: TurnBroadcast | None = None
     cont_state: dict | None = None
     activity_failed = False
@@ -12578,9 +13808,16 @@ async def _watch_inflight_tasks(
 
     async def _open_continuation() -> None:
         """Register a fresh continuation broadcast in _active_turns[sid] under
-        the lock. If a live turn somehow holds the slot, leave cont None —
-        _emit_settlement then publishes into THAT turn's broadcast instead."""
-        nonlocal cont, cont_state
+        the lock when possible, while ALWAYS retaining a private collector.
+
+        A terminal task event can land in the narrow interval where the source
+        turn has published ResultMessage but still owns `_active_turns`.  The
+        old implementation returned with ``cont is None`` in that case: the
+        card flip rode the live carrier, but the following AssistantMessage was
+        never rendered or persisted.  A collector is independent of that UI
+        slot; the occupied live broadcast remains an optional second carrier.
+        """
+        nonlocal cont, cont_state, continuation_seen
         if not _owns_generation():
             return
         b = TurnBroadcast(session_id=session_id, model=continuation_model)
@@ -12588,13 +13825,14 @@ async def _watch_inflight_tasks(
             session_id, b.started_at)
         b.parent_turn_id = _background_origin_turn_id.get(session_id, "")
         b.is_continuation = True
+        b.perf_client = "warm"
+        continuation_seen = True
         async with _lock:
             if not _owns_generation():
                 return
             existing = _active_turns.get(session_id)
-            if existing is not None and not existing.done:
-                return   # a live turn raced in — _emit_settlement handles it
-            _active_turns[session_id] = b
+            if existing is None or existing.done:
+                _active_turns[session_id] = b
         cont = b
         cont_state = {
             "tool_use_names": {},
@@ -12627,15 +13865,15 @@ async def _watch_inflight_tasks(
         tool_use_id). So fall back to it, and only report a drop when there is
         genuinely nobody to publish to.
         """
+        delivered = False
         if cont is not None:
             cont.publish(event)
-            return True
+            delivered = True
         live = _active_turns.get(session_id)
-        if live is not None and not live.done:
+        if live is not None and live is not cont and not live.done:
             live.publish(event)
-            sys.stderr.write(
-                f"[chat] task watcher: settlement published into the live "
-                f"turn sid={session_id[:8]} turn={live.turn_id[:8]}\n")
+            delivered = True
+        if delivered:
             return True
         sys.stderr.write(
             f"[chat] task watcher: settlement had no carrier "
@@ -12656,6 +13894,10 @@ async def _watch_inflight_tasks(
         cont_state = None
         if b is None:
             return
+        # Shutdown marks every active broadcast before cancelling its watcher.
+        # Treat that as cancellation even when the finally block is the caller;
+        # a streamed prefix is not a truthful completed Agent reply.
+        cancelled = bool(cancelled or b.cancelled)
         incomplete_error = (state or {}).get("incomplete_error")
         completed_at_ms = int(time.time() * 1000)
         assistant_uuid = str((state or {}).get("assistant_uuid") or "")
@@ -12669,6 +13911,13 @@ async def _watch_inflight_tasks(
             "failed" if incomplete_error else
             "completed"
         )
+        b.perf_status = terminal_status
+        b.perf_error_kind = (
+            "cancelled" if cancelled else
+            "background_continuation_incomplete" if incomplete_error else
+            "none"
+        )
+        b.perf_background_count = len(pending)
         done_payload = {
             "cancelled": cancelled,
             "model": b.model,
@@ -12716,6 +13965,24 @@ async def _watch_inflight_tasks(
                     f"[chat] continuation footer annotation failed "
                     f"sid={session_id[:8]}: {type(e).__name__}\n")
                 sys.stderr.flush()
+        # A rollover intentionally excludes source-only task notifications and
+        # continuation text from the successor's Claude transcript.  Stage the
+        # final Agent prose in a private durable outbox, then let a separate
+        # delivery owner wait for the latest visible leaf to become idle and
+        # anchor one presentation-only bubble there.  Do not mark the source
+        # replay consumed here: if the eager rollover later rolls back, the
+        # still-public source must retain its normal live continuation path.
+        if not cancelled and not sess.session_is_deleting(session_id):
+            event_id = _persist_runtime_continuation_outbox(
+                session_id,
+                b,
+                completed_at_ms=completed_at_ms,
+                elapsed_s=cont_elapsed,
+                terminal_status=terminal_status,
+                incomplete_error=str(incomplete_error or ""),
+            )
+            if event_id:
+                _schedule_runtime_continuation_delivery(session_id, event_id)
         b.finish()
         async with _lock:
             if _active_turns.get(session_id) is b:
@@ -12732,7 +13999,7 @@ async def _watch_inflight_tasks(
         transcript rendering/conversation counts by the SDK's `isMeta`
         semantics.
         """
-        nonlocal activity_failed
+        nonlocal activity_failed, watch_error_kind
         if (pending or cont is None or cont_state is None
                 or last_settle_status == "stopped"
                 or cont_state["explicit_resume_requested"]):
@@ -12765,13 +14032,15 @@ async def _watch_inflight_tasks(
             return True
         except Exception as e:
             activity_failed = True
+            watch_error_kind = "explicit_resume"
             cont_state["incomplete_error"] = (
                 "后台任务已经完成，但最终答复续接失败。请发送“继续”让 Muse "
                 f"完成上一轮。（{type(e).__name__}）"
             )
             sys.stderr.write(
                 f"[chat] task watcher: explicit resume failed "
-                f"sid={session_id[:8]}: {type(e).__name__}: {e}\n")
+                f"sid={session_id[:8]} exc={type(e).__name__} "
+                f"kind=explicit_resume\n")
             return False
 
     def _mark_incomplete() -> None:
@@ -12854,15 +14123,17 @@ async def _watch_inflight_tasks(
             if not task_id or task_id not in pending:
                 continue
             status = terminal.get("status") or None
-            won = _on_task_settled(
+            outcome = _on_task_settled(
                 session_id, task_id, status=status,
                 tool_use_id=terminal.get("tool_use_id"),
                 summary=terminal.get("summary"),
                 output_file=terminal.get("output_file"),
                 usage=dict(terminal.get("usage") or {}))
+            if outcome is None:
+                continue
             pending.pop(task_id, None)
             last_settle_status = str(status or "") or None
-            if won:
+            if outcome:
                 if cont is None:
                     await _open_continuation()
                 _emit_settlement({
@@ -12883,11 +14154,13 @@ async def _watch_inflight_tasks(
         """Publish a stopped terminal only after the owner process is gone."""
         nonlocal last_settle_status
         for task_id in tuple(pending):
-            won = _on_task_settled(
+            outcome = _on_task_settled(
                 session_id, task_id, status="stopped",
                 summary="后台任务超过安全运行时限，已终止其运行环境。")
+            if outcome is None:
+                continue
             pending.pop(task_id, None)
-            if won:
+            if outcome:
                 if cont is None:
                     await _open_continuation()
                 _emit_settlement({
@@ -13071,11 +14344,9 @@ async def _watch_inflight_tasks(
                         summary=getattr(msg, "summary", None),
                         output_file=getattr(msg, "output_file", None),
                         usage=dict(getattr(msg, "usage", None) or {}))
+                    if won_typed is None:
+                        continue
                     last_settle_status = getattr(msg, "status", None)
-                    sys.stderr.write(
-                        f"[chat] task watcher: typed notification "
-                        f"sid={session_id[:8]} task={tid} "
-                        f"status={last_settle_status} won={won_typed}\n")
                     pending.pop(tid, None)
                     _reschedule_watch_deadline()
                     if won_typed:
@@ -13101,11 +14372,9 @@ async def _watch_inflight_tasks(
                             summary=terminal.get("summary"),
                             output_file=terminal.get("output_file"),
                             usage=dict(terminal.get("usage") or {}))
+                        if won_updated is None:
+                            continue
                         last_settle_status = terminal["status"]
-                        sys.stderr.write(
-                            f"[chat] task watcher: terminal update "
-                            f"sid={session_id[:8]} task={tid} "
-                            f"status={last_settle_status} won={won_updated}\n")
                         pending.pop(tid, None)
                         _reschedule_watch_deadline()
                         if won_updated:
@@ -13128,18 +14397,20 @@ async def _watch_inflight_tasks(
                     # user turn (2026-06-11 sleep-300 bug).
                     tid = getattr(msg, "task_id", "") or ""
                     desc = getattr(msg, "description", None)
-                    if tid:
+                    accepted_start = (
+                        bool(tid) and _record_background_task_launch(
+                            session_id,
+                            tid,
+                            tool_use_id=getattr(msg, "tool_use_id", None),
+                            description=desc,
+                        )
+                    )
+                    if accepted_start:
+                        watched_task_ids.add(tid)
                         pending[tid] = desc
                         _pin_background_task(session_id, tid)
-                        _record_background_task_launch(
-                            session_id, tid,
-                            tool_use_id=getattr(msg, "tool_use_id", None),
-                            description=desc)
-                        sys.stderr.write(
-                            f"[chat] task watcher: typed start "
-                            f"sid={session_id[:8]} task={tid}\n")
                         _reschedule_watch_deadline()
-                    if cont is not None:
+                    if cont is not None and accepted_start:
                         cont.publish({"event": "task_started",
                                       "data": json.dumps({
                             "task_id": tid,
@@ -13167,17 +14438,22 @@ async def _watch_inflight_tasks(
                     sys.stderr.write(
                         f"[chat] task fallback: watcher settled via "
                         f"<task-notification> XML, typed message missed "
-                        f"sid={session_id}\n")
-                    won = [n for n in notifs
-                           if _on_task_settled(
-                               session_id, n.get("task_id") or "",
-                               status=n.get("status") or None,
-                               tool_use_id=n.get("tool_use_id") or None,
-                               summary=n.get("summary") or None,
-                               output_file=n.get("output_file") or None)]
+                        f"sid={session_id[:8]}\n")
+                    won: list[dict[str, Any]] = []
                     for n in notifs:
-                        pending.pop(n.get("task_id") or "", None)
+                        tid = n.get("task_id") or ""
+                        outcome = _on_task_settled(
+                            session_id, tid,
+                            status=n.get("status") or None,
+                            tool_use_id=n.get("tool_use_id") or None,
+                            summary=n.get("summary") or None,
+                            output_file=n.get("output_file") or None)
+                        if outcome is None:
+                            continue
+                        pending.pop(tid, None)
                         last_settle_status = n.get("status") or None
+                        if outcome:
+                            won.append(n)
                     _reschedule_watch_deadline()
                     if won and cont is None:
                         await _open_continuation()
@@ -13208,12 +14484,16 @@ async def _watch_inflight_tasks(
         # watcher can continue ownership; ordinary new turns never cancel a
         # live watcher.
         watcher_cancelled = True
+        watch_error_kind = "cancelled"
         raise
     except asyncio.TimeoutError:
         activity_failed = True
+        watch_error_kind = "timeout"
         await _terminate_expired_tasks("reached its absolute task deadline")
     except Exception as e:
         activity_failed = True
+        watch_error_kind = str(
+            _classify_stream_error(str(e)).get("kind") or "unknown")
         sys.stderr.write(
             f"[chat] task watcher sid={session_id[:8]} err: "
             f"{type(e).__name__}; entering safe termination\n")
@@ -13224,17 +14504,47 @@ async def _watch_inflight_tasks(
         if _bg_stream is not None and bg_q is not None:
             _bg_stream.detach_background(bg_q)
         # Close any continuation still open (e.g. grace timeout / outer
-        # timeout / stream end with no ResultMessage). No-op on the
-        # cancellation path (cont is None by the invariant), so we never await
-        # while cancelled.
+        # timeout / stream end with no ResultMessage). Shutdown may cancel after
+        # a partial AssistantMessage; pass that cancellation through so the
+        # prefix is closed live but never staged as a completed Agent bubble.
         if cont is not None:
             try:
-                await _close_continuation()
-            except Exception:
-                pass
-        sys.stderr.write(
-            f"[chat] task watcher exit sid={session_id[:8]} "
-            f"pending_left={sorted(pending)}\n")
+                await _close_continuation(cancelled=watcher_cancelled)
+            except Exception as exc:
+                activity_failed = True
+                if watch_error_kind == "none":
+                    watch_error_kind = str(
+                        _classify_stream_error(str(exc)).get("kind")
+                        or "continuation_close")
+        _safe_last_status = (
+            str(last_settle_status)
+            if last_settle_status in {
+                "completed", "failed", "stopped", "cancelled", "done",
+            }
+            else "none"
+        )
+        _watch_status = (
+            "cancelled" if watcher_cancelled else
+            "failed" if activity_failed else
+            "incomplete" if pending else
+            "completed"
+        )
+        if watch_error_kind == "none" and pending:
+            watch_error_kind = "pending"
+        _perf_event(
+            "chat.background",
+            sid8=obs.short_id(session_id),
+            origin_turn8=obs.short_id(
+                activity_owner_id
+                or _background_origin_turn_id.get(session_id, "")),
+            tasks_count=len(watched_task_ids),
+            settled_count=len(watched_task_ids - set(pending)),
+            watch_ms=obs.elapsed_ms(watch_started),
+            continuation=continuation_seen,
+            status=_watch_status,
+            last_status=_safe_last_status,
+            error_kind=watch_error_kind,
+        )
         # Close the logical turn before queue drain can start another turn and
         # reuse this session's single Activity Center row.
         if (not watcher_cancelled
@@ -13264,13 +14574,15 @@ async def _watch_inflight_tasks(
                     except Exception as e:
                         sys.stderr.write(
                             f"[chat] post-task runtime rebuild failed "
-                            f"sid={session_id}: {e}\n")
+                            f"sid={session_id[:8]} "
+                            f"exc={type(e).__name__}\n")
                 try:
                     await _maybe_drain_queue(session_id)
                 except Exception as e:
                     sys.stderr.write(
                         f"[chat] post-task queue drain failed "
-                        f"sid={session_id}: {e}\n")
+                        f"sid={session_id[:8]} "
+                        f"exc={type(e).__name__}\n")
         if (_owns_generation()
                 and not _sessions_with_inflight_tasks.get(session_id)):
             _delete_active_turn_sidecar_if_idle(session_id)
@@ -13329,9 +14641,6 @@ def _spawn_task_watcher(
         _background_origin_turn_id.setdefault(session_id, origin_turn_id)
     generation = _continuation_generations.get(session_id, 0) + 1
     _continuation_generations[session_id] = generation
-    sys.stderr.write(
-        f"[chat] task watcher spawned sid={session_id[:8]} "
-        f"generation={generation} pending={sorted(pending)}\n")
     _task_watchers[session_id] = asyncio.create_task(
         _watch_inflight_tasks(
             session_id,
@@ -13427,6 +14736,8 @@ async def _finish_cancelled_startup(
             await _finish_activity(session_id, broadcast, "cancelled")
             async with _lock:
                 if not broadcast.done:
+                    broadcast.perf_status = "cancelled"
+                    broadcast.perf_error_kind = "cancelled"
                     broadcast.publish({
                         "event": "cancelled",
                         "data": json.dumps({
@@ -13495,14 +14806,17 @@ async def _start_activity_early(
                 start_task.result()
             except Exception as e:
                 sys.stderr.write(
-                    f"[activity] start failed sid={session_id}: {e}\n")
+                    f"[activity] start failed sid={session_id[:8]} "
+                    f"exc={type(e).__name__}\n")
             else:
                 broadcast.activity_started = True
             raise
         else:
             broadcast.activity_started = True
     except Exception as e:
-        sys.stderr.write(f"[activity] start failed sid={session_id}: {e}\n")
+        sys.stderr.write(
+            f"[activity] start failed sid={session_id[:8]} "
+            f"exc={type(e).__name__}\n")
 
 
 async def _finish_activity(
@@ -13536,7 +14850,8 @@ async def _finish_activity(
             raise
     except Exception as e:
         sys.stderr.write(
-            f"[activity] startup finish failed sid={session_id}: {e}\n")
+            f"[activity] startup finish failed sid={session_id[:8]} "
+            f"exc={type(e).__name__}\n")
     finally:
         broadcast.activity_started = False
 
@@ -13549,6 +14864,10 @@ async def _abort_turn_startup(
     pause_queue: bool = True,
 ) -> bool:
     """Settle every owner created before an SDK query has been sent."""
+    broadcast.perf_status = status
+    if status != "completed" and broadcast.perf_error_kind == "none":
+        broadcast.perf_error_kind = (
+            "cancelled" if status == "cancelled" else "startup")
     queue_settled = False
     if broadcast.queue_item_id:
         try:
@@ -13601,6 +14920,8 @@ async def _fail_queued_attachment_startup(
     cleanup.  The durable claim is released with the exact turn id; the item and
     its attachment ids remain visible in the paused queue for edit/reattach.
     """
+    broadcast.perf_status = "failed"
+    broadcast.perf_error_kind = "attachment"
     queue_settled = False
     try:
         queue_settled = sess.release_queue_claim(
@@ -13689,6 +15010,7 @@ async def _finish_background_activity(
                 status,
                 activity_source="background",
                 owner_id=owner_id,
+                mark_read=True,
             )
         )
         try:
@@ -13701,13 +15023,10 @@ async def _finish_background_activity(
                     continue
             finish_task.result()
             raise
-        # The visible successor already shows the predecessor-owned task card.
-        # Do not also light the global Activity Center for the hidden source.
-        if (sess.get_session_meta(session_id) or {}).get("runtime_successor"):
-            await asyncio.to_thread(_activity.ack, sid=session_id)
     except Exception as e:
         sys.stderr.write(
-            f"[activity] background finish failed sid={session_id}: {e}\n")
+            f"[activity] background finish failed sid={session_id[:8]} "
+            f"exc={type(e).__name__}\n")
 
 
 async def _start_turn(
@@ -13828,6 +15147,8 @@ async def _start_turn(
         except Exception:
             async with _lock:
                 if _active_turns.get(session_id) is broadcast:
+                    broadcast.perf_status = "failed"
+                    broadcast.perf_error_kind = "queue_bind"
                     broadcast.finish()
                     _active_turns.pop(session_id, None)
             raise _TurnStartError("could not bind queued message to turn")
@@ -13870,6 +15191,7 @@ async def _start_turn(
         # Virgin session — frontend's choice gets persisted on first send.
         model_to_use = model or MODEL
         sess.update_model(session_id, model_to_use)
+    broadcast.model = model_to_use
 
     # Permission is a session setting, not a browser-global preference. A
     # direct request remains authoritative and is persisted for legacy clients
@@ -13912,6 +15234,7 @@ async def _start_turn(
     # a 500. Also: release the reservation we made at the top of NEW-TURN
     # MODE, otherwise this session's slot stays "busy" forever and
     # subsequent sends get rejected.
+    _client_started = obs.monotonic()
     try:
         # Serialize client creation/replacement with scheduler and /compact.
         # The active-turn reservation above is visible before we wait here, so
@@ -13923,6 +15246,21 @@ async def _start_turn(
             }
             if permission == "plan":
                 client_kwargs["plan_return_permission"] = plan_return_to_use
+            _client_key = (
+                session_id, model_to_use, effort_to_use, service_tier_to_use)
+            async with _lock:
+                _cached_client = _clients.get(_client_key)
+                _cached_permission = _client_permission.get(_client_key)
+                _cached_plan_return = _client_plan_return.get(_client_key, "")
+            broadcast.perf_client = (
+                "warm"
+                if (_cached_client is not None
+                    and session_id not in _pending_runtime_rebuilds
+                    and _cached_permission == permission
+                    and (permission != "plan"
+                         or _cached_plan_return == plan_return_to_use))
+                else "cold"
+            )
             startup_task = asyncio.create_task(
                 get_client(
                     session_id, model_to_use, permission,
@@ -13934,6 +15272,7 @@ async def _start_turn(
                 if broadcast.startup_task is startup_task:
                     broadcast.startup_task = None
     except asyncio.TimeoutError:
+        broadcast.perf_error_kind = "timeout"
         queue_settled = await _abort_turn_startup(
             session_id, broadcast, "failed", pause_queue=True)
         raise _TurnStartError(
@@ -13954,12 +15293,16 @@ async def _start_turn(
         raise
     except Exception as e:
         err_msg = str(e) or f"{type(e).__name__}"
+        broadcast.perf_error_kind = str(
+            _classify_stream_error(err_msg).get("kind") or "startup")
         # Free the reservation so the user can fix their config (e.g. add an
         # API key) and immediately retry without waiting for any timeout.
         queue_settled = await _abort_turn_startup(
             session_id, broadcast, "failed", pause_queue=True)
         raise _TurnStartError(
             err_msg, queue_claim_settled=queue_settled)
+    finally:
+        broadcast.perf_client_ms = obs.elapsed_ms(_client_started)
 
     # Stop can race the final instant of client startup: the client may have
     # committed to the pool just after /interrupt snapshotted an empty target
@@ -14031,8 +15374,10 @@ async def _start_turn(
                     full_url = f"/api/chat/attachments/{session_id}/{aid}.{ext}"
                 except Exception as _e:
                     sys.stderr.write(
-                        f"[attach] persist failed sid={session_id} aid={aid} "
-                        f"path={attach_dir} err={type(_e).__name__}: {_e}\n")
+                        f"[attach] persist failed "
+                        f"sid={obs.short_id(session_id)} "
+                        f"aid={obs.short_id(aid)} "
+                        f"exc={type(_e).__name__} kind=write\n")
                     sys.stderr.flush()
                 # Thumb for in-stream bubble (≤ 160 px, JPEG 60%).
                 thumb_b64 = None
@@ -14193,7 +15538,8 @@ async def _start_turn(
         except Exception as e:
             sys.stderr.write(
                 f"[chat-preflight] compact_progress emit failed "
-                f"sid={session_id[:8]} phase={phase}: {type(e).__name__}: {e}\n")
+                f"sid={session_id[:8]} phase={phase} "
+                f"exc={type(e).__name__}\n")
             sys.stderr.flush()
 
     async def _preflight_compact_if_needed(emit=None) -> None:
@@ -14670,7 +16016,12 @@ async def _start_turn(
                     _turn_transcript_boundary, session_id, model_to_use)
                 broadcast.transcript_boundary = transcript_boundary
                 _write_active_turn_sidecar(broadcast)
-                await _preflight_compact_if_needed(_emit_side)
+                _preflight_started = obs.monotonic()
+                try:
+                    await _preflight_compact_if_needed(_emit_side)
+                finally:
+                    broadcast.perf_preflight_ms = obs.elapsed_ms(
+                        _preflight_started)
                 # Snapshot AFTER preflight compact (which may write a new compact
                 # boundary) and immediately BEFORE this user query. A cache hit is
                 # cheap; to_thread keeps a long-session parse off the event loop.
@@ -14686,6 +16037,8 @@ async def _start_turn(
                 binary_blocks = [*img_blocks, *pdf_blocks]
 
                 async def _send_query() -> None:
+                    if not broadcast.perf_query_started:
+                        broadcast.perf_query_started = obs.monotonic()
                     if binary_blocks:
                         text_block = {"type": "text", "text": prompt}
                         content = [*binary_blocks, text_block]
@@ -14710,6 +16063,10 @@ async def _start_turn(
                     if decision in ("drop", "stale_result"):
                         replay_dropped += 1
                         return decision
+                    if (broadcast.perf_query_started
+                            and broadcast.perf_first_event_ms < 0):
+                        broadcast.perf_first_event_ms = obs.elapsed_ms(
+                            broadcast.perf_query_started)
                     await merge_q.put(("claude", msg))
                     return decision
 
@@ -14819,7 +16176,8 @@ async def _start_turn(
                         "waiting_approval", detail="Waiting for user input")
                 except Exception as e:
                     sys.stderr.write(
-                        f"[activity] waiting state failed sid={session_id}: {e}\n")
+                        f"[activity] waiting state failed sid={session_id[:8]} "
+                        f"exc={type(e).__name__}\n")
             return payload
 
         async def _flush_side_channels():
@@ -14948,15 +16306,6 @@ async def _start_turn(
                                  if full.startswith(streamed_str)
                                  else full)
                         if tail:
-                            sys.stderr.write(
-                                f"[chat-stream] sid={session_id} "
-                                f"TextBlock tail-emit: streamed="
-                                f"{len(streamed_str)} chars, "
-                                f"block.text={len(full)} chars, "
-                                f"emitting tail={len(tail)} chars "
-                                f"(prefix_match="
-                                f"{full.startswith(streamed_str)})\n")
-                            sys.stderr.flush()
                             assistant_acc.append(tail)
                             streamed_in_bubble.append(tail)
                             yield {"event": "text",
@@ -15024,7 +16373,7 @@ async def _start_turn(
                     sys.stderr.write(
                         f"[chat] task fallback: in-turn settle via "
                         f"<task-notification> XML, typed message missed "
-                        f"sid={session_id} task={tid}\n")
+                        f"sid={session_id[:8]} task={obs.short_id(tid)}\n")
                     inflight_tasks.pop(tid, None)
                     yield {"event": "task_notification", "data": json.dumps({
                         "task_id": tid,
@@ -15057,18 +16406,21 @@ async def _start_turn(
                                 sys.stderr.write(
                                     f"[chat] task fallback: bg launch detected "
                                     f"via tool_result sniff, TaskStartedMessage "
-                                    f"missed sid={session_id} task={tid}\n")
+                                    f"missed sid={session_id[:8]} "
+                                    f"task={obs.short_id(tid)}\n")
                                 desc = bg_launch_desc.get(tu_id)
+                                recorded = _record_background_task_launch(
+                                    session_id, tid,
+                                    tool_use_id=tu_id,
+                                    description=desc,
+                                    output_file=launch.get("output_file"))
+                                if not recorded:
+                                    continue
                                 inflight_tasks[tid] = {
                                     "tool_use_id": tu_id,
                                     "description": desc,
                                 }
                                 _pin_background_task(session_id, tid)
-                                _record_background_task_launch(
-                                    session_id, tid,
-                                    tool_use_id=tu_id,
-                                    description=desc,
-                                    output_file=launch.get("output_file"))
                                 # Stamp the launching card ⏳ running live, the
                                 # same shape _handle_task_message emits for a
                                 # typed TaskStartedMessage.
@@ -15110,6 +16462,12 @@ async def _start_turn(
                     "description": getattr(msg, "description", None),
                 }
                 if tid:
+                    accepted_start = _record_background_task_launch(
+                        session_id, tid,
+                        tool_use_id=info["tool_use_id"],
+                        description=info["description"])
+                    if not accepted_start:
+                        return
                     inflight_tasks[tid] = info
                     # Pin the originating client from the moment the task
                     # starts: disconnect() kills the CLI subprocess and would
@@ -15118,10 +16476,6 @@ async def _start_turn(
                     # watcher). Mid-turn this is redundant with _active_turns'
                     # eviction exemption, but it's what survives past turn end.
                     _pin_background_task(session_id, tid)
-                    _record_background_task_launch(
-                        session_id, tid,
-                        tool_use_id=info["tool_use_id"],
-                        description=info["description"])
                 yield {"event": "task_started", "data": json.dumps({
                     "task_id": tid,
                     "tool_use_id": info["tool_use_id"],
@@ -15138,12 +16492,6 @@ async def _start_turn(
                 })}
             elif isinstance(msg, TaskNotificationMessage):
                 tid = getattr(msg, "task_id", "") or ""
-                sys.stderr.write(
-                    f"[chat] in-turn typed notification sid={session_id[:8]} "
-                    f"task={tid} status={getattr(msg, 'status', None)}\n")
-                # Drop from the per-turn in-flight set so it isn't handed to the
-                # cross-turn watcher (it settled in-turn).
-                inflight_tasks.pop(tid, None)
                 status = getattr(msg, "status", None)
                 summary = getattr(msg, "summary", None)
                 output_file = getattr(msg, "output_file", None)
@@ -15167,6 +16515,12 @@ async def _start_turn(
                     summary=summary,
                     output_file=output_file,
                     usage=dict(getattr(msg, "usage", None) or {}))
+                if settled is None:
+                    return
+                # Drop from the per-turn in-flight set only after this runtime
+                # has proved ownership. A successor's synthetic terminal must
+                # not mutate the predecessor's live bookkeeping.
+                inflight_tasks.pop(tid, None)
                 yield {"event": "task_notification", "data": json.dumps({
                     "task_id": tid,
                     "tool_use_id": getattr(msg, "tool_use_id", None),
@@ -15183,16 +16537,15 @@ async def _start_turn(
                 if terminal is None:
                     return
                 tid = terminal["task_id"]
-                inflight_tasks.pop(tid, None)
                 won_updated = _on_task_settled(
                     session_id, tid, status=terminal["status"],
                     tool_use_id=terminal.get("tool_use_id"),
                     summary=terminal.get("summary"),
                     output_file=terminal.get("output_file"),
                     usage=dict(terminal.get("usage") or {}))
-                sys.stderr.write(
-                    f"[chat] in-turn terminal update sid={session_id[:8]} "
-                    f"task={tid} status={terminal['status']} won={won_updated}\n")
+                if won_updated is None:
+                    return
+                inflight_tasks.pop(tid, None)
                 if won_updated:
                     terminal["background_tasks_pending"] = len(
                         _sessions_with_inflight_tasks.get(session_id, ()))
@@ -15217,6 +16570,9 @@ async def _start_turn(
             yield the consolidated 'done' SSE event the FE awaits, then finish
             slower per-message annotations and session metadata bookkeeping."""
             nonlocal memory_outcome_scheduled
+            if broadcast.perf_query_started:
+                broadcast.perf_result_ms = obs.elapsed_ms(
+                    broadcast.perf_query_started)
             cost = getattr(msg, "total_cost_usd", None) or 0.0
             u = getattr(msg, "usage", {}) or {}
             # ResultMessage.usage is CUMULATIVE per session. Per-turn
@@ -15273,6 +16629,11 @@ async def _start_turn(
             }
             _activity_status = ("cancelled" if was_cancelled else
                                 "failed" if _is_error else "completed")
+            broadcast.perf_status = _activity_status
+            broadcast.perf_error_kind = (
+                str(_error_class.get("kind") or "unknown")
+                if _is_error else "none"
+            )
             _done_session_usage = dict(sess_u)
             _done_memory_recall = mem0.pop_recall_trace(session_id)
             _done_memory_receipt = _persistable_memory_recall(
@@ -15299,6 +16660,7 @@ async def _start_turn(
             _done_background_tasks = len(
                 _merge_session_inflight(session_id, inflight_tasks)
             )
+            broadcast.perf_background_count = _done_background_tasks
             _done_activity_source = (
                 "background"
                 if _done_background_tasks
@@ -15384,6 +16746,7 @@ async def _start_turn(
                 "background_tasks_pending": _done_background_tasks,
                 "activity_source": _done_activity_source,
             })}
+            broadcast.perf_post_started = obs.monotonic()
 
             # Everything below is post-turn persistence/telemetry. It remains
             # inside the detached pump so browser disconnects cannot cancel it,
@@ -15413,7 +16776,7 @@ async def _start_turn(
                 except Exception as _e:
                     sys.stderr.write(
                         f"[chat-stream] third-party get_context_usage skipped for "
-                        f"sid={session_id}: {type(_e).__name__}\n")
+                        f"sid={session_id[:8]} exc={type(_e).__name__}\n")
                 capability = await _detect_gateway_context_capability(
                     model_to_use)
                 details = _context_limit_details(
@@ -15468,7 +16831,7 @@ async def _start_turn(
                 except Exception as _e:
                     sys.stderr.write(
                         f"[chat-stream] get_context_usage skipped for "
-                        f"sid={session_id}: {type(_e).__name__}\n")
+                        f"sid={session_id[:8]} exc={type(_e).__name__}\n")
 
             # Sidecar annotations: resolve UUIDs from the exact pre-query
             # transcript coordinate. A simple "latest assistant" tail scan is
@@ -15603,17 +16966,10 @@ async def _start_turn(
             if not was_cancelled:
                 from . import presence as _presence
                 if _presence.recently_active():
-                    # User is at one of their devices — they'll see the
-                    # reply in-app. Skip the push fan-out entirely. Log it:
-                    # a silently-skipped push is indistinguishable from a
-                    # broken pipeline without this line (2026-06-12 lesson).
-                    # None-safe: see task-settled site — age can be None
-                    # even when recently_active() returned True.
-                    _age = _presence.last_seen_age()
-                    _age_s = f"{_age:.0f}s" if _age is not None else "?"
-                    sys.stderr.write(
-                        f"[push] turn-done skipped (presence "
-                        f"age={_age_s}) sid={session_id}\n")
+                    # User is at one of their devices and will see the reply
+                    # in-app.  This successful high-frequency gate is silent;
+                    # actual push failures remain logged below.
+                    pass
                 else:
                     try:
                         from . import push as _push
@@ -15646,7 +17002,10 @@ async def _start_turn(
                             context=f"turn-done {session_id[:8]}",
                         )
                     except Exception as e:
-                        sys.stderr.write(f"[chat] turn push failed: {e}\n")
+                        sys.stderr.write(
+                            f"[chat] turn push failed "
+                            f"sid={session_id[:8]} "
+                            f"exc={type(e).__name__}\n")
             # Strip unverifiable thinking-block signatures so this session
             # stays resumable via `claude --resume` (and the official
             # Anthropic API). Third-party vendors (DeepSeek / GLM /
@@ -15684,7 +17043,10 @@ async def _start_turn(
                     from . import jsonl_cleanup as _jc
                     await asyncio.to_thread(_jc.clean_session, session_id)
                 except Exception as e:
-                    sys.stderr.write(f"[chat] jsonl cleanup failed: {e}\n")
+                    sys.stderr.write(
+                        f"[chat] jsonl cleanup failed "
+                        f"sid={session_id[:8]} "
+                        f"exc={type(e).__name__}\n")
             # Memory write is deferred until turn status is known. Clean
             # exchanges may be consolidated into memories. Cancelled turns are
             # evidence-only (never fact candidates), which preserves the useful
@@ -16035,13 +17397,14 @@ async def _start_turn(
         except asyncio.TimeoutError:
             if terminal_published:
                 sys.stderr.write(
-                    f"[chat] post-turn bookkeeping timed out sid={session_id}\n")
+                    f"[chat] post-turn bookkeeping timed out "
+                    f"sid={session_id[:8]}\n")
                 return
             turn_errored = True
             turn_error_text = f"turn exceeded {BG_TIMEOUT_S}s"
             sys.stderr.write(
                 f"[chat] turn exceeded MUSELAB_TURN_TIMEOUT_S={BG_TIMEOUT_S}s, "
-                f"aborting sid={session_id}\n")
+                f"aborting sid={session_id[:8]}\n")
             sys.stderr.flush()
             broadcast.publish(await _durable_error_event(turn_error_text))
         except Exception as e:
@@ -16063,6 +17426,22 @@ async def _start_turn(
             sys.stderr.flush()
             broadcast.publish(await _durable_error_event(turn_error_text))
         finally:
+            if broadcast.cancelled:
+                broadcast.perf_status = "cancelled"
+                broadcast.perf_error_kind = "cancelled"
+            elif turn_errored:
+                broadcast.perf_status = "failed"
+                if broadcast.perf_error_kind in {"", "none"}:
+                    broadcast.perf_error_kind = str(
+                        _classify_stream_error(turn_error_text).get("kind")
+                        or "unknown"
+                    )
+            elif broadcast.perf_status == "unknown":
+                broadcast.perf_status = "completed"
+            broadcast.perf_background_count = max(
+                broadcast.perf_background_count,
+                len(_sessions_with_inflight_tasks.get(session_id, ())),
+            )
             # Successful ResultMessage already popped its trace into the done
             # payload. Every other terminal path (transport error, timeout,
             # forced stop) must clear it here to isolate the next turn.
@@ -16125,6 +17504,25 @@ async def _start_turn(
                         f"[chat] queue terminal ack failed sid={session_id[:8]} "
                         f"item={broadcast.queue_item_id[:8]} "
                         f"exc={type(e).__name__}\n")
+            # Keep the completed canonical turn's reservation while committing
+            # any hidden-owner reply that became READY during it.  Releasing the
+            # slot first lets the queue reserve its next turn and can postpone
+            # this Agent bubble until the whole queue drains.
+            if not deleting_session:
+                try:
+                    await _flush_runtime_continuations_at_turn_boundary(
+                        session_id,
+                        expected_active=broadcast,
+                    )
+                except Exception as exc:
+                    # The outbox remains durable. Queue drain below fails closed
+                    # while a READY record exists and delivery re-kicks it after
+                    # a later successful presentation commit.
+                    sys.stderr.write(
+                        f"[chat] runtime continuation boundary flush failed "
+                        f"sid={session_id[:8]} exc={type(exc).__name__}\n"
+                    )
+                    sys.stderr.flush()
             broadcast.finish()
             _active_turns.pop(session_id, None)
             if (not deleting_session
@@ -16172,7 +17570,8 @@ async def _start_turn(
                     await _maybe_drain_queue(session_id)
             except Exception as e:
                 sys.stderr.write(
-                    f"[chat] queue drain trigger failed sid={session_id}: {e}\n")
+                    f"[chat] queue drain trigger failed sid={session_id[:8]} "
+                    f"exc={type(e).__name__}\n")
 
     # Keep a handle to the detached pump so the force-stop watchdog can cancel
     # it if an interrupt + client teardown ever fails to unblock receive_response.
@@ -16190,13 +17589,6 @@ def _notify_queue_paused_on_error(session_id: str) -> None:
         try:
             from . import presence as _presence
             if _presence.recently_active():
-                # None-safe: see task-settled site — age can be None
-                # even when recently_active() returned True.
-                _age = _presence.last_seen_age()
-                _age_s = f"{_age:.0f}s" if _age is not None else "?"
-                sys.stderr.write(
-                    f"[push] queue-paused skipped (presence "
-                    f"age={_age_s}) sid={session_id}\n")
                 return
             from . import push as _push
             sname = ""
@@ -16216,7 +17608,9 @@ def _notify_queue_paused_on_error(session_id: str) -> None:
                 context=f"queue-paused {session_id[:8]}",
             )
         except Exception as e:
-            sys.stderr.write(f"[chat] queue-paused push failed: {e}\n")
+            sys.stderr.write(
+                f"[chat] queue-paused push failed "
+                f"sid={session_id[:8]} exc={type(e).__name__}\n")
     try:
         asyncio.create_task(_go())
     except RuntimeError:
@@ -16267,10 +17661,44 @@ async def _maybe_drain_queue(session_id: str) -> None:
                         f"sid={session_id[:8]} status={exc.status_code}\n"
                     )
             return
+        # READY presentation events are part of the visible chronology. Commit
+        # them before claiming the next FIFO item; if local I/O cannot do so,
+        # leave the queue untouched and let the retained delivery owner re-kick.
+        try:
+            await _flush_runtime_continuations_at_turn_boundary(session_id)
+        except Exception as exc:
+            sys.stderr.write(
+                f"[chat] queued runtime continuation flush failed "
+                f"sid={session_id[:8]} exc={type(exc).__name__}\n"
+            )
+            sys.stderr.flush()
+            return
+        if _runtime_lineage_has_ready_continuation(session_id):
+            return
         item = sess.claim_queue_message(session_id)
         if item is None:
             return
         item_id = str(item.get("id") or "")
+        try:
+            _queue_snapshot = sess.get_queue(session_id)
+            _queue_depth = (
+                len(_queue_snapshot.get("items") or [])
+                + int(bool(_queue_snapshot.get("inflight")))
+            )
+        except Exception:
+            _queue_depth = -1
+        try:
+            _enqueued_at_ms = int(item.get("enqueued_at") or 0)
+        except (TypeError, ValueError):
+            _enqueued_at_ms = 0
+        _perf_event(
+            "queue.claim",
+            sid8=obs.short_id(session_id),
+            item8=obs.short_id(item_id),
+            wait_ms=(max(0, int(time.time() * 1000) - _enqueued_at_ms)
+                     if _enqueued_at_ms else -1),
+            depth=_queue_depth,
+        )
         # Queue files survive a process restart; staged uploads deliberately do
         # not, and they can also expire while waiting behind a long turn.  Never
         # degrade an attachment-bearing message into a text-only turn.  Check
@@ -16346,7 +17774,8 @@ async def _maybe_drain_queue(session_id: str) -> None:
         except Exception as e:
             sess.release_queue_claim(session_id, item_id, pause=True)
             sys.stderr.write(
-                f"[chat] queue drain crashed sid={session_id}: {e}\n")
+                f"[chat] queue drain crashed sid={session_id[:8]} "
+                f"exc={type(e).__name__}\n")
             _notify_queue_paused_on_error(session_id)
 
 
@@ -16376,8 +17805,8 @@ def _schedule_queue_drain(session_id: str) -> None:
             return
         if exc is not None:
             sys.stderr.write(
-                f"[chat] scheduled queue drain failed sid={session_id}: "
-                f"{type(exc).__name__}: {exc}\n")
+                f"[chat] scheduled queue drain failed "
+                f"sid={session_id[:8]} exc={type(exc).__name__}\n")
         if rekick:
             # Defer creation to the next loop turn so the completed task is no
             # longer observable as the owner. A later enqueue can set the bit
@@ -16431,6 +17860,9 @@ def session_active_status(sid: str) -> dict:
         if overlay.get("state") == "running"
     )
     runtime_background_pending = len(runtime_task_ids)
+    runtime_continuation_pending, runtime_ui_revision = (
+        _runtime_continuation_projection_state(sid)
+    )
     b = _active_turns.get(sid)
     if b is not None and getattr(b, "is_continuation", False) \
             and getattr(b, "continuation_consumed", False):
@@ -16480,6 +17912,8 @@ def session_active_status(sid: str) -> dict:
                     "events_so_far": 0,
                     "background_tasks_pending": background_pending,
                     "runtime_background_tasks_pending": runtime_background_pending,
+                    "runtime_continuation_pending": runtime_continuation_pending,
+                    "runtime_ui_revision": runtime_ui_revision,
                     "user_text": "",
                     "user_images": [],
                     "user_docs": [],
@@ -16488,6 +17922,8 @@ def session_active_status(sid: str) -> dict:
                 "active": False,
                 "background_tasks_pending": 0,
                 "runtime_background_tasks_pending": runtime_background_pending,
+                "runtime_continuation_pending": runtime_continuation_pending,
+                "runtime_ui_revision": runtime_ui_revision,
                 # A just-finished direct or queued turn can disappear from the
                 # live registry before the reconnect probe lands. Preserve its
                 # delivery class through the grace broadcast so the browser
@@ -16503,6 +17939,8 @@ def session_active_status(sid: str) -> dict:
         "background_tasks_pending": len(
             _sessions_with_inflight_tasks.get(sid, ())),
         "runtime_background_tasks_pending": runtime_background_pending,
+        "runtime_continuation_pending": runtime_continuation_pending,
+        "runtime_ui_revision": runtime_ui_revision,
         "turn_id": b.turn_id,
         "parent_turn_id": b.parent_turn_id,
         "model": b.model,

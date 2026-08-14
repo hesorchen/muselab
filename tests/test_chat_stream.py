@@ -13,6 +13,7 @@ import base64
 import collections
 import inspect
 import json
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -645,7 +646,7 @@ def test_done_is_published_before_slow_post_turn_bookkeeping(
         monkeypatch.setattr(
             activity_module.activity,
             "finish",
-            lambda activity_sid, status, *, activity_source="", owner_id="": activity_transitions.append(
+            lambda activity_sid, status, *, activity_source="", owner_id="", mark_read=None: activity_transitions.append(
                 ("finish", activity_sid, status)),
         )
 
@@ -754,7 +755,7 @@ def test_activity_stays_running_until_background_continuation_finishes(
         monkeypatch.setattr(
             activity_module.activity,
             "finish",
-            lambda activity_sid, status, *, activity_source="", owner_id="": activity_transitions.append(
+            lambda activity_sid, status, *, activity_source="", owner_id="", mark_read=None: activity_transitions.append(
                 ("finish", activity_sid, status)),
         )
 
@@ -852,7 +853,7 @@ def test_background_stream_eof_releases_dead_task_and_closes_activity(
     monkeypatch.setattr(
         activity_module.activity,
         "finish",
-        lambda activity_sid, status, *, activity_source="", owner_id="": transitions.append(
+        lambda activity_sid, status, *, activity_source="", owner_id="", mark_read=None: transitions.append(
             (activity_sid, status)),
     )
     try:
@@ -884,6 +885,16 @@ def test_stream_drops_prior_turn_replay_but_keeps_late_task_lifecycle(
     old_uuids = frozenset({"old-stream", "old-assistant", "old-user", "old-result"})
     monkeypatch.setattr(
         chat_mod, "_session_message_uuids", lambda _sid, _model: old_uuids)
+    # The delayed lifecycle record is only authoritative when it belongs to a
+    # task launched by this runtime.  Keep that ownership durable but leave the
+    # in-memory pin clear: this models a prior observer already releasing the
+    # runtime while the typed terminal record remains buffered in the pooled
+    # SDK queue.  The new turn may start, and the late record may still patch
+    # the old card without resurrecting the task or creating a notification.
+    assert chat_mod.sess.set_runtime_task_overlay(
+        sid, "task-old", state="running", owner_session_id=sid,
+        tool_use_id="tu-old",
+    )
 
     stale_batch = [
         TaskNotificationMessage(
@@ -943,6 +954,16 @@ def test_stream_drops_prior_turn_replay_but_keeps_late_task_lifecycle(
 
     assert fake.receive_calls == 2, "stale Result should reopen receive_response"
     assert kinds.count("task_notification") == 1
+    notification = next(
+        json.loads(data)
+        for kind, data in events
+        if kind == "task_notification"
+    )
+    assert notification["already_reported"] is True
+    assert notification["background_tasks_pending"] == 0
+    assert chat_mod.sess.get_runtime_task_overlays(sid)["task-old"][
+        "state"
+    ] == "completed"
     assert "tool_use" not in kinds
     assert "tool_result" not in kinds
     chunks = [json.loads(d)["text"] for e, d in events if e == "text"]
@@ -1388,6 +1409,66 @@ def test_stream_background_task_messages_flow_through(stream_env, client, monkey
     assert sid not in chat_mod._sessions_with_inflight_tasks
 
 
+def test_successor_suppresses_predecessor_orphan_notification(
+        stream_env, client, monkeypatch):
+    """A resumed child must not surface CLI's synthetic predecessor stop."""
+    chat_mod = stream_env
+    source = chat_mod.sess.create_session("runtime owner")
+    child_sid = _make_session(client)
+    assert chat_mod.sess.link_runtime_successor(source["id"], child_sid)
+    chat_mod._pin_background_task(source["id"], "task-inherited")
+    assert chat_mod._record_background_task_launch(
+        source["id"], "task-inherited", tool_use_id="tool-inherited")
+
+    messages = [
+        TaskNotificationMessage(
+            subtype="task_notification", data={}, task_id="task-inherited",
+            status="stopped", output_file="",
+            summary="No completion record was found in the previous session.",
+            uuid="synthetic-stop", session_id=child_sid,
+            tool_use_id="tool-inherited",
+        ),
+        AssistantMessage(
+            content=[TextBlock(text="current reply")],
+            model="claude-sonnet-4-6", uuid="current-assistant",
+            usage={"input_tokens": 4, "output_tokens": 2},
+        ),
+        ResultMessage(
+            subtype="success", duration_ms=20, duration_api_ms=18,
+            is_error=False, num_turns=1, session_id=child_sid,
+            total_cost_usd=0.0,
+            usage={"input_tokens": 4, "output_tokens": 2},
+            result="current reply", uuid="current-result",
+        ),
+    ]
+    fake = _FakeStreamClient(messages)
+
+    async def fake_get_client(*_args, **_kwargs):
+        return fake
+
+    monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
+    try:
+        response = client.get(
+            f"/api/chat/stream?token={TEST_TOKEN}&session_id={child_sid}"
+            "&prompt=current&model=claude-sonnet-4-6")
+        assert response.status_code == 200, response.text
+        events = _parse_sse(response.text)
+        assert "task_notification" not in [kind for kind, _ in events]
+        assert "done" in [kind for kind, _ in events]
+        assert chat_mod._sessions_with_inflight_tasks[source["id"]] == {
+            "task-inherited"
+        }
+        for sid in (source["id"], child_sid):
+            overlay = chat_mod.sess.get_runtime_task_overlays(
+                sid)["task-inherited"]
+            assert overlay["state"] == "running"
+            assert overlay["owner_session_id"] == source["id"]
+    finally:
+        chat_mod._sessions_with_inflight_tasks.pop(source["id"], None)
+        chat_mod._bg_task_pinned_at.pop("task-inherited", None)
+        chat_mod._bg_task_tool_use_ids.pop("task-inherited", None)
+
+
 class _FakeWatchClient:
     """Minimal client exposing only receive_messages() — the surface the
     cross-turn watcher reads."""
@@ -1573,6 +1654,793 @@ def test_watcher_opens_continuation_turn_and_unpins(stream_env):
         chat_mod._task_watchers.pop(sid, None)
         chat_mod._active_turns.pop(sid, None)
         chat_mod._recent_turns.pop(sid, None)
+
+
+@pytest.mark.asyncio
+async def test_hidden_runtime_continuation_projects_one_agent_bubble_to_leaf(
+        stream_env):
+    """A rolled-over owner must deliver prose, not a toast, to the child.
+
+    Keep a source turn in `_active_turns` to cover the settle-vs-finalizer race:
+    the task notification may use that live carrier, but a private continuation
+    collector must still retain the following AssistantMessage for projection.
+    """
+    chat_mod = stream_env
+    source_sid = "11111111-2222-4333-8444-555555555555"
+    child_sid = "22222222-3333-4444-8555-666666666666"
+    chat_mod.sess.register_session(
+        source_sid, name="hidden owner", model="claude-sonnet-4-6")
+    chat_mod.sess.register_session(
+        child_sid,
+        name="visible leaf",
+        model="claude-sonnet-4-6",
+        runtime_predecessor=source_sid,
+    )
+    assert chat_mod.sess.link_runtime_successor(source_sid, child_sid)
+    chat_mod._pin_background_task(source_sid, "task-project")
+    assert chat_mod._record_background_task_launch(
+        source_sid, "task-project", tool_use_id="tool-project")
+    occupied = chat_mod.TurnBroadcast(
+        source_sid, model="claude-sonnet-4-6")
+    chat_mod._active_turns[source_sid] = occupied
+
+    notification = TaskNotificationMessage(
+        subtype="task_notification", data={}, task_id="task-project",
+        status="completed", output_file="/tmp/private-result.md",
+        summary="done", uuid="notify-project", session_id=source_sid,
+        tool_use_id="tool-project")
+    reaction_text = "后台分析已经完成，这是 Agent 的续答。"
+    reaction = AssistantMessage(
+        content=[TextBlock(text=reaction_text)],
+        model="claude-sonnet-4-6", usage={},
+        uuid="source-only-assistant-uuid")
+    result = ResultMessage(
+        subtype="success", duration_ms=1250, duration_api_ms=1200,
+        is_error=False, num_turns=1, session_id=source_sid,
+        total_cost_usd=0.0, usage={})
+
+    try:
+        await chat_mod._watch_inflight_tasks(
+            source_sid,
+            _FakeWatchClient([notification, reaction, result]),
+            {"task-project": "background analysis"},
+        )
+        deliveries = [
+            task for (sid, _), task
+            in chat_mod._runtime_continuation_delivery_tasks.items()
+            if sid == source_sid
+        ]
+        if deliveries:
+            await asyncio.wait_for(
+                asyncio.gather(*deliveries), timeout=2)
+
+        snapshots, revision = chat_mod._load_cancelled_turn_snapshots(
+            child_sid)
+        runtime_snapshots = [
+            item for item in snapshots
+            if item.get("kind") == "runtime_continuation"
+        ]
+        assert len(runtime_snapshots) == 1
+        bubble = runtime_snapshots[0]["messages"][0]
+        assert bubble == {
+            "role": "assistant",
+            "text": reaction_text,
+            "model": "claude-sonnet-4-6",
+            "ts": bubble["ts"],
+            "elapsed": 1.2,
+            "turn_status": "completed",
+            "display_kind": "runtime_continuation",
+            "runtime_event_id": runtime_snapshots[0]["runtime_event_id"],
+            "presentation_only": True,
+            "forkable": False,
+            "_key": (
+                "runtime-continuation:"
+                f"{runtime_snapshots[0]['runtime_event_id']}:0"
+            ),
+        }
+        assert "uuid" not in bubble
+        assert "forkUuid" not in bubble
+        assert revision
+        assert not chat_mod._session_has_runtime_continuation_outbox(
+            source_sid)
+
+        response = chat_mod.get_session_api(
+            child_sid,
+            full=False,
+            tail=50,
+            offset=-1,
+            limit=0,
+            history_generation="",
+            around_uuid="",
+            before=0,
+            after=0,
+        )
+        projected = [
+            item for item in response["messages"]
+            if item.get("display_kind") == "runtime_continuation"
+        ]
+        assert len(projected) == 1
+        assert projected[0]["text"] == reaction_text
+        assert response["runtime_ui_revision"] == revision
+        assert response["turn_count"] == 0
+        pending, active_revision = (
+            chat_mod._runtime_continuation_projection_state(source_sid))
+        assert pending is False
+        assert active_revision == revision
+
+        # A later rollover must carry the presentation event forward even
+        # though the SDK JSONL (correctly) has no such assistant record.
+        grandchild_sid = "33333333-4444-4555-8666-777777777777"
+        chat_mod.sess.register_session(
+            grandchild_sid,
+            name="visible leaf",
+            model="claude-sonnet-4-6",
+            runtime_predecessor=child_sid,
+        )
+        assert chat_mod.sess.link_runtime_successor(
+            child_sid, grandchild_sid)
+        chat_mod._sync_runtime_successor_postlude(child_sid)
+        grandchild_snapshots, _ = (
+            chat_mod._load_cancelled_turn_snapshots(grandchild_sid))
+        assert [
+            item["messages"][0]["text"]
+            for item in grandchild_snapshots
+            if item.get("kind") == "runtime_continuation"
+        ] == [reaction_text]
+        grandchild_response = chat_mod.get_session_api(
+            grandchild_sid,
+            full=False,
+            tail=50,
+            offset=-1,
+            limit=0,
+            history_generation="",
+            around_uuid="",
+            before=0,
+            after=0,
+        )
+        assert sum(
+            item.get("runtime_event_id")
+            == runtime_snapshots[0]["runtime_event_id"]
+            for item in grandchild_response["messages"]
+        ) == 1
+    finally:
+        chat_mod._active_turns.pop(source_sid, None)
+        occupied.close()
+        chat_mod._sessions_with_inflight_tasks.pop(source_sid, None)
+        chat_mod._bg_task_pinned_at.pop("task-project", None)
+        chat_mod._bg_task_tool_use_ids.pop("task-project", None)
+        chat_mod._recent_turns.pop(source_sid, None)
+        for key, task in tuple(
+                chat_mod._runtime_continuation_delivery_tasks.items()):
+            if key[0] == source_sid:
+                if not task.done():
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+                chat_mod._runtime_continuation_delivery_tasks.pop(key, None)
+        chat_mod._delete_runtime_continuation_outboxes(source_sid)
+        chat_mod._delete_cancelled_turn_snapshots(child_sid)
+        chat_mod._delete_cancelled_turn_snapshots(
+            "33333333-4444-4555-8666-777777777777")
+
+
+@pytest.mark.asyncio
+async def test_runtime_continuation_waits_for_visible_leaf_turn_boundary(
+        stream_env):
+    """Never insert a hidden-owner reply into the middle of a child turn."""
+    chat_mod = stream_env
+    source_sid = "44444444-5555-4666-8777-888888888888"
+    child_sid = "55555555-6666-4777-8888-999999999999"
+    chat_mod.sess.register_session(
+        source_sid, name="source", model="claude-sonnet-4-6")
+    chat_mod.sess.register_session(
+        child_sid,
+        name="child",
+        model="claude-sonnet-4-6",
+        runtime_predecessor=source_sid,
+    )
+    assert chat_mod.sess.link_runtime_successor(source_sid, child_sid)
+
+    continuation = chat_mod.TurnBroadcast(
+        source_sid, model="claude-sonnet-4-6")
+    continuation.is_continuation = True
+    continuation.publish({
+        "event": "text",
+        "data": json.dumps({"text": "延迟到当前回复结束后显示。"}),
+    })
+    event_id = chat_mod._persist_runtime_continuation_outbox(
+        source_sid,
+        continuation,
+        completed_at_ms=1_800_000_000_000,
+        elapsed_s=2.0,
+        terminal_status="completed",
+    )
+    assert event_id
+    child_turn = chat_mod.TurnBroadcast(
+        child_sid, model="claude-sonnet-4-6")
+    chat_mod._active_turns[child_sid] = child_turn
+    delivery = chat_mod._schedule_runtime_continuation_delivery(
+        source_sid, event_id)
+    assert delivery is not None
+
+    try:
+        await asyncio.sleep(0.05)
+        snapshots, _ = chat_mod._load_cancelled_turn_snapshots(child_sid)
+        assert not any(
+            item.get("kind") == "runtime_continuation"
+            for item in snapshots
+        )
+        assert chat_mod._session_has_runtime_continuation_outbox(source_sid)
+        pending, _ = chat_mod._runtime_continuation_projection_state(child_sid)
+        assert pending is True
+
+        child_turn.finish()
+        chat_mod._active_turns.pop(child_sid, None)
+        await asyncio.wait_for(delivery, timeout=2)
+        snapshots, _ = chat_mod._load_cancelled_turn_snapshots(child_sid)
+        projected = [
+            item for item in snapshots
+            if item.get("kind") == "runtime_continuation"
+        ]
+        assert len(projected) == 1
+        assert projected[0]["messages"][0]["text"] == (
+            "延迟到当前回复结束后显示。")
+        pending, revision = (
+            chat_mod._runtime_continuation_projection_state(child_sid))
+        assert pending is False
+        assert revision
+    finally:
+        chat_mod._active_turns.pop(child_sid, None)
+        child_turn.close()
+        continuation.close()
+        if not delivery.done():
+            delivery.cancel()
+            await asyncio.gather(delivery, return_exceptions=True)
+        chat_mod._runtime_continuation_delivery_tasks.pop(
+            (source_sid, event_id), None)
+        chat_mod._delete_runtime_continuation_outboxes(source_sid)
+        chat_mod._delete_cancelled_turn_snapshots(child_sid)
+
+
+@pytest.mark.asyncio
+async def test_fast_continuation_survives_result_to_rollover_link_gap(
+        stream_env):
+    """A very fast task may finish before the eager fork publishes its link."""
+    chat_mod = stream_env
+    source_sid = "66666666-7777-4888-8999-aaaaaaaaaaaa"
+    child_sid = "77777777-8888-4999-8aaa-bbbbbbbbbbbb"
+    chat_mod.sess.register_session(
+        source_sid, name="source", model="claude-sonnet-4-6")
+    chat_mod.sess.register_session(
+        child_sid,
+        name="child",
+        model="claude-sonnet-4-6",
+        runtime_predecessor=source_sid,
+    )
+    hold_prewarm = asyncio.Event()
+    prewarm = asyncio.create_task(hold_prewarm.wait())
+    chat_mod._runtime_prewarm_tasks[source_sid] = prewarm
+    continuation = chat_mod.TurnBroadcast(
+        source_sid, model="claude-sonnet-4-6")
+    continuation.publish({
+        "event": "text",
+        "data": json.dumps({"text": "快速任务也不能丢失续答。"}),
+    })
+    event_id = chat_mod._persist_runtime_continuation_outbox(
+        source_sid,
+        continuation,
+        completed_at_ms=1_800_000_100_000,
+        elapsed_s=1.0,
+        terminal_status="completed",
+    )
+    assert event_id
+    delivery = chat_mod._schedule_runtime_continuation_delivery(
+        source_sid, event_id)
+    assert delivery is not None
+
+    try:
+        await asyncio.sleep(0.05)
+        assert chat_mod._session_has_runtime_continuation_outbox(source_sid)
+        snapshots, _ = chat_mod._load_cancelled_turn_snapshots(child_sid)
+        assert snapshots == []
+
+        assert chat_mod.sess.link_runtime_successor(source_sid, child_sid)
+        await asyncio.wait_for(delivery, timeout=2)
+        snapshots, _ = chat_mod._load_cancelled_turn_snapshots(child_sid)
+        assert [
+            item["messages"][0]["text"]
+            for item in snapshots
+            if item.get("kind") == "runtime_continuation"
+        ] == ["快速任务也不能丢失续答。"]
+    finally:
+        hold_prewarm.set()
+        await asyncio.gather(prewarm, return_exceptions=True)
+        if chat_mod._runtime_prewarm_tasks.get(source_sid) is prewarm:
+            chat_mod._runtime_prewarm_tasks.pop(source_sid, None)
+        continuation.close()
+        if not delivery.done():
+            delivery.cancel()
+            await asyncio.gather(delivery, return_exceptions=True)
+        chat_mod._runtime_continuation_delivery_tasks.pop(
+            (source_sid, event_id), None)
+        chat_mod._delete_runtime_continuation_outboxes(source_sid)
+        chat_mod._delete_cancelled_turn_snapshots(child_sid)
+
+
+@pytest.mark.asyncio
+async def test_unconditional_outbox_survives_source_lock_to_link_gap(stream_env):
+    """The write-ahead bubble exists before rollover intent becomes visible."""
+    chat_mod = stream_env
+    source_sid = "88888888-9999-4aaa-8bbb-cccccccccccc"
+    child_sid = "99999999-aaaa-4bbb-8ccc-dddddddddddd"
+    chat_mod.sess.register_session(
+        source_sid, name="source", model="claude-sonnet-4-6")
+    chat_mod.sess.register_session(
+        child_sid,
+        name="child",
+        model="claude-sonnet-4-6",
+        runtime_predecessor=source_sid,
+    )
+    continuation = chat_mod.TurnBroadcast(
+        source_sid, model="claude-sonnet-4-6")
+    continuation.publish({
+        "event": "text",
+        "data": json.dumps({"text": "先完成，再发布 rollover link。"}),
+    })
+    event_id = chat_mod._persist_runtime_continuation_outbox(
+        source_sid,
+        continuation,
+        completed_at_ms=1_800_000_200_000,
+        elapsed_s=1.0,
+        terminal_status="completed",
+    )
+    assert event_id
+    rollover_lock = chat_mod._runtime_rollover_lock_for(source_sid)
+    await rollover_lock.acquire()
+    delivery = chat_mod._schedule_runtime_continuation_delivery(
+        source_sid, event_id)
+    assert delivery is not None
+
+    try:
+        await asyncio.sleep(0.05)
+        assert chat_mod._session_has_runtime_continuation_outbox(source_sid)
+        assert chat_mod.sess.link_runtime_successor(source_sid, child_sid)
+        rollover_lock.release()
+        await asyncio.wait_for(delivery, timeout=2)
+        snapshots, _ = chat_mod._load_cancelled_turn_snapshots(child_sid)
+        assert [
+            item["messages"][0]["text"]
+            for item in snapshots
+            if item.get("kind") == "runtime_continuation"
+        ] == ["先完成，再发布 rollover link。"]
+    finally:
+        if rollover_lock.locked():
+            rollover_lock.release()
+        continuation.close()
+        if not delivery.done():
+            delivery.cancel()
+            await asyncio.gather(delivery, return_exceptions=True)
+        chat_mod._runtime_continuation_delivery_tasks.pop(
+            (source_sid, event_id), None)
+        chat_mod._delete_runtime_continuation_outboxes(source_sid)
+        chat_mod._delete_cancelled_turn_snapshots(child_sid)
+
+
+@pytest.mark.asyncio
+async def test_startup_recovery_delivers_durable_agent_bubble(stream_env):
+    chat_mod = stream_env
+    source_sid = "90909090-abab-4cdc-8efe-121212121212"
+    child_sid = "a0a0a0a0-bcbc-4ded-8f0f-232323232323"
+    chat_mod.sess.register_session(
+        source_sid, name="source", model="claude-sonnet-4-6")
+    chat_mod.sess.register_session(
+        child_sid,
+        name="child",
+        model="claude-sonnet-4-6",
+        runtime_predecessor=source_sid,
+    )
+    assert chat_mod.sess.link_runtime_successor(source_sid, child_sid)
+    continuation = chat_mod.TurnBroadcast(
+        source_sid, model="claude-sonnet-4-6")
+    continuation.publish({
+        "event": "text",
+        "data": json.dumps({"text": "重启后仍应出现的 Agent 回复。"}),
+    })
+    event_id = chat_mod._persist_runtime_continuation_outbox(
+        source_sid,
+        continuation,
+        completed_at_ms=1_800_000_250_000,
+        elapsed_s=1.0,
+        terminal_status="completed",
+    )
+    assert event_id
+    try:
+        assert await chat_mod.recover_runtime_continuation_outboxes_at_startup() == 1
+        delivery = chat_mod._runtime_continuation_delivery_tasks[
+            (source_sid, event_id)]
+        await asyncio.wait_for(delivery, timeout=2)
+        snapshots, _ = chat_mod._load_cancelled_turn_snapshots(child_sid)
+        assert [
+            item["messages"][0]["text"]
+            for item in snapshots
+            if item.get("kind") == "runtime_continuation"
+        ] == ["重启后仍应出现的 Agent 回复。"]
+        assert not chat_mod._session_has_runtime_continuation_outbox(source_sid)
+    finally:
+        continuation.close()
+        task = chat_mod._runtime_continuation_delivery_tasks.pop(
+            (source_sid, event_id), None)
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        chat_mod._delete_runtime_continuation_outboxes(source_sid)
+        chat_mod._delete_cancelled_turn_snapshots(child_sid)
+
+
+@pytest.mark.asyncio
+async def test_continuation_waits_for_latest_edge_rollback(stream_env):
+    """A -> B -> provisional C delivery barriers on B, then falls back to B."""
+    chat_mod = stream_env
+    source_sid = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+    middle_sid = "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff"
+    provisional_sid = "cccccccc-dddd-4eee-8fff-000000000000"
+    for sid, predecessor in (
+        (source_sid, ""),
+        (middle_sid, source_sid),
+        (provisional_sid, middle_sid),
+    ):
+        chat_mod.sess.register_session(
+            sid,
+            name=sid[:8],
+            model="claude-sonnet-4-6",
+            runtime_predecessor=predecessor,
+        )
+    assert chat_mod.sess.link_runtime_successor(source_sid, middle_sid)
+    continuation = chat_mod.TurnBroadcast(
+        source_sid, model="claude-sonnet-4-6")
+    continuation.publish({
+        "event": "text",
+        "data": json.dumps({"text": "回滚后应落到稳定的 B。"}),
+    })
+    event_id = chat_mod._persist_runtime_continuation_outbox(
+        source_sid,
+        continuation,
+        completed_at_ms=1_800_000_300_000,
+        elapsed_s=1.0,
+        terminal_status="completed",
+    )
+    latest_edge_lock = chat_mod._runtime_rollover_lock_for(middle_sid)
+    await latest_edge_lock.acquire()
+    assert chat_mod.sess.link_runtime_successor(middle_sid, provisional_sid)
+    delivery = chat_mod._schedule_runtime_continuation_delivery(
+        source_sid, event_id)
+    assert delivery is not None
+
+    try:
+        await asyncio.sleep(0.05)
+        assert not delivery.done()
+        provisional, _ = chat_mod._load_cancelled_turn_snapshots(
+            provisional_sid)
+        assert provisional == []
+        assert chat_mod.sess.unlink_runtime_successor(
+            middle_sid, provisional_sid)
+        chat_mod.sess.delete_session(provisional_sid)
+        latest_edge_lock.release()
+        await asyncio.wait_for(delivery, timeout=2)
+        stable, _ = chat_mod._load_cancelled_turn_snapshots(middle_sid)
+        assert [
+            item["messages"][0]["text"]
+            for item in stable
+            if item.get("kind") == "runtime_continuation"
+        ] == ["回滚后应落到稳定的 B。"]
+    finally:
+        if latest_edge_lock.locked():
+            latest_edge_lock.release()
+        continuation.close()
+        if not delivery.done():
+            delivery.cancel()
+            await asyncio.gather(delivery, return_exceptions=True)
+        chat_mod._runtime_continuation_delivery_tasks.pop(
+            (source_sid, event_id), None)
+        chat_mod._delete_runtime_continuation_outboxes(source_sid)
+        chat_mod._delete_cancelled_turn_snapshots(middle_sid)
+        chat_mod._delete_cancelled_turn_snapshots(provisional_sid)
+
+
+def test_runtime_outbox_merges_prose_and_quarantines_corruption(stream_env):
+    chat_mod = stream_env
+    source_sid = "dddddddd-eeee-4fff-8000-111111111111"
+    continuation = chat_mod.TurnBroadcast(
+        source_sid, model="claude-sonnet-4-6")
+    continuation.publish({
+        "event": "text", "data": json.dumps({"text": "第一段"})})
+    continuation.publish({
+        "event": "tool_use", "data": json.dumps({"name": "Read"})})
+    continuation.publish({
+        "event": "text", "data": json.dumps({"text": "第二段"})})
+    event_id = chat_mod._persist_runtime_continuation_outbox(
+        source_sid,
+        continuation,
+        completed_at_ms=1_800_000_400_000,
+        elapsed_s=1.0,
+        terminal_status="completed",
+    )
+    try:
+        outbox = chat_mod._load_runtime_continuation_outbox(
+            source_sid, event_id)
+        assert outbox["message"]["text"] == "第一段\n\n第二段"
+        assert chat_mod._persist_runtime_continuation_outbox(
+            source_sid,
+            continuation,
+            completed_at_ms=1_800_000_400_001,
+            elapsed_s=1.0,
+            terminal_status="cancelled",
+        ) == ""
+
+        corrupt_id = "eeeeeeee-ffff-4000-8111-222222222222"
+        corrupt_path = chat_mod._runtime_continuation_outbox_path(
+            source_sid, corrupt_id)
+        corrupt_path.parent.mkdir(parents=True, exist_ok=True)
+        corrupt_path.write_text("not-json", encoding="utf-8")
+        assert chat_mod._load_runtime_continuation_outbox(
+            source_sid, corrupt_id) is None
+        assert not corrupt_path.exists()
+        assert list(corrupt_path.parent.glob(f"{corrupt_path.name}.invalid*"))
+    finally:
+        continuation.close()
+        chat_mod._delete_runtime_continuation_outboxes(source_sid)
+
+
+def test_around_uuid_uses_virtual_snapshot_coordinates(stream_env, monkeypatch):
+    chat_mod = stream_env
+    index = {
+        "records": [
+            {"uuid": "u1", "bubble_count": 1},
+            {"uuid": "u2", "bubble_count": 1},
+        ],
+        "orders": {"full": [0, 1], "normal": [0, 1]},
+        "bubble_prefix": {"full": [0, 1, 2], "normal": [0, 1, 2]},
+    }
+    snapshot = {
+        "turn_id": "terminal-1",
+        "started_at_ms": 10,
+        "anchors": {
+            "full": {"uuid": "u1", "total": 1},
+            "normal": {"uuid": "u1", "total": 1},
+        },
+        "hidden_uuids": [],
+        "messages": [{
+            "role": "assistant",
+            "text": "后台 Agent 气泡",
+            "display_kind": "runtime_continuation",
+        }],
+    }
+
+    def shaped(_path, shaped_index, record_ids, _annotations):
+        return [
+            {"role": "assistant", "uuid": shaped_index["records"][i]["uuid"]}
+            for i in record_ids
+        ]
+
+    monkeypatch.setattr(chat_mod, "_indexed_ui_records", shaped)
+    result = chat_mod._interrupted_history_window_around_uuid(
+        chat_mod.Path("/unused"),
+        index,
+        [snapshot],
+        {},
+        "u2",
+        before=1,
+        after=0,
+    )
+    assert result is not None
+    window, total, offset, has_later = result
+    assert [item.get("text") or item.get("uuid") for item in window] == [
+        "后台 Agent 气泡", "u2"]
+    assert (total, offset, has_later) == (3, 1, False)
+
+
+@pytest.mark.asyncio
+async def test_runtime_snapshot_copy_cannot_recreate_after_purge(
+        stream_env, monkeypatch):
+    chat_mod = stream_env
+    source_sid = "ffffffff-0000-4111-8222-333333333333"
+    target_sid = "00000000-1111-4222-8333-444444444444"
+    chat_mod.sess.register_session(
+        target_sid, name="target", model="claude-sonnet-4-6")
+    entered = threading.Event()
+    release = threading.Event()
+    real_loader = chat_mod._load_cancelled_turn_snapshots
+    snapshot = {
+        "kind": "runtime_continuation",
+        "sid": source_sid,
+        "turn_id": "11111111-2222-4333-8444-555555555555",
+        "runtime_event_id": "11111111-2222-4333-8444-555555555555",
+        "started_at_ms": 10,
+        "anchors": {
+            "full": {"uuid": "", "total": 0},
+            "normal": {"uuid": "", "total": 0},
+        },
+        "hidden_uuids": [],
+        "messages": [{"role": "assistant", "text": "private"}],
+    }
+
+    def blocking_loader(sid):
+        if sid == source_sid:
+            entered.set()
+            assert release.wait(timeout=2)
+            return [snapshot], "revision"
+        return real_loader(sid)
+
+    def missing_sdk(*_args, **_kwargs):
+        raise FileNotFoundError
+
+    monkeypatch.setattr(
+        chat_mod, "_load_cancelled_turn_snapshots", blocking_loader)
+    monkeypatch.setattr(chat_mod, "sdk_delete_session", missing_sdk)
+    copy_task = asyncio.create_task(asyncio.to_thread(
+        chat_mod._copy_runtime_continuation_snapshots,
+        source_sid,
+        target_sid,
+        {},
+    ))
+    assert await asyncio.to_thread(entered.wait, 1)
+    purge_task = asyncio.create_task(asyncio.to_thread(
+        chat_mod._purge_single_session_storage, target_sid))
+    await asyncio.sleep(0.05)
+    assert not purge_task.done()
+    release.set()
+    await asyncio.wait_for(copy_task, timeout=2)
+    assert await asyncio.wait_for(purge_task, timeout=2) is True
+    target_path = chat_mod._cancelled_turn_snapshot_path(
+        target_sid, snapshot["runtime_event_id"])
+    assert target_path is not None
+    assert not target_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_queue_claim_waits_for_ready_agent_bubble(stream_env, monkeypatch):
+    chat_mod = stream_env
+    source_sid = "12121212-3434-4567-8899-abababababab"
+    leaf_sid = "23232323-4545-4678-899a-bcbcbcbcbcbc"
+    chat_mod.sess.register_session(
+        source_sid, name="source", model="claude-sonnet-4-6")
+    chat_mod.sess.register_session(
+        leaf_sid,
+        name="leaf",
+        model="claude-sonnet-4-6",
+        runtime_predecessor=source_sid,
+    )
+    assert chat_mod.sess.link_runtime_successor(source_sid, leaf_sid)
+    queued = chat_mod.sess.enqueue_message(leaf_sid, "queued after bubble")
+    continuation = chat_mod.TurnBroadcast(
+        source_sid, model="claude-sonnet-4-6")
+    continuation.publish({
+        "event": "text",
+        "data": json.dumps({"text": "必须先显示的后台 Agent 回复。"}),
+    })
+    event_id = chat_mod._persist_runtime_continuation_outbox(
+        source_sid,
+        continuation,
+        completed_at_ms=1_800_000_500_000,
+        elapsed_s=1.0,
+        terminal_status="completed",
+    )
+    assert event_id
+    real_claim = chat_mod.sess.claim_queue_message
+    sequence = []
+
+    def guarded_claim(sid):
+        snapshots, _ = chat_mod._load_cancelled_turn_snapshots(leaf_sid)
+        assert [
+            item["messages"][0]["text"]
+            for item in snapshots
+            if item.get("kind") == "runtime_continuation"
+        ] == ["必须先显示的后台 Agent 回复。"]
+        assert not chat_mod._session_has_runtime_continuation_outbox(source_sid)
+        sequence.append("claim")
+        return real_claim(sid)
+
+    async def fake_start(_sid, _text, **kwargs):
+        sequence.append(("start", kwargs["queue_item_id"]))
+
+    monkeypatch.setattr(
+        chat_mod.sess, "claim_queue_message", guarded_claim)
+    monkeypatch.setattr(chat_mod, "_start_turn", fake_start)
+    try:
+        await chat_mod._maybe_drain_queue(leaf_sid)
+        assert sequence == [
+            "claim", ("start", queued["item"]["id"])]
+    finally:
+        continuation.close()
+        chat_mod.sess.release_queue_claim(
+            leaf_sid, queued["item"]["id"])
+        chat_mod._delete_runtime_continuation_outboxes(source_sid)
+        chat_mod._delete_cancelled_turn_snapshots(leaf_sid)
+
+
+@pytest.mark.asyncio
+async def test_watcher_shutdown_partial_never_projects_completed_bubble(
+        stream_env):
+    chat_mod = stream_env
+    source_sid = "34343434-5656-4789-8aab-cdcdcdcdcdcd"
+    child_sid = "45454545-6767-489a-8bbc-dededededede"
+    task_id = "shutdown-partial"
+    chat_mod.sess.register_session(
+        source_sid, name="source", model="claude-sonnet-4-6")
+    chat_mod.sess.register_session(
+        child_sid,
+        name="child",
+        model="claude-sonnet-4-6",
+        runtime_predecessor=source_sid,
+    )
+    assert chat_mod.sess.link_runtime_successor(source_sid, child_sid)
+    chat_mod._pin_background_task(source_sid, task_id)
+    assert chat_mod._record_background_task_launch(source_sid, task_id)
+    partial_seen = asyncio.Event()
+    never = asyncio.Event()
+    notification = TaskNotificationMessage(
+        subtype="task_notification",
+        data={},
+        task_id=task_id,
+        status="completed",
+        output_file="/tmp/private",
+        summary="done",
+        uuid="shutdown-notification",
+        session_id=source_sid,
+        tool_use_id="shutdown-tool",
+    )
+    partial = AssistantMessage(
+        content=[TextBlock(text="这只是尚未完成的前缀")],
+        model="claude-sonnet-4-6",
+        usage={},
+        uuid="shutdown-partial-assistant",
+    )
+
+    class _PartialClient:
+        async def receive_messages(self):
+            yield notification
+            yield partial
+            partial_seen.set()
+            await never.wait()
+
+        async def query(self, _prompt):
+            return None
+
+    watcher = asyncio.create_task(chat_mod._watch_inflight_tasks(
+        source_sid,
+        _PartialClient(),
+        {task_id: "background"},
+    ))
+    try:
+        await asyncio.wait_for(partial_seen.wait(), timeout=1)
+        watcher.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await watcher
+        assert not chat_mod._session_has_runtime_continuation_outbox(source_sid)
+        snapshots, _ = chat_mod._load_cancelled_turn_snapshots(child_sid)
+        assert not any(
+            item.get("kind") == "runtime_continuation"
+            for item in snapshots
+        )
+        recent = chat_mod._recent_turns.get(source_sid)
+        assert recent is not None
+        done = next(
+            event for event in recent.replay_events()
+            if event.get("event") == "done"
+        )
+        assert json.loads(done["data"])["cancelled"] is True
+    finally:
+        if not watcher.done():
+            watcher.cancel()
+            await asyncio.gather(watcher, return_exceptions=True)
+        chat_mod._sessions_with_inflight_tasks.pop(source_sid, None)
+        chat_mod._bg_task_pinned_at.pop(task_id, None)
+        chat_mod._bg_task_tool_use_ids.pop(task_id, None)
+        recent = chat_mod._recent_turns.pop(source_sid, None)
+        if recent is not None:
+            recent.close()
+        chat_mod._active_turns.pop(source_sid, None)
+        chat_mod._delete_runtime_continuation_outboxes(source_sid)
+        chat_mod._delete_cancelled_turn_snapshots(child_sid)
 
 
 def test_continuation_terminal_precedes_annotation_bookkeeping(stream_env):
@@ -2612,7 +3480,7 @@ def test_stream_early_get_client_failure_emits_error_frame(stream_env, client, m
     monkeypatch.setattr(
         activity_module.activity,
         "finish",
-        lambda activity_sid, status, *, activity_source="", owner_id="": activity_transitions.append(
+        lambda activity_sid, status, *, activity_source="", owner_id="", mark_read=None: activity_transitions.append(
             ("finish", activity_sid, status)),
     )
 
@@ -4144,6 +5012,8 @@ def test_watcher_without_a_task_pin_is_not_user_visible_active(stream_env):
             "active": False,
             "background_tasks_pending": 0,
             "runtime_background_tasks_pending": 0,
+            "runtime_continuation_pending": False,
+            "runtime_ui_revision": "",
             "activity_source": "",
         }
 
