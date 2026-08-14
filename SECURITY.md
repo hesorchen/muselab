@@ -64,7 +64,7 @@ log {
 
 - A compromised `MUSELAB_TOKEN` — full access is granted by design
 - Tool or shell access beyond a registered workspace — `bypassPermissions` intentionally gives the agent the service user's authority; file-API containment is not an OS sandbox
-- Resource exhaustion at the request layer — upload size is capped (100 MB by default, configurable via `MUSELAB_MAX_UPLOAD_MB`); `/api/files/grep` has a soft 8-second time budget and a 1 MB per-file cap; `/api/log/client-error` is rate-limited to 30 requests per IP per minute. Other endpoints do not have per-IP rate limiting. If muselab is exposed to more than one trusted user, place a reverse proxy (Caddy or nginx) in front with global rate limits.
+- Resource exhaustion at the request layer — upload size is capped (100 MB by default, configurable via `MUSELAB_MAX_UPLOAD_MB`); `/api/files/grep` has a soft 8-second time budget and a 1 MB per-file cap; `/api/log/client-error` is limited to an 8 KiB streaming body and 30 requests per IP per minute. The generated Caddy configuration also rejects oversized bodies for that unauthenticated route. Other endpoints do not have per-IP rate limiting. If muselab is exposed to more than one trusted user, place a reverse proxy (Caddy or nginx) in front with global rate limits.
 
 ## Reporting a vulnerability
 

@@ -16,11 +16,13 @@ endpoints in backend/api_scheduler.py.
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import sys
 import threading
 import time
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -96,6 +98,16 @@ _state: dict[str, Any] = {
     "history": [],      # list of run entries (capped to 200)
     "unread_count": 0,  # results since user last acked
 }
+
+
+class SchedulerPersistenceError(RuntimeError):
+    """The durable scheduler state is unavailable or could not be saved."""
+
+
+# A corrupt/unreadable state file is never equivalent to an empty scheduler.
+# Once this fence is raised, all public reads and mutations fail explicitly so
+# an unrelated later write cannot replace the user's original file.
+_STATE_ERROR = ""
 
 _scheduler_task: asyncio.Task | None = None
 # Strong references to fire-and-forget execution tasks (tick-loop fires,
@@ -190,10 +202,23 @@ def _cancel_runs(
     return matches, had_activity, session_ids
 
 
-async def join_cancelled_runs(tasks: list[asyncio.Task]) -> None:
-    """Wait for a stable snapshot returned by a cancel_runs_* helper."""
-    if tasks:
-        await asyncio.gather(*tasks, return_exceptions=True)
+async def join_cancelled_runs(
+    tasks: list[asyncio.Task],
+    *,
+    timeout: float = 5.0,
+) -> bool:
+    """Boundedly join a stable snapshot returned by a cancel helper.
+
+    Revocation/tombstone fences make any late owner unable to commit state.
+    Returning False lets destructive API cleanup continue rather than waiting
+    forever on a cancellation-resistant SDK coroutine.
+    """
+    if not tasks:
+        return True
+    done, pending = await asyncio.wait(tasks, timeout=max(0.1, timeout))
+    for task in pending:
+        task.cancel()
+    return not pending
 
 
 async def _cancel_and_join_runs(
@@ -259,31 +284,70 @@ _PREVIEW_CAP_CHARS = 240
 
 
 def _load_state() -> None:
-    global _state
+    global _state, _STATE_ERROR
     if not _STATE_FILE or not _STATE_FILE.exists():
+        _STATE_ERROR = ""
         return
     try:
         loaded = json.loads(_STATE_FILE.read_text(encoding="utf-8"))
-        if isinstance(loaded, dict):
-            _state = {
-                "tasks": loaded.get("tasks", {}),
-                "history": loaded.get("history", []),
-                "unread_count": loaded.get("unread_count", 0),
-            }
+        if not isinstance(loaded, dict):
+            raise ValueError("scheduler state root must be an object")
+        tasks = loaded.get("tasks", {})
+        history = loaded.get("history", [])
+        unread = loaded.get("unread_count", 0)
+        if not isinstance(tasks, dict) or not isinstance(history, list):
+            raise ValueError("scheduler tasks/history have invalid types")
+        if isinstance(unread, bool) or not isinstance(unread, int) or unread < 0:
+            raise ValueError("scheduler unread_count must be a non-negative integer")
+        _state = {
+            "tasks": tasks,
+            "history": history,
+            "unread_count": unread,
+        }
+        _STATE_ERROR = ""
     except Exception as e:
-        sys.stderr.write(f"[scheduler] failed to load state: {e}\n")
+        _STATE_ERROR = "scheduler state could not be loaded; original file preserved"
+        sys.stderr.write(
+            f"[scheduler] failed to load state ({type(e).__name__}); "
+            "writes are disabled and the original file was preserved\n"
+        )
+        raise SchedulerPersistenceError(_STATE_ERROR) from e
 
 
 def _save_state() -> None:
+    global _STATE_ERROR
+    if _STATE_ERROR:
+        raise SchedulerPersistenceError(_STATE_ERROR)
     if not _STATE_FILE:
         return
     try:
         atomic_write_text(
             _STATE_FILE,
             json.dumps(_state, ensure_ascii=False, indent=2),
+            mode=0o600,
         )
     except Exception as e:
-        sys.stderr.write(f"[scheduler] failed to save state: {e}\n")
+        _STATE_ERROR = "scheduler state could not be saved; change was not committed"
+        sys.stderr.write(
+            f"[scheduler] failed to save state ({type(e).__name__}); "
+            "scheduler entered read-only degraded mode\n"
+        )
+        raise SchedulerPersistenceError(_STATE_ERROR) from e
+
+
+def ensure_available() -> None:
+    """Fail clearly instead of exposing an empty or unsaved scheduler view."""
+    if _STATE_ERROR:
+        raise SchedulerPersistenceError(_STATE_ERROR)
+
+
+def persistence_status() -> dict[str, Any]:
+    return {"available": not bool(_STATE_ERROR), "error": _STATE_ERROR}
+
+
+def _restore_state(snapshot: dict[str, Any]) -> None:
+    global _state
+    _state = snapshot
 
 
 # ---------- schedule math ----------
@@ -425,16 +489,19 @@ def _month_max_day(year: int, month: int) -> int:
 # ---------- public CRUD ----------
 
 def list_tasks() -> list[dict]:
+    ensure_available()
     with _STATE_LOCK:
-        return sorted(
+        return copy.deepcopy(sorted(
             _state["tasks"].values(),
             key=lambda t: (not t.get("enabled", True), t.get("created_at", 0)),
-        )
+        ))
 
 
 def get_task(tid: str) -> dict | None:
+    ensure_available()
     with _STATE_LOCK:
-        return _state["tasks"].get(tid)
+        task = _state["tasks"].get(tid)
+        return copy.deepcopy(task) if task is not None else None
 
 
 def create_task(name: str, prompt: str, schedule: dict,
@@ -456,13 +523,12 @@ def create_task(name: str, prompt: str, schedule: dict,
         independent unless you ask otherwise). Old tasks that lack the
         field at all fall back to "reuse" in _execute_task() so we don't
         retroactively break their behavior."""
+    ensure_available()
     if session_mode not in ("reuse", "fresh"):
         raise ValueError(
             f"session_mode must be 'reuse' or 'fresh', got {session_mode!r}")
     next_run = _compute_next_run(schedule)
-    if next_run is None and schedule.get("kind") != "once":
-        # Allow `once` with no next_run only when explicitly so (past
-        # date) — but the API layer should reject those upfront.
+    if next_run is None:
         raise ValueError(f"schedule does not produce a next fire time: {schedule}")
     # Lazy import to avoid backend.sessions ↔ backend.scheduler cycle
     from . import sessions as sess
@@ -489,53 +555,95 @@ def create_task(name: str, prompt: str, schedule: dict,
         "next_run": next_run,
         "created_at": time.time(),
     }
-    with _STATE_LOCK:
-        _state["tasks"][tid] = task
-        _save_state()
-    return task
+    try:
+        with _STATE_LOCK:
+            snapshot = copy.deepcopy(_state)
+            _state["tasks"][tid] = task
+            try:
+                _save_state()
+            except Exception:
+                _restore_state(snapshot)
+                raise
+    except Exception:
+        # Reuse mode allocates a session before the scheduler transaction.
+        # A failed scheduler write must not leave that empty session orphaned.
+        if sid:
+            try:
+                sess.begin_session_delete(sid)
+                sess.delete_session(sid)
+            except Exception as cleanup_error:
+                sys.stderr.write(
+                    f"[scheduler] failed to roll back seed session "
+                    f"({type(cleanup_error).__name__})\n"
+                )
+        raise
+    return copy.deepcopy(task)
 
 
 def update_task(tid: str, **changes: Any) -> dict | None:
-    with _STATE_LOCK:
-        t = _state["tasks"].get(tid)
-        if not t:
-            return None
+    ensure_available()
+    seeded_sid = ""
+    rename_after_commit: tuple[str, str] | None = None
+    try:
+        with _STATE_LOCK:
+            snapshot = copy.deepcopy(_state)
+            t = _state["tasks"].get(tid)
+            if not t:
+                return None
         # Capture the old name BEFORE applying the change — used to detect a
         # rename so we can keep the bound session's name in sync. Without
         # this the history picker kept showing the old `[定时] xxx` label
         # while the scheduler list showed the new task name.
-        old_name = t.get("name")
-        for k in ("name", "prompt", "model"):
-            if k in changes and changes[k] is not None:
-                t[k] = str(changes[k])
-        if "enabled" in changes and changes["enabled"] is not None:
-            t["enabled"] = bool(changes["enabled"])
-        if "schedule" in changes and changes["schedule"] is not None:
-            t["schedule"] = changes["schedule"]
-            t["next_run"] = _compute_next_run(t["schedule"])
-        if "session_mode" in changes and changes["session_mode"] is not None:
-            new_mode = changes["session_mode"]
-            if new_mode not in ("reuse", "fresh"):
-                raise ValueError(
-                    f"session_mode must be 'reuse' or 'fresh', got {new_mode!r}")
-            old_mode = _effective_session_mode(t)
-            t["session_mode"] = new_mode
+            old_name = t.get("name")
+            for k in ("name", "prompt", "model"):
+                if k in changes and changes[k] is not None:
+                    t[k] = str(changes[k])
+            if "schedule" in changes and changes["schedule"] is not None:
+                next_run = _compute_next_run(changes["schedule"])
+                if next_run is None:
+                    # The edit form sends the whole draft. Let users rename or
+                    # change the model of an already-spent disabled once task,
+                    # while still rejecting any newly-selected past schedule.
+                    unchanged_spent = (
+                        not t.get("enabled", True)
+                        and changes["schedule"] == t.get("schedule")
+                    )
+                    if not unchanged_spent:
+                        raise ValueError(
+                            "schedule does not produce a future fire time"
+                        )
+                t["schedule"] = changes["schedule"]
+                t["next_run"] = next_run
+            if "enabled" in changes and changes["enabled"] is not None:
+                enabled = bool(changes["enabled"])
+                if enabled and t.get("next_run") is None:
+                    next_run = _compute_next_run(t.get("schedule") or {})
+                    if next_run is None:
+                        raise ValueError(
+                            "cannot enable a task without a future fire time"
+                        )
+                    t["next_run"] = next_run
+                t["enabled"] = enabled
+            if "session_mode" in changes and changes["session_mode"] is not None:
+                new_mode = changes["session_mode"]
+                if new_mode not in ("reuse", "fresh"):
+                    raise ValueError(
+                        f"session_mode must be 'reuse' or 'fresh', got {new_mode!r}")
+                old_mode = _effective_session_mode(t)
+                t["session_mode"] = new_mode
             # Transitioning fresh → reuse: future runs need a bound session
             # to append to. The most-recent fresh run's session (if any) is
             # a reasonable seed — Muse already has its prior reply in there.
             # If no run yet (session_id empty), create one now so the next
             # run has somewhere to land.
-            if old_mode == "fresh" and new_mode == "reuse" and not t.get("session_id"):
-                try:
+                if (old_mode == "fresh" and new_mode == "reuse"
+                        and not t.get("session_id")):
                     from . import sessions as sess
                     sess_meta = sess.create_session(
                         name=f"{_scheduled_label_prefix()}{t.get('name', '')}",
                         model=t.get("model", ""))
-                    t["session_id"] = sess_meta["id"]
-                except Exception as e:
-                    sys.stderr.write(
-                        f"[scheduler] update_task({tid}): seed session for "
-                        f"reuse mode failed: {e}\n")
+                    seeded_sid = sess_meta["id"]
+                    t["session_id"] = seeded_sid
             # reuse → fresh: keep the existing session_id around (becomes the
             # "most recent run" pointer); future runs will spin up new ones.
             # The old bound session is NOT deleted — it has the user's prior
@@ -543,20 +651,41 @@ def update_task(tid: str, **changes: Any) -> dict | None:
         # Sync bound session name if the task was renamed — only meaningful
         # for reuse mode (fresh mode's session_id points at a timestamped
         # historical run, renaming it to a generic name would lose info).
-        new_name = t.get("name")
-        sid = t.get("session_id")
-        if (sid and new_name and new_name != old_name
-                and _effective_session_mode(t) == "reuse"):
+            new_name = t.get("name")
+            sid = t.get("session_id")
+            if (sid and new_name and new_name != old_name
+                    and _effective_session_mode(t) == "reuse"):
+                rename_after_commit = (sid, str(new_name))
+            try:
+                _save_state()
+            except Exception:
+                _restore_state(snapshot)
+                raise
+            result = copy.deepcopy(t)
+    except Exception:
+        if seeded_sid:
             try:
                 from . import sessions as sess
-                sess.rename_session(
-                    sid, f"{_scheduled_label_prefix()}{new_name}")
-            except Exception as e:
+                sess.begin_session_delete(seeded_sid)
+                sess.delete_session(seeded_sid)
+            except Exception as cleanup_error:
                 sys.stderr.write(
-                    f"[scheduler] update_task({tid}): bound session {sid} "
-                    f"rename failed: {e}\n")
-        _save_state()
-        return t
+                    f"[scheduler] failed to roll back seed session "
+                    f"({type(cleanup_error).__name__})\n"
+                )
+        raise
+    if rename_after_commit:
+        sid, new_name = rename_after_commit
+        try:
+            from . import sessions as sess
+            sess.rename_session(
+                sid, f"{_scheduled_label_prefix()}{new_name}")
+        except Exception as e:
+            sys.stderr.write(
+                f"[scheduler] update_task({tid}): bound session rename failed "
+                f"({type(e).__name__})\n"
+            )
+    return result
 
 
 def _effective_session_mode(task: dict) -> str:
@@ -574,8 +703,11 @@ def list_task_history(tid: str, limit: int = 100) -> list[dict]:
 
     No new state — filters _state["history"] in place. The history list
     is already capped at _HISTORY_CAP globally, so this is bounded too."""
+    ensure_available()
     with _STATE_LOCK:
-        out = [e for e in _state["history"] if e.get("task_id") == tid]
+        out = copy.deepcopy([
+            e for e in _state["history"] if e.get("task_id") == tid
+        ])
     out.sort(key=lambda e: e.get("ts", 0), reverse=True)
     if limit > 0:
         out = out[:limit]
@@ -596,6 +728,7 @@ def delete_task(tid: str, *, purge_bound_session: bool = True) -> bool:
         select and delete in the regular sessions list if they want.
 
     Returns True if the task existed and got removed."""
+    ensure_available()
     with _RUN_REGISTRY_LOCK:
         if purge_bound_session and any(
             owner_tid == tid and not task.done()
@@ -606,16 +739,24 @@ def delete_task(tid: str, *, purge_bound_session: bool = True) -> bool:
                 "use the async API cleanup path"
             )
         with _STATE_LOCK:
+            snapshot = copy.deepcopy(_state)
             t = _state["tasks"].pop(tid, None)
             if not t:
                 return False
             # Fence while registration is excluded. A task created just
             # before this critical section either appears above and rejects
             # the sync cascade, or starts afterward and observes revocation.
+            was_revoked = tid in _REVOKED_TASK_IDS
             _REVOKED_TASK_IDS.add(tid)
             mode = _effective_session_mode(t)
             sid = t.get("session_id")
-            _save_state()
+            try:
+                _save_state()
+            except Exception:
+                _restore_state(snapshot)
+                if not was_revoked:
+                    _REVOKED_TASK_IDS.discard(tid)
+                raise
     # Cascade OUTSIDE the lock — the purge touches disk (SDK JSONL, sidecar,
     # attachments) and must not stall other scheduler state operations.
     # purge_session_storage is the same full-cleanup path the HTTP session
@@ -629,14 +770,20 @@ def delete_task(tid: str, *, purge_bound_session: bool = True) -> bool:
             sys.stderr.write(
                 f"[scheduler] delete_task({tid}): bound session {sid} "
                 f"cleanup failed: {e}\n")
+            # The task removal is already durable and cannot be safely rolled
+            # back after a potentially-partial filesystem purge. Still, never
+            # report the compound operation as success while its bound session
+            # may remain visible; callers can surface/retry the cleanup error.
+            raise
     return True
 
 
 def list_history(limit: int = 50) -> list[dict]:
     """Most-recent first, capped at `limit`."""
+    ensure_available()
     with _STATE_LOCK:
         h = _state.get("history", [])
-        return h[-limit:][::-1]
+        return copy.deepcopy(h[-limit:][::-1])
 
 
 def delete_history_entry(ts: float, task_id: str = "") -> bool:
@@ -651,12 +798,18 @@ def delete_history_entry(ts: float, task_id: str = "") -> bool:
     history may have been pruned by _HISTORY_CAP between display and
     click).
     """
+    ensure_available()
     with _STATE_LOCK:
+        snapshot = copy.deepcopy(_state)
         h = _state.get("history", [])
         for i, entry in enumerate(h):
             if entry.get("ts") == ts and (not task_id or entry.get("task_id") == task_id):
                 h.pop(i)
-                _save_state()
+                try:
+                    _save_state()
+                except Exception:
+                    _restore_state(snapshot)
+                    raise
                 return True
     return False
 
@@ -668,26 +821,58 @@ def clear_history() -> int:
     runs that arrived after their last drawer-open). If you want both
     cleared, also call ack_unread() at the call site.
     """
+    ensure_available()
     with _STATE_LOCK:
+        snapshot = copy.deepcopy(_state)
         n = len(_state.get("history", []))
         _state["history"] = []
-        _save_state()
+        try:
+            _save_state()
+        except Exception:
+            _restore_state(snapshot)
+            raise
     return n
 
 
 def get_unread() -> int:
+    ensure_available()
     with _STATE_LOCK:
         return _state.get("unread_count", 0)
 
 
 def ack_unread() -> int:
+    ensure_available()
     with _STATE_LOCK:
+        snapshot = copy.deepcopy(_state)
         _state["unread_count"] = 0
-        _save_state()
+        try:
+            _save_state()
+        except Exception:
+            _restore_state(snapshot)
+            raise
     return 0
 
 
 # ---------- task execution ----------
+
+
+@asynccontextmanager
+async def _disconnect_runtime_on_cancel(session_id: str):
+    """Fence a timed-out/cancelled scheduled turn before releasing its lock."""
+    try:
+        yield
+    except asyncio.CancelledError:
+        from .chat import disconnect_client
+        try:
+            await disconnect_client(session_id)
+        except Exception as exc:
+            # disconnect_client retains an unfinished SDK close in a per-session
+            # fence. A later turn must join it before creating/reusing a client.
+            sys.stderr.write(
+                f"[scheduler] runtime cleanup pending sid={session_id[:8]} "
+                f"({type(exc).__name__})\n"
+            )
+        raise
 
 
 async def _run_sdk_task_turn(
@@ -716,7 +901,13 @@ async def _run_sdk_task_turn(
     reply_text = ""
     error: str | None = None
     saw_result = False
-    async with _session_runtime_lock_for(session_id):
+    # Exit order matters: the cancellation guard tears down/fences the CLI
+    # while the session runtime lock is still owned. A timeout can therefore
+    # never release the lock and let the next turn reuse a still-running client.
+    async with (
+        _session_runtime_lock_for(session_id),
+        _disconnect_runtime_on_cancel(session_id),
+    ):
         # Re-check after acquiring: an interactive request may have reserved
         # the session while this scheduled run was waiting for the mutex.
         active = _active_turns.get(session_id)
@@ -850,6 +1041,7 @@ async def run_task_now(tid: str) -> bool:
 
     Useful as a "retry" affordance after a failure, and as a smoke test
     after editing a task without having to wait for the next fire window."""
+    ensure_available()
     with _STATE_LOCK:
         task = _state["tasks"].get(tid)
     if not task:
@@ -905,6 +1097,7 @@ async def _execute_task(task: dict) -> None:
         # Resolve `sid` INSIDE the lock so two parallel run-now clicks
         # don't both mint fresh sessions then race on session_id write.
         if mode == "fresh":
+            sid = ""
             try:
                 from . import sessions as sess
                 ts_label = datetime.now().strftime("%m-%d %H:%M")
@@ -913,11 +1106,16 @@ async def _execute_task(task: dict) -> None:
                     model=task.get("model", ""))
                 sid = sess_meta["id"]
                 with _STATE_LOCK:
+                    snapshot = copy.deepcopy(_state)
                     revoked = tid in _REVOKED_TASK_IDS
                     if not revoked:
                         # "most recent run" pointer
                         task["session_id"] = sid
-                        _save_state()
+                        try:
+                            _save_state()
+                        except Exception:
+                            _restore_state(snapshot)
+                            raise
                 if revoked:
                     # A synchronous compatibility caller can revoke while
                     # create_session is doing disk I/O in another thread.
@@ -926,31 +1124,48 @@ async def _execute_task(task: dict) -> None:
                     sess.delete_session(sid)
                     return
             except Exception as e:
+                if sid:
+                    try:
+                        sess.begin_session_delete(sid)
+                        sess.delete_session(sid)
+                    except Exception as cleanup_error:
+                        sys.stderr.write(
+                            "[scheduler] failed to roll back fresh session "
+                            f"({type(cleanup_error).__name__})\n"
+                        )
                 # If session minting itself fails (disk full, etc.), record
                 # the failure as a history entry rather than crashing the
                 # scheduler loop. Bail before touching the SDK.
                 sys.stderr.write(
                     f"[scheduler] task {tid} fresh-session mint failed: "
                     f"{type(e).__name__}: {e}\n")
-                now = time.time()
-                with _STATE_LOCK:
-                    if tid not in _REVOKED_TASK_IDS:
-                        _state["history"].append({
-                            "task_id": tid,
-                            "task_name": task["name"],
-                            "session_id": "",
-                            "ts": now,
-                            "ok": False,
-                            "error": (
-                                "session mint failed: "
-                                f"{type(e).__name__}: {e}"
-                            ),
-                            "reply_preview": None,
-                        })
-                        _state["unread_count"] = (
-                            _state.get("unread_count", 0) + 1
-                        )
-                        _save_state()
+                # A persistence failure has already fenced the scheduler and
+                # cannot safely record another mutation. Other mint failures
+                # remain visible in history when that history can be saved.
+                if not isinstance(e, SchedulerPersistenceError):
+                    now = time.time()
+                    with _STATE_LOCK:
+                        snapshot = copy.deepcopy(_state)
+                        if tid not in _REVOKED_TASK_IDS:
+                            _state["history"].append({
+                                "task_id": tid,
+                                "task_name": task["name"],
+                                "session_id": "",
+                                "ts": now,
+                                "ok": False,
+                                "error": (
+                                    "session mint failed: "
+                                    f"{type(e).__name__}: {e}"
+                                ),
+                                "reply_preview": None,
+                            })
+                            _state["unread_count"] = (
+                                _state.get("unread_count", 0) + 1
+                            )
+                            try:
+                                _save_state()
+                            except Exception:
+                                _restore_state(snapshot)
                 return
         else:
             sid = task["session_id"]
@@ -1018,6 +1233,7 @@ async def _execute_task(task: dict) -> None:
                     or session_store.session_is_deleting(sid)
                 )
                 if not revoked:
+                    snapshot = copy.deepcopy(_state)
                     task["last_run"] = now
                     _state["history"].append(entry)
                     # Successful runs bump unread; errors also bump so the
@@ -1027,7 +1243,15 @@ async def _execute_task(task: dict) -> None:
                     )
                     if len(_state["history"]) > _HISTORY_CAP:
                         _state["history"] = _state["history"][-_HISTORY_CAP:]
-                    _save_state()
+                    try:
+                        _save_state()
+                    except SchedulerPersistenceError as exc:
+                        _restore_state(snapshot)
+                        error = f"SchedulerPersistenceError: {exc}"
+                        sys.stderr.write(
+                            f"[scheduler] task {tid} result was not persisted; "
+                            "in-memory mutation rolled back\n"
+                        )
             try:
                 from .activity import activity as _activity
                 current = asyncio.current_task()
@@ -1144,6 +1368,7 @@ async def _scheduler_loop() -> None:
                     # task doesn't fire twice if we tick again before it
                     # finishes.
                     with _STATE_LOCK:
+                        state_snapshot = copy.deepcopy(_state)
                         task["next_run"] = _compute_next_run(task["schedule"])
                         # A `once` task fires exactly once — after firing it
                         # has no future next_run, so disable it too. This
@@ -1152,7 +1377,11 @@ async def _scheduler_loop() -> None:
                         # again.
                         if (task.get("schedule") or {}).get("kind") == "once":
                             task["enabled"] = False
-                        _save_state()
+                        try:
+                            _save_state()
+                        except Exception:
+                            _restore_state(state_snapshot)
+                            raise
                     task_obj = _track_task(
                         asyncio.create_task(_execute_task(task)),
                         task_id=str(task.get("id") or ""),
@@ -1194,6 +1423,7 @@ async def start_scheduler() -> None:
     _CATCHUP_MAX_AGE_S = 24 * 3600
     with _STATE_LOCK:
         _load_state()
+        state_snapshot = copy.deepcopy(_state)
         for task in _state["tasks"].values():
             sched = task.get("schedule")
             if not sched:
@@ -1219,7 +1449,11 @@ async def start_scheduler() -> None:
             # keep next_run set, so they stay enabled until they fire.
             if sched.get("kind") == "once" and task["next_run"] is None:
                 task["enabled"] = False
-        _save_state()
+        try:
+            _save_state()
+        except Exception:
+            _restore_state(state_snapshot)
+            raise
     # Kick off catch-up runs — staggered so an overnight outage with many
     # daily tasks doesn't spawn every CLI subprocess at once (thundering
     # herd). Each carries the same done-callback the tick loop uses, so a

@@ -45,10 +45,20 @@ _RECONCILE_REPLAY_LIMIT = 500
 # sibling set independently so one generated/dump directory cannot turn a cold
 # page load into a multi-megabyte JSON response and browser main-thread stall.
 _BOOTSTRAP_CHILDREN_PER_PARENT = 500
+# Database maintenance runs only during service startup, before the file index
+# is exposed.  Avoid churning small databases: both an absolute and a relative
+# threshold must be crossed before any page-moving operation is attempted.
+_VACUUM_MIN_RECLAIM_BYTES = 16 * 1024 * 1024
+_VACUUM_MIN_FREE_RATIO = 0.25
+_INCREMENTAL_VACUUM_MAX_PAGES = 4096
 
 
 class WorkspaceScanIncomplete(RuntimeError):
     """Raised when a full reconciliation cannot safely prove deletions."""
+
+
+class WorkspaceScanCancelled(RuntimeError):
+    """Raised when lifecycle shutdown asks a full scan to stop."""
 
 
 def database_path(primary_root: Path) -> Path:
@@ -81,21 +91,34 @@ def is_ignored_descendant(path: str | Path) -> bool:
     )
 
 
-def scan_workspace(root: Path) -> list[dict[str, Any]]:
+def scan_workspace(
+    root: Path,
+    cancel_event: threading.Event | None = None,
+) -> list[dict[str, Any]]:
     """Return a complete metadata snapshot without following directory links."""
     root = root.resolve()
     rows: list[dict[str, Any]] = []
     stack: list[tuple[Path, Path]] = [(root, Path())]
     while stack:
+        if cancel_event is not None and cancel_event.is_set():
+            raise WorkspaceScanCancelled("workspace scan cancelled")
         directory, logical_parent = stack.pop()
         try:
             with os.scandir(directory) as iterator:
-                children = list(iterator)
+                children = []
+                for child in iterator:
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise WorkspaceScanCancelled(
+                            "workspace scan cancelled"
+                        )
+                    children.append(child)
         except OSError as exc:
             # A partial snapshot cannot distinguish an unreadable subtree from a
             # deleted one. Keep the last-good index instead of inventing deletes.
             raise WorkspaceScanIncomplete(str(directory)) from exc
         for child in children:
+            if cancel_event is not None and cancel_event.is_set():
+                raise WorkspaceScanCancelled("workspace scan cancelled")
             if child.name in _EXCLUDED_DIRS:
                 continue
             logical = logical_parent / child.name
@@ -146,6 +169,10 @@ class WorkspaceStore:
                 # avoids taking the journal-mode lock on every short-lived
                 # read connection used by bootstrap/delta hot paths.
                 db.execute("PRAGMA journal_mode = WAL")
+                # New databases adopt incremental auto-vacuum before their
+                # schema is created. Existing databases switch during the
+                # threshold-gated one-time full VACUUM in maintain_database().
+                db.execute("PRAGMA auto_vacuum = INCREMENTAL")
                 db.executescript(
                     """
                     CREATE TABLE IF NOT EXISTS workspaces (
@@ -242,6 +269,65 @@ class WorkspaceStore:
                 )
             self._secure_database_files()
             self._ready = True
+
+    def maintain_database(self) -> dict[str, Any]:
+        """Reclaim meaningful freelist bloat outside interactive hot paths.
+
+        The first maintenance of an older database performs the one required
+        full VACUUM to enable incremental auto-vacuum. Later startups reclaim
+        at most 4096 pages, bounding routine work while still reducing a large
+        high-water mark over time. SQLite's own locking keeps this safe; the
+        caller invokes it before the file index is exposed to requests.
+        """
+        self.initialize()
+        started = time.monotonic()
+        with self._lock, self._connect() as db:
+            before = self._database_stats(db)
+            should_reclaim = (
+                before["reclaimable_bytes"] >= _VACUUM_MIN_RECLAIM_BYTES
+                and before["free_ratio"] >= _VACUUM_MIN_FREE_RATIO
+            )
+            action = "none"
+            if should_reclaim:
+                db.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
+                if before["auto_vacuum"] != 2:
+                    db.execute("PRAGMA auto_vacuum = INCREMENTAL")
+                    db.execute("VACUUM")
+                    action = "full"
+                else:
+                    pages = min(
+                        before["freelist_count"],
+                        _INCREMENTAL_VACUUM_MAX_PAGES,
+                    )
+                    db.execute(f"PRAGMA incremental_vacuum({pages})")
+                    action = "incremental"
+            after = self._database_stats(db)
+        self._secure_database_files()
+        return {
+            "action": action,
+            "before": before,
+            "after": after,
+            "duration_ms": round((time.monotonic() - started) * 1000, 1),
+        }
+
+    @staticmethod
+    def _database_stats(db: sqlite3.Connection) -> dict[str, Any]:
+        page_size = int(db.execute("PRAGMA page_size").fetchone()[0])
+        page_count = int(db.execute("PRAGMA page_count").fetchone()[0])
+        freelist_count = int(db.execute("PRAGMA freelist_count").fetchone()[0])
+        auto_vacuum = int(db.execute("PRAGMA auto_vacuum").fetchone()[0])
+        return {
+            "page_size": page_size,
+            "page_count": page_count,
+            "freelist_count": freelist_count,
+            "reclaimable_bytes": page_size * freelist_count,
+            "free_ratio": (
+                round(freelist_count / page_count, 4)
+                if page_count
+                else 0.0
+            ),
+            "auto_vacuum": auto_vacuum,
+        }
 
     def register_workspace(
         self,
@@ -372,6 +458,7 @@ class WorkspaceStore:
         name: str,
         *,
         primary: bool = False,
+        cancel_event: threading.Event | None = None,
     ) -> int:
         """Scan disk, update only changed rows, and log offline changes."""
         root = root.resolve()
@@ -379,14 +466,20 @@ class WorkspaceStore:
         # reconciliation transaction. Different workspaces may still scan in
         # parallel, while bootstrap/delta reads keep using the last-good index.
         with self._workspace_lock(workspace_id):
-            snapshot = scan_workspace(root)
+            snapshot = scan_workspace(root, cancel_event=cancel_event)
+            if cancel_event is not None and cancel_event.is_set():
+                raise WorkspaceScanCancelled("workspace scan cancelled")
             self.register_workspace(
                 workspace_id,
                 root,
                 name,
                 primary=primary,
             )
+            if cancel_event is not None and cancel_event.is_set():
+                raise WorkspaceScanCancelled("workspace scan cancelled")
             with self._connect() as db:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise WorkspaceScanCancelled("workspace scan cancelled")
                 db.execute("BEGIN IMMEDIATE")
                 state = db.execute(
                     """
@@ -472,6 +565,13 @@ class WorkspaceStore:
                             changes,
                         )
 
+                # Cancellation cannot pre-empt a single sqlite C call, but it
+                # can prevent a fully computed, now-stale snapshot from being
+                # committed after runtime shutdown has begun. Checks bracket
+                # the final metadata/prune work so an exception rolls the
+                # explicit transaction back via the connection context.
+                if cancel_event is not None and cancel_event.is_set():
+                    raise WorkspaceScanCancelled("workspace scan cancelled")
                 db.execute(
                     """
                     UPDATE workspaces
@@ -481,6 +581,8 @@ class WorkspaceStore:
                     (seq, time.time(), workspace_id),
                 )
                 self._prune(db, workspace_id, seq)
+                if cancel_event is not None and cancel_event.is_set():
+                    raise WorkspaceScanCancelled("workspace scan cancelled")
                 db.commit()
                 return seq
 

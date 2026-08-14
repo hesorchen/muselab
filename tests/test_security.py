@@ -151,3 +151,18 @@ def test_client_error_rate_limited(client):
     r = client.post("/api/log/client-error", json=payload)
     assert r.status_code == 200
     assert r.json() == {"ok": True, "rate_limited": True}
+
+
+def test_client_error_rejects_oversized_body_before_logging(client):
+    """The 8 KiB telemetry cap is an input-memory boundary, not truncation."""
+    from backend import main as m
+
+    m._CLIENT_ERR_BUCKETS.clear()
+    r = client.post(
+        "/api/log/client-error",
+        content=b"x" * (m._CLIENT_ERR_BODY_LIMIT + 1),
+        headers={"content-type": "application/octet-stream"},
+    )
+
+    assert r.status_code == 413
+    assert r.json() == {"ok": False, "error": "body_too_large"}

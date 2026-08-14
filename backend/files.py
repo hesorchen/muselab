@@ -6,6 +6,7 @@ import json
 import re
 import secrets
 import shutil
+import sys
 import threading
 import time
 from collections import OrderedDict
@@ -234,30 +235,78 @@ def auto_purge_expired_trash(root: Path | None = None) -> int:
         tid = data.get("trash_id")
         if not tid or not _valid_trash_id(tid):
             continue
-        _purge_one(tid, root)
-        purged += 1
+        try:
+            if _purge_one(tid, root):
+                purged += 1
+        except OSError as exc:
+            # Keep both the payload remainder and manifest discoverable for a
+            # later retry. Startup cleanup is best-effort, but never reports a
+            # failed deletion as purged.
+            sys.stderr.write(
+                f"[files] expired trash purge failed tid={tid} "
+                f"({type(exc).__name__})\n"
+            )
     return purged
 
 
-def _purge_one(tid: str, root: Path | None = None) -> None:
-    """Permanently delete one trash item (manifest + payload).
-    Silent no-op if neither exists."""
+def _path_lexists(path: Path) -> bool:
+    """Like lexists(): a broken symlink is still a deletable payload."""
+    return path.exists() or path.is_symlink()
+
+
+def _remove_path_strict(path: Path) -> bool:
+    """Remove one path and verify it is gone; never swallow an I/O failure."""
+    if not _path_lexists(path):
+        return False
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path)
+    else:
+        path.unlink()
+    if _path_lexists(path):
+        raise OSError("permanent delete did not remove the target")
+    return True
+
+
+def _purge_one(tid: str, root: Path | None = None) -> bool:
+    """Permanently delete one trash item while preserving recovery metadata.
+
+    The manifest is removed only after the payload is confirmed absent. If a
+    recursive delete is partial, the remaining payload and its manifest stay
+    visible so the user can retry instead of getting a false success.
+    """
     d = _trash_dir(root)
     payload = d / tid
-    if payload.exists():
-        if payload.is_dir():
-            shutil.rmtree(payload, ignore_errors=True)
-        else:
-            try:
-                payload.unlink()
-            except OSError:
-                pass
     mf = d / f"{tid}.json"
-    if mf.exists():
-        try:
-            mf.unlink()
-        except OSError:
-            pass
+    existed = _path_lexists(payload) or _path_lexists(mf)
+    _remove_path_strict(payload)
+    _remove_path_strict(mf)
+    return existed
+
+
+def _delete_failure(
+    exc: OSError,
+    *,
+    target: Path,
+    directory_payload: bool,
+    detail: str,
+) -> HTTPException:
+    """Map destructive I/O failures without exposing a filesystem path."""
+    if isinstance(exc, PermissionError):
+        return HTTPException(
+            status_code=403,
+            detail=detail,
+            headers={"X-MuseLab-Error-Code": "permission_denied"},
+        )
+    error_code = (
+        "partial_delete"
+        if directory_payload and _path_lexists(target)
+        else "io_error"
+    )
+    return HTTPException(
+        status_code=500,
+        detail=detail,
+        headers={"X-MuseLab-Error-Code": error_code},
+    )
 
 # Filenames without extensions that are commonly text (Dockerfile, Makefile, etc.).
 # Compared case-insensitively against the full name.
@@ -1292,16 +1341,16 @@ def delete(
         raise HTTPException(status_code=404, detail="not found")
     _guard_not_trash(target, root)
     if permanent:
-        # ignore_errors mirrors the soft-delete _purge_one path. A
-        # permission / busy-file error here previously bubbled up as a 500
-        # with a traceback that leaked absolute internal paths.
-        if target.is_dir():
-            shutil.rmtree(target, ignore_errors=True)
-        else:
-            try:
-                target.unlink(missing_ok=True)
-            except OSError:
-                pass
+        was_directory = target.is_dir() and not target.is_symlink()
+        try:
+            _remove_path_strict(target)
+        except OSError as exc:
+            raise _delete_failure(
+                exc,
+                target=target,
+                directory_payload=was_directory,
+                detail="permanent delete failed; the target may still exist",
+            ) from None
         return {"ok": True, "permanent": True}
     manifest = _move_to_trash(target, root, original_rel=req.path)
     return {"ok": True, "permanent": False,
@@ -1379,9 +1428,20 @@ def trash_purge(req: TrashIdReq, root: Path = Depends(_workspace_root)) -> dict:
     if not _valid_trash_id(req.trash_id):
         raise HTTPException(status_code=400, detail="invalid trash_id")
     d = _trash_dir(root)
-    if not (d / f"{req.trash_id}.json").exists() and not (d / req.trash_id).exists():
+    payload = d / req.trash_id
+    manifest = d / f"{req.trash_id}.json"
+    if not manifest.exists() and not payload.exists():
         raise HTTPException(status_code=404, detail="trash item not found")
-    _purge_one(req.trash_id, root)
+    was_directory = payload.is_dir() and not payload.is_symlink()
+    try:
+        _purge_one(req.trash_id, root)
+    except OSError as exc:
+        raise _delete_failure(
+            exc,
+            target=payload,
+            directory_payload=was_directory,
+            detail="trash purge failed; the item was kept for retry",
+        ) from None
     return {"ok": True}
 
 
@@ -1392,11 +1452,25 @@ def trash_empty(root: Path = Depends(_workspace_root)) -> dict:
     if not d.exists():
         return {"ok": True, "purged": 0}
     count = 0
+    failed = 0
     for mf in list(d.glob("*.json")):
         tid = mf.stem
-        _purge_one(tid, root)
-        count += 1
-    return {"ok": True, "purged": count}
+        try:
+            if _purge_one(tid, root):
+                count += 1
+        except OSError:
+            failed += 1
+    if failed:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "message": "trash cleanup was only partially completed",
+                "purged": count,
+                "failed": failed,
+            },
+            headers={"X-MuseLab-Error-Code": "partial_delete"},
+        )
+    return {"ok": True, "purged": count, "failed": 0}
 
 
 class MkdirReq(BaseModel):

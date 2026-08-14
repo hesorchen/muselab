@@ -17,7 +17,17 @@ import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Iterable, Literal, get_args
-from fastapi import APIRouter, Depends, Query, HTTPException, UploadFile, File, Request, Response
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    Query,
+    HTTPException,
+    UploadFile,
+    File,
+    Request,
+    Response,
+)
 from fastapi.responses import FileResponse
 from sse_starlette.sse import EventSourceResponse, ServerSentEvent
 from pydantic import BaseModel, Field
@@ -1274,6 +1284,10 @@ _session_runtime_locks: dict[str, asyncio.Lock] = {}
 # from popping adjacent FIFO items before either reserves _active_turns[sid].
 _queue_drain_locks: dict[str, asyncio.Lock] = {}
 _queue_drain_tasks: dict[str, asyncio.Task] = {}
+# A queue POST can land while the coalesced drain is busy forking a detached
+# runtime. Remember that wakeup instead of dropping it; once the first drain
+# exits, one follow-up pass migrates any item accepted after its queue snapshot.
+_queue_drain_rekicks: set[str] = set()
 # Session settings can change after a turn reserves `_active_turns[sid]` but
 # before its detached query task starts. Disconnecting in that gap kills the
 # freshly selected client. Mark rebuilds and consume them at the next safe SDK
@@ -1317,6 +1331,22 @@ _bg_task_pinned_at: dict[str, float] = {}
 # transcript counts after the verified compact result has already reached the
 # browser. Strong references prevent accidental mid-run garbage collection.
 _maintenance_tasks: set[asyncio.Task] = set()
+# SDK disconnect owns process reaping and can legitimately take about 20s
+# (stdin close, graceful wait, TERM, then KILL). Keep timed-out owners keyed by
+# session so a retry/new turn must join the same cleanup before touching disk or
+# starting another CLI against the transcript.
+_session_disconnect_tasks: dict[str, set[asyncio.Task]] = {}
+_session_disconnect_failed: set[str] = set()
+_CLIENT_DISCONNECT_DEADLINE_S = 22.0
+# Turn/scheduler owners cancelled by session deletion can outlive their first
+# bounded join. Keep the exact handles keyed by session so a retry cannot race
+# ahead and purge the transcript while an earlier owner is still unwinding.
+_session_runtime_cleanup_tasks: dict[str, set[asyncio.Task]] = {}
+# A disk purge may itself exceed the public HTTP deadline (slow/networked
+# workspace). Repeated DELETEs join the same owner instead of starting a second
+# destructive transaction. Completed, unobserved owners expire after 5 min.
+_session_purge_tasks: dict[str, asyncio.Task] = {}
+_SESSION_DELETE_DEADLINE_S = 30.0
 # Original user-turn start (epoch seconds) retained across the detached gap and
 # every headless continuation. `/active` returns it after a page refresh so the
 # footer timer keeps counting from the real turn start instead of restarting.
@@ -1335,7 +1365,22 @@ _background_activity_finishes: dict[str, tuple[str, str]] = {}
 # message before CancelledError lands. Generation checks keep that stale reader
 # from opening or closing a newer continuation in that window.
 _continuation_generations: dict[str, int] = {}
-_TASK_WATCH_TIMEOUT = env_int("MUSELAB_TASK_WATCH_TIMEOUT", 1800, min_value=60)
+# Keep this comfortably above the common ``sleep 1800; ...`` anti-pattern.  A
+# deadline exactly equal to the requested delay races the command after sleep
+# against MuseLab's timeout recovery, which is both surprising and unsafe.
+# The watcher still enforces a hard bound; long delayed work belongs in the
+# scheduler rather than an SDK-owned Bash task.
+_TASK_WATCH_TIMEOUT = env_int("MUSELAB_TASK_WATCH_TIMEOUT", 3600, min_value=60)
+# Once the absolute lease expires, first ask the CLI to stop each task and give
+# its terminal TaskNotification a short chance to arrive.  A control ack is not
+# itself proof that the child stopped, so expiry may release pins only after a
+# terminal notification or a fully-confirmed SDK disconnect.
+_TASK_STOP_ACK_TIMEOUT_S = max(
+    0.1, env_float("MUSELAB_TASK_STOP_ACK_TIMEOUT_S", 3.0))
+_TASK_STOP_SETTLE_GRACE_S = max(
+    0.1, env_float("MUSELAB_TASK_STOP_SETTLE_GRACE_S", 5.0))
+_TASK_TERMINATION_RETRY_S = max(
+    0.1, env_float("MUSELAB_TASK_TERMINATION_RETRY_S", 5.0))
 # After the LAST in-flight task delivers its terminal notification, the CLI
 # auto-continues a short turn (model reacts to the result). The probe (§3.4)
 # measured it landing ~1.3s later, but it's not strictly guaranteed for every
@@ -1355,6 +1400,115 @@ _STOPPED_CONTINUATION_GRACE = env_int(
 # the label available to the detached watcher and across watcher replacement.
 # Populated on TaskStarted, consumed+removed on settle.
 _bg_task_descriptions: dict[str, str] = {}
+_bg_task_tool_use_ids: dict[str, str] = {}
+
+# A source session can be rolled over at most once.  Keep creation + metadata
+# link + queue migration inside one per-source critical section so retries from
+# multiple browser tabs all receive the same successor UUID.
+_runtime_rollover_locks: dict[str, asyncio.Lock] = {}
+# Main-response completion should not make the user's next send pay for the
+# detached fork plus a cold CLI connect.  One retained task per source creates
+# that successor as soon as the canonical ``done`` boundary is published, then
+# warms its runtime while the user is reading the answer.  The rollover lock
+# above remains the authority: an eager task, /continue-detached, and queue
+# drain all converge on the same durable child.
+_runtime_prewarm_tasks: dict[str, asyncio.Task] = {}
+# Title writes touch both MuseLab's index and the SDK JSONL.  Serialize the
+# pair so late runtime-postlude propagation cannot overwrite a user rename in
+# the narrow gap between checking the inherited title and writing customTitle.
+_session_title_locks = tuple(threading.RLock() for _ in range(64))
+
+
+def _runtime_rollover_lock_for(session_id: str) -> asyncio.Lock:
+    return _runtime_rollover_locks.setdefault(session_id, asyncio.Lock())
+
+
+@contextmanager
+def _session_title_lock(session_id: str):
+    lock = _session_title_locks[hash(session_id) % len(_session_title_locks)]
+    with lock:
+        yield
+
+
+def _runtime_task_overlay(
+    session_id: str,
+    task_id: str,
+    *,
+    state: str,
+    tool_use_id: str | None = None,
+    description: str | None = None,
+    summary: str | None = None,
+    output_file: str | None = None,
+    usage: dict | None = None,
+) -> None:
+    """Persist one task-card patch on its owner and runtime successor.
+
+    This is deliberately sidecar-only: the successor never receives the old
+    CLI's implicit continuation in its transcript/model context.
+    """
+    owner = str(session_id or "")
+    tid = str(task_id or "")
+    if not owner or not tid:
+        return
+    resolved_tool_use = str(
+        tool_use_id or _bg_task_tool_use_ids.get(tid) or ""
+    )
+    fields: dict[str, Any] = {
+        "state": "stopped" if state == "killed" else state,
+        "owner_session_id": owner,
+        "updated_at": int(time.time() * 1000),
+    }
+    resolved_description = description or _bg_task_descriptions.get(tid)
+    if resolved_tool_use:
+        fields["tool_use_id"] = resolved_tool_use
+    if resolved_description:
+        fields["description"] = resolved_description
+    if summary:
+        fields["summary"] = summary
+    if output_file:
+        fields["output_file"] = output_file
+    if usage:
+        fields["usage"] = dict(usage)
+    try:
+        current = owner
+        seen: set[str] = set()
+        for _ in range(32):
+            if not current or current in seen:
+                break
+            seen.add(current)
+            sess.set_runtime_task_overlay(current, tid, **fields)
+            current_meta = sess.get_session_meta(current) or {}
+            current = str(current_meta.get("runtime_successor") or "")
+    except Exception as exc:
+        sys.stderr.write(
+            f"[chat] runtime task overlay failed sid={owner[:8]} "
+            f"task={tid} exc={type(exc).__name__}\n"
+        )
+
+
+def _record_background_task_launch(
+    session_id: str,
+    task_id: str,
+    *,
+    tool_use_id: str | None = None,
+    description: str | None = None,
+    output_file: str | None = None,
+) -> None:
+    tid = str(task_id or "")
+    if not tid:
+        return
+    if tool_use_id:
+        _bg_task_tool_use_ids[tid] = str(tool_use_id)
+    if description:
+        _bg_task_descriptions[tid] = str(description)
+    _runtime_task_overlay(
+        session_id,
+        tid,
+        state="running",
+        tool_use_id=tool_use_id,
+        description=description,
+        output_file=output_file,
+    )
 
 
 def _session_has_live_watcher(session_id: str) -> bool:
@@ -3123,6 +3277,10 @@ async def get_client(session_id: str, model: str, permission: str = "bypassPermi
 
     effort: "auto" / "low" / "medium" / "high" / "xhigh" / "max" / "ultra".
     Empty string remains accepted as a legacy spelling of ``auto``."""
+    if not await _join_session_disconnects(session_id):
+        raise RuntimeCleanupTimeout(
+            "session runtime cleanup is still in progress"
+        )
     if sess.session_is_deleting(session_id):
         raise RuntimeError("session is being deleted")
     if session_id in _pending_runtime_rebuilds:
@@ -3479,7 +3637,9 @@ async def _evict_failed_session_stream(stream: _SessionStream) -> None:
         if _session_streams.get(key) is stream:
             _session_streams.pop(key, None)
     try:
-        await client.disconnect()
+        if not await _join_session_disconnects(key[0], (client,)):
+            raise RuntimeCleanupTimeout(
+                "failed session stream cleanup is still in progress")
     except Exception as e:
         sys.stderr.write(
             f"[chat] failed-stream disconnect sid={key[0][:8]} "
@@ -3512,17 +3672,152 @@ def _stream_for(client: ClaudeSDKClient) -> _SessionStream | None:
 
 
 async def _drop_session_streams(session_id: str) -> None:
+    streams = []
     for key in [k for k in _session_streams if k[0] == session_id]:
         stream = _session_streams.pop(key, None)
         if stream is not None:
-            await stream.aclose()
+            streams.append(stream)
+    if not streams:
+        return
+    tasks = {asyncio.create_task(stream.aclose()) for stream in streams}
+    done, pending = await asyncio.wait(tasks, timeout=1.0)
+    if done:
+        await asyncio.gather(*done, return_exceptions=True)
+    for task in pending:
+        task.cancel()
+        _retain_detached_cleanup(task)
+
+
+def _retain_detached_cleanup(task: asyncio.Task) -> None:
+    """Keep a timed-out cancellation owner alive and consume its outcome.
+
+    ``asyncio.wait_for`` waits for cancellation acknowledgement and therefore
+    is not a hard deadline when an SDK coroutine suppresses cancellation.  A
+    plain ``wait`` lets the request continue; this registry prevents the
+    detached task from being garbage-collected and avoids unhandled-exception
+    noise if it eventually exits.
+    """
+    _maintenance_tasks.add(task)
+
+    def _done(done: asyncio.Task) -> None:
+        _maintenance_tasks.discard(done)
+        if done.cancelled():
+            return
+        with suppress(Exception):
+            done.exception()
+
+    task.add_done_callback(_done)
+
+
+class RuntimeCleanupTimeout(RuntimeError):
+    """A CLI cleanup did not finish before the public operation's deadline."""
+
+
+def _track_session_disconnect(session_id: str, task: asyncio.Task) -> None:
+    owners = _session_disconnect_tasks.setdefault(session_id, set())
+    owners.add(task)
+
+    def _done(done: asyncio.Task) -> None:
+        current = _session_disconnect_tasks.get(session_id)
+        if current is not None:
+            current.discard(done)
+            if not current:
+                _session_disconnect_tasks.pop(session_id, None)
+        if done.cancelled():
+            _session_disconnect_failed.add(session_id)
+            return
+        try:
+            error = done.exception()
+        except Exception as exc:
+            error = exc
+        if error is not None:
+            _session_disconnect_failed.add(session_id)
+
+    task.add_done_callback(_done)
+
+
+async def _join_session_disconnects(
+    session_id: str,
+    clients: Iterable[ClaudeSDKClient] = (),
+    *,
+    timeout: float = _CLIENT_DISCONNECT_DEADLINE_S,
+) -> bool:
+    if session_id in _session_disconnect_failed:
+        return False
+    tasks = {
+        task
+        for task in _session_disconnect_tasks.get(session_id, set())
+        if not task.done()
+    }
+    for client in {id(item): item for item in clients}.values():
+        task = asyncio.create_task(client.disconnect())
+        _track_session_disconnect(session_id, task)
+        tasks.add(task)
+    if not tasks:
+        return True
+    done, pending = await asyncio.wait(tasks, timeout=max(0.1, timeout))
+    if done:
+        await asyncio.gather(*done, return_exceptions=True)
+    # Do not raw-cancel SDK close: its subprocess transport documents that a
+    # bare asyncio cancellation can skip TERM/KILL escalation. The registry is
+    # the durable in-process fence until these owners actually finish.
+    return not pending and session_id not in _session_disconnect_failed
+
+
+def _track_session_runtime_cleanup(
+    session_id: str,
+    task: asyncio.Task,
+) -> None:
+    """Retain one cancelled owner until it reaches a terminal state.
+
+    Cancellation and ordinary exceptions are both terminal for this fence: the
+    safety property is that the owner can no longer append or recreate files,
+    not that its business operation succeeded.
+    """
+    owners = _session_runtime_cleanup_tasks.setdefault(session_id, set())
+    owners.add(task)
+
+    def _done(done: asyncio.Task) -> None:
+        current = _session_runtime_cleanup_tasks.get(session_id)
+        if current is not None:
+            current.discard(done)
+            if not current:
+                _session_runtime_cleanup_tasks.pop(session_id, None)
+        if not done.cancelled():
+            with suppress(Exception):
+                done.exception()
+
+    task.add_done_callback(_done)
+
+
+async def _join_session_runtime_cleanup(
+    session_id: str,
+    tasks: Iterable[asyncio.Task] = (),
+    *,
+    timeout: float = 5.0,
+) -> bool:
+    owners = {
+        task
+        for task in _session_runtime_cleanup_tasks.get(session_id, set())
+        if not task.done()
+    }
+    for task in tasks:
+        if task is not None and not task.done():
+            _track_session_runtime_cleanup(session_id, task)
+            owners.add(task)
+    if not owners:
+        return True
+    done, pending = await asyncio.wait(owners, timeout=max(0.1, timeout))
+    if done:
+        await asyncio.gather(*done, return_exceptions=True)
+    return not pending
 
 
 async def disconnect_client(session_id: str) -> None:
     """Disconnect every cached client for this session (across all models).
-    The disconnect() call can wait up to 5 s for the CLI subprocess to
-    exit; we pop dict entries under _lock but do the await OUTSIDE so
-    other requests aren't blocked for seconds at a time."""
+    The SDK subprocess transport has a bounded graceful/TERM/KILL close path;
+    we pop dict entries under _lock but await it OUTSIDE so other sessions are
+    never blocked by one slow process."""
     to_disconnect: list[ClaudeSDKClient] = []
     _pending_runtime_rebuilds.discard(session_id)
     # Stop the pumps first: they iterate the very stream disconnect() tears
@@ -3540,11 +3835,69 @@ async def disconnect_client(session_id: str) -> None:
                 _client_lru.remove(k)
             if c is not None:
                 to_disconnect.append(c)
-    for c in to_disconnect:
-        try:
-            await c.disconnect()
-        except Exception:
-            pass
+    if not await _join_session_disconnects(session_id, to_disconnect):
+        raise RuntimeCleanupTimeout(
+            "session runtime cleanup did not finish; retry the operation"
+        )
+
+
+async def _disconnect_background_task_owner(
+    session_id: str,
+    client: ClaudeSDKClient,
+) -> None:
+    """Confirm teardown of the exact CLI that owns a background task.
+
+    Production watchers normally hold a pooled client, in which case the
+    ordinary session-wide cleanup is authoritative.  The identity fallback is
+    needed when a failed stream already evicted that client from the pool (and
+    keeps direct/unit watcher use honest): an empty pool is not by itself proof
+    that this particular CLI process was reaped.
+    """
+    async with _lock:
+        pooled = any(
+            key[0] == session_id and candidate is client
+            for key, candidate in _clients.items()
+        )
+    if pooled:
+        await disconnect_client(session_id)
+        return
+    # A failed-stream eviction registers its exact cleanup before removing the
+    # client. Join that owner rather than starting a duplicate disconnect. Do
+    # not use _join_session_disconnects here: its sticky failure fence is
+    # correct for ordinary callers, but this is the recovery owner that must be
+    # allowed to prove a later retry succeeded and clear that sticky state.
+    existing = set(_session_disconnect_tasks.get(session_id, set()))
+    if existing:
+        done, pending = await asyncio.wait(
+            existing, timeout=_CLIENT_DISCONNECT_DEADLINE_S)
+        if pending:
+            raise RuntimeCleanupTimeout(
+                "background task runtime cleanup is still in progress")
+        results = await asyncio.gather(*done, return_exceptions=True)
+        if any(isinstance(result, BaseException) for result in results):
+            raise RuntimeCleanupTimeout(
+                "background task runtime cleanup failed")
+        _session_disconnect_failed.discard(session_id)
+        return
+    disconnect = getattr(client, "disconnect", None)
+    if not callable(disconnect):
+        raise RuntimeCleanupTimeout(
+            "background task owner cannot confirm runtime cleanup")
+    cleanup = asyncio.create_task(disconnect())
+    _track_session_disconnect(session_id, cleanup)
+    done, pending = await asyncio.wait(
+        {cleanup}, timeout=_CLIENT_DISCONNECT_DEADLINE_S)
+    if pending:
+        raise RuntimeCleanupTimeout(
+            "background task runtime cleanup did not finish")
+    result = (await asyncio.gather(*done, return_exceptions=True))[0]
+    if isinstance(result, BaseException):
+        raise RuntimeCleanupTimeout(
+            "background task runtime cleanup failed")
+    # A successful exact-owner retry is positive proof that the process
+    # cleanup completed, so future turns need not inherit an earlier transient
+    # disconnect failure forever.
+    _session_disconnect_failed.discard(session_id)
 
 
 async def shutdown_runtime() -> None:
@@ -3557,27 +3910,63 @@ async def shutdown_runtime() -> None:
         task for task in _task_watchers.values() if not task.done()
     }
     tasks.update(task for task in _maintenance_tasks if not task.done())
+    protected_cleanup_tasks: set[asyncio.Task] = {
+        task for task in _session_purge_tasks.values() if not task.done()
+    }
+    for owners in _session_runtime_cleanup_tasks.values():
+        protected_cleanup_tasks.update(
+            task for task in owners if not task.done()
+        )
     for broadcast in tuple(_active_turns.values()):
         broadcast.cancelled = True
         for attr in ("startup_task", "startup_owner_task", "task"):
             task = getattr(broadcast, attr, None)
             if isinstance(task, asyncio.Task) and not task.done():
                 tasks.add(task)
+    tasks.difference_update(protected_cleanup_tasks)
     for task in tasks:
         task.cancel()
     if tasks:
-        await asyncio.gather(*tasks, return_exceptions=True)
+        done, pending = await asyncio.wait(tasks, timeout=2.0)
+        if done:
+            await asyncio.gather(*done, return_exceptions=True)
+        for task in pending:
+            _retain_detached_cleanup(task)
 
     streams = list(_session_streams.values())
     _session_streams.clear()
     if streams:
-        await asyncio.gather(
-            *(stream.aclose() for stream in streams),
-            return_exceptions=True,
-        )
+        close_tasks = {
+            asyncio.create_task(stream.aclose()) for stream in streams
+        }
+        done, pending = await asyncio.wait(close_tasks, timeout=1.0)
+        if done:
+            await asyncio.gather(*done, return_exceptions=True)
+        for task in pending:
+            task.cancel()
+            _retain_detached_cleanup(task)
+
+    existing_disconnects = {
+        task
+        for owners in _session_disconnect_tasks.values()
+        for task in owners
+        if not task.done()
+    }
 
     async with _lock:
-        clients = list({id(client): client for client in _clients.values()}.values())
+        clients_by_session: dict[str, list[ClaudeSDKClient]] = {}
+        seen_clients: set[int] = set()
+        for key, client in _clients.items():
+            if id(client) in seen_clients:
+                continue
+            seen_clients.add(id(client))
+            clients_by_session.setdefault(key[0], []).append(client)
+        shutdown_disconnects: set[asyncio.Task] = set()
+        for sid, clients in clients_by_session.items():
+            for client in clients:
+                task = asyncio.create_task(client.disconnect())
+                _track_session_disconnect(sid, task)
+                shutdown_disconnects.add(task)
         _clients.clear()
         _client_permission.clear()
         _client_plan_return.clear()
@@ -3589,21 +3978,53 @@ async def shutdown_runtime() -> None:
         _bg_task_pinned_at.clear()
         _background_activity_finishes.clear()
         _task_watchers.clear()
-        _maintenance_tasks.clear()
+        _runtime_prewarm_tasks.clear()
         _queue_drain_tasks.clear()
+        _queue_drain_rekicks.clear()
         _queue_drain_locks.clear()
 
-    async def _disconnect(client: ClaudeSDKClient) -> None:
-        try:
-            await asyncio.wait_for(client.disconnect(), timeout=4.0)
-        except (asyncio.TimeoutError, Exception):
-            pass
-
-    if clients:
-        await asyncio.gather(
-            *(_disconnect(client) for client in clients),
-            return_exceptions=True,
+    # Session-specific disconnect owners are deliberately not cancelled: the
+    # SDK close path owns TERM/KILL escalation. Give them one final bounded
+    # join while the event loop is alive, then keep their handles until process
+    # shutdown rather than losing ownership of a still-running child cleanup.
+    async def _join_existing_disconnects() -> None:
+        if not existing_disconnects:
+            return
+        done, _pending = await asyncio.wait(
+            existing_disconnects,
+            timeout=4.0,
         )
+        if done:
+            await asyncio.gather(*done, return_exceptions=True)
+
+    async def _join_protected_cleanup() -> None:
+        if not protected_cleanup_tasks:
+            return
+        done, _pending = await asyncio.wait(
+            protected_cleanup_tasks,
+            timeout=4.0,
+        )
+        if done:
+            await asyncio.gather(*done, return_exceptions=True)
+
+    async def _disconnect_pooled_clients() -> None:
+        # Registration happened atomically with pool removal under `_lock`.
+        # A concurrent DELETE can therefore never observe both an empty pool
+        # and an empty cleanup registry for a still-running subprocess.
+        if not shutdown_disconnects:
+            return
+        done, _pending = await asyncio.wait(
+            shutdown_disconnects,
+            timeout=4.0,
+        )
+        if done:
+            await asyncio.gather(*done, return_exceptions=True)
+
+    await asyncio.gather(
+        _disconnect_pooled_clients(),
+        _join_existing_disconnects(),
+        _join_protected_cleanup(),
+    )
 
 
 async def _rebuild_session_runtime(session_id: str) -> None:
@@ -3864,18 +4285,11 @@ def list_sessions_api(
         sid for sid, bc in _active_turns.items()
         if bc is not None and not bc.done
     }
-    # Expire pins older than the watch timeout before deriving the flag. A pin is
-    # the ONLY reason a session reports background_active, and it is cleared only
-    # by a terminal notification — a task that never delivers one used to keep
-    # the session `active` forever, which in turn kept the browser's reconnect /
-    # reconcile machinery awake (2026-08-04 flicker). Reaping here (rather than
-    # only at turn end) means the deadline holds for an idle session too.
-    for sid in list(_sessions_with_inflight_tasks):
-        reaped = _reap_stale_task_pins(sid)
-        if reaped:
-            sys.stderr.write(
-                f"[chat] reaped stale task pins sid={sid[:8]} "
-                f"tasks={sorted(reaped)}\n")
+    # Background pins are lifecycle fences, not cache entries.  Read-only list
+    # requests must never expire them: doing so could start a queued turn while
+    # the SDK-owned command was still alive.  The owning watcher enforces the
+    # absolute deadline and releases only after a terminal notification or a
+    # confirmed CLI disconnect.
     background_active_sids = {
         sid for sid, task_ids in _sessions_with_inflight_tasks.items()
         if task_ids
@@ -4708,6 +5122,38 @@ def _sdk_messages_to_ui(sm_list: list, annotations: dict[str, dict],
         if ann_docs and entry.get("role") == "user":
             entry["docs"] = ann_docs
     return out
+
+
+def _apply_runtime_task_overlays(
+    messages: list[dict], overlays: dict[str, dict],
+) -> None:
+    """Patch copied tool cards with predecessor-owned task state, in place.
+
+    The overlay is presentation-only sidecar data.  It is applied after SDK
+    transcript shaping and is never included in a later model query.
+    """
+    if not overlays:
+        return
+    by_tool_use = {
+        str(overlay.get("tool_use_id") or ""): overlay
+        for overlay in overlays.values()
+        if isinstance(overlay, dict) and overlay.get("tool_use_id")
+    }
+    for message in messages:
+        if message.get("role") != "tool_use":
+            continue
+        current = message.get("task_status") or {}
+        task_id = str(current.get("task_id") or "")
+        overlay = overlays.get(task_id) if task_id else None
+        if overlay is None:
+            overlay = by_tool_use.get(str(message.get("id") or ""))
+        if not isinstance(overlay, dict):
+            continue
+        message["task_status"] = {
+            **current,
+            **overlay,
+            "task_id": str(overlay.get("task_id") or task_id),
+        }
 
 
 def _transcript_index_path(sid: str) -> Path:
@@ -5680,6 +6126,10 @@ def get_session_api(
     active_turn = _active_turns.get(sid)
     if active_turn is not None and active_turn.done:
         active_turn = None
+    _apply_runtime_task_overlays(
+        window,
+        sess.get_runtime_task_overlays(sid),
+    )
     _complete_turn_footer_metadata(
         window,
         model,
@@ -6872,9 +7322,14 @@ def _clear_session_runtime_state(sid: str) -> list[asyncio.Task]:
     if runtime_lock is not None and not runtime_lock.locked():
         _session_runtime_locks.pop(sid, None)
     drain_task = _queue_drain_tasks.pop(sid, None)
+    _queue_drain_rekicks.discard(sid)
     if drain_task is not None and not drain_task.done():
         drain_task.cancel()
         cancelled_tasks.append(drain_task)
+    prewarm_task = _runtime_prewarm_tasks.pop(sid, None)
+    if prewarm_task is not None and not prewarm_task.done():
+        prewarm_task.cancel()
+        cancelled_tasks.append(prewarm_task)
     drain_lock = _queue_drain_locks.get(sid)
     if drain_lock is not None and not drain_lock.locked():
         _queue_drain_locks.pop(sid, None)
@@ -6889,6 +7344,7 @@ def _clear_session_runtime_state(sid: str) -> list[asyncio.Task]:
     task_ids = _sessions_with_inflight_tasks.pop(sid, set())
     for task_id in task_ids:
         _bg_task_descriptions.pop(task_id, None)
+        _bg_task_tool_use_ids.pop(task_id, None)
         _bg_task_pinned_at.pop(task_id, None)
     recent = _recent_turns.pop(sid, None)
     if recent is not None:
@@ -7020,28 +7476,19 @@ async def _purge_session_storage_async_inner(sid: str) -> bool:
     # scheduler owners; otherwise DELETE can wait forever on the very process
     # that the later disconnect was supposed to stop.
     await disconnect_client(sid)
-    await _scheduler.join_cancelled_runs(scheduler_runs)
     critical_cleanup = (
         getattr(active, "_cancelled_startup_cleanup_task", None)
         if active is not None else None
     )
-    if critical_cleanup in pending:
-        pending.remove(critical_cleanup)
-    if critical_cleanup is not None and not critical_cleanup.done():
-        # Snapshot and Activity writes run in worker threads. Their wrapper is
-        # the only reliable join handle, so deletion must wait for its known
-        # outcome before removing files and returning success.
-        await asyncio.gather(critical_cleanup, return_exceptions=True)
-    if pending:
-        try:
-            await asyncio.wait_for(
-                asyncio.gather(*pending, return_exceptions=True),
-                timeout=5.0,
-            )
-        except asyncio.TimeoutError:
-            # The deletion fence already prevents a late queue resurrection;
-            # bounded cleanup keeps a wedged SDK task from hanging DELETE.
-            pass
+    cleanup_owners = set(pending)
+    cleanup_owners.update(scheduler_runs)
+    if critical_cleanup is not None:
+        cleanup_owners.add(critical_cleanup)
+    cleanup_complete = await _join_session_runtime_cleanup(
+        sid,
+        cleanup_owners,
+        timeout=5.0,
+    )
     # A bounded owner join protects DELETE from a permanently wedged SDK, but
     # the global Activity ledger must never be left in `running` if that bound
     # is reached.  The normal owner cleanup clears this bit first; this is an
@@ -7069,26 +7516,74 @@ async def _purge_session_storage_async_inner(sid: str) -> bool:
                 f"[activity] delete finish failed sid={sid[:8]} "
                 f"exc={type(exc).__name__}\n"
             )
+    if not cleanup_complete:
+        # Do not race the destructive disk purge against a late snapshot,
+        # queue write, SDK response, or scheduler finalizer. The tombstone is
+        # intentionally retained; a retry joins these exact owners and then
+        # continues the same deletion transaction.
+        raise RuntimeCleanupTimeout(
+            "session cleanup is still in progress; retry the operation"
+        )
     _session_usage.pop(sid, None)
     _interrupted_at_startup.pop(sid, None)
     return await asyncio.to_thread(purge_session_storage, sid)
 
 
 async def purge_session_storage_async(sid: str) -> bool:
-    """Delete runtime and disk state completely, even if HTTP disconnects."""
-    cleanup = asyncio.create_task(_purge_session_storage_async_inner(sid))
+    """Delete runtime and disk state under one reusable bounded owner.
+
+    The destructive transaction remains shielded from an HTTP disconnect, but
+    the request itself has a hard deadline. A retry joins the same owner rather
+    than starting a second purge against partially-mutated state.
+    """
+    cleanup = _session_purge_tasks.get(sid)
+    if cleanup is None:
+        cleanup = asyncio.create_task(_purge_session_storage_async_inner(sid))
+        _session_purge_tasks[sid] = cleanup
+
+        def _expire(done: asyncio.Task) -> None:
+            error: BaseException | None = None
+            if done.cancelled():
+                error = asyncio.CancelledError()
+            else:
+                try:
+                    error = done.exception()
+                except BaseException as exc:
+                    error = exc
+
+            # A failed transaction should be retryable on the next request.
+            # Successful unobserved results stay briefly cached so a client
+            # that lost its response sees the same idempotent outcome.
+            if error is not None:
+                if _session_purge_tasks.get(sid) is done:
+                    _session_purge_tasks.pop(sid, None)
+                return
+
+            def _drop() -> None:
+                if _session_purge_tasks.get(sid) is done:
+                    _session_purge_tasks.pop(sid, None)
+
+            done.get_loop().call_later(300.0, _drop)
+
+        cleanup.add_done_callback(_expire)
     try:
-        return await asyncio.shield(cleanup)
+        done, pending = await asyncio.wait(
+            {cleanup},
+            timeout=_SESSION_DELETE_DEADLINE_S,
+        )
     except asyncio.CancelledError:
-        # Deletion is an explicit destructive decision. Once fenced, finish it
-        # deterministically instead of leaving half-deleted state.
-        while not cleanup.done():
-            try:
-                await asyncio.shield(cleanup)
-            except asyncio.CancelledError:
-                continue
-        cleanup.result()
+        # The shared task intentionally keeps running under the deletion
+        # tombstone; a subsequent request can join it.
         raise
+    if pending:
+        raise RuntimeCleanupTimeout(
+            "session deletion is still running; retry the operation"
+        )
+    try:
+        return cleanup.result()
+    finally:
+        if _session_purge_tasks.get(sid) is cleanup:
+            _session_purge_tasks.pop(sid, None)
 
 
 @router.delete("/sessions/{sid}", dependencies=[Depends(require_token)])
@@ -7097,7 +7592,53 @@ async def delete_session_api(sid: str) -> dict:
     # authoritative: an SDK-only session (sidecar lost / never written) got
     # its JSONL deleted and THEN returned 404 — the user saw a failure while
     # the transcript was already gone, and local cleanup was skipped.
-    if not await purge_session_storage_async(sid):
+    lineage: list[str] = []
+    seen: set[str] = set()
+    current = sid
+    # Walk to the oldest runtime owner first so deleting the visible successor
+    # cannot strand an invisible CLI/background process.
+    predecessors: list[str] = []
+    while current and current not in seen and len(seen) < 32:
+        seen.add(current)
+        meta = await asyncio.to_thread(sess.get_session_meta, current)
+        predecessor = str((meta or {}).get("runtime_predecessor") or "")
+        if not predecessor:
+            break
+        predecessors.append(predecessor)
+        current = predecessor
+    lineage.extend(reversed(predecessors))
+    lineage.append(sid)
+    # Also cover an explicit API delete of a hidden predecessor.
+    current = sid
+    while len(seen) < 32:
+        meta = await asyncio.to_thread(sess.get_session_meta, current)
+        successor = str((meta or {}).get("runtime_successor") or "")
+        if not successor or successor in seen:
+            break
+        seen.add(successor)
+        lineage.append(successor)
+        current = successor
+    removed = False
+    pending_lineage = list(dict.fromkeys(lineage))
+    queued_lineage = set(pending_lineage)
+    cursor = 0
+    while cursor < len(pending_lineage) and cursor < 32:
+        runtime_sid = pending_lineage[cursor]
+        cursor += 1
+        # The eager detached fork runs in a worker and may have started after
+        # the lineage snapshot above. Fence first, then re-read the durable
+        # edge: if rollover linked just before the fence, include that child;
+        # if deletion won, rollover observes the tombstone and rolls it back.
+        await asyncio.to_thread(sess.begin_session_delete, runtime_sid)
+        fenced_meta = await asyncio.to_thread(
+            sess.get_session_meta, runtime_sid)
+        late_successor = str(
+            (fenced_meta or {}).get("runtime_successor") or "")
+        if late_successor and late_successor not in queued_lineage:
+            queued_lineage.add(late_successor)
+            pending_lineage.append(late_successor)
+        removed = await purge_session_storage_async(runtime_sid) or removed
+    if not removed:
         raise HTTPException(404, "session not found")
     return {"ok": True}
 
@@ -7243,8 +7784,24 @@ def get_queue_api(sid: str, response: Response) -> dict:
     return data
 
 
+async def _schedule_queue_drain_after_response(session_id: str) -> None:
+    """Enter the loop-owned drain scheduler from Starlette's async callback.
+
+    ``BackgroundTasks`` invokes synchronous callbacks in a worker thread.  The
+    drain scheduler creates an ``asyncio.Task`` and therefore must stay on the
+    request's event loop; an async wrapper gives Starlette the right execution
+    mode.  Response background callbacks run only after the final body frame
+    has been sent, so rollover/client startup cannot delay the enqueue ACK.
+    """
+    _schedule_queue_drain(session_id)
+
+
 @router.post("/sessions/{sid}/queue", dependencies=[Depends(require_token)])
-async def enqueue_api(sid: str, req: QueueEnqueueReq) -> dict:
+async def enqueue_api(
+    sid: str,
+    req: QueueEnqueueReq,
+    background_tasks: BackgroundTasks,
+) -> dict:
     text = (req.text or "").strip()
     if not text and not (req.image_ids or "").strip():
         raise HTTPException(400, "empty message")
@@ -7294,12 +7851,11 @@ async def enqueue_api(sid: str, req: QueueEnqueueReq) -> dict:
             raise HTTPException(404, "session not found")
         # queue_full → 409 so the FE can surface "队列已满（上限 10 条）".
         raise HTTPException(409, res.get("error", "enqueue failed"))
-    # Do not await SDK startup in the HTTP request: an idle/cold session can
-    # take tens of seconds to connect. The scheduled task is retained in the
-    # maintenance registry, coalesced per sid and serialised with every other
-    # drain source. If a turn/watcher still owns the session this is a cheap
-    # no-op; that owner's completion remains the next wakeup.
-    _schedule_queue_drain(sid)
+    # Do not even *start* rollover/SDK work until Starlette has sent the final
+    # response body frame. Scheduling before ``return`` can let a CPU-heavy
+    # fork monopolise the loop/GIL before the enqueue ACK reaches the browser.
+    # The callback itself stays async because the scheduler is loop-owned.
+    background_tasks.add_task(_schedule_queue_drain_after_response, sid)
     return res
 
 
@@ -7474,7 +8030,20 @@ async def patch_session_api(sid: str, req: SessionPatchReq) -> dict:
 
     ok = False
     if req.name is not None:
-        renamed = sess.rename_session(sid, req.name)
+        # Keep the local title and SDK customTitle as one serialized write.
+        # Runtime-rollover postlude propagation uses the same lock and rechecks
+        # the inherited title inside it, so a user's explicit rename always
+        # wins rather than being overwritten by a late automatic sync.
+        with _session_title_lock(sid):
+            renamed = sess.rename_session(sid, req.name)
+            # Also propagate to CLI's JSONL so list_sessions() / manual claude
+            # CLI runs see the new title. Silent no-op if JSONL doesn't exist.
+            try:
+                sdk_rename_session(
+                    sid, req.name,
+                    directory=str(sess.session_workspace(sid)))
+            except (FileNotFoundError, ValueError):
+                pass
         ok = renamed or ok
         if renamed:
             # The task ledger stores one denormalized display name per
@@ -7484,13 +8053,6 @@ async def patch_session_api(sid: str, req: SessionPatchReq) -> dict:
             # cannot reorder the task center or make a result unread again.
             from .activity import activity as _activity
             await asyncio.to_thread(_activity.rename_session, sid, req.name)
-        # Also propagate to CLI's JSONL so list_sessions() / manual claude
-        # CLI runs see the new title. Silent no-op if JSONL doesn't exist yet.
-        try:
-            sdk_rename_session(
-                sid, req.name, directory=str(sess.session_workspace(sid)))
-        except (FileNotFoundError, ValueError):
-            pass
     if req.tag is not None:
         # Empty string → clear tag. SDK accepts None or str.
         try:
@@ -8525,7 +9087,13 @@ def _create_context_recovery_session(
     only to that new file.  Register the new UUID in MuseLab only after the
     fork is complete, so the browser can never discover a half-built session.
     """
-    source_meta = sess.get_session_meta(source_sid)
+    try:
+        source_meta = sess.get_session_meta(source_sid)
+    except Exception as exc:
+        sys.stderr.write(
+            f"[chat] runtime postlude source read failed "
+            f"sid={source_sid[:8]} exc={type(exc).__name__}\n")
+        return {"annotations": 0, "renamed": 0}
     if source_meta is None:
         raise context_recovery.ContextRecoveryError("source session is unavailable")
     source_path = _find_session_jsonl(source_sid)
@@ -9225,6 +9793,481 @@ def fork_session_api(sid: str, req: ForkReq) -> dict:
     }
 
 
+def _runtime_fork_uuid_mapping(child_sid: str) -> dict[str, str]:
+    """Read the SDK fork's explicit old->new UUID backlinks."""
+    path = _find_session_jsonl(child_sid)
+    if path is None:
+        return {}
+    mapping: dict[str, str] = {}
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                try:
+                    entry = json.loads(line)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                origin = entry.get("forkedFrom") or {}
+                old_uuid = str(origin.get("messageUuid") or "")
+                new_uuid = str(entry.get("uuid") or "")
+                if old_uuid and new_uuid:
+                    mapping[old_uuid] = new_uuid
+    except OSError:
+        return {}
+    return mapping
+
+
+def _sync_runtime_successor_postlude(source_sid: str) -> dict[str, int]:
+    """Propagate late turn metadata through every runtime successor.
+
+    A detached rollover may be committed as soon as the canonical ``done``
+    event is visible, while the source pump is still finishing transcript
+    parsing, attachment/footer annotations, and its first-turn auto-name.  The
+    initial fork copy cannot see those later writes.  Re-copy each fork-visible
+    annotation edge-by-edge so UUIDs are translated at every generation, and
+    carry the final display name while a successor still has the title it
+    inherited at fork time.  A user-renamed successor is therefore a deliberate
+    boundary for name propagation, but not for annotation propagation.
+    """
+    source_meta = sess.get_session_meta(source_sid)
+    if source_meta is None:
+        return {"annotations": 0, "renamed": 0}
+    desired_name = str(source_meta.get("name") or "").strip()
+    current_sid = source_sid
+    propagate_name = bool(desired_name)
+    seen: set[str] = set()
+    copied = 0
+    renamed = 0
+    for _ in range(32):
+        if not current_sid or current_sid in seen:
+            break
+        seen.add(current_sid)
+        try:
+            current_meta = sess.get_session_meta(current_sid) or {}
+        except Exception as exc:
+            sys.stderr.write(
+                f"[chat] runtime postlude lineage read failed "
+                f"sid={current_sid[:8]} exc={type(exc).__name__}\n")
+            break
+        child_sid = str(current_meta.get("runtime_successor") or "")
+        if not child_sid or child_sid in seen:
+            break
+        try:
+            child_meta = sess.get_session_meta(child_sid)
+        except Exception as exc:
+            sys.stderr.write(
+                f"[chat] runtime postlude child read failed "
+                f"sid={child_sid[:8]} exc={type(exc).__name__}\n")
+            break
+        if child_meta is None:
+            break
+        try:
+            uuid_mapping = _runtime_fork_uuid_mapping(child_sid)
+            copied += sess.copy_message_annotations(
+                current_sid, child_sid, uuid_mapping)
+        except Exception as exc:
+            sys.stderr.write(
+                f"[chat] runtime annotation postlude sync failed "
+                f"sid={current_sid[:8]} child={child_sid[:8]} "
+                f"exc={type(exc).__name__}\n"
+            )
+
+        if propagate_name:
+            try:
+                with _session_title_lock(child_sid):
+                    # Re-read under the same lock used by PATCH /sessions. A
+                    # user rename that won before this point is a hard boundary
+                    # and is never overwritten by late automatic propagation.
+                    fresh_child = sess.get_session_meta(child_sid) or child_meta
+                    child_name = str(fresh_child.get("name") or "").strip()
+                    inherited_name = str(
+                        fresh_child.get("forked_from_name") or "").strip()
+                    if child_name not in {desired_name, inherited_name}:
+                        propagate_name = False
+                    elif child_name != desired_name:
+                        child_model = str(
+                            fresh_child.get("model") or MODEL).strip()
+                        try:
+                            with _session_config_dir(child_model):
+                                sdk_rename_session(
+                                    child_sid,
+                                    desired_name,
+                                    directory=str(
+                                        sess.session_workspace(child_sid)),
+                                )
+                        except (FileNotFoundError, ValueError):
+                            # The index remains authoritative until an SDK
+                            # transcript exists.
+                            pass
+                        if sess.rename_session(child_sid, desired_name):
+                            renamed += 1
+            except Exception as exc:
+                # Presentation reconciliation must never roll back a valid
+                # runtime successor or skip the source turn's later cleanup.
+                sys.stderr.write(
+                    f"[chat] runtime title postlude sync failed "
+                    f"sid={child_sid[:8]} exc={type(exc).__name__}\n"
+                )
+        current_sid = child_sid
+    return {"annotations": copied, "renamed": renamed}
+
+
+def _runtime_fork_boundary(sid: str, meta: dict) -> str:
+    # Never guess from the latest assistant: with multiple background tasks an
+    # earlier task may already have appended a source-only auto-continuation
+    # while a sibling remains pending. Forking that tail would leak old runtime
+    # text into the interactive successor.
+    return str(meta.get("runtime_boundary_message_id") or "")
+
+
+def _backfill_runtime_task_overlays(source_sid: str) -> None:
+    """Recover running-card ownership for sessions predating rollover state."""
+    pending = set(_sessions_with_inflight_tasks.get(source_sid, ()))
+    if not pending:
+        return
+    meta = sess.get_session_meta(source_sid) or {}
+    try:
+        messages = _shaped_ui_messages(
+            source_sid, str(meta.get("model") or MODEL), True)
+    except Exception:
+        messages = []
+    for message in messages:
+        if message.get("role") != "tool_result":
+            continue
+        launch = _parse_bg_launch(str(message.get("text") or ""))
+        if not launch or launch.get("task_id") not in pending:
+            continue
+        _record_background_task_launch(
+            source_sid,
+            str(launch["task_id"]),
+            tool_use_id=str(message.get("id") or ""),
+            output_file=launch.get("output_file"),
+        )
+    # Agent tasks do not have the Bash launch string, but live starts retained
+    # their tool id/description in memory. Ensure every pin has an owner row.
+    for task_id in pending:
+        if task_id not in sess.get_runtime_task_overlays(source_sid):
+            _record_background_task_launch(
+                source_sid,
+                task_id,
+                tool_use_id=_bg_task_tool_use_ids.get(task_id),
+                description=_bg_task_descriptions.get(task_id),
+            )
+
+
+async def _continue_detached_runtime_locked(source_sid: str) -> dict:
+    """Commit one rollover; caller must hold the per-source lock."""
+    source_meta = await asyncio.to_thread(sess.get_session_meta, source_sid)
+    if source_meta is None:
+        raise HTTPException(404, "session not found")
+    if sess.session_is_deleting(source_sid):
+        raise HTTPException(409, "session is being deleted")
+    existing_sid = str(source_meta.get("runtime_successor") or "")
+    if existing_sid:
+        # Idempotent retries also self-heal a successor created in the
+        # canonical-done/postlude window (or by an older process version).
+        await asyncio.to_thread(
+            _sync_runtime_successor_postlude, source_sid)
+        child_meta = await asyncio.to_thread(sess.get_session_meta, existing_sid)
+        if child_meta is None:
+            raise HTTPException(409, "runtime successor is unavailable")
+        try:
+            queue_move = await asyncio.to_thread(
+                sess.migrate_queue, source_sid, existing_sid)
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from None
+        if queue_move["target"].get("items"):
+            _schedule_queue_drain(existing_sid)
+        inherited_overlays = await asyncio.to_thread(
+            sess.get_runtime_task_overlays, existing_sid)
+        return {
+            **child_meta,
+            "session_id": existing_sid,
+            "source_session_id": source_sid,
+            "owner_session_id": source_sid,
+            "inherited_background_tasks_pending": sum(
+                1 for overlay in inherited_overlays.values()
+                if overlay.get("state") == "running"),
+            "queue_migrated": queue_move["migrated"],
+            "queue_pending": len(queue_move["target"].get("items") or []),
+            "reused": True,
+        }
+
+    active = _active_turns.get(source_sid)
+    if (active is not None and not active.done
+            and not getattr(active, "is_continuation", False)
+            and not getattr(
+                active, "canonical_terminal_published", False)):
+        raise HTTPException(409, "cannot continue while a turn is active")
+    background_pending = len(
+        _sessions_with_inflight_tasks.get(source_sid, ()))
+    if not background_pending and not _session_has_live_watcher(source_sid):
+        return {
+            **source_meta,
+            "session_id": source_sid,
+            "source_session_id": source_sid,
+            "owner_session_id": source_sid,
+            "inherited_background_tasks_pending": 0,
+            "queue_migrated": 0,
+            "reused": True,
+        }
+
+    boundary = await asyncio.to_thread(
+        _runtime_fork_boundary, source_sid, source_meta)
+    if not boundary:
+        raise HTTPException(409, "background turn boundary is unavailable")
+    await asyncio.to_thread(_backfill_runtime_task_overlays, source_sid)
+    if sess.session_is_deleting(source_sid):
+        raise HTTPException(409, "session is being deleted")
+    source_model = str(source_meta.get("model") or MODEL).strip()
+    source_name = str(source_meta.get("name") or "会话").strip()
+    try:
+        def _fork_runtime():
+            with _session_config_dir(source_model):
+                return sdk_fork_session(
+                    source_sid,
+                    directory=str(sess.session_workspace(source_sid)),
+                    up_to_message_id=boundary,
+                    title=source_name,
+                )
+        forked = await asyncio.to_thread(_fork_runtime)
+    except FileNotFoundError:
+        raise HTTPException(404, "source transcript not found") from None
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from None
+    except Exception as exc:
+        sys.stderr.write(
+            f"[chat] detached runtime fork failed sid={source_sid[:8]} "
+            f"exc={type(exc).__name__}\n"
+        )
+        raise HTTPException(500, "runtime rollover failed") from None
+
+    child_sid = str(forked.session_id)
+    linked = False
+    try:
+        # sdk_fork_session runs in a worker and cannot be cancelled midway.
+        # DELETE may fence the source while that worker is copying JSONL; in
+        # that case register only inside this rollback-owned block, then remove
+        # every child artifact instead of publishing an orphan successor.
+        if sess.session_is_deleting(source_sid):
+            raise ValueError("source session is being deleted")
+        child_meta = await asyncio.to_thread(
+            sess.register_session,
+            child_sid,
+            name=source_name,
+            model=source_model,
+            permission=source_meta.get("permission") or "",
+            plan_return_permission=source_meta.get("plan_return_permission"),
+            auto_named=False,
+            message_count=int(source_meta.get("message_count") or 0),
+            turn_count=int(source_meta.get("turn_count") or 0),
+            effort=_normalize_effort(source_meta.get("effort")),
+            service_tier=source_meta.get("service_tier") or "",
+            thinking=source_meta.get("thinking") is not False,
+            forked_from=source_sid,
+            forked_from_name=source_name,
+            forked_from_message_id=boundary,
+            activity_hidden=bool(source_meta.get("activity_hidden", False)),
+            runtime_profile=source_meta.get("runtime_profile") or "",
+            runtime_predecessor=source_sid,
+            cwd=source_meta.get("cwd") or str(ROOT),
+        )
+        _JSONL_PATH_CACHE.pop(child_sid, None)
+        uuid_mapping = await asyncio.to_thread(
+            _runtime_fork_uuid_mapping, child_sid)
+        await asyncio.to_thread(
+            sess.copy_message_annotations,
+            source_sid, child_sid, uuid_mapping)
+        await asyncio.to_thread(
+            sess.copy_runtime_task_overlays, source_sid, child_sid)
+        # Move accepted work before hiding the source. If this fails, no
+        # public session identity has changed yet and rollback is trivial.
+        queue_move = await asyncio.to_thread(
+            sess.migrate_queue, source_sid, child_sid)
+
+        def _link_if_source_live() -> bool:
+            # Linearize the final public link with begin_session_delete(). If
+            # deletion wins, rollback below removes the unlinked child; if the
+            # link wins, the delete path re-reads the successor after fencing.
+            with sess.session_lifecycle_lock(source_sid):
+                if sess.session_is_deleting(source_sid):
+                    return False
+                return sess.link_runtime_successor(source_sid, child_sid)
+
+        if not await asyncio.to_thread(_link_if_source_live):
+            raise ValueError("runtime successor changed")
+        linked = True
+        # Close the settle/link race: anything written to source just before
+        # the durable link is copied once more; later terminal patches
+        # propagate via _runtime_task_overlay's successor lookup.
+        await asyncio.to_thread(
+            sess.copy_runtime_task_overlays, source_sid, child_sid)
+        # Close the complementary done/postlude race.  If the source pump
+        # finished its late metadata before this link became visible, its
+        # own reconciliation could not discover the child; running it once
+        # after the durable link observes those already-finished writes.
+        await asyncio.to_thread(
+            _sync_runtime_successor_postlude, source_sid)
+    except Exception as exc:
+        if linked:
+            await asyncio.to_thread(
+                sess.unlink_runtime_successor, source_sid, child_sid)
+        with suppress(Exception):
+            await asyncio.to_thread(
+                sess.migrate_queue, child_sid, source_sid)
+        await asyncio.to_thread(sess.delete_session, child_sid)
+        try:
+            with _session_config_dir(source_model):
+                sdk_delete_session(
+                    child_sid,
+                    directory=str(sess.session_workspace(source_sid)),
+                )
+        except Exception:
+            child_path = _find_session_jsonl(child_sid)
+            if child_path is not None:
+                child_path.unlink(missing_ok=True)
+        status = 409 if isinstance(exc, ValueError) else 500
+        raise HTTPException(status, "runtime rollover could not commit") from None
+    if queue_move["target"].get("items"):
+        _schedule_queue_drain(child_sid)
+    public_child = (
+        await asyncio.to_thread(sess.get_session_meta, child_sid)
+    ) or child_meta
+    inherited_overlays = await asyncio.to_thread(
+        sess.get_runtime_task_overlays, child_sid)
+    return {
+        **public_child,
+        "session_id": child_sid,
+        "source_session_id": source_sid,
+        "owner_session_id": source_sid,
+        "inherited_background_tasks_pending": sum(
+            1 for overlay in inherited_overlays.values()
+            if overlay.get("state") == "running"),
+        "queue_migrated": queue_move["migrated"],
+        "queue_pending": len(queue_move["target"].get("items") or []),
+        "reused": False,
+    }
+
+
+async def _continue_detached_runtime(source_sid: str) -> dict:
+    """Run rollover to commit/rollback even if its HTTP owner is cancelled."""
+    async with _runtime_rollover_lock_for(source_sid):
+        owner = asyncio.create_task(
+            _continue_detached_runtime_locked(source_sid))
+        cancellation: asyncio.CancelledError | None = None
+        while not owner.done():
+            try:
+                await asyncio.shield(owner)
+            except asyncio.CancelledError as exc:
+                # The SDK fork and queue migration are one logical commit.
+                # Keep the lock until the owner either links the successor or
+                # completes rollback; only then acknowledge request cancel.
+                cancellation = exc
+        if cancellation is not None:
+            # Consume a possible owner failure before returning cancellation;
+            # a retry will observe its durable commit or clean rollback.
+            with suppress(BaseException):
+                owner.result()
+            raise cancellation
+        return owner.result()
+
+
+async def _prepare_detached_successor_runtime(source_sid: str) -> None:
+    """Create and warm the interactive child of a background-owned runtime.
+
+    This is latency hiding only: rollover remains idempotent and durable in
+    :func:`_continue_detached_runtime`, while ``get_client``'s per-key creation
+    lock coalesces a concurrent foreground start.  Failures are deliberately
+    fail-soft because the ordinary endpoint/queue path can retry on demand.
+    """
+    try:
+        successor = await _continue_detached_runtime(source_sid)
+        child_sid = str(successor.get("session_id") or "")
+        if not child_sid or child_sid == source_sid:
+            return
+        child_meta = await asyncio.to_thread(sess.get_session_meta, child_sid)
+        if (child_meta is None
+                or sess.session_is_deleting(source_sid)
+                or sess.session_is_deleting(child_sid)):
+            return
+
+        model = str(child_meta.get("model") or MODEL).strip()
+        permission = _validate_permission(
+            str(child_meta.get("permission") or ""))
+        effort = _normalize_effort(child_meta.get("effort"))
+        service_tier = str(child_meta.get("service_tier") or "").strip()
+        client_kwargs: dict[str, Any] = {
+            "effort": effort,
+            "service_tier": service_tier,
+        }
+        if permission == "plan":
+            client_kwargs["plan_return_permission"] = (
+                _normalize_plan_return_permission(
+                    permission, child_meta.get("plan_return_permission"))
+            )
+
+        # A foreground turn reserves _active_turns before it waits for this
+        # mutex.  Re-check inside the mutex so whichever path arrives first
+        # owns startup; get_client's creation lock is a second idempotency
+        # guard for callers that reached the same runtime key concurrently.
+        async with _session_runtime_lock_for(child_sid):
+            active = _active_turns.get(child_sid)
+            if (active is not None and not active.done
+                    or sess.session_is_deleting(source_sid)
+                    or sess.session_is_deleting(child_sid)):
+                return
+            await get_client(
+                child_sid,
+                model,
+                permission,
+                **client_kwargs,
+            )
+    except asyncio.CancelledError:
+        raise
+    except HTTPException as exc:
+        # Boundary/delete races are recoverable.  Log only status + opaque id;
+        # exception detail can include transcript or workspace information.
+        sys.stderr.write(
+            f"[chat] detached runtime prewarm deferred "
+            f"sid={source_sid[:8]} status={exc.status_code}\n"
+        )
+    except Exception as exc:
+        sys.stderr.write(
+            f"[chat] detached runtime prewarm failed "
+            f"sid={source_sid[:8]} exc={type(exc).__name__}\n"
+        )
+    finally:
+        sys.stderr.flush()
+
+
+def _schedule_detached_successor_prewarm(source_sid: str) -> None:
+    """Retain one eager rollover/prewarm owner for ``source_sid``."""
+    existing = _runtime_prewarm_tasks.get(source_sid)
+    if existing is not None and not existing.done():
+        return
+    task = asyncio.create_task(
+        _prepare_detached_successor_runtime(source_sid))
+    _runtime_prewarm_tasks[source_sid] = task
+    _maintenance_tasks.add(task)
+
+    def _done(done: asyncio.Task) -> None:
+        _maintenance_tasks.discard(done)
+        if _runtime_prewarm_tasks.get(source_sid) is done:
+            _runtime_prewarm_tasks.pop(source_sid, None)
+        if done.cancelled():
+            return
+        with suppress(Exception):
+            done.exception()
+
+    task.add_done_callback(_done)
+
+
+@router.post("/sessions/{sid}/continue-detached",
+             dependencies=[Depends(require_token)])
+async def continue_detached_session_api(sid: str) -> dict:
+    """Continue immediately without sharing the predecessor's live CLI."""
+    return await _continue_detached_runtime(sid)
+
+
 class BudgetReq(BaseModel):
     budget_usd: float       # 0 = disabled
 
@@ -9729,20 +10772,20 @@ async def reset(session_id: str | None = None) -> dict:
     if session_id:
         await disconnect_client(session_id)
         return {"ok": True, "reset": [session_id]}
+    # Snapshot public keys first, then let each per-session teardown pop its
+    # clients under the lock and wait outside it. The old implementation held
+    # the global pool lock across an unbounded SDK disconnect, freezing every
+    # get_client()/DELETE/reset request behind one wedged subprocess.
     async with _lock:
         keys = list(_clients.keys())
-        for k in keys:
-            c = _clients.pop(k, None)
-            _client_permission.pop(k, None)
-            _client_plan_return.pop(k, None)
-            _creation_locks.pop(k, None)
-            if k in _client_lru:
-                _client_lru.remove(k)
-            if c is not None:
-                try:
-                    await c.disconnect()
-                except Exception:
-                    pass
+    session_ids = {k[0] for k in keys}
+    results = await asyncio.gather(
+        *(disconnect_client(sid) for sid in session_ids),
+        return_exceptions=True,
+    )
+    for result in results:
+        if isinstance(result, BaseException):
+            raise result
     # Runtime key begins with (session_id, model); keep only those public bits.
     return {"ok": True, "reset": [f"{k[0]}@{k[1]}" for k in keys]}
 
@@ -11291,8 +12334,8 @@ def _pin_background_task(session_id: str, task_id: str) -> None:
     """Register a launched background task as in flight for the session.
 
     Single entry point so the launch instant is always recorded alongside the
-    pin — _reap_stale_task_pins needs it to expire a task whose terminal
-    notification never arrives.
+    pin. The owning watcher derives its absolute termination deadline from this
+    stable timestamp across watcher generations.
     """
     if not task_id:
         return
@@ -11300,38 +12343,15 @@ def _pin_background_task(session_id: str, task_id: str) -> None:
     _bg_task_pinned_at.setdefault(task_id, time.time())
 
 
-def _reap_stale_task_pins(session_id: str) -> list[str]:
-    """Unpin tasks that have been in flight longer than _TASK_WATCH_TIMEOUT.
-
-    A pin is the sole reason a session keeps reporting active:true. Nothing
-    else expires it: _settle_background_task needs a terminal notification.
-    This explicit reap is the per-task half of the absolute deadline; the
-    watcher itself uses the newest pending pin as its generation-independent
-    outer deadline.
-
-    Returns the reaped ids so the caller can log them.
-    """
-    ids = _sessions_with_inflight_tasks.get(session_id)
-    if not ids:
-        return []
-    now = time.time()
-    stale = [tid for tid in ids
-             if now - _bg_task_pinned_at.get(tid, now) >= _TASK_WATCH_TIMEOUT]
-    if stale:
-        _release_task_pins(session_id, stale)
-        for tid in stale:
-            _bg_task_descriptions.pop(tid, None)
-    return stale
-
-
 def _task_watch_timeout_remaining(task_ids: Iterable[str]) -> float | None:
     """Seconds until the newest pending task reaches its absolute deadline.
 
     Watchers may be replaced across ordinary turns, but task launch timestamps
     are stable.  Basing each generation on those timestamps prevents every
-    respawn from granting the same orphan another full 30-minute lease.  The
-    newest deadline is used so an older sibling cannot prematurely terminate a
-    genuinely fresh task; list and /active probes reap individual older pins.
+    respawn from granting the same orphan another full lease.  The newest
+    deadline is used so an older sibling cannot prematurely terminate a
+    genuinely fresh task. Expiry is handled only by the owning watcher, which
+    keeps the fence until it confirms a terminal notification or disconnect.
     """
     ids = [task_id for task_id in task_ids if task_id]
     if not ids:
@@ -11369,6 +12389,7 @@ def _settle_background_task(session_id: str, task_id: str) -> bool:
             if not ids:
                 _sessions_with_inflight_tasks.pop(session_id, None)
         _bg_task_descriptions.pop(task_id, None)
+        _bg_task_tool_use_ids.pop(task_id, None)
         _bg_task_pinned_at.pop(task_id, None)
     return settled
 
@@ -11378,6 +12399,10 @@ def _on_task_settled(
     task_id: str,
     *,
     status: str | None = None,
+    tool_use_id: str | None = None,
+    summary: str | None = None,
+    output_file: str | None = None,
+    usage: dict | None = None,
 ) -> bool:
     """SINGLE settlement entry for a background task's terminal signal.
 
@@ -11400,11 +12425,22 @@ def _on_task_settled(
     `status` stays in the signature: callers still report it, and it documents
     the terminal kinds should the push ever come back.
     """
+    # Persist before settlement consumes the launch metadata. Do this even for
+    # a duplicate terminal signal: a later typed notification often carries a
+    # richer summary/output path than the first terminal TaskUpdated patch.
+    _runtime_task_overlay(
+        session_id,
+        task_id,
+        state=str(status or "done"),
+        tool_use_id=tool_use_id,
+        summary=summary,
+        output_file=output_file,
+        usage=usage,
+    )
     settled = _settle_background_task(session_id, task_id)
     if not settled:
         return False
-    # NO push here — see docstring. `status` intentionally unused.
-    _ = status
+    # NO push here — see docstring.
     return True
 
 
@@ -11784,6 +12820,188 @@ async def _watch_inflight_tasks(
     # lost — it buffers in the SDK queue and the next turn's in-turn
     # dispatch drains it.
     last_settle_status: str | None = None
+
+    async def _consume_timeout_terminal(msg: Any) -> bool:
+        """Settle terminal messages observed after timeout-issued stops.
+
+        This deliberately mirrors the normal watcher branches below.  It is
+        kept local to the timeout recovery window so ordinary lifecycle
+        delivery remains unchanged while we wait for positive proof that each
+        stop request actually reached a terminal state.
+        """
+        nonlocal last_settle_status
+        terminals: list[dict[str, Any]] = []
+        if isinstance(msg, TaskNotificationMessage):
+            terminals.append({
+                "task_id": getattr(msg, "task_id", "") or "",
+                "tool_use_id": getattr(msg, "tool_use_id", None),
+                "status": getattr(msg, "status", None),
+                "summary": getattr(msg, "summary", None),
+                "output_file": getattr(msg, "output_file", None),
+                "usage": dict(getattr(msg, "usage", None) or {}),
+            })
+        elif isinstance(msg, TaskUpdatedMessage):
+            terminal = _terminal_task_update(msg)
+            if terminal is not None:
+                terminals.append(terminal)
+        else:
+            terminals.extend(_parse_task_notifications(
+                _usermsg_task_notification_text(msg)))
+        if not terminals:
+            return False
+        for terminal in terminals:
+            task_id = str(terminal.get("task_id") or "")
+            if not task_id or task_id not in pending:
+                continue
+            status = terminal.get("status") or None
+            won = _on_task_settled(
+                session_id, task_id, status=status,
+                tool_use_id=terminal.get("tool_use_id"),
+                summary=terminal.get("summary"),
+                output_file=terminal.get("output_file"),
+                usage=dict(terminal.get("usage") or {}))
+            pending.pop(task_id, None)
+            last_settle_status = str(status or "") or None
+            if won:
+                if cont is None:
+                    await _open_continuation()
+                _emit_settlement({
+                    "event": "task_notification",
+                    "data": json.dumps({
+                        "task_id": task_id,
+                        "tool_use_id": terminal.get("tool_use_id"),
+                        "status": status,
+                        "summary": terminal.get("summary"),
+                        "output_file": terminal.get("output_file"),
+                        "usage": dict(terminal.get("usage") or {}),
+                        "background_tasks_pending": len(pending),
+                    }),
+                })
+        return True
+
+    async def _settle_after_confirmed_disconnect() -> None:
+        """Publish a stopped terminal only after the owner process is gone."""
+        nonlocal last_settle_status
+        for task_id in tuple(pending):
+            won = _on_task_settled(
+                session_id, task_id, status="stopped",
+                summary="后台任务超过安全运行时限，已终止其运行环境。")
+            pending.pop(task_id, None)
+            if won:
+                if cont is None:
+                    await _open_continuation()
+                _emit_settlement({
+                    "event": "task_notification",
+                    "data": json.dumps({
+                        "task_id": task_id,
+                        "tool_use_id": None,
+                        "status": "stopped",
+                        "summary": (
+                            "后台任务超过安全运行时限，已终止其运行环境。"
+                        ),
+                        "output_file": None,
+                        "background_tasks_pending": len(pending),
+                    }),
+                })
+        last_settle_status = "stopped"
+
+    async def _terminate_expired_tasks(reason: str) -> None:
+        """Stop expired tasks without ever opening an unsafe queue window.
+
+        ``stop_task`` only acknowledges a control request.  We therefore keep
+        every lifecycle pin until either its terminal message arrives or
+        ``disconnect_client`` confirms the owning CLI cleanup.  A cleanup that
+        cannot yet be confirmed is retried by this same live watcher; the
+        session stays fenced and queued work cannot start in between attempts.
+        """
+        if not pending or not _owns_generation():
+            return
+        sys.stderr.write(
+            f"[chat] task watcher sid={session_id[:8]} {reason}; "
+            f"requesting stop for {len(pending)} task(s)\n")
+        sys.stderr.flush()
+
+        async def _request_stop(task_id: str) -> bool:
+            try:
+                await asyncio.wait_for(
+                    client.stop_task(task_id),
+                    timeout=_TASK_STOP_ACK_TIMEOUT_S,
+                )
+                return True
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                return False
+
+        stop_results = await asyncio.gather(*(
+            _request_stop(task_id) for task_id in tuple(pending)
+        ))
+        sys.stderr.write(
+            f"[chat] task watcher sid={session_id[:8]} stop requests "
+            f"acked={sum(stop_results)}/{len(stop_results)}\n")
+        sys.stderr.flush()
+
+        # ``asyncio.timeout`` cancels the in-flight ``__anext__`` that was
+        # waiting when the absolute lease expired.  Direct SDK iterators treat
+        # that cancellation as terminal; attach a fresh iterator for the stop
+        # notification.  Pump-backed watchers keep the same background queue.
+        _reopen_stream()
+
+        # An ack is not terminal. Continue owning the same reader for a short
+        # bounded window so normal stopped notifications can update their tool
+        # cards without tearing down the reusable CLI process.
+        settle_deadline = (
+            asyncio.get_running_loop().time() + _TASK_STOP_SETTLE_GRACE_S)
+        while pending and _owns_generation():
+            remaining = settle_deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                break
+            try:
+                msg = await _next_message(remaining)
+            except asyncio.TimeoutError:
+                break
+            if msg is _STREAM_EOF:
+                # EOF proves the message channel is gone, not necessarily that
+                # the subprocess cleanup has completed.  Continue to the
+                # tracked disconnect fence below before releasing anything.
+                break
+            if await _consume_timeout_terminal(msg):
+                continue
+            if isinstance(msg, ResultMessage):
+                await _close_continuation(
+                    duration_ms=getattr(msg, "duration_ms", None))
+            elif cont is not None and cont_state is not None:
+                for event in _render_continuation_message(msg, cont_state):
+                    cont.publish(event)
+
+        if not pending:
+            return
+
+        # No terminal marker arrived.  Stop the entire owning runtime so a
+        # late command/result cannot cross into the queued user turn.  SDK
+        # disconnect already owns graceful -> TERM -> KILL escalation.  If it
+        # is still running at its bounded public deadline, keep this watcher
+        # and its pins alive and retry; never turn a timeout into an unpin.
+        attempt = 0
+        while pending and _owns_generation():
+            attempt += 1
+            try:
+                await _disconnect_background_task_owner(session_id, client)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                if attempt == 1 or attempt % 6 == 0:
+                    sys.stderr.write(
+                        f"[chat] task watcher sid={session_id[:8]} "
+                        f"runtime termination pending attempt={attempt} "
+                        f"exc={type(exc).__name__}\n")
+                    sys.stderr.flush()
+                await asyncio.sleep(min(
+                    30.0, _TASK_TERMINATION_RETRY_S * attempt))
+                continue
+            await _settle_after_confirmed_disconnect()
+            return
+
     try:
         async with asyncio.timeout(
             _task_watch_timeout_remaining(pending)
@@ -11816,25 +13034,15 @@ async def _watch_inflight_tasks(
                     break
                 if msg is _STREAM_EOF:
                     if pending:
-                        # A definitive stream EOF means the owning CLI is gone:
-                        # no terminal TaskNotification can ever arrive for the
-                        # still-pinned subprocesses.  Keeping those pins made
-                        # /active and Activity Center report a ghost running
-                        # task after an interrupted turn had already vanished
-                        # from the chat pane.  Watcher replacement/shutdown
-                        # arrives as CancelledError instead and deliberately
-                        # retains ownership, so releasing only on EOF is safe.
+                        # The message channel ended, but SDK process cleanup may
+                        # still be running.  Enter the same stop/disconnect
+                        # fence as an absolute timeout; never infer process
+                        # death from EOF alone.
                         deferred = _background_activity_finishes.get(session_id)
                         deferred_status = deferred[0] if deferred else None
                         activity_failed = deferred_status != "cancelled"
-                        sys.stderr.write(
-                            f"[chat] task watcher: stream ended with "
-                            f"{len(pending)} pending task(s) "
-                            f"sid={session_id[:8]}; releasing dead pins\n")
-                        _release_task_pins(session_id, pending)
-                        for task_id in pending:
-                            _bg_task_descriptions.pop(task_id, None)
-                        pending.clear()
+                        await _terminate_expired_tasks(
+                            "message stream ended before task settlement")
                         break
                     if await _request_explicit_resume("message stream ended"):
                         _reopen_stream()
@@ -11857,7 +13065,12 @@ async def _watch_inflight_tasks(
                     # double-fired here.
                     tid = getattr(msg, "task_id", "") or ""
                     won_typed = _on_task_settled(
-                        session_id, tid, status=getattr(msg, "status", None))
+                        session_id, tid,
+                        status=getattr(msg, "status", None),
+                        tool_use_id=getattr(msg, "tool_use_id", None),
+                        summary=getattr(msg, "summary", None),
+                        output_file=getattr(msg, "output_file", None),
+                        usage=dict(getattr(msg, "usage", None) or {}))
                     last_settle_status = getattr(msg, "status", None)
                     sys.stderr.write(
                         f"[chat] task watcher: typed notification "
@@ -11883,7 +13096,11 @@ async def _watch_inflight_tasks(
                     if terminal is not None:
                         tid = terminal["task_id"]
                         won_updated = _on_task_settled(
-                            session_id, tid, status=terminal["status"])
+                            session_id, tid, status=terminal["status"],
+                            tool_use_id=terminal.get("tool_use_id"),
+                            summary=terminal.get("summary"),
+                            output_file=terminal.get("output_file"),
+                            usage=dict(terminal.get("usage") or {}))
                         last_settle_status = terminal["status"]
                         sys.stderr.write(
                             f"[chat] task watcher: terminal update "
@@ -11914,8 +13131,10 @@ async def _watch_inflight_tasks(
                     if tid:
                         pending[tid] = desc
                         _pin_background_task(session_id, tid)
-                        if desc:
-                            _bg_task_descriptions[tid] = desc
+                        _record_background_task_launch(
+                            session_id, tid,
+                            tool_use_id=getattr(msg, "tool_use_id", None),
+                            description=desc)
                         sys.stderr.write(
                             f"[chat] task watcher: typed start "
                             f"sid={session_id[:8]} task={tid}\n")
@@ -11952,7 +13171,10 @@ async def _watch_inflight_tasks(
                     won = [n for n in notifs
                            if _on_task_settled(
                                session_id, n.get("task_id") or "",
-                               status=n.get("status") or None)]
+                               status=n.get("status") or None,
+                               tool_use_id=n.get("tool_use_id") or None,
+                               summary=n.get("summary") or None,
+                               output_file=n.get("output_file") or None)]
                     for n in notifs:
                         pending.pop(n.get("task_id") or "", None)
                         last_settle_status = n.get("status") or None
@@ -11989,19 +13211,13 @@ async def _watch_inflight_tasks(
         raise
     except asyncio.TimeoutError:
         activity_failed = True
-        sys.stderr.write(
-            f"[chat] task watcher sid={session_id} reached its absolute "
-            f"task deadline, {len(pending)} task(s) still pending; "
-            f"unpinning client\n")
-        _release_task_pins(session_id, pending)
-        for task_id in pending:
-            _bg_task_descriptions.pop(task_id, None)
+        await _terminate_expired_tasks("reached its absolute task deadline")
     except Exception as e:
         activity_failed = True
         sys.stderr.write(
-            f"[chat] task watcher sid={session_id} err: "
-            f"{type(e).__name__}: {e}; unpinning client\n")
-        _release_task_pins(session_id, pending)
+            f"[chat] task watcher sid={session_id[:8]} err: "
+            f"{type(e).__name__}; entering safe termination\n")
+        await _terminate_expired_tasks("failed before task settlement")
     finally:
         # Release our slot on the session pump so a later turn's messages are
         # not routed to a watcher that has exited.
@@ -12075,14 +13291,10 @@ def _merge_session_inflight(
     _spawn_task_watcher's caller, so the session reported active:true while
     waiting for a notification that can never arrive a second time.
 
-    Descriptions for prior-turn tasks come from the cross-turn cache. Pins older
-    than the watch timeout are reaped here rather than carried forward forever.
+    Descriptions for prior-turn tasks come from the cross-turn cache. Expired
+    pins remain authoritative until their watcher safely terminates the owning
+    runtime; a turn-boundary merge must never reap lifecycle state itself.
     """
-    reaped = _reap_stale_task_pins(session_id)
-    if reaped:
-        sys.stderr.write(
-            f"[chat] reaped stale task pins sid={session_id[:8]} "
-            f"tasks={sorted(reaped)}\n")
     merged: dict[str, dict] = {}
     for tid in _sessions_with_inflight_tasks.get(session_id, ()):
         info = turn_inflight.get(tid) or {}
@@ -12138,7 +13350,7 @@ async def _retire_unpinned_task_watcher(session_id: str) -> None:
     clears the global pin in `_handle_task_message`, while the old watcher's
     private `pending` set never sees it.  Once the turn confirms there are no
     pins left, cancel that now-ownerless reader so it cannot suppress compact
-    and LRU reclamation until the 30-minute task timeout.
+    and LRU reclamation until the full task-watch timeout.
     """
     if _sessions_with_inflight_tasks.get(session_id):
         return
@@ -12489,6 +13701,10 @@ async def _finish_background_activity(
                     continue
             finish_task.result()
             raise
+        # The visible successor already shows the predecessor-owned task card.
+        # Do not also light the global Activity Center for the hidden source.
+        if (sess.get_session_meta(session_id) or {}).get("runtime_successor"):
+            await asyncio.to_thread(_activity.ack, sid=session_id)
     except Exception as e:
         sys.stderr.write(
             f"[activity] background finish failed sid={session_id}: {e}\n")
@@ -13800,7 +15016,10 @@ async def _start_turn(
                     # (sync check, no await between gate and emit → no
                     # double-fire).
                     if tid and not _on_task_settled(
-                            session_id, tid, status=n.get("status") or None):
+                            session_id, tid, status=n.get("status") or None,
+                            tool_use_id=n.get("tool_use_id") or None,
+                            summary=n.get("summary") or None,
+                            output_file=n.get("output_file") or None):
                         continue
                     sys.stderr.write(
                         f"[chat] task fallback: in-turn settle via "
@@ -13845,8 +15064,11 @@ async def _start_turn(
                                     "description": desc,
                                 }
                                 _pin_background_task(session_id, tid)
-                                if desc:
-                                    _bg_task_descriptions[tid] = desc
+                                _record_background_task_launch(
+                                    session_id, tid,
+                                    tool_use_id=tu_id,
+                                    description=desc,
+                                    output_file=launch.get("output_file"))
                                 # Stamp the launching card ⏳ running live, the
                                 # same shape _handle_task_message emits for a
                                 # typed TaskStartedMessage.
@@ -13896,8 +15118,10 @@ async def _start_turn(
                     # watcher). Mid-turn this is redundant with _active_turns'
                     # eviction exemption, but it's what survives past turn end.
                     _pin_background_task(session_id, tid)
-                    if info["description"]:
-                        _bg_task_descriptions[tid] = info["description"]
+                    _record_background_task_launch(
+                        session_id, tid,
+                        tool_use_id=info["tool_use_id"],
+                        description=info["description"])
                 yield {"event": "task_started", "data": json.dumps({
                     "task_id": tid,
                     "tool_use_id": info["tool_use_id"],
@@ -13937,7 +15161,12 @@ async def _start_turn(
                 # payload can carry a summary/output_file the patch lacked, and
                 # the card merge is idempotent) but is flagged so the client
                 # treats it as a card patch rather than a fresh notification.
-                settled = _on_task_settled(session_id, tid, status=status)
+                settled = _on_task_settled(
+                    session_id, tid, status=status,
+                    tool_use_id=getattr(msg, "tool_use_id", None),
+                    summary=summary,
+                    output_file=output_file,
+                    usage=dict(getattr(msg, "usage", None) or {}))
                 yield {"event": "task_notification", "data": json.dumps({
                     "task_id": tid,
                     "tool_use_id": getattr(msg, "tool_use_id", None),
@@ -13956,7 +15185,11 @@ async def _start_turn(
                 tid = terminal["task_id"]
                 inflight_tasks.pop(tid, None)
                 won_updated = _on_task_settled(
-                    session_id, tid, status=terminal["status"])
+                    session_id, tid, status=terminal["status"],
+                    tool_use_id=terminal.get("tool_use_id"),
+                    summary=terminal.get("summary"),
+                    output_file=terminal.get("output_file"),
+                    usage=dict(terminal.get("usage") or {}))
                 sys.stderr.write(
                     f"[chat] in-turn terminal update sid={session_id[:8]} "
                     f"task={tid} status={terminal['status']} won={won_updated}\n")
@@ -14074,6 +15307,16 @@ async def _start_turn(
             if _done_background_tasks:
                 _defer_activity_finish(
                     session_id, broadcast, _activity_status)
+                if last_assistant_uuid:
+                    try:
+                        sess.set_runtime_background_boundary(
+                            session_id, last_assistant_uuid)
+                    except Exception as exc:
+                        sys.stderr.write(
+                            f"[chat] runtime boundary persist failed "
+                            f"sid={session_id[:8]} "
+                            f"exc={type(exc).__name__}\n"
+                        )
             else:
                 await _finish_activity(
                     session_id, broadcast, _activity_status)
@@ -14322,6 +15565,14 @@ async def _start_turn(
                                turn_count=n_turns,
                                auto_rename_from=_rename_src)
             sess.update_model(session_id, model_to_use)
+            # ``done`` is intentionally published before this slower block. A
+            # user can therefore roll over the session while these annotations
+            # and the first-turn name are still being persisted. Reconcile the
+            # completed source into every already-linked successor; the
+            # endpoint performs the same reconciliation after linking to close
+            # the opposite ordering of the race.
+            await asyncio.to_thread(
+                _sync_runtime_successor_postlude, session_id)
             # Web Push on turn-done. Three gates, in order:
             #   1. Turn was NOT user-cancelled — see was_cancelled above.
             #   2. No device has heartbeated /api/presence recently — i.e.
@@ -14724,8 +15975,12 @@ async def _start_turn(
                     # errors too so the queue pauses instead of headlessly
                     # cascading the next item onto a failing session.
                     elif isinstance(ev, dict) and ev.get("event") == "done":
+                        done_data: dict[str, Any] = {}
                         try:
-                            if json.loads(ev.get("data") or "{}").get("is_error"):
+                            parsed_done = json.loads(ev.get("data") or "{}")
+                            if isinstance(parsed_done, dict):
+                                done_data = parsed_done
+                            if done_data.get("is_error"):
                                 turn_errored = True
                         except (ValueError, TypeError):
                             pass
@@ -14734,11 +15989,6 @@ async def _start_turn(
                         # duplicate display snapshot layered over JSONL.
                         broadcast.canonical_terminal_published = True
                         if broadcast.queue_item_id:
-                            done_data = {}
-                            try:
-                                done_data = json.loads(ev.get("data") or "{}")
-                            except (TypeError, ValueError):
-                                pass
                             if done_data.get("is_error") or done_data.get("cancelled"):
                                 queue_settled = sess.release_queue_claim(
                                     session_id,
@@ -14754,6 +16004,15 @@ async def _start_turn(
                                 )
                             if not queue_settled:
                                 raise RuntimeError("queue terminal ownership mismatch")
+                        if (not done_data.get("is_error")
+                                and not done_data.get("cancelled")
+                                and int(done_data.get(
+                                    "background_tasks_pending") or 0) > 0):
+                            # The Result handler persisted the exact assistant
+                            # boundary before yielding this event. Start fork +
+                            # cold-client setup now, in parallel with the slow
+                            # post-turn transcript/context bookkeeping below.
+                            _schedule_detached_successor_prewarm(session_id)
                     if (isinstance(ev, dict)
                             and ev.get("event") == "cancelled"
                             and broadcast.cancelled):
@@ -14977,6 +16236,17 @@ async def _maybe_drain_queue(session_id: str) -> None:
     item is restored to the queue head so nothing is dropped. A start failure
     additionally pauses the queue (mirrors the turn-errored policy)."""
     async with _queue_drain_lock_for(session_id):
+        runtime_meta = sess.get_session_meta(session_id) or {}
+        successor_sid = str(runtime_meta.get("runtime_successor") or "")
+        if runtime_meta.get("runtime_shadow"):
+            if successor_sid:
+                try:
+                    moved = sess.migrate_queue(session_id, successor_sid)
+                except ValueError:
+                    return
+                if moved["target"].get("items"):
+                    _schedule_queue_drain(successor_sid)
+            return
         if session_id in _active_turns and not _active_turns[session_id].done:
             return
         # The watcher owns a logical response boundary even though no ordinary
@@ -14984,6 +16254,18 @@ async def _maybe_drain_queue(session_id: str) -> None:
         # final continuation releases the single SDK pump.
         if (_sessions_with_inflight_tasks.get(session_id)
                 or _session_has_live_watcher(session_id)):
+            queued = sess.get_queue(session_id)
+            if queued.get("items") or queued.get("inflight"):
+                try:
+                    successor = await _continue_detached_runtime(session_id)
+                    successor_sid = str(successor.get("session_id") or "")
+                    if successor_sid and successor_sid != session_id:
+                        _schedule_queue_drain(successor_sid)
+                except HTTPException as exc:
+                    sys.stderr.write(
+                        f"[chat] queued runtime rollover deferred "
+                        f"sid={session_id[:8]} status={exc.status_code}\n"
+                    )
             return
         item = sess.claim_queue_message(session_id)
         if item is None:
@@ -15072,6 +16354,9 @@ def _schedule_queue_drain(session_id: str) -> None:
     """Kick one retained, coalesced drain task without delaying enqueue HTTP."""
     existing = _queue_drain_tasks.get(session_id)
     if existing is not None and not existing.done():
+        # Coalescing used to discard this wakeup. During a long runtime fork,
+        # that could strand a later accepted prompt on the hidden source queue.
+        _queue_drain_rekicks.add(session_id)
         return
     task = asyncio.create_task(_maybe_drain_queue(session_id))
     _queue_drain_tasks[session_id] = task
@@ -15081,6 +16366,8 @@ def _schedule_queue_drain(session_id: str) -> None:
         _maintenance_tasks.discard(done)
         if _queue_drain_tasks.get(session_id) is done:
             _queue_drain_tasks.pop(session_id, None)
+        rekick = session_id in _queue_drain_rekicks
+        _queue_drain_rekicks.discard(session_id)
         if done.cancelled():
             return
         try:
@@ -15091,6 +16378,12 @@ def _schedule_queue_drain(session_id: str) -> None:
             sys.stderr.write(
                 f"[chat] scheduled queue drain failed sid={session_id}: "
                 f"{type(exc).__name__}: {exc}\n")
+        if rekick:
+            # Defer creation to the next loop turn so the completed task is no
+            # longer observable as the owner. A later enqueue can set the bit
+            # again while this follow-up pass runs.
+            asyncio.get_running_loop().call_soon(
+                _schedule_queue_drain, session_id)
 
     task.add_done_callback(_done)
 
@@ -15131,6 +16424,13 @@ def session_active_status(sid: str) -> dict:
     """Tell the frontend whether `sid` has an in-progress background
     turn. Used on session load to decide between "render JSONL history"
     and "open a reconnect SSE stream to follow the live tail."""
+    runtime_task_ids = set(_sessions_with_inflight_tasks.get(sid, ()))
+    runtime_task_ids.update(
+        task_id
+        for task_id, overlay in sess.get_runtime_task_overlays(sid).items()
+        if overlay.get("state") == "running"
+    )
+    runtime_background_pending = len(runtime_task_ids)
     b = _active_turns.get(sid)
     if b is not None and getattr(b, "is_continuation", False) \
             and getattr(b, "continuation_consumed", False):
@@ -15160,11 +16460,6 @@ def session_active_status(sid: str) -> dict:
                 and not getattr(recent, "continuation_consumed", False)):
             b = recent
         else:
-            reaped = _reap_stale_task_pins(sid)
-            if reaped:
-                sys.stderr.write(
-                    f"[chat] reaped stale task pins sid={sid[:8]} "
-                    f"tasks={sorted(reaped)}\n")
             background_pending = len(
                 _sessions_with_inflight_tasks.get(sid, ()))
             if background_pending:
@@ -15184,12 +16479,15 @@ def session_active_status(sid: str) -> dict:
                     "started_at": _background_turn_started_at.get(sid, 0),
                     "events_so_far": 0,
                     "background_tasks_pending": background_pending,
+                    "runtime_background_tasks_pending": runtime_background_pending,
                     "user_text": "",
                     "user_images": [],
                     "user_docs": [],
                 }
             return {
                 "active": False,
+                "background_tasks_pending": 0,
+                "runtime_background_tasks_pending": runtime_background_pending,
                 # A just-finished direct or queued turn can disappear from the
                 # live registry before the reconnect probe lands. Preserve its
                 # delivery class through the grace broadcast so the browser
@@ -15202,6 +16500,9 @@ def session_active_status(sid: str) -> dict:
         "active": True,
         "attachable": True,
         "background": False,
+        "background_tasks_pending": len(
+            _sessions_with_inflight_tasks.get(sid, ())),
+        "runtime_background_tasks_pending": runtime_background_pending,
         "turn_id": b.turn_id,
         "parent_turn_id": b.parent_turn_id,
         "model": b.model,

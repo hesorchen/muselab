@@ -141,6 +141,46 @@ def _parse_sse(raw: str):
     return events
 
 
+@pytest.mark.asyncio
+async def test_queue_drain_replays_one_wakeup_coalesced_during_rollover(
+        app_module, monkeypatch):
+    """A second enqueue during a long drain must not strand on the source."""
+    from backend import chat as chat_mod
+
+    sid = "queue-rekick-during-rollover"
+    first_entered = asyncio.Event()
+    release_first = asyncio.Event()
+    second_finished = asyncio.Event()
+    calls = 0
+
+    async def fake_drain(got_sid):
+        nonlocal calls
+        assert got_sid == sid
+        calls += 1
+        if calls == 1:
+            first_entered.set()
+            await release_first.wait()
+        else:
+            second_finished.set()
+
+    monkeypatch.setattr(chat_mod, "_maybe_drain_queue", fake_drain)
+    chat_mod._schedule_queue_drain(sid)
+    await asyncio.wait_for(first_entered.wait(), timeout=1)
+
+    # Multiple triggers while the owner is running collapse to one retained
+    # level-triggered retry, rather than one task per click/request.
+    chat_mod._schedule_queue_drain(sid)
+    chat_mod._schedule_queue_drain(sid)
+    assert sid in chat_mod._queue_drain_rekicks
+    assert calls == 1
+
+    release_first.set()
+    await asyncio.wait_for(second_finished.wait(), timeout=1)
+    await asyncio.sleep(0)
+    assert calls == 2
+    assert sid not in chat_mod._queue_drain_rekicks
+
+
 def test_stream_happy_path_text_tooluse_result_done(stream_env, client, monkeypatch):
     """Happy path: assistant text → tool_use → tool_result → done. Assert
     every key frame flows through with the expected shape."""
@@ -784,17 +824,30 @@ def test_background_stream_eof_releases_dead_task_and_closes_activity(
     transitions = []
 
     class _ClosedClient:
+        def __init__(self):
+            self.stop_calls = []
+            self.disconnect_calls = 0
+
+        async def stop_task(self, task_id):
+            self.stop_calls.append(task_id)
+
+        async def disconnect(self):
+            self.disconnect_calls += 1
+
         async def receive_messages(self):
             if False:  # pragma: no cover - make this an async generator
                 yield None
 
     async def exercise():
+        fake = _ClosedClient()
         chat_mod._pin_background_task(sid, task_id)
         chat_mod._bg_task_descriptions[task_id] = "sleep 30"
         chat_mod._background_activity_finishes[sid] = (
             deferred_status, "background-owner")
         await chat_mod._watch_inflight_tasks(
-            sid, _ClosedClient(), {task_id: "sleep 30"})
+            sid, fake, {task_id: "sleep 30"})
+        assert fake.stop_calls == [task_id]
+        assert fake.disconnect_calls == 1
 
     monkeypatch.setattr(
         activity_module.activity,
@@ -3839,45 +3892,44 @@ def test_merge_session_inflight_does_not_resurrect_watcher_settled_task(stream_e
         chat_mod._sessions_with_inflight_tasks.pop(sid, None)
 
 
-def test_stale_task_pins_expire_after_the_watch_timeout(stream_env):
-    """A pin is the ONLY thing making a session report background_active, and
-    _settle_background_task needs a terminal notification to clear it. A task
-    that never delivers one (a background job that produced no output) used to
-    pin its session forever — respawning a watcher after every user turn and
-    keeping the browser's reconnect machinery awake. The deadline is absolute
-    from the task's own launch, not per-watcher."""
+def test_read_only_status_never_reaps_expired_background_fence(
+    stream_env, client,
+):
+    """A timeout is not proof that an SDK-owned child process stopped.
+
+    Session-list and /active polling used to synchronously reap an old pin,
+    opening a queue-drain race outside the watcher.  Both read paths must keep
+    reporting the fence until lifecycle recovery confirms a terminal message
+    or disconnect.
+    """
     import time as _time
 
     chat_mod = stream_env
-    sid = "sid-stale-pin"
+    sid = _make_session(client)
+    task_id = "task-expired-but-unconfirmed"
     try:
-        chat_mod._pin_background_task(sid, "task_fresh")
-        chat_mod._pin_background_task(sid, "task_zombie")
-        chat_mod._bg_task_descriptions["task_zombie"] = "pytest that died"
-        # Backdate one pin past the watch timeout.
-        chat_mod._bg_task_pinned_at["task_zombie"] = (
+        chat_mod._pin_background_task(sid, task_id)
+        chat_mod._bg_task_pinned_at[task_id] = (
             _time.time() - chat_mod._TASK_WATCH_TIMEOUT - 1)
 
-        reaped = chat_mod._reap_stale_task_pins(sid)
+        listing = client.get(
+            "/api/chat/sessions",
+            headers={"X-Auth-Token": TEST_TOKEN},
+        )
+        assert listing.status_code == 200
+        listed = next(row for row in listing.json()["sessions"]
+                      if row["id"] == sid)
+        assert listed["background_active"] is True
 
-        assert reaped == ["task_zombie"]
-        assert chat_mod._sessions_with_inflight_tasks[sid] == {"task_fresh"}
-        # Reaping consumes the bookkeeping so nothing leaks.
-        assert "task_zombie" not in chat_mod._bg_task_pinned_at
-        assert "task_zombie" not in chat_mod._bg_task_descriptions
-        # A fresh pin is never reaped, and the call is idempotent.
-        assert chat_mod._reap_stale_task_pins(sid) == []
-
-        # Last pin expiring drops the session entirely → background_active False.
-        chat_mod._bg_task_pinned_at["task_fresh"] = (
-            _time.time() - chat_mod._TASK_WATCH_TIMEOUT - 1)
-        assert chat_mod._reap_stale_task_pins(sid) == ["task_fresh"]
-        assert sid not in chat_mod._sessions_with_inflight_tasks
+        active = client.get(
+            f"/api/chat/sessions/{sid}/active",
+            headers={"X-Auth-Token": TEST_TOKEN},
+        )
+        assert active.status_code == 200
+        assert active.json()["background_tasks_pending"] == 1
+        assert chat_mod._sessions_with_inflight_tasks[sid] == {task_id}
     finally:
-        chat_mod._sessions_with_inflight_tasks.pop(sid, None)
-        for tid in ("task_fresh", "task_zombie"):
-            chat_mod._bg_task_pinned_at.pop(tid, None)
-            chat_mod._bg_task_descriptions.pop(tid, None)
+        chat_mod._release_task_pins(sid, {task_id})
 
 
 def test_watcher_timeout_keeps_absolute_task_deadline_across_respawns(
@@ -3905,6 +3957,178 @@ def test_watcher_timeout_keeps_absolute_task_deadline_across_respawns(
         chat_mod._bg_task_pinned_at.pop("task_new", None)
 
 
+def test_watcher_timeout_waits_for_terminal_stop_before_queue_drain(
+    stream_env, monkeypatch,
+):
+    """A stop_task control ack alone cannot release the session fence."""
+    chat_mod = stream_env
+    sid = "sid-timeout-terminal"
+    task_id = "task-timeout-terminal"
+    queue_drains = []
+
+    notification = TaskNotificationMessage(
+        subtype="task_notification", data={}, task_id=task_id,
+        status="stopped", output_file="", summary="stopped at deadline",
+        uuid="task-timeout-terminal-msg", session_id=sid,
+        tool_use_id="tool-timeout-terminal",
+    )
+
+    class _TimeoutStopClient:
+        def __init__(self):
+            self.stop_calls = []
+            self.stop_requested = asyncio.Event()
+            self.release_terminal = asyncio.Event()
+
+        async def stop_task(self, requested):
+            self.stop_calls.append(requested)
+            self.stop_requested.set()
+
+        async def receive_messages(self):
+            # A fresh SDK receive iterator is attached for timeout recovery;
+            # the iterator cancelled by the outer deadline may not be reused.
+            await self.stop_requested.wait()
+            await self.release_terminal.wait()
+            yield notification
+
+    fake = _TimeoutStopClient()
+
+    async def fake_drain(drain_sid):
+        queue_drains.append(drain_sid)
+
+    async def exercise():
+        chat_mod._pin_background_task(sid, task_id)
+        monkeypatch.setattr(
+            chat_mod, "_task_watch_timeout_remaining", lambda _ids: 0.01)
+        monkeypatch.setattr(chat_mod, "_TASK_STOP_SETTLE_GRACE_S", 1.0)
+        monkeypatch.setattr(chat_mod, "_maybe_drain_queue", fake_drain)
+        watcher = asyncio.create_task(chat_mod._watch_inflight_tasks(
+            sid, fake, {task_id: "sleep forever"}))
+        chat_mod._task_watchers[sid] = watcher
+        await fake.stop_requested.wait()
+        # stop_task returned, but the terminal marker has not. The pin remains
+        # and queue drain cannot run in this gap.
+        assert chat_mod._sessions_with_inflight_tasks[sid] == {task_id}
+        assert queue_drains == []
+        fake.release_terminal.set()
+        await asyncio.wait_for(watcher, timeout=1)
+
+    try:
+        asyncio.run(exercise())
+        assert fake.stop_calls == [task_id]
+        assert sid not in chat_mod._sessions_with_inflight_tasks
+        assert queue_drains == [sid]
+    finally:
+        chat_mod._release_task_pins(sid, {task_id})
+        chat_mod._task_watchers.pop(sid, None)
+        chat_mod._active_turns.pop(sid, None)
+        recent = chat_mod._recent_turns.pop(sid, None)
+        if recent is not None:
+            recent.close()
+
+
+def test_watcher_timeout_disconnect_failure_keeps_fence_and_queue_paused(
+    stream_env, monkeypatch,
+):
+    """Unconfirmed process cleanup remains fenced until a later retry wins."""
+    chat_mod = stream_env
+    sid = "sid-timeout-disconnect"
+    task_id = "task-timeout-disconnect"
+    queue_drains = []
+    disconnect_attempts = []
+    retry_seen = asyncio.Event()
+    release_disconnect = asyncio.Event()
+
+    class _TimeoutDisconnectClient:
+        async def stop_task(self, _task_id):
+            return None
+
+        async def receive_messages(self):
+            await asyncio.Event().wait()
+            if False:  # pragma: no cover - make this an async generator
+                yield None
+
+    fake = _TimeoutDisconnectClient()
+
+    async def fake_disconnect(disconnect_sid, disconnect_client):
+        assert disconnect_sid == sid
+        assert disconnect_client is fake
+        disconnect_attempts.append(disconnect_sid)
+        if len(disconnect_attempts) == 1:
+            retry_seen.set()
+            raise chat_mod.RuntimeCleanupTimeout("still stopping")
+        await release_disconnect.wait()
+
+    async def fake_drain(drain_sid):
+        queue_drains.append(drain_sid)
+
+    async def exercise():
+        chat_mod._pin_background_task(sid, task_id)
+        monkeypatch.setattr(
+            chat_mod, "_task_watch_timeout_remaining", lambda _ids: 0.01)
+        monkeypatch.setattr(chat_mod, "_TASK_STOP_SETTLE_GRACE_S", 0.01)
+        monkeypatch.setattr(chat_mod, "_TASK_TERMINATION_RETRY_S", 0.01)
+        monkeypatch.setattr(
+            chat_mod, "_disconnect_background_task_owner", fake_disconnect)
+        monkeypatch.setattr(chat_mod, "_maybe_drain_queue", fake_drain)
+        watcher = asyncio.create_task(chat_mod._watch_inflight_tasks(
+            sid, fake, {task_id: "sleep forever"}))
+        chat_mod._task_watchers[sid] = watcher
+        await asyncio.wait_for(retry_seen.wait(), timeout=1)
+        # Cleanup has failed once and the retry is not yet confirmed. Nothing
+        # may turn this into an unpin/drain window.
+        assert chat_mod._sessions_with_inflight_tasks[sid] == {task_id}
+        assert queue_drains == []
+        release_disconnect.set()
+        await asyncio.wait_for(watcher, timeout=1)
+
+    try:
+        asyncio.run(exercise())
+        assert len(disconnect_attempts) >= 2
+        assert sid not in chat_mod._sessions_with_inflight_tasks
+        assert queue_drains == [sid]
+    finally:
+        chat_mod._release_task_pins(sid, {task_id})
+        chat_mod._task_watchers.pop(sid, None)
+        chat_mod._active_turns.pop(sid, None)
+        recent = chat_mod._recent_turns.pop(sid, None)
+        if recent is not None:
+            recent.close()
+
+
+def test_background_owner_disconnect_retry_clears_transient_failure(stream_env):
+    """The safety fence must permit a later exact-owner cleanup to recover."""
+    chat_mod = stream_env
+    sid = "sid-disconnect-recovery"
+
+    class _RetryDisconnectClient:
+        def __init__(self):
+            self.calls = 0
+
+        async def disconnect(self):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("transient cleanup failure")
+
+    fake = _RetryDisconnectClient()
+
+    async def exercise():
+        with pytest.raises(chat_mod.RuntimeCleanupTimeout):
+            await chat_mod._disconnect_background_task_owner(sid, fake)
+        # Let the tracking callback publish its sticky failure state.
+        await asyncio.sleep(0)
+        assert sid in chat_mod._session_disconnect_failed
+        await chat_mod._disconnect_background_task_owner(sid, fake)
+        await asyncio.sleep(0)
+
+    try:
+        asyncio.run(exercise())
+        assert fake.calls == 2
+        assert sid not in chat_mod._session_disconnect_failed
+    finally:
+        chat_mod._session_disconnect_failed.discard(sid)
+        chat_mod._session_disconnect_tasks.pop(sid, None)
+
+
 def test_watcher_without_a_task_pin_is_not_user_visible_active(stream_env):
     chat_mod = stream_env
     sid = "sid-watcher-without-pin"
@@ -3918,6 +4142,8 @@ def test_watcher_without_a_task_pin_is_not_user_visible_active(stream_env):
         chat_mod._task_watchers[sid] = LiveWatcher()
         assert chat_mod.session_active_status(sid) == {
             "active": False,
+            "background_tasks_pending": 0,
+            "runtime_background_tasks_pending": 0,
             "activity_source": "",
         }
 
@@ -3933,7 +4159,7 @@ def test_watcher_without_a_task_pin_is_not_user_visible_active(stream_env):
 
 def test_unpinned_watcher_is_retired_after_foreground_consumes_terminal(
         stream_env):
-    """A watcher that missed its notification must not live for 30 minutes."""
+    """A watcher that missed its notification must not live for a full lease."""
     chat_mod = stream_env
     sid = "sid-stale-watcher-after-foreground"
 

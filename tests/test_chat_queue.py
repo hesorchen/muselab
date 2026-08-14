@@ -226,6 +226,89 @@ def test_required_session_enqueue_self_heals_sdk_only_session(app_module):
     assert sess.get_queue(sid)["items"][0]["text"] == "accepted on SDK truth"
 
 
+def test_indexed_enqueue_fast_path_reads_index_once_without_lifecycle_probe(
+    app_module, monkeypatch,
+):
+    sess = _sess(app_module)
+    sid = sess.create_session()["id"]
+    original_load_index = sess._load_index
+    index_reads = 0
+
+    def counted_load_index():
+        nonlocal index_reads
+        index_reads += 1
+        return original_load_index()
+
+    @contextlib.contextmanager
+    def forbidden_lifecycle(_sid):
+        raise AssertionError("indexed enqueue must not take lifecycle stripe")
+        yield
+
+    monkeypatch.setattr(sess, "_load_index", counted_load_index)
+    monkeypatch.setattr(sess, "session_lifecycle_lock", forbidden_lifecycle)
+    monkeypatch.setattr(
+        sess,
+        "sdk_get_session_info",
+        lambda *_args, **_kwargs: pytest.fail("indexed enqueue probed SDK"),
+    )
+
+    result = sess.enqueue_existing_message(sid, "fast indexed enqueue")
+
+    assert result["ok"] is True
+    assert index_reads == 1
+    assert result["queue"]["items"][0]["text"] == "fast indexed enqueue"
+
+
+def test_indexed_enqueue_and_delete_remain_linearized(
+    app_module, monkeypatch,
+):
+    """The fast path commits before DELETE or observes its tombstone."""
+    sess = _sess(app_module)
+    sid = sess.create_session()["id"]
+    save_entered = threading.Event()
+    release_save = threading.Event()
+    original_save = sess._save_queue
+
+    def blocked_save(target_sid, data, *, bump=True):
+        if (
+            target_sid == sid
+            and any(
+                item.get("text") == "accepted before delete"
+                for item in data.get("items", [])
+            )
+        ):
+            save_entered.set()
+            assert release_save.wait(timeout=2)
+        return original_save(target_sid, data, bump=bump)
+
+    monkeypatch.setattr(sess, "_save_queue", blocked_save)
+    enqueued = []
+    deleted = []
+    enqueue_thread = threading.Thread(
+        target=lambda: enqueued.append(
+            sess.enqueue_existing_message(sid, "accepted before delete")
+        ),
+    )
+    enqueue_thread.start()
+    assert save_entered.wait(timeout=1)
+    delete_thread = threading.Thread(
+        target=lambda: deleted.append(sess.delete_session(sid)),
+    )
+    delete_thread.start()
+    assert delete_thread.is_alive()
+
+    release_save.set()
+    enqueue_thread.join(timeout=2)
+    delete_thread.join(timeout=2)
+
+    assert not enqueue_thread.is_alive()
+    assert not delete_thread.is_alive()
+    assert enqueued[0]["ok"] is True
+    assert deleted == [True]
+    assert sid not in sess.indexed_session_ids()
+    assert not sess._queue_path(sid).exists()
+
+
 def test_enqueue_never_overwrites_corrupt_queue(app_module):
     sess = _sess(app_module)
     sid = "s-corrupt-runtime-queue"
@@ -771,6 +854,7 @@ async def test_cancelled_enqueue_joins_commit_and_schedules_drain(
     task = asyncio.create_task(chat.enqueue_api(
         "s-cancelled-enqueue",
         chat.QueueEnqueueReq(text="durable"),
+        chat.BackgroundTasks(),
     ))
     assert await asyncio.to_thread(entered.wait, 1)
     task.cancel()
@@ -827,6 +911,59 @@ def test_queue_endpoint_schedules_drain_kick(client, auth, monkeypatch):
 
     assert response.status_code == 200, response.text
     assert kicks == [sid]
+
+
+@pytest.mark.asyncio
+async def test_queue_drain_kick_is_deferred_to_response_background(
+    app_module, monkeypatch,
+):
+    """The queue ACK is built before rollover/drain work can start."""
+    from backend import chat
+
+    sid = _sess(app_module).create_session()["id"]
+    kicks = []
+    monkeypatch.setattr(chat, "_schedule_queue_drain", kicks.append)
+    background = chat.BackgroundTasks()
+
+    response = await chat.enqueue_api(
+        sid,
+        chat.QueueEnqueueReq(text="ack first"),
+        background,
+    )
+
+    assert response["ok"] is True
+    assert kicks == []
+    await background()
+    assert kicks == [sid]
+
+
+@pytest.mark.asyncio
+async def test_response_sends_final_body_before_queue_background_callback():
+    """Pin Starlette's response ordering relied on by the queue ACK path."""
+    from fastapi import BackgroundTasks
+    from starlette.responses import JSONResponse
+
+    order = []
+    background = BackgroundTasks()
+
+    async def kick():
+        order.append("drain")
+
+    async def send(message):
+        if message["type"] == "http.response.start":
+            order.append("start")
+        elif message["type"] == "http.response.body":
+            assert message.get("more_body", False) is False
+            order.append("final-body")
+
+    async def receive():
+        return {"type": "http.disconnect"}
+
+    background.add_task(kick)
+    response = JSONResponse({"ok": True}, background=background)
+    await response({"type": "http"}, receive, send)
+
+    assert order == ["start", "final-body", "drain"]
 
 
 def test_queue_endpoint_rejects_empty_message(
@@ -955,7 +1092,13 @@ async def test_late_enqueue_after_empty_completion_check_kicks_idle_queue(
     # observed no work. A stale browser then posts while it still renders the
     # session as streaming — this used to leave the item stranded forever.
     await chat._maybe_drain_queue(sid)
-    response = await chat.enqueue_api(sid, chat.QueueEnqueueReq(text="late"))
+    background = chat.BackgroundTasks()
+    response = await chat.enqueue_api(
+        sid,
+        chat.QueueEnqueueReq(text="late"),
+        background,
+    )
+    await background()
     await asyncio.wait_for(started.wait(), timeout=1)
     task = chat._queue_drain_tasks.get(sid)
     if task is not None:

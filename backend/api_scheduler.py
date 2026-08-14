@@ -120,7 +120,10 @@ def patch_task_endpoint(tid: str, req: TaskPatch) -> dict:
     if "schedule" in changes and changes["schedule"]:
         changes["schedule"] = {k: v for k, v in changes["schedule"].items()
                                 if v is not None}
-    t = sched.update_task(tid, **changes)
+    try:
+        t = sched.update_task(tid, **changes)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from None
     if not t:
         raise HTTPException(404, "task not found")
     return t

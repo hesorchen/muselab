@@ -10,14 +10,15 @@ from pathlib import Path
 from fastapi import Body, Depends, FastAPI, Request
 from fastapi.middleware.gzip import GZipMiddleware
 from .auth import require_token
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from .files import router as files_router
-from .chat import router as chat_router
+from .chat import RuntimeCleanupTimeout, router as chat_router
 from .api_settings import router as settings_router
 from .api_memory import router as memory_router
 from .api_scheduler import router as scheduler_router
+from .scheduler import SchedulerPersistenceError
 from .api_push import router as push_router
 from .workspaces import router as workspaces_router
 from .activity_api import router as activity_router
@@ -227,6 +228,19 @@ async def _lifespan(app: FastAPI):
         _asyncio.to_thread(_sess.ensure_private_session_storage),
         _asyncio.to_thread(_activity.initialize_runtime_state),
     )
+    # Runtime-rollover task cards are durable UI overlays, but their owning
+    # CLI process and watcher are intentionally process-local.  After a
+    # service restart there is therefore no legitimate way for a persisted
+    # ``running`` overlay to still be alive.  Settle those rows before serving
+    # requests so a successor tab cannot poll forever for an owner that no
+    # longer exists.
+    stale_runtime_tasks = await _asyncio.to_thread(
+        _sess.stop_stale_runtime_task_overlays)
+    if stale_runtime_tasks:
+        sys.stderr.write(
+            f"[muselab] stopped {stale_runtime_tasks} stale runtime task "
+            "overlay(s) on startup\n")
+        sys.stderr.flush()
     try:
         # Run the fail-closed queue sweep before starting any optional service.
         # In particular, scheduler catch-up can launch work immediately; it
@@ -398,6 +412,36 @@ async def _backfill_turn_counts() -> None:
 
 
 app = FastAPI(title="muselab", version=project_version(), lifespan=_lifespan)
+
+
+@app.exception_handler(SchedulerPersistenceError)
+async def scheduler_persistence_error_handler(
+    _request: Request,
+    exc: SchedulerPersistenceError,
+) -> JSONResponse:
+    """Expose durable-state degradation without leaking filesystem paths."""
+    return JSONResponse(
+        status_code=503,
+        content={
+            "detail": str(exc),
+            "code": "scheduler_persistence_unavailable",
+            "degraded": True,
+        },
+    )
+
+
+@app.exception_handler(RuntimeCleanupTimeout)
+async def runtime_cleanup_timeout_handler(
+    _request: Request,
+    _exc: RuntimeCleanupTimeout,
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=503,
+        content={
+            "detail": "runtime cleanup is still in progress; retry shortly",
+            "code": "runtime_cleanup_pending",
+        },
+    )
 
 # Gzip every response ≥1KB. The frontend ships ~1.2MB of uncompressed text
 # assets (app.js / index.html / styles.css) plus JSON-heavy API responses
@@ -767,6 +811,7 @@ def presence_heartbeat(payload: dict | None = Body(default=None)) -> dict:
 _CLIENT_ERR_BUCKETS: dict[str, tuple[float, int]] = {}
 _CLIENT_ERR_WINDOW_SEC = 60.0
 _CLIENT_ERR_PER_WINDOW = 30
+_CLIENT_ERR_BODY_LIMIT = 8 * 1024
 
 
 def _client_err_allow(ip: str) -> bool:
@@ -806,26 +851,44 @@ async def client_error_log(request: Request) -> dict:
     ip = (request.client.host if request.client else "?") or "?"
     if not _client_err_allow(ip):
         return {"ok": True, "rate_limited": True}
+    content_length = request.headers.get("content-length")
+    if content_length:
+        try:
+            declared_size = int(content_length)
+        except ValueError:
+            return JSONResponse(
+                {"ok": False, "error": "invalid_content_length"},
+                status_code=400,
+            )
+        if declared_size < 0 or declared_size > _CLIENT_ERR_BODY_LIMIT:
+            return JSONResponse(
+                {"ok": False, "error": "body_too_large"},
+                status_code=413,
+            )
     try:
-        raw = await request.body()
+        body = bytearray()
+        async for chunk in request.stream():
+            if len(body) + len(chunk) > _CLIENT_ERR_BODY_LIMIT:
+                return JSONResponse(
+                    {"ok": False, "error": "body_too_large"},
+                    status_code=413,
+                )
+            body.extend(chunk)
+        raw = bytes(body)
     except Exception as e:
         sys.stderr.write(f"[client-error] body read failed: {type(e).__name__}: {e}\n")
         sys.stderr.flush()
         return {"ok": False}
-    # Cap at 8 KiB — a real stack trace is well under 2 KiB; anything
-    # bigger is either pathological or hostile.
-    if len(raw) > 8192:
-        raw = raw[:8192] + b"...[truncated]"
     try:
         payload = _json.loads(raw.decode("utf-8", errors="replace"))
-        line = _json.dumps(payload, ensure_ascii=False)[:8192]
+        line = _json.dumps(payload, ensure_ascii=False)[:_CLIENT_ERR_BODY_LIMIT]
     except Exception:
         # Invalid-JSON fallback writes the raw body. json.dumps above
         # escapes embedded newlines, but this path doesn't — a body with
         # CR/LF would forge extra "[client-error] …" log lines (log
         # injection). Collapse CR/LF to spaces so one request stays one
         # log line.
-        line = raw.decode("utf-8", errors="replace")[:8192]
+        line = raw.decode("utf-8", errors="replace")[:_CLIENT_ERR_BODY_LIMIT]
         line = line.replace("\r", " ").replace("\n", " ")
     sys.stderr.write(f"[client-error] {line}\n")
     sys.stderr.flush()
