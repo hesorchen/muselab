@@ -2290,13 +2290,21 @@ def test_sse_ready_workspace_id_mismatch_forces_cold_tree_recovery(
             });
             const oldGeneration = app._workspaceGeneration(owner);
             await app._startFileEvents();
-            const first = streams[0];
+            // Layout watchers from the shared page can race an additional
+            // connection into the fake stream list. Exercise the stream that
+            // actually owns app state instead of assuming streams[0] won.
+            const first = app._fileEvents;
+            if (!first) throw new Error('owner file-event stream did not start');
             first.dispatchEvent(new MessageEvent('ready', {
               data: JSON.stringify({
                 ready: true, cursor: 0, workspace_id: newId,
               }),
             }));
-            for (let i = 0; i < 100 && streams.length < 2; i += 1) {
+            for (let i = 0; i < 100 && (
+              !first.closed || loadCalls < 1
+              || app._workspaceRegistryId(owner) !== newId
+              || app._fileEvents === first
+            ); i += 1) {
               await new Promise(resolve => setTimeout(resolve, 10));
             }
             const stored = await cache.getWorkspaceSnapshot(owner);
