@@ -1498,7 +1498,7 @@ def test_session_todo_modal_uses_large_desktop_board(
     expect(modal.locator(".session-todo-lane")).to_have_count(3)
 
     high_item = modal.locator(".session-todo-item", has_text="High item")
-    high_item.dblclick()
+    high_item.locator(".session-todo-edit-button").click()
     edit = high_item.locator(".session-todo-edit")
     expect(edit).to_be_visible()
     expect(edit).to_be_focused()
@@ -1512,7 +1512,7 @@ def test_session_todo_modal_uses_large_desktop_board(
     assert saved == "Edited high item"
 
     medium_item = modal.locator(".session-todo-item", has_text="Medium item")
-    medium_item.dblclick()
+    medium_item.locator(".session-todo-edit-button").click()
     medium_edit = medium_item.locator(".session-todo-edit")
     medium_edit.fill("Must not save")
     medium_edit.press("Escape")
@@ -4720,23 +4720,23 @@ def test_background_task_gap_leaves_composer_usable_without_empty_reconnect(
     )
 
     _app_eval(page, "return app.loadSession(arg);", sid)
-    # A pending background task is tracked, but it no longer makes the session
-    # busy: the turn already reached ResultMessage, and the backend pump owns
-    # the stream, so the user can keep talking while the task runs.
+    # A pending background task remains an internal queue-routing state so a
+    # new prompt can be handed to a successor runtime safely.  It must not,
+    # however, disable the composer or open an empty foreground SSE.
     page.wait_for_function(
         """sid => {
           const app = document.querySelector("#app")._x_dataStack[0];
           const st = app.tabState[sid];
+          const input = document.querySelector(".chat-input-textarea");
           return st && st.backgroundActive === true
-            && st.streaming === false && app._isBusy(sid) === false
+            && st.streaming === false && input && !input.disabled
             && st.streamElapsed >= 89;
         }""",
         arg=sid,
         timeout=10000,
     )
-    # The "background task running · new messages will queue" strip is gone
-    # along with the queueing it described, and the turn footer no longer
-    # spins for a task that is not this turn's work.
+    # The old blocking strip is gone, and the turn footer no longer spins for
+    # a task that is not this turn's work.
     expect(page.locator(".background-task-strip")).to_have_count(0)
     expect(page.locator(".msg-pane:visible .thinking-dots:visible")).to_have_count(0)
     # The tab dot still surfaces that something is running in the background.
@@ -5431,8 +5431,9 @@ def test_mobile_composer_footer_is_compact_and_never_overflows(
                   const send = pick(".chat-toolbar-queue");
                   const stop = pick(".chat-toolbar-stop");
                   const textLabelCount = button => Array.from(button.children)
-                    .filter(child => !child.classList.contains("icon")
-                      && !child.classList.contains("chat-toolbar-queue-badge"))
+                    .filter(child => !child.classList.contains("chat-toolbar-queue-badge")
+                      && getComputedStyle(child).display !== "none"
+                      && child.textContent.trim())
                     .length;
                   return {
                     composer: box(".chat-input"),
