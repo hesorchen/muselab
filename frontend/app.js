@@ -22690,6 +22690,12 @@ function portal() {
       this.dismissPreviewQuote(true);
       if (this._isMobileLayout()) this.setMobileTab("chat");
       this.$nextTick(() => {
+        // Do not let this delayed convenience-focus steal a newer selection.
+        // A fast user (or a busy renderer) can begin selecting another bubble
+        // before Alpine reaches this tick; focusing the textarea would then
+        // collapse that fresh range and the selection actions never appear.
+        const selection = window.getSelection && window.getSelection();
+        if (selection && selection.rangeCount && !selection.isCollapsed) return;
         const ta = this.$refs.chatInput;
         if (ta) ta.focus();
       });
