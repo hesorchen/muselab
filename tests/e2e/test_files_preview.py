@@ -2303,7 +2303,8 @@ def test_sse_ready_workspace_id_mismatch_forces_cold_tree_recovery(
             for (let i = 0; i < 100 && (
               !first.closed || loadCalls < 1
               || app._workspaceRegistryId(owner) !== newId
-              || app._fileEvents === first
+              || !app._fileEvents || app._fileEvents === first
+              || app._fileEventsGeneration !== app._workspaceGeneration(owner)
             ); i += 1) {
               await new Promise(resolve => setTimeout(resolve, 10));
             }
