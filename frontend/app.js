@@ -594,7 +594,13 @@ function portal() {
     sessionTodoDragId: "",
     sessionTodoEditId: "",
     sessionTodoEditDraft: "",
+    _sessionTodoEditOwner: null,
     userTodos: [],
+    // Lightweight focus ownership shared by modal/popover surfaces. DOM nodes
+    // live here only while their surface is open; the stack ensures a nested
+    // managed dialog never restores focus behind the dialog above it.
+    _focusSurfaceState: {},
+    _modalFocusStack: [],
     activity: {
       show: false, loading: false, events: [],
       // Custom groups are the primary organization surface. An explicit user
@@ -1243,7 +1249,38 @@ function portal() {
       // IME. Some WebViews report the commit Enter as an ordinary keydown
       // immediately after compositionend; the per-element lifecycle guard
       // below keeps global shortcuts from treating it as a real command.
-      if (this._isImeComposingEvent(ev)) return;
+      if (this._isImeComposingEvent(ev)) {
+        // The candidate UI owns Escape too. Stop it at document level so old
+        // `.window` listeners cannot close one or several dialogs while the
+        // user is merely dismissing an IME candidate list.
+        if (ev.key === "Escape") ev.stopPropagation();
+        return;
+      }
+      if (ev.key === "Escape" && this.sessionPickerOpen) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        this.closeHistoryPicker();
+        return;
+      }
+      // Managed dialogs own Escape before any app-global action (especially
+      // the chat's Escape-to-stop shortcut). Close only the top surface so a
+      // modal opened over another modal cannot collapse both in one keypress.
+      if (ev.key === "Escape" && this._modalFocusStack.length) {
+        const top = this._modalFocusStack[this._modalFocusStack.length - 1];
+        ev.preventDefault();
+        ev.stopPropagation();
+        if (top === "generic-modal" && this.modal.cancel) this.modal.cancel();
+        else if (top === "scheduler") this.closeScheduler();
+        else if (top === "session-todo") this.closeSessionTodoBoard();
+        else if (top === "activity") this.closeActivityCenter();
+        else if (top === "settings") this.settings.show = false;
+        else if (top === "image-gen") this.closeImageGen();
+        else if (top === "cheatsheet") this.cheatSheet.show = false;
+        else if (top === "workspace-browser") this.closeWorkspaceBrowser();
+        else if (top === "claude-auth") this.closeClaudeAuthModal();
+        else if (top === "trash") this.closeTrashModal();
+        return;
+      }
       // ---- Command palette ----
       // Cmd/Ctrl+K from anywhere opens it. While open, palette owns
       // ↑/↓/Enter; everything else falls through to the input.
@@ -1411,6 +1448,7 @@ function portal() {
       this._prewarmPreviewLibs();
       // 全局快捷键（绑在 document，避免每个 textarea 单独处理）
       document.addEventListener("keydown", e => this.onGlobalKeyDown(e));
+      this._registerFocusSurfaceWatchers();
       window.addEventListener("resize", () => {
         this._queueMemoryRecallPosition();
         if (this.activity.moveMenu.show) this.closeActivityMoveMenu();
@@ -4005,6 +4043,23 @@ function portal() {
       if (value === "failed") return this.lang === "zh" ? "失败" : "Failed";
       return this.lang === "zh" ? "已中断" : "Interrupted";
     },
+    _backgroundTaskCount(state) {
+      const own = Number(state && state.backgroundTaskCount);
+      const inherited = Number(state && state.inheritedBackgroundTaskCount);
+      const count = (Number.isFinite(own) && own > 0 ? Math.floor(own) : 0)
+        + (Number.isFinite(inherited) && inherited > 0 ? Math.floor(inherited) : 0);
+      return count > 0 ? count : 1;
+    },
+    turnHasPendingBackground(m, pane, isLatest = false) {
+      // This is deliberately a display-only composite state. The canonical
+      // turn_status remains "completed"; backgroundActive belongs to the
+      // session watcher lifecycle and must never be persisted onto the turn.
+      return !!(isLatest
+        && pane && (pane.backgroundActive || pane.inheritedBackgroundTaskCount > 0)
+        && !pane.streaming
+        && m && !m._failed && !m._interrupted
+        && this.turnFooterStatus(m, pane) === "completed");
+    },
     turnFooterTime(m, pane) {
       const status = this.turnFooterStatus(m, pane);
       if (status === "running") {
@@ -4711,14 +4766,26 @@ function portal() {
     chooseOne({ title, body = "", choices }) {
       const zh = this.lang === "zh";
       if (!title) title = zh ? "请选择" : "Choose";
+      const opener = document.activeElement;
       return new Promise((resolve) => {
         this.modal = {
           show: true, title, body, input: null, choices,
           okText: "", cancelText: zh ? "取消" : "Cancel", danger: false,
           confirm: null,
-          pick: (v) => { this.modal.show = false; resolve(v); },
-          cancel: () => { this.modal.show = false; resolve(null); },
+          pick: (v) => {
+            this.modal.show = false;
+            this._closeFocusSurface("generic-modal");
+            resolve(v);
+          },
+          cancel: () => {
+            this.modal.show = false;
+            this._closeFocusSurface("generic-modal");
+            resolve(null);
+          },
         };
+        this._openFocusSurface(
+          "generic-modal", ".confirm-modal", ".modal-choice", opener, true,
+        );
       });
     },
 
@@ -4809,8 +4876,9 @@ function portal() {
       }
       const path = ts.output_file;
       const name = path.split("/").pop();
+      const ownerSid = ts.owner_session_id || this.currentId;
       const url = "/api/chat/task-output?session_id="
-        + encodeURIComponent(this.currentId)
+        + encodeURIComponent(ownerSid)
         + "&path=" + encodeURIComponent(path);
       try {
         await this.openFile({ path, name }, { readUrl: url, reveal: true });
@@ -4828,7 +4896,8 @@ function portal() {
       if (!ts || !ts.task_id) return;
       const zh = this.lang === "zh";
       try {
-        const r = await fetch("/api/chat/sessions/" + this.currentId
+        const ownerSid = ts.owner_session_id || this.currentId;
+        const r = await fetch("/api/chat/sessions/" + ownerSid
           + "/tasks/" + encodeURIComponent(ts.task_id) + "/stop",
           { method: "POST", headers: this.hdr() });
         if (r.ok) {
@@ -5548,6 +5617,125 @@ function portal() {
       return true;
     },
 
+    // ===== focus-managed surfaces =====
+    _focusableElements(root) {
+      if (!root || !root.querySelectorAll) return [];
+      const selector = [
+        "a[href]", "area[href]", "button:not([disabled])",
+        "input:not([disabled]):not([type='hidden'])", "select:not([disabled])",
+        "textarea:not([disabled])", "[contenteditable='true']",
+        "[tabindex]:not([tabindex='-1'])",
+      ].join(",");
+      return Array.from(root.querySelectorAll(selector)).filter(el => {
+        if (el.hidden || el.getAttribute("aria-hidden") === "true") return false;
+        const style = window.getComputedStyle(el);
+        return style.display !== "none" && style.visibility !== "hidden"
+          && (el.getClientRects().length > 0 || el === document.activeElement);
+      });
+    },
+    _focusWithoutScroll(el) {
+      if (!el || typeof el.focus !== "function") return false;
+      try { el.focus({ preventScroll: true }); }
+      catch (_) { try { el.focus(); } catch (_) { return false; } }
+      return document.activeElement === el;
+    },
+    _registerFocusSurfaceWatchers() {
+      const surfaces = [
+        ["settings.show", "settings", ".settings-modal", ".settings-menu-item.active"],
+        ["imageGen.show", "image-gen", ".image-gen-modal", ".image-gen-prompt"],
+        ["cheatSheet.show", "cheatsheet", ".cheatsheet-modal", ".modal-close"],
+        ["workspaceBrowser.show", "workspace-browser", ".workspace-browser-modal", ".workspace-browser-up:not([disabled])"],
+        ["claudeAuthModal.open", "claude-auth", ".claude-auth-modal", ".modal-close"],
+        ["trash.modalOpen", "trash", ".trash-modal", ".modal-close"],
+      ];
+      for (const [path, key, root, initial] of surfaces) {
+        this.$watch(path, show => {
+          if (show) {
+            this._openFocusSurface(
+              key, root, initial, document.activeElement, true,
+            );
+          } else {
+            this._closeFocusSurface(key);
+          }
+        });
+      }
+    },
+    _openFocusSurface(key, rootSelector, initialSelector = "", opener = null,
+                      modal = false) {
+      if (!key || !rootSelector) return;
+      const owner = opener || document.activeElement;
+      this._focusSurfaceState[key] = {
+        owner: owner && typeof owner.focus === "function" ? owner : null,
+        rootSelector,
+        initialSelector,
+        modal: !!modal,
+      };
+      if (modal) {
+        this._modalFocusStack = this._modalFocusStack.filter(item => item !== key);
+        this._modalFocusStack.push(key);
+      }
+      this.$nextTick(() => {
+        const state = this._focusSurfaceState[key];
+        if (!state) return;
+        const root = document.querySelector(state.rootSelector);
+        if (!root) return;
+        const focusable = this._focusableElements(root);
+        const preferred = state.initialSelector
+          ? root.querySelector(state.initialSelector) : null;
+        const target = focusable.includes(preferred) ? preferred : (focusable[0] || root);
+        this._focusWithoutScroll(target);
+      });
+    },
+    _closeFocusSurface(key, restore = true) {
+      const state = this._focusSurfaceState[key];
+      if (!state) return;
+      delete this._focusSurfaceState[key];
+      if (state.modal) {
+        this._modalFocusStack = this._modalFocusStack.filter(item => item !== key);
+      }
+      if (!restore) return;
+      this.$nextTick(() => {
+        // If another managed modal is still open, keep focus in that surface
+        // instead of restoring an opener hidden behind it.
+        const topKey = this._modalFocusStack[this._modalFocusStack.length - 1];
+        const top = topKey && this._focusSurfaceState[topKey];
+        if (top) {
+          const root = document.querySelector(top.rootSelector);
+          if (root && !root.contains(document.activeElement)) {
+            const owner = state.owner;
+            const target = owner && owner.isConnected && !owner.disabled
+              && root.contains(owner) ? owner : (this._focusableElements(root)[0] || root);
+            this._focusWithoutScroll(target);
+          }
+          return;
+        }
+        const owner = state.owner;
+        if (owner && owner.isConnected && !owner.disabled) {
+          this._focusWithoutScroll(owner);
+        }
+      });
+    },
+    trapDialogFocus(ev, key) {
+      if (!ev || ev.key !== "Tab" || ev.defaultPrevented) return;
+      if (this._modalFocusStack[this._modalFocusStack.length - 1] !== key) return;
+      const state = this._focusSurfaceState[key];
+      const root = state && document.querySelector(state.rootSelector);
+      if (!root) return;
+      const focusable = this._focusableElements(root);
+      if (!focusable.length) {
+        ev.preventDefault();
+        this._focusWithoutScroll(root);
+        return;
+      }
+      const current = focusable.indexOf(document.activeElement);
+      const target = ev.shiftKey
+        ? (current <= 0 ? focusable[focusable.length - 1] : null)
+        : (current < 0 || current === focusable.length - 1 ? focusable[0] : null);
+      if (!target) return;
+      ev.preventDefault();
+      this._focusWithoutScroll(target);
+    },
+
     // ===== modal =====
     confirmModalOnEnter(ev) {
       if (!this._claimNonImeEnter(ev)) return;
@@ -5564,13 +5752,26 @@ function portal() {
       if (!title) title = zh ? "确认" : "Confirm";
       if (!okText) okText = zh ? "确认" : "Confirm";
       if (!cancelText) cancelText = zh ? "取消" : "Cancel";
+      const opener = document.activeElement;
       return new Promise((resolve) => {
         this.modal = {
           show: true, title, body, input: null,
           okText, cancelText, danger,
-          confirm: () => { this.modal.show = false; resolve(true); },
-          cancel: () => { this.modal.show = false; resolve(false); },
+          confirm: () => {
+            this.modal.show = false;
+            this._closeFocusSurface("generic-modal");
+            resolve(true);
+          },
+          cancel: () => {
+            this.modal.show = false;
+            this._closeFocusSurface("generic-modal");
+            resolve(false);
+          },
         };
+        this._openFocusSurface(
+          "generic-modal", ".confirm-modal", ".modal-foot button:last-child",
+          opener, true,
+        );
       });
     },
     prompt({ title, body = "", placeholder = "", value = "", okText, cancelText }) {
@@ -5579,14 +5780,26 @@ function portal() {
       if (!title) title = zh ? "输入" : "Input";
       if (!okText) okText = zh ? "确认" : "Confirm";
       if (!cancelText) cancelText = zh ? "取消" : "Cancel";
+      const opener = document.activeElement;
       return new Promise((resolve) => {
         this.modal = {
           show: true, title, body, input: value, placeholder,
           okText, cancelText, danger: false,
-          confirm: () => { const v = this.modal.input; this.modal.show = false; resolve(v); },
-          cancel: () => { this.modal.show = false; resolve(null); },
+          confirm: () => {
+            const v = this.modal.input;
+            this.modal.show = false;
+            this._closeFocusSurface("generic-modal");
+            resolve(v);
+          },
+          cancel: () => {
+            this.modal.show = false;
+            this._closeFocusSurface("generic-modal");
+            resolve(null);
+          },
         };
-        this.$nextTick(() => { if (this.$refs.modalInput) this.$refs.modalInput.focus(); });
+        this._openFocusSurface(
+          "generic-modal", ".confirm-modal", "input", opener, true,
+        );
       });
     },
 
@@ -6963,6 +7176,27 @@ function portal() {
         // task settlement opens a continuation broadcast.
         backgroundActive: false,
         backgroundTaskCount: 0,
+        // A detached task still belongs to the pre-rollover runtime. The
+        // visible successor can run foreground turns independently while this
+        // separate counter keeps the inherited task card/footer live.
+        inheritedBackgroundOwner: "",
+        inheritedBackgroundTaskCount: 0,
+        _inheritedTaskPoller: null,
+        _backgroundHandoffPromise: null,
+        // Runtime rollover replaces the source tabState while a queue POST can
+        // still be in flight. Keep a primitive lineage in both directions so
+        // that send's finally block can finish against the successor instead
+        // of leaving its cloned composer locked (and its submitted text live).
+        _backgroundSuccessorSid: "",
+        _handoffSourceSid: "",
+        // A user send owns the composer until the prompt is durably accepted
+        // by either the turn endpoint or the server-side queue.  Background
+        // runtime rollover can take seconds on a long transcript; without a
+        // per-composer claim every Enter during that wait submits the same
+        // still-visible draft again.
+        _composerSubmitting: false,
+        _composerSubmitToken: null,
+        _backgroundHandoffScheduled: false,
         // A background task can settle before Claude starts its automatic
         // follow-up reaction. Keep the transport attached, but suppress the
         // generic running footer during that idle protocol gap.
@@ -7168,6 +7402,25 @@ function portal() {
       if (st._sessionActivityExpected === undefined) {
         st._sessionActivityExpected = null;
       }
+      if (!Number.isFinite(Number(st.inheritedBackgroundTaskCount))) {
+        st.inheritedBackgroundTaskCount = 0;
+      }
+      if (st.inheritedBackgroundOwner === undefined) {
+        st.inheritedBackgroundOwner = "";
+      }
+      if (st._inheritedTaskPoller === undefined) st._inheritedTaskPoller = null;
+      if (st._backgroundHandoffPromise === undefined) {
+        st._backgroundHandoffPromise = null;
+      }
+      if (st._backgroundSuccessorSid === undefined) {
+        st._backgroundSuccessorSid = "";
+      }
+      if (st._handoffSourceSid === undefined) st._handoffSourceSid = "";
+      if (st._composerSubmitting === undefined) st._composerSubmitting = false;
+      if (st._composerSubmitToken === undefined) st._composerSubmitToken = null;
+      if (st._backgroundHandoffScheduled === undefined) {
+        st._backgroundHandoffScheduled = false;
+      }
       if (!Array.isArray(st.draft.pendingQuotes)) st.draft.pendingQuotes = [];
       if (!st._queueMutating || typeof st._queueMutating !== "object") {
         st._queueMutating = {};
@@ -7187,13 +7440,35 @@ function portal() {
       if (!sid) return false;
       const st = this.tabState[sid];
       return !!(this.isTabStreaming(sid)
-        || (st && st.compacting));
+        || (st && (st.compacting || st.backgroundActive || st._draining
+          || (st.pendingQueue && st.pendingQueue.length))));
+    },
+    sendButtonHint(sid) {
+      return this._isBusy(sid) ? this.t("queue.button_hint") : this.t("btn.send");
     },
     async _confirmSessionBusy(sid, st = this.tabState[sid]) {
       if (!sid) return false;
-      if (st && (st.streaming || st.compacting)) return true;
+      // These are locally authoritative busy states. In particular, a
+      // background watcher cannot accept a foreground turn on its source
+      // runtime, and the durable queue endpoint owns the settle-vs-enqueue
+      // race. Probing /active first added a full request (and sometimes an
+      // 8-second timeout on a loaded server) before the queue POST, making
+      // Enter appear inert even though the local state already knew the
+      // answer. A migrated/draining queue also remains FIFO: never launch a
+      // direct turn in the short child handoff gap.
+      if (st && (st.streaming || st.compacting || st.backgroundActive
+          || st._draining || (st.pendingQueue && st.pendingQueue.length))) {
+        return true;
+      }
       const session = (this.sessions || []).find(s => s.id === sid);
-      if (!session || !session.active) return false;
+      // A runtime predecessor is hidden from the refreshed session list once
+      // another browser has already rolled it over.  The still-open local tab
+      // nevertheless retains its background watcher state and must probe the
+      // source instead of treating the missing row as idle; otherwise a
+      // second device can try to start a foreground turn on the old CLI.
+      if ((!session || !session.active) && !(st && st.backgroundActive)) {
+        return false;
+      }
       // session.active is a polled cache and can remain true for one response
       // after a turn's final drain already ran. Confirm it before enqueueing;
       // otherwise an idle queue item can be stranded with no turn left to drain.
@@ -7211,11 +7486,9 @@ function portal() {
             sid, active, status.started_at, status.background_tasks_pending);
         }
         if (!active && session) session.active = false;
-        // `active` includes a background watcher. Although the pump is the
-        // sole SDK reader, the CLI does not expose a reliable request id that
-        // can separate an old task's late auto-continuation from a new query.
-        // Queue until the watcher closes; it advances FIFO immediately after
-        // releasing the response boundary.
+        // A detached watcher still makes the SOURCE runtime busy. send() uses
+        // this precise flag to transparently roll the visible tab over to an
+        // isolated successor before starting the next foreground turn.
         if (status.background) return true;
         return active;
       } catch (_) {
@@ -7395,7 +7668,7 @@ function portal() {
       }
     },
     async _enqueueMessage(sid, item) {
-      this._ensureTabState(sid);
+      const enqueueState = this._ensureTabState(sid);
       // Only ready (uploaded, error-free) attachment IDs go to the server.
       // Preview blobs aren't persisted; if these IDs expire (10 min) before
       // the server drains the item, _start_turn skips them and sends text.
@@ -7412,6 +7685,7 @@ function portal() {
             "",
           )
         : "";
+      let accepted = null;
       try {
         const r = await fetch("/api/chat/sessions/" + sid + "/queue", {
           method: "POST",
@@ -7436,12 +7710,80 @@ function portal() {
           this.toast(this.lang === "zh" ? "加入队列失败" : "Failed to queue", "error", 3000);
           return false;
         }
+        try { accepted = await r.json(); } catch (_) { accepted = null; }
       } catch (_e) {
         this.toast(this.lang === "zh" ? "网络错误，未能入队" : "Network error — not queued",
                    "error", 3000);
         return false;
       }
-      await this._syncQueueFromServer(sid);
+      // The POST response is the durable acceptance boundary. Reflect its item
+      // immediately and reconcile in the background: waiting on a second GET
+      // can contend with the just-scheduled multi-megabyte transcript fork and
+      // make a successfully queued send look frozen for seconds.
+      // The proactive fork may have replaced `sid` while this POST was in
+      // flight. Follow the published lineage so the accepted bubble and queue
+      // revision land on the visible successor, not on an orphaned source.
+      const successorSid = String(enqueueState._backgroundSuccessorSid || "");
+      const successor = successorSid && this.tabState[successorSid];
+      const mirrorState = successor && successor._handoffSourceSid === sid
+        ? successor : (this.tabState[sid] === enqueueState ? enqueueState : null);
+      const mirrorSid = mirrorState === successor ? successorSid : sid;
+      if (mirrorState
+          && accepted && accepted.item && accepted.item.id
+          && !mirrorState.pendingQueue.some(q => q.id === accepted.item.id)) {
+        const queued = accepted.item;
+        const optimisticImages = (item.pendingImages || [])
+          .filter(im => im.id && !im.error)
+          .map(im => ({
+            id: im.id,
+            mime: im.mime || "",
+            src: im.preview || im.src || "",
+          }));
+        const optimisticDocs = (item.pendingDocs || [])
+          .filter(doc => doc.id && !doc.error)
+          .map(doc => ({
+            id: doc.id,
+            kind: doc.kind || "text",
+            name: doc.name || "file",
+          }));
+        mirrorState.pendingQueue = [
+          ...mirrorState.pendingQueue,
+          {
+            id: queued.id,
+            text: queued.text || item.text || "",
+            displayText: Object.prototype.hasOwnProperty.call(
+              queued, "display_text")
+              ? (queued.display_text || "") : (item.displayText || item.text || ""),
+            pendingQuotes: Array.isArray(queued.selection_quotes)
+              ? queued.selection_quotes : (item.pendingQuotes || []),
+            image_ids: queued.image_ids || image_ids,
+            hasAttach: !!String(queued.image_ids || image_ids).trim(),
+            images: optimisticImages,
+            docs: optimisticDocs,
+            expiredCount: 0,
+            pendingImages: [],
+            pendingDocs: [],
+            enqueuedAt: queued.enqueued_at || Date.now(),
+          },
+        ];
+        const acceptedRevision = Number(accepted.queue && accepted.queue.revision);
+        if (Number.isFinite(acceptedRevision)) {
+          mirrorState._queueRevision = Math.max(
+            Number(mirrorState._queueRevision) || 0, acceptedRevision);
+        }
+      }
+      if (mirrorState === successor) {
+        // The handoff's first attach probe may have observed the child before
+        // this POST committed. Re-arm it now; the backend owns idempotent drain
+        // and this only reconnects the visible UI to the resulting turn.
+        successor._draining = true;
+        this._syncQueueFromServer(successorSid);
+        if (this.currentId === successorSid) {
+          this.$nextTick(() => this._attachToServerTurn(successorSid, 20));
+        }
+      } else {
+        this._syncQueueFromServer(sid);
+      }
       return true;
     },
     // Post-turn / on-activate hook. The SERVER drains the queue (pops the next
@@ -7460,12 +7802,289 @@ function portal() {
       }
       this._attachToServerTurn(sid, 8, completedTurnId);
     },
+    _cloneRolloverValue(value) {
+      if (value === undefined || value === null) return value;
+      if (typeof structuredClone === "function") {
+        try { return structuredClone(value); } catch (_) {}
+      }
+      try { return JSON.parse(JSON.stringify(value)); } catch (_) { return value; }
+    },
+    _stateForDetachedSuccessor(sourceSid, childSid, sourceState, pendingCount) {
+      const child = this._blankTabState();
+      child._sid = childSid;
+      const cloneMessages = rows => (rows || []).map(row =>
+        this._cloneRolloverValue(row));
+      child.messages = cloneMessages(sourceState.messages);
+      child._earlierMessages = cloneMessages(sourceState._earlierMessages);
+      child._laterMessages = cloneMessages(sourceState._laterMessages);
+      child.messagesReady = sourceState.messagesReady !== false;
+      child.messagesLoading = false;
+      child.historyGeneration = sourceState.historyGeneration || "";
+      child._historyOrder = sourceState._historyOrder || "normal";
+      child._hasServerLater = !!sourceState._hasServerLater;
+      child._loadedOffset = Number(sourceState._loadedOffset) || 0;
+      child._total = Number(sourceState._total) || child.messages.length;
+      child._preTotal = Number(sourceState._preTotal) || 0;
+      child._truncatedFromTop = !!sourceState._truncatedFromTop;
+      child._hasMoreHistory = !!sourceState._hasMoreHistory;
+      child.sessionUsage = this._cloneRolloverValue(sourceState.sessionUsage);
+      child.permission = sourceState.permission || "";
+      child.effort = sourceState.effort || "auto";
+      child.serviceTier = sourceState.serviceTier || "";
+      child.atBottom = sourceState.atBottom !== false;
+      child.scrollTop = Number(sourceState.scrollTop) || 0;
+      child._loaded = true;
+      child._seenUpdated = sourceState._seenUpdated;
+      child.pendingQueue = this._cloneRolloverValue(sourceState.pendingQueue || []);
+      child._queuePaused = !!sourceState._queuePaused;
+      child._draining = !!sourceState._draining || child.pendingQueue.length > 0;
+      child._handoffSourceSid = sourceSid;
+      // A send can be waiting on its durable queue POST while the runtime fork
+      // finishes. Transfer the primitive claim with the draft. Otherwise the
+      // newly visible child enables Send again with the submitted text still
+      // present, and a second Enter can enqueue a duplicate before the first
+      // POST's finally block gets a chance to run.
+      child._composerSubmitting = !!sourceState._composerSubmitting;
+      child._composerSubmitToken = sourceState._composerSubmitToken || null;
+      // The composer moves to the successor, but it must be a different owner
+      // object. Upload entries may hold browser File objects, so copy their
+      // arrays rather than JSON-serialising them.
+      child.draft = {
+        ...sourceState.draft,
+        pendingImages: (sourceState.draft.pendingImages || []).slice(),
+        pendingDocs: (sourceState.draft.pendingDocs || []).slice(),
+        pendingQuotes: (sourceState.draft.pendingQuotes || []).map(q => ({ ...q })),
+        _uploadControllers: new Set(sourceState.draft._uploadControllers || []),
+      };
+      child.inheritedBackgroundOwner = sourceSid;
+      child.inheritedBackgroundTaskCount = Math.max(1, Number(pendingCount) || 1);
+      // A cloned running card must keep addressing the runtime that owns it.
+      for (const message of this._allPaneMessages(child)) {
+        if (message && message.task_status
+            && message.task_status.state === "running") {
+          message.task_status = {
+            ...message.task_status,
+            owner_session_id: message.task_status.owner_session_id || sourceSid,
+          };
+        }
+      }
+      return child;
+    },
+    _claimDetachedRolloverSlot(handoff) {
+      // Stateful slash commands cannot overtake work migrated into a real
+      // successor.  A 409/settled watcher returns the source id and is not a
+      // rollover, so the slash command may retry there normally.
+      return !!(handoff && handoff.rolledOver);
+    },
+    async _handoffBackgroundSession(sourceSid, sourceState = this.tabState[sourceSid]) {
+      if (!sourceSid || !sourceState || this.tabState[sourceSid] !== sourceState) {
+        return null;
+      }
+      if (sourceState._backgroundHandoffPromise) {
+        return await sourceState._backgroundHandoffPromise;
+      }
+      const task = (async () => {
+        const sourceMeta = (this.sessions || []).find(s => s.id === sourceSid) || {};
+        let response;
+        try {
+          response = await fetch(
+            `/api/chat/sessions/${encodeURIComponent(sourceSid)}/continue-detached`,
+            { method: "POST", headers: this.hdr() },
+          );
+        } catch (_) {
+          return null;
+        }
+        // A watcher can settle between /active and this request. Let the caller
+        // retry the ordinary send path against the now-idle source.
+        if (response.status === 409) {
+          return { sessionId: sourceSid, queuePending: false, rolledOver: false };
+        }
+        if (!response.ok) return null;
+        let payload = null;
+        try { payload = await response.json(); } catch (_) { return null; }
+        const childSid = String(payload.id || payload.session_id || "");
+        if (!childSid || childSid === sourceSid) {
+          return { sessionId: sourceSid, queuePending: false, rolledOver: false };
+        }
+        const pending = Number(
+          payload.inherited_background_tasks_pending
+          ?? payload.background_tasks_pending
+          ?? sourceState.backgroundTaskCount,
+        );
+        const wasDraining = !!sourceState._draining;
+        const childState = this._stateForDetachedSuccessor(
+          sourceSid, childSid, sourceState, pending,
+        );
+        const childMeta = {
+          ...sourceMeta,
+          ...payload,
+          id: childSid,
+          name: payload.name || sourceMeta.name || "",
+          model: payload.model || sourceMeta.model || "",
+          cwd: payload.cwd || sourceMeta.cwd || this.currentWorkspacePath(),
+          active: false,
+          turn_active: false,
+          background_active: false,
+        };
+        const sourceIndex = this.sessions.findIndex(s => s.id === sourceSid);
+        const withoutBoth = this.sessions.filter(
+          s => s.id !== sourceSid && s.id !== childSid);
+        if (sourceIndex >= 0) withoutBoth.splice(
+          Math.min(sourceIndex, withoutBoth.length), 0, childMeta);
+        else withoutBoth.unshift(childMeta);
+        this.sessions = withoutBoth;
+        // Publish the lineage before installing/removing tab state. An
+        // overlapping send closure still holds sourceState after this point
+        // and uses the link to settle its cloned composer on the child.
+        sourceState._backgroundSuccessorSid = childSid;
+        this.tabState[childSid] = childState;
+        const tabIndex = this.openTabIds.indexOf(sourceSid);
+        this.openTabIds = this.openTabIds.filter(
+          id => id !== sourceSid && id !== childSid);
+        if (tabIndex >= 0) this.openTabIds.splice(
+          Math.min(tabIndex, this.openTabIds.length), 0, childSid);
+        const replaceId = id => id === sourceSid ? childSid : id;
+        this._residentTabIds = Array.from(new Set(
+          (this._residentTabIds || []).map(replaceId)));
+        this._residentTabLru = Array.from(new Set(
+          (this._residentTabLru || []).map(replaceId)));
+        this._stopBgContPoller(sourceSid);
+        if (sourceState._streamTimer) clearInterval(sourceState._streamTimer);
+        sourceState._streamTimer = null;
+        delete this.tabState[sourceSid];
+        this._deletePersistedChatDraft(sourceSid);
+        this._persistChatDraft(childSid, childState.draft.input || "");
+        // Preserve focus ownership: only replace the visible source tab. A
+        // user who switched tabs while the POST was in flight stays there.
+        if (this.currentId === sourceSid) {
+          this.currentId = childSid;
+          this._activateTabState(childSid);
+          if (childMeta.cwd) {
+            this.workspaceLastSession = {
+              ...this.workspaceLastSession,
+              [childMeta.cwd]: childSid,
+            };
+          }
+        }
+        this._sessionsEtag = "";
+        this.savePrefs();
+        this._ensureInheritedTaskPoller(childSid, sourceSid);
+        // Establish whether the triggering prompt must join the migrated tail
+        // BEFORE send() retries. The endpoint schedules the old queue drain;
+        // blindly starting this prompt could otherwise overtake accepted work.
+        await this._syncQueueFromServer(childSid);
+        const advertisedDepth = Number(
+          payload.target_queue_depth
+          ?? payload.queue_depth
+          ?? payload.queue_pending
+          ?? 0);
+        const queuePending = Number(payload.queue_migrated) > 0
+          || (Number.isFinite(advertisedDepth) && advertisedDepth > 0)
+          || childState.pendingQueue.length > 0;
+        // Keep later sends on the durable FIFO until the poller observes the
+        // migrated turn. _attachToServerTurn clears this when the queue is
+        // genuinely idle; without this handoff guard a fast second Enter could
+        // mint a direct turn between queue migration and active-turn attach.
+        childState._draining = queuePending || wasDraining;
+        return { sessionId: childSid, queuePending, rolledOver: true };
+      })();
+      sourceState._backgroundHandoffPromise = task;
+      try { return await task; }
+      finally {
+        if (this.tabState[sourceSid] === sourceState) {
+          sourceState._backgroundHandoffPromise = null;
+        }
+      }
+    },
+    _scheduleBackgroundHandoff(sourceSid, sourceState) {
+      // Queue acceptance is the user-facing completion boundary.  The costly
+      // transcript fork is follow-up bookkeeping and must never keep the
+      // composer looking stuck.  The backend performs the same idempotent
+      // rollover from its queue drain, while this task obtains the successor
+      // id and swaps the visible tab once that work commits.
+      if (!sourceSid || !sourceState
+          || this.tabState[sourceSid] !== sourceState
+          || sourceState._backgroundHandoffScheduled) return;
+      sourceState._backgroundHandoffScheduled = true;
+      Promise.resolve().then(async () => {
+        const handoff = await this._handoffBackgroundSession(
+          sourceSid, sourceState);
+        if (handoff && handoff.rolledOver && handoff.sessionId) {
+          const child = this.tabState[handoff.sessionId];
+          if (child) child._draining = !!handoff.queuePending;
+          this._attachToServerTurn(handoff.sessionId, 20);
+        }
+      }).catch(() => {
+        // The server-side queue drain owns retries.  Keep the accepted prompt
+        // durable and let normal session polling discover the successor.
+      }).finally(() => {
+        if (this.tabState[sourceSid] === sourceState) {
+          sourceState._backgroundHandoffScheduled = false;
+        }
+      });
+    },
+    _ensureInheritedTaskPoller(childSid, sourceSid) {
+      const st = childSid && this.tabState[childSid];
+      if (!st || !sourceSid || st._inheritedTaskPoller) return;
+      let ticksLeft = 1810;
+      const stop = () => {
+        if (st._inheritedTaskPoller) clearInterval(st._inheritedTaskPoller);
+        st._inheritedTaskPoller = null;
+      };
+      const tick = async () => {
+        if (this.tabState[childSid] !== st || ticksLeft-- <= 0) {
+          stop();
+          return;
+        }
+        let status = null;
+        try {
+          const r = await fetch(
+            `/api/chat/sessions/${encodeURIComponent(sourceSid)}/active`,
+            { headers: this.hdr() },
+          );
+          if (r.ok) status = await r.json();
+        } catch (_) { return; }
+        if (!status) return;
+        // On a second rollover, `sourceSid` can itself be a visible successor
+        // whose inherited task is owned by an older hidden runtime. Its local
+        // pin count is zero, while the sidecar overlay chain still reports the
+        // real running task. Prefer that aggregate so a grandchild does not
+        // clear the yellow badge before the original task settles.
+        const reported = Number(
+          status.runtime_background_tasks_pending
+          ?? status.background_tasks_pending,
+        );
+        if (Number.isFinite(reported) && reported > 0) {
+          st.inheritedBackgroundTaskCount = Math.floor(reported);
+          return;
+        }
+        // The source can keep an already-finished, unconsumed continuation in
+        // its grace cache for about a minute. `active` therefore is NOT the
+        // terminal signal here; the authoritative inherited-task count is.
+        if (!Number.isFinite(reported) || reported !== 0) return;
+        // Adopt the backend's child overlay once no child turn can be disturbed
+        // by reconciliation. The source continuation is intentionally never
+        // subscribed from this successor.
+        if (st.streaming || st.es || st.compacting) return;
+        const loaded = await this.loadSession(childSid, {
+          quiet: true, probeActive: false,
+        });
+        if (!loaded || this.tabState[childSid] !== st) return;
+        st.inheritedBackgroundTaskCount = 0;
+        st.inheritedBackgroundOwner = "";
+        stop();
+      };
+      st._inheritedTaskPoller = setInterval(tick, 2000);
+      tick();
+    },
     // Poll /active + re-subscribe to a server-started turn. Retries a few
     // times because the server's drain runs a beat AFTER it publishes the
     // previous turn's `done` (in the background task's finally), so /active
     // can flip to true just after we land here. Stops once we attach, run
     // out of tries, or the queue turns out empty/paused.
-    async _attachToServerTurn(sid, tries, completedTurnId = "") {
+    async _attachToServerTurn(
+      sid, tries, completedTurnId = "", reconciledQueuedTurnId = "",
+    ) {
       const st0 = this.tabState[sid];
       if (this.currentId !== sid || this.streaming) {
         if (st0) st0._draining = false;
@@ -7483,6 +8102,7 @@ function portal() {
       let uText = "", uImages = [], uDocs = [];
       let continuation = false;
       let background = false, attachable = true, backgroundTaskCount = 0;
+      let activitySource = "";
       try {
         const r = await fetch("/api/chat/sessions/" + sid + "/active",
                                { headers: this.hdr() });
@@ -7493,6 +8113,7 @@ function portal() {
           continuation = !!d.continuation;
           background = !!d.background;
           attachable = d.attachable !== false;
+          activitySource = String(d.activity_source || "");
           backgroundTaskCount = Math.max(
             0, Number(d.background_tasks_pending) || 0);
           uText = d.user_text || "";
@@ -7500,6 +8121,61 @@ function portal() {
           uDocs = d.user_docs || [];
         }
       } catch (_e) {}
+      // A server-drained queue turn may be shorter than this poll interval. In
+      // that case there is no live broadcast left to attach to: /active returns
+      // inactive + activity_source=queued, while the queue has already ACKed the
+      // item and therefore also looks empty. The canonical transcript is the
+      // only remaining delivery channel. Pull it quietly so the completed reply
+      // and its persisted footer appear without a manual page refresh.
+      //
+      // Reconcile before attaching an ACTIVE queued turn too. One or more faster
+      // predecessors may have completed between probes; attaching only the newest
+      // broadcast would otherwise skip their user/reply/footer rows until reload.
+      // Re-probe after the await because the observed turn can finish or advance
+      // while the canonical fetch is in flight. The turn-id marker makes the
+      // second probe attach instead of recursively reloading the same turn.
+      const queuedReconcileKey = active ? turnId : "__recent_queued__";
+      if (activitySource === "queued"
+          && queuedReconcileKey !== reconciledQueuedTurnId) {
+        const loaded = await this.loadSession(sid, {
+          quiet: true, probeActive: false,
+        });
+        if (this.tabState[sid] !== st || this.currentId !== sid) {
+          if (this.tabState[sid] === st) st._draining = false;
+          this._syncQueueFromServer(sid);
+          return;
+        }
+        if (!active) {
+          if (loaded) {
+            // The inactive snapshot predates the history fetch. Probe once more
+            // after the merge: a newly-enqueued item may already have started
+            // while that request was in flight. The marker prevents the same
+            // recent queued completion from triggering another history pull.
+            return this._attachToServerTurn(
+              sid, Math.max(1, tries - 1), completedTurnId,
+              queuedReconcileKey,
+            );
+          }
+          if (tries <= 1) {
+            st._draining = false;
+            this._syncQueueFromServer(sid);
+          } else {
+            setTimeout(
+              () => this._attachToServerTurn(
+                sid, tries - 1, completedTurnId, reconciledQueuedTurnId,
+              ),
+              350,
+            );
+          }
+          return;
+        }
+        // Whether the history request succeeded or not, never attach using the
+        // pre-await active snapshot. A fresh probe prevents a completed/replaced
+        // broadcast from receiving this reconnect.
+        return this._attachToServerTurn(
+          sid, Math.max(1, tries - 1), completedTurnId, queuedReconcileKey,
+        );
+      }
       // `done` is intentionally emitted before slow post-turn persistence
       // finishes, so /active can briefly still expose the broadcast that just
       // completed. Never mistake that SAME turn for the next queue item and
@@ -7525,6 +8201,15 @@ function portal() {
         if (st && turnId) st.activeTurnId = turnId;
         this._setBackgroundTaskActive(
           sid, true, startedAt, backgroundTaskCount);
+        if (expect) {
+          const handoff = await this._handoffBackgroundSession(sid, st);
+          const childSid = handoff && handoff.sessionId;
+          if (childSid && childSid !== sid) {
+            this.$nextTick(() => this._attachToServerTurn(
+              childSid, Math.max(1, tries - 1), completedTurnId));
+            return;
+          }
+        }
         this._ensureBgContPoller(sid);
         return;
       }
@@ -7652,7 +8337,9 @@ function portal() {
       if (!st || !st.messages) return false;
       return st.messages.some(m =>
         m && m.role === "tool_use" && m.task_status
-        && m.task_status.state === "running");
+        && m.task_status.state === "running"
+        && (!m.task_status.owner_session_id
+          || m.task_status.owner_session_id === sid));
     },
     _ensureBgContPoller(sid) {
       this._bgContPollers = this._bgContPollers || {};
@@ -7660,10 +8347,10 @@ function portal() {
       const bgState = this.tabState[sid];
       if (!this._bgHasRunningCard(sid)
           && !(bgState && bgState.backgroundActive)) return;
-      // Hard cap mirrors the server's MUSELAB_TASK_WATCH_TIMEOUT (1800s): at a
-      // 2s cadence that's ~900 ticks. Prevents an interval lingering forever if
+      // Hard cap mirrors the server's MUSELAB_TASK_WATCH_TIMEOUT (3600s): at a
+      // 2s cadence that's ~1800 ticks. Prevents an interval lingering forever if
       // the user navigates away and the running card never resolves on the FE.
-      let ticksLeft = 910;
+      let ticksLeft = 1810;
       const tick = async () => {
         if (ticksLeft-- <= 0) { this._stopBgContPoller(sid); return; }
         const ownerState = this.tabState[sid];
@@ -8676,6 +9363,19 @@ function portal() {
       if (_pending.length) {
         next = [...(_pending.map(id => _om[id])), ...next];
       }
+      // An eager detached-runtime fork deliberately hides its predecessor from
+      // the canonical list before this browser has received/adopted the child
+      // id. Retain the already-open local row only for that bounded handoff
+      // window; otherwise workspaceOpenTabIds filters it out and the active tab
+      // visibly disappears between the quiet poll and continue-detached.
+      const _handoffRows = (this.sessions || []).filter(meta => {
+        if (!meta || _present.has(meta.id)
+            || !(this.openTabIds || []).includes(meta.id)) return false;
+        const state = this.tabState && this.tabState[meta.id];
+        return !!(state && (state._backgroundHandoffScheduled
+          || state._backgroundHandoffPromise));
+      });
+      if (_handoffRows.length) next = [..._handoffRows, ...next];
       next = next
         .map(meta => this._retainExpectedSessionSettings(meta))
         .map(meta => this._retainExpectedSessionActivity(meta));
@@ -9905,6 +10605,7 @@ function portal() {
           try { st._streamStartController.abort(); } catch {}
         }
         if (st._streamTimer) clearInterval(st._streamTimer);
+        if (st._inheritedTaskPoller) clearInterval(st._inheritedTaskPoller);
         if (st._stallWatch) clearInterval(st._stallWatch);
         if (st._reconnectTimer) clearTimeout(st._reconnectTimer);
         if (st._canonicalResyncTimer) clearTimeout(st._canonicalResyncTimer);
@@ -9919,6 +10620,9 @@ function portal() {
         st.streaming = false;
         st.backgroundActive = false;
         st.backgroundTaskCount = 0;
+        st.inheritedBackgroundTaskCount = 0;
+        st.inheritedBackgroundOwner = "";
+        st._inheritedTaskPoller = null;
         st._streamTimer = null;
         st._stallWatch = null;
         st._reconnectTimer = null;
@@ -10398,7 +11102,7 @@ function portal() {
     },
     isTabBackgroundActive(tid) {
       const st = this.tabState[tid];
-      if (st && st.backgroundActive) return true;
+      if (st && (st.backgroundActive || st.inheritedBackgroundTaskCount > 0)) return true;
       const s = this.sessions.find(x => x.id === tid);
       return !!(s && s.background_active);
     },
@@ -11190,8 +11894,14 @@ function portal() {
       this._persistGlobalUserTodos();
     },
     startSessionTodoEdit(item, ev) {
-      if (!item || !item.id || ev?.target?.closest?.("button")) return;
-      const host = ev?.currentTarget;
+      const explicit = !!ev?.currentTarget?.matches?.(".session-todo-edit-button");
+      const interactive = ev?.target?.closest?.("button, input, select, textarea, a");
+      if (!item || !item.id || (!explicit && interactive)) return;
+      const host = explicit
+        ? ev?.currentTarget?.closest?.(".session-todo-item") : ev?.currentTarget;
+      this._sessionTodoEditOwner = explicit
+        ? ev.currentTarget
+        : host?.querySelector?.(".session-todo-edit-button");
       this.sessionTodoEditId = item.id;
       this.sessionTodoEditDraft = String(item.text || "");
       this.$nextTick(() => {
@@ -11204,7 +11914,16 @@ function portal() {
         }, 0);
       });
     },
-    saveSessionTodoEdit(id = this.sessionTodoEditId) {
+    _finishSessionTodoEdit(restoreFocus = false) {
+      const owner = this._sessionTodoEditOwner;
+      this._sessionTodoEditOwner = null;
+      this.sessionTodoEditId = "";
+      this.sessionTodoEditDraft = "";
+      if (restoreFocus && owner) {
+        this.$nextTick(() => this._focusWithoutScroll(owner));
+      }
+    },
+    saveSessionTodoEdit(id = this.sessionTodoEditId, restoreFocus = false) {
       if (!id || id !== this.sessionTodoEditId) return;
       const text = String(this.sessionTodoEditDraft || "").trim();
       if (text) {
@@ -11212,12 +11931,10 @@ function portal() {
           item.id === id ? { ...item, text: text.slice(0, 240) } : item);
         this._persistGlobalUserTodos();
       }
-      this.sessionTodoEditId = "";
-      this.sessionTodoEditDraft = "";
+      this._finishSessionTodoEdit(restoreFocus);
     },
-    cancelSessionTodoEdit() {
-      this.sessionTodoEditId = "";
-      this.sessionTodoEditDraft = "";
+    cancelSessionTodoEdit(restoreFocus = false) {
+      this._finishSessionTodoEdit(restoreFocus);
     },
     clearCompletedSessionUserTodos() {
       this.userTodos = this.sessionTodoItems().filter(item => !item.completed);
@@ -11225,6 +11942,45 @@ function portal() {
     },
     sessionTodosForPriority(priority) {
       return this.sessionTodoItems().filter(item => item.priority === priority);
+    },
+    setSessionTodoPriority(id, priority, restoreFocus = false) {
+      if (!id || !["high", "medium", "low"].includes(priority)) return;
+      let changed = false;
+      this.userTodos = this.sessionTodoItems().map(item => {
+        if (item.id !== id || item.priority === priority) return item;
+        changed = true;
+        return { ...item, priority };
+      });
+      if (!changed) return;
+      this._persistGlobalUserTodos();
+      if (restoreFocus) {
+        this.$nextTick(() => {
+          const selector = `.session-todo-item[data-todo-id="${CSS.escape(id)}"] .session-todo-priority-select`;
+          this._focusWithoutScroll(document.querySelector(selector));
+        });
+      }
+    },
+    canMoveSessionTodo(item, delta) {
+      if (!item || !item.id || !delta) return false;
+      const peers = this.sessionTodosForPriority(item.priority);
+      const index = peers.findIndex(peer => peer.id === item.id);
+      const target = index + (delta < 0 ? -1 : 1);
+      return index >= 0 && target >= 0 && target < peers.length;
+    },
+    moveSessionTodoWithinPriority(id, delta) {
+      const items = this.sessionTodoItems().slice();
+      const source = items.findIndex(item => item.id === id);
+      if (source < 0 || !delta) return;
+      const priority = items[source].priority;
+      const peerIndexes = items.map((item, index) => item.priority === priority ? index : -1)
+        .filter(index => index >= 0);
+      const peerIndex = peerIndexes.indexOf(source);
+      const targetPeer = peerIndex + (delta < 0 ? -1 : 1);
+      if (targetPeer < 0 || targetPeer >= peerIndexes.length) return;
+      const target = peerIndexes[targetPeer];
+      [items[source], items[target]] = [items[target], items[source]];
+      this.userTodos = items;
+      this._persistGlobalUserTodos();
     },
     onSessionTodoDragStart(ev, item) {
       this.sessionTodoDragId = item.id;
@@ -11255,12 +12011,21 @@ function portal() {
     },
     toggleSessionTodoBoard() {
       if (this.sessionTodoOpen) this.closeSessionTodoBoard();
-      else this.sessionTodoOpen = true;
+      else {
+        const opener = document.activeElement;
+        this.sessionTodoOpen = true;
+        this._openFocusSurface(
+          "session-todo", ".session-todo-modal", ".session-todo-compose input",
+          opener, true,
+        );
+      }
     },
     closeSessionTodoBoard() {
+      const wasOpen = this.sessionTodoOpen;
       this.sessionTodoOpen = false;
       this.sessionTodoDraft = "";
       this.cancelSessionTodoEdit();
+      if (wasOpen) this._closeFocusSurface("session-todo");
     },
     taskLogLine(m) {
       if (!m || !m.name) return null;
@@ -12360,7 +13125,7 @@ function portal() {
       ].filter(Boolean);
     },
     toggleHistoryPicker(ev) {
-      if (this.sessionPickerOpen) { this.sessionPickerOpen = false; return; }
+      if (this.sessionPickerOpen) { this.closeHistoryPicker(); return; }
       const btn = ev && ev.currentTarget;
       const rect = btn ? btn.getBoundingClientRect() : null;
       if (rect) {
@@ -12376,9 +13141,19 @@ function portal() {
       }
       this.sessionPickerOpen = true;
       this.pickerGroupExpanded = {};  // reset collapse state on each open
+      this._openFocusSurface(
+        "history-picker", ".chat-tab-history .session-picker-pop",
+        ".session-picker-search", btn, false,
+      );
+    },
+    closeHistoryPicker(restoreFocus = true, cancelRename = true) {
+      if (!this.sessionPickerOpen && !this._focusSurfaceState["history-picker"]) return;
+      this.sessionPickerOpen = false;
+      if (cancelRename) this.pickerCancelInlineRename();
+      this._closeFocusSurface("history-picker", restoreFocus);
     },
     pickerOpenSession(sid) {
-      this.sessionPickerOpen = false;
+      this.closeHistoryPicker();
       // A search hit may live OUTSIDE the recent window, so its metadata isn't
       // in this.sessions yet — merge it in so the tab title / model resolve
       // immediately (the next _pullSessionList keeps it via ?ids=). Without
@@ -12416,7 +13191,7 @@ function portal() {
     },
     pickerRowMenu(ev, sid) {
       if (ev && ev.stopPropagation) ev.stopPropagation();
-      this.sessionPickerOpen = false;
+      this.closeHistoryPicker();
       this.showTabMenu(ev, sid);
     },
     // Inline rename inside the picker row (✎ icon). MUST be fully
@@ -12490,6 +13265,11 @@ function portal() {
       if (ev && ev.stopPropagation) ev.stopPropagation();
       const s = this.sessions.find(x => x.id === sid);
       const name = (s && s.name) || sid.slice(0, 8);
+      // The confirmation dialog is a separate modal surface. Close the picker
+      // first and make its still-visible trigger the focus owner; otherwise
+      // confirm/cancel tries to restore focus to a hidden row button.
+      this.closeHistoryPicker(false);
+      this._focusWithoutScroll(document.getElementById("history-picker-trigger"));
       const ok = await this.confirm({
         title: this.t("modal.delete_session_title"),
         body: this.t("modal.delete_session_body", { name }),
@@ -12518,7 +13298,7 @@ function portal() {
       // Close the picker popup first — its z-index (1500) sits ABOVE the global
       // confirm modal, so leaving it open would bury the confirm dialog behind
       // the session list. The popup has done its job once the action fires.
-      this.sessionPickerOpen = false;
+      this.closeHistoryPicker();
       // 1) Ask the server how many would be deleted (no mutation).
       let preview;
       try {
@@ -12594,7 +13374,7 @@ function portal() {
       const x = Math.min(cx, window.innerWidth - 220);
       const y = Math.min(cy, window.innerHeight - 200);
       setTimeout(() => {
-        this.sessionPickerOpen = false;
+        if (this.sessionPickerOpen) this.closeHistoryPicker();
         this.tabCtxMenu = { id, x, y };
       }, 0);
     },
@@ -12924,6 +13704,22 @@ function portal() {
         if (!r.ok) return;
         const d = await r.json();
         if (this.tabState[sid] !== st) return;
+        // A hard refresh reconstructs a rollover child from its own history,
+        // not from the in-memory handoff path. Restore the inherited watcher
+        // badge/poller from the presentation-only task overlay reported by
+        // /active; otherwise an ancestor-owned card stays "running" forever
+        // with no yellow dot until the user refreshes again after settlement.
+        const inheritedPending = Number(d.runtime_background_tasks_pending);
+        const sessionMeta = (this.sessions || []).find(row => row.id === sid);
+        const predecessorSid = String(
+          (sessionMeta && sessionMeta.runtime_predecessor) || "",
+        );
+        if (Number.isFinite(inheritedPending) && inheritedPending > 0
+            && predecessorSid) {
+          st.inheritedBackgroundOwner = predecessorSid;
+          st.inheritedBackgroundTaskCount = Math.floor(inheritedPending);
+          this._ensureInheritedTaskPoller(sid, predecessorSid);
+        }
         if (d.active && d.background && d.attachable === false) {
           st._serverActiveObserved = true;
           if (d.turn_id) st.activeTurnId = d.turn_id;
@@ -22346,8 +23142,13 @@ function portal() {
       const drain = () => {
         const job = queue.shift();
         if (!job) return;
-        Promise.resolve().then(job).catch(() => {});
-        if (queue.length) idle(drain);
+        // Do not schedule the next heavy parse until this job has settled.
+        // One idle callback per item alone is not enough: requestIdleCallback
+        // may run again while the previous asset is still downloading or
+        // evaluating, clustering hljs and KaTeX work on the main thread.
+        Promise.resolve().then(job).catch(() => {}).finally(() => {
+          if (queue.length) idle(drain);
+        });
       };
       idle(drain);
     },
@@ -24833,6 +25634,9 @@ function portal() {
       // Enter, claim the event here instead of using Alpine's `.prevent`
       // modifier, which would preventDefault even during composition.
       if (!this._claimNonImeEnter(ev)) return;
+      // Holding Enter emits repeated keydown events.  Once the first event has
+      // claimed this draft, later repeats must not become duplicate sends.
+      if (ev.repeat) return;
       if (this.mentionShow) { this.pickMention(); return; }
       // Newline-at-cursor for: Shift+Enter, Ctrl+Enter, Meta+Enter, and
       // touch devices (where bare Enter is a newline because send is via
@@ -25165,6 +25969,31 @@ function portal() {
       if (!sendSid) return false;
       if (sendSid === this.currentId) this._captureComposerState(sendSid);
       const sendState = this._ensureTabState(sendSid);
+      const isComposerSubmission = !opts.reconnect && !opts.resumedItem
+        && typeof opts.detachedText !== "string";
+      // Keep the ownership token primitive. Alpine proxies objects assigned to
+      // reactive state, which would break identity comparison in finally and
+      // leave the send button permanently locked after a successful submit.
+      const composerSubmitToken = opts._composerSubmitToken
+        || `composer-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      if (isComposerSubmission) {
+        if (sendState._composerSubmitToken
+            && sendState._composerSubmitToken !== composerSubmitToken) {
+          return false;
+        }
+        sendState._composerSubmitToken = composerSubmitToken;
+        sendState._composerSubmitting = true;
+      }
+      // `finally` must be able to release a composer claim after a proactive
+      // handoff replaces the source tabState. Keep this resolver in send()'s
+      // outer scope: declarations inside the `try` block are not visible from
+      // its sibling `finally` block in JavaScript.
+      const successorState = () => {
+        const childSid = String(sendState._backgroundSuccessorSid || "");
+        const child = childSid && this.tabState[childSid];
+        return child && child._handoffSourceSid === sendSid ? child : null;
+      };
+      try {
       // Stop is an acknowledged control handshake, not an idle gap.  Sending
       // while it is still settling used to enqueue a fresh message between the
       // interrupt endpoint's atomic pause and the turn cleanup's second pause;
@@ -25212,28 +26041,40 @@ function portal() {
         ? composerInput : this._composerPromptText(composerInput, composerQuotes);
       const ownsSendDraft = () => this.tabState[sendSid] === sendState
         && sendState.draft === sendDraft;
+      const ownsSubmittedDraft = state => !!(state
+        && state._composerSubmitToken === composerSubmitToken
+        && state.draft && state.draft.input === composerInput);
       const clearSubmittedComposer = ({ preserveForHandshake = false } = {}) => {
         if (hasDetachedText) return;
-        if (!ownsSendDraft()) return;
+        // A proactive background rollover can replace sourceState while this
+        // send awaits the queue POST. Settle whichever state currently owns
+        // the transferred primitive claim; never clear a newer draft.
+        const ownerState = ownsSendDraft() && ownsSubmittedDraft(sendState)
+          ? sendState : (ownsSubmittedDraft(successorState())
+            ? successorState() : null);
+        if (!ownerState) return;
+        const ownerSid = ownerState === sendState
+          ? sendSid : String(sendState._backgroundSuccessorSid || "");
+        const ownerDraft = ownerState.draft;
         if (preserveForHandshake) {
-          this._stageChatRecoveryDraft(sendSid, composerInput);
+          this._stageChatRecoveryDraft(ownerSid, composerInput);
         }
-        if (sendDraft.input === composerInput) sendDraft.input = "";
-        this._resetChatInputHistory(sendDraft);
+        if (ownerDraft.input === composerInput) ownerDraft.input = "";
+        this._resetChatInputHistory(ownerDraft);
         const removeOwned = (items, sent) => {
           for (let i = items.length - 1; i >= 0; i--) {
             if (sent.has(items[i])) items.splice(i, 1);
           }
         };
-        removeOwned(sendDraft.pendingImages, new Set(composerImages));
-        removeOwned(sendDraft.pendingDocs, new Set(composerDocs));
-        removeOwned(sendDraft.pendingQuotes, new Set(composerQuotes));
+        removeOwned(ownerDraft.pendingImages, new Set(composerImages));
+        removeOwned(ownerDraft.pendingDocs, new Set(composerDocs));
+        removeOwned(ownerDraft.pendingQuotes, new Set(composerQuotes));
         // Clearing the visible composer must not clear the durable backup
         // until the SSE handshake succeeds. A newer draft typed during an
         // await is persisted alongside that pending outgoing text.
-        this._persistChatDraft(sendSid, sendDraft.input);
-        if (sendSid === this.currentId) {
-          this._activateComposerState(sendSid);
+        this._persistChatDraft(ownerSid, ownerDraft.input);
+        if (ownerSid === this.currentId) {
+          this._activateComposerState(ownerSid);
           this.$nextTick(() => {
             if (this.$refs.chatInput) this.autoGrow(this.$refs.chatInput);
           });
@@ -25327,7 +26168,29 @@ function portal() {
       if (!isReconnect && !resumed && !hasDetachedText && text.startsWith("/")) {
         const m = text.match(/^\/(\w+)(?:\s+(.*))?$/);
         if (m) {
-          if (await this._confirmSessionBusy(sendSid, sendState)) {
+          const slashBusy = await this._confirmSessionBusy(sendSid, sendState);
+          if (slashBusy && !sendState.streaming && !sendState.compacting
+              && sendState.backgroundActive
+              && !opts._backgroundRolloverAttempted) {
+            const childSid = await this._handoffBackgroundSession(
+              sendSid, sendState);
+            if (childSid && childSid.sessionId) {
+              // Slash commands are stateful local operations and are never
+              // durable queue items. Do not let one overtake already accepted
+              // prompts migrated to the successor.
+              if (this._claimDetachedRolloverSlot(childSid)) {
+                this.toast(this.t("queue.slash_blocked"), "warn", 3000);
+                return false;
+              }
+              return await this.send({
+                ...opts,
+                sessionId: childSid.sessionId,
+                _backgroundRolloverAttempted: true,
+                _composerSubmitToken: composerSubmitToken,
+              });
+            }
+          }
+          if (slashBusy) {
             this.toast(this.t("queue.slash_blocked"), "warn", 3000);
             return;
           }
@@ -25424,8 +26287,14 @@ function portal() {
       // Busy: streaming OR compacting → park on the pinned session's queue.
       // Upload waiting and failure validation happen first so a programmatic
       // send can never enqueue a text-only fallback while its attachment fails.
-      if (!isReconnect && !resumed
-          && await this._confirmSessionBusy(sendSid, sendState)) {
+      const confirmedBusy = !isReconnect && !resumed
+        ? await this._confirmSessionBusy(sendSid, sendState)
+        : false;
+      if (confirmedBusy) {
+        const shouldHandoffBackground = !sendState.streaming
+          && !sendState.compacting
+          && sendState.backgroundActive
+          && !opts._backgroundRolloverAttempted;
         const ok = await this._enqueueMessage(sendSid, {
           text,
           displayText: composerInput,
@@ -25437,6 +26306,9 @@ function portal() {
         });
         if (!ok) return false;
         clearSubmittedComposer();
+        if (shouldHandoffBackground) {
+          this._scheduleBackgroundHandoff(sendSid, sendState);
+        }
         if (this.currentId === sendSid) {
           this.atBottom = true;
           this.scrollToBottom(true);
@@ -26660,6 +27532,7 @@ function portal() {
         const completedAtMs = Number(meta.completedAtMs) || 0;
         const durationMs = Number(meta.durationMs) || 0;
         const assistantUuid = String(meta.assistantUuid || "");
+        const completedTurnId = String(meta.turnId || "");
         const completedModel = String(
           meta.model || streamState.streamingModel || modelForBubble || "",
         );
@@ -26684,22 +27557,58 @@ function portal() {
         let tailCandidate = null;
         let stampedAssistant = null;
         let lastUserCandidate = null;
-        for (let k = turnMessages.length - 1; k >= 0; k--) {
-          const m = turnMessages[k];
-          if (m.role === "user") {
-            lastUserCandidate = m;
-            break;                               // entered the previous turn
+        // A server-started queued turn gives its optimistic user envelope the
+        // immutable turn id before replay starts. Prefer that exact boundary:
+        // handoff clones and a rapid queue chain can leave another turn at the
+        // array tail, so "walk back to the newest user" is not authoritative.
+        let exactUserIndex = -1;
+        if (completedTurnId) {
+          for (let k = turnMessages.length - 1; k >= 0; k--) {
+            const candidate = turnMessages[k];
+            if (candidate && candidate.role === "user"
+                && candidate._turnId === completedTurnId) {
+              exactUserIndex = k;
+              break;
+            }
           }
-          if (tailCandidate === null) tailCandidate = m;
-          // Skip tool blocks / standalone thinking; they're not the
-          // "reply" the user reads time off.
-          if (m.role !== "assistant") continue;
-          // An assistant bubble that already carries a stamp belongs to an
-          // earlier, finished turn — we've walked out of this one.
-          if (m.ts) break;
-          _stamp(m);                              // found the tail text bubble
-          stampedAssistant = m;
-          break;                                  // stop after the first one (most recent)
+        }
+        if (exactUserIndex >= 0) {
+          lastUserCandidate = turnMessages[exactUserIndex];
+          let exactTail = turnMessages.length - 1;
+          for (let k = exactUserIndex + 1; k < turnMessages.length; k++) {
+            if (turnMessages[k] && turnMessages[k].role === "user") {
+              exactTail = k - 1;
+              break;
+            }
+          }
+          for (let k = exactTail; k > exactUserIndex; k--) {
+            const m = turnMessages[k];
+            if (tailCandidate === null) tailCandidate = m;
+            if (!m || m.role !== "assistant") continue;
+            _stamp(m);
+            stampedAssistant = m;
+            break;
+          }
+        } else {
+          // Legacy/direct turns may not yet have a turn id on their user row.
+          // Retain the tail scan as a compatibility fallback.
+          for (let k = turnMessages.length - 1; k >= 0; k--) {
+            const m = turnMessages[k];
+            if (m.role === "user") {
+              lastUserCandidate = m;
+              break;                               // entered the previous turn
+            }
+            if (tailCandidate === null) tailCandidate = m;
+            // Skip tool blocks / standalone thinking; they're not the
+            // "reply" the user reads time off.
+            if (m.role !== "assistant") continue;
+            // An assistant bubble that already carries a stamp belongs to an
+            // earlier, finished turn — we've walked out of this one.
+            if (m.ts) break;
+            _stamp(m);                              // found the tail text bubble
+            stampedAssistant = m;
+            break;                                  // stop after the first one (most recent)
+          }
         }
         // An interrupt/error can land before the SDK emits any muse-side
         // block.  Stamp that turn's user envelope so the terminal footer does
@@ -26852,6 +27761,7 @@ function portal() {
         );
         es.close();
         _markDone(!!d.cancelled, backgroundPending, true, {
+          turnId: completedTurnId,
           assistantUuid: d.assistant_uuid,
           completedAtMs: d.completed_at_ms,
           durationMs: d.duration_ms,
@@ -26861,6 +27771,15 @@ function portal() {
           memoryRecall: d.memory_recall,
         });
         _stopTimer();
+        // The main reply has reached its durable boundary, but a detached SDK
+        // task can keep the source runtime alive for minutes. Publish the
+        // handoff intent before the quiet session-list pull below: the backend
+        // may already hide an eagerly-forked predecessor, and the tab must not
+        // blink out while the browser adopts that successor. Continuation
+        // turns are reactions on the source runtime and never fork again.
+        if (backgroundPending > 0 && !isContinuation && !d.cancelled) {
+          this._scheduleBackgroundHandoff(streamSid, streamState);
+        }
         if (d.is_error && !d.cancelled && d.snapshot_ready) {
           // A terminal failure's private display snapshot owns both any valid
           // partial answer and the separate error bubble. Adopt it only after
@@ -27393,6 +28312,19 @@ function portal() {
       // readyState === CLOSED and call _markDone() prematurely, flipping the
       // turn to "done" (input re-enabled, footer stamped, unread dot) ~800ms
       // before the reconnect restored streaming. Removing it stops that flicker.
+      } finally {
+        if (isComposerSubmission) {
+          const owners = [
+            this.tabState[sendSid] === sendState ? sendState : null,
+            successorState(),
+          ];
+          for (const owner of owners) {
+            if (!owner || owner._composerSubmitToken !== composerSubmitToken) continue;
+            owner._composerSubmitToken = null;
+            owner._composerSubmitting = false;
+          }
+        }
+      }
     },
     async stop() {
       // Stop has exactly one meaning: interrupt the active turn for the current
@@ -28170,17 +29102,24 @@ function portal() {
           }
         } catch (_) {}
       }
+      const opener = document.activeElement;
       this.activity.show = true;
       this.activity.loading = true;
+      this._openFocusSurface(
+        "activity", ".activity-modal", ".activity-searchbar input",
+        opener, true,
+      );
       await this.fetchActivity();
       this.activity.loading = false;
     },
     closeActivityCenter() {
+      const wasOpen = this.activity.show;
       this.activity.show = false;
       this.closeActivityMoveMenu();
       this.cancelActivityGroupEditor();
       this.onActivityDragEnd();
       this.onActivityGroupOrderDragEnd();
+      if (wasOpen) this._closeFocusSurface("activity");
     },
     setActivityView(view) {
       if (!["status", "groups", "timeline"].includes(view)) return;
@@ -28298,6 +29237,10 @@ function portal() {
       return (this.activity.events || []).filter(item => this.activityMatchesSearch(item)).length;
     },
     clearActivitySearch() {
+      if (!this.activitySearchQuery()) {
+        this.closeActivityCenter();
+        return;
+      }
       this.activity.query = "";
     },
     activityEventTimestamp(item) {
@@ -29271,7 +30214,12 @@ function portal() {
 
     // ===== scheduler drawer =====
     async openScheduler() {
+      const opener = document.activeElement;
       this.scheduler.show = true;
+      this._openFocusSurface(
+        "scheduler", ".sched-modal", ".sched-input-name",
+        opener, true,
+      );
       await this.loadSchedulerTasks();
       await this.loadSchedulerHistory();
       // Opening the drawer = user has seen unread results. Server-side
@@ -29284,7 +30232,11 @@ function portal() {
         this.scheduler.draft.model = this.model || "";
       }
     },
-    closeScheduler() { this.scheduler.show = false; },
+    closeScheduler() {
+      const wasOpen = this.scheduler.show;
+      this.scheduler.show = false;
+      if (wasOpen) this._closeFocusSurface("scheduler");
+    },
     _resetSchedDraft() {
       this.scheduler.draft = {
         editingId: null,

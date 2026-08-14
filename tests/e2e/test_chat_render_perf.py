@@ -3450,6 +3450,204 @@ def test_desktop_cancelled_snapshot_reconcile_never_blanks_or_replaces_live_node
     _assert_no_browser_errors(page, errors)
 
 
+def test_fast_completed_queued_turn_reconciles_footer_without_refresh(
+    page: Page, backend_url, auth_token,
+):
+    """A queued turn that finishes before attach falls back to quiet history."""
+    errors = _capture_browser_errors(page)
+    page.set_viewport_size({"width": 1440, "height": 900})
+    sid = "fast-completed-queued-footer"
+    completed_at_ms = int(time.time() * 1000)
+    history_requests: list[str] = []
+
+    page.route(
+        f"**/api/chat/sessions/{sid}/queue",
+        lambda route: route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({"items": [], "paused": False, "revision": 2}),
+        ),
+    )
+    page.route(
+        f"**/api/chat/sessions/{sid}/active",
+        lambda route: route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({
+                "active": False,
+                "activity_source": "queued",
+                "background_tasks_pending": 0,
+            }),
+        ),
+    )
+
+    def canonical_history(route):
+        history_requests.append(route.request.url)
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({
+                "id": sid,
+                "name": "Fast queued footer",
+                "model": "e2e-model",
+                "permission": "bypassPermissions",
+                "thinking": True,
+                "updated_at": completed_at_ms / 1000,
+                "messages": [
+                    {
+                        "role": "user",
+                        "text": "FAST_QUEUED_PROMPT",
+                        "uuid": "fast-queued-user",
+                    },
+                    {
+                        "role": "assistant",
+                        "text": "FAST_QUEUED_REPLY",
+                        "uuid": "fast-queued-assistant",
+                        "ts": completed_at_ms,
+                        "elapsed": 4.2,
+                        "model": "e2e-model",
+                        "turn_status": "completed",
+                    },
+                ],
+                "offset": 0,
+                "total": 2,
+                "has_more": False,
+                "history_generation": "fast-queued-footer-e2e",
+            }),
+        )
+
+    page.route(f"**/api/chat/sessions/{sid}?*", canonical_history)
+    _login(page, backend_url, auth_token)
+    _app_eval(
+        page,
+        """
+        const sid = arg.sid;
+        if (app._sessionsSyncTimer) clearInterval(app._sessionsSyncTimer);
+        app._sessionsSyncTimer = null;
+        app.refreshSessions = async () => {};
+        app._syncSessionListQuiet = async () => false;
+        app._fetchTabUsage = async () => {};
+        app._checkActiveTurn = () => {};
+        app._scheduleIdlePreload = () => {};
+        app.appReady = true;
+        app.availableModels = [{
+          model: 'e2e-model', label: 'E2E model', group: 'e2e',
+          supports_thinking: true,
+        }];
+        app.sessions = [{
+          id: sid, name: 'Fast queued footer', updated_at: 1,
+          model: 'e2e-model', permission: 'bypassPermissions', thinking: true,
+        }];
+        app.openTabIds = [sid];
+        app.tabState = {};
+        app.tabState[sid] = app._blankTabState();
+        const st = app._ensureTabState(sid);
+        st.messages.push(...app._historyEnvelopes(sid, [{
+          role: 'assistant', text: 'KEEP_VISIBLE_DURING_RECONCILE',
+          html: '<p>KEEP_VISIBLE_DURING_RECONCILE</p>',
+          uuid: 'prior-visible-assistant', ts: Date.now() - 10000,
+          elapsed: 2, model: 'e2e-model', turn_status: 'completed',
+        }]));
+        st._loaded = true;
+        st._seenUpdated = 1;
+        st._draining = true;
+        st.messagesReady = true;
+        app.currentId = sid;
+        app._residentTabIds = [sid];
+        app._activateTabState(sid);
+        app.messagesReady = true;
+        app.messagesLoading = false;
+        app.mobileTab = 'chat';
+        return true;
+        """,
+        {"sid": sid},
+    )
+    page.wait_for_function(
+        """([sid]) => {
+          const pane = document.querySelector(
+            `.msg-pane[data-tid="${CSS.escape(sid)}"]`);
+          return pane?.textContent.includes('KEEP_VISIBLE_DURING_RECONCILE');
+        }""",
+        arg=[sid],
+    )
+    _app_eval(
+        page,
+        """
+        const sid = arg;
+        const pane = document.querySelector(
+          `.msg-pane[data-tid="${CSS.escape(sid)}"]`);
+        window.__fastQueueMinMessages = pane.querySelectorAll('.msg').length;
+        window.__fastQueueObserver = new MutationObserver(() => {
+          const current = document.querySelector(
+            `.msg-pane[data-tid="${CSS.escape(sid)}"]`);
+          const count = current ? current.querySelectorAll('.msg').length : 0;
+          window.__fastQueueMinMessages = Math.min(
+            window.__fastQueueMinMessages, count);
+        });
+        window.__fastQueueObserver.observe(
+          document.querySelector('#app'), {childList: true, subtree: true});
+        window.__fastQueueAttach = app._attachToServerTurn(
+          sid, 2, 'previous-completed-turn');
+        return true;
+        """,
+        sid,
+    )
+    page.evaluate("() => window.__fastQueueAttach")
+    page.wait_for_function(
+        """([sid, completedAt]) => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const st = app.tabState[sid];
+          const tail = st?.messages?.[st.messages.length - 1];
+          return tail?.uuid === 'fast-queued-assistant'
+            && tail.ts === completedAt && tail.turn_status === 'completed'
+            && st._draining === false;
+        }""",
+        arg=[sid, completed_at_ms],
+        timeout=5000,
+    )
+    result = _app_eval(
+        page,
+        """
+        window.__fastQueueObserver.disconnect();
+        const st = app.tabState[arg];
+        return {
+          minMessages: window.__fastQueueMinMessages,
+          ready: st.messagesReady,
+          loading: st.messagesLoading,
+          streaming: st.streaming,
+        };
+        """,
+        sid,
+    )
+    assert history_requests, "completed queued turn did not pull canonical history"
+    assert result == {
+        "minMessages": 1,
+        "ready": True,
+        "loading": False,
+        "streaming": False,
+    }
+    footer = page.locator(
+        f'.msg-pane[data-tid="{sid}"] .turn-footer'
+    ).last
+    expect(footer).to_be_visible()
+    expected_time = _app_eval(
+        page, "return app.fmtTurnTime(arg);", completed_at_ms
+    )
+    expected_status = _app_eval(
+        page, "return app.lang === 'zh' ? '已完成' : 'Completed';"
+    )
+    expect(footer.locator(".turn-status > span").first).to_have_text(
+        expected_status
+    )
+    expect(footer.locator(".msg-ts")).to_have_text(expected_time)
+    expect(footer.locator(".msg-elapsed")).to_have_text("· 4s")
+    expected_model = _app_eval(
+        page, "return '· ' + app.modelLabel(arg);", "e2e-model"
+    )
+    expect(footer.locator(".turn-model")).to_have_text(expected_model)
+    _assert_no_browser_errors(page, errors)
+
+
 def test_tool_result_tail_done_metadata_renders_footer_before_canonical_reload(
     page: Page, backend_url, auth_token,
 ):
@@ -3714,7 +3912,9 @@ def test_tool_result_tail_done_metadata_renders_footer_before_canonical_reload(
     expect(footer.locator(".msg-ts")).to_have_text(expected_time)
     expect(footer.locator(".msg-elapsed")).to_have_text("· 2m05s")
     expect(footer.locator(".turn-model")).to_have_text("· E2E model")
-    expect(footer.locator(".turn-status")).to_have_text(expected_status)
+    expect(footer.locator(".turn-status > span").first).to_have_text(
+        expected_status
+    )
     recall_trigger = footer.locator(".memory-recall-trace")
     expect(recall_trigger).to_be_visible()
     expect(footer.locator(".turn-fork-btn")).to_be_visible()

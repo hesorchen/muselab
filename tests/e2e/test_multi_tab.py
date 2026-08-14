@@ -397,6 +397,259 @@ def test_send_upload_wait_is_owned_by_starting_tab(
     assert settled == [False, False, False]
 
 
+def test_repeated_enter_while_background_busy_submits_one_draft(
+        page: Page, backend_url, auth_token):
+    """Rapid and repeated Enter events share one composer submission claim."""
+    _login(page, backend_url, auth_token)
+    textarea = page.locator(".chat-input-textarea")
+    textarea.fill("ONLY_ONCE")
+    page.wait_for_function(
+        "() => document.querySelector('#app')._x_dataStack[0].input === 'ONLY_ONCE'")
+
+    page.evaluate(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const sid = app.currentId;
+          const st = app._ensureTabState(sid);
+          app.availableModels = [{model: 'fake-model', group: 'test'}];
+          st.backgroundActive = true;
+          st.streaming = false;
+          st.compacting = false;
+          app._awaitRuntimeSettingPatches = async () => true;
+          window.__busyProbeCalls = 0;
+          window.__busyGate = new Promise(resolve => { window.__releaseBusy = resolve; });
+          app._confirmSessionBusy = async () => {
+            window.__busyProbeCalls += 1;
+            await window.__busyGate;
+            return true;
+          };
+          window.__queuedDrafts = [];
+          app._enqueueMessage = async (_sid, item) => {
+            window.__queuedDrafts.push({text: item.text, displayText: item.displayText});
+            return true;
+          };
+          app._handoffBackgroundSession = () => new Promise(
+            resolve => { window.__releaseHandoff = resolve; });
+          app._attachToServerTurn = () => {};
+
+          const target = document.querySelector('.chat-input-textarea');
+          for (let i = 0; i < 5; i += 1) {
+            target.dispatchEvent(new KeyboardEvent('keydown', {
+              key: 'Enter', code: 'Enter', bubbles: true, cancelable: true,
+              repeat: i >= 2,
+            }));
+          }
+        }"""
+    )
+    page.wait_for_function("() => window.__busyProbeCalls === 1")
+    assert page.evaluate(
+        "() => document.querySelector('#app')._x_dataStack[0]"
+        ".tabState[document.querySelector('#app')._x_dataStack[0].currentId]"
+        "._composerSubmitting") is True
+    expect(page.locator(".chat-toolbar-queue")).to_be_disabled()
+
+    page.evaluate("() => window.__releaseBusy()")
+    page.wait_for_function("() => window.__queuedDrafts.length === 1")
+    page.wait_for_function(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          return app.tabState[app.currentId]._composerSubmitting === false;
+        }"""
+    )
+    result = page.evaluate(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const st = app.tabState[app.currentId];
+          window.__releaseHandoff(null);
+          return {
+            queued: window.__queuedDrafts,
+            input: app.input,
+            draft: st.draft.input,
+          };
+        }"""
+    )
+    assert result == {
+        "queued": [{"text": "ONLY_ONCE", "displayText": "ONLY_ONCE"}],
+        "input": "",
+        "draft": "",
+    }
+
+
+def test_background_send_resolves_before_runtime_handoff(
+        page: Page, backend_url, auth_token):
+    """Queue commit is synchronous; the expensive runtime fork is not."""
+    _login(page, backend_url, auth_token)
+    page.locator(".chat-input-textarea").fill("QUEUE_FIRST")
+    page.wait_for_function(
+        "() => document.querySelector('#app')._x_dataStack[0].input === 'QUEUE_FIRST'")
+    page.evaluate(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const st = app._ensureTabState(app.currentId);
+          app.availableModels = [{model: 'fake-model', group: 'test'}];
+          st.backgroundActive = true;
+          st.streaming = false;
+          st.compacting = false;
+          app._awaitRuntimeSettingPatches = async () => true;
+          app._confirmSessionBusy = async () => true;
+          window.__sendOrder = [];
+          window.__queueGate = new Promise(resolve => { window.__releaseQueue = resolve; });
+          window.__handoffGate = new Promise(resolve => { window.__releaseHandoff = resolve; });
+          app._enqueueMessage = async () => {
+            window.__sendOrder.push('enqueue:start');
+            await window.__queueGate;
+            window.__sendOrder.push('enqueue:committed');
+            return true;
+          };
+          app._handoffBackgroundSession = async () => {
+            window.__sendOrder.push('handoff:start');
+            await window.__handoffGate;
+            return null;
+          };
+          app._attachToServerTurn = () => {};
+          window.__backgroundSend = app.send();
+        }"""
+    )
+    page.wait_for_function("() => window.__sendOrder[0] === 'enqueue:start'")
+    assert page.evaluate("() => window.__sendOrder") == ["enqueue:start"]
+
+    resolved = page.evaluate(
+        """async () => {
+          window.__releaseQueue();
+          return await Promise.race([
+            window.__backgroundSend,
+            new Promise(resolve => setTimeout(() => resolve('timed-out'), 300)),
+          ]);
+        }"""
+    )
+    assert resolved is True
+    page.wait_for_function(
+        "() => window.__sendOrder.includes('handoff:start')")
+    state = page.evaluate(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          return {
+            order: window.__sendOrder,
+            input: app.input,
+            submitting: app.tabState[app.currentId]._composerSubmitting,
+          };
+        }"""
+    )
+    assert state == {
+        "order": ["enqueue:start", "enqueue:committed", "handoff:start"],
+        "input": "",
+        "submitting": False,
+    }
+    page.evaluate("() => window.__releaseHandoff()")
+
+
+def test_background_handoff_during_queue_post_settles_successor_composer(
+        page: Page, backend_url, auth_token):
+    """A proactive rollover cannot leave a cloned draft locked or resendable."""
+    _login(page, backend_url, auth_token)
+    page.locator(".chat-input-textarea").fill("RACE_ONCE")
+    page.wait_for_function(
+        "() => document.querySelector('#app')._x_dataStack[0].input === 'RACE_ONCE'")
+
+    page.evaluate(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const sourceSid = app.currentId;
+          const source = app._ensureTabState(sourceSid);
+          app.availableModels = [{model: 'fake-model', group: 'test'}];
+          source.backgroundActive = true;
+          source.streaming = false;
+          source.compacting = false;
+          app._awaitRuntimeSettingPatches = async () => true;
+          window.__busyProbeCalls = 0;
+          app._confirmSessionBusy = async () => {
+            window.__busyProbeCalls += 1;
+            return true;
+          };
+          window.__queueCalls = 0;
+          window.__queueGate = new Promise(resolve => { window.__releaseQueue = resolve; });
+          window.__acceptedQueueItem = {
+            id: 'q-race', text: 'RACE_ONCE', display_text: 'RACE_ONCE',
+            image_ids: '', selection_quotes: [], enqueued_at: Date.now(),
+          };
+          const originalFetch = window.fetch.bind(window);
+          window.fetch = async (url, init = {}) => {
+            const value = String(url);
+            if (value.includes('/api/chat/sessions/') && value.endsWith('/queue')) {
+              if ((init.method || 'GET').toUpperCase() === 'POST') {
+                window.__queueCalls += 1;
+                await window.__queueGate;
+                return new Response(JSON.stringify({
+                  item: window.__acceptedQueueItem,
+                  queue: {revision: 7},
+                }), {status: 200, headers: {'Content-Type': 'application/json'}});
+              }
+              return new Response(JSON.stringify({
+                revision: 7, paused: false,
+                items: [window.__acceptedQueueItem],
+              }), {status: 200, headers: {'Content-Type': 'application/json'}});
+            }
+            return originalFetch(url, init);
+          };
+          app._handoffBackgroundSession = async (sid, st) => {
+            const childSid = 'successor-race';
+            const child = app._stateForDetachedSuccessor(sid, childSid, st, 1);
+            st._backgroundSuccessorSid = childSid;
+            app.tabState[childSid] = child;
+            app.sessions = app.sessions
+              .filter(row => row.id !== sid && row.id !== childSid)
+              .concat([{id: childSid, name: 'successor', model: 'fake-model'}]);
+            app.openTabIds = app.openTabIds.map(id => id === sid ? childSid : id);
+            app.currentId = childSid;
+            app._activateTabState(childSid);
+            delete app.tabState[sid];
+            return {sessionId: childSid, queuePending: true, rolledOver: true};
+          };
+          window.__attachSids = [];
+          app._attachToServerTurn = sid => { window.__attachSids.push(sid); };
+          window.__raceSend = app.send();
+          window.__sourceSid = sourceSid;
+        }"""
+    )
+    page.wait_for_function("() => window.__queueCalls === 1")
+    page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          await app._handoffBackgroundSession(window.__sourceSid,
+            app.tabState[window.__sourceSid]);
+        }"""
+    )
+    before = page.evaluate(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const st = app.tabState[app.currentId];
+          return {input: app.input, draft: st.draft.input,
+                  submitting: st._composerSubmitting};
+        }"""
+    )
+    assert before == {"input": "RACE_ONCE", "draft": "RACE_ONCE", "submitting": True}
+
+    result = page.evaluate(
+        """async () => {
+          window.__releaseQueue();
+          await window.__raceSend;
+          await new Promise(resolve => setTimeout(resolve, 0));
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const st = app.tabState[app.currentId];
+          return {input: app.input, draft: st.draft.input,
+                  submitting: st._composerSubmitting,
+                  token: st._composerSubmitToken, queueCalls: window.__queueCalls,
+                  queueIds: st.pendingQueue.map(item => item.id),
+                  attachSids: window.__attachSids};
+        }"""
+    )
+    assert result == {
+        "input": "", "draft": "", "submitting": False,
+        "token": None, "queueCalls": 1, "queueIds": ["q-race"],
+        "attachSids": ["successor-race"],
+    }
+
+
 def test_queue_edit_restores_original_tab_during_switch(
         page: Page, backend_url, auth_token):
     _login(page, backend_url, auth_token)

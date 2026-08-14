@@ -1593,8 +1593,8 @@ def test_chat_header_exposes_authenticated_session_todo_board():
     assert "toggleSessionUserTodo(id)" in app
     assert "deleteSessionUserTodo(id)" in app
     assert "startSessionTodoEdit(item, ev)" in app
-    assert "saveSessionTodoEdit(id = this.sessionTodoEditId)" in app
-    assert "cancelSessionTodoEdit()" in app
+    assert "saveSessionTodoEdit(id = this.sessionTodoEditId, restoreFocus = false)" in app
+    assert "cancelSessionTodoEdit(restoreFocus = false)" in app
     assert "sessionTodosForPriority(priority)" in app
     assert "sessionTodoIndicatorPriority()" in app
     assert 'item.priority === "high"' in app
@@ -1628,14 +1628,18 @@ def test_chat_header_exposes_authenticated_session_todo_board():
     assert '@dblclick.prevent="startSessionTodoEdit(item, $event)"' in html
     assert ':draggable="sessionTodoEditId !== item.id"' in html
     assert 'class="session-todo-edit"' in html
-    assert '@keydown.enter.prevent="saveSessionTodoEdit(item.id)"' in html
-    assert '@keydown.escape.stop.prevent="cancelSessionTodoEdit()"' in html
+    assert '@keydown.enter="if (_claimNonImeEnter($event)) saveSessionTodoEdit(item.id, true)"' in html
+    assert "cancelSessionTodoEdit(true)" in html
+    assert '@compositionstart="onLocalImeCompositionStart($event)"' in html
+    assert '@compositionend="onLocalImeCompositionEnd($event)"' in html
+    assert '@keydown="onLocalImeKeydown($event)"' in html
     assert '@blur="saveSessionTodoEdit(item.id)"' in html
     assert '@dragstart="onSessionTodoDragStart($event, item)"' in html
     assert '@drop="onSessionTodoDrop($event, priority)"' in html
     assert '@drop.stop="onSessionTodoDrop($event, priority, item.id)"' in html
     assert '@click="toggleSessionUserTodo(item.id)"' in html
     assert '@click="deleteSessionUserTodo(item.id)"' in html
+    assert '@keydown.tab="trapDialogFocus($event, \'session-todo\')"' in html
     assert ".session-todo-modal" in css
     assert ".modal.session-todo-modal" in css
     assert "width:min(1040px,calc(100vw - 64px))" in css
@@ -1861,7 +1865,7 @@ def test_stop_control_interrupts_session_and_never_removes_queue_items():
     assert "chat-toolbar-stop" in html
     assert "tabState[currentId]?._stopping" in html
     assert "等待上一条任务完成中断" in html
-    assert "_isBusy(currentId) ? t('queue.button_hint') : t('btn.send')" in html
+    assert "sendButtonHint(currentId)" in html
     assert "撤回队尾" not in html
     assert "removePendingQueueItem" not in stop
     assert "if (st._stopping) return" in stop
@@ -1890,7 +1894,7 @@ def test_stop_control_interrupts_session_and_never_removes_queue_items():
     assert "this.isTabStreaming(this.currentId)" in app
 
 
-def test_background_task_gap_stops_footer_and_routes_composer_to_queue():
+def test_background_task_gap_rolls_foreground_onto_detached_successor():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
     html = (FRONTEND / "index.html").read_text(encoding="utf-8")
     css = (FRONTEND / "styles.css").read_text(encoding="utf-8")
@@ -1898,14 +1902,36 @@ def test_background_task_gap_stops_footer_and_routes_composer_to_queue():
 
     assert "backgroundActive: false" in app
     assert "backgroundTaskCount: 0" in app
+    helper_start = app.index("    turnHasPendingBackground(")
+    helper_end = app.index("\n    turnFooterTime(", helper_start)
+    helper = app[helper_start:helper_end]
+    assert "isLatest" in helper
+    assert "pane.backgroundActive || pane.inheritedBackgroundTaskCount > 0" in helper
+    assert "&& !pane.streaming" in helper
+    assert "!m._failed && !m._interrupted" in helper
+    assert 'this.turnFooterStatus(m, pane) === "completed"' in helper
+    assert "turn_status =" not in helper
     # A pending background task keeps its card alive without extending the
-    # completed turn's footer timer. The composer remains editable, but send()
-    # detects the watcher and persists the message in FIFO until it settles.
-    assert "|| (st && st.compacting));" in app
-    assert "if (st && (st.streaming || st.compacting)) return true;" in app
+    # completed turn's footer timer. A fresh foreground send transparently
+    # rolls onto an isolated successor instead of waiting for that task.
+    assert "st.compacting || st.backgroundActive || st._draining" in app
+    assert "st.streaming || st.compacting || st.backgroundActive" in app
+    assert "st._draining || (st.pendingQueue && st.pendingQueue.length)" in app
     assert "if (status.background) return true;" in app
+    assert "async _handoffBackgroundSession(" in app
+    assert "/continue-detached`" in app
+    assert "_stateForDetachedSuccessor(" in app
+    assert "_backgroundRolloverAttempted" in app
+    assert "owner_session_id" in app
+    # A second browser may refresh its list after the first browser hid the
+    # predecessor. Its still-open tab must trust the local watcher flag and
+    # probe /active instead of attempting a turn on the missing source row.
+    assert "&& !(st && st.backgroundActive)" in app
     assert "d.background && d.attachable === false" in app
     assert "background_tasks_pending" in app
+    poller_start = app.index("    _ensureBgContPoller(sid) {")
+    poller_end = app.index("\n    _stopBgContPoller(", poller_start)
+    assert "let ticksLeft = 1810;" in app[poller_start:poller_end]
     assert "_stopTimer();" in app
     assert "_continuationAwaitingReaction: false" in app
     # The turn footer must key off a REAL streaming turn. It used to also
@@ -1913,6 +1939,11 @@ def test_background_task_gap_stops_footer_and_routes_composer_to_queue():
     # of every turn that finished while a background task was still pending.
     assert "pane && pane.streaming && i === paneMsgs.length - 1" in html
     assert "pane.streaming || pane.backgroundActive" not in html
+    assert "i === paneMsgs.length - 1" in html
+    assert "t('chat.main_response_completed')" in html
+    assert "t('chat.background_running_count'" in html
+    assert 'class="queued-background-wait"' not in html
+    assert "t('queue.waiting_background_tasks'" not in html
     # The "background task running · messages will queue" strip is gone: it
     # told the user they could not keep talking, which is no longer true.
     assert "background-task-strip" not in html
@@ -1920,6 +1951,11 @@ def test_background_task_gap_stops_footer_and_routes_composer_to_queue():
     assert "isTabRunning(tid)" in html
     assert "isTabBackgroundActive(tid)" in html
     assert '"chat.background_running": "后台任务运行中"' in i18n
+    assert '"chat.main_response_completed": "主回复完成"' in i18n
+    hint_start = app.index("    sendButtonHint(sid) {")
+    hint_end = app.index("\n    async _confirmSessionBusy", hint_start)
+    assert "this.isTabBackgroundActive(sid)" not in app[hint_start:hint_end]
+    assert '"queue.waiting_background_tasks": "等待 {count} 个后台任务"' in i18n
     assert "if (streamState.es === es) streamState.es = null" in app
     assert "d.background && d.attachable === false" in app
     assert "continuation: !!d.continuation" in app
@@ -1931,6 +1967,108 @@ def test_background_task_gap_stops_footer_and_routes_composer_to_queue():
     assert 'Object.prototype.hasOwnProperty.call(s, "turn_active")' in app
     assert "return !!s.turn_active" in app
     assert "return !!(s && s.background_active)" in app
+
+
+def test_inherited_task_poller_uses_pending_count_not_source_active_ttl():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    start = app.index("    _ensureInheritedTaskPoller(")
+    end = app.index("\n    // Poll /active + re-subscribe", start)
+    poller = app[start:end]
+
+    assert "status.runtime_background_tasks_pending" in poller
+    assert "?? status.background_tasks_pending" in poller
+    assert "reported !== 0" in poller
+    assert "status.active || st.streaming" not in poller
+    assert "if (st.streaming || st.es || st.compacting) return;" in poller
+    assert "quiet: true, probeActive: false" in poller
+    assert 'st.inheritedBackgroundTaskCount = 0' in poller
+
+    # A reloaded successor never ran the live handoff initializer. Its normal
+    # active probe must rebuild inherited ownership from durable session meta
+    # and the overlay aggregate, then arm the same poller.
+    check_start = app.index("    async _checkActiveTurn(sid) {")
+    check_end = app.index("\n    // Hover-prefetch", check_start)
+    check = app[check_start:check_end]
+    assert "d.runtime_background_tasks_pending" in check
+    assert "sessionMeta.runtime_predecessor" in check
+    assert "st.inheritedBackgroundTaskCount = Math.floor(inheritedPending)" in check
+    assert "this._ensureInheritedTaskPoller(sid, predecessorSid)" in check
+
+
+def test_detached_rollover_preserves_migrated_queue_fifo():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    handoff_start = app.index("    async _handoffBackgroundSession(")
+    handoff_end = app.index("\n    _ensureInheritedTaskPoller(", handoff_start)
+    handoff = app[handoff_start:handoff_end]
+    send_start = app.index("    async send(opts = {}) {")
+    send_end = app.index("\n    // ====== ask_user_question", send_start)
+    send = app[send_start:send_end]
+
+    assert "await this._syncQueueFromServer(childSid)" in handoff
+    assert "Number(payload.queue_migrated) > 0" in handoff
+    assert "payload.target_queue_depth" in handoff
+    assert "?? payload.queue_depth" in handoff
+    assert "?? payload.queue_pending" in handoff
+    assert "childState.pendingQueue.length > 0" in handoff
+    assert "return { sessionId: childSid, queuePending, rolledOver: true };" in handoff
+    # Ordinary messages commit to the source's durable queue before the
+    # expensive transcript fork. The backend migrates that accepted item in
+    # FIFO order; the browser handoff is non-blocking presentation work.
+    busy = send[send.index("const confirmedBusy ="):]
+    busy = busy[:busy.index("// Push to the SENDING tab's messages array")]
+    assert "await this._enqueueMessage(sendSid" in busy
+    assert "clearSubmittedComposer();" in busy
+    assert "this._scheduleBackgroundHandoff(sendSid, sendState);" in busy
+    assert "await this._handoffBackgroundSession" not in busy
+    assert busy.index("await this._enqueueMessage(sendSid") < busy.index(
+        "this._scheduleBackgroundHandoff(sendSid, sendState);"
+    )
+    # Stateful slash commands cannot be represented in the durable queue and
+    # therefore wait instead of overtaking migrated prompts.
+    slash = send[send.index("const slashBusy ="):send.index("let readyImages", send.index("const slashBusy ="))]
+    assert "if (this._claimDetachedRolloverSlot(childSid))" in slash
+    assert 'this.toast(this.t("queue.slash_blocked")' in slash
+    claim_start = app.index("    _claimDetachedRolloverSlot(")
+    claim_end = app.index("\n    async _handoffBackgroundSession", claim_start)
+    claim = app[claim_start:claim_end]
+    assert "return !!(handoff && handoff.rolledOver);" in claim
+    assert "_rolloverLaunchClaimed" not in claim
+
+
+def test_composer_send_has_a_per_session_reentry_guard():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    send_start = app.index("    async send(opts = {}) {")
+    send_end = app.index("\n    // ====== ask_user_question", send_start)
+    send = app[send_start:send_end]
+
+    assert "_composerSubmitting: false" in app
+    assert "_composerSubmitToken: null" in app
+    assert "if (sendState._composerSubmitToken" in send
+    assert "sendState._composerSubmitting = true;" in send
+    assert "} finally {" in send
+    assert "owner._composerSubmitting = false;" in send
+    assert send.index("sendState._composerSubmitting = true;") < send.index(
+        "await this._awaitRuntimeSettingPatches(sendSid, sendState)"
+    )
+    assert "if (ev.repeat) return;" in app
+    assert "tabState[currentId]?._composerSubmitting" in html
+    assert ':aria-busy="!!tabState[currentId]?._composerSubmitting"' in html
+    enqueue_start = app.index("    async _enqueueMessage(sid, item) {")
+    enqueue_end = app.index("\n    // Post-turn / on-activate hook", enqueue_start)
+    enqueue = app[enqueue_start:enqueue_end]
+    assert "accepted = await r.json()" in enqueue
+    assert "this._syncQueueFromServer(sid);" in enqueue
+    assert "await this._syncQueueFromServer(sid);" not in enqueue
+
+    # A done event with detached work rolls over proactively, and an in-flight
+    # queue POST transfers its primitive composer claim to that successor.
+    assert "if (backgroundPending > 0 && !isContinuation && !d.cancelled)" in send
+    assert "this._scheduleBackgroundHandoff(streamSid, streamState);" in send
+    assert "_backgroundSuccessorSid: \"\"" in app
+    assert "child._composerSubmitToken = sourceState._composerSubmitToken || null;" in app
+    assert "const successorState = () =>" in send
+    assert "successorState()," in send
 
 
 def test_attachment_uploads_have_deadlines_and_never_log_filenames():
@@ -1986,7 +2124,7 @@ def test_send_pins_owner_waits_before_enqueue_and_blocks_failed_attachments():
     assert "const composerImages = hasDetachedText ? [] : sendDraft.pendingImages.slice()" in send
     assert "const composerDocs = hasDetachedText ? [] : sendDraft.pendingDocs.slice()" in send
     assert "const clearSubmittedComposer = ({ preserveForHandshake = false } = {}) =>" in send
-    assert "removeOwned(sendDraft.pendingImages" in send
+    assert "removeOwned(ownerDraft.pendingImages" in send
     busy_branch = "await this._confirmSessionBusy(sendSid, sendState)"
     assert send.index("while (ownsSendDraft() && stillUploading())") < send.rindex(busy_branch)
     assert send.index("failedAttachments.length") < send.rindex(busy_branch)
@@ -2037,7 +2175,7 @@ def test_chat_draft_survives_refresh_and_failed_stream_start():
     assert "this.tabState[id].draft.input = this._consumePersistedChatDraft(id)" in app
     assert 'window.addEventListener("pagehide"' in app
     assert "this._schedulePersistChatDraft(this.currentId, this.input" in app
-    assert "this._stageChatRecoveryDraft(sendSid, composerInput)" in send
+    assert "this._stageChatRecoveryDraft(ownerSid, composerInput)" in send
     assert "clearSubmittedComposer({ preserveForHandshake: true })" in send
     assert "this._commitChatRecoveryDraft(sendSid, composerInput)" in send
     assert "const rollbackUnstartedSend = (restoreDraft = true) =>" in send
@@ -2966,6 +3104,7 @@ def test_chat_code_blocks_have_copy_button_with_clipboard_fallback():
 
 
 def test_chat_send_and_stop_buttons_are_icon_only_but_accessible():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
     html = (FRONTEND / "index.html").read_text(encoding="utf-8")
     css = (FRONTEND / "styles.css").read_text(encoding="utf-8")
     toolbar_start = html.index('class="btn-primary chat-toolbar-send chat-toolbar-queue"')
@@ -2976,7 +3115,13 @@ def test_chat_send_and_stop_buttons_are_icon_only_but_accessible():
     assert 'x-text="t(\'btn.send\')"' not in buttons
     assert 'x-text="t(\'btn.stop\')"' not in buttons
     assert "tabState[currentId]?._stopping" in buttons
-    assert "_isBusy(currentId) ? t('queue.button_hint') : t('btn.send')" in buttons
+    assert buttons.count("sendButtonHint(currentId)") == 2
+    send_hint_start = app.index("    sendButtonHint(sid) {")
+    send_hint_end = app.index("\n    async _confirmSessionBusy", send_hint_start)
+    send_hint = app[send_hint_start:send_hint_end]
+    assert "this.isTabBackgroundActive(sid)" not in send_hint
+    assert 'this.t("chat.background_queue_hint")' not in send_hint
+    assert 'this.t("queue.button_hint")' in send_hint
     assert ':aria-label="t(\'btn.stop\')"' in buttons
     assert ".chat-toolbar-send { width: 44px; padding: 0; }" in css
     assert ".chat-toolbar-send > span:nth-child(2)" not in css
