@@ -87,7 +87,7 @@ dependencies = [
     # when pgvector is selected; Qdrant deployments never open a Postgres
     # connection, but keeping the driver installed makes provider switching a
     # runtime setting instead of a redeploy.
-    "psycopg[binary]>=3.2.9",
+    "psycopg[binary]>=3.3.4",
 ]
 
 [project.urls]
