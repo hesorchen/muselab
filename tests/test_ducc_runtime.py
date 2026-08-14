@@ -16,8 +16,14 @@ def test_ducc_wrapper_removes_muselab_provider_identity(tmp_path):
         "    'AWS_SECRET_ACCESS_KEY', 'DATABASE_URL', 'SSH_AUTH_SOCK',\n"
         "    'UNRELATED_PRIVATE_VALUE', 'MUSELAB_DUCC_CLI',\n"
         "    'HTTPS_PROXY', 'DUCC_AUTH_SOURCE', 'HOME',\n"
+        "    'CLAUDE_CODE_RESUME_SOURCE_ALIVE',\n"
+        "    'LC_ALL', 'LC_PRIVATE_SENTINEL',\n"
         "]\n"
-        "print(json.dumps({name: name in os.environ for name in names}))\n",
+        "print(json.dumps({\n"
+        "    'present': {name: name in os.environ for name in names},\n"
+        "    'resume_source_alive': "
+        "os.environ.get('CLAUDE_CODE_RESUME_SOURCE_ALIVE'),\n"
+        "}))\n",
         encoding="utf-8",
     )
     fake_ducc.chmod(0o755)
@@ -38,6 +44,9 @@ def test_ducc_wrapper_removes_muselab_provider_identity(tmp_path):
         "UNRELATED_PRIVATE_VALUE": "synthetic-private-value",
         "HTTPS_PROXY": "https://user:password@proxy.invalid",
         "DUCC_AUTH_SOURCE": "synthetic-ducc-source",
+        "CLAUDE_CODE_RESUME_SOURCE_ALIVE": "2026-08-14T09:21:38.123Z",
+        "LC_ALL": "C.UTF-8",
+        "LC_PRIVATE_SENTINEL": "private-locale-shaped-value",
     })
 
     completed = subprocess.run(
@@ -47,7 +56,8 @@ def test_ducc_wrapper_removes_muselab_provider_identity(tmp_path):
         text=True,
         env=env,
     )
-    present = json.loads(completed.stdout)
+    output = json.loads(completed.stdout)
+    present = output["present"]
 
     assert present == {
         "MUSELAB_TOKEN": False,
@@ -64,4 +74,22 @@ def test_ducc_wrapper_removes_muselab_provider_identity(tmp_path):
         "HTTPS_PROXY": False,
         "DUCC_AUTH_SOURCE": True,
         "HOME": True,
+        "CLAUDE_CODE_RESUME_SOURCE_ALIVE": True,
+        "LC_ALL": True,
+        "LC_PRIVATE_SENTINEL": False,
     }
+    assert output["resume_source_alive"] == "2026-08-14T09:21:38.123Z"
+
+    env["CLAUDE_CODE_RESUME_SOURCE_ALIVE"] = (
+        "private text that must not cross the DUCC boundary"
+    )
+    invalid = subprocess.run(
+        [str(wrapper), "probe"],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    invalid_output = json.loads(invalid.stdout)
+    assert invalid_output["present"]["CLAUDE_CODE_RESUME_SOURCE_ALIVE"] is False
+    assert invalid_output["resume_source_alive"] is None

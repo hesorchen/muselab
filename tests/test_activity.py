@@ -249,6 +249,82 @@ def test_summary_and_ack(tmp_path, monkeypatch):
     assert acknowledged["group_unread"]["failed"] == 0
 
 
+def test_background_finish_publishes_terminal_read_atomically(
+    tmp_path,
+    monkeypatch,
+):
+    """A chat bubble, not an Activity badge, announces background completion."""
+    service = _service(tmp_path, monkeypatch)
+    service.start(
+        "s1",
+        summary="background task",
+        activity_source="background",
+        owner_id="turn-1",
+    )
+
+    async def exercise():
+        async with service.subscribe() as queue:
+            item = await asyncio.to_thread(
+                service.finish,
+                "s1",
+                "completed",
+                activity_source="background",
+                owner_id="turn-1",
+                mark_read=True,
+            )
+            payload = await asyncio.wait_for(queue.get(), timeout=1)
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(queue.get(), timeout=0.01)
+            return item, payload
+
+    item, payload = asyncio.run(exercise())
+    assert item["state"] == "completed"
+    assert item["read"] is True
+    assert payload["item"]["state"] == "completed"
+    assert payload["item"]["read"] is True
+    assert payload["summary"]["unread"] == 0
+    assert payload["summary"]["attention"] == 0
+    assert service.summary()["groups"]["history"] == 1
+
+
+def test_background_finish_retry_repairs_unread_without_reordering(
+    tmp_path,
+    monkeypatch,
+):
+    service = _service(tmp_path, monkeypatch)
+    service.start(
+        "s1",
+        summary="background task",
+        activity_source="background",
+        owner_id="turn-1",
+    )
+    first = service.finish(
+        "s1", "completed", activity_source="background", owner_id="turn-1")
+    assert first["read"] is False
+    finished_at = first["finished_at"]
+    updated_at = first["updated_at"]
+
+    async def exercise():
+        async with service.subscribe() as queue:
+            repaired = await asyncio.to_thread(
+                service.finish,
+                "s1",
+                "completed",
+                activity_source="background",
+                owner_id="turn-1",
+                mark_read=True,
+            )
+            payload = await asyncio.wait_for(queue.get(), timeout=1)
+            return repaired, payload
+
+    repaired, payload = asyncio.run(exercise())
+    assert repaired["read"] is True
+    assert repaired["finished_at"] == finished_at
+    assert repaired["updated_at"] == updated_at
+    assert payload["item"]["read"] is True
+    assert payload["summary"]["unread"] == 0
+
+
 def test_completed_moves_from_review_to_history_after_ack(tmp_path, monkeypatch):
     service = _service(tmp_path, monkeypatch)
     service.start("s1", summary="produce result")

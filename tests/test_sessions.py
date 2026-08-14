@@ -133,7 +133,9 @@ def test_fork_annotation_copy_rekeys_message_uuid(app_module):
     assert annotation["docs"] == [{"name": "note.md"}]
 
 
-@pytest.mark.parametrize("terminal_state", ["completed", "failed", "stopped"])
+@pytest.mark.parametrize(
+    "terminal_state", ["completed", "failed", "stopped", "done"],
+)
 def test_runtime_task_overlay_terminal_state_cannot_regress_to_running(
     app_module, terminal_state,
 ):
@@ -154,7 +156,9 @@ def test_runtime_task_overlay_terminal_state_cannot_regress_to_running(
     )
 
     overlay = sess.get_runtime_task_overlays(sid)["task-1"]
-    assert overlay["state"] == terminal_state
+    assert overlay["state"] == (
+        "completed" if terminal_state == "done" else terminal_state
+    )
     assert overlay["summary"] == "terminal result"
     assert overlay["tool_use_id"] == "tool-late"
 
@@ -180,6 +184,198 @@ def test_startup_stops_only_stale_running_runtime_task_overlays(app_module):
     assert terminal["state"] == "completed"
     assert terminal["summary"] == "done"
     assert sess.stop_stale_runtime_task_overlays() == 0
+
+
+def test_runtime_fork_boundary_at_is_strict_utc_and_successor_only(app_module):
+    from backend import sessions as sess
+
+    source = sess.create_session("runtime-source")
+    assert source["runtime_fork_boundary_at"] == ""
+    assert sess.set_runtime_background_boundary(source["id"], "message-1")
+    assert sess.get_session_meta(source["id"])["runtime_fork_boundary_at"] == ""
+
+    successor_id = "11111111-2222-4333-8444-555555555555"
+    successor = sess.register_session(
+        successor_id,
+        name="runtime-successor",
+        runtime_predecessor=source["id"],
+        runtime_fork_boundary_at="2026-08-14T10:20:30.123456+08:00",
+    )
+    assert successor["runtime_fork_boundary_at"] == (
+        "2026-08-14T02:20:30.123456Z"
+    )
+    assert sess.link_runtime_successor(source["id"], successor_id)
+
+    raw_rows = json.loads(sess.INDEX.read_text(encoding="utf-8"))
+    raw_successor = next(row for row in raw_rows if row["id"] == successor_id)
+    assert raw_successor["runtime_fork_boundary_at"] == (
+        "2026-08-14T02:20:30.123456Z"
+    )
+    assert sess.normalize_runtime_fork_boundary_at(
+        "2026-08-14T02:20:30Z"
+    ) == "2026-08-14T02:20:30.000000Z"
+    assert sess.normalize_runtime_fork_boundary_at(
+        "2026-08-14T02:20:30"
+    ) == ""
+    with pytest.raises(ValueError, match="timezone-aware ISO 8601"):
+        sess.register_session(
+            "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+            runtime_fork_boundary_at="2026-08-14T02:20:30",
+        )
+
+
+def test_runtime_lineage_authority_uses_earliest_owner_snapshot(app_module):
+    from backend import sessions as sess
+
+    source = sess.create_session("runtime-source")["id"]
+    child = sess.create_session("runtime-child")["id"]
+    grandchild = sess.create_session("runtime-grandchild")["id"]
+    assert sess.link_runtime_successor(source, child)
+    assert sess.link_runtime_successor(child, grandchild)
+    assert sess.runtime_lineage(child) == [source, child, grandchild]
+
+    assert sess.set_runtime_task_overlay(
+        source,
+        "source-task",
+        owner_session_id=source,
+        state="running",
+        description="source launch",
+    )
+    assert sess.copy_runtime_task_overlays(source, child) == 1
+
+    # Simulate a pre-fix successor that rewrote both owner and lifecycle state.
+    child_data = sess._load_sidecar(child, use_cache=False)
+    child_overlay = child_data["runtime_task_overlays"]["source-task"]
+    child_overlay.update({
+        "owner_session_id": child,
+        "state": "stopped",
+        "summary": "false successor stop",
+        "tool_use_id": "tool-recovered-from-copy",
+    })
+    sess._save_sidecar(child, child_data)
+    assert sess.set_runtime_task_overlay(
+        child,
+        "child-task",
+        owner_session_id=child,
+        state="running",
+    )
+
+    authoritative = sess.get_authoritative_runtime_task_overlays(child)
+    source_task = authoritative["source-task"]
+    assert source_task["owner_session_id"] == source
+    assert source_task["state"] == "running"
+    assert "summary" not in source_task
+    assert source_task["tool_use_id"] == "tool-recovered-from-copy"
+    assert authoritative["child-task"]["owner_session_id"] == child
+    assert "child-task" not in sess.get_authoritative_runtime_task_overlays(
+        source
+    )
+
+
+def test_runtime_task_overlay_owner_and_terminal_state_are_monotonic(app_module):
+    from backend import sessions as sess
+
+    sid = sess.create_session("runtime-overlay-invariants")["id"]
+    assert sess.set_runtime_task_overlay(
+        sid,
+        "task-1",
+        owner_session_id=sid,
+        state="running",
+        description="original",
+    )
+    assert sess.set_runtime_task_overlay(
+        sid,
+        "task-1",
+        state="completed",
+        summary="authoritative result",
+        usage={"seconds": 3},
+        updated_at=100,
+    )
+    assert not sess.set_runtime_task_overlay(
+        sid,
+        "task-1",
+        owner_session_id="foreign-runtime",
+        state="stopped",
+    )
+    assert not sess.set_runtime_task_overlay(
+        sid, "task-1", state="stopped", summary="false stop",
+    )
+    assert sess.set_runtime_task_overlay(
+        sid,
+        "task-1",
+        state="running",
+        summary="late launch",
+        usage={"seconds": 999},
+        updated_at=999,
+        tool_use_id="tool-late",
+    )
+
+    overlay = sess.get_runtime_task_overlays(sid)["task-1"]
+    assert overlay["owner_session_id"] == sid
+    assert overlay["state"] == "completed"
+    assert overlay["summary"] == "authoritative result"
+    assert overlay["usage"] == {"seconds": 3}
+    assert overlay["updated_at"] == 100
+    assert overlay["tool_use_id"] == "tool-late"
+    assert sess.set_runtime_task_overlay(
+        sid,
+        "task-1",
+        state="completed",
+        output_file="/tmp/task-1.out",
+    )
+    assert not sess.set_runtime_task_overlay(
+        sid,
+        "task-1",
+        state="completed",
+        output_file="/tmp/task-1.out",
+    )
+
+
+def test_reconcile_runtime_task_overlay_chains_repairs_forward_copies(app_module):
+    from backend import sessions as sess
+
+    source = sess.create_session("runtime-source")["id"]
+    child = sess.create_session("runtime-child")["id"]
+    grandchild = sess.create_session("runtime-grandchild")["id"]
+    assert sess.link_runtime_successor(source, child)
+    assert sess.link_runtime_successor(child, grandchild)
+
+    assert sess.set_runtime_task_overlay(
+        source,
+        "source-task",
+        owner_session_id=source,
+        state="completed",
+        summary="real result",
+    )
+    assert sess.copy_runtime_task_overlays(source, child) == 1
+    child_data = sess._load_sidecar(child, use_cache=False)
+    child_data["runtime_task_overlays"]["source-task"].update({
+        "owner_session_id": child,
+        "state": "stopped",
+        "summary": "false successor stop",
+        "restart_recovered": True,
+    })
+    sess._save_sidecar(child, child_data)
+    assert sess.set_runtime_task_overlay(
+        child,
+        "child-task",
+        owner_session_id=child,
+        state="running",
+        description="child launch",
+    )
+
+    assert sess.reconcile_runtime_task_overlay_chains() == 3
+    assert sess.reconcile_runtime_task_overlay_chains() == 0
+
+    source_visible = sess.get_authoritative_runtime_task_overlays(source)
+    assert set(source_visible) == {"source-task"}
+    visible = sess.get_authoritative_runtime_task_overlays(grandchild)
+    assert visible["source-task"]["owner_session_id"] == source
+    assert visible["source-task"]["state"] == "completed"
+    assert visible["source-task"]["summary"] == "real result"
+    assert "restart_recovered" not in visible["source-task"]
+    assert visible["child-task"]["owner_session_id"] == child
+    assert visible["child-task"]["state"] == "running"
 
 
 def test_corrupt_index_is_never_overwritten_by_a_mutator(app_module):

@@ -1847,9 +1847,11 @@ def test_workspace_switch_disables_composer_and_gates_programmatic_user_send():
     html = (FRONTEND / "index.html").read_text(encoding="utf-8")
     start = app.index("async send(opts = {})")
     send = app[start:app.index("// ====== ask_user_question", start)]
+    textarea = html[html.index('<textarea x-ref="chatInput"'):]
+    textarea = textarea[:textarea.index("</textarea>")]
 
     assert "if (this.workspaceSwitching && !opts.reconnect && !opts.resumedItem) return" in send
-    assert ':disabled="!availableModels.length || workspaceSwitching"' in html
+    assert ':disabled="workspaceSwitching || !availableModels.length"' in textarea
     assert 'multiple style="display:none" :disabled="workspaceSwitching"' in html
     assert ':disabled="workspaceSwitching || !availableModels.length' in html
     assert ':disabled="workspaceSwitching || !!(tabState[currentId]' in html
@@ -1969,7 +1971,7 @@ def test_background_task_gap_rolls_foreground_onto_detached_successor():
     assert "return !!(s && s.background_active)" in app
 
 
-def test_inherited_task_poller_uses_pending_count_not_source_active_ttl():
+def test_inherited_task_poller_waits_for_durable_agent_projection():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
     start = app.index("    _ensureInheritedTaskPoller(")
     end = app.index("\n    // Poll /active + re-subscribe", start)
@@ -1977,11 +1979,67 @@ def test_inherited_task_poller_uses_pending_count_not_source_active_ttl():
 
     assert "status.runtime_background_tasks_pending" in poller
     assert "?? status.background_tasks_pending" in poller
+    assert "status.runtime_continuation_pending" in poller
+    assert "status.runtime_ui_revision" in poller
+    assert "st.runtimeUiRevision === desiredRevision" in poller
     assert "reported !== 0" in poller
     assert "status.active || st.streaming" not in poller
     assert "if (st.streaming || st.es || st.compacting) return;" in poller
     assert "quiet: true, probeActive: false" in poller
     assert 'st.inheritedBackgroundTaskCount = 0' in poller
+    assert "if (stopped || inFlight) return;" in poller
+    assert "epoch !== tickEpoch" in poller
+    # Single-flight must not turn one half-open /active request into a
+    # permanently wedged poller. The owning tick aborts on the normal session
+    # request timeout and releases its controller in finally.
+    assert "const controller = new AbortController();" in poller
+    assert "Number(this._sessionListTimeoutMs) || 8000" in poller
+    assert "signal: controller.signal" in poller
+    assert "clearTimeout(timeout);" in poller
+    assert "activeController.abort()" in poller
+    # Every canonical adoption joins the existing per-session single-flight.
+    # A revision-changing terminal tick performs that merge once, not once for
+    # the bubble and immediately again for the completed task overlay.
+    assert "this._reloadSessionCoalesced(childSid" in poller
+    assert "this.loadSession(childSid" not in poller
+    assert "loadedCanonicalThisTick = true" in poller
+    assert "adoptedRevision && !loadedCanonicalThisTick" in poller
+    # Only a newly adopted durable reply marks an off-screen successor unread.
+    # The later terminal-overlay reload must not badge the tab, and the current
+    # tab is already visibly consuming the bubble.
+    adoption_start = poller.index("if (!adoptedRevision")
+    adoption_end = poller.index("if (Number.isFinite(reported)", adoption_start)
+    adoption = poller[adoption_start:adoption_end]
+    assert "const continuationEventIdsBefore = new Set(" in adoption
+    assert 'message.display_kind === "runtime_continuation"' in adoption
+    assert "message.runtime_event_id" in adoption
+    assert "const hasNewRuntimeContinuation" in adoption
+    assert adoption.index("continuationEventIdsBefore = new Set") < adoption.index(
+        "this._reloadSessionCoalesced(childSid")
+    assert adoption.index("this._reloadSessionCoalesced(childSid") < adoption.index(
+        "const hasNewRuntimeContinuation")
+    assert "revisionBeforeAdoption !== desiredRevision" in adoption
+    assert "&& hasNewRuntimeContinuation" in adoption
+    assert "childSid !== this.currentId" in adoption
+    assert "if (adoptedRevision" in adoption
+    assert "st.unread = true;" in adoption
+    assert poller.count("st.unread = true;") == 1
+    assert poller.index("if (continuationPending) return;") < poller.index(
+        'st.inheritedBackgroundTaskCount = 0')
+
+    # task_notification is transport/card state only. A transient toast or an
+    # unread dot at this point races ahead of (and duplicates) the durable Agent
+    # reply; revision adoption above is the sole user-visible completion owner.
+    notification_start = app.index(
+        'es.addEventListener("task_notification", ev => {')
+    notification_end = app.index(
+        'es.addEventListener("rate_limit", ev => {', notification_start)
+    notification = app[notification_start:notification_end]
+    assert "applyTaskStatus(d.tool_use_id" in notification
+    assert "_noteBackgroundTaskSettled" not in notification
+    assert ".unread" not in notification
+    assert "this.toast(" not in notification
+    assert "_noteBackgroundTaskSettled" not in app
 
     # A reloaded successor never ran the live handoff initializer. Its normal
     # active probe must rebuild inherited ownership from durable session meta
@@ -1990,9 +2048,79 @@ def test_inherited_task_poller_uses_pending_count_not_source_active_ttl():
     check_end = app.index("\n    // Hover-prefetch", check_start)
     check = app[check_start:check_end]
     assert "d.runtime_background_tasks_pending" in check
+    assert "d.runtime_continuation_pending" in check
+    assert "d.runtime_ui_revision" in check
     assert "sessionMeta.runtime_predecessor" in check
-    assert "st.inheritedBackgroundTaskCount = Math.floor(inheritedPending)" in check
+    assert "Math.max(0, Math.floor(inheritedPending))" in check
     assert "this._ensureInheritedTaskPoller(sid, predecessorSid)" in check
+
+
+def test_runtime_ui_revision_rejects_out_of_order_session_response():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    start = app.index("    async loadSession(sid, opts = {}) {")
+    end = app.index("\n    // Warm OPEN-but-inactive tabs", start)
+    load = app[start:end]
+
+    baseline = 'const runtimeUiRevisionAtLoad = String(st.runtimeUiRevision || "");'
+    response = 'const loadedRuntimeUiRevision = String(s.runtime_ui_revision || "");'
+    current = 'const currentRuntimeUiRevision = String(st.runtimeUiRevision || "");'
+    stale_guard = (
+        "if (currentRuntimeUiRevision !== runtimeUiRevisionAtLoad\n"
+        "            && currentRuntimeUiRevision !== loadedRuntimeUiRevision)"
+    )
+    assert baseline in load
+    assert response in load
+    assert current in load
+    assert stale_guard in load
+    assert load.index(stale_guard) < load.index("st.messages.splice(")
+    assert load.index(stale_guard) < load.index(
+        "st.runtimeUiRevision = loadedRuntimeUiRevision")
+
+    # The session-list reconciler and inherited-task poller share the same
+    # coalescer, shrinking the remaining concurrency surface before the
+    # revision guard handles direct legacy callers.
+    reconcile_start = app.index("    _reconcileOpenSession(next) {")
+    reconcile_end = app.index("\n    // Field-level equality", reconcile_start)
+    reconcile = app[reconcile_start:reconcile_end]
+    assert "await this._reloadSessionCoalesced(" in reconcile
+    assert "await this.loadSession(sid, { quiet: true })" not in reconcile
+
+
+def test_runtime_continuation_history_identity_footer_and_fork_guards():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    css = (FRONTEND / "styles.css").read_text(encoding="utf-8")
+
+    continuity_start = app.index("    _messageContinuitySignatures(m) {")
+    continuity_end = app.index(
+        "\n    _preserveCanonicalMessageIdentity", continuity_start)
+    continuity = app[continuity_start:continuity_end]
+    runtime_guard = continuity[continuity.index(
+        'if (m.display_kind === "runtime_continuation")'):]
+    runtime_guard = runtime_guard[:runtime_guard.index("const continuityIds")]
+    assert 'push("runtime-event", m.runtime_event_id)' in runtime_guard
+    assert 'push("text", m.text)' not in runtime_guard
+
+    preserve_start = app.index(
+        "    _preserveCanonicalMessageIdentity(st, incoming) {")
+    preserve_end = app.index("\n    _assignLiveKey", preserve_start)
+    preserve = app[preserve_start:preserve_end]
+    assert 'canonicalTail.display_kind !== "runtime_continuation"' in preserve
+
+    fork_start = app.index("    turnForkMessageId(paneMsgs, i) {")
+    fork_end = app.index("\n    // Normalize a model-emitted path", fork_start)
+    fork = app[fork_start:fork_end]
+    assert 'tail.display_kind === "runtime_continuation"' in fork
+    assert "tail.forkable === false" in fork
+    assert 'next.display_kind !== "runtime_continuation"' in fork
+    assert "paneMsgs[i + 1].display_kind === 'runtime_continuation'" in html
+    # Runtime continuations have no preceding user row, but are still a new
+    # assistant turn. Their stable data-message-key exempts them from the
+    # adjacent non-user rule that hides avatars inside one ordinary turn.
+    avatar_boundary = (
+        ':not([data-message-key*="runtime-continuation:"]) .msg-avatar'
+    )
+    assert css.count(avatar_boundary) == 2
 
 
 def test_detached_rollover_preserves_migrated_queue_fifo():
@@ -2023,16 +2151,17 @@ def test_detached_rollover_preserves_migrated_queue_fifo():
     assert busy.index("await this._enqueueMessage(sendSid") < busy.index(
         "this._scheduleBackgroundHandoff(sendSid, sendState);"
     )
-    # Stateful slash commands cannot be represented in the durable queue and
-    # therefore wait instead of overtaking migrated prompts.
-    slash = send[send.index("const slashBusy ="):send.index("let readyImages", send.index("const slashBusy ="))]
-    assert "if (this._claimDetachedRolloverSlot(childSid))" in slash
-    assert 'this.toast(this.t("queue.slash_blocked")' in slash
-    claim_start = app.index("    _claimDetachedRolloverSlot(")
-    claim_end = app.index("\n    async _handoffBackgroundSession", claim_start)
-    claim = app[claim_start:claim_end]
-    assert "return !!(handoff && handoff.rolledOver);" in claim
-    assert "_rolloverLaunchClaimed" not in claim
+    # Slash controls never enter the durable message queue. Their per-command
+    # busy policy is owned by the shared dispatcher, while this send path has a
+    # single delegation point and therefore cannot overtake migrated prompts
+    # through a second handoff implementation.
+    slash_start = send.index("// Slash controls must stay responsive")
+    slash_end = send.index("// Keep the ownership token primitive", slash_start)
+    slash = send[slash_start:slash_end]
+    assert "await this._dispatchSlash(" in slash
+    assert "_enqueueMessage" not in slash
+    assert "_handoffBackgroundSession" not in slash
+    assert "_confirmSessionBusy" not in slash
 
 
 def test_composer_send_has_a_per_session_reentry_guard():
@@ -2305,6 +2434,13 @@ def test_render_key_hot_paths_use_pane_index_without_full_scans_or_transport_dup
     assert capture.count('navigator.sendBeacon("/api/log/client-error"') == 1
     assert capture.count('fetch("/api/log/client-error"') == 1
     assert '_deliverClientErrorRecord(rec, telemetry, "[muse-telemetry]", "warn")' in capture
+    assert "const wireRecord = _clientErrorWireRecord(rec);" in capture
+    wire_helper = capture[
+        capture.index("function _clientErrorWireRecord"):
+        capture.index("function _deliverClientErrorRecord")
+    ]
+    for private_field in ("rec.message", "rec.stack", "rec.filename", "rec.url", "rec.ua"):
+        assert private_field not in wire_helper
 
 
 def test_render_key_regression_boundaries_keep_state_and_owners_consistent():
@@ -2820,7 +2956,11 @@ def test_terminal_ansi_palettes_are_distinct_and_readable():
         palettes[theme] = colors
 
     assert palettes["dark"] != palettes["light"] != palettes["eyecare"]
-    backgrounds = {"light": "#ffffff", "eyecare": "#f5f0e0"}
+    backgrounds = {
+        "light": ["#ffffff"],
+        # All three curated eyecare surface levels share this ANSI palette.
+        "eyecare": ["#fbf9f1", "#f5f0e0", "#faedce"],
+    }
 
     def luminance(hex_color: str) -> float:
         channels = [
@@ -2841,13 +2981,16 @@ def test_terminal_ansi_palettes_are_distinct_and_readable():
         )
         return (lighter + 0.05) / (darker + 0.05)
 
-    for theme, background in backgrounds.items():
-        failures = {
-            name: round(contrast(color, background), 2)
-            for name, color in palettes[theme].items()
-            if contrast(color, background) < 4.5
-        }
-        assert not failures, f"{theme} ANSI colors below 4.5:1: {failures}"
+    for theme, theme_backgrounds in backgrounds.items():
+        for background in theme_backgrounds:
+            failures = {
+                name: round(contrast(color, background), 2)
+                for name, color in palettes[theme].items()
+                if contrast(color, background) < 4.5
+            }
+            assert not failures, (
+                f"{theme}@{background} ANSI colors below 4.5:1: {failures}"
+            )
 
     terminal_rule = css[css.index(".preview-body.terminal-active"):
                         css.index("}", css.index(".preview-body.terminal-active"))]
@@ -2859,6 +3002,98 @@ def test_terminal_ansi_palettes_are_distinct_and_readable():
     assert 'if (this.theme !== "dark")' in app
     assert 'value("--c-diff-add-bg")' in app
     assert 'value("--c-diff-del-bg")' in app
+
+
+def test_eyecare_intensity_is_curated_persisted_and_content_safe():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    css = (FRONTEND / "styles.css").read_text(encoding="utf-8")
+    i18n = (FRONTEND / "i18n" / "index.js").read_text(encoding="utf-8")
+
+    assert "eyecareLevel: 2" in app
+    assert 'localStorage.getItem("muselab_eyecare_level")' in app
+    assert "Number.isInteger(savedEyecareLevel)" in app
+    assert 'this._setLS("muselab_eyecare_level", String(next))' in app
+    assert "!Number.isInteger(next) || next < 1 || next > 3" in app
+    assert 'setAttribute("data-eyecare-level", String(this.eyecareLevel))' in app
+    assert 'getPropertyValue("--c-bg-0")' in app
+    assert "setEyecareLevel(level)" in app
+    assert 'const order = ["light", "dark", "eyecare"]' in app
+    assert "if (this._terminal) this._terminal.options.theme = this._terminalTheme()" in app
+
+    row_start = html.index('class="settings-row eyecare-level-row"')
+    row_end = html.index('<div class="settings-row">', row_start)
+    row = html[row_start:row_end]
+    assert 'x-show="theme === \'eyecare\'"' in row
+    assert 'role="group"' in row
+    assert row.count(':aria-pressed="eyecareLevel===') == 3
+    for level in (1, 2, 3):
+        assert f'@click="setEyecareLevel({level})"' in row
+
+    for key in (
+        "set.label.eyecare_level", "set.eyecare.soft",
+        "set.eyecare.balanced", "set.eyecare.deep", "set.eyecare.hint",
+    ):
+        assert i18n.count(f'"{key}"') == 2
+
+    expected = {
+        1: {
+            "--c-bg-0": "#fbf9f1", "--c-bg-1": "#f8f5ec",
+            "--c-bg-2": "#f3efe6", "--c-assistant-bg": "#f8f5ec",
+            "--c-user-bg": "#e8f0e3", "--c-tool-bg": "#f6f0e2",
+            "--c-thinking-bg": "#f1f1e8",
+        },
+        3: {
+            "--c-bg-0": "#faedce", "--c-bg-1": "#f5e9cc",
+            "--c-bg-2": "#f1e4c7", "--c-assistant-bg": "#f5e9cc",
+            "--c-user-bg": "#e0ebcf", "--c-tool-bg": "#f5e5c4",
+            "--c-thinking-bg": "#ede4ca",
+        },
+    }
+    blocks = {}
+    for level, tokens in expected.items():
+        match = re.search(
+            rf'html\[data-theme="eyecare"\]\[data-eyecare-level="{level}"\] '
+            r"\{(.*?)\n\}",
+            css,
+            re.S,
+        )
+        assert match, f"missing eyecare level {level}"
+        blocks[level] = match.group(1)
+        assert "filter:" not in blocks[level]
+        for token, value in tokens.items():
+            assert f"{token}: {value}" in blocks[level]
+    assert 'data-eyecare-level="2"' not in css
+
+    def luminance(hex_color: str) -> float:
+        channels = [
+            int(hex_color[index:index + 2], 16) / 255
+            for index in (1, 3, 5)
+        ]
+        linear = [
+            value / 12.92 if value <= 0.04045
+            else ((value + 0.055) / 1.055) ** 2.4
+            for value in channels
+        ]
+        return 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2]
+
+    def contrast(first: str, second: str) -> float:
+        lighter, darker = sorted(
+            (luminance(first), luminance(second)), reverse=True,
+        )
+        return (lighter + 0.05) / (darker + 0.05)
+
+    # Endpoint backgrounds keep body/muted text readable; level 2 is already
+    # covered by the long-standing eyecare palette tests above.
+    for colors in expected.values():
+        assert contrast("#3d3526", colors["--c-bg-0"]) >= 4.5
+        assert contrast("#5e5447", colors["--c-bg-1"]) >= 4.5
+        assert contrast("#6b6050", colors["--c-bg-2"]) >= 4.5
+        assert contrast("#2f6a2f", colors["--c-bg-2"]) >= 4.5
+        assert contrast("#92500a", colors["--c-bg-2"]) >= 4.5
+        assert contrast("#3a5a30", colors["--c-user-bg"]) >= 4.5
+        assert contrast("#6f5226", colors["--c-tool-bg"]) >= 4.5
+        assert contrast("#5a6a4a", colors["--c-thinking-bg"]) >= 4.5
 
 
 def test_diff_surfaces_use_theme_tokens_and_readable_edges():
@@ -3781,3 +4016,189 @@ def test_turn_busy_race_falls_back_to_durable_queue():
         "await this._enqueueMessage(streamSid"
     )
     assert "this._removePaneMessage(streamState, sentUserBubble);" in busy
+
+
+def test_slash_registry_has_core_commands_aliases_and_busy_policies():
+    constants = (FRONTEND / "data" / "constants.js").read_text(encoding="utf-8")
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    start = constants.index("window.MUSELAB_SLASH_CMDS = [")
+    registry = constants[start:constants.index("\n];", start)]
+
+    # The first implementation is retained for a later UX redesign, but its
+    # entry point is intentionally closed: slash-prefixed text is ordinary chat.
+    assert "window.MUSELAB_SLASH_ENABLED = false" in constants
+    assert "SLASH_ENABLED: window.MUSELAB_SLASH_ENABLED === true" in app
+    assert 'x-show="SLASH_ENABLED && slashShow"' in html
+    assert 'if (this.SLASH_ENABLED && text.startsWith("/"))' in app
+    assert "if (this.SLASH_ENABLED && isComposerSubmission)" in app
+
+    # Do not freeze the total command count: local conveniences may grow. These
+    # eight names are the stable product contract, and aliases resolve through
+    # the same records instead of becoming duplicate command implementations.
+    for name in (
+        "context", "compact", "model", "permission",
+        "mcp", "stop", "usage", "effort",
+    ):
+        assert re.search(rf'\bname:\s*"{name}"', registry)
+    assert 'name: "permission", aliases: ["permissions"]' in registry
+    assert 'name: "usage", aliases: ["cost"]' in registry
+
+    for name in ("context", "mcp", "usage"):
+        assert re.search(
+            rf'name:\s*"{name}"[^\n]*policy:\s*"readonly"', registry,
+        )
+    assert re.search(r'name:\s*"stop"[^\n]*policy:\s*"immediate"', registry)
+    for name in ("compact", "model", "permission", "effort"):
+        assert re.search(
+            rf'name:\s*"{name}"[^\n]*policy:\s*"stateful"', registry,
+        )
+
+
+def test_slash_palette_supports_aliases_and_second_stage_arguments():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+
+    resolve = app[app.index("    _resolveSlashCommand(rawName) {"):]
+    resolve = resolve[:resolve.index("\n    _slashCommandResults(")]
+    assert "command.name === name" in resolve
+    assert "(command.aliases || []).includes(name)" in resolve
+
+    arguments = app[app.index("    _slashArgumentResults(command, rawQuery) {"):]
+    arguments = arguments[:arguments.index("\n    _refreshSlashPalette(")]
+    assert "this.availableModels" in arguments
+    assert 'command.argKind === "permission"' in arguments
+    assert "this.effortChoices(this.model)" in arguments
+    assert 'command.argKind === "session"' in arguments
+    assert "rows.filter(item => item._search.includes(query))" in arguments
+
+    refresh = app[app.index("    _refreshSlashPalette(prefix = this.input) {"):]
+    refresh = refresh[:refresh.index("\n    _setSlashComposerValue(")]
+    assert "this._slashCommandResults(raw)" in refresh
+    assert "this._slashArgumentResults(command" in refresh
+    # A miss keeps the popup shell mounted so its no-result row is reachable.
+    assert "this.slashShow = true" in refresh
+    assert ':key="c._key"' in html
+    assert "slashStage === 'argument' ? t('slash.no_arg')" in html
+
+
+def test_slash_enter_tab_pointer_and_send_share_one_dispatcher():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+
+    pick = app[app.index("    pickSlash(i = this.slashIdx) {"):]
+    pick = pick[:pick.index("\n    onSlashTab(")]
+    # Choosing a command with arguments opens stage two; choosing an argument
+    # and choosing an argument-free command both enter the same dispatcher.
+    assert "if (command.argKind)" in pick
+    assert "this._setSlashComposerValue(`/${command.name} `, true)" in pick
+    assert pick.count("this._dispatchSlash(") == 2
+
+    tab = app[app.index("    onSlashTab(ev) {"):]
+    tab = tab[:tab.index("\n    _slashDraftHasAttachments(")]
+    assert "this._isImeComposingEvent(ev)" in tab
+    assert tab.index("this._isImeComposingEvent(ev)") < tab.index("ev.preventDefault()")
+    assert "this.pickSlash()" in tab
+
+    enter = app[app.index("    onEnter(ev) {"):]
+    enter = enter[:enter.index("\n    _captureChatPosition(")]
+    assert enter.index("this._claimNonImeEnter(ev)") < enter.index("this.slashShow")
+    # Slash selection wins before the mobile newline policy, while a composing
+    # Enter still exits through _claimNonImeEnter without touching the palette.
+    assert enter.index("this.pickSlash()") < enter.index("this._isMobileLayout()")
+
+    send = app[app.index("    async send(opts = {}) {"):]
+    slash_start = send.index("// Slash controls must stay responsive")
+    slash_end = send.index("// Keep the ownership token primitive", slash_start)
+    slash = send[slash_start:slash_end]
+    assert "await this._dispatchSlash(" in slash
+    assert "_runSlash(" not in slash
+    assert "_runSlashHandler(" not in slash
+
+    assert '@keydown.tab="onSlashTab($event)"' in html
+    assert '@keydown.tab.prevent=' not in html
+    assert '@mousedown.prevent="pickSlash(i)"' in html
+
+
+def test_slash_dispatcher_centralizes_busy_and_attachment_policy():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    start = app.index("    async _dispatchSlash(rawCommand, rawArg, opts = {}) {")
+    dispatcher = app[start:app.index("\n    async _runSlashHandler(", start)]
+
+    assert "const command = this._resolveSlashCommand(rawCommand)" in dispatcher
+    assert 'if (command.policy === "stateful")' in dispatcher
+    assert "await this._confirmSessionBusy(sid, st)" in dispatcher
+    # Read-only and immediate commands skip the stateful-only branch; all
+    # commands still share re-entry, error, and exact-draft clearing rules.
+    assert dispatcher.count("_confirmSessionBusy(") == 1
+    assert "await this._runSlashHandler(" in dispatcher
+    assert "if (this._slashDispatching && ownsDispatchLock) return false" in dispatcher
+
+    attach = dispatcher.index("this._slashDraftHasAttachments(sid)")
+    busy = dispatcher.index('command.policy === "stateful"')
+    run = dispatcher.index("await this._runSlashHandler(")
+    clear = dispatcher.index('ownerState.draft.input = ""')
+    assert attach < busy < run < clear
+    assert "ownerState.draft.input === submitted" in dispatcher
+    assert "this.currentId === sid && this.input === submitted" in dispatcher
+    assert 'this._setChatInput("")' in dispatcher
+    attachment_helper = app[app.index("    _slashDraftHasAttachments("):start]
+    for field in ("pendingImages", "pendingDocs", "pendingQuotes"):
+        assert field in attachment_helper
+
+
+def test_slash_handlers_use_existing_safe_control_flows():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    start = app.index("    async _runSlashHandler(cmd, arg) {")
+    handler = app[start:app.index("\n    // Compatibility entry point", start)]
+
+    context = handler[handler.index('case "context"'):handler.index('case "compact"')]
+    compact = handler[handler.index('case "compact"'):handler.index('case "model"')]
+    model = handler[handler.index('case "model"'):handler.index('case "permission"')]
+    permission = handler[
+        handler.index('case "permission"'):handler.index('case "mcp"')
+    ]
+    mcp = handler[handler.index('case "mcp"'):handler.index('case "stop"')]
+    stop = handler[handler.index('case "stop"'):handler.index('case "usage"')]
+    usage = handler[handler.index('case "usage"'):handler.index('case "effort"')]
+    effort = handler[handler.index('case "effort"'):handler.index('case "help"')]
+
+    assert "await this.showCtxBreakdown()" in context
+    assert "await this.runCompact()" in compact
+    assert "/sessions/${this.currentId}/compact" not in compact
+    assert "this.availableModels" in model
+    assert "await this.onModelChange()" in model
+    assert "this._normalizePermissionMode(value)" in permission
+    assert "await this.onPermissionChange()" in permission
+    assert "this.toggleMcpDrawer()" in mcp and "await this.fetchMcp()" in mcp
+    assert "await this.stop()" in stop
+    assert "await this.fetchStats()" in usage
+    assert "this._normalizeEffort(arg)" in effort
+    assert "this._effortAllowed(value, this.model)" in effort
+    assert "await this.onEffortChange()" in effort
+
+    # Backward compatibility is a thin delegate, not a policy bypass.
+    compat = app[app.index("    async _runSlash(cmd, arg) {"):]
+    compat = compat[:compat.index("\n    // Inject a synthetic assistant bubble")]
+    assert "return this._dispatchSlash(cmd, arg)" in compat
+
+
+def test_slash_controls_run_before_provider_gate_without_consuming_attachments():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    send = app[app.index("    async send(opts = {}) {"):]
+    slash_start = send.index("// Slash controls must stay responsive")
+    provider_gate = send.index("// No-provider gate", slash_start)
+    slash_end = send.index("// Keep the ownership token primitive", slash_start)
+    slash = send[slash_start:slash_end]
+
+    assert "if (this.SLASH_ENABLED && isComposerSubmission)" in slash
+    assert "sendState.draft && sendState.draft.input" in slash
+    assert "await this._dispatchSlash(" in slash
+    # The send path does not clear or move attachment arrays. Dispatcher refusal
+    # leaves the exact tab-owned draft intact for the user to edit or resend.
+    for destructive in (
+        "pendingImages.splice", "pendingDocs.splice", "pendingQuotes.splice",
+        "clearSubmittedComposer", "ownerState.draft.input = \"\"",
+    ):
+        assert destructive not in slash
+    assert slash_start < provider_gate

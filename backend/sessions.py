@@ -35,7 +35,7 @@ import sys
 import threading
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, get_args
 
@@ -123,6 +123,57 @@ _VALID_PLAN_RETURN_PERMISSIONS = (
 _PLAN_RETURN_PERMISSION_FALLBACK = "default"
 
 
+_STRICT_ISO_DATETIME_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}"
+    r"(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})$"
+)
+
+
+def _normalize_iso_utc(value: Any) -> str:
+    """Return one strict, timezone-aware ISO timestamp in canonical UTC.
+
+    Runtime rollover timestamps cross the index/sidecar boundary and are later
+    compared with CLI JSONL timestamps.  Accepting naive datetimes (or the very
+    permissive forms ``datetime.fromisoformat`` otherwise tolerates) makes that
+    comparison depend on the host timezone.  Reject those inputs and expose one
+    stable spelling with an explicit ``Z`` suffix and microsecond precision.
+    """
+    parsed: datetime
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str):
+        candidate = value.strip()
+        if not _STRICT_ISO_DATETIME_RE.fullmatch(candidate):
+            return ""
+        try:
+            parsed = datetime.fromisoformat(
+                candidate[:-1] + "+00:00"
+                if candidate.endswith("Z") else candidate
+            )
+        except ValueError:
+            return ""
+    else:
+        return ""
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return ""
+    try:
+        utc = parsed.astimezone(timezone.utc)
+    except (OverflowError, ValueError):
+        return ""
+    return utc.isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
+def normalize_runtime_fork_boundary_at(value: Any) -> str:
+    """Public normalizer for the timestamp captured at SDK fork creation.
+
+    The chat runtime records this value before registering the successor.  Keep
+    the permissive-to-empty behavior here so callers can decide whether an
+    absent SDK timestamp should abort a rollover, while ``register_session``
+    still rejects an explicitly supplied malformed value.
+    """
+    return _normalize_iso_utc(value)
+
+
 def _normalize_plan_return_permission(permission: Any, value: Any) -> str:
     """Return the safe Plan-exit mode for a persisted session or queue item.
 
@@ -181,6 +232,9 @@ def _normalize_session_permission_fields(row: dict) -> dict:
     )
     normalized["runtime_boundary_message_id"] = str(
         normalized.get("runtime_boundary_message_id") or ""
+    )
+    normalized["runtime_fork_boundary_at"] = _normalize_iso_utc(
+        normalized.get("runtime_fork_boundary_at")
     )
     return normalized
 
@@ -507,6 +561,9 @@ def _merge_sdk_with_index(
         "runtime_boundary_message_id": str(
             m.get("runtime_boundary_message_id") or ""
         ),
+        "runtime_fork_boundary_at": _normalize_iso_utc(
+            m.get("runtime_fork_boundary_at")
+        ),
         # Every conversation is bound to the directory the Claude SDK was
         # started in.  Keep it in the sidecar so history, files and previews
         # switch as one workspace instead of silently falling back to ROOT.
@@ -698,6 +755,7 @@ def register_session(sid: str, *, name: str = "", model: str = "",
                      activity_hidden: bool = False,
                      runtime_profile: str = "",
                      runtime_predecessor: str = "",
+                     runtime_fork_boundary_at: str | datetime = "",
                      cwd: str | Path | None = None) -> dict:
     """Add a session that already has a UUID (e.g. one minted by SDK
     fork_session) to the muselab index. Same shape as create_session
@@ -706,6 +764,11 @@ def register_session(sid: str, *, name: str = "", model: str = "",
     workspace = workspace_registry.resolve(cwd)
     if runtime_profile not in ("", "side_question"):
         raise ValueError("invalid runtime profile")
+    normalized_runtime_fork_boundary_at = _normalize_iso_utc(
+        runtime_fork_boundary_at
+    )
+    if runtime_fork_boundary_at and not normalized_runtime_fork_boundary_at:
+        raise ValueError("runtime_fork_boundary_at must be timezone-aware ISO 8601")
     meta = {
         "id": sid,
         "name": name or _default_session_name(),
@@ -733,6 +796,7 @@ def register_session(sid: str, *, name: str = "", model: str = "",
         "runtime_shadow": False,
         "runtime_successor": "",
         "runtime_boundary_message_id": "",
+        "runtime_fork_boundary_at": normalized_runtime_fork_boundary_at,
         "cwd": str(workspace),
     }
     if forked_from:
@@ -1136,6 +1200,60 @@ def unlink_runtime_successor(source_sid: str, successor_sid: str) -> bool:
         return True
 
 
+_RUNTIME_LINEAGE_MAX = 32
+
+
+def _runtime_lineage_from_rows(sid: str, rows: list[dict]) -> list[str]:
+    """Return the linked runtime chain containing ``sid``, oldest first."""
+    sid = str(sid or "")
+    by_id = {
+        str(row.get("id")): row
+        for row in rows
+        if isinstance(row, dict) and row.get("id")
+    }
+    if not sid or sid not in by_id:
+        return []
+
+    predecessors: list[str] = []
+    seen = {sid}
+    current = sid
+    while len(seen) < _RUNTIME_LINEAGE_MAX:
+        predecessor = str(
+            by_id.get(current, {}).get("runtime_predecessor") or ""
+        )
+        if not predecessor or predecessor in seen or predecessor not in by_id:
+            break
+        predecessors.append(predecessor)
+        seen.add(predecessor)
+        current = predecessor
+
+    lineage = list(reversed(predecessors)) + [sid]
+    current = sid
+    while len(lineage) < _RUNTIME_LINEAGE_MAX:
+        successor = str(
+            by_id.get(current, {}).get("runtime_successor") or ""
+        )
+        if not successor or successor in seen or successor not in by_id:
+            break
+        lineage.append(successor)
+        seen.add(successor)
+        current = successor
+    return lineage
+
+
+def runtime_lineage(sid: str) -> list[str]:
+    """Return the durable rollover lineage containing ``sid``, oldest first.
+
+    One index snapshot is used for the entire walk.  Reading predecessor and
+    successor links through separate ``get_session_meta`` calls could otherwise
+    splice together two generations while a rollover commits or rolls back.
+    Broken links and cycles are bounded defensively rather than followed beyond
+    the indexed chain.
+    """
+    with _INDEX_LOCK:
+        return _runtime_lineage_from_rows(sid, _load_index())
+
+
 def update_model(sid: str, model: str) -> None:
     with _INDEX_LOCK:
         idx = _load_index()
@@ -1316,44 +1434,283 @@ def get_runtime_task_overlays(sid: str) -> dict[str, dict]:
 _RUNTIME_TASK_TERMINAL_STATES = frozenset({
     "completed", "failed", "stopped",
 })
+_RUNTIME_TASK_CROSS_COPY_IDENTITY_FIELDS = frozenset({
+    "tool_use_id", "description",
+})
+
+
+def _normalized_runtime_task_state(value: Any) -> Any:
+    """Normalize legacy terminal spellings without coercing unknown values."""
+    if not isinstance(value, str):
+        return value
+    normalized = value.strip().lower()
+    if normalized == "done":
+        return "completed"
+    if normalized == "killed":
+        return "stopped"
+    return normalized
 
 
 def set_runtime_task_overlay(
     sid: str,
     task_id: str,
+    *,
+    owner_session_id: str | None = None,
     **fields: Any,
-) -> None:
-    """Merge one durable UI-only task status into a session sidecar."""
+) -> bool:
+    """Merge one durable UI-only task status into a session sidecar.
+
+    The first writer establishes the process owner.  Copies in rollover
+    successors retain that owner forever, and a task that has reached one
+    terminal state can neither be revived nor rewritten as a different
+    terminal outcome by a delayed notification.  The return value says whether
+    durable state actually changed.
+    """
     task_id = str(task_id or "")
     if not task_id:
-        return
+        return False
     with session_lifecycle_lock(sid):
         with _QUEUE_LOCK:
             if sid in _DELETED_SESSION_IDS:
-                return
+                return False
         with _SIDECAR_LOCK:
             data = _load_sidecar(sid, use_cache=False)
             overlays = data.setdefault("runtime_task_overlays", {})
             if not isinstance(overlays, dict):
                 overlays = {}
                 data["runtime_task_overlays"] = overlays
-            current = overlays.setdefault(task_id, {"task_id": task_id})
+            stored = overlays.get(task_id)
+            current = dict(stored) if isinstance(stored, dict) else {
+                "task_id": task_id,
+            }
+            existing_owner = str(current.get("owner_session_id") or "")
+            requested_owner = str(owner_session_id or "")
+            if existing_owner and requested_owner not in ("", existing_owner):
+                return False
+            effective_owner = existing_owner or requested_owner or sid
+
+            incoming = {
+                key: value for key, value in fields.items()
+                if value is not None
+            }
+            if "state" in incoming:
+                incoming["state"] = _normalized_runtime_task_state(
+                    incoming["state"]
+                )
+            current_state = _normalized_runtime_task_state(
+                current.get("state")
+            )
+            incoming_state = incoming.get("state")
+
+            # At-least-once delivery can reorder terminal TaskNotification
+            # records.  Once terminal, a different terminal result is never a
+            # harmless enrichment: rejecting the complete patch keeps summary,
+            # usage and timestamps tied to the authoritative outcome.
+            if (
+                current_state in _RUNTIME_TASK_TERMINAL_STATES
+                and incoming_state in _RUNTIME_TASK_TERMINAL_STATES
+                and incoming_state != current_state
+            ):
+                return False
+
             # Task lifecycle delivery is at-least-once and can be reordered:
             # a delayed launch/backfill patch may arrive after the terminal
             # TaskNotification. Terminality is durable truth, so that stale
-            # ``running`` state may enrich other metadata but never revive the
-            # card or its inherited-background badge.
-            preserve_terminal_state = (
-                current.get("state") in _RUNTIME_TASK_TERMINAL_STATES
-                and fields.get("state") == "running"
+            # ``running`` state may enrich immutable card identity only.  It
+            # must not replace terminal summary/usage/timing metadata.
+            late_running_patch = (
+                current_state in _RUNTIME_TASK_TERMINAL_STATES
+                and incoming_state == "running"
             )
-            for key, value in fields.items():
-                if value is not None:
-                    if preserve_terminal_state and key == "state":
-                        continue
-                    current[key] = value
-            current["task_id"] = task_id
+            if late_running_patch:
+                incoming = {
+                    key: value for key, value in incoming.items()
+                    if (
+                        key in _RUNTIME_TASK_CROSS_COPY_IDENTITY_FIELDS
+                        and not current.get(key)
+                    )
+                }
+
+            updated = dict(current)
+            updated["owner_session_id"] = effective_owner
+            for key, value in incoming.items():
+                updated[key] = value
+            if current_state in _RUNTIME_TASK_TERMINAL_STATES:
+                updated["state"] = current_state
+            elif "state" in updated:
+                updated["state"] = _normalized_runtime_task_state(
+                    updated["state"]
+                )
+            updated["task_id"] = task_id
+            if isinstance(stored, dict) and stored == updated:
+                return False
+            overlays[task_id] = updated
             _save_sidecar(sid, data)
+            return True
+
+
+def _authoritative_runtime_task_snapshot(
+    task_id: str,
+    lineage: list[str],
+    overlays_by_sid: dict[str, dict[str, dict]],
+) -> tuple[str, dict] | None:
+    """Resolve a task once, from its earliest durable lineage appearance.
+
+    Successor overlays are replicated UI views.  Their later lifecycle state
+    is never allowed to overrule the process owner's record; they may only fill
+    missing card identity fields.
+    """
+    candidates: list[tuple[int, str, dict]] = []
+    for position, row_sid in enumerate(lineage):
+        value = overlays_by_sid.get(row_sid, {}).get(task_id)
+        if isinstance(value, dict):
+            candidates.append((position, row_sid, value))
+    if not candidates:
+        return None
+
+    first_position, first_sid, first = candidates[0]
+    declared_owner = str(first.get("owner_session_id") or "")
+    try:
+        declared_position = lineage.index(declared_owner)
+    except ValueError:
+        declared_position = -1
+    # A copied task may first survive in a child while correctly naming an
+    # earlier owner whose sidecar was lost.  A claimed future owner is not a
+    # valid provenance edge and falls back to the first durable appearance.
+    owner_sid = (
+        declared_owner
+        if 0 <= declared_position <= first_position
+        else first_sid
+    )
+    owner_record = overlays_by_sid.get(owner_sid, {}).get(task_id)
+    authority = (
+        owner_record if isinstance(owner_record, dict) else first
+    )
+    canonical = dict(authority)
+    canonical["task_id"] = task_id
+    canonical["owner_session_id"] = owner_sid
+    if "state" in canonical:
+        canonical["state"] = _normalized_runtime_task_state(
+            canonical["state"]
+        )
+    for _position, _row_sid, candidate in candidates:
+        for key in _RUNTIME_TASK_CROSS_COPY_IDENTITY_FIELDS:
+            if not canonical.get(key) and candidate.get(key) is not None:
+                canonical[key] = candidate[key]
+    return owner_sid, canonical
+
+
+def get_authoritative_runtime_task_overlays(sid: str) -> dict[str, dict]:
+    """Return lineage-visible task cards resolved from their true owner.
+
+    A source runtime cannot see tasks launched by a later successor.  A child
+    can see predecessor-owned tasks even if a crash interrupted the physical
+    overlay copy, because those owners precede it in the durable lineage.
+    """
+    lineage = runtime_lineage(sid)
+    if not lineage or sid not in lineage:
+        return get_runtime_task_overlays(sid)
+    current_position = lineage.index(sid)
+    visible_lineage = lineage[:current_position + 1]
+    overlays_by_sid = {
+        row_sid: get_runtime_task_overlays(row_sid)
+        for row_sid in lineage
+    }
+    visible_task_ids = {
+        task_id
+        for row_sid in visible_lineage
+        for task_id in overlays_by_sid.get(row_sid, {})
+    }
+    authoritative: dict[str, dict] = {}
+    for task_id in visible_task_ids:
+        resolved = _authoritative_runtime_task_snapshot(
+            task_id, lineage, overlays_by_sid
+        )
+        if resolved is not None:
+            authoritative[task_id] = resolved[1]
+    return authoritative
+
+
+def _replace_runtime_task_overlay_snapshot(
+    sid: str,
+    task_id: str,
+    snapshot: dict,
+) -> bool:
+    """Repair helper that replaces one copied snapshot exactly."""
+    with session_lifecycle_lock(sid):
+        with _QUEUE_LOCK:
+            if sid in _DELETED_SESSION_IDS:
+                return False
+        with _SIDECAR_LOCK:
+            data = _load_sidecar(sid, use_cache=False)
+            overlays = data.setdefault("runtime_task_overlays", {})
+            if not isinstance(overlays, dict):
+                overlays = {}
+                data["runtime_task_overlays"] = overlays
+            replacement = dict(snapshot)
+            replacement["task_id"] = task_id
+            if overlays.get(task_id) == replacement:
+                return False
+            overlays[task_id] = replacement
+            _save_sidecar(sid, data)
+            return True
+
+
+def reconcile_runtime_task_overlay_chains() -> int:
+    """Repair owner snapshots across every indexed runtime rollover chain.
+
+    Reconciliation is intended for startup before orphan settlement.  It
+    restores copied descendants from the earliest owner snapshot, then the
+    ordinary stale-task pass can settle only the genuine owner state and
+    replicate that result without mistaking a successor for a new process.
+    """
+    with _INDEX_LOCK:
+        rows = _load_index()
+    indexed_ids = [
+        str(row.get("id"))
+        for row in rows
+        if isinstance(row, dict) and row.get("id")
+    ]
+    repaired = 0
+    visited: set[str] = set()
+    for indexed_sid in indexed_ids:
+        if indexed_sid in visited:
+            continue
+        lineage = _runtime_lineage_from_rows(indexed_sid, rows)
+        if not lineage:
+            continue
+        visited.update(lineage)
+        overlays_by_sid = {
+            row_sid: get_runtime_task_overlays(row_sid)
+            for row_sid in lineage
+        }
+        task_ids = {
+            task_id
+            for overlay in overlays_by_sid.values()
+            for task_id in overlay
+        }
+        for task_id in task_ids:
+            resolved = _authoritative_runtime_task_snapshot(
+                task_id, lineage, overlays_by_sid
+            )
+            if resolved is None:
+                continue
+            owner_sid, canonical = resolved
+            try:
+                owner_position = lineage.index(owner_sid)
+            except ValueError:
+                continue
+            # Child-owned tasks do not exist in predecessor context.  Copy the
+            # canonical owner record only forward from its launch runtime.
+            for target_sid in lineage[owner_position:]:
+                if _replace_runtime_task_overlay_snapshot(
+                    target_sid, task_id, canonical
+                ):
+                    repaired += 1
+                    overlays_by_sid.setdefault(target_sid, {})[task_id] = dict(
+                        canonical
+                    )
+    return repaired
 
 
 def copy_runtime_task_overlays(source_sid: str, target_sid: str) -> int:
@@ -1380,14 +1737,15 @@ def stop_stale_runtime_task_overlays() -> int:
         for task_id, overlay in get_runtime_task_overlays(sid).items():
             if overlay.get("state") != "running":
                 continue
-            set_runtime_task_overlay(
+            changed = set_runtime_task_overlay(
                 sid,
                 task_id,
                 state="stopped",
                 updated_at=now_ms,
                 restart_recovered=True,
             )
-            stopped += 1
+            if changed:
+                stopped += 1
     return stopped
 
 
@@ -2043,6 +2401,7 @@ def enqueue_message(sid: str, text: str, image_ids: str = "",
                             "runtime_shadow", "runtime_successor",
                             "runtime_predecessor",
                             "runtime_boundary_message_id",
+                            "runtime_fork_boundary_at",
                         )
                         if existing_session.get(key) is not None
                     }

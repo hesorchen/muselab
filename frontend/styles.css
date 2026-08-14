@@ -347,6 +347,42 @@ html[data-theme="eyecare"] {
   --c-thinking-fg: #5a6a4a;
 }
 
+/* Eyecare intensity is a deliberately small, curated scale rather than a
+   global opacity/sepia filter. Filters distort screenshots, image previews,
+   charts and syntax colors; token palettes warm only MuseLab chrome while
+   preserving content fidelity. Level 2 above is the historical/default
+   palette. Level 1 reduces the paper tint; level 3 lowers the blue channel
+   while keeping enough luminance for the existing accessible ANSI palette. */
+html[data-theme="eyecare"][data-eyecare-level="1"] {
+  --c-bg-0: #fbf9f1;
+  --c-bg-1: #f8f5ec;
+  --c-bg-2: #f3efe6;
+  --c-bg-3: #e8e3d8;
+  --c-bg-4: #d8d0c2;
+  --c-bg-5: #c1b8a9;
+  --c-border: #e9e4da;
+  --c-border-strong: #dcd5c8;
+  --c-user-bg: #e8f0e3;
+  --c-assistant-bg: #f8f5ec;
+  --c-tool-bg: #f6f0e2;
+  --c-thinking-bg: #f1f1e8;
+}
+
+html[data-theme="eyecare"][data-eyecare-level="3"] {
+  --c-bg-0: #faedce;
+  --c-bg-1: #f5e9cc;
+  --c-bg-2: #f1e4c7;
+  --c-bg-3: #e8d9b8;
+  --c-bg-4: #d4c198;
+  --c-bg-5: #baa67d;
+  --c-border: #e7dabd;
+  --c-border-strong: #d5c49f;
+  --c-user-bg: #e0ebcf;
+  --c-assistant-bg: #f5e9cc;
+  --c-tool-bg: #f5e5c4;
+  --c-thinking-bg: #ede4ca;
+}
+
 
 html, body {
   margin: 0; height: 100%; overflow: hidden;
@@ -6607,9 +6643,22 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 .ctx-chip.warn:hover { filter: brightness(1.05); }
 
 /* ===== Slash command popup ===== */
-.slash-pop .mention-item { display: flex; gap: 10px; align-items: baseline; }
-.slash-name { font-weight: var(--fw-semibold); color: var(--c-accent); flex-shrink: 0; min-width: 80px; }
-.slash-desc { color: var(--c-fg-2); font-size: var(--fs-xs); }
+.slash-pop .mention-item { display: flex; gap: 10px; align-items: baseline; min-width: 0; }
+.slash-name {
+  font-weight: var(--fw-semibold); color: var(--c-accent);
+  flex: 0 1 auto; min-width: 80px; max-width: 48%;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.slash-desc {
+  color: var(--c-fg-2); font-size: var(--fs-xs);
+  flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.slash-current {
+  flex: 0 0 auto; padding: 1px 5px; border-radius: var(--r-full);
+  color: var(--c-accent-fg); background: var(--c-accent-soft);
+  font-size: var(--fs-2xs);
+}
 
 /* ===== TodoWrite checklist ===== */
 .todo-card {
@@ -8458,7 +8507,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 }
 
 /* 语言切换：两个胶囊按钮 */
-.lang-picker, .theme-picker {
+.lang-picker, .theme-picker, .eyecare-level-picker {
   display: inline-flex; gap: 0;
   border: 1px solid var(--c-border-strong); border-radius: var(--r-md);
   overflow: hidden;
@@ -8466,17 +8515,20 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
                               产生右侧空白带边框 — 强制 hug 内容宽 */
   width: fit-content;
 }
-.lang-picker .btn-ghost, .theme-picker .btn-ghost {
+.lang-picker .btn-ghost, .theme-picker .btn-ghost,
+.eyecare-level-picker .btn-ghost {
   height: 32px; padding: 0 14px; border-radius: 0; border: 0;
   background: transparent; color: var(--c-fg-3);
   transition: background var(--t-fast), color var(--t-fast);
 }
-.lang-picker .btn-ghost.active, .theme-picker .btn-ghost.active {
+.lang-picker .btn-ghost.active, .theme-picker .btn-ghost.active,
+.eyecare-level-picker .btn-ghost.active {
   background: var(--c-btn-primary-bg); color: var(--c-on-accent);
   font-weight: 600;
 }
 .lang-picker .btn-ghost:hover:not(.active),
-.theme-picker .btn-ghost:hover:not(.active) { background: var(--c-bg-2); color: var(--c-fg-0); }
+.theme-picker .btn-ghost:hover:not(.active),
+.eyecare-level-picker .btn-ghost:hover:not(.active) { background: var(--c-bg-2); color: var(--c-fg-0); }
 
 /* ==========================================================================
    Scrollbars
@@ -9844,14 +9896,20 @@ html[data-theme="dark"] .bubble :not(pre) > code:not(.has-file-link) * {
    the hidden ones — animating an invisible element wastes paint cycles
    and could leak through if a child uses currentColor.
    ========================================================================== */
-.msg:not(.user):not(.compact) + .msg:not(.user):not(.compact) .msg-avatar {
+/* A durable runtime-continuation is a new assistant turn even though it has no
+   user row before it.  Its stable history key is already exposed as
+   data-message-key, so keep that turn's avatar visible without adding another
+   reactive class binding to the large message template. */
+.msg:not(.user):not(.compact) +
+.msg:not(.user):not(.compact):not([data-message-key*="runtime-continuation:"]) .msg-avatar {
   visibility: hidden;
   animation: none;
   border-color: transparent;
   background: transparent;
   box-shadow: none;
 }
-.msg:not(.user):not(.compact) + .msg:not(.user):not(.compact) .msg-avatar svg {
+.msg:not(.user):not(.compact) +
+.msg:not(.user):not(.compact):not([data-message-key*="runtime-continuation:"]) .msg-avatar svg {
   animation: none;
 }
 

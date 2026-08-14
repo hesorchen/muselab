@@ -1,4 +1,6 @@
 import functools
+import hashlib
+import json
 import logging
 import os
 import re
@@ -26,11 +28,57 @@ from .terminal import router as terminal_router
 from .file_events import router as file_events_router
 from .settings import ROOT, PORT, HOST
 from .version import project_version
+from .observability import (
+    elapsed_ms as _perf_elapsed_ms,
+    is_slow as _perf_is_slow,
+    monotonic as _perf_monotonic,
+    perf_enabled as _perf_enabled,
+    perf_event,
+)
 
 
 class _TokenFilter(logging.Filter):
-    """Strip reusable tokens and capability tickets from access-log URLs."""
-    _re = re.compile(r'(?P<name>token|ticket)=[^&\s"]+')
+    """Make Uvicorn access logs low-volume and safe for local archives.
+
+    Uvicorn receives the concrete request target, not FastAPI's route
+    template.  Logging it verbatim exposes every query value and stable
+    session UUID.  The privacy-safe slow/error ASGI middleware below replaces
+    raw access logging, so every Uvicorn access record is dropped.  The target
+    sanitizer remains here as a fail-closed regression surface and for any
+    future explicitly opted-in access sink.
+    """
+
+    _uuid_re = re.compile(
+        r"(?i)(?<![0-9a-f])(?:"
+        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+        r"[0-9a-f]{4}-[0-9a-f]{12}|[0-9a-f]{32}"
+        r")(?![0-9a-f])"
+    )
+    _safe_query_name_re = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]{0,63}$")
+    _known_query_names = frozenset({
+        "around_uuid", "cursor", "direction", "full", "ids", "image_ids",
+        "limit", "mobile", "model", "offset", "path", "permission",
+        "preview", "q", "root", "session_id", "show_hidden", "tail",
+        "ticket", "token", "turn_id", "v", "workspace",
+    })
+
+    @classmethod
+    def _safe_target(cls, target: str) -> str:
+        path, separator, raw_query = target.partition("?")
+        safe_path = cls._uuid_re.sub(":id", path)
+        if not separator:
+            return safe_path
+        safe_parts: list[str] = []
+        for part in raw_query.split("&"):
+            raw_name = part.partition("=")[0]
+            name = (
+                raw_name
+                if (cls._safe_query_name_re.fullmatch(raw_name)
+                    and raw_name in cls._known_query_names)
+                else "param"
+            )
+            safe_parts.append(f"{name}=***")
+        return f"{safe_path}?{'&'.join(safe_parts)}"
 
     def filter(self, record: logging.LogRecord) -> bool:
         # uvicorn's access logger calls info("%s - \"%s %s HTTP/%s\" %d", ...)
@@ -38,42 +86,31 @@ class _TokenFilter(logging.Filter):
         # is just the format template). The token sits in the URL/path, i.e.
         # args[2].
         #
-        # 2026-06-08 fix: the previous version rendered the message, scrubbed
-        # it, then set `record.args = ()`. That blanked the 5-tuple uvicorn's
-        # AccessFormatter unpacks — `(client_addr, method, full_path,
-        # http_version, status) = record.args` — so EVERY authed request
-        # (token= is in nearly all of them) spammed journald with
-        # "--- Logging error --- ValueError: not enough values to unpack
-        # (expected 5, got 0)". Redact INSIDE the args tuple instead, leaving
-        # the 5-tuple shape intact so the formatter still works.
+        # Normalize the structured tuple before suppressing the raw access
+        # record. This keeps the filter fail-safe if another handler inspects
+        # the record, while privacy-safe slow/error summaries are emitted by
+        # the HTTP observability middleware instead.
         args = record.args
         if isinstance(args, tuple) and len(args) == 5:
             full_path = args[2]
-            if isinstance(full_path, str) and (
-                "token=" in full_path or "ticket=" in full_path
-            ):
+            if isinstance(full_path, str):
                 record.args = (
                     args[0], args[1],
-                    self._re.sub(r"\g<name>=***", full_path),
+                    self._safe_target(full_path),
                     args[3], args[4],
                 )
-            return True
-        # Fallback for any non-access-log record routed through this filter
-        # (different arg shape → not consumed by AccessFormatter's 5-tuple
-        # unpack, so collapsing to a scrubbed literal is safe here).
-        try:
-            message = record.getMessage()
-        except Exception:
-            return True
-        redacted = self._re.sub(r"\g<name>=***", message)
-        if redacted != message:
-            record.msg = redacted
-            record.args = ()
-        return True
+            return False
+        # A future Uvicorn format change must fail closed.  Free-form access
+        # messages can contain a prompt-bearing legacy URL, so do not attempt a
+        # best-effort scrub that might miss an unusual query encoding.
+        record.msg = "access event suppressed: unsupported log shape"
+        record.args = ()
+        return False
 
 
 # Apply to uvicorn access logger
 logging.getLogger("uvicorn.access").addFilter(_TokenFilter())
+_CLIENT_ERROR_LOG = logging.getLogger("muselab.client")
 
 FRONTEND = Path(__file__).resolve().parent.parent / "frontend"
 
@@ -81,6 +118,8 @@ FRONTEND = Path(__file__).resolve().parent.parent / "frontend"
 # event loop's weak task references don't let them be GC'd mid-run.
 _BG_TASKS: set = set()
 GRACEFUL_SHUTDOWN_TIMEOUT = 3
+_LOOP_LAG_INTERVAL_S = 1.0
+_LOOP_LAG_THRESHOLD_MS = 250
 
 
 _ASSET_VERSION_CANDIDATES = tuple(sorted(
@@ -170,6 +209,28 @@ def _launch_background_tasks(coroutines) -> None:
         task.add_done_callback(_BG_TASKS.discard)
 
 
+async def _monitor_event_loop_lag() -> None:
+    """Emit only actionable event-loop stalls; stay silent on healthy ticks."""
+    if not _perf_enabled():
+        return
+    import asyncio
+
+    expected = _perf_monotonic() + _LOOP_LAG_INTERVAL_S
+    while True:
+        await asyncio.sleep(_LOOP_LAG_INTERVAL_S)
+        observed = _perf_monotonic()
+        lag_ms = max(0, round((observed - expected) * 1000))
+        if lag_ms >= _LOOP_LAG_THRESHOLD_MS:
+            try:
+                perf_event("runtime.loop_lag", lag_ms=lag_ms)
+            except Exception:
+                # Diagnostics must never terminate their own long-lived monitor.
+                pass
+        # Reset after a stall so one pause creates one event rather than a
+        # permanent positive offset on every later healthy tick.
+        expected = observed + _LOOP_LAG_INTERVAL_S
+
+
 async def _recover_message_queues_at_startup(session_store) -> int:
     """Restore durable claims and leave every surviving queue paused.
 
@@ -228,6 +289,19 @@ async def _lifespan(app: FastAPI):
         _asyncio.to_thread(_sess.ensure_private_session_storage),
         _asyncio.to_thread(_activity.initialize_runtime_state),
     )
+    # Older releases allowed a successor CLI's synthetic ``stopped`` record to
+    # overwrite the predecessor's real terminal state. Repair each runtime
+    # chain from its oldest owner before applying restart recovery, so a true
+    # completed task is never relabelled stopped merely because the process
+    # restarted later.
+    repaired_runtime_tasks = await _asyncio.to_thread(
+        _sess.reconcile_runtime_task_overlay_chains)
+    if repaired_runtime_tasks:
+        sys.stderr.write(
+            f"[muselab] repaired {repaired_runtime_tasks} inherited runtime "
+            "task overlay(s) on startup\n")
+        sys.stderr.flush()
+
     # Runtime-rollover task cards are durable UI overlays, but their owning
     # CLI process and watcher are intentionally process-local.  After a
     # service restart there is therefore no legitimate way for a persisted
@@ -258,6 +332,21 @@ async def _lifespan(app: FastAPI):
         sys.stderr.write(
             f"[muselab] recovered {recovered} paused message queue(s) "
             "on startup\n")
+        sys.stderr.flush()
+    # A hidden background-task owner can finish its Agent continuation just
+    # before the process exits.  The private READY outbox survives that crash;
+    # resume its presentation-only delivery to the latest visible successor.
+    # Scheduling is non-blocking, and queue recovery above has already paused
+    # every stale claim so no restarted turn can race ahead of the projection.
+    from . import chat as _chat
+    recovered_continuations = await (
+        _chat.recover_runtime_continuation_outboxes_at_startup()
+    )
+    if recovered_continuations:
+        sys.stderr.write(
+            f"[muselab] resumed {recovered_continuations} pending runtime "
+            "continuation delivery task(s) on startup\n"
+        )
         sys.stderr.flush()
     await _start_optional_services(_sched, _push, _mem0)
     # Prune empty sessions + auto-purge expired trash. Both used to block
@@ -322,6 +411,7 @@ async def _lifespan(app: FastAPI):
     # background work. Stash them on a module-level set and drop each one
     # when it finishes so the set doesn't grow unbounded.
     _launch_background_tasks((
+        _monitor_event_loop_lag(),
         _bg_prune_sessions(),
         _bg_purge_trash(),
         _bg_warm_versions(),
@@ -509,6 +599,122 @@ class _SecurityHeadersMiddleware:
 app.add_middleware(_SecurityHeadersMiddleware)
 
 
+def _safe_http_route(scope: Scope) -> str:
+    """Return only a code-defined route template, never a concrete URL."""
+    route = scope.get("route")
+    template = getattr(route, "path", "")
+    if isinstance(template, str) and template.startswith("/"):
+        return template
+    # A 404 has no matched route.  Do not derive a fallback from scope["path"]:
+    # it may be a private filename or another user-controlled value.
+    return "<unmatched>"
+
+
+def _emit_http_perf(**fields: object) -> None:
+    """Performance diagnostics must never be able to fail an HTTP request."""
+    try:
+        perf_event("http.request", **fields)
+    except Exception:
+        pass
+
+
+class _RequestPerformanceMiddleware:
+    """Log only slow or failed HTTP requests using privacy-safe dimensions.
+
+    This is a direct ASGI wrapper rather than ``BaseHTTPMiddleware`` so it
+    does not add task boundaries or buffer SSE.  Ordinary responses are timed
+    through their final body chunk.  For SSE, the only meaningful HTTP latency
+    is time-to-response-headers; the long-lived connection is deliberately not
+    reported as a slow request.
+    """
+
+    def __init__(self, app: ASGIApp):
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http" or not _perf_enabled():
+            await self.app(scope, receive, send)
+            return
+
+        started = _perf_monotonic()
+        status_code = 500
+        response_started = False
+        response_complete = False
+        is_sse = False
+        emitted = False
+        response_bytes = 0
+        headers_ms: int | None = None
+
+        def emit_if_needed(phase: str, *, error_kind: str = "") -> None:
+            nonlocal emitted
+            if emitted:
+                return
+            duration_ms = (
+                headers_ms
+                if phase == "handshake" and headers_ms is not None
+                else _perf_elapsed_ms(started)
+            )
+            if (status_code < 400 and not error_kind
+                    and not _perf_is_slow(duration_ms)):
+                return
+            emitted = True
+            method = str(scope.get("method") or "UNKNOWN").upper()
+            if not re.fullmatch(r"[A-Z]{1,16}", method):
+                method = "OTHER"
+            _emit_http_perf(
+                method=method,
+                route=_safe_http_route(scope),
+                status_code=status_code,
+                duration_ms=duration_ms,
+                headers_ms=headers_ms,
+                response_bytes=response_bytes,
+                phase=phase,
+                error_kind=error_kind or None,
+            )
+
+        async def send_with_timing(message: Message) -> None:
+            nonlocal status_code, response_started, response_complete, is_sse
+            nonlocal response_bytes, headers_ms
+            if message["type"] == "http.response.start":
+                response_started = True
+                status_code = int(message.get("status") or 500)
+                headers_ms = _perf_elapsed_ms(started)
+                for name, value in message.get("headers") or ():
+                    if name.lower() == b"content-type":
+                        is_sse = value.lower().startswith(b"text/event-stream")
+                        break
+                if is_sse:
+                    emit_if_needed("handshake")
+            elif message["type"] == "http.response.body":
+                if not is_sse:
+                    body = message.get("body", b"")
+                    if isinstance(body, (bytes, bytearray, memoryview)):
+                        response_bytes += len(body)
+                if not message.get("more_body", False):
+                    response_complete = True
+                    if not is_sse:
+                        emit_if_needed("complete")
+            await send(message)
+
+        try:
+            await self.app(scope, receive, send_with_timing)
+            # Defensive ASGI fallback for an app that omits the terminal empty
+            # body frame.  Never use it for SSE: that would measure connection
+            # lifetime instead of handshake latency.
+            if response_started and not response_complete and not is_sse:
+                emit_if_needed("complete")
+        except Exception as exc:
+            # Once an SSE handshake is sent, a later disconnect/stream failure
+            # belongs to stream diagnostics, not HTTP request duration.
+            if not (response_started and is_sse):
+                emit_if_needed("handshake" if not response_started else "complete",
+                               error_kind=type(exc).__name__)
+            raise
+
+
+app.add_middleware(_RequestPerformanceMiddleware)
+
+
 app.include_router(files_router)
 app.include_router(file_events_router)
 app.include_router(chat_router)
@@ -559,8 +765,9 @@ def _detect_versions() -> dict:
 # at import time used to spawn a `claude --version` subprocess that blocked
 # module load for up to 3s, delaying uvicorn cold start.
 
-# Surface the resolved config so ops can confirm what the running process
-# is actually using — host / port / root / which third-party vendors are
+# Surface a privacy-bounded config summary so ops can confirm what the running
+# process is actually using — host / port / whether a root override exists /
+# which third-party vendors are
 # enabled. Helps diagnose "I added DEEPSEEK_API_KEY but the model picker
 # still doesn't show it" by making the env-var-vs-process state explicit.
 def _startup_config_banner() -> None:
@@ -570,7 +777,9 @@ def _startup_config_banner() -> None:
     enabled = [p.display for p in _ep.catalog()
                  if os.environ.get(p.env_key)]
     enabled_s = ", ".join(enabled) if enabled else "(none — Claude only)"
-    print(f"[muselab] config: host={host} port={port} root={ROOT} "
+    root_configured = bool(os.environ.get("MUSELAB_ROOT", "").strip())
+    print(f"[muselab] config: host={host} port={port} "
+          f"root_configured={str(root_configured).lower()} "
           f"third_party={enabled_s}",
           file=sys.stderr, flush=True)
 _startup_config_banner()
@@ -812,6 +1021,28 @@ _CLIENT_ERR_BUCKETS: dict[str, tuple[float, int]] = {}
 _CLIENT_ERR_WINDOW_SEC = 60.0
 _CLIENT_ERR_PER_WINDOW = 30
 _CLIENT_ERR_BODY_LIMIT = 8 * 1024
+_CLIENT_ERR_FINGERPRINT_KEY = os.urandom(16)
+_CLIENT_ERR_KINDS = frozenset({
+    "error",
+    "unhandledrejection",
+    "resource",
+    "message_render_key",
+    "frontend_diagnostic",
+})
+_CLIENT_ERR_NAMES = frozenset({
+    "AbortError", "AggregateError", "DataError", "Error", "EvalError",
+    "InvalidStateError", "NetworkError", "NotAllowedError", "NotFoundError",
+    "NotReadableError", "OperationError", "QuotaExceededError", "RangeError",
+    "ReferenceError", "SecurityError", "SyntaxError", "TimeoutError",
+    "TypeError", "URIError", "UnknownError",
+})
+_CLIENT_ERR_METHODS = frozenset({
+    "DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT",
+})
+_CLIENT_ERR_RESOURCE_TAGS = frozenset({
+    "AUDIO", "IFRAME", "IMG", "LINK", "SCRIPT", "SOURCE", "VIDEO",
+})
+_CLIENT_ERR_ISSUES = frozenset({"duplicate", "missing"})
 
 
 def _client_err_allow(ip: str) -> bool:
@@ -834,6 +1065,86 @@ def _client_err_allow(ip: str) -> bool:
     return True
 
 
+def _client_error_fingerprint(value: object) -> str:
+    """Return a process-local correlation token, never reversible log text."""
+    if not isinstance(value, str) or not value:
+        return ""
+    return hashlib.blake2s(
+        value.encode("utf-8", errors="replace"),
+        key=_CLIENT_ERR_FINGERPRINT_KEY,
+        digest_size=8,
+    ).hexdigest()
+
+
+def _client_error_int(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return 0
+    return min(10_000_000, max(0, value))
+
+
+def _safe_client_error_record(payload: object) -> dict[str, object] | None:
+    """Validate one browser diagnostic and return its strict safe projection."""
+    if not isinstance(payload, dict):
+        return None
+    kind = payload.get("kind")
+    if not isinstance(kind, str) or kind not in _CLIENT_ERR_KINDS:
+        return None
+
+    if kind in {"message_render_key", "frontend_diagnostic"}:
+        counts = {issue: 0 for issue in _CLIENT_ERR_ISSUES}
+        issues = payload.get("issues")
+        if not isinstance(issues, list):
+            return None
+        for item in issues[:32]:
+            if not isinstance(item, dict):
+                continue
+            issue = item.get("issue")
+            count = item.get("count")
+            if (issue in _CLIENT_ERR_ISSUES
+                    and isinstance(count, int) and not isinstance(count, bool)
+                    and count > 0):
+                counts[issue] = min(100_000, counts[issue] + count)
+        if not any(counts.values()):
+            return None
+        # Deliberately omit pane/session/message keys.  The aggregate is enough
+        # to detect a reconciliation regression without retaining user state.
+        return {
+            "kind": kind,
+            "duplicate_count": counts["duplicate"],
+            "missing_count": counts["missing"],
+        }
+
+    raw_name = payload.get("name")
+    error_name = (
+        raw_name
+        if isinstance(raw_name, str) and raw_name in _CLIENT_ERR_NAMES
+        else "OtherError"
+    )
+    record: dict[str, object] = {
+        "kind": kind,
+        "error_name": error_name,
+        "line": _client_error_int(payload.get("lineno")),
+        "column": _client_error_int(payload.get("colno")),
+    }
+    reason_fp = _client_error_fingerprint(payload.get("message"))
+    trace_fp = _client_error_fingerprint(payload.get("stack"))
+    if reason_fp:
+        record["reason_fp"] = reason_fp
+    if trace_fp:
+        record["trace_fp"] = trace_fp
+    last_fetch = payload.get("lastFetch")
+    if isinstance(last_fetch, dict):
+        method = str(last_fetch.get("method") or "").upper()
+        if method in _CLIENT_ERR_METHODS:
+            record["last_method"] = method
+    if kind == "resource":
+        tag = str(payload.get("tagName") or "").upper()
+        record["resource_tag"] = (
+            tag if tag in _CLIENT_ERR_RESOURCE_TAGS else "OTHER"
+        )
+    return record
+
+
 @app.post("/api/log/client-error")
 async def client_error_log(request: Request) -> dict:
     """Capture browser-side JS errors that the user can't easily extract
@@ -841,13 +1152,13 @@ async def client_error_log(request: Request) -> dict:
     unauthenticated — the page that emits these may not be authed yet
     (errors during boot), and the only side-effect is a stderr line.
 
-    Body is opaque JSON, size-capped, written verbatim to stderr so it
-    lands in systemd/docker logs alongside server-side tracebacks. No
-    storage, no parsing — keep the surface tiny on purpose.
+    The input is size-capped and projected through a strict allowlist. Error
+    text, stack content, URLs, fetch targets, filenames, UA strings, session
+    IDs, and arbitrary extra fields are never persisted. Message/stack hashes
+    use a process-local keyed digest solely for duplicate correlation.
 
     Rate-limited per IP (30 / minute) so a runaway error loop in the
     browser can't fill journald / docker logs."""
-    import json as _json
     ip = (request.client.host if request.client else "?") or "?"
     if not _client_err_allow(ip):
         return {"ok": True, "rate_limited": True}
@@ -876,22 +1187,25 @@ async def client_error_log(request: Request) -> dict:
             body.extend(chunk)
         raw = bytes(body)
     except Exception as e:
-        sys.stderr.write(f"[client-error] body read failed: {type(e).__name__}: {e}\n")
-        sys.stderr.flush()
+        _CLIENT_ERROR_LOG.warning(
+            "browser diagnostic body read failed exc=%s", type(e).__name__)
         return {"ok": False}
     try:
-        payload = _json.loads(raw.decode("utf-8", errors="replace"))
-        line = _json.dumps(payload, ensure_ascii=False)[:_CLIENT_ERR_BODY_LIMIT]
-    except Exception:
-        # Invalid-JSON fallback writes the raw body. json.dumps above
-        # escapes embedded newlines, but this path doesn't — a body with
-        # CR/LF would forge extra "[client-error] …" log lines (log
-        # injection). Collapse CR/LF to spaces so one request stays one
-        # log line.
-        line = raw.decode("utf-8", errors="replace")[:_CLIENT_ERR_BODY_LIMIT]
-        line = line.replace("\r", " ").replace("\n", " ")
-    sys.stderr.write(f"[client-error] {line}\n")
-    sys.stderr.flush()
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        # Never mirror malformed/raw input into logs.
+        return JSONResponse(
+            {"ok": False, "error": "invalid_json"}, status_code=400)
+    safe_record = _safe_client_error_record(payload)
+    if safe_record is None:
+        return JSONResponse(
+            {"ok": False, "error": "invalid_payload"}, status_code=422)
+    encoded = json.dumps(
+        safe_record, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+    if safe_record["kind"] in {"message_render_key", "frontend_diagnostic"}:
+        _CLIENT_ERROR_LOG.warning("browser diagnostic %s", encoded)
+    else:
+        _CLIENT_ERROR_LOG.error("browser error %s", encoded)
     return {"ok": True}
 
 

@@ -23,6 +23,7 @@ from watchfiles import Change, awatch
 from .auth import require_token
 from .capability_tickets import tickets
 from .files import INTERNAL_DIR_NAME, TRASH_DIR_NAME
+from .observability import elapsed_ms, is_slow, monotonic, perf_event, short_id
 from .workspace_store import WorkspaceStore, is_ignored_descendant
 from .workspaces import registry, resolve_workspace_root
 
@@ -43,6 +44,14 @@ _FORCE_POLLING: bool | None = (
     if _POLLING_ENV is None
     else _POLLING_ENV.strip().lower() in {"1", "true", "yes", "on"}
 )
+
+
+def _perf_event(event: str, /, **fields: Any) -> None:
+    """Keep diagnostics from changing file-index lifecycle semantics."""
+    try:
+        perf_event(event, **fields)
+    except Exception:
+        pass
 
 
 @dataclass
@@ -70,6 +79,7 @@ class _WatchState:
     reconcile_running: bool = False
     scan_cancel: threading.Event = field(default_factory=threading.Event)
     stop_task: asyncio.Task[None] | None = None
+    queue_overflow_active: bool = False
 
 
 def _normalise_bootstrap_parents(
@@ -673,14 +683,43 @@ class FileWatchManager:
         show_hidden: bool = False,
         parents: list[str] | None = None,
     ) -> dict[str, Any]:
-        state = await self.ensure_workspace(root)
-        await self._await_baseline(state)
-        return await asyncio.to_thread(
-            self.store.bootstrap,
-            state.workspace_id,
-            show_hidden=show_hidden,
-            parents=parents,
+        started = monotonic()
+        state: _WatchState | None = None
+        try:
+            state = await self.ensure_workspace(root)
+            await self._await_baseline(state)
+            payload = await asyncio.to_thread(
+                self.store.bootstrap,
+                state.workspace_id,
+                show_hidden=show_hidden,
+                parents=parents,
+            )
+        except asyncio.CancelledError:
+            _perf_event(
+                "files.bootstrap",
+                workspace=(short_id(state.workspace_id) if state else None),
+                status="cancelled",
+                total_ms=elapsed_ms(started),
+            )
+            raise
+        except Exception as exc:
+            _perf_event(
+                "files.bootstrap",
+                workspace=(short_id(state.workspace_id) if state else None),
+                status="error",
+                error_type=type(exc).__name__,
+                total_ms=elapsed_ms(started),
+            )
+            raise
+        _perf_event(
+            "files.bootstrap",
+            workspace=short_id(state.workspace_id),
+            status="ok",
+            total_ms=elapsed_ms(started),
+            entries=len(payload.get("entries") or ()),
+            partial=bool(payload.get("partial", False)),
         )
+        return payload
 
     async def current_cursor(self, root: Path) -> int:
         state = await self.ensure_workspace(root)
@@ -710,14 +749,48 @@ class FileWatchManager:
         *,
         limit: int = 2000,
     ) -> dict[str, Any]:
-        state = await self.ensure_workspace(root)
-        await self._await_baseline(state)
-        return await asyncio.to_thread(
-            self.store.delta,
-            state.workspace_id,
-            cursor,
-            limit=limit,
-        )
+        started = monotonic()
+        state: _WatchState | None = None
+        try:
+            state = await self.ensure_workspace(root)
+            await self._await_baseline(state)
+            payload = await asyncio.to_thread(
+                self.store.delta,
+                state.workspace_id,
+                cursor,
+                limit=limit,
+            )
+        except asyncio.CancelledError:
+            _perf_event(
+                "files.delta",
+                workspace=(short_id(state.workspace_id) if state else None),
+                status="cancelled",
+                total_ms=elapsed_ms(started),
+            )
+            raise
+        except Exception as exc:
+            _perf_event(
+                "files.delta",
+                workspace=(short_id(state.workspace_id) if state else None),
+                status="error",
+                error_type=type(exc).__name__,
+                total_ms=elapsed_ms(started),
+            )
+            raise
+        total_ms = elapsed_ms(started)
+        resync = bool(payload.get("resync"))
+        has_more = bool(payload.get("has_more"))
+        if is_slow(total_ms) or resync or has_more:
+            _perf_event(
+                "files.delta",
+                workspace=short_id(state.workspace_id),
+                status="ok",
+                total_ms=total_ms,
+                changes=len(payload.get("changes") or ()),
+                resync=resync,
+                has_more=has_more,
+            )
+        return payload
 
     async def _await_baseline(self, state: _WatchState) -> None:
         if not state.initialized:
@@ -790,29 +863,70 @@ class FileWatchManager:
         self,
         state: _WatchState,
     ) -> None:
+        started = monotonic()
+        metrics: dict[str, int | bool] = {
+            "scan_slot_wait_ms": 0,
+            "mutation_lock_wait_ms": 0,
+            "scan_ms": 0,
+            "replay_ms": 0,
+            "changes": 0,
+            "resync": False,
+        }
+        status = "error"
+        error_type: str | None = None
         try:
-            await self._reconcile_and_broadcast_impl(state)
+            await self._reconcile_and_broadcast_impl(state, metrics)
+            status = "ok"
+        except asyncio.CancelledError:
+            status = "cancelled"
+            error_type = "CancelledError"
+            raise
+        except Exception as exc:
+            error_type = type(exc).__name__
+            raise
         finally:
             # Keep this true through replay, broadcast, and watcher-path
             # refresh. A watcher generation that changes anywhere after the
             # snapshot begins must queue one more armed closing pass.
             state.reconcile_running = False
+            _perf_event(
+                "files.reconcile",
+                workspace=short_id(state.workspace_id),
+                status=status,
+                error_type=error_type,
+                scan_slot_wait_ms=metrics["scan_slot_wait_ms"],
+                mutation_lock_wait_ms=metrics["mutation_lock_wait_ms"],
+                scan_ms=metrics["scan_ms"],
+                replay_ms=metrics["replay_ms"],
+                changes=metrics["changes"],
+                resync=metrics["resync"],
+                total_ms=elapsed_ms(started),
+            )
 
     async def _reconcile_and_broadcast_impl(
         self,
         state: _WatchState,
+        metrics: dict[str, int | bool],
     ) -> None:
         broadcast_payload: dict[str, Any] | None = None
         while True:
             # Wait for the single full-scan slot before taking this workspace's
             # mutation lock. A workspace queued behind another long scan must
             # keep accepting cheap watcher batches in the meantime.
+            scan_slot_started = monotonic()
             await self._reconcile_semaphore.acquire()
+            metrics["scan_slot_wait_ms"] = int(
+                metrics["scan_slot_wait_ms"]
+            ) + elapsed_ms(scan_slot_started)
             scan_slot_held = True
             mutation_lock_held = False
             retry_after_arm = False
             try:
+                mutation_lock_started = monotonic()
                 await state.mutation_lock.acquire()
+                metrics["mutation_lock_wait_ms"] = int(
+                    metrics["mutation_lock_wait_ms"]
+                ) + elapsed_ms(mutation_lock_started)
                 mutation_lock_held = True
                 # The watcher may have restarted while this workspace waited
                 # behind another scan. Do not take a snapshot in that unarmed
@@ -828,37 +942,55 @@ class FileWatchManager:
                         self.store.current_cursor,
                         state.workspace_id,
                     )
-                    await asyncio.to_thread(
-                        self.store.reconcile,
-                        state.workspace_id,
-                        state.root,
-                        state.name,
-                        primary=state.primary,
-                        cancel_event=state.scan_cancel,
-                    )
+                    scan_started = monotonic()
+                    try:
+                        await asyncio.to_thread(
+                            self.store.reconcile,
+                            state.workspace_id,
+                            state.root,
+                            state.name,
+                            primary=state.primary,
+                            cancel_event=state.scan_cancel,
+                        )
+                    finally:
+                        metrics["scan_ms"] = int(
+                            metrics["scan_ms"]
+                        ) + elapsed_ms(scan_started)
                     # Only the expensive full scan is globally serialized.
                     # Retain the per-workspace mutation lock through delta so
                     # its replay window is still atomic.
                     self._reconcile_semaphore.release()
                     scan_slot_held = False
-                    replay = await asyncio.to_thread(
-                        self.store.delta,
-                        state.workspace_id,
-                        before,
-                        limit=5000,
-                    )
-                    if replay.get("resync") or replay.get("has_more"):
-                        cursor = await asyncio.to_thread(
-                            self.store.current_cursor,
+                    replay_started = monotonic()
+                    try:
+                        replay = await asyncio.to_thread(
+                            self.store.delta,
                             state.workspace_id,
+                            before,
+                            limit=5000,
                         )
-                        broadcast_payload = {
-                            "resync": True,
-                            "changes": [],
-                            "cursor": cursor,
-                        }
-                    elif replay.get("changes"):
-                        broadcast_payload = replay
+                        metrics["changes"] = len(
+                            replay.get("changes") or ()
+                        )
+                        metrics["resync"] = bool(
+                            replay.get("resync") or replay.get("has_more")
+                        )
+                        if replay.get("resync") or replay.get("has_more"):
+                            cursor = await asyncio.to_thread(
+                                self.store.current_cursor,
+                                state.workspace_id,
+                            )
+                            broadcast_payload = {
+                                "resync": True,
+                                "changes": [],
+                                "cursor": cursor,
+                            }
+                        elif replay.get("changes"):
+                            broadcast_payload = replay
+                    finally:
+                        metrics["replay_ms"] = int(
+                            metrics["replay_ms"]
+                        ) + elapsed_ms(replay_started)
             finally:
                 if scan_slot_held:
                     self._reconcile_semaphore.release()
@@ -1000,7 +1132,16 @@ class FileWatchManager:
                 # Polling keeps the durable contract instead of retrying the
                 # same broken registration forever.
                 if _is_watch_resource_error(exc):
+                    changed_to_polling = state.force_polling is not True
                     state.force_polling = True
+                    if changed_to_polling:
+                        _perf_event(
+                            "files.watcher_mode",
+                            workspace=short_id(state.workspace_id),
+                            mode="polling",
+                            reason="resource_exhaustion",
+                            error_type=type(exc).__name__,
+                        )
                 # There is an uncovered interval between this failed generation
                 # and its replacement. Defer the closing reconciliation until
                 # the retry is genuinely armed, coalescing with any pass already
@@ -1032,8 +1173,10 @@ class FileWatchManager:
         state: _WatchState,
         payload: dict[str, Any],
     ) -> None:
+        overflowed = 0
         for queue in tuple(state.subscribers):
             if queue.full():
+                overflowed += 1
                 with contextlib.suppress(asyncio.QueueEmpty):
                     while True:
                         queue.get_nowait()
@@ -1050,6 +1193,17 @@ class FileWatchManager:
                 payload_for_queue = payload
             with contextlib.suppress(asyncio.QueueFull):
                 queue.put_nowait(payload_for_queue)
+        if overflowed:
+            if not state.queue_overflow_active:
+                _perf_event(
+                    "files.watcher_queue_overflow",
+                    workspace=short_id(state.workspace_id),
+                    subscribers=len(state.subscribers),
+                    overflowed=overflowed,
+                )
+            state.queue_overflow_active = True
+        else:
+            state.queue_overflow_active = False
 
     @staticmethod
     def _close_subscribers(state: _WatchState) -> None:
