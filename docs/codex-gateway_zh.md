@@ -39,8 +39,8 @@ Agent SDK 没有 `auto`、`ultra` 或 Fast 的原生字段，因此 muselab 通�
 
 - `auto` 删除 translator 合成的 effort，让模型 catalog 默认值继续生效；
 - `low` 到 `max` 直接映射到 `reasoning.effort`；
-- `ultra` 在线路上映射为 `max`，并激活 muselab 原生
-  `ultra-orchestrator` Skill 做受限并发编排；
+- `ultra` 在线路上映射为 `max`，并保留 muselab 对 subagent spawn depth
+  与 concurrency 的上限；
 - Fast 独立映射为 `service_tier: priority`。
 
 ## 启用方式

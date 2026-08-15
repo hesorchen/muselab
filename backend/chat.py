@@ -127,14 +127,8 @@ _VALID_EFFORT = ("auto", *_SDK_EFFORT_LEVELS, "ultra")
 _VALID_SERVICE_TIERS = frozenset({"", "fast"})
 
 # Codex Ultra is a client-level mode, not a raw Responses API effort literal:
-# the provider wire contract currently tops out at ``max``. Ultra combines
-# that maximum reasoning level with the bundled ``ultra-orchestrator`` Skill.
-# The hook below activates that native workflow without adding a muselab-owned
-# system prompt or rewriting the canonical user message/transcript.
-_ULTRA_SKILL_CONTEXT = (
-    "MuseLab Ultra mode is selected for this turn. Invoke and follow the "
-    "bundled ultra-orchestrator Skill for the user's original request."
-)
+# the provider wire contract currently tops out at ``max``. MuseLab also keeps
+# bounded subagent depth/concurrency for Ultra without injecting a workflow.
 
 # Claude CLI uses this host contract when resuming a transcript that was
 # forked away from a still-live runtime.  The value is only an ISO timestamp:
@@ -288,18 +282,6 @@ def _perf_event(event: str, /, **fields: Any) -> None:
         obs.perf_event(event, **fields)
     except Exception:
         pass
-
-
-def _build_ultra_skill_hook():
-    """Activate Ultra's native Skill through transient SDK context."""
-    async def ultra_skill_hook(_input_data, _tool_use_id, _context):
-        return {
-            "hookSpecificOutput": {
-                "hookEventName": "UserPromptSubmit",
-                "additionalContext": _ULTRA_SKILL_CONTEXT,
-            }
-        }
-    return ultra_skill_hook
 
 
 def _build_runtime_task_context_hook(session_id: str):
@@ -2897,9 +2879,6 @@ async def _build_and_connect_client(
     if (not side_question_runtime
             and sess_data.get("runtime_predecessor")):
         user_prompt_hooks.append(_build_runtime_task_context_hook(session_id))
-    if (effort == "ultra" and _is_codex_gateway_model(model)
-            and not side_question_runtime and not skills_off):
-        user_prompt_hooks.append(_build_ultra_skill_hook())
     opts_kwargs = dict(
         cwd=str(workspace_root),
         model=(endpoints.ducc_cli_model(model) if is_ducc
@@ -2950,8 +2929,8 @@ async def _build_and_connect_client(
         # prompt boundary.
         setting_sources=["user", "project", "local"],
         # The SDK cwd is the user's active workspace, not this repository.
-        # Load muselab itself as a local SDK plugin so the built-in skills/
-        # directory remains discoverable in every registered workspace.
+        # Load muselab itself as a local SDK plugin so the skills/ extension
+        # slot remains discoverable in every registered workspace.
         plugins=[{
             "type": "local",
             "path": str(Path(__file__).resolve().parent.parent),
@@ -3033,12 +3012,12 @@ async def _build_and_connect_client(
             "allow-dangerously-skip-permissions": None,
         }
     # Let the SDK expose every discovered Skill for every provider, including
-    # Anthropic-compatible third-party gateways:
-    # users expect an explicitly named local skill (e.g. galatea) to be usable
-    # regardless of the selected model. Operators who hit vendor payload limits
-    # can still opt out globally via MUSELAB_DISABLE_SKILLS=1.
-    if not skills_off and not side_question_runtime:
-        opts_kwargs["skills"] = "all"
+    # Anthropic-compatible third-party gateways. Passing [] for disabled or
+    # privacy-isolated runtimes is deliberate: omission can let SDK defaults
+    # re-enable discovery.
+    opts_kwargs["skills"] = (
+        [] if skills_off or side_question_runtime else "all"
+    )
     # Optional model params from env (UI-editable via /api/settings).
     mt = env_int("MUSELAB_MAX_TURNS", 0, min_value=0)
     if mt > 0:
@@ -3074,8 +3053,8 @@ async def _build_and_connect_client(
             # thinking to medium. Claude CLI *does* support custom headers, so
             # carry the canonical MuseLab controls out-of-band and let Gateway
             # apply them after translation. Ultra maps to the provider's wire-
-            # level `max`; its proactive-delegation half is provided by the
-            # bundled Skill activated through UserPromptSubmit above.
+            # level `max`; MuseLab separately enforces bounded subagent depth
+            # and concurrency for Ultra below.
             # Send `auto` too: Gateway removes
             # the translator's synthetic medium so the model catalog default
             # (Sol=low, others may differ) remains authoritative.
@@ -3083,9 +3062,8 @@ async def _build_and_connect_client(
                 _muselab_gateway_headers(effort, service_tier)
             )
             if effort == "ultra":
-                # The Skill guides the main agent, but subagents do not inherit
-                # it. Enforce the runtime boundary too: no nested fan-out and at
-                # most four concurrent workers. Explicit operator overrides are
+                # Enforce the runtime boundary: no nested fan-out and at most
+                # four concurrent workers. Explicit operator overrides are
                 # preserved; invalid/zero values fall back to a safe positive
                 # integer through env_int().
                 env_ovr["CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH"] = str(
@@ -4823,10 +4801,10 @@ def create_session_api(req: CreateReq) -> dict:
 
 @router.post("/sessions/organize", dependencies=[Depends(require_token)])
 def create_organize_session_api(req: CreateReq | None = None) -> dict:
-    """Create a normal SDK session and return a Skill-invoking starter.
+    """Create a normal SDK session and return a self-contained organizer starter.
 
-    The ``workspace-curator`` Skill inventories the selected workspace and
-    proposes reversible organization changes. This endpoint deliberately
+    The starter directs the agent through a read-only scan, proposal, explicit
+    confirmation, and execution of approved changes. This endpoint deliberately
     creates no files or directories: organizing a workspace must not opt the
     user into a personal-profile template or a predefined directory taxonomy.
     No custom system prompt is attached to the session.

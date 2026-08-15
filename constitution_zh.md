@@ -7,10 +7,10 @@
 >
 > 范围：本文约束的是 *工程不变量*，不是功能愿望清单。功能意图写进每次改动的 spec，产品路线图与已知问题见 [GitHub Issues](https://github.com/hesorchen/muselab/issues)。
 
-- **版本：** 4.0.0
+- **版本：** 5.0.0
 - **批准日：** 2026-05-31
-- **最近修订：** 2026-07-31
-- **派生自：** `docs/architecture.md`、`CONTRIBUTING.md`、`SECURITY.md`、`pyproject.toml`，以及截至 2026-07-31 的前后端源码。
+- **最近修订：** 2026-08-15
+- **派生自：** `docs/architecture.md`、`CONTRIBUTING.md`、`SECURITY.md`、`pyproject.toml`，以及截至 2026-08-15 的前后端源码。
 
 规范性关键词 **必须（MUST）/ 禁止（MUST NOT）/ 应当（SHOULD）/ 可以（MAY）** 遵循 RFC 2119。
 
@@ -72,7 +72,7 @@ muselab 通过 **Claude Agent SDK**（与 Claude Code 同一引擎）驱动 Clau
 | `activity.py` / `activity_api.py` | 活动中心状态 + 其 API |
 | `transcript_index.py` | transcript 索引 |
 | `api_settings.py` | `/api/settings`——热改写 `.env` + `os.environ` |
-| `prompts.py` | 内置工作流的简短启动消息 |
+| `prompts.py` | 自包含 UI 工作流的简短启动消息 |
 | `ask_user_question.py` | 进程内 `muselab` MCP server |
 | `permission_request.py` | 工具权限往返 |
 | `settings.py` | `ROOT` / `PORT` / `HOST`、`atomic_write_text`、`env_int` |
@@ -101,7 +101,7 @@ muselab 通过 **Claude Agent SDK**（与 Claude Code 同一引擎）驱动 Clau
 对话 transcript 由 Claude CLI 所有：Claude 会话通常位于默认配置根，第三方 Provider 会话可能位于隔离的配置根。muselab 的 `sessions/` 只持有叠加在其上的 sidecar 元数据（名称、cwd、每消息 model 徽标、成本、附件）。muselab **禁止**复制或分叉 transcript 本身的所有权。
 
 ### A9 — 原生指令归属
-muselab **禁止**注入全局或会话级自定义 system prompt。持久身份、回复偏好与个人上下文属于 SDK 自动发现的 `CLAUDE.md` 层级；可复用任务工作流属于 Skill；工具特有行为属于工具描述与代码强制的权限配置。UI 可以用开场 Prompt 调用这些原生能力，但**禁止**再建立一层行为指令体系。用户主动选择的运行模式只有在 hook 仅标识模式与 Skill、保持规范 user prompt 与 transcript 不变、并把可复用行为留在 `SKILL.md` 时，才可以通过 SDK `UserPromptSubmit.additionalContext` 激活内置 Skill；hook **禁止**携带另一套身份、persona 或工作流副本。
+muselab **禁止**注入全局或会话级自定义 system prompt。持久身份、回复偏好与个人上下文属于 SDK 自动发现的 `CLAUDE.md` 层级；可复用任务工作流属于 Skill；工具特有行为属于工具描述与代码强制的权限配置。UI 可以用开场 Prompt 描述自包含任务，但**禁止**再建立一层行为指令体系。运行模式**禁止**通过 system prompt 或临时 hook context 注入另一套身份、persona 或可复用工作流；可复用流程只属于用户、workspace、plugin、经审核生成或仓库扩展 Skills。
 
 ---
 
@@ -188,6 +188,7 @@ muselab 是一个**自托管、以工作区为边界的 Agent 工作台**，不�
 
 ## 9. 修订记录
 
+- **5.0.0（2026-08-15）：** 移除预装 Skill 分发以及 A9 中运行模式激活 Skill 的例外。Skills 继续作为 SDK 原生扩展机制，支持用户、workspace、plugin、经审核生成与仓库扩展工作流；运行模式只保留传输与资源边界契约。
 - **4.0.0（2026-07-31）：** Fast 在 SDK client 启动时即固定进 Gateway header 契约，因此为 A4 的精确 client-pool key 加入 `service_tier`；同时修订 A9，允许用户显式选择的运行模式通过临时 `UserPromptSubmit.additionalContext` 激活内置 Skill，但必须保持规范 prompt／transcript 不变，并把工作流留在 `SKILL.md`，而不是注入自定义 system prompt。
 - **3.0.0（2026-07-31）：** 将 muselab 从原有个人领域定位调整为以工作区为边界的 Agent 工作台；移除领域预设，同时保留本地文件、自托管与安全不变量。
 - **2.0.0（2026-07-23）：** 将单 archive 模型更新为多工作区；纳入真实终端、短期实时连接 ticket 与 Activity 模块；把模型连续性明确为前端默认 fork、管理 API 显式覆盖；固化 CLAUDE.md／Skills／工具权限的原生指令归属。

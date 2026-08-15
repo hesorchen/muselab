@@ -455,7 +455,7 @@ def test_side_question_runtime_exposes_only_public_web_tools(
     assert captured["setting_sources"] == []
     assert captured["plugins"] == []
     assert captured["mcp_servers"] == {}
-    assert "skills" not in captured
+    assert captured["skills"] == []
     assert "can_use_tool" not in captured
     assert "UserPromptSubmit" not in captured["hooks"]
 
@@ -627,17 +627,7 @@ def test_codex_auto_and_ultra_fast_use_gateway_headers(
     assert "system_prompt" not in ultra
     ultra_matchers = ultra["hooks"]["UserPromptSubmit"]
     assert len(ultra_matchers) == 1
-    assert len(ultra_matchers[0].hooks) == 2
-
-    async def invoke_ultra_hook():
-        return await ultra_matchers[0].hooks[1](
-            {"prompt": "original user request"}, None, None)
-
-    hook_result = asyncio.run(invoke_ultra_hook())
-    specific = hook_result["hookSpecificOutput"]
-    assert specific["hookEventName"] == "UserPromptSubmit"
-    assert "ultra-orchestrator Skill" in specific["additionalContext"]
-    assert "original user request" not in specific["additionalContext"]
+    assert len(ultra_matchers[0].hooks) == 1
     assert ultra["env"]["CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH"] == "1"
     assert ultra["env"]["CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS"] == "4"
 
@@ -647,7 +637,7 @@ def test_codex_auto_and_ultra_fast_use_gateway_headers(
         "ultra", "fast", plan_return_permission="bypassPermissions"))
     assert plan_ultra["extra_args"]["allow-dangerously-skip-permissions"] is None
     assert "system_prompt" not in plan_ultra
-    assert len(plan_ultra["hooks"]["UserPromptSubmit"][0].hooks) == 2
+    assert len(plan_ultra["hooks"]["UserPromptSubmit"][0].hooks) == 1
 
     monkeypatch.setenv("MUSELAB_DISABLE_SKILLS", "1")
     no_skill = _capture_build_options(chat_mod, monkeypatch)
@@ -655,7 +645,7 @@ def test_codex_auto_and_ultra_fast_use_gateway_headers(
         "sid-codex-ultra-no-skills", "codex:gpt-5.6-sol",
         "bypassPermissions", "ultra", "fast"))
     assert no_skill["effort"] == "max"
-    assert "skills" not in no_skill
+    assert no_skill["skills"] == []
     assert "system_prompt" not in no_skill
     assert len(no_skill["hooks"]["UserPromptSubmit"][0].hooks) == 1
 
@@ -695,7 +685,7 @@ def test_disable_skills_env_still_opts_out(app_module, monkeypatch, tmp_path):
     asyncio.run(chat_mod._build_and_connect_client(
         "sid-third-party-no-skills", "deepseek-v4-pro", "bypassPermissions", ""))
 
-    assert "skills" not in captured
+    assert captured["skills"] == []
 
 
 def test_mem0_recall_uses_user_prompt_hook(app_module, monkeypatch, tmp_path):

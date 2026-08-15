@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import subprocess
 from pathlib import Path
 from urllib.parse import unquote
 
@@ -77,14 +78,17 @@ def test_documentation_has_chinese_and_english_pairs():
     assert not missing, "documentation missing _zh counterpart:\n" + "\n".join(missing)
 
 
-def test_bundled_skills_are_listed_in_both_skill_docs():
-    names = sorted(
-        path.parent.name for path in (ROOT / "skills").glob("*/SKILL.md")
-    )
-    for doc in (DOCS / "skills.md", DOCS / "skills_zh.md"):
-        text = doc.read_text(encoding="utf-8")
-        missing = [name for name in names if f"`{name}`" not in text]
-        assert not missing, f"{doc.name} missing bundled skills: {missing}"
+def test_default_checkout_has_no_tracked_bundled_skill_payloads():
+    tracked = subprocess.run(
+        ["git", "ls-files", "--", "skills"],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.splitlines()
+    payloads = [path for path in tracked if Path(path).name.lower() == "skill.md"]
+    assert payloads == [], f"tracked bundled Skill payloads: {payloads}"
+    assert (ROOT / "skills" / "README.md").is_file()
 
 
 def test_example_environment_variables_are_in_configuration_reference():
@@ -109,7 +113,7 @@ def test_documented_files_endpoint_count_matches_router():
         DOCS / "backend-files_zh.md").read_text(encoding="utf-8")
 
 
-def test_docker_runtime_contains_bundled_skills_and_templates():
+def test_docker_runtime_preserves_skill_extension_slot_and_templates():
     dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
     assert "COPY skills ./skills" in dockerfile
     assert "COPY scripts/templates ./scripts/templates" in dockerfile

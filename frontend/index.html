@@ -5230,9 +5230,8 @@
             <span x-text="t('set.sec.skills')"></span>
             <span class="settings-save-mode live" x-text="t('set.mode.live')"></span>
           </div>
-          <!-- Auto-detection notice: tells the user muselab automatically
-               pulled in skills from their Claude Code setup. No setup
-               needed — the SDK already loaded them. -->
+          <!-- Dynamic discovery notice; the list reflects the backend's
+               current read-only Skill inventory. -->
           <div class="skills-meta" x-show="settings.skills.length">
             <span class="skills-count" x-text="t('set.skills.count', { n: settings.skills.length })"></span>
             <span class="skills-meta-sep">·</span>
@@ -5243,11 +5242,8 @@
                  x-show="settings.skills.length">
           <div x-show="!settings.skills.length" class="settings-empty"
                x-text="t('set.skills.empty')"></div>
-          <!-- Card grid — no per-skill emoji (skills are dynamic, can't
-               hardcode icons). Single generic 🧩 marker, scope tag tells
-               where it came from. "Try this" pre-fills the chat input
-               with a starter prompt; for the 7 hand-crafted ones we use
-               a concrete demo prompt, others get a generic seed. -->
+          <!-- Card grid — Skills are dynamic, so every entry uses the same
+               generic icon and the same name-based "Try this" prompt seed. -->
           <div class="skills-grid">
             <template x-for="sk in filteredSkills()" :key="sk.scope + ':' + sk.name + ':' + (sk.source || '')">
               <!-- 2026-05-23: scope/source chip removed. 用户反馈"显示来源

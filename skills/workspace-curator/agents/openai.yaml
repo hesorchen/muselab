@@ -1,4 +1,0 @@
-interface:
-  display_name: "Workspace Curator"
-  short_description: "扫描工作区，确认后安全整理文件"
-  default_prompt: "Use $workspace-curator to scan this workspace and propose safe organization changes."
