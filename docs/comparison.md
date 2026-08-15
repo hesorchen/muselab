@@ -71,7 +71,7 @@ personal profile and creates no predefined directory structure.
 - Not a RAG service — files are read on demand via Read / Grep, never
   pre-embedded; for crawl-style document chat use
   [AnythingLLM](https://github.com/Mintplex-Labs/anything-llm)
-- No plugin marketplace — 12 curated skills ship out of the box and
-  external Claude Code plugins are auto-discovered, but there's no
-  in-app store; use [LobeChat](https://github.com/lobehub/lobe-chat)
+- No plugin marketplace — user-installed and external Claude Code plugin
+  skills are auto-discovered, but muselab ships no task-specific presets and
+  has no in-app store; use [LobeChat](https://github.com/lobehub/lobe-chat)
   if you need one

@@ -10,12 +10,12 @@
 > intent lives in per-change specs; product roadmap and known issues live on
 > [GitHub Issues](https://github.com/hesorchen/muselab/issues).
 
-- **Version:** 4.0.0
+- **Version:** 5.0.0
 - **Ratified:** 2026-05-31
-- **Last amended:** 2026-07-31
+- **Last amended:** 2026-08-15
 - **Derived from:** `docs/architecture.md`,
   `CONTRIBUTING.md`, `SECURITY.md`, `pyproject.toml`, and the backend/frontend
-  source as of 2026-07-31.
+  source as of 2026-08-15.
 
 Normative keywords **MUST / MUST NOT / SHOULD / MAY** follow RFC 2119.
 
@@ -98,7 +98,7 @@ shape rather than growing a god-module:
 | `activity.py` / `activity_api.py` | activity-center state + its API |
 | `transcript_index.py` | transcript index |
 | `api_settings.py` | `/api/settings` — hot-rewrite `.env` + `os.environ` |
-| `prompts.py` | short starter messages for built-in workflows |
+| `prompts.py` | short starter messages for self-contained UI workflows |
 | `ask_user_question.py` | in-process `muselab` MCP server |
 | `permission_request.py` | tool-permission round-trip |
 | `settings.py` | `ROOT` / `PORT` / `HOST`, `atomic_write_text`, `env_int` |
@@ -160,12 +160,11 @@ muselab MUST NOT inject a global or per-session custom system prompt. Persistent
 identity, response preferences, and personal context belong in the
 SDK-discovered `CLAUDE.md` hierarchy. Reusable task workflows belong in Skills,
 and tool-specific behavior belongs in tool descriptions and enforced permission
-configuration. UI starter prompts MAY invoke those native capabilities without
-creating another instruction layer. A user-selected runtime mode MAY activate
-a bundled Skill through SDK `UserPromptSubmit.additionalContext` only when the
-hook names the mode and Skill, leaves the canonical user prompt and transcript
-unchanged, and keeps the reusable behavior in `SKILL.md`; it MUST NOT carry a
-parallel identity, persona, or copy of the workflow itself.
+configuration. UI starter prompts MAY describe a self-contained task without
+creating another instruction layer. Runtime modes MUST NOT inject a parallel
+identity, persona, or reusable workflow through system prompts or transient
+hook context; reusable workflows remain in user, workspace, plugin, generated,
+or repository-extension Skills.
 
 ---
 
@@ -306,6 +305,11 @@ following MUST be declined absent an explicit constitution amendment:
 
 ## 9. Amendment history
 
+- **5.0.0 (2026-08-15):** Removed the bundled Skill distribution and the
+  runtime-mode Skill activation exception from A9. Skills remain an SDK-native
+  extension mechanism for user, workspace, plugin, reviewed generated, and
+  repository-extension workflows; runtime modes retain only their transport
+  and resource-bound contracts.
 - **4.0.0 (2026-07-31):** Expanded A4's exact client-pool key with
   `service_tier` because Fast is fixed in the Gateway header contract at SDK
   client launch; amended A9 so an explicitly selected runtime mode may activate

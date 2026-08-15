@@ -1140,15 +1140,15 @@ def _list_plugin_skills() -> list[dict]:
 
 @router.get("/skills", dependencies=[Depends(require_token)])
 def list_skills() -> dict:
-    """List all skills discoverable from project, user, and plugin scopes.
+    """List Skills visible to the read-only dynamic frontend browser.
 
-    project = muselab's own preset skills (this repo's skills/)
-    user    = ~/.claude/skills/ (shared with Claude Code CLI)
+    project = optional repository extension Skills (this repo's skills/)
+    user    = ~/.claude/skills/ (including reviewed generated Skills)
     plugin  = ~/.claude/plugins/marketplaces/*/plugins/*/skills/
 
-    Same-named skills across scopes are returned as separate entries —
-    the UI shows scope badges so users can see when a skill is shadowed
-    (e.g. they have a user-scope mermaid-helper AND a project preset)."""
+    Same-named Skills across scopes are returned as separate entries so their
+    provenance remains inspectable. Active-workspace discovery itself remains
+    SDK-native through setting_sources=["user", "project", "local"]."""
     skills = (_list_skills_in(SKILL_PROJECT_DIR, "project") +
               _list_skills_in(SKILL_USER_DIR, "user") +
               _list_plugin_skills())

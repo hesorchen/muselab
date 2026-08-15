@@ -70,9 +70,9 @@ muselab 代码库与文档中使用的专有术语，集中定义，供各处引
 
 **sidecar** — 文件 `$MUSELAB_SESSIONS_DIR/<sid>.sidecar.json`，存储叠加在 CLI JSONL 之上的每条消息注解：成本（USD）、模型标识、时间戳、上传图片缩略图和文档引用。每次回合后写入；从不存储对话记录本身。参见 [`backend-sessions.md — Sidecar files`](backend-sessions.md)。
 
-**setting_sources** — 在 `ClaudeAgentOptions` 中传入的 SDK 参数 `["user", "project", "local"]`，告知 Claude Agent SDK 要加载哪些配置作用域。活动工作区中的 `CLAUDE.md` 和 Claude 配置按这些作用域加载；muselab 的内置 `skills/` 则通过本地 plugin 暴露。
+**setting_sources** — 在 `ClaudeAgentOptions` 中传入的 SDK 参数 `["user", "project", "local"]`，告知 Claude Agent SDK 要加载哪些配置作用域。`CLAUDE.md`、Skills 与 Claude 配置按用户和活动 workspace scope 加载；本地 plugin 保留 muselab 的空仓库级 Skill 扩展槽。
 
-**skill / SKILL.md** — skill 是 `skills/`（或 `~/.claude/skills/`）下包含带 YAML frontmatter 的 `SKILL.md` 文件的目录。`description` 字段（以 `"USE WHEN …"` 开头）是模型决定是否激活该 skill 的主要信号。设置 `skills="all"` 后，Claude Agent SDK 将所有可发现的 `SKILL.md` 提供给模型。Skills 默认对所有 provider 启用，可通过 `MUSELAB_DISABLE_SKILLS` 全局关闭。
+**skill / SKILL.md** — Skill 是包含带 YAML frontmatter 的 `SKILL.md` 文件的目录，可来自用户、workspace、plugin、经审核生成或仓库扩展来源。`description` 字段（以 `"USE WHEN …"` 开头）是主要激活信号。设置 `skills="all"` 后 SDK 暴露所有可发现 Skills；设置 `MUSELAB_DISABLE_SKILLS` 后 muselab 显式传入 `skills=[]`。
 
 **SSE / replay spool** — 浏览器先以带 header 鉴权的 POST 提交回合并取得短期一次性 ticket，再用 ticket 连接 `GET /api/chat/stream`。回合事件持续写入磁盘 replay spool；重新连接的浏览器按 cursor 补发，而不是依赖进程内保存完整事件列表。后台执行在浏览器断开后继续。参见 [`routing.md`](routing.md)。
 

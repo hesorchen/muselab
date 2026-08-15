@@ -47,8 +47,8 @@ config apply those controls after Anthropic-to-Codex translation:
 - `auto` removes the translator's synthetic effort so the model catalog
   default remains authoritative;
 - `low` through `max` map directly to `reasoning.effort`;
-- `ultra` maps to wire-level `max` and activates muselab's native
-  `ultra-orchestrator` Skill for bounded parallel delegation;
+- `ultra` maps to wire-level `max` and keeps muselab's subagent spawn-depth
+  and concurrency bounds;
 - Fast maps independently to `service_tier: priority`.
 
 ## Enable it

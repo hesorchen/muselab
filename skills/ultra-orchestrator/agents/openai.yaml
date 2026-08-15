@@ -1,4 +1,0 @@
-interface:
-  display_name: "Ultra Orchestrator"
-  short_description: "Maximum reasoning with safe bounded parallel agent delegation"
-  default_prompt: "Use $ultra-orchestrator to solve this request with maximum reasoning and bounded parallel delegation."

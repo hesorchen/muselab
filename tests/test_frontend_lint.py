@@ -3565,7 +3565,7 @@ def test_effort_field_uses_a_short_label_not_the_tooltip_prose():
     """`effort.title` is tooltip copy, not a field caption.
 
     The localized string explains the model-dependent levels and Ultra's
-    proactive delegation semantics. Rendered as a visible <span> label it wraps
+    bounded subagent capacity. Rendered as a visible <span> label it wraps
     to multiple lines and becomes the largest contributor to panel height.
     Mirrors the existing thinking.label / thinking.title split.
     """
@@ -3578,7 +3578,7 @@ def test_effort_field_uses_a_short_label_not_the_tooltip_prose():
     for key in ("effort.label", "effort.title"):
         assert i18n.count(f'"{key}":') == 2, f"{key} missing from a locale"
     assert "Ultra = 最大推理" in i18n
-    assert "Ultra combines maximum reasoning" in i18n
+    assert "Ultra uses maximum reasoning" in i18n
 
 
 def test_running_state_is_pinned_to_the_scroll_viewport_not_the_last_message():
