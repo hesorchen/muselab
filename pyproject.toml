@@ -49,14 +49,14 @@ dependencies = [
     # Path/effort drift is already auto-eliminated via
     # project_key_for_directory() + EffortLevel.
     "claude-agent-sdk>=0.2.136,<0.3",
-    "fastapi>=0.138.1",
+    "fastapi>=0.141.1",
     # Pin starlette above the fastapi-transitive 1.0.0, which carries
     # PYSEC-2026-161 (fixed in 1.0.1). Direct constraint so the pip-audit
     # CVE-scan CI job stays green.
-    "starlette>=1.3.1",
+    "starlette>=1.6.0",
     "python-dotenv>=1.2.2",
     "python-multipart>=0.0.32",
-    "uvicorn[standard]>=0.49.0",
+    "uvicorn[standard]>=0.52.3",
     # Live file-tree refresh for Agent / terminal / external-editor changes.
     # One on-demand watcher per subscribed workspace feeds the durable SQLite
     # index; offline reconciliation runs when that workspace is reactivated.
