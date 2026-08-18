@@ -53,12 +53,12 @@ def _json(request: Request, response: Response, payload: dict):
 @router.get("", dependencies=[Depends(require_token)])
 def list_activity(request: Request, response: Response,
                   limit: int = Query(100, ge=1, le=500)):
-    return _json(request, response, activity.snapshot(limit))
+    return _json(request, response, activity.snapshot(limit, filter_live=True))
 
 
 @router.get("/summary", dependencies=[Depends(require_token)])
 def activity_summary(request: Request, response: Response):
-    return _json(request, response, activity.summary())
+    return _json(request, response, activity.summary(filter_live=True))
 
 
 @router.post("/events-ticket", dependencies=[Depends(require_token)])
@@ -119,7 +119,7 @@ async def activity_events() -> EventSourceResponse:
 
 @router.post("/ack-all", dependencies=[Depends(require_token)])
 def ack_all():
-    return {"ok": True, "changed": activity.ack(), "summary": activity.summary()}
+    return {"ok": True, "changed": activity.ack(), "summary": activity.summary(filter_live=True)}
 
 
 @router.get("/groups", dependencies=[Depends(require_token)])
@@ -193,9 +193,9 @@ def patch_activity(event_id: str, req: ActivityPatchRequest):
 
 @router.post("/{event_id}/ack", dependencies=[Depends(require_token)])
 def ack_event(event_id: str):
-    return {"ok": True, "changed": activity.ack(event_id), "summary": activity.summary()}
+    return {"ok": True, "changed": activity.ack(event_id), "summary": activity.summary(filter_live=True)}
 
 
 @router.post("/session/{sid}/ack", dependencies=[Depends(require_token)])
 def ack_session(sid: str):
-    return {"ok": True, "changed": activity.ack(sid=sid), "summary": activity.summary()}
+    return {"ok": True, "changed": activity.ack(sid=sid), "summary": activity.summary(filter_live=True)}

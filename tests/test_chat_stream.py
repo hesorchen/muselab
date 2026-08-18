@@ -13,9 +13,7 @@ import base64
 import collections
 import inspect
 import json
-import sys
 import threading
-import time
 from types import SimpleNamespace
 
 import pytest

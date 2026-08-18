@@ -730,26 +730,29 @@ class ActivityService:
             self._publish_locked(item=item)
             return dict(item)
 
-    def list(self, limit: int = 100) -> list[dict[str, Any]]:
+    def list(self, limit: int = 100, *, filter_live: bool = False) -> list[dict[str, Any]]:
         self.initialize_runtime_state()
         with self._lock:
             events = [dict(x) for x in self._events]
-        events = self._filter_live(events)
+        if filter_live:
+            events = self._filter_live(events)
         events.sort(key=_activity_at, reverse=True)
         return events[:min(max(limit, 1), _MAX_EVENTS)]
 
-    def summary(self) -> dict[str, Any]:
+    def summary(self, *, filter_live: bool = False) -> dict[str, Any]:
         self.initialize_runtime_state()
         with self._lock:
             events = [dict(x) for x in self._events]
             generation = self._generation
             revision = self._revision
-        result = _summarize(self._filter_live(events))
+        if filter_live:
+            events = self._filter_live(events)
+        result = _summarize(events)
         result["generation"] = generation
         result["revision"] = revision
         return result
 
-    def snapshot(self, limit: int = 100) -> dict[str, Any]:
+    def snapshot(self, limit: int = 100, *, filter_live: bool = False) -> dict[str, Any]:
         """Return rows and counters from the same locked ledger snapshot."""
         self.initialize_runtime_state()
         with self._lock:
@@ -758,7 +761,8 @@ class ActivityService:
             group_order = self._group_order_payload_locked()
             generation = self._generation
             revision = self._revision
-        events = self._filter_live(events)
+        if filter_live:
+            events = self._filter_live(events)
         summary = _summarize(events)
         summary["generation"] = generation
         summary["revision"] = revision
