@@ -1,6 +1,7 @@
 """Episode consolidation, verification, hybrid recall and Skill approval."""
 import asyncio
 
+import httpx
 import pytest
 
 
@@ -366,6 +367,156 @@ def test_transcript_reconciliation_stops_at_next_real_user_turn(
         row["event_type"] for row in instance.store.episode(episode["id"])["evidence"]
     ]
     assert event_types == ["message", "tool_use", "tool_result"]
+
+
+def _run_worker_job(tmp_path, monkeypatch, failures, *, kind="reindex_memory"):
+    from backend import memory_engine as module, memory_store as store_module
+    from backend.memory_engine import MemoryEngine
+    from backend.memory_store import MemoryStore
+
+    instance = MemoryEngine(MemoryStore(tmp_path / "worker.sqlite3"))
+    cfg = _config()
+    monkeypatch.setattr(instance, "config", lambda: cfg)
+    clock = [1000.0]
+    monkeypatch.setattr(store_module, "_now", lambda: clock[0])
+    events = []
+    monkeypatch.setattr(
+        module, "perf_event",
+        lambda event, **fields: events.append((event, fields)),
+    )
+    calls = 0
+
+    async def handle(_memory_id):
+        nonlocal calls
+        calls += 1
+        if failures:
+            raise failures.pop(0)
+
+    monkeypatch.setattr(instance, "_index_memory", handle)
+    job_id = instance.store.enqueue(
+        kind, {"memory_id": "memory-1"}, owner_id=cfg.owner_id)
+    finish_job = instance.store.finish_job
+
+    def finish_and_advance(job_id, *, error=None, retry_seconds=None):
+        finish_job(job_id, error=error, retry_seconds=retry_seconds)
+        if retry_seconds is not None:
+            clock[0] += retry_seconds
+        else:
+            instance._closing = True
+
+    monkeypatch.setattr(instance.store, "finish_job", finish_and_advance)
+    _run(instance._worker())
+    job = next(row for row in instance.store.list_jobs() if row["id"] == job_id)
+    return calls, job, events
+
+
+@pytest.mark.parametrize(("exc", "retryable", "category", "status"), [
+    (TimeoutError("secret prompt"), True, "timeout", None),
+    (httpx.ConnectError(
+        "secret transport", request=httpx.Request(
+            "GET", "https://token.example/private")), True, "transport", None),
+    (httpx.HTTPStatusError(
+        "secret response", request=httpx.Request(
+            "GET", "https://token.example/private"),
+        response=httpx.Response(409)), True, "transient_http", 409),
+    (httpx.HTTPStatusError(
+        "secret response", request=httpx.Request(
+            "GET", "https://token.example/private"),
+        response=httpx.Response(401)), False, "authentication", 401),
+    (ValueError("secret config"), False, "invalid_value", None),
+    (TypeError("secret body"), False, "invalid_type", None),
+    (KeyError("secret key"), False, "missing_key", None),
+    (FileNotFoundError("/private/path"), False, "file_not_found", None),
+    (PermissionError("/private/path"), False, "permission", None),
+    (RuntimeError("unknown secret"), False, "unclassified", None),
+])
+def test_failure_classifier_is_explicit_and_private(exc, retryable, category, status):
+    from backend.memory_engine import classify_memory_failure
+
+    actual_retryable, detail = classify_memory_failure(exc)
+    assert actual_retryable is retryable
+    assert detail == {
+        "category": category,
+        "exception_class": type(exc).__name__,
+        **({"status": status} if status is not None else {}),
+    }
+    assert "secret" not in repr(detail)
+    assert "/private" not in repr(detail)
+    assert "token.example" not in repr(detail)
+
+
+def test_worker_retries_safe_transient_three_times_without_secret_leakage(
+        tmp_path, monkeypatch, caplog):
+    import httpx
+
+    secret = "sk-super-secret-worker-token"
+    failures = [
+        httpx.HTTPStatusError(
+            f"provider body {secret}",
+            request=httpx.Request("POST", f"https://example.test/{secret}"),
+            response=httpx.Response(500),
+        )
+        for _ in range(3)
+    ]
+    calls, job, events = _run_worker_job(tmp_path, monkeypatch, failures)
+
+    assert calls == 3
+    assert job["attempts"] == 3
+    assert job["status"] == "failed"
+    assert job["last_error"] == (
+        '{"category":"transient_http","exception_class":'
+        '"HTTPStatusError","status":500}'
+    )
+    assert [fields["outcome"] for _, fields in events] == [
+        "retry", "retry", "failed"]
+    assert all(event == "memory.job" for event, _ in events)
+    assert secret not in job["last_error"]
+    assert secret not in caplog.text
+    assert "example.test" not in caplog.text
+
+
+def test_worker_does_not_retry_terminal_generation_error(tmp_path, monkeypatch):
+    from backend.memory_providers import GenerationError
+
+    calls, job, events = _run_worker_job(tmp_path, monkeypatch, [GenerationError(
+        retryable=False, category="invalid_configuration", api_error_status=400)])
+
+    assert calls == 1
+    assert job["attempts"] == 1
+    assert job["status"] == "failed"
+    assert job["last_error"] == (
+        '{"category":"invalid_configuration","exception_class":'
+        '"GenerationError","status":400}'
+    )
+    assert events[0][1]["outcome"] == "failed"
+
+
+def test_generation_error_retry_flag_is_authoritative():
+    from backend.memory_engine import classify_memory_failure
+    from backend.memory_providers import GenerationError
+
+    retryable, detail = classify_memory_failure(GenerationError(
+        retryable=True, category="provider_overloaded", api_error_status=400))
+    assert retryable is True
+    assert detail == {
+        "category": "provider_overloaded",
+        "exception_class": "GenerationError",
+        "status": 400,
+    }
+
+
+def test_worker_treats_unknown_job_kind_as_terminal(tmp_path, monkeypatch):
+    calls, job, events = _run_worker_job(
+        tmp_path, monkeypatch, [], kind="private-unknown-kind")
+
+    assert calls == 0
+    assert job["attempts"] == 1
+    assert job["status"] == "failed"
+    assert job["last_error"] == (
+        '{"category":"unknown_job","exception_class":"UnknownMemoryJobError"}'
+    )
+    assert events[0][1]["kind"] == "unknown"
+    assert events[0][1]["outcome"] == "failed"
 
 
 def test_reindex_all_queues_one_batch_job(tmp_path, monkeypatch):

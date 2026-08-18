@@ -24,7 +24,11 @@ from .auth import require_token
 from .capability_tickets import tickets
 from .files import INTERNAL_DIR_NAME, TRASH_DIR_NAME
 from .observability import elapsed_ms, is_slow, monotonic, perf_event, short_id
-from .workspace_store import WorkspaceStore, is_ignored_descendant
+from .workspace_store import (
+    WorkspaceScanCancelled,
+    WorkspaceStore,
+    is_ignored_descendant,
+)
 from .workspaces import registry, resolve_workspace_root
 
 
@@ -36,6 +40,8 @@ _WATCH_STEP_MS = 100
 _WATCH_RETRY_S = 1.5
 _WATCH_LINGER_S = 30.0
 _MAX_IDLE_WATCHERS = 3
+_RECONCILE_BACKOFF_START_S = 0.25
+_RECONCILE_BACKOFF_CAP_S = 5.0
 _EVENT_TICKET_TTL_S = 45
 _EXCLUDED_DIRS = frozenset({TRASH_DIR_NAME, INTERNAL_DIR_NAME})
 _POLLING_ENV = os.getenv("WATCHFILES_FORCE_POLLING")
@@ -77,6 +83,10 @@ class _WatchState:
     needs_closing_reconcile: bool = False
     reconcile_pending: bool = False
     reconcile_running: bool = False
+    reconcile_attempts: int = 0
+    reconcile_failures: int = 0
+    reconcile_retry_at: float = 0.0
+    reconcile_cancel: asyncio.Event = field(default_factory=asyncio.Event)
     scan_cancel: threading.Event = field(default_factory=threading.Event)
     stop_task: asyncio.Task[None] | None = None
     queue_overflow_active: bool = False
@@ -549,6 +559,7 @@ class FileWatchManager:
                     and not state.reconcile_task.done()
                 ):
                     reconcile_task = state.reconcile_task
+                    state.reconcile_cancel.set()
                     state.scan_cancel.set()
                 state.reconcile_pending = False
                 state.reconcile_task = None
@@ -797,16 +808,28 @@ class FileWatchManager:
             await state.ready.wait()
         if state.initialized:
             return
-        detail = "workspace index is temporarily unavailable"
-        if state.reconcile_error is not None:
-            detail = f"{detail}: {state.reconcile_error}"
-        raise HTTPException(status_code=503, detail=detail)
+        raise HTTPException(
+            status_code=503,
+            detail="workspace index is temporarily unavailable",
+        )
+
+    async def _wait_for_reconcile_backoff(self, state: _WatchState) -> bool:
+        delay = max(0.0, state.reconcile_retry_at - monotonic())
+        if delay <= 0:
+            return not state.reconcile_cancel.is_set()
+        try:
+            await asyncio.wait_for(state.reconcile_cancel.wait(), timeout=delay)
+        except TimeoutError:
+            return True
+        return False
 
     async def _reconcile_after_watch(self, state: _WatchState) -> None:
         """Reconcile downtime after the watcher gets a chance to register."""
         while True:
             state.reconcile_pending = False
             try:
+                if not await self._wait_for_reconcile_backoff(state):
+                    return
                 if state.task is not None:
                     # Never call a scan a closing reconciliation until the
                     # corresponding native watcher is genuinely armed. Waiting
@@ -818,8 +841,9 @@ class FileWatchManager:
                 await self._reconcile_and_broadcast(state)
             except asyncio.CancelledError:
                 raise
-            except Exception as exc:
-                state.reconcile_error = exc
+            except WorkspaceScanCancelled:
+                return
+            except Exception:
                 self._broadcast(
                     state,
                     {"resync": True, "changes": []},
@@ -874,15 +898,34 @@ class FileWatchManager:
         }
         status = "error"
         error_type: str | None = None
+        phase = "initial" if not state.initialized else "closing"
+        state.reconcile_attempts += 1
+        attempt = state.reconcile_attempts
+        backoff_ms = 0
         try:
             await self._reconcile_and_broadcast_impl(state, metrics)
+            state.reconcile_failures = 0
+            state.reconcile_retry_at = 0.0
             status = "ok"
         except asyncio.CancelledError:
             status = "cancelled"
             error_type = "CancelledError"
             raise
+        except WorkspaceScanCancelled:
+            status = "cancelled"
+            error_type = "WorkspaceScanCancelled"
+            raise
         except Exception as exc:
             error_type = type(exc).__name__
+            state.reconcile_error = exc
+            state.reconcile_failures += 1
+            backoff = min(
+                _RECONCILE_BACKOFF_START_S
+                * (2 ** min(state.reconcile_failures - 1, 20)),
+                _RECONCILE_BACKOFF_CAP_S,
+            )
+            state.reconcile_retry_at = monotonic() + backoff
+            backoff_ms = round(backoff * 1000)
             raise
         finally:
             # Keep this true through replay, broadcast, and watcher-path
@@ -894,6 +937,10 @@ class FileWatchManager:
                 workspace=short_id(state.workspace_id),
                 status=status,
                 error_type=error_type,
+                phase=phase,
+                attempt=attempt,
+                failures=state.reconcile_failures,
+                backoff_ms=backoff_ms,
                 scan_slot_wait_ms=metrics["scan_slot_wait_ms"],
                 mutation_lock_wait_ms=metrics["mutation_lock_wait_ms"],
                 scan_ms=metrics["scan_ms"],
@@ -1233,6 +1280,7 @@ class FileWatchManager:
                 if task is not None
             ]
             for state in states:
+                state.reconcile_cancel.set()
                 state.scan_cancel.set()
                 if (state.reconcile_task is not None
                         and not state.reconcile_task.done()):
@@ -1329,66 +1377,76 @@ async def _event_stream(
     root: Path,
     cursor: int | None,
 ) -> AsyncIterator[ServerSentEvent]:
-    async with manager.subscribe(root) as queue:
-        # Do not call bootstrap here: on a home-directory workspace that used
-        # to materialize and JSON-encode tens of MB for every SSE connection.
-        ready_state = await manager.ready_state(root)
-        ready_cursor = ready_state["cursor"]
-        yield ServerSentEvent(
-            event="ready",
-            data=json.dumps(
-                {"ready": True, **ready_state},
-                separators=(",", ":"),
-            ),
-        )
-
-        delivered = ready_cursor if cursor is None else cursor
-        if cursor is not None:
-            while True:
-                replay = await manager.delta(root, delivered)
-                event = (
-                    "resync"
-                    if replay.get("resync")
-                    else "changes"
-                )
-                if replay.get("resync") or replay["changes"]:
-                    yield ServerSentEvent(
-                        event=event,
-                        data=json.dumps(
-                            replay,
-                            separators=(",", ":"),
-                        ),
-                    )
-                delivered = replay["cursor"]
-                if (
-                    replay.get("resync")
-                    or not replay.get("has_more")
-                ):
-                    break
-
-        while True:
-            payload = await queue.get()
-            if payload.get("close"):
-                return
-            if (
-                "cursor" in payload
-                and payload["cursor"] <= delivered
-            ):
-                continue
-            event = (
-                "resync"
-                if payload.get("resync")
-                else "changes"
-            )
+    ready_sent = False
+    try:
+        async with manager.subscribe(root) as queue:
+            # Do not call bootstrap here: on a home-directory workspace that used
+            # to materialize and JSON-encode tens of MB for every SSE connection.
+            ready_state = await manager.ready_state(root)
+            ready_cursor = ready_state["cursor"]
+            ready_sent = True
             yield ServerSentEvent(
-                event=event,
+                event="ready",
                 data=json.dumps(
-                    payload,
+                    {"ready": True, **ready_state},
                     separators=(",", ":"),
                 ),
             )
-            if "cursor" in payload:
-                delivered = payload["cursor"]
+
+            delivered = ready_cursor if cursor is None else cursor
+            if cursor is not None:
+                while True:
+                    replay = await manager.delta(root, delivered)
+                    event = (
+                        "resync"
+                        if replay.get("resync")
+                        else "changes"
+                    )
+                    if replay.get("resync") or replay["changes"]:
+                        yield ServerSentEvent(
+                            event=event,
+                            data=json.dumps(
+                                replay,
+                                separators=(",", ":"),
+                            ),
+                        )
+                    delivered = replay["cursor"]
+                    if (
+                        replay.get("resync")
+                        or not replay.get("has_more")
+                    ):
+                        break
+
+            while True:
+                payload = await queue.get()
+                if payload.get("close"):
+                    return
+                if (
+                    "cursor" in payload
+                    and payload["cursor"] <= delivered
+                ):
+                    continue
+                event = (
+                    "resync"
+                    if payload.get("resync")
+                    else "changes"
+                )
+                yield ServerSentEvent(
+                    event=event,
+                    data=json.dumps(
+                        payload,
+                        separators=(",", ":"),
+                    ),
+                )
+                if "cursor" in payload:
+                    delivered = payload["cursor"]
+    except HTTPException:
+        if not ready_sent:
+            yield ServerSentEvent(
+                event="unavailable",
+                data='{"available":false,"retryable":true}',
+            )
+        return
 
 
 @router.get(

@@ -72,6 +72,29 @@ bash scripts/doctor.sh                # 重新校验安装并探测服务
 bash scripts/intake.sh                # 可选：创建或刷新工作区 CLAUDE.md
 ```
 
+## 可选：本地 `screen` 部署与有界日志
+
+上面的标准 systemd 服务仍写入 journald，轮转与保留策略继续由 journald 管理。
+若另行使用本地 `screen` 部署，可通过仓库内的通用启动器保存有界的 stdout/stderr 合并日志：
+
+```bash
+REPO="$(pwd)"
+screen -dmS muselab-local \
+  python3 "$REPO/scripts/rotating_log_launcher.py" \
+    --log "$REPO/muselab.log" --max-bytes 52428800 --keep 5 -- \
+    uv run python -m backend.main
+```
+
+启动器不内置仓库、用户或命令路径；子进程运行期间也会按大小轮转，并把 `SIGTERM`、
+`SIGINT`、`SIGHUP` 转发给整个子进程组。每一代保留日志都不会超过 `--max-bytes`；
+若单行异常长，轮转可能把它拆到相邻两代日志中。
+
+严重事件循环卡顿的归因只记录 Python 模块名和函数名，不记录局部变量、源码行、路径、
+prompt 或任何标识符。可通过 `MUSELAB_LOOP_HEARTBEAT_MS`、
+`MUSELAB_LOOP_LAG_WARN_MS`、`MUSELAB_LOOP_STALL_MS`、
+`MUSELAB_LOOP_STALL_RATE_LIMIT_S` 调整默认值；设置 `MUSELAB_PERF_LOG=0`
+可关闭包括 watchdog 在内的全部性能事件。
+
 ## 可选：配置工作区说明
 
 如需为主工作区记录长期项目约定，可显式运行：

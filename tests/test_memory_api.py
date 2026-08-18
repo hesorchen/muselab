@@ -94,13 +94,20 @@ def test_enabled_config_must_pass_probe(client, auth, monkeypatch):
                    "collection": "memory"},
     }
 
+    secret = "https://user:password@example.test/private?token=secret"
+
     async def broken(_config=None):
-        raise RuntimeError("embedding unavailable")
+        raise RuntimeError(secret)
 
     monkeypatch.setattr(api_memory.engine, "probe", broken)
     response = client.put("/api/memory/config", headers=auth, json=body)
     assert response.status_code == 400
-    assert "配置未保存" in response.json()["detail"]
+    assert response.json()["detail"] == {
+        "category": "unclassified",
+        "exception_class": "RuntimeError",
+    }
+    assert secret not in response.text
+    assert "example.test" not in response.text
     assert client.get("/api/memory/config", headers=auth).json()["mode"] == "off"
 
 

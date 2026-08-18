@@ -534,6 +534,31 @@ class ActivityService:
         return next((x for x in reversed(self._events)
                      if x.get("session_id") == sid), None)
 
+    def _live_session_ids(self) -> set[str]:
+        """Session ids the frontend can still open.
+
+        ``sessions.list_sessions()`` already excludes deleted sessions and rows
+        owned by a removed workspace — exactly the sessions a task-center click
+        would fail to open. Matching it here keeps the activity center from
+        showing (and erroring on) phantom rows.
+        """
+        return {
+            str(s.get("id"))
+            for s in sessions.list_sessions()
+            if s.get("id")
+        }
+
+    def _filter_live(self, events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Drop ledger rows whose backing session no longer opens. Anonymous
+        rows (no session_id) are always kept."""
+        if not events:
+            return []
+        live = self._live_session_ids()
+        return [
+            x for x in events
+            if not x.get("session_id") or str(x.get("session_id")) in live
+        ]
+
     def start(
         self,
         sid: str,
@@ -705,21 +730,29 @@ class ActivityService:
             self._publish_locked(item=item)
             return dict(item)
 
-    def list(self, limit: int = 100) -> list[dict[str, Any]]:
+    def list(self, limit: int = 100, *, filter_live: bool = False) -> list[dict[str, Any]]:
         self.initialize_runtime_state()
         with self._lock:
-            events = sorted(self._events, key=_activity_at, reverse=True)
-            return [dict(x) for x in events[:min(max(limit, 1), _MAX_EVENTS)]]
+            events = [dict(x) for x in self._events]
+        if filter_live:
+            events = self._filter_live(events)
+        events.sort(key=_activity_at, reverse=True)
+        return events[:min(max(limit, 1), _MAX_EVENTS)]
 
-    def summary(self) -> dict[str, Any]:
+    def summary(self, *, filter_live: bool = False) -> dict[str, Any]:
         self.initialize_runtime_state()
         with self._lock:
-            result = _summarize([dict(x) for x in self._events])
-            result["generation"] = self._generation
-            result["revision"] = self._revision
-            return result
+            events = [dict(x) for x in self._events]
+            generation = self._generation
+            revision = self._revision
+        if filter_live:
+            events = self._filter_live(events)
+        result = _summarize(events)
+        result["generation"] = generation
+        result["revision"] = revision
+        return result
 
-    def snapshot(self, limit: int = 100) -> dict[str, Any]:
+    def snapshot(self, limit: int = 100, *, filter_live: bool = False) -> dict[str, Any]:
         """Return rows and counters from the same locked ledger snapshot."""
         self.initialize_runtime_state()
         with self._lock:
@@ -728,10 +761,12 @@ class ActivityService:
             group_order = self._group_order_payload_locked()
             generation = self._generation
             revision = self._revision
-        ordered = sorted(events, key=_activity_at, reverse=True)
+        if filter_live:
+            events = self._filter_live(events)
         summary = _summarize(events)
         summary["generation"] = generation
         summary["revision"] = revision
+        ordered = sorted(events, key=_activity_at, reverse=True)
         return {
             "events": ordered[:min(max(limit, 1), _MAX_EVENTS)],
             "summary": summary,
@@ -1019,6 +1054,37 @@ class ActivityService:
                 "revision": self._revision,
                 "item": dict(item),
             }
+
+    def migrate_group_to_successor(
+        self,
+        source_sid: str,
+        successor_sid: str,
+    ) -> bool:
+        """Carry a runtime rollover's activity-group lane onto its fork.
+
+        When a session with pending background work forks a same-named
+        successor (runtime rollover), the source is hidden and the fork keeps
+        running.  If the source had been assigned to a custom activity group,
+        the fork must inherit that lane so the rollover stays invisible to the
+        user instead of surfacing a new ungrouped row.
+        """
+        self.initialize_runtime_state()
+        source_sid = str(source_sid or "")
+        successor_sid = str(successor_sid or "")
+        if not source_sid or not successor_sid or source_sid == successor_sid:
+            return False
+        with self._lock:
+            assigned = self._group_assignments.get(source_sid, "")
+            if not assigned:
+                return False
+            self._group_assignments.pop(source_sid, None)
+            self._group_assignments[successor_sid] = assigned
+            events_changed = self._reconcile_event_groups()
+            if events_changed:
+                self._save()
+            self._save_group_state()
+            self._publish_locked(resync=True)
+            return True
 
     def set_pin(self, event_id: str, pinned: bool) -> dict[str, Any] | None:
         """Persist a pin and return the exact ledger revision it belongs to."""

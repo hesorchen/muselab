@@ -26,6 +26,7 @@ from .workspaces import router as workspaces_router
 from .activity_api import router as activity_router
 from .terminal import router as terminal_router
 from .file_events import router as file_events_router
+from .todos_api import router as todos_router
 from .settings import ROOT, PORT, HOST
 from .version import project_version
 from .observability import (
@@ -120,6 +121,86 @@ _BG_TASKS: set = set()
 GRACEFUL_SHUTDOWN_TIMEOUT = 3
 _LOOP_LAG_INTERVAL_S = 1.0
 _LOOP_LAG_THRESHOLD_MS = 250
+_LOOP_STALL_THRESHOLD_S = 5.0
+_LOOP_STALL_RATE_LIMIT_S = 60.0
+
+
+def _bounded_env_float(name: str, default: float,
+                       minimum: float, maximum: float) -> float:
+    try:
+        value = float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    if not minimum <= value <= maximum:
+        value = default
+    return value
+
+
+class _EventLoopStallWatchdog:
+    """Attribute severe loop stalls from a daemon thread without user data.
+
+    The watchdog records only the blocked frame's module and function names.
+    It never formats locals, source lines, absolute paths, exception text, or
+    request/session identifiers.
+    """
+
+    def __init__(self, loop_thread_id: int, heartbeat_at: float, *,
+                 threshold_s: float, rate_limit_s: float, poll_s: float):
+        self._loop_thread_id = loop_thread_id
+        self._heartbeat_at = heartbeat_at
+        self._threshold_s = threshold_s
+        self._rate_limit_s = rate_limit_s
+        self._poll_s = poll_s
+        self._last_report_at: float | None = None
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="muselab-loop-watchdog",
+            daemon=True,
+        )
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def heartbeat(self, observed_at: float) -> None:
+        self._heartbeat_at = observed_at
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout=min(1.0, self._poll_s * 2 + 0.05))
+
+    def _blocked_site(self) -> str:
+        frame = sys._current_frames().get(self._loop_thread_id)
+        if frame is None:
+            return "unknown"
+        module = str(frame.f_globals.get("__name__", "unknown"))
+        function = str(frame.f_code.co_name or "unknown")
+        safe_module = re.sub(r"[^A-Za-z0-9_.-]", "_", module)[:80]
+        safe_function = re.sub(r"[^A-Za-z0-9_.-]", "_", function)[:60]
+        return f"{safe_module}:{safe_function}"
+
+    def _check_once(self, observed_at: float) -> None:
+        lag_s = max(0.0, observed_at - self._heartbeat_at)
+        if lag_s < self._threshold_s:
+            return
+        if (self._last_report_at is not None
+                and observed_at - self._last_report_at < self._rate_limit_s):
+            return
+        self._last_report_at = observed_at
+        try:
+            perf_event(
+                "runtime.loop_stall",
+                lag_ms=round(lag_s * 1000),
+                site=self._blocked_site(),
+            )
+        except Exception:
+            # Diagnostics must never terminate the watchdog thread.
+            pass
+
+    def _run(self) -> None:
+        while not self._stop.wait(self._poll_s):
+            self._check_once(_perf_monotonic())
 
 
 _ASSET_VERSION_CANDIDATES = tuple(sorted(
@@ -210,25 +291,54 @@ def _launch_background_tasks(coroutines) -> None:
 
 
 async def _monitor_event_loop_lag() -> None:
-    """Emit only actionable event-loop stalls; stay silent on healthy ticks."""
+    """Report loop lag and let a thread attribute severe stalls while blocked."""
     if not _perf_enabled():
         return
     import asyncio
 
-    expected = _perf_monotonic() + _LOOP_LAG_INTERVAL_S
-    while True:
-        await asyncio.sleep(_LOOP_LAG_INTERVAL_S)
-        observed = _perf_monotonic()
-        lag_ms = max(0, round((observed - expected) * 1000))
-        if lag_ms >= _LOOP_LAG_THRESHOLD_MS:
-            try:
-                perf_event("runtime.loop_lag", lag_ms=lag_ms)
-            except Exception:
-                # Diagnostics must never terminate their own long-lived monitor.
-                pass
-        # Reset after a stall so one pause creates one event rather than a
-        # permanent positive offset on every later healthy tick.
-        expected = observed + _LOOP_LAG_INTERVAL_S
+    interval_s = _bounded_env_float(
+        "MUSELAB_LOOP_HEARTBEAT_MS", _LOOP_LAG_INTERVAL_S * 1000, 50, 60_000
+    ) / 1000
+    warning_ms = _bounded_env_float(
+        "MUSELAB_LOOP_LAG_WARN_MS", _LOOP_LAG_THRESHOLD_MS, 25, 60_000
+    )
+    stall_s = max(
+        interval_s * 2,
+        _bounded_env_float(
+            "MUSELAB_LOOP_STALL_MS", _LOOP_STALL_THRESHOLD_S * 1000,
+            1000, 300_000,
+        ) / 1000,
+    )
+    rate_limit_s = _bounded_env_float(
+        "MUSELAB_LOOP_STALL_RATE_LIMIT_S", _LOOP_STALL_RATE_LIMIT_S, 1, 3600
+    )
+    observed = _perf_monotonic()
+    watchdog = _EventLoopStallWatchdog(
+        threading.get_ident(),
+        observed,
+        threshold_s=stall_s,
+        rate_limit_s=rate_limit_s,
+        poll_s=min(interval_s, max(0.05, stall_s / 4)),
+    )
+    watchdog.start()
+    expected = observed + interval_s
+    try:
+        while True:
+            await asyncio.sleep(interval_s)
+            observed = _perf_monotonic()
+            watchdog.heartbeat(observed)
+            lag_ms = max(0, round((observed - expected) * 1000))
+            if lag_ms >= warning_ms:
+                try:
+                    perf_event("runtime.loop_lag", lag_ms=lag_ms)
+                except Exception:
+                    # Diagnostics must never terminate their own long-lived monitor.
+                    pass
+            # Reset after a stall so one pause creates one event rather than a
+            # permanent positive offset on every later healthy tick.
+            expected = observed + interval_s
+    finally:
+        watchdog.stop()
 
 
 async def _recover_message_queues_at_startup(session_store) -> int:
@@ -279,6 +389,7 @@ async def _lifespan(app: FastAPI):
 
     from . import sessions as _sess
     from .activity import activity as _activity
+    from .todos import todos as _todos
     from . import scheduler as _sched
     from . import push as _push
     from . import memory_client as _mem0
@@ -288,6 +399,7 @@ async def _lifespan(app: FastAPI):
     await _asyncio.gather(
         _asyncio.to_thread(_sess.ensure_private_session_storage),
         _asyncio.to_thread(_activity.initialize_runtime_state),
+        _asyncio.to_thread(_todos.initialize_runtime_state),
     )
     # Older releases allowed a successor CLI's synthetic ``stopped`` record to
     # overwrite the predecessor's real terminal state. Repair each runtime
@@ -462,33 +574,39 @@ async def _backfill_turn_counts() -> None:
     if _ROOT is None:
         return
     try:
-        ss = _sess.list_sessions()
+        ss = await _asyncio.to_thread(_sess.list_sessions)
     except Exception as e:
         sys.stderr.write(f"[muselab] backfill list_sessions failed: {e}\n")
         return
+
+    def _load_counts(sid: str) -> tuple[int, int]:
+        msgs = _gsm(sid, directory=str(_sess.session_workspace(sid)))
+        return len(msgs), sum(
+            1 for sm in msgs if _chat._is_real_user_prompt(sm)
+        )
+
     updated = 0
     for s in ss:
         sid = s.get("id")
         if not sid:
             continue
         try:
-            msgs = _gsm(sid, directory=str(_sess.session_workspace(sid)))
+            message_count, n_turns = await _asyncio.to_thread(_load_counts, sid)
         except Exception:
             continue
-        n_turns = sum(1 for sm in msgs if _chat._is_real_user_prompt(sm))
         cur = s.get("turn_count")
         if cur == n_turns:
             continue
         try:
-            _sess.bump_session(sid, message_count=len(msgs),
-                                turn_count=n_turns)
+            await _asyncio.to_thread(
+                _sess.bump_session,
+                sid,
+                message_count=message_count,
+                turn_count=n_turns,
+            )
             updated += 1
         except Exception:
             pass
-        # Yield to the event loop periodically so we don't starve the web
-        # server on a large archive (~200+ sessions).
-        if updated % 20 == 0:
-            await _asyncio.sleep(0)
     if updated:
         sys.stderr.write(
             f"[muselab] backfilled turn_count for {updated} sessions\n")
@@ -725,6 +843,7 @@ app.include_router(push_router)
 app.include_router(workspaces_router)
 app.include_router(activity_router)
 app.include_router(terminal_router)
+app.include_router(todos_router)
 
 
 @functools.lru_cache(maxsize=1)

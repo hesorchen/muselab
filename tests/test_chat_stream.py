@@ -2940,6 +2940,108 @@ def test_subscribe_broadcast_marks_continuation_consumed(stream_env):
     assert plain.continuation_consumed is False
 
 
+def test_replay_spool_uses_private_configured_runtime_dir(
+        stream_env, monkeypatch, tmp_path):
+    chat_mod = stream_env
+    runtime_dir = tmp_path / "durable-runtime"
+    monkeypatch.setenv("MUSELAB_RUNTIME_DIR", str(runtime_dir))
+
+    spool = chat_mod._ReplaySpool()
+    try:
+        assert spool.path.parent == runtime_dir
+        assert runtime_dir.stat().st_mode & 0o777 == 0o700
+        assert spool.path.stat().st_mode & 0o777 == 0o600
+    finally:
+        spool.close()
+
+
+def test_replay_spool_rolls_back_partial_enospc(
+        stream_env, monkeypatch, tmp_path):
+    chat_mod = stream_env
+    monkeypatch.setenv("MUSELAB_RUNTIME_DIR", str(tmp_path / "runtime"))
+    spool = chat_mod._ReplaySpool()
+    real_write = chat_mod.os.write
+    calls = 0
+
+    def partial_then_full(fd, blob):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return real_write(fd, blob[:max(1, len(blob) // 2)])
+        raise OSError(28, "disk full private detail")
+
+    try:
+        monkeypatch.setattr(chat_mod.os, "write", partial_then_full)
+        with pytest.raises(OSError) as failure:
+            spool.append({"event": "done", "data": "{}"})
+        assert failure.value.errno == 28
+        assert spool.size() == 0
+        assert len(spool) == 0
+        assert spool.path.read_bytes() == b""
+
+        monkeypatch.setattr(chat_mod.os, "write", real_write)
+        spool.append({"event": "done", "data": "{}"})
+        assert list(spool) == [{"event": "done", "data": "{}"}]
+    finally:
+        spool.close()
+
+
+def test_replay_spool_becomes_unusable_when_partial_rollback_fails(
+        stream_env, monkeypatch, tmp_path):
+    chat_mod = stream_env
+    monkeypatch.setenv("MUSELAB_RUNTIME_DIR", str(tmp_path / "runtime"))
+    spool = chat_mod._ReplaySpool()
+    real_write = chat_mod.os.write
+    calls = 0
+
+    def partial_then_enospc(fd, blob):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return real_write(fd, blob[:1])
+        raise OSError(28, "disk full")
+
+    monkeypatch.setattr(chat_mod.os, "write", partial_then_enospc)
+    monkeypatch.setattr(
+        chat_mod.os, "ftruncate",
+        lambda *_args: (_ for _ in ()).throw(OSError(5, "rollback failed")),
+    )
+    try:
+        with pytest.raises(OSError) as failure:
+            spool.append({"event": "done", "data": "{}"})
+        assert failure.value.errno == 28
+        with pytest.raises(RuntimeError, match="unusable"):
+            spool.append({"event": "done", "data": "{}"})
+    finally:
+        spool.close()
+
+
+def test_replay_corruption_is_typed_and_subscriber_resyncs_once(
+        stream_env, monkeypatch, tmp_path):
+    chat_mod = stream_env
+    monkeypatch.setenv("MUSELAB_RUNTIME_DIR", str(tmp_path / "runtime"))
+    spool = chat_mod._ReplaySpool()
+    spool.path.write_bytes(b'{"event":"done","data":7}\n')
+    try:
+        with pytest.raises(chat_mod._ReplayRecordCorruption):
+            list(spool)
+
+        async def consume():
+            subscriber = chat_mod._TurnSubscriber(spool.open_reader())
+            first = await subscriber.get()
+            second = await subscriber.get()
+            return first, second
+
+        first, second = asyncio.run(consume())
+        assert first["event"] == "resync"
+        assert json.loads(first["data"]) == {
+            "reason": "replay_corrupt", "retryable": True,
+        }
+        assert second is None
+    finally:
+        spool.close()
+
+
 def test_broadcast_replay_compacts_100k_deltas_into_bounded_chunks(stream_env):
     """Replay stays exact without retaining one envelope per token in memory."""
     import json
@@ -3423,6 +3525,25 @@ def test_stream_ticket_replays_complete_turn_for_mobile_and_desktop(
         bc.close()
 
 
+def test_shutdown_closes_active_and_recent_broadcast_spools(
+        stream_env, monkeypatch, tmp_path):
+    chat_mod = stream_env
+    monkeypatch.setenv("MUSELAB_RUNTIME_DIR", str(tmp_path / "runtime"))
+    active = chat_mod.TurnBroadcast("shutdown-active")
+    recent = chat_mod.TurnBroadcast("shutdown-recent")
+    active_path = active.events.path
+    recent_path = recent.events.path
+    chat_mod._active_turns[active.session_id] = active
+    chat_mod._recent_turns[recent.session_id] = recent
+
+    asyncio.run(chat_mod.shutdown_runtime())
+
+    assert not active_path.exists()
+    assert not recent_path.exists()
+    assert active.session_id not in chat_mod._active_turns
+    assert recent.session_id not in chat_mod._recent_turns
+
+
 def test_stream_error_path_classifies_auth_error(stream_env, client, monkeypatch):
     """If the SDK stream raises an auth-shaped error, the handler emits an
     `error` frame carrying the classification (kind=auth, non-retryable)."""
@@ -3453,6 +3574,99 @@ def test_stream_error_path_classifies_auth_error(stream_env, client, monkeypatch
     assert err["cta"] == "open_settings"
     assert err["retryable"] is False
     # Reservation released even on error so the user can retry.
+    assert sid not in chat_mod._active_turns
+
+
+def test_terminal_snapshot_failure_keeps_primary_error_frame(
+        stream_env, client, monkeypatch, capsys):
+    chat_mod = stream_env
+    sid = _make_session(client)
+    primary = "HTTP 401 primary-auth-failure"
+    secondary = "PRIVATE_SNAPSHOT_DETAIL"
+
+    class BoomClient:
+        async def query(self, _prompt):
+            return None
+
+        async def receive_response(self):
+            raise RuntimeError(primary)
+            yield  # pragma: no cover
+
+    async def fake_get_client(*_args, **_kwargs):
+        return BoomClient()
+
+    monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
+    monkeypatch.setattr(
+        chat_mod,
+        "_persist_failed_turn_snapshot",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            OSError(secondary)),
+    )
+
+    response = client.get(
+        f"/api/chat/stream?token={TEST_TOKEN}&session_id={sid}"
+        "&prompt=hi&model=claude-sonnet-4-6")
+    error = next(
+        json.loads(data)
+        for event, data in _parse_sse(response.text)
+        if event == "error"
+    )
+
+    assert primary in error["error"]
+    assert error["snapshot_ready"] is False
+    diagnostics = capsys.readouterr().err
+    assert "stage=terminal_snapshot" in diagnostics
+    assert secondary not in diagnostics
+    assert primary not in diagnostics
+
+
+def test_terminal_replay_failure_keeps_primary_failure_state(
+        stream_env, client, monkeypatch, capsys):
+    chat_mod = stream_env
+    sid = _make_session(client)
+    primary = "PRIMARY_STREAM_FAILURE"
+    secondary = "PRIVATE_REPLAY_FAILURE"
+    recorded = []
+
+    class BoomClient:
+        async def query(self, _prompt):
+            return None
+
+        async def receive_response(self):
+            raise RuntimeError(primary)
+            yield  # pragma: no cover
+
+    async def fake_get_client(*_args, **_kwargs):
+        return BoomClient()
+
+    real_append = chat_mod._ReplaySpool.append
+
+    def fail_error_record(spool, event):
+        if event.get("event") == "error":
+            raise OSError(28, secondary)
+        return real_append(spool, event)
+
+    monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
+    monkeypatch.setattr(chat_mod, "_persist_failed_turn_snapshot",
+                        lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(chat_mod._ReplaySpool, "append", fail_error_record)
+    monkeypatch.setattr(
+        chat_mod.mem0, "schedule_failed",
+        lambda *args, **_kwargs: recorded.append(args) or True,
+    )
+
+    response = client.get(
+        f"/api/chat/stream?token={TEST_TOKEN}&session_id={sid}"
+        "&prompt=hi&model=claude-sonnet-4-6")
+
+    assert response.status_code == 200
+    assert len(recorded) == 1
+    assert primary in recorded[0][4]
+    assert secondary not in recorded[0][4]
+    diagnostics = capsys.readouterr().err
+    assert "stage=terminal_replay" in diagnostics
+    assert secondary not in diagnostics
+    assert primary not in diagnostics
     assert sid not in chat_mod._active_turns
 
 

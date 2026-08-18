@@ -21,6 +21,7 @@ def _load(monkeypatch, url="http://127.0.0.1:8800"):
     importlib.reload(settings)
     import backend.memory_client as mc
     importlib.reload(mc)
+    monkeypatch.setattr(mc, "native_enabled", lambda: False)
     return mc
 
 
@@ -94,7 +95,7 @@ def test_disabled_when_no_or_invalid_url(monkeypatch):
     for url in ("", "ftp://127.0.0.1:8800", "http://host:8800?token=x",
                 "http://127.0.0.1:notaport", "http://127.0.0.1:70000"):
         mc = _load(monkeypatch, url=url)
-        assert mc.enabled() is False
+        assert mc.enabled() is False, url
         assert _run(mc.search_context("q", "sid")) == ""
 
 
@@ -157,6 +158,31 @@ def test_store_payload_has_no_run_id(monkeypatch, fake_httpx):
     assert url.endswith("/add")
     assert "run_id" not in payload
     assert payload["user_id"] == "muselab"
+
+
+def test_failsoft_logging_never_renders_exception_secrets(
+        monkeypatch, fake_httpx, caplog):
+    import httpx
+
+    mc = _load(monkeypatch)
+    secret = "sk-private-memory-client-secret"
+
+    async def fail(*_args, **_kwargs):
+        raise httpx.HTTPStatusError(
+            f"private body {secret}",
+            request=httpx.Request("POST", f"https://example.test/{secret}"),
+            response=httpx.Response(529),
+        )
+
+    monkeypatch.setattr(mc, "_post_json", fail)
+    caplog.set_level("DEBUG", logger="muselab.mem0")
+    assert _run(mc.search_context("private prompt", "s")) == ""
+    assert "category=transient_http" in caplog.text
+    assert "exception_class=HTTPStatusError" in caplog.text
+    assert "status=529" in caplog.text
+    assert secret not in caplog.text
+    assert "example.test" not in caplog.text
+    assert "private prompt" not in caplog.text
 
 
 def test_failsoft_wall_clock_timeout(monkeypatch, fake_httpx):

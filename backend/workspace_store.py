@@ -35,6 +35,8 @@ _IGNORED_SUBTREES = frozenset({
     ".pytest_cache",
     ".tox",
     ".hypothesis",
+    ".jumbo",
+    ".jumbo.bak",
 })
 _EVENT_LIMIT = 20_000
 # A reconciliation can discover tens of thousands of offline changes at once
