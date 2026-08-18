@@ -346,6 +346,7 @@ function portal() {
     _fileEventsSeq: 0,
     _fileEventsTimer: null,
     _fileEventsPending: null,
+    _fileEventsReconnectFailures: 0,
     _fileTreeDirty: false,
     _fileTreeRefreshBusy: false,
     _fileTreeRefreshGeneration: "",
@@ -17088,6 +17089,13 @@ function portal() {
       if (this._isMobileLayout()) return this.mobileTab === "files";
       return !!this.leftOpen && !this.desktopFullPane;
     },
+    _nextFileEventsReconnectDelay() {
+      this._fileEventsReconnectFailures += 1;
+      return Math.min(
+        500 * Math.pow(2, this._fileEventsReconnectFailures - 1),
+        8000,
+      );
+    },
     _stopFileEvents(markDirty = false) {
       const workspace = this._fileEventsWorkspace;
       ++this._fileEventsSeq;
@@ -17956,7 +17964,10 @@ function portal() {
             && this._workspaceGenerationIsCurrent(
               workspace, workspaceGeneration,
             )) {
-          this._fileEventsTimer = setTimeout(() => this._startFileEvents(), 1500);
+          this._fileEventsTimer = setTimeout(
+            () => this._startFileEvents(),
+            this._nextFileEventsReconnectDelay(),
+          );
         }
         return;
       }
@@ -17981,6 +17992,7 @@ function portal() {
         );
       es.addEventListener("ready", (ev) => {
         if (!owns()) return;
+        this._fileEventsReconnectFailures = 0;
         let payload = {};
         try { payload = JSON.parse(ev.data); } catch (_) {}
         const readyWorkspaceId = String(payload.workspace_id || "");
@@ -18034,7 +18046,10 @@ function portal() {
         this._fileEventsWorkspace = "";
         this._fileEventsGeneration = "";
         if (this._fileTreeIsVisible()) {
-          this._fileEventsTimer = setTimeout(() => this._startFileEvents(), 1500);
+          this._fileEventsTimer = setTimeout(
+            () => this._startFileEvents(),
+            this._nextFileEventsReconnectDelay(),
+          );
         }
       };
       if (!this._fileEventsVisibilityBound) {

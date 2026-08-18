@@ -2208,6 +2208,56 @@ def test_workspace_remove_readd_rejects_old_path_generation(
     }
 
 
+def test_file_event_reconnect_backoff_resets_on_ready(
+        page: Page, backend_url, auth_token):
+    _login(page, backend_url, auth_token)
+    result = page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const originals = {
+            EventSource: window.EventSource,
+            capabilities: app._fileCapabilities,
+            visible: app._fileTreeIsVisible,
+          };
+          class FakeEventSource extends EventTarget {
+            close() {}
+          }
+          try {
+            app._stopFileEvents(false);
+            app._fileEventsReconnectFailures = 0;
+            const delays = Array.from(
+              {length: 6}, () => app._nextFileEventsReconnectDelay(),
+            );
+            window.EventSource = FakeEventSource;
+            app._fileCapabilities = async () => ({
+              mintTicket: async () => 'fake-ticket',
+            });
+            app._fileTreeIsVisible = () => true;
+            await app._startFileEvents();
+            const stream = app._fileEvents;
+            stream.dispatchEvent(new MessageEvent('ready', {
+              data: JSON.stringify({ready: true, cursor: 0}),
+            }));
+            return {
+              delays,
+              failuresAfterReady: app._fileEventsReconnectFailures,
+              nextDelay: app._nextFileEventsReconnectDelay(),
+            };
+          } finally {
+            app._stopFileEvents(false);
+            window.EventSource = originals.EventSource;
+            app._fileCapabilities = originals.capabilities;
+            app._fileTreeIsVisible = originals.visible;
+          }
+        }"""
+    )
+    assert result == {
+        "delays": [500, 1000, 2000, 4000, 8000, 8000],
+        "failuresAfterReady": 0,
+        "nextDelay": 500,
+    }
+
+
 def test_sse_ready_workspace_id_mismatch_forces_cold_tree_recovery(
         page: Page, backend_url, auth_token):
     _login(page, backend_url, auth_token)

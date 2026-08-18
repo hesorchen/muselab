@@ -1,6 +1,7 @@
 """Shared filesystem watcher and SSE endpoint regressions."""
 
 import asyncio
+import contextlib
 import os
 import stat
 import threading
@@ -26,6 +27,44 @@ def test_file_event_ticket_is_workspace_bound_and_single_use(
     scope = (str(temp_root.resolve()),)
     assert tickets.validate(ticket, "files", scope) is True
     assert tickets.validate(ticket, "files", scope) is False
+
+
+def test_unavailable_sse_crosses_gzip_middleware_as_clean_event(
+    client,
+    auth,
+    app_module,
+    temp_root,
+    monkeypatch,
+):
+    import backend.file_events as file_events
+
+    class UnavailableManager:
+        @contextlib.asynccontextmanager
+        async def subscribe(self, _root):
+            yield asyncio.Queue()
+
+        async def ready_state(self, _root):
+            raise file_events.HTTPException(
+                status_code=503,
+                detail=f"private scan failure: {temp_root}/secret",
+            )
+
+    minted = client.post("/api/files/events-ticket", headers=auth)
+    ticket = minted.json()["ticket"]
+    monkeypatch.setattr(file_events, "manager", UnavailableManager())
+    response = client.get(
+        "/api/files/events",
+        params={"ticket": ticket},
+        headers={"Accept-Encoding": "gzip"},
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    assert response.headers.get("content-encoding") != "gzip"
+    assert response.text.count("event: unavailable") == 1
+    assert '{"available":false,"retryable":true}' in response.text
+    assert str(temp_root) not in response.text
+    assert "private scan failure" not in response.text
 
 
 def test_selected_bootstrap_post_is_bounded_and_validates_parents(
@@ -125,7 +164,10 @@ def test_watch_filter_checks_workspace_relative_paths(app_module, tmp_path):
         Change.modified,
         str(root / "node_modules" / "pkg" / "x.js"),
     ) is False
-    for opaque in (".cache", ".local", ".codex", ".claude", ".npm", "venv"):
+    for opaque in (
+        ".cache", ".local", ".codex", ".claude", ".npm", "venv",
+        ".jumbo", ".jumbo.bak",
+    ):
         assert include(Change.modified, str(root / opaque)) is True
         assert include(
             Change.modified,
@@ -1215,6 +1257,100 @@ async def test_failed_initial_reconcile_retries_on_next_ensure(
 
 
 @pytest.mark.asyncio
+async def test_reconcile_failures_back_off_coalesce_and_reset(
+    app_module,
+    temp_root,
+    monkeypatch,
+):
+    import backend.file_events as file_events
+
+    store = file_events.WorkspaceStore(temp_root)
+    real_reconcile = store.reconcile
+    calls = 0
+    events = []
+
+    def fail_twice(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls <= 2:
+            raise file_events.WorkspaceScanIncomplete(
+                f"private failure under {temp_root}/secret-{calls}"
+            )
+        return real_reconcile(*args, **kwargs)
+
+    monkeypatch.setattr(store, "reconcile", fail_twice)
+    monkeypatch.setattr(file_events, "_RECONCILE_BACKOFF_START_S", 0.02)
+    monkeypatch.setattr(file_events, "_RECONCILE_BACKOFF_CAP_S", 0.04)
+    monkeypatch.setattr(
+        file_events,
+        "perf_event",
+        lambda event, **fields: events.append((event, fields)),
+    )
+    manager = file_events.FileWatchManager(store)
+
+    with pytest.raises(file_events.HTTPException) as first:
+        await manager.bootstrap(temp_root)
+    assert first.value.detail == "workspace index is temporarily unavailable"
+    assert str(temp_root) not in first.value.detail
+
+    started = file_events.monotonic()
+    failed_pair = await asyncio.gather(
+        manager.bootstrap(temp_root),
+        manager.bootstrap(temp_root),
+        return_exceptions=True,
+    )
+    assert all(isinstance(item, file_events.HTTPException) for item in failed_pair)
+    assert calls == 2
+    assert file_events.monotonic() - started >= 0.015
+
+    started = file_events.monotonic()
+    recovered = await asyncio.gather(
+        manager.bootstrap(temp_root),
+        manager.bootstrap(temp_root),
+    )
+    assert calls == 3
+    assert file_events.monotonic() - started >= 0.03
+    assert recovered[0] == recovered[1]
+
+    state = manager._states[temp_root.resolve()]
+    assert state.reconcile_attempts == 3
+    assert state.reconcile_failures == 0
+    assert state.reconcile_retry_at == 0.0
+    reconcile_events = [fields for event, fields in events
+                        if event == "files.reconcile"]
+    assert [fields["attempt"] for fields in reconcile_events] == [1, 2, 3]
+    assert [fields["failures"] for fields in reconcile_events] == [1, 2, 0]
+    assert [fields["backoff_ms"] for fields in reconcile_events] == [20, 40, 0]
+    assert {fields["phase"] for fields in reconcile_events} == {"initial"}
+    captured = repr(reconcile_events)
+    assert str(temp_root) not in captured
+    assert "private failure" not in captured
+    await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_interrupts_reconcile_backoff(
+    app_module,
+    temp_root,
+):
+    import backend.file_events as file_events
+
+    manager = file_events.FileWatchManager(file_events.WorkspaceStore(temp_root))
+    state = file_events._WatchState(
+        root=temp_root.resolve(),
+        workspace_id="workspace-id",
+        reconcile_retry_at=file_events.monotonic() + 30,
+    )
+    manager._states[state.root] = state
+    async with manager._lock:
+        manager._queue_reconcile_locked(state)
+    await asyncio.sleep(0)
+
+    await asyncio.wait_for(manager.shutdown(), timeout=0.5)
+    assert state.reconcile_task is None
+
+
+@pytest.mark.asyncio
 async def test_sse_ready_uses_lightweight_cursor_not_bootstrap(
     app_module,
     temp_root,
@@ -1245,6 +1381,71 @@ async def test_sse_ready_uses_lightweight_cursor_not_bootstrap(
     assert f'"workspace_id":"{workspace_id}"' in ready.data
     await stream.aclose()
     await local_manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_sse_initial_unavailable_is_private_and_closes_cleanly(
+    app_module,
+    temp_root,
+    monkeypatch,
+):
+    import backend.file_events as file_events
+
+    exited = False
+
+    class UnavailableManager:
+        @contextlib.asynccontextmanager
+        async def subscribe(self, _root):
+            nonlocal exited
+            try:
+                yield asyncio.Queue()
+            finally:
+                exited = True
+
+        async def ready_state(self, _root):
+            raise file_events.HTTPException(
+                status_code=503,
+                detail=f"failed to scan {temp_root}/private: permission denied",
+            )
+
+    monkeypatch.setattr(file_events, "manager", UnavailableManager())
+    events = [event async for event in file_events._event_stream(temp_root, None)]
+
+    assert len(events) == 1
+    assert events[0].event == "unavailable"
+    assert events[0].data == '{"available":false,"retryable":true}'
+    assert str(temp_root) not in events[0].data
+    assert "permission denied" not in events[0].data
+    assert exited is True
+
+
+@pytest.mark.asyncio
+async def test_http_exception_after_sse_ready_becomes_clean_eof(
+    app_module,
+    temp_root,
+    monkeypatch,
+):
+    import backend.file_events as file_events
+
+    class ClosingManager:
+        @contextlib.asynccontextmanager
+        async def subscribe(self, _root):
+            yield asyncio.Queue()
+
+        async def ready_state(self, _root):
+            return {"workspace_id": "safe-id", "cursor": 1}
+
+        async def delta(self, _root, _cursor):
+            raise file_events.HTTPException(
+                status_code=503,
+                detail=f"late failure at {temp_root}/private",
+            )
+
+    monkeypatch.setattr(file_events, "manager", ClosingManager())
+    events = [event async for event in file_events._event_stream(temp_root, 0)]
+
+    assert [event.event for event in events] == ["ready"]
+    assert str(temp_root) not in events[0].data
 
 
 @pytest.mark.asyncio

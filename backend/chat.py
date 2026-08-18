@@ -1,4 +1,5 @@
 import os
+import errno
 import threading
 import base64
 from collections import deque
@@ -282,6 +283,18 @@ def _perf_event(event: str, /, **fields: Any) -> None:
         obs.perf_event(event, **fields)
     except Exception:
         pass
+
+
+def _safe_secondary_diagnostic(
+    stage: str, session_id: str, exc: BaseException,
+) -> None:
+    """Emit one bounded, content-free diagnostic for contained cleanup faults."""
+    safe_stage = re.sub(r"[^a-z0-9_.-]", "_", stage.lower())[:48]
+    sys.stderr.write(
+        f"[chat-secondary] stage={safe_stage} "
+        f"sid={obs.short_id(session_id)} exc={type(exc).__name__}\n"
+    )
+    sys.stderr.flush()
 
 
 def _build_runtime_task_context_hook(session_id: str):
@@ -785,23 +798,77 @@ def _stream_text_payload(event: dict) -> tuple[str, str] | None:
     return kind, payload["text"]
 
 
+class _ReplayRecordCorruption(ValueError):
+    """A replay row is incomplete or violates the private spool schema."""
+
+
+def _decode_replay_record(line: bytes) -> dict:
+    """Decode and type-check one complete replay row for every reader path."""
+    if not line.endswith(b"\n"):
+        raise _ReplayRecordCorruption("incomplete replay record")
+    try:
+        event = json.loads(line)
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise _ReplayRecordCorruption("invalid replay json") from exc
+    if not isinstance(event, dict):
+        raise _ReplayRecordCorruption("replay record is not an object")
+    if not isinstance(event.get("event"), str) or not event["event"]:
+        raise _ReplayRecordCorruption("replay event type is invalid")
+    if not isinstance(event.get("data"), str):
+        raise _ReplayRecordCorruption("replay event data is invalid")
+    if "_coalesced" in event and not isinstance(event["_coalesced"], bool):
+        raise _ReplayRecordCorruption("replay coalesced marker is invalid")
+    return event
+
+
+def _replay_runtime_dir() -> Path:
+    """Return private durable storage for transient replay records."""
+    configured = os.environ.get("MUSELAB_RUNTIME_DIR", "").strip()
+    root = (Path(configured).expanduser() if configured
+            else sess.SESS_DIR / "runtime")
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    root.chmod(0o700)
+    return root
+
+
 class _ReplaySpool:
     """Append-only replay storage outside the Python heap."""
 
     def __init__(self):
-        fd, name = tempfile.mkstemp(prefix="muselab-turn-", suffix=".jsonl")
+        fd, name = tempfile.mkstemp(
+            prefix="muselab-turn-", suffix=".jsonl",
+            dir=str(_replay_runtime_dir()),
+        )
+        os.fchmod(fd, 0o600)
         self.path = Path(name)
-        self._writer = os.fdopen(fd, "ab", buffering=0)
+        self._fd = fd
         self._count = 0
         self._bytes = 0
         self._closed = False
+        self._usable = True
 
     def append(self, event: dict) -> None:
         if self._closed:
             raise RuntimeError("replay spool is closed")
+        if not self._usable:
+            raise RuntimeError("replay spool is unusable")
         payload = json.dumps(event, ensure_ascii=False, separators=(",", ":"))
         blob = payload.encode("utf-8") + b"\n"
-        self._writer.write(blob)
+        start = self._bytes
+        written = 0
+        try:
+            while written < len(blob):
+                count = os.write(self._fd, blob[written:])
+                if count <= 0:
+                    raise OSError(errno.EIO, "replay spool write made no progress")
+                written += count
+        except BaseException:
+            try:
+                os.ftruncate(self._fd, start)
+                os.lseek(self._fd, start, os.SEEK_SET)
+            except OSError:
+                self._usable = False
+            raise
         self._count += 1
         self._bytes += len(blob)
 
@@ -821,7 +888,7 @@ class _ReplaySpool:
     def __iter__(self):
         with self.open_reader() as reader:
             for line in reader:
-                yield json.loads(line)
+                yield _decode_replay_record(line)
 
     def __getitem__(self, index):
         if isinstance(index, slice):
@@ -837,7 +904,7 @@ class _ReplaySpool:
         if self._closed:
             return
         self._closed = True
-        self._writer.close()
+        os.close(self._fd)
         with suppress(OSError):
             self.path.unlink()
 
@@ -923,6 +990,8 @@ class _TurnSubscriber:
                 await self._wake.wait()
                 continue
             event = self._next_spool_event()
+            if self._resync_reason:
+                continue
             if event is _LIVE_MESSAGE_BARRIER:
                 self._draining_live_barrier = True
                 continue
@@ -943,6 +1012,8 @@ class _TurnSubscriber:
             # Close the clear/append race: publish() may have written between
             # the first EOF read and clear(). Recheck before sleeping.
             event = self._next_spool_event()
+            if self._resync_reason:
+                continue
             if event is _LIVE_MESSAGE_BARRIER:
                 self._draining_live_barrier = True
                 continue
@@ -968,9 +1039,10 @@ class _TurnSubscriber:
             if not line:
                 return None
             try:
-                event = json.loads(line)
-            except ValueError:
-                continue
+                event = _decode_replay_record(line)
+            except _ReplayRecordCorruption:
+                self.resync("replay_corrupt")
+                return None
             coalesced = event.pop("_coalesced", False)
             if coalesced and offset >= self._skip_from:
                 # Streamed to us live, token by token — emitting the coalesced
@@ -4174,6 +4246,17 @@ async def shutdown_runtime() -> None:
             await asyncio.gather(*done, return_exceptions=True)
         for task in pending:
             _retain_detached_cleanup(task)
+
+    broadcasts = {
+        id(broadcast): broadcast
+        for broadcast in (
+            *tuple(_active_turns.values()),
+            *tuple(_recent_turns.values()),
+        )
+    }.values()
+    for broadcast in broadcasts:
+        broadcast.close()
+    _recent_turns.clear()
 
     streams = list(_session_streams.values())
     _session_streams.clear()
@@ -16626,15 +16709,19 @@ async def _start_turn(
             # cannot collapse the live partial+error pair into bare JSONL.
             _failed_snapshot_ready = False
             if _is_error and not was_cancelled:
-                _failed_snapshot_ready = await asyncio.to_thread(
-                    _persist_failed_turn_snapshot,
-                    broadcast,
-                    _error_message,
-                    terminal_at_ms=_completed_at_ms,
-                    elapsed_s=_elapsed_s,
-                    memory_recall=_done_memory_receipt,
-                    canonical_terminal_published=True,
-                )
+                try:
+                    _failed_snapshot_ready = await asyncio.to_thread(
+                        _persist_failed_turn_snapshot,
+                        broadcast,
+                        _error_message,
+                        terminal_at_ms=_completed_at_ms,
+                        elapsed_s=_elapsed_s,
+                        memory_recall=_done_memory_receipt,
+                        canonical_terminal_published=True,
+                    )
+                except Exception as exc:
+                    _safe_secondary_diagnostic(
+                        "terminal_snapshot", session_id, exc)
             _done_background_tasks = len(
                 _merge_session_inflight(session_id, inflight_tasks)
             )
@@ -17229,15 +17316,20 @@ async def _start_turn(
                 0, terminal_at_ms - int(float(broadcast.started_at or 0) * 1000))
             recall = mem0.pop_recall_trace(session_id)
             receipt = _persistable_memory_recall(recall)
-            snapshot_ready = await asyncio.to_thread(
-                _persist_failed_turn_snapshot,
-                broadcast,
-                turn_error_text,
-                terminal_at_ms=terminal_at_ms,
-                elapsed_s=round(duration_ms / 1000, 1),
-                memory_recall=receipt,
-                canonical_terminal_published=False,
-            )
+            snapshot_ready = False
+            try:
+                snapshot_ready = await asyncio.to_thread(
+                    _persist_failed_turn_snapshot,
+                    broadcast,
+                    turn_error_text,
+                    terminal_at_ms=terminal_at_ms,
+                    elapsed_s=round(duration_ms / 1000, 1),
+                    memory_recall=receipt,
+                    canonical_terminal_published=False,
+                )
+            except Exception as exc:
+                _safe_secondary_diagnostic(
+                    "terminal_snapshot", session_id, exc)
             event = _error_event(turn_error_text)
             try:
                 data = json.loads(event.get("data") or "{}")
@@ -17384,16 +17476,23 @@ async def _start_turn(
                 f"[chat] turn exceeded MUSELAB_TURN_TIMEOUT_S={BG_TIMEOUT_S}s, "
                 f"aborting sid={session_id[:8]}\n")
             sys.stderr.flush()
-            broadcast.publish(await _durable_error_event(turn_error_text))
+            try:
+                broadcast.publish(await _durable_error_event(turn_error_text))
+            except Exception as exc:
+                _safe_secondary_diagnostic(
+                    "terminal_replay", session_id, exc)
         except Exception as e:
             if terminal_published:
                 sys.stderr.write(
                     f"[chat] post-turn bookkeeping failed "
                     f"sid={session_id[:8]} exc={type(e).__name__}\n")
                 return
+            primary_already_recorded = turn_errored and bool(turn_error_text)
             turn_errored = True
-            turn_error_text = f"{type(e).__name__}: {e}"
-            error_kind = _classify_stream_error(str(e)).get("kind", "unknown")
+            if not primary_already_recorded:
+                turn_error_text = f"{type(e).__name__}: {e}"
+            error_kind = _classify_stream_error(
+                turn_error_text).get("kind", "unknown")
             # The authenticated SSE frame below is the user-facing error
             # surface. Server logs keep only safe diagnostics: SDK/Gateway
             # exception strings and tracebacks can contain prompts, paths,
@@ -17402,7 +17501,16 @@ async def _start_turn(
                 f"[chat] background turn crashed sid={session_id[:8]} "
                 f"exc={type(e).__name__} kind={error_kind}\n")
             sys.stderr.flush()
-            broadcast.publish(await _durable_error_event(turn_error_text))
+            if primary_already_recorded:
+                _safe_secondary_diagnostic(
+                    "terminal_replay", session_id, e)
+            else:
+                try:
+                    broadcast.publish(
+                        await _durable_error_event(turn_error_text))
+                except Exception as exc:
+                    _safe_secondary_diagnostic(
+                        "terminal_replay", session_id, exc)
         finally:
             if broadcast.cancelled:
                 broadcast.perf_status = "cancelled"

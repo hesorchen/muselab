@@ -2526,6 +2526,48 @@ def test_render_key_regression_boundaries_keep_state_and_owners_consistent():
     assert "this._releasePaneMessageRenderKeys(st" in truncate
 
 
+def test_render_key_owned_arrays_mutate_only_at_audited_boundaries():
+    """New pane-array mutations must explicitly join the render-key audit."""
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    method = "<top-level>"
+    mutation_methods = set()
+    method_re = re.compile(
+        r"^    (?:async )?([A-Za-z_$][\w$]*)\([^)]*\) \{$"
+    )
+    mutation_re = re.compile(
+        r"\b(?:st|sendState|ownerState|newSt|child)\."
+        r"(?:messages|_earlierMessages|_laterMessages)"
+        r"(?:\.(?:push|unshift|splice|pop|shift)\s*\(|\.length\s*=|\s*=)"
+    )
+    for line in app.splitlines():
+        declaration = method_re.match(line)
+        if declaration:
+            method = declaration.group(1)
+        if mutation_re.search(line):
+            mutation_methods.add(method)
+
+    assert mutation_methods == {
+        "_capHistoryCache",
+        "_capLiveMessages",
+        "_capMountedWindow",
+        "_ensureTabState",
+        "_fetchLaterWindow",
+        "_fetchOlderWindow",
+        "_loadAroundMessage",
+        "_reloadHistoryTailAfterConflict",
+        "_revealMessagesChunked",
+        "_scrollToUserMsg",
+        "_stateForDetachedSuccessor",
+        "loadEarlierMessages",
+        "loadLaterMessages",
+        "loadSession",
+        "newSession",
+        "onModelChange",
+        "returnToLatest",
+        "send",
+    }
+
+
 def test_render_key_telemetry_has_one_disposable_trailing_flush():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
     report_start = app.index("_flushPaneRenderKeyTelemetry(tid, st)")
@@ -3224,6 +3266,15 @@ def test_file_tree_live_events_are_workspace_scoped_and_mobile_batched():
     assert "const delay = this._isMobileLayout() ? 650 : 250" in app
     assert "if (!this._fileTreeIsVisible())" in app
     assert "this._stopFileEvents(true)" in app
+    assert "_fileEventsReconnectFailures: 0" in app
+    assert "_nextFileEventsReconnectDelay()" in app
+    assert "500 * Math.pow(2, this._fileEventsReconnectFailures - 1)" in app
+    assert "this._fileEventsReconnectFailures = 0" in app
+    assert "this._nextFileEventsReconnectDelay()" in app
+    assert "1500" not in app[
+        app.index("async _startFileEvents()"):
+        app.index("\n    _queueFileChanges", app.index("async _startFileEvents()"))
+    ]
     assert 'if (t === "files") this._flushFileTreeDirty()' not in app
 
 
