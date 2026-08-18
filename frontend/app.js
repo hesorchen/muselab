@@ -637,6 +637,7 @@ function portal() {
     sessionTodoEditDraft: "",
     _sessionTodoEditOwner: null,
     userTodos: [],
+    todoRevision: 0,
     // Lightweight focus ownership shared by modal/popover surfaces. DOM nodes
     // live here only while their surface is open; the stack ensures a nested
     // managed dialog never restores focus behind the dialog above it.
@@ -685,6 +686,10 @@ function portal() {
     _activityLiveSeq: 0,
     _activityLiveTimer: null,
     _activityLiveVisibilityBound: false,
+    _todoLiveSource: null,
+    _todoLiveSeq: 0,
+    _todoLiveTimer: null,
+    _todoLiveVisibilityBound: false,
     _activityPinPending: {},
     _activityGroupPending: {},
     _activityGroupOrderSeq: 0,
@@ -1523,6 +1528,9 @@ function portal() {
         localStorage.removeItem(oldK);
       }
       this.userTodos = this._loadGlobalUserTodos();
+      // Pull the server-authoritative board once at boot (and one-time-migrate
+      // any existing localStorage todos up). Best-effort: offline keeps cache.
+      this._syncTodosFromServer();
       window.addEventListener("storage", ev => {
         const key = this._globalUserTodoStorageKey();
         if (ev.key === key) {
@@ -2221,6 +2229,7 @@ function portal() {
         () => this.ackCurrentActivity(),
       );
       this._startActivityEvents();
+      this._startTodoEvents();
       this._startMemoryMonitor();
     },
 
@@ -11969,6 +11978,57 @@ function portal() {
           JSON.stringify(this.sessionTodoItems()),
         );
       } catch (_) { /* private mode / quota: keep the in-memory clipboard */ }
+      this._pushTodosToServer();
+    },
+    _applyTodosPayload(payload) {
+      if (!payload || !Array.isArray(payload.items)) return;
+      const revision = Number(payload.revision) || 0;
+      if (revision === this.todoRevision) return;
+      this.userTodos = this._normalizeUserTodos(payload.items);
+      this.todoRevision = revision;
+      try {
+        localStorage.setItem(
+          this._globalUserTodoStorageKey(),
+          JSON.stringify(this.userTodos),
+        );
+      } catch (_) { /* offline cache is best-effort */ }
+    },
+    async _pushTodosToServer() {
+      if (!this.token) return;
+      const r = await this.api("/api/todos", {
+        method: "PUT",
+        json: {
+          items: this.sessionTodoItems(),
+          base_revision: this.todoRevision,
+        },
+      });
+      if (r.ok) {
+        this._applyTodosPayload(r.data || {});
+      } else if (r.status === 409) {
+        // A concurrent device won; reconcile to the server-authoritative list.
+        await this._syncTodosFromServer();
+      }
+    },
+    async _syncTodosFromServer() {
+      if (!this.token) return;
+      const r = await this.api("/api/todos");
+      if (!r.ok) return; // offline / unauthenticated: keep the local cache
+      let data = r.data || {};
+      const local = this.sessionTodoItems();
+      if ((!Array.isArray(data.items) || !data.items.length) && local.length) {
+        // One-time migration of pre-sync localStorage todos up to the server.
+        const pushed = await this.api("/api/todos", {
+          method: "PUT",
+          json: { items: local, base_revision: Number(data.revision) || 0 },
+        });
+        if (pushed.ok) {
+          data = pushed.data || data;
+        } else {
+          const refetch = await this.api("/api/todos");
+          if (refetch.ok) data = refetch.data || data;
+        }
+      }
+      this._applyTodosPayload(data);
     },
     sessionTodoItems() {
       return Array.isArray(this.userTodos) ? this.userTodos : [];
@@ -30375,6 +30435,73 @@ function portal() {
       return await this.fetchActivity({
         summaryOnly: !this.activity.show && this.activity.events.length > 0,
       });
+    },
+    async _startTodoEvents() {
+      if (!this.token || typeof EventSource === "undefined") return;
+      if (typeof document !== "undefined"
+          && document.visibilityState !== "visible") {
+        this._stopTodoEvents();
+        return;
+      }
+      if (this._todoLiveSource) return;
+      this._stopTodoEvents();
+      const seq = ++this._todoLiveSeq;
+      let ticket = "";
+      try {
+        const r = await fetch("/api/todos/events-ticket", {
+          method: "POST",
+          headers: this.hdr(),
+        });
+        if (!r.ok) throw new Error("todos ticket failed");
+        ticket = String((await r.json()).ticket || "");
+      } catch (_) {
+        if (seq === this._todoLiveSeq) {
+          this._todoLiveTimer = setTimeout(() => this._startTodoEvents(), 1500);
+        }
+        return;
+      }
+      if (seq !== this._todoLiveSeq || !ticket) return;
+      const es = new EventSource(
+        `/api/todos/events?ticket=${encodeURIComponent(ticket)}`,
+      );
+      this._todoLiveSource = es;
+      const owns = () => (
+        seq === this._todoLiveSeq && this._todoLiveSource === es
+      );
+      const apply = (ev) => {
+        if (!owns()) return;
+        let payload;
+        try { payload = JSON.parse(ev.data); } catch (_) { return; }
+        this._applyTodosPayload(payload);
+      };
+      es.addEventListener("ready", apply);
+      es.addEventListener("update", apply);
+      es.onerror = () => {
+        if (!owns()) return;
+        try { es.close(); } catch (_) {}
+        this._todoLiveSource = null;
+        this._todoLiveTimer = setTimeout(() => this._startTodoEvents(), 1500);
+      };
+      if (!this._todoLiveVisibilityBound) {
+        this._todoLiveVisibilityBound = true;
+        document.addEventListener("visibilitychange", () => {
+          if (document.visibilityState !== "visible") {
+            this._stopTodoEvents();
+          } else {
+            this._startTodoEvents();
+          }
+        });
+        window.addEventListener("pagehide", () => this._stopTodoEvents());
+      }
+    },
+    _stopTodoEvents() {
+      ++this._todoLiveSeq;
+      if (this._todoLiveSource) {
+        try { this._todoLiveSource.close(); } catch (_) {}
+      }
+      this._todoLiveSource = null;
+      if (this._todoLiveTimer) clearTimeout(this._todoLiveTimer);
+      this._todoLiveTimer = null;
     },
     _syncScheduledActivitySnapshot(events) {
       const scheduled = (events || []).filter(

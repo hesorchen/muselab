@@ -26,6 +26,7 @@ from .workspaces import router as workspaces_router
 from .activity_api import router as activity_router
 from .terminal import router as terminal_router
 from .file_events import router as file_events_router
+from .todos_api import router as todos_router
 from .settings import ROOT, PORT, HOST
 from .version import project_version
 from .observability import (
@@ -388,6 +389,7 @@ async def _lifespan(app: FastAPI):
 
     from . import sessions as _sess
     from .activity import activity as _activity
+    from .todos import todos as _todos
     from . import scheduler as _sched
     from . import push as _push
     from . import memory_client as _mem0
@@ -397,6 +399,7 @@ async def _lifespan(app: FastAPI):
     await _asyncio.gather(
         _asyncio.to_thread(_sess.ensure_private_session_storage),
         _asyncio.to_thread(_activity.initialize_runtime_state),
+        _asyncio.to_thread(_todos.initialize_runtime_state),
     )
     # Older releases allowed a successor CLI's synthetic ``stopped`` record to
     # overwrite the predecessor's real terminal state. Repair each runtime
@@ -840,6 +843,7 @@ app.include_router(push_router)
 app.include_router(workspaces_router)
 app.include_router(activity_router)
 app.include_router(terminal_router)
+app.include_router(todos_router)
 
 
 @functools.lru_cache(maxsize=1)
