@@ -46,6 +46,28 @@ _MAX_EXPORT_BYTES = 10 * 1024 * 1024
 _MAX_QUERY_CHARS = 8_000
 _MAX_STORE_TEXT_CHARS = 50_000
 
+
+def _failure_metadata(exc: BaseException) -> dict[str, object]:
+    from .memory_engine import classify_memory_failure
+    return classify_memory_failure(exc)[1]
+
+
+def _failure_record(failure: dict[str, object]) -> str:
+    return json.dumps(failure, sort_keys=True, separators=(",", ":"))
+
+
+def _log_failure(level: int, event: str, exc: BaseException) -> None:
+    failure = _failure_metadata(exc)
+    log.log(
+        level,
+        "%s category=%s exception_class=%s status=%s",
+        event,
+        failure["category"],
+        failure["exception_class"],
+        failure.get("status"),
+    )
+
+
 _ZERO_WIDTH_RE = re.compile(r"[​-‏‪-‮⁠-⁯﻿]")
 _FENCE_RE = re.compile(r"-{2,}.*?memory.*?-{2,}", re.IGNORECASE)
 _ROLE_RE = re.compile(
@@ -79,7 +101,7 @@ def start() -> None:
         from .memory_engine import engine
         engine.start()
     except Exception as exc:
-        log.warning("native memory start skipped: %s", exc)
+        _log_failure(logging.WARNING, "native memory start skipped", exc)
 
 
 def base_url() -> str:
@@ -101,13 +123,7 @@ def base_url() -> str:
 
 
 def enabled() -> bool:
-    try:
-        from .memory_engine import engine
-        if engine.enabled():
-            return True
-    except Exception:
-        pass
-    return bool(base_url())
+    return native_enabled() or bool(base_url())
 
 
 def native_enabled() -> bool:
@@ -284,7 +300,8 @@ async def export_legacy_memories() -> list[str]:
                 return values
             errors.append(f"{path}: empty or unsupported response")
         except Exception as exc:
-            errors.append(f"{path}: {type(exc).__name__}")
+            failure = _failure_metadata(exc)
+            errors.append(_failure_record(failure))
     raise RuntimeError("legacy Mem0 export is unavailable (" + "; ".join(errors) + ")")
 
 
@@ -299,7 +316,7 @@ async def search_context(query: str, session_id: str) -> str:
                 if (clean := _sanitize(str(row.get("content", ""))))
             ], max_chars=engine.config().retrieval.max_context_chars)
         except Exception as exc:
-            log.debug("native memory search skipped: %s", exc)
+            _log_failure(logging.DEBUG, "native memory search skipped", exc)
             return ""
     url = base_url()
     query = _cap_text(query.strip(), _MAX_QUERY_CHARS)
@@ -325,7 +342,7 @@ async def search_context(query: str, session_id: str) -> str:
             latency_ms=round((time.perf_counter() - started) * 1000),
             status="error",
         )
-        log.debug("mem0 search skipped: %s", exc)
+        _log_failure(logging.DEBUG, "mem0 search skipped", exc)
         return ""
 
 
@@ -355,7 +372,7 @@ async def store_turn(session_id: str, model: str, user_text: str,
                 session_id, model, user_text, assistant_text, outcome="success",
                 turn_id=turn_id)
         except Exception as exc:
-            log.debug("native memory store skipped: %s", exc)
+            _log_failure(logging.DEBUG, "native memory store skipped", exc)
         return
     del session_id
     url = base_url()
@@ -373,7 +390,7 @@ async def store_turn(session_id: str, model: str, user_text: str,
         }
         await _post_no_result(f"{url}/add", payload, _STORE_TIMEOUT)
     except Exception as exc:
-        log.debug("mem0 store skipped: %s", exc)
+        _log_failure(logging.DEBUG, "mem0 store skipped", exc)
 
 
 def schedule_store(session_id: str, model: str, user_text: str,
@@ -455,4 +472,4 @@ async def aclose(timeout: float = _STORE_TIMEOUT + 1.0) -> None:
         from .memory_engine import engine
         await engine.stop(timeout=min(timeout, 5.0))
     except Exception as exc:
-        log.debug("native memory shutdown skipped: %s", exc)
+        _log_failure(logging.DEBUG, "native memory shutdown skipped", exc)

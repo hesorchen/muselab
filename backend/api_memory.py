@@ -14,7 +14,7 @@ from .memory_config import (
     public_config,
     save_config,
 )
-from .memory_engine import engine
+from .memory_engine import classify_memory_failure, engine
 
 router = APIRouter(
     prefix="/api/memory", tags=["memory"], dependencies=[Depends(require_token)])
@@ -25,6 +25,10 @@ _IMPORTABLE_STATUSES = ("active", "pending_review")
 # Authorities recall() knows how to weight (see memory_engine._rank); anything
 # else imports as "confirmed" rather than silently landing in the 0.8 bucket.
 _IMPORTABLE_AUTHORITIES = ("confirmed", "inferred", "legacy_import")
+
+
+def _failure_detail(exc: BaseException) -> dict[str, object]:
+    return classify_memory_failure(exc)[1]
 
 
 class MemoryCreate(BaseModel):
@@ -90,9 +94,7 @@ async def put_config(config: dict, probe: bool = Query(default=True)) -> dict:
         try:
             await engine.probe(merged)
         except Exception as exc:
-            raise HTTPException(
-                400, f"记忆环境健康检查失败，配置未保存：{type(exc).__name__}: {exc}"
-            ) from None
+            raise HTTPException(400, _failure_detail(exc)) from None
     save_config(merged)
     await engine.reconfigure()
     return {"config": public_config(merged), "status": engine.status()}
@@ -105,8 +107,7 @@ async def probe_memory(config: dict | None = None) -> dict:
     try:
         return await engine.probe(config)
     except Exception as exc:
-        raise HTTPException(
-            400, f"{type(exc).__name__}: {exc}") from None
+        raise HTTPException(400, _failure_detail(exc)) from None
 
 
 def _resolve_config_input(raw: dict, current: MemoryConfig) -> MemoryConfig:
@@ -132,7 +133,7 @@ def _resolve_config_input(raw: dict, current: MemoryConfig) -> MemoryConfig:
     try:
         return MemoryConfig.model_validate(data)
     except Exception as exc:
-        raise HTTPException(422, str(exc)) from None
+        raise HTTPException(422, _failure_detail(exc)) from None
 
 
 @router.get("/status")
@@ -171,7 +172,7 @@ async def create_item(body: MemoryCreate) -> dict:
         return await engine.add_confirmed_memory(
             body.kind, body.content, tags=body.tags, source=source)
     except ValueError as exc:
-        raise HTTPException(400, str(exc)) from None
+        raise HTTPException(400, _failure_detail(exc)) from None
 
 
 @router.get("/items/{memory_id}")
@@ -190,7 +191,7 @@ async def correct_item(memory_id: str, body: MemoryCorrection) -> dict:
     except KeyError:
         raise HTTPException(404, "memory not found") from None
     except ValueError as exc:
-        raise HTTPException(409, str(exc)) from None
+        raise HTTPException(409, _failure_detail(exc)) from None
 
 
 @router.post("/items/{memory_id}/approve")
@@ -272,7 +273,7 @@ def approve_skill(artifact_id: str, body: SkillApproval) -> dict:
     except KeyError:
         raise HTTPException(404, "pending skill candidate not found") from None
     except ValueError as exc:
-        raise HTTPException(400, str(exc)) from None
+        raise HTTPException(400, _failure_detail(exc)) from None
 
 
 @router.post("/skills/{artifact_id}/reject")
@@ -290,7 +291,7 @@ def disable_skill(artifact_id: str) -> dict:
     except KeyError:
         raise HTTPException(404, "skill candidate not found") from None
     except ValueError as exc:
-        raise HTTPException(400, str(exc)) from None
+        raise HTTPException(400, _failure_detail(exc)) from None
 
 
 @router.get("/jobs")
@@ -370,7 +371,7 @@ async def import_memory(body: MemoryImport) -> dict:
             counts = await asyncio.to_thread(
                 engine.store.import_snapshot, snapshot, cfg.owner_id)
         except (ValueError, TypeError) as exc:
-            raise HTTPException(422, str(exc)) from None
+            raise HTTPException(422, _failure_detail(exc)) from None
         queued = engine.reindex_all() if cfg.enabled and body.memories else 0
         return {
             "ok": True,
@@ -383,7 +384,7 @@ async def import_memory(body: MemoryImport) -> dict:
         legacy_memories = [MemoryImportItem.model_validate(row)
                            for row in body.memories]
     except (ValueError, TypeError) as exc:
-        raise HTTPException(422, f"invalid legacy memory import: {exc}") from None
+        raise HTTPException(422, _failure_detail(exc)) from None
     incoming = [*body.items, *legacy_memories]
     if not incoming:
         raise HTTPException(422, "memory import contains no items")
@@ -407,7 +408,7 @@ async def import_memory(body: MemoryImport) -> dict:
                 authority=authority,
                 confidence=1.0 if item.confidence is None else item.confidence)
         except ValueError as exc:
-            raise HTTPException(422, str(exc)) from None
+            raise HTTPException(422, _failure_detail(exc)) from None
         existing.add(key)
         created += 1
     return {"ok": True, "created": created}
@@ -419,7 +420,7 @@ async def import_legacy_mem0() -> dict:
     try:
         values = await memory_client.export_legacy_memories()
     except Exception as exc:
-        raise HTTPException(400, str(exc)) from None
+        raise HTTPException(400, _failure_detail(exc)) from None
     cfg = load_config()
     existing = {
         " ".join(item["content"].casefold().split())

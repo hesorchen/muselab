@@ -13,7 +13,11 @@ import shutil
 import tempfile
 import time
 from pathlib import Path
+
+import httpx
+
 from .memory_config import MemoryConfig, database_path, load_config, memory_dir
+from .observability import elapsed_ms, perf_event
 from .memory_providers import (
     EmbeddingProvider,
     GenerationError,
@@ -70,6 +74,79 @@ _TOKEN_RE = re.compile(
 # retrieval quality is flat well below it — a query is a topic hint, not the
 # document being matched.
 _RECALL_QUERY_CHARS = 800
+_SAFE_TRANSIENT_STATUSES = {408, 409, 429, 529}
+_KNOWN_JOB_KINDS = {
+    "consolidate_episode",
+    "reconcile_transcript",
+    "cross_episode_dream",
+    "reindex_memory",
+    "reindex_memories",
+    "unindex_memory",
+}
+
+
+class UnknownMemoryJobError(ValueError):
+    pass
+
+
+class MemoryJobOwnerMismatchError(RuntimeError):
+    pass
+
+
+def _exception_status(exc: BaseException) -> int | None:
+    if isinstance(exc, GenerationError):
+        status = exc.api_error_status
+    else:
+        response = getattr(exc, "response", None)
+        status = getattr(response, "status_code", None)
+        if status is None:
+            status = getattr(exc, "status_code", None)
+    return status if isinstance(status, int) else None
+
+
+def classify_memory_failure(exc: BaseException) -> tuple[bool, dict[str, object]]:
+    """Classify a failure without retaining exception text or request details."""
+    status = _exception_status(exc)
+    if isinstance(exc, GenerationError):
+        retryable = bool(exc.retryable)
+        category = str(exc.category or "generation_failure")
+    elif isinstance(exc, TimeoutError):
+        retryable, category = True, "timeout"
+    elif isinstance(exc, httpx.TransportError):
+        retryable, category = True, "transport"
+    elif status is not None:
+        retryable = status in _SAFE_TRANSIENT_STATUSES or 500 <= status <= 599
+        if status in {401, 403}:
+            category = "authentication"
+        else:
+            category = "transient_http" if retryable else "http_error"
+    elif isinstance(exc, UnknownMemoryJobError):
+        retryable, category = False, "unknown_job"
+    elif isinstance(exc, MemoryJobOwnerMismatchError):
+        retryable, category = False, "owner_mismatch"
+    elif isinstance(exc, PermissionError):
+        retryable, category = False, "permission"
+    elif isinstance(exc, FileNotFoundError):
+        retryable, category = False, "file_not_found"
+    elif isinstance(exc, KeyError):
+        retryable, category = False, "missing_key"
+    elif isinstance(exc, TypeError):
+        retryable, category = False, "invalid_type"
+    elif isinstance(exc, ValueError):
+        retryable, category = False, "invalid_value"
+    else:
+        retryable, category = False, "unclassified"
+    detail: dict[str, object] = {
+        "category": category,
+        "exception_class": type(exc).__name__,
+    }
+    if status is not None:
+        detail["status"] = status
+    return retryable, detail
+
+
+def _failure_record(detail: dict[str, object]) -> str:
+    return json.dumps(detail, sort_keys=True, separators=(",", ":"))
 
 
 def _redact(text: str, limit: int = 40_000) -> str:
@@ -271,21 +348,18 @@ class MemoryEngine:
                 except TimeoutError:
                     pass
                 continue
+            started = time.perf_counter()
             error: str | None = None
-            retryable = True
-            # Owner fence. Jobs carry the owner that enqueued them; the
-            # handlers below resolve everything else from the LIVE config, so
-            # a job that outlives an owner change (config edit / profile
-            # switch) would attribute the old owner's episodes and memories to
-            # the new one. Drop instead of retrying — the payload references
-            # rows the current owner does not own, so no retry can fix it.
-            job_owner = str(job.get("owner_id") or "")
-            if job_owner and job_owner != self.config().owner_id:
-                await asyncio.to_thread(
-                    self.store.finish_job, job["id"],
-                    error=f"dropped: enqueued under owner {job_owner!r}")
-                continue
+            retryable = False
+            failure: dict[str, object] | None = None
+            attempts = int(job.get("attempts", 0)) + 1
+            safe_kind = job["kind"] if job.get("kind") in _KNOWN_JOB_KINDS else "unknown"
             try:
+                # Owner fence. Jobs carry the owner that enqueued them; the
+                # handlers below resolve everything else from the LIVE config.
+                job_owner = str(job.get("owner_id") or "")
+                if job_owner and job_owner != self.config().owner_id:
+                    raise MemoryJobOwnerMismatchError
                 if job["kind"] == "consolidate_episode":
                     await self._consolidate_episode(job["payload"]["episode_id"])
                 elif job["kind"] == "reconcile_transcript":
@@ -303,18 +377,33 @@ class MemoryEngine:
                 elif job["kind"] == "unindex_memory":
                     await self._unindex_memory(job["payload"]["memory_id"])
                 else:
-                    raise ValueError(f"unknown memory job: {job['kind']}")
+                    raise UnknownMemoryJobError
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                error = f"{type(exc).__name__}: {exc}"
-                retryable = not isinstance(exc, GenerationError) or exc.retryable
-                log.warning("memory job %s failed: %s", job["id"], error)
-            attempts = int(job.get("attempts", 0)) + 1
+                retryable, failure = classify_memory_failure(exc)
+                error = _failure_record(failure)
+                log.warning(
+                    "memory job failed category=%s exception_class=%s status=%s",
+                    failure["category"], failure["exception_class"],
+                    failure.get("status"),
+                )
             await asyncio.to_thread(
                 self.store.finish_job, job["id"], error=error,
                 retry_seconds=(min(300.0, 2 ** attempts)
                                if error and retryable and attempts < 3 else None))
+            perf_event(
+                "memory.job",
+                kind=safe_kind,
+                attempt=attempts,
+                duration_ms=elapsed_ms(started),
+                outcome=("retry" if error and retryable and attempts < 3
+                         else "failed" if error else "done"),
+                category=failure.get("category") if failure else None,
+                exception_class=(failure.get("exception_class")
+                                 if failure else None),
+                status=failure.get("status") if failure else None,
+            )
 
     async def _sweep_idle_episodes(self) -> None:
         cfg = self.config()
@@ -861,11 +950,17 @@ class MemoryEngine:
         dense_rows, lexical_rows = await asyncio.gather(
             _bounded(dense), _bounded(lexical), return_exceptions=True)
         if isinstance(dense_rows, Exception):
-            log.debug("dense recall skipped: %r", dense_rows)
+            _, failure = classify_memory_failure(dense_rows)
+            log.debug(
+                "dense recall skipped category=%s exception_class=%s status=%s",
+                failure["category"], failure["exception_class"], failure.get("status"))
             dense_rows, status = [], (
                 "timeout" if isinstance(dense_rows, TimeoutError) else "partial")
         if isinstance(lexical_rows, Exception):
-            log.debug("lexical recall skipped: %r", lexical_rows)
+            _, failure = classify_memory_failure(lexical_rows)
+            log.debug(
+                "lexical recall skipped category=%s exception_class=%s status=%s",
+                failure["category"], failure["exception_class"], failure.get("status"))
             lexical_rows, status = [], (
                 "timeout" if isinstance(lexical_rows, TimeoutError) else "partial")
 
@@ -912,7 +1007,11 @@ class MemoryEngine:
             except TimeoutError:
                 status = "timeout"
             except Exception as exc:
-                log.debug("rerank skipped: %s", exc)
+                _, failure = classify_memory_failure(exc)
+                log.debug(
+                    "rerank skipped category=%s exception_class=%s status=%s",
+                    failure["category"], failure["exception_class"],
+                    failure.get("status"))
                 status = "partial"
         result = hydrated[:cfg.retrieval.final_limit]
         latency = (time.perf_counter() - started) * 1000
@@ -986,8 +1085,11 @@ class MemoryEngine:
             try:
                 await vector_store(cfg.vector).delete(memory_id)
             except Exception as exc:
-                log.warning("old vector deletion queued for retry (%s): %s",
-                            memory_id, exc)
+                _, failure = classify_memory_failure(exc)
+                log.warning(
+                    "old vector deletion queued category=%s exception_class=%s status=%s",
+                    failure["category"], failure["exception_class"],
+                    failure.get("status"))
                 self.store.enqueue("unindex_memory", {"memory_id": memory_id},
                                    owner_id=cfg.owner_id)
             self.store.enqueue("reindex_memory", {"memory_id": memory["id"]},
@@ -1009,8 +1111,11 @@ class MemoryEngine:
             try:
                 await vector_store(cfg.vector).delete(memory_id)
             except Exception as exc:
-                log.warning("vector deletion queued for retry (%s): %s",
-                            memory_id, exc)
+                _, failure = classify_memory_failure(exc)
+                log.warning(
+                    "vector deletion queued category=%s exception_class=%s status=%s",
+                    failure["category"], failure["exception_class"],
+                    failure.get("status"))
                 self.store.enqueue("unindex_memory", {"memory_id": memory_id},
                                    owner_id=cfg.owner_id)
                 self._wake.set()
