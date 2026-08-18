@@ -5907,7 +5907,7 @@ def _summarize_tool_input(name: str | None, inp: dict) -> str:
     if name in ("Read", "Edit", "Write"):
         return inp.get("file_path", "")
     if name == "Bash":
-        return (inp.get("command") or "")[:200]
+        return (inp.get("command") or "")[:_MAX_INPUT_FIELD_LEN]
     if name in ("Glob", "Grep"):
         return (inp.get("pattern") or "") + (f"  in {inp.get('path','')}" if inp.get("path") else "")
     if name == "WebFetch":
@@ -12107,7 +12107,7 @@ def _render_tool_use(block: ToolUseBlock) -> dict:
     if name in ("Read", "Edit", "Write"):
         summary = inp.get("file_path", "")
     elif name == "Bash":
-        summary = (inp.get("command") or "")[:200]
+        summary = (inp.get("command") or "")[:_MAX_INPUT_FIELD_LEN]
     elif name in ("Glob", "Grep"):
         summary = (inp.get("pattern") or "") + (f"  in {inp.get('path','')}" if inp.get("path") else "")
     elif name == "WebFetch":
