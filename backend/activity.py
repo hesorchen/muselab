@@ -1051,6 +1051,37 @@ class ActivityService:
                 "item": dict(item),
             }
 
+    def migrate_group_to_successor(
+        self,
+        source_sid: str,
+        successor_sid: str,
+    ) -> bool:
+        """Carry a runtime rollover's activity-group lane onto its fork.
+
+        When a session with pending background work forks a same-named
+        successor (runtime rollover), the source is hidden and the fork keeps
+        running.  If the source had been assigned to a custom activity group,
+        the fork must inherit that lane so the rollover stays invisible to the
+        user instead of surfacing a new ungrouped row.
+        """
+        self.initialize_runtime_state()
+        source_sid = str(source_sid or "")
+        successor_sid = str(successor_sid or "")
+        if not source_sid or not successor_sid or source_sid == successor_sid:
+            return False
+        with self._lock:
+            assigned = self._group_assignments.get(source_sid, "")
+            if not assigned:
+                return False
+            self._group_assignments.pop(source_sid, None)
+            self._group_assignments[successor_sid] = assigned
+            events_changed = self._reconcile_event_groups()
+            if events_changed:
+                self._save()
+            self._save_group_state()
+            self._publish_locked(resync=True)
+            return True
+
     def set_pin(self, event_id: str, pinned: bool) -> dict[str, Any] | None:
         """Persist a pin and return the exact ledger revision it belongs to."""
         self.initialize_runtime_state()

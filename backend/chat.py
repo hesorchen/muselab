@@ -11346,6 +11346,17 @@ async def _continue_detached_runtime_locked(source_sid: str) -> dict:
         # after the durable link observes those already-finished writes.
         await asyncio.to_thread(
             _sync_runtime_successor_postlude, source_sid)
+        # Best-effort: carry the source's activity-group lane onto the fork so
+        # a runtime rollover stays invisible instead of surfacing a new
+        # ungrouped row.  A failure here must not abort the fork.
+        try:
+            from .activity import activity as _activity
+            await asyncio.to_thread(
+                _activity.migrate_group_to_successor, source_sid, child_sid)
+        except Exception as _exc:
+            sys.stderr.write(
+                f"[activity] group migrate failed src={source_sid[:8]} "
+                f"dst={child_sid[:8]} exc={type(_exc).__name__}\n")
     except Exception as exc:
         if linked:
             await asyncio.to_thread(
