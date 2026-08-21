@@ -3113,10 +3113,44 @@ def test_viewport_virtualization_keeps_history_and_scroll_anchor(
         """,
         sid,
     )
-    assert streaming["tailMounted"] is True
+    # A reader inspecting old content keeps one viewport window. The live tail
+    # remains in the normalized repository and is mounted only when follow resumes;
+    # a second streaming-only tail was removed because streaming=false tore it down
+    # at completion and collapsed the scroll layout.
+    assert streaming["tailMounted"] is False
     assert streaming["mounted"] < 80
     assert streaming["canonical"] == 600
+
+    rebased = _app_eval(
+        page,
+        """
+        const st = app._ensureTabState(arg);
+        st.streaming = false;
+        st.atBottom = true;
+        st.messageRange.visibleStart = 540;
+        st.messageRange.visibleEnd = 600;
+        st._virtualStart = 48;
+        st._virtualEnd = 60;
+        const snapshot = app._captureMessageVirtualWindow(st);
+        st.messageRange.visibleStart = 0;
+        app._rebaseMessageVirtualWindow(st, snapshot, true);
+        return new Promise(resolve => app.$nextTick(() => resolve({
+          start: st._virtualStart,
+          end: st._virtualEnd,
+          tailMounted: !!document.querySelector(
+            '.msg[data-message-key="virtual-key-599"]'),
+          headMounted: !!document.querySelector(
+            '.msg[data-message-key="virtual-key-048"]'),
+        })));
+        """,
+        sid,
+    )
+    assert rebased["end"] == 600
+    assert rebased["start"] > 500
+    assert rebased["tailMounted"] is True
+    assert rebased["headMounted"] is False
     _assert_no_browser_errors(page, errors)
+
 
 def test_load_session_reconnects_active_turn_and_renders_live_assistant(
     page: Page, backend_url, auth_token

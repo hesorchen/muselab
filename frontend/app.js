@@ -9019,6 +9019,44 @@ function portal() {
       }
       return { start, end: messages.length };
     },
+    _captureMessageVirtualWindow(st) {
+      const messages = this._visiblePaneMessages(st);
+      if (!messages.length || st._virtualStart < 0 || st._virtualEnd <= st._virtualStart) {
+        return null;
+      }
+      const start = Math.max(0, Math.min(st._virtualStart, messages.length - 1));
+      const end = Math.max(start + 1, Math.min(st._virtualEnd, messages.length));
+      return {
+        startKey: messages[start] && messages[start]._k,
+        endKey: messages[end - 1] && messages[end - 1]._k,
+      };
+    },
+    _rebaseMessageVirtualWindow(st, snapshot, followTail = false) {
+      const messages = this._visiblePaneMessages(st);
+      if (!messages.length) {
+        st._virtualStart = -1;
+        st._virtualEnd = -1;
+        st._virtualRevision++;
+        return;
+      }
+      let next = null;
+      if (followTail) {
+        next = this._initialMessageVirtualRange(st);
+      } else if (snapshot) {
+        const start = messages.findIndex(m => m && m._k === snapshot.startKey);
+        const end = messages.findIndex(m => m && m._k === snapshot.endKey);
+        if (start >= 0 || end >= 0) {
+          next = {
+            start: start >= 0 ? start : Math.max(0, end - 24),
+            end: end >= 0 ? end + 1 : Math.min(messages.length, start + 25),
+          };
+        }
+      }
+      if (!next) next = this._initialMessageVirtualRange(st);
+      st._virtualStart = next.start;
+      st._virtualEnd = next.end;
+      st._virtualRevision++;
+    },
     paneMessageRows(tid) {
       const st = tid && this.tabState && this.tabState[tid];
       const messages = this._visiblePaneMessages(st);
@@ -9049,16 +9087,11 @@ function portal() {
       for (let i = start; i < end; i++) {
         rows.push({ key: messages[i]._k, index: i, message: messages[i], spacer: false });
       }
-      // A live tail must stay mounted even while the reader inspects older rows.
-      // Keep only the final three envelopes plus one measured spacer, not the
-      // potentially huge interval between the viewport and the active turn.
-      const tailStart = st.streaming && end < messages.length
-        ? Math.max(end, messages.length - 3) : messages.length;
-      spacer("middle", end, tailStart);
-      for (let i = tailStart; i < messages.length; i++) {
-        rows.push({ key: messages[i]._k, index: i, message: messages[i], spacer: false });
-      }
-      if (tailStart === messages.length) spacer("bottom", end, messages.length);
+      // Keep one virtual window only. Live messages remain authoritative in the
+      // normalized repository even when the reader is inspecting older rows;
+      // mounting a second three-row tail was unnecessary and made `streaming=false`
+      // remove those nodes exactly at completion, collapsing the scroll layout.
+      spacer("bottom", end, messages.length);
       return rows;
     },
     _measureMessageVirtualRows(tid, st) {
@@ -14324,6 +14357,15 @@ function portal() {
         // Replace the one repository in place. Quiet reconciliation preserves
         // matching message object identity; cold reveal changes only range coords.
         if (st.streaming || st.es) return true;
+        // _virtualStart/_virtualEnd are LOCAL to the revealed slice. A quiet
+        // canonical refresh can move visibleStart from a narrow recent tail to
+        // an older coordinate; carrying the same numbers across that change
+        // points the DOM at entirely different (usually much earlier) messages.
+        // Snapshot stable keys before replacing the range and synchronously
+        // rebase after it, so Alpine never paints one frame with invalid indices.
+        const virtualWindowBeforeInstall = quiet
+          ? this._captureMessageVirtualWindow(st) : null;
+        const followTailAtInstall = quiet && st.atBottom !== false;
         st.messages.splice(0, st.messages.length, ...all);
         Object.assign(st.messageRange, {
           visibleStart: startIdx,
@@ -14334,6 +14376,10 @@ function portal() {
           order: (s.history_order === "full" || full) ? "full" : "normal",
           generation: s.history_generation || "",
         });
+        if (quiet) {
+          this._rebaseMessageVirtualWindow(
+            st, virtualWindowBeforeInstall, followTailAtInstall);
+        }
         st.runtimeUiRevision = loadedRuntimeUiRevision;
         // Seed the render-only viewport at the newest end after installing the
         // response coordinates. Canonical envelopes remain untouched.
@@ -26246,8 +26292,13 @@ function portal() {
         });
         return;
       }
-      // Streaming auto-follow path: bottom region is already realized,
-      // so the cheap single-shot is accurate and avoids per-chunk rAF.
+      // Streaming auto-follow must mount the tail BEFORE the scroll microtask.
+      // _scheduleLiveMessageViewport uses requestAnimationFrame; relying on it
+      // meant this nextTick ran first and scrolled the previous DOM window, then
+      // the rAF moved the virtual window without another scroll. Synchronizing
+      // here is normally a no-op once the tail is mounted, and guarantees the
+      // ordering when a new row first extends it.
+      this._syncMessageViewport(sid, true);
       this.$nextTick(() => {
         if (this.currentId !== sid || this.tabState[sid] !== st) return;
         el.scrollTop = el.scrollHeight;

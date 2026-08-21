@@ -3124,6 +3124,34 @@ def test_explicit_send_scroll_mounts_virtual_tail_without_restoring_old_anchor()
     send = app[send_start:send_end]
     assert "streamState.atBottom = true" in send
     assert "this.scrollToBottom(true)" in send
+    # Per-delta follow cannot defer tail mounting to rAF and scroll on nextTick:
+    # the microtask runs first and otherwise scrolls the previous DOM window.
+    assert scroll.count("this._syncMessageViewport(sid, true)") >= 2
+
+
+def test_quiet_canonical_reload_rebases_virtual_window_before_alpine_paints():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+
+    load_start = app.index("    async loadSession(sid, opts = {}) {")
+    load_end = app.index("// Warm OPEN-but-inactive tabs", load_start)
+    load = app[load_start:load_end]
+    capture = "const virtualWindowBeforeInstall = quiet"
+    splice = "st.messages.splice(0, st.messages.length, ...all)"
+    assign = "Object.assign(st.messageRange"
+    rebase = "this._rebaseMessageVirtualWindow("
+    assert capture in load
+    assert rebase in load
+    assert load.index(capture) < load.index(splice) < load.index(assign) < load.index(rebase)
+    assert "const followTailAtInstall = quiet && st.atBottom !== false" in load
+
+    helper_start = app.index("    _captureMessageVirtualWindow(st) {")
+    helper_end = app.index("    paneMessageRows(tid) {", helper_start)
+    helper = app[helper_start:helper_end]
+    assert "startKey:" in helper and "endKey:" in helper
+    assert "messages.findIndex(m => m && m._k === snapshot.startKey)" in helper
+    assert "messages.findIndex(m => m && m._k === snapshot.endKey)" in helper
+    assert "if (followTail)" in helper
+    assert "this._initialMessageVirtualRange(st)" in helper
 
 
 def test_long_chat_state_keeps_complete_normalized_history_and_generation_safety():
@@ -3195,7 +3223,10 @@ def test_long_chat_state_keeps_complete_normalized_history_and_generation_safety
     assert "st._virtualHeights[key] = height" in virtual
     assert 'spacer("top", 0, start)' in virtual
     assert 'spacer("bottom", end, messages.length)' in virtual
-    assert "messages.length - 3" in virtual
+    # Streaming and completed states share one DOM window. A separately-mounted
+    # live tail was torn down by streaming=false and collapsed the completion layout.
+    assert "messages.length - 3" not in virtual
+    assert 'spacer("middle"' not in virtual
     assert "this._captureViewportMessageAnchor(body, tid)" in virtual
     assert "this._restoreMessageAnchor(body, anchor)" in virtual
     sync_start = app.index("_syncNormalizedHistory(st) {")
