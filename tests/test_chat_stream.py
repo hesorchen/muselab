@@ -4331,6 +4331,89 @@ def test_canonical_block_ids_are_record_local_and_repeatable():
     assert [m["block_id"] for m in second] == expected
 
 
+def test_large_canonical_body_is_deferred_without_source_truncation():
+    from backend import chat as chat_mod
+
+    body = "x" * (chat_mod._HISTORY_INLINE_BODY_CAP + 1)
+    record = _sm("large-record", "assistant", [
+        {"type": "text", "text": body},
+    ])
+
+    messages = chat_mod._sdk_messages_to_ui(
+        [record], {}, defer_large_bodies=True)
+
+    assert len(messages) == 1
+    message = messages[0]
+    assert message["block_id"] == "large-record:0:assistant"
+    assert message["body_state"] == "unloaded"
+    assert message["body_available"] is True
+    assert message["body_length"] == len(body)
+    assert message["body_ref"] == message["block_id"]
+    assert message["text"] == body[:chat_mod._HISTORY_BODY_PREVIEW_CAP]
+    assert message["text_truncated"] is False
+
+
+def test_session_block_endpoint_reads_only_requested_canonical_record(
+        stream_env, client, monkeypatch, tmp_path):
+    chat_mod = stream_env
+    sid = _make_session(client)
+    body = ("full canonical body\n" * 999) + "full canonical body"
+    entry = {
+        "uuid": "large-record",
+        "type": "assistant",
+        "message": {"content": [{"type": "text", "text": body}]},
+    }
+    raw = (json.dumps(entry) + "\n").encode("utf-8")
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_bytes(raw)
+    index = {
+        "records": [{
+            "uuid": "large-record",
+            "offset": 0,
+            "length": len(raw),
+        }],
+    }
+    monkeypatch.setattr(
+        chat_mod, "_ensure_transcript_index", lambda _sid: (transcript, index))
+
+    response = client.get(
+        f"/api/chat/sessions/{sid}/blocks/large-record:0:assistant",
+        headers={"X-Auth-Token": TEST_TOKEN},
+    )
+
+    assert response.status_code == 200, response.text
+    loaded = response.json()
+    assert loaded["block_id"] == "large-record:0:assistant"
+    assert loaded["body_state"] == "loaded"
+    assert loaded["body_length"] == len(body)
+    assert loaded["text"] == body
+
+
+def test_session_block_endpoint_rejects_invalid_or_missing_block(
+        stream_env, client, monkeypatch, tmp_path):
+    chat_mod = stream_env
+    sid = _make_session(client)
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text("", encoding="utf-8")
+    monkeypatch.setattr(
+        chat_mod,
+        "_ensure_transcript_index",
+        lambda _sid: (transcript, {"records": []}),
+    )
+
+    invalid = client.get(
+        f"/api/chat/sessions/{sid}/blocks/not-a-block-id",
+        headers={"X-Auth-Token": TEST_TOKEN},
+    )
+    missing = client.get(
+        f"/api/chat/sessions/{sid}/blocks/missing:0:assistant",
+        headers={"X-Auth-Token": TEST_TOKEN},
+    )
+
+    assert invalid.status_code == 400
+    assert missing.status_code == 404
+
+
 def test_rebuild_failed_status_maps_through():
     from backend import chat as chat_mod
     tuid = "toolu_fail"

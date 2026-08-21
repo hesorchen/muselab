@@ -2116,6 +2116,13 @@
                          :class="{ 'is-streaming-bubble': pane && pane.streaming && i === paneMsgs.length - 1 }">
                       <div x-show="m._streamPlain" class="stream-plain" x-text="m.text || ''"></div>
                       <div x-show="!m._streamPlain" x-html="m.html || ''"></div>
+                      <button x-show="m.body_available && m.body_state !== 'loaded'"
+                              class="btn-ghost xs"
+                              :disabled="m.body_state === 'loading'"
+                              @click.stop="m.body_state === 'error' && (m.body_state = 'unloaded'); _loadMessageBody(m)"
+                              x-text="m.body_state === 'loading'
+                                ? (lang==='zh' ? '加载正文中…' : 'Loading body…')
+                                : (lang==='zh' ? '加载完整正文' : 'Load full body')"></button>
                     </div>
                   </div>
                   <!-- Per-bubble footer removed. Time + streaming dots

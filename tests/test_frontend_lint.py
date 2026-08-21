@@ -2455,6 +2455,26 @@ def test_history_keys_prefer_backend_block_identity_without_local_dup_suffixes()
     assert "const seen = new Map()" not in history_keys
 
 
+def test_large_history_bodies_load_by_stable_block_reference():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+
+    loader_start = app.index("    async _loadMessageBody(m) {")
+    loader_end = app.index("    async toggleMsgExpanded", loader_start)
+    loader = app[loader_start:loader_end]
+    toggle_start = loader_end
+    toggle_end = app.index("    // Rendered markdown", toggle_start)
+    toggle = app[toggle_start:toggle_end]
+
+    assert 'm.body_state !== "unloaded"' in loader
+    assert '"/blocks/" + encodeURIComponent(m.body_ref)' in loader
+    assert 'Object.assign(m, loaded' in loader
+    assert 'body_state: "loaded"' in loader
+    assert "await this._loadMessageBody(m)" in toggle
+    assert "m.body_available && m.body_state !== 'loaded'" in html
+    assert "加载完整正文" in html
+
+
 def test_render_key_hot_paths_use_pane_index_without_full_scans_or_transport_duplication():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
 

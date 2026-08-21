@@ -5194,8 +5194,13 @@ def _usermsg_task_notification_text(msg) -> str:
     return text if "<task-notification>" in text else ""
 
 
-def _sdk_messages_to_ui(sm_list: list, annotations: dict[str, dict],
-                          compact_uuids: set[str] | None = None) -> list[dict]:
+def _sdk_messages_to_ui(
+    sm_list: list,
+    annotations: dict[str, dict],
+    compact_uuids: set[str] | None = None,
+    *,
+    defer_large_bodies: bool = False,
+) -> list[dict]:
     """Convert SDK SessionMessage list into muselab's flat UI message list.
     Each SessionMessage may explode into multiple UI bubbles because the
     frontend renders tool_use / tool_result / thinking blocks as separate
@@ -5369,8 +5374,8 @@ def _sdk_messages_to_ui(sm_list: list, annotations: dict[str, dict],
                     "id": tu_id,
                     "preview": tr_text[:_TOOL_RESULT_PREVIEW_CAP],
                     "truncated": len(tr_text) > _TOOL_RESULT_PREVIEW_CAP,
-                    "text": tr_text[:_TOOL_RESULT_TEXT_CAP],
-                    "text_truncated": len(tr_text) > _TOOL_RESULT_TEXT_CAP,
+                    "text": tr_text,
+                    "text_truncated": False,
                     "is_error": bool(block.get("is_error", False)),
                 }
                 if tool_name:
@@ -5462,6 +5467,8 @@ def _sdk_messages_to_ui(sm_list: list, annotations: dict[str, dict],
         ann_docs = ann.get("docs")
         if ann_docs and entry.get("role") == "user":
             entry["docs"] = ann_docs
+    if defer_large_bodies:
+        _defer_large_ui_bodies(out)
     return out
 
 
@@ -5639,7 +5646,8 @@ def _indexed_ui_records(
         for e in entries
     ]
     compact = {str(e.get("uuid")) for e in entries if e.get("isCompactSummary")}
-    bubbles = _sdk_messages_to_ui(raw, annotations, compact)
+    bubbles = _sdk_messages_to_ui(
+        raw, annotations, compact, defer_large_bodies=True)
 
     # Cross-window context is stored in the index: a page may begin with a
     # tool_result whose tool_use is outside the read window, and a launching
@@ -6073,7 +6081,8 @@ def _shaped_ui_messages(sid: str, model: str, full: bool) -> list[dict]:
         sdk_msgs = []
     annotations = sess.get_message_annotations(sid)
     compact_uuids = _compact_summary_uuids(sid)
-    messages = _sdk_messages_to_ui(sdk_msgs, annotations, compact_uuids)
+    messages = _sdk_messages_to_ui(
+        sdk_msgs, annotations, compact_uuids, defer_large_bodies=True)
     if jsig is not None:
         _UI_MSGS_CACHE.pop(key, None)
         _UI_MSGS_CACHE[key] = (jsig, ssig, messages)
@@ -6522,6 +6531,67 @@ def get_session_api(
         # has adopted the hidden owner's latest continuation bubble before
         # stopping its inherited-task poller.
         "runtime_ui_revision": snapshot_generation,
+    }
+
+
+@router.get("/sessions/{sid}/blocks/{block_id}",
+            dependencies=[Depends(require_token)])
+def get_session_block_api(sid: str, block_id: str) -> dict:
+    """Read one canonical UI block body by stable transcript identity."""
+    if sess.get_session_meta(sid) is None:
+        raise HTTPException(404, "session not found")
+    match = re.fullmatch(r"([^:]+):(\d+):([a-z_]+)", block_id)
+    if match is None:
+        raise HTTPException(400, "invalid block id")
+    record_uuid = match.group(1)
+    indexed = _ensure_transcript_index(sid)
+    if indexed is None:
+        raise HTTPException(404, "transcript not found")
+    transcript_path, index = indexed
+    record_i = next(
+        (i for i, record in enumerate(index.get("records") or [])
+         if str(record.get("uuid") or "") == record_uuid),
+        None,
+    )
+    if record_i is None:
+        raise HTTPException(404, "block not found")
+    entries = transcript_idx.read_records(transcript_path, index, [record_i])
+    if not entries:
+        raise HTTPException(404, "block not found")
+    entry = entries[0]
+    raw = _RawMsg(
+        str(entry.get("uuid") or ""),
+        str(entry.get("type") or ""),
+        entry.get("message") or {},
+        _transcript_ts_ms(entry),
+    )
+    compact = {record_uuid} if entry.get("isCompactSummary") else set()
+    messages = _sdk_messages_to_ui([raw], {}, compact)
+    block = next(
+        (message for message in messages
+         if message.get("block_id") == block_id),
+        None,
+    )
+    if block is None or not isinstance(block.get("text"), str):
+        raise HTTPException(404, "block body not found")
+    body = block["text"]
+    if block.get("role") == "tool_result":
+        tool_id = str(block.get("id") or "")
+        tool_name = str((index.get("tool_use_names") or {}).get(tool_id) or "")
+        if tool_name:
+            block["tool_name"] = tool_name
+            if tool_name == "Bash":
+                parsed = _parse_bash_result(body)
+                if parsed:
+                    block["bash"] = parsed
+    if len(body.encode("utf-8")) > 8 * 1024 * 1024:
+        raise HTTPException(413, "block body exceeds the 8 MiB response limit")
+    return {
+        **block,
+        "body_state": "loaded",
+        "body_available": True,
+        "body_length": len(body),
+        "body_ref": block_id,
     }
 
 
@@ -12308,12 +12378,51 @@ def _render_tool_use(block: ToolUseBlock) -> dict:
     return out
 
 
-# tool_result raw text cap. preview stays small (cheap default render);
-# `text` carries the full body up to this cap (drives the "expand" button).
-# 50 KB ≈ a long Bash stack trace or a 500-line Read window — bigger than
-# that and the FE's <pre> render starts to feel sluggish anyway.
+# Live SSE tool results still need a hard ceiling because the canonical JSONL
+# may not exist yet. Historical responses use stable block references instead:
+# large bodies stay in the authoritative transcript and are fetched on demand.
 _TOOL_RESULT_PREVIEW_CAP = 500
 _TOOL_RESULT_TEXT_CAP = 50_000
+_HISTORY_INLINE_BODY_CAP = 8_000
+_HISTORY_BODY_PREVIEW_CAP = 2_000
+
+
+def _defer_large_ui_bodies(messages: list[dict]) -> None:
+    """Replace oversized canonical bodies with a stable lazy-load reference.
+
+    This is a transport decision only. ``body_state=unloaded`` means the full
+    source is still present in the canonical transcript; it must not be confused
+    with irreversible source truncation. User prompts remain inline so edit/retry
+    behavior never depends on a second request.
+    """
+    for message in messages:
+        role = str(message.get("role") or "")
+        if role not in {"assistant", "thinking", "tool_result"} \
+                and not message.get("_is_compact_summary"):
+            continue
+        text = message.get("text")
+        block_id = str(message.get("block_id") or "")
+        if not isinstance(text, str) or len(text) <= _HISTORY_INLINE_BODY_CAP \
+                or not block_id:
+            continue
+        preview_cap = (
+            _TOOL_RESULT_PREVIEW_CAP
+            if role == "tool_result"
+            else _HISTORY_BODY_PREVIEW_CAP
+        )
+        preview = text[:preview_cap]
+        message["text"] = preview
+        message["preview"] = preview
+        message["body_state"] = "unloaded"
+        message["body_available"] = True
+        message["body_length"] = len(text)
+        message["body_ref"] = block_id
+        # Structured Bash fields can contain the same multi-megabyte stdout.
+        # They are reconstructed by the block endpoint together with the body.
+        message.pop("bash", None)
+        # Legacy clients may render the preview, but must not claim the source
+        # was discarded. ``text_truncated`` is reserved for true source loss.
+        message["text_truncated"] = False
 
 
 # Bash output format from claude-code's CLI: stdout / stderr / exit_code are

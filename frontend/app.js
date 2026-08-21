@@ -11343,14 +11343,49 @@ function portal() {
     // state for anything that renders open by default (the compact summary),
     // computes !false === true, writes "expanded" over an already-expanded
     // block — and the first tap visibly does nothing.
-    toggleMsgExpanded(m, i, defaultOpen = false) {
+    async _loadMessageBody(m) {
+      if (!m || m.body_state !== "unloaded" || !m.body_ref) return true;
+      if (m._bodyLoadPromise) return m._bodyLoadPromise;
+      const sid = this.currentId;
+      m.body_state = "loading";
+      m._bodyLoadPromise = (async () => {
+        try {
+          const r = await fetch(
+            "/api/chat/sessions/" + encodeURIComponent(sid)
+              + "/blocks/" + encodeURIComponent(m.body_ref),
+            { headers: this.hdr() },
+          );
+          if (!r.ok) throw new Error("HTTP " + r.status);
+          const loaded = await r.json();
+          const localKey = m._k;
+          Object.assign(m, loaded, { _k: localKey, body_state: "loaded" });
+          if (m.role === "assistant") m.html = this.mdRender(m.text || "");
+          if (m._is_compact_summary) delete m._compactHtml;
+          return true;
+        } catch (_) {
+          m.body_state = "error";
+          this.toast(
+            this.lang === "zh" ? "正文加载失败，请重试" : "Failed to load body; retry",
+            "error", 3000,
+          );
+          return false;
+        } finally {
+          delete m._bodyLoadPromise;
+        }
+      })();
+      return m._bodyLoadPromise;
+    },
+    async toggleMsgExpanded(m, i, defaultOpen = false) {
       if (!m) return;
       const idx = (i ?? (this.messages || []).indexOf(m));
       const k = this._msgKey(idx, m);
       const cur = this.isMsgExpanded(idx, m, defaultOpen);
-      const newState = !cur;
+      if (!cur && m.body_available && m.body_state !== "loaded") {
+        if (m.body_state === "error") m.body_state = "unloaded";
+        if (!await this._loadMessageBody(m)) return;
+      }
       // Spread-assign so Alpine sees the replacement and re-evaluates.
-      this._expandedMsgs = { ...this._expandedMsgs, [k]: newState };
+      this._expandedMsgs = { ...this._expandedMsgs, [k]: !cur };
     },
     // Rendered markdown for a /compact summary body. Cached onto the message
     // because the summary runs 10-20k chars and x-html re-evaluates on every
