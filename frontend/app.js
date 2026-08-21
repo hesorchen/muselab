@@ -14190,6 +14190,8 @@ function portal() {
       const isCurrent = sid === this.currentId;
       const quietScrollEl = quiet && isCurrent ? this.$refs.chatBody : null;
       const quietScrollTop = quietScrollEl ? quietScrollEl.scrollTop : 0;
+      const quietAnchor = quietScrollEl && !st.atBottom
+        ? this._captureViewportMessageAnchor(quietScrollEl, sid) : null;
       // Quiet refresh keeps the existing bubbles on screen (morph swap below) —
       // raising the skeleton would defeat the point, so only cold/switch loads
       // flip it. Also re-baseline the open-session resync cursor on a real load
@@ -14238,7 +14240,12 @@ function portal() {
           ? st.messages.length : 0;
         const _quietFloor = Math.min(this._mountedMessageCap(), _mountedNow);
         const _initialLoadEarly = Math.max(_baseInitialLoad, _quietFloor);
-        const FETCH_TAIL = Math.max(_baseInitialLoad * 5, _quietFloor);
+        // While the user reads history, retain the widest bounded canonical
+        // window so a newly-finished tool-heavy turn does not evict the visible
+        // anchor before the quiet reconciliation can restore it.
+        const FETCH_TAIL = quiet && !st.atBottom
+          ? this._historyCacheCap()
+          : Math.max(_baseInitialLoad * 5, _quietFloor);
         const qs = full ? "?full=1" : ("?tail=" + FETCH_TAIL);
         const controller = new AbortController();
         const timeout = setTimeout(
@@ -14556,8 +14563,10 @@ function portal() {
               if (sid === this.currentId && _wasAtBottom) {
                 this.atBottom = true; this.scrollToBottom(true);
               } else if (sid === this.currentId && quietScrollEl) {
-                quietScrollEl.scrollTop = quietScrollTop;
-                st.scrollTop = quietScrollTop;
+                const restored = this._restoreMessageAnchor(
+                  quietScrollEl, quietAnchor);
+                if (!restored) quietScrollEl.scrollTop = quietScrollTop;
+                st.scrollTop = quietScrollEl.scrollTop;
                 st.atBottom = false;
               }
             });
@@ -15196,6 +15205,20 @@ function portal() {
       this._syncSessionMessageStore(st);
       return new Set(dropped);
     },
+    _captureViewportMessageAnchor(scrollEl, sid) {
+      if (!scrollEl || !sid) return null;
+      const pane = scrollEl.querySelector(
+        `.msg-pane[data-tid="${CSS.escape(sid)}"]`);
+      if (!pane) return null;
+      const viewportTop = scrollEl.getBoundingClientRect().top;
+      for (const el of pane.querySelectorAll(".msg[data-message-key]")) {
+        const rect = el.getBoundingClientRect();
+        if (rect.bottom <= viewportTop) continue;
+        const key = el.getAttribute("data-message-key");
+        if (key) return { key, tid: sid, top: rect.top };
+      }
+      return null;
+    },
     _captureMessageAnchor(scrollEl, m) {
       const key = m && m._k;
       if (!scrollEl || !key) return null;
@@ -15207,13 +15230,14 @@ function portal() {
       return { key, tid: this.currentId || "", top: el.getBoundingClientRect().top };
     },
     _restoreMessageAnchor(scrollEl, anchor) {
-      if (!scrollEl || !anchor) return;
+      if (!scrollEl || !anchor) return false;
       const pane = scrollEl.querySelector(
         `.msg-pane[data-tid="${CSS.escape(anchor.tid || "")}"]`);
       const el = (pane || scrollEl).querySelector(
         `.msg[data-message-key="${CSS.escape(anchor.key)}"]`);
-      if (!el) return;
+      if (!el) return false;
       scrollEl.scrollTop += el.getBoundingClientRect().top - anchor.top;
+      return true;
     },
     // Pop the next batch of older messages off the per-tab stash, mdRender
     // them on demand, prepend to messages[]. Critical: preserve scroll

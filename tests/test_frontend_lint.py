@@ -2455,6 +2455,25 @@ def test_history_keys_prefer_backend_block_identity_without_local_dup_suffixes()
     assert "const seen = new Map()" not in history_keys
 
 
+def test_quiet_history_reload_restores_visible_block_anchor_not_absolute_scroll():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    load_start = app.index("    async loadSession(sid, opts = {}) {")
+    load_end = app.index("    // loadSession is per-session safe", load_start)
+    load = app[load_start:load_end]
+    anchor_start = app.index("    _captureViewportMessageAnchor(scrollEl, sid) {")
+    anchor_end = app.index("    // Pop the next batch", anchor_start)
+    anchors = app[anchor_start:anchor_end]
+
+    assert "this._captureViewportMessageAnchor(quietScrollEl, sid)" in load
+    assert "quiet && !st.atBottom" in load
+    assert "? this._historyCacheCap()" in load
+    assert "this._restoreMessageAnchor(" in load
+    assert "if (!restored) quietScrollEl.scrollTop = quietScrollTop" in load
+    assert 'pane.querySelectorAll(".msg[data-message-key]")' in anchors
+    assert "rect.bottom <= viewportTop" in anchors
+    assert "return true" in anchors
+
+
 def test_history_store_normalizes_canonical_blocks_and_prunes_session_windows():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
     start = app.index("    _historyStoreKey(sid, m) {")
