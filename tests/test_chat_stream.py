@@ -1973,9 +1973,13 @@ async def test_hidden_runtime_continuation_projects_one_agent_bubble_to_leaf(
             "runtime_event_id": runtime_snapshots[0]["runtime_event_id"],
             "presentation_only": True,
             "forkable": False,
+            "block_id": (
+                "runtime-continuation:"
+                f"{runtime_snapshots[0]['runtime_event_id']}:0:assistant"
+            ),
             "_key": (
                 "runtime-continuation:"
-                f"{runtime_snapshots[0]['runtime_event_id']}:0"
+                f"{runtime_snapshots[0]['runtime_event_id']}:0:assistant"
             ),
         }
         assert "uuid" not in bubble
@@ -4301,6 +4305,30 @@ def test_rebuild_stamps_terminal_task_status_and_hides_xml():
     assert not any(
         m.get("role") == "user" and "task-notification" in (m.get("text") or "")
         for m in out), "raw task-notification XML leaked into a bubble"
+
+
+def test_canonical_block_ids_are_record_local_and_repeatable():
+    from backend import chat as chat_mod
+
+    record = _sm("assistant-record", "assistant", [
+        {"type": "thinking", "thinking": "consider"},
+        {"type": "text", "text": "before"},
+        {"type": "tool_use", "id": "tool-1", "name": "Read",
+         "input": {"file_path": "/tmp/a"}},
+        {"type": "text", "text": "after"},
+    ])
+    first = chat_mod._sdk_messages_to_ui([record], {})
+    second = chat_mod._sdk_messages_to_ui([record], {})
+
+    expected = [
+        "assistant-record:0:thinking",
+        "assistant-record:1:assistant",
+        "assistant-record:2:tool_use",
+        "assistant-record:3:assistant",
+    ]
+    assert [m["block_id"] for m in first] == expected
+    assert [m["_key"] for m in first] == expected
+    assert [m["block_id"] for m in second] == expected
 
 
 def test_rebuild_failed_status_maps_through():

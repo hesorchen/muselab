@@ -348,7 +348,13 @@ def test_window_endpoint_matches_full_oracle_and_adds_stable_keys(
     assert body["has_more"] is True
     assert body["has_later"] is True
     assert body["history_generation"]
-    assert len({m["_key"] for m in body["messages"]}) == len(body["messages"])
+    assert [m["block_id"] for m in body["messages"]] == [
+        m["block_id"] for m in oracle[1:5]
+    ]
+    assert [m["_key"] for m in body["messages"]] == [
+        m["block_id"] for m in body["messages"]
+    ]
+    assert len({m["block_id"] for m in body["messages"]}) == len(body["messages"])
 
 
 def test_window_endpoint_interleaves_cancelled_snapshot_at_original_anchor(

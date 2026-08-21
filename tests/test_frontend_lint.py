@@ -2444,6 +2444,17 @@ def test_fork_banner_and_message_template_are_null_and_key_safe():
     assert 'x-for="(m, i) in paneMsgs" :key="m._k"' in html
 
 
+def test_history_keys_prefer_backend_block_identity_without_local_dup_suffixes():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    key_start = app.index("    _historyMessageKey(sid, m) {")
+    key_end = app.index("    _messageContinuitySignatures(m) {", key_start)
+    history_keys = app[key_start:key_end]
+
+    assert "if (m && m.block_id) return sid + \":block:\" + m.block_id;" in history_keys
+    assert '":dup:"' not in history_keys
+    assert "const seen = new Map()" not in history_keys
+
+
 def test_render_key_hot_paths_use_pane_index_without_full_scans_or_transport_duplication():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
 

@@ -14781,6 +14781,7 @@ function portal() {
     },
     _historyMessageKey(sid, m) {
       if (m && m._k) return m._k;
+      if (m && m.block_id) return sid + ":block:" + m.block_id;
       if (m && m._key) return sid + ":idx:" + m._key;
       if (m && m.uuid) return sid + ":uuid:" + m.uuid;
       const identity = [m && m.role, m && (m.id || m.tool_use_id || ""),
@@ -14789,13 +14790,10 @@ function portal() {
       return sid + ":hist:" + this._stableHash(identity);
     },
     _historyEnvelopes(sid, list) {
-      const seen = new Map();
-      return (list || []).map(m => {
-        const base = this._historyMessageKey(sid, m);
-        const n = seen.get(base) || 0;
-        seen.set(base, n + 1);
-        return { ...m, _k: n ? base + ":dup:" + n : base };
-      });
+      return (list || []).map(m => ({
+        ...m,
+        _k: this._historyMessageKey(sid, m),
+      }));
     },
     _messageContinuitySignatures(m) {
       if (!m) return [];

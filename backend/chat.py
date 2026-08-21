@@ -5415,7 +5415,12 @@ def _sdk_messages_to_ui(sm_list: list, annotations: dict[str, dict],
             continue
         ordinal = key_ordinals.get(u, 0)
         key_ordinals[u] = ordinal + 1
-        entry["_key"] = f"{u}:{ordinal}"
+        block_id = f"{u}:{ordinal}:{entry.get('role') or 'unknown'}"
+        entry["block_id"] = block_id
+        # Backward-compatible transport key. New consumers should persist
+        # block_id; unlike response-local duplicate suffixes it is derived only
+        # from the canonical record and block position.
+        entry["_key"] = block_id
         if u in mts_by_uuid:
             entry["mts"] = mts_by_uuid[u]
         ann = annotations.get(u, {})
@@ -5641,12 +5646,8 @@ def _indexed_ui_records(
     # card may need a terminal task notification appended much later.
     tool_names = index.get("tool_use_names") or {}
     task_status = index.get("task_status") or {}
-    ordinals: dict[str, int] = {}
     for bubble in bubbles:
         uid = str(bubble.get("uuid") or "")
-        ordinal = ordinals.get(uid, 0)
-        ordinals[uid] = ordinal + 1
-        bubble["_key"] = f"{uid}:{ordinal}"
         context = turn_context.get(uid)
         if context is not None:
             origin_uuid, started_at_ms = context
@@ -6976,7 +6977,8 @@ def _persist_runtime_continuation_outbox(
         "runtime_event_id": event_id,
         "presentation_only": True,
         "forkable": False,
-        "_key": f"runtime-continuation:{event_id}:0",
+        "block_id": f"runtime-continuation:{event_id}:0:assistant",
+        "_key": f"runtime-continuation:{event_id}:0:assistant",
     }
     payload = {
         "schema": _RUNTIME_CONTINUATION_OUTBOX_SCHEMA,
@@ -7077,7 +7079,8 @@ def _persist_runtime_continuation_snapshot_locked(
         "runtime_event_id": event_id,
         "presentation_only": True,
         "forkable": False,
-        "_key": f"runtime-continuation:{event_id}:0",
+        "block_id": f"runtime-continuation:{event_id}:0:assistant",
+        "_key": f"runtime-continuation:{event_id}:0:assistant",
     })
     # This is a complete assistant-only display turn.  Never expose a source
     # transcript UUID (or a fork UUID) on the successor: the bubble is not a
@@ -7912,7 +7915,9 @@ def _persist_cancelled_turn_snapshot_locked(bc: "TurnBroadcast") -> bool:
         return False
 
     for index, message in enumerate(messages):
-        message["_key"] = f"cancelled:{bc.turn_id}:{index}"
+        block_id = f"snapshot:{bc.turn_id}:{index}:{message.get('role') or 'unknown'}"
+        message["block_id"] = block_id
+        message["_key"] = block_id
         message["_interrupted"] = True
         message["_interrupted_turn_id"] = bc.turn_id
     for message in reversed(messages):
@@ -8060,7 +8065,9 @@ def _persist_failed_turn_snapshot(
             return False
 
         for index, message in enumerate(messages):
-            message["_key"] = f"failed:{bc.turn_id}:{index}"
+            block_id = f"snapshot:{bc.turn_id}:{index}:{message.get('role') or 'unknown'}"
+            message["block_id"] = block_id
+            message["_key"] = block_id
             message["_terminalTurnId"] = bc.turn_id
             if message.get("role") == "user":
                 message["_failed"] = True
