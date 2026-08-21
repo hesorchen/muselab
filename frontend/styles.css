@@ -4274,6 +4274,12 @@ pre.text {
   pointer-events: none;
 }
 .msg-virtual-spacer > * { display: none !important; }
+.chat-bottom-anchor {
+  flex: 0 0 1px;
+  width: 100%;
+  height: 1px;
+  pointer-events: none;
+}
 .load-later-wrap {
   display: flex;
   justify-content: center;

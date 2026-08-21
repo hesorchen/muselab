@@ -12896,7 +12896,10 @@ function portal() {
     },
 
     async activateTab(tid) {
-      if (tid === this.currentId) return;
+      if (tid === this.currentId) {
+        this.scrollToBottom(true);
+        return;
+      }
       await this.openTab(tid);
       if (this.currentId !== tid) return;
       // Clear the green "task done while you were elsewhere" dot now that
@@ -13830,6 +13833,12 @@ function portal() {
       // Only the active pane is mounted. Normalized messages and stable-key rich
       // HTML caches retain state while Alpine rebuilds this viewport projection.
       this._activateTabState(this.currentId);
+      // Selecting a conversation means opening its latest state, not restoring a
+      // stale historical viewport. Reader-controlled position is preserved only
+      // while staying inside the same active tab; every explicit tab selection
+      // re-engages tail follow before loading/remounting the pane.
+      const selectedState = this._ensureTabState(this.currentId);
+      selectedState.atBottom = true;
       this.ackCurrentActivity();
       this.savePrefs();
       // Sync the model + permission + effort dropdowns to THIS session's persisted
@@ -13874,14 +13883,15 @@ function portal() {
       }
       const st = this._ensureTabState(this.currentId);
       if (!st._loaded) {
-        await this._ensureSessionLoaded(this.currentId);
+        const target = this.currentId;
+        await this._ensureSessionLoaded(target);
+        if (this.currentId === target) this.scrollToBottom(true);
       } else {
         // The keyed single-pane projection remounts from normalized state without
         // refetching. Reveal after the tab change paints, then restore position.
         const target = this.currentId;
         const stCur = this.tabState && this.tabState[this.currentId];
-        const shouldFollow = !stCur || stCur.atBottom !== false;
-        stCur.atBottom = shouldFollow;
+        stCur.atBottom = true;
         // Hide bubbles for one frame so the tab-bar flip + skeleton paints
         // immediately; reveal next frame after the single pane remounts.
         stCur.messagesReady = false;
@@ -13890,7 +13900,7 @@ function portal() {
           stCur.messagesReady = true;
           this._afterPaint(() => {
             if (this.currentId !== target) return;
-            this._restoreChatPosition(target);
+            this.scrollToBottom(true);
             // Fresh DOM → always (re)highlight; reset the sentinel first.
             if (stCur) stCur._highlighted = false;
             this.highlightCode(".chat-body");
@@ -26249,7 +26259,29 @@ function portal() {
     // Stamp the last genuine user scroll gesture. Bound to wheel / touchmove /
     // pointerdown on the chat body (see index.html) so onChatScroll can tell a
     // user scroll-up apart from a layout-induced scroll event.
-    _userScrollIntent() {
+    _chatTouchStart(ev) {
+      const touch = ev && ev.touches && ev.touches[0];
+      this._chatTouchY = touch ? touch.clientY : null;
+    },
+    _userScrollIntent(ev) {
+      const el = this.$refs.chatBody;
+      let movesTowardHistory = true;
+      if (ev && ev.type === "wheel") {
+        movesTowardHistory = Number(ev.deltaY) < 0;
+      } else if (ev && ev.type === "touchmove") {
+        const touch = ev.touches && ev.touches[0];
+        const previousY = Number(this._chatTouchY);
+        const currentY = touch ? touch.clientY : previousY;
+        movesTowardHistory = Number.isFinite(previousY) && currentY > previousY;
+        this._chatTouchY = currentY;
+      } else if (ev && ev.type === "pointerdown" && el) {
+        // A pointer press inside message content is selection/clicking, not a
+        // scroll request. Only the scrollbar gutter claims pointerdown as a
+        // possible reader-controlled scroll; wheel/touch paths know direction.
+        const rect = el.getBoundingClientRect();
+        movesTowardHistory = Number(ev.clientX) >= rect.right - 20;
+      }
+      if (!movesTowardHistory) return;
       if (this.previewQuote.show && this.previewQuote.source === "chat"
           && this.previewQuote.mode !== "ask") {
         // Hide the contextual actions while the transcript moves, but preserve
@@ -26261,13 +26293,66 @@ function portal() {
       }
       this._userScrollAt = Date.now();
       const st = this.currentId && this.tabState && this.tabState[this.currentId];
-      if (st) st._userScrollAt = this._userScrollAt;
+      if (st) {
+        st._userScrollAt = this._userScrollAt;
+        st.atBottom = false;
+      }
+      // A real upward gesture immediately owns the viewport. Cancel any tail
+      // settle that was still realizing content-visibility rows; waiting for its
+      // next synthetic scroll event would let it yank the reader back down.
+      this._settleToken = (this._settleToken || 0) + 1;
+      this._autoScrolling = false;
+    },
+    _ensureChatTailObserver() {
+      const body = this.$refs && this.$refs.chatBody;
+      if (!body || typeof ResizeObserver !== "function") return;
+      if (this._chatTailObservedBody === body) return;
+      if (this._chatTailResizeObserver) this._chatTailResizeObserver.disconnect();
+      if (this._chatTailMutationObserver) this._chatTailMutationObserver.disconnect();
+      this._chatTailObservedBody = body;
+      const schedule = () => {
+        const sid = this.currentId;
+        const st = sid && this.tabState && this.tabState[sid];
+        if (!st || st.atBottom === false || this._chatTailPinFrame) return;
+        this._chatTailPinFrame = requestAnimationFrame(() => {
+          this._chatTailPinFrame = 0;
+          const current = sid && this.tabState && this.tabState[sid];
+          if (this.currentId !== sid || current !== st || st.atBottom === false) return;
+          this.scrollToBottom(false);
+        });
+      };
+      const observeLayoutOwners = () => {
+        this._chatTailResizeObserver.disconnect();
+        this._chatTailResizeObserver.observe(body);
+        for (const child of body.children) this._chatTailResizeObserver.observe(child);
+      };
+      this._chatTailResizeObserver = new ResizeObserver(schedule);
+      this._chatTailMutationObserver = new MutationObserver(() => {
+        observeLayoutOwners();
+        schedule();
+      });
+      this._chatTailMutationObserver.observe(body, { childList: true });
+      observeLayoutOwners();
+    },
+    _scrollChatTailNow(sid, st) {
+      const el = this.$refs && this.$refs.chatBody;
+      if (!el || !st || this.currentId !== sid || this.tabState[sid] !== st) return;
+      const tail = this.$refs && this.$refs.chatBottom;
+      if (tail && typeof tail.scrollIntoView === "function") {
+        tail.scrollIntoView({ block: "end", inline: "nearest", behavior: "auto" });
+      }
+      // Keep the explicit scroller assignment as a deterministic fallback for
+      // embedded/mobile WebViews whose scrollIntoView chooses an outer scroller.
+      el.scrollTop = el.scrollHeight;
+      st.atBottom = true;
+      st.scrollTop = el.scrollTop;
     },
     scrollToBottom(force) {
       const el = this.$refs.chatBody;
       const sid = this.currentId;
       const st = sid && this.tabState && this.tabState[sid];
       if (!el || !st) return;
+      this._ensureChatTailObserver();
       // Strict semantics: when not forced, respect the user's atBottom
       // intent exclusively. Don't re-sample geometry — the prior
       // "sample-then-decide" approach used a 150px window that meant
@@ -26299,12 +26384,7 @@ function portal() {
       // here is normally a no-op once the tail is mounted, and guarantees the
       // ordering when a new row first extends it.
       this._syncMessageViewport(sid, true);
-      this.$nextTick(() => {
-        if (this.currentId !== sid || this.tabState[sid] !== st) return;
-        el.scrollTop = el.scrollHeight;
-        st.atBottom = true;
-        st.scrollTop = el.scrollTop;
-      });
+      this.$nextTick(() => this._scrollChatTailNow(sid, st));
     },
 
     // Re-slam the viewport to the very bottom each frame until the
@@ -26318,7 +26398,9 @@ function portal() {
     // frame budget is spent.
     _settleScrollToBottom({ maxFrames } = {}) {
       const el = this.$refs.chatBody;
-      if (!el) return;
+      const sid = this.currentId;
+      const st = sid && this.tabState && this.tabState[sid];
+      if (!el || !st) return;
       // Mobile WebViews pay a far higher per-frame reflow cost: each
       // `scrollTop = scrollHeight` below forces a synchronous layout of the
       // whole content-visibility:auto pane, and 40 of them on a tab switch /
@@ -26347,7 +26429,11 @@ function portal() {
       let stable = 0;
       const step = () => {
         if (this._settleToken !== myToken) return; // superseded; newer settle owns the flag
-        el.scrollTop = el.scrollHeight; // browser clamps to valid range
+        if (this.currentId !== sid || this.tabState[sid] !== st || st.atBottom === false) {
+          done();
+          return;
+        }
+        this._scrollChatTailNow(sid, st);
         frames++;
         const h = el.scrollHeight;
         if (Math.abs(h - lastH) < 1) {

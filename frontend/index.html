@@ -1813,7 +1813,7 @@
              the mobile keyboard toolbar. -->
         <div class="chat-transcript-wrap"
              x-data="{ get activeSession(){ return activeSessionPane() } }">
-        <div class="chat-body" x-ref="chatBody" @scroll="onChatScroll()" @wheel.passive="_userScrollIntent()" @touchmove.passive="_userScrollIntent()" @pointerdown.passive="_userScrollIntent()" @click="onChatClick($event)"
+        <div class="chat-body" x-ref="chatBody" @scroll="onChatScroll()" @wheel.passive="_userScrollIntent($event)" @touchstart.passive="_chatTouchStart($event)" @touchmove.passive="_userScrollIntent($event)" @pointerdown.passive="_userScrollIntent($event)" @click="onChatClick($event)"
              :class="{ 'msgs-hidden': !activeSession.messagesReady && activeSession.messages.length }">
           <!-- Shimmer skeleton while loadSession is in-flight. Without
                this, switching to a long-history session briefly shows the
@@ -3124,6 +3124,10 @@
               </div>
             </div>
           </div>
+          <!-- One stable physical target for every tail-follow path. Message
+               virtualization may replace the mounted rows and spacers, but this
+               node never changes identity or disappears at stream completion. -->
+          <div x-ref="chatBottom" class="chat-bottom-anchor" aria-hidden="true"></div>
         </div>
         <button class="jump-bottom" x-show="!activeSession.atBottom" @click="scrollToBottom(true)" :title="lang==='zh'?'最新':'Jump to latest'" :aria-label="lang==='zh' ? '跳到最新消息' : 'Jump to latest'"><svg><use href="#i-arrow-down"/></svg></button>
         <!-- Outline FAB — sits right above jump-bottom in the same chat

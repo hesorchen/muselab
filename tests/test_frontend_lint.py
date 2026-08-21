@@ -327,7 +327,7 @@ def test_preview_selection_quote_attachment_and_side_question_are_safely_wired()
     assert "calc(100vh - 24px)" in desktop_resize
     for edge in ("n", "ne", "e", "se", "s", "sw", "w", "nw"):
         assert f".preview-selection-resize-handle.is-{edge}" in desktop_resize
-    scroll_intent_start = app.index("\n    _userScrollIntent() {")
+    scroll_intent_start = app.index("\n    _userScrollIntent(ev) {")
     scroll_intent_end = app.index("\n    scrollToBottom(", scroll_intent_start)
     scroll_intent = app[scroll_intent_start:scroll_intent_end]
     assert "this.dismissPreviewQuote(false)" in scroll_intent
@@ -3127,6 +3127,43 @@ def test_explicit_send_scroll_mounts_virtual_tail_without_restoring_old_anchor()
     # Per-delta follow cannot defer tail mounting to rAF and scroll on nextTick:
     # the microtask runs first and otherwise scrolls the previous DOM window.
     assert scroll.count("this._syncMessageViewport(sid, true)") >= 2
+
+
+def test_tab_selection_and_layout_changes_share_one_tail_follow_controller():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+
+    activate_start = app.index("    async activateTab(tid) {")
+    activate_end = app.index("    _scrollTabIntoView(tid) {", activate_start)
+    activate = app[activate_start:activate_end]
+    assert "if (tid === this.currentId)" in activate
+    assert "this.scrollToBottom(true)" in activate
+
+    switch_start = app.index("    async switchSession() {")
+    switch_end = app.index("    _afterPaint(fn) {", switch_start)
+    switch = app[switch_start:switch_end]
+    assert "selectedState.atBottom = true" in switch
+    assert switch.count("this.scrollToBottom(true)") >= 2
+    assert "this._restoreChatPosition(target)" not in switch
+
+    controller_start = app.index("    _ensureChatTailObserver() {")
+    controller_end = app.index("    scrollToBottom(force) {", controller_start)
+    controller = app[controller_start:controller_end]
+    assert "new ResizeObserver(schedule)" in controller
+    assert "new MutationObserver" in controller
+    assert "if (!st || st.atBottom === false" in controller
+    assert "this.scrollToBottom(false)" in controller
+    assert 'this.$refs && this.$refs.chatBottom' in controller
+    assert 'tail.scrollIntoView({ block: "end"' in controller
+    assert 'x-ref="chatBottom"' in html
+
+    intent_start = app.index("    _userScrollIntent(ev) {")
+    intent_end = app.index("    _ensureChatTailObserver() {", intent_start)
+    intent = app[intent_start:intent_end]
+    assert 'ev.type === "wheel"' in intent
+    assert "Number(ev.deltaY) < 0" in intent
+    assert "st.atBottom = false" in intent
+    assert "this._settleToken = (this._settleToken || 0) + 1" in intent
 
 
 def test_quiet_canonical_reload_rebases_virtual_window_before_alpine_paints():
