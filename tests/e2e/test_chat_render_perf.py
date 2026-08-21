@@ -2383,7 +2383,7 @@ def test_mobile_long_history_switching_does_not_blank(page: Page, backend_url, a
           }
           app.tabState[id] = st;
           app._ensureTabState(id);
-          app._capLiveMessages(st);
+          app._scheduleLiveMessageViewport(st);
         }
         app.currentId = sessionIds[0];
         app.messagesReady = true;
@@ -2394,17 +2394,17 @@ def test_mobile_long_history_switching_does_not_blank(page: Page, backend_url, a
         return true;
         """,
     )
-    mounted_cap = _app_eval(page, "return app._mountedMessageCap();")
+    history_size = 90
 
     page.wait_for_function(
-        """mountedCap => {
+        """historySize => {
           const panes = Array.from(document.querySelectorAll(".msg-pane"))
             .filter(p => getComputedStyle(p).display !== "none");
-          return panes.length === 1
-            && panes[0].querySelectorAll(".msg").length > 0
-            && panes[0].querySelectorAll(".msg").length <= mountedCap;
+          const rendered = panes.length === 1
+            ? panes[0].querySelectorAll(".msg").length : 0;
+          return rendered > 0 && rendered < historySize;
         }""",
-        arg=mounted_cap,
+        arg=history_size,
         timeout=5000,
     )
 
@@ -2423,14 +2423,14 @@ def test_mobile_long_history_switching_does_not_blank(page: Page, backend_url, a
         expected_tail = f"history {sid.rsplit('-', 1)[1]}:89"
         try:
             page.wait_for_function(
-                """({ expected, mountedCap }) => {
+                """({ expected, historySize }) => {
                   const panes = Array.from(document.querySelectorAll(".msg-pane"))
                     .filter(p => getComputedStyle(p).display !== "none");
                   return panes.some(p => p.textContent.includes(expected)
                     && p.querySelectorAll(".msg").length > 0
-                    && p.querySelectorAll(".msg").length <= mountedCap);
+                    && p.querySelectorAll(".msg").length < historySize);
                 }""",
-                arg={"expected": expected_tail, "mountedCap": mounted_cap},
+                arg={"expected": expected_tail, "historySize": history_size},
                 timeout=5000,
             )
         except TimeoutError as exc:
@@ -2451,7 +2451,7 @@ def test_mobile_long_history_switching_does_not_blank(page: Page, backend_url, a
             )
             raise AssertionError(f"target tail not visible: {expected_tail}; diag={diag}") from exc
         snap = _visible_pane_with_text_snapshot(page, expected_tail)
-        assert snap["msgCount"] <= mounted_cap
+        assert 0 < snap["msgCount"] < history_size
         assert expected_tail in snap["text"]
         assert page.locator(".msg-pane").count() <= 1
         assert page.locator(".msg-pane").count() <= 1
@@ -2618,9 +2618,8 @@ def test_mobile_windowed_load_session_pages_older_history(page: Page, backend_ur
     assert page.locator(".msg-pane").count() <= 1
     assert page.locator(".msg-pane:visible .msg").count() <= 75
 
-    # Traverse all the way through a history larger than the memory cap. The
-    # window must slide backward (evicting far-future bubbles) until message 0
-    # is mounted; the old implementation stopped forever at the first cap.
+    # Traverse the full server-paged history. Normalized envelopes stay reachable
+    # while the viewport scheduler mounts message 0 only when it enters view.
     for _ in range(24):
         _app_eval(
             page,

@@ -2566,7 +2566,7 @@ def test_quiet_history_reload_restores_visible_block_anchor_not_absolute_scroll(
     assert "this._captureViewportMessageAnchor(quietScrollEl, sid)" in load
     assert "quietScrollEl && !st.atBottom" in load
     assert "this._allPaneMessages(st).length" in load
-    assert "!st.atBottom ? this._historyCacheCap() : 0" in load
+    assert "!st.atBottom ? this._historyReconcileWindowSize() : 0" in load
     assert "this._restoreMessageAnchor(" in load
     assert "if (!restored) quietScrollEl.scrollTop = quietScrollTop" in load
     assert 'pane.querySelectorAll(".msg[data-message-key]")' in anchors
@@ -2582,9 +2582,9 @@ def test_history_store_normalizes_canonical_blocks_without_count_eviction():
     dispose_start = app.index("    _disposeTabRuntime(id) {")
     dispose_end = app.index("    _startWorkspaceDrag", dispose_start)
     dispose = app[dispose_start:dispose_end]
-    cap_start = app.index("    _capHistoryCache(st) {")
-    cap_end = app.index("    _captureViewportMessageAnchor", cap_start)
-    cap = app[cap_start:cap_end]
+    sync_start = app.index("    _syncNormalizedHistory(st) {")
+    sync_end = app.index("    _captureViewportMessageAnchor", sync_start)
+    normalized_sync = app[sync_start:sync_end]
 
     assert "_messagesById: new Map()" in app
     assert "_sessionWindows: new Map()" in app
@@ -2597,9 +2597,14 @@ def test_history_store_normalizes_canonical_blocks_without_count_eviction():
     assert "this._sessionWindows.set(sid, retained)" in store
     assert "this._messagesById.delete(storeKey)" in store
     assert "this._dropSessionMessageStore(id)" in dispose
-    assert "this._syncSessionMessageStore(st)" in cap
-    assert "splice(" not in cap
-    assert "_messagesById.delete" not in cap
+    assert "this._syncSessionMessageStore(st)" in normalized_sync
+    assert "splice(" not in normalized_sync
+    assert "_messagesById.delete" not in normalized_sync
+    for legacy_name in (
+        "_mountedMessageCap", "_historyCacheCap", "_capMountedWindow",
+        "_capHistoryCache", "_capLiveMessages",
+    ):
+        assert legacy_name not in app
 
 
 def test_large_history_bodies_load_by_stable_block_reference():
@@ -2641,7 +2646,7 @@ def test_message_keys_use_stable_identity_without_repair_or_telemetry():
     assert ":dup:" not in history
 
     append_start = app.index("    _assignLiveKey(st, m) {")
-    append_end = app.index("\n    // Retained as load/page sizing", append_start)
+    append_end = app.index("\n    // Server/history windows", append_start)
     append = app[append_start:append_end]
     assert '":live:" + st._nextLiveKey++' in append
     assert "_renderKeyOwners" not in append
@@ -2735,7 +2740,7 @@ def test_done_immediately_stamps_tool_tail_and_quietly_adopts_fork_boundary():
     html = (FRONTEND / "index.html").read_text(encoding="utf-8")
 
     append_start = app.index("_appendLiveMessage(st, m)")
-    append_end = app.index("\n    _mountedMessageCap", append_start)
+    append_end = app.index("\n    _historyWindowSize", append_start)
     append = app[append_start:append_end]
     # Every live role can become the visual turn tail. Predeclaring these keys
     # makes done-time assignments reactive on tool/status rows too.
@@ -2896,7 +2901,7 @@ def test_queue_sync_keeps_older_success_when_newer_read_fails():
     assert "st._queueSyncSeq !== seq" not in sync
 
 
-def test_long_chat_state_is_per_tab_bounded_and_generation_safe():
+def test_long_chat_state_keeps_complete_normalized_history_and_generation_safety():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
     html = (FRONTEND / "index.html").read_text(encoding="utf-8")
     css = (FRONTEND / "styles.css").read_text(encoding="utf-8")
@@ -2910,10 +2915,10 @@ def test_long_chat_state_is_per_tab_bounded_and_generation_safe():
     assert "_hasServerLater: false" in blank
     assert "_laterMessages: []" in blank
     assert "_nextLiveKey: 1" in blank
-    assert "_mountedMessageCap() { return 300; }" in app
-    assert "_historyCacheCap() { return 800; }" in app
-    assert "_mountedMessageCap() { return this._isMobileLayout()" not in app
-    assert "_historyCacheCap() { return this._isMobileLayout()" not in app
+    assert "_historyWindowSize() { return 300; }" in app
+    assert "_historyReconcileWindowSize() { return 800; }" in app
+    assert "_historyWindowSize() { return this._isMobileLayout()" not in app
+    assert "_historyReconcileWindowSize() { return this._isMobileLayout()" not in app
     assert "_MAX_RESIDENT_PANES" not in app
     assert "residentPaneIds" not in app
     assert "_promoteResident" not in app
@@ -2930,7 +2935,7 @@ def test_long_chat_state_is_per_tab_bounded_and_generation_safe():
     around_end = app.index("// Outline click", around_start)
     around = app[around_start:around_end]
     assert "return this._loadAroundMessage(sid, uuid, false)" in around
-    assert 'this._capMountedWindow(st, "around", uuid)' in around
+    assert 'this._scheduleHistoryViewport(st, "around", uuid)' in around
     assert "st._hasServerLater = !!data.has_later" in around
     assert 'st._historyOrder = data.history_order === "normal" ? "normal" : "full"' in around
 
@@ -2941,8 +2946,8 @@ def test_long_chat_state_is_per_tab_bounded_and_generation_safe():
     newer = app[older_end:later_end]
     assert 'st._historyOrder === "full" ? "&full=1" : ""' in older
     assert 'st._historyOrder === "full" ? "&full=1" : ""' in newer
-    assert "_historyCacheCap()" not in older
-    assert "_historyCacheCap()" not in newer
+    assert "_historyReconcileWindowSize()" not in older
+    assert "_historyReconcileWindowSize()" not in newer
     assert "const room =" not in older
     assert "const room =" not in newer
     assert "st._loadedOffset + this._allPaneMessages(st).length" in newer
@@ -2961,9 +2966,9 @@ def test_long_chat_state_is_per_tab_bounded_and_generation_safe():
     assert "messages.length - 3" in virtual
     assert "this._captureViewportMessageAnchor(body, tid)" in virtual
     assert "this._restoreMessageAnchor(body, anchor)" in virtual
-    cap_start = app.index("_capHistoryCache(st) {")
-    cap_end = app.index("_captureViewportMessageAnchor", cap_start)
-    assert "splice(" not in app[cap_start:cap_end]
+    sync_start = app.index("_syncNormalizedHistory(st) {")
+    sync_end = app.index("_captureViewportMessageAnchor", sync_start)
+    assert "splice(" not in app[sync_start:sync_end]
     # "Load earlier" keys off the server cursor first…
     assert "if (st._loadedOffset > 0) return true;" in app
     # …and, at cursor 0, off stranded pre-chain history (post-/compact), which
@@ -3029,7 +3034,7 @@ def test_stream_deltas_use_throttled_plain_snapshots_and_final_rich_render():
     assert 'class="stream-plain" x-text="m._streamText || \'\'"' in html
     assert 'x-show="!m._streamPlain" x-html="m.html || \'\'"' in html
     assert "if (this.atBottom) this.scrollToBottom(false)" in app
-    assert "if (this.atBottom) this._capLiveMessages" not in app
+    assert "if (this.atBottom) this._scheduleLiveMessageViewport" not in app
     assert "const maxChunk = this._isMobileLayout() ? 4 : 12" in app
     assert "const frameBudgetMs = this._isMobileLayout() ? 6 : 12" in app
     assert "performance.now() - started >= frameBudgetMs" in app

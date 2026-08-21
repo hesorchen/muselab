@@ -3870,7 +3870,7 @@ function portal() {
     async _loadAroundMessage(sid, uuid, retryAfterConflict = true) {
       const st = this.tabState && this.tabState[sid];
       if (!st || !uuid || st.streaming || st.es) return false;
-      const limit = this._mountedMessageCap();
+      const limit = this._historyWindowSize();
       const generation = st.historyGeneration
         ? "&history_generation=" + encodeURIComponent(st.historyGeneration) : "";
       const r = await fetch("/api/chat/sessions/" + sid
@@ -3902,10 +3902,9 @@ function portal() {
       st.historyGeneration = data.history_generation || st.historyGeneration || "";
       st._historyOrder = data.history_order === "normal" ? "normal" : "full";
       st._hasServerLater = !!data.has_later;
-      // Set the server coordinate before defensive trimming: if a malformed
-      // or older backend returns more than the cache cap, _capHistoryCache
-      // advances _loadedOffset for every discarded head bubble.
-      this._capMountedWindow(st, "around", uuid);
+      // Install server coordinates before scheduling the around-target viewport.
+      // Every fetched normalized envelope remains reachable outside the rendered rows.
+      this._scheduleHistoryViewport(st, "around", uuid);
       st._hasMoreHistory = st._earlierMessages.length > 0 || st._loadedOffset > 0;
       if (sid === this.currentId) {
         this.messages = st.messages;
@@ -3966,7 +3965,7 @@ function portal() {
           }
         });
         st.messages.unshift(...batch);
-        this._capMountedWindow(st, "around", uuid);
+        this._scheduleHistoryViewport(st, "around", uuid);
         if (sid === this.currentId) this.messages = st.messages;
         st._hasMoreHistory =
           (st._earlierMessages || []).length > 0 || st._loadedOffset > 0;
@@ -8372,7 +8371,7 @@ function portal() {
           turnUser = lastUser;
         }
         if ((uText || uImages.length || uDocs.length) && !turnUser) {
-          this._capLiveMessages(st);
+          this._scheduleLiveMessageViewport(st);
           turnUser = this._appendLiveMessage(st, {
             role: "user",
             text: uText,
@@ -14136,25 +14135,25 @@ function portal() {
         const _baseInitialLoad = _coldEarly ? 30 : 60;
         // QUIET refresh must not shrink the pane. A quiet load is a merge into
         // an ALREADY-PAINTED pane, and a long agentic turn can leave up to
-        // _mountedMessageCap() canonical bubbles in its active window — far
-        // more than the cold-open window above. Loading the narrow window in that state
-        // spliced several hundred bubbles down to ~60 and pushed the rest into
-        // _earlierMessages: a violent height collapse + mass DOM teardown,
+        // _historyWindowSize() canonical bubbles in its active request window —
+        // far more than the cold-open window above. Loading the narrow window in
+        // that state spliced several hundred bubbles down to ~60 and pushed the
+        // rest into _earlierMessages: a violent height collapse + mass DOM teardown,
         // which is the post-turn half of the "会话区刷新闪烁" report
-        // (2026-08-04). Widen the window (and the fetched tail) to at least
-        // what is currently mounted so a quiet merge is a true in-place morph.
+        // (2026-08-04). Widen the request (and fetched tail) to preserve the
+        // current canonical window during the in-place morph.
         // Cold opens and non-quiet loads keep the narrow, freeze-avoiding
         // window — nothing is painted yet there, so there is nothing to
         // preserve.
-        const _mountedNow = (quiet && Array.isArray(st.messages))
+        const _currentWindowSize = (quiet && Array.isArray(st.messages))
           ? st.messages.length : 0;
-        const _quietFloor = Math.min(this._mountedMessageCap(), _mountedNow);
+        const _quietFloor = Math.min(this._historyWindowSize(), _currentWindowSize);
         const _initialLoadEarly = Math.max(_baseInitialLoad, _quietFloor);
         // While the user reads history, request at least every canonical block
         // already loaded so quiet reconciliation cannot drop the visible anchor.
         const FETCH_TAIL = quiet
           ? Math.max(_baseInitialLoad * 5, this._allPaneMessages(st).length,
-            !st.atBottom ? this._historyCacheCap() : 0)
+            !st.atBottom ? this._historyReconcileWindowSize() : 0)
           : Math.max(_baseInitialLoad * 5, _quietFloor);
         const qs = full ? "?full=1" : ("?tail=" + FETCH_TAIL);
         const controller = new AbortController();
@@ -14316,7 +14315,7 @@ function portal() {
           // Quiet refresh: render the whole visible window synchronously so the
           // in-place swap below morphs in fully-rendered bubbles with no
           // deferred-head dance. Not as costly as it looks even with the
-          // mounted-width floor above: _preserveCanonicalMessageIdentity has
+          // current-window floor above: _preserveCanonicalMessageIdentity has
           // already reused the live objects, which keep their existing `html`,
           // so renderMarkdown only does real work for genuinely new rows.
           visible.forEach(renderMarkdown);
@@ -14378,7 +14377,7 @@ function portal() {
         st._preTotal = Number.isInteger(s.pre_total) ? s.pre_total : 0;
         // Seed the render-only viewport at the newest end after installing the
         // response coordinates. Canonical envelopes remain untouched.
-        this._capMountedWindow(st, "newer");
+        this._scheduleHistoryViewport(st, "newer");
         this._syncSessionMessageStore(st);
         // More history exists if either the in-memory stash has older
         // bubbles OR the server holds bubbles before our window.
@@ -14629,7 +14628,7 @@ function portal() {
         }
       }
       if (this.tabState[sid] === st) {
-        this._capMountedWindow(st, "older");
+        this._scheduleHistoryViewport(st, "older");
       }
     },
     // E5: render the deferred HEAD — the rewound, above-the-fold bubbles whose
@@ -15004,17 +15003,16 @@ function portal() {
       const target = (st._laterMessages && st._laterMessages.length)
         ? st._laterMessages : st.messages;
       target.push(m);
-      this._capMountedWindow(st, "newer");
-      this._capHistoryCache(st);
+      this._scheduleHistoryViewport(st, "newer");
+      this._syncNormalizedHistory(st);
       return target[target.length - 1];
     },
-    // Retained as load/page sizing compatibility. Mobile and desktop use the
-    // same canonical windows; measured viewport virtualization controls DOM
-    // size without removing or device-capping canonical messages.
-    _mountedMessageCap() { return 300; },
-    _historyCacheCap() { return 800; },
-    _capMountedWindow(st, direction = "newer", anchorUuid = "") {
-      if (!st) return { head: [], tail: [] };
+    // Server/history windows are independent of the rendered DOM row count.
+    // Viewport virtualization alone decides which normalized messages mount.
+    _historyWindowSize() { return 300; },
+    _historyReconcileWindowSize() { return 800; },
+    _scheduleHistoryViewport(st, direction = "newer", anchorUuid = "") {
+      if (!st) return;
       if (direction === "around" && anchorUuid) {
         const target = st.messages.findIndex(m => m && m.uuid === anchorUuid);
         if (target >= 0) {
@@ -15024,15 +15022,9 @@ function portal() {
         }
       }
       this._scheduleMessageViewportSync(st._sid, direction === "newer" && st.atBottom !== false);
-      return { head: [], tail: [] };
     },
-    _capHistoryCache(st) {
-      // Normalized history is authoritative browser state. Paging may decide
-      // which section is revealed, but a numeric cache cap must never discard a
-      // fetched block or make its interaction state disappear.
-      if (!st) return new Set();
-      this._syncSessionMessageStore(st);
-      return new Set();
+    _syncNormalizedHistory(st) {
+      if (st) this._syncSessionMessageStore(st);
     },
     _captureViewportMessageAnchor(scrollEl, sid) {
       if (!scrollEl || !sid) return null;
@@ -15194,7 +15186,7 @@ function portal() {
         st.historyGeneration = data.history_generation || st.historyGeneration || "";
         st._historyOrder = data.history_order === "full" ? "full" : "normal";
         if (sid === this.currentId) this.historyGeneration = st.historyGeneration;
-        this._capHistoryCache(st, "older");
+        this._syncNormalizedHistory(st);
         st._hasServerLater = (st._loadedOffset + this._allPaneMessages(st).length)
           < st._total;
         st._hasMoreHistory =
@@ -15244,7 +15236,7 @@ function portal() {
         st.historyGeneration = data.history_generation || st.historyGeneration || "";
         st._historyOrder = data.history_order === "full" ? "full" : "normal";
         if (sid === this.currentId) this.historyGeneration = st.historyGeneration;
-        this._capHistoryCache(st, "newer");
+        this._syncNormalizedHistory(st);
         st._hasServerLater = (st._loadedOffset + this._allPaneMessages(st).length)
           < st._total;
         return win.length;
@@ -15302,7 +15294,7 @@ function portal() {
       const anchorUuid = anchor.uuid;
       const ok = await this._loadAroundMessage(sid, anchorUuid);
       if (!ok || this.tabState[sid] !== st) return false;
-      // _loadAroundMessage replaces the mounted window, so without re-anchoring
+      // _loadAroundMessage replaces the canonical history window, so without re-anchoring
       // the viewport the reader gets teleported mid-transcript. Jump-to-start
       // (not centred, no highlight flash) keeps the message they were reading
       // at the fold with the recovered history stacked above it.
@@ -15391,7 +15383,7 @@ function portal() {
       const anchor = this._captureViewportMessageAnchor(scrollEl, sid);
       this._shiftMessageVirtualWindow(st, batch.length);
       st.messages.unshift(...batch);
-      this._capMountedWindow(st, "older");
+      this._scheduleHistoryViewport(st, "older");
       if (isCurrent) this.messages = st.messages;
       st._hasMoreHistory = st._earlierMessages.length > 0 || st._loadedOffset > 0;
       // Restore scroll position so the message the user was looking at
@@ -15428,7 +15420,7 @@ function portal() {
       // last canonical bubble may be outside the viewport render window.
       const anchor = this._captureViewportMessageAnchor(scrollEl, sid);
       st.messages.push(...batch);
-      this._capMountedWindow(st, "newer");
+      this._scheduleHistoryViewport(st, "newer");
       if (sid === this.currentId) {
         this.messages = st.messages;
         this.$nextTick(() => {
@@ -15455,11 +15447,11 @@ function portal() {
         return true;
       }
       const all = this._allPaneMessages(st);
-      const cap = this._mountedMessageCap();
-      st.messages.splice(0, st.messages.length, ...all.slice(-cap));
-      st._earlierMessages = all.slice(0, Math.max(0, all.length - cap));
+      const windowSize = this._historyWindowSize();
+      st.messages.splice(0, st.messages.length, ...all.slice(-windowSize));
+      st._earlierMessages = all.slice(0, Math.max(0, all.length - windowSize));
       st._laterMessages = [];
-      this._capHistoryCache(st, "newer");
+      this._syncNormalizedHistory(st);
       st.atBottom = true;
       if (sid === this.currentId) {
         this.messages = st.messages;
@@ -15486,7 +15478,7 @@ function portal() {
     // Live history stays canonical in memory. The viewport row builder, not an
     // envelope count, bounds the DOM while keeping every interaction target and
     // normalized object reachable during long streaming turns.
-    _capLiveMessages(st) {
+    _scheduleLiveMessageViewport(st) {
       if (!st || !st.messages) return;
       this._scheduleMessageViewportSync(st._sid, st.atBottom !== false);
     },
@@ -15529,8 +15521,8 @@ function portal() {
       if (!sid) return false;
       const st = this.tabState[sid];
       if (!st) return false;
-      // Retained as a compatibility hook for the template. Sliding-window
-      // paging now makes every indexed bubble reachable within the cap.
+      // Retained as a compatibility hook for the template. Transparent paging
+      // and normalized history keep every indexed bubble reachable.
       return false;
     },
 
@@ -26938,7 +26930,7 @@ function portal() {
         if (!await this._awaitRuntimeSettingPatches(sendSid, sendState)) return false;
         // Refresh the viewport window before growing the live tail; canonical
         // history remains intact while mounted rows stay bounded.
-        this._capLiveMessages(sendState);
+        this._scheduleLiveMessageViewport(sendState);
         sentUserBubble = this._appendLiveMessage(sendState, {
           role: "user", text,
           displayText: hasDetachedText ? detachedDisplayText : composerInput,
@@ -27385,7 +27377,7 @@ function portal() {
       // Scroll only if the active tab is the one receiving the stream;
       // otherwise we'd yank the user away from whatever they're reading.
       const _scrollIfActive = () => {
-        this._capLiveMessages(streamState);
+        this._scheduleLiveMessageViewport(streamState);
         if (this.currentId !== streamSid) return;
         // Refresh the measured viewport window throughout a long agentic turn.
         // The final streaming rows remain mounted separately when the reader is
