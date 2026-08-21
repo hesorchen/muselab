@@ -2531,12 +2531,76 @@ body.kb-open .layout:focus-within .mobile-tab-bar { display: none; }
   width: min(420px, calc(100vw - 24px));
 }
 .preview-selection-ask-shell {
+  position: relative;
   width: 100%;
   max-height: min(560px, calc(100vh - 28px));
   overflow: hidden;
   border: 1px solid var(--c-border-strong);
   border-radius: var(--r-lg);
   background: var(--c-bg-2);
+}
+.preview-selection-resize-handle { display: none; }
+@media (min-width: 601px) {
+  .preview-selection-popover.is-asking {
+    width: min(var(--preview-question-width, 560px), calc(100vw - 24px));
+    height: min(var(--preview-question-height, 520px), calc(100vh - 24px));
+    min-width: min(360px, calc(100vw - 24px));
+    min-height: min(260px, calc(100vh - 24px));
+    max-width: calc(100vw - 24px);
+    max-height: calc(100vh - 24px);
+  }
+  .preview-selection-popover.is-asking .preview-selection-ask-shell {
+    height: 100%;
+    max-height: none;
+  }
+  .preview-selection-popover.is-asking .preview-selection-ask {
+    height: 100%;
+    overflow: auto;
+  }
+  .preview-selection-popover.is-asking .preview-selection-answer {
+    height: 100%;
+    max-height: none;
+  }
+  .preview-selection-popover.is-asking .preview-selection-conversation {
+    flex: 1;
+    max-height: none;
+  }
+  .preview-selection-resize-handle {
+    position: absolute;
+    z-index: 2;
+    display: block;
+    touch-action: none;
+    user-select: none;
+  }
+  .preview-selection-resize-handle.is-n,
+  .preview-selection-resize-handle.is-s {
+    left: 10px;
+    right: 10px;
+    height: 8px;
+    cursor: ns-resize;
+  }
+  .preview-selection-resize-handle.is-n { top: 0; }
+  .preview-selection-resize-handle.is-s { bottom: 0; }
+  .preview-selection-resize-handle.is-e,
+  .preview-selection-resize-handle.is-w {
+    top: 10px;
+    bottom: 10px;
+    width: 8px;
+    cursor: ew-resize;
+  }
+  .preview-selection-resize-handle.is-e { right: 0; }
+  .preview-selection-resize-handle.is-w { left: 0; }
+  .preview-selection-resize-handle.is-ne,
+  .preview-selection-resize-handle.is-se,
+  .preview-selection-resize-handle.is-sw,
+  .preview-selection-resize-handle.is-nw {
+    width: 14px;
+    height: 14px;
+  }
+  .preview-selection-resize-handle.is-ne { top: 0; right: 0; cursor: nesw-resize; }
+  .preview-selection-resize-handle.is-se { right: 0; bottom: 0; cursor: nwse-resize; }
+  .preview-selection-resize-handle.is-sw { bottom: 0; left: 0; cursor: nesw-resize; }
+  .preview-selection-resize-handle.is-nw { top: 0; left: 0; cursor: nwse-resize; }
 }
 .preview-selection-ask {
   width: 100%;

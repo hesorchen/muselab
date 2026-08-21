@@ -468,7 +468,8 @@ function portal() {
     previewQuote: {
       show: false, mode: "actions", source: "", role: "", sessionId: "",
       messageId: "", text: "", path: "", question: "", followup: "",
-      x: 0, y: 0, above: false, truncated: false, sending: false,
+      x: 0, y: 0, width: 560, height: 520,
+      above: false, truncated: false, sending: false,
       askSessionId: "", askSessionName: "", askPrompt: "", askError: "",
       askAutoScroll: true,
       // Ask mode starts anchored to the selection. The first title-bar drag
@@ -488,6 +489,7 @@ function portal() {
     _previewSelectionBound: false,
     _previewSelectionTimer: null,
     _previewQuoteDrag: null,
+    _previewQuoteResize: null,
     _previewQuoteConstraintFrame: null,
     _previewQuoteResizeObserver: null,
     PREVIEW_QUOTE_MAX_CHARS: 6000,
@@ -22623,6 +22625,7 @@ function portal() {
     _initPreviewSelection() {
       if (this._previewSelectionBound) return;
       this._previewSelectionBound = true;
+      this._loadPreviewQuoteDesktopSize();
       document.addEventListener("selectionchange", () => {
         // Focusing the inline question field collapses the document selection.
         // The selected source has already been snapshotted, so retain the ask
@@ -22661,12 +22664,60 @@ function portal() {
           // window near an edge, keep the growing shell in view without
           // disturbing its position during ordinary content updates.
           if (this.previewQuote.show && this.previewQuote.dragged
-              && !this.previewQuote.dragging) {
+              && !this.previewQuote.dragging && !this._previewQuoteResize) {
             this._schedulePreviewQuoteConstraint();
           }
         });
         this._previewQuoteResizeObserver.observe(popover);
       });
+    },
+
+    _loadPreviewQuoteDesktopSize() {
+      try {
+        const saved = JSON.parse(
+          localStorage.getItem("muselab_side_question_size") || "null",
+        );
+        if (!saved || typeof saved !== "object") return;
+        const width = Number(saved.width);
+        const height = Number(saved.height);
+        if (Number.isFinite(width) && width >= 360 && width <= 2400) {
+          this.previewQuote.width = Math.round(width);
+        }
+        if (Number.isFinite(height) && height >= 260 && height <= 1800) {
+          this.previewQuote.height = Math.round(height);
+        }
+      } catch (_) {}
+    },
+
+    _savePreviewQuoteDesktopSize() {
+      try {
+        localStorage.setItem("muselab_side_question_size", JSON.stringify({
+          width: Math.round(this.previewQuote.width),
+          height: Math.round(this.previewQuote.height),
+        }));
+      } catch (_) {}
+    },
+
+    _previewQuoteDesktop() {
+      return !!(window.matchMedia
+        && window.matchMedia("(min-width: 601px)").matches);
+    },
+
+    _preparePreviewQuoteDesktopWindow() {
+      if (!this._previewQuoteDesktop()) return false;
+      const popover = this._previewQuoteElement();
+      if (!popover || !popover.getClientRects().length) return false;
+      const rect = popover.getBoundingClientRect();
+      const next = this._clampPreviewQuotePosition(
+        rect.left, rect.top, rect.width, rect.height,
+      );
+      Object.assign(this.previewQuote, {
+        x: next.x,
+        y: next.y,
+        above: false,
+        dragged: true,
+      });
+      return true;
     },
 
     _previewQuoteElement() {
@@ -22806,6 +22857,108 @@ function portal() {
         } catch (_) {}
       }
       this.previewQuote.dragging = false;
+    },
+
+    startPreviewQuoteResize(ev, edge) {
+      if (!ev || !this._previewQuoteDesktop()
+          || !this.previewQuote.show || this.previewQuote.mode !== "ask"
+          || (ev.button != null && ev.button !== 0) || ev.isPrimary === false
+          || !/^(n|ne|e|se|s|sw|w|nw)$/.test(edge)) return false;
+      const popover = this._previewQuoteElement();
+      if (!popover) return false;
+      this._cancelPreviewQuoteDrag();
+      const rect = popover.getBoundingClientRect();
+      const handle = ev.currentTarget;
+      this._previewQuoteResize = {
+        pointerId: ev.pointerId,
+        edge,
+        startX: ev.clientX,
+        startY: ev.clientY,
+        left: rect.left,
+        top: rect.top,
+        right: rect.right,
+        bottom: rect.bottom,
+        handle,
+      };
+      Object.assign(this.previewQuote, {
+        x: rect.left,
+        y: rect.top,
+        width: rect.width,
+        height: rect.height,
+        above: false,
+        dragged: true,
+      });
+      try { handle.setPointerCapture(ev.pointerId); } catch (_) {}
+      if (ev.cancelable) ev.preventDefault();
+      return true;
+    },
+
+    movePreviewQuoteResize(ev) {
+      const resize = this._previewQuoteResize;
+      if (!resize || !ev || ev.pointerId !== resize.pointerId) return false;
+      const viewport = this._previewQuoteViewport();
+      const margin = 12;
+      const minWidth = Math.min(360, Math.max(1, viewport.width - margin * 2));
+      const minHeight = Math.min(260, Math.max(1, viewport.height - margin * 2));
+      const dx = ev.clientX - resize.startX;
+      const dy = ev.clientY - resize.startY;
+      let left = resize.left;
+      let right = resize.right;
+      let top = resize.top;
+      let bottom = resize.bottom;
+      if (resize.edge.includes("w")) {
+        left = Math.min(resize.right - minWidth,
+          Math.max(viewport.left + margin, resize.left + dx));
+      }
+      if (resize.edge.includes("e")) {
+        right = Math.max(resize.left + minWidth,
+          Math.min(viewport.left + viewport.width - margin, resize.right + dx));
+      }
+      if (resize.edge.includes("n")) {
+        top = Math.min(resize.bottom - minHeight,
+          Math.max(viewport.top + margin, resize.top + dy));
+      }
+      if (resize.edge.includes("s")) {
+        bottom = Math.max(resize.top + minHeight,
+          Math.min(viewport.top + viewport.height - margin, resize.bottom + dy));
+      }
+      Object.assign(this.previewQuote, {
+        x: left,
+        y: top,
+        width: right - left,
+        height: bottom - top,
+      });
+      if (ev.cancelable) ev.preventDefault();
+      return true;
+    },
+
+    finishPreviewQuoteResize(ev) {
+      const resize = this._previewQuoteResize;
+      if (!resize || (ev && ev.pointerId != null
+          && ev.pointerId !== resize.pointerId)) return false;
+      this._previewQuoteResize = null;
+      try {
+        if (resize.handle && resize.handle.hasPointerCapture
+            && resize.handle.hasPointerCapture(resize.pointerId)) {
+          resize.handle.releasePointerCapture(resize.pointerId);
+        }
+      } catch (_) {}
+      this._constrainPreviewQuoteToViewport();
+      this._savePreviewQuoteDesktopSize();
+      if (ev && ev.cancelable) ev.preventDefault();
+      return true;
+    },
+
+    _cancelPreviewQuoteResize() {
+      const resize = this._previewQuoteResize;
+      this._previewQuoteResize = null;
+      if (!resize || !resize.handle) return;
+      try {
+        if (resize.handle.hasPointerCapture
+            && resize.handle.hasPointerCapture(resize.pointerId)) {
+          resize.handle.releasePointerCapture(resize.pointerId);
+        }
+      } catch (_) {}
     },
 
     _previewSelectionHost(node) {
@@ -22953,6 +23106,7 @@ function portal() {
       clearTimeout(this._previewSelectionTimer);
       this._previewSelectionTimer = null;
       this._cancelPreviewQuoteDrag();
+      this._cancelPreviewQuoteResize();
       Object.assign(this.previewQuote, {
         show: false, mode: "actions", source: "", role: "", sessionId: "",
         messageId: "", text: "", path: "", question: "", followup: "",
@@ -23086,6 +23240,7 @@ function portal() {
     openPreviewSelectionAsk() {
       if (!this.previewQuote.show || !this.previewQuote.text) return;
       this._cancelPreviewQuoteDrag();
+      this._cancelPreviewQuoteResize();
       this.previewQuote.mode = "ask";
       this.previewQuote.dragged = false;
       this.previewQuote.question = "";
@@ -23096,6 +23251,7 @@ function portal() {
       this.previewQuote.askError = "";
       this.previewQuote.askAutoScroll = true;
       this.$nextTick(() => {
+        this._preparePreviewQuoteDesktopWindow();
         // x-ref inside an x-if template is not guaranteed to join Alpine's
         // root $refs collection on the same tick in every browser build.
         const input = this.$refs.previewQuoteInput

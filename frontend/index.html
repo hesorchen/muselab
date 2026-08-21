@@ -3682,7 +3682,12 @@
          'is-dragged': previewQuote.dragged,
          'is-dragging': previewQuote.dragging,
        }"
-       :style="{ left: previewQuote.x + 'px', top: previewQuote.y + 'px' }"
+       :style="{
+         left: previewQuote.x + 'px',
+         top: previewQuote.y + 'px',
+         '--preview-question-width': previewQuote.width + 'px',
+         '--preview-question-height': previewQuote.height + 'px',
+       }"
        role="dialog"
        :aria-label="previewQuote.mode === 'ask'
          ? (lang === 'zh' ? '针对选中内容询问' : 'Ask about selection')
@@ -3834,6 +3839,16 @@
             </button>
           </div>
         </div>
+        <template x-for="edge in ['n', 'ne', 'e', 'se', 's', 'sw', 'w', 'nw']" :key="edge">
+          <span class="preview-selection-resize-handle"
+                :class="'is-' + edge"
+                aria-hidden="true"
+                @pointerdown.stop="startPreviewQuoteResize($event, edge)"
+                @pointermove.stop="movePreviewQuoteResize($event)"
+                @pointerup.stop="finishPreviewQuoteResize($event)"
+                @pointercancel.stop="finishPreviewQuoteResize($event)"
+                @lostpointercapture.stop="finishPreviewQuoteResize($event)"></span>
+        </template>
       </div>
     </template>
   </div>

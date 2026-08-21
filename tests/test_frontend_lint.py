@@ -304,6 +304,29 @@ def test_preview_selection_quote_attachment_and_side_question_are_safely_wired()
     assert "finishPreviewQuoteDrag(ev)" in app
     assert "window.visualViewport.addEventListener" in app
     assert "new ResizeObserver" in app
+
+    # Desktop side-question windows are larger by default, resize from every
+    # edge/corner without a framework, remember the chosen size, and leave the
+    # <=600px mobile layout untouched by keeping handles desktop-only.
+    assert "x: 0, y: 0, width: 560, height: 520" in app
+    assert 'localStorage.getItem("muselab_side_question_size")' in app
+    assert 'localStorage.setItem("muselab_side_question_size"' in app
+    assert "startPreviewQuoteResize(ev, edge)" in app
+    assert "movePreviewQuoteResize(ev)" in app
+    assert "finishPreviewQuoteResize(ev)" in app
+    assert "['n', 'ne', 'e', 'se', 's', 'sw', 'w', 'nw']" in html
+    assert "--preview-question-width" in html
+    assert ".preview-selection-resize-handle { display: none; }" in css
+    desktop_resize_start = css.index("@media (min-width: 601px)")
+    desktop_resize = css[desktop_resize_start:
+                         css.index("\n.preview-selection-ask {",
+                                   desktop_resize_start)]
+    assert "var(--preview-question-width, 560px)" in desktop_resize
+    assert "var(--preview-question-height, 520px)" in desktop_resize
+    assert "calc(100vw - 24px)" in desktop_resize
+    assert "calc(100vh - 24px)" in desktop_resize
+    for edge in ("n", "ne", "e", "se", "s", "sw", "w", "nw"):
+        assert f".preview-selection-resize-handle.is-{edge}" in desktop_resize
     scroll_intent_start = app.index("\n    _userScrollIntent() {")
     scroll_intent_end = app.index("\n    scrollToBottom(", scroll_intent_start)
     scroll_intent = app[scroll_intent_start:scroll_intent_end]
