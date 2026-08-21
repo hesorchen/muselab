@@ -3907,6 +3907,12 @@ function portal() {
         preTotal: Number.isInteger(data.pre_total) ? data.pre_total : 0,
         generation: data.history_generation || st.messageRange.generation || "",
         order: data.history_order === "normal" ? "normal" : "full",
+        // around_uuid changes coordinate space and is not chunk-aligned. Drop the
+        // previous normal-order manifest so its spacer/chunk ids cannot be reused
+        // against this full-order window.
+        manifest: null,
+        firstChunk: -1,
+        lastChunk: -1,
       });
       // around_uuid replaces both the repository and its server coordinates.
       this._scheduleHistoryViewport(st, "around", uuid);
@@ -7111,6 +7117,9 @@ function portal() {
           preTotal: 0,
           order: "normal",
           generation: "",
+          manifest: null,
+          firstChunk: -1,
+          lastChunk: -1,
         },
         messagesReady: true,
         messagesLoading: false,
@@ -7328,7 +7337,8 @@ function portal() {
         st.messageRange = {
           visibleStart: 0, visibleEnd: st.messages.length,
           offset: 0, total: st.messages.length, preTotal: 0,
-          order: "normal", generation: "",
+          order: "normal", generation: "", manifest: null,
+          firstChunk: -1, lastChunk: -1,
         };
       }
       const range = st.messageRange;
@@ -7342,6 +7352,9 @@ function portal() {
       if (!Number.isInteger(range.preTotal)) range.preTotal = 0;
       if (range.order !== "full") range.order = "normal";
       if (typeof range.generation !== "string") range.generation = "";
+      if (!range.manifest || !Array.isArray(range.manifest.chunks)) range.manifest = null;
+      if (!Number.isInteger(range.firstChunk)) range.firstChunk = -1;
+      if (!Number.isInteger(range.lastChunk)) range.lastChunk = -1;
       if (st.messagesReady === undefined) st.messagesReady = true;
       if (st.messagesLoading === undefined) st.messagesLoading = false;
       if (st.runtimeUiRevision === undefined) st.runtimeUiRevision = "";
@@ -9055,6 +9068,21 @@ function portal() {
       if (end > start) height += Math.max(0, end - start - 1) * gap;
       return Math.max(0, Math.round(height));
     },
+    _historyExternalSpacerHeight(st, edge) {
+      const range = st && st.messageRange;
+      const manifest = range && range.manifest;
+      const chunks = manifest && Array.isArray(manifest.chunks) ? manifest.chunks : [];
+      if (!chunks.length || range.firstChunk < 0 || range.lastChunk < range.firstChunk) return 0;
+      if (edge === "top") {
+        const first = chunks[range.firstChunk];
+        return first ? Math.max(0, Number(first.estimated_top) || 0) : 0;
+      }
+      const last = chunks[range.lastChunk];
+      if (!last) return 0;
+      const loadedBottom = (Number(last.estimated_top) || 0)
+        + (Number(last.estimated_height) || 0);
+      return Math.max(0, (Number(manifest.estimated_height) || 0) - loadedBottom);
+    },
     _initialMessageVirtualRange(st) {
       const messages = this._visiblePaneMessages(st);
       const target = 2400;
@@ -9120,17 +9148,20 @@ function portal() {
       const pane = this._paneElement(tid);
       const gap = this._messageVirtualGap(pane);
       const rows = [];
-      const spacer = (kind, from, to) => {
-        if (to <= from) return;
+      const spacer = (kind, height, historyEdge = "") => {
+        height = Math.max(0, Math.round(Number(height) || 0));
+        if (!height) return;
         rows.push({
           key: tid + ":virtual-spacer:" + kind,
           index: -1,
           message: { role: "virtual_spacer", _k: tid + ":virtual-spacer:" + kind },
           spacer: true,
-          height: this._messageVirtualRangeHeight(st, messages, from, to, gap),
+          historyEdge,
+          height,
         });
       };
-      spacer("top", 0, start);
+      spacer("history-top", this._historyExternalSpacerHeight(st, "top"), "top");
+      spacer("top", this._messageVirtualRangeHeight(st, messages, 0, start, gap));
       for (let i = start; i < end; i++) {
         rows.push({ key: messages[i]._k, index: i, message: messages[i], spacer: false });
       }
@@ -9138,7 +9169,9 @@ function portal() {
       // normalized repository even when the reader is inspecting older rows;
       // mounting a second three-row tail was unnecessary and made `streaming=false`
       // remove those nodes exactly at completion, collapsing the scroll layout.
-      spacer("bottom", end, messages.length);
+      spacer("bottom", this._messageVirtualRangeHeight(
+        st, messages, end, messages.length, gap));
+      spacer("history-bottom", this._historyExternalSpacerHeight(st, "bottom"), "bottom");
       return rows;
     },
     _measureMessageVirtualRows(tid, st) {
@@ -9180,8 +9213,11 @@ function portal() {
         + (st._virtualScrollDirection > 0 ? directionalExtra : 0);
       const paneRect = pane.getBoundingClientRect();
       const bodyRect = body.getBoundingClientRect();
-      const wantedTop = Math.max(0, bodyRect.top - paneRect.top - topOverscan);
-      const wantedBottom = Math.max(wantedTop, bodyRect.bottom - paneRect.top + bottomOverscan);
+      const residentTop = this._historyExternalSpacerHeight(st, "top");
+      const wantedTop = Math.max(
+        0, bodyRect.top - paneRect.top - residentTop - topOverscan);
+      const wantedBottom = Math.max(
+        wantedTop, bodyRect.bottom - paneRect.top - residentTop + bottomOverscan);
       let cursor = 0;
       let start = 0;
       while (start < messages.length) {
@@ -11096,6 +11132,11 @@ function portal() {
       }
       if (makeCurrent && id !== this.currentId) {
         this._captureChatPosition(this.currentId);
+        const targetState = this._ensureTabState(id);
+        // Keep a warm long-history pane hidden until its shared scroll container
+        // has been pinned to the tail. Revealing first flashes the manifest's
+        // large top spacer as an apparently blank conversation.
+        if (targetState.messages.length) targetState.messagesReady = false;
         this.currentId = id;
         await this.switchSession();
       }
@@ -13983,9 +14024,13 @@ function portal() {
         if (paneWasWarm) {
           // Warm pane: x-show reveals the existing keyed DOM. Do not flash a
           // skeleton, rebuild directives, or rescan already-highlighted content.
-          stCur.messagesReady = true;
           this.$nextTick(() => {
-            if (this.currentId === target) this.scrollToBottom(true);
+            if (this.currentId !== target) return;
+            this.scrollToBottom(true);
+            stCur.messagesReady = true;
+            this.$nextTick(() => {
+              if (this.currentId === target) this.scrollToBottom(true);
+            });
           });
         } else {
           // Cold LRU miss: the pane is being reconstructed from normalized state.
@@ -13993,6 +14038,7 @@ function portal() {
           stCur.messagesReady = false;
           this._afterPaint(() => {
             if (this.currentId !== target) return;
+            this.scrollToBottom(true);
             stCur.messagesReady = true;
             this._afterPaint(() => {
               if (this.currentId !== target) return;
@@ -14278,7 +14324,9 @@ function portal() {
           ? Math.max(_baseInitialLoad * 5, st.messages.length,
             !st.atBottom ? this._historyReconcileWindowSize() : 0)
           : Math.max(_baseInitialLoad * 5, _quietFloor);
-        const qs = full ? "?full=1" : ("?tail=" + FETCH_TAIL);
+        const qs = full
+          ? "?full=1"
+          : (quiet ? ("?tail=" + FETCH_TAIL) : "?history_manifest=1");
         const controller = new AbortController();
         const timeout = setTimeout(
           () => controller.abort(),
@@ -14420,7 +14468,11 @@ function portal() {
           if (msgs.length - start > HARD_CAP) start = msgs.length - HARD_CAP;
           return Math.max(0, start);
         };
-        const startIdx = pickVisibleStart(all);
+        const loadedManifest = s.history_manifest
+          && Array.isArray(s.history_manifest.chunks) ? s.history_manifest : null;
+        const loadedChunkId = Number.isInteger(s.history_chunk_id)
+          ? s.history_chunk_id : -1;
+        const startIdx = loadedManifest ? 0 : pickVisibleStart(all);
         const visible = all.slice(startIdx);
         // E5: when pickVisibleStart rewound `visible` past the bottom
         // INITIAL_LOAD (agentic / tool-heavy sessions hit HARD_CAP≈90), that
@@ -14483,6 +14535,9 @@ function portal() {
           preTotal: Number.isInteger(s.pre_total) ? s.pre_total : 0,
           order: (s.history_order === "full" || full) ? "full" : "normal",
           generation: s.history_generation || "",
+          manifest: loadedManifest,
+          firstChunk: loadedChunkId,
+          lastChunk: loadedChunkId,
         });
         if (quiet) {
           this._rebaseMessageVirtualWindow(
@@ -15281,51 +15336,17 @@ function portal() {
       const epoch = ++st._historyHydrationEpoch;
       try {
         let failed = false;
-        const yieldToBrowser = async () => {
-          if (st._historyHydrationUrgent) return;
-          await new Promise(resolve => {
-            if (typeof window !== "undefined" && window.requestIdleCallback) {
-              window.requestIdleCallback(() => resolve(), { timeout: 250 });
-            } else {
-              setTimeout(resolve, 32);
-            }
-          });
-        };
-
         this._revealResidentHistory(st);
-        while (this.tabState[sid] === st && sid === this.currentId
-               && st._historyHydrationEpoch === epoch && st.messageRange.offset > 0) {
-          if (st.streaming && !st._historyHydrationUrgent) break;
+        // History transport is viewport-driven. Never walk to offset zero in the
+        // background: a 50 MB transcript must not become one giant Alpine array.
+        // Urgent scheduling means the reader is approaching the loaded top edge,
+        // so fetch exactly one adjacent cost-bounded chunk and preserve the anchor.
+        if (st._historyHydrationUrgent && st.messageRange.offset > 0 && !st.streaming) {
           const loaded = await this._fetchOlderWindow(sid);
           if (this.tabState[sid] !== st || st._historyHydrationEpoch !== epoch) return;
-          if (loaded <= 0) {
-            failed = st.messageRange.offset > 0;
-            break;
-          }
-          this._revealResidentHistory(st);
-          await yieldToBrowser();
-          st._historyHydrationUrgent = false;
+          failed = loaded <= 0 && st.messageRange.offset > 0;
+          if (loaded > 0) this._revealResidentHistory(st);
         }
-
-        // around_uuid/full-order transitions can leave canonical records on both
-        // sides of the current anchor. Fill and reveal the newer side as well so
-        // pagination never resurfaces as a user-visible mode or control.
-        while (this.tabState[sid] === st && sid === this.currentId
-               && st._historyHydrationEpoch === epoch
-               && st.messageRange.offset + st.messages.length < st.messageRange.total) {
-          if (st.streaming && !st._historyHydrationUrgent) break;
-          const loaded = await this._fetchLaterWindow(sid);
-          if (this.tabState[sid] !== st || st._historyHydrationEpoch !== epoch) return;
-          if (loaded <= 0) {
-            failed = true;
-            break;
-          }
-          st.messageRange.visibleEnd = st.messages.length;
-          this._scheduleHistoryViewport(st, "newer");
-          await yieldToBrowser();
-          st._historyHydrationUrgent = false;
-        }
-
         const missingHistory = st.messageRange.offset > 0
           || st.messageRange.offset + st.messages.length < st.messageRange.total;
         st._historyHydrationError = failed && missingHistory;
@@ -15358,16 +15379,24 @@ function portal() {
       const st = this._ensureTabState(sid);
       const range = st.messageRange;
       if (st._fetchingOlder || !(range.offset > 0)) return 0;
+      const chunks = range.manifest && Array.isArray(range.manifest.chunks)
+        ? range.manifest.chunks : null;
+      const previousChunk = chunks && range.firstChunk > 0
+        ? range.firstChunk - 1 : -1;
       const pageSize = Math.min(this.HISTORY_PAGE, range.offset);
-      const newOffset = range.offset - pageSize;
+      const newOffset = previousChunk >= 0
+        ? Number(chunks[previousChunk].start) || 0
+        : range.offset - pageSize;
       st._fetchingOlder = true;
       try {
         const generation = range.generation
           ? "&history_generation=" + encodeURIComponent(range.generation) : "";
         const order = range.order === "full" ? "&full=1" : "";
+        const windowQuery = previousChunk >= 0
+          ? ("?chunk=" + previousChunk)
+          : ("?offset=" + newOffset + "&limit=" + pageSize);
         const r = await fetch(
-          "/api/chat/sessions/" + sid + "?offset=" + newOffset + "&limit=" + pageSize
-          + order + generation,
+          "/api/chat/sessions/" + sid + windowQuery + order + generation,
           { headers: this.hdr() });
         if (r.status === 409) {
           await this._reloadHistoryTailAfterConflict(sid, st);
@@ -15381,6 +15410,21 @@ function portal() {
         range.visibleStart += win.length;
         range.visibleEnd += win.length;
         range.offset = Number.isInteger(data.offset) ? data.offset : newOffset;
+        if (previousChunk >= 0) {
+          range.firstChunk = previousChunk;
+          const residentChunks = range.lastChunk - range.firstChunk + 1;
+          if (residentChunks > 3) {
+            const dropped = chunks[range.lastChunk];
+            const dropCount = Math.min(
+              st.messages.length, Math.max(0, Number(dropped && dropped.block_count) || 0));
+            if (dropCount) {
+              st.messages.splice(st.messages.length - dropCount, dropCount);
+              range.visibleStart = Math.min(range.visibleStart, st.messages.length);
+              range.visibleEnd = Math.min(range.visibleEnd, st.messages.length);
+            }
+            range.lastChunk--;
+          }
+        }
         if (Number.isInteger(data.total)) range.total = data.total;
         if (Number.isInteger(data.pre_total)) range.preTotal = data.pre_total;
         range.generation = data.history_generation || range.generation || "";
@@ -15399,18 +15443,31 @@ function portal() {
       if (!sid) return 0;
       const st = this._ensureTabState(sid);
       const range = st.messageRange;
+      const body = sid === this.currentId ? this.$refs && this.$refs.chatBody : null;
+      const anchor = body && st.atBottom === false
+        ? this._captureViewportMessageAnchor(body, sid) : null;
       if (st._fetchingLater) return 0;
-      const start = range.offset + st.messages.length;
+      const chunks = range.manifest && Array.isArray(range.manifest.chunks)
+        ? range.manifest.chunks : null;
+      const nextChunk = chunks && range.lastChunk >= 0
+        && range.lastChunk + 1 < chunks.length ? range.lastChunk + 1 : -1;
+      const start = nextChunk >= 0
+        ? Number(chunks[nextChunk].start) || 0
+        : range.offset + st.messages.length;
       if (start >= range.total) return 0;
-      const limit = Math.min(this.HISTORY_PAGE, range.total - start);
+      const limit = nextChunk >= 0
+        ? Number(chunks[nextChunk].block_count) || 0
+        : Math.min(this.HISTORY_PAGE, range.total - start);
       st._fetchingLater = true;
       try {
         const generation = range.generation
           ? "&history_generation=" + encodeURIComponent(range.generation) : "";
         const order = range.order === "full" ? "&full=1" : "";
+        const windowQuery = nextChunk >= 0
+          ? ("?chunk=" + nextChunk)
+          : ("?offset=" + start + "&limit=" + limit);
         const r = await fetch(
-          "/api/chat/sessions/" + sid + "?offset=" + start + "&limit=" + limit
-          + order + generation,
+          "/api/chat/sessions/" + sid + windowQuery + order + generation,
           { headers: this.hdr() });
         if (r.status === 409) {
           await this._reloadHistoryTailAfterConflict(sid, st);
@@ -15421,11 +15478,37 @@ function portal() {
         if (this.tabState[sid] !== st) return 0;
         const win = this._historyEnvelopes(sid, data.messages || []);
         st.messages.push(...win);
+        range.visibleEnd = st.messages.length;
+        if (nextChunk >= 0) {
+          range.lastChunk = nextChunk;
+          const residentChunks = range.lastChunk - range.firstChunk + 1;
+          if (residentChunks > 3) {
+            const dropped = chunks[range.firstChunk];
+            const dropCount = Math.min(
+              st.messages.length, Math.max(0, Number(dropped && dropped.block_count) || 0));
+            if (dropCount) {
+              st.messages.splice(0, dropCount);
+              this._shiftMessageVirtualWindow(st, -dropCount);
+              range.visibleStart = Math.max(0, range.visibleStart - dropCount);
+              range.visibleEnd = Math.max(range.visibleStart, range.visibleEnd - dropCount);
+            }
+            range.firstChunk++;
+            range.offset = Number(chunks[range.firstChunk].start) || 0;
+          }
+        }
         if (Number.isInteger(data.total)) range.total = data.total;
         if (Number.isInteger(data.pre_total)) range.preTotal = data.pre_total;
         range.generation = data.history_generation || range.generation || "";
         range.order = data.history_order === "full" ? "full" : "normal";
         this._syncNormalizedHistory(st);
+        if (body && anchor) {
+          this.$nextTick(() => {
+            if (this.tabState[sid] === st && sid === this.currentId && st.atBottom === false) {
+              this._restoreMessageAnchor(body, anchor);
+              this._scheduleMessageViewportSync(sid);
+            }
+          });
+        }
         return win.length;
       } catch (_) {
         return 0;
@@ -26422,10 +26505,17 @@ function portal() {
         st._virtualScrollVelocity = Math.min(20000, Math.abs(delta) * 1000 / elapsed);
         st._lastVirtualScrollTop = el.scrollTop;
         st._lastVirtualScrollAt = now;
-        // Promote history transport before the reader reaches the loaded edge.
-        // Background hydration normally wins this race; the six-screen guard is
-        // the urgent path for a scrollbar drag or a very fast upward flick.
-        if (el.scrollTop < el.clientHeight * 6) {
+        // Promote one adjacent cost-bounded chunk before the reader reaches a
+        // loaded edge. Manifest aggregate heights keep this O(chunks), while the
+        // resident Alpine repository stays capped instead of hydrating to zero.
+        const pane = this._paneElement(this.currentId);
+        const topHistoryHeight = this._historyExternalSpacerHeight(st, "top");
+        const bottomHistoryHeight = this._historyExternalSpacerHeight(st, "bottom");
+        const paneTop = pane ? pane.offsetTop : 0;
+        const nearLoadedTop = st.messageRange.manifest
+          ? el.scrollTop < paneTop + topHistoryHeight + el.clientHeight * 6
+          : el.scrollTop < el.clientHeight * 6;
+        if (nearLoadedTop) {
           if (st.messageRange.visibleStart > 0 || st.messageRange.offset > 0) {
             this._scheduleTransparentHistory(st, true);
           } else if (this._preCompactReachable(st) && !st._loadingEarlier) {
@@ -26433,6 +26523,14 @@ function portal() {
             // order mapping; trigger it transparently only when the reader has
             // actually reached that edge so background work never moves them.
             this.loadEarlierMessages(st._sid);
+          }
+        }
+        if (st.messageRange.manifest && bottomHistoryHeight > 0) {
+          const loadedBottom = paneTop
+            + (Number(st.messageRange.manifest.estimated_height) || 0)
+            - bottomHistoryHeight;
+          if (el.scrollTop + el.clientHeight * 7 > loadedBottom) {
+            this._fetchLaterWindow(st._sid);
           }
         }
       }

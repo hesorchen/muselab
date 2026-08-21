@@ -256,6 +256,55 @@ def render_tool_result(
     return out
 
 
+def estimate_ui_message_height(message: dict) -> int:
+    """Estimate one rendered bubble's height without browser layout.
+
+    The estimate is intentionally coarse; measured browser heights replace it
+    after mount. Its job is to keep history chunks and unloaded spacers close
+    enough that scrollbar geometry is stable before those measurements exist.
+    """
+    role = str(message.get("role") or "")
+    text = str(message.get("text") or message.get("preview") or "")
+    if role in {"tool_use", "task", "permission_request", "ask_user_question"}:
+        base = 112
+    elif role == "tool_result":
+        base = 96
+    elif role == "thinking":
+        base = 72
+    else:
+        base = 64
+    lines = 0
+    for line in text.split("\n") or [""]:
+        lines += max(1, (len(line) + 55) // 56)
+    fences = text.count("```") // 2
+    images = len(message.get("images") or [])
+    documents = len(message.get("docs") or [])
+    height = base + lines * 23 + fences * 26 + images * 320 + documents * 72
+    return max(64, min(int(height), 8000))
+
+
+def ui_messages_metrics(messages: list[dict]) -> dict[str, Any]:
+    """Return block-level metrics used by deterministic history chunking."""
+    bubble_metrics: list[dict[str, int]] = []
+    for message in messages:
+        try:
+            serialized = json.dumps(
+                message, ensure_ascii=False, separators=(",", ":"), default=str,
+            ).encode("utf-8")
+        except (TypeError, ValueError):
+            serialized = str(message).encode("utf-8", errors="replace")
+        bubble_metrics.append({
+            "estimated_height": estimate_ui_message_height(message),
+            "serialized_bytes": len(serialized),
+        })
+    return {
+        "block_count": len(bubble_metrics),
+        "estimated_height": sum(item["estimated_height"] for item in bubble_metrics),
+        "serialized_bytes": sum(item["serialized_bytes"] for item in bubble_metrics),
+        "bubble_metrics": bubble_metrics,
+    }
+
+
 def defer_large_ui_bodies(
     messages: list[dict],
     *,
@@ -499,6 +548,16 @@ def describe_transcript_record(
     )
     compact = {msg.uuid} if entry.get("isCompactSummary") else set()
     bubbles = render_messages([msg], {}, compact)
+    # Index metrics follow the same deferred-body shape sent by history windows;
+    # otherwise one huge tool result would make transport cost look much larger
+    # than the actual response while still underestimating its visual footprint.
+    defer_large_ui_bodies(
+        bubbles,
+        inline_body_cap=HISTORY_INLINE_BODY_CAP,
+        body_preview_cap=HISTORY_BODY_PREVIEW_CAP,
+        tool_result_preview_cap=TOOL_RESULT_PREVIEW_CAP,
+    )
+    metrics = ui_messages_metrics(bubbles)
     tool_uses: list[dict] = []
     content = (entry.get("message") or {}).get("content")
     if isinstance(content, list):
@@ -520,6 +579,9 @@ def describe_transcript_record(
     )
     return {
         "bubble_count": len(bubbles),
+        "estimated_height": metrics["estimated_height"],
+        "serialized_bytes": metrics["serialized_bytes"],
+        "bubble_metrics": metrics["bubble_metrics"],
         "user_preview": outline_preview(user_text) if user_bubble is not None else "",
         "real_user_prompt": is_real_user_prompt(msg) and not notifications,
         "has_inline_images": has_inline_images,

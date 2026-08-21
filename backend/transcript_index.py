@@ -21,7 +21,7 @@ from .settings import atomic_write_text
 
 # Increment whenever persisted descriptor semantics (bubble expansion, preview,
 # tool/task metadata) change, not only when the JSON container shape changes.
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 _TRANSCRIPT_TYPES = {"user", "assistant", "progress", "system", "attachment"}
 _PREFIX_GUARD_BYTES = 1024 * 1024
 
@@ -200,6 +200,9 @@ def _append_complete_lines(
                 "is_meta": bool(entry.get("isMeta")),
                 "compact": bool(entry.get("isCompactSummary")),
                 "bubble_count": int(desc.get("bubble_count") or 0),
+                "estimated_height": int(desc.get("estimated_height") or 0),
+                "serialized_bytes": int(desc.get("serialized_bytes") or 0),
+                "bubble_metrics": desc.get("bubble_metrics") or [],
                 "user_preview": desc.get("user_preview") or "",
                 "real_user_prompt": bool(desc.get("real_user_prompt")),
                 "has_inline_images": bool(desc.get("has_inline_images")),

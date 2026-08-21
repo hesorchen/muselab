@@ -9,8 +9,14 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Callable
 
+from .chat_presentation import ui_messages_metrics
+
 
 ShapeRecords = Callable[[Path, dict, list[int], dict[str, dict]], list[dict]]
+
+CHUNK_TARGET_HEIGHT = 4800
+CHUNK_MAX_BYTES = 384 * 1024
+CHUNK_MAX_BLOCKS = 96
 
 
 def combined_generation(base: str, snapshot_generation: str) -> str:
@@ -120,6 +126,88 @@ def history_stats(
         and records[segment["record_id"]].get("real_user_prompt")
     )
     return total, canonical_turns + snapshot_turns
+
+
+def build_history_manifest(
+    index: dict | None,
+    snapshots: list[dict],
+    order: str,
+    *,
+    generation: str = "",
+) -> dict:
+    """Build a lightweight bubble-coordinate manifest for bounded UI reads.
+
+    Boundaries use estimated rendered height, serialized response bytes and UI
+    block count. Turn count is deliberately absent: one agentic turn can contain
+    hundreds of independently rendered tool/thinking/result blocks.
+    """
+    segments, _ = history_segments(index, snapshots, order)
+    records = (index or {}).get("records") or []
+    chunks: list[dict[str, int]] = []
+    cursor = 0
+    estimated_top = 0
+    current: dict[str, int] | None = None
+
+    def close_current() -> None:
+        nonlocal current, estimated_top
+        if current is None or current["block_count"] <= 0:
+            current = None
+            return
+        current["id"] = len(chunks)
+        current["end"] = current["start"] + current["block_count"]
+        current["estimated_top"] = estimated_top
+        chunks.append(current)
+        estimated_top += current["estimated_height"]
+        current = None
+
+    for segment in segments:
+        count = max(0, int(segment.get("count") or 0))
+        if not count:
+            continue
+        if segment.get("kind") == "record":
+            record_id = int(segment.get("record_id") or 0)
+            record = records[record_id] if 0 <= record_id < len(records) else {}
+            metrics = list(record.get("bubble_metrics") or [])
+            fallback_height = max(88, int(record.get("estimated_height") or 0) // count)
+            fallback_bytes = max(64, int(record.get("serialized_bytes") or 0) // count)
+        else:
+            snapshot_metrics = ui_messages_metrics(
+                list((segment.get("snapshot") or {}).get("messages") or []))
+            metrics = list(snapshot_metrics.get("bubble_metrics") or [])
+            fallback_height = 88
+            fallback_bytes = 256
+
+        for local in range(count):
+            metric = metrics[local] if local < len(metrics) else {}
+            height = max(64, int(metric.get("estimated_height") or fallback_height)) + 8
+            size = max(1, int(metric.get("serialized_bytes") or fallback_bytes))
+            would_exceed = current is not None and (
+                current["estimated_height"] + height > CHUNK_TARGET_HEIGHT
+                or current["serialized_bytes"] + size > CHUNK_MAX_BYTES
+                or current["block_count"] + 1 > CHUNK_MAX_BLOCKS
+            )
+            if would_exceed:
+                close_current()
+            if current is None:
+                current = {
+                    "start": cursor,
+                    "block_count": 0,
+                    "estimated_height": 0,
+                    "serialized_bytes": 0,
+                }
+            current["block_count"] += 1
+            current["estimated_height"] += height
+            current["serialized_bytes"] += size
+            cursor += 1
+    close_current()
+    return {
+        "version": 1,
+        "generation": generation,
+        "order": order,
+        "total_blocks": cursor,
+        "estimated_height": estimated_top,
+        "chunks": chunks,
+    }
 
 
 def history_window(
