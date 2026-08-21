@@ -64,6 +64,7 @@ from .settings import (
 from . import sessions as sess
 from . import endpoints
 from . import context_recovery
+from . import chat_history
 from . import transcript_index as transcript_idx
 from .workspaces import (
     registry as workspace_registry,
@@ -397,363 +398,111 @@ def _build_codex_skill_guard_hook():
 
 
 def _cli_project_roots() -> list[Path]:
-    """Return the directories where Claude CLI writes session JSONLs:
-
-    1. ``~/.claude/projects`` — default root used by Claude (Pro OAuth /
-       Anthropic API key).
-    2. ``${XDG_STATE_HOME:-~/.local/state}/muselab/vendor-cli/projects`` —
-       durable vendor-isolated root used when muselab routes the CLI
-       subprocess to a third-party Anthropic-compatible endpoint (DeepSeek /
-       GLM / MiniMax / Kimi / Qwen / MiMo). See ``endpoints.env_override`` for
-       the isolation rationale.
-
-    Callers reading transcripts MUST walk both. Forgetting the vendor
-    root has caused real bugs across the codebase — vendor sessions
-    silently invisible to cost dashboard, context-meter rebuild, full-
-    text search, compact marker detection, and the JSONL existence
-    check in :func:`get_client` that picks ``session_id=`` vs
-    ``resume=`` when spawning the CLI (the wrong call → CLI exits with
-    "Session ID already in use"). The single-helper pattern makes
-    forgetting impossible.
-
-    Only existing roots are returned, so callers don't need a separate
-    ``.exists()`` guard before iterating.
-    """
-    candidates = [
-        Path.home() / ".claude" / "projects",
-        endpoints._vendor_config_dir() / "projects",
-    ]
-    return [r for r in candidates if r.exists()]
+    """Compatibility wrapper for canonical Claude CLI project roots."""
+    return chat_history.cli_project_roots(endpoints._vendor_config_dir())
 
 
 def _cli_encode_cwd(path: str) -> str:
-    """Mirror Claude CLI's projects-dir encoding (e.g. ``/home/alice`` →
-    ``-home-alice``).
-
-    Delegates to the SDK's own ``project_key_for_directory()`` so the
-    encoding stays in lockstep with the CLI even if the rule changes —
-    the previous hand-rolled ``"".join(c if c.isalnum() else "-" ...)``
-    silently drifted on non-ASCII paths (it kept unicode letters via
-    ``str.isalnum`` while the CLI replaces them too: ``/home/用户`` →
-    hand-rolled ``-home-用户`` vs CLI/SDK ``-home---``), which would
-    mis-locate sessions under a unicode archive root. The cost dashboard,
-    transcript search, and tests all import this helper, so keeping the
-    name (a thin SDK delegate) keeps every call site in lockstep.
-    """
-    return project_key_for_directory(path)
+    """Compatibility wrapper for the SDK/CLI workspace encoding."""
+    return chat_history.cli_encode_cwd(
+        path, project_key_for_directory=project_key_for_directory)
 
 
-_JSONL_PATH_CACHE: dict[str, Path] = {}
-_JSONL_PATH_CACHE_MAX = 4096
+# Public compatibility aliases: callers and tests historically mutate this
+# exact object through ``backend.chat``.  The extracted implementation receives
+# it explicitly so cache identity and monkeypatch behavior remain unchanged.
+_JSONL_PATH_CACHE = chat_history.JSONL_PATH_CACHE
+_JSONL_PATH_CACHE_MAX = chat_history.JSONL_PATH_CACHE_MAX
 
 
 def _find_session_jsonl(sid: str) -> Path | None:
-    """Locate the CLI JSONL for ``sid`` across both project roots.
-
-    A session lives in exactly one root (Pro/Claude vs vendor — they're
-    mutually exclusive per session), so the first match wins. Returns
-    ``None`` when the session has no on-disk transcript yet (truly new
-    session).
-
-    Positive hits are cached (sid → Path): once a transcript exists its
-    path never moves, so repeat lookups skip the cross-root glob. Misses
-    are deliberately NOT cached — a new session's JSONL appears moments
-    after creation and must be found on the next call. A cached path that
-    has since been deleted (session removal) falls back to a fresh glob.
-    """
-    cached = _JSONL_PATH_CACHE.get(sid)
-    if cached is not None:
-        if cached.is_file():
-            return cached
-        _JSONL_PATH_CACHE.pop(sid, None)
-    for projects_root in _cli_project_roots():
-        for hit in projects_root.glob(f"*/{sid}.jsonl"):
-            if hit.is_file():
-                if len(_JSONL_PATH_CACHE) >= _JSONL_PATH_CACHE_MAX:
-                    _JSONL_PATH_CACHE.clear()
-                _JSONL_PATH_CACHE[sid] = hit
-                return hit
-    return None
+    """Compatibility wrapper for positive-cache transcript discovery."""
+    return chat_history.find_session_jsonl(
+        sid,
+        project_roots=_cli_project_roots,
+        cache=_JSONL_PATH_CACHE,
+        cache_max=_JSONL_PATH_CACHE_MAX,
+    )
 
 
 def _canonical_session_evidence_path(sid: str, workspace: Path) -> Path | None:
-    """Return the validated canonical CLI transcript path for one session.
-
-    The lookup helper is intentionally broad because history discovery supports
-    both native and vendor stores. This boundary is narrower: evidence may only
-    expose the exact ``<root>/<encoded workspace>/<sid>.jsonl`` file, resolved
-    beneath a known CLI projects root. Symlinks, stale workspace associations,
-    and non-canonical ids fail closed instead of leaking a filesystem path.
-    """
-    try:
-        canonical_sid = str(uuid.UUID(sid))
-    except (ValueError, AttributeError, TypeError):
-        return None
-    if sid != canonical_sid:
-        return None
-    candidate = _find_session_jsonl(sid)
-    if candidate is None:
-        return None
-    try:
-        resolved = candidate.resolve(strict=True)
-        roots = {root.resolve(strict=True) for root in _cli_project_roots()}
-    except OSError:
-        return None
-    if resolved.name != f"{sid}.jsonl":
-        return None
-    if resolved.parent.name != _cli_encode_cwd(str(workspace)):
-        return None
-    if resolved.parent.parent not in roots:
-        return None
-    return resolved
+    """Compatibility wrapper for validated canonical transcript evidence."""
+    return chat_history.canonical_session_evidence_path(
+        sid,
+        workspace,
+        find_session_jsonl=_find_session_jsonl,
+        project_roots=_cli_project_roots,
+        encode_cwd=_cli_encode_cwd,
+    )
 
 
 def _compact_tail_cursor(sid: str) -> tuple[Path | None, int]:
-    """Snapshot the transcript byte boundary before one native compact.
-
-    Only the newly appended tail is inspected afterwards.  This avoids both a
-    repeated multi-megabyte scan and accidentally treating an older compact or
-    API failure as the outcome of the command that just ran.
-    """
-    path = _find_session_jsonl(sid)
-    if path is None:
-        return None, 0
-    try:
-        return path, path.stat().st_size
-    except OSError:
-        return path, 0
+    """Compatibility wrapper for the pre-compact transcript cursor."""
+    return chat_history.compact_tail_cursor(
+        sid, find_session_jsonl=_find_session_jsonl)
 
 
 def _compact_tail_outcome(path: Path | None, offset: int) -> dict[str, bool]:
-    """Return privacy-safe facts from records appended by one ``/compact``.
-
-    Some CLI/Gateway combinations return a nominally successful ResultMessage
-    while writing the real context-window 400 only as a ``system``
-    ``local_command`` transcript record.  Token verification catches the
-    no-op, but without this tail check MuseLab wastes another identical retry
-    on a fresh process.  Conversely, a real compact boundary is authoritative
-    even when the control-plane usage reading is briefly stale.
-    """
-    result = {
-        "boundary": False,
-        "summary": False,
-        "context_error": False,
-    }
-    if path is None:
-        return result
-    try:
-        with path.open("rb") as handle:
-            size = handle.seek(0, os.SEEK_END)
-            handle.seek(offset if 0 <= offset <= size else 0)
-            raw = handle.read()
-    except OSError:
-        return result
-    for line in raw.splitlines():
-        if not line.strip():
-            continue
-        try:
-            entry = json.loads(line)
-        except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
-            continue
-        if not isinstance(entry, dict):
-            continue
-        if entry.get("subtype") == "compact_boundary":
-            result["boundary"] = True
-        if entry.get("isCompactSummary") is True:
-            result["summary"] = True
-        if entry.get("subtype") != "local_command":
-            continue
-        data = entry.get("data") if isinstance(entry.get("data"), dict) else {}
-        text = str(entry.get("content") or data.get("content") or "").lower()
-        if any(marker in text for marker in (
-            "context window", "context length", "input exceeds",
-            "maximum context", "prompt too long", "too many tokens",
-        )):
-            result["context_error"] = True
-    return result
+    """Compatibility wrapper for raw post-compact tail inspection."""
+    return chat_history.compact_tail_outcome(path, offset)
 
 
 @contextmanager
 def _session_config_dir(model: str = ""):
-    """Serialize SDK session-store calls and select the matching CLI root.
-
-    Claude Agent SDK session helpers consult the process-global
-    ``CLAUDE_CONFIG_DIR`` instead of accepting it as an argument. Vendor
-    sessions therefore need a temporary override, while native Claude calls
-    must wait for that override to be restored. Keep the mutation behind one
-    context manager so reads, forks, and future SDK session operations cannot
-    drift onto different roots.
-    """
-    with _vendor_msg_lock:
-        old = os.environ.get("CLAUDE_CONFIG_DIR")
-        try:
-            if model and endpoints.is_third_party(model):
-                os.environ["CLAUDE_CONFIG_DIR"] = str(endpoints._vendor_config_dir())
-            yield
-        finally:
-            if old is not None:
-                os.environ["CLAUDE_CONFIG_DIR"] = old
-            else:
-                os.environ.pop("CLAUDE_CONFIG_DIR", None)
+    """Compatibility wrapper for the SDK's process-global config directory."""
+    with chat_history.session_config_dir(
+        model,
+        lock=_vendor_msg_lock,
+        is_third_party=endpoints.is_third_party,
+        vendor_config_dir=endpoints._vendor_config_dir,
+    ):
+        yield
 
 
 def _get_session_msgs(sid: str, model: str = "") -> list:
-    """Read SDK messages from the native or vendor-isolated session store."""
-    with _session_config_dir(model):
-        return get_session_messages(
-            sid, directory=str(sess.session_workspace(sid)))
+    """Compatibility wrapper retaining the patchable SDK message loader."""
+    return chat_history.get_session_msgs(
+        sid,
+        model,
+        config_dir=_session_config_dir,
+        loader=get_session_messages,
+        workspace=sess.session_workspace,
+    )
 
 
 def _transcript_ts_ms(entry: dict) -> int | None:
-    """Epoch-ms of a raw transcript entry's ``timestamp`` (ISO-8601, UTC).
-
-    Every CLI JSONL record carries one; the SDK's SessionMessage does not
-    expose it, which is why per-message times were unavailable to the UI even
-    though the data was on disk the whole time. Returns None for missing or
-    unparseable values — a message with no time simply doesn't show one."""
-    raw = entry.get("timestamp") or ""
-    if not raw:
-        return None
-    try:
-        import datetime as _dt
-        return int(_dt.datetime.fromisoformat(
-            str(raw).replace("Z", "+00:00")).timestamp() * 1000)
-    except (ValueError, TypeError, OverflowError):
-        return None
+    """Compatibility wrapper for raw transcript timestamps."""
+    return chat_history.transcript_ts_ms(entry)
 
 
-class _RawMsg:
-    """Minimal stand-in for the SDK's SessionMessage, exposing just the
-    .uuid / .type / .message surface that _sdk_messages_to_ui consumes. Lets
-    the full-history reader reuse the exact same UI-shaping logic as the
-    normal path, so the two views can't drift.
-
-    `mts` is the extra field the real SessionMessage lacks — see
-    _transcript_ts_ms. Optional so existing construction sites keep working."""
-    __slots__ = ("uuid", "type", "message", "mts")
-
-    def __init__(self, uuid: str, type_: str, message: dict,
-                 mts: int | None = None):
-        self.uuid = uuid
-        self.type = type_
-        self.message = message
-        self.mts = mts
+_RawMsg = chat_history.RawMsg
 
 
 def _full_session_msgs(sid: str) -> list:
-    """Like _get_session_msgs but WITHOUT the SDK's compact-boundary cutoff.
-
-    The SDK's get_session_messages() starts emitting AT the compact summary
-    (it mirrors the post-compaction context the model actually sees), so a
-    compacted session loses its PRE-compact user prompts entirely. To let the
-    outline list — and let the user JUMP to — those earlier prompts, we parse
-    the raw CLI JSONL ourselves and return EVERY user/assistant entry in file
-    (chronological) order.
-
-    Why file order and NOT a parentUuid walk: compaction writes a *fresh root*
-    — the compact summary's parent is a `system` entry whose parentUuid is
-    None, so the pre-compact prompts live on a genuinely disconnected branch
-    that no walk from the active leaf can reach. The CLI appends to the JSONL
-    strictly in time order, and forks copy history into a SEPARATE file with
-    new UUIDs (so a single JSONL is linear), which makes file order a safe,
-    complete basis for reconstructing the whole conversation.
-
-    Returns _RawMsg objects, so _sdk_messages_to_ui shapes them identically
-    to the normal path — no separate reconstruction logic to keep in sync.
-    Reads the file directly via _find_session_jsonl (which already covers the
-    vendor-isolated root), so no CLAUDE_CONFIG_DIR juggling is needed."""
-    jsonl_path = _find_session_jsonl(sid)
-    if jsonl_path is None:
-        return []
-    out: list[_RawMsg] = []
-    seen: set[str] = set()         # dedup by uuid (defensive; should be unique)
-    try:
-        with jsonl_path.open("r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    e = json.loads(line)
-                except (json.JSONDecodeError, ValueError):
-                    continue
-                if e.get("type") not in ("user", "assistant"):
-                    continue
-                u = e.get("uuid")
-                if not u or u in seen:
-                    continue
-                seen.add(u)
-                out.append(_RawMsg(u, e.get("type"), e.get("message") or {},
-                                   _transcript_ts_ms(e)))
-    except Exception:
-        return []
-    return out
+    """Compatibility wrapper for canonical full-file transcript reads."""
+    return chat_history.full_session_msgs(
+        sid,
+        find_session_jsonl=_find_session_jsonl,
+        raw_msg_type=_RawMsg,
+        timestamp_ms=_transcript_ts_ms,
+    )
 
 
 def _read_tail_lines(path: Path, n: int, block: int = 65536) -> list[str]:
-    """Return the last ~n non-empty lines of a file, reading from the end so
-    cost is O(tail) instead of O(file). Used to find the just-appended turn's
-    UUIDs without parsing a multi-thousand-line transcript."""
-    with path.open("rb") as f:
-        f.seek(0, os.SEEK_END)
-        pos = f.tell()
-        data = b""
-        # Read backwards a block at a time until we've captured > n newlines
-        # (or hit the start of the file).
-        while pos > 0 and data.count(b"\n") <= n:
-            read = min(block, pos)
-            pos -= read
-            f.seek(pos)
-            data = f.read(read) + data
-        lines = data.split(b"\n")
-        return [ln.decode("utf-8", "replace")
-                for ln in lines[-n:] if ln.strip()]
+    """Compatibility wrapper for bounded raw tail reads."""
+    return chat_history.read_tail_lines(path, n, block)
 
 
 def _recent_turn_uuids(sid: str, want_image_user: bool,
                        tail_lines: int = 400) -> tuple[str | None, str | None]:
-    """Find the most recent assistant UUID and most recent user UUID by
-    reading only the TAIL of the JSONL (the turn that just finished is at the
-    very end). Replaces a full _get_session_msgs() parse whose sole purpose
-    was to grab these two UUIDs for sidecar annotation. Returns (None, None)
-    on any failure so the caller can fall back to the full parse.
-
-    want_image_user: when the turn carried image attachments, match the last
-    user entry that actually contains an image block (not just any last user
-    msg) — mirrors the full-parse path's image-matching guard."""
-    path = _find_session_jsonl(sid)
-    if path is None:
-        return (None, None)
-    try:
-        lines = _read_tail_lines(path, tail_lines)
-    except Exception:
-        return (None, None)
-    asst_uuid: str | None = None
-    user_uuid: str | None = None
-    for line in reversed(lines):
-        try:
-            e = json.loads(line)
-        except (json.JSONDecodeError, ValueError):
-            continue
-        t = e.get("type")
-        u = e.get("uuid")
-        if not u:
-            continue
-        if t == "assistant" and asst_uuid is None:
-            asst_uuid = u
-        elif t == "user" and user_uuid is None:
-            if want_image_user:
-                content = (e.get("message") or {}).get("content") or []
-                has_img = isinstance(content, list) and any(
-                    isinstance(b, dict) and b.get("type") == "image"
-                    for b in content)
-                if has_img:
-                    user_uuid = u
-            else:
-                user_uuid = u
-        if asst_uuid and user_uuid:
-            break
-    return (asst_uuid, user_uuid)
+    """Compatibility wrapper for recent canonical turn UUID discovery."""
+    return chat_history.recent_turn_uuids(
+        sid,
+        want_image_user,
+        tail_lines,
+        find_session_jsonl=_find_session_jsonl,
+        tail_reader=_read_tail_lines,
+    )
 
 
 router = APIRouter(prefix="/api/chat", tags=["chat"])
@@ -6197,14 +5946,9 @@ _UI_MSGS_CACHE_MAX = 8
 
 
 def _jsonl_signature(sid: str) -> tuple[float, int] | None:
-    path = _find_session_jsonl(sid)
-    if path is None:
-        return None
-    try:
-        st = path.stat()
-        return (st.st_mtime, st.st_size)
-    except OSError:
-        return None
+    """Compatibility wrapper for canonical transcript freshness."""
+    return chat_history.jsonl_signature(
+        sid, find_session_jsonl=_find_session_jsonl)
 
 
 def _shaped_ui_messages(sid: str, model: str, full: bool) -> list[dict]:

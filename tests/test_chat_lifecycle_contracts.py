@@ -86,6 +86,42 @@ def test_chat_lifecycle_routes_keep_response_shapes(
     assert deleted.json() == {"ok": True}
 
 
+def test_chat_history_wrappers_keep_patchable_facade_and_shared_cache(
+    app_module, monkeypatch, tmp_path,
+):
+    from backend import chat as chat_mod
+    from backend import chat_history
+
+    assert chat_mod._JSONL_PATH_CACHE is chat_history.JSONL_PATH_CACHE
+
+    projects = tmp_path / "projects"
+    first = projects / "-workspace" / "first.jsonl"
+    second = projects / "-workspace" / "second.jsonl"
+    first.parent.mkdir(parents=True)
+    first.write_text("{}\n", encoding="utf-8")
+    second.write_text("{}\n", encoding="utf-8")
+    monkeypatch.setattr(chat_mod, "_cli_project_roots", lambda: [projects])
+    monkeypatch.setattr(chat_mod, "_JSONL_PATH_CACHE_MAX", 1)
+    chat_mod._JSONL_PATH_CACHE.clear()
+
+    assert chat_mod._find_session_jsonl("first") == first
+    assert chat_mod._find_session_jsonl("second") == second
+    assert chat_mod._JSONL_PATH_CACHE == {"second": second}
+
+    calls = []
+
+    def load_messages(sid, *, directory):
+        calls.append((sid, directory))
+        return ["loaded"]
+
+    monkeypatch.setattr(chat_mod, "get_session_messages", load_messages)
+    monkeypatch.setattr(
+        chat_mod.sess, "session_workspace", lambda _sid: tmp_path / "workspace")
+    assert chat_mod._get_session_msgs("sdk-session") == ["loaded"]
+    assert calls == [("sdk-session", str(tmp_path / "workspace"))]
+    chat_mod._JSONL_PATH_CACHE.clear()
+
+
 def test_history_endpoint_uses_cli_jsonl_and_applies_overlay_only_for_presentation(
     app_module, client, auth, monkeypatch, tmp_path,
 ):
