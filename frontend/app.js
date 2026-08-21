@@ -8978,6 +8978,13 @@ function portal() {
       if (!range) return st.messages;
       return st.messages.slice(range.visibleStart, range.visibleEnd);
     },
+    _containsPaneMessage(st, message) {
+      // Streaming ownership must be checked against the authoritative resident
+      // repository, not only the currently revealed/virtualized slice. The old
+      // three-array adapter supplied this helper implicitly; removing it without
+      // this direct replacement made every text event throw before auto-follow.
+      return !!(st && Array.isArray(st.messages) && st.messages.includes(message));
+    },
     paneMessages(tid) {
       // The repository remains authoritative; this is only its revealed slice.
       if (!tid) return [];

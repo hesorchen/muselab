@@ -2598,6 +2598,10 @@ def test_active_stream_owns_messages_and_continuation_reconciles_canonical_histo
     assert "this.tabState[sid] !== st || st.streaming || st.es" in reveal
     assert "const ownsCurBubble = () =>" in send
     assert "this._containsPaneMessage(streamState, curBubble)" in send
+    contains_start = app.index("_containsPaneMessage(st, message)")
+    contains = app[contains_start:app.index("paneMessages(tid)", contains_start)]
+    assert "Array.isArray(st.messages)" in contains
+    assert "st.messages.includes(message)" in contains
     assert "const surfaceTerminalError = detail =>" in send
     assert "surfaceTerminalError(_detail)" in send
     assert "surfaceTerminalError(serverError)" in send
