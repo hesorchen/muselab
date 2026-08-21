@@ -2455,6 +2455,32 @@ def test_history_keys_prefer_backend_block_identity_without_local_dup_suffixes()
     assert "const seen = new Map()" not in history_keys
 
 
+def test_history_store_normalizes_canonical_blocks_and_prunes_session_windows():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    start = app.index("    _historyStoreKey(sid, m) {")
+    end = app.index("    _messageContinuitySignatures(m) {", start)
+    store = app[start:end]
+    dispose_start = app.index("    _disposeTabRuntime(id) {")
+    dispose_end = app.index("    _startWorkspaceDrag", dispose_start)
+    dispose = app[dispose_start:dispose_end]
+    cap_start = app.index("    _capHistoryCache(st, direction = \"newer\") {")
+    cap_end = app.index("    _captureMessageAnchor", cap_start)
+    cap = app[cap_start:cap_end]
+
+    assert "_messagesById: new Map()" in app
+    assert "_sessionWindows: new Map()" in app
+    assert "sessionKeys.add(storeKey)" in store
+    assert "this._messagesById.get(storeKey)" in store
+    assert "this._messagesById.set(storeKey, created)" in store
+    assert "Object.assign(existing, m" in store
+    assert 'existing.body_state === "loaded"' in store
+    assert 'm.body_state === "unloaded"' in store
+    assert "this._sessionWindows.set(sid, retained)" in store
+    assert "this._messagesById.delete(storeKey)" in store
+    assert "this._dropSessionMessageStore(id)" in dispose
+    assert "this._syncSessionMessageStore(st)" in cap
+
+
 def test_large_history_bodies_load_by_stable_block_reference():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
     html = (FRONTEND / "index.html").read_text(encoding="utf-8")

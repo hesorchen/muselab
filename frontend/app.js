@@ -570,6 +570,10 @@ function portal() {
 
     // ===== chat =====
     sessions: [], currentId: "",
+    // Canonical history is normalized by stable block identity. Arrays inside
+    // each tab are only ordered window views; all views reuse the same object.
+    _messagesById: new Map(),
+    _sessionWindows: new Map(),
     // True while loadSession(currentId) is in flight. UI uses this to swap
     // the brand-empty placeholder for a shimmer skeleton, so users don't
     // see "Muse · Calliope / empty chat" for the second a big session
@@ -10768,6 +10772,7 @@ function portal() {
       if (this._sessionLoadPromises) delete this._sessionLoadPromises[id];
       if (this._prefetching) delete this._prefetching[id];
       if (this.tabState[id] === st) delete this.tabState[id];
+      this._dropSessionMessageStore(id);
       this._residentTabIds = (this._residentTabIds || []).filter(x => x !== id);
       this._residentTabLru = (this._residentTabLru || []).filter(x => x !== id);
       this._clearSessionWarnFlags(id);
@@ -14461,6 +14466,7 @@ function portal() {
         // visible slice exceeds the DOM cap, retain its tail so the actual
         // latest reply remains mounted.
         this._capMountedWindow(st, "newer");
+        this._syncSessionMessageStore(st);
         this._recordPaneRenderKeyShape(st);
         // More history exists if either the in-memory stash has older
         // bubbles OR the server holds bubbles before our window.
@@ -14824,11 +14830,66 @@ function portal() {
         m && (m.text || m.preview || m.summary || "")].join("");
       return sid + ":hist:" + this._stableHash(identity);
     },
+    _historyStoreKey(sid, m) {
+      return m && m.block_id ? sid + ":" + m.block_id : "";
+    },
     _historyEnvelopes(sid, list) {
-      return (list || []).map(m => ({
-        ...m,
-        _k: this._historyMessageKey(sid, m),
-      }));
+      return (list || []).map(m => {
+        const renderKey = this._historyMessageKey(sid, m);
+        const storeKey = this._historyStoreKey(sid, m);
+        if (!storeKey) return { ...m, _k: renderKey };
+        const sessionKeys = this._sessionWindows.get(sid) || new Set();
+        sessionKeys.add(storeKey);
+        this._sessionWindows.set(sid, sessionKeys);
+        const existing = this._messagesById.get(storeKey);
+        if (!existing) {
+          const created = { ...m, _k: renderKey };
+          this._messagesById.set(storeKey, created);
+          return created;
+        }
+        // A quiet reload returns transport previews again. Never replace a body
+        // the user already loaded from the canonical block endpoint with that
+        // unloaded preview; block_id identifies immutable transcript content.
+        const loadedBody = existing.body_state === "loaded"
+          && m.body_state === "unloaded"
+          ? {
+              text: existing.text,
+              preview: existing.preview,
+              html: existing.html,
+              bash: existing.bash,
+              body_state: "loaded",
+              body_available: existing.body_available,
+              body_length: existing.body_length,
+              body_ref: existing.body_ref,
+            }
+          : null;
+        Object.assign(existing, m, { _k: renderKey });
+        if (loadedBody) Object.assign(existing, loadedBody);
+        return existing;
+      });
+    },
+    _syncSessionMessageStore(st) {
+      const sid = st && st._sid;
+      if (!sid) return;
+      const retained = new Set();
+      for (const message of this._allPaneMessages(st)) {
+        const storeKey = this._historyStoreKey(sid, message);
+        if (!storeKey) continue;
+        retained.add(storeKey);
+        // Live → canonical reconciliation may deliberately retain the live
+        // object. Make that adopted object the normalized canonical instance.
+        this._messagesById.set(storeKey, message);
+      }
+      const previous = this._sessionWindows.get(sid) || new Set();
+      for (const storeKey of previous) {
+        if (!retained.has(storeKey)) this._messagesById.delete(storeKey);
+      }
+      this._sessionWindows.set(sid, retained);
+    },
+    _dropSessionMessageStore(sid) {
+      const keys = this._sessionWindows.get(sid) || new Set();
+      for (const storeKey of keys) this._messagesById.delete(storeKey);
+      this._sessionWindows.delete(sid);
     },
     _messageContinuitySignatures(m) {
       if (!m) return [];
@@ -15132,6 +15193,7 @@ function portal() {
         this._releasePaneMessageRenderKeys(
           st, dropped.filter(message => !retained.has(message)));
       }
+      this._syncSessionMessageStore(st);
       return new Set(dropped);
     },
     _captureMessageAnchor(scrollEl, m) {
