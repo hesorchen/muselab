@@ -293,6 +293,8 @@ def test_deferred_history_bodies_load_without_manual_body_action(
             _is_compact_summary: true,
           }),
         ];
+        st.messageRange.visibleEnd = st.messages.length;
+        st.messageRange.total = st.messages.length;
         app._expandedMsgs = {};
         app._activateTabState(arg);
         app.messagesReady = true;
@@ -1253,6 +1255,8 @@ def test_chat_bubble_selection_quotes_as_attachment_and_asks_in_side_session(
             uuid: "selection-assistant", _k: "selection-assistant", _noAnim: true,
           },
         ];
+        st.messageRange.visibleEnd = st.messages.length;
+        st.messageRange.total = st.messages.length;
         st.draft.input = "EXISTING_DRAFT";
         st.draft.pendingImages = [{
           id: "keep-image", uploading: false,
@@ -1458,6 +1462,8 @@ def test_chat_wheel_preserves_selection_across_messages(
             _noAnim: true,
           },
         ];
+        st.messageRange.visibleEnd = st.messages.length;
+        st.messageRange.total = st.messages.length;
         app._activateTabState(arg);
         app.mobileTab = "chat";
         return true;
@@ -2304,6 +2310,8 @@ def test_mobile_completed_turn_can_fork_from_that_point(
             _k: arg.boundary, _noAnim: true,
           },
         ];
+        st.messageRange.visibleEnd = st.messages.length;
+        st.messageRange.total = st.messages.length;
         app._activateTabState(arg.sid);
         app.openTab = async id => {
           if (!app.openTabIds.includes(id)) app.openTabIds.push(id);
@@ -2381,6 +2389,8 @@ def test_mobile_long_history_switching_does_not_blank(page: Page, backend_url, a
               _noAnim: true,
             });
           }
+          st.messageRange.visibleEnd = st.messages.length;
+          st.messageRange.total = st.messages.length;
           app.tabState[id] = st;
           app._ensureTabState(id);
           app._scheduleLiveMessageViewport(st);
@@ -2495,6 +2505,8 @@ def test_desktop_session_switch_remounts_one_pane_and_keeps_composer_stable(
           const st = app._blankTabState();
           st._loaded = true;
           st.messages = app._historyEnvelopes(id, arg.messages[id]);
+          st.messageRange.visibleEnd = st.messages.length;
+          st.messageRange.total = st.messages.length;
           st.messagesReady = true;
           st.messagesLoading = false;
           st.atBottom = true;
@@ -2595,10 +2607,11 @@ def test_mobile_windowed_load_session_pages_older_history(page: Page, backend_ur
         const st = app._ensureTabState(arg);
         return {
           messages: st.messages.length,
-          earlier: st._earlierMessages.length,
-          later: st._laterMessages.length,
-          loadedOffset: st._loadedOffset,
-          total: st._total,
+          visible: st.messageRange.visibleEnd - st.messageRange.visibleStart,
+          earlier: st.messageRange.visibleStart,
+          later: st.messages.length - st.messageRange.visibleEnd,
+          loadedOffset: st.messageRange.offset,
+          total: st.messageRange.total,
           hasMore: st._hasMoreHistory,
           paneCount: document.querySelectorAll(".msg-pane").length,
           ready: app.messagesReady,
@@ -2608,7 +2621,8 @@ def test_mobile_windowed_load_session_pages_older_history(page: Page, backend_ur
         sid,
     )
     assert requests and requests[0]["tail"] == 75
-    assert state["messages"] <= 60
+    assert state["messages"] == 75
+    assert state["visible"] <= 60
     assert state["loadedOffset"] == 105
     assert state["total"] == 180
     assert state["hasMore"] is True
@@ -2654,13 +2668,14 @@ def test_mobile_windowed_load_session_pages_older_history(page: Page, backend_ur
         const st = app._ensureTabState(arg);
         return {
           messages: st.messages.length,
-          earlier: st._earlierMessages.length,
-          later: st._laterMessages.length,
-          loadedOffset: st._loadedOffset,
-          total: st._total,
+          visible: st.messageRange.visibleEnd - st.messageRange.visibleStart,
+          earlier: st.messageRange.visibleStart,
+          later: st.messages.length - st.messageRange.visibleEnd,
+          loadedOffset: st.messageRange.offset,
+          total: st.messageRange.total,
           hasMore: st._hasMoreHistory,
           hasServerLater: st._hasServerLater,
-          cached: st.messages.length + st._earlierMessages.length + st._laterMessages.length,
+          cached: st.messages.length,
           ready: app.messagesReady,
           visibleText: Array.from(document.querySelectorAll(".msg-pane"))
             .filter(p => getComputedStyle(p).display !== "none")
@@ -2687,7 +2702,8 @@ def test_mobile_windowed_load_session_pages_older_history(page: Page, backend_ur
         const st = app._ensureTabState(arg);
         return {
           latestInMessages: st.messages.some(m => (m.text || "").includes("WINDOW_MSG_179")),
-          latestInLater: st._laterMessages.some(m => (m.text || "").includes("WINDOW_MSG_179")),
+          latestInLater: st.messages.slice(st.messageRange.visibleEnd)
+            .some(m => (m.text || "").includes("WINDOW_MSG_179")),
           latestInDom: document.querySelector(".chat-body")?.textContent.includes("WINDOW_MSG_179"),
           hasServerLater: st._hasServerLater,
           ready: st.messagesReady,
@@ -2709,7 +2725,12 @@ def test_mobile_windowed_load_session_pages_older_history(page: Page, backend_ur
           .some(p => p.textContent.includes('WINDOW_MSG_179'))""",
         timeout=5000,
     )
-    assert _app_eval(page, "return app._ensureTabState(arg)._laterMessages.length;", sid) == 0
+    assert _app_eval(
+        page,
+        """const st = app._ensureTabState(arg);
+        return st.messages.length - st.messageRange.visibleEnd;""",
+        sid,
+    ) == 0
     assert page.locator(".msg-pane").count() <= 1
     assert page.locator(".msg-pane:visible .msg").count() <= 60
 
@@ -2740,7 +2761,7 @@ def test_history_pagination_keeps_stable_cross_page_keys_without_remounting(
     # the real offset/limit history fetch and prepend a page across the boundary.
     for _ in range(20):
         local_earlier = _app_eval(
-            page, "return app._ensureTabState(arg)._earlierMessages.length;", sid
+            page, "return app._ensureTabState(arg).messageRange.visibleStart;", sid
         )
         if local_earlier == 0:
             break
@@ -2756,7 +2777,7 @@ def test_history_pagination_keeps_stable_cross_page_keys_without_remounting(
         return {
           found: !!mounted,
           key: mounted?._k || "",
-          loadedOffset: st._loadedOffset,
+          loadedOffset: st.messageRange.offset,
         };
         """,
         sid,
@@ -2769,7 +2790,7 @@ def test_history_pagination_keeps_stable_cross_page_keys_without_remounting(
         page,
         """
         const st = app._ensureTabState(arg);
-        const all = app._allPaneMessages(st);
+        const all = st.messages;
         const mounted = all.find(m => m.uuid === "CROSS_PAGE_KEY-tr-110");
         const olderUser = all.find(m => m.uuid === "CROSS_PAGE_KEY-u-104");
         const olderAssistant = all.find(m => m.uuid === "CROSS_PAGE_KEY-a-101");
@@ -2881,7 +2902,7 @@ def test_outline_around_conflict_retries_and_returns_to_real_tail(
         page,
         """
         const st = app._ensureTabState(arg);
-        st.historyGeneration = "gen-old";
+        st.messageRange.generation = "gen-old";
         st._loaded = true;
         st.messagesReady = true;
         return true;
@@ -2911,10 +2932,13 @@ def test_outline_around_conflict_retries_and_returns_to_real_tail(
         const st = app._ensureTabState(arg);
         return {
           mounted: st.messages.length,
-          earlier: st._earlierMessages.length,
-          later: st._laterMessages.length,
+          earlier: st.messageRange.visibleStart,
+          later: st.messages.length - st.messageRange.visibleEnd,
           targetMounted: st.messages.some(m => m.uuid === "around-target"),
-          order: st._historyOrder,
+          order: st.messageRange.order,
+          offset: st.messageRange.offset,
+          total: st.messageRange.total,
+          generation: st.messageRange.generation,
           hasServerLater: st._hasServerLater,
         };
         """,
@@ -2922,7 +2946,12 @@ def test_outline_around_conflict_retries_and_returns_to_real_tail(
     )
     assert around_state["mounted"] == len(around_messages)
     assert around_state["targetMounted"] is True
+    assert around_state["earlier"] == 0
+    assert around_state["later"] == 0
     assert around_state["order"] == "full"
+    assert around_state["offset"] == 200
+    assert around_state["total"] == 500
+    assert around_state["generation"] == "gen-new"
     assert around_state["hasServerLater"] is True
     assert len([call for call in calls if "around_uuid" in call]) == 2
     assert len([call for call in calls if "tail" in call]) == 1
@@ -2933,7 +2962,7 @@ def test_outline_around_conflict_retries_and_returns_to_real_tail(
         """() => {
           const app = document.querySelector('#app')._x_dataStack[0];
           const st = app._ensureTabState(app.currentId);
-          return st._historyOrder === 'normal' && !st._hasServerLater
+          return st.messageRange.order === 'normal' && !st._hasServerLater
             && st.messages.some(m => (m.text || '').includes('CANONICAL_LATEST_VISIBLE'));
         }""",
         timeout=10000,
@@ -2964,10 +2993,15 @@ def test_viewport_virtualization_keeps_history_and_scroll_anchor(
         });
         st.messages.splice(0, st.messages.length,
           ...Array.from({ length: 600 }, (_, i) => make(i)));
-        st._earlierMessages = [];
-        st._laterMessages = [];
-        st._loadedOffset = 0;
-        st._total = 600;
+        Object.assign(st.messageRange, {
+          visibleStart: 0,
+          visibleEnd: 600,
+          offset: 0,
+          total: 600,
+          preTotal: 0,
+          order: "normal",
+          generation: "",
+        });
         st._hasServerLater = false;
         st.messagesReady = true;
         st.messagesLoading = false;
@@ -2994,7 +3028,7 @@ def test_viewport_virtualization_keeps_history_and_scroll_anchor(
         """
         const st = app._ensureTabState(arg);
         const pane = document.querySelector('.msg-pane:visible');
-        return { canonical: st.messages.length, normalized: app._allPaneMessages(st).length,
+        return { canonical: st.messages.length, normalized: st.messages.length,
           mounted: pane.querySelectorAll('.msg').length,
           spacers: pane.querySelectorAll('.msg-virtual-spacer').length };
         """,
@@ -3727,6 +3761,8 @@ def test_fast_completed_queued_turn_reconciles_footer_without_refresh(
           uuid: 'prior-visible-assistant', ts: Date.now() - 10000,
           elapsed: 2, model: 'e2e-model', turn_status: 'completed',
         }]));
+        st.messageRange.visibleEnd = st.messages.length;
+        st.messageRange.total = st.messages.length;
         st._loaded = true;
         st._seenUpdated = 1;
         st._draining = true;
@@ -4198,6 +4234,8 @@ def test_stable_message_identity_needs_no_repair_telemetry(
           const first = app._historyEnvelopes(sid, payload);
           const second = app._historyEnvelopes(sid, payload.map(message => ({...message})));
           st.messages.push(...first);
+          st.messageRange.visibleEnd = st.messages.length;
+          st.messageRange.total = st.messages.length;
           app.currentId = sid;
           app._activateTabState(sid);
           app.messagesReady = true;
@@ -4209,11 +4247,18 @@ def test_stable_message_identity_needs_no_repair_telemetry(
           const live = Array.from({length: 25}, (_, i) => app._appendLiveMessage(st, {
             role: "thinking", text: `live ${i}`,
           }));
+          const followedEnd = st.messageRange.visibleEnd;
+          st.messageRange.visibleEnd = 3;
+          app._appendLiveMessage(st, {role: "thinking", text: "hidden live"});
+          const hiddenEnd = st.messageRange.visibleEnd;
           return {
             keys: first.map(message => message._k),
             sameObjects: first.every((message, i) => Alpine.raw(second[i]) === Alpine.raw(message)),
             domKeys,
             liveKeys: live.map(message => message._k),
+            followedEnd,
+            hiddenEnd,
+            repositoryLength: st.messages.length,
             normalizedCount: app._sessionWindows.get(sid)?.size || 0,
             paneCount: document.querySelectorAll(".msg-pane").length,
             telemetryBuffer: typeof window.__museTelemetry__,
@@ -4231,6 +4276,9 @@ def test_stable_message_identity_needs_no_repair_telemetry(
     assert result["domKeys"] == result["keys"]
     assert len(result["liveKeys"]) == len(set(result["liveKeys"])) == 25
     assert all(":live:" in key for key in result["liveKeys"])
+    assert result["followedEnd"] == 28
+    assert result["repositoryLength"] == 29
+    assert result["hiddenEnd"] == 3
     assert result["normalizedCount"] == 3
     assert result["paneCount"] == 1
     assert result["telemetryBuffer"] == "undefined"
@@ -4309,12 +4357,16 @@ def test_canonical_reload_stays_quiet_when_background_tab_becomes_current(
           role: "assistant", text: "OTHER_VISIBLE",
           html: "<p>OTHER_VISIBLE</p>", _k: `${other}:existing`, _noAnim: true,
         });
+        otherState.messageRange.visibleEnd = otherState.messages.length;
+        otherState.messageRange.total = otherState.messages.length;
         const targetState = app._ensureTabState(target);
         targetState._loaded = true;
         targetState.messages.push({
           role: "assistant", text: arg.finalText,
           html: `<p>${arg.finalText}</p>`, _k: `${target}:live:1`,
         });
+        targetState.messageRange.visibleEnd = targetState.messages.length;
+        targetState.messageRange.total = targetState.messages.length;
         targetState.messagesReady = true;
         targetState.messagesLoading = false;
         app.currentId = other;
@@ -4409,6 +4461,8 @@ def test_mobile_turn_footer_keeps_complete_metadata_inside_chat(
             model: 'codex:a-very-long-model-name-for-footer',
             turn_status: 'completed',
           }]));
+          st.messageRange.visibleEnd = st.messages.length;
+          st.messageRange.total = st.messages.length;
           st._loaded = true;
           st.messagesReady = true;
           st.streaming = false;
@@ -4776,6 +4830,8 @@ def test_inherited_projection_unread_requires_new_runtime_event(
                   _k: `${sid}:idx:${spec.name}`,
                   _noAnim: true,
                 });
+                spec.st.messageRange.visibleEnd = spec.st.messages.length;
+                spec.st.messageRange.total = spec.st.messages.length;
               }
               spec.st.runtimeUiRevision = spec.desired;
               return true;
@@ -4798,6 +4854,8 @@ def test_inherited_projection_unread_requires_new_runtime_event(
                 _k: `${child}:idx:runtime-existing-${item.name}`,
                 _noAnim: true,
               });
+              st.messageRange.visibleEnd = st.messages.length;
+              st.messageRange.total = st.messages.length;
               app.tabState[child] = st;
               specs.set(child, { ...item, st, loads: 0 });
               app.currentId = item.current ? child : "different-visible-tab";
@@ -4974,6 +5032,8 @@ def test_background_completion_no_active_fallback_never_blanks_visible_messages(
             _k: `${sid}:live:3`, _noAnim: true,
           },
         );
+        st.messageRange.visibleEnd = st.messages.length;
+        st.messageRange.total = st.messages.length;
         app.currentId = sid;
         app.mobileTab = "chat";
         app._activateTabState(sid);
@@ -5123,6 +5183,8 @@ def test_incomplete_background_continuation_keeps_user_queue_runnable(
           uuid: "continuation-queue-assistant",
           _k: "continuation-queue-assistant", _noAnim: true,
         }];
+        st.messageRange.visibleEnd = st.messages.length;
+        st.messageRange.total = st.messages.length;
         st.pendingQueue = [{
           id: "queued-user-followup", text: "USER FOLLOWUP",
           pendingImages: [], pendingDocs: [],
@@ -5759,7 +5821,7 @@ def test_120kb_mixed_sse_stream_renders_final_assistant_html(
           mounted: Array.from(document.querySelectorAll('.msg-pane'))
             .filter(p => getComputedStyle(p).display !== 'none')
             .reduce((n, p) => n + p.querySelectorAll('.msg').length, 0),
-          cached: st.messages.length + st._earlierMessages.length + st._laterMessages.length,
+          cached: st.messages.length,
         };
         """,
     )

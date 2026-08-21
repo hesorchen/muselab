@@ -578,8 +578,9 @@ def test_chat_arrow_keys_walk_user_input_history_and_restore_draft():
     end = app.index("\n    _cancelMentionLookup()", start)
     history = app[start:end]
 
-    assert "st._earlierMessages" in history
-    assert "st._laterMessages" in history
+    assert "const messages = st ? st.messages" in history
+    assert "_earlierMessages" not in history
+    assert "_laterMessages" not in history
     assert 'm.role === "user"' in history
     assert "draft._historyIndex = index - 1" in history
     assert "draft._historyIndex = index + 1" in history
@@ -2562,12 +2563,12 @@ def test_quiet_history_reload_restores_visible_block_anchor_not_absolute_scroll(
     load_end = app.index("    // loadSession is per-session safe", load_start)
     load = app[load_start:load_end]
     anchor_start = app.index("    _captureViewportMessageAnchor(scrollEl, sid) {")
-    anchor_end = app.index("    // Pop the next batch", anchor_start)
+    anchor_end = app.index("    LOAD_MORE_BATCH:", anchor_start)
     anchors = app[anchor_start:anchor_end]
 
     assert "this._captureViewportMessageAnchor(quietScrollEl, sid)" in load
     assert "quietScrollEl && !st.atBottom" in load
-    assert "this._allPaneMessages(st).length" in load
+    assert "st.messages.length" in load
     assert "!st.atBottom ? this._historyReconcileWindowSize() : 0" in load
     assert "this._restoreMessageAnchor(" in load
     assert "if (!restored) quietScrollEl.scrollTop = quietScrollTop" in load
@@ -2680,7 +2681,8 @@ def test_message_identity_checks_only_incoming_batch_and_keeps_cold_replay_fallb
     reconnect = send[send.index(
         "} else if (!isContinuation && resumeEventSeq === 0) {"):
         send.index("// (isContinuation:")]
-    assert "sendState.messages.splice(lastUserIdx + 1)" in reconnect
+    assert "this._truncatePaneMessagesFrom(sendState" in reconnect
+    assert "sendState.messages[lastUserIdx + 1]" in reconnect
     assert "_releasePaneMessageRenderKeys" not in reconnect
 
 
@@ -2693,8 +2695,7 @@ def test_render_key_owned_arrays_mutate_only_at_audited_boundaries():
         r"^    (?:async )?([A-Za-z_$][\w$]*)\([^)]*\) \{$"
     )
     mutation_re = re.compile(
-        r"\b(?:st|sendState|ownerState|newSt|child)\."
-        r"(?:messages|_earlierMessages|_laterMessages)"
+        r"\b(?:st|sendState|ownerState|newSt|child)\.messages"
         r"(?:\.(?:push|unshift|splice|pop|shift)\s*\(|\.length\s*=|\s*=)"
     )
     for line in app.splitlines():
@@ -2705,21 +2706,16 @@ def test_render_key_owned_arrays_mutate_only_at_audited_boundaries():
             mutation_methods.add(method)
 
     assert mutation_methods == {
-        "_ensureTabState",
+        "_appendLiveMessage",
         "_fetchLaterWindow",
         "_fetchOlderWindow",
         "_loadAroundMessage",
-        "_reloadHistoryTailAfterConflict",
-        "_revealMessagesChunked",
-        "_scrollToUserMsg",
+        "_removePaneMessage",
         "_stateForDetachedSuccessor",
-        "loadEarlierMessages",
-        "loadLaterMessages",
+        "_truncatePaneMessagesFrom",
         "loadSession",
         "newSession",
         "onModelChange",
-        "returnToLatest",
-        "send",
     }
 
 
@@ -2968,6 +2964,25 @@ def test_transcript_active_session_ui_reads_through_pane_facade():
     assert "activeSessionPane().sessionUsage.context_used_pct" in html
     assert not re.search(r"(?<!activeSessionPane\(\)\.)sessionUsage\.", html)
 
+    assert "historyGeneration" not in root_state
+    assert "messageRange:" not in root_state
+    visible_start = app.index("_visiblePaneMessages(st)")
+    visible = app[visible_start:app.index("paneMessages(tid)", visible_start)]
+    assert "st.messages.slice(range.visibleStart, range.visibleEnd)" in visible
+
+    blank_start = app.index("_blankTabState()")
+    blank_end = app.index("_ensureTabState(id)", blank_start)
+    blank = app[blank_start:blank_end]
+    for declaration in (
+        "messages: []", "messageRange: {", "visibleStart: 0", "visibleEnd: 0",
+        "offset: 0", "total: 0", "preTotal: 0", 'order: "normal"',
+        'generation: ""', "messagesReady: true", "messagesLoading: false",
+        "streaming: false", "es: null", 'streamingModel: ""',
+        "streamElapsed: 0", "_streamTimer: null", "_streamStartedAt: 0",
+        "sessionUsage:", "atBottom: true",
+    ):
+        assert declaration in blank
+
     send_start = app.index("async send(opts = {})")
     send = app[send_start:app.index("async stop()", send_start)]
     for assignment in (
@@ -2997,11 +3012,16 @@ def test_long_chat_state_keeps_complete_normalized_history_and_generation_safety
                 app.index("_ensureTabState(id)", app.index("_blankTabState()"))]
     assert "messagesReady: true" in blank
     assert "messagesLoading: false" in blank
-    assert 'historyGeneration: ""' in blank
-    assert '_historyOrder: "normal"' in blank
-    assert "_hasServerLater: false" in blank
-    assert "_laterMessages: []" in blank
+    assert "messageRange: {" in blank
+    for coordinate in (
+        "visibleStart: 0", "visibleEnd: 0", "offset: 0", "total: 0",
+        "preTotal: 0", 'order: "normal"', 'generation: ""',
+    ):
+        assert coordinate in blank
     assert "_nextLiveKey: 1" in blank
+    assert "_activated: false" in blank
+    for removed in ("_earlierMessages", "_laterMessages", "_allPaneMessages"):
+        assert removed not in app
     assert "_historyWindowSize() { return 300; }" in app
     assert "_historyReconcileWindowSize() { return 800; }" in app
     assert "_historyWindowSize() { return this._isMobileLayout()" not in app
@@ -3023,22 +3043,24 @@ def test_long_chat_state_keeps_complete_normalized_history_and_generation_safety
     around = app[around_start:around_end]
     assert "return this._loadAroundMessage(sid, uuid, false)" in around
     assert 'this._scheduleHistoryViewport(st, "around", uuid)' in around
-    assert "st._hasServerLater = !!data.has_later" in around
-    assert 'st._historyOrder = data.history_order === "normal" ? "normal" : "full"' in around
+    assert "st.messages.splice(0, st.messages.length, ...win)" in around
+    assert "Object.assign(st.messageRange" in around
+    assert 'order: data.history_order === "normal" ? "normal" : "full"' in around
 
     older_start = app.index("async _fetchOlderWindow(sid)")
     older_end = app.index("async _fetchLaterWindow(sid)", older_start)
     older = app[older_start:older_end]
     later_end = app.index("// Per-message placeholder height", older_end)
     newer = app[older_end:later_end]
-    assert 'st._historyOrder === "full" ? "&full=1" : ""' in older
-    assert 'st._historyOrder === "full" ? "&full=1" : ""' in newer
+    assert 'range.order === "full" ? "&full=1" : ""' in older
+    assert 'range.order === "full" ? "&full=1" : ""' in newer
     assert "_historyReconcileWindowSize()" not in older
     assert "_historyReconcileWindowSize()" not in newer
     assert "const room =" not in older
     assert "const room =" not in newer
-    assert "st._loadedOffset + this._allPaneMessages(st).length" in newer
-    assert "< st._total" in newer
+    assert "const start = range.offset + st.messages.length" in newer
+    assert "start >= range.total" in newer
+    assert "st.messages.push(...win)" in newer
 
     virtual_start = app.index("_messageVirtualHeight(st, message)")
     virtual_end = app.index("async initSessions(options = {})", virtual_start)
@@ -3056,12 +3078,11 @@ def test_long_chat_state_keeps_complete_normalized_history_and_generation_safety
     sync_start = app.index("_syncNormalizedHistory(st) {")
     sync_end = app.index("_captureViewportMessageAnchor", sync_start)
     assert "splice(" not in app[sync_start:sync_end]
-    # "Load earlier" keys off the server cursor first…
-    assert "if (st._loadedOffset > 0) return true;" in app
-    # …and, at cursor 0, off stranded pre-chain history (post-/compact), which
-    # is reached by crossing orders rather than by decrementing the cursor.
-    assert "return this._preCompactReachable(st);" in app
-    assert 'st._historyOrder !== "full" && (st._preTotal || 0) > 0' in app
+    # Reveal coordinates and server coordinates jointly own navigation.
+    assert "st.messageRange.visibleStart > 0" in app
+    assert "st.messageRange.offset > 0" in app
+    assert "|| this._preCompactReachable(st)" in app
+    assert 'st.messageRange.order !== "full" && st.messageRange.preTotal > 0' in app
     switch_start = app.index("async _switchToFullOrder(sid)")
     switch_end = app.index("async loadEarlierMessages(sid)", switch_start)
     switch = app[switch_start:switch_end]
@@ -3069,7 +3090,7 @@ def test_long_chat_state_keeps_complete_normalized_history_and_generation_safety
     # two orders mis-seats the window (full keeps sidechains, normal doesn't).
     assert "this._loadAroundMessage(sid, anchorUuid)" in switch
     assert "&full=1" not in switch
-    assert "_preTotal" not in switch.split("_preCompactReachable")[-1]
+    assert "messageRange.preTotal" not in switch.split("_preCompactReachable")[-1]
     assert "historyTruncated(sid)" in app and "return false" in app[
         app.index("historyTruncated(sid)"):app.index("async renameSession()")]
 
