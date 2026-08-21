@@ -141,6 +141,28 @@ def test_incremental_append_partial_malformed_and_replace(tmp_path):
     assert [r["uuid"] for r in schema_rebuilt["records"]] == ["u9"]
 
 
+def test_large_append_parses_only_new_records_with_bounded_prefix_guard(tmp_path):
+    transcript = tmp_path / "large.jsonl"
+    index_path = tmp_path / "large.index.json"
+    _append(transcript, _entry("large", "user", "x" * (2 * 1024 * 1024)))
+    ti.ensure_index("large", transcript, index_path, _describe)
+    old_scanned = transcript.stat().st_size
+    described = []
+
+    def describe(entry):
+        described.append(entry["uuid"])
+        return _describe(entry)
+
+    _append(transcript, _entry("new", "assistant", "only-new", "large"))
+    appended = ti.ensure_index("large", transcript, index_path, describe)
+
+    assert described == ["new"]
+    assert appended["records"][-1]["offset"] == old_scanned
+    source = appended["source"]
+    assert source["scanned_bytes"] - source["guard_start"] <= ti._PREFIX_GUARD_BYTES
+    assert old_scanned - source["guard_start"] <= ti._PREFIX_GUARD_BYTES
+
+
 def test_same_inode_growing_rewrite_rebuilds(tmp_path):
     transcript = tmp_path / "rewrite.jsonl"
     index_path = tmp_path / "rewrite.index.json"
@@ -171,8 +193,8 @@ def test_same_inode_middle_rewrite_plus_growth_rebuilds(tmp_path):
     generation = first["history_generation"]
     inode = transcript.stat().st_ino
 
-    # Preserve the old first/last 4 KiB and total indexed length. The old
-    # sparse prefix fingerprint accepted this as a pure append.
+    # This fixture is smaller than the bounded suffix guard, so changing its
+    # middle must still invalidate append metadata without hashing large files.
     rewritten = list(entries)
     rewritten[4] = _entry("x04", "user", "change-04-" + ("4" * 6000))
     old_line = json.dumps(entries[4], ensure_ascii=False)
