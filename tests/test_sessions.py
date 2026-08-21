@@ -109,6 +109,88 @@ def test_session_lifecycle(client, auth):
     assert r.status_code == 404
 
 
+def test_session_evidence_returns_validated_canonical_paths(
+        client, auth, app_module, temp_root, tmp_path, monkeypatch):
+    from backend import chat, sessions as sess
+
+    meta = sess.create_session(
+        "evidence session", model="claude-sonnet-4-6", cwd=temp_root,
+    )
+    sid = meta["id"]
+    projects = tmp_path / "claude" / "projects"
+    transcript = projects / chat._cli_encode_cwd(str(temp_root)) / f"{sid}.jsonl"
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text('{"type":"user"}\n', encoding="utf-8")
+    monkeypatch.setattr(chat, "_cli_project_roots", lambda: [projects])
+    chat._JSONL_PATH_CACHE.clear()
+
+    response = client.get(f"/api/chat/sessions/{sid}/evidence", headers=auth)
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "session_name": "evidence session",
+        "session_id": sid,
+        "transcript_path": str(transcript.resolve()),
+        "workspace": str(temp_root),
+        "model": "claude-sonnet-4-6",
+        "sidecar_path": str(sess._sidecar_path(sid).resolve()),
+    }
+
+
+def test_session_evidence_requires_auth_and_existing_transcript(
+        client, auth, app_module):
+    from backend import sessions as sess
+
+    meta = sess.create_session("no transcript")
+    path = f"/api/chat/sessions/{meta['id']}/evidence"
+
+    assert client.get(path).status_code == 401
+    assert client.get(path, headers=auth).status_code == 404
+    invalid = client.get(
+        "/api/chat/sessions/not-a-uuid/evidence", headers=auth,
+    )
+    assert invalid.status_code == 400
+
+
+def test_session_evidence_rejects_transcript_from_wrong_workspace(
+        client, auth, app_module, temp_root, tmp_path, monkeypatch):
+    from backend import chat, sessions as sess
+
+    meta = sess.create_session("wrong workspace", cwd=temp_root)
+    sid = meta["id"]
+    projects = tmp_path / "claude" / "projects"
+    transcript = projects / "-somewhere-else" / f"{sid}.jsonl"
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text("{}\n", encoding="utf-8")
+    monkeypatch.setattr(chat, "_cli_project_roots", lambda: [projects])
+    chat._JSONL_PATH_CACHE.clear()
+
+    response = client.get(f"/api/chat/sessions/{sid}/evidence", headers=auth)
+
+    assert response.status_code == 404
+    assert "transcript_path" not in response.text
+
+
+def test_session_evidence_omits_missing_sidecar(
+        client, auth, app_module, temp_root, tmp_path, monkeypatch):
+    from backend import chat, sessions as sess
+
+    meta = sess.create_session("without sidecar", cwd=temp_root)
+    sid = meta["id"]
+    sess._sidecar_path(sid).unlink()
+    projects = tmp_path / "claude" / "projects"
+    transcript = projects / chat._cli_encode_cwd(str(temp_root)) / f"{sid}.jsonl"
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text("{}\n", encoding="utf-8")
+    monkeypatch.setattr(chat, "_cli_project_roots", lambda: [projects])
+    chat._JSONL_PATH_CACHE.clear()
+
+    response = client.get(f"/api/chat/sessions/{sid}/evidence", headers=auth)
+
+    assert response.status_code == 200
+    assert "sidecar_path" not in response.json()
+
+
 def test_fork_annotation_copy_rekeys_message_uuid(app_module):
     from backend import sessions as sess
 

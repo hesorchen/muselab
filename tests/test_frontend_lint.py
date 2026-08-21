@@ -1308,6 +1308,24 @@ def test_conversation_fork_is_explicit_and_keeps_edit_and_model_switch_separate(
     assert ".fork-origin-banner" in css
 
 
+def test_tab_menu_copies_server_authoritative_session_evidence_json():
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+
+    assert '@click="menuCopySessionEvidence(tabCtxMenu && tabCtxMenu.id)"' in html
+    start = app.index("async menuCopySessionEvidence(id)")
+    end = app.index("\n    async menuDelete", start)
+    method = app[start:end]
+    assert "/api/chat/sessions/${encodeURIComponent(id)}/evidence" in method
+    assert "{ headers: this.hdr() }" in method
+    assert "const evidence = await response.json()" in method
+    assert "JSON.stringify(evidence, null, 2)" in method
+    assert "navigator.clipboard.writeText" in method
+    assert "this.toast(" in method
+    assert "transcript_path" not in method
+    assert ".cwd" not in method
+
+
 def test_history_jump_keeps_the_session_that_owned_the_click():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
     start = app.index("_scrollToUserMsg(m, ownerSid = this.currentId)")

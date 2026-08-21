@@ -13831,6 +13831,32 @@ function portal() {
       a.click();
       setTimeout(() => a.remove(), 200);
     },
+    async menuCopySessionEvidence(id) {
+      this.closeTabMenu();
+      if (!id) return;
+      try {
+        const response = await fetch(
+          `/api/chat/sessions/${encodeURIComponent(id)}/evidence`,
+          { headers: this.hdr() },
+        );
+        if (!response.ok) throw new Error(await response.text());
+        const evidence = await response.json();
+        if (!navigator.clipboard || !navigator.clipboard.writeText) {
+          throw new Error("clipboard unavailable");
+        }
+        await navigator.clipboard.writeText(JSON.stringify(evidence, null, 2));
+        this.toast(
+          this.lang === "zh" ? "已复制会话证据 JSON" : "Session evidence JSON copied",
+          "success",
+          1800,
+        );
+      } catch (_) {
+        this.errToast(
+          "copy-session-evidence",
+          this.lang === "zh" ? "复制失败，需要 HTTPS 且会话须已有记录" : "Copy failed; HTTPS and an existing transcript are required",
+        );
+      }
+    },
     async menuDelete(id) {
       this.closeTabMenu();
       await this.deleteSessionById(id);

@@ -1796,6 +1796,8 @@
                     : (lang==='zh' ? 'Fork 对话' : 'Fork conversation')"></button>
           <button @click="menuExportMarkdown(tabCtxMenu && tabCtxMenu.id)"
                   x-text="lang==='zh' ? '导出为 Markdown' : 'Export as Markdown'"></button>
+          <button @click="menuCopySessionEvidence(tabCtxMenu && tabCtxMenu.id)"
+                  x-text="lang==='zh' ? '复制会话证据 JSON' : 'Copy session evidence JSON'"></button>
           <hr/>
           <button class="danger" @click="menuDelete(tabCtxMenu && tabCtxMenu.id)"
                   x-text="lang==='zh' ? '删除会话' : 'Delete session'"></button>

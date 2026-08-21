@@ -476,6 +476,38 @@ def _find_session_jsonl(sid: str) -> Path | None:
     return None
 
 
+def _canonical_session_evidence_path(sid: str, workspace: Path) -> Path | None:
+    """Return the validated canonical CLI transcript path for one session.
+
+    The lookup helper is intentionally broad because history discovery supports
+    both native and vendor stores. This boundary is narrower: evidence may only
+    expose the exact ``<root>/<encoded workspace>/<sid>.jsonl`` file, resolved
+    beneath a known CLI projects root. Symlinks, stale workspace associations,
+    and non-canonical ids fail closed instead of leaking a filesystem path.
+    """
+    try:
+        canonical_sid = str(uuid.UUID(sid))
+    except (ValueError, AttributeError, TypeError):
+        return None
+    if sid != canonical_sid:
+        return None
+    candidate = _find_session_jsonl(sid)
+    if candidate is None:
+        return None
+    try:
+        resolved = candidate.resolve(strict=True)
+        roots = {root.resolve(strict=True) for root in _cli_project_roots()}
+    except OSError:
+        return None
+    if resolved.name != f"{sid}.jsonl":
+        return None
+    if resolved.parent.name != _cli_encode_cwd(str(workspace)):
+        return None
+    if resolved.parent.parent not in roots:
+        return None
+    return resolved
+
+
 def _compact_tail_cursor(sid: str) -> tuple[Path | None, int]:
     """Snapshot the transcript byte boundary before one native compact.
 
@@ -4723,6 +4755,45 @@ def list_sessions_api(
                 )
         response.headers["ETag"] = etag
     return body
+
+
+@router.get("/sessions/{sid}/evidence", dependencies=[Depends(require_token)])
+def get_session_evidence_api(sid: str) -> dict:
+    """Return copyable, server-derived evidence for one known session.
+
+    This endpoint exposes no caller-selected path and never creates an export.
+    The transcript is the existing Claude CLI JSONL, validated against both the
+    registered workspace and the known native/vendor session roots.
+    """
+    try:
+        if str(uuid.UUID(sid)) != sid:
+            raise ValueError
+    except (ValueError, AttributeError, TypeError):
+        raise HTTPException(400, "invalid session id") from None
+    meta = sess.get_session_meta(sid)
+    if meta is None:
+        raise HTTPException(404, "session not found")
+    workspace = sess.session_workspace(sid)
+    transcript = _canonical_session_evidence_path(sid, workspace)
+    if transcript is None:
+        raise HTTPException(404, "canonical session transcript not found")
+    evidence = {
+        "session_name": str(meta.get("name") or ""),
+        "session_id": sid,
+        "transcript_path": str(transcript),
+        "workspace": str(workspace),
+        "model": str(meta.get("model") or ""),
+    }
+    sidecar = sess._sidecar_path(sid)
+    try:
+        resolved_sidecar = sidecar.resolve(strict=True)
+        if (resolved_sidecar.is_file()
+                and resolved_sidecar.parent == sess.SESS_DIR.resolve(strict=True)
+                and resolved_sidecar.name == f"{sid}.sidecar.json"):
+            evidence["sidecar_path"] = str(resolved_sidecar)
+    except OSError:
+        pass
+    return evidence
 
 
 def _canonical_available_model(model: str, groups: list[dict] | None = None) -> str:
