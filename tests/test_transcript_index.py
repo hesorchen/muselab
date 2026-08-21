@@ -379,46 +379,6 @@ def test_window_endpoint_matches_full_oracle_and_adds_stable_keys(
     assert len({m["block_id"] for m in body["messages"]}) == len(body["messages"])
 
 
-def test_history_manifest_endpoint_selects_tail_and_explicit_chunk(
-    client, auth, app_module, tmp_path, monkeypatch,
-):
-    from backend import chat as chat_mod
-    from backend import chat_history_window as history
-
-    monkeypatch.setattr(history, "CHUNK_TARGET_HEIGHT", 10**9)
-    monkeypatch.setattr(history, "CHUNK_MAX_BYTES", 10**9)
-    monkeypatch.setattr(history, "CHUNK_MAX_BLOCKS", 2)
-    entries = [
-        _entry("u1", "user", "one"),
-        _entry("a1", "assistant", "two", "u1"),
-        _entry("u2", "user", "three", "a1"),
-        _entry("a2", "assistant", "four", "u2"),
-        _entry("u3", "user", "five", "a2"),
-    ]
-    sid, _ = _make_endpoint_session(client, auth, chat_mod, tmp_path, entries)
-
-    tail_response = client.get(
-        f"/api/chat/sessions/{sid}", headers=auth,
-        params={"history_manifest": 1},
-    )
-    assert tail_response.status_code == 200, tail_response.text
-    tail = tail_response.json()
-    assert [chunk["block_count"] for chunk in tail["history_manifest"]["chunks"]] == [2, 2, 1]
-    assert tail["history_chunk_id"] == 2
-    assert tail["offset"] == 4
-    assert [message.get("text") for message in tail["messages"]] == ["five"]
-
-    first_response = client.get(
-        f"/api/chat/sessions/{sid}", headers=auth,
-        params={"chunk": 0},
-    )
-    assert first_response.status_code == 200, first_response.text
-    first = first_response.json()
-    assert first["history_chunk_id"] == 0
-    assert first["offset"] == 0
-    assert [message.get("text") for message in first["messages"]] == ["one", "two"]
-
-
 def test_window_endpoint_interleaves_cancelled_snapshot_at_original_anchor(
     client, auth, app_module, tmp_path,
 ):

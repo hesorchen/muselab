@@ -65,7 +65,6 @@ from . import sessions as sess
 from . import endpoints
 from . import context_recovery
 from . import chat_history
-from . import chat_history_window
 from . import chat_presentation
 from . import chat_overlays
 from . import chat_runtime
@@ -5099,8 +5098,6 @@ def get_session_api(
     around_uuid: str = Query(""),
     before: int = Query(0, ge=0),
     after: int = Query(0, ge=0),
-    history_manifest: bool = False,
-    chunk: int = -1,
 ) -> dict:
     """Read session: metadata from muselab sidecar + transcript from CLI JSONL
     via SDK. Merges per-message annotations (cost, model, images) into the
@@ -5141,15 +5138,10 @@ def get_session_api(
     # ``full``-order paging after an outline jump.  Keeping normal/full as an
     # explicit response coordinate prevents a full-order offset from later
     # being sent to the default normal-order endpoint.
-    uses_index = bool(
-        around_uuid or tail > 0 or offset >= 0 or snapshots
-        or history_manifest or chunk >= 0
-    )
+    uses_index = bool(around_uuid or tail > 0 or offset >= 0 or snapshots)
     generation = ""
     has_later = False
     pre_total = 0
-    manifest: dict | None = None
-    selected_chunk = -1
     history_order = "full" if (full or around_uuid) else "normal"
 
     if uses_index:
@@ -5164,20 +5156,6 @@ def get_session_api(
                 })
             if around_uuid:
                 raise HTTPException(404, "message uuid not found")
-            if history_manifest or chunk >= 0:
-                manifest = chat_history_window.build_history_manifest(
-                    None, snapshots, history_order, generation=generation)
-                chunks = manifest.get("chunks") or []
-                selected_chunk = chunk if chunk >= 0 else len(chunks) - 1
-                if selected_chunk < 0 or selected_chunk >= len(chunks):
-                    if chunks:
-                        raise HTTPException(404, "history chunk not found")
-                    offset, limit, tail = 0, 0, 0
-                else:
-                    selected = chunks[selected_chunk]
-                    offset = int(selected["start"])
-                    limit = int(selected["block_count"])
-                    tail = 0
             window, total, win_offset, has_later = _interrupted_history_window(
                 None, None, snapshots, {}, history_order,
                 tail=tail, offset=offset, limit=limit)
@@ -5212,23 +5190,6 @@ def get_session_api(
                     sess.get_message_annotations(sid))
                 _bind_pending_attachments(sid, image_messages)
             annotations = sess.get_message_annotations(sid)
-            if around_uuid and (history_manifest or chunk >= 0):
-                raise HTTPException(
-                    400, "history chunks cannot be combined with around_uuid")
-            if history_manifest or chunk >= 0:
-                manifest = chat_history_window.build_history_manifest(
-                    index, snapshots, history_order, generation=generation)
-                chunks = manifest.get("chunks") or []
-                selected_chunk = chunk if chunk >= 0 else len(chunks) - 1
-                if selected_chunk < 0 or selected_chunk >= len(chunks):
-                    if chunks:
-                        raise HTTPException(404, "history chunk not found")
-                    offset, limit, tail = 0, 0, 0
-                else:
-                    selected = chunks[selected_chunk]
-                    offset = int(selected["start"])
-                    limit = int(selected["block_count"])
-                    tail = 0
             if around_uuid:
                 # before/after and the legacy limit are all expressed in UI
                 # bubbles.  The index maps that exact range back to the small
@@ -5376,10 +5337,6 @@ def get_session_api(
         "pre_total": pre_total if history_order == "normal" else 0,
         "history_generation": generation,
         "history_order": history_order,
-        **({
-            "history_manifest": manifest,
-            "history_chunk_id": selected_chunk,
-        } if manifest is not None else {}),
         # Presentation generation used by a rollover child to prove that it
         # has adopted the hidden owner's latest continuation bubble before
         # stopping its inherited-task poller.

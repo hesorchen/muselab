@@ -141,27 +141,7 @@ def _route_windowed_session(page: Page, sid: str, messages: list[dict]) -> list[
         total = len(messages)
         offset = 0
         window = messages
-        chunk_size = 30
-        chunks = [
-            {
-                "id": i // chunk_size,
-                "start": i,
-                "end": min(total, i + chunk_size),
-                "block_count": min(chunk_size, total - i),
-                "estimated_height": min(chunk_size, total - i) * 120,
-                "serialized_bytes": min(chunk_size, total - i) * 256,
-                "estimated_top": i * 120,
-            }
-            for i in range(0, total, chunk_size)
-        ]
-        selected_chunk = -1
-        if "history_manifest" in qs or "chunk" in qs:
-            selected_chunk = (
-                int(qs["chunk"][0]) if "chunk" in qs else len(chunks) - 1)
-            selected = chunks[selected_chunk]
-            offset = selected["start"]
-            window = messages[offset:selected["end"]]
-        elif "tail" in qs:
+        if "tail" in qs:
             tail = int(qs["tail"][0])
             offset = max(0, total - tail)
             window = messages[offset:]
@@ -172,7 +152,6 @@ def _route_windowed_session(page: Page, sid: str, messages: list[dict]) -> list[
         requests.append({
             "url": url,
             "tail": int(qs["tail"][0]) if "tail" in qs else None,
-            "chunk": selected_chunk if selected_chunk >= 0 else None,
             "offset": offset,
             "limit": int(qs["limit"][0]) if "limit" in qs else None,
             "count": len(window),
@@ -191,18 +170,6 @@ def _route_windowed_session(page: Page, sid: str, messages: list[dict]) -> list[
                 "total": total,
                 "has_more": offset > 0,
                 "history_generation": "gen-e2e-1",
-                "history_order": "normal",
-                **({
-                    "history_manifest": {
-                        "version": 1,
-                        "generation": "gen-e2e-1",
-                        "order": "normal",
-                        "total_blocks": total,
-                        "estimated_height": total * 120,
-                        "chunks": chunks,
-                    },
-                    "history_chunk_id": selected_chunk,
-                } if selected_chunk >= 0 else {}),
             }),
         )
 
@@ -2653,10 +2620,10 @@ def test_mobile_windowed_load_session_pages_older_history(page: Page, backend_ur
         """,
         sid,
     )
-    assert requests and requests[0]["chunk"] == 5
-    assert state["messages"] == 30
-    assert state["visible"] <= 30
-    assert state["loadedOffset"] == 150
+    assert requests and requests[0]["tail"] == 75
+    assert state["messages"] == 75
+    assert state["visible"] <= 60
+    assert state["loadedOffset"] == 105
     assert state["total"] == 180
     assert state["hasMore"] is True
     assert state["paneCount"] <= 1

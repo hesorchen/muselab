@@ -3218,9 +3218,9 @@ def test_history_paging_is_transparent_and_fast_scroll_never_enters_blank_rows()
     assert "st.messageRange.visibleStart = 0" in hydrate
     assert "this._shiftMessageVirtualWindow(st, count)" in hydrate
     assert "this._fetchOlderWindow(sid)" in hydrate
-    assert "this._fetchLaterWindow(sid)" not in hydrate
-    assert "Never walk to offset zero" in hydrate
-    assert "while (this.tabState[sid] === st" not in hydrate
+    assert "this._fetchLaterWindow(sid)" in hydrate
+    assert "st.messageRange.visibleEnd = st.messages.length" in hydrate
+    assert "window.requestIdleCallback" in hydrate
     assert "st._historyHydrationRetry = setTimeout" in hydrate
 
     scroll_start = app.index("    onChatScroll() {")
@@ -3230,8 +3230,6 @@ def test_history_paging_is_transparent_and_fast_scroll_never_enters_blank_rows()
     assert "st._virtualScrollDirection" in scroll
     assert "el.clientHeight * 6" in scroll
     assert "this._scheduleTransparentHistory(st, true)" in scroll
-    assert "this._fetchLaterWindow(st._sid)" in scroll
-    assert '_historyExternalSpacerHeight(st, "top")' in scroll
 
     virtual_start = app.index("    _syncMessageViewport(tid = this.currentId")
     virtual_end = app.index("    _scheduleMessageViewportSync", virtual_start)
@@ -3289,7 +3287,6 @@ def test_long_chat_state_keeps_complete_normalized_history_and_generation_safety
     for coordinate in (
         "visibleStart: 0", "visibleEnd: 0", "offset: 0", "total: 0",
         "preTotal: 0", 'order: "normal"', 'generation: ""',
-        "manifest: null", "firstChunk: -1", "lastChunk: -1",
     ):
         assert coordinate in blank
     assert "_nextLiveKey: 1" in blank
@@ -3320,8 +3317,6 @@ def test_long_chat_state_keeps_complete_normalized_history_and_generation_safety
     assert "st.messages.splice(0, st.messages.length, ...win)" in around
     assert "Object.assign(st.messageRange" in around
     assert 'order: data.history_order === "normal" ? "normal" : "full"' in around
-    assert "manifest: null" in around
-    assert "firstChunk: -1" in around and "lastChunk: -1" in around
 
     older_start = app.index("async _fetchOlderWindow(sid)")
     older_end = app.index("async _fetchLaterWindow(sid)", older_start)
@@ -3334,12 +3329,9 @@ def test_long_chat_state_keeps_complete_normalized_history_and_generation_safety
     assert "_historyReconcileWindowSize()" not in newer
     assert "const room =" not in older
     assert "const room =" not in newer
-    assert "range.offset + st.messages.length" in newer
+    assert "const start = range.offset + st.messages.length" in newer
     assert "start >= range.total" in newer
     assert "st.messages.push(...win)" in newer
-    assert '"?chunk=" + nextChunk' in newer
-    assert "residentChunks > 3" in older
-    assert "residentChunks > 3" in newer
 
     virtual_start = app.index("_messageVirtualHeight(st, message)")
     virtual_end = app.index("async initSessions(options = {})", virtual_start)
@@ -3349,9 +3341,8 @@ def test_long_chat_state_keeps_complete_normalized_history_and_generation_safety
     assert "body.clientHeight * 1.5" in virtual
     assert 'querySelectorAll(".msg[data-message-key]")' in virtual
     assert "st._virtualHeights[key] = height" in virtual
-    assert 'spacer("history-top", this._historyExternalSpacerHeight(st, "top"), "top")' in virtual
-    assert 'spacer("history-bottom", this._historyExternalSpacerHeight(st, "bottom"), "bottom")' in virtual
-    assert 'const residentTop = this._historyExternalSpacerHeight(st, "top")' in virtual
+    assert 'spacer("top", 0, start)' in virtual
+    assert 'spacer("bottom", end, messages.length)' in virtual
     # Streaming and completed states share one DOM window. A separately-mounted
     # live tail was torn down by streaming=false and collapsed the completion layout.
     assert "messages.length - 3" not in virtual

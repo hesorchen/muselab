@@ -1914,7 +1914,6 @@
                  :class="row.spacer ? 'msg-virtual-spacer' : ('msg ' + (m._is_compact_summary ? 'compact' : m.role) + (isMsgRenderable(m, i, paneMsgs) ? '' : ' is-hidden') + (m._noAnim ? ' no-anim' : ''))"
                  :data-uuid="row.spacer ? '' : (m.uuid || '')"
                  :data-message-key="row.spacer ? '' : m._k"
-                 :data-history-edge="row.spacer ? (row.historyEdge || '') : ''"
                  :aria-hidden="row.spacer ? 'true' : null"
                  :style="row.spacer ? ('height:' + row.height + 'px') : ('contain-intrinsic-size: auto ' + messageIntrinsicH(pane, m) + 'px')">
               <!-- Per-message wall-clock (`mts`, backend). Deliberately NOT on
