@@ -2406,7 +2406,8 @@ def test_mobile_long_history_switching_does_not_blank(page: Page, backend_url, a
           const panes = Array.from(document.querySelectorAll(".msg-pane"))
             .filter(p => getComputedStyle(p).display !== "none");
           return panes.length === 1
-            && panes[0].querySelectorAll(".msg").length === mountedCap;
+            && panes[0].querySelectorAll(".msg").length > 0
+            && panes[0].querySelectorAll(".msg").length <= mountedCap;
         }""",
         arg=mounted_cap,
         timeout=5000,
@@ -2432,7 +2433,8 @@ def test_mobile_long_history_switching_does_not_blank(page: Page, backend_url, a
                   const panes = Array.from(document.querySelectorAll(".msg-pane"))
                     .filter(p => getComputedStyle(p).display !== "none");
                   return panes.some(p => p.textContent.includes(expected)
-                    && p.querySelectorAll(".msg").length === mountedCap);
+                    && p.querySelectorAll(".msg").length > 0
+                    && p.querySelectorAll(".msg").length <= mountedCap);
                 }""",
                 arg={"expected": expected_tail, "mountedCap": mounted_cap},
                 timeout=5000,
@@ -2629,7 +2631,18 @@ def test_mobile_windowed_load_session_pages_older_history(page: Page, backend_ur
     # window must slide backward (evicting far-future bubbles) until message 0
     # is mounted; the old implementation stopped forever at the first cap.
     for _ in range(24):
-        _app_eval(page, "return app.loadEarlierMessages(arg);", sid)
+        _app_eval(
+            page,
+            """
+            const body = app.$refs.chatBody;
+            app.atBottom = false;
+            app._ensureTabState(arg).atBottom = false;
+            body.scrollTop = 0;
+            app._syncMessageViewport(arg);
+            return app.loadEarlierMessages(arg);
+            """,
+            sid,
+        )
         page.wait_for_timeout(50)
         if _app_eval(
             page,
@@ -2674,10 +2687,10 @@ def test_mobile_windowed_load_session_pages_older_history(page: Page, backend_ur
     assert final_state["ready"] is True
     assert final_state["bodyHeight"] > 100
     assert "WINDOW_MSG_000" in final_state["visibleText"]
-    assert final_state["messages"] <= 60
-    assert final_state["cached"] <= 120
-    assert final_state["later"] > 0
-    assert final_state["hasServerLater"] is True
+    assert final_state["messages"] == 180
+    assert final_state["cached"] == 180
+    assert final_state["later"] == 0
+    assert final_state["hasServerLater"] is False
     latest_after_load_earlier = _app_eval(
         page,
         """
@@ -2693,10 +2706,10 @@ def test_mobile_windowed_load_session_pages_older_history(page: Page, backend_ur
         sid,
     )
     assert latest_after_load_earlier == {
-        "latestInMessages": False,
+        "latestInMessages": True,
         "latestInLater": False,
         "latestInDom": False,
-        "hasServerLater": True,
+        "hasServerLater": False,
         "ready": True,
     }
     _app_eval(page, "app.returnToLatest(arg); return true;", sid)
@@ -2921,7 +2934,7 @@ def test_outline_around_conflict_retries_and_returns_to_real_tail(
         """,
         sid,
     )
-    assert around_state["mounted"] <= 60
+    assert around_state["mounted"] == len(around_messages)
     assert around_state["targetMounted"] is True
     assert around_state["order"] == "full"
     assert around_state["hasServerLater"] is True
@@ -2944,127 +2957,148 @@ def test_outline_around_conflict_retries_and_returns_to_real_tail(
     _assert_no_browser_errors(page, errors)
 
 
-def test_bidirectional_cap_preserves_keyed_scroll_anchor(
+def test_viewport_virtualization_keeps_history_and_scroll_anchor(
     page: Page, backend_url, auth_token,
 ):
-    """Top/bottom eviction must not move the surviving reading anchor."""
+    """Only viewport rows mount; canonical history and keyed anchors survive shifts."""
     errors = _capture_browser_errors(page)
     page.set_viewport_size({"width": 390, "height": 844})
     _login(page, backend_url, auth_token)
-    sid = "perf-bidirectional-cap"
+    sid = "perf-viewport-virtual-history"
+    _bootstrap_session_for_real_load(page, sid, "Viewport virtual history")
     _app_eval(
         page,
         """
-        const sid = arg;
-        app.refreshSessions = async () => {};
-        app._fetchTabUsage = async () => {};
-        app.sessions = [{
-          id: sid, name: "Perf bidirectional cap", updated_at: Date.now() / 1000,
-          model: "e2e-model", permission: "bypassPermissions", thinking: true,
-        }];
-        app.openTabIds = [sid];
-        app.tabState = {};
-        app.tabState[sid] = app._blankTabState();
-        const st = app._ensureTabState(sid);
-        const cap = app._mountedMessageCap();
-        const make = (prefix, i) => ({
-          role: "assistant", uuid: `${prefix}-uuid-${i}`,
-          _k: `${prefix}-key-${i}`, _noAnim: true,
-          text: `${prefix}-${i} ` + "variable height ".repeat(8 + (i % 5) * 8),
-          html: `<p>${prefix}-${i} ${"variable height ".repeat(8 + (i % 5) * 8)}</p>`,
+        const st = app._ensureTabState(arg);
+        const make = i => ({
+          role: i % 2 ? "assistant" : "user",
+          uuid: `virtual-uuid-${i}`, _k: `virtual-key-${i}`, _noAnim: true,
+          text: `VIRTUAL_MESSAGE_${i} ` + "variable height ".repeat(8 + (i % 7) * 6),
+          html: i % 2 ? `<p>VIRTUAL_MESSAGE_${i} ${"tail ".repeat(20)}</p>` : "",
         });
         st.messages.splice(0, st.messages.length,
-          ...Array.from({ length: cap }, (_, i) => make("mounted", i)));
-        st._earlierMessages = Array.from({ length: 10 }, (_, i) => make("older", i));
+          ...Array.from({ length: 600 }, (_, i) => make(i)));
+        st._earlierMessages = [];
         st._laterMessages = [];
         st._loadedOffset = 0;
-        st._total = cap + st._earlierMessages.length;
+        st._total = 600;
         st._hasServerLater = false;
         st.messagesReady = true;
         st.messagesLoading = false;
-        app.currentId = sid;
-        app._residentTabIds = [sid];
-        app._activateTabState(sid);
-        app._promoteResident(sid);
+        st.atBottom = true;
+        app.currentId = arg;
+        app._residentTabIds = [arg];
+        app._activateTabState(arg);
+        app._promoteResident(arg);
         app.mobileTab = "chat";
+        app.$nextTick(() => app.scrollToBottom(true));
         return true;
         """,
         sid,
     )
-    mounted_cap = _app_eval(page, "return app._mountedMessageCap();")
     page.wait_for_function(
-        """mountedCap => Array.from(document.querySelectorAll('.msg-pane'))
-          .filter(p => getComputedStyle(p).display !== 'none')
-          .reduce((n, p) => n + p.querySelectorAll('.msg').length, 0) === mountedCap""",
-        arg=mounted_cap,
+        """() => {
+          const pane = document.querySelector('.msg-pane:visible');
+          return pane && pane.textContent.includes('VIRTUAL_MESSAGE_599')
+            && pane.querySelectorAll('.msg').length > 0
+            && pane.querySelectorAll('.msg').length < 80;
+        }""",
         timeout=10000,
     )
+    initial = _app_eval(
+        page,
+        """
+        const st = app._ensureTabState(arg);
+        const pane = document.querySelector('.msg-pane:visible');
+        return { canonical: st.messages.length, normalized: app._allPaneMessages(st).length,
+          mounted: pane.querySelectorAll('.msg').length,
+          spacers: pane.querySelectorAll('.msg-virtual-spacer').length };
+        """,
+        sid,
+    )
+    assert initial["canonical"] == initial["normalized"] == 600
+    assert 0 < initial["mounted"] < 80
+    assert initial["spacers"] >= 1
+
+    _app_eval(
+        page,
+        """
+        const body = app.$refs.chatBody;
+        app.atBottom = false;
+        app._ensureTabState(app.currentId).atBottom = false;
+        body.scrollTop = Math.floor(body.scrollHeight * 0.45);
+        app._syncMessageViewport(app.currentId);
+        return true;
+        """,
+    )
+    page.wait_for_timeout(100)
+    anchor = page.evaluate(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const body = app.$refs.chatBody;
+          const rows = Array.from(document.querySelectorAll('.msg-pane:visible .msg'));
+          const row = rows.find(el => {
+            const r = el.getBoundingClientRect();
+            return r.bottom > body.getBoundingClientRect().top;
+          });
+          return {key: row?.dataset.messageKey || '', top: row?.getBoundingClientRect().top || 0};
+        }"""
+    )
+    assert anchor["key"]
     page.evaluate(
         """() => {
-          const body = document.querySelector('.chat-body');
-          body.scrollTop = Math.min(500, body.scrollHeight - body.clientHeight);
+          const app = document.querySelector('#app')._x_dataStack[0];
+          app.$refs.chatBody.scrollTop += 500;
+          app._syncMessageViewport(app.currentId);
         }"""
     )
-    older_anchor = page.evaluate(
+    page.wait_for_timeout(100)
+    page.evaluate(
         """() => {
-          const app = document.querySelector("#app")._x_dataStack[0];
-          const st = app._ensureTabState(app.currentId);
-          const key = st.messages[0]._k;
-          const top = document.querySelector(
-            `.msg[data-message-key="${CSS.escape(key)}"]`).getBoundingClientRect().top;
-          return { key, top };
+          const app = document.querySelector('#app')._x_dataStack[0];
+          app.$refs.chatBody.scrollTop -= 500;
+          app._syncMessageViewport(app.currentId);
         }"""
     )
-    _app_eval(page, "return app.loadEarlierMessages(arg);", sid)
-    page.wait_for_function(
-        """({ key, mountedCap }) => {
-          const pane = Array.from(document.querySelectorAll(".msg-pane"))
-            .find(p => getComputedStyle(p).display !== "none");
-          return pane && pane.querySelectorAll(".msg").length === mountedCap
-            && pane.querySelector(
-              `.msg[data-message-key="${CSS.escape(key)}"]`);
+    page.wait_for_timeout(100)
+    shifted = page.evaluate(
+        """key => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const row = document.querySelector(
+            `.msg[data-message-key="${CSS.escape(key)}"]`);
+          const st = app._ensureTabState(app.currentId);
+          return {canonical: st.messages.length, mounted: document.querySelectorAll(
+            '.msg-pane:visible .msg').length, top: row?.getBoundingClientRect().top || 0};
         }""",
-        arg={"key": older_anchor["key"], "mountedCap": mounted_cap},
-        timeout=10000,
+        anchor["key"],
     )
-    after_older = page.evaluate(
-        """key => document.querySelector(
-          `.msg[data-message-key="${CSS.escape(key)}"]`).getBoundingClientRect().top""",
-        older_anchor["key"],
-    )
-    assert abs(after_older - older_anchor["top"]) < 2
+    assert shifted["canonical"] == 600
+    assert shifted["mounted"] < 80
+    assert abs(shifted["top"] - anchor["top"]) < 3
 
-    newer_anchor = page.evaluate(
-        """() => {
-          const app = document.querySelector("#app")._x_dataStack[0];
-          const st = app._ensureTabState(app.currentId);
-          const key = st.messages[st.messages.length - 1]._k;
-          const top = document.querySelector(
-            `.msg[data-message-key="${CSS.escape(key)}"]`).getBoundingClientRect().top;
-          return { key, top };
-        }"""
+    streaming = _app_eval(
+        page,
+        """
+        const st = app._ensureTabState(arg);
+        st.streaming = true;
+        st.atBottom = false;
+        app.atBottom = false;
+        const body = app.$refs.chatBody;
+        body.scrollTop = 0;
+        app._syncMessageViewport(arg);
+        return new Promise(resolve => app.$nextTick(() => resolve({
+          tailMounted: !!document.querySelector(
+            '.msg[data-message-key="virtual-key-599"]'),
+          mounted: document.querySelectorAll('.msg-pane:visible .msg').length,
+          canonical: st.messages.length,
+        })));
+        """,
+        sid,
     )
-    _app_eval(page, "return app.loadLaterMessages(arg);", sid)
-    page.wait_for_function(
-        """({ key, mountedCap }) => {
-          const pane = Array.from(document.querySelectorAll(".msg-pane"))
-            .find(p => getComputedStyle(p).display !== "none");
-          return pane && pane.querySelectorAll(".msg").length === mountedCap
-            && pane.querySelector(
-              `.msg[data-message-key="${CSS.escape(key)}"]`);
-        }""",
-        arg={"key": newer_anchor["key"], "mountedCap": mounted_cap},
-        timeout=10000,
-    )
-    after_newer = page.evaluate(
-        """key => document.querySelector(
-          `.msg[data-message-key="${CSS.escape(key)}"]`).getBoundingClientRect().top""",
-        newer_anchor["key"],
-    )
-    assert abs(after_newer - newer_anchor["top"]) < 2
-    assert page.locator(".msg-pane:visible .msg").count() == mounted_cap
+    assert streaming["tailMounted"] is True
+    assert streaming["mounted"] < 80
+    assert streaming["canonical"] == 600
     _assert_no_browser_errors(page, errors)
-
 
 def test_load_session_reconnects_active_turn_and_renders_live_assistant(
     page: Page, backend_url, auth_token
@@ -6045,7 +6079,7 @@ def test_120kb_mixed_sse_stream_renders_final_assistant_html(
         assert render_stats["plain"] == 0
         assert render_stats["rich"] >= 1
     assert render_stats["mounted"] <= 60
-    assert render_stats["cached"] <= 120
+    assert render_stats["cached"] >= render_stats["mounted"]
     long_tasks = page.evaluate("() => window.__longTasks || []")
     assert max(long_tasks or [0]) < 2000, long_tasks
 

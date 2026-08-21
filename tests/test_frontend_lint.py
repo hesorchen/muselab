@@ -2538,7 +2538,9 @@ def test_fork_banner_and_message_template_are_null_and_key_safe():
     html = (FRONTEND / "index.html").read_text(encoding="utf-8")
 
     assert "currentForkSource()?.name || ''" in html
-    assert 'x-for="(m, i) in paneMsgs" :key="m._k"' in html
+    assert 'x-for="row in paneRows" :key="row.key"' in html
+    assert 'get m(){ return row.message }' in html
+    assert ':data-message-key="row.spacer ? \'\' : m._k"' in html
 
 
 def test_history_keys_prefer_backend_block_identity_without_local_dup_suffixes():
@@ -2562,8 +2564,9 @@ def test_quiet_history_reload_restores_visible_block_anchor_not_absolute_scroll(
     anchors = app[anchor_start:anchor_end]
 
     assert "this._captureViewportMessageAnchor(quietScrollEl, sid)" in load
-    assert "quiet && !st.atBottom" in load
-    assert "? this._historyCacheCap()" in load
+    assert "quietScrollEl && !st.atBottom" in load
+    assert "this._allPaneMessages(st).length" in load
+    assert "!st.atBottom ? this._historyCacheCap() : 0" in load
     assert "this._restoreMessageAnchor(" in load
     assert "if (!restored) quietScrollEl.scrollTop = quietScrollTop" in load
     assert 'pane.querySelectorAll(".msg[data-message-key]")' in anchors
@@ -2571,7 +2574,7 @@ def test_quiet_history_reload_restores_visible_block_anchor_not_absolute_scroll(
     assert "return true" in anchors
 
 
-def test_history_store_normalizes_canonical_blocks_and_prunes_session_windows():
+def test_history_store_normalizes_canonical_blocks_without_count_eviction():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
     start = app.index("    _historyStoreKey(sid, m) {")
     end = app.index("    _messageContinuitySignatures(m) {", start)
@@ -2579,8 +2582,8 @@ def test_history_store_normalizes_canonical_blocks_and_prunes_session_windows():
     dispose_start = app.index("    _disposeTabRuntime(id) {")
     dispose_end = app.index("    _startWorkspaceDrag", dispose_start)
     dispose = app[dispose_start:dispose_end]
-    cap_start = app.index("    _capHistoryCache(st, direction = \"newer\") {")
-    cap_end = app.index("    _captureMessageAnchor", cap_start)
+    cap_start = app.index("    _capHistoryCache(st) {")
+    cap_end = app.index("    _captureViewportMessageAnchor", cap_start)
     cap = app[cap_start:cap_end]
 
     assert "_messagesById: new Map()" in app
@@ -2595,6 +2598,8 @@ def test_history_store_normalizes_canonical_blocks_and_prunes_session_windows():
     assert "this._messagesById.delete(storeKey)" in store
     assert "this._dropSessionMessageStore(id)" in dispose
     assert "this._syncSessionMessageStore(st)" in cap
+    assert "splice(" not in cap
+    assert "_messagesById.delete" not in cap
 
 
 def test_large_history_bodies_load_by_stable_block_reference():
@@ -2625,7 +2630,7 @@ def test_render_key_hot_paths_use_pane_index_without_full_scans_or_transport_dup
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
 
     append_start = app.index("    _appendLiveMessage(st, m) {")
-    append_end = app.index("\n    // Keep the phone DOM", append_start)
+    append_end = app.index("\n    // Retained as load/page sizing", append_start)
     append_body = app[append_start:append_end]
     assert "_assignLiveKey(st, m)" in append_body
     assert "_allPaneMessages" not in append_body
@@ -2725,9 +2730,6 @@ def test_render_key_owned_arrays_mutate_only_at_audited_boundaries():
             mutation_methods.add(method)
 
     assert mutation_methods == {
-        "_capHistoryCache",
-        "_capLiveMessages",
-        "_capMountedWindow",
         "_ensureTabState",
         "_fetchLaterWindow",
         "_fetchOlderWindow",
@@ -2933,6 +2935,7 @@ def test_queue_sync_keeps_older_success_when_newer_read_fails():
 def test_long_chat_state_is_per_tab_bounded_and_generation_safe():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
     html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    css = (FRONTEND / "styles.css").read_text(encoding="utf-8")
 
     blank = app[app.index("_blankTabState()"):
                 app.index("_ensureTabState(id)", app.index("_blankTabState()"))]
@@ -2972,17 +2975,29 @@ def test_long_chat_state_is_per_tab_bounded_and_generation_safe():
     newer = app[older_end:later_end]
     assert 'st._historyOrder === "full" ? "&full=1" : ""' in older
     assert 'st._historyOrder === "full" ? "&full=1" : ""' in newer
+    assert "_historyCacheCap()" not in older
+    assert "_historyCacheCap()" not in newer
+    assert "const room =" not in older
+    assert "const room =" not in newer
     assert "st._loadedOffset + this._allPaneMessages(st).length" in newer
     assert "< st._total" in newer
 
-    cap_start = app.index("_capMountedWindow(st, direction")
-    cap_end = app.index("// Pop the next batch", cap_start)
-    cap = app[cap_start:cap_end]
-    assert 'direction === "around"' in cap
-    assert 'direction === "older"' in cap
-    assert "st._laterMessages.splice(st._laterMessages.length - drop, drop)" in cap
-    assert "_captureMessageAnchor(scrollEl, m)" in cap
-    assert "_restoreMessageAnchor(scrollEl, anchor)" in cap
+    virtual_start = app.index("_messageVirtualHeight(st, message)")
+    virtual_end = app.index("// [resident-panes]", virtual_start)
+    virtual = app[virtual_start:virtual_end]
+    assert "paneMessageRows(tid)" in virtual
+    assert "_syncMessageViewport(tid = this.currentId" in virtual
+    assert "body.clientHeight * 1.5" in virtual
+    assert 'querySelectorAll(".msg[data-message-key]")' in virtual
+    assert "st._virtualHeights[key] = height" in virtual
+    assert 'spacer("top", 0, start)' in virtual
+    assert 'spacer("bottom", end, messages.length)' in virtual
+    assert "messages.length - 3" in virtual
+    assert "this._captureViewportMessageAnchor(body, tid)" in virtual
+    assert "this._restoreMessageAnchor(body, anchor)" in virtual
+    cap_start = app.index("_capHistoryCache(st) {")
+    cap_end = app.index("_captureViewportMessageAnchor", cap_start)
+    assert "splice(" not in app[cap_start:cap_end]
     # "Load earlier" keys off the server cursor first…
     assert "if (st._loadedOffset > 0) return true;" in app
     # …and, at cursor 0, off stranded pre-chain history (post-/compact), which
@@ -3004,7 +3019,10 @@ def test_long_chat_state_is_per_tab_bounded_and_generation_safe():
     pane_end = html.index("<!-- /P1 per-tab message panes", pane_start)
     pane = html[pane_start:pane_end]
     assert ':data-tid="tid"' in pane
-    assert 'x-for="(m, i) in paneMsgs" :key="m._k"' in pane
+    assert 'x-for="row in paneRows" :key="row.key"' in pane
+    assert "paneMessageRows(tid)" in pane
+    assert "msg-virtual-spacer" in pane
+    assert ".msg-virtual-spacer > * { display: none !important; }" in css
     assert "pane.streaming" in pane
     assert "pane.streamElapsed" in pane
     # Elapsed reads through a null-guarded pane. `pane` resolves to null while

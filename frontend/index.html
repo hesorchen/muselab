@@ -1913,11 +1913,14 @@
           <template x-for="tid in residentPaneIds()" :key="tid">
           <div class="msg-pane" x-show="tid === currentId"
                :data-tid="tid"
-               x-data="{ get pane(){ return paneState(tid) }, get paneMsgs(){ return paneMessages(tid) } }">
-          <template x-for="(m, i) in paneMsgs" :key="m._k">
-            <div :class="'msg ' + (m._is_compact_summary ? 'compact' : m.role) + (isMsgRenderable(m, i, paneMsgs) ? '' : ' is-hidden') + (m._noAnim ? ' no-anim' : '')"
-                 :data-uuid="m.uuid || ''" :data-message-key="m._k"
-                 :style="'contain-intrinsic-size: auto ' + estIntrinsicH(m) + 'px'">
+               x-data="{ get pane(){ return paneState(tid) }, get paneMsgs(){ return paneMessages(tid) }, get paneRows(){ return paneMessageRows(tid) } }">
+          <template x-for="row in paneRows" :key="row.key">
+            <div x-data="{ get m(){ return row.message }, get i(){ return row.index } }"
+                 :class="row.spacer ? 'msg-virtual-spacer' : ('msg ' + (m._is_compact_summary ? 'compact' : m.role) + (isMsgRenderable(m, i, paneMsgs) ? '' : ' is-hidden') + (m._noAnim ? ' no-anim' : ''))"
+                 :data-uuid="row.spacer ? '' : (m.uuid || '')"
+                 :data-message-key="row.spacer ? '' : m._k"
+                 :aria-hidden="row.spacer ? 'true' : null"
+                 :style="row.spacer ? ('height:' + row.height + 'px') : ('contain-intrinsic-size: auto ' + estIntrinsicH(m) + 'px')">
               <!-- Per-message wall-clock (`mts`, backend). Deliberately NOT on
                    by default: an agentic turn is 30+ tool cards, and stamping
                    every one of them costs more attention than it returns —

@@ -7190,6 +7190,14 @@ function portal() {
           pendingMissing: 0,
           flushTimer: null,
         },
+        // Viewport-only render window. Canonical envelopes remain in the history
+        // arrays; these indexes decide only which keyed bubbles are mounted.
+        _virtualStart: -1,
+        _virtualEnd: -1,
+        _virtualHeights: Object.create(null),
+        _virtualSyncFrame: 0,
+        _virtualForceTail: false,
+        _virtualRevision: 0,
         // Newer half of the bounded bidirectional window. Chronological order is
         // always: _earlierMessages + messages + _laterMessages.
         _laterMessages: [],
@@ -7432,6 +7440,14 @@ function portal() {
       if (st._renderKeyTelemetry.flushTimer === undefined) {
         st._renderKeyTelemetry.flushTimer = null;
       }
+      if (!Number.isInteger(st._virtualStart)) st._virtualStart = -1;
+      if (!Number.isInteger(st._virtualEnd)) st._virtualEnd = -1;
+      if (!st._virtualHeights || typeof st._virtualHeights !== "object") {
+        st._virtualHeights = Object.create(null);
+      }
+      if (!Number.isFinite(st._virtualSyncFrame)) st._virtualSyncFrame = 0;
+      if (st._virtualForceTail === undefined) st._virtualForceTail = false;
+      if (!Number.isFinite(st._virtualRevision)) st._virtualRevision = 0;
       if (st.activeTurnId === undefined) st.activeTurnId = "";
       if (st.parentTurnId === undefined) st.parentTurnId = "";
       if (!Number.isFinite(st.lastEventSeq)) st.lastEventSeq = 0;
@@ -9206,11 +9222,164 @@ function portal() {
       return true;
     },
     paneMessages(tid) {
-      // Pure O(1) render lookup. Key normalization happens at pane data ingress
-      // and activation boundaries, never from this repeatedly-evaluated getter.
+      // Pure O(1) canonical lookup. Virtualization changes only the render rows;
+      // every interaction helper continues to see the complete revealed window.
       if (!tid) return [];
       const st = this.tabState && this.tabState[tid];
       return (st && st.messages) || [];
+    },
+    _messageVirtualHeight(st, message) {
+      const key = message && message._k;
+      const measured = key && Number(st._virtualHeights[key]);
+      return measured > 0 ? measured : this.estIntrinsicH(message);
+    },
+    _messageVirtualGap(pane) {
+      if (!pane || typeof getComputedStyle !== "function") return 8;
+      const gap = parseFloat(getComputedStyle(pane).rowGap || "8");
+      return Number.isFinite(gap) ? gap : 8;
+    },
+    _messageVirtualRangeHeight(st, messages, start, end, gap = 8) {
+      let height = 0;
+      for (let i = start; i < end; i++) {
+        height += this._messageVirtualHeight(st, messages[i]);
+      }
+      if (end > start) height += Math.max(0, end - start - 1) * gap;
+      return Math.max(0, Math.round(height));
+    },
+    _initialMessageVirtualRange(st) {
+      const messages = st.messages || [];
+      const target = 2400;
+      let start = messages.length;
+      let height = 0;
+      while (start > 0 && height < target) {
+        start--;
+        height += this._messageVirtualHeight(st, messages[start]) + 8;
+      }
+      return { start, end: messages.length };
+    },
+    paneMessageRows(tid) {
+      const st = tid && this.tabState && this.tabState[tid];
+      const messages = (st && st.messages) || [];
+      if (!st || !messages.length) return [];
+      // Read the revision so measured heights invalidate Alpine's derived rows.
+      void st._virtualRevision;
+      let start = Math.max(0, Math.min(st._virtualStart, messages.length));
+      let end = Math.max(start, Math.min(st._virtualEnd, messages.length));
+      if (st._virtualStart < 0 || end <= start) {
+        const initial = this._initialMessageVirtualRange(st);
+        start = initial.start;
+        end = initial.end;
+      }
+      const pane = this._paneElement(tid);
+      const gap = this._messageVirtualGap(pane);
+      const rows = [];
+      const spacer = (kind, from, to) => {
+        if (to <= from) return;
+        rows.push({
+          key: tid + ":virtual-spacer:" + kind,
+          index: -1,
+          message: { role: "virtual_spacer", _k: tid + ":virtual-spacer:" + kind },
+          spacer: true,
+          height: this._messageVirtualRangeHeight(st, messages, from, to, gap),
+        });
+      };
+      spacer("top", 0, start);
+      for (let i = start; i < end; i++) {
+        rows.push({ key: messages[i]._k, index: i, message: messages[i], spacer: false });
+      }
+      // A live tail must stay mounted even while the reader inspects older rows.
+      // Keep only the final three envelopes plus one measured spacer, not the
+      // potentially huge interval between the viewport and the active turn.
+      const tailStart = st.streaming && end < messages.length
+        ? Math.max(end, messages.length - 3) : messages.length;
+      spacer("middle", end, tailStart);
+      for (let i = tailStart; i < messages.length; i++) {
+        rows.push({ key: messages[i]._k, index: i, message: messages[i], spacer: false });
+      }
+      if (tailStart === messages.length) spacer("bottom", end, messages.length);
+      return rows;
+    },
+    _measureMessageVirtualRows(tid, st) {
+      const pane = this._paneElement(tid);
+      if (!pane || this.tabState[tid] !== st) return false;
+      let changed = false;
+      for (const el of pane.querySelectorAll(".msg[data-message-key]")) {
+        const key = el.getAttribute("data-message-key");
+        const height = Math.max(1, Math.round(el.getBoundingClientRect().height));
+        if (key && st._virtualHeights[key] !== height) {
+          st._virtualHeights[key] = height;
+          changed = true;
+        }
+      }
+      if (changed) st._virtualRevision++;
+      return changed;
+    },
+    _syncMessageViewport(tid = this.currentId, forceTail = false) {
+      const st = tid && this.tabState && this.tabState[tid];
+      const body = this.$refs && this.$refs.chatBody;
+      const pane = this._paneElement(tid);
+      const messages = (st && st.messages) || [];
+      if (!st || !body || !pane || !messages.length || tid !== this.currentId) return;
+      this._measureMessageVirtualRows(tid, st);
+      const gap = this._messageVirtualGap(pane);
+      const overscan = Math.max(600, body.clientHeight * 1.5);
+      const paneRect = pane.getBoundingClientRect();
+      const bodyRect = body.getBoundingClientRect();
+      const wantedTop = Math.max(0, bodyRect.top - paneRect.top - overscan);
+      const wantedBottom = Math.max(wantedTop, bodyRect.bottom - paneRect.top + overscan);
+      let cursor = 0;
+      let start = 0;
+      while (start < messages.length) {
+        const next = cursor + this._messageVirtualHeight(st, messages[start]);
+        if (next >= wantedTop) break;
+        cursor = next + gap;
+        start++;
+      }
+      let end = start;
+      while (end < messages.length && cursor <= wantedBottom) {
+        cursor += this._messageVirtualHeight(st, messages[end]) + gap;
+        end++;
+      }
+      if (forceTail || st.atBottom) {
+        end = messages.length;
+        let tailHeight = 0;
+        start = end;
+        const target = body.clientHeight + overscan;
+        while (start > 0 && tailHeight < target) {
+          start--;
+          tailHeight += this._messageVirtualHeight(st, messages[start]) + gap;
+        }
+      }
+      if (start === st._virtualStart && end === st._virtualEnd) return;
+      const anchor = this._captureViewportMessageAnchor(body, tid);
+      st._virtualStart = start;
+      st._virtualEnd = end;
+      st._virtualRevision++;
+      this.$nextTick(() => {
+        if (this.tabState[tid] !== st || tid !== this.currentId) return;
+        this._measureMessageVirtualRows(tid, st);
+        this._restoreMessageAnchor(body, anchor);
+      });
+    },
+    _scheduleMessageViewportSync(tid = this.currentId, forceTail = false) {
+      const st = tid && this.tabState && this.tabState[tid];
+      if (!st) return;
+      st._virtualForceTail = st._virtualForceTail || forceTail;
+      if (st._virtualSyncFrame) return;
+      const run = () => {
+        st._virtualSyncFrame = 0;
+        const shouldForceTail = st._virtualForceTail;
+        st._virtualForceTail = false;
+        this._syncMessageViewport(tid, shouldForceTail);
+      };
+      st._virtualSyncFrame = typeof requestAnimationFrame === "function"
+        ? requestAnimationFrame(run) : setTimeout(run, 0);
+    },
+    _shiftMessageVirtualWindow(st, delta) {
+      if (!st || !delta || st._virtualStart < 0) return;
+      st._virtualStart += delta;
+      st._virtualEnd += delta;
+      st._virtualRevision++;
     },
 
     // [resident-panes] The id list the message-pane x-for iterates. Returns the
@@ -10851,6 +11020,14 @@ function portal() {
         if (st._reconnectTimer) clearTimeout(st._reconnectTimer);
         if (st._canonicalResyncTimer) clearTimeout(st._canonicalResyncTimer);
         if (st._reconcileRetryTimer) clearTimeout(st._reconcileRetryTimer);
+        if (st._virtualSyncFrame) {
+          if (typeof cancelAnimationFrame === "function") {
+            cancelAnimationFrame(st._virtualSyncFrame);
+          } else {
+            clearTimeout(st._virtualSyncFrame);
+          }
+          st._virtualSyncFrame = 0;
+        }
         if (st._renderKeyTelemetry && st._renderKeyTelemetry.flushTimer) {
           clearTimeout(st._renderKeyTelemetry.flushTimer);
           st._renderKeyTelemetry.flushTimer = null;
@@ -14421,11 +14598,11 @@ function portal() {
           ? st.messages.length : 0;
         const _quietFloor = Math.min(this._mountedMessageCap(), _mountedNow);
         const _initialLoadEarly = Math.max(_baseInitialLoad, _quietFloor);
-        // While the user reads history, retain the widest bounded canonical
-        // window so a newly-finished tool-heavy turn does not evict the visible
-        // anchor before the quiet reconciliation can restore it.
-        const FETCH_TAIL = quiet && !st.atBottom
-          ? this._historyCacheCap()
+        // While the user reads history, request at least every canonical block
+        // already loaded so quiet reconciliation cannot drop the visible anchor.
+        const FETCH_TAIL = quiet
+          ? Math.max(_baseInitialLoad * 5, this._allPaneMessages(st).length,
+            !st.atBottom ? this._historyCacheCap() : 0)
           : Math.max(_baseInitialLoad * 5, _quietFloor);
         const qs = full ? "?full=1" : ("?tail=" + FETCH_TAIL);
         const controller = new AbortController();
@@ -14508,9 +14685,10 @@ function portal() {
           all = this._preserveCanonicalMessageIdentity(st, all);
         }
         const incomingCount = all.length;
-        const cacheCap = this._historyCacheCap();
-        const trimmedHead = Math.max(0, all.length - cacheCap);
-        if (trimmedHead) all = all.slice(trimmedHead);
+        // The response is already server-windowed. Keep every fetched normalized
+        // block; viewport virtualization makes a second count-based client trim
+        // unnecessary and would discard interaction state on full/around loads.
+        const trimmedHead = 0;
         this._markPaneRenderKeysDirty(st);
         this._rebuildPaneMessageRenderKeys(sid, all);
         // Lazy-load thresholds — only render the tail of the conversation on
@@ -14648,11 +14826,8 @@ function portal() {
         st._loadedOffset = (Number.isInteger(s.offset) ? s.offset : 0) + trimmedHead;
         st._total = Number.isInteger(s.total) ? s.total : incomingCount;
         st._preTotal = Number.isInteger(s.pre_total) ? s.pre_total : 0;
-        // Trimming may evict the oldest cached bubbles and advance the cursor,
-        // so it must run after the response coordinate has been installed.
-        // A canonical load is anchored at the newest end. If the selected
-        // visible slice exceeds the DOM cap, retain its tail so the actual
-        // latest reply remains mounted.
+        // Seed the render-only viewport at the newest end after installing the
+        // response coordinates. Canonical envelopes remain untouched.
         this._capMountedWindow(st, "newer");
         this._syncSessionMessageStore(st);
         this._recordPaneRenderKeyShape(st);
@@ -15295,99 +15470,35 @@ function portal() {
       const target = (st._laterMessages && st._laterMessages.length)
         ? st._laterMessages : st.messages;
       target.push(m);
-      if (target === st.messages) this._capMountedWindow(st, "newer");
+      this._capMountedWindow(st, "newer");
       this._capHistoryCache(st);
       this._recordPaneRenderKeyShape(st);
       return target[target.length - 1];
     },
-    // Keep the phone DOM deliberately small. Rich tool/diff/code bubbles can
-    // expand into hundreds of descendants each; 60 envelopes was still enough
-    // to exhaust a mobile WebView during a display:none → flex reveal. Evicted
-    // envelopes stay in the bounded history cache and remain reachable through
-    // "Load earlier", so this is windowing rather than data loss.
+    // Retained as load/page sizing compatibility. DOM size is now controlled by
+    // the measured viewport window below, never by removing canonical messages.
     _mountedMessageCap() { return this._isMobileLayout() ? 36 : 300; },
     _historyCacheCap() { return this._isMobileLayout() ? 120 : 800; },
     _capMountedWindow(st, direction = "newer", anchorUuid = "") {
-      const cap = this._mountedMessageCap();
-      if (!st || !st.messages || st.messages.length <= cap) {
-        return { head: [], tail: [] };
-      }
-      let head = [];
-      let tail = [];
-      if (direction === "older") {
-        tail = st.messages.splice(cap);
-        st._laterMessages = tail.concat(st._laterMessages || []);
-      } else if (direction === "around") {
+      if (!st) return { head: [], tail: [] };
+      if (direction === "around" && anchorUuid) {
         const target = st.messages.findIndex(m => m && m.uuid === anchorUuid);
-        const centered = target < 0 ? 0 : target - Math.floor(cap / 2);
-        const start = Math.max(0, Math.min(centered, st.messages.length - cap));
-        head = st.messages.splice(0, start);
-        tail = st.messages.splice(cap);
-        st._earlierMessages = (st._earlierMessages || []).concat(head);
-        st._laterMessages = tail.concat(st._laterMessages || []);
-      } else {
-        head = st.messages.splice(0, st.messages.length - cap);
-        st._earlierMessages = (st._earlierMessages || []).concat(head);
+        if (target >= 0) {
+          st._virtualStart = Math.max(0, target - 12);
+          st._virtualEnd = Math.min(st.messages.length, target + 13);
+          st._virtualRevision++;
+        }
       }
-      this._capHistoryCache(st, direction);
-      this._recordPaneRenderKeyShape(st);
-      return { head, tail };
+      this._scheduleMessageViewportSync(st._sid, direction === "newer" && st.atBottom !== false);
+      return { head: [], tail: [] };
     },
-    _capHistoryCache(st, direction = "newer") {
+    _capHistoryCache(st) {
+      // Normalized history is authoritative browser state. Paging may decide
+      // which section is revealed, but a numeric cache cap must never discard a
+      // fetched block or make its interaction state disappear.
       if (!st) return new Set();
-      const cap = this._historyCacheCap();
-      const dropped = [];
-      let held = (st._earlierMessages || []).length + (st.messages || []).length
-        + (st._laterMessages || []).length;
-      const dropEarlier = () => {
-        if (!(st._earlierMessages && st._earlierMessages.length) || held <= cap) return;
-        const drop = Math.min(held - cap, st._earlierMessages.length);
-        dropped.push(...st._earlierMessages.splice(0, drop));
-        st._loadedOffset = (st._loadedOffset || 0) + drop;
-        held -= drop;
-      };
-      const dropLater = () => {
-        if (!(st._laterMessages && st._laterMessages.length) || held <= cap) return;
-        // Keep the messages adjacent to the mounted window. Dropping from the
-        // front creates an unrecoverable hole before loadLaterMessages' next
-        // item; dropping the far future preserves one contiguous range.
-        const drop = Math.min(held - cap, st._laterMessages.length);
-        dropped.push(...st._laterMessages.splice(st._laterMessages.length - drop, drop));
-        st._hasServerLater = true;
-        held -= drop;
-      };
-      if (direction === "older") {
-        // Paging backward must retain the newly fetched past and evict the far
-        // future. The old earlier-first policy hit the cap once and made every
-        // older server page permanently unreachable.
-        dropLater();
-        dropEarlier();
-      } else if (direction === "around") {
-        // Defensive path for an oversized around response. Preserve the
-        // mounted target and discard whichever off-screen side is farther.
-        while (held > cap) {
-          const earlier = (st._earlierMessages || []).length;
-          const later = (st._laterMessages || []).length;
-          if (later >= earlier && later) dropLater();
-          else if (earlier) dropEarlier();
-          else break;
-        }
-      } else {
-        // Latest/newer navigation is the mirror image: keep the future and
-        // evict the far past, advancing the absolute first-held coordinate.
-        dropEarlier();
-        dropLater();
-      }
-      if (dropped.length) {
-        const retained = new Set();
-        for (const list of [st._earlierMessages, st.messages, st._laterMessages]) {
-          for (const message of (list || [])) retained.add(message);
-        }
-        this._releasePaneMessageRenderKeys(
-          st, dropped.filter(message => !retained.has(message)));
-      }
       this._syncSessionMessageStore(st);
-      return new Set(dropped);
+      return new Set();
     },
     _captureViewportMessageAnchor(scrollEl, sid) {
       if (!scrollEl || !sid) return null;
@@ -15516,15 +15627,10 @@ function portal() {
       const st = this._ensureTabState(sid);
       if (st._fetchingOlder) return 0;
       if (!(st._loadedOffset > 0)) return 0;
-      const held = (st.messages ? st.messages.length : 0)
-                 + (st._earlierMessages ? st._earlierMessages.length : 0)
-                 + (st._laterMessages ? st._laterMessages.length : 0);
-      // Reclaim the far-future cache while moving backward. This keeps a
-      // bounded contiguous window that can slide through the entire history,
-      // instead of treating the memory cap as a permanent navigation wall.
-      const room = Math.max(0, this._historyCacheCap() - held)
-        + (st._laterMessages ? st._laterMessages.length : 0);
-      const pageSize = Math.min(this.HISTORY_PAGE, st._loadedOffset, room);
+      // Fetch the next server page without imposing a browser count cap.
+      // Canonical normalized history remains resident; only its DOM rows are
+      // virtualized.
+      const pageSize = Math.min(this.HISTORY_PAGE, st._loadedOffset);
       if (pageSize <= 0) return 0;
       const newOffset = st._loadedOffset - pageSize;
       const limit = st._loadedOffset - newOffset;
@@ -15580,11 +15686,9 @@ function portal() {
         st._hasServerLater = false;
         return 0;
       }
-      // Mirror the older-page policy: reclaim the far-past stash so forward
-      // paging can also slide through history without exceeding the cache.
-      const room = Math.max(0, this._historyCacheCap() - held)
-        + (st._earlierMessages ? st._earlierMessages.length : 0);
-      const limit = Math.min(this.HISTORY_PAGE, st._total - start, room);
+      // Mirror older paging: retain every fetched canonical envelope and let
+      // viewport virtualization bound only the mounted rows.
+      const limit = Math.min(this.HISTORY_PAGE, st._total - start);
       if (limit <= 0) return 0;
       st._fetchingLater = true;
       try {
@@ -15753,10 +15857,11 @@ function portal() {
       // Capture scroll geometry BEFORE the DOM grows so we can restore the
       // user's visible-content offset after Alpine re-renders.
       const scrollEl = isCurrent ? this.$refs.chatBody : null;
-      // The previous first bubble survives an older-direction cap. Anchoring
-      // that exact keyed element stays correct even when the same mutation
-      // also removes tall bubbles from the bottom.
-      const anchor = this._captureMessageAnchor(scrollEl, st.messages[0]);
+      // Anchor the actual reading fold, not a count-window boundary that may be
+      // virtualized out of the DOM. Shift virtual indexes with the prepend so
+      // the same keyed rows remain mounted until the viewport resync runs.
+      const anchor = this._captureViewportMessageAnchor(scrollEl, sid);
+      this._shiftMessageVirtualWindow(st, batch.length);
       st.messages.unshift(...batch);
       this._markPaneRenderKeysDirty(st);
       this._ensurePaneMessageRenderKeys(sid);
@@ -15768,6 +15873,7 @@ function portal() {
       if (scrollEl) {
         this.$nextTick(() => {
           this._restoreMessageAnchor(scrollEl, anchor);
+          this._scheduleMessageViewportSync(sid);
           // Re-run code highlighting ONLY on the newly prepended bubbles
           // (the first batch.length `.msg` children). Rescanning the whole
           // chat body each click is O(total) — wasteful once a long history
@@ -15792,16 +15898,17 @@ function portal() {
       const batchSize = this._isMobileLayout() ? 20 : this.LOAD_MORE_BATCH;
       const batch = st._laterMessages.splice(0, batchSize);
       const scrollEl = sid === this.currentId ? this.$refs.chatBody : null;
-      // The previous last bubble survives a newer-direction cap; preserve its
-      // screen coordinate instead of restoring an absolute scrollTop after
-      // removing an arbitrary-height prefix.
-      const anchor = this._captureMessageAnchor(
-        scrollEl, st.messages[st.messages.length - 1]);
+      // Preserve the keyed row currently crossing the reading fold. The prior
+      // last canonical bubble may be outside the viewport render window.
+      const anchor = this._captureViewportMessageAnchor(scrollEl, sid);
       st.messages.push(...batch);
       this._capMountedWindow(st, "newer");
       if (sid === this.currentId) {
         this.messages = st.messages;
-        this.$nextTick(() => this._restoreMessageAnchor(scrollEl, anchor));
+        this.$nextTick(() => {
+          this._restoreMessageAnchor(scrollEl, anchor);
+          this._scheduleMessageViewportSync(sid);
+        });
       }
     },
     async returnToLatest(sid) {
@@ -15850,33 +15957,20 @@ function portal() {
       return local + server;
     },
 
-    // Evict the oldest rendered messages back to the lazy stash so a long
-    // LIVE session doesn't accumulate unbounded DOM (the mobile OOM root
-    // cause). Called right before a new user turn is appended — the mirror
-    // image of loadEarlierMessages: front-of-messages[] → end-of-stash.
-    // The evicted bubbles already carry .html, so paging them back via
-    // "Load earlier" re-renders nothing. Eviction happens at the TOP while
-    // the user sits at the bottom sending, so there's no scroll jump.
+    // Live history stays canonical in memory. The viewport row builder, not an
+    // envelope count, bounds the DOM while keeping every interaction target and
+    // normalized object reachable during long streaming turns.
     _capLiveMessages(st) {
       if (!st || !st.messages) return;
-      const cap = this._mountedMessageCap();
-      const overflow = st.messages.length - cap;
-      if (overflow <= 0) return;
-      const evicted = st.messages.splice(0, overflow);
-      // Append to the END of the stash: these bubbles are newer than
-      // everything already stashed but older than what stays visible, so
-      // they're the "closest in time" batch loadEarlierMessages pops first.
-      st._earlierMessages = (st._earlierMessages || []).concat(evicted);
-      this._capHistoryCache(st);
-      st._hasMoreHistory = st._earlierMessages.length > 0 || st._loadedOffset > 0;
+      this._scheduleMessageViewportSync(st._sid, st.atBottom !== false);
     },
     hasMoreHistory(sid) {
       sid = sid || this.currentId;
       if (!sid) return false;
       const st = this.tabState[sid];
       if (!st) return false;
-      // The bounded cache is a sliding window: reaching its size cap no longer
-      // blocks older paging because the far-future side is evicted on demand.
+      // Canonical history stays resident; this only reports whether another
+      // explicitly paged earlier section remains locally or on the server.
       if (st._earlierMessages && st._earlierMessages.length) return true;
       if (st._loadedOffset > 0) return true;
       // Sitting at offset 0 of a chain that itself starts partway into the
@@ -26706,6 +26800,7 @@ function portal() {
       const el = this.$refs.chatBody;
       if (!el) return;
       const st = this.currentId && this.tabState && this.tabState[this.currentId];
+      this._scheduleMessageViewportSync(this.currentId);
       // While WE are programmatically pinning to the bottom (the settle loop),
       // every per-frame `scrollTop = scrollHeight` fires this handler. Its
       // geometry read (scrollHeight/clientHeight) forces a synchronous reflow,
@@ -26733,9 +26828,8 @@ function portal() {
       // ANY scroll event whose geometry read > 2px — but several NON-user events
       // fire scroll with a transiently-wrong distance and silently broke
       // mid-stream follow ("某些 block 导致停止追随"):
-      //   1. _capLiveMessages evicting top bubbles on a long agentic turn shifts
-      //      content up; content-visibility:auto height estimates make the
-      //      distance read briefly > 2px.
+      //   1. A measured virtual-window shift replaces estimated spacer height;
+      //      the distance read can briefly exceed 2px during that correction.
       //   2. A late-realizing block (image / iframe / mermaid / highlighted code)
       //      growing height triggers the browser's scroll-anchoring, which moves
       //      scrollTop without any user input.
@@ -27310,14 +27404,14 @@ function portal() {
       // broadcast-rebuild on `/sessions/{sid}` GET produced it for us.
       if (!isReconnect) {
         // Sending starts a new latest turn. If the user paged into an older
-        // window, collapse the bounded cache back to its newest window first.
+        // server window, return to the canonical latest order first.
         if (this.hasLaterMessages(sendSid)) {
           const latestLoaded = await this.returnToLatest(sendSid);
           if (!latestLoaded || this.tabState[sendSid] !== sendState) return false;
         }
         if (!await this._awaitRuntimeSettingPatches(sendSid, sendState)) return false;
-        // Trim the live backlog before growing it again — keeps long
-        // sessions from ballooning the DOM past the mobile crash point.
+        // Refresh the viewport window before growing the live tail; canonical
+        // history remains intact while mounted rows stay bounded.
         this._capLiveMessages(sendState);
         sentUserBubble = this._appendLiveMessage(sendState, {
           role: "user", text,
@@ -27776,24 +27870,15 @@ function portal() {
       const _scrollIfActive = () => {
         this._capLiveMessages(streamState);
         if (this.currentId !== streamSid) return;
-        // Mid-stream DOM cap (root-cause fix for the mobile freeze on long
-        // turns). _capLiveMessages otherwise only runs at user-send, so a
-        // SINGLE long agentic turn — dozens of thinking / tool_use /
-        // tool_result bubbles pushed before the user types again — grows
-        // messages[] (and the rendered DOM) without bound. On phones the
-        // ballooning DOM eventually freezes the WebView. Trim from the
-        // front on every render/append tick: it's O(1) when under cap, and
-        // splice(0, overflow) can never touch the streaming tail bubble.
-        // Gate on atBottom — the same guard scrollToBottom uses — so we
-        // never evict (and visually jump) while the user has scrolled up to
-        // read history. Evicted bubbles land in the "Load earlier" stash.
+        // Refresh the measured viewport window throughout a long agentic turn.
+        // The final streaming rows remain mounted separately when the reader is
+        // scrolled up, while auto-follow still pins the main window to the tail.
         if (this.atBottom) this.scrollToBottom(false);
       };
       // Coalesced variant for event bursts. A turn that settles N background
       // tasks at once delivers N task_notification events back-to-back; calling
-      // _scrollIfActive per event ran N × (_capLiveMessages splice → Alpine DOM
-      // teardown → scrollHeight reflow → scrollTop slam), which is exactly the
-      // "会话区刷新闪烁" the user reported (2026-08-04). Collapse the whole burst
+      // _scrollIfActive per event repeatedly recalculates rows and scroll geometry.
+      // Collapse the whole burst to avoid the reported conversation-pane flicker
       // into one pass on the next frame — the card patches themselves are
       // already applied synchronously, so nothing visible is delayed beyond a
       // single frame.

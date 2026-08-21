@@ -4266,6 +4266,14 @@ pre.text {
   flex-direction: column;
   gap: var(--sp-2);
 }
+.msg-virtual-spacer {
+  flex: 0 0 auto;
+  width: 100%;
+  min-height: 0;
+  overflow: hidden;
+  pointer-events: none;
+}
+.msg-virtual-spacer > * { display: none !important; }
 .load-later-wrap {
   display: flex;
   justify-content: center;
