@@ -14130,14 +14130,14 @@ function portal() {
         // still render only ~INITIAL_LOAD and stash the rest. Older history
         // pages in from the server via _fetchOlderWindow on "Load earlier".
         const _coldEarly = !this.appReady;
-        const _mobileEarly = this._isMobileLayout();
-        const _baseInitialLoad = _mobileEarly
-          ? (_coldEarly ? 8 : 15)
-          : (_coldEarly ? 30 : 60);
+        // Mobile uses the same canonical history window as desktop. Viewport
+        // virtualization, rather than a device-specific message count, bounds
+        // mounted DOM work on smaller screens.
+        const _baseInitialLoad = _coldEarly ? 30 : 60;
         // QUIET refresh must not shrink the pane. A quiet load is a merge into
         // an ALREADY-PAINTED pane, and a long agentic turn can leave up to
-        // _mountedMessageCap() (300 desktop) bubbles mounted — far more than
-        // the cold-open window above. Loading the narrow window in that state
+        // _mountedMessageCap() canonical bubbles in its active window — far
+        // more than the cold-open window above. Loading the narrow window in that state
         // spliced several hundred bubbles down to ~60 and pushed the rest into
         // _earlierMessages: a violent height collapse + mass DOM teardown,
         // which is the post-turn half of the "会话区刷新闪烁" report
@@ -15008,10 +15008,11 @@ function portal() {
       this._capHistoryCache(st);
       return target[target.length - 1];
     },
-    // Retained as load/page sizing compatibility. DOM size is now controlled by
-    // the measured viewport window below, never by removing canonical messages.
-    _mountedMessageCap() { return this._isMobileLayout() ? 36 : 300; },
-    _historyCacheCap() { return this._isMobileLayout() ? 120 : 800; },
+    // Retained as load/page sizing compatibility. Mobile and desktop use the
+    // same canonical windows; measured viewport virtualization controls DOM
+    // size without removing or device-capping canonical messages.
+    _mountedMessageCap() { return 300; },
+    _historyCacheCap() { return 800; },
     _capMountedWindow(st, direction = "newer", anchorUuid = "") {
       if (!st) return { head: [], tail: [] };
       if (direction === "around" && anchorUuid) {

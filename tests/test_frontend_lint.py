@@ -2910,13 +2910,16 @@ def test_long_chat_state_is_per_tab_bounded_and_generation_safe():
     assert "_hasServerLater: false" in blank
     assert "_laterMessages: []" in blank
     assert "_nextLiveKey: 1" in blank
-    assert "_mountedMessageCap() { return this._isMobileLayout() ? 36 : 300; }" in app
-    assert "_historyCacheCap() { return this._isMobileLayout() ? 120 : 800; }" in app
+    assert "_mountedMessageCap() { return 300; }" in app
+    assert "_historyCacheCap() { return 800; }" in app
+    assert "_mountedMessageCap() { return this._isMobileLayout()" not in app
+    assert "_historyCacheCap() { return this._isMobileLayout()" not in app
     assert "_MAX_RESIDENT_PANES" not in app
     assert "residentPaneIds" not in app
     assert "_promoteResident" not in app
-    assert "? (_coldEarly ? 8 : 15)" in app
-    assert ": (_coldEarly ? 30 : 60)" in app
+    assert "const _baseInitialLoad = _coldEarly ? 30 : 60;" in app
+    assert "const _mobileEarly" not in app
+    assert "_coldEarly ? 8 : 15" not in app
     assert "if (cst && cst.streaming) continue" not in app
     assert '"&history_generation="' in app
     assert "if (r.status === 409)" in app
