@@ -65,6 +65,7 @@ from . import sessions as sess
 from . import endpoints
 from . import context_recovery
 from . import chat_history
+from . import chat_presentation
 from . import transcript_index as transcript_idx
 from .workspaces import (
     registry as workspace_registry,
@@ -4974,19 +4975,11 @@ def search_sessions_api(q: str = Query(default="", min_length=0, max_length=200)
 # CLI wraps slash commands as pseudo-user messages with these tags so it can
 # round-trip through the conversation log. They're internal protocol detail
 # and should never reach the user's chat UI as a regular bubble.
-_CLI_SLASH_TAGS_RE = re.compile(
-    r"<(command-name|command-message|command-args|"
-    r"local-command-stdout|local-command-stderr)>.*?</\1>",
-    re.DOTALL,
-)
 
 
 def _strip_cli_slash_wrapper(text: str) -> str:
-    """Remove CLI slash-command protocol tags. Returns cleaned text (may be
-    empty — caller should skip rendering when empty)."""
-    if not text:
-        return text
-    return _CLI_SLASH_TAGS_RE.sub("", text).strip()
+    """Patchable facade for CLI slash-command presentation cleanup."""
+    return chat_presentation.strip_cli_slash_wrapper(text)
 
 
 # A run_in_background task's completion round-trips through the conversation log
@@ -5004,33 +4997,11 @@ def _strip_cli_slash_wrapper(text: str) -> str:
 # rebuild (the transcript stores the XML record, never the typed message) and
 # as a live fallback for older CLIs; a fallback hit logs a
 # "[chat] task fallback" warning.
-_TASK_NOTIFICATION_RE = re.compile(
-    r"<task-notification>(.*?)</task-notification>", re.DOTALL)
 
 
 def _parse_task_notifications(text: str) -> list[dict]:
-    """Extract task-notification records from a user-message string. Returns a
-    list of {tool_use_id, task_id, status, summary, output_file}. Returns []
-    unless the message STARTS with <task-notification> — so prose that merely
-    mentions the tag (e.g. a context-summary message describing the protocol) is
-    never mistaken for an actual completion record."""
-    if not text or not text.lstrip().startswith("<task-notification>"):
-        return []
-    recs: list[dict] = []
-    for m in _TASK_NOTIFICATION_RE.finditer(text):
-        body = m.group(1)
-
-        def _f(tag: str) -> str:
-            mm = re.search(rf"<{tag}>(.*?)</{tag}>", body, re.DOTALL)
-            return mm.group(1).strip() if mm else ""
-        recs.append({
-            "tool_use_id": _f("tool-use-id"),
-            "task_id": _f("task-id"),
-            "status": _f("status"),
-            "summary": _f("summary"),
-            "output_file": _f("output-file"),
-        })
-    return recs
+    """Patchable facade for canonical task-notification parsing."""
+    return chat_presentation.parse_task_notifications(text)
 
 
 # FALLBACK launch sniff (updated 2026-06-11): on CLI 2.1.141 + SDK 0.2.95 a
@@ -5045,49 +5016,17 @@ def _parse_task_notifications(text: str) -> list[dict]:
 # post-completion auto-continue would never stream live. NOTE: the English
 # wording below is CLI-version-coupled; that brittleness is exactly why typed
 # messages are now the primary path. See docs/background-tasks-spec.md.
-_BG_LAUNCH_RE = re.compile(
-    r"Command running in background with ID:\s*([A-Za-z0-9._-]+)\."
-    r"\s*Output is being written to:\s*(\S+?\.output)\b")
 
 
 def _parse_bg_launch(text: str) -> dict | None:
-    """Detect a Bash background-task launch from a tool_result body. Returns
-    {task_id, output_file} on match, else None."""
-    if not text:
-        return None
-    m = _BG_LAUNCH_RE.search(text)
-    if not m:
-        return None
-    return {"task_id": m.group(1), "output_file": m.group(2)}
+    """Patchable facade for legacy background-launch parsing."""
+    return chat_presentation.parse_bg_launch(text)
 
 
 def _usermsg_task_notification_text(msg) -> str:
-    """If `msg` is a UserMessage carrying a <task-notification>, return its
-    textual content; else return "".
-
-    Fallback-path helper (updated 2026-06-11): the typed
-    TaskNotificationMessage is the primary live completion signal on CLI
-    2.1.141 + SDK 0.2.95. Some CLI builds additionally/instead deliver the
-    terminal completion as a normal UserMessage whose content is the raw
-    <task-notification> XML; this helper lets the fallback branches consume
-    that shape. Content may be a plain string or a list of content blocks;
-    flatten both to text."""
-    if not isinstance(msg, UserMessage):
-        return ""
-    content = getattr(msg, "content", None)
-    if isinstance(content, str):
-        text = content
-    elif isinstance(content, list):
-        parts = []
-        for block in content:
-            if isinstance(block, TextBlock):
-                parts.append(getattr(block, "text", "") or "")
-            elif isinstance(block, str):
-                parts.append(block)
-        text = "".join(parts)
-    else:
-        return ""
-    return text if "<task-notification>" in text else ""
+    """Patchable facade for fallback UserMessage notification extraction."""
+    return chat_presentation.usermsg_task_notification_text(
+        msg, user_message_type=UserMessage, text_block_type=TextBlock)
 
 
 def _sdk_messages_to_ui(
@@ -5097,275 +5036,20 @@ def _sdk_messages_to_ui(
     *,
     defer_large_bodies: bool = False,
 ) -> list[dict]:
-    """Convert SDK SessionMessage list into muselab's flat UI message list.
-    Each SessionMessage may explode into multiple UI bubbles because the
-    frontend renders tool_use / tool_result / thinking blocks as separate
-    messages from the text bubble. Annotations (cost, model, images) attach
-    by message UUID to the primary text bubble. UUIDs in `compact_uuids`
-    get an `_is_compact_summary` flag so the UI can render a "📦 已压缩" pill."""
-    compact_uuids = compact_uuids or set()
-    out: list[dict] = []
-    # tool_use_id → tool_name lookup so the historic-load path attaches the
-    # same `tool_name` field that the live stream attaches. Keeps the FE's
-    # per-tool rich renderers (Bash terminal, Read with gutter, …) working
-    # after a page refresh / session reload.
-    tool_use_names: dict[str, str] = {}
-    for sm in sm_list:
-        ann = annotations.get(sm.uuid, {})
-        is_compact = sm.uuid in compact_uuids
-        msg = sm.message or {}
-        content = msg.get("content")
-
-        # Simple shape: content is a single string.
-        if isinstance(content, str):
-            # Claude CLI persists an explicit Stop as a synthetic user record.
-            # It is not a message the human sent and must not split the visible
-            # assistant/tool run or appear as an English user bubble.
-            if _is_cli_interrupt_message(content):
-                continue
-            # Background-task completion record → stamp the launching tool_use
-            # card's terminal task_status (durable ✅ across reloads) and DROP
-            # the raw XML bubble. The card was emitted by an earlier assistant
-            # SessionMessage, so it's already in `out`; match it by tool_use id.
-            notifs = _parse_task_notifications(content)
-            if notifs:
-                for n in notifs:
-                    tuid = n.get("tool_use_id")
-                    if not tuid:
-                        continue
-                    raw_st = n.get("status") or ""
-                    state = (raw_st if raw_st in ("completed", "failed",
-                                                   "stopped") else "done")
-                    for prev in reversed(out):
-                        if (prev.get("role") == "tool_use"
-                                and prev.get("id") == tuid):
-                            prev["task_status"] = {
-                                "task_id": n.get("task_id") or "",
-                                "state": state,
-                                "summary": n.get("summary") or "",
-                                "output_file": n.get("output_file") or "",
-                            }
-                            break
-                continue
-            text = _strip_cli_slash_wrapper(content)
-            # CLI's slash-command wrapper (<command-name>/compact</command-name>
-            # …) round-trips through the conversation log as a "user" turn;
-            # hide it from the UI rather than rendering a confusing bubble.
-            if not text:
-                continue
-            entry = {"role": sm.type, "text": text, "uuid": sm.uuid}
-            if is_compact:
-                entry["_is_compact_summary"] = True
-            entry.update(ann)   # cost / model / images / etc.
-            out.append(entry)
-            continue
-        if not isinstance(content, list):
-            continue
-
-        text_buf = ""
-        image_refs = []   # placeholder for inline image blocks (if any in JSONL)
-
-        def flush_text():
-            nonlocal text_buf, image_refs
-            # Strip CLI slash wrapper before deciding if there's anything to
-            # render. Pure-wrapper messages produce empty text + no images
-            # → drop the bubble entirely.
-            cleaned = _strip_cli_slash_wrapper(text_buf)
-            if _is_cli_interrupt_message(cleaned):
-                cleaned = ""
-            if not cleaned and not image_refs:
-                text_buf = ""
-                image_refs = []
-                return
-            entry = {"role": sm.type, "text": cleaned, "uuid": sm.uuid}
-            if is_compact:
-                entry["_is_compact_summary"] = True
-            if image_refs:
-                # CLI JSONL stores image source dicts; convert minimal info for UI.
-                # If sidecar has full base64 (uploaded via muselab), it wins
-                # — already merged via ann["images"].
-                entry.setdefault("images", image_refs)
-            entry.update(ann)
-            out.append(entry)
-            text_buf = ""
-            image_refs = []
-
-        for block in content:
-            if not isinstance(block, dict):
-                continue
-            bt = block.get("type")
-            if bt == "text":
-                text_buf += block.get("text", "")
-            elif bt == "thinking":
-                flush_text()
-                # Live streaming now shows real thinking text (we pass
-                # display="summarized" — see _build_options). But the FINAL
-                # transcript persisted to JSONL can still come back redacted
-                # for Opus 4.x (`thinking` is "" and only the `signature`
-                # survives). On reload we surface a placeholder so the UI
-                # doesn't show an empty block — reads as "model thought here
-                # but the text isn't retained" rather than a broken render.
-                th_text = block.get("thinking", "") or ""
-                if not th_text.strip() and block.get("signature"):
-                    th_text = "[已加密推理 · 仅 streaming 期间可见明文]"
-                out.append({"role": "thinking", "text": th_text,
-                             "uuid": sm.uuid})
-            elif bt == "tool_use":
-                flush_text()
-                tu_name = block.get("name") or ""
-                tu_id = block.get("id") or ""
-                if tu_id:
-                    tool_use_names[tu_id] = tu_name
-                # Slim + cap the input the same way the live stream does so
-                # the FE gets a consistent shape across "fresh stream" and
-                # "reload from JSONL". Without this, reload-after-Edit lost
-                # the old_string/new_string fields and the diff renderer
-                # silently degraded to file-path-only.
-                raw_input = block.get("input") or {}
-                # Shared whitelist with the realtime _render_tool_use path —
-                # see module-level _SLIM_INPUT_FIELDS.
-                slim_input = {
-                    k: _slim_input_value(v)
-                    for k, v in raw_input.items()
-                    if k in _SLIM_INPUT_FIELDS
-                }
-                tu = {
-                    "role": "tool_use",
-                    "uuid": sm.uuid,
-                    "id": tu_id,
-                    "name": tu_name,
-                    "input": slim_input,
-                    # Compact summary that the frontend usually shows in the bubble
-                    "summary": _summarize_tool_input(tu_name, raw_input),
-                }
-                if tu_name == "TodoWrite":
-                    tu["todos"] = raw_input.get("todos") or []
-                elif tu_name in ("Task", "Agent"):
-                    tu["task"] = {
-                        "subagent_type": raw_input.get("subagent_type"),
-                        "description": raw_input.get("description"),
-                        "prompt": raw_input.get("prompt"),
-                    }
-                elif tu_name == "ExitPlanMode":
-                    tu["plan"] = raw_input.get("plan") or ""
-                out.append(tu)
-            elif bt == "tool_result":
-                flush_text()
-                tr_text = ""
-                tr_content = block.get("content")
-                if isinstance(tr_content, str):
-                    tr_text = tr_content
-                elif isinstance(tr_content, list):
-                    parts = []
-                    for p in tr_content:
-                        if isinstance(p, dict):
-                            parts.append(p.get("text", str(p)))
-                        else:
-                            parts.append(str(p))
-                    tr_text = "\n".join(parts)
-                tu_id = block.get("tool_use_id") or ""
-                tool_name = tool_use_names.get(tu_id, "")
-                entry = {
-                    "role": "tool_result", "uuid": sm.uuid,
-                    "id": tu_id,
-                    "preview": tr_text[:_TOOL_RESULT_PREVIEW_CAP],
-                    "truncated": len(tr_text) > _TOOL_RESULT_PREVIEW_CAP,
-                    "text": tr_text,
-                    "text_truncated": False,
-                    "is_error": bool(block.get("is_error", False)),
-                }
-                if tool_name:
-                    entry["tool_name"] = tool_name
-                if tool_name == "Bash":
-                    bash = _parse_bash_result(tr_text)
-                    if bash:
-                        entry["bash"] = bash
-                out.append(entry)
-            elif bt == "image":
-                # Inline image block in user content — record a reference.
-                # Real base64 lives in the sidecar (annotations["images"]) for
-                # images the user uploaded via muselab's upload flow.
-                src = block.get("source") or {}
-                image_refs.append({"mime": src.get("media_type") or ""})
-            # Other block types (server_tool_use, etc.) — skip silently for now.
-        flush_text()
-    # Propagate the turn-completion ts (stored on the LAST sm.uuid of
-    # the turn via set_message_annotation in chat_stream's tail) onto
-    # EVERY ui entry that shares that uuid — thinking / tool_use /
-    # tool_result / assistant text. The frontend renders turn-footer
-    # under whichever entry is the turn tail; making sure all of them
-    # carry ts means whatever block ends up at the tail can display
-    # the time. Cheap O(N) — annotations is already a dict lookup.
-    # Per-message wall-clock, distinct from `ts`. `ts` is the TURN-completion
-    # stamp deliberately fanned across the tail uuid only; `mts` is when this
-    # individual record was written. Keeping them separate matters: the FE's
-    # _markDone walks backwards looking for a bubble that already has `ts` to
-    # decide it has left the current turn, so populating `ts` everywhere would
-    # abort that walk on the first block it saw. Absent on the pure-SDK loader
-    # (SessionMessage carries no timestamp) — consumers must treat it as
-    # optional.
-    mts_by_uuid: dict[str, int] = {}
-    for sm in sm_list:
-        val = getattr(sm, "mts", None)
-        if val:
-            mts_by_uuid[sm.uuid] = val
-    key_ordinals: dict[str, int] = {}
-    for entry in out:
-        u = entry.get("uuid")
-        if not u:
-            continue
-        ordinal = key_ordinals.get(u, 0)
-        key_ordinals[u] = ordinal + 1
-        block_id = f"{u}:{ordinal}:{entry.get('role') or 'unknown'}"
-        entry["block_id"] = block_id
-        # Backward-compatible transport key. New consumers should persist
-        # block_id; unlike response-local duplicate suffixes it is derived only
-        # from the canonical record and block position.
-        entry["_key"] = block_id
-        if u in mts_by_uuid:
-            entry["mts"] = mts_by_uuid[u]
-        ann = annotations.get(u, {})
-        ts = ann.get("ts")
-        if ts is not None and "ts" not in entry:
-            entry["ts"] = ts
-        # Also fan elapsed_s out the same way — turn-footer's "13:42 ·
-        # 2m50s" should survive a session reload too. Stored as float
-        # seconds by chat.py (see _handle_result_message).
-        elapsed = ann.get("elapsed_s")
-        if elapsed is not None and "elapsed" not in entry:
-            entry["elapsed"] = elapsed
-        # Completion annotations belong to the persisted assistant UUID, but
-        # one SDK message can explode into thinking/tool/result bubbles and the
-        # footer mounts on whichever bubble is visually last.  Fan model and
-        # terminal state across that UUID just like ts/elapsed, otherwise a
-        # tool-ending turn reloads as two separator lines with no model/state.
-        model_name = ann.get("model")
-        if model_name and "model" not in entry:
-            entry["model"] = model_name
-        turn_status = ann.get("turn_status")
-        if turn_status and "turn_status" not in entry:
-            entry["turn_status"] = turn_status
-        # Recall trace is footer metadata too.  The live `done` event carries
-        # it for the first paint; fan the persisted sidecar value across every
-        # bubble produced by the assistant UUID so a refresh/tool-ending turn
-        # keeps the same memory badge on its actual visual tail.
-        memory_recall = ann.get("memory_recall")
-        if memory_recall and "memoryRecall" not in entry:
-            entry["memoryRecall"] = memory_recall
-        # User-msg image annotations (thumb + url for the lightbox)
-        # live in the sidecar — the inline `image_refs` extracted from
-        # the SDK content blocks only carry `mime`. Layer the sidecar's
-        # richer payload on top so the FE sees {mime, thumb, url} after
-        # a session reload, not just the bare mime.
-        ann_images = ann.get("images")
-        if ann_images and entry.get("role") == "user":
-            entry["images"] = ann_images
-        ann_docs = ann.get("docs")
-        if ann_docs and entry.get("role") == "user":
-            entry["docs"] = ann_docs
-    if defer_large_bodies:
-        _defer_large_ui_bodies(out)
-    return out
+    """Patchable facade for canonical transcript-to-UI shaping."""
+    return chat_presentation.sdk_messages_to_ui(
+        sm_list,
+        annotations,
+        compact_uuids,
+        defer_large_bodies=defer_large_bodies,
+        is_cli_interrupt_message=_is_cli_interrupt_message,
+        slim_input_fields=_SLIM_INPUT_FIELDS,
+        slim_value=_slim_input_value,
+        summarize_input=_summarize_tool_input,
+        parse_bash=_parse_bash_result,
+        tool_result_preview_cap=_TOOL_RESULT_PREVIEW_CAP,
+        defer_bodies=_defer_large_ui_bodies,
+    )
 
 
 def _apply_runtime_task_overlays(
@@ -5405,43 +5089,13 @@ def _transcript_index_path(sid: str) -> Path:
 
 
 def _describe_transcript_record(entry: dict) -> dict:
-    """Build persistent index metadata using the real UI expansion logic.
-
-    Calling `_sdk_messages_to_ui` for one record makes `bubble_count` an exact
-    contract rather than a second, approximate block counter that can drift
-    when slash wrappers, task notifications, or new block types are added.
-    """
-    msg = _RawMsg(str(entry.get("uuid") or ""), str(entry.get("type") or ""),
-                  entry.get("message") or {})
-    compact = {msg.uuid} if entry.get("isCompactSummary") else set()
-    bubbles = _sdk_messages_to_ui([msg], {}, compact)
-    tool_uses: list[dict] = []
-    content = (entry.get("message") or {}).get("content")
-    if isinstance(content, list):
-        for block in content:
-            if isinstance(block, dict) and block.get("type") == "tool_use":
-                tool_uses.append({
-                    "id": block.get("id") or "",
-                    "name": block.get("name") or "",
-                })
-    notifications = (
-        _parse_task_notifications(content) if isinstance(content, str) else []
+    """Build index metadata with the same patchable UI renderer facade."""
+    return chat_presentation.describe_transcript_record(
+        entry,
+        raw_message_factory=_RawMsg,
+        render_messages=_sdk_messages_to_ui,
+        is_real_user_prompt=_is_real_user_prompt,
     )
-    user_bubble = next((b for b in bubbles if b.get("role") == "user"), None)
-    user_text = (user_bubble or {}).get("text", "")
-    has_inline_images = (
-        isinstance(content, list)
-        and any(isinstance(block, dict) and block.get("type") == "image"
-                for block in content)
-    )
-    return {
-        "bubble_count": len(bubbles),
-        "user_preview": _outline_preview(user_text) if user_bubble is not None else "",
-        "real_user_prompt": _is_real_user_prompt(msg) and not notifications,
-        "has_inline_images": has_inline_images,
-        "tool_uses": tool_uses,
-        "task_notifications": notifications,
-    }
 
 
 def _ensure_transcript_index(sid: str) -> tuple[Path, dict] | None:
@@ -5656,107 +5310,14 @@ def _complete_turn_footer_metadata(
     has_later: bool,
     active_turn: "TurnBroadcast | None" = None,
 ) -> None:
-    """Put one complete footer contract on every real visual turn tail.
-
-    The frontend footer lives on the last muse-side bubble before a visible
-    user bubble.  Persisted completion annotations, however, belong to the
-    exact assistant UUID that produced ResultMessage and may sit earlier than
-    a trailing tool_result.  Background continuations add another wrinkle:
-    they have no visible user separator at all.  Restrict donors to the tail's
-    indexed turn origin, then fill status/time/duration/model without leaking
-    metadata across those hidden boundaries.
-    """
-    if not messages:
-        return
-    active_uuid = ""
-    if active_turn is not None and not active_turn.done:
-        active_uuid = str(active_turn.last_assistant_uuid or "")
-
-    i = 0
-    while i < len(messages):
-        if messages[i].get("role") == "user":
-            i += 1
-            continue
-        group_start = i
-        while i < len(messages) and messages[i].get("role") != "user":
-            i += 1
-        group = messages[group_start:i]
-        tail = group[-1]
-        origin_uuid = str(tail.get("_turn_origin_uuid") or "")
-        scope = ([item for item in group
-                  if str(item.get("_turn_origin_uuid") or "") == origin_uuid]
-                 if origin_uuid else group)
-        if not scope:
-            scope = [tail]
-
-        def last_value(field: str) -> Any:
-            for item in reversed(scope):
-                if field not in item:
-                    continue
-                value = item.get(field)
-                if value is not None and value != "":
-                    return value
-            return None
-
-        status = str(last_value("turn_status") or "")
-        active_scope = bool(active_uuid and any(
-            str(item.get("uuid") or "") == active_uuid for item in scope))
-        closed_by_user = i < len(messages)
-        complete_window_tail = i == len(messages) and not has_later
-        if not status:
-            if active_scope:
-                status = "running"
-            elif closed_by_user or complete_window_tail:
-                status = "completed"
-
-        # A page ending in the middle of a turn is not a real footer boundary.
-        # Leave it without status; the frontend hides incomplete separators.
-        if not status:
-            continue
-
-        terminal_ms = last_value("ts")
-        if terminal_ms is None:
-            terminal_ms = last_value("mts")
-        try:
-            terminal_ms = int(terminal_ms) if terminal_ms is not None else None
-        except (TypeError, ValueError, OverflowError):
-            terminal_ms = None
-
-        started_ms = last_value("turn_started_at")
-        try:
-            started_ms = int(started_ms) if started_ms is not None else None
-        except (TypeError, ValueError, OverflowError):
-            started_ms = None
-
-        elapsed = last_value("elapsed")
-        try:
-            elapsed = float(elapsed) if elapsed is not None else None
-        except (TypeError, ValueError, OverflowError):
-            elapsed = None
-        if elapsed is None and started_ms is not None:
-            end_ms = (int(time.time() * 1000)
-                      if status == "running" else terminal_ms)
-            if end_ms is not None:
-                elapsed = round(max(0.0, (end_ms - started_ms) / 1000), 1)
-
-        footer_model = str(last_value("model") or "")
-        if not footer_model and active_scope and active_turn is not None:
-            footer_model = str(active_turn.model or "")
-        if not footer_model:
-            footer_model = str(session_model or "")
-
-        tail["turn_status"] = status
-        if status != "running" and terminal_ms is not None:
-            tail["ts"] = terminal_ms
-        if started_ms is not None:
-            tail["turn_started_at"] = started_ms
-        if elapsed is not None:
-            tail["elapsed"] = elapsed
-        if footer_model:
-            tail["model"] = footer_model
-        memory_recall = last_value("memoryRecall")
-        if memory_recall:
-            tail["memoryRecall"] = memory_recall
+    """Patchable facade for footer-donor presentation shaping."""
+    chat_presentation.complete_turn_footer_metadata(
+        messages,
+        session_model,
+        has_later=has_later,
+        active_turn=active_turn,
+        now=time.time,
+    )
 
 
 def _persistable_memory_recall(trace: Any) -> dict | None:
@@ -5815,36 +5376,8 @@ def _bind_pending_attachments(sid: str, messages: list[dict]) -> None:
 
 
 def _summarize_tool_input(name: str | None, inp: dict) -> str:
-    """Same summarization used by _render_tool_use, factored to also work for
-    raw dict input (post-JSONL parse, no ToolUseBlock instance)."""
-    if not name:
-        return ""
-    if name in ("Read", "Edit", "Write"):
-        return inp.get("file_path", "")
-    if name == "Bash":
-        return (inp.get("command") or "")[:_MAX_INPUT_FIELD_LEN]
-    if name in ("Glob", "Grep"):
-        return (inp.get("pattern") or "") + (f"  in {inp.get('path','')}" if inp.get("path") else "")
-    if name == "WebFetch":
-        return inp.get("url", "")
-    if name == "WebSearch":
-        return inp.get("query", "")
-    if name == "TodoWrite":
-        return f"{len(inp.get('todos') or [])} todos"
-    # Keep these in sync with _render_tool_use (the realtime-stream path) —
-    # otherwise reloading a Task/ExitPlanMode/Skill turn from JSONL shows an
-    # empty summary while the live stream showed a meaningful one.
-    # "Agent" is the SDK's current name for the subagent-invoking tool
-    # (was "Task"); accept both so old + new transcripts both render.
-    if name in ("Task", "Agent"):
-        sub = inp.get("subagent_type") or "agent"
-        desc = inp.get("description") or ""
-        return f"[{sub}] {desc}"[:240]
-    if name == "ExitPlanMode":
-        return (inp.get("plan") or "")[:240]
-    if name == "Skill":
-        return inp.get("name") or inp.get("skill") or ""
-    return ""
+    """Patchable facade for historic tool-input summaries."""
+    return chat_presentation.summarize_tool_input(name, inp)
 
 
 # Cache of compact-summary UUID scans keyed by sid → (mtime, size, uuids).
@@ -6487,20 +6020,8 @@ def get_session_block_api(sid: str, block_id: str) -> dict:
 
 
 def _outline_preview(text: str) -> str:
-    """First meaningful line of a user prompt, trimmed to 80 chars. Mirrors
-    the old client-side preview logic so the outline reads the same after we
-    moved extraction server-side. Skips blockquote (>) lines and strips a
-    leading markdown heading marker."""
-    raw = (text or "").strip()
-    if not raw:
-        return "(empty)"
-    lines = raw.split("\n")
-    one_line = next(
-        (ln for ln in lines if ln.strip() and not ln.strip().startswith(">")),
-        lines[0] if lines else raw,
-    )
-    cleaned = re.sub(r"^#+\s*", "", one_line).strip()
-    return cleaned[:77] + "…" if len(cleaned) > 80 else cleaned
+    """Patchable facade for session-outline previews."""
+    return chat_presentation.outline_preview(text)
 
 
 @router.get("/sessions/{sid}/outline", dependencies=[Depends(require_token)])
@@ -6548,164 +6069,8 @@ def get_session_outline_api(sid: str) -> dict:
 
 
 def _broadcast_to_ui_messages(bc: "TurnBroadcast") -> list[dict]:
-    """Reconstruct the browser-visible portion of one broadcast.
-
-    This is the display record used when an explicit interrupt prevents the
-    CLI from committing a canonical JSONL turn.  It deliberately contains no
-    hidden protocol payloads and is never fed back to the model: only the same
-    bounded text/thinking/tool fields already sent to the browser are kept.
-    """
-    out: list[dict] = []
-    if bc.user_text or bc.user_images or bc.user_docs:
-        out.append({
-            "role": "user",
-            "text": bc.user_text,
-            "images": bc.user_images,
-            "docs": bc.user_docs,
-        })
-    cur_text_msg: dict | None = None
-    cur_thinking_msg: dict | None = None
-
-    def close_segment() -> None:
-        nonlocal cur_text_msg, cur_thinking_msg
-        cur_text_msg = None
-        cur_thinking_msg = None
-
-    def apply_task_status(tool_use_id: str, task_id: str, **patch: Any) -> None:
-        for message in reversed(out):
-            if message.get("role") != "tool_use":
-                continue
-            status = message.get("task_status") or {}
-            if (tool_use_id and message.get("id") == tool_use_id) or (
-                task_id and status.get("task_id") == task_id
-            ):
-                message["task_status"] = {**status, "task_id": task_id, **patch}
-                return
-
-    for ev in bc.replay_events():
-        kind = ev.get("event") or ""
-        data_str = ev.get("data") or "{}"
-        try:
-            data = json.loads(data_str)
-        except Exception:
-            continue
-        if kind == "text":
-            cur_thinking_msg = None
-            chunk = data.get("text", "")
-            if cur_text_msg is None:
-                cur_text_msg = {"role": "assistant", "text": chunk,
-                                  "model": bc.model}
-                out.append(cur_text_msg)
-            else:
-                cur_text_msg["text"] += chunk
-        elif kind == "thinking":
-            cur_text_msg = None
-            chunk = data.get("text", "")
-            if cur_thinking_msg is None:
-                cur_thinking_msg = {"role": "thinking", "text": chunk}
-                out.append(cur_thinking_msg)
-            else:
-                cur_thinking_msg["text"] += chunk
-        elif kind == "tool_use":
-            close_segment()
-            message = {
-                "role": "tool_use",
-                "name": data.get("name"),
-                "id": data.get("id"),
-                "summary": data.get("summary"),
-                "input": data.get("input") or {},
-                "task_status": None,
-                "_approvalSuperseded": False,
-                **({"todos": data["todos"]} if "todos" in data else {}),
-                **({"task": data["task"]} if "task" in data else {}),
-                **({"plan": data["plan"]} if "plan" in data else {}),
-            }
-            out.append(message)
-        elif kind == "tool_result":
-            close_segment()
-            out.append({
-                "role": "tool_result",
-                "id": data.get("id"),
-                "tool_name": data.get("tool_name") or "",
-                "preview": data.get("preview"),
-                "text": data.get("text") or "",
-                "truncated": data.get("truncated"),
-                "text_truncated": data.get("text_truncated"),
-                "is_error": data.get("is_error"),
-                "bash": data.get("bash"),
-            })
-        elif kind == "task_started":
-            apply_task_status(
-                str(data.get("tool_use_id") or ""),
-                str(data.get("task_id") or ""),
-                state="running",
-                description=data.get("description") or "",
-            )
-        elif kind == "task_progress":
-            apply_task_status(
-                str(data.get("tool_use_id") or ""),
-                str(data.get("task_id") or ""),
-                state="running",
-                usage=data.get("usage") or {},
-                last_tool_name=data.get("last_tool_name") or "",
-            )
-        elif kind == "task_notification":
-            raw_state = str(data.get("status") or "")
-            state = raw_state if raw_state in {
-                "completed", "failed", "stopped"
-            } else "done"
-            apply_task_status(
-                str(data.get("tool_use_id") or ""),
-                str(data.get("task_id") or ""),
-                state=state,
-                summary=data.get("summary") or "",
-                output_file=data.get("output_file") or "",
-            )
-        elif kind == "ask_user_question":
-            close_segment()
-            questions = data.get("questions") or []
-            out.append({
-                "role": "ask_user_question",
-                "id": data.get("id"),
-                "questions": questions,
-                "pendingAnswers": {
-                    str(question.get("question") or ""): (
-                        [] if question.get("multiSelect") else None
-                    )
-                    for question in questions
-                    if isinstance(question, dict)
-                },
-                # The stream is terminal: never resurrect an actionable card
-                # whose backend Future was cancelled with the turn.
-                "submitted": True,
-                "askOtherOpen": False,
-                "askOtherText": "",
-            })
-        elif kind == "permission_request":
-            close_segment()
-            out.append({
-                "role": "permission_request",
-                "id": data.get("id"),
-                "tool": data.get("tool"),
-                "summary": data.get("summary"),
-                "kind": data.get("kind") or "tool",
-                "suggestions": data.get("suggestions") or [],
-                "return_mode": data.get("return_mode") or "",
-                "title": data.get("title") or "",
-                "display_name": data.get("display_name") or "",
-                "description": data.get("description") or "",
-                "input": data.get("input") or {},
-                "tool_use_id": data.get("tool_use_id") or data.get("toolUseId") or "",
-                "plan": data.get("plan") or "",
-                "resolved": True,
-                "decision": "expired",
-                "mode": None,
-                "submitting": False,
-                "awaitingTransition": False,
-                "_decisionAcknowledged": True,
-                "failure_message": "",
-            })
-    return out
+    """Patchable facade for interrupted-turn display reconstruction."""
+    return chat_presentation.broadcast_to_ui_messages(bc)
 
 
 _CANCELLED_TURN_SNAPSHOT_SCHEMA = 1
@@ -12261,7 +11626,7 @@ async def reset(session_id: str | None = None) -> dict:
 # capping the worst case at "still fits in one SSE frame, fits in the browser
 # buffer". Truncation is marked inline so the FE can show "…and 90KB more"
 # instead of silently rendering a partial diff.
-_MAX_INPUT_FIELD_LEN = 100_000
+_MAX_INPUT_FIELD_LEN = chat_presentation.MAX_INPUT_FIELD_LEN
 
 # Single source of truth for which tool-input fields the FE actually renders.
 # BOTH the realtime stream path (_render_tool_use) and the JSONL-reload path
@@ -12269,155 +11634,48 @@ _MAX_INPUT_FIELD_LEN = 100_000
 # so a reloaded session renders the same tool chips/labels the live stream did
 # (previously the two whitelists had drifted: reload was missing the Task*
 # family subject/activeForm/taskId/status fields).
-_SLIM_INPUT_FIELDS = frozenset({
-    "file_path", "notebook_path", "path",
-    "command", "pattern", "url", "query",
-    "name", "skill", "subagent_type", "description", "todos",
-    # Diff-rendering inputs (Edit / MultiEdit / Write).
-    "old_string", "new_string", "edits", "content",
-    # Read pagination — surfaces as "lines N–M" label.
-    "offset", "limit",
-    # Bash extras — long-running command spinner state.
-    "timeout", "run_in_background",
-    # MultiEdit/Edit "fix on miss" flag (Claude sometimes sends it).
-    "replace_all",
-    # Task* family — FE task-log-line renderer (subject + #id + status).
-    "subject", "activeForm",
-    "taskId", "task_id", "status",
-    "addBlocks", "addBlockedBy",
-})
+_SLIM_INPUT_FIELDS = chat_presentation.SLIM_INPUT_FIELDS
 
 
 def _slim_input_value(v: Any) -> Any:
-    """Cap a single tool-input field so a runaway Write doesn't blow the
-    SSE buffer. Strings get truncated with a marker; large lists/dicts are
-    rejected entirely and replaced by a placeholder (the FE wasn't going to
-    render them meaningfully anyway)."""
-    if isinstance(v, str) and len(v) > _MAX_INPUT_FIELD_LEN:
-        return (v[:_MAX_INPUT_FIELD_LEN]
-                + f"\n…[truncated, {len(v) - _MAX_INPUT_FIELD_LEN} chars more]")
-    if isinstance(v, (list, dict)):
-        try:
-            dumped = json.dumps(v, ensure_ascii=False)
-            if len(dumped) > _MAX_INPUT_FIELD_LEN:
-                return (f"[truncated structured field, "
-                        f"{len(dumped)} chars total]")
-        except (TypeError, ValueError):
-            pass
-    return v
+    """Patchable facade for bounded tool-input transport values."""
+    return chat_presentation.slim_input_value(
+        v, max_length=_MAX_INPUT_FIELD_LEN)
 
 
 def _render_tool_use(block: ToolUseBlock) -> dict:
-    inp = block.input or {}
-    name = block.name
-    if name in ("Read", "Edit", "Write"):
-        summary = inp.get("file_path", "")
-    elif name == "Bash":
-        summary = (inp.get("command") or "")[:_MAX_INPUT_FIELD_LEN]
-    elif name in ("Glob", "Grep"):
-        summary = (inp.get("pattern") or "") + (f"  in {inp.get('path','')}" if inp.get("path") else "")
-    elif name == "WebFetch":
-        summary = inp.get("url", "")
-    elif name == "WebSearch":
-        summary = inp.get("query", "")
-    elif name == "TodoWrite":
-        items = inp.get("todos") or []
-        summary = f"{len(items)} todos"
-    elif name in ("Task", "Agent"):
-        sub = inp.get("subagent_type") or "agent"
-        desc = inp.get("description") or ""
-        summary = f"[{sub}] {desc}"[:240]
-    elif name == "ExitPlanMode":
-        summary = (inp.get("plan") or "")[:240]
-    elif name == "Skill":
-        summary = inp.get("name") or inp.get("skill") or ""
-    else:
-        summary = json.dumps(inp, ensure_ascii=False)[:200]
-
-    # Slim input — drop bulky fields the FE doesn't use, cap retained fields
-    # at _MAX_INPUT_FIELD_LEN. FE uses these for:
-    #   - file_path → clickable chip + preview auto-refresh on Edit
-    #   - old_string / new_string / edits / content → diff rendering for
-    #     Edit / MultiEdit / Write (previously the FE had no way to show
-    #     "what Muse actually changed" beyond a file_path chip)
-    #   - offset / limit → "lines N–M of …" label on Read
-    #   - command → Bash terminal-style block
-    # Field set is the module-level _SLIM_INPUT_FIELDS (shared with the
-    # JSONL-reload path so live + reloaded renders stay identical).
-    slim_input = {k: _slim_input_value(v)
-                  for k, v in inp.items() if k in _SLIM_INPUT_FIELDS}
-    out: dict = {"name": name, "summary": summary, "id": block.id,
-                  "input": slim_input}
-    # Pass full structured payloads through for tools that have dedicated UIs.
-    if name == "TodoWrite":
-        out["todos"] = inp.get("todos") or []
-    elif name in ("Task", "Agent"):
-        out["task"] = {
-            "subagent_type": inp.get("subagent_type"),
-            "description": inp.get("description"),
-            "prompt": inp.get("prompt"),
-        }
-    elif name == "ExitPlanMode":
-        out["plan"] = inp.get("plan") or ""
-    return out
+    """Patchable facade for live tool-use rendering."""
+    return chat_presentation.render_tool_use(
+        block,
+        max_input_field_len=_MAX_INPUT_FIELD_LEN,
+        slim_input_fields=_SLIM_INPUT_FIELDS,
+        slim_value=_slim_input_value,
+    )
 
 
 # Live SSE tool results still need a hard ceiling because the canonical JSONL
 # may not exist yet. Historical responses use stable block references instead:
 # large bodies stay in the authoritative transcript and are fetched on demand.
-_TOOL_RESULT_PREVIEW_CAP = 500
-_TOOL_RESULT_TEXT_CAP = 50_000
-_HISTORY_INLINE_BODY_CAP = 8_000
-_HISTORY_BODY_PREVIEW_CAP = 2_000
+_TOOL_RESULT_PREVIEW_CAP = chat_presentation.TOOL_RESULT_PREVIEW_CAP
+_TOOL_RESULT_TEXT_CAP = chat_presentation.TOOL_RESULT_TEXT_CAP
+_HISTORY_INLINE_BODY_CAP = chat_presentation.HISTORY_INLINE_BODY_CAP
+_HISTORY_BODY_PREVIEW_CAP = chat_presentation.HISTORY_BODY_PREVIEW_CAP
 
 
 def _defer_large_ui_bodies(messages: list[dict]) -> None:
-    """Replace oversized canonical bodies with a stable lazy-load reference.
-
-    This is a transport decision only. ``body_state=unloaded`` means the full
-    source is still present in the canonical transcript; it must not be confused
-    with irreversible source truncation. User prompts remain inline so edit/retry
-    behavior never depends on a second request.
-    """
-    for message in messages:
-        role = str(message.get("role") or "")
-        if role not in {"assistant", "thinking", "tool_result"} \
-                and not message.get("_is_compact_summary"):
-            continue
-        text = message.get("text")
-        block_id = str(message.get("block_id") or "")
-        if not isinstance(text, str) or len(text) <= _HISTORY_INLINE_BODY_CAP \
-                or not block_id:
-            continue
-        preview_cap = (
-            _TOOL_RESULT_PREVIEW_CAP
-            if role == "tool_result"
-            else _HISTORY_BODY_PREVIEW_CAP
-        )
-        preview = text[:preview_cap]
-        message["text"] = preview
-        message["preview"] = preview
-        message["body_state"] = "unloaded"
-        message["body_available"] = True
-        message["body_length"] = len(text)
-        message["body_ref"] = block_id
-        # Structured Bash fields can contain the same multi-megabyte stdout.
-        # They are reconstructed by the block endpoint together with the body.
-        message.pop("bash", None)
-        # Legacy clients may render the preview, but must not claim the source
-        # was discarded. ``text_truncated`` is reserved for true source loss.
-        message["text_truncated"] = False
+    """Patchable facade for deferred canonical-body transport shaping."""
+    chat_presentation.defer_large_ui_bodies(
+        messages,
+        inline_body_cap=_HISTORY_INLINE_BODY_CAP,
+        body_preview_cap=_HISTORY_BODY_PREVIEW_CAP,
+        tool_result_preview_cap=_TOOL_RESULT_PREVIEW_CAP,
+    )
 
 
 # Bash output format from claude-code's CLI: stdout / stderr / exit_code are
 # wrapped in pseudo-XML tags so we can split them apart for terminal-style
 # rendering. Falls through gracefully when the tags aren't present (vendor
 # wrappers / mocked runs); the FE then just renders the raw body.
-_BASH_TAG_RE = re.compile(
-    r"<(stdout|stderr|exit_code|interrupted|description)>"
-    r"(.*?)</\1>",
-    re.DOTALL,
-)
 
 
 def _classify_stream_error(err: Any) -> dict:
@@ -12518,65 +11776,21 @@ def _error_event(err: Any, *, activity_source: str = "") -> dict:
 
 
 def _parse_bash_result(text: str) -> dict | None:
-    """Return {stdout, stderr, exit_code, interrupted, description} when
-    `text` carries CLI's wrapped Bash output. None when the body isn't in
-    that shape (still falls through to plain-text rendering on the FE)."""
-    if not text or "<" not in text:
-        return None
-    matches = list(_BASH_TAG_RE.finditer(text))
-    if not matches:
-        return None
-    parts: dict[str, Any] = {}
-    for m in matches:
-        tag, body = m.group(1), m.group(2)
-        if tag == "exit_code":
-            try:
-                parts["exit_code"] = int(body.strip())
-            except ValueError:
-                pass
-        elif tag == "interrupted":
-            parts["interrupted"] = body.strip().lower() in ("true", "1", "yes")
-        else:
-            parts[tag] = body
-    return parts or None
+    """Patchable facade for structured Bash result parsing."""
+    return chat_presentation.parse_bash_result(text)
 
 
-def _render_tool_result(block: ToolResultBlock,
-                        *, tool_name: str = "") -> dict:
-    text = ""
-    if isinstance(block.content, str):
-        text = block.content
-    elif isinstance(block.content, list):
-        parts = []
-        for p in block.content:
-            if isinstance(p, dict):
-                parts.append(p.get("text", str(p)))
-            else:
-                parts.append(str(p))
-        text = "\n".join(parts)
-    out: dict = {
-        "id": getattr(block, "tool_use_id", None),
-        "preview": text[:_TOOL_RESULT_PREVIEW_CAP],
-        "truncated": len(text) > _TOOL_RESULT_PREVIEW_CAP,
-        # Full body up to _TOOL_RESULT_TEXT_CAP — drives the FE's "expand"
-        # affordance and per-tool rich render (Bash terminal, Read with
-        # gutter, WebFetch markdown card). When the underlying SDK text was
-        # bigger than the cap, `text_truncated` tells the FE so it can show
-        # "… 50KB more cut" instead of pretending this is the full output.
-        "text": text[:_TOOL_RESULT_TEXT_CAP],
-        "text_truncated": len(text) > _TOOL_RESULT_TEXT_CAP,
-        "is_error": bool(getattr(block, "is_error", False)),
-    }
-    if tool_name:
-        out["tool_name"] = tool_name
-    # Bash gets structured-output extraction so the FE can render stdout /
-    # stderr / exit-code with different styling. Only emit when the parse
-    # actually succeeded — empty objects would mislead.
-    if tool_name == "Bash":
-        bash = _parse_bash_result(text)
-        if bash:
-            out["bash"] = bash
-    return out
+def _render_tool_result(
+    block: ToolResultBlock, *, tool_name: str = "",
+) -> dict:
+    """Patchable facade for live tool-result rendering."""
+    return chat_presentation.render_tool_result(
+        block,
+        tool_name=tool_name,
+        preview_cap=_TOOL_RESULT_PREVIEW_CAP,
+        text_cap=_TOOL_RESULT_TEXT_CAP,
+        parse_bash=_parse_bash_result,
+    )
 
 
 # ====== attachment upload (images + documents) ======

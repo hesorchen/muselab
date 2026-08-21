@@ -1,5 +1,7 @@
 """Compatibility contracts for splitting chat lifecycle code across modules."""
 
+import ast
+import inspect
 import json
 
 from fastapi.routing import APIRoute
@@ -215,3 +217,41 @@ def test_history_endpoint_uses_cli_jsonl_and_applies_overlay_only_for_presentati
     )
     assert "task_status" not in canonical_tool_card
     assert b"presentation-only completion" not in transcript.read_bytes()
+
+
+def test_chat_presentation_facades_remain_patchable(app_module, monkeypatch):
+    from backend import chat as chat_mod
+    from backend import chat_presentation
+
+    imports = [
+        node
+        for node in ast.walk(ast.parse(inspect.getsource(chat_presentation)))
+        if isinstance(node, (ast.Import, ast.ImportFrom))
+    ]
+    assert not any(
+        (isinstance(node, ast.ImportFrom) and node.module == "chat")
+        or (isinstance(node, ast.Import)
+            and any(alias.name.endswith(".chat") for alias in node.names))
+        for node in imports
+    )
+
+    calls = []
+
+    def strip(text):
+        calls.append(text)
+        return "patched"
+
+    monkeypatch.setattr(chat_presentation, "strip_cli_slash_wrapper", strip)
+    assert chat_mod._strip_cli_slash_wrapper("canonical") == "patched"
+    assert calls == ["canonical"]
+
+    monkeypatch.setattr(chat_mod, "_HISTORY_INLINE_BODY_CAP", 1)
+    monkeypatch.setattr(chat_mod, "_HISTORY_BODY_PREVIEW_CAP", 1)
+    message = {
+        "role": "assistant",
+        "text": "body",
+        "block_id": "record:0:assistant",
+    }
+    chat_mod._defer_large_ui_bodies([message])
+    assert message["text"] == "b"
+    assert message["body_length"] == 4
