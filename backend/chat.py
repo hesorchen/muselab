@@ -10033,7 +10033,13 @@ async def session_usage(session_id: str, model: str = "") -> dict:
     ClaudeSDKClient.get_context_usage() against the live session."""
     u = _session_usage.get(session_id)
     if u is None:
-        rebuilt = _session_usage_from_jsonl(session_id)
+        rebuilt = await obs.to_thread_io(
+            "chat.usage_hydrate",
+            session_id,
+            _session_usage_from_jsonl,
+            session_id,
+            file_path=lambda: _find_session_jsonl(session_id),
+        )
         if rebuilt is not None:
             # Populate the cache so subsequent polls don't re-walk JSONL.
             _session_usage[session_id] = rebuilt
@@ -14447,35 +14453,32 @@ async def _watch_inflight_tasks(
                 "cta": "retry",
                 "retryable": True,
             })
-        # The broadcast terminal boundary is user-facing truth. Close it
-        # before transcript scans / annotation writes so a slow sidecar or
-        # long JSONL cannot leave the continuation footer pulsing after the
-        # SDK has already emitted its ResultMessage.
-        b.publish({"event": "done", "data": json.dumps(done_payload)})
-        # AssistantMessage already supplied the exact persisted UUID.  Annotate
-        # that boundary directly in the same event-loop turn as done; rescanning
-        # "the latest assistant" raced both delayed JSONL flushes and the next
-        # user turn, which is why continuation footers disappeared on refresh.
+        # AssistantMessage already supplied the exact persisted UUID. Commit its
+        # footer before publishing done so an immediate refresh cannot beat the
+        # sidecar write. The write runs off-loop; ordering, not event-loop
+        # blocking, is the durability boundary.
         if assistant_uuid and not sess.session_is_deleting(session_id):
             try:
-                # Keep this synchronous inside the current event-loop turn:
-                # publish() only queues the frame, so subscribers cannot act
-                # on done (or refresh) until this tiny local sidecar write is
-                # durable.  Offloading here reintroduced the very race this
-                # exact-UUID path is meant to close.
-                sess.set_message_annotation(
+                await obs.to_thread_io(
+                    "chat.continuation_footer_write",
+                    session_id,
+                    sess.set_message_annotation,
                     session_id,
                     assistant_uuid,
                     model=b.model,
                     ts=completed_at_ms,
                     turn_status=terminal_status,
                     elapsed_s=cont_elapsed if cont_elapsed >= 1 else None,
+                    file_path=sess._sidecar_path(session_id),
                 )
             except Exception as e:
                 sys.stderr.write(
                     f"[chat] continuation footer annotation failed "
                     f"sid={session_id[:8]}: {type(e).__name__}\n")
                 sys.stderr.flush()
+        # The durable footer is now visible to reloads; close the live terminal
+        # boundary before slower transcript/outbox bookkeeping.
+        b.publish({"event": "done", "data": json.dumps(done_payload)})
         # A rollover intentionally excludes source-only task notifications and
         # continuation text from the successor's Claude transcript.  Stage the
         # final Agent prose in a private durable outbox, then let a separate
@@ -14484,13 +14487,18 @@ async def _watch_inflight_tasks(
         # replay consumed here: if the eager rollover later rolls back, the
         # still-public source must retain its normal live continuation path.
         if not cancelled and not sess.session_is_deleting(session_id):
-            event_id = _persist_runtime_continuation_outbox(
+            event_id = await obs.to_thread_io(
+                "chat.continuation_outbox_write",
+                session_id,
+                _persist_runtime_continuation_outbox,
                 session_id,
                 b,
                 completed_at_ms=completed_at_ms,
                 elapsed_s=cont_elapsed,
                 terminal_status=terminal_status,
                 incomplete_error=str(incomplete_error or ""),
+                file_path=_runtime_continuation_outbox_path(
+                    session_id, str(b.turn_id or "")),
             )
             if event_id:
                 _schedule_runtime_continuation_delivery(session_id, event_id)
@@ -16578,7 +16586,13 @@ async def _start_turn(
                 existing_uuids, transcript_boundary = await asyncio.to_thread(
                     _turn_transcript_boundary, session_id, model_to_use)
                 broadcast.transcript_boundary = transcript_boundary
-                _write_active_turn_sidecar(broadcast)
+                await obs.to_thread_io(
+                    "chat.active_turn_write",
+                    session_id,
+                    _write_active_turn_sidecar,
+                    broadcast,
+                    file_path=_active_turn_path(session_id),
+                )
                 _preflight_started = obs.monotonic()
                 try:
                     await _preflight_compact_if_needed(_emit_side)
@@ -17319,7 +17333,9 @@ async def _start_turn(
             _footer_annotation_uuid = ""
             if terminal_assistant_uuid:
                 try:
-                    await asyncio.to_thread(
+                    await obs.to_thread_io(
+                        "chat.sidecar_terminal_write",
+                        session_id,
                         sess.set_message_annotation,
                         session_id,
                         terminal_assistant_uuid,
@@ -17329,6 +17345,7 @@ async def _start_turn(
                         turn_status=_activity_status,
                         elapsed_s=_elapsed_s,
                         memory_recall=_done_memory_receipt,
+                        file_path=sess._sidecar_path(session_id),
                     )
                     _footer_annotation_uuid = terminal_assistant_uuid
                 except Exception as exc:
@@ -17493,18 +17510,31 @@ async def _start_turn(
                 # "13:42 · 2m50s" footer (FE-side stamping only survives
                 # within the live session). None when SDK didn't fill
                 # duration_ms.
-                sess.set_message_annotation(
-                    session_id, new_asst_uuid,
-                    cost=f"${cost:.4f}", model=model_to_use,
+                await obs.to_thread_io(
+                    "chat.sidecar_footer_write",
+                    session_id,
+                    sess.set_message_annotation,
+                    session_id,
+                    new_asst_uuid,
+                    cost=f"${cost:.4f}",
+                    model=model_to_use,
                     ts=_completed_at_ms,
                     turn_status=_activity_status,
                     elapsed_s=_elapsed_s,
-                    memory_recall=_done_memory_receipt)
+                    memory_recall=_done_memory_receipt,
+                    file_path=sess._sidecar_path(session_id),
+                )
             if new_user_uuid and (persisted_imgs or persisted_docs):
-                sess.set_message_annotation(
-                    session_id, new_user_uuid,
+                await obs.to_thread_io(
+                    "chat.sidecar_attachment_write",
+                    session_id,
+                    sess.set_message_annotation,
+                    session_id,
+                    new_user_uuid,
                     images=persisted_imgs or None,
-                    docs=persisted_docs or None)
+                    docs=persisted_docs or None,
+                    file_path=sess._sidecar_path(session_id),
+                )
             # mem0 write is deferred to AFTER we compute was_cancelled / _is_error
             # below — we must not distill a cancelled or errored turn into a
             # "durable fact". See the mem0.schedule_store(...) call further down.
@@ -17547,10 +17577,21 @@ async def _start_turn(
             _rename_src = first_user_text or prompt
             if _rename_src.strip() == _IMAGE_ONLY_PLACEHOLDER:
                 _rename_src = "图片对话" if is_chinese_locale() else "Image chat"
-            sess.bump_session(session_id, message_count=len(all_msgs),
-                               turn_count=n_turns,
-                               auto_rename_from=_rename_src)
-            sess.update_model(session_id, model_to_use)
+            def _persist_session_summary() -> None:
+                sess.bump_session(
+                    session_id,
+                    message_count=len(all_msgs),
+                    turn_count=n_turns,
+                    auto_rename_from=_rename_src,
+                )
+                sess.update_model(session_id, model_to_use)
+
+            await obs.to_thread_io(
+                "chat.session_index_write",
+                session_id,
+                _persist_session_summary,
+                file_path=sess.INDEX,
+            )
             # ``done`` is intentionally published before this slower block. A
             # user can therefore roll over the session while these annotations
             # and the first-turn name are still being persisted. Reconcile the
@@ -17844,8 +17885,16 @@ async def _start_turn(
     # the new turn boundary so it can never be attributed to this prompt.
     mem0.pop_recall_trace(session_id)
     # Refresh the pending intent with resolved model, attachment display refs,
-    # and the exact pre-query transcript boundary captured above.
-    _write_active_turn_sidecar(broadcast)
+    # and the exact pre-query transcript boundary captured above. Keep this
+    # filesystem write off the event loop because the sidecar is durable state.
+    await obs.to_thread_io(
+        "chat.active_turn_write",
+        session_id,
+        _write_active_turn_sidecar,
+        broadcast,
+        file_path=_active_turn_path(session_id),
+    )
+    _interrupted_at_startup.pop(session_id, None)
 
     async def _pump_gen_to_broadcast():
         nonlocal memory_outcome_scheduled

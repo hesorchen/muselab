@@ -330,7 +330,14 @@ async def _monitor_event_loop_lag() -> None:
             lag_ms = max(0, round((observed - expected) * 1000))
             if lag_ms >= warning_ms:
                 try:
-                    perf_event("runtime.loop_lag", lag_ms=lag_ms)
+                    perf_event(
+                        "runtime.loop_lag",
+                        site="event_loop",
+                        session="none",
+                        duration_ms=lag_ms,
+                        file_size=0,
+                        lag_ms=lag_ms,
+                    )
                 except Exception:
                     # Diagnostics must never terminate their own long-lived monitor.
                     pass

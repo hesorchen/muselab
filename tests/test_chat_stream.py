@@ -2687,20 +2687,65 @@ async def test_watcher_shutdown_partial_never_projects_completed_bubble(
         chat_mod._delete_cancelled_turn_snapshots(child_sid)
 
 
-def test_continuation_terminal_precedes_annotation_bookkeeping(stream_env):
-    """Queue done, annotate its exact UUID, then release the event loop."""
+def test_usage_transcript_hydration_does_not_block_event_loop(
+    stream_env, monkeypatch,
+):
+    import time
+
+    sid = "12345678-usage-hydrate"
+    stream_env._session_usage.pop(sid, None)
+    monkeypatch.setattr(
+        stream_env,
+        "_session_usage_from_jsonl",
+        lambda _sid: (time.sleep(0.04) or None),
+    )
+    monkeypatch.setattr(stream_env, "_find_session_jsonl", lambda _sid: None)
+
+    async def no_capability(_model):
+        return {}
+
+    monkeypatch.setattr(
+        stream_env, "_detect_gateway_context_capability", no_capability)
+
+    ticks = 0
+    done = False
+
+    async def ticker():
+        nonlocal ticks
+        while not done:
+            ticks += 1
+            await asyncio.sleep(0.001)
+
+    async def scenario():
+        nonlocal done
+        ticker_task = asyncio.create_task(ticker())
+        try:
+            await stream_env.session_usage(sid)
+        finally:
+            done = True
+            await ticker_task
+            stream_env._session_usage.pop(sid, None)
+
+    asyncio.run(scenario())
+    assert ticks >= 5
+
+
+def test_continuation_footer_is_durable_before_terminal_publish(stream_env):
+    """Offload the exact-UUID sidecar write without reopening the reload race."""
     import inspect
 
     source = inspect.getsource(stream_env._watch_inflight_tasks)
+    close_at = source.index("async def _close_continuation")
+    annotate_at = source.index("sess.set_message_annotation,", close_at)
     done_at = source.index(
-        'b.publish({"event": "done", "data": json.dumps(done_payload)})')
-    annotate_at = source.index("sess.set_message_annotation(", done_at)
-    finish_at = source.index("b.finish()", annotate_at)
-    assert done_at < annotate_at
-    assert annotate_at < finish_at
-    close_source = source[source.index("async def _close_continuation"):finish_at]
+        'b.publish({"event": "done", "data": json.dumps(done_payload)})',
+        annotate_at,
+    )
+    finish_at = source.index("b.finish()", done_at)
+    assert annotate_at < done_at < finish_at
+    close_source = source[close_at:finish_at]
     assert "_recent_turn_uuids" not in close_source
-    assert "asyncio.to_thread" not in close_source
+    assert 'await obs.to_thread_io(' in close_source
     assert '(state or {}).get("assistant_uuid")' in close_source
     assert stream_env._CONTINUATION_GRACE <= 8
 
