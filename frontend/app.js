@@ -9106,14 +9106,19 @@ function portal() {
         }
       }
       if (start === st._virtualStart && end === st._virtualEnd) return;
-      const anchor = this._captureViewportMessageAnchor(body, tid);
+      // Normal virtualization updates preserve the message currently under the
+      // reader's eyes. An explicit tail jump (Send / ↓) is different: restoring
+      // that old anchor after mounting the tail would undo the user's request
+      // and leave the pane at its previous scroll position.
+      const anchor = forceTail
+        ? null : this._captureViewportMessageAnchor(body, tid);
       st._virtualStart = start;
       st._virtualEnd = end;
       st._virtualRevision++;
       this.$nextTick(() => {
         if (this.tabState[tid] !== st || tid !== this.currentId) return;
         this._measureMessageVirtualRows(tid, st);
-        this._restoreMessageAnchor(body, anchor);
+        if (!forceTail) this._restoreMessageAnchor(body, anchor);
       });
     },
     _scheduleMessageViewportSync(tid = this.currentId, forceTail = false) {
@@ -26217,15 +26222,18 @@ function portal() {
       // viewport stays put until they manually scroll back to the bottom.
       if (!force && st.atBottom === false) return;
       if (force) {
-        // Explicit jump (the ↓ FAB). `.msg` uses content-visibility:auto,
-        // so off-screen bubbles report an ESTIMATED height (the 200px
-        // contain-intrinsic-size placeholder). A one-shot scrollTop =
-        // scrollHeight therefore lands short — as bottom content scrolls
-        // into view and realizes its (taller) real height, scrollHeight
-        // keeps growing. Re-slam to the bottom each frame until scrollHeight
-        // stops growing. See _settleScrollToBottom.
-        this._settleScrollToBottom();
+        // Explicit jump (Send / ↓): mount the virtual tail first. Otherwise a
+        // reader who sent while viewing older rows still had only that old DOM
+        // window mounted; the subsequent settle could scroll merely to the end
+        // of the spacer and an anchor restore would pull it back again.
         st.atBottom = true;
+        this._syncMessageViewport(sid, true);
+        this.$nextTick(() => {
+          if (this.currentId !== sid || this.tabState[sid] !== st) return;
+          // `.msg` uses `content-visibility:auto`, so keep pinning until the newly
+          // mounted tail's real heights settle rather than trusting one scroll.
+          this._settleScrollToBottom();
+        });
         return;
       }
       // Streaming auto-follow path: bottom region is already realized,

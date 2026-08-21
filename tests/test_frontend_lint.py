@@ -3097,6 +3097,30 @@ def test_transcript_active_session_ui_reads_through_pane_facade():
     assert "st.atBottom === false" in scroll
 
 
+def test_explicit_send_scroll_mounts_virtual_tail_without_restoring_old_anchor():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+
+    sync_start = app.index("_syncMessageViewport(tid = this.currentId, forceTail = false)")
+    sync_end = app.index("_scheduleMessageViewportSync", sync_start)
+    sync = app[sync_start:sync_end]
+    assert "const anchor = forceTail" in sync
+    assert "if (!forceTail) this._restoreMessageAnchor(body, anchor)" in sync
+
+    scroll_start = app.index("    scrollToBottom(force) {")
+    scroll_end = app.index("// Re-slam the viewport", scroll_start)
+    scroll = app[scroll_start:scroll_end]
+    assert "st.atBottom = true" in scroll
+    assert "this._syncMessageViewport(sid, true)" in scroll
+    assert "this.$nextTick(() =>" in scroll
+    assert "this._settleScrollToBottom()" in scroll
+
+    send_start = app.index("    async send(opts = {}) {")
+    send_end = app.index("    async stop()", send_start)
+    send = app[send_start:send_end]
+    assert "streamState.atBottom = true" in send
+    assert "this.scrollToBottom(true)" in send
+
+
 def test_long_chat_state_keeps_complete_normalized_history_and_generation_safety():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
     html = (FRONTEND / "index.html").read_text(encoding="utf-8")
