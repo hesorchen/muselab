@@ -928,6 +928,8 @@
                     x-text="lang==='zh' ? '@ 引用到 chat' : '@-mention in chat'"></button>
             <button @click="previewTabMenuAction('copyPath')"
                     x-text="lang==='zh' ? '复制路径' : 'Copy path'"></button>
+            <button @click="previewTabMenuAction('copyAbsolutePath')"
+                    x-text="t('btn.copy_absolute_path')"></button>
           </div>
         </div>
       </template>
@@ -4089,6 +4091,9 @@
     <!-- 通用 -->
     <button class="ctx-item" @click="ctxAction('copyPath')" x-show="!ctxMenu.multi">
       <span class="icon"><svg><use href="#i-copy"/></svg></span><span x-text="t('btn.copy_path')"></span>
+    </button>
+    <button class="ctx-item" @click="ctxAction('copyAbsolutePath')" x-show="!ctxMenu.multi">
+      <span class="icon"><svg><use href="#i-copy"/></svg></span><span x-text="t('btn.copy_absolute_path')"></span>
     </button>
     <button class="ctx-item" @click="ctxAction('rename')" x-show="!ctxMenu.multi">
       <span class="icon"><svg><use href="#i-edit"/></svg></span><span x-text="t('btn.rename')"></span>

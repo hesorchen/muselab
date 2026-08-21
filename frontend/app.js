@@ -10035,6 +10035,13 @@ function portal() {
     fileWorkspacePath() {
       return this.currentWorkspacePath();
     },
+    absoluteFilePath(path) {
+      const root = String(this.fileWorkspacePath() || "");
+      const relative = String(path || "").replace(/^\/+/, "");
+      if (!root) return relative;
+      if (!relative) return root;
+      return root.endsWith("/") ? root + relative : root + "/" + relative;
+    },
     currentWorkspacePath() {
       if (this.activeWorkspace) return this.activeWorkspace;
       const session = this.sessions.find(s => s.id === this.currentId);
@@ -13163,6 +13170,15 @@ function portal() {
                                             ? "需要 HTTPS"
                                             : "HTTPS required"));
           break;
+        case "copyAbsolutePath": {
+          const absolutePath = this.absoluteFilePath(path);
+          navigator.clipboard?.writeText(absolutePath).then(
+            () => this.toast(this.t("toast.copied") + ": " + absolutePath, "success", 1500),
+            () => this.errToast("copy", this.lang === "zh"
+                                            ? "需要 HTTPS"
+                                            : "HTTPS required"));
+          break;
+        }
       }
     },
 
@@ -19026,7 +19042,7 @@ function portal() {
       }
       if (n) this.treeFocusPath = n.path;
       // Clamp to viewport so menu doesn't overflow.
-      const MENU_W = 200, MENU_H = 280;
+      const MENU_W = 200, MENU_H = 312;
       const x = Math.min(ev.clientX, window.innerWidth - MENU_W - 8);
       const y = Math.min(ev.clientY, window.innerHeight - MENU_H - 8);
       this.ctxMenu = { show: true, x, y, node: n, multi };
@@ -19046,6 +19062,12 @@ function portal() {
           await navigator.clipboard?.writeText(n.path);
           this.toast(this.t("toast.copied") + ": " + n.path, "success", 1500);
           break;
+        case "copyAbsolutePath": {
+          const absolutePath = this.absoluteFilePath(n.path);
+          await navigator.clipboard?.writeText(absolutePath);
+          this.toast(this.t("toast.copied") + ": " + absolutePath, "success", 1500);
+          break;
+        }
         case "copyAsBak":
           // Right-click "Copy as .bak" — paste-target defaults to the
           // source's own parent dir, matching user expectation of an

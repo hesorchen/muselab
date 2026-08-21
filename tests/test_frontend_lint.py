@@ -123,6 +123,20 @@ def test_i18n_zh_en_key_parity():
     )
 
 
+def test_file_menus_can_copy_relative_and_absolute_paths():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    i18n = (FRONTEND / "i18n" / "index.js").read_text(encoding="utf-8")
+
+    assert "absoluteFilePath(path)" in app
+    assert 'return root.endsWith("/") ? root + relative : root + "/" + relative' in app
+    assert app.count('case "copyAbsolutePath"') == 2
+    assert "previewTabMenuAction('copyAbsolutePath')" in html
+    assert "ctxAction('copyAbsolutePath')" in html
+    assert '"btn.copy_absolute_path": "复制绝对路径"' in i18n
+    assert '"btn.copy_absolute_path": "Copy absolute path"' in i18n
+
+
 def test_empty_chat_keeps_only_the_file_mention_hint():
     html = (FRONTEND / "index.html").read_text(encoding="utf-8")
     i18n = (FRONTEND / "i18n" / "index.js").read_text(encoding="utf-8")
