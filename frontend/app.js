@@ -578,6 +578,11 @@ function portal() {
     _sessionWindows: new Map(),
     _assistantBodyObserver: null,
     _assistantBodyTargets: new Map(),
+    // Final assistant HTML is also retained by the same stable render key. This
+    // survives window object eviction/reload without keying rich output by an
+    // ever-growing text value, while the bounded LRU keeps memory predictable.
+    _historyHtmlByKey: new Map(),
+    _historyHtmlBytes: 0,
     // True while loadSession(currentId) is in flight. UI uses this to swap
     // the brand-empty placeholder for a shimmer skeleton, so users don't
     // see "Muse · Calliope / empty chat" for the second a big session
@@ -3946,7 +3951,7 @@ function portal() {
       this._markPaneRenderKeysDirty(st);
       this._rebuildPaneMessageRenderKeys(sid, win);
       for (const m of win) {
-        if (m.role === "assistant" && m.text && !m.html) m.html = this.mdRender(m.text);
+        if (m.role === "assistant" && m.text && !m.html) m.html = this._renderHistoryMessage(m);
       }
       if (!win.some(m => m.uuid === uuid)) return false;
       st.messages.splice(0, st.messages.length, ...win);
@@ -4019,7 +4024,7 @@ function portal() {
         const batch = earlier.splice(idx);
         batch.forEach(em => {
           if (em.role === "assistant" && em.text && !em.html) {
-            em.html = this.mdRender(em.text);
+            em.html = this._renderHistoryMessage(em);
           }
         });
         st.messages.unshift(...batch);
@@ -4433,9 +4438,8 @@ function portal() {
     // tool-result / MCP / plan bubble on re-render, and the load-earlier path
     // runs it in batches; without a cache those are all full re-parses. Cache
     // is keyed by exact input text and LRU-evicted at a hard cap so memory
-    // stays bounded. The live streaming bubble deliberately bypasses this
-    // (calls _mdRenderUncached) so its ever-growing intermediate strings never
-    // pollute the cache or evict useful static-message entries.
+    // stays bounded. Open SSE segments stay plain and do not enter this cache;
+    // their final rich render is cached only after a terminal/tool boundary.
     mdRender(text) {
       if (!text) return "";
       const cache = this._mdCache || (this._mdCache = new Map());
@@ -4459,6 +4463,44 @@ function portal() {
         cache.delete(k);
       }
       return out;
+    },
+
+    _renderHistoryMessage(m) {
+      if (!m || m.role !== "assistant" || !m.text) return "";
+      const key = m._k || "";
+      if (!key) return this.mdRender(m.text);
+      const cache = this._historyHtmlByKey;
+      const hit = cache.get(key);
+      if (hit && hit.text === m.text) {
+        cache.delete(key);
+        cache.set(key, hit);
+        return hit.html;
+      }
+      if (hit) {
+        this._historyHtmlBytes = Math.max(0, this._historyHtmlBytes - hit.bytes);
+        cache.delete(key);
+      }
+      const html = this.mdRender(m.text);
+      const entry = { text: m.text, html, bytes: (m.text.length + html.length) * 2 };
+      cache.set(key, entry);
+      this._historyHtmlBytes += entry.bytes;
+      while (cache.size > 400 || (this._historyHtmlBytes > 16 * 1024 * 1024 && cache.size > 1)) {
+        const oldestKey = cache.keys().next().value;
+        const oldest = cache.get(oldestKey);
+        this._historyHtmlBytes = Math.max(
+          0, this._historyHtmlBytes - (oldest ? oldest.bytes : 0));
+        cache.delete(oldestKey);
+      }
+      return html;
+    },
+
+    _historyHtmlDelete(m) {
+      const key = m && m._k;
+      if (!key) return;
+      const hit = this._historyHtmlByKey.get(key);
+      if (!hit) return;
+      this._historyHtmlBytes = Math.max(0, this._historyHtmlBytes - hit.bytes);
+      this._historyHtmlByKey.delete(key);
     },
 
     _mdCacheDelete(text) {
@@ -4499,7 +4541,7 @@ function portal() {
     // of an in-flight bubble: parse + sanitize only. The expensive passes
     // (KaTeX math typesetting + the full-DOM _linkifyFilePaths walk) are
     // skipped mid-stream and run ONCE on the final render (flushRender →
-    // renderNow(true) → opts.streaming falsy). Doing them on every chunk was
+    // renderFinal). Doing them on every chunk was
     // a big chunk of the "long reply pegs the phone CPU / freezes" cost:
     // each tick re-walked the entire rendered DOM for code/anchor nodes and
     // re-ran KaTeX over the whole bubble. File-links + math only need to be
@@ -4517,21 +4559,11 @@ function portal() {
       if (text.length >= 64 * 1024) {
         const hasRichSyntax = /```|~~~|`|\[[^\]]+\]\(|<\/?[A-Za-z][^>]*>|\*\*|__|~~|\$\$|\\\(|\\\[|(^|\n)\s{0,3}(?:#{1,6}\s|>\s|[-+*]\s|\d+[.)]\s)/m.test(text);
         if (!hasRichSyntax) {
-          const visibleLimit = 48 * 1024;
-          const head = this.escape(text.slice(0, visibleLimit));
-          const renderLines = value => value
+          const escaped = this.escape(text);
+          const rendered = escaped
             .replace(/\r?\n\r?\n+/g, "</p><p>")
             .replace(/\r?\n/g, "<br>");
-          if (text.length > visibleLimit) {
-            const tail = this.escape(text.slice(visibleLimit));
-            const label = this.lang === "zh"
-              ? `展开剩余 ${Math.ceil((text.length - visibleLimit) / 1024)} KB`
-              : `Show remaining ${Math.ceil((text.length - visibleLimit) / 1024)} KB`;
-            return `<div class="long-answer-preview"><p>${renderLines(head)}</p></div>`
-              + `<details class="long-answer-rest"><summary>${label}</summary>`
-              + `<div><p>${renderLines(tail)}</p></div></details>`;
-          }
-          return "<p>" + renderLines(head) + "</p>";
+          return "<p>" + rendered + "</p>";
         }
       }
       // Streaming-friendly preprocess: close any unclosed ``` or ~~~ fenced
@@ -4691,7 +4723,8 @@ function portal() {
         for (const m of this.messages) {
           if (m && typeof m.text === "string" && m.html && RE.test(m.text)) {
             this._mdCacheDelete(m.text);  // drop stale (raw-$$) cache entry
-            m.html = this.mdRender(m.text);
+            this._historyHtmlDelete(m);
+            m.html = this._renderHistoryMessage(m);
           }
         }
       }
@@ -11367,7 +11400,7 @@ function portal() {
           const loaded = await r.json();
           const localKey = m._k;
           Object.assign(m, loaded, { _k: localKey, body_state: "loaded" });
-          if (m.role === "assistant") m.html = this.mdRender(m.text || "");
+          if (m.role === "assistant") m.html = this._renderHistoryMessage(m);
           if (m._is_compact_summary) delete m._compactHtml;
           return true;
         } catch (_) {
@@ -14423,7 +14456,7 @@ function portal() {
         const INITIAL_LOAD = _initialLoadEarly;
         const renderMarkdown = (m) => {
           if (m.role === "assistant" && m.text && !m.html) {
-            m.html = this.mdRender(m.text);
+            m.html = this._renderHistoryMessage(m);
           }
         };
         // Split into earlier (deferred) vs visible (rendered now).
@@ -14815,7 +14848,7 @@ function portal() {
     async _fillDeferredHead(sid, st, head) {
       if (!head || !head.length) return;
       const renderOne = (m) => {
-        if (m && m.role === "assistant" && m.text && !m.html) m.html = this.mdRender(m.text);
+        if (m && m.role === "assistant" && m.text && !m.html) m.html = this._renderHistoryMessage(m);
       };
       const CH = this._isMobileLayout() ? 4 : 12;
       let i = 0;
@@ -14966,7 +14999,10 @@ function portal() {
     },
     _dropSessionMessageStore(sid) {
       const keys = this._sessionWindows.get(sid) || new Set();
-      for (const storeKey of keys) this._messagesById.delete(storeKey);
+      for (const storeKey of keys) {
+        this._historyHtmlDelete(this._messagesById.get(storeKey));
+        this._messagesById.delete(storeKey);
+      }
       this._sessionWindows.delete(sid);
     },
     _messageContinuitySignatures(m) {
@@ -15620,7 +15656,7 @@ function portal() {
         for (let k = j; k < end; k++) {
           const m = batch[k];
           if (m.role === "assistant" && m.text && !m.html) {
-            m.html = this.mdRender(m.text);
+            m.html = this._renderHistoryMessage(m);
           }
         }
         if (end < batch.length) {
@@ -27699,7 +27735,7 @@ function portal() {
         // empty / null so x-show defaults match "not yet computed".
         const bubble = {
           role: "assistant",
-          text: "", html: "", cost: "",
+          text: "", html: "", _streamText: "", _streamPlain: true, cost: "",
           model: modelForBubble,
           ts: null,
           elapsed: 0,
@@ -27724,14 +27760,14 @@ function portal() {
         const text = String(detail || "");
         if (!text) return;
         if (ownsCurBubble()) {
-          if (!curBubble.text) {
+          if (!acc) {
             acc = text;
             curBubble.text = text;
             curBubble.error = text;
-            renderNow(true);
+            renderFinal();
             return;
           }
-          if ((curBubble.text || "") === text) {
+          if (acc === text) {
             curBubble.error = text;
             return;
           }
@@ -27745,83 +27781,65 @@ function portal() {
         acc = text;
         curBubble.text = text;
         curBubble.error = text;
-        renderNow(true);
+        renderFinal();
       };
-      // Throttle markdown rendering during fast token streams. mdRender
-      // re-parses the FULL accumulated text every tick, so the per-render cost
-      // grows with reply length (O(n) per render → O(n²) over the whole
-      // reply). On long replies — and especially on phones — re-parsing every
-      // 80ms pegs the CPU and heats the device. Stretch the interval as `acc`
-      // grows so total re-parse work stays bounded; short replies keep the
-      // snappy 80ms feel. flushRender() always paints the complete final text
-      // on done/close, so stretching never loses content.
-      const _renderInterval = () => {
-        // Desktop always keeps rich markdown, but very long replies still need
-        // a modest cadence increase to avoid reparsing 100+ KiB every 80 ms.
-        const n = acc.length;
-        if (!streamMobile) {
-          if (n < 32 * 1024) return 80;
-          if (n < 128 * 1024) return 160;
-          return 320;
-        }
-        if (n < 2000) return 80;
-        if (n < 8000) return 160;
-        if (n < 20000) return 320;
-        // Very long replies: stretch the interval hard so the total re-parse
-        // work stays bounded. marked.parse + DOMPurify is O(n) per render, so
-        // a 100KB reply re-parsed every 600ms pegs a phone CPU at 100% for the
-        // whole stream (heat + freeze). flushRender() always paints the
-        // complete final text on done, so stretching never drops content.
-        if (n < 50000) return 600;
-        if (n < 120000) return 1000;
-        return 1600;
-      };
-      let lastRender = 0;
+      // SSE deltas only append to `acc`. While the segment is open, paint a
+      // lightweight text snapshot at most once per frame/time slice; never feed
+      // the ever-growing prefix back through marked/DOMPurify. A tool/thinking
+      // boundary or terminal event performs the one complete rich render.
+      const STREAM_PAINT_MS = streamMobile ? 50 : 32;
+      let lastPlainPaint = 0;
+      let pendingFrame = null;
       let pendingTimer = null;
-      // final=true → the message is complete (done / tool boundary): run the
-      // full render (KaTeX + file-link linkify). final=false → throttled
-      // in-flight tick: cheap parse+sanitize only.
-      const renderNow = (final = false) => {
-        if (!ownsCurBubble()) {
-          curBubble = null; acc = ""; pendingTimer = null; return;
+      const cancelPendingPaint = () => {
+        if (pendingTimer) clearTimeout(pendingTimer);
+        if (pendingFrame && typeof cancelAnimationFrame === "function") {
+          cancelAnimationFrame(pendingFrame);
         }
-        // Beyond 32 KiB, repeatedly reparsing the full accumulated markdown is
-        // quadratic. Keep a safe x-text preview until the segment/done boundary,
-        // then perform exactly one final rich render.
-        if (!final && streamMobile && acc.length > 32 * 1024) {
-          curBubble._streamPlain = true;
-          curBubble.html = "";
-          streamState._streamPlainRenderCount++;
-        } else {
-          curBubble.html = this._mdRenderUncached(acc, { streaming: !final });
-          curBubble._streamPlain = false;
-          streamState._streamRichRenderCount++;
-        }
-        lastRender = Date.now();
         pendingTimer = null;
-        // Coalesce auto-scroll onto the throttled render tick. Scrolling on
-        // every token forced a full reflow (scrollHeight read) of the entire
-        // message DOM per chunk — O(conversation length) per token, the main
-        // reason long conversations froze mid-stream. Now it fires at most
-        // once per render instead of once per token.
+        pendingFrame = null;
+      };
+      const paintPlainNow = () => {
+        pendingTimer = null;
+        pendingFrame = null;
+        if (!ownsCurBubble()) { curBubble = null; acc = ""; return; }
+        curBubble.text = acc;
+        curBubble._streamText = acc;
+        curBubble._streamPlain = true;
+        lastPlainPaint = Date.now();
+        streamState._streamPlainRenderCount++;
         _scrollIfActive();
       };
-      const scheduleRender = () => {
-        const interval = _renderInterval();
-        const since = Date.now() - lastRender;
-        if (since >= interval) {
-          renderNow();
-        } else if (!pendingTimer) {
-          pendingTimer = setTimeout(renderNow, interval - since);
+      const schedulePlainPaint = () => {
+        if (pendingTimer || pendingFrame) return;
+        const queueFrame = () => {
+          pendingTimer = null;
+          if (typeof requestAnimationFrame === "function") {
+            pendingFrame = requestAnimationFrame(paintPlainNow);
+          } else {
+            pendingTimer = setTimeout(paintPlainNow, 0);
+          }
+        };
+        const wait = Math.max(0, STREAM_PAINT_MS - (Date.now() - lastPlainPaint));
+        if (wait) pendingTimer = setTimeout(queueFrame, wait);
+        else queueFrame();
+      };
+      const renderFinal = () => {
+        if (!ownsCurBubble()) {
+          cancelPendingPaint();
+          curBubble = null; acc = ""; return;
         }
+        cancelPendingPaint();
+        curBubble.text = acc;
+        curBubble._streamText = acc;
+        curBubble.html = this._renderHistoryMessage(curBubble);
+        curBubble._streamPlain = false;
+        streamState._streamRichRenderCount++;
+        _scrollIfActive();
       };
       const flushRender = () => {
-        if (pendingTimer) { clearTimeout(pendingTimer); pendingTimer = null; }
-        // final=true: this bubble is done (stream end / tool boundary), so do
-        // the full render incl. KaTeX + file-path linkify that the throttled
-        // ticks skipped.
-        if (ownsCurBubble()) renderNow(true);
-        else { curBubble = null; acc = ""; }
+        if (ownsCurBubble()) renderFinal();
+        else { cancelPendingPaint(); curBubble = null; acc = ""; }
       };
       const closeAsst = () => { flushRender(); curBubble = null; acc = ""; };
       const _setContinuationAwaitingReaction = (waiting) => {
@@ -27857,26 +27875,12 @@ function portal() {
         }
       };
 
-      // Re-render the in-flight assistant bubble from the accumulated text.
-      // Exposed on streamState so the global selectionchange guard (see
-      // _initStreamSelectionGuard) can flush a deferred render once the user
-      // releases their text selection. Re-reads curBubble/acc from the closure
-      // every call, so it stays correct even after openAsst/closeAsst swap
-      // bubbles mid-stream.
+      // Exposed on streamState so the global selectionchange guard can publish
+      // the latest plain snapshot after the user releases a selection. Rich HTML
+      // remains reserved for closeAsst()/done boundaries.
       const renderStreamingHtml = () => {
-        // Mid-stream deferred render (selection cleared): cheap path. The
-        // done-handler's flushRender does the full final pass.
-        if (ownsCurBubble()) {
-          if (streamMobile && acc.length > 32 * 1024) {
-            curBubble._streamPlain = true;
-            curBubble.html = "";
-            streamState._streamPlainRenderCount++;
-          } else {
-            curBubble.html = this._mdRenderUncached(acc, { streaming: true });
-            curBubble._streamPlain = false;
-            streamState._streamRichRenderCount++;
-          }
-        } else { curBubble = null; acc = ""; }
+        if (ownsCurBubble()) schedulePlainPaint();
+        else { cancelPendingPaint(); curBubble = null; acc = ""; }
         streamState._pendingHtmlRender = null;
       };
       streamState._renderStreamingHtml = renderStreamingHtml;
@@ -27920,24 +27924,13 @@ function portal() {
         _setContinuationAwaitingReaction(false);
         if (!openAsst()) return;
         acc += d.text;
-        curBubble.text = acc;
-        // Skip the mdRender → x-html assignment while the user has an active
-        // text selection in the chat body. x-html replaces innerHTML on every
-        // chunk, which forces the browser to collapse any selection inside the
-        // bubble — making "select while streaming, then Ctrl+C" impossible.
-        // We still accumulate `acc`; the selectionchange listener flushes a
-        // deferred render the moment the selection clears, and the `done`
-        // handler's flushRender catches anything still pending at stream end.
+        // Keep the currently painted snapshot stable while the user selects it.
+        // The closure accumulates every delta; reactive `text` and `_streamText`
+        // advance together only on the throttled paint or terminal flush.
         if (this._selectionInChatBody()) {
           streamState._pendingHtmlRender = renderStreamingHtml;
         } else {
-          // Throttle instead of re-parsing the full accumulated text on every
-          // token. scheduleRender() drives renderNow (which also coalesces the
-          // auto-scroll); flushRender() on done/close catches any trailing
-          // chunk still inside the throttle window. The scroll used to fire
-          // here on every token (forcing a full-DOM reflow per chunk) — it's
-          // now folded into renderNow so it runs at most once per render.
-          scheduleRender();
+          schedulePlainPaint();
         }
       });
       es.addEventListener("thinking", ev => {

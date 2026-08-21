@@ -2117,7 +2117,7 @@
                     <div class="bubble"
                          :class="{ 'is-streaming-bubble': pane && pane.streaming && i === paneMsgs.length - 1 }"
                          x-init="observeAssistantBody($el, m, tid)">
-                      <div x-show="m._streamPlain" class="stream-plain" x-text="m.text || ''"></div>
+                      <div x-show="m._streamPlain" class="stream-plain" x-text="m._streamText || ''"></div>
                       <div x-show="!m._streamPlain" x-html="m.html || ''"></div>
                     </div>
                   </div>

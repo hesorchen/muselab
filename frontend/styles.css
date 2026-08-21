@@ -4275,20 +4275,6 @@ pre.text {
   overflow-wrap: anywhere;
   font: inherit;
 }
-.long-answer-rest {
-  margin-top: var(--sp-2);
-  color: var(--c-fg-1);
-}
-.long-answer-rest > summary {
-  width: fit-content;
-  cursor: pointer;
-  color: var(--c-accent);
-  font-size: var(--fs-sm);
-  user-select: none;
-}
-.long-answer-rest > div {
-  margin-top: var(--sp-2);
-}
 .msg {
   display: flex;
   flex-direction: column;

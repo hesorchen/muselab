@@ -1827,8 +1827,8 @@ def test_bounded_stream_resync_waits_for_canonical_history_without_retry_loop():
     assert 'const streamMobile = this._isMobileLayout()' in app
     assert 'mobile: streamMobile' in app
     assert '"&mobile=" + (streamMobile ? "1" : "0")' in app
-    assert 'if (!streamMobile)' in app
-    assert 'if (!final && streamMobile && acc.length > 32 * 1024)' in app
+    assert "const STREAM_PAINT_MS = streamMobile ? 50 : 32" in app
+    assert "schedulePlainPaint()" in app
     assert 'if (streamMobile && reason === "replay_truncated")' in handler
     assert 'streamState._canonicalResyncPending = true' in handler
     assert "this._scheduleCanonicalStreamReload(streamSid, streamState)" in handler
@@ -2960,18 +2960,30 @@ def test_long_chat_state_is_per_tab_bounded_and_generation_safe():
         "pane.streaming &&", "")
 
 
-def test_long_stream_switches_to_plain_preview_and_final_rich_render():
+def test_stream_deltas_use_throttled_plain_snapshots_and_final_rich_render():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
     html = (FRONTEND / "index.html").read_text(encoding="utf-8")
     css = (FRONTEND / "styles.css").read_text(encoding="utf-8")
 
-    assert "acc.length > 32 * 1024" in app
-    assert "curBubble._streamPlain = true" in app
-    assert "curBubble._streamPlain = false" in app
+    handler_start = app.index('es.addEventListener("text"')
+    handler_end = app.index('es.addEventListener("thinking"', handler_start)
+    handler = app[handler_start:handler_end]
+    render_start = app.index("const renderFinal = () =>", handler_start - 8000)
+    render_end = app.index("const closeAsst", render_start)
+    render = app[render_start:render_end]
+
+    assert "acc += d.text" in handler
+    assert "curBubble.text = acc" not in handler
+    assert "schedulePlainPaint()" in handler
+    assert "_mdRenderUncached" not in handler
+    assert "requestAnimationFrame(paintPlainNow)" in app
+    assert "curBubble._streamText = acc" in render
+    assert "curBubble.html = this._renderHistoryMessage(curBubble)" in render
+    assert "curBubble._streamPlain = false" in render
     assert "_streamRichRenderCount" in app
     assert "_streamPlainRenderCount" in app
     assert "}, 1000);" in app
-    assert 'class="stream-plain" x-text="m.text || \'\'"' in html
+    assert 'class="stream-plain" x-text="m._streamText || \'\'"' in html
     assert 'x-show="!m._streamPlain" x-html="m.html || \'\'"' in html
     assert "if (this.atBottom) this.scrollToBottom(false)" in app
     assert "if (this.atBottom) this._capLiveMessages" not in app
@@ -2986,6 +2998,26 @@ def test_long_stream_switches_to_plain_preview_and_final_rich_render():
     assert ".chat-toolbar.has-stop .chat-toolbar-ring" in css
     assert ".chat-toolbar-rl { display: none !important; }" in css
     assert ":class=\"{ 'has-stop': isTabStreaming(currentId) }\"" in html
+
+
+def test_history_markdown_cache_reuses_stable_block_keys_without_hiding_content():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+
+    history_key = app[app.index("_historyMessageKey(sid, m)"):]
+    history_key = history_key[:history_key.index("_historyStoreKey", 1)]
+    render = app[app.index("_renderHistoryMessage(m) {"):]
+    render = render[:render.index("_historyHtmlDelete", 1)]
+    huge_plain = app[app.index("if (text.length >= 64 * 1024)"):]
+    huge_plain = huge_plain[:huge_plain.index("// Streaming-friendly preprocess")]
+
+    assert "m.block_id" in history_key
+    assert "const key = m._k" in render
+    assert "hit && hit.text === m.text" in render
+    assert "cache.size > 400" in render
+    assert "16 * 1024 * 1024" in render
+    assert "visibleLimit" not in huge_plain
+    assert "<details" not in huge_plain
+    assert "this.escape(text)" in huge_plain
 
 
 def test_terminal_preview_has_local_renderer_and_management_wiring():

@@ -5819,7 +5819,7 @@ def test_mobile_composer_footer_is_compact_and_never_overflows(
     ("viewport", "expects_plain"),
     [
         ({"width": 390, "height": 844}, True),
-        ({"width": 1440, "height": 900}, False),
+        ({"width": 1440, "height": 900}, True),
     ],
     ids=["mobile", "desktop"],
 )
@@ -5907,7 +5907,8 @@ def test_120kb_mixed_sse_stream_renders_final_assistant_html(
           const last = app.messages[app.messages.length - 1];
           return app.streaming === true
             && last && last.role === "assistant"
-            && last.html.includes("MID_STREAM_VISIBLE_1")
+            && last._streamPlain === true
+            && last._streamText.includes("MID_STREAM_VISIBLE_1")
             && body.includes("MID_STREAM_VISIBLE_1");
         }""",
         timeout=10000,
@@ -5919,7 +5920,7 @@ def test_120kb_mixed_sse_stream_renders_final_assistant_html(
         return {
           streaming: app.streaming,
           textLength: last.text.length,
-          htmlLength: last.html.length,
+          streamTextLength: last._streamText.length,
         };
         """,
     )
@@ -5938,8 +5939,8 @@ def test_120kb_mixed_sse_stream_renders_final_assistant_html(
           return app.streaming === true
             && last && last.role === "assistant"
             && last.text.length > prev.textLength
-            && last.html.length >= prev.htmlLength
-            && last.html.includes("MID_STREAM_VISIBLE_2")
+            && last._streamText.length > prev.streamTextLength
+            && last._streamText.includes("MID_STREAM_VISIBLE_2")
             && body.includes("MID_STREAM_VISIBLE_2");
         }""",
         arg=mid_1,
