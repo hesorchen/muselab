@@ -320,7 +320,43 @@ def test_chat_overlay_facades_remain_patchable(app_module, monkeypatch):
         return "patched-generation"
 
     monkeypatch.setattr(chat_overlays, "_combined_history_generation", combine)
-    assert chat_mod._combined_history_generation("canonical", "overlay") == (
-        "patched-generation"
-    )
+    assert chat_mod._combined_history_generation(
+        "canonical", "overlay",
+    ) == "patched-generation"
     assert calls == [("canonical", "overlay")]
+
+
+def test_chat_history_window_facades_remain_patchable(app_module, monkeypatch):
+    from backend import chat as chat_mod
+    from backend import chat_history_window
+
+    imports = [
+        node
+        for node in ast.walk(ast.parse(inspect.getsource(chat_history_window)))
+        if isinstance(node, (ast.Import, ast.ImportFrom))
+    ]
+    assert not any(
+        (isinstance(node, ast.ImportFrom) and node.module == "chat")
+        or (isinstance(node, ast.Import)
+            and any(alias.name.endswith(".chat") for alias in node.names))
+        for node in imports
+    )
+
+    calls = []
+
+    def assemble(index, snapshots, order):
+        calls.append((index, snapshots, order))
+        return ([{"kind": "snapshot", "count": 1}], 1)
+
+    monkeypatch.setattr(chat_history_window, "history_segments", assemble)
+    index = {"records": [], "orders": {"normal": []}}
+    snapshots = [{"messages": [{"role": "assistant", "text": "overlay"}]}]
+    assert chat_mod._interrupted_history_segments(
+        index, snapshots, "normal",
+    ) == ([{"kind": "snapshot", "count": 1}], 1)
+    assert calls == [(index, snapshots, "normal")]
+
+    assert chat_mod._combined_history_generation("canonical", "") == "canonical"
+    assert chat_mod._combined_history_generation(
+        "canonical", "display",
+    ) == "canonical~cancelled-display"
