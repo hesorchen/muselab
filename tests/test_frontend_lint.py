@@ -3984,6 +3984,7 @@ def test_turn_footer_is_a_separator_and_no_longer_hosts_streaming_dots():
 def test_turn_footer_falls_back_to_transcript_time_and_shows_model_and_state():
     """Historic/tool-ending turns must not render as an empty separator."""
     chat = (BACKEND / "chat.py").read_text(encoding="utf-8")
+    presentation = (BACKEND / "chat_presentation.py").read_text(encoding="utf-8")
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
     html = (FRONTEND / "index.html").read_text(encoding="utf-8")
 
@@ -3995,11 +3996,14 @@ def test_turn_footer_falls_back_to_transcript_time_and_shows_model_and_state():
     assert 'class="turn-model"' in footer
     assert 'class="turn-status"' in footer
     assert "modelLabel(turnFooterModel(m, pane, tid))" in footer
-    assert 'entry["model"] = model_name' in chat
-    assert 'entry["turn_status"] = turn_status' in chat
+    assert '("model", "model")' in presentation
+    assert '("turn_status", "turn_status")' in presentation
+    assert "entry.setdefault(target, value)" in presentation
     assert "turn_status=_activity_status" in chat
     assert "def _complete_turn_footer_metadata(" in chat
-    assert 'tail["turn_status"] = status' in chat
+    assert "chat_presentation.complete_turn_footer_metadata(" in chat
+    assert 'tail["turn_status"] = status' in presentation
+    assert 'tail["model"] = footer_model' in presentation
 
     mark_start = app.index("const _markDone = (")
     mark_end = app.index("\n      const markUserFailed", mark_start)
@@ -4049,6 +4053,7 @@ def test_per_message_timestamps_are_plumbed_but_only_shown_on_expand():
     """
     chat = (BACKEND / "chat.py").read_text(encoding="utf-8")
     history = (BACKEND / "chat_history.py").read_text(encoding="utf-8")
+    presentation = (BACKEND / "chat_presentation.py").read_text(encoding="utf-8")
     html = (FRONTEND / "index.html").read_text(encoding="utf-8")
 
     assert "def _transcript_ts_ms(entry: dict) -> int | None:" in chat
@@ -4057,7 +4062,7 @@ def test_per_message_timestamps_are_plumbed_but_only_shown_on_expand():
     # Raw-entry loaders stamp it; the pure-SDK loader can't (SessionMessage has
     # no timestamp field) and consumers must tolerate its absence.
     assert "timestamp_ms=_transcript_ts_ms" in chat
-    assert 'entry["mts"] = mts_by_uuid[u]' in chat
+    assert 'entry["mts"] = mts_by_uuid[message_uuid]' in presentation
     assert '__slots__ = ("uuid", "type", "message", "mts")' in history
 
     # Shown only on an EXPANDED tool card — 30+ stamped cards per turn costs
