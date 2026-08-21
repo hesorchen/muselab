@@ -75,8 +75,18 @@ def stream_env(app_module, monkeypatch):
     logic itself untouched."""
     from backend import chat as chat_mod
 
-    # No real JSONL transcript — result handler tolerates an empty list.
+    # No real JSONL transcript. Model a committed current-turn boundary by
+    # default; individual failure tests override this resolver explicitly.
     monkeypatch.setattr(chat_mod, "_get_session_msgs", lambda sid, model="": [])
+    monkeypatch.setattr(
+        chat_mod, "_real_turn_uuids_from_boundary_for_test",
+        chat_mod._turn_uuids_from_boundary, raising=False)
+    monkeypatch.setattr(
+        chat_mod,
+        "_turn_uuids_from_boundary",
+        lambda *_args, **_kwargs: (
+            "fixture-canonical-assistant", "fixture-canonical-user", True),
+    )
     # Skip jsonl signature cleanup (would scan disk).
     from backend import jsonl_cleanup
     monkeypatch.setattr(jsonl_cleanup, "clean_session", lambda sid: None)
@@ -112,6 +122,13 @@ def test_mem0_never_rewrites_canonical_user_query(
         f"&prompt={prompt}&model=claude-sonnet-4-6")
     assert response.status_code == 200
     assert fake.queried == [prompt]
+    done = next(
+        json.loads(data)
+        for event, data in _parse_sse(response.text)
+        if event == "done"
+    )
+    assert done["is_error"] is False
+    assert done["assistant_uuid"] == "fixture-canonical-assistant"
 
 
 def _make_session(client):
@@ -530,6 +547,224 @@ def test_result_only_error_persists_tail_bubble_without_relabeling_old_turn(
     assert terminal["role"] == "assistant"
     assert "context window" in terminal["text"]
     assert terminal["turn_status"] == "failed"
+
+
+def test_prevent_continuation_cannot_be_overridden_by_success_result(
+        stream_env, client, monkeypatch):
+    """A rejected UserPromptSubmit stays failed even if Result says success."""
+    chat_mod = stream_env
+    sid = _make_session(client)
+    fake = _FakeStreamClient([
+        SystemMessage(
+            subtype="informational",
+            data={
+                "content": (
+                    "UserPromptSubmit operation blocked by hook: "
+                    "callback timed out"
+                ),
+                "level": "warning",
+                "preventContinuation": True,
+            },
+        ),
+        ResultMessage(
+            subtype="success", duration_ms=50, duration_api_ms=40,
+            is_error=False, num_turns=1, session_id=sid,
+            total_cost_usd=0.0, usage={},
+        ),
+    ])
+
+    async def fake_get_client(*_args, **_kwargs):
+        return fake
+
+    monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
+    response = client.get(
+        f"/api/chat/stream?token={TEST_TOKEN}&session_id={sid}"
+        "&prompt=must-survive-refresh&model=claude-sonnet-4-6",
+    )
+    assert response.status_code == 200, response.text
+    done = next(
+        json.loads(data)
+        for event, data in _parse_sse(response.text)
+        if event == "done"
+    )
+
+    assert done["is_error"] is True
+    assert done["snapshot_ready"] is True
+    assert done["assistant_uuid"] == ""
+    assert "blocked by hook" in done["error"]
+    assert done["kind"] == "network"
+    assert done["retryable"] is True
+
+    history = client.get(
+        f"/api/chat/sessions/{sid}",
+        params={"tail": 80},
+        headers={"X-Auth-Token": TEST_TOKEN},
+    )
+    assert history.status_code == 200, history.text
+    messages = history.json()["messages"]
+    assert any(
+        message.get("role") == "user"
+        and message.get("text") == "must-survive-refresh"
+        and message.get("_failed") is True
+        for message in messages
+    )
+    assert messages[-1]["turn_status"] == "failed"
+
+
+def test_prevent_continuation_without_result_surfaces_hook_error(
+        stream_env, client, monkeypatch):
+    chat_mod = stream_env
+    sid = _make_session(client)
+    fake = _FakeStreamClient([SystemMessage(
+        subtype="informational",
+        data={
+            "content": "UserPromptSubmit operation blocked by hook timeout",
+            "preventContinuation": True,
+        },
+    )])
+
+    async def fake_get_client(*_args, **_kwargs):
+        return fake
+
+    monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
+    response = client.get(
+        f"/api/chat/stream?token={TEST_TOKEN}&session_id={sid}"
+        "&prompt=no-result&model=claude-sonnet-4-6",
+    )
+    error = next(
+        json.loads(data)
+        for event, data in _parse_sse(response.text)
+        if event == "error"
+    )
+
+    assert "blocked by hook timeout" in error["error"]
+    assert "without a ResultMessage" not in error["error"]
+    assert error["snapshot_ready"] is True
+
+
+def test_success_result_without_canonical_turn_is_failed(
+        stream_env, client, monkeypatch):
+    """Result success is insufficient when the current turn never reached JSONL."""
+    chat_mod = stream_env
+    sid = _make_session(client)
+    fake = _FakeStreamClient([ResultMessage(
+        subtype="success", duration_ms=50, duration_api_ms=40,
+        is_error=False, num_turns=1, session_id=sid,
+        total_cost_usd=0.0, usage={},
+    )])
+
+    async def fake_get_client(*_args, **_kwargs):
+        return fake
+
+    monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
+    monkeypatch.setattr(
+        chat_mod, "_turn_uuids_from_boundary",
+        lambda *_args, **_kwargs: (None, None, True),
+    )
+    response = client.get(
+        f"/api/chat/stream?token={TEST_TOKEN}&session_id={sid}"
+        "&prompt=missing-canonical-turn&model=claude-sonnet-4-6",
+    )
+    assert response.status_code == 200, response.text
+    done = next(
+        json.loads(data)
+        for event, data in _parse_sse(response.text)
+        if event == "done"
+    )
+
+    assert done["is_error"] is True
+    assert done["snapshot_ready"] is True
+    assert done["assistant_uuid"] == ""
+    assert "committed to conversation history" in done["error"]
+    assert done["retryable"] is True
+
+
+def test_canonical_commit_waits_for_late_transcript_flush(
+        stream_env, client, monkeypatch):
+    chat_mod = stream_env
+    sid = _make_session(client)
+    fake = _FakeStreamClient([ResultMessage(
+        subtype="success", duration_ms=50, duration_api_ms=40,
+        is_error=False, num_turns=1, session_id=sid,
+        total_cost_usd=0.0, usage={},
+    )])
+    evidence = iter([
+        (None, None, True),
+        ("late-assistant", "late-user", True),
+    ])
+    calls = 0
+
+    async def fake_get_client(*_args, **_kwargs):
+        return fake
+
+    def resolve(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return next(evidence)
+
+    monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
+    monkeypatch.setattr(chat_mod, "_turn_uuids_from_boundary", resolve)
+    response = client.get(
+        f"/api/chat/stream?token={TEST_TOKEN}&session_id={sid}"
+        "&prompt=late-flush&model=claude-sonnet-4-6",
+    )
+    done = next(
+        json.loads(data)
+        for event, data in _parse_sse(response.text)
+        if event == "done"
+    )
+
+    assert calls == 2
+    assert done["is_error"] is False
+    assert done["assistant_uuid"] == "late-assistant"
+
+
+def test_slash_command_success_does_not_require_chat_bubbles(
+        stream_env, client, monkeypatch):
+    chat_mod = stream_env
+    sid = _make_session(client)
+    fake = _FakeStreamClient([ResultMessage(
+        subtype="success", duration_ms=50, duration_api_ms=40,
+        is_error=False, num_turns=1, session_id=sid,
+        total_cost_usd=0.0, usage={},
+    )])
+
+    async def fake_get_client(*_args, **_kwargs):
+        return fake
+
+    def forbidden_resolver(*_args, **_kwargs):
+        raise AssertionError("slash command must use its SDK Result verdict")
+
+    monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
+    monkeypatch.setattr(
+        chat_mod, "_turn_uuids_from_boundary", forbidden_resolver)
+    response = client.get(
+        f"/api/chat/stream?token={TEST_TOKEN}&session_id={sid}"
+        "&prompt=/compact&model=claude-sonnet-4-6",
+    )
+    done = next(
+        json.loads(data)
+        for event, data in _parse_sse(response.text)
+        if event == "done"
+    )
+
+    assert done["is_error"] is False
+
+
+def test_unestablished_boundary_cannot_match_old_history(
+        stream_env, monkeypatch):
+    chat_mod = stream_env
+
+    def forbidden_index(_sid):
+        raise AssertionError("invalid anchor must fail before history lookup")
+
+    monkeypatch.setattr(chat_mod, "_ensure_transcript_index", forbidden_index)
+    assert chat_mod._real_turn_uuids_from_boundary_for_test(
+        "sid",
+        {"record_count": 0, "capture_ok": False},
+        started_at_ms=1000,
+        terminal_at_ms=2000,
+    ) == (None, None, False)
 
 
 def test_activity_hidden_turn_never_enters_global_task_center(
@@ -1090,9 +1325,14 @@ def test_turn_response_boundary_accepts_lifecycle_and_uuid_less_error(stream_env
     error_result = ResultMessage(
         subtype="error", duration_ms=1, duration_api_ms=1,
         is_error=True, num_turns=1, session_id="sid", uuid=None)
+    stale_system = SystemMessage(
+        subtype="informational",
+        data={"uuid": "old", "preventContinuation": True},
+    )
 
     assert boundary.classify(lifecycle) == "forward"
     assert boundary.classify(old_result) == "stale_result"
+    assert boundary.classify(stale_system) == "drop"
     assert boundary.classify(error_result) == "current_result"
 
 

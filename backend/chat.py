@@ -6168,10 +6168,14 @@ def _turn_transcript_boundary(
         "normal_total": 0,
         "full_uuid": "",
         "full_total": 0,
+        # Distinguish a valid empty first-turn boundary from a failed lookup.
+        # A zero record_count alone cannot do that and may point at old history.
+        "capture_ok": False,
     }
     try:
         indexed = _ensure_transcript_index(sid)
         if indexed is None:
+            boundary["capture_ok"] = not existing
             return existing, boundary
         _, index = indexed
         records = index.get("records") or []
@@ -6180,6 +6184,7 @@ def _turn_transcript_boundary(
             "record_count": len(records),
             "source_dev": int(source.get("dev") or 0),
             "source_inode": int(source.get("inode") or 0),
+            "capture_ok": True,
         })
         for order in ("normal", "full"):
             record_ids = (index.get("orders") or {}).get(order) or []
@@ -6207,7 +6212,9 @@ class _TurnResponseBoundary:
         TaskNotificationMessage, TaskUpdatedMessage,
         RateLimitEvent,
     )
-    _TURN_TYPES = (StreamEvent, AssistantMessage, UserMessage, ResultMessage)
+    _TURN_TYPES = (
+        StreamEvent, AssistantMessage, UserMessage, SystemMessage, ResultMessage,
+    )
 
     def __init__(self, existing_uuids: frozenset[str] | set[str]):
         self.existing_uuids = frozenset(existing_uuids)
@@ -6228,6 +6235,9 @@ class _TurnResponseBoundary:
             return "forward"
 
         uid = str(getattr(msg, "uuid", None) or "")
+        if isinstance(msg, SystemMessage) and not uid:
+            data = msg.data if isinstance(msg.data, dict) else {}
+            uid = str(data.get("uuid") or "")
         if uid and uid in self.existing_uuids:
             return "stale_result" if isinstance(msg, ResultMessage) else "drop"
 
@@ -7604,9 +7614,8 @@ def _turn_uuids_from_boundary(
     *,
     started_at_ms: int,
     terminal_at_ms: int,
-    want_image_user: bool,
-) -> tuple[str | None, str | None]:
-    """Resolve only UUIDs owned by the turn after a pre-query boundary.
+) -> tuple[str | None, str | None, bool]:
+    """Resolve current-turn UUIDs and whether canonical inspection succeeded.
 
     A naive "latest assistant" tail scan can return the previous turn when
     the current Gateway failure has only a ResultMessage. Reuse the indexed
@@ -7614,10 +7623,12 @@ def _turn_uuids_from_boundary(
     only when it descends from this turn's real user prompt after the exact
     pre-query record coordinate.
     """
+    if not bool((boundary or {}).get("capture_ok")):
+        return None, None, False
     try:
         indexed = _ensure_transcript_index(sid)
         if indexed is None:
-            return None, None
+            return None, None, True
         transcript_path, index = indexed
         probe = {
             "transcript_boundary": dict(boundary or {}),
@@ -7629,27 +7640,53 @@ def _turn_uuids_from_boundary(
         span, assistant_uuid = _cancelled_snapshot_canonical_span(
             transcript_path, index, probe)
         if not span:
-            return assistant_uuid or None, None
+            return assistant_uuid or None, None, True
         span_set = set(span)
         user_uuid: str | None = None
         for record in index.get("records") or []:
             uid = str(record.get("uuid") or "")
             if uid not in span_set or not record.get("real_user_prompt"):
                 continue
-            if want_image_user and not record.get("has_inline_images"):
-                continue
             user_uuid = uid
             break
-        return assistant_uuid or None, user_uuid
+        return assistant_uuid or None, user_uuid, True
     except Exception as exc:
-        # Annotation enrichment is best-effort. Never fall back to an
-        # unbounded/latest UUID on failure; leaving a footer receipt absent is
-        # safer than mutating a prior turn.
+        # Never fall back to an unbounded/latest UUID. Callers treat absent
+        # evidence as an uncommitted turn, which is safer than publishing a
+        # success that can disappear or mutating a prior turn's annotation.
         sys.stderr.write(
             f"[chat] turn UUID boundary resolve skipped sid={sid[:8]} "
             f"exc={type(exc).__name__}\n")
         sys.stderr.flush()
-        return None, None
+        return None, None, False
+
+
+async def _settle_turn_uuids(
+    sid: str,
+    boundary: dict[str, Any],
+    *,
+    started_at_ms: int,
+    terminal_at_ms: int,
+    require_assistant: bool,
+) -> tuple[str | None, str | None, bool]:
+    """Wait briefly for the CLI's canonical JSONL append to become observable."""
+    evidence: tuple[str | None, str | None, bool] = (None, None, False)
+    for delay in (0.0, 0.05, 0.15, 0.3, 0.5):
+        if delay:
+            await asyncio.sleep(delay)
+        evidence = await asyncio.to_thread(
+            _turn_uuids_from_boundary,
+            sid,
+            boundary,
+            started_at_ms=started_at_ms,
+            terminal_at_ms=terminal_at_ms,
+        )
+        assistant_uuid, user_uuid, inspected = evidence
+        if user_uuid and (assistant_uuid or not require_assistant):
+            break
+        if not inspected and not bool((boundary or {}).get("capture_ok")):
+            break
+    return evidence
 
 
 def _heal_cancelled_snapshot_from_canonical(
@@ -10168,18 +10205,31 @@ def _sdk_assistant_error(msg: Any) -> dict | None:
 
 
 def _sdk_system_error(msg: Any) -> dict | None:
-    """Recognize slash-command failures encoded as local SystemMessage rows.
+    """Recognize terminal failures carried only by a SystemMessage.
 
-    Claude CLI can finish `/compact` with a nominally successful ResultMessage
-    while putting the actual Gateway/API failure only in a generic
-    `system/local_command` message. Ignore normal local-command prose; promote
-    only text that our public stream classifier already recognizes as an API,
-    auth, quota, model-route, network, or context failure.
+    ``preventContinuation`` means the CLI rejected the user prompt before it
+    entered the canonical transcript.  A later nominally successful
+    ResultMessage is only the hook operation finishing; it must not turn that
+    rejected prompt into a completed chat turn.
+
+    Slash commands have a second legacy shape: the CLI can finish `/compact`
+    with a successful ResultMessage while putting the actual Gateway/API failure
+    only in ``system/local_command``.  Normal local-command prose remains
+    non-terminal.
     """
-    if not isinstance(msg, SystemMessage) or msg.subtype != "local_command":
+    if not isinstance(msg, SystemMessage):
         return None
     data = msg.data if isinstance(msg.data, dict) else {}
-    text = str(data.get("content") or "").strip()
+    prevented = data.get("preventContinuation") is True
+    if not prevented and msg.subtype != "local_command":
+        return None
+    text = str(data.get("content") or data.get("error") or "").strip()
+    if prevented:
+        return {
+            "message": text or "User prompt was rejected before it was committed.",
+            "source": "system_prevent_continuation",
+            "api_error_status": None,
+        }
     if not text:
         return None
     classified = _classify_stream_error(text)
@@ -16139,6 +16189,12 @@ async def _start_turn(
                             and broadcast.perf_first_event_ms < 0):
                         broadcast.perf_first_event_ms = obs.elapsed_ms(
                             broadcast.perf_query_started)
+                    # Record terminal system signals in the pump before reading
+                    # the next item. If the stream closes without ResultMessage,
+                    # event_gen may not have consumed the queued row yet.
+                    if (isinstance(msg, SystemMessage)
+                            and (error_info := _sdk_system_error(msg))):
+                        turn_sdk_errors.append(error_info)
                     await merge_q.put(("claude", msg))
                     return decision
 
@@ -16161,8 +16217,10 @@ async def _start_turn(
                                 # pump has already evicted its cached client;
                                 # raising here produces a visible SSE error and
                                 # makes the next send build a fresh runtime.
+                                captured = _merge_sdk_errors(turn_sdk_errors)
                                 raise (
-                                    stream._failure
+                                    ClaudeSDKError(captured["message"])
+                                    if captured else stream._failure
                                     or ClaudeSDKError(
                                         "SDK message stream ended without "
                                         "a ResultMessage")
@@ -16193,6 +16251,10 @@ async def _start_turn(
                                 break
                         if current_terminal or not stale_terminal:
                             break
+                    if not current_terminal:
+                        captured = _merge_sdk_errors(turn_sdk_errors)
+                        if captured:
+                            raise ClaudeSDKError(captured["message"])
                 if replay_dropped:
                     sys.stderr.write(
                         f"[chat-stream] dropped stale replay sid={session_id[:8]} "
@@ -16681,11 +16743,53 @@ async def _start_turn(
             was_cancelled = session_id in _pending_interrupts
             _pending_interrupts.discard(session_id)
             broadcast.cancelled = was_cancelled
+            _completed_at_ms = int(time.time() * 1000)
             _result_error = _sdk_result_error(msg)
             _turn_error = _merge_sdk_errors([
                 *turn_sdk_errors,
                 *([_result_error] if _result_error else []),
             ])
+
+            # A success-shaped ResultMessage proves only that the SDK operation
+            # ended. Ordinary chat turns are committed only when this exact
+            # pre-query boundary owns both a real user row and an assistant row.
+            # Slash commands have their own system/result transcript shape, so
+            # they retain the SDK Result verdict. Error/cancel turns only need a
+            # user UUID when attachments must be annotated.
+            boundary_asst_uuid: str | None = None
+            new_user_uuid: str | None = None
+            boundary_inspected = False
+            _commit_required = bool(prompt.strip()) and not prompt.lstrip().startswith("/")
+            if ((_turn_error is None and not was_cancelled and _commit_required)
+                    or persisted_imgs or persisted_docs):
+                boundary_asst_uuid, new_user_uuid, boundary_inspected = (
+                    await _settle_turn_uuids(
+                        session_id,
+                        broadcast.transcript_boundary,
+                        started_at_ms=int(float(broadcast.started_at or 0) * 1000),
+                        terminal_at_ms=_completed_at_ms,
+                        require_assistant=(
+                            _turn_error is None
+                            and not was_cancelled
+                            and _commit_required
+                        ),
+                    )
+                )
+            if (_turn_error is None and not was_cancelled and _commit_required
+                    and (not boundary_asst_uuid or not new_user_uuid)):
+                detail = (
+                    "Canonical conversation history could not be inspected."
+                    if not boundary_inspected else
+                    "The turn ended before the user message and assistant "
+                    "response were committed to conversation history."
+                )
+                _turn_error = {
+                    "message": detail,
+                    "source": "canonical_commit",
+                    "api_error_status": None,
+                }
+            terminal_assistant_uuid = last_assistant_uuid or boundary_asst_uuid or ""
+
             _is_error = _turn_error is not None
             _subtype = getattr(msg, "subtype", None)
             _errors = getattr(msg, "errors", None) or []
@@ -16710,7 +16814,6 @@ async def _start_turn(
             _done_memory_recall = mem0.pop_recall_trace(session_id)
             _done_memory_receipt = _persistable_memory_recall(
                 _done_memory_recall)
-            _completed_at_ms = int(time.time() * 1000)
             _msg_duration_ms = getattr(msg, "duration_ms", None)
             _elapsed_s = (round(_msg_duration_ms / 1000, 1)
                           if _msg_duration_ms else None)
@@ -16745,10 +16848,10 @@ async def _start_turn(
             if _done_background_tasks:
                 _defer_activity_finish(
                     session_id, broadcast, _activity_status)
-                if last_assistant_uuid:
+                if terminal_assistant_uuid:
                     try:
                         sess.set_runtime_background_boundary(
-                            session_id, last_assistant_uuid)
+                            session_id, terminal_assistant_uuid)
                     except Exception as exc:
                         sys.stderr.write(
                             f"[chat] runtime boundary persist failed "
@@ -16765,12 +16868,12 @@ async def _start_turn(
             # bookkeeping below is still running and observe a bare assistant
             # record with no status/model/duration.
             _footer_annotation_uuid = ""
-            if last_assistant_uuid:
+            if terminal_assistant_uuid:
                 try:
                     await asyncio.to_thread(
                         sess.set_message_annotation,
                         session_id,
-                        last_assistant_uuid,
+                        terminal_assistant_uuid,
                         cost=f"${cost:.4f}",
                         model=model_to_use,
                         ts=_completed_at_ms,
@@ -16778,7 +16881,7 @@ async def _start_turn(
                         elapsed_s=_elapsed_s,
                         memory_recall=_done_memory_receipt,
                     )
-                    _footer_annotation_uuid = last_assistant_uuid
+                    _footer_annotation_uuid = terminal_assistant_uuid
                 except Exception as exc:
                     sys.stderr.write(
                         f"[chat] terminal footer annotation failed "
@@ -16787,7 +16890,7 @@ async def _start_turn(
             yield {"event": "done", "data": json.dumps({
                 "turn_id": broadcast.turn_id,
                 "duration_ms": _msg_duration_ms,
-                "assistant_uuid": last_assistant_uuid,
+                "assistant_uuid": terminal_assistant_uuid,
                 "completed_at_ms": _completed_at_ms,
                 "total_cost_usd": cost,
                 "model": model_to_use,
@@ -16921,18 +17024,13 @@ async def _start_turn(
             # fallback branch, which previously left it unbound on the fast path
             # → UnboundLocalError at every turn's end.
             all_msgs: list | None = None
-            boundary_asst_uuid, new_user_uuid = await asyncio.to_thread(
-                _turn_uuids_from_boundary,
-                session_id,
-                broadcast.transcript_boundary,
-                started_at_ms=int(float(broadcast.started_at or 0) * 1000),
-                terminal_at_ms=_completed_at_ms,
-                want_image_user=bool(persisted_imgs),
-            )
+            # Reuse the commit-gate result captured before `done`; a second index
+            # lookup would add latency and could observe a different transcript
+            # generation than the one that decided the terminal status.
             # AssistantMessage observed in this stream is authoritative. The
             # indexed boundary is a safe fallback for older SDKs that omit the
             # UUID on the in-memory object but still write it to JSONL.
-            new_asst_uuid = last_assistant_uuid or boundary_asst_uuid
+            new_asst_uuid = terminal_assistant_uuid
             if new_asst_uuid and new_asst_uuid != _footer_annotation_uuid:
                 # ts (ms epoch) stamps the turn's completion time. The
                 # frontend's turn-footer (.turn-footer in index.html)
@@ -17208,6 +17306,10 @@ async def _start_turn(
                     # window store + push a live `rate_limit` SSE event.
                     async for ev in _handle_rate_limit(msg):
                         yield ev
+                elif isinstance(msg, SystemMessage):
+                    # Terminal system signals were captured by the turn-scoped
+                    # pump before enqueue; informational rows need no UI event.
+                    pass
                 elif isinstance(msg, ResultMessage):
                     async for ev in _handle_result_message(msg):
                         yield ev
