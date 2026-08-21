@@ -255,3 +255,72 @@ def test_chat_presentation_facades_remain_patchable(app_module, monkeypatch):
     chat_mod._defer_large_ui_bodies([message])
     assert message["text"] == "b"
     assert message["body_length"] == 4
+
+
+def test_chat_overlay_module_keeps_runtime_boundary_and_shared_containers(
+    app_module,
+):
+    from backend import chat as chat_mod
+    from backend import chat_overlays
+
+    tree = ast.parse(inspect.getsource(chat_overlays))
+    imports = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.Import, ast.ImportFrom))
+    ]
+    assert not any(
+        (
+            isinstance(node, ast.ImportFrom)
+            and any(alias.name == "chat" for alias in node.names)
+        )
+        or (
+            isinstance(node, ast.Import)
+            and any(alias.name.endswith(".chat") for alias in node.names)
+        )
+        for node in imports
+    )
+    assert not any(
+        isinstance(node, ast.ImportFrom)
+        and node.module == "claude_agent_sdk"
+        for node in imports
+    )
+
+    top_level_functions = {
+        node.name
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    assert not {
+        "get_client",
+        "disconnect_client",
+        "_start_turn",
+        "_watch_background_tasks",
+        "_create_runtime_successor",
+    } & top_level_functions
+
+    assert (
+        chat_mod._runtime_continuation_delivery_tasks
+        is chat_overlays.RUNTIME_CONTINUATION_DELIVERY_TASKS
+    )
+    assert (
+        chat_mod._runtime_rollover_locks
+        is chat_overlays.RUNTIME_CONTINUATION_FENCES
+    )
+
+
+def test_chat_overlay_facades_remain_patchable(app_module, monkeypatch):
+    from backend import chat as chat_mod
+    from backend import chat_overlays
+
+    calls = []
+
+    def combine(base, overlay):
+        calls.append((base, overlay))
+        return "patched-generation"
+
+    monkeypatch.setattr(chat_overlays, "_combined_history_generation", combine)
+    assert chat_mod._combined_history_generation("canonical", "overlay") == (
+        "patched-generation"
+    )
+    assert calls == [("canonical", "overlay")]
