@@ -151,6 +151,40 @@ def test_recall_hook_uses_additional_context(monkeypatch, fake_httpx):
     assert fake_httpx.calls[-1][2]["query"] == "original user prompt"
 
 
+def test_recall_hook_times_out_before_sdk_watchdog_and_fails_open(monkeypatch):
+    mc = _load(monkeypatch)
+    monkeypatch.setattr(mc, "_RECALL_DEADLINE", 0.01)
+    cancelled = asyncio.Event()
+
+    async def stalled_recall(_query, _session_id):
+        try:
+            await asyncio.sleep(10)
+        finally:
+            cancelled.set()
+
+    monkeypatch.setattr(mc, "search_context", stalled_recall)
+    hook = mc.build_recall_hook("session-timeout")
+
+    async def scenario():
+        result = await hook({"prompt": "must still be submitted"}, None, None)
+        assert result == {}
+        assert cancelled.is_set()
+
+    _run(scenario())
+    assert mc.RECALL_HOOK_TIMEOUT > mc._RECALL_DEADLINE
+
+
+def test_recall_hook_backend_error_fails_open(monkeypatch):
+    mc = _load(monkeypatch)
+
+    async def broken_recall(_query, _session_id):
+        raise RuntimeError("memory backend unavailable")
+
+    monkeypatch.setattr(mc, "search_context", broken_recall)
+    hook = mc.build_recall_hook("session-error")
+    assert _run(hook({"prompt": "must still be submitted"}, None, None)) == {}
+
+
 def test_store_payload_has_no_run_id(monkeypatch, fake_httpx):
     mc = _load(monkeypatch)
     _run(mc.store_turn("session-A", "model", "remember X", "X noted"))

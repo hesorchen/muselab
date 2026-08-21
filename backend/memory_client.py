@@ -35,8 +35,13 @@ _legacy_recall_traces: dict[str, dict] = {}
 _LEGACY_TRACE_MAX = 256
 
 _USER_ID = "muselab"
-_SEARCH_TIMEOUT = 3.0
-RECALL_HOOK_TIMEOUT = _SEARCH_TIMEOUT + 0.5
+# Memory is optional context, never part of the message commit path.  Finish the
+# callback before the SDK's hook watchdog: an SDK-level hook timeout sets
+# preventContinuation=true and rejects the user's prompt.  The inner deadline
+# converts a slow recall into an empty additionalContext response instead.
+_RECALL_DEADLINE = 3.0
+_SEARCH_TIMEOUT = _RECALL_DEADLINE
+RECALL_HOOK_TIMEOUT = _RECALL_DEADLINE + 0.5
 _STORE_TIMEOUT = 10.0
 _SEARCH_LIMIT = 5
 _MAX_MEM_CHARS = 400
@@ -347,10 +352,21 @@ async def search_context(query: str, session_id: str) -> str:
 
 
 def build_recall_hook(session_id: str):
-    """Build an SDK UserPromptSubmit hook bound to one muselab session."""
+    """Build a fail-open UserPromptSubmit hook for optional memory context.
+
+    Returning before ``RECALL_HOOK_TIMEOUT`` is a correctness requirement, not a
+    latency optimization.  If the SDK watchdog fires it rejects the user prompt
+    with ``preventContinuation=true``.  A slow or broken memory backend must
+    therefore degrade to no recalled context instead of aborting the turn.
+    """
     async def recall_hook(input_data, _tool_use_id, _context):
         prompt = input_data.get("prompt", "") if isinstance(input_data, dict) else ""
-        block = await search_context(str(prompt), session_id)
+        try:
+            async with asyncio.timeout(_RECALL_DEADLINE):
+                block = await search_context(str(prompt), session_id)
+        except Exception as exc:
+            _log_failure(logging.DEBUG, "memory recall hook skipped", exc)
+            return {}
         if not block:
             return {}
         return {
