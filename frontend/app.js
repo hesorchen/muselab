@@ -574,20 +574,6 @@ function portal() {
     // ever-growing text value, while the bounded LRU keeps memory predictable.
     _historyHtmlByKey: new Map(),
     _historyHtmlBytes: 0,
-    // True while loadSession(currentId) is in flight. UI uses this to swap
-    // the brand-empty placeholder for a shimmer skeleton, so users don't
-    // see "Muse · Calliope / empty chat" for the second a big session
-    // takes to fetch.
-    messagesLoading: false,
-    // Compatibility mirrors for the active tab only. The authoritative values
-    // live in tabState[currentId]; the mounted pane reads that session state.
-    historyGeneration: "",
-    // Gates revealing a freshly-loaded session: stays false from load-start
-    // until syntax-highlight + artifacts finish, so the whole conversation
-    // appears at once instead of janking in code-block-by-code-block (the
-    // skeleton covers the gap). Default true so empty/streaming views aren't
-    // hidden. Only loadSession flips it false→true.
-    messagesReady: true,
 
     // ===== scheduled tasks (bell drawer) =====
     // Daily-fire prompts that dispatch into a dedicated muselab session.
@@ -791,35 +777,10 @@ function portal() {
                           //  has a different shape — overlapping names crash
                           //  Alpine when one side reads .show on the other's null)
     forkingSessionId: "",
-    // Per-tab runtime state. Keyed by session id and the sole owner of the
-    // transcript, history-loading, stream, usage, and scroll-follow state.
-    // Root names remain compatibility accessors for older helpers/templates;
-    // they never store a second copy and always resolve through currentId.
+    // Per-tab runtime state. Keyed by session id and authoritative for every
+    // session-panel field. Background callbacks keep their captured owner state;
+    // the mounted pane resolves the current owner through activeSessionPane().
     tabState: {},
-    get messages() { return this.activeSessionPane().messages; },
-    set messages(value) { this._setActiveSessionPaneField("messages", value); },
-    get messagesReady() { return this.activeSessionPane().messagesReady; },
-    set messagesReady(value) { this._setActiveSessionPaneField("messagesReady", value); },
-    get messagesLoading() { return this.activeSessionPane().messagesLoading; },
-    set messagesLoading(value) { this._setActiveSessionPaneField("messagesLoading", value); },
-    get historyGeneration() { return this.activeSessionPane().historyGeneration; },
-    set historyGeneration(value) { this._setActiveSessionPaneField("historyGeneration", value); },
-    get streaming() { return this.activeSessionPane().streaming; },
-    set streaming(value) { this._setActiveSessionPaneField("streaming", value); },
-    get es() { return this.activeSessionPane().es; },
-    set es(value) { this._setActiveSessionPaneField("es", value); },
-    get streamingModel() { return this.activeSessionPane().streamingModel; },
-    set streamingModel(value) { this._setActiveSessionPaneField("streamingModel", value); },
-    get streamElapsed() { return this.activeSessionPane().streamElapsed; },
-    set streamElapsed(value) { this._setActiveSessionPaneField("streamElapsed", value); },
-    get _streamTimer() { return this.activeSessionPane()._streamTimer; },
-    set _streamTimer(value) { this._setActiveSessionPaneField("_streamTimer", value); },
-    get _streamStartedAt() { return this.activeSessionPane()._streamStartedAt; },
-    set _streamStartedAt(value) { this._setActiveSessionPaneField("_streamStartedAt", value); },
-    get sessionUsage() { return this.activeSessionPane().sessionUsage; },
-    set sessionUsage(value) { this._setActiveSessionPaneField("sessionUsage", value); },
-    get atBottom() { return this.activeSessionPane().atBottom; },
-    set atBottom(value) { this._setActiveSessionPaneField("atBottom", value); },
     model: "claude-sonnet-4-6",
     // The configured "new-session default" model (Settings → 新会话). Kept
     // SEPARATE from `model`, which tracks the CURRENTLY-VIEWED session and is
@@ -1765,7 +1726,7 @@ function portal() {
         console.error("file:", ev.filename, "line:", ev.lineno, "col:", ev.colno);
         console.error("stack:", ev.error.stack);
         console.error("currentId:", this.currentId,
-                      "messages.length:", (this.messages || []).length,
+                      "messages.length:", this.activeSessionPane().messages.length,
                       "sessions.length:", (this.sessions || []).length,
                       "previewTabCtxMenu:", JSON.stringify(this.previewTabCtxMenu),
                       "ctxBreakdown:", JSON.stringify(this.ctxBreakdown));
@@ -2457,7 +2418,7 @@ function portal() {
             const knownLocal = localVer
               && localVer !== "__MUSELAB_ASSET_VERSION__";
             if (knownLocal && localVer !== String(remoteVer)
-                && !this.streaming) {
+                && !this.activeSessionPane().streaming) {
               this._appVersionReloadFired = true;
               console.info("[muselab] asset version changed",
                            localVer, "→", remoteVer, "— reloading");
@@ -2863,7 +2824,7 @@ function portal() {
     // 命中的是「每一个 assistant 轮次的首条」——历史里每个轮次都满足，
     // 于是流式时所有轮次的头像一起动。正确语义是「仅当前（最新）轮」：
     // 既是轮首（前一条是 user 或开头），又是最后一轮（自此往后不再有 user）。
-    isStreamingTurnAvatar(i, msgs = this.messages, streaming = this.streaming) {
+    isStreamingTurnAvatar(i, msgs = this.activeSessionPane().messages, streaming = this.activeSessionPane().streaming) {
       if (!streaming) return false;
       if (!msgs || !msgs.length) return false;
       // 最新轮的轮首 = 最后一个 user 之后紧邻的第一条 assistant。这等价于旧
@@ -3880,7 +3841,7 @@ function portal() {
       // Fire off a background backend fetch so the list reflects the
       // FULL session, not just the lazy-loaded visible window. This was
       // the source of "outline shows only 2 user messages on a 45-user
-      // session" — the original filter walked this.messages which only
+      // session" — the original filter walked only the active pane window, which
       // contains the recent slice after the long-history performance
       // optimization (commit 664304a).
       const sid = this.currentId;
@@ -3900,7 +3861,7 @@ function portal() {
         }));
       }
       // Fallback: live filter on the visible window (original behavior).
-      return (this.messages || []).filter(
+      return this.activeSessionPane().messages.filter(
         m => m && m.role === "user" && !m._is_compact_summary);
     },
     async _loadAroundMessage(sid, uuid, retryAfterConflict = true) {
@@ -4148,7 +4109,7 @@ function portal() {
     // lookup; Alpine re-evaluates it per render which is fine since
     // it's a few comparisons.
     isTurnTail(i) {
-      const arr = this.messages;
+      const arr = this.activeSessionPane().messages;
       if (!arr || i < 0 || i >= arr.length) return false;
       const m = arr[i];
       if (!m || m.role === "user") return false;
@@ -4686,8 +4647,9 @@ function portal() {
     _rerenderMathMessages() {
       if (!window.renderMathInElement) return;
       const RE = /\$\$|\\\(|\\\[|\$[^$\n]+\$/;
-      if (Array.isArray(this.messages)) {
-        for (const m of this.messages) {
+      const messages = this.activeSessionPane().messages;
+      if (Array.isArray(messages)) {
+        for (const m of messages) {
           if (m && typeof m.text === "string" && m.html && RE.test(m.text)) {
             this._mdCacheDelete(m.text);  // drop stale (raw-$$) cache entry
             this._historyHtmlDelete(m);
@@ -6265,17 +6227,17 @@ function portal() {
       // AND the in-memory messages array — take the max. Two failure modes
       // we need to cover simultaneously:
       //   (a) sessions list metadata loaded before messages stream in →
-      //       this.messages temporarily empty but persisted count > 0 →
+      //       the active pane is temporarily empty but persisted count > 0 →
       //       prefer persisted count.
       //   (b) user switches model mid-first-turn (or before the FIRST turn's
-      //       bump_session has fired) → persisted count still 0 but
-      //       this.messages already has user + streaming-assistant bubbles →
+      //       bump_session has fired) → persisted count still 0 but the active
+      //       pane already has user + streaming-assistant bubbles →
       //       prefer in-memory length. The old single-source logic took
       //       persisted=0 here and silently switched without the "新建会话?"
       //       confirm (2026-05-23 user feedback).
       const persistedFromMeta = (cur && typeof cur.message_count === "number")
         ? cur.message_count : 0;
-      const persistedCount = Math.max(persistedFromMeta, this.messages.length || 0);
+      const persistedCount = Math.max(persistedFromMeta, this.activeSessionPane().messages.length || 0);
 
       // Empty session — switch in place (no point creating an empty fork).
       // Still toast so the user gets visual confirmation the switch happened.
@@ -7603,7 +7565,9 @@ function portal() {
       // Even one envelope may contain a very large tool result or diff, so
       // message count alone is not a safe complexity proxy on this reveal path.
       const deferChat = next === "chat" && this._isMobileLayout() && chatLen > 0;
-      if (deferChat) chatState.messagesReady = false;
+      if (deferChat) {
+        chatState.messagesReady = false;
+      }
       if (previous === "preview" && next !== "preview") {
         this._capturePreviewViewState(ownerPath);
         this._cancelPreviewViewRestore();
@@ -8233,7 +8197,7 @@ function portal() {
       sid, tries, completedTurnId = "", reconciledQueuedTurnId = "",
     ) {
       const st0 = this.tabState[sid];
-      if (this.currentId !== sid || this.streaming) {
+      if (this.currentId !== sid || this.activeSessionPane().streaming) {
         if (st0) st0._draining = false;
         this._syncQueueFromServer(sid);
         return;
@@ -8331,7 +8295,7 @@ function portal() {
       // turn has a different immutable turn_id and remains attachable below.
       if (active && completedTurnId
           && (!turnId || turnId === completedTurnId)) {
-        if (expect && tries > 1 && !this.streaming && this.currentId === sid) {
+        if (expect && tries > 1 && !this.activeSessionPane().streaming && this.currentId === sid) {
           setTimeout(
             () => this._attachToServerTurn(
               sid, tries - 1, completedTurnId,
@@ -8360,7 +8324,7 @@ function portal() {
         this._ensureBgContPoller(sid);
         return;
       }
-      if (active && continuation && !this.streaming && this.currentId === sid) {
+      if (active && continuation && !this.activeSessionPane().streaming && this.currentId === sid) {
         // The slot holds a bg-task continuation turn, not a queued item. Hand
         // it to the continuation poller (no user bubble, no truncation) instead
         // of the queue-drain reconnect below.
@@ -8369,7 +8333,7 @@ function portal() {
                     turnId, startedAt });
         return;
       }
-      if (active && !this.streaming && this.currentId === sid) {
+      if (active && !this.activeSessionPane().streaming && this.currentId === sid) {
         if (st) st._draining = false;
         // FIX (queue live-render): when the SERVER drained a queued item and
         // started its turn headlessly, the browser never pushed a user bubble
@@ -8412,7 +8376,7 @@ function portal() {
         this.$nextTick(() => this._syncQueueFromServer(sid));
         return;
       }
-      if (expect && tries > 1 && !this.streaming && this.currentId === sid) {
+      if (expect && tries > 1 && !this.activeSessionPane().streaming && this.currentId === sid) {
         setTimeout(
           () => this._attachToServerTurn(
             sid, tries - 1, completedTurnId,
@@ -8503,7 +8467,7 @@ function portal() {
         if (typeof document !== "undefined"
             && document.visibilityState !== "visible") return;
         // Not viewing this session, or already streaming → retry next tick.
-        if (this.currentId !== sid || this.streaming) return;
+        if (this.currentId !== sid || this.activeSessionPane().streaming) return;
         // PRIMARY completion path (since the 2026-06-11 typed-message
         // alignment): the cross-turn watcher reliably receives the typed
         // TaskNotificationMessage and opens a continuation broadcast, so
@@ -8525,7 +8489,7 @@ function portal() {
             } else if (!d.active) {
               this._setBackgroundTaskActive(sid, false);
             }
-            if (d.active && d.continuation && !this.streaming
+            if (d.active && d.continuation && !this.activeSessionPane().streaming
                 && this.currentId === sid) {
               // Dedup: /active surfaces a finished continuation from the
               // server's _recent_turns for the full 60s TTL, so if ANOTHER
@@ -8865,9 +8829,9 @@ function portal() {
       return draft;
     },
 
-    // Activate only the state that still has an intentional root owner. The
-    // transcript/stream/usage/scroll fields are read through root accessors and
-    // therefore need no copy when currentId changes.
+    // Activate the shared composer and current-session compatibility controls.
+    // Session-panel fields stay owned by tabState[id] and are read through the
+    // pane façade instead of being copied into root state.
     _activateTabState(id) {
       const st = this._ensureTabState(id);
       const meta = (this.sessions || []).find(s => s.id === id);
@@ -9874,7 +9838,7 @@ function portal() {
       // doesn't touch the panes, so it skips this.
       const chatEl = field === "currentId" ? this.$refs.chatBody : null;
       const savedTop = chatEl ? chatEl.scrollTop : 0;
-      const wasAtBottom = this.atBottom;
+      const wasAtBottom = this.activeSessionPane().atBottom !== false;
       await this.$nextTick();
       this[field] = "";
       await this.$nextTick();
@@ -11202,7 +11166,7 @@ function portal() {
     pageTitle() {
       const cur = this.sessions.find(s => s.id === this.currentId);
       const name = (cur && cur.name) || "";
-      const prefix = this.streaming ? "● " : "";
+      const prefix = this.activeSessionPane().streaming ? "● " : "";
       return name ? `${prefix}${name} · muselab` : "muselab — Meet Muse";
     },
     // ===== thinking / tool_result collapse =====
@@ -11246,8 +11210,8 @@ function portal() {
       // user's explicit toggle (the _expandedMsgs check above).
       if (defaultOpen) return true;
       // Default: only the actively-streaming last block is expanded.
-      const msgs = paneMsgs || this.messages || [];
-      const streaming = paneState ? !!paneState.streaming : !!this.streaming;
+      const msgs = paneMsgs || this.activeSessionPane().messages;
+      const streaming = paneState ? !!paneState.streaming : !!this.activeSessionPane().streaming;
       return streaming && i === msgs.length - 1;
     },
     // `defaultOpen` MUST mirror whatever the caller passed to isMsgExpanded()
@@ -11328,7 +11292,7 @@ function portal() {
     },
     async toggleMsgExpanded(m, i, defaultOpen = false) {
       if (!m) return;
-      const idx = (i ?? (this.messages || []).indexOf(m));
+      const idx = (i ?? this.activeSessionPane().messages.indexOf(m));
       const k = this._msgKey(idx, m);
       const cur = this.isMsgExpanded(idx, m, defaultOpen);
       if (!cur && m.body_available && m.body_state !== "loaded") {
@@ -11359,7 +11323,7 @@ function portal() {
       if (kind) cls += " kind-" + kind;
       return cls;
     },
-    toolResultSummary(m, i, paneMsgs = this.messages) {
+    toolResultSummary(m, i, paneMsgs = this.activeSessionPane().messages) {
       const text = (m && (m.text || m.preview)) || "";
       const lines = text.split("\n").length;
       const kind = this.toolResultKind(m);
@@ -11547,7 +11511,7 @@ function portal() {
     // Find the matching tool_use for a given tool_result by walking
     // backwards through messages and matching tool_use_id. Used by the
     // diff preview renderer to count +/- on Edit/Write/MultiEdit.
-    findToolUseFor(toolResult, fromIdx, paneMsgs = this.messages) {
+    findToolUseFor(toolResult, fromIdx, paneMsgs = this.activeSessionPane().messages) {
       if (!toolResult || fromIdx === undefined || fromIdx === null) return null;
       const id = toolResult.tool_use_id || toolResult.tool_id;
       if (!id) {
@@ -11559,7 +11523,7 @@ function portal() {
         return null;
       }
       for (let j = fromIdx - 1; j >= 0; j--) {
-        const c = this.messages[j];
+        const c = this.activeSessionPane().messages[j];
         if (c && c.role === "tool_use" &&
             (c.id === id || c.tool_use_id === id)) return c;
       }
@@ -11665,7 +11629,7 @@ function portal() {
     // 不会出现 footer 了". Cost: a 28px timestamp-only row at the end of
     // turns whose last msg has no body content — acceptable visual artifact
     // since it preserves the "turn ended at HH:MM" signal.
-    isMsgRenderable(m, i, paneMsgs = this.messages) {
+    isMsgRenderable(m, i, paneMsgs = this.activeSessionPane().messages) {
       if (!m) return false;
       // Tail check first: dominates any "body is empty" judgment below.
       const msgs = paneMsgs || [];
@@ -11734,7 +11698,7 @@ function portal() {
     // index are appends / evictions (length changes) and tab switches
     // (currentId changes); in-place streaming text mutations don't. Writing
     // the cache only on key change keeps it loop-safe under Alpine.
-    _latestEditToolIdx(paneMsgs = this.messages, tid = this.currentId) {
+    _latestEditToolIdx(paneMsgs = this.activeSessionPane().messages, tid = this.currentId) {
       const msgs = paneMsgs || [];
       const key = (tid || "_") + ":" + msgs.length;
       const cached = this._cachedLatestEditIdx;
@@ -11762,7 +11726,7 @@ function portal() {
       this._cachedLatestEditIdx = { key, idx };
       return idx;
     },
-    isLatestEditTool(i, m, paneMsgs = this.messages, tid = this.currentId) {
+    isLatestEditTool(i, m, paneMsgs = this.activeSessionPane().messages, tid = this.currentId) {
       if (!m || !(m.name === "Edit" || m.name === "Write" || m.name === "MultiEdit")) return false;
       return i === this._latestEditToolIdx(paneMsgs, tid);
     },
@@ -11859,7 +11823,7 @@ function portal() {
       } catch (_) { /* best-effort housekeeping — never block the UI */ }
     },
     _taskSubjectMapForMessages() {
-      const msgs = this.messages || [];
+      const msgs = this.activeSessionPane().messages;
       // Cache key includes session id — switching tabs/sessions must
       // invalidate even when message count happens to match.
       const cacheKey = (this.currentId || "_") + ":" + msgs.length;
@@ -12782,7 +12746,7 @@ function portal() {
     },
 
     ctxRingTitle() {
-      const u = this.sessionUsage || {};
+      const u = this.activeSessionPane().sessionUsage || {};
       const used = u.context_used || 0;
       const limit = u.context_limit || 0;
       const pct = u.context_used_pct || 0;
@@ -13976,7 +13940,7 @@ function portal() {
     // only the row the user actually pauses on triggers a fetch.
     //
     // Safety: loadSession is per-session safe (writes only into
-    // tabState[sid].messages, never touches this.messages or
+    // tabState[sid].messages and never touches another pane or
     // messagesLoading unless sid === currentId), so prefetching an
     // off-screen session can't disturb the active view.
     prefetchSession(sid) {
@@ -14440,7 +14404,7 @@ function portal() {
             // re-highlight the freshly-added tail and re-pin to the bottom IF the
             // user was following it — _reconcileOpenSession only quiet-reloads
             // when atBottom, so this won't yank anyone reading history.
-            const _wasAtBottom = st.atBottom;
+            const _wasAtBottom = st.atBottom !== false;
             this.$nextTick(async () => {
               try { await this.highlightCode(".chat-body"); st._highlighted = true; }
               catch (_e) { /* highlight best-effort */ }
@@ -14516,7 +14480,7 @@ function portal() {
     // requestIdleCallback (falls back to a short timeout) so it yields to
     // any foreground work; skipped entirely while the visible tab is
     // streaming so it can't steal main-thread time from a live reply.
-    // loadSession is per-session safe (only touches this.messages when
+    // loadSession is per-session safe (only mounts the requested owner when
     // sid === currentId), so preloading an off-screen tab can't disturb the
     // active view; the backend parse it triggers is now cached by
     // (mtime, size), making repeat/preload loads cheap.
@@ -14573,8 +14537,8 @@ function portal() {
     // (directive-heavy) bubble templates incrementally. A single bulk push of
     // ~30 rich bubbles blocks the main thread for seconds on a long session /
     // throttled device — the dominant remaining cold-open freeze after the hljs
-    // fix. Alpine reads st.messages through the active-session accessor, so each
-    // in-place push reacts without copying the array into root state.
+    // fix. st.messages is the SAME array Alpine watches (bound via
+    // the same tabState owner remains mounted during this call), so each push reacts.
     async _revealMessagesChunked(sid, st, visible) {
       const CH = this._isMobileLayout() ? 4 : 15;
       let i = 0;
@@ -14671,7 +14635,7 @@ function portal() {
         return !(this._prefetching && this._prefetching[id]);
       });
       if (!next) return;                       // all open tabs warm — done
-      if (this.streaming) {                    // don't fight a live reply
+      if (this.activeSessionPane().streaming) {                    // don't fight a live reply
         this._scheduleIdlePreload();
         return;
       }
@@ -25476,6 +25440,7 @@ function portal() {
         case "usage": {
           await this.fetchStats();
           const s = this.stats;
+          const usage = this.activeSessionPane().sessionUsage;
           const lines = [
             `**${this.t("slash.cost_title")}**`,
             `- ${this.t("cost.total")}: $${s.total_cost_usd.toFixed(4)}`,
@@ -25484,7 +25449,7 @@ function portal() {
             s.budget_usd > 0
               ? `- ${this.t("cost.budget")}: $${s.budget_usd} (${s.budget_used_pct}% used)`
               : `- ${this.t("cost.no_budget")}`,
-            `- ${this.t("cost.context")}: ${((this.sessionUsage.context_used || this.sessionUsage.input_tokens || 0) / 1000).toFixed(1)}K / ${(this.sessionUsage.context_limit / 1000).toFixed(0)}K (${this.sessionUsage.context_used_pct}%)`,
+            `- ${this.t("cost.context")}: ${((usage.context_used || usage.input_tokens || 0) / 1000).toFixed(1)}K / ${(usage.context_limit / 1000).toFixed(0)}K (${usage.context_used_pct}%)`,
           ];
           this._injectAssistantNote(lines.join("\n"));
           return true;
@@ -25808,18 +25773,19 @@ function portal() {
     // is still tracked server-side and exposed via /api/chat/usage for
     // anyone integrating muselab into a wider dashboard.
     ctxMeterLabel() {
-      const limit = this.sessionUsage.context_limit || 0;
+      const usage = this.activeSessionPane().sessionUsage;
+      const limit = usage.context_limit || 0;
       // Pre-fetch state — backend hasn't told us the real limit yet.
       // Show a placeholder rather than rendering "0K / 0K · NaN%".
       if (!limit) return this.lang === "zh" ? "上下文 …" : "Context …";
-      const pct = this.sessionUsage.context_used_pct || 0;
-      const usedTokens = (this.sessionUsage.context_used != null)
-        ? this.sessionUsage.context_used
-        : (this.sessionUsage.input_tokens || 0)
-          + (this.sessionUsage.cache_read_tokens || 0)
-          + (this.sessionUsage.cache_creation_tokens || 0);
-      const cachedTokens = (this.sessionUsage.cache_read_tokens || 0)
-                         + (this.sessionUsage.cache_creation_tokens || 0);
+      const pct = usage.context_used_pct || 0;
+      const usedTokens = (usage.context_used != null)
+        ? usage.context_used
+        : (usage.input_tokens || 0)
+          + (usage.cache_read_tokens || 0)
+          + (usage.cache_creation_tokens || 0);
+      const cachedTokens = (usage.cache_read_tokens || 0)
+                         + (usage.cache_creation_tokens || 0);
       const usedK = (usedTokens / 1000).toFixed(1);
       const cachedK = (cachedTokens / 1000).toFixed(1);
       const limitK = (limit / 1000).toFixed(0);
@@ -25867,8 +25833,8 @@ function portal() {
       const sid = targetSid || this.currentId;
       if (!sid) return;
       const st = this.tabState[sid];
-      // streaming check is per-target-session, not on `this.streaming`
-      // (which mirrors the active tab — wrong source of truth when the
+      // The streaming check is per target session, not through the active-pane
+      // façade, which would be the wrong owner when the
       // call comes from a background stream's done handler).
       if (st && st.streaming) {
         this.toast(this.t("ctx.compact_wait_streaming"), "warn", 2500);
@@ -25877,7 +25843,7 @@ function portal() {
       // Empty-session guard. The target session's frontend message
       // mirror may be transiently empty (loadSession in flight on
       // background tabs), so fall back to backend's message_count.
-      const targetMessages = (st && st.messages) || (sid === this.currentId ? this.messages : []);
+      const targetMessages = (st && st.messages) || [];
       const hasFrontendContent = targetMessages.some(
         m => m.role === "assistant" && m.text);
       const meta = this.sessions.find(s => s.id === sid);
@@ -26003,7 +25969,7 @@ function portal() {
             ...(st.messages || []),
             ...(st._laterMessages || []),
           ]
-        : (this.messages || []);
+        : this.activeSessionPane().messages;
       return messages
         .filter(m => m && m.role === "user" && typeof m.text === "string"
           && m.text.length)
@@ -26267,7 +26233,6 @@ function portal() {
       const el = this.$refs.chatBody;
       if (!st || !el || sid !== this.currentId) return;
       st.scrollTop = el.scrollTop;
-      st.atBottom = !!this.atBottom;
     },
     _restoreChatPosition(sid = this.currentId) {
       const st = sid && this.tabState && this.tabState[sid];
@@ -26344,7 +26309,9 @@ function portal() {
     },
     scrollToBottom(force) {
       const el = this.$refs.chatBody;
-      if (!el) return;
+      const sid = this.currentId;
+      const st = sid && this.tabState && this.tabState[sid];
+      if (!el || !st) return;
       // Strict semantics: when not forced, respect the user's atBottom
       // intent exclusively. Don't re-sample geometry — the prior
       // "sample-then-decide" approach used a 150px window that meant
@@ -26353,7 +26320,7 @@ function portal() {
       // chunk's small height kept distance briefly under 150). With
       // this guard, once the user is meaningfully scrolled up the
       // viewport stays put until they manually scroll back to the bottom.
-      if (!force && !this.atBottom) return;
+      if (!force && st.atBottom === false) return;
       if (force) {
         // Explicit jump (the ↓ FAB). `.msg` uses content-visibility:auto,
         // so off-screen bubbles report an ESTIMATED height (the 200px
@@ -26363,19 +26330,16 @@ function portal() {
         // keeps growing. Re-slam to the bottom each frame until scrollHeight
         // stops growing. See _settleScrollToBottom.
         this._settleScrollToBottom();
-        const st = this.currentId && this.tabState && this.tabState[this.currentId];
-        if (st) st.atBottom = true;
+        st.atBottom = true;
         return;
       }
       // Streaming auto-follow path: bottom region is already realized,
       // so the cheap single-shot is accurate and avoids per-chunk rAF.
       this.$nextTick(() => {
+        if (this.currentId !== sid || this.tabState[sid] !== st) return;
         el.scrollTop = el.scrollHeight;
-        const st = this.currentId && this.tabState && this.tabState[this.currentId];
-        if (st) {
-          st.atBottom = true;
-          st.scrollTop = el.scrollTop;
-        }
+        st.atBottom = true;
+        st.scrollTop = el.scrollTop;
       });
     },
 
@@ -26525,7 +26489,7 @@ function portal() {
       // ===== Pin target session at function entry =====
       // CRITICAL (fixes 2026-05-22 cross-tab leak): send() has multiple
       // await points downstream (stillUploading polling loop, queue drain
-      // hand-off, etc). If `this.currentId` / `this.messages` are read
+      // hand-off, etc). If `this.currentId` / the active pane are read
       // AFTER one of those awaits, a tab switch by the user during the
       // await silently retargets the entire send — the user msg bubble
       // ends up in the new tab, the stream URL still references the new
@@ -26536,10 +26500,9 @@ function portal() {
       // queuing/draining on the old tab.
       //
       // Fix: snapshot the target session ID right here, before any await,
-      // and route every downstream write through `_ensureTabState(sendSid)`
-      // (NOT through `this.messages` which is just a proxy to
-      // tabState[currentId].messages and may have been re-aliased by
-      // activateTab during an await). The stream URL also uses sendSid.
+      // and route every downstream write through `_ensureTabState(sendSid)`,
+      // not through the currently mounted pane, whose owner may change during
+      // an await. The stream URL also uses sendSid.
       // If the user switches tabs while we're sending, the bubble + reply
       // both stay in the original tab — visible only when they switch
       // back — which is the contract `streamSid` was supposed to enforce
@@ -26875,8 +26838,8 @@ function portal() {
         return true;
       }
       // Push to the SENDING tab's messages array (looked up via sendSid),
-      // not this.messages — `this.messages` may have been re-aliased to a
-      // different tab if the user switched mid-await. See the "Pin target
+      // not the active pane — the user may have switched tabs mid-await. See
+      // the "Pin target
       // session" block at function entry for the full story.
       // Reconnect mode skips pushing a user msg — the backend already
       // has the user prompt from the original turn, and the
@@ -26988,12 +26951,22 @@ function portal() {
       // hidden by the bulk-reveal gate. `messagesReady=false` drives
       // `.chat-body.msgs-hidden .msg { display:none }` + the loading skeleton —
       // a mechanism that exists ONLY for loadSession's chunked reveal of
-      // historical bubbles. A skipped reveal callback must not leave this tab's
-      // gate closed when a live turn starts; force the owning tabState visible.
+      // historical bubbles. But a pane's messagesReady can otherwise only flip
+      // back to true inside switchSession / loadSession reveal callbacks
+      // that are guarded `if (this.currentId !== target) return`. If that reveal
+      // is skipped — rapid tab switch, or hitting "+" (newSession) right after a
+      // session started loading — messagesReady is left STUCK at false. On the
+      // next send, the moment messages.length goes >0 the msgs-hidden class
+      // engages and the ENTIRE reply (and the user's own bubble) renders
+      // display:none. The data still streams + persists to JSONL, so a full PWA
+      // restart re-runs loadSession's reveal and the reply "appears" — exactly
+      // the "new session, first reply invisible until restart" report. Force the
+      // reveal whenever we stream into the ACTIVE tab; there is nothing to
+      // lazy-reveal once the user is actively sending into the pane they see.
       streamState.messagesReady = true;
       streamState.messagesLoading = false;
-      // 锁定 — pending bubble 用它，不跟着 dropdown。
       streamState.streamingModel = sendModel;
+      // 锁定在 origin owner 上——pending bubble 不跟着当前 dropdown 或切 tab 变化。
       // Start the wall-clock NOW, at submit-time — not later in es.onopen.
       // The previous setup waited for the SSE handshake (which can take
       // 1-3s on slow networks / cold backends) before the counter began
@@ -27312,7 +27285,7 @@ function portal() {
         // Refresh the measured viewport window throughout a long agentic turn.
         // The final streaming rows remain mounted separately when the reader is
         // scrolled up, while auto-follow still pins the main window to the tail.
-        if (this.atBottom) this.scrollToBottom(false);
+        if (streamState.atBottom !== false) this.scrollToBottom(false);
       };
       // Coalesced variant for event bursts. A turn that settles N background
       // tasks at once delivers N task_notification events back-to-back; calling
@@ -28275,7 +28248,9 @@ function portal() {
           this.$nextTick(() => {
             const pane = this._paneElement(streamSid);
             this.highlightCode(".chat-body", pane ? [pane] : null).then(() => {
-              if (this.currentId === streamSid && this.atBottom) this.scrollToBottom(true);
+              if (this.currentId === streamSid && streamState.atBottom !== false) {
+                this.scrollToBottom(true);
+              }
             });
           });
         }
@@ -28627,13 +28602,10 @@ function portal() {
         setTimeout(async () => {
           // User switched to another tab mid-backoff. The ORIGIN tab's turn
           // is still running on the server — don't _markDone() it (that
-          // abandons the transparent reconnect AND, via `this.streaming`,
-          // wrongly unlocks/locks the CURRENT tab's composer which belongs
-          // to a different session). Keep tabState[streamSid].streaming
-          // true; when the user switches back, loadSession's
-          // _checkActiveTurn(streamSid) re-attaches (or loads the finished
-          // reply from disk). Only this owner tab's timer is stopped while the
-          // inactive pane waits for a later explicit re-attach.
+          // abandons the transparent reconnect and clears the origin owner's
+          // running state. Keep tabState[streamSid].streaming true; when the user
+          // switches back, loadSession's _checkActiveTurn(streamSid) re-attaches
+          // (or loads the finished reply from disk). Only the origin timer stops.
           if (this.currentId !== streamSid) {
             _stopTimer();
             return;
@@ -29142,7 +29114,9 @@ function portal() {
         return;
       }
       // Close any other open edit first (only one inline editor at a time).
-      (this.messages || []).forEach(msg => { if (msg !== m && msg._editing) msg._editing = false; });
+      this.activeSessionPane().messages.forEach(msg => {
+        if (msg !== m && msg._editing) msg._editing = false;
+      });
       m._editText = this.userVisibleText(m);
       m._editing = true;
     },

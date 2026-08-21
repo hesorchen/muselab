@@ -1314,7 +1314,7 @@
           <svg x-show="!leftOpen || desktopFullPane"><use href="#i-chevron-right"/></svg>
         </button>
         <span class="pane-title">
-          <span class="muse-mascot sm" :class="{'greet': mascotGreet, 'is-streaming': streaming}"
+          <span class="muse-mascot sm" :class="{'greet': mascotGreet, 'is-streaming': activeSessionPane().streaming}"
                 @click="cycleMascot()" :title="mascotLabel() + (lang==='zh'?'（点击换一位）':' (click for next muse)')">
             <svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg>
           </span>
@@ -3543,8 +3543,8 @@
                  @click.outside and closes it immediately. -->
             <button class="chat-toolbar-ring"
                     :class="{
-                      warn: sessionUsage.context_used_pct >= 70 && sessionUsage.context_used_pct < 90,
-                      danger: sessionUsage.context_used_pct >= 90,
+                      warn: activeSessionPane().sessionUsage.context_used_pct >= 70 && activeSessionPane().sessionUsage.context_used_pct < 90,
+                      danger: activeSessionPane().sessionUsage.context_used_pct >= 90,
                     }"
                     @click.stop="showCtxBreakdown()"
                     @contextmenu.prevent.stop="showCtxBreakdown()"
@@ -3556,7 +3556,7 @@
                         stroke="currentColor" stroke-width="2.5"
                         stroke-linecap="round"
                         stroke-dasharray="43.98"
-                        :stroke-dashoffset="43.98 * (1 - Math.min(100, sessionUsage.context_used_pct||0) / 100)"
+                        :stroke-dashoffset="43.98 * (1 - Math.min(100, activeSessionPane().sessionUsage.context_used_pct||0) / 100)"
                         transform="rotate(-90 10 10)"/>
               </svg>
             </button>

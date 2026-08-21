@@ -430,7 +430,7 @@ def test_mobile_preview_captures_before_hiding_and_pins_tree_taps():
     assert mobile_tab.index("chatState.messagesReady = false") < mobile_tab.index(
         "this.mobileTab = next"
     )
-    assert "this.messagesReady =" not in mobile_tab
+    assert "this.messagesReady" not in mobile_tab
     assert "this._afterPaint(() => {" in mobile_tab
     assert 'this.mobileTab !== "chat"' in mobile_tab
     assert 'this.mobileTab !== "preview"' in app
@@ -2912,6 +2912,34 @@ def test_transcript_active_session_ui_reads_through_pane_facade():
     assert "this.paneState(this.currentId)" in accessor
     assert "_EMPTY_ACTIVE_SESSION_PANE" in accessor
 
+    owned_fields = (
+        "messages",
+        "messagesReady",
+        "messagesLoading",
+        "historyGeneration",
+        "streaming",
+        "es",
+        "streamingModel",
+        "streamElapsed",
+        "_streamTimer",
+        "_streamStartedAt",
+        "sessionUsage",
+        "atBottom",
+    )
+    root_state = app[app.index("// ===== chat ====="):app.index("_blankTabState()")]
+    for field in owned_fields:
+        assert not re.search(rf"^    {field}:\s", root_state, re.M)
+        assert not re.search(rf"this\.{re.escape(field)}(?![A-Za-z0-9_])", app)
+    assert "this._streamTimer" not in app
+    assert "this._streamStartedAt" not in app
+
+    activate_start = app.index("_activateTabState(id)")
+    activate = app[activate_start:app.index("_paneElement(tid)", activate_start)]
+    for field in owned_fields:
+        assert f"this.{field} =" not in activate
+    assert "this._streamTimer =" not in activate
+    assert "this._streamStartedAt =" not in activate
+
     body_start = html.index('<div class="chat-transcript-wrap"')
     body_end = html.index('<div class="chat-input">', body_start)
     transcript = html[body_start:body_end]
@@ -2936,62 +2964,28 @@ def test_transcript_active_session_ui_reads_through_pane_facade():
     assert 'x-show="streaming && (!messages.length' not in transcript
     assert 'x-show="!atBottom"' not in transcript
 
+    assert "'is-streaming': activeSessionPane().streaming" in html
+    assert "activeSessionPane().sessionUsage.context_used_pct" in html
+    assert not re.search(r"(?<!activeSessionPane\(\)\.)sessionUsage\.", html)
 
-def test_tab_state_exclusively_owns_transcript_stream_usage_and_scroll_state():
-    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
-    owned = (
-        "messages", "messagesReady", "messagesLoading", "historyGeneration",
-        "streaming", "es", "streamingModel", "streamElapsed", "_streamTimer",
-        "_streamStartedAt", "sessionUsage", "atBottom",
-    )
-
-    root_start = app.index("    tabState: {},")
-    root_end = app.index("    model:", root_start)
-    root = app[root_start:root_end]
-    for field in owned:
-        assert f"get {field}() {{ return this.activeSessionPane().{field}; }}" in root
-        assert (
-            f'set {field}(value) {{ this._setActiveSessionPaneField("{field}", value); }}'
-            in root
-        )
-        assert not re.search(rf"this\.{re.escape(field)}\s*=", app)
-    setter_start = app.index("_setActiveSessionPaneField(field, value)")
-    setter_end = app.index("\n    paneMessages(tid)", setter_start)
-    setter = app[setter_start:setter_end]
-    assert "const st = this.paneState(this.currentId)" in setter
-    assert "if (st) st[field] = value" in setter
-
-    activate_start = app.index("_activateTabState(id)")
-    activate_end = app.index("\n    _paneElement", activate_start)
-    activate = app[activate_start:activate_end]
-    for field in owned:
-        assert f"this.{field} =" not in activate
-
-    blank_start = app.index("_blankTabState()")
-    blank_end = app.index("_ensureTabState(id)", blank_start)
-    blank = app[blank_start:blank_end]
-    for declaration in (
-        "messages: []", "messagesReady: true", "messagesLoading: false",
-        'historyGeneration: ""', "streaming: false", "es: null",
-        'streamingModel: ""', "streamElapsed: 0", "_streamTimer: null",
-        "_streamStartedAt: 0", "sessionUsage:", "atBottom: true",
+    send_start = app.index("async send(opts = {})")
+    send = app[send_start:app.index("async stop()", send_start)]
+    for assignment in (
+        "streamState.streaming = true",
+        "streamState.streamingModel = sendModel",
+        "streamState.streamElapsed = _initElapsed",
+        "streamState.messagesReady = true",
+        "streamState.messagesLoading = false",
+        "Object.assign(streamState.sessionUsage, d.session_usage)",
     ):
-        assert declaration in blank
+        assert assignment in send
+    assert "streamState.atBottom = true" in send
 
-    load_start = app.index("async loadSession(sid, opts = {})")
-    load_end = app.index("// Warm OPEN-but-inactive tabs", load_start)
-    around_start = app.index("async _loadAroundMessage(sid, uuid")
-    around_end = app.index("// Outline click", around_start)
-    pagination_start = app.index("async _fetchOlderWindow(sid)")
-    pagination_end = app.index("// Per-message placeholder height", pagination_start)
-    sse_start = app.index("async send(opts = {})")
-    sse_end = app.index("async stop()", sse_start)
-    for section in (
-        app[load_start:load_end], app[around_start:around_end],
-        app[pagination_start:pagination_end], app[sse_start:sse_end],
-    ):
-        for field in owned:
-            assert not re.search(rf"this\.{re.escape(field)}\s*=", section)
+    scroll_start = app.index("_captureChatPosition(sid = this.currentId)")
+    scroll = app[scroll_start:app.index("// Scroll chatBody", scroll_start)]
+    assert "st.atBottom = true" in scroll
+    assert "st.atBottom = false" in scroll
+    assert "st.atBottom === false" in scroll
 
 
 def test_long_chat_state_keeps_complete_normalized_history_and_generation_safety():
@@ -3126,8 +3120,8 @@ def test_stream_deltas_use_throttled_plain_snapshots_and_final_rich_render():
     assert "}, 1000);" in app
     assert 'class="stream-plain" x-text="m._streamText || \'\'"' in html
     assert 'x-show="!m._streamPlain" x-html="m.html || \'\'"' in html
-    assert "if (this.atBottom) this.scrollToBottom(false)" in app
-    assert "if (this.atBottom) this._scheduleLiveMessageViewport" not in app
+    assert "if (streamState.atBottom !== false) this.scrollToBottom(false)" in app
+    assert "if (streamState.atBottom !== false) this._scheduleLiveMessageViewport" not in app
     assert "const maxChunk = this._isMobileLayout() ? 4 : 12" in app
     assert "const frameBudgetMs = this._isMobileLayout() ? 6 : 12" in app
     assert "performance.now() - started >= frameBudgetMs" in app
