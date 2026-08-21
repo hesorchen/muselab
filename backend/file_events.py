@@ -38,6 +38,8 @@ _QUEUE_LIMIT = 8
 _WATCH_DEBOUNCE_MS = 350
 _WATCH_STEP_MS = 100
 _WATCH_RETRY_S = 1.5
+_RECONCILE_RETRY_BASE_S = 0.25
+_RECONCILE_RETRY_MAX_S = 30.0
 _WATCH_LINGER_S = 30.0
 _MAX_IDLE_WATCHERS = 3
 _RECONCILE_BACKOFF_START_S = 0.25
@@ -87,6 +89,7 @@ class _WatchState:
     reconcile_failures: int = 0
     reconcile_retry_at: float = 0.0
     reconcile_cancel: asyncio.Event = field(default_factory=asyncio.Event)
+    scan_progress: dict[str, Any] = field(default_factory=dict)
     scan_cancel: threading.Event = field(default_factory=threading.Event)
     stop_task: asyncio.Task[None] | None = None
     queue_overflow_active: bool = False
@@ -218,10 +221,6 @@ class FileWatchManager:
         # Otherwise a slow first registration can reinstall an orphan state
         # and SQLite row after the registry/API deletion has completed.
         self._lifecycle_locks: dict[Path, asyncio.Lock] = {}
-        # Full scans are deliberately process-bounded. On the small machines
-        # MuseLab commonly runs on, parallel recursive scans only create disk,
-        # SQLite, and scheduler contention while delaying foreground reads.
-        self._reconcile_semaphore = asyncio.Semaphore(1)
         self._started = False
 
     def _cancel_idle_stop_locked(
@@ -254,6 +253,22 @@ class FileWatchManager:
             name=f"muselab-files:{state.workspace_id}",
         )
         return True
+
+    @staticmethod
+    def _record_reconcile_retry(state: _WatchState) -> None:
+        """Apply workspace-local exponential backoff after a failed/partial pass."""
+        state.reconcile_failures += 1
+        delay = min(
+            _RECONCILE_RETRY_MAX_S,
+            _RECONCILE_RETRY_BASE_S
+            * (2 ** min(state.reconcile_failures - 1, 16)),
+        )
+        state.reconcile_retry_at = monotonic() + delay
+
+    @staticmethod
+    def _reset_reconcile_retry(state: _WatchState) -> None:
+        state.reconcile_failures = 0
+        state.reconcile_retry_at = 0.0
 
     def _queue_reconcile_locked(self, state: _WatchState) -> None:
         """Coalesce full scans, retaining a requested closing pass."""
@@ -561,6 +576,8 @@ class FileWatchManager:
                     reconcile_task = state.reconcile_task
                     state.reconcile_cancel.set()
                     state.scan_cancel.set()
+                    if not state.reconcile_running:
+                        reconcile_task.cancel()
                 state.reconcile_pending = False
                 state.reconcile_task = None
                 state.stop_task = None
@@ -827,6 +844,9 @@ class FileWatchManager:
         """Reconcile downtime after the watcher gets a chance to register."""
         while True:
             state.reconcile_pending = False
+            retry_delay = max(0.0, state.reconcile_retry_at - monotonic())
+            if retry_delay:
+                await asyncio.sleep(retry_delay)
             try:
                 if not await self._wait_for_reconcile_backoff(state):
                     return
@@ -838,12 +858,18 @@ class FileWatchManager:
                     armed = await self._wait_for_armed_watcher(state)
                     if not armed and state.task is not None:
                         return
-                await self._reconcile_and_broadcast(state)
+                partial = await self._reconcile_and_broadcast(state)
+                if partial:
+                    self._record_reconcile_retry(state)
+                    state.reconcile_pending = True
+                else:
+                    self._reset_reconcile_retry(state)
             except asyncio.CancelledError:
                 raise
             except WorkspaceScanCancelled:
                 return
-            except Exception:
+            except Exception as exc:
+                state.reconcile_error = exc
                 self._broadcast(
                     state,
                     {"resync": True, "changes": []},
@@ -886,27 +912,31 @@ class FileWatchManager:
     async def _reconcile_and_broadcast(
         self,
         state: _WatchState,
-    ) -> None:
+    ) -> bool:
         started = monotonic()
-        metrics: dict[str, int | bool] = {
-            "scan_slot_wait_ms": 0,
+        metrics: dict[str, int | bool | str | None] = {
             "mutation_lock_wait_ms": 0,
             "scan_ms": 0,
             "replay_ms": 0,
+            "scanned_files": 0,
+            "snapshot_files": 0,
             "changes": 0,
             "resync": False,
+            "partial": False,
+            "partial_reason": None,
         }
         status = "error"
         error_type: str | None = None
+        backoff_ms = 0
         phase = "initial" if not state.initialized else "closing"
         state.reconcile_attempts += 1
         attempt = state.reconcile_attempts
-        backoff_ms = 0
+        partial = False
         try:
-            await self._reconcile_and_broadcast_impl(state, metrics)
-            state.reconcile_failures = 0
-            state.reconcile_retry_at = 0.0
-            status = "ok"
+            partial = await self._reconcile_and_broadcast_impl(state, metrics)
+            if not partial:
+                self._reset_reconcile_retry(state)
+            status = "partial" if partial else "ok"
         except asyncio.CancelledError:
             status = "cancelled"
             error_type = "CancelledError"
@@ -918,14 +948,12 @@ class FileWatchManager:
         except Exception as exc:
             error_type = type(exc).__name__
             state.reconcile_error = exc
-            state.reconcile_failures += 1
-            backoff = min(
+            self._record_reconcile_retry(state)
+            backoff_ms = round(min(
                 _RECONCILE_BACKOFF_START_S
                 * (2 ** min(state.reconcile_failures - 1, 20)),
                 _RECONCILE_BACKOFF_CAP_S,
-            )
-            state.reconcile_retry_at = monotonic() + backoff
-            backoff_ms = round(backoff * 1000)
+            ) * 1000)
             raise
         finally:
             # Keep this true through replay, broadcast, and watcher-path
@@ -941,43 +969,36 @@ class FileWatchManager:
                 attempt=attempt,
                 failures=state.reconcile_failures,
                 backoff_ms=backoff_ms,
-                scan_slot_wait_ms=metrics["scan_slot_wait_ms"],
                 mutation_lock_wait_ms=metrics["mutation_lock_wait_ms"],
                 scan_ms=metrics["scan_ms"],
                 replay_ms=metrics["replay_ms"],
+                scanned_files=metrics["scanned_files"],
+                snapshot_files=metrics["snapshot_files"],
                 changes=metrics["changes"],
                 resync=metrics["resync"],
+                partial=metrics["partial"],
+                partial_reason=metrics["partial_reason"],
                 total_ms=elapsed_ms(started),
             )
+        return partial
 
     async def _reconcile_and_broadcast_impl(
         self,
         state: _WatchState,
-        metrics: dict[str, int | bool],
-    ) -> None:
+        metrics: dict[str, int | bool | str | None],
+    ) -> bool:
         broadcast_payload: dict[str, Any] | None = None
+        partial = False
         while True:
-            # Wait for the single full-scan slot before taking this workspace's
-            # mutation lock. A workspace queued behind another long scan must
-            # keep accepting cheap watcher batches in the meantime.
-            scan_slot_started = monotonic()
-            await self._reconcile_semaphore.acquire()
-            metrics["scan_slot_wait_ms"] = int(
-                metrics["scan_slot_wait_ms"]
-            ) + elapsed_ms(scan_slot_started)
-            scan_slot_held = True
-            mutation_lock_held = False
+            mutation_lock_started = monotonic()
+            await state.mutation_lock.acquire()
+            metrics["mutation_lock_wait_ms"] = int(
+                metrics["mutation_lock_wait_ms"]
+            ) + elapsed_ms(mutation_lock_started)
             retry_after_arm = False
             try:
-                mutation_lock_started = monotonic()
-                await state.mutation_lock.acquire()
-                metrics["mutation_lock_wait_ms"] = int(
-                    metrics["mutation_lock_wait_ms"]
-                ) + elapsed_ms(mutation_lock_started)
-                mutation_lock_held = True
-                # The watcher may have restarted while this workspace waited
-                # behind another scan. Do not take a snapshot in that unarmed
-                # gap; release both locks, follow the new generation, then retry.
+                # A watcher may restart while this workspace waits for an older
+                # mutation. Never scan inside the replacement generation's gap.
                 if state.task is not None and not state.watch_ready.is_set():
                     retry_after_arm = True
                 else:
@@ -989,6 +1010,7 @@ class FileWatchManager:
                         self.store.current_cursor,
                         state.workspace_id,
                     )
+                    scan_report: dict[str, Any] = {}
                     scan_started = monotonic()
                     try:
                         await asyncio.to_thread(
@@ -998,16 +1020,24 @@ class FileWatchManager:
                             state.name,
                             primary=state.primary,
                             cancel_event=state.scan_cancel,
+                            report=scan_report,
+                            scan_progress=state.scan_progress,
                         )
                     finally:
                         metrics["scan_ms"] = int(
                             metrics["scan_ms"]
                         ) + elapsed_ms(scan_started)
-                    # Only the expensive full scan is globally serialized.
-                    # Retain the per-workspace mutation lock through delta so
-                    # its replay window is still atomic.
-                    self._reconcile_semaphore.release()
-                    scan_slot_held = False
+                    partial = bool(scan_report.get("partial"))
+                    metrics["partial"] = partial
+                    metrics["partial_reason"] = scan_report.get(
+                        "partial_reason"
+                    )
+                    metrics["scanned_files"] = int(
+                        scan_report.get("scanned_files") or 0
+                    )
+                    metrics["snapshot_files"] = int(
+                        scan_report.get("snapshot_files") or 0
+                    )
                     replay_started = monotonic()
                     try:
                         replay = await asyncio.to_thread(
@@ -1039,10 +1069,7 @@ class FileWatchManager:
                             metrics["replay_ms"]
                         ) + elapsed_ms(replay_started)
             finally:
-                if scan_slot_held:
-                    self._reconcile_semaphore.release()
-                if mutation_lock_held:
-                    state.mutation_lock.release()
+                state.mutation_lock.release()
             if not retry_after_arm:
                 break
             if not await self._wait_for_armed_watcher(state):
@@ -1058,6 +1085,7 @@ class FileWatchManager:
             if latest_paths != state.watch_paths:
                 self._request_watch_refresh(state)
                 await self._schedule_reconcile(state)
+        return partial
 
     async def _schedule_reconcile(self, state: _WatchState) -> None:
         async with self._lock:
@@ -1285,6 +1313,8 @@ class FileWatchManager:
                 if (state.reconcile_task is not None
                         and not state.reconcile_task.done()):
                     reconcile_tasks.append(state.reconcile_task)
+                    if not state.reconcile_running:
+                        state.reconcile_task.cancel()
                 self._close_subscribers(state)
                 state.reconcile_task = None
                 state.stop_task = None
