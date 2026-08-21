@@ -68,6 +68,10 @@ from . import chat_history
 from . import chat_presentation
 from . import chat_overlays
 from . import transcript_index as transcript_idx
+
+# Compatibility export: tests and local tooling construct durable interrupted
+# snapshots through the historical chat-module schema constant.
+_CANCELLED_TURN_SNAPSHOT_SCHEMA = chat_overlays._CANCELLED_TURN_SNAPSHOT_SCHEMA
 from .workspaces import (
     registry as workspace_registry,
     resolve_workspace_root,
