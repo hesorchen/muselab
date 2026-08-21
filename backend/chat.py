@@ -17,7 +17,7 @@ import urllib.parse
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Iterable, Literal, get_args
+from typing import Any, Callable, Iterable, Literal, get_args
 from fastapi import (
     APIRouter,
     BackgroundTasks,
@@ -64,6 +64,11 @@ from .settings import (
 from . import sessions as sess
 from . import endpoints
 from . import context_recovery
+from . import chat_history
+from . import chat_presentation
+from . import chat_overlays
+from . import chat_runtime
+from . import chat_successor
 from . import transcript_index as transcript_idx
 from .workspaces import (
     registry as workspace_registry,
@@ -77,6 +82,10 @@ from . import permission_request as perm
 from . import memory_client as mem0
 from . import observability as obs
 from .sdk_compat import UnsignedThinkingCompatibleClient
+
+# Compatibility export: tests and local tooling construct durable interrupted
+# snapshots through the historical chat-module schema constant.
+_CANCELLED_TURN_SNAPSHOT_SCHEMA = chat_overlays._CANCELLED_TURN_SNAPSHOT_SCHEMA
 
 # Valid permission modes, derived from the SDK's PermissionMode literal so
 # the whitelist tracks SDK upgrades automatically. External strings (query
@@ -397,331 +406,111 @@ def _build_codex_skill_guard_hook():
 
 
 def _cli_project_roots() -> list[Path]:
-    """Return the directories where Claude CLI writes session JSONLs:
-
-    1. ``~/.claude/projects`` — default root used by Claude (Pro OAuth /
-       Anthropic API key).
-    2. ``${XDG_STATE_HOME:-~/.local/state}/muselab/vendor-cli/projects`` —
-       durable vendor-isolated root used when muselab routes the CLI
-       subprocess to a third-party Anthropic-compatible endpoint (DeepSeek /
-       GLM / MiniMax / Kimi / Qwen / MiMo). See ``endpoints.env_override`` for
-       the isolation rationale.
-
-    Callers reading transcripts MUST walk both. Forgetting the vendor
-    root has caused real bugs across the codebase — vendor sessions
-    silently invisible to cost dashboard, context-meter rebuild, full-
-    text search, compact marker detection, and the JSONL existence
-    check in :func:`get_client` that picks ``session_id=`` vs
-    ``resume=`` when spawning the CLI (the wrong call → CLI exits with
-    "Session ID already in use"). The single-helper pattern makes
-    forgetting impossible.
-
-    Only existing roots are returned, so callers don't need a separate
-    ``.exists()`` guard before iterating.
-    """
-    candidates = [
-        Path.home() / ".claude" / "projects",
-        endpoints._vendor_config_dir() / "projects",
-    ]
-    return [r for r in candidates if r.exists()]
+    """Compatibility wrapper for canonical Claude CLI project roots."""
+    return chat_history.cli_project_roots(endpoints._vendor_config_dir())
 
 
 def _cli_encode_cwd(path: str) -> str:
-    """Mirror Claude CLI's projects-dir encoding (e.g. ``/home/alice`` →
-    ``-home-alice``).
-
-    Delegates to the SDK's own ``project_key_for_directory()`` so the
-    encoding stays in lockstep with the CLI even if the rule changes —
-    the previous hand-rolled ``"".join(c if c.isalnum() else "-" ...)``
-    silently drifted on non-ASCII paths (it kept unicode letters via
-    ``str.isalnum`` while the CLI replaces them too: ``/home/用户`` →
-    hand-rolled ``-home-用户`` vs CLI/SDK ``-home---``), which would
-    mis-locate sessions under a unicode archive root. The cost dashboard,
-    transcript search, and tests all import this helper, so keeping the
-    name (a thin SDK delegate) keeps every call site in lockstep.
-    """
-    return project_key_for_directory(path)
+    """Compatibility wrapper for the SDK/CLI workspace encoding."""
+    return chat_history.cli_encode_cwd(
+        path, project_key_for_directory=project_key_for_directory)
 
 
-_JSONL_PATH_CACHE: dict[str, Path] = {}
-_JSONL_PATH_CACHE_MAX = 4096
+# Public compatibility aliases: callers and tests historically mutate this
+# exact object through ``backend.chat``.  The extracted implementation receives
+# it explicitly so cache identity and monkeypatch behavior remain unchanged.
+_JSONL_PATH_CACHE = chat_history.JSONL_PATH_CACHE
+_JSONL_PATH_CACHE_MAX = chat_history.JSONL_PATH_CACHE_MAX
 
 
 def _find_session_jsonl(sid: str) -> Path | None:
-    """Locate the CLI JSONL for ``sid`` across both project roots.
+    """Compatibility wrapper for positive-cache transcript discovery."""
+    return chat_history.find_session_jsonl(
+        sid,
+        project_roots=_cli_project_roots,
+        cache=_JSONL_PATH_CACHE,
+        cache_max=_JSONL_PATH_CACHE_MAX,
+    )
 
-    A session lives in exactly one root (Pro/Claude vs vendor — they're
-    mutually exclusive per session), so the first match wins. Returns
-    ``None`` when the session has no on-disk transcript yet (truly new
-    session).
 
-    Positive hits are cached (sid → Path): once a transcript exists its
-    path never moves, so repeat lookups skip the cross-root glob. Misses
-    are deliberately NOT cached — a new session's JSONL appears moments
-    after creation and must be found on the next call. A cached path that
-    has since been deleted (session removal) falls back to a fresh glob.
-    """
-    cached = _JSONL_PATH_CACHE.get(sid)
-    if cached is not None:
-        if cached.is_file():
-            return cached
-        _JSONL_PATH_CACHE.pop(sid, None)
-    for projects_root in _cli_project_roots():
-        for hit in projects_root.glob(f"*/{sid}.jsonl"):
-            if hit.is_file():
-                if len(_JSONL_PATH_CACHE) >= _JSONL_PATH_CACHE_MAX:
-                    _JSONL_PATH_CACHE.clear()
-                _JSONL_PATH_CACHE[sid] = hit
-                return hit
-    return None
+def _canonical_session_evidence_path(sid: str, workspace: Path) -> Path | None:
+    """Compatibility wrapper for validated canonical transcript evidence."""
+    return chat_history.canonical_session_evidence_path(
+        sid,
+        workspace,
+        find_session_jsonl=_find_session_jsonl,
+        project_roots=_cli_project_roots,
+        encode_cwd=_cli_encode_cwd,
+    )
 
 
 def _compact_tail_cursor(sid: str) -> tuple[Path | None, int]:
-    """Snapshot the transcript byte boundary before one native compact.
-
-    Only the newly appended tail is inspected afterwards.  This avoids both a
-    repeated multi-megabyte scan and accidentally treating an older compact or
-    API failure as the outcome of the command that just ran.
-    """
-    path = _find_session_jsonl(sid)
-    if path is None:
-        return None, 0
-    try:
-        return path, path.stat().st_size
-    except OSError:
-        return path, 0
+    """Compatibility wrapper for the pre-compact transcript cursor."""
+    return chat_history.compact_tail_cursor(
+        sid, find_session_jsonl=_find_session_jsonl)
 
 
 def _compact_tail_outcome(path: Path | None, offset: int) -> dict[str, bool]:
-    """Return privacy-safe facts from records appended by one ``/compact``.
-
-    Some CLI/Gateway combinations return a nominally successful ResultMessage
-    while writing the real context-window 400 only as a ``system``
-    ``local_command`` transcript record.  Token verification catches the
-    no-op, but without this tail check MuseLab wastes another identical retry
-    on a fresh process.  Conversely, a real compact boundary is authoritative
-    even when the control-plane usage reading is briefly stale.
-    """
-    result = {
-        "boundary": False,
-        "summary": False,
-        "context_error": False,
-    }
-    if path is None:
-        return result
-    try:
-        with path.open("rb") as handle:
-            size = handle.seek(0, os.SEEK_END)
-            handle.seek(offset if 0 <= offset <= size else 0)
-            raw = handle.read()
-    except OSError:
-        return result
-    for line in raw.splitlines():
-        if not line.strip():
-            continue
-        try:
-            entry = json.loads(line)
-        except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
-            continue
-        if not isinstance(entry, dict):
-            continue
-        if entry.get("subtype") == "compact_boundary":
-            result["boundary"] = True
-        if entry.get("isCompactSummary") is True:
-            result["summary"] = True
-        if entry.get("subtype") != "local_command":
-            continue
-        data = entry.get("data") if isinstance(entry.get("data"), dict) else {}
-        text = str(entry.get("content") or data.get("content") or "").lower()
-        if any(marker in text for marker in (
-            "context window", "context length", "input exceeds",
-            "maximum context", "prompt too long", "too many tokens",
-        )):
-            result["context_error"] = True
-    return result
+    """Compatibility wrapper for raw post-compact tail inspection."""
+    return chat_history.compact_tail_outcome(path, offset)
 
 
 @contextmanager
 def _session_config_dir(model: str = ""):
-    """Serialize SDK session-store calls and select the matching CLI root.
-
-    Claude Agent SDK session helpers consult the process-global
-    ``CLAUDE_CONFIG_DIR`` instead of accepting it as an argument. Vendor
-    sessions therefore need a temporary override, while native Claude calls
-    must wait for that override to be restored. Keep the mutation behind one
-    context manager so reads, forks, and future SDK session operations cannot
-    drift onto different roots.
-    """
-    with _vendor_msg_lock:
-        old = os.environ.get("CLAUDE_CONFIG_DIR")
-        try:
-            if model and endpoints.is_third_party(model):
-                os.environ["CLAUDE_CONFIG_DIR"] = str(endpoints._vendor_config_dir())
-            yield
-        finally:
-            if old is not None:
-                os.environ["CLAUDE_CONFIG_DIR"] = old
-            else:
-                os.environ.pop("CLAUDE_CONFIG_DIR", None)
+    """Compatibility wrapper for the SDK's process-global config directory."""
+    with chat_history.session_config_dir(
+        model,
+        lock=_vendor_msg_lock,
+        is_third_party=endpoints.is_third_party,
+        vendor_config_dir=endpoints._vendor_config_dir,
+    ):
+        yield
 
 
 def _get_session_msgs(sid: str, model: str = "") -> list:
-    """Read SDK messages from the native or vendor-isolated session store."""
-    with _session_config_dir(model):
-        return get_session_messages(
-            sid, directory=str(sess.session_workspace(sid)))
+    """Compatibility wrapper retaining the patchable SDK message loader."""
+    return chat_history.get_session_msgs(
+        sid,
+        model,
+        config_dir=_session_config_dir,
+        loader=get_session_messages,
+        workspace=sess.session_workspace,
+    )
 
 
 def _transcript_ts_ms(entry: dict) -> int | None:
-    """Epoch-ms of a raw transcript entry's ``timestamp`` (ISO-8601, UTC).
-
-    Every CLI JSONL record carries one; the SDK's SessionMessage does not
-    expose it, which is why per-message times were unavailable to the UI even
-    though the data was on disk the whole time. Returns None for missing or
-    unparseable values — a message with no time simply doesn't show one."""
-    raw = entry.get("timestamp") or ""
-    if not raw:
-        return None
-    try:
-        import datetime as _dt
-        return int(_dt.datetime.fromisoformat(
-            str(raw).replace("Z", "+00:00")).timestamp() * 1000)
-    except (ValueError, TypeError, OverflowError):
-        return None
+    """Compatibility wrapper for raw transcript timestamps."""
+    return chat_history.transcript_ts_ms(entry)
 
 
-class _RawMsg:
-    """Minimal stand-in for the SDK's SessionMessage, exposing just the
-    .uuid / .type / .message surface that _sdk_messages_to_ui consumes. Lets
-    the full-history reader reuse the exact same UI-shaping logic as the
-    normal path, so the two views can't drift.
-
-    `mts` is the extra field the real SessionMessage lacks — see
-    _transcript_ts_ms. Optional so existing construction sites keep working."""
-    __slots__ = ("uuid", "type", "message", "mts")
-
-    def __init__(self, uuid: str, type_: str, message: dict,
-                 mts: int | None = None):
-        self.uuid = uuid
-        self.type = type_
-        self.message = message
-        self.mts = mts
+_RawMsg = chat_history.RawMsg
 
 
 def _full_session_msgs(sid: str) -> list:
-    """Like _get_session_msgs but WITHOUT the SDK's compact-boundary cutoff.
-
-    The SDK's get_session_messages() starts emitting AT the compact summary
-    (it mirrors the post-compaction context the model actually sees), so a
-    compacted session loses its PRE-compact user prompts entirely. To let the
-    outline list — and let the user JUMP to — those earlier prompts, we parse
-    the raw CLI JSONL ourselves and return EVERY user/assistant entry in file
-    (chronological) order.
-
-    Why file order and NOT a parentUuid walk: compaction writes a *fresh root*
-    — the compact summary's parent is a `system` entry whose parentUuid is
-    None, so the pre-compact prompts live on a genuinely disconnected branch
-    that no walk from the active leaf can reach. The CLI appends to the JSONL
-    strictly in time order, and forks copy history into a SEPARATE file with
-    new UUIDs (so a single JSONL is linear), which makes file order a safe,
-    complete basis for reconstructing the whole conversation.
-
-    Returns _RawMsg objects, so _sdk_messages_to_ui shapes them identically
-    to the normal path — no separate reconstruction logic to keep in sync.
-    Reads the file directly via _find_session_jsonl (which already covers the
-    vendor-isolated root), so no CLAUDE_CONFIG_DIR juggling is needed."""
-    jsonl_path = _find_session_jsonl(sid)
-    if jsonl_path is None:
-        return []
-    out: list[_RawMsg] = []
-    seen: set[str] = set()         # dedup by uuid (defensive; should be unique)
-    try:
-        with jsonl_path.open("r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    e = json.loads(line)
-                except (json.JSONDecodeError, ValueError):
-                    continue
-                if e.get("type") not in ("user", "assistant"):
-                    continue
-                u = e.get("uuid")
-                if not u or u in seen:
-                    continue
-                seen.add(u)
-                out.append(_RawMsg(u, e.get("type"), e.get("message") or {},
-                                   _transcript_ts_ms(e)))
-    except Exception:
-        return []
-    return out
+    """Compatibility wrapper for canonical full-file transcript reads."""
+    return chat_history.full_session_msgs(
+        sid,
+        find_session_jsonl=_find_session_jsonl,
+        raw_msg_type=_RawMsg,
+        timestamp_ms=_transcript_ts_ms,
+    )
 
 
 def _read_tail_lines(path: Path, n: int, block: int = 65536) -> list[str]:
-    """Return the last ~n non-empty lines of a file, reading from the end so
-    cost is O(tail) instead of O(file). Used to find the just-appended turn's
-    UUIDs without parsing a multi-thousand-line transcript."""
-    with path.open("rb") as f:
-        f.seek(0, os.SEEK_END)
-        pos = f.tell()
-        data = b""
-        # Read backwards a block at a time until we've captured > n newlines
-        # (or hit the start of the file).
-        while pos > 0 and data.count(b"\n") <= n:
-            read = min(block, pos)
-            pos -= read
-            f.seek(pos)
-            data = f.read(read) + data
-        lines = data.split(b"\n")
-        return [ln.decode("utf-8", "replace")
-                for ln in lines[-n:] if ln.strip()]
+    """Compatibility wrapper for bounded raw tail reads."""
+    return chat_history.read_tail_lines(path, n, block)
 
 
 def _recent_turn_uuids(sid: str, want_image_user: bool,
                        tail_lines: int = 400) -> tuple[str | None, str | None]:
-    """Find the most recent assistant UUID and most recent user UUID by
-    reading only the TAIL of the JSONL (the turn that just finished is at the
-    very end). Replaces a full _get_session_msgs() parse whose sole purpose
-    was to grab these two UUIDs for sidecar annotation. Returns (None, None)
-    on any failure so the caller can fall back to the full parse.
-
-    want_image_user: when the turn carried image attachments, match the last
-    user entry that actually contains an image block (not just any last user
-    msg) — mirrors the full-parse path's image-matching guard."""
-    path = _find_session_jsonl(sid)
-    if path is None:
-        return (None, None)
-    try:
-        lines = _read_tail_lines(path, tail_lines)
-    except Exception:
-        return (None, None)
-    asst_uuid: str | None = None
-    user_uuid: str | None = None
-    for line in reversed(lines):
-        try:
-            e = json.loads(line)
-        except (json.JSONDecodeError, ValueError):
-            continue
-        t = e.get("type")
-        u = e.get("uuid")
-        if not u:
-            continue
-        if t == "assistant" and asst_uuid is None:
-            asst_uuid = u
-        elif t == "user" and user_uuid is None:
-            if want_image_user:
-                content = (e.get("message") or {}).get("content") or []
-                has_img = isinstance(content, list) and any(
-                    isinstance(b, dict) and b.get("type") == "image"
-                    for b in content)
-                if has_img:
-                    user_uuid = u
-            else:
-                user_uuid = u
-        if asst_uuid and user_uuid:
-            break
-    return (asst_uuid, user_uuid)
+    """Compatibility wrapper for recent canonical turn UUID discovery."""
+    return chat_history.recent_turn_uuids(
+        sid,
+        want_image_user,
+        tail_lines,
+        find_session_jsonl=_find_session_jsonl,
+        tail_reader=_read_tail_lines,
+    )
 
 
 router = APIRouter(prefix="/api/chat", tags=["chat"])
@@ -734,34 +523,30 @@ router = APIRouter(prefix="/api/chat", tags=["chat"])
 # fan-out for the privacy rationale.
 
 
-# Clients keyed by (session_id, model, effort, service_tier). Both controls are
-# launch-time request plumbing, so a runtime created for standard service must
-# never be reused after the session switches to Fast (or vice versa).
-_ClientKey = tuple[str, str, str, str]
-_clients: dict[_ClientKey, ClaudeSDKClient] = {}
-# Tracks the permission_mode the cached client was launched with. Permission
-# is launch-sensitive (notably default -> bypassPermissions cannot always be
-# enabled dynamically), so a mismatch rebuilds the runtime instead of trying
-# to mutate it in place.
-_client_permission: dict[_ClientKey, str] = {}
-# A client launched in Plan Mode has one more capability bit: whether it may
-# return to bypassPermissions after ExitPlanMode. The CLI only permits that
-# transition when the process was started with
-# --allow-dangerously-skip-permissions, so two otherwise-identical `plan`
-# runtimes with different return modes must never share a pooled client.
-_client_plan_return: dict[_ClientKey, str] = {}
+# Compatibility aliases: callers and tests historically inspect and mutate
+# these exact containers through ``backend.chat``. The focused runtime module
+# owns them; aliases preserve identity across the extraction boundary.
+_ClientKey = chat_runtime.ClientKey
+_clients = chat_runtime.CLIENTS
+_client_permission = chat_runtime.CLIENT_PERMISSION
+_client_plan_return = chat_runtime.CLIENT_PLAN_RETURN
 
+
+# Bound the exact wire-event window used for incremental reconnect. The durable
+# spool below still stores a coalesced, complete turn for a cold/full replay;
+# this in-memory window stores individual text/thinking deltas so a client can
+# resume in the middle of a message without replaying or duplicating its prefix.
+# If a requested sequence has fallen out of this window, the server explicitly
+# asks the browser to reconcile from canonical history instead of guessing.
+_BROADCAST_REPLAY_MAX_EVENTS = env_int(
+    "MUSELAB_STREAM_REPLAY_MAX_EVENTS", 4096, min_value=64)
+_BROADCAST_REPLAY_MAX_BYTES = env_int(
+    "MUSELAB_STREAM_REPLAY_MAX_BYTES", 4 * 1024 * 1024, min_value=64 * 1024)
 
 # Cap on token deltas queued for a single attached subscriber. Deltas are the
 # ephemeral presentation channel (see _TurnSubscriber): they are never spooled,
-# so this bounds the only per-subscriber memory that exists. A client that
-# backs up past this is resynced rather than served a truncated bubble.
-#
-# This replaces the old MUSELAB_STREAM_REPLAY_MAX_EVENTS / _MAX_BYTES replay
-# window. That window existed because every token delta was written to the
-# replay spool, so a normal reply blew past 512 events in seconds and mobile
-# reconnects were told to give up on the live stream. The spool now records one
-# coalesced event per message instead, so there is no replay length to bound.
+# so this bounds per-subscriber memory. A client that backs up past this is
+# resynced rather than served a truncated bubble.
 _BROADCAST_LIVE_DELTA_MAX = env_int(
     "MUSELAB_STREAM_LIVE_DELTA_MAX", 4096, min_value=64)
 _BROADCAST_SUBSCRIBER_MAX_EVENTS = env_int(
@@ -936,10 +721,11 @@ class _TurnSubscriber:
     are replaying and gets emitted.
     """
 
-    def __init__(self, replay=None, *, resync_reason: str = "",
-                 skip_from: int = 0):
+    def __init__(self, replay=None, *, initial_events=None,
+                 resync_payload: dict | None = None, skip_from: int = 0):
         self._replay = replay
-        self._resync_reason = resync_reason
+        self._initial_events: deque[dict] = deque(initial_events or ())
+        self._resync_payload = dict(resync_payload or {})
         self._skip_from = skip_from
         # Deltas produced while attached. Bounded: a stalled HTTP connection
         # must not grow this without limit. Overflow degrades to a resync
@@ -956,12 +742,16 @@ class _TurnSubscriber:
             # every loop boundary before touching `_replay`; checking only at
             # function entry turned an intended resync frame into a None.tell
             # AttributeError under live-delta backpressure.
-            if self._resync_reason:
-                reason, self._resync_reason = self._resync_reason, ""
+            if self._resync_payload:
+                payload, self._resync_payload = self._resync_payload, {}
                 return {
                     "event": "resync",
-                    "data": json.dumps({"reason": reason, "retryable": True}),
+                    "data": json.dumps(payload),
                 }
+            if self._initial_events:
+                event = dict(self._initial_events.popleft())
+                event.pop("_coalesced", None)
+                return event
             if self._replay is None:
                 return None
             if self._draining_live_barrier:
@@ -990,7 +780,7 @@ class _TurnSubscriber:
                 await self._wake.wait()
                 continue
             event = self._next_spool_event()
-            if self._resync_reason:
+            if self._resync_payload:
                 continue
             if event is _LIVE_MESSAGE_BARRIER:
                 self._draining_live_barrier = True
@@ -1012,7 +802,7 @@ class _TurnSubscriber:
             # Close the clear/append race: publish() may have written between
             # the first EOF read and clear(). Recheck before sleeping.
             event = self._next_spool_event()
-            if self._resync_reason:
+            if self._resync_payload:
                 continue
             if event is _LIVE_MESSAGE_BARRIER:
                 self._draining_live_barrier = True
@@ -1087,8 +877,12 @@ class _TurnSubscriber:
         self._wake.set()
         return True
 
-    def resync(self, reason: str) -> None:
-        self._resync_reason = reason
+    def resync(self, reason: str, **details) -> None:
+        self._resync_payload = {
+            "reason": reason,
+            "retryable": True,
+            **details,
+        }
         self.close_reader()
         self._done = True
         self._wake.set()
@@ -1133,15 +927,23 @@ class TurnBroadcast:
         self.model = model
         self.events = _ReplaySpool()
         self.subscribers: set[_TurnSubscriber] = set()
-        # Legacy constructor arguments remain accepted for callers/tests.
-        # replay_max_* used to bound a spool that recorded every token delta;
-        # the spool now records one coalesced event per message, so there is
-        # nothing to truncate and no subscriber-side queue to size.
-        _ = (replay_max_events, replay_max_bytes,
-             subscriber_max_events, subscriber_max_bytes)
+        self._resume_max_events = (
+            replay_max_events if replay_max_events > 0
+            else _BROADCAST_REPLAY_MAX_EVENTS
+        )
+        self._resume_max_bytes = (
+            replay_max_bytes if replay_max_bytes > 0
+            else _BROADCAST_REPLAY_MAX_BYTES
+        )
+        self._resume_events: deque[tuple[int, dict, int]] = deque()
+        self._resume_bytes = 0
+        # Legacy per-subscriber constructor arguments remain accepted. Live
+        # backpressure is governed by the module constants used by subscribers.
+        _ = (subscriber_max_events, subscriber_max_bytes)
         self._compact_kind: str | None = None
         self._compact_parts: list[str] = []
         self._compact_chars = 0
+        self._compact_last_seq = 0
         self._replay_bytes = 0
         self.done = False
         # Set True when this turn ended via an explicit user /interrupt (vs.
@@ -1303,12 +1105,14 @@ class TurnBroadcast:
             kind, text = current_text
             if self._compact_kind not in (None, kind):
                 self._flush_compact_text()
+            stamped = self._stamp_wire_event(event)
             if self._compact_kind is None:
                 self._compact_kind = kind
             self._compact_parts.append(text)
             self._compact_chars += len(text)
+            self._compact_last_seq = self._event_seq
             for subscriber in tuple(self.subscribers):
-                if not subscriber.publish_live(event):
+                if not subscriber.publish_live(stamped):
                     self.subscribers.discard(subscriber)
             # Bound the accumulator so a very long message (or a headless turn
             # with nobody attached) cannot hold unbounded text in memory. A
@@ -1321,21 +1125,32 @@ class TurnBroadcast:
         # A non-delta event closes whatever message was streaming: write its
         # coalesced form first so the spool stays in true chronological order.
         self._flush_compact_text()
-        self._append_replay(event)
+        stamped = self._stamp_wire_event(event)
+        self._append_replay(stamped)
 
-    def _append_replay(self, event: dict) -> None:
-        replay = dict(event)
+    def _stamp_wire_event(self, event: dict) -> dict:
+        stamped = dict(event)
         self._event_seq += 1
         try:
-            payload = json.loads(replay.get("data") or "{}")
+            payload = json.loads(stamped.get("data") or "{}")
         except (TypeError, ValueError):
             payload = None
         if isinstance(payload, dict):
-            payload.setdefault("turn_id", self.turn_id)
-            payload.setdefault("event_seq", self._event_seq)
+            payload["turn_id"] = self.turn_id
+            payload["event_seq"] = self._event_seq
             if self.parent_turn_id:
-                payload.setdefault("parent_turn_id", self.parent_turn_id)
-            replay["data"] = json.dumps(payload, ensure_ascii=False)
+                payload["parent_turn_id"] = self.parent_turn_id
+            stamped["data"] = json.dumps(payload, ensure_ascii=False)
+        size = _broadcast_event_size(stamped)
+        self._resume_events.append((self._event_seq, stamped, size))
+        self._resume_bytes += size
+        while (len(self._resume_events) > self._resume_max_events
+               or self._resume_bytes > self._resume_max_bytes):
+            _, _, evicted_size = self._resume_events.popleft()
+            self._resume_bytes -= evicted_size
+        return stamped
+
+    def _append_replay(self, replay: dict) -> None:
         self.events.append(replay)
         self._replay_bytes += _broadcast_event_size(replay)
         for subscriber in tuple(self.subscribers):
@@ -1352,14 +1167,22 @@ class TurnBroadcast:
         """
         if self._compact_kind is None:
             return
+        payload = {
+            "text": "".join(self._compact_parts),
+            "turn_id": self.turn_id,
+            "event_seq": self._compact_last_seq,
+        }
+        if self.parent_turn_id:
+            payload["parent_turn_id"] = self.parent_turn_id
         event = {
             "event": self._compact_kind,
-            "data": json.dumps({"text": "".join(self._compact_parts)}, ensure_ascii=False),
+            "data": json.dumps(payload, ensure_ascii=False),
             "_coalesced": True,
         }
         self._compact_kind = None
         self._compact_parts = []
         self._compact_chars = 0
+        self._compact_last_seq = 0
         self._append_replay(event)
         # `_append_replay` and these markers run synchronously on the same
         # event-loop turn: a reader woken by the spool append cannot interleave
@@ -1374,10 +1197,16 @@ class TurnBroadcast:
     def replay_events(self):
         yield from self.events
         if self._compact_kind is not None:
+            payload = {
+                "text": "".join(self._compact_parts),
+                "turn_id": self.turn_id,
+                "event_seq": self._compact_last_seq,
+            }
+            if self.parent_turn_id:
+                payload["parent_turn_id"] = self.parent_turn_id
             yield {
                 "event": self._compact_kind,
-                "data": json.dumps(
-                    {"text": "".join(self._compact_parts)}, ensure_ascii=False),
+                "data": json.dumps(payload, ensure_ascii=False),
             }
 
     def finish(self) -> None:
@@ -1428,30 +1257,57 @@ class TurnBroadcast:
         self.subscribers.clear()
         self.events.close()
 
-    def subscribe(self, *, mobile: bool = False) -> _TurnSubscriber:
-        """Attach a reader. Every subscriber gets the complete turn.
+    def subscribe(
+        self,
+        *,
+        mobile: bool = False,
+        last_event_seq: int = 0,
+    ) -> _TurnSubscriber:
+        """Attach a full reader or resume strictly after ``last_event_seq``.
 
-        Flushing first is what makes a mid-message join lossless: the half of
-        the current bubble that has streamed so far is still sitting in the
-        accumulator, so we write it to the spool now. The arriving subscriber
-        replays it as history and then picks up the remaining deltas live,
-        continuing from the right place instead of starting mid-word. Already-
-        attached subscribers skip it — its offset is at or after their own
-        attach point, and they received those tokens as deltas.
-
-        `mobile` is accepted for wire compatibility and deliberately ignored.
-        Mobile clients used to be handed a `replay_truncated` resync and no
-        live stream at all whenever the spool had grown past 512 events, which
-        a normal reply did within seconds because every token was an event.
-        There is no longer a replay length to outgrow.
+        Sequence zero is the cold/legacy path and replays the complete coalesced
+        spool. A positive checkpoint uses the bounded exact-wire buffer, which
+        includes individual text/thinking deltas. If every missing sequence is
+        no longer available, emit one explicit canonical-history fallback.
         """
         _ = mobile
         self._flush_compact_text()
+        requested = max(0, int(last_event_seq or 0))
+        replay = self.events.open_reader()
+        initial_events: list[dict] = []
+        resync_payload: dict | None = None
+        if requested > 0:
+            replay.seek(self.events.size())
+            latest = self._event_seq
+            earliest = self._resume_events[0][0] if self._resume_events else latest + 1
+            if requested > latest or (
+                requested < latest and requested < earliest - 1
+            ):
+                replay.close()
+                replay = None
+                resync_payload = {
+                    "reason": "replay_gap",
+                    "fallback": "canonical_history",
+                    "retryable": False,
+                    "turn_id": self.turn_id,
+                    "requested_event_seq": requested,
+                    "earliest_event_seq": earliest if earliest <= latest else None,
+                    "latest_event_seq": latest,
+                }
+            else:
+                initial_events = [
+                    event for seq, event, _ in self._resume_events
+                    if seq > requested
+                ]
         subscriber = _TurnSubscriber(
-            self.events.open_reader(), skip_from=self.events.size())
+            replay,
+            initial_events=initial_events,
+            resync_payload=resync_payload,
+            skip_from=self.events.size(),
+        )
         if self.done:
             subscriber.close()
-        else:
+        elif resync_payload is None:
             self.subscribers.add(subscriber)
         return subscriber
 
@@ -1502,12 +1358,11 @@ def _get_recent_turn(session_id: str) -> TurnBroadcast | None:
         b.close()
         return None
     return b
-# LRU bookkeeping. Each CLI subprocess holds ~30-50 MB RSS; without a cap
-# muselab leaks memory as users open more sessions. New clients append to
-# the tail; on cache miss with len > cap, oldest gets disconnected.
-_client_lru: list[_ClientKey] = []   # (session_id, model, effort, service_tier)
+# Each CLI subprocess holds ~30-50 MB RSS. Runtime-owned LRU/lock aliases keep
+# the historical chat facade patchable while bounding the shared client pool.
+_client_lru = chat_runtime.CLIENT_LRU
 _CLIENT_POOL_CAP = env_int("MUSELAB_CLIENT_POOL_CAP", 3, min_value=1)
-_lock = asyncio.Lock()
+_lock = chat_runtime.CLIENT_LOCK
 
 # Exactly one SDK operation may own a session's CLI stream at a time. The
 # interactive turn mutex only covers /stream turns; scheduler and /compact
@@ -1572,16 +1427,14 @@ _maintenance_tasks: set[asyncio.Task] = set()
 # resulting assistant text is delivered to the newest visible successor as a
 # presentation-only snapshot.  Keep the delivery task strongly referenced and
 # keyed by the durable outbox identity so retries cannot create two writers.
-_runtime_continuation_delivery_tasks: dict[
-    tuple[str, str], asyncio.Task
-] = {}
-# SDK disconnect owns process reaping and can legitimately take about 20s
-# (stdin close, graceful wait, TERM, then KILL). Keep timed-out owners keyed by
-# session so a retry/new turn must join the same cleanup before touching disk or
-# starting another CLI against the transcript.
-_session_disconnect_tasks: dict[str, set[asyncio.Task]] = {}
-_session_disconnect_failed: set[str] = set()
-_CLIENT_DISCONNECT_DEADLINE_S = 22.0
+_runtime_continuation_delivery_tasks = (
+    chat_overlays.RUNTIME_CONTINUATION_DELIVERY_TASKS
+)
+# SDK disconnect fences are runtime-owned. Keep the exact shared containers and
+# deadline visible through the historical chat facade.
+_session_disconnect_tasks = chat_runtime.SESSION_DISCONNECT_TASKS
+_session_disconnect_failed = chat_runtime.SESSION_DISCONNECT_FAILED
+_CLIENT_DISCONNECT_DEADLINE_S = chat_runtime.CLIENT_DISCONNECT_DEADLINE_S
 # Turn/scheduler owners cancelled by session deletion can outlive their first
 # bounded join. Keep the exact handles keyed by session so a retry cannot race
 # ahead and purge the transcript while an earlier owner is still unwinding.
@@ -1646,32 +1499,19 @@ _STOPPED_CONTINUATION_GRACE = env_int(
 _bg_task_descriptions: dict[str, str] = {}
 _bg_task_tool_use_ids: dict[str, str] = {}
 
-# A source session can be rolled over at most once.  Keep creation + metadata
-# link + queue migration inside one per-source critical section so retries from
-# multiple browser tabs all receive the same successor UUID.
-_runtime_rollover_locks: dict[str, asyncio.Lock] = {}
-# Main-response completion should not make the user's next send pay for the
-# detached fork plus a cold CLI connect.  One retained task per source creates
-# that successor as soon as the canonical ``done`` boundary is published, then
-# warms its runtime while the user is reading the answer.  The rollover lock
-# above remains the authority: an eager task, /continue-detached, and queue
-# drain all converge on the same durable child.
-_runtime_prewarm_tasks: dict[str, asyncio.Task] = {}
-# Title writes touch both MuseLab's index and the SDK JSONL.  Serialize the
-# pair so late runtime-postlude propagation cannot overwrite a user rename in
-# the narrow gap between checking the inherited title and writing customTitle.
-_session_title_locks = tuple(threading.RLock() for _ in range(64))
+# Compatibility aliases: deletion, overlays, tests, and local tooling must
+# observe the exact containers owned by the extracted successor lifecycle.
+_runtime_rollover_locks = chat_successor.RUNTIME_ROLLOVER_LOCKS
+_runtime_prewarm_tasks = chat_successor.RUNTIME_PREWARM_TASKS
+_session_title_locks = chat_successor.SESSION_TITLE_LOCKS
 
 
 def _runtime_rollover_lock_for(session_id: str) -> asyncio.Lock:
-    return _runtime_rollover_locks.setdefault(session_id, asyncio.Lock())
+    return chat_successor.runtime_rollover_lock_for(session_id)
 
 
-@contextmanager
 def _session_title_lock(session_id: str):
-    lock = _session_title_locks[hash(session_id) % len(_session_title_locks)]
-    with lock:
-        yield
+    return chat_successor.session_title_lock(session_id)
 
 
 def _runtime_task_overlay(
@@ -1836,8 +1676,9 @@ def _terminal_task_update(msg: TaskUpdatedMessage) -> dict | None:
 # - We do NOT auto-resume. Auto-resume would burn tokens on conversations the
 #   user has already abandoned and bypass their "should I rephrase?" judgment.
 #   Frontend gets the list + sids and toasts the user — they decide.
-# - File presence == status "in_flight". Don't bother with a status field;
-#   deletion is the only terminal action.
+# - The sidecar owns the user's pending intent only until canonical commit or a
+#   durable failed/cancelled display snapshot takes over. A process-crash orphan
+#   is converted to that snapshot before a later turn can reuse the same sid.
 # - No periodic touch / last_event_ts. Adding background touch task per turn
 #   means N file writes per second across active turns — not worth the
 #   complexity for "stale by 30s vs 30min" UX granularity. `started_at` is
@@ -1851,10 +1692,12 @@ def _active_turn_path(sid: str) -> Path:
     return _ACTIVE_TURN_DIR / f"{sid}.json"
 
 
-def _write_active_turn_sidecar(bc: TurnBroadcast) -> None:
-    """Persist the in-flight turn so a restart can surface it to the UI.
-    Best-effort: a failure here must NOT abort the turn (we'd rather run
-    the user's prompt without a recovery breadcrumb than refuse to run)."""
+def _write_active_turn_sidecar(bc: TurnBroadcast) -> bool:
+    """Persist the user intent before the SDK can accept the turn.
+
+    Callers at the initial submission boundary must fail closed when this
+    returns False; later rewrites only enrich an already-durable record.
+    """
     try:
         raw = bc.user_text or ""
         first_line = raw.strip().splitlines()[0] if raw.strip() else ""
@@ -1868,20 +1711,23 @@ def _write_active_turn_sidecar(bc: TurnBroadcast) -> None:
                 "model": bc.model,
                 "started_at": bc.started_at,
                 "turn_id": bc.turn_id,
+                "user_images": bc.user_images,
+                "user_docs": bc.user_docs,
+                "transcript_boundary": dict(bc.transcript_boundary or {}),
             }, ensure_ascii=False),
             mode=0o600,
         )
+        return True
     except Exception as e:
         sys.stderr.write(
             f"[chat] failed to write active-turn sidecar "
             f"sid={obs.short_id(bc.session_id)} exc={type(e).__name__}\n")
         sys.stderr.flush()
+        return False
 
 
 def _delete_active_turn_sidecar(sid: str) -> None:
-    """Called on clean turn termination (success / error / timeout). The
-    only case where we leave it on disk is when the process dies before
-    reaching this — exactly the case we want startup scan to catch."""
+    """Delete pending intent only after canonical/snapshot ownership exists."""
     try:
         p = _active_turn_path(sid)
         if p.exists():
@@ -1890,19 +1736,23 @@ def _delete_active_turn_sidecar(sid: str) -> None:
         pass
 
 
-def _delete_active_turn_sidecar_if_idle(sid: str) -> bool:
-    """Delete the crash breadcrumb only after the whole logical turn is idle.
+def _retain_active_turn_for_recovery(sid: str) -> None:
+    """Expose a still-owned sidecar to history without waiting for restart."""
+    try:
+        data = json.loads(_active_turn_path(sid).read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            _interrupted_at_startup[sid] = data
+    except Exception:
+        pass
 
-    A main ResultMessage is not terminal when SDK background tasks are still
-    owned by a detached watcher. Keeping the sidecar through that gap lets a
-    process restart surface the turn as interrupted instead of leaving a
-    transcript that silently ends at TaskNotification/thinking.
+
+def _release_active_turn_sidecar(sid: str) -> bool:
+    """Release pending-intent ownership at a durable terminal boundary.
+
+    Detached task state has its own runtime overlays/outbox. Keeping the user
+    intent sidecar after the canonical turn committed conflates those two owners
+    and can duplicate an already-successful prompt after a process restart.
     """
-    if _sessions_with_inflight_tasks.get(sid):
-        return False
-    watcher = _task_watchers.get(sid)
-    if watcher is not None and not watcher.done():
-        return False
     _delete_active_turn_sidecar(sid)
     return True
 
@@ -2706,16 +2556,12 @@ def _budget_usd() -> float:
     return env_float("MUSELAB_BUDGET_USD", 0.0)
 
 
-# Per-(sid, model, effort, service-tier) creation lock. Coalesces cache misses
-# on the same key (so we don't spawn two CLI subprocesses for one tab) while
-# leaving DIFFERENT keys free to build concurrently. Replaces the global
-# _lock-across-await pattern that froze every other request for 3-5 s while
-# one slow `client.connect()` ran.
-_creation_locks: dict[_ClientKey, asyncio.Lock] = {}
+# Per-runtime-key creation locks are shared with the extracted pool owner.
+_creation_locks = chat_runtime.CREATION_LOCKS
 
 
 def _creation_lock_for(key: _ClientKey) -> asyncio.Lock:
-    return _creation_locks.setdefault(key, asyncio.Lock())
+    return chat_runtime.creation_lock_for(key)
 
 
 def _normalize_plan_return_permission(
@@ -3045,6 +2891,15 @@ async def _build_and_connect_client(
             )],
         },
     )
+    if permission == "bypassPermissions" and not side_question_runtime:
+        # bypassPermissions shadows can_use_tool, but PreToolUse still runs.
+        # Route the SDK-native AskUserQuestion through the same interactive UI
+        # as the MuseLab MCP alias instead of letting the CLI return its terminal
+        # placeholder ("Answer questions?") with no clickable options.
+        opts_kwargs["hooks"].setdefault("PreToolUse", []).append(HookMatcher(
+            matcher="AskUserQuestion",
+            hooks=[perm.build_ask_user_question_hook_for_session(session_id)],
+        ))
     if side_question_runtime:
         # Side questions are deliberately narrower than ordinary workspace
         # agents.  `tools` removes every built-in except public web lookup;
@@ -3297,9 +3152,9 @@ async def _build_and_connect_client(
             opts_kwargs["effort"] = sdk_effort
     # can_use_tool resolves SDK permission prompts; it is not a universal tool
     # hook. In bypassPermissions the SDK approves tools before consulting the
-    # callback, so wiring it there only creates a false AskUserQuestion promise
-    # plus CanUseToolShadowedWarning noise. Interactive questions use the
-    # dedicated muselab MCP tool in every mode.
+    # callback, so wiring it there only creates CanUseToolShadowedWarning noise.
+    # Native AskUserQuestion is handled by the dedicated PreToolUse hook above;
+    # the MuseLab MCP question tool remains available in every mode as well.
     if permission != "bypassPermissions" and not side_question_runtime:
         opts_kwargs["can_use_tool"] = perm.build_callback_for_session(
             session_id,
@@ -3541,476 +3396,54 @@ async def _disconnect_unpooled_client(
     client: ClaudeSDKClient,
     session_id: str,
 ) -> None:
-    """Boundedly close a connected client that never entered the pool.
-
-    Once a cold client exists locally, cancellation must not drop its only
-    Python handle before the CLI subprocess is reaped. A child task plus
-    shield lets cleanup finish under the original cancellation; a repeated
-    cancellation is re-raised only after the bounded disconnect settles.
-    """
-    async def _sdk_disconnect() -> None:
-        try:
-            # The SDK close path is already bounded and escalates graceful →
-            # TERM → KILL. Wrapping it in a shorter wait_for cancels at the
-            # graceful boundary and skips that escalation, which can leave the
-            # only handle to an unpooled CLI orphaned for the service lifetime.
-            await client.disconnect()
-        except Exception as exc:
-            sys.stderr.write(
-                f"[client-pool] unpooled {session_id[:8]} disconnect err: "
-                f"{type(exc).__name__}\n"
-            )
-
-    cleanup = asyncio.create_task(_sdk_disconnect())
-    cancelled = False
-    while not cleanup.done():
-        try:
-            await asyncio.shield(cleanup)
-        except asyncio.CancelledError:
-            cancelled = True
-    cleanup.result()
-    if cancelled:
-        raise asyncio.CancelledError
+    return await chat_runtime.disconnect_unpooled_client(client, session_id)
 
 
-async def get_client(session_id: str, model: str, permission: str = "bypassPermissions",
-                     effort: str = "",
-                     service_tier: str = "",
-                     plan_return_permission: str = "") -> ClaudeSDKClient:
-    """Create or fetch a client for a session/model/effort/service-tier key.
-    Switching model, effort, or service tier yields a fresh client;
-    resume=session_id loads the same on-disk conversation history.
-
-    Concurrency: _lock is only held across synchronous dict / LRU operations.
-    The slow `await client.connect()` runs OUTSIDE _lock under a per-key
-    creation lock — concurrent callers for different runtime keys
-    keys never block each other; concurrent callers for the SAME key
-    coalesce so we don't spawn two CLI subprocesses for one tab.
-
-    effort: "auto" / "low" / "medium" / "high" / "xhigh" / "max" / "ultra".
-    Empty string remains accepted as a legacy spelling of ``auto``."""
-    if not await _join_session_disconnects(session_id):
-        raise RuntimeCleanupTimeout(
-            "session runtime cleanup is still in progress"
-        )
-    if sess.session_is_deleting(session_id):
-        raise RuntimeError("session is being deleted")
-    if session_id in _pending_runtime_rebuilds:
-        # Callers that operate a session hold its runtime lock. Consuming the
-        # marker here closes the race where a new turn reserves the active slot
-        # just before the previous turn's cleanup tries to rebuild.
-        await disconnect_client(session_id)
-
-    effort = _normalize_effort(effort)
-    service_tier = (service_tier or "").strip()
-    if effort not in _VALID_EFFORT:
-        raise ValueError(f"invalid effort: {effort}")
-    if service_tier not in _VALID_SERVICE_TIERS:
-        raise ValueError(f"invalid service tier: {service_tier}")
-    key = (session_id, model, effort, service_tier)
-    plan_return_permission = _normalize_plan_return_permission(
-        permission, plan_return_permission)
-
-    # Fast path: cache hit. Lock just long enough to read + touch LRU.
-    async with _lock:
-        cached = _clients.get(key)
-        if cached is not None:
-            if key in _client_lru:
-                _client_lru.remove(key)
-            _client_lru.append(key)
-        cached_perm = _client_permission.get(key) if cached is not None else None
-        cached_plan_return = (
-            _client_plan_return.get(key, "") if cached is not None else "")
-
-    if cached is not None:
-        if sess.session_is_deleting(session_id):
-            raise RuntimeError("session is being deleted")
-        # Permission is part of the runtime's launch contract even though it
-        # is not part of the storage key. In particular, a process launched in
-        # default mode may reject a later switch to bypassPermissions. Never
-        # return a stale client after a failed control request: replace the
-        # session runtime deterministically.
-        if (cached_perm != permission
-                or (permission == "plan"
-                    and cached_plan_return != plan_return_permission)):
-            await disconnect_client(session_id)
-            return await get_client(
-                session_id, model, permission, effort=effort,
-                service_tier=service_tier,
-                plan_return_permission=plan_return_permission)
-        return cached
-
-    # Cache miss: build a new client OUTSIDE _lock. Per-key creation
-    # lock prevents two concurrent misses on the same key from spawning
-    # two CLI subprocesses (where one becomes orphaned).
-    async with _creation_lock_for(key):
-        # Re-check under the global lock — another coroutine may have
-        # already finished building while we waited for the creation lock.
-        async with _lock:
-            cached = _clients.get(key)
-            if cached is not None:
-                if key in _client_lru:
-                    _client_lru.remove(key)
-                _client_lru.append(key)
-            cached_perm = (
-                _client_permission.get(key) if cached is not None else None)
-            cached_plan_return = (
-                _client_plan_return.get(key, "") if cached is not None else "")
-
-        # Two callers can race on the same storage key while requesting
-        # different launch modes. The creation lock coalesces them, but the
-        # waiter must still reject the runtime built with the other mode.
-        if cached is not None:
-            if sess.session_is_deleting(session_id):
-                raise RuntimeError("session is being deleted")
-            if (cached_perm == permission
-                    and (permission != "plan"
-                         or cached_plan_return == plan_return_permission)):
-                return cached
-            await disconnect_client(session_id)
-
-        # Slow path — no awaits hold _lock.
-        if permission == "plan":
-            client = await _build_and_connect_client(
-                session_id, model, permission, effort, service_tier,
-                plan_return_permission=plan_return_permission)
-        else:
-            client = await _build_and_connect_client(
-                session_id, model, permission, effort, service_tier)
-
-        # Wedge gate: freeze the tool-set before anyone can run a turn on this
-        # client. Runs under the per-key creation lock (blocks only same-key
-        # callers, never siblings) and BEFORE the pool commit, so no other
-        # request can grab this client and start a turn mid-connection. See
-        # _await_mcp_ready for the full rationale. Skip the status round-trip
-        # entirely when no external MCP server is configured (the default):
-        # the in-process 'muselab' server connects synchronously during
-        # connect(), so there's nothing left to settle.
-        try:
-            if _has_enabled_external_mcp():
-                await _await_mcp_ready(client)
-        except BaseException:
-            await _disconnect_unpooled_client(client, session_id)
-            raise
-
-        # Commit + LRU eviction. Eviction's await disconnect() runs
-        # OUTSIDE _lock (the disconnect can take up to 5 s). Eviction
-        # also SKIPS any client whose session has an in-flight turn —
-        # dropping a live stream mid-flow looked like "Muse just stopped
-        # talking" to the user (no error event, just dead air).
-        to_disconnect: list[
-            tuple[_ClientKey, ClaudeSDKClient, "_SessionStream | None"]
-        ] = []
-        reject_deleting = False
-        async with _lock:
-            # Linearize pool commit with DELETE's lifecycle tombstone. If
-            # commit wins, DELETE's later disconnect sees this client; if the
-            # tombstone wins, no pool/stream/LRU state is published at all.
-            # Keep this synchronous section await-free. Lock order is
-            # _lock(async) -> lifecycle(threading) -> queue(threading).
-            with sess.session_lifecycle_lock(session_id):
-                reject_deleting = sess.session_is_deleting(session_id)
-                if not reject_deleting:
-                    _clients[key] = client
-                    _client_permission[key] = permission
-                    if permission == "plan":
-                        _client_plan_return[key] = plan_return_permission
-                    else:
-                        _client_plan_return.pop(key, None)
-                    # Start the sole reader for this client BEFORE anyone can
-                    # consume it. Turns and the background-task watcher both
-                    # attach to this pump instead of opening their own
-                    # iterator over the same stream.
-                    _ensure_session_stream(key, client)
-                    _client_lru.append(key)
-            while (not reject_deleting
-                   and len(_client_lru) > _CLIENT_POOL_CAP):
-                # Find the oldest evictable client: not ourselves, not
-                # currently streaming. If every cached client is live,
-                # leave the pool over its cap until the next eviction
-                # attempt — better than killing somebody's reply.
-                candidate_idx = None
-                for i, k in enumerate(_client_lru):
-                    if k == key:
-                        continue
-                    if k[0] in _active_turns and not _active_turns[k[0]].done:
-                        continue
-                    # Pin clients with in-flight background tasks: disconnect()
-                    # kills the CLI subprocess, which would abort the running
-                    # task and the watcher draining its notification stream.
-                    if k[0] in _sessions_with_inflight_tasks:
-                        continue
-                    # A just-settled task can clear its pin before the watcher
-                    # finishes the final auto-continuation/grace cleanup. The
-                    # pump is still owned during that window, so eviction is
-                    # just as destructive as it is while the pin is present.
-                    if _session_has_live_watcher(k[0]):
-                        continue
-                    candidate_idx = i
-                    break
-                if candidate_idx is None:
-                    break
-                old_key = _client_lru.pop(candidate_idx)
-                old_client = _clients.pop(old_key, None)
-                _client_permission.pop(old_key, None)
-                _client_plan_return.pop(old_key, None)
-                # Drop the per-key creation lock too — otherwise evicted
-                # keys leak Lock objects in _creation_locks forever
-                # (disconnect_client clears it, but LRU eviction didn't).
-                _creation_locks.pop(old_key, None)
-                if old_client is not None:
-                    # The pump owns a task plus replay deques and a reference
-                    # to the SDK client.  LRU eviction used to remove only the
-                    # client, leaving that whole stream graph alive forever.
-                    old_stream = _session_streams.pop(old_key, None)
-                    to_disconnect.append((old_key, old_client, old_stream))
-
-        if reject_deleting:
-            await _disconnect_unpooled_client(client, session_id)
-            raise RuntimeError("session is being deleted")
-
-        for old_key, c, old_stream in to_disconnect:
-            if old_stream is not None:
-                await old_stream.aclose()
-            try:
-                await c.disconnect()
-            except Exception as e:
-                sys.stderr.write(
-                    f"[client-pool] evict disconnect failed "
-                    f"sid={obs.short_id(old_key[0])} "
-                    f"exc={type(e).__name__}\n")
-                sys.stderr.flush()
-
-        return client
+async def get_client(
+    session_id: str,
+    model: str,
+    permission: str = "bypassPermissions",
+    effort: str = "",
+    service_tier: str = "",
+    plan_return_permission: str = "",
+) -> ClaudeSDKClient:
+    """Compatibility facade for the extracted SDK runtime pool."""
+    return await chat_runtime.get_client(
+        session_id,
+        model,
+        permission,
+        effort=effort,
+        service_tier=service_tier,
+        plan_return_permission=plan_return_permission,
+    )
 
 
-# Sentinel pushed to a consumer queue when the underlying SDK stream ends.
-_STREAM_EOF = object()
-
-
-class _SessionStream:
-    """The sole reader of one SDK client's message stream.
-
-    The Claude Agent SDK gives a client exactly ONE message stream.
-    ``receive_messages()`` is an unbounded iterator over it and
-    ``receive_response()`` is a bounded convenience wrapper that stops at the
-    next ResultMessage (see the SDK's client.py). muselab used to open one of
-    those per consumer — a turn opened ``receive_response()``, a detached
-    background-task watcher opened ``receive_messages()`` — so two iterators
-    competed for the same underlying queue. Whoever happened to be reading
-    owned the stream, which is exactly why starting a turn while a background
-    task was still pending had to be refused with ``_TurnBusy``.
-
-    This makes ownership explicit: one pump per client reads the stream
-    forever and routes each message to whoever is registered. ``query()`` is a
-    pure write on the transport, so submitting a new prompt while the pump is
-    iterating is safe by construction.
-
-    Routing: an attached turn wins; otherwise the background sink; otherwise
-    the message is parked in ``_orphans`` and handed to the next consumer that
-    attaches. That parking is load-bearing — the SDK queue used to do it for
-    us (a late auto-continuation buffered there until the next turn drained
-    it), and a permanently-draining pump takes that job over.
-    """
-
-    # Bounded so a session nobody is reading cannot grow without limit. Far
-    # above the handful of messages a late continuation actually parks.
-    _ORPHAN_MAX = 512
-
-    def __init__(self, key: "_ClientKey", client: ClaudeSDKClient):
-        self.key = key
-        self.client = client
-        self._turn: asyncio.Queue | None = None
-        self._background: asyncio.Queue | None = None
-        self._orphans: deque = deque(maxlen=self._ORPHAN_MAX)
-        self._closed = False
-        self._failure: Exception | None = None
-        self.task: asyncio.Task = asyncio.create_task(self._pump())
-
-    def _adopt_orphans(self, q: asyncio.Queue) -> None:
-        while self._orphans:
-            q.put_nowait(self._orphans.popleft())
-
-    def attach_turn(self) -> asyncio.Queue:
-        """Register the active turn as the destination for NEW messages.
-
-        Deliberately does not adopt `_orphans`: anything parked there was
-        produced before this turn's query() went out, so it belongs to earlier
-        work — typically a background task's auto-continuation that landed
-        while nobody was attached. Handing it to this turn is exactly how a
-        follow-up used to swallow the previous task's continuation and render
-        it as the answer to the new prompt. It stays parked for the watcher.
-        """
-        q: asyncio.Queue = asyncio.Queue()
-        self._turn = q
-        return q
-
-    def detach_turn(self, q: asyncio.Queue) -> None:
-        if self._turn is q:
-            self._turn = None
-
-    def park_unconsumed(self, q: asyncio.Queue) -> None:
-        """Hand a detached consumer's leftovers back to the orphan park.
-
-        A slash-command consumer (`_run_sdk_command_checked`) stops at ITS
-        ResultMessage, but the pump may already have routed later messages into
-        the same queue — a background task's notification, an auto-continuation.
-        Letting the queue fall out of scope would drop them silently, so they go
-        back to `_orphans` for whoever attaches next.
-        """
-        while True:
-            try:
-                msg = q.get_nowait()
-            except asyncio.QueueEmpty:
-                break
-            if msg is _STREAM_EOF:
-                continue
-            self._orphans.append(msg)
-
-    def attach_background(self) -> asyncio.Queue:
-        """Register the task watcher as the sink for messages nobody owns.
-
-        Always adopts `_orphans`, including while a turn is attached: parked
-        messages were produced before that turn asked for anything, so they
-        are the watcher's by definition.
-        """
-        q: asyncio.Queue = asyncio.Queue()
-        self._background = q
-        self._adopt_orphans(q)
-        return q
-
-    def detach_background(self, q: asyncio.Queue) -> None:
-        if self._background is q:
-            self._background = None
-
-    async def _pump(self) -> None:
-        try:
-            async for msg in self.client.receive_messages():
-                if self._closed:
-                    break
-                q = self._turn or self._background
-                if q is not None:
-                    q.put_nowait(msg)
-                else:
-                    self._orphans.append(msg)
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            self._failure = e
-            sys.stderr.write(
-                f"[chat] session stream ended sid={self.key[0][:8]} "
-                f"exc={type(e).__name__}\n")
-            sys.stderr.flush()
-        finally:
-            # A pooled interactive SDK stream is expected to live until
-            # muselab explicitly closes it. Natural EOF while `_closed` is
-            # still false therefore means the CLI/runtime died even if the SDK
-            # did not preserve a more specific exception.
-            if not self._closed and self._failure is None:
-                self._failure = ClaudeSDKError(
-                    "SDK message stream ended before the session was closed")
-            self._closed = True
-            for q in (self._turn, self._background):
-                if q is not None:
-                    q.put_nowait(_STREAM_EOF)
-            if self._failure is not None:
-                # The previous implementation left the dead client in
-                # `_clients`. Every later turn hit get_client()'s cache fast
-                # path and tried to write to the terminated subprocess until a
-                # fork/settings change/restart happened to rebuild it.
-                await _evict_failed_session_stream(self)
-
-    async def aclose(self) -> None:
-        self._closed = True
-        if not self.task.done():
-            self.task.cancel()
-            with suppress(asyncio.CancelledError, Exception):
-                await self.task
-
-
-# One pump per cached client, keyed exactly like `_clients`.
-_session_streams: dict["_ClientKey", _SessionStream] = {}
+_STREAM_EOF = chat_runtime.STREAM_EOF
+_SessionStream = chat_runtime.SessionStream
+_session_streams = chat_runtime.SESSION_STREAMS
 
 
 async def _evict_failed_session_stream(stream: _SessionStream) -> None:
-    """Remove one failed stream's exact client from every runtime cache.
-
-    Identity checks are load-bearing: a settings change or concurrent recovery
-    may already have installed a replacement under the same key. The failed
-    stream must never evict that fresh runtime.
-    """
-    key = stream.key
-    client = stream.client
-    async with _lock:
-        if _clients.get(key) is client:
-            _clients.pop(key, None)
-            _client_permission.pop(key, None)
-            _client_plan_return.pop(key, None)
-            if key in _client_lru:
-                _client_lru.remove(key)
-        if _session_streams.get(key) is stream:
-            _session_streams.pop(key, None)
-    try:
-        if not await _join_session_disconnects(key[0], (client,)):
-            raise RuntimeCleanupTimeout(
-                "failed session stream cleanup is still in progress")
-    except Exception as e:
-        sys.stderr.write(
-            f"[chat] failed-stream disconnect sid={key[0][:8]} "
-            f"exc={type(e).__name__}\n")
-        sys.stderr.flush()
+    return await chat_runtime.evict_failed_session_stream(stream)
 
 
-def _ensure_session_stream(key: "_ClientKey",
-                           client: ClaudeSDKClient) -> _SessionStream:
-    stream = _session_streams.get(key)
-    if stream is not None and not stream._closed and stream.client is client:
-        return stream
-    if stream is not None:
-        stream._closed = True
-    stream = _SessionStream(key, client)
-    _session_streams[key] = stream
-    return stream
+def _ensure_session_stream(
+    key: _ClientKey,
+    client: ClaudeSDKClient,
+) -> _SessionStream:
+    return chat_runtime.ensure_session_stream(key, client)
 
 
 def _stream_for(client: ClaudeSDKClient) -> _SessionStream | None:
-    """Find the pump that owns this client's message stream.
-
-    Consumers (the turn loop, the background-task watcher) already hold a
-    `client`; looking the pump up by identity keeps their signatures unchanged.
-    """
-    for stream in _session_streams.values():
-        if stream.client is client and not stream._closed:
-            return stream
-    return None
+    return chat_runtime.stream_for(client)
 
 
 async def _drop_session_streams(session_id: str) -> None:
-    streams = []
-    for key in [k for k in _session_streams if k[0] == session_id]:
-        stream = _session_streams.pop(key, None)
-        if stream is not None:
-            streams.append(stream)
-    if not streams:
-        return
-    tasks = {asyncio.create_task(stream.aclose()) for stream in streams}
-    done, pending = await asyncio.wait(tasks, timeout=1.0)
-    if done:
-        await asyncio.gather(*done, return_exceptions=True)
-    for task in pending:
-        task.cancel()
-        _retain_detached_cleanup(task)
+    return await chat_runtime.drop_session_streams(session_id)
 
 
 def _retain_detached_cleanup(task: asyncio.Task) -> None:
-    """Keep a timed-out cancellation owner alive and consume its outcome.
-
-    ``asyncio.wait_for`` waits for cancellation acknowledgement and therefore
-    is not a hard deadline when an SDK coroutine suppresses cancellation.  A
-    plain ``wait`` lets the request continue; this registry prevents the
-    detached task from being garbage-collected and avoids unhandled-exception
-    noise if it eventually exits.
-    """
+    """Keep a timed-out cancellation owner alive and consume its outcome."""
     _maintenance_tasks.add(task)
 
     def _done(done: asyncio.Task) -> None:
@@ -4023,31 +3456,11 @@ def _retain_detached_cleanup(task: asyncio.Task) -> None:
     task.add_done_callback(_done)
 
 
-class RuntimeCleanupTimeout(RuntimeError):
-    """A CLI cleanup did not finish before the public operation's deadline."""
+RuntimeCleanupTimeout = chat_runtime.RuntimeCleanupTimeout
 
 
 def _track_session_disconnect(session_id: str, task: asyncio.Task) -> None:
-    owners = _session_disconnect_tasks.setdefault(session_id, set())
-    owners.add(task)
-
-    def _done(done: asyncio.Task) -> None:
-        current = _session_disconnect_tasks.get(session_id)
-        if current is not None:
-            current.discard(done)
-            if not current:
-                _session_disconnect_tasks.pop(session_id, None)
-        if done.cancelled():
-            _session_disconnect_failed.add(session_id)
-            return
-        try:
-            error = done.exception()
-        except Exception as exc:
-            error = exc
-        if error is not None:
-            _session_disconnect_failed.add(session_id)
-
-    task.add_done_callback(_done)
+    chat_runtime.track_session_disconnect(session_id, task)
 
 
 async def _join_session_disconnects(
@@ -4056,26 +3469,9 @@ async def _join_session_disconnects(
     *,
     timeout: float = _CLIENT_DISCONNECT_DEADLINE_S,
 ) -> bool:
-    if session_id in _session_disconnect_failed:
-        return False
-    tasks = {
-        task
-        for task in _session_disconnect_tasks.get(session_id, set())
-        if not task.done()
-    }
-    for client in {id(item): item for item in clients}.values():
-        task = asyncio.create_task(client.disconnect())
-        _track_session_disconnect(session_id, task)
-        tasks.add(task)
-    if not tasks:
-        return True
-    done, pending = await asyncio.wait(tasks, timeout=max(0.1, timeout))
-    if done:
-        await asyncio.gather(*done, return_exceptions=True)
-    # Do not raw-cancel SDK close: its subprocess transport documents that a
-    # bare asyncio cancellation can skip TERM/KILL escalation. The registry is
-    # the durable in-process fence until these owners actually finish.
-    return not pending and session_id not in _session_disconnect_failed
+    return await chat_runtime.join_session_disconnects(
+        session_id, clients, timeout=timeout
+    )
 
 
 def _track_session_runtime_cleanup(
@@ -4128,95 +3524,21 @@ async def _join_session_runtime_cleanup(
 
 
 async def disconnect_client(session_id: str) -> None:
-    """Disconnect every cached client for this session (across all models).
-    The SDK subprocess transport has a bounded graceful/TERM/KILL close path;
-    we pop dict entries under _lock but await it OUTSIDE so other sessions are
-    never blocked by one slow process."""
-    to_disconnect: list[ClaudeSDKClient] = []
-    _pending_runtime_rebuilds.discard(session_id)
-    # Stop the pumps first: they iterate the very stream disconnect() tears
-    # down, and a reader still attached would surface the teardown as a
-    # transport exception rather than a clean end.
-    await _drop_session_streams(session_id)
-    async with _lock:
-        keys = [k for k in _clients if k[0] == session_id]
-        for k in keys:
-            c = _clients.pop(k, None)
-            _client_permission.pop(k, None)
-            _client_plan_return.pop(k, None)
-            _creation_locks.pop(k, None)
-            if k in _client_lru:
-                _client_lru.remove(k)
-            if c is not None:
-                to_disconnect.append(c)
-    if not await _join_session_disconnects(session_id, to_disconnect):
-        raise RuntimeCleanupTimeout(
-            "session runtime cleanup did not finish; retry the operation"
-        )
+    """Compatibility facade for session-wide SDK runtime teardown."""
+    return await chat_runtime.disconnect_client(session_id)
 
 
 async def _disconnect_background_task_owner(
     session_id: str,
     client: ClaudeSDKClient,
 ) -> None:
-    """Confirm teardown of the exact CLI that owns a background task.
-
-    Production watchers normally hold a pooled client, in which case the
-    ordinary session-wide cleanup is authoritative.  The identity fallback is
-    needed when a failed stream already evicted that client from the pool (and
-    keeps direct/unit watcher use honest): an empty pool is not by itself proof
-    that this particular CLI process was reaped.
-    """
-    async with _lock:
-        pooled = any(
-            key[0] == session_id and candidate is client
-            for key, candidate in _clients.items()
-        )
-    if pooled:
-        await disconnect_client(session_id)
-        return
-    # A failed-stream eviction registers its exact cleanup before removing the
-    # client. Join that owner rather than starting a duplicate disconnect. Do
-    # not use _join_session_disconnects here: its sticky failure fence is
-    # correct for ordinary callers, but this is the recovery owner that must be
-    # allowed to prove a later retry succeeded and clear that sticky state.
-    existing = set(_session_disconnect_tasks.get(session_id, set()))
-    if existing:
-        done, pending = await asyncio.wait(
-            existing, timeout=_CLIENT_DISCONNECT_DEADLINE_S)
-        if pending:
-            raise RuntimeCleanupTimeout(
-                "background task runtime cleanup is still in progress")
-        results = await asyncio.gather(*done, return_exceptions=True)
-        if any(isinstance(result, BaseException) for result in results):
-            raise RuntimeCleanupTimeout(
-                "background task runtime cleanup failed")
-        _session_disconnect_failed.discard(session_id)
-        return
-    disconnect = getattr(client, "disconnect", None)
-    if not callable(disconnect):
-        raise RuntimeCleanupTimeout(
-            "background task owner cannot confirm runtime cleanup")
-    cleanup = asyncio.create_task(disconnect())
-    _track_session_disconnect(session_id, cleanup)
-    done, pending = await asyncio.wait(
-        {cleanup}, timeout=_CLIENT_DISCONNECT_DEADLINE_S)
-    if pending:
-        raise RuntimeCleanupTimeout(
-            "background task runtime cleanup did not finish")
-    result = (await asyncio.gather(*done, return_exceptions=True))[0]
-    if isinstance(result, BaseException):
-        raise RuntimeCleanupTimeout(
-            "background task runtime cleanup failed")
-    # A successful exact-owner retry is positive proof that the process
-    # cleanup completed, so future turns need not inherit an earlier transient
-    # disconnect failure forever.
-    _session_disconnect_failed.discard(session_id)
+    return await chat_runtime.disconnect_background_task_owner(
+        session_id, client
+    )
 
 
 async def shutdown_runtime() -> None:
     """Boundedly stop every in-process chat task, stream, and SDK client."""
-    global _client_lru
 
     # Stop detached task watchers and active turn pumps before tearing down the
     # shared SDK streams they consume.
@@ -4258,69 +3580,15 @@ async def shutdown_runtime() -> None:
         broadcast.close()
     _recent_turns.clear()
 
-    streams = list(_session_streams.values())
-    _session_streams.clear()
-    if streams:
-        close_tasks = {
-            asyncio.create_task(stream.aclose()) for stream in streams
-        }
-        done, pending = await asyncio.wait(close_tasks, timeout=1.0)
-        if done:
-            await asyncio.gather(*done, return_exceptions=True)
-        for task in pending:
-            task.cancel()
-            _retain_detached_cleanup(task)
-
-    existing_disconnects = {
-        task
-        for owners in _session_disconnect_tasks.values()
-        for task in owners
-        if not task.done()
-    }
-
-    async with _lock:
-        clients_by_session: dict[str, list[ClaudeSDKClient]] = {}
-        seen_clients: set[int] = set()
-        for key, client in _clients.items():
-            if id(client) in seen_clients:
-                continue
-            seen_clients.add(id(client))
-            clients_by_session.setdefault(key[0], []).append(client)
-        shutdown_disconnects: set[asyncio.Task] = set()
-        for sid, clients in clients_by_session.items():
-            for client in clients:
-                task = asyncio.create_task(client.disconnect())
-                _track_session_disconnect(sid, task)
-                shutdown_disconnects.add(task)
-        _clients.clear()
-        _client_permission.clear()
-        _client_plan_return.clear()
-        _creation_locks.clear()
-        _client_lru.clear()
-        _pending_runtime_rebuilds.clear()
-        _active_turns.clear()
-        _sessions_with_inflight_tasks.clear()
-        _bg_task_pinned_at.clear()
-        _background_activity_finishes.clear()
-        _task_watchers.clear()
-        _runtime_prewarm_tasks.clear()
-        _queue_drain_tasks.clear()
-        _queue_drain_rekicks.clear()
-        _queue_drain_locks.clear()
-
-    # Session-specific disconnect owners are deliberately not cancelled: the
-    # SDK close path owns TERM/KILL escalation. Give them one final bounded
-    # join while the event loop is alive, then keep their handles until process
-    # shutdown rather than losing ownership of a still-running child cleanup.
-    async def _join_existing_disconnects() -> None:
-        if not existing_disconnects:
-            return
-        done, _pending = await asyncio.wait(
-            existing_disconnects,
-            timeout=4.0,
-        )
-        if done:
-            await asyncio.gather(*done, return_exceptions=True)
+    _active_turns.clear()
+    _sessions_with_inflight_tasks.clear()
+    _bg_task_pinned_at.clear()
+    _background_activity_finishes.clear()
+    _task_watchers.clear()
+    _runtime_prewarm_tasks.clear()
+    _queue_drain_tasks.clear()
+    _queue_drain_rekicks.clear()
+    _queue_drain_locks.clear()
 
     async def _join_protected_cleanup() -> None:
         if not protected_cleanup_tasks:
@@ -4332,22 +3600,8 @@ async def shutdown_runtime() -> None:
         if done:
             await asyncio.gather(*done, return_exceptions=True)
 
-    async def _disconnect_pooled_clients() -> None:
-        # Registration happened atomically with pool removal under `_lock`.
-        # A concurrent DELETE can therefore never observe both an empty pool
-        # and an empty cleanup registry for a still-running subprocess.
-        if not shutdown_disconnects:
-            return
-        done, _pending = await asyncio.wait(
-            shutdown_disconnects,
-            timeout=4.0,
-        )
-        if done:
-            await asyncio.gather(*done, return_exceptions=True)
-
     await asyncio.gather(
-        _disconnect_pooled_clients(),
-        _join_existing_disconnects(),
+        chat_runtime.shutdown_clients(),
         _join_protected_cleanup(),
     )
 
@@ -4570,7 +3824,7 @@ def list_sessions_api(
     #               that fell outside the recent window.
     # limit=0 (the default) preserves the old "return everything" behaviour for
     # any caller that doesn't opt in.
-    full = sess.list_sessions()
+    full, list_revision = sess.list_sessions_snapshot()
     # A workspace switch only needs that workspace's recent sessions.  Filter
     # before applying q/limit/ids so an open-tab id owned by another workspace
     # can never be pulled into this response.  Legacy rows without cwd belong
@@ -4656,7 +3910,7 @@ def list_sessions_api(
     # changed. Any session mutation bumps the generation; a turn starting /
     # finishing changes active_sids; different limit/ids/q get their own key.
     _etag_key = (
-        sess.list_sessions_generation(),
+        list_revision,
         limit,
         ids,
         q_norm,
@@ -4713,6 +3967,45 @@ def list_sessions_api(
                 )
         response.headers["ETag"] = etag
     return body
+
+
+@router.get("/sessions/{sid}/evidence", dependencies=[Depends(require_token)])
+def get_session_evidence_api(sid: str) -> dict:
+    """Return copyable, server-derived evidence for one known session.
+
+    This endpoint exposes no caller-selected path and never creates an export.
+    The transcript is the existing Claude CLI JSONL, validated against both the
+    registered workspace and the known native/vendor session roots.
+    """
+    try:
+        if str(uuid.UUID(sid)) != sid:
+            raise ValueError
+    except (ValueError, AttributeError, TypeError):
+        raise HTTPException(400, "invalid session id") from None
+    meta = sess.get_session_meta(sid)
+    if meta is None:
+        raise HTTPException(404, "session not found")
+    workspace = sess.session_workspace(sid)
+    transcript = _canonical_session_evidence_path(sid, workspace)
+    if transcript is None:
+        raise HTTPException(404, "canonical session transcript not found")
+    evidence = {
+        "session_name": str(meta.get("name") or ""),
+        "session_id": sid,
+        "transcript_path": str(transcript),
+        "workspace": str(workspace),
+        "model": str(meta.get("model") or ""),
+    }
+    sidecar = sess._sidecar_path(sid)
+    try:
+        resolved_sidecar = sidecar.resolve(strict=True)
+        if (resolved_sidecar.is_file()
+                and resolved_sidecar.parent == sess.SESS_DIR.resolve(strict=True)
+                and resolved_sidecar.name == f"{sid}.sidecar.json"):
+            evidence["sidecar_path"] = str(resolved_sidecar)
+    except OSError:
+        pass
+    return evidence
 
 
 def _canonical_available_model(model: str, groups: list[dict] | None = None) -> str:
@@ -5068,19 +4361,11 @@ def search_sessions_api(q: str = Query(default="", min_length=0, max_length=200)
 # CLI wraps slash commands as pseudo-user messages with these tags so it can
 # round-trip through the conversation log. They're internal protocol detail
 # and should never reach the user's chat UI as a regular bubble.
-_CLI_SLASH_TAGS_RE = re.compile(
-    r"<(command-name|command-message|command-args|"
-    r"local-command-stdout|local-command-stderr)>.*?</\1>",
-    re.DOTALL,
-)
 
 
 def _strip_cli_slash_wrapper(text: str) -> str:
-    """Remove CLI slash-command protocol tags. Returns cleaned text (may be
-    empty — caller should skip rendering when empty)."""
-    if not text:
-        return text
-    return _CLI_SLASH_TAGS_RE.sub("", text).strip()
+    """Patchable facade for CLI slash-command presentation cleanup."""
+    return chat_presentation.strip_cli_slash_wrapper(text)
 
 
 # A run_in_background task's completion round-trips through the conversation log
@@ -5098,33 +4383,11 @@ def _strip_cli_slash_wrapper(text: str) -> str:
 # rebuild (the transcript stores the XML record, never the typed message) and
 # as a live fallback for older CLIs; a fallback hit logs a
 # "[chat] task fallback" warning.
-_TASK_NOTIFICATION_RE = re.compile(
-    r"<task-notification>(.*?)</task-notification>", re.DOTALL)
 
 
 def _parse_task_notifications(text: str) -> list[dict]:
-    """Extract task-notification records from a user-message string. Returns a
-    list of {tool_use_id, task_id, status, summary, output_file}. Returns []
-    unless the message STARTS with <task-notification> — so prose that merely
-    mentions the tag (e.g. a context-summary message describing the protocol) is
-    never mistaken for an actual completion record."""
-    if not text or not text.lstrip().startswith("<task-notification>"):
-        return []
-    recs: list[dict] = []
-    for m in _TASK_NOTIFICATION_RE.finditer(text):
-        body = m.group(1)
-
-        def _f(tag: str) -> str:
-            mm = re.search(rf"<{tag}>(.*?)</{tag}>", body, re.DOTALL)
-            return mm.group(1).strip() if mm else ""
-        recs.append({
-            "tool_use_id": _f("tool-use-id"),
-            "task_id": _f("task-id"),
-            "status": _f("status"),
-            "summary": _f("summary"),
-            "output_file": _f("output-file"),
-        })
-    return recs
+    """Patchable facade for canonical task-notification parsing."""
+    return chat_presentation.parse_task_notifications(text)
 
 
 # FALLBACK launch sniff (updated 2026-06-11): on CLI 2.1.141 + SDK 0.2.95 a
@@ -5139,315 +4402,40 @@ def _parse_task_notifications(text: str) -> list[dict]:
 # post-completion auto-continue would never stream live. NOTE: the English
 # wording below is CLI-version-coupled; that brittleness is exactly why typed
 # messages are now the primary path. See docs/background-tasks-spec.md.
-_BG_LAUNCH_RE = re.compile(
-    r"Command running in background with ID:\s*([A-Za-z0-9._-]+)\."
-    r"\s*Output is being written to:\s*(\S+?\.output)\b")
 
 
 def _parse_bg_launch(text: str) -> dict | None:
-    """Detect a Bash background-task launch from a tool_result body. Returns
-    {task_id, output_file} on match, else None."""
-    if not text:
-        return None
-    m = _BG_LAUNCH_RE.search(text)
-    if not m:
-        return None
-    return {"task_id": m.group(1), "output_file": m.group(2)}
+    """Patchable facade for legacy background-launch parsing."""
+    return chat_presentation.parse_bg_launch(text)
 
 
 def _usermsg_task_notification_text(msg) -> str:
-    """If `msg` is a UserMessage carrying a <task-notification>, return its
-    textual content; else return "".
-
-    Fallback-path helper (updated 2026-06-11): the typed
-    TaskNotificationMessage is the primary live completion signal on CLI
-    2.1.141 + SDK 0.2.95. Some CLI builds additionally/instead deliver the
-    terminal completion as a normal UserMessage whose content is the raw
-    <task-notification> XML; this helper lets the fallback branches consume
-    that shape. Content may be a plain string or a list of content blocks;
-    flatten both to text."""
-    if not isinstance(msg, UserMessage):
-        return ""
-    content = getattr(msg, "content", None)
-    if isinstance(content, str):
-        text = content
-    elif isinstance(content, list):
-        parts = []
-        for block in content:
-            if isinstance(block, TextBlock):
-                parts.append(getattr(block, "text", "") or "")
-            elif isinstance(block, str):
-                parts.append(block)
-        text = "".join(parts)
-    else:
-        return ""
-    return text if "<task-notification>" in text else ""
+    """Patchable facade for fallback UserMessage notification extraction."""
+    return chat_presentation.usermsg_task_notification_text(
+        msg, user_message_type=UserMessage, text_block_type=TextBlock)
 
 
-def _sdk_messages_to_ui(sm_list: list, annotations: dict[str, dict],
-                          compact_uuids: set[str] | None = None) -> list[dict]:
-    """Convert SDK SessionMessage list into muselab's flat UI message list.
-    Each SessionMessage may explode into multiple UI bubbles because the
-    frontend renders tool_use / tool_result / thinking blocks as separate
-    messages from the text bubble. Annotations (cost, model, images) attach
-    by message UUID to the primary text bubble. UUIDs in `compact_uuids`
-    get an `_is_compact_summary` flag so the UI can render a "📦 已压缩" pill."""
-    compact_uuids = compact_uuids or set()
-    out: list[dict] = []
-    # tool_use_id → tool_name lookup so the historic-load path attaches the
-    # same `tool_name` field that the live stream attaches. Keeps the FE's
-    # per-tool rich renderers (Bash terminal, Read with gutter, …) working
-    # after a page refresh / session reload.
-    tool_use_names: dict[str, str] = {}
-    for sm in sm_list:
-        ann = annotations.get(sm.uuid, {})
-        is_compact = sm.uuid in compact_uuids
-        msg = sm.message or {}
-        content = msg.get("content")
-
-        # Simple shape: content is a single string.
-        if isinstance(content, str):
-            # Claude CLI persists an explicit Stop as a synthetic user record.
-            # It is not a message the human sent and must not split the visible
-            # assistant/tool run or appear as an English user bubble.
-            if _is_cli_interrupt_message(content):
-                continue
-            # Background-task completion record → stamp the launching tool_use
-            # card's terminal task_status (durable ✅ across reloads) and DROP
-            # the raw XML bubble. The card was emitted by an earlier assistant
-            # SessionMessage, so it's already in `out`; match it by tool_use id.
-            notifs = _parse_task_notifications(content)
-            if notifs:
-                for n in notifs:
-                    tuid = n.get("tool_use_id")
-                    if not tuid:
-                        continue
-                    raw_st = n.get("status") or ""
-                    state = (raw_st if raw_st in ("completed", "failed",
-                                                   "stopped") else "done")
-                    for prev in reversed(out):
-                        if (prev.get("role") == "tool_use"
-                                and prev.get("id") == tuid):
-                            prev["task_status"] = {
-                                "task_id": n.get("task_id") or "",
-                                "state": state,
-                                "summary": n.get("summary") or "",
-                                "output_file": n.get("output_file") or "",
-                            }
-                            break
-                continue
-            text = _strip_cli_slash_wrapper(content)
-            # CLI's slash-command wrapper (<command-name>/compact</command-name>
-            # …) round-trips through the conversation log as a "user" turn;
-            # hide it from the UI rather than rendering a confusing bubble.
-            if not text:
-                continue
-            entry = {"role": sm.type, "text": text, "uuid": sm.uuid}
-            if is_compact:
-                entry["_is_compact_summary"] = True
-            entry.update(ann)   # cost / model / images / etc.
-            out.append(entry)
-            continue
-        if not isinstance(content, list):
-            continue
-
-        text_buf = ""
-        image_refs = []   # placeholder for inline image blocks (if any in JSONL)
-
-        def flush_text():
-            nonlocal text_buf, image_refs
-            # Strip CLI slash wrapper before deciding if there's anything to
-            # render. Pure-wrapper messages produce empty text + no images
-            # → drop the bubble entirely.
-            cleaned = _strip_cli_slash_wrapper(text_buf)
-            if _is_cli_interrupt_message(cleaned):
-                cleaned = ""
-            if not cleaned and not image_refs:
-                text_buf = ""
-                image_refs = []
-                return
-            entry = {"role": sm.type, "text": cleaned, "uuid": sm.uuid}
-            if is_compact:
-                entry["_is_compact_summary"] = True
-            if image_refs:
-                # CLI JSONL stores image source dicts; convert minimal info for UI.
-                # If sidecar has full base64 (uploaded via muselab), it wins
-                # — already merged via ann["images"].
-                entry.setdefault("images", image_refs)
-            entry.update(ann)
-            out.append(entry)
-            text_buf = ""
-            image_refs = []
-
-        for block in content:
-            if not isinstance(block, dict):
-                continue
-            bt = block.get("type")
-            if bt == "text":
-                text_buf += block.get("text", "")
-            elif bt == "thinking":
-                flush_text()
-                # Live streaming now shows real thinking text (we pass
-                # display="summarized" — see _build_options). But the FINAL
-                # transcript persisted to JSONL can still come back redacted
-                # for Opus 4.x (`thinking` is "" and only the `signature`
-                # survives). On reload we surface a placeholder so the UI
-                # doesn't show an empty block — reads as "model thought here
-                # but the text isn't retained" rather than a broken render.
-                th_text = block.get("thinking", "") or ""
-                if not th_text.strip() and block.get("signature"):
-                    th_text = "[已加密推理 · 仅 streaming 期间可见明文]"
-                out.append({"role": "thinking", "text": th_text,
-                             "uuid": sm.uuid})
-            elif bt == "tool_use":
-                flush_text()
-                tu_name = block.get("name") or ""
-                tu_id = block.get("id") or ""
-                if tu_id:
-                    tool_use_names[tu_id] = tu_name
-                # Slim + cap the input the same way the live stream does so
-                # the FE gets a consistent shape across "fresh stream" and
-                # "reload from JSONL". Without this, reload-after-Edit lost
-                # the old_string/new_string fields and the diff renderer
-                # silently degraded to file-path-only.
-                raw_input = block.get("input") or {}
-                # Shared whitelist with the realtime _render_tool_use path —
-                # see module-level _SLIM_INPUT_FIELDS.
-                slim_input = {
-                    k: _slim_input_value(v)
-                    for k, v in raw_input.items()
-                    if k in _SLIM_INPUT_FIELDS
-                }
-                tu = {
-                    "role": "tool_use",
-                    "uuid": sm.uuid,
-                    "id": tu_id,
-                    "name": tu_name,
-                    "input": slim_input,
-                    # Compact summary that the frontend usually shows in the bubble
-                    "summary": _summarize_tool_input(tu_name, raw_input),
-                }
-                if tu_name == "TodoWrite":
-                    tu["todos"] = raw_input.get("todos") or []
-                elif tu_name in ("Task", "Agent"):
-                    tu["task"] = {
-                        "subagent_type": raw_input.get("subagent_type"),
-                        "description": raw_input.get("description"),
-                        "prompt": raw_input.get("prompt"),
-                    }
-                elif tu_name == "ExitPlanMode":
-                    tu["plan"] = raw_input.get("plan") or ""
-                out.append(tu)
-            elif bt == "tool_result":
-                flush_text()
-                tr_text = ""
-                tr_content = block.get("content")
-                if isinstance(tr_content, str):
-                    tr_text = tr_content
-                elif isinstance(tr_content, list):
-                    parts = []
-                    for p in tr_content:
-                        if isinstance(p, dict):
-                            parts.append(p.get("text", str(p)))
-                        else:
-                            parts.append(str(p))
-                    tr_text = "\n".join(parts)
-                tu_id = block.get("tool_use_id") or ""
-                tool_name = tool_use_names.get(tu_id, "")
-                entry = {
-                    "role": "tool_result", "uuid": sm.uuid,
-                    "id": tu_id,
-                    "preview": tr_text[:_TOOL_RESULT_PREVIEW_CAP],
-                    "truncated": len(tr_text) > _TOOL_RESULT_PREVIEW_CAP,
-                    "text": tr_text[:_TOOL_RESULT_TEXT_CAP],
-                    "text_truncated": len(tr_text) > _TOOL_RESULT_TEXT_CAP,
-                    "is_error": bool(block.get("is_error", False)),
-                }
-                if tool_name:
-                    entry["tool_name"] = tool_name
-                if tool_name == "Bash":
-                    bash = _parse_bash_result(tr_text)
-                    if bash:
-                        entry["bash"] = bash
-                out.append(entry)
-            elif bt == "image":
-                # Inline image block in user content — record a reference.
-                # Real base64 lives in the sidecar (annotations["images"]) for
-                # images the user uploaded via muselab's upload flow.
-                src = block.get("source") or {}
-                image_refs.append({"mime": src.get("media_type") or ""})
-            # Other block types (server_tool_use, etc.) — skip silently for now.
-        flush_text()
-    # Propagate the turn-completion ts (stored on the LAST sm.uuid of
-    # the turn via set_message_annotation in chat_stream's tail) onto
-    # EVERY ui entry that shares that uuid — thinking / tool_use /
-    # tool_result / assistant text. The frontend renders turn-footer
-    # under whichever entry is the turn tail; making sure all of them
-    # carry ts means whatever block ends up at the tail can display
-    # the time. Cheap O(N) — annotations is already a dict lookup.
-    # Per-message wall-clock, distinct from `ts`. `ts` is the TURN-completion
-    # stamp deliberately fanned across the tail uuid only; `mts` is when this
-    # individual record was written. Keeping them separate matters: the FE's
-    # _markDone walks backwards looking for a bubble that already has `ts` to
-    # decide it has left the current turn, so populating `ts` everywhere would
-    # abort that walk on the first block it saw. Absent on the pure-SDK loader
-    # (SessionMessage carries no timestamp) — consumers must treat it as
-    # optional.
-    mts_by_uuid: dict[str, int] = {}
-    for sm in sm_list:
-        val = getattr(sm, "mts", None)
-        if val:
-            mts_by_uuid[sm.uuid] = val
-    key_ordinals: dict[str, int] = {}
-    for entry in out:
-        u = entry.get("uuid")
-        if not u:
-            continue
-        ordinal = key_ordinals.get(u, 0)
-        key_ordinals[u] = ordinal + 1
-        entry["_key"] = f"{u}:{ordinal}"
-        if u in mts_by_uuid:
-            entry["mts"] = mts_by_uuid[u]
-        ann = annotations.get(u, {})
-        ts = ann.get("ts")
-        if ts is not None and "ts" not in entry:
-            entry["ts"] = ts
-        # Also fan elapsed_s out the same way — turn-footer's "13:42 ·
-        # 2m50s" should survive a session reload too. Stored as float
-        # seconds by chat.py (see _handle_result_message).
-        elapsed = ann.get("elapsed_s")
-        if elapsed is not None and "elapsed" not in entry:
-            entry["elapsed"] = elapsed
-        # Completion annotations belong to the persisted assistant UUID, but
-        # one SDK message can explode into thinking/tool/result bubbles and the
-        # footer mounts on whichever bubble is visually last.  Fan model and
-        # terminal state across that UUID just like ts/elapsed, otherwise a
-        # tool-ending turn reloads as two separator lines with no model/state.
-        model_name = ann.get("model")
-        if model_name and "model" not in entry:
-            entry["model"] = model_name
-        turn_status = ann.get("turn_status")
-        if turn_status and "turn_status" not in entry:
-            entry["turn_status"] = turn_status
-        # Recall trace is footer metadata too.  The live `done` event carries
-        # it for the first paint; fan the persisted sidecar value across every
-        # bubble produced by the assistant UUID so a refresh/tool-ending turn
-        # keeps the same memory badge on its actual visual tail.
-        memory_recall = ann.get("memory_recall")
-        if memory_recall and "memoryRecall" not in entry:
-            entry["memoryRecall"] = memory_recall
-        # User-msg image annotations (thumb + url for the lightbox)
-        # live in the sidecar — the inline `image_refs` extracted from
-        # the SDK content blocks only carry `mime`. Layer the sidecar's
-        # richer payload on top so the FE sees {mime, thumb, url} after
-        # a session reload, not just the bare mime.
-        ann_images = ann.get("images")
-        if ann_images and entry.get("role") == "user":
-            entry["images"] = ann_images
-        ann_docs = ann.get("docs")
-        if ann_docs and entry.get("role") == "user":
-            entry["docs"] = ann_docs
-    return out
+def _sdk_messages_to_ui(
+    sm_list: list,
+    annotations: dict[str, dict],
+    compact_uuids: set[str] | None = None,
+    *,
+    defer_large_bodies: bool = False,
+) -> list[dict]:
+    """Patchable facade for canonical transcript-to-UI shaping."""
+    return chat_presentation.sdk_messages_to_ui(
+        sm_list,
+        annotations,
+        compact_uuids,
+        defer_large_bodies=defer_large_bodies,
+        is_cli_interrupt_message=_is_cli_interrupt_message,
+        slim_input_fields=_SLIM_INPUT_FIELDS,
+        slim_value=_slim_input_value,
+        summarize_input=_summarize_tool_input,
+        parse_bash=_parse_bash_result,
+        tool_result_preview_cap=_TOOL_RESULT_PREVIEW_CAP,
+        defer_bodies=_defer_large_ui_bodies,
+    )
 
 
 def _apply_runtime_task_overlays(
@@ -5487,43 +4475,13 @@ def _transcript_index_path(sid: str) -> Path:
 
 
 def _describe_transcript_record(entry: dict) -> dict:
-    """Build persistent index metadata using the real UI expansion logic.
-
-    Calling `_sdk_messages_to_ui` for one record makes `bubble_count` an exact
-    contract rather than a second, approximate block counter that can drift
-    when slash wrappers, task notifications, or new block types are added.
-    """
-    msg = _RawMsg(str(entry.get("uuid") or ""), str(entry.get("type") or ""),
-                  entry.get("message") or {})
-    compact = {msg.uuid} if entry.get("isCompactSummary") else set()
-    bubbles = _sdk_messages_to_ui([msg], {}, compact)
-    tool_uses: list[dict] = []
-    content = (entry.get("message") or {}).get("content")
-    if isinstance(content, list):
-        for block in content:
-            if isinstance(block, dict) and block.get("type") == "tool_use":
-                tool_uses.append({
-                    "id": block.get("id") or "",
-                    "name": block.get("name") or "",
-                })
-    notifications = (
-        _parse_task_notifications(content) if isinstance(content, str) else []
+    """Build index metadata with the same patchable UI renderer facade."""
+    return chat_presentation.describe_transcript_record(
+        entry,
+        raw_message_factory=_RawMsg,
+        render_messages=_sdk_messages_to_ui,
+        is_real_user_prompt=_is_real_user_prompt,
     )
-    user_bubble = next((b for b in bubbles if b.get("role") == "user"), None)
-    user_text = (user_bubble or {}).get("text", "")
-    has_inline_images = (
-        isinstance(content, list)
-        and any(isinstance(block, dict) and block.get("type") == "image"
-                for block in content)
-    )
-    return {
-        "bubble_count": len(bubbles),
-        "user_preview": _outline_preview(user_text) if user_bubble is not None else "",
-        "real_user_prompt": _is_real_user_prompt(msg) and not notifications,
-        "has_inline_images": has_inline_images,
-        "tool_uses": tool_uses,
-        "task_notifications": notifications,
-    }
 
 
 def _ensure_transcript_index(sid: str) -> tuple[Path, dict] | None:
@@ -5624,19 +4582,16 @@ def _indexed_ui_records(
         for e in entries
     ]
     compact = {str(e.get("uuid")) for e in entries if e.get("isCompactSummary")}
-    bubbles = _sdk_messages_to_ui(raw, annotations, compact)
+    bubbles = _sdk_messages_to_ui(
+        raw, annotations, compact, defer_large_bodies=True)
 
     # Cross-window context is stored in the index: a page may begin with a
     # tool_result whose tool_use is outside the read window, and a launching
     # card may need a terminal task notification appended much later.
     tool_names = index.get("tool_use_names") or {}
     task_status = index.get("task_status") or {}
-    ordinals: dict[str, int] = {}
     for bubble in bubbles:
         uid = str(bubble.get("uuid") or "")
-        ordinal = ordinals.get(uid, 0)
-        ordinals[uid] = ordinal + 1
-        bubble["_key"] = f"{uid}:{ordinal}"
         context = turn_context.get(uid)
         if context is not None:
             origin_uuid, started_at_ms = context
@@ -5741,107 +4696,14 @@ def _complete_turn_footer_metadata(
     has_later: bool,
     active_turn: "TurnBroadcast | None" = None,
 ) -> None:
-    """Put one complete footer contract on every real visual turn tail.
-
-    The frontend footer lives on the last muse-side bubble before a visible
-    user bubble.  Persisted completion annotations, however, belong to the
-    exact assistant UUID that produced ResultMessage and may sit earlier than
-    a trailing tool_result.  Background continuations add another wrinkle:
-    they have no visible user separator at all.  Restrict donors to the tail's
-    indexed turn origin, then fill status/time/duration/model without leaking
-    metadata across those hidden boundaries.
-    """
-    if not messages:
-        return
-    active_uuid = ""
-    if active_turn is not None and not active_turn.done:
-        active_uuid = str(active_turn.last_assistant_uuid or "")
-
-    i = 0
-    while i < len(messages):
-        if messages[i].get("role") == "user":
-            i += 1
-            continue
-        group_start = i
-        while i < len(messages) and messages[i].get("role") != "user":
-            i += 1
-        group = messages[group_start:i]
-        tail = group[-1]
-        origin_uuid = str(tail.get("_turn_origin_uuid") or "")
-        scope = ([item for item in group
-                  if str(item.get("_turn_origin_uuid") or "") == origin_uuid]
-                 if origin_uuid else group)
-        if not scope:
-            scope = [tail]
-
-        def last_value(field: str) -> Any:
-            for item in reversed(scope):
-                if field not in item:
-                    continue
-                value = item.get(field)
-                if value is not None and value != "":
-                    return value
-            return None
-
-        status = str(last_value("turn_status") or "")
-        active_scope = bool(active_uuid and any(
-            str(item.get("uuid") or "") == active_uuid for item in scope))
-        closed_by_user = i < len(messages)
-        complete_window_tail = i == len(messages) and not has_later
-        if not status:
-            if active_scope:
-                status = "running"
-            elif closed_by_user or complete_window_tail:
-                status = "completed"
-
-        # A page ending in the middle of a turn is not a real footer boundary.
-        # Leave it without status; the frontend hides incomplete separators.
-        if not status:
-            continue
-
-        terminal_ms = last_value("ts")
-        if terminal_ms is None:
-            terminal_ms = last_value("mts")
-        try:
-            terminal_ms = int(terminal_ms) if terminal_ms is not None else None
-        except (TypeError, ValueError, OverflowError):
-            terminal_ms = None
-
-        started_ms = last_value("turn_started_at")
-        try:
-            started_ms = int(started_ms) if started_ms is not None else None
-        except (TypeError, ValueError, OverflowError):
-            started_ms = None
-
-        elapsed = last_value("elapsed")
-        try:
-            elapsed = float(elapsed) if elapsed is not None else None
-        except (TypeError, ValueError, OverflowError):
-            elapsed = None
-        if elapsed is None and started_ms is not None:
-            end_ms = (int(time.time() * 1000)
-                      if status == "running" else terminal_ms)
-            if end_ms is not None:
-                elapsed = round(max(0.0, (end_ms - started_ms) / 1000), 1)
-
-        footer_model = str(last_value("model") or "")
-        if not footer_model and active_scope and active_turn is not None:
-            footer_model = str(active_turn.model or "")
-        if not footer_model:
-            footer_model = str(session_model or "")
-
-        tail["turn_status"] = status
-        if status != "running" and terminal_ms is not None:
-            tail["ts"] = terminal_ms
-        if started_ms is not None:
-            tail["turn_started_at"] = started_ms
-        if elapsed is not None:
-            tail["elapsed"] = elapsed
-        if footer_model:
-            tail["model"] = footer_model
-        memory_recall = last_value("memoryRecall")
-        if memory_recall:
-            tail["memoryRecall"] = memory_recall
+    """Patchable facade for footer-donor presentation shaping."""
+    chat_presentation.complete_turn_footer_metadata(
+        messages,
+        session_model,
+        has_later=has_later,
+        active_turn=active_turn,
+        now=time.time,
+    )
 
 
 def _persistable_memory_recall(trace: Any) -> dict | None:
@@ -5900,36 +4762,8 @@ def _bind_pending_attachments(sid: str, messages: list[dict]) -> None:
 
 
 def _summarize_tool_input(name: str | None, inp: dict) -> str:
-    """Same summarization used by _render_tool_use, factored to also work for
-    raw dict input (post-JSONL parse, no ToolUseBlock instance)."""
-    if not name:
-        return ""
-    if name in ("Read", "Edit", "Write"):
-        return inp.get("file_path", "")
-    if name == "Bash":
-        return (inp.get("command") or "")[:_MAX_INPUT_FIELD_LEN]
-    if name in ("Glob", "Grep"):
-        return (inp.get("pattern") or "") + (f"  in {inp.get('path','')}" if inp.get("path") else "")
-    if name == "WebFetch":
-        return inp.get("url", "")
-    if name == "WebSearch":
-        return inp.get("query", "")
-    if name == "TodoWrite":
-        return f"{len(inp.get('todos') or [])} todos"
-    # Keep these in sync with _render_tool_use (the realtime-stream path) —
-    # otherwise reloading a Task/ExitPlanMode/Skill turn from JSONL shows an
-    # empty summary while the live stream showed a meaningful one.
-    # "Agent" is the SDK's current name for the subagent-invoking tool
-    # (was "Task"); accept both so old + new transcripts both render.
-    if name in ("Task", "Agent"):
-        sub = inp.get("subagent_type") or "agent"
-        desc = inp.get("description") or ""
-        return f"[{sub}] {desc}"[:240]
-    if name == "ExitPlanMode":
-        return (inp.get("plan") or "")[:240]
-    if name == "Skill":
-        return inp.get("name") or inp.get("skill") or ""
-    return ""
+    """Patchable facade for historic tool-input summaries."""
+    return chat_presentation.summarize_tool_input(name, inp)
 
 
 # Cache of compact-summary UUID scans keyed by sid → (mtime, size, uuids).
@@ -6031,14 +4865,9 @@ _UI_MSGS_CACHE_MAX = 8
 
 
 def _jsonl_signature(sid: str) -> tuple[float, int] | None:
-    path = _find_session_jsonl(sid)
-    if path is None:
-        return None
-    try:
-        st = path.stat()
-        return (st.st_mtime, st.st_size)
-    except OSError:
-        return None
+    """Compatibility wrapper for canonical transcript freshness."""
+    return chat_history.jsonl_signature(
+        sid, find_session_jsonl=_find_session_jsonl)
 
 
 def _shaped_ui_messages(sid: str, model: str, full: bool) -> list[dict]:
@@ -6062,7 +4891,8 @@ def _shaped_ui_messages(sid: str, model: str, full: bool) -> list[dict]:
         sdk_msgs = []
     annotations = sess.get_message_annotations(sid)
     compact_uuids = _compact_summary_uuids(sid)
-    messages = _sdk_messages_to_ui(sdk_msgs, annotations, compact_uuids)
+    messages = _sdk_messages_to_ui(
+        sdk_msgs, annotations, compact_uuids, defer_large_bodies=True)
     if jsig is not None:
         _UI_MSGS_CACHE.pop(key, None)
         _UI_MSGS_CACHE[key] = (jsig, ssig, messages)
@@ -6168,10 +4998,14 @@ def _turn_transcript_boundary(
         "normal_total": 0,
         "full_uuid": "",
         "full_total": 0,
+        # Distinguish a valid empty first-turn boundary from a failed lookup.
+        # A zero record_count alone cannot do that and may point at old history.
+        "capture_ok": False,
     }
     try:
         indexed = _ensure_transcript_index(sid)
         if indexed is None:
+            boundary["capture_ok"] = not existing
             return existing, boundary
         _, index = indexed
         records = index.get("records") or []
@@ -6180,6 +5014,7 @@ def _turn_transcript_boundary(
             "record_count": len(records),
             "source_dev": int(source.get("dev") or 0),
             "source_inode": int(source.get("inode") or 0),
+            "capture_ok": True,
         })
         for order in ("normal", "full"):
             record_ids = (index.get("orders") or {}).get(order) or []
@@ -6207,7 +5042,9 @@ class _TurnResponseBoundary:
         TaskNotificationMessage, TaskUpdatedMessage,
         RateLimitEvent,
     )
-    _TURN_TYPES = (StreamEvent, AssistantMessage, UserMessage, ResultMessage)
+    _TURN_TYPES = (
+        StreamEvent, AssistantMessage, UserMessage, SystemMessage, ResultMessage,
+    )
 
     def __init__(self, existing_uuids: frozenset[str] | set[str]):
         self.existing_uuids = frozenset(existing_uuids)
@@ -6228,6 +5065,9 @@ class _TurnResponseBoundary:
             return "forward"
 
         uid = str(getattr(msg, "uuid", None) or "")
+        if isinstance(msg, SystemMessage) and not uid:
+            data = msg.data if isinstance(msg.data, dict) else {}
+            uid = str(data.get("uuid") or "")
         if uid and uid in self.existing_uuids:
             return "stale_result" if isinstance(msg, ResultMessage) else "drop"
 
@@ -6289,6 +5129,10 @@ def get_session_api(
     if meta is None:
         raise HTTPException(404, "session not found")
     model = meta.get("model", "")
+    if (sid in _interrupted_at_startup
+            and not _recover_interrupted_turn_snapshot(sid)):
+        raise HTTPException(
+            503, "interrupted turn could not be loaded into durable history")
     snapshots, snapshot_generation = _load_cancelled_turn_snapshots(sid)
     # Any bounded request uses the byte-offset index, including bounded
     # ``full``-order paging after an outline jump.  Keeping normal/full as an
@@ -6500,21 +5344,70 @@ def get_session_api(
     }
 
 
-def _outline_preview(text: str) -> str:
-    """First meaningful line of a user prompt, trimmed to 80 chars. Mirrors
-    the old client-side preview logic so the outline reads the same after we
-    moved extraction server-side. Skips blockquote (>) lines and strips a
-    leading markdown heading marker."""
-    raw = (text or "").strip()
-    if not raw:
-        return "(empty)"
-    lines = raw.split("\n")
-    one_line = next(
-        (ln for ln in lines if ln.strip() and not ln.strip().startswith(">")),
-        lines[0] if lines else raw,
+@router.get("/sessions/{sid}/blocks/{block_id}",
+            dependencies=[Depends(require_token)])
+def get_session_block_api(sid: str, block_id: str) -> dict:
+    """Read one canonical UI block body by stable transcript identity."""
+    if sess.get_session_meta(sid) is None:
+        raise HTTPException(404, "session not found")
+    match = re.fullmatch(r"([^:]+):(\d+):([a-z_]+)", block_id)
+    if match is None:
+        raise HTTPException(400, "invalid block id")
+    record_uuid = match.group(1)
+    indexed = _ensure_transcript_index(sid)
+    if indexed is None:
+        raise HTTPException(404, "transcript not found")
+    transcript_path, index = indexed
+    record_i = next(
+        (i for i, record in enumerate(index.get("records") or [])
+         if str(record.get("uuid") or "") == record_uuid),
+        None,
     )
-    cleaned = re.sub(r"^#+\s*", "", one_line).strip()
-    return cleaned[:77] + "…" if len(cleaned) > 80 else cleaned
+    if record_i is None:
+        raise HTTPException(404, "block not found")
+    entries = transcript_idx.read_records(transcript_path, index, [record_i])
+    if not entries:
+        raise HTTPException(404, "block not found")
+    entry = entries[0]
+    raw = _RawMsg(
+        str(entry.get("uuid") or ""),
+        str(entry.get("type") or ""),
+        entry.get("message") or {},
+        _transcript_ts_ms(entry),
+    )
+    compact = {record_uuid} if entry.get("isCompactSummary") else set()
+    messages = _sdk_messages_to_ui([raw], {}, compact)
+    block = next(
+        (message for message in messages
+         if message.get("block_id") == block_id),
+        None,
+    )
+    if block is None or not isinstance(block.get("text"), str):
+        raise HTTPException(404, "block body not found")
+    body = block["text"]
+    if block.get("role") == "tool_result":
+        tool_id = str(block.get("id") or "")
+        tool_name = str((index.get("tool_use_names") or {}).get(tool_id) or "")
+        if tool_name:
+            block["tool_name"] = tool_name
+            if tool_name == "Bash":
+                parsed = _parse_bash_result(body)
+                if parsed:
+                    block["bash"] = parsed
+    if len(body.encode("utf-8")) > 8 * 1024 * 1024:
+        raise HTTPException(413, "block body exceeds the 8 MiB response limit")
+    return {
+        **block,
+        "body_state": "loaded",
+        "body_available": True,
+        "body_length": len(body),
+        "body_ref": block_id,
+    }
+
+
+def _outline_preview(text: str) -> str:
+    """Patchable facade for session-outline previews."""
+    return chat_presentation.outline_preview(text)
 
 
 @router.get("/sessions/{sid}/outline", dependencies=[Depends(require_token)])
@@ -6562,1041 +5455,122 @@ def get_session_outline_api(sid: str) -> dict:
 
 
 def _broadcast_to_ui_messages(bc: "TurnBroadcast") -> list[dict]:
-    """Reconstruct the browser-visible portion of one broadcast.
-
-    This is the display record used when an explicit interrupt prevents the
-    CLI from committing a canonical JSONL turn.  It deliberately contains no
-    hidden protocol payloads and is never fed back to the model: only the same
-    bounded text/thinking/tool fields already sent to the browser are kept.
-    """
-    out: list[dict] = []
-    if bc.user_text or bc.user_images or bc.user_docs:
-        out.append({
-            "role": "user",
-            "text": bc.user_text,
-            "images": bc.user_images,
-            "docs": bc.user_docs,
-        })
-    cur_text_msg: dict | None = None
-    cur_thinking_msg: dict | None = None
-
-    def close_segment() -> None:
-        nonlocal cur_text_msg, cur_thinking_msg
-        cur_text_msg = None
-        cur_thinking_msg = None
-
-    def apply_task_status(tool_use_id: str, task_id: str, **patch: Any) -> None:
-        for message in reversed(out):
-            if message.get("role") != "tool_use":
-                continue
-            status = message.get("task_status") or {}
-            if (tool_use_id and message.get("id") == tool_use_id) or (
-                task_id and status.get("task_id") == task_id
-            ):
-                message["task_status"] = {**status, "task_id": task_id, **patch}
-                return
-
-    for ev in bc.replay_events():
-        kind = ev.get("event") or ""
-        data_str = ev.get("data") or "{}"
-        try:
-            data = json.loads(data_str)
-        except Exception:
-            continue
-        if kind == "text":
-            cur_thinking_msg = None
-            chunk = data.get("text", "")
-            if cur_text_msg is None:
-                cur_text_msg = {"role": "assistant", "text": chunk,
-                                  "model": bc.model}
-                out.append(cur_text_msg)
-            else:
-                cur_text_msg["text"] += chunk
-        elif kind == "thinking":
-            cur_text_msg = None
-            chunk = data.get("text", "")
-            if cur_thinking_msg is None:
-                cur_thinking_msg = {"role": "thinking", "text": chunk}
-                out.append(cur_thinking_msg)
-            else:
-                cur_thinking_msg["text"] += chunk
-        elif kind == "tool_use":
-            close_segment()
-            message = {
-                "role": "tool_use",
-                "name": data.get("name"),
-                "id": data.get("id"),
-                "summary": data.get("summary"),
-                "input": data.get("input") or {},
-                "task_status": None,
-                "_approvalSuperseded": False,
-                **({"todos": data["todos"]} if "todos" in data else {}),
-                **({"task": data["task"]} if "task" in data else {}),
-                **({"plan": data["plan"]} if "plan" in data else {}),
-            }
-            out.append(message)
-        elif kind == "tool_result":
-            close_segment()
-            out.append({
-                "role": "tool_result",
-                "id": data.get("id"),
-                "tool_name": data.get("tool_name") or "",
-                "preview": data.get("preview"),
-                "text": data.get("text") or "",
-                "truncated": data.get("truncated"),
-                "text_truncated": data.get("text_truncated"),
-                "is_error": data.get("is_error"),
-                "bash": data.get("bash"),
-            })
-        elif kind == "task_started":
-            apply_task_status(
-                str(data.get("tool_use_id") or ""),
-                str(data.get("task_id") or ""),
-                state="running",
-                description=data.get("description") or "",
-            )
-        elif kind == "task_progress":
-            apply_task_status(
-                str(data.get("tool_use_id") or ""),
-                str(data.get("task_id") or ""),
-                state="running",
-                usage=data.get("usage") or {},
-                last_tool_name=data.get("last_tool_name") or "",
-            )
-        elif kind == "task_notification":
-            raw_state = str(data.get("status") or "")
-            state = raw_state if raw_state in {
-                "completed", "failed", "stopped"
-            } else "done"
-            apply_task_status(
-                str(data.get("tool_use_id") or ""),
-                str(data.get("task_id") or ""),
-                state=state,
-                summary=data.get("summary") or "",
-                output_file=data.get("output_file") or "",
-            )
-        elif kind == "ask_user_question":
-            close_segment()
-            questions = data.get("questions") or []
-            out.append({
-                "role": "ask_user_question",
-                "id": data.get("id"),
-                "questions": questions,
-                "pendingAnswers": {
-                    str(question.get("question") or ""): (
-                        [] if question.get("multiSelect") else None
-                    )
-                    for question in questions
-                    if isinstance(question, dict)
-                },
-                # The stream is terminal: never resurrect an actionable card
-                # whose backend Future was cancelled with the turn.
-                "submitted": True,
-                "askOtherOpen": False,
-                "askOtherText": "",
-            })
-        elif kind == "permission_request":
-            close_segment()
-            out.append({
-                "role": "permission_request",
-                "id": data.get("id"),
-                "tool": data.get("tool"),
-                "summary": data.get("summary"),
-                "kind": data.get("kind") or "tool",
-                "suggestions": data.get("suggestions") or [],
-                "return_mode": data.get("return_mode") or "",
-                "title": data.get("title") or "",
-                "display_name": data.get("display_name") or "",
-                "description": data.get("description") or "",
-                "input": data.get("input") or {},
-                "tool_use_id": data.get("tool_use_id") or data.get("toolUseId") or "",
-                "plan": data.get("plan") or "",
-                "resolved": True,
-                "decision": "expired",
-                "mode": None,
-                "submitting": False,
-                "awaitingTransition": False,
-                "_decisionAcknowledged": True,
-                "failure_message": "",
-            })
-    return out
+    """Patchable facade for interrupted-turn display reconstruction."""
+    return chat_presentation.broadcast_to_ui_messages(bc)
 
 
-_CANCELLED_TURN_SNAPSHOT_SCHEMA = 1
-_RUNTIME_CONTINUATION_OUTBOX_SCHEMA = 1
-_RUNTIME_CONTINUATION_DISPLAY_KIND = "runtime_continuation"
 
 
 def _canonical_uuid_component(value: str) -> str | None:
-    """Return a filesystem-safe canonical UUID or ``None``."""
-    try:
-        parsed = uuid.UUID(str(value or ""))
-    except (ValueError, AttributeError, TypeError):
-        return None
-    canonical = str(parsed)
-    return canonical if canonical == str(value or "").lower() else None
-
+    return chat_overlays._canonical_uuid_component(value)
 
 def _cancelled_turn_session_dir(sid: str) -> Path | None:
-    safe_sid = _canonical_uuid_component(sid)
-    if safe_sid is None:
-        return None
-    return sess.SESS_DIR / "cancelled_turns" / safe_sid
-
+    return chat_overlays._cancelled_turn_session_dir(sid)
 
 def _cancelled_turn_snapshot_path(sid: str, turn_id: str) -> Path | None:
-    directory = _cancelled_turn_session_dir(sid)
-    safe_turn = _canonical_uuid_component(turn_id)
-    if directory is None or safe_turn is None:
-        return None
-    return directory / f"{safe_turn}.json"
-
+    return chat_overlays._cancelled_turn_snapshot_path(sid, turn_id)
 
 def _runtime_continuation_outbox_dir(source_sid: str) -> Path | None:
-    safe_sid = _canonical_uuid_component(source_sid)
-    if safe_sid is None:
-        return None
-    return sess.SESS_DIR / "runtime_continuation_outbox" / safe_sid
+    return chat_overlays._runtime_continuation_outbox_dir(source_sid)
 
-
-def _runtime_continuation_outbox_path(
-    source_sid: str,
-    event_id: str,
-) -> Path | None:
-    directory = _runtime_continuation_outbox_dir(source_sid)
-    safe_event = _canonical_uuid_component(event_id)
-    if directory is None or safe_event is None:
-        return None
-    return directory / f"{safe_event}.json"
-
+def _runtime_continuation_outbox_path(source_sid: str, event_id: str) -> Path | None:
+    return chat_overlays._runtime_continuation_outbox_path(source_sid, event_id)
 
 def _delete_runtime_continuation_outboxes(source_sid: str) -> None:
-    directory = _runtime_continuation_outbox_dir(source_sid)
-    if directory is not None and directory.exists():
-        shutil.rmtree(directory, ignore_errors=True)
+    return chat_overlays._delete_runtime_continuation_outboxes(source_sid)
 
-
-def _load_runtime_continuation_outbox(
-    source_sid: str,
-    event_id: str,
-) -> dict | None:
-    path = _runtime_continuation_outbox_path(source_sid, event_id)
-    if path is None:
-        return None
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(data, dict):
-            raise ValueError("outbox root must be an object")
-        if data.get("schema") != _RUNTIME_CONTINUATION_OUTBOX_SCHEMA:
-            raise ValueError("unsupported outbox schema")
-        if data.get("source_sid") != source_sid:
-            raise ValueError("outbox source mismatch")
-        if data.get("event_id") != event_id:
-            raise ValueError("outbox event mismatch")
-        message = data.get("message")
-        if not isinstance(message, dict) or message.get("role") != "assistant":
-            raise ValueError("outbox message mismatch")
-        if not isinstance(message.get("text"), str) or not message["text"].strip():
-            raise ValueError("outbox message is empty")
-        return data
-    except FileNotFoundError:
-        return None
-    except Exception as exc:
-        # A corrupt/older-schema READY record must not pin every successor tab
-        # forever.  Move it out of the ``*.json`` delivery namespace while
-        # retaining the private artifact for local diagnosis.  The rename is
-        # same-directory and therefore atomic; neither the filename nor the log
-        # contains assistant prose.
-        try:
-            quarantine = path.with_name(f"{path.name}.invalid")
-            if quarantine.exists():
-                quarantine = path.with_name(
-                    f"{path.name}.invalid.{uuid.uuid4().hex[:8]}"
-                )
-            os.replace(path, quarantine)
-            with suppress(OSError):
-                quarantine.chmod(0o600)
-        except FileNotFoundError:
-            pass
-        except OSError:
-            # A concurrent delete may own the directory.  The original error is
-            # still reported below without exposing payload contents.
-            pass
-        # The payload contains private assistant text.  Log only stable local
-        # identifiers and the exception class, never the content or a task
-        # output path.
-        sys.stderr.write(
-            f"[chat] runtime continuation outbox skipped "
-            f"sid={source_sid[:8]} event={event_id[:8]} "
-            f"exc={type(exc).__name__}\n"
-        )
-        sys.stderr.flush()
-        return None
-
+def _load_runtime_continuation_outbox(source_sid: str, event_id: str) -> dict | None:
+    return chat_overlays._load_runtime_continuation_outbox(source_sid, event_id)
 
 def _runtime_continuation_outbox_entries() -> list[tuple[str, str]]:
-    root = sess.SESS_DIR / "runtime_continuation_outbox"
-    if not root.exists():
-        return []
-    entries: list[tuple[str, str]] = []
-    try:
-        source_dirs = list(root.iterdir())
-    except OSError:
-        return []
-    for directory in source_dirs:
-        source_sid = _canonical_uuid_component(directory.name)
-        if source_sid is None or not directory.is_dir():
-            continue
-        try:
-            paths = list(directory.glob("*.json"))
-        except OSError:
-            continue
-        for path in paths:
-            event_id = _canonical_uuid_component(path.stem)
-            if event_id is not None:
-                entries.append((source_sid, event_id))
-    entries.sort()
-    return entries
-
+    return chat_overlays._runtime_continuation_outbox_entries()
 
 def _session_has_runtime_continuation_outbox(source_sid: str) -> bool:
-    directory = _runtime_continuation_outbox_dir(source_sid)
-    if directory is None or not directory.exists():
-        return False
-    try:
-        return any(directory.glob("*.json"))
-    except OSError:
-        return False
-
+    return chat_overlays._session_has_runtime_continuation_outbox(source_sid)
 
 def _runtime_continuation_outbox_event_ids(source_sid: str) -> list[str]:
-    """Return validated READY ids for one owner without reading private text."""
-    directory = _runtime_continuation_outbox_dir(source_sid)
-    if directory is None or not directory.exists():
-        return []
-    try:
-        event_ids = [
-            event_id
-            for path in directory.glob("*.json")
-            if (event_id := _canonical_uuid_component(path.stem)) is not None
-        ]
-    except OSError:
-        return []
-    return sorted(set(event_ids))
-
+    return chat_overlays._runtime_continuation_outbox_event_ids(source_sid)
 
 def _runtime_lineage_has_ready_continuation(leaf_sid: str) -> bool:
-    """Whether a visible leaf still has an ancestor READY projection."""
-    lineage = sess.runtime_lineage(leaf_sid) or [leaf_sid]
-    if not lineage or lineage[-1] != leaf_sid:
-        return False
-    return any(
-        _runtime_continuation_outbox_event_ids(owner_sid)
-        for owner_sid in lineage[:-1]
-    )
+    return chat_overlays._runtime_lineage_has_ready_continuation(leaf_sid)
 
-
-def _persist_runtime_continuation_outbox(
-    source_sid: str,
-    broadcast: "TurnBroadcast",
-    *,
-    completed_at_ms: int,
-    elapsed_s: float,
-    terminal_status: str,
-    incomplete_error: str = "",
-) -> str:
-    """Durably stage one hidden-runtime reply for its visible successor.
-
-    The source transcript remains Claude's canonical model history.  This
-    outbox contains only the final user-visible assistant prose and footer
-    facts; it deliberately excludes thinking, tool protocol, task summaries,
-    output paths, and the source AssistantMessage UUID.
-    """
-    # Write first, decide whether a successor needs the projection later while
-    # actually holding the source rollover lock.  Merely sampling ``locked()``
-    # here left a check-then-link gap: a fast continuation could decide it was
-    # public, then a waiting rollover would fork at the earlier boundary and
-    # hide the only durable reply.
-    if terminal_status not in {"completed", "failed"}:
-        return ""
-    event_id = str(broadcast.turn_id or "")
-    path = _runtime_continuation_outbox_path(source_sid, event_id)
-    if path is None:
-        return ""
-
-    messages = _broadcast_to_ui_messages(broadcast)
-    # A continuation can speak, use a tool, then speak again.  The successor
-    # intentionally gets one simple Agent bubble, but it must retain every
-    # user-visible prose segment in order rather than silently keeping only the
-    # last one.  Thinking/tool protocol remains excluded.
-    assistant_texts = [
-        str(message.get("text") or "").strip()
-        for message in messages
-        if message.get("role") == "assistant"
-        and str(message.get("text") or "").strip()
-    ]
-    text = "\n\n".join(assistant_texts)
-    if incomplete_error:
-        text = incomplete_error
-    if not text.strip():
-        return ""
-
-    message = {
-        "role": "assistant",
-        "text": text,
-        "model": broadcast.model,
-        "ts": int(completed_at_ms),
-        "elapsed": float(elapsed_s),
-        "turn_status": terminal_status,
-        "display_kind": _RUNTIME_CONTINUATION_DISPLAY_KIND,
-        "runtime_event_id": event_id,
-        "presentation_only": True,
-        "forkable": False,
-        "_key": f"runtime-continuation:{event_id}:0",
-    }
-    payload = {
-        "schema": _RUNTIME_CONTINUATION_OUTBOX_SCHEMA,
-        "source_sid": source_sid,
-        "event_id": event_id,
-        "model": broadcast.model,
-        "completed_at_ms": int(completed_at_ms),
-        "terminal_status": terminal_status,
-        "message": message,
-    }
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with suppress(OSError):
-            path.parent.parent.chmod(0o700)
-        with suppress(OSError):
-            path.parent.chmod(0o700)
-        atomic_write_text(
-            path,
-            json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
-            mode=0o600,
-        )
-        with suppress(OSError):
-            path.chmod(0o600)
-        return event_id
-    except Exception as exc:
-        sys.stderr.write(
-            f"[chat] runtime continuation outbox write failed "
-            f"sid={source_sid[:8]} event={event_id[:8]} "
-            f"exc={type(exc).__name__}\n"
-        )
-        sys.stderr.flush()
-        return ""
-
+def _persist_runtime_continuation_outbox(source_sid: str, broadcast: 'TurnBroadcast', *, completed_at_ms: int, elapsed_s: float, terminal_status: str, incomplete_error: str='') -> str:
+    return chat_overlays._persist_runtime_continuation_outbox(source_sid, broadcast, completed_at_ms=completed_at_ms, elapsed_s=elapsed_s, terminal_status=terminal_status, incomplete_error=incomplete_error)
 
 def _sync_runtime_display_message_count(sid: str) -> None:
-    """Refresh cached list counts after a presentation-only snapshot write."""
-    snapshots, _ = _load_cancelled_turn_snapshots(sid)
-    indexed = _ensure_transcript_index(sid)
-    index = indexed[1] if indexed is not None else None
-    total, turns = _interrupted_history_stats(index, snapshots, "normal")
-    sess.bump_session(sid, message_count=total, turn_count=turns)
+    return chat_overlays._sync_runtime_display_message_count(sid)
 
+def _persist_runtime_continuation_snapshot(target_sid: str, outbox: dict) -> bool:
+    return chat_overlays._persist_runtime_continuation_snapshot(target_sid, outbox)
 
-def _persist_runtime_continuation_snapshot(
-    target_sid: str,
-    outbox: dict,
-) -> bool:
-    """Project one staged reply under the target's deletion fence."""
-    # ``asyncio.to_thread`` cancellation does not stop its worker.  Holding the
-    # same lifecycle lock as purge means a writer that started first completes
-    # before purge removes the directory, while a writer arriving after the
-    # tombstone becomes a no-op and cannot recreate private text after DELETE.
-    with sess.session_lifecycle_lock(target_sid):
-        return _persist_runtime_continuation_snapshot_locked(target_sid, outbox)
+def _persist_runtime_continuation_snapshot_locked(target_sid: str, outbox: dict) -> bool:
+    return chat_overlays._persist_runtime_continuation_snapshot_locked(target_sid, outbox)
 
+def _copy_runtime_continuation_snapshots(source_sid: str, target_sid: str, uuid_mapping: dict[str, str]) -> int:
+    return chat_overlays._copy_runtime_continuation_snapshots(source_sid, target_sid, uuid_mapping)
 
-def _persist_runtime_continuation_snapshot_locked(
-    target_sid: str,
-    outbox: dict,
-) -> bool:
-    """Project one staged reply into ``target_sid``'s virtual UI history."""
-    event_id = str(outbox.get("event_id") or "")
-    path = _cancelled_turn_snapshot_path(target_sid, event_id)
-    if path is None or sess.session_is_deleting(target_sid):
-        return False
-    if path.exists():
-        try:
-            existing = json.loads(path.read_text(encoding="utf-8"))
-            if (
-                isinstance(existing, dict)
-                and existing.get("kind") == _RUNTIME_CONTINUATION_DISPLAY_KIND
-                and existing.get("runtime_event_id") == event_id
-                and existing.get("sid") == target_sid
-            ):
-                # The first attempt may have committed the private snapshot and
-                # then crashed/failed while refreshing the list-row cache.  A
-                # replay must repair that cache before consuming the outbox.
-                try:
-                    _sync_runtime_display_message_count(target_sid)
-                except Exception as exc:
-                    sys.stderr.write(
-                        f"[chat] runtime continuation existing count sync "
-                        f"failed sid={target_sid[:8]} event={event_id[:8]} "
-                        f"exc={type(exc).__name__}\n"
-                    )
-                    sys.stderr.flush()
-                return True
-        except Exception:
-            pass
+def _copy_runtime_continuation_snapshots_locked(source_sid: str, target_sid: str, uuid_mapping: dict[str, str]) -> int:
+    return chat_overlays._copy_runtime_continuation_snapshots_locked(source_sid, target_sid, uuid_mapping)
 
-    target_meta = sess.get_session_meta(target_sid) or {}
-    target_model = str(target_meta.get("model") or outbox.get("model") or "")
-    _, boundary = _turn_transcript_boundary(target_sid, target_model)
-    completed_at_ms = int(outbox.get("completed_at_ms") or 0)
-    message = dict(outbox.get("message") or {})
-    message.update({
-        "display_kind": _RUNTIME_CONTINUATION_DISPLAY_KIND,
-        "runtime_event_id": event_id,
-        "presentation_only": True,
-        "forkable": False,
-        "_key": f"runtime-continuation:{event_id}:0",
-    })
-    # This is a complete assistant-only display turn.  Never expose a source
-    # transcript UUID (or a fork UUID) on the successor: the bubble is not a
-    # legal Claude history boundary and must not be offered as a fork point.
-    message.pop("uuid", None)
-    message.pop("forkUuid", None)
-    payload = {
-        "schema": _CANCELLED_TURN_SNAPSHOT_SCHEMA,
-        "kind": _RUNTIME_CONTINUATION_DISPLAY_KIND,
-        "sid": target_sid,
-        "turn_id": event_id,
-        "runtime_event_id": event_id,
-        # Snapshot ordering is completion ordering, not the source user turn's
-        # start time (which can be hours earlier for a long-running task).
-        "started_at_ms": completed_at_ms,
-        "terminal_at_ms": completed_at_ms,
-        "anchors": {
-            "normal": {
-                "uuid": boundary.get("normal_uuid") or "",
-                "total": int(boundary.get("normal_total") or 0),
-            },
-            "full": {
-                "uuid": boundary.get("full_uuid") or "",
-                "total": int(boundary.get("full_total") or 0),
-            },
-        },
-        "hidden_uuids": [],
-        "messages": [message],
-    }
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with suppress(OSError):
-            path.parent.chmod(0o700)
-        atomic_write_text(
-            path,
-            json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
-            mode=0o600,
-        )
-        with suppress(OSError):
-            path.chmod(0o600)
-        _sync_runtime_display_message_count(target_sid)
-        return True
-    except Exception as exc:
-        sys.stderr.write(
-            f"[chat] runtime continuation snapshot write failed "
-            f"sid={target_sid[:8]} event={event_id[:8]} "
-            f"exc={type(exc).__name__}\n"
-        )
-        sys.stderr.flush()
-        return False
+async def _deliver_runtime_continuation_outbox(source_sid: str, event_id: str) -> bool:
+    return await chat_overlays._deliver_runtime_continuation_outbox(source_sid, event_id)
 
+async def _flush_runtime_continuations_at_turn_boundary(leaf_sid: str, *, expected_active: 'TurnBroadcast | None'=None) -> int:
+    return await chat_overlays._flush_runtime_continuations_at_turn_boundary(leaf_sid, expected_active=expected_active)
 
-def _copy_runtime_continuation_snapshots(
-    source_sid: str,
-    target_sid: str,
-    uuid_mapping: dict[str, str],
-) -> int:
-    """Copy presentation snapshots under the target deletion fence."""
-    # Rollover copies run in a worker thread.  Cancellation of the awaiting
-    # coroutine cannot stop that worker, so the same target lifecycle lock used
-    # by DELETE must cover the tombstone check and every write/count refresh.
-    with sess.session_lifecycle_lock(target_sid):
-        if sess.session_is_deleting(target_sid):
-            return 0
-        return _copy_runtime_continuation_snapshots_locked(
-            source_sid, target_sid, uuid_mapping)
-
-
-def _copy_runtime_continuation_snapshots_locked(
-    source_sid: str,
-    target_sid: str,
-    uuid_mapping: dict[str, str],
-) -> int:
-    """Copy already-visible UI continuations across a later SDK fork.
-
-    Anchors are translated one edge at a time.  If a CLI build omits a UUID
-    backlink, retain the exact bubble-total coordinate with an empty UUID;
-    the fork boundary is later than every copied event, so that coordinate is
-    still a safe placement fallback.
-    """
-    snapshots, _ = _load_cancelled_turn_snapshots(source_sid)
-    copied = 0
-    for snapshot in snapshots:
-        if snapshot.get("kind") != _RUNTIME_CONTINUATION_DISPLAY_KIND:
-            continue
-        event_id = str(snapshot.get("runtime_event_id") or "")
-        target_path = _cancelled_turn_snapshot_path(target_sid, event_id)
-        if target_path is None or target_path.exists():
-            continue
-        anchors: dict[str, dict] = {}
-        for order in ("normal", "full"):
-            source_anchor = dict(
-                ((snapshot.get("anchors") or {}).get(order) or {}))
-            source_uuid = str(source_anchor.get("uuid") or "")
-            anchors[order] = {
-                "uuid": str(uuid_mapping.get(source_uuid) or "")
-                if source_uuid else "",
-                "total": int(source_anchor.get("total") or 0),
-            }
-        payload = {
-            **snapshot,
-            "sid": target_sid,
-            "anchors": anchors,
-            "messages": [
-                dict(message) for message in (snapshot.get("messages") or [])
-            ],
-        }
-        try:
-            target_path.parent.mkdir(parents=True, exist_ok=True)
-            with suppress(OSError):
-                target_path.parent.chmod(0o700)
-            atomic_write_text(
-                target_path,
-                json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
-                mode=0o600,
-            )
-            with suppress(OSError):
-                target_path.chmod(0o600)
-            copied += 1
-        except Exception as exc:
-            sys.stderr.write(
-                f"[chat] runtime continuation snapshot copy failed "
-                f"sid={source_sid[:8]} child={target_sid[:8]} "
-                f"event={event_id[:8]} exc={type(exc).__name__}\n"
-            )
-            sys.stderr.flush()
-    if copied:
-        try:
-            _sync_runtime_display_message_count(target_sid)
-        except Exception as exc:
-            sys.stderr.write(
-                f"[chat] runtime continuation count sync failed "
-                f"sid={target_sid[:8]} exc={type(exc).__name__}\n"
-            )
-            sys.stderr.flush()
-    return copied
-
-
-async def _deliver_runtime_continuation_outbox(
-    source_sid: str,
-    event_id: str,
-) -> bool:
-    """Deliver a READY outbox to the newest idle lineage leaf exactly once."""
-    while True:
-        outbox = await asyncio.to_thread(
-            _load_runtime_continuation_outbox, source_sid, event_id)
-        if outbox is None:
-            return False
-        # The durable latest link is published before its rollover
-        # postlude/queue migration has reached the commit boundary.  Observe the
-        # chain, acquire the lock owned by that exact latest edge, then re-read
-        # under the lock.  For A -> B -> C this must be B's lock, not always A's;
-        # otherwise C can still be a provisional child that later rolls back.
-        observed_lineage = await asyncio.to_thread(
-            sess.runtime_lineage, source_sid)
-        barrier_sid = (
-            observed_lineage[-2]
-            if len(observed_lineage) >= 2
-            else source_sid
-        )
-        wait_for_rollover = False
-        lineage_changed = False
-        async with _runtime_rollover_lock_for(barrier_sid):
-            source_meta = await asyncio.to_thread(
-                sess.get_session_meta, source_sid)
-            if source_meta is None or sess.session_is_deleting(source_sid):
-                path = _runtime_continuation_outbox_path(source_sid, event_id)
-                if path is not None:
-                    with suppress(OSError):
-                        path.unlink(missing_ok=True)
-                return False
-            lineage = await asyncio.to_thread(sess.runtime_lineage, source_sid)
-            if lineage != observed_lineage:
-                lineage_changed = True
-            elif len(lineage) < 2 or lineage[-1] == source_sid:
-                # The watcher is the last authority capable of initiating a
-                # boundary fork.  Keep the unconditional write-ahead record
-                # until that owner exits (or a registered eager prewarm commits).
-                prewarm = _runtime_prewarm_tasks.get(source_sid)
-                wait_for_rollover = bool(
-                    _session_has_live_watcher(source_sid)
-                    or (prewarm is not None and not prewarm.done())
-                    or source_meta.get("runtime_shadow")
-                )
-                if not wait_for_rollover:
-                    path = _runtime_continuation_outbox_path(
-                        source_sid, event_id)
-                    if path is not None:
-                        with suppress(OSError):
-                            path.unlink(missing_ok=True)
-                    return False
-        if lineage_changed:
-            await asyncio.sleep(0)
-            continue
-        if wait_for_rollover:
-            await asyncio.sleep(0.2)
-            continue
-        leaf_sid = lineage[-1]
-        if sess.session_is_deleting(leaf_sid):
-            await asyncio.sleep(0.2)
-            continue
-
-        # A new rollover and this projection must agree on one latest leaf.
-        # The leaf runtime lock also places the bubble after any turn currently
-        # writing JSONL and before a later turn can establish its own boundary.
-        delivered = False
-        retry_delay = 0.05
-        async with _runtime_rollover_lock_for(leaf_sid):
-            fresh_lineage = await asyncio.to_thread(
-                sess.runtime_lineage, source_sid)
-            if not fresh_lineage or fresh_lineage[-1] != leaf_sid:
-                retry_delay = 0.05
-            else:
-                active = _active_turns.get(leaf_sid)
-                if active is not None and not active.done:
-                    retry_delay = 0.2
-                else:
-                    runtime_lock = _session_runtime_lock_for(leaf_sid)
-                    async with runtime_lock:
-                        active = _active_turns.get(leaf_sid)
-                        fresh_lineage = await asyncio.to_thread(
-                            sess.runtime_lineage, source_sid)
-                        if (
-                            (active is not None and not active.done)
-                            or not fresh_lineage
-                            or fresh_lineage[-1] != leaf_sid
-                        ):
-                            retry_delay = 0.2
-                        else:
-                            delivered = await asyncio.to_thread(
-                                _persist_runtime_continuation_snapshot,
-                                leaf_sid,
-                                outbox,
-                            )
-                            retry_delay = 0.5
-        if delivered:
-            path = _runtime_continuation_outbox_path(source_sid, event_id)
-            if path is not None:
-                with suppress(OSError):
-                    path.unlink(missing_ok=True)
-            # A queued turn may have deferred itself while this READY record was
-            # waiting for the leaf boundary. Re-kick after the presentation
-            # commit; the drain's own active/paused checks remain authoritative.
-            with suppress(Exception):
-                queued = sess.get_queue(leaf_sid)
-                if queued.get("items") or queued.get("inflight"):
-                    _schedule_queue_drain(leaf_sid)
-            return True
-        await asyncio.sleep(retry_delay)
-
-
-async def _flush_runtime_continuations_at_turn_boundary(
-    leaf_sid: str,
-    *,
-    expected_active: "TurnBroadcast | None" = None,
-) -> int:
-    """Commit every READY ancestor reply before releasing a leaf turn slot.
-
-    The source-lock pass is a commit barrier for initial forks: once each lock
-    has been acquired and released, a visible link cannot still roll back.  The
-    leaf rollover/runtime locks then serialize this display boundary with a
-    later fork or query.  Outbox-directory rescans are synchronous and tiny so
-    there is no event-loop yield between observing "empty" and returning to the
-    caller that will release/reserve ``_active_turns``.
-    """
-    lineage = await asyncio.to_thread(sess.runtime_lineage, leaf_sid)
-    if not lineage or lineage[-1] != leaf_sid:
-        return 0
-    owners = list(dict.fromkeys(lineage[:-1]))
-    if not owners:
-        return 0
-
-    # Never nest source locks under the leaf lock; delivery uses source -> leaf
-    # as two separate phases and this preserves the same acyclic order.
-    for owner_sid in owners:
-        async with _runtime_rollover_lock_for(owner_sid):
-            pass
-
-    delivered = 0
-    async with _runtime_rollover_lock_for(leaf_sid):
-        fresh_lineage = await asyncio.to_thread(sess.runtime_lineage, leaf_sid)
-        if not fresh_lineage or fresh_lineage[-1] != leaf_sid:
-            return 0
-        fresh_owners = list(dict.fromkeys(fresh_lineage[:-1]))
-        if not fresh_owners:
-            return 0
-        async with _session_runtime_lock_for(leaf_sid):
-            active = _active_turns.get(leaf_sid)
-            if expected_active is None:
-                if active is not None and not active.done:
-                    return 0
-            elif active is not expected_active:
-                return 0
-
-            while True:
-                ready = [
-                    (owner_sid, event_id)
-                    for owner_sid in fresh_owners
-                    for event_id in _runtime_continuation_outbox_event_ids(
-                        owner_sid)
-                ]
-                if not ready:
-                    return delivered
-                progressed = False
-                for owner_sid, event_id in ready:
-                    outbox = await asyncio.to_thread(
-                        _load_runtime_continuation_outbox,
-                        owner_sid,
-                        event_id,
-                    )
-                    if outbox is None:
-                        # Invalid records are quarantined by the loader, so a
-                        # rescan can make forward progress without busy-looping.
-                        progressed = True
-                        continue
-                    persisted = await asyncio.to_thread(
-                        _persist_runtime_continuation_snapshot,
-                        leaf_sid,
-                        outbox,
-                    )
-                    if not persisted:
-                        # Keep the write-ahead record. Delivery/restart can retry,
-                        # and queue drain will be re-kicked after a later commit.
-                        continue
-                    path = _runtime_continuation_outbox_path(
-                        owner_sid, event_id)
-                    if path is not None:
-                        with suppress(OSError):
-                            path.unlink(missing_ok=True)
-                    delivered += 1
-                    progressed = True
-                if not progressed:
-                    return delivered
-
-
-def _schedule_runtime_continuation_delivery(
-    source_sid: str,
-    event_id: str,
-) -> asyncio.Task | None:
-    key = (source_sid, event_id)
-    existing = _runtime_continuation_delivery_tasks.get(key)
-    if existing is not None and not existing.done():
-        return existing
-    try:
-        task = asyncio.create_task(
-            _deliver_runtime_continuation_outbox(source_sid, event_id))
-    except RuntimeError:
-        return None
-    _runtime_continuation_delivery_tasks[key] = task
-    _maintenance_tasks.add(task)
-
-    def _done(done: asyncio.Task) -> None:
-        if _runtime_continuation_delivery_tasks.get(key) is done:
-            _runtime_continuation_delivery_tasks.pop(key, None)
-        _maintenance_tasks.discard(done)
-        if done.cancelled():
-            return
-        try:
-            done.result()
-        except Exception as exc:
-            sys.stderr.write(
-                f"[chat] runtime continuation delivery failed "
-                f"sid={source_sid[:8]} event={event_id[:8]} "
-                f"exc={type(exc).__name__}\n"
-            )
-            sys.stderr.flush()
-
-    task.add_done_callback(_done)
-    return task
-
+def _schedule_runtime_continuation_delivery(source_sid: str, event_id: str) -> asyncio.Task | None:
+    return chat_overlays._schedule_runtime_continuation_delivery(source_sid, event_id)
 
 async def recover_runtime_continuation_outboxes_at_startup() -> int:
-    """Schedule crash-surviving READY continuations before serving traffic."""
-    entries = await asyncio.to_thread(_runtime_continuation_outbox_entries)
-    scheduled = 0
-    for source_sid, event_id in entries:
-        if _schedule_runtime_continuation_delivery(source_sid, event_id):
-            scheduled += 1
-    return scheduled
-
+    return await chat_overlays.recover_runtime_continuation_outboxes_at_startup()
 
 def _runtime_continuation_projection_state(sid: str) -> tuple[bool, str]:
-    """Return lineage-wide pending state and the visible leaf's UI revision."""
-    lineage = sess.runtime_lineage(sid) or [sid]
-    leaf_sid = lineage[-1]
-    pending = False
-    for owner_sid in lineage[:-1]:
-        if (
-            _session_has_live_watcher(owner_sid)
-            or _session_has_runtime_continuation_outbox(owner_sid)
-        ):
-            pending = True
-            break
-    try:
-        _, revision = _load_cancelled_turn_snapshots(leaf_sid)
-    except Exception:
-        revision = ""
-    return pending, revision
-
+    return chat_overlays._runtime_continuation_projection_state(sid)
 
 def _delete_cancelled_turn_snapshots(sid: str) -> None:
-    directory = _cancelled_turn_session_dir(sid)
-    if directory is None or not directory.exists():
-        return
-    shutil.rmtree(directory, ignore_errors=True)
+    return chat_overlays._delete_cancelled_turn_snapshots(sid)
 
+def _cancelled_snapshot_canonical_span(transcript_path: Path, index: dict, snapshot: dict) -> tuple[list[str], str]:
+    return chat_overlays._cancelled_snapshot_canonical_span(transcript_path, index, snapshot)
 
-def _cancelled_snapshot_canonical_span(
-    transcript_path: Path,
-    index: dict,
-    snapshot: dict,
-) -> tuple[list[str], str]:
-    """Resolve a late JSONL flush back to its interrupted turn.
+def _heal_cancelled_snapshot_from_canonical(sid: str, path: Path, snapshot: dict, transcript_path: Path, index: dict) -> bool:
+    return chat_overlays._heal_cancelled_snapshot_from_canonical(sid, path, snapshot, transcript_path, index)
 
-    A force-stopped CLI can acknowledge the terminal boundary before its
-    AssistantMessage UUID is observable, then append that canonical record
-    several seconds later.  The snapshot's pre-query record coordinate plus
-    the original user-record timestamp identifies that turn without inspecting
-    or logging private message text.  Return all UUIDs in the logical turn and
-    the last assistant UUID that can own its durable footer.
-    """
-    boundary = snapshot.get("transcript_boundary") or {}
-    records = index.get("records") or []
-    try:
-        start = int(boundary.get("record_count"))
-    except (TypeError, ValueError):
-        return [], ""
-    if start < 0 or start >= len(records):
-        return [], ""
+def _load_cancelled_turn_snapshots(sid: str) -> tuple[list[dict], str]:
+    return chat_overlays._load_cancelled_turn_snapshots(sid)
 
-    source = index.get("source") or {}
-    for field, current_field in (
-        ("source_dev", "dev"), ("source_inode", "inode"),
-    ):
-        try:
-            expected = int(boundary.get(field) or 0)
-            current = int(source.get(current_field) or 0)
-        except (TypeError, ValueError):
-            return [], ""
-        if expected and current and expected != current:
-            return [], ""
+def _combined_history_generation(base: str, snapshot_generation: str) -> str:
+    return chat_overlays._combined_history_generation(base, snapshot_generation)
 
-    real_user_ids = [
-        record_i for record_i in range(start, len(records))
-        if records[record_i].get("real_user_prompt")
-    ]
-    if not real_user_ids:
-        return [], ""
-    entries = transcript_idx.read_records(
-        transcript_path, index, real_user_ids)
-    entry_by_uuid = {
-        str(entry.get("uuid") or ""): entry for entry in entries
-    }
-    started_ms = int(snapshot.get("started_at_ms") or 0)
-    interrupted_ms = int(snapshot.get("interrupted_at_ms") or 0)
-    canonical_terminal = bool(snapshot.get("canonical_terminal_published"))
-    terminal_status = str(snapshot.get("terminal_status") or "")
-    origin_i: int | None = None
-    for candidate_position, record_i in enumerate(real_user_ids):
-        record_uuid = str(records[record_i].get("uuid") or "")
-        ts_ms = _transcript_ts_ms(entry_by_uuid.get(record_uuid) or {})
-        if ts_ms is None:
-            # A canonical ResultMessage means this query definitely reached
-            # the transcript even on legacy rows without timestamps.  The
-            # first real prompt after the pre-query boundary is therefore it.
-            # Failed display snapshots are stricter: they may represent a
-            # gateway rejection before the user row was flushed. Treating the
-            # first later legacy/no-timestamp prompt as that failed turn would
-            # hide a legitimate resend and relabel its assistant failed.
-            if (canonical_terminal and candidate_position == 0
-                    and snapshot.get("terminal_status") != "failed"):
-                origin_i = record_i
-            break
-        if started_ms and ts_ms < started_ms - 5_000:
-            continue
-        # Failed snapshots can be created before the rejected user row ever
-        # reaches the transcript. A deliberate retry may happen immediately;
-        # never absorb a timestamped prompt *after* the failure merely because
-        # it arrived inside the normal 250 ms late-flush tolerance. Interrupted
-        # turns still retain that tolerance because their original user row is
-        # known to have entered the live SDK stream.
-        terminal_slack_ms = 0 if terminal_status == "failed" else 250
-        if interrupted_ms and ts_ms <= interrupted_ms + terminal_slack_ms:
-            origin_i = record_i
-            break
-        # A post-interrupt prompt belongs to a resend/new turn.  Never borrow
-        # its assistant merely because the user repeated the exact same text.
-        if interrupted_ms and ts_ms > interrupted_ms + terminal_slack_ms:
-            break
+def _persist_cancelled_turn_snapshot(bc: 'TurnBroadcast') -> bool:
+    return chat_overlays._persist_cancelled_turn_snapshot(bc)
 
-    if origin_i is None:
-        return [], ""
-    origin_uuid = str(records[origin_i].get("uuid") or "")
-    by_uuid = {
-        str(record.get("uuid") or ""): record_i
-        for record_i, record in enumerate(records)
-        if record.get("uuid")
-    }
-    origin_cache: dict[int, str] = {}
+def _cancelled_footer_values(bc: 'TurnBroadcast') -> tuple[int, float]:
+    return chat_overlays._cancelled_footer_values(bc)
 
-    def logical_origin(record_i: int) -> str:
-        cached = origin_cache.get(record_i)
-        if cached is not None:
-            return cached
-        current_i = record_i
-        seen: set[str] = set()
-        result = ""
-        while 0 <= current_i < len(records):
-            current = records[current_i]
-            current_uuid = str(current.get("uuid") or "")
-            if current_uuid in seen:
-                break
-            if current_uuid:
-                seen.add(current_uuid)
-            # A task notification starts a separate headless continuation;
-            # cancelling the launch turn must not relabel that later reaction.
-            if current.get("task_notifications"):
-                break
-            if current.get("real_user_prompt"):
-                result = current_uuid
-                break
-            parent = str(current.get("parent") or "")
-            parent_i = by_uuid.get(parent) if parent else None
-            if parent_i is None:
-                break
-            current_i = parent_i
-        origin_cache[record_i] = result
-        return result
+def _persist_cancelled_footer_annotation_locked(bc: 'TurnBroadcast', now_ms: int, elapsed_s: float) -> bool:
+    return chat_overlays._persist_cancelled_footer_annotation_locked(bc, now_ms, elapsed_s)
 
-    span: list[str] = []
-    tail_assistant_uuid = ""
-    for record_i in range(origin_i, len(records)):
-        if logical_origin(record_i) != origin_uuid:
-            continue
-        record = records[record_i]
-        record_uuid = str(record.get("uuid") or "")
-        if record_uuid:
-            span.append(record_uuid)
-        if (record.get("type") == "assistant"
-                and int(record.get("bubble_count") or 0) > 0):
-            tail_assistant_uuid = record_uuid
-    return span, tail_assistant_uuid
+def _persist_cancelled_turn_snapshot_locked(bc: 'TurnBroadcast') -> bool:
+    return chat_overlays._persist_cancelled_turn_snapshot_locked(bc)
 
+def _persist_failed_turn_snapshot(bc: 'TurnBroadcast', error_text: str, *, terminal_at_ms: int | None=None, elapsed_s: float | None=None, memory_recall: dict | None=None, canonical_terminal_published: bool=False) -> bool:
+    return chat_overlays._persist_failed_turn_snapshot(bc, error_text, terminal_at_ms=terminal_at_ms, elapsed_s=elapsed_s, memory_recall=memory_recall, canonical_terminal_published=canonical_terminal_published)
+
+def _recover_interrupted_turn_snapshot(sid: str) -> bool:
+    return chat_overlays._recover_interrupted_turn_snapshot(sid)
+
+def _interrupted_history_segments(index: dict | None, snapshots: list[dict], order: str) -> tuple[list[dict], int]:
+    return chat_overlays._interrupted_history_segments(index, snapshots, order)
+
+def _interrupted_history_stats(index: dict | None, snapshots: list[dict], order: str) -> tuple[int, int]:
+    return chat_overlays._interrupted_history_stats(index, snapshots, order)
+
+def _interrupted_history_window(transcript_path: Path | None, index: dict | None, snapshots: list[dict], annotations: dict[str, dict], order: str, *, tail: int=0, offset: int=-1, limit: int=0) -> tuple[list[dict], int, int, bool]:
+    return chat_overlays._interrupted_history_window(transcript_path, index, snapshots, annotations, order, tail=tail, offset=offset, limit=limit)
+
+def _interrupted_history_window_around_uuid(transcript_path: Path, index: dict, snapshots: list[dict], annotations: dict[str, dict], uuid_value: str, before: int, after: int, *, limit: int=0) -> tuple[list[dict], int, int, bool] | None:
+    return chat_overlays._interrupted_history_window_around_uuid(transcript_path, index, snapshots, annotations, uuid_value, before, after, limit=limit)
 
 def _turn_uuids_from_boundary(
     sid: str,
@@ -7604,9 +5578,8 @@ def _turn_uuids_from_boundary(
     *,
     started_at_ms: int,
     terminal_at_ms: int,
-    want_image_user: bool,
-) -> tuple[str | None, str | None]:
-    """Resolve only UUIDs owned by the turn after a pre-query boundary.
+) -> tuple[str | None, str | None, bool]:
+    """Resolve current-turn UUIDs and whether canonical inspection succeeded.
 
     A naive "latest assistant" tail scan can return the previous turn when
     the current Gateway failure has only a ResultMessage. Reuse the indexed
@@ -7614,10 +5587,12 @@ def _turn_uuids_from_boundary(
     only when it descends from this turn's real user prompt after the exact
     pre-query record coordinate.
     """
+    if not bool((boundary or {}).get("capture_ok")):
+        return None, None, False
     try:
         indexed = _ensure_transcript_index(sid)
         if indexed is None:
-            return None, None
+            return None, None, True
         transcript_path, index = indexed
         probe = {
             "transcript_boundary": dict(boundary or {}),
@@ -7629,722 +5604,53 @@ def _turn_uuids_from_boundary(
         span, assistant_uuid = _cancelled_snapshot_canonical_span(
             transcript_path, index, probe)
         if not span:
-            return assistant_uuid or None, None
+            return assistant_uuid or None, None, True
         span_set = set(span)
         user_uuid: str | None = None
         for record in index.get("records") or []:
             uid = str(record.get("uuid") or "")
             if uid not in span_set or not record.get("real_user_prompt"):
                 continue
-            if want_image_user and not record.get("has_inline_images"):
-                continue
             user_uuid = uid
             break
-        return assistant_uuid or None, user_uuid
+        return assistant_uuid or None, user_uuid, True
     except Exception as exc:
-        # Annotation enrichment is best-effort. Never fall back to an
-        # unbounded/latest UUID on failure; leaving a footer receipt absent is
-        # safer than mutating a prior turn.
+        # Never fall back to an unbounded/latest UUID. Callers treat absent
+        # evidence as an uncommitted turn, which is safer than publishing a
+        # success that can disappear or mutating a prior turn's annotation.
         sys.stderr.write(
             f"[chat] turn UUID boundary resolve skipped sid={sid[:8]} "
             f"exc={type(exc).__name__}\n")
         sys.stderr.flush()
-        return None, None
+        return None, None, False
 
 
-def _heal_cancelled_snapshot_from_canonical(
+async def _settle_turn_uuids(
     sid: str,
-    path: Path,
-    snapshot: dict,
-    transcript_path: Path,
-    index: dict,
-) -> bool:
-    """Promote a late canonical assistant to the snapshot's terminal truth.
-
-    Until an assistant exists, dynamically hide any duplicate canonical user
-    rows and keep rendering the private snapshot.  An interrupted snapshot can
-    retire once the assistant arrives because its missing truth is only footer
-    metadata.  A failed snapshot also owns a separate terminal error bubble;
-    an arbitrary partial assistant does not prove that bubble was persisted,
-    so the display snapshot must remain authoritative.
-    """
-    span, assistant_uuid = _cancelled_snapshot_canonical_span(
-        transcript_path, index, snapshot)
-    if span:
-        snapshot["hidden_uuids"] = list(dict.fromkeys([
-            *(snapshot.get("hidden_uuids") or []), *span,
-        ]))
-    if not assistant_uuid:
-        return False
-    started_ms = int(snapshot.get("started_at_ms") or 0)
-    terminal_ms = int(
-        snapshot.get("terminal_at_ms")
-        or snapshot.get("interrupted_at_ms")
-        or 0
-    )
-    elapsed_s = round(max(0, terminal_ms - started_ms) / 1000, 1)
-    terminal_status = str(snapshot.get("terminal_status") or "cancelled")
-    try:
-        sess.set_message_annotation(
+    boundary: dict[str, Any],
+    *,
+    started_at_ms: int,
+    terminal_at_ms: int,
+    require_assistant: bool,
+) -> tuple[str | None, str | None, bool]:
+    """Wait briefly for the CLI's canonical JSONL append to become observable."""
+    evidence: tuple[str | None, str | None, bool] = (None, None, False)
+    for delay in (0.0, 0.05, 0.15, 0.3, 0.5):
+        if delay:
+            await asyncio.sleep(delay)
+        evidence = await asyncio.to_thread(
+            _turn_uuids_from_boundary,
             sid,
-            assistant_uuid,
-            model=str(snapshot.get("model") or ""),
-            ts=terminal_ms or None,
-            turn_status=terminal_status,
-            elapsed_s=elapsed_s,
-            memory_recall=snapshot.get("memory_recall") or None,
+            boundary,
+            started_at_ms=started_at_ms,
+            terminal_at_ms=terminal_at_ms,
         )
-    except Exception as exc:
-        sys.stderr.write(
-            f"[chat] late cancelled footer heal failed sid={sid[:8]} "
-            f"exc={type(exc).__name__}\n")
-        return False
-    if terminal_status == "failed":
-        # Keep replacing the whole canonical turn with the display snapshot.
-        # Otherwise a partial AssistantMessage causes the healer to delete the
-        # only durable copy of the terminal error row on the first quiet reload.
-        return False
-
-    # Exact path comes from the already-validated canonical sid/turn snapshot
-    # directory.  Failure to unlink is harmless: subsequent reads resolve and
-    # exclude it again, while the sidecar remains authoritative.
-    with suppress(OSError):
-        path.unlink(missing_ok=True)
-    return True
-
-
-def _load_cancelled_turn_snapshots(sid: str) -> tuple[list[dict], str]:
-    """Load private display-only interrupted-turn snapshots.
-
-    The generation hashes filenames and stat data only; private message text is
-    never copied into an ETag, log line, or other externally observable cache
-    key.
-    """
-    directory = _cancelled_turn_session_dir(sid)
-    if directory is None or not directory.exists():
-        return [], ""
-    loaded: list[tuple[Path, dict]] = []
-    for path in sorted(directory.glob("*.json")):
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-            if not isinstance(data, dict):
-                raise ValueError("snapshot root must be an object")
-            if data.get("schema") != _CANCELLED_TURN_SNAPSHOT_SCHEMA:
-                raise ValueError("unsupported snapshot schema")
-            if data.get("sid") != sid or not isinstance(data.get("messages"), list):
-                raise ValueError("snapshot ownership mismatch")
-            loaded.append((path, data))
-        except Exception as exc:
-            # Never log payloads: a cancelled turn can contain private source,
-            # prompts, or tool output. Filename + exception class is enough for
-            # an operator to find a corrupt local artifact.
-            sys.stderr.write(
-                f"[chat] cancelled snapshot skipped file={path.name} "
-                f"exc={type(exc).__name__}\n")
-    indexed: tuple[Path, dict] | None = None
-    if any((data.get("transcript_boundary") or {}).get("record_count") is not None
-           for _, data in loaded):
-        try:
-            indexed = _ensure_transcript_index(sid)
-        except Exception as exc:
-            sys.stderr.write(
-                f"[chat] cancelled snapshot heal skipped sid={sid[:8]} "
-                f"exc={type(exc).__name__}\n")
-
-    snapshots: list[dict] = []
-    kept_paths: list[Path] = []
-    for path, data in loaded:
-        healed = False
-        if indexed is not None and data.get("transcript_boundary"):
-            try:
-                healed = _heal_cancelled_snapshot_from_canonical(
-                    sid, path, data, indexed[0], indexed[1])
-            except Exception as exc:
-                # Recovery must fail closed to the already-valid private
-                # snapshot; a malformed/temporarily changing transcript must
-                # never turn session history into a 500 response.
-                sys.stderr.write(
-                    f"[chat] cancelled snapshot heal deferred sid={sid[:8]} "
-                    f"exc={type(exc).__name__}\n")
-        if not healed:
-            snapshots.append(data)
-            kept_paths.append(path)
-    snapshots.sort(key=lambda item: (
-        int(item.get("started_at_ms") or 0), str(item.get("turn_id") or "")))
-    digest = hashlib.blake2b(digest_size=12)
-    for path in kept_paths:
-        try:
-            stat = path.stat()
-        except OSError:
-            continue
-        digest.update(path.name.encode("ascii", errors="ignore"))
-        digest.update(f":{stat.st_mtime_ns}:{stat.st_size};".encode("ascii"))
-    return snapshots, digest.hexdigest() if snapshots else ""
-
-
-def _combined_history_generation(base: str, snapshot_generation: str) -> str:
-    if not snapshot_generation:
-        return base
-    return f"{base or 'none'}~cancelled-{snapshot_generation}"
-
-
-def _persist_cancelled_turn_snapshot(bc: "TurnBroadcast") -> bool:
-    """Serialize the pump/watchdog race and persist one stable snapshot."""
-    with bc.cancelled_snapshot_lock:
-        return _persist_cancelled_turn_snapshot_locked(bc)
-
-
-def _cancelled_footer_values(bc: "TurnBroadcast") -> tuple[int, float]:
-    """Return one stable terminal timestamp/duration for an interrupted turn."""
-    now_ms = int(getattr(bc, "cancelled_at_ms", 0) or 0)
-    if now_ms <= 0:
-        now_ms = int(time.time() * 1000)
-        bc.cancelled_at_ms = now_ms
-    elapsed_s = max(0.0, now_ms / 1000.0 - float(bc.started_at or 0))
-    return now_ms, round(elapsed_s, 1)
-
-
-def _persist_cancelled_footer_annotation_locked(
-    bc: "TurnBroadcast", now_ms: int, elapsed_s: float,
-) -> bool:
-    """Persist footer truth even when an interrupted turn reached JSONL late.
-
-    ResultMessage normally owns this annotation.  A forced CLI teardown can
-    still emit and persist an AssistantMessage without ever producing that
-    terminal ResultMessage, which used to leave a refresh with only the raw
-    text.  AssistantMessage already gave us its exact UUID; writing a private
-    sidecar annotation is safe even if the JSONL line itself flushes shortly
-    afterwards.
-    """
-    assistant_uuid = str(getattr(bc, "last_assistant_uuid", "") or "")
-    if not assistant_uuid:
-        return False
-    try:
-        sess.set_message_annotation(
-            bc.session_id,
-            assistant_uuid,
-            model=bc.model,
-            ts=now_ms,
-            turn_status="cancelled",
-            elapsed_s=elapsed_s,
-        )
-        return True
-    except Exception as exc:
-        # No prompt/reply text in logs: UUID ownership + exception class is
-        # enough to diagnose a local sidecar failure without leaking content.
-        sys.stderr.write(
-            f"[chat] cancelled footer annotation failed "
-            f"sid={bc.session_id[:8]} exc={type(exc).__name__}\n")
-        sys.stderr.flush()
-        return False
-
-
-def _persist_cancelled_turn_snapshot_locked(bc: "TurnBroadcast") -> bool:
-    """Atomically persist the browser-visible part of a non-canonical turn."""
-    if bc.cancelled_snapshot_persisted:
-        return True
-    if bc.cancelled_snapshot_suppressed or not bc.cancelled:
-        return False
-    now_ms, elapsed_s = _cancelled_footer_values(bc)
-    annotation_ready = _persist_cancelled_footer_annotation_locked(
-        bc, now_ms, elapsed_s)
-    # ResultMessage made the canonical transcript authoritative.  Do not layer
-    # a duplicate display snapshot over it; the exact UUID annotation above is
-    # the only missing persistence step in this narrow done/interrupt race.
-    if bc.canonical_terminal_published and annotation_ready:
-        return annotation_ready
-    path = _cancelled_turn_snapshot_path(bc.session_id, bc.turn_id)
-    if path is None:
-        return False
-    messages = _broadcast_to_ui_messages(bc)
-    if not messages:
-        return False
-
-    for index, message in enumerate(messages):
-        message["_key"] = f"cancelled:{bc.turn_id}:{index}"
-        message["_interrupted"] = True
-        message["_interrupted_turn_id"] = bc.turn_id
-    for message in reversed(messages):
-        if message.get("role") != "user":
-            message.setdefault("ts", now_ms)
-            if elapsed_s >= 1:
-                message.setdefault("elapsed", elapsed_s)
-            message.setdefault("model", bc.model)
-            message.setdefault("turn_status", "cancelled")
+        assistant_uuid, user_uuid, inspected = evidence
+        if user_uuid and (assistant_uuid or not require_assistant):
             break
-
-    boundary = dict(bc.transcript_boundary or {})
-
-    payload = {
-        "schema": _CANCELLED_TURN_SNAPSHOT_SCHEMA,
-        "sid": bc.session_id,
-        "turn_id": bc.turn_id,
-        "model": bc.model,
-        "started_at_ms": int(float(bc.started_at or 0) * 1000),
-        "interrupted_at_ms": now_ms,
-        "canonical_terminal_published": bool(
-            bc.canonical_terminal_published),
-        "transcript_boundary": {
-            "record_count": int(boundary.get("record_count") or 0),
-            "source_dev": int(boundary.get("source_dev") or 0),
-            "source_inode": int(boundary.get("source_inode") or 0),
-        },
-        "anchors": {
-            "normal": {
-                "uuid": boundary.get("normal_uuid") or "",
-                "total": int(boundary.get("normal_total") or 0),
-            },
-            "full": {
-                "uuid": boundary.get("full_uuid") or "",
-                "total": int(boundary.get("full_total") or 0),
-            },
-        },
-        "hidden_uuids": [],
-        "messages": messages,
-    }
-    try:
-        # Keep the atomic writer's temporary file and the final snapshot in a
-        # session-private directory. Interrupted prompts and tool output must
-        # not be readable by another local account during the rename-sized
-        # window before the final file chmod below.
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with suppress(OSError):
-            path.parent.chmod(0o700)
-        atomic_write_text(
-            path,
-            json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
-            mode=0o600,
-        )
-        with suppress(OSError):
-            path.chmod(0o600)
-    except Exception as exc:
-        sys.stderr.write(
-            f"[chat] cancelled snapshot write failed sid={bc.session_id[:8]} "
-            f"exc={type(exc).__name__}\n")
-        sys.stderr.flush()
-        return False
-
-    # The durable display record is already committed. Metadata is a
-    # self-healing cache (the history endpoint recomputes it), so a failure to
-    # bump the list row must not tell the browser that snapshot persistence
-    # failed and leave the just-rendered pane exposed to an older reload.
-    bc.cancelled_snapshot_persisted = True
-    try:
-        snapshots, _ = _load_cancelled_turn_snapshots(bc.session_id)
-        indexed = _ensure_transcript_index(bc.session_id)
-        index = indexed[1] if indexed is not None else None
-        total, turns = _interrupted_history_stats(index, snapshots, "normal")
-        sess.bump_session(
-            bc.session_id,
-            message_count=total,
-            turn_count=turns,
-            auto_rename_from=bc.user_text,
-        )
-    except Exception as exc:
-        sys.stderr.write(
-            f"[chat] cancelled snapshot metadata sync failed "
-            f"sid={bc.session_id[:8]} "
-            f"exc={type(exc).__name__}\n")
-        sys.stderr.flush()
-    return True
-
-
-def _persist_failed_turn_snapshot(
-    bc: "TurnBroadcast",
-    error_text: str,
-    *,
-    terminal_at_ms: int | None = None,
-    elapsed_s: float | None = None,
-    memory_recall: dict | None = None,
-    canonical_terminal_published: bool = False,
-) -> bool:
-    """Persist a refreshable display record for a terminal turn failure.
-
-    The SDK normally writes an AssistantMessage that can own footer metadata.
-    Some Gateway/API/transport failures emit only a ResultMessage (or no
-    ResultMessage at all). In that shape there is no safe UUID to annotate:
-    choosing the transcript's latest assistant would mutate the previous turn.
-    Even when a legitimate partial assistant exists, it cannot own the separate
-    terminal error bubble shown live. Store the exact browser-visible failure
-    in the same private, display-only snapshot channel used for interrupted
-    turns instead. It is never fed back into model context and historical files
-    remain mode 0600.
-    """
-    with bc.cancelled_snapshot_lock:
-        if bc.failed_snapshot_persisted:
-            return True
-        if bc.cancelled_snapshot_suppressed or bc.cancelled:
-            return False
-        path = _cancelled_turn_snapshot_path(bc.session_id, bc.turn_id)
-        if path is None:
-            return False
-
-        now_ms = int(terminal_at_ms or time.time() * 1000)
-        duration = (
-            max(0.0, float(elapsed_s))
-            if elapsed_s is not None
-            else max(0.0, now_ms / 1000.0 - float(bc.started_at or 0))
-        )
-        duration = round(duration, 1)
-        visible_error = str(error_text or "Turn failed without an assistant response.")
-        messages = _broadcast_to_ui_messages(bc)
-
-        # Match the live UI: retain any legitimate partial answer, then show
-        # the terminal failure as its own assistant row. Avoid a duplicate if
-        # the provider already streamed the exact same text before dying.
-        last_assistant = next(
-            (message for message in reversed(messages)
-             if message.get("role") == "assistant"),
-            None,
-        )
-        if not last_assistant or str(last_assistant.get("text") or "") != visible_error:
-            messages.append({
-                "role": "assistant",
-                "text": visible_error,
-                "model": bc.model,
-                "error": visible_error,
-            })
-        if not messages:
-            return False
-
-        for index, message in enumerate(messages):
-            message["_key"] = f"failed:{bc.turn_id}:{index}"
-            message["_terminalTurnId"] = bc.turn_id
-            if message.get("role") == "user":
-                message["_failed"] = True
-                message["_error_text"] = visible_error
-        for message in reversed(messages):
-            if message.get("role") == "user":
-                continue
-            message.setdefault("ts", now_ms)
-            if duration >= 1:
-                message.setdefault("elapsed", duration)
-            message.setdefault("model", bc.model)
-            message.setdefault("turn_status", "failed")
-            if memory_recall:
-                message.setdefault("memoryRecall", memory_recall)
+        if not inspected and not bool((boundary or {}).get("capture_ok")):
             break
-
-        boundary = dict(bc.transcript_boundary or {})
-        payload = {
-            "schema": _CANCELLED_TURN_SNAPSHOT_SCHEMA,
-            "sid": bc.session_id,
-            "turn_id": bc.turn_id,
-            "model": bc.model,
-            "terminal_status": "failed",
-            "started_at_ms": int(float(bc.started_at or 0) * 1000),
-            "terminal_at_ms": now_ms,
-            # Retain this legacy coordinate so the existing canonical-span
-            # resolver can safely pair/hide the just-written user JSONL row.
-            "interrupted_at_ms": now_ms,
-            "canonical_terminal_published": bool(
-                canonical_terminal_published),
-            "memory_recall": memory_recall,
-            "transcript_boundary": {
-                "record_count": int(boundary.get("record_count") or 0),
-                "source_dev": int(boundary.get("source_dev") or 0),
-                "source_inode": int(boundary.get("source_inode") or 0),
-            },
-            "anchors": {
-                "normal": {
-                    "uuid": boundary.get("normal_uuid") or "",
-                    "total": int(boundary.get("normal_total") or 0),
-                },
-                "full": {
-                    "uuid": boundary.get("full_uuid") or "",
-                    "total": int(boundary.get("full_total") or 0),
-                },
-            },
-            "hidden_uuids": [],
-            "messages": messages,
-        }
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            with suppress(OSError):
-                path.parent.chmod(0o700)
-            atomic_write_text(
-                path,
-                json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
-                mode=0o600,
-            )
-            with suppress(OSError):
-                path.chmod(0o600)
-        except Exception as exc:
-            sys.stderr.write(
-                f"[chat] failed snapshot write failed sid={bc.session_id[:8]} "
-                f"exc={type(exc).__name__}\n")
-            sys.stderr.flush()
-            return False
-
-        bc.failed_snapshot_persisted = True
-        try:
-            snapshots, _ = _load_cancelled_turn_snapshots(bc.session_id)
-            indexed = _ensure_transcript_index(bc.session_id)
-            index = indexed[1] if indexed is not None else None
-            total, turns = _interrupted_history_stats(index, snapshots, "normal")
-            sess.bump_session(
-                bc.session_id,
-                message_count=total,
-                turn_count=turns,
-                auto_rename_from=bc.user_text,
-            )
-        except Exception as exc:
-            sys.stderr.write(
-                f"[chat] failed snapshot metadata sync failed "
-                f"sid={bc.session_id[:8]} exc={type(exc).__name__}\n")
-            sys.stderr.flush()
-        return True
-
-
-def _interrupted_history_segments(
-    index: dict | None,
-    snapshots: list[dict],
-    order: str,
-) -> tuple[list[dict], int]:
-    """Build a virtual bubble stream of canonical records + snapshots."""
-    records = (index or {}).get("records") or []
-    orders = (index or {}).get("orders") or {}
-    record_ids = list(orders.get(order) or [])
-    positions: dict[str, int] = {}
-    for position, record_id in enumerate(record_ids):
-        uid = str(records[record_id].get("uuid") or "")
-        if uid:
-            positions[uid] = position
-    full_uuids = {
-        str(records[record_id].get("uuid") or "")
-        for record_id in orders.get("full") or []
-    }
-    prefix = ((index or {}).get("bubble_prefix") or {}).get(order) or [0]
-
-    placed: dict[int, list[dict]] = {}
-    included: list[dict] = []
-    for snapshot in snapshots:
-        anchors = snapshot.get("anchors") or {}
-        anchor = anchors.get(order) or {}
-        anchor_uuid = str(anchor.get("uuid") or "")
-        if anchor_uuid and anchor_uuid in positions:
-            position = positions[anchor_uuid]
-        elif order == "normal" and anchor_uuid and anchor_uuid in full_uuids:
-            # The interrupted turn sits before the current compact/fork root.
-            # Keep it in full-history mode but do not punch it back into the
-            # normal post-compact view.
-            continue
-        else:
-            target = max(0, int(anchor.get("total") or 0))
-            position = -1
-            for pos in range(len(record_ids)):
-                reached = int(prefix[pos + 1] if pos + 1 < len(prefix) else 0)
-                if reached > target:
-                    break
-                position = pos
-        placed.setdefault(position, []).append(snapshot)
-        included.append(snapshot)
-
-    for group in placed.values():
-        group.sort(key=lambda item: (
-            int(item.get("started_at_ms") or 0), str(item.get("turn_id") or "")))
-
-    hidden = {
-        str(uid)
-        for snapshot in included
-        for uid in (snapshot.get("hidden_uuids") or [])
-        if uid
-    }
-    segments: list[dict] = []
-
-    def append_snapshots(position: int) -> None:
-        for snapshot in placed.get(position, []):
-            messages = snapshot.get("messages") or []
-            if messages:
-                segments.append({
-                    "kind": "snapshot",
-                    "snapshot": snapshot,
-                    "count": len(messages),
-                })
-
-    append_snapshots(-1)
-    for position, record_id in enumerate(record_ids):
-        record = records[record_id]
-        if str(record.get("uuid") or "") not in hidden:
-            count = max(0, int(record.get("bubble_count") or 0))
-            if count:
-                segments.append({
-                    "kind": "record",
-                    "record_id": record_id,
-                    "count": count,
-                })
-        append_snapshots(position)
-    snapshot_turns = sum(
-        1
-        for snapshot in included
-        if any(
-            isinstance(message, dict) and message.get("role") == "user"
-            for message in (snapshot.get("messages") or [])
-        )
-    )
-    return segments, snapshot_turns
-
-
-def _interrupted_history_stats(
-    index: dict | None,
-    snapshots: list[dict],
-    order: str,
-) -> tuple[int, int]:
-    segments, snapshot_turns = _interrupted_history_segments(
-        index, snapshots, order)
-    total = sum(int(segment.get("count") or 0) for segment in segments)
-    records = (index or {}).get("records") or []
-    canonical_turns = sum(
-        1
-        for segment in segments
-        if segment.get("kind") == "record"
-        and records[segment["record_id"]].get("real_user_prompt")
-    )
-    return total, canonical_turns + snapshot_turns
-
-
-def _interrupted_history_window(
-    transcript_path: Path | None,
-    index: dict | None,
-    snapshots: list[dict],
-    annotations: dict[str, dict],
-    order: str,
-    *,
-    tail: int = 0,
-    offset: int = -1,
-    limit: int = 0,
-) -> tuple[list[dict], int, int, bool]:
-    """Read one window from the virtual display history.
-
-    Only canonical records that intersect the requested display window are
-    read from JSONL.  A session with a cancelled snapshot therefore retains
-    the existing long-history/windowing protections instead of falling back to
-    a full transcript parse on every open.
-    """
-    segments, _ = _interrupted_history_segments(index, snapshots, order)
-    total = sum(int(segment.get("count") or 0) for segment in segments)
-    if offset >= 0:
-        start = max(0, min(offset, total))
-        end = total if limit <= 0 else min(total, start + limit)
-    elif tail > 0:
-        start = max(0, total - tail)
-        end = total
-    else:
-        start, end = 0, total
-
-    pieces: list[tuple[str, Any, int, int]] = []
-    selected_record_ids: list[int] = []
-    cursor = 0
-    for segment in segments:
-        count = int(segment.get("count") or 0)
-        seg_start, seg_end = cursor, cursor + count
-        cursor = seg_end
-        overlap_start = max(start, seg_start)
-        overlap_end = min(end, seg_end)
-        if overlap_start >= overlap_end:
-            continue
-        local_start = overlap_start - seg_start
-        local_end = overlap_end - seg_start
-        if segment["kind"] == "record":
-            record_id = int(segment["record_id"])
-            selected_record_ids.append(record_id)
-            pieces.append(("record", record_id, local_start, local_end))
-        else:
-            pieces.append((
-                "snapshot", segment["snapshot"], local_start, local_end))
-
-    shaped_by_record: dict[int, list[dict]] = {}
-    if transcript_path is not None and index is not None and selected_record_ids:
-        shaped = _indexed_ui_records(
-            transcript_path, index, selected_record_ids, annotations)
-        shaped_cursor = 0
-        records = index.get("records") or []
-        for record_id in selected_record_ids:
-            count = max(0, int(records[record_id].get("bubble_count") or 0))
-            shaped_by_record[record_id] = shaped[
-                shaped_cursor:shaped_cursor + count]
-            shaped_cursor += count
-
-    window: list[dict] = []
-    for kind, source, local_start, local_end in pieces:
-        if kind == "record":
-            messages = shaped_by_record.get(int(source), [])
-        else:
-            started_at_ms = int(source.get("started_at_ms") or 0)
-            turn_id = str(source.get("turn_id") or "")
-            messages = [dict(message)
-                        for message in (source.get("messages") or [])]
-            for message in messages:
-                if turn_id:
-                    message.setdefault(
-                        "_turn_origin_uuid", f"terminal:{turn_id}")
-                if started_at_ms > 0:
-                    message.setdefault("turn_started_at", started_at_ms)
-        window.extend(messages[local_start:local_end])
-    return window, total, start, end < total
-
-
-def _interrupted_history_window_around_uuid(
-    transcript_path: Path,
-    index: dict,
-    snapshots: list[dict],
-    annotations: dict[str, dict],
-    uuid_value: str,
-    before: int,
-    after: int,
-    *,
-    limit: int = 0,
-) -> tuple[list[dict], int, int, bool] | None:
-    """Read an around-UUID window in the same virtual coordinates as paging."""
-    segments, _ = _interrupted_history_segments(index, snapshots, "full")
-    records = index.get("records") or []
-    total = sum(int(segment.get("count") or 0) for segment in segments)
-    cursor = 0
-    target_start = -1
-    target_end = -1
-    for segment in segments:
-        count = max(0, int(segment.get("count") or 0))
-        if segment.get("kind") == "record":
-            record_id = int(segment.get("record_id") or 0)
-            if (
-                0 <= record_id < len(records)
-                and str(records[record_id].get("uuid") or "") == uuid_value
-            ):
-                target_start = cursor
-                target_end = cursor + count
-                break
-        cursor += count
-    if target_start < 0 or target_end <= target_start:
-        return None
-
-    if limit > 0:
-        span = min(limit, target_end - target_start)
-        context = max(0, limit - span)
-        before_budget = context // 2
-        after_budget = context - before_budget
-        start = max(0, target_start - before_budget)
-        end = min(total, target_start + span + after_budget)
-        if end - start < limit:
-            start = max(0, end - limit)
-            end = min(total, start + limit)
-        if not (start <= target_start < end):
-            start = max(0, min(target_start, total - limit))
-            end = min(total, start + limit)
-    else:
-        start = max(0, target_start - max(0, before))
-        end = min(total, target_end + max(0, after))
-
-    window, _total, win_offset, has_later = _interrupted_history_window(
-        transcript_path,
-        index,
-        snapshots,
-        annotations,
-        "full",
-        offset=start,
-        limit=end - start,
-    )
-    return window, _total, win_offset, has_later
-
+    return evidence
 
 @router.get("/sessions/{sid}/export", dependencies=[Depends(require_token_query)])
 def export_session_markdown(sid: str) -> Response:
@@ -9692,7 +6998,13 @@ async def session_usage(session_id: str, model: str = "") -> dict:
     ClaudeSDKClient.get_context_usage() against the live session."""
     u = _session_usage.get(session_id)
     if u is None:
-        rebuilt = _session_usage_from_jsonl(session_id)
+        rebuilt = await obs.to_thread_io(
+            "chat.usage_hydrate",
+            session_id,
+            _session_usage_from_jsonl,
+            session_id,
+            file_path=lambda: _find_session_jsonl(session_id),
+        )
         if rebuilt is not None:
             # Populate the cache so subsequent polls don't re-walk JSONL.
             _session_usage[session_id] = rebuilt
@@ -10168,18 +7480,31 @@ def _sdk_assistant_error(msg: Any) -> dict | None:
 
 
 def _sdk_system_error(msg: Any) -> dict | None:
-    """Recognize slash-command failures encoded as local SystemMessage rows.
+    """Recognize terminal failures carried only by a SystemMessage.
 
-    Claude CLI can finish `/compact` with a nominally successful ResultMessage
-    while putting the actual Gateway/API failure only in a generic
-    `system/local_command` message. Ignore normal local-command prose; promote
-    only text that our public stream classifier already recognizes as an API,
-    auth, quota, model-route, network, or context failure.
+    ``preventContinuation`` means the CLI rejected the user prompt before it
+    entered the canonical transcript.  A later nominally successful
+    ResultMessage is only the hook operation finishing; it must not turn that
+    rejected prompt into a completed chat turn.
+
+    Slash commands have a second legacy shape: the CLI can finish `/compact`
+    with a successful ResultMessage while putting the actual Gateway/API failure
+    only in ``system/local_command``.  Normal local-command prose remains
+    non-terminal.
     """
-    if not isinstance(msg, SystemMessage) or msg.subtype != "local_command":
+    if not isinstance(msg, SystemMessage):
         return None
     data = msg.data if isinstance(msg.data, dict) else {}
-    text = str(data.get("content") or "").strip()
+    prevented = data.get("preventContinuation") is True
+    if not prevented and msg.subtype != "local_command":
+        return None
+    text = str(data.get("content") or data.get("error") or "").strip()
+    if prevented:
+        return {
+            "message": text or "User prompt was rejected before it was committed.",
+            "source": "system_prevent_continuation",
+            "api_error_status": None,
+        }
     if not text:
         return None
     classified = _classify_stream_error(text)
@@ -10287,6 +7612,24 @@ def _context_recovery_inputs(
     return used, limit
 
 
+def _commit_fork_lifecycle(
+    source_sid: str,
+    source_meta: dict[str, Any],
+    *,
+    fork_child: Callable[[], Any] | None,
+    register_kwargs: dict[str, Any],
+    successor: bool,
+    copy_runtime_overlays: bool = False,
+) -> dict[str, Any]:
+    return chat_successor.commit_fork_lifecycle(
+        source_sid,
+        source_meta,
+        fork_child=fork_child,
+        register_kwargs=register_kwargs,
+        successor=successor,
+        copy_runtime_overlays=copy_runtime_overlays,
+    )
+
 def _create_context_recovery_session(
     source_sid: str,
     model: str,
@@ -10311,7 +7654,7 @@ def _create_context_recovery_session(
     if source_meta is None:
         raise context_recovery.ContextRecoveryError("source session is unavailable")
     source_path = _find_session_jsonl(source_sid)
-    if source_path is None:
+    if source_path is None and not source_meta.get("runtime_successor"):
         raise context_recovery.ContextRecoveryError("source transcript is unavailable")
 
     source_model = (source_meta.get("model") or model or MODEL).strip()
@@ -10320,63 +7663,70 @@ def _create_context_recovery_session(
     recovery_name = f"{source_name} · {suffix}"
     workspace = sess.session_workspace(source_sid)
 
-    with _session_config_dir(source_model):
-        result = context_recovery.create_recovery_fork(
-            source_sid,
-            source_path,
-            workspace,
-            title=recovery_name,
-            pre_tokens=pre_tokens,
-            model_config_context=context_limit or None,
-        )
+    def _fork_recovery():
+        if source_path is None:
+            raise context_recovery.ContextRecoveryError(
+                "source transcript is unavailable")
+        with _session_config_dir(source_model):
+            return context_recovery.create_recovery_fork(
+                source_sid,
+                source_path,
+                workspace,
+                title=recovery_name,
+                pre_tokens=pre_tokens,
+                model_config_context=context_limit or None,
+            )
 
-    try:
-        meta = sess.register_session(
-            result.session_id,
-            name=recovery_name,
-            model=source_model,
-            permission=source_meta.get("permission") or "",
-            plan_return_permission=source_meta.get("plan_return_permission"),
-            auto_named=False,
-            # The active SDK chain contains the compact summary.  Full-history
+    lifecycle = _commit_fork_lifecycle(
+        source_sid,
+        source_meta,
+        fork_child=_fork_recovery,
+        register_kwargs={
+            "name": recovery_name,
+            "model": source_model,
+            "permission": source_meta.get("permission") or "",
+            "plan_return_permission": source_meta.get("plan_return_permission"),
+            "auto_named": False,
+            # The active SDK chain contains the compact summary. Full-history
             # mode can still read the copied records behind its boundary.
-            message_count=1,
-            turn_count=0,
-            effort=_normalize_effort(source_meta.get("effort")),
-            service_tier=source_meta.get("service_tier") or "",
-            thinking=source_meta.get("thinking") is not False,
-            forked_from=source_sid,
-            forked_from_name=source_name,
-            activity_hidden=bool(source_meta.get("activity_hidden", False)),
-            runtime_profile=source_meta.get("runtime_profile") or "",
-            cwd=source_meta.get("cwd") or str(workspace),
-        )
-    except Exception:
-        # register_session normally has no partial failure, but storage errors
-        # must not leave an unindexed recovery transcript behind.
-        try:
-            with _session_config_dir(source_model):
-                sdk_delete_session(result.session_id, directory=str(workspace))
-        except Exception:
-            result.path.unlink(missing_ok=True)
-        raise
-
-    _JSONL_PATH_CACHE[result.session_id] = result.path
+            "message_count": 1,
+            "turn_count": 0,
+            "effort": _normalize_effort(source_meta.get("effort")),
+            "service_tier": source_meta.get("service_tier") or "",
+            "thinking": source_meta.get("thinking") is not False,
+            "forked_from": source_sid,
+            "forked_from_name": source_name,
+            "activity_hidden": bool(source_meta.get("activity_hidden", False)),
+            "runtime_profile": source_meta.get("runtime_profile") or "",
+            "runtime_predecessor": source_sid,
+            "cwd": source_meta.get("cwd") or str(workspace),
+        },
+        successor=True,
+    )
+    child_sid = str(lifecycle["child_sid"])
+    result = lifecycle.get("forked")
+    if result is not None:
+        _JSONL_PATH_CACHE[child_sid] = result.path
     if context_limit:
         try:
-            sess.set_session_ctx_window(result.session_id, context_limit)
+            sess.set_session_ctx_window(child_sid, context_limit)
         except Exception:
             pass
-    _session_usage[result.session_id] = {
+    estimated_post_tokens = (
+        result.stats.estimated_post_tokens
+        if result is not None else int(
+            (_session_usage.get(child_sid) or {}).get("context_used") or 0)
+    )
+    _session_usage[child_sid] = {
         "input_tokens": 0,
         "output_tokens": 0,
         "cache_read_tokens": 0,
         "cache_creation_tokens": 0,
         "total_cost_usd": 0.0,
         "last_turn_at": 0.0,
-        "context_used": result.stats.estimated_post_tokens,
+        "context_used": estimated_post_tokens,
         "context_used_pct": (
-            round(result.stats.estimated_post_tokens / context_limit * 100, 1)
+            round(estimated_post_tokens / context_limit * 100, 1)
             if context_limit else 0.0
         ),
         "context_limit": context_limit,
@@ -10384,16 +7734,22 @@ def _create_context_recovery_session(
         "context_used_is_estimate": True,
         "context_is_estimate": True,
     }
-    public_meta = {**meta, "session_id": result.session_id}
-    return {
-        "session": public_meta,
-        "stats": {
+    public_meta = {**lifecycle["child_meta"], "session_id": child_sid}
+    stats = (
+        {
             "included_messages": result.stats.included_messages,
             "omitted_messages": result.stats.omitted_messages,
             "truncated_messages": result.stats.truncated_messages,
-            "estimated_post_tokens": result.stats.estimated_post_tokens,
-        },
-    }
+            "estimated_post_tokens": estimated_post_tokens,
+        }
+        if result is not None else {
+            "included_messages": 0,
+            "omitted_messages": 0,
+            "truncated_messages": 0,
+            "estimated_post_tokens": estimated_post_tokens,
+        }
+    )
+    return {"session": public_meta, "stats": stats}
 
 
 async def _recover_context_session(
@@ -10935,604 +8291,51 @@ class ForkReq(BaseModel):
 
 @router.post("/sessions/{sid}/fork", dependencies=[Depends(require_token)])
 def fork_session_api(sid: str, req: ForkReq) -> dict:
-    """Branch a session at an arbitrary persisted message boundary.
-
-    The SDK copies the JSONL into a fresh session and remaps its UUID chain.
-    muselab adds UI lineage plus the source session's runtime preferences.
-    Message editing remains a separate "reuse text and resend" interaction;
-    it does not call this endpoint.
-    """
-    src_meta = sess.get_session_meta(sid)
-    if src_meta is None:
-        raise HTTPException(404, "session not found")
-    active = _active_turns.get(sid)
-    if active is not None and not active.done:
-        raise HTTPException(409, "cannot fork while a turn is active")
-    # A detached background task belongs to the source CLI process, not to
-    # the JSONL transcript. Forking here is therefore a point-in-time snapshot:
-    # the fork receives every complete record persisted when the SDK reads the
-    # file, while the process and its eventual continuation stay in the source
-    # session. The SDK reads the source bytes once and its JSONL parser ignores
-    # an incomplete final append, so this does not clone a half-written record.
-    # Keep the stricter active-turn guard above: ordinary token/tool streaming
-    # writes continuously and does not yet have a clean user-visible boundary.
-    background_tasks_pending = len(
-        _sessions_with_inflight_tasks.get(sid, ())
-    )
-    source_model = (src_meta.get("model") or MODEL).strip()
-    source_name = (src_meta.get("name") or "会话").strip()
-    requested_title = (req.title or "").strip()
-    new_name = requested_title or (
-        f"{source_name} · {'分支' if is_chinese_locale() else 'Fork'}"
-    )
-    forked_count = (
-        0
-        if req.up_to_message_id
-        else int(src_meta.get("message_count") or 0)
-    )
-    forked_turns = (
-        0
-        if req.up_to_message_id
-        else int(src_meta.get("turn_count") or 0)
-    )
-    try:
-        with _session_config_dir(source_model):
-            result = sdk_fork_session(
-                sid,
-                directory=str(sess.session_workspace(sid)),
-                up_to_message_id=req.up_to_message_id,
-                title=new_name,
-            )
-    except FileNotFoundError:
-        raise HTTPException(404, "source transcript not found")
-    except ValueError as e:
-        raise HTTPException(400, str(e))
-    except Exception as e:
-        sys.stderr.write(
-            f"[chat] fork session failed sid={sid[:8]} "
-            f"exc={type(e).__name__}\n")
-        sys.stderr.flush()
-        raise HTTPException(500, "fork failed — see server log") from None
-    new_sid = result.session_id
-    meta = sess.register_session(
-        new_sid,
-        name=new_name,
-        model=src_meta.get("model") or MODEL,
-        permission=src_meta.get("permission") or "",
-        plan_return_permission=src_meta.get("plan_return_permission"),
-        auto_named=False,
-        message_count=forked_count,
-        turn_count=forked_turns,
-        effort=_normalize_effort(src_meta.get("effort")),
-        service_tier=src_meta.get("service_tier") or "",
-        thinking=src_meta.get("thinking") is not False,
-        forked_from=sid,
-        forked_from_name=source_name,
-        forked_from_message_id=req.up_to_message_id or "",
+    return chat_successor.fork_session(
+        sid,
+        up_to_message_id=req.up_to_message_id,
+        title=req.title,
         activity_hidden=req.activity_hidden,
         runtime_profile=req.runtime_profile,
-        cwd=src_meta.get("cwd") or str(ROOT),
     )
-    return {
-        **meta,
-        "session_id": new_sid,
-        "source_background_tasks_pending": background_tasks_pending,
-    }
 
 
 def _runtime_fork_uuid_mapping(child_sid: str) -> dict[str, str]:
-    """Read the SDK fork's explicit old->new UUID backlinks."""
-    path = _find_session_jsonl(child_sid)
-    if path is None:
-        return {}
-    mapping: dict[str, str] = {}
-    try:
-        with path.open("r", encoding="utf-8", errors="replace") as handle:
-            for line in handle:
-                try:
-                    entry = json.loads(line)
-                except (json.JSONDecodeError, ValueError):
-                    continue
-                origin = entry.get("forkedFrom") or {}
-                old_uuid = str(origin.get("messageUuid") or "")
-                new_uuid = str(entry.get("uuid") or "")
-                if old_uuid and new_uuid:
-                    mapping[old_uuid] = new_uuid
-    except OSError:
-        return {}
-    return mapping
+    return chat_successor.runtime_fork_uuid_mapping(child_sid)
 
 
 def _sync_runtime_successor_postlude(source_sid: str) -> dict[str, int]:
-    """Propagate late turn metadata through every runtime successor.
-
-    A detached rollover may be committed as soon as the canonical ``done``
-    event is visible, while the source pump is still finishing transcript
-    parsing, attachment/footer annotations, and its first-turn auto-name.  The
-    initial fork copy cannot see those later writes.  Re-copy each fork-visible
-    annotation edge-by-edge so UUIDs are translated at every generation, and
-    carry the final display name while a successor still has the title it
-    inherited at fork time.  A user-renamed successor is therefore a deliberate
-    boundary for name propagation, but not for annotation propagation.
-    """
-    source_meta = sess.get_session_meta(source_sid)
-    if source_meta is None:
-        return {"annotations": 0, "renamed": 0}
-    desired_name = str(source_meta.get("name") or "").strip()
-    current_sid = source_sid
-    propagate_name = bool(desired_name)
-    seen: set[str] = set()
-    copied = 0
-    renamed = 0
-    for _ in range(32):
-        if not current_sid or current_sid in seen:
-            break
-        seen.add(current_sid)
-        try:
-            current_meta = sess.get_session_meta(current_sid) or {}
-        except Exception as exc:
-            sys.stderr.write(
-                f"[chat] runtime postlude lineage read failed "
-                f"sid={current_sid[:8]} exc={type(exc).__name__}\n")
-            break
-        child_sid = str(current_meta.get("runtime_successor") or "")
-        if not child_sid or child_sid in seen:
-            break
-        try:
-            child_meta = sess.get_session_meta(child_sid)
-        except Exception as exc:
-            sys.stderr.write(
-                f"[chat] runtime postlude child read failed "
-                f"sid={child_sid[:8]} exc={type(exc).__name__}\n")
-            break
-        if child_meta is None:
-            break
-        try:
-            uuid_mapping = _runtime_fork_uuid_mapping(child_sid)
-            copied += sess.copy_message_annotations(
-                current_sid, child_sid, uuid_mapping)
-            # UI-only continuation bubbles are deliberately absent from the
-            # Claude JSONL fork.  Carry them across explicitly so a later
-            # rollover does not make an already-visible Agent reply disappear;
-            # their anchors are translated through the same per-edge UUID map.
-            _copy_runtime_continuation_snapshots(
-                current_sid, child_sid, uuid_mapping)
-        except Exception as exc:
-            sys.stderr.write(
-                f"[chat] runtime display postlude sync failed "
-                f"sid={current_sid[:8]} child={child_sid[:8]} "
-                f"exc={type(exc).__name__}\n"
-            )
-
-        if propagate_name:
-            try:
-                with _session_title_lock(child_sid):
-                    # Re-read under the same lock used by PATCH /sessions. A
-                    # user rename that won before this point is a hard boundary
-                    # and is never overwritten by late automatic propagation.
-                    fresh_child = sess.get_session_meta(child_sid) or child_meta
-                    child_name = str(fresh_child.get("name") or "").strip()
-                    inherited_name = str(
-                        fresh_child.get("forked_from_name") or "").strip()
-                    if child_name not in {desired_name, inherited_name}:
-                        propagate_name = False
-                    elif child_name != desired_name:
-                        child_model = str(
-                            fresh_child.get("model") or MODEL).strip()
-                        try:
-                            with _session_config_dir(child_model):
-                                sdk_rename_session(
-                                    child_sid,
-                                    desired_name,
-                                    directory=str(
-                                        sess.session_workspace(child_sid)),
-                                )
-                        except (FileNotFoundError, ValueError):
-                            # The index remains authoritative until an SDK
-                            # transcript exists.
-                            pass
-                        if sess.rename_session(child_sid, desired_name):
-                            renamed += 1
-            except Exception as exc:
-                # Presentation reconciliation must never roll back a valid
-                # runtime successor or skip the source turn's later cleanup.
-                sys.stderr.write(
-                    f"[chat] runtime title postlude sync failed "
-                    f"sid={child_sid[:8]} exc={type(exc).__name__}\n"
-                )
-        current_sid = child_sid
-    return {"annotations": copied, "renamed": renamed}
+    return chat_successor.sync_runtime_successor_postlude(source_sid)
 
 
 def _runtime_fork_boundary(sid: str, meta: dict) -> str:
-    # Never guess from the latest assistant: with multiple background tasks an
-    # earlier task may already have appended a source-only auto-continuation
-    # while a sibling remains pending. Forking that tail would leak old runtime
-    # text into the interactive successor.
-    return str(meta.get("runtime_boundary_message_id") or "")
+    return chat_successor.runtime_fork_boundary(sid, meta)
 
 
 def _backfill_runtime_task_overlays(source_sid: str) -> None:
-    """Recover running-card ownership for sessions predating rollover state."""
-    pending = set(_sessions_with_inflight_tasks.get(source_sid, ()))
-    if not pending:
-        return
-    meta = sess.get_session_meta(source_sid) or {}
-    try:
-        messages = _shaped_ui_messages(
-            source_sid, str(meta.get("model") or MODEL), True)
-    except Exception:
-        messages = []
-    for message in messages:
-        if message.get("role") != "tool_result":
-            continue
-        launch = _parse_bg_launch(str(message.get("text") or ""))
-        if not launch or launch.get("task_id") not in pending:
-            continue
-        _record_background_task_launch(
-            source_sid,
-            str(launch["task_id"]),
-            tool_use_id=str(message.get("id") or ""),
-            output_file=launch.get("output_file"),
-        )
-    # Agent tasks do not have the Bash launch string, but live starts retained
-    # their tool id/description in memory. Ensure every pin has an owner row.
-    for task_id in pending:
-        if task_id not in sess.get_runtime_task_overlays(source_sid):
-            _record_background_task_launch(
-                source_sid,
-                task_id,
-                tool_use_id=_bg_task_tool_use_ids.get(task_id),
-                description=_bg_task_descriptions.get(task_id),
-            )
+    return chat_successor.backfill_runtime_task_overlays(source_sid)
 
 
 async def _continue_detached_runtime_locked(source_sid: str) -> dict:
-    """Commit one rollover; caller must hold the per-source lock."""
-    source_meta = await asyncio.to_thread(sess.get_session_meta, source_sid)
-    if source_meta is None:
-        raise HTTPException(404, "session not found")
-    if sess.session_is_deleting(source_sid):
-        raise HTTPException(409, "session is being deleted")
-    existing_sid = str(source_meta.get("runtime_successor") or "")
-    if existing_sid:
-        # Idempotent retries also self-heal a successor created in the
-        # canonical-done/postlude window (or by an older process version).
-        await asyncio.to_thread(
-            _sync_runtime_successor_postlude, source_sid)
-        child_meta = await asyncio.to_thread(sess.get_session_meta, existing_sid)
-        if child_meta is None:
-            raise HTTPException(409, "runtime successor is unavailable")
-        try:
-            queue_move = await asyncio.to_thread(
-                sess.migrate_queue, source_sid, existing_sid)
-        except ValueError as exc:
-            raise HTTPException(409, str(exc)) from None
-        if queue_move["target"].get("items"):
-            _schedule_queue_drain(existing_sid)
-        inherited_overlays = await asyncio.to_thread(
-            sess.get_runtime_task_overlays, existing_sid)
-        return {
-            **child_meta,
-            "session_id": existing_sid,
-            "source_session_id": source_sid,
-            "owner_session_id": source_sid,
-            "inherited_background_tasks_pending": sum(
-                1 for overlay in inherited_overlays.values()
-                if overlay.get("state") == "running"),
-            "queue_migrated": queue_move["migrated"],
-            "queue_pending": len(queue_move["target"].get("items") or []),
-            "reused": True,
-        }
-
-    active = _active_turns.get(source_sid)
-    if (active is not None and not active.done
-            and not getattr(active, "is_continuation", False)
-            and not getattr(
-                active, "canonical_terminal_published", False)):
-        raise HTTPException(409, "cannot continue while a turn is active")
-    background_pending = len(
-        _sessions_with_inflight_tasks.get(source_sid, ()))
-    if not background_pending and not _session_has_live_watcher(source_sid):
-        return {
-            **source_meta,
-            "session_id": source_sid,
-            "source_session_id": source_sid,
-            "owner_session_id": source_sid,
-            "inherited_background_tasks_pending": 0,
-            "queue_migrated": 0,
-            "reused": True,
-        }
-
-    boundary = await asyncio.to_thread(
-        _runtime_fork_boundary, source_sid, source_meta)
-    if not boundary:
-        raise HTTPException(409, "background turn boundary is unavailable")
-    await asyncio.to_thread(_backfill_runtime_task_overlays, source_sid)
-    if sess.session_is_deleting(source_sid):
-        raise HTTPException(409, "session is being deleted")
-    source_model = str(source_meta.get("model") or MODEL).strip()
-    source_name = str(source_meta.get("name") or "会话").strip()
-    try:
-        def _fork_runtime():
-            with _session_config_dir(source_model):
-                return sdk_fork_session(
-                    source_sid,
-                    directory=str(sess.session_workspace(source_sid)),
-                    up_to_message_id=boundary,
-                    title=source_name,
-                )
-        forked = await asyncio.to_thread(_fork_runtime)
-        # Keep the marker fixed for this successor. The SDK rewrites the last
-        # copied record's timestamp during the fork; sampling immediately
-        # afterwards is therefore strictly outside the inherited history.
-        runtime_fork_boundary_at = datetime.now(UTC).isoformat().replace(
-            "+00:00", "Z")
-    except FileNotFoundError:
-        raise HTTPException(404, "source transcript not found") from None
-    except ValueError as exc:
-        raise HTTPException(409, str(exc)) from None
-    except Exception as exc:
-        sys.stderr.write(
-            f"[chat] detached runtime fork failed sid={source_sid[:8]} "
-            f"exc={type(exc).__name__}\n"
-        )
-        raise HTTPException(500, "runtime rollover failed") from None
-
-    child_sid = str(forked.session_id)
-    linked = False
-    try:
-        # sdk_fork_session runs in a worker and cannot be cancelled midway.
-        # DELETE may fence the source while that worker is copying JSONL; in
-        # that case register only inside this rollback-owned block, then remove
-        # every child artifact instead of publishing an orphan successor.
-        if sess.session_is_deleting(source_sid):
-            raise ValueError("source session is being deleted")
-        child_meta = await asyncio.to_thread(
-            sess.register_session,
-            child_sid,
-            name=source_name,
-            model=source_model,
-            permission=source_meta.get("permission") or "",
-            plan_return_permission=source_meta.get("plan_return_permission"),
-            auto_named=False,
-            message_count=int(source_meta.get("message_count") or 0),
-            turn_count=int(source_meta.get("turn_count") or 0),
-            effort=_normalize_effort(source_meta.get("effort")),
-            service_tier=source_meta.get("service_tier") or "",
-            thinking=source_meta.get("thinking") is not False,
-            forked_from=source_sid,
-            forked_from_name=source_name,
-            forked_from_message_id=boundary,
-            activity_hidden=bool(source_meta.get("activity_hidden", False)),
-            runtime_profile=source_meta.get("runtime_profile") or "",
-            runtime_predecessor=source_sid,
-            runtime_fork_boundary_at=runtime_fork_boundary_at,
-            cwd=source_meta.get("cwd") or str(ROOT),
-        )
-        _JSONL_PATH_CACHE.pop(child_sid, None)
-        uuid_mapping = await asyncio.to_thread(
-            _runtime_fork_uuid_mapping, child_sid)
-        await asyncio.to_thread(
-            sess.copy_message_annotations,
-            source_sid, child_sid, uuid_mapping)
-        await asyncio.to_thread(
-            sess.copy_runtime_task_overlays, source_sid, child_sid)
-        # Move accepted work before hiding the source. If this fails, no
-        # public session identity has changed yet and rollback is trivial.
-        queue_move = await asyncio.to_thread(
-            sess.migrate_queue, source_sid, child_sid)
-
-        def _link_if_source_live() -> bool:
-            # Linearize the final public link with begin_session_delete(). If
-            # deletion wins, rollback below removes the unlinked child; if the
-            # link wins, the delete path re-reads the successor after fencing.
-            with sess.session_lifecycle_lock(source_sid):
-                if sess.session_is_deleting(source_sid):
-                    return False
-                return sess.link_runtime_successor(source_sid, child_sid)
-
-        if not await asyncio.to_thread(_link_if_source_live):
-            raise ValueError("runtime successor changed")
-        linked = True
-        # Close the settle/link race: anything written to source just before
-        # the durable link is copied once more; later terminal patches
-        # propagate via _runtime_task_overlay's successor lookup.
-        await asyncio.to_thread(
-            sess.copy_runtime_task_overlays, source_sid, child_sid)
-        # Close the complementary done/postlude race.  If the source pump
-        # finished its late metadata before this link became visible, its
-        # own reconciliation could not discover the child; running it once
-        # after the durable link observes those already-finished writes.
-        await asyncio.to_thread(
-            _sync_runtime_successor_postlude, source_sid)
-        # Best-effort: carry the source's activity-group lane onto the fork so
-        # a runtime rollover stays invisible instead of surfacing a new
-        # ungrouped row.  A failure here must not abort the fork.
-        try:
-            from .activity import activity as _activity
-            await asyncio.to_thread(
-                _activity.migrate_group_to_successor, source_sid, child_sid)
-        except Exception as _exc:
-            sys.stderr.write(
-                f"[activity] group migrate failed src={source_sid[:8]} "
-                f"dst={child_sid[:8]} exc={type(_exc).__name__}\n")
-    except Exception as exc:
-        if linked:
-            await asyncio.to_thread(
-                sess.unlink_runtime_successor, source_sid, child_sid)
-        with suppress(Exception):
-            await asyncio.to_thread(
-                sess.migrate_queue, child_sid, source_sid)
-        try:
-            # The child may already contain copied annotations, task overlays,
-            # transcript index and presentation-only continuation snapshots.
-            # Rollback must use the same complete disk purge as DELETE, not just
-            # remove its session row and SDK JSONL.
-            await asyncio.to_thread(_purge_single_session_storage, child_sid)
-        except Exception:
-            # Preserve the original rollover error, but still make a best-effort
-            # privacy sweep if an unexpected purge implementation fails.
-            await asyncio.to_thread(sess.delete_session, child_sid)
-            await asyncio.to_thread(
-                _delete_cancelled_turn_snapshots, child_sid)
-            await asyncio.to_thread(
-                _delete_runtime_continuation_outboxes, child_sid)
-            await asyncio.to_thread(_delete_active_turn_sidecar, child_sid)
-            with suppress(OSError):
-                _transcript_index_path(child_sid).unlink(missing_ok=True)
-            try:
-                with _session_config_dir(source_model):
-                    sdk_delete_session(
-                        child_sid,
-                        directory=str(sess.session_workspace(source_sid)),
-                    )
-            except Exception:
-                child_path = _find_session_jsonl(child_sid)
-                if child_path is not None:
-                    child_path.unlink(missing_ok=True)
-        status = 409 if isinstance(exc, ValueError) else 500
-        raise HTTPException(status, "runtime rollover could not commit") from None
-    if queue_move["target"].get("items"):
-        _schedule_queue_drain(child_sid)
-    public_child = (
-        await asyncio.to_thread(sess.get_session_meta, child_sid)
-    ) or child_meta
-    inherited_overlays = await asyncio.to_thread(
-        sess.get_runtime_task_overlays, child_sid)
-    return {
-        **public_child,
-        "session_id": child_sid,
-        "source_session_id": source_sid,
-        "owner_session_id": source_sid,
-        "inherited_background_tasks_pending": sum(
-            1 for overlay in inherited_overlays.values()
-            if overlay.get("state") == "running"),
-        "queue_migrated": queue_move["migrated"],
-        "queue_pending": len(queue_move["target"].get("items") or []),
-        "reused": False,
-    }
+    return await chat_successor.continue_detached_runtime_locked(source_sid)
 
 
 async def _continue_detached_runtime(source_sid: str) -> dict:
-    """Run rollover to commit/rollback even if its HTTP owner is cancelled."""
-    async with _runtime_rollover_lock_for(source_sid):
-        owner = asyncio.create_task(
-            _continue_detached_runtime_locked(source_sid))
-        cancellation: asyncio.CancelledError | None = None
-        while not owner.done():
-            try:
-                await asyncio.shield(owner)
-            except asyncio.CancelledError as exc:
-                # The SDK fork and queue migration are one logical commit.
-                # Keep the lock until the owner either links the successor or
-                # completes rollback; only then acknowledge request cancel.
-                cancellation = exc
-        if cancellation is not None:
-            # Consume a possible owner failure before returning cancellation;
-            # a retry will observe its durable commit or clean rollback.
-            with suppress(BaseException):
-                owner.result()
-            raise cancellation
-        return owner.result()
+    return await chat_successor.continue_detached_runtime(source_sid)
 
 
 async def _prepare_detached_successor_runtime(source_sid: str) -> None:
-    """Create and warm the interactive child of a background-owned runtime.
-
-    This is latency hiding only: rollover remains idempotent and durable in
-    :func:`_continue_detached_runtime`, while ``get_client``'s per-key creation
-    lock coalesces a concurrent foreground start.  Failures are deliberately
-    fail-soft because the ordinary endpoint/queue path can retry on demand.
-    """
-    try:
-        successor = await _continue_detached_runtime(source_sid)
-        child_sid = str(successor.get("session_id") or "")
-        if not child_sid or child_sid == source_sid:
-            return
-        child_meta = await asyncio.to_thread(sess.get_session_meta, child_sid)
-        if (child_meta is None
-                or sess.session_is_deleting(source_sid)
-                or sess.session_is_deleting(child_sid)):
-            return
-
-        model = str(child_meta.get("model") or MODEL).strip()
-        permission = _validate_permission(
-            str(child_meta.get("permission") or ""))
-        effort = _normalize_effort(child_meta.get("effort"))
-        service_tier = str(child_meta.get("service_tier") or "").strip()
-        client_kwargs: dict[str, Any] = {
-            "effort": effort,
-            "service_tier": service_tier,
-        }
-        if permission == "plan":
-            client_kwargs["plan_return_permission"] = (
-                _normalize_plan_return_permission(
-                    permission, child_meta.get("plan_return_permission"))
-            )
-
-        # A foreground turn reserves _active_turns before it waits for this
-        # mutex.  Re-check inside the mutex so whichever path arrives first
-        # owns startup; get_client's creation lock is a second idempotency
-        # guard for callers that reached the same runtime key concurrently.
-        async with _session_runtime_lock_for(child_sid):
-            active = _active_turns.get(child_sid)
-            if (active is not None and not active.done
-                    or sess.session_is_deleting(source_sid)
-                    or sess.session_is_deleting(child_sid)):
-                return
-            await get_client(
-                child_sid,
-                model,
-                permission,
-                **client_kwargs,
-            )
-    except asyncio.CancelledError:
-        raise
-    except HTTPException as exc:
-        # Boundary/delete races are recoverable.  Log only status + opaque id;
-        # exception detail can include transcript or workspace information.
-        sys.stderr.write(
-            f"[chat] detached runtime prewarm deferred "
-            f"sid={source_sid[:8]} status={exc.status_code}\n"
-        )
-    except Exception as exc:
-        sys.stderr.write(
-            f"[chat] detached runtime prewarm failed "
-            f"sid={source_sid[:8]} exc={type(exc).__name__}\n"
-        )
-    finally:
-        sys.stderr.flush()
+    return await chat_successor.prepare_detached_successor_runtime(source_sid)
 
 
 def _schedule_detached_successor_prewarm(source_sid: str) -> None:
-    """Retain one eager rollover/prewarm owner for ``source_sid``."""
-    existing = _runtime_prewarm_tasks.get(source_sid)
-    if existing is not None and not existing.done():
-        return
-    task = asyncio.create_task(
-        _prepare_detached_successor_runtime(source_sid))
-    _runtime_prewarm_tasks[source_sid] = task
-    _maintenance_tasks.add(task)
-
-    def _done(done: asyncio.Task) -> None:
-        _maintenance_tasks.discard(done)
-        if _runtime_prewarm_tasks.get(source_sid) is done:
-            _runtime_prewarm_tasks.pop(source_sid, None)
-        if done.cancelled():
-            return
-        with suppress(Exception):
-            done.exception()
-
-    task.add_done_callback(_done)
+    return chat_successor.schedule_detached_successor_prewarm(source_sid)
 
 
 @router.post("/sessions/{sid}/continue-detached",
              dependencies=[Depends(require_token)])
 async def continue_detached_session_api(sid: str) -> dict:
-    """Continue immediately without sharing the predecessor's live CLI."""
     return await _continue_detached_runtime(sid)
-
 
 class BudgetReq(BaseModel):
     budget_usd: float       # 0 = disabled
@@ -12020,6 +8823,7 @@ async def _force_stop_after_grace(
         async with _lock:
             if _active_turns.get(session_id) is bc:
                 _active_turns.pop(session_id, None)
+        snapshot_ready = bc.cancelled_snapshot_persisted
         if not bc.done:
             snapshot_ready = await asyncio.to_thread(
                 _persist_cancelled_turn_snapshot, bc)
@@ -12028,7 +8832,10 @@ async def _force_stop_after_grace(
                 "data": json.dumps({"snapshot_ready": snapshot_ready}),
             })
             bc.finish()
-        _delete_active_turn_sidecar(session_id)
+        if snapshot_ready or bc.queue_item_id:
+            _delete_active_turn_sidecar(session_id)
+        else:
+            _retain_active_turn_for_recovery(session_id)
     except Exception as e:
         sys.stderr.write(
             f"[chat-interrupt] force-stop watchdog failed "
@@ -12066,7 +8873,7 @@ async def reset(session_id: str | None = None) -> dict:
 # capping the worst case at "still fits in one SSE frame, fits in the browser
 # buffer". Truncation is marked inline so the FE can show "…and 90KB more"
 # instead of silently rendering a partial diff.
-_MAX_INPUT_FIELD_LEN = 100_000
+_MAX_INPUT_FIELD_LEN = chat_presentation.MAX_INPUT_FIELD_LEN
 
 # Single source of truth for which tool-input fields the FE actually renders.
 # BOTH the realtime stream path (_render_tool_use) and the JSONL-reload path
@@ -12074,116 +8881,48 @@ _MAX_INPUT_FIELD_LEN = 100_000
 # so a reloaded session renders the same tool chips/labels the live stream did
 # (previously the two whitelists had drifted: reload was missing the Task*
 # family subject/activeForm/taskId/status fields).
-_SLIM_INPUT_FIELDS = frozenset({
-    "file_path", "notebook_path", "path",
-    "command", "pattern", "url", "query",
-    "name", "skill", "subagent_type", "description", "todos",
-    # Diff-rendering inputs (Edit / MultiEdit / Write).
-    "old_string", "new_string", "edits", "content",
-    # Read pagination — surfaces as "lines N–M" label.
-    "offset", "limit",
-    # Bash extras — long-running command spinner state.
-    "timeout", "run_in_background",
-    # MultiEdit/Edit "fix on miss" flag (Claude sometimes sends it).
-    "replace_all",
-    # Task* family — FE task-log-line renderer (subject + #id + status).
-    "subject", "activeForm",
-    "taskId", "task_id", "status",
-    "addBlocks", "addBlockedBy",
-})
+_SLIM_INPUT_FIELDS = chat_presentation.SLIM_INPUT_FIELDS
 
 
 def _slim_input_value(v: Any) -> Any:
-    """Cap a single tool-input field so a runaway Write doesn't blow the
-    SSE buffer. Strings get truncated with a marker; large lists/dicts are
-    rejected entirely and replaced by a placeholder (the FE wasn't going to
-    render them meaningfully anyway)."""
-    if isinstance(v, str) and len(v) > _MAX_INPUT_FIELD_LEN:
-        return (v[:_MAX_INPUT_FIELD_LEN]
-                + f"\n…[truncated, {len(v) - _MAX_INPUT_FIELD_LEN} chars more]")
-    if isinstance(v, (list, dict)):
-        try:
-            dumped = json.dumps(v, ensure_ascii=False)
-            if len(dumped) > _MAX_INPUT_FIELD_LEN:
-                return (f"[truncated structured field, "
-                        f"{len(dumped)} chars total]")
-        except (TypeError, ValueError):
-            pass
-    return v
+    """Patchable facade for bounded tool-input transport values."""
+    return chat_presentation.slim_input_value(
+        v, max_length=_MAX_INPUT_FIELD_LEN)
 
 
 def _render_tool_use(block: ToolUseBlock) -> dict:
-    inp = block.input or {}
-    name = block.name
-    if name in ("Read", "Edit", "Write"):
-        summary = inp.get("file_path", "")
-    elif name == "Bash":
-        summary = (inp.get("command") or "")[:_MAX_INPUT_FIELD_LEN]
-    elif name in ("Glob", "Grep"):
-        summary = (inp.get("pattern") or "") + (f"  in {inp.get('path','')}" if inp.get("path") else "")
-    elif name == "WebFetch":
-        summary = inp.get("url", "")
-    elif name == "WebSearch":
-        summary = inp.get("query", "")
-    elif name == "TodoWrite":
-        items = inp.get("todos") or []
-        summary = f"{len(items)} todos"
-    elif name in ("Task", "Agent"):
-        sub = inp.get("subagent_type") or "agent"
-        desc = inp.get("description") or ""
-        summary = f"[{sub}] {desc}"[:240]
-    elif name == "ExitPlanMode":
-        summary = (inp.get("plan") or "")[:240]
-    elif name == "Skill":
-        summary = inp.get("name") or inp.get("skill") or ""
-    else:
-        summary = json.dumps(inp, ensure_ascii=False)[:200]
-
-    # Slim input — drop bulky fields the FE doesn't use, cap retained fields
-    # at _MAX_INPUT_FIELD_LEN. FE uses these for:
-    #   - file_path → clickable chip + preview auto-refresh on Edit
-    #   - old_string / new_string / edits / content → diff rendering for
-    #     Edit / MultiEdit / Write (previously the FE had no way to show
-    #     "what Muse actually changed" beyond a file_path chip)
-    #   - offset / limit → "lines N–M of …" label on Read
-    #   - command → Bash terminal-style block
-    # Field set is the module-level _SLIM_INPUT_FIELDS (shared with the
-    # JSONL-reload path so live + reloaded renders stay identical).
-    slim_input = {k: _slim_input_value(v)
-                  for k, v in inp.items() if k in _SLIM_INPUT_FIELDS}
-    out: dict = {"name": name, "summary": summary, "id": block.id,
-                  "input": slim_input}
-    # Pass full structured payloads through for tools that have dedicated UIs.
-    if name == "TodoWrite":
-        out["todos"] = inp.get("todos") or []
-    elif name in ("Task", "Agent"):
-        out["task"] = {
-            "subagent_type": inp.get("subagent_type"),
-            "description": inp.get("description"),
-            "prompt": inp.get("prompt"),
-        }
-    elif name == "ExitPlanMode":
-        out["plan"] = inp.get("plan") or ""
-    return out
+    """Patchable facade for live tool-use rendering."""
+    return chat_presentation.render_tool_use(
+        block,
+        max_input_field_len=_MAX_INPUT_FIELD_LEN,
+        slim_input_fields=_SLIM_INPUT_FIELDS,
+        slim_value=_slim_input_value,
+    )
 
 
-# tool_result raw text cap. preview stays small (cheap default render);
-# `text` carries the full body up to this cap (drives the "expand" button).
-# 50 KB ≈ a long Bash stack trace or a 500-line Read window — bigger than
-# that and the FE's <pre> render starts to feel sluggish anyway.
-_TOOL_RESULT_PREVIEW_CAP = 500
-_TOOL_RESULT_TEXT_CAP = 50_000
+# Live SSE tool results still need a hard ceiling because the canonical JSONL
+# may not exist yet. Historical responses use stable block references instead:
+# large bodies stay in the authoritative transcript and are fetched on demand.
+_TOOL_RESULT_PREVIEW_CAP = chat_presentation.TOOL_RESULT_PREVIEW_CAP
+_TOOL_RESULT_TEXT_CAP = chat_presentation.TOOL_RESULT_TEXT_CAP
+_HISTORY_INLINE_BODY_CAP = chat_presentation.HISTORY_INLINE_BODY_CAP
+_HISTORY_BODY_PREVIEW_CAP = chat_presentation.HISTORY_BODY_PREVIEW_CAP
+
+
+def _defer_large_ui_bodies(messages: list[dict]) -> None:
+    """Patchable facade for deferred canonical-body transport shaping."""
+    chat_presentation.defer_large_ui_bodies(
+        messages,
+        inline_body_cap=_HISTORY_INLINE_BODY_CAP,
+        body_preview_cap=_HISTORY_BODY_PREVIEW_CAP,
+        tool_result_preview_cap=_TOOL_RESULT_PREVIEW_CAP,
+    )
 
 
 # Bash output format from claude-code's CLI: stdout / stderr / exit_code are
 # wrapped in pseudo-XML tags so we can split them apart for terminal-style
 # rendering. Falls through gracefully when the tags aren't present (vendor
 # wrappers / mocked runs); the FE then just renders the raw body.
-_BASH_TAG_RE = re.compile(
-    r"<(stdout|stderr|exit_code|interrupted|description)>"
-    r"(.*?)</\1>",
-    re.DOTALL,
-)
 
 
 def _classify_stream_error(err: Any) -> dict:
@@ -12284,65 +9023,21 @@ def _error_event(err: Any, *, activity_source: str = "") -> dict:
 
 
 def _parse_bash_result(text: str) -> dict | None:
-    """Return {stdout, stderr, exit_code, interrupted, description} when
-    `text` carries CLI's wrapped Bash output. None when the body isn't in
-    that shape (still falls through to plain-text rendering on the FE)."""
-    if not text or "<" not in text:
-        return None
-    matches = list(_BASH_TAG_RE.finditer(text))
-    if not matches:
-        return None
-    parts: dict[str, Any] = {}
-    for m in matches:
-        tag, body = m.group(1), m.group(2)
-        if tag == "exit_code":
-            try:
-                parts["exit_code"] = int(body.strip())
-            except ValueError:
-                pass
-        elif tag == "interrupted":
-            parts["interrupted"] = body.strip().lower() in ("true", "1", "yes")
-        else:
-            parts[tag] = body
-    return parts or None
+    """Patchable facade for structured Bash result parsing."""
+    return chat_presentation.parse_bash_result(text)
 
 
-def _render_tool_result(block: ToolResultBlock,
-                        *, tool_name: str = "") -> dict:
-    text = ""
-    if isinstance(block.content, str):
-        text = block.content
-    elif isinstance(block.content, list):
-        parts = []
-        for p in block.content:
-            if isinstance(p, dict):
-                parts.append(p.get("text", str(p)))
-            else:
-                parts.append(str(p))
-        text = "\n".join(parts)
-    out: dict = {
-        "id": getattr(block, "tool_use_id", None),
-        "preview": text[:_TOOL_RESULT_PREVIEW_CAP],
-        "truncated": len(text) > _TOOL_RESULT_PREVIEW_CAP,
-        # Full body up to _TOOL_RESULT_TEXT_CAP — drives the FE's "expand"
-        # affordance and per-tool rich render (Bash terminal, Read with
-        # gutter, WebFetch markdown card). When the underlying SDK text was
-        # bigger than the cap, `text_truncated` tells the FE so it can show
-        # "… 50KB more cut" instead of pretending this is the full output.
-        "text": text[:_TOOL_RESULT_TEXT_CAP],
-        "text_truncated": len(text) > _TOOL_RESULT_TEXT_CAP,
-        "is_error": bool(getattr(block, "is_error", False)),
-    }
-    if tool_name:
-        out["tool_name"] = tool_name
-    # Bash gets structured-output extraction so the FE can render stdout /
-    # stderr / exit-code with different styling. Only emit when the parse
-    # actually succeeded — empty objects would mislead.
-    if tool_name == "Bash":
-        bash = _parse_bash_result(text)
-        if bash:
-            out["bash"] = bash
-    return out
+def _render_tool_result(
+    block: ToolResultBlock, *, tool_name: str = "",
+) -> dict:
+    """Patchable facade for live tool-result rendering."""
+    return chat_presentation.render_tool_result(
+        block,
+        tool_name=tool_name,
+        preview_cap=_TOOL_RESULT_PREVIEW_CAP,
+        text_cap=_TOOL_RESULT_TEXT_CAP,
+        parse_bash=_parse_bash_result,
+    )
 
 
 # ====== attachment upload (images + documents) ======
@@ -13376,6 +10071,7 @@ class StreamStartReq(BaseModel):
     # Empty for a new turn. Reconnects pin the exact server turn they observed
     # via /sessions/{sid}/active so they can never attach to a newer turn.
     turn_id: str = ""
+    last_event_seq: int = Field(default=0, ge=0)
     model: str = ""
     permission: str = "bypassPermissions"
     image_ids: str = ""
@@ -13402,6 +10098,7 @@ def stream_start(req: StreamStartReq) -> dict:
             "prompt": req.prompt,
             "session_id": req.session_id,
             "turn_id": req.turn_id,
+            "last_event_seq": req.last_event_seq,
             "model": req.model,
             "permission": permission,
             "image_ids": req.image_ids,
@@ -13416,6 +10113,7 @@ async def stream(
     token: str = Query(default=""),
     session_id: str = Query(default=""),
     turn_id: str = Query(default=""),
+    last_event_seq: int = Query(default=0, ge=0),
     model: str = Query(default=""),
     permission: str = Query(default="bypassPermissions"),
     image_ids: str = Query(default=""),
@@ -13435,6 +10133,7 @@ async def stream(
         prompt = params["prompt"]
         session_id = params["session_id"]
         turn_id = params.get("turn_id", "")
+        last_event_seq = int(params.get("last_event_seq", 0) or 0)
         model = params["model"]
         permission = params["permission"]
         image_ids = params["image_ids"]
@@ -13455,6 +10154,9 @@ async def stream(
     # entry resident past its TTL — gc previously only ran on upload and on
     # the attachment-consume path. Cheap (O(n) over ≤100 capped entries).
     _gc_images()
+    if last_event_seq > 0 and not turn_id:
+        raise HTTPException(
+            422, "turn_id required when last_event_seq is provided")
     # RECONNECT MODE: empty prompt + NO attached images + an active
     # in-flight turn on this session = subscribe to the existing
     # TurnBroadcast for replay + live tail. Frontend uses this after
@@ -13491,7 +10193,10 @@ async def stream(
                     return EventSourceResponse(
                         _recent_changed_gen(), headers=_SSE_HEADERS)
                 return EventSourceResponse(
-                    _subscribe_broadcast(recent, mobile=mobile),
+                    _subscribe_broadcast(
+                        recent, mobile=mobile,
+                        last_event_seq=last_event_seq,
+                    ),
                     headers=_SSE_HEADERS,
                     ping_message_factory=_sse_ping_event,
                 )
@@ -13511,7 +10216,10 @@ async def stream(
             return EventSourceResponse(
                 _active_changed_gen(), headers=_SSE_HEADERS)
         return EventSourceResponse(
-            _subscribe_broadcast(existing, mobile=mobile),
+            _subscribe_broadcast(
+                existing, mobile=mobile,
+                last_event_seq=last_event_seq,
+            ),
             headers=_SSE_HEADERS,
             ping_message_factory=_sse_ping_event,
         )
@@ -14008,35 +10716,32 @@ async def _watch_inflight_tasks(
                 "cta": "retry",
                 "retryable": True,
             })
-        # The broadcast terminal boundary is user-facing truth. Close it
-        # before transcript scans / annotation writes so a slow sidecar or
-        # long JSONL cannot leave the continuation footer pulsing after the
-        # SDK has already emitted its ResultMessage.
-        b.publish({"event": "done", "data": json.dumps(done_payload)})
-        # AssistantMessage already supplied the exact persisted UUID.  Annotate
-        # that boundary directly in the same event-loop turn as done; rescanning
-        # "the latest assistant" raced both delayed JSONL flushes and the next
-        # user turn, which is why continuation footers disappeared on refresh.
+        # AssistantMessage already supplied the exact persisted UUID. Commit its
+        # footer before publishing done so an immediate refresh cannot beat the
+        # sidecar write. The write runs off-loop; ordering, not event-loop
+        # blocking, is the durability boundary.
         if assistant_uuid and not sess.session_is_deleting(session_id):
             try:
-                # Keep this synchronous inside the current event-loop turn:
-                # publish() only queues the frame, so subscribers cannot act
-                # on done (or refresh) until this tiny local sidecar write is
-                # durable.  Offloading here reintroduced the very race this
-                # exact-UUID path is meant to close.
-                sess.set_message_annotation(
+                await obs.to_thread_io(
+                    "chat.continuation_footer_write",
+                    session_id,
+                    sess.set_message_annotation,
                     session_id,
                     assistant_uuid,
                     model=b.model,
                     ts=completed_at_ms,
                     turn_status=terminal_status,
                     elapsed_s=cont_elapsed if cont_elapsed >= 1 else None,
+                    file_path=sess._sidecar_path(session_id),
                 )
             except Exception as e:
                 sys.stderr.write(
                     f"[chat] continuation footer annotation failed "
                     f"sid={session_id[:8]}: {type(e).__name__}\n")
                 sys.stderr.flush()
+        # The durable footer is now visible to reloads; close the live terminal
+        # boundary before slower transcript/outbox bookkeeping.
+        b.publish({"event": "done", "data": json.dumps(done_payload)})
         # A rollover intentionally excludes source-only task notifications and
         # continuation text from the successor's Claude transcript.  Stage the
         # final Agent prose in a private durable outbox, then let a separate
@@ -14045,13 +10750,18 @@ async def _watch_inflight_tasks(
         # replay consumed here: if the eager rollover later rolls back, the
         # still-public source must retain its normal live continuation path.
         if not cancelled and not sess.session_is_deleting(session_id):
-            event_id = _persist_runtime_continuation_outbox(
+            event_id = await obs.to_thread_io(
+                "chat.continuation_outbox_write",
+                session_id,
+                _persist_runtime_continuation_outbox,
                 session_id,
                 b,
                 completed_at_ms=completed_at_ms,
                 elapsed_s=cont_elapsed,
                 terminal_status=terminal_status,
                 incomplete_error=str(incomplete_error or ""),
+                file_path=_runtime_continuation_outbox_path(
+                    session_id, str(b.turn_id or "")),
             )
             if event_id:
                 _schedule_runtime_continuation_delivery(session_id, event_id)
@@ -14657,7 +11367,7 @@ async def _watch_inflight_tasks(
                         f"exc={type(e).__name__}\n")
         if (_owns_generation()
                 and not _sessions_with_inflight_tasks.get(session_id)):
-            _delete_active_turn_sidecar_if_idle(session_id)
+            _release_active_turn_sidecar(session_id)
 
 
 def _merge_session_inflight(
@@ -14819,7 +11529,10 @@ async def _finish_cancelled_startup(
                     broadcast.finish()
                 if not sess.session_is_deleting(session_id):
                     _remember_recent_turn(session_id, broadcast)
-                _delete_active_turn_sidecar(session_id)
+                if snapshot_ready or broadcast.queue_item_id:
+                    _delete_active_turn_sidecar(session_id)
+                else:
+                    _retain_active_turn_for_recovery(session_id)
                 if _active_turns.get(session_id) is broadcast:
                     _active_turns.pop(session_id, None)
             return broadcast
@@ -14934,6 +11647,7 @@ async def _abort_turn_startup(
     status: str,
     *,
     pause_queue: bool = True,
+    error_text: str = "",
 ) -> bool:
     """Settle every owner created before an SDK query has been sent."""
     broadcast.perf_status = status
@@ -14977,6 +11691,27 @@ async def _abort_turn_startup(
                 continue
         activity_finish.result()
         raise
+
+    if broadcast.queue_item_id:
+        # The durable queue row still owns the original text and attachments.
+        _delete_active_turn_sidecar(session_id)
+    else:
+        visible_error = error_text or (
+            "Turn submission was interrupted before reaching canonical history."
+            if status == "cancelled"
+            else "Turn submission failed before reaching canonical history."
+        )
+        snapshot_ready = await asyncio.to_thread(
+            _persist_failed_turn_snapshot,
+            broadcast,
+            visible_error,
+            terminal_at_ms=int(time.time() * 1000),
+            canonical_terminal_published=False,
+        )
+        if snapshot_ready:
+            _delete_active_turn_sidecar(session_id)
+        else:
+            _retain_active_turn_for_recovery(session_id)
     return queue_settled
 
 
@@ -15209,6 +11944,29 @@ async def _start_turn(
     broadcast.user_text = prompt
     broadcast.startup_owner_task = asyncio.current_task()
     broadcast.queue_item_id = str(queue_item_id or "")
+    # The reservation is also the pending-intent commit point. Persist before
+    # cold client/MCP startup so a process restart cannot erase a prompt merely
+    # because the SDK had not accepted it yet. A queue item already has its own
+    # durable owner, but mirroring it here keeps direct and queued turn recovery
+    # behavior identical once claimed.
+    if session_id in _interrupted_at_startup:
+        recovered = await asyncio.to_thread(
+            _recover_interrupted_turn_snapshot, session_id)
+        if not recovered:
+            async with _lock:
+                if _active_turns.get(session_id) is broadcast:
+                    broadcast.finish()
+                    _active_turns.pop(session_id, None)
+            raise _TurnStartError(
+                "previous interrupted turn could not be persisted for recovery")
+        _interrupted_at_startup.pop(session_id, None)
+    if not _write_active_turn_sidecar(broadcast):
+        async with _lock:
+            if _active_turns.get(session_id) is broadcast:
+                broadcast.finish()
+                _active_turns.pop(session_id, None)
+        raise _TurnStartError(
+            "user message could not be persisted before submission")
     # The reservation above is the commit point: bind the durable queue claim
     # before any SDK startup await can be cancelled. From here, only this turn's
     # terminal cleanup may ack or release the item.
@@ -15237,7 +11995,8 @@ async def _start_turn(
         raise
     except _TurnBusy:
         await _abort_turn_startup(
-            session_id, broadcast, "failed", pause_queue=False)
+            session_id, broadcast, "failed", pause_queue=False,
+            error_text="Previous background task is still using this session.")
         raise
     if broadcast.cancelled:
         return await _finish_cancelled_startup(session_id, broadcast)
@@ -15345,10 +12104,12 @@ async def _start_turn(
                     broadcast.startup_task = None
     except asyncio.TimeoutError:
         broadcast.perf_error_kind = "timeout"
+        timeout_error = "Client connection timed out — CLI process may be hung"
         queue_settled = await _abort_turn_startup(
-            session_id, broadcast, "failed", pause_queue=True)
+            session_id, broadcast, "failed", pause_queue=True,
+            error_text=timeout_error)
         raise _TurnStartError(
-            "Client connection timed out — CLI process may be hung",
+            timeout_error,
             status=504,
             queue_claim_settled=queue_settled)
     except asyncio.CancelledError:
@@ -15370,7 +12131,8 @@ async def _start_turn(
         # Free the reservation so the user can fix their config (e.g. add an
         # API key) and immediately retry without waiting for any timeout.
         queue_settled = await _abort_turn_startup(
-            session_id, broadcast, "failed", pause_queue=True)
+            session_id, broadcast, "failed", pause_queue=True,
+            error_text=err_msg)
         raise _TurnStartError(
             err_msg, queue_claim_settled=queue_settled)
     finally:
@@ -16087,7 +12849,13 @@ async def _start_turn(
                 existing_uuids, transcript_boundary = await asyncio.to_thread(
                     _turn_transcript_boundary, session_id, model_to_use)
                 broadcast.transcript_boundary = transcript_boundary
-                _write_active_turn_sidecar(broadcast)
+                await obs.to_thread_io(
+                    "chat.active_turn_write",
+                    session_id,
+                    _write_active_turn_sidecar,
+                    broadcast,
+                    file_path=_active_turn_path(session_id),
+                )
                 _preflight_started = obs.monotonic()
                 try:
                     await _preflight_compact_if_needed(_emit_side)
@@ -16139,6 +12907,12 @@ async def _start_turn(
                             and broadcast.perf_first_event_ms < 0):
                         broadcast.perf_first_event_ms = obs.elapsed_ms(
                             broadcast.perf_query_started)
+                    # Record terminal system signals in the pump before reading
+                    # the next item. If the stream closes without ResultMessage,
+                    # event_gen may not have consumed the queued row yet.
+                    if (isinstance(msg, SystemMessage)
+                            and (error_info := _sdk_system_error(msg))):
+                        turn_sdk_errors.append(error_info)
                     await merge_q.put(("claude", msg))
                     return decision
 
@@ -16161,8 +12935,10 @@ async def _start_turn(
                                 # pump has already evicted its cached client;
                                 # raising here produces a visible SSE error and
                                 # makes the next send build a fresh runtime.
+                                captured = _merge_sdk_errors(turn_sdk_errors)
                                 raise (
-                                    stream._failure
+                                    ClaudeSDKError(captured["message"])
+                                    if captured else stream._failure
                                     or ClaudeSDKError(
                                         "SDK message stream ended without "
                                         "a ResultMessage")
@@ -16193,6 +12969,10 @@ async def _start_turn(
                                 break
                         if current_terminal or not stale_terminal:
                             break
+                    if not current_terminal:
+                        captured = _merge_sdk_errors(turn_sdk_errors)
+                        if captured:
+                            raise ClaudeSDKError(captured["message"])
                 if replay_dropped:
                     sys.stderr.write(
                         f"[chat-stream] dropped stale replay sid={session_id[:8]} "
@@ -16681,11 +13461,53 @@ async def _start_turn(
             was_cancelled = session_id in _pending_interrupts
             _pending_interrupts.discard(session_id)
             broadcast.cancelled = was_cancelled
+            _completed_at_ms = int(time.time() * 1000)
             _result_error = _sdk_result_error(msg)
             _turn_error = _merge_sdk_errors([
                 *turn_sdk_errors,
                 *([_result_error] if _result_error else []),
             ])
+
+            # A success-shaped ResultMessage proves only that the SDK operation
+            # ended. Ordinary chat turns are committed only when this exact
+            # pre-query boundary owns both a real user row and an assistant row.
+            # Slash commands have their own system/result transcript shape, so
+            # they retain the SDK Result verdict. Error/cancel turns only need a
+            # user UUID when attachments must be annotated.
+            boundary_asst_uuid: str | None = None
+            new_user_uuid: str | None = None
+            boundary_inspected = False
+            _commit_required = bool(prompt.strip()) and not prompt.lstrip().startswith("/")
+            if ((_turn_error is None and not was_cancelled and _commit_required)
+                    or persisted_imgs or persisted_docs):
+                boundary_asst_uuid, new_user_uuid, boundary_inspected = (
+                    await _settle_turn_uuids(
+                        session_id,
+                        broadcast.transcript_boundary,
+                        started_at_ms=int(float(broadcast.started_at or 0) * 1000),
+                        terminal_at_ms=_completed_at_ms,
+                        require_assistant=(
+                            _turn_error is None
+                            and not was_cancelled
+                            and _commit_required
+                        ),
+                    )
+                )
+            if (_turn_error is None and not was_cancelled and _commit_required
+                    and (not boundary_asst_uuid or not new_user_uuid)):
+                detail = (
+                    "Canonical conversation history could not be inspected."
+                    if not boundary_inspected else
+                    "The turn ended before the user message and assistant "
+                    "response were committed to conversation history."
+                )
+                _turn_error = {
+                    "message": detail,
+                    "source": "canonical_commit",
+                    "api_error_status": None,
+                }
+            terminal_assistant_uuid = last_assistant_uuid or boundary_asst_uuid or ""
+
             _is_error = _turn_error is not None
             _subtype = getattr(msg, "subtype", None)
             _errors = getattr(msg, "errors", None) or []
@@ -16710,7 +13532,6 @@ async def _start_turn(
             _done_memory_recall = mem0.pop_recall_trace(session_id)
             _done_memory_receipt = _persistable_memory_recall(
                 _done_memory_recall)
-            _completed_at_ms = int(time.time() * 1000)
             _msg_duration_ms = getattr(msg, "duration_ms", None)
             _elapsed_s = (round(_msg_duration_ms / 1000, 1)
                           if _msg_duration_ms else None)
@@ -16733,6 +13554,14 @@ async def _start_turn(
                 except Exception as exc:
                     _safe_secondary_diagnostic(
                         "terminal_snapshot", session_id, exc)
+            # Transfer ownership before publishing the terminal event: canonical
+            # success owns the prompt directly; a failed turn is safe to clear
+            # only after its display snapshot committed. If snapshot persistence
+            # failed, retain the sidecar for restart recovery.
+            if ((not _is_error and not was_cancelled)
+                    or (_is_error and _failed_snapshot_ready)):
+                await asyncio.to_thread(
+                    _delete_active_turn_sidecar, session_id)
             _done_background_tasks = len(
                 _merge_session_inflight(session_id, inflight_tasks)
             )
@@ -16745,10 +13574,10 @@ async def _start_turn(
             if _done_background_tasks:
                 _defer_activity_finish(
                     session_id, broadcast, _activity_status)
-                if last_assistant_uuid:
+                if terminal_assistant_uuid:
                     try:
                         sess.set_runtime_background_boundary(
-                            session_id, last_assistant_uuid)
+                            session_id, terminal_assistant_uuid)
                     except Exception as exc:
                         sys.stderr.write(
                             f"[chat] runtime boundary persist failed "
@@ -16765,20 +13594,23 @@ async def _start_turn(
             # bookkeeping below is still running and observe a bare assistant
             # record with no status/model/duration.
             _footer_annotation_uuid = ""
-            if last_assistant_uuid:
+            if terminal_assistant_uuid:
                 try:
-                    await asyncio.to_thread(
+                    await obs.to_thread_io(
+                        "chat.sidecar_terminal_write",
+                        session_id,
                         sess.set_message_annotation,
                         session_id,
-                        last_assistant_uuid,
+                        terminal_assistant_uuid,
                         cost=f"${cost:.4f}",
                         model=model_to_use,
                         ts=_completed_at_ms,
                         turn_status=_activity_status,
                         elapsed_s=_elapsed_s,
                         memory_recall=_done_memory_receipt,
+                        file_path=sess._sidecar_path(session_id),
                     )
-                    _footer_annotation_uuid = last_assistant_uuid
+                    _footer_annotation_uuid = terminal_assistant_uuid
                 except Exception as exc:
                     sys.stderr.write(
                         f"[chat] terminal footer annotation failed "
@@ -16787,7 +13619,7 @@ async def _start_turn(
             yield {"event": "done", "data": json.dumps({
                 "turn_id": broadcast.turn_id,
                 "duration_ms": _msg_duration_ms,
-                "assistant_uuid": last_assistant_uuid,
+                "assistant_uuid": terminal_assistant_uuid,
                 "completed_at_ms": _completed_at_ms,
                 "total_cost_usd": cost,
                 "model": model_to_use,
@@ -16921,18 +13753,13 @@ async def _start_turn(
             # fallback branch, which previously left it unbound on the fast path
             # → UnboundLocalError at every turn's end.
             all_msgs: list | None = None
-            boundary_asst_uuid, new_user_uuid = await asyncio.to_thread(
-                _turn_uuids_from_boundary,
-                session_id,
-                broadcast.transcript_boundary,
-                started_at_ms=int(float(broadcast.started_at or 0) * 1000),
-                terminal_at_ms=_completed_at_ms,
-                want_image_user=bool(persisted_imgs),
-            )
+            # Reuse the commit-gate result captured before `done`; a second index
+            # lookup would add latency and could observe a different transcript
+            # generation than the one that decided the terminal status.
             # AssistantMessage observed in this stream is authoritative. The
             # indexed boundary is a safe fallback for older SDKs that omit the
             # UUID on the in-memory object but still write it to JSONL.
-            new_asst_uuid = last_assistant_uuid or boundary_asst_uuid
+            new_asst_uuid = terminal_assistant_uuid
             if new_asst_uuid and new_asst_uuid != _footer_annotation_uuid:
                 # ts (ms epoch) stamps the turn's completion time. The
                 # frontend's turn-footer (.turn-footer in index.html)
@@ -16946,18 +13773,31 @@ async def _start_turn(
                 # "13:42 · 2m50s" footer (FE-side stamping only survives
                 # within the live session). None when SDK didn't fill
                 # duration_ms.
-                sess.set_message_annotation(
-                    session_id, new_asst_uuid,
-                    cost=f"${cost:.4f}", model=model_to_use,
+                await obs.to_thread_io(
+                    "chat.sidecar_footer_write",
+                    session_id,
+                    sess.set_message_annotation,
+                    session_id,
+                    new_asst_uuid,
+                    cost=f"${cost:.4f}",
+                    model=model_to_use,
                     ts=_completed_at_ms,
                     turn_status=_activity_status,
                     elapsed_s=_elapsed_s,
-                    memory_recall=_done_memory_receipt)
+                    memory_recall=_done_memory_receipt,
+                    file_path=sess._sidecar_path(session_id),
+                )
             if new_user_uuid and (persisted_imgs or persisted_docs):
-                sess.set_message_annotation(
-                    session_id, new_user_uuid,
+                await obs.to_thread_io(
+                    "chat.sidecar_attachment_write",
+                    session_id,
+                    sess.set_message_annotation,
+                    session_id,
+                    new_user_uuid,
                     images=persisted_imgs or None,
-                    docs=persisted_docs or None)
+                    docs=persisted_docs or None,
+                    file_path=sess._sidecar_path(session_id),
+                )
             # mem0 write is deferred to AFTER we compute was_cancelled / _is_error
             # below — we must not distill a cancelled or errored turn into a
             # "durable fact". See the mem0.schedule_store(...) call further down.
@@ -17000,10 +13840,21 @@ async def _start_turn(
             _rename_src = first_user_text or prompt
             if _rename_src.strip() == _IMAGE_ONLY_PLACEHOLDER:
                 _rename_src = "图片对话" if is_chinese_locale() else "Image chat"
-            sess.bump_session(session_id, message_count=len(all_msgs),
-                               turn_count=n_turns,
-                               auto_rename_from=_rename_src)
-            sess.update_model(session_id, model_to_use)
+            def _persist_session_summary() -> None:
+                sess.bump_session(
+                    session_id,
+                    message_count=len(all_msgs),
+                    turn_count=n_turns,
+                    auto_rename_from=_rename_src,
+                )
+                sess.update_model(session_id, model_to_use)
+
+            await obs.to_thread_io(
+                "chat.session_index_write",
+                session_id,
+                _persist_session_summary,
+                file_path=sess.INDEX,
+            )
             # ``done`` is intentionally published before this slower block. A
             # user can therefore roll over the session while these annotations
             # and the first-turn name are still being persisted. Reconcile the
@@ -17208,6 +14059,10 @@ async def _start_turn(
                     # window store + push a live `rate_limit` SSE event.
                     async for ev in _handle_rate_limit(msg):
                         yield ev
+                elif isinstance(msg, SystemMessage):
+                    # Terminal system signals were captured by the turn-scoped
+                    # pump before enqueue; informational rows need no UI event.
+                    pass
                 elif isinstance(msg, ResultMessage):
                     async for ev in _handle_result_message(msg):
                         yield ev
@@ -17292,11 +14147,16 @@ async def _start_turn(
     # that died before ResultMessage may have left one behind; discard it at
     # the new turn boundary so it can never be attributed to this prompt.
     mem0.pop_recall_trace(session_id)
-    # Persist an in-flight breadcrumb so a process crash / restart can
-    # surface this turn to the user on next boot. Auto-dismiss any
-    # stale entry for this sid — starting a new turn supersedes whatever
-    # the previous process left behind.
-    _write_active_turn_sidecar(broadcast)
+    # Refresh the pending intent with resolved model, attachment display refs,
+    # and the exact pre-query transcript boundary captured above. Keep this
+    # filesystem write off the event loop because the sidecar is durable state.
+    await obs.to_thread_io(
+        "chat.active_turn_write",
+        session_id,
+        _write_active_turn_sidecar,
+        broadcast,
+        file_path=_active_turn_path(session_id),
+    )
     _interrupted_at_startup.pop(session_id, None)
 
     async def _pump_gen_to_broadcast():
@@ -17632,11 +14492,13 @@ async def _start_turn(
             # and silently dropping the rendered content until a manual refresh.
             if not deleting_session:
                 _remember_recent_turn(session_id, broadcast)
-            # Main ResultMessage is terminal only when no detached background
-            # task watcher still owns the logical turn. Keep the breadcrumb
-            # through that gap so a restart after TaskNotification but before
-            # the final model reaction is surfaced as interrupted.
-            _delete_active_turn_sidecar_if_idle(session_id)
+            # Clear only after another durable owner exists. A failure whose
+            # snapshot write failed deliberately leaves the pending intent for
+            # restart recovery instead of acknowledging data we did not retain.
+            if ((not turn_errored and not broadcast.cancelled)
+                    or broadcast.failed_snapshot_persisted
+                    or broadcast.cancelled_snapshot_persisted):
+                _release_active_turn_sidecar(session_id)
             # Server-side queue drain (Option B). Now that _active_turns no
             # longer holds this sid, advance the queue:
             #   - errored → pause the queue (don't cascade failures headlessly;
@@ -17918,23 +14780,25 @@ async def _subscribe_broadcast(
     broadcast: TurnBroadcast,
     *,
     mobile: bool = False,
+    last_event_seq: int = 0,
 ):
-    """Yield disk-backed replay followed by its live tail.
+    """Yield full or incremental replay followed by its live tail.
 
-    Mobile readers use a bounded reconnect replay window and receive one
-    explicit ``resync`` event when that window is exceeded. Every reader tails
-    the same append-only spool, so a stalled HTTP connection retains only a
-    file cursor rather than an unbounded Python queue. Desktop replay remains
-    complete without duplicating the turn in memory.
+    Sequence zero reads the complete disk-backed spool. Positive checkpoints
+    use the broadcast's bounded exact-event window and receive one explicit
+    ``resync`` event if the missing range is unavailable. Every attached reader
+    then tails the same append-only spool, so stalled HTTP connections retain a
+    file cursor rather than an unbounded Python queue.
     """
-    # A subscriber is now attached. For a CONTINUATION broadcast this is the
-    # one-and-only reconnect that replays the finished task's card flip +
-    # reaction; mark it consumed so `/active` stops advertising it (else the
-    # 8s poller re-reconnects every tick within the 60s grace TTL → duplicate
-    # reaction bubbles). Harmless no-op for normal turns.
-    if getattr(broadcast, "is_continuation", False):
+    subscriber = broadcast.subscribe(
+        mobile=mobile, last_event_seq=last_event_seq)
+    # A real subscriber is now attached. For a CONTINUATION broadcast this is
+    # the one-and-only reconnect that replays the finished task's card flip +
+    # reaction. A replay-gap fallback is not an attachment and must not consume
+    # the continuation advertisement before canonical reconciliation starts.
+    if (getattr(broadcast, "is_continuation", False)
+            and not subscriber._resync_payload):
         broadcast.continuation_consumed = True
-    subscriber = broadcast.subscribe(mobile=mobile)
     try:
         while True:
             ev = await subscriber.get()
@@ -18071,6 +14935,9 @@ def list_interrupted_turns() -> dict:
     the conversation is worth retrying)."""
     items = []
     for sid, data in _interrupted_at_startup.items():
+        # Materialize the pending user intent before the browser can acknowledge
+        # the notification. The toast is optional UX; the history row is durable.
+        _recover_interrupted_turn_snapshot(sid)
         items.append({
             "sid": sid,
             "preview": data.get("user_text_preview") or "",
@@ -18085,11 +14952,11 @@ def list_interrupted_turns() -> dict:
 @router.post("/interrupted-turns/{sid}/dismiss",
              dependencies=[Depends(require_token)])
 def dismiss_interrupted_turn(sid: str) -> dict:
-    """User clicked 'dismiss' (or opened the session and saw the history).
-    Removes the in-memory entry AND deletes the disk sidecar so future
-    restarts don't keep nagging about the same turn."""
+    """Acknowledge the warning only after its user intent is durable history."""
+    if sid in _interrupted_at_startup and not _recover_interrupted_turn_snapshot(sid):
+        raise HTTPException(
+            503, "interrupted turn could not be persisted; acknowledgement deferred")
     _interrupted_at_startup.pop(sid, None)
-    _delete_active_turn_sidecar(sid)
     return {"ok": True}
 
 
@@ -18191,3 +15058,104 @@ async def providers_list() -> dict:
         "default_model": _resolve_default_model(""),
         "default_permission": default_permission,
     }
+
+
+# Dynamic bridge for SDK client/runtime lifecycle. Every callback resolves the
+# chat facade at call time, preserving monkeypatch behavior while the extracted
+# module owns the exact shared pool, disconnect, and stream-pump containers.
+chat_runtime.configure_hooks(chat_runtime.RuntimeHooks(
+    sessions=sess,
+    normalize_effort=lambda *a, **k: _normalize_effort(*a, **k),
+    valid_efforts=_VALID_EFFORT,
+    valid_service_tiers=_VALID_SERVICE_TIERS,
+    normalize_plan_return_permission=lambda *a, **k: _normalize_plan_return_permission(*a, **k),
+    build_and_connect_client=lambda *a, **k: _build_and_connect_client(*a, **k),
+    has_enabled_external_mcp=lambda: _has_enabled_external_mcp(),
+    await_mcp_ready=lambda *a, **k: _await_mcp_ready(*a, **k),
+    active_turns=_active_turns,
+    sessions_with_inflight_tasks=_sessions_with_inflight_tasks,
+    session_has_live_watcher=lambda *a, **k: _session_has_live_watcher(*a, **k),
+    pending_runtime_rebuilds=_pending_runtime_rebuilds,
+    client_pool_cap=lambda: _CLIENT_POOL_CAP,
+    disconnect_unpooled_client=lambda *a, **k: _disconnect_unpooled_client(*a, **k),
+    disconnect_client=lambda *a, **k: disconnect_client(*a, **k),
+    get_client=lambda *a, **k: get_client(*a, **k),
+    ensure_session_stream=lambda *a, **k: _ensure_session_stream(*a, **k),
+    join_session_disconnects=lambda *a, **k: _join_session_disconnects(*a, **k),
+    evict_failed_session_stream=lambda *a, **k: _evict_failed_session_stream(*a, **k),
+    retain_detached_cleanup=lambda *a, **k: _retain_detached_cleanup(*a, **k),
+))
+
+
+# Dynamic runtime bridge for transcript-fork/successor lifecycle. Every callback
+# resolves the chat facade at call time, preserving the historical monkeypatch
+# surface while keeping the extracted module independent of chat and the SDK.
+from .activity import activity as _successor_activity  # noqa: E402
+
+chat_successor.configure_hooks(chat_successor.SuccessorHooks(
+    sessions=sess,
+    activity=_successor_activity,
+    model_default=MODEL,
+    root=ROOT,
+    is_chinese_locale=lambda: is_chinese_locale(),
+    normalize_effort=lambda *a, **k: _normalize_effort(*a, **k),
+    validate_permission=lambda *a, **k: _validate_permission(*a, **k),
+    normalize_plan_return_permission=lambda *a, **k: _normalize_plan_return_permission(*a, **k),
+    session_config_dir=lambda *a, **k: _session_config_dir(*a, **k),
+    sdk_fork_session=lambda *a, **k: sdk_fork_session(*a, **k),
+    sdk_delete_session=lambda *a, **k: sdk_delete_session(*a, **k),
+    sdk_rename_session=lambda *a, **k: sdk_rename_session(*a, **k),
+    find_session_jsonl=lambda *a, **k: _find_session_jsonl(*a, **k),
+    jsonl_path_cache=_JSONL_PATH_CACHE,
+    purge_single_session_storage=lambda *a, **k: _purge_single_session_storage(*a, **k),
+    copy_runtime_continuation_snapshots=lambda *a, **k: _copy_runtime_continuation_snapshots(*a, **k),
+    shaped_ui_messages=lambda *a, **k: _shaped_ui_messages(*a, **k),
+    parse_bg_launch=lambda *a, **k: _parse_bg_launch(*a, **k),
+    record_background_task_launch=lambda *a, **k: _record_background_task_launch(*a, **k),
+    sessions_with_inflight_tasks=_sessions_with_inflight_tasks,
+    bg_task_tool_use_ids=_bg_task_tool_use_ids,
+    bg_task_descriptions=_bg_task_descriptions,
+    active_turns=_active_turns,
+    session_has_live_watcher=lambda *a, **k: _session_has_live_watcher(*a, **k),
+    schedule_queue_drain=lambda *a, **k: _schedule_queue_drain(*a, **k),
+    get_client=lambda *a, **k: get_client(*a, **k),
+    session_runtime_lock_for=lambda *a, **k: _session_runtime_lock_for(*a, **k),
+    maintenance_tasks=_maintenance_tasks,
+    runtime_fork_uuid_mapping=lambda *a, **k: _runtime_fork_uuid_mapping(*a, **k),
+    sync_runtime_successor_postlude=lambda *a, **k: _sync_runtime_successor_postlude(*a, **k),
+    runtime_fork_boundary=lambda *a, **k: _runtime_fork_boundary(*a, **k),
+    backfill_runtime_task_overlays=lambda *a, **k: _backfill_runtime_task_overlays(*a, **k),
+    commit_fork_lifecycle=lambda *a, **k: _commit_fork_lifecycle(*a, **k),
+    continue_detached_runtime_locked=lambda *a, **k: _continue_detached_runtime_locked(*a, **k),
+    continue_detached_runtime=lambda *a, **k: _continue_detached_runtime(*a, **k),
+    prepare_detached_successor_runtime=lambda *a, **k: _prepare_detached_successor_runtime(*a, **k),
+    runtime_rollover_lock_for=lambda *a, **k: _runtime_rollover_lock_for(*a, **k),
+    session_title_lock=lambda *a, **k: _session_title_lock(*a, **k),
+))
+
+
+# Dynamic runtime bridge for display-only overlays.  Every callback resolves the
+# chat facade at call time, preserving the long-standing monkeypatch surface.
+chat_overlays.configure_hooks(chat_overlays.OverlayHooks(
+    broadcast_to_ui_messages=lambda *a, **k: _broadcast_to_ui_messages(*a, **k),
+    ensure_transcript_index=lambda *a, **k: _ensure_transcript_index(*a, **k),
+    turn_transcript_boundary=lambda *a, **k: _turn_transcript_boundary(*a, **k),
+    transcript_ts_ms=lambda *a, **k: _transcript_ts_ms(*a, **k),
+    classify_stream_error=lambda *a, **k: _classify_stream_error(*a, **k),
+    indexed_ui_records=lambda *a, **k: _indexed_ui_records(*a, **k),
+    turn_uuids_from_boundary=lambda *a, **k: _turn_uuids_from_boundary(*a, **k),
+    delete_active_turn_sidecar=lambda *a, **k: _delete_active_turn_sidecar(*a, **k),
+    turn_broadcast_factory=lambda *a, **k: TurnBroadcast(*a, **k),
+    interrupted_at_startup=_interrupted_at_startup,
+    persist_failed_turn_snapshot=lambda *a, **k: _persist_failed_turn_snapshot(*a, **k),
+    load_cancelled_turn_snapshots=lambda *a, **k: _load_cancelled_turn_snapshots(*a, **k),
+    cancelled_snapshot_canonical_span=lambda *a, **k: _cancelled_snapshot_canonical_span(*a, **k),
+    persist_runtime_continuation_snapshot=lambda *a, **k: _persist_runtime_continuation_snapshot(*a, **k),
+    runtime_rollover_lock_for=lambda *a, **k: _runtime_rollover_lock_for(*a, **k),
+    session_runtime_lock_for=lambda *a, **k: _session_runtime_lock_for(*a, **k),
+    session_has_live_watcher=lambda *a, **k: _session_has_live_watcher(*a, **k),
+    schedule_queue_drain=lambda *a, **k: _schedule_queue_drain(*a, **k),
+    runtime_prewarm_tasks=_runtime_prewarm_tasks,
+    active_turns=_active_turns,
+    maintenance_tasks=_maintenance_tasks,
+))

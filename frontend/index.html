@@ -928,6 +928,8 @@
                     x-text="lang==='zh' ? '@ 引用到 chat' : '@-mention in chat'"></button>
             <button @click="previewTabMenuAction('copyPath')"
                     x-text="lang==='zh' ? '复制路径' : 'Copy path'"></button>
+            <button @click="previewTabMenuAction('copyAbsolutePath')"
+                    x-text="t('btn.copy_absolute_path')"></button>
           </div>
         </div>
       </template>
@@ -1314,7 +1316,7 @@
           <svg x-show="!leftOpen || desktopFullPane"><use href="#i-chevron-right"/></svg>
         </button>
         <span class="pane-title">
-          <span class="muse-mascot sm" :class="{'greet': mascotGreet, 'is-streaming': streaming}"
+          <span class="muse-mascot sm" :class="{'greet': mascotGreet, 'is-streaming': activeSessionPane().streaming}"
                 @click="cycleMascot()" :title="mascotLabel() + (lang==='zh'?'（点击换一位）':' (click for next muse)')">
             <svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg>
           </span>
@@ -1796,6 +1798,8 @@
                     : (lang==='zh' ? 'Fork 对话' : 'Fork conversation')"></button>
           <button @click="menuExportMarkdown(tabCtxMenu && tabCtxMenu.id)"
                   x-text="lang==='zh' ? '导出为 Markdown' : 'Export as Markdown'"></button>
+          <button @click="menuCopySessionEvidence(tabCtxMenu && tabCtxMenu.id)"
+                  x-text="lang==='zh' ? '复制会话证据 JSON' : 'Copy session evidence JSON'"></button>
           <hr/>
           <button class="danger" @click="menuDelete(tabCtxMenu && tabCtxMenu.id)"
                   x-text="lang==='zh' ? '删除会话' : 'Delete session'"></button>
@@ -1809,12 +1813,16 @@
         <!-- Position transcript controls against the area above the variable-
              height composer, so they never disappear behind queued items or
              the mobile keyboard toolbar. -->
-        <div class="chat-transcript-wrap">
-        <div class="chat-body" x-ref="chatBody" @scroll="onChatScroll()" @wheel.passive="_userScrollIntent()" @touchmove.passive="_userScrollIntent()" @pointerdown.passive="_userScrollIntent()" @click="onChatClick($event)" :class="{ 'msgs-hidden': !messagesReady && messages.length }">
+        <div class="chat-transcript-wrap"
+             x-data="{ get activeSession(){ return activeSessionPane() } }">
+        <div class="chat-body" x-ref="chatBody" @scroll="onChatScroll()" @wheel.passive="_userScrollIntent($event)" @touchstart.passive="_chatTouchStart($event)" @touchmove.passive="_userScrollIntent($event)" @pointerdown.passive="_userScrollIntent($event)" @click="onChatClick($event)"
+             :class="{ 'msgs-hidden': !activeSession.messagesReady && activeSession.messages.length }">
           <!-- Shimmer skeleton while loadSession is in-flight. Without
                this, switching to a long-history session briefly shows the
                brand-empty onboarding cards as if it were a new session. -->
-          <div x-show="(messagesLoading && !messages.length) || (!messagesReady && messages.length)" class="chat-skeleton" aria-hidden="true">
+          <div x-show="(activeSession.messagesLoading && !activeSession.messages.length)
+                       || (!activeSession.messagesReady && activeSession.messages.length)"
+               class="chat-skeleton" aria-hidden="true">
             <template x-for="i in 3" :key="i">
               <div class="chat-skeleton-msg">
                 <div class="chat-skeleton-avatar"></div>
@@ -1826,7 +1834,8 @@
               </div>
             </template>
           </div>
-          <div x-show="!messages.length && !messagesLoading" class="brand-empty chat-empty">
+          <div x-show="!activeSession.messages.length && !activeSession.messagesLoading"
+               class="brand-empty chat-empty">
             <span class="muse-mascot lg" :class="{'greet': mascotGreet}" @click="cycleMascot()">
               <svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg>
             </span>
@@ -1875,20 +1884,14 @@
             </div>
           </template>
 
-          <!-- Lazy-loaded history controls — sits above the message loop.
-               Only shown when loadSession() deferred older messages because
-               history exceeds INITIAL_LOAD. Clicking pages back in batches
-               (LOAD_MORE_BATCH = 50) while preserving scroll position. -->
-          <div x-show="messagesReady && (hasMoreHistory() || historyTruncated())"
-               class="load-earlier-wrap">
-            <button x-show="hasMoreHistory()"
-                    class="load-earlier-btn"
-                    @click="loadEarlierMessages()"
-                    x-text="t('history.load_earlier', { n: earlierMessageCount() })"></button>
-            <div x-show="historyTruncated() && !hasMoreHistory()"
-                 class="load-earlier-truncated-note"
-                 x-text="t('history.truncated_note')"></div>
-          </div>
+          <!-- History pagination is transport-only. Older canonical windows are
+               filled and revealed automatically; surface only a transient retry
+               state when the local read fails, never a manual load control. -->
+          <div x-show="activeSession._historyHydrationError"
+               class="load-earlier-wrap load-earlier-status"
+               role="status"
+               aria-live="polite"
+               x-text="lang==='zh' ? '正在重试补齐会话历史…' : 'Retrying conversation history…'"></div>
           <!-- Per-message rendering — Alpine 3's reactivity worked
                reliably on this flat messages x-for. The "group into
                assistant turns" experiment broke streaming reactivity
@@ -1898,24 +1901,23 @@
                to hide the avatar on all but the FIRST assistant-side
                msg in a run — visually the same "one avatar per turn"
                result without a derived data structure. -->
-          <!-- P1 (chat-perf-redesign): per-tab DOM persistence. One message
-               list is rendered per OPEN tab; switching toggles x-show instead
-               of swapping the array backing a single x-for (which forced a
-               full Alpine teardown+rebuild of the whole subtree on every
-               switch). The single message template below is UNCHANGED — it's
-               just wrapped in a per-tab pane and bound to paneMessages(tid).
-               For the visible pane paneMessages(currentId) === this.messages
-               by identity, so every `messages`-reading binding inside stays
-               correct; hidden panes are display:none so their (stale)
-               result is never seen. -->
-          <template x-for="tid in residentPaneIds()" :key="tid">
-          <div class="msg-pane" x-show="tid === currentId"
+          <!-- Keep ten recent virtualized panes mounted as an LRU DOM cache.
+               Hidden panes retain their keyed Alpine/Markdown view but remain out
+               of layout; canonical messages still live only in tabState. -->
+          <template x-for="tid in warmTranscriptTabIds()" :key="tid">
+          <div class="msg-pane"
+               x-show="tid === currentId"
+               x-cloak
+               :aria-hidden="tid === currentId ? null : 'true'"
                :data-tid="tid"
-               x-data="{ get pane(){ return paneState(tid) }, get paneMsgs(){ return paneMessages(tid) } }">
-          <template x-for="(m, i) in paneMsgs" :key="m._k">
-            <div :class="'msg ' + (m._is_compact_summary ? 'compact' : m.role) + (isMsgRenderable(m, i, paneMsgs) ? '' : ' is-hidden') + (m._noAnim ? ' no-anim' : '')"
-                 :data-uuid="m.uuid || ''" :data-message-key="m._k"
-                 :style="'contain-intrinsic-size: auto ' + estIntrinsicH(m) + 'px'">
+               x-data="{ get pane(){ return paneState(tid) }, get paneMsgs(){ return paneMessages(tid) }, get paneRows(){ return paneMessageRows(tid) } }">
+          <template x-for="row in paneRows" :key="row.key">
+            <div x-data="{ get m(){ return row.message }, get i(){ return row.index } }"
+                 :class="row.spacer ? 'msg-virtual-spacer' : ('msg ' + (m._is_compact_summary ? 'compact' : m.role) + (isMsgRenderable(m, i, paneMsgs) ? '' : ' is-hidden') + (m._noAnim ? ' no-anim' : ''))"
+                 :data-uuid="row.spacer ? '' : (m.uuid || '')"
+                 :data-message-key="row.spacer ? '' : m._k"
+                 :aria-hidden="row.spacer ? 'true' : null"
+                 :style="row.spacer ? ('height:' + row.height + 'px') : ('contain-intrinsic-size: auto ' + messageIntrinsicH(pane, m) + 'px')">
               <!-- Per-message wall-clock (`mts`, backend). Deliberately NOT on
                    by default: an agentic turn is 30+ tool cards, and stamping
                    every one of them costs more attention than it returns —
@@ -2113,9 +2115,17 @@
                       <svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg>
                     </span>
                     <div class="bubble"
-                         :class="{ 'is-streaming-bubble': pane && pane.streaming && i === paneMsgs.length - 1 }">
-                      <div x-show="m._streamPlain" class="stream-plain" x-text="m.text || ''"></div>
-                      <div x-show="!m._streamPlain" x-html="m.html || ''"></div>
+                         :class="{ 'is-streaming-bubble': pane && pane.streaming && i === paneMsgs.length - 1 }"
+                         x-init="observeAssistantBody($el, m, tid)">
+                      <div x-show="m._streamPlain" class="stream-plain" x-text="m._streamText || ''"></div>
+                      <!-- Newly-virtualized history must never be blank while its
+                           rich renderer catches up. Show resident text immediately
+                           (the transport preview until body prefetch completes), then
+                           upgrade automatically to sanitized Markdown/attachments. -->
+                      <div x-show="!m._streamPlain && !m.html"
+                           class="history-plain"
+                           x-text="m.text || m.preview || ''"></div>
+                      <div x-show="!m._streamPlain && m.html" x-html="m.html || ''"></div>
                     </div>
                   </div>
                   <!-- Per-bubble footer removed. Time + streaming dots
@@ -2925,17 +2935,9 @@
           </div>
           </div>
           </template>
-          <div x-show="messagesReady && hasLaterMessages()" class="load-later-wrap">
-            <button class="load-earlier-btn" @click="loadLaterMessages()"
-                    x-text="lang==='zh' ? '加载较新消息（' + laterMessageCount() + '）' : 'Load newer (' + laterMessageCount() + ')'">
-            </button>
-            <button class="load-earlier-btn latest" @click="returnToLatest()"
-                    x-text="lang==='zh' ? '回到最新' : 'Back to latest'"></button>
-          </div>
           <!-- /P1 per-tab message panes. Siblings below (pending bubble,
                pending queue, banners) stay single-instance with active-tab
-               semantics — they read currentId / this.messages / streaming,
-               which already track the active tab. -->
+               semantics through the activeSession façade above. -->
           <!-- Pending "Muse 正在思考" bubble — only while we're waiting for
                the very first chunk. Once a streaming assistant message has
                started accumulating text (its bubble is already rendered
@@ -2954,9 +2956,9 @@
                top of the turn, when the last msg is still the user's, so both
                placeholders would qualify and stack. The 📦 one is strictly
                more informative, so it wins. -->
-          <div x-show="streaming && (!messages.length
-                                       || messages[messages.length-1].role === 'user')
-                       && !(tabState[currentId] && tabState[currentId].compacting)"
+          <div x-show="activeSession.streaming && (!activeSession.messages.length
+                                       || activeSession.messages[activeSession.messages.length-1].role === 'user')
+                       && !activeSession.compacting"
                class="msg assistant">
             <div class="msg-row">
               <span class="msg-avatar assistant-avatar is-streaming-avatar" :title="mascotLabel()">
@@ -2965,12 +2967,12 @@
               <div class="bubble pending">
                 <span class="thinking-dots"><span></span><span></span><span></span></span>
                 <span class="thinking-label">
-                  <span x-text="t('chat.thinking') + ' · ' + modelLabel(streamingModel)"></span>
+                  <span x-text="t('chat.thinking') + ' · ' + modelLabel(activeSession.streamingModel)"></span>
                   <!-- 2026-05-23: 用统一 fmtStreamElapsed（"12s"/"2m50s"/"1h05m"），
                        跟下方 turn-footer 一致；之前是 `12.3s` 一种格式，长 turn
                        会变 187.4s 这种难读的大数字。-->
-                  <span x-show="streamElapsed > 1" class="stream-elapsed"
-                        x-text="' · ' + fmtStreamElapsed(streamElapsed)"></span>
+                  <span x-show="activeSession.streamElapsed > 1" class="stream-elapsed"
+                        x-text="' · ' + fmtStreamElapsed(activeSession.streamElapsed)"></span>
                 </span>
               </div>
             </div>
@@ -2985,25 +2987,15 @@
                replying (or while a compact was running). They auto-drain on
                the next done event / compact-finally / activateTab. Faded
                + dashed border distinguishes them from real user bubbles. -->
-          <template x-for="(q, qi) in (tabState[currentId] && tabState[currentId].pendingQueue || [])"
-                    :key="q.id">
+          <template x-for="(q, qi) in activeSession.pendingQueue" :key="q.id">
             <div class="msg user queued">
               <div class="msg-row queued-row">
                 <div class="bubble user-bubble queued-bubble">
                   <div class="queued-header">
                     <span class="queued-icon"><svg><use href="#i-clock"/></svg></span>
-                    <!-- "/N" uses _currentQueueLen() (which guards
-                         tabState[currentId] being undefined) instead of
-                         tabState[currentId].pendingQueue.length directly:
-                         during a tab switch, Alpine briefly re-evaluates
-                         this child binding while currentId already points
-                         at a fresh-but-uninitialized tabState entry,
-                         which threw "undefined is not an object" in the
-                         wild (reported via /api/log/client-error
-                         2026-05-22). -->
                     <span class="queued-label"
                           x-text="(lang==='zh' ? '已排队 ' : 'Queued ') + (qi+1) + ' / '
-                                   + _currentQueueLen()"></span>
+                                   + activeSession.pendingQueue.length"></span>
                     <!-- "已排队 1/2" alone reads as "will send shortly", which
                          is wrong while the queue is paused — the item will
                          NEVER send until Resume. State the difference on the
@@ -3012,7 +3004,7 @@
                          phone, and the bubble is what the user actually looks
                          at when wondering why nothing happened. -->
                     <span class="queued-paused-badge"
-                          x-show="tabState[currentId] && tabState[currentId]._queuePaused"
+                          x-show="activeSession._queuePaused"
                           x-text="lang==='zh' ? '已暂停' : 'paused'"></span>
                     <span style="flex:1"></span>
                     <button class="queued-act icon-btn sm"
@@ -3088,21 +3080,18 @@
                because of the flag, and nothing ever indicates why. Paused wins
                over streaming (2026-07-25 report: 2 items sat through several
                completed turns with no visible cause). -->
-          <div x-show="tabState[currentId]
-                        && tabState[currentId].pendingQueue
-                        && tabState[currentId].pendingQueue.length
-                        && (!streaming || tabState[currentId]._queuePaused)
-                        && !(tabState[currentId].backgroundActive)
-                        && !(tabState[currentId].compacting)
-                        && !(tabState[currentId]._draining)"
+          <div x-show="activeSession.pendingQueue.length
+                        && (!activeSession.streaming || activeSession._queuePaused)
+                        && !activeSession.backgroundActive
+                        && !activeSession.compacting
+                        && !activeSession._draining"
                class="queue-paused-banner">
             <span class="queue-paused-icon"><svg><use href="#i-alert-triangle"/></svg></span>
             <span class="queue-paused-text"
-                  x-text="((tabState[currentId] && tabState[currentId]._queuePaused)
+                  x-text="(activeSession._queuePaused
                             ? (lang==='zh' ? '上一条中断，队列已暂停（' : 'Queue paused (')
                             : (lang==='zh' ? '队列等待中（' : 'Queue waiting (' ))
-                          + ((tabState[currentId] && tabState[currentId].pendingQueue
-                              && tabState[currentId].pendingQueue.length) || 0)
+                          + activeSession.pendingQueue.length
                           + (lang==='zh' ? ' 条）' : ' waiting)')"></span>
             <button class="queue-paused-btn primary"
                     @click="resumeQueueDrain(currentId)"
@@ -3120,7 +3109,7 @@
                shimmer in the top ctx-meter). Appears for the full window
                between native-compact POST and loadSession completing — can
                be ~20-60s on a long session. -->
-          <div x-show="tabState[currentId] && tabState[currentId].compacting" class="msg assistant compact-pending">
+          <div x-show="activeSession.compacting" class="msg assistant compact-pending">
             <div class="msg-row">
               <span class="msg-avatar assistant-avatar is-streaming-avatar" :title="mascotLabel()">
                 <svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg>
@@ -3132,12 +3121,16 @@
               </div>
             </div>
           </div>
+          <!-- One stable physical target for every tail-follow path. Message
+               virtualization may replace the mounted rows and spacers, but this
+               node never changes identity or disappears at stream completion. -->
+          <div x-ref="chatBottom" class="chat-bottom-anchor" aria-hidden="true"></div>
         </div>
-        <button class="jump-bottom" x-show="!atBottom" @click="scrollToBottom(true)" :title="lang==='zh'?'最新':'Jump to latest'" :aria-label="lang==='zh' ? '跳到最新消息' : 'Jump to latest'"><svg><use href="#i-arrow-down"/></svg></button>
+        <button class="jump-bottom" x-show="!activeSession.atBottom" @click="scrollToBottom(true)" :title="lang==='zh'?'最新':'Jump to latest'" :aria-label="lang==='zh' ? '跳到最新消息' : 'Jump to latest'"><svg><use href="#i-arrow-down"/></svg></button>
         <!-- Outline FAB — sits right above jump-bottom in the same chat
-             pane. Same visibility rule as jump-bottom (x-show="!atBottom")
+             pane. Same visibility rule as jump-bottom (x-show="!activeSession.atBottom")
              so the two appear/disappear together as a pair. -->
-        <button class="chat-outline-fab" x-show="!atBottom"
+        <button class="chat-outline-fab" x-show="!activeSession.atBottom"
                 @click="msgOutlineOpen = true"
                 :title="lang==='zh' ? '会话目录' : 'Outline'">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -3152,8 +3145,8 @@
         <!-- Prev-user FAB — top of the chat-pane stack, sits 46px above
              the outline FAB. Steps the viewport up to the previous user
              message so you can walk back through your own turns. Shares
-             the trio's x-show="!atBottom" visibility. -->
-        <button class="chat-prevuser-fab" x-show="!atBottom" @click="jumpToPrevUser()"
+             the trio's x-show="!activeSession.atBottom" visibility. -->
+        <button class="chat-prevuser-fab" x-show="!activeSession.atBottom" @click="jumpToPrevUser()"
                 :title="lang==='zh' ? '上一条提问' : 'Previous message'"
                 :aria-label="lang==='zh' ? '跳到上一条用户消息' : 'Jump to previous user message'"><svg><use href="#i-arrow-up"/></svg></button>
         </div>
@@ -3551,8 +3544,8 @@
                  @click.outside and closes it immediately. -->
             <button class="chat-toolbar-ring"
                     :class="{
-                      warn: sessionUsage.context_used_pct >= 70 && sessionUsage.context_used_pct < 90,
-                      danger: sessionUsage.context_used_pct >= 90,
+                      warn: activeSessionPane().sessionUsage.context_used_pct >= 70 && activeSessionPane().sessionUsage.context_used_pct < 90,
+                      danger: activeSessionPane().sessionUsage.context_used_pct >= 90,
                     }"
                     @click.stop="showCtxBreakdown()"
                     @contextmenu.prevent.stop="showCtxBreakdown()"
@@ -3564,7 +3557,7 @@
                         stroke="currentColor" stroke-width="2.5"
                         stroke-linecap="round"
                         stroke-dasharray="43.98"
-                        :stroke-dashoffset="43.98 * (1 - Math.min(100, sessionUsage.context_used_pct||0) / 100)"
+                        :stroke-dashoffset="43.98 * (1 - Math.min(100, activeSessionPane().sessionUsage.context_used_pct||0) / 100)"
                         transform="rotate(-90 10 10)"/>
               </svg>
             </button>
@@ -3582,40 +3575,19 @@
               <span class="chat-toolbar-rl-text" x-text="currentQuotaText()"></span>
             </span>
             <span class="chat-toolbar-spacer"></span>
-            <!-- Send / Stop. The button is disabled while ANY attachment is
-                 still mid-upload (pendingImages/pendingDocs .uploading) — the
-                 user cannot fire a turn until every image/doc finishes, so a
-                 half-uploaded attachment can never be sent. `_sendWaitingForUpload`
-                 stays as a belt-and-suspenders guard for the resumed-queue path
-                 (drained item whose snapshot is still uploading), where the
-                 auto-wait inside sendMessage polls to completion. Together they
-                 also stop a double-tap from queueing two sends for one upload. -->
-            <!-- Send button — always visible. send() routes the click:
-                 idle → fire SSE; streaming/compacting → enqueue onto
-                 tabState[currentId].pendingQueue. A small badge in the
-                 corner surfaces the current backlog count. The title
-                 swaps to reflect what the click will actually do, so
-                 the user always knows. The neighboring stop button only
-                 shows while streaming. Same shape + size + fill — they
-                 read as a sibling pair (blue send / red stop). -->
+            <!-- Send stays visible. Internal submission phases are represented
+                 only by the button spinner; no transport status text is exposed.
+                 Streaming, compact and queued work remain routable states. -->
             <button @click="send()"
-                    :disabled="workspaceSwitching || !availableModels.length || tabState[currentId]?._stopping || tabState[currentId]?._composerSubmitting || tabState[currentId]?._permissionChangePending || runtimeSettingsPending() || _sendWaitingForUpload || pendingImages.some(im => im.uploading) || pendingDocs.some(d => d.uploading) || (!input.trim() && !pendingQuotes.length && !pendingImages.length && !pendingDocs.length)"
+                    :disabled="composerClaimed(currentId) || !!composerDisabledReason(currentId)"
                     class="btn-primary chat-toolbar-send chat-toolbar-queue"
-                    :aria-busy="!!tabState[currentId]?._composerSubmitting"
-                    :aria-label="tabState[currentId]?._composerSubmitting
-                      ? (lang==='zh' ? '正在发送' : 'Sending')
-                      : tabState[currentId]?._stopping
-                      ? (lang==='zh' ? '正在中断' : 'Stopping')
-                      : sendButtonHint(currentId)"
-                    :title="tabState[currentId]?._composerSubmitting
-                      ? (lang==='zh' ? '正在提交消息' : 'Submitting message')
-                      : tabState[currentId]?._stopping
-                      ? (lang==='zh' ? '等待上一条任务完成中断' : 'Waiting for the previous turn to stop')
-                      : sendButtonHint(currentId)">
+                    :aria-busy="composerClaimed(currentId)"
+                    :aria-label="sendButtonHint(currentId)"
+                    :title="sendButtonHint(currentId)">
               <span class="spinner-sm"
-                    x-show="tabState[currentId]?._composerSubmitting"></span>
+                    x-show="composerClaimed(currentId)"></span>
               <span class="icon"
-                    x-show="!tabState[currentId]?._composerSubmitting"><svg><use href="#i-send"/></svg></span>
+                    x-show="!composerClaimed(currentId)"><svg><use href="#i-send"/></svg></span>
               <span class="chat-toolbar-queue-badge"
                     x-show="_currentQueueLen() > 0"
                     x-text="_currentQueueLen()"></span>
@@ -3679,7 +3651,12 @@
          'is-dragged': previewQuote.dragged,
          'is-dragging': previewQuote.dragging,
        }"
-       :style="{ left: previewQuote.x + 'px', top: previewQuote.y + 'px' }"
+       :style="{
+         left: previewQuote.x + 'px',
+         top: previewQuote.y + 'px',
+         '--preview-question-width': previewQuote.width + 'px',
+         '--preview-question-height': previewQuote.height + 'px',
+       }"
        role="dialog"
        :aria-label="previewQuote.mode === 'ask'
          ? (lang === 'zh' ? '针对选中内容询问' : 'Ask about selection')
@@ -3831,6 +3808,16 @@
             </button>
           </div>
         </div>
+        <template x-for="edge in ['n', 'ne', 'e', 'se', 's', 'sw', 'w', 'nw']" :key="edge">
+          <span class="preview-selection-resize-handle"
+                :class="'is-' + edge"
+                aria-hidden="true"
+                @pointerdown.stop="startPreviewQuoteResize($event, edge)"
+                @pointermove.stop="movePreviewQuoteResize($event)"
+                @pointerup.stop="finishPreviewQuoteResize($event)"
+                @pointercancel.stop="finishPreviewQuoteResize($event)"
+                @lostpointercapture.stop="finishPreviewQuoteResize($event)"></span>
+        </template>
       </div>
     </template>
   </div>
@@ -4104,6 +4091,9 @@
     <!-- 通用 -->
     <button class="ctx-item" @click="ctxAction('copyPath')" x-show="!ctxMenu.multi">
       <span class="icon"><svg><use href="#i-copy"/></svg></span><span x-text="t('btn.copy_path')"></span>
+    </button>
+    <button class="ctx-item" @click="ctxAction('copyAbsolutePath')" x-show="!ctxMenu.multi">
+      <span class="icon"><svg><use href="#i-copy"/></svg></span><span x-text="t('btn.copy_absolute_path')"></span>
     </button>
     <button class="ctx-item" @click="ctxAction('rename')" x-show="!ctxMenu.multi">
       <span class="icon"><svg><use href="#i-edit"/></svg></span><span x-text="t('btn.rename')"></span>

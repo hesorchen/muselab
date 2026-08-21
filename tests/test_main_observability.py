@@ -219,7 +219,16 @@ def test_event_loop_monitor_emits_only_threshold_crossing(
     with pytest.raises(asyncio.CancelledError):
         asyncio.run(app_module._monitor_event_loop_lag())
 
-    assert events == [("runtime.loop_lag", {"lag_ms": 300})]
+    assert events == [(
+        "runtime.loop_lag",
+        {
+            "site": "event_loop",
+            "session": "none",
+            "duration_ms": 300,
+            "file_size": 0,
+            "lag_ms": 300,
+        },
+    )]
     assert watchdog.started is True
     assert watchdog.heartbeats == [1.3]
     assert watchdog.stopped is True

@@ -670,6 +670,38 @@ async def test_failed_generation_reconciles_only_after_retry_is_armed(
     await manager.shutdown()
 
 
+def test_reconcile_backoff_is_scoped_to_each_workspace(
+    app_module,
+    temp_root,
+    monkeypatch,
+):
+    import backend.file_events as file_events
+
+    monkeypatch.setattr(file_events, "monotonic", lambda: 100.0)
+    monkeypatch.setattr(file_events, "_RECONCILE_RETRY_BASE_S", 1.0)
+    monkeypatch.setattr(file_events, "_RECONCILE_RETRY_MAX_S", 10.0)
+    first = file_events._WatchState(
+        root=temp_root / "first",
+        workspace_id="first",
+    )
+    second = file_events._WatchState(
+        root=temp_root / "second",
+        workspace_id="second",
+    )
+
+    file_events.FileWatchManager._record_reconcile_retry(first)
+    file_events.FileWatchManager._record_reconcile_retry(first)
+    file_events.FileWatchManager._record_reconcile_retry(second)
+
+    assert first.reconcile_failures == 2
+    assert first.reconcile_retry_at == 102.0
+    assert second.reconcile_failures == 1
+    assert second.reconcile_retry_at == 101.0
+    file_events.FileWatchManager._reset_reconcile_retry(second)
+    assert second.reconcile_retry_at == 0.0
+    assert first.reconcile_retry_at == 102.0
+
+
 @pytest.mark.asyncio
 async def test_reconcile_perf_event_splits_wait_scan_and_replay(
     app_module,
@@ -709,12 +741,10 @@ async def test_reconcile_perf_event_splits_wait_scan_and_replay(
         initialized=True,
     )
 
-    # Exercise both independent queueing stages without making the test slow.
-    await manager._reconcile_semaphore.acquire()
+    # The per-workspace mutation queue is observable without a process-wide
+    # scan gate that would couple unrelated roots.
     await state.mutation_lock.acquire()
     task = asyncio.create_task(manager._reconcile_and_broadcast(state))
-    await asyncio.sleep(0.02)
-    manager._reconcile_semaphore.release()
     await asyncio.sleep(0.02)
     state.mutation_lock.release()
     await asyncio.wait_for(task, timeout=1)
@@ -725,13 +755,17 @@ async def test_reconcile_perf_event_splits_wait_scan_and_replay(
     assert fields["workspace"] == "workspac"
     assert fields["status"] == "ok"
     assert fields["error_type"] is None
-    assert fields["scan_slot_wait_ms"] >= 10
+    assert "scan_slot_wait_ms" not in fields
     assert fields["mutation_lock_wait_ms"] >= 10
     assert fields["scan_ms"] >= 0
     assert fields["replay_ms"] >= 0
+    assert fields["scanned_files"] == 0
+    assert fields["snapshot_files"] == 0
+    assert fields["partial"] is False
+    assert fields["partial_reason"] is None
     assert fields["changes"] == 1
     assert fields["resync"] is True
-    assert fields["total_ms"] >= 30
+    assert fields["total_ms"] >= 10
     captured = repr(events)
     assert str(temp_root) not in captured
     assert "private-replay.txt" not in captured
@@ -739,7 +773,7 @@ async def test_reconcile_perf_event_splits_wait_scan_and_replay(
 
 
 @pytest.mark.asyncio
-async def test_full_reconciles_are_globally_serialized(
+async def test_workspace_reconciles_run_independently_off_event_loop(
     app_module,
     temp_root,
 ):
@@ -806,26 +840,24 @@ async def test_full_reconciles_are_globally_serialized(
     second_task = asyncio.create_task(
         manager._reconcile_and_broadcast(second)
     )
-    await asyncio.sleep(0.05)
-    assert store.calls == 1
-    assert store.max_active == 1
-    queued_workspace_mutated = asyncio.Event()
+    for _ in range(20):
+        if store.calls == 2:
+            break
+        await asyncio.sleep(0.01)
+    assert store.calls == 2
+    assert store.max_active == 2
 
-    async def mutate_while_scan_is_queued():
-        async with second.mutation_lock:
-            queued_workspace_mutated.set()
-
-    queued_mutation = asyncio.create_task(mutate_while_scan_is_queued())
-    await asyncio.wait_for(queued_workspace_mutated.wait(), timeout=0.5)
-    await queued_mutation
+    # Both blocking scans are worker-thread work: the event loop must continue
+    # servicing unrelated coroutines while neither filesystem pass can finish.
+    heartbeat = asyncio.Event()
+    asyncio.get_running_loop().call_soon(heartbeat.set)
+    await asyncio.wait_for(heartbeat.wait(), timeout=0.2)
     store.release.set()
     await asyncio.gather(first_task, second_task)
-    assert store.calls == 2
-    assert store.max_active == 1
 
-    # A watcher can restart while its workspace is queued behind the global
-    # scan slot. The queued pass must follow the replacement generation and
-    # wait for it to arm instead of scanning inside the new watch gap.
+    # A watcher can restart while its own mutation lock is queued. The pass must
+    # follow the replacement generation and wait for it to arm instead of
+    # scanning inside the new watch gap.
     async def parked_watcher():
         await asyncio.Future()
 
@@ -838,13 +870,13 @@ async def test_full_reconciles_are_globally_serialized(
     )
     queued.watch_ready.set()
     queued.watch_paths = (queued.root,)
-    await manager._reconcile_semaphore.acquire()
+    await queued.mutation_lock.acquire()
     queued_scan = asyncio.create_task(
         manager._reconcile_and_broadcast(queued)
     )
     await asyncio.sleep(0.02)
     queued.watch_ready.clear()
-    manager._reconcile_semaphore.release()
+    queued.mutation_lock.release()
     await asyncio.sleep(0.05)
     assert store.calls == 2
     queued.watch_ready.set()
@@ -1541,10 +1573,10 @@ def test_directory_modified_events_are_bounded_cursor_noops(
     scans = 0
     real_scan = workspace_store.scan_workspace
 
-    def counted_scan(root):
+    def counted_scan(root, **kwargs):
         nonlocal scans
         scans += 1
-        return real_scan(root)
+        return real_scan(root, **kwargs)
 
     monkeypatch.setattr(workspace_store, "scan_workspace", counted_scan)
     duplicate = store.apply_changes(
@@ -1963,6 +1995,154 @@ def test_heavy_hidden_subtrees_keep_node_but_skip_descendants(
         assert name in paths
         assert f"{name}/deep" not in paths
         assert f"{name}/deep/state.json" not in paths
+
+
+def test_reconcile_budget_reports_partial_without_inventing_deletes(
+    app_module,
+    temp_root,
+):
+    from backend.workspace_store import WorkspaceStore
+    from backend.workspaces import registry
+
+    workspace_id = registry.id_for(temp_root)
+    store = WorkspaceStore(temp_root)
+    store.reconcile(
+        workspace_id,
+        temp_root,
+        "root",
+        primary=True,
+        max_files=None,
+        max_seconds=None,
+    )
+    stale = temp_root / "README.md"
+    stale.unlink()
+    (temp_root / "00-observed.txt").write_text("new", encoding="utf-8")
+
+    report = {}
+    store.reconcile(
+        workspace_id,
+        temp_root,
+        "root",
+        primary=True,
+        max_files=1,
+        max_seconds=None,
+        report=report,
+    )
+
+    assert report == {
+        "partial": True,
+        "partial_reason": "file_limit",
+        "scanned_files": 1,
+        "snapshot_files": 1,
+        "resumed": False,
+        "scan_ms": report["scan_ms"],
+    }
+    partial_paths = {
+        row["path"] for row in store.bootstrap(workspace_id)["entries"]
+    }
+    assert "README.md" in partial_paths
+
+    complete_report = {}
+    store.reconcile(
+        workspace_id,
+        temp_root,
+        "root",
+        primary=True,
+        max_files=None,
+        max_seconds=None,
+        report=complete_report,
+    )
+    assert complete_report["partial"] is False
+    complete_paths = {
+        row["path"] for row in store.bootstrap(workspace_id)["entries"]
+    }
+    assert "README.md" not in complete_paths
+    assert "00-observed.txt" in complete_paths
+
+
+def test_bounded_scan_resumes_until_snapshot_is_complete(
+    app_module,
+    tmp_path,
+):
+    from backend.workspace_store import WorkspaceStore
+
+    root = tmp_path / "resumable"
+    root.mkdir()
+    for index in range(7):
+        (root / f"file-{index}.txt").write_text("x", encoding="utf-8")
+
+    store = WorkspaceStore(root)
+    progress = {}
+    reports = []
+    for _ in range(10):
+        report = {}
+        store.reconcile(
+            "bounded-workspace",
+            root,
+            "bounded",
+            max_files=2,
+            max_seconds=None,
+            report=report,
+            scan_progress=progress,
+        )
+        reports.append(report)
+        if not report["partial"]:
+            break
+
+    assert len(reports) == 4
+    assert [report["scanned_files"] for report in reports] == [2, 2, 2, 1]
+    assert reports[-1]["snapshot_files"] == 7
+    assert reports[-1]["resumed"] is True
+    assert progress == {}
+    assert {
+        row["path"]
+        for row in store.bootstrap("bounded-workspace")["entries"]
+    } == {f"file-{index}.txt" for index in range(7)}
+
+
+def test_explicit_large_tree_pruning_keeps_only_directory_nodes(
+    app_module,
+    temp_root,
+):
+    from backend.workspace_store import scan_workspace
+
+    for name in (
+        "node_modules",
+        ".git",
+        "dist",
+        "build",
+        "target",
+        "output",
+        "pdc_space",
+        "share_space",
+        "content_agent_freshdoc",
+    ):
+        nested = temp_root / name / "deep"
+        nested.mkdir(parents=True, exist_ok=True)
+        (nested / "large.bin").write_bytes(b"x")
+
+    paths = {
+        row["path"]
+        for row in scan_workspace(
+            temp_root,
+            max_files=None,
+            max_seconds=None,
+        )
+    }
+    for name in (
+        "node_modules",
+        ".git",
+        "dist",
+        "build",
+        "target",
+        "output",
+        "pdc_space",
+        "share_space",
+        "content_agent_freshdoc",
+    ):
+        assert name in paths
+        assert f"{name}/deep" not in paths
+        assert f"{name}/deep/large.bin" not in paths
 
 
 def test_unchanged_reconcile_does_not_bulk_reinsert(

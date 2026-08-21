@@ -75,8 +75,18 @@ def stream_env(app_module, monkeypatch):
     logic itself untouched."""
     from backend import chat as chat_mod
 
-    # No real JSONL transcript — result handler tolerates an empty list.
+    # No real JSONL transcript. Model a committed current-turn boundary by
+    # default; individual failure tests override this resolver explicitly.
     monkeypatch.setattr(chat_mod, "_get_session_msgs", lambda sid, model="": [])
+    monkeypatch.setattr(
+        chat_mod, "_real_turn_uuids_from_boundary_for_test",
+        chat_mod._turn_uuids_from_boundary, raising=False)
+    monkeypatch.setattr(
+        chat_mod,
+        "_turn_uuids_from_boundary",
+        lambda *_args, **_kwargs: (
+            "fixture-canonical-assistant", "fixture-canonical-user", True),
+    )
     # Skip jsonl signature cleanup (would scan disk).
     from backend import jsonl_cleanup
     monkeypatch.setattr(jsonl_cleanup, "clean_session", lambda sid: None)
@@ -112,6 +122,13 @@ def test_mem0_never_rewrites_canonical_user_query(
         f"&prompt={prompt}&model=claude-sonnet-4-6")
     assert response.status_code == 200
     assert fake.queried == [prompt]
+    done = next(
+        json.loads(data)
+        for event, data in _parse_sse(response.text)
+        if event == "done"
+    )
+    assert done["is_error"] is False
+    assert done["assistant_uuid"] == "fixture-canonical-assistant"
 
 
 def _make_session(client):
@@ -530,6 +547,224 @@ def test_result_only_error_persists_tail_bubble_without_relabeling_old_turn(
     assert terminal["role"] == "assistant"
     assert "context window" in terminal["text"]
     assert terminal["turn_status"] == "failed"
+
+
+def test_prevent_continuation_cannot_be_overridden_by_success_result(
+        stream_env, client, monkeypatch):
+    """A rejected UserPromptSubmit stays failed even if Result says success."""
+    chat_mod = stream_env
+    sid = _make_session(client)
+    fake = _FakeStreamClient([
+        SystemMessage(
+            subtype="informational",
+            data={
+                "content": (
+                    "UserPromptSubmit operation blocked by hook: "
+                    "callback timed out"
+                ),
+                "level": "warning",
+                "preventContinuation": True,
+            },
+        ),
+        ResultMessage(
+            subtype="success", duration_ms=50, duration_api_ms=40,
+            is_error=False, num_turns=1, session_id=sid,
+            total_cost_usd=0.0, usage={},
+        ),
+    ])
+
+    async def fake_get_client(*_args, **_kwargs):
+        return fake
+
+    monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
+    response = client.get(
+        f"/api/chat/stream?token={TEST_TOKEN}&session_id={sid}"
+        "&prompt=must-survive-refresh&model=claude-sonnet-4-6",
+    )
+    assert response.status_code == 200, response.text
+    done = next(
+        json.loads(data)
+        for event, data in _parse_sse(response.text)
+        if event == "done"
+    )
+
+    assert done["is_error"] is True
+    assert done["snapshot_ready"] is True
+    assert done["assistant_uuid"] == ""
+    assert "blocked by hook" in done["error"]
+    assert done["kind"] == "network"
+    assert done["retryable"] is True
+
+    history = client.get(
+        f"/api/chat/sessions/{sid}",
+        params={"tail": 80},
+        headers={"X-Auth-Token": TEST_TOKEN},
+    )
+    assert history.status_code == 200, history.text
+    messages = history.json()["messages"]
+    assert any(
+        message.get("role") == "user"
+        and message.get("text") == "must-survive-refresh"
+        and message.get("_failed") is True
+        for message in messages
+    )
+    assert messages[-1]["turn_status"] == "failed"
+
+
+def test_prevent_continuation_without_result_surfaces_hook_error(
+        stream_env, client, monkeypatch):
+    chat_mod = stream_env
+    sid = _make_session(client)
+    fake = _FakeStreamClient([SystemMessage(
+        subtype="informational",
+        data={
+            "content": "UserPromptSubmit operation blocked by hook timeout",
+            "preventContinuation": True,
+        },
+    )])
+
+    async def fake_get_client(*_args, **_kwargs):
+        return fake
+
+    monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
+    response = client.get(
+        f"/api/chat/stream?token={TEST_TOKEN}&session_id={sid}"
+        "&prompt=no-result&model=claude-sonnet-4-6",
+    )
+    error = next(
+        json.loads(data)
+        for event, data in _parse_sse(response.text)
+        if event == "error"
+    )
+
+    assert "blocked by hook timeout" in error["error"]
+    assert "without a ResultMessage" not in error["error"]
+    assert error["snapshot_ready"] is True
+
+
+def test_success_result_without_canonical_turn_is_failed(
+        stream_env, client, monkeypatch):
+    """Result success is insufficient when the current turn never reached JSONL."""
+    chat_mod = stream_env
+    sid = _make_session(client)
+    fake = _FakeStreamClient([ResultMessage(
+        subtype="success", duration_ms=50, duration_api_ms=40,
+        is_error=False, num_turns=1, session_id=sid,
+        total_cost_usd=0.0, usage={},
+    )])
+
+    async def fake_get_client(*_args, **_kwargs):
+        return fake
+
+    monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
+    monkeypatch.setattr(
+        chat_mod, "_turn_uuids_from_boundary",
+        lambda *_args, **_kwargs: (None, None, True),
+    )
+    response = client.get(
+        f"/api/chat/stream?token={TEST_TOKEN}&session_id={sid}"
+        "&prompt=missing-canonical-turn&model=claude-sonnet-4-6",
+    )
+    assert response.status_code == 200, response.text
+    done = next(
+        json.loads(data)
+        for event, data in _parse_sse(response.text)
+        if event == "done"
+    )
+
+    assert done["is_error"] is True
+    assert done["snapshot_ready"] is True
+    assert done["assistant_uuid"] == ""
+    assert "committed to conversation history" in done["error"]
+    assert done["retryable"] is True
+
+
+def test_canonical_commit_waits_for_late_transcript_flush(
+        stream_env, client, monkeypatch):
+    chat_mod = stream_env
+    sid = _make_session(client)
+    fake = _FakeStreamClient([ResultMessage(
+        subtype="success", duration_ms=50, duration_api_ms=40,
+        is_error=False, num_turns=1, session_id=sid,
+        total_cost_usd=0.0, usage={},
+    )])
+    evidence = iter([
+        (None, None, True),
+        ("late-assistant", "late-user", True),
+    ])
+    calls = 0
+
+    async def fake_get_client(*_args, **_kwargs):
+        return fake
+
+    def resolve(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return next(evidence)
+
+    monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
+    monkeypatch.setattr(chat_mod, "_turn_uuids_from_boundary", resolve)
+    response = client.get(
+        f"/api/chat/stream?token={TEST_TOKEN}&session_id={sid}"
+        "&prompt=late-flush&model=claude-sonnet-4-6",
+    )
+    done = next(
+        json.loads(data)
+        for event, data in _parse_sse(response.text)
+        if event == "done"
+    )
+
+    assert calls == 2
+    assert done["is_error"] is False
+    assert done["assistant_uuid"] == "late-assistant"
+
+
+def test_slash_command_success_does_not_require_chat_bubbles(
+        stream_env, client, monkeypatch):
+    chat_mod = stream_env
+    sid = _make_session(client)
+    fake = _FakeStreamClient([ResultMessage(
+        subtype="success", duration_ms=50, duration_api_ms=40,
+        is_error=False, num_turns=1, session_id=sid,
+        total_cost_usd=0.0, usage={},
+    )])
+
+    async def fake_get_client(*_args, **_kwargs):
+        return fake
+
+    def forbidden_resolver(*_args, **_kwargs):
+        raise AssertionError("slash command must use its SDK Result verdict")
+
+    monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
+    monkeypatch.setattr(
+        chat_mod, "_turn_uuids_from_boundary", forbidden_resolver)
+    response = client.get(
+        f"/api/chat/stream?token={TEST_TOKEN}&session_id={sid}"
+        "&prompt=/compact&model=claude-sonnet-4-6",
+    )
+    done = next(
+        json.loads(data)
+        for event, data in _parse_sse(response.text)
+        if event == "done"
+    )
+
+    assert done["is_error"] is False
+
+
+def test_unestablished_boundary_cannot_match_old_history(
+        stream_env, monkeypatch):
+    chat_mod = stream_env
+
+    def forbidden_index(_sid):
+        raise AssertionError("invalid anchor must fail before history lookup")
+
+    monkeypatch.setattr(chat_mod, "_ensure_transcript_index", forbidden_index)
+    assert chat_mod._real_turn_uuids_from_boundary_for_test(
+        "sid",
+        {"record_count": 0, "capture_ok": False},
+        started_at_ms=1000,
+        terminal_at_ms=2000,
+    ) == (None, None, False)
 
 
 def test_activity_hidden_turn_never_enters_global_task_center(
@@ -1090,9 +1325,14 @@ def test_turn_response_boundary_accepts_lifecycle_and_uuid_less_error(stream_env
     error_result = ResultMessage(
         subtype="error", duration_ms=1, duration_api_ms=1,
         is_error=True, num_turns=1, session_id="sid", uuid=None)
+    stale_system = SystemMessage(
+        subtype="informational",
+        data={"uuid": "old", "preventContinuation": True},
+    )
 
     assert boundary.classify(lifecycle) == "forward"
     assert boundary.classify(old_result) == "stale_result"
+    assert boundary.classify(stale_system) == "drop"
     assert boundary.classify(error_result) == "current_result"
 
 
@@ -1733,9 +1973,13 @@ async def test_hidden_runtime_continuation_projects_one_agent_bubble_to_leaf(
             "runtime_event_id": runtime_snapshots[0]["runtime_event_id"],
             "presentation_only": True,
             "forkable": False,
+            "block_id": (
+                "runtime-continuation:"
+                f"{runtime_snapshots[0]['runtime_event_id']}:0:assistant"
+            ),
             "_key": (
                 "runtime-continuation:"
-                f"{runtime_snapshots[0]['runtime_event_id']}:0"
+                f"{runtime_snapshots[0]['runtime_event_id']}:0:assistant"
             ),
         }
         assert "uuid" not in bubble
@@ -2443,20 +2687,65 @@ async def test_watcher_shutdown_partial_never_projects_completed_bubble(
         chat_mod._delete_cancelled_turn_snapshots(child_sid)
 
 
-def test_continuation_terminal_precedes_annotation_bookkeeping(stream_env):
-    """Queue done, annotate its exact UUID, then release the event loop."""
+def test_usage_transcript_hydration_does_not_block_event_loop(
+    stream_env, monkeypatch,
+):
+    import time
+
+    sid = "12345678-usage-hydrate"
+    stream_env._session_usage.pop(sid, None)
+    monkeypatch.setattr(
+        stream_env,
+        "_session_usage_from_jsonl",
+        lambda _sid: (time.sleep(0.04) or None),
+    )
+    monkeypatch.setattr(stream_env, "_find_session_jsonl", lambda _sid: None)
+
+    async def no_capability(_model):
+        return {}
+
+    monkeypatch.setattr(
+        stream_env, "_detect_gateway_context_capability", no_capability)
+
+    ticks = 0
+    done = False
+
+    async def ticker():
+        nonlocal ticks
+        while not done:
+            ticks += 1
+            await asyncio.sleep(0.001)
+
+    async def scenario():
+        nonlocal done
+        ticker_task = asyncio.create_task(ticker())
+        try:
+            await stream_env.session_usage(sid)
+        finally:
+            done = True
+            await ticker_task
+            stream_env._session_usage.pop(sid, None)
+
+    asyncio.run(scenario())
+    assert ticks >= 5
+
+
+def test_continuation_footer_is_durable_before_terminal_publish(stream_env):
+    """Offload the exact-UUID sidecar write without reopening the reload race."""
     import inspect
 
     source = inspect.getsource(stream_env._watch_inflight_tasks)
+    close_at = source.index("async def _close_continuation")
+    annotate_at = source.index("sess.set_message_annotation,", close_at)
     done_at = source.index(
-        'b.publish({"event": "done", "data": json.dumps(done_payload)})')
-    annotate_at = source.index("sess.set_message_annotation(", done_at)
-    finish_at = source.index("b.finish()", annotate_at)
-    assert done_at < annotate_at
-    assert annotate_at < finish_at
-    close_source = source[source.index("async def _close_continuation"):finish_at]
+        'b.publish({"event": "done", "data": json.dumps(done_payload)})',
+        annotate_at,
+    )
+    finish_at = source.index("b.finish()", done_at)
+    assert annotate_at < done_at < finish_at
+    close_source = source[close_at:finish_at]
     assert "_recent_turn_uuids" not in close_source
-    assert "asyncio.to_thread" not in close_source
+    assert 'await obs.to_thread_io(' in close_source
     assert '(state or {}).get("assistant_uuid")' in close_source
     assert stream_env._CONTINUATION_GRACE <= 8
 
@@ -2523,8 +2812,125 @@ def test_watcher_explicitly_resumes_when_auto_continuation_stream_ends(stream_en
         chat_mod._delete_active_turn_sidecar(sid)
 
 
-def test_active_turn_sidecar_survives_detached_background_gap(stream_env):
-    """A main Result is not clean completion while its watcher is alive."""
+def test_restart_orphan_becomes_durable_failed_history(
+        stream_env, client, monkeypatch):
+    """A crash before canonical UserMessage commit must not erase the prompt."""
+    chat_mod = stream_env
+    sid = _make_session(client)
+    turn = chat_mod.TurnBroadcast(
+        session_id=sid, model="claude-sonnet-4-6")
+    turn.user_text = "原始发送内容必须保留"
+    turn.user_images = [{"id": "image-one", "url": "/private/image-one"}]
+    turn.user_docs = [{"id": "doc-one", "name": "notes.md"}]
+    turn.transcript_boundary = {
+        "record_count": 7,
+        "source_dev": 11,
+        "source_inode": 13,
+        "capture_ok": True,
+    }
+    chat_mod._write_active_turn_sidecar(turn)
+    monkeypatch.setattr(
+        chat_mod, "_turn_uuids_from_boundary",
+        lambda *_args, **_kwargs: (None, None, True),
+    )
+    sidecar = chat_mod._active_turn_path(sid)
+    persisted = json.loads(sidecar.read_text(encoding="utf-8"))
+    chat_mod._interrupted_at_startup[sid] = persisted
+
+    try:
+        history = client.get(
+            f"/api/chat/sessions/{sid}",
+            params={"tail": 80},
+            headers={"X-Auth-Token": TEST_TOKEN},
+        )
+        assert history.status_code == 200, history.text
+        messages = history.json()["messages"]
+        user = next(m for m in messages if m.get("role") == "user")
+        assert user["text"] == "原始发送内容必须保留"
+        assert user["images"] == turn.user_images
+        assert user["docs"] == turn.user_docs
+        assert user["_failed"] is True
+        assert user["_error_kind"] == "unknown"
+        assert user["_error_cta"] == "retry"
+        assert user["_error_retryable"] is True
+        assert "restarted" in user["_error_text"]
+        assert messages[-1]["turn_status"] == "failed"
+        assert not sidecar.exists()
+
+        snapshots, _ = chat_mod._load_cancelled_turn_snapshots(sid)
+        assert snapshots[0]["transcript_boundary"] == {
+            "record_count": 7,
+            "source_dev": 11,
+            "source_inode": 13,
+        }
+    finally:
+        chat_mod._interrupted_at_startup.pop(sid, None)
+        chat_mod._delete_active_turn_sidecar(sid)
+
+
+def test_restart_sidecar_does_not_duplicate_already_canonical_turn(
+        stream_env, client, monkeypatch):
+    chat_mod = stream_env
+    sid = _make_session(client)
+    turn = chat_mod.TurnBroadcast(
+        session_id=sid, model="claude-sonnet-4-6")
+    turn.user_text = "already committed"
+    turn.transcript_boundary = {
+        "record_count": 3,
+        "source_dev": 5,
+        "source_inode": 7,
+        "capture_ok": True,
+    }
+    chat_mod._write_active_turn_sidecar(turn)
+    chat_mod._interrupted_at_startup[sid] = json.loads(
+        chat_mod._active_turn_path(sid).read_text(encoding="utf-8"))
+    monkeypatch.setattr(
+        chat_mod, "_turn_uuids_from_boundary",
+        lambda *_args, **_kwargs: ("canonical-assistant", "canonical-user", True),
+    )
+    persist_calls = []
+    monkeypatch.setattr(
+        chat_mod, "_persist_failed_turn_snapshot",
+        lambda *_args, **_kwargs: persist_calls.append(True) or True,
+    )
+
+    try:
+        assert chat_mod._recover_interrupted_turn_snapshot(sid) is True
+        assert persist_calls == []
+        assert not chat_mod._active_turn_path(sid).exists()
+    finally:
+        chat_mod._interrupted_at_startup.pop(sid, None)
+        chat_mod._delete_active_turn_sidecar(sid)
+
+
+def test_interrupted_dismiss_fails_closed_until_history_is_durable(
+        stream_env, client, monkeypatch):
+    chat_mod = stream_env
+    sid = _make_session(client)
+    turn = chat_mod.TurnBroadcast(
+        session_id=sid, model="claude-sonnet-4-6")
+    turn.user_text = "do not discard me"
+    chat_mod._write_active_turn_sidecar(turn)
+    chat_mod._interrupted_at_startup[sid] = json.loads(
+        chat_mod._active_turn_path(sid).read_text(encoding="utf-8"))
+    monkeypatch.setattr(
+        chat_mod, "_persist_failed_turn_snapshot", lambda *_args, **_kwargs: False)
+
+    try:
+        response = client.post(
+            f"/api/chat/interrupted-turns/{sid}/dismiss",
+            headers={"X-Auth-Token": TEST_TOKEN},
+        )
+        assert response.status_code == 503
+        assert sid in chat_mod._interrupted_at_startup
+        assert chat_mod._active_turn_path(sid).exists()
+    finally:
+        chat_mod._interrupted_at_startup.pop(sid, None)
+        chat_mod._delete_active_turn_sidecar(sid)
+
+
+def test_active_turn_sidecar_releases_after_canonical_main_turn(stream_env):
+    """Detached tasks use runtime state, not the already-committed user intent."""
     import asyncio
 
     chat_mod = stream_env
@@ -2539,8 +2945,8 @@ def test_active_turn_sidecar_survives_detached_background_gap(stream_env):
         blocker = asyncio.create_task(asyncio.sleep(60))
         chat_mod._task_watchers[sid] = blocker
         try:
-            assert chat_mod._delete_active_turn_sidecar_if_idle(sid) is False
-            assert chat_mod._active_turn_path(sid).exists()
+            assert chat_mod._release_active_turn_sidecar(sid) is True
+            assert not chat_mod._active_turn_path(sid).exists()
         finally:
             blocker.cancel()
             await asyncio.gather(blocker, return_exceptions=True)
@@ -3451,6 +3857,64 @@ def test_turn_broadcast_stamps_stable_identity_and_sequence(stream_env):
     assert all(payload["parent_turn_id"] == "parent-turn" for payload in payloads)
 
 
+def test_incremental_reconnect_replays_only_missing_events_without_duplicates(
+        stream_env):
+    chat_mod = stream_env
+    bc = chat_mod.TurnBroadcast(session_id="incremental-resume")
+    bc.publish({"event": "text", "data": '{"text":"A"}'})
+    bc.publish({"event": "text", "data": '{"text":"B"}'})
+    bc.publish({"event": "tool_result", "data": '{"id":"tool"}'})
+    bc.publish({"event": "done", "data": '{"is_error":false}'})
+    bc.finish()
+
+    async def collect():
+        subscriber = bc.subscribe(last_event_seq=1)
+        events = []
+        while True:
+            event = await subscriber.get()
+            if event is None:
+                return events
+            events.append(event)
+
+    events = asyncio.run(collect())
+    payloads = [json.loads(event["data"]) for event in events]
+    assert [payload["event_seq"] for payload in payloads] == [2, 3, 4]
+    assert [event["event"] for event in events] == ["text", "tool_result", "done"]
+    assert payloads[0]["text"] == "B"
+    assert all(payload["turn_id"] == bc.turn_id for payload in payloads)
+
+
+def test_incremental_reconnect_gap_explicitly_requires_canonical_history(
+        stream_env):
+    chat_mod = stream_env
+    bc = chat_mod.TurnBroadcast(
+        session_id="incremental-gap",
+        replay_max_events=2,
+        replay_max_bytes=1024 * 1024,
+    )
+    for i in range(4):
+        bc.publish({"event": "tool_result", "data": json.dumps({"id": i})})
+
+    async def collect():
+        subscriber = bc.subscribe(last_event_seq=1)
+        first = await subscriber.get()
+        second = await subscriber.get()
+        return first, second
+
+    first, second = asyncio.run(collect())
+    assert first["event"] == "resync"
+    assert json.loads(first["data"]) == {
+        "reason": "replay_gap",
+        "fallback": "canonical_history",
+        "retryable": False,
+        "turn_id": bc.turn_id,
+        "requested_event_seq": 1,
+        "earliest_event_seq": 3,
+        "latest_event_seq": 4,
+    }
+    assert second is None
+
+
 def test_reconnect_turn_id_mismatch_resyncs_instead_of_attaching(
         stream_env, client):
     """A late reconnect for A must never consume newer turn B's replay."""
@@ -3481,6 +3945,57 @@ def test_reconnect_turn_id_mismatch_resyncs_instead_of_attaching(
         assert all(event != "text" for event, _ in events)
     finally:
         chat_mod._active_turns.pop(sid, None)
+        bc.close()
+
+
+def test_incremental_resume_requires_turn_identity(stream_env, client):
+    response = client.post(
+        "/api/chat/stream/start",
+        headers={"X-Auth-Token": TEST_TOKEN},
+        json={
+            "prompt": "",
+            "session_id": "missing-turn-id",
+            "last_event_seq": 2,
+        },
+    )
+    assert response.status_code == 200, response.text
+    streamed = client.get(
+        f"/api/chat/stream?ticket={response.json()['ticket']}")
+    assert streamed.status_code == 422
+    assert streamed.json()["detail"] == (
+        "turn_id required when last_event_seq is provided")
+
+
+def test_stream_ticket_incremental_resume_is_duplicate_free(stream_env, client):
+    chat_mod = stream_env
+    sid = _make_session(client)
+    bc = chat_mod.TurnBroadcast(session_id=sid)
+    for i in range(4):
+        bc.publish({"event": "tool_result", "data": json.dumps({"id": i})})
+    bc.finish()
+    chat_mod._recent_turns[sid] = bc
+    try:
+        response = client.post(
+            "/api/chat/stream/start",
+            headers={"X-Auth-Token": TEST_TOKEN},
+            json={
+                "prompt": "",
+                "session_id": sid,
+                "turn_id": bc.turn_id,
+                "last_event_seq": 2,
+            },
+        )
+        assert response.status_code == 200, response.text
+        streamed = client.get(
+            f"/api/chat/stream?ticket={response.json()['ticket']}")
+        events = _parse_sse(streamed.text)
+        payloads = [json.loads(data) for event, data in events
+                    if event == "tool_result"]
+        assert [payload["event_seq"] for payload in payloads] == [3, 4]
+        assert [payload["id"] for payload in payloads] == [2, 3]
+        assert all(event != "resync" for event, _ in events)
+    finally:
+        chat_mod._recent_turns.pop(sid, None)
         bc.close()
 
 
@@ -3670,6 +4185,35 @@ def test_terminal_replay_failure_keeps_primary_failure_state(
     assert sid not in chat_mod._active_turns
 
 
+def test_stream_refuses_submission_when_pending_intent_write_fails(
+        stream_env, client, monkeypatch):
+    chat_mod = stream_env
+    sid = _make_session(client)
+    client_calls = []
+
+    async def should_not_start(*_args, **_kwargs):
+        client_calls.append(True)
+        raise AssertionError("SDK startup must follow durable intent commit")
+
+    monkeypatch.setattr(chat_mod, "get_client", should_not_start)
+    monkeypatch.setattr(
+        chat_mod, "_write_active_turn_sidecar", lambda _broadcast: False)
+
+    response = client.get(
+        f"/api/chat/stream?token={TEST_TOKEN}&session_id={sid}"
+        "&prompt=keep-me&model=claude-sonnet-4-6",
+    )
+    assert response.status_code == 200
+    error = next(
+        json.loads(data)
+        for event, data in _parse_sse(response.text)
+        if event == "error"
+    )
+    assert "could not be persisted" in error["error"]
+    assert client_calls == []
+    assert sid not in chat_mod._active_turns
+
+
 def test_stream_early_get_client_failure_emits_error_frame(stream_env, client, monkeypatch):
     """If get_client itself raises (e.g. auth pre-check), the handler must
     surface an SSE error frame, NOT bubble a 500 — the FE can only render
@@ -3711,6 +4255,21 @@ def test_stream_early_get_client_failure_emits_error_frame(stream_env, client, m
         ("start", sid, "hi"),
         ("finish", sid, "failed"),
     ]
+    assert not chat_mod._active_turn_path(sid).exists()
+    history = client.get(
+        f"/api/chat/sessions/{sid}",
+        params={"tail": 20},
+        headers={"X-Auth-Token": TEST_TOKEN},
+    )
+    user = next(
+        message for message in history.json()["messages"]
+        if message.get("role") == "user"
+    )
+    assert user["text"] == "hi"
+    assert user["_failed"] is True
+    assert user["_error_kind"] == "auth"
+    assert user["_error_cta"] == "open_settings"
+    assert user["_error_retryable"] is False
 
 
 def _ok_turn(sid):
@@ -3900,6 +4459,148 @@ def test_rebuild_stamps_terminal_task_status_and_hides_xml():
     assert not any(
         m.get("role") == "user" and "task-notification" in (m.get("text") or "")
         for m in out), "raw task-notification XML leaked into a bubble"
+
+
+def test_canonical_block_ids_are_record_local_and_repeatable():
+    from backend import chat as chat_mod
+
+    record = _sm("assistant-record", "assistant", [
+        {"type": "thinking", "thinking": "consider"},
+        {"type": "text", "text": "before"},
+        {"type": "tool_use", "id": "tool-1", "name": "Read",
+         "input": {"file_path": "/tmp/a"}},
+        {"type": "text", "text": "after"},
+    ])
+    first = chat_mod._sdk_messages_to_ui([record], {})
+    second = chat_mod._sdk_messages_to_ui([record], {})
+
+    expected = [
+        "assistant-record:0:thinking",
+        "assistant-record:1:assistant",
+        "assistant-record:2:tool_use",
+        "assistant-record:3:assistant",
+    ]
+    assert [m["block_id"] for m in first] == expected
+    assert [m["_key"] for m in first] == expected
+    assert [m["block_id"] for m in second] == expected
+
+
+def test_large_canonical_body_is_deferred_without_source_truncation():
+    from backend import chat as chat_mod
+
+    body = "x" * (chat_mod._HISTORY_INLINE_BODY_CAP + 1)
+    record = _sm("large-record", "assistant", [
+        {"type": "text", "text": body},
+    ])
+
+    messages = chat_mod._sdk_messages_to_ui(
+        [record], {}, defer_large_bodies=True)
+
+    assert len(messages) == 1
+    message = messages[0]
+    assert message["block_id"] == "large-record:0:assistant"
+    assert message["body_state"] == "unloaded"
+    assert message["body_available"] is True
+    assert message["body_length"] == len(body)
+    assert message["body_ref"] == message["block_id"]
+    assert message["text"] == body[:chat_mod._HISTORY_BODY_PREVIEW_CAP]
+    assert message["text_truncated"] is False
+
+
+@pytest.mark.parametrize(
+    ("role", "compact", "preview_cap"),
+    [
+        ("thinking", False, "history"),
+        ("tool_result", False, "tool"),
+        ("user", True, "history"),
+    ],
+)
+def test_expandable_history_bodies_defer_without_marking_source_truncated(
+        role, compact, preview_cap):
+    from backend import chat as chat_mod
+
+    body = "y" * (chat_mod._HISTORY_INLINE_BODY_CAP + 1)
+    message = {
+        "role": role,
+        "text": body,
+        "block_id": f"large-record:0:{role}",
+    }
+    if compact:
+        message["_is_compact_summary"] = True
+
+    chat_mod._defer_large_ui_bodies([message])
+
+    expected_cap = (
+        chat_mod._TOOL_RESULT_PREVIEW_CAP
+        if preview_cap == "tool"
+        else chat_mod._HISTORY_BODY_PREVIEW_CAP
+    )
+    assert message["text"] == body[:expected_cap]
+    assert message["body_state"] == "unloaded"
+    assert message["body_ref"] == message["block_id"]
+    assert message["body_length"] == len(body)
+    assert message["text_truncated"] is False
+
+
+def test_session_block_endpoint_reads_only_requested_canonical_record(
+        stream_env, client, monkeypatch, tmp_path):
+    chat_mod = stream_env
+    sid = _make_session(client)
+    body = ("full canonical body\n" * 999) + "full canonical body"
+    entry = {
+        "uuid": "large-record",
+        "type": "assistant",
+        "message": {"content": [{"type": "text", "text": body}]},
+    }
+    raw = (json.dumps(entry) + "\n").encode("utf-8")
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_bytes(raw)
+    index = {
+        "records": [{
+            "uuid": "large-record",
+            "offset": 0,
+            "length": len(raw),
+        }],
+    }
+    monkeypatch.setattr(
+        chat_mod, "_ensure_transcript_index", lambda _sid: (transcript, index))
+
+    response = client.get(
+        f"/api/chat/sessions/{sid}/blocks/large-record:0:assistant",
+        headers={"X-Auth-Token": TEST_TOKEN},
+    )
+
+    assert response.status_code == 200, response.text
+    loaded = response.json()
+    assert loaded["block_id"] == "large-record:0:assistant"
+    assert loaded["body_state"] == "loaded"
+    assert loaded["body_length"] == len(body)
+    assert loaded["text"] == body
+
+
+def test_session_block_endpoint_rejects_invalid_or_missing_block(
+        stream_env, client, monkeypatch, tmp_path):
+    chat_mod = stream_env
+    sid = _make_session(client)
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text("", encoding="utf-8")
+    monkeypatch.setattr(
+        chat_mod,
+        "_ensure_transcript_index",
+        lambda _sid: (transcript, {"records": []}),
+    )
+
+    invalid = client.get(
+        f"/api/chat/sessions/{sid}/blocks/not-a-block-id",
+        headers={"X-Auth-Token": TEST_TOKEN},
+    )
+    missing = client.get(
+        f"/api/chat/sessions/{sid}/blocks/missing:0:assistant",
+        headers={"X-Auth-Token": TEST_TOKEN},
+    )
+
+    assert invalid.status_code == 400
+    assert missing.status_code == 404
 
 
 def test_rebuild_failed_status_maps_through():

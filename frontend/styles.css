@@ -2531,12 +2531,76 @@ body.kb-open .layout:focus-within .mobile-tab-bar { display: none; }
   width: min(420px, calc(100vw - 24px));
 }
 .preview-selection-ask-shell {
+  position: relative;
   width: 100%;
   max-height: min(560px, calc(100vh - 28px));
   overflow: hidden;
   border: 1px solid var(--c-border-strong);
   border-radius: var(--r-lg);
   background: var(--c-bg-2);
+}
+.preview-selection-resize-handle { display: none; }
+@media (min-width: 601px) {
+  .preview-selection-popover.is-asking {
+    width: min(var(--preview-question-width, 560px), calc(100vw - 24px));
+    height: min(var(--preview-question-height, 520px), calc(100vh - 24px));
+    min-width: min(360px, calc(100vw - 24px));
+    min-height: min(260px, calc(100vh - 24px));
+    max-width: calc(100vw - 24px);
+    max-height: calc(100vh - 24px);
+  }
+  .preview-selection-popover.is-asking .preview-selection-ask-shell {
+    height: 100%;
+    max-height: none;
+  }
+  .preview-selection-popover.is-asking .preview-selection-ask {
+    height: 100%;
+    overflow: auto;
+  }
+  .preview-selection-popover.is-asking .preview-selection-answer {
+    height: 100%;
+    max-height: none;
+  }
+  .preview-selection-popover.is-asking .preview-selection-conversation {
+    flex: 1;
+    max-height: none;
+  }
+  .preview-selection-resize-handle {
+    position: absolute;
+    z-index: 2;
+    display: block;
+    touch-action: none;
+    user-select: none;
+  }
+  .preview-selection-resize-handle.is-n,
+  .preview-selection-resize-handle.is-s {
+    left: 10px;
+    right: 10px;
+    height: 8px;
+    cursor: ns-resize;
+  }
+  .preview-selection-resize-handle.is-n { top: 0; }
+  .preview-selection-resize-handle.is-s { bottom: 0; }
+  .preview-selection-resize-handle.is-e,
+  .preview-selection-resize-handle.is-w {
+    top: 10px;
+    bottom: 10px;
+    width: 8px;
+    cursor: ew-resize;
+  }
+  .preview-selection-resize-handle.is-e { right: 0; }
+  .preview-selection-resize-handle.is-w { left: 0; }
+  .preview-selection-resize-handle.is-ne,
+  .preview-selection-resize-handle.is-se,
+  .preview-selection-resize-handle.is-sw,
+  .preview-selection-resize-handle.is-nw {
+    width: 14px;
+    height: 14px;
+  }
+  .preview-selection-resize-handle.is-ne { top: 0; right: 0; cursor: nesw-resize; }
+  .preview-selection-resize-handle.is-se { right: 0; bottom: 0; cursor: nwse-resize; }
+  .preview-selection-resize-handle.is-sw { bottom: 0; left: 0; cursor: nesw-resize; }
+  .preview-selection-resize-handle.is-nw { top: 0; left: 0; cursor: nwse-resize; }
 }
 .preview-selection-ask {
   width: 100%;
@@ -4159,6 +4223,9 @@ pre.text {
   position: relative;
   display: flex;
   flex-direction: column;
+  /* Transcript content owns the scroll, never the pane. This hard boundary
+     keeps a very tall block/compact summary from sizing the composer away. */
+  overflow: hidden;
 }
 .chat-body {
   flex: 1; overflow-y: auto;
@@ -4199,31 +4266,29 @@ pre.text {
   flex-direction: column;
   gap: var(--sp-2);
 }
-.load-later-wrap {
-  display: flex;
-  justify-content: center;
-  gap: var(--sp-2);
-  padding-block: var(--sp-2);
+.msg-virtual-spacer {
+  flex: 0 0 auto;
+  width: 100%;
+  min-height: 0;
+  overflow: hidden;
+  pointer-events: none;
 }
-.load-later-wrap .latest { font-weight: 600; }
-.stream-plain {
+.msg-virtual-spacer > * { display: none !important; }
+.chat-bottom-anchor {
+  flex: 0 0 1px;
+  width: 100%;
+  height: 1px;
+  pointer-events: none;
+}
+.load-earlier-status {
+  color: var(--c-fg-2);
+  font-size: var(--fs-xs);
+}
+.stream-plain,
+.history-plain {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
   font: inherit;
-}
-.long-answer-rest {
-  margin-top: var(--sp-2);
-  color: var(--c-fg-1);
-}
-.long-answer-rest > summary {
-  width: fit-content;
-  cursor: pointer;
-  color: var(--c-accent);
-  font-size: var(--fs-sm);
-  user-select: none;
-}
-.long-answer-rest > div {
-  margin-top: var(--sp-2);
 }
 .msg {
   display: flex;
@@ -5593,6 +5658,10 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 .img-attachments {
   display: flex; flex-wrap: wrap; gap: 6px;
   padding: 6px 4px;
+  max-height: 132px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  flex: 0 1 auto;
 }
 .selection-quote-chip {
   position: relative;
@@ -7094,10 +7163,14 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
      row 3: chat-toolbar — every control compactly stacked here */
 .chat-input {
   display: flex; flex-direction: column;
-  flex-shrink: 0;
+  flex: 0 0 auto;
+  min-height: 0;
+  max-height: 420px;
+  max-height: min(50dvh, 420px);
   gap: 6px; padding: var(--sp-2);
   border-top: 1px solid var(--c-border); background: var(--c-bg-1);
   position: relative;
+  z-index: 6;
   /* Match .chat-body's centered reading column on wide viewports so
      the input field aligns visually with the message bubbles instead
      of stretching corner-to-corner under a narrow message column.
@@ -7161,6 +7234,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
    share the same 26px height + same hover behavior. */
 .chat-toolbar {
   display: flex; align-items: center; gap: 2px;
+  min-width: 0;
   padding: 4px 6px;
   border-top: 1px solid var(--c-border);
   background: var(--c-bg-1);
@@ -7389,6 +7463,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
    swaps to a danger-style stop button automatically. */
 .chat-toolbar-send {
   height: 26px; width: 26px; padding: 0;
+  flex: 0 0 26px;
   display: inline-flex; align-items: center; justify-content: center;
   border: 0; border-radius: var(--r-md); cursor: pointer;
   background: var(--c-btn-primary-bg); color: var(--c-on-accent);

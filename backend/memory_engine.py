@@ -27,6 +27,7 @@ from .memory_providers import (
 )
 from .memory_store import MemoryStore
 from .memory_transcript import slice_turn_records
+from . import observability as obs
 
 log = logging.getLogger("muselab.memory")
 
@@ -975,9 +976,19 @@ class MemoryEngine:
                 value["score"] += 1.0 / (60 + rank + 1)
                 value["channels"].append(row.get("channel", "unknown"))
         candidates = sorted(fused.values(), key=lambda item: item["score"], reverse=True)
+        candidate_limit = max(cfg.retrieval.final_limit * 3, 12)
+        candidate_rows = candidates[:candidate_limit]
+        memories = await obs.to_thread_io(
+            "memory.recall_hydrate",
+            session_id,
+            self.store.memories_by_ids,
+            [candidate["id"] for candidate in candidate_rows],
+            file_path=self.store.path,
+        )
+        memory_by_id = {memory["id"]: memory for memory in memories}
         hydrated: list[dict] = []
-        for candidate in candidates[:max(cfg.retrieval.final_limit * 3, 12)]:
-            memory = self.store.memory(candidate["id"])
+        for candidate in candidate_rows:
+            memory = memory_by_id.get(candidate["id"])
             if not memory or memory.get("status") != "active":
                 continue
             authority_boost = {"confirmed": 1.3, "inferred": 1.0}.get(
@@ -1015,8 +1026,18 @@ class MemoryEngine:
                 status = "partial"
         result = hydrated[:cfg.retrieval.final_limit]
         latency = (time.perf_counter() - started) * 1000
-        recall_id = self.store.log_recall(
-            cfg.owner_id, session_id, retrieval_query, result, latency, status)
+        recall_id = await obs.to_thread_io(
+            "memory.recall_log_write",
+            session_id,
+            self.store.log_recall,
+            cfg.owner_id,
+            session_id,
+            retrieval_query,
+            result,
+            latency,
+            status,
+            file_path=self.store.path,
+        )
         trace = {"id": recall_id, "count": len(result), "latency_ms": round(latency, 1),
                  "status": status,
                  "items": [{"id": item["id"], "kind": item["kind"],

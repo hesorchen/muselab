@@ -181,6 +181,46 @@ async def test_full_roundtrip_deny_with_message():
 
 
 @pytest.mark.asyncio
+async def test_bypass_pretool_hook_routes_native_question_to_ui():
+    # permission_request may outlive backend module reloads in the chat-stream
+    # suite; exercise the exact question registry captured by this hook.
+    auq = perm.auq
+
+    sid = "sess-bypass-question"
+    queue = auq.register_session_queue(sid)
+    hook = perm.build_ask_user_question_hook_for_session(sid)
+    questions = [{
+        "question": "Pick one",
+        "header": "test",
+        "multiSelect": False,
+        "options": ["A", "B"],
+    }]
+
+    async def driver():
+        event = await asyncio.wait_for(queue.get(), timeout=2)
+        assert event["event"] == "ask_user_question"
+        payload = json.loads(event["data"])
+        assert payload["questions"][0]["options"] == [
+            {"label": "A", "description": ""},
+            {"label": "B", "description": ""},
+        ]
+        assert auq.submit_answer(
+            sid, payload["id"], {"Pick one": "B"}) is True
+
+    driver_task = asyncio.create_task(driver())
+    result = await hook({
+        "tool_name": "AskUserQuestion",
+        "tool_input": {"questions": questions},
+    }, "tool-1", None)
+    await driver_task
+    auq.unregister_session_queue(sid)
+
+    specific = result["hookSpecificOutput"]
+    assert specific["permissionDecision"] == "allow"
+    assert specific["updatedInput"]["answers"] == {"Pick one": "B"}
+
+
+@pytest.mark.asyncio
 async def test_always_allow_caches_subsequent_calls():
     sid = "sess-C"
     perm.register_session_queue(sid)

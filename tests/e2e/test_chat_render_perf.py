@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import time
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 import pytest
 
@@ -231,6 +231,100 @@ def _visible_pane_with_text_snapshot(page: Page, text: str):
     )
 
 
+def test_deferred_history_bodies_load_without_manual_body_action(
+    page: Page, backend_url, auth_token,
+):
+    errors = _capture_browser_errors(page)
+    _login(page, backend_url, auth_token)
+    requested: list[str] = []
+    full = {
+        "assistant-record:0:assistant": {
+            "role": "assistant", "text": "ASSISTANT_FULL_BODY_MARKER",
+        },
+        "thinking-record:0:thinking": {
+            "role": "thinking", "text": "THINKING_FULL_BODY_MARKER",
+        },
+        "tool-record:0:tool_result": {
+            "role": "tool_result", "text": "TOOL_FULL_BODY_MARKER",
+            "tool_name": "UnknownTool",
+        },
+        "compact-record:0:user": {
+            "role": "user", "text": "COMPACT_FULL_BODY_MARKER",
+            "_is_compact_summary": True,
+        },
+    }
+
+    def handle_body(route) -> None:
+        block_id = unquote(urlparse(route.request.url).path.rsplit("/", 1)[-1])
+        requested.append(block_id)
+        payload = {
+            **full[block_id],
+            "block_id": block_id,
+            "body_ref": block_id,
+            "body_available": True,
+            "body_state": "loaded",
+            "body_length": len(full[block_id]["text"]),
+        }
+        route.fulfill(status=200, content_type="application/json",
+                      body=json.dumps(payload))
+
+    page.route("**/api/chat/sessions/*/blocks/*", handle_body)
+    sid = _app_eval(page, "return app.currentId;")
+    _app_eval(
+        page,
+        """
+        const st = app._ensureTabState(arg);
+        const deferred = (role, blockId, extra = {}) => ({
+          role, block_id: blockId, body_ref: blockId,
+          body_available: true, body_state: "unloaded", body_length: 12000,
+          text: role + " preview", preview: role + " preview",
+          _k: arg + ":block:" + blockId, _noAnim: true, ...extra,
+        });
+        st._loaded = true;
+        st.messages = [
+          deferred("assistant", "assistant-record:0:assistant", {
+            html: "<p>assistant preview</p>",
+          }),
+          deferred("thinking", "thinking-record:0:thinking"),
+          deferred("tool_result", "tool-record:0:tool_result", {
+            tool_name: "UnknownTool", is_error: false,
+          }),
+          deferred("user", "compact-record:0:user", {
+            _is_compact_summary: true,
+          }),
+        ];
+        st.messageRange.visibleEnd = st.messages.length;
+        st.messageRange.total = st.messages.length;
+        app._expandedMsgs = {};
+        app._activateTabState(arg);
+        app.messagesReady = true;
+        return true;
+        """,
+        sid,
+    )
+
+    page.wait_for_function(
+        """() => document.body.textContent.includes('ASSISTANT_FULL_BODY_MARKER')"""
+    )
+    assert requested == ["assistant-record:0:assistant"]
+    expect(page.get_by_text("Load full body")).to_have_count(0)
+    expect(page.get_by_text("加载完整正文")).to_have_count(0)
+
+    page.locator(".thinking-head").click()
+    expect(page.get_by_text("THINKING_FULL_BODY_MARKER")).to_be_visible()
+    page.locator(".tool-result-head").click()
+    expect(page.get_by_text("TOOL_FULL_BODY_MARKER")).to_be_visible()
+    page.locator(".compact-summary-pill").click()
+    expect(page.get_by_text("COMPACT_FULL_BODY_MARKER")).to_be_visible()
+    assert requested == [
+        "assistant-record:0:assistant",
+        "thinking-record:0:thinking",
+        "tool-record:0:tool_result",
+        "compact-record:0:user",
+    ]
+    _assert_no_browser_errors(page, errors)
+
+
 def test_context_recovery_replays_plain_text_exactly_once(
     page: Page, backend_url, auth_token,
 ):
@@ -385,12 +479,10 @@ def _bootstrap_session_for_real_load(page: Page, sid: str, name: str) -> None:
         app.openTabIds = [arg.sid];
         app.tabState = {};
         app.currentId = arg.sid;
-        app._residentTabIds = [arg.sid];
         app.mobileTab = "chat";
         app.messagesReady = true;
         app.messagesLoading = false;
         app._activateTabState(arg.sid);
-        app._promoteResident(arg.sid);
         return true;
         """,
         {"sid": sid, "name": name},
@@ -1163,6 +1255,8 @@ def test_chat_bubble_selection_quotes_as_attachment_and_asks_in_side_session(
             uuid: "selection-assistant", _k: "selection-assistant", _noAnim: true,
           },
         ];
+        st.messageRange.visibleEnd = st.messages.length;
+        st.messageRange.total = st.messages.length;
         st.draft.input = "EXISTING_DRAFT";
         st.draft.pendingImages = [{
           id: "keep-image", uploading: false,
@@ -1368,6 +1462,8 @@ def test_chat_wheel_preserves_selection_across_messages(
             _noAnim: true,
           },
         ];
+        st.messageRange.visibleEnd = st.messages.length;
+        st.messageRange.total = st.messages.length;
         app._activateTabState(arg);
         app.mobileTab = "chat";
         return true;
@@ -2214,6 +2310,8 @@ def test_mobile_completed_turn_can_fork_from_that_point(
             _k: arg.boundary, _noAnim: true,
           },
         ];
+        st.messageRange.visibleEnd = st.messages.length;
+        st.messageRange.total = st.messages.length;
         app._activateTabState(arg.sid);
         app.openTab = async id => {
           if (!app.openTabIds.includes(id)) app.openTabIds.push(id);
@@ -2259,7 +2357,7 @@ def test_mobile_completed_turn_can_fork_from_that_point(
 
 
 def test_mobile_long_history_switching_does_not_blank(page: Page, backend_url, auth_token):
-    """Switch repeatedly between long resident chat panes on a mobile viewport."""
+    """Switch repeatedly between long normalized histories on a mobile viewport."""
     errors = _capture_browser_errors(page)
     page.set_viewport_size({"width": 390, "height": 844})
     _login(page, backend_url, auth_token)
@@ -2276,8 +2374,6 @@ def test_mobile_long_history_switching_does_not_blank(page: Page, backend_url, a
           model: "e2e-model", permission: "bypassPermissions", thinking: true,
         }));
         app.openTabIds = sessionIds.slice();
-        app._MAX_RESIDENT_PANES = 2;
-        app._residentTabIds = sessionIds.slice(0, 4);
         app.tabState = {};
         for (const [idx, id] of sessionIds.entries()) {
           const st = app._blankTabState();
@@ -2293,30 +2389,32 @@ def test_mobile_long_history_switching_does_not_blank(page: Page, backend_url, a
               _noAnim: true,
             });
           }
+          st.messageRange.visibleEnd = st.messages.length;
+          st.messageRange.total = st.messages.length;
           app.tabState[id] = st;
           app._ensureTabState(id);
-          app._capLiveMessages(st);
+          app._scheduleLiveMessageViewport(st);
         }
         app.currentId = sessionIds[0];
         app.messagesReady = true;
         app.messagesLoading = false;
         app.mobileTab = "chat";
         app._activateTabState(app.currentId);
-        app._promoteResident(app.currentId);
         app.$nextTick(() => app.scrollToBottom(true));
         return true;
         """,
     )
-    mounted_cap = _app_eval(page, "return app._mountedMessageCap();")
+    history_size = 90
 
     page.wait_for_function(
-        """mountedCap => {
+        """historySize => {
           const panes = Array.from(document.querySelectorAll(".msg-pane"))
             .filter(p => getComputedStyle(p).display !== "none");
-          return panes.length === 1
-            && panes[0].querySelectorAll(".msg").length === mountedCap;
+          const rendered = panes.length === 1
+            ? panes[0].querySelectorAll(".msg").length : 0;
+          return rendered > 0 && rendered < historySize;
         }""",
-        arg=mounted_cap,
+        arg=history_size,
         timeout=5000,
     )
 
@@ -2328,7 +2426,6 @@ def test_mobile_long_history_switching_does_not_blank(page: Page, backend_url, a
             app.messagesReady = true;
             app.messagesLoading = false;
             app._activateTabState(arg);
-            app._promoteResident(arg);
             app.$nextTick(() => app.scrollToBottom(true));
             """,
             sid,
@@ -2336,13 +2433,14 @@ def test_mobile_long_history_switching_does_not_blank(page: Page, backend_url, a
         expected_tail = f"history {sid.rsplit('-', 1)[1]}:89"
         try:
             page.wait_for_function(
-                """({ expected, mountedCap }) => {
+                """({ expected, historySize }) => {
                   const panes = Array.from(document.querySelectorAll(".msg-pane"))
                     .filter(p => getComputedStyle(p).display !== "none");
                   return panes.some(p => p.textContent.includes(expected)
-                    && p.querySelectorAll(".msg").length === mountedCap);
+                    && p.querySelectorAll(".msg").length > 0
+                    && p.querySelectorAll(".msg").length < historySize);
                 }""",
-                arg={"expected": expected_tail, "mountedCap": mounted_cap},
+                arg={"expected": expected_tail, "historySize": history_size},
                 timeout=5000,
             )
         except TimeoutError as exc:
@@ -2351,7 +2449,7 @@ def test_mobile_long_history_switching_does_not_blank(page: Page, backend_url, a
                   const app = document.querySelector("#app")._x_dataStack[0];
                   return {
                     currentId: app.currentId,
-                    resident: app.residentPaneIds(),
+                    paneCount: document.querySelectorAll(".msg-pane").length,
                     openTabIds: app.openTabIds,
                     messagesLength: app.messages.length,
                     visiblePanes: Array.from(document.querySelectorAll(".msg-pane"))
@@ -2363,18 +2461,18 @@ def test_mobile_long_history_switching_does_not_blank(page: Page, backend_url, a
             )
             raise AssertionError(f"target tail not visible: {expected_tail}; diag={diag}") from exc
         snap = _visible_pane_with_text_snapshot(page, expected_tail)
-        assert snap["msgCount"] <= mounted_cap
+        assert 0 < snap["msgCount"] < history_size
         assert expected_tail in snap["text"]
         assert page.locator(".msg-pane").count() <= 1
-        assert _app_eval(page, "return app.residentPaneIds().length;") <= 1
+        assert page.locator(".msg-pane").count() <= 1
 
     _assert_no_browser_errors(page, errors)
 
 
-def test_desktop_warm_session_switch_keeps_panes_and_composer_stable(
+def test_desktop_session_switch_remounts_one_pane_and_keeps_composer_stable(
     page: Page, backend_url: str, auth_token: str,
 ):
-    """Desktop prioritizes instant warm switches without footer/layout jumps."""
+    """Desktop remounts one virtualized pane without footer/layout jumps."""
     errors = _capture_browser_errors(page)
     page.set_viewport_size({"width": 1440, "height": 900})
     _login(page, backend_url, auth_token)
@@ -2407,6 +2505,8 @@ def test_desktop_warm_session_switch_keeps_panes_and_composer_stable(
           const st = app._blankTabState();
           st._loaded = true;
           st.messages = app._historyEnvelopes(id, arg.messages[id]);
+          st.messageRange.visibleEnd = st.messages.length;
+          st.messageRange.total = st.messages.length;
           st.messagesReady = true;
           st.messagesLoading = false;
           st.atBottom = true;
@@ -2414,11 +2514,9 @@ def test_desktop_warm_session_switch_keeps_panes_and_composer_stable(
           app._ensureTabState(id);
         }
         app.currentId = arg.ids[0];
-        app._residentTabIds = arg.ids.slice();
         app.messagesReady = true;
         app.messagesLoading = false;
         app._activateTabState(app.currentId);
-        app._promoteResident(app.currentId);
         return true;
         """,
         payload,
@@ -2428,7 +2526,7 @@ def test_desktop_warm_session_switch_keeps_panes_and_composer_stable(
           const panes = Array.from(document.querySelectorAll(".msg-pane"));
           const visible = panes.filter(
             pane => getComputedStyle(pane).display !== "none");
-          return panes.length === 4
+          return panes.length === 1
             && visible.length === 1
             && visible[0].querySelectorAll(".msg").length === 40;
         }"""
@@ -2451,7 +2549,7 @@ def test_desktop_warm_session_switch_keeps_panes_and_composer_stable(
               pane => getComputedStyle(pane).display !== "none");
             out.push({
               elapsed: performance.now() - started,
-              resident: app.residentPaneIds().length,
+              paneCount: document.querySelectorAll(".msg-pane").length,
               panes: panes.length,
               visible: visible.length,
               visibleMessages: visible[0]?.querySelectorAll(".msg").length || 0,
@@ -2468,11 +2566,10 @@ def test_desktop_warm_session_switch_keeps_panes_and_composer_stable(
     assert after is not None
     elapsed = sorted(row["elapsed"] for row in switches)
     # Shared/low-memory CI can produce one scheduling outlier; the sustained
-    # interaction is what users feel across repeated warm switches.
+    # interaction is what users feel across repeated remounts.
     assert elapsed[len(elapsed) // 2] < 700, switches
     assert max(elapsed) < 1500, switches
-    assert all(row["resident"] == 4 for row in switches)
-    assert all(row["panes"] == 4 and row["visible"] == 1 for row in switches)
+    assert all(row["panes"] == 1 and row["visible"] == 1 for row in switches)
     assert all(row["visibleMessages"] == 40 for row in switches)
     assert all(row["ready"] and row["skeleton"] == "none" for row in switches)
     assert abs(after["y"] - before["y"]) < 1
@@ -2510,12 +2607,13 @@ def test_mobile_windowed_load_session_pages_older_history(page: Page, backend_ur
         const st = app._ensureTabState(arg);
         return {
           messages: st.messages.length,
-          earlier: st._earlierMessages.length,
-          later: st._laterMessages.length,
-          loadedOffset: st._loadedOffset,
-          total: st._total,
+          visible: st.messageRange.visibleEnd - st.messageRange.visibleStart,
+          earlier: st.messageRange.visibleStart,
+          later: st.messages.length - st.messageRange.visibleEnd,
+          loadedOffset: st.messageRange.offset,
+          total: st.messageRange.total,
           hasMore: st._hasMoreHistory,
-          resident: app.residentPaneIds().length,
+          paneCount: document.querySelectorAll(".msg-pane").length,
           ready: app.messagesReady,
           bodyText: document.querySelector(".chat-body")?.textContent || "",
         };
@@ -2523,21 +2621,32 @@ def test_mobile_windowed_load_session_pages_older_history(page: Page, backend_ur
         sid,
     )
     assert requests and requests[0]["tail"] == 75
-    assert state["messages"] <= 60
+    assert state["messages"] == 75
+    assert state["visible"] <= 60
     assert state["loadedOffset"] == 105
     assert state["total"] == 180
     assert state["hasMore"] is True
-    assert state["resident"] <= 1
+    assert state["paneCount"] <= 1
     assert "WINDOW_MSG_179" in state["bodyText"]
     assert "WINDOW_MSG_000" not in state["bodyText"]
     assert page.locator(".msg-pane").count() <= 1
     assert page.locator(".msg-pane:visible .msg").count() <= 75
 
-    # Traverse all the way through a history larger than the memory cap. The
-    # window must slide backward (evicting far-future bubbles) until message 0
-    # is mounted; the old implementation stopped forever at the first cap.
+    # Traverse the full server-paged history. Normalized envelopes stay reachable
+    # while the viewport scheduler mounts message 0 only when it enters view.
     for _ in range(24):
-        _app_eval(page, "return app.loadEarlierMessages(arg);", sid)
+        _app_eval(
+            page,
+            """
+            const body = app.$refs.chatBody;
+            app.atBottom = false;
+            app._ensureTabState(arg).atBottom = false;
+            body.scrollTop = 0;
+            app._syncMessageViewport(arg);
+            return app.loadEarlierMessages(arg);
+            """,
+            sid,
+        )
         page.wait_for_timeout(50)
         if _app_eval(
             page,
@@ -2559,13 +2668,14 @@ def test_mobile_windowed_load_session_pages_older_history(page: Page, backend_ur
         const st = app._ensureTabState(arg);
         return {
           messages: st.messages.length,
-          earlier: st._earlierMessages.length,
-          later: st._laterMessages.length,
-          loadedOffset: st._loadedOffset,
-          total: st._total,
+          visible: st.messageRange.visibleEnd - st.messageRange.visibleStart,
+          earlier: st.messageRange.visibleStart,
+          later: st.messages.length - st.messageRange.visibleEnd,
+          loadedOffset: st.messageRange.offset,
+          total: st.messageRange.total,
           hasMore: st._hasMoreHistory,
           hasServerLater: st._hasServerLater,
-          cached: st.messages.length + st._earlierMessages.length + st._laterMessages.length,
+          cached: st.messages.length,
           ready: app.messagesReady,
           visibleText: Array.from(document.querySelectorAll(".msg-pane"))
             .filter(p => getComputedStyle(p).display !== "none")
@@ -2582,17 +2692,18 @@ def test_mobile_windowed_load_session_pages_older_history(page: Page, backend_ur
     assert final_state["ready"] is True
     assert final_state["bodyHeight"] > 100
     assert "WINDOW_MSG_000" in final_state["visibleText"]
-    assert final_state["messages"] <= 60
-    assert final_state["cached"] <= 120
-    assert final_state["later"] > 0
-    assert final_state["hasServerLater"] is True
+    assert final_state["messages"] == 180
+    assert final_state["cached"] == 180
+    assert final_state["later"] == 0
+    assert final_state["hasServerLater"] is False
     latest_after_load_earlier = _app_eval(
         page,
         """
         const st = app._ensureTabState(arg);
         return {
           latestInMessages: st.messages.some(m => (m.text || "").includes("WINDOW_MSG_179")),
-          latestInLater: st._laterMessages.some(m => (m.text || "").includes("WINDOW_MSG_179")),
+          latestInLater: st.messages.slice(st.messageRange.visibleEnd)
+            .some(m => (m.text || "").includes("WINDOW_MSG_179")),
           latestInDom: document.querySelector(".chat-body")?.textContent.includes("WINDOW_MSG_179"),
           hasServerLater: st._hasServerLater,
           ready: st.messagesReady,
@@ -2601,10 +2712,10 @@ def test_mobile_windowed_load_session_pages_older_history(page: Page, backend_ur
         sid,
     )
     assert latest_after_load_earlier == {
-        "latestInMessages": False,
+        "latestInMessages": True,
         "latestInLater": False,
         "latestInDom": False,
-        "hasServerLater": True,
+        "hasServerLater": False,
         "ready": True,
     }
     _app_eval(page, "app.returnToLatest(arg); return true;", sid)
@@ -2614,24 +2725,25 @@ def test_mobile_windowed_load_session_pages_older_history(page: Page, backend_ur
           .some(p => p.textContent.includes('WINDOW_MSG_179'))""",
         timeout=5000,
     )
-    assert _app_eval(page, "return app._ensureTabState(arg)._laterMessages.length;", sid) == 0
+    assert _app_eval(
+        page,
+        """const st = app._ensureTabState(arg);
+        return st.messages.length - st.messageRange.visibleEnd;""",
+        sid,
+    ) == 0
     assert page.locator(".msg-pane").count() <= 1
     assert page.locator(".msg-pane:visible .msg").count() <= 60
 
     _assert_no_browser_errors(page, errors)
 
 
-def test_history_pagination_repairs_cross_page_keys_without_remounting(
+def test_history_pagination_keeps_stable_cross_page_keys_without_remounting(
     page: Page, backend_url, auth_token,
 ):
     errors = _capture_browser_errors(page)
     page.set_viewport_size({"width": 390, "height": 844})
     sid = "perf-cross-page-render-keys"
     messages = _make_mixed_messages(180, "CROSS_PAGE_KEY")
-    messages[101]["_k"] = "   "
-    messages[102]["_k"] = f"{sid}:render-repair:1"
-    messages[104]["_k"] = "cross-page-duplicate"
-    messages[110]["_k"] = "cross-page-duplicate"
     requests = _route_windowed_session(page, sid, messages)
     _login(page, backend_url, auth_token)
     _bootstrap_session_for_real_load(page, sid, "Cross-page render keys")
@@ -2649,7 +2761,7 @@ def test_history_pagination_repairs_cross_page_keys_without_remounting(
     # the real offset/limit history fetch and prepend a page across the boundary.
     for _ in range(20):
         local_earlier = _app_eval(
-            page, "return app._ensureTabState(arg)._earlierMessages.length;", sid
+            page, "return app._ensureTabState(arg).messageRange.visibleStart;", sid
         )
         if local_earlier == 0:
             break
@@ -2665,7 +2777,7 @@ def test_history_pagination_repairs_cross_page_keys_without_remounting(
         return {
           found: !!mounted,
           key: mounted?._k || "",
-          loadedOffset: st._loadedOffset,
+          loadedOffset: st.messageRange.offset,
         };
         """,
         sid,
@@ -2678,18 +2790,18 @@ def test_history_pagination_repairs_cross_page_keys_without_remounting(
         page,
         """
         const st = app._ensureTabState(arg);
-        const all = app._allPaneMessages(st);
+        const all = st.messages;
         const mounted = all.find(m => m.uuid === "CROSS_PAGE_KEY-tr-110");
-        const duplicate = all.find(m => m.uuid === "CROSS_PAGE_KEY-u-104");
-        const missing = all.find(m => m.uuid === "CROSS_PAGE_KEY-a-101");
-        const legitimate = all.find(m => m.uuid === "CROSS_PAGE_KEY-tr-102");
+        const olderUser = all.find(m => m.uuid === "CROSS_PAGE_KEY-u-104");
+        const olderAssistant = all.find(m => m.uuid === "CROSS_PAGE_KEY-a-101");
+        const olderTool = all.find(m => m.uuid === "CROSS_PAGE_KEY-tr-102");
         const keys = all.map(m => m._k);
         return {
           sameMountedObject: mounted === window.__crossPageMountedObject,
           mountedKey: mounted?._k || "",
-          duplicateKey: duplicate?._k || "",
-          missingKey: missing?._k || "",
-          legitimateKey: legitimate?._k || "",
+          olderUserKey: olderUser?._k || "",
+          olderAssistantKey: olderAssistant?._k || "",
+          olderToolKey: olderTool?._k || "",
           allNonempty: keys.every(key => typeof key === "string" && key.trim()),
           unique: new Set(keys).size === keys.length,
         };
@@ -2699,10 +2811,10 @@ def test_history_pagination_repairs_cross_page_keys_without_remounting(
 
     assert any(request["offset"] < 105 for request in requests[1:]), requests
     assert after["sameMountedObject"] is True
-    assert after["mountedKey"] == before["key"] == "cross-page-duplicate"
-    assert after["duplicateKey"] != after["mountedKey"]
-    assert after["legitimateKey"] == f"{sid}:render-repair:1"
-    assert after["missingKey"] != after["legitimateKey"]
+    assert after["mountedKey"] == before["key"] == f"{sid}:uuid:CROSS_PAGE_KEY-tr-110"
+    assert after["olderUserKey"] == f"{sid}:uuid:CROSS_PAGE_KEY-u-104"
+    assert after["olderAssistantKey"] == f"{sid}:uuid:CROSS_PAGE_KEY-a-101"
+    assert after["olderToolKey"] == f"{sid}:uuid:CROSS_PAGE_KEY-tr-102"
     assert after["allNonempty"] is True
     assert after["unique"] is True
     _assert_no_browser_errors(page, errors)
@@ -2790,7 +2902,7 @@ def test_outline_around_conflict_retries_and_returns_to_real_tail(
         page,
         """
         const st = app._ensureTabState(arg);
-        st.historyGeneration = "gen-old";
+        st.messageRange.generation = "gen-old";
         st._loaded = true;
         st.messagesReady = true;
         return true;
@@ -2820,18 +2932,26 @@ def test_outline_around_conflict_retries_and_returns_to_real_tail(
         const st = app._ensureTabState(arg);
         return {
           mounted: st.messages.length,
-          earlier: st._earlierMessages.length,
-          later: st._laterMessages.length,
+          earlier: st.messageRange.visibleStart,
+          later: st.messages.length - st.messageRange.visibleEnd,
           targetMounted: st.messages.some(m => m.uuid === "around-target"),
-          order: st._historyOrder,
+          order: st.messageRange.order,
+          offset: st.messageRange.offset,
+          total: st.messageRange.total,
+          generation: st.messageRange.generation,
           hasServerLater: st._hasServerLater,
         };
         """,
         sid,
     )
-    assert around_state["mounted"] <= 60
+    assert around_state["mounted"] == len(around_messages)
     assert around_state["targetMounted"] is True
+    assert around_state["earlier"] == 0
+    assert around_state["later"] == 0
     assert around_state["order"] == "full"
+    assert around_state["offset"] == 200
+    assert around_state["total"] == 500
+    assert around_state["generation"] == "gen-new"
     assert around_state["hasServerLater"] is True
     assert len([call for call in calls if "around_uuid" in call]) == 2
     assert len([call for call in calls if "tail" in call]) == 1
@@ -2842,7 +2962,7 @@ def test_outline_around_conflict_retries_and_returns_to_real_tail(
         """() => {
           const app = document.querySelector('#app')._x_dataStack[0];
           const st = app._ensureTabState(app.currentId);
-          return st._historyOrder === 'normal' && !st._hasServerLater
+          return st.messageRange.order === 'normal' && !st._hasServerLater
             && st.messages.some(m => (m.text || '').includes('CANONICAL_LATEST_VISIBLE'));
         }""",
         timeout=10000,
@@ -2852,125 +2972,183 @@ def test_outline_around_conflict_retries_and_returns_to_real_tail(
     _assert_no_browser_errors(page, errors)
 
 
-def test_bidirectional_cap_preserves_keyed_scroll_anchor(
+def test_viewport_virtualization_keeps_history_and_scroll_anchor(
     page: Page, backend_url, auth_token,
 ):
-    """Top/bottom eviction must not move the surviving reading anchor."""
+    """Only viewport rows mount; canonical history and keyed anchors survive shifts."""
     errors = _capture_browser_errors(page)
     page.set_viewport_size({"width": 390, "height": 844})
     _login(page, backend_url, auth_token)
-    sid = "perf-bidirectional-cap"
+    sid = "perf-viewport-virtual-history"
+    _bootstrap_session_for_real_load(page, sid, "Viewport virtual history")
     _app_eval(
         page,
         """
-        const sid = arg;
-        app.refreshSessions = async () => {};
-        app._fetchTabUsage = async () => {};
-        app.sessions = [{
-          id: sid, name: "Perf bidirectional cap", updated_at: Date.now() / 1000,
-          model: "e2e-model", permission: "bypassPermissions", thinking: true,
-        }];
-        app.openTabIds = [sid];
-        app.tabState = {};
-        app.tabState[sid] = app._blankTabState();
-        const st = app._ensureTabState(sid);
-        const cap = app._mountedMessageCap();
-        const make = (prefix, i) => ({
-          role: "assistant", uuid: `${prefix}-uuid-${i}`,
-          _k: `${prefix}-key-${i}`, _noAnim: true,
-          text: `${prefix}-${i} ` + "variable height ".repeat(8 + (i % 5) * 8),
-          html: `<p>${prefix}-${i} ${"variable height ".repeat(8 + (i % 5) * 8)}</p>`,
+        const st = app._ensureTabState(arg);
+        const make = i => ({
+          role: i % 2 ? "assistant" : "user",
+          uuid: `virtual-uuid-${i}`, _k: `virtual-key-${i}`, _noAnim: true,
+          text: `VIRTUAL_MESSAGE_${i} ` + "variable height ".repeat(8 + (i % 7) * 6),
+          html: i % 2 ? `<p>VIRTUAL_MESSAGE_${i} ${"tail ".repeat(20)}</p>` : "",
         });
         st.messages.splice(0, st.messages.length,
-          ...Array.from({ length: cap }, (_, i) => make("mounted", i)));
-        st._earlierMessages = Array.from({ length: 10 }, (_, i) => make("older", i));
-        st._laterMessages = [];
-        st._loadedOffset = 0;
-        st._total = cap + st._earlierMessages.length;
+          ...Array.from({ length: 600 }, (_, i) => make(i)));
+        Object.assign(st.messageRange, {
+          visibleStart: 0,
+          visibleEnd: 600,
+          offset: 0,
+          total: 600,
+          preTotal: 0,
+          order: "normal",
+          generation: "",
+        });
         st._hasServerLater = false;
         st.messagesReady = true;
         st.messagesLoading = false;
-        app.currentId = sid;
-        app._residentTabIds = [sid];
-        app._activateTabState(sid);
-        app._promoteResident(sid);
+        st.atBottom = true;
+        app.currentId = arg;
+        app._activateTabState(arg);
         app.mobileTab = "chat";
+        app.$nextTick(() => app.scrollToBottom(true));
         return true;
         """,
         sid,
     )
-    mounted_cap = _app_eval(page, "return app._mountedMessageCap();")
     page.wait_for_function(
-        """mountedCap => Array.from(document.querySelectorAll('.msg-pane'))
-          .filter(p => getComputedStyle(p).display !== 'none')
-          .reduce((n, p) => n + p.querySelectorAll('.msg').length, 0) === mountedCap""",
-        arg=mounted_cap,
+        """() => {
+          const pane = document.querySelector('.msg-pane:visible');
+          return pane && pane.textContent.includes('VIRTUAL_MESSAGE_599')
+            && pane.querySelectorAll('.msg').length > 0
+            && pane.querySelectorAll('.msg').length < 80;
+        }""",
         timeout=10000,
     )
+    initial = _app_eval(
+        page,
+        """
+        const st = app._ensureTabState(arg);
+        const pane = document.querySelector('.msg-pane:visible');
+        return { canonical: st.messages.length, normalized: st.messages.length,
+          mounted: pane.querySelectorAll('.msg').length,
+          spacers: pane.querySelectorAll('.msg-virtual-spacer').length };
+        """,
+        sid,
+    )
+    assert initial["canonical"] == initial["normalized"] == 600
+    assert 0 < initial["mounted"] < 80
+    assert initial["spacers"] >= 1
+
+    _app_eval(
+        page,
+        """
+        const body = app.$refs.chatBody;
+        app.atBottom = false;
+        app._ensureTabState(app.currentId).atBottom = false;
+        body.scrollTop = Math.floor(body.scrollHeight * 0.45);
+        app._syncMessageViewport(app.currentId);
+        return true;
+        """,
+    )
+    page.wait_for_timeout(100)
+    anchor = page.evaluate(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const body = app.$refs.chatBody;
+          const rows = Array.from(document.querySelectorAll('.msg-pane:visible .msg'));
+          const row = rows.find(el => {
+            const r = el.getBoundingClientRect();
+            return r.bottom > body.getBoundingClientRect().top;
+          });
+          return {key: row?.dataset.messageKey || '', top: row?.getBoundingClientRect().top || 0};
+        }"""
+    )
+    assert anchor["key"]
     page.evaluate(
         """() => {
-          const body = document.querySelector('.chat-body');
-          body.scrollTop = Math.min(500, body.scrollHeight - body.clientHeight);
+          const app = document.querySelector('#app')._x_dataStack[0];
+          app.$refs.chatBody.scrollTop += 500;
+          app._syncMessageViewport(app.currentId);
         }"""
     )
-    older_anchor = page.evaluate(
+    page.wait_for_timeout(100)
+    page.evaluate(
         """() => {
-          const app = document.querySelector("#app")._x_dataStack[0];
-          const st = app._ensureTabState(app.currentId);
-          const key = st.messages[0]._k;
-          const top = document.querySelector(
-            `.msg[data-message-key="${CSS.escape(key)}"]`).getBoundingClientRect().top;
-          return { key, top };
+          const app = document.querySelector('#app')._x_dataStack[0];
+          app.$refs.chatBody.scrollTop -= 500;
+          app._syncMessageViewport(app.currentId);
         }"""
     )
-    _app_eval(page, "return app.loadEarlierMessages(arg);", sid)
-    page.wait_for_function(
-        """({ key, mountedCap }) => {
-          const pane = Array.from(document.querySelectorAll(".msg-pane"))
-            .find(p => getComputedStyle(p).display !== "none");
-          return pane && pane.querySelectorAll(".msg").length === mountedCap
-            && pane.querySelector(
-              `.msg[data-message-key="${CSS.escape(key)}"]`);
+    page.wait_for_timeout(100)
+    shifted = page.evaluate(
+        """key => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const row = document.querySelector(
+            `.msg[data-message-key="${CSS.escape(key)}"]`);
+          const st = app._ensureTabState(app.currentId);
+          return {canonical: st.messages.length, mounted: document.querySelectorAll(
+            '.msg-pane:visible .msg').length, top: row?.getBoundingClientRect().top || 0};
         }""",
-        arg={"key": older_anchor["key"], "mountedCap": mounted_cap},
-        timeout=10000,
+        anchor["key"],
     )
-    after_older = page.evaluate(
-        """key => document.querySelector(
-          `.msg[data-message-key="${CSS.escape(key)}"]`).getBoundingClientRect().top""",
-        older_anchor["key"],
-    )
-    assert abs(after_older - older_anchor["top"]) < 2
+    assert shifted["canonical"] == 600
+    assert shifted["mounted"] < 80
+    assert abs(shifted["top"] - anchor["top"]) < 3
 
-    newer_anchor = page.evaluate(
-        """() => {
-          const app = document.querySelector("#app")._x_dataStack[0];
-          const st = app._ensureTabState(app.currentId);
-          const key = st.messages[st.messages.length - 1]._k;
-          const top = document.querySelector(
-            `.msg[data-message-key="${CSS.escape(key)}"]`).getBoundingClientRect().top;
-          return { key, top };
-        }"""
+    streaming = _app_eval(
+        page,
+        """
+        const st = app._ensureTabState(arg);
+        st.streaming = true;
+        st.atBottom = false;
+        app.atBottom = false;
+        const body = app.$refs.chatBody;
+        body.scrollTop = 0;
+        app._syncMessageViewport(arg);
+        return new Promise(resolve => app.$nextTick(() => resolve({
+          tailMounted: !!document.querySelector(
+            '.msg[data-message-key="virtual-key-599"]'),
+          mounted: document.querySelectorAll('.msg-pane:visible .msg').length,
+          canonical: st.messages.length,
+        })));
+        """,
+        sid,
     )
-    _app_eval(page, "return app.loadLaterMessages(arg);", sid)
-    page.wait_for_function(
-        """({ key, mountedCap }) => {
-          const pane = Array.from(document.querySelectorAll(".msg-pane"))
-            .find(p => getComputedStyle(p).display !== "none");
-          return pane && pane.querySelectorAll(".msg").length === mountedCap
-            && pane.querySelector(
-              `.msg[data-message-key="${CSS.escape(key)}"]`);
-        }""",
-        arg={"key": newer_anchor["key"], "mountedCap": mounted_cap},
-        timeout=10000,
+    # A reader inspecting old content keeps one viewport window. The live tail
+    # remains in the normalized repository and is mounted only when follow resumes;
+    # a second streaming-only tail was removed because streaming=false tore it down
+    # at completion and collapsed the scroll layout.
+    assert streaming["tailMounted"] is False
+    assert streaming["mounted"] < 80
+    assert streaming["canonical"] == 600
+
+    rebased = _app_eval(
+        page,
+        """
+        const st = app._ensureTabState(arg);
+        st.streaming = false;
+        st.atBottom = true;
+        st.messageRange.visibleStart = 540;
+        st.messageRange.visibleEnd = 600;
+        st._virtualStart = 48;
+        st._virtualEnd = 60;
+        const snapshot = app._captureMessageVirtualWindow(st);
+        st.messageRange.visibleStart = 0;
+        app._rebaseMessageVirtualWindow(st, snapshot, true);
+        return new Promise(resolve => app.$nextTick(() => resolve({
+          start: st._virtualStart,
+          end: st._virtualEnd,
+          tailMounted: !!document.querySelector(
+            '.msg[data-message-key="virtual-key-599"]'),
+          headMounted: !!document.querySelector(
+            '.msg[data-message-key="virtual-key-048"]'),
+        })));
+        """,
+        sid,
     )
-    after_newer = page.evaluate(
-        """key => document.querySelector(
-          `.msg[data-message-key="${CSS.escape(key)}"]`).getBoundingClientRect().top""",
-        newer_anchor["key"],
-    )
-    assert abs(after_newer - newer_anchor["top"]) < 2
-    assert page.locator(".msg-pane:visible .msg").count() == mounted_cap
+    assert rebased["end"] == 600
+    assert rebased["start"] > 500
+    assert rebased["tailMounted"] is True
+    assert rebased["headMounted"] is False
     _assert_no_browser_errors(page, errors)
 
 
@@ -3043,12 +3221,10 @@ def test_load_session_reconnects_active_turn_and_renders_live_assistant(
         app.openTabIds = [arg];
         app.tabState = {};
         app.currentId = arg;
-        app._residentTabIds = [arg];
         app.mobileTab = "chat";
         app.messagesReady = true;
         app.messagesLoading = false;
         app._activateTabState(arg);
-        app._promoteResident(arg);
         return true;
         """,
         sid,
@@ -3163,7 +3339,6 @@ def test_desktop_done_reconcile_preserves_live_message_dom_identity(
         st._loaded = true;
         st._seenUpdated = 1;
         app.currentId = sid;
-        app._residentTabIds = [sid];
         app._activateTabState(sid);
         app.messagesReady = true;
         app.messagesLoading = false;
@@ -3338,7 +3513,6 @@ def test_desktop_cancelled_snapshot_reconcile_never_blanks_or_replaces_live_node
         st._loaded = true;
         st._seenUpdated = 1;
         app.currentId = sid;
-        app._residentTabIds = [sid];
         app._activateTabState(sid);
         app.messagesReady = true;
         app.messagesLoading = false;
@@ -3621,12 +3795,13 @@ def test_fast_completed_queued_turn_reconciles_footer_without_refresh(
           uuid: 'prior-visible-assistant', ts: Date.now() - 10000,
           elapsed: 2, model: 'e2e-model', turn_status: 'completed',
         }]));
+        st.messageRange.visibleEnd = st.messages.length;
+        st.messageRange.total = st.messages.length;
         st._loaded = true;
         st._seenUpdated = 1;
         st._draining = true;
         st.messagesReady = true;
         app.currentId = sid;
-        app._residentTabIds = [sid];
         app._activateTabState(sid);
         app.messagesReady = true;
         app.messagesLoading = false;
@@ -3831,7 +4006,6 @@ def test_tool_result_tail_done_metadata_renders_footer_before_canonical_reload(
         st._loaded = true;
         st._seenUpdated = 1;
         app.currentId = sid;
-        app._residentTabIds = [sid];
         app._activateTabState(sid);
         app.messagesReady = true;
         app.messagesLoading = false;
@@ -4067,7 +4241,7 @@ def test_tool_result_tail_done_metadata_renders_footer_before_canonical_reload(
     _assert_no_browser_errors(page, errors)
 
 
-def test_message_render_keys_are_repaired_per_pane_and_survive_reconciliation(
+def test_stable_message_identity_needs_no_repair_telemetry(
     page: Page, backend_url, auth_token,
 ):
     errors = _capture_browser_errors(page)
@@ -4076,343 +4250,73 @@ def test_message_render_keys_are_repaired_per_pane_and_survive_reconciliation(
     result = page.evaluate(
         """async () => {
           const app = document.querySelector("#app")._x_dataStack[0];
-          const sid = "render-key-primary";
-          const otherSid = "render-key-other";
-          const reconcileSid = "render-key-reconcile";
-          const marker = "PRIVATE_MESSAGE_CONTENT_MUST_NOT_REACH_TELEMETRY";
+          const sid = "stable-render-identity";
           app.refreshSessions = async () => {};
           app._fetchTabUsage = async () => {};
           app._scheduleIdlePreload = () => {};
           app.appReady = true;
-          app.sessions = [
-            {id: sid, name: "Primary", model: "e2e-model"},
-            {id: otherSid, name: "Other", model: "e2e-model"},
-          ];
-          app.openTabIds = [sid, otherSid];
+          app.sessions = [{id: sid, name: "Stable", model: "e2e-model"}];
+          app.openTabIds = [sid];
           app.tabState = {};
           const st = app._ensureTabState(sid);
-          const other = app._ensureTabState(otherSid);
           st._loaded = true;
-          other._loaded = true;
-          const original = {role: "user", text: marker + " user", _k: "shared-key"};
-          const live = {role: "assistant", text: marker + " assistant", _k: "shared-key"};
-          const missing = {role: "thinking", text: marker + " thinking", _k: "   "};
-          const futureLegit = {
-            role: "tool_result", text: marker + " legitimate repair-shaped key",
-            _k: `${sid}:render-repair:1`,
-          };
-          // A repeated occurrence of the exact same object cannot be repaired by
-          // mutating _k: both occurrences share that property. Normalization must
-          // remove the later array occurrence and preserve the first.
-          st.messages.push(original, live, missing, futureLegit, original);
-          // The same key is valid in another pane; uniqueness is pane-local.
-          other.messages.push({role: "assistant", text: "other", _k: "shared-key"});
-          window.__museTelemetry__.length = 0;
-          const realReport = window.__museReportTelemetry__;
-          const realDateNow = Date.now;
-          let now = 100_000;
-          Date.now = () => now;
-          let telemetryCalls = 0;
-          window.__museReportTelemetry__ = (record) => {
-            telemetryCalls += 1;
-            realReport(record);
-          };
+          const payload = [
+            {role: "user", text: "question", block_id: "record-1:0:user"},
+            {role: "assistant", text: "answer", block_id: "record-2:0:assistant"},
+            {role: "tool_result", text: "tool", block_id: "record-2:1:tool_result"},
+          ];
+          const first = app._historyEnvelopes(sid, payload);
+          const second = app._historyEnvelopes(sid, payload.map(message => ({...message})));
+          st.messages.push(...first);
+          st.messageRange.visibleEnd = st.messages.length;
+          st.messageRange.total = st.messages.length;
           app.currentId = sid;
-          app._residentTabIds = [otherSid, sid];
           app._activateTabState(sid);
           app.messagesReady = true;
           app.messagesLoading = false;
-
-          const ensureMethod = app._ensurePaneMessageRenderKeys;
-          const rebuildMethod = app._rebuildPaneMessageRenderKeys;
-          const normalize = (id) => ensureMethod.call(app, id);
-          let fullScans = 0;
-          app._rebuildPaneMessageRenderKeys = function(...args) {
-            fullScans += 1;
-            return rebuildMethod.apply(this, args);
-          };
-          // Re-activation and repeated render getters are both O(1) once this
-          // pane's current message generation has been normalized.
-          app._activateTabState(sid);
-          app._activateTabState(sid);
-          const firstKeys = app.paneMessages(sid).map(m => m._k);
-          const secondKeys = app.paneMessages(sid).map(m => m._k);
-          const otherKeys = app.paneMessages(otherSid).map(m => m._k);
-          const warmFullScans = fullScans;
           await new Promise(resolve => app.$nextTick(() => requestAnimationFrame(resolve)));
-          const pane = document.querySelector(
-            `.msg-pane[data-tid="${CSS.escape(sid)}"]`);
+          const pane = document.querySelector(`.msg-pane[data-tid="${sid}"]`);
           const domKeys = pane ? Array.from(pane.querySelectorAll(".msg"))
             .map(el => el.dataset.messageKey) : [];
-          const initialTelemetry = window.__museTelemetry__.slice();
-          const stableBefore = [original._k, live._k, missing._k, futureLegit._k];
-          const appended = [];
-          for (let i = 0; i < 25; i++) {
-            appended.push(app._appendLiveMessage(st, {
-              role: "thinking", text: `live append ${i}`,
-            }));
-          }
-          const liveFullScans = fullScans;
-          const appendedKeys = appended.map(message => message._k);
-
-          // Install the fake timer before the first repair inside the rate
-          // window. That repair owns the one trailing flush; installing this
-          // after it would leave a real timer in telemetry.flushTimer and the
-          // deterministic callback list would remain empty.
-          const realSetTimeout = window.setTimeout;
-          const trailingCallbacks = [];
-          let trailingSchedules = 0;
-          window.setTimeout = (callback, delay) => {
-            trailingSchedules += 1;
-            trailingCallbacks.push({callback, delay});
-            return 90_000 + trailingSchedules;
-          };
-          const inserted = {
-            role: "tool_result", text: marker + " inserted", _k: "shared-key",
-          };
-          st.messages.unshift(inserted);
-          normalize(sid);
-          const insertedKey = inserted._k;
-          const stableAfterInsert = [original._k, live._k, missing._k, futureLegit._k];
-          st.messages.splice(0, st.messages.length, missing, inserted, live, original);
-          normalize(sid);
-          const stableAfterReorder = [original._k, live._k, missing._k, futureLegit._k];
-          // Further corruption inside the rate window is aggregated behind the
-          // same trailing timer.
-          st.messages.push(
-            {role: "tool_use", text: marker + " duplicate again", _k: "shared-key"},
-            {role: "thinking", text: marker + " missing again"},
-          );
-          normalize(sid);
-          st.messages.push({role: "thinking", text: marker + " missing again 2"});
-          normalize(sid);
-          window.setTimeout = realSetTimeout;
-          const telemetryInsideWindow = window.__museTelemetry__.slice();
-          now += 60_000;
-          trailingCallbacks[0].callback();
-          const telemetry = window.__museTelemetry__.slice();
-
-          const liveKey = live._k;
-          const canonical = app._historyEnvelopes(sid, [{
-            role: "assistant", text: live.text, uuid: "canonical-assistant",
-          }]);
-          const preserved = app._preserveCanonicalMessageIdentity(st, canonical);
-          app._claimPaneMessageRenderKeys(sid, preserved);
-
-          const reconcile = app._ensureTabState(reconcileSid);
-          const older = {
-            role: "assistant", text: "same reply", uuid: "older-assistant",
-            _k: `${reconcileSid}:uuid:older-assistant`,
-          };
-          const newestLive = {
-            role: "assistant", text: "same reply", _k: `${reconcileSid}:live:1`,
-          };
-          reconcile.messages.push(older, newestLive);
-          const reconciled = app._preserveCanonicalMessageIdentity(
-            reconcile,
-            app._historyEnvelopes(reconcileSid, [{
-              role: "assistant", text: "same reply", uuid: "canonical-newest",
-            }]),
-          );
-          rebuildMethod.call(app, reconcileSid, reconciled);
-          app._rebuildPaneMessageRenderKeys = rebuildMethod;
-          window.__museReportTelemetry__ = realReport;
-          Date.now = realDateNow;
-
+          const live = Array.from({length: 25}, (_, i) => app._appendLiveMessage(st, {
+            role: "thinking", text: `live ${i}`,
+          }));
+          const followedEnd = st.messageRange.visibleEnd;
+          st.messageRange.visibleEnd = 3;
+          app._appendLiveMessage(st, {role: "thinking", text: "hidden live"});
+          const hiddenEnd = st.messageRange.visibleEnd;
           return {
-            firstKeys, secondKeys, otherKeys, domKeys,
-            warmFullScans, liveFullScans, appendedKeys,
-            stableBefore, stableAfterInsert, stableAfterReorder, insertedKey,
-            futureLegitKey: futureLegit._k, missingKey: missing._k,
-            initialTelemetry, telemetryInsideWindow, telemetry, telemetryCalls,
-            trailingSchedules, trailingDelay: trailingCallbacks[0]?.delay,
-            sameObjectOccurrences: st.messages.filter(
-              message => Alpine.raw(message) === original).length,
-            telemetryText: JSON.stringify(telemetry), marker,
-            liveSameObject: Alpine.raw(preserved[0]) === live,
-            liveKey: preserved[0]._k,
-            expectedLiveKey: liveKey,
-            canonicalUuid: preserved[0].uuid,
-            newestSameObject: Alpine.raw(reconciled[0]) === newestLive,
-            newestKey: reconciled[0]._k,
+            keys: first.map(message => message._k),
+            sameObjects: first.every((message, i) => Alpine.raw(second[i]) === Alpine.raw(message)),
+            domKeys,
+            liveKeys: live.map(message => message._k),
+            followedEnd,
+            hiddenEnd,
+            repositoryLength: st.messages.length,
+            normalizedCount: app._sessionWindows.get(sid)?.size || 0,
+            paneCount: document.querySelectorAll(".msg-pane").length,
+            telemetryBuffer: typeof window.__museTelemetry__,
+            telemetryReporter: typeof window.__museReportTelemetry__,
           };
         }"""
     )
 
-    assert result["firstKeys"] == result["secondKeys"], result
-    assert len(result["firstKeys"]) == len(set(result["firstKeys"])) == 4, result
-    assert all(result["firstKeys"]), result
-    assert result["otherKeys"] == ["shared-key"], result
-    assert result["domKeys"] == result["firstKeys"], result
-    assert result["warmFullScans"] == 0, result
-    assert result["liveFullScans"] == 0, result
-    assert len(result["appendedKeys"]) == len(set(result["appendedKeys"])) == 25, result
-    assert not set(result["appendedKeys"]) & set(result["stableBefore"]), result
-    assert result["stableAfterInsert"] == result["stableBefore"], result
-    assert result["stableAfterReorder"] == result["stableBefore"], result
-    assert result["insertedKey"] not in result["stableBefore"], result
-    assert result["futureLegitKey"] == "render-key-primary:render-repair:1", result
-    assert result["missingKey"] != result["futureLegitKey"], result
-    first_report = {
-        "kind": "message_render_key",
-        "pane": "render-key-primary",
-        "session": "render-key-primary",
-        "issues": [
-            {"issue": "duplicate", "count": 2},
-            {"issue": "missing", "count": 1},
-        ],
-    }
-    assert result["initialTelemetry"] == result["telemetryInsideWindow"] == [
-        first_report
-    ], result
-    assert result["telemetry"] == [
-        first_report,
-        {
-            "kind": "message_render_key",
-            "pane": "render-key-primary",
-            "session": "render-key-primary",
-            "issues": [
-                {"issue": "duplicate", "count": 2},
-                {"issue": "missing", "count": 2},
-            ],
-        },
-    ], result
-    assert result["telemetryCalls"] == 2, result
-    assert result["trailingSchedules"] == 1, result
-    assert result["trailingDelay"] == 60_000, result
-    assert result["sameObjectOccurrences"] == 1, result
-    assert result["marker"] not in result["telemetryText"], result
-    assert result["liveSameObject"] is True, result
-    assert result["liveKey"] == result["expectedLiveKey"], result
-    assert result["canonicalUuid"] == "canonical-assistant", result
-    assert result["newestSameObject"] is True, result
-    assert result["newestKey"] == "render-key-reconcile:live:1", result
-    _assert_no_browser_errors(page, errors)
-
-
-def test_history_async_boundaries_reject_stale_state_and_reclaim_detached_keys(
-    page: Page, backend_url, auth_token,
-):
-    errors = _capture_browser_errors(page)
-    _login(page, backend_url, auth_token)
-
-    result = page.evaluate(
-        """async () => {
-          const app = document.querySelector("#app")._x_dataStack[0];
-          app._fetchTabUsage = async () => {};
-          app._scheduleIdlePreload = () => {};
-
-          // _fetchOlderWindow must not call any state-creating/key helper after
-          // its captured tab state was replaced while response JSON awaited.
-          const fetchSid = "render-key-stale-fetch";
-          const oldFetchState = app._ensureTabState(fetchSid);
-          oldFetchState._loadedOffset = 1;
-          oldFetchState._total = 1;
-          oldFetchState.historyGeneration = "old-generation";
-          let resolveJson;
-          const realFetch = window.fetch;
-          window.fetch = async () => ({
-            ok: true, status: 200,
-            json: () => new Promise(resolve => { resolveJson = resolve; }),
-          });
-          const fetchPromise = app._fetchOlderWindow(fetchSid);
-          while (!resolveJson) await Promise.resolve();
-          const freshFetchState = app._blankTabState();
-          freshFetchState._sid = fetchSid;
-          app.tabState[fetchSid] = freshFetchState;
-          resolveJson({
-            messages: [{role: "user", text: "stale", uuid: "stale-fetch"}],
-            offset: 0, total: 1, history_generation: "new-generation",
-          });
-          const fetched = await fetchPromise;
-          window.fetch = realFetch;
-
-          // loadEarlierMessages detaches before chunked rendering. Replacing the
-          // state during that yield must leave both the orphan and fresh state
-          // untouched by the eventual continuation.
-          const staleSid = "render-key-stale-earlier";
-          const staleState = app._ensureTabState(staleSid);
-          staleState._loaded = true;
-          staleState._earlierMessages = Array.from({length: 81}, (_, i) => ({
-            role: "assistant", text: `stale earlier ${i}`,
-            _k: `${staleSid}:hist:${i}`,
-          }));
-          app._rebuildPaneMessageRenderKeys(staleSid);
-          app.currentId = staleSid;
-          app.messages = staleState.messages;
-          const realRaf = window.requestAnimationFrame;
-          let staleRaf;
-          window.requestAnimationFrame = callback => { staleRaf = callback; return 1; };
-          const stalePromise = app.loadEarlierMessages(staleSid);
-          while (!staleRaf) await Promise.resolve();
-          const freshEarlierState = app._blankTabState();
-          freshEarlierState._sid = staleSid;
-          app.tabState[staleSid] = freshEarlierState;
-          window.requestAnimationFrame = realRaf;
-          staleRaf();
-          await stalePromise;
-
-          // In the owned-state case, inject a colliding object while the batch is
-          // detached. Reinsertion must run the normalization boundary again.
-          const reclaimSid = "render-key-reclaim-earlier";
-          const reclaimState = app._ensureTabState(reclaimSid);
-          reclaimState._loaded = true;
-          const detached = Array.from({length: 81}, (_, i) => ({
-            role: "assistant", text: `owned earlier ${i}`,
-            _k: `${reclaimSid}:hist:${i}`,
-          }));
-          reclaimState._earlierMessages = detached.slice();
-          app._rebuildPaneMessageRenderKeys(reclaimSid);
-          app.currentId = reclaimSid;
-          app.messages = reclaimState.messages;
-          let reclaimRaf;
-          window.requestAnimationFrame = callback => { reclaimRaf = callback; return 2; };
-          const reclaimPromise = app.loadEarlierMessages(reclaimSid);
-          while (!reclaimRaf) await Promise.resolve();
-          const intruder = {
-            role: "tool_result", text: "intruder", _k: detached[1]._k,
-          };
-          reclaimState.messages.push(intruder);
-          app._markPaneRenderKeysDirty(reclaimState);
-          app._ensurePaneMessageRenderKeys(reclaimSid);
-          // Only the first frame is intercepted so the collision can be injected.
-          // Restore the real scheduler before releasing it; the remaining batch
-          // needs several 16-message frame callbacks to finish.
-          window.requestAnimationFrame = realRaf;
-          reclaimRaf();
-          await reclaimPromise;
-          const reclaimKeys = reclaimState.messages.map(message => message._k);
-
-          return {
-            fetched,
-            freshFetchMessages: freshFetchState.messages.length,
-            freshFetchOwners: freshFetchState._renderKeyOwners.size,
-            oldFetchEarlier: oldFetchState._earlierMessages.length,
-            staleOldMessages: staleState.messages.length,
-            staleFreshMessages: freshEarlierState.messages.length,
-            reclaimCount: reclaimState.messages.length,
-            reclaimExpectedCount: Math.min(detached.length, app.LOAD_MORE_BATCH) + 1,
-            reclaimUnique: new Set(reclaimKeys).size,
-            collisionResolved: intruder._k !== detached[1]._k,
-            detachedOwned: Alpine.raw(
-              reclaimState._renderKeyOwners.get(detached[1]._k)) === detached[1],
-          };
-        }"""
-    )
-
-    expected_reclaim_count = result.pop("reclaimExpectedCount")
-    assert result == {
-        "fetched": 0,
-        "freshFetchMessages": 0,
-        "freshFetchOwners": 0,
-        "oldFetchEarlier": 0,
-        "staleOldMessages": 0,
-        "staleFreshMessages": 0,
-        "reclaimCount": expected_reclaim_count,
-        "reclaimUnique": expected_reclaim_count,
-        "collisionResolved": True,
-        "detachedOwned": True,
-    }
+    assert result["keys"] == [
+        "stable-render-identity:block:record-1:0:user",
+        "stable-render-identity:block:record-2:0:assistant",
+        "stable-render-identity:block:record-2:1:tool_result",
+    ]
+    assert result["sameObjects"] is True
+    assert result["domKeys"] == result["keys"]
+    assert len(result["liveKeys"]) == len(set(result["liveKeys"])) == 25
+    assert all(":live:" in key for key in result["liveKeys"])
+    assert result["followedEnd"] == 28
+    assert result["repositoryLength"] == 29
+    assert result["hiddenEnd"] == 3
+    assert result["normalizedCount"] == 3
+    assert result["paneCount"] == 1
+    assert result["telemetryBuffer"] == "undefined"
+    assert result["telemetryReporter"] == "undefined"
     _assert_no_browser_errors(page, errors)
 
 
@@ -4487,16 +4391,19 @@ def test_canonical_reload_stays_quiet_when_background_tab_becomes_current(
           role: "assistant", text: "OTHER_VISIBLE",
           html: "<p>OTHER_VISIBLE</p>", _k: `${other}:existing`, _noAnim: true,
         });
+        otherState.messageRange.visibleEnd = otherState.messages.length;
+        otherState.messageRange.total = otherState.messages.length;
         const targetState = app._ensureTabState(target);
         targetState._loaded = true;
         targetState.messages.push({
           role: "assistant", text: arg.finalText,
           html: `<p>${arg.finalText}</p>`, _k: `${target}:live:1`,
         });
+        targetState.messageRange.visibleEnd = targetState.messages.length;
+        targetState.messageRange.total = targetState.messages.length;
         targetState.messagesReady = true;
         targetState.messagesLoading = false;
         app.currentId = other;
-        app._residentTabIds = [other, target];
         app.mobileTab = "chat";
         app._activateTabState(other);
         return new Promise(resolve => app.$nextTick(() => requestAnimationFrame(resolve)));
@@ -4588,6 +4495,8 @@ def test_mobile_turn_footer_keeps_complete_metadata_inside_chat(
             model: 'codex:a-very-long-model-name-for-footer',
             turn_status: 'completed',
           }]));
+          st.messageRange.visibleEnd = st.messages.length;
+          st.messageRange.total = st.messages.length;
           st._loaded = true;
           st.messagesReady = true;
           st.streaming = false;
@@ -4781,12 +4690,10 @@ def test_background_task_gap_leaves_composer_usable_without_empty_reconnect(
         app.openTabIds = [arg];
         app.tabState = {};
         app.currentId = arg;
-        app._residentTabIds = [arg];
         app.mobileTab = "chat";
         app.messagesReady = true;
         app.messagesLoading = false;
         app._activateTabState(arg);
-        app._promoteResident(arg);
         return true;
         """,
         sid,
@@ -4957,6 +4864,8 @@ def test_inherited_projection_unread_requires_new_runtime_event(
                   _k: `${sid}:idx:${spec.name}`,
                   _noAnim: true,
                 });
+                spec.st.messageRange.visibleEnd = spec.st.messages.length;
+                spec.st.messageRange.total = spec.st.messages.length;
               }
               spec.st.runtimeUiRevision = spec.desired;
               return true;
@@ -4979,6 +4888,8 @@ def test_inherited_projection_unread_requires_new_runtime_event(
                 _k: `${child}:idx:runtime-existing-${item.name}`,
                 _noAnim: true,
               });
+              st.messageRange.visibleEnd = st.messages.length;
+              st.messageRange.total = st.messages.length;
               app.tabState[child] = st;
               specs.set(child, { ...item, st, loads: 0 });
               app.currentId = item.current ? child : "different-visible-tab";
@@ -5155,8 +5066,9 @@ def test_background_completion_no_active_fallback_never_blanks_visible_messages(
             _k: `${sid}:live:3`, _noAnim: true,
           },
         );
+        st.messageRange.visibleEnd = st.messages.length;
+        st.messageRange.total = st.messages.length;
         app.currentId = sid;
-        app._residentTabIds = [sid];
         app.mobileTab = "chat";
         app._activateTabState(sid);
         app.messagesReady = true;
@@ -5305,6 +5217,8 @@ def test_incomplete_background_continuation_keeps_user_queue_runnable(
           uuid: "continuation-queue-assistant",
           _k: "continuation-queue-assistant", _noAnim: true,
         }];
+        st.messageRange.visibleEnd = st.messages.length;
+        st.messageRange.total = st.messages.length;
         st.pendingQueue = [{
           id: "queued-user-followup", text: "USER FOLLOWUP",
           pendingImages: [], pendingDocs: [],
@@ -5727,7 +5641,7 @@ def test_mobile_composer_footer_is_compact_and_never_overflows(
     ("viewport", "expects_plain"),
     [
         ({"width": 390, "height": 844}, True),
-        ({"width": 1440, "height": 900}, False),
+        ({"width": 1440, "height": 900}, True),
     ],
     ids=["mobile", "desktop"],
 )
@@ -5767,7 +5681,6 @@ def test_120kb_mixed_sse_stream_renders_final_assistant_html(
         app.tabState = {};
         app.tabState[sid] = app._blankTabState();
         app.currentId = sid;
-        app._residentTabIds = [sid];
         app._activateTabState(sid);
         app.messagesReady = true;
         app.messagesLoading = false;
@@ -5815,7 +5728,8 @@ def test_120kb_mixed_sse_stream_renders_final_assistant_html(
           const last = app.messages[app.messages.length - 1];
           return app.streaming === true
             && last && last.role === "assistant"
-            && last.html.includes("MID_STREAM_VISIBLE_1")
+            && last._streamPlain === true
+            && last._streamText.includes("MID_STREAM_VISIBLE_1")
             && body.includes("MID_STREAM_VISIBLE_1");
         }""",
         timeout=10000,
@@ -5827,7 +5741,7 @@ def test_120kb_mixed_sse_stream_renders_final_assistant_html(
         return {
           streaming: app.streaming,
           textLength: last.text.length,
-          htmlLength: last.html.length,
+          streamTextLength: last._streamText.length,
         };
         """,
     )
@@ -5846,8 +5760,8 @@ def test_120kb_mixed_sse_stream_renders_final_assistant_html(
           return app.streaming === true
             && last && last.role === "assistant"
             && last.text.length > prev.textLength
-            && last.html.length >= prev.htmlLength
-            && last.html.includes("MID_STREAM_VISIBLE_2")
+            && last._streamText.length > prev.streamTextLength
+            && last._streamText.includes("MID_STREAM_VISIBLE_2")
             && body.includes("MID_STREAM_VISIBLE_2");
         }""",
         arg=mid_1,
@@ -5941,7 +5855,7 @@ def test_120kb_mixed_sse_stream_renders_final_assistant_html(
           mounted: Array.from(document.querySelectorAll('.msg-pane'))
             .filter(p => getComputedStyle(p).display !== 'none')
             .reduce((n, p) => n + p.querySelectorAll('.msg').length, 0),
-          cached: st.messages.length + st._earlierMessages.length + st._laterMessages.length,
+          cached: st.messages.length,
         };
         """,
     )
@@ -5952,7 +5866,7 @@ def test_120kb_mixed_sse_stream_renders_final_assistant_html(
         assert render_stats["plain"] == 0
         assert render_stats["rich"] >= 1
     assert render_stats["mounted"] <= 60
-    assert render_stats["cached"] <= 120
+    assert render_stats["cached"] >= render_stats["mounted"]
     long_tasks = page.evaluate("() => window.__longTasks || []")
     assert max(long_tasks or [0]) < 2000, long_tasks
 

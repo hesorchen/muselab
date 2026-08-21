@@ -1,5 +1,6 @@
 """Episode consolidation, verification, hybrid recall and Skill approval."""
 import asyncio
+import threading
 
 import httpx
 import pytest
@@ -199,6 +200,21 @@ def test_hybrid_recall_fuses_channels_and_exposes_trace(tmp_path, monkeypatch):
     memory = instance.store.create_memory(
         "default", "decision", "推荐系统上线前需要小流量验证",
         authority="confirmed", confidence=1.0)
+    event_loop_thread = threading.get_ident()
+    io_threads = {}
+    original_hydrate = instance.store.memories_by_ids
+    original_log = instance.store.log_recall
+
+    def tracked_hydrate(memory_ids):
+        io_threads["hydrate"] = threading.get_ident()
+        return original_hydrate(memory_ids)
+
+    def tracked_log(*args, **kwargs):
+        io_threads["log"] = threading.get_ident()
+        return original_log(*args, **kwargs)
+
+    monkeypatch.setattr(instance.store, "memories_by_ids", tracked_hydrate)
+    monkeypatch.setattr(instance.store, "log_recall", tracked_log)
 
     class FakeEmbedding:
         def __init__(self, _config): pass
@@ -219,6 +235,8 @@ def test_hybrid_recall_fuses_channels_and_exposes_trace(tmp_path, monkeypatch):
     trace = instance.pop_recall_trace("session-x")
     assert trace["count"] == 1
     assert trace["items"][0]["sources"] == []
+    assert io_threads["hydrate"] != event_loop_thread
+    assert io_threads["log"] != event_loop_thread
 
 
 def test_skill_draft_is_inert_until_explicit_approval(tmp_path, monkeypatch):

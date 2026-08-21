@@ -92,6 +92,9 @@ def test_third_party_provider_enables_sdk_skills(app_module, monkeypatch, tmp_pa
     assert client is not None
     assert captured["skills"] == "all"
     assert "can_use_tool" not in captured
+    assert [m.matcher for m in captured["hooks"]["PreToolUse"]] == [
+        "AskUserQuestion"
+    ]
     assert captured["env"]["ANTHROPIC_API_KEY"] == "sk-test"
     for tier in ("OPUS", "SONNET", "HAIKU", "FABLE"):
         assert captured["env"][f"ANTHROPIC_DEFAULT_{tier}_MODEL"] == "deepseek-v4-pro"
@@ -556,12 +559,14 @@ def test_codex_gateway_effort_reaches_sdk_options(app_module, monkeypatch, tmp_p
     # compact preflight instead of its unrelated built-in 200K default.
     assert captured["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] == "258400"
     assert captured["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "258400"
-    skill_guards = captured["hooks"]["PreToolUse"]
-    assert len(skill_guards) == 1
-    assert skill_guards[0].matcher == "Skill"
+    pre_tool_hooks = captured["hooks"]["PreToolUse"]
+    assert [m.matcher for m in pre_tool_hooks] == [
+        "Skill", "AskUserQuestion"
+    ]
+    skill_guard = pre_tool_hooks[0]
 
     async def invoke_skill_guard(name):
-        return await skill_guards[0].hooks[0](
+        return await skill_guard.hooks[0](
             {"tool_input": {"skill": name}}, None, None)
 
     denied = asyncio.run(invoke_skill_guard("claude-api"))
@@ -576,7 +581,9 @@ def test_codex_gateway_effort_reaches_sdk_options(app_module, monkeypatch, tmp_p
     asyncio.run(chat_mod._build_and_connect_client(
         "sid-codex-skill-optout", "codex:gpt-5.5",
         "bypassPermissions", "high"))
-    assert "PreToolUse" not in opted_out["hooks"]
+    assert [m.matcher for m in opted_out["hooks"]["PreToolUse"]] == [
+        "AskUserQuestion"
+    ]
 
 
 def test_codex_auto_and_ultra_fast_use_gateway_headers(
@@ -670,7 +677,9 @@ def test_bare_gpt_provider_never_inherits_codex_gateway_headers(
     assert captured["effort"] == "high"
     assert captured["thinking"] == {"type": "disabled"}
     assert "ANTHROPIC_CUSTOM_HEADERS" not in captured["env"]
-    assert "PreToolUse" not in captured["hooks"]
+    assert [m.matcher for m in captured["hooks"]["PreToolUse"]] == [
+        "AskUserQuestion"
+    ]
 
 
 def test_disable_skills_env_still_opts_out(app_module, monkeypatch, tmp_path):
