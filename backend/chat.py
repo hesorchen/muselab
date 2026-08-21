@@ -1836,8 +1836,9 @@ def _terminal_task_update(msg: TaskUpdatedMessage) -> dict | None:
 # - We do NOT auto-resume. Auto-resume would burn tokens on conversations the
 #   user has already abandoned and bypass their "should I rephrase?" judgment.
 #   Frontend gets the list + sids and toasts the user — they decide.
-# - File presence == status "in_flight". Don't bother with a status field;
-#   deletion is the only terminal action.
+# - The sidecar owns the user's pending intent only until canonical commit or a
+#   durable failed/cancelled display snapshot takes over. A process-crash orphan
+#   is converted to that snapshot before a later turn can reuse the same sid.
 # - No periodic touch / last_event_ts. Adding background touch task per turn
 #   means N file writes per second across active turns — not worth the
 #   complexity for "stale by 30s vs 30min" UX granularity. `started_at` is
@@ -1851,10 +1852,12 @@ def _active_turn_path(sid: str) -> Path:
     return _ACTIVE_TURN_DIR / f"{sid}.json"
 
 
-def _write_active_turn_sidecar(bc: TurnBroadcast) -> None:
-    """Persist the in-flight turn so a restart can surface it to the UI.
-    Best-effort: a failure here must NOT abort the turn (we'd rather run
-    the user's prompt without a recovery breadcrumb than refuse to run)."""
+def _write_active_turn_sidecar(bc: TurnBroadcast) -> bool:
+    """Persist the user intent before the SDK can accept the turn.
+
+    Callers at the initial submission boundary must fail closed when this
+    returns False; later rewrites only enrich an already-durable record.
+    """
     try:
         raw = bc.user_text or ""
         first_line = raw.strip().splitlines()[0] if raw.strip() else ""
@@ -1868,20 +1871,23 @@ def _write_active_turn_sidecar(bc: TurnBroadcast) -> None:
                 "model": bc.model,
                 "started_at": bc.started_at,
                 "turn_id": bc.turn_id,
+                "user_images": bc.user_images,
+                "user_docs": bc.user_docs,
+                "transcript_boundary": dict(bc.transcript_boundary or {}),
             }, ensure_ascii=False),
             mode=0o600,
         )
+        return True
     except Exception as e:
         sys.stderr.write(
             f"[chat] failed to write active-turn sidecar "
             f"sid={obs.short_id(bc.session_id)} exc={type(e).__name__}\n")
         sys.stderr.flush()
+        return False
 
 
 def _delete_active_turn_sidecar(sid: str) -> None:
-    """Called on clean turn termination (success / error / timeout). The
-    only case where we leave it on disk is when the process dies before
-    reaching this — exactly the case we want startup scan to catch."""
+    """Delete pending intent only after canonical/snapshot ownership exists."""
     try:
         p = _active_turn_path(sid)
         if p.exists():
@@ -1890,19 +1896,23 @@ def _delete_active_turn_sidecar(sid: str) -> None:
         pass
 
 
-def _delete_active_turn_sidecar_if_idle(sid: str) -> bool:
-    """Delete the crash breadcrumb only after the whole logical turn is idle.
+def _retain_active_turn_for_recovery(sid: str) -> None:
+    """Expose a still-owned sidecar to history without waiting for restart."""
+    try:
+        data = json.loads(_active_turn_path(sid).read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            _interrupted_at_startup[sid] = data
+    except Exception:
+        pass
 
-    A main ResultMessage is not terminal when SDK background tasks are still
-    owned by a detached watcher. Keeping the sidecar through that gap lets a
-    process restart surface the turn as interrupted instead of leaving a
-    transcript that silently ends at TaskNotification/thinking.
+
+def _release_active_turn_sidecar(sid: str) -> bool:
+    """Release pending-intent ownership at a durable terminal boundary.
+
+    Detached task state has its own runtime overlays/outbox. Keeping the user
+    intent sidecar after the canonical turn committed conflates those two owners
+    and can duplicate an already-successful prompt after a process restart.
     """
-    if _sessions_with_inflight_tasks.get(sid):
-        return False
-    watcher = _task_watchers.get(sid)
-    if watcher is not None and not watcher.done():
-        return False
     _delete_active_turn_sidecar(sid)
     return True
 
@@ -6299,6 +6309,10 @@ def get_session_api(
     if meta is None:
         raise HTTPException(404, "session not found")
     model = meta.get("model", "")
+    if (sid in _interrupted_at_startup
+            and not _recover_interrupted_turn_snapshot(sid)):
+        raise HTTPException(
+            503, "interrupted turn could not be loaded into durable history")
     snapshots, snapshot_generation = _load_cancelled_turn_snapshots(sid)
     # Any bounded request uses the byte-offset index, including bounded
     # ``full``-order paging after an outline jump.  Keeping normal/full as an
@@ -8024,6 +8038,7 @@ def _persist_failed_turn_snapshot(
         )
         duration = round(duration, 1)
         visible_error = str(error_text or "Turn failed without an assistant response.")
+        error_meta = _classify_stream_error(visible_error)
         messages = _broadcast_to_ui_messages(bc)
 
         # Match the live UI: retain any legitimate partial answer, then show
@@ -8050,6 +8065,9 @@ def _persist_failed_turn_snapshot(
             if message.get("role") == "user":
                 message["_failed"] = True
                 message["_error_text"] = visible_error
+                message["_error_kind"] = error_meta["kind"]
+                message["_error_cta"] = error_meta["cta"]
+                message["_error_retryable"] = error_meta["retryable"]
         for message in reversed(messages):
             if message.get("role") == "user":
                 continue
@@ -8131,6 +8149,68 @@ def _persist_failed_turn_snapshot(
                 f"sid={bc.session_id[:8]} exc={type(exc).__name__}\n")
             sys.stderr.flush()
         return True
+
+
+def _recover_interrupted_turn_snapshot(sid: str) -> bool:
+    """Move a process-crash orphan from pending intent to durable history.
+
+    The active-turn sidecar is the only record guaranteed to exist before the
+    CLI commits a UserMessage.  On restart, convert it to the same private
+    failed-turn snapshot used by live terminal failures before deleting the
+    sidecar.  This keeps JSONL authoritative while ensuring a reload or a later
+    send cannot silently erase the user's original text.
+    """
+    data = _interrupted_at_startup.get(sid)
+    if not isinstance(data, dict):
+        return True
+
+    turn = TurnBroadcast(
+        session_id=sid,
+        model=str(data.get("model") or ""),
+    )
+    turn_id = str(data.get("turn_id") or "")
+    try:
+        turn.turn_id = str(uuid.UUID(turn_id))
+    except (ValueError, AttributeError):
+        # Old sidecars predate turn_id. A fresh stable ID is sufficient because
+        # the orphan has no canonical turn identity to preserve.
+        pass
+    turn.user_text = str(data.get("user_text") or "")
+    images = data.get("user_images")
+    docs = data.get("user_docs")
+    boundary = data.get("transcript_boundary")
+    turn.user_images = list(images) if isinstance(images, list) else []
+    turn.user_docs = list(docs) if isinstance(docs, list) else []
+    turn.transcript_boundary = dict(boundary) if isinstance(boundary, dict) else {}
+    try:
+        turn.started_at = float(data.get("started_at") or turn.started_at)
+    except (TypeError, ValueError):
+        pass
+
+    # A process can die after the CLI append but before sidecar cleanup. If this
+    # exact pre-query boundary already owns a canonical user+assistant pair,
+    # JSONL has won ownership and no failed display snapshot should be layered
+    # over the successful turn.
+    if turn.transcript_boundary.get("capture_ok"):
+        assistant_uuid, user_uuid, _ = _turn_uuids_from_boundary(
+            sid,
+            turn.transcript_boundary,
+            started_at_ms=int(turn.started_at * 1000),
+            terminal_at_ms=int(time.time() * 1000),
+        )
+        if assistant_uuid and user_uuid:
+            _delete_active_turn_sidecar(sid)
+            return True
+
+    recovered = _persist_failed_turn_snapshot(
+        turn,
+        "MuseLab restarted before this turn reached canonical conversation history.",
+        terminal_at_ms=int(time.time() * 1000),
+        canonical_terminal_published=False,
+    )
+    if recovered:
+        _delete_active_turn_sidecar(sid)
+    return recovered
 
 
 def _interrupted_history_segments(
@@ -12070,6 +12150,7 @@ async def _force_stop_after_grace(
         async with _lock:
             if _active_turns.get(session_id) is bc:
                 _active_turns.pop(session_id, None)
+        snapshot_ready = bc.cancelled_snapshot_persisted
         if not bc.done:
             snapshot_ready = await asyncio.to_thread(
                 _persist_cancelled_turn_snapshot, bc)
@@ -12078,7 +12159,10 @@ async def _force_stop_after_grace(
                 "data": json.dumps({"snapshot_ready": snapshot_ready}),
             })
             bc.finish()
-        _delete_active_turn_sidecar(session_id)
+        if snapshot_ready or bc.queue_item_id:
+            _delete_active_turn_sidecar(session_id)
+        else:
+            _retain_active_turn_for_recovery(session_id)
     except Exception as e:
         sys.stderr.write(
             f"[chat-interrupt] force-stop watchdog failed "
@@ -14707,7 +14791,7 @@ async def _watch_inflight_tasks(
                         f"exc={type(e).__name__}\n")
         if (_owns_generation()
                 and not _sessions_with_inflight_tasks.get(session_id)):
-            _delete_active_turn_sidecar_if_idle(session_id)
+            _release_active_turn_sidecar(session_id)
 
 
 def _merge_session_inflight(
@@ -14869,7 +14953,10 @@ async def _finish_cancelled_startup(
                     broadcast.finish()
                 if not sess.session_is_deleting(session_id):
                     _remember_recent_turn(session_id, broadcast)
-                _delete_active_turn_sidecar(session_id)
+                if snapshot_ready or broadcast.queue_item_id:
+                    _delete_active_turn_sidecar(session_id)
+                else:
+                    _retain_active_turn_for_recovery(session_id)
                 if _active_turns.get(session_id) is broadcast:
                     _active_turns.pop(session_id, None)
             return broadcast
@@ -14984,6 +15071,7 @@ async def _abort_turn_startup(
     status: str,
     *,
     pause_queue: bool = True,
+    error_text: str = "",
 ) -> bool:
     """Settle every owner created before an SDK query has been sent."""
     broadcast.perf_status = status
@@ -15027,6 +15115,27 @@ async def _abort_turn_startup(
                 continue
         activity_finish.result()
         raise
+
+    if broadcast.queue_item_id:
+        # The durable queue row still owns the original text and attachments.
+        _delete_active_turn_sidecar(session_id)
+    else:
+        visible_error = error_text or (
+            "Turn submission was interrupted before reaching canonical history."
+            if status == "cancelled"
+            else "Turn submission failed before reaching canonical history."
+        )
+        snapshot_ready = await asyncio.to_thread(
+            _persist_failed_turn_snapshot,
+            broadcast,
+            visible_error,
+            terminal_at_ms=int(time.time() * 1000),
+            canonical_terminal_published=False,
+        )
+        if snapshot_ready:
+            _delete_active_turn_sidecar(session_id)
+        else:
+            _retain_active_turn_for_recovery(session_id)
     return queue_settled
 
 
@@ -15259,6 +15368,29 @@ async def _start_turn(
     broadcast.user_text = prompt
     broadcast.startup_owner_task = asyncio.current_task()
     broadcast.queue_item_id = str(queue_item_id or "")
+    # The reservation is also the pending-intent commit point. Persist before
+    # cold client/MCP startup so a process restart cannot erase a prompt merely
+    # because the SDK had not accepted it yet. A queue item already has its own
+    # durable owner, but mirroring it here keeps direct and queued turn recovery
+    # behavior identical once claimed.
+    if session_id in _interrupted_at_startup:
+        recovered = await asyncio.to_thread(
+            _recover_interrupted_turn_snapshot, session_id)
+        if not recovered:
+            async with _lock:
+                if _active_turns.get(session_id) is broadcast:
+                    broadcast.finish()
+                    _active_turns.pop(session_id, None)
+            raise _TurnStartError(
+                "previous interrupted turn could not be persisted for recovery")
+        _interrupted_at_startup.pop(session_id, None)
+    if not _write_active_turn_sidecar(broadcast):
+        async with _lock:
+            if _active_turns.get(session_id) is broadcast:
+                broadcast.finish()
+                _active_turns.pop(session_id, None)
+        raise _TurnStartError(
+            "user message could not be persisted before submission")
     # The reservation above is the commit point: bind the durable queue claim
     # before any SDK startup await can be cancelled. From here, only this turn's
     # terminal cleanup may ack or release the item.
@@ -15287,7 +15419,8 @@ async def _start_turn(
         raise
     except _TurnBusy:
         await _abort_turn_startup(
-            session_id, broadcast, "failed", pause_queue=False)
+            session_id, broadcast, "failed", pause_queue=False,
+            error_text="Previous background task is still using this session.")
         raise
     if broadcast.cancelled:
         return await _finish_cancelled_startup(session_id, broadcast)
@@ -15395,10 +15528,12 @@ async def _start_turn(
                     broadcast.startup_task = None
     except asyncio.TimeoutError:
         broadcast.perf_error_kind = "timeout"
+        timeout_error = "Client connection timed out — CLI process may be hung"
         queue_settled = await _abort_turn_startup(
-            session_id, broadcast, "failed", pause_queue=True)
+            session_id, broadcast, "failed", pause_queue=True,
+            error_text=timeout_error)
         raise _TurnStartError(
-            "Client connection timed out — CLI process may be hung",
+            timeout_error,
             status=504,
             queue_claim_settled=queue_settled)
     except asyncio.CancelledError:
@@ -15420,7 +15555,8 @@ async def _start_turn(
         # Free the reservation so the user can fix their config (e.g. add an
         # API key) and immediately retry without waiting for any timeout.
         queue_settled = await _abort_turn_startup(
-            session_id, broadcast, "failed", pause_queue=True)
+            session_id, broadcast, "failed", pause_queue=True,
+            error_text=err_msg)
         raise _TurnStartError(
             err_msg, queue_claim_settled=queue_settled)
     finally:
@@ -16836,6 +16972,14 @@ async def _start_turn(
                 except Exception as exc:
                     _safe_secondary_diagnostic(
                         "terminal_snapshot", session_id, exc)
+            # Transfer ownership before publishing the terminal event: canonical
+            # success owns the prompt directly; a failed turn is safe to clear
+            # only after its display snapshot committed. If snapshot persistence
+            # failed, retain the sidecar for restart recovery.
+            if ((not _is_error and not was_cancelled)
+                    or (_is_error and _failed_snapshot_ready)):
+                await asyncio.to_thread(
+                    _delete_active_turn_sidecar, session_id)
             _done_background_tasks = len(
                 _merge_session_inflight(session_id, inflight_tasks)
             )
@@ -17394,12 +17538,9 @@ async def _start_turn(
     # that died before ResultMessage may have left one behind; discard it at
     # the new turn boundary so it can never be attributed to this prompt.
     mem0.pop_recall_trace(session_id)
-    # Persist an in-flight breadcrumb so a process crash / restart can
-    # surface this turn to the user on next boot. Auto-dismiss any
-    # stale entry for this sid — starting a new turn supersedes whatever
-    # the previous process left behind.
+    # Refresh the pending intent with resolved model, attachment display refs,
+    # and the exact pre-query transcript boundary captured above.
     _write_active_turn_sidecar(broadcast)
-    _interrupted_at_startup.pop(session_id, None)
 
     async def _pump_gen_to_broadcast():
         nonlocal memory_outcome_scheduled
@@ -17734,11 +17875,13 @@ async def _start_turn(
             # and silently dropping the rendered content until a manual refresh.
             if not deleting_session:
                 _remember_recent_turn(session_id, broadcast)
-            # Main ResultMessage is terminal only when no detached background
-            # task watcher still owns the logical turn. Keep the breadcrumb
-            # through that gap so a restart after TaskNotification but before
-            # the final model reaction is surfaced as interrupted.
-            _delete_active_turn_sidecar_if_idle(session_id)
+            # Clear only after another durable owner exists. A failure whose
+            # snapshot write failed deliberately leaves the pending intent for
+            # restart recovery instead of acknowledging data we did not retain.
+            if ((not turn_errored and not broadcast.cancelled)
+                    or broadcast.failed_snapshot_persisted
+                    or broadcast.cancelled_snapshot_persisted):
+                _release_active_turn_sidecar(session_id)
             # Server-side queue drain (Option B). Now that _active_turns no
             # longer holds this sid, advance the queue:
             #   - errored → pause the queue (don't cascade failures headlessly;
@@ -18173,6 +18316,9 @@ def list_interrupted_turns() -> dict:
     the conversation is worth retrying)."""
     items = []
     for sid, data in _interrupted_at_startup.items():
+        # Materialize the pending user intent before the browser can acknowledge
+        # the notification. The toast is optional UX; the history row is durable.
+        _recover_interrupted_turn_snapshot(sid)
         items.append({
             "sid": sid,
             "preview": data.get("user_text_preview") or "",
@@ -18187,11 +18333,11 @@ def list_interrupted_turns() -> dict:
 @router.post("/interrupted-turns/{sid}/dismiss",
              dependencies=[Depends(require_token)])
 def dismiss_interrupted_turn(sid: str) -> dict:
-    """User clicked 'dismiss' (or opened the session and saw the history).
-    Removes the in-memory entry AND deletes the disk sidecar so future
-    restarts don't keep nagging about the same turn."""
+    """Acknowledge the warning only after its user intent is durable history."""
+    if sid in _interrupted_at_startup and not _recover_interrupted_turn_snapshot(sid):
+        raise HTTPException(
+            503, "interrupted turn could not be persisted; acknowledgement deferred")
     _interrupted_at_startup.pop(sid, None)
-    _delete_active_turn_sidecar(sid)
     return {"ok": True}
 
 
