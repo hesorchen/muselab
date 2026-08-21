@@ -9102,7 +9102,8 @@ function portal() {
         cursor += this._messageVirtualHeight(st, messages[end]) + gap;
         end++;
       }
-      if (forceTail || st.atBottom) {
+      const followTail = forceTail || st.atBottom;
+      if (followTail) {
         end = messages.length;
         let tailHeight = 0;
         start = end;
@@ -9113,11 +9114,13 @@ function portal() {
         }
       }
       if (start === st._virtualStart && end === st._virtualEnd) return;
-      // Normal virtualization updates preserve the message currently under the
-      // reader's eyes. An explicit tail jump (Send / ↓) is different: restoring
-      // that old anchor after mounting the tail would undo the user's request
-      // and leave the pane at its previous scroll position.
-      const anchor = forceTail
+      // Normal reader-controlled virtualization updates preserve the message
+      // currently under the reader's eyes. Tail-follow updates must not: every
+      // programmatic scroll event schedules another viewport sync with
+      // forceTail=false, but st.atBottom remains true. Restoring an anchor in
+      // that follow-up sync was undoing both Send's explicit jump and every
+      // streaming auto-follow step.
+      const anchor = followTail
         ? null : this._captureViewportMessageAnchor(body, tid);
       st._virtualStart = start;
       st._virtualEnd = end;
@@ -9125,7 +9128,7 @@ function portal() {
       this.$nextTick(() => {
         if (this.tabState[tid] !== st || tid !== this.currentId) return;
         this._measureMessageVirtualRows(tid, st);
-        if (!forceTail) this._restoreMessageAnchor(body, anchor);
+        if (!followTail) this._restoreMessageAnchor(body, anchor);
       });
     },
     _scheduleMessageViewportSync(tid = this.currentId, forceTail = false) {

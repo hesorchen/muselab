@@ -3107,8 +3107,9 @@ def test_explicit_send_scroll_mounts_virtual_tail_without_restoring_old_anchor()
     sync_start = app.index("_syncMessageViewport(tid = this.currentId, forceTail = false)")
     sync_end = app.index("_scheduleMessageViewportSync", sync_start)
     sync = app[sync_start:sync_end]
-    assert "const anchor = forceTail" in sync
-    assert "if (!forceTail) this._restoreMessageAnchor(body, anchor)" in sync
+    assert "const followTail = forceTail || st.atBottom" in sync
+    assert "const anchor = followTail" in sync
+    assert "if (!followTail) this._restoreMessageAnchor(body, anchor)" in sync
 
     scroll_start = app.index("    scrollToBottom(force) {")
     scroll_end = app.index("// Re-slam the viewport", scroll_start)
