@@ -427,9 +427,10 @@ def test_mobile_preview_captures_before_hiding_and_pins_tree_taps():
         "this._restorePreviewViewState(ownerPath, ownerLoadSeq)"
     ) < mobile_tab.index("this.mobileTab = next")
     assert "this._schedulePreviewViewRestore(ownerPath, ownerLoadSeq)" in mobile_tab
-    assert mobile_tab.index("this.messagesReady = false") < mobile_tab.index(
+    assert mobile_tab.index("chatState.messagesReady = false") < mobile_tab.index(
         "this.mobileTab = next"
     )
+    assert "this.messagesReady =" not in mobile_tab
     assert "this._afterPaint(() => {" in mobile_tab
     assert 'this.mobileTab !== "chat"' in mobile_tab
     assert 'this.mobileTab !== "preview"' in app
@@ -1159,7 +1160,8 @@ def test_session_delete_confirms_once_and_disposes_browser_runtime():
     assert delete.index("this._disposeTabRuntime(sid)") > delete.index("if (!response.ok)")
     assert "deleteSessionById(cur.id, { confirmed: true })" in current
     assert "const ownedEs = st.es" in dispose
-    assert "this.es === ownedEs" in dispose
+    assert "st.es = null" in dispose
+    assert "this.es === ownedEs" not in dispose
     assert "this._stopBgContPoller(id)" in dispose
     assert "delete this._sessionLoadPromises[id]" in dispose
     assert "delete this.tabState[id]" in dispose
@@ -2933,6 +2935,63 @@ def test_transcript_active_session_ui_reads_through_pane_facade():
     assert "_currentQueueLen()" not in transcript
     assert 'x-show="streaming && (!messages.length' not in transcript
     assert 'x-show="!atBottom"' not in transcript
+
+
+def test_tab_state_exclusively_owns_transcript_stream_usage_and_scroll_state():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    owned = (
+        "messages", "messagesReady", "messagesLoading", "historyGeneration",
+        "streaming", "es", "streamingModel", "streamElapsed", "_streamTimer",
+        "_streamStartedAt", "sessionUsage", "atBottom",
+    )
+
+    root_start = app.index("    tabState: {},")
+    root_end = app.index("    model:", root_start)
+    root = app[root_start:root_end]
+    for field in owned:
+        assert f"get {field}() {{ return this.activeSessionPane().{field}; }}" in root
+        assert (
+            f'set {field}(value) {{ this._setActiveSessionPaneField("{field}", value); }}'
+            in root
+        )
+        assert not re.search(rf"this\.{re.escape(field)}\s*=", app)
+    setter_start = app.index("_setActiveSessionPaneField(field, value)")
+    setter_end = app.index("\n    paneMessages(tid)", setter_start)
+    setter = app[setter_start:setter_end]
+    assert "const st = this.paneState(this.currentId)" in setter
+    assert "if (st) st[field] = value" in setter
+
+    activate_start = app.index("_activateTabState(id)")
+    activate_end = app.index("\n    _paneElement", activate_start)
+    activate = app[activate_start:activate_end]
+    for field in owned:
+        assert f"this.{field} =" not in activate
+
+    blank_start = app.index("_blankTabState()")
+    blank_end = app.index("_ensureTabState(id)", blank_start)
+    blank = app[blank_start:blank_end]
+    for declaration in (
+        "messages: []", "messagesReady: true", "messagesLoading: false",
+        'historyGeneration: ""', "streaming: false", "es: null",
+        'streamingModel: ""', "streamElapsed: 0", "_streamTimer: null",
+        "_streamStartedAt: 0", "sessionUsage:", "atBottom: true",
+    ):
+        assert declaration in blank
+
+    load_start = app.index("async loadSession(sid, opts = {})")
+    load_end = app.index("// Warm OPEN-but-inactive tabs", load_start)
+    around_start = app.index("async _loadAroundMessage(sid, uuid")
+    around_end = app.index("// Outline click", around_start)
+    pagination_start = app.index("async _fetchOlderWindow(sid)")
+    pagination_end = app.index("// Per-message placeholder height", pagination_start)
+    sse_start = app.index("async send(opts = {})")
+    sse_end = app.index("async stop()", sse_start)
+    for section in (
+        app[load_start:load_end], app[around_start:around_end],
+        app[pagination_start:pagination_end], app[sse_start:sse_end],
+    ):
+        for field in owned:
+            assert not re.search(rf"this\.{re.escape(field)}\s*=", section)
 
 
 def test_long_chat_state_keeps_complete_normalized_history_and_generation_safety():

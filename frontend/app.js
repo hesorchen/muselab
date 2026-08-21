@@ -201,13 +201,32 @@ function _rawMsg(m) {
 //   (every tool_use bubble, every render).
 const _HTML_ESCAPE_MAP = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
 const _FILE_TOOLS = new Set(["Read", "Edit", "Write", "NotebookEdit", "MultiEdit"]);
+const _EMPTY_SESSION_USAGE = Object.freeze({
+  input_tokens: 0,
+  output_tokens: 0,
+  cache_read_tokens: 0,
+  cache_creation_tokens: 0,
+  context_limit: 0,
+  context_used: 0,
+  context_used_pct: 0,
+  context_used_source: "none",
+  context_used_is_estimate: false,
+  context_limit_source: "",
+  context_limit_is_estimate: true,
+  context_is_estimate: true,
+});
 const _EMPTY_ACTIVE_SESSION_PANE = Object.freeze({
   messages: Object.freeze([]),
   messagesReady: true,
   messagesLoading: false,
+  historyGeneration: "",
   streaming: false,
+  es: null,
   streamingModel: "",
   streamElapsed: 0,
+  _streamTimer: null,
+  _streamStartedAt: 0,
+  sessionUsage: _EMPTY_SESSION_USAGE,
   pendingQueue: Object.freeze([]),
   _queuePaused: false,
   backgroundActive: false,
@@ -772,15 +791,35 @@ function portal() {
                           //  has a different shape — overlapping names crash
                           //  Alpine when one side reads .show on the other's null)
     forkingSessionId: "",
-    // Per-tab runtime state. Keyed by session id. Each entry is a "snapshot"
-    // of {messages, sessionUsage, streaming, es, streamingModel, ...} that the
-    // active tab mirrors into root state (this.messages, this.es, etc.) via
-    // _activateTabState(). Background tabs' stream callbacks write to their
-    // own tabState[sid] so switching away doesn't lose / mis-route events.
-    // The active tab's `this.messages` and `tabState[currentId].messages` are
-    // the SAME array reference — we mutate in place, never replace.
+    // Per-tab runtime state. Keyed by session id and the sole owner of the
+    // transcript, history-loading, stream, usage, and scroll-follow state.
+    // Root names remain compatibility accessors for older helpers/templates;
+    // they never store a second copy and always resolve through currentId.
     tabState: {},
-    messages: [],
+    get messages() { return this.activeSessionPane().messages; },
+    set messages(value) { this._setActiveSessionPaneField("messages", value); },
+    get messagesReady() { return this.activeSessionPane().messagesReady; },
+    set messagesReady(value) { this._setActiveSessionPaneField("messagesReady", value); },
+    get messagesLoading() { return this.activeSessionPane().messagesLoading; },
+    set messagesLoading(value) { this._setActiveSessionPaneField("messagesLoading", value); },
+    get historyGeneration() { return this.activeSessionPane().historyGeneration; },
+    set historyGeneration(value) { this._setActiveSessionPaneField("historyGeneration", value); },
+    get streaming() { return this.activeSessionPane().streaming; },
+    set streaming(value) { this._setActiveSessionPaneField("streaming", value); },
+    get es() { return this.activeSessionPane().es; },
+    set es(value) { this._setActiveSessionPaneField("es", value); },
+    get streamingModel() { return this.activeSessionPane().streamingModel; },
+    set streamingModel(value) { this._setActiveSessionPaneField("streamingModel", value); },
+    get streamElapsed() { return this.activeSessionPane().streamElapsed; },
+    set streamElapsed(value) { this._setActiveSessionPaneField("streamElapsed", value); },
+    get _streamTimer() { return this.activeSessionPane()._streamTimer; },
+    set _streamTimer(value) { this._setActiveSessionPaneField("_streamTimer", value); },
+    get _streamStartedAt() { return this.activeSessionPane()._streamStartedAt; },
+    set _streamStartedAt(value) { this._setActiveSessionPaneField("_streamStartedAt", value); },
+    get sessionUsage() { return this.activeSessionPane().sessionUsage; },
+    set sessionUsage(value) { this._setActiveSessionPaneField("sessionUsage", value); },
+    get atBottom() { return this.activeSessionPane().atBottom; },
+    set atBottom(value) { this._setActiveSessionPaneField("atBottom", value); },
     model: "claude-sonnet-4-6",
     // The configured "new-session default" model (Settings → 新会话). Kept
     // SEPARATE from `model`, which tracks the CURRENTLY-VIEWED session and is
@@ -823,14 +862,7 @@ function portal() {
     // Active-tab composer mirror. The durable-in-memory owner is
     // tabState[currentId].draft; capture/activate keeps these template-facing
     // fields aligned without persisting drafts across a page reload.
-    input: "", streaming: false, es: null,
-    // 锁定当前在跑的那条请求用的模型——dropdown 切到别的，pending bubble 不能跟着变。
-    streamingModel: "",
-    // Elapsed seconds since send() — pending bubble shows it after 1s so the
-    // user knows the system isn't stuck.
-    streamElapsed: 0,
-    _streamTimer: null,
-    _streamStartedAt: 0,
+    input: "",
     pendingImages: [],    // [{id, mime, preview (data URL), uploading, error, file}]
     pendingDocs: [],      // [{id, name, kind: 'pdf'|'text', uploading, error}]
     // Selected preview/chat text attached to the current draft. Unlike the
@@ -912,15 +944,6 @@ function portal() {
     // as a component property so `this.SLASH_CMDS` references throughout the
     // file keep working without changes.
     SLASH_CMDS: window.MUSELAB_SLASH_CMDS || [],
-    // Per-session context meter snapshot, updated on every SSE `done` event
-    sessionUsage: { input_tokens: 0, output_tokens: 0,
-                     cache_read_tokens: 0, cache_creation_tokens: 0,
-                     context_limit: 0, context_used: 0, context_used_pct: 0,
-                     context_used_source: "none",
-                     context_used_is_estimate: false,
-                     context_limit_source: "",
-                     context_limit_is_estimate: true,
-                     context_is_estimate: true },
     stats: { total_cost_usd: 0, total_messages: 0, total_input_tokens: 0,
               total_output_tokens: 0, total_cache_read_tokens: 0,
               total_cache_creation_tokens: 0, cache_hit_pct: 0,
@@ -949,7 +972,6 @@ function portal() {
     // nothing. Deliberately stays false if the fetch fails: an unreachable
     // backend is not evidence of a missing provider either.
     _modelsLoaded: false,
-    atBottom: true,
     // Timestamp (ms) of the last genuine user scroll gesture on the chat body.
     // onChatScroll uses it to disengage auto-follow ONLY on user-driven
     // scroll-up, never on layout-induced scroll events. See _userScrollIntent.
@@ -3920,10 +3942,6 @@ function portal() {
       // Every fetched normalized envelope remains reachable outside the rendered rows.
       this._scheduleHistoryViewport(st, "around", uuid);
       st._hasMoreHistory = st._earlierMessages.length > 0 || st._loadedOffset > 0;
-      if (sid === this.currentId) {
-        this.messages = st.messages;
-        this.historyGeneration = st.historyGeneration;
-      }
       return st.messages.some(m => m.uuid === uuid);
     },
 
@@ -3937,7 +3955,6 @@ function portal() {
       if (this._isMobileLayout()) this.setMobileTab("chat");
       const activeState = this.tabState && this.tabState[sid];
       if (activeState) activeState.atBottom = false;
-      if (sid === this.currentId) this.atBottom = false;
       const tryScroll = () => {
         if (sid !== this.currentId) return false;
         const body = this.$refs && this.$refs.chatBody;
@@ -3980,7 +3997,6 @@ function portal() {
         });
         st.messages.unshift(...batch);
         this._scheduleHistoryViewport(st, "around", uuid);
-        if (sid === this.currentId) this.messages = st.messages;
         st._hasMoreHistory =
           (st._earlierMessages || []).length > 0 || st._loadedOffset > 0;
         this.$nextTick(() => {
@@ -7587,10 +7603,7 @@ function portal() {
       // Even one envelope may contain a very large tool result or diff, so
       // message count alone is not a safe complexity proxy on this reveal path.
       const deferChat = next === "chat" && this._isMobileLayout() && chatLen > 0;
-      if (deferChat) {
-        chatState.messagesReady = false;
-        this.messagesReady = false;
-      }
+      if (deferChat) chatState.messagesReady = false;
       if (previous === "preview" && next !== "preview") {
         this._capturePreviewViewState(ownerPath);
         this._cancelPreviewViewRestore();
@@ -7608,7 +7621,6 @@ function portal() {
           if (this._mobileTabSeq !== tabSeq || this.mobileTab !== "chat"
               || this.currentId !== target || this.tabState[target] !== chatState) return;
           chatState.messagesReady = true;
-          this.messagesReady = true;
           this._afterPaint(() => {
             if (this._mobileTabSeq === tabSeq && this.mobileTab === "chat"
                 && this.currentId === target) {
@@ -8392,7 +8404,7 @@ function portal() {
             docs: uDocs,
             _turnId: turnId,
           });
-          this.atBottom = true;
+          st.atBottom = true;
           this.scrollToBottom(true);
         }
         if (st && turnId) st.activeTurnId = turnId;
@@ -8441,16 +8453,10 @@ function portal() {
             const elapsed = Math.max(
               0, (Date.now() - (st._streamStartedAt || Date.now())) / 1000);
             st.streamElapsed = elapsed;
-            if (this.currentId === sid) this.streamElapsed = elapsed;
           }, 1000);
         }
         st.streamElapsed = Math.max(
           0, (Date.now() - st._streamStartedAt) / 1000);
-        if (this.currentId === sid) {
-          this._streamStartedAt = st._streamStartedAt;
-          this._streamTimer = st._streamTimer;
-          this.streamElapsed = st.streamElapsed;
-        }
         return;
       }
       // A live continuation still owns the timer. Its terminal handler will
@@ -8461,11 +8467,6 @@ function portal() {
       st._streamTimer = null;
       st._streamStartedAt = 0;
       st.streamElapsed = 0;
-      if (this.currentId === sid) {
-        this._streamTimer = null;
-        this._streamStartedAt = 0;
-        this.streamElapsed = 0;
-      }
     },
     _bgHasRunningCard(sid) {
       const st = this.tabState[sid];
@@ -8820,7 +8821,6 @@ function portal() {
         if (!ur.ok) return;
         const u = await ur.json();
         Object.assign(st.sessionUsage, u);
-        if (sid === this.currentId) this.sessionUsage = st.sessionUsage;
       } catch (e) { /* non-fatal */ } finally {
         st._usageFetching = false;
       }
@@ -8865,10 +8865,9 @@ function portal() {
       return draft;
     },
 
-    // Mirror this tab's state into root fields so the UI sees it. Object refs
-    // (messages, sessionUsage, composer attachments) are shared — mutations
-    // from anywhere reflect. Primitives are copied and explicitly captured
-    // before ownership changes.
+    // Activate only the state that still has an intentional root owner. The
+    // transcript/stream/usage/scroll fields are read through root accessors and
+    // therefore need no copy when currentId changes.
     _activateTabState(id) {
       const st = this._ensureTabState(id);
       const meta = (this.sessions || []).find(s => s.id === id);
@@ -8897,18 +8896,6 @@ function portal() {
       );
       this.serviceTier = st.serviceTier;
       this._activateComposerState(id);
-      this.messages = st.messages;
-      this.sessionUsage = st.sessionUsage;
-      this.streaming = st.streaming;
-      this.es = st.es;
-      this.streamingModel = st.streamingModel;
-      this.streamElapsed = st.streamElapsed;
-      this.messagesReady = st.messagesReady !== false;
-      this.messagesLoading = !!st.messagesLoading;
-      this.historyGeneration = st.historyGeneration || "";
-      this._streamTimer = st._streamTimer;
-      this._streamStartedAt = st._streamStartedAt;
-      this.atBottom = st.atBottom !== false;
       // Tab cache may hold an out-of-date sessionUsage (e.g. backend table
       // updated since we last polled). Fire-and-forget a re-fetch so the
       // meter reflects current truth without blocking the UI swap.
@@ -8932,11 +8919,14 @@ function portal() {
       if (!tid) return null;
       return (this.tabState && this.tabState[tid]) || null;
     },
-    // Alpine-facing façade for single-instance transcript decorations. The
-    // active skeleton, pending/running indicators, queue, and compact state all
-    // resolve through the tab owner instead of root compatibility mirrors.
+    // Alpine-facing façade for single-instance transcript decorations and the
+    // root compatibility accessors. Every read resolves through the tab owner.
     activeSessionPane() {
       return this.paneState(this.currentId) || _EMPTY_ACTIVE_SESSION_PANE;
+    },
+    _setActiveSessionPaneField(field, value) {
+      const st = this.paneState(this.currentId);
+      if (st) st[field] = value;
     },
     paneMessages(tid) {
       // Pure O(1) canonical lookup. Virtualization changes only the render rows;
@@ -9511,10 +9501,6 @@ function portal() {
               st._stallWatch = null;
               st.es = null;
               st.streaming = false;
-              if (sid === this.currentId) {
-                this.es = null;
-                this.streaming = false;
-              }
               this._setBackgroundTaskActive(
                 sid, true, d.started_at, d.background_tasks_pending);
               this._ensureBgContPoller(sid);
@@ -9537,10 +9523,6 @@ function portal() {
             st._stallWatch = null;
             st.es = null;
             st.streaming = false;
-            if (sid === this.currentId) {
-              this.es = null;
-              this.streaming = false;
-            }
             await this.send({
               reconnect: true,
               sessionId: sid,
@@ -9652,13 +9634,6 @@ function portal() {
       st._serverActiveObserved = false;
       st.streamElapsed = 0;
       st._streamStartedAt = 0;
-      if (sid === this.currentId) {
-        this.streaming = false;
-        this.es = null;
-        this._streamTimer = null;
-        this.streamElapsed = 0;
-        this._streamStartedAt = 0;
-      }
     },
 
     // Central brake on transparent reconnects. Incremental resume makes the
@@ -10701,11 +10676,6 @@ function portal() {
         st._effortPatchSeq = (Number(st._effortPatchSeq) || 0) + 1;
         st._serviceTierPatchSeq = (Number(st._serviceTierPatchSeq) || 0) + 1;
         st._thinkingPatchSeq = (Number(st._thinkingPatchSeq) || 0) + 1;
-        if (this.currentId === id && this.es === ownedEs) {
-          this.es = null;
-          this.streaming = false;
-          this._streamTimer = null;
-        }
       }
       this._stopBgContPoller(id);
       if (this._sessionLoadPromises) delete this._sessionLoadPromises[id];
@@ -13866,15 +13836,13 @@ function portal() {
         const target = this.currentId;
         const stCur = this.tabState && this.tabState[this.currentId];
         const shouldFollow = !stCur || stCur.atBottom !== false;
-        this.atBottom = shouldFollow;
+        stCur.atBottom = shouldFollow;
         // Hide bubbles for one frame so the tab-bar flip + skeleton paints
         // immediately; reveal next frame after the single pane remounts.
         stCur.messagesReady = false;
-        this.messagesReady = false;
         this._afterPaint(() => {
           if (this.currentId !== target) return;
           stCur.messagesReady = true;
-          this.messagesReady = true;
           this._afterPaint(() => {
             if (this.currentId !== target) return;
             this._restoreChatPosition(target);
@@ -14128,11 +14096,7 @@ function portal() {
       if (!quiet) {
         st.messagesLoading = true;
         st.messagesReady = false;
-        if (isCurrent) {
-          this.messagesLoading = true;
-          this.messagesReady = false;
-          this._openSeenUpdated = undefined;
-        }
+        if (isCurrent) this._openSeenUpdated = undefined;
       }
       // Set true once we've scheduled the reveal (highlight→show). Guards the
       // finally so error / empty-result paths don't leave the skeleton stuck.
@@ -14367,7 +14331,6 @@ function portal() {
           // One-shot splice swap after `_preserveCanonicalMessageIdentity`:
           // matching live/canonical bubbles retain both their object identity
           // and `_k`, so only genuinely new/removed transcript rows touch DOM.
-          this.messages = st.messages;
           st.messages.splice(0, st.messages.length, ...visible);
         } else {
           st.messages.length = 0;
@@ -14386,7 +14349,6 @@ function portal() {
         st.runtimeUiRevision = loadedRuntimeUiRevision;
         st._historyOrder = (s.history_order === "full" || full) ? "full" : "normal";
         st._hasServerLater = !!s.has_later;
-        if (sid === this.currentId) this.historyGeneration = st.historyGeneration;
         // Backend windowing cursor. The server told us the index of the
         // first bubble it returned (`s.offset`); everything before that
         // still lives on disk and pages in via _fetchOlderWindow. full /
@@ -14457,7 +14419,6 @@ function portal() {
         st.effort = resolvedEffort;
         st.serviceTier = resolvedServiceTier;
         if (sid === this.currentId) {
-          this.messages = st.messages;
           // Background-completion: if there's an in-flight turn on this
           // session that finished while we were elsewhere, the JSONL we
           // just loaded already has its complete output — nothing to do.
@@ -14479,12 +14440,12 @@ function portal() {
             // re-highlight the freshly-added tail and re-pin to the bottom IF the
             // user was following it — _reconcileOpenSession only quiet-reloads
             // when atBottom, so this won't yank anyone reading history.
-            const _wasAtBottom = this.atBottom;
+            const _wasAtBottom = st.atBottom;
             this.$nextTick(async () => {
               try { await this.highlightCode(".chat-body"); st._highlighted = true; }
               catch (_e) { /* highlight best-effort */ }
               if (sid === this.currentId && _wasAtBottom) {
-                this.atBottom = true; this.scrollToBottom(true);
+                st.atBottom = true; this.scrollToBottom(true);
               } else if (sid === this.currentId && quietScrollEl) {
                 const restored = this._restoreMessageAnchor(
                   quietScrollEl, quietAnchor);
@@ -14496,7 +14457,7 @@ function portal() {
             await this._fetchTabUsage(sid);
             return true;
           }
-          this.atBottom = true;
+          st.atBottom = true;
           // Hold the skeleton until highlight + artifacts finish, then reveal
           // the whole conversation at once. Without this, a big session paints
           // un-highlighted text first, then janks code-block-by-code-block as
@@ -14515,9 +14476,8 @@ function portal() {
             catch (_e) { /* highlight best-effort — reveal regardless */ }
             if (sid === this.currentId) {
               st.messagesReady = true;
-              this.messagesReady = true;
               this.$nextTick(() => {
-                this.atBottom = true; this.scrollToBottom(true);
+                st.atBottom = true; this.scrollToBottom(true);
                 // E5: the on-screen tail is now painted + pinned to the bottom.
                 // Fill the deferred head above the fold (idle-chunked + scroll-
                 // anchored) so the rewound bubbles are ready before the user
@@ -14542,10 +14502,6 @@ function portal() {
           st.messagesLoading = false;
           if (!scheduledReveal || sid !== this.currentId) st.messagesReady = true;
           if (sid === this.currentId) {
-            this.messagesLoading = false;
-            // No reveal scheduled (error / early return) → don't trap the
-            // skeleton: show whatever we have.
-            if (!scheduledReveal) this.messagesReady = true;
             // The active tab is now warm — opportunistically warm one desktop
             // envelope without mounting another pane.
             this._scheduleIdlePreload();
@@ -14617,8 +14573,8 @@ function portal() {
     // (directive-heavy) bubble templates incrementally. A single bulk push of
     // ~30 rich bubbles blocks the main thread for seconds on a long session /
     // throttled device — the dominant remaining cold-open freeze after the hljs
-    // fix. st.messages is the SAME array Alpine watches (bound via
-    // this.messages = st.messages just before this call), so each push reacts.
+    // fix. Alpine reads st.messages through the active-session accessor, so each
+    // in-place push reacts without copying the array into root state.
     async _revealMessagesChunked(sid, st, visible) {
       const CH = this._isMobileLayout() ? 4 : 15;
       let i = 0;
@@ -15204,7 +15160,6 @@ function portal() {
         if (Number.isInteger(data.pre_total)) st._preTotal = data.pre_total;
         st.historyGeneration = data.history_generation || st.historyGeneration || "";
         st._historyOrder = data.history_order === "full" ? "full" : "normal";
-        if (sid === this.currentId) this.historyGeneration = st.historyGeneration;
         this._syncNormalizedHistory(st);
         st._hasServerLater = (st._loadedOffset + this._allPaneMessages(st).length)
           < st._total;
@@ -15254,7 +15209,6 @@ function portal() {
         if (Number.isInteger(data.pre_total)) st._preTotal = data.pre_total;
         st.historyGeneration = data.history_generation || st.historyGeneration || "";
         st._historyOrder = data.history_order === "full" ? "full" : "normal";
-        if (sid === this.currentId) this.historyGeneration = st.historyGeneration;
         this._syncNormalizedHistory(st);
         st._hasServerLater = (st._loadedOffset + this._allPaneMessages(st).length)
           < st._total;
@@ -15403,7 +15357,6 @@ function portal() {
       this._shiftMessageVirtualWindow(st, batch.length);
       st.messages.unshift(...batch);
       this._scheduleHistoryViewport(st, "older");
-      if (isCurrent) this.messages = st.messages;
       st._hasMoreHistory = st._earlierMessages.length > 0 || st._loadedOffset > 0;
       // Restore scroll position so the message the user was looking at
       // stays in place. Without this the viewport snaps to the new top.
@@ -15441,7 +15394,6 @@ function portal() {
       st.messages.push(...batch);
       this._scheduleHistoryViewport(st, "newer");
       if (sid === this.currentId) {
-        this.messages = st.messages;
         this.$nextTick(() => {
           this._restoreMessageAnchor(scrollEl, anchor);
           this._scheduleMessageViewportSync(sid);
@@ -15460,7 +15412,6 @@ function portal() {
         if (!loaded || this.tabState[sid] !== st) return false;
         st.atBottom = true;
         if (sid === this.currentId) {
-          this.atBottom = true;
           this.$nextTick(() => this.scrollToBottom(true));
         }
         return true;
@@ -15473,8 +15424,6 @@ function portal() {
       this._syncNormalizedHistory(st);
       st.atBottom = true;
       if (sid === this.currentId) {
-        this.messages = st.messages;
-        this.atBottom = true;
         this.$nextTick(() => this.scrollToBottom(true));
       }
       return true;
@@ -26325,7 +26274,6 @@ function portal() {
       const el = this.$refs.chatBody;
       if (!st || !el || sid !== this.currentId) return;
       const shouldFollow = st.atBottom !== false;
-      this.atBottom = shouldFollow;
       if (shouldFollow) {
         this._settleScrollToBottom();
       } else {
@@ -26353,7 +26301,6 @@ function portal() {
       if (nearBottom) {
         // Reaching the bottom always (re-)engages auto-follow, regardless of
         // what moved us there — that's the unambiguous "I want to follow" state.
-        this.atBottom = true;
         if (st) {
           st.atBottom = true;
           st.scrollTop = el.scrollTop;
@@ -26375,10 +26322,7 @@ function portal() {
       // so the next streaming tick re-pins to the bottom.
       const userDriven = (Date.now() - ((st && st._userScrollAt)
         || this._userScrollAt || 0)) < 400;
-      if (userDriven) {
-        this.atBottom = false;
-        if (st) st.atBottom = false;
-      }
+      if (userDriven && st) st.atBottom = false;
       if (st) st.scrollTop = el.scrollTop;
     },
     // Stamp the last genuine user scroll gesture. Bound to wheel / touchmove /
@@ -26419,7 +26363,6 @@ function portal() {
         // keeps growing. Re-slam to the bottom each frame until scrollHeight
         // stops growing. See _settleScrollToBottom.
         this._settleScrollToBottom();
-        this.atBottom = true;
         const st = this.currentId && this.tabState && this.tabState[this.currentId];
         if (st) st.atBottom = true;
         return;
@@ -26428,7 +26371,6 @@ function portal() {
       // so the cheap single-shot is accurate and avoids per-chunk rAF.
       this.$nextTick(() => {
         el.scrollTop = el.scrollHeight;
-        this.atBottom = true;
         const st = this.currentId && this.tabState && this.tabState[this.currentId];
         if (st) {
           st.atBottom = true;
@@ -26927,7 +26869,7 @@ function portal() {
           this._scheduleBackgroundHandoff(sendSid, sendState);
         }
         if (this.currentId === sendSid) {
-          this.atBottom = true;
+          sendState.atBottom = true;
           this.scrollToBottom(true);
         }
         return true;
@@ -27042,33 +26984,16 @@ function portal() {
       }
       streamState.streaming = true;
       streamState._continuationAwaitingReaction = false;
-      if (streamSid === this.currentId) this.streaming = true;
       // A live turn renders DIRECTLY into the visible pane, so it must never be
       // hidden by the bulk-reveal gate. `messagesReady=false` drives
       // `.chat-body.msgs-hidden .msg { display:none }` + the loading skeleton —
       // a mechanism that exists ONLY for loadSession's chunked reveal of
-      // historical bubbles. But messagesReady is GLOBAL root state and only
-      // flips back to true inside switchSession / loadSession reveal callbacks
-      // that are guarded `if (this.currentId !== target) return`. If that reveal
-      // is skipped — rapid tab switch, or hitting "+" (newSession) right after a
-      // session started loading — messagesReady is left STUCK at false. On the
-      // next send, the moment messages.length goes >0 the msgs-hidden class
-      // engages and the ENTIRE reply (and the user's own bubble) renders
-      // display:none. The data still streams + persists to JSONL, so a full PWA
-      // restart re-runs loadSession's reveal and the reply "appears" — exactly
-      // the "new session, first reply invisible until restart" report. Force the
-      // reveal whenever we stream into the ACTIVE tab; there is nothing to
-      // lazy-reveal once the user is actively sending into the pane they see.
+      // historical bubbles. A skipped reveal callback must not leave this tab's
+      // gate closed when a live turn starts; force the owning tabState visible.
       streamState.messagesReady = true;
       streamState.messagesLoading = false;
-      if (streamSid === this.currentId) {
-        this.messagesReady = true;
-        this.messagesLoading = false;
-      }
+      // 锁定 — pending bubble 用它，不跟着 dropdown。
       streamState.streamingModel = sendModel;
-      // 锁定 — pending bubble 用它，不跟着 dropdown。只在 streamSid 仍是当前
-      // tab 时写 root 状态，否则只污染后台 tab 的显示。
-      if (streamSid === this.currentId) this.streamingModel = sendModel;
       // Start the wall-clock NOW, at submit-time — not later in es.onopen.
       // The previous setup waited for the SSE handshake (which can take
       // 1-3s on slow networks / cold backends) before the counter began
@@ -27103,21 +27028,17 @@ function portal() {
         _streamStartMs = Date.now();
       }
       streamState._streamStartedAt = _streamStartMs;
-      if (streamSid === this.currentId) this._streamStartedAt = _streamStartMs;
       const _initElapsed = Math.max(0, (Date.now() - _streamStartMs) / 1000);
       streamState.streamElapsed = _initElapsed;
-      if (streamSid === this.currentId) this.streamElapsed = _initElapsed;
       // Tick immediately so the footer shows 0.0s right after submit
       // (without waiting for the first 200ms interval tick).
       if (streamState._streamTimer) clearInterval(streamState._streamTimer);
       streamState._streamTimer = setInterval(() => {
         const elapsed = (Date.now() - streamState._streamStartedAt) / 1000;
         streamState.streamElapsed = elapsed;
-        if (this.currentId === streamSid) this.streamElapsed = elapsed;
       }, 1000);
-      if (streamSid === this.currentId) this._streamTimer = streamState._streamTimer;
       if (streamSid === this.currentId) {
-        this.atBottom = true;
+        streamState.atBottom = true;
         this.scrollToBottom(true);
       }
 
@@ -27212,14 +27133,6 @@ function portal() {
         streamState.parentTurnId = "";
         streamState.lastEventSeq = 0;
         streamState.streamingModel = "";
-        if (streamSid === this.currentId) {
-          this.streaming = false;
-          this.es = null;
-          this._streamTimer = null;
-          this._streamStartedAt = 0;
-          this.streamElapsed = 0;
-          this.streamingModel = "";
-        }
       };
       try {
         let tr = await _mintTicket();
@@ -27272,7 +27185,6 @@ function portal() {
       }
       const es = new EventSource(url);
       streamState.es = es;
-      if (streamSid === this.currentId) this.es = es;
       // NOTE — a successful open deliberately does NOT reset
       // _reconnectAttempts. Every reconnect DOES open successfully (the
       // backend replays the turn happily), so resetting here made the
@@ -27329,7 +27241,6 @@ function portal() {
               streamState._canonicalResyncReason = "turn_changed";
               try { es.close(); } catch (_) {}
               if (streamState.es === es) streamState.es = null;
-              if (this.currentId === streamSid && this.es === es) this.es = null;
               this._scheduleCanonicalStreamReload(streamSid, streamState);
               return;
             }
@@ -27560,11 +27471,6 @@ function portal() {
           }
           streamState._streamStartedAt = 0;
           streamState.streamElapsed = 0;
-          if (this.currentId === streamSid) {
-            this._streamTimer = null;
-            this._streamStartedAt = 0;
-            this.streamElapsed = 0;
-          }
           return;
         }
         if (!streamState.streaming || streamState._streamTimer) return;
@@ -27573,12 +27479,7 @@ function portal() {
           const elapsed = Math.max(
             0, (Date.now() - streamState._streamStartedAt) / 1000);
           streamState.streamElapsed = elapsed;
-          if (this.currentId === streamSid) this.streamElapsed = elapsed;
         }, 1000);
-        if (this.currentId === streamSid) {
-          this._streamStartedAt = streamState._streamStartedAt;
-          this._streamTimer = streamState._streamTimer;
-        }
       };
 
       // Exposed on streamState so the global selectionchange guard can publish
@@ -28007,10 +27908,6 @@ function portal() {
         }
         if (keepBackgroundElapsed) return;
         streamState.streamElapsed = 0;
-        if (this.currentId === streamSid) {
-          this._streamTimer = null;
-          this.streamElapsed = 0;
-        }
       };
       // Mark the stream done for the ORIGIN tab. If the user is on a
       // different tab, we still update tabState[streamSid] silently — they'll
@@ -28185,8 +28082,6 @@ function portal() {
           tailCandidate.forkUuid = assistantUuid;
         }
         if (this.currentId === streamSid) {
-          this.streaming = false;
-          this.es = null;
           // textarea was :disabled while streaming → focus during stream was
           // a no-op. Re-focus now so the user can immediately type the next
           // message (supports rapid-fire conversation).
@@ -28241,7 +28136,6 @@ function portal() {
         if (d.stats) this.stats = { ...this.stats, ...d.stats };
         if (d.session_usage) {
           Object.assign(streamState.sessionUsage, d.session_usage);
-          if (this.currentId === streamSid) this.sessionUsage = streamState.sessionUsage;
         }
         this._budgetWarned = this._budgetWarned || {};
         if (d.budget_usd > 0 && d.budget_used_pct >= 90 && !this._budgetWarned[streamSid]) {
@@ -28432,7 +28326,6 @@ function portal() {
         if (streamState._stallWatch) clearInterval(streamState._stallWatch);
         streamState._stallWatch = null;
         streamState.es = null;
-        if (this.currentId === streamSid) this.es = null;
         if (streamMobile && reason === "replay_truncated") {
           this.toast(this.lang === "zh"
             ? "回复数据量较大，完成后会自动从会话记录同步"
@@ -28701,7 +28594,6 @@ function portal() {
         // send({ reconnect:true }) refuses while an ES handle is present, even
         // when that EventSource is already CLOSED.
         if (streamState.es === es) streamState.es = null;
-        if (this.currentId === streamSid && this.es === es) this.es = null;
 
         if (attempts > MAX_ATTEMPTS) {
           // Given up. Surface manual retry UI.
@@ -28740,8 +28632,8 @@ function portal() {
           // to a different session). Keep tabState[streamSid].streaming
           // true; when the user switches back, loadSession's
           // _checkActiveTurn(streamSid) re-attaches (or loads the finished
-          // reply from disk). Only the timer is stopped — it writes
-          // root-level streamElapsed which is now another tab's display.
+          // reply from disk). Only this owner tab's timer is stopped while the
+          // inactive pane waits for a later explicit re-attach.
           if (this.currentId !== streamSid) {
             _stopTimer();
             return;
@@ -28779,7 +28671,6 @@ function portal() {
             // streaming flag must be cleared first or send() bails as
             // "already streaming."
             streamState.streaming = false;
-            if (this.currentId === streamSid) this.streaming = false;
             // Anchor the elapsed timer to the backend turn's real start so
             // the footer resumes from the true start, not from reconnect.
             this.send({ reconnect: true, sessionId: streamSid,
@@ -28805,7 +28696,6 @@ function portal() {
               setTimeout(() => {
                 if (this.currentId !== streamSid) return;
                 streamState.streaming = false;
-                if (this.currentId === streamSid) this.streaming = false;
                 this.send({ reconnect: true, sessionId: streamSid,
                             turnId: streamState.activeTurnId || "" });
               }, 800 * Math.pow(2, attempts));
@@ -28901,14 +28791,6 @@ function portal() {
         st.streaming = false;
         st._stopping = false;
         st.streamingModel = "";
-        if (sid === this.currentId) {
-          this.streaming = false;
-          this.es = null;
-          this._streamTimer = null;
-          this._streamStartedAt = 0;
-          this.streamElapsed = 0;
-          this.streamingModel = "";
-        }
         this.toast(this.lang === "zh" ? "已中断" : "Interrupted", "warn", 1500);
         return;
       }
