@@ -530,6 +530,10 @@ class GenerationProvider:
     def _route(self) -> tuple[str, str, str] | None:
         from . import endpoints
         model = self.config.generation_model
+        if endpoints.is_ducc_model(model):
+            # DUCC is a CLI runtime with its own auth/endpoint selection, not an
+            # Anthropic-compatible HTTP endpoint. Route through the SDK path.
+            return None
         provider = endpoints.lookup(model)
         if provider is not None:
             key = os.environ.get(provider.env_key, "")
@@ -553,9 +557,12 @@ class GenerationProvider:
 
     def metadata(self) -> tuple[str, str]:
         from . import endpoints
-        provider = endpoints.lookup(self.config.generation_model)
+        model = self.config.generation_model
+        if endpoints.is_ducc_model(model):
+            return ("ducc", model)
+        provider = endpoints.lookup(model)
         return ((provider.display if provider is not None else "anthropic"),
-                self.config.generation_model)
+                model)
 
     async def complete(self, system: str, prompt: str, *,
                        max_tokens: int = 3000) -> str:
@@ -648,10 +655,32 @@ class GenerationProvider:
         from claude_agent_sdk import ClaudeAgentOptions, query
         from claude_agent_sdk.types import AssistantMessage, ResultMessage, TextBlock
 
+        from . import endpoints
+        model = self.config.generation_model
+        options_kwargs: dict[str, Any] = {}
+        if endpoints.is_ducc_model(model):
+            # Reuse the same DUCC CLI routing as chat so memory generation can
+            # call ducc:-prefixed models (e.g. ducc:deepseek-v4-pro) without an
+            # HTTP API key. The wrapper execs the real DUCC launcher, which owns
+            # authentication, endpoint selection and the comate custom header.
+            from .chat import _ducc_subprocess_env
+            from .settings import locate_ducc_executable, ducc_cli_wrapper
+
+            ducc_executable = locate_ducc_executable()
+            wrapper = ducc_cli_wrapper()
+            if (ducc_executable is None or not os.path.isfile(wrapper)
+                    or not os.access(wrapper, os.X_OK)):
+                raise GenerationError(
+                    retryable=False, provider="ducc", model=model,
+                    category="invalid_configuration")
+            options_kwargs["cli_path"] = wrapper
+            options_kwargs["env"] = _ducc_subprocess_env(ducc_executable)
+            model = endpoints.ducc_cli_model(model)
+
         workdir = memory_dir() / "generator"
         workdir.mkdir(parents=True, exist_ok=True)
         options = ClaudeAgentOptions(
-            model=self.config.generation_model,
+            model=model,
             system_prompt=system,
             tools=[],
             allowed_tools=[],
@@ -664,6 +693,7 @@ class GenerationProvider:
             permission_mode="default",
             cwd=workdir,
             include_partial_messages=False,
+            **options_kwargs,
         )
         parts: list[str] = []
         async for message in query(prompt=prompt, options=options):

@@ -15875,6 +15875,13 @@ function portal() {
       }
     },
 
+    _memoryErrorDetail(d, status) {
+      const detail = d && d.detail;
+      if (detail == null) return `HTTP ${status}`;
+      if (typeof detail === "string") return detail;
+      return detail.message || detail.category || JSON.stringify(detail);
+    },
+
     async probeMemory() {
       const mem = this.settings.memory;
       mem.probing = true; mem.probeResult = null;
@@ -15885,7 +15892,7 @@ function portal() {
           body: JSON.stringify(this._memoryConfigPayload()),
         });
         const d = await r.json().catch(() => ({}));
-        if (!r.ok) throw new Error(d.detail || `HTTP ${r.status}`);
+        if (!r.ok) throw new Error(this._memoryErrorDetail(d, r.status));
         mem.probeResult = d;
         this.toast(this.lang === "zh" ? "记忆环境检查通过" : "Memory environment is healthy",
           "success");
@@ -15908,7 +15915,7 @@ function portal() {
           body: JSON.stringify(this._memoryConfigPayload()),
         });
         const d = await r.json().catch(() => ({}));
-        if (!r.ok) throw new Error(d.detail || `HTTP ${r.status}`);
+        if (!r.ok) throw new Error(this._memoryErrorDetail(d, r.status));
         mem.config = d.config; mem.status = d.status;
         this._memoryMonitorEnabled = d.config.mode !== "off";
         this._startMemoryMonitor();
