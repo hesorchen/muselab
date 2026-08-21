@@ -1900,18 +1900,11 @@
                to hide the avatar on all but the FIRST assistant-side
                msg in a run — visually the same "one avatar per turn"
                result without a derived data structure. -->
-          <!-- P1 (chat-perf-redesign): per-tab DOM persistence. One message
-               list is rendered per OPEN tab; switching toggles x-show instead
-               of swapping the array backing a single x-for (which forced a
-               full Alpine teardown+rebuild of the whole subtree on every
-               switch). The single message template below is UNCHANGED — it's
-               just wrapped in a per-tab pane and bound to paneMessages(tid).
-               For the visible pane paneMessages(currentId) === this.messages
-               by identity, so every `messages`-reading binding inside stays
-               correct; hidden panes are display:none so their (stale)
-               result is never seen. -->
-          <template x-for="tid in residentPaneIds()" :key="tid">
-          <div class="msg-pane" x-show="tid === currentId"
+          <!-- Only the active pane is mounted. Stable normalized messages,
+               cached rich HTML and viewport rows reconstruct it without keeping
+               hidden rich DOM resident for background tabs. -->
+          <template x-for="tid in (currentId ? [currentId] : [])" :key="tid">
+          <div class="msg-pane"
                :data-tid="tid"
                x-data="{ get pane(){ return paneState(tid) }, get paneMsgs(){ return paneMessages(tid) }, get paneRows(){ return paneMessageRows(tid) } }">
           <template x-for="row in paneRows" :key="row.key">

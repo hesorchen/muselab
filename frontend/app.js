@@ -28,7 +28,6 @@
   const DEDUP_WINDOW_MS = 10_000;
   const ring = window.__museErrors__ = [];
   const seen = new Map(); // sig -> last-ts
-  const telemetry = window.__museTelemetry__ = [];
 
   // Last fetch URL/method, captured by the wrapper below. Safari's
   // "TypeError: Load failed" has no info about which request died;
@@ -41,19 +40,6 @@
 
   function _clientErrorWireRecord(rec) {
     const kind = String((rec && rec.kind) || "");
-    if (kind === "message_render_key" || kind === "frontend_diagnostic") {
-      const allowedIssues = new Set(["duplicate", "missing"]);
-      const issues = [];
-      for (const item of ((rec && rec.issues) || []).slice(0, 32)) {
-        const issue = String((item && item.issue) || "");
-        const count = Number(item && item.count);
-        if (allowedIssues.has(issue) && Number.isInteger(count) && count > 0) {
-          issues.push({ issue, count: Math.min(count, 100_000) });
-        }
-      }
-      return issues.length ? { kind, issues } : null;
-    }
-
     if (!["error", "unhandledrejection", "resource"].includes(kind)) return null;
     const record = {
       kind,
@@ -113,34 +99,6 @@
     rec.lastFetch = window.__museLastFetch__;
     void _deliverClientErrorRecord(rec, ring, "[muse-capture]");
   }
-
-  // Recoverable render-boundary diagnostics use a separate, content-free
-  // channel: they must be observable without being promoted to uncaught errors.
-  // A malformed pane is reported as one deterministic issue batch rather than
-  // one request per message, preserving the endpoint's client-error quota.
-  window.__museReportTelemetry__ = (record) => {
-    const allowedIssues = new Set(["duplicate", "missing"]);
-    const counts = new Map();
-    for (const item of ((record && record.issues) || [])) {
-      const issue = String((item && item.issue) || "");
-      const count = Number(item && item.count);
-      if (allowedIssues.has(issue) && Number.isInteger(count) && count > 0) {
-        counts.set(issue, (counts.get(issue) || 0) + count);
-      }
-    }
-    const rec = {
-      kind: record && record.kind === "message_render_key"
-        ? "message_render_key" : "frontend_diagnostic",
-      pane: String((record && record.pane) || "").slice(0, 128),
-      session: String((record && record.session) || "").slice(0, 128),
-      issues: Array.from(counts, ([issue, count]) => ({
-        issue, count: Math.min(count, 10_000),
-      }))
-        .sort((a, b) => a.issue < b.issue ? -1 : (a.issue > b.issue ? 1 : 0)),
-    };
-    if (!rec.issues.length) return;
-    void _deliverClientErrorRecord(rec, telemetry, "[muse-telemetry]", "warn");
-  };
 
   window.addEventListener("unhandledrejection", (ev) => {
     const r = ev.reason;
@@ -589,7 +547,7 @@ function portal() {
     // takes to fetch.
     messagesLoading: false,
     // Compatibility mirrors for the active tab only. The authoritative values
-    // live in tabState[currentId]; resident panes must read their own pane state.
+    // live in tabState[currentId]; the mounted pane reads that session state.
     historyGeneration: "",
     // Gates revealing a freshly-loaded session: stays false from load-start
     // until syntax-highlight + artifacts finish, so the whole conversation
@@ -793,23 +751,6 @@ function portal() {
     _mobileKeyboardPollTimer: null,
     _mobileViewportSettleTimers: [],
     _mobileRootResetTimers: [],
-    // [resident-panes] Which tabs keep their message-pane DOM mounted. The chat
-    // panes (index.html) render one .msg-pane per id HERE — not per openTabIds —
-    // so far-back tabs are unmounted, bounding how much retained DOM the browser
-    // reflows on every switch (the mobile switch-lag root cause: cost scaled with
-    // total nodes across ALL open tabs, not the target session). LRU: current +
-    // the most-recent few. Switching to an evicted-but-loaded tab rebuilds its
-    // bubbles from tabState[id].messages (data always survives; only the DOM is
-    // dropped). _MAX_RESIDENT_PANES caps the set.
-    _residentTabIds: [],
-    // Recency is tracked separately from the DOM-facing resident id list.
-    // Reordering an Alpine keyed x-for physically moves entire message panes;
-    // keeping membership stable makes desktop warm switches a pure x-show.
-    _residentTabLru: [],
-    // Mobile retains only the visible pane. Desktop keeps a wider working set so
-    // normal tab switching is a pure x-show flip instead of a bubble rebuild.
-    // Streaming in a hidden tab keeps its data/SSE even after its DOM is evicted.
-    _MAX_RESIDENT_PANES: 4,
     renamingTabId: "",   // session id whose name is currently being inline-edited
     renameDraft: "",     // current value of the inline rename <input>
     tabCtxMenu: null,    // {id, x, y} for the right-click tab menu, or null
@@ -3948,8 +3889,6 @@ function portal() {
       const data = await r.json();
       if (this.tabState[sid] !== st) return false;
       const win = this._historyEnvelopes(sid, data.messages || []);
-      this._markPaneRenderKeysDirty(st);
-      this._rebuildPaneMessageRenderKeys(sid, win);
       for (const m of win) {
         if (m.role === "assistant" && m.text && !m.html) m.html = this._renderHistoryMessage(m);
       }
@@ -3967,7 +3906,6 @@ function portal() {
       // or older backend returns more than the cache cap, _capHistoryCache
       // advances _loadedOffset for every discarded head bubble.
       this._capMountedWindow(st, "around", uuid);
-      this._recordPaneRenderKeyShape(st);
       st._hasMoreHistory = st._earlierMessages.length > 0 || st._loadedOffset > 0;
       if (sid === this.currentId) {
         this.messages = st.messages;
@@ -7176,20 +7114,6 @@ function portal() {
         // Monotonic per-tab sequence for optimistic/live messages. Historical
         // envelopes use transcript identity; live keys never depend on array index.
         _nextLiveKey: 1,
-        // Defensive render-key repair is pane-local and identity-based. These
-        // objects are diagnostics metadata, not reactive UI state.
-        _renderKeyByObject: new WeakMap(),
-        _renderKeyOwners: new Map(),
-        _renderKeyGeneration: 0,
-        _renderKeyNormalizedGeneration: -1,
-        _renderKeyShape: null,
-        _nextRenderRepairKey: 1,
-        _renderKeyTelemetry: {
-          lastReportedAt: -Infinity,
-          pendingDuplicate: 0,
-          pendingMissing: 0,
-          flushTimer: null,
-        },
         // Viewport-only render window. Canonical envelopes remain in the history
         // arrays; these indexes decide only which keyed bubbles are mounted.
         _virtualStart: -1,
@@ -7417,29 +7341,6 @@ function portal() {
       if (st._hasServerLater === undefined) st._hasServerLater = false;
       if (st._fetchingLater === undefined) st._fetchingLater = false;
       if (!Number.isInteger(st._nextLiveKey)) st._nextLiveKey = 1;
-      if (!(st._renderKeyByObject instanceof WeakMap)) {
-        st._renderKeyByObject = new WeakMap();
-      }
-      if (!(st._renderKeyOwners instanceof Map)) st._renderKeyOwners = new Map();
-      if (!Number.isInteger(st._renderKeyGeneration)) st._renderKeyGeneration = 0;
-      if (!Number.isInteger(st._renderKeyNormalizedGeneration)) {
-        st._renderKeyNormalizedGeneration = -1;
-      }
-      if (!st._renderKeyShape || typeof st._renderKeyShape !== "object") {
-        st._renderKeyShape = null;
-      }
-      if (!Number.isInteger(st._nextRenderRepairKey)) st._nextRenderRepairKey = 1;
-      if (!st._renderKeyTelemetry || typeof st._renderKeyTelemetry !== "object") {
-        st._renderKeyTelemetry = {
-          lastReportedAt: -Infinity,
-          pendingDuplicate: 0,
-          pendingMissing: 0,
-          flushTimer: null,
-        };
-      }
-      if (st._renderKeyTelemetry.flushTimer === undefined) {
-        st._renderKeyTelemetry.flushTimer = null;
-      }
       if (!Number.isInteger(st._virtualStart)) st._virtualStart = -1;
       if (!Number.isInteger(st._virtualEnd)) st._virtualEnd = -1;
       if (!st._virtualHeights || typeof st._virtualHeights !== "object") {
@@ -8088,11 +7989,6 @@ function portal() {
           id => id !== sourceSid && id !== childSid);
         if (tabIndex >= 0) this.openTabIds.splice(
           Math.min(tabIndex, this.openTabIds.length), 0, childSid);
-        const replaceId = id => id === sourceSid ? childSid : id;
-        this._residentTabIds = Array.from(new Set(
-          (this._residentTabIds || []).map(replaceId)));
-        this._residentTabLru = Array.from(new Set(
-          (this._residentTabLru || []).map(replaceId)));
         this._stopBgContPoller(sourceSid);
         if (sourceState._streamTimer) clearInterval(sourceState._streamTimer);
         sourceState._streamTimer = null;
@@ -8963,7 +8859,6 @@ function portal() {
     // before ownership changes.
     _activateTabState(id) {
       const st = this._ensureTabState(id);
-      this._ensurePaneMessageRenderKeys(id);
       const meta = (this.sessions || []).find(s => s.id === id);
       const selectedModel = st._modelExpected
         ? st._modelExpected.value : (meta && meta.model);
@@ -9008,19 +8903,9 @@ function portal() {
       this._fetchTabUsage(id);
     },
 
-    // P1 (chat-perf-redesign): per-tab DOM persistence. The chat message
-    // list is rendered once PER OPEN TAB (outer x-for over openTabIds), each
-    // pane bound to ITS OWN message array via this method. Switching tabs
-    // then only toggles x-show on the panes instead of swapping the array
-    // backing a single x-for — which used to force Alpine to teardown +
-    // rebuild the entire message subtree (measured: ~88% of switch time was
-    // that JS rebuild, scaling O(messages) and making long/agentic sessions
-    // the worst case). The active tab's
-    // array is still mirrored to this.messages by _activateTabState, so
-    // every existing `messages`-reading binding stays correct for the
-    // VISIBLE pane (paneMessages(currentId) === this.messages by identity).
-    // Hidden panes' bindings still evaluate against this.messages but are
-    // display:none, so the (possibly stale) result is never seen.
+    // The DOM is only a projection of the active tab. Normalized envelopes,
+    // stable rich-render cache entries and per-tab viewport state survive tab
+    // switches; no hidden message subtree is retained as a second cache.
     _paneElement(tid) {
       const body = this.$refs && this.$refs.chatBody;
       if (!body || !tid) return null;
@@ -9034,192 +8919,6 @@ function portal() {
     paneState(tid) {
       if (!tid) return null;
       return (this.tabState && this.tabState[tid]) || null;
-    },
-    _paneRenderKeyShape(st) {
-      return {
-        messages: st.messages, messagesLength: (st.messages || []).length,
-        messagesFirst: st.messages && st.messages[0],
-        messagesLast: st.messages && st.messages[st.messages.length - 1],
-        earlier: st._earlierMessages,
-        earlierLength: (st._earlierMessages || []).length,
-        earlierFirst: st._earlierMessages && st._earlierMessages[0],
-        earlierLast: st._earlierMessages
-          && st._earlierMessages[st._earlierMessages.length - 1],
-        later: st._laterMessages,
-        laterLength: (st._laterMessages || []).length,
-        laterFirst: st._laterMessages && st._laterMessages[0],
-        laterLast: st._laterMessages && st._laterMessages[st._laterMessages.length - 1],
-      };
-    },
-    _recordPaneRenderKeyShape(st) {
-      st._renderKeyShape = this._paneRenderKeyShape(st);
-      st._renderKeyNormalizedGeneration = st._renderKeyGeneration;
-    },
-    _paneRenderKeyShapeChanged(st) {
-      const before = st._renderKeyShape;
-      if (!before) return true;
-      const after = this._paneRenderKeyShape(st);
-      return before.messages !== after.messages
-        || before.messagesLength !== after.messagesLength
-        || before.messagesFirst !== after.messagesFirst
-        || before.messagesLast !== after.messagesLast
-        || before.earlier !== after.earlier
-        || before.earlierLength !== after.earlierLength
-        || before.earlierFirst !== after.earlierFirst
-        || before.earlierLast !== after.earlierLast
-        || before.later !== after.later
-        || before.laterLength !== after.laterLength
-        || before.laterFirst !== after.laterFirst
-        || before.laterLast !== after.laterLast;
-    },
-    _markPaneRenderKeysDirty(st) {
-      if (st) st._renderKeyGeneration++;
-    },
-    _flushPaneRenderKeyTelemetry(tid, st) {
-      if (!st || typeof window === "undefined" || !window.__museReportTelemetry__) {
-        return false;
-      }
-      const telemetry = st._renderKeyTelemetry;
-      const now = Date.now();
-      if (now - telemetry.lastReportedAt < 60_000) return false;
-      const issues = [
-        { issue: "duplicate", count: telemetry.pendingDuplicate },
-        { issue: "missing", count: telemetry.pendingMissing },
-      ].filter(item => item.count > 0);
-      if (!issues.length) return false;
-      if (telemetry.flushTimer) clearTimeout(telemetry.flushTimer);
-      telemetry.flushTimer = null;
-      window.__museReportTelemetry__({
-        kind: "message_render_key",
-        pane: String(tid || "pane"),
-        session: String(st._sid || tid || ""),
-        issues,
-      });
-      telemetry.lastReportedAt = now;
-      telemetry.pendingDuplicate = 0;
-      telemetry.pendingMissing = 0;
-      return true;
-    },
-    _reportPaneRenderKeyIssues(tid, st, issueCounts) {
-      if (!st || !issueCounts.size) return;
-      const telemetry = st._renderKeyTelemetry;
-      telemetry.pendingDuplicate = Math.min(10_000,
-        telemetry.pendingDuplicate + (issueCounts.get("duplicate") || 0));
-      telemetry.pendingMissing = Math.min(10_000,
-        telemetry.pendingMissing + (issueCounts.get("missing") || 0));
-      if (this._flushPaneRenderKeyTelemetry(tid, st)
-          || typeof window === "undefined" || !window.__museReportTelemetry__
-          || telemetry.flushTimer) return;
-      const delay = Math.max(0, 60_000 - (Date.now() - telemetry.lastReportedAt));
-      telemetry.flushTimer = setTimeout(() => {
-        telemetry.flushTimer = null;
-        if (this.tabState[tid] !== st) return;
-        this._flushPaneRenderKeyTelemetry(tid, st);
-      }, delay);
-    },
-    _nextPaneRenderRepairKey(tid, st, reserved) {
-      let key;
-      do {
-        key = String(tid || "pane") + ":render-repair:" + st._nextRenderRepairKey++;
-      } while (st._renderKeyOwners.has(key) || (reserved && reserved.has(key)));
-      return key;
-    },
-    _claimPaneMessageRenderKeys(
-      tid, messages, skipped = null, reservedKeys = null, initialIssues = null,
-    ) {
-      const st = this._ensureTabState(tid);
-      const list = [];
-      const objects = new Set();
-      for (const message of (Array.isArray(messages) ? messages : [])) {
-        if (!message || typeof message !== "object" || objects.has(message)
-            || (skipped && skipped.has(message))) continue;
-        objects.add(message);
-        list.push(message);
-      }
-      const reserved = reservedKeys ? new Set(reservedKeys) : new Set();
-      for (const message of list) {
-        if (st._renderKeyByObject.has(message)) continue;
-        const raw = message._k == null ? "" : String(message._k).trim();
-        if (raw) reserved.add(raw);
-      }
-      const issueCounts = initialIssues ? new Map(initialIssues) : new Map();
-      for (const message of list) {
-        const assigned = st._renderKeyByObject.get(message);
-        const assignedOwner = assigned && st._renderKeyOwners.get(assigned);
-        if (assigned && (!assignedOwner || assignedOwner === message)) {
-          message._k = assigned;
-          if (!assignedOwner) st._renderKeyOwners.set(assigned, message);
-          continue;
-        }
-        const raw = message._k == null ? "" : String(message._k).trim();
-        const owner = raw && st._renderKeyOwners.get(raw);
-        let key = raw;
-        if (!raw || (owner && owner !== message)) {
-          const issue = raw ? "duplicate" : "missing";
-          issueCounts.set(issue, (issueCounts.get(issue) || 0) + 1);
-          key = this._nextPaneRenderRepairKey(tid, st, reserved);
-        }
-        message._k = key;
-        st._renderKeyByObject.set(message, key);
-        st._renderKeyOwners.set(key, message);
-      }
-      this._reportPaneRenderKeyIssues(tid, st, issueCounts);
-      return list;
-    },
-    _rebuildPaneMessageRenderKeys(tid, messages = null) {
-      const st = this._ensureTabState(tid);
-      const oldByObject = st._renderKeyByObject;
-      const list = [];
-      const objects = new Set();
-      // Prefer the mounted window when overlapping pagination temporarily
-      // exposes the same object in more than one segment.
-      const sources = messages ? [messages]
-        : [st.messages || [], st._earlierMessages || [], st._laterMessages || []];
-      let duplicateOccurrences = 0;
-      for (const source of sources) {
-        for (let i = 0; i < source.length; i++) {
-          const message = source[i];
-          if (!message || typeof message !== "object") continue;
-          if (objects.has(message)) {
-            source.splice(i--, 1);
-            duplicateOccurrences++;
-            continue;
-          }
-          objects.add(message);
-          list.push(message);
-        }
-      }
-      const occurrenceIssues = duplicateOccurrences
-        ? new Map([["duplicate", duplicateOccurrences]]) : null;
-      const reserved = new Set();
-      for (const message of list) {
-        const assigned = oldByObject.get(message);
-        const raw = assigned || (message._k == null ? "" : String(message._k).trim());
-        if (raw) reserved.add(raw);
-      }
-      st._renderKeyByObject = new WeakMap();
-      st._renderKeyOwners = new Map();
-      const pending = [];
-      for (const message of list) {
-        const assigned = oldByObject.get(message);
-        if (assigned && !st._renderKeyOwners.has(assigned)) {
-          message._k = assigned;
-          st._renderKeyByObject.set(message, assigned);
-          st._renderKeyOwners.set(assigned, message);
-        } else {
-          pending.push(message);
-        }
-      }
-      this._claimPaneMessageRenderKeys(tid, pending, null, reserved, occurrenceIssues);
-      if (!messages) this._recordPaneRenderKeyShape(st);
-      return list;
-    },
-    _ensurePaneMessageRenderKeys(tid) {
-      const st = this._ensureTabState(tid);
-      if (st._renderKeyNormalizedGeneration === st._renderKeyGeneration
-          && !this._paneRenderKeyShapeChanged(st)) return false;
-      this._rebuildPaneMessageRenderKeys(tid);
-      return true;
     },
     paneMessages(tid) {
       // Pure O(1) canonical lookup. Virtualization changes only the render rows;
@@ -9382,68 +9081,6 @@ function portal() {
       st._virtualRevision++;
     },
 
-    // [resident-panes] The id list the message-pane x-for iterates. Returns the
-    // LRU resident set, but ALWAYS overlays currentId so the VISIBLE pane is
-    // mounted even if some code path set currentId without going through
-    // switchSession's promote (defensive — switchSession + initSessions keep
-    // currentId in _residentTabIds in the normal flow). Pure read: NO mutation
-    // (runs inside x-for render). Reactive on _residentTabIds + currentId, so the
-    // pane set re-evaluates exactly when either changes; :key="tid" keeps stable
-    // panes from rebuilding.
-    residentPaneIds() {
-      const budget = this._isMobileLayout() ? 1 : this._MAX_RESIDENT_PANES;
-      const list = (this._residentTabIds || []).filter(Boolean);
-      if (this._isMobileLayout()) {
-        return this.currentId ? [this.currentId] : list.slice(0, 1);
-      }
-      const stable = list.slice(0, budget);
-      if (this.currentId && !stable.includes(this.currentId)) {
-        if (stable.length >= budget) stable.pop();
-        stable.push(this.currentId);
-      }
-      return stable;
-    },
-    // [resident-panes] LRU bookkeeping. Promote `tid` to most-recently-used, then
-    // evict panes past _MAX_RESIDENT_PANES from the LRU end — but NEVER evict the
-    // current tab (it's on-screen) or a tab with a live stream (its bubbles are
-    // being written by SSE handlers; unmounting would drop the in-progress reply
-    // from view until a rebuild). An evicted tab's _highlighted is reset so its
-    // future rebuilt DOM re-runs syntax highlight.
-    _promoteResident(tid) {
-      if (!tid) return;
-      const budget = this._isMobileLayout() ? 1 : this._MAX_RESIDENT_PANES;
-      let residents = Array.from(new Set(
-        (this._residentTabIds || []).filter(Boolean)));
-      let lru = (this._residentTabLru || []).filter(
-        x => residents.includes(x) && x !== tid);
-      // Bootstrap recency for state created before this field existed and for
-      // deterministic browser fixtures that seed resident ids directly.
-      for (const id of residents) {
-        if (id !== tid && !lru.includes(id)) lru.push(id);
-      }
-      lru.unshift(tid);
-      if (!residents.includes(tid)) residents.push(tid);
-      while (residents.length > budget) {
-        const cand = [...lru].reverse().find(
-          id => id !== tid && id !== this.currentId && residents.includes(id));
-        if (!cand) break;
-        residents = residents.filter(id => id !== cand);
-        lru = lru.filter(id => id !== cand);
-        const cst = this.tabState && this.tabState[cand];
-        // DOM residency is independent from stream ownership. Hidden streams keep
-        // mutating their tab state through SSE and rebuild when activated.
-        if (cst) cst._highlighted = false;
-      }
-      this._residentTabLru = lru;
-      // Avoid touching the x-for dependency when membership did not change.
-      // Assignment itself makes Alpine reconcile every pane even if the ids
-      // are semantically equal.
-      if (residents.length !== (this._residentTabIds || []).length
-          || residents.some((id, i) => id !== this._residentTabIds[i])) {
-        this._residentTabIds = residents;
-      }
-    },
-
     async initSessions(options = {}) {
       if (this._sessionInitPromise) return this._sessionInitPromise;
       this._sessionInitPromise = this._initSessionsOnce(options);
@@ -9510,11 +9147,6 @@ function portal() {
         this._persistChatDraft(this.currentId, landingState.draft.input);
         this._deletePersistedChatDraft(previousId);
       }
-      // [resident-panes] Seed the LRU with the landing tab only. Other restored
-      // tabs lazy-mount on first switch (rebuild path), so a multi-tab restore
-      // doesn't pay to render every pane up front.
-      this._residentTabIds = [this.currentId];
-      this._residentTabLru = [this.currentId];
       this._activateTabState(this.currentId);
       const st = this._ensureTabState(this.currentId);
       if (!st._loaded) {
@@ -11028,10 +10660,6 @@ function portal() {
           }
           st._virtualSyncFrame = 0;
         }
-        if (st._renderKeyTelemetry && st._renderKeyTelemetry.flushTimer) {
-          clearTimeout(st._renderKeyTelemetry.flushTimer);
-          st._renderKeyTelemetry.flushTimer = null;
-        }
         st.es = null;
         st._streamStartController = null;
         st._cancelBeforeStream = false;
@@ -11066,8 +10694,6 @@ function portal() {
       if (this._prefetching) delete this._prefetching[id];
       if (this.tabState[id] === st) delete this.tabState[id];
       this._dropSessionMessageStore(id);
-      this._residentTabIds = (this._residentTabIds || []).filter(x => x !== id);
-      this._residentTabLru = (this._residentTabLru || []).filter(x => x !== id);
       this._clearSessionWarnFlags(id);
     },
     _startWorkspaceDrag(path, pointerId = null) {
@@ -14168,13 +13794,8 @@ function portal() {
       // Switch the visible tab. We do NOT touch other tabs' streams — each
       // tab's ES is in its own tabState[id], and stream callbacks write
       // there directly. Switching is just "show that tab".
-      // [resident-panes] Decide warm vs rebuild BEFORE promoting: was this tab's
-      // pane already mounted? Yes → warm (pure x-show flip, DOM already present).
-      // No (LRU-evicted, or first activation of a background-opened tab) → rebuild
-      // (Alpine re-mounts its bubbles from tabState). Then promote currentId so its
-      // pane is (or stays) resident and any LRU eviction happens now.
-      const _wasResident = (this._residentTabIds || []).includes(this.currentId);
-      this._promoteResident(this.currentId);
+      // Only the active pane is mounted. Normalized messages and stable-key rich
+      // HTML caches retain state while Alpine rebuilds this viewport projection.
       this._activateTabState(this.currentId);
       this.ackCurrentActivity();
       this.savePrefs();
@@ -14221,84 +13842,15 @@ function portal() {
       const st = this._ensureTabState(this.currentId);
       if (!st._loaded) {
         await this._ensureSessionLoaded(this.currentId);
-      } else if (_wasResident) {
-        // Already loaded — content is in the DOM, the switch is just an x-show
-        // flip. The click→switch lag came from the browser laying out the
-        // newly-revealed pane (style/layout of every .msg scales with that
-        // tab's history) PLUS scrollToBottom's forced reflow + highlightCode's
-        // full-body walk, all BEFORE the browser could paint the currentId
-        // change — so a big tab "froze" ~1.5s and even small tabs lagged
-        // ~100-200ms.
-        const stCur = this.tabState && this.tabState[this.currentId];
-        const shouldFollow = !stCur || stCur.atBottom !== false;
-        this.atBottom = shouldFollow;
-        const histLen = (stCur && stCur.messages && stCur.messages.length) || 0;
-        // On mobile, heavy history keeps the bubbles display:none'd for one frame
-        // (`.chat-body.msgs-hidden .msg { display:none }`, driven by
-        // messagesReady=false) so the tab-bar flip + a loading skeleton PAINT
-        // immediately with ZERO bubble layout. Then reveal on the next frame —
-        // the (unavoidable) layout of N bubbles now happens AFTER the switch is
-        // already on screen, so the click feels instant with a brief loading
-        // state. Desktop favours visual continuity and keeps warm panes visible;
-        // the wider resident set makes these switches a direct x-show flip.
-        // Guard the deferred callbacks against a rapid re-switch: if the user
-        // tabs away again before the next frame, the stale callback must not
-        // flip messagesReady / scroll / highlight for a tab that's no longer
-        // visible (it would clobber the now-current tab's state).
-        const target = this.currentId;
-        // Already-highlighted tabs don't need another full-body highlight pass
-        // on every switch: the per-node data-hl sentinel already early-returns,
-        // but the `.chat-body pre code` querySelectorAll still walks EVERY open
-        // pane's DOM each time. Streaming new code sets its own data-hl via the
-        // stream path, so a warm re-activation has nothing new to do. Skip it.
-        const reHighlight = () => { if (!stCur || !stCur._highlighted) { this.highlightCode(".chat-body"); if (stCur) stCur._highlighted = true; } };
-        // Warm switch: settle to the bottom. The loop early-exits as soon as
-        // scrollHeight is stable (2 frames) — a couple frames for a tab whose
-        // heights are already realized, more for tall content-visibility
-        // bubbles that realize as they scroll in — and onChatScroll is
-        // suppressed during it, so the default cap is cheap in the common case
-        // while still landing correctly on tall histories.
-        const settle = () => this._restoreChatPosition(target);
-        if (this._isMobileLayout()
-            && histLen >= Math.ceil(this._mountedMessageCap() / 2)
-            && shouldFollow) {
-          stCur.messagesReady = false;
-          this.messagesReady = false;          // msgs-hidden → bubbles display:none + skeleton
-          this._afterPaint(() => {
-            if (this.currentId !== target) return;
-            stCur.messagesReady = true;
-            this.messagesReady = true;         // reveal bubbles (layout now, post-switch-paint)
-            this._afterPaint(() => {
-              if (this.currentId !== target) return;
-              settle();
-              reHighlight();
-            });
-          });
-        } else {
-          stCur.messagesReady = true;
-          this.messagesReady = true;           // cheap reveal → no skeleton flash
-          this._afterPaint(() => {
-            if (this.currentId !== target) return;
-            settle();
-            reHighlight();
-          });
-        }
       } else {
-        // [resident-panes] REBUILD: history is loaded in tabState but this pane
-        // was NOT mounted (LRU-evicted, or first activation of a tab opened in
-        // the background). Promoting currentId above added it to _residentTabIds,
-        // so the message-pane x-for will MOUNT a fresh .msg-pane and render its
-        // bubbles from tabState[id].messages on the next Alpine tick. No refetch
-        // (skip net/parse/md) — wait for the mount to paint, then highlight +
-        // settle scroll. Cost is O(target history), bounded by THIS session, not
-        // the sum of every open tab's retained DOM (that was the lag root cause).
+        // The keyed single-pane projection remounts from normalized state without
+        // refetching. Reveal after the tab change paints, then restore position.
         const target = this.currentId;
         const stCur = this.tabState && this.tabState[this.currentId];
         const shouldFollow = !stCur || stCur.atBottom !== false;
         this.atBottom = shouldFollow;
-        // Hide bubbles for one frame so the tab-bar flip + skeleton paint
-        // instantly; reveal next frame so the O(M) fresh-mount layout lands AFTER
-        // the switch is on-screen (same trick as the heavy-warm path above).
+        // Hide bubbles for one frame so the tab-bar flip + skeleton paints
+        // immediately; reveal next frame after the single pane remounts.
         stCur.messagesReady = false;
         this.messagesReady = false;
         this._afterPaint(() => {
@@ -14689,8 +14241,6 @@ function portal() {
         // block; viewport virtualization makes a second count-based client trim
         // unnecessary and would discard interaction state on full/around loads.
         const trimmedHead = 0;
-        this._markPaneRenderKeysDirty(st);
-        this._rebuildPaneMessageRenderKeys(sid, all);
         // Lazy-load thresholds — only render the tail of the conversation on
         // first paint; older messages stay in a "to-render" stash and get
         // mdRender'd on demand when the user clicks "Load earlier".
@@ -14830,7 +14380,6 @@ function portal() {
         // response coordinates. Canonical envelopes remain untouched.
         this._capMountedWindow(st, "newer");
         this._syncSessionMessageStore(st);
-        this._recordPaneRenderKeyShape(st);
         // More history exists if either the in-memory stash has older
         // bubbles OR the server holds bubbles before our window.
         st._hasMoreHistory = st._earlierMessages.length > 0 || st._loadedOffset > 0;
@@ -15061,7 +14610,6 @@ function portal() {
         // loadSession owns the reveal. Prevents double-fill / duplicate keys.
         if (this.tabState[sid] !== st || st.streaming || st.es) return;
         const chunk = visible.slice(i, i + CH);
-        this._claimPaneMessageRenderKeys(sid, chunk);
         st.messages.push(...chunk);
         i += chunk.length;
         // Tab switched away mid-reveal: the array is no longer on screen and a
@@ -15071,10 +14619,8 @@ function portal() {
         if (sid !== this.currentId) {
           if (i < visible.length) {
             const rest = visible.slice(i);
-            this._claimPaneMessageRenderKeys(sid, rest);
             st.messages.push(...rest);
           }
-          this._recordPaneRenderKeyShape(st);
           return;
         }
         if (i < visible.length) {
@@ -15084,7 +14630,6 @@ function portal() {
       }
       if (this.tabState[sid] === st) {
         this._capMountedWindow(st, "older");
-        this._recordPaneRenderKeyShape(st);
       }
     },
     // E5: render the deferred HEAD — the rewound, above-the-fold bubbles whose
@@ -15199,8 +14744,22 @@ function portal() {
       return m && m.block_id ? sid + ":" + m.block_id : "";
     },
     _historyEnvelopes(sid, list) {
-      return (list || []).map(m => {
-        const renderKey = this._historyMessageKey(sid, m);
+      const source = list || [];
+      const renderKeys = source.map(m => this._historyMessageKey(sid, m));
+      const uniqueKeys = new Set();
+      for (const key of renderKeys) {
+        if (!key || uniqueKeys.has(key)) {
+          // Stable block identity is a transport invariant. Do not invent a
+          // response-local suffix or silently remove a colliding message: keep
+          // the previous pane intact and make the producer defect explicit.
+          try { console.error("[muse-invariant] duplicate or missing message identity", sid); }
+          catch (_) { /* diagnostics must not mask the invariant failure */ }
+          throw new Error("message identity invariant violated for session " + sid);
+        }
+        uniqueKeys.add(key);
+      }
+      return source.map((m, index) => {
+        const renderKey = renderKeys[index];
         const storeKey = this._historyStoreKey(sid, m);
         if (!storeKey) return { ...m, _k: renderKey };
         const sessionKeys = this._sessionWindows.get(sid) || new Set();
@@ -15383,34 +14942,15 @@ function portal() {
       return result;
     },
     _assignLiveKey(st, m) {
-      // A late async callback may still hold a disposed pane state after the
-      // same session is reopened. Never claim keys in the replacement pane.
+      // Live identities are allocated once by the owning tab and remain stable
+      // through incremental reconnect. Canonical reconciliation may deliberately
+      // retain this key for the already-mounted object.
       if (this.tabState[st._sid] !== st) return m;
-      this._ensurePaneMessageRenderKeys(st._sid);
-      if (!m._k) {
-        do {
-          m._k = (st._sid || "tab") + ":live:" + st._nextLiveKey++;
-        } while (st._renderKeyOwners.has(m._k));
-      }
-      this._claimPaneMessageRenderKeys(st._sid, [m]);
+      if (!m._k) m._k = (st._sid || "tab") + ":live:" + st._nextLiveKey++;
       return m;
     },
     _allPaneMessages(st) {
       return [].concat(st._earlierMessages || [], st.messages || [], st._laterMessages || []);
-    },
-    _containsPaneMessage(st, m) {
-      return !!m && ((st.messages || []).includes(m)
-        || (st._earlierMessages || []).includes(m)
-        || (st._laterMessages || []).includes(m));
-    },
-    _releasePaneMessageRenderKeys(st, messages) {
-      if (!st || !Array.isArray(messages)) return;
-      for (const message of messages) {
-        const key = message && st._renderKeyByObject.get(message);
-        if (key && st._renderKeyOwners.get(key) === message) {
-          st._renderKeyOwners.delete(key);
-        }
-      }
     },
     _removePaneMessage(st, m) {
       if (!st || !m) return false;
@@ -15419,8 +14959,6 @@ function portal() {
         const idx = list.indexOf(m);
         if (idx >= 0) {
           list.splice(idx, 1);
-          if (!this._containsPaneMessage(st, m)) this._releasePaneMessageRenderKeys(st, [m]);
-          this._recordPaneRenderKeyShape(st);
           return true;
         }
       }
@@ -15429,25 +14967,21 @@ function portal() {
     _truncatePaneMessagesFrom(st, m) {
       if (!st || !m) return false;
       const lists = [st._earlierMessages, st.messages, st._laterMessages];
-      const removed = [];
       let found = false;
       for (const list of lists) {
         if (!Array.isArray(list)) continue;
         if (found) {
-          removed.push(...list.splice(0));
+          list.splice(0);
           continue;
         }
         const idx = list.indexOf(m);
         if (idx < 0) continue;
-        removed.push(...list.splice(idx));
+        list.splice(idx);
         found = true;
       }
       if (!found) return false;
       st._hasServerLater = false;
       st._total = (st._loadedOffset || 0) + this._allPaneMessages(st).length;
-      this._releasePaneMessageRenderKeys(st,
-        removed.filter(message => !this._containsPaneMessage(st, message)));
-      this._recordPaneRenderKeyShape(st);
       return true;
     },
     _appendLiveMessage(st, m) {
@@ -15472,7 +15006,6 @@ function portal() {
       target.push(m);
       this._capMountedWindow(st, "newer");
       this._capHistoryCache(st);
-      this._recordPaneRenderKeyShape(st);
       return target[target.length - 1];
     },
     // Retained as load/page sizing compatibility. DOM size is now controlled by
@@ -15651,7 +15184,6 @@ function portal() {
         const data = await r.json();
         if (this.tabState[sid] !== st) return 0;
         const win = this._historyEnvelopes(sid, data.messages || []);
-        this._ensurePaneMessageRenderKeys(sid);
         // Prepend (older bubbles go to the front of the stash). mdRender is
         // still deferred until a bubble is paged into messages[].
         st._earlierMessages = win.concat(st._earlierMessages || []);
@@ -15661,9 +15193,7 @@ function portal() {
         st.historyGeneration = data.history_generation || st.historyGeneration || "";
         st._historyOrder = data.history_order === "full" ? "full" : "normal";
         if (sid === this.currentId) this.historyGeneration = st.historyGeneration;
-        const dropped = this._capHistoryCache(st, "older");
-        this._claimPaneMessageRenderKeys(sid, win, dropped);
-        this._recordPaneRenderKeyShape(st);
+        this._capHistoryCache(st, "older");
         st._hasServerLater = (st._loadedOffset + this._allPaneMessages(st).length)
           < st._total;
         st._hasMoreHistory =
@@ -15707,16 +15237,13 @@ function portal() {
         const data = await r.json();
         if (this.tabState[sid] !== st) return 0;
         const win = this._historyEnvelopes(sid, data.messages || []);
-        this._ensurePaneMessageRenderKeys(sid);
         st._laterMessages = (st._laterMessages || []).concat(win);
         if (Number.isInteger(data.total)) st._total = data.total;
         if (Number.isInteger(data.pre_total)) st._preTotal = data.pre_total;
         st.historyGeneration = data.history_generation || st.historyGeneration || "";
         st._historyOrder = data.history_order === "full" ? "full" : "normal";
         if (sid === this.currentId) this.historyGeneration = st.historyGeneration;
-        const dropped = this._capHistoryCache(st, "newer");
-        this._claimPaneMessageRenderKeys(sid, win, dropped);
-        this._recordPaneRenderKeyShape(st);
+        this._capHistoryCache(st, "newer");
         st._hasServerLater = (st._loadedOffset + this._allPaneMessages(st).length)
           < st._total;
         return win.length;
@@ -15863,8 +15390,6 @@ function portal() {
       const anchor = this._captureViewportMessageAnchor(scrollEl, sid);
       this._shiftMessageVirtualWindow(st, batch.length);
       st.messages.unshift(...batch);
-      this._markPaneRenderKeysDirty(st);
-      this._ensurePaneMessageRenderKeys(sid);
       this._capMountedWindow(st, "older");
       if (isCurrent) this.messages = st.messages;
       st._hasMoreHistory = st._earlierMessages.length > 0 || st._loadedOffset > 0;
@@ -27438,10 +26963,7 @@ function portal() {
         const roles = sendState.messages.map(m => m.role);
         const lastUserIdx = roles.lastIndexOf("user");
         if (lastUserIdx >= 0 && lastUserIdx < sendState.messages.length - 1) {
-          const removed = sendState.messages.splice(lastUserIdx + 1);
-          this._releasePaneMessageRenderKeys(sendState,
-            removed.filter(message => !this._containsPaneMessage(sendState, message)));
-          this._recordPaneRenderKeyShape(sendState);
+          sendState.messages.splice(lastUserIdx + 1);
         }
       }
       // (isContinuation: keep the existing messages intact — the watcher's
@@ -27531,12 +27053,6 @@ function portal() {
         this.messagesReady = true;
         this.messagesLoading = false;
       }
-      // [resident-panes] A tab with a live stream must stay mounted even if the
-      // user tabs away — its bubbles are being written by the SSE handlers below.
-      // Promote it now (streamState.streaming is already true, so the LRU's
-      // streaming guard will refuse to evict it). When streamSid === currentId
-      // (the common case) this is a harmless re-promote of the front entry.
-      this._promoteResident(streamSid);
       streamState.streamingModel = sendModel;
       // 锁定 — pending bubble 用它，不跟着 dropdown。只在 streamSid 仍是当前
       // tab 时写 root 状态，否则只污染后台 tab 的显示。

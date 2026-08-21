@@ -65,7 +65,6 @@ def test_auto_ack_accepts_any_result_rendered_in_current_visible_turn(
           const directState = app._ensureTabState(directSid);
           const otherState = app._ensureTabState(otherSid);
           app.currentId = directSid;
-          app._residentTabIds = [directSid];
           app._activateTabState(directSid);
           const calls = [];
           app.ackActivitySession = async (sid, retries) => {
@@ -126,7 +125,6 @@ def test_visible_completion_ack_wins_both_done_and_activity_sse_orders(
           await Promise.allSettled(
             Object.values(app._activityFetchPromises || {}));
           app.currentId = sid;
-          app._residentTabIds = [sid];
           const st = app._ensureTabState(sid);
           st._loaded = true;
           app._activateTabState(sid);

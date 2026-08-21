@@ -477,12 +477,10 @@ def _bootstrap_session_for_real_load(page: Page, sid: str, name: str) -> None:
         app.openTabIds = [arg.sid];
         app.tabState = {};
         app.currentId = arg.sid;
-        app._residentTabIds = [arg.sid];
         app.mobileTab = "chat";
         app.messagesReady = true;
         app.messagesLoading = false;
         app._activateTabState(arg.sid);
-        app._promoteResident(arg.sid);
         return true;
         """,
         {"sid": sid, "name": name},
@@ -2351,7 +2349,7 @@ def test_mobile_completed_turn_can_fork_from_that_point(
 
 
 def test_mobile_long_history_switching_does_not_blank(page: Page, backend_url, auth_token):
-    """Switch repeatedly between long resident chat panes on a mobile viewport."""
+    """Switch repeatedly between long normalized histories on a mobile viewport."""
     errors = _capture_browser_errors(page)
     page.set_viewport_size({"width": 390, "height": 844})
     _login(page, backend_url, auth_token)
@@ -2368,8 +2366,6 @@ def test_mobile_long_history_switching_does_not_blank(page: Page, backend_url, a
           model: "e2e-model", permission: "bypassPermissions", thinking: true,
         }));
         app.openTabIds = sessionIds.slice();
-        app._MAX_RESIDENT_PANES = 2;
-        app._residentTabIds = sessionIds.slice(0, 4);
         app.tabState = {};
         for (const [idx, id] of sessionIds.entries()) {
           const st = app._blankTabState();
@@ -2394,7 +2390,6 @@ def test_mobile_long_history_switching_does_not_blank(page: Page, backend_url, a
         app.messagesLoading = false;
         app.mobileTab = "chat";
         app._activateTabState(app.currentId);
-        app._promoteResident(app.currentId);
         app.$nextTick(() => app.scrollToBottom(true));
         return true;
         """,
@@ -2421,7 +2416,6 @@ def test_mobile_long_history_switching_does_not_blank(page: Page, backend_url, a
             app.messagesReady = true;
             app.messagesLoading = false;
             app._activateTabState(arg);
-            app._promoteResident(arg);
             app.$nextTick(() => app.scrollToBottom(true));
             """,
             sid,
@@ -2445,7 +2439,7 @@ def test_mobile_long_history_switching_does_not_blank(page: Page, backend_url, a
                   const app = document.querySelector("#app")._x_dataStack[0];
                   return {
                     currentId: app.currentId,
-                    resident: app.residentPaneIds(),
+                    paneCount: document.querySelectorAll(".msg-pane").length,
                     openTabIds: app.openTabIds,
                     messagesLength: app.messages.length,
                     visiblePanes: Array.from(document.querySelectorAll(".msg-pane"))
@@ -2460,15 +2454,15 @@ def test_mobile_long_history_switching_does_not_blank(page: Page, backend_url, a
         assert snap["msgCount"] <= mounted_cap
         assert expected_tail in snap["text"]
         assert page.locator(".msg-pane").count() <= 1
-        assert _app_eval(page, "return app.residentPaneIds().length;") <= 1
+        assert page.locator(".msg-pane").count() <= 1
 
     _assert_no_browser_errors(page, errors)
 
 
-def test_desktop_warm_session_switch_keeps_panes_and_composer_stable(
+def test_desktop_session_switch_remounts_one_pane_and_keeps_composer_stable(
     page: Page, backend_url: str, auth_token: str,
 ):
-    """Desktop prioritizes instant warm switches without footer/layout jumps."""
+    """Desktop remounts one virtualized pane without footer/layout jumps."""
     errors = _capture_browser_errors(page)
     page.set_viewport_size({"width": 1440, "height": 900})
     _login(page, backend_url, auth_token)
@@ -2508,11 +2502,9 @@ def test_desktop_warm_session_switch_keeps_panes_and_composer_stable(
           app._ensureTabState(id);
         }
         app.currentId = arg.ids[0];
-        app._residentTabIds = arg.ids.slice();
         app.messagesReady = true;
         app.messagesLoading = false;
         app._activateTabState(app.currentId);
-        app._promoteResident(app.currentId);
         return true;
         """,
         payload,
@@ -2522,7 +2514,7 @@ def test_desktop_warm_session_switch_keeps_panes_and_composer_stable(
           const panes = Array.from(document.querySelectorAll(".msg-pane"));
           const visible = panes.filter(
             pane => getComputedStyle(pane).display !== "none");
-          return panes.length === 4
+          return panes.length === 1
             && visible.length === 1
             && visible[0].querySelectorAll(".msg").length === 40;
         }"""
@@ -2545,7 +2537,7 @@ def test_desktop_warm_session_switch_keeps_panes_and_composer_stable(
               pane => getComputedStyle(pane).display !== "none");
             out.push({
               elapsed: performance.now() - started,
-              resident: app.residentPaneIds().length,
+              paneCount: document.querySelectorAll(".msg-pane").length,
               panes: panes.length,
               visible: visible.length,
               visibleMessages: visible[0]?.querySelectorAll(".msg").length || 0,
@@ -2562,11 +2554,10 @@ def test_desktop_warm_session_switch_keeps_panes_and_composer_stable(
     assert after is not None
     elapsed = sorted(row["elapsed"] for row in switches)
     # Shared/low-memory CI can produce one scheduling outlier; the sustained
-    # interaction is what users feel across repeated warm switches.
+    # interaction is what users feel across repeated remounts.
     assert elapsed[len(elapsed) // 2] < 700, switches
     assert max(elapsed) < 1500, switches
-    assert all(row["resident"] == 4 for row in switches)
-    assert all(row["panes"] == 4 and row["visible"] == 1 for row in switches)
+    assert all(row["panes"] == 1 and row["visible"] == 1 for row in switches)
     assert all(row["visibleMessages"] == 40 for row in switches)
     assert all(row["ready"] and row["skeleton"] == "none" for row in switches)
     assert abs(after["y"] - before["y"]) < 1
@@ -2609,7 +2600,7 @@ def test_mobile_windowed_load_session_pages_older_history(page: Page, backend_ur
           loadedOffset: st._loadedOffset,
           total: st._total,
           hasMore: st._hasMoreHistory,
-          resident: app.residentPaneIds().length,
+          paneCount: document.querySelectorAll(".msg-pane").length,
           ready: app.messagesReady,
           bodyText: document.querySelector(".chat-body")?.textContent || "",
         };
@@ -2621,7 +2612,7 @@ def test_mobile_windowed_load_session_pages_older_history(page: Page, backend_ur
     assert state["loadedOffset"] == 105
     assert state["total"] == 180
     assert state["hasMore"] is True
-    assert state["resident"] <= 1
+    assert state["paneCount"] <= 1
     assert "WINDOW_MSG_179" in state["bodyText"]
     assert "WINDOW_MSG_000" not in state["bodyText"]
     assert page.locator(".msg-pane").count() <= 1
@@ -2726,17 +2717,13 @@ def test_mobile_windowed_load_session_pages_older_history(page: Page, backend_ur
     _assert_no_browser_errors(page, errors)
 
 
-def test_history_pagination_repairs_cross_page_keys_without_remounting(
+def test_history_pagination_keeps_stable_cross_page_keys_without_remounting(
     page: Page, backend_url, auth_token,
 ):
     errors = _capture_browser_errors(page)
     page.set_viewport_size({"width": 390, "height": 844})
     sid = "perf-cross-page-render-keys"
     messages = _make_mixed_messages(180, "CROSS_PAGE_KEY")
-    messages[101]["_k"] = "   "
-    messages[102]["_k"] = f"{sid}:render-repair:1"
-    messages[104]["_k"] = "cross-page-duplicate"
-    messages[110]["_k"] = "cross-page-duplicate"
     requests = _route_windowed_session(page, sid, messages)
     _login(page, backend_url, auth_token)
     _bootstrap_session_for_real_load(page, sid, "Cross-page render keys")
@@ -2785,16 +2772,16 @@ def test_history_pagination_repairs_cross_page_keys_without_remounting(
         const st = app._ensureTabState(arg);
         const all = app._allPaneMessages(st);
         const mounted = all.find(m => m.uuid === "CROSS_PAGE_KEY-tr-110");
-        const duplicate = all.find(m => m.uuid === "CROSS_PAGE_KEY-u-104");
-        const missing = all.find(m => m.uuid === "CROSS_PAGE_KEY-a-101");
-        const legitimate = all.find(m => m.uuid === "CROSS_PAGE_KEY-tr-102");
+        const olderUser = all.find(m => m.uuid === "CROSS_PAGE_KEY-u-104");
+        const olderAssistant = all.find(m => m.uuid === "CROSS_PAGE_KEY-a-101");
+        const olderTool = all.find(m => m.uuid === "CROSS_PAGE_KEY-tr-102");
         const keys = all.map(m => m._k);
         return {
           sameMountedObject: mounted === window.__crossPageMountedObject,
           mountedKey: mounted?._k || "",
-          duplicateKey: duplicate?._k || "",
-          missingKey: missing?._k || "",
-          legitimateKey: legitimate?._k || "",
+          olderUserKey: olderUser?._k || "",
+          olderAssistantKey: olderAssistant?._k || "",
+          olderToolKey: olderTool?._k || "",
           allNonempty: keys.every(key => typeof key === "string" && key.trim()),
           unique: new Set(keys).size === keys.length,
         };
@@ -2804,10 +2791,10 @@ def test_history_pagination_repairs_cross_page_keys_without_remounting(
 
     assert any(request["offset"] < 105 for request in requests[1:]), requests
     assert after["sameMountedObject"] is True
-    assert after["mountedKey"] == before["key"] == "cross-page-duplicate"
-    assert after["duplicateKey"] != after["mountedKey"]
-    assert after["legitimateKey"] == f"{sid}:render-repair:1"
-    assert after["missingKey"] != after["legitimateKey"]
+    assert after["mountedKey"] == before["key"] == f"{sid}:uuid:CROSS_PAGE_KEY-tr-110"
+    assert after["olderUserKey"] == f"{sid}:uuid:CROSS_PAGE_KEY-u-104"
+    assert after["olderAssistantKey"] == f"{sid}:uuid:CROSS_PAGE_KEY-a-101"
+    assert after["olderToolKey"] == f"{sid}:uuid:CROSS_PAGE_KEY-tr-102"
     assert after["allNonempty"] is True
     assert after["unique"] is True
     _assert_no_browser_errors(page, errors)
@@ -2987,9 +2974,7 @@ def test_viewport_virtualization_keeps_history_and_scroll_anchor(
         st.messagesLoading = false;
         st.atBottom = true;
         app.currentId = arg;
-        app._residentTabIds = [arg];
         app._activateTabState(arg);
-        app._promoteResident(arg);
         app.mobileTab = "chat";
         app.$nextTick(() => app.scrollToBottom(true));
         return true;
@@ -3169,12 +3154,10 @@ def test_load_session_reconnects_active_turn_and_renders_live_assistant(
         app.openTabIds = [arg];
         app.tabState = {};
         app.currentId = arg;
-        app._residentTabIds = [arg];
         app.mobileTab = "chat";
         app.messagesReady = true;
         app.messagesLoading = false;
         app._activateTabState(arg);
-        app._promoteResident(arg);
         return true;
         """,
         sid,
@@ -3289,7 +3272,6 @@ def test_desktop_done_reconcile_preserves_live_message_dom_identity(
         st._loaded = true;
         st._seenUpdated = 1;
         app.currentId = sid;
-        app._residentTabIds = [sid];
         app._activateTabState(sid);
         app.messagesReady = true;
         app.messagesLoading = false;
@@ -3464,7 +3446,6 @@ def test_desktop_cancelled_snapshot_reconcile_never_blanks_or_replaces_live_node
         st._loaded = true;
         st._seenUpdated = 1;
         app.currentId = sid;
-        app._residentTabIds = [sid];
         app._activateTabState(sid);
         app.messagesReady = true;
         app.messagesLoading = false;
@@ -3752,7 +3733,6 @@ def test_fast_completed_queued_turn_reconciles_footer_without_refresh(
         st._draining = true;
         st.messagesReady = true;
         app.currentId = sid;
-        app._residentTabIds = [sid];
         app._activateTabState(sid);
         app.messagesReady = true;
         app.messagesLoading = false;
@@ -3957,7 +3937,6 @@ def test_tool_result_tail_done_metadata_renders_footer_before_canonical_reload(
         st._loaded = true;
         st._seenUpdated = 1;
         app.currentId = sid;
-        app._residentTabIds = [sid];
         app._activateTabState(sid);
         app.messagesReady = true;
         app.messagesLoading = false;
@@ -4193,7 +4172,7 @@ def test_tool_result_tail_done_metadata_renders_footer_before_canonical_reload(
     _assert_no_browser_errors(page, errors)
 
 
-def test_message_render_keys_are_repaired_per_pane_and_survive_reconciliation(
+def test_stable_message_identity_needs_no_repair_telemetry(
     page: Page, backend_url, auth_token,
 ):
     errors = _capture_browser_errors(page)
@@ -4202,343 +4181,61 @@ def test_message_render_keys_are_repaired_per_pane_and_survive_reconciliation(
     result = page.evaluate(
         """async () => {
           const app = document.querySelector("#app")._x_dataStack[0];
-          const sid = "render-key-primary";
-          const otherSid = "render-key-other";
-          const reconcileSid = "render-key-reconcile";
-          const marker = "PRIVATE_MESSAGE_CONTENT_MUST_NOT_REACH_TELEMETRY";
+          const sid = "stable-render-identity";
           app.refreshSessions = async () => {};
           app._fetchTabUsage = async () => {};
           app._scheduleIdlePreload = () => {};
           app.appReady = true;
-          app.sessions = [
-            {id: sid, name: "Primary", model: "e2e-model"},
-            {id: otherSid, name: "Other", model: "e2e-model"},
-          ];
-          app.openTabIds = [sid, otherSid];
+          app.sessions = [{id: sid, name: "Stable", model: "e2e-model"}];
+          app.openTabIds = [sid];
           app.tabState = {};
           const st = app._ensureTabState(sid);
-          const other = app._ensureTabState(otherSid);
           st._loaded = true;
-          other._loaded = true;
-          const original = {role: "user", text: marker + " user", _k: "shared-key"};
-          const live = {role: "assistant", text: marker + " assistant", _k: "shared-key"};
-          const missing = {role: "thinking", text: marker + " thinking", _k: "   "};
-          const futureLegit = {
-            role: "tool_result", text: marker + " legitimate repair-shaped key",
-            _k: `${sid}:render-repair:1`,
-          };
-          // A repeated occurrence of the exact same object cannot be repaired by
-          // mutating _k: both occurrences share that property. Normalization must
-          // remove the later array occurrence and preserve the first.
-          st.messages.push(original, live, missing, futureLegit, original);
-          // The same key is valid in another pane; uniqueness is pane-local.
-          other.messages.push({role: "assistant", text: "other", _k: "shared-key"});
-          window.__museTelemetry__.length = 0;
-          const realReport = window.__museReportTelemetry__;
-          const realDateNow = Date.now;
-          let now = 100_000;
-          Date.now = () => now;
-          let telemetryCalls = 0;
-          window.__museReportTelemetry__ = (record) => {
-            telemetryCalls += 1;
-            realReport(record);
-          };
+          const payload = [
+            {role: "user", text: "question", block_id: "record-1:0:user"},
+            {role: "assistant", text: "answer", block_id: "record-2:0:assistant"},
+            {role: "tool_result", text: "tool", block_id: "record-2:1:tool_result"},
+          ];
+          const first = app._historyEnvelopes(sid, payload);
+          const second = app._historyEnvelopes(sid, payload.map(message => ({...message})));
+          st.messages.push(...first);
           app.currentId = sid;
-          app._residentTabIds = [otherSid, sid];
           app._activateTabState(sid);
           app.messagesReady = true;
           app.messagesLoading = false;
-
-          const ensureMethod = app._ensurePaneMessageRenderKeys;
-          const rebuildMethod = app._rebuildPaneMessageRenderKeys;
-          const normalize = (id) => ensureMethod.call(app, id);
-          let fullScans = 0;
-          app._rebuildPaneMessageRenderKeys = function(...args) {
-            fullScans += 1;
-            return rebuildMethod.apply(this, args);
-          };
-          // Re-activation and repeated render getters are both O(1) once this
-          // pane's current message generation has been normalized.
-          app._activateTabState(sid);
-          app._activateTabState(sid);
-          const firstKeys = app.paneMessages(sid).map(m => m._k);
-          const secondKeys = app.paneMessages(sid).map(m => m._k);
-          const otherKeys = app.paneMessages(otherSid).map(m => m._k);
-          const warmFullScans = fullScans;
           await new Promise(resolve => app.$nextTick(() => requestAnimationFrame(resolve)));
-          const pane = document.querySelector(
-            `.msg-pane[data-tid="${CSS.escape(sid)}"]`);
+          const pane = document.querySelector(`.msg-pane[data-tid="${sid}"]`);
           const domKeys = pane ? Array.from(pane.querySelectorAll(".msg"))
             .map(el => el.dataset.messageKey) : [];
-          const initialTelemetry = window.__museTelemetry__.slice();
-          const stableBefore = [original._k, live._k, missing._k, futureLegit._k];
-          const appended = [];
-          for (let i = 0; i < 25; i++) {
-            appended.push(app._appendLiveMessage(st, {
-              role: "thinking", text: `live append ${i}`,
-            }));
-          }
-          const liveFullScans = fullScans;
-          const appendedKeys = appended.map(message => message._k);
-
-          // Install the fake timer before the first repair inside the rate
-          // window. That repair owns the one trailing flush; installing this
-          // after it would leave a real timer in telemetry.flushTimer and the
-          // deterministic callback list would remain empty.
-          const realSetTimeout = window.setTimeout;
-          const trailingCallbacks = [];
-          let trailingSchedules = 0;
-          window.setTimeout = (callback, delay) => {
-            trailingSchedules += 1;
-            trailingCallbacks.push({callback, delay});
-            return 90_000 + trailingSchedules;
-          };
-          const inserted = {
-            role: "tool_result", text: marker + " inserted", _k: "shared-key",
-          };
-          st.messages.unshift(inserted);
-          normalize(sid);
-          const insertedKey = inserted._k;
-          const stableAfterInsert = [original._k, live._k, missing._k, futureLegit._k];
-          st.messages.splice(0, st.messages.length, missing, inserted, live, original);
-          normalize(sid);
-          const stableAfterReorder = [original._k, live._k, missing._k, futureLegit._k];
-          // Further corruption inside the rate window is aggregated behind the
-          // same trailing timer.
-          st.messages.push(
-            {role: "tool_use", text: marker + " duplicate again", _k: "shared-key"},
-            {role: "thinking", text: marker + " missing again"},
-          );
-          normalize(sid);
-          st.messages.push({role: "thinking", text: marker + " missing again 2"});
-          normalize(sid);
-          window.setTimeout = realSetTimeout;
-          const telemetryInsideWindow = window.__museTelemetry__.slice();
-          now += 60_000;
-          trailingCallbacks[0].callback();
-          const telemetry = window.__museTelemetry__.slice();
-
-          const liveKey = live._k;
-          const canonical = app._historyEnvelopes(sid, [{
-            role: "assistant", text: live.text, uuid: "canonical-assistant",
-          }]);
-          const preserved = app._preserveCanonicalMessageIdentity(st, canonical);
-          app._claimPaneMessageRenderKeys(sid, preserved);
-
-          const reconcile = app._ensureTabState(reconcileSid);
-          const older = {
-            role: "assistant", text: "same reply", uuid: "older-assistant",
-            _k: `${reconcileSid}:uuid:older-assistant`,
-          };
-          const newestLive = {
-            role: "assistant", text: "same reply", _k: `${reconcileSid}:live:1`,
-          };
-          reconcile.messages.push(older, newestLive);
-          const reconciled = app._preserveCanonicalMessageIdentity(
-            reconcile,
-            app._historyEnvelopes(reconcileSid, [{
-              role: "assistant", text: "same reply", uuid: "canonical-newest",
-            }]),
-          );
-          rebuildMethod.call(app, reconcileSid, reconciled);
-          app._rebuildPaneMessageRenderKeys = rebuildMethod;
-          window.__museReportTelemetry__ = realReport;
-          Date.now = realDateNow;
-
+          const live = Array.from({length: 25}, (_, i) => app._appendLiveMessage(st, {
+            role: "thinking", text: `live ${i}`,
+          }));
           return {
-            firstKeys, secondKeys, otherKeys, domKeys,
-            warmFullScans, liveFullScans, appendedKeys,
-            stableBefore, stableAfterInsert, stableAfterReorder, insertedKey,
-            futureLegitKey: futureLegit._k, missingKey: missing._k,
-            initialTelemetry, telemetryInsideWindow, telemetry, telemetryCalls,
-            trailingSchedules, trailingDelay: trailingCallbacks[0]?.delay,
-            sameObjectOccurrences: st.messages.filter(
-              message => Alpine.raw(message) === original).length,
-            telemetryText: JSON.stringify(telemetry), marker,
-            liveSameObject: Alpine.raw(preserved[0]) === live,
-            liveKey: preserved[0]._k,
-            expectedLiveKey: liveKey,
-            canonicalUuid: preserved[0].uuid,
-            newestSameObject: Alpine.raw(reconciled[0]) === newestLive,
-            newestKey: reconciled[0]._k,
+            keys: first.map(message => message._k),
+            sameObjects: first.every((message, i) => Alpine.raw(second[i]) === Alpine.raw(message)),
+            domKeys,
+            liveKeys: live.map(message => message._k),
+            normalizedCount: app._sessionWindows.get(sid)?.size || 0,
+            paneCount: document.querySelectorAll(".msg-pane").length,
+            telemetryBuffer: typeof window.__museTelemetry__,
+            telemetryReporter: typeof window.__museReportTelemetry__,
           };
         }"""
     )
 
-    assert result["firstKeys"] == result["secondKeys"], result
-    assert len(result["firstKeys"]) == len(set(result["firstKeys"])) == 4, result
-    assert all(result["firstKeys"]), result
-    assert result["otherKeys"] == ["shared-key"], result
-    assert result["domKeys"] == result["firstKeys"], result
-    assert result["warmFullScans"] == 0, result
-    assert result["liveFullScans"] == 0, result
-    assert len(result["appendedKeys"]) == len(set(result["appendedKeys"])) == 25, result
-    assert not set(result["appendedKeys"]) & set(result["stableBefore"]), result
-    assert result["stableAfterInsert"] == result["stableBefore"], result
-    assert result["stableAfterReorder"] == result["stableBefore"], result
-    assert result["insertedKey"] not in result["stableBefore"], result
-    assert result["futureLegitKey"] == "render-key-primary:render-repair:1", result
-    assert result["missingKey"] != result["futureLegitKey"], result
-    first_report = {
-        "kind": "message_render_key",
-        "pane": "render-key-primary",
-        "session": "render-key-primary",
-        "issues": [
-            {"issue": "duplicate", "count": 2},
-            {"issue": "missing", "count": 1},
-        ],
-    }
-    assert result["initialTelemetry"] == result["telemetryInsideWindow"] == [
-        first_report
-    ], result
-    assert result["telemetry"] == [
-        first_report,
-        {
-            "kind": "message_render_key",
-            "pane": "render-key-primary",
-            "session": "render-key-primary",
-            "issues": [
-                {"issue": "duplicate", "count": 2},
-                {"issue": "missing", "count": 2},
-            ],
-        },
-    ], result
-    assert result["telemetryCalls"] == 2, result
-    assert result["trailingSchedules"] == 1, result
-    assert result["trailingDelay"] == 60_000, result
-    assert result["sameObjectOccurrences"] == 1, result
-    assert result["marker"] not in result["telemetryText"], result
-    assert result["liveSameObject"] is True, result
-    assert result["liveKey"] == result["expectedLiveKey"], result
-    assert result["canonicalUuid"] == "canonical-assistant", result
-    assert result["newestSameObject"] is True, result
-    assert result["newestKey"] == "render-key-reconcile:live:1", result
-    _assert_no_browser_errors(page, errors)
-
-
-def test_history_async_boundaries_reject_stale_state_and_reclaim_detached_keys(
-    page: Page, backend_url, auth_token,
-):
-    errors = _capture_browser_errors(page)
-    _login(page, backend_url, auth_token)
-
-    result = page.evaluate(
-        """async () => {
-          const app = document.querySelector("#app")._x_dataStack[0];
-          app._fetchTabUsage = async () => {};
-          app._scheduleIdlePreload = () => {};
-
-          // _fetchOlderWindow must not call any state-creating/key helper after
-          // its captured tab state was replaced while response JSON awaited.
-          const fetchSid = "render-key-stale-fetch";
-          const oldFetchState = app._ensureTabState(fetchSid);
-          oldFetchState._loadedOffset = 1;
-          oldFetchState._total = 1;
-          oldFetchState.historyGeneration = "old-generation";
-          let resolveJson;
-          const realFetch = window.fetch;
-          window.fetch = async () => ({
-            ok: true, status: 200,
-            json: () => new Promise(resolve => { resolveJson = resolve; }),
-          });
-          const fetchPromise = app._fetchOlderWindow(fetchSid);
-          while (!resolveJson) await Promise.resolve();
-          const freshFetchState = app._blankTabState();
-          freshFetchState._sid = fetchSid;
-          app.tabState[fetchSid] = freshFetchState;
-          resolveJson({
-            messages: [{role: "user", text: "stale", uuid: "stale-fetch"}],
-            offset: 0, total: 1, history_generation: "new-generation",
-          });
-          const fetched = await fetchPromise;
-          window.fetch = realFetch;
-
-          // loadEarlierMessages detaches before chunked rendering. Replacing the
-          // state during that yield must leave both the orphan and fresh state
-          // untouched by the eventual continuation.
-          const staleSid = "render-key-stale-earlier";
-          const staleState = app._ensureTabState(staleSid);
-          staleState._loaded = true;
-          staleState._earlierMessages = Array.from({length: 81}, (_, i) => ({
-            role: "assistant", text: `stale earlier ${i}`,
-            _k: `${staleSid}:hist:${i}`,
-          }));
-          app._rebuildPaneMessageRenderKeys(staleSid);
-          app.currentId = staleSid;
-          app.messages = staleState.messages;
-          const realRaf = window.requestAnimationFrame;
-          let staleRaf;
-          window.requestAnimationFrame = callback => { staleRaf = callback; return 1; };
-          const stalePromise = app.loadEarlierMessages(staleSid);
-          while (!staleRaf) await Promise.resolve();
-          const freshEarlierState = app._blankTabState();
-          freshEarlierState._sid = staleSid;
-          app.tabState[staleSid] = freshEarlierState;
-          window.requestAnimationFrame = realRaf;
-          staleRaf();
-          await stalePromise;
-
-          // In the owned-state case, inject a colliding object while the batch is
-          // detached. Reinsertion must run the normalization boundary again.
-          const reclaimSid = "render-key-reclaim-earlier";
-          const reclaimState = app._ensureTabState(reclaimSid);
-          reclaimState._loaded = true;
-          const detached = Array.from({length: 81}, (_, i) => ({
-            role: "assistant", text: `owned earlier ${i}`,
-            _k: `${reclaimSid}:hist:${i}`,
-          }));
-          reclaimState._earlierMessages = detached.slice();
-          app._rebuildPaneMessageRenderKeys(reclaimSid);
-          app.currentId = reclaimSid;
-          app.messages = reclaimState.messages;
-          let reclaimRaf;
-          window.requestAnimationFrame = callback => { reclaimRaf = callback; return 2; };
-          const reclaimPromise = app.loadEarlierMessages(reclaimSid);
-          while (!reclaimRaf) await Promise.resolve();
-          const intruder = {
-            role: "tool_result", text: "intruder", _k: detached[1]._k,
-          };
-          reclaimState.messages.push(intruder);
-          app._markPaneRenderKeysDirty(reclaimState);
-          app._ensurePaneMessageRenderKeys(reclaimSid);
-          // Only the first frame is intercepted so the collision can be injected.
-          // Restore the real scheduler before releasing it; the remaining batch
-          // needs several 16-message frame callbacks to finish.
-          window.requestAnimationFrame = realRaf;
-          reclaimRaf();
-          await reclaimPromise;
-          const reclaimKeys = reclaimState.messages.map(message => message._k);
-
-          return {
-            fetched,
-            freshFetchMessages: freshFetchState.messages.length,
-            freshFetchOwners: freshFetchState._renderKeyOwners.size,
-            oldFetchEarlier: oldFetchState._earlierMessages.length,
-            staleOldMessages: staleState.messages.length,
-            staleFreshMessages: freshEarlierState.messages.length,
-            reclaimCount: reclaimState.messages.length,
-            reclaimExpectedCount: Math.min(detached.length, app.LOAD_MORE_BATCH) + 1,
-            reclaimUnique: new Set(reclaimKeys).size,
-            collisionResolved: intruder._k !== detached[1]._k,
-            detachedOwned: Alpine.raw(
-              reclaimState._renderKeyOwners.get(detached[1]._k)) === detached[1],
-          };
-        }"""
-    )
-
-    expected_reclaim_count = result.pop("reclaimExpectedCount")
-    assert result == {
-        "fetched": 0,
-        "freshFetchMessages": 0,
-        "freshFetchOwners": 0,
-        "oldFetchEarlier": 0,
-        "staleOldMessages": 0,
-        "staleFreshMessages": 0,
-        "reclaimCount": expected_reclaim_count,
-        "reclaimUnique": expected_reclaim_count,
-        "collisionResolved": True,
-        "detachedOwned": True,
-    }
+    assert result["keys"] == [
+        "stable-render-identity:block:record-1:0:user",
+        "stable-render-identity:block:record-2:0:assistant",
+        "stable-render-identity:block:record-2:1:tool_result",
+    ]
+    assert result["sameObjects"] is True
+    assert result["domKeys"] == result["keys"]
+    assert len(result["liveKeys"]) == len(set(result["liveKeys"])) == 25
+    assert all(":live:" in key for key in result["liveKeys"])
+    assert result["normalizedCount"] == 3
+    assert result["paneCount"] == 1
+    assert result["telemetryBuffer"] == "undefined"
+    assert result["telemetryReporter"] == "undefined"
     _assert_no_browser_errors(page, errors)
 
 
@@ -4622,7 +4319,6 @@ def test_canonical_reload_stays_quiet_when_background_tab_becomes_current(
         targetState.messagesReady = true;
         targetState.messagesLoading = false;
         app.currentId = other;
-        app._residentTabIds = [other, target];
         app.mobileTab = "chat";
         app._activateTabState(other);
         return new Promise(resolve => app.$nextTick(() => requestAnimationFrame(resolve)));
@@ -4907,12 +4603,10 @@ def test_background_task_gap_leaves_composer_usable_without_empty_reconnect(
         app.openTabIds = [arg];
         app.tabState = {};
         app.currentId = arg;
-        app._residentTabIds = [arg];
         app.mobileTab = "chat";
         app.messagesReady = true;
         app.messagesLoading = false;
         app._activateTabState(arg);
-        app._promoteResident(arg);
         return true;
         """,
         sid,
@@ -5282,7 +4976,6 @@ def test_background_completion_no_active_fallback_never_blanks_visible_messages(
           },
         );
         app.currentId = sid;
-        app._residentTabIds = [sid];
         app.mobileTab = "chat";
         app._activateTabState(sid);
         app.messagesReady = true;
@@ -5893,7 +5586,6 @@ def test_120kb_mixed_sse_stream_renders_final_assistant_html(
         app.tabState = {};
         app.tabState[sid] = app._blankTabState();
         app.currentId = sid;
-        app._residentTabIds = [sid];
         app._activateTabState(sid);
         app.messagesReady = true;
         app.messagesLoading = false;

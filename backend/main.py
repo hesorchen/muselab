@@ -1152,8 +1152,6 @@ _CLIENT_ERR_KINDS = frozenset({
     "error",
     "unhandledrejection",
     "resource",
-    "message_render_key",
-    "frontend_diagnostic",
 })
 _CLIENT_ERR_NAMES = frozenset({
     "AbortError", "AggregateError", "DataError", "Error", "EvalError",
@@ -1168,7 +1166,6 @@ _CLIENT_ERR_METHODS = frozenset({
 _CLIENT_ERR_RESOURCE_TAGS = frozenset({
     "AUDIO", "IFRAME", "IMG", "LINK", "SCRIPT", "SOURCE", "VIDEO",
 })
-_CLIENT_ERR_ISSUES = frozenset({"duplicate", "missing"})
 
 
 def _client_err_allow(ip: str) -> bool:
@@ -1215,30 +1212,6 @@ def _safe_client_error_record(payload: object) -> dict[str, object] | None:
     kind = payload.get("kind")
     if not isinstance(kind, str) or kind not in _CLIENT_ERR_KINDS:
         return None
-
-    if kind in {"message_render_key", "frontend_diagnostic"}:
-        counts = {issue: 0 for issue in _CLIENT_ERR_ISSUES}
-        issues = payload.get("issues")
-        if not isinstance(issues, list):
-            return None
-        for item in issues[:32]:
-            if not isinstance(item, dict):
-                continue
-            issue = item.get("issue")
-            count = item.get("count")
-            if (issue in _CLIENT_ERR_ISSUES
-                    and isinstance(count, int) and not isinstance(count, bool)
-                    and count > 0):
-                counts[issue] = min(100_000, counts[issue] + count)
-        if not any(counts.values()):
-            return None
-        # Deliberately omit pane/session/message keys.  The aggregate is enough
-        # to detect a reconciliation regression without retaining user state.
-        return {
-            "kind": kind,
-            "duplicate_count": counts["duplicate"],
-            "missing_count": counts["missing"],
-        }
 
     raw_name = payload.get("name")
     error_name = (
@@ -1328,10 +1301,7 @@ async def client_error_log(request: Request) -> dict:
             {"ok": False, "error": "invalid_payload"}, status_code=422)
     encoded = json.dumps(
         safe_record, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
-    if safe_record["kind"] in {"message_render_key", "frontend_diagnostic"}:
-        _CLIENT_ERROR_LOG.warning("browser diagnostic %s", encoded)
-    else:
-        _CLIENT_ERROR_LOG.error("browser error %s", encoded)
+    _CLIENT_ERROR_LOG.error("browser error %s", encoded)
     return {"ok": True}
 
 

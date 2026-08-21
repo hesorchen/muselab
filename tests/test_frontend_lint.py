@@ -2626,66 +2626,46 @@ def test_large_history_bodies_load_by_stable_block_reference():
     assert "Load full body" not in html
 
 
-def test_render_key_hot_paths_use_pane_index_without_full_scans_or_transport_duplication():
+def test_message_keys_use_stable_identity_without_repair_or_telemetry():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
 
-    append_start = app.index("    _appendLiveMessage(st, m) {")
+    history_start = app.index("    _historyMessageKey(sid, m) {")
+    history_end = app.index("    _syncSessionMessageStore(st) {", history_start)
+    history = app[history_start:history_end]
+    assert 'sid + ":block:" + m.block_id' in history
+    assert "const renderKeys = source.map" in history
+    assert "const uniqueKeys = new Set()" in history
+    assert "uniqueKeys.has(key)" in history
+    assert "message identity invariant violated" in history
+    assert "response-local suffix" in history
+    assert ":dup:" not in history
+
+    append_start = app.index("    _assignLiveKey(st, m) {")
     append_end = app.index("\n    // Retained as load/page sizing", append_start)
-    append_body = app[append_start:append_end]
-    assert "_assignLiveKey(st, m)" in append_body
-    assert "_allPaneMessages" not in append_body
-    assert "_rebuildPaneMessageRenderKeys" not in append_body
+    append = app[append_start:append_end]
+    assert '":live:" + st._nextLiveKey++' in append
+    assert "_renderKeyOwners" not in append
+    assert "_claimPaneMessageRenderKeys" not in append
 
-    activate_start = app.index("    _activateTabState(id) {")
-    activate_end = app.index("\n    // P1 (chat-perf-redesign)", activate_start)
-    activate_body = app[activate_start:activate_end]
-    assert "_ensurePaneMessageRenderKeys(id)" in activate_body
-    assert "_allPaneMessages" not in activate_body
-
-    capture_start = app.index("(function installErrorCapture() {")
-    capture_end = app.index("\n})();", capture_start)
-    capture = app[capture_start:capture_end]
-    assert capture.count('navigator.sendBeacon("/api/log/client-error"') == 1
-    assert capture.count('fetch("/api/log/client-error"') == 1
-    assert '_deliverClientErrorRecord(rec, telemetry, "[muse-telemetry]", "warn")' in capture
-    assert "const wireRecord = _clientErrorWireRecord(rec);" in capture
-    wire_helper = capture[
-        capture.index("function _clientErrorWireRecord"):
-        capture.index("function _deliverClientErrorRecord")
-    ]
-    for private_field in ("rec.message", "rec.stack", "rec.filename", "rec.url", "rec.ua"):
-        assert private_field not in wire_helper
+    for obsolete in (
+        "render-repair", "message_render_key", "frontend_diagnostic",
+        "__museTelemetry__", "__museReportTelemetry__",
+        "_renderKeyByObject", "_renderKeyOwners", "_renderKeyShape",
+        "_rebuildPaneMessageRenderKeys", "_ensurePaneMessageRenderKeys",
+        "_claimPaneMessageRenderKeys", "_releasePaneMessageRenderKeys",
+    ):
+        assert obsolete not in app
 
 
-def test_render_key_regression_boundaries_keep_state_and_owners_consistent():
+def test_message_identity_checks_only_incoming_batch_and_keeps_cold_replay_fallback():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
 
-    older_start = app.index("async _fetchOlderWindow(sid)")
-    older_end = app.index("async _fetchLaterWindow(sid)", older_start)
-    older = app[older_start:older_end]
-    assert older.index("const data = await r.json()") < older.index(
-        "if (this.tabState[sid] !== st) return 0")
-    assert older.index("if (this.tabState[sid] !== st) return 0") < older.index(
-        "this._historyEnvelopes")
-    assert older.index("if (this.tabState[sid] !== st) return 0") < older.index(
-        "this._ensurePaneMessageRenderKeys")
-
-    earlier_start = app.index("async loadEarlierMessages(sid)")
-    earlier_end = app.index("async loadLaterMessages(sid)", earlier_start)
-    earlier = app[earlier_start:earlier_end]
-    assert "await this._fetchOlderWindow(sid);\n        if (this.tabState[sid] !== st) return;" in earlier
-    assert "requestAnimationFrame(() => r()) : setTimeout(r, 0)));\n          if (this.tabState[sid] !== st) return;" in earlier
-    assert earlier.index("st.messages.unshift(...batch)") < earlier.index(
-        "this._ensurePaneMessageRenderKeys(sid)")
-    assert earlier.index("this._ensurePaneMessageRenderKeys(sid)") < earlier.index(
-        'this._capMountedWindow(st, "older")')
-
-    rebuild_start = app.index("_rebuildPaneMessageRenderKeys(tid, messages = null)")
-    rebuild_end = app.index("_ensurePaneMessageRenderKeys(tid)", rebuild_start)
-    rebuild = app[rebuild_start:rebuild_end]
-    assert "source.splice(i--, 1)" in rebuild
-    assert 'new Map([["duplicate", duplicateOccurrences]])' in rebuild
-    assert "occurrenceIssues" in rebuild
+    envelopes_start = app.index("    _historyEnvelopes(sid, list) {")
+    envelopes_end = app.index("    _syncSessionMessageStore(st) {", envelopes_start)
+    envelopes = app[envelopes_start:envelopes_end]
+    assert "source.map(m => this._historyMessageKey(sid, m))" in envelopes
+    assert "_allPaneMessages" not in envelopes
+    assert "source.splice" not in envelopes
 
     send_start = app.index("async send(opts = {})")
     send_end = app.index("async stop()", send_start)
@@ -2693,20 +2673,8 @@ def test_render_key_regression_boundaries_keep_state_and_owners_consistent():
     reconnect = send[send.index(
         "} else if (!isContinuation && resumeEventSeq === 0) {"):
         send.index("// (isContinuation:")]
-    assert "const removed = sendState.messages.splice(lastUserIdx + 1)" in reconnect
-    assert "this._releasePaneMessageRenderKeys(sendState" in reconnect
-
-    retry_start = app.index("retryFailedMessage(m)")
-    retry_end = app.index("onUserBubbleClick", retry_start)
-    assert "this._removePaneMessage(st, m)" in app[retry_start:retry_end]
-    edit_start = app.index("commitEditMessage(m)")
-    edit_end = app.index("_humanizeStreamError", edit_start)
-    assert "this._truncatePaneMessagesFrom(st, m)" in app[edit_start:edit_end]
-    truncate_start = app.index("_truncatePaneMessagesFrom(st, m)")
-    truncate_end = app.index("_appendLiveMessage(st, m)", truncate_start)
-    truncate = app[truncate_start:truncate_end]
-    assert "st._hasServerLater = false" in truncate
-    assert "this._releasePaneMessageRenderKeys(st" in truncate
+    assert "sendState.messages.splice(lastUserIdx + 1)" in reconnect
+    assert "_releasePaneMessageRenderKeys" not in reconnect
 
 
 def test_render_key_owned_arrays_mutate_only_at_audited_boundaries():
@@ -2748,22 +2716,18 @@ def test_render_key_owned_arrays_mutate_only_at_audited_boundaries():
     }
 
 
-def test_render_key_telemetry_has_one_disposable_trailing_flush():
+def test_error_capture_has_no_render_repair_telemetry_channel():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
-    report_start = app.index("_flushPaneRenderKeyTelemetry(tid, st)")
-    report_end = app.index("_nextPaneRenderRepairKey", report_start)
-    report = app[report_start:report_end]
-    dispose_start = app.index("_disposeTabRuntime(id)")
-    dispose_end = app.index("async removeWorkspace", dispose_start)
-    dispose = app[dispose_start:dispose_end]
+    capture_start = app.index("(function installErrorCapture() {")
+    capture_end = app.index("\n})();", capture_start)
+    capture = app[capture_start:capture_end]
 
-    assert "flushTimer: null" in app
-    assert "|| telemetry.flushTimer) return" in report
-    assert "telemetry.flushTimer = setTimeout(() =>" in report
-    assert "if (this.tabState[tid] !== st) return" in report
-    assert "this._flushPaneRenderKeyTelemetry(tid, st)" in report
-    assert "clearTimeout(st._renderKeyTelemetry.flushTimer)" in dispose
-    assert "st._renderKeyTelemetry.flushTimer = null" in dispose
+    assert capture.count('navigator.sendBeacon("/api/log/client-error"') == 1
+    assert capture.count('fetch("/api/log/client-error"') == 1
+    assert "message_render_key" not in capture
+    assert "frontend_diagnostic" not in capture
+    assert "__museReportTelemetry__" not in capture
+    assert "__museTelemetry__" not in capture
 
 
 def test_done_immediately_stamps_tool_tail_and_quietly_adopts_fork_boundary():
@@ -2947,13 +2911,12 @@ def test_long_chat_state_is_per_tab_bounded_and_generation_safe():
     assert "_laterMessages: []" in blank
     assert "_nextLiveKey: 1" in blank
     assert "_mountedMessageCap() { return this._isMobileLayout() ? 36 : 300; }" in app
-    assert "histLen >= Math.ceil(this._mountedMessageCap() / 2)" in app
     assert "_historyCacheCap() { return this._isMobileLayout() ? 120 : 800; }" in app
-    assert "const budget = this._isMobileLayout() ? 1 : this._MAX_RESIDENT_PANES" in app
-    assert "_MAX_RESIDENT_PANES: 4" in app
+    assert "_MAX_RESIDENT_PANES" not in app
+    assert "residentPaneIds" not in app
+    assert "_promoteResident" not in app
     assert "? (_coldEarly ? 8 : 15)" in app
     assert ": (_coldEarly ? 30 : 60)" in app
-    assert "&& histLen >= Math.ceil(this._mountedMessageCap() / 2)" in app
     assert "if (cst && cst.streaming) continue" not in app
     assert '"&history_generation="' in app
     assert "if (r.status === 409)" in app
@@ -2983,7 +2946,7 @@ def test_long_chat_state_is_per_tab_bounded_and_generation_safe():
     assert "< st._total" in newer
 
     virtual_start = app.index("_messageVirtualHeight(st, message)")
-    virtual_end = app.index("// [resident-panes]", virtual_start)
+    virtual_end = app.index("async initSessions(options = {})", virtual_start)
     virtual = app[virtual_start:virtual_end]
     assert "paneMessageRows(tid)" in virtual
     assert "_syncMessageViewport(tid = this.currentId" in virtual
@@ -3018,6 +2981,8 @@ def test_long_chat_state_is_per_tab_bounded_and_generation_safe():
     pane_start = html.index('<div class="msg-pane"')
     pane_end = html.index("<!-- /P1 per-tab message panes", pane_start)
     pane = html[pane_start:pane_end]
+    assert 'x-for="tid in (currentId ? [currentId] : [])"' in html
+    assert "residentPaneIds" not in html
     assert ':data-tid="tid"' in pane
     assert 'x-for="row in paneRows" :key="row.key"' in pane
     assert "paneMessageRows(tid)" in pane
