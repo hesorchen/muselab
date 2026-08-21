@@ -1090,6 +1090,30 @@ class ActivityService:
                 "successor": successor,
             }
 
+    def discard_session(self, sid: str) -> bool:
+        """Remove a provisional child's Activity projection transactionally."""
+        self.initialize_runtime_state()
+        target = str(sid or "").strip()
+        if not target:
+            return False
+        with self._lock:
+            has_assignment = target in self._group_assignments
+            has_event = any(
+                str(item.get("session_id") or item.get("thread_id") or "") == target
+                for item in self._events
+            )
+            if not has_assignment and not has_event:
+                return False
+            snapshot = self._group_event_snapshot_locked()
+            self._group_assignments.pop(target, None)
+            self._events = [
+                item for item in self._events
+                if str(item.get("session_id") or item.get("thread_id") or "") != target
+            ]
+            self._save_group_event_state_locked(snapshot)
+            self._publish_locked(resync=True)
+            return True
+
     def rename_session(self, sid: str, name: str) -> dict[str, Any] | None:
         """Update only the mutable display name for a conversation row.
 

@@ -770,6 +770,7 @@ def register_session(sid: str, *, name: str = "", model: str = "",
                      runtime_profile: str = "",
                      runtime_predecessor: str = "",
                      runtime_fork_boundary_at: str | datetime = "",
+                     runtime_shadow: bool = False,
                      cwd: str | Path | None = None) -> dict:
     """Add a session that already has a UUID (e.g. one minted by SDK
     fork_session) to the muselab index. Same shape as create_session
@@ -807,7 +808,11 @@ def register_session(sid: str, *, name: str = "", model: str = "",
         "activity_hidden": bool(activity_hidden),
         "runtime_profile": runtime_profile,
         "runtime_predecessor": str(runtime_predecessor or ""),
-        "runtime_shadow": False,
+        # Fork children stay absent from the public picker until every durable
+        # projection has committed. Successor publication clears this flag in
+        # the same index write that hides the source; ordinary forks clear it
+        # explicitly after their projections are complete.
+        "runtime_shadow": bool(runtime_shadow),
         "runtime_successor": "",
         "runtime_boundary_message_id": "",
         "runtime_fork_boundary_at": normalized_runtime_fork_boundary_at,
@@ -1167,8 +1172,22 @@ def set_runtime_background_boundary(sid: str, message_id: str) -> bool:
     return False
 
 
+def publish_fork_child(sid: str) -> bool:
+    """Make one fully projected ordinary fork visible, idempotently."""
+    with _INDEX_LOCK:
+        idx = _load_index()
+        child = next((row for row in idx if row.get("id") == sid), None)
+        if child is None:
+            return False
+        if not child.get("runtime_shadow"):
+            return True
+        child["runtime_shadow"] = False
+        _save_index(idx)
+        return True
+
+
 def link_runtime_successor(source_sid: str, successor_sid: str) -> bool:
-    """Atomically mark ``source`` as a hidden runtime owned by ``successor``."""
+    """Atomically publish ``successor`` and hide its replaced source runtime."""
     if not source_sid or not successor_sid or source_sid == successor_sid:
         return False
     with _INDEX_LOCK:

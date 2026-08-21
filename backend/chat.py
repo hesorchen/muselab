@@ -17,7 +17,7 @@ import urllib.parse
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Iterable, Literal, get_args
+from typing import Any, Callable, Iterable, Literal, get_args
 from fastapi import (
     APIRouter,
     BackgroundTasks,
@@ -10647,6 +10647,134 @@ def _context_recovery_inputs(
     return used, limit
 
 
+def _commit_fork_lifecycle(
+    source_sid: str,
+    source_meta: dict[str, Any],
+    *,
+    fork_child: Callable[[], Any] | None,
+    register_kwargs: dict[str, Any],
+    successor: bool,
+    copy_runtime_overlays: bool = False,
+) -> dict[str, Any]:
+    """Commit every MuseLab projection for one SDK transcript fork.
+
+    New children are registered as hidden provisional rows.  The source remains
+    visible until transcript UUIDs, annotations, queue state, task overlays and
+    Activity placement are durable; the final index write then either publishes
+    an ordinary fork or atomically links the successor while hiding its source.
+    A linked successor is also the retry key, so an interrupted caller can replay
+    every idempotent projection without creating another SDK fork.
+    """
+    from .activity import activity as _activity
+
+    existing_sid = (
+        str(source_meta.get("runtime_successor") or "") if successor else ""
+    )
+    reused = bool(existing_sid)
+    forked = None
+    child_sid = existing_sid
+    child_created = False
+    queue_projected = False
+    activity_projected = False
+    linked = False
+    try:
+        if not child_sid:
+            if fork_child is None:
+                raise ValueError("successor transcript is unavailable")
+            forked = fork_child()
+            child_sid = str(forked.session_id)
+            if not child_sid or child_sid == source_sid:
+                raise ValueError("fork returned an invalid child session")
+            child_created = True
+            child_meta = sess.register_session(
+                child_sid,
+                runtime_shadow=True,
+                **register_kwargs,
+            )
+        else:
+            child_meta = sess.get_session_meta(child_sid)
+            if child_meta is None:
+                raise ValueError("successor session is unavailable")
+
+        _JSONL_PATH_CACHE.pop(child_sid, None)
+        uuid_mapping = _runtime_fork_uuid_mapping(child_sid)
+        sess.copy_message_annotations(source_sid, child_sid, uuid_mapping)
+
+        if successor:
+            queue_move = sess.migrate_queue(source_sid, child_sid)
+            queue_projected = True
+        else:
+            queue_move = {
+                "migrated": 0,
+                "source": sess.get_queue(source_sid),
+                "target": sess.get_queue(child_sid),
+            }
+
+        if copy_runtime_overlays:
+            sess.copy_runtime_task_overlays(source_sid, child_sid)
+
+        if successor:
+            _activity.inherit_session(source_sid, child_sid, successor=True)
+        else:
+            _activity.inherit_session(source_sid, child_sid)
+        activity_projected = True
+
+        if successor:
+            def _link_if_source_live() -> bool:
+                with sess.session_lifecycle_lock(source_sid):
+                    if sess.session_is_deleting(source_sid):
+                        return False
+                    return sess.link_runtime_successor(source_sid, child_sid)
+
+            if not _link_if_source_live():
+                raise ValueError("successor link changed")
+            linked = True
+        elif not sess.publish_fork_child(child_sid):
+            raise ValueError("fork child disappeared before publication")
+
+        return {
+            "child_sid": child_sid,
+            "child_meta": sess.get_session_meta(child_sid) or child_meta,
+            "forked": forked,
+            "uuid_mapping": uuid_mapping,
+            "queue_move": queue_move,
+            "reused": reused,
+        }
+    except Exception:
+        if not child_created:
+            # A previously linked successor is already public durable state.
+            # Never tear it down because one repair projection is temporarily
+            # unavailable; the next retry must be able to continue filling it.
+            raise
+        if linked:
+            with suppress(Exception):
+                sess.unlink_runtime_successor(source_sid, child_sid)
+        if activity_projected:
+            if successor:
+                with suppress(Exception):
+                    _activity.inherit_session(
+                        child_sid, source_sid, successor=True)
+            else:
+                with suppress(Exception):
+                    _activity.discard_session(child_sid)
+        if queue_projected:
+            with suppress(Exception):
+                sess.migrate_queue(child_sid, source_sid)
+        try:
+            _purge_single_session_storage(child_sid)
+        except Exception:
+            sess.delete_session(child_sid)
+            with suppress(Exception):
+                sdk_delete_session(
+                    child_sid,
+                    directory=str(sess.session_workspace(source_sid)),
+                )
+            child_path = _find_session_jsonl(child_sid)
+            if child_path is not None:
+                child_path.unlink(missing_ok=True)
+        raise
+
+
 def _create_context_recovery_session(
     source_sid: str,
     model: str,
@@ -10671,7 +10799,7 @@ def _create_context_recovery_session(
     if source_meta is None:
         raise context_recovery.ContextRecoveryError("source session is unavailable")
     source_path = _find_session_jsonl(source_sid)
-    if source_path is None:
+    if source_path is None and not source_meta.get("runtime_successor"):
         raise context_recovery.ContextRecoveryError("source transcript is unavailable")
 
     source_model = (source_meta.get("model") or model or MODEL).strip()
@@ -10680,69 +10808,70 @@ def _create_context_recovery_session(
     recovery_name = f"{source_name} · {suffix}"
     workspace = sess.session_workspace(source_sid)
 
-    with _session_config_dir(source_model):
-        result = context_recovery.create_recovery_fork(
-            source_sid,
-            source_path,
-            workspace,
-            title=recovery_name,
-            pre_tokens=pre_tokens,
-            model_config_context=context_limit or None,
-        )
+    def _fork_recovery():
+        if source_path is None:
+            raise context_recovery.ContextRecoveryError(
+                "source transcript is unavailable")
+        with _session_config_dir(source_model):
+            return context_recovery.create_recovery_fork(
+                source_sid,
+                source_path,
+                workspace,
+                title=recovery_name,
+                pre_tokens=pre_tokens,
+                model_config_context=context_limit or None,
+            )
 
-    try:
-        meta = sess.register_session(
-            result.session_id,
-            name=recovery_name,
-            model=source_model,
-            permission=source_meta.get("permission") or "",
-            plan_return_permission=source_meta.get("plan_return_permission"),
-            auto_named=False,
-            # The active SDK chain contains the compact summary.  Full-history
+    lifecycle = _commit_fork_lifecycle(
+        source_sid,
+        source_meta,
+        fork_child=_fork_recovery,
+        register_kwargs={
+            "name": recovery_name,
+            "model": source_model,
+            "permission": source_meta.get("permission") or "",
+            "plan_return_permission": source_meta.get("plan_return_permission"),
+            "auto_named": False,
+            # The active SDK chain contains the compact summary. Full-history
             # mode can still read the copied records behind its boundary.
-            message_count=1,
-            turn_count=0,
-            effort=_normalize_effort(source_meta.get("effort")),
-            service_tier=source_meta.get("service_tier") or "",
-            thinking=source_meta.get("thinking") is not False,
-            forked_from=source_sid,
-            forked_from_name=source_name,
-            activity_hidden=bool(source_meta.get("activity_hidden", False)),
-            runtime_profile=source_meta.get("runtime_profile") or "",
-            cwd=source_meta.get("cwd") or str(workspace),
-        )
-        from .activity import activity as _activity
-        _activity.inherit_session(source_sid, result.session_id, successor=True)
-    except Exception:
-        # Session registration and Activity lineage are one published successor.
-        # The Activity journal rolls its own files back; remove every child
-        # artifact before surfacing failure so a retry starts from the source.
-        try:
-            _purge_single_session_storage(result.session_id)
-        except Exception:
-            try:
-                with _session_config_dir(source_model):
-                    sdk_delete_session(result.session_id, directory=str(workspace))
-            except Exception:
-                result.path.unlink(missing_ok=True)
-        raise
-
-    _JSONL_PATH_CACHE[result.session_id] = result.path
+            "message_count": 1,
+            "turn_count": 0,
+            "effort": _normalize_effort(source_meta.get("effort")),
+            "service_tier": source_meta.get("service_tier") or "",
+            "thinking": source_meta.get("thinking") is not False,
+            "forked_from": source_sid,
+            "forked_from_name": source_name,
+            "activity_hidden": bool(source_meta.get("activity_hidden", False)),
+            "runtime_profile": source_meta.get("runtime_profile") or "",
+            "runtime_predecessor": source_sid,
+            "cwd": source_meta.get("cwd") or str(workspace),
+        },
+        successor=True,
+    )
+    child_sid = str(lifecycle["child_sid"])
+    result = lifecycle.get("forked")
+    if result is not None:
+        _JSONL_PATH_CACHE[child_sid] = result.path
     if context_limit:
         try:
-            sess.set_session_ctx_window(result.session_id, context_limit)
+            sess.set_session_ctx_window(child_sid, context_limit)
         except Exception:
             pass
-    _session_usage[result.session_id] = {
+    estimated_post_tokens = (
+        result.stats.estimated_post_tokens
+        if result is not None else int(
+            (_session_usage.get(child_sid) or {}).get("context_used") or 0)
+    )
+    _session_usage[child_sid] = {
         "input_tokens": 0,
         "output_tokens": 0,
         "cache_read_tokens": 0,
         "cache_creation_tokens": 0,
         "total_cost_usd": 0.0,
         "last_turn_at": 0.0,
-        "context_used": result.stats.estimated_post_tokens,
+        "context_used": estimated_post_tokens,
         "context_used_pct": (
-            round(result.stats.estimated_post_tokens / context_limit * 100, 1)
+            round(estimated_post_tokens / context_limit * 100, 1)
             if context_limit else 0.0
         ),
         "context_limit": context_limit,
@@ -10750,16 +10879,22 @@ def _create_context_recovery_session(
         "context_used_is_estimate": True,
         "context_is_estimate": True,
     }
-    public_meta = {**meta, "session_id": result.session_id}
-    return {
-        "session": public_meta,
-        "stats": {
+    public_meta = {**lifecycle["child_meta"], "session_id": child_sid}
+    stats = (
+        {
             "included_messages": result.stats.included_messages,
             "omitted_messages": result.stats.omitted_messages,
             "truncated_messages": result.stats.truncated_messages,
-            "estimated_post_tokens": result.stats.estimated_post_tokens,
-        },
-    }
+            "estimated_post_tokens": estimated_post_tokens,
+        }
+        if result is not None else {
+            "included_messages": 0,
+            "omitted_messages": 0,
+            "truncated_messages": 0,
+            "estimated_post_tokens": estimated_post_tokens,
+        }
+    )
+    return {"session": public_meta, "stats": stats}
 
 
 async def _recover_context_session(
@@ -11341,69 +11476,53 @@ def fork_session_api(sid: str, req: ForkReq) -> dict:
         if req.up_to_message_id
         else int(src_meta.get("turn_count") or 0)
     )
-    try:
+    def _fork_explicit():
         with _session_config_dir(source_model):
-            result = sdk_fork_session(
+            return sdk_fork_session(
                 sid,
                 directory=str(sess.session_workspace(sid)),
                 up_to_message_id=req.up_to_message_id,
                 title=new_name,
             )
-    except FileNotFoundError:
-        raise HTTPException(404, "source transcript not found")
-    except ValueError as e:
-        raise HTTPException(400, str(e))
-    except Exception as e:
-        sys.stderr.write(
-            f"[chat] fork session failed sid={sid[:8]} "
-            f"exc={type(e).__name__}\n")
-        sys.stderr.flush()
-        raise HTTPException(500, "fork failed — see server log") from None
-    new_sid = result.session_id
+
     try:
-        meta = sess.register_session(
-            new_sid,
-            name=new_name,
-            model=src_meta.get("model") or MODEL,
-            permission=src_meta.get("permission") or "",
-            plan_return_permission=src_meta.get("plan_return_permission"),
-            auto_named=False,
-            message_count=forked_count,
-            turn_count=forked_turns,
-            effort=_normalize_effort(src_meta.get("effort")),
-            service_tier=src_meta.get("service_tier") or "",
-            thinking=src_meta.get("thinking") is not False,
-            forked_from=sid,
-            forked_from_name=source_name,
-            forked_from_message_id=req.up_to_message_id or "",
-            activity_hidden=req.activity_hidden,
-            runtime_profile=req.runtime_profile,
-            cwd=src_meta.get("cwd") or str(ROOT),
+        lifecycle = _commit_fork_lifecycle(
+            sid,
+            src_meta,
+            fork_child=_fork_explicit,
+            register_kwargs={
+                "name": new_name,
+                "model": src_meta.get("model") or MODEL,
+                "permission": src_meta.get("permission") or "",
+                "plan_return_permission": src_meta.get("plan_return_permission"),
+                "auto_named": False,
+                "message_count": forked_count,
+                "turn_count": forked_turns,
+                "effort": _normalize_effort(src_meta.get("effort")),
+                "service_tier": src_meta.get("service_tier") or "",
+                "thinking": src_meta.get("thinking") is not False,
+                "forked_from": sid,
+                "forked_from_name": source_name,
+                "forked_from_message_id": req.up_to_message_id or "",
+                "activity_hidden": req.activity_hidden,
+                "runtime_profile": req.runtime_profile,
+                "cwd": src_meta.get("cwd") or str(ROOT),
+            },
+            successor=False,
         )
-        from .activity import activity as _activity
-        _activity.inherit_session(sid, new_sid)
+    except FileNotFoundError:
+        raise HTTPException(404, "source transcript not found") from None
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from None
     except Exception as exc:
-        try:
-            _purge_single_session_storage(new_sid)
-        except Exception:
-            sess.delete_session(new_sid)
-            try:
-                with _session_config_dir(source_model):
-                    sdk_delete_session(
-                        new_sid,
-                        directory=str(sess.session_workspace(sid)),
-                    )
-            except Exception:
-                child_path = _find_session_jsonl(new_sid)
-                if child_path is not None:
-                    child_path.unlink(missing_ok=True)
         sys.stderr.write(
             f"[chat] fork commit failed sid={sid[:8]} "
-            f"child={new_sid[:8]} exc={type(exc).__name__}\n")
+            f"exc={type(exc).__name__}\n")
         sys.stderr.flush()
         raise HTTPException(500, "fork failed — see server log") from None
+    new_sid = str(lifecycle["child_sid"])
     return {
-        **meta,
+        **lifecycle["child_meta"],
         "session_id": new_sid,
         "source_background_tasks_pending": background_tasks_pending,
     }
@@ -11585,18 +11704,24 @@ async def _continue_detached_runtime_locked(source_sid: str) -> dict:
         raise HTTPException(409, "session is being deleted")
     existing_sid = str(source_meta.get("runtime_successor") or "")
     if existing_sid:
-        # Idempotent retries also self-heal a successor created in the
-        # canonical-done/postlude window (or by an older process version).
-        await asyncio.to_thread(
-            _sync_runtime_successor_postlude, source_sid)
-        child_meta = await asyncio.to_thread(sess.get_session_meta, existing_sid)
-        if child_meta is None:
-            raise HTTPException(409, "runtime successor is unavailable")
+        # Replay the complete projection sequence, not only the queue. This
+        # repairs successors committed by an older process or interrupted after
+        # their final link without minting a second transcript fork.
         try:
-            queue_move = await asyncio.to_thread(
-                sess.migrate_queue, source_sid, existing_sid)
+            lifecycle = await asyncio.to_thread(
+                _commit_fork_lifecycle,
+                source_sid,
+                source_meta,
+                fork_child=None,
+                register_kwargs={},
+                successor=True,
+                copy_runtime_overlays=True,
+            )
         except ValueError as exc:
             raise HTTPException(409, str(exc)) from None
+        await asyncio.to_thread(_sync_runtime_successor_postlude, source_sid)
+        child_meta = lifecycle["child_meta"]
+        queue_move = lifecycle["queue_move"]
         if queue_move["target"].get("items"):
             _schedule_queue_drain(existing_sid)
         inherited_overlays = await asyncio.to_thread(
@@ -11642,146 +11767,79 @@ async def _continue_detached_runtime_locked(source_sid: str) -> dict:
         raise HTTPException(409, "session is being deleted")
     source_model = str(source_meta.get("model") or MODEL).strip()
     source_name = str(source_meta.get("name") or "会话").strip()
+    register_kwargs: dict[str, Any] = {
+        "name": source_name,
+        "model": source_model,
+        "permission": source_meta.get("permission") or "",
+        "plan_return_permission": source_meta.get("plan_return_permission"),
+        "auto_named": False,
+        "message_count": int(source_meta.get("message_count") or 0),
+        "turn_count": int(source_meta.get("turn_count") or 0),
+        "effort": _normalize_effort(source_meta.get("effort")),
+        "service_tier": source_meta.get("service_tier") or "",
+        "thinking": source_meta.get("thinking") is not False,
+        "forked_from": source_sid,
+        "forked_from_name": source_name,
+        "forked_from_message_id": boundary,
+        "activity_hidden": bool(source_meta.get("activity_hidden", False)),
+        "runtime_profile": source_meta.get("runtime_profile") or "",
+        "runtime_predecessor": source_sid,
+        "cwd": source_meta.get("cwd") or str(ROOT),
+    }
+
+    def _fork_runtime():
+        if sess.session_is_deleting(source_sid):
+            raise ValueError("source session is being deleted")
+        with _session_config_dir(source_model):
+            forked = sdk_fork_session(
+                source_sid,
+                directory=str(sess.session_workspace(source_sid)),
+                up_to_message_id=boundary,
+                title=source_name,
+            )
+        # The SDK rewrites the copied tail timestamp. Sampling immediately after
+        # the fork gives a stable boundary outside all inherited history.
+        register_kwargs["runtime_fork_boundary_at"] = (
+            datetime.now(UTC).isoformat().replace("+00:00", "Z")
+        )
+        return forked
+
     try:
-        def _fork_runtime():
-            with _session_config_dir(source_model):
-                return sdk_fork_session(
-                    source_sid,
-                    directory=str(sess.session_workspace(source_sid)),
-                    up_to_message_id=boundary,
-                    title=source_name,
-                )
-        forked = await asyncio.to_thread(_fork_runtime)
-        # Keep the marker fixed for this successor. The SDK rewrites the last
-        # copied record's timestamp during the fork; sampling immediately
-        # afterwards is therefore strictly outside the inherited history.
-        runtime_fork_boundary_at = datetime.now(UTC).isoformat().replace(
-            "+00:00", "Z")
+        lifecycle = await asyncio.to_thread(
+            _commit_fork_lifecycle,
+            source_sid,
+            source_meta,
+            fork_child=_fork_runtime,
+            register_kwargs=register_kwargs,
+            successor=True,
+            copy_runtime_overlays=True,
+        )
     except FileNotFoundError:
         raise HTTPException(404, "source transcript not found") from None
-    except ValueError as exc:
-        raise HTTPException(409, str(exc)) from None
+    except ValueError:
+        raise HTTPException(409, "runtime rollover could not commit") from None
     except Exception as exc:
         sys.stderr.write(
             f"[chat] detached runtime fork failed sid={source_sid[:8]} "
             f"exc={type(exc).__name__}\n"
         )
-        raise HTTPException(500, "runtime rollover failed") from None
+        raise HTTPException(500, "runtime rollover could not commit") from None
 
-    child_sid = str(forked.session_id)
-    linked = False
+    child_sid = str(lifecycle["child_sid"])
+    child_meta = lifecycle["child_meta"]
+    queue_move = lifecycle["queue_move"]
+    # Close the settle/link race and the complementary done/postlude race. The
+    # successor is already committed, so a transient reconciliation write must
+    # remain retryable rather than turning a successful publication into 500.
     try:
-        # sdk_fork_session runs in a worker and cannot be cancelled midway.
-        # DELETE may fence the source while that worker is copying JSONL; in
-        # that case register only inside this rollback-owned block, then remove
-        # every child artifact instead of publishing an orphan successor.
-        if sess.session_is_deleting(source_sid):
-            raise ValueError("source session is being deleted")
-        child_meta = await asyncio.to_thread(
-            sess.register_session,
-            child_sid,
-            name=source_name,
-            model=source_model,
-            permission=source_meta.get("permission") or "",
-            plan_return_permission=source_meta.get("plan_return_permission"),
-            auto_named=False,
-            message_count=int(source_meta.get("message_count") or 0),
-            turn_count=int(source_meta.get("turn_count") or 0),
-            effort=_normalize_effort(source_meta.get("effort")),
-            service_tier=source_meta.get("service_tier") or "",
-            thinking=source_meta.get("thinking") is not False,
-            forked_from=source_sid,
-            forked_from_name=source_name,
-            forked_from_message_id=boundary,
-            activity_hidden=bool(source_meta.get("activity_hidden", False)),
-            runtime_profile=source_meta.get("runtime_profile") or "",
-            runtime_predecessor=source_sid,
-            runtime_fork_boundary_at=runtime_fork_boundary_at,
-            cwd=source_meta.get("cwd") or str(ROOT),
-        )
-        _JSONL_PATH_CACHE.pop(child_sid, None)
-        uuid_mapping = await asyncio.to_thread(
-            _runtime_fork_uuid_mapping, child_sid)
-        await asyncio.to_thread(
-            sess.copy_message_annotations,
-            source_sid, child_sid, uuid_mapping)
         await asyncio.to_thread(
             sess.copy_runtime_task_overlays, source_sid, child_sid)
-        # Move accepted work before hiding the source. If this fails, no
-        # public session identity has changed yet and rollback is trivial.
-        queue_move = await asyncio.to_thread(
-            sess.migrate_queue, source_sid, child_sid)
-
-        def _link_if_source_live() -> bool:
-            # Linearize the final public link with begin_session_delete(). If
-            # deletion wins, rollback below removes the unlinked child; if the
-            # link wins, the delete path re-reads the successor after fencing.
-            with sess.session_lifecycle_lock(source_sid):
-                if sess.session_is_deleting(source_sid):
-                    return False
-                return sess.link_runtime_successor(source_sid, child_sid)
-
-        if not await asyncio.to_thread(_link_if_source_live):
-            raise ValueError("runtime successor changed")
-        linked = True
-        # Close the settle/link race: anything written to source just before
-        # the durable link is copied once more; later terminal patches
-        # propagate via _runtime_task_overlay's successor lookup.
-        await asyncio.to_thread(
-            sess.copy_runtime_task_overlays, source_sid, child_sid)
-        # Close the complementary done/postlude race.  If the source pump
-        # finished its late metadata before this link became visible, its
-        # own reconciliation could not discover the child; running it once
-        # after the durable link observes those already-finished writes.
-        await asyncio.to_thread(
-            _sync_runtime_successor_postlude, source_sid)
-        # Best-effort: carry the source's activity-group lane onto the fork so
-        # a runtime rollover stays invisible instead of surfacing a new
-        # ungrouped row.  A failure here must not abort the fork.
-        try:
-            from .activity import activity as _activity
-            await asyncio.to_thread(
-                _activity.migrate_group_to_successor, source_sid, child_sid)
-        except Exception as _exc:
-            sys.stderr.write(
-                f"[activity] group migrate failed src={source_sid[:8]} "
-                f"dst={child_sid[:8]} exc={type(_exc).__name__}\n")
     except Exception as exc:
-        if linked:
-            await asyncio.to_thread(
-                sess.unlink_runtime_successor, source_sid, child_sid)
-        with suppress(Exception):
-            await asyncio.to_thread(
-                sess.migrate_queue, child_sid, source_sid)
-        try:
-            # The child may already contain copied annotations, task overlays,
-            # transcript index and presentation-only continuation snapshots.
-            # Rollback must use the same complete disk purge as DELETE, not just
-            # remove its session row and SDK JSONL.
-            await asyncio.to_thread(_purge_single_session_storage, child_sid)
-        except Exception:
-            # Preserve the original rollover error, but still make a best-effort
-            # privacy sweep if an unexpected purge implementation fails.
-            await asyncio.to_thread(sess.delete_session, child_sid)
-            await asyncio.to_thread(
-                _delete_cancelled_turn_snapshots, child_sid)
-            await asyncio.to_thread(
-                _delete_runtime_continuation_outboxes, child_sid)
-            await asyncio.to_thread(_delete_active_turn_sidecar, child_sid)
-            with suppress(OSError):
-                _transcript_index_path(child_sid).unlink(missing_ok=True)
-            try:
-                with _session_config_dir(source_model):
-                    sdk_delete_session(
-                        child_sid,
-                        directory=str(sess.session_workspace(source_sid)),
-                    )
-            except Exception:
-                child_path = _find_session_jsonl(child_sid)
-                if child_path is not None:
-                    child_path.unlink(missing_ok=True)
-        status = 409 if isinstance(exc, ValueError) else 500
-        raise HTTPException(status, "runtime rollover could not commit") from None
+        sys.stderr.write(
+            f"[chat] runtime overlay post-link sync failed "
+            f"sid={source_sid[:8]} child={child_sid[:8]} "
+            f"exc={type(exc).__name__}\n")
+    await asyncio.to_thread(_sync_runtime_successor_postlude, source_sid)
     if queue_move["target"].get("items"):
         _schedule_queue_drain(child_sid)
     public_child = (
