@@ -872,7 +872,8 @@ def test_chat_refresh_and_stats_requests_run_concurrently():
     assert "st._seenUpdated = Math.max" not in reconcile
     assert "const stillBehind" in reconcile
     assert "st._pendingExternalUpdate = true" in reconcile
-    assert "st._reconcileRetryTimer = setTimeout" in reconcile
+    assert 'this._requestSessionSync(sid, "history_revision"' in reconcile
+    assert "delayMs: Math.min(2000, 250 * (retries + 1))" in reconcile
 
 
 def test_session_history_and_workspace_use_distinct_icons():
@@ -1029,6 +1030,88 @@ def test_session_poll_and_revision_reconciliation_are_resilient():
     assert "this._sessionsInitialized = true" in app
 
 
+def test_session_synchronization_has_one_per_tab_coordinator():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    state_start = app.index("sessionSync: {")
+    state = app[state_start:app.index("_backgroundHandoffPromise", state_start)]
+    coordinator_start = app.index("_requestSessionSync(sid, reason, options = {})")
+    coordinator_end = app.index("// ===== Per-session message queue", coordinator_start)
+    coordinator = app[coordinator_start:coordinator_end]
+
+    for field in (
+        "pending: Object.create(null)", "timer: null", "inFlight: null",
+        "epoch: 0", "backgroundTicksLeft: 0", "inheritedTicksLeft: 0",
+        'inheritedSourceSid: ""', "canonicalStartedAt: 0",
+    ):
+        assert field in state
+    assert "if (sync.inFlight) return" in coordinator
+    assert "sync.inFlight = { reason: request.reason, task }" in coordinator
+    assert "delete sync.pending[request.reason]" in coordinator
+    assert "this._scheduleSessionSync(sid, st)" in coordinator
+    for reason in (
+        "active_probe", "busy_probe", "queue_attach",
+        "background_continuation", "inherited_tasks", "history_revision",
+        "completed_turn", "stream_health", "transport_retry",
+        "canonical_replay", "history_load",
+    ):
+        assert f'case "{reason}":' in coordinator
+
+    assert '_requestSessionSync(sid, "active_probe")' in app
+    assert '_requestSessionSync(sid, "queue_attach"' in app
+    assert '_requestSessionSync(sid, "background_continuation"' in app
+    assert '_requestSessionSync(childSid, "inherited_tasks"' in app
+    assert '_requestSessionSync(sid, "history_revision"' in app
+    assert '_requestSessionSync(sid, "completed_turn"' in app
+    assert '_requestSessionSync(sid, "stream_health"' in app
+    assert '_requestSessionSync(streamSid, "transport_retry"' in app
+    assert '_requestSessionSync(sid, "canonical_replay"' in app
+    assert '_requestSessionSync(sid, "history_load"' in app
+    assert "this._disposeSessionSync(st)" in app
+
+    for superseded in (
+        "_sessionLoadPromises", "_inheritedTaskPoller", "_bgContPollers",
+        "_reconcilePromise", "_reconcileRetryTimer", "_canonicalResyncTimer",
+        "_streamHealthProbe",
+    ):
+        assert superseded not in app
+    assert "setInterval(tick, 2000)" not in app
+
+
+def test_session_sync_transitions_preserve_canonical_and_view_ownership():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    inherited_start = app.index("async _pollInheritedTasks(")
+    inherited_end = app.index("// Poll /active + re-subscribe", inherited_start)
+    inherited = app[inherited_start:inherited_end]
+    background_start = app.index("async _pollBackgroundContinuation(")
+    background_end = app.index("_reconcileCompletedTurn(", background_start)
+    background = app[background_start:background_end]
+    revision_start = app.index("async _runHistoryRevisionSync(")
+    revision_end = app.index("// Field-level equality", revision_start)
+    revision = app[revision_start:revision_end]
+
+    assert "this.tabState[childSid] !== st" in inherited
+    assert "quiet: true, probeActive: false" in inherited
+    assert "st.runtimeUiRevision === desiredRevision" in inherited
+    assert 'delayMs: 2000' in inherited
+    assert "this.tabState[sid] !== st" in background
+    assert 'delayMs: 2000' in background
+    assert "st.messages.forEach" in background
+    assert "quiet: true, probeActive: false" in revision
+    assert "targetUpdated > seen" in revision
+    assert "delayMs: Math.min(2000, 250 * (retries + 1))" in revision
+
+    # Synchronization changes only the canonical per-tab repository. Keep the
+    # ordered messages + range model and composer ownership established earlier.
+    assert "st.messages.splice(0, st.messages.length, ...all)" in app
+    assert "Object.assign(st.messageRange" in app
+    assert "child.messages = cloneMessages(sourceState.messages)" in app
+    assert "child.messageRange = { ...sourceState.messageRange }" in app
+    assert "child.draft = {" in app
+    assert "child._composerSubmitToken = sourceState._composerSubmitToken" in app
+    assert "_earlierMessages" not in app
+    assert "_laterMessages" not in app
+
+
 def test_optimistic_session_is_registered_before_first_turn():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
     helper_start = app.index("_registerOptimisticSession(meta)")
@@ -1053,17 +1136,18 @@ def test_optimistic_session_is_registered_before_first_turn():
 
 def test_silent_stream_recovers_without_manual_refresh():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
-    start = app.index("async _recoverStalledStream(sid = this.currentId)")
-    end = app.index("\n    _retireStaleSessionStream", start)
+    start = app.index("_recoverStalledStream(sid = this.currentId)")
+    end = app.index("\n    _scheduleCanonicalStreamReload", start)
     recovery = app[start:end]
 
     assert "Date.now() - observedActivity < 18_000" in recovery
+    assert 'this._requestSessionSync(sid, "stream_health"' in recovery
     assert "d.events_so_far" in recovery
     assert "st._serverActiveObserved = true" in recovery
     assert "await this.send({" in recovery
     assert "reconnect: true" in recovery
     assert "this._retireStaleSessionStream(sid, st)" in recovery
-    assert "await this.loadSession(sid, { quiet: true })" in recovery
+    assert "quiet: true, probeActive: false" in recovery
     assert "this._recoverStalledStream(streamSid)" in app
 
 
@@ -1163,8 +1247,8 @@ def test_session_delete_confirms_once_and_disposes_browser_runtime():
     assert "const ownedEs = st.es" in dispose
     assert "st.es = null" in dispose
     assert "this.es === ownedEs" not in dispose
-    assert "this._stopBgContPoller(id)" in dispose
-    assert "delete this._sessionLoadPromises[id]" in dispose
+    assert "this._disposeSessionSync(st)" in dispose
+    assert "_sessionLoadPromises" not in dispose
     assert "delete this.tabState[id]" in dispose
 
 
@@ -2017,7 +2101,7 @@ def test_background_task_gap_rolls_foreground_onto_detached_successor():
     assert "st.compacting || st.backgroundActive || st._draining" in app
     assert "st.streaming || st.compacting || st.backgroundActive" in app
     assert "st._draining || (st.pendingQueue && st.pendingQueue.length)" in app
-    assert "if (status.background) return true;" in app
+    assert "return status.background ? true : active;" in app
     assert "async _handoffBackgroundSession(" in app
     assert "/continue-detached`" in app
     assert "_stateForDetachedSuccessor(" in app
@@ -2031,7 +2115,9 @@ def test_background_task_gap_rolls_foreground_onto_detached_successor():
     assert "background_tasks_pending" in app
     poller_start = app.index("    _ensureBgContPoller(sid) {")
     poller_end = app.index("\n    _stopBgContPoller(", poller_start)
-    assert "let ticksLeft = 1810;" in app[poller_start:poller_end]
+    poller = app[poller_start:poller_end]
+    assert "st.sessionSync.backgroundTicksLeft = 1810" in poller
+    assert 'this._requestSessionSync(sid, "background_continuation"' in poller
     assert "_stopTimer();" in app
     assert "_continuationAwaitingReaction: false" in app
     # The turn footer must key off a REAL streaming turn. It used to also
@@ -2082,24 +2168,21 @@ def test_inherited_task_poller_waits_for_durable_agent_projection():
     assert "st.runtimeUiRevision === desiredRevision" in poller
     assert "reported !== 0" in poller
     assert "status.active || st.streaming" not in poller
-    assert "if (st.streaming || st.es || st.compacting) return;" in poller
+    assert "if (st.streaming || st.es || st.compacting) { again(); return true; }" in poller
     assert "quiet: true, probeActive: false" in poller
     assert 'st.inheritedBackgroundTaskCount = 0' in poller
-    assert "if (stopped || inFlight) return;" in poller
-    assert "epoch !== tickEpoch" in poller
-    # Single-flight must not turn one half-open /active request into a
-    # permanently wedged poller. The owning tick aborts on the normal session
-    # request timeout and releases its controller in finally.
+    assert 'this._requestSessionSync(childSid, "inherited_tasks"' in poller
+    assert "sync.inheritedTicksLeft-- <= 0" in poller
+    # The shared coordinator is the single-flight owner. A half-open /active
+    # request still aborts on the normal session timeout before the next reason.
     assert "const controller = new AbortController();" in poller
     assert "Number(this._sessionListTimeoutMs) || 8000" in poller
     assert "signal: controller.signal" in poller
     assert "clearTimeout(timeout);" in poller
-    assert "activeController.abort()" in poller
-    # Every canonical adoption joins the existing per-session single-flight.
-    # A revision-changing terminal tick performs that merge once, not once for
-    # the bubble and immediately again for the completed task overlay.
-    assert "this._reloadSessionCoalesced(childSid" in poller
-    assert "this.loadSession(childSid" not in poller
+    # The handler is already inside the per-session coordinator, so canonical
+    # adoption calls loadSession directly instead of nesting another sync reason.
+    assert "this.loadSession(childSid" in poller
+    assert "this._reloadSessionCoalesced(childSid" not in poller
     assert "loadedCanonicalThisTick = true" in poller
     assert "adoptedRevision && !loadedCanonicalThisTick" in poller
     # Only a newly adopted durable reply marks an off-screen successor unread.
@@ -2113,8 +2196,8 @@ def test_inherited_task_poller_waits_for_durable_agent_projection():
     assert "message.runtime_event_id" in adoption
     assert "const hasNewRuntimeContinuation" in adoption
     assert adoption.index("continuationEventIdsBefore = new Set") < adoption.index(
-        "this._reloadSessionCoalesced(childSid")
-    assert adoption.index("this._reloadSessionCoalesced(childSid") < adoption.index(
+        "this.loadSession(childSid")
+    assert adoption.index("this.loadSession(childSid") < adoption.index(
         "const hasNewRuntimeContinuation")
     assert "revisionBeforeAdoption !== desiredRevision" in adoption
     assert "&& hasNewRuntimeContinuation" in adoption
@@ -2122,7 +2205,7 @@ def test_inherited_task_poller_waits_for_durable_agent_projection():
     assert "if (adoptedRevision" in adoption
     assert "st.unread = true;" in adoption
     assert poller.count("st.unread = true;") == 1
-    assert poller.index("if (continuationPending) return;") < poller.index(
+    assert poller.index("if (continuationPending) { again(); return true; }") < poller.index(
         'st.inheritedBackgroundTaskCount = 0')
 
     # task_notification is transport/card state only. A transient toast or an
@@ -2142,7 +2225,7 @@ def test_inherited_task_poller_waits_for_durable_agent_projection():
     # A reloaded successor never ran the live handoff initializer. Its normal
     # active probe must rebuild inherited ownership from durable session meta
     # and the overlay aggregate, then arm the same poller.
-    check_start = app.index("    async _checkActiveTurn(sid) {")
+    check_start = app.index("    async _probeActiveTurn(sid, st) {")
     check_end = app.index("\n    // Hover-prefetch", check_start)
     check = app[check_start:check_end]
     assert "d.runtime_background_tasks_pending" in check
@@ -2174,14 +2257,14 @@ def test_runtime_ui_revision_rejects_out_of_order_session_response():
     assert load.index(stale_guard) < load.index(
         "st.runtimeUiRevision = loadedRuntimeUiRevision")
 
-    # The session-list reconciler and inherited-task poller share the same
-    # coalescer, shrinking the remaining concurrency surface before the
-    # revision guard handles direct legacy callers.
+    # Session-list reconciliation enters the same per-session coordinator as
+    # inherited polling; its handler owns the one direct canonical load.
     reconcile_start = app.index("    _reconcileOpenSession(next) {")
     reconcile_end = app.index("\n    // Field-level equality", reconcile_start)
     reconcile = app[reconcile_start:reconcile_end]
-    assert "await this._reloadSessionCoalesced(" in reconcile
-    assert "await this.loadSession(sid, { quiet: true })" not in reconcile
+    assert 'this._requestSessionSync(sid, "history_revision"' in reconcile
+    assert "async _runHistoryRevisionSync(" in reconcile
+    assert "quiet: true, probeActive: false" in reconcile
 
 
 def test_runtime_continuation_history_identity_footer_and_fork_guards():
@@ -2528,12 +2611,12 @@ def test_active_stream_owns_messages_and_continuation_reconciles_canonical_histo
     # rendered pane and must never take the cold-load skeleton/clear path.
     no_active_start = send.index('if (serverError === "no active turn")')
     no_active_end = send.index("// ---- Transport-level", no_active_start)
-    assert "this.loadSession(streamSid, { quiet: true })" in send[
+    assert "this._reloadSessionCoalesced(streamSid, { quiet: true })" in send[
         no_active_start:no_active_end]
     transport_finished_start = send.index("if (!d.active)", no_active_end)
     transport_finished_end = send.index(
         "if (d.background && d.attachable === false)", transport_finished_start)
-    assert "this.loadSession(streamSid, { quiet: true })" in send[
+    assert "this._reloadSessionCoalesced(streamSid, { quiet: true })" in send[
         transport_finished_start:transport_finished_end]
 
 
@@ -2783,7 +2866,8 @@ def test_done_immediately_stamps_tool_tail_and_quietly_adopts_fork_boundary():
     assert "m && m.role !== \"user\" && m.uuid" in reconcile
     assert "m.role === \"assistant\" && m.uuid" in reconcile
     assert "m && m.uuid === expectedAssistantUuid" in reconcile
-    assert "const loaded = await this.loadSession(sid, { quiet: true })" in reconcile
+    assert "const loaded = await this.loadSession(sid, {" in reconcile
+    assert "quiet: true, probeActive: false" in reconcile
     assert "attempt < 30" in reconcile
     assert "Math.min(2000, 250 + attempt * 100)" in reconcile
 
@@ -4362,10 +4446,10 @@ def test_midturn_reconnect_storm_guards_are_in_place():
     # Refusal falls back to the flicker-free path: wait out the turn, then
     # quiet-load canonical history.
     assert "this._scheduleCanonicalStreamReload(sid, st);" in gate
-    check = js[js.index("    async _checkActiveTurn(sid) {"):]
+    check = js[js.index("    async _probeActiveTurn(sid, st) {"):]
     check = check[:check.index("\n    // Hover-prefetch")]
     assert "if (!this._allowReconnect(sid, d.turn_id)) return;" in check
-    recover = js[js.index("    async _recoverStalledStream(sid = this.currentId) {"):]
+    recover = js[js.index("    _recoverStalledStream(sid = this.currentId) {"):]
     recover = recover[:recover.index("\n    _scheduleCanonicalStreamReload(")]
     assert "if (!this._allowReconnect(sid, d.turn_id || st.activeTurnId)) return false;" in recover
 

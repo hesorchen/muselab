@@ -763,7 +763,6 @@ function portal() {
     IME_STALE_AFTER_MS: 5000,
     _fileMetaCache: new Map(),
     _paletteFileSeq: 0,
-    _sessionLoadPromises: {},
     _sessionsInitialized: false,
     _sessionInitPromise: null,
     _sessionListPullPromise: null,
@@ -7155,7 +7154,20 @@ function portal() {
         // separate counter keeps the inherited task card/footer live.
         inheritedBackgroundOwner: "",
         inheritedBackgroundTaskCount: 0,
-        _inheritedTaskPoller: null,
+        // One coordinator owns every asynchronous read/retry for this session.
+        // Reasons are explicit and deduplicated; at most one handler may run, so
+        // active probes, continuation discovery and canonical adoption cannot
+        // race each other into duplicate reconnects or stale history swaps.
+        sessionSync: {
+          pending: Object.create(null),
+          timer: null,
+          inFlight: null,
+          epoch: 0,
+          backgroundTicksLeft: 0,
+          inheritedTicksLeft: 0,
+          inheritedSourceSid: "",
+          canonicalStartedAt: 0,
+        },
         _backgroundHandoffPromise: null,
         // Runtime rollover replaces the source tabState while a queue POST can
         // still be in flight. Keep a primitive lineage in both directions so
@@ -7204,9 +7216,7 @@ function portal() {
         // list echoes the same state, so an in-flight stale response cannot
         // relight the tab's running dot for another poll interval.
         _sessionActivityExpected: null,
-        _streamHealthProbe: null,
         _reconnectTimer: null,
-        _canonicalResyncTimer: null,
         _canonicalResyncPending: false,
         // Per-session permission mirror. The active tab copies this primitive
         // into root `permission`; background tabs never read another tab's
@@ -7235,8 +7245,7 @@ function portal() {
         _loaded: false,   // set true after first loadSession populates messages
         _seenUpdated: undefined,
         _reconcileTargetUpdated: 0,
-        _reconcilePromise: null,
-        _reconcileRetryTimer: null,
+        _reconcileRetryN: 0,
         _pendingExternalUpdate: false,
         atBottom: true,
         scrollTop: 0,
@@ -7354,7 +7363,16 @@ function portal() {
       if (st.inheritedBackgroundOwner === undefined) {
         st.inheritedBackgroundOwner = "";
       }
-      if (st._inheritedTaskPoller === undefined) st._inheritedTaskPoller = null;
+      if (!st.sessionSync || typeof st.sessionSync !== "object") {
+        st.sessionSync = {
+          pending: Object.create(null), timer: null, inFlight: null, epoch: 0,
+          backgroundTicksLeft: 0, inheritedTicksLeft: 0, inheritedSourceSid: "",
+          canonicalStartedAt: 0,
+        };
+      }
+      if (!st.sessionSync.pending || typeof st.sessionSync.pending !== "object") {
+        st.sessionSync.pending = Object.create(null);
+      }
       if (st._backgroundHandoffPromise === undefined) {
         st._backgroundHandoffPromise = null;
       }
@@ -7372,6 +7390,137 @@ function portal() {
         st._queueMutating = {};
       }
       return st;
+    },
+    _requestSessionSync(sid, reason, options = {}) {
+      const st = sid && this.tabState[sid];
+      if (!st || !reason) return Promise.resolve(false);
+      const sync = st.sessionSync;
+      const delayMs = Math.max(0, Number(options.delayMs) || 0);
+      const dueAt = Date.now() + delayMs;
+      return new Promise(resolve => {
+        const current = sync.pending[reason];
+        if (current) {
+          current.options = { ...current.options, ...options };
+          current.dueAt = Math.min(current.dueAt, dueAt);
+          current.waiters.push(resolve);
+        } else {
+          sync.pending[reason] = {
+            reason, options: { ...options }, dueAt, waiters: [resolve],
+          };
+        }
+        this._scheduleSessionSync(sid, st);
+      });
+    },
+    _scheduleSessionSync(sid, st) {
+      if (!sid || !st || this.tabState[sid] !== st) return;
+      const sync = st.sessionSync;
+      if (sync.inFlight) return;
+      const pending = Object.values(sync.pending);
+      if (!pending.length) {
+        if (sync.timer) clearTimeout(sync.timer);
+        sync.timer = null;
+        return;
+      }
+      const next = pending.reduce((best, item) => (
+        !best || item.dueAt < best.dueAt ? item : best
+      ), null);
+      if (sync.timer) clearTimeout(sync.timer);
+      sync.timer = setTimeout(
+        () => this._runSessionSync(sid, st),
+        Math.max(0, next.dueAt - Date.now()),
+      );
+    },
+    async _runSessionSync(sid, st) {
+      if (!sid || !st || this.tabState[sid] !== st) return false;
+      const sync = st.sessionSync;
+      sync.timer = null;
+      if (sync.inFlight) return false;
+      const now = Date.now();
+      const ready = Object.values(sync.pending)
+        .filter(item => item.dueAt <= now)
+        .sort((a, b) => a.dueAt - b.dueAt);
+      if (!ready.length) {
+        this._scheduleSessionSync(sid, st);
+        return false;
+      }
+      const request = ready[0];
+      delete sync.pending[request.reason];
+      const epoch = sync.epoch;
+      const task = (async () => {
+        switch (request.reason) {
+          case "active_probe":
+            return await this._probeActiveTurn(sid, st, request.options);
+          case "busy_probe":
+            return await this._probeSessionBusy(sid, st, request.options);
+          case "queue_attach":
+            return await this._runQueueAttach(sid, st, request.options);
+          case "background_continuation":
+            return await this._pollBackgroundContinuation(sid, st);
+          case "inherited_tasks":
+            return await this._pollInheritedTasks(sid, st, request.options);
+          case "history_revision":
+            return await this._runHistoryRevisionSync(sid, st, request.options);
+          case "completed_turn":
+            return await this._runCompletedTurnSync(sid, st, request.options);
+          case "stream_health":
+            return await this._runStreamHealthSync(sid, st, request.options);
+          case "transport_retry":
+            return typeof request.options.run === "function"
+              ? await request.options.run() : false;
+          case "canonical_replay":
+            return await this._runCanonicalReplaySync(sid, st, request.options);
+          case "history_load":
+            return await this._runSessionHistoryLoad(sid, st, request.options);
+          default:
+            return false;
+        }
+      })();
+      sync.inFlight = { reason: request.reason, task };
+      let result = false;
+      try { result = await task; }
+      catch (_) { result = false; }
+      finally {
+        if (this.tabState[sid] === st && sync.epoch === epoch
+            && sync.inFlight && sync.inFlight.task === task) {
+          sync.inFlight = null;
+        }
+        request.waiters.forEach(resolve => resolve(result));
+        if (this.tabState[sid] === st && sync.epoch === epoch) {
+          this._scheduleSessionSync(sid, st);
+        }
+      }
+      return result;
+    },
+    _cancelSessionSyncReason(st, reason) {
+      const sync = st && st.sessionSync;
+      const request = sync && sync.pending && sync.pending[reason];
+      if (!request) return;
+      delete sync.pending[reason];
+      (request.waiters || []).forEach(resolve => resolve(false));
+      if (st._sid && this.tabState[st._sid] === st) {
+        this._scheduleSessionSync(st._sid, st);
+      }
+    },
+    _disposeSessionSync(st) {
+      if (!st || !st.sessionSync) return;
+      const sync = st.sessionSync;
+      sync.epoch += 1;
+      if (sync.timer) clearTimeout(sync.timer);
+      sync.timer = null;
+      for (const request of Object.values(sync.pending || {})) {
+        (request.waiters || []).forEach(resolve => resolve(false));
+      }
+      sync.pending = Object.create(null);
+      sync.inFlight = null;
+    },
+    async _runSessionHistoryLoad(sid, st, options = {}) {
+      if (this.tabState[sid] !== st) return false;
+      const loadOptions = { ...(options.loadOptions || options) };
+      delete loadOptions.delayMs;
+      delete loadOptions.loadOptions;
+      const ok = await this.loadSession(sid, loadOptions);
+      if (ok && this.tabState[sid] === st) st._loaded = true;
+      return !!ok;
     },
 
     // ===== Per-session message queue =====
@@ -7492,30 +7641,29 @@ function portal() {
       // session.active is a polled cache and can remain true for one response
       // after a turn's final drain already ran. Confirm it before enqueueing;
       // otherwise an idle queue item can be stranded with no turn left to drain.
+      return await this._requestSessionSync(sid, "busy_probe", { session });
+    },
+    async _probeSessionBusy(sid, st, options = {}) {
+      const session = options.session;
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 8000);
       try {
         const r = await fetch("/api/chat/sessions/" + sid + "/active", {
           headers: this.hdr(), signal: controller.signal,
         });
-        if (!r.ok) return true; // conservative on an unknown server state
+        if (!r.ok) return true;
         const status = await r.json();
+        if (this.tabState[sid] !== st) return true;
         const active = !!status.active;
-        if (st && status.background) {
+        if (status.background) {
           this._setBackgroundTaskActive(
             sid, active, status.started_at, status.background_tasks_pending);
         }
         if (!active && session) session.active = false;
-        // A detached watcher still makes the SOURCE runtime busy. send() uses
-        // this precise flag to transparently roll the visible tab over to an
-        // isolated successor before starting the next foreground turn.
-        if (status.background) return true;
-        return active;
+        return status.background ? true : active;
       } catch (_) {
         return true;
-      } finally {
-        clearTimeout(timeout);
-      }
+      } finally { clearTimeout(timeout); }
     },
     // True when the CSS @media single-pane mobile layout is active —
     // EITHER the viewport is narrow (≤900px) OR we're on a touch device
@@ -7958,7 +8106,7 @@ function portal() {
           id => id !== sourceSid && id !== childSid);
         if (tabIndex >= 0) this.openTabIds.splice(
           Math.min(tabIndex, this.openTabIds.length), 0, childSid);
-        this._stopBgContPoller(sourceSid);
+        this._disposeSessionSync(sourceState);
         if (sourceState._streamTimer) clearInterval(sourceState._streamTimer);
         sourceState._streamTimer = null;
         delete this.tabState[sourceSid];
@@ -8035,149 +8183,126 @@ function portal() {
     },
     _ensureInheritedTaskPoller(childSid, sourceSid) {
       const st = childSid && this.tabState[childSid];
-      if (!st || !sourceSid || st._inheritedTaskPoller) return;
-      let ticksLeft = 1810;
-      let inFlight = false;
-      let stopped = false;
-      let epoch = 0;
-      let activeController = null;
-      const stop = () => {
-        if (stopped) return;
-        stopped = true;
-        epoch += 1;
-        if (activeController) {
-          try { activeController.abort(); } catch (_) {}
-          activeController = null;
-        }
-        if (st._inheritedTaskPoller) clearInterval(st._inheritedTaskPoller);
-        st._inheritedTaskPoller = null;
-      };
-      const runTick = async tickEpoch => {
-        let status = null;
-        const controller = new AbortController();
-        activeController = controller;
-        const timeout = setTimeout(
-          () => controller.abort(),
-          Math.max(100, Number(this._sessionListTimeoutMs) || 8000),
-        );
-        try {
-          const r = await fetch(
-            `/api/chat/sessions/${encodeURIComponent(sourceSid)}/active`,
-            { headers: this.hdr(), signal: controller.signal },
-          );
-          if (r.ok) status = await r.json();
-        } catch (_) { return; }
-        finally {
-          clearTimeout(timeout);
-          if (activeController === controller) activeController = null;
-        }
-        if (stopped || epoch !== tickEpoch || this.tabState[childSid] !== st) return;
-        if (!status) return;
-        // On a second rollover, `sourceSid` can itself be a visible successor
-        // whose inherited task is owned by an older hidden runtime. Its local
-        // pin count is zero, while the sidecar overlay chain still reports the
-        // real running task. Prefer that aggregate so a grandchild does not
-        // clear the yellow badge before the original task settles.
-        const reported = Number(
-          status.runtime_background_tasks_pending
-          ?? status.background_tasks_pending,
-        );
-        const continuationPending = !!status.runtime_continuation_pending;
-        const desiredRevision = String(status.runtime_ui_revision || "");
-        const revisionBeforeAdoption = String(st.runtimeUiRevision || "");
-        let adoptedRevision = desiredRevision
-          ? revisionBeforeAdoption === desiredRevision
-          : true;
-        let loadedCanonicalThisTick = false;
-        // More than one task can finish at different times. Adopt every ready
-        // Agent continuation revision even while a sibling task is still
-        // running; task count and reply readiness are independent signals.
-        if (!adoptedRevision && !st.streaming && !st.es && !st.compacting) {
-          const continuationEventIdsBefore = new Set(
-            st.messages
-              .filter(message => message
-                && message.display_kind === "runtime_continuation"
-                && message.runtime_event_id)
-              .map(message => String(message.runtime_event_id)),
-          );
-          const loaded = await this._reloadSessionCoalesced(childSid, {
-            quiet: true, probeActive: false,
+      if (!st || !sourceSid) return;
+      const sync = st.sessionSync;
+      if (sync.inheritedSourceSid !== sourceSid || sync.inheritedTicksLeft <= 0) {
+        sync.inheritedSourceSid = sourceSid;
+        sync.inheritedTicksLeft = 1810;
+      }
+      this._requestSessionSync(childSid, "inherited_tasks", { sourceSid });
+    },
+    async _pollInheritedTasks(childSid, st, options = {}) {
+      if (this.tabState[childSid] !== st) return false;
+      const sync = st.sessionSync;
+      const sourceSid = String(options.sourceSid || sync.inheritedSourceSid || "");
+      if (!sourceSid || sync.inheritedTicksLeft-- <= 0) {
+        sync.inheritedSourceSid = "";
+        return false;
+      }
+      const again = () => {
+        if (this.tabState[childSid] === st && sync.inheritedSourceSid === sourceSid) {
+          this._requestSessionSync(childSid, "inherited_tasks", {
+            sourceSid, delayMs: 2000,
           });
-          if (stopped || epoch !== tickEpoch || this.tabState[childSid] !== st) return;
-          if (!loaded) return;
-          loadedCanonicalThisTick = true;
-          adoptedRevision = st.runtimeUiRevision === desiredRevision;
-          const hasNewRuntimeContinuation = st.messages.some(
-            message => message
+        }
+      };
+      let status = null;
+      const controller = new AbortController();
+      const timeout = setTimeout(
+        () => controller.abort(),
+        Math.max(100, Number(this._sessionListTimeoutMs) || 8000),
+      );
+      try {
+        const r = await fetch(
+          `/api/chat/sessions/${encodeURIComponent(sourceSid)}/active`,
+          { headers: this.hdr(), signal: controller.signal },
+        );
+        if (r.ok) status = await r.json();
+      } catch (_) { /* retry below */ }
+      finally { clearTimeout(timeout); }
+      if (this.tabState[childSid] !== st || sync.inheritedSourceSid !== sourceSid) {
+        return false;
+      }
+      if (!status) { again(); return false; }
+      const reported = Number(
+        status.runtime_background_tasks_pending ?? status.background_tasks_pending,
+      );
+      const continuationPending = !!status.runtime_continuation_pending;
+      const desiredRevision = String(status.runtime_ui_revision || "");
+      const revisionBeforeAdoption = String(st.runtimeUiRevision || "");
+      let adoptedRevision = desiredRevision
+        ? revisionBeforeAdoption === desiredRevision : true;
+      let loadedCanonicalThisTick = false;
+      if (!adoptedRevision && !st.streaming && !st.es && !st.compacting) {
+        const continuationEventIdsBefore = new Set(
+          st.messages
+            .filter(message => message
               && message.display_kind === "runtime_continuation"
-              && message.runtime_event_id
-              && !continuationEventIdsBefore.has(
-                String(message.runtime_event_id)),
-          );
-          // A projected continuation is an ordinary new Agent reply. Mirror
-          // normal background completion semantics when it lands off-screen,
-          // but do not badge the tab for a task-overlay-only terminal reload
-          // or for a cancelled/failed snapshot that shares the broader
-          // runtime_ui_revision digest.
-          if (adoptedRevision
-              && revisionBeforeAdoption !== desiredRevision
-              && hasNewRuntimeContinuation
-              && childSid !== this.currentId) {
-            st.unread = true;
-          }
+              && message.runtime_event_id)
+            .map(message => String(message.runtime_event_id)),
+        );
+        const loaded = await this.loadSession(childSid, {
+          quiet: true, probeActive: false,
+        });
+        if (this.tabState[childSid] !== st) return false;
+        if (!loaded) { again(); return false; }
+        st._loaded = true;
+        loadedCanonicalThisTick = true;
+        adoptedRevision = st.runtimeUiRevision === desiredRevision;
+        const hasNewRuntimeContinuation = st.messages.some(
+          message => message
+            && message.display_kind === "runtime_continuation"
+            && message.runtime_event_id
+            && !continuationEventIdsBefore.has(String(message.runtime_event_id)),
+        );
+        if (adoptedRevision
+            && revisionBeforeAdoption !== desiredRevision
+            && hasNewRuntimeContinuation
+            && childSid !== this.currentId) {
+          st.unread = true;
         }
-        if (Number.isFinite(reported) && reported > 0) {
-          st.inheritedBackgroundTaskCount = Math.floor(reported);
-          return;
-        }
-        // The task overlay becomes terminal before Claude's automatic Agent
-        // continuation has finished. Keep polling through that zero-count gap
-        // until the durable UI-only projection is READY on the visible leaf.
-        if (continuationPending) return;
-        if (!Number.isFinite(reported) || reported !== 0) return;
-        if (st.streaming || st.es || st.compacting) return;
-        // If no revision changed, this final reload still adopts the task
-        // card's completed/stopped overlay. The source continuation itself is
-        // never cross-subscribed; its ordinary assistant bubble now arrives
-        // through the successor's durable presentation history.
-        const loaded = adoptedRevision && !loadedCanonicalThisTick
-          ? await this._reloadSessionCoalesced(childSid, {
-              quiet: true, probeActive: false,
-            })
-          : true;
-        if (stopped || epoch !== tickEpoch || this.tabState[childSid] !== st) return;
-        if (!loaded || this.tabState[childSid] !== st) return;
-        if (desiredRevision && st.runtimeUiRevision !== desiredRevision) return;
-        st.inheritedBackgroundTaskCount = 0;
-        st.inheritedBackgroundOwner = "";
-        stop();
-      };
-      const tick = async () => {
-        if (stopped || inFlight) return;
-        if (this.tabState[childSid] !== st || ticksLeft-- <= 0) {
-          stop();
-          return;
-        }
-        inFlight = true;
-        const tickEpoch = epoch;
-        try {
-          await runTick(tickEpoch);
-        } finally {
-          inFlight = false;
-        }
-      };
-      st._inheritedTaskPoller = setInterval(tick, 2000);
-      tick();
+      }
+      if (Number.isFinite(reported) && reported > 0) {
+        st.inheritedBackgroundTaskCount = Math.floor(reported);
+        again();
+        return true;
+      }
+      if (continuationPending) { again(); return true; }
+      if (!Number.isFinite(reported) || reported !== 0) { again(); return false; }
+      if (st.streaming || st.es || st.compacting) { again(); return true; }
+      const loaded = adoptedRevision && !loadedCanonicalThisTick
+        ? await this.loadSession(childSid, { quiet: true, probeActive: false })
+        : true;
+      if (this.tabState[childSid] !== st) return false;
+      if (!loaded || (desiredRevision && st.runtimeUiRevision !== desiredRevision)) {
+        again();
+        return false;
+      }
+      st._loaded = true;
+      st.inheritedBackgroundTaskCount = 0;
+      st.inheritedBackgroundOwner = "";
+      sync.inheritedSourceSid = "";
+      sync.inheritedTicksLeft = 0;
+      return true;
     },
     // Poll /active + re-subscribe to a server-started turn. Retries a few
     // times because the server's drain runs a beat AFTER it publishes the
     // previous turn's `done` (in the background task's finally), so /active
     // can flip to true just after we land here. Stops once we attach, run
     // out of tries, or the queue turns out empty/paused.
-    async _attachToServerTurn(
+    _attachToServerTurn(
       sid, tries, completedTurnId = "", reconciledQueuedTurnId = "",
     ) {
+      return this._requestSessionSync(sid, "queue_attach", {
+        tries, completedTurnId, reconciledQueuedTurnId,
+      });
+    },
+    async _runQueueAttach(sid, ownerState, options = {}) {
+      const tries = Math.max(0, Number(options.tries) || 0);
+      const completedTurnId = String(options.completedTurnId || "");
+      const reconciledQueuedTurnId = String(options.reconciledQueuedTurnId || "");
       const st0 = this.tabState[sid];
+      if (st0 !== ownerState) return false;
       if (this.currentId !== sid || this.activeSessionPane().streaming) {
         if (st0) st0._draining = false;
         this._syncQueueFromServer(sid);
@@ -8243,30 +8368,31 @@ function portal() {
             // after the merge: a newly-enqueued item may already have started
             // while that request was in flight. The marker prevents the same
             // recent queued completion from triggering another history pull.
-            return this._attachToServerTurn(
-              sid, Math.max(1, tries - 1), completedTurnId,
-              queuedReconcileKey,
-            );
+            this._requestSessionSync(sid, "queue_attach", {
+              tries: Math.max(1, tries - 1), completedTurnId,
+              reconciledQueuedTurnId: queuedReconcileKey,
+            });
+            return true;
           }
           if (tries <= 1) {
             st._draining = false;
             this._syncQueueFromServer(sid);
           } else {
-            setTimeout(
-              () => this._attachToServerTurn(
-                sid, tries - 1, completedTurnId, reconciledQueuedTurnId,
-              ),
-              350,
-            );
+            this._requestSessionSync(sid, "queue_attach", {
+              tries: tries - 1, completedTurnId, reconciledQueuedTurnId,
+              delayMs: 350,
+            });
           }
           return;
         }
         // Whether the history request succeeded or not, never attach using the
         // pre-await active snapshot. A fresh probe prevents a completed/replaced
         // broadcast from receiving this reconnect.
-        return this._attachToServerTurn(
-          sid, Math.max(1, tries - 1), completedTurnId, queuedReconcileKey,
-        );
+        this._requestSessionSync(sid, "queue_attach", {
+          tries: Math.max(1, tries - 1), completedTurnId,
+          reconciledQueuedTurnId: queuedReconcileKey,
+        });
+        return true;
       }
       // `done` is intentionally emitted before slow post-turn persistence
       // finishes, so /active can briefly still expose the broadcast that just
@@ -8277,12 +8403,9 @@ function portal() {
       if (active && completedTurnId
           && (!turnId || turnId === completedTurnId)) {
         if (expect && tries > 1 && !this.activeSessionPane().streaming && this.currentId === sid) {
-          setTimeout(
-            () => this._attachToServerTurn(
-              sid, tries - 1, completedTurnId,
-            ),
-            350,
-          );
+          this._requestSessionSync(sid, "queue_attach", {
+            tries: tries - 1, completedTurnId, delayMs: 350,
+          });
         } else if (st) {
           st._draining = false;
         }
@@ -8358,12 +8481,9 @@ function portal() {
         return;
       }
       if (expect && tries > 1 && !this.activeSessionPane().streaming && this.currentId === sid) {
-        setTimeout(
-          () => this._attachToServerTurn(
-            sid, tries - 1, completedTurnId,
-          ),
-          350,
-        );
+        this._requestSessionSync(sid, "queue_attach", {
+          tries: tries - 1, completedTurnId, delayMs: 350,
+        });
       } else if (st) {
         st._draining = false;
       }
@@ -8423,45 +8543,46 @@ function portal() {
           || m.task_status.owner_session_id === sid));
     },
     _ensureBgContPoller(sid) {
-      this._bgContPollers = this._bgContPollers || {};
-      if (this._bgContPollers[sid]) return;          // already polling
-      const bgState = this.tabState[sid];
-      if (!this._bgHasRunningCard(sid)
-          && !(bgState && bgState.backgroundActive)) return;
-      // Hard cap mirrors the server's MUSELAB_TASK_WATCH_TIMEOUT (3600s): at a
-      // 2s cadence that's ~1800 ticks. Prevents an interval lingering forever if
-      // the user navigates away and the running card never resolves on the FE.
-      let ticksLeft = 1810;
-      const tick = async () => {
-        if (ticksLeft-- <= 0) { this._stopBgContPoller(sid); return; }
-        const ownerState = this.tabState[sid];
-        // Card settled and the server no longer reports a detached watcher.
-        if (!this._bgHasRunningCard(sid)
-            && !(ownerState && ownerState.backgroundActive)) {
-          this._stopBgContPoller(sid);
-          return;
+      const st = sid && this.tabState[sid];
+      if (!st || (!this._bgHasRunningCard(sid) && !st.backgroundActive)) return;
+      if (st.sessionSync.backgroundTicksLeft <= 0) {
+        st.sessionSync.backgroundTicksLeft = 1810;
+      }
+      this._requestSessionSync(sid, "background_continuation");
+    },
+    async _pollBackgroundContinuation(sid, st) {
+      if (this.tabState[sid] !== st) return false;
+      const sync = st.sessionSync;
+      if (sync.backgroundTicksLeft-- <= 0
+          || (!this._bgHasRunningCard(sid) && !st.backgroundActive)) {
+        this._stopBgContPoller(sid);
+        return false;
+      }
+      const again = () => {
+        if (this.tabState[sid] === st && sync.backgroundTicksLeft > 0) {
+          this._requestSessionSync(sid, "background_continuation", { delayMs: 2000 });
         }
-        // Tab hidden → skip the network work entirely (same battery/radio
-        // rationale as _pingHealth). The card badge isn't visible anyway;
-        // the next visible tick reconciles. ticksLeft still counts down so
-        // the hard cap holds even for a permanently-backgrounded tab.
-        if (typeof document !== "undefined"
-            && document.visibilityState !== "visible") return;
-        // Not viewing this session, or already streaming → retry next tick.
-        if (this.currentId !== sid || this.activeSessionPane().streaming) return;
-        // PRIMARY completion path (since the 2026-06-11 typed-message
-        // alignment): the cross-turn watcher reliably receives the typed
-        // TaskNotificationMessage and opens a continuation broadcast, so
-        // /active — a cheap, tiny JSON probe — discovers it on the next
-        // tick and reconnects in continuation mode; the replayed
-        // task_notification flips the card and streams the auto-continue.
-        // (The browser has no persistent SSE channel in the turn gap — the
-        // per-turn EventSource closes on done — so SOME polling is the only
-        // discovery mechanism; this probe is the lightest one.)
-        let contFound = false;
+      };
+      if (typeof document !== "undefined"
+          && document.visibilityState !== "visible") {
+        again();
+        return true;
+      }
+      if (this.currentId !== sid || st.streaming || st.es) {
+        again();
+        return true;
+      }
+      let contFound = false;
+      try {
+        const controller = new AbortController();
+        const timeout = setTimeout(
+          () => controller.abort(),
+          Math.max(100, Number(this._sessionListTimeoutMs) || 8000),
+        );
         try {
-          const r = await fetch("/api/chat/sessions/" + sid + "/active",
-                                 { headers: this.hdr() });
+          const r = await fetch("/api/chat/sessions/" + sid + "/active", {
+            headers: this.hdr(), signal: controller.signal,
+          });
           if (r.ok) {
             const d = await r.json();
             if (d.background && d.active) {
@@ -8470,167 +8591,134 @@ function portal() {
             } else if (!d.active) {
               this._setBackgroundTaskActive(sid, false);
             }
-            if (d.active && d.continuation && !this.activeSessionPane().streaming
+            if (d.active && d.continuation && !st.streaming && !st.es
                 && this.currentId === sid) {
-              // Dedup: /active surfaces a finished continuation from the
-              // server's _recent_turns for the full 60s TTL, so if ANOTHER
-              // bg task keeps this poller alive the same continuation would
-              // be re-reconnected every 8s → duplicate reaction bubbles. Key
-              // on the continuation's immutable turn_id. started_at is the
-              // originating turn's epoch and is intentionally shared by every
-              // continuation, so it is not a valid identity.
-              // and replay each one at most once. The normal single-task case
-              // self-stops on the card flip and never reaches a second tick,
-              // but this makes the multi-task case safe too.
               this._consumedConts = this._consumedConts || {};
               const ckey = sid + ":" + (d.turn_id || d.started_at);
               if (!this._consumedConts[ckey]) {
                 this._consumedConts[ckey] = true;
                 contFound = true;
                 this.send({ reconnect: true, continuation: true,
-                             sessionId: sid, turnId: d.turn_id || "",
-                             startedAt: d.started_at });
+                            sessionId: sid, turnId: d.turn_id || "",
+                            startedAt: d.started_at });
               }
             }
           }
-        } catch (_e) {}
-        if (contFound) return;   // continuation replay will flip the card
-        // FALLBACK reconciliation, every 16th tick (~32s): pull the history
-        // tail and stamp terminal task_status onto still-running cards. This
-        // covers the cases the /active probe can't see — the watcher died
-        // (server restart), the continuation's 60s TTL expired before a
-        // hidden tab came back, or an older CLI that only round-trips the
-        // <task-notification> JSONL record. Demoted from every-tick PRIMARY
-        // (it fetches an 80-message tail vs /active's ~100 bytes) on
-        // 2026-06-11 when the typed-message path made the continuation
-        // broadcast reliable.
-        this._bgContTickN = (this._bgContTickN || 0) + 1;
-        if (this._bgContTickN % 16 !== 0) return;
+        } finally { clearTimeout(timeout); }
+      } catch (_) { /* fallback cadence below */ }
+      if (this.tabState[sid] !== st) return false;
+      sync.backgroundTickN = (Number(sync.backgroundTickN) || 0) + 1;
+      if (!contFound && sync.backgroundTickN % 16 === 0) {
         try {
-          const hr = await fetch("/api/chat/sessions/" + sid + "?tail=80",
-                                  { headers: this.hdr() });
+          const hr = await fetch("/api/chat/sessions/" + sid + "?tail=80", {
+            headers: this.hdr(),
+          });
           if (hr.ok) {
             const hs = await hr.json();
+            if (this.tabState[sid] !== st) return false;
             const settled = {};
             (hs.messages || []).forEach(m => {
               if (m && m.role === "tool_use" && m.id && m.task_status
-                  && m.task_status.state
-                  && m.task_status.state !== "running") {
+                  && m.task_status.state && m.task_status.state !== "running") {
                 settled[m.id] = m.task_status;
               }
             });
-            const st = this.tabState[sid];
-            if (st && st.messages) {
-              st.messages.forEach(m => {
-                if (m && m.role === "tool_use" && m.task_status
-                    && m.task_status.state === "running" && settled[m.id]) {
-                  // Reassign the whole object so Alpine's :class re-evaluates.
-                  m.task_status = Object.assign({}, m.task_status, settled[m.id]);
-                }
-              });
-            }
+            st.messages.forEach(m => {
+              if (m && m.role === "tool_use" && m.task_status
+                  && m.task_status.state === "running" && settled[m.id]) {
+                m.task_status = Object.assign({}, m.task_status, settled[m.id]);
+              }
+            });
           }
-        } catch (_e) {}
-      };
-      this._bgContPollers[sid] = setInterval(tick, 2000);
-      tick();   // kick once immediately
+        } catch (_) { /* retry on the next fallback cadence */ }
+      }
+      again();
+      return true;
     },
     _stopBgContPoller(sid) {
-      if (this._bgContPollers && this._bgContPollers[sid]) {
-        clearInterval(this._bgContPollers[sid]);
-        delete this._bgContPollers[sid];
-      }
+      const st = sid && this.tabState[sid];
+      if (!st) return;
+      st.sessionSync.backgroundTicksLeft = 0;
+      this._cancelSessionSyncReason(st, "background_continuation");
     },
     _reconcileCompletedTurn(
       sid, ownerState, expectedText = "", attempt = 0, expectedAssistantUuid = "",
     ) {
-      // The live turn is an optimistic rendering of the server-owned
-      // transcript. `done` deliberately arrives before slow UUID/annotation
-      // bookkeeping, so poll the cheap tail until it contains a persisted
-      // boundary for THIS turn, then merge it through quiet loadSession. This
-      // gives the footer a fork id without waiting for the 10s session-list
-      // poll and never blanks/remounts the live bubbles.
+      if (!sid || this.tabState[sid] !== ownerState) return Promise.resolve(false);
+      return this._requestSessionSync(sid, "completed_turn", {
+        expectedText, attempt, expectedAssistantUuid,
+        delayMs: attempt ? Math.min(2000, 250 + attempt * 100) : 80,
+      });
+    },
+    async _runCompletedTurnSync(sid, ownerState, options = {}) {
+      const attempt = Math.max(0, Number(options.attempt) || 0);
+      const expectedText = String(options.expectedText || "");
+      const expectedAssistantUuid = String(options.expectedAssistantUuid || "");
+      const stillOwned = () => this.tabState[sid] === ownerState
+        && !ownerState.streaming && !ownerState.es;
+      if (!stillOwned()) return false;
       const retry = () => {
-        if (attempt < 30) {
-          this._reconcileCompletedTurn(
-            sid, ownerState, expectedText, attempt + 1, expectedAssistantUuid,
-          );
+        if (attempt < 30 && stillOwned()) {
+          this._requestSessionSync(sid, "completed_turn", {
+            expectedText, expectedAssistantUuid, attempt: attempt + 1,
+            delayMs: Math.min(2000, 350 + attempt * 100),
+          });
         }
       };
-      setTimeout(async () => {
-        if (this.tabState[sid] !== ownerState || ownerState.streaming || ownerState.es) return;
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 8000);
-        const stillOwned = () => this.tabState[sid] === ownerState
-          && !ownerState.streaming && !ownerState.es;
-        try {
-          // `done` is intentionally early; wait for the detached backend pump
-          // to retire before swapping canonical history. The footer already
-          // has done.assistant_uuid/completed_at_ms/duration_ms, so this wait
-          // does not delay any visible completion affordance.
-          const activeResponse = await fetch(
-            "/api/chat/sessions/" + sid + "/active",
-            { headers: this.hdr(), signal: controller.signal },
-          );
-          if (!stillOwned()) return;
-          let activity = null;
-          try { activity = activeResponse.ok ? await activeResponse.json() : null; }
-          catch (_) { activity = null; }
-          // A detached background task has no live transcript writer.  It must
-          // not hold the just-finished foreground turn's canonical merge behind
-          // 30 repeated /active probes for the life of `sleep 20s`.  A real
-          // turn/continuation (active without background) still owns the pane.
-          if (!activity || (activity.active && !activity.background)) {
-            retry();
-            return;
-          }
-          const historyResponse = await fetch(
-            "/api/chat/sessions/" + sid + "?tail=80",
-            { headers: this.hdr(), signal: controller.signal },
-          );
-          if (!stillOwned()) return;
-          if (!historyResponse.ok) { retry(); return; }
-          const history = await historyResponse.json();
-          const messages = Array.isArray(history.messages) ? history.messages : [];
-          let turnStart = 0;
-          for (let i = messages.length - 1; i >= 0; i -= 1) {
-            if (messages[i] && messages[i].role === "user") {
-              turnStart = i + 1;
-              break;
-            }
-          }
-          const canonicalTurn = messages.slice(turnStart);
-          const hasBoundary = canonicalTurn.some(
-            m => m && m.role !== "user" && m.uuid,
-          );
-          // The backend's AssistantMessage UUID is the authoritative turn
-          // boundary. Prefer it over live text equality: a transport can lose
-          // the final delta, and synthetic API errors intentionally use a
-          // structured done payload whose wording need not equal the raw
-          // transcript TextBlock byte-for-byte.
-          const hasExpectedAssistant = !expectedAssistantUuid
-            || canonicalTurn.some(
-              m => m && m.uuid === expectedAssistantUuid,
-            );
-          const hasFinal = expectedAssistantUuid
-            ? hasExpectedAssistant
-            : (!expectedText || canonicalTurn.some(
-                m => m && m.role === "assistant" && m.uuid
-                  && (m.text || "") === expectedText,
-              ));
-          if (!hasBoundary || !hasFinal) { retry(); return; }
-          if (!stillOwned()) return;
-          const loaded = await this.loadSession(sid, { quiet: true });
-          if (!loaded) retry();
-        } catch (_) {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 8000);
+      try {
+        const activeResponse = await fetch(
+          "/api/chat/sessions/" + sid + "/active",
+          { headers: this.hdr(), signal: controller.signal },
+        );
+        if (!stillOwned()) return false;
+        let activity = null;
+        try { activity = activeResponse.ok ? await activeResponse.json() : null; }
+        catch (_) { activity = null; }
+        if (!activity || (activity.active && !activity.background)) {
           retry();
-        } finally {
-          clearTimeout(timeout);
+          return false;
         }
-      // Post-turn context accounting/transcript annotation can legitimately
-      // take tens of seconds on large sessions. Back off to a 2s ceiling for
-      // an overall ~45s barrier without generating a hot polling loop.
-      }, attempt ? Math.min(2000, 250 + attempt * 100) : 80);
+        const historyResponse = await fetch(
+          "/api/chat/sessions/" + sid + "?tail=80",
+          { headers: this.hdr(), signal: controller.signal },
+        );
+        if (!stillOwned()) return false;
+        if (!historyResponse.ok) { retry(); return false; }
+        const history = await historyResponse.json();
+        const messages = Array.isArray(history.messages) ? history.messages : [];
+        let turnStart = 0;
+        for (let i = messages.length - 1; i >= 0; i -= 1) {
+          if (messages[i] && messages[i].role === "user") {
+            turnStart = i + 1;
+            break;
+          }
+        }
+        const canonicalTurn = messages.slice(turnStart);
+        const hasBoundary = canonicalTurn.some(
+          m => m && m.role !== "user" && m.uuid,
+        );
+        const hasExpectedAssistant = !expectedAssistantUuid
+          || canonicalTurn.some(m => m && m.uuid === expectedAssistantUuid);
+        const hasFinal = expectedAssistantUuid
+          ? hasExpectedAssistant
+          : (!expectedText || canonicalTurn.some(
+              m => m && m.role === "assistant" && m.uuid
+                && (m.text || "") === expectedText,
+            ));
+        if (!hasBoundary || !hasFinal) { retry(); return false; }
+        if (!stillOwned()) return false;
+        const loaded = await this.loadSession(sid, {
+          quiet: true, probeActive: false,
+        });
+        if (!loaded) retry();
+        else ownerState._loaded = true;
+        return !!loaded;
+      } catch (_) {
+        retry();
+        return false;
+      } finally { clearTimeout(timeout); }
     },
     _reconcileCompletedContinuation(
       sid, ownerState, expectedText = "", attempt = 0, expectedAssistantUuid = "",
@@ -9417,150 +9505,137 @@ function portal() {
     // "nothing changed" tick. `_openSeenUpdated` is the updated_at the rendered
     // messages reflect; a real load / switch / our-own-stream-done re-baselines
     // it (set to undefined) so we never reload a session we just pulled.
-    async _recoverStalledStream(sid = this.currentId) {
+    _recoverStalledStream(sid = this.currentId) {
       const st = sid && this.tabState && this.tabState[sid];
-      if (!st || (!st.streaming && !st.es) || st._reconnectTimer) return false;
-      if (st._streamHealthProbe) return st._streamHealthProbe;
-
+      if (!st || (!st.streaming && !st.es) || st._reconnectTimer) {
+        return Promise.resolve(false);
+      }
       const ownerEs = st.es;
       const observedActivity = Number(st._lastSseActivity)
         || Number(st._streamStartedAt) || Date.now();
       const transportClosed = !!(ownerEs && Number(ownerEs.readyState) === 2);
-      if (!transportClosed && Date.now() - observedActivity < 18_000) return false;
-
-      const task = (async () => {
-        const controller = new AbortController();
-        const timeout = setTimeout(
-          () => controller.abort(),
-          Math.max(100, Number(this._sessionListTimeoutMs) || 8000),
-        );
-        try {
-          const r = await fetch(`/api/chat/sessions/${sid}/active`, {
-            headers: this.hdr(), signal: controller.signal,
-          });
-          if (!r.ok) return false;
-          const d = await r.json();
-          if (this.tabState[sid] !== st || st.es !== ownerEs) return false;
-
-          if (d.active) {
-            st._serverActiveObserved = true;
-            if (d.background && d.attachable === false) {
-              try { if (st.es) st.es.close(); } catch (_) {}
-              if (st._stallWatch) clearInterval(st._stallWatch);
-              st._stallWatch = null;
-              st.es = null;
-              st.streaming = false;
-              this._setBackgroundTaskActive(
-                sid, true, d.started_at, d.background_tasks_pending);
-              this._ensureBgContPoller(sid);
-              return true;
-            }
-            const silenceMs = Date.now() - (Number(st._lastSseActivity)
-              || Number(st._streamStartedAt) || Date.now());
-            const serverHasReplay = Math.max(0, Number(d.events_so_far) || 0) > 0;
-            const closedNow = !!(st.es && Number(st.es.readyState) === 2);
-            if (!st.es || (!closedNow && (!serverHasReplay || silenceMs < 18_000))) {
-              return false;
-            }
-            // Same brake as _checkActiveTurn: this is a second, independent
-            // reconnect source, and it used to zero _reconnectAttempts right
-            // before sending — which is one of the reasons MAX_ATTEMPTS never
-            // bit. Ask the shared gate instead of resetting the counter.
-            if (!this._allowReconnect(sid, d.turn_id || st.activeTurnId)) return false;
-            try { st.es.close(); } catch (_) {}
+      if (!transportClosed && Date.now() - observedActivity < 18_000) {
+        return Promise.resolve(false);
+      }
+      return this._requestSessionSync(sid, "stream_health", { ownerEs });
+    },
+    async _runStreamHealthSync(sid, st, options = {}) {
+      const ownerEs = options.ownerEs;
+      if (this.tabState[sid] !== st || st.es !== ownerEs) return false;
+      const controller = new AbortController();
+      const timeout = setTimeout(
+        () => controller.abort(),
+        Math.max(100, Number(this._sessionListTimeoutMs) || 8000),
+      );
+      try {
+        const r = await fetch(`/api/chat/sessions/${sid}/active`, {
+          headers: this.hdr(), signal: controller.signal,
+        });
+        if (!r.ok) return false;
+        const d = await r.json();
+        if (this.tabState[sid] !== st || st.es !== ownerEs) return false;
+        if (d.active) {
+          st._serverActiveObserved = true;
+          if (d.background && d.attachable === false) {
+            try { if (st.es) st.es.close(); } catch (_) {}
             if (st._stallWatch) clearInterval(st._stallWatch);
             st._stallWatch = null;
             st.es = null;
             st.streaming = false;
-            await this.send({
-              reconnect: true,
-              sessionId: sid,
-              turnId: d.turn_id || st.activeTurnId || "",
-              startedAt: d.started_at,
-            });
+            this._setBackgroundTaskActive(
+              sid, true, d.started_at, d.background_tasks_pending);
+            this._ensureBgContPoller(sid);
             return true;
           }
-
-          if (!st._serverActiveObserved && !st._pendingExternalUpdate) return false;
-          this._retireStaleSessionStream(sid, st);
-          st._pendingExternalUpdate = true;
-          const loaded = await this.loadSession(sid, { quiet: true });
-          if (loaded) {
-            st._loaded = true;
-            st._pendingExternalUpdate = false;
-            this._syncQueueFromServer(sid);
+          const silenceMs = Date.now() - (Number(st._lastSseActivity)
+            || Number(st._streamStartedAt) || Date.now());
+          const serverHasReplay = Math.max(0, Number(d.events_so_far) || 0) > 0;
+          const closedNow = !!(st.es && Number(st.es.readyState) === 2);
+          if (!st.es || (!closedNow && (!serverHasReplay || silenceMs < 18_000))) {
+            return false;
           }
-          return !!loaded;
-        } catch (_) {
-          return false;
-        } finally {
-          clearTimeout(timeout);
+          if (!this._allowReconnect(sid, d.turn_id || st.activeTurnId)) return false;
+          try { st.es.close(); } catch (_) {}
+          if (st._stallWatch) clearInterval(st._stallWatch);
+          st._stallWatch = null;
+          st.es = null;
+          st.streaming = false;
+          await this.send({
+            reconnect: true,
+            sessionId: sid,
+            turnId: d.turn_id || st.activeTurnId || "",
+            startedAt: d.started_at,
+          });
+          return true;
         }
-      })();
-      st._streamHealthProbe = task;
-      try {
-        return await task;
-      } finally {
-        if (this.tabState[sid] === st && st._streamHealthProbe === task) {
-          st._streamHealthProbe = null;
-        }
-      }
-    },
-
-    _scheduleCanonicalStreamReload(sid, st, { minimumWaitMs = 0 } = {}) {
-      if (!sid || !st || this.tabState[sid] !== st) return;
-      if (st._canonicalResyncTimer) return;
-      st._canonicalResyncPending = true;
-      const started = Date.now();
-      const poll = async () => {
-        st._canonicalResyncTimer = null;
-        if (this.tabState[sid] !== st) return;
-        let active = true;
-        try {
-          const controller = new AbortController();
-          const timeout = setTimeout(() => controller.abort(), 8000);
-          try {
-            const r = await fetch(`/api/chat/sessions/${encodeURIComponent(sid)}/active`, {
-              headers: this.hdr(), signal: controller.signal,
-            });
-            if (r.ok) active = !!(await r.json()).active;
-          } finally {
-            clearTimeout(timeout);
-          }
-        } catch (_) {
-          active = true;
-        }
-        const waited = Date.now() - started;
-        if (active || waited < minimumWaitMs) {
-          // Backend turns are capped at 30 minutes. Keep the poll itself
-          // bounded too; after that canonical history is the only safe truth.
-          if (waited < 31 * 60_000) {
-            st._canonicalResyncTimer = setTimeout(poll, 1000);
-            return;
-          }
-        }
+        if (!st._serverActiveObserved && !st._pendingExternalUpdate) return false;
         this._retireStaleSessionStream(sid, st);
         st._pendingExternalUpdate = true;
-        // This is reconciliation of an already-rendered stream, never a cold
-        // open. Keep quiet semantics even if the tab changes while the fetch is
-        // in flight, so becoming current cannot clear the pane and enter the
-        // chunked skeleton path mid-recovery.
-        const loaded = await this.loadSession(sid, { quiet: true });
-        if (this.tabState[sid] !== st) return;
-        st._canonicalResyncPending = false;
+        const loaded = await this.loadSession(sid, {
+          quiet: true, probeActive: false,
+        });
         if (loaded) {
           st._loaded = true;
           st._pendingExternalUpdate = false;
           this._syncQueueFromServer(sid);
         }
-      };
-      st._canonicalResyncTimer = setTimeout(poll, 250);
+        return !!loaded;
+      } catch (_) {
+        return false;
+      } finally { clearTimeout(timeout); }
+    },
+
+    _scheduleCanonicalStreamReload(sid, st, { minimumWaitMs = 0 } = {}) {
+      if (!sid || !st || this.tabState[sid] !== st) return;
+      st._canonicalResyncPending = true;
+      if (!st.sessionSync.canonicalStartedAt) {
+        st.sessionSync.canonicalStartedAt = Date.now();
+      }
+      this._requestSessionSync(sid, "canonical_replay", {
+        minimumWaitMs, delayMs: 250,
+      });
+    },
+    async _runCanonicalReplaySync(sid, st, options = {}) {
+      if (this.tabState[sid] !== st) return false;
+      const startedAt = Number(st.sessionSync.canonicalStartedAt) || Date.now();
+      const minimumWaitMs = Math.max(0, Number(options.minimumWaitMs) || 0);
+      let active = true;
+      try {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 8000);
+        try {
+          const r = await fetch(`/api/chat/sessions/${encodeURIComponent(sid)}/active`, {
+            headers: this.hdr(), signal: controller.signal,
+          });
+          if (r.ok) active = !!(await r.json()).active;
+        } finally { clearTimeout(timeout); }
+      } catch (_) { active = true; }
+      if (this.tabState[sid] !== st) return false;
+      const waited = Date.now() - startedAt;
+      if ((active || waited < minimumWaitMs) && waited < 31 * 60_000) {
+        this._requestSessionSync(sid, "canonical_replay", {
+          minimumWaitMs, delayMs: 1000,
+        });
+        return true;
+      }
+      this._retireStaleSessionStream(sid, st);
+      st._pendingExternalUpdate = true;
+      const loaded = await this.loadSession(sid, { quiet: true });
+      if (this.tabState[sid] !== st) return false;
+      st._canonicalResyncPending = false;
+      st.sessionSync.canonicalStartedAt = 0;
+      if (loaded) {
+        st._loaded = true;
+        st._pendingExternalUpdate = false;
+        this._syncQueueFromServer(sid);
+      }
+      return !!loaded;
     },
 
     _retireStaleSessionStream(sid, st) {
       if (st.es) { try { st.es.close(); } catch (_) {} st.es = null; }
-      if (st._canonicalResyncTimer) clearTimeout(st._canonicalResyncTimer);
-      st._canonicalResyncTimer = null;
+      this._cancelSessionSyncReason(st, "canonical_replay");
+      st.sessionSync.canonicalStartedAt = 0;
       st._canonicalResyncPending = false;
       if (st._streamTimer) {
         clearInterval(st._streamTimer);
@@ -9651,10 +9726,6 @@ function portal() {
           && Number(cur.message_count || 0) !== Number(previous.message_count || 0);
         const turnCountChanged = !!previous
           && Number(cur.turn_count || 0) !== Number(previous.turn_count || 0);
-        // JSONL mtime can advance on task lifecycle/progress records even when
-        // no visible conversation row changed.  During a detached background
-        // gap, only count changes are evidence that the pane needs a canonical
-        // refresh; status/name/time updates belong to their own UI surfaces.
         const visibleNewer = newer && (
           !backgroundOnly || messageCountChanged || turnCountChanged
         );
@@ -9666,16 +9737,6 @@ function portal() {
           || !!(previous && previous.active)
           || (newer && streamAgeMs >= 5000)
         );
-        // A live SSE is the strongest evidence available that the turn is still
-        // running: it is a direct pipe to the turn itself, while the session
-        // list is a 10 s snapshot that can lag a turn start (or race a turn
-        // boundary). Retiring a HEALTHY transport on one such tick used to
-        // hand the pane to the reconnect path, which then replayed the whole
-        // turn and re-armed itself — the outer half of the 2026-08-04 flicker
-        // storm. Only retire when the transport itself agrees it is dead:
-        // closed readyState, or no inbound event (incl. the 15 s server ping)
-        // for longer than two ping intervals. A healthy stream just records
-        // the discrepancy and keeps the pane; its own `done` reconciles.
         if ((st.streaming || st.es) && serverSettled) {
           const sseSilentMs = Date.now() - (Number(st._lastSseActivity)
             || Number(st._streamStartedAt) || Date.now());
@@ -9689,16 +9750,6 @@ function portal() {
           if (visibleNewer) st._pendingExternalUpdate = true;
           continue;
         }
-
-        // `cur.active` alone is NOT a reason to re-read the transcript. The
-        // session list reports active for the whole life of an in-flight turn
-        // *and* of any background task (`_sessions_with_inflight_tasks`), so
-        // treating it as "needs refresh" re-ran a full ?tail=300 quiet reload
-        // on every tick of that window — and loadSession's tail then probed
-        // /active and reconnected, closing the 2026-08-04 flicker loop.
-        // Refresh only on real evidence of new content; handle "server has a
-        // live turn but this tab owns no transport" as a separate attach-only
-        // path that costs one /active probe and no pane rewrite.
         const needsRefresh = st._pendingExternalUpdate || visibleNewer;
         const hasTurnActivityFlag = Object.prototype.hasOwnProperty.call(
           cur, "turn_active",
@@ -9707,69 +9758,64 @@ function portal() {
           hasTurnActivityFlag ? !!cur.turn_active
             : (!!cur.active && !cur.background_active)
         ) && !st.streaming && !st.es;
-        if (needsRefresh && newU > priorTarget) st._reconcileRetryN = 0;
-        if (needsRefresh) {
-          st._reconcileTargetUpdated = Math.max(priorTarget, newU);
-        }
-        if (st._reconcilePromise) {
-          if (needsRefresh) st._pendingExternalUpdate = true;
-          continue;
-        }
         if (!needsRefresh) {
           if (!hasBaseline && st._loaded && newU) st._seenUpdated = newU;
           if (wantsAttach && st._loaded) this._checkActiveTurn(sid);
           continue;
         }
-
-        const attach = wantsAttach;
+        if (newU > priorTarget) st._reconcileRetryN = 0;
+        st._reconcileTargetUpdated = Math.max(priorTarget, newU);
         st._pendingExternalUpdate = false;
-        let succeeded = false;
-        const task = (async () => {
-          try {
-            const loaded = await this._reloadSessionCoalesced(
-              sid, { quiet: true });
-            if (!loaded) {
-              st._pendingExternalUpdate = true;
-              return;
-            }
-            succeeded = true;
-            st._loaded = true;
-            // loadSession records the revision carried by the transcript it
-            // actually read. Never advance that cursor to the session-list
-            // target here: a concurrent list request can observe U2 while an
-            // already-in-flight transcript still contains U1. The finally
-            // block detects that gap and schedules the existing quiet retry.
-            if (attach) await this._checkActiveTurn(sid);
-          } catch (_) {
-            st._pendingExternalUpdate = true;
-          } finally {
-            if (st._reconcilePromise === task) st._reconcilePromise = null;
-            const seen = Number(st._seenUpdated);
-            const hasSeen = st._seenUpdated !== undefined && Number.isFinite(seen);
-            const target = Number(st._reconcileTargetUpdated) || 0;
-            const stillBehind = target > 0 && (!hasSeen || target > seen);
-            if (stillBehind) st._pendingExternalUpdate = true;
-            else if (succeeded) st._pendingExternalUpdate = false;
-            // Bounded catch-up retry. The transcript can legitimately lag the
-            // list target by one round (a list response observed U2 while the
-            // transcript request already in flight still carried U1), so retry
-            // — but back off and stop. An unbounded 250 ms retry is a hot loop
-            // whenever the gap does NOT close, and each round costs a full
-            // ?tail= reload of the visible pane (2026-08-04 flicker storm).
-            const retries = Number(st._reconcileRetryN) || 0;
-            if (!stillBehind) st._reconcileRetryN = 0;
-            if (succeeded && stillBehind && !st.streaming && !st.es
-                && !st._reconcileRetryTimer && retries < 6) {
-              st._reconcileRetryN = retries + 1;
-              st._reconcileRetryTimer = setTimeout(() => {
-                st._reconcileRetryTimer = null;
-                const latest = (this.sessions || []).find(s => s && s.id === sid);
-                if (latest) this._reconcileOpenSession([latest]);
-              }, Math.min(2000, 250 * (retries + 1)));
-            }
-          }
-        })();
-        st._reconcilePromise = task;
+        this._requestSessionSync(sid, "history_revision", {
+          attach: wantsAttach,
+          targetUpdated: st._reconcileTargetUpdated,
+        });
+      }
+    },
+    async _runHistoryRevisionSync(sid, st, options = {}) {
+      if (this.tabState[sid] !== st) return false;
+      if (st.streaming || st.es) {
+        st._pendingExternalUpdate = true;
+        return false;
+      }
+      const targetUpdated = Math.max(
+        Number(st._reconcileTargetUpdated) || 0,
+        Number(options.targetUpdated) || 0,
+      );
+      st._reconcileTargetUpdated = targetUpdated;
+      let succeeded = false;
+      try {
+        const loaded = await this.loadSession(sid, {
+          quiet: true, probeActive: false,
+        });
+        if (!loaded) {
+          st._pendingExternalUpdate = true;
+          return false;
+        }
+        succeeded = true;
+        st._loaded = true;
+        if (options.attach) this._checkActiveTurn(sid);
+        return true;
+      } catch (_) {
+        st._pendingExternalUpdate = true;
+        return false;
+      } finally {
+        if (this.tabState[sid] !== st) return;
+        const seen = Number(st._seenUpdated);
+        const hasSeen = st._seenUpdated !== undefined && Number.isFinite(seen);
+        const stillBehind = targetUpdated > 0 && (!hasSeen || targetUpdated > seen);
+        if (stillBehind) st._pendingExternalUpdate = true;
+        else if (succeeded) st._pendingExternalUpdate = false;
+        const retries = Number(st._reconcileRetryN) || 0;
+        if (!stillBehind) st._reconcileRetryN = 0;
+        if (succeeded && stillBehind && !st.streaming && !st.es && retries < 6) {
+          st._reconcileRetryN = retries + 1;
+          this._requestSessionSync(sid, "history_revision", {
+            attach: !!options.attach,
+            targetUpdated,
+            delayMs: Math.min(2000, 250 * (retries + 1)),
+          });
+        }
       }
     },
     // Field-level equality over the rendered session metadata. Returns true
@@ -10589,11 +10635,9 @@ function portal() {
           try { st._streamStartController.abort(); } catch {}
         }
         if (st._streamTimer) clearInterval(st._streamTimer);
-        if (st._inheritedTaskPoller) clearInterval(st._inheritedTaskPoller);
         if (st._stallWatch) clearInterval(st._stallWatch);
         if (st._reconnectTimer) clearTimeout(st._reconnectTimer);
-        if (st._canonicalResyncTimer) clearTimeout(st._canonicalResyncTimer);
-        if (st._reconcileRetryTimer) clearTimeout(st._reconcileRetryTimer);
+        this._disposeSessionSync(st);
         if (st._virtualSyncFrame) {
           if (typeof cancelAnimationFrame === "function") {
             cancelAnimationFrame(st._virtualSyncFrame);
@@ -10610,24 +10654,17 @@ function portal() {
         st.backgroundTaskCount = 0;
         st.inheritedBackgroundTaskCount = 0;
         st.inheritedBackgroundOwner = "";
-        st._inheritedTaskPoller = null;
         st._streamTimer = null;
         st._stallWatch = null;
         st._reconnectTimer = null;
-        st._canonicalResyncTimer = null;
         st._canonicalResyncPending = false;
-        st._streamHealthProbe = null;
         st._serverActiveObserved = false;
-        st._reconcileRetryTimer = null;
-        st._reconcilePromise = null;
         st._permissionPatchSeq = (Number(st._permissionPatchSeq) || 0) + 1;
         st._modelPatchSeq = (Number(st._modelPatchSeq) || 0) + 1;
         st._effortPatchSeq = (Number(st._effortPatchSeq) || 0) + 1;
         st._serviceTierPatchSeq = (Number(st._serviceTierPatchSeq) || 0) + 1;
         st._thinkingPatchSeq = (Number(st._thinkingPatchSeq) || 0) + 1;
       }
-      this._stopBgContPoller(id);
-      if (this._sessionLoadPromises) delete this._sessionLoadPromises[id];
       if (this._prefetching) delete this._prefetching[id];
       if (this.tabState[id] === st) delete this.tabState[id];
       this._dropSessionMessageStore(id);
@@ -13819,12 +13856,14 @@ function portal() {
     // an empty-prompt SSE to the same endpoint, and the backend's
     // reconnect mode replays the existing event buffer then streams
     // live. User sees the reply continue right where it left off.
-    async _checkActiveTurn(sid) {
+    _checkActiveTurn(sid) {
+      return this._requestSessionSync(sid, "active_probe");
+    },
+    async _probeActiveTurn(sid, st) {
       // Refresh the queue mirror on every load/reconnect probe so a session
       // with server-side queued items shows them immediately (e.g. items that
       // were waiting behind an active turn, or left dormant after a restart).
-      const st = this.tabState && this.tabState[sid];
-      if (!sid || !st) return;
+      if (!sid || !st || this.tabState[sid] !== st) return false;
       this._syncQueueFromServer(sid);
       const controller = new AbortController();
       const timeout = setTimeout(
@@ -13949,25 +13988,10 @@ function portal() {
       }, 300);
     },
 
-    async _reloadSessionCoalesced(sid, opts = {}) {
-      if (!sid) return false;
-      if (this._sessionLoadPromises[sid]) {
-        return this._sessionLoadPromises[sid];
-      }
-      const st = this._ensureTabState(sid);
-      const task = (async () => {
-        const ok = await this.loadSession(sid, opts);
-        if (ok) st._loaded = true;
-        return !!ok;
-      })();
-      this._sessionLoadPromises[sid] = task;
-      try {
-        return await task;
-      } finally {
-        if (this._sessionLoadPromises[sid] === task) {
-          delete this._sessionLoadPromises[sid];
-        }
-      }
+    _reloadSessionCoalesced(sid, opts = {}) {
+      if (!sid) return Promise.resolve(false);
+      this._ensureTabState(sid);
+      return this._requestSessionSync(sid, "history_load", { loadOptions: opts });
     },
     async _ensureSessionLoaded(sid) {
       if (!sid) return false;
@@ -27093,6 +27117,9 @@ function portal() {
             }
           }
         }
+        if (ev && ev.type !== "error") {
+          this._cancelSessionSyncReason(streamState, "transport_retry");
+        }
         if (ev && ev.type !== "ping" && ev.type !== "error") {
           streamState._serverActiveObserved = true;
         }
@@ -27108,7 +27135,12 @@ function portal() {
       streamState._stallWatch = setInterval(() => {
         if (!streamState.streaming) return;
         const silentMs = Date.now() - (streamState._lastSseActivity || 0);
-        if (silentMs > 40000 && !streamState._streamHealthProbe) {
+        const sync = streamState.sessionSync;
+        const healthProbePending = !!(sync && (
+          (sync.inFlight && sync.inFlight.reason === "stream_health")
+          || (sync.pending && sync.pending.stream_health)
+        ));
+        if (silentMs > 40000 && !healthProbePending) {
           // 40s of total silence (server pings every 15s → ≥2 missed) means
           // the connection is dead in a way onerror never caught. Tear down
           // the watchdog and drive the existing reconnect logic via a
@@ -28064,7 +28096,7 @@ function portal() {
           // partial answer and the separate error bubble. Adopt it only after
           // the backend confirms the atomic write; otherwise retain the live
           // objects instead of replacing them with an older canonical view.
-          this.loadSession(streamSid, { quiet: true });
+          this._reloadSessionCoalesced(streamSid, { quiet: true });
         } else if (d.is_error && !d.cancelled) {
           streamState._seenUpdated = undefined;
           if (streamSid === this.currentId) this._openSeenUpdated = undefined;
@@ -28228,7 +28260,7 @@ function portal() {
           // messagesReady off and clears/rebuilds the array, producing an
           // empty/skeleton flash before the same transcript returns. Quiet
           // mode morphs canonical history into the mounted keyed messages.
-          this.loadSession(streamSid, { quiet: true }).then(() => {
+          this._reloadSessionCoalesced(streamSid, { quiet: true }).then(() => {
             this.$nextTick(() => this._drainPendingQueue(streamSid));
           });
           return;
@@ -28318,7 +28350,7 @@ function portal() {
           // the atomic display write. On disk/permission failure, retaining
           // live objects is safer than immediately erasing the visible error.
           if (errorMeta.snapshot_ready) {
-            this.loadSession(streamSid, { quiet: true });
+            this._reloadSessionCoalesced(streamSid, { quiet: true });
           } else {
             streamState._seenUpdated = undefined;
             if (streamSid === this.currentId) this._openSeenUpdated = undefined;
@@ -28459,7 +28491,9 @@ function portal() {
         // the user sees the completed reply rather than an in-progress
         // bubble that never resolves.
         const delay = 800 * Math.pow(2, attempts - 1);
-        setTimeout(async () => {
+        this._requestSessionSync(streamSid, "transport_retry", {
+          delayMs: delay,
+          run: async () => {
           // User switched to another tab mid-backoff. The ORIGIN tab's turn
           // is still running on the server — don't _markDone() it (that
           // abandons the transparent reconnect and clears the origin owner's
@@ -28485,7 +28519,7 @@ function portal() {
               _markDone(false, false, true); _stopTimer();
               this._ackViewedActivity(streamSid, streamState, 3);
               if (this.currentId === streamSid) {
-                this.loadSession(streamSid, { quiet: true });
+                this._reloadSessionCoalesced(streamSid, { quiet: true });
               }
               return;
             }
@@ -28525,15 +28559,20 @@ function portal() {
             } else {
               // Schedule next retry ourselves since the old EventSource is
               // closed and no new transport error will fire.
-              setTimeout(() => {
-                if (this.currentId !== streamSid) return;
-                streamState.streaming = false;
-                this.send({ reconnect: true, sessionId: streamSid,
-                            turnId: streamState.activeTurnId || "" });
-              }, 800 * Math.pow(2, attempts));
+              this._requestSessionSync(streamSid, "transport_retry", {
+                delayMs: 800 * Math.pow(2, attempts),
+                run: () => {
+                  if (this.currentId !== streamSid) return false;
+                  streamState.streaming = false;
+                  this.send({ reconnect: true, sessionId: streamSid,
+                              turnId: streamState.activeTurnId || "" });
+                  return true;
+                },
+              });
             }
           }
-        }, delay);
+          },
+        });
       });
       es.addEventListener("cancelled", ev => {
         flushRender();
@@ -28557,7 +28596,7 @@ function portal() {
         streamState._seenUpdated = undefined;
         if (streamSid === this.currentId) this._openSeenUpdated = undefined;
         if (d && d.snapshot_ready) {
-          this.loadSession(streamSid, {
+          this._reloadSessionCoalesced(streamSid, {
             quiet: true,
             probeActive: false,
           }).then(loaded => {
