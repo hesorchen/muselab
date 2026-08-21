@@ -409,7 +409,7 @@ def test_interrupted_turn_sidecar_round_trip(app_module, client, auth, tmp_path)
 
     # Drop a fake sidecar (mimics what _write_active_turn_sidecar does
     # on turn start, then a process death before _delete... could fire).
-    fake_sid = "TEST-CRASHED-TURN-001"
+    fake_sid = "11111111-2222-4333-8444-555555555555"
     sidecar_path = chat_mod._active_turn_path(fake_sid)
     sidecar_path.write_text(json.dumps({
         "sid": fake_sid,
