@@ -3148,6 +3148,26 @@ def test_explicit_send_scroll_mounts_virtual_tail_without_restoring_old_anchor()
     assert scroll.count("this._syncMessageViewport(sid, true)") >= 2
 
 
+def test_warm_transcript_panes_skip_remount_skeleton_and_full_highlight():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+
+    switch_start = app.index("    async switchSession() {")
+    switch_end = app.index("    _afterPaint(fn) {", switch_start)
+    switch = app[switch_start:switch_end]
+    warm_start = switch.index("if (paneWasWarm) {")
+    cold_start = switch.index("} else {", warm_start)
+    warm = switch[warm_start:cold_start]
+
+    assert "stCur.messagesReady = true" in warm
+    assert "this.scrollToBottom(true)" in warm
+    assert "messagesReady = false" not in warm
+    assert "highlightCode" not in warm
+    assert 'x-for="tid in warmTranscriptTabIds()"' in html
+    assert 'x-show="tid === currentId"' in html
+
+
+
 def test_tab_selection_and_layout_changes_share_one_tail_follow_controller():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
     html = (FRONTEND / "index.html").read_text(encoding="utf-8")
@@ -3351,8 +3371,12 @@ def test_long_chat_state_keeps_complete_normalized_history_and_generation_safety
     pane_start = html.index('<div class="msg-pane"')
     pane_end = html.index("<!-- /P1 per-tab message panes", pane_start)
     pane = html[pane_start:pane_end]
-    assert 'x-for="tid in (currentId ? [currentId] : [])"' in html
-    assert "residentPaneIds" not in html
+    assert 'x-for="tid in warmTranscriptTabIds()"' in html
+    assert 'x-show="tid === currentId"' in pane
+    assert "WARM_TRANSCRIPT_LIMIT: 10" in app
+    assert "_touchTranscriptPane(id)" in app
+    assert "st.streaming || st.es" in app
+    assert ".filter(tid => !streamingSet.has(tid))" in app
     assert ':data-tid="tid"' in pane
     assert 'x-for="row in paneRows" :key="row.key"' in pane
     assert "paneMessageRows(tid)" in pane

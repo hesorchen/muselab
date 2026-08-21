@@ -567,6 +567,11 @@ function portal() {
 
     // ===== chat =====
     sessions: [], currentId: "",
+    // Keep a bounded LRU of virtualized transcript panes mounted. The canonical
+    // message repository remains the authority; these are disposable DOM views.
+    _warmTranscriptTabs: [],
+    _transcriptPaneLru: [],
+    WARM_TRANSCRIPT_LIMIT: 10,
     // Canonical history is normalized by stable block identity. Each tab keeps
     // one chronological repository and one explicit revealed/server range.
     _messagesById: new Map(),
@@ -8944,9 +8949,47 @@ function portal() {
       this._fetchTabUsage(id);
     },
 
-    // The DOM is only a projection of the active tab. Normalized envelopes,
-    // stable rich-render cache entries and per-tab viewport state survive tab
-    // switches; no hidden message subtree is retained as a second cache.
+    // Retain ten recently-used virtualized transcript panes. Each pane mounts
+    // only its viewport rows/spacers, so this avoids repeated Alpine/Markdown DOM
+    // reconstruction without retaining a second full-history representation.
+    _touchTranscriptPane(id) {
+      if (!id) return false;
+      const open = new Set(this.workspaceOpenTabIds());
+      open.add(id);
+      const mounted = (this._warmTranscriptTabs || []).filter(tid => open.has(tid));
+      const wasWarm = mounted.includes(id);
+      const previousLru = (this._transcriptPaneLru || []).filter(tid => open.has(tid));
+      const lru = [id, ...previousLru.filter(tid => tid !== id)];
+      this._transcriptPaneLru = lru;
+      // A background stream keeps mutating its pane. Never evict that live DOM;
+      // once it settles, the next activation naturally trims it by LRU again.
+      const streaming = Array.from(open).filter(tid => {
+        const st = this.tabState && this.tabState[tid];
+        return st && (st.streaming || st.es);
+      });
+      const streamingSet = new Set(streaming);
+      const ordinary = lru
+        .filter(tid => !streamingSet.has(tid))
+        .slice(0, this.WARM_TRANSCRIPT_LIMIT);
+      const desired = [...ordinary, ...streaming];
+      const desiredSet = new Set(desired);
+      // Preserve mount order for panes that remain warm. Reordering the x-for on
+      // every click would physically move several large DOM subtrees and recreate
+      // the very tab-switch cost this cache is meant to remove.
+      this._warmTranscriptTabs = [
+        ...mounted.filter(tid => desiredSet.has(tid)),
+        ...desired.filter(tid => !mounted.includes(tid)),
+      ];
+      return wasWarm;
+    },
+    warmTranscriptTabIds() {
+      const open = new Set(this.workspaceOpenTabIds());
+      const warm = (this._warmTranscriptTabs || []).filter(tid => open.has(tid));
+      if (this.currentId && open.has(this.currentId) && !warm.includes(this.currentId)) {
+        return [this.currentId, ...warm];
+      }
+      return warm;
+    },
     _paneElement(tid) {
       const body = this.$refs && this.$refs.chatBody;
       if (!body || !tid) return null;
@@ -9276,6 +9319,7 @@ function portal() {
         this._persistChatDraft(this.currentId, landingState.draft.input);
         this._deletePersistedChatDraft(previousId);
       }
+      this._touchTranscriptPane(this.currentId);
       this._activateTabState(this.currentId);
       const st = this._ensureTabState(this.currentId);
       if (!st._loaded) {
@@ -10753,6 +10797,8 @@ function portal() {
         st._thinkingPatchSeq = (Number(st._thinkingPatchSeq) || 0) + 1;
       }
       if (this._prefetching) delete this._prefetching[id];
+      this._warmTranscriptTabs = (this._warmTranscriptTabs || []).filter(tid => tid !== id);
+      this._transcriptPaneLru = (this._transcriptPaneLru || []).filter(tid => tid !== id);
       if (this.tabState[id] === st) delete this.tabState[id];
       this._dropSessionMessageStore(id);
       this._clearSessionWarnFlags(id);
@@ -11019,6 +11065,7 @@ function portal() {
       st.serviceTier = meta.service_tier;
       this._activateTabState(id);
       if (!this.openTabIds.includes(id)) this.openTabIds.push(id);
+      this._touchTranscriptPane(id);
       if (this._isMobileLayout()) this.setMobileTab("chat");
       this.savePrefs();
       // Start registration without delaying the new-tab interaction. send()
@@ -13869,11 +13916,12 @@ function portal() {
       // Earlier we only did this in openTab, which left chat-tabs taps and
       // a few other paths needing a second tap on the bottom Muse icon.
       if (this._isMobileLayout()) this.setMobileTab("chat");
+      const paneWasWarm = this._touchTranscriptPane(this.currentId);
       // Switch the visible tab. We do NOT touch other tabs' streams — each
       // tab's ES is in its own tabState[id], and stream callbacks write
       // there directly. Switching is just "show that tab".
-      // Only the active pane is mounted. Normalized messages and stable-key rich
-      // HTML caches retain state while Alpine rebuilds this viewport projection.
+      // The active pane and the nine most-recent panes stay mounted as bounded
+      // virtualized DOM views. Canonical messages remain owned by tabState.
       this._activateTabState(this.currentId);
       // Selecting a conversation means opening its latest state, not restoring a
       // stale historical viewport. Reader-controlled position is preserved only
@@ -13929,26 +13977,33 @@ function portal() {
         await this._ensureSessionLoaded(target);
         if (this.currentId === target) this.scrollToBottom(true);
       } else {
-        // The keyed single-pane projection remounts from normalized state without
-        // refetching. Reveal after the tab change paints, then restore position.
         const target = this.currentId;
-        const stCur = this.tabState && this.tabState[this.currentId];
+        const stCur = this.tabState && this.tabState[target];
         stCur.atBottom = true;
-        // Hide bubbles for one frame so the tab-bar flip + skeleton paints
-        // immediately; reveal next frame after the single pane remounts.
-        stCur.messagesReady = false;
-        this._afterPaint(() => {
-          if (this.currentId !== target) return;
+        if (paneWasWarm) {
+          // Warm pane: x-show reveals the existing keyed DOM. Do not flash a
+          // skeleton, rebuild directives, or rescan already-highlighted content.
           stCur.messagesReady = true;
+          this.$nextTick(() => {
+            if (this.currentId === target) this.scrollToBottom(true);
+          });
+        } else {
+          // Cold LRU miss: the pane is being reconstructed from normalized state.
+          // Paint the tab selection first, then reveal/highlight this new DOM once.
+          stCur.messagesReady = false;
           this._afterPaint(() => {
             if (this.currentId !== target) return;
-            this.scrollToBottom(true);
-            // Fresh DOM → always (re)highlight; reset the sentinel first.
-            if (stCur) stCur._highlighted = false;
-            this.highlightCode(".chat-body");
-            if (stCur) stCur._highlighted = true;
+            stCur.messagesReady = true;
+            this._afterPaint(() => {
+              if (this.currentId !== target) return;
+              this.scrollToBottom(true);
+              stCur._highlighted = false;
+              const pane = this._paneElement(target);
+              this.highlightCode(".chat-body", pane ? [pane] : null);
+              stCur._highlighted = true;
+            });
           });
-        });
+        }
       }
       this._scheduleTransparentHistory(st, false);
     },

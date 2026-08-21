@@ -1899,13 +1899,14 @@
                to hide the avatar on all but the FIRST assistant-side
                msg in a run — visually the same "one avatar per turn"
                result without a derived data structure. -->
-          <!-- Only the active pane is mounted. Stable normalized messages,
-               cached rich HTML and viewport rows reconstruct it without keeping
-               hidden rich DOM resident for background tabs. Single-instance
-               decorations read the activeSession façade so they share the same
-               tab owner as this pane. -->
-          <template x-for="tid in (currentId ? [currentId] : [])" :key="tid">
+          <!-- Keep ten recent virtualized panes mounted as an LRU DOM cache.
+               Hidden panes retain their keyed Alpine/Markdown view but remain out
+               of layout; canonical messages still live only in tabState. -->
+          <template x-for="tid in warmTranscriptTabIds()" :key="tid">
           <div class="msg-pane"
+               x-show="tid === currentId"
+               x-cloak
+               :aria-hidden="tid === currentId ? null : 'true'"
                :data-tid="tid"
                x-data="{ get pane(){ return paneState(tid) }, get paneMsgs(){ return paneMessages(tid) }, get paneRows(){ return paneMessageRows(tid) } }">
           <template x-for="row in paneRows" :key="row.key">
