@@ -1948,7 +1948,7 @@ def test_workspace_switch_disables_composer_and_gates_programmatic_user_send():
     assert "if (this.workspaceSwitching && !opts.reconnect && !opts.resumedItem) return" in send
     assert ':disabled="workspaceSwitching || !availableModels.length"' in textarea
     assert 'multiple style="display:none" :disabled="workspaceSwitching"' in html
-    assert ':disabled="workspaceSwitching || !availableModels.length' in html
+    assert ':disabled="!!composerDisabledReason(currentId)"' in html
     assert ':disabled="workspaceSwitching || !!(tabState[currentId]' in html
 
 
@@ -1960,8 +1960,8 @@ def test_stop_control_interrupts_session_and_never_removes_queue_items():
 
     assert 'x-show="isTabStreaming(currentId)"' in html
     assert "chat-toolbar-stop" in html
-    assert "tabState[currentId]?._stopping" in html
-    assert "等待上一条任务完成中断" in html
+    assert "if (st._stopping)" in app
+    assert "正在中断上一条任务" in app
     assert "sendButtonHint(currentId)" in html
     assert "撤回队尾" not in html
     assert "removePendingQueueItem" not in stop
@@ -2259,25 +2259,27 @@ def test_detached_rollover_preserves_migrated_queue_fifo():
     assert "_confirmSessionBusy" not in slash
 
 
-def test_composer_send_has_a_per_session_reentry_guard():
+def test_composer_send_has_one_claim_owner_and_visible_disabled_reason():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
     html = (FRONTEND / "index.html").read_text(encoding="utf-8")
     send_start = app.index("    async send(opts = {}) {")
     send_end = app.index("\n    // ====== ask_user_question", send_start)
     send = app[send_start:send_end]
 
-    assert "_composerSubmitting: false" in app
+    assert "_composerSubmitting" not in app
     assert "_composerSubmitToken: null" in app
+    assert '_composerSubmitPhase: ""' in app
     assert "if (sendState._composerSubmitToken" in send
-    assert "sendState._composerSubmitting = true;" in send
-    assert "} finally {" in send
-    assert "owner._composerSubmitting = false;" in send
-    assert send.index("sendState._composerSubmitting = true;") < send.index(
+    assert 'sendState._composerSubmitPhase = "submitting";' in send
+    assert "this._releaseComposerClaim(composerSubmitToken);" in send
+    assert send.index('sendState._composerSubmitPhase = "submitting";') < send.index(
         "await this._awaitRuntimeSettingPatches(sendSid, sendState)"
     )
     assert "if (ev.repeat) return;" in app
-    assert "tabState[currentId]?._composerSubmitting" in html
-    assert ':aria-busy="!!tabState[currentId]?._composerSubmitting"' in html
+    assert ':disabled="!!composerDisabledReason(currentId)"' in html
+    assert ':aria-busy="composerClaimed(currentId)"' in html
+    assert 'id="composer-send-status"' in html
+    assert 'x-text="composerDisabledReason(currentId)"' in html
     enqueue_start = app.index("    async _enqueueMessage(sid, item) {")
     enqueue_end = app.index("\n    // Post-turn / on-activate hook", enqueue_start)
     enqueue = app[enqueue_start:enqueue_end]
@@ -2291,8 +2293,40 @@ def test_composer_send_has_a_per_session_reentry_guard():
     assert "this._scheduleBackgroundHandoff(streamSid, streamState);" in send
     assert "_backgroundSuccessorSid: \"\"" in app
     assert "child._composerSubmitToken = sourceState._composerSubmitToken || null;" in app
+    assert 'child._composerSubmitPhase = child._composerSubmitToken' in app
     assert "const successorState = () =>" in send
-    assert "successorState()," in send
+    assert "ownsSubmittedDraft(successorState())" in send
+
+
+def test_composer_disabled_state_covers_failures_without_blocking_durable_queue():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    css = (FRONTEND / "styles.css").read_text(encoding="utf-8")
+    start = app.index("    composerDisabledReason(sid = this.currentId) {")
+    end = app.index("\n    sendButtonHint(sid) {", start)
+    disabled = app[start:end]
+
+    for state in (
+        "workspaceSwitching", "_stopping", "_composerSubmitToken",
+        "_permissionChangePending", "runtimeSettingsPending(sid)",
+        "_sendWaitingForUpload", "item.uploading", "item.error || !item.id",
+    ):
+        assert state in disabled
+    # Streaming, compaction and queued items are delivery modes: send() must
+    # remain enabled so the backend's durable FIFO can accept the next prompt.
+    assert ".streaming" not in disabled
+    assert ".compacting" not in disabled
+    assert "pendingQueue" not in disabled
+    assert 'this._isBusy(sid) ? this.t("queue.button_hint")' in app
+    assert 'this._setComposerClaimPhase(sendState, composerSubmitToken, "queue")' in app
+    assert 'this._setComposerClaimPhase(sendState, composerSubmitToken, "stream_start")' in app
+    assert 'sourceState._composerSubmitPhase = "rollover"' in app
+    assert 'class="chat-composer-disabled-reason"' in html
+    assert "overflow: hidden;" in css[css.index(".chat-transcript-wrap {"):
+                                      css.index(".chat-body {", css.index(".chat-transcript-wrap {"))]
+    assert "max-height: min(50dvh, 420px);" in css
+    assert "max-height: 132px;" in css
+    assert "flex: 0 0 26px;" in css
 
 
 def test_attachment_uploads_have_deadlines_and_never_log_filenames():
@@ -3016,7 +3050,7 @@ def test_stream_deltas_use_throttled_plain_snapshots_and_final_rich_render():
     composer_start = css.index(
         ".chat-input {", css.index("VSCode-Claude style bottom input area"))
     chat_input = css[composer_start:css.index("}", composer_start)]
-    assert "flex-shrink: 0" in chat_input
+    assert "flex: 0 0 auto" in chat_input
     assert ".chat-input-wrap { padding: 0; }" in css
     assert ".chat-toolbar.has-stop .chat-toolbar-ring" in css
     assert ".chat-toolbar-rl { display: none !important; }" in css
@@ -3608,7 +3642,7 @@ def test_chat_send_and_stop_buttons_are_icon_only_but_accessible():
     buttons = html[toolbar_start:toolbar_end]
     assert 'x-text="t(\'btn.send\')"' not in buttons
     assert 'x-text="t(\'btn.stop\')"' not in buttons
-    assert "tabState[currentId]?._stopping" in buttons
+    assert ':aria-busy="composerClaimed(currentId)"' in buttons
     assert buttons.count("sendButtonHint(currentId)") == 2
     send_hint_start = app.index("    sendButtonHint(sid) {")
     send_hint_end = app.index("\n    async _confirmSessionBusy", send_hint_start)
@@ -3916,7 +3950,7 @@ def test_queue_controls_validate_mutations_and_block_send_during_interrupt():
     send_end = app.index("\n    // ====== ask_user_question", send_start)
     send = app[send_start:send_end]
     assert "if (sendState._stopping && !opts.reconnect && !opts.resumedItem)" in send
-    assert "tabState[currentId]?._stopping" in html
+    assert "if (st._stopping)" in app
     assert "queueActionBusy(currentId, 'edit:' + q.id)" in html
     assert "queueActionBusy(currentId, 'remove:' + q.id)" in html
     assert "sess.pause_queue_if_nonempty(session_id)" in chat

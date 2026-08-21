@@ -3585,40 +3585,20 @@
               <span class="chat-toolbar-rl-text" x-text="currentQuotaText()"></span>
             </span>
             <span class="chat-toolbar-spacer"></span>
-            <!-- Send / Stop. The button is disabled while ANY attachment is
-                 still mid-upload (pendingImages/pendingDocs .uploading) — the
-                 user cannot fire a turn until every image/doc finishes, so a
-                 half-uploaded attachment can never be sent. `_sendWaitingForUpload`
-                 stays as a belt-and-suspenders guard for the resumed-queue path
-                 (drained item whose snapshot is still uploading), where the
-                 auto-wait inside sendMessage polls to completion. Together they
-                 also stop a double-tap from queueing two sends for one upload. -->
-            <!-- Send button — always visible. send() routes the click:
-                 idle → fire SSE; streaming/compacting → enqueue onto
-                 tabState[currentId].pendingQueue. A small badge in the
-                 corner surfaces the current backlog count. The title
-                 swaps to reflect what the click will actually do, so
-                 the user always knows. The neighboring stop button only
-                 shows while streaming. Same shape + size + fill — they
-                 read as a sibling pair (blue send / red stop). -->
+            <!-- Send stays visible. composerDisabledReason() owns blocking and
+                 explains it below; streaming, compact and queued work remain
+                 routable states that send() appends to the durable FIFO. -->
             <button @click="send()"
-                    :disabled="workspaceSwitching || !availableModels.length || tabState[currentId]?._stopping || tabState[currentId]?._composerSubmitting || tabState[currentId]?._permissionChangePending || runtimeSettingsPending() || _sendWaitingForUpload || pendingImages.some(im => im.uploading) || pendingDocs.some(d => d.uploading) || (!input.trim() && !pendingQuotes.length && !pendingImages.length && !pendingDocs.length)"
+                    :disabled="!!composerDisabledReason(currentId)"
                     class="btn-primary chat-toolbar-send chat-toolbar-queue"
-                    :aria-busy="!!tabState[currentId]?._composerSubmitting"
-                    :aria-label="tabState[currentId]?._composerSubmitting
-                      ? (lang==='zh' ? '正在发送' : 'Sending')
-                      : tabState[currentId]?._stopping
-                      ? (lang==='zh' ? '正在中断' : 'Stopping')
-                      : sendButtonHint(currentId)"
-                    :title="tabState[currentId]?._composerSubmitting
-                      ? (lang==='zh' ? '正在提交消息' : 'Submitting message')
-                      : tabState[currentId]?._stopping
-                      ? (lang==='zh' ? '等待上一条任务完成中断' : 'Waiting for the previous turn to stop')
-                      : sendButtonHint(currentId)">
+                    :aria-busy="composerClaimed(currentId)"
+                    aria-describedby="composer-send-status"
+                    :aria-label="sendButtonHint(currentId)"
+                    :title="sendButtonHint(currentId)">
               <span class="spinner-sm"
-                    x-show="tabState[currentId]?._composerSubmitting"></span>
+                    x-show="composerClaimed(currentId)"></span>
               <span class="icon"
-                    x-show="!tabState[currentId]?._composerSubmitting"><svg><use href="#i-send"/></svg></span>
+                    x-show="!composerClaimed(currentId)"><svg><use href="#i-send"/></svg></span>
               <span class="chat-toolbar-queue-badge"
                     x-show="_currentQueueLen() > 0"
                     x-text="_currentQueueLen()"></span>
@@ -3632,6 +3612,12 @@
             </button>
           </div>
         </div>
+        <div id="composer-send-status"
+             class="chat-composer-disabled-reason"
+             role="status"
+             aria-live="polite"
+             x-show="composerDisabledReason(currentId)"
+             x-text="composerDisabledReason(currentId)"></div>
       </div>
     </aside>
 

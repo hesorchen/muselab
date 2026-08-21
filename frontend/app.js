@@ -7241,8 +7241,10 @@ function portal() {
         // runtime rollover can take seconds on a long transcript; without a
         // per-composer claim every Enter during that wait submits the same
         // still-visible draft again.
-        _composerSubmitting: false,
         _composerSubmitToken: null,
+        // Human-readable phase for the unique composer claim above. The token
+        // owns exclusion; this phase only explains that ownership to the user.
+        _composerSubmitPhase: "",
         _backgroundHandoffScheduled: false,
         // A background task can settle before Claude starts its automatic
         // follow-up reaction. Keep the transport attached, but suppress the
@@ -7464,8 +7466,8 @@ function portal() {
         st._backgroundSuccessorSid = "";
       }
       if (st._handoffSourceSid === undefined) st._handoffSourceSid = "";
-      if (st._composerSubmitting === undefined) st._composerSubmitting = false;
       if (st._composerSubmitToken === undefined) st._composerSubmitToken = null;
+      if (st._composerSubmitPhase === undefined) st._composerSubmitPhase = "";
       if (st._backgroundHandoffScheduled === undefined) {
         st._backgroundHandoffScheduled = false;
       }
@@ -7491,8 +7493,82 @@ function portal() {
         || (st && (st.compacting || st.backgroundActive || st._draining
           || (st.pendingQueue && st.pendingQueue.length))));
     },
+    composerClaimed(sid = this.currentId) {
+      const st = sid && this.tabState && this.tabState[sid];
+      return !!(st && st._composerSubmitToken);
+    },
+    _composerClaimReason(st) {
+      const zh = this.lang === "zh";
+      switch (st && st._composerSubmitPhase) {
+        case "upload":
+          return zh ? "正在等待附件上传完成" : "Waiting for attachments to upload";
+        case "queue":
+          return zh ? "正在将消息保存到队列" : "Saving the message to the queue";
+        case "stream_start":
+          return zh ? "正在启动回复" : "Starting the response";
+        case "rollover":
+          return zh ? "正在切换到接续会话" : "Switching to the successor session";
+        default:
+          return zh ? "正在提交消息" : "Submitting the message";
+      }
+    },
+    composerDisabledReason(sid = this.currentId) {
+      const zh = this.lang === "zh";
+      if (this.workspaceSwitching) {
+        return zh ? "正在切换工作区" : "Switching workspace";
+      }
+      if (!sid) return zh ? "请先打开会话" : "Open a session first";
+      if (!this.availableModels || !this.availableModels.length) {
+        return !this._modelsLoaded
+          ? (zh ? "正在加载可用模型" : "Loading available models")
+          : (zh ? "请先配置可用模型" : "Configure an available model first");
+      }
+      const st = this.tabState && this.tabState[sid];
+      if (!st) return zh ? "正在准备会话" : "Preparing the session";
+      if (st._stopping) {
+        return zh ? "正在中断上一条任务" : "Stopping the previous turn";
+      }
+      if (st._composerSubmitToken) return this._composerClaimReason(st);
+      if (st._permissionChangePending) return this.t("perm.switching");
+      if (this.runtimeSettingsPending(sid)) {
+        return zh ? "正在保存运行设置" : "Saving runtime settings";
+      }
+      const draft = st.draft || {};
+      const images = draft.pendingImages || [];
+      const docs = draft.pendingDocs || [];
+      if (draft._sendWaitingForUpload
+          || images.some(item => item.uploading)
+          || docs.some(item => item.uploading)) {
+        return zh ? "附件仍在上传" : "Attachments are still uploading";
+      }
+      if (images.some(item => item.error || !item.id)
+          || docs.some(item => item.error || !item.id)) {
+        return zh
+          ? "附件上传失败，请移除失败项或重新上传"
+          : "An attachment failed to upload; remove or re-upload it";
+      }
+      const hasContent = !!(String(draft.input || "").trim()
+        || (draft.pendingQuotes || []).length || images.length || docs.length);
+      if (!hasContent) return zh ? "输入消息后即可发送" : "Type a message to send";
+      return "";
+    },
     sendButtonHint(sid) {
+      const disabled = this.composerDisabledReason(sid);
+      if (disabled) return disabled;
       return this._isBusy(sid) ? this.t("queue.button_hint") : this.t("btn.send");
+    },
+    _setComposerClaimPhase(st, token, phase) {
+      if (st && st._composerSubmitToken === token) {
+        st._composerSubmitPhase = phase || "submitting";
+      }
+    },
+    _releaseComposerClaim(token) {
+      if (!token) return;
+      for (const st of Object.values(this.tabState || {})) {
+        if (!st || st._composerSubmitToken !== token) continue;
+        st._composerSubmitToken = null;
+        st._composerSubmitPhase = "";
+      }
     },
     async _confirmSessionBusy(sid, st = this.tabState[sid]) {
       if (!sid) return false;
@@ -7893,8 +7969,9 @@ function portal() {
       // newly visible child enables Send again with the submitted text still
       // present, and a second Enter can enqueue a duplicate before the first
       // POST's finally block gets a chance to run.
-      child._composerSubmitting = !!sourceState._composerSubmitting;
       child._composerSubmitToken = sourceState._composerSubmitToken || null;
+      child._composerSubmitPhase = child._composerSubmitToken
+        ? "rollover" : "";
       // The composer moves to the successor, but it must be a different owner
       // object. Upload entries may hold browser File objects, so copy their
       // arrays rather than JSON-serialising them.
@@ -7933,6 +8010,9 @@ function portal() {
         return await sourceState._backgroundHandoffPromise;
       }
       const task = (async () => {
+        if (sourceState._composerSubmitToken) {
+          sourceState._composerSubmitPhase = "rollover";
+        }
         const sourceMeta = (this.sessions || []).find(s => s.id === sourceSid) || {};
         let response;
         try {
@@ -26931,7 +27011,7 @@ function portal() {
           return false;
         }
         sendState._composerSubmitToken = composerSubmitToken;
-        sendState._composerSubmitting = true;
+        sendState._composerSubmitPhase = "submitting";
       }
       // `finally` must be able to release a composer claim after a proactive
       // handoff replaces the source tabState. Keep this resolver in send()'s
@@ -27139,6 +27219,7 @@ function portal() {
         const stillUploading = () => ownedImages.some(im => im.uploading)
           || ownedDocs.some(d => d.uploading);
         if (stillUploading()) {
+          this._setComposerClaimPhase(sendState, composerSubmitToken, "upload");
           sendDraft._sendWaitingForUpload = true;
           if (sendSid === this.currentId) this._sendWaitingForUpload = true;
           try {
@@ -27152,6 +27233,7 @@ function portal() {
             }
           }
           if (!ownsSendDraft()) return false;
+          this._setComposerClaimPhase(sendState, composerSubmitToken, "submitting");
         }
         // An attachment is part of the user's send intent. If any upload failed,
         // keep every chip/draft in place and refuse the send instead of silently
@@ -27194,6 +27276,7 @@ function portal() {
         ? await this._confirmSessionBusy(sendSid, sendState)
         : false;
       if (confirmedBusy) {
+        this._setComposerClaimPhase(sendState, composerSubmitToken, "queue");
         const shouldHandoffBackground = !sendState.streaming
           && !sendState.compacting
           && sendState.backgroundActive
@@ -27425,6 +27508,7 @@ function portal() {
       // downgrade to putting the prompt + token back into the URL — retry
       // the ticket once, then surface the failure instead.
       let url;
+      this._setComposerClaimPhase(sendState, composerSubmitToken, "stream_start");
       const streamStartController = new AbortController();
       streamState._streamStartController = streamStartController;
       streamState._cancelBeforeStream = false;
@@ -29173,15 +29257,10 @@ function portal() {
       // before the reconnect restored streaming. Removing it stops that flicker.
       } finally {
         if (isComposerSubmission) {
-          const owners = [
-            this.tabState[sendSid] === sendState ? sendState : null,
-            successorState(),
-          ];
-          for (const owner of owners) {
-            if (!owner || owner._composerSubmitToken !== composerSubmitToken) continue;
-            owner._composerSubmitToken = null;
-            owner._composerSubmitting = false;
-          }
+          // Runtime rollover may replace the source more than once while an
+          // async queue/start request settles. The token is globally unique, so
+          // release every surviving holder instead of guessing one successor.
+          this._releaseComposerClaim(composerSubmitToken);
         }
       }
     },

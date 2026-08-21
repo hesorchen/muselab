@@ -248,6 +248,8 @@ def test_ticket_failure_restores_draft_and_idle_state(
             bubbleCount: app.messages.filter(
               m => m.role === 'user' && m.text === 'ticket-failure-recovered'
             ).length,
+            claimToken: app.tabState[app.currentId]._composerSubmitToken,
+            claimPhase: app.tabState[app.currentId]._composerSubmitPhase,
             hasToast: app.toasts.some(t => t.msg.includes('发送失败')
               || t.msg.includes('Send failed')),
           };
@@ -263,6 +265,8 @@ def test_ticket_failure_restores_draft_and_idle_state(
         "imageIds": ["recover-image"],
         "docIds": ["recover-doc"],
         "bubbleCount": 0,
+        "claimToken": None,
+        "claimPhase": "",
         "hasToast": True,
     }
     assert not page.locator("#jserr").is_visible()
@@ -397,6 +401,97 @@ def test_send_upload_wait_is_owned_by_starting_tab(
     assert settled == [False, False, False]
 
 
+def test_composer_disabled_reason_is_visible_and_busy_states_still_queue(
+        page: Page, backend_url, auth_token):
+    _login(page, backend_url, auth_token)
+    page.locator(".chat-input-textarea").fill("NEXT")
+    page.evaluate(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const st = app._ensureTabState(app.currentId);
+          app.lang = 'en';
+          app._modelsLoaded = true;
+          app.availableModels = [{model: 'fake-model', group: 'test'}];
+          st.compacting = true;
+        }"""
+    )
+    send = page.locator(".chat-toolbar-queue")
+    expect(send).to_be_enabled()
+    expect(page.locator("#composer-send-status")).to_be_hidden()
+    assert "queue" in (send.get_attribute("title") or "").lower()
+
+    states = page.evaluate(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const st = app.tabState[app.currentId];
+          const reason = phase => {
+            st._composerSubmitToken = 'claim-visible';
+            st._composerSubmitPhase = phase;
+            return app.composerDisabledReason(app.currentId);
+          };
+          const values = {
+            queue: reason('queue'),
+            streamStart: reason('stream_start'),
+            rollover: reason('rollover'),
+          };
+          app._releaseComposerClaim('claim-visible');
+          st.compacting = false;
+          st.draft.pendingDocs = [{id: '', uploading: false, error: true}];
+          values.uploadError = app.composerDisabledReason(app.currentId);
+          st.draft.pendingDocs = [];
+          st.draft.input = '';
+          app._activateComposerState(app.currentId);
+          values.empty = app.composerDisabledReason(app.currentId);
+          return values;
+        }"""
+    )
+    assert states == {
+        "queue": "Saving the message to the queue",
+        "streamStart": "Starting the response",
+        "rollover": "Switching to the successor session",
+        "uploadError": "An attachment failed to upload; remove or re-upload it",
+        "empty": "Type a message to send",
+    }
+    expect(send).to_be_disabled()
+    expect(page.locator("#composer-send-status")).to_have_text("Type a message to send")
+
+
+def test_composer_and_send_stay_visible_with_tall_content(
+        page: Page, backend_url, auth_token):
+    _login(page, backend_url, auth_token)
+    metrics = page.evaluate(
+        """() => {
+          const body = document.querySelector('.chat-body');
+          const pane = document.querySelector('.pane.chat');
+          const composer = document.querySelector('.chat-input');
+          const send = document.querySelector('.chat-toolbar-queue');
+          const attachments = document.querySelector('.img-attachments');
+          const tall = document.createElement('div');
+          tall.style.height = '6000px';
+          tall.style.flex = '0 0 6000px';
+          body.appendChild(tall);
+          attachments.style.display = 'flex';
+          for (let i = 0; i < 40; i += 1) {
+            const chip = document.createElement('div');
+            chip.className = 'doc-chip';
+            chip.textContent = 'attachment-' + i;
+            attachments.appendChild(chip);
+          }
+          const rect = el => {
+            const r = el.getBoundingClientRect();
+            return {top: r.top, bottom: r.bottom, height: r.height};
+          };
+          return {pane: rect(pane), composer: rect(composer), send: rect(send),
+                  attachments: rect(attachments)};
+        }"""
+    )
+    assert metrics["composer"]["top"] >= metrics["pane"]["top"]
+    assert metrics["composer"]["bottom"] <= metrics["pane"]["bottom"] + 1
+    assert metrics["send"]["top"] >= metrics["composer"]["top"]
+    assert metrics["send"]["bottom"] <= metrics["composer"]["bottom"]
+    assert metrics["attachments"]["height"] <= 132
+
+
 def test_repeated_enter_while_background_busy_submits_one_draft(
         page: Page, backend_url, auth_token):
     """Rapid and repeated Enter events share one composer submission claim."""
@@ -445,7 +540,7 @@ def test_repeated_enter_while_background_busy_submits_one_draft(
     assert page.evaluate(
         "() => document.querySelector('#app')._x_dataStack[0]"
         ".tabState[document.querySelector('#app')._x_dataStack[0].currentId]"
-        "._composerSubmitting") is True
+        "._composerSubmitToken") is not None
     expect(page.locator(".chat-toolbar-queue")).to_be_disabled()
 
     page.evaluate("() => window.__releaseBusy()")
@@ -453,7 +548,7 @@ def test_repeated_enter_while_background_busy_submits_one_draft(
     page.wait_for_function(
         """() => {
           const app = document.querySelector('#app')._x_dataStack[0];
-          return app.tabState[app.currentId]._composerSubmitting === false;
+          return app.tabState[app.currentId]._composerSubmitToken === null;
         }"""
     )
     result = page.evaluate(
@@ -531,7 +626,7 @@ def test_background_send_resolves_before_runtime_handoff(
           return {
             order: window.__sendOrder,
             input: app.input,
-            submitting: app.tabState[app.currentId]._composerSubmitting,
+            submitting: !!app.tabState[app.currentId]._composerSubmitToken,
           };
         }"""
     )
@@ -624,7 +719,7 @@ def test_background_handoff_during_queue_post_settles_successor_composer(
           const app = document.querySelector('#app')._x_dataStack[0];
           const st = app.tabState[app.currentId];
           return {input: app.input, draft: st.draft.input,
-                  submitting: st._composerSubmitting};
+                  submitting: !!st._composerSubmitToken};
         }"""
     )
     assert before == {"input": "RACE_ONCE", "draft": "RACE_ONCE", "submitting": True}
@@ -637,7 +732,7 @@ def test_background_handoff_during_queue_post_settles_successor_composer(
           const app = document.querySelector('#app')._x_dataStack[0];
           const st = app.tabState[app.currentId];
           return {input: app.input, draft: st.draft.input,
-                  submitting: st._composerSubmitting,
+                  submitting: !!st._composerSubmitToken,
                   token: st._composerSubmitToken, queueCalls: window.__queueCalls,
                   queueIds: st.pendingQueue.map(item => item.id),
                   attachSids: window.__attachSids};

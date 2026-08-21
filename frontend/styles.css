@@ -4223,6 +4223,9 @@ pre.text {
   position: relative;
   display: flex;
   flex-direction: column;
+  /* Transcript content owns the scroll, never the pane. This hard boundary
+     keeps a very tall block/compact summary from sizing the composer away. */
+  overflow: hidden;
 }
 .chat-body {
   flex: 1; overflow-y: auto;
@@ -5643,6 +5646,10 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 .img-attachments {
   display: flex; flex-wrap: wrap; gap: 6px;
   padding: 6px 4px;
+  max-height: 132px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  flex: 0 1 auto;
 }
 .selection-quote-chip {
   position: relative;
@@ -7144,10 +7151,14 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
      row 3: chat-toolbar — every control compactly stacked here */
 .chat-input {
   display: flex; flex-direction: column;
-  flex-shrink: 0;
+  flex: 0 0 auto;
+  min-height: 0;
+  max-height: 420px;
+  max-height: min(50dvh, 420px);
   gap: 6px; padding: var(--sp-2);
   border-top: 1px solid var(--c-border); background: var(--c-bg-1);
   position: relative;
+  z-index: 6;
   /* Match .chat-body's centered reading column on wide viewports so
      the input field aligns visually with the message bubbles instead
      of stretching corner-to-corner under a narrow message column.
@@ -7211,9 +7222,18 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
    share the same 26px height + same hover behavior. */
 .chat-toolbar {
   display: flex; align-items: center; gap: 2px;
+  min-width: 0;
   padding: 4px 6px;
   border-top: 1px solid var(--c-border);
   background: var(--c-bg-1);
+}
+.chat-composer-disabled-reason {
+  min-width: 0;
+  padding: 0 4px;
+  color: var(--c-fg-3);
+  font-size: var(--fs-2xs);
+  line-height: 1.35;
+  overflow-wrap: anywhere;
 }
 .chat-toolbar-btn {
   display: inline-flex; align-items: center; justify-content: center;
@@ -7439,6 +7459,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
    swaps to a danger-style stop button automatically. */
 .chat-toolbar-send {
   height: 26px; width: 26px; padding: 0;
+  flex: 0 0 26px;
   display: inline-flex; align-items: center; justify-content: center;
   border: 0; border-radius: var(--r-md); cursor: pointer;
   background: var(--c-btn-primary-bg); color: var(--c-on-accent);
