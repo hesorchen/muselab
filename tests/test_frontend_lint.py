@@ -4048,14 +4048,17 @@ def test_per_message_timestamps_are_plumbed_but_only_shown_on_expand():
     the current turn, so it would abort on the first block it saw.
     """
     chat = (BACKEND / "chat.py").read_text(encoding="utf-8")
+    history = (BACKEND / "chat_history.py").read_text(encoding="utf-8")
     html = (FRONTEND / "index.html").read_text(encoding="utf-8")
 
     assert "def _transcript_ts_ms(entry: dict) -> int | None:" in chat
-    # Both raw-entry loaders stamp it; the pure-SDK loader can't (SessionMessage
-    # has no timestamp field) and consumers must tolerate its absence.
-    assert chat.count("_transcript_ts_ms(e)") == 2
+    assert "return chat_history.transcript_ts_ms(entry)" in chat
+    assert "def transcript_ts_ms(entry: dict) -> int | None:" in history
+    # Raw-entry loaders stamp it; the pure-SDK loader can't (SessionMessage has
+    # no timestamp field) and consumers must tolerate its absence.
+    assert "timestamp_ms=_transcript_ts_ms" in chat
     assert 'entry["mts"] = mts_by_uuid[u]' in chat
-    assert '__slots__ = ("uuid", "type", "message", "mts")' in chat
+    assert '__slots__ = ("uuid", "type", "message", "mts")' in history
 
     # Shown only on an EXPANDED tool card — 30+ stamped cards per turn costs
     # more attention than it returns, and the separator already answers "when".
