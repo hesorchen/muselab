@@ -2891,6 +2891,15 @@ async def _build_and_connect_client(
             )],
         },
     )
+    if permission == "bypassPermissions" and not side_question_runtime:
+        # bypassPermissions shadows can_use_tool, but PreToolUse still runs.
+        # Route the SDK-native AskUserQuestion through the same interactive UI
+        # as the MuseLab MCP alias instead of letting the CLI return its terminal
+        # placeholder ("Answer questions?") with no clickable options.
+        opts_kwargs["hooks"].setdefault("PreToolUse", []).append(HookMatcher(
+            matcher="AskUserQuestion",
+            hooks=[perm.build_ask_user_question_hook_for_session(session_id)],
+        ))
     if side_question_runtime:
         # Side questions are deliberately narrower than ordinary workspace
         # agents.  `tools` removes every built-in except public web lookup;
@@ -3143,9 +3152,9 @@ async def _build_and_connect_client(
             opts_kwargs["effort"] = sdk_effort
     # can_use_tool resolves SDK permission prompts; it is not a universal tool
     # hook. In bypassPermissions the SDK approves tools before consulting the
-    # callback, so wiring it there only creates a false AskUserQuestion promise
-    # plus CanUseToolShadowedWarning noise. Interactive questions use the
-    # dedicated muselab MCP tool in every mode.
+    # callback, so wiring it there only creates CanUseToolShadowedWarning noise.
+    # Native AskUserQuestion is handled by the dedicated PreToolUse hook above;
+    # the MuseLab MCP question tool remains available in every mode as well.
     if permission != "bypassPermissions" and not side_question_runtime:
         opts_kwargs["can_use_tool"] = perm.build_callback_for_session(
             session_id,

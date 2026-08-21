@@ -7,10 +7,10 @@ Two responsibilities now share one callback (SDK 0.2.82 routes both through
 1. **Tool approval** (when permission_mode != bypassPermissions):
    surface a permission card, await Allow / Deny / Always.
 
-2. **AskUserQuestion** (only when the SDK actually asks): SDK's native
-   multiple-choice tool. In bypass mode the SDK auto-approves tools before
-   this callback, so muselab's reliable interactive surface is the dedicated
-   `mcp__muselab__ask_user_question` tool instead.
+2. **AskUserQuestion**: SDK's native multiple-choice tool. Normal permission
+   modes route it through `can_use_tool`; bypass mode routes it through a
+   dedicated PreToolUse hook because the SDK auto-approves tools before calling
+   the permission callback.
 
 "Always allow" works at the muselab session level (in-memory): subsequent calls
 to the same (tool, key) pair bypass the prompt for the rest of this session.
@@ -380,6 +380,38 @@ async def _handle_ask_user_question(
     # SDK requires both `questions` and `answers` in updated_input.
     return PermissionResultAllow(
         updated_input={"questions": questions, "answers": answers})
+
+
+def build_ask_user_question_hook_for_session(session_id: str):
+    """Route native AskUserQuestion through MuseLab in bypass mode.
+
+    ``can_use_tool`` is shadowed by ``bypassPermissions``, but PreToolUse hooks
+    still run. Reuse the same question bridge and translate its SDK permission
+    result into the hook result shape expected by Claude Code.
+    """
+    async def hook(input_data, _tool_use_id, _context):
+        data = input_data if isinstance(input_data, dict) else {}
+        tool_input = data.get("tool_input")
+        if not isinstance(tool_input, dict):
+            tool_input = {}
+        result = await _handle_ask_user_question(session_id, tool_input)
+        if result.behavior == "allow":
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "allow",
+                    "updatedInput": result.updated_input or tool_input,
+                }
+            }
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": result.message,
+            }
+        }
+
+    return hook
 
 
 async def _handle_exit_plan_mode(
