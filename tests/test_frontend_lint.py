@@ -2901,6 +2901,40 @@ def test_queue_sync_keeps_older_success_when_newer_read_fails():
     assert "st._queueSyncSeq !== seq" not in sync
 
 
+def test_transcript_active_session_ui_reads_through_pane_facade():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+
+    accessor_start = app.index("activeSessionPane()")
+    accessor = app[accessor_start:app.index("paneMessages(tid)", accessor_start)]
+    assert "this.paneState(this.currentId)" in accessor
+    assert "_EMPTY_ACTIVE_SESSION_PANE" in accessor
+
+    body_start = html.index('<div class="chat-transcript-wrap"')
+    body_end = html.index('<div class="chat-input">', body_start)
+    transcript = html[body_start:body_end]
+    assert 'get activeSession(){ return activeSessionPane() }' in transcript
+    for binding in (
+        "activeSession.messages",
+        "activeSession.messagesReady",
+        "activeSession.messagesLoading",
+        "activeSession.streaming",
+        "activeSession.streamingModel",
+        "activeSession.streamElapsed",
+        "activeSession.pendingQueue",
+        "activeSession._queuePaused",
+        "activeSession.backgroundActive",
+        "activeSession.compacting",
+        "activeSession._draining",
+        "activeSession.atBottom",
+    ):
+        assert binding in transcript
+    assert "tabState[currentId]" not in transcript
+    assert "_currentQueueLen()" not in transcript
+    assert 'x-show="streaming && (!messages.length' not in transcript
+    assert 'x-show="!atBottom"' not in transcript
+
+
 def test_long_chat_state_keeps_complete_normalized_history_and_generation_safety():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
     html = (FRONTEND / "index.html").read_text(encoding="utf-8")
@@ -3993,7 +4027,7 @@ def test_queue_paused_flag_cannot_outlive_its_items():
 
     # Paused beats streaming: "a turn is running" no longer implies "it will
     # drain when the turn ends".
-    assert "(!streaming || tabState[currentId]._queuePaused)" in html
+    assert "(!activeSession.streaming || activeSession._queuePaused)" in html
     # And the bubble itself says so — the banner is easy to scroll past.
     assert 'class="queued-paused-badge"' in html
 
@@ -4047,10 +4081,10 @@ def test_running_bar_and_pending_bubble_are_mutually_exclusive():
     assert "paneMsgs[paneMsgs.length - 1].role !== 'user'" in bar
     assert "paneMsgs.length" in bar
 
-    # The pending bubble's own gate, unchanged — the two conditions are
-    # complements, so exactly one renders.
-    assert ("streaming && (!messages.length\n"
-            "                                       || messages[messages.length-1]"
+    # The pending bubble reads the same active-session pane as the sticky bar's
+    # visible resident pane, so the two conditions stay complementary.
+    assert ("activeSession.streaming && (!activeSession.messages.length\n"
+            "                                       || activeSession.messages[activeSession.messages.length-1]"
             ".role === 'user')") in html
 
 
@@ -4101,7 +4135,7 @@ def test_auto_compact_drives_the_same_ui_as_a_manual_one():
 
     # Exactly one placeholder bubble: the auto-compact fires while the last msg
     # is still the user's, which is also the generic pending bubble's trigger.
-    assert ("&& !(tabState[currentId] && tabState[currentId].compacting)\"\n"
+    assert ("&& !activeSession.compacting\"\n"
             "               class=\"msg assistant\"") in html
 
 

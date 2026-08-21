@@ -201,6 +201,20 @@ function _rawMsg(m) {
 //   (every tool_use bubble, every render).
 const _HTML_ESCAPE_MAP = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
 const _FILE_TOOLS = new Set(["Read", "Edit", "Write", "NotebookEdit", "MultiEdit"]);
+const _EMPTY_ACTIVE_SESSION_PANE = Object.freeze({
+  messages: Object.freeze([]),
+  messagesReady: true,
+  messagesLoading: false,
+  streaming: false,
+  streamingModel: "",
+  streamElapsed: 0,
+  pendingQueue: Object.freeze([]),
+  _queuePaused: false,
+  backgroundActive: false,
+  compacting: false,
+  _draining: false,
+  atBottom: true,
+});
 
 // xterm's 16 ANSI colors need separate palettes for light backgrounds.
 // Reusing the dark palette made bright white literally white-on-white and
@@ -6524,8 +6538,8 @@ function portal() {
     compactPendingLabel() {
       const zh = this.lang === "zh";
       const base = zh ? "压缩对话中…" : "Compacting conversation…";
-      const st = this.tabState[this.currentId];
-      if (!st || !st._compactStartedAt) return base;
+      const st = this.activeSessionPane();
+      if (!st._compactStartedAt) return base;
       const secs = st.streamElapsed || 0;
       if (secs < 2) return base;
       return base + " · " + this.fmtStreamElapsed(secs);
@@ -7675,8 +7689,7 @@ function portal() {
       st._queuePaused = !!data.paused;
     },
     _currentQueueLen() {
-      const st = this.tabState[this.currentId];
-      return (st && st.pendingQueue) ? st.pendingQueue.length : 0;
+      return this.activeSessionPane().pendingQueue.length;
     },
     queueActionBusy(sid, key) {
       const st = sid && this.tabState[sid];
@@ -8918,6 +8931,12 @@ function portal() {
     paneState(tid) {
       if (!tid) return null;
       return (this.tabState && this.tabState[tid]) || null;
+    },
+    // Alpine-facing façade for single-instance transcript decorations. The
+    // active skeleton, pending/running indicators, queue, and compact state all
+    // resolve through the tab owner instead of root compatibility mirrors.
+    activeSessionPane() {
+      return this.paneState(this.currentId) || _EMPTY_ACTIVE_SESSION_PANE;
     },
     paneMessages(tid) {
       // Pure O(1) canonical lookup. Virtualization changes only the render rows;
