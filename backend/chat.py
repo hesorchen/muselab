@@ -70,10 +70,6 @@ from . import chat_overlays
 from . import chat_runtime
 from . import chat_successor
 from . import transcript_index as transcript_idx
-
-# Compatibility export: tests and local tooling construct durable interrupted
-# snapshots through the historical chat-module schema constant.
-_CANCELLED_TURN_SNAPSHOT_SCHEMA = chat_overlays._CANCELLED_TURN_SNAPSHOT_SCHEMA
 from .workspaces import (
     registry as workspace_registry,
     resolve_workspace_root,
@@ -86,6 +82,10 @@ from . import permission_request as perm
 from . import memory_client as mem0
 from . import observability as obs
 from .sdk_compat import UnsignedThinkingCompatibleClient
+
+# Compatibility export: tests and local tooling construct durable interrupted
+# snapshots through the historical chat-module schema constant.
+_CANCELLED_TURN_SNAPSHOT_SCHEMA = chat_overlays._CANCELLED_TURN_SNAPSHOT_SCHEMA
 
 # Valid permission modes, derived from the SDK's PermissionMode literal so
 # the whitelist tracks SDK upgrades automatically. External strings (query
@@ -15090,7 +15090,7 @@ chat_runtime.configure_hooks(chat_runtime.RuntimeHooks(
 # Dynamic runtime bridge for transcript-fork/successor lifecycle. Every callback
 # resolves the chat facade at call time, preserving the historical monkeypatch
 # surface while keeping the extracted module independent of chat and the SDK.
-from .activity import activity as _successor_activity
+from .activity import activity as _successor_activity  # noqa: E402
 
 chat_successor.configure_hooks(chat_successor.SuccessorHooks(
     sessions=sess,

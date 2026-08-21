@@ -16,13 +16,16 @@ from pathlib import Path
 import shutil
 import sys
 import time
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 import uuid
 
 from . import chat_history_window
 from . import sessions as sess
 from . import transcript_index as transcript_idx
 from .settings import atomic_write_text
+
+if TYPE_CHECKING:
+    from .chat import TurnBroadcast
 
 
 @dataclass(frozen=True)
