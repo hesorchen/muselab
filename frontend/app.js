@@ -9762,11 +9762,10 @@ function portal() {
       }
     },
 
-    // Central brake on transparent reconnects. A reconnect is never cheap:
-    // TurnBroadcast.subscribe() replays the ENTIRE turn (measured 2026-08-04:
-    // 403 events / ~900 KB mid-turn), and send({reconnect:true}) first wipes
-    // the in-flight bubbles (`splice(lastUserIdx + 1)`) before re-pushing them
-    // one by one. Any path that can fire faster than a turn lasts therefore
+    // Central brake on transparent reconnects. Incremental resume makes the
+    // normal path cheap, but a cold checkpoint or replay gap still reconciles
+    // a full turn/history suffix. Any path that can fire faster than a turn lasts
+    // can therefore still create transport churn and visible fallback work, and
     // shows up as a continuous flicker storm — 2026-08-04 measured ~60 full
     // teardown+replay cycles in 20-30 s, driven by list-poll reconciliation
     // rather than by a real transport failure.
@@ -27074,11 +27073,15 @@ function portal() {
       const expectedTurnId = isReconnect
         ? (opts.turnId || sendState.activeTurnId || "")
         : "";
-      // A normal reconnect rebuilds its in-flight suffix from replay, so its
-      // sequence checkpoint resets. Continuation reconnects append and retain
-      // their checkpoint only when retrying the exact same continuation.
-      if (!isReconnect || !isContinuation
-          || sendState.activeTurnId !== expectedTurnId) {
+      // Resume only when this pane still owns the exact same immutable turn.
+      // A cold reload or ABA turn change has no trustworthy checkpoint and uses
+      // the full replay path (sequence zero). Mid-turn transport reconnects keep
+      // their rendered suffix and ask only for events after this checkpoint.
+      const resumeEventSeq = isReconnect && !!expectedTurnId
+        && sendState.activeTurnId === expectedTurnId
+        ? Math.max(0, Number(sendState.lastEventSeq) || 0)
+        : 0;
+      if (!isReconnect || sendState.activeTurnId !== expectedTurnId) {
         sendState.lastEventSeq = 0;
       }
       if (expectedTurnId) sendState.activeTurnId = expectedTurnId;
@@ -27251,14 +27254,10 @@ function portal() {
           })),
           docs: readyDocs.map(d => ({ name: d.name, kind: d.kind })),
         });
-      } else if (!isContinuation) {
-        // Truncate the in-flight portion: the backend broadcast will
-        // replay every event from the start of the turn (thinking +
-        // assistant + tool_use + ...), and our handlers below push
-        // them as messages. The mid-turn rebuild that loadSession
-        // already populated would otherwise be duplicated, so drop
-        // anything after the most recent user msg before the replay
-        // fills it back in.
+      } else if (!isContinuation && resumeEventSeq === 0) {
+        // Cold/legacy reconnect: the backend will replay every event from the
+        // start of the turn, so discard the already-rendered suffix first.
+        // Incremental reconnects retain it and request only missing sequences.
         const roles = sendState.messages.map(m => m.role);
         const lastUserIdx = roles.lastIndexOf("user");
         if (lastUserIdx >= 0 && lastUserIdx < sendState.messages.length - 1) {
@@ -27438,6 +27437,7 @@ function portal() {
             prompt: text,
             session_id: streamSid,
             turn_id: expectedTurnId,
+            last_event_seq: resumeEventSeq,
             model: sendModel,
             permission: sendPermission,
             image_ids: attachIds.length ? attachIds.join(",") : "",
@@ -27523,6 +27523,7 @@ function portal() {
             + "?prompt=" + encodeURIComponent(text)
             + "&session_id=" + encodeURIComponent(streamSid)
             + "&turn_id=" + encodeURIComponent(expectedTurnId)
+            + "&last_event_seq=" + encodeURIComponent(resumeEventSeq)
             + "&model=" + encodeURIComponent(sendModel)
             + "&permission=" + encodeURIComponent(sendPermission)
             + "&mobile=" + (streamMobile ? "1" : "0")
@@ -27677,6 +27678,14 @@ function portal() {
       // tab is active).
       let curBubble = null;
       let acc = "";
+      if (isReconnect && resumeEventSeq > 0 && !isContinuation) {
+        const existing = this._allPaneMessages(streamState);
+        const tail = existing[existing.length - 1];
+        if (tail && tail.role === "assistant") {
+          curBubble = tail;
+          acc = tail.text || "";
+        }
+      }
       const modelForBubble = sendModel;
       // Scroll only if the active tab is the one receiving the stream;
       // otherwise we'd yank the user away from whatever they're reading.
@@ -28716,8 +28725,10 @@ function portal() {
       });
       es.addEventListener("resync", ev => {
         flushRender();
-        let reason = "replay_truncated";
-        try { reason = JSON.parse(ev.data).reason || reason; } catch (_) {}
+        let payload = {};
+        try { payload = JSON.parse(ev.data) || {}; } catch (_) {}
+        const reason = payload.reason || "replay_truncated";
+        const fallback = payload.fallback || "canonical_history";
         streamState._canonicalResyncPending = true;
         streamState._serverActiveObserved = true;
         try { es.close(); } catch (_) {}
@@ -28731,9 +28742,11 @@ function portal() {
             : "This reply exceeded the live replay window; canonical history will sync when it finishes",
             "info", 5000);
         }
+        // The protocol names the authoritative recovery source. Unknown/older
+        // values still fail closed to canonical history rather than reconnecting
+        // the same unavailable sequence in a loop.
+        streamState._canonicalResyncFallback = fallback;
         this._scheduleCanonicalStreamReload(streamSid, streamState);
-        // `reason` is intentionally retained for browser diagnostics without
-        // changing user-facing retry semantics.
         streamState._canonicalResyncReason = reason;
       });
       es.addEventListener("error", async ev => {

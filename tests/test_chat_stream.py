@@ -3812,6 +3812,64 @@ def test_turn_broadcast_stamps_stable_identity_and_sequence(stream_env):
     assert all(payload["parent_turn_id"] == "parent-turn" for payload in payloads)
 
 
+def test_incremental_reconnect_replays_only_missing_events_without_duplicates(
+        stream_env):
+    chat_mod = stream_env
+    bc = chat_mod.TurnBroadcast(session_id="incremental-resume")
+    bc.publish({"event": "text", "data": '{"text":"A"}'})
+    bc.publish({"event": "text", "data": '{"text":"B"}'})
+    bc.publish({"event": "tool_result", "data": '{"id":"tool"}'})
+    bc.publish({"event": "done", "data": '{"is_error":false}'})
+    bc.finish()
+
+    async def collect():
+        subscriber = bc.subscribe(last_event_seq=1)
+        events = []
+        while True:
+            event = await subscriber.get()
+            if event is None:
+                return events
+            events.append(event)
+
+    events = asyncio.run(collect())
+    payloads = [json.loads(event["data"]) for event in events]
+    assert [payload["event_seq"] for payload in payloads] == [2, 3, 4]
+    assert [event["event"] for event in events] == ["text", "tool_result", "done"]
+    assert payloads[0]["text"] == "B"
+    assert all(payload["turn_id"] == bc.turn_id for payload in payloads)
+
+
+def test_incremental_reconnect_gap_explicitly_requires_canonical_history(
+        stream_env):
+    chat_mod = stream_env
+    bc = chat_mod.TurnBroadcast(
+        session_id="incremental-gap",
+        replay_max_events=2,
+        replay_max_bytes=1024 * 1024,
+    )
+    for i in range(4):
+        bc.publish({"event": "tool_result", "data": json.dumps({"id": i})})
+
+    async def collect():
+        subscriber = bc.subscribe(last_event_seq=1)
+        first = await subscriber.get()
+        second = await subscriber.get()
+        return first, second
+
+    first, second = asyncio.run(collect())
+    assert first["event"] == "resync"
+    assert json.loads(first["data"]) == {
+        "reason": "replay_gap",
+        "fallback": "canonical_history",
+        "retryable": False,
+        "turn_id": bc.turn_id,
+        "requested_event_seq": 1,
+        "earliest_event_seq": 3,
+        "latest_event_seq": 4,
+    }
+    assert second is None
+
+
 def test_reconnect_turn_id_mismatch_resyncs_instead_of_attaching(
         stream_env, client):
     """A late reconnect for A must never consume newer turn B's replay."""
@@ -3842,6 +3900,57 @@ def test_reconnect_turn_id_mismatch_resyncs_instead_of_attaching(
         assert all(event != "text" for event, _ in events)
     finally:
         chat_mod._active_turns.pop(sid, None)
+        bc.close()
+
+
+def test_incremental_resume_requires_turn_identity(stream_env, client):
+    response = client.post(
+        "/api/chat/stream/start",
+        headers={"X-Auth-Token": TEST_TOKEN},
+        json={
+            "prompt": "",
+            "session_id": "missing-turn-id",
+            "last_event_seq": 2,
+        },
+    )
+    assert response.status_code == 200, response.text
+    streamed = client.get(
+        f"/api/chat/stream?ticket={response.json()['ticket']}")
+    assert streamed.status_code == 422
+    assert streamed.json()["detail"] == (
+        "turn_id required when last_event_seq is provided")
+
+
+def test_stream_ticket_incremental_resume_is_duplicate_free(stream_env, client):
+    chat_mod = stream_env
+    sid = _make_session(client)
+    bc = chat_mod.TurnBroadcast(session_id=sid)
+    for i in range(4):
+        bc.publish({"event": "tool_result", "data": json.dumps({"id": i})})
+    bc.finish()
+    chat_mod._recent_turns[sid] = bc
+    try:
+        response = client.post(
+            "/api/chat/stream/start",
+            headers={"X-Auth-Token": TEST_TOKEN},
+            json={
+                "prompt": "",
+                "session_id": sid,
+                "turn_id": bc.turn_id,
+                "last_event_seq": 2,
+            },
+        )
+        assert response.status_code == 200, response.text
+        streamed = client.get(
+            f"/api/chat/stream?ticket={response.json()['ticket']}")
+        events = _parse_sse(streamed.text)
+        payloads = [json.loads(data) for event, data in events
+                    if event == "tool_result"]
+        assert [payload["event_seq"] for payload in payloads] == [3, 4]
+        assert [payload["id"] for payload in payloads] == [2, 3]
+        assert all(event != "resync" for event, _ in events)
+    finally:
+        chat_mod._recent_turns.pop(sid, None)
         bc.close()
 
 

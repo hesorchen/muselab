@@ -1073,12 +1073,34 @@ def test_stream_reconnect_is_pinned_to_backend_turn_identity():
 
     assert "const expectedTurnId = isReconnect" in send
     assert "turn_id: expectedTurnId" in send
+    assert "last_event_seq: resumeEventSeq" in send
     assert '"&turn_id=" + encodeURIComponent(expectedTurnId)' in send
+    assert '"&last_event_seq=" + encodeURIComponent(resumeEventSeq)' in send
+    assert "sendState.activeTurnId === expectedTurnId" in send
+    assert "!isContinuation && resumeEventSeq === 0" in send
+    assert "isReconnect && resumeEventSeq > 0 && !isContinuation" in send
+    assert 'tail && tail.role === "assistant"' in send
+    assert 'acc = tail.text || ""' in send
     assert "streamState.es !== es" in send
     assert "ownedTurnId !== eventTurnId" in send
     assert "eventSeq <= (Number(streamState.lastEventSeq) || 0)" in send
     assert "sessionId: streamSid" in send
     assert "turnId: d.turn_id || streamState.activeTurnId || \"\"" in send
+
+
+def test_stream_replay_gap_falls_back_to_canonical_history():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    start = app.index('es.addEventListener("resync", ev => {')
+    end = app.index('es.addEventListener("error", async ev => {', start)
+    handler = app[start:end]
+
+    assert 'payload.fallback || "canonical_history"' in handler
+    assert "streamState._canonicalResyncPending = true" in handler
+    assert "streamState._canonicalResyncFallback = fallback" in handler
+    assert "this._scheduleCanonicalStreamReload(streamSid, streamState)" in handler
+    assert handler.index("try { es.close(); }") < handler.index(
+        "this._scheduleCanonicalStreamReload(streamSid, streamState)"
+    )
 
 
 def test_interrupted_turn_is_dismissed_after_open_or_manual_close():
@@ -2629,8 +2651,9 @@ def test_render_key_regression_boundaries_keep_state_and_owners_consistent():
     send_start = app.index("async send(opts = {})")
     send_end = app.index("async stop()", send_start)
     send = app[send_start:send_end]
-    reconnect = send[send.index("} else if (!isContinuation) {"):
-                     send.index("// (isContinuation:")]
+    reconnect = send[send.index(
+        "} else if (!isContinuation && resumeEventSeq === 0) {"):
+        send.index("// (isContinuation:")]
     assert "const removed = sendState.messages.splice(lastUserIdx + 1)" in reconnect
     assert "this._releasePaneMessageRenderKeys(sendState" in reconnect
 

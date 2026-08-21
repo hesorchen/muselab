@@ -784,16 +784,21 @@ _client_permission: dict[_ClientKey, str] = {}
 _client_plan_return: dict[_ClientKey, str] = {}
 
 
+# Bound the exact wire-event window used for incremental reconnect. The durable
+# spool below still stores a coalesced, complete turn for a cold/full replay;
+# this in-memory window stores individual text/thinking deltas so a client can
+# resume in the middle of a message without replaying or duplicating its prefix.
+# If a requested sequence has fallen out of this window, the server explicitly
+# asks the browser to reconcile from canonical history instead of guessing.
+_BROADCAST_REPLAY_MAX_EVENTS = env_int(
+    "MUSELAB_STREAM_REPLAY_MAX_EVENTS", 4096, min_value=64)
+_BROADCAST_REPLAY_MAX_BYTES = env_int(
+    "MUSELAB_STREAM_REPLAY_MAX_BYTES", 4 * 1024 * 1024, min_value=64 * 1024)
+
 # Cap on token deltas queued for a single attached subscriber. Deltas are the
 # ephemeral presentation channel (see _TurnSubscriber): they are never spooled,
-# so this bounds the only per-subscriber memory that exists. A client that
-# backs up past this is resynced rather than served a truncated bubble.
-#
-# This replaces the old MUSELAB_STREAM_REPLAY_MAX_EVENTS / _MAX_BYTES replay
-# window. That window existed because every token delta was written to the
-# replay spool, so a normal reply blew past 512 events in seconds and mobile
-# reconnects were told to give up on the live stream. The spool now records one
-# coalesced event per message instead, so there is no replay length to bound.
+# so this bounds per-subscriber memory. A client that backs up past this is
+# resynced rather than served a truncated bubble.
 _BROADCAST_LIVE_DELTA_MAX = env_int(
     "MUSELAB_STREAM_LIVE_DELTA_MAX", 4096, min_value=64)
 _BROADCAST_SUBSCRIBER_MAX_EVENTS = env_int(
@@ -968,10 +973,11 @@ class _TurnSubscriber:
     are replaying and gets emitted.
     """
 
-    def __init__(self, replay=None, *, resync_reason: str = "",
-                 skip_from: int = 0):
+    def __init__(self, replay=None, *, initial_events=None,
+                 resync_payload: dict | None = None, skip_from: int = 0):
         self._replay = replay
-        self._resync_reason = resync_reason
+        self._initial_events: deque[dict] = deque(initial_events or ())
+        self._resync_payload = dict(resync_payload or {})
         self._skip_from = skip_from
         # Deltas produced while attached. Bounded: a stalled HTTP connection
         # must not grow this without limit. Overflow degrades to a resync
@@ -988,12 +994,16 @@ class _TurnSubscriber:
             # every loop boundary before touching `_replay`; checking only at
             # function entry turned an intended resync frame into a None.tell
             # AttributeError under live-delta backpressure.
-            if self._resync_reason:
-                reason, self._resync_reason = self._resync_reason, ""
+            if self._resync_payload:
+                payload, self._resync_payload = self._resync_payload, {}
                 return {
                     "event": "resync",
-                    "data": json.dumps({"reason": reason, "retryable": True}),
+                    "data": json.dumps(payload),
                 }
+            if self._initial_events:
+                event = dict(self._initial_events.popleft())
+                event.pop("_coalesced", None)
+                return event
             if self._replay is None:
                 return None
             if self._draining_live_barrier:
@@ -1022,7 +1032,7 @@ class _TurnSubscriber:
                 await self._wake.wait()
                 continue
             event = self._next_spool_event()
-            if self._resync_reason:
+            if self._resync_payload:
                 continue
             if event is _LIVE_MESSAGE_BARRIER:
                 self._draining_live_barrier = True
@@ -1044,7 +1054,7 @@ class _TurnSubscriber:
             # Close the clear/append race: publish() may have written between
             # the first EOF read and clear(). Recheck before sleeping.
             event = self._next_spool_event()
-            if self._resync_reason:
+            if self._resync_payload:
                 continue
             if event is _LIVE_MESSAGE_BARRIER:
                 self._draining_live_barrier = True
@@ -1119,8 +1129,12 @@ class _TurnSubscriber:
         self._wake.set()
         return True
 
-    def resync(self, reason: str) -> None:
-        self._resync_reason = reason
+    def resync(self, reason: str, **details) -> None:
+        self._resync_payload = {
+            "reason": reason,
+            "retryable": True,
+            **details,
+        }
         self.close_reader()
         self._done = True
         self._wake.set()
@@ -1165,15 +1179,23 @@ class TurnBroadcast:
         self.model = model
         self.events = _ReplaySpool()
         self.subscribers: set[_TurnSubscriber] = set()
-        # Legacy constructor arguments remain accepted for callers/tests.
-        # replay_max_* used to bound a spool that recorded every token delta;
-        # the spool now records one coalesced event per message, so there is
-        # nothing to truncate and no subscriber-side queue to size.
-        _ = (replay_max_events, replay_max_bytes,
-             subscriber_max_events, subscriber_max_bytes)
+        self._resume_max_events = (
+            replay_max_events if replay_max_events > 0
+            else _BROADCAST_REPLAY_MAX_EVENTS
+        )
+        self._resume_max_bytes = (
+            replay_max_bytes if replay_max_bytes > 0
+            else _BROADCAST_REPLAY_MAX_BYTES
+        )
+        self._resume_events: deque[tuple[int, dict, int]] = deque()
+        self._resume_bytes = 0
+        # Legacy per-subscriber constructor arguments remain accepted. Live
+        # backpressure is governed by the module constants used by subscribers.
+        _ = (subscriber_max_events, subscriber_max_bytes)
         self._compact_kind: str | None = None
         self._compact_parts: list[str] = []
         self._compact_chars = 0
+        self._compact_last_seq = 0
         self._replay_bytes = 0
         self.done = False
         # Set True when this turn ended via an explicit user /interrupt (vs.
@@ -1335,12 +1357,14 @@ class TurnBroadcast:
             kind, text = current_text
             if self._compact_kind not in (None, kind):
                 self._flush_compact_text()
+            stamped = self._stamp_wire_event(event)
             if self._compact_kind is None:
                 self._compact_kind = kind
             self._compact_parts.append(text)
             self._compact_chars += len(text)
+            self._compact_last_seq = self._event_seq
             for subscriber in tuple(self.subscribers):
-                if not subscriber.publish_live(event):
+                if not subscriber.publish_live(stamped):
                     self.subscribers.discard(subscriber)
             # Bound the accumulator so a very long message (or a headless turn
             # with nobody attached) cannot hold unbounded text in memory. A
@@ -1353,21 +1377,32 @@ class TurnBroadcast:
         # A non-delta event closes whatever message was streaming: write its
         # coalesced form first so the spool stays in true chronological order.
         self._flush_compact_text()
-        self._append_replay(event)
+        stamped = self._stamp_wire_event(event)
+        self._append_replay(stamped)
 
-    def _append_replay(self, event: dict) -> None:
-        replay = dict(event)
+    def _stamp_wire_event(self, event: dict) -> dict:
+        stamped = dict(event)
         self._event_seq += 1
         try:
-            payload = json.loads(replay.get("data") or "{}")
+            payload = json.loads(stamped.get("data") or "{}")
         except (TypeError, ValueError):
             payload = None
         if isinstance(payload, dict):
-            payload.setdefault("turn_id", self.turn_id)
-            payload.setdefault("event_seq", self._event_seq)
+            payload["turn_id"] = self.turn_id
+            payload["event_seq"] = self._event_seq
             if self.parent_turn_id:
-                payload.setdefault("parent_turn_id", self.parent_turn_id)
-            replay["data"] = json.dumps(payload, ensure_ascii=False)
+                payload["parent_turn_id"] = self.parent_turn_id
+            stamped["data"] = json.dumps(payload, ensure_ascii=False)
+        size = _broadcast_event_size(stamped)
+        self._resume_events.append((self._event_seq, stamped, size))
+        self._resume_bytes += size
+        while (len(self._resume_events) > self._resume_max_events
+               or self._resume_bytes > self._resume_max_bytes):
+            _, _, evicted_size = self._resume_events.popleft()
+            self._resume_bytes -= evicted_size
+        return stamped
+
+    def _append_replay(self, replay: dict) -> None:
         self.events.append(replay)
         self._replay_bytes += _broadcast_event_size(replay)
         for subscriber in tuple(self.subscribers):
@@ -1384,14 +1419,22 @@ class TurnBroadcast:
         """
         if self._compact_kind is None:
             return
+        payload = {
+            "text": "".join(self._compact_parts),
+            "turn_id": self.turn_id,
+            "event_seq": self._compact_last_seq,
+        }
+        if self.parent_turn_id:
+            payload["parent_turn_id"] = self.parent_turn_id
         event = {
             "event": self._compact_kind,
-            "data": json.dumps({"text": "".join(self._compact_parts)}, ensure_ascii=False),
+            "data": json.dumps(payload, ensure_ascii=False),
             "_coalesced": True,
         }
         self._compact_kind = None
         self._compact_parts = []
         self._compact_chars = 0
+        self._compact_last_seq = 0
         self._append_replay(event)
         # `_append_replay` and these markers run synchronously on the same
         # event-loop turn: a reader woken by the spool append cannot interleave
@@ -1406,10 +1449,16 @@ class TurnBroadcast:
     def replay_events(self):
         yield from self.events
         if self._compact_kind is not None:
+            payload = {
+                "text": "".join(self._compact_parts),
+                "turn_id": self.turn_id,
+                "event_seq": self._compact_last_seq,
+            }
+            if self.parent_turn_id:
+                payload["parent_turn_id"] = self.parent_turn_id
             yield {
                 "event": self._compact_kind,
-                "data": json.dumps(
-                    {"text": "".join(self._compact_parts)}, ensure_ascii=False),
+                "data": json.dumps(payload, ensure_ascii=False),
             }
 
     def finish(self) -> None:
@@ -1460,30 +1509,57 @@ class TurnBroadcast:
         self.subscribers.clear()
         self.events.close()
 
-    def subscribe(self, *, mobile: bool = False) -> _TurnSubscriber:
-        """Attach a reader. Every subscriber gets the complete turn.
+    def subscribe(
+        self,
+        *,
+        mobile: bool = False,
+        last_event_seq: int = 0,
+    ) -> _TurnSubscriber:
+        """Attach a full reader or resume strictly after ``last_event_seq``.
 
-        Flushing first is what makes a mid-message join lossless: the half of
-        the current bubble that has streamed so far is still sitting in the
-        accumulator, so we write it to the spool now. The arriving subscriber
-        replays it as history and then picks up the remaining deltas live,
-        continuing from the right place instead of starting mid-word. Already-
-        attached subscribers skip it — its offset is at or after their own
-        attach point, and they received those tokens as deltas.
-
-        `mobile` is accepted for wire compatibility and deliberately ignored.
-        Mobile clients used to be handed a `replay_truncated` resync and no
-        live stream at all whenever the spool had grown past 512 events, which
-        a normal reply did within seconds because every token was an event.
-        There is no longer a replay length to outgrow.
+        Sequence zero is the cold/legacy path and replays the complete coalesced
+        spool. A positive checkpoint uses the bounded exact-wire buffer, which
+        includes individual text/thinking deltas. If every missing sequence is
+        no longer available, emit one explicit canonical-history fallback.
         """
         _ = mobile
         self._flush_compact_text()
+        requested = max(0, int(last_event_seq or 0))
+        replay = self.events.open_reader()
+        initial_events: list[dict] = []
+        resync_payload: dict | None = None
+        if requested > 0:
+            replay.seek(self.events.size())
+            latest = self._event_seq
+            earliest = self._resume_events[0][0] if self._resume_events else latest + 1
+            if requested > latest or (
+                requested < latest and requested < earliest - 1
+            ):
+                replay.close()
+                replay = None
+                resync_payload = {
+                    "reason": "replay_gap",
+                    "fallback": "canonical_history",
+                    "retryable": False,
+                    "turn_id": self.turn_id,
+                    "requested_event_seq": requested,
+                    "earliest_event_seq": earliest if earliest <= latest else None,
+                    "latest_event_seq": latest,
+                }
+            else:
+                initial_events = [
+                    event for seq, event, _ in self._resume_events
+                    if seq > requested
+                ]
         subscriber = _TurnSubscriber(
-            self.events.open_reader(), skip_from=self.events.size())
+            replay,
+            initial_events=initial_events,
+            resync_payload=resync_payload,
+            skip_from=self.events.size(),
+        )
         if self.done:
             subscriber.close()
-        else:
+        elif resync_payload is None:
             self.subscribers.add(subscriber)
         return subscriber
 
@@ -13726,6 +13802,7 @@ class StreamStartReq(BaseModel):
     # Empty for a new turn. Reconnects pin the exact server turn they observed
     # via /sessions/{sid}/active so they can never attach to a newer turn.
     turn_id: str = ""
+    last_event_seq: int = Field(default=0, ge=0)
     model: str = ""
     permission: str = "bypassPermissions"
     image_ids: str = ""
@@ -13752,6 +13829,7 @@ def stream_start(req: StreamStartReq) -> dict:
             "prompt": req.prompt,
             "session_id": req.session_id,
             "turn_id": req.turn_id,
+            "last_event_seq": req.last_event_seq,
             "model": req.model,
             "permission": permission,
             "image_ids": req.image_ids,
@@ -13766,6 +13844,7 @@ async def stream(
     token: str = Query(default=""),
     session_id: str = Query(default=""),
     turn_id: str = Query(default=""),
+    last_event_seq: int = Query(default=0, ge=0),
     model: str = Query(default=""),
     permission: str = Query(default="bypassPermissions"),
     image_ids: str = Query(default=""),
@@ -13785,6 +13864,7 @@ async def stream(
         prompt = params["prompt"]
         session_id = params["session_id"]
         turn_id = params.get("turn_id", "")
+        last_event_seq = int(params.get("last_event_seq", 0) or 0)
         model = params["model"]
         permission = params["permission"]
         image_ids = params["image_ids"]
@@ -13805,6 +13885,9 @@ async def stream(
     # entry resident past its TTL — gc previously only ran on upload and on
     # the attachment-consume path. Cheap (O(n) over ≤100 capped entries).
     _gc_images()
+    if last_event_seq > 0 and not turn_id:
+        raise HTTPException(
+            422, "turn_id required when last_event_seq is provided")
     # RECONNECT MODE: empty prompt + NO attached images + an active
     # in-flight turn on this session = subscribe to the existing
     # TurnBroadcast for replay + live tail. Frontend uses this after
@@ -13841,7 +13924,10 @@ async def stream(
                     return EventSourceResponse(
                         _recent_changed_gen(), headers=_SSE_HEADERS)
                 return EventSourceResponse(
-                    _subscribe_broadcast(recent, mobile=mobile),
+                    _subscribe_broadcast(
+                        recent, mobile=mobile,
+                        last_event_seq=last_event_seq,
+                    ),
                     headers=_SSE_HEADERS,
                     ping_message_factory=_sse_ping_event,
                 )
@@ -13861,7 +13947,10 @@ async def stream(
             return EventSourceResponse(
                 _active_changed_gen(), headers=_SSE_HEADERS)
         return EventSourceResponse(
-            _subscribe_broadcast(existing, mobile=mobile),
+            _subscribe_broadcast(
+                existing, mobile=mobile,
+                last_event_seq=last_event_seq,
+            ),
             headers=_SSE_HEADERS,
             ping_message_factory=_sse_ping_event,
         )
@@ -18379,23 +18468,25 @@ async def _subscribe_broadcast(
     broadcast: TurnBroadcast,
     *,
     mobile: bool = False,
+    last_event_seq: int = 0,
 ):
-    """Yield disk-backed replay followed by its live tail.
+    """Yield full or incremental replay followed by its live tail.
 
-    Mobile readers use a bounded reconnect replay window and receive one
-    explicit ``resync`` event when that window is exceeded. Every reader tails
-    the same append-only spool, so a stalled HTTP connection retains only a
-    file cursor rather than an unbounded Python queue. Desktop replay remains
-    complete without duplicating the turn in memory.
+    Sequence zero reads the complete disk-backed spool. Positive checkpoints
+    use the broadcast's bounded exact-event window and receive one explicit
+    ``resync`` event if the missing range is unavailable. Every attached reader
+    then tails the same append-only spool, so stalled HTTP connections retain a
+    file cursor rather than an unbounded Python queue.
     """
-    # A subscriber is now attached. For a CONTINUATION broadcast this is the
-    # one-and-only reconnect that replays the finished task's card flip +
-    # reaction; mark it consumed so `/active` stops advertising it (else the
-    # 8s poller re-reconnects every tick within the 60s grace TTL → duplicate
-    # reaction bubbles). Harmless no-op for normal turns.
-    if getattr(broadcast, "is_continuation", False):
+    subscriber = broadcast.subscribe(
+        mobile=mobile, last_event_seq=last_event_seq)
+    # A real subscriber is now attached. For a CONTINUATION broadcast this is
+    # the one-and-only reconnect that replays the finished task's card flip +
+    # reaction. A replay-gap fallback is not an attachment and must not consume
+    # the continuation advertisement before canonical reconciliation starts.
+    if (getattr(broadcast, "is_continuation", False)
+            and not subscriber._resync_payload):
         broadcast.continuation_consumed = True
-    subscriber = broadcast.subscribe(mobile=mobile)
     try:
         while True:
             ev = await subscriber.get()
