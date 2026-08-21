@@ -1501,7 +1501,13 @@ def test_native_compact_rejects_in_band_context_error(chat_mod, client, monkeypa
         return fake
 
     monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
-    key = (sid, "claude-sonnet-4-6", "auto", "")
+    meta = chat_mod.sess.get_session_meta(sid)
+    key = (
+        sid,
+        meta["model"] or chat_mod.MODEL,
+        meta["effort"],
+        meta["service_tier"],
+    )
     chat_mod._client_permission[key] = "default"
 
     r = client.post(
