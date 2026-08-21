@@ -1,6 +1,7 @@
 """Compatibility contracts for splitting chat lifecycle code across modules."""
 
 import ast
+import asyncio
 import inspect
 import json
 
@@ -480,3 +481,106 @@ def test_chat_successor_facades_remain_patchable(app_module, monkeypatch):
     meta = {"runtime_boundary_message_id": "canonical-boundary"}
     assert chat_mod._runtime_fork_boundary("source", meta) == "patched-boundary"
     assert calls == [("source", meta)]
+
+
+def test_chat_runtime_module_keeps_focused_boundary_and_shared_state(app_module):
+    from backend import chat as chat_mod
+    from backend import chat_runtime
+
+    tree = ast.parse(inspect.getsource(chat_runtime))
+    imports = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.Import, ast.ImportFrom))
+    ]
+    assert not any(
+        (
+            isinstance(node, ast.ImportFrom)
+            and any(alias.name == "chat" for alias in node.names)
+        )
+        or (
+            isinstance(node, ast.Import)
+            and any(alias.name.endswith(".chat") for alias in node.names)
+        )
+        for node in imports
+    )
+
+    top_level_functions = {
+        node.name
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    assert {
+        "get_client",
+        "disconnect_client",
+        "disconnect_background_task_owner",
+        "shutdown_clients",
+        "ensure_session_stream",
+        "stream_for",
+    } <= top_level_functions
+    assert not {
+        "_start_turn",
+        "_watch_background_tasks",
+        "_maybe_drain_queue",
+        "continue_detached_runtime",
+    } & top_level_functions
+
+    assert chat_mod._clients is chat_runtime.CLIENTS
+    assert chat_mod._client_permission is chat_runtime.CLIENT_PERMISSION
+    assert chat_mod._client_plan_return is chat_runtime.CLIENT_PLAN_RETURN
+    assert chat_mod._client_lru is chat_runtime.CLIENT_LRU
+    assert chat_mod._creation_locks is chat_runtime.CREATION_LOCKS
+    assert chat_mod._session_streams is chat_runtime.SESSION_STREAMS
+    assert (
+        chat_mod._session_disconnect_tasks
+        is chat_runtime.SESSION_DISCONNECT_TASKS
+    )
+    assert (
+        chat_mod._session_disconnect_failed
+        is chat_runtime.SESSION_DISCONNECT_FAILED
+    )
+    assert chat_mod._lock is chat_runtime.CLIENT_LOCK
+    assert chat_mod._STREAM_EOF is chat_runtime.STREAM_EOF
+    assert chat_mod._SessionStream is chat_runtime.SessionStream
+    assert chat_mod.RuntimeCleanupTimeout is chat_runtime.RuntimeCleanupTimeout
+
+
+def test_chat_runtime_facades_and_hooks_remain_patchable(
+    app_module, monkeypatch,
+):
+    from backend import chat as chat_mod
+    from backend import chat_runtime
+
+    async def scenario():
+        runtime_calls = []
+
+        async def runtime_get_client(*args, **kwargs):
+            runtime_calls.append((args, kwargs))
+            return "patched-runtime-client"
+
+        monkeypatch.setattr(chat_runtime, "get_client", runtime_get_client)
+        assert await chat_mod.get_client("sid", "model", effort="high") == (
+            "patched-runtime-client"
+        )
+        assert runtime_calls == [
+            (("sid", "model", "bypassPermissions"), {
+                "effort": "high",
+                "service_tier": "",
+                "plan_return_permission": "",
+            })
+        ]
+
+        builder_calls = []
+
+        async def patched_builder(*args, **kwargs):
+            builder_calls.append((args, kwargs))
+            return "patched-builder-client"
+
+        monkeypatch.setattr(chat_mod, "_build_and_connect_client", patched_builder)
+        hooks = chat_runtime._require_hooks()
+        assert await hooks.build_and_connect_client("sid", "model") == (
+            "patched-builder-client"
+        )
+        assert builder_calls == [(("sid", "model"), {})]
+
+    asyncio.run(scenario())

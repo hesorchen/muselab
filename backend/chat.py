@@ -67,6 +67,7 @@ from . import context_recovery
 from . import chat_history
 from . import chat_presentation
 from . import chat_overlays
+from . import chat_runtime
 from . import chat_successor
 from . import transcript_index as transcript_idx
 
@@ -522,22 +523,13 @@ router = APIRouter(prefix="/api/chat", tags=["chat"])
 # fan-out for the privacy rationale.
 
 
-# Clients keyed by (session_id, model, effort, service_tier). Both controls are
-# launch-time request plumbing, so a runtime created for standard service must
-# never be reused after the session switches to Fast (or vice versa).
-_ClientKey = tuple[str, str, str, str]
-_clients: dict[_ClientKey, ClaudeSDKClient] = {}
-# Tracks the permission_mode the cached client was launched with. Permission
-# is launch-sensitive (notably default -> bypassPermissions cannot always be
-# enabled dynamically), so a mismatch rebuilds the runtime instead of trying
-# to mutate it in place.
-_client_permission: dict[_ClientKey, str] = {}
-# A client launched in Plan Mode has one more capability bit: whether it may
-# return to bypassPermissions after ExitPlanMode. The CLI only permits that
-# transition when the process was started with
-# --allow-dangerously-skip-permissions, so two otherwise-identical `plan`
-# runtimes with different return modes must never share a pooled client.
-_client_plan_return: dict[_ClientKey, str] = {}
+# Compatibility aliases: callers and tests historically inspect and mutate
+# these exact containers through ``backend.chat``. The focused runtime module
+# owns them; aliases preserve identity across the extraction boundary.
+_ClientKey = chat_runtime.ClientKey
+_clients = chat_runtime.CLIENTS
+_client_permission = chat_runtime.CLIENT_PERMISSION
+_client_plan_return = chat_runtime.CLIENT_PLAN_RETURN
 
 
 # Bound the exact wire-event window used for incremental reconnect. The durable
@@ -1366,12 +1358,11 @@ def _get_recent_turn(session_id: str) -> TurnBroadcast | None:
         b.close()
         return None
     return b
-# LRU bookkeeping. Each CLI subprocess holds ~30-50 MB RSS; without a cap
-# muselab leaks memory as users open more sessions. New clients append to
-# the tail; on cache miss with len > cap, oldest gets disconnected.
-_client_lru: list[_ClientKey] = []   # (session_id, model, effort, service_tier)
+# Each CLI subprocess holds ~30-50 MB RSS. Runtime-owned LRU/lock aliases keep
+# the historical chat facade patchable while bounding the shared client pool.
+_client_lru = chat_runtime.CLIENT_LRU
 _CLIENT_POOL_CAP = env_int("MUSELAB_CLIENT_POOL_CAP", 3, min_value=1)
-_lock = asyncio.Lock()
+_lock = chat_runtime.CLIENT_LOCK
 
 # Exactly one SDK operation may own a session's CLI stream at a time. The
 # interactive turn mutex only covers /stream turns; scheduler and /compact
@@ -1439,13 +1430,11 @@ _maintenance_tasks: set[asyncio.Task] = set()
 _runtime_continuation_delivery_tasks = (
     chat_overlays.RUNTIME_CONTINUATION_DELIVERY_TASKS
 )
-# SDK disconnect owns process reaping and can legitimately take about 20s
-# (stdin close, graceful wait, TERM, then KILL). Keep timed-out owners keyed by
-# session so a retry/new turn must join the same cleanup before touching disk or
-# starting another CLI against the transcript.
-_session_disconnect_tasks: dict[str, set[asyncio.Task]] = {}
-_session_disconnect_failed: set[str] = set()
-_CLIENT_DISCONNECT_DEADLINE_S = 22.0
+# SDK disconnect fences are runtime-owned. Keep the exact shared containers and
+# deadline visible through the historical chat facade.
+_session_disconnect_tasks = chat_runtime.SESSION_DISCONNECT_TASKS
+_session_disconnect_failed = chat_runtime.SESSION_DISCONNECT_FAILED
+_CLIENT_DISCONNECT_DEADLINE_S = chat_runtime.CLIENT_DISCONNECT_DEADLINE_S
 # Turn/scheduler owners cancelled by session deletion can outlive their first
 # bounded join. Keep the exact handles keyed by session so a retry cannot race
 # ahead and purge the transcript while an earlier owner is still unwinding.
@@ -2567,16 +2556,12 @@ def _budget_usd() -> float:
     return env_float("MUSELAB_BUDGET_USD", 0.0)
 
 
-# Per-(sid, model, effort, service-tier) creation lock. Coalesces cache misses
-# on the same key (so we don't spawn two CLI subprocesses for one tab) while
-# leaving DIFFERENT keys free to build concurrently. Replaces the global
-# _lock-across-await pattern that froze every other request for 3-5 s while
-# one slow `client.connect()` ran.
-_creation_locks: dict[_ClientKey, asyncio.Lock] = {}
+# Per-runtime-key creation locks are shared with the extracted pool owner.
+_creation_locks = chat_runtime.CREATION_LOCKS
 
 
 def _creation_lock_for(key: _ClientKey) -> asyncio.Lock:
-    return _creation_locks.setdefault(key, asyncio.Lock())
+    return chat_runtime.creation_lock_for(key)
 
 
 def _normalize_plan_return_permission(
@@ -3402,476 +3387,54 @@ async def _disconnect_unpooled_client(
     client: ClaudeSDKClient,
     session_id: str,
 ) -> None:
-    """Boundedly close a connected client that never entered the pool.
-
-    Once a cold client exists locally, cancellation must not drop its only
-    Python handle before the CLI subprocess is reaped. A child task plus
-    shield lets cleanup finish under the original cancellation; a repeated
-    cancellation is re-raised only after the bounded disconnect settles.
-    """
-    async def _sdk_disconnect() -> None:
-        try:
-            # The SDK close path is already bounded and escalates graceful →
-            # TERM → KILL. Wrapping it in a shorter wait_for cancels at the
-            # graceful boundary and skips that escalation, which can leave the
-            # only handle to an unpooled CLI orphaned for the service lifetime.
-            await client.disconnect()
-        except Exception as exc:
-            sys.stderr.write(
-                f"[client-pool] unpooled {session_id[:8]} disconnect err: "
-                f"{type(exc).__name__}\n"
-            )
-
-    cleanup = asyncio.create_task(_sdk_disconnect())
-    cancelled = False
-    while not cleanup.done():
-        try:
-            await asyncio.shield(cleanup)
-        except asyncio.CancelledError:
-            cancelled = True
-    cleanup.result()
-    if cancelled:
-        raise asyncio.CancelledError
+    return await chat_runtime.disconnect_unpooled_client(client, session_id)
 
 
-async def get_client(session_id: str, model: str, permission: str = "bypassPermissions",
-                     effort: str = "",
-                     service_tier: str = "",
-                     plan_return_permission: str = "") -> ClaudeSDKClient:
-    """Create or fetch a client for a session/model/effort/service-tier key.
-    Switching model, effort, or service tier yields a fresh client;
-    resume=session_id loads the same on-disk conversation history.
-
-    Concurrency: _lock is only held across synchronous dict / LRU operations.
-    The slow `await client.connect()` runs OUTSIDE _lock under a per-key
-    creation lock — concurrent callers for different runtime keys
-    keys never block each other; concurrent callers for the SAME key
-    coalesce so we don't spawn two CLI subprocesses for one tab.
-
-    effort: "auto" / "low" / "medium" / "high" / "xhigh" / "max" / "ultra".
-    Empty string remains accepted as a legacy spelling of ``auto``."""
-    if not await _join_session_disconnects(session_id):
-        raise RuntimeCleanupTimeout(
-            "session runtime cleanup is still in progress"
-        )
-    if sess.session_is_deleting(session_id):
-        raise RuntimeError("session is being deleted")
-    if session_id in _pending_runtime_rebuilds:
-        # Callers that operate a session hold its runtime lock. Consuming the
-        # marker here closes the race where a new turn reserves the active slot
-        # just before the previous turn's cleanup tries to rebuild.
-        await disconnect_client(session_id)
-
-    effort = _normalize_effort(effort)
-    service_tier = (service_tier or "").strip()
-    if effort not in _VALID_EFFORT:
-        raise ValueError(f"invalid effort: {effort}")
-    if service_tier not in _VALID_SERVICE_TIERS:
-        raise ValueError(f"invalid service tier: {service_tier}")
-    key = (session_id, model, effort, service_tier)
-    plan_return_permission = _normalize_plan_return_permission(
-        permission, plan_return_permission)
-
-    # Fast path: cache hit. Lock just long enough to read + touch LRU.
-    async with _lock:
-        cached = _clients.get(key)
-        if cached is not None:
-            if key in _client_lru:
-                _client_lru.remove(key)
-            _client_lru.append(key)
-        cached_perm = _client_permission.get(key) if cached is not None else None
-        cached_plan_return = (
-            _client_plan_return.get(key, "") if cached is not None else "")
-
-    if cached is not None:
-        if sess.session_is_deleting(session_id):
-            raise RuntimeError("session is being deleted")
-        # Permission is part of the runtime's launch contract even though it
-        # is not part of the storage key. In particular, a process launched in
-        # default mode may reject a later switch to bypassPermissions. Never
-        # return a stale client after a failed control request: replace the
-        # session runtime deterministically.
-        if (cached_perm != permission
-                or (permission == "plan"
-                    and cached_plan_return != plan_return_permission)):
-            await disconnect_client(session_id)
-            return await get_client(
-                session_id, model, permission, effort=effort,
-                service_tier=service_tier,
-                plan_return_permission=plan_return_permission)
-        return cached
-
-    # Cache miss: build a new client OUTSIDE _lock. Per-key creation
-    # lock prevents two concurrent misses on the same key from spawning
-    # two CLI subprocesses (where one becomes orphaned).
-    async with _creation_lock_for(key):
-        # Re-check under the global lock — another coroutine may have
-        # already finished building while we waited for the creation lock.
-        async with _lock:
-            cached = _clients.get(key)
-            if cached is not None:
-                if key in _client_lru:
-                    _client_lru.remove(key)
-                _client_lru.append(key)
-            cached_perm = (
-                _client_permission.get(key) if cached is not None else None)
-            cached_plan_return = (
-                _client_plan_return.get(key, "") if cached is not None else "")
-
-        # Two callers can race on the same storage key while requesting
-        # different launch modes. The creation lock coalesces them, but the
-        # waiter must still reject the runtime built with the other mode.
-        if cached is not None:
-            if sess.session_is_deleting(session_id):
-                raise RuntimeError("session is being deleted")
-            if (cached_perm == permission
-                    and (permission != "plan"
-                         or cached_plan_return == plan_return_permission)):
-                return cached
-            await disconnect_client(session_id)
-
-        # Slow path — no awaits hold _lock.
-        if permission == "plan":
-            client = await _build_and_connect_client(
-                session_id, model, permission, effort, service_tier,
-                plan_return_permission=plan_return_permission)
-        else:
-            client = await _build_and_connect_client(
-                session_id, model, permission, effort, service_tier)
-
-        # Wedge gate: freeze the tool-set before anyone can run a turn on this
-        # client. Runs under the per-key creation lock (blocks only same-key
-        # callers, never siblings) and BEFORE the pool commit, so no other
-        # request can grab this client and start a turn mid-connection. See
-        # _await_mcp_ready for the full rationale. Skip the status round-trip
-        # entirely when no external MCP server is configured (the default):
-        # the in-process 'muselab' server connects synchronously during
-        # connect(), so there's nothing left to settle.
-        try:
-            if _has_enabled_external_mcp():
-                await _await_mcp_ready(client)
-        except BaseException:
-            await _disconnect_unpooled_client(client, session_id)
-            raise
-
-        # Commit + LRU eviction. Eviction's await disconnect() runs
-        # OUTSIDE _lock (the disconnect can take up to 5 s). Eviction
-        # also SKIPS any client whose session has an in-flight turn —
-        # dropping a live stream mid-flow looked like "Muse just stopped
-        # talking" to the user (no error event, just dead air).
-        to_disconnect: list[
-            tuple[_ClientKey, ClaudeSDKClient, "_SessionStream | None"]
-        ] = []
-        reject_deleting = False
-        async with _lock:
-            # Linearize pool commit with DELETE's lifecycle tombstone. If
-            # commit wins, DELETE's later disconnect sees this client; if the
-            # tombstone wins, no pool/stream/LRU state is published at all.
-            # Keep this synchronous section await-free. Lock order is
-            # _lock(async) -> lifecycle(threading) -> queue(threading).
-            with sess.session_lifecycle_lock(session_id):
-                reject_deleting = sess.session_is_deleting(session_id)
-                if not reject_deleting:
-                    _clients[key] = client
-                    _client_permission[key] = permission
-                    if permission == "plan":
-                        _client_plan_return[key] = plan_return_permission
-                    else:
-                        _client_plan_return.pop(key, None)
-                    # Start the sole reader for this client BEFORE anyone can
-                    # consume it. Turns and the background-task watcher both
-                    # attach to this pump instead of opening their own
-                    # iterator over the same stream.
-                    _ensure_session_stream(key, client)
-                    _client_lru.append(key)
-            while (not reject_deleting
-                   and len(_client_lru) > _CLIENT_POOL_CAP):
-                # Find the oldest evictable client: not ourselves, not
-                # currently streaming. If every cached client is live,
-                # leave the pool over its cap until the next eviction
-                # attempt — better than killing somebody's reply.
-                candidate_idx = None
-                for i, k in enumerate(_client_lru):
-                    if k == key:
-                        continue
-                    if k[0] in _active_turns and not _active_turns[k[0]].done:
-                        continue
-                    # Pin clients with in-flight background tasks: disconnect()
-                    # kills the CLI subprocess, which would abort the running
-                    # task and the watcher draining its notification stream.
-                    if k[0] in _sessions_with_inflight_tasks:
-                        continue
-                    # A just-settled task can clear its pin before the watcher
-                    # finishes the final auto-continuation/grace cleanup. The
-                    # pump is still owned during that window, so eviction is
-                    # just as destructive as it is while the pin is present.
-                    if _session_has_live_watcher(k[0]):
-                        continue
-                    candidate_idx = i
-                    break
-                if candidate_idx is None:
-                    break
-                old_key = _client_lru.pop(candidate_idx)
-                old_client = _clients.pop(old_key, None)
-                _client_permission.pop(old_key, None)
-                _client_plan_return.pop(old_key, None)
-                # Drop the per-key creation lock too — otherwise evicted
-                # keys leak Lock objects in _creation_locks forever
-                # (disconnect_client clears it, but LRU eviction didn't).
-                _creation_locks.pop(old_key, None)
-                if old_client is not None:
-                    # The pump owns a task plus replay deques and a reference
-                    # to the SDK client.  LRU eviction used to remove only the
-                    # client, leaving that whole stream graph alive forever.
-                    old_stream = _session_streams.pop(old_key, None)
-                    to_disconnect.append((old_key, old_client, old_stream))
-
-        if reject_deleting:
-            await _disconnect_unpooled_client(client, session_id)
-            raise RuntimeError("session is being deleted")
-
-        for old_key, c, old_stream in to_disconnect:
-            if old_stream is not None:
-                await old_stream.aclose()
-            try:
-                await c.disconnect()
-            except Exception as e:
-                sys.stderr.write(
-                    f"[client-pool] evict disconnect failed "
-                    f"sid={obs.short_id(old_key[0])} "
-                    f"exc={type(e).__name__}\n")
-                sys.stderr.flush()
-
-        return client
+async def get_client(
+    session_id: str,
+    model: str,
+    permission: str = "bypassPermissions",
+    effort: str = "",
+    service_tier: str = "",
+    plan_return_permission: str = "",
+) -> ClaudeSDKClient:
+    """Compatibility facade for the extracted SDK runtime pool."""
+    return await chat_runtime.get_client(
+        session_id,
+        model,
+        permission,
+        effort=effort,
+        service_tier=service_tier,
+        plan_return_permission=plan_return_permission,
+    )
 
 
-# Sentinel pushed to a consumer queue when the underlying SDK stream ends.
-_STREAM_EOF = object()
-
-
-class _SessionStream:
-    """The sole reader of one SDK client's message stream.
-
-    The Claude Agent SDK gives a client exactly ONE message stream.
-    ``receive_messages()`` is an unbounded iterator over it and
-    ``receive_response()`` is a bounded convenience wrapper that stops at the
-    next ResultMessage (see the SDK's client.py). muselab used to open one of
-    those per consumer — a turn opened ``receive_response()``, a detached
-    background-task watcher opened ``receive_messages()`` — so two iterators
-    competed for the same underlying queue. Whoever happened to be reading
-    owned the stream, which is exactly why starting a turn while a background
-    task was still pending had to be refused with ``_TurnBusy``.
-
-    This makes ownership explicit: one pump per client reads the stream
-    forever and routes each message to whoever is registered. ``query()`` is a
-    pure write on the transport, so submitting a new prompt while the pump is
-    iterating is safe by construction.
-
-    Routing: an attached turn wins; otherwise the background sink; otherwise
-    the message is parked in ``_orphans`` and handed to the next consumer that
-    attaches. That parking is load-bearing — the SDK queue used to do it for
-    us (a late auto-continuation buffered there until the next turn drained
-    it), and a permanently-draining pump takes that job over.
-    """
-
-    # Bounded so a session nobody is reading cannot grow without limit. Far
-    # above the handful of messages a late continuation actually parks.
-    _ORPHAN_MAX = 512
-
-    def __init__(self, key: "_ClientKey", client: ClaudeSDKClient):
-        self.key = key
-        self.client = client
-        self._turn: asyncio.Queue | None = None
-        self._background: asyncio.Queue | None = None
-        self._orphans: deque = deque(maxlen=self._ORPHAN_MAX)
-        self._closed = False
-        self._failure: Exception | None = None
-        self.task: asyncio.Task = asyncio.create_task(self._pump())
-
-    def _adopt_orphans(self, q: asyncio.Queue) -> None:
-        while self._orphans:
-            q.put_nowait(self._orphans.popleft())
-
-    def attach_turn(self) -> asyncio.Queue:
-        """Register the active turn as the destination for NEW messages.
-
-        Deliberately does not adopt `_orphans`: anything parked there was
-        produced before this turn's query() went out, so it belongs to earlier
-        work — typically a background task's auto-continuation that landed
-        while nobody was attached. Handing it to this turn is exactly how a
-        follow-up used to swallow the previous task's continuation and render
-        it as the answer to the new prompt. It stays parked for the watcher.
-        """
-        q: asyncio.Queue = asyncio.Queue()
-        self._turn = q
-        return q
-
-    def detach_turn(self, q: asyncio.Queue) -> None:
-        if self._turn is q:
-            self._turn = None
-
-    def park_unconsumed(self, q: asyncio.Queue) -> None:
-        """Hand a detached consumer's leftovers back to the orphan park.
-
-        A slash-command consumer (`_run_sdk_command_checked`) stops at ITS
-        ResultMessage, but the pump may already have routed later messages into
-        the same queue — a background task's notification, an auto-continuation.
-        Letting the queue fall out of scope would drop them silently, so they go
-        back to `_orphans` for whoever attaches next.
-        """
-        while True:
-            try:
-                msg = q.get_nowait()
-            except asyncio.QueueEmpty:
-                break
-            if msg is _STREAM_EOF:
-                continue
-            self._orphans.append(msg)
-
-    def attach_background(self) -> asyncio.Queue:
-        """Register the task watcher as the sink for messages nobody owns.
-
-        Always adopts `_orphans`, including while a turn is attached: parked
-        messages were produced before that turn asked for anything, so they
-        are the watcher's by definition.
-        """
-        q: asyncio.Queue = asyncio.Queue()
-        self._background = q
-        self._adopt_orphans(q)
-        return q
-
-    def detach_background(self, q: asyncio.Queue) -> None:
-        if self._background is q:
-            self._background = None
-
-    async def _pump(self) -> None:
-        try:
-            async for msg in self.client.receive_messages():
-                if self._closed:
-                    break
-                q = self._turn or self._background
-                if q is not None:
-                    q.put_nowait(msg)
-                else:
-                    self._orphans.append(msg)
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            self._failure = e
-            sys.stderr.write(
-                f"[chat] session stream ended sid={self.key[0][:8]} "
-                f"exc={type(e).__name__}\n")
-            sys.stderr.flush()
-        finally:
-            # A pooled interactive SDK stream is expected to live until
-            # muselab explicitly closes it. Natural EOF while `_closed` is
-            # still false therefore means the CLI/runtime died even if the SDK
-            # did not preserve a more specific exception.
-            if not self._closed and self._failure is None:
-                self._failure = ClaudeSDKError(
-                    "SDK message stream ended before the session was closed")
-            self._closed = True
-            for q in (self._turn, self._background):
-                if q is not None:
-                    q.put_nowait(_STREAM_EOF)
-            if self._failure is not None:
-                # The previous implementation left the dead client in
-                # `_clients`. Every later turn hit get_client()'s cache fast
-                # path and tried to write to the terminated subprocess until a
-                # fork/settings change/restart happened to rebuild it.
-                await _evict_failed_session_stream(self)
-
-    async def aclose(self) -> None:
-        self._closed = True
-        if not self.task.done():
-            self.task.cancel()
-            with suppress(asyncio.CancelledError, Exception):
-                await self.task
-
-
-# One pump per cached client, keyed exactly like `_clients`.
-_session_streams: dict["_ClientKey", _SessionStream] = {}
+_STREAM_EOF = chat_runtime.STREAM_EOF
+_SessionStream = chat_runtime.SessionStream
+_session_streams = chat_runtime.SESSION_STREAMS
 
 
 async def _evict_failed_session_stream(stream: _SessionStream) -> None:
-    """Remove one failed stream's exact client from every runtime cache.
-
-    Identity checks are load-bearing: a settings change or concurrent recovery
-    may already have installed a replacement under the same key. The failed
-    stream must never evict that fresh runtime.
-    """
-    key = stream.key
-    client = stream.client
-    async with _lock:
-        if _clients.get(key) is client:
-            _clients.pop(key, None)
-            _client_permission.pop(key, None)
-            _client_plan_return.pop(key, None)
-            if key in _client_lru:
-                _client_lru.remove(key)
-        if _session_streams.get(key) is stream:
-            _session_streams.pop(key, None)
-    try:
-        if not await _join_session_disconnects(key[0], (client,)):
-            raise RuntimeCleanupTimeout(
-                "failed session stream cleanup is still in progress")
-    except Exception as e:
-        sys.stderr.write(
-            f"[chat] failed-stream disconnect sid={key[0][:8]} "
-            f"exc={type(e).__name__}\n")
-        sys.stderr.flush()
+    return await chat_runtime.evict_failed_session_stream(stream)
 
 
-def _ensure_session_stream(key: "_ClientKey",
-                           client: ClaudeSDKClient) -> _SessionStream:
-    stream = _session_streams.get(key)
-    if stream is not None and not stream._closed and stream.client is client:
-        return stream
-    if stream is not None:
-        stream._closed = True
-    stream = _SessionStream(key, client)
-    _session_streams[key] = stream
-    return stream
+def _ensure_session_stream(
+    key: _ClientKey,
+    client: ClaudeSDKClient,
+) -> _SessionStream:
+    return chat_runtime.ensure_session_stream(key, client)
 
 
 def _stream_for(client: ClaudeSDKClient) -> _SessionStream | None:
-    """Find the pump that owns this client's message stream.
-
-    Consumers (the turn loop, the background-task watcher) already hold a
-    `client`; looking the pump up by identity keeps their signatures unchanged.
-    """
-    for stream in _session_streams.values():
-        if stream.client is client and not stream._closed:
-            return stream
-    return None
+    return chat_runtime.stream_for(client)
 
 
 async def _drop_session_streams(session_id: str) -> None:
-    streams = []
-    for key in [k for k in _session_streams if k[0] == session_id]:
-        stream = _session_streams.pop(key, None)
-        if stream is not None:
-            streams.append(stream)
-    if not streams:
-        return
-    tasks = {asyncio.create_task(stream.aclose()) for stream in streams}
-    done, pending = await asyncio.wait(tasks, timeout=1.0)
-    if done:
-        await asyncio.gather(*done, return_exceptions=True)
-    for task in pending:
-        task.cancel()
-        _retain_detached_cleanup(task)
+    return await chat_runtime.drop_session_streams(session_id)
 
 
 def _retain_detached_cleanup(task: asyncio.Task) -> None:
-    """Keep a timed-out cancellation owner alive and consume its outcome.
-
-    ``asyncio.wait_for`` waits for cancellation acknowledgement and therefore
-    is not a hard deadline when an SDK coroutine suppresses cancellation.  A
-    plain ``wait`` lets the request continue; this registry prevents the
-    detached task from being garbage-collected and avoids unhandled-exception
-    noise if it eventually exits.
-    """
+    """Keep a timed-out cancellation owner alive and consume its outcome."""
     _maintenance_tasks.add(task)
 
     def _done(done: asyncio.Task) -> None:
@@ -3884,31 +3447,11 @@ def _retain_detached_cleanup(task: asyncio.Task) -> None:
     task.add_done_callback(_done)
 
 
-class RuntimeCleanupTimeout(RuntimeError):
-    """A CLI cleanup did not finish before the public operation's deadline."""
+RuntimeCleanupTimeout = chat_runtime.RuntimeCleanupTimeout
 
 
 def _track_session_disconnect(session_id: str, task: asyncio.Task) -> None:
-    owners = _session_disconnect_tasks.setdefault(session_id, set())
-    owners.add(task)
-
-    def _done(done: asyncio.Task) -> None:
-        current = _session_disconnect_tasks.get(session_id)
-        if current is not None:
-            current.discard(done)
-            if not current:
-                _session_disconnect_tasks.pop(session_id, None)
-        if done.cancelled():
-            _session_disconnect_failed.add(session_id)
-            return
-        try:
-            error = done.exception()
-        except Exception as exc:
-            error = exc
-        if error is not None:
-            _session_disconnect_failed.add(session_id)
-
-    task.add_done_callback(_done)
+    chat_runtime.track_session_disconnect(session_id, task)
 
 
 async def _join_session_disconnects(
@@ -3917,26 +3460,9 @@ async def _join_session_disconnects(
     *,
     timeout: float = _CLIENT_DISCONNECT_DEADLINE_S,
 ) -> bool:
-    if session_id in _session_disconnect_failed:
-        return False
-    tasks = {
-        task
-        for task in _session_disconnect_tasks.get(session_id, set())
-        if not task.done()
-    }
-    for client in {id(item): item for item in clients}.values():
-        task = asyncio.create_task(client.disconnect())
-        _track_session_disconnect(session_id, task)
-        tasks.add(task)
-    if not tasks:
-        return True
-    done, pending = await asyncio.wait(tasks, timeout=max(0.1, timeout))
-    if done:
-        await asyncio.gather(*done, return_exceptions=True)
-    # Do not raw-cancel SDK close: its subprocess transport documents that a
-    # bare asyncio cancellation can skip TERM/KILL escalation. The registry is
-    # the durable in-process fence until these owners actually finish.
-    return not pending and session_id not in _session_disconnect_failed
+    return await chat_runtime.join_session_disconnects(
+        session_id, clients, timeout=timeout
+    )
 
 
 def _track_session_runtime_cleanup(
@@ -3989,95 +3515,21 @@ async def _join_session_runtime_cleanup(
 
 
 async def disconnect_client(session_id: str) -> None:
-    """Disconnect every cached client for this session (across all models).
-    The SDK subprocess transport has a bounded graceful/TERM/KILL close path;
-    we pop dict entries under _lock but await it OUTSIDE so other sessions are
-    never blocked by one slow process."""
-    to_disconnect: list[ClaudeSDKClient] = []
-    _pending_runtime_rebuilds.discard(session_id)
-    # Stop the pumps first: they iterate the very stream disconnect() tears
-    # down, and a reader still attached would surface the teardown as a
-    # transport exception rather than a clean end.
-    await _drop_session_streams(session_id)
-    async with _lock:
-        keys = [k for k in _clients if k[0] == session_id]
-        for k in keys:
-            c = _clients.pop(k, None)
-            _client_permission.pop(k, None)
-            _client_plan_return.pop(k, None)
-            _creation_locks.pop(k, None)
-            if k in _client_lru:
-                _client_lru.remove(k)
-            if c is not None:
-                to_disconnect.append(c)
-    if not await _join_session_disconnects(session_id, to_disconnect):
-        raise RuntimeCleanupTimeout(
-            "session runtime cleanup did not finish; retry the operation"
-        )
+    """Compatibility facade for session-wide SDK runtime teardown."""
+    return await chat_runtime.disconnect_client(session_id)
 
 
 async def _disconnect_background_task_owner(
     session_id: str,
     client: ClaudeSDKClient,
 ) -> None:
-    """Confirm teardown of the exact CLI that owns a background task.
-
-    Production watchers normally hold a pooled client, in which case the
-    ordinary session-wide cleanup is authoritative.  The identity fallback is
-    needed when a failed stream already evicted that client from the pool (and
-    keeps direct/unit watcher use honest): an empty pool is not by itself proof
-    that this particular CLI process was reaped.
-    """
-    async with _lock:
-        pooled = any(
-            key[0] == session_id and candidate is client
-            for key, candidate in _clients.items()
-        )
-    if pooled:
-        await disconnect_client(session_id)
-        return
-    # A failed-stream eviction registers its exact cleanup before removing the
-    # client. Join that owner rather than starting a duplicate disconnect. Do
-    # not use _join_session_disconnects here: its sticky failure fence is
-    # correct for ordinary callers, but this is the recovery owner that must be
-    # allowed to prove a later retry succeeded and clear that sticky state.
-    existing = set(_session_disconnect_tasks.get(session_id, set()))
-    if existing:
-        done, pending = await asyncio.wait(
-            existing, timeout=_CLIENT_DISCONNECT_DEADLINE_S)
-        if pending:
-            raise RuntimeCleanupTimeout(
-                "background task runtime cleanup is still in progress")
-        results = await asyncio.gather(*done, return_exceptions=True)
-        if any(isinstance(result, BaseException) for result in results):
-            raise RuntimeCleanupTimeout(
-                "background task runtime cleanup failed")
-        _session_disconnect_failed.discard(session_id)
-        return
-    disconnect = getattr(client, "disconnect", None)
-    if not callable(disconnect):
-        raise RuntimeCleanupTimeout(
-            "background task owner cannot confirm runtime cleanup")
-    cleanup = asyncio.create_task(disconnect())
-    _track_session_disconnect(session_id, cleanup)
-    done, pending = await asyncio.wait(
-        {cleanup}, timeout=_CLIENT_DISCONNECT_DEADLINE_S)
-    if pending:
-        raise RuntimeCleanupTimeout(
-            "background task runtime cleanup did not finish")
-    result = (await asyncio.gather(*done, return_exceptions=True))[0]
-    if isinstance(result, BaseException):
-        raise RuntimeCleanupTimeout(
-            "background task runtime cleanup failed")
-    # A successful exact-owner retry is positive proof that the process
-    # cleanup completed, so future turns need not inherit an earlier transient
-    # disconnect failure forever.
-    _session_disconnect_failed.discard(session_id)
+    return await chat_runtime.disconnect_background_task_owner(
+        session_id, client
+    )
 
 
 async def shutdown_runtime() -> None:
     """Boundedly stop every in-process chat task, stream, and SDK client."""
-    global _client_lru
 
     # Stop detached task watchers and active turn pumps before tearing down the
     # shared SDK streams they consume.
@@ -4119,69 +3571,15 @@ async def shutdown_runtime() -> None:
         broadcast.close()
     _recent_turns.clear()
 
-    streams = list(_session_streams.values())
-    _session_streams.clear()
-    if streams:
-        close_tasks = {
-            asyncio.create_task(stream.aclose()) for stream in streams
-        }
-        done, pending = await asyncio.wait(close_tasks, timeout=1.0)
-        if done:
-            await asyncio.gather(*done, return_exceptions=True)
-        for task in pending:
-            task.cancel()
-            _retain_detached_cleanup(task)
-
-    existing_disconnects = {
-        task
-        for owners in _session_disconnect_tasks.values()
-        for task in owners
-        if not task.done()
-    }
-
-    async with _lock:
-        clients_by_session: dict[str, list[ClaudeSDKClient]] = {}
-        seen_clients: set[int] = set()
-        for key, client in _clients.items():
-            if id(client) in seen_clients:
-                continue
-            seen_clients.add(id(client))
-            clients_by_session.setdefault(key[0], []).append(client)
-        shutdown_disconnects: set[asyncio.Task] = set()
-        for sid, clients in clients_by_session.items():
-            for client in clients:
-                task = asyncio.create_task(client.disconnect())
-                _track_session_disconnect(sid, task)
-                shutdown_disconnects.add(task)
-        _clients.clear()
-        _client_permission.clear()
-        _client_plan_return.clear()
-        _creation_locks.clear()
-        _client_lru.clear()
-        _pending_runtime_rebuilds.clear()
-        _active_turns.clear()
-        _sessions_with_inflight_tasks.clear()
-        _bg_task_pinned_at.clear()
-        _background_activity_finishes.clear()
-        _task_watchers.clear()
-        _runtime_prewarm_tasks.clear()
-        _queue_drain_tasks.clear()
-        _queue_drain_rekicks.clear()
-        _queue_drain_locks.clear()
-
-    # Session-specific disconnect owners are deliberately not cancelled: the
-    # SDK close path owns TERM/KILL escalation. Give them one final bounded
-    # join while the event loop is alive, then keep their handles until process
-    # shutdown rather than losing ownership of a still-running child cleanup.
-    async def _join_existing_disconnects() -> None:
-        if not existing_disconnects:
-            return
-        done, _pending = await asyncio.wait(
-            existing_disconnects,
-            timeout=4.0,
-        )
-        if done:
-            await asyncio.gather(*done, return_exceptions=True)
+    _active_turns.clear()
+    _sessions_with_inflight_tasks.clear()
+    _bg_task_pinned_at.clear()
+    _background_activity_finishes.clear()
+    _task_watchers.clear()
+    _runtime_prewarm_tasks.clear()
+    _queue_drain_tasks.clear()
+    _queue_drain_rekicks.clear()
+    _queue_drain_locks.clear()
 
     async def _join_protected_cleanup() -> None:
         if not protected_cleanup_tasks:
@@ -4193,22 +3591,8 @@ async def shutdown_runtime() -> None:
         if done:
             await asyncio.gather(*done, return_exceptions=True)
 
-    async def _disconnect_pooled_clients() -> None:
-        # Registration happened atomically with pool removal under `_lock`.
-        # A concurrent DELETE can therefore never observe both an empty pool
-        # and an empty cleanup registry for a still-running subprocess.
-        if not shutdown_disconnects:
-            return
-        done, _pending = await asyncio.wait(
-            shutdown_disconnects,
-            timeout=4.0,
-        )
-        if done:
-            await asyncio.gather(*done, return_exceptions=True)
-
     await asyncio.gather(
-        _disconnect_pooled_clients(),
-        _join_existing_disconnects(),
+        chat_runtime.shutdown_clients(),
         _join_protected_cleanup(),
     )
 
@@ -15665,6 +15049,33 @@ async def providers_list() -> dict:
         "default_model": _resolve_default_model(""),
         "default_permission": default_permission,
     }
+
+
+# Dynamic bridge for SDK client/runtime lifecycle. Every callback resolves the
+# chat facade at call time, preserving monkeypatch behavior while the extracted
+# module owns the exact shared pool, disconnect, and stream-pump containers.
+chat_runtime.configure_hooks(chat_runtime.RuntimeHooks(
+    sessions=sess,
+    normalize_effort=lambda *a, **k: _normalize_effort(*a, **k),
+    valid_efforts=_VALID_EFFORT,
+    valid_service_tiers=_VALID_SERVICE_TIERS,
+    normalize_plan_return_permission=lambda *a, **k: _normalize_plan_return_permission(*a, **k),
+    build_and_connect_client=lambda *a, **k: _build_and_connect_client(*a, **k),
+    has_enabled_external_mcp=lambda: _has_enabled_external_mcp(),
+    await_mcp_ready=lambda *a, **k: _await_mcp_ready(*a, **k),
+    active_turns=_active_turns,
+    sessions_with_inflight_tasks=_sessions_with_inflight_tasks,
+    session_has_live_watcher=lambda *a, **k: _session_has_live_watcher(*a, **k),
+    pending_runtime_rebuilds=_pending_runtime_rebuilds,
+    client_pool_cap=lambda: _CLIENT_POOL_CAP,
+    disconnect_unpooled_client=lambda *a, **k: _disconnect_unpooled_client(*a, **k),
+    disconnect_client=lambda *a, **k: disconnect_client(*a, **k),
+    get_client=lambda *a, **k: get_client(*a, **k),
+    ensure_session_stream=lambda *a, **k: _ensure_session_stream(*a, **k),
+    join_session_disconnects=lambda *a, **k: _join_session_disconnects(*a, **k),
+    evict_failed_session_stream=lambda *a, **k: _evict_failed_session_stream(*a, **k),
+    retain_detached_cleanup=lambda *a, **k: _retain_detached_cleanup(*a, **k),
+))
 
 
 # Dynamic runtime bridge for transcript-fork/successor lifecycle. Every callback
