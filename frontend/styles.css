@@ -4280,14 +4280,12 @@ pre.text {
   height: 1px;
   pointer-events: none;
 }
-.load-later-wrap {
-  display: flex;
-  justify-content: center;
-  gap: var(--sp-2);
-  padding-block: var(--sp-2);
+.load-earlier-status {
+  color: var(--c-fg-2);
+  font-size: var(--fs-xs);
 }
-.load-later-wrap .latest { font-weight: 600; }
-.stream-plain {
+.stream-plain,
+.history-plain {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
   font: inherit;

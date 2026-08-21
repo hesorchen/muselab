@@ -1882,20 +1882,14 @@
             </div>
           </template>
 
-          <!-- Lazy-loaded history controls — sits above the message loop.
-               Only shown when loadSession() deferred older messages because
-               history exceeds INITIAL_LOAD. Clicking pages back in batches
-               (LOAD_MORE_BATCH = 50) while preserving scroll position. -->
-          <div x-show="activeSession.messagesReady && (hasMoreHistory() || historyTruncated())"
-               class="load-earlier-wrap">
-            <button x-show="hasMoreHistory()"
-                    class="load-earlier-btn"
-                    @click="loadEarlierMessages()"
-                    x-text="t('history.load_earlier', { n: earlierMessageCount() })"></button>
-            <div x-show="historyTruncated() && !hasMoreHistory()"
-                 class="load-earlier-truncated-note"
-                 x-text="t('history.truncated_note')"></div>
-          </div>
+          <!-- History pagination is transport-only. Older canonical windows are
+               filled and revealed automatically; surface only a transient retry
+               state when the local read fails, never a manual load control. -->
+          <div x-show="activeSession._historyHydrationError"
+               class="load-earlier-wrap load-earlier-status"
+               role="status"
+               aria-live="polite"
+               x-text="lang==='zh' ? '正在重试补齐会话历史…' : 'Retrying conversation history…'"></div>
           <!-- Per-message rendering — Alpine 3's reactivity worked
                reliably on this flat messages x-for. The "group into
                assistant turns" experiment broke streaming reactivity
@@ -1920,7 +1914,7 @@
                  :data-uuid="row.spacer ? '' : (m.uuid || '')"
                  :data-message-key="row.spacer ? '' : m._k"
                  :aria-hidden="row.spacer ? 'true' : null"
-                 :style="row.spacer ? ('height:' + row.height + 'px') : ('contain-intrinsic-size: auto ' + estIntrinsicH(m) + 'px')">
+                 :style="row.spacer ? ('height:' + row.height + 'px') : ('contain-intrinsic-size: auto ' + messageIntrinsicH(pane, m) + 'px')">
               <!-- Per-message wall-clock (`mts`, backend). Deliberately NOT on
                    by default: an agentic turn is 30+ tool cards, and stamping
                    every one of them costs more attention than it returns —
@@ -2121,7 +2115,14 @@
                          :class="{ 'is-streaming-bubble': pane && pane.streaming && i === paneMsgs.length - 1 }"
                          x-init="observeAssistantBody($el, m, tid)">
                       <div x-show="m._streamPlain" class="stream-plain" x-text="m._streamText || ''"></div>
-                      <div x-show="!m._streamPlain" x-html="m.html || ''"></div>
+                      <!-- Newly-virtualized history must never be blank while its
+                           rich renderer catches up. Show resident text immediately
+                           (the transport preview until body prefetch completes), then
+                           upgrade automatically to sanitized Markdown/attachments. -->
+                      <div x-show="!m._streamPlain && !m.html"
+                           class="history-plain"
+                           x-text="m.text || m.preview || ''"></div>
+                      <div x-show="!m._streamPlain && m.html" x-html="m.html || ''"></div>
                     </div>
                   </div>
                   <!-- Per-bubble footer removed. Time + streaming dots
@@ -2931,13 +2932,6 @@
           </div>
           </div>
           </template>
-          <div x-show="activeSession.messagesReady && hasLaterMessages()" class="load-later-wrap">
-            <button class="load-earlier-btn" @click="loadLaterMessages()"
-                    x-text="lang==='zh' ? '加载较新消息（' + laterMessageCount() + '）' : 'Load newer (' + laterMessageCount() + ')'">
-            </button>
-            <button class="load-earlier-btn latest" @click="returnToLatest()"
-                    x-text="lang==='zh' ? '回到最新' : 'Back to latest'"></button>
-          </div>
           <!-- /P1 per-tab message panes. Siblings below (pending bubble,
                pending queue, banners) stay single-instance with active-tab
                semantics through the activeSession façade above. -->

@@ -2723,7 +2723,9 @@ def test_large_history_bodies_load_by_stable_block_reference():
     assert 'Object.assign(m, loaded' in loader
     assert 'body_state: "loaded"' in loader
     assert 'new IntersectionObserver' in loader
-    assert 'rootMargin: "1200px 0px"' in loader
+    assert 'root: (this.$refs && this.$refs.chatBody) || null' in loader
+    assert 'rootMargin: "500% 0px"' in loader
+    assert 'm.html = this._renderHistoryMessage(m)' in loader
     assert "this._loadMessageBody(m, sid)" in loader
     assert "await this._loadMessageBody(m)" in toggle
     assert 'x-init="observeAssistantBody($el, m, tid)"' in html
@@ -3166,6 +3168,47 @@ def test_tab_selection_and_layout_changes_share_one_tail_follow_controller():
     assert "this._settleToken = (this._settleToken || 0) + 1" in intent
 
 
+def test_history_paging_is_transparent_and_fast_scroll_never_enters_blank_rows():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+
+    hydrate_start = app.index("    _revealResidentHistory(st) {")
+    hydrate_end = app.index("    // Pull the next older window", hydrate_start)
+    hydrate = app[hydrate_start:hydrate_end]
+    assert "st.messageRange.visibleStart = 0" in hydrate
+    assert "this._shiftMessageVirtualWindow(st, count)" in hydrate
+    assert "this._fetchOlderWindow(sid)" in hydrate
+    assert "this._fetchLaterWindow(sid)" in hydrate
+    assert "st.messageRange.visibleEnd = st.messages.length" in hydrate
+    assert "window.requestIdleCallback" in hydrate
+    assert "st._historyHydrationRetry = setTimeout" in hydrate
+
+    scroll_start = app.index("    onChatScroll() {")
+    scroll_end = app.index("    // Stamp the last genuine user scroll gesture", scroll_start)
+    scroll = app[scroll_start:scroll_end]
+    assert "st._virtualScrollVelocity" in scroll
+    assert "st._virtualScrollDirection" in scroll
+    assert "el.clientHeight * 6" in scroll
+    assert "this._scheduleTransparentHistory(st, true)" in scroll
+
+    virtual_start = app.index("    _syncMessageViewport(tid = this.currentId")
+    virtual_end = app.index("    _scheduleMessageViewportSync", virtual_start)
+    virtual = app[virtual_start:virtual_end]
+    assert "const speedScreens = Math.min(" in virtual
+    assert "const topOverscan = overscan" in virtual
+    assert "const bottomOverscan = overscan" in virtual
+    assert "const measurementAnchor = followTail" in virtual
+    assert "if (heightsChanged && measurementAnchor)" in virtual
+
+    assert '@click="loadEarlierMessages()"' not in html
+    assert '@click="loadLaterMessages()"' not in html
+    assert 'history.load_earlier' not in html
+    assert 'Load newer' not in html
+    assert 'activeSession._historyHydrationError' in html
+    assert 'class="history-plain"' in html
+    assert "messageIntrinsicH(pane, m)" in html
+
+
 def test_quiet_canonical_reload_rebases_virtual_window_before_alpine_paints():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
 
@@ -3331,7 +3374,10 @@ def test_stream_deltas_use_throttled_plain_snapshots_and_final_rich_render():
     assert "_streamPlainRenderCount" in app
     assert "}, 1000);" in app
     assert 'class="stream-plain" x-text="m._streamText || \'\'"' in html
-    assert 'x-show="!m._streamPlain" x-html="m.html || \'\'"' in html
+    assert 'x-show="!m._streamPlain && !m.html"' in html
+    assert 'class="history-plain"' in html
+    assert 'x-text="m.text || m.preview || \'\'"' in html
+    assert 'x-show="!m._streamPlain && m.html" x-html="m.html || \'\'"' in html
     assert "if (streamState.atBottom !== false) this.scrollToBottom(false)" in app
     assert "if (streamState.atBottom !== false) this._scheduleLiveMessageViewport" not in app
     assert "const maxChunk = this._isMobileLayout() ? 4 : 12" in app

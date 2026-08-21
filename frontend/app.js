@@ -235,6 +235,7 @@ const _EMPTY_ACTIVE_SESSION_PANE = Object.freeze({
   backgroundActive: false,
   compacting: false,
   _draining: false,
+  _historyHydrationError: false,
   atBottom: true,
 });
 
@@ -7287,8 +7288,20 @@ function portal() {
         _usageFetching: false,
         _hasMoreHistory: false,
         _truncatedFromTop: false,
-        // True while an async backend older-window fetch is in flight, so
-        // rapid "Load earlier" clicks don't fire duplicate requests.
+        // History paging is an internal transport concern. The active session
+        // fills its normalized repository in idle slices and promotes urgent
+        // reads when the user scrolls toward the loaded edge.
+        _historyHydrating: false,
+        _historyHydrationScheduled: false,
+        _historyHydrationUrgent: false,
+        _historyHydrationEpoch: 0,
+        _historyHydrationError: false,
+        _historyHydrationRetry: null,
+        _lastVirtualScrollTop: 0,
+        _lastVirtualScrollAt: 0,
+        _virtualScrollVelocity: 0,
+        _virtualScrollDirection: 0,
+        // Single-flight guards for older/newer server windows.
         _fetchingOlder: false,
         _fetchingLater: false,
       };
@@ -8976,6 +8989,9 @@ function portal() {
       if (!st || !Array.isArray(st.messages)) return [];
       const range = st.messageRange;
       if (!range) return st.messages;
+      if (range.visibleStart === 0 && range.visibleEnd === st.messages.length) {
+        return st.messages;
+      }
       return st.messages.slice(range.visibleStart, range.visibleEnd);
     },
     _containsPaneMessage(st, message) {
@@ -8994,6 +9010,9 @@ function portal() {
       const key = message && message._k;
       const measured = key && Number(st._virtualHeights[key]);
       return measured > 0 ? measured : this.estIntrinsicH(message);
+    },
+    messageIntrinsicH(st, message) {
+      return st ? this._messageVirtualHeight(st, message) : this.estIntrinsicH(message);
     },
     _messageVirtualGap(pane) {
       if (!pane || typeof getComputedStyle !== "function") return 8;
@@ -9115,13 +9134,26 @@ function portal() {
       const pane = this._paneElement(tid);
       const messages = this._visiblePaneMessages(st);
       if (!st || !body || !pane || !messages.length || tid !== this.currentId) return;
-      this._measureMessageVirtualRows(tid, st);
+      const followTail = forceTail || st.atBottom;
+      // Height realization changes spacer geometry even when the mounted index
+      // range itself stays unchanged. Capture the reader's stable message before
+      // measuring so that correction cannot move the content under their eyes.
+      const measurementAnchor = followTail
+        ? null : this._captureViewportMessageAnchor(body, tid);
+      const heightsChanged = this._measureMessageVirtualRows(tid, st);
       const gap = this._messageVirtualGap(pane);
       const overscan = Math.max(600, body.clientHeight * 1.5);
+      const speedScreens = Math.min(
+        8, (Number(st._virtualScrollVelocity) || 0) / Math.max(1, body.clientHeight));
+      const directionalExtra = body.clientHeight * speedScreens;
+      const topOverscan = overscan
+        + (st._virtualScrollDirection < 0 ? directionalExtra : 0);
+      const bottomOverscan = overscan
+        + (st._virtualScrollDirection > 0 ? directionalExtra : 0);
       const paneRect = pane.getBoundingClientRect();
       const bodyRect = body.getBoundingClientRect();
-      const wantedTop = Math.max(0, bodyRect.top - paneRect.top - overscan);
-      const wantedBottom = Math.max(wantedTop, bodyRect.bottom - paneRect.top + overscan);
+      const wantedTop = Math.max(0, bodyRect.top - paneRect.top - topOverscan);
+      const wantedBottom = Math.max(wantedTop, bodyRect.bottom - paneRect.top + bottomOverscan);
       let cursor = 0;
       let start = 0;
       while (start < messages.length) {
@@ -9135,7 +9167,6 @@ function portal() {
         cursor += this._messageVirtualHeight(st, messages[end]) + gap;
         end++;
       }
-      const followTail = forceTail || st.atBottom;
       if (followTail) {
         end = messages.length;
         let tailHeight = 0;
@@ -9146,7 +9177,16 @@ function portal() {
           tailHeight += this._messageVirtualHeight(st, messages[start]) + gap;
         }
       }
-      if (start === st._virtualStart && end === st._virtualEnd) return;
+      if (start === st._virtualStart && end === st._virtualEnd) {
+        if (heightsChanged && measurementAnchor) {
+          this.$nextTick(() => {
+            if (this.tabState[tid] === st && tid === this.currentId && st.atBottom === false) {
+              this._restoreMessageAnchor(body, measurementAnchor);
+            }
+          });
+        }
+        return;
+      }
       // Normal reader-controlled virtualization updates preserve the message
       // currently under the reader's eyes. Tail-follow updates must not: every
       // programmatic scroll event schedules another viewport sync with
@@ -9154,7 +9194,7 @@ function portal() {
       // that follow-up sync was undoing both Send's explicit jump and every
       // streaming auto-follow step.
       const anchor = followTail
-        ? null : this._captureViewportMessageAnchor(body, tid);
+        ? null : (measurementAnchor || this._captureViewportMessageAnchor(body, tid));
       st._virtualStart = start;
       st._virtualEnd = end;
       st._virtualRevision++;
@@ -10696,6 +10736,9 @@ function portal() {
         if (st._streamTimer) clearInterval(st._streamTimer);
         if (st._stallWatch) clearInterval(st._stallWatch);
         if (st._reconnectTimer) clearTimeout(st._reconnectTimer);
+        if (st._historyHydrationRetry) clearTimeout(st._historyHydrationRetry);
+        st._historyHydrationRetry = null;
+        st._historyHydrationEpoch = (Number(st._historyHydrationEpoch) || 0) + 1;
         this._disposeSessionSync(st);
         if (st._virtualSyncFrame) {
           if (typeof cancelAnimationFrame === "function") {
@@ -11332,8 +11375,19 @@ function portal() {
       return m._bodyLoadPromise;
     },
     observeAssistantBody(el, m, sid) {
-      if (!el || !m || m.role !== "assistant" || !m.body_available
-          || m.body_state === "loaded") return;
+      if (!el || !m || m.role !== "assistant") return;
+      if (m.body_state === "loaded" || !m.body_available) {
+        if (m.text && !m.html) {
+          const render = () => {
+            if (el.isConnected && m.text && !m.html) {
+              m.html = this._renderHistoryMessage(m);
+            }
+          };
+          if (typeof requestAnimationFrame === "function") requestAnimationFrame(render);
+          else setTimeout(render, 0);
+        }
+        return;
+      }
       const load = async () => {
         if (!el.isConnected || m.body_state === "loaded") return true;
         if (m.body_state === "error") m.body_state = "unloaded";
@@ -11361,7 +11415,10 @@ function portal() {
               this._assistantBodyTargets.delete(target);
             });
           }
-        }, { root: null, rootMargin: "1200px 0px" });
+        }, {
+          root: (this.$refs && this.$refs.chatBody) || null,
+          rootMargin: "500% 0px",
+        });
       }
       for (const target of this._assistantBodyTargets.keys()) {
         if (target.isConnected) continue;
@@ -13908,6 +13965,7 @@ function portal() {
           });
         });
       }
+      this._scheduleTransparentHistory(st, false);
     },
     // Run `fn` AFTER the browser has painted the current frame. A single
     // requestAnimationFrame fires before paint; the nested one runs at the top
@@ -14396,7 +14454,7 @@ function portal() {
         this._scheduleHistoryViewport(st, "newer");
         this._syncSessionMessageStore(st);
         st._hasMoreHistory = st.messageRange.visibleStart > 0
-          || st.messageRange.offset > 0;
+          || st.messageRange.offset > 0 || this._preCompactReachable(st);
         // Remember whether this load pulled the full raw-JSONL history, so
         // _scrollToUserMsg knows it can stop retrying after one full reload.
         st._fullLoaded = full;
@@ -14488,6 +14546,7 @@ function portal() {
                 st.atBottom = false;
               }
             });
+            if (!full && sid === this.currentId) this._scheduleTransparentHistory(st, false);
             await this._fetchTabUsage(sid);
             return true;
           }
@@ -14522,6 +14581,7 @@ function portal() {
                     window.requestIdleCallback(_kick, { timeout: 300 });
                   } else { setTimeout(_kick, 32); }
                 }
+                if (!full) this._scheduleTransparentHistory(st, false);
               });
             }
           });
@@ -15129,6 +15189,123 @@ function portal() {
       return this.loadSession(sid, { quiet: sid === this.currentId });
     },
 
+    _revealResidentHistory(st) {
+      if (!st || !st.messageRange || st.messageRange.visibleStart <= 0) return 0;
+      const sid = st._sid;
+      const count = st.messageRange.visibleStart;
+      const body = sid === this.currentId ? this.$refs && this.$refs.chatBody : null;
+      const anchor = body ? this._captureViewportMessageAnchor(body, sid) : null;
+      this._shiftMessageVirtualWindow(st, count);
+      st.messageRange.visibleStart = 0;
+      st._hasMoreHistory = st.messageRange.offset > 0 || this._preCompactReachable(st);
+      this._scheduleHistoryViewport(st, "older");
+      if (body && anchor) {
+        this.$nextTick(() => {
+          if (this.tabState[sid] !== st || sid !== this.currentId || st.atBottom !== false) return;
+          this._restoreMessageAnchor(body, anchor);
+          this._scheduleMessageViewportSync(sid);
+        });
+      }
+      return count;
+    },
+    _scheduleTransparentHistory(st, urgent = false) {
+      if (!st || !st._sid || this.tabState[st._sid] !== st) return;
+      if (urgent && st._historyHydrationRetry) {
+        clearTimeout(st._historyHydrationRetry);
+        st._historyHydrationRetry = null;
+      }
+      if (st._historyHydrating) {
+        if (urgent) st._historyHydrationUrgent = true;
+        return;
+      }
+      if (st._historyHydrationScheduled && !urgent) return;
+      st._historyHydrationScheduled = true;
+      const sid = st._sid;
+      const run = () => {
+        st._historyHydrationScheduled = false;
+        if (this.tabState[sid] !== st || sid !== this.currentId) return;
+        this._hydrateTransparentHistory(sid, st, urgent);
+      };
+      if (!urgent && typeof window !== "undefined" && window.requestIdleCallback) {
+        window.requestIdleCallback(run, { timeout: 500 });
+      } else if (!urgent) {
+        setTimeout(run, 80);
+      } else {
+        run();
+      }
+    },
+    async _hydrateTransparentHistory(sid, st, urgent = false) {
+      if (!sid || this.tabState[sid] !== st || st._historyHydrating) return;
+      st._historyHydrating = true;
+      st._historyHydrationUrgent = !!urgent;
+      const epoch = ++st._historyHydrationEpoch;
+      try {
+        let failed = false;
+        const yieldToBrowser = async () => {
+          if (st._historyHydrationUrgent) return;
+          await new Promise(resolve => {
+            if (typeof window !== "undefined" && window.requestIdleCallback) {
+              window.requestIdleCallback(() => resolve(), { timeout: 250 });
+            } else {
+              setTimeout(resolve, 32);
+            }
+          });
+        };
+
+        this._revealResidentHistory(st);
+        while (this.tabState[sid] === st && sid === this.currentId
+               && st._historyHydrationEpoch === epoch && st.messageRange.offset > 0) {
+          if (st.streaming && !st._historyHydrationUrgent) break;
+          const loaded = await this._fetchOlderWindow(sid);
+          if (this.tabState[sid] !== st || st._historyHydrationEpoch !== epoch) return;
+          if (loaded <= 0) {
+            failed = st.messageRange.offset > 0;
+            break;
+          }
+          this._revealResidentHistory(st);
+          await yieldToBrowser();
+          st._historyHydrationUrgent = false;
+        }
+
+        // around_uuid/full-order transitions can leave canonical records on both
+        // sides of the current anchor. Fill and reveal the newer side as well so
+        // pagination never resurfaces as a user-visible mode or control.
+        while (this.tabState[sid] === st && sid === this.currentId
+               && st._historyHydrationEpoch === epoch
+               && st.messageRange.offset + st.messages.length < st.messageRange.total) {
+          if (st.streaming && !st._historyHydrationUrgent) break;
+          const loaded = await this._fetchLaterWindow(sid);
+          if (this.tabState[sid] !== st || st._historyHydrationEpoch !== epoch) return;
+          if (loaded <= 0) {
+            failed = true;
+            break;
+          }
+          st.messageRange.visibleEnd = st.messages.length;
+          this._scheduleHistoryViewport(st, "newer");
+          await yieldToBrowser();
+          st._historyHydrationUrgent = false;
+        }
+
+        const missingHistory = st.messageRange.offset > 0
+          || st.messageRange.offset + st.messages.length < st.messageRange.total;
+        st._historyHydrationError = failed && missingHistory;
+      } finally {
+        if (this.tabState[sid] === st) {
+          st._historyHydrating = false;
+          st._hasMoreHistory = st.messageRange.visibleStart > 0
+            || st.messageRange.offset > 0 || this._preCompactReachable(st);
+          if (st._historyHydrationError && !st._historyHydrationRetry) {
+            st._historyHydrationRetry = setTimeout(() => {
+              st._historyHydrationRetry = null;
+              if (this.tabState[sid] === st && sid === this.currentId) {
+                this._scheduleTransparentHistory(st, false);
+              }
+            }, 1500);
+          }
+        }
+      }
+    },
+
     // Pull the next older window of bubbles from the server into the FRONT
     // of the resident repository and rewind its server offset. Used when the range
     // is exhausted but the server still holds older history (the backend-
@@ -15287,7 +15464,10 @@ function portal() {
       try {
         if (range.visibleStart === 0 && range.offset === 0
             && this._preCompactReachable(st)) {
-          await this._switchToFullOrder(sid);
+          const switched = await this._switchToFullOrder(sid);
+          if (switched && this.tabState[sid] === st) {
+            this._scheduleTransparentHistory(st, true);
+          }
           return;
         }
         if (range.visibleStart === 0 && range.offset > 0) {
@@ -15336,29 +15516,6 @@ function portal() {
         st._loadingEarlier = false;
       }
     },
-    async loadLaterMessages(sid) {
-      sid = sid || this.currentId;
-      const st = sid && this.tabState[sid];
-      if (!st) return;
-      const range = st.messageRange;
-      if (range.visibleEnd === st.messages.length
-          && range.offset + st.messages.length < range.total) {
-        await this._fetchLaterWindow(sid);
-        if (this.tabState[sid] !== st) return;
-      }
-      if (range.visibleEnd >= st.messages.length) return;
-      const batchSize = this._isMobileLayout() ? 20 : this.LOAD_MORE_BATCH;
-      const scrollEl = sid === this.currentId ? this.$refs.chatBody : null;
-      const anchor = this._captureViewportMessageAnchor(scrollEl, sid);
-      range.visibleEnd = Math.min(st.messages.length, range.visibleEnd + batchSize);
-      this._scheduleHistoryViewport(st, "newer");
-      if (scrollEl) {
-        this.$nextTick(() => {
-          this._restoreMessageAnchor(scrollEl, anchor);
-          this._scheduleMessageViewportSync(sid);
-        });
-      }
-    },
     async returnToLatest(sid) {
       sid = sid || this.currentId;
       const st = sid && this.tabState[sid];
@@ -15384,15 +15541,6 @@ function portal() {
       return range.visibleEnd < st.messages.length
         || range.offset + st.messages.length < range.total;
     },
-    laterMessageCount(sid) {
-      const st = this.tabState[sid || this.currentId];
-      if (!st) return 0;
-      const range = st.messageRange;
-      const local = st.messages.length - range.visibleEnd;
-      const server = Math.max(0, range.total - range.offset - st.messages.length);
-      return local + server;
-    },
-
     // Live history stays canonical in memory. The viewport row builder, not an
     // envelope count, bounds the DOM while keeping every interaction target and
     // normalized object reachable during long streaming turns.
@@ -26216,6 +26364,31 @@ function portal() {
       const el = this.$refs.chatBody;
       if (!el) return;
       const st = this.currentId && this.tabState && this.tabState[this.currentId];
+      if (st) {
+        const now = (typeof performance !== "undefined" && performance.now)
+          ? performance.now() : Date.now();
+        const previousTop = Number(st._lastVirtualScrollTop) || 0;
+        const previousAt = Number(st._lastVirtualScrollAt) || now;
+        const delta = el.scrollTop - previousTop;
+        const elapsed = Math.max(8, now - previousAt);
+        st._virtualScrollDirection = delta < -1 ? -1 : (delta > 1 ? 1 : st._virtualScrollDirection);
+        st._virtualScrollVelocity = Math.min(20000, Math.abs(delta) * 1000 / elapsed);
+        st._lastVirtualScrollTop = el.scrollTop;
+        st._lastVirtualScrollAt = now;
+        // Promote history transport before the reader reaches the loaded edge.
+        // Background hydration normally wins this race; the six-screen guard is
+        // the urgent path for a scrollbar drag or a very fast upward flick.
+        if (el.scrollTop < el.clientHeight * 6) {
+          if (st.messageRange.visibleStart > 0 || st.messageRange.offset > 0) {
+            this._scheduleTransparentHistory(st, true);
+          } else if (this._preCompactReachable(st) && !st._loadingEarlier) {
+            // Crossing the compact boundary needs the server's UUID-based full-
+            // order mapping; trigger it transparently only when the reader has
+            // actually reached that edge so background work never moves them.
+            this.loadEarlierMessages(st._sid);
+          }
+        }
+      }
       this._scheduleMessageViewportSync(this.currentId);
       // While WE are programmatically pinning to the bottom (the settle loop),
       // every per-frame `scrollTop = scrollHeight` fires this handler. Its
