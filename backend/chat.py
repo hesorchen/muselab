@@ -10558,14 +10558,20 @@ def _create_context_recovery_session(
             runtime_profile=source_meta.get("runtime_profile") or "",
             cwd=source_meta.get("cwd") or str(workspace),
         )
+        from .activity import activity as _activity
+        _activity.inherit_session(source_sid, result.session_id, successor=True)
     except Exception:
-        # register_session normally has no partial failure, but storage errors
-        # must not leave an unindexed recovery transcript behind.
+        # Session registration and Activity lineage are one published successor.
+        # The Activity journal rolls its own files back; remove every child
+        # artifact before surfacing failure so a retry starts from the source.
         try:
-            with _session_config_dir(source_model):
-                sdk_delete_session(result.session_id, directory=str(workspace))
+            _purge_single_session_storage(result.session_id)
         except Exception:
-            result.path.unlink(missing_ok=True)
+            try:
+                with _session_config_dir(source_model):
+                    sdk_delete_session(result.session_id, directory=str(workspace))
+            except Exception:
+                result.path.unlink(missing_ok=True)
         raise
 
     _JSONL_PATH_CACHE[result.session_id] = result.path
@@ -11201,25 +11207,48 @@ def fork_session_api(sid: str, req: ForkReq) -> dict:
         sys.stderr.flush()
         raise HTTPException(500, "fork failed — see server log") from None
     new_sid = result.session_id
-    meta = sess.register_session(
-        new_sid,
-        name=new_name,
-        model=src_meta.get("model") or MODEL,
-        permission=src_meta.get("permission") or "",
-        plan_return_permission=src_meta.get("plan_return_permission"),
-        auto_named=False,
-        message_count=forked_count,
-        turn_count=forked_turns,
-        effort=_normalize_effort(src_meta.get("effort")),
-        service_tier=src_meta.get("service_tier") or "",
-        thinking=src_meta.get("thinking") is not False,
-        forked_from=sid,
-        forked_from_name=source_name,
-        forked_from_message_id=req.up_to_message_id or "",
-        activity_hidden=req.activity_hidden,
-        runtime_profile=req.runtime_profile,
-        cwd=src_meta.get("cwd") or str(ROOT),
-    )
+    try:
+        meta = sess.register_session(
+            new_sid,
+            name=new_name,
+            model=src_meta.get("model") or MODEL,
+            permission=src_meta.get("permission") or "",
+            plan_return_permission=src_meta.get("plan_return_permission"),
+            auto_named=False,
+            message_count=forked_count,
+            turn_count=forked_turns,
+            effort=_normalize_effort(src_meta.get("effort")),
+            service_tier=src_meta.get("service_tier") or "",
+            thinking=src_meta.get("thinking") is not False,
+            forked_from=sid,
+            forked_from_name=source_name,
+            forked_from_message_id=req.up_to_message_id or "",
+            activity_hidden=req.activity_hidden,
+            runtime_profile=req.runtime_profile,
+            cwd=src_meta.get("cwd") or str(ROOT),
+        )
+        from .activity import activity as _activity
+        _activity.inherit_session(sid, new_sid)
+    except Exception as exc:
+        try:
+            _purge_single_session_storage(new_sid)
+        except Exception:
+            sess.delete_session(new_sid)
+            try:
+                with _session_config_dir(source_model):
+                    sdk_delete_session(
+                        new_sid,
+                        directory=str(sess.session_workspace(sid)),
+                    )
+            except Exception:
+                child_path = _find_session_jsonl(new_sid)
+                if child_path is not None:
+                    child_path.unlink(missing_ok=True)
+        sys.stderr.write(
+            f"[chat] fork commit failed sid={sid[:8]} "
+            f"child={new_sid[:8]} exc={type(exc).__name__}\n")
+        sys.stderr.flush()
+        raise HTTPException(500, "fork failed — see server log") from None
     return {
         **meta,
         "session_id": new_sid,

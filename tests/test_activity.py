@@ -500,6 +500,100 @@ def test_custom_groups_persist_reorder_and_assignment_without_rewriting_task(
     assert state["assignments"] == {}
 
 
+def test_compact_successor_atomically_inherits_activity_lineage_and_placement(
+    tmp_path,
+    monkeypatch,
+):
+    service = _service(tmp_path, monkeypatch)
+    source = service.start("source", summary="compact me")
+    service.finish("source", "completed")
+    group = service.create_group("Recovery", "violet")["group"]
+    service.set_group(source["id"], group["id"], before_event_id="")
+    service.set_pin(source["id"], True)
+    before = next(row for row in service.list() if row["id"] == source["id"])
+
+    inherited = service.inherit_session("source", "child", successor=True)
+
+    assert inherited["item"]["id"] == source["id"]
+    assert inherited["item"]["session_id"] == "child"
+    assert inherited["item"]["session_name"] == "Session child"
+    assert inherited["group_id"] == group["id"]
+    assert all(row["session_id"] != "source" for row in service.list())
+    after = next(row for row in service.list() if row["session_id"] == "child")
+    for field in (
+        "id", "updated_at", "started_at", "finished_at", "state", "read",
+        "task_summary", "turn_count", "pinned", "group_id", "group_order",
+    ):
+        assert after[field] == before[field]
+    assert service._group_assignments == {"child": group["id"]}
+
+    revision = service.revision
+    retry = service.inherit_session("source", "child", successor=True)
+    assert retry["item"]["id"] == source["id"]
+    assert service.revision == revision
+
+    restarted = _service(tmp_path, monkeypatch)
+    restored = restarted.list()[0]
+    assert restored["id"] == source["id"]
+    assert restored["session_id"] == "child"
+    assert restarted._group_assignments == {"child": group["id"]}
+
+
+def test_ordinary_fork_inherits_group_without_stealing_source_lineage(
+    tmp_path,
+    monkeypatch,
+):
+    service = _service(tmp_path, monkeypatch)
+    source = service.start("source", summary="branch me")
+    group = service.create_group("Branches", "green")["group"]
+    service.set_group(source["id"], group["id"])
+
+    inherited = service.inherit_session("source", "child")
+
+    assert inherited["item"] is None
+    assert inherited["group_id"] == group["id"]
+    assert next(row for row in service.list() if row["session_id"] == "source")
+    child = service.start("child", summary="new branch")
+    assert child["id"] != source["id"]
+    assert child["group_id"] == group["id"]
+    assert {row["session_id"] for row in service.list()} == {"source", "child"}
+    assert service._group_assignments == {
+        "source": group["id"],
+        "child": group["id"],
+    }
+
+
+def test_successor_inheritance_rolls_back_both_activity_files_on_failure(
+    tmp_path,
+    monkeypatch,
+):
+    service = _service(tmp_path, monkeypatch)
+    source = service.start("source", summary="keep source")
+    group = service.create_group("Stable", "amber")["group"]
+    service.set_group(source["id"], group["id"], before_event_id="")
+    real_save = service._save
+    calls = 0
+
+    def fail_once():
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OSError("simulated successor write failure")
+        real_save()
+
+    monkeypatch.setattr(service, "_save", fail_once)
+    with pytest.raises(OSError, match="simulated successor write failure"):
+        service.inherit_session("source", "child", successor=True)
+
+    row = service.list()[0]
+    assert row["session_id"] == "source"
+    assert row["id"] == source["id"]
+    assert service._group_assignments == {"source": group["id"]}
+    restarted = _service(tmp_path, monkeypatch)
+    assert restarted.list()[0]["session_id"] == "source"
+    assert restarted._group_assignments == {"source": group["id"]}
+
+
 def test_group_layout_order_includes_ungrouped_and_persists(
     tmp_path,
     monkeypatch,

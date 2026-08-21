@@ -1029,6 +1029,67 @@ class ActivityService:
                 "group_order": self._group_order_payload_locked(),
             }
 
+    def inherit_session(
+        self,
+        source_sid: str,
+        child_sid: str,
+        *,
+        successor: bool = False,
+    ) -> dict[str, Any]:
+        """Inherit a fork's durable group placement and optional activity row.
+
+        Ordinary forks copy only the custom-group assignment: the source remains
+        an independent conversation and the child gets its own row on first use.
+        A true successor (for example compact recovery) moves the existing row,
+        preserving its id, ordering, pin/read state and turn lineage.  The shared
+        group/event journal makes the mutation atomic, while the child-key checks
+        make a committed retry a no-op.
+        """
+        self.initialize_runtime_state()
+        source = str(source_sid or "").strip()
+        child = str(child_sid or "").strip()
+        if not source or not child or source == child:
+            raise ValueError("distinct source and child sessions are required")
+        child_name, _, _ = self._metadata(child)
+        with self._lock:
+            source_item = self._latest(source)
+            child_item = self._latest(child)
+            source_group = self._group_assignments.get(source, "")
+            child_group = self._group_assignments.get(child, "")
+
+            if child_group and source_group and child_group != source_group:
+                raise ValueError("child activity group already differs from source")
+            if successor and source_item is not None and child_item is not None:
+                raise ValueError("child activity lineage already exists")
+
+            snapshot = self._group_event_snapshot_locked()
+            changed = False
+            if source_group and not child_group:
+                self._group_assignments[child] = source_group
+                changed = True
+            if successor:
+                if source_item is not None:
+                    source_item["session_id"] = child
+                    source_item.pop("thread_id", None)
+                    source_item["session_name"] = child_name
+                    child_item = source_item
+                    changed = True
+                if source in self._group_assignments:
+                    self._group_assignments.pop(source, None)
+                    changed = True
+
+            if changed:
+                self._save_group_event_state_locked(snapshot)
+                if successor and child_item is not None:
+                    self._publish_locked(item=child_item)
+            return {
+                "generation": self._generation,
+                "revision": self._revision,
+                "item": dict(child_item) if child_item is not None else None,
+                "group_id": self._group_assignments.get(child, ""),
+                "successor": successor,
+            }
+
     def rename_session(self, sid: str, name: str) -> dict[str, Any] | None:
         """Update only the mutable display name for a conversation row.
 

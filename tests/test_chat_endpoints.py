@@ -1571,6 +1571,8 @@ def test_fork_inherits_session_settings_and_records_lineage(
     client,
     monkeypatch,
 ):
+    from backend import activity as activity_module
+
     source = client.post(
         "/api/chat/sessions",
         headers={"X-Auth-Token": TEST_TOKEN, "Content-Type": "application/json"},
@@ -1594,6 +1596,13 @@ def test_fork_inherits_session_settings_and_records_lineage(
         chat_mod,
         "sdk_fork_session",
         lambda *_args, **_kwargs: SimpleNamespace(session_id=new_sid),
+    )
+    activity_inherits = []
+    monkeypatch.setattr(
+        activity_module.activity,
+        "inherit_session",
+        lambda source_sid, child_sid, **kwargs: activity_inherits.append(
+            (source_sid, child_sid, kwargs)),
     )
     response = client.post(
         f"/api/chat/sessions/{sid}/fork",
@@ -1627,6 +1636,48 @@ def test_fork_inherits_session_settings_and_records_lineage(
     assert body["activity_hidden"] is True
     assert body["runtime_profile"] == "side_question"
     assert body["cwd"] == source.json()["cwd"]
+    assert activity_inherits == [(sid, new_sid, {})]
+
+
+def test_fork_activity_inheritance_failure_removes_provisional_child(
+    chat_mod,
+    client,
+    monkeypatch,
+):
+    from backend import activity as activity_module
+
+    source = client.post(
+        "/api/chat/sessions",
+        headers={"X-Auth-Token": TEST_TOKEN, "Content-Type": "application/json"},
+        json={"name": "atomic fork source"},
+    ).json()
+    child_sid = "22222222-3333-4444-8555-666666666666"
+    sdk_deletes = []
+    monkeypatch.setattr(
+        chat_mod,
+        "sdk_fork_session",
+        lambda *_args, **_kwargs: SimpleNamespace(session_id=child_sid),
+    )
+    monkeypatch.setattr(
+        activity_module.activity,
+        "inherit_session",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("activity disk")),
+    )
+    monkeypatch.setattr(
+        chat_mod,
+        "sdk_delete_session",
+        lambda sid, **_kwargs: sdk_deletes.append(sid),
+    )
+
+    response = client.post(
+        f"/api/chat/sessions/{source['id']}/fork",
+        headers={"X-Auth-Token": TEST_TOKEN, "Content-Type": "application/json"},
+        json={},
+    )
+
+    assert response.status_code == 500
+    assert chat_mod.sess.get_session_meta(child_sid) is None
+    assert sdk_deletes == [child_sid]
 
 
 def test_fork_rejects_active_source_session(
@@ -2188,6 +2239,55 @@ def test_native_compact_rejects_success_without_token_drop(chat_mod, client, mon
     )
     assert r.status_code == 500, r.text
     assert "did not decrease" in r.json()["detail"]
+
+
+def test_compact_recovery_publishes_activity_successor_only_after_registration(
+    chat_mod,
+    client,
+    monkeypatch,
+    tmp_path,
+):
+    from backend import activity as activity_module
+
+    sid = _make_compact_session(client)
+    child_sid = "33333333-4444-4555-8666-777777777777"
+    source_path = tmp_path / f"{sid}.jsonl"
+    source_path.write_text("{}\n", encoding="utf-8")
+    child_path = tmp_path / f"{child_sid}.jsonl"
+    child_path.write_text("{}\n", encoding="utf-8")
+    stats = SimpleNamespace(
+        included_messages=1,
+        omitted_messages=0,
+        truncated_messages=0,
+        estimated_post_tokens=123,
+    )
+    monkeypatch.setattr(chat_mod, "_find_session_jsonl", lambda _sid: source_path)
+    monkeypatch.setattr(
+        chat_mod.context_recovery,
+        "create_recovery_fork",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            session_id=child_sid,
+            path=child_path,
+            stats=stats,
+        ),
+    )
+    calls = []
+
+    def inherit(source_sid, recovered_sid, **kwargs):
+        assert chat_mod.sess.get_session_meta(recovered_sid) is not None
+        calls.append((source_sid, recovered_sid, kwargs))
+
+    monkeypatch.setattr(activity_module.activity, "inherit_session", inherit)
+
+    result = chat_mod._create_context_recovery_session(
+        sid,
+        "claude-sonnet-4-6",
+        pre_tokens=456,
+        context_limit=200_000,
+    )
+
+    assert result["session"]["id"] == child_sid
+    assert calls == [(sid, child_sid, {"successor": True})]
 
 
 def test_native_codex_compact_recovers_verified_no_shrink(
