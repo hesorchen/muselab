@@ -4688,7 +4688,7 @@ def list_sessions_api(
     #               that fell outside the recent window.
     # limit=0 (the default) preserves the old "return everything" behaviour for
     # any caller that doesn't opt in.
-    full = sess.list_sessions()
+    full, list_revision = sess.list_sessions_snapshot()
     # A workspace switch only needs that workspace's recent sessions.  Filter
     # before applying q/limit/ids so an open-tab id owned by another workspace
     # can never be pulled into this response.  Legacy rows without cwd belong
@@ -4774,7 +4774,7 @@ def list_sessions_api(
     # changed. Any session mutation bumps the generation; a turn starting /
     # finishing changes active_sids; different limit/ids/q get their own key.
     _etag_key = (
-        sess.list_sessions_generation(),
+        list_revision,
         limit,
         ids,
         q_norm,

@@ -272,10 +272,10 @@ def _save_index(items: list[dict]) -> None:
     ]
     atomic_write_text(
         INDEX, json.dumps(canonical, ensure_ascii=False, indent=2), mode=0o600)
-    # Index was just rewritten — invalidate any cached list_sessions() output
-    # so the next caller sees the rename / delete / bump immediately rather
-    # than waiting for the TTL to expire.
-    invalidate_sessions_cache()
+    # Keep the cheap metadata layer live in-place.  A one-session rename/count
+    # update must not discard the independently cached transcript metadata and
+    # force the next /sessions poll to enumerate every workspace JSONL again.
+    _apply_index_snapshot(canonical)
 
 
 # Serialize all index R-M-W. The mutators below (toggle_pin /
@@ -317,99 +317,61 @@ _SIDECAR_LOCK = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
-# list_sessions() TTL cache
+# Incremental list_sessions() cache
 # ---------------------------------------------------------------------------
-# Profile on a 270-session archive showed `list_sessions()` takes 150-480ms,
-# dominated by `sdk_list_sessions()` walking every JSONL for metadata. The
-# function is called multiple times per request flow:
-#   - /api/chat/sessions (UI refresh)
-#   - search endpoint (builds id→name map)
-#   - compact cross-session lookups
-#   - heartbeat reconnect path
+# The public list has two sources with very different costs:
+#   * index: MuseLab metadata + cached transcript statistics (cheap JSON file)
+#   * transcripts: SDK metadata collected by stat/head/tail reads across every
+#     workspace JSONL (hundreds of milliseconds on a large archive)
 #
-# Caching with a short TTL deduplicates "refresh storms" (heartbeat reconnect
-# triggers refreshSessions + fetchContextInfo + scheduler unread simultaneously)
-# without staling user-visible state for more than ~0.5s. Internal mutations
-# (bump_session / rename / delete / pin) call `invalidate_sessions_cache()`
-# via `_save_index` so muselab-driven changes appear immediately; only
-# external JSONL writes (rare in muselab context) wait for the TTL.
-#
-# TTL was 2.0s until 2026-05-28 — multi-device + external CLI use cases
-# (running `claude --resume xxx` in a terminal while muselab is open in a
-# browser tab) noticed the new turns missing from the list for up to 2s
-# after each external write. 0.5s feels live without sacrificing the
-# refresh-storm dedup (a typical storm completes in ~50 ms anyway).
-#
-# 2026-06-07: raised 0.5s → 30s. The 0.5s TTL meant the 10s foreground poll
-# ALWAYS missed the cache and paid the full ~400ms cold rebuild every time
-# (sdk_list_sessions walks every JSONL for metadata — measured 0.38-0.43s on a
-# 330-session archive). Since EVERY muselab-internal mutation (bump_session /
-# rename / delete / pin / create) calls invalidate_sessions_cache() via
-# _save_index, the cache is already correct for muselab-driven changes — the
-# only staleness window is an EXTERNAL `claude --resume` write, which now takes
-# up to 30s to surface in the list (acceptable; rare workflow). The live
-# `active` streaming dots are computed per-request OUTSIDE the cache (from
-# _active_turns in chat.py), so they stay real-time regardless of this TTL.
-
-_LIST_CACHE: dict[str, Any] = {"at": 0.0, "data": None, "gen": 0}
+# Keep the layers separate. A cold request installs the index layer and returns
+# immediately, while transcript metadata refreshes in a background single-
+# flight. Local writes patch only the index layer, preserving the transcript
+# layer, so one session's count/title change never forces an archive-wide scan.
+_LIST_CACHE: dict[str, Any] = {
+    "index": {},
+    "transcripts": {},
+    "data": None,
+    "transcript_at": 0.0,
+    "gen": 0,
+    "epoch": 0,
+}
 _LIST_CACHE_TTL_S = 30.0
 _LIST_CACHE_LOCK = threading.Lock()
-
-
-# Single-flight flag for the stale-while-revalidate background rebuild.
 _LIST_REFRESHING: dict[str, bool] = {"v": False}
-
-
-def _refresh_list_cache_bg() -> None:
-    """Background single-flight rebuild for stale-while-revalidate. Builds a
-    fresh snapshot via _build_sessions_list() and installs it unless an
-    invalidation happened mid-build (data=None) — in that case the next
-    caller must rebuild synchronously to see the post-mutation state, so we
-    must not overwrite the invalidation with our possibly-pre-mutation
-    snapshot."""
-    try:
-        result = _build_sessions_list()
-        now = time.time()
-        with _LIST_CACHE_LOCK:
-            if _LIST_CACHE["data"] is not None:
-                _LIST_CACHE["data"] = result
-                _LIST_CACHE["at"] = now
-                _LIST_CACHE["gen"] += 1
-    except Exception as e:
-        sys.stderr.write(f"[sessions] bg list refresh failed: "
-                         f"{type(e).__name__}: {e}\n")
-    finally:
-        _LIST_REFRESHING["v"] = False
-
-
-def list_sessions_generation() -> int:
-    """Monotonic counter bumped on every fresh list_sessions() rebuild and
-    on invalidation. Lets callers cache values derived from the list (e.g.
-    the /sessions ETag digest) keyed on this instead of re-hashing the same
-    snapshot on every poll."""
-    with _LIST_CACHE_LOCK:
-        return _LIST_CACHE["gen"]
-
-
-def invalidate_sessions_cache() -> None:
-    """Drop the cached list_sessions() snapshot. Call after any mutation that
-    changes index.json or adds/removes a session sidecar."""
-    with _LIST_CACHE_LOCK:
-        _LIST_CACHE["at"] = 0.0
-        _LIST_CACHE["data"] = None
-        _LIST_CACHE["gen"] += 1
-    _META_CACHE.clear()
 
 
 # Short-TTL per-sid metadata cache. A single GET /sessions/{sid} request can
 # call get_session_meta up to 3 times (meta + cost + ctx paths), and EACH
 # call does a full index.json read plus an SDK get_session_info JSONL probe.
-# 2s is short enough that externally-visible staleness is negligible (the
-# sessions LIST already tolerates 30s), and any muselab-side mutation goes
-# through _save_index → invalidate_sessions_cache which clears this too.
+# Index mutations evict only the ids whose metadata actually changed.
 _META_CACHE: dict[str, tuple[float, dict]] = {}
 _META_CACHE_TTL_S = 2.0
 _META_CACHE_MAX = 256
+
+
+def list_sessions_generation() -> int:
+    """Revision of the composed public list used by the endpoint ETag."""
+    with _LIST_CACHE_LOCK:
+        return _LIST_CACHE["gen"]
+
+
+def invalidate_sessions_cache() -> None:
+    """Fully reset both layers after workspace topology/external test changes.
+
+    Ordinary index mutations must use :func:`_apply_index_snapshot` instead;
+    they retain cached transcript metadata and update the public revision only
+    when the composed response changes.
+    """
+    with _LIST_CACHE_LOCK:
+        _LIST_CACHE["index"] = {}
+        _LIST_CACHE["transcripts"] = {}
+        _LIST_CACHE["data"] = None
+        _LIST_CACHE["transcript_at"] = 0.0
+        _LIST_CACHE["gen"] += 1
+        _LIST_CACHE["epoch"] += 1
+        _LIST_REFRESHING["v"] = False
+    _META_CACHE.clear()
 
 
 # Parsed-sidecar cache keyed by sid → (mtime, size, dict). Sidecars are
@@ -622,105 +584,157 @@ def set_pin(sid: str, val: bool) -> bool:
         return bool(val)
 
 
-def list_sessions() -> list[dict]:
-    """List sessions, preferring SDK truth (CLI JSONL last_modified +
-    custom_title) and falling back to muselab index for muselab-specific
-    fields and pre-first-query sessions.
+def _index_list_layer(items: list[dict]) -> dict[str, dict]:
+    return {
+        str(row["id"]): dict(row)
+        for row in items
+        if isinstance(row, dict) and row.get("id")
+    }
 
-    Cached for `_LIST_CACHE_TTL_S` seconds — see cache block in this module.
-    Mutations call `invalidate_sessions_cache()` so cache staleness only
-    affects external-to-muselab JSONL writes.
 
-    Stale-while-revalidate: when the TTL has expired but a snapshot still
-    exists, return the stale snapshot immediately and rebuild in a single
-    background thread (single-flight via _LIST_REFRESHING). The caller
-    never blocks on the ~400ms sdk_list_sessions walk; the refreshed data
-    lands for the NEXT call. invalidate_sessions_cache() drops the data
-    outright, so muselab-driven mutations still rebuild synchronously on
-    the next call (immediate consistency preserved)."""
-    now = time.time()
+def _compose_sessions_list(
+    index_by_id: dict[str, dict],
+    transcript_by_id: dict[str, tuple[Any, Path]],
+) -> list[dict]:
+    """Compose the public list from already-cached source layers only."""
+    # Tombstones are process-local and mutations are serialized under the GIL;
+    # copying the set here avoids taking _QUEUE_LOCK while _save_index may
+    # already be called from a queue transaction.
+    deleted_ids = set(_DELETED_SESSION_IDS)
+    out: list[dict] = []
+    seen: set[str] = set()
+    for sid, (info, workspace) in transcript_by_id.items():
+        if sid in deleted_ids:
+            continue
+        merged = _merge_sdk_with_index(
+            info, index_by_id.get(sid, {}), workspace)
+        if not merged.get("runtime_shadow"):
+            out.append(merged)
+        seen.add(sid)
+    for sid, stored in index_by_id.items():
+        if sid in seen or sid in deleted_ids:
+            continue
+        # Removed workspaces retain durable metadata for later re-registration,
+        # but are absent from the active picker.
+        if stored.get("cwd") and not workspace_registry.contains(stored.get("cwd")):
+            continue
+        row = _normalize_session_permission_fields(stored)
+        if row.get("runtime_shadow"):
+            continue
+        row.pop("system_prompt", None)
+        row.setdefault("cwd", str(ROOT))
+        out.append(row)
+    return sorted(
+        out,
+        key=lambda row: (
+            1 if row.get("pinned") else 0,
+            row.get("updated_at", 0),
+        ),
+        reverse=True,
+    )
+
+
+def _apply_index_snapshot(items: list[dict]) -> None:
+    """Install the cheap metadata/statistics layer without dropping transcripts."""
+    new_index = _index_list_layer(items)
     with _LIST_CACHE_LOCK:
-        cached = _LIST_CACHE.get("data")
-        if cached is not None:
-            fresh = (now - _LIST_CACHE["at"]) < _LIST_CACHE_TTL_S
-            if not fresh and not _LIST_REFRESHING["v"]:
-                _LIST_REFRESHING["v"] = True
-                threading.Thread(
-                    target=_refresh_list_cache_bg, daemon=True,
-                ).start()
-            # Return a shallow copy of the list so callers that mutate-in-place
-            # (e.g. add a transient field for rendering) don't poison the cache.
-            # Inner dicts are still shared — read-only callers won't notice.
-            return list(cached)
-    result = _build_sessions_list()
-    with _LIST_CACHE_LOCK:
-        _LIST_CACHE["data"] = result
-        _LIST_CACHE["at"] = now
-        _LIST_CACHE["gen"] += 1
-    # Return a shallow copy so caller mutations don't bleed back into cache.
-    return list(result)
+        old_index = _LIST_CACHE["index"]
+        changed_ids = {
+            sid for sid in old_index.keys() | new_index.keys()
+            if old_index.get(sid) != new_index.get(sid)
+        }
+        previous = _LIST_CACHE["data"]
+        _LIST_CACHE["index"] = new_index
+        current = _compose_sessions_list(
+            new_index, _LIST_CACHE["transcripts"])
+        _LIST_CACHE["data"] = current
+        if previous != current:
+            _LIST_CACHE["gen"] += 1
+    for sid in changed_ids:
+        _META_CACHE.pop(sid, None)
 
 
-def _build_sessions_list() -> list[dict]:
-    """The uncached list build: SDK walk + index merge + sort. Called by
-    list_sessions() (sync, cache miss) and _refresh_list_cache_bg() (async,
-    stale-while-revalidate)."""
-    # A cancellation-resistant SDK writer can finish after DELETE has removed
-    # the transcript.  Snapshot the process tombstones and filter both SDK and
-    # index rows so that late disk activity cannot resurrect a deleted session
-    # in the UI while the process is still alive.
-    with _QUEUE_LOCK:
-        deleted_ids = set(_DELETED_SESSION_IDS)
-    index = [s for s in _load_index() if s.get("id") not in deleted_ids]
-    index_by_id = {s["id"]: s for s in index}
-    sdk_list: list[tuple[Any, Path]] = []
+def _scan_transcript_metadata() -> dict[str, tuple[Any, Path]]:
+    """Enumerate transcript metadata for all registered workspaces."""
+    result: dict[str, tuple[Any, Path]] = {}
     for workspace in workspace_registry.paths():
         try:
-            sdk_list.extend(
-                (info, workspace)
-                for info in sdk_list_sessions(directory=str(workspace))
-            )
-        except Exception as e:
+            for info in sdk_list_sessions(directory=str(workspace)):
+                result.setdefault(info.session_id, (info, workspace))
+        except Exception as exc:
             sys.stderr.write(
                 f"[sessions] sdk_list_sessions failed for {workspace}, "
                 f"falling back to index.json for that workspace: "
-                f"{type(e).__name__}: {e}\n")
-    out: list[dict] = []
-    seen: set[str] = set()
-    for info, workspace in sdk_list:
-        if info.session_id in seen or info.session_id in deleted_ids:
-            continue
-        m = index_by_id.get(info.session_id, {})
-        merged = _merge_sdk_with_index(info, m, workspace)
-        if not merged.get("runtime_shadow"):
-            out.append(merged)
-        seen.add(info.session_id)
-    # Append muselab-only entries (no JSONL on disk yet — usually because
-    # the user just created the session but hasn't sent the first message).
-    for s in index:
-        if s["id"] not in seen:
-            # Rows owned by a workspace that has since been removed stay in
-            # index.json (so re-registering the directory restores them), but
-            # must not leak into the active session list meanwhile.  Legacy
-            # rows without cwd belong to the primary workspace.
-            if s.get("cwd") and not workspace_registry.contains(s.get("cwd")):
-                continue
-            row = dict(s)
-            row = _normalize_session_permission_fields(row)
-            if row.get("runtime_shadow"):
-                continue
-            # Legacy muselab releases persisted per-session system prompts.
-            # Keep the inert key on disk for non-destructive compatibility,
-            # but never expose or execute it.
-            row.pop("system_prompt", None)
-            row.setdefault("cwd", str(ROOT))
-            out.append(row)
-    # Sort: pinned sessions first (descending), then by updated_at desc.
-    return sorted(
-        out,
-        key=lambda s: (1 if s.get("pinned") else 0, s.get("updated_at", 0)),
-        reverse=True,
-    )
+                f"{type(exc).__name__}: {exc}\n"
+            )
+    return result
+
+
+def _refresh_list_cache_bg(epoch: int) -> None:
+    """Refresh only the expensive transcript layer in one background flight."""
+    try:
+        transcripts = _scan_transcript_metadata()
+        with _LIST_CACHE_LOCK:
+            if _LIST_CACHE["epoch"] != epoch:
+                return
+            previous = _LIST_CACHE["data"]
+            _LIST_CACHE["transcripts"] = transcripts
+            _LIST_CACHE["transcript_at"] = time.time()
+            current = _compose_sessions_list(
+                _LIST_CACHE["index"], transcripts)
+            _LIST_CACHE["data"] = current
+            if previous != current:
+                _LIST_CACHE["gen"] += 1
+    except Exception as exc:
+        sys.stderr.write(
+            f"[sessions] bg transcript refresh failed: "
+            f"{type(exc).__name__}: {exc}\n"
+        )
+    finally:
+        with _LIST_CACHE_LOCK:
+            if _LIST_CACHE["epoch"] == epoch:
+                _LIST_REFRESHING["v"] = False
+
+
+def _ensure_index_list_layer() -> None:
+    with _LIST_CACHE_LOCK:
+        if _LIST_CACHE["data"] is not None:
+            return
+    # Serialize with writers so a cold reader cannot install an index snapshot
+    # captured just before a concurrent mutation committed.
+    with _INDEX_LOCK:
+        _apply_index_snapshot(_load_index())
+
+
+def list_sessions_snapshot() -> tuple[list[dict], int]:
+    """Return one list snapshot and its matching monotonic revision."""
+    _ensure_index_list_layer()
+    now = time.time()
+    with _LIST_CACHE_LOCK:
+        stale = (
+            now - float(_LIST_CACHE["transcript_at"] or 0)
+            >= _LIST_CACHE_TTL_S
+        )
+        if stale and not _LIST_REFRESHING["v"]:
+            _LIST_REFRESHING["v"] = True
+            epoch = _LIST_CACHE["epoch"]
+            threading.Thread(
+                target=_refresh_list_cache_bg,
+                args=(epoch,),
+                name="muselab-session-list-refresh",
+                daemon=True,
+            ).start()
+        return list(_LIST_CACHE["data"] or []), _LIST_CACHE["gen"]
+
+
+def list_sessions() -> list[dict]:
+    """Return cached sessions without synchronously walking transcript JSONL.
+
+    Index metadata (including cached message/turn counts) is immediately
+    consistent with MuseLab writes. SDK title/first-prompt/timestamp changes and
+    SDK-only sessions converge on the next poll after the background refresh.
+    """
+    return list_sessions_snapshot()[0]
 
 
 def create_session(
