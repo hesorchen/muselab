@@ -438,10 +438,7 @@ def test_composer_disabled_reason_is_visible_and_busy_states_still_queue(
           st.compacting = false;
           st.draft.pendingDocs = [{id: '', uploading: false, error: true}];
           values.uploadError = app.composerDisabledReason(app.currentId);
-          st.draft.pendingDocs = [];
-          st.draft.input = '';
-          app._activateComposerState(app.currentId);
-          values.empty = app.composerDisabledReason(app.currentId);
+          values.uploadErrorStatus = app.composerStatusReason(app.currentId);
           return values;
         }"""
     )
@@ -450,10 +447,31 @@ def test_composer_disabled_reason_is_visible_and_busy_states_still_queue(
         "streamStart": "Starting the response",
         "rollover": "Switching to the successor session",
         "uploadError": "An attachment failed to upload; remove or re-upload it",
-        "empty": "Type a message to send",
+        "uploadErrorStatus": "An attachment failed to upload; remove or re-upload it",
     }
     expect(send).to_be_disabled()
-    expect(page.locator("#composer-send-status")).to_have_text("Type a message to send")
+    expect(page.locator("#composer-send-status")).to_have_text(
+        "An attachment failed to upload; remove or re-upload it"
+    )
+
+    empty = page.evaluate(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const st = app.tabState[app.currentId];
+          st.draft.pendingDocs = [];
+          st.draft.input = '';
+          app._activateComposerState(app.currentId);
+          return {
+            disabled: app.composerDisabledReason(app.currentId),
+            status: app.composerStatusReason(app.currentId),
+          };
+        }"""
+    )
+    assert empty == {"disabled": "Type a message to send", "status": ""}
+    expect(send).to_be_disabled()
+    expect(send).to_have_attribute("title", "Type a message to send")
+    expect(send).to_have_attribute("aria-label", "Type a message to send")
+    expect(page.locator("#composer-send-status")).to_be_hidden()
 
 
 def test_composer_and_send_stay_visible_with_tall_content(

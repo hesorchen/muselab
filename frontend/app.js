@@ -7557,7 +7557,7 @@ function portal() {
           return zh ? "正在提交消息" : "Submitting the message";
       }
     },
-    composerDisabledReason(sid = this.currentId) {
+    composerStatusReason(sid = this.currentId) {
       const zh = this.lang === "zh";
       if (this.workspaceSwitching) {
         return zh ? "正在切换工作区" : "Switching workspace";
@@ -7592,9 +7592,20 @@ function portal() {
           ? "附件上传失败，请移除失败项或重新上传"
           : "An attachment failed to upload; remove or re-upload it";
       }
+      return "";
+    },
+    composerDisabledReason(sid = this.currentId) {
+      const status = this.composerStatusReason(sid);
+      if (status) return status;
+      const st = this.tabState[sid];
+      const draft = st.draft || {};
       const hasContent = !!(String(draft.input || "").trim()
-        || (draft.pendingQuotes || []).length || images.length || docs.length);
-      if (!hasContent) return zh ? "输入消息后即可发送" : "Type a message to send";
+        || (draft.pendingQuotes || []).length
+        || (draft.pendingImages || []).length
+        || (draft.pendingDocs || []).length);
+      if (!hasContent) {
+        return this.lang === "zh" ? "输入消息后即可发送" : "Type a message to send";
+      }
       return "";
     },
     sendButtonHint(sid) {

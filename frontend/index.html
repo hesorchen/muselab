@@ -3574,8 +3574,9 @@
               <span class="chat-toolbar-rl-text" x-text="currentQuotaText()"></span>
             </span>
             <span class="chat-toolbar-spacer"></span>
-            <!-- Send stays visible. composerDisabledReason() owns blocking and
-                 explains it below; streaming, compact and queued work remain
+            <!-- Send stays visible. composerDisabledReason() owns button
+                 blocking; composerStatusReason() exposes only actionable
+                 status below. Streaming, compact and queued work remain
                  routable states that send() appends to the durable FIFO. -->
             <button @click="send()"
                     :disabled="!!composerDisabledReason(currentId)"
@@ -3605,8 +3606,8 @@
              class="chat-composer-disabled-reason"
              role="status"
              aria-live="polite"
-             x-show="composerDisabledReason(currentId)"
-             x-text="composerDisabledReason(currentId)"></div>
+             x-show="composerStatusReason(currentId)"
+             x-text="composerStatusReason(currentId)"></div>
       </div>
     </aside>
 

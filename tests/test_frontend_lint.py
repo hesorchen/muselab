@@ -2345,7 +2345,7 @@ def test_detached_rollover_preserves_migrated_queue_fifo():
     assert "_confirmSessionBusy" not in slash
 
 
-def test_composer_send_has_one_claim_owner_and_visible_disabled_reason():
+def test_composer_send_has_one_claim_owner_and_visible_status_reason():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
     html = (FRONTEND / "index.html").read_text(encoding="utf-8")
     send_start = app.index("    async send(opts = {}) {")
@@ -2365,7 +2365,7 @@ def test_composer_send_has_one_claim_owner_and_visible_disabled_reason():
     assert ':disabled="!!composerDisabledReason(currentId)"' in html
     assert ':aria-busy="composerClaimed(currentId)"' in html
     assert 'id="composer-send-status"' in html
-    assert 'x-text="composerDisabledReason(currentId)"' in html
+    assert 'x-text="composerStatusReason(currentId)"' in html
     enqueue_start = app.index("    async _enqueueMessage(sid, item) {")
     enqueue_end = app.index("\n    // Post-turn / on-activate hook", enqueue_start)
     enqueue = app[enqueue_start:enqueue_end]
@@ -2388,16 +2388,23 @@ def test_composer_disabled_state_covers_failures_without_blocking_durable_queue(
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
     html = (FRONTEND / "index.html").read_text(encoding="utf-8")
     css = (FRONTEND / "styles.css").read_text(encoding="utf-8")
-    start = app.index("    composerDisabledReason(sid = this.currentId) {")
-    end = app.index("\n    sendButtonHint(sid) {", start)
-    disabled = app[start:end]
+    status_start = app.index("    composerStatusReason(sid = this.currentId) {")
+    disabled_start = app.index("    composerDisabledReason(sid = this.currentId) {")
+    end = app.index("\n    sendButtonHint(sid) {", disabled_start)
+    status = app[status_start:disabled_start]
+    disabled = app[disabled_start:end]
 
     for state in (
         "workspaceSwitching", "_stopping", "_composerSubmitToken",
         "_permissionChangePending", "runtimeSettingsPending(sid)",
         "_sendWaitingForUpload", "item.uploading", "item.error || !item.id",
     ):
-        assert state in disabled
+        assert state in status
+    assert "输入消息后即可发送" not in status
+    assert "Type a message to send" not in status
+    assert "this.composerStatusReason(sid)" in disabled
+    assert "输入消息后即可发送" in disabled
+    assert "Type a message to send" in disabled
     # Streaming, compaction and queued items are delivery modes: send() must
     # remain enabled so the backend's durable FIFO can accept the next prompt.
     assert ".streaming" not in disabled
@@ -2408,6 +2415,9 @@ def test_composer_disabled_state_covers_failures_without_blocking_durable_queue(
     assert 'this._setComposerClaimPhase(sendState, composerSubmitToken, "stream_start")' in app
     assert 'sourceState._composerSubmitPhase = "rollover"' in app
     assert 'class="chat-composer-disabled-reason"' in html
+    assert 'x-show="composerStatusReason(currentId)"' in html
+    assert 'x-text="composerStatusReason(currentId)"' in html
+    assert 'x-show="composerDisabledReason(currentId)"' not in html
     assert "overflow: hidden;" in css[css.index(".chat-transcript-wrap {"):
                                       css.index(".chat-body {", css.index(".chat-transcript-wrap {"))]
     assert "max-height: min(50dvh, 420px);" in css
