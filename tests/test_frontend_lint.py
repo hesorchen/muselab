@@ -3170,6 +3170,9 @@ def test_tab_selection_and_layout_changes_share_one_tail_follow_controller():
     controller = app[controller_start:controller_end]
     assert "new ResizeObserver(schedule)" in controller
     assert "new MutationObserver" in controller
+    assert "record.target === body" in controller
+    assert "subtree: true" in controller
+    assert "characterData: true" in controller
     assert "if (!st || st.atBottom === false" in controller
     assert "this.scrollToBottom(false)" in controller
     assert 'this.$refs && this.$refs.chatBottom' in controller

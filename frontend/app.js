@@ -26468,9 +26468,19 @@ function portal() {
       if (this._chatTailResizeObserver) this._chatTailResizeObserver.disconnect();
       if (this._chatTailMutationObserver) this._chatTailMutationObserver.disconnect();
       this._chatTailObservedBody = body;
-      const schedule = () => {
+      const schedule = entries => {
         const sid = this.currentId;
         const st = sid && this.tabState && this.tabState[sid];
+        if (Array.isArray(entries) && entries.length) {
+          const touchesActiveLayout = entries.some(entry => {
+            const target = entry && entry.target;
+            if (!target || target === body) return true;
+            const owner = target.classList && target.classList.contains("msg-pane")
+              ? target : null;
+            return !owner || owner.dataset.tid === sid;
+          });
+          if (!touchesActiveLayout) return;
+        }
         if (!st || st.atBottom === false || this._chatTailPinFrame) return;
         this._chatTailPinFrame = requestAnimationFrame(() => {
           this._chatTailPinFrame = 0;
@@ -26485,11 +26495,30 @@ function portal() {
         for (const child of body.children) this._chatTailResizeObserver.observe(child);
       };
       this._chatTailResizeObserver = new ResizeObserver(schedule);
-      this._chatTailMutationObserver = new MutationObserver(() => {
-        observeLayoutOwners();
-        schedule();
+      this._chatTailMutationObserver = new MutationObserver(records => {
+        // Streaming x-text/x-html updates happen below the direct message row.
+        // The event handler's scroll request can run before Alpine commits that
+        // descendant mutation, while the old childList-only observer never saw it.
+        // Re-pin on the committed DOM change; only refresh ResizeObserver owners
+        // when the body's direct children themselves changed.
+        if (records.some(record => record.type === "childList"
+            && record.target === body)) {
+          observeLayoutOwners();
+        }
+        const activeSid = this.currentId;
+        const touchesActivePane = records.some(record => {
+          if (record.target === body) return true;
+          const owner = record.target && record.target.closest
+            ? record.target.closest(".msg-pane") : null;
+          return !owner || owner.dataset.tid === activeSid;
+        });
+        if (touchesActivePane) schedule();
       });
-      this._chatTailMutationObserver.observe(body, { childList: true });
+      this._chatTailMutationObserver.observe(body, {
+        childList: true,
+        subtree: true,
+        characterData: true,
+      });
       observeLayoutOwners();
     },
     _scrollChatTailNow(sid, st) {
