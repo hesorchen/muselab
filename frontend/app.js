@@ -574,6 +574,8 @@ function portal() {
     // each tab are only ordered window views; all views reuse the same object.
     _messagesById: new Map(),
     _sessionWindows: new Map(),
+    _assistantBodyObserver: null,
+    _assistantBodyTargets: new Map(),
     // True while loadSession(currentId) is in flight. UI uses this to swap
     // the brand-empty placeholder for a shimmer skeleton, so users don't
     // see "Muse · Calliope / empty chat" for the second a big session
@@ -11348,10 +11350,9 @@ function portal() {
     // state for anything that renders open by default (the compact summary),
     // computes !false === true, writes "expanded" over an already-expanded
     // block — and the first tap visibly does nothing.
-    async _loadMessageBody(m) {
+    async _loadMessageBody(m, sid = this.currentId) {
       if (!m || m.body_state !== "unloaded" || !m.body_ref) return true;
       if (m._bodyLoadPromise) return m._bodyLoadPromise;
-      const sid = this.currentId;
       m.body_state = "loading";
       m._bodyLoadPromise = (async () => {
         try {
@@ -11379,6 +11380,46 @@ function portal() {
         }
       })();
       return m._bodyLoadPromise;
+    },
+    observeAssistantBody(el, m, sid) {
+      if (!el || !m || m.role !== "assistant" || !m.body_available
+          || m.body_state === "loaded") return;
+      const load = async () => {
+        if (!el.isConnected || m.body_state === "loaded") return true;
+        if (m.body_state === "error") m.body_state = "unloaded";
+        return this._loadMessageBody(m, sid);
+      };
+      if (typeof IntersectionObserver === "undefined") {
+        setTimeout(load, 0);
+        return;
+      }
+      if (!this._assistantBodyObserver) {
+        this._assistantBodyObserver = new IntersectionObserver(entries => {
+          for (const entry of entries) {
+            const target = entry.target;
+            const pending = this._assistantBodyTargets.get(target);
+            if (!pending) continue;
+            if (!target.isConnected || pending.message.body_state === "loaded") {
+              this._assistantBodyObserver.unobserve(target);
+              this._assistantBodyTargets.delete(target);
+              continue;
+            }
+            if (!entry.isIntersecting) continue;
+            pending.load().then(ok => {
+              if (!ok || !this._assistantBodyObserver) return;
+              this._assistantBodyObserver.unobserve(target);
+              this._assistantBodyTargets.delete(target);
+            });
+          }
+        }, { root: null, rootMargin: "1200px 0px" });
+      }
+      for (const target of this._assistantBodyTargets.keys()) {
+        if (target.isConnected) continue;
+        this._assistantBodyObserver.unobserve(target);
+        this._assistantBodyTargets.delete(target);
+      }
+      this._assistantBodyTargets.set(el, { message: m, load });
+      this._assistantBodyObserver.observe(el);
     },
     async toggleMsgExpanded(m, i, defaultOpen = false) {
       if (!m) return;

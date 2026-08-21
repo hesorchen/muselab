@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import time
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 import pytest
 
@@ -229,6 +229,98 @@ def _visible_pane_with_text_snapshot(page: Page, text: str):
         }""",
         text,
     )
+
+
+def test_deferred_history_bodies_load_without_manual_body_action(
+    page: Page, backend_url, auth_token,
+):
+    errors = _capture_browser_errors(page)
+    _login(page, backend_url, auth_token)
+    requested: list[str] = []
+    full = {
+        "assistant-record:0:assistant": {
+            "role": "assistant", "text": "ASSISTANT_FULL_BODY_MARKER",
+        },
+        "thinking-record:0:thinking": {
+            "role": "thinking", "text": "THINKING_FULL_BODY_MARKER",
+        },
+        "tool-record:0:tool_result": {
+            "role": "tool_result", "text": "TOOL_FULL_BODY_MARKER",
+            "tool_name": "UnknownTool",
+        },
+        "compact-record:0:user": {
+            "role": "user", "text": "COMPACT_FULL_BODY_MARKER",
+            "_is_compact_summary": True,
+        },
+    }
+
+    def handle_body(route) -> None:
+        block_id = unquote(urlparse(route.request.url).path.rsplit("/", 1)[-1])
+        requested.append(block_id)
+        payload = {
+            **full[block_id],
+            "block_id": block_id,
+            "body_ref": block_id,
+            "body_available": True,
+            "body_state": "loaded",
+            "body_length": len(full[block_id]["text"]),
+        }
+        route.fulfill(status=200, content_type="application/json",
+                      body=json.dumps(payload))
+
+    page.route("**/api/chat/sessions/*/blocks/*", handle_body)
+    sid = _app_eval(page, "return app.currentId;")
+    _app_eval(
+        page,
+        """
+        const st = app._ensureTabState(arg);
+        const deferred = (role, blockId, extra = {}) => ({
+          role, block_id: blockId, body_ref: blockId,
+          body_available: true, body_state: "unloaded", body_length: 12000,
+          text: role + " preview", preview: role + " preview",
+          _k: arg + ":block:" + blockId, _noAnim: true, ...extra,
+        });
+        st._loaded = true;
+        st.messages = [
+          deferred("assistant", "assistant-record:0:assistant", {
+            html: "<p>assistant preview</p>",
+          }),
+          deferred("thinking", "thinking-record:0:thinking"),
+          deferred("tool_result", "tool-record:0:tool_result", {
+            tool_name: "UnknownTool", is_error: false,
+          }),
+          deferred("user", "compact-record:0:user", {
+            _is_compact_summary: true,
+          }),
+        ];
+        app._expandedMsgs = {};
+        app._activateTabState(arg);
+        app.messagesReady = true;
+        return true;
+        """,
+        sid,
+    )
+
+    page.wait_for_function(
+        """() => document.body.textContent.includes('ASSISTANT_FULL_BODY_MARKER')"""
+    )
+    assert requested == ["assistant-record:0:assistant"]
+    expect(page.get_by_text("Load full body")).to_have_count(0)
+    expect(page.get_by_text("加载完整正文")).to_have_count(0)
+
+    page.locator(".thinking-head").click()
+    expect(page.get_by_text("THINKING_FULL_BODY_MARKER")).to_be_visible()
+    page.locator(".tool-result-head").click()
+    expect(page.get_by_text("TOOL_FULL_BODY_MARKER")).to_be_visible()
+    page.locator(".compact-summary-pill").click()
+    expect(page.get_by_text("COMPACT_FULL_BODY_MARKER")).to_be_visible()
+    assert requested == [
+        "assistant-record:0:assistant",
+        "thinking-record:0:thinking",
+        "tool-record:0:tool_result",
+        "compact-record:0:user",
+    ]
+    _assert_no_browser_errors(page, errors)
 
 
 def test_context_recovery_replays_plain_text_exactly_once(

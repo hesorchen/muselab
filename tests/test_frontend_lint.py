@@ -2504,7 +2504,7 @@ def test_large_history_bodies_load_by_stable_block_reference():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
     html = (FRONTEND / "index.html").read_text(encoding="utf-8")
 
-    loader_start = app.index("    async _loadMessageBody(m) {")
+    loader_start = app.index("    async _loadMessageBody(m, sid = this.currentId) {")
     loader_end = app.index("    async toggleMsgExpanded", loader_start)
     loader = app[loader_start:loader_end]
     toggle_start = loader_end
@@ -2515,9 +2515,13 @@ def test_large_history_bodies_load_by_stable_block_reference():
     assert '"/blocks/" + encodeURIComponent(m.body_ref)' in loader
     assert 'Object.assign(m, loaded' in loader
     assert 'body_state: "loaded"' in loader
+    assert 'new IntersectionObserver' in loader
+    assert 'rootMargin: "1200px 0px"' in loader
+    assert "this._loadMessageBody(m, sid)" in loader
     assert "await this._loadMessageBody(m)" in toggle
-    assert "m.body_available && m.body_state !== 'loaded'" in html
-    assert "加载完整正文" in html
+    assert 'x-init="observeAssistantBody($el, m, tid)"' in html
+    assert "加载完整正文" not in html
+    assert "Load full body" not in html
 
 
 def test_render_key_hot_paths_use_pane_index_without_full_scans_or_transport_duplication():

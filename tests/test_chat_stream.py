@@ -4353,6 +4353,41 @@ def test_large_canonical_body_is_deferred_without_source_truncation():
     assert message["text_truncated"] is False
 
 
+@pytest.mark.parametrize(
+    ("role", "compact", "preview_cap"),
+    [
+        ("thinking", False, "history"),
+        ("tool_result", False, "tool"),
+        ("user", True, "history"),
+    ],
+)
+def test_expandable_history_bodies_defer_without_marking_source_truncated(
+        role, compact, preview_cap):
+    from backend import chat as chat_mod
+
+    body = "y" * (chat_mod._HISTORY_INLINE_BODY_CAP + 1)
+    message = {
+        "role": role,
+        "text": body,
+        "block_id": f"large-record:0:{role}",
+    }
+    if compact:
+        message["_is_compact_summary"] = True
+
+    chat_mod._defer_large_ui_bodies([message])
+
+    expected_cap = (
+        chat_mod._TOOL_RESULT_PREVIEW_CAP
+        if preview_cap == "tool"
+        else chat_mod._HISTORY_BODY_PREVIEW_CAP
+    )
+    assert message["text"] == body[:expected_cap]
+    assert message["body_state"] == "unloaded"
+    assert message["body_ref"] == message["block_id"]
+    assert message["body_length"] == len(body)
+    assert message["text_truncated"] is False
+
+
 def test_session_block_endpoint_reads_only_requested_canonical_record(
         stream_env, client, monkeypatch, tmp_path):
     chat_mod = stream_env
