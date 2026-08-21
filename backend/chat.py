@@ -67,6 +67,7 @@ from . import context_recovery
 from . import chat_history
 from . import chat_presentation
 from . import chat_overlays
+from . import chat_successor
 from . import transcript_index as transcript_idx
 
 # Compatibility export: tests and local tooling construct durable interrupted
@@ -1509,32 +1510,19 @@ _STOPPED_CONTINUATION_GRACE = env_int(
 _bg_task_descriptions: dict[str, str] = {}
 _bg_task_tool_use_ids: dict[str, str] = {}
 
-# A source session can be rolled over at most once.  Keep creation + metadata
-# link + queue migration inside one per-source critical section so retries from
-# multiple browser tabs all receive the same successor UUID.
-_runtime_rollover_locks = chat_overlays.RUNTIME_CONTINUATION_FENCES
-# Main-response completion should not make the user's next send pay for the
-# detached fork plus a cold CLI connect.  One retained task per source creates
-# that successor as soon as the canonical ``done`` boundary is published, then
-# warms its runtime while the user is reading the answer.  The rollover lock
-# above remains the authority: an eager task, /continue-detached, and queue
-# drain all converge on the same durable child.
-_runtime_prewarm_tasks: dict[str, asyncio.Task] = {}
-# Title writes touch both MuseLab's index and the SDK JSONL.  Serialize the
-# pair so late runtime-postlude propagation cannot overwrite a user rename in
-# the narrow gap between checking the inherited title and writing customTitle.
-_session_title_locks = tuple(threading.RLock() for _ in range(64))
+# Compatibility aliases: deletion, overlays, tests, and local tooling must
+# observe the exact containers owned by the extracted successor lifecycle.
+_runtime_rollover_locks = chat_successor.RUNTIME_ROLLOVER_LOCKS
+_runtime_prewarm_tasks = chat_successor.RUNTIME_PREWARM_TASKS
+_session_title_locks = chat_successor.SESSION_TITLE_LOCKS
 
 
 def _runtime_rollover_lock_for(session_id: str) -> asyncio.Lock:
-    return _runtime_rollover_locks.setdefault(session_id, asyncio.Lock())
+    return chat_successor.runtime_rollover_lock_for(session_id)
 
 
-@contextmanager
 def _session_title_lock(session_id: str):
-    lock = _session_title_locks[hash(session_id) % len(_session_title_locks)]
-    with lock:
-        yield
+    return chat_successor.session_title_lock(session_id)
 
 
 def _runtime_task_overlay(
@@ -8240,124 +8228,14 @@ def _commit_fork_lifecycle(
     successor: bool,
     copy_runtime_overlays: bool = False,
 ) -> dict[str, Any]:
-    """Commit every MuseLab projection for one SDK transcript fork.
-
-    New children are registered as hidden provisional rows.  The source remains
-    visible until transcript UUIDs, annotations, queue state, task overlays and
-    Activity placement are durable; the final index write then either publishes
-    an ordinary fork or atomically links the successor while hiding its source.
-    A linked successor is also the retry key, so an interrupted caller can replay
-    every idempotent projection without creating another SDK fork.
-    """
-    from .activity import activity as _activity
-
-    existing_sid = (
-        str(source_meta.get("runtime_successor") or "") if successor else ""
+    return chat_successor.commit_fork_lifecycle(
+        source_sid,
+        source_meta,
+        fork_child=fork_child,
+        register_kwargs=register_kwargs,
+        successor=successor,
+        copy_runtime_overlays=copy_runtime_overlays,
     )
-    reused = bool(existing_sid)
-    forked = None
-    child_sid = existing_sid
-    child_created = False
-    queue_projected = False
-    activity_projected = False
-    linked = False
-    try:
-        if not child_sid:
-            if fork_child is None:
-                raise ValueError("successor transcript is unavailable")
-            forked = fork_child()
-            child_sid = str(forked.session_id)
-            if not child_sid or child_sid == source_sid:
-                raise ValueError("fork returned an invalid child session")
-            child_created = True
-            child_meta = sess.register_session(
-                child_sid,
-                runtime_shadow=True,
-                **register_kwargs,
-            )
-        else:
-            child_meta = sess.get_session_meta(child_sid)
-            if child_meta is None:
-                raise ValueError("successor session is unavailable")
-
-        _JSONL_PATH_CACHE.pop(child_sid, None)
-        uuid_mapping = _runtime_fork_uuid_mapping(child_sid)
-        sess.copy_message_annotations(source_sid, child_sid, uuid_mapping)
-
-        if successor:
-            queue_move = sess.migrate_queue(source_sid, child_sid)
-            queue_projected = True
-        else:
-            queue_move = {
-                "migrated": 0,
-                "source": sess.get_queue(source_sid),
-                "target": sess.get_queue(child_sid),
-            }
-
-        if copy_runtime_overlays:
-            sess.copy_runtime_task_overlays(source_sid, child_sid)
-
-        if successor:
-            _activity.inherit_session(source_sid, child_sid, successor=True)
-        else:
-            _activity.inherit_session(source_sid, child_sid)
-        activity_projected = True
-
-        if successor:
-            def _link_if_source_live() -> bool:
-                with sess.session_lifecycle_lock(source_sid):
-                    if sess.session_is_deleting(source_sid):
-                        return False
-                    return sess.link_runtime_successor(source_sid, child_sid)
-
-            if not _link_if_source_live():
-                raise ValueError("successor link changed")
-            linked = True
-        elif not sess.publish_fork_child(child_sid):
-            raise ValueError("fork child disappeared before publication")
-
-        return {
-            "child_sid": child_sid,
-            "child_meta": sess.get_session_meta(child_sid) or child_meta,
-            "forked": forked,
-            "uuid_mapping": uuid_mapping,
-            "queue_move": queue_move,
-            "reused": reused,
-        }
-    except Exception:
-        if not child_created:
-            # A previously linked successor is already public durable state.
-            # Never tear it down because one repair projection is temporarily
-            # unavailable; the next retry must be able to continue filling it.
-            raise
-        if linked:
-            with suppress(Exception):
-                sess.unlink_runtime_successor(source_sid, child_sid)
-        if activity_projected:
-            if successor:
-                with suppress(Exception):
-                    _activity.inherit_session(
-                        child_sid, source_sid, successor=True)
-            else:
-                with suppress(Exception):
-                    _activity.discard_session(child_sid)
-        if queue_projected:
-            with suppress(Exception):
-                sess.migrate_queue(child_sid, source_sid)
-        try:
-            _purge_single_session_storage(child_sid)
-        except Exception:
-            sess.delete_session(child_sid)
-            with suppress(Exception):
-                sdk_delete_session(
-                    child_sid,
-                    directory=str(sess.session_workspace(source_sid)),
-                )
-            child_path = _find_session_jsonl(child_sid)
-            if child_path is not None:
-                child_path.unlink(missing_ok=True)
-        raise
-
 
 def _create_context_recovery_session(
     source_sid: str,
@@ -9020,550 +8898,51 @@ class ForkReq(BaseModel):
 
 @router.post("/sessions/{sid}/fork", dependencies=[Depends(require_token)])
 def fork_session_api(sid: str, req: ForkReq) -> dict:
-    """Branch a session at an arbitrary persisted message boundary.
-
-    The SDK copies the JSONL into a fresh session and remaps its UUID chain.
-    muselab adds UI lineage plus the source session's runtime preferences.
-    Message editing remains a separate "reuse text and resend" interaction;
-    it does not call this endpoint.
-    """
-    src_meta = sess.get_session_meta(sid)
-    if src_meta is None:
-        raise HTTPException(404, "session not found")
-    active = _active_turns.get(sid)
-    if active is not None and not active.done:
-        raise HTTPException(409, "cannot fork while a turn is active")
-    # A detached background task belongs to the source CLI process, not to
-    # the JSONL transcript. Forking here is therefore a point-in-time snapshot:
-    # the fork receives every complete record persisted when the SDK reads the
-    # file, while the process and its eventual continuation stay in the source
-    # session. The SDK reads the source bytes once and its JSONL parser ignores
-    # an incomplete final append, so this does not clone a half-written record.
-    # Keep the stricter active-turn guard above: ordinary token/tool streaming
-    # writes continuously and does not yet have a clean user-visible boundary.
-    background_tasks_pending = len(
-        _sessions_with_inflight_tasks.get(sid, ())
+    return chat_successor.fork_session(
+        sid,
+        up_to_message_id=req.up_to_message_id,
+        title=req.title,
+        activity_hidden=req.activity_hidden,
+        runtime_profile=req.runtime_profile,
     )
-    source_model = (src_meta.get("model") or MODEL).strip()
-    source_name = (src_meta.get("name") or "会话").strip()
-    requested_title = (req.title or "").strip()
-    new_name = requested_title or (
-        f"{source_name} · {'分支' if is_chinese_locale() else 'Fork'}"
-    )
-    forked_count = (
-        0
-        if req.up_to_message_id
-        else int(src_meta.get("message_count") or 0)
-    )
-    forked_turns = (
-        0
-        if req.up_to_message_id
-        else int(src_meta.get("turn_count") or 0)
-    )
-    def _fork_explicit():
-        with _session_config_dir(source_model):
-            return sdk_fork_session(
-                sid,
-                directory=str(sess.session_workspace(sid)),
-                up_to_message_id=req.up_to_message_id,
-                title=new_name,
-            )
-
-    try:
-        lifecycle = _commit_fork_lifecycle(
-            sid,
-            src_meta,
-            fork_child=_fork_explicit,
-            register_kwargs={
-                "name": new_name,
-                "model": src_meta.get("model") or MODEL,
-                "permission": src_meta.get("permission") or "",
-                "plan_return_permission": src_meta.get("plan_return_permission"),
-                "auto_named": False,
-                "message_count": forked_count,
-                "turn_count": forked_turns,
-                "effort": _normalize_effort(src_meta.get("effort")),
-                "service_tier": src_meta.get("service_tier") or "",
-                "thinking": src_meta.get("thinking") is not False,
-                "forked_from": sid,
-                "forked_from_name": source_name,
-                "forked_from_message_id": req.up_to_message_id or "",
-                "activity_hidden": req.activity_hidden,
-                "runtime_profile": req.runtime_profile,
-                "cwd": src_meta.get("cwd") or str(ROOT),
-            },
-            successor=False,
-        )
-    except FileNotFoundError:
-        raise HTTPException(404, "source transcript not found") from None
-    except ValueError as exc:
-        raise HTTPException(400, str(exc)) from None
-    except Exception as exc:
-        sys.stderr.write(
-            f"[chat] fork commit failed sid={sid[:8]} "
-            f"exc={type(exc).__name__}\n")
-        sys.stderr.flush()
-        raise HTTPException(500, "fork failed — see server log") from None
-    new_sid = str(lifecycle["child_sid"])
-    return {
-        **lifecycle["child_meta"],
-        "session_id": new_sid,
-        "source_background_tasks_pending": background_tasks_pending,
-    }
 
 
 def _runtime_fork_uuid_mapping(child_sid: str) -> dict[str, str]:
-    """Read the SDK fork's explicit old->new UUID backlinks."""
-    path = _find_session_jsonl(child_sid)
-    if path is None:
-        return {}
-    mapping: dict[str, str] = {}
-    try:
-        with path.open("r", encoding="utf-8", errors="replace") as handle:
-            for line in handle:
-                try:
-                    entry = json.loads(line)
-                except (json.JSONDecodeError, ValueError):
-                    continue
-                origin = entry.get("forkedFrom") or {}
-                old_uuid = str(origin.get("messageUuid") or "")
-                new_uuid = str(entry.get("uuid") or "")
-                if old_uuid and new_uuid:
-                    mapping[old_uuid] = new_uuid
-    except OSError:
-        return {}
-    return mapping
+    return chat_successor.runtime_fork_uuid_mapping(child_sid)
 
 
 def _sync_runtime_successor_postlude(source_sid: str) -> dict[str, int]:
-    """Propagate late turn metadata through every runtime successor.
-
-    A detached rollover may be committed as soon as the canonical ``done``
-    event is visible, while the source pump is still finishing transcript
-    parsing, attachment/footer annotations, and its first-turn auto-name.  The
-    initial fork copy cannot see those later writes.  Re-copy each fork-visible
-    annotation edge-by-edge so UUIDs are translated at every generation, and
-    carry the final display name while a successor still has the title it
-    inherited at fork time.  A user-renamed successor is therefore a deliberate
-    boundary for name propagation, but not for annotation propagation.
-    """
-    source_meta = sess.get_session_meta(source_sid)
-    if source_meta is None:
-        return {"annotations": 0, "renamed": 0}
-    desired_name = str(source_meta.get("name") or "").strip()
-    current_sid = source_sid
-    propagate_name = bool(desired_name)
-    seen: set[str] = set()
-    copied = 0
-    renamed = 0
-    for _ in range(32):
-        if not current_sid or current_sid in seen:
-            break
-        seen.add(current_sid)
-        try:
-            current_meta = sess.get_session_meta(current_sid) or {}
-        except Exception as exc:
-            sys.stderr.write(
-                f"[chat] runtime postlude lineage read failed "
-                f"sid={current_sid[:8]} exc={type(exc).__name__}\n")
-            break
-        child_sid = str(current_meta.get("runtime_successor") or "")
-        if not child_sid or child_sid in seen:
-            break
-        try:
-            child_meta = sess.get_session_meta(child_sid)
-        except Exception as exc:
-            sys.stderr.write(
-                f"[chat] runtime postlude child read failed "
-                f"sid={child_sid[:8]} exc={type(exc).__name__}\n")
-            break
-        if child_meta is None:
-            break
-        try:
-            uuid_mapping = _runtime_fork_uuid_mapping(child_sid)
-            copied += sess.copy_message_annotations(
-                current_sid, child_sid, uuid_mapping)
-            # UI-only continuation bubbles are deliberately absent from the
-            # Claude JSONL fork.  Carry them across explicitly so a later
-            # rollover does not make an already-visible Agent reply disappear;
-            # their anchors are translated through the same per-edge UUID map.
-            _copy_runtime_continuation_snapshots(
-                current_sid, child_sid, uuid_mapping)
-        except Exception as exc:
-            sys.stderr.write(
-                f"[chat] runtime display postlude sync failed "
-                f"sid={current_sid[:8]} child={child_sid[:8]} "
-                f"exc={type(exc).__name__}\n"
-            )
-
-        if propagate_name:
-            try:
-                with _session_title_lock(child_sid):
-                    # Re-read under the same lock used by PATCH /sessions. A
-                    # user rename that won before this point is a hard boundary
-                    # and is never overwritten by late automatic propagation.
-                    fresh_child = sess.get_session_meta(child_sid) or child_meta
-                    child_name = str(fresh_child.get("name") or "").strip()
-                    inherited_name = str(
-                        fresh_child.get("forked_from_name") or "").strip()
-                    if child_name not in {desired_name, inherited_name}:
-                        propagate_name = False
-                    elif child_name != desired_name:
-                        child_model = str(
-                            fresh_child.get("model") or MODEL).strip()
-                        try:
-                            with _session_config_dir(child_model):
-                                sdk_rename_session(
-                                    child_sid,
-                                    desired_name,
-                                    directory=str(
-                                        sess.session_workspace(child_sid)),
-                                )
-                        except (FileNotFoundError, ValueError):
-                            # The index remains authoritative until an SDK
-                            # transcript exists.
-                            pass
-                        if sess.rename_session(child_sid, desired_name):
-                            renamed += 1
-            except Exception as exc:
-                # Presentation reconciliation must never roll back a valid
-                # runtime successor or skip the source turn's later cleanup.
-                sys.stderr.write(
-                    f"[chat] runtime title postlude sync failed "
-                    f"sid={child_sid[:8]} exc={type(exc).__name__}\n"
-                )
-        current_sid = child_sid
-    return {"annotations": copied, "renamed": renamed}
+    return chat_successor.sync_runtime_successor_postlude(source_sid)
 
 
 def _runtime_fork_boundary(sid: str, meta: dict) -> str:
-    # Never guess from the latest assistant: with multiple background tasks an
-    # earlier task may already have appended a source-only auto-continuation
-    # while a sibling remains pending. Forking that tail would leak old runtime
-    # text into the interactive successor.
-    return str(meta.get("runtime_boundary_message_id") or "")
+    return chat_successor.runtime_fork_boundary(sid, meta)
 
 
 def _backfill_runtime_task_overlays(source_sid: str) -> None:
-    """Recover running-card ownership for sessions predating rollover state."""
-    pending = set(_sessions_with_inflight_tasks.get(source_sid, ()))
-    if not pending:
-        return
-    meta = sess.get_session_meta(source_sid) or {}
-    try:
-        messages = _shaped_ui_messages(
-            source_sid, str(meta.get("model") or MODEL), True)
-    except Exception:
-        messages = []
-    for message in messages:
-        if message.get("role") != "tool_result":
-            continue
-        launch = _parse_bg_launch(str(message.get("text") or ""))
-        if not launch or launch.get("task_id") not in pending:
-            continue
-        _record_background_task_launch(
-            source_sid,
-            str(launch["task_id"]),
-            tool_use_id=str(message.get("id") or ""),
-            output_file=launch.get("output_file"),
-        )
-    # Agent tasks do not have the Bash launch string, but live starts retained
-    # their tool id/description in memory. Ensure every pin has an owner row.
-    for task_id in pending:
-        if task_id not in sess.get_runtime_task_overlays(source_sid):
-            _record_background_task_launch(
-                source_sid,
-                task_id,
-                tool_use_id=_bg_task_tool_use_ids.get(task_id),
-                description=_bg_task_descriptions.get(task_id),
-            )
+    return chat_successor.backfill_runtime_task_overlays(source_sid)
 
 
 async def _continue_detached_runtime_locked(source_sid: str) -> dict:
-    """Commit one rollover; caller must hold the per-source lock."""
-    source_meta = await asyncio.to_thread(sess.get_session_meta, source_sid)
-    if source_meta is None:
-        raise HTTPException(404, "session not found")
-    if sess.session_is_deleting(source_sid):
-        raise HTTPException(409, "session is being deleted")
-    existing_sid = str(source_meta.get("runtime_successor") or "")
-    if existing_sid:
-        # Replay the complete projection sequence, not only the queue. This
-        # repairs successors committed by an older process or interrupted after
-        # their final link without minting a second transcript fork.
-        try:
-            lifecycle = await asyncio.to_thread(
-                _commit_fork_lifecycle,
-                source_sid,
-                source_meta,
-                fork_child=None,
-                register_kwargs={},
-                successor=True,
-                copy_runtime_overlays=True,
-            )
-        except ValueError as exc:
-            raise HTTPException(409, str(exc)) from None
-        await asyncio.to_thread(_sync_runtime_successor_postlude, source_sid)
-        child_meta = lifecycle["child_meta"]
-        queue_move = lifecycle["queue_move"]
-        if queue_move["target"].get("items"):
-            _schedule_queue_drain(existing_sid)
-        inherited_overlays = await asyncio.to_thread(
-            sess.get_runtime_task_overlays, existing_sid)
-        return {
-            **child_meta,
-            "session_id": existing_sid,
-            "source_session_id": source_sid,
-            "owner_session_id": source_sid,
-            "inherited_background_tasks_pending": sum(
-                1 for overlay in inherited_overlays.values()
-                if overlay.get("state") == "running"),
-            "queue_migrated": queue_move["migrated"],
-            "queue_pending": len(queue_move["target"].get("items") or []),
-            "reused": True,
-        }
-
-    active = _active_turns.get(source_sid)
-    if (active is not None and not active.done
-            and not getattr(active, "is_continuation", False)
-            and not getattr(
-                active, "canonical_terminal_published", False)):
-        raise HTTPException(409, "cannot continue while a turn is active")
-    background_pending = len(
-        _sessions_with_inflight_tasks.get(source_sid, ()))
-    if not background_pending and not _session_has_live_watcher(source_sid):
-        return {
-            **source_meta,
-            "session_id": source_sid,
-            "source_session_id": source_sid,
-            "owner_session_id": source_sid,
-            "inherited_background_tasks_pending": 0,
-            "queue_migrated": 0,
-            "reused": True,
-        }
-
-    boundary = await asyncio.to_thread(
-        _runtime_fork_boundary, source_sid, source_meta)
-    if not boundary:
-        raise HTTPException(409, "background turn boundary is unavailable")
-    await asyncio.to_thread(_backfill_runtime_task_overlays, source_sid)
-    if sess.session_is_deleting(source_sid):
-        raise HTTPException(409, "session is being deleted")
-    source_model = str(source_meta.get("model") or MODEL).strip()
-    source_name = str(source_meta.get("name") or "会话").strip()
-    register_kwargs: dict[str, Any] = {
-        "name": source_name,
-        "model": source_model,
-        "permission": source_meta.get("permission") or "",
-        "plan_return_permission": source_meta.get("plan_return_permission"),
-        "auto_named": False,
-        "message_count": int(source_meta.get("message_count") or 0),
-        "turn_count": int(source_meta.get("turn_count") or 0),
-        "effort": _normalize_effort(source_meta.get("effort")),
-        "service_tier": source_meta.get("service_tier") or "",
-        "thinking": source_meta.get("thinking") is not False,
-        "forked_from": source_sid,
-        "forked_from_name": source_name,
-        "forked_from_message_id": boundary,
-        "activity_hidden": bool(source_meta.get("activity_hidden", False)),
-        "runtime_profile": source_meta.get("runtime_profile") or "",
-        "runtime_predecessor": source_sid,
-        "cwd": source_meta.get("cwd") or str(ROOT),
-    }
-
-    def _fork_runtime():
-        if sess.session_is_deleting(source_sid):
-            raise ValueError("source session is being deleted")
-        with _session_config_dir(source_model):
-            forked = sdk_fork_session(
-                source_sid,
-                directory=str(sess.session_workspace(source_sid)),
-                up_to_message_id=boundary,
-                title=source_name,
-            )
-        # The SDK rewrites the copied tail timestamp. Sampling immediately after
-        # the fork gives a stable boundary outside all inherited history.
-        register_kwargs["runtime_fork_boundary_at"] = (
-            datetime.now(UTC).isoformat().replace("+00:00", "Z")
-        )
-        return forked
-
-    try:
-        lifecycle = await asyncio.to_thread(
-            _commit_fork_lifecycle,
-            source_sid,
-            source_meta,
-            fork_child=_fork_runtime,
-            register_kwargs=register_kwargs,
-            successor=True,
-            copy_runtime_overlays=True,
-        )
-    except FileNotFoundError:
-        raise HTTPException(404, "source transcript not found") from None
-    except ValueError:
-        raise HTTPException(409, "runtime rollover could not commit") from None
-    except Exception as exc:
-        sys.stderr.write(
-            f"[chat] detached runtime fork failed sid={source_sid[:8]} "
-            f"exc={type(exc).__name__}\n"
-        )
-        raise HTTPException(500, "runtime rollover could not commit") from None
-
-    child_sid = str(lifecycle["child_sid"])
-    child_meta = lifecycle["child_meta"]
-    queue_move = lifecycle["queue_move"]
-    # Close the settle/link race and the complementary done/postlude race. The
-    # successor is already committed, so a transient reconciliation write must
-    # remain retryable rather than turning a successful publication into 500.
-    try:
-        await asyncio.to_thread(
-            sess.copy_runtime_task_overlays, source_sid, child_sid)
-    except Exception as exc:
-        sys.stderr.write(
-            f"[chat] runtime overlay post-link sync failed "
-            f"sid={source_sid[:8]} child={child_sid[:8]} "
-            f"exc={type(exc).__name__}\n")
-    await asyncio.to_thread(_sync_runtime_successor_postlude, source_sid)
-    if queue_move["target"].get("items"):
-        _schedule_queue_drain(child_sid)
-    public_child = (
-        await asyncio.to_thread(sess.get_session_meta, child_sid)
-    ) or child_meta
-    inherited_overlays = await asyncio.to_thread(
-        sess.get_runtime_task_overlays, child_sid)
-    return {
-        **public_child,
-        "session_id": child_sid,
-        "source_session_id": source_sid,
-        "owner_session_id": source_sid,
-        "inherited_background_tasks_pending": sum(
-            1 for overlay in inherited_overlays.values()
-            if overlay.get("state") == "running"),
-        "queue_migrated": queue_move["migrated"],
-        "queue_pending": len(queue_move["target"].get("items") or []),
-        "reused": False,
-    }
+    return await chat_successor.continue_detached_runtime_locked(source_sid)
 
 
 async def _continue_detached_runtime(source_sid: str) -> dict:
-    """Run rollover to commit/rollback even if its HTTP owner is cancelled."""
-    async with _runtime_rollover_lock_for(source_sid):
-        owner = asyncio.create_task(
-            _continue_detached_runtime_locked(source_sid))
-        cancellation: asyncio.CancelledError | None = None
-        while not owner.done():
-            try:
-                await asyncio.shield(owner)
-            except asyncio.CancelledError as exc:
-                # The SDK fork and queue migration are one logical commit.
-                # Keep the lock until the owner either links the successor or
-                # completes rollback; only then acknowledge request cancel.
-                cancellation = exc
-        if cancellation is not None:
-            # Consume a possible owner failure before returning cancellation;
-            # a retry will observe its durable commit or clean rollback.
-            with suppress(BaseException):
-                owner.result()
-            raise cancellation
-        return owner.result()
+    return await chat_successor.continue_detached_runtime(source_sid)
 
 
 async def _prepare_detached_successor_runtime(source_sid: str) -> None:
-    """Create and warm the interactive child of a background-owned runtime.
-
-    This is latency hiding only: rollover remains idempotent and durable in
-    :func:`_continue_detached_runtime`, while ``get_client``'s per-key creation
-    lock coalesces a concurrent foreground start.  Failures are deliberately
-    fail-soft because the ordinary endpoint/queue path can retry on demand.
-    """
-    try:
-        successor = await _continue_detached_runtime(source_sid)
-        child_sid = str(successor.get("session_id") or "")
-        if not child_sid or child_sid == source_sid:
-            return
-        child_meta = await asyncio.to_thread(sess.get_session_meta, child_sid)
-        if (child_meta is None
-                or sess.session_is_deleting(source_sid)
-                or sess.session_is_deleting(child_sid)):
-            return
-
-        model = str(child_meta.get("model") or MODEL).strip()
-        permission = _validate_permission(
-            str(child_meta.get("permission") or ""))
-        effort = _normalize_effort(child_meta.get("effort"))
-        service_tier = str(child_meta.get("service_tier") or "").strip()
-        client_kwargs: dict[str, Any] = {
-            "effort": effort,
-            "service_tier": service_tier,
-        }
-        if permission == "plan":
-            client_kwargs["plan_return_permission"] = (
-                _normalize_plan_return_permission(
-                    permission, child_meta.get("plan_return_permission"))
-            )
-
-        # A foreground turn reserves _active_turns before it waits for this
-        # mutex.  Re-check inside the mutex so whichever path arrives first
-        # owns startup; get_client's creation lock is a second idempotency
-        # guard for callers that reached the same runtime key concurrently.
-        async with _session_runtime_lock_for(child_sid):
-            active = _active_turns.get(child_sid)
-            if (active is not None and not active.done
-                    or sess.session_is_deleting(source_sid)
-                    or sess.session_is_deleting(child_sid)):
-                return
-            await get_client(
-                child_sid,
-                model,
-                permission,
-                **client_kwargs,
-            )
-    except asyncio.CancelledError:
-        raise
-    except HTTPException as exc:
-        # Boundary/delete races are recoverable.  Log only status + opaque id;
-        # exception detail can include transcript or workspace information.
-        sys.stderr.write(
-            f"[chat] detached runtime prewarm deferred "
-            f"sid={source_sid[:8]} status={exc.status_code}\n"
-        )
-    except Exception as exc:
-        sys.stderr.write(
-            f"[chat] detached runtime prewarm failed "
-            f"sid={source_sid[:8]} exc={type(exc).__name__}\n"
-        )
-    finally:
-        sys.stderr.flush()
+    return await chat_successor.prepare_detached_successor_runtime(source_sid)
 
 
 def _schedule_detached_successor_prewarm(source_sid: str) -> None:
-    """Retain one eager rollover/prewarm owner for ``source_sid``."""
-    existing = _runtime_prewarm_tasks.get(source_sid)
-    if existing is not None and not existing.done():
-        return
-    task = asyncio.create_task(
-        _prepare_detached_successor_runtime(source_sid))
-    _runtime_prewarm_tasks[source_sid] = task
-    _maintenance_tasks.add(task)
-
-    def _done(done: asyncio.Task) -> None:
-        _maintenance_tasks.discard(done)
-        if _runtime_prewarm_tasks.get(source_sid) is done:
-            _runtime_prewarm_tasks.pop(source_sid, None)
-        if done.cancelled():
-            return
-        with suppress(Exception):
-            done.exception()
-
-    task.add_done_callback(_done)
+    return chat_successor.schedule_detached_successor_prewarm(source_sid)
 
 
 @router.post("/sessions/{sid}/continue-detached",
              dependencies=[Depends(require_token)])
 async def continue_detached_session_api(sid: str) -> dict:
-    """Continue immediately without sharing the predecessor's live CLI."""
     return await _continue_detached_runtime(sid)
-
 
 class BudgetReq(BaseModel):
     budget_usd: float       # 0 = disabled
@@ -16286,6 +15665,53 @@ async def providers_list() -> dict:
         "default_model": _resolve_default_model(""),
         "default_permission": default_permission,
     }
+
+
+# Dynamic runtime bridge for transcript-fork/successor lifecycle. Every callback
+# resolves the chat facade at call time, preserving the historical monkeypatch
+# surface while keeping the extracted module independent of chat and the SDK.
+from .activity import activity as _successor_activity
+
+chat_successor.configure_hooks(chat_successor.SuccessorHooks(
+    sessions=sess,
+    activity=_successor_activity,
+    model_default=MODEL,
+    root=ROOT,
+    is_chinese_locale=lambda: is_chinese_locale(),
+    normalize_effort=lambda *a, **k: _normalize_effort(*a, **k),
+    validate_permission=lambda *a, **k: _validate_permission(*a, **k),
+    normalize_plan_return_permission=lambda *a, **k: _normalize_plan_return_permission(*a, **k),
+    session_config_dir=lambda *a, **k: _session_config_dir(*a, **k),
+    sdk_fork_session=lambda *a, **k: sdk_fork_session(*a, **k),
+    sdk_delete_session=lambda *a, **k: sdk_delete_session(*a, **k),
+    sdk_rename_session=lambda *a, **k: sdk_rename_session(*a, **k),
+    find_session_jsonl=lambda *a, **k: _find_session_jsonl(*a, **k),
+    jsonl_path_cache=_JSONL_PATH_CACHE,
+    purge_single_session_storage=lambda *a, **k: _purge_single_session_storage(*a, **k),
+    copy_runtime_continuation_snapshots=lambda *a, **k: _copy_runtime_continuation_snapshots(*a, **k),
+    shaped_ui_messages=lambda *a, **k: _shaped_ui_messages(*a, **k),
+    parse_bg_launch=lambda *a, **k: _parse_bg_launch(*a, **k),
+    record_background_task_launch=lambda *a, **k: _record_background_task_launch(*a, **k),
+    sessions_with_inflight_tasks=_sessions_with_inflight_tasks,
+    bg_task_tool_use_ids=_bg_task_tool_use_ids,
+    bg_task_descriptions=_bg_task_descriptions,
+    active_turns=_active_turns,
+    session_has_live_watcher=lambda *a, **k: _session_has_live_watcher(*a, **k),
+    schedule_queue_drain=lambda *a, **k: _schedule_queue_drain(*a, **k),
+    get_client=lambda *a, **k: get_client(*a, **k),
+    session_runtime_lock_for=lambda *a, **k: _session_runtime_lock_for(*a, **k),
+    maintenance_tasks=_maintenance_tasks,
+    runtime_fork_uuid_mapping=lambda *a, **k: _runtime_fork_uuid_mapping(*a, **k),
+    sync_runtime_successor_postlude=lambda *a, **k: _sync_runtime_successor_postlude(*a, **k),
+    runtime_fork_boundary=lambda *a, **k: _runtime_fork_boundary(*a, **k),
+    backfill_runtime_task_overlays=lambda *a, **k: _backfill_runtime_task_overlays(*a, **k),
+    commit_fork_lifecycle=lambda *a, **k: _commit_fork_lifecycle(*a, **k),
+    continue_detached_runtime_locked=lambda *a, **k: _continue_detached_runtime_locked(*a, **k),
+    continue_detached_runtime=lambda *a, **k: _continue_detached_runtime(*a, **k),
+    prepare_detached_successor_runtime=lambda *a, **k: _prepare_detached_successor_runtime(*a, **k),
+    runtime_rollover_lock_for=lambda *a, **k: _runtime_rollover_lock_for(*a, **k),
+    session_title_lock=lambda *a, **k: _session_title_lock(*a, **k),
+))
 
 
 # Dynamic runtime bridge for display-only overlays.  Every callback resolves the

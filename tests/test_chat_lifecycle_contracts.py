@@ -360,3 +360,123 @@ def test_chat_history_window_facades_remain_patchable(app_module, monkeypatch):
     assert chat_mod._combined_history_generation(
         "canonical", "display",
     ) == "canonical~cancelled-display"
+
+
+def test_chat_successor_module_keeps_runtime_boundary_and_shared_state(
+    app_module,
+):
+    from backend import chat as chat_mod
+    from backend import chat_overlays, chat_successor
+
+    tree = ast.parse(inspect.getsource(chat_successor))
+    imports = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.Import, ast.ImportFrom))
+    ]
+    assert not any(
+        (
+            isinstance(node, ast.ImportFrom)
+            and any(alias.name == "chat" for alias in node.names)
+        )
+        or (
+            isinstance(node, ast.Import)
+            and any(alias.name.endswith(".chat") for alias in node.names)
+        )
+        for node in imports
+    )
+    assert not any(
+        (
+            isinstance(node, ast.ImportFrom)
+            and node.module
+            and node.module.startswith("claude_agent_sdk")
+        )
+        or (
+            isinstance(node, ast.Import)
+            and any(
+                alias.name.startswith("claude_agent_sdk")
+                for alias in node.names
+            )
+        )
+        for node in imports
+    )
+
+    top_level_functions = {
+        node.name
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    assert {
+        "commit_fork_lifecycle",
+        "fork_session",
+        "continue_detached_runtime",
+        "schedule_detached_successor_prewarm",
+    } <= top_level_functions
+    assert not {
+        "get_client",
+        "disconnect_client",
+        "_start_turn",
+        "_watch_inflight_tasks",
+        "_apply_runtime_task_overlays",
+    } & top_level_functions
+
+    assert (
+        chat_mod._runtime_rollover_locks
+        is chat_successor.RUNTIME_ROLLOVER_LOCKS
+        is chat_overlays.RUNTIME_CONTINUATION_FENCES
+    )
+    assert (
+        chat_mod._runtime_prewarm_tasks
+        is chat_successor.RUNTIME_PREWARM_TASKS
+    )
+    assert chat_mod._session_title_locks is chat_successor.SESSION_TITLE_LOCKS
+
+
+def test_chat_successor_routes_keep_fastapi_contract(app_module):
+    from backend import chat as chat_mod
+
+    contract = {}
+    for route in chat_mod.router.routes:
+        if not isinstance(route, APIRoute):
+            continue
+        if route.path not in {
+            "/api/chat/sessions/{sid}/fork",
+            "/api/chat/sessions/{sid}/continue-detached",
+        }:
+            continue
+        dependencies = tuple(
+            dependency.call.__name__
+            for dependency in route.dependant.dependencies
+        )
+        for method in route.methods:
+            contract[(route.path, method)] = (
+                dependencies,
+                route.response_model,
+            )
+
+    assert contract == {
+        ("/api/chat/sessions/{sid}/fork", "POST"): (
+            ("require_token",),
+            dict,
+        ),
+        ("/api/chat/sessions/{sid}/continue-detached", "POST"): (
+            ("require_token",),
+            dict,
+        ),
+    }
+
+
+def test_chat_successor_facades_remain_patchable(app_module, monkeypatch):
+    from backend import chat as chat_mod
+    from backend import chat_successor
+
+    calls = []
+
+    def boundary(sid, meta):
+        calls.append((sid, meta))
+        return "patched-boundary"
+
+    monkeypatch.setattr(chat_successor, "runtime_fork_boundary", boundary)
+    meta = {"runtime_boundary_message_id": "canonical-boundary"}
+    assert chat_mod._runtime_fork_boundary("source", meta) == "patched-boundary"
+    assert calls == [("source", meta)]
