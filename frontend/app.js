@@ -7555,21 +7555,6 @@ function portal() {
       const st = sid && this.tabState && this.tabState[sid];
       return !!(st && st._composerSubmitToken);
     },
-    _composerClaimReason(st) {
-      const zh = this.lang === "zh";
-      switch (st && st._composerSubmitPhase) {
-        case "upload":
-          return zh ? "正在等待附件上传完成" : "Waiting for attachments to upload";
-        case "queue":
-          return zh ? "正在将消息保存到队列" : "Saving the message to the queue";
-        case "stream_start":
-          return zh ? "正在启动回复" : "Starting the response";
-        case "rollover":
-          return zh ? "正在切换到接续会话" : "Switching to the successor session";
-        default:
-          return zh ? "正在提交消息" : "Submitting the message";
-      }
-    },
     composerStatusReason(sid = this.currentId) {
       const zh = this.lang === "zh";
       if (this.workspaceSwitching) {
@@ -7586,7 +7571,6 @@ function portal() {
       if (st._stopping) {
         return zh ? "正在中断上一条任务" : "Stopping the previous turn";
       }
-      if (st._composerSubmitToken) return this._composerClaimReason(st);
       if (st._permissionChangePending) return this.t("perm.switching");
       if (this.runtimeSettingsPending(sid)) {
         return zh ? "正在保存运行设置" : "Saving runtime settings";
@@ -7622,6 +7606,7 @@ function portal() {
       return "";
     },
     sendButtonHint(sid) {
+      if (this.composerClaimed(sid)) return this.t("btn.send");
       const disabled = this.composerDisabledReason(sid);
       if (disabled) return disabled;
       return this._isBusy(sid) ? this.t("queue.button_hint") : this.t("btn.send");
@@ -26803,13 +26788,6 @@ function portal() {
         this.toast(this.t("perm.switching"), "warn", 2000);
         return false;
       }
-      // Effort and Fast are persisted session launch settings, not fields on the
-      // stream ticket. Wait for their shared PATCH queue before minting a turn;
-      // otherwise a quick select→Send can race and launch with the old runtime.
-      if (!opts.reconnect
-          && !await this._awaitRuntimeSettingPatches(sendSid, sendState)) {
-        return false;
-      }
       const sendDraft = sendState.draft;
       // A preview-selection question is an independent prompt, not a rewrite
       // of the visible composer. Keep the current draft and every attachment
@@ -26832,6 +26810,7 @@ function portal() {
       const ownsSubmittedDraft = state => !!(state
         && state._composerSubmitToken === composerSubmitToken
         && state.draft && state.draft.input === composerInput);
+      let sentUserBubble = null;
       const clearSubmittedComposer = ({ preserveForHandshake = false } = {}) => {
         if (hasDetachedText) return;
         // A proactive background rollover can replace sourceState while this
@@ -26867,6 +26846,43 @@ function portal() {
             if (this.$refs.chatInput) this.autoGrow(this.$refs.chatInput);
           });
         }
+      };
+      // Once the payload is valid, the composer clears and its bubble appears
+      // before registration/settings/busy probes. Any pre-ticket failure restores
+      // the exact submitted payload without overwriting text typed meanwhile.
+      let submittedDraftRestored = false;
+      const restoreSubmittedComposer = (restoreAttachments = false) => {
+        if (!isComposerSubmission || submittedDraftRestored) return;
+        submittedDraftRestored = true;
+        if (ownsSendDraft()) {
+          sendDraft.input = this._mergeChatDraftText(
+            composerInput, sendDraft.input || "",
+          );
+          if (restoreAttachments) {
+            const restoreOwned = (items, sent) => {
+              const missing = sent.filter(item => !items.includes(item));
+              if (missing.length) items.unshift(...missing);
+            };
+            restoreOwned(sendDraft.pendingImages, composerImages);
+            restoreOwned(sendDraft.pendingDocs, composerDocs);
+            restoreOwned(sendDraft.pendingQuotes, composerQuotes);
+          }
+          this._resolveChatRecoveryDraft(sendSid, sendDraft.input);
+          if (sendSid === this.currentId) this._activateComposerState(sendSid);
+          return;
+        }
+        const persisted = this._chatDraftRecord(sendSid);
+        this._resolveChatRecoveryDraft(sendSid, this._mergeChatDraftText(
+          composerInput,
+          this._mergeChatDraftText(persisted.pending, persisted.text),
+        ));
+      };
+      const rollbackOptimisticSubmission = () => {
+        if (sentUserBubble) {
+          this._removePaneMessage(sendState, sentUserBubble);
+          sentUserBubble = null;
+        }
+        restoreSubmittedComposer(true);
       };
       // Snapshot model/permission alongside sendSid — the attachment-upload
       // awaits below can span a tab switch, after which this.model /
@@ -26968,7 +26984,6 @@ function portal() {
       // exits naturally with a red-border chip the user can remove + retry.
       // The send button stays disabled (_sendWaitingForUpload) so a double-
       // tap can't enqueue a second send while we wait.
-      let sentUserBubble = null;
       if (!isReconnect) {
         // For resumed items use their own snapshot; otherwise use the composer
         // snapshot captured before any await. Never drift to another tab's
@@ -27009,14 +27024,50 @@ function portal() {
         readyImages = ownedImages.slice();
         readyDocs = ownedDocs.slice();
       }
+
+      // Commit the interaction to the screen before any network preflight. The
+      // payload snapshot above is immutable, so later registration/settings/busy
+      // checks can safely run after the textarea clears and the user bubble paints.
+      if (!isReconnect) {
+        if (!resumed && !hasDetachedText) {
+          clearSubmittedComposer({ preserveForHandshake: true });
+        }
+        if (this.hasLaterMessages(sendSid)) {
+          const latestLoaded = await this.returnToLatest(sendSid);
+          if (!latestLoaded || this.tabState[sendSid] !== sendState) {
+            restoreSubmittedComposer(true);
+            return false;
+          }
+        }
+        this._scheduleLiveMessageViewport(sendState);
+        sentUserBubble = this._appendLiveMessage(sendState, {
+          role: "user", text,
+          displayText: hasDetachedText ? detachedDisplayText : composerInput,
+          selectionQuotes: composerQuotes.map(q => ({ ...q })),
+          images: readyImages.map(im => ({
+            preview: im.preview,
+            url: (im.id && im.attach_ext && sendSid)
+              ? `/api/chat/attachments/${sendSid}/${im.id}.${im.attach_ext}`
+              : undefined,
+            mime: im.mime,
+          })),
+          docs: readyDocs.map(d => ({ name: d.name, kind: d.kind })),
+        });
+        if (this.currentId === sendSid) {
+          sendState.atBottom = true;
+          this.scrollToBottom(true);
+        }
+      }
+
       // A newly opened tab is optimistic until POST /sessions lands. Do not
       // launch the first turn before that durable index row exists: if the user
       // cancels before the SDK writes its JSONL, activity would otherwise point
       // at a session that was never persisted. Registration failure leaves the
-      // composer/attachments untouched so the user can retry safely.
+      // failure rolls the optimistic bubble back and restores the exact payload.
       if (!isReconnect && this._optimisticMetas[sendSid]) {
         const registered = await this._ensureSessionRegistered(sendSid);
         if (!registered) {
+          rollbackOptimisticSubmission();
           this.toast(this.lang === "zh"
             ? "发送失败：新会话未能保存，请检查连接后重试"
             : "Send failed: the new session could not be saved — check your connection and retry",
@@ -27026,6 +27077,7 @@ function portal() {
       }
       if (!isReconnect
           && !await this._awaitRuntimeSettingPatches(sendSid, sendState)) {
+        rollbackOptimisticSubmission();
         return false;
       }
       // Busy: streaming OR compacting → park on the pinned session's queue.
@@ -27049,8 +27101,17 @@ function portal() {
           permission: sendPermission,
           plan_return_permission: sendPlanReturnPermission,
         });
-        if (!ok) return false;
-        clearSubmittedComposer();
+        if (!ok) {
+          rollbackOptimisticSubmission();
+          return false;
+        }
+        if (sentUserBubble) {
+          this._removePaneMessage(sendState, sentUserBubble);
+          sentUserBubble = null;
+        }
+        if (isComposerSubmission) {
+          this._commitChatRecoveryDraft(sendSid, composerInput);
+        }
         if (shouldHandoffBackground) {
           this._scheduleBackgroundHandoff(sendSid, sendState);
         }
@@ -27060,43 +27121,9 @@ function portal() {
         }
         return true;
       }
-      // Push to the SENDING tab's messages array (looked up via sendSid),
-      // not the active pane — the user may have switched tabs mid-await. See
-      // the "Pin target
-      // session" block at function entry for the full story.
-      // Reconnect mode skips pushing a user msg — the backend already
-      // has the user prompt from the original turn, and the
-      // broadcast-rebuild on `/sessions/{sid}` GET produced it for us.
-      if (!isReconnect) {
-        // Sending starts a new latest turn. If the user paged into an older
-        // server window, return to the canonical latest order first.
-        if (this.hasLaterMessages(sendSid)) {
-          const latestLoaded = await this.returnToLatest(sendSid);
-          if (!latestLoaded || this.tabState[sendSid] !== sendState) return false;
-        }
-        if (!await this._awaitRuntimeSettingPatches(sendSid, sendState)) return false;
-        // Refresh the viewport window before growing the live tail; canonical
-        // history remains intact while mounted rows stay bounded.
-        this._scheduleLiveMessageViewport(sendState);
-        sentUserBubble = this._appendLiveMessage(sendState, {
-          role: "user", text,
-          displayText: hasDetachedText ? detachedDisplayText : composerInput,
-          selectionQuotes: composerQuotes.map(q => ({ ...q })),
-          images: readyImages.map(im => ({
-            preview: im.preview,
-            // Pre-compute the URL the backend will serve once it
-            // persists the full-res original (it does so the moment
-            // the SSE stream consumes the upload's aid). This makes
-            // the lightbox work even if the user reloads before the
-            // stream-completion annotation hook fires.
-            url: (im.id && im.attach_ext && sendSid)
-              ? `/api/chat/attachments/${sendSid}/${im.id}.${im.attach_ext}`
-              : undefined,
-            mime: im.mime,
-          })),
-          docs: readyDocs.map(d => ({ name: d.name, kind: d.kind })),
-        });
-      } else if (!isContinuation && resumeEventSeq === 0) {
+      // Reconnect mode has no optimistic user bubble: the backend already owns
+      // the prompt and its canonical replay replaces any stale rendered suffix.
+      if (isReconnect && !isContinuation && resumeEventSeq === 0) {
         // Cold/legacy reconnect: the backend will replay every event from the
         // start of the turn, so discard the already-rendered suffix first.
         // Incremental reconnects retain it and request only missing sequences.
@@ -27115,13 +27142,9 @@ function portal() {
         ...readyImages.map(im => im.id),
         ...readyDocs.map(d => d.id),
       ];
-      // Reconnect: nothing to clear. Resumed: input/pendingImages were
-      // already cleared at enqueue time, and the user may have typed a
-      // new draft since — don't touch their work-in-progress.
+      // The ordinary composer was already cleared before network preflight.
+      // Restore desktop focus after those awaits without touching a newer draft.
       if (!isReconnect && !resumed && !hasDetachedText) {
-        // Remove only the captured payload; a newer draft typed during an await
-        // stays in the still-global Phase 1 composer.
-        clearSubmittedComposer({ preserveForHandshake: true });
         this.$nextTick(() => {
           if (this.currentId !== sendSid) return;
           const ta = this.$refs.chatInput;
@@ -27268,39 +27291,6 @@ function portal() {
           }),
         });
         return tr;
-      };
-      // Restore a failed outgoing text without overwriting anything typed
-      // while the request was in flight. Attachments can be restored only
-      // before the ticket is consumed; their browser File/upload handles are
-      // deliberately not serialised across a page reload.
-      let submittedDraftRestored = false;
-      const restoreSubmittedComposer = (restoreAttachments = false) => {
-        if (hasDetachedText || isReconnect || resumed || submittedDraftRestored) return;
-        submittedDraftRestored = true;
-        if (ownsSendDraft()) {
-          sendDraft.input = this._mergeChatDraftText(
-            composerInput, sendDraft.input || "",
-          );
-          if (restoreAttachments) {
-            const restoreOwned = (items, sent) => {
-              const missing = sent.filter(item => !items.includes(item));
-              if (missing.length) items.unshift(...missing);
-            };
-            restoreOwned(sendDraft.pendingImages, composerImages);
-            restoreOwned(sendDraft.pendingDocs, composerDocs);
-            restoreOwned(sendDraft.pendingQuotes, composerQuotes);
-          }
-          this._resolveChatRecoveryDraft(sendSid, sendDraft.input);
-          if (sendSid === this.currentId) this._activateComposerState(sendSid);
-          return;
-        }
-        // The tab may have been closed during the failing request. Preserve
-        // the text in localStorage so reopening the session still recovers it.
-        const persisted = this._chatDraftRecord(sendSid);
-        this._resolveChatRecoveryDraft(sendSid, this._mergeChatDraftText(
-          composerInput,
-          this._mergeChatDraftText(persisted.pending, persisted.text),
-        ));
       };
       // Stop/ticket failure before EventSource opens means no backend turn was
       // created. Remove the optimistic bubble, restore the full local payload,

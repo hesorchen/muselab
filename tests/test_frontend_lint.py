@@ -352,7 +352,7 @@ def test_preview_selection_quote_attachment_and_side_question_are_safely_wired()
     assert "opts.permissionMode || inheritedPermission" in send
     assert "if (hasDetachedText) return;" in send
     assert "if (!hasDetachedText) this._cancelMentionLookup();" in send
-    assert "if (hasDetachedText || isReconnect || resumed" in send
+    assert "if (!isComposerSubmission || submittedDraftRestored) return;" in send
     assert "if (!hasDetachedText && !isReconnect && !resumed)" in send
     ask_start = app.index("async sendPreviewSelectionQuestion()")
     ask_end = app.index("\n\n    // A11y:", ask_start)
@@ -1112,7 +1112,7 @@ def test_session_sync_transitions_preserve_canonical_and_view_ownership():
     assert "_laterMessages" not in app
 
 
-def test_optimistic_session_is_registered_before_first_turn():
+def test_optimistic_session_paints_immediately_but_registers_before_ticket():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
     helper_start = app.index("_registerOptimisticSession(meta)")
     helper_end = app.index("\n    newSession(options = {})", helper_start)
@@ -1128,9 +1128,9 @@ def test_optimistic_session_is_registered_before_first_turn():
     ensure_at = send.index("await this._ensureSessionRegistered(sendSid)")
     push_at = send.index("this._appendLiveMessage(sendState")
     ticket_at = send.index('fetch("/api/chat/stream/start"')
-    clear_at = send.index("clearSubmittedComposer();")
-    assert ensure_at < push_at < ticket_at
-    assert ensure_at < clear_at
+    clear_at = send.index("clearSubmittedComposer({ preserveForHandshake: true })")
+    assert clear_at < push_at < ensure_at < ticket_at
+    assert "rollbackOptimisticSubmission();" in send
     assert "新会话未能保存" in send
 
 
@@ -1354,7 +1354,10 @@ def test_runtime_setting_writes_gate_send_and_restore_per_session():
 
     send_start = app.index("async send(opts = {})")
     send = app[send_start:]
-    assert send.count("await this._awaitRuntimeSettingPatches(sendSid, sendState)") >= 3
+    assert send.count("await this._awaitRuntimeSettingPatches(sendSid, sendState)") == 1
+    assert send.index("sentUserBubble = this._appendLiveMessage") < send.index(
+        "await this._awaitRuntimeSettingPatches(sendSid, sendState)"
+    )
     assert "runtimeSettingsPending()" in html
     model_control = html[html.index('<select x-model="model"'):
                          html.index("</select>", html.index('<select x-model="model"'))]
@@ -2035,7 +2038,7 @@ def test_workspace_switch_disables_composer_and_gates_programmatic_user_send():
     assert "if (this.workspaceSwitching && !opts.reconnect && !opts.resumedItem) return" in send
     assert ':disabled="workspaceSwitching || !availableModels.length"' in textarea
     assert 'multiple style="display:none" :disabled="workspaceSwitching"' in html
-    assert ':disabled="!!composerDisabledReason(currentId)"' in html
+    assert ':disabled="composerClaimed(currentId) || !!composerDisabledReason(currentId)"' in html
     assert ':disabled="workspaceSwitching || !!(tabState[currentId]' in html
 
 
@@ -2324,9 +2327,9 @@ def test_detached_rollover_preserves_migrated_queue_fifo():
     # expensive transcript fork. The backend migrates that accepted item in
     # FIFO order; the browser handoff is non-blocking presentation work.
     busy = send[send.index("const confirmedBusy ="):]
-    busy = busy[:busy.index("// Push to the SENDING tab's messages array")]
+    busy = busy[:busy.index("// Reconnect mode has no optimistic user bubble")]
     assert "await this._enqueueMessage(sendSid" in busy
-    assert "clearSubmittedComposer();" in busy
+    assert "this._commitChatRecoveryDraft(sendSid, composerInput);" in busy
     assert "this._scheduleBackgroundHandoff(sendSid, sendState);" in busy
     assert "await this._handoffBackgroundSession" not in busy
     assert busy.index("await this._enqueueMessage(sendSid") < busy.index(
@@ -2345,7 +2348,7 @@ def test_detached_rollover_preserves_migrated_queue_fifo():
     assert "_confirmSessionBusy" not in slash
 
 
-def test_composer_send_has_one_claim_owner_and_visible_status_reason():
+def test_composer_send_has_one_claim_owner_without_exposing_internal_phases():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
     html = (FRONTEND / "index.html").read_text(encoding="utf-8")
     send_start = app.index("    async send(opts = {}) {")
@@ -2361,11 +2364,23 @@ def test_composer_send_has_one_claim_owner_and_visible_status_reason():
     assert send.index('sendState._composerSubmitPhase = "submitting";') < send.index(
         "await this._awaitRuntimeSettingPatches(sendSid, sendState)"
     )
+    assert send.count("await this._awaitRuntimeSettingPatches(sendSid, sendState)") == 1
+    assert send.index("sentUserBubble = this._appendLiveMessage") < send.index(
+        "await this._ensureSessionRegistered(sendSid)"
+    )
+    assert send.index("clearSubmittedComposer({ preserveForHandshake: true })") < send.index(
+        "await this._ensureSessionRegistered(sendSid)"
+    )
+    assert send.index("sentUserBubble = this._appendLiveMessage") < send.index(
+        "await this._confirmSessionBusy(sendSid, sendState)"
+    )
+    assert "rollbackOptimisticSubmission();" in send
     assert "if (ev.repeat) return;" in app
-    assert ':disabled="!!composerDisabledReason(currentId)"' in html
+    assert ':disabled="composerClaimed(currentId) || !!composerDisabledReason(currentId)"' in html
     assert ':aria-busy="composerClaimed(currentId)"' in html
-    assert 'id="composer-send-status"' in html
-    assert 'x-text="composerStatusReason(currentId)"' in html
+    assert 'id="composer-send-status"' not in html
+    assert 'aria-describedby="composer-send-status"' not in html
+    assert 'x-text="composerStatusReason(currentId)"' not in html
     enqueue_start = app.index("    async _enqueueMessage(sid, item) {")
     enqueue_end = app.index("\n    // Post-turn / on-activate hook", enqueue_start)
     enqueue = app[enqueue_start:enqueue_end]
@@ -2395,13 +2410,15 @@ def test_composer_disabled_state_covers_failures_without_blocking_durable_queue(
     disabled = app[disabled_start:end]
 
     for state in (
-        "workspaceSwitching", "_stopping", "_composerSubmitToken",
+        "workspaceSwitching", "_stopping",
         "_permissionChangePending", "runtimeSettingsPending(sid)",
         "_sendWaitingForUpload", "item.uploading", "item.error || !item.id",
     ):
         assert state in status
     assert "输入消息后即可发送" not in status
     assert "Type a message to send" not in status
+    assert "正在启动回复" not in app
+    assert "Starting the response" not in app
     assert "this.composerStatusReason(sid)" in disabled
     assert "输入消息后即可发送" in disabled
     assert "Type a message to send" in disabled
@@ -2414,9 +2431,9 @@ def test_composer_disabled_state_covers_failures_without_blocking_durable_queue(
     assert 'this._setComposerClaimPhase(sendState, composerSubmitToken, "queue")' in app
     assert 'this._setComposerClaimPhase(sendState, composerSubmitToken, "stream_start")' in app
     assert 'sourceState._composerSubmitPhase = "rollover"' in app
-    assert 'class="chat-composer-disabled-reason"' in html
-    assert 'x-show="composerStatusReason(currentId)"' in html
-    assert 'x-text="composerStatusReason(currentId)"' in html
+    assert 'class="chat-composer-disabled-reason"' not in html
+    assert 'x-show="composerStatusReason(currentId)"' not in html
+    assert 'x-text="composerStatusReason(currentId)"' not in html
     assert 'x-show="composerDisabledReason(currentId)"' not in html
     assert "overflow: hidden;" in css[css.index(".chat-transcript-wrap {"):
                                       css.index(".chat-body {", css.index(".chat-transcript-wrap {"))]
@@ -2778,7 +2795,7 @@ def test_message_identity_checks_only_incoming_batch_and_keeps_cold_replay_fallb
     send_end = app.index("async stop()", send_start)
     send = app[send_start:send_end]
     reconnect = send[send.index(
-        "} else if (!isContinuation && resumeEventSeq === 0) {"):
+        "if (isReconnect && !isContinuation && resumeEventSeq === 0) {"):
         send.index("// (isContinuation:")]
     assert "this._truncatePaneMessagesFrom(sendState" in reconnect
     assert "sendState.messages[lastUserIdx + 1]" in reconnect

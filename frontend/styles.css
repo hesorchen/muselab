@@ -7239,14 +7239,6 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   border-top: 1px solid var(--c-border);
   background: var(--c-bg-1);
 }
-.chat-composer-disabled-reason {
-  min-width: 0;
-  padding: 0 4px;
-  color: var(--c-fg-3);
-  font-size: var(--fs-2xs);
-  line-height: 1.35;
-  overflow-wrap: anywhere;
-}
 .chat-toolbar-btn {
   display: inline-flex; align-items: center; justify-content: center;
   width: 26px; height: 26px; flex-shrink: 0;

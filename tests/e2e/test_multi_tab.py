@@ -401,7 +401,7 @@ def test_send_upload_wait_is_owned_by_starting_tab(
     assert settled == [False, False, False]
 
 
-def test_composer_disabled_reason_is_visible_and_busy_states_still_queue(
+def test_composer_internal_phases_stay_hidden_and_busy_states_still_queue(
         page: Page, backend_url, auth_token):
     _login(page, backend_url, auth_token)
     page.locator(".chat-input-textarea").fill("NEXT")
@@ -417,7 +417,7 @@ def test_composer_disabled_reason_is_visible_and_busy_states_still_queue(
     )
     send = page.locator(".chat-toolbar-queue")
     expect(send).to_be_enabled()
-    expect(page.locator("#composer-send-status")).to_be_hidden()
+    expect(page.locator("#composer-send-status")).to_have_count(0)
     assert "queue" in (send.get_attribute("title") or "").lower()
 
     states = page.evaluate(
@@ -443,16 +443,14 @@ def test_composer_disabled_reason_is_visible_and_busy_states_still_queue(
         }"""
     )
     assert states == {
-        "queue": "Saving the message to the queue",
-        "streamStart": "Starting the response",
-        "rollover": "Switching to the successor session",
+        "queue": "",
+        "streamStart": "",
+        "rollover": "",
         "uploadError": "An attachment failed to upload; remove or re-upload it",
         "uploadErrorStatus": "An attachment failed to upload; remove or re-upload it",
     }
     expect(send).to_be_disabled()
-    expect(page.locator("#composer-send-status")).to_have_text(
-        "An attachment failed to upload; remove or re-upload it"
-    )
+    expect(page.locator("#composer-send-status")).to_have_count(0)
 
     empty = page.evaluate(
         """() => {
@@ -471,7 +469,7 @@ def test_composer_disabled_reason_is_visible_and_busy_states_still_queue(
     expect(send).to_be_disabled()
     expect(send).to_have_attribute("title", "Type a message to send")
     expect(send).to_have_attribute("aria-label", "Type a message to send")
-    expect(page.locator("#composer-send-status")).to_be_hidden()
+    expect(page.locator("#composer-send-status")).to_have_count(0)
 
 
 def test_composer_and_send_stay_visible_with_tall_content(

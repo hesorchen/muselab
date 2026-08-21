@@ -3572,15 +3572,13 @@
               <span class="chat-toolbar-rl-text" x-text="currentQuotaText()"></span>
             </span>
             <span class="chat-toolbar-spacer"></span>
-            <!-- Send stays visible. composerDisabledReason() owns button
-                 blocking; composerStatusReason() exposes only actionable
-                 status below. Streaming, compact and queued work remain
-                 routable states that send() appends to the durable FIFO. -->
+            <!-- Send stays visible. Internal submission phases are represented
+                 only by the button spinner; no transport status text is exposed.
+                 Streaming, compact and queued work remain routable states. -->
             <button @click="send()"
-                    :disabled="!!composerDisabledReason(currentId)"
+                    :disabled="composerClaimed(currentId) || !!composerDisabledReason(currentId)"
                     class="btn-primary chat-toolbar-send chat-toolbar-queue"
                     :aria-busy="composerClaimed(currentId)"
-                    aria-describedby="composer-send-status"
                     :aria-label="sendButtonHint(currentId)"
                     :title="sendButtonHint(currentId)">
               <span class="spinner-sm"
@@ -3600,12 +3598,6 @@
             </button>
           </div>
         </div>
-        <div id="composer-send-status"
-             class="chat-composer-disabled-reason"
-             role="status"
-             aria-live="polite"
-             x-show="composerStatusReason(currentId)"
-             x-text="composerStatusReason(currentId)"></div>
       </div>
     </aside>
 
