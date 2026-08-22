@@ -1,9 +1,17 @@
 import os
 import socket
 import subprocess
+import sys
 import time
 from pathlib import Path
 
+import pytest
+
+
+pytestmark = pytest.mark.skipif(
+    sys.platform != "linux",
+    reason="safe-restart controls Linux screen and /proc process state",
+)
 
 REPO = Path(__file__).resolve().parents[1]
 SCRIPT = REPO / "scripts" / "safe-restart.sh"
