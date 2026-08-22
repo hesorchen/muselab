@@ -1375,6 +1375,10 @@ _session_runtime_locks: dict[str, asyncio.Lock] = {}
 # from popping adjacent FIFO items before either reserves _active_turns[sid].
 _queue_drain_locks: dict[str, asyncio.Lock] = {}
 _queue_drain_tasks: dict[str, asyncio.Task] = {}
+# Recoverable runtime-rollover conflicts (404/409 while a background watcher is
+# handing ownership to its successor) need a retained wake-up even when no new
+# enqueue or task notification arrives. One delayed retry per session is enough.
+_queue_drain_retry_tasks: dict[str, asyncio.Task] = {}
 # A queue POST can land while the coalesced drain is busy forking a detached
 # runtime. Remember that wakeup instead of dropping it; once the first drain
 # exits, one follow-up pass migrates any item accepted after its queue snapshot.
@@ -3587,6 +3591,7 @@ async def shutdown_runtime() -> None:
     _task_watchers.clear()
     _runtime_prewarm_tasks.clear()
     _queue_drain_tasks.clear()
+    _queue_drain_retry_tasks.clear()
     _queue_drain_rekicks.clear()
     _queue_drain_locks.clear()
 
@@ -5741,10 +5746,12 @@ def _clear_session_runtime_state(sid: str) -> list[asyncio.Task]:
     if runtime_lock is not None and not runtime_lock.locked():
         _session_runtime_locks.pop(sid, None)
     drain_task = _queue_drain_tasks.pop(sid, None)
+    retry_task = _queue_drain_retry_tasks.pop(sid, None)
     _queue_drain_rekicks.discard(sid)
-    if drain_task is not None and not drain_task.done():
-        drain_task.cancel()
-        cancelled_tasks.append(drain_task)
+    for task in (drain_task, retry_task):
+        if task is not None and not task.done():
+            task.cancel()
+            cancelled_tasks.append(task)
     prewarm_task = _runtime_prewarm_tasks.pop(sid, None)
     if prewarm_task is not None and not prewarm_task.done():
         prewarm_task.cancel()
@@ -8820,6 +8827,17 @@ async def _force_stop_after_grace(
         t = getattr(bc, "task", None)
         if t is not None and not t.done():
             t.cancel()
+            # Cancellation enters the pump's own ``finally``, which already
+            # settles Activity, queue ownership and the durable sidecar. Give
+            # that single owner a bounded chance to finish before taking over;
+            # otherwise both paths can release the same queue claim and publish
+            # the same Activity terminal transition.
+            try:
+                await asyncio.wait_for(asyncio.shield(t), timeout=2.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
+            if bc.done or _active_turns.get(session_id) is not bc:
+                return
         async with _lock:
             if _active_turns.get(session_id) is bc:
                 _active_turns.pop(session_id, None)
@@ -8831,7 +8849,24 @@ async def _force_stop_after_grace(
                 "event": "cancelled",
                 "data": json.dumps({"snapshot_ready": snapshot_ready}),
             })
-            bc.finish()
+        # The pump normally owns all terminal bookkeeping. If it never unwinds,
+        # the watchdog must perform the same externally visible settlement rather
+        # than merely freeing `_active_turns`: otherwise Activity can stay green/
+        # running and a queued item can remain durably inflight forever.
+        mem0.pop_recall_trace(session_id)
+        await _finish_activity(session_id, bc, "cancelled")
+        if bc.queue_item_id:
+            sess.release_queue_claim(
+                session_id,
+                bc.queue_item_id,
+                turn_id=bc.turn_id,
+                pause=True,
+            )
+        sess.pause_queue_if_nonempty(session_id)
+        bc.perf_status = "cancelled"
+        bc.perf_error_kind = "cancelled"
+        bc.finish()
+        _remember_recent_turn(session_id, bc)
         if snapshot_ready or bc.queue_item_id:
             _delete_active_turn_sidecar(session_id)
         else:
@@ -13458,7 +13493,14 @@ async def _start_turn(
             # push fan-out, JSONL compatibility cleanup). The old ordering kept
             # the footer pulsing "Running" for seconds after the final answer
             # was already visible.
-            was_cancelled = session_id in _pending_interrupts
+            # ``interrupt()`` marks the exact live broadcast before awaiting the
+            # SDK control request. Treat that turn-owned bit as authoritative:
+            # ResultMessage can race the later session-level bookkeeping, and
+            # overwriting it with ``False`` used to turn a user Stop into a
+            # completed/failed result.
+            was_cancelled = bool(
+                broadcast.cancelled or session_id in _pending_interrupts
+            )
             _pending_interrupts.discard(session_id)
             broadcast.cancelled = was_cancelled
             _completed_at_ms = int(time.time() * 1000)
@@ -14576,6 +14618,44 @@ def _notify_queue_paused_on_error(session_id: str) -> None:
         pass  # no running loop (shouldn't happen in request context)
 
 
+def _schedule_queue_drain_retry(session_id: str, delay_s: float = 1.0) -> None:
+    """Retain one delayed retry for a recoverable runtime handoff conflict."""
+    existing = _queue_drain_retry_tasks.get(session_id)
+    if existing is not None and not existing.done():
+        return
+
+    async def _retry() -> None:
+        await asyncio.sleep(delay_s)
+        queue = sess.get_queue(session_id)
+        if queue.get("paused") or not (
+            queue.get("items") or queue.get("inflight")
+        ):
+            return
+        _schedule_queue_drain(session_id)
+
+    task = asyncio.create_task(_retry())
+    _queue_drain_retry_tasks[session_id] = task
+    _maintenance_tasks.add(task)
+
+    def _done(done: asyncio.Task) -> None:
+        _maintenance_tasks.discard(done)
+        if _queue_drain_retry_tasks.get(session_id) is done:
+            _queue_drain_retry_tasks.pop(session_id, None)
+        if done.cancelled():
+            return
+        try:
+            exc = done.exception()
+        except asyncio.CancelledError:
+            return
+        if exc is not None:
+            sys.stderr.write(
+                f"[chat] delayed queue drain failed "
+                f"sid={session_id[:8]} exc={type(exc).__name__}\n"
+            )
+
+    task.add_done_callback(_done)
+
+
 async def _maybe_drain_queue(session_id: str) -> None:
     """Drain trigger: if no turn is running for this session and the queue
     has a non-paused head item, pop it and start the next turn headlessly.
@@ -14619,6 +14699,8 @@ async def _maybe_drain_queue(session_id: str) -> None:
                         f"[chat] queued runtime rollover deferred "
                         f"sid={session_id[:8]} status={exc.status_code}\n"
                     )
+                    if exc.status_code in {404, 409}:
+                        _schedule_queue_drain_retry(session_id)
             return
         # READY presentation events are part of the visible chronology. Commit
         # them before claiming the next FIFO item; if local I/O cannot do so,

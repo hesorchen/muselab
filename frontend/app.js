@@ -9706,6 +9706,9 @@ function portal() {
           st._loaded = true;
           st._pendingExternalUpdate = false;
           this._syncQueueFromServer(sid);
+          this.$nextTick(() => this._drainPendingQueue(
+            sid, st.activeTurnId || "",
+          ));
         }
         return !!loaded;
       } catch (_) {
@@ -9756,6 +9759,9 @@ function portal() {
         st._loaded = true;
         st._pendingExternalUpdate = false;
         this._syncQueueFromServer(sid);
+        this.$nextTick(() => this._drainPendingQueue(
+          sid, st.activeTurnId || "",
+        ));
       }
       return !!loaded;
     },
@@ -10573,13 +10579,12 @@ function portal() {
             || this.workspaceOpenTabIds(path)
               .map(id => this.sessions.find(s => s.id === id)).find(Boolean)
             || workspaceRows[0];
-          if (target) await this._ensureSessionLoaded(target.id);
           return target || null;
         })().catch(() => null);
         const [surfaceOk, target] = await Promise.all([surfaceReady, targetReady]);
         if (switchSeq !== this._workspaceSwitchSeq
             || !surfaceOk || !this._workspaceIsCurrent(path)) return;
-        if (target) await this.openTab(target.id);
+        if (target) await this.openTab(target.id, true, { deferLoad: true });
         else this.newSession({ cwd: path });
         if (switchSeq !== this._workspaceSwitchSeq
             || !this._workspaceIsCurrent(path)) return;
@@ -11085,7 +11090,7 @@ function portal() {
     // ===== tabs =====
     // Switch to (and if needed open) a tab. Used by the picker dropdown to
     // promote a history session into a tab.
-    async openTab(id, makeCurrent = true) {
+    async openTab(id, makeCurrent = true, options = {}) {
       const session = this.sessions.find(s => s.id === id);
       const cwd = session && session.cwd;
       if (cwd && cwd !== this.currentWorkspacePath()
@@ -11104,7 +11109,16 @@ function portal() {
       if (makeCurrent && id !== this.currentId) {
         this._captureChatPosition(this.currentId);
         this.currentId = id;
-        await this.switchSession();
+        const switching = this.switchSession();
+        if (options.deferLoad) {
+          // Workspace switching owns only the shell transition. switchSession()
+          // synchronously commits the selected tab and then waits on the target
+          // transcript; let that wait continue behind the pane-local skeleton so
+          // unrelated controls regain input after the next shell paint.
+          void switching.catch(() => false);
+        } else {
+          await switching;
+        }
       }
       if (cwd) {
         this.workspaceLastSession = { ...this.workspaceLastSession, [cwd]: id };
@@ -14258,43 +14272,16 @@ function portal() {
       // finally so error / empty-result paths don't leave the skeleton stuck.
       let scheduledReveal = false;
       try {
-        // Backend windowing (perf): a long / un-compacted session can shape
-        // into thousands of bubbles and many MB of JSON. Shipping + parsing
-        // the whole thing on every entry was the dominant freeze ("卡死").
-        // So unless full mode is requested, ask the server for only the TAIL
-        // we'll actually paint up front. The tail must be wide enough that
-        // pickVisibleStart's "at least 2 user turns" guarantee still holds
-        // (it can rewind up to INITIAL_LOAD*5), so we request that much; we
-        // still render only ~INITIAL_LOAD and stash the rest. Older history
-        // pages in from the server via _fetchOlderWindow on "Load earlier".
-        const _coldEarly = !this.appReady;
-        // Mobile uses the same canonical history window as desktop. Viewport
-        // virtualization, rather than a device-specific message count, bounds
-        // mounted DOM work on smaller screens.
-        const _baseInitialLoad = _coldEarly ? 30 : 60;
-        // QUIET refresh must not shrink the pane. A quiet load is a merge into
-        // an ALREADY-PAINTED pane, and a long agentic turn can leave up to
-        // _historyWindowSize() canonical bubbles in its active request window —
-        // far more than the cold-open window above. Loading the narrow window in
-        // that state spliced several hundred bubbles down to ~60 and pushed the
-        // rest outside the visible range: a violent height collapse + mass DOM teardown,
-        // which is the post-turn half of the "会话区刷新闪烁" report
-        // (2026-08-04). Widen the request (and fetched tail) to preserve the
-        // current canonical window during the in-place morph.
-        // Cold opens and non-quiet loads keep the narrow, freeze-avoiding
-        // window — nothing is painted yet there, so there is nothing to
-        // preserve.
-        const _currentWindowSize = (quiet && Array.isArray(st.messages))
-          ? st.messages.length : 0;
-        const _quietFloor = Math.min(this._historyWindowSize(), _currentWindowSize);
-        const _initialLoadEarly = Math.max(_baseInitialLoad, _quietFloor);
-        // While the user reads history, request at least every canonical block
-        // already loaded so quiet reconciliation cannot drop the visible anchor.
-        const FETCH_TAIL = quiet
-          ? Math.max(_baseInitialLoad * 5, st.messages.length,
-            !st.atBottom ? this._historyReconcileWindowSize() : 0)
-          : Math.max(_baseInitialLoad * 5, _quietFloor);
-        const qs = full ? "?full=1" : ("?tail=" + FETCH_TAIL);
+        // Bound every normal session entry by canonical UI-block count. A cold
+        // open receives only the latest 20 blocks on mobile or 100 on desktop;
+        // older history remains server-authoritative and is fetched explicitly.
+        // Quiet reconciliation preserves only the resident blocks the reader has
+        // already chosen to load, rather than silently expanding toward full history.
+        const historyPage = this._historyWindowSize();
+        const requestedTail = quiet
+          ? Math.max(historyPage, st.messages.length)
+          : historyPage;
+        const qs = full ? "?full=1" : "?tail=" + requestedTail;
         const controller = new AbortController();
         const timeout = setTimeout(
           () => controller.abort(),
@@ -14618,7 +14605,7 @@ function portal() {
           // in a single multi-second task. The skeleton stays up until this
           // resolves, so the user sees a responsive page (tabs / sidebar stay
           // clickable) instead of a frozen one ("卡死").
-          await this._revealMessagesChunked(sid, st, visible);
+          await this._revealMessagesChunked(sid, st, visible, !quiet);
           if (this.tabState[sid] !== st || st.streaming || st.es) return true;
           this.$nextTick(async () => {
             try { await this.highlightCode(".chat-body"); st._highlighted = true; }
@@ -14720,22 +14707,72 @@ function portal() {
     },
     // Reveal the resident repository in small coordinate steps, yielding a frame
     // between updates so Alpine instantiates the directive-heavy bubble templates
-    // incrementally. The repository itself never moves; only messageRange's
-    // visible end advances.
-    async _revealMessagesChunked(sid, st, visible) {
-      const CH = this._isMobileLayout() ? 4 : 15;
-      const start = st.messageRange.visibleStart;
-      let i = 0;
-      while (i < visible.length) {
-        if (this.tabState[sid] !== st || st.streaming || st.es) return;
-        i = Math.min(visible.length, i + CH);
-        st.messageRange.visibleEnd = start + i;
-        if (sid !== this.currentId) {
-          st.messageRange.visibleEnd = start + visible.length;
-          return;
+    // incrementally. Start at the newest tail and prepend older rows: a manual tab
+    // switch can therefore show the latest answer after the first batch instead of
+    // hiding behind the skeleton until all 100 resident blocks have mounted.
+    async _revealMessagesChunked(sid, st, visible, tailFirst = true) {
+      // Alpine row creation is the remaining dominant long task: one row can
+      // contain many nested directives, tool cards and x-html bodies. Keep each
+      // commit deliberately small so transcript installation yields to shell
+      // buttons and the composer between batches instead of freezing the app.
+      const CH = this._isMobileLayout() ? 1 : 2;
+      if (!tailFirst) {
+        // Quiet canonical reconciliation preserves an existing viewport anchor.
+        // Keep its established chronological expansion; exposing only the tail
+        // first would temporarily remove the anchored row before the final restore.
+        const start = st.messageRange.visibleStart;
+        let i = 0;
+        while (i < visible.length) {
+          if (this.tabState[sid] !== st || st.streaming || st.es) return;
+          i = Math.min(visible.length, i + CH);
+          st.messageRange.visibleEnd = start + i;
+          await new Promise(resolve => this.$nextTick(resolve));
+          if (!this._paneElement(sid)) {
+            st.messageRange.visibleEnd = start + visible.length;
+            break;
+          }
+          if (i < visible.length) {
+            await new Promise(r => (typeof requestAnimationFrame === "function"
+              ? requestAnimationFrame(() => r()) : setTimeout(r, 16)));
+          }
         }
-        if (i < visible.length) {
-          await new Promise(r => (window.requestAnimationFrame
+        if (this.tabState[sid] === st) this._scheduleHistoryViewport(st, "older");
+        return;
+      }
+      const finalStart = st.messageRange.visibleStart;
+      const finalEnd = finalStart + visible.length;
+      let cursor = finalEnd;
+      st.messageRange.visibleStart = finalEnd;
+      st.messageRange.visibleEnd = finalEnd;
+      while (cursor > finalStart) {
+        if (this.tabState[sid] !== st || st.streaming || st.es) return;
+        const active = sid === this.currentId;
+        const scrollEl = active ? this._chatBodyElement() : null;
+        const anchor = scrollEl && st.atBottom === false
+          ? this._captureViewportMessageAnchor(scrollEl, sid) : null;
+        const nextStart = Math.max(finalStart, cursor - CH);
+        st.messageRange.visibleStart = nextStart;
+        st.messageRange.visibleEnd = finalEnd;
+        cursor = nextStart;
+        // Wait for Alpine to instantiate this keyed batch. As soon as the active
+        // pane owns its newest rows, remove only the transcript skeleton and pin
+        // the physical scroller; the remaining resident rows continue prepending
+        // between frames without blocking the composer or surrounding controls.
+        await new Promise(resolve => this.$nextTick(resolve));
+        if (active && sid === this.currentId && this.tabState[sid] === st) {
+          if (!st.messagesReady) st.messagesReady = true;
+          if (st.atBottom !== false) {
+            this._scrollChatTailNow(sid, st);
+          } else if (scrollEl) {
+            this._restoreMessageAnchor(scrollEl, anchor);
+          }
+        }
+        if (!this._paneElement(sid)) {
+          st.messageRange.visibleStart = finalStart;
+          break;
+        }
+        if (cursor > finalStart) {
+          await new Promise(r => (typeof requestAnimationFrame === "function"
             ? requestAnimationFrame(() => r()) : setTimeout(r, 16)));
         }
       }
@@ -15114,7 +15151,7 @@ function portal() {
     },
     // Server/history windows are independent of the rendered DOM row count.
     // Viewport virtualization alone decides which normalized messages mount.
-    _historyWindowSize() { return 300; },
+    _historyWindowSize() { return this._isMobileLayout() ? 20 : 100; },
     _historyReconcileWindowSize() { return 800; },
     _scheduleHistoryViewport(st, direction = "newer", anchorUuid = "") {
       if (!st) return;
@@ -28905,24 +28942,18 @@ function portal() {
         if (streamState.es === es) streamState.es = null;
 
         if (attempts > MAX_ATTEMPTS) {
-          // Given up. Surface manual retry UI.
+          // Transport exhaustion is not a server-authenticated terminal result.
+          // Keep the logical turn running and reconcile at low frequency; the
+          // detached backend pump may still complete, settle its queue claim and
+          // start the next queued turn while this browser is offline.
           this.toast(this.lang === "zh"
-                      ? "和 Muse 的连接断开了，重试一下"
-                      : "Lost connection to Muse — try again",
-                      "error");
-          if (!isContinuation) markUserFailed();
-          _markDone(); _stopTimer();
-          if (streamState.pendingQueue && streamState.pendingQueue.length > 0) {
-            // Optimistic — the server also pauses the queue in the turn's
-            // finally (Task 3) when an errored turn has items waiting. Show
-            // the banner now, reconcile with server truth a beat later.
-            streamState._queuePaused = true;
-            setTimeout(() => {
-              if (this.tabState[streamSid] === streamState) {
-                this._syncQueueFromServer(streamSid);
-              }
-            }, 800);
-          }
+                      ? "连接暂时中断，正在后台恢复会话状态"
+                      : "Connection interrupted; recovering session state",
+                      "warn", 4000);
+          streamState._serverActiveObserved = true;
+          this._scheduleCanonicalStreamReload(streamSid, streamState, {
+            minimumWaitMs: 1000,
+          });
           return;
         }
 
@@ -28961,7 +28992,13 @@ function portal() {
               _markDone(false, false, true); _stopTimer();
               this._ackViewedActivity(streamSid, streamState, 3);
               if (this.currentId === streamSid) {
-                this._reloadSessionCoalesced(streamSid, { quiet: true });
+                this._reloadSessionCoalesced(streamSid, { quiet: true }).then(loaded => {
+                  if (loaded && this.tabState[streamSid] === streamState) {
+                    this.$nextTick(() => this._drainPendingQueue(
+                      streamSid, streamState.activeTurnId || "",
+                    ));
+                  }
+                });
               }
               return;
             }
@@ -28992,12 +29029,14 @@ function portal() {
             // the running footer and temporarily unlock the composer even
             // though the server-side turn was still alive.
             if (attempts >= MAX_ATTEMPTS) {
-              _markDone(); _stopTimer();
               this.toast(this.lang === "zh"
-                          ? "和 Muse 的连接断开了，重试一下"
-                          : "Lost connection to Muse — try again",
-                          "error");
-              if (!isContinuation) markUserFailed();
+                          ? "连接暂时中断，正在后台恢复会话状态"
+                          : "Connection interrupted; recovering session state",
+                          "warn", 4000);
+              streamState._serverActiveObserved = true;
+              this._scheduleCanonicalStreamReload(streamSid, streamState, {
+                minimumWaitMs: 1000,
+              });
             } else {
               // Schedule next retry ourselves since the old EventSource is
               // closed and no new transport error will fire.
@@ -29104,6 +29143,19 @@ function portal() {
         st.streaming = false;
         st._stopping = false;
         st.streamingModel = "";
+        if (st.pendingQueue && st.pendingQueue.length > 0) {
+          // No backend turn exists yet, but the durable queue may already do.
+          // Persist the same Stop semantics instead of leaving only the local
+          // banner paused while the server remains free to drain it.
+          try {
+            await fetch(`/api/chat/sessions/${encodeURIComponent(sid)}/queue/pause`, {
+              method: "POST",
+              headers: Object.assign({ "Content-Type": "application/json" }, this.hdr()),
+              body: JSON.stringify({ paused: true }),
+            });
+          } catch (_) { /* queue sync below/next activation reconciles */ }
+          this._syncQueueFromServer(sid);
+        }
         this.toast(this.lang === "zh" ? "已中断" : "Interrupted", "warn", 1500);
         return;
       }
