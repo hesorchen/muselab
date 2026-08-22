@@ -161,6 +161,7 @@ def test_pending_send_text_survives_hard_refresh(
           const originalFetch = window.fetch.bind(window);
           window.fetch = (url, init) => {
             if (String(url).includes('/api/chat/stream/start')) {
+              window.__streamStartBlocked = true;
               return new Promise(() => {});
             }
             return originalFetch(url, init);
@@ -173,8 +174,7 @@ def test_pending_send_text_survives_hard_refresh(
           const app = document.querySelector('#app')._x_dataStack[0];
           const store = JSON.parse(localStorage.getItem(
             'muselab_chat_drafts_v1') || '{}');
-          const st = app._ensureTabState(app.currentId);
-          return st.streaming && app.input === ''
+          return window.__streamStartBlocked === true && app.input === ''
             && store.drafts?.[app.currentId]?.pending === marker;
         }""",
         arg=[marker],
