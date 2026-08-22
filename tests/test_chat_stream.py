@@ -199,6 +199,36 @@ async def test_queue_drain_replays_one_wakeup_coalesced_during_rollover(
     assert sid not in chat_mod._queue_drain_rekicks
 
 
+@pytest.mark.asyncio
+async def test_queue_rollover_conflict_retains_delayed_retry(
+        app_module, monkeypatch):
+    """A transient background-owner 409 must not strand queued work forever."""
+    from fastapi import HTTPException
+    from backend import chat as chat_mod
+
+    sid = "queue-rollover-retry"
+    retried = []
+    chat_mod._sessions_with_inflight_tasks[sid] = {"task-1"}
+    monkeypatch.setattr(
+        chat_mod.sess, "get_queue",
+        lambda got_sid: {"items": [{"id": "q-1"}], "inflight": None}
+        if got_sid == sid else {"items": [], "inflight": None},
+    )
+
+    async def deferred(_sid):
+        raise HTTPException(status_code=409, detail="handoff in progress")
+
+    monkeypatch.setattr(chat_mod, "_continue_detached_runtime", deferred)
+    monkeypatch.setattr(
+        chat_mod, "_schedule_queue_drain_retry", retried.append)
+    try:
+        await chat_mod._maybe_drain_queue(sid)
+    finally:
+        chat_mod._sessions_with_inflight_tasks.pop(sid, None)
+
+    assert retried == [sid]
+
+
 def test_stream_happy_path_text_tooluse_result_done(stream_env, client, monkeypatch):
     """Happy path: assistant text → tool_use → tool_result → done. Assert
     every key frame flows through with the expected shape."""
@@ -226,7 +256,7 @@ def test_stream_happy_path_text_tooluse_result_done(stream_env, client, monkeypa
             usage={"input_tokens": 100, "output_tokens": 20,
                    "cache_read_input_tokens": 0,
                    "cache_creation_input_tokens": 0},
-            uuid="assistant-final-uuid",
+            uuid="assistant-tool-uuid",
         ),
         # SDK emits the tool result wrapped in the AssistantMessage's
         # follow-up; here we send it as a ToolResultBlock-bearing assistant
@@ -239,11 +269,17 @@ def test_stream_happy_path_text_tooluse_result_done(stream_env, client, monkeypa
             model="claude-sonnet-4-6",
             usage={},
         ),
+        AssistantMessage(
+            content=[TextBlock(text="Read completed successfully.")],
+            model="claude-sonnet-4-6", usage={},
+            uuid="assistant-final-uuid",
+        ),
         ResultMessage(
             subtype="success", duration_ms=1500, duration_api_ms=1400,
             is_error=False, num_turns=1, session_id=sid,
             total_cost_usd=0.0042,
             usage={"input_tokens": 100, "output_tokens": 20},
+            result="Read completed successfully.",
         ),
     ]
 
@@ -306,9 +342,9 @@ def test_stream_happy_path_text_tooluse_result_done(stream_env, client, monkeypa
     assert sid not in chat_mod._active_turns
 
 
-def test_tool_only_turn_persists_completion_annotation(
+def test_tool_only_turn_recovers_result_text_and_survives_refresh(
         stream_env, client, monkeypatch):
-    """Completion metadata must survive turns with no streamed assistant text."""
+    """Result-only final prose must appear before done and remain after reload."""
     chat_mod = stream_env
     sid = _make_session(client)
     assistant_uuid = "assistant-tool-only-uuid"
@@ -336,6 +372,7 @@ def test_tool_only_turn_persists_completion_annotation(
             subtype="success", duration_ms=2500, duration_api_ms=2400,
             is_error=False, num_turns=1, session_id=sid,
             total_cost_usd=0.0, usage={},
+            result="Inspection completed with a final summary.",
         ),
     ]
 
@@ -360,36 +397,136 @@ def test_tool_only_turn_persists_completion_annotation(
     assert response.status_code == 200, response.text
     events = _parse_sse(response.text)
     done = next(json.loads(data) for event, data in events if event == "done")
+    kinds = [event for event, _data in events]
+    recovered = [
+        json.loads(data)["text"]
+        for event, data in events if event == "text"
+    ]
 
-    assert done["assistant_uuid"] == assistant_uuid
+    assert kinds.index("text") < kinds.index("done")
+    assert recovered[-1] == "Inspection completed with a final summary."
+    assert done["assistant_uuid"] == ""
     assert done["duration_ms"] == 2500
     assert done["memory_recall"] == recall
-    annotations = chat_mod.sess.get_message_annotations(sid)
-    assert annotations[assistant_uuid]["ts"] == done["completed_at_ms"]
-    assert annotations[assistant_uuid]["elapsed_s"] == 2.5
-    assert annotations[assistant_uuid]["turn_status"] == "completed"
-    persisted_recall = annotations[assistant_uuid]["memory_recall"]
-    assert persisted_recall == {
+    assert done["snapshot_ready"] is True
+    assert done["result_recovered"] is True
+
+    history = client.get(
+        f"/api/chat/sessions/{sid}",
+        params={"tail": 80},
+        headers={"X-Auth-Token": TEST_TOKEN},
+    )
+    assert history.status_code == 200, history.text
+    messages = history.json()["messages"]
+    terminal = messages[-1]
+    assert terminal["role"] == "assistant"
+    assert terminal["text"] == "Inspection completed with a final summary."
+    assert terminal["turn_status"] == "completed"
+    assert terminal["elapsed"] == 2.5
+    assert terminal["memoryRecall"] == {
         "id": recall["id"], "count": 1, "latency_ms": 4, "status": "ok",
         "items": [{"id": "memory-1", "kind": "preference"}],
     }
-    assert "content" not in persisted_recall["items"][0]
-    persisted = chat_mod._RawMsg(
-        assistant_uuid,
-        "assistant",
-        {"content": [{
-            "type": "tool_use", "id": "tu_tool_only", "name": "Read",
-            "input": {"file_path": "/tmp/tool-only.txt"},
-        }]},
+    assert "content" not in terminal["memoryRecall"]["items"][0]
+
+
+def test_result_race_preserves_turn_owned_cancelled_state(
+        stream_env, client, monkeypatch):
+    """Stop marked on the exact broadcast wins even before pending bookkeeping."""
+    chat_mod = stream_env
+    sid = _make_session(client)
+    tool_message = AssistantMessage(
+        content=[ToolUseBlock(
+            id="tu_cancel_race", name="Read",
+            input={"file_path": "/tmp/cancel-race.txt"},
+        )],
+        model="claude-sonnet-4-6", usage={},
+        uuid="assistant-cancel-race",
     )
-    shaped = chat_mod._sdk_messages_to_ui([persisted], annotations)
-    assert shaped[-1]["role"] == "tool_use"
-    assert shaped[-1]["model"] == "claude-sonnet-4-6"
-    assert shaped[-1]["turn_status"] == "completed"
-    assert shaped[-1]["memoryRecall"] == persisted_recall
-    chat_mod._complete_turn_footer_metadata(
-        shaped, "claude-sonnet-4-6", has_later=False)
-    assert shaped[-1]["memoryRecall"] == persisted_recall
+    result = ResultMessage(
+        subtype="success", duration_ms=900, duration_api_ms=800,
+        is_error=False, num_turns=1, session_id=sid,
+        total_cost_usd=0.0, usage={}, result="late result after stop",
+    )
+
+    class CancellingClient(_FakeStreamClient):
+        async def receive_response(self):
+            yield tool_message
+            # Model Result races the route's session-level pending flag, but the
+            # Stop click has already marked this exact broadcast cancelled.
+            chat_mod._active_turns[sid].cancelled = True
+            assert sid not in chat_mod._pending_interrupts
+            yield result
+
+    async def fake_get_client(*_args, **_kwargs):
+        return CancellingClient([])
+
+    monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
+    response = client.get(
+        f"/api/chat/stream?token={TEST_TOKEN}&session_id={sid}"
+        "&prompt=inspect&model=claude-sonnet-4-6",
+    )
+    assert response.status_code == 200, response.text
+    events = _parse_sse(response.text)
+    done = next(json.loads(data) for event, data in events if event == "done")
+
+    assert done["cancelled"] is True
+    assert done["is_error"] is False
+    assert done["result_recovered"] is False
+    assert not [data for event, data in events if event == "text"]
+
+
+def test_tool_only_success_without_result_is_not_false_completed(
+        stream_env, client, monkeypatch):
+    """A successful SDK boundary is not a completed user reply without prose."""
+    chat_mod = stream_env
+    sid = _make_session(client)
+    messages = [
+        AssistantMessage(
+            content=[ToolUseBlock(
+                id="tu_missing_final", name="Read",
+                input={"file_path": "/tmp/missing-final.txt"},
+            )],
+            model="claude-sonnet-4-6", usage={},
+            uuid="assistant-missing-final",
+        ),
+        ResultMessage(
+            subtype="success", duration_ms=900, duration_api_ms=800,
+            is_error=False, num_turns=1, session_id=sid,
+            total_cost_usd=0.0, usage={}, result=None,
+        ),
+    ]
+
+    async def fake_get_client(*_args, **_kwargs):
+        return _FakeStreamClient(messages)
+
+    monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
+    response = client.get(
+        f"/api/chat/stream?token={TEST_TOKEN}&session_id={sid}"
+        "&prompt=inspect&model=claude-sonnet-4-6",
+    )
+    assert response.status_code == 200, response.text
+    done = next(
+        json.loads(data)
+        for event, data in _parse_sse(response.text)
+        if event == "done"
+    )
+
+    assert done["is_error"] is True
+    assert done["result_recovered"] is False
+    assert done["snapshot_ready"] is True
+    assert done["assistant_uuid"] == "assistant-missing-final"
+    assert "without a final assistant response" in done["error"]
+
+    history = client.get(
+        f"/api/chat/sessions/{sid}",
+        params={"tail": 80},
+        headers={"X-Auth-Token": TEST_TOKEN},
+    )
+    assert history.status_code == 200, history.text
+    terminal = history.json()["messages"][-1]
+    assert terminal["turn_status"] == "failed"
+    assert "without a final assistant response" in terminal["text"]
 
 
 def test_forced_interrupt_persists_refreshable_footer_and_private_snapshot(
@@ -609,6 +746,92 @@ def test_prevent_continuation_cannot_be_overridden_by_success_result(
         for message in messages
     )
     assert messages[-1]["turn_status"] == "failed"
+
+
+def test_persisted_hook_rejection_beats_generic_canonical_commit_error(
+        stream_env, client, monkeypatch):
+    """Warm streams may omit the SystemMessage even though JSONL persisted it."""
+    chat_mod = stream_env
+    sid = _make_session(client)
+    fake = _FakeStreamClient([ResultMessage(
+        subtype="success", duration_ms=50, duration_api_ms=40,
+        is_error=False, num_turns=1, session_id=sid,
+        total_cost_usd=0.0, usage={},
+    )])
+
+    async def fake_get_client(*_args, **_kwargs):
+        return fake
+
+    monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
+    monkeypatch.setattr(
+        chat_mod, "_turn_uuids_from_boundary",
+        lambda *_args, **_kwargs: (None, None, True),
+    )
+    monkeypatch.setattr(
+        chat_mod, "_turn_prevented_error_from_boundary",
+        lambda *_args, **_kwargs: {
+            "message": (
+                "UserPromptSubmit operation blocked by hook: "
+                "callback timed out after 3500ms"
+            ),
+            "source": "system_prevent_continuation",
+            "api_error_status": None,
+        },
+    )
+
+    response = client.get(
+        f"/api/chat/stream?token={TEST_TOKEN}&session_id={sid}"
+        "&prompt=hook-timeout&model=claude-sonnet-4-6",
+    )
+    done = next(
+        json.loads(data)
+        for event, data in _parse_sse(response.text)
+        if event == "done"
+    )
+
+    assert done["is_error"] is True
+    assert "callback timed out after 3500ms" in done["error"]
+    assert "conversation history" not in done["error"]
+    assert done["snapshot_ready"] is True
+
+
+def test_persisted_hook_rejection_is_read_after_the_turn_boundary(
+        stream_env, monkeypatch, tmp_path):
+    chat_mod = stream_env
+    entry = {
+        "type": "system",
+        "uuid": "hook-warning",
+        "content": (
+            "UserPromptSubmit operation blocked by hook:\n"
+            "callback timed out after 3500ms"
+        ),
+        "preventContinuation": True,
+    }
+    raw = (json.dumps(entry) + "\n").encode()
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_bytes(raw)
+    index = {
+        "source": {},
+        "records": [{
+            "offset": 0,
+            "length": len(raw),
+            "uuid": "hook-warning",
+            "type": "system",
+        }],
+    }
+    monkeypatch.setattr(
+        chat_mod, "_ensure_transcript_index",
+        lambda _sid: (transcript, index),
+    )
+
+    error = chat_mod._turn_prevented_error_from_boundary(
+        "session-id",
+        {"capture_ok": True, "record_count": 0},
+    )
+
+    assert error is not None
+    assert error["source"] == "system_prevent_continuation"
+    assert "timed out after 3500ms" in error["message"]
 
 
 def test_prevent_continuation_without_result_surfaces_hook_error(
@@ -923,14 +1146,13 @@ def test_done_is_published_before_slow_post_turn_bookkeeping(
     asyncio.run(exercise())
 
 
-def test_activity_stays_running_until_background_continuation_finishes(
+def test_activity_finishes_before_background_continuation_settles(
         stream_env, client, monkeypatch):
-    """A main ResultMessage is not the logical end while a task is detached.
+    """The main ResultMessage settles the human task before detached work.
 
-    The tab derives its yellow dot from the task pin.  Activity Center must keep
-    the same session running until that pin settles and the CLI's continuation
-    reaches its own ResultMessage; otherwise opening the center shows no running
-    indicator for work that is visibly still active in the tab strip.
+    The tab and task card keep showing the background process, but Activity
+    Center becomes terminal immediately and the later continuation must not
+    create a second completion transition.
     """
     from backend import activity as activity_module
 
@@ -991,7 +1213,7 @@ def test_activity_stays_running_until_background_continuation_finishes(
             activity_module.activity,
             "finish",
             lambda activity_sid, status, *, activity_source="", owner_id="", mark_read=None: activity_transitions.append(
-                ("finish", activity_sid, status)),
+                ("finish", activity_sid, status, mark_read)),
         )
 
         broadcast = await chat_mod._start_turn(sid, "run a background task")
@@ -1003,18 +1225,16 @@ def test_activity_stays_running_until_background_continuation_finishes(
         )
         assert activity_transitions == [
             ("start", sid, "run a background task"),
+            ("finish", sid, "completed", None),
         ]
         main_done = next(
             event for event in broadcast.replay_events()
             if event.get("event") == "done"
         )
-        assert json.loads(main_done["data"])["activity_source"] == "background"
+        assert json.loads(main_done["data"])["activity_source"] == "direct"
         assert chat_mod._sessions_with_inflight_tasks[sid] == {
             "task_deferred",
         }
-        assert chat_mod._background_activity_finishes[sid] == (
-            "completed", broadcast.turn_id)
-
         await asyncio.wait_for(broadcast.task, timeout=1)
         watcher = chat_mod._task_watchers[sid]
         release_watcher.set()
@@ -1022,16 +1242,14 @@ def test_activity_stays_running_until_background_continuation_finishes(
 
         assert activity_transitions == [
             ("start", sid, "run a background task"),
-            ("finish", sid, "completed"),
+            ("finish", sid, "completed", None),
         ]
         assert sid not in chat_mod._sessions_with_inflight_tasks
-        assert sid not in chat_mod._background_activity_finishes
 
     try:
         asyncio.run(exercise())
     finally:
         chat_mod._sessions_with_inflight_tasks.pop(sid, None)
-        chat_mod._background_activity_finishes.pop(sid, None)
         chat_mod._task_watchers.pop(sid, None)
         chat_mod._active_turns.pop(sid, None)
         recent = chat_mod._recent_turns.pop(sid, None)
@@ -1040,23 +1258,19 @@ def test_activity_stays_running_until_background_continuation_finishes(
         chat_mod._delete_active_turn_sidecar(sid)
 
 
-@pytest.mark.parametrize(
-    ("deferred_status", "expected_status"),
-    [("completed", "failed"), ("cancelled", "cancelled")],
-)
-def test_background_stream_eof_releases_dead_task_and_closes_activity(
-        stream_env, monkeypatch, deferred_status, expected_status):
+def test_background_stream_eof_releases_dead_task_without_reopening_activity(
+        stream_env, monkeypatch):
     """A closed CLI can never deliver the pending task's terminal marker.
 
-    This is the force-teardown path behind the stale yellow tab / Activity
-    Center row: unlike watcher replacement, the watcher is not cancelled; its
-    shared stream ends cleanly with EOF while the task pin is still present.
+    The watcher must still stop the orphaned process and release its task pin,
+    but its failure is conversation-local: the already-settled human Activity
+    row must not be reopened or overwritten.
     """
     from backend import activity as activity_module
 
     chat_mod = stream_env
-    sid = f"sid-eof-{deferred_status}"
-    task_id = f"task-eof-{deferred_status}"
+    sid = "sid-eof-background"
+    task_id = "task-eof-background"
     transitions = []
 
     class _ClosedClient:
@@ -1078,8 +1292,6 @@ def test_background_stream_eof_releases_dead_task_and_closes_activity(
         fake = _ClosedClient()
         chat_mod._pin_background_task(sid, task_id)
         chat_mod._bg_task_descriptions[task_id] = "sleep 30"
-        chat_mod._background_activity_finishes[sid] = (
-            deferred_status, "background-owner")
         await chat_mod._watch_inflight_tasks(
             sid, fake, {task_id: "sleep 30"})
         assert fake.stop_calls == [task_id]
@@ -1093,14 +1305,12 @@ def test_background_stream_eof_releases_dead_task_and_closes_activity(
     )
     try:
         asyncio.run(exercise())
-        assert transitions == [(sid, expected_status)]
+        assert transitions == []
         assert sid not in chat_mod._sessions_with_inflight_tasks
-        assert sid not in chat_mod._background_activity_finishes
         assert task_id not in chat_mod._bg_task_descriptions
         assert task_id not in chat_mod._bg_task_pinned_at
     finally:
         chat_mod._sessions_with_inflight_tasks.pop(sid, None)
-        chat_mod._background_activity_finishes.pop(sid, None)
         chat_mod._bg_task_descriptions.pop(task_id, None)
         chat_mod._bg_task_pinned_at.pop(task_id, None)
         chat_mod._background_turn_started_at.pop(sid, None)
@@ -2728,6 +2938,17 @@ def test_usage_transcript_hydration_does_not_block_event_loop(
 
     asyncio.run(scenario())
     assert ticks >= 5
+
+
+def test_initial_active_turn_persistence_runs_off_event_loop(stream_env):
+    """The first durable prompt write must not block unrelated API/SSE work."""
+    import inspect
+
+    source = inspect.getsource(stream_env._start_turn)
+    write_at = source.index('await obs.to_thread_io(\n        "chat.active_turn_write"')
+    bind_at = source.index("sess.bind_queue_turn(", write_at)
+    assert write_at < bind_at
+    assert "_write_active_turn_sidecar,\n        broadcast" in source[write_at:bind_at]
 
 
 def test_continuation_footer_is_durable_before_terminal_publish(stream_env):

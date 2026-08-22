@@ -643,6 +643,10 @@ a:hover { color: var(--c-accent-hover); text-decoration: underline; }
   backdrop-filter: blur(5px);
   -webkit-backdrop-filter: blur(5px);
   cursor: progress;
+  /* Status only: workspace bootstrap must never become a modal input shield.
+     The active pane may still be loading, but mobile navigation, Activity,
+     Settings and the composer remain independently reachable underneath. */
+  pointer-events: none;
 }
 .workspace-switch-status {
   display: inline-flex;
@@ -2312,15 +2316,11 @@ body.kb-open .layout:focus-within .mobile-tab-bar { display: none; }
   letter-spacing: 0.5px;
 }
 .muse-mascot.greet { animation: muse-bounce .9s ease; }
-/* `.is-streaming` — slow breathing animation. Previously this class was
-   intentionally STATIC ("流式状态由 pending bubble 的 thinking-dots
-   表达") but the pending bubble disappears the moment the first chunk
-   arrives, leaving the user with no in-flight indicator for the rest
-   of the reply. Breathing is gentle enough not to compete with content
-   yet clearly signals "still working". Stream-caret on the bubble itself
-   carries the per-token feedback; mascot carries the session-level one.
-   Note: avoid using the .thinking class name — it has unrelated bubble
-   styling elsewhere that crushes the 20px mascot. */
+/* `.is-streaming` — slow breathing animation. The turn footer carries the
+   explicit in-flight state; breathing remains a gentle secondary cue on
+   mascot instances that are already part of message content. Note: avoid
+   using the .thinking class name — it has unrelated bubble styling elsewhere
+   that crushes the 20px mascot. */
 .muse-mascot.is-streaming {
   color: var(--c-accent);
   animation: muse-breath 2.4s ease-in-out infinite;
@@ -4307,16 +4307,10 @@ pre.text {
      so eager rendering just lets the browser paint the bounded window up front
      instead of stuttering every scroll. */
 }
-/* Desktop keeps several warm conversation panes mounted for instant tab
-   switches. Lay out only the visible slice of a newly revealed history;
-   off-screen bubbles use the per-message intrinsic height estimate already
-   written inline. Phones stay eager because their sequential touch scrolling
-   is more sensitive to on-demand realization and they retain only one pane. */
-@media (min-width: 769px) and (pointer: fine) {
-  .msg-pane .msg {
-    content-visibility: auto;
-  }
-}
+/* Render the bounded resident history eagerly on every device. Combining
+   content-visibility:auto with estimated virtual spacers made fast wheel
+   movement enter unpainted space and repeatedly resize the scrollbar as real
+   heights replaced estimates. Transport paging now bounds history work. */
 /* Paged-in history bubbles ("Load earlier" / live-cap restore) mount as a
    batch of 20+ at once. Each .msg would play the msg-in entrance animation on
    mount, so the whole batch fades+slides in simultaneously the instant you load
@@ -4696,9 +4690,8 @@ html[data-theme="light"] .msg.user .bubble { color: white; }
 
 /* Compact-in-progress placeholder bubble. Sits at the very bottom of the
    message list while native /compact is running (can be 20-60s on a long
-   session). Reuses .bubble.pending layout — adds a 📦 prefix icon + a
-   subtle border-pulse to differentiate it from the assistant-thinking
-   pending bubble (otherwise the two look identical). */
+   session). Reuses .bubble.pending layout and adds a 📦 prefix icon plus a
+   subtle border pulse; normal response startup now uses a turn separator. */
 .compact-pending .bubble.pending {
   border: 1px solid var(--c-accent);
   animation: compact-pending-pulse 1.6s ease-in-out infinite;
@@ -4725,10 +4718,11 @@ html[data-theme="light"] .msg.user .bubble { color: white; }
   display: flex; flex-direction: column;
   gap: 18px;
 }
-/* FIX ⑤: keep already-mounted message rows hidden behind the skeleton until
-   loadSession finishes highlighting (messagesReady). Prevents the half-rendered
-   "partway then stuck" flash on big sessions, especially on mobile. */
-.chat-body.msgs-hidden .msg { display: none; }
+/* Never remove canonical messages from layout while a cold load settles.
+   The old display:none gate left only turn separators / virtual spacers visible
+   whenever messagesReady missed a callback, producing a full-height blank chat
+   that could not be scrolled to its tail. The skeleton remains the loading cue;
+   already-resident rows stay usable underneath it. */
 .chat-skeleton-msg {
   display: flex; gap: 10px;
   align-items: flex-start;
@@ -4797,22 +4791,17 @@ html[data-theme="light"] .msg.user .bubble { color: white; }
   .cost-skeleton-kpis { grid-template-columns: repeat(2, 1fr); }
 }
 
-/* Per-bubble streaming caret retired — the new .streaming-tail row at
-   the bottom of the chat body (see index.html, after the pending
-   bubble) handles "muse is still generating" universally, including
-   when the last block is a thinking card or tool result rather than
-   a text bubble. Avoids double-pulsing dots stacked in two places. */
-/* Per-turn footer. Sits under the tail block of every muse turn —
-   carries the streaming dots while in flight and the HH:MM
-   completion stamp once done. One footer per turn, regardless of
-   how many blocks (thinking / tool_use / tool_result / assistant)
-   are in the turn. Aligned to the muse-side content column (avatar
-   width 32px + gap 8px = 40px gutter). */
-/* Now also the turn SEPARATOR: two hairlines bracket the stamp so the row
-   reads as a boundary rather than a caption hanging off the last card. The
-   40px content-column indent is gone with them — a boundary should span the
-   full width, and there is no longer an avatar-aligned run of dots to line up
-   with (those moved to .turn-running-bar). */
+/* Per-bubble streaming caret retired. The per-turn footer is the single
+   live status source once a muse-side block exists, avoiding duplicate
+   pulsing indicators in the same turn. */
+/* Per-turn footer. Sits under the tail block of every muse turn and carries
+   live state while in flight, then the completion metadata once done. One
+   footer per turn, regardless of how many blocks (thinking / tool_use /
+   tool_result / assistant) are in the turn. */
+/* The footer also acts as the turn SEPARATOR: two hairlines bracket the stamp
+   so the row reads as a boundary rather than a caption hanging off the last
+   card. A boundary spans the full width rather than following the avatar
+   gutter. */
 .turn-footer {
   padding: 0;
   margin: 6px 0 2px;
@@ -4837,7 +4826,37 @@ html[data-theme="light"] .msg.user .bubble { color: white; }
 }
 .turn-status {
   min-width: 48px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 5px;
   text-align: right;
+}
+.turn-running-dots {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+}
+.turn-running-dots > span {
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: currentColor;
+  opacity: 0.38;
+  animation: turn-running-wave 1.35s ease-in-out infinite;
+}
+.turn-running-dots > span:nth-child(2) { animation-delay: 0.14s; }
+.turn-running-dots > span:nth-child(3) { animation-delay: 0.28s; }
+@keyframes turn-running-wave {
+  0%, 56%, 100% { opacity: 0.38; transform: translateY(0); }
+  28% { opacity: 0.92; transform: translateY(-1.5px); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .turn-running-dots > span {
+    animation: none;
+    opacity: 0.7;
+    transform: none;
+  }
 }
 .turn-status.background-pending {
   min-width: 0;
@@ -4908,38 +4927,13 @@ html[data-theme="light"] .msg.user .bubble { color: white; }
     height: 30px;
   }
 }
-/* Sticky "still running" row — see the comment on .turn-running-bar in
-   index.html for why this exists instead of the trailing dots it replaced.
-   Opaque bg-1 (the chat pane's own background) so message content scrolls
-   UNDER it cleanly; the hairline gives it an edge without a heavy shadow. */
-.turn-running-bar {
-  position: sticky;
-  bottom: 0;
-  z-index: 5;
-  display: flex;
-  align-items: center;
-  gap: var(--sp-2);
-  margin-top: 4px;
-  padding: 6px 2px 4px;
-  background: var(--c-bg-1);
-  border-top: 1px solid var(--c-border);
-}
-.turn-running-label {
-  font-size: var(--fs-xs);
-  color: var(--c-fg-3);
-  font-family: var(--font-mono);
-  letter-spacing: 0.3px;
-}
-
 .thinking-dots { display: inline-flex; gap: var(--sp-1); align-items: center; }
 .thinking-dots span {
   width: 6px; height: 6px; border-radius: 50%; background: var(--c-accent);
   animation: thinking-pulse 1.2s ease-in-out infinite;
 }
-/* `.turn-footer .stream-elapsed` removed: the footer became a turn separator
-   and its elapsed counter moved to .turn-running-bar. The only remaining
-   .stream-elapsed is inside the pending bubble, where it is sibling-inline
-   and inherits .thinking-label's styling — it never needed this rule. */
+/* Turn separators render live and final elapsed values through `.msg-elapsed`;
+   no separate streaming elapsed style is needed. */
 .background-task-footer-label {
   color: var(--c-warn);
   font-size: var(--fs-xs);
@@ -10392,6 +10386,7 @@ html[data-theme="dark"] .bubble :not(pre) > code:not(.has-file-link) * {
   color: var(--c-accent);
 }
 .load-earlier-btn:active { background: var(--c-bg-4); }
+.load-earlier-btn:disabled { opacity: .6; cursor: wait; }
 .load-earlier-truncated-note {
   font-size: var(--fs-xs);
   color: var(--c-fg-3);

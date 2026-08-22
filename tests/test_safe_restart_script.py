@@ -40,7 +40,9 @@ if [[ ${1:-} == -S && ${3:-} == -X && ${4:-} == quit ]]; then
   file="$state/$2.pid"
   if [[ -f $file ]]; then
     pid=$(<"$file")
-    kill -TERM "$pid" 2>/dev/null || true
+    if [[ ${SCREEN_QUIT_NO_SIGNAL:-0} != 1 ]]; then
+      kill -TERM "$pid" 2>/dev/null || true
+    fi
     rm -f "$file"
   fi
   exit 0
@@ -219,6 +221,51 @@ def test_safe_restart_cold_starts_then_switches_with_new_pid(tmp_path: Path):
         assert final["new_pid"].isdigit()
         assert final["old_pid"] != final["new_pid"]
         assert final["startup_marker"] in startup_log.read_text().splitlines()
+    finally:
+        _stop_screen(screen, state, session)
+
+
+def test_safe_restart_signals_listener_without_waiting_for_screen_timeout(
+        tmp_path: Path):
+    port, preflight_port = _free_port(), _free_port()
+    screen, state = _fake_screen(tmp_path)
+    entry = _good_entry(tmp_path)
+    session = f"muselab-{port}"
+    status = tmp_path / "status"
+    env = _base_env(tmp_path, screen, state)
+    env["SCREEN_QUIT_NO_SIGNAL"] = "1"
+    env["MUSELAB_RESTART_STOP_TIMEOUT"] = "4"
+    _start_baseline(screen, state, session, entry, port)
+    started = time.monotonic()
+    try:
+        subprocess.run(
+            [
+                "bash",
+                str(SCRIPT),
+                "--port",
+                str(port),
+                "--preflight-port",
+                str(preflight_port),
+                "--entry",
+                str(entry),
+                "--session",
+                session,
+                "--status",
+                str(status),
+                "--startup-log",
+                str(tmp_path / "startup.log"),
+                "--watchdog-log",
+                str(tmp_path / "watchdog.log"),
+            ],
+            check=True,
+            env=env,
+        )
+        final = _wait_result(status, "success")
+        elapsed = time.monotonic() - started
+        assert final["phase"] == "done"
+        # The previous implementation spent STOP_TIMEOUT once before sending
+        # SIGTERM to each of the two listeners, so this fixture took >8 seconds.
+        assert elapsed < 7
     finally:
         _stop_screen(screen, state, session)
 

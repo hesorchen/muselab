@@ -770,6 +770,7 @@ def test_workspace_picker_supports_mouse_and_touch_reordering():
 def test_workspace_switch_moves_files_preview_and_conversation_together():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
     html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    css = (FRONTEND / "styles.css").read_text(encoding="utf-8")
     start = app.index("async switchWorkspace(path)")
     end = app.index("\n    closeWorkspaceBrowser()", start)
     switch = app[start:end]
@@ -777,7 +778,7 @@ def test_workspace_switch_moves_files_preview_and_conversation_together():
     assert "const surfaceReady = Promise.resolve(" in switch
     assert "this._changeWorkspaceSurface(path)" in switch
     assert "await this._pullWorkspaceSessions(path)" in switch
-    assert "await this._ensureSessionLoaded(target.id)" in switch
+    assert "await this._ensureSessionLoaded(target.id)" not in switch
     assert "await Promise.all([surfaceReady, targetReady])" in switch
     assert "_pullAllSessions()" not in switch
     target_ready = switch[switch.index("const targetReady"):switch.index(
@@ -785,17 +786,31 @@ def test_workspace_switch_moves_files_preview_and_conversation_together():
     assert "this.currentId =" not in target_ready
     assert "this.openTab(" not in target_ready
     assert switch.index("await Promise.all([surfaceReady, targetReady])") < switch.index(
-        "await this.openTab(target.id)")
+        "await this.openTab(target.id, true, { deferLoad: true })")
+    open_start = app.index("async openTab(id, makeCurrent = true, options = {})")
+    open_end = app.index("// Open a session id arriving", open_start)
+    open_tab = app[open_start:open_end]
+    assert "const switching = this.switchSession()" in open_tab
+    assert "if (options.deferLoad)" in open_tab
+    assert "void switching.catch(() => false)" in open_tab
     assert "workspaceSurfaceTransition: false" in app
     assert "const switchSeq = ++this._workspaceSwitchSeq" in switch
     assert "this.workspaceSurfaceTransition = true" in switch
     assert "await this.$nextTick()" in switch
     assert "this.workspaceSurfaceTransition = false" in switch
     assert "const previousMobileTab = this.mobileTab" in switch
+    surface_start = app.index("async _changeWorkspaceSurface(path)")
+    surface_end = app.index("\n    async switchWorkspace(path)", surface_start)
+    surface = app[surface_start:surface_end]
+    assert "await treeReady" not in surface
+    assert "void treeReady.then(startFileEvents)" in surface
     assert "this.setMobileTab(previousMobileTab)" in switch
     assert 'class="workspace-switch-shield"' in html
     assert 'x-show="workspaceSurfaceTransition"' in html
     assert ':aria-busy="workspaceSurfaceTransition"' in html
+    shield_start = css.index(".workspace-switch-shield {")
+    shield_end = css.index("}", shield_start)
+    assert "pointer-events: none" in css[shield_start:shield_end]
     assert "return this.currentWorkspacePath()" in app
     assert "workspaceSurfaces: this.workspaceSurfaces" in app
     files_start = html.index('<aside class="pane files"')
@@ -824,8 +839,8 @@ def test_workspace_switch_uses_scoped_session_window_and_merges_it():
     ensure_start = app.index("async _ensureSessionLoaded(sid)")
     ensure_end = app.index("\n    async loadSession(sid", ensure_start)
     ensure = app[ensure_start:ensure_end]
-    assert "const canonicalBehind = st._loaded" in ensure
-    assert "updated > seen" in ensure
+    assert "const canonicalBehind = this._canonicalMetaBehind(st, meta)" in ensure
+    assert "if (canonicalBehind) st._pendingExternalUpdate = true" in ensure
     assert "canonicalBehind ? { quiet: true } : {}" in ensure
     assert "this._applySessionList([...incoming, ...otherWorkspaces])" in pull
     assert "this._optimisticMetas && this._optimisticMetas[session.id]" in pull
@@ -953,14 +968,34 @@ def test_file_tree_uses_a_bounded_viewport_window():
 def test_session_rename_patches_activity_without_reloading_chat():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
     helper_start = app.index("_applyRenamedSession(sid, name) {")
-    helper = app[helper_start:app.index("\n    async pickerCommitInlineRename()", helper_start)]
+    picker_start = app.index("async pickerCommitInlineRename()", helper_start)
+    helper = app[helper_start:picker_start]
+    picker = app[picker_start:app.index("\n    pickerCancelInlineRename()", picker_start)]
     modal_start = app.index("async renameSession() {")
     modal = app[modal_start:app.index("\n    // ===== settings modal", modal_start)]
+    tab_start = app.index("async commitRenameTab() {")
+    tab = app[tab_start:app.index("cancelRenameTab()", tab_start)]
 
     assert "item.session_name = name" in helper
     assert "this.activity.events = [...this.activity.events]" in helper
+    optimistic_start = helper.index("async _renameSessionOptimistically(")
+    optimistic = helper[optimistic_start:]
+    assert optimistic.index("this._applyRenamedSession(sid, name)") < optimistic.index("await fetch(")
+    assert "if (current && current.name === name)" in optimistic
+    assert "this._applyRenamedSession(sid, previousName)" in optimistic
     assert app.count("this._applyRenamedSession(") == 2
+    assert 'this._renameSessionOptimistically(cur.id, name, cur.name, true, "modal")' in modal
+    assert 'this._renameSessionOptimistically(id, name, cur.name, true, "tab")' in tab
+    assert 'this._renameSessionOptimistically(sid, name, cur.name, false, "picker")' in picker
+    assert '_reportSessionRenamePerf(fields) {' in app
+    assert 'fetch("/api/log/session-rename"' in app
+    assert "renamePerf.optimistic_apply_ms" in optimistic
+    assert "renamePerf.optimistic_paint_ms" in optimistic
+    assert "renamePerf.request_ms" in optimistic
+    assert 'renamePerf.status = "rollback"' in optimistic
+    assert "this._reportSessionRenamePerf(renamePerf)" in optimistic
     assert "refreshSessions" not in modal
+    assert "refreshSessions" not in tab
     assert "loadSession" not in helper
     assert "fetchActivity" not in helper
 
@@ -1501,7 +1536,7 @@ def test_failed_transcript_refresh_preserves_last_good_messages():
     load = app[start:end]
     failed = load[
         load.index("if (!r.ok) {"):
-        load.index("const s = this._retainExpectedSessionSettings(await r.json())")
+        load.index("const parsedSession = await r.json()")
     ]
 
     assert "return false" in failed
@@ -2041,7 +2076,7 @@ def test_context_recovery_opens_branch_and_never_reuses_attachment_ids():
     assert "pendingDocs" not in error[error.index("if (hasContextRecovery)"):]
 
 
-def test_workspace_switch_disables_composer_and_gates_programmatic_user_send():
+def test_workspace_switch_keeps_drafting_available_but_gates_user_send():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
     html = (FRONTEND / "index.html").read_text(encoding="utf-8")
     start = app.index("async send(opts = {})")
@@ -2050,8 +2085,9 @@ def test_workspace_switch_disables_composer_and_gates_programmatic_user_send():
     textarea = textarea[:textarea.index("</textarea>")]
 
     assert "if (this.workspaceSwitching && !opts.reconnect && !opts.resumedItem) return" in send
-    assert ':disabled="workspaceSwitching || !availableModels.length"' in textarea
-    assert 'multiple style="display:none" :disabled="workspaceSwitching"' in html
+    assert ':disabled="!availableModels.length"' in textarea
+    assert ':disabled="workspaceSwitching || !availableModels.length"' not in textarea
+    assert 'multiple style="display:none" :disabled="workspaceSwitching"' not in html
     assert ':disabled="composerClaimed(currentId) || !!composerDisabledReason(currentId)"' in html
     assert ':disabled="workspaceSwitching || !!(tabState[currentId]' in html
 
@@ -2072,19 +2108,26 @@ def test_stop_control_interrupts_session_and_never_removes_queue_items():
     assert "if (st._stopping) return" in stop
     assert "const r = await fetch(" in stop
     assert "if (!r.ok) throw" in stop
-    assert 'String(item).startsWith(sid + "@")' in stop
-    assert "const timeout = setTimeout(() => controller.abort(), 15000)" in stop
-    assert "waitForTerminalEvent = !!st.streaming" in stop
+    assert "const ownerEs = st.es" in stop
+    assert "st._optimisticInterrupt = true" in stop
+    assert "st.streaming = false" in stop
+    assert "this._setSessionActivityExpectation(sid, false)" in stop
+    assert 'this.toast(this.lang === "zh" ? "已中断"' in stop
+    assert "const timeout = setTimeout(() => controller.abort(), 3000)" in stop
+    assert 'fetch(`/api/chat/sessions/${encodeURIComponent(sid)}/active`' in stop
+    assert "st.es === ownerEs && active === true" in stop
+    assert "st.streaming = true" in stop
     assert "this._retireStaleSessionStream(sid, st)" not in stop
     assert "if (st._renderStreamingHtml) st._renderStreamingHtml()" not in stop
-    assert "if (!didInterrupt)" in stop
-    assert "if (!waitForTerminalEvent || !st.streaming)" in stop
+    assert "waitForTerminalEvent" not in stop
     cancelled_start = app.index('es.addEventListener("cancelled"')
     cancelled_end = app.index("\n      });", cancelled_start)
     cancelled = app[cancelled_start:cancelled_end]
     assert "_markDone(true, false, true, {" in cancelled
     assert 'turnStatus: "cancelled"' in cancelled
     assert "d.snapshot_ready" in cancelled
+    assert "alreadySettledOptimistically" in cancelled
+    assert "if (!alreadySettledOptimistically)" in cancelled
     assert "streamState._seenUpdated = undefined" in cancelled
     assert "quiet: true" in cancelled
     assert "probeActive: false" in cancelled
@@ -2122,6 +2165,14 @@ def test_background_task_gap_rolls_foreground_onto_detached_successor():
     assert "async _handoffBackgroundSession(" in app
     assert "/continue-detached`" in app
     assert "_stateForDetachedSuccessor(" in app
+    successor_start = app.index("_stateForDetachedSuccessor(")
+    successor_end = app.index("_claimDetachedRolloverSlot", successor_start)
+    successor = app[successor_start:successor_end]
+    assert "child._loaded = !!sourceState._loaded && child.messages.length > 0" in successor
+    handoff_start = app.index("async _handoffBackgroundSession(")
+    handoff_end = app.index("_ensureInheritedTaskPoller", handoff_start)
+    handoff = app[handoff_start:handoff_end]
+    assert 'this._requestSessionSync(childSid, "history_load"' in handoff
     assert "_backgroundRolloverAttempted" in app
     assert "owner_session_id" in app
     # A second browser may refresh its list after the first browser hid the
@@ -2374,6 +2425,9 @@ def test_composer_send_has_one_claim_owner_without_exposing_internal_phases():
     assert '_composerSubmitPhase: ""' in app
     assert "if (sendState._composerSubmitToken" in send
     assert 'sendState._composerSubmitPhase = "submitting";' in send
+    assert "if (sendState._optimisticInterrupt" in send
+    assert "if (sendState.es) sendState.es.close()" in send
+    assert "sendState._pendingExternalUpdate = true" in send
     assert "this._releaseComposerClaim(composerSubmitToken);" in send
     assert send.index('sendState._composerSubmitPhase = "submitting";') < send.index(
         "await this._awaitRuntimeSettingPatches(sendSid, sendState)"
@@ -2624,9 +2678,15 @@ def test_active_stream_owns_messages_and_continuation_reconciles_canonical_histo
 
     assert "if (st.streaming || st.es) return false" in load
     assert "this.tabState[sid] !== st || st.streaming || st.es" in load
-    reveal_start = app.index("async _revealMessagesChunked(sid, st, visible)")
+    reveal_start = app.index("async _revealMessagesChunked(sid, st, visible, tailFirst = true)")
     reveal = app[reveal_start:app.index("async _fillDeferredHead", reveal_start)]
     assert "this.tabState[sid] !== st || st.streaming || st.es" in reveal
+    assert "const CH = this._isMobileLayout() ? 1 : 2" in reveal
+    assert "let cursor = finalEnd" in reveal
+    assert "st.messageRange.visibleStart = nextStart" in reveal
+    assert "if (!st.messagesReady) st.messagesReady = true" in reveal
+    assert "this._scrollChatTailNow(sid, st)" in reveal
+    assert "await this._yieldHistoryInstall();" in reveal
     assert "const ownsCurBubble = () =>" in send
     assert "this._containsPaneMessage(streamState, curBubble)" in send
     contains_start = app.index("_containsPaneMessage(st, message)")
@@ -2644,6 +2704,10 @@ def test_active_stream_owns_messages_and_continuation_reconciles_canonical_histo
     assert "const stillOwned = () => this.tabState[sid] === ownerState" in app
     assert "if (!isContinuation)" in send
     assert "all = this._preserveCanonicalMessageIdentity(st, all)" in load
+    assert "const quietRangeBeforeInstall = quiet ?" in load
+    assert "await new Promise(resolve => this.$nextTick(resolve))" in load
+    assert "this._revealMessagesChunked(sid, st, visible, true)" in load
+    assert "this._revealMessagesChunked(sid, st, visible, !quiet)" not in load
     assert "delete canonicalFields._k" in app
     assert "matched._k = mountedKey" in app
     canonical_start = app.index("_scheduleCanonicalStreamReload(sid, st")
@@ -2661,8 +2725,14 @@ def test_active_stream_owns_messages_and_continuation_reconciles_canonical_histo
     transport_finished_start = send.index("if (!d.active)", no_active_end)
     transport_finished_end = send.index(
         "if (d.background && d.attachable === false)", transport_finished_start)
-    assert "this._reloadSessionCoalesced(streamSid, { quiet: true })" in send[
-        transport_finished_start:transport_finished_end]
+    transport_finished = send[transport_finished_start:transport_finished_end]
+    assert "this._reloadSessionCoalesced(streamSid, { quiet: true })" in transport_finished
+    assert "this._drainPendingQueue(" in transport_finished
+    assert "streamState.activeTurnId || \"\"" in transport_finished
+    health_start = app.index("async _runStreamHealthSync(sid, st, options = {})")
+    health_end = app.index("_scheduleCanonicalStreamReload(", health_start)
+    health = app[health_start:health_end]
+    assert "this._drainPendingQueue(" in health
 
 
 def test_fork_banner_and_message_template_are_null_and_key_safe():
@@ -2691,13 +2761,14 @@ def test_quiet_history_reload_restores_visible_block_anchor_not_absolute_scroll(
     load_end = app.index("    // loadSession is per-session safe", load_start)
     load = app[load_start:load_end]
     anchor_start = app.index("    _captureViewportMessageAnchor(scrollEl, sid) {")
-    anchor_end = app.index("    LOAD_MORE_BATCH:", anchor_start)
+    anchor_end = app.index("    outlineVersion:", anchor_start)
     anchors = app[anchor_start:anchor_end]
 
     assert "this._captureViewportMessageAnchor(quietScrollEl, sid)" in load
     assert "quietScrollEl && !st.atBottom" in load
     assert "st.messages.length" in load
-    assert "!st.atBottom ? this._historyReconcileWindowSize() : 0" in load
+    assert "Math.max(historyPage, st.messages.length)" in load
+    assert "_historyReconcileWindowSize()" not in load
     assert "this._restoreMessageAnchor(" in load
     assert "if (!restored) quietScrollEl.scrollTop = quietScrollTop" in load
     assert 'pane.querySelectorAll(".msg[data-message-key]")' in anchors
@@ -2754,14 +2825,34 @@ def test_large_history_bodies_load_by_stable_block_reference():
     assert 'Object.assign(m, loaded' in loader
     assert 'body_state: "loaded"' in loader
     assert 'new IntersectionObserver' in loader
-    assert 'root: (this.$refs && this.$refs.chatBody) || null' in loader
+    assert 'root: (this._chatBodyElement()) || null' in loader
     assert 'rootMargin: "500% 0px"' in loader
-    assert 'm.html = this._renderHistoryMessage(m)' in loader
+    assert 'this._queueHistoryRichRender(m, sid)' in loader
     assert "this._loadMessageBody(m, sid)" in loader
     assert "await this._loadMessageBody(m)" in toggle
     assert 'x-init="observeAssistantBody($el, m, tid)"' in html
     assert "加载完整正文" not in html
     assert "Load full body" not in html
+
+
+def test_history_rich_render_never_blocks_canonical_install_or_batches_one_frame():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    load_start = app.index("    async loadSession(sid, opts = {}) {")
+    load_end = app.index("// Warm OPEN-but-inactive tabs", load_start)
+    load = app[load_start:load_end]
+    queue_start = app.index("    _queueHistoryRichRender(m,")
+    queue_end = app.index("    observeAssistantBody(el, m, sid)", queue_start)
+    queue = app[queue_start:queue_end]
+
+    assert "await this._renderMessagesChunked(visible" not in load
+    assert "historyPerf.markdown_ms = 0" in load
+    assert "_historyRichRenderQueue.push" in queue
+    assert "m._richRenderQueued" in queue
+    assert "window.requestIdleCallback(run, { timeout: 250 })" in queue
+    assert "this._renderHistoryMessage(m)" in queue
+    assert "if (this._historyRichRenderQueue.length) this._scheduleHistoryRichRender()" in queue
+    assert "forEach" not in queue
+    assert "const fenced = text.match(" in app
 
 
 def test_message_keys_use_stable_identity_without_repair_or_telemetry():
@@ -2916,7 +3007,7 @@ def test_done_immediately_stamps_tool_tail_and_quietly_adopts_fork_boundary():
     assert "const loaded = await this.loadSession(sid, {" in reconcile
     assert "quiet: true, probeActive: false" in reconcile
     assert "attempt < 30" in reconcile
-    assert "Math.min(2000, 250 + attempt * 100)" in reconcile
+    assert "Math.min(2000, 250 + options.attempt * 100)" in reconcile
 
     continuity_start = app.index("_messageContinuitySignatures(m)")
     continuity_end = app.index(
@@ -2943,7 +3034,6 @@ def test_done_immediately_stamps_tool_tail_and_quietly_adopts_fork_boundary():
 
 def test_background_settlement_pauses_footer_until_reaction_starts():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
-    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
     send_start = app.index("async send(opts = {})")
     send = app[send_start:app.index("async stop()", send_start)]
 
@@ -2951,7 +3041,10 @@ def test_background_settlement_pauses_footer_until_reaction_starts():
     assert "_setContinuationAwaitingReaction(false)" in send
     assert "background_tasks_pending" in send
     assert "_continuationAwaitingReaction: false" in app
-    assert "!(pane._continuationAwaitingReaction)" in html
+    status_start = app.index("turnFooterStatus(m, pane) {")
+    status_end = app.index("turnStatusLabel(status)", status_start)
+    status = app[status_start:status_end]
+    assert "if (pane && pane._continuationAwaitingReaction) return \"\";" in status
 
 
 def test_terminal_event_immediately_settles_tab_activity_snapshot():
@@ -3140,9 +3233,9 @@ def test_explicit_send_scroll_mounts_virtual_tail_without_restoring_old_anchor()
     sync_start = app.index("_syncMessageViewport(tid = this.currentId, forceTail = false)")
     sync_end = app.index("_scheduleMessageViewportSync", sync_start)
     sync = app[sync_start:sync_end]
-    assert "const followTail = forceTail || st.atBottom" in sync
-    assert "const anchor = followTail" in sync
-    assert "if (!followTail) this._restoreMessageAnchor(body, anchor)" in sync
+    assert "Intentionally no-op" in sync
+    assert "void tid" in sync
+    assert "void forceTail" in sync
 
     scroll_start = app.index("    scrollToBottom(force) {")
     scroll_end = app.index("// Re-slam the viewport", scroll_start)
@@ -3174,12 +3267,33 @@ def test_warm_transcript_panes_skip_remount_skeleton_and_full_highlight():
     warm = switch[warm_start:cold_start]
 
     assert "stCur.messagesReady = true" in warm
-    assert "this.scrollToBottom(true)" in warm
+    assert "this._scrollChatTailNow(target, stCur)" in warm
+    assert "this._settleScrollToBottom()" in warm
     assert "messagesReady = false" not in warm
     assert "highlightCode" not in warm
+    cold = switch[cold_start:]
+    assert "stCur.messagesReady = false" in cold
+    assert cold.index("stCur.messagesReady = true") < cold.index("this._scrollChatTailNow(target, stCur)")
+    assert cold.index("this._scrollChatTailNow(target, stCur)") < cold.index("this._afterPaint(() =>")
     assert 'x-for="tid in warmTranscriptTabIds()"' in html
     assert 'x-show="tid === currentId"' in html
 
+
+
+def test_cold_session_restore_replays_active_tab_tail_after_pane_mount():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+
+    init_start = app.index("    async _initSessionsOnce(options = {}) {")
+    init_end = app.index("    // Shared session-list pull", init_start)
+    init = app[init_start:init_end]
+    assert "await this._ensureSessionLoaded(this.currentId)" in init
+    assert "const restoredId = this.currentId" in init
+    assert "this.$nextTick(() => this._afterPaint(() =>" in init
+    assert "restored.messagesReady = true" in init
+    assert "this.scrollToBottom(true)" in init
+    assert init.index("await this._ensureSessionLoaded(this.currentId)") < init.index(
+        "this.scrollToBottom(true)"
+    )
 
 
 def test_tab_selection_and_layout_changes_share_one_tail_follow_controller():
@@ -3196,7 +3310,8 @@ def test_tab_selection_and_layout_changes_share_one_tail_follow_controller():
     switch_end = app.index("    _afterPaint(fn) {", switch_start)
     switch = app[switch_start:switch_end]
     assert "selectedState.atBottom = true" in switch
-    assert switch.count("this.scrollToBottom(true)") >= 2
+    assert "this.scrollToBottom(true)" in switch
+    assert switch.count("this._scrollChatTailNow(target, stCur)") == 2
     assert "this._restoreChatPosition(target)" not in switch
 
     controller_start = app.index("    _ensureChatTailObserver() {")
@@ -3222,43 +3337,38 @@ def test_tab_selection_and_layout_changes_share_one_tail_follow_controller():
     assert "this._settleToken = (this._settleToken || 0) + 1" in intent
 
 
-def test_history_paging_is_transparent_and_fast_scroll_never_enters_blank_rows():
+def test_history_paging_uses_smaller_mobile_pages_only_on_user_request():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
     html = (FRONTEND / "index.html").read_text(encoding="utf-8")
 
-    hydrate_start = app.index("    _revealResidentHistory(st) {")
-    hydrate_end = app.index("    // Pull the next older window", hydrate_start)
-    hydrate = app[hydrate_start:hydrate_end]
-    assert "st.messageRange.visibleStart = 0" in hydrate
-    assert "this._shiftMessageVirtualWindow(st, count)" in hydrate
-    assert "this._fetchOlderWindow(sid)" in hydrate
-    assert "this._fetchLaterWindow(sid)" in hydrate
-    assert "st.messageRange.visibleEnd = st.messages.length" in hydrate
-    assert "window.requestIdleCallback" in hydrate
-    assert "st._historyHydrationRetry = setTimeout" in hydrate
+    load_start = app.index("    async loadSession(sid, opts = {}) {")
+    load_end = app.index("// Warm OPEN-but-inactive tabs", load_start)
+    load = app[load_start:load_end]
+    assert "_historyWindowSize() { return this._isMobileLayout() ? 20 : 100; }" in app
+    assert 'const qs = full ? "?full=1" : "?tail=" + requestedTail' in load
+    assert "const historyPage = this._historyWindowSize()" in load
+    assert "Math.max(historyPage, st.messages.length)" in load
+    assert "this._scheduleTransparentHistory(st, false)" not in load
+
+    earlier_start = app.index("    async loadEarlierMessages(sid) {")
+    earlier_end = app.index("    async returnToLatest(sid)", earlier_start)
+    earlier = app[earlier_start:earlier_end]
+    assert "const batchSize = this._historyWindowSize()" in earlier
+    assert "await this._fetchOlderWindow(sid)" in earlier
+    assert "this._captureViewportMessageAnchor(scrollEl, sid)" in earlier
+    assert "this._restoreMessageAnchor(scrollEl, anchor)" in earlier
 
     scroll_start = app.index("    onChatScroll() {")
     scroll_end = app.index("    // Stamp the last genuine user scroll gesture", scroll_start)
     scroll = app[scroll_start:scroll_end]
-    assert "st._virtualScrollVelocity" in scroll
-    assert "st._virtualScrollDirection" in scroll
-    assert "el.clientHeight * 6" in scroll
-    assert "this._scheduleTransparentHistory(st, true)" in scroll
+    assert "loadEarlierMessages(" not in scroll
+    assert "_scheduleTransparentHistory(" not in scroll
 
-    virtual_start = app.index("    _syncMessageViewport(tid = this.currentId")
-    virtual_end = app.index("    _scheduleMessageViewportSync", virtual_start)
-    virtual = app[virtual_start:virtual_end]
-    assert "const speedScreens = Math.min(" in virtual
-    assert "const topOverscan = overscan" in virtual
-    assert "const bottomOverscan = overscan" in virtual
-    assert "const measurementAnchor = followTail" in virtual
-    assert "if (heightsChanged && measurementAnchor)" in virtual
-
-    assert '@click="loadEarlierMessages()"' not in html
+    assert '@click="loadEarlierMessages()"' in html
+    assert ':disabled="activeSession._loadingEarlier"' in html
+    assert "history.load_earlier" in html
+    assert "earlierMessageCount()" in html
     assert '@click="loadLaterMessages()"' not in html
-    assert 'history.load_earlier' not in html
-    assert 'Load newer' not in html
-    assert 'activeSession._historyHydrationError' in html
     assert 'class="history-plain"' in html
     assert "messageIntrinsicH(pane, m)" in html
 
@@ -3307,16 +3417,15 @@ def test_long_chat_state_keeps_complete_normalized_history_and_generation_safety
     assert "_activated: false" in blank
     for removed in ("_earlierMessages", "_laterMessages", "_allPaneMessages"):
         assert removed not in app
-    assert "_historyWindowSize() { return 300; }" in app
+    assert "_historyWindowSize() { return this._isMobileLayout() ? 20 : 100; }" in app
     assert "_historyReconcileWindowSize() { return 800; }" in app
-    assert "_historyWindowSize() { return this._isMobileLayout()" not in app
     assert "_historyReconcileWindowSize() { return this._isMobileLayout()" not in app
     assert "_MAX_RESIDENT_PANES" not in app
     assert "residentPaneIds" not in app
     assert "_promoteResident" not in app
-    assert "const _baseInitialLoad = _coldEarly ? 30 : 60;" in app
-    assert "const _mobileEarly" not in app
-    assert "_coldEarly ? 8 : 15" not in app
+    assert 'const qs = full ? "?full=1" : "?tail=" + requestedTail' in app
+    assert "Math.max(historyPage, st.messages.length)" in app
+    assert "const _baseInitialLoad" not in app
     assert "if (cst && cst.streaming) continue" not in app
     assert '"&history_generation="' in app
     assert "if (r.status === 409)" in app
@@ -3352,17 +3461,17 @@ def test_long_chat_state_keeps_complete_normalized_history_and_generation_safety
     virtual = app[virtual_start:virtual_end]
     assert "paneMessageRows(tid)" in virtual
     assert "_syncMessageViewport(tid = this.currentId" in virtual
-    assert "body.clientHeight * 1.5" in virtual
+    assert "return messages.map((message, index) =>" in virtual
+    assert "spacer: false" in virtual
+    assert "Intentionally no-op" in virtual
     assert 'querySelectorAll(".msg[data-message-key]")' in virtual
     assert "st._virtualHeights[key] = height" in virtual
-    assert 'spacer("top", 0, start)' in virtual
-    assert 'spacer("bottom", end, messages.length)' in virtual
-    # Streaming and completed states share one DOM window. A separately-mounted
-    # live tail was torn down by streaming=false and collapsed the completion layout.
+    # Streaming and completed states share one exact-height browser layout. The
+    # removed estimated spacers could expose blank regions during fast touch scroll.
     assert "messages.length - 3" not in virtual
     assert 'spacer("middle"' not in virtual
-    assert "this._captureViewportMessageAnchor(body, tid)" in virtual
-    assert "this._restoreMessageAnchor(body, anchor)" in virtual
+    assert 'spacer("top"' not in virtual
+    assert 'spacer("bottom"' not in virtual
     sync_start = app.index("_syncNormalizedHistory(st) {")
     sync_end = app.index("_captureViewportMessageAnchor", sync_start)
     assert "splice(" not in app[sync_start:sync_end]
@@ -3387,7 +3496,9 @@ def test_long_chat_state_keeps_complete_normalized_history_and_generation_safety
     pane = html[pane_start:pane_end]
     assert 'x-for="tid in warmTranscriptTabIds()"' in html
     assert 'x-show="tid === currentId"' in pane
-    assert "WARM_TRANSCRIPT_LIMIT: 10" in app
+    assert "WARM_TRANSCRIPT_LIMIT: 3" in app
+    assert "const warmLimit = this._isMobileLayout() ? 1 : this.WARM_TRANSCRIPT_LIMIT" in app
+    assert ".slice(0, warmLimit)" in app
     assert "_touchTranscriptPane(id)" in app
     assert "st.streaming || st.es" in app
     assert ".filter(tid => !streamingSet.has(tid))" in app
@@ -3397,15 +3508,93 @@ def test_long_chat_state_keeps_complete_normalized_history_and_generation_safety
     assert "msg-virtual-spacer" in pane
     assert ".msg-virtual-spacer > * { display: none !important; }" in css
     assert "pane.streaming" in pane
-    assert "pane.streamElapsed" in pane
-    # Elapsed reads through a null-guarded pane. `pane` resolves to null while
-    # a closing tab's pane is torn down, and an unguarded property read there
-    # throws inside the Alpine effect.
-    assert "fmtStreamElapsed((pane && pane.streamElapsed) || 0)" in pane
-    assert 'x-text="fmtStreamElapsed(pane.streamElapsed)"' not in pane
+    # The single shared footer reads through the active-session façade rather
+    # than duplicating elapsed timers inside every warm transcript pane.
+    assert "activeSession.streamElapsed" in html
+    assert 'x-text="\'· \' + fmtStreamElapsed(activeSession.streamElapsed)"' in html
     assert "messages.length" not in re.sub(r"<!--.*?-->", "", pane, flags=re.S)
     assert "streaming &&" not in re.sub(r"<!--.*?-->", "", pane, flags=re.S).replace(
         "pane.streaming &&", "")
+
+
+def test_cold_history_reveal_never_marks_a_nonempty_session_with_an_empty_range():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+
+    guard_start = app.index("_ensureNonEmptyMessageRange(st) {")
+    guard_end = app.index("_containsPaneMessage", guard_start)
+    guard = app[guard_start:guard_end]
+    assert "if (!st || !Array.isArray(st.messages) || !st.messages.length)" in guard
+    assert "range.visibleEnd <= range.visibleStart" in guard
+    assert "range.visibleEnd = length" in guard
+    assert "range.visibleStart = Math.max(0, length - 1)" in guard
+
+    visible_start = app.index("_visiblePaneMessages(st) {")
+    visible_end = app.index("_ensureNonEmptyMessageRange(st) {", visible_start)
+    visible_accessor = app[visible_start:visible_end]
+    assert "this._ensureNonEmptyMessageRange(st);" in visible_accessor
+
+    successor_start = app.index("_stateForDetachedSuccessor(")
+    successor_end = app.index("_claimDetachedRolloverSlot", successor_start)
+    successor = app[successor_start:successor_end]
+    clone_range = successor.index("child.messageRange = { ...sourceState.messageRange };")
+    repair_range = successor.index("this._ensureNonEmptyMessageRange(child);")
+    mark_loaded = successor.index(
+        "child._loaded = !!sourceState._loaded && child.messages.length > 0;"
+    )
+    assert clone_range < repair_range < mark_loaded
+
+    reveal_start = app.index("async _revealMessagesChunked(sid, st, visible")
+    reveal_end = app.index("// E5: render the deferred HEAD", reveal_start)
+    reveal = app[reveal_start:reveal_end]
+    assignment = reveal.index("st.messageRange.visibleStart = nextStart")
+    cancellation = reveal.index(
+        "if (this.tabState[sid] !== st || st.streaming || st.es) return",
+        reveal.index("const finalStart = st.messageRange.visibleStart"),
+    )
+    assert assignment < cancellation
+    assert "st.messageRange.visibleStart = finalEnd" not in reveal
+    assert "st.messageRange.visibleEnd = finalEnd" in reveal
+    assert "await this._yieldHistoryInstall();" in reveal
+    assert "requestAnimationFrame(() => r())" not in reveal
+
+    install_yield_start = app.index("_yieldHistoryInstall() {")
+    install_yield_end = app.index(
+        "async _revealMessagesChunked", install_yield_start)
+    install_yield = app[install_yield_start:install_yield_end]
+    assert 'window.scheduler.postTask(() => {}, { priority: "background" })' in install_yield
+    assert "window.requestIdleCallback" in install_yield
+    assert "setTimeout(resolve, 50)" in install_yield
+
+    load_start = app.index("async loadSession(sid, opts = {})")
+    load_end = app.index("// Warm OPEN-but-inactive tabs", load_start)
+    load = app[load_start:load_end]
+    fail_open = load.index("this._ensureNonEmptyMessageRange(st);")
+    ready = load.index("st.messagesReady = true", fail_open)
+    assert fail_open < ready
+
+    switch_start = app.index("async switchSession()")
+    switch_end = app.index("// Run `fn` AFTER", switch_start)
+    switch = app[switch_start:switch_end]
+    assert "canonicalCount > 0 && !st.messages.length" in switch
+    assert "loadedButMissingCanonical || loadedButBehindCanonical" in switch
+    assert "if (loadedButMissingCanonical) st._loaded = false" in switch
+    assert "if (loadedButBehindCanonical) st._pendingExternalUpdate = true" in switch
+    assert "await this._ensureSessionLoaded(target);" in switch
+
+    activate_start = app.index("async activateTab(tid)")
+    activate_end = app.index("_scrollTabIntoView(tid)", activate_start)
+    activate = app[activate_start:activate_end]
+    assert "if (tid === this.currentId)" in activate
+    assert "canonicalCount > 0 && !st.messages.length" in activate
+    assert "st._loaded = false" in activate
+    assert "await this._ensureSessionLoaded(tid);" in activate
+    assert "this._ensureNonEmptyMessageRange(st);" in activate
+
+    reconcile_start = app.index("_reconcileOpenSession(next)")
+    reconcile_end = app.index("async _runHistoryRevisionSync", reconcile_start)
+    reconcile = app[reconcile_start:reconcile_end]
+    assert "canonicalMissingLocally" in reconcile
+    assert 'this._requestSessionSync(sid, "history_load"' in reconcile
 
 
 def test_stream_deltas_use_throttled_plain_snapshots_and_final_rich_render():
@@ -3892,7 +4081,7 @@ def test_workspace_cache_uses_delta_without_blocking_or_copying_hidden_bursts():
     change_end = app.index("\n    async switchWorkspace(path)", change_start)
     change = app[change_start:change_end]
     assert "this.loadRoot({ runtimeSnapshot: !!runtime })" in change
-    assert "coldTreeOk = await treeReady" in change
+    assert "await treeReady" not in change
     assert "Promise.allSettled" not in change
     assert "await terminalRefresh" not in change
     assert "this.fetchTerminals({ restore: true })" in change
@@ -4236,49 +4425,35 @@ def test_effort_field_uses_a_short_label_not_the_tooltip_prose():
     assert "Ultra uses maximum reasoning" in i18n
 
 
-def test_running_state_is_pinned_to_the_scroll_viewport_not_the_last_message():
-    """A long agentic turn must show "still running" at every scroll position.
-
-    2026-07-25 report ("这种界面很让人困惑啊 为什么没有footer？"): a screenful of
-    tool cards with no time, no state, no boundary. Three separately-reasonable
-    rules composed into that: (1) one footer per TURN, on its tail message;
-    (2) the HH:MM stamp only lands in the `done` handler, so a running turn has
-    no `ts` anywhere; (3) the pulsing avatar marks the turn's FIRST message,
-    which in a 40-block turn is far off-screen. Net: the only evidence of life
-    was the composer's stop button.
-    """
+def test_running_state_is_rendered_once_in_the_turn_separator():
+    """Live status belongs to the turn separator, not a duplicate sticky row."""
     html = (FRONTEND / "index.html").read_text(encoding="utf-8")
     css = (FRONTEND / "styles.css").read_text(encoding="utf-8")
 
-    pane_start = html.index('<div class="msg-pane"')
-    pane_end = html.index("<!-- /P1 per-tab message panes", pane_start)
-    pane = html[pane_start:pane_end]
-    # Lives INSIDE the pane: panes are resident per tab, and a single shared
-    # bar would report the active tab's state under every one of them.
-    assert 'class="turn-running-bar"' in pane
-    # The gate also excludes the pending-bubble case — see
-    # test_running_bar_and_pending_bubble_are_mutually_exclusive.
-    assert 'x-show="pane && pane.streaming' in pane
+    assert 'class="turn-running-bar"' not in html
+    assert ".turn-running-bar" not in css
 
-    block = css[css.index(".turn-running-bar {"):]
-    block = block[:block.index("}")]
-    assert "position: sticky" in block
-    assert "bottom: 0" in block
-    # Opaque, or message text shows through as it scrolls underneath.
-    assert "background: var(--c-bg-1)" in block
+    footer = html[html.index('<div class="turn-footer"'):]
+    footer = footer[:footer.index('<button class="turn-fork-btn"')]
+    assert 'class="turn-running-dots"' in footer
+    assert "turnFooterStatus(m, pane) === 'running'" in footer
+    assert "turnFooterElapsed(m, pane)" in footer
+    assert "turnFooterModel(m, pane, tid)" in footer
+
+    assert "@keyframes turn-running-wave" in css
+    assert "transform: translateY(-1.5px)" in css
+    assert "@media (prefers-reduced-motion: reduce)" in css
+    assert "animation: none" in css
 
 
-def test_turn_footer_is_a_separator_and_no_longer_hosts_streaming_dots():
-    """The footer became the turn boundary; the dots moved to the sticky bar.
-
-    Keeping both would pulse two sets of dots ~20px apart whenever the user
-    happened to be scrolled to the bottom.
-    """
+def test_turn_footer_is_a_separator_and_hosts_the_only_running_dots():
+    """The turn boundary owns the restrained live-state animation."""
     html = (FRONTEND / "index.html").read_text(encoding="utf-8")
     css = (FRONTEND / "styles.css").read_text(encoding="utf-8")
 
     footer = html[html.index('<div class="turn-footer"'):]
     footer = footer[:footer.index("</div>")]
+    assert "turn-running-dots" in footer
     assert "thinking-dots" not in footer
     assert "stream-elapsed" not in footer
     # Bracketing hairlines are what make it read as a boundary rather than a
@@ -4442,27 +4617,29 @@ def test_compact_summary_stays_collapsed_until_tapped():
     assert opt_out < fn.index("streaming && i === msgs.length - 1")
 
 
-def test_running_bar_and_pending_bubble_are_mutually_exclusive():
-    """Only one live-state indicator at a time.
-
-    The sticky .turn-running-bar shows dots + elapsed + model. So does the
-    "Muse 正在思考…" pending bubble, and the bar pins itself a few px below it —
-    2026-07-25 screenshot showed "运行中 · 9m27s · Opus 5" stacked directly on
-    "Muse 正在思考… · Opus 5 · 9m27s". The pending bubble renders when there is
-    no muse-side msg yet; the bar must require the inverse.
-    """
+def test_pre_response_state_uses_the_same_turn_separator_not_a_left_bubble():
+    """Before the first muse block, render the shared footer contract temporarily."""
     html = (FRONTEND / "index.html").read_text(encoding="utf-8")
 
-    bar = html[html.index('class="turn-running-bar"'):]
-    bar = bar[:bar.index("</div>")]
-    assert "paneMsgs[paneMsgs.length - 1].role !== 'user'" in bar
-    assert "paneMsgs.length" in bar
+    assert 'class="turn-running-bar"' not in html
+    assert 'class="turn-footer turn-pending-footer"' in html
+    pending_start = html.index('class="turn-footer turn-pending-footer"')
+    pending = html[html.rfind("<div", 0, pending_start):html.index("</div>", pending_start)]
+    assert "activeSession.messages[activeSession.messages.length-1].role === 'user'" in pending
+    assert "!activeSession.compacting" in pending
+    assert "!activeSession._continuationAwaitingReaction" in pending
+    assert 'class="msg assistant"' not in pending
+    assert "assistant-avatar" not in pending
+    assert 'class="turn-running-dots"' in pending
+    assert "turnStatusLabel('running')" in pending
+    assert "fmtTurnTime(activeSession._streamStartedAt)" in pending
+    assert "fmtStreamElapsed(activeSession.streamElapsed)" in pending
+    assert "modelLabel(activeSession.streamingModel)" in pending
 
-    # The pending bubble reads the same active-session pane as the sticky bar's
-    # visible resident pane, so the two conditions stay complementary.
-    assert ("activeSession.streaming && (!activeSession.messages.length\n"
-            "                                       || activeSession.messages[activeSession.messages.length-1]"
-            ".role === 'user')") in html
+    footer = html[html.index('<div class="turn-footer"'):]
+    footer = footer[:footer.index('<button class="turn-fork-btn"')]
+    assert "m.role !== 'user'" in footer
+    assert "turnFooterStatus(m, pane) === 'running'" in footer
 
 
 def test_auto_compact_drives_the_same_ui_as_a_manual_one():
@@ -4510,10 +4687,12 @@ def test_auto_compact_drives_the_same_ui_as_a_manual_one():
     done = done[:done.index("this._setBackgroundTaskActive(")]
     assert "streamState.compacting = false;" in done
 
-    # Exactly one placeholder bubble: the auto-compact fires while the last msg
-    # is still the user's, which is also the generic pending bubble's trigger.
-    assert ("&& !activeSession.compacting\"\n"
-            "               class=\"msg assistant\"") in html
+    # Auto-compact fires while the last msg is still the user's, which also
+    # qualifies the pre-response separator. Its explicit exclusion keeps the 📦
+    # maintenance placeholder as the only visible status.
+    assert ("&& !activeSession.compacting\n"
+            "                       && !activeSession._continuationAwaitingReaction\"") in html
+    assert 'x-show="activeSession.compacting" class="msg assistant compact-pending"' in html
 
 
 def test_concise_mode_hides_exactly_three_card_classes():
@@ -4631,7 +4810,8 @@ def test_midturn_reconnect_storm_guards_are_in_place():
     reconcile = js[js.index("    _reconcileOpenSession(next) {"):]
     reconcile = reconcile[:reconcile.index("\n    _sessionsEqual(")]
     assert "const backgroundOnly = !!cur.background_active && !cur.turn_active;" in reconcile
-    assert "const needsRefresh = st._pendingExternalUpdate || visibleNewer;" in reconcile
+    assert "const needsRefresh = st._pendingExternalUpdate" in reconcile
+    assert "|| visibleNewer || canonicalSuffixMissing" in reconcile
     assert "messageCountChanged || turnCountChanged" in reconcile
     assert "!!cur.active || st._pendingExternalUpdate" not in reconcile
     # Attaching to a server-side turn is a separate, pane-preserving path.
@@ -4675,6 +4855,18 @@ def test_midturn_reconnect_storm_guards_are_in_place():
     onopen = js[js.index("      es.onopen = () => {"):]
     onopen = onopen[:onopen.index("      };")]
     assert "_reconnectAttempts" not in onopen
+    exhausted_start = js.index("if (attempts > MAX_ATTEMPTS)")
+    exhausted_end = js.index("// Exponential backoff", exhausted_start)
+    exhausted = js[exhausted_start:exhausted_end]
+    assert "this._scheduleCanonicalStreamReload(streamSid, streamState" in exhausted
+    assert "markUserFailed()" not in exhausted
+    assert "_markDone()" not in exhausted
+    probe_exhausted_start = js.index("if (attempts >= MAX_ATTEMPTS)", exhausted_end)
+    probe_exhausted_end = js.index("} else {", probe_exhausted_start)
+    probe_exhausted = js[probe_exhausted_start:probe_exhausted_end]
+    assert "this._scheduleCanonicalStreamReload(streamSid, streamState" in probe_exhausted
+    assert "markUserFailed()" not in probe_exhausted
+    assert "_markDone()" not in probe_exhausted
 
     # 6. Turn completion refreshes the list quietly instead of via
     #    refreshSessions(), which also drives _recoverStalledStream — i.e. it
@@ -4897,3 +5089,66 @@ def test_slash_controls_run_before_provider_gate_without_consuming_attachments()
     ):
         assert destructive not in slash
     assert slash_start < provider_gate
+
+
+def test_canonical_history_load_never_reports_stream_takeover_as_success():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    start = app.index("    async loadSession(sid, opts = {}) {")
+    end = app.index("\n    // Warm OPEN-but-inactive tabs", start)
+    load = app[start:end]
+
+    assert "if (st.streaming || st.es) return false;" in load
+    assert "if (st.streaming || st.es) return true;" not in load
+    assert "if (this.tabState[sid] !== st || st.streaming || st.es) return true;" not in load
+    assert "st._installedCanonicalCount = Math.max(" in load
+    assert load.index("st.messages.splice(0, st.messages.length, ...all)") < load.index(
+        "st._installedCanonicalCount = Math.max("
+    )
+
+
+def test_nonempty_tabs_detect_and_quiet_merge_a_missing_canonical_suffix():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    reconcile_start = app.index("    _reconcileOpenSession(next) {")
+    reconcile_end = app.index("\n    async _runHistoryRevisionSync", reconcile_start)
+    reconcile = app[reconcile_start:reconcile_end]
+    ensure_start = app.index("    async _ensureSessionLoaded(sid) {")
+    ensure_end = app.index("\n    async loadSession", ensure_start)
+    ensure = app[ensure_start:ensure_end]
+
+    assert "canonicalCount > installedCount" in reconcile
+    assert "canonicalSuffixMissing" in reconcile
+    assert "visibleNewer || canonicalSuffixMissing" in reconcile
+    assert "canonicalCount <= installedCount" in reconcile
+    assert "this._canonicalMetaBehind(st, meta)" in ensure
+    assert "canonicalBehind ? { quiet: true } : {}" in ensure
+
+
+def test_completed_turn_reconciliation_survives_a_new_stream_owner():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    start = app.index("    _canonicalMetaBehind(st, meta) {")
+    end = app.index("\n    _reconcileCompletedContinuation", start)
+    completion = app[start:end]
+    mark_start = app.index("      const _markDone = (")
+    mark_end = app.index("\n      es.addEventListener(\"done\"", mark_start)
+    mark_done = app[mark_start:mark_end]
+
+    assert "ownerState._pendingCompletedTurnSync = options" in completion
+    assert "if (!stillOwned()) return false;" in completion
+    assert "ownerState._pendingCompletedTurnSync = null" in completion
+    assert "_resumePendingCanonicalSync(sid, st)" in completion
+    assert "this.$nextTick(() => this._resumePendingCanonicalSync(" in mark_done
+
+
+def test_tab_activation_checks_canonical_installation_watermark():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    activate_start = app.index("    async activateTab(tid) {")
+    activate_end = app.index("\n    _scrollTabIntoView", activate_start)
+    activate = app[activate_start:activate_end]
+    switch_start = app.index("    async switchSession() {")
+    switch_end = app.index("\n    _afterPaint", switch_start)
+    switch = app[switch_start:switch_end]
+
+    assert "this._canonicalMetaBehind(st, meta)" in activate
+    assert "await this._ensureSessionLoaded(tid)" in activate
+    assert "this._canonicalMetaBehind(st, cur)" in switch
+    assert "loadedButBehindCanonical" in switch

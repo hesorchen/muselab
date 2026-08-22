@@ -156,12 +156,33 @@ def session_config_dir(
     lock,
     is_third_party: Callable[[str], bool],
     vendor_config_dir: Callable[[], Path],
+    session_path: Path | None = None,
 ) -> Iterator[None]:
-    """Serialize and scope the SDK's process-global ``CLAUDE_CONFIG_DIR``."""
+    """Serialize and scope the SDK's process-global ``CLAUDE_CONFIG_DIR``.
+
+    Existing sessions are routed by their canonical transcript location rather
+    than their current model label.  A session can be switched to a third-party
+    model after its JSONL was created in the native store; model-only routing
+    would then make fork/rename report a false ``session not found``.  New
+    sessions without a transcript retain the historical model-based fallback.
+    """
     with lock:
         old = os.environ.get("CLAUDE_CONFIG_DIR")
         try:
-            if model and is_third_party(model):
+            routed = False
+            if session_path is not None:
+                try:
+                    projects_root = session_path.resolve().parent.parent
+                    vendor_dir = vendor_config_dir().resolve()
+                    if projects_root == vendor_dir / "projects":
+                        os.environ["CLAUDE_CONFIG_DIR"] = str(vendor_dir)
+                        routed = True
+                    elif projects_root == (Path.home() / ".claude" / "projects").resolve():
+                        os.environ.pop("CLAUDE_CONFIG_DIR", None)
+                        routed = True
+                except OSError:
+                    pass
+            if not routed and model and is_third_party(model):
                 os.environ["CLAUDE_CONFIG_DIR"] = str(vendor_config_dir())
             yield
         finally:
