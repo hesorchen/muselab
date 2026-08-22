@@ -1447,14 +1447,36 @@ def get_message_annotations(sid: str) -> dict[str, dict]:
     return _load_sidecar(sid).get("messages", {})
 
 
-def get_runtime_task_overlays(sid: str) -> dict[str, dict]:
-    """Return UI-only background task cards keyed by task id.
+_RUNTIME_TASK_OVERLAY_MARKER = b'"runtime_task_overlays"'
 
-    Runtime-rollover children never resume the predecessor's CLI process.  The
-    overlay lets their copied tool card reflect that process's lifecycle while
-    remaining completely absent from model context.
+
+def _sidecar_has_runtime_task_overlays(sid: str) -> bool:
+    """Check for the overlay section without parsing a potentially huge sidecar.
+
+    Message annotations can make sidecars tens of megabytes. Startup only needs
+    the small minority containing runtime task state, so parsing every indexed
+    sidecar made each cold start spend about two minutes in JSON decoding.
+    False positives are safe (the normal loader validates them); I/O failures
+    deliberately return true so the authoritative loader still fails closed.
     """
-    raw = _load_sidecar(sid).get("runtime_task_overlays") or {}
+    path = _sidecar_path(sid)
+    overlap = len(_RUNTIME_TASK_OVERLAY_MARKER) - 1
+    carry = b""
+    try:
+        with path.open("rb") as stream:
+            while chunk := stream.read(64 * 1024):
+                data = carry + chunk
+                if _RUNTIME_TASK_OVERLAY_MARKER in data:
+                    return True
+                carry = data[-overlap:]
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return False
+
+
+def _normalize_runtime_task_overlays(raw: Any) -> dict[str, dict]:
     if not isinstance(raw, dict):
         return {}
     return {
@@ -1462,6 +1484,43 @@ def get_runtime_task_overlays(sid: str) -> dict[str, dict]:
         for task_id, value in raw.items()
         if task_id and isinstance(value, dict)
     }
+
+
+def _load_runtime_task_overlays_section(sid: str) -> dict[str, dict]:
+    """Decode only the overlay object, not the sidecar's large message map."""
+    path = _sidecar_path(sid)
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {}
+    except UnicodeDecodeError as exc:
+        raise RuntimeError(f"cannot parse session sidecar: {path}") from exc
+    marker_at = raw.find(_RUNTIME_TASK_OVERLAY_MARKER.decode("ascii"))
+    if marker_at < 0:
+        return {}
+    colon_at = raw.find(":", marker_at + len(_RUNTIME_TASK_OVERLAY_MARKER))
+    if colon_at < 0:
+        raise RuntimeError(f"cannot parse session sidecar: {path}")
+    value_at = colon_at + 1
+    while value_at < len(raw) and raw[value_at].isspace():
+        value_at += 1
+    try:
+        value, _ = json.JSONDecoder().raw_decode(raw, value_at)
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
+        raise RuntimeError(f"cannot parse session sidecar: {path}") from exc
+    return _normalize_runtime_task_overlays(value)
+
+
+def get_runtime_task_overlays(sid: str) -> dict[str, dict]:
+    """Return UI-only background task cards keyed by task id.
+
+    Runtime-rollover children never resume the predecessor's CLI process.  The
+    overlay lets their copied tool card reflect that process's lifecycle while
+    remaining completely absent from model context.
+    """
+    return _normalize_runtime_task_overlays(
+        _load_sidecar(sid).get("runtime_task_overlays") or {}
+    )
 
 
 _RUNTIME_TASK_TERMINAL_STATES = frozenset({
@@ -1664,29 +1723,34 @@ def get_authoritative_runtime_task_overlays(sid: str) -> dict[str, dict]:
     return authoritative
 
 
-def _replace_runtime_task_overlay_snapshot(
+def _replace_runtime_task_overlay_snapshots(
     sid: str,
-    task_id: str,
-    snapshot: dict,
-) -> bool:
-    """Repair helper that replaces one copied snapshot exactly."""
+    snapshots: dict[str, dict],
+) -> int:
+    """Replace copied snapshots in one read-modify-write transaction."""
+    if not snapshots:
+        return 0
     with session_lifecycle_lock(sid):
         with _QUEUE_LOCK:
             if sid in _DELETED_SESSION_IDS:
-                return False
+                return 0
         with _SIDECAR_LOCK:
             data = _load_sidecar(sid, use_cache=False)
             overlays = data.setdefault("runtime_task_overlays", {})
             if not isinstance(overlays, dict):
                 overlays = {}
                 data["runtime_task_overlays"] = overlays
-            replacement = dict(snapshot)
-            replacement["task_id"] = task_id
-            if overlays.get(task_id) == replacement:
-                return False
-            overlays[task_id] = replacement
-            _save_sidecar(sid, data)
-            return True
+            changed = 0
+            for task_id, snapshot in snapshots.items():
+                replacement = dict(snapshot)
+                replacement["task_id"] = task_id
+                if overlays.get(task_id) == replacement:
+                    continue
+                overlays[task_id] = replacement
+                changed += 1
+            if changed:
+                _save_sidecar(sid, data)
+            return changed
 
 
 def reconcile_runtime_task_overlay_chains() -> int:
@@ -1704,6 +1768,13 @@ def reconcile_runtime_task_overlay_chains() -> int:
         for row in rows
         if isinstance(row, dict) and row.get("id")
     ]
+    overlay_sids = {
+        sid for sid in indexed_ids
+        if _sidecar_has_runtime_task_overlays(sid)
+    }
+    if not overlay_sids:
+        return 0
+
     repaired = 0
     visited: set[str] = set()
     for indexed_sid in indexed_ids:
@@ -1713,8 +1784,13 @@ def reconcile_runtime_task_overlay_chains() -> int:
         if not lineage:
             continue
         visited.update(lineage)
+        if overlay_sids.isdisjoint(lineage):
+            continue
         overlays_by_sid = {
-            row_sid: get_runtime_task_overlays(row_sid)
+            row_sid: (
+                _load_runtime_task_overlays_section(row_sid)
+                if row_sid in overlay_sids else {}
+            )
             for row_sid in lineage
         }
         task_ids = {
@@ -1722,6 +1798,7 @@ def reconcile_runtime_task_overlay_chains() -> int:
             for overlay in overlays_by_sid.values()
             for task_id in overlay
         }
+        repairs_by_sid: dict[str, dict[str, dict]] = {}
         for task_id in task_ids:
             resolved = _authoritative_runtime_task_snapshot(
                 task_id, lineage, overlays_by_sid
@@ -1736,13 +1813,13 @@ def reconcile_runtime_task_overlay_chains() -> int:
             # Child-owned tasks do not exist in predecessor context.  Copy the
             # canonical owner record only forward from its launch runtime.
             for target_sid in lineage[owner_position:]:
-                if _replace_runtime_task_overlay_snapshot(
-                    target_sid, task_id, canonical
-                ):
-                    repaired += 1
-                    overlays_by_sid.setdefault(target_sid, {})[task_id] = dict(
-                        canonical
-                    )
+                if overlays_by_sid.get(target_sid, {}).get(task_id) == canonical:
+                    continue
+                repairs_by_sid.setdefault(target_sid, {})[task_id] = canonical
+        for target_sid, snapshots in repairs_by_sid.items():
+            repaired += _replace_runtime_task_overlay_snapshots(
+                target_sid, snapshots
+            )
     return repaired
 
 
@@ -1767,7 +1844,9 @@ def stop_stale_runtime_task_overlays() -> int:
     stopped = 0
     now_ms = int(time.time() * 1000)
     for sid in indexed_session_ids():
-        for task_id, overlay in get_runtime_task_overlays(sid).items():
+        if not _sidecar_has_runtime_task_overlays(sid):
+            continue
+        for task_id, overlay in _load_runtime_task_overlays_section(sid).items():
             if overlay.get("state") != "running":
                 continue
             changed = set_runtime_task_overlay(

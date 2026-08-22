@@ -16,6 +16,9 @@ def _service(tmp_path, monkeypatch):
         "_metadata",
         lambda sid: (f"Session {sid}", workspace, "ws"),
     )
+    # Service-unit fixtures use synthetic session ids rather than creating full
+    # chat sessions. Treat their ledger rows as live unless a test explicitly
+    # overrides this source to exercise phantom-session filtering.
     from backend import activity as activity_module
     monkeypatch.setattr(
         activity_module.sessions,
@@ -549,6 +552,55 @@ def test_compact_successor_atomically_inherits_activity_lineage_and_placement(
     assert restarted._group_assignments == {"child": group["id"]}
 
 
+def test_successor_does_not_inherit_owner_from_completed_human_turn(
+    tmp_path,
+    monkeypatch,
+):
+    service = _service(tmp_path, monkeypatch)
+    source = service.start(
+        "source",
+        summary="launch background work",
+        activity_source="direct",
+        owner_id="source-turn",
+    )
+    source_done = service.finish(
+        "source",
+        "completed",
+        activity_source="direct",
+        owner_id="source-turn",
+    )
+    assert source_done["state"] == "completed"
+    assert source_done["owner_id"] == "source-turn"
+    assert "active_owner_ids" not in source_done
+
+    inherited = service.inherit_session("source", "child", successor=True)
+    assert inherited["item"]["session_id"] == "child"
+    assert inherited["item"]["owner_id"] == "source-turn"
+    assert "active_owner_ids" not in inherited["item"]
+
+    child = service.start(
+        "child",
+        summary="independent child turn",
+        activity_source="direct",
+        owner_id="child-turn",
+    )
+    assert child["id"] == source["id"]
+    assert child["owner_id"] == "child-turn"
+    assert "active_owner_ids" not in child
+
+    child_done = service.finish(
+        "child",
+        "completed",
+        activity_source="direct",
+        owner_id="child-turn",
+    )
+    assert child_done["state"] == "completed"
+    assert child_done["session_id"] == "child"
+    assert child_done["owner_id"] == "child-turn"
+    assert "active_owner_ids" not in child_done
+    assert service.summary()["running"] == 0
+
+
 def test_ordinary_fork_inherits_group_without_stealing_source_lineage(
     tmp_path,
     monkeypatch,
@@ -823,13 +875,26 @@ async def test_rename_persists_and_pushes_without_reordering_task(
 
 def test_restart_marks_running_as_failed(tmp_path, monkeypatch):
     service = _service(tmp_path, monkeypatch)
-    service.start("s1", summary="long task")
+    service.start(
+        "s1",
+        summary="long task",
+        owner_id="pre-restart-owner",
+    )
     restarted = _service(tmp_path, monkeypatch)
     row = restarted.list()[0]
     assert row["state"] == "failed"
     assert row["needs_attention"] is False
     assert row["read"] is False
     assert row["updated_at"] == row["finished_at"]
+    assert "owner_id" not in row
+    assert "active_owner_ids" not in row
+
+    resumed = restarted.start("s1", summary="next turn", owner_id="new-owner")
+    assert resumed["owner_id"] == "new-owner"
+    assert "active_owner_ids" not in resumed
+    finished = restarted.finish("s1", "completed", owner_id="new-owner")
+    assert finished["state"] == "completed"
+    assert restarted.summary()["running"] == 0
     assert json.loads((Path(tmp_path) / ".muselab" / "activity.json").read_text())
 
 

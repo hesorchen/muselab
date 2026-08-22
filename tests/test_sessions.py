@@ -6,7 +6,6 @@ metadata + per-message annotation sidecar layer only. End-to-end transcript
 flows require a live SDK and are not unit-testable here.
 """
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 from pathlib import Path
@@ -416,7 +415,8 @@ def test_runtime_task_overlay_owner_and_terminal_state_are_monotonic(app_module)
     )
 
 
-def test_reconcile_runtime_task_overlay_chains_repairs_forward_copies(app_module):
+def test_reconcile_runtime_task_overlay_chains_repairs_forward_copies(
+        app_module, monkeypatch):
     from backend import sessions as sess
 
     source = sess.create_session("runtime-source")["id"]
@@ -449,7 +449,17 @@ def test_reconcile_runtime_task_overlay_chains_repairs_forward_copies(app_module
         description="child launch",
     )
 
+    original_load = sess._load_sidecar
+    mutation_loads = []
+
+    def tracked_load(sid, *, use_cache=True):
+        if not use_cache:
+            mutation_loads.append(sid)
+        return original_load(sid, use_cache=use_cache)
+
+    monkeypatch.setattr(sess, "_load_sidecar", tracked_load)
     assert sess.reconcile_runtime_task_overlay_chains() == 3
+    assert sorted(mutation_loads) == sorted([child, grandchild])
     assert sess.reconcile_runtime_task_overlay_chains() == 0
 
     source_visible = sess.get_authoritative_runtime_task_overlays(source)
@@ -726,20 +736,22 @@ def test_sessions_first_page_does_not_wait_for_workspace_jsonl_scan(
 
     def blocked_scan(**_kwargs):
         scan_started.set()
-        release_scan.wait(2)
+        release_scan.wait(60)
         return [_sdk_session_info(local["id"], title="transcript title")]
 
     monkeypatch.setattr(sess, "sdk_list_sessions", blocked_scan)
     try:
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            future = pool.submit(
-                client.get, "/api/chat/sessions", headers=auth)
-            response = future.result(timeout=1)
-        assert response.status_code == 200
-        initial_etag = response.headers["etag"]
-        listed = {row["id"]: row for row in response.json()["sessions"]}
+        # Start the background flight outside TestClient. Starlette waits for
+        # request-owned worker activity on some runners, which makes a wall-clock
+        # assertion measure TestClient shutdown rather than this cache contract.
+        initial, _generation = sess.list_sessions_snapshot()
+        listed = {row["id"]: row for row in initial}
         assert listed[local["id"]]["name"] == "cached metadata"
         assert scan_started.wait(1)
+
+        response = client.get("/api/chat/sessions", headers=auth)
+        assert response.status_code == 200
+        initial_etag = response.headers["etag"]
     finally:
         release_scan.set()
         _wait_for_list_refresh(sess)

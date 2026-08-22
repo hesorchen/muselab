@@ -137,6 +137,12 @@ class ActivityService:
                         needs_attention=False,
                         read=False,
                     )
+                    # Activity owners are process-local lifecycle claims. Once a
+                    # restart terminalizes the row, retaining them lets the next
+                    # turn inherit dead owners and remain running after its real
+                    # owner finishes.
+                    item.pop("owner_id", None)
+                    item.pop("active_owner_ids", None)
                     changed = True
             if changed:
                 self._save()
@@ -539,6 +545,25 @@ class ActivityService:
         return next((x for x in reversed(self._events)
                      if x.get("session_id") == sid), None)
 
+    @staticmethod
+    def _active_owner_ids(item: dict[str, Any]) -> list[str]:
+        values = item.get("active_owner_ids")
+        if not isinstance(values, list):
+            return []
+        return list(dict.fromkeys(
+            str(value)[:200] for value in values if str(value or "").strip()
+        ))
+
+    def _latest_by_owner(self, owner_id: str) -> dict[str, Any] | None:
+        owner = str(owner_id or "")[:200]
+        if not owner:
+            return None
+        return next((
+            item for item in reversed(self._events)
+            if item.get("owner_id") == owner
+            or owner in self._active_owner_ids(item)
+        ), None)
+
     def _live_session_ids(self) -> set[str]:
         """Session ids the frontend can still open.
 
@@ -583,6 +608,10 @@ class ActivityService:
                 item = {"id": uuid.uuid4().hex, "session_id": sid,
                         "turn_count": 0}
                 self._events.append(item)
+            inherited_owners = (
+                self._active_owner_ids(item)
+                if item.get("state") in _ACTIVE else []
+            )
             item.update(
                 kind=(kind or "turn")[:40],
                 # Chat turns use this delivery-class field to distinguish a
@@ -606,9 +635,17 @@ class ActivityService:
             else:
                 item.pop("source_id", None)
             if owner_id:
-                item["owner_id"] = owner_id[:200]
+                owner = owner_id[:200]
+                item["owner_id"] = owner
+                if inherited_owners:
+                    item["active_owner_ids"] = list(dict.fromkeys(
+                        [*inherited_owners, owner]
+                    ))
+                else:
+                    item.pop("active_owner_ids", None)
             else:
                 item.pop("owner_id", None)
+                item.pop("active_owner_ids", None)
             self._events = self._events[-_MAX_EVENTS:]
             self._save()
             self._publish_locked(item=item)
@@ -659,6 +696,12 @@ class ActivityService:
             "cancelled" if status in {"cancelled", "interrupted"} else "failed")
         with self._lock:
             item = self._latest(sid)
+            if item is None and owner_id:
+                # A successor moves the visible Activity row to its child SID,
+                # while the inherited watcher still settles through the source
+                # SID. Resolve that durable logical owner before treating the
+                # finish as an orphan.
+                item = self._latest_by_owner(owner_id)
             if item is None:
                 # A normal owner may only close the Activity incarnation it
                 # successfully started. If its start failed before persisting
@@ -678,10 +721,24 @@ class ActivityService:
                 item = self._latest(sid)
             assert item is not None
             # A detached watcher can finish after a newer foreground turn has
-            # reused this session row. Only the owner that started the current
-            # incarnation may close it; deletion intentionally omits owner_id
-            # to force a terminal state for whichever incarnation remains.
-            if owner_id and item.get("owner_id") != owner_id:
+            # reused this session row. Ordinary rows still have one replaceable
+            # owner. Successor inheritance promotes that owner into a small set,
+            # because the child may run a foreground turn while predecessor-owned
+            # background work remains active.
+            active_owners = self._active_owner_ids(item)
+            if owner_id and active_owners:
+                owner = owner_id[:200]
+                if owner not in active_owners:
+                    return dict(item)
+                remaining_owners = [value for value in active_owners if value != owner]
+                if remaining_owners:
+                    item["active_owner_ids"] = remaining_owners
+                    if item.get("owner_id") == owner:
+                        item["owner_id"] = remaining_owners[-1]
+                    self._save()
+                    return dict(item)
+                item.pop("active_owner_ids", None)
+            elif owner_id and item.get("owner_id") != owner_id:
                 return dict(item)
             owner_revoked = False
             if not owner_id:
@@ -689,6 +746,8 @@ class ActivityService:
                 # Revoke the current incarnation so its late ordinary owner can
                 # no longer overwrite this authoritative terminal state.
                 owner_revoked = item.pop("owner_id", None) is not None
+                owner_revoked = item.pop("active_owner_ids", None) is not None \
+                    or owner_revoked
             # Terminal delivery can be observed by more than one cleanup path
             # (for example the Result boundary and an outer pump fallback).
             # Repeating the same terminal state must be a true no-op: rewriting
@@ -716,12 +775,10 @@ class ActivityService:
             now = time.time()
             if activity_source:
                 item["activity_source"] = activity_source[:40]
-            # Background logical turns surface their result as a normal Agent
-            # bubble in chat.  Their Activity row remains useful history, but
-            # must become terminal+read in this same locked mutation: publishing
-            # an unread finish and ACKing it afterwards exposes a transient red
-            # badge to SSE clients.  Other callers retain the established unread
-            # completion/failure semantics by leaving ``mark_read`` unspecified.
+            # Callers may atomically finish as read when the result was already
+            # visible to the user. Otherwise completion/failure retains the normal
+            # unread-result semantics; the frontend ACKs a visibly mounted session
+            # after receiving the terminal Activity transition.
             terminal_read = (
                 bool(mark_read) if mark_read is not None
                 else state == "cancelled"
@@ -1074,6 +1131,16 @@ class ActivityService:
                 changed = True
             if successor:
                 if source_item is not None:
+                    # A running predecessor watcher keeps settling with its old
+                    # SID/owner after this row moves to the child. Preserve that
+                    # owner explicitly so a child foreground turn can coexist
+                    # without completing the shared logical task prematurely.
+                    inherited_owners = self._active_owner_ids(source_item)
+                    current_owner = str(source_item.get("owner_id") or "")[:200]
+                    if source_item.get("state") in _ACTIVE and current_owner:
+                        if current_owner not in inherited_owners:
+                            inherited_owners.append(current_owner)
+                        source_item["active_owner_ids"] = inherited_owners
                     source_item["session_id"] = child
                     source_item.pop("thread_id", None)
                     source_item["session_name"] = child_name

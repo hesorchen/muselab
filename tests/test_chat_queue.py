@@ -1307,6 +1307,47 @@ async def test_drain_waits_while_background_task_pending(
 
 
 @pytest.mark.asyncio
+async def test_drain_hands_off_queue_before_background_task_settles(
+    app_module, monkeypatch,
+):
+    """A safe successor must run queued work without waiting for the task."""
+    from backend import chat
+
+    sess = _sess(app_module)
+    source_sid = sess.create_session()["id"]
+    child_sid = sess.create_session()["id"]
+    sess.enqueue_message(source_sid, "follow-up")
+    chat._sessions_with_inflight_tasks[source_sid] = {"task-1"}
+    handoffs = []
+    scheduled = []
+    starts = []
+
+    async def fake_continue_detached(session_id):
+        handoffs.append(session_id)
+        sess.migrate_queue(source_sid, child_sid)
+        return {"session_id": child_sid}
+
+    async def fake_start_turn(*args, **kwargs):
+        starts.append((args, kwargs))
+
+    monkeypatch.setattr(chat, "_continue_detached_runtime", fake_continue_detached)
+    monkeypatch.setattr(chat, "_schedule_queue_drain", scheduled.append)
+    monkeypatch.setattr(chat, "_start_turn", fake_start_turn)
+    try:
+        await chat._maybe_drain_queue(source_sid)
+    finally:
+        chat._sessions_with_inflight_tasks.pop(source_sid, None)
+
+    assert handoffs == [source_sid]
+    assert scheduled == [child_sid]
+    assert starts == []
+    assert sess.get_queue(source_sid)["items"] == []
+    assert [
+        item["text"] for item in sess.get_queue(child_sid)["items"]
+    ] == ["follow-up"]
+
+
+@pytest.mark.asyncio
 async def test_drain_pauses_missing_attachments_without_sending_text(
     app_module, monkeypatch,
 ):

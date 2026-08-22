@@ -172,6 +172,7 @@ def test_recall_hook_times_out_before_sdk_watchdog_and_fails_open(monkeypatch):
 
     _run(scenario())
     assert mc.RECALL_HOOK_TIMEOUT > mc._RECALL_DEADLINE
+    assert mc.RECALL_HOOK_TIMEOUT - mc._SEARCH_TIMEOUT >= 5.0
 
 
 def test_recall_hook_backend_error_fails_open(monkeypatch):

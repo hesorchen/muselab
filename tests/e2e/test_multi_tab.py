@@ -158,9 +158,11 @@ def test_pending_send_text_survives_hard_refresh(
     page.evaluate(
         """() => {
           const app = document.querySelector('#app')._x_dataStack[0];
+          app._confirmSessionBusy = async () => false;
           const originalFetch = window.fetch.bind(window);
           window.fetch = (url, init) => {
             if (String(url).includes('/api/chat/stream/start')) {
+              window.__streamStartBlocked = true;
               return new Promise(() => {});
             }
             return originalFetch(url, init);
@@ -173,7 +175,7 @@ def test_pending_send_text_survives_hard_refresh(
           const app = document.querySelector('#app')._x_dataStack[0];
           const store = JSON.parse(localStorage.getItem(
             'muselab_chat_drafts_v1') || '{}');
-          return app.streaming && app.input === ''
+          return window.__streamStartBlocked === true && app.input === ''
             && store.drafts?.[app.currentId]?.pending === marker;
         }""",
         arg=[marker],
@@ -984,6 +986,7 @@ def test_workspace_switch_overlaps_tree_sessions_and_transcript_without_early_ac
             savePrefs: app.savePrefs,
             persist: app._scheduleWorkspaceTreePersist,
             toast: app.toast,
+            openActivityCenter: app.openActivityCenter,
           };
           const events = {};
           const opened = [];
@@ -1024,10 +1027,14 @@ def test_workspace_switch_overlaps_tree_sessions_and_transcript_without_early_ac
             events.currentAtPreloadEnd = app.currentId;
             return sid === targetId;
           };
-          app.openTab = async sid => {
+          app.openTab = async (sid, makeCurrent = true, options = {}) => {
             events.currentBeforeOpen = app.currentId;
+            events.openOptions = {...options};
             opened.push(sid);
-            app.currentId = sid;
+            if (makeCurrent) app.currentId = sid;
+            const loading = app._ensureSessionLoaded(sid);
+            if (options.deferLoad) void loading;
+            else await loading;
           };
           app.newSession = () => { newCount += 1; };
           app._startFileEvents = () => {};
@@ -1039,6 +1046,14 @@ def test_workspace_switch_overlaps_tree_sessions_and_transcript_without_early_ac
             const started = performance.now();
             await app.switchWorkspace(targetPath);
             const elapsed = performance.now() - started;
+            events.switchEnd = performance.now();
+            events.shieldAfterSwitch = getComputedStyle(
+              document.querySelector('.workspace-switch-shield')
+            ).display !== 'none';
+            events.activityClicks = 0;
+            app.openActivityCenter = () => { events.activityClicks += 1; };
+            document.querySelector('.activity-center-btn').click();
+            await Promise.resolve();
             return {
               elapsed, events, originalCurrent, targetId,
               current: app.currentId, opened, newCount,
@@ -1060,24 +1075,23 @@ def test_workspace_switch_overlaps_tree_sessions_and_transcript_without_early_ac
             app.savePrefs = originals.savePrefs;
             app._scheduleWorkspaceTreePersist = originals.persist;
             app.toast = originals.toast;
+            app.openActivityCenter = originals.openActivityCenter;
           }
         }"""
     )
     events = result["events"]
-    tree_duration = events["treeEnd"] - events["treeStart"]
-    target_duration = events["preloadEnd"] - events["sessionsStart"]
-    concurrent_duration = max(events["treeEnd"], events["preloadEnd"]) \
-        - min(events["treeStart"], events["sessionsStart"])
     assert abs(events["treeStart"] - events["sessionsStart"]) < 75
-    assert events["preloadStart"] < events["treeEnd"]
-    # Measure the network/preload window directly.  ``elapsed`` also includes
-    # synchronous Alpine surface teardown/capture before either mocked request
-    # starts, which grows under a CPU-starved browser and is unrelated to
-    # whether these two I/O chains overlap.
-    assert concurrent_duration < tree_duration + target_duration - 80
-    assert events["currentAtPreloadStart"] == result["originalCurrent"]
-    assert events["currentAtPreloadEnd"] == result["originalCurrent"]
+    # Tree bootstrap and transcript loading continue behind pane-local state.
+    # Neither may extend the global shield/composer-disabled transition.
+    if "treeEnd" in events:
+        assert events["switchEnd"] < events["treeEnd"]
+    if "preloadEnd" in events:
+        assert events["switchEnd"] < events["preloadEnd"]
+    assert events["currentAtPreloadStart"] == result["targetId"]
     assert events["shieldDuringPreload"] is True
+    assert events["shieldAfterSwitch"] is False
+    assert events["activityClicks"] == 1
+    assert events["openOptions"]["deferLoad"] is True
     assert events["currentBeforeOpen"] == result["originalCurrent"]
     assert events["preloadedSid"] == result["targetId"]
     assert result["stalePresent"] is False

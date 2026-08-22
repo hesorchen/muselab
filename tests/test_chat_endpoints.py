@@ -7,6 +7,7 @@ fan-out, response shape) runs for real without spawning a CLI.
 import asyncio
 import json
 import os
+from pathlib import Path
 import threading
 from types import SimpleNamespace
 
@@ -121,12 +122,17 @@ def test_session_rename_updates_activity_ledger(chat_mod, client, monkeypatch):
     assert created.status_code == 200, created.text
     sid = created.json()["id"]
     calls = []
+    perf_events = []
 
     def rename_activity(target_sid, name):
         calls.append((target_sid, name))
 
     monkeypatch.setattr(activity_module.activity, "rename_session", rename_activity)
     monkeypatch.setattr(chat_mod, "sdk_rename_session", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        chat_mod, "_perf_event",
+        lambda event, **fields: perf_events.append((event, fields)),
+    )
 
     response = client.patch(
         f"/api/chat/sessions/{sid}",
@@ -137,6 +143,19 @@ def test_session_rename_updates_activity_ledger(chat_mod, client, monkeypatch):
     assert response.status_code == 200, response.text
     assert chat_mod.sess.get_session(sid)["name"] == "After rename"
     assert calls == [(sid, "After rename")]
+    assert len(perf_events) == 1
+    event, fields = perf_events[0]
+    assert event == "session.rename"
+    assert fields["session"] == sid[:8]
+    assert fields["status"] == "ok"
+    for key in (
+        "lock_wait_ms", "local_index_ms", "sdk_rename_ms", "activity_ms",
+        "total_ms",
+    ):
+        assert isinstance(fields[key], int)
+        assert fields[key] >= 0
+    assert "Before rename" not in repr(perf_events)
+    assert "After rename" not in repr(perf_events)
 
 
 def test_session_effort_and_fast_patch_persist_and_rebuild(
@@ -784,7 +803,7 @@ async def test_session_runtime_cleanup_invalidates_continuation_owner(chat_mod):
 
 
 @pytest.mark.asyncio
-async def test_async_purge_keeps_runtime_mutation_on_event_loop(
+async def test_async_purge_does_not_treat_background_watcher_as_activity(
         chat_mod, monkeypatch):
     from backend import activity as activity_module
 
@@ -814,12 +833,13 @@ async def test_async_purge_keeps_runtime_mutation_on_event_loop(
         lambda activity_sid, status, *, activity_source="", owner_id="", mark_read=None:
             activity_finishes.append((activity_sid, status, activity_source)),
     )
-    chat_mod._background_activity_finishes[sid] = (
-        "completed", "background-owner")
+    watcher = asyncio.create_task(asyncio.sleep(0))
+    await watcher
+    chat_mod._task_watchers[sid] = watcher
 
     assert await chat_mod.purge_session_storage_async(sid) is True
     assert observed_threads == [loop_thread]
-    assert activity_finishes == [(sid, "cancelled", "background")]
+    assert activity_finishes == []
 
 
 @pytest.mark.asyncio
@@ -1642,6 +1662,45 @@ def test_vendor_fork_uses_vendor_session_store_and_restores_env(
     assert os.environ["CLAUDE_CONFIG_DIR"] == "original-config"
 
 
+def test_existing_native_transcript_overrides_third_party_model_store(
+    chat_mod, client, monkeypatch,
+):
+    r = client.post(
+        "/api/chat/sessions",
+        headers={"X-Auth-Token": TEST_TOKEN, "Content-Type": "application/json"},
+        json={"name": "native transcript", "model": "claude-sonnet-4-6"},
+    )
+    assert r.status_code == 200, r.text
+    sid = r.json()["id"]
+    chat_mod.sess.update_model(sid, "codex:gpt-5.6-sol")
+    native_path = (
+        Path.home() / ".claude" / "projects" / "-workspace" / f"{sid}.jsonl"
+    )
+    original_find = chat_mod._find_session_jsonl
+    monkeypatch.setattr(
+        chat_mod,
+        "_find_session_jsonl",
+        lambda requested: native_path if requested == sid else original_find(requested),
+    )
+    observed = {}
+
+    def fake_fork(*_args, **_kwargs):
+        observed["config_dir"] = os.environ.get("CLAUDE_CONFIG_DIR")
+        return SimpleNamespace(session_id="21111111-2222-4333-8444-555555555555")
+
+    monkeypatch.setattr(chat_mod, "sdk_fork_session", fake_fork)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "inherited-vendor-config")
+    response = client.post(
+        f"/api/chat/sessions/{sid}/fork",
+        headers={"X-Auth-Token": TEST_TOKEN, "Content-Type": "application/json"},
+        json={"title": "native store fork"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert observed["config_dir"] is None
+    assert os.environ["CLAUDE_CONFIG_DIR"] == "inherited-vendor-config"
+
+
 def test_fork_inherits_session_settings_and_records_lineage(
     chat_mod,
     client,
@@ -2001,6 +2060,17 @@ def test_continue_detached_forks_once_hides_source_and_migrates_queue(
     sid = source["id"]
     boundary = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
     child_sid = "11111111-2222-4333-8444-555555555555"
+    chat_mod.sess.update_model(sid, "codex:gpt-5.6-sol")
+    native_path = (
+        Path.home() / ".claude" / "projects" / "-workspace" / f"{sid}.jsonl"
+    )
+    original_find = chat_mod._find_session_jsonl
+    monkeypatch.setattr(
+        chat_mod,
+        "_find_session_jsonl",
+        lambda requested: native_path if requested == sid else original_find(requested),
+    )
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "inherited-vendor-config")
     chat_mod.sess.set_runtime_background_boundary(sid, boundary)
     chat_mod._sessions_with_inflight_tasks[sid] = {"task-a"}
     chat_mod.sess.set_runtime_task_overlay(
@@ -2011,8 +2081,10 @@ def test_continue_detached_forks_once_hides_source_and_migrates_queue(
         sid, "continue now", permission="default")
     assert queued["ok"] is True
     fork_calls = []
+    observed = {}
 
     def fake_fork(source_sid, **kwargs):
+        observed["config_dir"] = os.environ.get("CLAUDE_CONFIG_DIR")
         fork_calls.append((source_sid, kwargs))
         return SimpleNamespace(session_id=child_sid)
 
@@ -2037,6 +2109,8 @@ def test_continue_detached_forks_once_hides_source_and_migrates_queue(
     assert second.json()["reused"] is True
     assert len(fork_calls) == 1
     assert fork_calls[0][1]["up_to_message_id"] == boundary
+    assert observed["config_dir"] is None
+    assert os.environ["CLAUDE_CONFIG_DIR"] == "inherited-vendor-config"
     assert chat_mod.sess.get_session_meta(sid)["runtime_shadow"] is True
     child_meta = chat_mod.sess.get_session_meta(child_sid)
     assert child_meta["runtime_predecessor"] == sid
