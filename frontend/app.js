@@ -15445,7 +15445,10 @@ function portal() {
       if (tailWasVisible) st.messageRange.visibleEnd = st.messages.length;
       this._scheduleHistoryViewport(st, tailWasVisible ? "newer" : "older");
       this._syncNormalizedHistory(st);
-      return m;
+      // Alpine wraps array entries lazily. Return the entry read back through the
+      // reactive array, not the raw object that was pushed, so streaming text,
+      // completion metadata and optimistic rollback mutations repaint immediately.
+      return st.messages[st.messages.length - 1];
     },
     // Server/history windows are independent of the rendered DOM row count.
     // Phones use a smaller explicit page because parsing and installing 100 rich

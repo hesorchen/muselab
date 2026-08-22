@@ -2967,6 +2967,8 @@ def test_done_immediately_stamps_tool_tail_and_quietly_adopts_fork_boundary():
     assert 'hasOwnProperty.call(m, "forkUuid")' in append
     assert 'hasOwnProperty.call(m, "ts")' in append
     assert 'hasOwnProperty.call(m, "elapsed")' in append
+    assert "return st.messages[st.messages.length - 1]" in append
+    assert "return m;" not in append
 
     mark_start = app.index("const _markDone = (")
     mark_end = app.index("\n      const markUserFailed", mark_start)
