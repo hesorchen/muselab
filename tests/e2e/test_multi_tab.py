@@ -158,6 +158,7 @@ def test_pending_send_text_survives_hard_refresh(
     page.evaluate(
         """() => {
           const app = document.querySelector('#app')._x_dataStack[0];
+          app._confirmSessionBusy = async () => false;
           const originalFetch = window.fetch.bind(window);
           window.fetch = (url, init) => {
             if (String(url).includes('/api/chat/stream/start')) {
