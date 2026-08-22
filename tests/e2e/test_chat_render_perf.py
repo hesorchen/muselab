@@ -3409,7 +3409,11 @@ def test_desktop_done_reconcile_preserves_live_message_dom_identity(
         })"""
     )
     page.wait_for_function(
-        "() => document.querySelector('#app')._x_dataStack[0].streaming === false",
+        """sid => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          return app._ensureTabState(sid).streaming === false;
+        }""",
+        arg=sid,
         timeout=10000,
     )
 
