@@ -1269,7 +1269,7 @@ async def test_sync_and_async_purge_from_leaf_clear_full_runtime_lineage(
 
 
 @pytest.mark.asyncio
-async def test_force_stop_tears_down_stuck_turn(chat_mod):
+async def test_force_stop_tears_down_stuck_turn(chat_mod, monkeypatch):
     """The SDK's client.interrupt() is best-effort; for an agentic turn the CLI
     may keep running, pinning the slot in _active_turns and bouncing every
     subsequent send with 'previous turn still running'. The force-stop watchdog
@@ -1277,6 +1277,32 @@ async def test_force_stop_tears_down_stuck_turn(chat_mod):
     sid = "sid-stuck"
     c = _seed(chat_mod, (sid, "claude-sonnet-4-6", "auto", ""))
     bc = chat_mod.TurnBroadcast(session_id=sid, model="claude-sonnet-4-6")
+    bc.queue_item_id = "q-stuck"
+    bc.activity_started = True
+    activity_finishes = []
+    queue_releases = []
+    queue_pauses = []
+    memory_clears = []
+    remembered = []
+
+    async def finish_activity(got_sid, got_bc, status):
+        activity_finishes.append((got_sid, got_bc.turn_id, status))
+        got_bc.activity_started = False
+
+    monkeypatch.setattr(chat_mod, "_finish_activity", finish_activity)
+    monkeypatch.setattr(
+        chat_mod.sess, "release_queue_claim",
+        lambda got_sid, item_id, **kwargs: queue_releases.append(
+            (got_sid, item_id, kwargs.get("turn_id"), kwargs.get("pause"))) or True,
+    )
+    monkeypatch.setattr(
+        chat_mod.sess, "pause_queue_if_nonempty", queue_pauses.append)
+    monkeypatch.setattr(
+        chat_mod.mem0, "pop_recall_trace", memory_clears.append)
+    monkeypatch.setattr(
+        chat_mod, "_remember_recent_turn",
+        lambda got_sid, got_bc: remembered.append((got_sid, got_bc.turn_id)),
+    )
     chat_mod._active_turns[sid] = bc
     try:
         # Tiny grace; the (absent) pump never frees the slot, so the watchdog
@@ -1286,7 +1312,51 @@ async def test_force_stop_tears_down_stuck_turn(chat_mod):
         assert sid not in chat_mod._active_turns  # slot freed → next send works
         assert bc.cancelled is True
         assert bc.done is True                    # subscribers get the sentinel
+        assert activity_finishes == [(sid, bc.turn_id, "cancelled")]
+        assert queue_releases == [(sid, "q-stuck", bc.turn_id, True)]
+        assert queue_pauses == [sid]
+        assert memory_clears == [sid]
+        assert remembered == [(sid, bc.turn_id)]
     finally:
+        chat_mod._active_turns.pop(sid, None)
+
+
+@pytest.mark.asyncio
+async def test_force_stop_lets_cancelled_pump_own_terminal_cleanup(
+    chat_mod, monkeypatch,
+):
+    """Cancelling the real pump must not race a second manual settlement."""
+    sid = "sid-pump-cleanup"
+    _seed(chat_mod, (sid, "claude-sonnet-4-6", "auto", ""))
+    bc = chat_mod.TurnBroadcast(session_id=sid, model="claude-sonnet-4-6")
+    manual_finishes = []
+    monkeypatch.setattr(
+        chat_mod,
+        "_finish_activity",
+        lambda *args, **kwargs: manual_finishes.append((args, kwargs)),
+    )
+
+    async def pump():
+        try:
+            await asyncio.Event().wait()
+        finally:
+            bc.finish()
+            chat_mod._active_turns.pop(sid, None)
+
+    task = asyncio.create_task(pump())
+    bc.task = task
+    chat_mod._active_turns[sid] = bc
+    await asyncio.sleep(0)
+    try:
+        await chat_mod._force_stop_after_grace(sid, bc, grace=0.01)
+        assert task.done()
+        assert bc.done is True
+        assert sid not in chat_mod._active_turns
+        assert manual_finishes == []
+    finally:
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
         chat_mod._active_turns.pop(sid, None)
 
 

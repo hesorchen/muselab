@@ -199,6 +199,36 @@ async def test_queue_drain_replays_one_wakeup_coalesced_during_rollover(
     assert sid not in chat_mod._queue_drain_rekicks
 
 
+@pytest.mark.asyncio
+async def test_queue_rollover_conflict_retains_delayed_retry(
+        app_module, monkeypatch):
+    """A transient background-owner 409 must not strand queued work forever."""
+    from fastapi import HTTPException
+    from backend import chat as chat_mod
+
+    sid = "queue-rollover-retry"
+    retried = []
+    chat_mod._sessions_with_inflight_tasks[sid] = {"task-1"}
+    monkeypatch.setattr(
+        chat_mod.sess, "get_queue",
+        lambda got_sid: {"items": [{"id": "q-1"}], "inflight": None}
+        if got_sid == sid else {"items": [], "inflight": None},
+    )
+
+    async def deferred(_sid):
+        raise HTTPException(status_code=409, detail="handoff in progress")
+
+    monkeypatch.setattr(chat_mod, "_continue_detached_runtime", deferred)
+    monkeypatch.setattr(
+        chat_mod, "_schedule_queue_drain_retry", retried.append)
+    try:
+        await chat_mod._maybe_drain_queue(sid)
+    finally:
+        chat_mod._sessions_with_inflight_tasks.pop(sid, None)
+
+    assert retried == [sid]
+
+
 def test_stream_happy_path_text_tooluse_result_done(stream_env, client, monkeypatch):
     """Happy path: assistant text → tool_use → tool_result → done. Assert
     every key frame flows through with the expected shape."""
@@ -390,6 +420,51 @@ def test_tool_only_turn_persists_completion_annotation(
     chat_mod._complete_turn_footer_metadata(
         shaped, "claude-sonnet-4-6", has_later=False)
     assert shaped[-1]["memoryRecall"] == persisted_recall
+
+
+def test_result_race_preserves_turn_owned_cancelled_state(
+        stream_env, client, monkeypatch):
+    """Stop marked on the exact broadcast wins before pending bookkeeping."""
+    chat_mod = stream_env
+    sid = _make_session(client)
+    tool_message = AssistantMessage(
+        content=[ToolUseBlock(
+            id="tu_cancel_race", name="Read",
+            input={"file_path": "/tmp/cancel-race.txt"},
+        )],
+        model="claude-sonnet-4-6", usage={},
+        uuid="assistant-cancel-race",
+    )
+    result = ResultMessage(
+        subtype="success", duration_ms=900, duration_api_ms=800,
+        is_error=False, num_turns=1, session_id=sid,
+        total_cost_usd=0.0, usage={},
+    )
+
+    class CancellingClient(_FakeStreamClient):
+        async def receive_response(self):
+            yield tool_message
+            chat_mod._active_turns[sid].cancelled = True
+            assert sid not in chat_mod._pending_interrupts
+            yield result
+
+    async def fake_get_client(*_args, **_kwargs):
+        return CancellingClient([])
+
+    monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
+    response = client.get(
+        f"/api/chat/stream?token={TEST_TOKEN}&session_id={sid}"
+        "&prompt=inspect&model=claude-sonnet-4-6",
+    )
+    assert response.status_code == 200, response.text
+    done = next(
+        json.loads(data)
+        for event, data in _parse_sse(response.text)
+        if event == "done"
+    )
+
+    assert done["cancelled"] is True
+    assert done["is_error"] is False
 
 
 def test_forced_interrupt_persists_refreshable_footer_and_private_snapshot(

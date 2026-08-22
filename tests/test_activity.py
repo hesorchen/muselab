@@ -16,6 +16,16 @@ def _service(tmp_path, monkeypatch):
         "_metadata",
         lambda sid: (f"Session {sid}", workspace, "ws"),
     )
+    from backend import activity as activity_module
+    monkeypatch.setattr(
+        activity_module.sessions,
+        "list_sessions",
+        lambda: [
+            {"id": row.get("session_id")}
+            for row in service._events
+            if row.get("session_id")
+        ],
+    )
     return service
 
 
@@ -839,6 +849,34 @@ async def test_subscriber_receives_task_transition_without_polling(
     assert payload["summary"]["running"] == 1
     assert payload["summary"]["revision"] == 1
     assert payload["summary"]["generation"] == payload["generation"]
+
+
+@pytest.mark.asyncio
+async def test_sse_summary_excludes_unopenable_unread_rows(
+    tmp_path,
+    monkeypatch,
+):
+    service = _service(tmp_path, monkeypatch)
+    from backend import activity as activity_module
+
+    live_ids = {"deleted", "running"}
+    monkeypatch.setattr(
+        activity_module.sessions,
+        "list_sessions",
+        lambda: [{"id": sid} for sid in sorted(live_ids)],
+    )
+    service.start("deleted", summary="old completed task")
+    service.finish("deleted", "completed")
+    live_ids.remove("deleted")
+
+    async with service.subscribe() as queue:
+        await asyncio.to_thread(
+            service.start, "running", summary="current running task")
+        payload = await asyncio.wait_for(queue.get(), timeout=1)
+
+    assert payload["summary"]["running"] == 1
+    assert payload["summary"]["unread"] == 0
+    assert payload["summary"] == service.summary(filter_live=True)
 
 
 @pytest.mark.asyncio

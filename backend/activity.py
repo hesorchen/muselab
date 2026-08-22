@@ -452,7 +452,12 @@ class ActivityService:
         loops and delivery crosses the boundary via ``call_soon_threadsafe``.
         """
         self._revision += 1
-        summary = _summarize([dict(x) for x in self._events])
+        # SSE and HTTP must summarize the same visible ledger. Keeping deleted
+        # sessions in the durable audit trail is fine, but letting their unread
+        # terminal rows leak only through SSE resurrects a green completion dot
+        # while every openable Activity row is still running.
+        visible_events = self._filter_live([dict(x) for x in self._events])
+        summary = _summarize(visible_events)
         summary["generation"] = self._generation
         summary["revision"] = self._revision
         payload: dict[str, Any] = {

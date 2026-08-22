@@ -777,7 +777,7 @@ def test_workspace_switch_moves_files_preview_and_conversation_together():
     assert "const surfaceReady = Promise.resolve(" in switch
     assert "this._changeWorkspaceSurface(path)" in switch
     assert "await this._pullWorkspaceSessions(path)" in switch
-    assert "await this._ensureSessionLoaded(target.id)" in switch
+    assert "await this._ensureSessionLoaded(target.id)" not in switch
     assert "await Promise.all([surfaceReady, targetReady])" in switch
     assert "_pullAllSessions()" not in switch
     target_ready = switch[switch.index("const targetReady"):switch.index(
@@ -785,7 +785,13 @@ def test_workspace_switch_moves_files_preview_and_conversation_together():
     assert "this.currentId =" not in target_ready
     assert "this.openTab(" not in target_ready
     assert switch.index("await Promise.all([surfaceReady, targetReady])") < switch.index(
-        "await this.openTab(target.id)")
+        "await this.openTab(target.id, true, { deferLoad: true })")
+    open_start = app.index("async openTab(id, makeCurrent = true, options = {})")
+    open_end = app.index("// Open a session id arriving", open_start)
+    open_tab = app[open_start:open_end]
+    assert "const switching = this.switchSession()" in open_tab
+    assert "if (options.deferLoad)" in open_tab
+    assert "void switching.catch(() => false)" in open_tab
     assert "workspaceSurfaceTransition: false" in app
     assert "const switchSeq = ++this._workspaceSwitchSeq" in switch
     assert "this.workspaceSurfaceTransition = true" in switch
@@ -2624,9 +2630,15 @@ def test_active_stream_owns_messages_and_continuation_reconciles_canonical_histo
 
     assert "if (st.streaming || st.es) return false" in load
     assert "this.tabState[sid] !== st || st.streaming || st.es" in load
-    reveal_start = app.index("async _revealMessagesChunked(sid, st, visible)")
+    reveal_start = app.index("async _revealMessagesChunked(sid, st, visible, tailFirst = true)")
     reveal = app[reveal_start:app.index("async _fillDeferredHead", reveal_start)]
     assert "this.tabState[sid] !== st || st.streaming || st.es" in reveal
+    assert "const CH = this._isMobileLayout() ? 1 : 2" in reveal
+    assert "let cursor = finalEnd" in reveal
+    assert "st.messageRange.visibleStart = nextStart" in reveal
+    assert "if (!st.messagesReady) st.messagesReady = true" in reveal
+    assert "this._scrollChatTailNow(sid, st)" in reveal
+    assert "requestAnimationFrame(() => r())" in reveal
     assert "const ownsCurBubble = () =>" in send
     assert "this._containsPaneMessage(streamState, curBubble)" in send
     contains_start = app.index("_containsPaneMessage(st, message)")
@@ -2661,8 +2673,14 @@ def test_active_stream_owns_messages_and_continuation_reconciles_canonical_histo
     transport_finished_start = send.index("if (!d.active)", no_active_end)
     transport_finished_end = send.index(
         "if (d.background && d.attachable === false)", transport_finished_start)
-    assert "this._reloadSessionCoalesced(streamSid, { quiet: true })" in send[
-        transport_finished_start:transport_finished_end]
+    transport_finished = send[transport_finished_start:transport_finished_end]
+    assert "this._reloadSessionCoalesced(streamSid, { quiet: true })" in transport_finished
+    assert "this._drainPendingQueue(" in transport_finished
+    assert "streamState.activeTurnId || \"\"" in transport_finished
+    health_start = app.index("async _runStreamHealthSync(sid, st, options = {})")
+    health_end = app.index("_scheduleCanonicalStreamReload(", health_start)
+    health = app[health_start:health_end]
+    assert "this._drainPendingQueue(" in health
 
 
 def test_fork_banner_and_message_template_are_null_and_key_safe():
@@ -2697,7 +2715,8 @@ def test_quiet_history_reload_restores_visible_block_anchor_not_absolute_scroll(
     assert "this._captureViewportMessageAnchor(quietScrollEl, sid)" in load
     assert "quietScrollEl && !st.atBottom" in load
     assert "st.messages.length" in load
-    assert "!st.atBottom ? this._historyReconcileWindowSize() : 0" in load
+    assert "Math.max(historyPage, st.messages.length)" in load
+    assert "_historyReconcileWindowSize()" not in load
     assert "this._restoreMessageAnchor(" in load
     assert "if (!restored) quietScrollEl.scrollTop = quietScrollTop" in load
     assert 'pane.querySelectorAll(".msg[data-message-key]")' in anchors
@@ -3307,14 +3326,15 @@ def test_long_chat_state_keeps_complete_normalized_history_and_generation_safety
     assert "_activated: false" in blank
     for removed in ("_earlierMessages", "_laterMessages", "_allPaneMessages"):
         assert removed not in app
-    assert "_historyWindowSize() { return 300; }" in app
+    assert "_historyWindowSize() { return this._isMobileLayout() ? 20 : 100; }" in app
     assert "_historyReconcileWindowSize() { return 800; }" in app
-    assert "_historyWindowSize() { return this._isMobileLayout()" not in app
     assert "_historyReconcileWindowSize() { return this._isMobileLayout()" not in app
     assert "_MAX_RESIDENT_PANES" not in app
     assert "residentPaneIds" not in app
     assert "_promoteResident" not in app
-    assert "const _baseInitialLoad = _coldEarly ? 30 : 60;" in app
+    assert 'const qs = full ? "?full=1" : "?tail=" + requestedTail' in app
+    assert "Math.max(historyPage, st.messages.length)" in app
+    assert "const _baseInitialLoad" not in app
     assert "const _mobileEarly" not in app
     assert "_coldEarly ? 8 : 15" not in app
     assert "if (cst && cst.streaming) continue" not in app
