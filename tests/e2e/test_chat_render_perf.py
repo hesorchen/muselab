@@ -3433,7 +3433,7 @@ def test_desktop_done_reconcile_preserves_live_message_dom_identity(
             frames.push({
               ready: st.messagesReady,
               loading: st.messagesLoading,
-              visible: !!pane && pane.textContent.includes(text),
+              visible: !!pane && pane.textContent.includes(text.trim()),
               count: pane ? pane.querySelectorAll(".msg").length : 0,
             });
             if (!st._reconcilePromise && i >= 2) break;
