@@ -737,7 +737,7 @@ def test_sessions_first_page_does_not_wait_for_workspace_jsonl_scan(
 
     def blocked_scan(**_kwargs):
         scan_started.set()
-        release_scan.wait(2)
+        release_scan.wait(60)
         return [_sdk_session_info(local["id"], title="transcript title")]
 
     monkeypatch.setattr(sess, "sdk_list_sessions", blocked_scan)
@@ -745,7 +745,10 @@ def test_sessions_first_page_does_not_wait_for_workspace_jsonl_scan(
         with ThreadPoolExecutor(max_workers=1) as pool:
             future = pool.submit(
                 client.get, "/api/chat/sessions", headers=auth)
-            response = future.result(timeout=1)
+            # Shared CI runners can pause TestClient scheduling for many seconds.
+            # Keep the scan blocked beyond this deadline so the assertion tests
+            # dependency on the scan rather than runner wall-clock latency.
+            response = future.result(timeout=30)
         assert response.status_code == 200
         initial_etag = response.headers["etag"]
         listed = {row["id"]: row for row in response.json()["sessions"]}
