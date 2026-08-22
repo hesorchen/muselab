@@ -1884,14 +1884,24 @@
             </div>
           </template>
 
-          <!-- History pagination is transport-only. Older canonical windows are
-               filled and revealed automatically; surface only a transient retry
-               state when the local read fails, never a manual load control. -->
+          <!-- Long histories are count-paged explicitly. The browser receives and
+               mounts only the newest 100 canonical blocks until the reader asks
+               for the preceding page; reaching the top never starts background
+               history work. -->
+          <div x-show="hasMoreHistory()" class="load-earlier-wrap">
+            <button type="button"
+                    class="load-earlier-btn"
+                    @click="loadEarlierMessages()"
+                    :disabled="activeSession._loadingEarlier"
+                    x-text="activeSession._loadingEarlier
+                      ? t('history.load_earlier_loading')
+                      : t('history.load_earlier', { n: earlierMessageCount() })"></button>
+          </div>
           <div x-show="activeSession._historyHydrationError"
                class="load-earlier-wrap load-earlier-status"
                role="status"
                aria-live="polite"
-               x-text="lang==='zh' ? '正在重试补齐会话历史…' : 'Retrying conversation history…'"></div>
+               x-text="lang==='zh' ? '更早的会话历史加载失败，请重试' : 'Earlier history failed to load; retry'"></div>
           <!-- Per-message rendering — Alpine 3's reactivity worked
                reliably on this flat messages x-for. The "group into
                assistant turns" experiment broke streaming reactivity
@@ -2827,10 +2837,9 @@
                    exactly the right place (the tail of every turn) and already
                    carried the one fact worth anchoring to (the time), so it
                    becomes the boundary rather than adding a second element.
-                   The streaming dots moved OUT of here to .turn-running-bar:
-                   they were only visible when you happened to be scrolled to
-                   the bottom, and keeping both would pulse two sets of dots
-                   ~20px apart. -->
+                   It is also the single source of live turn status: restrained
+                   dots appear beside "Running" here, avoiding a duplicate
+                   sticky status row at the bottom of the viewport. -->
               <div class="turn-footer"
                    x-show="(m.role !== 'user' || m.turn_status || m._interrupted || m._failed)
                      && (i === paneMsgs.length - 1
@@ -2853,6 +2862,9 @@
                         'background-pending': turnHasPendingBackground(
                           m, pane, i === paneMsgs.length - 1)
                       }]">
+                  <span class="turn-running-dots"
+                        x-show="turnFooterStatus(m, pane) === 'running'"
+                        aria-hidden="true"><span></span><span></span><span></span></span>
                   <span x-text="turnHasPendingBackground(
                                   m, pane, i === paneMsgs.length - 1)
                                 ? t('chat.main_response_completed')
@@ -2901,87 +2913,44 @@
               </div>
             </div>
           </template>
-          <!-- Running indicator, pinned to the bottom of the SCROLL VIEWPORT
-               rather than trailing the last message. An agentic turn can run
-               for dozens of blocks, and the only two "still working" cues used
-               to be (a) the pulsing avatar, which sits on the turn's FIRST
-               message and is long scrolled off-screen, and (b) the dots in the
-               turn-footer under the very last message, which you only see if
-               you happen to be scrolled to the bottom. Anywhere else in a long
-               turn the chat is an undifferentiated wall of tool cards with no
-               state and no time (2026-07-25 report). Sticky keeps the answer
-               on screen at every scroll position; it's inside the pane so each
-               resident tab carries its own. -->
-          <!-- Suppressed while the "Muse 正在思考…" pending bubble is up: that
-               bubble already carries dots + model + elapsed, and the sticky bar
-               parks itself ~20px under it, so the user sees the SAME three
-               facts twice (2026-07-25 screenshot: "运行中 · 9m27s · Opus 5" over
-               "Muse 正在思考… · Opus 5 · 9m27s"). The pending bubble's own
-               condition is "no muse-side msg yet" — mirror it inverted here so
-               exactly one of the two is ever visible. -->
-          <div class="turn-running-bar"
-               x-show="pane && pane.streaming
-                       && !(pane._continuationAwaitingReaction)
-                       && paneMsgs.length
-                       && paneMsgs[paneMsgs.length - 1].role !== 'user'"
-               x-cloak>
-            <span class="thinking-dots"><span></span><span></span><span></span></span>
-            <span class="turn-running-label"
-                  x-text="(lang==='zh' ? '运行中' : 'Running')
-                          + (pane && pane.streamElapsed >= 1
-                              ? ' · ' + fmtStreamElapsed((pane && pane.streamElapsed) || 0) : '')
-                          + (pane && pane.streamingModel
-                              ? ' · ' + modelLabel(pane.streamingModel) : '')"></span>
-          </div>
           </div>
           </template>
-          <!-- /P1 per-tab message panes. Siblings below (pending bubble,
+          <!-- /P1 per-tab message panes. Siblings below (pre-response status,
                pending queue, banners) stay single-instance with active-tab
                semantics through the activeSession façade above. -->
-          <!-- Pending "Muse 正在思考" bubble — only while we're waiting for
-               the very first chunk. Once a streaming assistant message has
-               started accumulating text (its bubble is already rendered
-               above via the x-for), this pending placeholder must hide or
-               we get two stacked bubbles with overlapping model labels. -->
-          <!-- Pending bubble: shown only when streaming AND there's no
-               assistant-side msg yet (i.e. last msg is the user's
-               input, or the message list is empty). Simpler than the
-               old "role NOT in [assistant, tool_use, tool_result,
-               thinking]" exclusion list — that list missed ask_user_
-               question / permission_request / system_note, leaving
-               the pending bubble's avatar duplicated next to those
-               msgs' own avatars. Now: any non-user last msg already
-               has its own avatar — suppress pending. -->
-          <!-- ...and NOT while an auto-compact is running: that fires at the
-               top of the turn, when the last msg is still the user's, so both
-               placeholders would qualify and stack. The 📦 one is strictly
-               more informative, so it wins. -->
+          <!-- Before the first muse-side block exists there is no message tail
+               on which to mount the normal turn footer. Render the SAME footer
+               contract here temporarily instead of reviving a second avatar +
+               "Muse is thinking" bubble. It disappears as soon as any muse-side
+               block arrives, whereupon that block's own footer takes over. -->
+          <!-- Auto-compact has its distinct 📦 placeholder and wins this slot.
+               A continuation waiting for background settlement is deliberately
+               quiet until its reaction stream actually starts. -->
           <div x-show="activeSession.streaming && (!activeSession.messages.length
                                        || activeSession.messages[activeSession.messages.length-1].role === 'user')
-                       && !activeSession.compacting"
-               class="msg assistant">
-            <div class="msg-row">
-              <span class="msg-avatar assistant-avatar is-streaming-avatar" :title="mascotLabel()">
-                <svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg>
-              </span>
-              <div class="bubble pending">
-                <span class="thinking-dots"><span></span><span></span><span></span></span>
-                <span class="thinking-label">
-                  <span x-text="t('chat.thinking') + ' · ' + modelLabel(activeSession.streamingModel)"></span>
-                  <!-- 2026-05-23: 用统一 fmtStreamElapsed（"12s"/"2m50s"/"1h05m"），
-                       跟下方 turn-footer 一致；之前是 `12.3s` 一种格式，长 turn
-                       会变 187.4s 这种难读的大数字。-->
-                  <span x-show="activeSession.streamElapsed > 1" class="stream-elapsed"
-                        x-text="' · ' + fmtStreamElapsed(activeSession.streamElapsed)"></span>
-                </span>
-              </div>
-            </div>
+                       && !activeSession.compacting
+                       && !activeSession._continuationAwaitingReaction"
+               class="turn-footer turn-pending-footer"
+               x-cloak>
+            <span class="turn-status running">
+              <span class="turn-running-dots" aria-hidden="true"><span></span><span></span><span></span></span>
+              <span x-text="turnStatusLabel('running')"></span>
+            </span>
+            <span x-show="activeSession._streamStartedAt"
+                  class="msg-ts"
+                  x-text="fmtTurnTime(activeSession._streamStartedAt)"></span>
+            <span x-show="activeSession.streamElapsed >= 1"
+                  class="msg-elapsed"
+                  x-text="'· ' + fmtStreamElapsed(activeSession.streamElapsed)"></span>
+            <span x-show="activeSession.streamingModel"
+                  class="turn-model"
+                  :title="activeSession.streamingModel"
+                  x-text="'· ' + modelLabel(activeSession.streamingModel)"></span>
           </div>
 
-          <!-- Standalone .streaming-tail removed — its job is now done
-               by .turn-footer inside the x-for loop, which renders on
-               the tail block of each turn and shows dots while
-               streaming + HH:MM once done. -->
+          <!-- Standalone streaming rows are retired. Before the first response
+               block the temporary separator above owns status; afterwards the
+               per-turn footer inside the message loop owns it. -->
 
           <!-- Pending queue: messages the user sent while Muse was still
                replying (or while a compact was running). They auto-drain on
@@ -3103,12 +3072,10 @@
                     x-text="lang==='zh' ? '清空队列' : 'Discard'"></button>
           </div>
 
-          <!-- Compact-in-progress placeholder bubble. Mirrors the streaming
-               pending bubble above so the user sees a familiar "something is
-               working" cue at the bottom of the chat (not just the silent
-               shimmer in the top ctx-meter). Appears for the full window
-               between native-compact POST and loadSession completing — can
-               be ~20-60s on a long session. -->
+          <!-- Compact-in-progress keeps its distinct 📦 placeholder because it
+               describes conversation maintenance rather than a response turn.
+               Appears for the full window between native-compact POST and
+               loadSession completing — can be ~20-60s on a long session. -->
           <div x-show="activeSession.compacting" class="msg assistant compact-pending">
             <div class="msg-row">
               <span class="msg-avatar assistant-avatar is-streaming-avatar" :title="mascotLabel()">
@@ -3346,7 +3313,7 @@
                actually gets inlined; unsupported types are rejected with
                a clear toast instead of being hidden in the picker. -->
           <input type="file" x-ref="attachInput"
-                 multiple style="display:none" :disabled="workspaceSwitching"
+                 multiple style="display:none"
                  @change="onAttachPicked($event)" />
           <!-- No-provider gate banner: when no model is configured the
                composer below is disabled (every send would 401 + lock the
@@ -3384,7 +3351,7 @@
           <textarea x-ref="chatInput"
                     x-effect="_syncChatInputDom(input, { target: $el })"
                     rows="1"
-                    :disabled="workspaceSwitching || !availableModels.length"
+                    :disabled="!availableModels.length"
                     class="chat-input-textarea"
                     name="muselab-chat-message"
                     inputmode="text"
@@ -3418,7 +3385,6 @@
                  the running turn). -->
             <button @click="$refs.attachInput.click()"
                     class="chat-toolbar-btn"
-                    :disabled="workspaceSwitching"
                     :title="t('attach.title')">
               <svg><use href="#i-paperclip"/></svg>
             </button>

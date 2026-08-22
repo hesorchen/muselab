@@ -416,7 +416,8 @@ def test_runtime_task_overlay_owner_and_terminal_state_are_monotonic(app_module)
     )
 
 
-def test_reconcile_runtime_task_overlay_chains_repairs_forward_copies(app_module):
+def test_reconcile_runtime_task_overlay_chains_repairs_forward_copies(
+        app_module, monkeypatch):
     from backend import sessions as sess
 
     source = sess.create_session("runtime-source")["id"]
@@ -449,7 +450,17 @@ def test_reconcile_runtime_task_overlay_chains_repairs_forward_copies(app_module
         description="child launch",
     )
 
+    original_load = sess._load_sidecar
+    mutation_loads = []
+
+    def tracked_load(sid, *, use_cache=True):
+        if not use_cache:
+            mutation_loads.append(sid)
+        return original_load(sid, use_cache=use_cache)
+
+    monkeypatch.setattr(sess, "_load_sidecar", tracked_load)
     assert sess.reconcile_runtime_task_overlay_chains() == 3
+    assert sorted(mutation_loads) == sorted([child, grandchild])
     assert sess.reconcile_runtime_task_overlay_chains() == 0
 
     source_visible = sess.get_authoritative_runtime_task_overlays(source)

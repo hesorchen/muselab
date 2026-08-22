@@ -9,6 +9,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests.conftest import TEST_TOKEN
+
 
 def _scope(*, route: str | None = "/api/items/{item_id}") -> dict:
     scope = {
@@ -174,6 +176,46 @@ async def test_unmatched_error_never_logs_concrete_path(
     assert events[0]["route"] == "<unmatched>"
     assert "private" not in repr(events)
     assert "report.md" not in repr(events)
+
+
+def test_session_rename_client_perf_is_strict_and_title_free(
+    app_module, client, monkeypatch,
+):
+    events = []
+    monkeypatch.setattr(
+        app_module, "perf_event",
+        lambda event, **fields: events.append((event, fields)),
+    )
+    headers = {
+        "X-Auth-Token": TEST_TOKEN,
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "surface": "tab",
+        "status": "ok",
+        "asset_version": "1787322486",
+        "optimistic_apply_ms": 1,
+        "optimistic_paint_ms": 17,
+        "request_ms": 2400,
+        "total_ms": 2401,
+        "long_task_count": 2,
+        "longest_task_ms": 95,
+    }
+
+    response = client.post(
+        "/api/log/session-rename", headers=headers, json=payload)
+
+    assert response.status_code == 200
+    assert response.json() == {"ok": True}
+    assert events == [("client.session_rename", payload)]
+
+    invalid = client.post(
+        "/api/log/session-rename", headers=headers,
+        json={**payload, "title": "private title"},
+    )
+    assert invalid.status_code == 422
+    assert invalid.json() == {"ok": False, "error": "invalid_payload"}
+    assert "private title" not in repr(events)
 
 
 def test_event_loop_monitor_emits_only_threshold_crossing(

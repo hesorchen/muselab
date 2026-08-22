@@ -34,7 +34,7 @@ class SuccessorHooks:
     normalize_effort: Callable[[str | None], str]
     validate_permission: Callable[[str], str]
     normalize_plan_return_permission: Callable[[str, Any], str]
-    session_config_dir: Callable[[str], Any]
+    session_config_dir: Callable[..., Any]
     sdk_fork_session: Callable[..., Any]
     sdk_delete_session: Callable[..., Any]
     sdk_rename_session: Callable[..., Any]
@@ -276,7 +276,7 @@ def fork_session(
     )
 
     def _fork_explicit():
-        with hooks.session_config_dir(source_model):
+        with hooks.session_config_dir(source_model, sid=sid):
             return hooks.sdk_fork_session(
                 sid,
                 directory=str(sess.session_workspace(sid)),
@@ -402,7 +402,9 @@ def sync_runtime_successor_postlude(source_sid: str) -> dict[str, int]:
                             fresh_child.get("model") or hooks.model_default
                         ).strip()
                         try:
-                            with hooks.session_config_dir(child_model):
+                            with hooks.session_config_dir(
+                                child_model, sid=child_sid
+                            ):
                                 hooks.sdk_rename_session(
                                     child_sid,
                                     desired_name,
@@ -567,7 +569,7 @@ async def continue_detached_runtime_locked(source_sid: str) -> dict:
     def _fork_runtime():
         if sess.session_is_deleting(source_sid):
             raise ValueError("source session is being deleted")
-        with hooks.session_config_dir(source_model):
+        with hooks.session_config_dir(source_model, sid=source_sid):
             forked = hooks.sdk_fork_session(
                 source_sid,
                 directory=str(sess.session_workspace(source_sid)),

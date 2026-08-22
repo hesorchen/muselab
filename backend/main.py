@@ -1244,6 +1244,106 @@ def _safe_client_error_record(payload: object) -> dict[str, object] | None:
     return record
 
 
+@app.post("/api/log/client-perf", dependencies=[Depends(require_token)])
+async def client_performance_log(payload: dict = Body(...)) -> dict:
+    """Persist one strict, content-free browser history-load timing summary."""
+    allowed_status = {"ok", "cancelled", "error"}
+    allowed_mode = {"cold", "quiet", "prefetch"}
+    status = payload.get("status")
+    mode = payload.get("mode")
+    if status not in allowed_status or mode not in allowed_mode:
+        return JSONResponse(
+            {"ok": False, "error": "invalid_payload"}, status_code=422)
+
+    def bounded_int(name: str) -> int:
+        value = payload.get(name)
+        if isinstance(value, bool) or not isinstance(value, int):
+            return 0
+        return min(100_000_000, max(0, value))
+
+    allowed_fields = {
+        "status", "mode", "foreground", "total_ms", "fetch_ms", "parse_ms",
+        "shape_ms", "markdown_ms", "install_ms", "response_bytes",
+        "block_count", "assistant_blocks", "long_task_count", "longest_task_ms",
+    }
+    if any(name not in allowed_fields for name in payload):
+        return JSONResponse(
+            {"ok": False, "error": "invalid_payload"}, status_code=422)
+    try:
+        perf_event(
+            "client.history_load",
+            status=status,
+            mode=mode,
+            foreground=bool(payload.get("foreground")),
+            total_ms=bounded_int("total_ms"),
+            fetch_ms=bounded_int("fetch_ms"),
+            parse_ms=bounded_int("parse_ms"),
+            shape_ms=bounded_int("shape_ms"),
+            markdown_ms=bounded_int("markdown_ms"),
+            install_ms=bounded_int("install_ms"),
+            response_bytes=bounded_int("response_bytes"),
+            block_count=bounded_int("block_count"),
+            assistant_blocks=bounded_int("assistant_blocks"),
+            long_task_count=bounded_int("long_task_count"),
+            longest_task_ms=bounded_int("longest_task_ms"),
+        )
+    except Exception:
+        # Diagnostics must never turn a successful history load into an error.
+        pass
+    return {"ok": True}
+
+
+@app.post("/api/log/session-rename", dependencies=[Depends(require_token)])
+async def client_session_rename_log(payload: dict = Body(...)) -> dict:
+    """Persist one strict, title-free browser session-rename timing summary."""
+    allowed_fields = {
+        "surface", "status", "asset_version", "optimistic_apply_ms",
+        "optimistic_paint_ms", "request_ms", "total_ms",
+        "long_task_count", "longest_task_ms",
+    }
+    if any(name not in allowed_fields for name in payload):
+        return JSONResponse(
+            {"ok": False, "error": "invalid_payload"}, status_code=422)
+    surface = payload.get("surface")
+    status = payload.get("status")
+    asset_version = payload.get("asset_version")
+    if surface not in {"tab", "picker", "modal"}:
+        return JSONResponse(
+            {"ok": False, "error": "invalid_payload"}, status_code=422)
+    if status not in {"ok", "error", "rollback"}:
+        return JSONResponse(
+            {"ok": False, "error": "invalid_payload"}, status_code=422)
+    if (not isinstance(asset_version, str)
+            or len(asset_version) > 32
+            or not re.fullmatch(r"[A-Za-z0-9._-]*", asset_version)):
+        return JSONResponse(
+            {"ok": False, "error": "invalid_payload"}, status_code=422)
+
+    def bounded_int(name: str) -> int:
+        value = payload.get(name)
+        if isinstance(value, bool) or not isinstance(value, int):
+            return 0
+        return min(100_000_000, max(0, value))
+
+    try:
+        perf_event(
+            "client.session_rename",
+            surface=surface,
+            status=status,
+            asset_version=asset_version,
+            optimistic_apply_ms=bounded_int("optimistic_apply_ms"),
+            optimistic_paint_ms=bounded_int("optimistic_paint_ms"),
+            request_ms=bounded_int("request_ms"),
+            total_ms=bounded_int("total_ms"),
+            long_task_count=bounded_int("long_task_count"),
+            longest_task_ms=bounded_int("longest_task_ms"),
+        )
+    except Exception:
+        # Diagnostics must never affect the rename interaction.
+        pass
+    return {"ok": True}
+
+
 @app.post("/api/log/client-error")
 async def client_error_log(request: Request) -> dict:
     """Capture browser-side JS errors that the user can't easily extract

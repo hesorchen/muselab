@@ -16,7 +16,7 @@ STATUS="${MUSELAB_RESTART_STATUS:-/tmp/muselab-safe-restart.status}"
 STARTUP_LOG="${MUSELAB_RESTART_STARTUP_LOG:-$REPO/muselab.log}"
 WATCHDOG_LOG="${MUSELAB_RESTART_WATCHDOG_LOG:-/tmp/muselab-safe-restart.watchdog.log}"
 HEALTH_TIMEOUT="${MUSELAB_RESTART_HEALTH_TIMEOUT:-90}"
-STOP_TIMEOUT="${MUSELAB_RESTART_STOP_TIMEOUT:-30}"
+STOP_TIMEOUT="${MUSELAB_RESTART_STOP_TIMEOUT:-15}"
 POLL_INTERVAL="${MUSELAB_RESTART_POLL_INTERVAL:-1}"
 DETACH_DELAY="${MUSELAB_RESTART_DETACH_DELAY:-2}"
 
@@ -224,11 +224,24 @@ start_screen_service() {
 stop_service() {
   local session="$1" port="$2" expected_pid="${3:-}" pid=""
   "$SCREEN_BIN" -S "$session" -X quit >/dev/null 2>&1 || true
-  wait_for_port_free "$port" && return 0
+
+  # `screen -X quit` removes the terminal session but does not reliably signal
+  # the exec'd listener. Waiting a full stop timeout before the first SIGTERM
+  # added 30 seconds to both preflight cleanup and production switchover. Verify
+  # that the port still belongs to the PID captured by this restart, then begin
+  # the bounded graceful shutdown immediately.
   pid="$(listener_pid "$port" 2>/dev/null || true)"
+  [[ -n "$pid" ]] || return 0
   [[ -n "$expected_pid" && "$pid" == "$expected_pid" ]] || return 1
   kill -TERM "$pid" 2>/dev/null || true
   wait_for_port_free "$port" && return 0
+
+  # Uvicorn has its own 3-second connection drain and MuseLab bounds subsystem
+  # cleanup. If either wedges beyond STOP_TIMEOUT, preserve the existing hard
+  # stop fallback rather than allowing a restart to hang indefinitely.
+  pid="$(listener_pid "$port" 2>/dev/null || true)"
+  [[ -n "$pid" ]] || return 0
+  [[ -n "$expected_pid" && "$pid" == "$expected_pid" ]] || return 1
   kill -KILL "$pid" 2>/dev/null || true
   wait_for_port_free "$port"
 }

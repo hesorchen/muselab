@@ -1008,10 +1008,10 @@ def _heal_cancelled_snapshot_from_canonical(
             f"[chat] late cancelled footer heal failed sid={sid[:8]} "
             f"exc={type(exc).__name__}\n")
         return False
-    if terminal_status == "failed":
+    if terminal_status == "failed" or snapshot.get("result_recovery") is True:
         # Keep replacing the whole canonical turn with the display snapshot.
-        # Otherwise a partial AssistantMessage causes the healer to delete the
-        # only durable copy of the terminal error row on the first quiet reload.
+        # Otherwise a partial AssistantMessage (including a final tool call with
+        # no prose) causes the healer to delete the only durable terminal row.
         return False
 
     # Exact path comes from the already-validated canonical sid/turn snapshot
@@ -1258,6 +1258,146 @@ def _persist_cancelled_turn_snapshot_locked(bc: "TurnBroadcast") -> bool:
             f"exc={type(exc).__name__}\n")
         sys.stderr.flush()
     return True
+
+
+def _persist_completed_result_snapshot(
+    bc: "TurnBroadcast",
+    result_text: str,
+    *,
+    terminal_at_ms: int,
+    elapsed_s: float | None = None,
+    memory_recall: dict | None = None,
+) -> bool:
+    """Persist final prose supplied only by a successful ResultMessage.
+
+    A few third-party runtimes can finish after a tool call without emitting a
+    final AssistantMessage, while still putting the user-facing answer in
+    ResultMessage.result. That value is authoritative for presentation but is
+    absent from canonical JSONL, so retain the complete live turn in the private
+    display snapshot channel. It is never fed back into model context.
+    """
+    _hooks = _require_hooks()
+    visible_result = str(result_text or "").strip()
+    if not visible_result:
+        return False
+    with bc.cancelled_snapshot_lock:
+        if bc.result_snapshot_persisted:
+            return True
+        if bc.cancelled_snapshot_suppressed or bc.cancelled:
+            return False
+        path = _cancelled_turn_snapshot_path(bc.session_id, bc.turn_id)
+        if path is None:
+            return False
+
+        messages = _hooks.broadcast_to_ui_messages(bc)
+        last_assistant = next(
+            (message for message in reversed(messages)
+             if message.get("role") == "assistant"),
+            None,
+        )
+        if (not last_assistant
+                or str(last_assistant.get("text") or "").strip()
+                != visible_result):
+            messages.append({
+                "role": "assistant",
+                "text": visible_result,
+                "model": bc.model,
+            })
+        if not messages:
+            return False
+
+        now_ms = int(terminal_at_ms)
+        duration = (
+            max(0.0, float(elapsed_s))
+            if elapsed_s is not None
+            else max(0.0, now_ms / 1000.0 - float(bc.started_at or 0))
+        )
+        duration = round(duration, 1)
+        for index, message in enumerate(messages):
+            block_id = f"snapshot:{bc.turn_id}:{index}:{message.get('role') or 'unknown'}"
+            message["block_id"] = block_id
+            message["_key"] = block_id
+            message["_terminalTurnId"] = bc.turn_id
+            message["presentation_only"] = True
+        for message in reversed(messages):
+            if message.get("role") == "user":
+                continue
+            message.setdefault("ts", now_ms)
+            if duration >= 1:
+                message.setdefault("elapsed", duration)
+            message.setdefault("model", bc.model)
+            message.setdefault("turn_status", "completed")
+            if memory_recall:
+                message.setdefault("memoryRecall", memory_recall)
+            break
+
+        boundary = dict(bc.transcript_boundary or {})
+        payload = {
+            "schema": _CANCELLED_TURN_SNAPSHOT_SCHEMA,
+            "sid": bc.session_id,
+            "turn_id": bc.turn_id,
+            "model": bc.model,
+            "terminal_status": "completed",
+            "result_recovery": True,
+            "started_at_ms": int(float(bc.started_at or 0) * 1000),
+            "terminal_at_ms": now_ms,
+            "interrupted_at_ms": now_ms,
+            "canonical_terminal_published": True,
+            "memory_recall": memory_recall,
+            "transcript_boundary": {
+                "record_count": int(boundary.get("record_count") or 0),
+                "source_dev": int(boundary.get("source_dev") or 0),
+                "source_inode": int(boundary.get("source_inode") or 0),
+            },
+            "anchors": {
+                "normal": {
+                    "uuid": boundary.get("normal_uuid") or "",
+                    "total": int(boundary.get("normal_total") or 0),
+                },
+                "full": {
+                    "uuid": boundary.get("full_uuid") or "",
+                    "total": int(boundary.get("full_total") or 0),
+                },
+            },
+            "hidden_uuids": [],
+            "messages": messages,
+        }
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with suppress(OSError):
+                path.parent.chmod(0o700)
+            atomic_write_text(
+                path,
+                json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+                mode=0o600,
+            )
+            with suppress(OSError):
+                path.chmod(0o600)
+        except Exception as exc:
+            sys.stderr.write(
+                f"[chat] result snapshot write failed sid={bc.session_id[:8]} "
+                f"exc={type(exc).__name__}\n")
+            sys.stderr.flush()
+            return False
+
+        bc.result_snapshot_persisted = True
+        try:
+            snapshots, _ = _hooks.load_cancelled_turn_snapshots(bc.session_id)
+            indexed = _hooks.ensure_transcript_index(bc.session_id)
+            index = indexed[1] if indexed is not None else None
+            total, turns = _interrupted_history_stats(index, snapshots, "normal")
+            sess.bump_session(
+                bc.session_id,
+                message_count=total,
+                turn_count=turns,
+                auto_rename_from=bc.user_text,
+            )
+        except Exception as exc:
+            sys.stderr.write(
+                f"[chat] result snapshot metadata sync failed "
+                f"sid={bc.session_id[:8]} exc={type(exc).__name__}\n")
+            sys.stderr.flush()
+        return True
 
 
 def _persist_failed_turn_snapshot(

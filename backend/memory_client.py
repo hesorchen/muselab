@@ -35,13 +35,15 @@ _legacy_recall_traces: dict[str, dict] = {}
 _LEGACY_TRACE_MAX = 256
 
 _USER_ID = "muselab"
-# Memory is optional context, never part of the message commit path.  Finish the
-# callback before the SDK's hook watchdog: an SDK-level hook timeout sets
-# preventContinuation=true and rejects the user's prompt.  The inner deadline
-# converts a slow recall into an empty additionalContext response instead.
+# Memory is optional context, never part of the message commit path. Finish the
+# callback before the SDK CLI's wall-clock hook watchdog: its timeout sets
+# preventContinuation=true and rejects the user's prompt. The inner deadline
+# converts a slow recall into empty additionalContext. The outer allowance must
+# also absorb event-loop stalls and the sibling runtime-handoff context hook;
+# a 0.5s margin proved insufficient under normal service load.
 _RECALL_DEADLINE = 3.0
 _SEARCH_TIMEOUT = _RECALL_DEADLINE
-RECALL_HOOK_TIMEOUT = _RECALL_DEADLINE + 0.5
+RECALL_HOOK_TIMEOUT = 10.0
 _STORE_TIMEOUT = 10.0
 _SEARCH_LIMIT = 5
 _MAX_MEM_CHARS = 400
