@@ -6,7 +6,6 @@ metadata + per-message annotation sidecar layer only. End-to-end transcript
 flows require a live SDK and are not unit-testable here.
 """
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 from pathlib import Path
@@ -742,18 +741,17 @@ def test_sessions_first_page_does_not_wait_for_workspace_jsonl_scan(
 
     monkeypatch.setattr(sess, "sdk_list_sessions", blocked_scan)
     try:
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            future = pool.submit(
-                client.get, "/api/chat/sessions", headers=auth)
-            # Shared CI runners can pause TestClient scheduling for many seconds.
-            # Keep the scan blocked beyond this deadline so the assertion tests
-            # dependency on the scan rather than runner wall-clock latency.
-            response = future.result(timeout=30)
-        assert response.status_code == 200
-        initial_etag = response.headers["etag"]
-        listed = {row["id"]: row for row in response.json()["sessions"]}
+        # Start the background flight outside TestClient. Starlette waits for
+        # request-owned worker activity on some runners, which makes a wall-clock
+        # assertion measure TestClient shutdown rather than this cache contract.
+        initial, _generation = sess.list_sessions_snapshot()
+        listed = {row["id"]: row for row in initial}
         assert listed[local["id"]]["name"] == "cached metadata"
         assert scan_started.wait(1)
+
+        response = client.get("/api/chat/sessions", headers=auth)
+        assert response.status_code == 200
+        initial_etag = response.headers["etag"]
     finally:
         release_scan.set()
         _wait_for_list_refresh(sess)
