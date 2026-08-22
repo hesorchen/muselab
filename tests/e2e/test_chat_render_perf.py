@@ -3363,10 +3363,11 @@ def test_desktop_done_reconcile_preserves_live_message_dom_identity(
     page.wait_for_function(
         """text => {
           const app = document.querySelector("#app")._x_dataStack[0];
-          const last = app.messages[app.messages.length - 1];
+          const st = app._ensureTabState(app.currentId);
+          const last = st.messages[st.messages.length - 1];
           const pane = Array.from(document.querySelectorAll(".msg-pane"))
             .find(el => getComputedStyle(el).display !== "none");
-          return app.streaming && last?.role === "assistant" && last.text === text
+          return st.streaming && last?.role === "assistant" && last.text === text
             && pane?.querySelector(".msg.assistant");
         }""",
         arg=final_text,
@@ -3375,7 +3376,8 @@ def test_desktop_done_reconcile_preserves_live_message_dom_identity(
     live = page.evaluate(
         """() => {
           const app = document.querySelector("#app")._x_dataStack[0];
-          const last = app.messages[app.messages.length - 1];
+          const st = app._ensureTabState(app.currentId);
+          const last = st.messages[st.messages.length - 1];
           const nodes = document.querySelectorAll(".msg-pane .msg.assistant");
           window.__doneReconcileLiveNode = nodes[nodes.length - 1];
           window.__doneReconcileLiveKey = last._k;
@@ -3425,8 +3427,8 @@ def test_desktop_done_reconcile_preserves_live_message_dom_identity(
             const pane = Array.from(document.querySelectorAll(".msg-pane"))
               .find(el => getComputedStyle(el).display !== "none");
             frames.push({
-              ready: app.messagesReady,
-              loading: app.messagesLoading,
+              ready: st.messagesReady,
+              loading: st.messagesLoading,
               visible: !!pane && pane.textContent.includes(text),
               count: pane ? pane.querySelectorAll(".msg").length : 0,
             });
@@ -3884,9 +3886,9 @@ def test_fast_completed_queued_turn_reconciles_footer_without_refresh(
     expected_status = _app_eval(
         page, "return app.lang === 'zh' ? '已完成' : 'Completed';"
     )
-    expect(footer.locator(".turn-status > span").first).to_have_text(
-        expected_status
-    )
+    expect(footer.locator(
+        ".turn-status > span:not(.turn-running-dots)"
+    )).to_have_text(expected_status)
     expect(footer.locator(".msg-ts")).to_have_text(expected_time)
     expect(footer.locator(".msg-elapsed")).to_have_text("· 4s")
     expected_model = _app_eval(

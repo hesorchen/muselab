@@ -173,7 +173,8 @@ def test_pending_send_text_survives_hard_refresh(
           const app = document.querySelector('#app')._x_dataStack[0];
           const store = JSON.parse(localStorage.getItem(
             'muselab_chat_drafts_v1') || '{}');
-          return app.streaming && app.input === ''
+          const st = app._ensureTabState(app.currentId);
+          return st.streaming && app.input === ''
             && store.drafts?.[app.currentId]?.pending === marker;
         }""",
         arg=[marker],
