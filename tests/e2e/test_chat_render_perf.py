@@ -3365,8 +3365,8 @@ def test_desktop_done_reconcile_preserves_live_message_dom_identity(
           const app = document.querySelector("#app")._x_dataStack[0];
           const st = app._ensureTabState(app.currentId);
           const last = st.messages[st.messages.length - 1];
-          const pane = Array.from(document.querySelectorAll(".msg-pane"))
-            .find(el => getComputedStyle(el).display !== "none");
+          const pane = document.querySelector(
+            `.msg-pane[data-tid="${CSS.escape(app.currentId)}"]`);
           return st.streaming && last?.role === "assistant" && last.text === text
             && pane?.querySelector(".msg.assistant");
         }""",
@@ -3428,8 +3428,8 @@ def test_desktop_done_reconcile_preserves_live_message_dom_identity(
           const frames = [];
           for (let i = 0; i < 12; i++) {
             await new Promise(resolve => requestAnimationFrame(resolve));
-            const pane = Array.from(document.querySelectorAll(".msg-pane"))
-              .find(el => getComputedStyle(el).display !== "none");
+            const pane = document.querySelector(
+              `.msg-pane[data-tid="${CSS.escape(sid)}"]`);
             frames.push({
               ready: st.messagesReady,
               loading: st.messagesLoading,
@@ -3892,6 +3892,7 @@ def test_fast_completed_queued_turn_reconciles_footer_without_refresh(
     )
     expect(footer.locator(
         ".turn-status > span:not(.turn-running-dots)"
+        ":not(.turn-background-running)"
     )).to_have_text(expected_status)
     expect(footer.locator(".msg-ts")).to_have_text(expected_time)
     expect(footer.locator(".msg-elapsed")).to_have_text("· 4s")
