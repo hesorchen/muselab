@@ -232,7 +232,7 @@ async def test_bootstrap_and_delta_perf_events_are_bounded_and_selective(
         initialized=True,
     )
 
-    async def ensure_workspace(_root):
+    async def ensure_workspace(_root, **_kwargs):
         return state
 
     async def await_baseline(_state):
@@ -541,6 +541,450 @@ async def test_idle_watcher_lru_and_stale_unsubscribe_are_bounded(
 
 
 @pytest.mark.asyncio
+async def test_subscription_reservations_bound_pending_and_attached_queues(
+    app_module,
+    temp_root,
+    monkeypatch,
+):
+    import backend.file_events as file_events
+
+    monkeypatch.setattr(file_events, "_MAX_WATCHED_ROOTS", 2)
+    monkeypatch.setattr(file_events, "_MAX_EVENT_SUBSCRIBERS", 64)
+    manager = file_events.FileWatchManager(
+        file_events.WorkspaceStore(temp_root)
+    )
+    root = temp_root.resolve()
+    ensure_gate = asyncio.Event()
+    ensure_calls = 0
+
+    async def parked():
+        await asyncio.Future()
+
+    state = file_events._WatchState(
+        root=root,
+        workspace_id="budget-root",
+        task=asyncio.create_task(parked()),
+        initialized=True,
+    )
+    manager._states[root] = state
+
+    async def ensure_workspace(_root, **_kwargs):
+        nonlocal ensure_calls
+        ensure_calls += 1
+        await ensure_gate.wait()
+        return state
+
+    monkeypatch.setattr(manager, "ensure_workspace", ensure_workspace)
+    contexts = [manager.subscribe(root) for _ in range(65)]
+    enter_tasks = [
+        asyncio.create_task(context.__aenter__())
+        for context in contexts
+    ]
+
+    for _ in range(200):
+        if (
+            manager._pending_subscribers == 64
+            and sum(task.done() for task in enter_tasks) == 1
+        ):
+            break
+        await asyncio.sleep(0)
+    assert manager._pending_subscribers == 64
+    assert sum(task.done() for task in enter_tasks) == 1
+
+    ensure_gate.set()
+    results = await asyncio.gather(
+        *enter_tasks,
+        return_exceptions=True,
+    )
+    accepted = [
+        (context, result)
+        for context, result in zip(contexts, results, strict=True)
+        if not isinstance(result, BaseException)
+    ]
+    rejected = [
+        result
+        for result in results
+        if isinstance(result, BaseException)
+    ]
+    assert len(accepted) == 64
+    assert len(rejected) == 1
+    assert isinstance(rejected[0], file_events.HTTPException)
+    assert rejected[0].status_code == 503
+    assert ensure_calls == 64
+    assert manager._pending_subscribers == 0
+    assert len(state.subscribers) == 64
+
+    for context, _queue in accepted:
+        await context.__aexit__(None, None, None)
+    assert state.subscribers == set()
+    assert manager._pending_subscribers == 0
+
+    async with manager.subscribe(root) as reused:
+        assert reused in state.subscribers
+    await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_watched_root_budget_reuses_idle_and_evicts_lru(
+    app_module,
+    temp_root,
+    monkeypatch,
+):
+    import backend.file_events as file_events
+
+    monkeypatch.setattr(file_events, "_MAX_WATCHED_ROOTS", 2)
+    monkeypatch.setattr(file_events, "_MAX_EVENT_SUBSCRIBERS", 8)
+    rejected = []
+    monkeypatch.setattr(
+        file_events,
+        "perf_event",
+        lambda event, **fields: rejected.append((event, fields)),
+    )
+    manager = file_events.FileWatchManager(
+        file_events.WorkspaceStore(temp_root)
+    )
+
+    async def parked():
+        await asyncio.Future()
+
+    async def fake_watch(_state):
+        await asyncio.Future()
+
+    monkeypatch.setattr(manager, "_watch", fake_watch)
+    roots = [
+        (temp_root / f"watched-{index}").resolve()
+        for index in range(3)
+    ]
+    active_queue = asyncio.Queue()
+    states = {
+        roots[0]: file_events._WatchState(
+            root=roots[0],
+            workspace_id="active",
+            subscribers={active_queue},
+            task=asyncio.create_task(parked()),
+            initialized=True,
+        ),
+        roots[1]: file_events._WatchState(
+            root=roots[1],
+            workspace_id="idle",
+            task=asyncio.create_task(parked()),
+            initialized=True,
+        ),
+        roots[2]: file_events._WatchState(
+            root=roots[2],
+            workspace_id="new",
+            initialized=True,
+        ),
+    }
+    manager._states.update(states)
+    manager._schedule_idle_stop_locked(states[roots[1]])
+    idle_watcher = states[roots[1]].task
+
+    async def ensure_workspace(root, **_kwargs):
+        return states[root.resolve()]
+
+    monkeypatch.setattr(manager, "ensure_workspace", ensure_workspace)
+
+    async with manager.subscribe(roots[1]) as idle_reconnect:
+        assert idle_reconnect in states[roots[1]].subscribers
+        assert states[roots[1]].task is idle_watcher
+        assert states[roots[1]].stop_task is None
+    assert list(manager._idle_watchers) == [roots[1]]
+
+    new_context = manager.subscribe(roots[2])
+    await new_context.__aenter__()
+    assert states[roots[1]].task is None
+    assert states[roots[1]].stop_task is None
+    assert states[roots[2]].task is not None
+    assert manager._watched_roots_locked() == {roots[0], roots[2]}
+
+    async with manager.subscribe(roots[0]):
+        assert manager._watched_roots_locked() == {roots[0], roots[2]}
+
+    with pytest.raises(file_events.HTTPException) as watcher_error:
+        async with manager.subscribe(roots[1]):
+            pytest.fail("all-active watcher budget admitted a new root")
+    assert watcher_error.value.status_code == 503
+    assert manager._pending_subscribers == 0
+    assert [
+        fields["reason"]
+        for event, fields in rejected
+        if event == "files.subscription_rejected"
+    ] == ["watcher_limit"]
+
+    await new_context.__aexit__(None, None, None)
+    await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_subscription_entry_owns_queue_cleanup(
+    app_module,
+    temp_root,
+    monkeypatch,
+):
+    import backend.file_events as file_events
+
+    monkeypatch.setattr(file_events, "_MAX_WATCHED_ROOTS", 2)
+    monkeypatch.setattr(file_events, "_MAX_EVENT_SUBSCRIBERS", 2)
+    manager = file_events.FileWatchManager(
+        file_events.WorkspaceStore(temp_root)
+    )
+    root = temp_root.resolve()
+
+    async def parked():
+        await asyncio.Future()
+
+    state = file_events._WatchState(
+        root=root,
+        workspace_id="cancel-entry",
+        task=asyncio.create_task(parked()),
+        initialized=True,
+    )
+    manager._states[root] = state
+    stop_running = asyncio.Event()
+    stop_cancelled = asyncio.Event()
+    stop_release = asyncio.Event()
+    stop_installed = False
+
+    async def slow_stop():
+        stop_running.set()
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            stop_cancelled.set()
+            while not stop_release.is_set():
+                try:
+                    await stop_release.wait()
+                except asyncio.CancelledError:
+                    continue
+            raise
+
+    async def ensure_workspace(_root, **_kwargs):
+        nonlocal stop_installed
+        if not stop_installed:
+            stop_installed = True
+            state.stop_task = asyncio.create_task(slow_stop())
+            manager._idle_watchers[root] = None
+            await stop_running.wait()
+        return state
+
+    monkeypatch.setattr(manager, "ensure_workspace", ensure_workspace)
+    real_unsubscribe = manager._unsubscribe
+    cleanup_started = asyncio.Event()
+    cleanup_release = asyncio.Event()
+    cleanup_cancelled = asyncio.Event()
+
+    async def slow_unsubscribe(cleanup_root, cleanup_queue):
+        cleanup_started.set()
+        try:
+            await cleanup_release.wait()
+        except asyncio.CancelledError:
+            cleanup_cancelled.set()
+            raise
+        await real_unsubscribe(cleanup_root, cleanup_queue)
+
+    monkeypatch.setattr(manager, "_unsubscribe", slow_unsubscribe)
+    context = manager.subscribe(root)
+    enter_task = asyncio.create_task(context.__aenter__())
+    await asyncio.wait_for(stop_cancelled.wait(), timeout=1)
+    assert len(state.subscribers) == 1
+
+    enter_task.cancel()
+    stop_release.set()
+    await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+    enter_task.cancel()
+    enter_task.cancel()
+    await asyncio.sleep(0)
+    assert not enter_task.done()
+    assert cleanup_cancelled.is_set() is False
+
+    cleanup_release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await enter_task
+    assert state.subscribers == set()
+    assert manager._pending_subscribers == 0
+    assert manager._pending_watched_roots == {}
+
+    async with manager.subscribe(root):
+        assert len(state.subscribers) == 1
+    assert state.subscribers == set()
+    await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_waits_for_pending_subscription_registration(
+    app_module,
+    temp_root,
+    monkeypatch,
+):
+    import backend.file_events as file_events
+
+    store = file_events.WorkspaceStore(temp_root)
+    manager = file_events.FileWatchManager(store)
+    register_started = threading.Event()
+    allow_register = threading.Event()
+    real_register = store.register_workspace
+
+    def blocked_register(*args, **kwargs):
+        register_started.set()
+        assert allow_register.wait(timeout=2)
+        return real_register(*args, **kwargs)
+
+    monkeypatch.setattr(store, "register_workspace", blocked_register)
+    context = manager.subscribe(temp_root)
+    enter_task = asyncio.create_task(context.__aenter__())
+    assert await asyncio.to_thread(register_started.wait, 1)
+
+    shutdown_task = asyncio.create_task(manager.shutdown())
+    await asyncio.sleep(0.05)
+    assert shutdown_task.done() is False
+    allow_register.set()
+
+    with pytest.raises(file_events.HTTPException) as unavailable:
+        await enter_task
+    assert unavailable.value.status_code == 503
+    await asyncio.wait_for(shutdown_task, timeout=2)
+    assert manager._states == {}
+    assert manager._subscription_setups == set()
+    assert manager._pending_subscribers == 0
+    assert manager._accepting_subscriptions is False
+
+
+@pytest.mark.asyncio
+async def test_reconcile_budget_caps_threads_without_holding_workspace_lock(
+    app_module,
+    temp_root,
+):
+    import backend.file_events as file_events
+
+    class CappedStore:
+        def __init__(self):
+            self.lock = threading.Lock()
+            self.four_entered = threading.Event()
+            self.release = threading.Semaphore(0)
+            self.calls = 0
+            self.active = 0
+            self.max_active = 0
+
+        def current_cursor(self, _workspace_id):
+            return 0
+
+        def reconcile(self, *_args, **_kwargs):
+            with self.lock:
+                self.calls += 1
+                self.active += 1
+                self.max_active = max(self.max_active, self.active)
+                if self.calls >= 4:
+                    self.four_entered.set()
+            assert self.release.acquire(timeout=3)
+            with self.lock:
+                self.active -= 1
+            return 0
+
+        def delta(self, *_args, **_kwargs):
+            return {
+                "cursor": 0,
+                "changes": [],
+                "resync": False,
+                "has_more": False,
+            }
+
+        def close(self):
+            return None
+
+    store = CappedStore()
+    manager = file_events.FileWatchManager(store)
+    states = [
+        file_events._WatchState(
+            root=temp_root / f"scan-budget-{index}",
+            workspace_id=f"scan-budget-{index}",
+            initialized=True,
+        )
+        for index in range(6)
+    ]
+    tasks = [
+        asyncio.create_task(manager._reconcile_and_broadcast(state))
+        for state in states
+    ]
+    assert await asyncio.to_thread(store.four_entered.wait, 1)
+    await asyncio.sleep(0.02)
+    assert store.calls == 4
+    assert store.max_active == 4
+
+    # Waiters do not consume their workspace mutation lock while queued behind
+    # the process-wide scan gate.
+    await asyncio.wait_for(states[4].mutation_lock.acquire(), timeout=0.2)
+    states[4].mutation_lock.release()
+    heartbeat = asyncio.Event()
+    asyncio.get_running_loop().call_soon(heartbeat.set)
+    await asyncio.wait_for(heartbeat.wait(), timeout=0.2)
+
+    tasks[5].cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await tasks[5]
+    store.release.release()
+    for _ in range(100):
+        if store.calls == 5:
+            break
+        await asyncio.sleep(0.01)
+    assert store.calls == 5
+    for _ in range(4):
+        store.release.release()
+    await asyncio.gather(*tasks[:5])
+    assert store.max_active == 4
+    assert manager._reconcile_slots._value == 4
+    await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_native_watcher_slot_waits_for_evicted_owner(
+    app_module,
+    temp_root,
+    monkeypatch,
+):
+    import backend.file_events as file_events
+
+    monkeypatch.setattr(file_events, "_MAX_WATCHED_ROOTS", 1)
+    manager = file_events.FileWatchManager(
+        file_events.WorkspaceStore(temp_root)
+    )
+    first_entered = asyncio.Event()
+    second_entered = asyncio.Event()
+
+    async def controlled_native(state):
+        if state.workspace_id == "first":
+            first_entered.set()
+        else:
+            second_entered.set()
+        await asyncio.Future()
+
+    monkeypatch.setattr(manager, "_watch_native", controlled_native)
+    first = file_events._WatchState(
+        root=(temp_root / "native-first").resolve(),
+        workspace_id="first",
+        initialized=True,
+    )
+    second = file_events._WatchState(
+        root=(temp_root / "native-second").resolve(),
+        workspace_id="second",
+        initialized=True,
+    )
+    assert manager._start_watcher_locked(first) is True
+    await asyncio.wait_for(first_entered.wait(), timeout=1)
+    assert manager._start_watcher_locked(second) is True
+    await asyncio.sleep(0.02)
+    assert second_entered.is_set() is False
+
+    first.task.cancel()
+    await asyncio.gather(first.task, return_exceptions=True)
+    await asyncio.wait_for(second_entered.wait(), timeout=1)
+    second.task.cancel()
+    await asyncio.gather(second.task, return_exceptions=True)
+    assert manager._native_watcher_slots._value == 1
+    await manager.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_watcher_restart_queues_an_armed_closing_reconcile(
     app_module,
     temp_root,
@@ -755,7 +1199,7 @@ async def test_reconcile_perf_event_splits_wait_scan_and_replay(
     assert fields["workspace"] == "workspac"
     assert fields["status"] == "ok"
     assert fields["error_type"] is None
-    assert "scan_slot_wait_ms" not in fields
+    assert fields["scan_slot_wait_ms"] >= 0
     assert fields["mutation_lock_wait_ms"] >= 10
     assert fields["scan_ms"] >= 0
     assert fields["replay_ms"] >= 0

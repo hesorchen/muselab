@@ -40,6 +40,9 @@ _WATCH_STEP_MS = 100
 _WATCH_RETRY_S = 1.5
 _RECONCILE_RETRY_BASE_S = 0.25
 _RECONCILE_RETRY_MAX_S = 30.0
+_MAX_WATCHED_ROOTS = 16
+_MAX_EVENT_SUBSCRIBERS = 64
+_MAX_CONCURRENT_RECONCILES = 4
 _WATCH_LINGER_S = 30.0
 _MAX_IDLE_WATCHERS = 3
 _RECONCILE_BACKOFF_START_S = 0.25
@@ -216,7 +219,18 @@ class FileWatchManager:
         self.store = store or WorkspaceStore(registry.primary)
         self._states: dict[Path, _WatchState] = {}
         self._idle_watchers: OrderedDict[Path, None] = OrderedDict()
+        self._pending_subscribers = 0
+        self._pending_watched_roots: dict[Path, int] = {}
+        self._subscription_generation = 0
+        self._subscription_setups: set[asyncio.Task[Any]] = set()
+        self._accepting_subscriptions = True
         self._lock = asyncio.Lock()
+        self._reconcile_slots = asyncio.Semaphore(
+            _MAX_CONCURRENT_RECONCILES,
+        )
+        self._native_watcher_slots = asyncio.Semaphore(
+            _MAX_WATCHED_ROOTS,
+        )
         # Registration/state I/O intentionally runs outside `_lock`, but an
         # ensure and remove for the same path must still be one lifecycle.
         # Otherwise a slow first registration can reinstall an orphan state
@@ -368,6 +382,7 @@ class FileWatchManager:
             if self._started:
                 return
             self._started = True
+            self._accepting_subscriptions = True
         try:
             await asyncio.to_thread(self.store.initialize)
             for entry in registry.list():
@@ -425,6 +440,7 @@ class FileWatchManager:
         self,
         root: Path,
         *,
+        expected_generation: int | None = None,
         start_watcher: bool | None = None,
         rescan: bool = False,
     ) -> _WatchState:
@@ -434,6 +450,7 @@ class FileWatchManager:
         async with lifecycle_lock:
             return await self._ensure_workspace_serialized(
                 root,
+                expected_generation=expected_generation,
                 start_watcher=start_watcher,
                 rescan=rescan,
             )
@@ -442,6 +459,7 @@ class FileWatchManager:
         self,
         root: Path,
         *,
+        expected_generation: int | None = None,
         start_watcher: bool | None = None,
         rescan: bool = False,
     ) -> _WatchState:
@@ -454,6 +472,14 @@ class FileWatchManager:
         # a state's registry metadata is current, keep that hot path entirely
         # in memory instead of opening SQLite twice per request.
         async with self._lock:
+            if (
+                expected_generation is not None
+                and (
+                    not self._accepting_subscriptions
+                    or expected_generation != self._subscription_generation
+                )
+            ):
+                self._reject_subscription_locked("manager_restarted")
             state = self._states.get(root)
             if (
                 state is not None
@@ -514,6 +540,14 @@ class FileWatchManager:
             status = await asyncio.to_thread(self.store.state, entry.id)
 
         async with self._lock:
+            if (
+                expected_generation is not None
+                and (
+                    not self._accepting_subscriptions
+                    or expected_generation != self._subscription_generation
+                )
+            ):
+                self._reject_subscription_locked("manager_restarted")
             # Another concurrent first request may have installed the state
             # while SQLite I/O was in flight. Reuse it and only refresh metadata.
             state = self._states.get(root)
@@ -620,39 +654,263 @@ class FileWatchManager:
             workspace_id,
         )
 
+    @staticmethod
+    def _watcher_live(state: _WatchState) -> bool:
+        return state.task is not None and not state.task.done()
+
+    def _watched_roots_locked(self) -> set[Path]:
+        """Return active, lingering, and admission-reserved watcher roots."""
+        roots = {
+            root
+            for root, count in self._pending_watched_roots.items()
+            if count > 0
+        }
+        roots.update(
+            state.root
+            for state in self._states.values()
+            if state.subscribers or self._watcher_live(state)
+        )
+        return roots
+
+    def _subscriber_count_locked(self) -> int:
+        return self._pending_subscribers + sum(
+            len(state.subscribers)
+            for state in self._states.values()
+        )
+
+    def _reject_subscription_locked(self, reason: str) -> None:
+        _perf_event(
+            "files.subscription_rejected",
+            reason=reason,
+            watched_roots=len(self._watched_roots_locked()),
+            subscribers=self._subscriber_count_locked(),
+            pending_subscribers=self._pending_subscribers,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="file event capacity is temporarily unavailable",
+        )
+
+    def _oldest_evictable_idle_locked(self) -> _WatchState | None:
+        """Pop the oldest live idle watcher that has no reconnect reservation."""
+        for root in tuple(self._idle_watchers):
+            state = self._states.get(root)
+            if (
+                state is None
+                or state.subscribers
+                or not self._watcher_live(state)
+            ):
+                self._idle_watchers.pop(root, None)
+                continue
+            if self._pending_watched_roots.get(root, 0) > 0:
+                continue
+            self._idle_watchers.pop(root, None)
+            return state
+        return None
+
+    def _evict_idle_watcher_locked(
+        self,
+        state: _WatchState,
+    ) -> list[asyncio.Task[None]]:
+        """Detach one idle generation; callers join returned tasks off-lock."""
+        cancelled: list[asyncio.Task[None]] = []
+        stop_task = state.stop_task
+        state.stop_task = None
+        if (
+            stop_task is not None
+            and stop_task is not asyncio.current_task()
+            and not stop_task.done()
+        ):
+            stop_task.cancel()
+            cancelled.append(stop_task)
+        watcher = self._detach_watcher_locked(state)
+        if watcher is not None:
+            watcher.cancel()
+            cancelled.append(watcher)
+        return cancelled
+
+    def _reserve_subscription_locked(
+        self,
+        root: Path,
+        owner: asyncio.Task[Any],
+    ) -> tuple[int, list[asyncio.Task[None]]]:
+        """Reserve bounded capacity before registry or SQLite work begins."""
+        if not self._accepting_subscriptions:
+            self._reject_subscription_locked("manager_restarted")
+        if self._subscriber_count_locked() >= _MAX_EVENT_SUBSCRIBERS:
+            self._reject_subscription_locked("subscriber_limit")
+
+        watched_roots = self._watched_roots_locked()
+        cancelled: list[asyncio.Task[None]] = []
+        if root not in watched_roots:
+            while len(watched_roots) >= _MAX_WATCHED_ROOTS:
+                idle = self._oldest_evictable_idle_locked()
+                if idle is None:
+                    self._reject_subscription_locked("watcher_limit")
+                cancelled.extend(self._evict_idle_watcher_locked(idle))
+                watched_roots.discard(idle.root)
+
+        state = self._states.get(root)
+        if state is not None:
+            cancelled_stop = self._cancel_idle_stop_locked(state)
+            if cancelled_stop is not None:
+                cancelled.append(cancelled_stop)
+
+        generation = self._subscription_generation
+        self._pending_subscribers += 1
+        self._pending_watched_roots[root] = (
+            self._pending_watched_roots.get(root, 0) + 1
+        )
+        self._subscription_setups.add(owner)
+        return generation, cancelled
+
+    def _release_reservation_locked(
+        self,
+        root: Path,
+        generation: int,
+        owner: asyncio.Task[Any],
+    ) -> list[asyncio.Task[None]]:
+        """Release one admission token and restore linger when it was unused."""
+        self._subscription_setups.discard(owner)
+        if generation != self._subscription_generation:
+            return []
+        count = self._pending_watched_roots.get(root, 0)
+        if count <= 0:
+            return []
+        self._pending_subscribers -= 1
+        if count == 1:
+            self._pending_watched_roots.pop(root, None)
+        else:
+            self._pending_watched_roots[root] = count - 1
+
+        state = self._states.get(root)
+        if (
+            root not in self._pending_watched_roots
+            and state is not None
+            and not state.subscribers
+        ):
+            return self._schedule_idle_stop_locked(state)
+        return []
+
+    async def _release_reservation(
+        self,
+        root: Path,
+        generation: int,
+        owner: asyncio.Task[Any],
+    ) -> None:
+        async with self._lock:
+            cancelled = self._release_reservation_locked(
+                root, generation, owner,
+            )
+        if cancelled:
+            await asyncio.gather(*cancelled, return_exceptions=True)
+
+    @staticmethod
+    async def _await_owned_cleanup(cleanup: asyncio.Task[None]) -> None:
+        """Join cleanup despite repeated caller cancellation, then propagate it."""
+        pending_cancel: asyncio.CancelledError | None = None
+        while True:
+            try:
+                await asyncio.shield(cleanup)
+                break
+            except asyncio.CancelledError as exc:
+                if cleanup.cancelled():
+                    raise
+                if pending_cancel is None:
+                    pending_cancel = exc
+        cleanup.result()
+        if pending_cancel is not None:
+            raise pending_cancel
+
     @contextlib.asynccontextmanager
     async def subscribe(
         self,
         root: Path,
     ) -> AsyncIterator[asyncio.Queue[dict[str, Any]]]:
         root = root.resolve()
+        setup_owner = asyncio.current_task()
+        if setup_owner is None:
+            raise RuntimeError("subscription requires an asyncio task")
         queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(
             maxsize=_QUEUE_LIMIT,
         )
+        reservation_generation: int | None = None
+        attached = False
         cancelled_stops: list[asyncio.Task[None]] = []
-        while True:
-            state = await self.ensure_workspace(root)
-            async with self._lock:
-                # Workspace removal can interleave with the SQLite registration
-                # above. Retry rather than attaching a queue to an orphan state.
-                if self._states.get(root) is not state:
-                    continue
-                cancelled = self._cancel_idle_stop_locked(state)
-                if cancelled is not None:
-                    cancelled_stops.append(cancelled)
-                # Adding the queue and starting/restarting its watcher are one
-                # atomic transition. A late unsubscribe for an older queue can
-                # therefore never stop this new subscriber's watcher.
-                state.subscribers.add(queue)
-                if self._start_watcher_locked(state):
-                    self._queue_reconcile_locked(state)
-                break
-        if cancelled_stops:
-            await asyncio.gather(*cancelled_stops, return_exceptions=True)
         try:
+            async with self._lock:
+                (
+                    reservation_generation,
+                    cancelled_stops,
+                ) = self._reserve_subscription_locked(
+                    root, setup_owner,
+                )
+            if cancelled_stops:
+                await asyncio.gather(
+                    *cancelled_stops,
+                    return_exceptions=True,
+                )
+                cancelled_stops.clear()
+
+            while True:
+                state = await self.ensure_workspace(
+                    root,
+                    expected_generation=reservation_generation,
+                )
+                async with self._lock:
+                    if (
+                        reservation_generation
+                        != self._subscription_generation
+                    ):
+                        self._reject_subscription_locked(
+                            "manager_restarted",
+                        )
+                    # Workspace removal can interleave with SQLite registration.
+                    # Retry instead of attaching to an orphan generation.
+                    if self._states.get(root) is not state:
+                        continue
+                    cancelled = self._cancel_idle_stop_locked(state)
+                    if cancelled is not None:
+                        cancelled_stops.append(cancelled)
+                    # Convert the pending token to an attached queue atomically.
+                    state.subscribers.add(queue)
+                    attached = True
+                    cancelled_stops.extend(
+                        self._release_reservation_locked(
+                            root,
+                            reservation_generation,
+                            setup_owner,
+                        ),
+                    )
+                    reservation_generation = None
+                    if self._start_watcher_locked(state):
+                        self._queue_reconcile_locked(state)
+                    break
+
+            if cancelled_stops:
+                await asyncio.gather(
+                    *cancelled_stops,
+                    return_exceptions=True,
+                )
             yield queue
         finally:
-            await self._unsubscribe(root, queue)
+            cleanup: asyncio.Task[None] | None = None
+            if attached:
+                cleanup = asyncio.create_task(
+                    self._unsubscribe(root, queue),
+                    name="muselab-files-subscription-cleanup",
+                )
+            elif reservation_generation is not None:
+                cleanup = asyncio.create_task(
+                    self._release_reservation(
+                        root,
+                        reservation_generation,
+                        setup_owner,
+                    ),
+                    name="muselab-files-reservation-cleanup",
+                )
+            if cleanup is not None:
+                await self._await_owned_cleanup(cleanup)
 
     async def _stop_after_linger(self, state: _WatchState) -> None:
         """Stop a still-idle watcher after the reconnect grace period."""
@@ -667,7 +925,10 @@ class FileWatchManager:
                 return
             state.stop_task = None
             self._idle_watchers.pop(state.root, None)
-            if state.subscribers:
+            if (
+                state.subscribers
+                or self._pending_watched_roots.get(state.root, 0) > 0
+            ):
                 return
             watcher = self._detach_watcher_locked(state)
         if watcher is not None:
@@ -680,7 +941,10 @@ class FileWatchManager:
     ) -> list[asyncio.Task[None]]:
         """Start linger and immediately enforce the bounded idle-watcher LRU."""
         cancelled: list[asyncio.Task[None]] = []
-        if state.task is None or state.task.done():
+        if (
+            self._pending_watched_roots.get(state.root, 0) > 0
+            or not self._watcher_live(state)
+        ):
             return cancelled
         if state.stop_task is None or state.stop_task.done():
             state.stop_task = asyncio.create_task(
@@ -690,21 +954,20 @@ class FileWatchManager:
         self._idle_watchers.pop(state.root, None)
         self._idle_watchers[state.root] = None
 
-        while len(self._idle_watchers) > _MAX_IDLE_WATCHERS:
-            stale_root, _ = self._idle_watchers.popitem(last=False)
-            stale = self._states.get(stale_root)
-            if stale is None or stale.subscribers:
-                continue
-            if stale.stop_task is not None:
-                stop_task = stale.stop_task
-                stale.stop_task = None
-                if not stop_task.done():
-                    stop_task.cancel()
-                    cancelled.append(stop_task)
-            watcher = self._detach_watcher_locked(stale)
-            if watcher is not None:
-                watcher.cancel()
-                cancelled.append(watcher)
+        while sum(
+            1
+            for root in self._idle_watchers
+            if self._pending_watched_roots.get(root, 0) == 0
+            and (
+                (candidate := self._states.get(root)) is not None
+                and not candidate.subscribers
+                and self._watcher_live(candidate)
+            )
+        ) > _MAX_IDLE_WATCHERS:
+            stale = self._oldest_evictable_idle_locked()
+            if stale is None:
+                break
+            cancelled.extend(self._evict_idle_watcher_locked(stale))
         return cancelled
 
     async def _unsubscribe(
@@ -939,6 +1202,7 @@ class FileWatchManager:
         started = monotonic()
         metrics: dict[str, int | bool | str | None] = {
             "mutation_lock_wait_ms": 0,
+            "scan_slot_wait_ms": 0,
             "scan_ms": 0,
             "replay_ms": 0,
             "scanned_files": 0,
@@ -992,6 +1256,7 @@ class FileWatchManager:
                 attempt=attempt,
                 failures=state.reconcile_failures,
                 backoff_ms=backoff_ms,
+                scan_slot_wait_ms=metrics["scan_slot_wait_ms"],
                 mutation_lock_wait_ms=metrics["mutation_lock_wait_ms"],
                 scan_ms=metrics["scan_ms"],
                 replay_ms=metrics["replay_ms"],
@@ -1013,8 +1278,17 @@ class FileWatchManager:
         broadcast_payload: dict[str, Any] | None = None
         partial = False
         while True:
+            scan_slot_started = monotonic()
+            await self._reconcile_slots.acquire()
+            metrics["scan_slot_wait_ms"] = int(
+                metrics["scan_slot_wait_ms"]
+            ) + elapsed_ms(scan_slot_started)
             mutation_lock_started = monotonic()
-            await state.mutation_lock.acquire()
+            try:
+                await state.mutation_lock.acquire()
+            except BaseException:
+                self._reconcile_slots.release()
+                raise
             metrics["mutation_lock_wait_ms"] = int(
                 metrics["mutation_lock_wait_ms"]
             ) + elapsed_ms(mutation_lock_started)
@@ -1093,6 +1367,7 @@ class FileWatchManager:
                         ) + elapsed_ms(replay_started)
             finally:
                 state.mutation_lock.release()
+                self._reconcile_slots.release()
             if not retry_after_arm:
                 break
             if not await self._wait_for_armed_watcher(state):
@@ -1138,6 +1413,14 @@ class FileWatchManager:
         return directories or (state.root,)
 
     async def _watch(self, state: _WatchState) -> None:
+        await self._native_watcher_slots.acquire()
+        try:
+            await self._watch_native(state)
+        finally:
+            self._native_watcher_slots.release()
+
+    async def _watch_native(self, state: _WatchState) -> None:
+        """Own one native/polling watcher only while its global slot is held."""
         while True:
             stop_event: asyncio.Event | None = None
             stream = None
@@ -1316,9 +1599,19 @@ class FileWatchManager:
 
     async def shutdown(self) -> None:
         async with self._lock:
+            self._accepting_subscriptions = False
+            subscription_setups = [
+                task
+                for task in self._subscription_setups
+                if task is not asyncio.current_task() and not task.done()
+            ]
+            self._subscription_setups.clear()
             states = list(self._states.values())
             self._states.clear()
             self._idle_watchers.clear()
+            self._subscription_generation += 1
+            self._pending_subscribers = 0
+            self._pending_watched_roots.clear()
             self._started = False
             maintenance_task = self._maintenance_task
             self._maintenance_task = None
@@ -1358,6 +1651,8 @@ class FileWatchManager:
         try:
             if reconcile_tasks:
                 await asyncio.gather(*reconcile_tasks, return_exceptions=True)
+            if subscription_setups:
+                await asyncio.gather(*subscription_setups, return_exceptions=True)
         finally:
             # close() only resets lazy state and uses a short RLock section.
             # Run it synchronously in finally so an outer lifecycle deadline
