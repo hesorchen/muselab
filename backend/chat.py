@@ -3800,7 +3800,7 @@ def _persist_attachment(session_id: str, aid: str, name: str,
     """
     safe = _safe_attach_name(name)
     try:
-        if not re.fullmatch(r"[A-Za-z0-9\-]{6,80}", aid):
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9\-]{0,79}", aid):
             raise UnsafePrivatePath("invalid attachment id")
         attach_dir = _attachment_session_dir(session_id, create=True)
         if attach_dir is None:
