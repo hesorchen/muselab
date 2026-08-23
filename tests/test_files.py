@@ -1,5 +1,7 @@
 """File CRUD + search + hidden-toggle endpoints."""
 import io
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 
@@ -564,6 +566,38 @@ def test_copy_bak_increments_on_conflict(client, auth, temp_root):
         assert r.status_code == 200, r.text
         assert r.json()["path"] == expected
         assert (temp_root / expected).exists()
+
+
+def test_copy_bak_concurrent_requests_allocate_distinct_names(
+    app_module,
+    monkeypatch,
+    temp_root,
+):
+    from backend import files
+
+    real_copy2 = files.shutil.copy2
+    copies_ready = threading.Barrier(2)
+
+    def synchronized_copy(src, dst, *args, **kwargs):
+        copies_ready.wait(timeout=5)
+        return real_copy2(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(files.shutil, "copy2", synchronized_copy)
+    request = files.CopyBakReq(src="README.md")
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(
+            lambda _index: files.copy_bak(request, root=temp_root),
+            range(2),
+        ))
+
+    assert {result["path"] for result in results} == {
+        "README.md.bak",
+        "README.md.bak.2",
+    }
+    original = (temp_root / "README.md").read_bytes()
+    assert (temp_root / "README.md.bak").read_bytes() == original
+    assert (temp_root / "README.md.bak.2").read_bytes() == original
+    assert list(temp_root.glob(".~README.md.*.copying")) == []
 
 
 def test_copy_bak_cross_dir(client, auth, temp_root):

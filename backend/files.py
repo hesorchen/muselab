@@ -1562,33 +1562,58 @@ def copy_bak(req: CopyBakReq, root: Path = Depends(_workspace_root)) -> dict:
             raise HTTPException(status_code=404, detail="dst_dir not found")
     else:
         parent = src.parent
-    new_name = _next_bak_name(parent, src.name)
-    dst = parent / new_name
-    _guard_not_trash(dst, root)
-    # safe_resolve the final path so the anti-traversal guard fires for
-    # the destination too.
     logical_parent = (
         _logical_relative_path(req.dst_dir)
         if req.dst_dir
         else _logical_relative_path(req.src).parent
     )
-    dst_rel = (logical_parent / new_name).as_posix()
-    safe_resolve(dst_rel, allow_sensitive=True, root=root)
-    # The appended `.bak[.N]` suffix means `_is_sensitive` (exact-name /
-    # suffix match) never fires on the destination — `secrets.env.bak`
-    # wouldn't match `.env.*`. Strip the trailing `.bak[.N]` chain and
-    # re-check the underlying name so a copy can't smuggle a sensitive
-    # file into a `.bak` wrapper. (Source is already blocked by the
-    # default safe_resolve above; this hardens the dst symmetrically.)
-    underlying = new_name
+
+    # Copy potentially large content outside the global destination lock. The
+    # temporary lives beside the final file, so the later hard-link commit is
+    # same-filesystem, atomic, and refuses to overwrite an external writer.
     while True:
-        m = re.match(r"^(.*)\.bak(?:\.\d+)?$", underlying)
-        if not m:
+        tmp = parent / f".~{src.name}.{secrets.token_hex(8)}.copying"
+        try:
+            with tmp.open("xb"):
+                pass
             break
-        underlying = m.group(1)
-    if _is_sensitive(Path(underlying)):
-        raise HTTPException(status_code=403, detail="sensitive file blocked")
-    shutil.copy2(src, dst)
+        except FileExistsError:
+            continue
+    try:
+        shutil.copy2(src, tmp)
+        with _DEST_WRITE_LOCK:
+            while True:
+                new_name = _next_bak_name(parent, src.name)
+                dst = parent / new_name
+                _guard_not_trash(dst, root)
+                # safe_resolve the final path so the anti-traversal guard fires
+                # for the destination too.
+                dst_rel = (logical_parent / new_name).as_posix()
+                safe_resolve(dst_rel, allow_sensitive=True, root=root)
+                # The appended `.bak[.N]` suffix means `_is_sensitive`
+                # (exact-name / suffix match) never fires on the destination —
+                # `secrets.env.bak` wouldn't match `.env.*`. Strip the trailing
+                # suffix chain and re-check the underlying name.
+                underlying = new_name
+                while True:
+                    match = re.match(r"^(.*)\.bak(?:\.\d+)?$", underlying)
+                    if not match:
+                        break
+                    underlying = match.group(1)
+                if _is_sensitive(Path(underlying)):
+                    raise HTTPException(
+                        status_code=403,
+                        detail="sensitive file blocked",
+                    )
+                try:
+                    os.link(tmp, dst)
+                except FileExistsError:
+                    # An external writer can race the in-process lock. Retry the
+                    # server-derived name; hard-link never replaces its file.
+                    continue
+                break
+    finally:
+        tmp.unlink(missing_ok=True)
     return {"ok": True, "path": dst_rel, "name": new_name}
 
 
