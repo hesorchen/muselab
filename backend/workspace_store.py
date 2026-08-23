@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import shutil
 import sqlite3
 import threading
 import time
@@ -64,12 +65,14 @@ _RECONCILE_REPLAY_LIMIT = 500
 # sibling set independently so one generated/dump directory cannot turn a cold
 # page load into a multi-megabyte JSON response and browser main-thread stall.
 _BOOTSTRAP_CHILDREN_PER_PARENT = 500
-# Database maintenance runs only during service startup, before the file index
-# is exposed.  Avoid churning small databases: both an absolute and a relative
-# threshold must be crossed before any page-moving operation is attempted.
+# Automatic service startup never moves database pages. New indexes enable
+# incremental auto-vacuum before creating the schema; legacy indexes report an
+# explicit offline full-vacuum requirement instead of delaying readiness.
+# Both thresholds must be crossed before any reclaim operation is considered.
 _VACUUM_MIN_RECLAIM_BYTES = 16 * 1024 * 1024
 _VACUUM_MIN_FREE_RATIO = 0.25
 _INCREMENTAL_VACUUM_MAX_PAGES = 4096
+_FULL_VACUUM_MIN_FREE_BYTES = 64 * 1024 * 1024
 
 
 class WorkspaceScanIncomplete(RuntimeError):
@@ -240,8 +243,9 @@ class WorkspaceStore:
                 # read connection used by bootstrap/delta hot paths.
                 db.execute("PRAGMA journal_mode = WAL")
                 # New databases adopt incremental auto-vacuum before their
-                # schema is created. Existing databases switch during the
-                # threshold-gated one-time full VACUUM in maintain_database().
+                # schema is created. Legacy databases only switch through an
+                # explicitly opted-in offline maintain_database() call; normal
+                # service startup never performs a full VACUUM.
                 db.execute("PRAGMA auto_vacuum = INCREMENTAL")
                 db.executescript(
                     """
@@ -340,17 +344,23 @@ class WorkspaceStore:
             self._secure_database_files()
             self._ready = True
 
-    def maintain_database(self) -> dict[str, Any]:
-        """Reclaim meaningful freelist bloat outside interactive hot paths.
+    def maintain_database(
+        self,
+        *,
+        allow_full_vacuum: bool = False,
+    ) -> dict[str, Any]:
+        """Reclaim freelist bloat only when explicitly invoked.
 
-        The first maintenance of an older database performs the one required
-        full VACUUM to enable incremental auto-vacuum. Later startups reclaim
-        at most 4096 pages, bounding routine work while still reducing a large
-        high-water mark over time. SQLite's own locking keeps this safe; the
-        caller invokes it before the file index is exposed to requests.
+        New databases use incremental auto-vacuum from their first schema
+        transaction. A legacy database needs one full VACUUM to switch modes,
+        but that operation is never implicit: it can copy the whole database
+        and must not sit on the service readiness path. An offline maintenance
+        command may opt in after stopping MuseLab; even then, require enough
+        free space for both the original and replacement database.
         """
         self.initialize()
         started = time.monotonic()
+        required_headroom = 0
         with self._lock, self._connect() as db:
             before = self._database_stats(db)
             should_reclaim = (
@@ -358,25 +368,41 @@ class WorkspaceStore:
                 and before["free_ratio"] >= _VACUUM_MIN_FREE_RATIO
             )
             action = "none"
-            if should_reclaim:
-                db.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
-                if before["auto_vacuum"] != 2:
-                    db.execute("PRAGMA auto_vacuum = INCREMENTAL")
-                    db.execute("VACUUM")
-                    action = "full"
-                else:
-                    pages = min(
-                        before["freelist_count"],
-                        _INCREMENTAL_VACUUM_MAX_PAGES,
+            full_vacuum_required = False
+            if should_reclaim and before["auto_vacuum"] != 2:
+                full_vacuum_required = True
+                action = "full-required"
+                if allow_full_vacuum:
+                    database_bytes = self.path.stat().st_size
+                    required_headroom = max(
+                        database_bytes * 2,
+                        _FULL_VACUUM_MIN_FREE_BYTES,
                     )
-                    db.execute(f"PRAGMA incremental_vacuum({pages})")
-                    action = "incremental"
+                    free_bytes = shutil.disk_usage(self.path.parent).free
+                    if free_bytes >= required_headroom:
+                        db.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
+                        db.execute("PRAGMA auto_vacuum = INCREMENTAL")
+                        db.execute("VACUUM")
+                        action = "full"
+                        full_vacuum_required = False
+                    else:
+                        action = "full-skipped-no-space"
+            elif should_reclaim:
+                db.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
+                pages = min(
+                    before["freelist_count"],
+                    _INCREMENTAL_VACUUM_MAX_PAGES,
+                )
+                db.execute(f"PRAGMA incremental_vacuum({pages})")
+                action = "incremental"
             after = self._database_stats(db)
         self._secure_database_files()
         return {
             "action": action,
             "before": before,
             "after": after,
+            "full_vacuum_required": full_vacuum_required,
+            "required_headroom_bytes": required_headroom,
             "duration_ms": round((time.monotonic() - started) * 1000, 1),
         }
 

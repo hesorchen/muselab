@@ -45,6 +45,7 @@ _MAX_IDLE_WATCHERS = 3
 _RECONCILE_BACKOFF_START_S = 0.25
 _RECONCILE_BACKOFF_CAP_S = 5.0
 _EVENT_TICKET_TTL_S = 45
+_DATABASE_MAINTENANCE_DELAY_S = 30.0
 _EXCLUDED_DIRS = frozenset({TRASH_DIR_NAME, INTERNAL_DIR_NAME})
 _POLLING_ENV = os.getenv("WATCHFILES_FORCE_POLLING")
 _FORCE_POLLING: bool | None = (
@@ -222,6 +223,7 @@ class FileWatchManager:
         # and SQLite row after the registry/API deletion has completed.
         self._lifecycle_locks: dict[Path, asyncio.Lock] = {}
         self._started = False
+        self._maintenance_task: asyncio.Task[None] | None = None
 
     def _cancel_idle_stop_locked(
         self,
@@ -322,6 +324,44 @@ class FileWatchManager:
             state.watch_stop_event.set()
         return task if task is not None and not task.done() else None
 
+    async def _maintain_database_after_ready(self) -> None:
+        """Run bounded index maintenance after readiness, never before it."""
+        try:
+            await asyncio.sleep(_DATABASE_MAINTENANCE_DELAY_S)
+            worker = asyncio.create_task(
+                asyncio.to_thread(self.store.maintain_database),
+                name="muselab-files-database-maintenance-worker",
+            )
+            try:
+                maintenance = await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                # A to_thread call cannot be stopped by cancelling its awaiter.
+                # Keep ownership until the bounded incremental operation exits
+                # so shutdown never closes the store underneath a live worker.
+                await worker
+                raise
+            if maintenance["action"] != "none":
+                before = maintenance["before"]
+                after = maintenance["after"]
+                sys.stderr.write(
+                    "[files] workspace index maintenance "
+                    f"action={maintenance['action']} "
+                    f"free_pages={before['freelist_count']}->"
+                    f"{after['freelist_count']} "
+                    f"duration_ms={maintenance['duration_ms']}\n"
+                )
+                sys.stderr.flush()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # Indexing remains available when optional compaction cannot
+            # acquire a lock or inspect filesystem headroom.
+            sys.stderr.write(
+                "[files] workspace index maintenance skipped "
+                f"({type(exc).__name__})\n"
+            )
+            sys.stderr.flush()
+
     async def start(self) -> None:
         """Initialize durable metadata without recursively watching every root."""
         async with self._lock:
@@ -330,29 +370,6 @@ class FileWatchManager:
             self._started = True
         try:
             await asyncio.to_thread(self.store.initialize)
-            try:
-                maintenance = await asyncio.to_thread(
-                    self.store.maintain_database
-                )
-                if maintenance["action"] != "none":
-                    before = maintenance["before"]
-                    after = maintenance["after"]
-                    sys.stderr.write(
-                        "[files] workspace index maintenance "
-                        f"action={maintenance['action']} "
-                        f"free_pages={before['freelist_count']}->"
-                        f"{after['freelist_count']} "
-                        f"duration_ms={maintenance['duration_ms']}\n"
-                    )
-                    sys.stderr.flush()
-            except Exception as exc:
-                # Indexing remains available when optional compaction cannot
-                # acquire a lock or the filesystem has no temporary headroom.
-                sys.stderr.write(
-                    "[files] workspace index maintenance skipped "
-                    f"({type(exc).__name__})\n"
-                )
-                sys.stderr.flush()
             for entry in registry.list():
                 await asyncio.to_thread(
                     self.store.register_workspace,
@@ -361,6 +378,12 @@ class FileWatchManager:
                     entry.name,
                     primary=entry.primary,
                 )
+            async with self._lock:
+                if self._started:
+                    self._maintenance_task = asyncio.create_task(
+                        self._maintain_database_after_ready(),
+                        name="muselab-files-database-maintenance",
+                    )
         except Exception:
             async with self._lock:
                 self._started = False
@@ -1297,6 +1320,8 @@ class FileWatchManager:
             self._states.clear()
             self._idle_watchers.clear()
             self._started = False
+            maintenance_task = self._maintenance_task
+            self._maintenance_task = None
             reconcile_tasks: list[asyncio.Task[None]] = []
             tasks = [
                 task
@@ -1318,6 +1343,9 @@ class FileWatchManager:
                 self._close_subscribers(state)
                 state.reconcile_task = None
                 state.stop_task = None
+        if maintenance_task is not None:
+            maintenance_task.cancel()
+            await asyncio.gather(maintenance_task, return_exceptions=True)
         for task in tasks:
             task.cancel()
         if tasks:
