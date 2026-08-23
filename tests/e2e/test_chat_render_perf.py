@@ -1303,7 +1303,12 @@ def test_chat_bubble_selection_quotes_as_attachment_and_asks_in_side_session(
         }"""
     )
     expect(page.locator(".preview-selection-actions")).to_be_visible()
-    page.locator(".preview-selection-actions button").first.click()
+    # iOS preserves the native selection by cancelling pointerdown, which can
+    # suppress the follow-up synthetic click. Exercise the real touch path.
+    page.locator(".preview-selection-actions button").first.dispatch_event(
+        "pointerdown",
+        {"pointerType": "touch", "button": 0, "bubbles": True, "cancelable": True},
+    )
     quoted = _app_eval(
         page,
         """
@@ -1367,7 +1372,10 @@ def test_chat_bubble_selection_quotes_as_attachment_and_asks_in_side_session(
             && app.previewQuote.role === 'user';
         }"""
     )
-    page.locator(".preview-selection-actions button").nth(1).click()
+    page.locator(".preview-selection-actions button").nth(1).dispatch_event(
+        "pointerdown",
+        {"pointerType": "touch", "button": 0, "bubbles": True, "cancelable": True},
+    )
     ask = page.locator(".preview-selection-ask textarea")
     expect(ask).to_be_focused()
     ask.fill("这里的结论为什么成立？")
@@ -5452,6 +5460,44 @@ def test_mobile_pwa_tabs_preview_rotation_keep_chat_usable(page: Page, backend_u
     assert page.locator(".msg-pane").count() <= 1
     assert _app_eval(page, "return app.messagesReady === true && !app.messagesLoading;") is True
 
+    _assert_no_browser_errors(page, errors)
+
+
+def test_mobile_composer_focus_closes_activity_group_menu(
+    page: Page, backend_url, auth_token,
+):
+    """Keyboard focus must not leave a portalled task-group menu below chat."""
+    errors = _capture_browser_errors(page)
+    page.set_viewport_size({"width": 390, "height": 844})
+    _login(page, backend_url, auth_token)
+    _app_eval(
+        page,
+        """
+        app.mobileTab = 'chat';
+        app.activity.show = true;
+        app.activity.moveMenu = {
+          show: true, eventId: 'stale-menu',
+          style: 'position:fixed;left:8px;top:500px;width:220px;',
+        };
+        return true;
+        """,
+    )
+
+    input_box = page.locator(".chat-input-textarea")
+    input_box.evaluate("el => { el.disabled = false; el.focus(); }")
+    page.wait_for_function(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const menu = document.querySelector('.activity-move-menu');
+          const backdrop = document.querySelector(
+            '.modal-backdrop .activity-modal')?.parentElement;
+          return !app.activity.show && !app.activity.moveMenu.show
+            && getComputedStyle(menu).display === 'none'
+            && getComputedStyle(backdrop).display === 'none';
+        }""",
+        timeout=2000,
+    )
+    expect(input_box).to_be_focused()
     _assert_no_browser_errors(page, errors)
 
 

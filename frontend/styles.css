@@ -2508,6 +2508,7 @@ body.kb-open .layout:focus-within .mobile-tab-bar { display: none; }
   font: inherit;
   font-weight: var(--fw-medium);
   cursor: pointer;
+  touch-action: manipulation;
   transition: color var(--t-fast), background var(--t-fast);
 }
 .preview-selection-actions button:hover,

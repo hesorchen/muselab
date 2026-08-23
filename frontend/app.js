@@ -1462,14 +1462,6 @@ function portal() {
       // double. Cheap to gate at the front; expensive to debug after.
       if (this._initialized) return;
       this._initialized = true;
-      // Prewarm the heavy preview vendor bundles (hljs / katex / mermaid)
-      // during browser idle, AFTER first paint. These are lazy-loaded on
-      // first use, but that cold load + compile (mermaid is ~3.3 MB) runs in
-      // the $nextTick AFTER a markdown preview has already painted — so the
-      // content shows, then the page freezes 2–3 s while the bundle parses.
-      // Warming them up front moves that cost off the click path. Fire-and-
-      // forget; failures fall back to the existing on-demand lazy load.
-      this._prewarmPreviewLibs();
       // 全局快捷键（绑在 document，避免每个 textarea 单独处理）
       document.addEventListener("keydown", e => this.onGlobalKeyDown(e));
       this._registerFocusSurfaceWatchers();
@@ -1814,6 +1806,13 @@ function portal() {
     // `scroll-margin-bottom: 16px` on the textarea (see styles.css) leaves a
     // breathing-room gap so the input isn't flush against the keyboard top.
     onChatInputFocus() {
+      // A group-assignment menu is portalled outside the activity backdrop. On
+      // iOS, focusing the composer can resize the visual viewport before the
+      // delayed outside-click closes that fixed layer, leaving the menu（and a
+      // clipped activity row）visible between the composer and keyboard. Composer
+      // focus is an unambiguous return to chat, so close both surfaces first.
+      if (this.activity.moveMenu.show) this.closeActivityMoveMenu();
+      if (this.activity.show) this.closeActivityCenter();
       document.documentElement.style.setProperty("--kb-inset", "0px");
       document.body.classList.add("kb-open");
       this._reconcileMobileViewport();
@@ -2076,7 +2075,7 @@ function portal() {
       // and let the reconnect banner take over.
       this._splashHardTimeout = setTimeout(() => {
         if (!this.appReady) {
-          this.appReady = true;
+          this._markReady();
           this.connState = "reconnecting";
         }
       }, 8000);
@@ -2094,6 +2093,12 @@ function portal() {
       })).catch(() => false);
       if (!restoredWorkspaceRegistry) await workspaceRegistryReady;
       const rootOwner = this.fileWorkspacePath();
+      // Context cards are the only network dependency that gates splash
+      // readiness. Dispatch them before the file tree, live transports, session
+      // list and decorative snapshots so a high-latency proxy cannot leave the
+      // critical request queued behind non-visible startup work.
+      const contextReady = Promise.resolve(this.fetchContextInfo());
+      void contextReady.catch(() => false);
       // Attach the rejection handler immediately: the rest of boot awaits
       // context/session work before it observes this promise, and a fast tree
       // failure must never surface as an unhandled rejection in that gap.
@@ -2112,7 +2117,7 @@ function portal() {
       // Chat/session/activity transports do not depend on the file index or
       // context cards. Start them before either slow request; the file stream
       // remains gated on rootReady below so its cursor is always trustworthy.
-      this._startLiveConnections({ fileEvents: false });
+      this._startLiveConnections({ fileEvents: false, activitySnapshot: false });
       this.fetchTerminals({ restore: true });
       // Push-notification deep-link: a turn-done notification opens
       // `/?session=<id>` in a fresh tab. After sessions load, jump to that
@@ -2120,16 +2125,6 @@ function portal() {
       // (the already-open-tab case is handled via the SW postMessage above).
       this._openStartupActivityDeeplink();
       this.initSessions().then(() => this._openStartupSessionDeeplink());
-      this.fetchStats();
-      // Trash badge state — light fetch (just count), gated by token
-      // which is already verified at this point. Fire-and-forget;
-      // failures degrade silently to "no badge styling".
-      this.loadTrash();
-      // Surface any in-flight turns that were cut short by a previous
-      // process death (OOM kill / power loss / manual restart mid-stream).
-      // Fire-and-forget — purely informational, doesn't block boot. Backend
-      // returns [] when nothing was interrupted (the common case).
-      this._checkInterruptedTurns();
       // First-run hint — surface key shortcuts so the user doesn't have to
       // hunt for them. Flagged in localStorage so it only fires once. Short
       // delay lets the splash clear first.
@@ -2161,10 +2156,11 @@ function portal() {
       // settles before we override it back to the user's actual last tab.
       // Desktop ignores mobileTab entirely so this is a no-op there.
       this._restorePendingMobileTab();
-      // Block readiness on context-info (the most important one for the
-      // onboarding cards). Others come along in parallel.
+      // Block readiness on the context request dispatched at the start of boot.
+      // Sessions and the file tree continue independently and reveal their own
+      // loading states instead of holding the whole shell behind a waterfall.
       try {
-        await this.fetchContextInfo();
+        await contextReady;
         this._markReady();
       } catch (e) {
         // Will retry via heartbeat
@@ -2185,16 +2181,19 @@ function portal() {
     // of only after a manual refresh. Both underlying starts are idempotent
     // (clearInterval before re-arming), but this is only ever called once per
     // boot path, so there's no double-start.
-    _startLiveConnections({ fileEvents = true } = {}) {
+    _startLiveConnections({ fileEvents = true, activitySnapshot = true } = {}) {
       this._startHeartbeat();
       this._startPresence();
       this._startSessionsSync();
       if (fileEvents) this._startFileEvents();
-      // Source-aware ACK needs the persisted ledger row on a cold boot.  Run
-      // it after the first snapshot instead of racing an empty events array.
-      Promise.resolve(this.fetchActivity()).finally(
-        () => this.ackCurrentActivity(),
-      );
+      // Source-aware ACK needs the persisted ledger row on a cold boot. Saved-
+      // token boot defers this decorative snapshot until after appReady; first
+      // sign-in keeps the original eager behavior through the default option.
+      if (activitySnapshot) {
+        Promise.resolve(this.fetchActivity()).catch(() => false).finally(
+          () => this.ackCurrentActivity(),
+        );
+      }
       this._startActivityEvents();
       this._startTodoEvents();
       this._startMemoryMonitor();
@@ -2234,12 +2233,46 @@ function portal() {
       }, 10_000);
     },
 
+    _scheduleDeferredBootWork() {
+      if (this._deferredBootWorkScheduled) return;
+      this._deferredBootWorkScheduled = true;
+      const run = () => {
+        // These snapshots decorate an already-usable shell. Keeping them off the
+        // critical path prevents six unrelated endpoints and preview bundles
+        // from competing with context/session startup on tunneled connections.
+        void Promise.resolve(this.fetchActivity()).catch(() => false).finally(
+          () => this.ackCurrentActivity(),
+        );
+        void Promise.resolve(this.fetchStats()).catch(() => false);
+        void Promise.resolve(this.loadTrash()).catch(() => false);
+        void Promise.resolve(this._checkInterruptedTurns()).catch(() => false);
+        this._prewarmPreviewLibs();
+      };
+      const schedule = () => {
+        try {
+          if (typeof window !== "undefined" && window.requestIdleCallback) {
+            window.requestIdleCallback(run, { timeout: 1500 });
+          } else {
+            setTimeout(run, 300);
+          }
+        } catch (_) { setTimeout(run, 300); }
+      };
+      // Give Alpine one frame to remove the splash and paint the usable shell
+      // before any best-effort network or parsing work begins.
+      if (typeof requestAnimationFrame === "function") {
+        requestAnimationFrame(() => requestAnimationFrame(schedule));
+      } else {
+        setTimeout(schedule, 0);
+      }
+    },
+
     _markReady() {
       if (this.appReady) return;
       this.appReady = true;
       clearTimeout(this._splashHintTimer);
       clearTimeout(this._splashHardTimeout);
       this.splashHint = "";
+      this._scheduleDeferredBootWork();
     },
 
     // Friendly "5 min ago" / "刚刚" / "3 h ago" formatter for the
@@ -5059,6 +5092,14 @@ function portal() {
       // Global requests are workspace-agnostic. File and conversation requests
       // add their registered workspace through fileHdr()/conversationHdr().
       return { "X-Auth-Token": this.token };
+    },
+    _staticAssetUrl(path) {
+      if (!path || !path.startsWith("/static/") || /[?&]v=/.test(path)) return path;
+      const version = typeof document !== "undefined"
+        ? document.querySelector('meta[name="muselab-asset-version"]')?.content
+        : "";
+      if (!version || version === "__MUSELAB_ASSET_VERSION__") return path;
+      return `${path}${path.includes("?") ? "&" : "?"}v=${encodeURIComponent(version)}`;
     },
     conversationHdr(path = "") {
       const headers = this.hdr();
@@ -17452,7 +17493,7 @@ function portal() {
     _fileCapabilities() {
       if (!this._fileCapabilitiesPromise) {
         this._fileCapabilitiesPromise = import(
-          "/static/modules/file-capabilities.mjs"
+          this._staticAssetUrl("/static/modules/file-capabilities.mjs")
         ).catch(error => {
           this._fileCapabilitiesPromise = null;
           throw error;
@@ -17463,7 +17504,7 @@ function portal() {
     _persistentCache() {
       if (!this._persistentCachePromise) {
         this._persistentCachePromise = import(
-          "/static/modules/persistent-cache.mjs"
+          this._staticAssetUrl("/static/modules/persistent-cache.mjs")
         ).catch(error => {
           this._persistentCachePromise = null;
           throw error;
@@ -23306,6 +23347,27 @@ function portal() {
         ? (message.displayText || "") : (message.text || "");
     },
 
+    activatePreviewSelectionAction(ev, action) {
+      // iOS Safari can suppress the synthetic click when pointerdown is
+      // preventDefault()'d to preserve a native text selection. Execute real
+      // pointer activation on pointerdown instead, and reserve click for
+      // keyboard／assistive-technology activation（detail === 0）. Ignoring the
+      // later pointer-generated click also prevents a detached button from
+      // running the action twice after the popover has already closed.
+      const pointerDown = ev && ev.type === "pointerdown"
+        && (ev.button == null || ev.button === 0);
+      const keyboardClick = ev && ev.type === "click" && ev.detail === 0;
+      if (!pointerDown && !keyboardClick) return false;
+      if (ev.preventDefault) ev.preventDefault();
+      if (ev.stopPropagation) ev.stopPropagation();
+      if (action === "quote") return this.quotePreviewSelection();
+      if (action === "ask") {
+        this.openPreviewSelectionAsk();
+        return true;
+      }
+      return false;
+    },
+
     quotePreviewSelection() {
       if (!this.currentId || !this.previewQuote.show || !this.previewQuote.text) {
         this.toast(this.lang === "zh" ? "请先打开一个会话" : "Open a chat first", "warn", 2200);
@@ -23789,10 +23851,12 @@ function portal() {
       if (ready()) return Promise.resolve();
       if (this[key]) return this[key];
       const clearOnFail = (err) => { this[key] = null; return Promise.reject(err); };
-      const loadOne = (src) => new Promise((resolve, reject) => {
+      const loadOne = (path) => new Promise((resolve, reject) => {
+        const isCss = path.split(/[?#]/, 1)[0].endsWith(".css");
+        const src = this._staticAssetUrl(path);
         // Already in the DOM (e.g. from a previous lazy-load attempt)? Wait
         // for ready(); don't re-inject the tag.
-        const sel = src.endsWith(".css")
+        const sel = isCss
           ? `link[href="${src}"]`
           : `script[src="${src}"]`;
         if (document.querySelector(sel)) {
@@ -23805,7 +23869,7 @@ function portal() {
           })();
           return;
         }
-        if (src.endsWith(".css")) {
+        if (isCss) {
           const l = document.createElement("link");
           l.rel = "stylesheet"; l.href = src;
           l.onload = resolve; l.onerror = () => reject(new Error("load failed: " + src));
@@ -23845,7 +23909,15 @@ function portal() {
     // never competes with the initial app render. Each step is fire-and-forget
     // and swallows errors — the on-demand lazy loaders remain the fallback.
     _prewarmPreviewLibs() {
-      if (this._previewLibsPrewarmed) return;
+      if (this._previewLibsPrewarmed || !this.appReady) return;
+      // Hidden tabs, data-saver and genuinely slow cellular links should keep
+      // bandwidth and parse budget for user-requested work. On-demand loaders
+      // remain available when the user actually opens rich preview content.
+      if (typeof document !== "undefined" && document.hidden) return;
+      const connection = typeof navigator !== "undefined"
+        ? navigator.connection : null;
+      if (connection && (connection.saveData
+          || ["slow-2g", "2g"].includes(connection.effectiveType))) return;
       this._previewLibsPrewarmed = true;
       // Each job below injects + parses a heavy vendor bundle on the main
       // thread. Firing them all inside ONE idle slice re-creates the freeze
@@ -23902,7 +23974,8 @@ function portal() {
     async _loadHljs() {
       if (window.hljs) return;
       if (this._hljsLoadPromise) return this._hljsLoadPromise;
-      const inject = (src) => new Promise((resolve, reject) => {
+      const inject = (path) => new Promise((resolve, reject) => {
+        const src = this._staticAssetUrl(path);
         if (document.querySelector(`script[src="${src}"]`)) {
           // Already in DOM — just wait for window.hljs to materialize.
           const t0 = Date.now();
@@ -23954,20 +24027,22 @@ function portal() {
       if (window.CodeMirror) return;
       if (this._cmLoadPromise) return this._cmLoadPromise;
       // Inject one asset (css/js), de-duping against an already-present tag.
-      const inject = (src) => new Promise((resolve, reject) => {
-        const sel = src.endsWith(".css")
+      const inject = (path) => new Promise((resolve, reject) => {
+        const isCss = path.split(/[?#]/, 1)[0].endsWith(".css");
+        const src = this._staticAssetUrl(path);
+        const sel = isCss
           ? `link[href="${src}"]` : `script[src="${src}"]`;
         if (document.querySelector(sel)) {
           // Already in flight/loaded from a prior attempt — give it a beat.
           const t0 = Date.now();
           (function wait() {
-            if (src.endsWith(".css") || window.CodeMirror) return resolve();
+            if (isCss || window.CodeMirror) return resolve();
             if (Date.now() - t0 > 5000) return resolve(); // don't hang the chain
             setTimeout(wait, 50);
           })();
           return;
         }
-        const node = src.endsWith(".css")
+        const node = isCss
           ? Object.assign(document.createElement("link"), { rel: "stylesheet", href: src })
           : Object.assign(document.createElement("script"), { src });
         node.onload = resolve;
@@ -24026,7 +24101,7 @@ function portal() {
       };
       this._mermaidLoadPromise = new Promise((resolve, reject) => {
         const s = document.createElement("script");
-        s.src = "/static/vendor/mermaid.min.js";
+        s.src = this._staticAssetUrl("/static/vendor/mermaid.min.js");
         s.onload = () => {
           try {
             // securityLevel: "strict" disables foreign HTML in labels,

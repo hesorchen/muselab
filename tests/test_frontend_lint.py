@@ -293,8 +293,10 @@ def test_preview_selection_quote_attachment_and_side_question_are_safely_wired()
     ]
 
     assert 'class="preview-selection-popover"' in html
-    assert '@click="quotePreviewSelection()"' in html
-    assert '@click="openPreviewSelectionAsk()"' in html
+    assert "@pointerdown=\"activatePreviewSelectionAction($event, 'quote')\"" in html
+    assert "@click=\"activatePreviewSelectionAction($event, 'quote')\"" in html
+    assert "@pointerdown=\"activatePreviewSelectionAction($event, 'ask')\"" in html
+    assert "@click=\"activatePreviewSelectionAction($event, 'ask')\"" in html
     assert '@submit.prevent="sendPreviewSelectionQuestion()"' in html
     assert 'x-ref="previewQuoteInput"' in html
     assert ':href="previewQuoteSourceIcon()"' in html
@@ -4202,9 +4204,15 @@ def test_workspace_cache_uses_delta_without_blocking_or_copying_hidden_bursts():
     boot_end = app.index("\n    // Start the always-on", boot_start)
     boot = app[boot_start:boot_end]
     assert "Promise.resolve(this.loadRoot()).catch(() => false)" in boot
-    assert "this._startLiveConnections({ fileEvents: false })" in boot
-    assert boot.index("this._startLiveConnections({ fileEvents: false })") < boot.index(
-        "await this.fetchContextInfo()")
+    assert (
+        "this._startLiveConnections({ fileEvents: false, activitySnapshot: false })"
+        in boot
+    )
+    assert boot.index("const contextReady = Promise.resolve(this.fetchContextInfo())") < (
+        boot.index("this._startLiveConnections({ fileEvents: false")
+    )
+    assert boot.index("this._startLiveConnections({ fileEvents: false") < boot.index(
+        "await contextReady")
     assert "await rootReady" not in boot
 
     load_start = app.index("loadRoot({\n      runtimeSnapshot = false")
