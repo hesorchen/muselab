@@ -2100,6 +2100,98 @@ def test_bounded_scan_resumes_until_snapshot_is_complete(
     } == {f"file-{index}.txt" for index in range(7)}
 
 
+def test_bounded_scan_survives_directory_enumeration_order_change(
+    app_module,
+    tmp_path,
+    monkeypatch,
+):
+    from backend import workspace_store
+    from backend.workspace_store import WorkspaceScanIncomplete, WorkspaceStore
+
+    root = tmp_path / "reordered-resume"
+    root.mkdir()
+    for name in ("a.txt", "b.txt", "c.txt"):
+        (root / name).write_text(name, encoding="utf-8")
+
+    store = WorkspaceStore(root)
+    workspace_id = "reordered-workspace"
+    store.reconcile(
+        workspace_id,
+        root,
+        "reordered",
+        max_files=None,
+        max_seconds=None,
+    )
+
+    real_scandir = workspace_store.os.scandir
+    root_calls = 0
+
+    class ReorderedScandir:
+        def __init__(self, directory):
+            nonlocal root_calls
+            self._iterator = real_scandir(directory)
+            entries = list(self._iterator)
+            if Path(directory).resolve() == root.resolve():
+                root_calls += 1
+                preferred = (
+                    ["a.txt", "b.txt", "c.txt"]
+                    if root_calls == 1
+                    else ["c.txt", "a.txt", "b.txt"]
+                )
+                rank = {name: index for index, name in enumerate(preferred)}
+                entries.sort(key=lambda child: rank.get(child.name, len(rank)))
+            self._entries = entries
+
+        def __enter__(self):
+            return iter(self._entries)
+
+        def __exit__(self, *_exc_info):
+            self._iterator.close()
+
+    monkeypatch.setattr(workspace_store.os, "scandir", ReorderedScandir)
+    progress = {}
+    first_report = {}
+    store.reconcile(
+        workspace_id,
+        root,
+        "reordered",
+        max_files=2,
+        max_seconds=None,
+        report=first_report,
+        scan_progress=progress,
+    )
+    assert first_report["partial"] is True
+
+    with pytest.raises(WorkspaceScanIncomplete):
+        store.reconcile(
+            workspace_id,
+            root,
+            "reordered",
+            max_files=2,
+            max_seconds=None,
+            scan_progress=progress,
+        )
+    assert progress == {}
+
+    final_report = {}
+    store.reconcile(
+        workspace_id,
+        root,
+        "reordered",
+        max_files=None,
+        max_seconds=None,
+        report=final_report,
+        scan_progress=progress,
+    )
+
+    assert root_calls == 3
+    assert final_report["partial"] is False
+    assert progress == {}
+    assert {
+        row["path"] for row in store.bootstrap(workspace_id)["entries"]
+    } == {"a.txt", "b.txt", "c.txt"}
+
+
 def test_explicit_large_tree_pruning_keeps_only_directory_nodes(
     app_module,
     temp_root,

@@ -126,8 +126,8 @@ def scan_workspace(
     root = root.resolve()
     scan_progress = progress if progress is not None else {}
     seen_paths: set[str] = scan_progress.setdefault("seen_paths", set())
-    stack: list[tuple[Path, Path, int]] = scan_progress.setdefault(
-        "stack", [(root, Path(), 0)]
+    stack: list[tuple[Path, Path, int, bytes | None]] = scan_progress.setdefault(
+        "stack", [(root, Path(), 0, None)]
     )
     resumed = bool(seen_paths)
     rows: list[dict[str, Any]] = []
@@ -140,32 +140,58 @@ def scan_workspace(
         if max_seconds is not None and time.monotonic() - started >= max_seconds:
             partial_reason = "time_limit"
             break
-        directory, logical_parent, skip = stack.pop()
+        directory, logical_parent, skip, expected_prefix = stack.pop()
+        # scandir order is not stable across passes. Hash the exact consumed
+        # prefix so an order or membership change restarts instead of skipping
+        # a live entry and later inferring its deletion.
+        prefix = hashlib.blake2b(digest_size=16)
+        prefix_verified = skip == 0
+        index = 0
         try:
             with os.scandir(directory) as iterator:
-                index = 0
                 for child in iterator:
+                    if child.name in _EXCLUDED_DIRS:
+                        continue
                     if index < skip:
+                        prefix.update(os.fsencode(child.name))
+                        prefix.update(b"\0")
                         index += 1
+                        if index == skip:
+                            if (
+                                expected_prefix is None
+                                or prefix.digest() != expected_prefix
+                            ):
+                                scan_progress.clear()
+                                raise WorkspaceScanIncomplete(
+                                    f"directory changed during resumed scan: {directory}"
+                                )
+                            prefix_verified = True
                         continue
                     if cancel_event is not None and cancel_event.is_set():
                         raise WorkspaceScanCancelled(
                             "workspace scan cancelled"
                         )
                     if max_files is not None and scanned_files >= max_files:
-                        stack.append((directory, logical_parent, index))
+                        stack.append((
+                            directory,
+                            logical_parent,
+                            index,
+                            prefix.digest(),
+                        ))
                         partial_reason = "file_limit"
                         break
                     if (
                         max_seconds is not None
                         and time.monotonic() - started >= max_seconds
                     ):
-                        stack.append((directory, logical_parent, index))
+                        stack.append((
+                            directory,
+                            logical_parent,
+                            index,
+                            prefix.digest(),
+                        ))
                         partial_reason = "time_limit"
                         break
-                    index += 1
-                    if child.name in _EXCLUDED_DIRS:
-                        continue
                     logical = logical_parent / child.name
                     try:
                         is_symlink = child.is_symlink()
@@ -176,6 +202,9 @@ def scan_workspace(
                         # A disappearing or temporarily unreadable entry makes
                         # this snapshot non-authoritative for deletion.
                         raise WorkspaceScanIncomplete(str(child.path)) from exc
+                    prefix.update(os.fsencode(child.name))
+                    prefix.update(b"\0")
+                    index += 1
                     path = logical.as_posix()
                     seen_paths.add(path)
                     rows.append(_entry(path, is_dir, stat))
@@ -185,7 +214,12 @@ def scan_workspace(
                         and not is_symlink
                         and child.name not in _IGNORED_SUBTREES
                     ):
-                        stack.append((Path(child.path), logical, 0))
+                        stack.append((Path(child.path), logical, 0, None))
+            if not prefix_verified:
+                scan_progress.clear()
+                raise WorkspaceScanIncomplete(
+                    f"directory changed during resumed scan: {directory}"
+                )
         except OSError as exc:
             scan_progress.clear()
             # Keep the last-good index instead of inventing deletes for an
