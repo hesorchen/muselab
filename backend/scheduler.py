@@ -18,6 +18,8 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import math
+import re
 import sys
 import threading
 import time
@@ -97,6 +99,10 @@ _state: dict[str, Any] = {
     "tasks": {},        # task_id -> task
     "history": [],      # list of run entries (capped to 200)
     "unread_count": 0,  # results since user last acked
+    # task_id -> immutable deletion cleanup intent.  The task and intent are
+    # committed in one scheduler.json replacement; external runtime/session
+    # cleanup removes the intent only after every owner reaches terminal state.
+    "cleanup_pending": {},
 }
 
 
@@ -271,6 +277,7 @@ _STATE_LOCK = threading.Lock()
 # replies interleave / drop messages. Lock is dict-resident keyed by
 # task id; locks are never deleted (one per task max, negligible memory).
 _task_locks: dict[str, asyncio.Lock] = {}
+_cleanup_locks: dict[str, asyncio.Lock] = {}
 
 
 def _task_lock(tid: str) -> asyncio.Lock:
@@ -279,8 +286,77 @@ def _task_lock(tid: str) -> asyncio.Lock:
         lock = asyncio.Lock()
         _task_locks[tid] = lock
     return lock
+
+
+def _cleanup_lock(tid: str) -> asyncio.Lock:
+    """Serialize idempotent cleanup retries for one deleted task."""
+    lock = _cleanup_locks.get(tid)
+    if lock is None:
+        lock = asyncio.Lock()
+        _cleanup_locks[tid] = lock
+    return lock
+
 _HISTORY_CAP = 200
 _PREVIEW_CAP_CHARS = 240
+_CLEANUP_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,199}\Z")
+
+
+def _valid_cleanup_id(value: Any, *, allow_empty: bool = False) -> bool:
+    if not isinstance(value, str):
+        return False
+    if not value:
+        return allow_empty
+    return bool(_CLEANUP_ID_RE.fullmatch(value))
+
+
+def _normalize_cleanup_intents(raw: Any, tasks: dict[str, Any]) -> dict[str, dict]:
+    """Validate cleanup records before any startup recovery can act on them.
+
+    scheduler.json is user-editable and may also be truncated/corrupted. A
+    malformed deletion record must fence the scheduler instead of turning an
+    arbitrary string into a session filesystem target.
+    """
+    if not isinstance(raw, dict):
+        raise ValueError("scheduler cleanup_pending must be an object")
+    normalized: dict[str, dict] = {}
+    for tid, intent in raw.items():
+        if not _valid_cleanup_id(tid):
+            raise ValueError("scheduler cleanup task id is invalid")
+        if tid in tasks:
+            raise ValueError("scheduler task cannot also be pending cleanup")
+        if not isinstance(intent, dict) or intent.get("task_id") != tid:
+            raise ValueError("scheduler cleanup intent has an invalid task id")
+        cleanup_id = intent.get("cleanup_id")
+        if not _valid_cleanup_id(cleanup_id):
+            raise ValueError("scheduler cleanup intent id is invalid")
+        mode = intent.get("session_mode")
+        if mode not in ("reuse", "fresh"):
+            raise ValueError("scheduler cleanup session mode is invalid")
+        sid = intent.get("session_id", "")
+        if not _valid_cleanup_id(sid, allow_empty=True):
+            raise ValueError("scheduler cleanup session id is invalid")
+        runtime_sids = intent.get("runtime_session_ids", [])
+        if not isinstance(runtime_sids, list) or len(runtime_sids) > 64:
+            raise ValueError("scheduler cleanup runtime sessions are invalid")
+        if any(not _valid_cleanup_id(item) for item in runtime_sids):
+            raise ValueError("scheduler cleanup runtime session id is invalid")
+        created_at = intent.get("created_at")
+        if (
+            isinstance(created_at, bool)
+            or not isinstance(created_at, (int, float))
+            or not math.isfinite(created_at)
+            or created_at < 0
+        ):
+            raise ValueError("scheduler cleanup created_at is invalid")
+        normalized[tid] = {
+            "task_id": tid,
+            "cleanup_id": cleanup_id,
+            "session_mode": mode,
+            "session_id": sid,
+            "runtime_session_ids": sorted(set(runtime_sids)),
+            "created_at": float(created_at),
+        }
+    return normalized
 
 
 def _load_state() -> None:
@@ -299,11 +375,17 @@ def _load_state() -> None:
             raise ValueError("scheduler tasks/history have invalid types")
         if isinstance(unread, bool) or not isinstance(unread, int) or unread < 0:
             raise ValueError("scheduler unread_count must be a non-negative integer")
+        cleanup_pending = _normalize_cleanup_intents(
+            loaded.get("cleanup_pending", {}), tasks
+        )
         _state = {
             "tasks": tasks,
             "history": history,
             "unread_count": unread,
+            "cleanup_pending": cleanup_pending,
         }
+        _REVOKED_TASK_IDS.clear()
+        _REVOKED_TASK_IDS.update(cleanup_pending)
         _STATE_ERROR = ""
     except Exception as e:
         _STATE_ERROR = "scheduler state could not be loaded; original file preserved"
@@ -714,68 +796,257 @@ def list_task_history(tid: str, limit: int = 100) -> list[dict]:
     return out
 
 
+def _pending_cleanups_unlocked() -> dict[str, dict]:
+    pending = _state.setdefault("cleanup_pending", {})
+    if not isinstance(pending, dict):
+        raise SchedulerPersistenceError(
+            "scheduler cleanup state is invalid; writes are disabled"
+        )
+    return pending
+
+
+def _make_task_cleanup_intent(
+    tid: str,
+    task: dict,
+    runtime_session_ids: set[str],
+) -> dict:
+    intent = {
+        "task_id": tid,
+        "cleanup_id": str(uuid.uuid4()),
+        "session_mode": _effective_session_mode(task),
+        "session_id": str(task.get("session_id") or ""),
+        "runtime_session_ids": sorted(runtime_session_ids),
+        "created_at": time.time(),
+    }
+    # Reuse the load-time validator so an unsafe legacy task id/session id
+    # cannot be promoted into an automatically executed deletion target.
+    return _normalize_cleanup_intents({tid: intent}, {})[tid]
+
+
+def get_task_cleanup(tid: str) -> dict | None:
+    """Return the durable cleanup intent for an already-removed task."""
+    ensure_available()
+    with _STATE_LOCK:
+        intent = _pending_cleanups_unlocked().get(tid)
+        return copy.deepcopy(intent) if intent is not None else None
+
+
+def list_pending_task_cleanups() -> list[dict]:
+    """Stable snapshot used by startup recovery."""
+    ensure_available()
+    with _STATE_LOCK:
+        return copy.deepcopy(list(_pending_cleanups_unlocked().values()))
+
+
+def _record_task_cleanup_runtime_sessions(
+    tid: str,
+    cleanup_id: str,
+    session_ids: set[str],
+) -> dict | None:
+    """Persist newly observed live owners before attempting disconnects."""
+    invalid = [sid for sid in session_ids if not _valid_cleanup_id(sid)]
+    if invalid:
+        raise SchedulerPersistenceError(
+            "scheduler cleanup observed an invalid runtime session id"
+        )
+    with _STATE_LOCK:
+        pending = _pending_cleanups_unlocked()
+        current = pending.get(tid)
+        if current is None:
+            return None
+        if current.get("cleanup_id") != cleanup_id:
+            raise RuntimeError("scheduler cleanup intent changed during retry")
+        merged = sorted(set(current.get("runtime_session_ids", [])) | session_ids)
+        if merged == current.get("runtime_session_ids", []):
+            return copy.deepcopy(current)
+        snapshot = copy.deepcopy(_state)
+        current["runtime_session_ids"] = merged
+        try:
+            _save_state()
+        except Exception:
+            _restore_state(snapshot)
+            raise
+        return copy.deepcopy(current)
+
+
+def _complete_task_cleanup(tid: str, cleanup_id: str) -> bool:
+    """Atomically acknowledge one exact cleanup intent."""
+    with _STATE_LOCK:
+        pending = _pending_cleanups_unlocked()
+        current = pending.get(tid)
+        if current is None:
+            return False
+        if current.get("cleanup_id") != cleanup_id:
+            raise RuntimeError("scheduler cleanup intent changed during completion")
+        snapshot = copy.deepcopy(_state)
+        pending.pop(tid)
+        try:
+            _save_state()
+        except Exception:
+            _restore_state(snapshot)
+            raise
+        return True
+
+
 def delete_task(tid: str, *, purge_bound_session: bool = True) -> bool:
-    """Delete a task and (only for reuse-mode) its bound session.
+    """Durably remove a task, then finish or expose its cleanup transaction.
 
-    Behavior by mode (chosen 2026-05-28 per user spec):
-      * reuse — delete the bound session too. There's exactly one; no
-        per-run history apart from what's inside that JSONL; orphaning
-        it would litter the history picker with un-attributable
-        `[定时] xxx` rows.
-      * fresh — DON'T touch any sessions. Each prior run is its own
-        independent session with potentially valuable history snapshots;
-        cascading delete could nuke dozens at once. The user can multi-
-        select and delete in the regular sessions list if they want.
-
-    Returns True if the task existed and got removed."""
+    The task row and cleanup intent are committed by one atomic scheduler.json
+    replacement. Failed external cleanup therefore leaves a stable tid that
+    synchronous callers and the HTTP endpoint can retry idempotently.
+    """
     ensure_available()
     with _RUN_REGISTRY_LOCK:
-        if purge_bound_session and any(
-            owner_tid == tid and not task.done()
+        active_owners = [
+            task
             for task, owner_tid in tuple(_RUN_TASK_IDS.items())
-        ):
+            if owner_tid == tid and not task.done()
+        ]
+        runtime_session_ids = {
+            sid
+            for task in active_owners
+            if (sid := _RUN_SESSION_IDS.get(task))
+        }
+        if purge_bound_session and active_owners:
             raise RuntimeError(
                 "cannot synchronously delete a running scheduler task; "
                 "use the async API cleanup path"
             )
         with _STATE_LOCK:
+            pending = _pending_cleanups_unlocked()
+            task = _state["tasks"].get(tid)
+            intent = pending.get(tid)
+            if task is None and intent is None:
+                return tid in _REVOKED_TASK_IDS
+            if task is not None and intent is not None:
+                raise SchedulerPersistenceError(
+                    "scheduler task conflicts with a pending cleanup intent"
+                )
+
             snapshot = copy.deepcopy(_state)
-            t = _state["tasks"].pop(tid, None)
-            if not t:
-                return False
-            # Fence while registration is excluded. A task created just
-            # before this critical section either appears above and rejects
-            # the sync cascade, or starts afterward and observes revocation.
             was_revoked = tid in _REVOKED_TASK_IDS
-            _REVOKED_TASK_IDS.add(tid)
-            mode = _effective_session_mode(t)
-            sid = t.get("session_id")
             try:
+                if task is not None:
+                    intent = _make_task_cleanup_intent(
+                        tid, task, runtime_session_ids
+                    )
+                    _state["tasks"].pop(tid)
+                    pending[tid] = intent
+                else:
+                    merged = sorted(
+                        set(intent.get("runtime_session_ids", []))
+                        | runtime_session_ids
+                    )
+                    if merged != intent.get("runtime_session_ids", []):
+                        intent["runtime_session_ids"] = merged
+                _REVOKED_TASK_IDS.add(tid)
                 _save_state()
             except Exception:
                 _restore_state(snapshot)
                 if not was_revoked:
                     _REVOKED_TASK_IDS.discard(tid)
                 raise
-    # Cascade OUTSIDE the lock — the purge touches disk (SDK JSONL, sidecar,
-    # attachments) and must not stall other scheduler state operations.
-    # purge_session_storage is the same full-cleanup path the HTTP session
-    # delete uses; the old sess.delete_session-only call left the SDK JSONL
-    # behind, so the "deleted" session could re-appear in the session list.
-    if purge_bound_session and mode == "reuse" and sid:
+            intent = copy.deepcopy(intent)
+
+    if not purge_bound_session:
+        return True
+    if intent.get("runtime_session_ids"):
+        raise RuntimeError(
+            "cannot synchronously finish cleanup with recorded runtime owners; "
+            "use the async API cleanup path"
+        )
+    if intent["session_mode"] == "reuse" and intent.get("session_id"):
         try:
             from .chat import purge_session_storage
-            purge_session_storage(sid)
+            purge_session_storage(intent["session_id"])
         except Exception as e:
             sys.stderr.write(
-                f"[scheduler] delete_task({tid}): bound session {sid} "
-                f"cleanup failed: {e}\n")
-            # The task removal is already durable and cannot be safely rolled
-            # back after a potentially-partial filesystem purge. Still, never
-            # report the compound operation as success while its bound session
-            # may remain visible; callers can surface/retry the cleanup error.
+                f"[scheduler] delete_task({tid}): bound session "
+                f"{intent['session_id']} cleanup failed: {e}\n"
+            )
             raise
+    # A concurrent idempotent cleaner may already have acknowledged the exact
+    # intent. Missing here is success; a different cleanup_id raises above.
+    _complete_task_cleanup(tid, intent["cleanup_id"])
     return True
+
+
+async def finish_task_cleanup(tid: str) -> bool:
+    """Finish one durable deletion intent; safe to retry by task id."""
+    ensure_available()
+    async with _cleanup_lock(tid):
+        intent = get_task_cleanup(tid)
+        if intent is None:
+            return tid in _REVOKED_TASK_IDS
+
+        runs, _, observed_session_ids = cancel_runs_for_task_now(tid)
+        runtime_session_ids = (
+            set(intent.get("runtime_session_ids", []))
+            | observed_session_ids
+        )
+        record_error: Exception | None = None
+        try:
+            refreshed = _record_task_cleanup_runtime_sessions(
+                tid,
+                intent["cleanup_id"],
+                runtime_session_ids,
+            )
+            if refreshed is not None:
+                intent = refreshed
+        except Exception as exc:
+            # Runtime owners are already cancelled. Still disconnect and join
+            # them before surfacing the persistence failure; the durable intent
+            # remains available after restart.
+            record_error = exc
+
+        disconnect_errors: list[BaseException] = []
+        if runtime_session_ids:
+            from .chat import disconnect_client
+            results = await asyncio.gather(
+                *(disconnect_client(sid) for sid in sorted(runtime_session_ids)),
+                return_exceptions=True,
+            )
+            disconnect_errors = [
+                result
+                for result in results
+                if isinstance(result, BaseException)
+            ]
+        joined = await join_cancelled_runs(runs)
+
+        if record_error is not None:
+            raise record_error
+        if disconnect_errors:
+            raise disconnect_errors[0]
+        if not joined:
+            raise RuntimeError(
+                "scheduler runtime owner did not stop before cleanup timeout"
+            )
+
+        if intent["session_mode"] == "reuse" and intent.get("session_id"):
+            from .chat import purge_session_storage_async
+            await purge_session_storage_async(intent["session_id"])
+
+        if _complete_task_cleanup(tid, intent["cleanup_id"]):
+            return True
+        # Another idempotent cleaner may have acknowledged the same record.
+        if get_task_cleanup(tid) is None:
+            return True
+        raise RuntimeError("scheduler cleanup intent changed during completion")
+
+
+async def _resume_pending_task_cleanups() -> None:
+    """Best-effort startup recovery for deletion transactions."""
+    for intent in list_pending_task_cleanups():
+        tid = intent["task_id"]
+        try:
+            await finish_task_cleanup(tid)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            sys.stderr.write(
+                f"[scheduler] pending cleanup {tid} remains retryable "
+                f"after {type(exc).__name__}: {exc}\n"
+            )
 
 
 def list_history(limit: int = 50) -> list[dict]:
@@ -1454,6 +1725,11 @@ async def start_scheduler() -> None:
         except Exception:
             _restore_state(state_snapshot)
             raise
+    # Resolve crash-interrupted deletions before starting new scheduled work.
+    # Failures are logged and retain their exact durable intent, so scheduler
+    # availability does not depend on one damaged external session tree.
+    await _resume_pending_task_cleanups()
+
     # Kick off catch-up runs — staggered so an overnight outage with many
     # daily tasks doesn't spawn every CLI subprocess at once (thundering
     # herd). Each carries the same done-callback the tick loop uses, so a
