@@ -1701,7 +1701,7 @@ def test_activity_center_groups_by_attention_order_and_read_state():
     custom_sort = app.index("const aManual = Number.isFinite")
     assert "if (aManual !== bManual) return aManual ? 1 : -1" in app[custom_sort:]
     assert "Number(a.group_order) - Number(b.group_order)" in app[custom_sort:]
-    assert 'group.key === "custom:__ungrouped__"' in app[custom_sort:]
+    assert 'groupKey === "custom:__ungrouped__"' in app[custom_sort:]
     assert "this._activityAppliedSeq = ++this._activityRequestSeq" in app
     assert '"/api/activity/events-ticket"' in app
     assert "new EventSource(" in app
@@ -1805,6 +1805,33 @@ def test_activity_center_searches_loaded_sessions_before_group_caps():
     assert "group.custom && !activitySearchQuery()" in html
     assert ".activity-searchbar" in css
     assert ".activity-search-empty" in css
+
+
+def test_activity_event_storage_and_derived_work_are_hard_bounded():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    fetch_start = app.index("    async fetchActivity(opts = {}) {")
+    fetch_end = app.index("\n    async openActivityCenter()", fetch_start)
+    fetch_activity = app[fetch_start:fetch_end]
+    derived_start = app.index("    _activityDerivedSnapshot() {")
+    derived_end = app.index("\n    normalizeActivityGroupOrder", derived_start)
+    derived = app[derived_start:derived_end]
+    update_start = app.index("    _applyActivityUpdate(payload) {")
+    update_end = app.index("\n    async _startActivityEvents()", update_start)
+    update = app[update_start:update_end]
+
+    assert "ACTIVITY_EVENT_CAP: 500" in app
+    assert "data.events.slice(0, this.ACTIVITY_EVENT_CAP)" in fetch_activity
+    assert ".slice(0, this.ACTIVITY_EVENT_CAP)" in update
+    assert "const _activityDerivedCaches = new WeakMap()" in app
+    assert "events: source.slice(0, limit)" in derived
+    assert "cache.source !== rawSource" in derived
+    assert "cache.groups.has(cacheKey)" in app
+    assert "cache.groups.set(cacheKey, events)" in app
+    count_start = app.index("    activitySearchResultCount() {")
+    count_end = app.index("\n    clearActivitySearch()", count_start)
+    search_count = app[count_start:count_end]
+    assert "this._activityDerivedSnapshot()" in search_count
+    assert "cache.events" in search_count
 
 
 def test_memory_recall_details_use_a_root_fixed_portal():

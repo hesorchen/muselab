@@ -184,13 +184,21 @@ const _mcpFmtCache  = new WeakMap();   // raw msg -> { kind, value }
 const _readLinesCache = new WeakMap(); // raw msg -> { src, lines }
 const _searchHitsCache = new WeakMap();// raw msg -> { src, hits }
 const _toolMdCache = new WeakMap();    // raw msg -> { src, html }
+// Activity grouping/search runs from several Alpine expressions per render.
+// Keep its derived snapshot off reactive state so populating the cache cannot
+// itself schedule another render. Weak keys let each portal instance GC.
+const _activityDerivedCaches = new WeakMap(); // raw portal -> derived snapshot
+function _rawAlpine(value) {
+  try {
+    return (window.Alpine && typeof Alpine.raw === "function")
+      ? Alpine.raw(value) : value;
+  } catch (_) { return value; }
+}
 // Unwrap an Alpine reactive proxy to its stable underlying object so the
 // WeakMap key is identity-stable across renders. Falls back to the proxy
 // (Alpine v3 caches proxies per target, so even that key is stable).
 function _rawMsg(m) {
-  try {
-    return (window.Alpine && typeof Alpine.raw === "function") ? Alpine.raw(m) : m;
-  } catch (_) { return m; }
+  return _rawAlpine(m);
 }
 
 // Module-level constants reused by hot-path helpers below. Hoisted out of the
@@ -30519,8 +30527,9 @@ function portal() {
             );
           }
           if (!opts.summaryOnly && Array.isArray(data.events)) {
-            this.activity.events = data.events;
-            this._syncScheduledActivitySnapshot(data.events);
+            const events = data.events.slice(0, this.ACTIVITY_EVENT_CAP);
+            this.activity.events = events;
+            this._syncScheduledActivitySnapshot(events);
           }
           if (!opts.summaryOnly) this.applyActivityGroupPayload(data);
           this._syncAppBadge();
@@ -30592,12 +30601,37 @@ function portal() {
         { key: "history", label: zh ? "历史任务" : "History" },
       ];
     },
+    ACTIVITY_EVENT_CAP: 500,
     ACTIVITY_GROUP_CAP: 5,
     ACTIVITY_CUSTOM_GROUP_CAP: 50,
     ACTIVITY_TIMELINE_CAP: 15,
     ACTIVITY_GROUP_COLORS: [
       "blue", "violet", "cyan", "green", "amber", "rose", "gray",
     ],
+    _activityDerivedSnapshot() {
+      const source = Array.isArray(this.activity.events)
+        ? this.activity.events : [];
+      const owner = _rawAlpine(this);
+      const rawSource = _rawAlpine(source);
+      const query = this.activitySearchQuery();
+      const lang = String(this.lang || "");
+      const limit = Math.max(0, Number(this.ACTIVITY_EVENT_CAP) || 0);
+      let cache = _activityDerivedCaches.get(owner);
+      if (!cache || cache.source !== rawSource || cache.query !== query
+          || cache.lang !== lang || cache.limit !== limit) {
+        cache = {
+          source: rawSource,
+          query,
+          lang,
+          limit,
+          events: source.slice(0, limit),
+          groups: new Map(),
+          searchCount: null,
+        };
+        _activityDerivedCaches.set(owner, cache);
+      }
+      return cache;
+    },
     normalizeActivityGroupOrder(order = this.activity.groupOrder) {
       const customIds = (this.activity.customGroups || [])
         .map(group => String(group.id || "")).filter(Boolean);
@@ -30684,8 +30718,13 @@ function portal() {
       return fields.some(value => String(value || "").toLocaleLowerCase().includes(query));
     },
     activitySearchResultCount() {
-      if (!this.activitySearchQuery()) return (this.activity.events || []).length;
-      return (this.activity.events || []).filter(item => this.activityMatchesSearch(item)).length;
+      const cache = this._activityDerivedSnapshot();
+      if (!cache.query) return cache.events.length;
+      if (cache.searchCount === null) {
+        cache.searchCount = cache.events
+          .filter(item => this.activityMatchesSearch(item)).length;
+      }
+      return cache.searchCount;
     },
     clearActivitySearch() {
       if (!this.activitySearchQuery()) {
@@ -30698,6 +30737,11 @@ function portal() {
       return Number(item?.updated_at || item?.finished_at || item?.started_at || 0);
     },
     activityAllEvents(group) {
+      const cache = this._activityDerivedSnapshot();
+      const groupKey = String(group?.key || "");
+      const custom = !!group?.custom;
+      const cacheKey = `${groupKey}|${Number(custom)}`;
+      if (cache.groups.has(cacheKey)) return cache.groups.get(cacheKey);
       const activeRank = { waiting_approval: 0, paused: 1, running: 2 };
       const attentionRank = item => {
         if (this.activityRequiresAction(item)) return 0;
@@ -30705,18 +30749,18 @@ function portal() {
         if (["running", "waiting_approval", "paused"].includes(item.state)) return 2;
         return 3;
       };
-      return (this.activity.events || [])
-        .filter(item => this.activityMatchesGroup(item, group.key))
+      const events = cache.events
+        .filter(item => this.activityMatchesGroup(item, groupKey))
         // Search before applying the per-group row cap so a matching older
         // session remains discoverable even when it was outside the first page.
         .filter(item => this.activityMatchesSearch(item))
         .sort((a, b) => {
-          if (group.key === "timeline") {
+          if (groupKey === "timeline") {
             const pinRank = Number(!!b.pinned) - Number(!!a.pinned);
             if (pinRank) return pinRank;
             return this.activityEventTimestamp(b) - this.activityEventTimestamp(a);
           }
-          if (group.custom) {
+          if (custom) {
             const aManual = Number.isFinite(Number(a.group_order));
             const bManual = Number.isFinite(Number(b.group_order));
             // Newly arrived rows without a manual position remain visible at the
@@ -30726,7 +30770,7 @@ function portal() {
               const order = Number(a.group_order) - Number(b.group_order);
               if (order) return order;
             }
-            if (group.key === "custom:__ungrouped__") {
+            if (groupKey === "custom:__ungrouped__") {
               return this.activityEventTimestamp(b) - this.activityEventTimestamp(a);
             }
             const pinRank = Number(!!b.pinned) - Number(!!a.pinned);
@@ -30735,12 +30779,14 @@ function portal() {
             if (rank) return rank;
             return this.activityEventTimestamp(b) - this.activityEventTimestamp(a);
           }
-          if (group.key === "running") {
+          if (groupKey === "running") {
             const rank = (activeRank[a.state] ?? 9) - (activeRank[b.state] ?? 9);
             if (rank) return rank;
           }
           return this.activityEventTimestamp(b) - this.activityEventTimestamp(a);
         });
+      cache.groups.set(cacheKey, events);
+      return events;
     },
     activityEvents(group) {
       const all = this.activityAllEvents(group);
@@ -31558,7 +31604,8 @@ function portal() {
         const at = this.activity.events.findIndex(row => row.id === item.id);
         if (at >= 0) this.activity.events.splice(at, 1, item);
         else this.activity.events.unshift(item);
-        this.activity.events = [...this.activity.events];
+        this.activity.events = this.activity.events
+          .slice(0, this.ACTIVITY_EVENT_CAP);
         this._applyScheduledActivity(item);
       }
       const acked = new Set(

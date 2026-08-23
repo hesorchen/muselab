@@ -29,6 +29,122 @@ def _login(page: Page, base: str, token: str) -> None:
     )
 
 
+def test_activity_event_retention_and_derived_cache_are_bounded(
+    page: Page, backend_url, auth_token,
+):
+    _login(page, backend_url, auth_token)
+
+    result = page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          app._stopActivityEvents();
+          app._abortActivityFetches();
+          await Promise.allSettled(
+            Object.values(app._activityFetchPromises || {}));
+          const nativeFetch = window.fetch;
+          try {
+            const sourceRows = Array.from({length: 620}, (_, index) => ({
+              id: `evt-${index}`,
+              kind: 'turn',
+              session_id: `session-${index}`,
+              task_summary: `task ${index}`,
+              state: 'completed',
+              read: true,
+              updated_at: 620 - index,
+            }));
+            window.fetch = async url => {
+              if (String(url).startsWith('/api/activity?')) {
+                return new Response(JSON.stringify({
+                  events: sourceRows,
+                  summary: {
+                    generation: 'cap-test', revision: 1,
+                    running: 0, unread: 0, attention: 0,
+                    groups: {
+                      review: 0, running: 0, failed: 0, history: 620,
+                    },
+                    group_unread: {
+                      review: 0, running: 0, failed: 0, history: 0,
+                    },
+                    workspaces: [],
+                  },
+                }), {
+                  status: 200,
+                  headers: {
+                    'Content-Type': 'application/json',
+                    'ETag': '"cap-test"',
+                  },
+                });
+              }
+              return nativeFetch(url);
+            };
+            app._activityEtags = {};
+            app._activityGeneration = '';
+            app._activityRevision = 0;
+            app._activityAppliedSeq = 0;
+            app._activityRequestSeq = 0;
+            app.activity.events = [];
+            const loaded = await app.fetchActivity();
+            const snapshotLength = app.activity.events.length;
+            const timeline = {key: 'timeline'};
+            const firstDerived = app.activityAllEvents(timeline);
+            const repeatedDerived = app.activityAllEvents(timeline);
+
+            app._applyActivityUpdate({
+              generation: 'cap-test',
+              revision: 2,
+              item: {
+                id: 'evt-live', kind: 'turn', session_id: 'session-live',
+                task_summary: 'live task', state: 'running', read: true,
+                updated_at: 10_000,
+              },
+            });
+            const afterUpdate = app.activityAllEvents(timeline);
+            const repeatedAfterUpdate = app.activityAllEvents(timeline);
+            const stateLengthAfterUpdate = app.activity.events.length;
+            const newestAfterUpdate = afterUpdate[0]?.id || '';
+            const droppedOldest = !app.activity.events.some(
+              row => row.id === 'evt-499');
+
+            app.activity.events = Array.from({length: 700}, (_, index) => ({
+              id: `overflow-${index}`,
+              state: 'completed',
+              read: true,
+              updated_at: index,
+            }));
+            app.activity.query = '';
+            const boundedDerived = app.activityAllEvents(timeline).length;
+            const boundedCount = app.activitySearchResultCount();
+            app.activity.query = 'overflow';
+            const boundedSearchCount = app.activitySearchResultCount();
+            return {
+              loaded, snapshotLength, stateLengthAfterUpdate,
+              newestAfterUpdate, droppedOldest,
+              reusedSnapshot: firstDerived === repeatedDerived,
+              invalidatedOnUpdate: firstDerived !== afterUpdate,
+              reusedAfterUpdate: afterUpdate === repeatedAfterUpdate,
+              boundedDerived, boundedCount, boundedSearchCount,
+            };
+          } finally {
+            window.fetch = nativeFetch;
+          }
+        }"""
+    )
+
+    assert result == {
+        "loaded": True,
+        "snapshotLength": 500,
+        "stateLengthAfterUpdate": 500,
+        "newestAfterUpdate": "evt-live",
+        "droppedOldest": True,
+        "reusedSnapshot": True,
+        "invalidatedOnUpdate": True,
+        "reusedAfterUpdate": True,
+        "boundedDerived": 500,
+        "boundedCount": 500,
+        "boundedSearchCount": 500,
+    }
+
+
 def test_memory_shortcut_opens_memory_settings_page(
     page: Page, backend_url, auth_token
 ):
