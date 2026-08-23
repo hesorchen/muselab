@@ -37,6 +37,10 @@
 <meta name="theme-color" content="#f5f0e0" />
 
 <link rel="stylesheet" href="/static/styles.css" />
+<!-- File-tree hydration imports this tiny module on every authenticated cold
+     boot. Fetch it alongside the main bundle so the high-latency proxy does not
+     add another round trip after app.js starts executing. -->
+<link rel="modulepreload" href="/static/modules/persistent-cache.mjs" />
 <!-- highlight.js theme CSS preloaded (4 KB) so highlighted code blocks
      don't FOUC when hljs lazy-loads. The 124 KB hljs script itself is
      lazy-loaded via `_loadHljs()` in app.js on first highlightCode()
@@ -3632,7 +3636,9 @@
     <template x-if="previewQuote.mode === 'actions'">
       <div class="preview-selection-actions" role="toolbar"
            :aria-label="lang === 'zh' ? '选中内容操作' : 'Selection actions'">
-        <button type="button" @pointerdown.prevent @click="quotePreviewSelection()"
+        <button type="button"
+                @pointerdown="activatePreviewSelectionAction($event, 'quote')"
+                @click="activatePreviewSelectionAction($event, 'quote')"
                 :title="lang === 'zh' ? '作为文本附件引用' : 'Attach as quoted text'">
           <svg viewBox="0 0 24 24" aria-hidden="true">
             <path d="M7 17h4V9H5v6a2 2 0 0 0 2 2Zm10 0h2V9h-6v6a2 2 0 0 0 2 2h2Z"/>
@@ -3640,7 +3646,9 @@
           <span x-text="lang === 'zh' ? '引用' : 'Quote'"></span>
         </button>
         <span class="preview-selection-divider" aria-hidden="true"></span>
-        <button type="button" @pointerdown.prevent @click="openPreviewSelectionAsk()"
+        <button type="button"
+                @pointerdown="activatePreviewSelectionAction($event, 'ask')"
+                @click="activatePreviewSelectionAction($event, 'ask')"
                 :title="lang === 'zh' ? '展开独立侧问' : 'Open an independent side question'">
           <svg viewBox="0 0 24 24" aria-hidden="true">
             <path d="M12 3a7 7 0 0 0-4.7 12.2L6 20l4.2-1.4A7 7 0 1 0 12 3Zm0 3.1a2.7 2.7 0 0 1 1.2 5.1c-.8.4-1.2.8-1.2 1.6v.3h-1.8v-.5c0-1.3.6-2.1 1.8-2.7.6-.3.9-.8.9-1.3 0-.7-.5-1.2-1.3-1.2-.7 0-1.3.4-1.8 1.1L8.5 7.4A4 4 0 0 1 12 6.1Zm-1.9 8.4H12V16h-1.9v-1.5Z"/>
