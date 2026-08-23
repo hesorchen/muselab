@@ -91,6 +91,27 @@ def _guard_not_trash(target: Path, root: Path | None = None) -> None:
             )
 
 
+def _guard_not_workspace_root(
+    target: Path,
+    root: Path | None = None,
+) -> None:
+    """Never let a file mutation consume a registered workspace root.
+
+    safe_resolve follows symlinks by design, so a link inside one workspace
+    may resolve to the exact root of another registered workspace. Compare
+    canonical targets across the registry before any recursive delete or
+    rename can turn that supported navigation feature into data loss.
+    """
+    roots = {_root_or_default(root), *workspace_registry.paths()}
+    for workspace in roots:
+        try:
+            if target == workspace.resolve():
+                raise HTTPException(
+                    status_code=400, detail="cannot delete a workspace root")
+        except (OSError, RuntimeError):
+            continue
+
+
 def _ensure_trash_dir(root: Path | None = None) -> Path:
     d = _trash_dir(root)
     ensure_private_directory(d)
@@ -1406,6 +1427,7 @@ def delete(
     target = safe_resolve(req.path, root=root)
     if not target.exists():
         raise HTTPException(status_code=404, detail="not found")
+    _guard_not_workspace_root(target, root)
     _guard_not_trash(target, root)
     if permanent:
         was_directory = target.is_dir() and not target.is_symlink()

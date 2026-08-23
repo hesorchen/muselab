@@ -209,6 +209,63 @@ def test_delete_nonempty_dir_permanent_still_works(client, auth, temp_root):
     assert not (temp_root / ".muselab-dustbin" / "notes").exists()
 
 
+def test_delete_rejects_selected_workspace_root(client, auth, temp_root):
+    marker = temp_root / "README.md"
+
+    soft = client.request(
+        "DELETE",
+        "/api/files/delete",
+        headers=auth,
+        json={"path": "."},
+    )
+    permanent = client.request(
+        "DELETE",
+        "/api/files/delete?permanent=true",
+        headers=auth,
+        json={"path": ""},
+    )
+
+    assert soft.status_code == 400
+    assert permanent.status_code == 400
+    assert soft.json() == {"detail": "cannot delete a workspace root"}
+    assert permanent.json() == {"detail": "cannot delete a workspace root"}
+    assert temp_root.is_dir()
+    assert marker.is_file()
+
+
+def test_delete_rejects_symlink_to_registered_workspace_root(
+    client,
+    auth,
+    temp_root,
+    tmp_path,
+):
+    other = tmp_path / "registered-workspace"
+    other.mkdir()
+    marker = other / "must-survive.txt"
+    marker.write_text("preserve", encoding="utf-8")
+    registered = client.post(
+        "/api/chat/workspaces",
+        headers=auth,
+        json={"path": str(other)},
+    )
+    assert registered.status_code == 200
+    link = temp_root / "registered-root-link"
+    link.symlink_to(other, target_is_directory=True)
+
+    response = client.request(
+        "DELETE",
+        "/api/files/delete?permanent=true",
+        headers=auth,
+        json={"path": link.name},
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {"detail": "cannot delete a workspace root"}
+    assert link.is_symlink()
+    assert other.is_dir()
+    assert marker.read_text(encoding="utf-8") == "preserve"
+
+
 def test_permanent_delete_failure_is_not_reported_as_success(
     client,
     auth,
