@@ -2317,9 +2317,13 @@ def test_inherited_task_poller_waits_for_durable_agent_projection():
 
 def test_active_turn_user_installation_dedupes_without_repeated_scroll():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
-    helper_start = app.index("    _installActiveTurnUser(")
+    helper_start = app.index("    _activeTurnUserSignature(")
     helper_end = app.index("\n    // Poll /active", helper_start)
     helper = app[helper_start:helper_end]
+    assert "const tailUser = messages[messages.length - 1];" in helper
+    assert "this._activeTurnUserSignature(" in helper
+    assert "tailUser.text, tailUser.images, tailUser.docs" in helper
+    assert "let lastUser" not in helper
     assert "let appended = false;" in helper
     assert "appended = true;" in helper
     assert "return { message: turnUser, appended };" in helper

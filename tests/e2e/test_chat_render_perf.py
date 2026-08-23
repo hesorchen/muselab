@@ -3298,6 +3298,95 @@ def test_load_session_reconnects_active_turn_and_renders_live_assistant(
     _assert_no_browser_errors(page, errors)
 
 
+def test_active_turn_adoption_requires_physical_tail_and_full_prompt_envelope(
+    page: Page, backend_url, auth_token,
+):
+    """Repeated text and attachment-only prompts cannot claim an older row."""
+    _login(page, backend_url, auth_token)
+    result = _app_eval(
+        page,
+        """
+        const makeState = (sid, messages) => {
+          const st = app._blankTabState();
+          st._sid = sid;
+          st.messages = messages;
+          st.messageRange.visibleStart = 0;
+          st.messageRange.visibleEnd = messages.length;
+          st.messageRange.total = messages.length;
+          app.tabState[sid] = st;
+          return st;
+        };
+
+        const repeated = makeState("active-repeat", [
+          { role: "user", text: "继续" },
+          { role: "assistant", text: "旧回复" },
+        ]);
+        const repeatedResult = app._installActiveTurnUser(
+          repeated, "turn-repeat", "继续", [], [],
+        );
+
+        const attachmentOnly = makeState("active-attachment", [
+          { role: "user", text: "", images: [
+            { mime: "image/png", url: "/old.png" },
+          ], docs: [] },
+        ]);
+        const attachmentResult = app._installActiveTurnUser(
+          attachmentOnly, "turn-attachment", "", [
+            { mime: "image/png", url: "/new.png" },
+          ], [],
+        );
+
+        const exactTail = makeState("active-exact-tail", [
+          { role: "user", text: "", images: [
+            { url: "/same.png", mime: "image/png" },
+          ], docs: [{ kind: "text", name: "notes.md" }] },
+        ]);
+        const exactResult = app._installActiveTurnUser(
+          exactTail, "turn-exact", "", [
+            { mime: "image/png", url: "/same.png" },
+          ], [{ name: "notes.md", kind: "text" }],
+        );
+
+        return {
+          repeated: {
+            appended: repeatedResult.appended,
+            length: repeated.messages.length,
+            oldTurnId: repeated.messages[0]._turnId || "",
+            tailTurnId: repeated.messages.at(-1)._turnId || "",
+          },
+          attachment: {
+            appended: attachmentResult.appended,
+            length: attachmentOnly.messages.length,
+            oldTurnId: attachmentOnly.messages[0]._turnId || "",
+            tailTurnId: attachmentOnly.messages.at(-1)._turnId || "",
+          },
+          exact: {
+            appended: exactResult.appended,
+            length: exactTail.messages.length,
+            tailTurnId: exactTail.messages.at(-1)._turnId || "",
+          },
+        };
+        """,
+    )
+    assert result["repeated"] == {
+        "appended": True,
+        "length": 3,
+        "oldTurnId": "",
+        "tailTurnId": "turn-repeat",
+    }
+    assert result["attachment"] == {
+        "appended": True,
+        "length": 2,
+        "oldTurnId": "",
+        "tailTurnId": "turn-attachment",
+    }
+    assert result["exact"] == {
+        "appended": False,
+        "length": 1,
+        "tailTurnId": "turn-exact",
+    }
+
+
 def test_desktop_done_reconcile_preserves_live_message_dom_identity(
     page: Page, backend_url, auth_token,
 ):

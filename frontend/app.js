@@ -8519,6 +8519,35 @@ function portal() {
       sync.inheritedTicksLeft = 0;
       return true;
     },
+    _activeTurnUserSignature(text = "", images = [], docs = []) {
+      const normalize = (value, seen = new WeakSet()) => {
+        if (value === null || typeof value === "string"
+            || typeof value === "boolean") return value;
+        if (typeof value === "number") {
+          return Number.isFinite(value) ? value : String(value);
+        }
+        if (typeof value === "undefined") return null;
+        if (Array.isArray(value)) {
+          return value.map(item => normalize(item, seen));
+        }
+        if (typeof value === "object") {
+          if (seen.has(value)) return "[circular]";
+          seen.add(value);
+          const normalized = {};
+          Object.keys(value).sort().forEach((key) => {
+            normalized[key] = normalize(value[key], seen);
+          });
+          seen.delete(value);
+          return normalized;
+        }
+        return String(value);
+      };
+      return JSON.stringify(normalize({
+        text: String(text || ""),
+        images: Array.isArray(images) ? images : [],
+        docs: Array.isArray(docs) ? docs : [],
+      }));
+    },
     _installActiveTurnUser(st, turnId, text = "", images = [], docs = []) {
       if (!st || !(text || images.length || docs.length)) return null;
       const messages = st.messages || [];
@@ -8526,19 +8555,17 @@ function portal() {
         ? messages.find(message => message && message.role === "user"
           && message._turnId === turnId)
         : null;
-      let lastUser = null;
-      for (let i = messages.length - 1; i >= 0; i -= 1) {
-        if (messages[i] && messages[i].role === "user") {
-          lastUser = messages[i];
-          break;
-        }
-      }
+      const tailUser = messages[messages.length - 1];
       // A canonical history load may already have installed this prompt without
-      // MuseLab's live turn id. Adopt that newest matching row before appending.
-      if (!turnUser && turnId && lastUser && !lastUser._turnId
-          && (lastUser.text || "") === text) {
-        lastUser._turnId = turnId;
-        turnUser = lastUser;
+      // MuseLab's live turn id. Only the physical tail can belong to the active
+      // turn, and the complete prompt envelope must match before it is adopted.
+      if (!turnUser && turnId && tailUser && tailUser.role === "user"
+          && !tailUser._turnId
+          && this._activeTurnUserSignature(
+            tailUser.text, tailUser.images, tailUser.docs,
+          ) === this._activeTurnUserSignature(text, images, docs)) {
+        tailUser._turnId = turnId;
+        turnUser = tailUser;
       }
       let appended = false;
       if (!turnUser) {
