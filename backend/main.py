@@ -396,17 +396,27 @@ async def _lifespan(app: FastAPI):
     must come up even if peripheral subsystems are degraded."""
     import asyncio as _asyncio
 
+    from . import chat as _chat
+    from . import files as _files
     from . import sessions as _sess
     from .activity import activity as _activity
     from .todos import todos as _todos
     from . import scheduler as _sched
     from . import push as _push
     from . import memory_client as _mem0
-    # Historical releases inherited the process umask for session sidecars.
-    # Repair those permissions only once the final runtime SESS_DIR is known;
-    # doing it during import leaks across hermetic test fixtures.
+    from .workspaces import registry as _workspace_registry
+    # Historical releases inherited the process umask for internal state.
+    # Repair permissions only once test fixtures and the workspace registry
+    # have selected their final runtime paths.
+    private_roots = {ROOT, *_workspace_registry.paths()}
     await _asyncio.gather(
         _asyncio.to_thread(_sess.ensure_private_session_storage),
+        _asyncio.to_thread(_chat.ensure_private_attachment_storage),
+        *(
+            _asyncio.to_thread(
+                _files.ensure_private_trash_storage, root, create=False)
+            for root in private_roots
+        ),
         _asyncio.to_thread(_activity.initialize_runtime_state),
         _asyncio.to_thread(_todos.initialize_runtime_state),
     )

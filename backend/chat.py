@@ -82,6 +82,14 @@ from .ask_user_question import (
 from . import permission_request as perm
 from . import memory_client as mem0
 from . import observability as obs
+from .private_storage import (
+    UnsafePrivatePath,
+    ensure_private_directory,
+    ensure_private_regular_file,
+    private_path_kind,
+    repair_private_path,
+    write_private_bytes,
+)
 from .sdk_compat import UnsignedThinkingCompatibleClient
 
 # Compatibility export: tests and local tooling construct durable interrupted
@@ -3677,6 +3685,43 @@ def _attachments_base() -> Path:
     return ROOT / ".muselab-attach"
 
 
+def _attachment_session_dir(
+    session_id: str,
+    *,
+    create: bool,
+) -> Path | None:
+    """Return a real private session directory without following symlinks."""
+    if not re.fullmatch(r"[A-Za-z0-9_\-]{6,80}", session_id):
+        raise UnsafePrivatePath("invalid attachment session directory")
+    base = _attachments_base()
+    if not ensure_private_directory(base, create=create):
+        return None
+    session_dir = base / session_id
+    if not ensure_private_directory(session_dir, create=create):
+        return None
+    return session_dir
+
+
+def ensure_private_attachment_storage() -> int:
+    """Repair attachment permissions from older umask-dependent releases."""
+    base = _attachments_base()
+    if not ensure_private_directory(base, create=False):
+        return 0
+    repaired = 1
+    for session_dir in base.iterdir():
+        if repair_private_path(session_dir) != "directory":
+            continue
+        repaired += 1
+        try:
+            children = list(session_dir.iterdir())
+        except OSError:
+            continue
+        for attachment in children:
+            if repair_private_path(attachment) == "file":
+                repaired += 1
+    return repaired
+
+
 # Longest filename component we'll write. Keeps `{aid}-{name}` (32 hex + dash
 # + this) comfortably under the 255-byte limit ext4/APFS enforce PER COMPONENT
 # — and that limit is in BYTES, so a CJK name at 3 bytes/char hits it ~3x
@@ -3738,11 +3783,14 @@ def _persist_attachment(session_id: str, aid: str, name: str,
     folder) what the file is.
     """
     safe = _safe_attach_name(name)
-    attach_dir = _attachments_base() / session_id
     try:
-        attach_dir.mkdir(parents=True, exist_ok=True)
+        if not re.fullmatch(r"[A-Za-z0-9\-]{6,80}", aid):
+            raise UnsafePrivatePath("invalid attachment id")
+        attach_dir = _attachment_session_dir(session_id, create=True)
+        if attach_dir is None:
+            raise UnsafePrivatePath("attachment directory is unavailable")
         path = attach_dir / f"{aid}-{safe}"
-        path.write_bytes(data)
+        write_private_bytes(path, data)
     except Exception as e:
         sys.stderr.write(
             f"[attach] persist failed sid={obs.short_id(session_id)} "
@@ -3772,24 +3820,25 @@ def _migrate_legacy_attachments() -> None:
     second-pass migration is a no-op."""
     old_base = sess.SESS_DIR / "attachments"
     new_base = _attachments_base()
-    if not old_base.exists() or old_base == new_base:
+    if private_path_kind(old_base) != "directory" or old_base == new_base:
         return
     try:
-        new_base.mkdir(parents=True, exist_ok=True)
-    except OSError:
+        ensure_private_directory(new_base)
+    except (OSError, UnsafePrivatePath):
         return
     moved = 0
     for child in list(old_base.iterdir()):
-        if not child.is_dir():
+        if private_path_kind(child) != "directory":
             continue
         target = new_base / child.name
-        if target.exists():
+        if private_path_kind(target) != "missing":
             continue  # already migrated; skip (don't clobber)
         try:
             shutil.move(str(child), str(target))
             moved += 1
         except OSError:
             pass
+    ensure_private_attachment_storage()
     # Remove empty old base
     try:
         if not any(old_base.iterdir()):
@@ -5923,11 +5972,14 @@ def _purge_session_storage_disk_locked(sid: str) -> bool:
     # persisted by upload-image → send pipeline). Without this, deleting
     # a session would orphan its image files on disk forever.
     attach_dir = _attachments_base() / sid
-    if attach_dir.exists():
-        try:
-            shutil.rmtree(attach_dir, ignore_errors=True)
-        except OSError:
-            pass
+    try:
+        kind = private_path_kind(attach_dir)
+        if kind == "directory":
+            shutil.rmtree(attach_dir)
+        elif kind in {"file", "symlink", "other"}:
+            attach_dir.unlink()
+    except OSError:
+        pass
     _delete_active_turn_sidecar(sid)
     _delete_cancelled_turn_snapshots(sid)
     _delete_runtime_continuation_outboxes(sid)
@@ -6472,7 +6524,7 @@ def reorder_queue_api(sid: str, req: QueueReorderReq) -> dict:
 # attachments dir actually has children.
 def _gc_orphan_attachments() -> None:
     base = _attachments_base()
-    if not base.exists():
+    if not ensure_private_directory(base, create=False):
         return
     try:
         # list_sessions() intentionally hides sessions belonging to a removed
@@ -6482,7 +6534,7 @@ def _gc_orphan_attachments() -> None:
     except Exception:
         return
     for child in base.iterdir():
-        if not child.is_dir():
+        if repair_private_path(child) != "directory":
             continue
         if child.name not in known_sids:
             try:
@@ -6497,23 +6549,24 @@ def attachments_usage() -> dict:
     can render this so users know how much disk their uploaded images
     have eaten, and can trigger a sweep."""
     base = _attachments_base()
-    if not base.exists():
+    if not ensure_private_directory(base, create=False):
         return {"total_bytes": 0, "file_count": 0, "session_count": 0}
     total = 0
     files = 0
     sessions_with_attach = 0
     for sid_dir in base.iterdir():
-        if not sid_dir.is_dir():
+        if repair_private_path(sid_dir) != "directory":
             continue
         has_any = False
-        for f in sid_dir.iterdir():
-            if f.is_file():
-                try:
-                    total += f.stat().st_size
-                    files += 1
-                    has_any = True
-                except OSError:
-                    pass
+        for attachment in sid_dir.iterdir():
+            if repair_private_path(attachment) != "file":
+                continue
+            try:
+                total += attachment.lstat().st_size
+                files += 1
+                has_any = True
+            except OSError:
+                pass
         if has_any:
             sessions_with_attach += 1
     return {
@@ -9266,15 +9319,15 @@ def _validate_attachment_ref(session_id: str, filename: str) -> Path:
     if ("/" in filename or ".." in filename or "\\" in filename
             or not re.fullmatch(r"[^/\\\x00-\x1f\x7f]{1,200}", filename)):
         raise HTTPException(400, "bad filename")
-    path = _attachments_base() / session_id / filename
-    if not path.exists() or not path.is_file():
-        raise HTTPException(404, "attachment not found")
-    base = _attachments_base().resolve()
-    real = path.resolve()
     try:
-        real.relative_to(base)
-    except ValueError:
-        raise HTTPException(400, "bad path") from None
+        session_dir = _attachment_session_dir(session_id, create=False)
+        if session_dir is None:
+            raise HTTPException(404, "attachment not found")
+        path = session_dir / filename
+        if not ensure_private_regular_file(path):
+            raise HTTPException(404, "attachment not found")
+    except UnsafePrivatePath:
+        raise HTTPException(400, "unsafe attachment storage") from None
     return path
 
 
@@ -12327,12 +12380,15 @@ async def _start_turn(
                     "image/webp": "webp",
                 }
                 ext = ext_map.get(entry["mime"], "bin")
-                attach_dir = _attachments_base() / session_id
                 full_url = None
                 try:
-                    attach_dir.mkdir(parents=True, exist_ok=True)
+                    attach_dir = _attachment_session_dir(
+                        session_id, create=True)
+                    if attach_dir is None:
+                        raise UnsafePrivatePath("attachment directory unavailable")
                     attach_path = attach_dir / f"{aid}.{ext}"
-                    attach_path.write_bytes(_b64.b64decode(entry["b64"]))
+                    write_private_bytes(
+                        attach_path, _b64.b64decode(entry["b64"]))
                     full_url = f"/api/chat/attachments/{session_id}/{aid}.{ext}"
                 except Exception as _e:
                     sys.stderr.write(

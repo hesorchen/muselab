@@ -6,6 +6,7 @@ import json
 import re
 import secrets
 import shutil
+import stat
 import sys
 import threading
 import time
@@ -18,6 +19,13 @@ from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse
 from pydantic import BaseModel
 from .auth import require_token, require_token_query
 from .capability_tickets import tickets
+from .private_storage import (
+    UnsafePrivatePath,
+    ensure_private_directory,
+    ensure_private_regular_file,
+    private_path_kind,
+    repair_private_path,
+)
 from .settings import ROOT, atomic_write_text, env_int
 from .workspaces import (
     registry as workspace_registry,
@@ -85,7 +93,7 @@ def _guard_not_trash(target: Path, root: Path | None = None) -> None:
 
 def _ensure_trash_dir(root: Path | None = None) -> Path:
     d = _trash_dir(root)
-    d.mkdir(parents=True, exist_ok=True)
+    ensure_private_directory(d)
     return d
 
 
@@ -110,14 +118,66 @@ def _valid_trash_id(tid: str) -> bool:
     return bool(tid) and bool(_TRASH_ID_RE.fullmatch(tid))
 
 
+def _read_private_manifest_file(path: Path) -> dict | None:
+    """Read one real 0600 manifest without following a symlink."""
+    try:
+        if not ensure_private_regular_file(path):
+            return None
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnsafePrivatePath, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _repair_trash_item(d: Path, manifest_path: Path) -> dict | None:
+    """Repair one exact item and return its validated manifest."""
+    data = _read_private_manifest_file(manifest_path)
+    if data is None:
+        return None
+    tid = str(data.get("trash_id") or "")
+    if not _valid_trash_id(tid) or manifest_path.name != f"{tid}.json":
+        return None
+    payload = d / tid
+    payload_kind = private_path_kind(payload)
+    if payload_kind not in {"directory", "file"}:
+        return None
+    original_mode = data.get("original_mode")
+    if (type(original_mode) is not int
+            or not 0 <= original_mode <= 0o777):
+        captured_mode = stat.S_IMODE(payload.lstat().st_mode) & 0o777
+        if private_path_kind(payload) != payload_kind:
+            return None
+        data = {**data, "original_mode": captured_mode}
+        atomic_write_text(manifest_path, json.dumps(data), mode=0o600)
+    if repair_private_path(payload) != payload_kind:
+        return None
+    return data
+
+
+def ensure_private_trash_storage(
+    root: Path | None = None,
+    *,
+    create: bool = False,
+) -> int:
+    """Repair old dustbin modes while preserving each payload's restore mode."""
+    d = _trash_dir(root)
+    if not ensure_private_directory(d, create=create):
+        return 0
+    repaired = 1
+    for manifest_path in d.glob("*.json"):
+        if _repair_trash_item(d, manifest_path) is not None:
+            repaired += 2
+    return repaired
+
+
 def _dir_size(p: Path) -> int:
     """Sum of file sizes (best-effort; OSError on individual files skipped)."""
     total = 0
     try:
         for sub in p.rglob("*"):
             try:
-                if sub.is_file():
-                    total += sub.stat().st_size
+                if private_path_kind(sub) == "file":
+                    total += sub.lstat().st_size
             except OSError:
                 continue
     except OSError:
@@ -141,10 +201,22 @@ def _move_to_trash(
         original_rel = str(target.relative_to(root))
     else:
         original_rel = _logical_relative_path(original_rel).as_posix()
+    target_kind = private_path_kind(target)
+    if target_kind not in {"directory", "file"}:
+        raise UnsafePrivatePath("trash payload must be a real file or directory")
+    original_mode = stat.S_IMODE(target.lstat().st_mode) & 0o777
     target.rename(payload)
-    is_dir = payload.is_dir()
     try:
-        size = _dir_size(payload) if is_dir else payload.stat().st_size
+        repair_private_path(payload)
+    except (OSError, UnsafePrivatePath):
+        # Permission hardening is part of the move contract. Put the original
+        # inode back rather than leaving an invisible, manifest-less payload.
+        payload.rename(target)
+        os.chmod(target, original_mode, follow_symlinks=False)
+        raise
+    is_dir = target_kind == "directory"
+    try:
+        size = _dir_size(payload) if is_dir else payload.lstat().st_size
     except OSError:
         size = 0
     manifest = {
@@ -154,24 +226,25 @@ def _move_to_trash(
         "deleted_at": time.time(),
         "kind": "dir" if is_dir else "file",
         "size": size,
+        "original_mode": original_mode,
     }
     # Atomic write: a half-written manifest from a crash mid-rename
     # would orphan the payload (manifest parses as invalid JSON → item
     # filtered out of /trash/list → user permanently loses access to
     # their soft-deleted file). atomic_write_text uses tempfile + rename
     # so readers always see either the old or the new full content.
-    atomic_write_text(trash / f"{tid}.json", json.dumps(manifest))
+    atomic_write_text(
+        trash / f"{tid}.json", json.dumps(manifest), mode=0o600)
     return manifest
 
 
 def _read_manifest(tid: str, root: Path | None = None) -> dict | None:
-    mf = _trash_dir(root) / f"{tid}.json"
-    if not mf.exists():
+    d = _trash_dir(root)
+    if not ensure_private_directory(d, create=False):
         return None
-    try:
-        return json.loads(mf.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    if not _valid_trash_id(tid):
         return None
+    return _repair_trash_item(d, d / f"{tid}.json")
 
 
 def _list_trash(root: Path | None = None) -> list[dict]:
@@ -179,20 +252,17 @@ def _list_trash(root: Path | None = None) -> list[dict]:
     without payload, or vice versa) are skipped — they'd be confusing
     to surface and the user can't usefully act on them anyway."""
     d = _trash_dir(root)
-    if not d.exists():
+    if not ensure_private_directory(d, create=False):
         return []
     items: list[dict] = []
     try:
-        for mf in d.glob("*.json"):
-            try:
-                data = json.loads(mf.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
+        for manifest_path in d.glob("*.json"):
+            data = _repair_trash_item(d, manifest_path)
+            if data is None:
                 continue
-            tid = data.get("trash_id")
-            if not tid:
-                continue
+            tid = str(data.get("trash_id") or "")
             payload = d / tid
-            if not payload.exists():
+            if private_path_kind(payload) not in {"directory", "file"}:
                 continue
             items.append(data)
     except OSError:
@@ -221,20 +291,15 @@ def auto_purge_expired_trash(root: Path | None = None) -> int:
     if _TRASH_TTL_DAYS <= 0:
         return 0
     d = _trash_dir(root)
-    if not d.exists():
+    if not ensure_private_directory(d, create=False):
         return 0
     cutoff = time.time() - (_TRASH_TTL_DAYS * 86400)
     purged = 0
-    for mf in list(d.glob("*.json")):
-        try:
-            data = json.loads(mf.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+    for manifest_path in list(d.glob("*.json")):
+        data = _repair_trash_item(d, manifest_path)
+        if data is None or (data.get("deleted_at") or 0) >= cutoff:
             continue
-        if (data.get("deleted_at") or 0) >= cutoff:
-            continue
-        tid = data.get("trash_id")
-        if not tid or not _valid_trash_id(tid):
-            continue
+        tid = str(data.get("trash_id") or "")
         try:
             if _purge_one(tid, root):
                 purged += 1
@@ -275,6 +340,8 @@ def _purge_one(tid: str, root: Path | None = None) -> bool:
     visible so the user can retry instead of getting a false success.
     """
     d = _trash_dir(root)
+    if not ensure_private_directory(d, create=False):
+        return False
     payload = d / tid
     mf = d / f"{tid}.json"
     existed = _path_lexists(payload) or _path_lexists(mf)
@@ -1392,11 +1459,15 @@ def trash_restore(req: TrashIdReq, root: Path = Depends(_workspace_root)) -> dic
     if not data:
         raise HTTPException(status_code=404, detail="trash item not found")
     payload = _trash_dir(root) / req.trash_id
-    if not payload.exists():
+    if private_path_kind(payload) not in {"directory", "file"}:
         raise HTTPException(status_code=404, detail="trash payload missing")
     orig_rel = data.get("original_path") or ""
     if not orig_rel:
         raise HTTPException(status_code=500, detail="manifest missing original_path")
+    original_mode = data.get("original_mode")
+    if (type(original_mode) is not int
+            or not 0 <= original_mode <= 0o777):
+        original_mode = None
     # Reuse safe_resolve so the same anti-traversal + sensitive-name guards
     # apply to restoration as to any other write. allow_sensitive=True
     # because the user already had this file in-place before deletion;
@@ -1406,15 +1477,17 @@ def trash_restore(req: TrashIdReq, root: Path = Depends(_workspace_root)) -> dic
     # write landing at `orig` between the probe and the rename would be
     # silently replaced by the restored payload.
     with _DEST_WRITE_LOCK:
-        if orig.exists():
+        if _path_lexists(orig):
             raise HTTPException(
                 status_code=409,
                 detail="original path is occupied; rename or clear it first",
             )
         orig.parent.mkdir(parents=True, exist_ok=True)
         payload.rename(orig)
+        if original_mode is not None:
+            os.chmod(orig, original_mode, follow_symlinks=False)
     mf = _trash_dir(root) / f"{req.trash_id}.json"
-    if mf.exists():
+    if _path_lexists(mf):
         try:
             mf.unlink()
         except OSError:
@@ -1428,11 +1501,13 @@ def trash_purge(req: TrashIdReq, root: Path = Depends(_workspace_root)) -> dict:
     if not _valid_trash_id(req.trash_id):
         raise HTTPException(status_code=400, detail="invalid trash_id")
     d = _trash_dir(root)
+    if not ensure_private_directory(d, create=False):
+        raise HTTPException(status_code=404, detail="trash item not found")
     payload = d / req.trash_id
     manifest = d / f"{req.trash_id}.json"
-    if not manifest.exists() and not payload.exists():
+    if not _path_lexists(manifest) and not _path_lexists(payload):
         raise HTTPException(status_code=404, detail="trash item not found")
-    was_directory = payload.is_dir() and not payload.is_symlink()
+    was_directory = private_path_kind(payload) == "directory"
     try:
         _purge_one(req.trash_id, root)
     except OSError as exc:
@@ -1449,7 +1524,7 @@ def trash_purge(req: TrashIdReq, root: Path = Depends(_workspace_root)) -> dict:
 def trash_empty(root: Path = Depends(_workspace_root)) -> dict:
     """Permanently delete every trash item. Irreversible."""
     d = _trash_dir(root)
-    if not d.exists():
+    if not ensure_private_directory(d, create=False):
         return {"ok": True, "purged": 0}
     count = 0
     failed = 0
