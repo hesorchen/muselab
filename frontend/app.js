@@ -20771,8 +20771,12 @@ function portal() {
       if (this._terminalLoadPromise) return this._terminalLoadPromise;
       const assetVersion = String(document.querySelector(
         'meta[name="muselab-asset-version"]')?.content || "");
-      const timeoutMs = 15000;
-      const deadline = Date.now() + 30000;
+      // Mobile Safari on a high-latency proxy can spend most of 15 seconds on
+      // the 489 KB xterm bundle before the tiny fit addon even starts. Give each
+      // request a realistic cellular timeout and keep enough shared budget for
+      // one cache-busting retry.
+      const timeoutMs = 30000;
+      const deadline = Date.now() + 75000;
       const isReady = src => src.endsWith(".css")
         || (src.includes("addon-fit") ? !!window.FitAddon : !!window.Terminal);
       const loadOnce = (src, attempt) => new Promise((resolve, reject) => {
@@ -20860,13 +20864,17 @@ function portal() {
         // loader for retry. Promise.all rejected immediately and left its
         // sibling alive; that stale branch could later remove the fresh DOM
         // node created by the next click.
+        // addon-fit is a standalone UMD bundle: it only needs Terminal when its
+        // exported class is instantiated, not while the script evaluates. Start
+        // all three requests together so a slow xterm download does not postpone
+        // the addon's timeout window on cellular/mobile proxy connections.
         const initial = await Promise.allSettled([
           inject("/static/vendor/xterm/xterm.css"),
           inject("/static/vendor/xterm/xterm.js"),
+          inject("/static/vendor/xterm/addon-fit.js"),
         ]);
         const failed = initial.find(result => result.status === "rejected");
         if (failed) throw failed.reason;
-        await inject("/static/vendor/xterm/addon-fit.js");
         if (!window.Terminal || !window.FitAddon) {
           throw new Error("terminal library globals missing");
         }
