@@ -1257,10 +1257,12 @@ def test_export_session_markdown_empty(client, auth, app_module):
     r = client.post("/api/chat/sessions", headers=auth,
                      json={"name": "export-empty"})
     sid = r.json()["id"]
-    r = client.get(
-        f"/api/chat/sessions/{sid}/export",
-        params={"token": "test-token-1234567890abcdef-secure-min-32"},
+    ticket = client.post(
+        "/api/chat/resource-ticket", headers=auth,
+        json={"resource": "export", "session_id": sid},
     )
+    assert ticket.status_code == 200
+    r = client.get(ticket.json()["url"])
     assert r.status_code == 200
     assert r.headers["content-type"].startswith("text/markdown")
     cd = r.headers["content-disposition"]
@@ -1277,9 +1279,10 @@ def test_export_session_markdown_empty(client, auth, app_module):
 
 
 def test_export_session_markdown_404_for_unknown(client, auth):
-    r = client.get(
-        "/api/chat/sessions/no-such-session/export",
-        params={"token": "test-token-1234567890abcdef-secure-min-32"},
+    r = client.post(
+        "/api/chat/resource-ticket",
+        headers=auth,
+        json={"resource": "export", "session_id": "no-such-session"},
     )
     assert r.status_code == 404
 

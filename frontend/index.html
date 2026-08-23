@@ -2016,7 +2016,7 @@
                                  and triggers a real network request that fails (was firing
                                  [muse-capture] resource-load-failed errors in console). -->
                             <span class="user-msg-img-wrap">
-                              <template x-if="im.preview || im.thumb || im.url">
+                              <template x-if="messageImageSrc(im)">
                                 <!-- in-bubble thumbnail prefers preview (live blob URL,
                                      freshest) > thumb (base64 thumbnail in JSONL); only
                                      falls back to full url if neither is available.
@@ -2024,17 +2024,14 @@
                                      served from disk) > preview > thumb — that's the
                                      fix for "click to enlarge shows blurry upscale". -->
                                 <img class="user-msg-img"
-                                     :src="im.preview || (im.thumb ? 'data:image/jpeg;base64,' + im.thumb : (im.url ? im.url + '?token=' + encodeURIComponent(token) : ''))"
+                                     :src="messageImageSrc(im)"
                                      :alt="im.name || 'image'"
-                                     @click="openLightbox(
-                                        im.url ? im.url + '?token=' + encodeURIComponent(token)
-                                          : (im.preview || 'data:image/jpeg;base64,' + im.thumb),
-                                        im.name)"
+                                     @click="openMessageImage(im)"
                                      :title="lang==='zh'?'点击放大':'Click to enlarge'"
                                      @error="$el.style.display='none'; $el.nextElementSibling && ($el.nextElementSibling.style.display='inline-flex')" />
                               </template>
                               <span class="user-msg-img-placeholder"
-                                    :style="(im.preview || im.thumb) ? 'display:none' : 'display:inline-flex'"
+                                    :style="messageImageSrc(im) ? 'display:none' : 'display:inline-flex'"
                                     :title="im.mime || 'image'">
                                 <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
                               </span>
@@ -3010,7 +3007,8 @@
                        Expired uploads (TTL) show a muted "附件已过期" chip. -->
                   <div class="queued-attach" x-show="q.hasAttach">
                     <template x-for="(im, ii) in (q.images || [])" :key="'qimg'+ii">
-                      <img class="queued-thumb" :src="im.src" loading="lazy" alt=""
+                      <img class="queued-thumb" x-show="im.src"
+                           :src="im.src || null" loading="lazy" alt=""
                            @error="$el.style.display='none'" />
                     </template>
                     <template x-for="(d, di) in (q.docs || [])" :key="'qdoc'+di">

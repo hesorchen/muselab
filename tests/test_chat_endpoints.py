@@ -1465,8 +1465,13 @@ def test_cancelled_turn_snapshot_survives_reload_export_and_delete(
         assert second.status_code == 200, second.text
         assert second.json()["messages"] == messages
 
-        exported = client.get(
-            f"/api/chat/sessions/{sid}/export?token={TEST_TOKEN}")
+        ticket = client.post(
+            "/api/chat/resource-ticket",
+            headers=auth,
+            json={"resource": "export", "session_id": sid},
+        )
+        assert ticket.status_code == 200, ticket.text
+        exported = client.get(ticket.json()["url"])
         assert exported.status_code == 200, exported.text
         assert "keep this interrupted prompt" in exported.text
         assert "partial assistant text" in exported.text

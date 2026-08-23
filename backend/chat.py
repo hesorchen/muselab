@@ -50,7 +50,8 @@ from claude_agent_sdk import (
     fork_session as sdk_fork_session,
 )
 from claude_agent_sdk.types import HookMatcher, PermissionMode
-from .auth import require_token_query, require_token, require_token_header_or_query
+from .auth import require_token, require_token_header_or_query
+from .capability_tickets import tickets
 from .settings import (
     ROOT,
     MODEL,
@@ -5717,12 +5718,15 @@ async def _settle_turn_uuids(
             break
     return evidence
 
-@router.get("/sessions/{sid}/export", dependencies=[Depends(require_token_query)])
-def export_session_markdown(sid: str) -> Response:
+@router.get("/sessions/{sid}/export")
+def export_session_markdown(sid: str, ticket: str = Query("")) -> Response:
     """Render the transcript as a single Markdown file the user can save.
 
-    Auth is via ?token=... rather than the header — file downloads from a
-    plain anchor don't carry custom headers."""
+    A plain download anchor cannot add an auth header, so it carries a
+    short-lived, session-bound, single-use resource ticket instead of the
+    long-lived global API token.
+    """
+    _require_chat_resource_ticket(ticket, ("export", sid))
     meta = sess.get_session_meta(sid)
     if meta is None:
         raise HTTPException(404, "session not found")
@@ -9220,6 +9224,103 @@ _XLSX_ATTACH_MAX_ROWS = 200
 _XLSX_ATTACH_MAX_COLS = 30
 _XLSX_ATTACH_CELL_MAX_CHARS = 200
 
+# Header-less browser resource surfaces use narrowly scoped, short-lived
+# capability tickets.  Export is a one-shot download; image resources permit a
+# small, finite number of reads because browsers may fetch the same URL for the
+# in-bubble image, the lightbox, and a conditional retry.
+_CHAT_RESOURCE_TICKET_KIND = "chat-resource"
+_CHAT_RESOURCE_TICKET_TTL = {
+    "export": 60,
+    "queued-image": min(300, _IMAGE_TTL_S),
+    "attachment": 600,
+}
+_CHAT_RESOURCE_TICKET_MAX_USES = {
+    "export": 1,
+    "queued-image": 8,
+    "attachment": 16,
+}
+
+
+class ChatResourceTicketReq(BaseModel):
+    resource: Literal["export", "queued-image", "attachment"]
+    session_id: str = Field(default="", max_length=80)
+    attachment_id: str = Field(default="", max_length=64)
+    filename: str = Field(default="", max_length=200)
+
+
+def _require_chat_resource_ticket(
+    ticket: str,
+    scope: tuple[str, ...],
+) -> None:
+    if not tickets.validate(ticket, _CHAT_RESOURCE_TICKET_KIND, scope):
+        raise HTTPException(
+            status_code=401,
+            detail="invalid or expired chat resource ticket",
+        )
+
+
+def _validate_attachment_ref(session_id: str, filename: str) -> Path:
+    """Return the exact persisted attachment selected by a resource ticket."""
+    if not re.fullmatch(r"[A-Za-z0-9_\-]{6,80}", session_id):
+        raise HTTPException(400, "bad session_id")
+    if ("/" in filename or ".." in filename or "\\" in filename
+            or not re.fullmatch(r"[^/\\\x00-\x1f\x7f]{1,200}", filename)):
+        raise HTTPException(400, "bad filename")
+    path = _attachments_base() / session_id / filename
+    if not path.exists() or not path.is_file():
+        raise HTTPException(404, "attachment not found")
+    base = _attachments_base().resolve()
+    real = path.resolve()
+    try:
+        real.relative_to(base)
+    except ValueError:
+        raise HTTPException(400, "bad path") from None
+    return path
+
+
+@router.post("/resource-ticket", dependencies=[Depends(require_token)])
+def mint_chat_resource_ticket(req: ChatResourceTicketReq) -> dict:
+    """Mint an opaque ticket for one exact export or attachment resource."""
+    resource = req.resource
+    if resource == "export":
+        if not req.session_id or sess.get_session_meta(req.session_id) is None:
+            raise HTTPException(404, "session not found")
+        scope = (resource, req.session_id)
+        url = f"/api/chat/sessions/{req.session_id}/export"
+    elif resource == "queued-image":
+        aid = req.attachment_id
+        if not re.fullmatch(r"[A-Za-z0-9]{6,64}", aid):
+            raise HTTPException(400, "bad id")
+        _gc_images()
+        with _image_store_lock:
+            entry = _image_store.get(aid)
+            if (entry is None or entry.get("kind") != "image"
+                    or not entry.get("b64")):
+                raise HTTPException(404, "queued image not found or expired")
+        scope = (resource, aid)
+        url = f"/api/chat/queued-image/{aid}"
+    else:
+        _validate_attachment_ref(req.session_id, req.filename)
+        scope = (resource, req.session_id, req.filename)
+        url = (f"/api/chat/attachments/{req.session_id}/"
+               f"{urllib.parse.quote(req.filename)}")
+
+    ttl = _CHAT_RESOURCE_TICKET_TTL[resource]
+    max_uses = _CHAT_RESOURCE_TICKET_MAX_USES[resource]
+    ticket = tickets.mint(
+        _CHAT_RESOURCE_TICKET_KIND,
+        scope,
+        ttl=ttl,
+        max_uses=max_uses,
+    )
+    separator = "&" if "?" in url else "?"
+    return {
+        "ticket": ticket,
+        "url": f"{url}{separator}ticket={urllib.parse.quote(ticket)}",
+        "expires_in": ttl,
+        "max_uses": max_uses,
+    }
+
 
 def _gc_images() -> None:
     """Drop entries older than TTL."""
@@ -9924,18 +10025,19 @@ def _xlsx_to_text(body: bytes, name: str) -> str:
     return "\n".join(parts)
 
 
-@router.get("/queued-image/{aid}", dependencies=[Depends(require_token_query)])
-def get_queued_image(aid: str):
+@router.get("/queued-image/{aid}")
+def get_queued_image(aid: str, ticket: str = Query("")):
     """FIX ③: serve an as-yet-unsent (queued) image straight from the
     in-memory upload store so the queued-message bubble can render a real
     thumbnail. Unlike /attachments/<sid>/<file> (on-disk, persisted at
     send-time), queued uploads live only in `_image_store` and disappear at
     the 10-min TTL — so this 404s once the entry expires, which the UI
-    already surfaces as "附件已过期". require_token_query lets a plain
-    `<img src=...?token=...>` load without per-element auth headers."""
+    already surfaces as "附件已过期". A bounded-use resource ticket lets a
+    plain ``<img>`` load it without exposing the global API token."""
     import re as _re
     if not _re.fullmatch(r"[A-Za-z0-9]{6,64}", aid):
         raise HTTPException(400, "bad id")
+    _require_chat_resource_ticket(ticket, ("queued-image", aid))
     _gc_images()
     entry = _image_store.get(aid)
     if entry is None or entry.get("kind") != "image" or not entry.get("b64"):
@@ -9984,42 +10086,25 @@ def get_task_output(session_id: str = Query(...), path: str = Query(...)):
     return _PlainText(data, headers={"Cache-Control": "private, max-age=60"})
 
 
-@router.get("/attachments/{session_id}/{filename}",
-            dependencies=[Depends(require_token_query)])
-def get_attachment(session_id: str, filename: str):
+@router.get("/attachments/{session_id}/{filename}")
+def get_attachment(
+    session_id: str,
+    filename: str,
+    ticket: str = Query(""),
+):
     """Serve the FULL-RES original of a user-uploaded image saved at
     send-time. Lightbox uses this; the in-stream bubble keeps using the
-    160-px thumbnail (small + fast). require_token_query lets the
-    browser issue plain `<img src=...?token=...>` requests without
-    needing to inject auth headers per element.
+    160-px thumbnail (small + fast). A short-lived, bounded-use ticket lets
+    the browser load the original without exposing the global API token.
 
     Path traversal guard: filename must be a single basename (no slashes,
     no parent-dir refs) and session_id must be a valid uuid-ish string.
     """
-    import re as _re
-    if not _re.fullmatch(r"[A-Za-z0-9_\-]{6,80}", session_id):
-        raise HTTPException(400, "bad session_id")
-    if "/" in filename or ".." in filename or "\\" in filename:
-        raise HTTPException(400, "bad filename")
-    # Was `[A-Za-z0-9_\-]+\.[A-Za-z0-9]{1,8}`, which predates this endpoint
-    # serving anything but images named `{aid}.{ext}`. Now that every
-    # attachment persists as `{aid}-{原文件名}`, an ASCII-only pattern 400s
-    # every Chinese filename — i.e. most of them. Widened to "one path
-    # component, no control chars", which combined with the traversal guard
-    # above and the resolve()/relative_to() check below is the actual
-    # security boundary. The `{aid}-` prefix still has to match a real file.
-    if not _re.fullmatch(r"[^/\\\x00-\x1f\x7f]{1,200}", filename):
-        raise HTTPException(400, "bad filename format")
-    path = _attachments_base() / session_id / filename
-    if not path.exists() or not path.is_file():
-        raise HTTPException(404, "attachment not found")
-    # Resolve + verify still inside the attachments dir (extra defense)
-    base = (_attachments_base()).resolve()
-    real = path.resolve()
-    try:
-        real.relative_to(base)
-    except ValueError:
-        raise HTTPException(400, "bad path")
+    _require_chat_resource_ticket(
+        ticket,
+        ("attachment", session_id, filename),
+    )
+    path = _validate_attachment_ref(session_id, filename)
     # MIME from extension
     ext = filename.rsplit(".", 1)[-1].lower()
     mime = {

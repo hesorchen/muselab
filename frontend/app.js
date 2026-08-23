@@ -280,6 +280,24 @@ const TERMINAL_ANSI_THEMES = Object.freeze({
   }),
 });
 
+// Header-less chat resources use short-lived, scope-bound credentials. Keep
+// both resolved tickets and in-flight mint requests in memory only so Alpine
+// re-evaluation cannot duplicate requests or persist bearer URLs.
+const CHAT_RESOURCE_TICKET_CACHE = new Map();
+const CHAT_RESOURCE_TICKET_CACHE_MAX = 256;
+function _pruneChatResourceTicketCache(now) {
+  for (const [key, entry] of CHAT_RESOURCE_TICKET_CACHE) {
+    if (!entry.promise && (!entry.expiresAt || entry.expiresAt <= now)) {
+      CHAT_RESOURCE_TICKET_CACHE.delete(key);
+    }
+  }
+  while (CHAT_RESOURCE_TICKET_CACHE.size >= CHAT_RESOURCE_TICKET_CACHE_MAX) {
+    CHAT_RESOURCE_TICKET_CACHE.delete(
+      CHAT_RESOURCE_TICKET_CACHE.keys().next().value,
+    );
+  }
+}
+
 function portal() {
   return {
     // ===== auth =====
@@ -5093,6 +5111,96 @@ function portal() {
       // add their registered workspace through fileHdr()/conversationHdr().
       return { "X-Auth-Token": this.token };
     },
+    async _mintChatResourceUrl(resource, fields = {}, fresh = false) {
+      const body = { resource, ...fields };
+      const cacheKey = JSON.stringify(body);
+      if (fresh) CHAT_RESOURCE_TICKET_CACHE.delete(cacheKey);
+      const now = Date.now();
+      _pruneChatResourceTicketCache(now);
+      const cached = CHAT_RESOURCE_TICKET_CACHE.get(cacheKey);
+      if (cached && cached.url && cached.expiresAt > now + 5000) {
+        return cached.url;
+      }
+      if (cached && cached.promise) return await cached.promise;
+
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 8000);
+      const promise = (async () => {
+        const response = await fetch("/api/chat/resource-ticket", {
+          method: "POST",
+          headers: { ...this.hdr(), "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+          signal: controller.signal,
+          cache: "no-store",
+        });
+        if (!response.ok) throw new Error("chat resource ticket unavailable");
+        const data = await response.json();
+        if (!data.url || !String(data.url).startsWith("/api/chat/")) {
+          throw new Error("invalid chat resource ticket response");
+        }
+        CHAT_RESOURCE_TICKET_CACHE.set(cacheKey, {
+          url: data.url,
+          expiresAt: Date.now() + Math.max(1, Number(data.expires_in) || 1) * 1000,
+        });
+        return data.url;
+      })();
+      CHAT_RESOURCE_TICKET_CACHE.set(cacheKey, { promise });
+      try {
+        return await promise;
+      } catch (error) {
+        CHAT_RESOURCE_TICKET_CACHE.delete(cacheKey);
+        throw error;
+      } finally {
+        clearTimeout(timeout);
+      }
+    },
+    _attachmentTicketFields(im) {
+      const raw = String((im && im.url) || "");
+      const match = raw.match(/^\/api\/chat\/attachments\/([^/]+)\/(.+)$/);
+      if (!match) return null;
+      try {
+        return {
+          session_id: decodeURIComponent(match[1]),
+          filename: decodeURIComponent(match[2]),
+        };
+      } catch (_) {
+        return null;
+      }
+    },
+    async _ensureMessageAttachmentUrl(im) {
+      const fields = this._attachmentTicketFields(im);
+      if (!fields) throw new Error("invalid attachment URL");
+      return await this._mintChatResourceUrl("attachment", fields);
+    },
+    messageImageSrc(im) {
+      if (!im) return "";
+      if (im.preview) return im.preview;
+      if (im.thumb) return "data:image/jpeg;base64," + im.thumb;
+      if (im._resourceUrl) return im._resourceUrl;
+      if (im.url && !im._resourceTicketPending) {
+        im._resourceTicketPending = true;
+        this._ensureMessageAttachmentUrl(im)
+          .then(url => { im._resourceUrl = url; })
+          .catch(() => { im._resourceUrl = ""; })
+          .finally(() => { im._resourceTicketPending = false; });
+      }
+      return "";
+    },
+    async openMessageImage(im) {
+      if (!im) return;
+      let src = im.preview || (im.thumb
+        ? "data:image/jpeg;base64," + im.thumb : "");
+      if (im.url) {
+        try {
+          src = await this._ensureMessageAttachmentUrl(im);
+          im._resourceUrl = src;
+        } catch (_) {
+          // A thumbnail/blob remains a safe, useful fallback when the full
+          // original expired or the ticket request briefly failed.
+        }
+      }
+      this.openLightbox(src, im.name);
+    },
     _staticAssetUrl(path) {
       if (!path || !path.startsWith("/static/") || /[?&]v=/.test(path)) return path;
       const version = typeof document !== "undefined"
@@ -7855,20 +7963,19 @@ function portal() {
       if (revision < (Number(st._queueRevision) || 0)) return;
       st._queueAppliedSeq = seq;
       st._queueRevision = revision;
-      st.pendingQueue = (data.items || []).map(it => {
+      const pendingQueue = (data.items || []).map(it => {
         // FIX ③: the server now resolves each upload id against its in-memory
         // store and returns `attachments: [{id, kind, name, mime, available}]`.
-        // Split them into renderable image thumbnails vs doc chips. `src`
-        // points at the queued-image endpoint (in-memory, token in query so a
-        // bare <img> can load it). Expired ids (available:false) are counted
-        // so the bubble can show "附件已过期".
+        // Split them into renderable image thumbnails vs doc chips. A bare
+        // <img> cannot add X-Auth-Token, so each image gets a short-lived,
+        // id-bound resource ticket below. Expired ids (available:false) are
+        // counted so the bubble can show "附件已过期".
         const atts = it.attachments || [];
-        const tok = encodeURIComponent(this.token || "");
         const images = atts
           .filter(a => a.available && a.kind === "image")
           .map(a => ({
             id: a.id, mime: a.mime || "",
-            src: `/api/chat/queued-image/${a.id}?token=${tok}`,
+            src: "",
           }));
         const docs = atts
           .filter(a => a.available && a.kind !== "image")
@@ -7893,6 +8000,25 @@ function portal() {
           pendingDocs: [],
           enqueuedAt: it.enqueued_at || Date.now(),
         };
+      });
+      st.pendingQueue = pendingQueue;
+      Promise.all(pendingQueue.flatMap(item =>
+        item.images.map(async im => {
+          try {
+            im.src = await this._mintChatResourceUrl("queued-image", {
+              attachment_id: im.id,
+            });
+          } catch (_) {
+            im.unavailable = true;
+          }
+        }))).then(() => {
+        if (this.tabState[sid] !== st || st._queueAppliedSeq !== seq) return;
+        for (const item of pendingQueue) {
+          const failed = item.images.filter(im => !im.src).length;
+          item.images = item.images.filter(im => im.src);
+          item.expiredCount += failed;
+        }
+        st.pendingQueue = [...pendingQueue];
       });
       st._queuePaused = !!data.paused;
     },
@@ -14111,22 +14237,25 @@ function portal() {
       this.startRenameTab(id);
     },
     async menuClose(id) { this.closeTabMenu(); await this.closeChatTab(id); },
-    menuExportMarkdown(id) {
+    async menuExportMarkdown(id) {
       this.closeTabMenu();
       if (!id) return;
-      // Use a transient anchor so the browser opens the streaming Response
-      // as a file download. Token goes in the query string because anchor
-      // requests can't carry custom headers.
-      const url = `/api/chat/sessions/${id}/export?token=`
-                  + encodeURIComponent(this.token);
-      const a = document.createElement("a");
-      a.href = url; a.style.display = "none";
-      // download attribute lets the server's Content-Disposition take
-      // precedence but still hints to the browser this isn't navigation.
-      a.setAttribute("download", "");
-      document.body.appendChild(a);
-      a.click();
-      setTimeout(() => a.remove(), 200);
+      try {
+        // Anchors cannot add X-Auth-Token. Mint a fresh, session-bound,
+        // single-use download ticket for every explicit export click.
+        const url = await this._mintChatResourceUrl(
+          "export", { session_id: id }, true,
+        );
+        const a = document.createElement("a");
+        a.href = url; a.style.display = "none";
+        // download lets Content-Disposition choose the final filename.
+        a.setAttribute("download", "");
+        document.body.appendChild(a);
+        a.click();
+        setTimeout(() => a.remove(), 200);
+      } catch (_) {
+        this.toast(this.lang === "zh" ? "导出失败" : "Export failed", "error");
+      }
     },
     async menuCopySessionEvidence(id) {
       this.closeTabMenu();
