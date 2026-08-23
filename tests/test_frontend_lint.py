@@ -3717,8 +3717,11 @@ def test_terminal_preview_has_local_renderer_and_management_wiring():
     assert "await Promise.allSettled([" in terminal_loader
     assert "node.remove()" in terminal_loader
     assert 'meta[name="muselab-asset-version"]' in terminal_loader
-    assert "const timeoutMs = 15000" in terminal_loader
-    assert "const deadline = Date.now() + 30000" in terminal_loader
+    assert "const timeoutMs = 30000" in terminal_loader
+    assert "const deadline = Date.now() + 75000" in terminal_loader
+    initial_load = terminal_loader[terminal_loader.index("await Promise.allSettled(["):]
+    initial_load = initial_load[:initial_load.index("]);")]
+    assert 'inject("/static/vendor/xterm/addon-fit.js")' in initial_load
     assert "async createTerminal(profileId)" in app
     assert "async renameTerminal(row)" in app
     assert "async closeTerminal(id" in app
