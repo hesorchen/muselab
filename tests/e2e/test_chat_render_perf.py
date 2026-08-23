@@ -3387,6 +3387,149 @@ def test_active_turn_adoption_requires_physical_tail_and_full_prompt_envelope(
     }
 
 
+def test_session_sync_deadline_dispose_and_hidden_resume(
+    page: Page, backend_url, auth_token,
+):
+    """A stuck request releases the coordinator; hidden polling resumes promptly."""
+    errors = _capture_browser_errors(page)
+    _login(page, backend_url, auth_token)
+    result = _app_eval(
+        page,
+        """
+        return (async () => {
+          const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+          const makeState = (sid) => {
+            const st = app._blankTabState();
+            st._sid = sid;
+            app.tabState[sid] = st;
+            return st;
+          };
+
+          app._abortActivityFetches();
+          await sleep(0);
+          const originalFetch = window.fetch;
+          const originalRequestDeadline = app.REQUEST_DEADLINE_MS;
+          app.REQUEST_DEADLINE_MS = 35;
+          window.fetch = () => new Promise(() => {});
+          const activityStarted = performance.now();
+          const activityResult = await app.fetchActivity();
+          const activityElapsed = performance.now() - activityStarted;
+          const activityReleased = activityResult === false
+            && !app._activityFetchPromises.events
+            && !app._activityFetchControllers.events;
+          window.fetch = originalFetch;
+          app.REQUEST_DEADLINE_MS = originalRequestDeadline;
+
+          const deadlineState = makeState("sync-never-resolving");
+          const deadlineResult = await app._requestSessionSync(
+            "sync-never-resolving", "transport_retry", {
+              deadlineMs: 40,
+              run: () => new Promise(() => {}),
+            },
+          );
+          const coordinatorReleased = deadlineResult === false
+            && deadlineState.sessionSync.inFlight === null;
+
+          const disposeState = makeState("sync-dispose");
+          let abortObserved = false;
+          const disposePromise = app._requestSessionSync(
+            "sync-dispose", "transport_retry", {
+              deadlineMs: 1000,
+              run: signal => new Promise((resolve) => {
+                const onAbort = () => {
+                  abortObserved = true;
+                  resolve("aborted");
+                };
+                if (signal.aborted) onAbort();
+                else signal.addEventListener("abort", onAbort, { once: true });
+              }),
+            },
+          );
+          for (let i = 0; i < 20 && !disposeState.sessionSync.inFlight; i += 1) {
+            await sleep(5);
+          }
+          const disposeWasInFlight = !!disposeState.sessionSync.inFlight;
+          app._disposeSessionSync(disposeState);
+          const disposeResult = await Promise.race([
+            disposePromise,
+            sleep(250).then(() => "stuck"),
+          ]);
+
+          const descriptor = Object.getOwnPropertyDescriptor(
+            document, "visibilityState",
+          );
+          let visibility = "hidden";
+          Object.defineProperty(document, "visibilityState", {
+            configurable: true,
+            get: () => visibility,
+          });
+          const hiddenState = makeState("sync-hidden");
+          let hiddenRuns = 0;
+          const hiddenPromise = app._requestSessionSync(
+            "sync-hidden", "transport_retry", {
+              deadlineMs: 500,
+              run: () => { hiddenRuns += 1; return true; },
+            },
+          );
+          await sleep(80);
+          const hiddenHeld = hiddenRuns === 0
+            && !!hiddenState.sessionSync.pending.transport_retry;
+          visibility = "visible";
+          app._resumeVisibleSessionSync();
+          const resumed = await Promise.race([
+            hiddenPromise,
+            sleep(500).then(() => "stuck"),
+          ]);
+          app._disposeSessionSync(hiddenState);
+          if (descriptor) {
+            Object.defineProperty(document, "visibilityState", descriptor);
+          } else {
+            delete document.visibilityState;
+          }
+
+          const originalRandom = Math.random;
+          Math.random = () => 0;
+          const retryDelays = [1, 2, 3].map(attempt => app._retryDelay(attempt));
+          const previousActivityFailures = app._activityLiveFailures;
+          app._activityLiveFailures = 0;
+          const activityDelays = [
+            app._activityReconnectDelay(),
+            app._activityReconnectDelay(),
+            app._activityReconnectDelay(),
+          ];
+          app._activityLiveFailures = previousActivityFailures;
+          Math.random = originalRandom;
+
+          return {
+            activityReleased,
+            activityElapsed,
+            coordinatorReleased,
+            disposeWasInFlight,
+            abortObserved,
+            disposeSettled: disposeResult !== "stuck",
+            hiddenHeld,
+            hiddenRuns,
+            resumed,
+            retryDelays,
+            activityDelays,
+          };
+        })();
+        """,
+    )
+    assert result["activityReleased"] is True
+    assert 25 <= result["activityElapsed"] < 500
+    assert result["coordinatorReleased"] is True
+    assert result["disposeWasInFlight"] is True
+    assert result["abortObserved"] is True
+    assert result["disposeSettled"] is True
+    assert result["hiddenHeld"] is True
+    assert result["hiddenRuns"] == 1
+    assert result["resumed"] is True
+    assert result["retryDelays"] == [800, 1600, 3200]
+    assert result["activityDelays"] == [1000, 2000, 4000]
+    _assert_no_browser_errors(page, errors)
+
+
 def test_desktop_done_reconcile_preserves_live_message_dom_identity(
     page: Page, backend_url, auth_token,
 ):

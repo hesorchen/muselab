@@ -1096,7 +1096,13 @@ def test_session_synchronization_has_one_per_tab_coordinator():
     ):
         assert field in state
     assert "if (sync.inFlight) return" in coordinator
-    assert "sync.inFlight = { reason: request.reason, task }" in coordinator
+    assert "sync.inFlight = { reason: request.reason, task, controller, epoch }" in coordinator
+    assert "Promise.race([operation, cancelled, deadline])" in coordinator
+    assert "inFlight.controller.abort()" in coordinator
+    assert "this._sessionSyncNeedsVisibility(request.reason)" in coordinator
+    assert "request.dueAt = Date.now() + 2000" in coordinator
+    assert "this._resumeVisibleSessionSync()" in app
+    assert "async _fetchWithDeadline(" in app
     assert "delete sync.pending[request.reason]" in coordinator
     assert "this._scheduleSessionSync(sid, st)" in coordinator
     for reason in (
@@ -1126,6 +1132,24 @@ def test_session_synchronization_has_one_per_tab_coordinator():
     ):
         assert superseded not in app
     assert "setInterval(tick, 2000)" not in app
+
+
+def test_session_sync_deadlines_and_activity_transport_backoff_are_bounded():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    fetch_start = app.index("    async _fetchWithDeadline(")
+    fetch_end = app.index("\n    _staticAssetUrl", fetch_start)
+    deadline_fetch = app[fetch_start:fetch_end]
+    assert "Promise.race([fetch(url, fetchOptions), control])" in deadline_fetch
+    assert 'abort("request deadline exceeded")' in deadline_fetch
+
+    activity_start = app.index("    async fetchActivity(opts = {}) {")
+    activity_end = app.index("\n    async ackActivityEvent", activity_start)
+    activity = app[activity_start:activity_end]
+    assert "this._fetchWithDeadline(path" in activity
+    assert "this._activityFetchControllers[key] = controller" in activity
+    assert "this._abortActivityFetches()" in activity
+    assert "this._activityReconnectDelay()" in activity
+    assert "this._activityLiveFailures = 0" in activity
 
 
 def test_session_sync_transitions_preserve_canonical_and_view_ownership():
@@ -2245,10 +2269,8 @@ def test_inherited_task_poller_waits_for_durable_agent_projection():
     assert "sync.inheritedTicksLeft-- <= 0" in poller
     # The shared coordinator is the single-flight owner. A half-open /active
     # request still aborts on the normal session timeout before the next reason.
-    assert "const controller = new AbortController();" in poller
-    assert "Number(this._sessionListTimeoutMs) || 8000" in poller
-    assert "signal: controller.signal" in poller
-    assert "clearTimeout(timeout);" in poller
+    assert "this._fetchWithDeadline(" in poller
+    assert "signal: options.signal" in poller
     # The handler is already inside the per-session coordinator, so canonical
     # adoption calls loadSession directly instead of nesting another sync reason.
     assert "this.loadSession(childSid" in poller
@@ -2295,7 +2317,7 @@ def test_inherited_task_poller_waits_for_durable_agent_projection():
     # A reloaded successor never ran the live handoff initializer. Its normal
     # active probe must rebuild inherited ownership from durable session meta
     # and the overlay aggregate, then arm the same poller.
-    check_start = app.index("    async _probeActiveTurn(sid, st) {")
+    check_start = app.index("    async _probeActiveTurn(sid, st, options = {}) {")
     check_end = app.index("\n    // Hover-prefetch", check_start)
     check = app[check_start:check_end]
     assert "d.runtime_background_tasks_pending" in check
@@ -2729,7 +2751,7 @@ def test_active_stream_owns_messages_and_continuation_reconciles_canonical_histo
     assert "closeAsst();" in send[send.index("const surfaceTerminalError = detail =>"):]
     assert "this._reconcileCompletedContinuation(" in send
     assert "streamSid, streamState, continuationFinalText" in send
-    assert "const loaded = await this.loadSession(sid, { quiet: true })" in app
+    assert "quiet: true, signal: options.signal" in app
     assert "expectedText" in app
     assert "const stillOwned = () => this.tabState[sid] === ownerState" in app
     assert "if (!isContinuation)" in send
@@ -2743,7 +2765,7 @@ def test_active_stream_owns_messages_and_continuation_reconciles_canonical_histo
     canonical_start = app.index("_scheduleCanonicalStreamReload(sid, st")
     canonical_end = app.index("\n    _retireStaleSessionStream", canonical_start)
     canonical_reload = app[canonical_start:canonical_end]
-    assert "this.loadSession(sid, { quiet: true })" in canonical_reload
+    assert "quiet: true, signal: options.signal" in canonical_reload
     assert "quiet: sid === this.currentId" not in canonical_reload
     # A continuation can emit its task-complete toast and then race out of the
     # grace-kept /active slot. Both terminal fallbacks reconcile an already-
@@ -3146,7 +3168,7 @@ def test_workspace_gate_does_not_destroy_retry_or_edit_before_send_rejects():
 
 def test_queue_sync_keeps_older_success_when_newer_read_fails():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
-    start = app.index("async _syncQueueFromServer(sid)")
+    start = app.index("async _syncQueueFromServer(sid, options = {})")
     sync = app[start:app.index("_currentQueueLen", start)]
 
     assert "_queueAppliedSeq: 0" in app
@@ -4883,7 +4905,7 @@ def test_midturn_reconnect_storm_guards_are_in_place():
     # Refusal falls back to the flicker-free path: wait out the turn, then
     # quiet-load canonical history.
     assert "this._scheduleCanonicalStreamReload(sid, st);" in gate
-    check = js[js.index("    async _probeActiveTurn(sid, st) {"):]
+    check = js[js.index("    async _probeActiveTurn(sid, st, options = {}) {"):]
     check = check[:check.index("\n    // Hover-prefetch")]
     assert "if (!this._allowReconnect(sid, d.turn_id)) return;" in check
     recover = js[js.index("    _recoverStalledStream(sid = this.currentId) {"):]
