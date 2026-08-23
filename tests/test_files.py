@@ -233,7 +233,7 @@ def test_delete_rejects_selected_workspace_root(client, auth, temp_root):
     assert marker.is_file()
 
 
-def test_delete_rejects_symlink_to_registered_workspace_root(
+def test_delete_unlinks_symlink_to_registered_workspace_without_following_it(
     client,
     auth,
     temp_root,
@@ -259,9 +259,10 @@ def test_delete_rejects_symlink_to_registered_workspace_root(
         json={"path": link.name},
     )
 
-    assert response.status_code == 400
-    assert response.json() == {"detail": "cannot delete a workspace root"}
-    assert link.is_symlink()
+    assert response.status_code == 200
+    assert response.json() == {"ok": True, "permanent": True}
+    assert not link.exists()
+    assert not link.is_symlink()
     assert other.is_dir()
     assert marker.read_text(encoding="utf-8") == "preserve"
 
@@ -274,7 +275,7 @@ def test_permanent_delete_failure_is_not_reported_as_success(
 ):
     from backend import files
 
-    def fail_remove(_path):
+    def fail_remove(_path, **_kwargs):
         raise OSError("simulated permanent delete failure")
 
     monkeypatch.setattr(files.shutil, "rmtree", fail_remove)
@@ -288,9 +289,18 @@ def test_permanent_delete_failure_is_not_reported_as_success(
     assert response.status_code == 500
     assert response.headers["X-MuseLab-Error-Code"] == "partial_delete"
     assert response.json() == {
-        "detail": "permanent delete failed; the target may still exist"
+        "detail": (
+            "permanent delete committed; physical cleanup is deferred"
+        )
     }
-    assert (temp_root / "notes").is_dir()
+    assert not (temp_root / "notes").exists()
+    dustbin = temp_root / ".muselab-dustbin"
+    tombstones = [
+        path for path in dustbin.iterdir()
+        if path.name.startswith(".permanent-")
+    ]
+    assert len(tombstones) == 1
+    assert tombstones[0].stat().st_mode & 0o777 == 0o700
 
 
 def test_permanent_delete_permission_failure_is_classified(
@@ -304,7 +314,9 @@ def test_permanent_delete_permission_failure_is_classified(
     monkeypatch.setattr(
         files.shutil,
         "rmtree",
-        lambda _path: (_ for _ in ()).throw(PermissionError("denied")),
+        lambda _path, **_kwargs: (
+            _ for _ in ()
+        ).throw(PermissionError("denied")),
     )
     response = client.request(
         "DELETE",
@@ -315,10 +327,10 @@ def test_permanent_delete_permission_failure_is_classified(
 
     assert response.status_code == 403
     assert response.headers["X-MuseLab-Error-Code"] == "permission_denied"
-    assert (temp_root / "notes").is_dir()
+    assert not (temp_root / "notes").exists()
 
 
-def test_trash_purge_failure_keeps_payload_and_manifest_for_retry(
+def test_trash_purge_cleanup_failure_is_committed_and_idempotent(
     client,
     auth,
     temp_root,
@@ -340,8 +352,9 @@ def test_trash_purge_failure_keeps_payload_and_manifest_for_retry(
 
     from backend import files
 
-    def fail_remove(path):
-        assert Path(path) == payload
+    def fail_remove(path, **kwargs):
+        assert Path(path).name.startswith(".purging-")
+        assert kwargs["dir_fd"] >= 0
         raise OSError("simulated trash purge failure")
 
     monkeypatch.setattr(files.shutil, "rmtree", fail_remove)
@@ -352,13 +365,25 @@ def test_trash_purge_failure_keeps_payload_and_manifest_for_retry(
         json={"trash_id": trash_id},
     )
 
-    assert response.status_code == 500
-    assert response.headers["X-MuseLab-Error-Code"] == "partial_delete"
+    assert response.status_code == 200, response.text
     assert response.json() == {
-        "detail": "trash purge failed; the item was kept for retry"
+        "ok": True,
+        "idempotent": False,
+        "cleanup_deferred": True,
     }
-    assert payload.is_dir()
-    assert manifest.is_file()
+    assert not payload.exists()
+    assert not manifest.exists()
+    assert (dustbin / f"{trash_id}.purged-receipt").is_file()
+    assert any(path.name.startswith(".purging-") for path in dustbin.iterdir())
+
+    response = client.request(
+        "DELETE",
+        "/api/files/trash/purge",
+        headers=auth,
+        json={"trash_id": trash_id},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["idempotent"] is True
 
 
 def test_trash_purge_rejects_path_traversal_in_trash_id(client, auth, temp_root):
