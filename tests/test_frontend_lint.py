@@ -2302,6 +2302,30 @@ def test_inherited_task_poller_waits_for_durable_agent_projection():
     assert "sessionMeta.runtime_predecessor" in check
     assert "Math.max(0, Math.floor(inheritedPending))" in check
     assert "this._ensureInheritedTaskPoller(sid, predecessorSid)" in check
+    # A second device attaching to an ordinary active turn must install the
+    # prompt envelope from /active before replaying assistant-only SSE events.
+    assert "this._installActiveTurnUser(" in check
+    assert "String(d.user_text || \"\")" in check
+    assert "Array.isArray(d.user_images) ? d.user_images : []" in check
+    assert "Array.isArray(d.user_docs) ? d.user_docs : []" in check
+    assert "if (activeTurnUser && activeTurnUser.appended)" in check
+    assert check.index("const activeTurnUser =") < check.index(
+        "this.send({ reconnect: true, sessionId: sid")
+
+
+def test_active_turn_user_installation_dedupes_without_repeated_scroll():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    helper_start = app.index("    _installActiveTurnUser(")
+    helper_end = app.index("\n    // Poll /active", helper_start)
+    helper = app[helper_start:helper_end]
+    assert "let appended = false;" in helper
+    assert "appended = true;" in helper
+    assert "return { message: turnUser, appended };" in helper
+
+    queue_start = app.index("    async _runQueueAttach(")
+    queue_end = app.index("\n    // ===== background-task continuation poller", queue_start)
+    queue = app[queue_start:queue_end]
+    assert "if (turnUser && turnUser.appended)" in queue
 
 
 def test_runtime_ui_revision_rejects_out_of_order_session_response():
@@ -3002,7 +3026,10 @@ def test_done_immediately_stamps_tool_tail_and_quietly_adopts_fork_boundary():
     reconcile = app[reconcile_start:reconcile_end]
     assert '"/api/chat/sessions/" + sid + "/active"' in reconcile
     assert "activity.active && !activity.background" in reconcile
-    assert '"/api/chat/sessions/" + sid + "?tail=80"' in reconcile
+    assert "const reconcileTail = this._historyReconcileWindowSize();" in reconcile
+    assert '"/api/chat/sessions/" + sid + "?tail=" + reconcileTail' in reconcile
+    assert "const completedTurnWindow = latestUserIndex >= 0" in reconcile
+    assert "minimumTail: completedTurnWindow" in reconcile
     assert "m && m.role !== \"user\" && m.uuid" in reconcile
     assert "m.role === \"assistant\" && m.uuid" in reconcile
     assert "m && m.uuid === expectedAssistantUuid" in reconcile
@@ -3349,7 +3376,9 @@ def test_history_paging_uses_smaller_mobile_pages_only_on_user_request():
     assert "_historyWindowSize() { return this._isMobileLayout() ? 20 : 100; }" in app
     assert 'const qs = full ? "?full=1" : "?tail=" + requestedTail' in load
     assert "const historyPage = this._historyWindowSize()" in load
+    assert "const minimumTail = Math.max(0, Number(opts.minimumTail) || 0)" in load
     assert "Math.max(historyPage, st.messages.length)" in load
+    assert "const requestedTail = Math.max(" in load
     assert "this._scheduleTransparentHistory(st, false)" not in load
 
     earlier_start = app.index("    async loadEarlierMessages(sid) {")
