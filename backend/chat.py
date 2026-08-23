@@ -3195,7 +3195,15 @@ async def _build_and_connect_client(
             # connect() may already have spawned the CLI before it becomes
             # cancellable. Until this function returns, the client is not in
             # the pool and no other cleanup path can reach it.
-            await _disconnect_unpooled_client(client, session_id)
+            try:
+                await _disconnect_unpooled_client(client, session_id)
+            except Exception as cleanup_exc:
+                sys.stderr.write(
+                    "[client-pool] connect failure cleanup pending "
+                    f"sid={session_id[:8]} "
+                    f"exc={type(cleanup_exc).__name__}\n"
+                )
+                sys.stderr.flush()
             raise
         return client
     except Exception as e:
@@ -3236,7 +3244,15 @@ async def _build_and_connect_client(
                 try:
                     await client.connect()
                 except BaseException:
-                    await _disconnect_unpooled_client(client, session_id)
+                    try:
+                        await _disconnect_unpooled_client(client, session_id)
+                    except Exception as cleanup_exc:
+                        sys.stderr.write(
+                            "[client-pool] retry connect cleanup pending "
+                            f"sid={session_id[:8]} "
+                            f"exc={type(cleanup_exc).__name__}\n"
+                        )
+                        sys.stderr.flush()
                     raise
                 if attempt > 0:
                     sys.stderr.write(

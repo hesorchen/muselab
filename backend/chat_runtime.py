@@ -68,6 +68,13 @@ CREATION_LOCKS: dict[ClientKey, asyncio.Lock] = {}
 SESSION_STREAMS: dict[ClientKey, "SessionStream"] = {}
 SESSION_DISCONNECT_TASKS: dict[str, set[asyncio.Task]] = {}
 SESSION_DISCONNECT_FAILED: set[str] = set()
+# A failed or timed-out disconnect must retain the exact client object. A
+# session-id-only failure bit cannot be retried after the pool entry has been
+# removed, and permanently poisons every later get_client() call.
+SESSION_DISCONNECT_CLIENTS: dict[
+    str, dict[int, ClaudeSDKClient]
+] = {}
+CLIENT_DISCONNECT_OWNERS: dict[int, asyncio.Task] = {}
 CLIENT_DISCONNECT_DEADLINE_S = 22.0
 STREAM_EOF = object()
 
@@ -80,29 +87,16 @@ async def disconnect_unpooled_client(
     client: ClaudeSDKClient,
     session_id: str,
 ) -> None:
-    """Boundedly close a connected client that never entered the pool."""
+    """Boundedly close a connected client that never entered the pool.
 
-    async def _sdk_disconnect() -> None:
-        try:
-            # The SDK close path owns graceful -> TERM -> KILL escalation. A
-            # shorter wait_for can cancel before that escalation completes.
-            await client.disconnect()
-        except Exception as exc:
-            sys.stderr.write(
-                f"[client-pool] unpooled {session_id[:8]} disconnect err: "
-                f"{type(exc).__name__}\n"
-            )
-
-    cleanup = asyncio.create_task(_sdk_disconnect())
-    cancelled = False
-    while not cleanup.done():
-        try:
-            await asyncio.shield(cleanup)
-        except asyncio.CancelledError:
-            cancelled = True
-    cleanup.result()
-    if cancelled:
-        raise asyncio.CancelledError
+    Cancellation only releases the caller; the exact cleanup owner remains in
+    the session registry. A later operation joins or retries it before a new
+    runtime can be created.
+    """
+    if not await join_session_disconnects(session_id, (client,)):
+        raise RuntimeCleanupTimeout(
+            "unpooled session runtime cleanup did not finish; retry"
+        )
 
 
 async def get_client(
@@ -213,7 +207,15 @@ async def get_client(
             if hooks.has_enabled_external_mcp():
                 await hooks.await_mcp_ready(client)
         except BaseException:
-            await hooks.disconnect_unpooled_client(client, session_id)
+            try:
+                await hooks.disconnect_unpooled_client(client, session_id)
+            except Exception as cleanup_exc:
+                sys.stderr.write(
+                    "[client-pool] MCP failure cleanup pending "
+                    f"sid={session_id[:8]} "
+                    f"exc={type(cleanup_exc).__name__}\n"
+                )
+                sys.stderr.flush()
             raise
 
         to_disconnect: list[
@@ -267,14 +269,18 @@ async def get_client(
         for old_key, old_client, old_stream in to_disconnect:
             if old_stream is not None:
                 await old_stream.aclose()
-            try:
-                await old_client.disconnect()
-            except Exception as exc:
+            if not await join_session_disconnects(
+                old_key[0], (old_client,)
+            ):
                 sys.stderr.write(
-                    "[client-pool] evict disconnect failed "
-                    f"sid={old_key[0][:8]} exc={type(exc).__name__}\n"
+                    "[client-pool] evict cleanup pending "
+                    f"sid={old_key[0][:8]}\n"
                 )
                 sys.stderr.flush()
+                retry = asyncio.create_task(
+                    _retry_pending_disconnects(old_key[0])
+                )
+                hooks.retain_detached_cleanup(retry)
 
         return client
 
@@ -456,29 +462,101 @@ def track_session_disconnect(session_id: str, task: asyncio.Task) -> None:
     task.add_done_callback(_done)
 
 
+async def _disconnect_owned_client(
+    session_id: str,
+    client_id: int,
+    client: ClaudeSDKClient,
+) -> None:
+    """Run one disconnect attempt while retaining retriable ownership."""
+    try:
+        await client.disconnect()
+    except BaseException:
+        SESSION_DISCONNECT_FAILED.add(session_id)
+        raise
+    else:
+        pending = SESSION_DISCONNECT_CLIENTS.get(session_id)
+        if pending is not None:
+            pending.pop(client_id, None)
+            if not pending:
+                SESSION_DISCONNECT_CLIENTS.pop(session_id, None)
+                SESSION_DISCONNECT_FAILED.discard(session_id)
+    finally:
+        current = asyncio.current_task()
+        if CLIENT_DISCONNECT_OWNERS.get(client_id) is current:
+            CLIENT_DISCONNECT_OWNERS.pop(client_id, None)
+
+
+def _queue_client_disconnect(
+    session_id: str,
+    client: ClaudeSDKClient,
+) -> asyncio.Task:
+    client_id = id(client)
+    pending = SESSION_DISCONNECT_CLIENTS.setdefault(session_id, {})
+    pending[client_id] = client
+    owner = CLIENT_DISCONNECT_OWNERS.get(client_id)
+    if owner is not None and not owner.done():
+        return owner
+    task = asyncio.create_task(
+        _disconnect_owned_client(session_id, client_id, client)
+    )
+    CLIENT_DISCONNECT_OWNERS[client_id] = task
+    track_session_disconnect(session_id, task)
+    return task
+
+
 async def join_session_disconnects(
     session_id: str,
     clients: Iterable[ClaudeSDKClient] = (),
     *,
     timeout: float = CLIENT_DISCONNECT_DEADLINE_S,
 ) -> bool:
-    if session_id in SESSION_DISCONNECT_FAILED:
-        return False
     tasks = {
         task
         for task in SESSION_DISCONNECT_TASKS.get(session_id, set())
         if not task.done()
     }
     for client in {id(item): item for item in clients}.values():
-        task = asyncio.create_task(client.disconnect())
-        track_session_disconnect(session_id, task)
-        tasks.add(task)
+        tasks.add(_queue_client_disconnect(session_id, client))
+    # Failed attempts retain their clients. A later admission check with no
+    # explicit client can therefore retry the exact subprocess.
+    for client in tuple(
+        SESSION_DISCONNECT_CLIENTS.get(session_id, {}).values()
+    ):
+        tasks.add(_queue_client_disconnect(session_id, client))
     if not tasks:
-        return True
+        return session_id not in SESSION_DISCONNECT_FAILED
     done, pending = await asyncio.wait(tasks, timeout=max(0.1, timeout))
     if done:
         await asyncio.gather(*done, return_exceptions=True)
-    return not pending and session_id not in SESSION_DISCONNECT_FAILED
+    # The deadline exceeds the SDK's graceful -> TERM -> KILL contract. Once
+    # exceeded, cancel the wedged attempt but retain its client for retry.
+    for task in pending:
+        task.cancel()
+    if pending:
+        await asyncio.sleep(0)
+    live = {
+        task
+        for task in SESSION_DISCONNECT_TASKS.get(session_id, set())
+        if not task.done()
+    }
+    return not (
+        pending
+        or live
+        or SESSION_DISCONNECT_CLIENTS.get(session_id)
+        or session_id in SESSION_DISCONNECT_FAILED
+    )
+
+
+async def _retry_pending_disconnects(session_id: str) -> None:
+    """Best-effort retry owner for LRU eviction, which has no HTTP caller."""
+    for delay in (0.25, 1.0, 4.0):
+        await asyncio.sleep(delay)
+        if await join_session_disconnects(session_id):
+            return
+    sys.stderr.write(
+        f"[client-pool] cleanup still pending sid={session_id[:8]}\n"
+    )
+    sys.stderr.flush()
 
 
 async def disconnect_client(session_id: str) -> None:
@@ -516,40 +594,15 @@ async def disconnect_background_task_owner(
     if pooled:
         await hooks.disconnect_client(session_id)
         return
-    existing = set(SESSION_DISCONNECT_TASKS.get(session_id, set()))
-    if existing:
-        done, pending = await asyncio.wait(
-            existing, timeout=CLIENT_DISCONNECT_DEADLINE_S
-        )
-        if pending:
-            raise RuntimeCleanupTimeout(
-                "background task runtime cleanup is still in progress"
-            )
-        results = await asyncio.gather(*done, return_exceptions=True)
-        if any(isinstance(result, BaseException) for result in results):
-            raise RuntimeCleanupTimeout(
-                "background task runtime cleanup failed"
-            )
-        SESSION_DISCONNECT_FAILED.discard(session_id)
-        return
     disconnect = getattr(client, "disconnect", None)
     if not callable(disconnect):
         raise RuntimeCleanupTimeout(
             "background task owner cannot confirm runtime cleanup"
         )
-    cleanup = asyncio.create_task(disconnect())
-    track_session_disconnect(session_id, cleanup)
-    done, pending = await asyncio.wait(
-        {cleanup}, timeout=CLIENT_DISCONNECT_DEADLINE_S
-    )
-    if pending:
+    if not await join_session_disconnects(session_id, (client,)):
         raise RuntimeCleanupTimeout(
-            "background task runtime cleanup did not finish"
+            "background task runtime cleanup did not finish; retry"
         )
-    result = (await asyncio.gather(*done, return_exceptions=True))[0]
-    if isinstance(result, BaseException):
-        raise RuntimeCleanupTimeout("background task runtime cleanup failed")
-    SESSION_DISCONNECT_FAILED.discard(session_id)
 
 
 async def shutdown_clients() -> None:
@@ -585,9 +638,18 @@ async def shutdown_clients() -> None:
         shutdown_disconnects: set[asyncio.Task] = set()
         for session_id, clients in clients_by_session.items():
             for client in clients:
-                task = asyncio.create_task(client.disconnect())
-                track_session_disconnect(session_id, task)
-                shutdown_disconnects.add(task)
+                shutdown_disconnects.add(
+                    _queue_client_disconnect(session_id, client)
+                )
+        # Include LRU-evicted and never-pooled clients retained after an
+        # earlier failed or timed-out attempt.
+        for session_id, clients in tuple(
+            SESSION_DISCONNECT_CLIENTS.items()
+        ):
+            for client in tuple(clients.values()):
+                shutdown_disconnects.add(
+                    _queue_client_disconnect(session_id, client)
+                )
         CLIENTS.clear()
         CLIENT_PERMISSION.clear()
         CLIENT_PLAN_RETURN.clear()
@@ -597,6 +659,11 @@ async def shutdown_clients() -> None:
 
     owners = existing_disconnects | shutdown_disconnects
     if owners:
-        done, _pending = await asyncio.wait(owners, timeout=4.0)
+        done, pending = await asyncio.wait(
+            owners, timeout=CLIENT_DISCONNECT_DEADLINE_S
+        )
         if done:
             await asyncio.gather(*done, return_exceptions=True)
+        for task in pending:
+            task.cancel()
+            hooks.retain_detached_cleanup(task)
