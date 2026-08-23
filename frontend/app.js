@@ -8352,6 +8352,36 @@ function portal() {
       sync.inheritedTicksLeft = 0;
       return true;
     },
+    _installActiveTurnUser(st, turnId, text = "", images = [], docs = []) {
+      if (!st || !(text || images.length || docs.length)) return null;
+      const messages = st.messages || [];
+      let turnUser = turnId
+        ? messages.find(message => message && message.role === "user"
+          && message._turnId === turnId)
+        : null;
+      let lastUser = null;
+      for (let i = messages.length - 1; i >= 0; i -= 1) {
+        if (messages[i] && messages[i].role === "user") {
+          lastUser = messages[i];
+          break;
+        }
+      }
+      // A canonical history load may already have installed this prompt without
+      // MuseLab's live turn id. Adopt that newest matching row before appending.
+      if (!turnUser && turnId && lastUser && !lastUser._turnId
+          && (lastUser.text || "") === text) {
+        lastUser._turnId = turnId;
+        turnUser = lastUser;
+      }
+      let appended = false;
+      if (!turnUser) {
+        turnUser = this._appendLiveMessage(st, {
+          role: "user", text, images, docs, _turnId: turnId,
+        });
+        appended = true;
+      }
+      return { message: turnUser, appended };
+    },
     // Poll /active + re-subscribe to a server-started turn. Retries a few
     // times because the server's drain runs a beat AFTER it publishes the
     // previous turn's `done` (in the background task's finally), so /active
@@ -8517,28 +8547,10 @@ function portal() {
         // case (loadSession already rebuilt this bubble): adopt an unlabelled
         // matching tail bubble. Identity, not text, is the durable dedupe key:
         // two queued turns are allowed to contain identical prompts.
-        const msgs = st ? st.messages : [];
-        let lastUser = null;
-        for (let i = msgs.length - 1; i >= 0; i--) {
-          if (msgs[i].role === "user") { lastUser = msgs[i]; break; }
-        }
-        let turnUser = turnId
-          ? msgs.find(m => m && m.role === "user" && m._turnId === turnId)
-          : null;
-        if (!turnUser && turnId && lastUser && !lastUser._turnId
-            && (lastUser.text || "") === uText) {
-          lastUser._turnId = turnId;
-          turnUser = lastUser;
-        }
-        if ((uText || uImages.length || uDocs.length) && !turnUser) {
+        const turnUser = this._installActiveTurnUser(
+          st, turnId, uText, uImages, uDocs);
+        if (turnUser && turnUser.appended) {
           this._scheduleLiveMessageViewport(st);
-          turnUser = this._appendLiveMessage(st, {
-            role: "user",
-            text: uText,
-            images: uImages,
-            docs: uDocs,
-            _turnId: turnId,
-          });
           st.atBottom = true;
           this.scrollToBottom(true);
         }
@@ -8782,22 +8794,29 @@ function portal() {
           retry();
           return false;
         }
+        const reconcileTail = this._historyReconcileWindowSize();
         const historyResponse = await fetch(
-          "/api/chat/sessions/" + sid + "?tail=80",
+          "/api/chat/sessions/" + sid + "?tail=" + reconcileTail,
           { headers: this.hdr(), signal: controller.signal },
         );
         if (!stillOwned()) return false;
         if (!historyResponse.ok) { retry(); return false; }
         const history = await historyResponse.json();
         const messages = Array.isArray(history.messages) ? history.messages : [];
-        let turnStart = 0;
+        let latestUserIndex = -1;
         for (let i = messages.length - 1; i >= 0; i -= 1) {
           if (messages[i] && messages[i].role === "user") {
-            turnStart = i + 1;
+            latestUserIndex = i;
             break;
           }
         }
+        const turnStart = latestUserIndex + 1;
         const canonicalTurn = messages.slice(turnStart);
+        // Mobile's normal 20-block window can start inside a tool-heavy turn.
+        // Reconcile at least through this turn's user boundary so canonical
+        // installation never keeps the reply while dropping its prompt.
+        const completedTurnWindow = latestUserIndex >= 0
+          ? messages.length - latestUserIndex : reconcileTail;
         const hasBoundary = canonicalTurn.some(
           m => m && m.role !== "user" && m.uuid,
         );
@@ -8813,6 +8832,7 @@ function portal() {
         if (!stillOwned()) return false;
         const loaded = await this.loadSession(sid, {
           quiet: true, probeActive: false,
+          minimumTail: completedTurnWindow,
         });
         if (!loaded) retry();
         else {
@@ -14342,6 +14362,21 @@ function portal() {
             : Number(st.inheritedBackgroundTaskCount) || 0;
           this._ensureInheritedTaskPoller(sid, predecessorSid);
         }
+        const activeTurnUser = d.active && !d.continuation
+          ? this._installActiveTurnUser(
+              st,
+              String(d.turn_id || ""),
+              String(d.user_text || ""),
+              Array.isArray(d.user_images) ? d.user_images : [],
+              Array.isArray(d.user_docs) ? d.user_docs : [],
+            )
+          : null;
+        if (activeTurnUser && activeTurnUser.appended) {
+          this._scheduleLiveMessageViewport(st);
+          if (this.currentId === sid && st.atBottom !== false) {
+            this.scrollToBottom(true);
+          }
+        }
         if (d.active && d.background && d.attachable === false) {
           st._serverActiveObserved = true;
           if (d.turn_id) st.activeTurnId = d.turn_id;
@@ -14546,9 +14581,11 @@ function portal() {
         // "Load earlier" control. Quiet reconciliation keeps blocks the user
         // already chose to load, but never expands the resident window by itself.
         const historyPage = this._historyWindowSize();
-        const requestedTail = quiet
-          ? Math.max(historyPage, st.messages.length)
-          : historyPage;
+        const minimumTail = Math.max(0, Number(opts.minimumTail) || 0);
+        const requestedTail = Math.max(
+          minimumTail,
+          quiet ? Math.max(historyPage, st.messages.length) : historyPage,
+        );
         const qs = full ? "?full=1" : "?tail=" + requestedTail;
         const controller = new AbortController();
         const timeout = setTimeout(
