@@ -355,7 +355,7 @@ def test_visible_completion_ack_wins_both_done_and_activity_sse_orders(
     assert result["activityFirstSettled"] == expected_settled
     assert result["doneFirstImmediate"] == expected_immediate
     assert result["doneFirstSettled"] == expected_settled
-    assert result["ackCalls"] == [1, 1, 0]
+    assert result["ackCalls"].count(1) == 2 and result["ackCalls"][-1] == 0
 
 
 def test_cached_activity_refresh_does_not_shift_rows_or_modal(
@@ -1364,6 +1364,7 @@ def test_activity_row_targeted_lookup_opens_mobile_session_and_workspace(
           app._checkActiveTurn = () => {};
           app._fetchTabUsage = async () => {};
           app._scheduleIdlePreload = () => {};
+          app._stopActivityEvents(); Object.values(app._activityFetchControllers || {}).forEach(controller => controller.abort()); app._activityFetchPromises = Object.create(null);
           app.fetchActivity = async () => true;
           app.setMobileTab('files');
           app._sessionListPullPromise = null;

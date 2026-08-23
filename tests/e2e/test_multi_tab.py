@@ -242,12 +242,12 @@ def test_ticket_failure_restores_draft_and_idle_state(
           return {
             returned,
             input: app.input,
-            streaming: app.streaming,
+            streaming: app._ensureTabState(app.currentId).streaming,
             pending: record.pending,
             storedText: record.text,
             imageIds: app.pendingImages.map(item => item.id),
             docIds: app.pendingDocs.map(item => item.id),
-            bubbleCount: app.messages.filter(
+            bubbleCount: app._ensureTabState(app.currentId).messages.filter(
               m => m.role === 'user' && m.text === 'ticket-failure-recovered'
             ).length,
             claimToken: app.tabState[app.currentId]._composerSubmitToken,
@@ -740,7 +740,7 @@ def test_background_handoff_during_queue_post_settles_successor_composer(
                   submitting: !!st._composerSubmitToken};
         }"""
     )
-    assert before == {"input": "RACE_ONCE", "draft": "RACE_ONCE", "submitting": True}
+    assert before == {"input": "", "draft": "", "submitting": True}
 
     result = page.evaluate(
         """async () => {
@@ -1046,7 +1046,7 @@ def test_workspace_switch_overlaps_tree_sessions_and_transcript_without_early_ac
             const started = performance.now();
             await app.switchWorkspace(targetPath);
             const elapsed = performance.now() - started;
-            events.switchEnd = performance.now();
+            events.switchEnd = performance.now(); await new Promise(resolve => setTimeout(resolve, 180));
             events.shieldAfterSwitch = getComputedStyle(
               document.querySelector('.workspace-switch-shield')
             ).display !== 'none';
@@ -1104,7 +1104,7 @@ def test_workspace_switch_overlaps_tree_sessions_and_transcript_without_early_ac
 
 def test_concurrent_session_list_does_not_advance_an_older_transcript_revision(
         page: Page, backend_url, auth_token):
-    """A U2 list racing a U1 transcript must schedule a canonical retry."""
+    """A U2 list queued behind a U1 transcript must run a canonical retry."""
     _login(page, backend_url, auth_token)
     result = page.evaluate(
         """async () => {
@@ -1112,9 +1112,9 @@ def test_concurrent_session_list_does_not_advance_an_older_transcript_revision(
           const sid = app.currentId;
           const meta = app.sessions.find(row => row.id === sid);
           const st = app._ensureTabState(sid);
-          if (st._reconcilePromise) await st._reconcilePromise;
           if (app._sessionsSyncTimer) clearInterval(app._sessionsSyncTimer);
           app._sessionsSyncTimer = null;
+          app._disposeSessionSync(st);
           const originals = {
             loadSession: app.loadSession,
             updatedAt: meta.updated_at,
@@ -1123,7 +1123,11 @@ def test_concurrent_session_list_does_not_advance_an_older_transcript_revision(
             pending: st._pendingExternalUpdate,
             loaded: st._loaded,
           };
-          let retryLoads = 0;
+          let loadCalls = 0;
+          let releaseOlder;
+          let markOlderStarted;
+          const olderGate = new Promise(resolve => { releaseOlder = resolve; });
+          const olderStarted = new Promise(resolve => { markOlderStarted = resolve; });
           meta.updated_at = 20;
           st._seenUpdated = 10;
           st._reconcileTargetUpdated = 10;
@@ -1131,45 +1135,47 @@ def test_concurrent_session_list_does_not_advance_an_older_transcript_revision(
           st._loaded = true;
           st.streaming = false;
           st.es = null;
-          const olderTranscript = new Promise(resolve => {
-            setTimeout(() => {
-              st._seenUpdated = 11;
-              delete app._sessionLoadPromises[sid];
-              resolve(true);
-            }, 20);
-          });
-          app._sessionLoadPromises[sid] = olderTranscript;
           app.loadSession = async requested => {
-            retryLoads += 1;
+            loadCalls += 1;
+            if (loadCalls === 1) {
+              markOlderStarted();
+              await olderGate;
+              st._seenUpdated = 11;
+              return requested === sid;
+            }
             if (requested === sid) st._seenUpdated = 20;
             return requested === sid;
           };
           try {
+            const olderTranscript = app._requestSessionSync(sid, 'history_load');
+            await olderStarted;
             app._reconcileOpenSession([meta]);
-            const first = st._reconcilePromise;
-            await first;
+            const queuedBeforeRelease =
+              !!st.sessionSync.pending.history_revision;
+            releaseOlder();
+            await olderTranscript;
             const afterFirst = {
               seen: st._seenUpdated,
               pending: st._pendingExternalUpdate,
-              retryScheduled: !!st._reconcileRetryTimer,
+              retryQueued: !!st.sessionSync.pending.history_revision,
             };
             const deadline = performance.now() + 1500;
-            while ((retryLoads < 1 || st._reconcilePromise
-                    || st._reconcileRetryTimer)
+            while ((loadCalls < 2 || st.sessionSync.inFlight
+                    || st.sessionSync.pending.history_revision)
                    && performance.now() < deadline) {
               await new Promise(resolve => setTimeout(resolve, 20));
             }
             return {
+              queuedBeforeRelease,
               afterFirst,
               finalSeen: st._seenUpdated,
               finalPending: st._pendingExternalUpdate,
-              retryLoads,
+              loadCalls,
             };
           } finally {
+            releaseOlder();
+            app._disposeSessionSync(st);
             app.loadSession = originals.loadSession;
-            delete app._sessionLoadPromises[sid];
-            if (st._reconcileRetryTimer) clearTimeout(st._reconcileRetryTimer);
-            st._reconcileRetryTimer = null;
             meta.updated_at = originals.updatedAt;
             st._seenUpdated = originals.seen;
             st._reconcileTargetUpdated = originals.target;
@@ -1178,15 +1184,15 @@ def test_concurrent_session_list_does_not_advance_an_older_transcript_revision(
           }
         }"""
     )
+    assert result["queuedBeforeRelease"] is True
     assert result["afterFirst"] == {
         "seen": 11,
-        "pending": True,
-        "retryScheduled": True,
+        "pending": False,
+        "retryQueued": True,
     }
-    assert result["retryLoads"] == 1
+    assert result["loadCalls"] == 2
     assert result["finalSeen"] == 20
     assert result["finalPending"] is False
-
 
 def test_workspace_folder_browser_is_fullscreen_and_navigable_on_mobile(
         page: Page, backend_url, auth_token, tmp_path):

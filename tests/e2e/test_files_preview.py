@@ -514,7 +514,7 @@ def test_preview_selection_quotes_as_attachment_and_asks_in_side_session(
             session: app.currentId,
             sessionCount: app.sessions.length,
             openTabs: [...app.openTabIds],
-            messageCount: app.messages.length,
+            messageCount: app._ensureTabState(app.currentId).messages.length,
           };
         }"""
     )
@@ -536,7 +536,7 @@ def test_preview_selection_quotes_as_attachment_and_asks_in_side_session(
             session: app.currentId,
             sessionCount: app.sessions.length,
             openTabs: [...app.openTabIds],
-            messageCount: app.messages.length,
+            messageCount: app._ensureTabState(app.currentId).messages.length,
           };
         }"""
     )
@@ -628,7 +628,7 @@ def test_preview_selection_quotes_as_attachment_and_asks_in_side_session(
             session: app.currentId,
             sessionCount: app.sessions.length,
             openTabs: [...app.openTabIds],
-            messageCount: app.messages.length,
+            messageCount: app._ensureTabState(app.currentId).messages.length,
             askSessionId: app.previewQuote.askSessionId,
             popover: app.previewQuote.show,
           };
@@ -814,7 +814,7 @@ def test_selection_side_question_window_drags_by_header_and_stays_in_view(
     assert before is not None and head_box is not None
     start_x = head_box["x"] + 32
     start_y = head_box["y"] + head_box["height"] / 2
-    target_left = 80
+    target_left = max(12, min(80, 1000 - before["width"] - 12))
     target_top = 120
     page.mouse.move(start_x, start_y)
     page.mouse.down()
@@ -1003,6 +1003,8 @@ def test_detached_preview_question_uses_send_pipeline_without_touching_draft(
     result = page.evaluate(
         """async () => {
           const app = document.querySelector('#app')._x_dataStack[0];
+          app.availableModels = [{model: 'e2e-model', label: 'E2E', group: 'e2e'}];
+          app.model = 'e2e-model';
           class FakeEventSource extends EventTarget {
             constructor(url) {
               super();
@@ -1032,7 +1034,7 @@ def test_detached_preview_question_uses_send_pipeline_without_touching_draft(
             app.pendingImages = [image];
             app.pendingDocs = [doc];
             app._captureComposerState(sid);
-            const messageCount = app.messages.length;
+            const messageCount = app._ensureTabState(app.currentId).messages.length;
             const sendResult = await app.send({
               sessionId: sid,
               detachedText: 'DETACHED PREVIEW QUESTION',
@@ -1051,7 +1053,7 @@ def test_detached_preview_question_uses_send_pipeline_without_touching_draft(
               recovery: app._chatDraftRecord(sid),
             };
           } finally {
-            if (app.es) app.es.close();
+            app.tabState[app.currentId]?.es?.close();
             window.EventSource = originalEventSource;
             app._confirmSessionBusy = originalBusy;
             app._awaitRuntimeSettingPatches = originalRuntimeWait;
@@ -1091,6 +1093,8 @@ def test_composer_quote_sends_context_without_rewriting_visible_text(
     result = page.evaluate(
         """async () => {
           const app = document.querySelector('#app')._x_dataStack[0];
+          app.availableModels = [{model: 'e2e-model', label: 'E2E', group: 'e2e'}];
+          app.model = 'e2e-model';
           class FakeEventSource extends EventTarget {
             constructor(url) {
               super();
@@ -1119,7 +1123,7 @@ def test_composer_quote_sends_context_without_rewriting_visible_text(
               text: 'SELECTED CONTEXT', truncated: false,
             }];
             app._captureComposerState(sid);
-            const before = app.messages.length;
+            const before = app._ensureTabState(app.currentId).messages.length;
             const sendResult = await app.send();
             await new Promise(resolve => setTimeout(resolve, 20));
             const state = app.tabState[sid];
@@ -1134,7 +1138,7 @@ def test_composer_quote_sends_context_without_rewriting_visible_text(
               quoteText: user && user.selectionQuotes[0].text,
             };
           } finally {
-            if (app.es) app.es.close();
+            app.tabState[app.currentId]?.es?.close();
             window.EventSource = originalEventSource;
             app._confirmSessionBusy = originalBusy;
             app._awaitRuntimeSettingPatches = originalRuntimeWait;
