@@ -671,6 +671,9 @@ function portal() {
     _sessionTodoEditOwner: null,
     userTodos: [],
     todoRevision: 0,
+    _todoPushGeneration: 0,
+    _todoPushPending: false,
+    _todoPushPromise: null,
     // Lightweight focus ownership shared by modal/popover surfaces. DOM nodes
     // live here only while their surface is open; the stack ensures a nested
     // managed dialog never restores focus behind the dialog above it.
@@ -12586,12 +12589,14 @@ function portal() {
           JSON.stringify(this.sessionTodoItems()),
         );
       } catch (_) { /* private mode / quota: keep the in-memory clipboard */ }
-      this._pushTodosToServer();
+      this._todoPushGeneration += 1;
+      this._todoPushPending = true;
+      void this._pushTodosToServer();
     },
     _applyTodosPayload(payload) {
       if (!payload || !Array.isArray(payload.items)) return;
       const revision = Number(payload.revision) || 0;
-      if (revision === this.todoRevision) return;
+      if (this._todoPushPending || revision < this.todoRevision) return;
       this.userTodos = this._normalizeUserTodos(payload.items);
       this.todoRevision = revision;
       try {
@@ -12602,39 +12607,85 @@ function portal() {
       } catch (_) { /* offline cache is best-effort */ }
     },
     async _pushTodosToServer() {
-      if (!this.token) return;
-      const r = await this.api("/api/todos", {
-        method: "PUT",
-        json: {
-          items: this.sessionTodoItems(),
-          base_revision: this.todoRevision,
-        },
-      });
-      if (r.ok) {
-        this._applyTodosPayload(r.data || {});
-      } else if (r.status === 409) {
-        // A concurrent device won; reconcile to the server-authoritative list.
-        await this._syncTodosFromServer();
+      if (!this.token) {
+        this._todoPushPending = false;
+        return;
       }
+      this._todoPushPending = true;
+      if (this._todoPushPromise) return this._todoPushPromise;
+
+      const drain = async () => {
+        while (this.token && this._todoPushPending) {
+          this._todoPushPending = false;
+          const generation = this._todoPushGeneration;
+          const items = this.sessionTodoItems().map(item => ({ ...item }));
+          const baseRevision = this.todoRevision;
+          const r = await this.api("/api/todos", {
+            method: "PUT",
+            json: { items, base_revision: baseRevision },
+          });
+          if (r.ok) {
+            const payload = r.data || {};
+            const revision = Number(payload.revision) || baseRevision;
+            if (generation === this._todoPushGeneration) {
+              this._applyTodosPayload(payload);
+            } else {
+              // The server committed the captured snapshot. Rebase the newest
+              // local edit on its revision without replacing the local board.
+              this.todoRevision = Math.max(this.todoRevision, revision);
+              this._todoPushPending = true;
+            }
+            continue;
+          }
+          if (r.status !== 409) return;
+
+          const refetch = await this.api("/api/todos");
+          if (!refetch.ok) return;
+          const payload = refetch.data || {};
+          const revision = Number(payload.revision) || baseRevision;
+          if (generation === this._todoPushGeneration) {
+            // No newer local edit exists, so the concurrent device wins.
+            this._applyTodosPayload(payload);
+          } else {
+            this.todoRevision = Math.max(this.todoRevision, revision);
+            this._todoPushPending = true;
+          }
+        }
+      };
+      const owner = drain().finally(() => {
+        if (this._todoPushPromise === owner) this._todoPushPromise = null;
+        // A local edit may arrive after the drain observes an empty queue but
+        // before its owner is cleared.
+        if (this.token && this._todoPushPending) {
+          void this._pushTodosToServer();
+        }
+      });
+      this._todoPushPromise = owner;
+      return owner;
     },
     async _syncTodosFromServer() {
       if (!this.token) return;
+      const generation = this._todoPushGeneration;
       const r = await this.api("/api/todos");
       if (!r.ok) return; // offline / unauthenticated: keep the local cache
-      let data = r.data || {};
+      const data = r.data || {};
+      const revision = Number(data.revision) || 0;
+      if (generation !== this._todoPushGeneration) {
+        // A local edit made while GET was in flight is newer than this
+        // snapshot. Keep it, then serialize it after the observed revision.
+        this.todoRevision = Math.max(this.todoRevision, revision);
+        this._todoPushPending = true;
+        await this._pushTodosToServer();
+        return;
+      }
       const local = this.sessionTodoItems();
       if ((!Array.isArray(data.items) || !data.items.length) && local.length) {
-        // One-time migration of pre-sync localStorage todos up to the server.
-        const pushed = await this.api("/api/todos", {
-          method: "PUT",
-          json: { items: local, base_revision: Number(data.revision) || 0 },
-        });
-        if (pushed.ok) {
-          data = pushed.data || data;
-        } else {
-          const refetch = await this.api("/api/todos");
-          if (refetch.ok) data = refetch.data || data;
-        }
+        // One-time migration shares the same writer as ordinary edits so it
+        // cannot race a user action made while startup sync is in flight.
+        this.todoRevision = Math.max(this.todoRevision, revision);
+        this._todoPushPending = true;
+        await this._pushTodosToServer();
+        return;
       }
       this._applyTodosPayload(data);
     },
@@ -12815,15 +12866,18 @@ function portal() {
           || !["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(ev.key)) return;
       ev.preventDefault();
       ev.stopPropagation();
+      const currentItem = this.sessionTodoItems()
+        .find(candidate => candidate.id === item.id);
+      if (!currentItem) return;
       const priorities = ["high", "medium", "low"];
       let changed = false;
       let action = "";
       if (ev.key === "ArrowLeft" || ev.key === "ArrowRight") {
-        const index = priorities.indexOf(item.priority);
+        const index = priorities.indexOf(currentItem.priority);
         const targetIndex = index + (ev.key === "ArrowLeft" ? -1 : 1);
         if (targetIndex >= 0 && targetIndex < priorities.length) {
           const priority = priorities[targetIndex];
-          changed = this._moveSessionTodoTo(item.id, priority, "", true);
+          changed = this._moveSessionTodoTo(currentItem.id, priority, "", true);
           const label = priority === "high"
             ? (this.lang === "zh" ? "高优先级" : "high priority")
             : priority === "medium"
@@ -12832,20 +12886,22 @@ function portal() {
           action = this.lang === "zh" ? `已移至${label}` : `moved to ${label}`;
         }
       } else {
-        const peers = this.sessionTodosForPriority(item.priority);
-        const index = peers.findIndex(peer => peer.id === item.id);
+        const peers = this.sessionTodosForPriority(currentItem.priority);
+        const index = peers.findIndex(peer => peer.id === currentItem.id);
         if (ev.key === "ArrowUp" && index > 0) {
-          changed = this._moveSessionTodoTo(item.id, item.priority, peers[index - 1].id, true);
+          changed = this._moveSessionTodoTo(
+            currentItem.id, currentItem.priority, peers[index - 1].id, true);
           action = this.lang === "zh" ? "已上移" : "moved up";
         } else if (ev.key === "ArrowDown" && index >= 0 && index + 1 < peers.length) {
           const beforeId = index + 2 < peers.length ? peers[index + 2].id : "";
-          changed = this._moveSessionTodoTo(item.id, item.priority, beforeId, true);
+          changed = this._moveSessionTodoTo(
+            currentItem.id, currentItem.priority, beforeId, true);
           action = this.lang === "zh" ? "已下移" : "moved down";
         }
       }
       if (changed) {
-        this._announceSessionTodoMove(item, action);
-        this._focusSessionTodoGrip(item.id);
+        this._announceSessionTodoMove(currentItem, action);
+        this._focusSessionTodoGrip(currentItem.id);
       }
     },
     onSessionTodoDrop(ev, priority, beforeId = "") {

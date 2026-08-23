@@ -1630,9 +1630,35 @@ def test_session_todo_modal_uses_large_desktop_board(
     # as pointer/native dragging.
     medium_grip = modal.locator('[data-todo-id="todo-medium"] .session-todo-grip')
     medium_grip.focus()
-    medium_grip.press("ArrowLeft")
+    keyboard_steps = page.evaluate(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const staleItem = app.sessionTodoItems()
+            .find(item => item.id === 'todo-medium');
+          const snapshot = () => app.sessionTodoItems()
+            .map(item => item.id + ':' + item.priority);
+          const eventFor = key => ({
+            key, altKey: false, ctrlKey: false, metaKey: false,
+            preventDefault() {}, stopPropagation() {},
+          });
+          app.onSessionTodoGripKeydown(eventFor('ArrowLeft'), staleItem);
+          const afterLeft = snapshot();
+          app.onSessionTodoGripKeydown(eventFor('ArrowUp'), staleItem);
+          return {afterLeft, afterUp: snapshot()};
+        }"""
+    )
+    assert keyboard_steps == {
+        "afterLeft": ["todo-high:high", "todo-low:low", "todo-medium:high"],
+        "afterUp": ["todo-medium:high", "todo-high:high", "todo-low:low"],
+    }
+    page.wait_for_function(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          return app._todoPushPromise === null && !app._todoPushPending;
+        }"""
+    )
+
     expect(modal.locator('.session-todo-lane.is-high [data-todo-id="todo-medium"]')).to_be_visible()
-    modal.locator('[data-todo-id="todo-medium"] .session-todo-grip').press("ArrowUp")
     ordered = page.evaluate(
         """() => {
           const app = document.querySelector('#app')._x_dataStack[0];
