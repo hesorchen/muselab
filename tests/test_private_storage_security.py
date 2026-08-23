@@ -362,3 +362,62 @@ def test_trash_storage_never_follows_root_manifest_or_payload_symlinks(
     assert exc_info.value.status_code == 404
     assert outside_payload.read_bytes() == b"external payload"
     assert _mode(outside_payload) == 0o644
+
+
+@pytest.mark.parametrize("fault", ["fchmod", "write", "fsync", "replace"])
+def test_private_writer_faults_never_publish_partial_final(
+    app_module,
+    temp_root,
+    monkeypatch,
+    fault,
+) -> None:
+    del app_module
+    from backend import private_storage
+
+    parent = temp_root / "atomic-writer"
+    parent.mkdir(mode=0o700)
+    existing = parent / "existing.bin"
+    missing = parent / "missing.bin"
+    existing.write_bytes(b"old-value")
+    existing.chmod(0o600)
+
+    original_fchmod = private_storage.os.fchmod
+    original_write = private_storage.os.write
+    original_fsync = private_storage.os.fsync
+    original_replace = private_storage.os.replace
+
+    if fault == "fchmod":
+        def fail_fchmod(fd, mode):
+            original_fchmod(fd, mode)
+            raise OSError("post-open fault")
+
+        monkeypatch.setattr(private_storage.os, "fchmod", fail_fchmod)
+    elif fault == "write":
+        def fail_write(fd, data):
+            original_write(fd, bytes(data[:1]))
+            raise OSError("post-write fault")
+
+        monkeypatch.setattr(private_storage.os, "write", fail_write)
+    elif fault == "fsync":
+        def fail_fsync(fd):
+            original_fsync(fd)
+            raise OSError("post-fsync fault")
+
+        monkeypatch.setattr(private_storage.os, "fsync", fail_fsync)
+    else:
+        def fail_replace(src, dst):
+            raise OSError("pre-commit replace fault")
+
+        monkeypatch.setattr(private_storage.os, "replace", fail_replace)
+
+    for target in (existing, missing):
+        with pytest.raises(OSError):
+            private_storage.write_private_bytes(target, b"new-value")
+
+    assert existing.read_bytes() == b"old-value"
+    assert not missing.exists()
+    assert not [
+        child for child in parent.iterdir()
+        if child.name.startswith(".") and child.name.endswith(".tmp")
+    ]
+    assert original_replace is not None

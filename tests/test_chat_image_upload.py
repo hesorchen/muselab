@@ -1,6 +1,9 @@
 """Tests for POST /api/chat/upload-image."""
+import asyncio
 import base64
 import io
+import threading
+import zipfile
 
 import pytest
 
@@ -348,3 +351,307 @@ def test_image_generate_history_lists_and_attaches(client, auth):
     img = r.json()["image"]
     assert img["id"]
     assert base64.b64decode(chat._image_store[img["id"]]["b64"]) == PNG_1X1
+
+
+@pytest.mark.asyncio
+async def test_upload_reader_stops_at_limit_plus_one(app_module, monkeypatch):
+    del app_module
+    from backend import chat
+
+    monkeypatch.setattr(chat, "_IMAGE_MAX_BYTES", 7)
+    monkeypatch.setattr(chat, "_UPLOAD_READ_CHUNK_BYTES", 3)
+
+    class SizedReader:
+        def __init__(self):
+            self.offset = 0
+            self.calls = []
+            self.body = b"0123456789"
+
+        async def read(self, size):
+            self.calls.append(size)
+            chunk = self.body[self.offset:self.offset + size]
+            self.offset += len(chunk)
+            return chunk
+
+    reader = SizedReader()
+    with pytest.raises(chat.HTTPException) as exc_info:
+        await chat._read_upload_limited(reader)
+    assert exc_info.value.status_code == 413
+    assert reader.offset == 8
+    assert reader.calls == [3, 3, 2]
+
+
+@pytest.mark.parametrize("budget", ["entries", "bytes"])
+def test_generated_batch_capacity_rejection_is_atomic(
+    app_module,
+    monkeypatch,
+    budget,
+):
+    del app_module
+    from backend import chat
+
+    with chat._image_store_lock:
+        chat._image_store.clear()
+        chat._staged_attachment_claims.clear()
+        count = 47 if budget == "entries" else 1
+        for index in range(count):
+            aid = f"leased-{index:02d}"
+            entry = {
+                "kind": "image",
+                "mime": "image/png",
+                "name": f"leased-{index}.png",
+                "b64": base64.b64encode(b"x").decode(),
+                "ts": chat.time.time(),
+            }
+            chat._image_store[aid] = entry
+            chat._staged_attachment_claims[aid] = f"token-{index}"
+        snapshot = dict(chat._image_store)
+        protected_bytes = sum(
+            chat._image_entry_bytes(entry)
+            for entry in chat._image_store.values()
+        )
+
+    monkeypatch.setattr(chat, "_IMAGE_STORE_MAX_ENTRIES", 48)
+    monkeypatch.setattr(
+        chat,
+        "_IMAGE_STORE_MAX_BYTES",
+        chat._IMAGE_STORE_MAX_BYTES
+        if budget == "entries" else protected_bytes + 1,
+    )
+    encoded = base64.b64encode(b"generated").decode()
+    with pytest.raises(chat.HTTPException) as exc_info:
+        chat._stage_generated_images([encoded, encoded], "image/png")
+    assert exc_info.value.status_code == 503
+    with chat._image_store_lock:
+        assert chat._image_store == snapshot
+        assert set(chat._staged_attachment_claims) == set(snapshot)
+
+
+@pytest.mark.asyncio
+async def test_response_owned_generated_batch_reclaimed_at_cancel_checkpoint(
+    app_module,
+    monkeypatch,
+):
+    del app_module
+    from backend import chat
+
+    encoded = base64.b64encode(PNG_1X1).decode()
+
+    async def stage_then_queue_cancel(b64s, mime):
+        items = chat._stage_generated_images(b64s, mime)
+        task = asyncio.current_task()
+        asyncio.get_running_loop().call_soon(task.cancel)
+        return items
+
+    monkeypatch.setattr(
+        chat, "_stage_generated_images_owned", stage_then_queue_cancel)
+    with pytest.raises(asyncio.CancelledError):
+        await chat._stage_generated_images_for_response(
+            [encoded, encoded], "image/png")
+    with chat._image_store_lock:
+        assert chat._image_store == {}
+        assert chat._staged_attachment_claims == {}
+
+@pytest.mark.asyncio
+async def test_owned_stage_preserves_owner_cancel_when_worker_fails(
+    app_module,
+    monkeypatch,
+):
+    del app_module
+    from backend import chat
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    def fail_after_cancel(*_args, **_kwargs):
+        entered.set()
+        assert release.wait(timeout=5)
+        raise chat.HTTPException(503, "injected worker failure")
+
+    monkeypatch.setattr(chat, "_stage_generated_images", fail_after_cancel)
+    owner = asyncio.create_task(chat._stage_generated_images_owned(
+        [base64.b64encode(PNG_1X1).decode()],
+        "image/png",
+    ))
+    assert await asyncio.to_thread(entered.wait, 5)
+    owner.cancel()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await owner
+    with chat._image_store_lock:
+        assert chat._image_store == {}
+
+
+@pytest.mark.asyncio
+async def test_job_attach_reclaims_batch_at_owner_cancel_checkpoint(
+    app_module,
+    monkeypatch,
+):
+    del app_module
+    from backend import chat
+
+    job_id = "job-attach-cancel"
+    image_id = "image-attach-cancel"
+    job_dir = chat._IMAGEGEN_FILES / job_id
+    job_dir.mkdir(parents=True)
+    (job_dir / "image-1.png").write_bytes(PNG_1X1)
+    chat._imagegen_put_job({
+        "id": job_id,
+        "status": "succeeded",
+        "images": [{
+            "image_id": image_id,
+            "file": "image-1.png",
+            "name": "generated.png",
+            "mime": "image/png",
+        }],
+        "created_at": 1.0,
+        "updated_at": 1.0,
+    })
+
+    async def stage_then_queue_cancel(b64s, mime):
+        items = chat._stage_generated_images(b64s, mime)
+        task = asyncio.current_task()
+        assert task is not None
+        asyncio.get_running_loop().call_soon(task.cancel)
+        return items
+
+    monkeypatch.setattr(
+        chat, "_stage_generated_images_owned", stage_then_queue_cancel)
+    with pytest.raises(asyncio.CancelledError):
+        await chat.attach_image_generate_job_image(job_id, image_id)
+    with chat._image_store_lock:
+        assert chat._image_store == {}
+        assert chat._staged_attachment_claims == {}
+
+@pytest.mark.parametrize("budget", ["entries", "member", "total", "ratio"])
+def test_xlsx_archive_budgets_reject_before_openpyxl(
+    app_module,
+    monkeypatch,
+    budget,
+):
+    del app_module
+    from backend import chat
+
+    payload = io.BytesIO()
+    with zipfile.ZipFile(
+        payload, "w", compression=zipfile.ZIP_DEFLATED,
+    ) as archive:
+        archive.writestr("a.xml", b"A" * 4096)
+        archive.writestr("b.xml", b"B" * 4096)
+
+    if budget == "entries":
+        monkeypatch.setattr(chat, "_XLSX_ARCHIVE_MAX_ENTRIES", 1)
+    elif budget == "member":
+        monkeypatch.setattr(chat, "_XLSX_ARCHIVE_MAX_MEMBER_BYTES", 1024)
+    elif budget == "total":
+        monkeypatch.setattr(
+            chat, "_XLSX_ARCHIVE_MAX_UNCOMPRESSED_BYTES", 6000)
+    else:
+        monkeypatch.setattr(chat, "_XLSX_ARCHIVE_MAX_COMPRESSION_RATIO", 1)
+
+    with pytest.raises(chat.HTTPException) as exc_info:
+        chat._validate_xlsx_archive(payload.getvalue())
+    assert exc_info.value.status_code == 422
+
+
+def test_xlsx_transcription_bounds_rows_and_columns(
+    app_module,
+    monkeypatch,
+):
+    del app_module
+    from backend import chat
+    openpyxl = pytest.importorskip("openpyxl")
+
+    monkeypatch.setattr(chat, "_XLSX_ATTACH_MAX_ROWS", 2)
+    monkeypatch.setattr(chat, "_XLSX_ATTACH_MAX_COLS", 2)
+    workbook = openpyxl.Workbook()
+    sheet = workbook.active
+    sheet["A1"] = "visible"
+    sheet["C1"] = "hidden-column"
+    sheet["A3"] = "hidden-row"
+    payload = io.BytesIO()
+    workbook.save(payload)
+    workbook.close()
+
+    text = chat._xlsx_to_text(payload.getvalue(), "safe.xlsx")
+    assert "visible" in text
+    assert "hidden-column" not in text
+    assert "hidden-row" not in text
+    assert "rows truncated at 2" in text
+    assert "cols truncated at 2" in text
+
+
+@pytest.mark.asyncio
+async def test_background_image_job_reclaims_temporary_staged_results(
+    app_module,
+    monkeypatch,
+):
+    del app_module
+    from backend import chat
+
+    encoded = base64.b64encode(PNG_1X1).decode()
+    staged = chat._stage_generated_images([encoded], "image/png")
+    job_id = "job-reclaim"
+    chat._imagegen_put_job({
+        "id": job_id,
+        "status": "queued",
+        "prompt": "prompt",
+        "model": "gpt-image-2",
+        "provider": None,
+        "size": "1024x1024",
+        "quality": "low",
+        "output_format": "png",
+        "n": 1,
+        "error": "",
+        "images": [],
+        "created_at": 1.0,
+        "updated_at": 1.0,
+    })
+
+    async def fake_generate(**_kwargs):
+        return {
+            "provider": "openai",
+            "model": "gpt-image-2",
+            "images": staged,
+        }
+
+    monkeypatch.setattr(chat, "_generate_openai_image_api", fake_generate)
+    request = chat.ImageGenerateReq(prompt="prompt")
+    await chat._run_imagegen_job(job_id, request)
+    with chat._image_store_lock:
+        assert staged[0]["id"] not in chat._image_store
+    assert chat._imagegen_load_jobs()[job_id]["status"] == "succeeded"
+
+
+@pytest.mark.asyncio
+async def test_image_job_detail_base64_runs_in_worker(app_module, monkeypatch):
+    del app_module
+    from backend import chat
+
+    job_id = "job-worker"
+    image_id = "image-worker"
+    job_dir = chat._IMAGEGEN_FILES / job_id
+    job_dir.mkdir(parents=True)
+    (job_dir / "image-1.png").write_bytes(PNG_1X1)
+    chat._imagegen_put_job({
+        "id": job_id,
+        "status": "succeeded",
+        "images": [{
+            "image_id": image_id,
+            "file": "image-1.png",
+            "mime": "image/png",
+        }],
+    })
+    main_thread = threading.get_ident()
+    worker_threads = []
+    original = chat._imagegen_public_job
+
+    def tracked(job, *, include_data=True):
+        worker_threads.append(threading.get_ident())
+        return original(job, include_data=include_data)
+
+    monkeypatch.setattr(chat, "_imagegen_public_job", tracked)
+    result = await chat.get_image_generate_job(job_id)
+    assert result["job"]["images"][0]["data_url"].startswith(
+        "data:image/png;base64,")
+    assert worker_threads and worker_threads[0] != main_thread
