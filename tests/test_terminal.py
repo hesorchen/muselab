@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 import sys
@@ -261,6 +262,165 @@ async def test_terminal_initial_ready_send_failure_detaches_subscriber(
     assert websocket.send_attempts == 1
     assert detached == [(session, subscriber)]
 
+
+
+@pytest.mark.asyncio
+async def test_terminal_create_reserves_capacity_during_spawn(
+    app_module,
+    monkeypatch,
+    tmp_path,
+):
+    from backend import terminal
+
+    class FakeWriter:
+        def __init__(self):
+            self.frames = []
+
+        def is_closing(self):
+            return False
+
+        def write(self, data):
+            self.frames.append(data)
+
+        async def drain(self):
+            return None
+
+    class FakeProcess:
+        pid = 1234
+        stdout = None
+        stderr = None
+        returncode = None
+
+        def __init__(self):
+            self.stdin = FakeWriter()
+            self.wait_calls = 0
+
+        async def wait(self):
+            self.wait_calls += 1
+            self.returncode = 0
+            return 0
+
+    manager = terminal.TerminalManager()
+    monkeypatch.setattr(terminal, "MAX_SESSIONS", 1)
+    monkeypatch.setattr(terminal.profiles, "get", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(terminal, "_shell_path", lambda: "/bin/sh")
+
+    async def no_start():
+        return None
+
+    spawn_entered = asyncio.Event()
+    release_spawn = asyncio.Event()
+    processes = []
+
+    async def fake_spawn(*_args, **_kwargs):
+        process = FakeProcess()
+        processes.append(process)
+        spawn_entered.set()
+        await release_spawn.wait()
+        return process
+
+    monkeypatch.setattr(manager, "start", no_start)
+    monkeypatch.setattr(terminal.asyncio, "create_subprocess_exec", fake_spawn)
+    first = asyncio.create_task(
+        manager.create(tmp_path, terminal.TerminalCreate(profile_id=""))
+    )
+    await spawn_entered.wait()
+
+    with pytest.raises(terminal.HTTPException) as rejected:
+        await manager.create(tmp_path, terminal.TerminalCreate(profile_id=""))
+    assert rejected.value.status_code == 409
+    assert len(processes) == 1
+
+    release_spawn.set()
+    session = await first
+    assert list(manager.sessions) == [session.id]
+    assert manager._reservations == {}
+    await manager.close(session.id, tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_terminal_create_cancellation_after_spawn_cleans_process(
+    app_module,
+    monkeypatch,
+    tmp_path,
+):
+    from backend import terminal
+
+    class FakeWriter:
+        def __init__(self):
+            self.frames = []
+
+        def is_closing(self):
+            return False
+
+        def write(self, data):
+            self.frames.append(data)
+
+        async def drain(self):
+            return None
+
+    class FakeProcess:
+        pid = 5678
+        stdout = None
+        stderr = None
+        returncode = None
+
+        def __init__(self):
+            self.stdin = FakeWriter()
+            self.wait_calls = 0
+
+        async def wait(self):
+            self.wait_calls += 1
+            self.returncode = 0
+            return 0
+
+    class RegistrationGate:
+        def __init__(self):
+            self._lock = asyncio.Lock()
+            self.entries = 0
+            self.registration_waiting = asyncio.Event()
+            self.never = asyncio.Event()
+
+        async def __aenter__(self):
+            self.entries += 1
+            if self.entries == 2:
+                self.registration_waiting.set()
+                await self.never.wait()
+            await self._lock.acquire()
+            return self
+
+        async def __aexit__(self, *_exc_info):
+            self._lock.release()
+
+    manager = terminal.TerminalManager()
+    manager.lock = RegistrationGate()
+    monkeypatch.setattr(terminal.profiles, "get", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(terminal, "_shell_path", lambda: "/bin/sh")
+
+    async def no_start():
+        return None
+
+    process = FakeProcess()
+
+    async def fake_spawn(*_args, **_kwargs):
+        return process
+
+    monkeypatch.setattr(manager, "start", no_start)
+    monkeypatch.setattr(terminal.asyncio, "create_subprocess_exec", fake_spawn)
+    creation = asyncio.create_task(
+        manager.create(tmp_path, terminal.TerminalCreate(profile_id=""))
+    )
+    await manager.lock.registration_waiting.wait()
+    creation.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await creation
+
+    assert manager.sessions == {}
+    assert manager._reservations == {}
+    assert process.wait_calls == 1
+    assert len(process.stdin.frames) == 1
+    assert process.stdin.frames[0][0] == terminal._TERMINATE
 
 def test_terminal_profiles_crud_default_and_startup_command(
     terminal_client, auth, temp_root,

@@ -276,6 +276,7 @@ class TerminalManager:
     def __init__(self) -> None:
         self.sessions: dict[str, TerminalSession] = {}
         self.tickets: dict[str, tuple[str, float]] = {}
+        self._reservations: dict[str, Path] = {}
         self.lock = asyncio.Lock()
         self.reaper_task: asyncio.Task | None = None
 
@@ -302,47 +303,86 @@ class TerminalManager:
     async def create(self, workspace: Path, request: TerminalCreate) -> TerminalSession:
         self.ensure_enabled()
         await self.start()
+        reservation_id = str(uuid.uuid4())
         async with self.lock:
             live = sum(1 for session in self.sessions.values()
                        if session.status == "running")
-            if live >= MAX_SESSIONS:
+            if live + len(self._reservations) >= MAX_SESSIONS:
                 raise HTTPException(409, f"terminal limit reached ({MAX_SESSIONS})")
-        profile = profiles.get(request.profile_id, use_default=True)
-        shell = _shell_path()
-        worker = Path(__file__).with_name("terminal_worker.py")
-        env = _terminal_env(shell, workspace)
-        process = await asyncio.create_subprocess_exec(
-            sys.executable, str(worker), shell, str(workspace),
-            str(request.rows), str(request.cols),
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=env,
-        )
-        now = time.time()
-        terminal_id = str(uuid.uuid4())
-        default_name = f"Terminal {sum(1 for s in self.sessions.values() if s.workspace == workspace) + 1}"
-        session = TerminalSession(
-            id=terminal_id,
-            name=request.name.strip() or (profile["name"] if profile else default_name),
-            workspace=workspace,
-            shell=shell,
-            profile_id=profile["id"] if profile else "",
-            profile_name=profile["name"] if profile else "",
-            process=process,
-            created_at=now,
-            last_activity=now,
-        )
+            default_number = (
+                sum(1 for session in self.sessions.values()
+                    if session.workspace == workspace)
+                + sum(1 for root in self._reservations.values()
+                      if root == workspace)
+                + 1
+            )
+            self._reservations[reservation_id] = workspace
+
+        session: TerminalSession | None = None
+        try:
+            profile = profiles.get(request.profile_id, use_default=True)
+            shell = _shell_path()
+            worker = Path(__file__).with_name("terminal_worker.py")
+            env = _terminal_env(shell, workspace)
+            process = await asyncio.create_subprocess_exec(
+                sys.executable, str(worker), shell, str(workspace),
+                str(request.rows), str(request.cols),
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
+            )
+            now = time.time()
+            terminal_id = str(uuid.uuid4())
+            session = TerminalSession(
+                id=terminal_id,
+                name=request.name.strip() or (
+                    profile["name"] if profile else f"Terminal {default_number}"
+                ),
+                workspace=workspace,
+                shell=shell,
+                profile_id=profile["id"] if profile else "",
+                profile_name=profile["name"] if profile else "",
+                process=process,
+                created_at=now,
+                last_activity=now,
+            )
+            if profile:
+                command = profile["command"].encode("utf-8")
+                if not command.endswith((b"\n", b"\r")):
+                    command += b"\n"
+                await self._write_worker(session, _INPUT, command)
+            async with self.lock:
+                self.sessions[terminal_id] = session
+                self._reservations.pop(reservation_id, None)
+            session.reader_task = asyncio.create_task(self._read_worker(session))
+            session.stderr_task = asyncio.create_task(self._read_stderr(session))
+            return session
+        except BaseException:
+            cleanup_task = asyncio.create_task(
+                self._rollback_create(reservation_id, session)
+            )
+            while not cleanup_task.done():
+                try:
+                    await asyncio.shield(cleanup_task)
+                except asyncio.CancelledError:
+                    # The caller may cancel repeatedly, but ownership of a spawned
+                    # process cannot be abandoned until rollback has finished.
+                    continue
+            cleanup_task.result()
+            raise
+
+    async def _rollback_create(
+        self,
+        reservation_id: str,
+        session: TerminalSession | None,
+    ) -> None:
         async with self.lock:
-            self.sessions[terminal_id] = session
-        session.reader_task = asyncio.create_task(self._read_worker(session))
-        session.stderr_task = asyncio.create_task(self._read_stderr(session))
-        if profile:
-            command = profile["command"].encode("utf-8")
-            if not command.endswith((b"\n", b"\r")):
-                command += b"\n"
-            await self._write_worker(session, _INPUT, command)
-        return session
+            self._reservations.pop(reservation_id, None)
+            if session is not None:
+                self.sessions.pop(session.id, None)
+        if session is not None:
+            await self._terminate_process(session)
 
     async def list(self, workspace: Path) -> list[dict[str, Any]]:
         self.ensure_enabled()
