@@ -1692,7 +1692,17 @@ def test_activity_center_groups_by_attention_order_and_read_state():
     assert "this.activityGroupCap(group)" in app
     assert "activityHiddenCount(group)" in app
     assert '"/api/activity?limit=500"' in app
-    assert "r.status === 304 && !opts.summaryOnly && !this.activity.events.length" in app
+    fetch_start = app.index("    async fetchActivity(opts = {}) {")
+    fetch_end = app.index("\n    async openActivityCenter()", fetch_start)
+    fetch_activity = app[fetch_start:fetch_end]
+    assert "_activityEventsSnapshotLoaded: false" in app
+    assert "r.status === 304 && !opts.summaryOnly" in fetch_activity
+    assert "&& !this._activityEventsSnapshotLoaded" in fetch_activity
+    assert "!this.activity.events.length" not in fetch_activity
+    assert "this._activityEventsSnapshotLoaded = true" in fetch_activity
+    assert fetch_activity.index("this.activity.events = events") < (
+        fetch_activity.index("this._activityEventsSnapshotLoaded = true")
+    )
     assert 'cache: "reload"' in app
     assert "opts.summaryOnly && this._activityFetchPromises.events" in app
     assert "!opts.summaryOnly && this._activityFetchPromises.summary" in app

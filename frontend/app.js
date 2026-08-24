@@ -715,6 +715,9 @@ function portal() {
     REQUEST_DEADLINE_MS: 8000,
     SESSION_SYNC_DEADLINE_MS: 35000,
     _activityEtags: {},
+    // A successful full snapshot may legally contain zero events. Track that
+    // ownership separately from rows added by optimistic or live updates.
+    _activityEventsSnapshotLoaded: false,
     _activityFetchPromises: {},
     _activityFetchControllers: {},
     _activityRequestSeq: 0,
@@ -30669,9 +30672,11 @@ function portal() {
           let r = await this._fetchWithDeadline(path, {
             headers, signal: controller.signal,
           });
-          // A long-lived tab can retain an ETag while Alpine state is rebuilt.
-          // Never accept a 304 as the only source for an empty task list.
-          if (r.status === 304 && !opts.summaryOnly && !this.activity.events.length) {
+          // An ETag without a locally owned full snapshot cannot validate the
+          // rows. Recover once without conditionals; a loaded empty snapshot
+          // can safely reuse a 304 just like a non-empty one.
+          if (r.status === 304 && !opts.summaryOnly
+              && !this._activityEventsSnapshotLoaded) {
             delete this._activityEtags[key];
             delete headers["If-None-Match"];
             r = await this._fetchWithDeadline(path, {
@@ -30707,6 +30712,7 @@ function portal() {
           if (!opts.summaryOnly && Array.isArray(data.events)) {
             const events = data.events.slice(0, this.ACTIVITY_EVENT_CAP);
             this.activity.events = events;
+            this._activityEventsSnapshotLoaded = true;
             this._syncScheduledActivitySnapshot(events);
           }
           if (!opts.summaryOnly) this.applyActivityGroupPayload(data);
