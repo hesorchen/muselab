@@ -1116,6 +1116,7 @@ def test_restore_mode_zero_directory_recovers_after_terminal_write_failure(
     app_module,
     temp_root,
     monkeypatch,
+    request,
 ) -> None:
     del app_module
     from backend import files
@@ -1123,6 +1124,14 @@ def test_restore_mode_zero_directory_recovers_after_terminal_write_failure(
     source = temp_root / "mode-zero-directory"
     source.mkdir()
     (source / "child.txt").write_bytes(b"child")
+
+    def restore_cleanup_permission() -> None:
+        try:
+            source.chmod(0o700)
+        except FileNotFoundError:
+            pass
+
+    request.addfinalizer(restore_cleanup_permission)
     source.chmod(0o000)
     manifest = files._move_to_trash(source, temp_root)
     trash_id = manifest["trash_id"]
