@@ -277,7 +277,7 @@ def _open_active_path(path: Path, flags: int) -> int | None:
         os.close(parent_fd)
 
 
-def _open_workspace_parent(
+def _open_workspace_parent_direct(
     anchor: _TrashAnchor,
     relative: str,
     *,
@@ -329,6 +329,46 @@ def _open_workspace_parent(
         raise
 
 
+def _open_workspace_parent(
+    anchor: _TrashAnchor,
+    relative: str,
+    *,
+    create: bool = False,
+) -> tuple[int, tuple[str, ...], str]:
+    """Open a logical parent while preserving registered symlink semantics."""
+    logical = _logical_relative_path(relative)
+    try:
+        return _open_workspace_parent_direct(
+            anchor,
+            relative,
+            create=create,
+        )
+    except OSError as direct_error:
+        if direct_error.errno not in {errno.ELOOP, errno.ENOTDIR}:
+            raise
+
+    parts = tuple(part for part in logical.parts if part not in {"", "."})
+    resolved_parent = safe_resolve(
+        logical.parent.as_posix(),
+        allow_sensitive=True,
+        root=anchor.root,
+    )
+    if create:
+        _mkdir_durable(resolved_parent)
+    identity = _path_identity_unanchored(resolved_parent)
+    if not _valid_identity(identity) or identity["kind"] != "directory":
+        raise UnsafePrivatePath("workspace parent identity is invalid")
+    parent_fd = _open_directory_anchor(resolved_parent, identity)
+    if not _logical_workspace_parent_is_reachable(
+        anchor,
+        relative,
+        parent_fd,
+    ):
+        os.close(parent_fd)
+        raise UnsafePrivatePath("workspace parent changed while opening")
+    return parent_fd, tuple(logical.parent.parts), parts[-1]
+
+
 def _directory_is_root_reachable(
     anchor: _TrashAnchor,
     parts: tuple[str, ...],
@@ -354,6 +394,35 @@ def _directory_is_root_reachable(
         )
     finally:
         os.close(reachable_fd)
+
+
+def _logical_workspace_parent_is_reachable(
+    anchor: _TrashAnchor,
+    relative: str,
+    held_fd: int,
+) -> bool:
+    """Prove a logical parent still resolves to the directory held by fd."""
+    try:
+        logical = _logical_relative_path(relative)
+        resolved_parent = safe_resolve(
+            logical.parent.as_posix(),
+            allow_sensitive=True,
+            root=anchor.root,
+        )
+        current = _path_identity_unanchored(resolved_parent)
+        held = _fd_identity(held_fd)
+        return (
+            _valid_identity(current)
+            and current["kind"] == "directory"
+            and current == held
+        )
+    except (
+        HTTPException,
+        OSError,
+        RuntimeError,
+        UnsafePrivatePath,
+    ):
+        return False
 
 
 
@@ -1571,7 +1640,7 @@ def _repair_trash_item(
             opened = _open_manifest_original_parent(anchor, repaired)
             if opened is None:
                 return repaired
-            parent_fd, parent_parts, _name, logical = opened
+            parent_fd, _parent_parts, _name, logical = opened
             try:
                 source_parent_identity = repaired.get(
                     "source_parent_identity"
@@ -1587,9 +1656,9 @@ def _repair_trash_item(
                     _fd_identity(parent_fd) != source_parent_identity
                     or _fd_identity(anchor.trash_fd)
                     != trash_parent_identity
-                    or not _directory_is_root_reachable(
+                    or not _logical_workspace_parent_is_reachable(
                         anchor,
-                        parent_parts,
+                        logical.as_posix(),
                         parent_fd,
                     )
                     or not _directory_is_root_reachable(
@@ -1634,7 +1703,7 @@ def _repair_trash_item(
         # A crash before rename leaves the source inode in its held-root path.
         if opened is None:
             return None
-        parent_fd, parent_parts, name, _logical = opened
+        parent_fd, _parent_parts, name, logical = opened
         try:
             source_parent_identity = data.get(
                 "source_parent_identity"
@@ -1644,9 +1713,9 @@ def _repair_trash_item(
                 and _fd_identity(parent_fd) != source_parent_identity
             ):
                 return None
-            if not _directory_is_root_reachable(
+            if not _logical_workspace_parent_is_reachable(
                 anchor,
-                parent_parts,
+                logical.as_posix(),
                 parent_fd,
             ):
                 return None
@@ -1678,7 +1747,7 @@ def _repair_trash_item(
     if opened is None:
         return data
 
-    parent_fd, parent_parts, name, logical = opened
+    parent_fd, _parent_parts, name, logical = opened
     try:
         restore_parent_identity = data.get(
             "restore_parent_identity"
@@ -1693,9 +1762,9 @@ def _repair_trash_item(
             or _fd_identity(anchor.trash_fd)
             != trash_parent_identity
             or _entry_identity_at(parent_fd, name) != identity
-            or not _directory_is_root_reachable(
+            or not _logical_workspace_parent_is_reachable(
                 anchor,
-                parent_parts,
+                logical.as_posix(),
                 parent_fd,
             )
             or not _directory_is_root_reachable(
@@ -1814,7 +1883,7 @@ def _move_to_trash(
             raise UnsafePrivatePath("trash transaction anchor is unavailable")
         anchor = anchored[0]
         try:
-            source_parent_fd, source_parent_parts, source_name = (
+            source_parent_fd, _source_parent_parts, source_name = (
                 _open_workspace_parent(anchor, original_rel))
         except OSError as exc:
             raise UnsafePrivatePath(
@@ -1940,9 +2009,9 @@ def _move_to_trash(
                         "trash rename outcome is uncertain") from exc
 
             parents_reachable = (
-                _directory_is_root_reachable(
+                _logical_workspace_parent_is_reachable(
                     anchor,
-                    source_parent_parts,
+                    original_rel,
                     source_parent_fd,
                 )
                 and _directory_is_root_reachable(
@@ -3468,7 +3537,7 @@ def _permanent_delete_anchored(relative: str, root: Path) -> bool:
             raise UnsafePrivatePath("trash transaction anchor is unavailable")
         anchor = anchored[0]
         try:
-            parent_fd, parent_parts, name = _open_workspace_parent(
+            parent_fd, _parent_parts, name = _open_workspace_parent(
                 anchor,
                 logical.as_posix(),
             )
@@ -3513,9 +3582,9 @@ def _permanent_delete_anchored(relative: str, root: Path) -> bool:
                 destination_parent_fd=anchor.trash_fd,
             )
             if (
-                not _directory_is_root_reachable(
+                not _logical_workspace_parent_is_reachable(
                     anchor,
-                    parent_parts,
+                    logical.as_posix(),
                     parent_fd,
                 )
                 or not _directory_is_root_reachable(
@@ -3760,7 +3829,7 @@ def trash_restore(req: TrashIdReq, root: Path = Depends(_workspace_root)) -> dic
 
         if payload_kind == "missing" and state == _TRASH_RESTORE_PREPARED:
             try:
-                parent_fd, parent_parts, original_name = (
+                parent_fd, _parent_parts, original_name = (
                     _open_workspace_parent(anchor, orig_rel))
             except (OSError, HTTPException):
                 raise HTTPException(
@@ -3780,9 +3849,9 @@ def trash_restore(req: TrashIdReq, root: Path = Depends(_workspace_root)) -> dic
                     _fd_identity(parent_fd) != restore_parent_identity
                     or _fd_identity(anchor.trash_fd)
                     != trash_parent_identity
-                    or not _directory_is_root_reachable(
+                    or not _logical_workspace_parent_is_reachable(
                         anchor,
-                        parent_parts,
+                        orig_rel,
                         parent_fd,
                     )
                     or not _directory_is_root_reachable(
@@ -3839,7 +3908,7 @@ def trash_restore(req: TrashIdReq, root: Path = Depends(_workspace_root)) -> dic
             )
 
         try:
-            parent_fd, parent_parts, original_name = _open_workspace_parent(
+            parent_fd, _parent_parts, original_name = _open_workspace_parent(
                 anchor,
                 orig_rel,
                 create=True,
@@ -3920,9 +3989,9 @@ def trash_restore(req: TrashIdReq, root: Path = Depends(_workspace_root)) -> dic
                     ) from None
 
             parents_reachable = (
-                _directory_is_root_reachable(
+                _logical_workspace_parent_is_reachable(
                     anchor,
-                    parent_parts,
+                    orig_rel,
                     parent_fd,
                 )
                 and _directory_is_root_reachable(
