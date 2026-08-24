@@ -1050,10 +1050,7 @@ def test_workspace_switch_overlaps_tree_sessions_and_transcript_without_early_ac
             const started = performance.now();
             await app.switchWorkspace(targetPath);
             const elapsed = performance.now() - started;
-            events.switchEnd = performance.now(); await new Promise(resolve => setTimeout(resolve, 180));
-            events.shieldAfterSwitch = getComputedStyle(
-              document.querySelector('.workspace-switch-shield')
-            ).display !== 'none';
+            events.switchEnd = performance.now();
             events.activityClicks = 0;
             app.openActivityCenter = () => { events.activityClicks += 1; };
             document.querySelector('.activity-center-btn').click();
@@ -1083,6 +1080,15 @@ def test_workspace_switch_overlaps_tree_sessions_and_transcript_without_early_ac
           }
         }"""
     )
+    # Alpine schedules the declared 120 ms leave transition across animation
+    # frames. Wait for its observable DOM end state instead of assuming a
+    # fixed wall-clock delay is enough on a loaded headless CI runner.
+    page.wait_for_function(
+        """() => getComputedStyle(document.querySelector(
+          '.workspace-switch-shield'
+        )).display === 'none'""",
+        timeout=2000,
+    )
     events = result["events"]
     assert abs(events["treeStart"] - events["sessionsStart"]) < 75
     # Tree bootstrap and transcript loading continue behind pane-local state.
@@ -1093,7 +1099,6 @@ def test_workspace_switch_overlaps_tree_sessions_and_transcript_without_early_ac
         assert events["switchEnd"] < events["preloadEnd"]
     assert events["currentAtPreloadStart"] == result["targetId"]
     assert events["shieldDuringPreload"] is True
-    assert events["shieldAfterSwitch"] is False
     assert events["activityClicks"] == 1
     assert events["openOptions"]["deferLoad"] is True
     assert events["currentBeforeOpen"] == result["originalCurrent"]

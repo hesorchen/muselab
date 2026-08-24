@@ -3181,7 +3181,6 @@ def test_resident_history_uses_exact_layout_and_native_scroll_anchor(
         app.currentId = arg;
         app._activateTabState(arg);
         app.mobileTab = "chat";
-        app.$nextTick(() => app.scrollToBottom(true));
         return true;
         """,
         sid,
@@ -3213,7 +3212,6 @@ def test_resident_history_uses_exact_layout_and_native_scroll_anchor(
         page,
         """
         const body = app._chatBodyElement();
-        app._ensureTabState(app.currentId).atBottom = false;
         app._ensureTabState(app.currentId).atBottom = false;
         body.scrollTop = Math.floor(body.scrollHeight * 0.45);
         app._syncMessageViewport(app.currentId);
