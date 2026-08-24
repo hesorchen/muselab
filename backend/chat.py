@@ -9,6 +9,7 @@ import json
 import asyncio
 import re
 import sys
+import sqlite3
 import shutil
 import subprocess
 import tempfile
@@ -91,6 +92,10 @@ from .private_storage import (
     private_path_kind,
     repair_private_path,
     write_private_bytes,
+)
+from .attachment_queue_store import (
+    DurableAttachmentError,
+    DurableAttachmentStore,
 )
 from .sdk_compat import UnsignedThinkingCompatibleClient
 
@@ -6528,6 +6533,7 @@ def _purge_session_storage_disk_locked(sid: str) -> bool:
         removed = True
     except (FileNotFoundError, ValueError):
         pass   # JSONL never existed (session never streamed) — that's fine
+    _durable_attachment_store.cancel_session(sid)
     if sess.delete_session(sid):
         removed = True
     try:
@@ -6966,15 +6972,25 @@ def get_queue_api(sid: str, response: Response) -> dict:
             ids = _attachment_ids(it.get("image_ids") or "")
             atts: list[dict] = []
             for aid in ids:
+                if not _valid_staged_attachment_id(aid):
+                    atts.append({"id": aid, "available": False})
+                    continue
                 entry = _image_store.get(aid)
-                if entry is None:
+                try:
+                    metadata = (
+                        entry or _durable_attachment_store.metadata(aid)
+                    )
+                except (DurableAttachmentError, OSError, sqlite3.Error,
+                        UnsafePrivatePath):
+                    metadata = None
+                if metadata is None:
                     atts.append({"id": aid, "available": False})
                     continue
                 atts.append({
                     "id": aid,
-                    "kind": entry.get("kind", "image"),
-                    "name": entry.get("name", ""),
-                    "mime": entry.get("mime", ""),
+                    "kind": metadata.get("kind", "image"),
+                    "name": metadata.get("name", ""),
+                    "mime": metadata.get("mime", ""),
                     "available": True,
                 })
             it["attachments"] = atts
@@ -7000,10 +7016,11 @@ async def enqueue_api(
     background_tasks: BackgroundTasks,
 ) -> dict:
     text = (req.text or "").strip()
-    if not text and not (req.image_ids or "").strip():
+    attachment_ids = _attachment_ids(req.image_ids or "")
+    if any(not _valid_staged_attachment_id(aid) for aid in attachment_ids):
+        raise HTTPException(400, "bad attachment id")
+    if not text and not attachment_ids:
         raise HTTPException(400, "empty message")
-    # Validate at enqueue so a bad mode is a visible 400 NOW, not a silent
-    # headless failure when the drain replays the item later.
     if (req.permission or "").strip():
         _validate_permission(req.permission)
     selection_quotes = _normalize_queue_selection_quotes(
@@ -7013,9 +7030,42 @@ async def enqueue_api(
         if selection_quotes
         else (req.display_text or text)
     )
-    # Session discovery can walk SDK workspaces.  The sessions-layer helper
-    # also holds the per-session lifecycle lock through the queue commit so an
-    # explicit DELETE cannot race an SDK-only preflight and be resurrected.
+
+    # Bind blobs before the queue JSON commit. A crash may leave an orphan ref
+    # (startup reconciliation releases it), but can never leave an accepted
+    # queue row pointing at bytes that were never made durable.
+    queue_item_id = "q-" + uuid.uuid4().hex
+    if attachment_ids:
+        await asyncio.to_thread(_gc_images)
+        bind_task = asyncio.create_task(asyncio.to_thread(
+            _durable_attachment_store.bind_queue_item,
+            sid,
+            queue_item_id,
+            attachment_ids,
+            ttl=_IMAGE_TTL_S,
+        ))
+        try:
+            binding = await asyncio.shield(bind_task)
+        except asyncio.CancelledError:
+            while not bind_task.done():
+                try:
+                    await asyncio.shield(bind_task)
+                except asyncio.CancelledError:
+                    continue
+            binding = bind_task.result()
+            if not binding.missing and not binding.busy:
+                await asyncio.to_thread(
+                    _durable_attachment_store.finish_queue_item,
+                    sid,
+                    queue_item_id,
+                    consume=False,
+                )
+            raise
+        if binding.missing:
+            raise HTTPException(409, "attachment is missing or expired")
+        if binding.busy:
+            raise HTTPException(409, "attachment is already queued")
+
     enqueue_task = asyncio.create_task(
         asyncio.to_thread(
             sess.enqueue_existing_message,
@@ -7026,14 +7076,12 @@ async def enqueue_api(
             display_text=display_text,
             selection_quotes=selection_quotes,
             plan_return_permission=req.plan_return_permission,
+            item_id=queue_item_id,
         )
     )
     try:
         res = await asyncio.shield(enqueue_task)
     except asyncio.CancelledError:
-        # to_thread cannot be stopped after the disk mutation starts. Join the
-        # known outcome and schedule a successful commit before propagating the
-        # disconnect; otherwise accepted work can sit forever with no drain.
         while not enqueue_task.done():
             try:
                 await asyncio.shield(enqueue_task)
@@ -7042,16 +7090,57 @@ async def enqueue_api(
         res = enqueue_task.result()
         if res.get("ok"):
             _schedule_queue_drain(sid)
+        elif attachment_ids:
+            await asyncio.to_thread(
+                _durable_attachment_store.finish_queue_item,
+                sid,
+                queue_item_id,
+                consume=False,
+            )
+        raise
+    except BaseException:
+        # Atomic queue writes can report an I/O error after the rename commit.
+        # Resolve that ambiguity before releasing the durable reference: an
+        # item visible in waiting/inflight storage already owns the blobs.
+        queue_committed = False
+        try:
+            queue = await asyncio.to_thread(sess.get_queue, sid)
+            inflight = queue.get("inflight") or {}
+            persisted_ids = {
+                str(item.get("id") or "")
+                for item in queue.get("items") or []
+            }
+            inflight_id = str(
+                ((inflight.get("item") or {}).get("id") or "")
+            )
+            queue_committed = (
+                queue_item_id in persisted_ids or inflight_id == queue_item_id
+            )
+        except Exception:
+            # Unknown ownership fails closed: retain the ref for startup's
+            # complete queue reconciliation instead of risking data loss.
+            queue_committed = True
+        if queue_committed:
+            _schedule_queue_drain(sid)
+        elif attachment_ids:
+            await asyncio.to_thread(
+                _durable_attachment_store.finish_queue_item,
+                sid,
+                queue_item_id,
+                consume=False,
+            )
         raise
     if not res.get("ok"):
+        if attachment_ids:
+            await asyncio.to_thread(
+                _durable_attachment_store.finish_queue_item,
+                sid,
+                queue_item_id,
+                consume=False,
+            )
         if res.get("error") == "session_not_found":
             raise HTTPException(404, "session not found")
-        # queue_full → 409 so the FE can surface "队列已满（上限 10 条）".
         raise HTTPException(409, res.get("error", "enqueue failed"))
-    # Do not even *start* rollover/SDK work until Starlette has sent the final
-    # response body frame. Scheduling before ``return`` can let a CPU-heavy
-    # fork monopolise the loop/GIL before the enqueue ACK reaches the browser.
-    # The callback itself stays async because the scheduler is loop-owned.
     background_tasks.add_task(_schedule_queue_drain_after_response, sid)
     return res
 
@@ -7059,14 +7148,23 @@ async def enqueue_api(
 @router.delete("/sessions/{sid}/queue/{item_id}", dependencies=[Depends(require_token)])
 def remove_queue_item_api(sid: str, item_id: str) -> dict:
     try:
-        return sess.remove_queue_item(sid, item_id)
+        updated, removed_ids = sess.remove_queue_item_with_removed(
+            sid, item_id)
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    for removed_id in removed_ids:
+        _durable_attachment_store.finish_queue_item(
+            sid, removed_id, consume=False)
+    return updated
 
 
 @router.delete("/sessions/{sid}/queue", dependencies=[Depends(require_token)])
 def clear_queue_api(sid: str) -> dict:
-    return {"ok": True, **sess.clear_queue(sid)}
+    updated, item_ids = sess.clear_queue_with_removed(sid)
+    for item_id in item_ids:
+        _durable_attachment_store.finish_queue_item(
+            sid, item_id, consume=False)
+    return {"ok": True, **updated}
 
 
 @router.post("/sessions/{sid}/queue/pause", dependencies=[Depends(require_token)])
@@ -9785,7 +9883,8 @@ def _render_tool_result(
 #   - PDFs → DocumentBlock with base64 data (Claude supports PDFs natively)
 #   - text-ish docs (md / txt / csv / json / source code) → inline-text prefix
 #     in the prompt so any model can consume them. Stored as utf-8 text.
-# Stored in-memory; on restart pending uploads are lost (fine — re-attach).
+# SQLite metadata + private blobs are authoritative. `_image_store` is only a
+# process-local hot cache retained for preparation and compatibility callers.
 
 _image_store: dict[str, dict] = {}     # id -> {kind, mime, b64|text, name, ts}
 # Most staged-upload mutations run on the event loop, but the sync queue/image
@@ -9806,6 +9905,10 @@ class _StagedAttachmentLease:
     token: str
     items: tuple[tuple[str, dict], ...]
     state: str = "active"
+    durable_ids: tuple[str, ...] = ()
+    rehydrated_ids: tuple[str, ...] = ()
+    queue_session_id: str = ""
+    queue_item_id: str = ""
 
     @property
     def ids(self) -> tuple[str, ...]:
@@ -9837,6 +9940,13 @@ def _attachment_ids(raw_ids: str) -> list[str]:
     ))
 
 
+_STAGED_ATTACHMENT_ID_RE = re.compile(r"[A-Za-z0-9_-]{6,80}")
+
+
+def _valid_staged_attachment_id(aid: str) -> bool:
+    return _STAGED_ATTACHMENT_ID_RE.fullmatch(str(aid or "")) is not None
+
+
 
 _IMAGE_TTL_S = 600
 _IMAGE_MAX_BYTES = 10 * 1024 * 1024     # 10 MB per file
@@ -9849,6 +9959,9 @@ _IMAGE_THUMBNAIL_MAX_PIXELS = 16 * 1024 * 1024
 # worst-case growth. Oldest-first eviction — see _enforce_image_budget.
 _IMAGE_STORE_MAX_BYTES = 256 * 1024 * 1024
 _IMAGE_STORE_MAX_ENTRIES = 48
+_ATTACHMENT_LEASE_S = 5 * 60
+_durable_attachment_store = DurableAttachmentStore(ROOT)
+
 _IMAGE_MIME = {"image/png", "image/jpeg", "image/gif", "image/webp"}
 _IMAGE_OUTPUT_MIME = {"png": "image/png", "jpeg": "image/jpeg", "webp": "image/webp"}
 _PDF_MIME = {"application/pdf"}
@@ -9959,7 +10072,7 @@ def mint_chat_resource_ticket(req: ChatResourceTicketReq) -> dict:
             raise HTTPException(400, "bad id")
         _gc_images()
         with _image_store_lock:
-            entry = _image_store.get(aid)
+            entry = _get_staged_entry_locked(aid)
             if (entry is None or entry.get("kind") != "image"
                     or not entry.get("b64")):
                 raise HTTPException(404, "queued image not found or expired")
@@ -9988,13 +10101,29 @@ def mint_chat_resource_ticket(req: ChatResourceTicketReq) -> dict:
     }
 
 
+def _get_staged_entry_locked(aid: str) -> dict | None:
+    """Resolve one staged object from the hot cache or durable blob store."""
+    entry = _image_store.get(aid)
+    if entry is not None:
+        return entry
+    return _durable_attachment_store.load_entry(aid)
+
+
 def _gc_images_locked(now: float | None = None) -> None:
-    """Collect expired, unleased entries while `_image_store_lock` is held."""
-    cutoff = (time.time() if now is None else now) - _IMAGE_TTL_S
+    """Collect expired, unleased entries from cache and durable storage."""
+    current = time.time() if now is None else now
+    cutoff = current - _IMAGE_TTL_S
     for aid in list(_image_store.keys()):
         entry = _image_store.get(aid)
         if (entry is not None and entry.get("ts", 0) < cutoff
                 and aid not in _staged_attachment_claims):
+            _image_store.pop(aid, None)
+    removed = _durable_attachment_store.gc(
+        now=current,
+        protected_tokens=set(_staged_attachment_claims.values()),
+    )
+    for aid in removed:
+        if aid not in _staged_attachment_claims:
             _image_store.pop(aid, None)
 
 
@@ -10002,13 +10131,13 @@ def _lease_staged_attachments(
     image_ids: str,
     *,
     require_all: bool,
+    queue_owner: tuple[str, str] | None = None,
 ) -> tuple[_StagedAttachmentLease | None, list[str], list[str]]:
-    """Exclusively lease staged objects without consuming their payloads.
+    """Lease staged objects from memory or the restart-safe registry.
 
-    Missing ids retain direct-send best-effort compatibility. An id leased by
-    another turn is different: every caller fails closed instead of silently
-    degrading or sending the same object twice. Queue callers additionally
-    require every requested id to survive the final post-startup TTL sweep.
+    Queue-owned leases additionally require the exact durable item reference;
+    this prevents an old or forged sidecar from consuming another queue item's
+    blob. Legacy memory-only entries remain supported for direct sends/tests.
     """
     ids = _attachment_ids(image_ids)
     if not ids:
@@ -10016,24 +10145,70 @@ def _lease_staged_attachments(
     with _image_store_lock:
         _gc_images_locked()
         busy = [aid for aid in ids if aid in _staged_attachment_claims]
-        missing = [aid for aid in ids if aid not in _image_store]
-        if busy or (require_all and missing):
-            return None, missing, busy
-        items = tuple(
-            (aid, _image_store[aid]) for aid in ids if aid in _image_store
+        if busy:
+            return None, [], busy
+        durable_candidates = [
+            aid for aid in ids if _valid_staged_attachment_id(aid)
+        ]
+        durable_ids = _durable_attachment_store.registered_ids(
+            durable_candidates)
+        missing = [
+            aid for aid in ids
+            if aid not in _image_store and aid not in durable_ids
+        ]
+        if require_all and missing:
+            return None, missing, []
+
+        token = uuid.uuid4().hex
+        load_ids = [
+            aid for aid in ids
+            if aid in durable_ids and aid not in _image_store
+        ]
+        durable = _durable_attachment_store.acquire(
+            [aid for aid in ids if aid in durable_ids],
+            token,
+            lease_seconds=_ATTACHMENT_LEASE_S,
+            queue_owner=queue_owner,
+            load_ids=load_ids,
         )
+        if durable.missing or durable.busy:
+            return None, list(durable.missing), list(durable.busy)
+
+        items: list[tuple[str, dict]] = []
+        for aid in ids:
+            entry = _image_store.get(aid) or durable.entries.get(aid)
+            if entry is None:
+                if require_all:
+                    _durable_attachment_store.release(
+                        token, ttl=_IMAGE_TTL_S)
+                    return None, [aid], []
+                continue
+            _image_store.setdefault(aid, entry)
+            items.append((aid, _image_store[aid]))
         if not items:
             return None, missing, []
-        token = uuid.uuid4().hex
         for aid, _entry in items:
             _staged_attachment_claims[aid] = token
-        return _StagedAttachmentLease(token=token, items=items), missing, []
+        return (
+            _StagedAttachmentLease(
+                token=token,
+                items=tuple(items),
+                durable_ids=tuple(
+                    aid for aid, _entry in items if aid in durable_ids
+                ),
+                rehydrated_ids=tuple(load_ids),
+                queue_session_id=(queue_owner[0] if queue_owner else ""),
+                queue_item_id=(queue_owner[1] if queue_owner else ""),
+            ),
+            missing,
+            [],
+        )
 
 
 def _commit_staged_attachment_lease(
     lease: _StagedAttachmentLease | None,
 ) -> bool:
-    """Consume exactly the payload objects owned by an active lease."""
+    """Consume direct blobs or mark queue blobs submitted after query()."""
     if lease is None:
         return True
     with _image_store_lock:
@@ -10045,6 +10220,12 @@ def _commit_staged_attachment_lease(
             _staged_attachment_claims.get(aid) != lease.token
             or _image_store.get(aid) is not entry
             for aid, entry in lease.items
+        ):
+            return False
+        if lease.durable_ids and not _durable_attachment_store.commit(
+            lease.token,
+            queue_session_id=lease.queue_session_id,
+            queue_item_id=lease.queue_item_id,
         ):
             return False
         for aid, _entry in lease.items:
@@ -10070,10 +10251,19 @@ def _begin_staged_attachment_rollback(
 def _fail_closed_staged_attachment_lease(
     lease: _StagedAttachmentLease | None,
 ) -> None:
-    """Consume every still-owned staged object after protocol uncertainty."""
+    """Consume owned objects after transport acceptance becomes uncertain."""
     if lease is None:
         return
     with _image_store_lock:
+        if lease.durable_ids:
+            try:
+                _durable_attachment_store.commit(
+                    lease.token,
+                    queue_session_id=lease.queue_session_id,
+                    queue_item_id=lease.queue_item_id,
+                )
+            except Exception:
+                pass
         for aid, entry in lease.items:
             if (_staged_attachment_claims.get(aid) == lease.token
                     and _image_store.get(aid) is entry):
@@ -10085,13 +10275,7 @@ def _fail_closed_staged_attachment_lease(
 def _release_staged_attachment_lease(
     lease: _StagedAttachmentLease | None,
 ) -> bool:
-    """Finish rollback with a fresh retry TTL.
-
-    Direct unit callers may release an active lease without disk artifacts;
-    convert it to ``rolling_back`` under the same lock first. The broadcast
-    rollback path performs that transition before asynchronous cleanup so
-    commit cannot win while files are being removed.
-    """
+    """Roll back a preparation and refresh the retry TTL durably."""
     if lease is None:
         return True
     with _image_store_lock:
@@ -10103,14 +10287,19 @@ def _release_staged_attachment_lease(
             lease.state = "rolling_back"
         if lease.state != "rolling_back":
             return False
+        if lease.durable_ids and not _durable_attachment_store.release(
+            lease.token, ttl=_IMAGE_TTL_S,
+        ):
+            return False
         retry_ts = time.time()
         for aid, entry in lease.items:
             if _staged_attachment_claims.get(aid) == lease.token:
                 _staged_attachment_claims.pop(aid, None)
                 if _image_store.get(aid) is entry:
-                    # A slow startup/preflight may outlive the original TTL.
-                    # Failure still promises a retryable staged object.
-                    entry["ts"] = retry_ts
+                    if aid in lease.rehydrated_ids:
+                        _image_store.pop(aid, None)
+                    else:
+                        entry["ts"] = retry_ts
         lease.state = "released"
         return True
 
@@ -10122,11 +10311,7 @@ def _gc_images() -> None:
 
 
 def _image_entry_bytes(entry: dict) -> int:
-    """Approximate retained size of a staged-upload entry. The base64 payload
-    (images / PDF) dominates; text and the raw bytes we hold for disk
-    persistence are counted too — `raw` in particular is un-capped now that
-    text attachments are no longer inlined, so leaving it out of the budget
-    would let the eviction logic under-count by the full file size."""
+    """Approximate retained bytes of one process-local staged entry."""
     return (len(entry.get("b64", ""))
             + len(entry.get("raw", b""))
             + len(entry.get("text", ""))
@@ -10134,37 +10319,32 @@ def _image_entry_bytes(entry: dict) -> int:
 
 
 def _enforce_image_budget() -> None:
-    """Evict oldest staged uploads until the store is within its byte + entry
-    caps. Bounds the unbounded-growth / OOM risk of many uploads that never get
-    consumed by a turn."""
+    """Evict oldest unclaimed cache and durable entries to the same budget."""
     with _image_store_lock:
         total = sum(_image_entry_bytes(e) for e in _image_store.values())
         if (len(_image_store) <= _IMAGE_STORE_MAX_ENTRIES
                 and total <= _IMAGE_STORE_MAX_BYTES):
             return
-        # Oldest first (by insertion ts). The just-added entry has the newest ts
-        # so it's evicted last — and one entry is ≤ ~13 MB ≪ budget, never
-        # self-evicts.
-        for aid, entry in sorted(_image_store.items(),
-                                 key=lambda kv: kv[1].get("ts", 0.0)):
+        evict: list[str] = []
+        for aid, entry in sorted(
+            _image_store.items(), key=lambda item: item[1].get("ts", 0.0),
+        ):
             if aid in _staged_attachment_claims:
                 continue
-            if (len(_image_store) <= _IMAGE_STORE_MAX_ENTRIES
+            if (len(_image_store) - len(evict) <= _IMAGE_STORE_MAX_ENTRIES
                     and total <= _IMAGE_STORE_MAX_BYTES):
                 break
             total -= _image_entry_bytes(entry)
+            evict.append(aid)
+        _durable_attachment_store.discard_unowned(evict)
+        for aid in evict:
             _image_store.pop(aid, None)
 
 
 def _put_staged_attachment_batch(
     batch: list[tuple[str, dict]],
 ) -> bool:
-    """Publish a generated/upload batch all-or-none under one budget lock.
-
-    Existing unclaimed entries may be evicted oldest-first. Claimed entries and
-    every member of ``batch`` are protected while capacity is calculated; if
-    those protected objects alone exceed either cap, the store is untouched.
-    """
+    """Publish a generated/upload batch to blobs, SQLite, then the hot cache."""
     if not batch:
         return True
     with _image_store_lock:
@@ -10181,24 +10361,35 @@ def _put_staged_attachment_batch(
         )
         projected_count = len(_image_store) + len(batch)
         projected_bytes = total_bytes + batch_bytes
-        evict: list[str] = []
+        cache_evict: list[str] = []
         for aid, entry in sorted(
-            _image_store.items(),
-            key=lambda item: item[1].get("ts", 0.0),
+            _image_store.items(), key=lambda item: item[1].get("ts", 0.0),
         ):
             if (projected_count <= _IMAGE_STORE_MAX_ENTRIES
                     and projected_bytes <= _IMAGE_STORE_MAX_BYTES):
                 break
             if aid in _staged_attachment_claims:
                 continue
-            evict.append(aid)
+            cache_evict.append(aid)
             projected_count -= 1
             projected_bytes -= _image_entry_bytes(entry)
         if (projected_count > _IMAGE_STORE_MAX_ENTRIES
                 or projected_bytes > _IMAGE_STORE_MAX_BYTES):
             return False
 
-        for aid in evict:
+        try:
+            published, durable_evict = _durable_attachment_store.stage_batch(
+                batch,
+                ttl=_IMAGE_TTL_S,
+                max_entries=_IMAGE_STORE_MAX_ENTRIES,
+                max_bytes=_IMAGE_STORE_MAX_BYTES,
+            )
+        except (OSError, sqlite3.Error, DurableAttachmentError,
+                UnsafePrivatePath):
+            return False
+        if not published:
+            return False
+        for aid in {*cache_evict, *durable_evict}:
             _image_store.pop(aid, None)
         for aid, entry in batch:
             _image_store[aid] = entry
@@ -10408,10 +10599,13 @@ def _stage_generated_image_bytes(raw: bytes, mime: str, idx: int) -> dict:
 def _discard_generated_image_batch(items: list[dict]) -> None:
     """Reclaim an HTTP-owned generated batch if its request is cancelled."""
     with _image_store_lock:
+        discarded: list[str] = []
         for item in items:
             aid = str(item.get("id") or "")
             if aid and aid not in _staged_attachment_claims:
                 _image_store.pop(aid, None)
+                discarded.append(aid)
+        _durable_attachment_store.discard_unowned(discarded)
 
 
 async def _discard_generated_image_batch_owned(items: list[dict]) -> None:
@@ -10652,7 +10846,7 @@ def _image_reference_files(
     with _image_store_lock:
         _gc_images_locked()
         for aid in image_ids[:8]:
-            entry = _image_store.get(aid)
+            entry = _get_staged_entry_locked(aid)
             if (not entry or entry.get("kind") != "image"
                     or not entry.get("b64")):
                 continue
@@ -10973,7 +11167,7 @@ def get_queued_image(aid: str, ticket: str = Query("")):
     _require_chat_resource_ticket(ticket, ("queued-image", aid))
     with _image_store_lock:
         _gc_images_locked()
-        entry = _image_store.get(aid)
+        entry = _get_staged_entry_locked(aid)
         if (entry is None or entry.get("kind") != "image"
                 or not entry.get("b64")):
             raise HTTPException(404, "queued image not found or expired")
@@ -11144,7 +11338,9 @@ async def upload_image(file: UploadFile = File(...)) -> dict:
         # — off-load it so the upload doesn't stall concurrent streams.
         # (perf: YELLOW — chat.py upload_image base64)
         entry["b64"] = (await asyncio.to_thread(base64.b64encode, body)).decode("ascii")
-    if not _put_staged_attachment(aid, entry):
+    if not await asyncio.to_thread(
+        _put_staged_attachment, aid, entry,
+    ):
         raise HTTPException(
             503, "staged attachment capacity is temporarily exhausted")
     # Content-free upload timing.  File names and MIME strings can disclose
@@ -13047,14 +13243,31 @@ async def _start_turn(
         try:
             sess.bind_queue_turn(
                 session_id, broadcast.queue_item_id, broadcast.turn_id)
+            _durable_attachment_store.mark_queue_turn(
+                session_id, broadcast.queue_item_id, broadcast.turn_id,
+            )
         except Exception:
+            queue_settled = False
+            try:
+                queue_settled = sess.release_queue_claim(
+                    session_id,
+                    broadcast.queue_item_id,
+                    turn_id=broadcast.turn_id,
+                    pause=True,
+                )
+            except Exception:
+                pass
+            _delete_active_turn_sidecar(session_id)
             async with _lock:
                 if _active_turns.get(session_id) is broadcast:
                     broadcast.perf_status = "failed"
                     broadcast.perf_error_kind = "queue_bind"
                     broadcast.finish()
                     _active_turns.pop(session_id, None)
-            raise _TurnStartError("could not bind queued message to turn")
+            raise _TurnStartError(
+                "could not bind queued message to turn",
+                queue_claim_settled=queue_settled,
+            )
     # Clear a completed watcher defensively. A live watcher must never be
     # cancelled here: it still owns the stream and its continuation belongs to
     # the previous turn.
@@ -13222,11 +13435,12 @@ async def _start_turn(
     # successful SDK query write commits the lease.
     prepared = _PreparedStagedAttachments()
     if image_ids:
-        lease, missing_attachments, busy_attachments = (
-            _lease_staged_attachments(
-                image_ids,
-                require_all=bool(broadcast.queue_item_id),
-            )
+        lease, missing_attachments, busy_attachments = await asyncio.to_thread(
+            _lease_staged_attachments,
+            image_ids,
+            require_all=bool(broadcast.queue_item_id),
+            queue_owner=((session_id, broadcast.queue_item_id)
+                         if broadcast.queue_item_id else None),
         )
         broadcast._attachment_lease = lease
         if busy_attachments or (
@@ -15467,6 +15681,12 @@ async def _start_turn(
                                     broadcast.queue_item_id,
                                     broadcast.turn_id,
                                 )
+                                if queue_settled:
+                                    _durable_attachment_store.finish_queue_item(
+                                        session_id,
+                                        broadcast.queue_item_id,
+                                        consume=True,
+                                    )
                             if not queue_settled:
                                 raise RuntimeError("queue terminal ownership mismatch")
                         if (not done_data.get("is_error")
@@ -15618,12 +15838,18 @@ async def _start_turn(
                         ):
                             raise RuntimeError("queue terminal ownership mismatch")
                     else:
-                        if not sess.ack_queue_message(
+                        queue_settled = sess.ack_queue_message(
                             session_id,
                             broadcast.queue_item_id,
                             broadcast.turn_id,
-                        ):
+                        )
+                        if not queue_settled:
                             raise RuntimeError("queue terminal ownership mismatch")
+                        _durable_attachment_store.finish_queue_item(
+                            session_id,
+                            broadcast.queue_item_id,
+                            consume=True,
+                        )
                 except Exception as e:
                     # Never duplicate a turn by guessing. The durable inflight
                     # record remains for restart recovery if acknowledgement fails.
@@ -15805,6 +16031,17 @@ async def _maybe_drain_queue(session_id: str) -> None:
                     moved = sess.migrate_queue(session_id, successor_sid)
                 except ValueError:
                     return
+                try:
+                    _durable_attachment_store.migrate_queue_items(
+                        session_id,
+                        [str(row.get("id") or "")
+                         for row in moved["target"].get("items", [])],
+                        successor_sid,
+                    )
+                except Exception as exc:
+                    sys.stderr.write(
+                        f"[chat] attachment ref migration deferred "
+                        f"exc={type(exc).__name__}\n")
                 if moved["target"].get("items"):
                     _schedule_queue_drain(successor_sid)
             return
@@ -15881,10 +16118,35 @@ async def _maybe_drain_queue(session_id: str) -> None:
             if aid.strip()
         ]
         if attachment_ids:
-            with _image_store_lock:
-                _gc_images_locked()
-                unavailable_count = sum(
-                    1 for aid in attachment_ids if aid not in _image_store)
+            try:
+                if any(
+                    not _valid_staged_attachment_id(aid)
+                    for aid in attachment_ids
+                ):
+                    unavailable_count = len(attachment_ids)
+                else:
+                    await asyncio.to_thread(_gc_images)
+                    with _image_store_lock:
+                        cached_ids = set(_image_store).intersection(
+                            attachment_ids)
+                    durable_ids = await asyncio.to_thread(
+                        _durable_attachment_store.existing_ids,
+                        attachment_ids,
+                    )
+                    unavailable_count = sum(
+                        1 for aid in attachment_ids
+                        if aid not in cached_ids and aid not in durable_ids)
+            except (DurableAttachmentError, OSError, sqlite3.Error,
+                    UnsafePrivatePath) as exc:
+                restored = sess.release_queue_claim(
+                    session_id, item_id, pause=True)
+                sys.stderr.write(
+                    f"[chat] queued attachment precheck failed "
+                    f"sid={session_id[:8]} item={item_id[:8]} "
+                    f"restored={restored} exc={type(exc).__name__}\n"
+                )
+                sys.stderr.flush()
+                return
             if unavailable_count:
                 restored = sess.release_queue_claim(
                     session_id, item_id, pause=True)
@@ -16269,6 +16531,36 @@ async def providers_list() -> dict:
         "default_model": _resolve_default_model(""),
         "default_permission": default_permission,
     }
+
+def recover_durable_queue_attachments_at_startup(
+    session_store=sess,
+) -> dict[str, int]:
+    """Reconcile durable refs against the complete, recovered queue set.
+
+    This runs only after sessions.recover_queue_inflight has parsed and
+    durably paused every queue. Consequently, an absent item is authoritative
+    and its orphan ref can be released; a duplicate id fails startup closed.
+    """
+    owners: dict[str, str] = {}
+    for sid in session_store.list_queue_session_ids():
+        queue = session_store.get_queue(sid)
+        rows = list(queue.get("items") or [])
+        inflight = queue.get("inflight") or {}
+        if inflight.get("item"):
+            rows.append(inflight["item"])
+        for row in rows:
+            item_id = str(row.get("id") or "")
+            if not item_id:
+                continue
+            previous = owners.get(item_id)
+            if previous is not None and previous != sid:
+                raise RuntimeError("duplicate durable queue item id")
+            owners[item_id] = sid
+    return _durable_attachment_store.reconcile_queue_refs(
+        owners,
+        ttl=_IMAGE_TTL_S,
+    )
+
 
 
 # Dynamic bridge for SDK client/runtime lifecycle. Every callback resolves the

@@ -451,6 +451,10 @@ async def _lifespan(app: FastAPI):
         # In particular, scheduler catch-up can launch work immediately; it
         # must never overlap an incomplete queue reconciliation.
         recovered = await _recover_message_queues_at_startup(_sess)
+        await _asyncio.to_thread(
+            _chat.recover_durable_queue_attachments_at_startup,
+            _sess,
+        )
     except Exception as exc:
         sys.stderr.write(
             "[muselab] queue recovery incomplete; refusing startup "

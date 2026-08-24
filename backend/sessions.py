@@ -2180,12 +2180,8 @@ def set_message_count(sid: str, message_count: int,
 #   - paused: set True when a queued turn errors / hits ask_user_question /
 #     is user-cancelled; auto-drain stops until the user resumes
 #
-# Attachment caveat: image_ids reference the in-memory _image_store in chat.py
-# which expires entries after 10 min and is empty after a restart.  The drain
-# validates every referenced id before starting a turn; if one is unavailable,
-# it atomically restores + pauses the item instead of silently sending text
-# without the attachment.  The queue endpoint then exposes unavailable ids so
-# the browser can offer an explicit edit/reattach recovery path.
+# Attachment ids resolve through chat.py's durable blob/SQLite registry. The
+# JSON sidecar deliberately retains only opaque ids and presentation data.
 _QUEUE_LOCK = threading.Lock()
 _QUEUE_MAX = 10   # mirror the frontend cap
 # Process-local deletion fence. It is always read/written under _QUEUE_LOCK.
@@ -2438,6 +2434,7 @@ def _enqueue_message_locked(
     display_text: str,
     selection_quotes: list[dict] | None,
     plan_return_permission: str | None,
+    item_id: str = "",
 ) -> dict:
     """Append one item while the caller owns ``_QUEUE_LOCK``."""
     if sid in _DELETED_SESSION_IDS:
@@ -2449,7 +2446,7 @@ def _enqueue_message_locked(
     if active_count >= _QUEUE_MAX:
         return {"ok": False, "error": "queue_full", "queue": data}
     item = {
-        "id": "q-" + uuid.uuid4().hex[:8],
+        "id": item_id or "q-" + uuid.uuid4().hex,
         "text": text or "",
         "display_text": display_text or "",
         "selection_quotes": selection_quotes or [],
@@ -2471,6 +2468,7 @@ def enqueue_message(sid: str, text: str, image_ids: str = "",
                     display_text: str = "",
                     selection_quotes: list[dict] | None = None,
                     plan_return_permission: str | None = None,
+                    item_id: str = "",
                     *, require_session: bool = False,
                     existing_session: dict | None = None,
                     sdk_verified: bool = False) -> dict:
@@ -2537,6 +2535,7 @@ def enqueue_message(sid: str, text: str, image_ids: str = "",
                     display_text,
                     selection_quotes,
                     plan_return_permission,
+                    item_id,
                 )
         return _enqueue_message_locked(
             sid,
@@ -2546,6 +2545,7 @@ def enqueue_message(sid: str, text: str, image_ids: str = "",
             display_text,
             selection_quotes,
             plan_return_permission,
+            item_id,
         )
 
 
@@ -2557,6 +2557,7 @@ def enqueue_existing_message(
     display_text: str = "",
     selection_quotes: list[dict] | None = None,
     plan_return_permission: str | None = None,
+    item_id: str = "",
 ) -> dict:
     """Atomically resolve an existing session and append one queued message.
 
@@ -2603,6 +2604,7 @@ def enqueue_existing_message(
                     display_text,
                     selection_quotes,
                     plan_return_permission,
+                    item_id,
                 )
 
     # An SDK-only session needs a potentially slow workspace probe and a
@@ -2626,6 +2628,7 @@ def enqueue_existing_message(
             display_text=display_text,
             selection_quotes=selection_quotes,
             plan_return_permission=plan_return_permission,
+            item_id=item_id,
             require_session=True,
             existing_session=current,
             sdk_verified=sdk_verified,
@@ -2765,7 +2768,10 @@ def requeue_head(sid: str, item: dict) -> dict:
         return data
 
 
-def remove_queue_item(sid: str, item_id: str) -> dict:
+def remove_queue_item_with_removed(
+    sid: str,
+    item_id: str,
+) -> tuple[dict, tuple[str, ...]]:
     """Remove one item by id. Returns the updated queue snapshot.
 
     Emptying the queue also clears ``paused``. The flag means "there is queued
@@ -2780,24 +2786,41 @@ def remove_queue_item(sid: str, item_id: str) -> dict:
     ``{items: [], paused: true}`` files dating back a week."""
     with _QUEUE_LOCK:
         data = _load_queue(sid, strict=True)
-        data["items"] = [it for it in data["items"] if it.get("id") != item_id]
         inflight = data.get("inflight") or {}
         if str((inflight.get("item") or {}).get("id") or "") == item_id:
             raise ValueError("queue item is currently executing")
+        kept = [it for it in data["items"] if it.get("id") != item_id]
+        removed = (item_id,) if len(kept) != len(data["items"]) else ()
+        data["items"] = kept
         if not data["items"]:
             data["paused"] = False
         _save_queue(sid, data)
-        return data
+        return data, removed
 
 
-def clear_queue(sid: str) -> dict:
+def remove_queue_item(sid: str, item_id: str) -> dict:
+    """Backward-compatible queue-only wrapper."""
+    return remove_queue_item_with_removed(sid, item_id)[0]
+
+
+def clear_queue_with_removed(sid: str) -> tuple[dict, tuple[str, ...]]:
     """Drop waiting items without stealing ownership from a running turn."""
     with _QUEUE_LOCK:
         current = _load_queue(sid, strict=True)
+        removed = tuple(
+            str(item.get("id") or "")
+            for item in current["items"]
+            if item.get("id")
+        )
         current["items"] = []
         current["paused"] = False
         _save_queue(sid, current)
-        return current
+        return current, removed
+
+
+def clear_queue(sid: str) -> dict:
+    """Backward-compatible queue-only wrapper."""
+    return clear_queue_with_removed(sid)[0]
 
 
 def set_queue_paused(sid: str, paused: bool) -> dict:
