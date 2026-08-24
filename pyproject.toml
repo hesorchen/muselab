@@ -101,6 +101,9 @@ Container     = "https://github.com/hesorchen/muselab/pkgs/container/muselab"
 dev = [
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
+    # Starlette 1.2+ prefers httpx2 for TestClient. Keep production httpx
+    # separately because memory_client imports that package directly.
+    "httpx2>=2.0.0",
     # Browser regressions cover Alpine rendering races and trusted mobile
     # touch gestures that static source assertions cannot exercise.
     "pytest-playwright>=0.7.0",
