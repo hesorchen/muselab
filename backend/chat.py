@@ -72,6 +72,7 @@ from . import chat_overlays
 from . import chat_runtime
 from . import chat_successor
 from . import transcript_index as transcript_idx
+from .imagegen_job_store import ImagegenJobStore
 from .workspaces import (
     registry as workspace_registry,
     resolve_workspace_root,
@@ -10253,8 +10254,7 @@ _IMAGEGEN_ROOT = ROOT / ".muselab" / "imagegen"
 _IMAGEGEN_FILES = _IMAGEGEN_ROOT / "files"
 _IMAGEGEN_JOBS_PATH = _IMAGEGEN_ROOT / "jobs.json"
 _IMAGEGEN_JOBS_MAX = 200
-_imagegen_jobs_lock = threading.RLock()
-_imagegen_jobs: dict[str, dict] | None = None
+_imagegen_job_store = ImagegenJobStore(_IMAGEGEN_JOBS_PATH, max_jobs=_IMAGEGEN_JOBS_MAX)
 
 
 def _validate_image_size(size: str) -> str:
@@ -10478,68 +10478,12 @@ async def _stage_generated_images_for_response(
 
 
 def _imagegen_load_jobs() -> dict[str, dict]:
-    global _imagegen_jobs
-    with _imagegen_jobs_lock:
-        if _imagegen_jobs is not None:
-            return _imagegen_jobs
-        jobs: dict[str, dict] = {}
-        try:
-            raw = json.loads(_IMAGEGEN_JOBS_PATH.read_text(encoding="utf-8"))
-            if isinstance(raw, dict):
-                raw_jobs = raw.get("jobs", {})
-                if isinstance(raw_jobs, dict):
-                    for jid, job in raw_jobs.items():
-                        if not isinstance(jid, str) or not isinstance(job, dict):
-                            continue
-                        # A process restart loses in-flight asyncio tasks; make
-                        # that visible instead of leaving history stuck forever.
-                        if job.get("status") in {"queued", "running"}:
-                            job = {
-                                **job,
-                                "status": "failed",
-                                "error": "image generation was interrupted by backend restart",
-                                "updated_at": time.time(),
-                            }
-                        jobs[jid] = job
-        except FileNotFoundError:
-            pass
-        except Exception as e:
-            print(f"[muselab] failed to load imagegen jobs: {e}",
-                  file=sys.stderr, flush=True)
-        _imagegen_jobs = jobs
-        return _imagegen_jobs
-
-
-def _imagegen_save_jobs_locked() -> None:
-    jobs = _imagegen_jobs or {}
-    ordered = dict(sorted(
-        jobs.items(),
-        key=lambda kv: float(kv[1].get("created_at") or 0),
-        reverse=True,
-    )[:_IMAGEGEN_JOBS_MAX])
-    jobs.clear()
-    jobs.update(ordered)
-    atomic_write_text(_IMAGEGEN_JOBS_PATH, json.dumps({"jobs": jobs}, ensure_ascii=False))
+    """Compatibility snapshot for tests and local diagnostic tooling."""
+    return _imagegen_job_store.snapshot()
 
 
 def _imagegen_put_job(job: dict) -> dict:
-    with _imagegen_jobs_lock:
-        jobs = _imagegen_load_jobs()
-        jobs[job["id"]] = job
-        _imagegen_save_jobs_locked()
-        return job
-
-
-def _imagegen_update_job(job_id: str, **patch: Any) -> dict | None:
-    with _imagegen_jobs_lock:
-        jobs = _imagegen_load_jobs()
-        job = jobs.get(job_id)
-        if not job:
-            return None
-        job.update(patch)
-        job["updated_at"] = time.time()
-        _imagegen_save_jobs_locked()
-        return job
+    return _imagegen_job_store.put(job)
 
 
 def _imagegen_job_file(job: dict, img: dict) -> Path:
@@ -10603,10 +10547,10 @@ def _imagegen_public_job(job: dict, *, include_data: bool = True) -> dict:
 
 
 def _imagegen_list_jobs(limit: int) -> list[dict]:
-    with _imagegen_jobs_lock:
-        jobs = list(_imagegen_load_jobs().values())
-    jobs.sort(key=lambda j: float(j.get("created_at") or 0), reverse=True)
-    return [_imagegen_public_job(j, include_data=False) for j in jobs[:max(1, min(limit, 100))]]
+    return [
+        _imagegen_public_job(job, include_data=False)
+        for job in _imagegen_job_store.list(limit)
+    ]
 
 
 def _persist_imagegen_result(job: dict, result: dict) -> list[dict]:
@@ -10647,9 +10591,9 @@ def _persist_imagegen_result(job: dict, result: dict) -> list[dict]:
 
 
 async def _run_imagegen_job(job_id: str, req: ImageGenerateReq) -> None:
-    _imagegen_update_job(job_id, status="running", error="")
     staged_result_items: list[dict] = []
     try:
+        await _imagegen_job_store.update_async(job_id, status="running", error="")
         prompt, model, size, quality, output_format, image_ids = _normalize_image_generate_req(req)
         result = await _generate_openai_image_api(
             req=req,
@@ -10664,33 +10608,36 @@ async def _run_imagegen_job(job_id: str, req: ImageGenerateReq) -> None:
             item for item in result.get("images", [])
             if isinstance(item, dict)
         ]
-        with _imagegen_jobs_lock:
-            jobs = _imagegen_load_jobs()
-            job = jobs.get(job_id)
-            if not job:
-                return
-            job_snapshot = dict(job)
+        job_snapshot = await asyncio.to_thread(
+            _imagegen_job_store.get, job_id)
+        if not job_snapshot:
+            return
         images = await asyncio.to_thread(
             _persist_imagegen_result,
             job_snapshot,
             result,
         )
-        with _imagegen_jobs_lock:
-            jobs = _imagegen_load_jobs()
-            job = jobs.get(job_id)
-            if not job:
-                return
-            job["provider"] = result.get("provider")
-            job["model"] = result.get("model") or model
-            job["images"] = images
-            job["status"] = "succeeded" if job["images"] else "failed"
-            job["error"] = "" if job["images"] else "image generation returned no images"
-            job["updated_at"] = time.time()
-            _imagegen_save_jobs_locked()
+        await _imagegen_job_store.update_async(
+            job_id,
+            provider=result.get("provider"),
+            model=result.get("model") or model,
+            images=images,
+            status="succeeded" if images else "failed",
+            error="" if images else "image generation returned no images",
+        )
+    except asyncio.CancelledError:
+        await _imagegen_job_store.update_async(
+            job_id,
+            status="failed",
+            error="image generation was cancelled",
+        )
+        raise
     except HTTPException as e:
-        _imagegen_update_job(job_id, status="failed", error=str(e.detail))
+        await _imagegen_job_store.update_async(
+            job_id, status="failed", error=str(e.detail))
     except Exception as e:
-        _imagegen_update_job(job_id, status="failed", error=f"{type(e).__name__}: {e}")
+        await _imagegen_job_store.update_async(
+            job_id, status="failed", error=f"{type(e).__name__}: {e}")
 
     finally:
         if staged_result_items:
@@ -10828,7 +10775,7 @@ async def create_image_generate_job(req: ImageGenerateReq) -> dict:
         "created_at": now,
         "updated_at": now,
     }
-    _imagegen_put_job(job)
+    await _imagegen_job_store.put_async(job)
     task = asyncio.create_task(_run_imagegen_job(job["id"], req))
     task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
     return {"ok": True, "job": _imagegen_public_job(job, include_data=True)}
@@ -10836,21 +10783,13 @@ async def create_image_generate_job(req: ImageGenerateReq) -> dict:
 
 @router.get("/image-generate/jobs", dependencies=[Depends(require_token)])
 async def list_image_generate_jobs(limit: int = Query(40, ge=1, le=100)) -> dict:
-    return {"ok": True, "jobs": _imagegen_list_jobs(limit)}
+    jobs = await asyncio.to_thread(_imagegen_list_jobs, limit)
+    return {"ok": True, "jobs": jobs}
 
 
 @router.get("/image-generate/jobs/{job_id}", dependencies=[Depends(require_token)])
 async def get_image_generate_job(job_id: str) -> dict:
-    with _imagegen_jobs_lock:
-        job = _imagegen_load_jobs().get(job_id)
-        if job:
-            job = {
-                **job,
-                "images": [
-                    dict(img) for img in job.get("images", [])
-                    if isinstance(img, dict)
-                ],
-            }
+    job = await asyncio.to_thread(_imagegen_job_store.get, job_id)
     if not job:
         raise HTTPException(404, "image generation job not found")
     public = await asyncio.to_thread(
@@ -10861,13 +10800,12 @@ async def get_image_generate_job(job_id: str) -> dict:
 @router.get("/image-generate/jobs/{job_id}/images/{image_id}",
             dependencies=[Depends(require_token)])
 async def get_image_generate_job_image(job_id: str, image_id: str) -> FileResponse:
-    with _imagegen_jobs_lock:
-        job = _imagegen_load_jobs().get(job_id)
-        if not job:
-            raise HTTPException(404, "image generation job not found")
-        images = job.get("images") if isinstance(job.get("images"), list) else []
-        img = next((x for x in images
-                    if isinstance(x, dict) and x.get("image_id") == image_id), None)
+    job = await asyncio.to_thread(_imagegen_job_store.get, job_id)
+    if not job:
+        raise HTTPException(404, "image generation job not found")
+    images = job.get("images") if isinstance(job.get("images"), list) else []
+    img = next((x for x in images
+                if isinstance(x, dict) and x.get("image_id") == image_id), None)
     if not img:
         raise HTTPException(404, "image generation image not found")
     path = _imagegen_job_file(job, img)
@@ -10883,13 +10821,12 @@ async def get_image_generate_job_image(job_id: str, image_id: str) -> FileRespon
 @router.post("/image-generate/jobs/{job_id}/attach/{image_id}",
              dependencies=[Depends(require_token)])
 async def attach_image_generate_job_image(job_id: str, image_id: str) -> dict:
-    with _imagegen_jobs_lock:
-        job = _imagegen_load_jobs().get(job_id)
-        if not job:
-            raise HTTPException(404, "image generation job not found")
-        images = job.get("images") if isinstance(job.get("images"), list) else []
-        img = next((x for x in images
-                    if isinstance(x, dict) and x.get("image_id") == image_id), None)
+    job = await asyncio.to_thread(_imagegen_job_store.get, job_id)
+    if not job:
+        raise HTTPException(404, "image generation job not found")
+    images = job.get("images") if isinstance(job.get("images"), list) else []
+    img = next((x for x in images
+                if isinstance(x, dict) and x.get("image_id") == image_id), None)
     if not img:
         raise HTTPException(404, "image generation image not found")
     try:
