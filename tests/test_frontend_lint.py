@@ -4667,10 +4667,15 @@ def test_queue_paused_flag_cannot_outlive_its_items():
     sessions = (BACKEND / "sessions.py").read_text(encoding="utf-8")
     html = (FRONTEND / "index.html").read_text(encoding="utf-8")
 
-    remove = sessions[sessions.index("def remove_queue_item("):]
-    remove = remove[:remove.index("def clear_queue(")]
+    remove = sessions[sessions.index("def remove_queue_item_with_removed("):]
+    remove = remove[:remove.index("def remove_queue_item(")]
     assert 'if not data["items"]:' in remove
     assert 'data["paused"] = False' in remove
+
+    clear = sessions[sessions.index("def clear_queue_with_removed("):]
+    clear = clear[:clear.index("def clear_queue(")]
+    assert 'current["items"] = []' in clear
+    assert 'current["paused"] = False' in clear
 
     # Paused beats streaming: "a turn is running" no longer implies "it will
     # drain when the turn ends".
