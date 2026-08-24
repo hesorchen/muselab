@@ -809,6 +809,10 @@ def test_selection_side_question_window_drags_by_header_and_stays_in_view(
         ".preview-selection-ask-head"
     )
     expect(form_head).to_be_visible()
+    # Visibility only proves x-if rendered. Wait for openPreviewSelectionAsk's
+    # nextTick initializer before pointer input can race its position reset.
+    expect(page.locator(
+        ".preview-selection-ask:visible textarea")).to_be_focused()
     before = popover.bounding_box()
     head_box = form_head.bounding_box()
     assert before is not None and head_box is not None
@@ -949,6 +953,9 @@ def test_selection_side_question_window_supports_touch_drag(
     popover = page.locator(".preview-selection-popover")
     head = page.locator(".preview-selection-ask .preview-selection-ask-head")
     expect(head).to_be_visible()
+    # Join the same nextTick focus callback before dispatching trusted touch.
+    expect(page.locator(
+        ".preview-selection-ask:visible textarea")).to_be_focused()
     before = popover.bounding_box()
     head_box = head.bounding_box()
     assert before is not None and head_box is not None

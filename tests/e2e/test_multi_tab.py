@@ -569,6 +569,10 @@ def test_repeated_enter_while_background_busy_submits_one_draft(
           return app.tabState[app.currentId]._composerSubmitToken === null;
         }"""
     )
+    # The handoff is intentionally fire-and-forget after queue commit. Join
+    # its observable start before releasing the test-owned promise.
+    page.wait_for_function(
+        "() => typeof window.__releaseHandoff === 'function'")
     result = page.evaluate(
         """() => {
           const app = document.querySelector('#app')._x_dataStack[0];
