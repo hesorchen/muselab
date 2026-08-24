@@ -90,7 +90,9 @@ def test_legacy_registry_rows_receive_stable_workspace_ids(
 
     other = _make_workspace(tmp_path)
     registry_dir = temp_root / ".muselab"
-    registry_dir.mkdir()
+    # Other private stores may initialize the shared internal container before
+    # the workspace registry migrates a legacy workspaces.json file.
+    registry_dir.mkdir(exist_ok=True)
     (registry_dir / "workspaces.json").write_text(
         json.dumps({
             "workspaces": [
