@@ -1598,6 +1598,269 @@ def test_terminal_surface_clicking_last_selected_file_tab_returns_to_file(
     )
 
 
+def test_virtual_file_tree_supports_keyboard_navigation_and_mobile_handoff(
+        page: Page, backend_url, auth_token):
+    page.set_viewport_size({"width": 1440, "height": 900})
+    _login(page, backend_url, auth_token)
+
+    page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          app._stopFileEvents(false);
+          app._treeLoadSeq += 1;
+          app.treeFocusPath = '';
+          app.selected = '';
+          app.visible = Array.from({length: 240}, (_, index) => {
+            const suffix = String(index).padStart(3, '0');
+            return {
+              path: `virtual-${suffix}.txt`, name: `virtual-${suffix}.txt`,
+              depth: 0, is_dir: false, size: index + 1,
+            };
+          });
+          app.fileTreeViewport = {start: 0, end: 80};
+          await new Promise(resolve => app.$nextTick(resolve));
+          const list = app.$refs.fileList;
+          list.scrollTop = 80 * app._fileTreeRowHeight();
+          app._syncFileTreeViewport(list);
+          await new Promise(resolve => app.$nextTick(resolve));
+        }"""
+    )
+
+    middle = page.locator(
+        '.filelist [role="treeitem"][data-path="virtual-090.txt"]'
+    )
+    expect(middle).to_be_visible()
+    middle.focus()
+    expect(middle).to_have_attribute("tabindex", "0")
+
+    page.keyboard.press("ArrowDown")
+    page.wait_for_function(
+        "() => document.activeElement?.dataset?.path === 'virtual-091.txt'"
+    )
+    page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const list = app.$refs.fileList;
+          list.scrollTop = 180 * app._fileTreeRowHeight();
+          app._syncFileTreeViewport(list);
+          await new Promise(resolve => app.$nextTick(resolve));
+        }"""
+    )
+    tab_stops = page.locator(
+        '.filelist [role="treeitem"][tabindex="0"]'
+    )
+    expect(tab_stops).to_have_count(1)
+    assert tab_stops.get_attribute("data-path") != "virtual-091.txt"
+    tab_stops.focus()
+    page.keyboard.press("Home")
+    page.wait_for_function(
+        "() => document.activeElement?.dataset?.path === 'virtual-000.txt'"
+    )
+    page.keyboard.press("End")
+    page.wait_for_function(
+        "() => document.activeElement?.dataset?.path === 'virtual-239.txt'"
+    )
+
+    page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const request = async (url, init) => {
+            const response = await fetch(url, init);
+            if (!response.ok && response.status !== 409) {
+              throw new Error(await response.text());
+            }
+          };
+          await request('/api/files/mkdir', {
+            method: 'POST',
+            headers: {...app.fileHdr(), 'Content-Type': 'application/json'},
+            body: JSON.stringify({path: 'keyboard-folder'}),
+          });
+          await request('/api/files/write', {
+            method: 'PUT',
+            headers: {...app.fileHdr(), 'Content-Type': 'application/json'},
+            body: JSON.stringify({
+              path: 'keyboard-folder/child.md', content: '# keyboard child',
+            }),
+          });
+          app.treeFocusPath = '';
+          app.selected = '';
+          app.fileTreeViewport = {start: 0, end: 80};
+          app.$refs.fileList.scrollTop = 0;
+          await app.reloadTree();
+          app._startFileEvents();
+          await new Promise(resolve => app.$nextTick(resolve));
+        }"""
+    )
+    refresh = page.locator(".filelist-sticky-root .root-action").last
+    refresh.focus()
+    page.keyboard.press("Tab")
+    page.wait_for_function(
+        "() => document.activeElement?.getAttribute('role') === 'treeitem'"
+    )
+
+    directory = page.locator(
+        '.filelist [role="treeitem"][data-path="keyboard-folder"]'
+    )
+    directory.focus()
+    expect(directory).to_have_attribute("aria-level", "1")
+    page.keyboard.press("ArrowRight")
+    expect(directory).to_have_attribute("aria-expanded", "true")
+    expect(directory).to_be_focused()
+    child = page.locator(
+        '.filelist [role="treeitem"]'
+        '[data-path="keyboard-folder/child.md"]'
+    )
+    expect(child).to_have_attribute("aria-level", "2")
+    page.keyboard.press("ArrowRight")
+    expect(child).to_be_focused()
+    page.keyboard.press("ArrowLeft")
+    expect(directory).to_be_focused()
+    page.keyboard.press("ArrowLeft")
+    expect(directory).to_have_attribute("aria-expanded", "false")
+
+    readme = page.locator(
+        '.filelist [role="treeitem"][data-path="README.md"]'
+    )
+    readme.focus()
+    page.keyboard.press("Enter")
+    page.wait_for_function(
+        "() => document.querySelector('#app')._x_dataStack[0].selected === 'README.md'"
+    )
+    expect(readme).to_be_focused()
+    notes = page.locator(
+        '.filelist [role="treeitem"][data-path="notes.md"]'
+    )
+    notes.focus()
+    page.keyboard.press("Space")
+    page.wait_for_function(
+        "() => document.querySelector('#app')._x_dataStack[0].selected === 'notes.md'"
+    )
+    expect(notes).to_be_focused()
+
+    page.set_viewport_size({"width": 390, "height": 844})
+    page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          app.setMobileTab('files');
+          await new Promise(resolve => app.$nextTick(resolve));
+        }"""
+    )
+    readme.focus()
+    page.keyboard.press("Enter")
+    page.wait_for_function(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const active = document.activeElement;
+          return app.mobileTab === 'preview'
+            && active?.matches('.pane.preview .tab.active .tab-main')
+            && active.getClientRects().length > 0;
+        }"""
+    )
+
+
+def test_file_and_terminal_tabs_expose_separate_keyboard_actions(
+        page: Page, backend_url, auth_token):
+    page.set_viewport_size({"width": 1440, "height": 900})
+    _login(page, backend_url, auth_token)
+    page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          app.tabs = [];
+          app.openFilesCollapsed = false;
+          app._clearPreviewState();
+          await app.openFile({path: 'README.md', name: 'README.md'});
+          await app.openFile({path: 'notes.md', name: 'notes.md'});
+          await new Promise(resolve => app.$nextTick(resolve));
+        }"""
+    )
+
+    page.locator(".open-files-close-all").focus()
+    page.keyboard.press("Tab")
+    page.wait_for_function(
+        "() => document.activeElement?.classList.contains('open-files-main')"
+    )
+    open_path = page.evaluate(
+        "() => document.activeElement.closest('li').dataset.path"
+    )
+    page.keyboard.press("Enter")
+    page.wait_for_function(
+        "path => document.querySelector('#app')._x_dataStack[0].selected === path",
+        arg=open_path,
+    )
+    page.keyboard.press("Tab")
+    assert page.evaluate(
+        "() => document.activeElement?.classList.contains('open-files-x')"
+    ) is True
+
+    page.locator(".tab-picker-btn").focus()
+    page.keyboard.press("Tab")
+    page.wait_for_function(
+        """() => document.activeElement?.matches(
+          '.pane.preview .tab[data-path] .tab-main')"""
+    )
+    file_path = page.evaluate(
+        "() => document.activeElement.closest('.tab').dataset.path"
+    )
+    page.keyboard.press("Enter")
+    page.wait_for_function(
+        "path => document.querySelector('#app')._x_dataStack[0].selected === path",
+        arg=file_path,
+    )
+    page.keyboard.press("Tab")
+    assert page.evaluate(
+        """() => document.activeElement?.matches(
+          '.pane.preview .tab[data-path] .tab-close')"""
+    ) is True
+    page.keyboard.press("Enter")
+    page.wait_for_function(
+        """path => !document.querySelector(
+          `.pane.preview .tab[data-path="${CSS.escape(path)}"]`)""",
+        arg=file_path,
+    )
+
+    page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          app.terminals = [{
+            id: 'keyboard-terminal', name: 'Keyboard terminal',
+            cwd: '/workspace', status: 'running',
+          }];
+          app.openTerminal = id => {
+            app.previewSurface = 'terminal';
+            app.activeTerminalId = id;
+          };
+          app.closeTerminal = id => {
+            app.terminals = app.terminals.filter(term => term.id !== id);
+            if (app.activeTerminalId === id) app.activeTerminalId = null;
+          };
+          await new Promise(resolve => app.$nextTick(resolve));
+        }"""
+    )
+    page.locator(".tab-picker-btn").focus()
+    page.keyboard.press("Tab")
+    page.wait_for_function(
+        """() => document.activeElement?.matches(
+          '.pane.preview .terminal-tab .tab-main')"""
+    )
+    page.keyboard.press("Enter")
+    page.wait_for_function(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          return app.previewSurface === 'terminal'
+            && app.activeTerminalId === 'keyboard-terminal';
+        }"""
+    )
+    page.keyboard.press("Tab")
+    assert page.evaluate(
+        """() => document.activeElement?.matches(
+          '.pane.preview .terminal-tab .tab-close')"""
+    ) is True
+    page.keyboard.press("Enter")
+    page.wait_for_function(
+        "() => !document.querySelector('.pane.preview .terminal-tab')"
+    )
+
+
 def test_rapid_csv_switch_aborts_old_page_and_commits_latest(page: Page,
                                                               backend_url,
                                                               auth_token):

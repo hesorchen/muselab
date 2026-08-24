@@ -1881,6 +1881,17 @@ body.kb-open .layout:focus-within .mobile-tab-bar { display: none; }
   cursor: pointer;
   color: var(--c-fg-1);
 }
+.open-files-main {
+  grid-column: 1 / 3;
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 6px;
+  width: 100%; min-width: 0; min-height: 20px;
+  padding: 0; border: 0;
+  background: transparent; color: inherit;
+  font: inherit; text-align: left; cursor: pointer;
+}
 .open-files-list li:hover { background: var(--c-bg-2); }
 /* Drag-to-reorder: horizontal insertion bar at the top of the hovered row
    (vertical list ⇒ top edge, mirroring the tab bar's left-edge indicator). */
@@ -1986,6 +1997,11 @@ body.kb-open .layout:focus-within .mobile-tab-bar { display: none; }
   opacity: 0.5; pointer-events: none;
 }
 .filelist li:hover { background: var(--c-bg-2); }
+.filelist li[role="treeitem"]:focus-visible {
+  outline: 2px solid var(--c-accent);
+  outline-offset: -2px;
+  box-shadow: inset 0 0 0 1px var(--c-accent-soft);
+}
 
 /* One stable trailing column owns either metadata or actions. Hover swaps the
    two in-place, so buttons never squeeze the file name or sit beside a size. */
@@ -2215,6 +2231,15 @@ body.kb-open .layout:focus-within .mobile-tab-bar { display: none; }
   border-bottom: 2px solid var(--c-accent); padding-bottom: 4px;
 }
 .tab.active .icon { color: var(--c-accent); }
+.tab-main {
+  display: flex; align-items: center; gap: 6px;
+  align-self: stretch; flex: 1; min-width: 0;
+  padding: 0; border: 0;
+  background: transparent; color: inherit;
+  font: inherit; text-align: left; cursor: pointer;
+  white-space: nowrap;
+}
+.tab-main .tab-name { min-width: 0; }
 /* VSCode-style preview tab: a single-click-opened, not-yet-pinned file shows
    its name in italics. Double-clicking the tab (or editing the file) pins it,
    dropping the italics. Only the name italicizes — icon/close stay upright. */
@@ -10065,6 +10090,7 @@ html[data-theme="dark"] .bubble :not(pre) > code:not(.has-file-link) * {
     padding-top: 2px;
     padding-bottom: 2px;
   }
+  .open-files-main { min-height: 36px; }
   .open-files-x { width: 36px; height: 36px; font-size: 20px; }
   .srow { min-height: 44px; padding-top: 9px; padding-bottom: 9px; }
   .csv-toolbar { flex-wrap: wrap; gap: 6px; }

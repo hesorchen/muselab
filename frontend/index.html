@@ -421,11 +421,16 @@
                 @click="switchTab(t.path, { reveal: true })"
                 @contextmenu.prevent="showPreviewTabMenu($event, t.path)"
                 :title="t.path">
-              <span class="icon"><svg><use :href="iconRef({name: t.name, is_dir: false})"/></svg></span>
-              <span class="name" x-text="t.name"></span>
-              <span class="tab-dirty" x-show="selected===t.path && _editorDirty()"
-                    :title="lang==='zh'?'有未保存的改动':'Unsaved changes'"></span>
-              <button class="open-files-x"
+              <button type="button" class="open-files-main"
+                      @click.stop="switchTab(t.path, { reveal: true })"
+                      :aria-current="selected === t.path ? 'page' : null"
+                      :aria-label="(lang==='zh' ? '打开文件：' : 'Open file: ') + t.name">
+                <span class="icon"><svg><use :href="iconRef({name: t.name, is_dir: false})"/></svg></span>
+                <span class="name" x-text="t.name"></span>
+                <span class="tab-dirty" x-show="selected===t.path && _editorDirty()"
+                      :title="lang==='zh'?'有未保存的改动':'Unsaved changes'"></span>
+              </button>
+              <button type="button" class="open-files-x"
                       @click.stop="closeTab(t.path)"
                       :title="lang==='zh'?'关闭':'Close'">×</button>
             </li>
@@ -478,10 +483,13 @@
           </span>
         </div>
       <ul class="filelist" x-ref="fileList"
+          role="tree"
+          :aria-label="lang==='zh' ? '工作区文件树' : 'Workspace file tree'"
           x-init="_attachPTR($el, () => reloadTree()); $nextTick(() => _syncFileTreeViewport($el))"
           @scroll.passive="onFileTreeScroll($event)"
           @mousedown="onMarqueeStart($event)">
         <li class="filelist-virtual-spacer" aria-hidden="true"
+            role="none"
             :style="`height:${fileTreeTopSpacer()}px`"></li>
         <template x-for="n in fileTreeWindowRows()" :key="n.path">
           <li :class="{file: !n.is_dir, dir: n.is_dir, sel: isRowSelected(n), 'drag-over': dragOver===n.path}"
@@ -489,6 +497,14 @@
               :data-path="n.path"
               :data-depth="n.depth"
               :data-ext="fileExtClass(n)"
+              role="treeitem"
+              :aria-label="n.name"
+              :aria-level="n.depth + 1"
+              :aria-expanded="n.is_dir ? expanded.has(n.path) : null"
+              :aria-selected="isRowSelected(n)"
+              :tabindex="treeRowTabIndex(n)"
+              @focus="onTreeRowFocus(n)"
+              @keydown="onTreeRowKeydown($event, n)"
               :draggable="isPointerDevice && isRowSelected(n)"
               @dragstart="onTreeNodeDragStart($event, n)"
               @dragend="dragOver=''; dragOverRoot=false; _dragSrcPath=null; _dragSrcPaths=null"
@@ -534,6 +550,7 @@
           </li>
         </template>
         <li class="filelist-virtual-spacer" aria-hidden="true"
+            role="none"
             :style="`height:${fileTreeBottomSpacer()}px`"></li>
         <li class="filelist-status" x-show="treeLoading && !visible.length"
             aria-live="polite">
@@ -869,12 +886,17 @@
         <template x-for="term in terminals" :key="'terminal-'+term.id">
           <div class="tab terminal-tab"
                :class="{active: previewSurface==='terminal' && activeTerminalId===term.id}"
-               @click="openTerminal(term.id)"
-               :title="term.cwd">
-            <span class="terminal-status-dot" :class="term.status"></span>
-            <span class="terminal-glyph">&gt;_</span>
-            <span class="tab-name" x-text="term.name"></span>
-            <button class="tab-close" @click.stop="closeTerminal(term.id)"
+               @click="openTerminal(term.id)">
+            <button type="button" class="tab-main"
+                    @click.stop="openTerminal(term.id)"
+                    :aria-current="previewSurface==='terminal' && activeTerminalId===term.id ? 'page' : null"
+                    :aria-label="(lang==='zh' ? '打开终端：' : 'Open terminal: ') + term.name"
+                    :title="term.cwd">
+              <span class="terminal-status-dot" :class="term.status"></span>
+              <span class="terminal-glyph">&gt;_</span>
+              <span class="tab-name" x-text="term.name"></span>
+            </button>
+            <button type="button" class="tab-close" @click.stop="closeTerminal(term.id)"
                     :title="lang==='zh'?'关闭终端':'Close terminal'">×</button>
           </div>
         </template>
@@ -892,14 +914,20 @@
                @contextmenu.prevent="showPreviewTabMenu($event, t.path)"
                @auxclick.prevent="onPreviewTabAuxClick($event, t.path)"
                :title="t.path">
-            <span class="icon"><svg><use :href="iconRef({name: t.name, is_dir: false})"/></svg></span>
-            <span class="tab-name" x-text="t.name"></span>
+            <button type="button" class="tab-main"
+                    @click.stop="switchTab(t.path, { reveal: true })"
+                    :aria-current="previewSurface==='file' && selected===t.path ? 'page' : null"
+                    :aria-label="(lang==='zh' ? '打开文件标签：' : 'Open file tab: ') + t.name"
+                    :title="t.path">
+              <span class="icon"><svg><use :href="iconRef({name: t.name, is_dir: false})"/></svg></span>
+              <span class="tab-name" x-text="t.name"></span>
+            </button>
             <!-- Unsaved-edits dot: only the currently-open file can be edited
                  (single editing buffer keyed by `selected`), so the dot tracks
                  selected===t.path && dirty. -->
             <span class="tab-dirty" x-show="selected===t.path && _editorDirty()"
                   :title="lang==='zh'?'有未保存的改动':'Unsaved changes'"></span>
-            <button class="tab-close" @click.stop="closeTab(t.path)" :title="lang==='zh'?'关闭（中键也可）':'Close (middle-click also)'">×</button>
+            <button type="button" class="tab-close" @click.stop="closeTab(t.path)" :title="lang==='zh'?'关闭（中键也可）':'Close (middle-click also)'">×</button>
           </div>
         </template>
         </div>

@@ -19448,6 +19448,116 @@ function portal() {
       this.toast(this.t(key), "info", hadExpanded ? 2500 : 1500);
       return true;
     },
+    treeRowTabIndex(n) {
+      if (!n) return -1;
+      const preferred = this.treeFocusPath || this.selected;
+      if (n.path === preferred) return 0;
+      const start = Math.max(
+        0,
+        Math.min(
+          Number(this.fileTreeViewport && this.fileTreeViewport.start) || 0,
+          this.visible.length,
+        ),
+      );
+      const end = Math.max(
+        start,
+        Math.min(
+          Number(this.fileTreeViewport && this.fileTreeViewport.end) || 80,
+          this.visible.length,
+        ),
+      );
+      const firstRendered = this.visible[start] || this.visible[0];
+      if (!firstRendered || n.path !== firstRendered.path) return -1;
+      // Only the first rendered row checks the current window. A logical focus
+      // owner outside the virtual slice cannot be tabbed to, so the mounted
+      // slice still needs exactly one entry point. Keep the scan O(window),
+      // not O(full tree * rendered rows).
+      for (let index = start; preferred && index < end; index += 1) {
+        if (this.visible[index].path === preferred) return -1;
+      }
+      return 0;
+    },
+    onTreeRowFocus(n) {
+      if (n && n.path) this.treeFocusPath = n.path;
+    },
+    _focusTreeRow(path, block = "nearest") {
+      if (!path) return false;
+      this.treeFocusPath = path;
+      this._positionFileTreePath(path, block);
+      const focusRow = () => {
+        const escaped = window.CSS && CSS.escape ? CSS.escape(path) : path;
+        const row = document.querySelector(
+          `.filelist li[role="treeitem"][data-path="${escaped}"]`,
+        );
+        if (!row) return false;
+        this._focusWithoutScroll(row);
+        return true;
+      };
+      this.$nextTick(() => {
+        if (focusRow()) return;
+        // A Home/End jump can replace the virtualized x-for window. Alpine's
+        // first nextTick publishes the slice, while its DOM nodes may not be
+        // mounted until the following paint; retry once without polling.
+        this._afterPaint(focusRow);
+      });
+      return true;
+    },
+    async onTreeRowKeydown(ev, n) {
+      if (!ev || !n || ev.target !== ev.currentTarget) return;
+      const key = ev.key;
+      if (key === "Enter" || key === " ") {
+        ev.preventDefault();
+        ev.stopPropagation();
+        await this.onNodeClick(ev, n);
+        if (this._isMobileLayout() && !n.is_dir) {
+          this.$nextTick(() => {
+            const active = document.querySelector(
+              ".pane.preview .tab.active .tab-main",
+            );
+            if (active) this._focusWithoutScroll(active);
+          });
+        } else {
+          this._focusTreeRow(n.path);
+        }
+        return;
+      }
+      const rows = this.visible;
+      const index = rows.findIndex(node => node.path === n.path);
+      if (index < 0) return;
+      let target = null;
+      if (key === "ArrowDown") target = rows[Math.min(rows.length - 1, index + 1)];
+      else if (key === "ArrowUp") target = rows[Math.max(0, index - 1)];
+      else if (key === "Home") target = rows[0];
+      else if (key === "End") target = rows[rows.length - 1];
+      else if (key === "ArrowRight" && n.is_dir) {
+        if (!this.expanded.has(n.path)) {
+          ev.preventDefault();
+          ev.stopPropagation();
+          await this.expand(n);
+          this.savePrefs();
+          this._focusTreeRow(n.path);
+          return;
+        }
+        const child = rows[index + 1];
+        if (child && child.depth === n.depth + 1) target = child;
+      } else if (key === "ArrowLeft") {
+        if (n.is_dir && this.expanded.has(n.path)) {
+          ev.preventDefault();
+          ev.stopPropagation();
+          this.collapse(n);
+          this.savePrefs();
+          this._focusTreeRow(n.path);
+          return;
+        }
+        const parentPath = n.path.includes("/")
+          ? n.path.split("/").slice(0, -1).join("/") : "";
+        if (parentPath) target = rows.find(node => node.path === parentPath);
+      }
+      if (!target) return;
+      ev.preventDefault();
+      ev.stopPropagation();
+      this._focusTreeRow(target.path);
+    },
     async onNodeClick(ev, n) {
       // ---- Desktop multi-select modifiers ----
       // Ctrl/Cmd-click toggles a single row in/out of the batch set; Shift-

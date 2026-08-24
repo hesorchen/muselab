@@ -5295,3 +5295,42 @@ def test_message_outline_is_a_focus_managed_keyboard_dialog():
     assert "_outlineFetchedAt" in refresh
     assert "_outlineFetching" in refresh
     assert ".msg-outline-item:focus-visible" in css
+
+
+def test_file_navigation_exposes_keyboard_semantics_and_distinct_actions():
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    css = (FRONTEND / "styles.css").read_text(encoding="utf-8")
+
+    assert 'role="tree"' in html
+    assert ':aria-label="n.name"' in html
+    assert ':aria-level="n.depth + 1"' in html
+    assert ':aria-expanded="n.is_dir ? expanded.has(n.path) : null"' in html
+    assert ':tabindex="treeRowTabIndex(n)"' in html
+    assert '@keydown="onTreeRowKeydown($event, n)"' in html
+    assert html.count('class="filelist-virtual-spacer" aria-hidden="true"') == 2
+    assert html.count('role="none"') >= 2
+
+    keyboard = app[app.index("    treeRowTabIndex(n) {"):]
+    keyboard = keyboard[:keyboard.index("\n    async onNodeClick(")]
+    for key in (
+        'key === "Enter"', 'key === " "', 'key === "ArrowDown"',
+        'key === "ArrowUp"', 'key === "Home"', 'key === "End"',
+        'key === "ArrowRight"', 'key === "ArrowLeft"',
+    ):
+        assert key in keyboard
+    assert "this._positionFileTreePath(path, block)" in keyboard
+    assert 'active) this._focusWithoutScroll(active)' in keyboard
+    assert "index < end" in keyboard
+    assert "this.visible[index].path === preferred" in keyboard
+    assert "preferredIsVisible" not in keyboard
+
+    assert 'type="button" class="open-files-main"' in html
+    assert 'type="button" class="open-files-x"' in html
+    assert html.count('type="button" class="tab-main"') == 2
+    assert html.count('type="button" class="tab-close"') >= 2
+    assert '@click.stop="switchTab(t.path, { reveal: true })"' in html
+    assert '@click.stop="openTerminal(term.id)"' in html
+    assert ".open-files-main {" in css
+    assert ".tab-main {" in css
+    assert '.filelist li[role="treeitem"]:focus-visible' in css
