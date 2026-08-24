@@ -2858,11 +2858,36 @@ def test_history_pagination_keeps_stable_cross_page_keys_without_remounting(
 def test_message_outline_traps_focus_and_supports_keyboard_selection(
     page: Page, backend_url, auth_token,
 ):
-    """Outline behaves as one modal and native buttons preserve keyboard UX."""
+    """Outline stays lazy, shows its local fallback, and preserves keyboard UX."""
     errors = _capture_browser_errors(page)
-    page.route(
-        "**/api/chat/sessions/*/outline",
-        lambda route: route.fulfill(
+    requests: list[str] = []
+
+    page.add_init_script(
+        """
+        (() => {
+          const nativeFetch = window.fetch;
+          window.__outlineFetchCalls = 0;
+          window.fetch = function(input, options) {
+            const url = String(typeof input === "string" ? input : input?.url || "");
+            if (!url.includes("/outline")) {
+              return nativeFetch.apply(this, arguments);
+            }
+            window.__outlineFetchCalls += 1;
+            const receiver = this;
+            const args = arguments;
+            return new Promise(resolve => {
+              window.__releaseOutlineFetch = () => {
+                resolve(nativeFetch.apply(receiver, args));
+              };
+            });
+          };
+        })();
+        """
+    )
+
+    def serve_outline(route):
+        requests.append(route.request.url)
+        route.fulfill(
             status=200,
             content_type="application/json",
             body=json.dumps({
@@ -2877,18 +2902,35 @@ def test_message_outline_traps_focus_and_supports_keyboard_selection(
                     },
                 ],
             }),
-        ),
+        )
+
+    page.route(
+        "**/api/chat/sessions/*/outline",
+        serve_outline,
     )
     _login(page, backend_url, auth_token)
-    page.wait_for_function(
-        """() => document.querySelector("#app")._x_dataStack[0]
-          .outlineMessages().length === 2"""
-    )
+    page.wait_for_timeout(100)
+    assert page.evaluate("() => window.__outlineFetchCalls") == 0
+    assert requests == []
+
     _app_eval(
         page,
         """
         const st = app._ensureTabState(app.currentId);
         st.atBottom = false;
+        st._backendOutline = [];
+        st._outlineFetchedAt = 0;
+        st._outlineFetching = false;
+        st.messages.splice(0, st.messages.length,
+          {
+            role: "user", uuid: "outline-first",
+            text: "Immediate local first",
+          },
+          {
+            role: "user", uuid: "outline-second",
+            text: "Immediate local second",
+          },
+        );
         app._scrollToUserMsg = message => {
           window.__outlineKeyboardSelection = message.uuid;
         };
@@ -2906,10 +2948,21 @@ def test_message_outline_traps_focus_and_supports_keyboard_selection(
     expect(dialog).to_have_attribute("aria-modal", "true")
     expect(dialog).to_have_attribute("aria-labelledby", "msg-outline-title")
     expect(dialog.locator("#msg-outline-title")).to_contain_text("(2)")
-
     items = dialog.locator(".msg-outline-item")
     expect(items).to_have_count(2)
+    expect(items.nth(0)).to_contain_text("Immediate local first")
     expect(items.nth(0)).to_be_focused()
+    assert page.evaluate("() => window.__outlineFetchCalls") == 1
+    assert requests == []
+
+    page.evaluate("() => window.__releaseOutlineFetch()")
+    expect(items.nth(0)).to_contain_text("First keyboard prompt")
+    page.wait_for_function(
+        """() => !document.querySelector("#app")._x_dataStack[0]
+          ._ensureTabState(document.querySelector("#app")._x_dataStack[0].currentId)
+          ._outlineFetching"""
+    )
+    assert len(requests) == 1
 
     # The last outline item wraps forward to the close button, while reverse
     # traversal from the first DOM control wraps back to the last item.
@@ -2927,11 +2980,15 @@ def test_message_outline_traps_focus_and_supports_keyboard_selection(
     # Native button activation covers Enter/Space without custom key handlers.
     opener.press("Enter")
     expect(items.nth(0)).to_be_focused()
+    page.wait_for_timeout(100)
+    assert page.evaluate("() => window.__outlineFetchCalls") == 1
+    assert len(requests) == 1
     items.nth(1).focus()
     page.keyboard.press("Space")
     expect(dialog).to_be_hidden()
     expect(opener).to_be_focused()
     assert page.evaluate("() => window.__outlineKeyboardSelection") == "outline-second"
+    assert len(requests) == 1
     _assert_no_browser_errors(page, errors)
 
 

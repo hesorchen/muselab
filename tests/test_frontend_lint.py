@@ -5271,7 +5271,22 @@ def test_message_outline_is_a_focus_managed_keyboard_dialog():
     open_start = app.index("    openMessageOutline(ev = null) {")
     close_end = app.index("\n    // Filter messages for the sidebar outline", open_start)
     focus_contract = app[open_start:close_end]
+    outline_start = app.index("    outlineMessages() {")
+    outline_end = app.index("\n    async _loadAroundMessage", outline_start)
+    outline_projection = app[outline_start:outline_end]
+    refresh_start = app.index("    async refreshOutlineFromBackend(sid) {")
+    refresh_end = app.index("\n    async _reloadHistoryTailAfterConflict", refresh_start)
+    refresh = app[refresh_start:refresh_end]
+
     assert '"message-outline", ".msg-outline-panel", ".msg-outline-item"' in focus_contract
     assert "opener, true" in focus_contract
+    assert "void this.refreshOutlineFromBackend(this.currentId);" in focus_contract
+    assert focus_contract.index("this._openFocusSurface(") < focus_contract.index(
+        "void this.refreshOutlineFromBackend(this.currentId);"
+    )
     assert 'this._closeFocusSurface("message-outline", restoreFocus)' in focus_contract
+    assert "refreshOutlineFromBackend" not in outline_projection
+    assert "this.activeSessionPane().messages.filter(" in outline_projection
+    assert "_outlineFetchedAt" in refresh
+    assert "_outlineFetching" in refresh
     assert ".msg-outline-item:focus-visible" in css

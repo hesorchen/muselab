@@ -3924,6 +3924,7 @@ function portal() {
         "message-outline", ".msg-outline-panel", ".msg-outline-item",
         opener, true,
       );
+      void this.refreshOutlineFromBackend(this.currentId);
     },
     closeMessageOutline(restoreFocus = true) {
       if (!this.msgOutlineOpen && !this._focusSurfaceState["message-outline"]) return;
@@ -3937,14 +3938,10 @@ function portal() {
       // Touch reactivity ping so the modal re-renders when backend fetch
       // completes (same mechanism conversationOutline uses).
       const _ = this.outlineVersion;
-      // Fire off a background backend fetch so the list reflects the
-      // FULL session, not just the lazy-loaded visible window. This was
-      // the source of "outline shows only 2 user messages on a 45-user
-      // session" — the original filter walked only the active pane window, which
-      // contains the recent slice after the long-history performance
-      // optimization (commit 664304a).
+      // Opening the dialog explicitly refreshes the full-session cache. Keep
+      // this render-time projection pure so Alpine can evaluate the hidden
+      // x-show subtree during boot without starting network work.
       const sid = this.currentId;
-      if (sid) this.refreshOutlineFromBackend(sid);
       // Primary: backend-sourced list, shaped to look like message
       // objects so the modal template (which calls outlineText(m) and
       // _scrollToUserMsg(m.uuid)) keeps working unchanged.
