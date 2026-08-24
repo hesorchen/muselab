@@ -3100,8 +3100,9 @@
              pane. Same visibility rule as jump-bottom (x-show="!activeSession.atBottom")
              so the two appear/disappear together as a pair. -->
         <button class="chat-outline-fab" x-show="!activeSession.atBottom"
-                @click="msgOutlineOpen = true"
-                :title="lang==='zh' ? '会话目录' : 'Outline'">
+                @click="openMessageOutline($event)"
+                :title="lang==='zh' ? '会话目录' : 'Outline'"
+                :aria-label="lang==='zh' ? '打开会话目录' : 'Open conversation outline'">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <line x1="8" y1="6" x2="21" y2="6"/>
             <line x1="8" y1="12" x2="21" y2="12"/>
@@ -3822,22 +3823,29 @@
        desktop it centers as a normal modal. -->
   <div class="msg-outline-modal" x-show="msgOutlineOpen"
        x-transition.opacity
-       @click.self="msgOutlineOpen = false"
-       @keydown.escape.window="msgOutlineOpen = false">
-    <div class="msg-outline-panel" @click.stop>
+       @click.self="closeMessageOutline()">
+    <div class="msg-outline-panel" tabindex="-1"
+         @click.stop
+         @keydown.escape.stop.prevent="closeMessageOutline()"
+         @keydown.tab="trapDialogFocus($event, 'message-outline')"
+         role="dialog" aria-modal="true" aria-labelledby="msg-outline-title">
       <div class="msg-outline-head">
-        <span class="msg-outline-label"
+        <span id="msg-outline-title" class="msg-outline-label"
               x-text="(lang==='zh' ? '会话目录 ' : 'Outline ') + '(' + outlineMessages().length + ')'"></span>
-        <button class="msg-outline-close" @click="msgOutlineOpen = false"
-                :title="lang==='zh' ? '关闭 (Esc)' : 'Close (Esc)'">×</button>
+        <button type="button" class="msg-outline-close" @click="closeMessageOutline()"
+                :title="lang==='zh' ? '关闭 (Esc)' : 'Close (Esc)'"
+                :aria-label="lang==='zh' ? '关闭会话目录' : 'Close conversation outline'">×</button>
       </div>
       <ul class="msg-outline-list">
         <template x-for="(m, i) in outlineMessages()" :key="m.uuid || m._k || ('o-' + i)">
-          <li @click="_scrollToUserMsg(m); msgOutlineOpen = false"
-              :title="m.text || m.body || ''">
-            <span class="msg-outline-idx" x-text="'#' + (i + 1)"></span>
-            <span class="msg-outline-text ellipsis" x-text="outlineText(m)"></span>
-            <span class="msg-outline-time" x-text="m.ts ? fmtHM(m.ts) : ''"></span>
+          <li>
+            <button type="button" class="msg-outline-item"
+                    @click="_scrollToUserMsg(m); closeMessageOutline()"
+                    :title="m.text || m.body || ''">
+              <span class="msg-outline-idx" x-text="'#' + (i + 1)"></span>
+              <span class="msg-outline-text ellipsis" x-text="outlineText(m)"></span>
+              <span class="msg-outline-time" x-text="m.ts ? fmtHM(m.ts) : ''"></span>
+            </button>
           </li>
         </template>
       </ul>

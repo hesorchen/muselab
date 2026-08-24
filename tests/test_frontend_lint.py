@@ -5247,3 +5247,31 @@ def test_tab_activation_checks_canonical_installation_watermark():
     assert "await this._ensureSessionLoaded(tid)" in activate
     assert "this._canonicalMetaBehind(st, cur)" in switch
     assert "loadedButBehindCanonical" in switch
+
+
+def test_message_outline_is_a_focus_managed_keyboard_dialog():
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    css = (FRONTEND / "styles.css").read_text(encoding="utf-8")
+    start = html.index("<!-- ============ Message outline modal")
+    end = html.index("<!-- ============ Codex / OpenAI image generation", start)
+    outline = html[start:end]
+
+    assert '@click="openMessageOutline($event)"' in html
+    assert "msgOutlineOpen = true" not in outline
+    assert "msgOutlineOpen = false" not in outline
+    assert 'role="dialog" aria-modal="true"' in outline
+    assert 'aria-labelledby="msg-outline-title"' in outline
+    assert 'tabindex="-1"' in outline
+    assert '@keydown.escape.stop.prevent="closeMessageOutline()"' in outline
+    assert '@keydown.tab="trapDialogFocus($event, \'message-outline\')"' in outline
+    assert 'type="button" class="msg-outline-item"' in outline
+    assert "closeMessageOutline()" in outline
+
+    open_start = app.index("    openMessageOutline(ev = null) {")
+    close_end = app.index("\n    // Filter messages for the sidebar outline", open_start)
+    focus_contract = app[open_start:close_end]
+    assert '"message-outline", ".msg-outline-panel", ".msg-outline-item"' in focus_contract
+    assert "opener, true" in focus_contract
+    assert 'this._closeFocusSurface("message-outline", restoreFocus)' in focus_contract
+    assert ".msg-outline-item:focus-visible" in css

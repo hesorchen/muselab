@@ -1256,19 +1256,30 @@ body.kb-open .layout:focus-within .mobile-tab-bar { display: none; }
   flex: 1;
 }
 .msg-outline-list li {
+  border-bottom: 1px solid var(--c-border);
+}
+.msg-outline-list li:last-child { border-bottom: none; }
+.msg-outline-item {
   display: grid;
   grid-template-columns: auto 1fr auto;
   gap: 10px;
   align-items: center;
+  width: 100%;
   padding: 8px 14px;
   cursor: pointer;
   font-size: var(--fs-sm);
+  font-family: inherit;
+  text-align: left;
+  color: inherit;
+  background: transparent;
+  border-top: none;
+  border-right: none;
+  border-bottom: none;
   border-left: 2px solid transparent;
-  border-bottom: 1px solid var(--c-border);
   transition: background var(--t-fast), border-color var(--t-fast);
 }
-.msg-outline-list li:last-child { border-bottom: none; }
-.msg-outline-list li:hover {
+.msg-outline-item:hover,
+.msg-outline-item:focus-visible {
   background: var(--c-bg-2);
   border-left-color: var(--c-accent);
 }

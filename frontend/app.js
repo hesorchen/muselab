@@ -3915,6 +3915,21 @@ function portal() {
       const mm = String(d.getMinutes()).padStart(2, "0");
       return hh + ":" + mm;
     },
+    openMessageOutline(ev = null) {
+      if (this.msgOutlineOpen) return;
+      const opener = ev && ev.currentTarget
+        ? ev.currentTarget : document.activeElement;
+      this.msgOutlineOpen = true;
+      this._openFocusSurface(
+        "message-outline", ".msg-outline-panel", ".msg-outline-item",
+        opener, true,
+      );
+    },
+    closeMessageOutline(restoreFocus = true) {
+      if (!this.msgOutlineOpen && !this._focusSurfaceState["message-outline"]) return;
+      this.msgOutlineOpen = false;
+      this._closeFocusSurface("message-outline", restoreFocus);
+    },
     // Filter messages for the sidebar outline. Returns only user prompts
     // (skipping the auto-injected compact summaries) — they're what the
     // user remembers asking, so they make the best jump targets.
