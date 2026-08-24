@@ -1465,8 +1465,13 @@ def test_cancelled_turn_snapshot_survives_reload_export_and_delete(
         assert second.status_code == 200, second.text
         assert second.json()["messages"] == messages
 
-        exported = client.get(
-            f"/api/chat/sessions/{sid}/export?token={TEST_TOKEN}")
+        ticket = client.post(
+            "/api/chat/resource-ticket",
+            headers=auth,
+            json={"resource": "export", "session_id": sid},
+        )
+        assert ticket.status_code == 200, ticket.text
+        exported = client.get(ticket.json()["url"])
         assert exported.status_code == 200, exported.text
         assert "keep this interrupted prompt" in exported.text
         assert "partial assistant text" in exported.text
@@ -2922,3 +2927,93 @@ def test_native_compact_returns_after_verification_and_schedules_recount(
     assert scheduled
     assert scheduled[0][0] == sid
     assert scheduled[0][2]["totalTokens"] == 50_000
+
+
+@pytest.mark.parametrize("owner_state", ["absent", "pre_cancelled", "hung"])
+@pytest.mark.asyncio
+async def test_force_stop_finalizes_attachments_for_every_owner_state(
+    chat_mod,
+    monkeypatch,
+    owner_state,
+):
+    sid = f"force-attachment-{owner_state}"
+    aid = f"force-aid-{owner_state}"
+    entry = {
+        "kind": "text",
+        "mime": "text/plain",
+        "name": "force.txt",
+        "raw": b"force",
+        "text": "force",
+        "ts": chat_mod.time.time(),
+    }
+    with chat_mod._image_store_lock:
+        chat_mod._image_store[aid] = entry
+    lease, _missing, _busy = chat_mod._lease_staged_attachments(
+        aid, require_all=True)
+    broadcast = chat_mod.TurnBroadcast(sid)
+    broadcast._attachment_lease = lease
+    artifact = (
+        chat_mod._attachments_base() / sid / f"{aid}-force.txt")
+    artifact.parent.mkdir(parents=True, exist_ok=True)
+    artifact.write_bytes(b"artifact")
+    broadcast._prepared_attachments = (
+        chat_mod._PreparedStagedAttachments(
+            artifact_paths=[str(artifact)])
+    )
+    owner_release = asyncio.Event()
+    owner = None
+
+    async def ignore_cancel_until_released():
+        while not owner_release.is_set():
+            try:
+                await owner_release.wait()
+            except asyncio.CancelledError:
+                continue
+
+    if owner_state == "pre_cancelled":
+        owner = asyncio.create_task(asyncio.Event().wait())
+        owner.cancel()
+        await asyncio.gather(owner, return_exceptions=True)
+        broadcast.task = owner
+    elif owner_state == "hung":
+        owner = asyncio.create_task(ignore_cancel_until_released())
+        broadcast.task = owner
+        await asyncio.sleep(0)
+
+    disconnect_release = asyncio.Event()
+
+    async def stuck_disconnect(_sid):
+        await disconnect_release.wait()
+
+    monkeypatch.setattr(chat_mod, "disconnect_client", stuck_disconnect)
+    monkeypatch.setattr(
+        chat_mod, "_INTERRUPT_FORCE_OWNER_JOIN_S", 0.01)
+    monkeypatch.setattr(
+        chat_mod, "_INTERRUPT_FORCE_DISCONNECT_JOIN_S", 0.01)
+    monkeypatch.setattr(
+        chat_mod, "_persist_cancelled_turn_snapshot",
+        lambda _broadcast: True,
+    )
+    chat_mod._active_turns[sid] = broadcast
+    try:
+        await chat_mod._force_stop_after_grace(
+            sid, broadcast, grace=0.001)
+        assert sid not in chat_mod._active_turns
+        assert broadcast.done is True
+        assert not artifact.exists()
+        assert chat_mod._image_store.get(aid) is entry
+        assert aid not in chat_mod._staged_attachment_claims
+        assert lease.state == "released"
+    finally:
+        owner_release.set()
+        disconnect_release.set()
+        if owner is not None:
+            await asyncio.gather(owner, return_exceptions=True)
+        for _ in range(100):
+            if not chat_mod._maintenance_tasks:
+                break
+            await asyncio.sleep(0.01)
+        chat_mod._active_turns.pop(sid, None)
+        with chat_mod._image_store_lock:
+            chat_mod._image_store.pop(aid, None)
+            chat_mod._staged_attachment_claims.pop(aid, None)

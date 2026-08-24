@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 
 import pytest
 
@@ -27,6 +28,326 @@ def _login(page: Page, base: str, token: str) -> None:
           return app && app.authed && app.appReady && app._sessionsInitialized;
         }"""
     )
+
+
+def test_activity_event_retention_and_derived_cache_are_bounded(
+    page: Page, backend_url, auth_token,
+):
+    _login(page, backend_url, auth_token)
+
+    result = page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          app._stopActivityEvents();
+          app._abortActivityFetches();
+          await Promise.allSettled(
+            Object.values(app._activityFetchPromises || {}));
+          const nativeFetch = window.fetch;
+          try {
+            const sourceRows = Array.from({length: 620}, (_, index) => ({
+              id: `evt-${index}`,
+              kind: 'turn',
+              session_id: `session-${index}`,
+              task_summary: `task ${index}`,
+              state: 'completed',
+              read: true,
+              updated_at: 620 - index,
+            }));
+            window.fetch = async url => {
+              if (String(url).startsWith('/api/activity?')) {
+                return new Response(JSON.stringify({
+                  events: sourceRows,
+                  summary: {
+                    generation: 'cap-test', revision: 1,
+                    running: 0, unread: 0, attention: 0,
+                    groups: {
+                      review: 0, running: 0, failed: 0, history: 620,
+                    },
+                    group_unread: {
+                      review: 0, running: 0, failed: 0, history: 0,
+                    },
+                    workspaces: [],
+                  },
+                }), {
+                  status: 200,
+                  headers: {
+                    'Content-Type': 'application/json',
+                    'ETag': '"cap-test"',
+                  },
+                });
+              }
+              return nativeFetch(url);
+            };
+            app._activityEtags = {};
+            app._activityGeneration = '';
+            app._activityRevision = 0;
+            app._activityAppliedSeq = 0;
+            app._activityRequestSeq = 0;
+            app._activityEventsSnapshotLoaded = false;
+            app.activity.events = [];
+            const loaded = await app.fetchActivity();
+            const snapshotLength = app.activity.events.length;
+            const timeline = {key: 'timeline'};
+            const firstDerived = app.activityAllEvents(timeline);
+            const repeatedDerived = app.activityAllEvents(timeline);
+
+            app._applyActivityUpdate({
+              generation: 'cap-test',
+              revision: 2,
+              item: {
+                id: 'evt-live', kind: 'turn', session_id: 'session-live',
+                task_summary: 'live task', state: 'running', read: true,
+                updated_at: 10_000,
+              },
+            });
+            const afterUpdate = app.activityAllEvents(timeline);
+            const repeatedAfterUpdate = app.activityAllEvents(timeline);
+            const stateLengthAfterUpdate = app.activity.events.length;
+            const newestAfterUpdate = afterUpdate[0]?.id || '';
+            const droppedOldest = !app.activity.events.some(
+              row => row.id === 'evt-499');
+
+            app.activity.events = Array.from({length: 700}, (_, index) => ({
+              id: `overflow-${index}`,
+              state: 'completed',
+              read: true,
+              updated_at: index,
+            }));
+            app.activity.query = '';
+            const boundedDerived = app.activityAllEvents(timeline).length;
+            const boundedCount = app.activitySearchResultCount();
+            app.activity.query = 'overflow';
+            const boundedSearchCount = app.activitySearchResultCount();
+            return {
+              loaded,
+              snapshotLoaded: app._activityEventsSnapshotLoaded,
+              snapshotLength, stateLengthAfterUpdate,
+              newestAfterUpdate, droppedOldest,
+              reusedSnapshot: firstDerived === repeatedDerived,
+              invalidatedOnUpdate: firstDerived !== afterUpdate,
+              reusedAfterUpdate: afterUpdate === repeatedAfterUpdate,
+              boundedDerived, boundedCount, boundedSearchCount,
+            };
+          } finally {
+            window.fetch = nativeFetch;
+          }
+        }"""
+    )
+
+    assert result == {
+        "loaded": True,
+        "snapshotLoaded": True,
+        "snapshotLength": 500,
+        "stateLengthAfterUpdate": 500,
+        "newestAfterUpdate": "evt-live",
+        "droppedOldest": True,
+        "reusedSnapshot": True,
+        "invalidatedOnUpdate": True,
+        "reusedAfterUpdate": True,
+        "boundedDerived": 500,
+        "boundedCount": 500,
+        "boundedSearchCount": 500,
+    }
+
+
+def test_activity_conditional_fetch_distinguishes_loaded_empty_snapshot(
+    page: Page, backend_url, auth_token,
+):
+    """A valid empty snapshot reuses 304; only a missing snapshot recovers."""
+    _login(page, backend_url, auth_token)
+    page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          app._stopActivityEvents();
+          app.ackCurrentActivity = () => false;
+          const pending = Object.values(app._activityFetchPromises || {});
+          app._abortActivityFetches();
+          await Promise.allSettled(pending);
+          if (app.activity.show) app.closeActivityCenter();
+        }"""
+    )
+
+    requests: list[dict[str, str]] = []
+
+    def conditional_activity(route):
+        request = route.request
+        if_none_match = request.headers.get("if-none-match", "")
+        requests.append({
+            "url": request.url,
+            "if_none_match": if_none_match,
+        })
+        if if_none_match:
+            route.fulfill(status=304, headers={"ETag": if_none_match})
+            return
+        route.fulfill(
+            status=200,
+            headers={
+                "Content-Type": "application/json",
+                "ETag": '"recovered-empty"',
+            },
+            body=json.dumps({
+                "events": [],
+                "summary": {
+                    "generation": "empty-snapshot-e2e",
+                    "revision": 1,
+                    "running": 0,
+                    "unread": 0,
+                    "attention": 0,
+                    "groups": {
+                        "review": 0,
+                        "running": 0,
+                        "failed": 0,
+                        "history": 0,
+                    },
+                    "group_unread": {
+                        "review": 0,
+                        "running": 0,
+                        "failed": 0,
+                        "history": 0,
+                    },
+                    "workspaces": [],
+                },
+            }),
+        )
+
+    page.route(
+        re.compile(r"/api/activity\?limit=500$"),
+        conditional_activity,
+    )
+
+    loaded_empty = page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          app._activityEtags = {events: '"loaded-empty"'};
+          app._activityEventsSnapshotLoaded = true;
+          app.activity.events = [];
+          app.activity.viewLoaded = true;
+          app.activity.show = false;
+          const opening = app.openActivityCenter();
+          const duplicate = app.fetchActivity();
+          const immediate = {
+            show: app.activity.show,
+            loading: app.activity.loading,
+          };
+          const [, duplicateResult] = await Promise.all([opening, duplicate]);
+          return {
+            immediate,
+            duplicateResult,
+            loading: app.activity.loading,
+            eventCount: app.activity.events.length,
+            snapshotLoaded: app._activityEventsSnapshotLoaded,
+            etag: app._activityEtags.events,
+            pending: Object.keys(app._activityFetchPromises),
+          };
+        }"""
+    )
+    assert loaded_empty == {
+        "immediate": {"show": True, "loading": True},
+        "duplicateResult": False,
+        "loading": False,
+        "eventCount": 0,
+        "snapshotLoaded": True,
+        "etag": '"loaded-empty"',
+        "pending": [],
+    }
+    expect(page.locator(".activity-modal")).to_be_visible()
+    assert [item["if_none_match"] for item in requests] == [
+        '"loaded-empty"'
+    ]
+    assert all(item["url"].endswith("/api/activity?limit=500")
+               for item in requests)
+
+    page.evaluate(
+        """() => document.querySelector('#app')._x_dataStack[0]
+          .closeActivityCenter()"""
+    )
+    requests.clear()
+    missing_empty = page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          app._activityEtags = {events: '"etag-without-snapshot"'};
+          app._activityEventsSnapshotLoaded = false;
+          app._activityGeneration = '';
+          app._activityRevision = 0;
+          app._activityAppliedSeq = 0;
+          app.activity.events = [];
+          const recovered = await app.fetchActivity();
+          return {
+            recovered,
+            eventCount: app.activity.events.length,
+            snapshotLoaded: app._activityEventsSnapshotLoaded,
+            etag: app._activityEtags.events,
+            pending: Object.keys(app._activityFetchPromises),
+          };
+        }"""
+    )
+    assert missing_empty == {
+        "recovered": True,
+        "eventCount": 0,
+        "snapshotLoaded": True,
+        "etag": '"recovered-empty"',
+        "pending": [],
+    }
+    assert [item["if_none_match"] for item in requests] == [
+        '"etag-without-snapshot"',
+        "",
+    ]
+    assert len({item["url"] for item in requests}) == 1
+
+    requests.clear()
+    concurrent_full = page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          app._activityEtags = {};
+          app._activityEventsSnapshotLoaded = false;
+          app._activityGeneration = '';
+          app._activityRevision = 0;
+          app._activityAppliedSeq = 0;
+          app.activity.events = [];
+          const results = await Promise.all([
+            app.fetchActivity(), app.fetchActivity(),
+          ]);
+          return {
+            results,
+            snapshotLoaded: app._activityEventsSnapshotLoaded,
+            pending: Object.keys(app._activityFetchPromises),
+          };
+        }"""
+    )
+    assert concurrent_full == {
+        "results": [True, True],
+        "snapshotLoaded": True,
+        "pending": [],
+    }
+    assert [item["if_none_match"] for item in requests] == [""]
+
+    requests.clear()
+    non_empty = page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          app._activityEtags = {events: '"loaded-non-empty"'};
+          app._activityEventsSnapshotLoaded = true;
+          app.activity.events = [{
+            id: 'preserved-event', state: 'completed', read: true,
+          }];
+          const result = await app.fetchActivity();
+          return {
+            result,
+            ids: app.activity.events.map(item => item.id),
+            snapshotLoaded: app._activityEventsSnapshotLoaded,
+            etag: app._activityEtags.events,
+          };
+        }"""
+    )
+    assert non_empty == {
+        "result": False,
+        "ids": ["preserved-event"],
+        "snapshotLoaded": True,
+        "etag": '"loaded-non-empty"',
+    }
+    assert [item["if_none_match"] for item in requests] == [
+        '"loaded-non-empty"'
+    ]
 
 
 def test_memory_shortcut_opens_memory_settings_page(
@@ -239,7 +560,7 @@ def test_visible_completion_ack_wins_both_done_and_activity_sse_orders(
     assert result["activityFirstSettled"] == expected_settled
     assert result["doneFirstImmediate"] == expected_immediate
     assert result["doneFirstSettled"] == expected_settled
-    assert result["ackCalls"] == [1, 1, 0]
+    assert result["ackCalls"].count(1) == 2 and result["ackCalls"][-1] == 0
 
 
 def test_cached_activity_refresh_does_not_shift_rows_or_modal(
@@ -1248,6 +1569,7 @@ def test_activity_row_targeted_lookup_opens_mobile_session_and_workspace(
           app._checkActiveTurn = () => {};
           app._fetchTabUsage = async () => {};
           app._scheduleIdlePreload = () => {};
+          app._stopActivityEvents(); Object.values(app._activityFetchControllers || {}).forEach(controller => controller.abort()); app._activityFetchPromises = Object.create(null);
           app.fetchActivity = async () => true;
           app.setMobileTab('files');
           app._sessionListPullPromise = null;

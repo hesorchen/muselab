@@ -421,11 +421,16 @@
                 @click="switchTab(t.path, { reveal: true })"
                 @contextmenu.prevent="showPreviewTabMenu($event, t.path)"
                 :title="t.path">
-              <span class="icon"><svg><use :href="iconRef({name: t.name, is_dir: false})"/></svg></span>
-              <span class="name" x-text="t.name"></span>
-              <span class="tab-dirty" x-show="selected===t.path && _editorDirty()"
-                    :title="lang==='zh'?'有未保存的改动':'Unsaved changes'"></span>
-              <button class="open-files-x"
+              <button type="button" class="open-files-main"
+                      @click.stop="switchTab(t.path, { reveal: true })"
+                      :aria-current="selected === t.path ? 'page' : null"
+                      :aria-label="(lang==='zh' ? '打开文件：' : 'Open file: ') + t.name">
+                <span class="icon"><svg><use :href="iconRef({name: t.name, is_dir: false})"/></svg></span>
+                <span class="name" x-text="t.name"></span>
+                <span class="tab-dirty" x-show="selected===t.path && _editorDirty()"
+                      :title="lang==='zh'?'有未保存的改动':'Unsaved changes'"></span>
+              </button>
+              <button type="button" class="open-files-x"
                       @click.stop="closeTab(t.path)"
                       :title="lang==='zh'?'关闭':'Close'">×</button>
             </li>
@@ -478,10 +483,13 @@
           </span>
         </div>
       <ul class="filelist" x-ref="fileList"
+          role="tree"
+          :aria-label="lang==='zh' ? '工作区文件树' : 'Workspace file tree'"
           x-init="_attachPTR($el, () => reloadTree()); $nextTick(() => _syncFileTreeViewport($el))"
           @scroll.passive="onFileTreeScroll($event)"
           @mousedown="onMarqueeStart($event)">
         <li class="filelist-virtual-spacer" aria-hidden="true"
+            role="none"
             :style="`height:${fileTreeTopSpacer()}px`"></li>
         <template x-for="n in fileTreeWindowRows()" :key="n.path">
           <li :class="{file: !n.is_dir, dir: n.is_dir, sel: isRowSelected(n), 'drag-over': dragOver===n.path}"
@@ -489,6 +497,14 @@
               :data-path="n.path"
               :data-depth="n.depth"
               :data-ext="fileExtClass(n)"
+              role="treeitem"
+              :aria-label="n.name"
+              :aria-level="n.depth + 1"
+              :aria-expanded="n.is_dir ? expanded.has(n.path) : null"
+              :aria-selected="isRowSelected(n)"
+              :tabindex="treeRowTabIndex(n)"
+              @focus="onTreeRowFocus(n)"
+              @keydown="onTreeRowKeydown($event, n)"
               :draggable="isPointerDevice && isRowSelected(n)"
               @dragstart="onTreeNodeDragStart($event, n)"
               @dragend="dragOver=''; dragOverRoot=false; _dragSrcPath=null; _dragSrcPaths=null"
@@ -534,6 +550,7 @@
           </li>
         </template>
         <li class="filelist-virtual-spacer" aria-hidden="true"
+            role="none"
             :style="`height:${fileTreeBottomSpacer()}px`"></li>
         <li class="filelist-status" x-show="treeLoading && !visible.length"
             aria-live="polite">
@@ -869,12 +886,17 @@
         <template x-for="term in terminals" :key="'terminal-'+term.id">
           <div class="tab terminal-tab"
                :class="{active: previewSurface==='terminal' && activeTerminalId===term.id}"
-               @click="openTerminal(term.id)"
-               :title="term.cwd">
-            <span class="terminal-status-dot" :class="term.status"></span>
-            <span class="terminal-glyph">&gt;_</span>
-            <span class="tab-name" x-text="term.name"></span>
-            <button class="tab-close" @click.stop="closeTerminal(term.id)"
+               @click="openTerminal(term.id)">
+            <button type="button" class="tab-main"
+                    @click.stop="openTerminal(term.id)"
+                    :aria-current="previewSurface==='terminal' && activeTerminalId===term.id ? 'page' : null"
+                    :aria-label="(lang==='zh' ? '打开终端：' : 'Open terminal: ') + term.name"
+                    :title="term.cwd">
+              <span class="terminal-status-dot" :class="term.status"></span>
+              <span class="terminal-glyph">&gt;_</span>
+              <span class="tab-name" x-text="term.name"></span>
+            </button>
+            <button type="button" class="tab-close" @click.stop="closeTerminal(term.id)"
                     :title="lang==='zh'?'关闭终端':'Close terminal'">×</button>
           </div>
         </template>
@@ -892,14 +914,20 @@
                @contextmenu.prevent="showPreviewTabMenu($event, t.path)"
                @auxclick.prevent="onPreviewTabAuxClick($event, t.path)"
                :title="t.path">
-            <span class="icon"><svg><use :href="iconRef({name: t.name, is_dir: false})"/></svg></span>
-            <span class="tab-name" x-text="t.name"></span>
+            <button type="button" class="tab-main"
+                    @click.stop="switchTab(t.path, { reveal: true })"
+                    :aria-current="previewSurface==='file' && selected===t.path ? 'page' : null"
+                    :aria-label="(lang==='zh' ? '打开文件标签：' : 'Open file tab: ') + t.name"
+                    :title="t.path">
+              <span class="icon"><svg><use :href="iconRef({name: t.name, is_dir: false})"/></svg></span>
+              <span class="tab-name" x-text="t.name"></span>
+            </button>
             <!-- Unsaved-edits dot: only the currently-open file can be edited
                  (single editing buffer keyed by `selected`), so the dot tracks
                  selected===t.path && dirty. -->
             <span class="tab-dirty" x-show="selected===t.path && _editorDirty()"
                   :title="lang==='zh'?'有未保存的改动':'Unsaved changes'"></span>
-            <button class="tab-close" @click.stop="closeTab(t.path)" :title="lang==='zh'?'关闭（中键也可）':'Close (middle-click also)'">×</button>
+            <button type="button" class="tab-close" @click.stop="closeTab(t.path)" :title="lang==='zh'?'关闭（中键也可）':'Close (middle-click also)'">×</button>
           </div>
         </template>
         </div>
@@ -2016,7 +2044,7 @@
                                  and triggers a real network request that fails (was firing
                                  [muse-capture] resource-load-failed errors in console). -->
                             <span class="user-msg-img-wrap">
-                              <template x-if="im.preview || im.thumb || im.url">
+                              <template x-if="messageImageSrc(im)">
                                 <!-- in-bubble thumbnail prefers preview (live blob URL,
                                      freshest) > thumb (base64 thumbnail in JSONL); only
                                      falls back to full url if neither is available.
@@ -2024,17 +2052,14 @@
                                      served from disk) > preview > thumb — that's the
                                      fix for "click to enlarge shows blurry upscale". -->
                                 <img class="user-msg-img"
-                                     :src="im.preview || (im.thumb ? 'data:image/jpeg;base64,' + im.thumb : (im.url ? im.url + '?token=' + encodeURIComponent(token) : ''))"
+                                     :src="messageImageSrc(im)"
                                      :alt="im.name || 'image'"
-                                     @click="openLightbox(
-                                        im.url ? im.url + '?token=' + encodeURIComponent(token)
-                                          : (im.preview || 'data:image/jpeg;base64,' + im.thumb),
-                                        im.name)"
+                                     @click="openMessageImage(im)"
                                      :title="lang==='zh'?'点击放大':'Click to enlarge'"
                                      @error="$el.style.display='none'; $el.nextElementSibling && ($el.nextElementSibling.style.display='inline-flex')" />
                               </template>
                               <span class="user-msg-img-placeholder"
-                                    :style="(im.preview || im.thumb) ? 'display:none' : 'display:inline-flex'"
+                                    :style="messageImageSrc(im) ? 'display:none' : 'display:inline-flex'"
                                     :title="im.mime || 'image'">
                                 <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
                               </span>
@@ -3010,7 +3035,8 @@
                        Expired uploads (TTL) show a muted "附件已过期" chip. -->
                   <div class="queued-attach" x-show="q.hasAttach">
                     <template x-for="(im, ii) in (q.images || [])" :key="'qimg'+ii">
-                      <img class="queued-thumb" :src="im.src" loading="lazy" alt=""
+                      <img class="queued-thumb" x-show="im.src"
+                           :src="im.src || null" loading="lazy" alt=""
                            @error="$el.style.display='none'" />
                     </template>
                     <template x-for="(d, di) in (q.docs || [])" :key="'qdoc'+di">
@@ -3102,8 +3128,9 @@
              pane. Same visibility rule as jump-bottom (x-show="!activeSession.atBottom")
              so the two appear/disappear together as a pair. -->
         <button class="chat-outline-fab" x-show="!activeSession.atBottom"
-                @click="msgOutlineOpen = true"
-                :title="lang==='zh' ? '会话目录' : 'Outline'">
+                @click="openMessageOutline($event)"
+                :title="lang==='zh' ? '会话目录' : 'Outline'"
+                :aria-label="lang==='zh' ? '打开会话目录' : 'Open conversation outline'">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <line x1="8" y1="6" x2="21" y2="6"/>
             <line x1="8" y1="12" x2="21" y2="12"/>
@@ -3824,22 +3851,29 @@
        desktop it centers as a normal modal. -->
   <div class="msg-outline-modal" x-show="msgOutlineOpen"
        x-transition.opacity
-       @click.self="msgOutlineOpen = false"
-       @keydown.escape.window="msgOutlineOpen = false">
-    <div class="msg-outline-panel" @click.stop>
+       @click.self="closeMessageOutline()">
+    <div class="msg-outline-panel" tabindex="-1"
+         @click.stop
+         @keydown.escape.stop.prevent="closeMessageOutline()"
+         @keydown.tab="trapDialogFocus($event, 'message-outline')"
+         role="dialog" aria-modal="true" aria-labelledby="msg-outline-title">
       <div class="msg-outline-head">
-        <span class="msg-outline-label"
+        <span id="msg-outline-title" class="msg-outline-label"
               x-text="(lang==='zh' ? '会话目录 ' : 'Outline ') + '(' + outlineMessages().length + ')'"></span>
-        <button class="msg-outline-close" @click="msgOutlineOpen = false"
-                :title="lang==='zh' ? '关闭 (Esc)' : 'Close (Esc)'">×</button>
+        <button type="button" class="msg-outline-close" @click="closeMessageOutline()"
+                :title="lang==='zh' ? '关闭 (Esc)' : 'Close (Esc)'"
+                :aria-label="lang==='zh' ? '关闭会话目录' : 'Close conversation outline'">×</button>
       </div>
       <ul class="msg-outline-list">
         <template x-for="(m, i) in outlineMessages()" :key="m.uuid || m._k || ('o-' + i)">
-          <li @click="_scrollToUserMsg(m); msgOutlineOpen = false"
-              :title="m.text || m.body || ''">
-            <span class="msg-outline-idx" x-text="'#' + (i + 1)"></span>
-            <span class="msg-outline-text ellipsis" x-text="outlineText(m)"></span>
-            <span class="msg-outline-time" x-text="m.ts ? fmtHM(m.ts) : ''"></span>
+          <li>
+            <button type="button" class="msg-outline-item"
+                    @click="_scrollToUserMsg(m); closeMessageOutline()"
+                    :title="m.text || m.body || ''">
+              <span class="msg-outline-idx" x-text="'#' + (i + 1)"></span>
+              <span class="msg-outline-text ellipsis" x-text="outlineText(m)"></span>
+              <span class="msg-outline-time" x-text="m.ts ? fmtHM(m.ts) : ''"></span>
+            </button>
           </li>
         </template>
       </ul>

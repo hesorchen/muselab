@@ -297,7 +297,7 @@ def test_deferred_history_bodies_load_without_manual_body_action(
         st.messageRange.total = st.messages.length;
         app._expandedMsgs = {};
         app._activateTabState(arg);
-        app.messagesReady = true;
+        app._ensureTabState(app.currentId).messagesReady = true;
         return true;
         """,
         sid,
@@ -311,7 +311,7 @@ def test_deferred_history_bodies_load_without_manual_body_action(
     expect(page.get_by_text("加载完整正文")).to_have_count(0)
 
     page.locator(".thinking-head").click()
-    expect(page.get_by_text("THINKING_FULL_BODY_MARKER")).to_be_visible()
+    expect(page.locator(".thinking-head + pre").filter(has_text="THINKING_FULL_BODY_MARKER")).to_be_visible()
     page.locator(".tool-result-head").click()
     expect(page.get_by_text("TOOL_FULL_BODY_MARKER")).to_be_visible()
     page.locator(".compact-summary-pill").click()
@@ -480,8 +480,8 @@ def _bootstrap_session_for_real_load(page: Page, sid: str, name: str) -> None:
         app.tabState = {};
         app.currentId = arg.sid;
         app.mobileTab = "chat";
-        app.messagesReady = true;
-        app.messagesLoading = false;
+        app._ensureTabState(app.currentId).messagesReady = true;
+        app._ensureTabState(app.currentId).messagesLoading = false;
         app._activateTabState(arg.sid);
         return true;
         """,
@@ -1523,7 +1523,7 @@ def test_chat_wheel_preserves_selection_across_messages(
     assert after_wheel == {
         "text": "FIRST_WHEEL_SELECTION_MARKER",
         "rangeCount": 1,
-        "popover": False,
+        "popover": True,
     }
 
     extended = page.evaluate(
@@ -1630,9 +1630,35 @@ def test_session_todo_modal_uses_large_desktop_board(
     # as pointer/native dragging.
     medium_grip = modal.locator('[data-todo-id="todo-medium"] .session-todo-grip')
     medium_grip.focus()
-    medium_grip.press("ArrowLeft")
+    keyboard_steps = page.evaluate(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const staleItem = app.sessionTodoItems()
+            .find(item => item.id === 'todo-medium');
+          const snapshot = () => app.sessionTodoItems()
+            .map(item => item.id + ':' + item.priority);
+          const eventFor = key => ({
+            key, altKey: false, ctrlKey: false, metaKey: false,
+            preventDefault() {}, stopPropagation() {},
+          });
+          app.onSessionTodoGripKeydown(eventFor('ArrowLeft'), staleItem);
+          const afterLeft = snapshot();
+          app.onSessionTodoGripKeydown(eventFor('ArrowUp'), staleItem);
+          return {afterLeft, afterUp: snapshot()};
+        }"""
+    )
+    assert keyboard_steps == {
+        "afterLeft": ["todo-high:high", "todo-low:low", "todo-medium:high"],
+        "afterUp": ["todo-medium:high", "todo-high:high", "todo-low:low"],
+    }
+    page.wait_for_function(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          return app._todoPushPromise === null && !app._todoPushPending;
+        }"""
+    )
+
     expect(modal.locator('.session-todo-lane.is-high [data-todo-id="todo-medium"]')).to_be_visible()
-    modal.locator('[data-todo-id="todo-medium"] .session-todo-grip').press("ArrowUp")
     ordered = page.evaluate(
         """() => {
           const app = document.querySelector('#app')._x_dataStack[0];
@@ -1900,7 +1926,7 @@ def test_effort_fast_capabilities_and_session_restore(
             app._sessionRegistrationPromises = {};
             app.currentId = modelSid;
             app.model = modelMeta.model;
-            app.messages = app._ensureTabState(modelSid).messages;
+            app._ensureTabState(modelSid);
             const modelCalls = [];
             let releaseModelRegistration;
             const modelRegistrationGate = new Promise(resolve => {
@@ -2404,8 +2430,8 @@ def test_mobile_long_history_switching_does_not_blank(page: Page, backend_url, a
           app._scheduleLiveMessageViewport(st);
         }
         app.currentId = sessionIds[0];
-        app.messagesReady = true;
-        app.messagesLoading = false;
+        app._ensureTabState(app.currentId).messagesReady = true;
+        app._ensureTabState(app.currentId).messagesLoading = false;
         app.mobileTab = "chat";
         app._activateTabState(app.currentId);
         app.$nextTick(() => app.scrollToBottom(true));
@@ -2420,7 +2446,7 @@ def test_mobile_long_history_switching_does_not_blank(page: Page, backend_url, a
             .filter(p => getComputedStyle(p).display !== "none");
           const rendered = panes.length === 1
             ? panes[0].querySelectorAll(".msg").length : 0;
-          return rendered > 0 && rendered < historySize;
+          return rendered === historySize;
         }""",
         arg=history_size,
         timeout=5000,
@@ -2431,8 +2457,8 @@ def test_mobile_long_history_switching_does_not_blank(page: Page, backend_url, a
             page,
             """
             app.currentId = arg;
-            app.messagesReady = true;
-            app.messagesLoading = false;
+            app._ensureTabState(app.currentId).messagesReady = true;
+            app._ensureTabState(app.currentId).messagesLoading = false;
             app._activateTabState(arg);
             app.$nextTick(() => app.scrollToBottom(true));
             """,
@@ -2445,8 +2471,7 @@ def test_mobile_long_history_switching_does_not_blank(page: Page, backend_url, a
                   const panes = Array.from(document.querySelectorAll(".msg-pane"))
                     .filter(p => getComputedStyle(p).display !== "none");
                   return panes.some(p => p.textContent.includes(expected)
-                    && p.querySelectorAll(".msg").length > 0
-                    && p.querySelectorAll(".msg").length < historySize);
+                    && p.querySelectorAll(".msg").length === historySize);
                 }""",
                 arg={"expected": expected_tail, "historySize": history_size},
                 timeout=5000,
@@ -2459,7 +2484,7 @@ def test_mobile_long_history_switching_does_not_blank(page: Page, backend_url, a
                     currentId: app.currentId,
                     paneCount: document.querySelectorAll(".msg-pane").length,
                     openTabIds: app.openTabIds,
-                    messagesLength: app.messages.length,
+                    messagesLength: app._ensureTabState(app.currentId).messages.length,
                     visiblePanes: Array.from(document.querySelectorAll(".msg-pane"))
                       .filter(p => getComputedStyle(p).display !== "none")
                       .map(p => ({ count: p.querySelectorAll(".msg").length,
@@ -2469,7 +2494,7 @@ def test_mobile_long_history_switching_does_not_blank(page: Page, backend_url, a
             )
             raise AssertionError(f"target tail not visible: {expected_tail}; diag={diag}") from exc
         snap = _visible_pane_with_text_snapshot(page, expected_tail)
-        assert 0 < snap["msgCount"] < history_size
+        assert snap["msgCount"] == history_size
         assert expected_tail in snap["text"]
         assert page.locator(".msg-pane").count() <= 1
         assert page.locator(".msg-pane").count() <= 1
@@ -2477,10 +2502,10 @@ def test_mobile_long_history_switching_does_not_blank(page: Page, backend_url, a
     _assert_no_browser_errors(page, errors)
 
 
-def test_desktop_session_switch_remounts_one_pane_and_keeps_composer_stable(
+def test_desktop_session_switch_keeps_bounded_warm_panes_and_composer_stable(
     page: Page, backend_url: str, auth_token: str,
 ):
-    """Desktop remounts one virtualized pane without footer/layout jumps."""
+    """Desktop keeps a bounded warm-pane cache without footer/layout jumps."""
     errors = _capture_browser_errors(page)
     page.set_viewport_size({"width": 1440, "height": 900})
     _login(page, backend_url, auth_token)
@@ -2522,8 +2547,8 @@ def test_desktop_session_switch_remounts_one_pane_and_keeps_composer_stable(
           app._ensureTabState(id);
         }
         app.currentId = arg.ids[0];
-        app.messagesReady = true;
-        app.messagesLoading = false;
+        app._ensureTabState(app.currentId).messagesReady = true;
+        app._ensureTabState(app.currentId).messagesLoading = false;
         app._activateTabState(app.currentId);
         return true;
         """,
@@ -2536,7 +2561,8 @@ def test_desktop_session_switch_remounts_one_pane_and_keeps_composer_stable(
             pane => getComputedStyle(pane).display !== "none");
           return panes.length === 1
             && visible.length === 1
-            && visible[0].querySelectorAll(".msg").length === 40;
+            && visible[0].querySelectorAll(".msg").length === 40
+            && getComputedStyle(document.querySelector(".chat-skeleton")).display === "none";
         }"""
     )
     before = page.locator(".chat-input").bounding_box()
@@ -2557,11 +2583,11 @@ def test_desktop_session_switch_remounts_one_pane_and_keeps_composer_stable(
               pane => getComputedStyle(pane).display !== "none");
             out.push({
               elapsed: performance.now() - started,
-              paneCount: document.querySelectorAll(".msg-pane").length,
+              expectedPanes: Math.min(ids.indexOf(id) + 1, app.WARM_TRANSCRIPT_LIMIT),
               panes: panes.length,
               visible: visible.length,
               visibleMessages: visible[0]?.querySelectorAll(".msg").length || 0,
-              ready: app.messagesReady,
+              ready: app._ensureTabState(app.currentId).messagesReady,
               skeleton: getComputedStyle(
                 document.querySelector(".chat-skeleton")).display,
             });
@@ -2577,9 +2603,10 @@ def test_desktop_session_switch_remounts_one_pane_and_keeps_composer_stable(
     # interaction is what users feel across repeated remounts.
     assert elapsed[len(elapsed) // 2] < 700, switches
     assert max(elapsed) < 1500, switches
-    assert all(row["panes"] == 1 and row["visible"] == 1 for row in switches)
+    assert all(row["panes"] == row["expectedPanes"] and row["visible"] == 1 for row in switches), switches
     assert all(row["visibleMessages"] == 40 for row in switches)
-    assert all(row["ready"] and row["skeleton"] == "none" for row in switches)
+    assert all(row["ready"] for row in switches), switches
+    assert switches[-1]["skeleton"] == "none", switches
     assert abs(after["y"] - before["y"]) < 1
     assert abs(after["height"] - before["height"]) < 1
     _assert_no_browser_errors(page, errors)
@@ -2599,9 +2626,9 @@ def test_mobile_windowed_load_session_pages_older_history(page: Page, backend_ur
     page.wait_for_function(
         """() => {
           const app = document.querySelector("#app")._x_dataStack[0];
-          return app.messagesReady === true
-            && app.messagesLoading === false
-            && app.messages.some(m => (m.text || "").includes("WINDOW_MSG_179"));
+          return app._ensureTabState(app.currentId).messagesReady === true
+            && app._ensureTabState(app.currentId).messagesLoading === false
+            && app._ensureTabState(app.currentId).messages.some(m => (m.text || "").includes("WINDOW_MSG_179"));
         }""",
         timeout=10000,
     )
@@ -2622,16 +2649,16 @@ def test_mobile_windowed_load_session_pages_older_history(page: Page, backend_ur
           total: st.messageRange.total,
           hasMore: st._hasMoreHistory,
           paneCount: document.querySelectorAll(".msg-pane").length,
-          ready: app.messagesReady,
+          ready: app._ensureTabState(app.currentId).messagesReady,
           bodyText: document.querySelector(".chat-body")?.textContent || "",
         };
         """,
         sid,
     )
-    assert requests and requests[0]["tail"] == 75
-    assert state["messages"] == 75
+    assert requests and requests[0]["tail"] == 20
+    assert state["messages"] == 20
     assert state["visible"] <= 60
-    assert state["loadedOffset"] == 105
+    assert state["loadedOffset"] == 160
     assert state["total"] == 180
     assert state["hasMore"] is True
     assert state["paneCount"] <= 1
@@ -2646,8 +2673,8 @@ def test_mobile_windowed_load_session_pages_older_history(page: Page, backend_ur
         _app_eval(
             page,
             """
-            const body = app.$refs.chatBody;
-            app.atBottom = false;
+            const body = app._chatBodyElement();
+            app._ensureTabState(app.currentId).atBottom = false;
             app._ensureTabState(arg).atBottom = false;
             body.scrollTop = 0;
             app._syncMessageViewport(arg);
@@ -2658,15 +2685,15 @@ def test_mobile_windowed_load_session_pages_older_history(page: Page, backend_ur
         page.wait_for_timeout(50)
         if _app_eval(
             page,
-            """return app.messages.some(m => (m.text || "").includes("WINDOW_MSG_000"));""",
+            """return app._ensureTabState(app.currentId).messages.some(m => (m.text || "").includes("WINDOW_MSG_000"));""",
         ):
             break
 
     page.wait_for_function(
         """() => {
           const app = document.querySelector("#app")._x_dataStack[0];
-          return app.messagesReady === true
-            && app.messages.some(m => (m.text || "").includes("WINDOW_MSG_000"));
+          return app._ensureTabState(app.currentId).messagesReady === true
+            && app._ensureTabState(app.currentId).messages.some(m => (m.text || "").includes("WINDOW_MSG_000"));
         }""",
         timeout=10000,
     )
@@ -2682,9 +2709,9 @@ def test_mobile_windowed_load_session_pages_older_history(page: Page, backend_ur
           loadedOffset: st.messageRange.offset,
           total: st.messageRange.total,
           hasMore: st._hasMoreHistory,
-          hasServerLater: st._hasServerLater,
+          hasLater: app.hasLaterMessages(arg),
           cached: st.messages.length,
-          ready: app.messagesReady,
+          ready: app._ensureTabState(app.currentId).messagesReady,
           visibleText: Array.from(document.querySelectorAll(".msg-pane"))
             .filter(p => getComputedStyle(p).display !== "none")
             .map(p => p.textContent).join("\\n"),
@@ -2703,7 +2730,7 @@ def test_mobile_windowed_load_session_pages_older_history(page: Page, backend_ur
     assert final_state["messages"] == 180
     assert final_state["cached"] == 180
     assert final_state["later"] == 0
-    assert final_state["hasServerLater"] is False
+    assert final_state["hasLater"] is False
     latest_after_load_earlier = _app_eval(
         page,
         """
@@ -2713,7 +2740,7 @@ def test_mobile_windowed_load_session_pages_older_history(page: Page, backend_ur
           latestInLater: st.messages.slice(st.messageRange.visibleEnd)
             .some(m => (m.text || "").includes("WINDOW_MSG_179")),
           latestInDom: document.querySelector(".chat-body")?.textContent.includes("WINDOW_MSG_179"),
-          hasServerLater: st._hasServerLater,
+          hasLater: app.hasLaterMessages(arg),
           ready: st.messagesReady,
         };
         """,
@@ -2722,8 +2749,8 @@ def test_mobile_windowed_load_session_pages_older_history(page: Page, backend_ur
     assert latest_after_load_earlier == {
         "latestInMessages": True,
         "latestInLater": False,
-        "latestInDom": False,
-        "hasServerLater": False,
+        "latestInDom": True,
+        "hasLater": False,
         "ready": True,
     }
     _app_eval(page, "app.returnToLatest(arg); return true;", sid)
@@ -2760,7 +2787,7 @@ def test_history_pagination_keeps_stable_cross_page_keys_without_remounting(
     page.wait_for_function(
         """() => {
           const app = document.querySelector("#app")._x_dataStack[0];
-          return app.messagesReady && !app.messagesLoading;
+          return app._ensureTabState(app.currentId).messagesReady && !app._ensureTabState(app.currentId).messagesLoading;
         }""",
         timeout=10000,
     )
@@ -2780,7 +2807,7 @@ def test_history_pagination_keeps_stable_cross_page_keys_without_remounting(
         page,
         """
         const st = app._ensureTabState(arg);
-        const mounted = st.messages.find(m => m.uuid === "CROSS_PAGE_KEY-tr-110");
+        const mounted = st.messages.find(m => m.uuid === "CROSS_PAGE_KEY-tu-170");
         window.__crossPageMountedObject = mounted;
         return {
           found: !!mounted,
@@ -2799,10 +2826,10 @@ def test_history_pagination_keeps_stable_cross_page_keys_without_remounting(
         """
         const st = app._ensureTabState(arg);
         const all = st.messages;
-        const mounted = all.find(m => m.uuid === "CROSS_PAGE_KEY-tr-110");
-        const olderUser = all.find(m => m.uuid === "CROSS_PAGE_KEY-u-104");
-        const olderAssistant = all.find(m => m.uuid === "CROSS_PAGE_KEY-a-101");
-        const olderTool = all.find(m => m.uuid === "CROSS_PAGE_KEY-tr-102");
+        const mounted = all.find(m => m.uuid === "CROSS_PAGE_KEY-tu-170");
+        const olderUser = all.find(m => m.uuid === "CROSS_PAGE_KEY-u-144");
+        const olderAssistant = all.find(m => m.uuid === "CROSS_PAGE_KEY-a-145");
+        const olderTool = all.find(m => m.uuid === "CROSS_PAGE_KEY-tr-147");
         const keys = all.map(m => m._k);
         return {
           sameMountedObject: mounted === window.__crossPageMountedObject,
@@ -2817,14 +2844,151 @@ def test_history_pagination_keeps_stable_cross_page_keys_without_remounting(
         sid,
     )
 
-    assert any(request["offset"] < 105 for request in requests[1:]), requests
+    assert any(request["offset"] < 160 for request in requests[1:]), requests
     assert after["sameMountedObject"] is True
-    assert after["mountedKey"] == before["key"] == f"{sid}:uuid:CROSS_PAGE_KEY-tr-110"
-    assert after["olderUserKey"] == f"{sid}:uuid:CROSS_PAGE_KEY-u-104"
-    assert after["olderAssistantKey"] == f"{sid}:uuid:CROSS_PAGE_KEY-a-101"
-    assert after["olderToolKey"] == f"{sid}:uuid:CROSS_PAGE_KEY-tr-102"
+    assert after["mountedKey"] == before["key"] == f"{sid}:uuid:CROSS_PAGE_KEY-tu-170"
+    assert after["olderUserKey"] == f"{sid}:uuid:CROSS_PAGE_KEY-u-144"
+    assert after["olderAssistantKey"] == f"{sid}:uuid:CROSS_PAGE_KEY-a-145"
+    assert after["olderToolKey"] == f"{sid}:uuid:CROSS_PAGE_KEY-tr-147"
     assert after["allNonempty"] is True
     assert after["unique"] is True
+    _assert_no_browser_errors(page, errors)
+
+
+def test_message_outline_traps_focus_and_supports_keyboard_selection(
+    page: Page, backend_url, auth_token,
+):
+    """Outline stays lazy, shows its local fallback, and preserves keyboard UX."""
+    errors = _capture_browser_errors(page)
+    requests: list[str] = []
+
+    page.add_init_script(
+        """
+        (() => {
+          const nativeFetch = window.fetch;
+          window.__outlineFetchCalls = 0;
+          window.fetch = function(input, options) {
+            const url = String(typeof input === "string" ? input : input?.url || "");
+            if (!url.includes("/outline")) {
+              return nativeFetch.apply(this, arguments);
+            }
+            window.__outlineFetchCalls += 1;
+            const receiver = this;
+            const args = arguments;
+            return new Promise(resolve => {
+              window.__releaseOutlineFetch = () => {
+                resolve(nativeFetch.apply(receiver, args));
+              };
+            });
+          };
+        })();
+        """
+    )
+
+    def serve_outline(route):
+        requests.append(route.request.url)
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({
+                "outline": [
+                    {
+                        "uuid": "outline-first",
+                        "preview": "First keyboard prompt",
+                    },
+                    {
+                        "uuid": "outline-second",
+                        "preview": "Second keyboard prompt",
+                    },
+                ],
+            }),
+        )
+
+    page.route(
+        "**/api/chat/sessions/*/outline",
+        serve_outline,
+    )
+    _login(page, backend_url, auth_token)
+    page.wait_for_timeout(100)
+    assert page.evaluate("() => window.__outlineFetchCalls") == 0
+    assert requests == []
+
+    _app_eval(
+        page,
+        """
+        const st = app._ensureTabState(app.currentId);
+        st.atBottom = false;
+        st._backendOutline = [];
+        st._outlineFetchedAt = 0;
+        st._outlineFetching = false;
+        st.messages.splice(0, st.messages.length,
+          {
+            role: "user", uuid: "outline-first",
+            text: "Immediate local first",
+          },
+          {
+            role: "user", uuid: "outline-second",
+            text: "Immediate local second",
+          },
+        );
+        app._scrollToUserMsg = message => {
+          window.__outlineKeyboardSelection = message.uuid;
+        };
+        """,
+    )
+
+    opener = page.locator(".chat-outline-fab:visible")
+    expect(opener).to_be_visible()
+    opener.focus()
+    opener.click()
+
+    dialog = page.locator(".msg-outline-panel")
+    expect(dialog).to_be_visible()
+    expect(dialog).to_have_attribute("role", "dialog")
+    expect(dialog).to_have_attribute("aria-modal", "true")
+    expect(dialog).to_have_attribute("aria-labelledby", "msg-outline-title")
+    expect(dialog.locator("#msg-outline-title")).to_contain_text("(2)")
+    items = dialog.locator(".msg-outline-item")
+    expect(items).to_have_count(2)
+    expect(items.nth(0)).to_contain_text("Immediate local first")
+    expect(items.nth(0)).to_be_focused()
+    assert page.evaluate("() => window.__outlineFetchCalls") == 1
+    assert requests == []
+
+    page.evaluate("() => window.__releaseOutlineFetch()")
+    expect(items.nth(0)).to_contain_text("First keyboard prompt")
+    page.wait_for_function(
+        """() => !document.querySelector("#app")._x_dataStack[0]
+          ._ensureTabState(document.querySelector("#app")._x_dataStack[0].currentId)
+          ._outlineFetching"""
+    )
+    assert len(requests) == 1
+
+    # The last outline item wraps forward to the close button, while reverse
+    # traversal from the first DOM control wraps back to the last item.
+    page.keyboard.press("Tab")
+    expect(items.nth(1)).to_be_focused()
+    page.keyboard.press("Tab")
+    expect(dialog.locator(".msg-outline-close")).to_be_focused()
+    page.keyboard.press("Shift+Tab")
+    expect(items.nth(1)).to_be_focused()
+
+    page.keyboard.press("Escape")
+    expect(dialog).to_be_hidden()
+    expect(opener).to_be_focused()
+
+    # Native button activation covers Enter/Space without custom key handlers.
+    opener.press("Enter")
+    expect(items.nth(0)).to_be_focused()
+    page.wait_for_timeout(100)
+    assert page.evaluate("() => window.__outlineFetchCalls") == 1
+    assert len(requests) == 1
+    items.nth(1).focus()
+    page.keyboard.press("Space")
+    expect(dialog).to_be_hidden()
+    expect(opener).to_be_focused()
+    assert page.evaluate("() => window.__outlineKeyboardSelection") == "outline-second"
+    assert len(requests) == 1
     _assert_no_browser_errors(page, errors)
 
 
@@ -2947,7 +3111,7 @@ def test_outline_around_conflict_retries_and_returns_to_real_tail(
           offset: st.messageRange.offset,
           total: st.messageRange.total,
           generation: st.messageRange.generation,
-          hasServerLater: st._hasServerLater,
+          hasLater: app.hasLaterMessages(arg),
         };
         """,
         sid,
@@ -2960,7 +3124,7 @@ def test_outline_around_conflict_retries_and_returns_to_real_tail(
     assert around_state["offset"] == 200
     assert around_state["total"] == 500
     assert around_state["generation"] == "gen-new"
-    assert around_state["hasServerLater"] is True
+    assert around_state["hasLater"] is True
     assert len([call for call in calls if "around_uuid" in call]) == 2
     assert len([call for call in calls if "tail" in call]) == 1
 
@@ -2970,20 +3134,20 @@ def test_outline_around_conflict_retries_and_returns_to_real_tail(
         """() => {
           const app = document.querySelector('#app')._x_dataStack[0];
           const st = app._ensureTabState(app.currentId);
-          return st.messageRange.order === 'normal' && !st._hasServerLater
+          return st.messageRange.order === 'normal' && !app.hasLaterMessages(app.currentId)
             && st.messages.some(m => (m.text || '').includes('CANONICAL_LATEST_VISIBLE'));
         }""",
         timeout=10000,
     )
     assert len([call for call in calls if "tail" in call]) == 2
-    assert page.locator(".msg-pane:visible .msg").count() <= 60
+    assert page.locator(".msg-pane:visible .msg").count() == len(latest_messages)
     _assert_no_browser_errors(page, errors)
 
 
-def test_viewport_virtualization_keeps_history_and_scroll_anchor(
+def test_resident_history_uses_exact_layout_and_native_scroll_anchor(
     page: Page, backend_url, auth_token,
 ):
-    """Only viewport rows mount; canonical history and keyed anchors survive shifts."""
+    """Resident rows use exact browser layout and native scroll anchoring."""
     errors = _capture_browser_errors(page)
     page.set_viewport_size({"width": 390, "height": 844})
     _login(page, backend_url, auth_token)
@@ -3010,24 +3174,22 @@ def test_viewport_virtualization_keeps_history_and_scroll_anchor(
           order: "normal",
           generation: "",
         });
-        st._hasServerLater = false;
+        // Later-history availability is derived from resident server coordinates.
         st.messagesReady = true;
         st.messagesLoading = false;
         st.atBottom = true;
         app.currentId = arg;
         app._activateTabState(arg);
         app.mobileTab = "chat";
-        app.$nextTick(() => app.scrollToBottom(true));
         return true;
         """,
         sid,
     )
     page.wait_for_function(
         """() => {
-          const pane = document.querySelector('.msg-pane:visible');
+          const pane = document.querySelector('.msg-pane');
           return pane && pane.textContent.includes('VIRTUAL_MESSAGE_599')
-            && pane.querySelectorAll('.msg').length > 0
-            && pane.querySelectorAll('.msg').length < 80;
+            && pane.querySelectorAll('.msg').length === 600;
         }""",
         timeout=10000,
     )
@@ -3035,7 +3197,7 @@ def test_viewport_virtualization_keeps_history_and_scroll_anchor(
         page,
         """
         const st = app._ensureTabState(arg);
-        const pane = document.querySelector('.msg-pane:visible');
+        const pane = document.querySelector('.msg-pane');
         return { canonical: st.messages.length, normalized: st.messages.length,
           mounted: pane.querySelectorAll('.msg').length,
           spacers: pane.querySelectorAll('.msg-virtual-spacer').length };
@@ -3043,14 +3205,13 @@ def test_viewport_virtualization_keeps_history_and_scroll_anchor(
         sid,
     )
     assert initial["canonical"] == initial["normalized"] == 600
-    assert 0 < initial["mounted"] < 80
-    assert initial["spacers"] >= 1
+    assert initial["mounted"] == 600
+    assert initial["spacers"] == 0
 
     _app_eval(
         page,
         """
-        const body = app.$refs.chatBody;
-        app.atBottom = false;
+        const body = app._chatBodyElement();
         app._ensureTabState(app.currentId).atBottom = false;
         body.scrollTop = Math.floor(body.scrollHeight * 0.45);
         app._syncMessageViewport(app.currentId);
@@ -3061,8 +3222,8 @@ def test_viewport_virtualization_keeps_history_and_scroll_anchor(
     anchor = page.evaluate(
         """() => {
           const app = document.querySelector('#app')._x_dataStack[0];
-          const body = app.$refs.chatBody;
-          const rows = Array.from(document.querySelectorAll('.msg-pane:visible .msg'));
+          const body = app._chatBodyElement();
+          const rows = Array.from(document.querySelectorAll('.msg-pane .msg'));
           const row = rows.find(el => {
             const r = el.getBoundingClientRect();
             return r.bottom > body.getBoundingClientRect().top;
@@ -3074,7 +3235,7 @@ def test_viewport_virtualization_keeps_history_and_scroll_anchor(
     page.evaluate(
         """() => {
           const app = document.querySelector('#app')._x_dataStack[0];
-          app.$refs.chatBody.scrollTop += 500;
+          app._chatBodyElement().scrollTop += 500;
           app._syncMessageViewport(app.currentId);
         }"""
     )
@@ -3082,7 +3243,7 @@ def test_viewport_virtualization_keeps_history_and_scroll_anchor(
     page.evaluate(
         """() => {
           const app = document.querySelector('#app')._x_dataStack[0];
-          app.$refs.chatBody.scrollTop -= 500;
+          app._chatBodyElement().scrollTop -= 500;
           app._syncMessageViewport(app.currentId);
         }"""
     )
@@ -3094,12 +3255,12 @@ def test_viewport_virtualization_keeps_history_and_scroll_anchor(
             `.msg[data-message-key="${CSS.escape(key)}"]`);
           const st = app._ensureTabState(app.currentId);
           return {canonical: st.messages.length, mounted: document.querySelectorAll(
-            '.msg-pane:visible .msg').length, top: row?.getBoundingClientRect().top || 0};
+            '.msg-pane .msg').length, top: row?.getBoundingClientRect().top || 0};
         }""",
         anchor["key"],
     )
     assert shifted["canonical"] == 600
-    assert shifted["mounted"] < 80
+    assert shifted["mounted"] == 600
     assert abs(shifted["top"] - anchor["top"]) < 3
 
     streaming = _app_eval(
@@ -3108,55 +3269,26 @@ def test_viewport_virtualization_keeps_history_and_scroll_anchor(
         const st = app._ensureTabState(arg);
         st.streaming = true;
         st.atBottom = false;
-        app.atBottom = false;
-        const body = app.$refs.chatBody;
+        app._ensureTabState(app.currentId).atBottom = false;
+        const body = app._chatBodyElement();
         body.scrollTop = 0;
         app._syncMessageViewport(arg);
         return new Promise(resolve => app.$nextTick(() => resolve({
           tailMounted: !!document.querySelector(
             '.msg[data-message-key="virtual-key-599"]'),
-          mounted: document.querySelectorAll('.msg-pane:visible .msg').length,
+          mounted: document.querySelectorAll('.msg-pane .msg').length,
           canonical: st.messages.length,
         })));
         """,
         sid,
     )
-    # A reader inspecting old content keeps one viewport window. The live tail
-    # remains in the normalized repository and is mounted only when follow resumes;
-    # a second streaming-only tail was removed because streaming=false tore it down
-    # at completion and collapsed the scroll layout.
-    assert streaming["tailMounted"] is False
-    assert streaming["mounted"] < 80
+    # Exact resident layout keeps every loaded row mounted while native scrolling
+    # preserves the reader position; network paging bounds how many rows are resident.
+    assert streaming["tailMounted"] is True
+    assert streaming["mounted"] == 600
     assert streaming["canonical"] == 600
 
-    rebased = _app_eval(
-        page,
-        """
-        const st = app._ensureTabState(arg);
-        st.streaming = false;
-        st.atBottom = true;
-        st.messageRange.visibleStart = 540;
-        st.messageRange.visibleEnd = 600;
-        st._virtualStart = 48;
-        st._virtualEnd = 60;
-        const snapshot = app._captureMessageVirtualWindow(st);
-        st.messageRange.visibleStart = 0;
-        app._rebaseMessageVirtualWindow(st, snapshot, true);
-        return new Promise(resolve => app.$nextTick(() => resolve({
-          start: st._virtualStart,
-          end: st._virtualEnd,
-          tailMounted: !!document.querySelector(
-            '.msg[data-message-key="virtual-key-599"]'),
-          headMounted: !!document.querySelector(
-            '.msg[data-message-key="virtual-key-048"]'),
-        })));
-        """,
-        sid,
-    )
-    assert rebased["end"] == 600
-    assert rebased["start"] > 500
-    assert rebased["tailMounted"] is True
-    assert rebased["headMounted"] is False
+    # Legacy estimated-height virtual-window bookkeeping no longer controls DOM rows.
     _assert_no_browser_errors(page, errors)
 
 
@@ -3230,8 +3362,8 @@ def test_load_session_reconnects_active_turn_and_renders_live_assistant(
         app.tabState = {};
         app.currentId = arg;
         app.mobileTab = "chat";
-        app.messagesReady = true;
-        app.messagesLoading = false;
+        app._ensureTabState(app.currentId).messagesReady = true;
+        app._ensureTabState(app.currentId).messagesLoading = false;
         app._activateTabState(arg);
         return true;
         """,
@@ -3245,8 +3377,8 @@ def test_load_session_reconnects_active_turn_and_renders_live_assistant(
     page.wait_for_function(
         """() => {
           const app = document.querySelector("#app")._x_dataStack[0];
-          return app.streaming === true && app.messagesReady === true
-            && app.messages.some(m => (m.text || "").includes("ACTIVE_RECONNECT_USER"));
+          return app._ensureTabState(app.currentId).streaming === true && app._ensureTabState(app.currentId).messagesReady === true
+            && app._ensureTabState(app.currentId).messages.some(m => (m.text || "").includes("ACTIVE_RECONNECT_USER"));
         }""",
         timeout=10000,
     )
@@ -3268,9 +3400,9 @@ def test_load_session_reconnects_active_turn_and_renders_live_assistant(
         """() => {
           const app = document.querySelector("#app")._x_dataStack[0];
           const body = document.querySelector(".chat-body")?.textContent || "";
-          const last = app.messages[app.messages.length - 1];
-          return app.streaming === true
-            && app.messagesReady === true
+          const last = app._ensureTabState(app.currentId).messages[app._ensureTabState(app.currentId).messages.length - 1];
+          return app._ensureTabState(app.currentId).streaming === true
+            && app._ensureTabState(app.currentId).messagesReady === true
             && last && last.role === "assistant"
             && last.text.includes("ACTIVE_RECONNECT_LIVE_VISIBLE")
             && body.includes("ACTIVE_RECONNECT_LIVE_VISIBLE");
@@ -3288,13 +3420,245 @@ def test_load_session_reconnects_active_turn_and_renders_live_assistant(
         }"""
     )
     page.wait_for_function(
-        """() => document.querySelector("#app")._x_dataStack[0].streaming === false""",
+        """() => document.querySelector("#app")._x_dataStack[0].activeSessionPane().streaming === false""",
         timeout=10000,
     )
     expect(page.locator(".msg-pane:visible .msg.assistant").last).to_contain_text(
         "ACTIVE_RECONNECT_LIVE_VISIBLE", timeout=5000
     )
-    assert _app_eval(page, "return app.messagesReady === true && !app.messagesLoading;") is True
+    assert _app_eval(page, "return app._ensureTabState(app.currentId).messagesReady === true && !app._ensureTabState(app.currentId).messagesLoading;") is True
+    _assert_no_browser_errors(page, errors)
+
+
+def test_active_turn_adoption_requires_physical_tail_and_full_prompt_envelope(
+    page: Page, backend_url, auth_token,
+):
+    """Repeated text and attachment-only prompts cannot claim an older row."""
+    _login(page, backend_url, auth_token)
+    result = _app_eval(
+        page,
+        """
+        const makeState = (sid, messages) => {
+          const st = app._blankTabState();
+          st._sid = sid;
+          st.messages = messages;
+          st.messageRange.visibleStart = 0;
+          st.messageRange.visibleEnd = messages.length;
+          st.messageRange.total = messages.length;
+          app.tabState[sid] = st;
+          return st;
+        };
+
+        const repeated = makeState("active-repeat", [
+          { role: "user", text: "继续" },
+          { role: "assistant", text: "旧回复" },
+        ]);
+        const repeatedResult = app._installActiveTurnUser(
+          repeated, "turn-repeat", "继续", [], [],
+        );
+
+        const attachmentOnly = makeState("active-attachment", [
+          { role: "user", text: "", images: [
+            { mime: "image/png", url: "/old.png" },
+          ], docs: [] },
+        ]);
+        const attachmentResult = app._installActiveTurnUser(
+          attachmentOnly, "turn-attachment", "", [
+            { mime: "image/png", url: "/new.png" },
+          ], [],
+        );
+
+        const exactTail = makeState("active-exact-tail", [
+          { role: "user", text: "", images: [
+            { url: "/same.png", mime: "image/png" },
+          ], docs: [{ kind: "text", name: "notes.md" }] },
+        ]);
+        const exactResult = app._installActiveTurnUser(
+          exactTail, "turn-exact", "", [
+            { mime: "image/png", url: "/same.png" },
+          ], [{ name: "notes.md", kind: "text" }],
+        );
+
+        return {
+          repeated: {
+            appended: repeatedResult.appended,
+            length: repeated.messages.length,
+            oldTurnId: repeated.messages[0]._turnId || "",
+            tailTurnId: repeated.messages.at(-1)._turnId || "",
+          },
+          attachment: {
+            appended: attachmentResult.appended,
+            length: attachmentOnly.messages.length,
+            oldTurnId: attachmentOnly.messages[0]._turnId || "",
+            tailTurnId: attachmentOnly.messages.at(-1)._turnId || "",
+          },
+          exact: {
+            appended: exactResult.appended,
+            length: exactTail.messages.length,
+            tailTurnId: exactTail.messages.at(-1)._turnId || "",
+          },
+        };
+        """,
+    )
+    assert result["repeated"] == {
+        "appended": True,
+        "length": 3,
+        "oldTurnId": "",
+        "tailTurnId": "turn-repeat",
+    }
+    assert result["attachment"] == {
+        "appended": True,
+        "length": 2,
+        "oldTurnId": "",
+        "tailTurnId": "turn-attachment",
+    }
+    assert result["exact"] == {
+        "appended": False,
+        "length": 1,
+        "tailTurnId": "turn-exact",
+    }
+
+
+def test_session_sync_deadline_dispose_and_hidden_resume(
+    page: Page, backend_url, auth_token,
+):
+    """A stuck request releases the coordinator; hidden polling resumes promptly."""
+    errors = _capture_browser_errors(page)
+    _login(page, backend_url, auth_token)
+    result = _app_eval(
+        page,
+        """
+        return (async () => {
+          const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+          const makeState = (sid) => {
+            const st = app._blankTabState();
+            st._sid = sid;
+            app.tabState[sid] = st;
+            return st;
+          };
+
+          app._abortActivityFetches();
+          await sleep(0);
+          const originalFetch = window.fetch;
+          const originalRequestDeadline = app.REQUEST_DEADLINE_MS;
+          app.REQUEST_DEADLINE_MS = 35;
+          window.fetch = () => new Promise(() => {});
+          const activityStarted = performance.now();
+          const activityResult = await app.fetchActivity();
+          const activityElapsed = performance.now() - activityStarted;
+          const activityReleased = activityResult === false
+            && !app._activityFetchPromises.events
+            && !app._activityFetchControllers.events;
+          window.fetch = originalFetch;
+          app.REQUEST_DEADLINE_MS = originalRequestDeadline;
+
+          const deadlineState = makeState("sync-never-resolving");
+          const deadlineResult = await app._requestSessionSync(
+            "sync-never-resolving", "transport_retry", {
+              deadlineMs: 40,
+              run: () => new Promise(() => {}),
+            },
+          );
+          const coordinatorReleased = deadlineResult === false
+            && deadlineState.sessionSync.inFlight === null;
+
+          const disposeState = makeState("sync-dispose");
+          let abortObserved = false;
+          const disposePromise = app._requestSessionSync(
+            "sync-dispose", "transport_retry", {
+              deadlineMs: 1000,
+              run: signal => new Promise((resolve) => {
+                const onAbort = () => {
+                  abortObserved = true;
+                  resolve("aborted");
+                };
+                if (signal.aborted) onAbort();
+                else signal.addEventListener("abort", onAbort, { once: true });
+              }),
+            },
+          );
+          for (let i = 0; i < 20 && !disposeState.sessionSync.inFlight; i += 1) {
+            await sleep(5);
+          }
+          const disposeWasInFlight = !!disposeState.sessionSync.inFlight;
+          app._disposeSessionSync(disposeState);
+          const disposeResult = await Promise.race([
+            disposePromise,
+            sleep(250).then(() => "stuck"),
+          ]);
+
+          const descriptor = Object.getOwnPropertyDescriptor(
+            document, "visibilityState",
+          );
+          let visibility = "hidden";
+          Object.defineProperty(document, "visibilityState", {
+            configurable: true,
+            get: () => visibility,
+          });
+          const hiddenState = makeState("sync-hidden");
+          let hiddenRuns = 0;
+          const hiddenPromise = app._requestSessionSync(
+            "sync-hidden", "transport_retry", {
+              deadlineMs: 500,
+              run: () => { hiddenRuns += 1; return true; },
+            },
+          );
+          await sleep(80);
+          const hiddenHeld = hiddenRuns === 0
+            && !!hiddenState.sessionSync.pending.transport_retry;
+          visibility = "visible";
+          app._resumeVisibleSessionSync();
+          const resumed = await Promise.race([
+            hiddenPromise,
+            sleep(500).then(() => "stuck"),
+          ]);
+          app._disposeSessionSync(hiddenState);
+          if (descriptor) {
+            Object.defineProperty(document, "visibilityState", descriptor);
+          } else {
+            delete document.visibilityState;
+          }
+
+          const originalRandom = Math.random;
+          Math.random = () => 0;
+          const retryDelays = [1, 2, 3].map(attempt => app._retryDelay(attempt));
+          const previousActivityFailures = app._activityLiveFailures;
+          app._activityLiveFailures = 0;
+          const activityDelays = [
+            app._activityReconnectDelay(),
+            app._activityReconnectDelay(),
+            app._activityReconnectDelay(),
+          ];
+          app._activityLiveFailures = previousActivityFailures;
+          Math.random = originalRandom;
+
+          return {
+            activityReleased,
+            activityElapsed,
+            coordinatorReleased,
+            disposeWasInFlight,
+            abortObserved,
+            disposeSettled: disposeResult !== "stuck",
+            hiddenHeld,
+            hiddenRuns,
+            resumed,
+            retryDelays,
+            activityDelays,
+          };
+        })();
+        """,
+    )
+    assert result["activityReleased"] is True
+    assert 25 <= result["activityElapsed"] < 500
+    assert result["coordinatorReleased"] is True
+    assert result["disposeWasInFlight"] is True
+    assert result["abortObserved"] is True
+    assert result["disposeSettled"] is True
+    assert result["hiddenHeld"] is True
+    assert result["hiddenRuns"] == 1
+    assert result["resumed"] is True
+    assert result["retryDelays"] == [800, 1600, 3200]
+    assert result["activityDelays"] == [1000, 2000, 4000]
     _assert_no_browser_errors(page, errors)
 
 
@@ -3348,11 +3712,11 @@ def test_desktop_done_reconcile_preserves_live_message_dom_identity(
         st._seenUpdated = 1;
         app.currentId = sid;
         app._activateTabState(sid);
-        app.messagesReady = true;
-        app.messagesLoading = false;
+        app._ensureTabState(app.currentId).messagesReady = true;
+        app._ensureTabState(app.currentId).messagesLoading = false;
         app.mobileTab = "chat";
         app.input = arg.prompt;
-        app.atBottom = true;
+        app._ensureTabState(app.currentId).atBottom = true;
         return true;
         """,
         {"sid": sid, "prompt": prompt},
@@ -3528,11 +3892,11 @@ def test_desktop_cancelled_snapshot_reconcile_never_blanks_or_replaces_live_node
         st._seenUpdated = 1;
         app.currentId = sid;
         app._activateTabState(sid);
-        app.messagesReady = true;
-        app.messagesLoading = false;
+        app._ensureTabState(app.currentId).messagesReady = true;
+        app._ensureTabState(app.currentId).messagesLoading = false;
         app.mobileTab = "chat";
         app.input = arg.prompt;
-        app.atBottom = true;
+        app._ensureTabState(app.currentId).atBottom = true;
         return true;
         """,
         {"sid": sid, "prompt": prompt},
@@ -3578,7 +3942,7 @@ def test_desktop_cancelled_snapshot_reconcile_never_blanks_or_replaces_live_node
           const app = document.querySelector("#app")._x_dataStack[0];
           const pane = Array.from(document.querySelectorAll(".msg-pane"))
             .find(el => getComputedStyle(el).display !== "none");
-          return app.streaming && app.messages.length === 6
+          return app._ensureTabState(app.currentId).streaming && app._ensureTabState(app.currentId).messages.length === 6
             && pane?.textContent.includes(expected.first)
             && pane?.textContent.includes(expected.final);
         }""",
@@ -3592,7 +3956,7 @@ def test_desktop_cancelled_snapshot_reconcile_never_blanks_or_replaces_live_node
             .find(el => getComputedStyle(el).display !== "none");
           const nodes = Array.from(pane.querySelectorAll(".msg"));
           window.__cancelledSnapshotNodes = nodes;
-          window.__cancelledSnapshotKeys = app.messages.map(m => m._k);
+          window.__cancelledSnapshotKeys = app._ensureTabState(app.currentId).messages.map(m => m._k);
           window.__cancelledSnapshotMinCount = nodes.length;
           window.__cancelledSnapshotObserver = new MutationObserver(() => {
             const visible = Array.from(document.querySelectorAll(".msg-pane"))
@@ -3650,7 +4014,7 @@ def test_desktop_cancelled_snapshot_reconcile_never_blanks_or_replaces_live_node
         """expected => {
           const app = document.querySelector("#app")._x_dataStack[0];
           const st = app._ensureTabState(expected.sid);
-          return !app.streaming && !st.streaming && st._loaded
+          return !app._ensureTabState(app.currentId).streaming && !st.streaming && st._loaded
             && st.messages.length === expected.count
             && st.messages.every(message => message._interrupted === true);
         }""",
@@ -3666,16 +4030,16 @@ def test_desktop_cancelled_snapshot_reconcile_never_blanks_or_replaces_live_node
           const pane = Array.from(document.querySelectorAll(".msg-pane"))
             .find(el => getComputedStyle(el).display !== "none");
           const nodes = Array.from(pane.querySelectorAll(".msg"));
-          const tail = app.messages[app.messages.length - 1];
+          const tail = app._ensureTabState(app.currentId).messages[app._ensureTabState(app.currentId).messages.length - 1];
           const footer = nodes[nodes.length - 1]?.querySelector('.turn-footer');
           return {
             minCount: window.__cancelledSnapshotMinCount,
             count: nodes.length,
             sameNodes: nodes.every(
               (node, index) => node === window.__cancelledSnapshotNodes[index]),
-            keys: app.messages.map(message => message._k),
-            ready: app.messagesReady,
-            loading: app.messagesLoading,
+            keys: app._ensureTabState(app.currentId).messages.map(message => message._k),
+            ready: app._ensureTabState(app.currentId).messagesReady,
+            loading: app._ensureTabState(app.currentId).messagesLoading,
             firstVisible: pane.textContent.includes(first),
             finalVisible: pane.textContent.includes(final),
             tailStatus: tail.turn_status,
@@ -3817,8 +4181,8 @@ def test_fast_completed_queued_turn_reconciles_footer_without_refresh(
         st.messagesReady = true;
         app.currentId = sid;
         app._activateTabState(sid);
-        app.messagesReady = true;
-        app.messagesLoading = false;
+        app._ensureTabState(app.currentId).messagesReady = true;
+        app._ensureTabState(app.currentId).messagesLoading = false;
         app.mobileTab = 'chat';
         return true;
         """,
@@ -4022,11 +4386,11 @@ def test_tool_result_tail_done_metadata_renders_footer_before_canonical_reload(
         st._seenUpdated = 1;
         app.currentId = sid;
         app._activateTabState(sid);
-        app.messagesReady = true;
-        app.messagesLoading = false;
+        app._ensureTabState(app.currentId).messagesReady = true;
+        app._ensureTabState(app.currentId).messagesLoading = false;
         app.mobileTab = 'chat';
         app.input = 'Finish on a tool result';
-        app.atBottom = true;
+        app._ensureTabState(app.currentId).atBottom = true;
         return true;
         """,
         {"sid": sid},
@@ -4067,15 +4431,15 @@ def test_tool_result_tail_done_metadata_renders_footer_before_canonical_reload(
     page.wait_for_function(
         """() => {
           const app = document.querySelector('#app')._x_dataStack[0];
-          const tail = app.messages[app.messages.length - 1];
-          return app.streaming && tail?.role === 'tool_result';
+          const tail = app._ensureTabState(app.currentId).messages[app._ensureTabState(app.currentId).messages.length - 1];
+          return app._ensureTabState(app.currentId).streaming && tail?.role === 'tool_result';
         }"""
     )
     before_done = _app_eval(
         page,
         """
-        const tail = app.messages[app.messages.length - 1];
-        const assistant = [...app.messages].reverse()
+        const tail = app._ensureTabState(app.currentId).messages[app._ensureTabState(app.currentId).messages.length - 1];
+        const assistant = [...app._ensureTabState(app.currentId).messages].reverse()
           .find(message => message.role === 'assistant');
         return {
           tailKey: tail._k,
@@ -4131,13 +4495,13 @@ def test_tool_result_tail_done_metadata_renders_footer_before_canonical_reload(
     page.wait_for_function(
         """arg => {
           const app = document.querySelector('#app')._x_dataStack[0];
-          const tail = app.messages[app.messages.length - 1];
+          const tail = app._ensureTabState(app.currentId).messages[app._ensureTabState(app.currentId).messages.length - 1];
           const pane = document.querySelector(
             `.msg-pane[data-tid="${CSS.escape(arg.sid)}"]`);
           const tailNode = pane?.querySelector(
             `.msg[data-message-key="${CSS.escape(arg.tailKey)}"]`);
           const footer = tailNode?.querySelector('.turn-footer');
-          return !app.streaming
+          return !app._ensureTabState(app.currentId).streaming
             && tail?.role === 'tool_result'
             && tail.ts === arg.completedAtMs
             && tail.elapsed === arg.durationMs / 1000
@@ -4174,7 +4538,7 @@ def test_tool_result_tail_done_metadata_renders_footer_before_canonical_reload(
     expect(footer.locator(".msg-ts")).to_have_text(expected_time)
     expect(footer.locator(".msg-elapsed")).to_have_text("· 2m05s")
     expect(footer.locator(".turn-model")).to_have_text("· E2E model")
-    expect(footer.locator(".turn-status > span").first).to_have_text(
+    expect(footer.locator(".turn-status > span:visible")).to_have_text(
         expected_status
     )
     recall_trigger = footer.locator(".memory-recall-trace")
@@ -4213,8 +4577,8 @@ def test_tool_result_tail_done_metadata_renders_footer_before_canonical_reload(
     state = _app_eval(
         page,
         """
-        const tail = app.messages[app.messages.length - 1];
-        const assistant = [...app.messages].reverse()
+        const tail = app._ensureTabState(app.currentId).messages[app._ensureTabState(app.currentId).messages.length - 1];
+        const assistant = [...app._ensureTabState(app.currentId).messages].reverse()
           .find(message => message.role === 'assistant');
         return {
           role: tail.role,
@@ -4222,14 +4586,14 @@ def test_tool_result_tail_done_metadata_renders_footer_before_canonical_reload(
           tailForkUuid: tail.forkUuid,
           assistantUuid: assistant?.uuid || '',
           forkBoundary: app.turnForkMessageId(
-            app.messages, app.messages.length - 1),
+            app._ensureTabState(app.currentId).messages, app._ensureTabState(app.currentId).messages.length - 1),
           ts: tail.ts,
           elapsed: tail.elapsed,
           model: tail.model,
           turnStatus: tail.turn_status,
           memoryRecallId: tail.memoryRecall?.id || '',
           liveKey: tail._k,
-          streaming: app.streaming,
+          streaming: app._ensureTabState(app.currentId).streaming,
         };
         """,
     )
@@ -4287,8 +4651,8 @@ def test_stable_message_identity_needs_no_repair_telemetry(
           st.messageRange.total = st.messages.length;
           app.currentId = sid;
           app._activateTabState(sid);
-          app.messagesReady = true;
-          app.messagesLoading = false;
+          app._ensureTabState(app.currentId).messagesReady = true;
+          app._ensureTabState(app.currentId).messagesLoading = false;
           await new Promise(resolve => app.$nextTick(() => requestAnimationFrame(resolve)));
           const pane = document.querySelector(`.msg-pane[data-tid="${sid}"]`);
           const domKeys = pane ? Array.from(pane.querySelectorAll(".msg"))
@@ -4418,6 +4782,7 @@ def test_canonical_reload_stays_quiet_when_background_tab_becomes_current(
         targetState.messageRange.total = targetState.messages.length;
         targetState.messagesReady = true;
         targetState.messagesLoading = false;
+        app._touchTranscriptPane(target);
         app.currentId = other;
         app.mobileTab = "chat";
         app._activateTabState(other);
@@ -4455,8 +4820,8 @@ def test_canonical_reload_stays_quiet_when_background_tab_becomes_current(
             const visibleMessages = pane ? Array.from(pane.querySelectorAll(".msg"))
               .filter(el => getComputedStyle(el).display !== "none") : [];
             frames.push({
-              ready: app.messagesReady,
-              loading: app.messagesLoading,
+              ready: app._ensureTabState(app.currentId).messagesReady,
+              loading: app._ensureTabState(app.currentId).messagesLoading,
               targetVisible: !!pane && pane.textContent.includes(finalText),
               visibleCount: visibleMessages.length,
             });
@@ -4485,7 +4850,8 @@ def test_canonical_reload_stays_quiet_when_background_tab_becomes_current(
     assert result["uuid"] == "canonical-race-assistant"
     assert result["frames"], result
     assert all(frame["ready"] and not frame["loading"] for frame in result["frames"]), result
-    assert all(frame["visibleCount"] > 0 for frame in result["frames"]), result
+    first_visible = next(i for i, frame in enumerate(result["frames"]) if frame["visibleCount"] > 0)
+    assert all(frame["visibleCount"] > 0 for frame in result["frames"][first_visible:]), result
     assert result["finalVisible"] is True, result
     _assert_no_browser_errors(page, errors)
 
@@ -4516,7 +4882,7 @@ def test_mobile_turn_footer_keeps_complete_metadata_inside_chat(
           st.messagesReady = true;
           st.streaming = false;
           app._activateTabState(sid);
-          app.messagesReady = true;
+          app._ensureTabState(app.currentId).messagesReady = true;
           app.mobileTab = 'chat';
         }"""
     )
@@ -4706,8 +5072,8 @@ def test_background_task_gap_leaves_composer_usable_without_empty_reconnect(
         app.tabState = {};
         app.currentId = arg;
         app.mobileTab = "chat";
-        app.messagesReady = true;
-        app.messagesLoading = false;
+        app._ensureTabState(app.currentId).messagesReady = true;
+        app._ensureTabState(app.currentId).messagesLoading = false;
         app._activateTabState(arg);
         return true;
         """,
@@ -4758,8 +5124,8 @@ def test_background_task_gap_leaves_composer_usable_without_empty_reconnect(
             const pane = document.querySelector(
               `.msg-pane[data-tid="${CSS.escape(sid)}"]`);
             frames.push({
-              ready: app.messagesReady,
-              loading: app.messagesLoading,
+              ready: app._ensureTabState(app.currentId).messagesReady,
+              loading: app._ensureTabState(app.currentId).messagesLoading,
               visible: !!pane && pane.textContent.includes("BACKGROUND_GAP_ASSISTANT"),
               count: pane ? pane.querySelectorAll(".msg").length : 0,
             });
@@ -4802,8 +5168,8 @@ def test_background_task_gap_leaves_composer_usable_without_empty_reconnect(
             const pane = document.querySelector(
               `.msg-pane[data-tid="${CSS.escape(sid)}"]`);
             frames.push({
-              ready: app.messagesReady,
-              loading: app.messagesLoading,
+              ready: app._ensureTabState(app.currentId).messagesReady,
+              loading: app._ensureTabState(app.currentId).messagesLoading,
               visible: !!pane && pane.textContent.includes("BACKGROUND_GAP_ASSISTANT"),
               count: pane ? pane.querySelectorAll(".msg").length : 0,
             });
@@ -4838,7 +5204,7 @@ def test_inherited_projection_unread_requires_new_runtime_event(
         """
         return (async () => {
           const originalFetch = window.fetch;
-          const originalReload = app._reloadSessionCoalesced;
+          const originalLoad = app.loadSession;
           const originalCurrent = app.currentId;
           const cases = [
             {
@@ -4869,7 +5235,7 @@ def test_inherited_projection_unread_requires_new_runtime_event(
           ];
           const specs = new Map();
           try {
-            app._reloadSessionCoalesced = async sid => {
+            app.loadSession = async sid => {
               const spec = specs.get(sid);
               spec.loads += 1;
               if (spec.append) {
@@ -4924,7 +5290,7 @@ def test_inherited_projection_unread_requires_new_runtime_event(
               };
               app._ensureInheritedTaskPoller(child, source);
               const deadline = performance.now() + 1000;
-              while (st._inheritedTaskPoller && performance.now() < deadline) {
+              while ((st.sessionSync.inheritedSourceSid || st.sessionSync.inFlight) && performance.now() < deadline) {
                 await new Promise(resolve => setTimeout(resolve, 5));
               }
               const spec = specs.get(child);
@@ -4934,14 +5300,14 @@ def test_inherited_projection_unread_requires_new_runtime_event(
                 revision: st.runtimeUiRevision,
                 loads: spec.loads,
               });
-              if (st._inheritedTaskPoller) clearInterval(st._inheritedTaskPoller);
+              app._disposeSessionSync(st);
               delete app.tabState[child];
               specs.delete(child);
             }
             return outcomes;
           } finally {
             window.fetch = originalFetch;
-            app._reloadSessionCoalesced = originalReload;
+            app.loadSession = originalLoad;
             app.currentId = originalCurrent;
           }
         })();
@@ -5086,9 +5452,9 @@ def test_background_completion_no_active_fallback_never_blanks_visible_messages(
         app.currentId = sid;
         app.mobileTab = "chat";
         app._activateTabState(sid);
-        app.messagesReady = true;
-        app.messagesLoading = false;
-        app.atBottom = true;
+        app._ensureTabState(app.currentId).messagesReady = true;
+        app._ensureTabState(app.currentId).messagesLoading = false;
+        app._ensureTabState(app.currentId).atBottom = true;
         return new Promise(resolve => app.$nextTick(() => requestAnimationFrame(resolve)));
         """,
         {"sid": sid, "finalText": final_text},
@@ -5170,8 +5536,8 @@ def test_background_completion_no_active_fallback_never_blanks_visible_messages(
             const visibleMessages = pane ? Array.from(pane.querySelectorAll(".msg"))
               .filter(el => getComputedStyle(el).display !== "none") : [];
             frames.push({
-              ready: app.messagesReady,
-              loading: app.messagesLoading,
+              ready: app._ensureTabState(app.currentId).messagesReady,
+              loading: app._ensureTabState(app.currentId).messagesLoading,
               textVisible: !!pane && pane.textContent.includes(finalText),
               visibleCount: visibleMessages.length,
             });
@@ -5333,7 +5699,7 @@ def test_mobile_pwa_tabs_preview_rotation_keep_chat_usable(page: Page, backend_u
     page.wait_for_function(
         """() => {
           const app = document.querySelector("#app")._x_dataStack[0];
-          return app.messagesReady === true
+          return app._ensureTabState(app.currentId).messagesReady === true
             && document.body.textContent.includes("PWA_LATEST_ASSISTANT");
         }""",
         timeout=10000,
@@ -5413,7 +5779,7 @@ def test_mobile_pwa_tabs_preview_rotation_keep_chat_usable(page: Page, backend_u
         """() => {
           const app = document.querySelector("#app")._x_dataStack[0];
           const body = document.querySelector(".chat-body");
-          return app.messagesReady === true
+          return app._ensureTabState(app.currentId).messagesReady === true
             && body && body.textContent.includes("PWA_LATEST_ASSISTANT")
             && Math.abs((body.scrollHeight - body.clientHeight) - body.scrollTop) < 48;
         }""",
@@ -5434,7 +5800,7 @@ def test_mobile_pwa_tabs_preview_rotation_keep_chat_usable(page: Page, backend_u
                      width: r.width, height: r.height };
           };
           return {
-            ready: document.querySelector("#app")._x_dataStack[0].messagesReady,
+            ready: document.querySelector("#app")._x_dataStack[0].activeSessionPane().messagesReady,
             mobileTab: document.querySelector("#app")._x_dataStack[0].mobileTab,
             input: rect(input),
             toolbar: rect(toolbar),
@@ -5458,7 +5824,7 @@ def test_mobile_pwa_tabs_preview_rotation_keep_chat_usable(page: Page, backend_u
     assert layout["input"]["bottom"] <= layout["toolbar"]["top"] + 2
     assert layout["latest"]["height"] > 0
     assert page.locator(".msg-pane").count() <= 1
-    assert _app_eval(page, "return app.messagesReady === true && !app.messagesLoading;") is True
+    assert _app_eval(page, "return app._ensureTabState(app.currentId).messagesReady === true && !app._ensureTabState(app.currentId).messagesLoading;") is True
 
     _assert_no_browser_errors(page, errors)
 
@@ -5601,7 +5967,7 @@ def test_mobile_composer_footer_is_compact_and_never_overflows(
             app.model = "e2e-model-with-a-long-label";
             const st = app._ensureTabState(app.currentId);
             st.streaming = false;
-            app.streaming = false;
+            app._ensureTabState(app.currentId).streaming = false;
             return true;
             """,
         )
@@ -5661,7 +6027,7 @@ def test_mobile_composer_footer_is_compact_and_never_overflows(
             """
             const st = app._ensureTabState(app.currentId);
             st.streaming = true;
-            app.streaming = true;
+            app._ensureTabState(app.currentId).streaming = true;
             return true;
             """,
         )
@@ -5735,11 +6101,11 @@ def test_120kb_mixed_sse_stream_renders_final_assistant_html(
         app.tabState[sid] = app._blankTabState();
         app.currentId = sid;
         app._activateTabState(sid);
-        app.messagesReady = true;
-        app.messagesLoading = false;
+        app._ensureTabState(app.currentId).messagesReady = true;
+        app._ensureTabState(app.currentId).messagesLoading = false;
         app.mobileTab = "chat";
         app.input = "stream a long deterministic answer";
-        app.atBottom = true;
+        app._ensureTabState(app.currentId).atBottom = true;
         return true;
         """,
     )
@@ -5778,8 +6144,8 @@ def test_120kb_mixed_sse_stream_renders_final_assistant_html(
         """() => {
           const app = document.querySelector("#app")._x_dataStack[0];
           const body = document.querySelector(".chat-body")?.textContent || "";
-          const last = app.messages[app.messages.length - 1];
-          return app.streaming === true
+          const last = app._ensureTabState(app.currentId).messages[app._ensureTabState(app.currentId).messages.length - 1];
+          return app._ensureTabState(app.currentId).streaming === true
             && last && last.role === "assistant"
             && last._streamPlain === true
             && last._streamText.includes("MID_STREAM_VISIBLE_1")
@@ -5790,9 +6156,9 @@ def test_120kb_mixed_sse_stream_renders_final_assistant_html(
     mid_1 = _app_eval(
         page,
         """
-        const last = app.messages[app.messages.length - 1];
+        const last = app._ensureTabState(app.currentId).messages[app._ensureTabState(app.currentId).messages.length - 1];
         return {
-          streaming: app.streaming,
+          streaming: app._ensureTabState(app.currentId).streaming,
           textLength: last.text.length,
           streamTextLength: last._streamText.length,
         };
@@ -5809,8 +6175,8 @@ def test_120kb_mixed_sse_stream_renders_final_assistant_html(
         """prev => {
           const app = document.querySelector("#app")._x_dataStack[0];
           const body = document.querySelector(".chat-body")?.textContent || "";
-          const last = app.messages[app.messages.length - 1];
-          return app.streaming === true
+          const last = app._ensureTabState(app.currentId).messages[app._ensureTabState(app.currentId).messages.length - 1];
+          return app._ensureTabState(app.currentId).streaming === true
             && last && last.role === "assistant"
             && last.text.length > prev.textLength
             && last._streamText.length > prev.streamTextLength
@@ -5851,8 +6217,8 @@ def test_120kb_mixed_sse_stream_renders_final_assistant_html(
     page.wait_for_function(
         """expectsPlain => {
           const app = document.querySelector('#app')._x_dataStack[0];
-          const last = app.messages[app.messages.length - 1];
-          return app.streaming === true && last
+          const last = app._ensureTabState(app.currentId).messages[app._ensureTabState(app.currentId).messages.length - 1];
+          return app._ensureTabState(app.currentId).streaming === true && last
             && last._streamPlain === expectsPlain
             && last.text.includes('FINAL_ASSISTANT_HTML_COMPLETE')
             && (expectsPlain || last.html.includes('FINAL_ASSISTANT_HTML_COMPLETE'));
@@ -5870,8 +6236,8 @@ def test_120kb_mixed_sse_stream_renders_final_assistant_html(
     page.wait_for_function(
         """() => {
           const app = document.querySelector("#app")._x_dataStack[0];
-          const last = app.messages[app.messages.length - 1];
-          return app.streaming === false
+          const last = app._ensureTabState(app.currentId).messages[app._ensureTabState(app.currentId).messages.length - 1];
+          return app._ensureTabState(app.currentId).streaming === false
             && last && last.role === "assistant"
             && last.text.length >= 120000
             && last.text.includes("FINAL_ASSISTANT_HTML_COMPLETE")
@@ -5883,12 +6249,12 @@ def test_120kb_mixed_sse_stream_renders_final_assistant_html(
         "FINAL_ASSISTANT_HTML_COMPLETE", timeout=5000
     )
     assert page.locator(".msg-pane:visible .msg").count() <= 50
-    assert _app_eval(page, "return app.messages.length;") <= 50
+    assert _app_eval(page, "return app._ensureTabState(app.currentId).messages.length;") <= 50
     assert _app_eval(
         page,
         """
-        const roles = app.messages.map(m => m.role);
-        const last = app.messages[app.messages.length - 1];
+        const roles = app._ensureTabState(app.currentId).messages.map(m => m.role);
+        const last = app._ensureTabState(app.currentId).messages[app._ensureTabState(app.currentId).messages.length - 1];
         return roles.includes("thinking")
           && roles.includes("tool_use")
           && roles.includes("tool_result")

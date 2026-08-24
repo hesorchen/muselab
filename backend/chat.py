@@ -9,12 +9,14 @@ import json
 import asyncio
 import re
 import sys
+import sqlite3
 import shutil
 import subprocess
 import tempfile
 import time
 import urllib.parse
 import uuid
+from dataclasses import dataclass, field as dataclass_field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable, Iterable, Literal, get_args
@@ -50,7 +52,8 @@ from claude_agent_sdk import (
     fork_session as sdk_fork_session,
 )
 from claude_agent_sdk.types import HookMatcher, PermissionMode
-from .auth import require_token_query, require_token, require_token_header_or_query
+from .auth import require_token, require_token_header_or_query
+from .capability_tickets import tickets
 from .settings import (
     ROOT,
     MODEL,
@@ -70,6 +73,7 @@ from . import chat_overlays
 from . import chat_runtime
 from . import chat_successor
 from . import transcript_index as transcript_idx
+from .imagegen_job_store import ImagegenJobStore
 from .workspaces import (
     registry as workspace_registry,
     resolve_workspace_root,
@@ -81,6 +85,18 @@ from .ask_user_question import (
 from . import permission_request as perm
 from . import memory_client as mem0
 from . import observability as obs
+from .private_storage import (
+    UnsafePrivatePath,
+    ensure_private_directory,
+    ensure_private_regular_file,
+    private_path_kind,
+    repair_private_path,
+    write_private_bytes,
+)
+from .attachment_queue_store import (
+    DurableAttachmentError,
+    DurableAttachmentStore,
+)
 from .sdk_compat import UnsignedThinkingCompatibleClient
 
 # Compatibility export: tests and local tooling construct durable interrupted
@@ -990,6 +1006,25 @@ class TurnBroadcast:
         self.user_text: str = ""
         self.user_images: list[dict] = []
         self.user_docs: list[dict] = []
+        # Staged uploads remain in the global store until the SDK query write
+        # succeeds. These private fields carry their exclusive lease and any
+        # pre-query disk artifacts across compact/preflight awaits so every
+        # failure/cancellation path can release one coherent transaction.
+        self._attachment_lease: "_StagedAttachmentLease | None" = None
+        self._prepared_attachments: "_PreparedStagedAttachments | None" = None
+        # Preparation wraps an actual worker thread. Rollback joins this task
+        # before exposing the staged id for retry, even when a force-stop
+        # watchdog takes over from a startup/pump task that never ran finally.
+        self._attachment_prepare_task: "asyncio.Task | None" = None
+        # A single shielded rollback owner makes cleanup idempotent under the
+        # pump, startup owner, watchdog, and repeated Task.cancel() racing one
+        # another. The completed task is retained for the broadcast lifetime.
+        self._attachment_rollback_task: "asyncio.Task | None" = None
+        # Startup settlement (lease/files + queue + Activity + active slot +
+        # sidecar/snapshot) likewise has one owner. The first terminal path
+        # wins; later paths only join it instead of duplicating bookkeeping.
+        self._startup_terminal_cleanup_task: "asyncio.Task | None" = None
+        self._startup_queue_settled = False
         # Display-only recovery boundary for an explicitly interrupted turn.
         # The Claude CLI may abort before it flushes this turn to JSONL, while
         # the browser has already rendered text/thinking/tool cards.  Capture
@@ -1447,6 +1482,10 @@ _runtime_continuation_delivery_tasks = (
 _session_disconnect_tasks = chat_runtime.SESSION_DISCONNECT_TASKS
 _session_disconnect_failed = chat_runtime.SESSION_DISCONNECT_FAILED
 _CLIENT_DISCONNECT_DEADLINE_S = chat_runtime.CLIENT_DISCONNECT_DEADLINE_S
+_ATTACHMENT_SHUTDOWN_JOIN_S = 4.0
+# Attachment workers and their finalizers form a protected lifecycle fence.
+# Tests may reduce the bounded join while production retains enough time for
+# ordinary fsync and document conversion to finish.
 # Turn/scheduler owners cancelled by session deletion can outlive their first
 # bounded join. Keep the exact handles keyed by session so a retry cannot race
 # ahead and purge the transcript while an earlier owner is still unwinding.
@@ -3186,7 +3225,15 @@ async def _build_and_connect_client(
             # connect() may already have spawned the CLI before it becomes
             # cancellable. Until this function returns, the client is not in
             # the pool and no other cleanup path can reach it.
-            await _disconnect_unpooled_client(client, session_id)
+            try:
+                await _disconnect_unpooled_client(client, session_id)
+            except Exception as cleanup_exc:
+                sys.stderr.write(
+                    "[client-pool] connect failure cleanup pending "
+                    f"sid={session_id[:8]} "
+                    f"exc={type(cleanup_exc).__name__}\n"
+                )
+                sys.stderr.flush()
             raise
         return client
     except Exception as e:
@@ -3227,7 +3274,15 @@ async def _build_and_connect_client(
                 try:
                     await client.connect()
                 except BaseException:
-                    await _disconnect_unpooled_client(client, session_id)
+                    try:
+                        await _disconnect_unpooled_client(client, session_id)
+                    except Exception as cleanup_exc:
+                        sys.stderr.write(
+                            "[client-pool] retry connect cleanup pending "
+                            f"sid={session_id[:8]} "
+                            f"exc={type(cleanup_exc).__name__}\n"
+                        )
+                        sys.stderr.flush()
                     raise
                 if attempt > 0:
                     sys.stderr.write(
@@ -3548,6 +3603,7 @@ async def shutdown_runtime() -> None:
 
     # Stop detached task watchers and active turn pumps before tearing down the
     # shared SDK streams they consume.
+    active_broadcasts = tuple(_active_turns.values())
     tasks: set[asyncio.Task] = {
         task for task in _task_watchers.values() if not task.done()
     }
@@ -3559,12 +3615,20 @@ async def shutdown_runtime() -> None:
         protected_cleanup_tasks.update(
             task for task in owners if not task.done()
         )
-    for broadcast in tuple(_active_turns.values()):
+    for broadcast in active_broadcasts:
         broadcast.cancelled = True
         for attr in ("startup_task", "startup_owner_task", "task"):
             task = getattr(broadcast, attr, None)
             if isinstance(task, asyncio.Task) and not task.done():
                 tasks.add(task)
+        for attr in (
+            "_attachment_prepare_task",
+            "_attachment_rollback_task",
+            "_startup_terminal_cleanup_task",
+        ):
+            task = getattr(broadcast, attr, None)
+            if isinstance(task, asyncio.Task) and not task.done():
+                protected_cleanup_tasks.add(task)
     tasks.difference_update(protected_cleanup_tasks)
     for task in tasks:
         task.cancel()
@@ -3574,6 +3638,21 @@ async def shutdown_runtime() -> None:
             await asyncio.gather(*done, return_exceptions=True)
         for task in pending:
             _retain_detached_cleanup(task)
+
+    # A cancelled owner may never run its coroutine/finally. Create an explicit
+    # attachment finalizer for every active broadcast and protect it through the
+    # second shutdown join.
+    attachment_finalizers: dict[asyncio.Task, TurnBroadcast] = {}
+    for broadcast in active_broadcasts:
+        if (
+            broadcast._attachment_lease is not None
+            or broadcast._attachment_prepare_task is not None
+        ):
+            finalizer = asyncio.create_task(
+                _rollback_broadcast_attachments(broadcast)
+            )
+            protected_cleanup_tasks.add(finalizer)
+            attachment_finalizers[finalizer] = broadcast
 
     broadcasts = {
         id(broadcast): broadcast
@@ -3599,12 +3678,31 @@ async def shutdown_runtime() -> None:
     async def _join_protected_cleanup() -> None:
         if not protected_cleanup_tasks:
             return
-        done, _pending = await asyncio.wait(
+        done, pending = await asyncio.wait(
             protected_cleanup_tasks,
-            timeout=4.0,
+            timeout=_ATTACHMENT_SHUTDOWN_JOIN_S,
         )
         if done:
             await asyncio.gather(*done, return_exceptions=True)
+        if not pending:
+            return
+
+        # Persist predicted final paths before the process lifecycle fence
+        # opens. Startup reconciliation removes files a slow worker may publish
+        # after the bounded shutdown deadline.
+        candidates: list[str] = []
+        for task in pending:
+            broadcast = attachment_finalizers.get(task)
+            if broadcast is not None:
+                candidates.extend(
+                    _broadcast_attachment_artifact_candidates(broadcast)
+                )
+            _retain_detached_cleanup(task)
+        if candidates:
+            await asyncio.to_thread(
+                _record_attachment_cleanup_intents,
+                candidates,
+            )
 
     await asyncio.gather(
         chat_runtime.shutdown_clients(),
@@ -3676,6 +3774,43 @@ def _attachments_base() -> Path:
     return ROOT / ".muselab-attach"
 
 
+def _attachment_session_dir(
+    session_id: str,
+    *,
+    create: bool,
+) -> Path | None:
+    """Return a real private session directory without following symlinks."""
+    if not re.fullmatch(r"[A-Za-z0-9_\-]{6,80}", session_id):
+        raise UnsafePrivatePath("invalid attachment session directory")
+    base = _attachments_base()
+    if not ensure_private_directory(base, create=create):
+        return None
+    session_dir = base / session_id
+    if not ensure_private_directory(session_dir, create=create):
+        return None
+    return session_dir
+
+
+def ensure_private_attachment_storage() -> int:
+    """Repair attachment permissions from older umask-dependent releases."""
+    base = _attachments_base()
+    if not ensure_private_directory(base, create=False):
+        return 0
+    repaired = 1
+    for session_dir in base.iterdir():
+        if repair_private_path(session_dir) != "directory":
+            continue
+        repaired += 1
+        try:
+            children = list(session_dir.iterdir())
+        except OSError:
+            continue
+        for attachment in children:
+            if repair_private_path(attachment) == "file":
+                repaired += 1
+    return repaired
+
+
 # Longest filename component we'll write. Keeps `{aid}-{name}` (32 hex + dash
 # + this) comfortably under the 255-byte limit ext4/APFS enforce PER COMPONENT
 # — and that limit is in BYTES, so a CJK name at 3 bytes/char hits it ~3x
@@ -3726,9 +3861,9 @@ def _persist_attachment(session_id: str, aid: str, name: str,
                         data: bytes) -> tuple[str, str] | None:
     """Write one attachment to `.muselab-attach/{sid}/{aid}-{safe name}`.
 
-    Returns (absolute path, browser URL), or None if the write failed — a
-    failed attachment must not abort the turn, the user still gets their
-    prompt through, just without that file. Callers log nothing extra; the
+    Returns (absolute path, browser URL), or None if the write failed. The
+    caller decides whether that file is optional (image/PDF local fallback)
+    or required (text/xlsx path manifest). Callers log nothing extra; the
     stderr line here is the single record.
 
     The `{aid}-` prefix is what makes the name collision-proof: two messages
@@ -3737,11 +3872,14 @@ def _persist_attachment(session_id: str, aid: str, name: str,
     folder) what the file is.
     """
     safe = _safe_attach_name(name)
-    attach_dir = _attachments_base() / session_id
     try:
-        attach_dir.mkdir(parents=True, exist_ok=True)
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9\-]{0,79}", aid):
+            raise UnsafePrivatePath("invalid attachment id")
+        attach_dir = _attachment_session_dir(session_id, create=True)
+        if attach_dir is None:
+            raise UnsafePrivatePath("attachment directory is unavailable")
         path = attach_dir / f"{aid}-{safe}"
-        path.write_bytes(data)
+        write_private_bytes(path, data)
     except Exception as e:
         sys.stderr.write(
             f"[attach] persist failed sid={obs.short_id(session_id)} "
@@ -3764,6 +3902,487 @@ def _doc_item(name: str, kind: str, saved: tuple[str, str] | None) -> dict:
     return item
 
 
+_attachment_cleanup_intent_lock = threading.RLock()
+_PRIVATE_TEMP_NAME_RE = re.compile(r"^\..+\.[0-9a-f]{16}\.tmp$")
+
+
+def _attachment_cleanup_intent_path() -> Path:
+    return _attachments_base() / ".cleanup-intents.json"
+
+
+def _normalized_attachment_cleanup_paths(paths: Iterable[str]) -> list[str]:
+    """Keep only lexical descendants of MuseLab's attachment root."""
+    base = Path(os.path.abspath(_attachments_base()))
+    intent_path = Path(os.path.abspath(_attachment_cleanup_intent_path()))
+    normalized: list[str] = []
+    for raw_path in paths:
+        path = Path(os.path.abspath(str(raw_path)))
+        try:
+            path.relative_to(base)
+        except ValueError:
+            continue
+        if path == intent_path:
+            continue
+        normalized.append(str(path))
+    return list(dict.fromkeys(normalized))
+
+
+def _load_attachment_cleanup_intents_locked() -> list[str]:
+    path = _attachment_cleanup_intent_path()
+    try:
+        if not ensure_private_regular_file(path):
+            return []
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError, UnsafePrivatePath):
+        return []
+    raw_paths = payload.get("paths") if isinstance(payload, dict) else None
+    return _normalized_attachment_cleanup_paths(
+        raw_paths if isinstance(raw_paths, list) else []
+    )
+
+
+def _write_attachment_cleanup_intents_locked(paths: Iterable[str]) -> None:
+    normalized = _normalized_attachment_cleanup_paths(paths)
+    intent_path = _attachment_cleanup_intent_path()
+    if not normalized:
+        try:
+            intent_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return
+    try:
+        write_private_bytes(
+            intent_path,
+            json.dumps({"paths": normalized}, ensure_ascii=False).encode(),
+        )
+    except Exception as exc:
+        sys.stderr.write(
+            f"[attach] cleanup intent write failed "
+            f"exc={type(exc).__name__}\n"
+        )
+        sys.stderr.flush()
+
+
+def _record_attachment_cleanup_intents(paths: Iterable[str]) -> None:
+    with _attachment_cleanup_intent_lock:
+        existing = _load_attachment_cleanup_intents_locked()
+        _write_attachment_cleanup_intents_locked([*existing, *paths])
+
+
+def _stale_attachment_temp_paths() -> list[Path]:
+    """List writer-owned temp files without following arbitrary directories."""
+    base = _attachments_base()
+    if not ensure_private_directory(base, create=False):
+        return []
+    directories = [base]
+    try:
+        children = list(base.iterdir())
+    except OSError:
+        return []
+    directories.extend(
+        child for child in children
+        if private_path_kind(child) == "directory"
+    )
+    stale: list[Path] = []
+    for directory in directories:
+        try:
+            entries = list(directory.iterdir())
+        except OSError:
+            continue
+        stale.extend(
+            entry for entry in entries
+            if _PRIVATE_TEMP_NAME_RE.fullmatch(entry.name)
+            and private_path_kind(entry) == "file"
+        )
+    return stale
+
+
+def _drain_attachment_cleanup_intents() -> int:
+    """Retry orphan cleanup from a prior failure or bounded shutdown."""
+    with _attachment_cleanup_intent_lock:
+        pending = _load_attachment_cleanup_intents_locked()
+        failed: list[str] = []
+        removed = 0
+        pending.extend(str(path) for path in _stale_attachment_temp_paths())
+        for raw_path in pending:
+            try:
+                Path(raw_path).unlink(missing_ok=True)
+                removed += 1
+            except OSError:
+                failed.append(raw_path)
+        _write_attachment_cleanup_intents_locked(failed)
+    if failed:
+        sys.stderr.write(
+            f"[attach] cleanup retry pending count={len(failed)}\n"
+        )
+        sys.stderr.flush()
+    return removed
+
+
+def _broadcast_attachment_artifact_candidates(
+    broadcast: TurnBroadcast,
+) -> list[str]:
+    """Predict every final path so bounded shutdown can persist cleanup."""
+    paths = list(
+        broadcast._prepared_attachments.artifact_paths
+        if broadcast._prepared_attachments is not None else []
+    )
+    lease = broadcast._attachment_lease
+    if lease is None:
+        return _normalized_attachment_cleanup_paths(paths)
+    base = _attachments_base() / broadcast.session_id
+    for aid, entry in lease.items:
+        kind = str(entry.get("kind") or "image")
+        name = str(entry.get("name") or "file")
+        if kind == "image":
+            ext = {
+                "image/png": "png", "image/jpeg": "jpg",
+                "image/jpg": "jpg", "image/gif": "gif",
+                "image/webp": "webp",
+            }.get(str(entry.get("mime") or ""), "bin")
+            paths.append(str(base / f"{aid}.{ext}"))
+        elif kind in {"pdf", "text", "xlsx"}:
+            paths.append(str(base / f"{aid}-{_safe_attach_name(name)}"))
+            if kind == "xlsx":
+                txt_name = Path(name).stem + ".txt"
+                paths.append(str(
+                    base / f"{aid}-txt-{_safe_attach_name(txt_name)}"
+                ))
+    return _normalized_attachment_cleanup_paths(paths)
+
+
+def _cleanup_prepared_attachments_sync(
+    prepared: "_PreparedStagedAttachments",
+) -> None:
+    """Remove pre-query artifacts after a lease rolls back."""
+    failed: list[str] = []
+    for raw_path in reversed(list(dict.fromkeys(prepared.artifact_paths))):
+        try:
+            Path(raw_path).unlink(missing_ok=True)
+        except OSError as exc:
+            failed.append(raw_path)
+            sys.stderr.write(
+                f"[attach] rollback unlink failed "
+                f"exc={type(exc).__name__}\n"
+            )
+            sys.stderr.flush()
+    if failed:
+        _record_attachment_cleanup_intents(failed)
+
+
+def _prepare_staged_attachments_sync(
+    session_id: str,
+    items: tuple[tuple[str, dict], ...],
+) -> "_PreparedStagedAttachments":
+    """Decode, thumbnail and persist one leased attachment set in a worker."""
+    prepared = _PreparedStagedAttachments()
+    try:
+        for aid, entry in items:
+            kind = entry.get("kind", "image")
+            if kind == "image":
+                encoded = str(entry.get("b64") or "")
+                try:
+                    raw = base64.b64decode(encoded, validate=True)
+                except Exception:
+                    raise _AttachmentPreparationError(
+                        "image attachment could not be decoded") from None
+                prepared.img_blocks.append({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": entry["mime"],
+                        "data": encoded,
+                    },
+                })
+                ext_map = {
+                    "image/png": "png", "image/jpeg": "jpg",
+                    "image/jpg": "jpg", "image/gif": "gif",
+                    "image/webp": "webp",
+                }
+                ext = ext_map.get(entry["mime"], "bin")
+                full_url = None
+                try:
+                    attach_dir = _attachment_session_dir(
+                        session_id, create=True)
+                    if attach_dir is None:
+                        raise UnsafePrivatePath(
+                            "attachment directory unavailable")
+                    attach_path = attach_dir / f"{aid}.{ext}"
+                    write_private_bytes(attach_path, raw)
+                    prepared.artifact_paths.append(str(attach_path))
+                    full_url = (
+                        f"/api/chat/attachments/{session_id}/{aid}.{ext}"
+                    )
+                except Exception as exc:
+                    sys.stderr.write(
+                        f"[attach] persist failed "
+                        f"sid={obs.short_id(session_id)} "
+                        f"aid={obs.short_id(aid)} "
+                        f"exc={type(exc).__name__} kind=write\n")
+                    sys.stderr.flush()
+
+                thumb_b64 = None
+                image_module = None
+                try:
+                    import io
+                    import warnings
+                    from PIL import Image as image_module
+
+                    with warnings.catch_warnings():
+                        warnings.simplefilter(
+                            "error", image_module.DecompressionBombWarning)
+                        with image_module.open(io.BytesIO(raw)) as image:
+                            width, height = image.size
+                            if width * height > _IMAGE_THUMBNAIL_MAX_PIXELS:
+                                raise image_module.DecompressionBombError(
+                                    "thumbnail pixel budget exceeded")
+                            image.thumbnail((160, 160))
+                            buf = io.BytesIO()
+                            image.convert("RGB").save(
+                                buf, "JPEG", quality=60)
+                            thumb_b64 = base64.b64encode(
+                                buf.getvalue()).decode("ascii")
+                except Exception as exc:
+                    bomb_types = (
+                        getattr(image_module, "DecompressionBombError", ()),
+                        getattr(image_module, "DecompressionBombWarning", ()),
+                    )
+                    if image_module is not None and isinstance(exc, bomb_types):
+                        sys.stderr.write(
+                            "[attach] thumbnail skipped reason=pixel_budget\n")
+                        sys.stderr.flush()
+                item: dict = {"mime": entry["mime"]}
+                if thumb_b64:
+                    item["thumb"] = thumb_b64
+                if full_url:
+                    item["url"] = full_url
+                prepared.persisted_imgs.append(item)
+            elif kind == "pdf":
+                encoded = str(entry.get("b64") or "")
+                try:
+                    raw = base64.b64decode(encoded, validate=True)
+                except Exception:
+                    raise _AttachmentPreparationError(
+                        "PDF attachment could not be decoded") from None
+                prepared.pdf_blocks.append({
+                    "type": "document",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "application/pdf",
+                        "data": encoded,
+                    },
+                })
+                doc_name = entry.get("name", "doc.pdf")
+                saved = _persist_attachment(
+                    session_id, aid, doc_name, raw)
+                if saved:
+                    prepared.artifact_paths.append(saved[0])
+                    prepared.disk_attachments.append(
+                        (_safe_attach_name(doc_name), saved[0], ""))
+                # The native SDK block remains useful if the optional local
+                # gateway fallback cannot be written.
+                prepared.persisted_docs.append(
+                    _doc_item(doc_name, "pdf", saved))
+            elif kind == "text":
+                doc_name = entry.get("name", "file.txt")
+                raw = entry.get("raw")
+                if not isinstance(raw, bytes):
+                    raw = str(entry.get("text") or "").encode("utf-8")
+                saved = _persist_attachment(
+                    session_id, aid, doc_name, raw)
+                if not saved:
+                    raise _AttachmentPreparationError(
+                        "text attachment could not be persisted")
+                prepared.artifact_paths.append(saved[0])
+                prepared.disk_attachments.append(
+                    (_safe_attach_name(doc_name), saved[0], ""))
+                prepared.persisted_docs.append(
+                    _doc_item(doc_name, "text", saved))
+            elif kind == "xlsx":
+                doc_name = entry.get("name", "book.xlsx")
+                raw = entry.get("raw")
+                if not isinstance(raw, bytes):
+                    raise _AttachmentPreparationError(
+                        "spreadsheet attachment payload is unavailable")
+                transcription = entry.get("text")
+                if not isinstance(transcription, str):
+                    raise _AttachmentPreparationError(
+                        "spreadsheet transcription is unavailable")
+                saved = _persist_attachment(
+                    session_id, aid, doc_name, raw)
+                if not saved:
+                    raise _AttachmentPreparationError(
+                        "spreadsheet attachment could not be persisted")
+                prepared.artifact_paths.append(saved[0])
+
+                txt_name = Path(doc_name).stem + ".txt"
+                txt_saved = _persist_attachment(
+                    session_id,
+                    aid + "-txt",
+                    txt_name,
+                    transcription.encode("utf-8"),
+                )
+                if not txt_saved:
+                    raise _AttachmentPreparationError(
+                        "spreadsheet transcription could not be persisted")
+                prepared.artifact_paths.append(txt_saved[0])
+                prepared.disk_attachments.append((
+                    _safe_attach_name(doc_name),
+                    saved[0],
+                    f"plain-text transcription: {txt_saved[0]}",
+                ))
+                prepared.persisted_docs.append(
+                    _doc_item(doc_name, "xlsx", saved))
+            else:
+                raise _AttachmentPreparationError(
+                    "unsupported staged attachment kind")
+    except BaseException:
+        _cleanup_prepared_attachments_sync(prepared)
+        raise
+    return prepared
+
+
+async def _await_thread_completion(func: Callable, *args):
+    """Join a real worker result even when the awaiting task is cancelled."""
+    task = asyncio.create_task(asyncio.to_thread(func, *args))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                continue
+        try:
+            task.result()
+        except Exception:
+            pass
+        raise
+
+
+async def _prepare_broadcast_attachments(
+    broadcast: TurnBroadcast,
+    session_id: str,
+    lease: "_StagedAttachmentLease",
+) -> "_PreparedStagedAttachments":
+    """Run preparation off-loop and retain its real result on cancellation."""
+    task = broadcast._attachment_prepare_task
+    if task is None:
+        task = asyncio.create_task(asyncio.to_thread(
+            _prepare_staged_attachments_sync,
+            session_id,
+            lease.items,
+        ))
+        broadcast._attachment_prepare_task = task
+    try:
+        prepared = await asyncio.shield(task)
+    except asyncio.CancelledError:
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                continue
+        try:
+            prepared = task.result()
+        except Exception:
+            # The sync worker cleans every partial artifact before raising.
+            pass
+        else:
+            if (broadcast._attachment_lease is lease
+                    and broadcast._attachment_rollback_task is None):
+                broadcast._prepared_attachments = prepared
+        raise
+    # A watchdog can start the shared rollback while joining this same worker.
+    # Never resurrect its cleaned result after that owner has taken over.
+    if (broadcast._attachment_lease is lease
+            and broadcast._attachment_rollback_task is None):
+        broadcast._prepared_attachments = prepared
+    return prepared
+
+
+async def _rollback_broadcast_attachments(broadcast: TurnBroadcast) -> None:
+    """Join and roll back one attachment transaction exactly once.
+
+    Pump, startup, and force-stop paths may arrive concurrently. The first
+    caller creates a shielded cleanup owner; every later caller joins that same
+    task. Preparation is joined before files are removed and the lease is
+    released, so a retry can never race a still-running writer.
+    """
+    cleanup = broadcast._attachment_rollback_task
+    if cleanup is None:
+        lease = broadcast._attachment_lease
+        rollback_won = _begin_staged_attachment_rollback(lease)
+
+        async def _cleanup() -> None:
+            if lease is None or not rollback_won:
+                return
+            prepared = broadcast._prepared_attachments
+            prepare_task = broadcast._attachment_prepare_task
+            try:
+                if prepare_task is not None:
+                    try:
+                        prepared = await asyncio.shield(prepare_task)
+                    except asyncio.CancelledError:
+                        if not prepare_task.cancelled():
+                            while not prepare_task.done():
+                                try:
+                                    await asyncio.shield(prepare_task)
+                                except asyncio.CancelledError:
+                                    continue
+                        if prepare_task.cancelled():
+                            prepared = None
+                        else:
+                            try:
+                                prepared = prepare_task.result()
+                            except Exception:
+                                prepared = None
+                    except Exception:
+                        # The sync preparer removes its own partial files before
+                        # propagating an error.
+                        prepared = None
+                    else:
+                        broadcast._prepared_attachments = prepared
+                if prepared is not None:
+                    await _await_thread_completion(
+                        _cleanup_prepared_attachments_sync, prepared)
+            finally:
+                _release_staged_attachment_lease(lease)
+                broadcast._attachment_lease = None
+                broadcast._prepared_attachments = None
+                broadcast._attachment_prepare_task = None
+
+        cleanup = asyncio.create_task(_cleanup())
+        broadcast._attachment_rollback_task = cleanup
+    try:
+        await asyncio.shield(cleanup)
+    except asyncio.CancelledError:
+        # Repeated cancellation cannot cut the transaction between releasing
+        # the staged id and settling the caller's remaining terminal state.
+        while not cleanup.done():
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                continue
+        cleanup.result()
+        raise
+
+
+def _commit_broadcast_attachments(broadcast: TurnBroadcast) -> None:
+    """Consume a lease exactly after the SDK query write succeeds."""
+    lease = broadcast._attachment_lease
+    if lease is None:
+        return
+    if not _commit_staged_attachment_lease(lease):
+        # query() already returned: transport acceptance is no longer
+        # reversible. Consume any objects still owned by this lease so a retry
+        # cannot duplicate an ambiguously submitted attachment.
+        _fail_closed_staged_attachment_lease(lease)
+        raise _AttachmentCommitUncertain("attachment submission state is uncertain")
+    broadcast._attachment_lease = None
+    broadcast._prepared_attachments = None
+    broadcast._attachment_prepare_task = None
+
+
 def _migrate_legacy_attachments() -> None:
     """One-shot migration: sessions/attachments/* → ROOT/.muselab-attach/*.
     Runs at module import. Idempotent — only moves dirs that don't yet
@@ -3771,24 +4390,25 @@ def _migrate_legacy_attachments() -> None:
     second-pass migration is a no-op."""
     old_base = sess.SESS_DIR / "attachments"
     new_base = _attachments_base()
-    if not old_base.exists() or old_base == new_base:
+    if private_path_kind(old_base) != "directory" or old_base == new_base:
         return
     try:
-        new_base.mkdir(parents=True, exist_ok=True)
-    except OSError:
+        ensure_private_directory(new_base)
+    except (OSError, UnsafePrivatePath):
         return
     moved = 0
     for child in list(old_base.iterdir()):
-        if not child.is_dir():
+        if private_path_kind(child) != "directory":
             continue
         target = new_base / child.name
-        if target.exists():
+        if private_path_kind(target) != "missing":
             continue  # already migrated; skip (don't clobber)
         try:
             shutil.move(str(child), str(target))
             moved += 1
         except OSError:
             pass
+    ensure_private_attachment_storage()
     # Remove empty old base
     try:
         if not any(old_base.iterdir()):
@@ -3803,6 +4423,7 @@ def _migrate_legacy_attachments() -> None:
 # Run migration once at import (cheap if no-op).
 try:
     _migrate_legacy_attachments()
+    _drain_attachment_cleanup_intents()
 except Exception:
     pass
 
@@ -5717,12 +6338,15 @@ async def _settle_turn_uuids(
             break
     return evidence
 
-@router.get("/sessions/{sid}/export", dependencies=[Depends(require_token_query)])
-def export_session_markdown(sid: str) -> Response:
+@router.get("/sessions/{sid}/export")
+def export_session_markdown(sid: str, ticket: str = Query("")) -> Response:
     """Render the transcript as a single Markdown file the user can save.
 
-    Auth is via ?token=... rather than the header — file downloads from a
-    plain anchor don't carry custom headers."""
+    A plain download anchor cannot add an auth header, so it carries a
+    short-lived, session-bound, single-use resource ticket instead of the
+    long-lived global API token.
+    """
+    _require_chat_resource_ticket(ticket, ("export", sid))
     meta = sess.get_session_meta(sid)
     if meta is None:
         raise HTTPException(404, "session not found")
@@ -5909,6 +6533,7 @@ def _purge_session_storage_disk_locked(sid: str) -> bool:
         removed = True
     except (FileNotFoundError, ValueError):
         pass   # JSONL never existed (session never streamed) — that's fine
+    _durable_attachment_store.cancel_session(sid)
     if sess.delete_session(sid):
         removed = True
     try:
@@ -5919,11 +6544,14 @@ def _purge_session_storage_disk_locked(sid: str) -> bool:
     # persisted by upload-image → send pipeline). Without this, deleting
     # a session would orphan its image files on disk forever.
     attach_dir = _attachments_base() / sid
-    if attach_dir.exists():
-        try:
-            shutil.rmtree(attach_dir, ignore_errors=True)
-        except OSError:
-            pass
+    try:
+        kind = private_path_kind(attach_dir)
+        if kind == "directory":
+            shutil.rmtree(attach_dir)
+        elif kind in {"file", "symlink", "other"}:
+            attach_dir.unlink()
+    except OSError:
+        pass
     _delete_active_turn_sidecar(sid)
     _delete_cancelled_turn_snapshots(sid)
     _delete_runtime_continuation_outboxes(sid)
@@ -6338,23 +6966,34 @@ def get_queue_api(sid: str, response: Response) -> dict:
     # only persists comma-joined upload ids — the preview blobs live in
     # _image_store. Ids missing there have expired (10-min TTL); we flag them
     # `available: False` so the UI can show "附件已过期" instead of a dead chip.
-    _gc_images()
-    for it in data.get("items", []):
-        ids = [x.strip() for x in (it.get("image_ids") or "").split(",") if x.strip()]
-        atts: list[dict] = []
-        for aid in ids:
-            entry = _image_store.get(aid)
-            if entry is None:
-                atts.append({"id": aid, "available": False})
-                continue
-            atts.append({
-                "id": aid,
-                "kind": entry.get("kind", "image"),
-                "name": entry.get("name", ""),
-                "mime": entry.get("mime", ""),
-                "available": True,
-            })
-        it["attachments"] = atts
+    with _image_store_lock:
+        _gc_images_locked()
+        for it in data.get("items", []):
+            ids = _attachment_ids(it.get("image_ids") or "")
+            atts: list[dict] = []
+            for aid in ids:
+                if not _valid_staged_attachment_id(aid):
+                    atts.append({"id": aid, "available": False})
+                    continue
+                entry = _image_store.get(aid)
+                try:
+                    metadata = (
+                        entry or _durable_attachment_store.metadata(aid)
+                    )
+                except (DurableAttachmentError, OSError, sqlite3.Error,
+                        UnsafePrivatePath):
+                    metadata = None
+                if metadata is None:
+                    atts.append({"id": aid, "available": False})
+                    continue
+                atts.append({
+                    "id": aid,
+                    "kind": metadata.get("kind", "image"),
+                    "name": metadata.get("name", ""),
+                    "mime": metadata.get("mime", ""),
+                    "available": True,
+                })
+            it["attachments"] = atts
     return data
 
 
@@ -6377,10 +7016,11 @@ async def enqueue_api(
     background_tasks: BackgroundTasks,
 ) -> dict:
     text = (req.text or "").strip()
-    if not text and not (req.image_ids or "").strip():
+    attachment_ids = _attachment_ids(req.image_ids or "")
+    if any(not _valid_staged_attachment_id(aid) for aid in attachment_ids):
+        raise HTTPException(400, "bad attachment id")
+    if not text and not attachment_ids:
         raise HTTPException(400, "empty message")
-    # Validate at enqueue so a bad mode is a visible 400 NOW, not a silent
-    # headless failure when the drain replays the item later.
     if (req.permission or "").strip():
         _validate_permission(req.permission)
     selection_quotes = _normalize_queue_selection_quotes(
@@ -6390,9 +7030,42 @@ async def enqueue_api(
         if selection_quotes
         else (req.display_text or text)
     )
-    # Session discovery can walk SDK workspaces.  The sessions-layer helper
-    # also holds the per-session lifecycle lock through the queue commit so an
-    # explicit DELETE cannot race an SDK-only preflight and be resurrected.
+
+    # Bind blobs before the queue JSON commit. A crash may leave an orphan ref
+    # (startup reconciliation releases it), but can never leave an accepted
+    # queue row pointing at bytes that were never made durable.
+    queue_item_id = "q-" + uuid.uuid4().hex
+    if attachment_ids:
+        await asyncio.to_thread(_gc_images)
+        bind_task = asyncio.create_task(asyncio.to_thread(
+            _durable_attachment_store.bind_queue_item,
+            sid,
+            queue_item_id,
+            attachment_ids,
+            ttl=_IMAGE_TTL_S,
+        ))
+        try:
+            binding = await asyncio.shield(bind_task)
+        except asyncio.CancelledError:
+            while not bind_task.done():
+                try:
+                    await asyncio.shield(bind_task)
+                except asyncio.CancelledError:
+                    continue
+            binding = bind_task.result()
+            if not binding.missing and not binding.busy:
+                await asyncio.to_thread(
+                    _durable_attachment_store.finish_queue_item,
+                    sid,
+                    queue_item_id,
+                    consume=False,
+                )
+            raise
+        if binding.missing:
+            raise HTTPException(409, "attachment is missing or expired")
+        if binding.busy:
+            raise HTTPException(409, "attachment is already queued")
+
     enqueue_task = asyncio.create_task(
         asyncio.to_thread(
             sess.enqueue_existing_message,
@@ -6403,14 +7076,12 @@ async def enqueue_api(
             display_text=display_text,
             selection_quotes=selection_quotes,
             plan_return_permission=req.plan_return_permission,
+            item_id=queue_item_id,
         )
     )
     try:
         res = await asyncio.shield(enqueue_task)
     except asyncio.CancelledError:
-        # to_thread cannot be stopped after the disk mutation starts. Join the
-        # known outcome and schedule a successful commit before propagating the
-        # disconnect; otherwise accepted work can sit forever with no drain.
         while not enqueue_task.done():
             try:
                 await asyncio.shield(enqueue_task)
@@ -6419,16 +7090,57 @@ async def enqueue_api(
         res = enqueue_task.result()
         if res.get("ok"):
             _schedule_queue_drain(sid)
+        elif attachment_ids:
+            await asyncio.to_thread(
+                _durable_attachment_store.finish_queue_item,
+                sid,
+                queue_item_id,
+                consume=False,
+            )
+        raise
+    except BaseException:
+        # Atomic queue writes can report an I/O error after the rename commit.
+        # Resolve that ambiguity before releasing the durable reference: an
+        # item visible in waiting/inflight storage already owns the blobs.
+        queue_committed = False
+        try:
+            queue = await asyncio.to_thread(sess.get_queue, sid)
+            inflight = queue.get("inflight") or {}
+            persisted_ids = {
+                str(item.get("id") or "")
+                for item in queue.get("items") or []
+            }
+            inflight_id = str(
+                ((inflight.get("item") or {}).get("id") or "")
+            )
+            queue_committed = (
+                queue_item_id in persisted_ids or inflight_id == queue_item_id
+            )
+        except Exception:
+            # Unknown ownership fails closed: retain the ref for startup's
+            # complete queue reconciliation instead of risking data loss.
+            queue_committed = True
+        if queue_committed:
+            _schedule_queue_drain(sid)
+        elif attachment_ids:
+            await asyncio.to_thread(
+                _durable_attachment_store.finish_queue_item,
+                sid,
+                queue_item_id,
+                consume=False,
+            )
         raise
     if not res.get("ok"):
+        if attachment_ids:
+            await asyncio.to_thread(
+                _durable_attachment_store.finish_queue_item,
+                sid,
+                queue_item_id,
+                consume=False,
+            )
         if res.get("error") == "session_not_found":
             raise HTTPException(404, "session not found")
-        # queue_full → 409 so the FE can surface "队列已满（上限 10 条）".
         raise HTTPException(409, res.get("error", "enqueue failed"))
-    # Do not even *start* rollover/SDK work until Starlette has sent the final
-    # response body frame. Scheduling before ``return`` can let a CPU-heavy
-    # fork monopolise the loop/GIL before the enqueue ACK reaches the browser.
-    # The callback itself stays async because the scheduler is loop-owned.
     background_tasks.add_task(_schedule_queue_drain_after_response, sid)
     return res
 
@@ -6436,14 +7148,23 @@ async def enqueue_api(
 @router.delete("/sessions/{sid}/queue/{item_id}", dependencies=[Depends(require_token)])
 def remove_queue_item_api(sid: str, item_id: str) -> dict:
     try:
-        return sess.remove_queue_item(sid, item_id)
+        updated, removed_ids = sess.remove_queue_item_with_removed(
+            sid, item_id)
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    for removed_id in removed_ids:
+        _durable_attachment_store.finish_queue_item(
+            sid, removed_id, consume=False)
+    return updated
 
 
 @router.delete("/sessions/{sid}/queue", dependencies=[Depends(require_token)])
 def clear_queue_api(sid: str) -> dict:
-    return {"ok": True, **sess.clear_queue(sid)}
+    updated, item_ids = sess.clear_queue_with_removed(sid)
+    for item_id in item_ids:
+        _durable_attachment_store.finish_queue_item(
+            sid, item_id, consume=False)
+    return {"ok": True, **updated}
 
 
 @router.post("/sessions/{sid}/queue/pause", dependencies=[Depends(require_token)])
@@ -6468,7 +7189,7 @@ def reorder_queue_api(sid: str, req: QueueReorderReq) -> dict:
 # attachments dir actually has children.
 def _gc_orphan_attachments() -> None:
     base = _attachments_base()
-    if not base.exists():
+    if not ensure_private_directory(base, create=False):
         return
     try:
         # list_sessions() intentionally hides sessions belonging to a removed
@@ -6478,7 +7199,7 @@ def _gc_orphan_attachments() -> None:
     except Exception:
         return
     for child in base.iterdir():
-        if not child.is_dir():
+        if repair_private_path(child) != "directory":
             continue
         if child.name not in known_sids:
             try:
@@ -6493,23 +7214,24 @@ def attachments_usage() -> dict:
     can render this so users know how much disk their uploaded images
     have eaten, and can trigger a sweep."""
     base = _attachments_base()
-    if not base.exists():
+    if not ensure_private_directory(base, create=False):
         return {"total_bytes": 0, "file_count": 0, "session_count": 0}
     total = 0
     files = 0
     sessions_with_attach = 0
     for sid_dir in base.iterdir():
-        if not sid_dir.is_dir():
+        if repair_private_path(sid_dir) != "directory":
             continue
         has_any = False
-        for f in sid_dir.iterdir():
-            if f.is_file():
-                try:
-                    total += f.stat().st_size
-                    files += 1
-                    has_any = True
-                except OSError:
-                    pass
+        for attachment in sid_dir.iterdir():
+            if repair_private_path(attachment) != "file":
+                continue
+            try:
+                total += attachment.lstat().st_size
+                files += 1
+                has_any = True
+            except OSError:
+                pass
         if has_any:
             sessions_with_attach += 1
     return {
@@ -8754,6 +9476,8 @@ _INTERRUPT_FORCE_GRACE_S = max(
 # wins the race and the user's resend transparently succeeds instead of seeing
 # "previous turn still running" during the teardown window.
 _INTERRUPT_DRAIN_WAIT_S = 6.0
+_INTERRUPT_FORCE_OWNER_JOIN_S = 2.0
+_INTERRUPT_FORCE_DISCONNECT_JOIN_S = 0.25
 
 
 @router.post("/interrupt", dependencies=[Depends(require_token_header_or_query)])
@@ -8783,12 +9507,23 @@ async def interrupt(session_id: str) -> dict:
         # in front of the 2.5s grace period.
         asyncio.create_task(_force_stop_after_grace(session_id, bc))
         startup_task = getattr(bc, "startup_task", None)
+        startup_owner = getattr(bc, "startup_owner_task", None)
+        cancelled_startup = False
         if startup_task is not None and not startup_task.done():
             # Cold-start cancellation: no client has reached `_clients` yet,
             # so client.interrupt() cannot help. Cancelling this task unwinds
             # CLI/MCP initialization; _start_turn converts it to a replayable
             # `cancelled` terminal event.
             startup_task.cancel()
+            cancelled_startup = True
+        elif (bc.task is None and startup_owner is not None
+              and not startup_owner.done()):
+            # Attachment preparation and the final intent write happen after
+            # client startup but before the detached pump exists. Cancel their
+            # outer owner; its shielded cleanup joins any real worker first.
+            startup_owner.cancel()
+            cancelled_startup = True
+        if cancelled_startup:
             return {
                 "ok": True,
                 "interrupted": [f"{session_id}@startup"],
@@ -8872,19 +9607,17 @@ async def _force_stop_after_grace(
     bc: "TurnBroadcast",
     grace: float = _INTERRUPT_FORCE_GRACE_S,
 ) -> None:
-    """Guarantee an interrupted turn actually stops.
+    """Guarantee Stop settles one turn through its shared terminal owner.
 
-    `client.interrupt()` only asks the CLI nicely; for agentic turns it doesn't
-    always abort. This watchdog waits `grace` seconds and, if the SAME turn is
-    still pinned in `_active_turns`, kills the CLI subprocess so the pump's
-    `receive_response()` unblocks — its error→break→finally path then frees the
-    slot. Because `bc.cancelled` was set in `interrupt()`, event_gen renders
-    that teardown as a `cancelled` event rather than a red error. As a last
-    resort (pump never unwinds) it cancels the pump task directly and frees the
-    slot by hand."""
+    A pump task can be absent, cancelled before its coroutine starts (and thus
+    run no ``finally``), or ignore cancellation inside SDK code. The watchdog
+    first gives the ordinary owner a bounded chance, then joins/creates the
+    broadcast's shielded startup finalizer. That finalizer joins attachment
+    preparation, removes artifacts, releases the lease, and only then settles
+    Activity/queue/sidecar/active-turn state.
+    """
     try:
         await asyncio.sleep(grace)
-        # SDK interrupt drained it naturally — nothing to force.
         if _active_turns.get(session_id) is not bc or bc.done:
             return
         sys.stderr.write(
@@ -8893,66 +9626,51 @@ async def _force_stop_after_grace(
             f"forcing client teardown\n")
         sys.stderr.flush()
         bc.cancelled = True
-        # Kill the CLI subprocess(es) for this session. The detached pump's
-        # receive_response() then errors out and its finally pops _active_turns.
+        disconnect_task = asyncio.create_task(disconnect_client(session_id))
         try:
-            await disconnect_client(session_id)
+            await asyncio.wait_for(
+                asyncio.shield(disconnect_task),
+                timeout=_INTERRUPT_FORCE_DISCONNECT_JOIN_S,
+            )
+        except asyncio.TimeoutError:
+            # A stuck subprocess teardown cannot hold the attachment finalizer.
+            _retain_detached_cleanup(disconnect_task)
         except Exception:
             pass
-        # Give the pump a moment to unwind on its own.
-        for _ in range(20):   # up to ~2s
+        finally:
+            if not disconnect_task.done():
+                _retain_detached_cleanup(disconnect_task)
+
+        # Give the normal owner a short chance after transport teardown.
+        deadline = time.monotonic() + _INTERRUPT_FORCE_OWNER_JOIN_S
+        while time.monotonic() < deadline:
             if bc.done or _active_turns.get(session_id) is not bc:
                 return
-            await asyncio.sleep(0.1)
-        # Last resort: the pump never unblocked. Cancel it (its finally still
-        # frees the slot) and clean up by hand so the session can't stay wedged.
-        t = getattr(bc, "task", None)
-        if t is not None and not t.done():
-            t.cancel()
-            # Cancellation enters the pump's own ``finally``, which already
-            # settles Activity, queue ownership and the durable sidecar. Give
-            # that single owner a bounded chance to finish before taking over;
-            # otherwise both paths can release the same queue claim and publish
-            # the same Activity terminal transition.
+            await asyncio.sleep(0.05)
+
+        owner = getattr(bc, "task", None)
+        if owner is None or owner.done():
+            startup_owner = getattr(bc, "startup_owner_task", None)
+            if startup_owner is not None and not startup_owner.done():
+                owner = startup_owner
+        if owner is not None and not owner.done():
+            owner.cancel()
             try:
-                await asyncio.wait_for(asyncio.shield(t), timeout=2.0)
+                await asyncio.wait_for(
+                    asyncio.shield(owner),
+                    timeout=_INTERRUPT_FORCE_OWNER_JOIN_S,
+                )
             except (asyncio.CancelledError, asyncio.TimeoutError):
                 pass
             if bc.done or _active_turns.get(session_id) is not bc:
                 return
-        async with _lock:
-            if _active_turns.get(session_id) is bc:
-                _active_turns.pop(session_id, None)
-        snapshot_ready = bc.cancelled_snapshot_persisted
-        if not bc.done:
-            snapshot_ready = await asyncio.to_thread(
-                _persist_cancelled_turn_snapshot, bc)
-            bc.publish({
-                "event": "cancelled",
-                "data": json.dumps({"snapshot_ready": snapshot_ready}),
-            })
-        # The pump normally owns all terminal bookkeeping. If it never unwinds,
-        # the watchdog must perform the same externally visible settlement rather
-        # than merely freeing `_active_turns`: otherwise Activity can stay green/
-        # running and a queued item can remain durably inflight forever.
+
+        # This is also correct when owner is None/already-cancelled: unlike a
+        # coroutine finally block, the retained attachment/startup state still
+        # exists and has one explicit cleanup owner.
         mem0.pop_recall_trace(session_id)
-        await _finish_activity(session_id, bc, "cancelled")
-        if bc.queue_item_id:
-            sess.release_queue_claim(
-                session_id,
-                bc.queue_item_id,
-                turn_id=bc.turn_id,
-                pause=True,
-            )
         sess.pause_queue_if_nonempty(session_id)
-        bc.perf_status = "cancelled"
-        bc.perf_error_kind = "cancelled"
-        bc.finish()
-        _remember_recent_turn(session_id, bc)
-        if snapshot_ready or bc.queue_item_id:
-            _delete_active_turn_sidecar(session_id)
-        else:
-            _retain_active_turn_for_recovery(session_id)
+        await _finish_cancelled_startup(session_id, bc)
     except Exception as e:
         sys.stderr.write(
             f"[chat-interrupt] force-stop watchdog failed "
@@ -9165,7 +9883,8 @@ def _render_tool_result(
 #   - PDFs → DocumentBlock with base64 data (Claude supports PDFs natively)
 #   - text-ish docs (md / txt / csv / json / source code) → inline-text prefix
 #     in the prompt so any model can consume them. Stored as utf-8 text.
-# Stored in-memory; on restart pending uploads are lost (fine — re-attach).
+# SQLite metadata + private blobs are authoritative. `_image_store` is only a
+# process-local hot cache retained for preparation and compatibility callers.
 
 _image_store: dict[str, dict] = {}     # id -> {kind, mime, b64|text, name, ts}
 # Most staged-upload mutations run on the event loop, but the sync queue/image
@@ -9174,8 +9893,65 @@ _image_store: dict[str, dict] = {}     # id -> {kind, mime, b64|text, name, ts}
 # "validate every id, then remove every id" from a concurrent collector or
 # budget eviction.  Never hold it across an await.
 _image_store_lock = threading.RLock()
+# Exclusive staged-upload ownership. The payload stays in `_image_store` while
+# leased; GC and budget eviction skip its id until the lease is committed or
+# released. A separate map avoids leaking transaction-only fields through the
+# queue/resource APIs that expose entry metadata.
+_staged_attachment_claims: dict[str, str] = {}
+
+
+@dataclass
+class _StagedAttachmentLease:
+    token: str
+    items: tuple[tuple[str, dict], ...]
+    state: str = "active"
+    durable_ids: tuple[str, ...] = ()
+    rehydrated_ids: tuple[str, ...] = ()
+    queue_session_id: str = ""
+    queue_item_id: str = ""
+
+    @property
+    def ids(self) -> tuple[str, ...]:
+        return tuple(aid for aid, _entry in self.items)
+
+
+@dataclass
+class _PreparedStagedAttachments:
+    img_blocks: list[dict] = dataclass_field(default_factory=list)
+    pdf_blocks: list[dict] = dataclass_field(default_factory=list)
+    disk_attachments: list[tuple[str, str, str]] = dataclass_field(
+        default_factory=list)
+    persisted_imgs: list[dict] = dataclass_field(default_factory=list)
+    persisted_docs: list[dict] = dataclass_field(default_factory=list)
+    artifact_paths: list[str] = dataclass_field(default_factory=list)
+
+
+class _AttachmentPreparationError(RuntimeError):
+    """A required staged attachment could not reach its query-ready state."""
+
+
+class _AttachmentCommitUncertain(RuntimeError):
+    """The SDK accepted query bytes but lease ownership was no longer exact."""
+
+
+def _attachment_ids(raw_ids: str) -> list[str]:
+    return list(dict.fromkeys(
+        aid.strip() for aid in str(raw_ids or "").split(",") if aid.strip()
+    ))
+
+
+_STAGED_ATTACHMENT_ID_RE = re.compile(r"[A-Za-z0-9_-]{6,80}")
+
+
+def _valid_staged_attachment_id(aid: str) -> bool:
+    return _STAGED_ATTACHMENT_ID_RE.fullmatch(str(aid or "")) is not None
+
+
+
 _IMAGE_TTL_S = 600
 _IMAGE_MAX_BYTES = 10 * 1024 * 1024     # 10 MB per file
+_UPLOAD_READ_CHUNK_BYTES = 1024 * 1024
+_IMAGE_THUMBNAIL_MAX_PIXELS = 16 * 1024 * 1024
 # Total in-memory budget for *staged* (not-yet-consumed) uploads + a hard entry
 # cap. Without these, N uploads that never get consumed by a turn pin N×~13MB of
 # base64 in RAM until their 10-min TTL — an OOM vector. Generous enough never to
@@ -9183,6 +9959,9 @@ _IMAGE_MAX_BYTES = 10 * 1024 * 1024     # 10 MB per file
 # worst-case growth. Oldest-first eviction — see _enforce_image_budget.
 _IMAGE_STORE_MAX_BYTES = 256 * 1024 * 1024
 _IMAGE_STORE_MAX_ENTRIES = 48
+_ATTACHMENT_LEASE_S = 5 * 60
+_durable_attachment_store = DurableAttachmentStore(ROOT)
+
 _IMAGE_MIME = {"image/png", "image/jpeg", "image/gif", "image/webp"}
 _IMAGE_OUTPUT_MIME = {"png": "image/png", "jpeg": "image/jpeg", "webp": "image/webp"}
 _PDF_MIME = {"application/pdf"}
@@ -9219,66 +9998,320 @@ _XLSX_ATTACH_MAX_SHEETS = 5
 _XLSX_ATTACH_MAX_ROWS = 200
 _XLSX_ATTACH_MAX_COLS = 30
 _XLSX_ATTACH_CELL_MAX_CHARS = 200
+_XLSX_ARCHIVE_MAX_ENTRIES = 4096
+_XLSX_ARCHIVE_MAX_UNCOMPRESSED_BYTES = 64 * 1024 * 1024
+_XLSX_ARCHIVE_MAX_MEMBER_BYTES = 32 * 1024 * 1024
+_XLSX_ARCHIVE_MAX_COMPRESSION_RATIO = 200
+
+# Header-less browser resource surfaces use narrowly scoped, short-lived
+# capability tickets.  Export is a one-shot download; image resources permit a
+# small, finite number of reads because browsers may fetch the same URL for the
+# in-bubble image, the lightbox, and a conditional retry.
+_CHAT_RESOURCE_TICKET_KIND = "chat-resource"
+_CHAT_RESOURCE_TICKET_TTL = {
+    "export": 60,
+    "queued-image": min(300, _IMAGE_TTL_S),
+    "attachment": 600,
+}
+_CHAT_RESOURCE_TICKET_MAX_USES = {
+    "export": 1,
+    "queued-image": 8,
+    "attachment": 16,
+}
 
 
-def _gc_images() -> None:
-    """Drop entries older than TTL."""
-    cutoff = time.time() - _IMAGE_TTL_S
-    with _image_store_lock:
-        for k in list(_image_store.keys()):
-            entry = _image_store.get(k)
-            if entry is not None and entry["ts"] < cutoff:
-                _image_store.pop(k, None)
+class ChatResourceTicketReq(BaseModel):
+    resource: Literal["export", "queued-image", "attachment"]
+    session_id: str = Field(default="", max_length=80)
+    attachment_id: str = Field(default="", max_length=64)
+    filename: str = Field(default="", max_length=200)
 
 
-def _claim_staged_attachments(
+def _require_chat_resource_ticket(
+    ticket: str,
+    scope: tuple[str, ...],
+) -> None:
+    if not tickets.validate(ticket, _CHAT_RESOURCE_TICKET_KIND, scope):
+        raise HTTPException(
+            status_code=401,
+            detail="invalid or expired chat resource ticket",
+        )
+
+
+def _validate_attachment_ref(session_id: str, filename: str) -> Path:
+    """Return the exact persisted attachment selected by a resource ticket."""
+    if not re.fullmatch(r"[A-Za-z0-9_\-]{6,80}", session_id):
+        raise HTTPException(400, "bad session_id")
+    if ("/" in filename or ".." in filename or "\\" in filename
+            or not re.fullmatch(r"[^/\\\x00-\x1f\x7f]{1,200}", filename)):
+        raise HTTPException(400, "bad filename")
+    try:
+        session_dir = _attachment_session_dir(session_id, create=False)
+        if session_dir is None:
+            raise HTTPException(404, "attachment not found")
+        path = session_dir / filename
+        if not ensure_private_regular_file(path):
+            raise HTTPException(404, "attachment not found")
+    except UnsafePrivatePath:
+        raise HTTPException(400, "unsafe attachment storage") from None
+    return path
+
+
+@router.post("/resource-ticket", dependencies=[Depends(require_token)])
+def mint_chat_resource_ticket(req: ChatResourceTicketReq) -> dict:
+    """Mint an opaque ticket for one exact export or attachment resource."""
+    resource = req.resource
+    if resource == "export":
+        if not req.session_id or sess.get_session_meta(req.session_id) is None:
+            raise HTTPException(404, "session not found")
+        scope = (resource, req.session_id)
+        url = f"/api/chat/sessions/{req.session_id}/export"
+    elif resource == "queued-image":
+        aid = req.attachment_id
+        if not re.fullmatch(r"[A-Za-z0-9]{6,64}", aid):
+            raise HTTPException(400, "bad id")
+        _gc_images()
+        with _image_store_lock:
+            entry = _get_staged_entry_locked(aid)
+            if (entry is None or entry.get("kind") != "image"
+                    or not entry.get("b64")):
+                raise HTTPException(404, "queued image not found or expired")
+        scope = (resource, aid)
+        url = f"/api/chat/queued-image/{aid}"
+    else:
+        _validate_attachment_ref(req.session_id, req.filename)
+        scope = (resource, req.session_id, req.filename)
+        url = (f"/api/chat/attachments/{req.session_id}/"
+               f"{urllib.parse.quote(req.filename)}")
+
+    ttl = _CHAT_RESOURCE_TICKET_TTL[resource]
+    max_uses = _CHAT_RESOURCE_TICKET_MAX_USES[resource]
+    ticket = tickets.mint(
+        _CHAT_RESOURCE_TICKET_KIND,
+        scope,
+        ttl=ttl,
+        max_uses=max_uses,
+    )
+    separator = "&" if "?" in url else "?"
+    return {
+        "ticket": ticket,
+        "url": f"{url}{separator}ticket={urllib.parse.quote(ticket)}",
+        "expires_in": ttl,
+        "max_uses": max_uses,
+    }
+
+
+def _get_staged_entry_locked(aid: str) -> dict | None:
+    """Resolve one staged object from the hot cache or durable blob store."""
+    entry = _image_store.get(aid)
+    if entry is not None:
+        return entry
+    return _durable_attachment_store.load_entry(aid)
+
+
+def _gc_images_locked(now: float | None = None) -> None:
+    """Collect expired, unleased entries from cache and durable storage."""
+    current = time.time() if now is None else now
+    cutoff = current - _IMAGE_TTL_S
+    for aid in list(_image_store.keys()):
+        entry = _image_store.get(aid)
+        if (entry is not None and entry.get("ts", 0) < cutoff
+                and aid not in _staged_attachment_claims):
+            _image_store.pop(aid, None)
+    removed = _durable_attachment_store.gc(
+        now=current,
+        protected_tokens=set(_staged_attachment_claims.values()),
+    )
+    for aid in removed:
+        if aid not in _staged_attachment_claims:
+            _image_store.pop(aid, None)
+
+
+def _lease_staged_attachments(
     image_ids: str,
     *,
     require_all: bool,
-) -> tuple[list[tuple[str, dict]], list[str]]:
-    """Consume staged uploads once, optionally with all-or-none semantics.
+    queue_owner: tuple[str, str] | None = None,
+) -> tuple[_StagedAttachmentLease | None, list[str], list[str]]:
+    """Lease staged objects from memory or the restart-safe registry.
 
-    Queue items are durable while staged uploads are not.  Their final claim
-    therefore happens only after client startup, immediately before the turn is
-    wired for query.  Holding the store lock across validation and removal
-    closes the TTL/budget-eviction TOCTOU window: if any requested id is gone,
-    a queued caller receives nothing and can restore its durable queue claim.
-
-    Direct sends retain their historical best-effort behaviour (`require_all`
-    false): available uploads are consumed once and missing ids are ignored.
+    Queue-owned leases additionally require the exact durable item reference;
+    this prevents an old or forged sidecar from consuming another queue item's
+    blob. Legacy memory-only entries remain supported for direct sends/tests.
     """
-    ids = list(dict.fromkeys(
-        aid.strip() for aid in str(image_ids or "").split(",") if aid.strip()
-    ))
+    ids = _attachment_ids(image_ids)
     if not ids:
-        return [], []
+        return None, [], []
     with _image_store_lock:
-        # Inline the TTL sweep under this same lock. Calling _gc_images() would
-        # also be safe because the lock is re-entrant, but keeping the cutoff and
-        # all-or-none validation in one critical section makes the guarantee
-        # explicit.
-        cutoff = time.time() - _IMAGE_TTL_S
-        for aid in list(_image_store.keys()):
-            entry = _image_store.get(aid)
-            if entry is not None and entry["ts"] < cutoff:
-                _image_store.pop(aid, None)
-        missing = [aid for aid in ids if aid not in _image_store]
-        if require_all and missing:
-            return [], missing
-        claimed = [
-            (aid, _image_store.pop(aid))
-            for aid in ids
-            if aid in _image_store
+        _gc_images_locked()
+        busy = [aid for aid in ids if aid in _staged_attachment_claims]
+        if busy:
+            return None, [], busy
+        durable_candidates = [
+            aid for aid in ids if _valid_staged_attachment_id(aid)
         ]
-        return claimed, missing
+        durable_ids = _durable_attachment_store.registered_ids(
+            durable_candidates)
+        missing = [
+            aid for aid in ids
+            if aid not in _image_store and aid not in durable_ids
+        ]
+        if require_all and missing:
+            return None, missing, []
+
+        token = uuid.uuid4().hex
+        load_ids = [
+            aid for aid in ids
+            if aid in durable_ids and aid not in _image_store
+        ]
+        durable = _durable_attachment_store.acquire(
+            [aid for aid in ids if aid in durable_ids],
+            token,
+            lease_seconds=_ATTACHMENT_LEASE_S,
+            queue_owner=queue_owner,
+            load_ids=load_ids,
+        )
+        if durable.missing or durable.busy:
+            return None, list(durable.missing), list(durable.busy)
+
+        items: list[tuple[str, dict]] = []
+        for aid in ids:
+            entry = _image_store.get(aid) or durable.entries.get(aid)
+            if entry is None:
+                if require_all:
+                    _durable_attachment_store.release(
+                        token, ttl=_IMAGE_TTL_S)
+                    return None, [aid], []
+                continue
+            _image_store.setdefault(aid, entry)
+            items.append((aid, _image_store[aid]))
+        if not items:
+            return None, missing, []
+        for aid, _entry in items:
+            _staged_attachment_claims[aid] = token
+        return (
+            _StagedAttachmentLease(
+                token=token,
+                items=tuple(items),
+                durable_ids=tuple(
+                    aid for aid, _entry in items if aid in durable_ids
+                ),
+                rehydrated_ids=tuple(load_ids),
+                queue_session_id=(queue_owner[0] if queue_owner else ""),
+                queue_item_id=(queue_owner[1] if queue_owner else ""),
+            ),
+            missing,
+            [],
+        )
+
+
+def _commit_staged_attachment_lease(
+    lease: _StagedAttachmentLease | None,
+) -> bool:
+    """Consume direct blobs or mark queue blobs submitted after query()."""
+    if lease is None:
+        return True
+    with _image_store_lock:
+        if lease.state == "committed":
+            return True
+        if lease.state != "active":
+            return False
+        if any(
+            _staged_attachment_claims.get(aid) != lease.token
+            or _image_store.get(aid) is not entry
+            for aid, entry in lease.items
+        ):
+            return False
+        if lease.durable_ids and not _durable_attachment_store.commit(
+            lease.token,
+            queue_session_id=lease.queue_session_id,
+            queue_item_id=lease.queue_item_id,
+        ):
+            return False
+        for aid, _entry in lease.items:
+            _image_store.pop(aid, None)
+            _staged_attachment_claims.pop(aid, None)
+        lease.state = "committed"
+        return True
+
+
+def _begin_staged_attachment_rollback(
+    lease: _StagedAttachmentLease | None,
+) -> bool:
+    """Atomically exclude commit while keeping every claim pinned."""
+    if lease is None:
+        return False
+    with _image_store_lock:
+        if lease.state == "active":
+            lease.state = "rolling_back"
+            return True
+        return lease.state in {"rolling_back", "uncertain"}
+
+
+def _fail_closed_staged_attachment_lease(
+    lease: _StagedAttachmentLease | None,
+) -> None:
+    """Consume owned objects after transport acceptance becomes uncertain."""
+    if lease is None:
+        return
+    with _image_store_lock:
+        if lease.durable_ids:
+            try:
+                _durable_attachment_store.commit(
+                    lease.token,
+                    queue_session_id=lease.queue_session_id,
+                    queue_item_id=lease.queue_item_id,
+                )
+            except Exception:
+                pass
+        for aid, entry in lease.items:
+            if (_staged_attachment_claims.get(aid) == lease.token
+                    and _image_store.get(aid) is entry):
+                _image_store.pop(aid, None)
+                _staged_attachment_claims.pop(aid, None)
+        lease.state = "uncertain"
+
+
+def _release_staged_attachment_lease(
+    lease: _StagedAttachmentLease | None,
+) -> bool:
+    """Roll back a preparation and refresh the retry TTL durably."""
+    if lease is None:
+        return True
+    with _image_store_lock:
+        if lease.state == "released":
+            return True
+        if lease.state in {"committed", "uncertain"}:
+            return False
+        if lease.state == "active":
+            lease.state = "rolling_back"
+        if lease.state != "rolling_back":
+            return False
+        if lease.durable_ids and not _durable_attachment_store.release(
+            lease.token, ttl=_IMAGE_TTL_S,
+        ):
+            return False
+        retry_ts = time.time()
+        for aid, entry in lease.items:
+            if _staged_attachment_claims.get(aid) == lease.token:
+                _staged_attachment_claims.pop(aid, None)
+                if _image_store.get(aid) is entry:
+                    if aid in lease.rehydrated_ids:
+                        _image_store.pop(aid, None)
+                    else:
+                        entry["ts"] = retry_ts
+        lease.state = "released"
+        return True
+
+
+def _gc_images() -> None:
+    """Drop expired entries without invalidating an active turn lease."""
+    with _image_store_lock:
+        _gc_images_locked()
 
 
 def _image_entry_bytes(entry: dict) -> int:
-    """Approximate retained size of a staged-upload entry. The base64 payload
-    (images / PDF) dominates; text and the raw bytes we hold for disk
-    persistence are counted too — `raw` in particular is un-capped now that
-    text attachments are no longer inlined, so leaving it out of the budget
-    would let the eviction logic under-count by the full file size."""
+    """Approximate retained bytes of one process-local staged entry."""
     return (len(entry.get("b64", ""))
             + len(entry.get("raw", b""))
             + len(entry.get("text", ""))
@@ -9286,24 +10319,86 @@ def _image_entry_bytes(entry: dict) -> int:
 
 
 def _enforce_image_budget() -> None:
-    """Evict oldest staged uploads until the store is within its byte + entry
-    caps. Bounds the unbounded-growth / OOM risk of many uploads that never get
-    consumed by a turn."""
+    """Evict oldest unclaimed cache and durable entries to the same budget."""
     with _image_store_lock:
         total = sum(_image_entry_bytes(e) for e in _image_store.values())
         if (len(_image_store) <= _IMAGE_STORE_MAX_ENTRIES
                 and total <= _IMAGE_STORE_MAX_BYTES):
             return
-        # Oldest first (by insertion ts). The just-added entry has the newest ts
-        # so it's evicted last — and one entry is ≤ ~13 MB ≪ budget, never
-        # self-evicts.
-        for aid, entry in sorted(_image_store.items(),
-                                 key=lambda kv: kv[1].get("ts", 0.0)):
-            if (len(_image_store) <= _IMAGE_STORE_MAX_ENTRIES
+        evict: list[str] = []
+        for aid, entry in sorted(
+            _image_store.items(), key=lambda item: item[1].get("ts", 0.0),
+        ):
+            if aid in _staged_attachment_claims:
+                continue
+            if (len(_image_store) - len(evict) <= _IMAGE_STORE_MAX_ENTRIES
                     and total <= _IMAGE_STORE_MAX_BYTES):
                 break
             total -= _image_entry_bytes(entry)
+            evict.append(aid)
+        _durable_attachment_store.discard_unowned(evict)
+        for aid in evict:
             _image_store.pop(aid, None)
+
+
+def _put_staged_attachment_batch(
+    batch: list[tuple[str, dict]],
+) -> bool:
+    """Publish a generated/upload batch to blobs, SQLite, then the hot cache."""
+    if not batch:
+        return True
+    with _image_store_lock:
+        _gc_images_locked()
+        ids = [aid for aid, _entry in batch]
+        if (len(set(ids)) != len(ids)
+                or any(aid in _image_store for aid in ids)
+                or any(aid in _staged_attachment_claims for aid in ids)):
+            return False
+
+        batch_bytes = sum(_image_entry_bytes(entry) for _aid, entry in batch)
+        total_bytes = sum(
+            _image_entry_bytes(entry) for entry in _image_store.values()
+        )
+        projected_count = len(_image_store) + len(batch)
+        projected_bytes = total_bytes + batch_bytes
+        cache_evict: list[str] = []
+        for aid, entry in sorted(
+            _image_store.items(), key=lambda item: item[1].get("ts", 0.0),
+        ):
+            if (projected_count <= _IMAGE_STORE_MAX_ENTRIES
+                    and projected_bytes <= _IMAGE_STORE_MAX_BYTES):
+                break
+            if aid in _staged_attachment_claims:
+                continue
+            cache_evict.append(aid)
+            projected_count -= 1
+            projected_bytes -= _image_entry_bytes(entry)
+        if (projected_count > _IMAGE_STORE_MAX_ENTRIES
+                or projected_bytes > _IMAGE_STORE_MAX_BYTES):
+            return False
+
+        try:
+            published, durable_evict = _durable_attachment_store.stage_batch(
+                batch,
+                ttl=_IMAGE_TTL_S,
+                max_entries=_IMAGE_STORE_MAX_ENTRIES,
+                max_bytes=_IMAGE_STORE_MAX_BYTES,
+            )
+        except (OSError, sqlite3.Error, DurableAttachmentError,
+                UnsafePrivatePath):
+            return False
+        if not published:
+            return False
+        for aid in {*cache_evict, *durable_evict}:
+            _image_store.pop(aid, None)
+        for aid, entry in batch:
+            _image_store[aid] = entry
+        return True
+
+
+def _put_staged_attachment(aid: str, entry: dict) -> bool:
+    """Publish one staged object through the all-or-none batch primitive."""
+    return _put_staged_attachment_batch([(aid, entry)])
 
 
 def _classify_attachment(mime: str, name: str) -> str:
@@ -9350,8 +10445,7 @@ _IMAGEGEN_ROOT = ROOT / ".muselab" / "imagegen"
 _IMAGEGEN_FILES = _IMAGEGEN_ROOT / "files"
 _IMAGEGEN_JOBS_PATH = _IMAGEGEN_ROOT / "jobs.json"
 _IMAGEGEN_JOBS_MAX = 200
-_imagegen_jobs_lock = threading.RLock()
-_imagegen_jobs: dict[str, dict] | None = None
+_imagegen_job_store = ImagegenJobStore(_IMAGEGEN_JOBS_PATH, max_jobs=_IMAGEGEN_JOBS_MAX)
 
 
 def _validate_image_size(size: str) -> str:
@@ -9441,103 +10535,149 @@ def _normalize_image_generate_req(
     return prompt, model, size, quality, output_format, image_ids
 
 
-def _stage_generated_image(b64: str, mime: str, idx: int) -> dict:
-    try:
-        raw = base64.b64decode(b64, validate=True)
-    except Exception:
-        raise HTTPException(502, "image API returned invalid base64") from None
-    if len(raw) > _IMAGE_MAX_BYTES:
-        raise HTTPException(502, "image API returned an image over the local 10MB limit")
-    aid = uuid.uuid4().hex
+def _stage_generated_images(
+    b64s: list[str],
+    mime: str,
+    start_index: int = 1,
+) -> list[dict]:
+    """Validate and publish a generated batch in one budget transaction."""
+    batch: list[tuple[str, dict]] = []
+    items: list[dict] = []
+    timestamp = time.time()
+    stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
     fmt = {v: k for k, v in _IMAGE_OUTPUT_MIME.items()}.get(mime, "png")
-    name = f"generated-{datetime.now(UTC).strftime('%Y%m%d-%H%M%S')}-{idx}.{fmt}"
-    _image_store[aid] = {
-        "kind": "image",
-        "mime": mime,
-        "name": name,
-        "b64": base64.b64encode(raw).decode("ascii"),
-        "ts": time.time(),
-    }
-    _enforce_image_budget()
-    return {
-        "id": aid,
-        "mime": mime,
-        "name": name,
-        "bytes": len(raw),
-        "attach_ext": "jpg" if fmt == "jpeg" else fmt,
-        "data_url": f"data:{mime};base64,{_image_store[aid]['b64']}",
-    }
+    for offset, b64 in enumerate(b64s):
+        try:
+            raw = base64.b64decode(b64, validate=True)
+        except Exception:
+            raise HTTPException(
+                502, "image API returned invalid base64") from None
+        if len(raw) > _IMAGE_MAX_BYTES:
+            raise HTTPException(
+                502,
+                "image API returned an image over the local 10MB limit",
+            )
+        aid = uuid.uuid4().hex
+        name = f"generated-{stamp}-{start_index + offset}.{fmt}"
+        encoded = base64.b64encode(raw).decode("ascii")
+        entry = {
+            "kind": "image",
+            "mime": mime,
+            "name": name,
+            "b64": encoded,
+            "ts": timestamp,
+        }
+        batch.append((aid, entry))
+        items.append({
+            "id": aid,
+            "mime": mime,
+            "name": name,
+            "bytes": len(raw),
+            "attach_ext": "jpg" if fmt == "jpeg" else fmt,
+            "data_url": f"data:{mime};base64,{encoded}",
+        })
+    if not _put_staged_attachment_batch(batch):
+        raise HTTPException(
+            503, "staged attachment capacity is temporarily exhausted")
+    return items
+
+
+def _stage_generated_image(b64: str, mime: str, idx: int) -> dict:
+    return _stage_generated_images([b64], mime, idx)[0]
 
 
 def _stage_generated_image_bytes(raw: bytes, mime: str, idx: int) -> dict:
     if len(raw) > _IMAGE_MAX_BYTES:
-        raise HTTPException(502, "image generation returned an image over the local 10MB limit")
-    return _stage_generated_image(base64.b64encode(raw).decode("ascii"), mime, idx)
+        raise HTTPException(
+            502,
+            "image generation returned an image over the local 10MB limit",
+        )
+    encoded = base64.b64encode(raw).decode("ascii")
+    return _stage_generated_images([encoded], mime, idx)[0]
+
+
+def _discard_generated_image_batch(items: list[dict]) -> None:
+    """Reclaim an HTTP-owned generated batch if its request is cancelled."""
+    with _image_store_lock:
+        discarded: list[str] = []
+        for item in items:
+            aid = str(item.get("id") or "")
+            if aid and aid not in _staged_attachment_claims:
+                _image_store.pop(aid, None)
+                discarded.append(aid)
+        _durable_attachment_store.discard_unowned(discarded)
+
+
+async def _discard_generated_image_batch_owned(items: list[dict]) -> None:
+    cleanup = asyncio.create_task(asyncio.to_thread(
+        _discard_generated_image_batch,
+        items,
+    ))
+    while not cleanup.done():
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            continue
+    cleanup.result()
+
+
+async def _stage_generated_images_owned(
+    b64s: list[str],
+    mime: str,
+    start_index: int = 1,
+) -> list[dict]:
+    """Join the worker and reclaim its published batch on owner cancellation."""
+    task = asyncio.create_task(asyncio.to_thread(
+        _stage_generated_images,
+        b64s,
+        mime,
+        start_index,
+    ))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError as cancelled:
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                continue
+            except BaseException:
+                break
+        items: list[dict] | None
+        try:
+            items = task.result()
+        except BaseException:
+            items = None
+        if items:
+            await _discard_generated_image_batch_owned(items)
+        raise cancelled
+
+
+async def _stage_generated_images_for_response(
+    b64s: list[str],
+    mime: str,
+) -> list[dict]:
+    """Stage a response-owned batch with a final cancellation checkpoint."""
+    items: list[dict] = []
+    try:
+        items = await _stage_generated_images_owned(b64s, mime)
+        # Deliver a cancellation already queued by the HTTP owner before the
+        # staged IDs escape into a response it can no longer receive.
+        await asyncio.sleep(0)
+        return items
+    except asyncio.CancelledError:
+        if items:
+            await _discard_generated_image_batch_owned(items)
+        raise
 
 
 def _imagegen_load_jobs() -> dict[str, dict]:
-    global _imagegen_jobs
-    with _imagegen_jobs_lock:
-        if _imagegen_jobs is not None:
-            return _imagegen_jobs
-        jobs: dict[str, dict] = {}
-        try:
-            raw = json.loads(_IMAGEGEN_JOBS_PATH.read_text(encoding="utf-8"))
-            if isinstance(raw, dict):
-                raw_jobs = raw.get("jobs", {})
-                if isinstance(raw_jobs, dict):
-                    for jid, job in raw_jobs.items():
-                        if not isinstance(jid, str) or not isinstance(job, dict):
-                            continue
-                        # A process restart loses in-flight asyncio tasks; make
-                        # that visible instead of leaving history stuck forever.
-                        if job.get("status") in {"queued", "running"}:
-                            job = {
-                                **job,
-                                "status": "failed",
-                                "error": "image generation was interrupted by backend restart",
-                                "updated_at": time.time(),
-                            }
-                        jobs[jid] = job
-        except FileNotFoundError:
-            pass
-        except Exception as e:
-            print(f"[muselab] failed to load imagegen jobs: {e}",
-                  file=sys.stderr, flush=True)
-        _imagegen_jobs = jobs
-        return _imagegen_jobs
-
-
-def _imagegen_save_jobs_locked() -> None:
-    jobs = _imagegen_jobs or {}
-    ordered = dict(sorted(
-        jobs.items(),
-        key=lambda kv: float(kv[1].get("created_at") or 0),
-        reverse=True,
-    )[:_IMAGEGEN_JOBS_MAX])
-    jobs.clear()
-    jobs.update(ordered)
-    atomic_write_text(_IMAGEGEN_JOBS_PATH, json.dumps({"jobs": jobs}, ensure_ascii=False))
+    """Compatibility snapshot for tests and local diagnostic tooling."""
+    return _imagegen_job_store.snapshot()
 
 
 def _imagegen_put_job(job: dict) -> dict:
-    with _imagegen_jobs_lock:
-        jobs = _imagegen_load_jobs()
-        jobs[job["id"]] = job
-        _imagegen_save_jobs_locked()
-        return job
-
-
-def _imagegen_update_job(job_id: str, **patch: Any) -> dict | None:
-    with _imagegen_jobs_lock:
-        jobs = _imagegen_load_jobs()
-        job = jobs.get(job_id)
-        if not job:
-            return None
-        job.update(patch)
-        job["updated_at"] = time.time()
-        _imagegen_save_jobs_locked()
-        return job
+    return _imagegen_job_store.put(job)
 
 
 def _imagegen_job_file(job: dict, img: dict) -> Path:
@@ -9601,10 +10741,10 @@ def _imagegen_public_job(job: dict, *, include_data: bool = True) -> dict:
 
 
 def _imagegen_list_jobs(limit: int) -> list[dict]:
-    with _imagegen_jobs_lock:
-        jobs = list(_imagegen_load_jobs().values())
-    jobs.sort(key=lambda j: float(j.get("created_at") or 0), reverse=True)
-    return [_imagegen_public_job(j, include_data=False) for j in jobs[:max(1, min(limit, 100))]]
+    return [
+        _imagegen_public_job(job, include_data=False)
+        for job in _imagegen_job_store.list(limit)
+    ]
 
 
 def _persist_imagegen_result(job: dict, result: dict) -> list[dict]:
@@ -9645,8 +10785,9 @@ def _persist_imagegen_result(job: dict, result: dict) -> list[dict]:
 
 
 async def _run_imagegen_job(job_id: str, req: ImageGenerateReq) -> None:
-    _imagegen_update_job(job_id, status="running", error="")
+    staged_result_items: list[dict] = []
     try:
+        await _imagegen_job_store.update_async(job_id, status="running", error="")
         prompt, model, size, quality, output_format, image_ids = _normalize_image_generate_req(req)
         result = await _generate_openai_image_api(
             req=req,
@@ -9657,22 +10798,72 @@ async def _run_imagegen_job(job_id: str, req: ImageGenerateReq) -> None:
             output_format=output_format,
             image_ids=image_ids,
         )
-        with _imagegen_jobs_lock:
-            jobs = _imagegen_load_jobs()
-            job = jobs.get(job_id)
-            if not job:
-                return
-            job["provider"] = result.get("provider")
-            job["model"] = result.get("model") or model
-            job["images"] = _persist_imagegen_result(job, result)
-            job["status"] = "succeeded" if job["images"] else "failed"
-            job["error"] = "" if job["images"] else "image generation returned no images"
-            job["updated_at"] = time.time()
-            _imagegen_save_jobs_locked()
+        staged_result_items = [
+            item for item in result.get("images", [])
+            if isinstance(item, dict)
+        ]
+        job_snapshot = await asyncio.to_thread(
+            _imagegen_job_store.get, job_id)
+        if not job_snapshot:
+            return
+        images = await asyncio.to_thread(
+            _persist_imagegen_result,
+            job_snapshot,
+            result,
+        )
+        await _imagegen_job_store.update_async(
+            job_id,
+            provider=result.get("provider"),
+            model=result.get("model") or model,
+            images=images,
+            status="succeeded" if images else "failed",
+            error="" if images else "image generation returned no images",
+        )
+    except asyncio.CancelledError:
+        await _imagegen_job_store.update_async(
+            job_id,
+            status="failed",
+            error="image generation was cancelled",
+        )
+        raise
     except HTTPException as e:
-        _imagegen_update_job(job_id, status="failed", error=str(e.detail))
+        await _imagegen_job_store.update_async(
+            job_id, status="failed", error=str(e.detail))
     except Exception as e:
-        _imagegen_update_job(job_id, status="failed", error=f"{type(e).__name__}: {e}")
+        await _imagegen_job_store.update_async(
+            job_id, status="failed", error=f"{type(e).__name__}: {e}")
+
+    finally:
+        if staged_result_items:
+            await _discard_generated_image_batch_owned(staged_result_items)
+
+
+def _image_reference_files(
+    image_ids: list[str],
+) -> list[tuple[str, tuple[str, bytes, str]]]:
+    """Snapshot staged references under lock and decode them in a worker."""
+    snapshots: list[tuple[str, str, str, str]] = []
+    with _image_store_lock:
+        _gc_images_locked()
+        for aid in image_ids[:8]:
+            entry = _get_staged_entry_locked(aid)
+            if (not entry or entry.get("kind") != "image"
+                    or not entry.get("b64")):
+                continue
+            snapshots.append((
+                aid,
+                str(entry.get("name") or f"{aid}.png"),
+                str(entry.get("mime") or "image/png"),
+                str(entry["b64"]),
+            ))
+    files: list[tuple[str, tuple[str, bytes, str]]] = []
+    for _aid, name, mime, encoded in snapshots:
+        try:
+            raw = base64.b64decode(encoded, validate=True)
+        except Exception:
+            continue
+        files.append(("image[]", (name, raw, mime)))
+    return files
 
 
 async def _generate_openai_image_api(
@@ -9690,9 +10881,9 @@ async def _generate_openai_image_api(
     timeout = max(10.0, env_float("MUSELAB_IMAGE_GENERATION_TIMEOUT", 180.0))
 
     import httpx
+    files = await asyncio.to_thread(_image_reference_files, image_ids)
     async with httpx.AsyncClient(timeout=timeout) as client:
         if image_ids:
-            _gc_images()
             data = {
                 "model": model,
                 "prompt": prompt,
@@ -9701,17 +10892,6 @@ async def _generate_openai_image_api(
                 "output_format": output_format,
                 "n": str(req.n),
             }
-            files = []
-            for aid in image_ids[:8]:
-                entry = _image_store.get(aid)
-                if not entry or entry.get("kind") != "image" or not entry.get("b64"):
-                    continue
-                try:
-                    raw = base64.b64decode(entry["b64"])
-                except Exception:
-                    continue
-                files.append(("image[]", (entry.get("name") or f"{aid}.png",
-                                          raw, entry.get("mime") or "image/png")))
             if not files:
                 raise HTTPException(400, "reference images are missing or expired")
             resp = await client.post(
@@ -9744,7 +10924,7 @@ async def _generate_openai_image_api(
     if not b64s:
         raise HTTPException(502, "image API returned no base64 image")
     mime = _IMAGE_OUTPUT_MIME[output_format]
-    items = [_stage_generated_image(b64, mime, i + 1) for i, b64 in enumerate(b64s)]
+    items = await _stage_generated_images_for_response(b64s, mime)
     return {
         "ok": True,
         "provider": "openai",
@@ -9789,7 +10969,7 @@ async def create_image_generate_job(req: ImageGenerateReq) -> dict:
         "created_at": now,
         "updated_at": now,
     }
-    _imagegen_put_job(job)
+    await _imagegen_job_store.put_async(job)
     task = asyncio.create_task(_run_imagegen_job(job["id"], req))
     task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
     return {"ok": True, "job": _imagegen_public_job(job, include_data=True)}
@@ -9797,28 +10977,29 @@ async def create_image_generate_job(req: ImageGenerateReq) -> dict:
 
 @router.get("/image-generate/jobs", dependencies=[Depends(require_token)])
 async def list_image_generate_jobs(limit: int = Query(40, ge=1, le=100)) -> dict:
-    return {"ok": True, "jobs": _imagegen_list_jobs(limit)}
+    jobs = await asyncio.to_thread(_imagegen_list_jobs, limit)
+    return {"ok": True, "jobs": jobs}
 
 
 @router.get("/image-generate/jobs/{job_id}", dependencies=[Depends(require_token)])
 async def get_image_generate_job(job_id: str) -> dict:
-    with _imagegen_jobs_lock:
-        job = _imagegen_load_jobs().get(job_id)
+    job = await asyncio.to_thread(_imagegen_job_store.get, job_id)
     if not job:
         raise HTTPException(404, "image generation job not found")
-    return {"ok": True, "job": _imagegen_public_job(job, include_data=True)}
+    public = await asyncio.to_thread(
+        _imagegen_public_job, job, include_data=True)
+    return {"ok": True, "job": public}
 
 
 @router.get("/image-generate/jobs/{job_id}/images/{image_id}",
             dependencies=[Depends(require_token)])
 async def get_image_generate_job_image(job_id: str, image_id: str) -> FileResponse:
-    with _imagegen_jobs_lock:
-        job = _imagegen_load_jobs().get(job_id)
-        if not job:
-            raise HTTPException(404, "image generation job not found")
-        images = job.get("images") if isinstance(job.get("images"), list) else []
-        img = next((x for x in images
-                    if isinstance(x, dict) and x.get("image_id") == image_id), None)
+    job = await asyncio.to_thread(_imagegen_job_store.get, job_id)
+    if not job:
+        raise HTTPException(404, "image generation job not found")
+    images = job.get("images") if isinstance(job.get("images"), list) else []
+    img = next((x for x in images
+                if isinstance(x, dict) and x.get("image_id") == image_id), None)
     if not img:
         raise HTTPException(404, "image generation image not found")
     path = _imagegen_job_file(job, img)
@@ -9834,24 +11015,67 @@ async def get_image_generate_job_image(job_id: str, image_id: str) -> FileRespon
 @router.post("/image-generate/jobs/{job_id}/attach/{image_id}",
              dependencies=[Depends(require_token)])
 async def attach_image_generate_job_image(job_id: str, image_id: str) -> dict:
-    with _imagegen_jobs_lock:
-        job = _imagegen_load_jobs().get(job_id)
-        if not job:
-            raise HTTPException(404, "image generation job not found")
-        images = job.get("images") if isinstance(job.get("images"), list) else []
-        img = next((x for x in images
-                    if isinstance(x, dict) and x.get("image_id") == image_id), None)
+    job = await asyncio.to_thread(_imagegen_job_store.get, job_id)
+    if not job:
+        raise HTTPException(404, "image generation job not found")
+    images = job.get("images") if isinstance(job.get("images"), list) else []
+    img = next((x for x in images
+                if isinstance(x, dict) and x.get("image_id") == image_id), None)
     if not img:
         raise HTTPException(404, "image generation image not found")
     try:
-        raw = _imagegen_job_file(job, img).read_bytes()
+        raw = await _await_thread_completion(
+            _imagegen_job_file(job, img).read_bytes)
     except OSError:
         raise HTTPException(404, "image file missing") from None
-    item = _stage_generated_image_bytes(raw, img.get("mime") or "image/png", 1)
+    encoded = await asyncio.to_thread(base64.b64encode, raw)
+    item = (await _stage_generated_images_for_response(
+        [encoded.decode("ascii")],
+        img.get("mime") or "image/png",
+    ))[0]
     if img.get("name"):
-        _image_store[item["id"]]["name"] = img["name"]
+        with _image_store_lock:
+            entry = _image_store.get(item["id"])
+            if entry is not None:
+                entry["name"] = img["name"]
         item["name"] = img["name"]
     return {"ok": True, "image": item}
+
+
+def _validate_xlsx_archive(body: bytes) -> None:
+    """Reject encrypted, oversized, or suspiciously compressed workbooks."""
+    import io
+    import zipfile
+
+    try:
+        with zipfile.ZipFile(io.BytesIO(body)) as archive:
+            infos = archive.infolist()
+    except (zipfile.BadZipFile, zipfile.LargeZipFile):
+        raise HTTPException(
+            422,
+            "failed to parse spreadsheet (file may be corrupt or unsupported)",
+        ) from None
+    if len(infos) > _XLSX_ARCHIVE_MAX_ENTRIES:
+        raise HTTPException(422, "spreadsheet archive exceeds safe entry budget")
+    total_uncompressed = 0
+    for info in infos:
+        if info.flag_bits & 0x1:
+            raise HTTPException(
+                422, "encrypted spreadsheets are not supported")
+        if info.file_size > _XLSX_ARCHIVE_MAX_MEMBER_BYTES:
+            raise HTTPException(
+                422, "spreadsheet archive member exceeds safe size budget")
+        total_uncompressed += info.file_size
+        if total_uncompressed > _XLSX_ARCHIVE_MAX_UNCOMPRESSED_BYTES:
+            raise HTTPException(
+                422, "spreadsheet archive exceeds safe unpacked size budget")
+        if (
+            info.file_size > 0
+            and info.file_size
+            > max(1, info.compress_size) * _XLSX_ARCHIVE_MAX_COMPRESSION_RATIO
+        ):
+            raise HTTPException(
+                422, "spreadsheet archive exceeds safe compression ratio")
 
 
 def _xlsx_to_text(body: bytes, name: str) -> str:
@@ -9861,17 +11085,20 @@ def _xlsx_to_text(body: bytes, name: str) -> str:
     import openpyxl
     from io import BytesIO
 
+    _validate_xlsx_archive(body)
     try:
         wb = openpyxl.load_workbook(BytesIO(body), read_only=True, data_only=True)
     except Exception as e:
-        # Don't echo the openpyxl exception message verbatim — it can
-        # leak internal library paths / partial cell contents / version
-        # info. Log the detail for debugging, return a generic message.
-        print(f"[muselab] xlsx parse failed for {name!r}: "
-              f"{type(e).__name__}: {e}", file=sys.stderr, flush=True)
-        raise HTTPException(
-            422, "failed to parse spreadsheet (file may be corrupt or unsupported)"
+        # Do not echo the filename, library message, or cell contents.
+        print(
+            f"[muselab] xlsx parse failed kind={type(e).__name__}",
+            file=sys.stderr,
+            flush=True,
         )
+        raise HTTPException(
+            422,
+            "failed to parse spreadsheet (file may be corrupt or unsupported)",
+        ) from None
 
     parts: list[str] = [f"# Spreadsheet: {name}"]
     sheets_total = len(wb.sheetnames)
@@ -9882,17 +11109,18 @@ def _xlsx_to_text(body: bytes, name: str) -> str:
             parts.append("")
             parts.append(f"## Sheet: {sheet_name}")
             rows_emitted = 0
-            cols_truncated = False
-            rows_truncated = False
-            for r_idx, row in enumerate(ws.iter_rows(values_only=True)):
-                if r_idx >= _XLSX_ATTACH_MAX_ROWS:
-                    rows_truncated = True
-                    break
+            sheet_rows = int(ws.max_row or 0)
+            sheet_cols = int(ws.max_column or 0)
+            rows_truncated = sheet_rows > _XLSX_ATTACH_MAX_ROWS
+            cols_truncated = sheet_cols > _XLSX_ATTACH_MAX_COLS
+            rows = ws.iter_rows(
+                max_row=min(sheet_rows, _XLSX_ATTACH_MAX_ROWS),
+                max_col=min(sheet_cols, _XLSX_ATTACH_MAX_COLS),
+                values_only=True,
+            ) if sheet_rows and sheet_cols else ()
+            for row in rows:
                 cells: list[str] = []
-                for c_idx, val in enumerate(row):
-                    if c_idx >= _XLSX_ATTACH_MAX_COLS:
-                        cols_truncated = True
-                        break
+                for val in row:
                     if val is None:
                         cells.append("")
                     else:
@@ -9924,29 +11152,34 @@ def _xlsx_to_text(body: bytes, name: str) -> str:
     return "\n".join(parts)
 
 
-@router.get("/queued-image/{aid}", dependencies=[Depends(require_token_query)])
-def get_queued_image(aid: str):
+@router.get("/queued-image/{aid}")
+def get_queued_image(aid: str, ticket: str = Query("")):
     """FIX ③: serve an as-yet-unsent (queued) image straight from the
     in-memory upload store so the queued-message bubble can render a real
     thumbnail. Unlike /attachments/<sid>/<file> (on-disk, persisted at
     send-time), queued uploads live only in `_image_store` and disappear at
     the 10-min TTL — so this 404s once the entry expires, which the UI
-    already surfaces as "附件已过期". require_token_query lets a plain
-    `<img src=...?token=...>` load without per-element auth headers."""
+    already surfaces as "附件已过期". A bounded-use resource ticket lets a
+    plain ``<img>`` load it without exposing the global API token."""
     import re as _re
     if not _re.fullmatch(r"[A-Za-z0-9]{6,64}", aid):
         raise HTTPException(400, "bad id")
-    _gc_images()
-    entry = _image_store.get(aid)
-    if entry is None or entry.get("kind") != "image" or not entry.get("b64"):
-        raise HTTPException(404, "queued image not found or expired")
+    _require_chat_resource_ticket(ticket, ("queued-image", aid))
+    with _image_store_lock:
+        _gc_images_locked()
+        entry = _get_staged_entry_locked(aid)
+        if (entry is None or entry.get("kind") != "image"
+                or not entry.get("b64")):
+            raise HTTPException(404, "queued image not found or expired")
+        encoded = str(entry["b64"])
+        mime = str(entry.get("mime") or "image/png")
     from fastapi.responses import Response as _Response
     try:
-        data = base64.b64decode(entry["b64"])
+        data = base64.b64decode(encoded, validate=True)
     except Exception:
         raise HTTPException(404, "queued image unreadable")
     return _Response(
-        content=data, media_type=entry.get("mime", "image/png"),
+        content=data, media_type=mime,
         headers={"Cache-Control": "private, max-age=300"},
     )
 
@@ -9984,42 +11217,25 @@ def get_task_output(session_id: str = Query(...), path: str = Query(...)):
     return _PlainText(data, headers={"Cache-Control": "private, max-age=60"})
 
 
-@router.get("/attachments/{session_id}/{filename}",
-            dependencies=[Depends(require_token_query)])
-def get_attachment(session_id: str, filename: str):
+@router.get("/attachments/{session_id}/{filename}")
+def get_attachment(
+    session_id: str,
+    filename: str,
+    ticket: str = Query(""),
+):
     """Serve the FULL-RES original of a user-uploaded image saved at
     send-time. Lightbox uses this; the in-stream bubble keeps using the
-    160-px thumbnail (small + fast). require_token_query lets the
-    browser issue plain `<img src=...?token=...>` requests without
-    needing to inject auth headers per element.
+    160-px thumbnail (small + fast). A short-lived, bounded-use ticket lets
+    the browser load the original without exposing the global API token.
 
     Path traversal guard: filename must be a single basename (no slashes,
     no parent-dir refs) and session_id must be a valid uuid-ish string.
     """
-    import re as _re
-    if not _re.fullmatch(r"[A-Za-z0-9_\-]{6,80}", session_id):
-        raise HTTPException(400, "bad session_id")
-    if "/" in filename or ".." in filename or "\\" in filename:
-        raise HTTPException(400, "bad filename")
-    # Was `[A-Za-z0-9_\-]+\.[A-Za-z0-9]{1,8}`, which predates this endpoint
-    # serving anything but images named `{aid}.{ext}`. Now that every
-    # attachment persists as `{aid}-{原文件名}`, an ASCII-only pattern 400s
-    # every Chinese filename — i.e. most of them. Widened to "one path
-    # component, no control chars", which combined with the traversal guard
-    # above and the resolve()/relative_to() check below is the actual
-    # security boundary. The `{aid}-` prefix still has to match a real file.
-    if not _re.fullmatch(r"[^/\\\x00-\x1f\x7f]{1,200}", filename):
-        raise HTTPException(400, "bad filename format")
-    path = _attachments_base() / session_id / filename
-    if not path.exists() or not path.is_file():
-        raise HTTPException(404, "attachment not found")
-    # Resolve + verify still inside the attachments dir (extra defense)
-    base = (_attachments_base()).resolve()
-    real = path.resolve()
-    try:
-        real.relative_to(base)
-    except ValueError:
-        raise HTTPException(400, "bad path")
+    _require_chat_resource_ticket(
+        ticket,
+        ("attachment", session_id, filename),
+    )
+    path = _validate_attachment_ref(session_id, filename)
     # MIME from extension
     ext = filename.rsplit(".", 1)[-1].lower()
     mime = {
@@ -10045,6 +11261,26 @@ def get_attachment(session_id: str, filename: str):
     )
 
 
+async def _read_upload_limited(file: UploadFile) -> bytes:
+    """Read at most the configured limit plus one byte from a multipart file."""
+    chunks: list[bytes] = []
+    total = 0
+    while total <= _IMAGE_MAX_BYTES:
+        remaining = _IMAGE_MAX_BYTES + 1 - total
+        chunk = await file.read(min(_UPLOAD_READ_CHUNK_BYTES, remaining))
+        if not chunk:
+            return b"".join(chunks)
+        total += len(chunk)
+        if total > _IMAGE_MAX_BYTES:
+            raise HTTPException(
+                413,
+                f"file too large. Max {_IMAGE_MAX_BYTES} bytes (~10MB)",
+            )
+        chunks.append(chunk)
+    raise HTTPException(
+        413, f"file too large. Max {_IMAGE_MAX_BYTES} bytes (~10MB)")
+
+
 @router.post("/upload-image", dependencies=[Depends(require_token)])
 async def upload_image(file: UploadFile = File(...)) -> dict:
     """Legacy endpoint name; now handles images + PDF + text-ish docs + xlsx."""
@@ -10061,11 +11297,8 @@ async def upload_image(file: UploadFile = File(...)) -> dict:
             f"(md/txt/csv/json/yaml/source code), or Excel (xlsx/xlsm).",
         )
     _t_read_start = time.perf_counter()
-    body = await file.read()
+    body = await _read_upload_limited(file)
     _t_read_end = time.perf_counter()
-    if len(body) > _IMAGE_MAX_BYTES:
-        raise HTTPException(413, f"file too large: {len(body)} bytes. "
-                                  f"Max {_IMAGE_MAX_BYTES} bytes (~10MB)")
     aid = uuid.uuid4().hex
     entry: dict = {"kind": kind, "mime": mime, "name": name, "ts": time.time()}
     if kind == "text":
@@ -10097,17 +11330,19 @@ async def upload_image(file: UploadFile = File(...)) -> dict:
         # event loop (and every concurrent SSE stream) mid-parse. (perf: RED —
         # chat.py upload_image xlsx parse)
         entry["raw"] = body
-        entry["text"] = await asyncio.to_thread(_xlsx_to_text, body, name)
+        entry["text"] = await asyncio.to_thread(
+            _xlsx_to_text, body, _safe_attach_name(name)
+        )
     else:
         # base64-encoding a ~10MB image is tens of ms of pure CPU on the loop
         # — off-load it so the upload doesn't stall concurrent streams.
         # (perf: YELLOW — chat.py upload_image base64)
         entry["b64"] = (await asyncio.to_thread(base64.b64encode, body)).decode("ascii")
-    _image_store[aid] = entry
-    # Bound worst-case memory: evict oldest staged uploads if this insert pushed
-    # the store past its byte / entry caps (anti-OOM). (perf: ORANGE — chat.py
-    # _image_store unbounded)
-    _enforce_image_budget()
+    if not await asyncio.to_thread(
+        _put_staged_attachment, aid, entry,
+    ):
+        raise HTTPException(
+            503, "staged attachment capacity is temporarily exhausted")
     # Content-free upload timing.  File names and MIME strings can disclose
     # private workspace details, so keep only the closed-set kind and sizes.
     _t_end = time.perf_counter()
@@ -10384,6 +11619,10 @@ async def stream(
 
 class _TurnBusy(Exception):
     """Raised by _start_turn when a turn is already in flight on the sid."""
+
+
+class _TurnCancelledBeforeQuery(Exception):
+    """Stop won the final pre-query cancellation check."""
 
 
 class _TurnStartError(Exception):
@@ -11587,12 +12826,14 @@ async def _finish_cancelled_startup(
     reservation until Activity is terminal, and only then publish/remember/pop
     the turn atomically under ``_lock``.
     """
-    cleanup = getattr(broadcast, "_cancelled_startup_cleanup_task", None)
+    cleanup = broadcast._startup_terminal_cleanup_task
     if cleanup is None:
-        async def _cleanup() -> TurnBroadcast:
+        async def _cleanup() -> bool:
+            await _rollback_broadcast_attachments(broadcast)
+            queue_settled = False
             if broadcast.queue_item_id:
                 try:
-                    sess.release_queue_claim(
+                    queue_settled = sess.release_queue_claim(
                         session_id,
                         broadcast.queue_item_id,
                         turn_id=broadcast.turn_id,
@@ -11629,6 +12870,7 @@ async def _finish_cancelled_startup(
                         }),
                     })
                     broadcast.finish()
+                broadcast._startup_queue_settled = queue_settled
                 if not sess.session_is_deleting(session_id):
                     _remember_recent_turn(session_id, broadcast)
                 if snapshot_ready or broadcast.queue_item_id:
@@ -11637,12 +12879,12 @@ async def _finish_cancelled_startup(
                     _retain_active_turn_for_recovery(session_id)
                 if _active_turns.get(session_id) is broadcast:
                     _active_turns.pop(session_id, None)
-            return broadcast
+            return queue_settled
 
         cleanup = asyncio.create_task(_cleanup())
-        broadcast._cancelled_startup_cleanup_task = cleanup
+        broadcast._startup_terminal_cleanup_task = cleanup
     try:
-        return await asyncio.shield(cleanup)
+        await asyncio.shield(cleanup)
     except asyncio.CancelledError:
         # A disconnected subscriber may cancel this task while the Stop-button
         # cleanup is already running. Join the single owner before propagating
@@ -11654,6 +12896,7 @@ async def _finish_cancelled_startup(
                 continue
         cleanup.result()
         raise
+    return broadcast
 
 
 async def _start_activity_early(
@@ -11751,125 +12994,108 @@ async def _abort_turn_startup(
     pause_queue: bool = True,
     error_text: str = "",
 ) -> bool:
-    """Settle every owner created before an SDK query has been sent."""
-    broadcast.perf_status = status
-    if status != "completed" and broadcast.perf_error_kind == "none":
-        broadcast.perf_error_kind = (
-            "cancelled" if status == "cancelled" else "startup")
-    queue_settled = False
-    if broadcast.queue_item_id:
-        try:
-            queue_settled = sess.release_queue_claim(
-                session_id,
-                broadcast.queue_item_id,
-                turn_id=broadcast.turn_id,
-                pause=pause_queue,
-            )
-        except Exception as exc:
-            # Queue corruption/deletion is already durable uncertainty. It must
-            # not prevent Activity and active-turn ownership from terminating.
-            sys.stderr.write(
-                f"[chat] startup queue rollback failed sid={session_id[:8]} "
-                f"item={broadcast.queue_item_id[:8]} "
-                f"exc={type(exc).__name__}\n"
-            )
-    async def _finalize_owner() -> None:
-        await _finish_activity(session_id, broadcast, status)
-        # Keep the reservation until the Activity row is terminal. Otherwise a
-        # new turn can start a replacement row that this older cleanup closes.
-        async with _lock:
-            if _active_turns.get(session_id) is broadcast:
-                broadcast.finish()
-                _active_turns.pop(session_id, None)
+    """Settle every pre-query owner in one shielded terminal transaction."""
+    cleanup = broadcast._startup_terminal_cleanup_task
+    if cleanup is None:
+        async def _cleanup() -> bool:
+            await _rollback_broadcast_attachments(broadcast)
+            broadcast.perf_status = status
+            if status != "completed" and broadcast.perf_error_kind == "none":
+                broadcast.perf_error_kind = (
+                    "cancelled" if status == "cancelled" else "startup")
+            queue_settled = False
+            if broadcast.queue_item_id:
+                try:
+                    queue_settled = sess.release_queue_claim(
+                        session_id,
+                        broadcast.queue_item_id,
+                        turn_id=broadcast.turn_id,
+                        pause=pause_queue,
+                    )
+                except Exception as exc:
+                    # Queue corruption/deletion is durable uncertainty, but it
+                    # must not strand Activity or the active-turn reservation.
+                    sys.stderr.write(
+                        f"[chat] startup queue rollback failed "
+                        f"sid={session_id[:8]} "
+                        f"item={broadcast.queue_item_id[:8]} "
+                        f"exc={type(exc).__name__}\n"
+                    )
 
-    activity_finish = asyncio.create_task(_finalize_owner())
+            if broadcast.queue_item_id:
+                # The durable queue row owns the original text/attachment ids.
+                _delete_active_turn_sidecar(session_id)
+            else:
+                visible_error = error_text or (
+                    "Turn submission was interrupted before reaching "
+                    "canonical history."
+                    if status == "cancelled"
+                    else "Turn submission failed before reaching canonical "
+                    "history."
+                )
+                try:
+                    snapshot_ready = await asyncio.to_thread(
+                        _persist_failed_turn_snapshot,
+                        broadcast,
+                        visible_error,
+                        terminal_at_ms=int(time.time() * 1000),
+                        canonical_terminal_published=False,
+                    )
+                except Exception as exc:
+                    snapshot_ready = False
+                    sys.stderr.write(
+                        f"[chat] startup snapshot failed "
+                        f"sid={session_id[:8]} exc={type(exc).__name__}\n"
+                    )
+                if snapshot_ready:
+                    _delete_active_turn_sidecar(session_id)
+                else:
+                    _retain_active_turn_for_recovery(session_id)
+
+            await _finish_activity(session_id, broadcast, status)
+            # Keep the reservation until every durable owner above is settled.
+            async with _lock:
+                broadcast._startup_queue_settled = queue_settled
+                if _active_turns.get(session_id) is broadcast:
+                    broadcast.finish()
+                    _active_turns.pop(session_id, None)
+            _interrupted_at_startup.pop(session_id, None)
+            return queue_settled
+
+        cleanup = asyncio.create_task(_cleanup())
+        broadcast._startup_terminal_cleanup_task = cleanup
     try:
-        await asyncio.shield(activity_finish)
+        return await asyncio.shield(cleanup)
     except asyncio.CancelledError:
-        while not activity_finish.done():
+        # Multiple Task.cancel() calls may arrive while rollback is joining a
+        # real worker. They cannot cut the rest of this terminal transaction.
+        while not cleanup.done():
             try:
-                await asyncio.shield(activity_finish)
+                await asyncio.shield(cleanup)
             except asyncio.CancelledError:
                 continue
-        activity_finish.result()
+        cleanup.result()
         raise
-
-    if broadcast.queue_item_id:
-        # The durable queue row still owns the original text and attachments.
-        _delete_active_turn_sidecar(session_id)
-    else:
-        visible_error = error_text or (
-            "Turn submission was interrupted before reaching canonical history."
-            if status == "cancelled"
-            else "Turn submission failed before reaching canonical history."
-        )
-        snapshot_ready = await asyncio.to_thread(
-            _persist_failed_turn_snapshot,
-            broadcast,
-            visible_error,
-            terminal_at_ms=int(time.time() * 1000),
-            canonical_terminal_published=False,
-        )
-        if snapshot_ready:
-            _delete_active_turn_sidecar(session_id)
-        else:
-            _retain_active_turn_for_recovery(session_id)
-    return queue_settled
 
 
 async def _fail_queued_attachment_startup(
     session_id: str,
     broadcast: TurnBroadcast,
 ) -> bool:
-    """Roll a bound queued turn back when its staged uploads disappeared.
+    """Roll a queued attachment failure through the shared terminal owner.
 
-    This path runs after the client has started but before the final query is
-    wired.  Keep the active reservation until Activity Center is terminal so a
-    direct send cannot start a new row and then be overwritten by this older
-    cleanup.  The durable claim is released with the exact turn id; the item and
-    its attachment ids remain visible in the paused queue for edit/reattach.
+    The durable row retains its original text and staged ids, is returned to
+    the paused queue, and can be retried after the attachment lease/files have
+    been fully rolled back.
     """
-    broadcast.perf_status = "failed"
     broadcast.perf_error_kind = "attachment"
-    queue_settled = False
-    try:
-        queue_settled = sess.release_queue_claim(
-            session_id,
-            broadcast.queue_item_id,
-            turn_id=broadcast.turn_id,
-            pause=True,
-        )
-    except Exception as e:
-        # Leave a failed release bound on disk for conservative restart
-        # recovery. Never guess ownership or drop the accepted item.
-        sys.stderr.write(
-            f"[chat] queued attachment rollback failed sid={session_id[:8]} "
-            f"item={broadcast.queue_item_id[:8]} exc={type(e).__name__}\n")
-        sys.stderr.flush()
-
-    activity_finish = asyncio.create_task(
-        _finish_activity(session_id, broadcast, "failed"))
-    try:
-        try:
-            await asyncio.shield(activity_finish)
-        except asyncio.CancelledError:
-            # The ledger writes in a worker thread and cannot actually be
-            # cancelled once started. Join it before exposing the session slot,
-            # or its late finish-by-sid could close a newer direct turn's row.
-            await activity_finish
-            raise
-    finally:
-        # No SDK query was sent, so there is no detached pump/recent-turn replay
-        # to own this broadcast. Synchronous identity cleanup is atomic on the
-        # event loop and still runs if Activity cleanup is cancelled.
-        if not broadcast.done:
-            broadcast.finish()
-        broadcast.close()
-        if _active_turns.get(session_id) is broadcast:
-            _active_turns.pop(session_id, None)
-        _interrupted_at_startup.pop(session_id, None)
-        _delete_active_turn_sidecar(session_id)
-    return queue_settled
+    return await _abort_turn_startup(
+        session_id,
+        broadcast,
+        "failed",
+        pause_queue=True,
+        error_text="attachment preparation failed",
+    )
 
 
 async def _start_turn(
@@ -12017,14 +13243,31 @@ async def _start_turn(
         try:
             sess.bind_queue_turn(
                 session_id, broadcast.queue_item_id, broadcast.turn_id)
+            _durable_attachment_store.mark_queue_turn(
+                session_id, broadcast.queue_item_id, broadcast.turn_id,
+            )
         except Exception:
+            queue_settled = False
+            try:
+                queue_settled = sess.release_queue_claim(
+                    session_id,
+                    broadcast.queue_item_id,
+                    turn_id=broadcast.turn_id,
+                    pause=True,
+                )
+            except Exception:
+                pass
+            _delete_active_turn_sidecar(session_id)
             async with _lock:
                 if _active_turns.get(session_id) is broadcast:
                     broadcast.perf_status = "failed"
                     broadcast.perf_error_kind = "queue_bind"
                     broadcast.finish()
                     _active_turns.pop(session_id, None)
-            raise _TurnStartError("could not bind queued message to turn")
+            raise _TurnStartError(
+                "could not bind queued message to turn",
+                queue_claim_settled=queue_settled,
+            )
     # Clear a completed watcher defensively. A live watcher must never be
     # cancelled here: it still owns the stream and its continuation belongs to
     # the previous turn.
@@ -12187,148 +13430,84 @@ async def _start_turn(
     if broadcast.cancelled:
         return await _finish_cancelled_startup(session_id, broadcast)
 
-    # Pull attachments from the in-memory store; build content blocks for the
-    # SDK. Consume them — same attachment won't be re-sent on retry.
-    img_blocks: list[dict] = []
-    pdf_blocks: list[dict] = []
-    # Every non-image attachment lands here as (display name, on-disk path,
-    # optional note). Nothing is pasted into the prompt any more — the user's
-    # call, and the right one: a 200 KB CSV used to cost 200 KB of context on
-    # EVERY subsequent turn because it lived in the transcript forever, while
-    # the agent usually only needed three columns of it.
-    disk_attachments: list[tuple[str, str, str]] = []
-    persisted_imgs: list[dict] = []
-    persisted_docs: list[dict] = []
+    # Lease staged uploads without consuming them. The payload remains retryable
+    # through CPU/disk preparation and native compact preflight; only a
+    # successful SDK query write commits the lease.
+    prepared = _PreparedStagedAttachments()
     if image_ids:
-        # This is the final attachment boundary before query wiring. Queue
-        # uploads are claimed all-or-none under the store lock: client startup
-        # may have taken long enough for a previously successful drain precheck
-        # to go stale, but the durable message must never degrade to text-only.
-        # Direct sends keep their historical best-effort missing-id behaviour.
-        claimed_attachments, missing_attachments = _claim_staged_attachments(
+        lease, missing_attachments, busy_attachments = await asyncio.to_thread(
+            _lease_staged_attachments,
             image_ids,
             require_all=bool(broadcast.queue_item_id),
+            queue_owner=((session_id, broadcast.queue_item_id)
+                         if broadcast.queue_item_id else None),
         )
-        if broadcast.queue_item_id and missing_attachments:
-            queue_settled = await _fail_queued_attachment_startup(
-                session_id, broadcast)
+        broadcast._attachment_lease = lease
+        if busy_attachments or (
+            broadcast.queue_item_id and missing_attachments
+        ):
+            if broadcast.queue_item_id:
+                queue_settled = await _fail_queued_attachment_startup(
+                    session_id, broadcast)
+            else:
+                queue_settled = await _abort_turn_startup(
+                    session_id,
+                    broadcast,
+                    "failed",
+                    error_text="attachment is already being submitted",
+                )
+            reason = (
+                "attachment is already being submitted"
+                if busy_attachments
+                else "queued attachment is missing or expired"
+            )
             raise _TurnStartError(
-                "queued attachment is missing or expired",
+                reason,
                 queue_claim_settled=queue_settled,
             )
-        for aid, entry in claimed_attachments:
-            kind = entry.get("kind", "image")
-            if kind == "image":
-                img_blocks.append({
-                    "type": "image",
-                    "source": {
-                        "type": "base64",
-                        "media_type": entry["mime"],
-                        "data": entry["b64"],
-                    },
-                })
-                # Persist FULL-RES original to disk so a future lightbox
-                # open after reload still sees the real image, not a 160-px
-                # thumbnail blown up. Path: sessions/attachments/<sid>/<aid>.<ext>
-                # JSONL message keeps {thumb, url, mime} — thumb for the
-                # in-stream chat bubble (small, fast), url for lightbox
-                # full-res. Previously only thumb was kept, hence "click
-                # to enlarge" showed a 160-px upscaled blur.
-                import io as _io
-                import base64 as _b64
-                ext_map = {
-                    "image/png": "png", "image/jpeg": "jpg",
-                    "image/jpg": "jpg", "image/gif": "gif",
-                    "image/webp": "webp",
-                }
-                ext = ext_map.get(entry["mime"], "bin")
-                attach_dir = _attachments_base() / session_id
-                full_url = None
-                try:
-                    attach_dir.mkdir(parents=True, exist_ok=True)
-                    attach_path = attach_dir / f"{aid}.{ext}"
-                    attach_path.write_bytes(_b64.b64decode(entry["b64"]))
-                    full_url = f"/api/chat/attachments/{session_id}/{aid}.{ext}"
-                except Exception as _e:
-                    sys.stderr.write(
-                        f"[attach] persist failed "
-                        f"sid={obs.short_id(session_id)} "
-                        f"aid={obs.short_id(aid)} "
-                        f"exc={type(_e).__name__} kind=write\n")
-                    sys.stderr.flush()
-                # Thumb for in-stream bubble (≤ 160 px, JPEG 60%).
-                thumb_b64 = None
-                try:
-                    from PIL import Image as _Img
-                    raw_bytes = _b64.b64decode(entry["b64"])
-                    with _Img.open(_io.BytesIO(raw_bytes)) as _img:
-                        _img.thumbnail((160, 160))
-                        buf = _io.BytesIO()
-                        _img.convert("RGB").save(buf, "JPEG", quality=60)
-                        thumb_b64 = _b64.b64encode(buf.getvalue()).decode()
-                except Exception:
-                    pass
-                _item: dict = {"mime": entry["mime"]}
-                if thumb_b64:
-                    _item["thumb"] = thumb_b64
-                if full_url:
-                    _item["url"] = full_url
-                persisted_imgs.append(_item)
-                # Stash to pending NOW so the attachment survives even if
-                # the stream gets cancelled / errored before the
-                # set_message_annotation(uuid) hook at stream-completion
-                # gets to fire. GET /sessions/{sid} will bind it to the
-                # next user message that has image refs but no annotation.
-                try:
-                    sess.append_pending_attachments(session_id, images=[_item])
-                except Exception:
-                    pass
-            elif kind == "pdf":
-                pdf_blocks.append({
-                    "type": "document",
-                    "source": {
-                        "type": "base64",
-                        "media_type": "application/pdf",
-                        "data": entry["b64"],
-                    },
-                })
-                # Keep the native Anthropic PDF document block above, but also
-                # persist a local copy and inject its path into the prompt.
-                # Some Anthropic-compatible gateways accept image blocks but
-                # silently ignore PDF document blocks; the path fallback lets
-                # Claude Code/Agent tools inspect the same PDF via Read.
-                doc_name = entry.get("name", "doc.pdf")
-                saved = _persist_attachment(
-                    session_id, aid, doc_name,
-                    base64.b64decode(entry["b64"]))
-                if saved:
-                    disk_attachments.append((doc_name, saved[0], ""))
-                persisted_docs.append(_doc_item(doc_name, "pdf", saved))
-            elif kind == "text":
-                doc_name = entry.get("name", "file.txt")
-                saved = _persist_attachment(
-                    session_id, aid, doc_name,
-                    entry.get("raw") or (entry.get("text") or "").encode("utf-8"))
-                if saved:
-                    disk_attachments.append((doc_name, saved[0], ""))
-                persisted_docs.append(_doc_item(doc_name, "text", saved))
-            elif kind == "xlsx":
-                # Original workbook + plain-text transcription, both on disk.
-                doc_name = entry.get("name", "book.xlsx")
-                saved = _persist_attachment(
-                    session_id, aid, doc_name, entry.get("raw") or b"")
-                txt_name = Path(doc_name).stem + ".txt"
-                txt_saved = _persist_attachment(
-                    session_id, aid + "-txt", txt_name,
-                    (entry.get("text") or "").encode("utf-8"))
-                if saved:
-                    note = (f"plain-text transcription: {txt_saved[0]}"
-                            if txt_saved else "")
-                    disk_attachments.append((doc_name, saved[0], note))
-                elif txt_saved:
-                    disk_attachments.append((txt_name, txt_saved[0], ""))
-                persisted_docs.append(_doc_item(doc_name, "xlsx", saved))
+        if lease is not None:
+            try:
+                prepared = await _prepare_broadcast_attachments(
+                    broadcast, session_id, lease)
+            except asyncio.CancelledError:
+                if broadcast.cancelled:
+                    return await _finish_cancelled_startup(
+                        session_id, broadcast)
+                await _abort_turn_startup(
+                    session_id,
+                    broadcast,
+                    "cancelled",
+                    pause_queue=True,
+                )
+                raise
+            except Exception:
+                broadcast.perf_error_kind = "attachment"
+                if broadcast.queue_item_id:
+                    queue_settled = await _fail_queued_attachment_startup(
+                        session_id, broadcast)
+                else:
+                    queue_settled = await _abort_turn_startup(
+                        session_id,
+                        broadcast,
+                        "failed",
+                        error_text="attachment preparation failed",
+                    )
+                raise _TurnStartError(
+                    "attachment preparation failed",
+                    queue_claim_settled=queue_settled,
+                ) from None
 
+    # Stop may arrive while the worker is in an uninterruptible thread. The
+    # wrapper joins its real result; re-check before those files can reach any
+    # prompt/sidecar/pump boundary.
+    if broadcast.cancelled:
+        return await _finish_cancelled_startup(session_id, broadcast)
+
+    img_blocks = list(prepared.img_blocks)
+    pdf_blocks = list(prepared.pdf_blocks)
+    disk_attachments = list(prepared.disk_attachments)
+    persisted_imgs = list(prepared.persisted_imgs)
+    persisted_docs = list(prepared.persisted_docs)
     # Attachments are referenced BY PATH, never inlined. The prompt gets a
     # manifest; the agent Reads what it needs. Two things this buys:
     #   - context: a big CSV no longer sits in the transcript forever, re-sent
@@ -12345,7 +13524,14 @@ async def _start_turn(
             "Use the Read tool on these paths. Do not guess at their contents.",
         ]
         for name, path, note in disk_attachments:
-            lines.append(f"- {name}: {path}" + (f"  ({note})" if note else ""))
+            fields = [
+                f"filename={json.dumps(name, ensure_ascii=False)}",
+                f"path={json.dumps(path, ensure_ascii=False)}",
+            ]
+            if note:
+                fields.append(
+                    f"note={json.dumps(note, ensure_ascii=False)}")
+            lines.append("- " + " ".join(fields))
         lines.append("--- end attached files ---")
         parts.append("\n".join(lines))
         prompt = "\n".join(parts).lstrip()
@@ -12916,10 +14102,15 @@ async def _start_turn(
                 # on this client. The canonical query remains exactly `prompt` so
                 # recalled data is never persisted as a fake user message.
                 # Multimodal path when binary blocks (image/pdf) are present.
-                # Text-only attachments were already inlined into `prompt`.
+                # Text/xlsx attachments are represented by the path manifest.
                 binary_blocks = [*img_blocks, *pdf_blocks]
 
                 async def _send_query() -> None:
+                    # Every preflight/transcript/sidecar await above is a Stop
+                    # race. This is the last instruction before SDK transport.
+                    if broadcast.cancelled:
+                        raise _TurnCancelledBeforeQuery()
+
                     if not broadcast.perf_query_started:
                         broadcast.perf_query_started = obs.monotonic()
                     if binary_blocks:
@@ -12936,6 +14127,29 @@ async def _start_turn(
                         await client.query(gen())
                     else:
                         await client.query(prompt)
+                    # query() is the transport commit point. Until it returns,
+                    # the lease is still retryable; after it succeeds, consume
+                    # the exact staged objects before receiving any response.
+                    try:
+                        _commit_broadcast_attachments(broadcast)
+                    except _AttachmentCommitUncertain:
+                        # A response may now be queued on this runtime; never
+                        # let the next turn adopt it as its own response.
+                        _pending_runtime_rebuilds.add(session_id)
+                        raise
+                    if persisted_imgs:
+                        try:
+                            await _await_thread_completion(
+                                sess.append_pending_attachments,
+                                session_id,
+                                list(persisted_imgs),
+                            )
+                        except Exception as exc:
+                            sys.stderr.write(
+                                "[attach] pending annotation failed "
+                                f"sid={obs.short_id(session_id)} "
+                                f"exc={type(exc).__name__}\n")
+                            sys.stderr.flush()
 
                 replay_dropped = 0
 
@@ -13021,9 +14235,13 @@ async def _start_turn(
                         f"[chat-stream] dropped stale replay sid={session_id[:8]} "
                         f"messages={replay_dropped}\n")
                     sys.stderr.flush()
+            terminal_kind = ""
+            terminal_payload: Any = None
             try:
                 async with _session_runtime_lock_for(session_id):
                     await _run_query()
+            except _TurnCancelledBeforeQuery:
+                terminal_kind = "cancelled"
             except _ContextRecovered as e:
                 # Expected control transfer: the old transcript was preserved
                 # and the browser will adopt the returned recovery session.
@@ -13032,7 +14250,7 @@ async def _start_turn(
                     f"[chat-preflight] recovery session ready "
                     f"sid={session_id[:8]} model={model_to_use}\n")
                 sys.stderr.flush()
-                await merge_q.put(("error", e))
+                terminal_kind, terminal_payload = "error", e
             except Exception as e:
                 # Keep enough structure for diagnosis without copying an SDK
                 # exception, prompt, path, credential or protocol payload into
@@ -13044,8 +14262,13 @@ async def _start_turn(
                     f"[chat-stream] sid={session_id[:8]} model={model_to_use} "
                     f"exc={type(e).__name__} kind={error_kind}\n")
                 sys.stderr.flush()
-                await merge_q.put(("error", e))
+                terminal_kind, terminal_payload = "error", e
             finally:
+                # Do not expose a terminal failure while its staged id is still
+                # busy. Retrying as soon as the browser sees error is safe.
+                await _rollback_broadcast_attachments(broadcast)
+                if terminal_kind:
+                    await merge_q.put((terminal_kind, terminal_payload))
                 await merge_q.put(("done", SENTINEL_DONE))
 
         async def pump_side_q(src_q):
@@ -14124,6 +15347,11 @@ async def _start_turn(
                     # Already shaped as {"event": "...", "data": "..."} — pass through.
                     yield await _prepare_side_event(payload)
                     continue
+                if kind == "cancelled":
+                    async for side_event in _flush_side_channels():
+                        yield side_event
+                    yield {"event": "cancelled", "data": "{}"}
+                    break
                 if kind == "error":
                     async for side_event in _flush_side_channels():
                         yield side_event
@@ -14214,6 +15442,10 @@ async def _start_turn(
             side_task.cancel()
             perm_task.cancel()
             claude_task.cancel()
+            # A task cancelled before its coroutine starts has no finally, and
+            # a task stuck in SDK code may ignore cancellation. Join the shared
+            # attachment finalizer directly before this outer owner can exit.
+            await _rollback_broadcast_attachments(broadcast)
             unregister_session_queue(session_id)
             if perm.unregister_session_queue(session_id):
                 # Approval returned updatedPermissions but no terminal tool hook
@@ -14265,13 +15497,42 @@ async def _start_turn(
     # Refresh the pending intent with resolved model, attachment display refs,
     # and the exact pre-query transcript boundary captured above. Keep this
     # filesystem write off the event loop because the sidecar is durable state.
-    await obs.to_thread_io(
-        "chat.active_turn_write",
-        session_id,
-        _write_active_turn_sidecar,
-        broadcast,
-        file_path=_active_turn_path(session_id),
-    )
+    try:
+        await obs.to_thread_io(
+            "chat.active_turn_write",
+            session_id,
+            _write_active_turn_sidecar,
+            broadcast,
+            file_path=_active_turn_path(session_id),
+        )
+    except asyncio.CancelledError:
+        if broadcast.cancelled:
+            return await _finish_cancelled_startup(
+                session_id, broadcast)
+        await _abort_turn_startup(
+            session_id,
+            broadcast,
+            "cancelled",
+            pause_queue=True,
+        )
+        raise
+    except Exception:
+        queue_settled = await _abort_turn_startup(
+            session_id,
+            broadcast,
+            "failed",
+            pause_queue=True,
+            error_text="turn intent could not be refreshed",
+        )
+        raise _TurnStartError(
+            "turn intent could not be refreshed",
+            queue_claim_settled=queue_settled,
+        ) from None
+    # The durable write may finish after Stop cancelled (or tried to cancel)
+    # this owner. Do not create a pump after the user-visible cancellation.
+    if broadcast.cancelled:
+        return await _finish_cancelled_startup(session_id, broadcast)
+
     _interrupted_at_startup.pop(session_id, None)
 
     async def _pump_gen_to_broadcast():
@@ -14420,6 +15681,12 @@ async def _start_turn(
                                     broadcast.queue_item_id,
                                     broadcast.turn_id,
                                 )
+                                if queue_settled:
+                                    _durable_attachment_store.finish_queue_item(
+                                        session_id,
+                                        broadcast.queue_item_id,
+                                        consume=True,
+                                    )
                             if not queue_settled:
                                 raise RuntimeError("queue terminal ownership mismatch")
                         if (not done_data.get("is_error")
@@ -14498,6 +15765,14 @@ async def _start_turn(
                     _safe_secondary_diagnostic(
                         "terminal_replay", session_id, exc)
         finally:
+            # A force-stop takeover owns all terminal bookkeeping. A pump that
+            # eventually escapes hung SDK code must only join that owner; doing
+            # Activity/queue/sidecar settlement again reintroduces the race the
+            # watchdog was meant to close.
+            if broadcast._startup_terminal_cleanup_task is not None:
+                await _finish_cancelled_startup(session_id, broadcast)
+                return
+
             if broadcast.cancelled:
                 broadcast.perf_status = "cancelled"
                 broadcast.perf_error_kind = "cancelled"
@@ -14563,12 +15838,18 @@ async def _start_turn(
                         ):
                             raise RuntimeError("queue terminal ownership mismatch")
                     else:
-                        if not sess.ack_queue_message(
+                        queue_settled = sess.ack_queue_message(
                             session_id,
                             broadcast.queue_item_id,
                             broadcast.turn_id,
-                        ):
+                        )
+                        if not queue_settled:
                             raise RuntimeError("queue terminal ownership mismatch")
+                        _durable_attachment_store.finish_queue_item(
+                            session_id,
+                            broadcast.queue_item_id,
+                            consume=True,
+                        )
                 except Exception as e:
                     # Never duplicate a turn by guessing. The durable inflight
                     # record remains for restart recovery if acknowledgement fails.
@@ -14750,6 +16031,17 @@ async def _maybe_drain_queue(session_id: str) -> None:
                     moved = sess.migrate_queue(session_id, successor_sid)
                 except ValueError:
                     return
+                try:
+                    _durable_attachment_store.migrate_queue_items(
+                        session_id,
+                        [str(row.get("id") or "")
+                         for row in moved["target"].get("items", [])],
+                        successor_sid,
+                    )
+                except Exception as exc:
+                    sys.stderr.write(
+                        f"[chat] attachment ref migration deferred "
+                        f"exc={type(exc).__name__}\n")
                 if moved["target"].get("items"):
                     _schedule_queue_drain(successor_sid)
             return
@@ -14826,9 +16118,35 @@ async def _maybe_drain_queue(session_id: str) -> None:
             if aid.strip()
         ]
         if attachment_ids:
-            _gc_images()
-            unavailable_count = sum(
-                1 for aid in attachment_ids if aid not in _image_store)
+            try:
+                if any(
+                    not _valid_staged_attachment_id(aid)
+                    for aid in attachment_ids
+                ):
+                    unavailable_count = len(attachment_ids)
+                else:
+                    await asyncio.to_thread(_gc_images)
+                    with _image_store_lock:
+                        cached_ids = set(_image_store).intersection(
+                            attachment_ids)
+                    durable_ids = await asyncio.to_thread(
+                        _durable_attachment_store.existing_ids,
+                        attachment_ids,
+                    )
+                    unavailable_count = sum(
+                        1 for aid in attachment_ids
+                        if aid not in cached_ids and aid not in durable_ids)
+            except (DurableAttachmentError, OSError, sqlite3.Error,
+                    UnsafePrivatePath) as exc:
+                restored = sess.release_queue_claim(
+                    session_id, item_id, pause=True)
+                sys.stderr.write(
+                    f"[chat] queued attachment precheck failed "
+                    f"sid={session_id[:8]} item={item_id[:8]} "
+                    f"restored={restored} exc={type(exc).__name__}\n"
+                )
+                sys.stderr.flush()
+                return
             if unavailable_count:
                 restored = sess.release_queue_claim(
                     session_id, item_id, pause=True)
@@ -15213,6 +16531,36 @@ async def providers_list() -> dict:
         "default_model": _resolve_default_model(""),
         "default_permission": default_permission,
     }
+
+def recover_durable_queue_attachments_at_startup(
+    session_store=sess,
+) -> dict[str, int]:
+    """Reconcile durable refs against the complete, recovered queue set.
+
+    This runs only after sessions.recover_queue_inflight has parsed and
+    durably paused every queue. Consequently, an absent item is authoritative
+    and its orphan ref can be released; a duplicate id fails startup closed.
+    """
+    owners: dict[str, str] = {}
+    for sid in session_store.list_queue_session_ids():
+        queue = session_store.get_queue(sid)
+        rows = list(queue.get("items") or [])
+        inflight = queue.get("inflight") or {}
+        if inflight.get("item"):
+            rows.append(inflight["item"])
+        for row in rows:
+            item_id = str(row.get("id") or "")
+            if not item_id:
+                continue
+            previous = owners.get(item_id)
+            if previous is not None and previous != sid:
+                raise RuntimeError("duplicate durable queue item id")
+            owners[item_id] = sid
+    return _durable_attachment_store.reconcile_queue_refs(
+        owners,
+        ttl=_IMAGE_TTL_S,
+    )
+
 
 
 # Dynamic bridge for SDK client/runtime lifecycle. Every callback resolves the

@@ -1,3 +1,4 @@
+import asyncio
 import functools
 import hashlib
 import json
@@ -7,6 +8,7 @@ import re
 import subprocess
 import sys
 import threading
+import weakref
 from contextlib import asynccontextmanager
 from pathlib import Path
 from fastapi import Body, Depends, FastAPI, Request
@@ -48,6 +50,7 @@ class _TokenFilter(logging.Filter):
     sanitizer remains here as a fail-closed regression surface and for any
     future explicitly opted-in access sink.
     """
+    _muselab_access_filter = True
 
     _uuid_re = re.compile(
         r"(?i)(?<![0-9a-f])(?:"
@@ -109,8 +112,21 @@ class _TokenFilter(logging.Filter):
         return False
 
 
-# Apply to uvicorn access logger
-logging.getLogger("uvicorn.access").addFilter(_TokenFilter())
+def _install_access_log_filter() -> None:
+    """Replace MuseLab's process-global filter across module reloads.
+
+    The test app intentionally reloads backend.main for filesystem isolation.
+    Logging keeps filters globally, so blindly adding one per import retained
+    every previous FastAPI module graph until interpreter shutdown.
+    """
+    logger = logging.getLogger("uvicorn.access")
+    for installed in tuple(logger.filters):
+        if getattr(installed, "_muselab_access_filter", False):
+            logger.removeFilter(installed)
+    logger.addFilter(_TokenFilter())
+
+
+_install_access_log_filter()
 _CLIENT_ERROR_LOG = logging.getLogger("muselab.client")
 
 FRONTEND = Path(__file__).resolve().parent.parent / "frontend"
@@ -394,17 +410,27 @@ async def _lifespan(app: FastAPI):
     must come up even if peripheral subsystems are degraded."""
     import asyncio as _asyncio
 
+    from . import chat as _chat
+    from . import files as _files
     from . import sessions as _sess
     from .activity import activity as _activity
     from .todos import todos as _todos
     from . import scheduler as _sched
     from . import push as _push
     from . import memory_client as _mem0
-    # Historical releases inherited the process umask for session sidecars.
-    # Repair those permissions only once the final runtime SESS_DIR is known;
-    # doing it during import leaks across hermetic test fixtures.
+    from .workspaces import registry as _workspace_registry
+    # Historical releases inherited the process umask for internal state.
+    # Repair permissions only once test fixtures and the workspace registry
+    # have selected their final runtime paths.
+    private_roots = {ROOT, *_workspace_registry.paths()}
     await _asyncio.gather(
         _asyncio.to_thread(_sess.ensure_private_session_storage),
+        _asyncio.to_thread(_chat.ensure_private_attachment_storage),
+        *(
+            _asyncio.to_thread(
+                _files.ensure_private_trash_storage, root, create=False)
+            for root in private_roots
+        ),
         _asyncio.to_thread(_activity.initialize_runtime_state),
         _asyncio.to_thread(_todos.initialize_runtime_state),
     )
@@ -439,6 +465,10 @@ async def _lifespan(app: FastAPI):
         # In particular, scheduler catch-up can launch work immediately; it
         # must never overlap an incomplete queue reconciliation.
         recovered = await _recover_message_queues_at_startup(_sess)
+        await _asyncio.to_thread(
+            _chat.recover_durable_queue_attachments_at_startup,
+            _sess,
+        )
     except Exception as exc:
         sys.stderr.write(
             "[muselab] queue recovery incomplete; refusing startup "
@@ -964,8 +994,80 @@ class _VersionedStaticFiles(StaticFiles):
 
     _GZ_MIN_SIZE = 256 * 1024
     _GZ_EXTS = (".js", ".css", ".json", ".svg", ".webmanifest", ".map")
-    _gz_cache: dict[str, tuple[float, int, bytes]] = {}
+    _gz_cache: dict[str, tuple[int, int, bytes]] = {}
     _gz_cache_max = 8
+    _gz_cache_lock = threading.Lock()
+    _gz_locks_guard = threading.Lock()
+    _gz_locks_by_loop: weakref.WeakKeyDictionary[
+        asyncio.AbstractEventLoop,
+        weakref.WeakValueDictionary[str, asyncio.Lock],
+    ] = weakref.WeakKeyDictionary()
+
+    @classmethod
+    def _gzip_lock(cls, key: str) -> asyncio.Lock:
+        """Return a per-asset lock bound to the current request loop.
+
+        Uvicorn normally has one event loop, while TestClient may create a new
+        loop per fixture.  Keeping locks per loop avoids sharing an asyncio
+        primitive across loops and still coalesces every production cold miss.
+        """
+        loop = asyncio.get_running_loop()
+        with cls._gz_locks_guard:
+            locks = cls._gz_locks_by_loop.get(loop)
+            if locks is None:
+                locks = weakref.WeakValueDictionary()
+                cls._gz_locks_by_loop[loop] = locks
+            lock = locks.get(key)
+            if lock is None:
+                lock = asyncio.Lock()
+                locks[key] = lock
+            return lock
+
+    @classmethod
+    def _gzip_cache_hit(cls, key: str, mtime_ns: int, size: int):
+        with cls._gz_cache_lock:
+            hit = cls._gz_cache.get(key)
+            if hit is not None and hit[0] == mtime_ns and hit[1] == size:
+                return hit
+        return None
+
+    @classmethod
+    def _store_gzip_cache(
+        cls, key: str, mtime_ns: int, size: int, data: bytes,
+    ) -> tuple[int, int, bytes]:
+        with cls._gz_cache_lock:
+            # Another loop may have completed while this loop compressed.  In
+            # that rare test/server topology, prefer the already-published
+            # value when it represents the same file generation.
+            hit = cls._gz_cache.get(key)
+            if hit is not None and hit[0] == mtime_ns and hit[1] == size:
+                return hit
+            if len(cls._gz_cache) >= cls._gz_cache_max and key not in cls._gz_cache:
+                cls._gz_cache.pop(next(iter(cls._gz_cache)), None)
+            hit = (mtime_ns, size, data)
+            cls._gz_cache[key] = hit
+            return hit
+
+    @staticmethod
+    def _read_and_gzip(
+        full: str, expected_mtime_ns: int, expected_size: int,
+    ) -> bytes | None:
+        """Read and compress one stable file generation off the event loop."""
+        import gzip as _gzip
+
+        try:
+            before = os.stat(full)
+            if (before.st_mtime_ns != expected_mtime_ns
+                    or before.st_size != expected_size):
+                return None
+            raw = Path(full).read_bytes()
+            after = os.stat(full)
+        except OSError:
+            return None
+        if (after.st_mtime_ns != before.st_mtime_ns
+                or after.st_size != before.st_size):
+            return None
+        return _gzip.compress(raw, compresslevel=6)
 
     async def get_response(self, path, scope):
         gz = await self._try_gzip_response(path, scope)
@@ -978,7 +1080,6 @@ class _VersionedStaticFiles(StaticFiles):
         return resp
 
     async def _try_gzip_response(self, path, scope):
-        import gzip as _gzip
         from starlette.responses import Response as _Resp
         headers = dict(scope.get("headers") or [])
         ae = headers.get(b"accept-encoding", b"").decode("latin-1")
@@ -992,21 +1093,29 @@ class _VersionedStaticFiles(StaticFiles):
             return None
         if st is None or not full or st.st_size < self._GZ_MIN_SIZE:
             return None
-        key = path
-        hit = self._gz_cache.get(key)
-        if hit is None or hit[0] != st.st_mtime or hit[1] != st.st_size:
-            try:
-                raw = Path(full).read_bytes()
-            except OSError:
-                return None
-            # Run the (CPU-bound, GIL-releasing) compress off the event loop.
-            import anyio
-            data = await anyio.to_thread.run_sync(
-                lambda: _gzip.compress(raw, compresslevel=6))
-            if len(self._gz_cache) >= self._gz_cache_max and key not in self._gz_cache:
-                self._gz_cache.pop(next(iter(self._gz_cache)), None)
-            self._gz_cache[key] = (st.st_mtime, st.st_size, data)
-            hit = self._gz_cache[key]
+        # Use the concrete file path, not the request-relative path: multiple
+        # app/TestClient instances can otherwise cross-contaminate `app.js`.
+        key = full
+        hit = self._gzip_cache_hit(key, st.st_mtime_ns, st.st_size)
+        if hit is None:
+            # Single-flight the whole cold path.  The previous implementation
+            # read on the event loop and let every concurrent miss compress the
+            # same multi-megabyte asset independently.
+            async with self._gzip_lock(key):
+                hit = self._gzip_cache_hit(key, st.st_mtime_ns, st.st_size)
+                if hit is None:
+                    import anyio
+                    data = await anyio.to_thread.run_sync(
+                        self._read_and_gzip,
+                        full,
+                        st.st_mtime_ns,
+                        st.st_size,
+                    )
+                    if data is None:
+                        return None
+                    hit = self._store_gzip_cache(
+                        key, st.st_mtime_ns, st.st_size, data,
+                    )
         import mimetypes
         mt = mimetypes.guess_type(path)[0] or "application/octet-stream"
         return _Resp(

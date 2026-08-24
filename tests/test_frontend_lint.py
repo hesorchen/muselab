@@ -1096,7 +1096,13 @@ def test_session_synchronization_has_one_per_tab_coordinator():
     ):
         assert field in state
     assert "if (sync.inFlight) return" in coordinator
-    assert "sync.inFlight = { reason: request.reason, task }" in coordinator
+    assert "sync.inFlight = { reason: request.reason, task, controller, epoch }" in coordinator
+    assert "Promise.race([operation, cancelled, deadline])" in coordinator
+    assert "inFlight.controller.abort()" in coordinator
+    assert "this._sessionSyncNeedsVisibility(request.reason)" in coordinator
+    assert "request.dueAt = Date.now() + 2000" in coordinator
+    assert "this._resumeVisibleSessionSync()" in app
+    assert "async _fetchWithDeadline(" in app
     assert "delete sync.pending[request.reason]" in coordinator
     assert "this._scheduleSessionSync(sid, st)" in coordinator
     for reason in (
@@ -1126,6 +1132,24 @@ def test_session_synchronization_has_one_per_tab_coordinator():
     ):
         assert superseded not in app
     assert "setInterval(tick, 2000)" not in app
+
+
+def test_session_sync_deadlines_and_activity_transport_backoff_are_bounded():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    fetch_start = app.index("    async _fetchWithDeadline(")
+    fetch_end = app.index("\n    _staticAssetUrl", fetch_start)
+    deadline_fetch = app[fetch_start:fetch_end]
+    assert "Promise.race([fetch(url, fetchOptions), control])" in deadline_fetch
+    assert 'abort("request deadline exceeded")' in deadline_fetch
+
+    activity_start = app.index("    async fetchActivity(opts = {}) {")
+    activity_end = app.index("\n    async ackActivityEvent", activity_start)
+    activity = app[activity_start:activity_end]
+    assert "this._fetchWithDeadline(path" in activity
+    assert "this._activityFetchControllers[key] = controller" in activity
+    assert "this._abortActivityFetches()" in activity
+    assert "this._activityReconnectDelay()" in activity
+    assert "this._activityLiveFailures = 0" in activity
 
 
 def test_session_sync_transitions_preserve_canonical_and_view_ownership():
@@ -1668,7 +1692,17 @@ def test_activity_center_groups_by_attention_order_and_read_state():
     assert "this.activityGroupCap(group)" in app
     assert "activityHiddenCount(group)" in app
     assert '"/api/activity?limit=500"' in app
-    assert "r.status === 304 && !opts.summaryOnly && !this.activity.events.length" in app
+    fetch_start = app.index("    async fetchActivity(opts = {}) {")
+    fetch_end = app.index("\n    async openActivityCenter()", fetch_start)
+    fetch_activity = app[fetch_start:fetch_end]
+    assert "_activityEventsSnapshotLoaded: false" in app
+    assert "r.status === 304 && !opts.summaryOnly" in fetch_activity
+    assert "&& !this._activityEventsSnapshotLoaded" in fetch_activity
+    assert "!this.activity.events.length" not in fetch_activity
+    assert "this._activityEventsSnapshotLoaded = true" in fetch_activity
+    assert fetch_activity.index("this.activity.events = events") < (
+        fetch_activity.index("this._activityEventsSnapshotLoaded = true")
+    )
     assert 'cache: "reload"' in app
     assert "opts.summaryOnly && this._activityFetchPromises.events" in app
     assert "!opts.summaryOnly && this._activityFetchPromises.summary" in app
@@ -1677,7 +1711,7 @@ def test_activity_center_groups_by_attention_order_and_read_state():
     custom_sort = app.index("const aManual = Number.isFinite")
     assert "if (aManual !== bManual) return aManual ? 1 : -1" in app[custom_sort:]
     assert "Number(a.group_order) - Number(b.group_order)" in app[custom_sort:]
-    assert 'group.key === "custom:__ungrouped__"' in app[custom_sort:]
+    assert 'groupKey === "custom:__ungrouped__"' in app[custom_sort:]
     assert "this._activityAppliedSeq = ++this._activityRequestSeq" in app
     assert '"/api/activity/events-ticket"' in app
     assert "new EventSource(" in app
@@ -1781,6 +1815,33 @@ def test_activity_center_searches_loaded_sessions_before_group_caps():
     assert "group.custom && !activitySearchQuery()" in html
     assert ".activity-searchbar" in css
     assert ".activity-search-empty" in css
+
+
+def test_activity_event_storage_and_derived_work_are_hard_bounded():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    fetch_start = app.index("    async fetchActivity(opts = {}) {")
+    fetch_end = app.index("\n    async openActivityCenter()", fetch_start)
+    fetch_activity = app[fetch_start:fetch_end]
+    derived_start = app.index("    _activityDerivedSnapshot() {")
+    derived_end = app.index("\n    normalizeActivityGroupOrder", derived_start)
+    derived = app[derived_start:derived_end]
+    update_start = app.index("    _applyActivityUpdate(payload) {")
+    update_end = app.index("\n    async _startActivityEvents()", update_start)
+    update = app[update_start:update_end]
+
+    assert "ACTIVITY_EVENT_CAP: 500" in app
+    assert "data.events.slice(0, this.ACTIVITY_EVENT_CAP)" in fetch_activity
+    assert ".slice(0, this.ACTIVITY_EVENT_CAP)" in update
+    assert "const _activityDerivedCaches = new WeakMap()" in app
+    assert "events: source.slice(0, limit)" in derived
+    assert "cache.source !== rawSource" in derived
+    assert "cache.groups.has(cacheKey)" in app
+    assert "cache.groups.set(cacheKey, events)" in app
+    count_start = app.index("    activitySearchResultCount() {")
+    count_end = app.index("\n    clearActivitySearch()", count_start)
+    search_count = app[count_start:count_end]
+    assert "this._activityDerivedSnapshot()" in search_count
+    assert "cache.events" in search_count
 
 
 def test_memory_recall_details_use_a_root_fixed_portal():
@@ -2245,10 +2306,8 @@ def test_inherited_task_poller_waits_for_durable_agent_projection():
     assert "sync.inheritedTicksLeft-- <= 0" in poller
     # The shared coordinator is the single-flight owner. A half-open /active
     # request still aborts on the normal session timeout before the next reason.
-    assert "const controller = new AbortController();" in poller
-    assert "Number(this._sessionListTimeoutMs) || 8000" in poller
-    assert "signal: controller.signal" in poller
-    assert "clearTimeout(timeout);" in poller
+    assert "this._fetchWithDeadline(" in poller
+    assert "signal: options.signal" in poller
     # The handler is already inside the per-session coordinator, so canonical
     # adoption calls loadSession directly instead of nesting another sync reason.
     assert "this.loadSession(childSid" in poller
@@ -2295,7 +2354,7 @@ def test_inherited_task_poller_waits_for_durable_agent_projection():
     # A reloaded successor never ran the live handoff initializer. Its normal
     # active probe must rebuild inherited ownership from durable session meta
     # and the overlay aggregate, then arm the same poller.
-    check_start = app.index("    async _probeActiveTurn(sid, st) {")
+    check_start = app.index("    async _probeActiveTurn(sid, st, options = {}) {")
     check_end = app.index("\n    // Hover-prefetch", check_start)
     check = app[check_start:check_end]
     assert "d.runtime_background_tasks_pending" in check
@@ -2317,9 +2376,13 @@ def test_inherited_task_poller_waits_for_durable_agent_projection():
 
 def test_active_turn_user_installation_dedupes_without_repeated_scroll():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
-    helper_start = app.index("    _installActiveTurnUser(")
+    helper_start = app.index("    _activeTurnUserSignature(")
     helper_end = app.index("\n    // Poll /active", helper_start)
     helper = app[helper_start:helper_end]
+    assert "const tailUser = messages[messages.length - 1];" in helper
+    assert "this._activeTurnUserSignature(" in helper
+    assert "tailUser.text, tailUser.images, tailUser.docs" in helper
+    assert "let lastUser" not in helper
     assert "let appended = false;" in helper
     assert "appended = true;" in helper
     assert "return { message: turnUser, appended };" in helper
@@ -2725,7 +2788,7 @@ def test_active_stream_owns_messages_and_continuation_reconciles_canonical_histo
     assert "closeAsst();" in send[send.index("const surfaceTerminalError = detail =>"):]
     assert "this._reconcileCompletedContinuation(" in send
     assert "streamSid, streamState, continuationFinalText" in send
-    assert "const loaded = await this.loadSession(sid, { quiet: true })" in app
+    assert "quiet: true, signal: options.signal" in app
     assert "expectedText" in app
     assert "const stillOwned = () => this.tabState[sid] === ownerState" in app
     assert "if (!isContinuation)" in send
@@ -2739,7 +2802,7 @@ def test_active_stream_owns_messages_and_continuation_reconciles_canonical_histo
     canonical_start = app.index("_scheduleCanonicalStreamReload(sid, st")
     canonical_end = app.index("\n    _retireStaleSessionStream", canonical_start)
     canonical_reload = app[canonical_start:canonical_end]
-    assert "this.loadSession(sid, { quiet: true })" in canonical_reload
+    assert "quiet: true, signal: options.signal" in canonical_reload
     assert "quiet: sid === this.currentId" not in canonical_reload
     # A continuation can emit its task-complete toast and then race out of the
     # grace-kept /active slot. Both terminal fallbacks reconcile an already-
@@ -3142,7 +3205,7 @@ def test_workspace_gate_does_not_destroy_retry_or_edit_before_send_rejects():
 
 def test_queue_sync_keeps_older_success_when_newer_read_fails():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
-    start = app.index("async _syncQueueFromServer(sid)")
+    start = app.index("async _syncQueueFromServer(sid, options = {})")
     sync = app[start:app.index("_currentQueueLen", start)]
 
     assert "_queueAppliedSeq: 0" in app
@@ -4614,10 +4677,15 @@ def test_queue_paused_flag_cannot_outlive_its_items():
     sessions = (BACKEND / "sessions.py").read_text(encoding="utf-8")
     html = (FRONTEND / "index.html").read_text(encoding="utf-8")
 
-    remove = sessions[sessions.index("def remove_queue_item("):]
-    remove = remove[:remove.index("def clear_queue(")]
+    remove = sessions[sessions.index("def remove_queue_item_with_removed("):]
+    remove = remove[:remove.index("def remove_queue_item(")]
     assert 'if not data["items"]:' in remove
     assert 'data["paused"] = False' in remove
+
+    clear = sessions[sessions.index("def clear_queue_with_removed("):]
+    clear = clear[:clear.index("def clear_queue(")]
+    assert 'current["items"] = []' in clear
+    assert 'current["paused"] = False' in clear
 
     # Paused beats streaming: "a turn is running" no longer implies "it will
     # drain when the turn ends".
@@ -4879,7 +4947,7 @@ def test_midturn_reconnect_storm_guards_are_in_place():
     # Refusal falls back to the flicker-free path: wait out the turn, then
     # quiet-load canonical history.
     assert "this._scheduleCanonicalStreamReload(sid, st);" in gate
-    check = js[js.index("    async _probeActiveTurn(sid, st) {"):]
+    check = js[js.index("    async _probeActiveTurn(sid, st, options = {}) {"):]
     check = check[:check.index("\n    // Hover-prefetch")]
     assert "if (!this._allowReconnect(sid, d.turn_id)) return;" in check
     recover = js[js.index("    _recoverStalledStream(sid = this.currentId) {"):]
@@ -5194,3 +5262,85 @@ def test_tab_activation_checks_canonical_installation_watermark():
     assert "await this._ensureSessionLoaded(tid)" in activate
     assert "this._canonicalMetaBehind(st, cur)" in switch
     assert "loadedButBehindCanonical" in switch
+
+
+def test_message_outline_is_a_focus_managed_keyboard_dialog():
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    css = (FRONTEND / "styles.css").read_text(encoding="utf-8")
+    start = html.index("<!-- ============ Message outline modal")
+    end = html.index("<!-- ============ Codex / OpenAI image generation", start)
+    outline = html[start:end]
+
+    assert '@click="openMessageOutline($event)"' in html
+    assert "msgOutlineOpen = true" not in outline
+    assert "msgOutlineOpen = false" not in outline
+    assert 'role="dialog" aria-modal="true"' in outline
+    assert 'aria-labelledby="msg-outline-title"' in outline
+    assert 'tabindex="-1"' in outline
+    assert '@keydown.escape.stop.prevent="closeMessageOutline()"' in outline
+    assert '@keydown.tab="trapDialogFocus($event, \'message-outline\')"' in outline
+    assert 'type="button" class="msg-outline-item"' in outline
+    assert "closeMessageOutline()" in outline
+
+    open_start = app.index("    openMessageOutline(ev = null) {")
+    close_end = app.index("\n    // Filter messages for the sidebar outline", open_start)
+    focus_contract = app[open_start:close_end]
+    outline_start = app.index("    outlineMessages() {")
+    outline_end = app.index("\n    async _loadAroundMessage", outline_start)
+    outline_projection = app[outline_start:outline_end]
+    refresh_start = app.index("    async refreshOutlineFromBackend(sid) {")
+    refresh_end = app.index("\n    async _reloadHistoryTailAfterConflict", refresh_start)
+    refresh = app[refresh_start:refresh_end]
+
+    assert '"message-outline", ".msg-outline-panel", ".msg-outline-item"' in focus_contract
+    assert "opener, true" in focus_contract
+    assert "void this.refreshOutlineFromBackend(this.currentId);" in focus_contract
+    assert focus_contract.index("this._openFocusSurface(") < focus_contract.index(
+        "void this.refreshOutlineFromBackend(this.currentId);"
+    )
+    assert 'this._closeFocusSurface("message-outline", restoreFocus)' in focus_contract
+    assert "refreshOutlineFromBackend" not in outline_projection
+    assert "this.activeSessionPane().messages.filter(" in outline_projection
+    assert "_outlineFetchedAt" in refresh
+    assert "_outlineFetching" in refresh
+    assert ".msg-outline-item:focus-visible" in css
+
+
+def test_file_navigation_exposes_keyboard_semantics_and_distinct_actions():
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    css = (FRONTEND / "styles.css").read_text(encoding="utf-8")
+
+    assert 'role="tree"' in html
+    assert ':aria-label="n.name"' in html
+    assert ':aria-level="n.depth + 1"' in html
+    assert ':aria-expanded="n.is_dir ? expanded.has(n.path) : null"' in html
+    assert ':tabindex="treeRowTabIndex(n)"' in html
+    assert '@keydown="onTreeRowKeydown($event, n)"' in html
+    assert html.count('class="filelist-virtual-spacer" aria-hidden="true"') == 2
+    assert html.count('role="none"') >= 2
+
+    keyboard = app[app.index("    treeRowTabIndex(n) {"):]
+    keyboard = keyboard[:keyboard.index("\n    async onNodeClick(")]
+    for key in (
+        'key === "Enter"', 'key === " "', 'key === "ArrowDown"',
+        'key === "ArrowUp"', 'key === "Home"', 'key === "End"',
+        'key === "ArrowRight"', 'key === "ArrowLeft"',
+    ):
+        assert key in keyboard
+    assert "this._positionFileTreePath(path, block)" in keyboard
+    assert 'active) this._focusWithoutScroll(active)' in keyboard
+    assert "index < end" in keyboard
+    assert "this.visible[index].path === preferred" in keyboard
+    assert "preferredIsVisible" not in keyboard
+
+    assert 'type="button" class="open-files-main"' in html
+    assert 'type="button" class="open-files-x"' in html
+    assert html.count('type="button" class="tab-main"') == 2
+    assert html.count('type="button" class="tab-close"') >= 2
+    assert '@click.stop="switchTab(t.path, { reveal: true })"' in html
+    assert '@click.stop="openTerminal(term.id)"' in html
+    assert ".open-files-main {" in css
+    assert ".tab-main {" in css
+    assert '.filelist li[role="treeitem"]:focus-visible' in css

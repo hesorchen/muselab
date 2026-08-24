@@ -1,6 +1,8 @@
 """Episode consolidation, verification, hybrid recall and Skill approval."""
 import asyncio
+import sqlite3
 import threading
+import time
 
 import httpx
 import pytest
@@ -29,6 +31,157 @@ def _config(mode="active"):
 
 def _run(coro):
     return asyncio.run(coro)
+
+
+def test_registry_lock_wait_does_not_freeze_event_loop(tmp_path, monkeypatch):
+    """A ten-second SQLite busy wait must not stall unrelated coroutines."""
+    from backend import memory_engine as module
+    from backend.memory_engine import MemoryEngine
+    from backend.memory_store import MemoryStore
+
+    path = tmp_path / "registry.sqlite3"
+    instance = MemoryEngine(MemoryStore(path))
+    cfg = _config()
+    monkeypatch.setattr(instance, "config", lambda: cfg)
+    evidence_id = instance.store.add_evidence(
+        "default", "session", "user", "需要归档")
+    episode = instance.store.get_or_create_episode(
+        "default", "session", idle_seconds=60)
+    instance.store.attach_evidence(episode["id"], [evidence_id])
+
+    async def fake_json(_self, _system, _prompt):
+        return {
+            "episode": {
+                "title": "归档", "summary": "已归档", "outcome": "success",
+                "entities": [], "attributes": {},
+            },
+            "memories": [],
+        }
+
+    monkeypatch.setattr(module.GenerationProvider, "complete_json", fake_json)
+    blocker = sqlite3.connect(path, isolation_level=None)
+    blocker.execute("BEGIN IMMEDIATE")
+
+    async def scenario():
+        task = asyncio.create_task(
+            instance._consolidate_episode(episode["id"]))
+        ticks = 0
+        deadline = asyncio.get_running_loop().time() + 0.08
+        while asyncio.get_running_loop().time() < deadline:
+            ticks += 1
+            await asyncio.sleep(0.005)
+        assert not task.done()
+        blocker.execute("ROLLBACK")
+        await asyncio.wait_for(task, timeout=1)
+        await instance.stop()
+        return ticks
+
+    try:
+        ticks = _run(scenario())
+    finally:
+        if blocker.in_transaction:
+            blocker.execute("ROLLBACK")
+        blocker.close()
+
+    assert ticks >= 3
+    assert instance.store.episode(
+        episode["id"], with_evidence=False)["summary"] == "已归档"
+
+
+def test_registry_initialization_runs_on_actor_thread(tmp_path, monkeypatch):
+    """Schema migration and first open stay off the asyncio thread."""
+    from backend import memory_engine as module
+    from backend.memory_engine import MemoryEngine
+
+    path = tmp_path / "lazy.sqlite3"
+    real_store = module.MemoryStore
+    constructor_threads: list[int] = []
+
+    def slow_store(store_path):
+        constructor_threads.append(threading.get_ident())
+        time.sleep(0.08)
+        return real_store(store_path)
+
+    monkeypatch.setattr(module, "MemoryStore", slow_store)
+    monkeypatch.setattr(module, "database_path", lambda: path)
+    instance = MemoryEngine()
+
+    async def scenario():
+        loop_thread = threading.get_ident()
+        task = asyncio.create_task(
+            instance._store_call(lambda store: store.stats("default")))
+        ticks = 0
+        deadline = asyncio.get_running_loop().time() + 0.04
+        while asyncio.get_running_loop().time() < deadline:
+            ticks += 1
+            await asyncio.sleep(0.005)
+        assert not task.done()
+        stats = await asyncio.wait_for(task, timeout=1)
+        await instance.stop()
+        return loop_thread, ticks, stats
+
+    loop_thread, ticks, stats = _run(scenario())
+    assert ticks >= 2
+    assert stats["memories"] == 0
+    assert constructor_threads
+    assert constructor_threads[0] != loop_thread
+
+
+def test_store_actor_cancellation_preserves_fifo_and_stop_drains(tmp_path):
+    """Cancellation drops the waiter, never a submitted DB transaction."""
+    from backend.memory_engine import MemoryEngine
+    from backend.memory_store import MemoryStore
+
+    instance = MemoryEngine(MemoryStore(tmp_path / "registry.sqlite3"))
+    started = threading.Event()
+    release = threading.Event()
+    order: list[str] = []
+    actor_threads: list[int] = []
+
+    def first(store):
+        actor_threads.append(threading.get_ident())
+        order.append("first-start")
+        started.set()
+        assert release.wait(timeout=1)
+        store.create_memory("default", "fact", "committed after cancellation")
+        order.append("first-commit")
+
+    def second(store):
+        actor_threads.append(threading.get_ident())
+        order.append("second-read")
+        return store.stats("default")["memories"]
+
+    async def scenario():
+        first_task = asyncio.create_task(instance._store_call(first))
+        async with asyncio.timeout(1):
+            while not started.is_set():
+                await asyncio.sleep(0.001)
+        second_task = asyncio.create_task(instance._store_call(second))
+        await asyncio.sleep(0)
+        first_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first_task
+
+        stop_task = asyncio.create_task(instance.stop())
+        await asyncio.sleep(0.03)
+        assert not stop_task.done()
+        release.set()
+        await asyncio.wait_for(stop_task, timeout=1)
+        count = await second_task
+        with pytest.raises(RuntimeError, match="closed"):
+            await instance._store_call(lambda store: store.stats("default"))
+        return count
+
+    try:
+        count = _run(scenario())
+    finally:
+        release.set()
+
+    assert count == 1
+    assert order == ["first-start", "first-commit", "second-read"]
+    assert len(set(actor_threads)) == 1
+    actor_thread = actor_threads[0]
+    assert not any(thread.ident == actor_thread for thread in threading.enumerate())
 
 
 def test_dreamer_and_verifier_create_traceable_memory(tmp_path, monkeypatch):
@@ -257,10 +410,10 @@ def test_skill_draft_is_inert_until_explicit_approval(tmp_path, monkeypatch):
 
     discoverable = home / ".claude" / "skills" / "muselab-generated-safe-workflow"
     assert not discoverable.exists()
-    approved = instance.approve_skill(candidate["id"])
+    approved = _run(instance.approve_skill(candidate["id"]))
     assert approved["status"] == "active"
     assert (discoverable / "SKILL.md").is_file()
-    disabled = instance.disable_skill(candidate["id"])
+    disabled = _run(instance.disable_skill(candidate["id"]))
     assert disabled["status"] == "disabled"
     assert not (discoverable / "SKILL.md").exists()
 
@@ -289,7 +442,7 @@ def test_disable_skill_rejects_snapshot_controlled_path(tmp_path, monkeypatch):
     )
 
     with pytest.raises(ValueError, match="escapes"):
-        instance.disable_skill(artifact["id"])
+        _run(instance.disable_skill(artifact["id"]))
 
     assert victim.read_text(encoding="utf-8") == "private"
     assert instance.store.artifact(artifact["id"])["status"] == "active"
@@ -548,7 +701,7 @@ def test_reindex_all_queues_one_batch_job(tmp_path, monkeypatch):
         instance.store.create_memory(
             "default", "fact", f"批量索引 {index}")
 
-    assert instance.reindex_all() == 5
+    assert _run(instance.reindex_all()) == 5
     jobs = instance.store.list_jobs()
     assert len(jobs) == 1
     assert jobs[0]["kind"] == "reindex_memories"

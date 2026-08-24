@@ -184,13 +184,21 @@ const _mcpFmtCache  = new WeakMap();   // raw msg -> { kind, value }
 const _readLinesCache = new WeakMap(); // raw msg -> { src, lines }
 const _searchHitsCache = new WeakMap();// raw msg -> { src, hits }
 const _toolMdCache = new WeakMap();    // raw msg -> { src, html }
+// Activity grouping/search runs from several Alpine expressions per render.
+// Keep its derived snapshot off reactive state so populating the cache cannot
+// itself schedule another render. Weak keys let each portal instance GC.
+const _activityDerivedCaches = new WeakMap(); // raw portal -> derived snapshot
+function _rawAlpine(value) {
+  try {
+    return (window.Alpine && typeof Alpine.raw === "function")
+      ? Alpine.raw(value) : value;
+  } catch (_) { return value; }
+}
 // Unwrap an Alpine reactive proxy to its stable underlying object so the
 // WeakMap key is identity-stable across renders. Falls back to the proxy
 // (Alpine v3 caches proxies per target, so even that key is stable).
 function _rawMsg(m) {
-  try {
-    return (window.Alpine && typeof Alpine.raw === "function") ? Alpine.raw(m) : m;
-  } catch (_) { return m; }
+  return _rawAlpine(m);
 }
 
 // Module-level constants reused by hot-path helpers below. Hoisted out of the
@@ -279,6 +287,24 @@ const TERMINAL_ANSI_THEMES = Object.freeze({
     white: "#6b6050", brightWhite: "#3d3526",
   }),
 });
+
+// Header-less chat resources use short-lived, scope-bound credentials. Keep
+// both resolved tickets and in-flight mint requests in memory only so Alpine
+// re-evaluation cannot duplicate requests or persist bearer URLs.
+const CHAT_RESOURCE_TICKET_CACHE = new Map();
+const CHAT_RESOURCE_TICKET_CACHE_MAX = 256;
+function _pruneChatResourceTicketCache(now) {
+  for (const [key, entry] of CHAT_RESOURCE_TICKET_CACHE) {
+    if (!entry.promise && (!entry.expiresAt || entry.expiresAt <= now)) {
+      CHAT_RESOURCE_TICKET_CACHE.delete(key);
+    }
+  }
+  while (CHAT_RESOURCE_TICKET_CACHE.size >= CHAT_RESOURCE_TICKET_CACHE_MAX) {
+    CHAT_RESOURCE_TICKET_CACHE.delete(
+      CHAT_RESOURCE_TICKET_CACHE.keys().next().value,
+    );
+  }
+}
 
 function portal() {
   return {
@@ -645,6 +671,9 @@ function portal() {
     _sessionTodoEditOwner: null,
     userTodos: [],
     todoRevision: 0,
+    _todoPushGeneration: 0,
+    _todoPushPending: false,
+    _todoPushPromise: null,
     // Lightweight focus ownership shared by modal/popover surfaces. DOM nodes
     // live here only while their surface is open; the stack ensures a nested
     // managed dialog never restores focus behind the dialog above it.
@@ -683,8 +712,14 @@ function portal() {
       dragOverGroupOrderId: "",
       dragGroupInsertAfter: false,
     },
+    REQUEST_DEADLINE_MS: 8000,
+    SESSION_SYNC_DEADLINE_MS: 35000,
     _activityEtags: {},
+    // A successful full snapshot may legally contain zero events. Track that
+    // ownership separately from rows added by optimistic or live updates.
+    _activityEventsSnapshotLoaded: false,
     _activityFetchPromises: {},
+    _activityFetchControllers: {},
     _activityRequestSeq: 0,
     _activityAppliedSeq: 0,
     _activityGeneration: "",
@@ -692,6 +727,8 @@ function portal() {
     _activityLiveSource: null,
     _activityLiveSeq: 0,
     _activityLiveTimer: null,
+    _activityLiveController: null,
+    _activityLiveFailures: 0,
     _activityLiveVisibilityBound: false,
     _todoLiveSource: null,
     _todoLiveSeq: 0,
@@ -2419,6 +2456,7 @@ function portal() {
         ping();                  // presence: re-arm push suppression
         this.ackCurrentActivity(); // visible current session is already viewed
         this._pingHealth();      // health: refresh conn state immediately
+        this._resumeVisibleSessionSync();
         // Refresh the session list in case another device created/deleted
         // sessions while this tab was hidden (drives the active-dot state).
         // The tab strip itself is device-local — no cross-device merge.
@@ -3880,6 +3918,22 @@ function portal() {
       const mm = String(d.getMinutes()).padStart(2, "0");
       return hh + ":" + mm;
     },
+    openMessageOutline(ev = null) {
+      if (this.msgOutlineOpen) return;
+      const opener = ev && ev.currentTarget
+        ? ev.currentTarget : document.activeElement;
+      this.msgOutlineOpen = true;
+      this._openFocusSurface(
+        "message-outline", ".msg-outline-panel", ".msg-outline-item",
+        opener, true,
+      );
+      void this.refreshOutlineFromBackend(this.currentId);
+    },
+    closeMessageOutline(restoreFocus = true) {
+      if (!this.msgOutlineOpen && !this._focusSurfaceState["message-outline"]) return;
+      this.msgOutlineOpen = false;
+      this._closeFocusSurface("message-outline", restoreFocus);
+    },
     // Filter messages for the sidebar outline. Returns only user prompts
     // (skipping the auto-injected compact summaries) — they're what the
     // user remembers asking, so they make the best jump targets.
@@ -3887,14 +3941,10 @@ function portal() {
       // Touch reactivity ping so the modal re-renders when backend fetch
       // completes (same mechanism conversationOutline uses).
       const _ = this.outlineVersion;
-      // Fire off a background backend fetch so the list reflects the
-      // FULL session, not just the lazy-loaded visible window. This was
-      // the source of "outline shows only 2 user messages on a 45-user
-      // session" — the original filter walked only the active pane window, which
-      // contains the recent slice after the long-history performance
-      // optimization (commit 664304a).
+      // Opening the dialog explicitly refreshes the full-session cache. Keep
+      // this render-time projection pure so Alpine can evaluate the hidden
+      // x-show subtree during boot without starting network work.
       const sid = this.currentId;
-      if (sid) this.refreshOutlineFromBackend(sid);
       // Primary: backend-sourced list, shaped to look like message
       // objects so the modal template (which calls outlineText(m) and
       // _scrollToUserMsg(m.uuid)) keeps working unchanged.
@@ -5092,6 +5142,153 @@ function portal() {
       // Global requests are workspace-agnostic. File and conversation requests
       // add their registered workspace through fileHdr()/conversationHdr().
       return { "X-Auth-Token": this.token };
+    },
+    async _mintChatResourceUrl(resource, fields = {}, fresh = false) {
+      const body = { resource, ...fields };
+      const cacheKey = JSON.stringify(body);
+      if (fresh) CHAT_RESOURCE_TICKET_CACHE.delete(cacheKey);
+      const now = Date.now();
+      _pruneChatResourceTicketCache(now);
+      const cached = CHAT_RESOURCE_TICKET_CACHE.get(cacheKey);
+      if (cached && cached.url && cached.expiresAt > now + 5000) {
+        return cached.url;
+      }
+      if (cached && cached.promise) return await cached.promise;
+
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 8000);
+      const promise = (async () => {
+        const response = await fetch("/api/chat/resource-ticket", {
+          method: "POST",
+          headers: { ...this.hdr(), "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+          signal: controller.signal,
+          cache: "no-store",
+        });
+        if (!response.ok) throw new Error("chat resource ticket unavailable");
+        const data = await response.json();
+        if (!data.url || !String(data.url).startsWith("/api/chat/")) {
+          throw new Error("invalid chat resource ticket response");
+        }
+        CHAT_RESOURCE_TICKET_CACHE.set(cacheKey, {
+          url: data.url,
+          expiresAt: Date.now() + Math.max(1, Number(data.expires_in) || 1) * 1000,
+        });
+        return data.url;
+      })();
+      CHAT_RESOURCE_TICKET_CACHE.set(cacheKey, { promise });
+      try {
+        return await promise;
+      } catch (error) {
+        CHAT_RESOURCE_TICKET_CACHE.delete(cacheKey);
+        throw error;
+      } finally {
+        clearTimeout(timeout);
+      }
+    },
+    _attachmentTicketFields(im) {
+      const raw = String((im && im.url) || "");
+      const match = raw.match(/^\/api\/chat\/attachments\/([^/]+)\/(.+)$/);
+      if (!match) return null;
+      try {
+        return {
+          session_id: decodeURIComponent(match[1]),
+          filename: decodeURIComponent(match[2]),
+        };
+      } catch (_) {
+        return null;
+      }
+    },
+    async _ensureMessageAttachmentUrl(im) {
+      const fields = this._attachmentTicketFields(im);
+      if (!fields) throw new Error("invalid attachment URL");
+      return await this._mintChatResourceUrl("attachment", fields);
+    },
+    messageImageSrc(im) {
+      if (!im) return "";
+      if (im.preview) return im.preview;
+      if (im.thumb) return "data:image/jpeg;base64," + im.thumb;
+      if (im._resourceUrl) return im._resourceUrl;
+      if (im.url && !im._resourceTicketPending) {
+        im._resourceTicketPending = true;
+        this._ensureMessageAttachmentUrl(im)
+          .then(url => { im._resourceUrl = url; })
+          .catch(() => { im._resourceUrl = ""; })
+          .finally(() => { im._resourceTicketPending = false; });
+      }
+      return "";
+    },
+    async openMessageImage(im) {
+      if (!im) return;
+      let src = im.preview || (im.thumb
+        ? "data:image/jpeg;base64," + im.thumb : "");
+      if (im.url) {
+        try {
+          src = await this._ensureMessageAttachmentUrl(im);
+          im._resourceUrl = src;
+        } catch (_) {
+          // A thumbnail/blob remains a safe, useful fallback when the full
+          // original expired or the ticket request briefly failed.
+        }
+      }
+      this.openLightbox(src, im.name);
+    },
+    _abortError(message = "request aborted") {
+      const error = new Error(message);
+      error.name = "AbortError";
+      return error;
+    },
+    async _fetchWithDeadline(
+      url, options = {}, deadlineMs = this.REQUEST_DEADLINE_MS,
+    ) {
+      const upstream = options.signal;
+      if (upstream && upstream.aborted) throw this._abortError();
+      const controller = new AbortController();
+      let rejectControl = null;
+      let settled = false;
+      const control = new Promise((_, reject) => { rejectControl = reject; });
+      const abort = (message) => {
+        if (settled) return;
+        try { controller.abort(); } catch (_) {}
+        rejectControl(this._abortError(message));
+      };
+      const onUpstreamAbort = () => abort("request aborted");
+      if (upstream) {
+        upstream.addEventListener("abort", onUpstreamAbort, { once: true });
+      }
+      const timeoutMs = Math.max(
+        1, Number(deadlineMs) || Number(this.REQUEST_DEADLINE_MS) || 8000,
+      );
+      const timer = setTimeout(
+        () => abort("request deadline exceeded"), timeoutMs,
+      );
+      const fetchOptions = { ...options, signal: controller.signal };
+      try {
+        // Keep the explicit race even though native fetch observes AbortSignal:
+        // test doubles and embedded WebViews are not always abort-cooperative.
+        return await Promise.race([fetch(url, fetchOptions), control]);
+      } finally {
+        settled = true;
+        clearTimeout(timer);
+        if (upstream) {
+          upstream.removeEventListener("abort", onUpstreamAbort);
+        }
+      }
+    },
+    _retryDelay(
+      attempt, { baseMs = 800, maxMs = 30000, jitterMs = 250 } = {},
+    ) {
+      const step = Math.max(1, Math.min(16, Math.floor(Number(attempt) || 1)));
+      const base = Math.min(
+        Math.max(1, Number(maxMs) || 30000),
+        Math.max(1, Number(baseMs) || 800) * Math.pow(2, step - 1),
+      );
+      const jitterCap = Math.max(
+        0, Math.min(Number(jitterMs) || 0, Math.floor(base / 4)),
+      );
+      const jitter = jitterCap
+        ? Math.floor(Math.random() * (jitterCap + 1)) : 0;
+      return base + jitter;
     },
     _staticAssetUrl(path) {
       if (!path || !path.startsWith("/static/") || /[?&]v=/.test(path)) return path;
@@ -7488,6 +7685,50 @@ function portal() {
       }
       return st;
     },
+    _sessionSyncNeedsVisibility(reason) {
+      return [
+        "active_probe", "busy_probe", "queue_attach",
+        "background_continuation", "inherited_tasks", "stream_health",
+        "transport_retry", "canonical_replay",
+      ].includes(reason);
+    },
+    _resumeVisibleSessionSync() {
+      if (typeof document !== "undefined"
+          && document.visibilityState !== "visible") return;
+      const now = Date.now();
+      for (const [sid, st] of Object.entries(this.tabState || {})) {
+        const sync = st && st.sessionSync;
+        if (!sync) continue;
+        for (const request of Object.values(sync.pending || {})) {
+          if (this._sessionSyncNeedsVisibility(request.reason)) {
+            request.dueAt = Math.min(Number(request.dueAt) || now, now);
+          }
+        }
+        if (sync.inheritedSourceSid && sync.inheritedTicksLeft > 0) {
+          this._requestSessionSync(sid, "inherited_tasks", {
+            sourceSid: sync.inheritedSourceSid,
+          });
+        }
+        if (sync.backgroundTicksLeft > 0
+            && (st.backgroundActive || this._bgHasRunningCard(sid))) {
+          this._requestSessionSync(sid, "background_continuation");
+        }
+        if (st._canonicalResyncPending) {
+          this._requestSessionSync(sid, "canonical_replay", {
+            minimumWaitMs: 0,
+          });
+        }
+        this._scheduleSessionSync(sid, st);
+      }
+      const sid = this.currentId;
+      const st = sid && this.tabState && this.tabState[sid];
+      if (!st) return;
+      if (st.streaming || st.es) {
+        this._requestSessionSync(sid, "stream_health", { ownerEs: st.es });
+      } else {
+        this._requestSessionSync(sid, "active_probe");
+      }
+    },
     _requestSessionSync(sid, reason, options = {}) {
       const st = sid && this.tabState[sid];
       if (!st || !reason) return Promise.resolve(false);
@@ -7541,42 +7782,76 @@ function portal() {
         return false;
       }
       const request = ready[0];
+      if (this._sessionSyncNeedsVisibility(request.reason)
+          && typeof document !== "undefined"
+          && document.visibilityState !== "visible") {
+        request.dueAt = Date.now() + 2000;
+        this._scheduleSessionSync(sid, st);
+        return false;
+      }
       delete sync.pending[request.reason];
       const epoch = sync.epoch;
-      const task = (async () => {
+      const controller = new AbortController();
+      const requestOptions = { ...request.options, signal: controller.signal };
+      const operation = (async () => {
         switch (request.reason) {
           case "active_probe":
-            return await this._probeActiveTurn(sid, st, request.options);
+            return await this._probeActiveTurn(sid, st, requestOptions);
           case "busy_probe":
-            return await this._probeSessionBusy(sid, st, request.options);
+            return await this._probeSessionBusy(sid, st, requestOptions);
           case "queue_attach":
-            return await this._runQueueAttach(sid, st, request.options);
+            return await this._runQueueAttach(sid, st, requestOptions);
           case "background_continuation":
-            return await this._pollBackgroundContinuation(sid, st);
+            return await this._pollBackgroundContinuation(sid, st, requestOptions);
           case "inherited_tasks":
-            return await this._pollInheritedTasks(sid, st, request.options);
+            return await this._pollInheritedTasks(sid, st, requestOptions);
           case "history_revision":
-            return await this._runHistoryRevisionSync(sid, st, request.options);
+            return await this._runHistoryRevisionSync(sid, st, requestOptions);
           case "completed_turn":
-            return await this._runCompletedTurnSync(sid, st, request.options);
+            return await this._runCompletedTurnSync(sid, st, requestOptions);
           case "stream_health":
-            return await this._runStreamHealthSync(sid, st, request.options);
+            return await this._runStreamHealthSync(sid, st, requestOptions);
           case "transport_retry":
-            return typeof request.options.run === "function"
-              ? await request.options.run() : false;
+            return typeof requestOptions.run === "function"
+              ? await requestOptions.run(controller.signal) : false;
           case "canonical_replay":
-            return await this._runCanonicalReplaySync(sid, st, request.options);
+            return await this._runCanonicalReplaySync(sid, st, requestOptions);
           case "history_load":
-            return await this._runSessionHistoryLoad(sid, st, request.options);
+            return await this._runSessionHistoryLoad(sid, st, requestOptions);
           default:
             return false;
         }
       })();
-      sync.inFlight = { reason: request.reason, task };
+      let deadlineTimer = null;
+      let cancelResolve = null;
+      const cancelled = new Promise(resolve => { cancelResolve = resolve; });
+      const onAbort = () => cancelResolve(false);
+      controller.signal.addEventListener("abort", onAbort, { once: true });
+      const configuredDeadline = Math.max(
+        1, Number(this.SESSION_SYNC_DEADLINE_MS) || 35000,
+      );
+      const defaultDeadline = request.reason === "history_load"
+          && request.options.loadOptions?.full
+        ? Math.max(configuredDeadline, 90000) : configuredDeadline;
+      const deadlineMs = Math.max(
+        1,
+        Number(request.options.deadlineMs)
+          || defaultDeadline,
+      );
+      const deadline = new Promise(resolve => {
+        deadlineTimer = setTimeout(() => {
+          try { controller.abort(); } catch (_) {}
+          resolve(false);
+        }, deadlineMs);
+      });
+      const task = Promise.race([operation, cancelled, deadline]);
+      sync.inFlight = { reason: request.reason, task, controller, epoch };
       let result = false;
       try { result = await task; }
       catch (_) { result = false; }
       finally {
+        if (deadlineTimer) clearTimeout(deadlineTimer);
+        controller.signal.removeEventListener("abort", onAbort);
         if (this.tabState[sid] === st && sync.epoch === epoch
             && sync.inFlight && sync.inFlight.task === task) {
           sync.inFlight = null;
@@ -7601,9 +7876,13 @@ function portal() {
     _disposeSessionSync(st) {
       if (!st || !st.sessionSync) return;
       const sync = st.sessionSync;
+      const inFlight = sync.inFlight;
       sync.epoch += 1;
       if (sync.timer) clearTimeout(sync.timer);
       sync.timer = null;
+      if (inFlight && inFlight.controller) {
+        try { inFlight.controller.abort(); } catch (_) {}
+      }
       for (const request of Object.values(sync.pending || {})) {
         (request.waiters || []).forEach(resolve => resolve(false));
       }
@@ -7741,12 +8020,11 @@ function portal() {
     },
     async _probeSessionBusy(sid, st, options = {}) {
       const session = options.session;
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 8000);
       try {
-        const r = await fetch("/api/chat/sessions/" + sid + "/active", {
-          headers: this.hdr(), signal: controller.signal,
-        });
+        const r = await this._fetchWithDeadline(
+          "/api/chat/sessions/" + sid + "/active",
+          { headers: this.hdr(), signal: options.signal },
+        );
         if (!r.ok) return true;
         const status = await r.json();
         if (this.tabState[sid] !== st) return true;
@@ -7759,7 +8037,7 @@ function portal() {
         return status.background ? true : active;
       } catch (_) {
         return true;
-      } finally { clearTimeout(timeout); }
+      }
     },
     // True when the CSS @media single-pane mobile layout is active —
     // EITHER the viewport is narrow (≤900px) OR we're on a touch device
@@ -7839,14 +8117,18 @@ function portal() {
     // read-only mirror in st.pendingQueue + st._queuePaused for rendering and
     // refreshes it via _syncQueueFromServer on load / tab-activate / after any
     // turn or mutation. Every mutation below hits an endpoint then re-syncs.
-    async _syncQueueFromServer(sid) {
+    async _syncQueueFromServer(sid, options = {}) {
       if (!sid) return;
       const st = this._ensureTabState(sid);
       const seq = ++st._queueSyncSeq;
       let data;
       try {
-        const r = await fetch("/api/chat/sessions/" + sid + "/queue",
-                               { headers: this.hdr(), cache: "no-store" });
+        const r = await this._fetchWithDeadline(
+          "/api/chat/sessions/" + sid + "/queue",
+          {
+            headers: this.hdr(), cache: "no-store", signal: options.signal,
+          },
+        );
         if (!r.ok) return;   // graceful: leave the current mirror untouched
         data = await r.json();
       } catch (_e) { return; }
@@ -7855,20 +8137,19 @@ function portal() {
       if (revision < (Number(st._queueRevision) || 0)) return;
       st._queueAppliedSeq = seq;
       st._queueRevision = revision;
-      st.pendingQueue = (data.items || []).map(it => {
+      const pendingQueue = (data.items || []).map(it => {
         // FIX ③: the server now resolves each upload id against its in-memory
         // store and returns `attachments: [{id, kind, name, mime, available}]`.
-        // Split them into renderable image thumbnails vs doc chips. `src`
-        // points at the queued-image endpoint (in-memory, token in query so a
-        // bare <img> can load it). Expired ids (available:false) are counted
-        // so the bubble can show "附件已过期".
+        // Split them into renderable image thumbnails vs doc chips. A bare
+        // <img> cannot add X-Auth-Token, so each image gets a short-lived,
+        // id-bound resource ticket below. Expired ids (available:false) are
+        // counted so the bubble can show "附件已过期".
         const atts = it.attachments || [];
-        const tok = encodeURIComponent(this.token || "");
         const images = atts
           .filter(a => a.available && a.kind === "image")
           .map(a => ({
             id: a.id, mime: a.mime || "",
-            src: `/api/chat/queued-image/${a.id}?token=${tok}`,
+            src: "",
           }));
         const docs = atts
           .filter(a => a.available && a.kind !== "image")
@@ -7893,6 +8174,25 @@ function portal() {
           pendingDocs: [],
           enqueuedAt: it.enqueued_at || Date.now(),
         };
+      });
+      st.pendingQueue = pendingQueue;
+      Promise.all(pendingQueue.flatMap(item =>
+        item.images.map(async im => {
+          try {
+            im.src = await this._mintChatResourceUrl("queued-image", {
+              attachment_id: im.id,
+            });
+          } catch (_) {
+            im.unavailable = true;
+          }
+        }))).then(() => {
+        if (this.tabState[sid] !== st || st._queueAppliedSeq !== seq) return;
+        for (const item of pendingQueue) {
+          const failed = item.images.filter(im => !im.src).length;
+          item.images = item.images.filter(im => im.src);
+          item.expiredCount += failed;
+        }
+        st.pendingQueue = [...pendingQueue];
       });
       st._queuePaused = !!data.paused;
     },
@@ -8303,7 +8603,7 @@ function portal() {
       if (this.tabState[childSid] !== st) return false;
       const sync = st.sessionSync;
       const sourceSid = String(options.sourceSid || sync.inheritedSourceSid || "");
-      if (!sourceSid || sync.inheritedTicksLeft-- <= 0) {
+      if (!sourceSid) {
         sync.inheritedSourceSid = "";
         return false;
       }
@@ -8314,20 +8614,25 @@ function portal() {
           });
         }
       };
+      if (typeof document !== "undefined"
+          && document.visibilityState !== "visible") {
+        again();
+        return true;
+      }
+      if (sync.inheritedTicksLeft-- <= 0) {
+        sync.inheritedSourceSid = "";
+        return false;
+      }
       let status = null;
-      const controller = new AbortController();
-      const timeout = setTimeout(
-        () => controller.abort(),
-        Math.max(100, Number(this._sessionListTimeoutMs) || 8000),
-      );
       try {
-        const r = await fetch(
+        const r = await this._fetchWithDeadline(
           `/api/chat/sessions/${encodeURIComponent(sourceSid)}/active`,
-          { headers: this.hdr(), signal: controller.signal },
+          { headers: this.hdr(), signal: options.signal },
+          Math.max(100, Number(this._sessionListTimeoutMs) || 8000),
         );
         if (r.ok) status = await r.json();
       } catch (_) { /* retry below */ }
-      finally { clearTimeout(timeout); }
+      if (options.signal?.aborted) return false;
       if (this.tabState[childSid] !== st || sync.inheritedSourceSid !== sourceSid) {
         return false;
       }
@@ -8350,7 +8655,7 @@ function portal() {
             .map(message => String(message.runtime_event_id)),
         );
         const loaded = await this.loadSession(childSid, {
-          quiet: true, probeActive: false,
+          quiet: true, probeActive: false, signal: options.signal,
         });
         if (this.tabState[childSid] !== st) return false;
         if (!loaded) { again(); return false; }
@@ -8379,7 +8684,9 @@ function portal() {
       if (!Number.isFinite(reported) || reported !== 0) { again(); return false; }
       if (st.streaming || st.es || st.compacting) { again(); return true; }
       const loaded = adoptedRevision && !loadedCanonicalThisTick
-        ? await this.loadSession(childSid, { quiet: true, probeActive: false })
+        ? await this.loadSession(childSid, {
+            quiet: true, probeActive: false, signal: options.signal,
+          })
         : true;
       if (this.tabState[childSid] !== st) return false;
       if (!loaded || (desiredRevision && st.runtimeUiRevision !== desiredRevision)) {
@@ -8393,6 +8700,35 @@ function portal() {
       sync.inheritedTicksLeft = 0;
       return true;
     },
+    _activeTurnUserSignature(text = "", images = [], docs = []) {
+      const normalize = (value, seen = new WeakSet()) => {
+        if (value === null || typeof value === "string"
+            || typeof value === "boolean") return value;
+        if (typeof value === "number") {
+          return Number.isFinite(value) ? value : String(value);
+        }
+        if (typeof value === "undefined") return null;
+        if (Array.isArray(value)) {
+          return value.map(item => normalize(item, seen));
+        }
+        if (typeof value === "object") {
+          if (seen.has(value)) return "[circular]";
+          seen.add(value);
+          const normalized = {};
+          Object.keys(value).sort().forEach((key) => {
+            normalized[key] = normalize(value[key], seen);
+          });
+          seen.delete(value);
+          return normalized;
+        }
+        return String(value);
+      };
+      return JSON.stringify(normalize({
+        text: String(text || ""),
+        images: Array.isArray(images) ? images : [],
+        docs: Array.isArray(docs) ? docs : [],
+      }));
+    },
     _installActiveTurnUser(st, turnId, text = "", images = [], docs = []) {
       if (!st || !(text || images.length || docs.length)) return null;
       const messages = st.messages || [];
@@ -8400,19 +8736,17 @@ function portal() {
         ? messages.find(message => message && message.role === "user"
           && message._turnId === turnId)
         : null;
-      let lastUser = null;
-      for (let i = messages.length - 1; i >= 0; i -= 1) {
-        if (messages[i] && messages[i].role === "user") {
-          lastUser = messages[i];
-          break;
-        }
-      }
+      const tailUser = messages[messages.length - 1];
       // A canonical history load may already have installed this prompt without
-      // MuseLab's live turn id. Adopt that newest matching row before appending.
-      if (!turnUser && turnId && lastUser && !lastUser._turnId
-          && (lastUser.text || "") === text) {
-        lastUser._turnId = turnId;
-        turnUser = lastUser;
+      // MuseLab's live turn id. Only the physical tail can belong to the active
+      // turn, and the complete prompt envelope must match before it is adopted.
+      if (!turnUser && turnId && tailUser && tailUser.role === "user"
+          && !tailUser._turnId
+          && this._activeTurnUserSignature(
+            tailUser.text, tailUser.images, tailUser.docs,
+          ) === this._activeTurnUserSignature(text, images, docs)) {
+        tailUser._turnId = turnId;
+        turnUser = tailUser;
       }
       let appended = false;
       if (!turnUser) {
@@ -8443,14 +8777,14 @@ function portal() {
       if (st0 !== ownerState) return false;
       if (this.currentId !== sid || this.activeSessionPane().streaming) {
         if (st0) st0._draining = false;
-        this._syncQueueFromServer(sid);
+        this._syncQueueFromServer(sid, options);
         return;
       }
       // _draining suppresses the idle "Queue waiting" banner during the brief
       // poll window between a turn's `done` and the server starting the next
       // queued turn — otherwise the banner flashes for ~350ms each drain step.
       if (st0) st0._draining = true;
-      await this._syncQueueFromServer(sid);
+      await this._syncQueueFromServer(sid, options);
       const st = this.tabState[sid];
       const expect = !!(st && st.pendingQueue && st.pendingQueue.length && !st._queuePaused);
       let active = false, startedAt = 0, turnId = "";
@@ -8459,8 +8793,10 @@ function portal() {
       let background = false, attachable = true, backgroundTaskCount = 0;
       let activitySource = "";
       try {
-        const r = await fetch("/api/chat/sessions/" + sid + "/active",
-                               { headers: this.hdr() });
+        const r = await this._fetchWithDeadline(
+          "/api/chat/sessions/" + sid + "/active",
+          { headers: this.hdr(), signal: options.signal },
+        );
         if (r.ok) {
           const d = await r.json();
           active = !!d.active; startedAt = d.started_at;
@@ -8476,6 +8812,10 @@ function portal() {
           uDocs = d.user_docs || [];
         }
       } catch (_e) {}
+      if (options.signal?.aborted) {
+        if (st) st._draining = false;
+        return false;
+      }
       // A server-drained queue turn may be shorter than this poll interval. In
       // that case there is no live broadcast left to attach to: /active returns
       // inactive + activity_source=queued, while the queue has already ACKed the
@@ -8493,7 +8833,7 @@ function portal() {
       if (activitySource === "queued"
           && queuedReconcileKey !== reconciledQueuedTurnId) {
         const loaded = await this.loadSession(sid, {
-          quiet: true, probeActive: false,
+          quiet: true, probeActive: false, signal: options.signal,
         });
         if (this.tabState[sid] !== st || this.currentId !== sid) {
           if (this.tabState[sid] === st) st._draining = false;
@@ -8670,11 +9010,10 @@ function portal() {
       }
       this._requestSessionSync(sid, "background_continuation");
     },
-    async _pollBackgroundContinuation(sid, st) {
+    async _pollBackgroundContinuation(sid, st, options = {}) {
       if (this.tabState[sid] !== st) return false;
       const sync = st.sessionSync;
-      if (sync.backgroundTicksLeft-- <= 0
-          || (!this._bgHasRunningCard(sid) && !st.backgroundActive)) {
+      if (!this._bgHasRunningCard(sid) && !st.backgroundActive) {
         this._stopBgContPoller(sid);
         return false;
       }
@@ -8688,51 +9027,52 @@ function portal() {
         again();
         return true;
       }
+      if (sync.backgroundTicksLeft-- <= 0) {
+        this._stopBgContPoller(sid);
+        return false;
+      }
       if (this.currentId !== sid || st.streaming || st.es) {
         again();
         return true;
       }
       let contFound = false;
       try {
-        const controller = new AbortController();
-        const timeout = setTimeout(
-          () => controller.abort(),
+        const r = await this._fetchWithDeadline(
+          "/api/chat/sessions/" + sid + "/active",
+          { headers: this.hdr(), signal: options.signal },
           Math.max(100, Number(this._sessionListTimeoutMs) || 8000),
         );
-        try {
-          const r = await fetch("/api/chat/sessions/" + sid + "/active", {
-            headers: this.hdr(), signal: controller.signal,
-          });
-          if (r.ok) {
-            const d = await r.json();
-            if (d.background && d.active) {
-              this._setBackgroundTaskActive(
-                sid, true, d.started_at, d.background_tasks_pending);
-            } else if (!d.active) {
-              this._setBackgroundTaskActive(sid, false);
-            }
-            if (d.active && d.continuation && !st.streaming && !st.es
-                && this.currentId === sid) {
-              this._consumedConts = this._consumedConts || {};
-              const ckey = sid + ":" + (d.turn_id || d.started_at);
-              if (!this._consumedConts[ckey]) {
-                this._consumedConts[ckey] = true;
-                contFound = true;
-                this.send({ reconnect: true, continuation: true,
-                            sessionId: sid, turnId: d.turn_id || "",
-                            startedAt: d.started_at });
-              }
+        if (r.ok) {
+          const d = await r.json();
+          if (d.background && d.active) {
+            this._setBackgroundTaskActive(
+              sid, true, d.started_at, d.background_tasks_pending);
+          } else if (!d.active) {
+            this._setBackgroundTaskActive(sid, false);
+          }
+          if (d.active && d.continuation && !st.streaming && !st.es
+              && this.currentId === sid) {
+            this._consumedConts = this._consumedConts || {};
+            const ckey = sid + ":" + (d.turn_id || d.started_at);
+            if (!this._consumedConts[ckey]) {
+              this._consumedConts[ckey] = true;
+              contFound = true;
+              this.send({ reconnect: true, continuation: true,
+                          sessionId: sid, turnId: d.turn_id || "",
+                          startedAt: d.started_at });
             }
           }
-        } finally { clearTimeout(timeout); }
+        }
       } catch (_) { /* fallback cadence below */ }
+      if (options.signal?.aborted) return false;
       if (this.tabState[sid] !== st) return false;
       sync.backgroundTickN = (Number(sync.backgroundTickN) || 0) + 1;
       if (!contFound && sync.backgroundTickN % 16 === 0) {
         try {
-          const hr = await fetch("/api/chat/sessions/" + sid + "?tail=80", {
-            headers: this.hdr(),
-          });
+          const hr = await this._fetchWithDeadline(
+            "/api/chat/sessions/" + sid + "?tail=80",
+            { headers: this.hdr(), signal: options.signal },
+          );
           if (hr.ok) {
             const hs = await hr.json();
             if (this.tabState[sid] !== st) return false;
@@ -8810,6 +9150,7 @@ function portal() {
         && !ownerState.streaming && !ownerState.es;
       if (!stillOwned()) return false;
       const retry = () => {
+        if (options.signal?.aborted) return;
         const next = {
           expectedText, expectedAssistantUuid, attempt: attempt + 1,
         };
@@ -8820,12 +9161,10 @@ function portal() {
           });
         }
       };
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 8000);
       try {
-        const activeResponse = await fetch(
+        const activeResponse = await this._fetchWithDeadline(
           "/api/chat/sessions/" + sid + "/active",
-          { headers: this.hdr(), signal: controller.signal },
+          { headers: this.hdr(), signal: options.signal },
         );
         if (!stillOwned()) return false;
         let activity = null;
@@ -8836,9 +9175,9 @@ function portal() {
           return false;
         }
         const reconcileTail = this._historyReconcileWindowSize();
-        const historyResponse = await fetch(
+        const historyResponse = await this._fetchWithDeadline(
           "/api/chat/sessions/" + sid + "?tail=" + reconcileTail,
-          { headers: this.hdr(), signal: controller.signal },
+          { headers: this.hdr(), signal: options.signal },
         );
         if (!stillOwned()) return false;
         if (!historyResponse.ok) { retry(); return false; }
@@ -8874,6 +9213,7 @@ function portal() {
         const loaded = await this.loadSession(sid, {
           quiet: true, probeActive: false,
           minimumTail: completedTurnWindow,
+          signal: options.signal,
         });
         if (!loaded) retry();
         else {
@@ -8884,7 +9224,7 @@ function portal() {
       } catch (_) {
         retry();
         return false;
-      } finally { clearTimeout(timeout); }
+      }
     },
     _reconcileCompletedContinuation(
       sid, ownerState, expectedText = "", attempt = 0, expectedAssistantUuid = "",
@@ -9754,15 +10094,12 @@ function portal() {
     async _runStreamHealthSync(sid, st, options = {}) {
       const ownerEs = options.ownerEs;
       if (this.tabState[sid] !== st || st.es !== ownerEs) return false;
-      const controller = new AbortController();
-      const timeout = setTimeout(
-        () => controller.abort(),
-        Math.max(100, Number(this._sessionListTimeoutMs) || 8000),
-      );
       try {
-        const r = await fetch(`/api/chat/sessions/${sid}/active`, {
-          headers: this.hdr(), signal: controller.signal,
-        });
+        const r = await this._fetchWithDeadline(
+          `/api/chat/sessions/${sid}/active`,
+          { headers: this.hdr(), signal: options.signal },
+          Math.max(100, Number(this._sessionListTimeoutMs) || 8000),
+        );
         if (!r.ok) return false;
         const d = await r.json();
         if (this.tabState[sid] !== st || st.es !== ownerEs) return false;
@@ -9804,7 +10141,7 @@ function portal() {
         this._retireStaleSessionStream(sid, st);
         st._pendingExternalUpdate = true;
         const loaded = await this.loadSession(sid, {
-          quiet: true, probeActive: false,
+          quiet: true, probeActive: false, signal: options.signal,
         });
         if (loaded) {
           st._loaded = true;
@@ -9817,7 +10154,7 @@ function portal() {
         return !!loaded;
       } catch (_) {
         return false;
-      } finally { clearTimeout(timeout); }
+      }
     },
 
     _scheduleCanonicalStreamReload(sid, st, { minimumWaitMs = 0 } = {}) {
@@ -9836,15 +10173,15 @@ function portal() {
       const minimumWaitMs = Math.max(0, Number(options.minimumWaitMs) || 0);
       let active = true;
       try {
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 8000);
-        try {
-          const r = await fetch(`/api/chat/sessions/${encodeURIComponent(sid)}/active`, {
-            headers: this.hdr(), signal: controller.signal,
-          });
-          if (r.ok) active = !!(await r.json()).active;
-        } finally { clearTimeout(timeout); }
-      } catch (_) { active = true; }
+        const r = await this._fetchWithDeadline(
+          `/api/chat/sessions/${encodeURIComponent(sid)}/active`,
+          { headers: this.hdr(), signal: options.signal },
+        );
+        if (r.ok) active = !!(await r.json()).active;
+      } catch (_) {
+        if (options.signal?.aborted) return false;
+        active = true;
+      }
       if (this.tabState[sid] !== st) return false;
       const waited = Date.now() - startedAt;
       if ((active || waited < minimumWaitMs) && waited < 31 * 60_000) {
@@ -9855,7 +10192,9 @@ function portal() {
       }
       this._retireStaleSessionStream(sid, st);
       st._pendingExternalUpdate = true;
-      const loaded = await this.loadSession(sid, { quiet: true });
+      const loaded = await this.loadSession(sid, {
+        quiet: true, signal: options.signal,
+      });
       if (this.tabState[sid] !== st) return false;
       st._canonicalResyncPending = false;
       st.sessionSync.canonicalStartedAt = 0;
@@ -10045,7 +10384,7 @@ function portal() {
       let succeeded = false;
       try {
         const loaded = await this.loadSession(sid, {
-          quiet: true, probeActive: false,
+          quiet: true, probeActive: false, signal: options.signal,
         });
         if (!loaded) {
           st._pendingExternalUpdate = true;
@@ -12265,12 +12604,14 @@ function portal() {
           JSON.stringify(this.sessionTodoItems()),
         );
       } catch (_) { /* private mode / quota: keep the in-memory clipboard */ }
-      this._pushTodosToServer();
+      this._todoPushGeneration += 1;
+      this._todoPushPending = true;
+      void this._pushTodosToServer();
     },
     _applyTodosPayload(payload) {
       if (!payload || !Array.isArray(payload.items)) return;
       const revision = Number(payload.revision) || 0;
-      if (revision === this.todoRevision) return;
+      if (this._todoPushPending || revision < this.todoRevision) return;
       this.userTodos = this._normalizeUserTodos(payload.items);
       this.todoRevision = revision;
       try {
@@ -12281,39 +12622,85 @@ function portal() {
       } catch (_) { /* offline cache is best-effort */ }
     },
     async _pushTodosToServer() {
-      if (!this.token) return;
-      const r = await this.api("/api/todos", {
-        method: "PUT",
-        json: {
-          items: this.sessionTodoItems(),
-          base_revision: this.todoRevision,
-        },
-      });
-      if (r.ok) {
-        this._applyTodosPayload(r.data || {});
-      } else if (r.status === 409) {
-        // A concurrent device won; reconcile to the server-authoritative list.
-        await this._syncTodosFromServer();
+      if (!this.token) {
+        this._todoPushPending = false;
+        return;
       }
+      this._todoPushPending = true;
+      if (this._todoPushPromise) return this._todoPushPromise;
+
+      const drain = async () => {
+        while (this.token && this._todoPushPending) {
+          this._todoPushPending = false;
+          const generation = this._todoPushGeneration;
+          const items = this.sessionTodoItems().map(item => ({ ...item }));
+          const baseRevision = this.todoRevision;
+          const r = await this.api("/api/todos", {
+            method: "PUT",
+            json: { items, base_revision: baseRevision },
+          });
+          if (r.ok) {
+            const payload = r.data || {};
+            const revision = Number(payload.revision) || baseRevision;
+            if (generation === this._todoPushGeneration) {
+              this._applyTodosPayload(payload);
+            } else {
+              // The server committed the captured snapshot. Rebase the newest
+              // local edit on its revision without replacing the local board.
+              this.todoRevision = Math.max(this.todoRevision, revision);
+              this._todoPushPending = true;
+            }
+            continue;
+          }
+          if (r.status !== 409) return;
+
+          const refetch = await this.api("/api/todos");
+          if (!refetch.ok) return;
+          const payload = refetch.data || {};
+          const revision = Number(payload.revision) || baseRevision;
+          if (generation === this._todoPushGeneration) {
+            // No newer local edit exists, so the concurrent device wins.
+            this._applyTodosPayload(payload);
+          } else {
+            this.todoRevision = Math.max(this.todoRevision, revision);
+            this._todoPushPending = true;
+          }
+        }
+      };
+      const owner = drain().finally(() => {
+        if (this._todoPushPromise === owner) this._todoPushPromise = null;
+        // A local edit may arrive after the drain observes an empty queue but
+        // before its owner is cleared.
+        if (this.token && this._todoPushPending) {
+          void this._pushTodosToServer();
+        }
+      });
+      this._todoPushPromise = owner;
+      return owner;
     },
     async _syncTodosFromServer() {
       if (!this.token) return;
+      const generation = this._todoPushGeneration;
       const r = await this.api("/api/todos");
       if (!r.ok) return; // offline / unauthenticated: keep the local cache
-      let data = r.data || {};
+      const data = r.data || {};
+      const revision = Number(data.revision) || 0;
+      if (generation !== this._todoPushGeneration) {
+        // A local edit made while GET was in flight is newer than this
+        // snapshot. Keep it, then serialize it after the observed revision.
+        this.todoRevision = Math.max(this.todoRevision, revision);
+        this._todoPushPending = true;
+        await this._pushTodosToServer();
+        return;
+      }
       const local = this.sessionTodoItems();
       if ((!Array.isArray(data.items) || !data.items.length) && local.length) {
-        // One-time migration of pre-sync localStorage todos up to the server.
-        const pushed = await this.api("/api/todos", {
-          method: "PUT",
-          json: { items: local, base_revision: Number(data.revision) || 0 },
-        });
-        if (pushed.ok) {
-          data = pushed.data || data;
-        } else {
-          const refetch = await this.api("/api/todos");
-          if (refetch.ok) data = refetch.data || data;
-        }
+        // One-time migration shares the same writer as ordinary edits so it
+        // cannot race a user action made while startup sync is in flight.
+        this.todoRevision = Math.max(this.todoRevision, revision);
+        this._todoPushPending = true;
+        await this._pushTodosToServer();
+        return;
       }
       this._applyTodosPayload(data);
     },
@@ -12494,15 +12881,18 @@ function portal() {
           || !["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(ev.key)) return;
       ev.preventDefault();
       ev.stopPropagation();
+      const currentItem = this.sessionTodoItems()
+        .find(candidate => candidate.id === item.id);
+      if (!currentItem) return;
       const priorities = ["high", "medium", "low"];
       let changed = false;
       let action = "";
       if (ev.key === "ArrowLeft" || ev.key === "ArrowRight") {
-        const index = priorities.indexOf(item.priority);
+        const index = priorities.indexOf(currentItem.priority);
         const targetIndex = index + (ev.key === "ArrowLeft" ? -1 : 1);
         if (targetIndex >= 0 && targetIndex < priorities.length) {
           const priority = priorities[targetIndex];
-          changed = this._moveSessionTodoTo(item.id, priority, "", true);
+          changed = this._moveSessionTodoTo(currentItem.id, priority, "", true);
           const label = priority === "high"
             ? (this.lang === "zh" ? "高优先级" : "high priority")
             : priority === "medium"
@@ -12511,20 +12901,22 @@ function portal() {
           action = this.lang === "zh" ? `已移至${label}` : `moved to ${label}`;
         }
       } else {
-        const peers = this.sessionTodosForPriority(item.priority);
-        const index = peers.findIndex(peer => peer.id === item.id);
+        const peers = this.sessionTodosForPriority(currentItem.priority);
+        const index = peers.findIndex(peer => peer.id === currentItem.id);
         if (ev.key === "ArrowUp" && index > 0) {
-          changed = this._moveSessionTodoTo(item.id, item.priority, peers[index - 1].id, true);
+          changed = this._moveSessionTodoTo(
+            currentItem.id, currentItem.priority, peers[index - 1].id, true);
           action = this.lang === "zh" ? "已上移" : "moved up";
         } else if (ev.key === "ArrowDown" && index >= 0 && index + 1 < peers.length) {
           const beforeId = index + 2 < peers.length ? peers[index + 2].id : "";
-          changed = this._moveSessionTodoTo(item.id, item.priority, beforeId, true);
+          changed = this._moveSessionTodoTo(
+            currentItem.id, currentItem.priority, beforeId, true);
           action = this.lang === "zh" ? "已下移" : "moved down";
         }
       }
       if (changed) {
-        this._announceSessionTodoMove(item, action);
-        this._focusSessionTodoGrip(item.id);
+        this._announceSessionTodoMove(currentItem, action);
+        this._focusSessionTodoGrip(currentItem.id);
       }
     },
     onSessionTodoDrop(ev, priority, beforeId = "") {
@@ -14111,22 +14503,25 @@ function portal() {
       this.startRenameTab(id);
     },
     async menuClose(id) { this.closeTabMenu(); await this.closeChatTab(id); },
-    menuExportMarkdown(id) {
+    async menuExportMarkdown(id) {
       this.closeTabMenu();
       if (!id) return;
-      // Use a transient anchor so the browser opens the streaming Response
-      // as a file download. Token goes in the query string because anchor
-      // requests can't carry custom headers.
-      const url = `/api/chat/sessions/${id}/export?token=`
-                  + encodeURIComponent(this.token);
-      const a = document.createElement("a");
-      a.href = url; a.style.display = "none";
-      // download attribute lets the server's Content-Disposition take
-      // precedence but still hints to the browser this isn't navigation.
-      a.setAttribute("download", "");
-      document.body.appendChild(a);
-      a.click();
-      setTimeout(() => a.remove(), 200);
+      try {
+        // Anchors cannot add X-Auth-Token. Mint a fresh, session-bound,
+        // single-use download ticket for every explicit export click.
+        const url = await this._mintChatResourceUrl(
+          "export", { session_id: id }, true,
+        );
+        const a = document.createElement("a");
+        a.href = url; a.style.display = "none";
+        // download lets Content-Disposition choose the final filename.
+        a.setAttribute("download", "");
+        document.body.appendChild(a);
+        a.click();
+        setTimeout(() => a.remove(), 200);
+      } catch (_) {
+        this.toast(this.lang === "zh" ? "导出失败" : "Export failed", "error");
+      }
     },
     async menuCopySessionEvidence(id) {
       this.closeTabMenu();
@@ -14361,20 +14756,18 @@ function portal() {
     _checkActiveTurn(sid) {
       return this._requestSessionSync(sid, "active_probe");
     },
-    async _probeActiveTurn(sid, st) {
+    async _probeActiveTurn(sid, st, options = {}) {
       // Refresh the queue mirror on every load/reconnect probe so a session
       // with server-side queued items shows them immediately (e.g. items that
       // were waiting behind an active turn, or left dormant after a restart).
       if (!sid || !st || this.tabState[sid] !== st) return false;
-      this._syncQueueFromServer(sid);
-      const controller = new AbortController();
-      const timeout = setTimeout(
-        () => controller.abort(),
-        Math.max(100, Number(this._sessionListTimeoutMs) || 8000),
-      );
+      this._syncQueueFromServer(sid, options);
       try {
-        const r = await fetch("/api/chat/sessions/" + sid + "/active",
-                               { headers: this.hdr(), signal: controller.signal });
+        const r = await this._fetchWithDeadline(
+          "/api/chat/sessions/" + sid + "/active",
+          { headers: this.hdr(), signal: options.signal },
+          Math.max(100, Number(this._sessionListTimeoutMs) || 8000),
+        );
         if (!r.ok) return;
         const d = await r.json();
         if (this.tabState[sid] !== st) return;
@@ -14463,7 +14856,6 @@ function portal() {
         // eventual completion surfaces live without a manual reload.
         this._ensureBgContPoller(sid);
       } catch (e) { /* silent */ }
-      finally { clearTimeout(timeout); }
     },
 
     // Hover-prefetch: kick off loadSession when the user's mouse rests
@@ -14628,23 +15020,20 @@ function portal() {
           quiet ? Math.max(historyPage, st.messages.length) : historyPage,
         );
         const qs = full ? "?full=1" : "?tail=" + requestedTail;
-        const controller = new AbortController();
-        const timeout = setTimeout(
-          () => controller.abort(),
-          full ? 60_000 : Math.max(100, Number(this._sessionReadTimeoutMs) || 15000),
-        );
         let r;
         const fetchStarted = perfNow();
         try {
-          r = await fetch("/api/chat/sessions/" + sid + qs, {
-            headers: this.hdr(), signal: controller.signal,
-          });
+          r = await this._fetchWithDeadline(
+            "/api/chat/sessions/" + sid + qs,
+            { headers: this.hdr(), signal: opts.signal },
+            full ? 60_000
+              : Math.max(100, Number(this._sessionReadTimeoutMs) || 15000),
+          );
         } catch (_) {
           historyPerf.status = "error";
           return false;
         } finally {
           historyPerf.fetch_ms = Math.round(perfNow() - fetchStarted);
-          clearTimeout(timeout);
         }
         if (!r.ok) {
           historyPerf.status = "error";
@@ -19061,6 +19450,116 @@ function portal() {
         : (hadExpanded ? "toast.hidden_hidden_collapsed" : "toast.hidden_hidden");
       this.toast(this.t(key), "info", hadExpanded ? 2500 : 1500);
       return true;
+    },
+    treeRowTabIndex(n) {
+      if (!n) return -1;
+      const preferred = this.treeFocusPath || this.selected;
+      if (n.path === preferred) return 0;
+      const start = Math.max(
+        0,
+        Math.min(
+          Number(this.fileTreeViewport && this.fileTreeViewport.start) || 0,
+          this.visible.length,
+        ),
+      );
+      const end = Math.max(
+        start,
+        Math.min(
+          Number(this.fileTreeViewport && this.fileTreeViewport.end) || 80,
+          this.visible.length,
+        ),
+      );
+      const firstRendered = this.visible[start] || this.visible[0];
+      if (!firstRendered || n.path !== firstRendered.path) return -1;
+      // Only the first rendered row checks the current window. A logical focus
+      // owner outside the virtual slice cannot be tabbed to, so the mounted
+      // slice still needs exactly one entry point. Keep the scan O(window),
+      // not O(full tree * rendered rows).
+      for (let index = start; preferred && index < end; index += 1) {
+        if (this.visible[index].path === preferred) return -1;
+      }
+      return 0;
+    },
+    onTreeRowFocus(n) {
+      if (n && n.path) this.treeFocusPath = n.path;
+    },
+    _focusTreeRow(path, block = "nearest") {
+      if (!path) return false;
+      this.treeFocusPath = path;
+      this._positionFileTreePath(path, block);
+      const focusRow = () => {
+        const escaped = window.CSS && CSS.escape ? CSS.escape(path) : path;
+        const row = document.querySelector(
+          `.filelist li[role="treeitem"][data-path="${escaped}"]`,
+        );
+        if (!row) return false;
+        this._focusWithoutScroll(row);
+        return true;
+      };
+      this.$nextTick(() => {
+        if (focusRow()) return;
+        // A Home/End jump can replace the virtualized x-for window. Alpine's
+        // first nextTick publishes the slice, while its DOM nodes may not be
+        // mounted until the following paint; retry once without polling.
+        this._afterPaint(focusRow);
+      });
+      return true;
+    },
+    async onTreeRowKeydown(ev, n) {
+      if (!ev || !n || ev.target !== ev.currentTarget) return;
+      const key = ev.key;
+      if (key === "Enter" || key === " ") {
+        ev.preventDefault();
+        ev.stopPropagation();
+        await this.onNodeClick(ev, n);
+        if (this._isMobileLayout() && !n.is_dir) {
+          this.$nextTick(() => {
+            const active = document.querySelector(
+              ".pane.preview .tab.active .tab-main",
+            );
+            if (active) this._focusWithoutScroll(active);
+          });
+        } else {
+          this._focusTreeRow(n.path);
+        }
+        return;
+      }
+      const rows = this.visible;
+      const index = rows.findIndex(node => node.path === n.path);
+      if (index < 0) return;
+      let target = null;
+      if (key === "ArrowDown") target = rows[Math.min(rows.length - 1, index + 1)];
+      else if (key === "ArrowUp") target = rows[Math.max(0, index - 1)];
+      else if (key === "Home") target = rows[0];
+      else if (key === "End") target = rows[rows.length - 1];
+      else if (key === "ArrowRight" && n.is_dir) {
+        if (!this.expanded.has(n.path)) {
+          ev.preventDefault();
+          ev.stopPropagation();
+          await this.expand(n);
+          this.savePrefs();
+          this._focusTreeRow(n.path);
+          return;
+        }
+        const child = rows[index + 1];
+        if (child && child.depth === n.depth + 1) target = child;
+      } else if (key === "ArrowLeft") {
+        if (n.is_dir && this.expanded.has(n.path)) {
+          ev.preventDefault();
+          ev.stopPropagation();
+          this.collapse(n);
+          this.savePrefs();
+          this._focusTreeRow(n.path);
+          return;
+        }
+        const parentPath = n.path.includes("/")
+          ? n.path.split("/").slice(0, -1).join("/") : "";
+        if (parentPath) target = rows.find(node => node.path === parentPath);
+      }
+      if (!target) return;
+      ev.preventDefault();
+      ev.stopPropagation();
+      this._focusTreeRow(target.path);
     },
     async onNodeClick(ev, n) {
       // ---- Desktop multi-select modifiers ----
@@ -29260,16 +29759,17 @@ function portal() {
           return;
         }
 
-        // Exponential backoff: 800 ms, 1.6 s, 3.2 s. _checkActiveTurn
+        // Exponential backoff with bounded jitter (800 ms / 1.6 s / 3.2 s base).
+        // _checkActiveTurn
         // confirms the backend turn is still in flight before opening a
         // fresh SSE — if the turn finished cleanly while we were
         // disconnected, it loads the session view from disk instead, so
         // the user sees the completed reply rather than an in-progress
         // bubble that never resolves.
-        const delay = 800 * Math.pow(2, attempts - 1);
+        const delay = this._retryDelay(attempts);
         this._requestSessionSync(streamSid, "transport_retry", {
           delayMs: delay,
-          run: async () => {
+          run: async (signal) => {
           // User switched to another tab mid-backoff. The ORIGIN tab's turn
           // is still running on the server — don't _markDone() it (that
           // abandons the transparent reconnect and clears the origin owner's
@@ -29283,8 +29783,10 @@ function portal() {
           // streamState.streaming is still true from initial send(); use
           // it as the in-flight gate _checkActiveTurn checks internally.
           try {
-            const r = await fetch(`/api/chat/sessions/${streamSid}/active`,
-                                    { headers: this.hdr() });
+            const r = await this._fetchWithDeadline(
+              `/api/chat/sessions/${streamSid}/active`,
+              { headers: this.hdr(), signal },
+            );
             if (!r.ok) throw new Error("active probe failed");
             const d = await r.json();
             if (!d.active) {
@@ -29344,7 +29846,7 @@ function portal() {
               // Schedule next retry ourselves since the old EventSource is
               // closed and no new transport error will fire.
               this._requestSessionSync(streamSid, "transport_retry", {
-                delayMs: 800 * Math.pow(2, attempts),
+                delayMs: this._retryDelay(attempts + 1),
                 run: () => {
                   if (this.currentId !== streamSid) return false;
                   streamState.streaming = false;
@@ -30141,6 +30643,8 @@ function portal() {
 
     // ===== global cross-workspace activity center =====
     async fetchActivity(opts = {}) {
+      if (typeof document !== "undefined"
+          && document.visibilityState !== "visible") return false;
       const key = opts.summaryOnly ? "summary" : "events";
       // A full snapshot also satisfies a summary refresh. Conversely, if a
       // cheap summary is already in flight when the user opens the center,
@@ -30158,18 +30662,26 @@ function portal() {
         }
       }
       const seq = ++this._activityRequestSeq;
+      const controller = new AbortController();
+      this._activityFetchControllers[key] = controller;
       const promise = (async () => {
         try {
           const path = opts.summaryOnly ? "/api/activity/summary" : "/api/activity?limit=500";
           const headers = { ...this.hdr() };
           if (this._activityEtags[key]) headers["If-None-Match"] = this._activityEtags[key];
-          let r = await fetch(path, { headers });
-          // A long-lived tab can retain an ETag while Alpine state is rebuilt.
-          // Never accept a 304 as the only source for an empty task list.
-          if (r.status === 304 && !opts.summaryOnly && !this.activity.events.length) {
+          let r = await this._fetchWithDeadline(path, {
+            headers, signal: controller.signal,
+          });
+          // An ETag without a locally owned full snapshot cannot validate the
+          // rows. Recover once without conditionals; a loaded empty snapshot
+          // can safely reuse a 304 just like a non-empty one.
+          if (r.status === 304 && !opts.summaryOnly
+              && !this._activityEventsSnapshotLoaded) {
             delete this._activityEtags[key];
             delete headers["If-None-Match"];
-            r = await fetch(path, { headers, cache: "reload" });
+            r = await this._fetchWithDeadline(path, {
+              headers, cache: "reload", signal: controller.signal,
+            });
           }
           if (r.status === 304 || !r.ok) return false;
           const etag = r.headers.get("etag");
@@ -30198,8 +30710,10 @@ function portal() {
             );
           }
           if (!opts.summaryOnly && Array.isArray(data.events)) {
-            this.activity.events = data.events;
-            this._syncScheduledActivitySnapshot(data.events);
+            const events = data.events.slice(0, this.ACTIVITY_EVENT_CAP);
+            this.activity.events = events;
+            this._activityEventsSnapshotLoaded = true;
+            this._syncScheduledActivitySnapshot(events);
           }
           if (!opts.summaryOnly) this.applyActivityGroupPayload(data);
           this._syncAppBadge();
@@ -30208,7 +30722,14 @@ function portal() {
       })();
       this._activityFetchPromises[key] = promise;
       try { return await promise; }
-      finally { if (this._activityFetchPromises[key] === promise) delete this._activityFetchPromises[key]; }
+      finally {
+        if (this._activityFetchPromises[key] === promise) {
+          delete this._activityFetchPromises[key];
+        }
+        if (this._activityFetchControllers[key] === controller) {
+          delete this._activityFetchControllers[key];
+        }
+      }
     },
     async openActivityCenter() {
       this.closeMemoryRecallPopover();
@@ -30264,12 +30785,37 @@ function portal() {
         { key: "history", label: zh ? "历史任务" : "History" },
       ];
     },
+    ACTIVITY_EVENT_CAP: 500,
     ACTIVITY_GROUP_CAP: 5,
     ACTIVITY_CUSTOM_GROUP_CAP: 50,
     ACTIVITY_TIMELINE_CAP: 15,
     ACTIVITY_GROUP_COLORS: [
       "blue", "violet", "cyan", "green", "amber", "rose", "gray",
     ],
+    _activityDerivedSnapshot() {
+      const source = Array.isArray(this.activity.events)
+        ? this.activity.events : [];
+      const owner = _rawAlpine(this);
+      const rawSource = _rawAlpine(source);
+      const query = this.activitySearchQuery();
+      const lang = String(this.lang || "");
+      const limit = Math.max(0, Number(this.ACTIVITY_EVENT_CAP) || 0);
+      let cache = _activityDerivedCaches.get(owner);
+      if (!cache || cache.source !== rawSource || cache.query !== query
+          || cache.lang !== lang || cache.limit !== limit) {
+        cache = {
+          source: rawSource,
+          query,
+          lang,
+          limit,
+          events: source.slice(0, limit),
+          groups: new Map(),
+          searchCount: null,
+        };
+        _activityDerivedCaches.set(owner, cache);
+      }
+      return cache;
+    },
     normalizeActivityGroupOrder(order = this.activity.groupOrder) {
       const customIds = (this.activity.customGroups || [])
         .map(group => String(group.id || "")).filter(Boolean);
@@ -30356,8 +30902,13 @@ function portal() {
       return fields.some(value => String(value || "").toLocaleLowerCase().includes(query));
     },
     activitySearchResultCount() {
-      if (!this.activitySearchQuery()) return (this.activity.events || []).length;
-      return (this.activity.events || []).filter(item => this.activityMatchesSearch(item)).length;
+      const cache = this._activityDerivedSnapshot();
+      if (!cache.query) return cache.events.length;
+      if (cache.searchCount === null) {
+        cache.searchCount = cache.events
+          .filter(item => this.activityMatchesSearch(item)).length;
+      }
+      return cache.searchCount;
     },
     clearActivitySearch() {
       if (!this.activitySearchQuery()) {
@@ -30370,6 +30921,11 @@ function portal() {
       return Number(item?.updated_at || item?.finished_at || item?.started_at || 0);
     },
     activityAllEvents(group) {
+      const cache = this._activityDerivedSnapshot();
+      const groupKey = String(group?.key || "");
+      const custom = !!group?.custom;
+      const cacheKey = `${groupKey}|${Number(custom)}`;
+      if (cache.groups.has(cacheKey)) return cache.groups.get(cacheKey);
       const activeRank = { waiting_approval: 0, paused: 1, running: 2 };
       const attentionRank = item => {
         if (this.activityRequiresAction(item)) return 0;
@@ -30377,18 +30933,18 @@ function portal() {
         if (["running", "waiting_approval", "paused"].includes(item.state)) return 2;
         return 3;
       };
-      return (this.activity.events || [])
-        .filter(item => this.activityMatchesGroup(item, group.key))
+      const events = cache.events
+        .filter(item => this.activityMatchesGroup(item, groupKey))
         // Search before applying the per-group row cap so a matching older
         // session remains discoverable even when it was outside the first page.
         .filter(item => this.activityMatchesSearch(item))
         .sort((a, b) => {
-          if (group.key === "timeline") {
+          if (groupKey === "timeline") {
             const pinRank = Number(!!b.pinned) - Number(!!a.pinned);
             if (pinRank) return pinRank;
             return this.activityEventTimestamp(b) - this.activityEventTimestamp(a);
           }
-          if (group.custom) {
+          if (custom) {
             const aManual = Number.isFinite(Number(a.group_order));
             const bManual = Number.isFinite(Number(b.group_order));
             // Newly arrived rows without a manual position remain visible at the
@@ -30398,7 +30954,7 @@ function portal() {
               const order = Number(a.group_order) - Number(b.group_order);
               if (order) return order;
             }
-            if (group.key === "custom:__ungrouped__") {
+            if (groupKey === "custom:__ungrouped__") {
               return this.activityEventTimestamp(b) - this.activityEventTimestamp(a);
             }
             const pinRank = Number(!!b.pinned) - Number(!!a.pinned);
@@ -30407,12 +30963,14 @@ function portal() {
             if (rank) return rank;
             return this.activityEventTimestamp(b) - this.activityEventTimestamp(a);
           }
-          if (group.key === "running") {
+          if (groupKey === "running") {
             const rank = (activeRank[a.state] ?? 9) - (activeRank[b.state] ?? 9);
             if (rank) return rank;
           }
           return this.activityEventTimestamp(b) - this.activityEventTimestamp(a);
         });
+      cache.groups.set(cacheKey, events);
+      return events;
     },
     activityEvents(group) {
       const all = this.activityAllEvents(group);
@@ -31034,8 +31592,46 @@ function portal() {
       const item = this.activity.events.find(row => String(row.id) === eventId);
       if (item) await this.assignActivityGroup(item, group.groupId || "", "");
     },
+    _abortActivityFetches() {
+      for (const controller of Object.values(this._activityFetchControllers || {})) {
+        try { controller.abort(); } catch (_) {}
+      }
+      this._activityFetchControllers = {};
+      this._activityFetchPromises = {};
+    },
+    _activityReconnectDelay() {
+      this._activityLiveFailures = Math.min(
+        16, Math.max(0, Number(this._activityLiveFailures) || 0) + 1,
+      );
+      return this._retryDelay(this._activityLiveFailures, {
+        baseMs: 1000, maxMs: 30000, jitterMs: 500,
+      });
+    },
+    _bindActivityVisibility() {
+      if (this._activityLiveVisibilityBound
+          || typeof document === "undefined") return;
+      this._activityLiveVisibilityBound = true;
+      document.addEventListener("visibilitychange", () => {
+        if (document.visibilityState !== "visible") {
+          this._stopActivityEvents();
+          this._abortActivityFetches();
+        } else {
+          this._activityLiveFailures = 0;
+          this._refreshActivityFromSignal();
+          this._startActivityEvents();
+        }
+      });
+      window.addEventListener("pagehide", () => {
+        this._stopActivityEvents();
+        this._abortActivityFetches();
+      });
+    },
     _stopActivityEvents() {
       ++this._activityLiveSeq;
+      if (this._activityLiveController) {
+        try { this._activityLiveController.abort(); } catch (_) {}
+      }
+      this._activityLiveController = null;
       if (this._activityLiveSource) {
         try { this._activityLiveSource.close(); } catch (_) {}
       }
@@ -31192,7 +31788,8 @@ function portal() {
         const at = this.activity.events.findIndex(row => row.id === item.id);
         if (at >= 0) this.activity.events.splice(at, 1, item);
         else this.activity.events.unshift(item);
-        this.activity.events = [...this.activity.events];
+        this.activity.events = this.activity.events
+          .slice(0, this.ACTIVITY_EVENT_CAP);
         this._applyScheduledActivity(item);
       }
       const acked = new Set(
@@ -31216,6 +31813,7 @@ function portal() {
     },
     async _startActivityEvents() {
       if (!this.token || typeof EventSource === "undefined") return;
+      this._bindActivityVisibility();
       if (typeof document !== "undefined"
           && document.visibilityState !== "visible") {
         this._stopActivityEvents();
@@ -31224,22 +31822,30 @@ function portal() {
       if (this._activityLiveSource) return;
       this._stopActivityEvents();
       const seq = ++this._activityLiveSeq;
+      const controller = new AbortController();
+      this._activityLiveController = controller;
       let ticket = "";
       try {
-        const r = await fetch("/api/activity/events-ticket", {
-          method: "POST",
-          headers: this.hdr(),
-        });
+        const r = await this._fetchWithDeadline(
+          "/api/activity/events-ticket",
+          {
+            method: "POST", headers: this.hdr(), signal: controller.signal,
+          },
+        );
         if (!r.ok) throw new Error("activity ticket failed");
         ticket = String((await r.json()).ticket || "");
       } catch (_) {
         if (seq === this._activityLiveSeq) {
           this._activityLiveTimer = setTimeout(
             () => this._startActivityEvents(),
-            1500,
+            this._activityReconnectDelay(),
           );
         }
         return;
+      } finally {
+        if (this._activityLiveController === controller) {
+          this._activityLiveController = null;
+        }
       }
       if (seq !== this._activityLiveSeq || !ticket) return;
       const es = new EventSource(
@@ -31251,6 +31857,7 @@ function portal() {
       );
       es.addEventListener("ready", (ev) => {
         if (!owns()) return;
+        this._activityLiveFailures = 0;
         let payload;
         try { payload = JSON.parse(ev.data); } catch (_) { return; }
         const generation = String(payload.generation || "");
@@ -31273,24 +31880,9 @@ function portal() {
         this._activityLiveSource = null;
         this._activityLiveTimer = setTimeout(
           () => this._startActivityEvents(),
-          1500,
+          this._activityReconnectDelay(),
         );
       };
-      if (!this._activityLiveVisibilityBound) {
-        this._activityLiveVisibilityBound = true;
-        document.addEventListener("visibilitychange", () => {
-          if (document.visibilityState !== "visible") {
-            this._stopActivityEvents();
-          } else {
-            this._refreshActivityFromSignal();
-            this._startActivityEvents();
-          }
-        });
-        window.addEventListener(
-          "pagehide",
-          () => this._stopActivityEvents(),
-        );
-      }
     },
     async ackActivityEvent(item, retries = 2) {
       if (!this.activityIsUnreadResult(item)) return true;
