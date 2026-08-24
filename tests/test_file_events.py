@@ -985,6 +985,345 @@ async def test_native_watcher_slot_waits_for_evicted_owner(
 
 
 @pytest.mark.asyncio
+async def test_native_directory_budget_is_fifo_and_cancellation_safe(
+    app_module,
+    temp_root,
+    monkeypatch,
+):
+    import backend.file_events as file_events
+
+    monkeypatch.setattr(
+        file_events,
+        "_MAX_NATIVE_DIRECTORY_WATCHES",
+        3,
+    )
+    manager = file_events.FileWatchManager(
+        file_events.WorkspaceStore(temp_root),
+    )
+    first = file_events._WatchState(
+        root=(temp_root / "budget-first").resolve(),
+        workspace_id="budget-first",
+        force_polling=False,
+    )
+    second = file_events._WatchState(
+        root=(temp_root / "budget-second").resolve(),
+        workspace_id="budget-second",
+        force_polling=False,
+    )
+    third = file_events._WatchState(
+        root=(temp_root / "budget-third").resolve(),
+        workspace_id="budget-third",
+        force_polling=False,
+    )
+
+    granted, reason, used = await manager._reserve_native_watch_budget(
+        first,
+        2,
+    )
+    assert (granted, reason, used) == (True, "available", 2)
+    assert await manager._reserve_native_watch_budget(second, 2) == (
+        False,
+        "capacity",
+        2,
+    )
+    # The younger one-directory request could fit, but cannot jump the FIFO
+    # head. It remains on correctness-preserving polling until its turn.
+    assert await manager._reserve_native_watch_budget(third, 1) == (
+        False,
+        "capacity",
+        2,
+    )
+    assert list(manager._native_watch_waiters) == [
+        second.root,
+        third.root,
+    ]
+    assert third.native_budget_ready.is_set() is False
+
+    await manager._cancel_native_budget_waiter(second)
+    assert list(manager._native_watch_waiters) == [third.root]
+    assert third.native_budget_ready.is_set() is True
+    assert await manager._reserve_native_watch_budget(third, 1) == (
+        True,
+        "available",
+        3,
+    )
+
+    # A replacement state for the same root cannot overwrite an older lease
+    # while that generation is still closing.
+    await manager._release_native_watch_budget(first)
+    await manager._release_native_watch_budget(third)
+    assert await manager._reserve_native_watch_budget(first, 1) == (
+        True,
+        "available",
+        1,
+    )
+    replacement = file_events._WatchState(
+        root=first.root,
+        workspace_id="budget-first-replacement",
+        force_polling=False,
+    )
+    assert await manager._reserve_native_watch_budget(replacement, 1) == (
+        False,
+        "capacity",
+        1,
+    )
+    await manager._release_native_watch_budget(first)
+    assert replacement.native_budget_ready.is_set() is True
+    assert await manager._reserve_native_watch_budget(replacement, 1) == (
+        True,
+        "available",
+        1,
+    )
+    await manager._release_native_watch_budget(replacement)
+    assert manager._native_directory_watches == 0
+    assert manager._native_watch_leases == {}
+    assert manager._native_watch_waiters == {}
+    await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_native_directory_budget_recovers_polling_root_after_release(
+    app_module,
+    temp_root,
+    monkeypatch,
+):
+    import backend.file_events as file_events
+
+    monkeypatch.setattr(
+        file_events,
+        "_MAX_NATIVE_DIRECTORY_WATCHES",
+        2,
+    )
+    manager = file_events.FileWatchManager(
+        file_events.WorkspaceStore(temp_root),
+    )
+    roots = [
+        (temp_root / name).resolve()
+        for name in ("native-owner", "polling-waiter")
+    ]
+    for root in roots:
+        (root / "nested").mkdir(parents=True)
+    first = file_events._WatchState(
+        root=roots[0],
+        workspace_id="native-owner",
+        force_polling=False,
+        initialized=True,
+    )
+    second = file_events._WatchState(
+        root=roots[1],
+        workspace_id="polling-waiter",
+        force_polling=False,
+        initialized=True,
+    )
+    manager._states.update({state.root: state for state in (first, second)})
+    first_started = asyncio.Event()
+    second_polling_started = asyncio.Event()
+    second_native_started = asyncio.Event()
+    calls = []
+    perf_events = []
+
+    async def watch_directories(state):
+        return (state.root, state.root / "nested")
+
+    async def fake_awatch(*paths, **options):
+        root = Path(paths[0])
+        force_polling = options["force_polling"]
+        calls.append((root, force_polling, tuple(Path(p) for p in paths)))
+        if root == first.root:
+            first_started.set()
+        elif force_polling:
+            second_polling_started.set()
+        else:
+            second_native_started.set()
+        await options["stop_event"].wait()
+        return
+        yield set()
+
+    async def ignore_reconcile(_state):
+        return None
+
+    monkeypatch.setattr(manager, "_watch_directories", watch_directories)
+    monkeypatch.setattr(manager, "_schedule_reconcile", ignore_reconcile)
+    monkeypatch.setattr(file_events, "awatch", fake_awatch)
+    monkeypatch.setattr(
+        file_events,
+        "perf_event",
+        lambda event, **fields: perf_events.append((event, fields)),
+    )
+
+    first.task = asyncio.create_task(manager._watch(first))
+    await asyncio.wait_for(first_started.wait(), timeout=1)
+    assert manager._native_directory_watches == 2
+    second.task = asyncio.create_task(manager._watch(second))
+    await asyncio.wait_for(second_polling_started.wait(), timeout=1)
+    assert second.native_budget_wait_cost == 2
+    assert manager._native_directory_watches == 2
+
+    first.task.cancel()
+    await asyncio.gather(first.task, return_exceptions=True)
+    await asyncio.wait_for(second_native_started.wait(), timeout=1)
+    assert manager._native_directory_watches == 2
+    assert manager._native_watch_waiters == {}
+    assert manager._native_watch_leases[second.root] == (second, 2)
+    assert [(root, polling) for root, polling, _paths in calls] == [
+        (first.root, False),
+        (second.root, True),
+        (second.root, False),
+    ]
+    assert [
+        fields["mode"]
+        for event, fields in perf_events
+        if event == "files.watcher_mode"
+    ] == ["polling", "native"]
+
+    await manager.shutdown()
+    assert manager._native_directory_watches == 0
+    assert manager._native_watch_leases == {}
+    assert manager._native_watch_waiters == {}
+
+
+@pytest.mark.asyncio
+async def test_native_directory_budget_reprices_refreshed_paths(
+    app_module,
+    temp_root,
+    monkeypatch,
+):
+    import backend.file_events as file_events
+
+    monkeypatch.setattr(
+        file_events,
+        "_MAX_NATIVE_DIRECTORY_WATCHES",
+        4,
+    )
+    manager = file_events.FileWatchManager(
+        file_events.WorkspaceStore(temp_root),
+    )
+    root = (temp_root / "repriced-root").resolve()
+    nested = root / "nested"
+    added = nested / "added"
+    added.mkdir(parents=True)
+    state = file_events._WatchState(
+        root=root,
+        workspace_id="repriced-root",
+        force_polling=False,
+        initialized=True,
+    )
+    manager._states[root] = state
+    first_started = asyncio.Event()
+    second_started = asyncio.Event()
+    directory_calls = 0
+    awatch_calls = []
+
+    async def watch_directories(_state):
+        nonlocal directory_calls
+        directory_calls += 1
+        if directory_calls == 1:
+            return (root, nested)
+        return (root, nested, added)
+
+    async def fake_awatch(*paths, **options):
+        awatch_calls.append(tuple(Path(path) for path in paths))
+        if len(awatch_calls) == 1:
+            first_started.set()
+        else:
+            second_started.set()
+        await options["stop_event"].wait()
+        return
+        yield set()
+
+    async def ignore_reconcile(_state):
+        return None
+
+    monkeypatch.setattr(manager, "_watch_directories", watch_directories)
+    monkeypatch.setattr(manager, "_schedule_reconcile", ignore_reconcile)
+    monkeypatch.setattr(file_events, "awatch", fake_awatch)
+    state.task = asyncio.create_task(manager._watch(state))
+    await asyncio.wait_for(first_started.wait(), timeout=1)
+    assert manager._native_directory_watches == 2
+    assert state.native_watch_cost == 2
+
+    manager._request_watch_refresh(state)
+    await asyncio.wait_for(second_started.wait(), timeout=1)
+    assert awatch_calls == [
+        (root, nested),
+        (root, nested, added),
+    ]
+    assert manager._native_directory_watches == 3
+    assert state.native_watch_cost == 3
+    assert manager._native_watch_leases[root] == (state, 3)
+
+    await manager.shutdown()
+    assert manager._native_directory_watches == 0
+    assert manager._native_watch_leases == {}
+
+
+@pytest.mark.asyncio
+async def test_oversized_native_watch_falls_back_without_truncating_events(
+    app_module,
+    temp_root,
+    monkeypatch,
+):
+    import backend.file_events as file_events
+    from backend.workspaces import registry
+
+    monkeypatch.setattr(
+        file_events,
+        "_MAX_NATIVE_DIRECTORY_WATCHES",
+        2,
+    )
+    store = file_events.WorkspaceStore(temp_root)
+    workspace_id = registry.id_for(temp_root)
+    store.reconcile(workspace_id, temp_root, "root", primary=True)
+    target = temp_root / "notes" / "deep" / "budget-event.txt"
+    target.write_text("preserved\n", encoding="utf-8")
+    calls = []
+    perf_events = []
+
+    async def fake_awatch(*paths, **options):
+        calls.append((tuple(Path(path) for path in paths), options))
+        yield {(Change.added, str(target))}
+        await asyncio.Future()
+
+    monkeypatch.setattr(file_events, "awatch", fake_awatch)
+    monkeypatch.setattr(
+        file_events,
+        "perf_event",
+        lambda event, **fields: perf_events.append((event, fields)),
+    )
+    manager = file_events.FileWatchManager(store)
+    queue = asyncio.Queue()
+    state = file_events._WatchState(
+        root=temp_root.resolve(),
+        workspace_id=workspace_id,
+        name="root",
+        primary=True,
+        subscribers={queue},
+        force_polling=False,
+        initialized=True,
+    )
+    manager._states[state.root] = state
+    state.task = asyncio.create_task(manager._watch(state))
+
+    payload = await asyncio.wait_for(queue.get(), timeout=1)
+    paths, options = calls[0]
+    assert options["force_polling"] is True
+    assert options["recursive"] is False
+    assert len(paths) > manager._native_directory_watch_limit
+    assert temp_root / "notes" / "deep" in paths
+    assert payload["changes"][0]["path"] == "notes/deep/budget-event.txt"
+    assert manager._native_directory_watches == 0
+    assert manager._native_watch_leases == {}
+    assert manager._native_watch_waiters == {}
+    assert [
+        fields["reason"]
+        for event, fields in perf_events
+        if event == "files.watcher_mode"
+    ] == ["workspace_limit"]
+
+    await manager.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_watcher_restart_queues_an_armed_closing_reconcile(
     app_module,
     temp_root,

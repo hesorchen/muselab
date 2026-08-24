@@ -43,6 +43,7 @@ _RECONCILE_RETRY_MAX_S = 30.0
 _MAX_WATCHED_ROOTS = 16
 _MAX_EVENT_SUBSCRIBERS = 64
 _MAX_CONCURRENT_RECONCILES = 4
+_NATIVE_DIRECTORY_WATCH_HARD_CAP = 131_072
 _WATCH_LINGER_S = 30.0
 _MAX_IDLE_WATCHERS = 3
 _RECONCILE_BACKOFF_START_S = 0.25
@@ -55,6 +56,34 @@ _FORCE_POLLING: bool | None = (
     None
     if _POLLING_ENV is None
     else _POLLING_ENV.strip().lower() in {"1", "true", "yes", "on"}
+)
+
+
+def _default_native_directory_watch_budget() -> int:
+    """Keep process-owned native watches well below the per-user kernel cap."""
+    configured = os.getenv("MUSELAB_NATIVE_WATCH_BUDGET")
+    if configured is not None:
+        with contextlib.suppress(ValueError):
+            return max(1, int(configured))
+    try:
+        kernel_limit = int(
+            Path("/proc/sys/fs/inotify/max_user_watches").read_text(
+                encoding="utf-8",
+            ).strip(),
+        )
+    except (OSError, ValueError):
+        kernel_limit = _NATIVE_DIRECTORY_WATCH_HARD_CAP * 4
+    # The kernel limit is shared by every process for this uid. Reserving at
+    # most one quarter (and never more than 128 Ki) leaves headroom for editors,
+    # language servers, and overlapping graceful-restart generations.
+    return max(
+        1,
+        min(_NATIVE_DIRECTORY_WATCH_HARD_CAP, kernel_limit // 4),
+    )
+
+
+_MAX_NATIVE_DIRECTORY_WATCHES = (
+    _default_native_directory_watch_budget()
 )
 
 
@@ -97,6 +126,10 @@ class _WatchState:
     scan_cancel: threading.Event = field(default_factory=threading.Event)
     stop_task: asyncio.Task[None] | None = None
     queue_overflow_active: bool = False
+    native_budget_ready: asyncio.Event = field(default_factory=asyncio.Event)
+    native_budget_wait_cost: int = 0
+    native_watch_cost: int = 0
+    native_budget_degraded: bool = False
 
 
 def _normalise_bootstrap_parents(
@@ -231,6 +264,17 @@ class FileWatchManager:
         self._native_watcher_slots = asyncio.Semaphore(
             _MAX_WATCHED_ROOTS,
         )
+        self._native_directory_watch_limit = (
+            _MAX_NATIVE_DIRECTORY_WATCHES
+        )
+        self._native_directory_watches = 0
+        self._native_watch_leases: dict[
+            Path, tuple[_WatchState, int]
+        ] = {}
+        self._native_watch_waiters: OrderedDict[
+            Path, tuple[_WatchState, int]
+        ] = OrderedDict()
+        self._native_watch_budget_lock = asyncio.Lock()
         # Registration/state I/O intentionally runs outside `_lock`, but an
         # ensure and remove for the same path must still be one lifecycle.
         # Otherwise a slow first registration can reinstall an orphan state
@@ -1412,12 +1456,155 @@ class FileWatchManager:
         )
         return directories or (state.root,)
 
+    @staticmethod
+    def _watchfiles_uses_polling(force_polling: bool | None) -> bool:
+        """Mirror watchfiles' explicit and WSL automatic polling decision."""
+        if force_polling is not None:
+            return force_polling
+        if sys.platform != "linux":
+            return False
+        with contextlib.suppress(AttributeError):
+            return "microsoft-standard" in os.uname().release.lower()
+        return False
+
+    @staticmethod
+    def _native_watch_cost(directories: tuple[Path, ...]) -> int:
+        """Estimate non-recursive inotify descriptors from unique directories."""
+        return max(1, len(dict.fromkeys(directories)))
+
+    def _wake_native_budget_waiter_locked(self) -> None:
+        """Wake only the FIFO head when the current capacity can satisfy it."""
+        if not self._native_watch_waiters:
+            return
+        _root, (state, cost) = next(
+            iter(self._native_watch_waiters.items()),
+        )
+        if (
+            state.root not in self._native_watch_leases
+            and self._native_directory_watches + cost
+            <= self._native_directory_watch_limit
+        ):
+            state.native_budget_ready.set()
+
+    async def _reserve_native_watch_budget(
+        self,
+        state: _WatchState,
+        cost: int,
+    ) -> tuple[bool, str, int]:
+        """Acquire exact directory capacity or join the fair polling queue."""
+        async with self._native_watch_budget_lock:
+            existing_lease = self._native_watch_leases.get(state.root)
+            if (
+                existing_lease is not None
+                and existing_lease[0] is state
+            ):
+                if existing_lease[1] != cost:
+                    raise RuntimeError(
+                        "native watch lease changed without release",
+                    )
+                return True, "retained", self._native_directory_watches
+
+            existing_waiter = self._native_watch_waiters.get(state.root)
+            if (
+                existing_waiter is not None
+                and existing_waiter[0] is not state
+            ):
+                stale_state, _stale_cost = (
+                    self._native_watch_waiters.pop(state.root)
+                )
+                stale_state.native_budget_ready.clear()
+                stale_state.native_budget_wait_cost = 0
+                existing_waiter = None
+
+            state.native_budget_ready.clear()
+            if cost > self._native_directory_watch_limit:
+                if (
+                    existing_waiter is not None
+                    and existing_waiter[0] is state
+                ):
+                    self._native_watch_waiters.pop(state.root, None)
+                state.native_budget_wait_cost = 0
+                self._wake_native_budget_waiter_locked()
+                return False, "workspace_limit", (
+                    self._native_directory_watches
+                )
+
+            if existing_waiter is None:
+                self._native_watch_waiters[state.root] = (state, cost)
+            else:
+                # Updating an armed generation's estimate keeps its FIFO place.
+                self._native_watch_waiters[state.root] = (state, cost)
+            state.native_budget_wait_cost = cost
+
+            first_root = next(iter(self._native_watch_waiters))
+            if (
+                first_root == state.root
+                and state.root not in self._native_watch_leases
+                and self._native_directory_watches + cost
+                <= self._native_directory_watch_limit
+            ):
+                self._native_watch_waiters.pop(state.root)
+                state.native_budget_wait_cost = 0
+                self._native_watch_leases[state.root] = (state, cost)
+                self._native_directory_watches += cost
+                state.native_watch_cost = cost
+                self._wake_native_budget_waiter_locked()
+                return True, "available", self._native_directory_watches
+
+            self._wake_native_budget_waiter_locked()
+            return False, "capacity", self._native_directory_watches
+
+    async def _release_native_watch_budget(
+        self,
+        state: _WatchState,
+    ) -> None:
+        async with self._native_watch_budget_lock:
+            lease = self._native_watch_leases.get(state.root)
+            if lease is None or lease[0] is not state:
+                return
+            self._native_watch_leases.pop(state.root)
+            self._native_directory_watches -= lease[1]
+            state.native_watch_cost = 0
+            self._wake_native_budget_waiter_locked()
+
+    async def _cancel_native_budget_waiter(
+        self,
+        state: _WatchState,
+    ) -> None:
+        async with self._native_watch_budget_lock:
+            waiter = self._native_watch_waiters.get(state.root)
+            if waiter is None or waiter[0] is not state:
+                state.native_budget_ready.clear()
+                state.native_budget_wait_cost = 0
+                return
+            self._native_watch_waiters.pop(state.root)
+            state.native_budget_ready.clear()
+            state.native_budget_wait_cost = 0
+            self._wake_native_budget_waiter_locked()
+
+    async def _release_native_watch_resources(
+        self,
+        state: _WatchState,
+    ) -> None:
+        await self._cancel_native_budget_waiter(state)
+        await self._release_native_watch_budget(state)
+
     async def _watch(self, state: _WatchState) -> None:
         await self._native_watcher_slots.acquire()
         try:
             await self._watch_native(state)
         finally:
-            self._native_watcher_slots.release()
+            cleanup = asyncio.create_task(
+                self._release_native_watch_resources(state),
+                name=(
+                    "muselab-files-native-budget-cleanup:"
+                    f"{state.workspace_id}"
+                ),
+            )
+            try:
+                await self._await_owned_cleanup(cleanup)
+            finally:
+                self._native_watcher_slots.release()
 
     async def _watch_native(self, state: _WatchState) -> None:
         """Own one native/polling watcher only while its global slot is held."""
@@ -1425,11 +1612,52 @@ class FileWatchManager:
             stop_event: asyncio.Event | None = None
             stream = None
             next_batch: asyncio.Task | None = None
+            budget_ready_task: asyncio.Task[bool] | None = None
+            native_lease = False
+            keep_budget_waiter = False
             try:
                 revision = state.watch_revision
                 directories = await self._watch_directories(state)
                 if revision != state.watch_revision:
                     continue
+                force_polling = state.force_polling
+                if not self._watchfiles_uses_polling(force_polling):
+                    watch_cost = self._native_watch_cost(directories)
+                    (
+                        native_lease,
+                        budget_reason,
+                        budget_used,
+                    ) = await self._reserve_native_watch_budget(
+                        state,
+                        watch_cost,
+                    )
+                    if native_lease:
+                        if state.native_budget_degraded:
+                            _perf_event(
+                                "files.watcher_mode",
+                                workspace=short_id(state.workspace_id),
+                                mode="native",
+                                reason="directory_budget_available",
+                                directory_watches=watch_cost,
+                                budget_limit=self._native_directory_watch_limit,
+                                budget_used=budget_used,
+                            )
+                            state.native_budget_degraded = False
+                    else:
+                        force_polling = True
+                        if not state.native_budget_degraded:
+                            _perf_event(
+                                "files.watcher_mode",
+                                workspace=short_id(state.workspace_id),
+                                mode="polling",
+                                reason=budget_reason,
+                                directory_watches=watch_cost,
+                                budget_limit=self._native_directory_watch_limit,
+                                budget_used=budget_used,
+                            )
+                            state.native_budget_degraded = True
+                else:
+                    await self._cancel_native_budget_waiter(state)
                 stop_event = asyncio.Event()
                 state.watch_stop_event = stop_event
                 if revision != state.watch_revision:
@@ -1441,12 +1669,21 @@ class FileWatchManager:
                     debounce=_WATCH_DEBOUNCE_MS,
                     step=_WATCH_STEP_MS,
                     stop_event=stop_event,
-                    force_polling=state.force_polling,
+                    force_polling=force_polling,
                     poll_delay_ms=500,
                     recursive=False,
                     ignore_permission_denied=True,
                 )
                 while True:
+                    if (
+                        force_polling is True
+                        and state.native_budget_wait_cost > 0
+                        and state.native_budget_ready.is_set()
+                    ):
+                        keep_budget_waiter = True
+                        state.needs_closing_reconcile = True
+                        stop_event.set()
+                        break
                     next_batch = asyncio.create_task(anext(stream))
                     # `awatch` constructs RustNotify before its first blocking
                     # await. Let that task reach the wait point. A task that has
@@ -1466,6 +1703,38 @@ class FileWatchManager:
                             state.needs_closing_reconcile = False
                             await self._schedule_reconcile(state)
                         try:
+                            if (
+                                force_polling is True
+                                and state.native_budget_wait_cost > 0
+                            ):
+                                budget_ready_task = asyncio.create_task(
+                                    state.native_budget_ready.wait(),
+                                )
+                                done, _pending = await asyncio.wait(
+                                    {next_batch, budget_ready_task},
+                                    return_when=asyncio.FIRST_COMPLETED,
+                                )
+                                if budget_ready_task in done:
+                                    # Keep the FIFO request across polling
+                                    # teardown. The replacement generation will
+                                    # consume it before any younger waiter.
+                                    keep_budget_waiter = True
+                                    state.needs_closing_reconcile = True
+                                    stop_event.set()
+                                    if not next_batch.done():
+                                        next_batch.cancel()
+                                    await asyncio.gather(
+                                        next_batch,
+                                        return_exceptions=True,
+                                    )
+                                    next_batch = None
+                                    break
+                                budget_ready_task.cancel()
+                                await asyncio.gather(
+                                    budget_ready_task,
+                                    return_exceptions=True,
+                                )
+                                budget_ready_task = None
                             changes = await next_batch
                         except StopAsyncIteration:
                             break
@@ -1503,6 +1772,8 @@ class FileWatchManager:
                         await self._schedule_reconcile(state)
                     if watch_refresh:
                         break
+                if keep_budget_waiter:
+                    continue
                 if revision != state.watch_revision:
                     continue
                 return
@@ -1538,12 +1809,25 @@ class FileWatchManager:
                         next_batch,
                         return_exceptions=True,
                     )
+                if (
+                    budget_ready_task is not None
+                    and not budget_ready_task.done()
+                ):
+                    budget_ready_task.cancel()
+                    await asyncio.gather(
+                        budget_ready_task,
+                        return_exceptions=True,
+                    )
                 if stream is not None:
                     with contextlib.suppress(
                         RuntimeError,
                         asyncio.CancelledError,
                     ):
                         await stream.aclose()
+                if native_lease:
+                    await self._release_native_watch_budget(state)
+                if not keep_budget_waiter:
+                    await self._cancel_native_budget_waiter(state)
                 if state.watch_stop_event is stop_event:
                     state.watch_stop_event = None
                     state.watch_ready.clear()
