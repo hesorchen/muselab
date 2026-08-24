@@ -1114,14 +1114,33 @@ def test_concurrent_session_list_does_not_advance_an_older_transcript_revision(
         """async () => {
           const app = document.querySelector('#app')._x_dataStack[0];
           const sid = app.currentId;
-          const meta = app.sessions.find(row => row.id === sid);
-          const st = app._ensureTabState(sid);
           if (app._sessionsSyncTimer) clearInterval(app._sessionsSyncTimer);
           app._sessionsSyncTimer = null;
+          // Let the login-time list owner settle before installing synthetic
+          // revisions; otherwise its late response can overwrite this fixture.
+          if (app._sessionListPullPromise) {
+            try { await app._sessionListPullPromise; } catch (_) {}
+          }
+          const meta = app.sessions.find(row => row.id === sid);
+          const st = app._ensureTabState(sid);
+          const settleDeadline = performance.now() + 3000;
+          while ((st.messagesLoading || st.sessionSync.inFlight
+                  || Object.keys(st.sessionSync.pending || {}).length)
+                 && performance.now() < settleDeadline) {
+            await new Promise(resolve => setTimeout(resolve, 20));
+          }
+          if (st.messagesLoading || st.sessionSync.inFlight
+              || Object.keys(st.sessionSync.pending || {}).length) {
+            throw new Error(
+              "initial session synchronization did not settle");
+          }
           app._disposeSessionSync(st);
           const originals = {
             loadSession: app.loadSession,
             updatedAt: meta.updated_at,
+            active: meta.active,
+            turnActive: meta.turn_active,
+            backgroundActive: meta.background_active,
             seen: st._seenUpdated,
             target: st._reconcileTargetUpdated,
             pending: st._pendingExternalUpdate,
@@ -1133,6 +1152,9 @@ def test_concurrent_session_list_does_not_advance_an_older_transcript_revision(
           const olderGate = new Promise(resolve => { releaseOlder = resolve; });
           const olderStarted = new Promise(resolve => { markOlderStarted = resolve; });
           meta.updated_at = 20;
+          meta.active = false;
+          meta.turn_active = false;
+          meta.background_active = false;
           st._seenUpdated = 10;
           st._reconcileTargetUpdated = 10;
           st._pendingExternalUpdate = false;
@@ -1181,6 +1203,9 @@ def test_concurrent_session_list_does_not_advance_an_older_transcript_revision(
             app._disposeSessionSync(st);
             app.loadSession = originals.loadSession;
             meta.updated_at = originals.updatedAt;
+            meta.active = originals.active;
+            meta.turn_active = originals.turnActive;
+            meta.background_active = originals.backgroundActive;
             st._seenUpdated = originals.seen;
             st._reconcileTargetUpdated = originals.target;
             st._pendingExternalUpdate = originals.pending;
