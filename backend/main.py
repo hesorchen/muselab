@@ -50,6 +50,7 @@ class _TokenFilter(logging.Filter):
     sanitizer remains here as a fail-closed regression surface and for any
     future explicitly opted-in access sink.
     """
+    _muselab_access_filter = True
 
     _uuid_re = re.compile(
         r"(?i)(?<![0-9a-f])(?:"
@@ -111,8 +112,21 @@ class _TokenFilter(logging.Filter):
         return False
 
 
-# Apply to uvicorn access logger
-logging.getLogger("uvicorn.access").addFilter(_TokenFilter())
+def _install_access_log_filter() -> None:
+    """Replace MuseLab's process-global filter across module reloads.
+
+    The test app intentionally reloads backend.main for filesystem isolation.
+    Logging keeps filters globally, so blindly adding one per import retained
+    every previous FastAPI module graph until interpreter shutdown.
+    """
+    logger = logging.getLogger("uvicorn.access")
+    for installed in tuple(logger.filters):
+        if getattr(installed, "_muselab_access_filter", False):
+            logger.removeFilter(installed)
+    logger.addFilter(_TokenFilter())
+
+
+_install_access_log_filter()
 _CLIENT_ERROR_LOG = logging.getLogger("muselab.client")
 
 FRONTEND = Path(__file__).resolve().parent.parent / "frontend"

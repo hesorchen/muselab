@@ -113,6 +113,27 @@ def test_access_log_filter_fails_closed_on_unknown_record_shape(app_module):
     assert "private-content" not in record.getMessage()
 
 
+def test_access_log_filter_install_replaces_prior_generation(app_module):
+    logger = logging.getLogger("uvicorn.access")
+    unrelated = logging.Filter("keep-me")
+    logger.addFilter(unrelated)
+    try:
+        previous = next(
+            item for item in logger.filters
+            if getattr(item, "_muselab_access_filter", False)
+        )
+        app_module._install_access_log_filter()
+        installed = [
+            item for item in logger.filters
+            if getattr(item, "_muselab_access_filter", False)
+        ]
+        assert len(installed) == 1
+        assert installed[0] is not previous
+        assert unrelated in logger.filters
+    finally:
+        logger.removeFilter(unrelated)
+
+
 def test_startup_config_banner_does_not_log_root_path(
     app_module, monkeypatch, capsys,
 ):
