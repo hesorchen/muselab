@@ -10,12 +10,12 @@
 > intent lives in per-change specs; product roadmap and known issues live on
 > [GitHub Issues](https://github.com/hesorchen/muselab/issues).
 
-- **Version:** 5.0.0
+- **Version:** 6.0.0
 - **Ratified:** 2026-05-31
-- **Last amended:** 2026-08-15
+- **Last amended:** 2026-08-25
 - **Derived from:** `docs/architecture.md`,
   `CONTRIBUTING.md`, `SECURITY.md`, `pyproject.toml`, and the backend/frontend
-  source as of 2026-08-15.
+  source as of 2026-08-25.
 
 Normative keywords **MUST / MUST NOT / SHOULD / MAY** follow RFC 2119.
 
@@ -99,8 +99,8 @@ shape rather than growing a god-module:
 | `transcript_index.py` | transcript index |
 | `api_settings.py` | `/api/settings` — hot-rewrite `.env` + `os.environ` |
 | `prompts.py` | short starter messages for self-contained UI workflows |
-| `ask_user_question.py` | in-process `muselab` MCP server |
-| `permission_request.py` | tool-permission round-trip |
+| `ask_user_question.py` | browser state bridge for native `AskUserQuestion` |
+| `permission_request.py` | tool-permission and interactive-question round-trip |
 | `settings.py` | `ROOT` / `PORT` / `HOST`, `atomic_write_text`, `env_int` |
 
 ### A3 — Per-session env override with config isolation
@@ -127,9 +127,9 @@ own transcript-compatibility risk. Sessions created before a provider existed
 self-heal to a configured model on first send.
 
 ### A6 — MCP: attribute-driven, gated, default-zero
-- The shipped default configures **zero** user MCP servers; connectors are
-  opt-in. Only the in-process `muselab` server (for `ask_user_question`) is
-  always present.
+- The shipped default configures **zero** MCP servers; every connector is
+  opt-in. Interactive questions use the SDK-native `AskUserQuestion`; no MCP
+  server may be registered solely to duplicate that built-in capability.
 - Every server (preset or user-added) is stored in `mcp.json` by **attributes**
   (`transport`, `disabled`, pinned `version`), never a hard-coded catalog.
 - Versions MUST be pinned. Shipped config MUST NOT use `npx -y latest` / unpinned
@@ -305,6 +305,11 @@ following MUST be declined absent an explicit constitution amendment:
 
 ## 9. Amendment history
 
+- **6.0.0 (2026-08-25):** Replaced the always-on in-process question MCP with
+  the SDK-native `AskUserQuestion` browser bridge after upgrading to Agent SDK
+  0.2.144 / Claude Code CLI 2.1.239 and verifying native answer delivery across
+  default, plan, acceptEdits, and bypass permission modes. The shipped MCP
+  topology is now truly default-zero; connectors remain opt-in.
 - **5.0.0 (2026-08-15):** Removed the bundled Skill distribution and the
   runtime-mode Skill activation exception from A9. Skills remain an SDK-native
   extension mechanism for user, workspace, plugin, reviewed generated, and

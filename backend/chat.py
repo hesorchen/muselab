@@ -79,8 +79,8 @@ from .workspaces import (
     resolve_workspace_root,
 )
 from .ask_user_question import (
-    build_server_for_session, register_session_queue,
-    unregister_session_queue, submit_answer,
+    ANSWER_TIMEOUT_S, register_session_queue, unregister_session_queue,
+    submit_answer,
 )
 from . import permission_request as perm
 from . import memory_client as mem0
@@ -2850,11 +2850,9 @@ async def _build_and_connect_client(
         max_buffer_size=max_buf,
         stderr=_cli_stderr,
         # Block harness-only tools the SDK exposes by default. AskUserQuestion
-        # is intentionally NOT blocked: we re-implement it via in-process MCP
-        # (mcp__muselab__ask_user_question) — see backend/ask_user_question.py.
-        # The MCP tool's own description explains when to use it. The built-in
-        # version is left enabled too as a fallback; the frontend renders both
-        # shapes.
+        # is intentionally kept: SDK 0.2.144 / CLI 2.1.239 correctly turns the
+        # browser-injected answers into a native tool_result in every supported
+        # permission mode; permission_request.py owns that UI bridge.
         #
         # MAINTENANCE NOTE (audit E/253, updated 2026-07-16): this is a
         # hand-maintained DENYLIST — a future harness-only tool is silently
@@ -2875,7 +2873,8 @@ async def _build_and_connect_client(
             # Claude CLI 2.1.211 additions whose protocol is owned by a
             # Claude Code / claude.ai host. muselab has no matching design,
             # review-findings, remote-trigger, or teammate-message surface.
-            "DesignSync", "RemoteTrigger", "ReportFindings", "SendMessage",
+            "DesignSync", "ListAgents", "RemoteTrigger", "ReportFindings",
+            "SendMessage",
         ],
         # Load CLAUDE.md from user (~/.claude/CLAUDE.md), project
         # (cwd/CLAUDE.md → the user's archive), and local (.claude/
@@ -2936,15 +2935,21 @@ async def _build_and_connect_client(
             )],
         },
     )
-    if permission == "bypassPermissions" and not side_question_runtime:
-        # bypassPermissions shadows can_use_tool, but PreToolUse still runs.
-        # Route the SDK-native AskUserQuestion through the same interactive UI
-        # as the MuseLab MCP alias instead of letting the CLI return its terminal
-        # placeholder ("Answer questions?") with no clickable options.
+    if not side_question_runtime:
+        # PreToolUse observes AskUserQuestion regardless of allow rules or a
+        # mid-turn permission-mode transition, unlike can_use_tool. It therefore
+        # owns the browser round-trip in every mode. The timeout must cover the
+        # full human-response window rather than the SDK's short hook default.
         opts_kwargs["hooks"].setdefault("PreToolUse", []).append(HookMatcher(
             matcher="AskUserQuestion",
             hooks=[perm.build_ask_user_question_hook_for_session(session_id)],
+            timeout=ANSWER_TIMEOUT_S + 5,
         ))
+        if permission == "bypassPermissions":
+            # Bypass mode otherwise omits the interactive tool from a headless
+            # client. Advertising stdio keeps native AskUserQuestion available;
+            # the PreToolUse hook above injects the answer before execution.
+            opts_kwargs["permission_prompt_tool_name"] = "stdio"
     if side_question_runtime:
         # Side questions are deliberately narrower than ordinary workspace
         # agents.  `tools` removes every built-in except public web lookup;
@@ -3094,18 +3099,14 @@ async def _build_and_connect_client(
     runtime_env[_RUNTIME_RESUME_SOURCE_ALIVE_ENV] = runtime_boundary
     opts_kwargs["env"] = runtime_env
 
-    # MCP servers: always register the in-process muselab server (for
-    # ask_user_question). Then merge in:
+    # MCP servers come from:
     #   - muselab's own mcp.json (UI-managed)
     #   - Claude Code's standard MCP config locations (~/.claude.json,
     #     ~/.claude/settings.json, <archive>/.mcp.json) so any MCP the
     #     user already added via `claude mcp add` "just works" without
     #     re-entering — muselab is positioned as a Claude Code replacement.
     # See backend/api_settings.py _load_mcp_merged for the merge rules.
-    mcp_dict: dict = (
-        {} if side_question_runtime
-        else {"muselab": build_server_for_session(session_id)}
-    )
+    mcp_dict: dict = {}
     if not side_question_runtime:
         try:
             from .api_settings import _load_mcp_merged
@@ -3127,13 +3128,12 @@ async def _build_and_connect_client(
                     continue
                 mcp_dict[name] = clean
         except Exception as e:
-            # Don't silently drop EVERY MCP server because one source had a
-            # parse error — log + carry on with the built-in. _load_mcp_merged
-            # already swallows per-file errors and stderr's them; this catch
-            # is for unexpected programmer errors only.
+            # Don't fail client construction because an MCP source had a parse
+            # error. _load_mcp_merged already swallows per-file errors and
+            # stderr's them; this catch is for unexpected programmer errors.
             sys.stderr.write(
                 f"[chat] mcp merge failed sid={session_id[:8]} "
-                f"exc={type(e).__name__}; only muselab built-in MCP active\n")
+                f"exc={type(e).__name__}; external MCP disabled for this client\n")
             sys.stderr.flush()
     opts_kwargs["mcp_servers"] = mcp_dict
     # Enable extended thinking for models whose provider endpoint handles
@@ -3195,11 +3195,9 @@ async def _build_and_connect_client(
         sdk_effort = "max" if effort == "ultra" else effort
         if sdk_effort in _SDK_EFFORT_LEVELS:
             opts_kwargs["effort"] = sdk_effort
-    # can_use_tool resolves SDK permission prompts; it is not a universal tool
-    # hook. In bypassPermissions the SDK approves tools before consulting the
-    # callback, so wiring it there only creates CanUseToolShadowedWarning noise.
-    # Native AskUserQuestion is handled by the dedicated PreToolUse hook above;
-    # the MuseLab MCP question tool remains available in every mode as well.
+    # can_use_tool resolves ordinary SDK permission prompts. Native
+    # AskUserQuestion always uses the PreToolUse browser bridge above because
+    # permission rules and live mode transitions can shadow this callback.
     if permission != "bypassPermissions" and not side_question_runtime:
         opts_kwargs["can_use_tool"] = perm.build_callback_for_session(
             session_id,
