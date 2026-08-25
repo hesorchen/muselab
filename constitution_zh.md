@@ -7,10 +7,10 @@
 >
 > 范围：本文约束的是 *工程不变量*，不是功能愿望清单。功能意图写进每次改动的 spec，产品路线图与已知问题见 [GitHub Issues](https://github.com/hesorchen/muselab/issues)。
 
-- **版本：** 5.0.0
+- **版本：** 6.0.0
 - **批准日：** 2026-05-31
-- **最近修订：** 2026-08-15
-- **派生自：** `docs/architecture.md`、`CONTRIBUTING.md`、`SECURITY.md`、`pyproject.toml`，以及截至 2026-08-15 的前后端源码。
+- **最近修订：** 2026-08-25
+- **派生自：** `docs/architecture.md`、`CONTRIBUTING.md`、`SECURITY.md`、`pyproject.toml`，以及截至 2026-08-25 的前后端源码。
 
 规范性关键词 **必须（MUST）/ 禁止（MUST NOT）/ 应当（SHOULD）/ 可以（MAY）** 遵循 RFC 2119。
 
@@ -73,8 +73,8 @@ muselab 通过 **Claude Agent SDK**（与 Claude Code 同一引擎）驱动 Clau
 | `transcript_index.py` | transcript 索引 |
 | `api_settings.py` | `/api/settings`——热改写 `.env` + `os.environ` |
 | `prompts.py` | 自包含 UI 工作流的简短启动消息 |
-| `ask_user_question.py` | 进程内 `muselab` MCP server |
-| `permission_request.py` | 工具权限往返 |
+| `ask_user_question.py` | 原生 `AskUserQuestion` 的浏览器状态桥接 |
+| `permission_request.py` | 工具权限与交互问答往返 |
 | `settings.py` | `ROOT` / `PORT` / `HOST`、`atomic_write_text`、`env_int` |
 
 ### A3 — per-session env 覆盖 + 配置隔离
@@ -87,7 +87,7 @@ muselab 通过 **Claude Agent SDK**（与 Claude Code 同一引擎）驱动 Clau
 首个真实回合确定会话模型。前端在非空会话切换不兼容模型时**必须** fork 新会话，避免跨 vendor thinking-block 签名导致不可恢复的 `400`。管理 API 可以显式修改会话模型，但调用者必须承担 transcript 兼容性风险。在任何 provider 存在之前创建的会话，会在首次发送时自愈到某个已配置模型。
 
 ### A6 — MCP：attribute 驱动、有门禁、默认零
-- 出厂默认配置**零**个用户 MCP server；连接器是 opt-in。只有进程内 `muselab` server（供 `ask_user_question`）永远在场。
+- 出厂默认配置**零**个 MCP server；连接器全部是 opt-in。交互问答使用 SDK 原生 `AskUserQuestion`，不得为内置问答额外注册 MCP server。
 - 每个 server（预置或用户添加）在 `mcp.json` 里都按**属性**存储（`transport`、`disabled`、钉死的 `version`），绝不用写死的 catalog。
 - 版本**必须**钉死。出厂配置**禁止**用 `npx -y latest` / 未钉版本的 `uvx`。
 - 后端**就绪门禁**（`chat.py` 的 `_await_mcp_ready`）**必须**把第 1 回合挂住，直到每个启用的外部 MCP server 到达终态，以防回合中途工具集变化把会话卡死。当没有启用外部 MCP 时门禁**必须**跳过（`_has_enabled_external_mcp`）。
@@ -188,6 +188,7 @@ muselab 是一个**自托管、以工作区为边界的 Agent 工作台**，不�
 
 ## 9. 修订记录
 
+- **6.0.0（2026-08-25）：** 升级至 Agent SDK 0.2.144／Claude Code CLI 2.1.239，并在 default、plan、acceptEdits 与 bypass 权限模式下验证原生答案传递后，用 SDK 原生 `AskUserQuestion` 浏览器桥接替代常驻的进程内问答 MCP。出厂 MCP 拓扑改为真正的默认零配置，连接器继续全部 opt-in。
 - **5.0.0（2026-08-15）：** 移除预装 Skill 分发以及 A9 中运行模式激活 Skill 的例外。Skills 继续作为 SDK 原生扩展机制，支持用户、workspace、plugin、经审核生成与仓库扩展工作流；运行模式只保留传输与资源边界契约。
 - **4.0.0（2026-07-31）：** Fast 在 SDK client 启动时即固定进 Gateway header 契约，因此为 A4 的精确 client-pool key 加入 `service_tier`；同时修订 A9，允许用户显式选择的运行模式通过临时 `UserPromptSubmit.additionalContext` 激活内置 Skill，但必须保持规范 prompt／transcript 不变，并把工作流留在 `SKILL.md`，而不是注入自定义 system prompt。
 - **3.0.0（2026-07-31）：** 将 muselab 从原有个人领域定位调整为以工作区为边界的 Agent 工作台；移除领域预设，同时保留本地文件、自托管与安全不变量。

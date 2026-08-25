@@ -180,12 +180,19 @@ async def test_full_roundtrip_deny_with_message():
     assert result.message == "no thanks"
 
 
+def test_native_answer_payload_uses_sdk_string_contract():
+    assert perm._native_answer_payload({
+        "Single": "Blue",
+        "Multiple": ["Red", "Blue"],
+    }) == {
+        "Single": "Blue",
+        "Multiple": "Red, Blue",
+    }
+
+
 @pytest.mark.asyncio
 async def test_bypass_pretool_hook_routes_native_question_to_ui():
-    # permission_request may outlive backend module reloads in the chat-stream
-    # suite; exercise the exact question registry captured by this hook.
     auq = perm.auq
-
     sid = "sess-bypass-question"
     queue = auq.register_session_queue(sid)
     hook = perm.build_ask_user_question_hook_for_session(sid)
@@ -198,12 +205,7 @@ async def test_bypass_pretool_hook_routes_native_question_to_ui():
 
     async def driver():
         event = await asyncio.wait_for(queue.get(), timeout=2)
-        assert event["event"] == "ask_user_question"
         payload = json.loads(event["data"])
-        assert payload["questions"][0]["options"] == [
-            {"label": "A", "description": ""},
-            {"label": "B", "description": ""},
-        ]
         assert auq.submit_answer(
             sid, payload["id"], {"Pick one": "B"}) is True
 

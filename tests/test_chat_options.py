@@ -92,9 +92,14 @@ def test_third_party_provider_enables_sdk_skills(app_module, monkeypatch, tmp_pa
     assert client is not None
     assert captured["skills"] == "all"
     assert "can_use_tool" not in captured
+    assert captured["permission_prompt_tool_name"] == "stdio"
     assert [m.matcher for m in captured["hooks"]["PreToolUse"]] == [
         "AskUserQuestion"
     ]
+    assert captured["hooks"]["PreToolUse"][0].timeout == (
+        chat_mod.ANSWER_TIMEOUT_S + 5)
+    assert "AskUserQuestion" not in captured["disallowed_tools"]
+    assert "muselab" not in captured["mcp_servers"]
     assert captured["env"]["ANTHROPIC_API_KEY"] == "sk-test"
     for tier in ("OPUS", "SONNET", "HAIKU", "FABLE"):
         assert captured["env"][f"ANTHROPIC_DEFAULT_{tier}_MODEL"] == "deepseek-v4-pro"
@@ -430,6 +435,12 @@ def test_non_bypass_runtime_installs_permission_resolver(
         "sid-default-permission", "deepseek-v4-pro", "default", ""))
 
     assert callable(captured["can_use_tool"])
+    assert [m.matcher for m in captured["hooks"]["PreToolUse"]] == [
+        "AskUserQuestion"
+    ]
+    assert "permission_prompt_tool_name" not in captured
+    assert "AskUserQuestion" not in captured["disallowed_tools"]
+    assert "muselab" not in captured["mcp_servers"]
 
 
 def test_side_question_runtime_exposes_only_public_web_tools(
@@ -486,6 +497,11 @@ def test_plan_runtime_can_return_to_bypass_and_installs_exit_hooks(
         "allow-dangerously-skip-permissions": None,
     }
     assert callable(captured["can_use_tool"])
+    assert [m.matcher for m in captured["hooks"]["PreToolUse"]] == [
+        "AskUserQuestion"
+    ]
+    assert "AskUserQuestion" not in captured["disallowed_tools"]
+    assert "muselab" not in captured["mcp_servers"]
     for hook_name in ("PostToolUse", "PostToolUseFailure"):
         matchers = captured["hooks"][hook_name]
         assert len(matchers) == 1
@@ -563,6 +579,8 @@ def test_codex_gateway_effort_reaches_sdk_options(app_module, monkeypatch, tmp_p
     assert [m.matcher for m in pre_tool_hooks] == [
         "Skill", "AskUserQuestion"
     ]
+    assert captured["permission_prompt_tool_name"] == "stdio"
+    assert "AskUserQuestion" not in captured["disallowed_tools"]
     skill_guard = pre_tool_hooks[0]
 
     async def invoke_skill_guard(name):
@@ -584,6 +602,8 @@ def test_codex_gateway_effort_reaches_sdk_options(app_module, monkeypatch, tmp_p
     assert [m.matcher for m in opted_out["hooks"]["PreToolUse"]] == [
         "AskUserQuestion"
     ]
+    assert opted_out["permission_prompt_tool_name"] == "stdio"
+    assert "AskUserQuestion" not in opted_out["disallowed_tools"]
 
 
 def test_codex_auto_and_ultra_fast_use_gateway_headers(
@@ -680,6 +700,8 @@ def test_bare_gpt_provider_never_inherits_codex_gateway_headers(
     assert [m.matcher for m in captured["hooks"]["PreToolUse"]] == [
         "AskUserQuestion"
     ]
+    assert captured["permission_prompt_tool_name"] == "stdio"
+    assert "AskUserQuestion" not in captured["disallowed_tools"]
 
 
 def test_disable_skills_env_still_opts_out(app_module, monkeypatch, tmp_path):
