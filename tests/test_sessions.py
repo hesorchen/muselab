@@ -217,6 +217,50 @@ def test_fork_annotation_copy_rekeys_message_uuid(app_module):
     assert annotation["docs"] == [{"name": "note.md"}]
 
 
+def test_runtime_task_overlay_bounds_summary_on_write(app_module):
+    from backend import sessions as sess
+    from backend.task_summaries import TASK_SUMMARY_PREVIEW_CAP
+
+    sid = sess.create_session("runtime-overlay-summary-budget")["id"]
+    full = "summary " * 1000
+
+    assert sess.set_runtime_task_overlay(
+        sid, "task-long", state="completed", summary=full,
+    )
+
+    overlay = sess.get_runtime_task_overlays(sid)["task-long"]
+    assert len(overlay["summary"]) == TASK_SUMMARY_PREVIEW_CAP
+    assert overlay["summary_length"] == len(full)
+    assert overlay["summary_truncated"] is True
+    raw = json.loads(sess._sidecar_path(sid).read_text(encoding="utf-8"))
+    assert raw["runtime_task_overlays"]["task-long"] == overlay
+
+
+def test_runtime_task_overlay_legacy_summary_is_bounded_then_compacted(app_module):
+    from backend import sessions as sess
+    from backend.task_summaries import TASK_SUMMARY_PREVIEW_CAP
+
+    sid = sess.create_session("runtime-overlay-legacy-summary")["id"]
+    full = "legacy " * 1000
+    sess._save_sidecar(sid, {
+        "runtime_task_overlays": {
+            "task-old": {"task_id": "task-old", "state": "completed", "summary": full},
+        },
+    })
+
+    overlay = sess.get_runtime_task_overlays(sid)["task-old"]
+    assert len(overlay["summary"]) == TASK_SUMMARY_PREVIEW_CAP
+    assert len(json.loads(sess._sidecar_path(sid).read_text(encoding="utf-8"))
+               ["runtime_task_overlays"]["task-old"]["summary"]) == len(full)
+
+    assert sess.set_runtime_task_overlay(sid, "task-new", state="running")
+    raw = json.loads(sess._sidecar_path(sid).read_text(encoding="utf-8"))
+    compacted = raw["runtime_task_overlays"]["task-old"]
+    assert len(compacted["summary"]) == TASK_SUMMARY_PREVIEW_CAP
+    assert compacted["summary_length"] == len(full)
+    assert compacted["summary_truncated"] is True
+
+
 @pytest.mark.parametrize(
     "terminal_state", ["completed", "failed", "stopped", "done"],
 )

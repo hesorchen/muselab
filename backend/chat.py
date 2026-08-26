@@ -73,6 +73,7 @@ from . import chat_overlays
 from . import chat_runtime
 from . import chat_successor
 from . import transcript_index as transcript_idx
+from .task_summaries import normalize_task_summary_fields
 from .imagegen_job_store import ImagegenJobStore
 from .workspaces import (
     registry as workspace_registry,
@@ -1178,6 +1179,8 @@ class TurnBroadcast:
         except (TypeError, ValueError):
             payload = None
         if isinstance(payload, dict):
+            if str(stamped.get("event") or "") == "task_notification":
+                payload = normalize_task_summary_fields(payload)
             payload["turn_id"] = self.turn_id
             payload["event_seq"] = self._event_seq
             if self.parent_turn_id:
@@ -2622,6 +2625,91 @@ def _normalize_plan_return_permission(
     return "default"
 
 
+def _build_plan_enter_hooks(
+    session_id: str,
+    launch_permission: str,
+) -> tuple[Any, Any]:
+    """Persist a native EnterPlanMode transition after the CLI confirms it."""
+
+    return_permission = (
+        launch_permission
+        if launch_permission in _VALID_PERMISSION_MODES
+        and launch_permission != "plan"
+        else "default"
+    )
+
+    def _stop_ambiguous_transition(reason: str) -> dict[str, Any]:
+        return {"continue_": False, "stopReason": reason}
+
+    async def _post_tool_use(input_data, tool_use_id, _context):
+        data = input_data if isinstance(input_data, dict) else {}
+        tid = str(data.get("tool_use_id") or tool_use_id or "")
+        # EnterPlanMode has already changed the live CLI. Always rebuild before
+        # another turn so the process launch contract matches durable metadata.
+        _pending_runtime_rebuilds.add(session_id)
+        try:
+            committed = sess.commit_plan_enter(
+                session_id,
+                expected_permission=launch_permission,
+                plan_return_permission=return_permission,
+            )
+        except Exception as exc:
+            sys.stderr.write(
+                f"[plan-mode] enter persist failed sid={session_id[:8]} "
+                f"exc={type(exc).__name__}\n")
+            committed = False
+        if not committed:
+            current = sess.get_session(session_id) or {}
+            await perm.emit_session_event(
+                session_id,
+                "permission_mode_change_failed",
+                {
+                    "permission": current.get("permission") or launch_permission,
+                    "requested_permission": "plan",
+                    "source": "enter_plan",
+                    "tool_use_id": tid,
+                    "message": (
+                        "Plan mode changed in another client; "
+                        "the stale transition was not applied."
+                    ),
+                },
+            )
+            return _stop_ambiguous_transition(
+                "A newer permission change superseded EnterPlanMode.")
+        await perm.emit_session_event(
+            session_id,
+            "permission_mode_changed",
+            {
+                "permission": "plan",
+                "previous_permission": launch_permission,
+                "source": "enter_plan",
+                "tool_use_id": tid,
+            },
+        )
+        return {}
+
+    async def _post_tool_use_failure(input_data, tool_use_id, _context):
+        data = input_data if isinstance(input_data, dict) else {}
+        tid = str(data.get("tool_use_id") or tool_use_id or "")
+        _pending_runtime_rebuilds.add(session_id)
+        current = sess.get_session(session_id) or {}
+        await perm.emit_session_event(
+            session_id,
+            "permission_mode_change_failed",
+            {
+                "permission": current.get("permission") or launch_permission,
+                "requested_permission": "plan",
+                "source": "enter_plan",
+                "tool_use_id": tid,
+                "message": str(data.get("error") or ""),
+            },
+        )
+        return _stop_ambiguous_transition(
+            "EnterPlanMode failed; the runtime will be rebuilt safely.")
+
+    return _post_tool_use, _post_tool_use_failure
+
+
 def _build_plan_exit_hooks(
     session_id: str,
     plan_return_permission: str = "default",
@@ -2792,6 +2880,12 @@ async def _build_and_connect_client(
         raise ValueError(f"invalid service tier: {service_tier}")
     plan_return_permission = _normalize_plan_return_permission(
         permission, plan_return_permission)
+    runtime_plan_return_permission = (
+        plan_return_permission if permission == "plan" else permission
+    )
+    if (runtime_plan_return_permission not in _VALID_PERMISSION_MODES
+            or runtime_plan_return_permission == "plan"):
+        runtime_plan_return_permission = "default"
     is_ducc = endpoints.is_ducc_model(model)
     workspace_root = sess.session_workspace(session_id)
     # New CLI rule: session_id + resume/continue conflict unless fork_session
@@ -2831,8 +2925,10 @@ async def _build_and_connect_client(
     _cli_stderr = _privacy_safe_cli_stderr_logger(
         "DUCC" if is_ducc else "SDK-CLI", session_id)
 
+    post_enter_hook, post_enter_failure_hook = _build_plan_enter_hooks(
+        session_id, permission)
     post_exit_hook, post_exit_failure_hook = _build_plan_exit_hooks(
-        session_id, plan_return_permission)
+        session_id, runtime_plan_return_permission)
     skills_off = os.environ.get("MUSELAB_DISABLE_SKILLS", "").lower() in (
         "1", "true", "yes",
     )
@@ -2925,14 +3021,26 @@ async def _build_and_connect_client(
                     "MUSELAB_ALLOW_LARGE_CODEX_CLAUDE_API_SKILL", ""
                 ).strip().lower() not in {"1", "true", "yes", "on"}
             ) else {}),
-            "PostToolUse": [HookMatcher(
-                matcher="ExitPlanMode",
-                hooks=[post_exit_hook],
-            )],
-            "PostToolUseFailure": [HookMatcher(
-                matcher="ExitPlanMode",
-                hooks=[post_exit_failure_hook],
-            )],
+            "PostToolUse": [
+                HookMatcher(
+                    matcher="EnterPlanMode",
+                    hooks=[post_enter_hook],
+                ),
+                HookMatcher(
+                    matcher="ExitPlanMode",
+                    hooks=[post_exit_hook],
+                ),
+            ],
+            "PostToolUseFailure": [
+                HookMatcher(
+                    matcher="EnterPlanMode",
+                    hooks=[post_enter_failure_hook],
+                ),
+                HookMatcher(
+                    matcher="ExitPlanMode",
+                    hooks=[post_exit_failure_hook],
+                ),
+            ],
         },
     )
     if not side_question_runtime:
@@ -2945,11 +3053,10 @@ async def _build_and_connect_client(
             hooks=[perm.build_ask_user_question_hook_for_session(session_id)],
             timeout=ANSWER_TIMEOUT_S + 5,
         ))
-        if permission == "bypassPermissions":
-            # Bypass mode otherwise omits the interactive tool from a headless
-            # client. Advertising stdio keeps native AskUserQuestion available;
-            # the PreToolUse hook above injects the answer before execution.
-            opts_kwargs["permission_prompt_tool_name"] = "stdio"
+        # can_use_tool is installed below for every ordinary runtime, including
+        # bypass. The SDK configures its stdio control route from that callback;
+        # keeping the callback present is required if native EnterPlanMode changes
+        # a bypass process into a mode that can prompt before ExitPlanMode.
     if side_question_runtime:
         # Side questions are deliberately narrower than ordinary workspace
         # agents.  `tools` removes every built-in except public web lookup;
@@ -3198,12 +3305,10 @@ async def _build_and_connect_client(
     # can_use_tool resolves ordinary SDK permission prompts. Native
     # AskUserQuestion always uses the PreToolUse browser bridge above because
     # permission rules and live mode transitions can shadow this callback.
-    if permission != "bypassPermissions" and not side_question_runtime:
+    if not side_question_runtime:
         opts_kwargs["can_use_tool"] = perm.build_callback_for_session(
             session_id,
-            plan_return_permission=(
-                plan_return_permission if permission == "plan" else None
-            ),
+            plan_return_permission=runtime_plan_return_permission,
         )
     # Third-party Anthropic-compatible endpoints may emit a `thinking` block
     # without the signature key that the SDK parser requires.  Use the narrow
@@ -5234,7 +5339,11 @@ def _indexed_ui_records(
                     if parsed:
                         bubble["bash"] = parsed
         elif bubble.get("role") == "tool_use" and tool_id in task_status:
-            bubble["task_status"] = task_status[tool_id]
+            status = task_status[tool_id]
+            bubble["task_status"] = (
+                normalize_task_summary_fields(status)
+                if isinstance(status, dict) else status
+            )
 
     # A bounded tail can begin after the AssistantMessage that owns the
     # completion annotation while still containing the actual visual tail

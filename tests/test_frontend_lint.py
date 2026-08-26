@@ -755,6 +755,48 @@ def test_multi_workspace_ui_and_folder_browser_are_wired_end_to_end():
     assert "height: 100dvh" in mobile
 
 
+def test_chat_tab_ids_are_normalized_at_restore_render_and_persist_boundaries():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+
+    helper_start = app.index("_normalizeOpenTabIds(ids, validIds = null)")
+    helper_end = app.index("\n    savePrefs()", helper_start)
+    helper = app[helper_start:helper_end]
+    assert "const seen = new Set()" in helper
+    assert 'typeof id !== "string" || !id || seen.has(id)' in helper
+    assert "seen.add(id)" in helper
+
+    save_start = app.index("savePrefs()")
+    save_end = app.index("\n    _scheduleSavePrefs()", save_start)
+    assert "openTabIds: this._normalizeOpenTabIds(this.openTabIds)" in app[
+        save_start:save_end]
+
+    load_start = app.index("loadPrefs()")
+    load_end = app.index("\n    loadNotifyPrefs()", load_start)
+    assert "this._normalizeOpenTabIds(p.openTabIds)" in app[load_start:load_end]
+
+    init_start = app.index("async _initSessionsOnce(options = {})")
+    init_end = app.index("\n    async _pullSessionList", init_start)
+    assert "this._normalizeOpenTabIds(this.openTabIds, validIds)" in app[
+        init_start:init_end]
+
+    workspace_start = app.index("workspaceOpenTabIds(path = \"\")")
+    workspace_end = app.index("\n    sessionInCurrentWorkspace", workspace_start)
+    assert "this._normalizeOpenTabIds(this.openTabIds).filter" in app[
+        workspace_start:workspace_end]
+
+    assert 'x-for="tid in workspaceOpenTabIds()" :key="tid"' in html
+    assert ':key="tid + ' not in html
+
+    shortcut_start = app.index("// Chat-tab keybindings")
+    shortcut_end = app.index('if (ev.key === "Escape")', shortcut_start)
+    shortcut = app[shortcut_start:shortcut_end]
+    assert "const editingOnMobile = this._isMobileLayout()" in shortcut
+    assert "if (editingOnMobile)" in shortcut
+    assert shortcut.index("if (editingOnMobile)") < shortcut.index(
+        'if (ev.key === "t"')
+
+
 def test_workspace_picker_supports_mouse_and_touch_reordering():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
     html = (FRONTEND / "index.html").read_text(encoding="utf-8")
@@ -1096,7 +1138,10 @@ def test_session_synchronization_has_one_per_tab_coordinator():
     ):
         assert field in state
     assert "if (sync.inFlight) return" in coordinator
-    assert "sync.inFlight = { reason: request.reason, task, controller, epoch }" in coordinator
+    assert "sync.inFlight = {" in coordinator
+    assert "reason: request.reason" in coordinator
+    assert "waiters: request.waiters" in coordinator
+    assert "sync.inFlight.waiters.push(resolve)" in coordinator
     assert "Promise.race([operation, cancelled, deadline])" in coordinator
     assert "inFlight.controller.abort()" in coordinator
     assert "this._sessionSyncNeedsVisibility(request.reason)" in coordinator
@@ -1743,7 +1788,10 @@ def test_activity_center_groups_by_attention_order_and_read_state():
     assert "const task = prior.catch(() => {}).then(run)" in app
     assert "json: { ids: requestedOrder }" in app
     assert "incomingRevision < this._activityRevision" in app
-    assert "if (this.activitySearchQuery() || group?.builtin) return false" in app
+    assert "moveActivityGroup(group, -1)" not in html
+    assert "moveActivityGroup(group, 1)" not in html
+    assert "async moveActivityGroup(group, delta)" not in app
+    assert "activityGroupCanMove(group, delta)" not in app
     update_start = app.index("_applyActivityUpdate(payload)")
     update_end = app.index("\n    async _startActivityEvents()", update_start)
     update = app[update_start:update_end]
@@ -1777,6 +1825,157 @@ def test_activity_center_groups_by_attention_order_and_read_state():
     assert "activityIsUnreadResult(item) ? ' is-unread'" in html
     assert ".activity-row.failed.is-unread .activity-state-dot" in css
     assert ".activity-row.failed .activity-state-dot,.activity-row.waiting_approval" not in css
+
+
+def test_activity_move_menu_is_mobile_safe_and_lifecycle_bound():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    css = (FRONTEND / "styles.css").read_text(encoding="utf-8")
+
+    open_start = app.index("    openActivityMoveMenu(ev, item) {")
+    open_end = app.index("\n    closeActivityMoveMenu(", open_start)
+    opener = app[open_start:open_end]
+    assert "if (this._isMobileLayout())" in opener
+    assert opener.index("if (this._isMobileLayout())") < opener.index(
+        "getBoundingClientRect()"
+    )
+    assert 'showMenu("")' in opener
+    assert '"activity-move", ".activity-move-menu", "button", opener, true' in opener
+    assert "`position:fixed;left:" in opener
+
+    assert 'class="activity-move-layer"' in html
+    assert (
+        'x-show="activity.show && activity.moveMenu.show && !!activityMoveMenuItem()"'
+        in html
+    )
+    assert '@click.self="closeActivityMoveMenu(true)"' in html
+    assert 'aria-haspopup="menu"' in html
+    assert 'aria-controls="activity-move-menu"' in html
+    assert ':aria-expanded="activity.moveMenu.show' in html
+    assert '@keydown="onActivityMoveMenuKeydown($event)"' in html
+    assert '@keydown.tab="trapDialogFocus($event, \'activity-move\')"' in html
+    assert 'role="menuitemradio"' in html
+    assert '["ArrowDown", "ArrowUp", "Home", "End"]' in app
+    assert ':aria-checked=' in html
+    assert "assignActivityGroup(activityMoveMenuItem(), group.groupId || '')" in html
+    assert "assignActivityGroup(activityMoveMenuItem(), group.groupId || '', '')" not in html
+    assert '@scroll.passive="activity.moveMenu.show && closeActivityMoveMenu()"' in html
+    assert (
+        '@scroll.passive="group.custom && activity.moveMenu.show '
+        '&& closeActivityMoveMenu()"' in html
+    )
+
+    escape_modal = app.index(
+        'if (ev.key === "Escape" && this._modalFocusStack.length)'
+    )
+    escape_move = app.index(
+        'else if (top === "activity-move") this.closeActivityMoveMenu(true)',
+        escape_modal,
+    )
+    assert escape_modal < escape_move
+    assert "const onVisualViewportChange = () =>" in app
+    assert "this.activity.moveMenu.show && this.activity.moveMenu.style" in app
+    assert 'vv.addEventListener("resize", onVisualViewportChange)' in app
+    assert 'vv.addEventListener("scroll", onVisualViewportChange)' in app
+
+    mobile_tab_start = app.index("    setMobileTab(next) {")
+    mobile_tab_end = app.index("\n    // The queue is authoritative", mobile_tab_start)
+    mobile_tab = app[mobile_tab_start:mobile_tab_end]
+    assert mobile_tab.index("this.closeActivityMoveMenu()") < mobile_tab.index(
+        "if (next === this.mobileTab) return"
+    )
+    picker_start = app.index("    toggleHistoryPicker(ev) {")
+    picker_end = app.index("\n    closeHistoryPicker", picker_start)
+    assert "this.closeActivityMoveMenu()" in app[picker_start:picker_end]
+    center_start = app.index("    async openActivityCenter() {")
+    center_end = app.index("\n    closeActivityCenter()", center_start)
+    assert "this.closeActivityMoveMenu()" in app[center_start:center_end]
+
+    fetch_start = app.index("    async fetchActivity(opts = {}) {")
+    fetch_end = app.index("\n    async openActivityCenter()", fetch_start)
+    fetch_activity = app[fetch_start:fetch_end]
+    snapshot_assignment = fetch_activity.index("this.activity.events = events")
+    missing_target = fetch_activity.index(
+        "(!this._isMobileLayout() || !this.activityMoveMenuItem())"
+    )
+    assert snapshot_assignment < missing_target
+    live_start = app.index("    _applyActivityUpdate(payload) {")
+    live_end = app.index("\n    async _startActivityEvents()", live_start)
+    live_update = app[live_start:live_end]
+    assert "!this._isMobileLayout() || !this.activityMoveMenuItem()" in live_update
+
+    assert ".activity-move-layer { position:fixed; inset:0" in css
+    mobile_css_start = css.index(
+        "@media (max-width: 900px), (pointer: coarse) and (max-height: 500px)"
+    )
+    mobile_css = css[mobile_css_start:]
+    assert "env(safe-area-inset-bottom)" in mobile_css
+    assert "var(--kb-inset, 0px)" in mobile_css
+    assert "calc(100dvh - var(--kb-inset, 0px) - 24px)" in mobile_css
+    assert "overscroll-behavior: contain" in mobile_css
+    assert "min-height: 44px" in mobile_css
+
+
+def test_activity_groups_bind_workspaces_without_filtering_group_members():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    css = (FRONTEND / "styles.css").read_text(encoding="utf-8")
+    i18n = (FRONTEND / "i18n" / "index.js").read_text(encoding="utf-8")
+
+    sections_start = app.index("activityCustomGroupSections()")
+    sections_end = app.index("\n    activityMatchesGroup", sections_start)
+    sections = app[sections_start:sections_end]
+    assert 'workspaceId: String(group.workspace_id || "")' in sections
+    assert 'workspacePath: String(group.workspace_path || "")' in sections
+
+    match_start = app.index("activityMatchesGroup(item, key)")
+    match_end = app.index("\n    activitySearchQuery", match_start)
+    matcher = app[match_start:match_end]
+    assert "workspace" not in matcher
+    assert "activity_source" not in matcher
+    assert 'String(item.group_id || "")' in matcher
+
+    entry_start = app.index("activityGroupWorkspaceEntry(group)")
+    entry_end = app.index("\n    openActivityGroupEditor", entry_start)
+    workspace_helpers = app[entry_start:entry_end]
+    assert 'String(workspace?.id || "") === workspaceId' in workspace_helpers
+    assert "workspace.path" not in workspace_helpers.split(
+        "activityGroupWorkspaceEntry(group)", 1)[1].split("},", 1)[0]
+    assert "await this.fetchSessionWorkspaces({" in workspace_helpers
+    assert "restoreCache: false" in workspace_helpers
+    assert "currentWorkspaceId !== expectedWorkspaceId" in workspace_helpers
+    assert "await this.switchWorkspace(entry.path)" in workspace_helpers
+    assert "_changeWorkspaceSurface" not in workspace_helpers
+
+    payload_start = app.index("applyActivityGroupPayload(data)")
+    payload_end = app.index("\n    activityCustomGroupSections", payload_start)
+    payload_apply = app[payload_start:payload_end]
+    assert "editor?.open && editor.id && !editor.workspaceDirty" in payload_apply
+    assert "editor.workspaceId = String(current.workspace_id" in payload_apply
+
+    save_start = app.index("async saveActivityGroup()")
+    save_end = app.index("\n    async deleteActivityGroup", save_start)
+    save = app[save_start:save_end]
+    assert "payload.workspace_id = workspaceId || null" in save
+    assert "if (!editing || draft.workspaceDirty)" in save
+    assert "this.activity.groupEditor.owner !== owner" in save
+
+    assert 'class="activity-group-workspace-field"' in html
+    assert "activity.groupEditor.workspaceDirty = true" in html
+    assert "workspace.id === activity.groupEditor.workspaceId" in html
+    assert 'class="activity-group-workspace-chip"' in html
+    assert '@click.stop="openActivityGroupWorkspace(group)"' in html
+    assert ".activity-group-workspace-chip" in css
+    assert ".activity-group-editor { flex:0 0 auto;" in css
+    assert "min-height:40px" in css
+    for key in (
+        "activity.group.workspace",
+        "activity.group.workspace_none",
+        "activity.group.workspace_open",
+        "activity.group.workspace_removed",
+        "activity.group.workspace_rebind",
+    ):
+        assert i18n.count(f'"{key}"') == 2
 
 
 def test_activity_center_searches_loaded_sessions_before_group_caps():
@@ -2793,7 +2992,9 @@ def test_active_stream_owns_messages_and_continuation_reconciles_canonical_histo
     assert "const stillOwned = () => this.tabState[sid] === ownerState" in app
     assert "if (!isContinuation)" in send
     assert "all = this._preserveCanonicalMessageIdentity(st, all)" in load
-    assert "const quietRangeBeforeInstall = quiet ?" in load
+    assert "const quietRangeSnapshot = quiet" in load
+    assert "this._resolveMessageRangeSnapshot(all, quietRangeSnapshot)" in load
+    assert "this._historyReplaceStillOwns(st, historyReplaceToken)" in load
     assert "await new Promise(resolve => this.$nextTick(resolve))" in load
     assert "this._revealMessagesChunked(sid, st, visible, true)" in load
     assert "this._revealMessagesChunked(sid, st, visible, !quiet)" not in load
@@ -3270,9 +3471,9 @@ def test_transcript_active_session_ui_reads_through_pane_facade():
         "activeSession.backgroundActive",
         "activeSession.compacting",
         "activeSession._draining",
-        "activeSession.atBottom",
     ):
         assert binding in transcript
+    assert "isAwayFromLatest()" in transcript
     assert "tabState[currentId]" not in transcript
     assert "_currentQueueLen()" not in transcript
     assert 'x-show="streaming && (!messages.length' not in transcript
@@ -3361,14 +3562,14 @@ def test_warm_transcript_panes_skip_remount_skeleton_and_full_highlight():
     warm = switch[warm_start:cold_start]
 
     assert "stCur.messagesReady = true" in warm
-    assert "this._scrollChatTailNow(target, stCur)" in warm
-    assert "this._settleScrollToBottom()" in warm
+    assert "this.returnToLatest(target)" in warm
+    assert "this._scrollChatTailNow(target, stCur)" not in warm
     assert "messagesReady = false" not in warm
     assert "highlightCode" not in warm
     cold = switch[cold_start:]
     assert "stCur.messagesReady = false" in cold
-    assert cold.index("stCur.messagesReady = true") < cold.index("this._scrollChatTailNow(target, stCur)")
-    assert cold.index("this._scrollChatTailNow(target, stCur)") < cold.index("this._afterPaint(() =>")
+    assert cold.index("stCur.messagesReady = true") < cold.index("this.returnToLatest(target)")
+    assert cold.index("this.returnToLatest(target)") < cold.index("this._afterPaint(() =>")
     assert 'x-for="tid in warmTranscriptTabIds()"' in html
     assert 'x-show="tid === currentId"' in html
 
@@ -3398,14 +3599,15 @@ def test_tab_selection_and_layout_changes_share_one_tail_follow_controller():
     activate_end = app.index("    _scrollTabIntoView(tid) {", activate_start)
     activate = app[activate_start:activate_end]
     assert "if (tid === this.currentId)" in activate
-    assert "this.scrollToBottom(true)" in activate
+    assert "await this.returnToLatest(tid)" in activate
 
     switch_start = app.index("    async switchSession() {")
     switch_end = app.index("    _afterPaint(fn) {", switch_start)
     switch = app[switch_start:switch_end]
-    assert "selectedState.atBottom = true" in switch
-    assert "this.scrollToBottom(true)" in switch
-    assert switch.count("this._scrollChatTailNow(target, stCur)") == 2
+    assert "selectedState.atBottom = true" not in switch
+    assert "await this.returnToLatest(target)" in switch
+    assert switch.count("this.returnToLatest(target)") >= 2
+    assert "this._scrollChatTailNow(target, stCur)" not in switch
     assert "this._restoreChatPosition(target)" not in switch
 
     controller_start = app.index("    _ensureChatTailObserver() {")
@@ -3449,7 +3651,9 @@ def test_history_paging_uses_smaller_mobile_pages_only_on_user_request():
     earlier_start = app.index("    async loadEarlierMessages(sid) {")
     earlier_end = app.index("    async returnToLatest(sid)", earlier_start)
     earlier = app[earlier_start:earlier_end]
-    assert "const batchSize = this._historyWindowSize()" in earlier
+    assert "const liveWindow = this._isLiveMessagePane(st)" in earlier
+    assert "this._liveMessageHistoryStep() : this._historyWindowSize()" in earlier
+    assert "nextStart + this._liveMessageDomCap()" in earlier
     assert "await this._fetchOlderWindow(sid)" in earlier
     assert "this._captureViewportMessageAnchor(scrollEl, sid)" in earlier
     assert "this._restoreMessageAnchor(scrollEl, anchor)" in earlier
@@ -3469,6 +3673,49 @@ def test_history_paging_uses_smaller_mobile_pages_only_on_user_request():
     assert "messageIntrinsicH(pane, m)" in html
 
 
+def test_live_turn_bounds_dom_and_indexes_task_status_without_linear_scans():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+
+    append_start = app.index("    _appendLiveMessage(st, m) {")
+    append_end = app.index("    _historyWindowSize()", append_start)
+    append = app[append_start:append_end]
+    assert "const followTail = tailWasVisible && st.atBottom !== false" in append
+    assert "this._boundLiveMessageRange(st, true)" in append
+    assert "this._syncNormalizedHistory(st)" not in append
+    assert "_liveMessageDomCap() { return this._isMobileLayout() ? 40 : 100; }" in app
+
+    send_start = app.index("    async send(opts = {}) {")
+    send_end = app.index("    async stop()", send_start)
+    send = app[send_start:send_end]
+    assert "const taskCardByToolUseId = new Map()" in send
+    assert "const taskCardByTaskId = new Map()" in send
+    assert "const ensureTaskCardIndex = () =>" in send
+    assert "for (const message of streamState.messages) registerTaskCard(message)" in send
+    apply_start = send.index("const applyTaskStatus")
+    apply_end = send.index('es.addEventListener("text"', apply_start)
+    assert "for (let k =" not in send[apply_start:apply_end]
+    assert "this._normalizeTaskStatusPreview" in send[apply_start:apply_end]
+    assert "if (_scrollCoalesceHandle !== null) return" in send
+    assert send.index("sendState.atBottom = true") < send.index(
+        "sentUserBubble = this._appendLiveMessage")
+
+    assert '@click="returnToLatest()"' in html
+    assert html.count('x-show="isAwayFromLatest()"') >= 3
+    assert "summary_truncated" in html
+
+    tail_start = app.index("    _scrollChatTailNow(sid, st) {")
+    tail_end = app.index("    scrollToBottom(force) {", tail_start)
+    assert "st.atBottom = true" not in app[tail_start:tail_end]
+    assert "this._enforceMessageRangeInvariant(st)" in app[tail_start:tail_end]
+
+    older_start = app.index("    async _fetchOlderWindow(sid) {")
+    later_end = app.index("    // Per-message placeholder height", older_start)
+    paging = app[older_start:later_end]
+    assert paging.count("this._captureHistoryPageToken(st)") == 2
+    assert paging.count("this._historyPageStillOwns(st, pageToken)") == 2
+
+
 def test_quiet_canonical_reload_rebases_virtual_window_before_alpine_paints():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
 
@@ -3482,7 +3729,18 @@ def test_quiet_canonical_reload_rebases_virtual_window_before_alpine_paints():
     assert capture in load
     assert rebase in load
     assert load.index(capture) < load.index(splice) < load.index(assign) < load.index(rebase)
-    assert "const followTailAtInstall = quiet && st.atBottom !== false" in load
+    assert "opts.followTail === true" in load
+    assert "this._resolveMessageRangeSnapshot(all, quietRangeSnapshot)" in load
+    assert "if (quiet && !quietRangeResolved)" in load
+
+    range_helper_start = app.index("    _captureMessageRangeSnapshot(st) {")
+    range_helper_end = app.index("    _captureViewportMessageAnchor", range_helper_start)
+    range_helper = app[range_helper_start:range_helper_end]
+    assert "startIdentity:" in range_helper and "endIdentity:" in range_helper
+    assert "_historyMessageIndex(messages, snapshot.startIdentity)" in range_helper
+    assert "_historyMessageIndex(messages, snapshot.endIdentity)" in range_helper
+    assert "_historyReplaceStillOwns" in range_helper
+    assert "_historyPageStillOwns" in range_helper
 
     helper_start = app.index("    _captureMessageVirtualWindow(st) {")
     helper_end = app.index("    paneMessageRows(tid) {", helper_start)
@@ -3721,8 +3979,9 @@ def test_stream_deltas_use_throttled_plain_snapshots_and_final_rich_render():
     assert 'class="history-plain"' in html
     assert 'x-text="m.text || m.preview || \'\'"' in html
     assert 'x-show="!m._streamPlain && m.html" x-html="m.html || \'\'"' in html
-    assert "if (streamState.atBottom !== false) this.scrollToBottom(false)" in app
-    assert "if (streamState.atBottom !== false) this._scheduleLiveMessageViewport" not in app
+    assert "if (this.currentId !== streamSid || streamState.atBottom === false) return" in app
+    assert "this.scrollToBottom(false)" in app
+    assert "if (_scrollCoalesceHandle !== null) return" in app
     assert "const maxChunk = this._isMobileLayout() ? 4 : 12" in app
     assert "const frameBudgetMs = this._isMobileLayout() ? 6 : 12" in app
     assert "performance.now() - started >= frameBudgetMs" in app
@@ -5262,6 +5521,100 @@ def test_tab_activation_checks_canonical_installation_watermark():
     assert "await this._ensureSessionLoaded(tid)" in activate
     assert "this._canonicalMetaBehind(st, cur)" in switch
     assert "loadedButBehindCanonical" in switch
+
+
+def test_transcript_loading_overlay_has_generation_owned_visual_contract():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    css = (FRONTEND / "styles.css").read_text(encoding="utf-8")
+    i18n = (FRONTEND / "i18n" / "index.js").read_text(encoding="utf-8")
+
+    blank_start = app.index("    _blankTabState() {")
+    blank_end = app.index("    _ensureTabState(id) {", blank_start)
+    blank = app[blank_start:blank_end]
+    assert "transcriptLoadGeneration: 0" in blank
+    assert 'transcriptLoadPhase: "idle"' in blank
+
+    helper_start = app.index("    transcriptLoadingVisible(")
+    helper_end = app.index("    _setActiveSessionPaneField", helper_start)
+    helpers = app[helper_start:helper_end]
+    assert '["fetching", "mounting", "settling"]' in helpers
+    assert 'st?.transcriptLoadPhase === "error"' in helpers
+    assert "this.tabState[token.sid] === token.state" in helpers
+    assert "token.state._sid === token.sid" in helpers
+    assert "token.state.transcriptLoadGeneration === token.generation" in helpers
+    assert 'token.state.transcriptLoadPhase = "settling"' in helpers
+    assert 'token.state.transcriptLoadPhase = "idle"' in helpers
+    assert 'token.state.transcriptLoadPhase = "error"' in helpers
+    assert "token.state.messagesLoading = false" in helpers
+    assert "token.state.messagesReady = true" in helpers
+    assert "await new Promise(resolve => this.$nextTick(resolve))" in helpers
+    assert "await new Promise(resolve => this._afterPaint(resolve))" in helpers
+    assert "_releaseTranscriptLoadForLive(st)" in helpers
+    assert "st.transcriptLoadGeneration =" in helpers
+
+    send_start = app.index("      const streamSid = sendSid;")
+    send_end = app.index("      streamState.streamingModel = sendModel;", send_start)
+    send_owner = app[send_start:send_end]
+    assert send_owner.index("this._releaseTranscriptLoadForLive(streamState)") < (
+        send_owner.index("streamState.streaming = true")
+    )
+
+    ensure_start = app.index("    async _ensureSessionLoaded(sid) {")
+    ensure_end = app.index("\n    async loadSession", ensure_start)
+    ensure = app[ensure_start:ensure_end]
+    assert ensure.index("this._beginTranscriptLoad") < ensure.index(
+        "this._reloadSessionCoalesced"
+    )
+    assert "canonicalBehind && st._loaded && st.messages.length > 0" in ensure
+    assert "sid === this.currentId && !quiet" in ensure
+    assert "loaded && st._loaded && this._ownsTranscriptLoad(token)" in ensure
+
+    switch_start = app.index("    async switchSession() {")
+    switch_end = app.index("\n    _afterPaint", switch_start)
+    switch = app[switch_start:switch_end]
+    warm_start = switch.index("if (paneWasWarm) {")
+    cold_start = switch.index("} else {", warm_start)
+    assert "_beginTranscriptLoad" not in switch[warm_start:cold_start]
+    assert 'this._beginTranscriptLoad(target, stCur, "mounting")' in switch[cold_start:]
+
+    wrap_start = html.index('<div class="chat-transcript-wrap"')
+    wrap_end = html.index('\n      <div class="chat-input">', wrap_start)
+    transcript = html[wrap_start:wrap_end]
+    body_end = transcript.index("</div>", transcript.index('<div class="chat-body"'))
+    overlay_at = transcript.index('class="chat-transcript-loading-overlay"')
+    assert overlay_at > body_end
+    assert 'x-show="!transcriptLoadFailed() && transcriptLoadingVisible()"' in transcript
+    assert "x-transition:" not in transcript
+    assert 'x-show="transcriptEmptyReady()"' in transcript
+    assert 'x-show="transcriptLoadFailed()"' in transcript
+    assert "transcriptLoadFailed() && !activeSession.messages.length" not in transcript
+    assert "st._loaded === true" in helpers
+    assert 'st.transcriptLoadPhase === "idle"' in helpers
+    assert "msgs-hidden" not in transcript
+
+    overlay_start = css.index(".chat-transcript-loading-overlay {")
+    overlay_end = css.index(".chat-muse-loader {", overlay_start)
+    overlay = css[overlay_start:overlay_end]
+    assert "position: absolute" in overlay
+    assert "inset: 0" in overlay
+    assert "var(--c-bg-1)" in overlay
+    assert "pointer-events: auto" in overlay
+    assert 'class="chat-muse-loader"' in transcript
+    assert 'class="chat-muse-loader-emblem"' in transcript
+    assert 'class="muse-mascot lg is-streaming"' in transcript
+    assert ':href="mascotHref()"' in transcript
+    assert 'class="chat-muse-loader-dots"' in transcript
+    assert 'class="sr-only"' not in transcript
+    assert 'class="chat-skeleton"' not in transcript
+    assert ".chat-muse-loader-emblem::after" in css
+    assert "@keyframes chat-muse-orbit" in css
+    assert "@keyframes chat-muse-dot" in css
+    assert '@media (prefers-reduced-motion: reduce)' in css
+    assert ':inert="transcriptLoadingVisible()"' in transcript
+
+    for key in ("chat.loading_session", "chat.load_failed", "chat.load_retry"):
+        assert i18n.count(f'"{key}"') == 2
 
 
 def test_message_outline_is_a_focus_managed_keyboard_dialog():

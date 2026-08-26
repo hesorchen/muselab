@@ -2562,7 +2562,7 @@ def test_desktop_session_switch_keeps_bounded_warm_panes_and_composer_stable(
           return panes.length === 1
             && visible.length === 1
             && visible[0].querySelectorAll(".msg").length === 40
-            && getComputedStyle(document.querySelector(".chat-skeleton")).display === "none";
+            && getComputedStyle(document.querySelector(".chat-transcript-loading-overlay")).display === "none";
         }"""
     )
     before = page.locator(".chat-input").bounding_box()
@@ -2578,6 +2578,13 @@ def test_desktop_session_switch_keeps_bounded_warm_panes_and_composer_stable(
             await app.switchSession();
             await new Promise(resolve =>
               requestAnimationFrame(() => requestAnimationFrame(resolve)));
+            const settleDeadline = performance.now() + 1000;
+            while ((app.transcriptLoadingVisible()
+                || getComputedStyle(document.querySelector(
+                  ".chat-transcript-loading-overlay")).display !== "none")
+                && performance.now() < settleDeadline) {
+              await new Promise(resolve => requestAnimationFrame(resolve));
+            }
             const panes = Array.from(document.querySelectorAll(".msg-pane"));
             const visible = panes.filter(
               pane => getComputedStyle(pane).display !== "none");
@@ -2589,7 +2596,7 @@ def test_desktop_session_switch_keeps_bounded_warm_panes_and_composer_stable(
               visibleMessages: visible[0]?.querySelectorAll(".msg").length || 0,
               ready: app._ensureTabState(app.currentId).messagesReady,
               skeleton: getComputedStyle(
-                document.querySelector(".chat-skeleton")).display,
+                document.querySelector(".chat-transcript-loading-overlay")).display,
             });
           }
           return out;
@@ -2609,6 +2616,267 @@ def test_desktop_session_switch_keeps_bounded_warm_panes_and_composer_stable(
     assert switches[-1]["skeleton"] == "none", switches
     assert abs(after["y"] - before["y"]) < 1
     assert abs(after["height"] - before["height"]) < 1
+    _assert_no_browser_errors(page, errors)
+
+
+def test_cold_session_switch_shields_every_frame_until_transcript_paints(
+    page: Page, backend_url: str, auth_token: str,
+):
+    """A gated cold switch never exposes onboarding or the previous transcript."""
+    errors = _capture_browser_errors(page)
+    page.set_viewport_size({"width": 1280, "height": 800})
+    _login(page, backend_url, auth_token)
+    sid_a = "loading-shield-a"
+    sid_b = "loading-shield-b"
+    marker_a = "OLD_SESSION_CONTENT_MUST_NEVER_FLASH"
+    marker_b = "NEW_SESSION_CONTENT_AFTER_RELEASE"
+    payload = {
+        "sidA": sid_a,
+        "sidB": sid_b,
+        "messagesA": _make_mixed_messages(6, marker_a),
+        "messagesB": _make_mixed_messages(6, marker_b),
+    }
+    _app_eval(
+        page,
+        """
+        app.refreshSessions = async () => {};
+        app._fetchTabUsage = async () => {};
+        app._scheduleIdlePreload = () => {};
+        app.sessions = [
+          {id: arg.sidA, name: "Loaded A", message_count: arg.messagesA.length,
+           updated_at: 1, model: "e2e-model"},
+          {id: arg.sidB, name: "Cold B", message_count: arg.messagesB.length,
+           updated_at: 2, model: "e2e-model"},
+        ];
+        app.openTabIds = [arg.sidA, arg.sidB];
+        app.tabState = {};
+        const a = app._ensureTabState(arg.sidA);
+        a.messages = app._historyEnvelopes(arg.sidA, arg.messagesA);
+        a.messageRange.visibleEnd = a.messages.length;
+        a.messageRange.total = a.messages.length;
+        a._installedCanonicalCount = a.messages.length;
+        a._loaded = true;
+        a.messagesReady = true;
+        const b = app._ensureTabState(arg.sidB);
+        b._loaded = false;
+        b.messagesReady = true;
+        app.currentId = arg.sidA;
+        app._touchTranscriptPane(arg.sidA);
+        app._activateTabState(arg.sidA);
+        let release;
+        const gate = new Promise(resolve => { release = resolve; });
+        app.__releaseTranscriptGate = release;
+        app.__slowTranscriptStarted = false;
+        app._reloadSessionCoalesced = async sid => {
+          if (sid !== arg.sidB) return true;
+          app.__slowTranscriptStarted = true;
+          await gate;
+          const st = app._ensureTabState(sid);
+          st.messages = app._historyEnvelopes(sid, arg.messagesB);
+          st.messageRange.visibleStart = 0;
+          st.messageRange.visibleEnd = st.messages.length;
+          st.messageRange.offset = 0;
+          st.messageRange.total = st.messages.length;
+          st._installedCanonicalCount = st.messages.length;
+          st.messagesReady = true;
+          st.messagesLoading = false;
+          st._loaded = true;
+          return true;
+        };
+        return true;
+        """,
+        payload,
+    )
+    page.wait_for_function(
+        """marker => Array.from(document.querySelectorAll('.msg-pane')).some(
+          node => getComputedStyle(node).display !== 'none'
+            && node.getClientRects().length > 0
+            && node.textContent.includes(marker))""",
+        arg=marker_a,
+    )
+
+    page.evaluate(
+        """sid => {
+          const app = document.querySelector("#app")._x_dataStack[0];
+          app.currentId = sid;
+          app.__switchPromise = app.switchSession();
+        }""",
+        sid_b,
+    )
+    page.wait_for_function(
+        "() => document.querySelector('#app')._x_dataStack[0].__slowTranscriptStarted"
+    )
+    frames = page.evaluate(
+        """async oldMarker => {
+          const out = [];
+          for (let i = 0; i < 12; i += 1) {
+            await new Promise(resolve => requestAnimationFrame(resolve));
+            const overlay = document.querySelector('.chat-transcript-loading-overlay');
+            const empty = document.querySelector('.chat-empty');
+            const visiblePanes = Array.from(document.querySelectorAll('.msg-pane'))
+              .filter(node => getComputedStyle(node).display !== 'none'
+                && node.getClientRects().length > 0);
+            const app = document.querySelector('#app')._x_dataStack[0];
+            out.push({
+              currentId: app.currentId,
+              phase: app._ensureTabState(app.currentId).transcriptLoadPhase,
+              generation: app._ensureTabState(app.currentId).transcriptLoadGeneration,
+              overlayVisible: !!overlay
+                && getComputedStyle(overlay).display !== 'none'
+                && overlay.getClientRects().length > 0,
+              overlayBackground: overlay ? getComputedStyle(overlay).backgroundColor : '',
+              emptyVisible: !!empty
+                && getComputedStyle(empty).display !== 'none'
+                && empty.getClientRects().length > 0,
+              oldVisible: visiblePanes.some(node => node.textContent.includes(oldMarker)),
+            });
+          }
+          return out;
+        }""",
+        marker_a,
+    )
+    hidden_frames = [row for row in frames if not row["overlayVisible"]]
+    assert not hidden_frames, hidden_frames
+    assert all(row["overlayBackground"] not in ("", "rgba(0, 0, 0, 0)") for row in frames)
+    assert not any(row["emptyVisible"] for row in frames), frames
+    assert not any(row["oldVisible"] for row in frames), frames
+
+    page.evaluate(
+        """async () => {
+          const app = document.querySelector("#app")._x_dataStack[0];
+          app.__releaseTranscriptGate();
+          await app.__switchPromise;
+        }"""
+    )
+    expect(page.locator(".chat-transcript-loading-overlay")).to_be_hidden(timeout=5000)
+    expect(page.locator(".msg-pane:visible")).to_contain_text(marker_b, timeout=5000)
+    expect(page.locator(".chat-empty")).to_be_hidden()
+    _assert_no_browser_errors(page, errors)
+
+
+def test_mobile_transcript_loader_uses_centered_muse_brand(
+    page: Page, backend_url: str, auth_token: str,
+):
+    errors = _capture_browser_errors(page)
+    page.set_viewport_size({"width": 390, "height": 844})
+    _login(page, backend_url, auth_token)
+    geometry = page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const sid = app.currentId || 'mobile-muse-loader';
+          if (!app.sessions.some(row => row.id === sid)) {
+            app.sessions = [{id: sid, name: 'Muse loader', message_count: 1}];
+          }
+          if (!app.openTabIds.includes(sid)) app.openTabIds = [sid];
+          const st = app._ensureTabState(sid);
+          st._loaded = false;
+          st.messagesReady = true;
+          st.messagesLoading = false;
+          st.transcriptLoadPhase = 'fetching';
+          app.currentId = sid;
+          await new Promise(resolve => app.$nextTick(resolve));
+          await new Promise(resolve => requestAnimationFrame(
+            () => requestAnimationFrame(resolve)));
+          const overlay = document.querySelector('.chat-transcript-loading-overlay');
+          const loader = overlay.querySelector('.chat-muse-loader');
+          const emblem = overlay.querySelector('.chat-muse-loader-emblem');
+          const copy = overlay.querySelector('.chat-muse-loader-copy strong');
+          const overlayRect = overlay.getBoundingClientRect();
+          const loaderRect = loader.getBoundingClientRect();
+          const result = {
+            overlayVisible: getComputedStyle(overlay).display !== 'none',
+            centerDeltaX: Math.abs(
+              loaderRect.left + loaderRect.width / 2
+              - (overlayRect.left + overlayRect.width / 2)),
+            centerDeltaY: Math.abs(
+              loaderRect.top + loaderRect.height / 2
+              - (overlayRect.top + overlayRect.height / 2)),
+            noOverflow: overlay.scrollWidth <= overlay.clientWidth,
+            emblemVisible: emblem.getClientRects().length > 0,
+            copy: copy.textContent.trim(),
+            skeletonCount: overlay.querySelectorAll('.chat-skeleton').length,
+            srOnlyCount: overlay.querySelectorAll('.sr-only').length,
+            mascotHref: overlay.querySelector('.muse-mascot use')
+              ?.getAttribute('href') || '',
+          };
+          st.transcriptLoadPhase = 'idle';
+          return result;
+        }"""
+    )
+    assert geometry["overlayVisible"] is True
+    assert geometry["centerDeltaX"] < 2
+    assert geometry["centerDeltaY"] < 2
+    assert geometry["noOverflow"] is True
+    assert geometry["emblemVisible"] is True
+    assert geometry["copy"].startswith("Muse ")
+    assert geometry["skeletonCount"] == 0
+    assert geometry["srOnlyCount"] == 0
+    assert geometry["mascotHref"].startswith("#m-")
+    expect(page.locator(".chat-transcript-loading-overlay")).to_be_hidden()
+    _assert_no_browser_errors(page, errors)
+
+
+def test_transcript_failure_keeps_resident_content_and_live_owner_cancels_shield(
+    page: Page, backend_url: str, auth_token: str,
+):
+    errors = _capture_browser_errors(page)
+    _login(page, backend_url, auth_token)
+    sid = "loading-shield-failure"
+    marker = "RESIDENT_CONTENT_SURVIVES_LOAD_FAILURE"
+    payload = {"sid": sid, "messages": _make_mixed_messages(4, marker)}
+    result = page.evaluate(
+        """async arg => {
+        const app = document.querySelector("#app")._x_dataStack[0];
+        app.refreshSessions = async () => {};
+        app._fetchTabUsage = async () => {};
+        app._scheduleIdlePreload = () => {};
+        app.sessions = [{
+          id: arg.sid, name: "Failure fixture",
+          message_count: arg.messages.length, updated_at: 2,
+        }];
+        app.openTabIds = [arg.sid];
+        app.tabState = {};
+        const st = app._ensureTabState(arg.sid);
+        st.messages = app._historyEnvelopes(arg.sid, arg.messages);
+        st.messageRange.visibleEnd = st.messages.length;
+        st.messageRange.total = st.messages.length;
+        st._loaded = false;
+        app.currentId = arg.sid;
+        app._touchTranscriptPane(arg.sid);
+        app._activateTabState(arg.sid);
+        app._reloadSessionCoalesced = async () => false;
+        const loaded = await app._ensureSessionLoaded(arg.sid);
+        return {loaded, phase: st.transcriptLoadPhase};
+        }""",
+        payload,
+    )
+    assert result == {"loaded": False, "phase": "error"}
+    expect(page.locator(".chat-load-error")).to_be_visible()
+    expect(page.locator(".chat-load-error")).to_contain_text("Conversation failed to load")
+    expect(page.locator(".msg-pane:visible")).to_contain_text(marker)
+    page.wait_for_function(
+        "() => !document.querySelector('#app')._x_dataStack[0].transcriptLoadingVisible()"
+    )
+    expect(page.locator(".chat-transcript-loading-overlay")).to_be_hidden()
+
+    live_takeover = _app_eval(
+        page,
+        """
+        const st = app._ensureTabState(arg);
+        const token = app._beginTranscriptLoad(arg, st, "fetching");
+        app._releaseTranscriptLoadForLive(st);
+        const staleFailed = app._failTranscriptLoad(token);
+        return {
+          phase: st.transcriptLoadPhase,
+          staleFailed,
+          generation: st.transcriptLoadGeneration,
+        };
+        """,
+        sid,
+    )
+    assert live_takeover["phase"] == "idle"
+    assert live_takeover["staleFailed"] is False
+    expect(page.locator(".chat-transcript-loading-overlay")).to_be_hidden()
     _assert_no_browser_errors(page, errors)
 
 
@@ -3140,7 +3408,18 @@ def test_outline_around_conflict_retries_and_returns_to_real_tail(
         timeout=10000,
     )
     assert len([call for call in calls if "tail" in call]) == 2
-    assert page.locator(".msg-pane:visible .msg").count() == len(latest_messages)
+    tail_state = _app_eval(
+        page,
+        """
+        const st = app._ensureTabState(arg);
+        return {resident: st.messages.length, cap: app._liveMessageDomCap()};
+        """,
+        sid,
+    )
+    assert tail_state["resident"] == len(latest_messages)
+    assert page.locator(".msg-pane:visible .msg").count() == min(
+        len(latest_messages), tail_state["cap"]
+    )
     _assert_no_browser_errors(page, errors)
 
 
@@ -4699,6 +4978,295 @@ def test_stable_message_identity_needs_no_repair_telemetry(
     _assert_no_browser_errors(page, errors)
 
 
+def test_live_turn_keeps_resident_messages_but_bounds_mounted_rows(
+    page: Page, backend_url, auth_token,
+):
+    errors = _capture_browser_errors(page)
+    page.set_viewport_size({"width": 1440, "height": 900})
+    _login(page, backend_url, auth_token)
+
+    result = page.evaluate(
+        """async () => {
+          const app = document.querySelector("#app")._x_dataStack[0];
+          const sid = "live-dom-budget";
+          app.refreshSessions = async () => {};
+          app._fetchTabUsage = async () => {};
+          app._scheduleIdlePreload = () => {};
+          app.appReady = true;
+          app.sessions = [{id: sid, name: "Live budget", model: "e2e-model"}];
+          app.openTabIds = [sid];
+          app.tabState = {};
+          const st = app._ensureTabState(sid);
+          st._loaded = true;
+          st.streaming = true;
+          st.atBottom = true;
+          app.currentId = sid;
+          app._activateTabState(sid);
+          app._ensureTabState(app.currentId).messagesReady = true;
+          app._ensureTabState(app.currentId).messagesLoading = false;
+          for (let i = 0; i < 250; i++) {
+            app._appendLiveMessage(st, {role: "thinking", text: `live ${i}`});
+          }
+          await new Promise(resolve => app.$nextTick(() => requestAnimationFrame(resolve)));
+          const followed = {
+            resident: st.messages.length,
+            start: st.messageRange.visibleStart,
+            end: st.messageRange.visibleEnd,
+            mounted: Array.from(document.querySelectorAll('.msg-pane')).filter(p => getComputedStyle(p).display !== 'none').reduce((n, p) => n + p.querySelectorAll('.msg').length, 0),
+          };
+          st.atBottom = false;
+          const frozen = {start: st.messageRange.visibleStart, end: st.messageRange.visibleEnd};
+          for (let i = 250; i < 300; i++) {
+            app._appendLiveMessage(st, {role: "thinking", text: `live ${i}`});
+          }
+          await new Promise(resolve => app.$nextTick(() => requestAnimationFrame(resolve)));
+          const reading = {
+            start: st.messageRange.visibleStart,
+            end: st.messageRange.visibleEnd,
+            resident: st.messages.length,
+            hasLater: app.hasLaterMessages(sid),
+          };
+          const body = document.querySelector('.chat-body');
+          body.scrollTop = body.scrollHeight;
+          app.onChatScroll();
+          const physicalBottomAtBottom = st.atBottom;
+          const emojiStatus = app._normalizeTaskStatusPreview({
+            summary: '😀'.repeat(1500), summary_length: 1500,
+            summary_truncated: false,
+          });
+          // Reproduce the completed-middle-window regression: explicit selection
+          // must acquire the logical tail, not merely scroll the bounded DOM.
+          st.streaming = false;
+          st.es = null;
+          await app.activateTab(sid);
+          await new Promise(resolve => app.$nextTick(() => requestAnimationFrame(resolve)));
+          const latest = {
+            start: st.messageRange.visibleStart,
+            end: st.messageRange.visibleEnd,
+            mounted: Array.from(document.querySelectorAll('.msg-pane')).filter(p => getComputedStyle(p).display !== 'none').reduce((n, p) => n + p.querySelectorAll('.msg').length, 0),
+          };
+          return {
+            followed, frozen, reading, latest, physicalBottomAtBottom,
+            emojiLength: Array.from(emojiStatus.summary).length,
+            emojiTruncated: emojiStatus.summary_truncated,
+          };
+        }"""
+    )
+
+    assert result["followed"] == {
+        "resident": 250, "start": 150, "end": 250, "mounted": 100,
+    }
+    assert result["reading"]["start"] == result["frozen"]["start"]
+    assert result["reading"]["end"] == result["frozen"]["end"]
+    assert result["reading"]["resident"] == 300
+    assert result["reading"]["hasLater"] is True
+    assert result["physicalBottomAtBottom"] is False
+    assert result["emojiLength"] == 1500
+    assert result["emojiTruncated"] is False
+    assert result["latest"] == {"start": 200, "end": 300, "mounted": 100}
+    _assert_no_browser_errors(page, errors)
+
+
+def test_stale_older_response_cannot_overwrite_new_canonical_tail(
+    page: Page, backend_url, auth_token,
+):
+    errors = _capture_browser_errors(page)
+    _login(page, backend_url, auth_token)
+
+    result = page.evaluate(
+        """async () => {
+          const app = document.querySelector("#app")._x_dataStack[0];
+          const sid = "history-owner-race";
+          app.refreshSessions = async () => {};
+          app._fetchTabUsage = async () => {};
+          app._scheduleIdlePreload = () => {};
+          app.sessions = [{id: sid, name: "History owner race", message_count: 60}];
+          app.openTabIds = [sid];
+          app.tabState = {};
+          app.currentId = sid;
+          const st = app._ensureTabState(sid);
+          st._loaded = true;
+          st.atBottom = false;
+          st.messages.push(...Array.from({length: 20}, (_, i) => ({
+            role: "user", text: `old ${i + 20}`, uuid: `old-${i + 20}`,
+            _k: `${sid}:uuid:old-${i + 20}`,
+          })));
+          Object.assign(st.messageRange, {
+            visibleStart: 0, visibleEnd: 20, offset: 20, total: 40,
+            preTotal: 0, order: "normal", generation: "G1",
+          });
+          app._activateTabState(sid);
+
+          const originalFetch = window.fetch;
+          let releaseOlder;
+          window.fetch = async url => {
+            const value = String(url);
+            if (value.includes("offset=0") && value.includes("history_generation=G1")) {
+              return await new Promise(resolve => {
+                releaseOlder = () => resolve(new Response(JSON.stringify({
+                  messages: Array.from({length: 20}, (_, i) => ({
+                    role: "user", text: `stale ${i}`, uuid: `stale-${i}`,
+                  })),
+                  offset: 0, total: 40, pre_total: 0,
+                  history_order: "normal", history_generation: "G1",
+                }), {status: 200, headers: {"content-type": "application/json"}}));
+              });
+            }
+            if (value.includes(`/api/chat/sessions/${sid}?tail=`)) {
+              return new Response(JSON.stringify({
+                id: sid, name: "History owner race", model: "e2e-model",
+                permission: "bypassPermissions", thinking: true,
+                messages: Array.from({length: 20}, (_, i) => ({
+                  role: i === 19 ? "assistant" : "user",
+                  text: `fresh ${i + 40}`, uuid: `fresh-${i + 40}`,
+                  turn_status: i === 19 ? "completed" : "",
+                })),
+                offset: 40, total: 60, message_count: 60,
+                pre_total: 0, history_order: "normal",
+                history_generation: "G2", runtime_ui_revision: "rev-2",
+                updated_at: 2,
+              }), {status: 200, headers: {"content-type": "application/json"}});
+            }
+            return originalFetch(url);
+          };
+
+          try {
+            const older = app._fetchOlderWindow(sid);
+            while (!releaseOlder) await new Promise(resolve => setTimeout(resolve, 0));
+            const canonical = await app.loadSession(sid, {
+              quiet: true, followTail: true, probeActive: false,
+            });
+            releaseOlder();
+            const olderCount = await older;
+            return {
+              canonical,
+              olderCount,
+              generation: st.messageRange.generation,
+              offset: st.messageRange.offset,
+              total: st.messageRange.total,
+              first: st.messages[0]?.uuid,
+              last: st.messages[st.messages.length - 1]?.uuid,
+              atBottom: st.atBottom,
+              hasLater: app.hasLaterMessages(sid),
+            };
+          } finally {
+            window.fetch = originalFetch;
+          }
+        }"""
+    )
+
+    assert result == {
+        "canonical": True,
+        "olderCount": 0,
+        "generation": "G2",
+        "offset": 40,
+        "total": 60,
+        "first": "fresh-40",
+        "last": "fresh-59",
+        "atBottom": True,
+        "hasLater": False,
+    }
+    _assert_no_browser_errors(page, errors)
+
+
+def test_newer_tail_request_wins_when_same_revision_responses_arrive_out_of_order(
+    page: Page, backend_url, auth_token,
+):
+    errors = _capture_browser_errors(page)
+    _login(page, backend_url, auth_token)
+
+    result = page.evaluate(
+        """async () => {
+          const app = document.querySelector("#app")._x_dataStack[0];
+          const sid = "tail-replace-owner-race";
+          app.refreshSessions = async () => {};
+          app._fetchTabUsage = async () => {};
+          app._scheduleIdlePreload = () => {};
+          app.sessions = [{id: sid, name: "Tail owner race", message_count: 2}];
+          app.openTabIds = [sid];
+          app.tabState = {};
+          app.currentId = sid;
+          const st = app._ensureTabState(sid);
+          st._loaded = true;
+          st.atBottom = true;
+          st.messages.push({
+            role: "user", text: "base", uuid: "base", _k: `${sid}:uuid:base`,
+          });
+          Object.assign(st.messageRange, {
+            visibleStart: 0, visibleEnd: 1, offset: 0, total: 1,
+            preTotal: 0, order: "normal", generation: "G0",
+          });
+          app._activateTabState(sid);
+
+          const originalFetch = window.fetch;
+          let requestCount = 0;
+          let releaseFirst;
+          const responseFor = (generation, suffix, updated) => new Response(
+            JSON.stringify({
+              id: sid, name: "Tail owner race", model: "e2e-model",
+              permission: "bypassPermissions", thinking: true,
+              messages: [
+                {role: "user", text: "base", uuid: "base"},
+                {role: "assistant", text: suffix, uuid: suffix,
+                 turn_status: "completed"},
+              ],
+              offset: 0, total: 2, message_count: 2,
+              pre_total: 0, history_order: "normal",
+              history_generation: generation,
+              // Deliberately identical: ownership must not depend on this field.
+              runtime_ui_revision: "same-revision",
+              updated_at: updated,
+            }),
+            {status: 200, headers: {"content-type": "application/json"}},
+          );
+          window.fetch = async url => {
+            if (!String(url).includes(`/api/chat/sessions/${sid}?tail=`)) {
+              return originalFetch(url);
+            }
+            requestCount++;
+            if (requestCount === 1) {
+              return await new Promise(resolve => {
+                releaseFirst = () => resolve(responseFor("G1", "stale-reply", 1));
+              });
+            }
+            return responseFor("G2", "fresh-reply", 2);
+          };
+
+          try {
+            const first = app.loadSession(sid, {
+              quiet: true, followTail: true, probeActive: false,
+            });
+            while (!releaseFirst) await new Promise(resolve => setTimeout(resolve, 0));
+            const secondResult = await app.loadSession(sid, {
+              quiet: true, followTail: true, probeActive: false,
+            });
+            releaseFirst();
+            const firstResult = await first;
+            return {
+              firstResult,
+              secondResult,
+              generation: st.messageRange.generation,
+              last: st.messages[st.messages.length - 1]?.uuid,
+              total: st.messageRange.total,
+              atBottom: st.atBottom,
+            };
+          } finally {
+            window.fetch = originalFetch;
+          }
+        }"""
+    )
+
+    assert result == {
+        "firstResult": False,
+        "secondResult": True,
+        "generation": "G2",
+        "last": "fresh-reply",
+        "total": 2,
+        "atBottom": True,
+    }
+    _assert_no_browser_errors(page, errors)
+
+
 def test_canonical_reload_stays_quiet_when_background_tab_becomes_current(
     page: Page, backend_url, auth_token,
 ):
@@ -5850,15 +6418,19 @@ def test_mobile_composer_focus_closes_activity_group_menu(
     )
 
     input_box = page.locator(".chat-input-textarea")
-    input_box.evaluate("el => { el.disabled = false; el.focus(); }")
+    input_box.evaluate("el => { el.disabled = false; }")
+    page.evaluate(
+        "() => document.querySelector('#app')._x_dataStack[0].onChatInputFocus()"
+    )
+    input_box.focus()
     page.wait_for_function(
         """() => {
           const app = document.querySelector('#app')._x_dataStack[0];
-          const menu = document.querySelector('.activity-move-menu');
+          const menuLayer = document.querySelector('.activity-move-layer');
           const backdrop = document.querySelector(
             '.modal-backdrop .activity-modal')?.parentElement;
           return !app.activity.show && !app.activity.moveMenu.show
-            && getComputedStyle(menu).display === 'none'
+            && getComputedStyle(menuLayer).display === 'none'
             && getComputedStyle(backdrop).display === 'none';
         }""",
         timeout=2000,

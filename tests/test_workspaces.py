@@ -2,6 +2,8 @@
 
 from urllib.parse import quote
 
+import pytest
+
 
 def _make_workspace(tmp_path, name="other"):
     path = tmp_path / name
@@ -50,6 +52,27 @@ def test_readding_same_path_gets_new_workspace_generation(
 
     assert first.path == second.path
     assert first.id != second.id
+
+
+def test_workspace_registry_resolves_only_the_exact_generation_id(
+    app_module,
+    tmp_path,
+):
+    from backend.workspaces import WorkspaceRegistry
+
+    primary = tmp_path / "primary"
+    primary.mkdir()
+    other = _make_workspace(tmp_path)
+    registry = WorkspaceRegistry(primary)
+    first = registry.register(other)
+
+    assert registry.entry_for_id(first.id) == first
+    registry.remove(other)
+    second = registry.register(other)
+    assert second.id != first.id
+    with pytest.raises(ValueError, match="workspace is not registered"):
+        registry.entry_for_id(first.id)
+    assert registry.entry_for_id(second.id) == second
 
 
 def test_removed_workspace_sessions_keep_their_attachments(

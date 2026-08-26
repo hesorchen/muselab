@@ -231,6 +231,9 @@ const _EMPTY_ACTIVE_SESSION_PANE = Object.freeze({
   }),
   messagesReady: true,
   messagesLoading: false,
+  transcriptLoadGeneration: 0,
+  transcriptLoadPhase: "idle",
+  _loaded: false,
   streaming: false,
   es: null,
   streamingModel: "",
@@ -594,8 +597,8 @@ function portal() {
 
     // ===== chat =====
     sessions: [], currentId: "",
-    // Keep a bounded LRU of virtualized transcript panes mounted. The canonical
-    // message repository remains the authority; these are disposable DOM views.
+    // Keep a bounded LRU of transcript panes mounted. Each pane renders an exact-
+    // height messageRange window; the canonical repository remains authoritative.
     _warmTranscriptTabs: [],
     _transcriptPaneLru: [],
     WARM_TRANSCRIPT_LIMIT: 3,
@@ -701,7 +704,9 @@ function portal() {
       customGroups: [],
       groupOrder: ["__ungrouped__"],
       groupEditor: {
-        open: false, id: "", name: "", color: "blue", saving: false,
+        open: false, id: "", name: "", color: "blue",
+        workspaceId: "", originalWorkspaceId: "", workspacePath: "",
+        workspaceDirty: false, owner: 0, saving: false,
       },
       moveMenu: { show: false, eventId: "", style: "" },
       dragEventId: "",
@@ -738,6 +743,7 @@ function portal() {
     _activityGroupPending: {},
     _activityGroupOrderSeq: 0,
     _activityGroupOrderQueue: null,
+    _activityGroupEditorSeq: 0,
     // Per-task "run-now" inflight flag — disables retry / send buttons until
     // activity SSE reports a terminal state. Keyed by task id.
     schedRunning: {},
@@ -780,6 +786,9 @@ function portal() {
     // active tab. Tabs can be opened from the session picker, closed via × on
     // the tab, or created by the "+ new" button.
     openTabIds: [],
+    _lastNewSessionAt: 0,
+    _lastNewSessionMeta: null,
+    NEW_SESSION_TOUCH_DEDUPE_MS: 500,
     sessionWorkspaces: [],
     activeWorkspace: "",
     workspaceMenuOpen: false,
@@ -1331,6 +1340,7 @@ function portal() {
         ev.preventDefault();
         ev.stopPropagation();
         if (top === "generic-modal" && this.modal.cancel) this.modal.cancel();
+        else if (top === "activity-move") this.closeActivityMoveMenu(true);
         else if (top === "scheduler") this.closeScheduler();
         else if (top === "session-todo") this.closeSessionTodoBoard();
         else if (top === "activity") this.closeActivityCenter();
@@ -1414,6 +1424,20 @@ function portal() {
       // We hijack Ctrl+T and Ctrl+W from the browser. The user is inside a
       // single-page web app — we own these. (Mobile Safari ignores them.)
       if ((ev.ctrlKey || ev.metaKey) && !ev.altKey) {
+        const shortcutTarget = ev.target || document.activeElement;
+        const shortcutTag = shortcutTarget && shortcutTarget.tagName;
+        const editingOnMobile = this._isMobileLayout() && (
+          shortcutTag === "INPUT"
+          || shortcutTag === "TEXTAREA"
+          || (shortcutTarget && shortcutTarget.isContentEditable)
+        );
+        if (editingOnMobile) {
+          // Mobile keyboards and remote-input bridges can briefly report a
+          // stuck Ctrl/Meta modifier during composition. Never create, close,
+          // or switch chat tabs while the user is editing text.
+          ev.preventDefault();
+          return;
+        }
         if (ev.key === "t" || ev.key === "T") {
           ev.preventDefault();
           this.newSession();
@@ -1448,7 +1472,6 @@ function portal() {
       }
       if (ev.key === "Escape") {
         if (this.memoryRecallPopover.show) { this.closeMemoryRecallPopover(); return; }
-        if (this.activity.moveMenu.show) { this.closeActivityMoveMenu(); return; }
         if (this.cheatSheet.show) { this.cheatSheet.show = false; return; }
         if (this.mentionShow) { this._cancelMentionLookup(); return; }
         if (this.ctxMenu.show) { this.ctxMenu.show = false; return; }
@@ -1504,7 +1527,12 @@ function portal() {
       this._registerFocusSurfaceWatchers();
       window.addEventListener("resize", () => {
         this._queueMemoryRecallPosition();
-        if (this.activity.moveMenu.show) this.closeActivityMoveMenu();
+        // A mobile sheet tracks the viewport in CSS and should survive browser
+        // chrome / keyboard resizes. Any menu carrying desktop anchor geometry
+        // must close before that inline position can become stale.
+        if (this.activity.moveMenu.show && this.activity.moveMenu.style) {
+          this.closeActivityMoveMenu(false);
+        }
       });
       // (Cross-tab queue sync via localStorage `storage` events was removed
       // when the queue moved server-side: there's one authoritative copy now,
@@ -1974,8 +2002,17 @@ function portal() {
     _initMobileKeyboardWatch() {
       const vv = window.visualViewport;
       if (vv) {
-        vv.addEventListener("resize", () => this._syncMobileKeyboardViewport());
-        vv.addEventListener("scroll", () => this._syncMobileKeyboardViewport());
+        const onVisualViewportChange = () => {
+          // Desktop menus are tied to a row rect and become stale as the visual
+          // viewport moves. Mobile menus are bottom sheets; keeping them open
+          // avoids an input blur / keyboard dismissal immediately undoing the tap.
+          if (this.activity.moveMenu.show && this.activity.moveMenu.style) {
+            this.closeActivityMoveMenu(false);
+          }
+          this._syncMobileKeyboardViewport();
+        };
+        vv.addEventListener("resize", onVisualViewportChange);
+        vv.addEventListener("scroll", onVisualViewportChange);
       }
       window.addEventListener("resize", () => {
         // A resize can flip the (pointer: coarse) / width breakpoints that
@@ -3966,6 +4003,7 @@ function portal() {
     async _loadAroundMessage(sid, uuid, retryAfterConflict = true) {
       const st = this.tabState && this.tabState[sid];
       if (!st || !uuid || st.streaming || st.es) return false;
+      const historyReplaceToken = this._beginHistoryReplace(st);
       const limit = this._historyWindowSize();
       const generation = st.messageRange.generation
         ? "&history_generation=" + encodeURIComponent(st.messageRange.generation) : "";
@@ -3983,12 +4021,16 @@ function portal() {
       }
       if (!r.ok) return false;
       const data = await r.json();
-      if (this.tabState[sid] !== st) return false;
+      if (this.tabState[sid] !== st
+          || !this._historyReplaceStillOwns(st, historyReplaceToken)) {
+        return false;
+      }
       const win = this._historyEnvelopes(sid, data.messages || []);
       for (const m of win) {
         if (m.role === "assistant" && m.text && !m.html) m.html = this._renderHistoryMessage(m);
       }
       if (!win.some(m => m.uuid === uuid)) return false;
+      if (!this._historyReplaceStillOwns(st, historyReplaceToken)) return false;
       st.messages.splice(0, st.messages.length, ...win);
       Object.assign(st.messageRange, {
         visibleStart: 0,
@@ -3999,6 +4041,8 @@ function portal() {
         generation: data.history_generation || st.messageRange.generation || "",
         order: data.history_order === "normal" ? "normal" : "full",
       });
+      st.atBottom = false;
+      this._enforceMessageRangeInvariant(st);
       // around_uuid replaces both the repository and its server coordinates.
       this._scheduleHistoryViewport(st, "around", uuid);
       st._hasMoreHistory = st.messageRange.offset > 0;
@@ -5905,6 +5949,9 @@ function portal() {
     _openFocusSurface(key, rootSelector, initialSelector = "", opener = null,
                       modal = false) {
       if (!key || !rootSelector) return;
+      if (modal && key !== "activity-move" && this.activity.moveMenu.show) {
+        this.closeActivityMoveMenu(false);
+      }
       const owner = opener || document.activeElement;
       this._focusSurfaceState[key] = {
         owner: owner && typeof owner.focus === "function" ? owner : null,
@@ -6085,6 +6132,19 @@ function portal() {
     },
 
     // ===== prefs =====
+    _normalizeOpenTabIds(ids, validIds = null) {
+      const allowed = validIds instanceof Set
+        ? validIds
+        : (validIds ? new Set(validIds) : null);
+      const seen = new Set();
+      return (Array.isArray(ids) ? ids : []).filter(id => {
+        if (typeof id !== "string" || !id || seen.has(id)) return false;
+        if (allowed && !allowed.has(id)) return false;
+        seen.add(id);
+        return true;
+      });
+    },
+
     savePrefs() {
       // Preview-pane state (tabs, selected) persists too so a refresh restores
       // the exact files the user was looking at — matches the chat-tab strip's
@@ -6094,7 +6154,7 @@ function portal() {
         model: this.model, defaultModel: this.defaultModel,
         permission: this.permission, defaultPermission: this.defaultPermission,
         currentId: this.currentId,
-        openTabIds: this.openTabIds,
+        openTabIds: this._normalizeOpenTabIds(this.openTabIds),
         previewTabs: this.tabs.map(t => this._previewTabSnapshot(t)),
         previewSelected: this.selected,
         previewSurface: this.previewSurface,
@@ -6181,7 +6241,9 @@ function portal() {
         else if (typeof p.rightWidth === "number") this.previewWidth = p.rightWidth;
         if (typeof p.showHidden === "boolean") this.showHidden = p.showHidden;
         if (p.currentId) this.currentId = p.currentId;
-        if (Array.isArray(p.openTabIds)) this.openTabIds = p.openTabIds;
+        if (Array.isArray(p.openTabIds)) {
+          this.openTabIds = this._normalizeOpenTabIds(p.openTabIds);
+        }
         // Preview tabs — restore the strip; the actual content fetch happens
         // lazily when the user clicks back to one (or via restorePreviewSelected
         // which runs once after login).
@@ -7374,6 +7436,10 @@ function portal() {
         },
         messagesReady: true,
         messagesLoading: false,
+        // Visual ownership for a foreground transcript transition. Canonical
+        // response ownership remains separate in _historyReplaceOwner/_historyEpoch.
+        transcriptLoadGeneration: 0,
+        transcriptLoadPhase: "idle",
         runtimeUiRevision: "",
         // Monotonic per-tab sequence for optimistic/live messages. Historical
         // envelopes use transcript identity; live keys never depend on array index.
@@ -7576,6 +7642,12 @@ function portal() {
         // Single-flight guards for older/newer server windows.
         _fetchingOlder: false,
         _fetchingLater: false,
+        // History responses may complete out of order on the same tab. Replacing
+        // requests advance the epoch so older/later page responses cannot write
+        // stale coordinates into a newer canonical repository.
+        _historyRequestSeq: 0,
+        _historyReplaceOwner: 0,
+        _historyEpoch: 0,
       };
     },
     _ensureTabState(id) {
@@ -7611,8 +7683,18 @@ function portal() {
       if (typeof range.generation !== "string") range.generation = "";
       if (st.messagesReady === undefined) st.messagesReady = true;
       if (st.messagesLoading === undefined) st.messagesLoading = false;
+      if (!Number.isInteger(st.transcriptLoadGeneration)) {
+        st.transcriptLoadGeneration = 0;
+      }
+      if (!["idle", "fetching", "mounting", "settling", "error"]
+          .includes(st.transcriptLoadPhase)) {
+        st.transcriptLoadPhase = "idle";
+      }
       if (st.runtimeUiRevision === undefined) st.runtimeUiRevision = "";
       if (st._fetchingLater === undefined) st._fetchingLater = false;
+      if (!Number.isInteger(st._historyRequestSeq)) st._historyRequestSeq = 0;
+      if (!Number.isInteger(st._historyReplaceOwner)) st._historyReplaceOwner = 0;
+      if (!Number.isInteger(st._historyEpoch)) st._historyEpoch = 0;
       if (!Number.isInteger(st._nextLiveKey)) st._nextLiveKey = 1;
       if (!Number.isInteger(st._virtualStart)) st._virtualStart = -1;
       if (!Number.isInteger(st._virtualEnd)) st._virtualEnd = -1;
@@ -7733,6 +7815,17 @@ function portal() {
       const st = sid && this.tabState[sid];
       if (!st || !reason) return Promise.resolve(false);
       const sync = st.sessionSync;
+      const historyLoadKey = reason === "history_load"
+        ? JSON.stringify({
+            full: !!options.loadOptions?.full,
+            quiet: !!options.loadOptions?.quiet,
+            probeActive: options.loadOptions?.probeActive,
+          })
+        : "";
+      if (reason === "history_load" && sync.inFlight?.reason === reason
+          && sync.inFlight.historyLoadKey === historyLoadKey) {
+        return new Promise(resolve => sync.inFlight.waiters.push(resolve));
+      }
       const delayMs = Math.max(0, Number(options.delayMs) || 0);
       const dueAt = Date.now() + delayMs;
       return new Promise(resolve => {
@@ -7845,7 +7938,21 @@ function portal() {
         }, deadlineMs);
       });
       const task = Promise.race([operation, cancelled, deadline]);
-      sync.inFlight = { reason: request.reason, task, controller, epoch };
+      const historyLoadKey = request.reason === "history_load"
+        ? JSON.stringify({
+            full: !!request.options.loadOptions?.full,
+            quiet: !!request.options.loadOptions?.quiet,
+            probeActive: request.options.loadOptions?.probeActive,
+          })
+        : "";
+      sync.inFlight = {
+        reason: request.reason,
+        task,
+        controller,
+        epoch,
+        historyLoadKey,
+        waiters: request.waiters,
+      };
       let result = false;
       try { result = await task; }
       catch (_) { result = false; }
@@ -8052,7 +8159,9 @@ function portal() {
                  && window.matchMedia("(pointer: coarse) and (max-height: 500px)").matches);
     },
     setMobileTab(next) {
-      if (!["files", "preview", "chat"].includes(next) || next === this.mobileTab) return;
+      if (!["files", "preview", "chat"].includes(next)) return;
+      if (this.activity.moveMenu.show) this.closeActivityMoveMenu();
+      if (next === this.mobileTab) return;
       const previous = this.mobileTab;
       if ((previous === "preview" && next !== "preview")
           || (previous === "chat" && next !== "chat"
@@ -9513,6 +9622,98 @@ function portal() {
     activeSessionPane() {
       return this.paneState(this.currentId) || _EMPTY_ACTIVE_SESSION_PANE;
     },
+    transcriptLoadingVisible() {
+      const st = this.activeSessionPane();
+      if (!this._sessionsInitialized && this.appReady && this.token) return true;
+      if (st?.transcriptLoadPhase === "error") return false;
+      return !!st && (
+        ["fetching", "mounting", "settling"].includes(st.transcriptLoadPhase)
+        || st.messagesLoading === true
+        || (st.messagesReady === false
+          && Array.isArray(st.messages) && st.messages.length > 0)
+      );
+    },
+    transcriptLoadFailed() {
+      const st = this.activeSessionPane();
+      return !!st && st.transcriptLoadPhase === "error";
+    },
+    transcriptEmptyReady() {
+      const st = this.activeSessionPane();
+      return !!st
+        && st._loaded === true
+        && st.messagesReady === true
+        && st.messagesLoading === false
+        && st.transcriptLoadPhase === "idle"
+        && Array.isArray(st.messages)
+        && !st.messages.length;
+    },
+    _beginTranscriptLoad(sid, st, phase = "fetching") {
+      if (!sid || !st || this.tabState[sid] !== st || st._sid !== sid) return null;
+      if ((st.streaming || st.es) && phase !== "mounting") return null;
+      st.transcriptLoadGeneration =
+        (Number(st.transcriptLoadGeneration) || 0) + 1;
+      st.transcriptLoadPhase = phase === "mounting" ? "mounting" : "fetching";
+      return { sid, state: st, generation: st.transcriptLoadGeneration };
+    },
+    _ownsTranscriptLoad(token) {
+      return !!token
+        && this.tabState[token.sid] === token.state
+        && token.state._sid === token.sid
+        && token.state.transcriptLoadGeneration === token.generation;
+    },
+    async _settleTranscriptLoad(token, options = {}) {
+      if (!this._ownsTranscriptLoad(token)) return false;
+      token.state.transcriptLoadPhase = "settling";
+      try {
+        if (!options.skipNextTick) {
+          await new Promise(resolve => this.$nextTick(resolve));
+          if (!this._ownsTranscriptLoad(token)) return false;
+        }
+        if (this.currentId === token.sid && options.returnToLatest !== false) {
+          const latest = await this.returnToLatest(token.sid);
+          if (!latest) throw new Error("transcript tail unavailable");
+          if (!this._ownsTranscriptLoad(token)) return false;
+        }
+        if (this.currentId === token.sid) {
+          if (options.singlePaint && typeof requestAnimationFrame === "function") {
+            await new Promise(resolve => requestAnimationFrame(resolve));
+          } else {
+            await new Promise(resolve => this._afterPaint(resolve));
+          }
+          if (!this._ownsTranscriptLoad(token)) return false;
+        }
+        token.state.transcriptLoadPhase = "idle";
+        return true;
+      } catch (_) {
+        this._failTranscriptLoad(token);
+        return false;
+      }
+    },
+    _failTranscriptLoad(token) {
+      if (!this._ownsTranscriptLoad(token)) return false;
+      // The phase is the visual transaction authority. Clear the legacy loading
+      // gates too so an overlapping history attempt cannot leave the opaque
+      // shield above the resident-content error banner.
+      token.state.messagesLoading = false;
+      token.state.messagesReady = true;
+      token.state.transcriptLoadPhase = "error";
+      return true;
+    },
+    _releaseTranscriptLoadForLive(st) {
+      if (!st) return;
+      st.transcriptLoadGeneration =
+        (Number(st.transcriptLoadGeneration) || 0) + 1;
+      st.transcriptLoadPhase = "idle";
+    },
+    async retryTranscriptLoad() {
+      const sid = this.currentId;
+      const st = sid && this.tabState[sid];
+      if (!sid || !st || st.streaming || st.es
+          || ["fetching", "mounting", "settling"]
+            .includes(st.transcriptLoadPhase)) return false;
+      if (!st.messages.length) st._loaded = false;
+      return await this._ensureSessionLoaded(sid);
+    },
     _setActiveSessionPaneField(field, value) {
       const st = this.paneState(this.currentId);
       if (st) st[field] = value;
@@ -9665,18 +9866,9 @@ function portal() {
       void forceTail;
     },
     _scheduleMessageViewportSync(tid = this.currentId, forceTail = false) {
-      const st = tid && this.tabState && this.tabState[tid];
-      if (!st) return;
-      st._virtualForceTail = st._virtualForceTail || forceTail;
-      if (st._virtualSyncFrame) return;
-      const run = () => {
-        st._virtualSyncFrame = 0;
-        const shouldForceTail = st._virtualForceTail;
-        st._virtualForceTail = false;
-        this._syncMessageViewport(tid, shouldForceTail);
-      };
-      st._virtualSyncFrame = typeof requestAnimationFrame === "function"
-        ? requestAnimationFrame(run) : setTimeout(run, 0);
+      // Exact-height messageRange windows need no estimated spacer maintenance.
+      void tid;
+      void forceTail;
     },
     _shiftMessageVirtualWindow(st, delta) {
       if (!st || !delta || st._virtualStart < 0) return;
@@ -9733,7 +9925,7 @@ function portal() {
       // the server: drop tabs whose session was deleted, then ensure currentId
       // is in the list. Other tabs are lazy-loaded on first switch.
       const validIds = new Set(this.sessions.map(s => s.id));
-      this.openTabIds = (this.openTabIds || []).filter(id => validIds.has(id));
+      this.openTabIds = this._normalizeOpenTabIds(this.openTabIds, validIds);
       if (!this.openTabIds.includes(this.currentId)) {
         this.openTabIds.push(this.currentId);
       }
@@ -10833,7 +11025,7 @@ function portal() {
       const cwd = path || this.currentWorkspacePath();
       const primary = (this.sessionWorkspaces.find(w => w.primary) || {}).path || "";
       const byId = new Map(this.sessions.map(s => [s.id, s]));
-      return (this.openTabIds || []).filter(id => {
+      return this._normalizeOpenTabIds(this.openTabIds).filter(id => {
         const session = byId.get(id);
         return session && (session.cwd || primary) === cwd;
       });
@@ -11462,6 +11654,27 @@ function portal() {
       return ok || !this._optimisticMetas[id];
     },
     newSession(options = {}) {
+      // A touch target can occasionally dispatch two clicks while the mobile
+      // viewport is settling around the software keyboard. Coalesce only a
+      // second, immediately repeated request for the same still-empty tab;
+      // once the user has typed or the first window has elapsed, a deliberate
+      // new-tab action creates a fresh session normally.
+      const interactionNow = performance.now();
+      const requestedCwd = options.cwd || this.currentWorkspacePath();
+      const recentMeta = this._lastNewSessionMeta;
+      const recentState = recentMeta && this.tabState[recentMeta.id];
+      const recentDraft = recentState && recentState.draft
+        ? String(recentState.draft.input || "") : "";
+      if (this._isMobileLayout()
+          && recentMeta
+          && this.currentId === recentMeta.id
+          && (recentMeta.cwd || "") === (requestedCwd || "")
+          && interactionNow - this._lastNewSessionAt
+            < this.NEW_SESSION_TOUCH_DEDUPE_MS
+          && (!recentState || !recentState.messages.length)
+          && !recentDraft) {
+        return recentMeta;
+      }
       // No longer stops streams in OTHER tabs — each tab has its own ES in
       // tabState[id].es. The new session starts fresh in its own tab.
       // Default name uses the user's BROWSER-LOCAL clock — the backend
@@ -11490,7 +11703,7 @@ function portal() {
       // old session you were just viewing). Fall back to this.model only when
       // the default isn't known yet (very first load before /providers lands).
       const seedModel = this.defaultModel || this.model || "";
-      const seedCwd = options.cwd || this.currentWorkspacePath();
+      const seedCwd = requestedCwd;
       // Reflect it in the dropdown immediately — _activateTabState doesn't touch
       // this.model, so without this the selector would still show the old
       // session's model even though the new session is seeded with the default.
@@ -11526,12 +11739,17 @@ function portal() {
       }
       const st = this._ensureTabState(id);
       st.messages.length = 0;
+      st.messagesReady = true;
+      st.messagesLoading = false;
+      st.transcriptLoadPhase = "idle";
       st._loaded = true;
       st.permission = meta.permission;
       st.effort = meta.effort;
       st.serviceTier = meta.service_tier;
       this._activateTabState(id);
       if (!this.openTabIds.includes(id)) this.openTabIds.push(id);
+      this._lastNewSessionAt = interactionNow;
+      this._lastNewSessionMeta = meta;
       this._touchTranscriptPane(id);
       if (this._isMobileLayout()) this.setMobileTab("chat");
       this.savePrefs();
@@ -13562,7 +13780,7 @@ function portal() {
         this._ensureNonEmptyMessageRange(st);
         st.messagesReady = true;
         this._touchTranscriptPane(tid);
-        this.$nextTick(() => this.scrollToBottom(true));
+        await this.returnToLatest(tid);
         return;
       }
       await this.openTab(tid);
@@ -14082,6 +14300,7 @@ function portal() {
     },
     toggleHistoryPicker(ev) {
       if (this.sessionPickerOpen) { this.closeHistoryPicker(); return; }
+      if (this.activity.moveMenu.show) this.closeActivityMoveMenu();
       const btn = ev && ev.currentTarget;
       const rect = btn ? btn.getBoundingClientRect() : null;
       if (rect) {
@@ -14578,7 +14797,7 @@ function portal() {
       // while staying inside the same active tab; every explicit tab selection
       // re-engages tail follow before loading/remounting the pane.
       const selectedState = this._ensureTabState(this.currentId);
-      selectedState.atBottom = true;
+      this._enforceMessageRangeInvariant(selectedState);
       this.ackCurrentActivity();
       this.savePrefs();
       // Sync the model + permission + effort dropdowns to THIS session's persisted
@@ -14634,11 +14853,10 @@ function portal() {
         if (loadedButBehindCanonical) st._pendingExternalUpdate = true;
         const target = this.currentId;
         await this._ensureSessionLoaded(target);
-        if (this.currentId === target) this.scrollToBottom(true);
       } else {
         const target = this.currentId;
         const stCur = this.tabState && this.tabState[target];
-        stCur.atBottom = true;
+        this._enforceMessageRangeInvariant(stCur);
         if (paneWasWarm) {
           // Warm pane: x-show reveals the existing keyed DOM. Do not flash a
           // skeleton, rebuild directives, or rescan already-highlighted content.
@@ -14646,36 +14864,53 @@ function portal() {
           this.$nextTick(() => {
             if (this.currentId !== target || this.tabState[target] !== stCur) return;
             // This callback runs after x-show has exposed the warm target pane.
-            // Position only this switch path immediately; changing the global
-            // scrollToBottom(force) ordering also affected cold page refreshes.
-            stCur.atBottom = true;
-            this._syncMessageViewport(target, true);
-            this._scrollChatTailNow(target, stCur);
-            this._settleScrollToBottom();
+            // Explicit selection means latest: acquire the logical tail before
+            // any physical scroll so a middle DOM window cannot masquerade as it.
+            void this.returnToLatest(target);
           });
         } else {
-          // Cold LRU miss: the pane is being reconstructed from normalized state.
-          // Paint the tab selection first, then reveal/highlight this new DOM once.
+          // Cold LRU miss: canonical data is resident, but Alpine must reconstruct
+          // the keyed pane. Keep an opaque visual transaction over that mount and
+          // tail-positioning window so partially-created rows never flash.
+          const mountToken = this._beginTranscriptLoad(target, stCur, "mounting");
           stCur.messagesReady = false;
           this.$nextTick(() => {
-            if (this.currentId !== target) return;
+            if (this.tabState[target] !== stCur) return;
+            if (this.currentId !== target) {
+              void this._settleTranscriptLoad(
+                mountToken, { returnToLatest: false });
+              return;
+            }
             stCur.messagesReady = true;
-            // Alpine applies the reveal before this callback, while the browser has
-            // not painted it yet. Position the shared scroller now; highlighting is
-            // post-paint work and must not delay or precede the tail jump.
-            this.$nextTick(() => {
-              if (this.currentId !== target || this.tabState[target] !== stCur) return;
-              stCur.atBottom = true;
-              this._syncMessageViewport(target, true);
-              this._scrollChatTailNow(target, stCur);
-              this._settleScrollToBottom();
-              this._afterPaint(() => {
-                if (this.currentId !== target) return;
-                stCur._highlighted = false;
-                const pane = this._paneElement(target);
-                this.highlightCode(".chat-body", pane ? [pane] : null);
-                stCur._highlighted = true;
-              });
+            this.$nextTick(async () => {
+              if (this.tabState[target] !== stCur) return;
+              if (this.currentId !== target) {
+                await this._settleTranscriptLoad(
+                  mountToken, { returnToLatest: false });
+                return;
+              }
+              try {
+                const latest = await this.returnToLatest(target);
+                if (!latest) {
+                  this._failTranscriptLoad(mountToken);
+                  return;
+                }
+                const settled = await this._settleTranscriptLoad(mountToken, {
+                  returnToLatest: false,
+                  skipNextTick: true,
+                  singlePaint: true,
+                });
+                if (!settled) return;
+                this._afterPaint(() => {
+                  if (this.currentId !== target || this.tabState[target] !== stCur) return;
+                  stCur._highlighted = false;
+                  const pane = this._paneElement(target);
+                  this.highlightCode(".chat-body", pane ? [pane] : null);
+                  stCur._highlighted = true;
+                });
+              } catch (_) {
+                this._failTranscriptLoad(mountToken);
+              }
             });
           });
         }
@@ -14907,15 +15142,42 @@ function portal() {
       const st = this._ensureTabState(sid);
       const meta = (this.sessions || []).find(session => session.id === sid);
       const canonicalBehind = this._canonicalMetaBehind(st, meta);
-      if (st._loaded && !canonicalBehind) return true;
+      if (st._loaded && !canonicalBehind) {
+        if (st.transcriptLoadPhase === "error") st.transcriptLoadPhase = "idle";
+        return true;
+      }
       if (canonicalBehind) st._pendingExternalUpdate = true;
-      // A workspace can have a warm tab whose transcript predates the scoped
-      // session row we just fetched. Refresh it off-screen while the tree is
-      // loading; quiet mode also keeps an already-visible pane intact when
-      // this helper is reused by another reconciliation path.
-      return await this._reloadSessionCoalesced(
-        sid, canonicalBehind ? { quiet: true } : {},
-      );
+      // A known-good resident transcript adopts newer canonical state quietly.
+      // Empty/unloaded panes need an opaque foreground transition instead: begin
+      // it synchronously, before the session-sync coordinator's setTimeout, so
+      // Alpine never gets a frame in which the new currentId looks like a new chat.
+      const canonicalLoadOptions = canonicalBehind ? { quiet: true } : {};
+      const quiet = canonicalBehind && st._loaded && st.messages.length > 0;
+      const token = sid === this.currentId && !quiet && !st.streaming && !st.es
+        ? this._beginTranscriptLoad(sid, st, "fetching") : null;
+      let loaded = false;
+      try {
+        loaded = await this._reloadSessionCoalesced(
+          sid, quiet ? canonicalLoadOptions : {},
+        );
+      } catch (_) {
+        loaded = false;
+      }
+      if (!token) {
+        if (loaded && st.transcriptLoadPhase === "error") {
+          st.transcriptLoadPhase = "idle";
+        }
+        if (loaded && quiet && sid === this.currentId) {
+          try { return await this.returnToLatest(sid); }
+          catch (_) { return false; }
+        }
+        return !!loaded;
+      }
+      if (loaded && st._loaded && this._ownsTranscriptLoad(token)) {
+        return await this._settleTranscriptLoad(token);
+      }
+      this._failTranscriptLoad(token);
+      return false;
     },
 
     async loadSession(sid, opts = {}) {
@@ -14953,6 +15215,9 @@ function portal() {
       // Return false so full-history/outline callers know the requested load was
       // deferred instead of recursively treating it as completed.
       if (st.streaming || st.es) return false;
+      const historyReplaceToken = this._beginHistoryReplace(st);
+      const quietRangeSnapshot = quiet
+        ? this._captureMessageRangeSnapshot(st) : null;
       // Skeleton on the active tab during the fetch — markdown rendering of
       // a long history can also take a noticeable beat after the network
       // returns, so the flag must wrap both phases.
@@ -15045,7 +15310,10 @@ function portal() {
         const parsedSession = await r.json();
         historyPerf.parse_ms = Math.round(perfNow() - parseStarted);
         const s = this._retainExpectedSessionSettings(parsedSession);
-        if (this.tabState[sid] !== st) return false;
+        if (this.tabState[sid] !== st
+            || !this._historyReplaceStillOwns(st, historyReplaceToken)) {
+          return false;
+        }
         if (st.streaming || st.es) return false;
         const loadedRuntimeUiRevision = String(s.runtime_ui_revision || "");
         const currentRuntimeUiRevision = String(st.runtimeUiRevision || "");
@@ -15128,7 +15396,10 @@ function portal() {
         // The tab may have been disposed/recreated, or a stream may have claimed
         // this state while markdown rendering yielded. Never write into a stale
         // generation or replace an active owner's message array.
-        if (this.tabState[sid] !== st || st.streaming || st.es) return false;
+        if (this.tabState[sid] !== st || st.streaming || st.es
+            || !this._historyReplaceStillOwns(st, historyReplaceToken)) {
+          return false;
+        }
         // Replace the one repository in place. Quiet reconciliation preserves
         // matching message object identity; cold reveal changes only range coords.
         if (st.streaming || st.es) return false;
@@ -15140,28 +15411,32 @@ function portal() {
         // rebase after it, so Alpine never paints one frame with invalid indices.
         const virtualWindowBeforeInstall = quiet
           ? this._captureMessageVirtualWindow(st) : null;
-        const followTailAtInstall = quiet && st.atBottom !== false;
-        const quietRangeBeforeInstall = quiet ? {
-          start: Math.max(0, Number(st.messageRange.visibleStart) || 0),
-          end: Math.max(0, Number(st.messageRange.visibleEnd) || 0),
-        } : null;
+        const followTailAtInstall = quiet && (
+          opts.followTail === true || !!(quietRangeSnapshot && quietRangeSnapshot.followTail)
+        );
+        const quietRangeResolved = quiet
+          ? (followTailAtInstall
+            ? {
+              start: Math.max(0, all.length - this._liveMessageDomCap()),
+              end: all.length,
+            }
+            : this._resolveMessageRangeSnapshot(all, quietRangeSnapshot))
+          : null;
+        // A quiet response that no longer contains the reader's stable message
+        // anchor belongs to another coordinate system (for example full/around vs
+        // normal tail), or was superseded by newer navigation. Preserve the current
+        // repository and expose the jump-to-latest affordance instead of silently
+        // applying old numeric indices to unrelated messages.
+        if (quiet && !quietRangeResolved) {
+          st.atBottom = false;
+          return false;
+        }
         const installStarted = perfNow();
         // Cold loads start from an empty coordinate and reveal the newest rows in
-        // small batches. Quiet reconciliation is different: matching objects and
-        // keys already own live DOM nodes, so collapsing the range to zero and
-        // replaying every row only forces Alpine to reconcile the growing list over
-        // dozens of frames. Preserve its established range and let one keyed patch
-        // mount only genuinely new/changed rows.
-        const quietStart = quietRangeBeforeInstall
-          ? Math.min(quietRangeBeforeInstall.start, all.length) : startIdx;
-        const quietEnd = quietRangeBeforeInstall
-          ? (followTailAtInstall
-            ? all.length
-            : Math.min(
-              all.length,
-              Math.max(quietStart, quietRangeBeforeInstall.end),
-            ))
-          : startIdx;
+        // small batches. Quiet reconciliation uses stable identities so inserts or
+        // order changes before the visible rows cannot retarget the mounted window.
+        const quietStart = quietRangeResolved ? quietRangeResolved.start : startIdx;
+        const quietEnd = quietRangeResolved ? quietRangeResolved.end : startIdx;
         st.messageRange.visibleStart = quiet ? quietStart : startIdx;
         st.messageRange.visibleEnd = quiet ? quietEnd : startIdx;
         st.messages.splice(0, st.messages.length, ...all);
@@ -15174,13 +15449,18 @@ function portal() {
           order: (s.history_order === "full" || full) ? "full" : "normal",
           generation: s.history_generation || "",
         });
+        if (quiet) st.atBottom = followTailAtInstall;
+        this._enforceMessageRangeInvariant(st);
         if (quiet) {
           await new Promise(resolve => this.$nextTick(resolve));
         } else {
           await this._revealMessagesChunked(sid, st, visible, true);
         }
         historyPerf.install_ms = Math.round(perfNow() - installStarted);
-        if (this.tabState[sid] !== st || st.streaming || st.es) return false;
+        if (this.tabState[sid] !== st || st.streaming || st.es
+            || !this._historyReplaceStillOwns(st, historyReplaceToken)) {
+          return false;
+        }
         if (quiet) {
           this._rebaseMessageVirtualWindow(
             st, virtualWindowBeforeInstall, followTailAtInstall);
@@ -15654,6 +15934,28 @@ function portal() {
     _historyStoreKey(sid, m) {
       return m && m.block_id ? sid + ":" + m.block_id : "";
     },
+    _normalizeTaskStatusPreview(status) {
+      if (!status || typeof status !== "object") return status;
+      const raw = String(status.summary || "");
+      const cap = 2000;
+      const codePoints = Array.from(raw);
+      const receivedLength = codePoints.length;
+      const declaredLength = Number(status.summary_length);
+      const summaryLength = Math.max(
+        receivedLength, Number.isFinite(declaredLength) ? declaredLength : 0);
+      const previewPoints = codePoints.slice(0, cap);
+      const summary = previewPoints.join("");
+      const declaredTruncated = typeof status.summary_truncated === "string"
+        ? ["1", "true", "yes", "on"].includes(
+          status.summary_truncated.trim().toLowerCase())
+        : !!status.summary_truncated;
+      return {
+        ...status,
+        summary,
+        summary_length: summaryLength,
+        summary_truncated: declaredTruncated || summaryLength > previewPoints.length,
+      };
+    },
     _historyEnvelopes(sid, list) {
       const source = list || [];
       const renderKeys = source.map(m => this._historyMessageKey(sid, m));
@@ -15669,7 +15971,11 @@ function portal() {
         }
         uniqueKeys.add(key);
       }
-      return source.map((m, index) => {
+      return source.map((sourceMessage, index) => {
+        const m = sourceMessage && sourceMessage.task_status
+          ? { ...sourceMessage,
+              task_status: this._normalizeTaskStatusPreview(sourceMessage.task_status) }
+          : sourceMessage;
         const renderKey = renderKeys[index];
         const storeKey = this._historyStoreKey(sid, m);
         if (!storeKey) return { ...m, _k: renderKey };
@@ -15905,13 +16211,15 @@ function portal() {
       }
       this._assignLiveKey(st, m);
       const tailWasVisible = st.messageRange.visibleEnd === st.messages.length;
+      const followTail = tailWasVisible && st.atBottom !== false;
       st.messages.push(m);
       st.messageRange.total = Math.max(
         st.messageRange.total + 1, st.messageRange.offset + st.messages.length);
-      // New live output follows the reader only when the tail was already visible.
-      if (tailWasVisible) st.messageRange.visibleEnd = st.messages.length;
-      this._scheduleHistoryViewport(st, tailWasVisible ? "newer" : "older");
-      this._syncNormalizedHistory(st);
+      // Reader-owned history stays frozen while live output continues. When the
+      // reader follows the tail, move a fixed exact-height window instead of
+      // allowing one long turn to mount every tool/task row indefinitely.
+      if (followTail) this._boundLiveMessageRange(st, true);
+      this._scheduleHistoryViewport(st, followTail ? "newer" : "older");
       // Alpine wraps array entries lazily. Return the entry read back through the
       // reactive array, not the raw object that was pushed, so streaming text,
       // completion metadata and optimistic rollback mutations repaint immediately.
@@ -15921,6 +16229,18 @@ function portal() {
     // Phones use a smaller explicit page because parsing and installing 100 rich
     // tool/Markdown blocks can monopolize their main thread. Desktop keeps 100.
     _historyWindowSize() { return this._isMobileLayout() ? 20 : 100; },
+    _liveMessageDomCap() { return this._isMobileLayout() ? 40 : 100; },
+    _liveMessageHistoryStep() { return Math.max(1, Math.floor(this._liveMessageDomCap() / 2)); },
+    _isLiveMessagePane(st) { return !!(st && (st.streaming || st.es)); },
+    _boundLiveMessageRange(st, followTail = false) {
+      if (!st || !st.messageRange || !Array.isArray(st.messages)) return;
+      const range = st.messageRange;
+      if (followTail) range.visibleEnd = st.messages.length;
+      range.visibleStart = Math.max(0, Math.min(range.visibleStart, range.visibleEnd));
+      if (range.visibleEnd - range.visibleStart > this._liveMessageDomCap()) {
+        range.visibleStart = range.visibleEnd - this._liveMessageDomCap();
+      }
+    },
     _historyReconcileWindowSize() { return 800; },
     _scheduleHistoryViewport(st, direction = "newer", anchorUuid = "") {
       if (!st) return;
@@ -15940,6 +16260,114 @@ function portal() {
     },
     _syncNormalizedHistory(st) {
       if (st) this._syncSessionMessageStore(st);
+    },
+    _historyMessageIdentity(message) {
+      if (!message) return "";
+      if (message.uuid) return "uuid:" + String(message.uuid);
+      if (message._k) return "key:" + String(message._k);
+      return "";
+    },
+    _historyMessageIndex(messages, identity) {
+      if (!identity || !Array.isArray(messages)) return -1;
+      return messages.findIndex(
+        message => this._historyMessageIdentity(message) === identity,
+      );
+    },
+    _captureMessageRangeSnapshot(st) {
+      if (!st || !st.messageRange || !Array.isArray(st.messages)) return null;
+      const range = st.messageRange;
+      const start = Math.max(0, Math.min(range.visibleStart, st.messages.length));
+      const end = Math.max(start, Math.min(range.visibleEnd, st.messages.length));
+      return {
+        followTail: st.atBottom !== false && !this._messageRangeHasLater(st),
+        startIdentity: this._historyMessageIdentity(st.messages[start]),
+        endIdentity: this._historyMessageIdentity(st.messages[end - 1]),
+        visibleCount: Math.max(0, end - start),
+        order: range.order,
+        generation: range.generation,
+      };
+    },
+    _resolveMessageRangeSnapshot(messages, snapshot) {
+      if (!snapshot) return null;
+      if (snapshot.followTail) {
+        const end = messages.length;
+        return {
+          start: Math.max(0, end - this._liveMessageDomCap()),
+          end,
+        };
+      }
+      const count = Math.max(1, Number(snapshot.visibleCount) || 1);
+      const startIndex = this._historyMessageIndex(messages, snapshot.startIdentity);
+      const endIndex = this._historyMessageIndex(messages, snapshot.endIdentity);
+      if (startIndex >= 0 && endIndex >= startIndex) {
+        return { start: startIndex, end: endIndex + 1 };
+      }
+      if (startIndex >= 0) {
+        return { start: startIndex, end: Math.min(messages.length, startIndex + count) };
+      }
+      if (endIndex >= 0) {
+        return { start: Math.max(0, endIndex - count + 1), end: endIndex + 1 };
+      }
+      return null;
+    },
+    _beginHistoryReplace(st) {
+      const seq = (Number(st && st._historyRequestSeq) || 0) + 1;
+      st._historyRequestSeq = seq;
+      st._historyReplaceOwner = seq;
+      st._historyEpoch = (Number(st._historyEpoch) || 0) + 1;
+      return { seq, epoch: st._historyEpoch };
+    },
+    _historyReplaceStillOwns(st, token) {
+      return !!(st && token
+        && st._historyReplaceOwner === token.seq
+        && st._historyEpoch === token.epoch);
+    },
+    _captureHistoryPageToken(st) {
+      const range = st.messageRange;
+      return {
+        epoch: st._historyEpoch,
+        generation: range.generation,
+        order: range.order,
+        offset: range.offset,
+        headIdentity: this._historyMessageIdentity(st.messages[0]),
+        tailIdentity: this._historyMessageIdentity(st.messages[st.messages.length - 1]),
+      };
+    },
+    _historyPageStillOwns(st, token) {
+      if (!st || !token || st._historyEpoch !== token.epoch) return false;
+      const range = st.messageRange;
+      return range.generation === token.generation
+        && range.order === token.order
+        && range.offset === token.offset
+        && this._historyMessageIdentity(st.messages[0]) === token.headIdentity
+        && this._historyMessageIdentity(st.messages[st.messages.length - 1])
+          === token.tailIdentity;
+    },
+    _messageRangeHasLater(st) {
+      if (!st || !st.messageRange || !Array.isArray(st.messages)) return false;
+      const range = st.messageRange;
+      return range.visibleEnd < st.messages.length
+        || range.offset + st.messages.length < range.total;
+    },
+    _enforceMessageRangeInvariant(st) {
+      if (!st || !st.messageRange || !Array.isArray(st.messages)) return;
+      const range = st.messageRange;
+      range.visibleStart = Math.max(
+        0, Math.min(Number(range.visibleStart) || 0, st.messages.length));
+      range.visibleEnd = Math.max(
+        range.visibleStart,
+        Math.min(Number(range.visibleEnd) || 0, st.messages.length),
+      );
+      range.offset = Math.max(0, Number(range.offset) || 0);
+      range.total = Math.max(
+        Number(range.total) || 0,
+        range.offset + st.messages.length,
+      );
+      if (this._messageRangeHasLater(st)) st.atBottom = false;
+    },
+    isAwayFromLatest(sid) {
+      const st = this.tabState[sid || this.currentId];
+      return !!(st && (st.atBottom === false || this._messageRangeHasLater(st)));
     },
     _captureViewportMessageAnchor(scrollEl, sid) {
       if (!scrollEl || !sid) return null;
@@ -16060,6 +16488,7 @@ function portal() {
       if (st._fetchingOlder || !(range.offset > 0)) return 0;
       const pageSize = Math.min(this._historyWindowSize(), range.offset);
       const newOffset = range.offset - pageSize;
+      const pageToken = this._captureHistoryPageToken(st);
       st._fetchingOlder = true;
       st._historyHydrationError = false;
       try {
@@ -16079,7 +16508,8 @@ function portal() {
           return 0;
         }
         const data = await r.json();
-        if (this.tabState[sid] !== st) return 0;
+        if (this.tabState[sid] !== st
+            || !this._historyPageStillOwns(st, pageToken)) return 0;
         const win = this._historyEnvelopes(sid, data.messages || []);
         st.messages.unshift(...win);
         range.visibleStart += win.length;
@@ -16089,6 +16519,7 @@ function portal() {
         if (Number.isInteger(data.pre_total)) range.preTotal = data.pre_total;
         range.generation = data.history_generation || range.generation || "";
         range.order = data.history_order === "full" ? "full" : "normal";
+        this._enforceMessageRangeInvariant(st);
         this._syncNormalizedHistory(st);
         st._hasMoreHistory = range.visibleStart > 0 || range.offset > 0;
         return win.length;
@@ -16108,6 +16539,7 @@ function portal() {
       const start = range.offset + st.messages.length;
       if (start >= range.total) return 0;
       const limit = Math.min(this._historyWindowSize(), range.total - start);
+      const pageToken = this._captureHistoryPageToken(st);
       st._fetchingLater = true;
       try {
         const generation = range.generation
@@ -16123,13 +16555,15 @@ function portal() {
         }
         if (!r.ok) return 0;
         const data = await r.json();
-        if (this.tabState[sid] !== st) return 0;
+        if (this.tabState[sid] !== st
+            || !this._historyPageStillOwns(st, pageToken)) return 0;
         const win = this._historyEnvelopes(sid, data.messages || []);
         st.messages.push(...win);
         if (Number.isInteger(data.total)) range.total = data.total;
         if (Number.isInteger(data.pre_total)) range.preTotal = data.pre_total;
         range.generation = data.history_generation || range.generation || "";
         range.order = data.history_order === "full" ? "full" : "normal";
+        this._enforceMessageRangeInvariant(st);
         this._syncNormalizedHistory(st);
         return win.length;
       } catch (_) {
@@ -16220,7 +16654,10 @@ function portal() {
           st._hasMoreHistory = range.offset > 0 || this._preCompactReachable(st);
           return;
         }
-        const batchSize = this._historyWindowSize();
+        const liveWindow = this._isLiveMessagePane(st);
+        const batchSize = liveWindow
+          ? this._liveMessageHistoryStep() : this._historyWindowSize();
+        const previousEnd = range.visibleEnd;
         const nextStart = Math.max(0, range.visibleStart - batchSize);
         const batch = st.messages.slice(nextStart, range.visibleStart);
         const RENDER_CHUNK = this._isMobileLayout() ? 4 : 16;
@@ -16244,6 +16681,10 @@ function portal() {
         const anchor = this._captureViewportMessageAnchor(scrollEl, sid);
         this._shiftMessageVirtualWindow(st, batch.length);
         range.visibleStart = nextStart;
+        if (liveWindow) {
+          range.visibleEnd = Math.min(
+            previousEnd, nextStart + this._liveMessageDomCap());
+        }
         this._scheduleHistoryViewport(st, "older");
         st._hasMoreHistory = range.visibleStart > 0 || range.offset > 0;
         if (scrollEl) {
@@ -16263,29 +16704,32 @@ function portal() {
       const st = sid && this.tabState[sid];
       if (!st) return false;
       const range = st.messageRange;
+      st.atBottom = false;
       if (range.offset + st.messages.length < range.total) {
-        const loaded = await this.loadSession(sid, { quiet: sid === this.currentId });
+        const loaded = await this.loadSession(sid, {
+          quiet: sid === this.currentId,
+          followTail: true,
+        });
         if (!loaded || this.tabState[sid] !== st) return false;
       } else {
-        const windowSize = this._historyWindowSize();
+        const windowSize = this._isLiveMessagePane(st)
+          ? this._liveMessageDomCap() : this._historyWindowSize();
         range.visibleEnd = st.messages.length;
         range.visibleStart = Math.max(0, range.visibleEnd - windowSize);
         this._scheduleHistoryViewport(st, "newer");
       }
+      this._enforceMessageRangeInvariant(st);
+      if (this._messageRangeHasLater(st)) return false;
       st.atBottom = true;
       if (sid === this.currentId) this.$nextTick(() => this.scrollToBottom(true));
       return true;
     },
     hasLaterMessages(sid) {
-      const st = this.tabState[sid || this.currentId];
-      if (!st) return false;
-      const range = st.messageRange;
-      return range.visibleEnd < st.messages.length
-        || range.offset + st.messages.length < range.total;
+      return this._messageRangeHasLater(this.tabState[sid || this.currentId]);
     },
-    // Live history stays canonical in memory. The viewport row builder, not an
-    // envelope count, bounds the DOM while keeping every interaction target and
-    // normalized object reachable during long streaming turns.
+    // Live history stays canonical in memory. `_appendLiveMessage` bounds the
+    // exact-height messageRange; this compatibility scheduler only lets existing
+    // tail-follow paths share the same frame boundary.
     _scheduleLiveMessageViewport(st) {
       if (!st || !st.messages) return;
       this._scheduleMessageViewportSync(st._sid, st.atBottom !== false);
@@ -26566,10 +27010,7 @@ function portal() {
           const hit = (this.sessions || []).find(s =>
             s.id.startsWith(arg) || s.name.toLowerCase().includes(q));
           if (!hit) { this.toast(this.t("slash.resume_no_match"), "warn", 2000); return false; }
-          this._captureChatPosition(this.currentId);
-          this.currentId = hit.id;
-          this._activateTabState(hit.id);
-          await this.loadSession(hit.id);
+          await this.openTab(hit.id, true);
           this.toast(this.t("slash.resumed", { name: hit.name }), "success", 1500);
           return true;
         }
@@ -26952,7 +27393,8 @@ function portal() {
         // Reload the compacted session if it's the active one; on a
         // background tab activateTab will reload it lazily later.
         if (sid === this.currentId) {
-          await this.loadSession(sid);
+          await this._reloadSessionCoalesced(
+            sid, { quiet: true, probeActive: false });
         }
         await this.refreshSessions();
         // Refresh ctx-meter — sessionUsage is only auto-updated on stream
@@ -27293,10 +27735,10 @@ function portal() {
       // mis-classify and never re-engage auto-follow).
       const nearBottom = (el.scrollHeight - el.scrollTop - el.clientHeight) < 2;
       if (nearBottom) {
-        // Reaching the bottom always (re-)engages auto-follow, regardless of
-        // what moved us there — that's the unambiguous "I want to follow" state.
+        // The physical bottom of a frozen range is not the logical transcript
+        // tail. Keep the jump affordance until hidden later messages are restored.
         if (st) {
-          st.atBottom = true;
+          st.atBottom = !this.hasLaterMessages(this.currentId);
           st.scrollTop = el.scrollTop;
         }
         return;
@@ -27386,11 +27828,13 @@ function portal() {
           });
           if (!touchesActiveLayout) return;
         }
-        if (!st || st.atBottom === false || this._chatTailPinFrame) return;
+        if (!st || st.atBottom === false || this._messageRangeHasLater(st)
+            || this._chatTailPinFrame) return;
         this._chatTailPinFrame = requestAnimationFrame(() => {
           this._chatTailPinFrame = 0;
           const current = sid && this.tabState && this.tabState[sid];
-          if (this.currentId !== sid || current !== st || st.atBottom === false) return;
+          if (this.currentId !== sid || current !== st || st.atBottom === false
+              || this._messageRangeHasLater(st)) return;
           this.scrollToBottom(false);
         });
       };
@@ -27436,8 +27880,8 @@ function portal() {
       // Keep the explicit scroller assignment as a deterministic fallback for
       // embedded/mobile WebViews whose scrollIntoView chooses an outer scroller.
       el.scrollTop = el.scrollHeight;
-      st.atBottom = true;
       st.scrollTop = el.scrollTop;
+      this._enforceMessageRangeInvariant(st);
     },
     scrollToBottom(force) {
       const el = this._chatBodyElement();
@@ -27455,10 +27899,13 @@ function portal() {
       // viewport stays put until they manually scroll back to the bottom.
       if (!force && st.atBottom === false) return;
       if (force) {
-        // Explicit jump (Send / ↓): mount the virtual tail first. Otherwise a
-        // reader who sent while viewing older rows still had only that old DOM
-        // window mounted; the subsequent settle could scroll merely to the end
-        // of the spacer and an anchor restore would pull it back again.
+        // Physical DOM bottom is not necessarily the logical transcript tail.
+        // Acquire the real tail first; returnToLatest re-enters this path only
+        // after local and server-side later windows have disappeared.
+        if (this._messageRangeHasLater(st)) {
+          void this.returnToLatest(sid);
+          return;
+        }
         st.atBottom = true;
         this._syncMessageViewport(sid, true);
         this.$nextTick(() => {
@@ -27521,7 +27968,8 @@ function portal() {
       let stable = 0;
       const step = () => {
         if (this._settleToken !== myToken) return; // superseded; newer settle owns the flag
-        if (this.currentId !== sid || this.tabState[sid] !== st || st.atBottom === false) {
+        if (this.currentId !== sid || this.tabState[sid] !== st
+            || st.atBottom === false || this._messageRangeHasLater(st)) {
           done();
           return;
         }
@@ -27984,6 +28432,9 @@ function portal() {
             return false;
           }
         }
+        // Sending is an explicit request to resume tail-follow. Set ownership
+        // before appending so the optimistic user bubble enters the bounded range.
+        sendState.atBottom = true;
         this._scheduleLiveMessageViewport(sendState);
         sentUserBubble = this._appendLiveMessage(sendState, {
           role: "user", text,
@@ -28136,24 +28587,14 @@ function portal() {
         streamState._reconnectGateCount = 0;
         streamState._reconnectGateAt = 0;
       }
+      // A live owner supersedes any foreground history shield. Advancing the
+      // visual generation makes an older load response unable to turn the live
+      // pane into either a loading or error surface when it eventually settles.
+      this._releaseTranscriptLoadForLive(streamState);
       streamState.streaming = true;
       streamState._continuationAwaitingReaction = false;
-      // A live turn renders DIRECTLY into the visible pane, so it must never be
-      // hidden by the bulk-reveal gate. `messagesReady=false` drives
-      // `.chat-body.msgs-hidden .msg { display:none }` + the loading skeleton —
-      // a mechanism that exists ONLY for loadSession's chunked reveal of
-      // historical bubbles. But a pane's messagesReady can otherwise only flip
-      // back to true inside switchSession / loadSession reveal callbacks
-      // that are guarded `if (this.currentId !== target) return`. If that reveal
-      // is skipped — rapid tab switch, or hitting "+" (newSession) right after a
-      // session started loading — messagesReady is left STUCK at false. On the
-      // next send, the moment messages.length goes >0 the msgs-hidden class
-      // engages and the ENTIRE reply (and the user's own bubble) renders
-      // display:none. The data still streams + persists to JSONL, so a full PWA
-      // restart re-runs loadSession's reveal and the reply "appears" — exactly
-      // the "new session, first reply invisible until restart" report. Force the
-      // reveal whenever we stream into the ACTIVE tab; there is nothing to
-      // lazy-reveal once the user is actively sending into the pane they see.
+      // A live turn renders directly into its pane; historical chunk readiness
+      // must never hide the user's bubble or the streamed reply.
       streamState.messagesReady = true;
       streamState.messagesLoading = false;
       streamState.streamingModel = sendModel;
@@ -28444,30 +28885,17 @@ function portal() {
         }
       }
       const modelForBubble = sendModel;
-      // Scroll only if the active tab is the one receiving the stream;
-      // otherwise we'd yank the user away from whatever they're reading.
-      const _scrollIfActive = () => {
-        this._scheduleLiveMessageViewport(streamState);
-        if (this.currentId !== streamSid) return;
-        // Refresh the measured viewport window throughout a long agentic turn.
-        // The final streaming rows remain mounted separately when the reader is
-        // scrolled up, while auto-follow still pins the main window to the tail.
-        if (streamState.atBottom !== false) this.scrollToBottom(false);
-      };
-      // Coalesced variant for event bursts. A turn that settles N background
-      // tasks at once delivers N task_notification events back-to-back; calling
-      // _scrollIfActive per event repeatedly recalculates rows and scroll geometry.
-      // Collapse the whole burst to avoid the reported conversation-pane flicker
-      // into one pass on the next frame — the card patches themselves are
-      // already applied synchronously, so nothing visible is delayed beyond a
-      // single frame.
+      // Every event mutates reactive state synchronously, but physical scrolling
+      // is shared and single-flight: one burst gets at most one layout pass/frame.
       let _scrollCoalesceHandle = null;
-      const _scrollIfActiveSoon = () => {
+      const _scrollIfActive = () => {
         if (_scrollCoalesceHandle !== null) return;
         const run = () => {
           _scrollCoalesceHandle = null;
           if (!ownsStreamState()) return;
-          _scrollIfActive();
+          this._scheduleLiveMessageViewport(streamState);
+          if (this.currentId !== streamSid || streamState.atBottom === false) return;
+          this.scrollToBottom(false);
         };
         _scrollCoalesceHandle = (typeof requestAnimationFrame === "function")
           ? requestAnimationFrame(run)
@@ -28632,36 +29060,41 @@ function portal() {
       };
       streamState._renderStreamingHtml = renderStreamingHtml;
 
-      // Attach SDK-native background-task lifecycle state to the launching
-      // tool_use card. The Task* messages (TaskStarted/Progress/Notification)
-      // carry tool_use_id = the SDK id of the Agent/Bash tool_use that started
-      // the background task, so we locate that message in the live turn and
-      // stamp `task_status` on it. The subagent card (index.html) renders
-      // ⏳ running → ✅/❌ from this. merge=true so a later progress/terminal
-      // event keeps fields an earlier event already set.
+      // Task lifecycle patches can arrive in large terminal bursts. Index the
+      // resident repository once, then update cards in O(1) even when a hard DOM
+      // window has temporarily unmounted the launching row.
+      const taskCardByToolUseId = new Map();
+      const taskCardByTaskId = new Map();
+      let taskCardIndexReady = false;
+      const registerTaskCard = card => {
+        if (!card || card.role !== "tool_use") return;
+        if (card.id) taskCardByToolUseId.set(String(card.id), card);
+        const taskId = card.task_status && card.task_status.task_id;
+        if (taskId) taskCardByTaskId.set(String(taskId), card);
+      };
+      const ensureTaskCardIndex = () => {
+        if (taskCardIndexReady) return;
+        for (const message of streamState.messages) registerTaskCard(message);
+        taskCardIndexReady = true;
+      };
       const applyTaskStatus = (toolUseId, patch, merge = true) => {
-        const msgs = streamState.messages;
-        for (let k = msgs.length - 1; k >= 0; k--) {
-          // role check is LOAD-BEARING: the tool_result bubble carries the
-          // SAME toolu_xxx id as its tool_use card and sits AFTER it, so a
-          // reverse scan on id alone hits the tool_result and stamps
-          // task_status where no template renders it. task_started slipped
-          // through only because the typed message arrives BEFORE the
-          // tool_result; every TERMINAL notification arrived after and was
-          // silently swallowed — the ⏳ card never flipped live (2026-06-11).
-          const byToolUse = !!toolUseId && msgs[k] && msgs[k].id === toolUseId;
-          // TaskUpdatedMessage deliberately has no top-level tool_use_id.
-          // Fall back to the task_id stamped by the earlier TaskStarted event,
-          // otherwise terminal-only task_updated patches leave the card on ⏳.
-          const byTask = !toolUseId && patch && patch.task_id && msgs[k]
-            && msgs[k].task_status
-            && msgs[k].task_status.task_id === patch.task_id;
-          if (msgs[k] && (byToolUse || byTask)
-              && msgs[k].role === "tool_use") {
-            const prev = (merge && msgs[k].task_status) ? msgs[k].task_status : {};
-            msgs[k].task_status = Object.assign({}, prev, patch);
-            return;
-          }
+        ensureTaskCardIndex();
+        let card = toolUseId
+          ? taskCardByToolUseId.get(String(toolUseId)) : null;
+        if (!card && patch && patch.task_id) {
+          card = taskCardByTaskId.get(String(patch.task_id));
+        }
+        if (!card || card.role !== "tool_use") {
+          if (toolUseId) taskCardByToolUseId.delete(String(toolUseId));
+          if (patch && patch.task_id) taskCardByTaskId.delete(String(patch.task_id));
+          return;
+        }
+        const prev = (merge && card.task_status) ? card.task_status : {};
+        card.task_status = this._normalizeTaskStatusPreview(
+          Object.assign({}, prev, patch));
+        if (card.id) taskCardByToolUseId.set(String(card.id), card);
+        if (card.task_status.task_id) {
+          taskCardByTaskId.set(String(card.task_status.task_id), card);
         }
       };
 
@@ -28728,7 +29161,8 @@ function portal() {
         if (d.todos != null) msg.todos = d.todos;
         if (d.task != null) msg.task = d.task;
         if (d.plan != null) msg.plan = d.plan;
-        this._appendLiveMessage(streamState, msg);
+        const liveToolCard = this._appendLiveMessage(streamState, msg);
+        registerTaskCard(liveToolCard);
         // File-mutating tools invalidate any open preview of the same file.
         // Bump previewVersion → rawUrl picks up a new ?_v= → iframe reloads;
         // _reloadPreviewIfDirty re-fetches md/text contents inline.
@@ -28796,6 +29230,8 @@ function portal() {
           task_id: d.task_id,
           state: st,
           summary: d.summary || "",
+          summary_length: d.summary_length,
+          summary_truncated: d.summary_truncated,
           output_file: d.output_file || "",
         });
         const remaining = Number(d.background_tasks_pending);
@@ -28813,7 +29249,7 @@ function portal() {
         // A task notification only updates its existing card. User-visible
         // completion feedback is the durable Agent continuation bubble; its
         // revision adoption owns the off-screen unread dot exactly once.
-        _scrollIfActiveSoon();
+        _scrollIfActive();
       });
       es.addEventListener("rate_limit", ev => {
         let d;
@@ -29062,6 +29498,8 @@ function portal() {
         authoritativeTerminal = false,
         completionMeta = null,
       ) => {
+        const followedTail = streamState.atBottom !== false
+          && !this._messageRangeHasLater(streamState);
         // A terminal stream cannot service permission buttons anymore. Expire
         // untouched cards, and fail an accepted ExitPlan transition if its
         // permission-mode commit never arrived.
@@ -29069,6 +29507,11 @@ function portal() {
         streamState.streaming = false;
         streamState._continuationAwaitingReaction = false;
         streamState.es = null;
+        if (followedTail) {
+          this._boundLiveMessageRange(streamState, true);
+          streamState.atBottom = true;
+        }
+        this._enforceMessageRangeInvariant(streamState);
         streamState._streamStartController = null;
         streamState._cancelBeforeStream = false;
         streamState._stopping = false;
@@ -30712,6 +31155,10 @@ function portal() {
           if (!opts.summaryOnly && Array.isArray(data.events)) {
             const events = data.events.slice(0, this.ACTIVITY_EVENT_CAP);
             this.activity.events = events;
+            if (this.activity.moveMenu.show
+                && (!this._isMobileLayout() || !this.activityMoveMenuItem())) {
+              this.closeActivityMoveMenu(false);
+            }
             this._activityEventsSnapshotLoaded = true;
             this._syncScheduledActivitySnapshot(events);
           }
@@ -30732,6 +31179,7 @@ function portal() {
       }
     },
     async openActivityCenter() {
+      this.closeActivityMoveMenu();
       this.closeMemoryRecallPopover();
       if (!this.activity.viewLoaded) {
         this.activity.viewLoaded = true;
@@ -30834,6 +31282,17 @@ function portal() {
     applyActivityGroupPayload(data) {
       if (Array.isArray(data?.custom_groups)) {
         this.activity.customGroups = data.custom_groups;
+        const editor = this.activity.groupEditor;
+        if (editor?.open && editor.id && !editor.workspaceDirty) {
+          const current = data.custom_groups.find(
+            group => String(group?.id || "") === String(editor.id),
+          );
+          if (current) {
+            editor.workspaceId = String(current.workspace_id || "");
+            editor.originalWorkspaceId = editor.workspaceId;
+            editor.workspacePath = String(current.workspace_path || "");
+          }
+        }
       }
       if (Array.isArray(data?.group_order)) {
         this.activity.groupOrder = this.normalizeActivityGroupOrder(data.group_order);
@@ -30850,6 +31309,8 @@ function portal() {
           groupId: group.id,
           orderId: String(group.id || ""),
           color: group.color || "blue",
+          workspaceId: String(group.workspace_id || ""),
+          workspacePath: String(group.workspace_path || ""),
         },
       ]));
       lookup.set("__ungrouped__", {
@@ -31137,7 +31598,51 @@ function portal() {
         this._activityPinPending = pending;
       }
     },
+    activityGroupWorkspaceEntry(group) {
+      const workspaceId = String(group?.workspaceId || group?.workspace_id || "");
+      if (!workspaceId) return null;
+      return (this.sessionWorkspaces || []).find(
+        workspace => String(workspace?.id || "") === workspaceId,
+      ) || null;
+    },
+    activityGroupWorkspaceLabel(group) {
+      const entry = this.activityGroupWorkspaceEntry(group);
+      if (entry) return entry.name || entry.path || this.t("activity.group.workspace");
+      const path = String(group?.workspacePath || group?.workspace_path || "");
+      if (!path) return "";
+      const parts = path.replace(/[\\/]+$/, "").split(/[\\/]/);
+      return parts[parts.length - 1] || path;
+    },
+    activityGroupWorkspaceAvailable(group) {
+      return !!this.activityGroupWorkspaceEntry(group);
+    },
+    async openActivityGroupWorkspace(group) {
+      const groupId = String(group?.groupId || group?.id || "");
+      const expectedWorkspaceId = String(
+        group?.workspaceId || group?.workspace_id || "",
+      );
+      if (!expectedWorkspaceId) return false;
+      const refreshed = await this.fetchSessionWorkspaces({
+        restoreCache: false,
+        validateActive: false,
+      });
+      const currentGroup = (this.activity.customGroups || []).find(
+        row => String(row?.id || "") === groupId,
+      );
+      const currentWorkspaceId = String(currentGroup?.workspace_id || "");
+      const entry = (this.sessionWorkspaces || []).find(
+        workspace => String(workspace?.id || "") === expectedWorkspaceId,
+      );
+      if (!refreshed || currentWorkspaceId !== expectedWorkspaceId || !entry) {
+        this.toast(this.t("activity.group.workspace_rebind"), "error");
+        return false;
+      }
+      this.closeActivityCenter();
+      await this.switchWorkspace(entry.path);
+      return this.currentWorkspacePath() === entry.path;
+    },
     openActivityGroupEditor(group = null) {
+      if (this.activity.groupEditor.saving) return;
       const palette = this.ACTIVITY_GROUP_COLORS;
       const fallback = palette[(this.activity.customGroups || []).length % palette.length];
       this.closeActivityMoveMenu();
@@ -31146,6 +31651,11 @@ function portal() {
         id: group?.groupId || group?.id || "",
         name: group?.label || group?.name || "",
         color: group?.color || fallback,
+        workspaceId: String(group?.workspaceId || group?.workspace_id || ""),
+        originalWorkspaceId: String(group?.workspaceId || group?.workspace_id || ""),
+        workspacePath: String(group?.workspacePath || group?.workspace_path || ""),
+        workspaceDirty: false,
+        owner: ++this._activityGroupEditorSeq,
         saving: false,
       };
       this.$nextTick(() => {
@@ -31153,9 +31663,13 @@ function portal() {
         if (input) input.focus();
       });
     },
-    cancelActivityGroupEditor() {
+    cancelActivityGroupEditor(force = false) {
+      if (this.activity.groupEditor.saving && !force) return;
+      const owner = ++this._activityGroupEditorSeq;
       this.activity.groupEditor = {
-        open: false, id: "", name: "", color: "blue", saving: false,
+        open: false, id: "", name: "", color: "blue",
+        workspaceId: "", originalWorkspaceId: "", workspacePath: "",
+        workspaceDirty: false, owner, saving: false,
       };
     },
     async saveActivityGroup() {
@@ -31163,7 +31677,13 @@ function portal() {
       const name = String(draft.name || "").trim();
       if (!name || draft.saving) return;
       draft.saving = true;
+      const owner = draft.owner;
       const editing = !!draft.id;
+      const payload = { name, color: draft.color || "blue" };
+      const workspaceId = String(draft.workspaceId || "");
+      if (!editing || draft.workspaceDirty) {
+        payload.workspace_id = workspaceId || null;
+      }
       try {
         const { ok, data, error } = await this.api(
           editing
@@ -31171,12 +31691,13 @@ function portal() {
             : "/api/activity/groups",
           {
             method: editing ? "PATCH" : "POST",
-            json: { name, color: draft.color || "blue" },
+            json: payload,
           },
         );
         if (!ok || !Array.isArray(data?.custom_groups)) {
           throw new Error(error || "activity group save failed");
         }
+        if (this.activity.groupEditor.owner !== owner) return false;
         const responseRevision = Number(data.revision) || 0;
         if (!responseRevision || responseRevision >= this._activityRevision) {
           this.applyActivityGroupPayload(data);
@@ -31184,8 +31705,9 @@ function portal() {
           this.fetchActivity().catch(() => {});
         }
         this._activityRevision = Math.max(this._activityRevision, responseRevision);
-        this.cancelActivityGroupEditor();
+        this.cancelActivityGroupEditor(true);
       } catch (error) {
+        if (this.activity.groupEditor.owner !== owner) return false;
         draft.saving = false;
         this.toast(
           this.lang === "zh"
@@ -31285,30 +31807,6 @@ function portal() {
         }
       }
     },
-    async moveActivityGroup(group, delta) {
-      if (this.activitySearchQuery()) return;
-      const orderId = String(group?.orderId || group?.groupId || "");
-      if (!orderId || !delta) return;
-      const previous = this.normalizeActivityGroupOrder();
-      const customOrder = previous.filter(groupId => groupId !== "__ungrouped__");
-      const at = customOrder.indexOf(orderId);
-      const target = at + delta;
-      if (at < 0 || target < 0 || target >= customOrder.length) return;
-      const next = [...customOrder];
-      const [moved] = next.splice(at, 1);
-      next.splice(target, 0, moved);
-      next.push("__ungrouped__");
-      await this.persistActivityGroupOrder(next, previous);
-    },
-    activityGroupCanMove(group, delta) {
-      if (this.activitySearchQuery() || group?.builtin) return false;
-      const orderId = String(group?.orderId || group?.groupId || "");
-      if (!orderId) return false;
-      const order = this.normalizeActivityGroupOrder()
-        .filter(groupId => groupId !== "__ungrouped__");
-      const at = order.indexOf(orderId);
-      return at >= 0 && at + delta >= 0 && at + delta < order.length;
-    },
     onActivityGroupOrderDragStart(ev, group) {
       if (this.activity.view !== "groups" || this.activitySearchQuery()
           || group?.builtin) return;
@@ -31355,7 +31853,19 @@ function portal() {
     },
     openActivityMoveMenu(ev, item) {
       if (!item?.id) return;
-      const rect = ev?.currentTarget?.getBoundingClientRect();
+      const eventId = String(item.id);
+      const opener = ev?.currentTarget || null;
+      const showMenu = (style) => {
+        this.activity.moveMenu = { show: true, eventId, style };
+        this._openFocusSurface(
+          "activity-move", ".activity-move-menu", "button", opener, true,
+        );
+      };
+      if (this._isMobileLayout()) {
+        showMenu("");
+        return;
+      }
+      const rect = opener?.getBoundingClientRect();
       if (!rect) return;
       const width = Math.min(230, window.innerWidth - 16);
       const estimatedHeight = Math.min(
@@ -31367,14 +31877,43 @@ function portal() {
       const top = rect.bottom + 6 + estimatedHeight <= window.innerHeight - 8
         ? rect.bottom + 6
         : Math.max(8, rect.top - estimatedHeight - 6);
-      this.activity.moveMenu = {
-        show: true,
-        eventId: String(item.id),
-        style: `position:fixed;left:${Math.round(left)}px;top:${Math.round(top)}px;width:${Math.round(width)}px;`,
-      };
+      showMenu(
+        `position:fixed;left:${Math.round(left)}px;top:${Math.round(top)}px;width:${Math.round(width)}px;`,
+      );
     },
-    closeActivityMoveMenu() {
+    onActivityMoveMenuKeydown(ev) {
+      if (!ev || !["ArrowDown", "ArrowUp", "Home", "End"].includes(ev.key)) return;
+      const menu = ev.currentTarget;
+      const items = this._focusableElements(menu).filter(
+        item => item.matches('[role="menuitemradio"]'),
+      );
+      if (!items.length) return;
+      const current = items.indexOf(document.activeElement);
+      let index;
+      if (ev.key === "Home") index = 0;
+      else if (ev.key === "End") index = items.length - 1;
+      else if (ev.key === "ArrowUp") {
+        index = current <= 0 ? items.length - 1 : current - 1;
+      } else {
+        index = current < 0 || current === items.length - 1 ? 0 : current + 1;
+      }
+      ev.preventDefault();
+      ev.stopPropagation();
+      this._focusWithoutScroll(items[index]);
+    },
+    closeActivityMoveMenu(restoreFocus = false) {
+      const menu = document.querySelector(".activity-move-menu");
+      const focusWasInside = !!(menu && menu.contains(document.activeElement));
       this.activity.moveMenu = { show: false, eventId: "", style: "" };
+      this._closeFocusSurface("activity-move", restoreFocus);
+      if (!restoreFocus && focusWasInside && this.activity.show) {
+        this.$nextTick(() => {
+          const modal = document.querySelector(".activity-modal");
+          if (modal && !modal.contains(document.activeElement)) {
+            this._focusWithoutScroll(modal);
+          }
+        });
+      }
     },
     activityMoveMenuItem() {
       const eventId = this.activity.moveMenu.eventId;
@@ -31423,7 +31962,7 @@ function portal() {
       const target = String(groupId || "");
       const previous = String(item.group_id || "");
       const hasPlacement = beforeEventId !== null;
-      this.closeActivityMoveMenu();
+      this.closeActivityMoveMenu(true);
       if (!hasPlacement && target === previous) return true;
       const previousPlacement = new Map(this.activity.events.map(row => [
         String(row.id), {
@@ -31757,6 +32296,7 @@ function portal() {
         this.applyActivityGroupPayload(payload);
       }
       if (payload?.resync) {
+        if (this.activity.moveMenu.show) this.closeActivityMoveMenu(false);
         this._activityRevision = Math.max(this._activityRevision, revision);
         this._activityAppliedSeq = ++this._activityRequestSeq;
         Promise.resolve(this._refreshActivityFromSignal()).finally(
@@ -31790,6 +32330,10 @@ function portal() {
         else this.activity.events.unshift(item);
         this.activity.events = this.activity.events
           .slice(0, this.ACTIVITY_EVENT_CAP);
+        if (this.activity.moveMenu.show
+            && (!this._isMobileLayout() || !this.activityMoveMenuItem())) {
+          this.closeActivityMoveMenu(false);
+        }
         this._applyScheduledActivity(item);
       }
       const acked = new Set(
@@ -31800,6 +32344,9 @@ function portal() {
           if (acked.has(row.id)) row.read = true;
         }
         this.activity.events = [...this.activity.events];
+        if (this.activity.moveMenu.show && !this._isMobileLayout()) {
+          this.closeActivityMoveMenu(false);
+        }
       }
       // The terminal payload's summary was captured before the visible ACK.
       // Keep the last read summary until the ACK response/SSE supplies its
