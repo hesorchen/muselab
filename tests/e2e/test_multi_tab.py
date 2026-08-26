@@ -86,6 +86,114 @@ def test_new_and_switch_and_close_tabs(page: Page, backend_url, auth_token):
     expect(page.locator(SEL_TAB)).to_have_count(initial + 1)
 
 
+def test_mobile_typing_cannot_duplicate_chat_tabs(page: Page, backend_url, auth_token):
+    """Dirty restored ids, Alpine input ticks and duplicate touch activation must
+    still produce one DOM tab per session id."""
+    page.set_viewport_size({"width": 390, "height": 844})
+    browser_errors: list[str] = []
+    page.on("pageerror", lambda error: browser_errors.append(str(error)))
+    _login(page, backend_url, auth_token)
+
+    sid = page.evaluate(
+        "document.querySelector('#app')._x_dataStack[0].currentId")
+    page.evaluate(
+        """([sid]) => {
+          const prefs = JSON.parse(localStorage.getItem("muselab_prefs") || "{}");
+          prefs.schema = Math.max(9, Number(prefs.schema) || 0);
+          prefs.currentId = sid;
+          prefs.openTabIds = [sid, sid];
+          prefs.mobileTab = "chat";
+          localStorage.setItem("muselab_prefs", JSON.stringify(prefs));
+        }""",
+        arg=[sid],
+    )
+    page.reload(wait_until="domcontentloaded")
+    page.wait_for_function(
+        """([sid]) => {
+          const app = document.querySelector("#app")?._x_dataStack?.[0];
+          return app && app._sessionsInitialized && app.currentId === sid;
+        }""",
+        arg=[sid],
+    )
+
+    composer = page.locator(".chat-input-textarea")
+    expect(composer).to_be_visible()
+    composer.fill("mobile duplicate-tab probe")
+    restored = page.evaluate(
+        """([sid]) => {
+          const app = document.querySelector("#app")._x_dataStack[0];
+          return {
+            storedCount: app.openTabIds.filter(id => id === sid).length,
+            projectedCount: app.workspaceOpenTabIds().filter(id => id === sid).length,
+            domCount: document.querySelectorAll(
+              `.chat-tab[data-tid="${CSS.escape(sid)}"]`).length,
+            activeCount: document.querySelectorAll(".chat-tab.active").length,
+          };
+        }""",
+        arg=[sid],
+    )
+    assert restored == {
+        "storedCount": 1,
+        "projectedCount": 1,
+        "domCount": 1,
+        "activeCount": 1,
+    }
+
+    # Runtime defence: even if a stale caller pollutes the array after boot,
+    # the render projection must never hand duplicate keys to Alpine.
+    page.evaluate(
+        """([sid]) => {
+          const app = document.querySelector("#app")._x_dataStack[0];
+          app.openTabIds = [sid, sid];
+        }""",
+        arg=[sid],
+    )
+    composer.fill("mobile duplicate-tab probe 2")
+    runtime = page.evaluate(
+        """([sid]) => {
+          const app = document.querySelector("#app")._x_dataStack[0];
+          return {
+            projectedCount: app.workspaceOpenTabIds().filter(id => id === sid).length,
+            domCount: document.querySelectorAll(
+              `.chat-tab[data-tid="${CSS.escape(sid)}"]`).length,
+          };
+        }""",
+        arg=[sid],
+    )
+    assert runtime == {"projectedCount": 1, "domCount": 1}
+
+    # Two immediate mobile activations are one user intent. The second call
+    # returns the same optimistic session rather than opening another blank tab.
+    deduped = page.evaluate(
+        """() => {
+          const app = document.querySelector("#app")._x_dataStack[0];
+          const before = app.workspaceOpenTabIds().length;
+          const first = app.newSession();
+          const second = app.newSession();
+          return {
+            sameId: first.id === second.id,
+            delta: app.workspaceOpenTabIds().length - before,
+            currentId: app.currentId,
+            createdId: first.id,
+          };
+        }"""
+    )
+    assert deduped["sameId"] is True
+    assert deduped["delta"] == 1
+    assert deduped["currentId"] == deduped["createdId"]
+
+    # A stuck modifier from a mobile IME or remote keyboard must not turn a
+    # composer keystroke into another new chat tab.
+    composer = page.locator(".chat-input-textarea")
+    composer.focus()
+    before_shortcut = page.locator(SEL_TAB).count()
+    composer.dispatch_event("keydown", {"key": "t", "ctrlKey": True,
+                                         "bubbles": True})
+    page.wait_for_timeout(50)
+    assert page.locator(SEL_TAB).count() == before_shortcut
+    assert browser_errors == []
+
+
 def test_inline_rename_via_dblclick(page: Page, backend_url, auth_token):
     """Double-click a tab title to swap in the rename input; Enter commits.
     Guards the x-if/blur race regression."""

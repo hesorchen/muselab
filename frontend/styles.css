@@ -3974,9 +3974,13 @@ pre.text {
 .activity-groups-toolbar small { overflow:hidden; color:var(--c-fg-3); font-size:var(--fs-xs); text-overflow:ellipsis; white-space:nowrap; }
 .activity-groups-toolbar .btn-ghost { flex:0 0 auto; display:inline-flex; align-items:center; gap:5px; }
 .activity-groups-toolbar .btn-ghost svg { width:13px; height:13px; }
-.activity-group-editor { display:grid; grid-template-columns:minmax(160px,1fr) auto auto; align-items:center; gap:10px; padding:10px 14px; border-bottom:1px solid var(--c-border); background:var(--c-bg-2); }
+.activity-group-editor { flex:0 0 auto; display:grid; grid-template-columns:minmax(150px,1fr) minmax(180px,.9fr) auto auto; align-items:center; gap:10px; padding:10px 14px; border-bottom:1px solid var(--c-border); background:var(--c-bg-2); }
 .activity-group-editor > input { min-width:0; height:32px; padding:0 9px; border:1px solid var(--c-border-strong); border-radius:var(--r-sm); outline:0; background:var(--c-bg-1); color:var(--c-fg-0); font:inherit; font-size:var(--fs-sm); }
 .activity-group-editor > input:focus { border-color:var(--c-accent); box-shadow:0 0 0 2px var(--c-accent-soft); }
+.activity-group-workspace-field { min-width:0; display:flex; align-items:center; gap:7px; color:var(--c-fg-3); font-size:var(--fs-xs); }
+.activity-group-workspace-field > span { flex:0 0 auto; }
+.activity-group-workspace-field select { min-width:0; width:100%; height:32px; padding:0 28px 0 8px; border:1px solid var(--c-border-strong); border-radius:var(--r-sm); outline:0; background:var(--c-bg-1); color:var(--c-fg-1); font:inherit; font-size:var(--fs-sm); }
+.activity-group-workspace-field select:focus { border-color:var(--c-accent); box-shadow:0 0 0 2px var(--c-accent-soft); }
 .activity-group-colors { display:flex; align-items:center; gap:6px; }
 .activity-group-swatch { width:18px; height:18px; padding:0; border:2px solid transparent; border-radius:50%; background:var(--activity-group-color,var(--c-fg-3)); cursor:pointer; box-shadow:0 0 0 1px color-mix(in srgb,var(--activity-group-color,var(--c-fg-3)) 45%,transparent); }
 .activity-group-swatch.active { border-color:var(--c-bg-1); box-shadow:0 0 0 2px var(--activity-group-color,var(--c-accent)); }
@@ -4075,6 +4079,12 @@ pre.text {
 .activity-custom-group-dot.is-gray,.activity-group-swatch.is-gray { --activity-group-color:var(--c-fg-3); }
 .activity-custom-group-count { min-width:18px; color:var(--c-fg-3); font:10px var(--font-mono); text-align:center; }
 .activity-custom-group-attention { min-width:18px; padding:1px 5px; border-radius:var(--r-full); background:var(--c-accent-soft); color:var(--c-accent); font:10px var(--font-mono); text-align:center; }
+.activity-group-workspace-chip { min-width:0; max-width:150px; height:27px; display:inline-flex; align-items:center; gap:5px; padding:0 7px; border:1px solid var(--c-border); border-radius:var(--r-full); background:var(--c-bg-1); color:var(--c-fg-2); font:inherit; font-size:var(--fs-xs); cursor:pointer; }
+.activity-group-workspace-chip:hover { border-color:var(--c-accent); color:var(--c-accent); }
+.activity-group-workspace-chip svg { width:12px; height:12px; flex:0 0 12px; }
+.activity-group-workspace-chip > span { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.activity-group-workspace-chip small { flex:0 0 auto; color:var(--c-warn); font-size:10px; white-space:nowrap; }
+.activity-group-workspace-chip.unavailable { border-style:dashed; color:var(--c-fg-4); }
 .activity-custom-group-actions { margin-left:auto; display:flex; align-items:center; gap:2px; opacity:0; transition:opacity var(--t-fast); }
 .activity-group.is-custom:hover .activity-custom-group-actions,.activity-custom-group-actions:focus-within { opacity:1; }
 .activity-custom-group-actions button { width:26px; height:26px; display:flex; align-items:center; justify-content:center; padding:0; border:0; border-radius:var(--r-sm); background:transparent; color:var(--c-fg-3); font:12px var(--font-mono); cursor:pointer; }
@@ -4114,6 +4124,7 @@ pre.text {
   .activity-body.is-group-board .activity-custom-group-head > strong {
     font-size:var(--fs-md);
   }
+  .activity-body.is-group-board .activity-group-workspace-chip { max-width:110px; }
   .activity-body.is-group-board .activity-custom-group-dot {
     width:9px;
     height:9px;
@@ -4191,7 +4202,8 @@ pre.text {
 @media (hover:none), (pointer:coarse) {
   .activity-pin,.activity-row-group,.activity-custom-group-actions { opacity:0.72; }
 }
-.activity-move-menu { position:fixed; z-index:1100; max-height:min(360px,calc(100vh - 16px)); overflow:auto; padding:5px; border:1px solid var(--c-border-strong); border-radius:var(--r-md); background:var(--c-bg-1); box-shadow:var(--shadow-pop); }
+.activity-move-layer { position:fixed; inset:0; z-index:1100; pointer-events:auto; }
+.activity-move-menu { position:fixed; max-height:min(360px,calc(100vh - 16px)); overflow:auto; overscroll-behavior:contain; padding:5px; border:1px solid var(--c-border-strong); border-radius:var(--r-md); background:var(--c-bg-1); box-shadow:var(--shadow-pop); pointer-events:auto; }
 .activity-move-menu-title { padding:6px 8px 5px; color:var(--c-fg-3); font-size:10px; font-weight:var(--fw-medium); }
 .activity-move-menu > button { width:100%; min-height:32px; display:flex; align-items:center; gap:8px; padding:5px 8px; border:0; border-radius:var(--r-sm); background:transparent; color:var(--c-fg-1); font:inherit; font-size:var(--fs-sm); text-align:left; cursor:pointer; }
 .activity-move-menu > button:hover { background:var(--c-bg-2); }
@@ -4204,9 +4216,14 @@ pre.text {
   .activity-view-switch { order:3; width:100%; margin-left:0; }
   .activity-view-switch button { flex:1; }
   .activity-groups-toolbar small { white-space:normal; }
-  .activity-group-editor { grid-template-columns:1fr; }
+  .activity-group-editor { max-height:min(58dvh,460px); overflow-y:auto; grid-template-columns:1fr; }
+  .activity-group-workspace-field { align-items:stretch; flex-direction:column; gap:4px; }
+  .activity-group-workspace-field select { width:100%; min-height:42px; }
   .activity-group-colors { padding:2px; }
   .activity-group-editor-actions { justify-content:flex-end; }
+  .activity-custom-group-head { flex-wrap:wrap; }
+  .activity-group-workspace-chip { order:5; max-width:100%; min-height:40px; }
+  .activity-custom-group-actions button { width:40px; height:40px; }
 }
 @media (max-width:600px) {
   .files-head-workspace { flex:1 1 auto; max-width:none; margin-left:2px; }
@@ -4335,7 +4352,7 @@ pre.text {
   /* Render eagerly (no content-visibility:auto). content-visibility:auto used
      to skip layout/paint for off-screen bubbles, added back when a long
      conversation kept EVERY message in the DOM. But history is now lazy-loaded
-     (INITIAL_LOAD window + paged batches + live cap), so only ~50 bubbles are
+     (paged history + a bounded live messageRange), so only a fixed window is
      ever in the DOM — and `auto` deferred each bubble's layout+paint to the
      moment it scrolled into view, which on phone CPUs meant per-bubble frame
      drops while scrolling through history (measured: 1244ms total scroll jank,
@@ -4745,53 +4762,153 @@ html[data-theme="light"] .msg.user .bubble { color: white; }
   50%      { box-shadow: 0 0 0 4px rgba(96, 147, 255, 0.22); }
 }
 
-/* Chat skeleton — placeholder rows while loadSession is fetching. The
-   shimmer pulse signals "loading, please wait" without taking over the
-   pane the way a spinner would. Three skeleton bubbles match the
-   typical short reply density; longer histories render the real
-   messages directly once fetched. */
-.chat-skeleton {
-  padding: 16px 20px;
-  display: flex; flex-direction: column;
-  gap: 18px;
+/* Foreground transcript loads use a fully opaque, pane-local shield. Keep the
+   canonical DOM mounted underneath so virtual ranges and tail geometry continue
+   to settle normally, but never expose old/partial rows or onboarding between
+   currentId selection and the target pane's first completed paint. */
+.chat-transcript-loading-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 6;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  pointer-events: auto;
+  background:
+    radial-gradient(circle at 50% 48%, var(--c-accent-soft) 0, transparent 30%),
+    var(--c-bg-1);
 }
+.chat-muse-loader {
+  width: min(100% - 32px, 360px);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 18px;
+  color: var(--c-fg-2);
+  text-align: center;
+}
+.chat-muse-loader-emblem {
+  position: relative;
+  width: 108px;
+  height: 108px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--c-accent-soft) 72%, var(--c-bg-1));
+  box-shadow:
+    0 0 0 1px color-mix(in srgb, var(--c-accent) 18%, transparent),
+    0 18px 42px color-mix(in srgb, var(--c-accent) 16%, transparent);
+}
+.chat-muse-loader-emblem::before,
+.chat-muse-loader-emblem::after {
+  content: "";
+  position: absolute;
+  border-radius: 50%;
+  pointer-events: none;
+}
+.chat-muse-loader-emblem::before {
+  inset: 7px;
+  border: 1px solid color-mix(in srgb, var(--c-accent) 24%, transparent);
+}
+.chat-muse-loader-emblem::after {
+  inset: -7px;
+  border: 2px solid transparent;
+  border-top-color: var(--c-accent);
+  border-right-color: color-mix(in srgb, var(--c-accent) 28%, transparent);
+  animation: chat-muse-orbit 3.2s linear infinite;
+}
+.chat-muse-loader-emblem .muse-mascot {
+  position: relative;
+  z-index: 1;
+  width: 58px;
+  height: 58px;
+  margin: 0;
+  cursor: default;
+  filter: drop-shadow(0 0 12px color-mix(in srgb, var(--c-accent) 34%, transparent));
+}
+.chat-muse-loader-copy {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-height: 24px;
+}
+.chat-muse-loader-copy strong {
+  color: var(--c-fg-1);
+  font-size: var(--fs-md);
+  font-weight: var(--fw-medium);
+  letter-spacing: .01em;
+}
+.chat-muse-loader-dots {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.chat-muse-loader-dots i {
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: var(--c-accent);
+  animation: chat-muse-dot 1.35s ease-in-out infinite;
+}
+.chat-muse-loader-dots i:nth-child(2) { animation-delay: .16s; }
+.chat-muse-loader-dots i:nth-child(3) { animation-delay: .32s; }
+@keyframes chat-muse-orbit {
+  to { transform: rotate(360deg); }
+}
+@keyframes chat-muse-dot {
+  0%, 70%, 100% { opacity: .28; transform: translateY(0); }
+  35% { opacity: 1; transform: translateY(-3px); }
+}
+@media (max-width: 600px) {
+  .chat-muse-loader { gap: 15px; }
+  .chat-muse-loader-emblem { width: 92px; height: 92px; }
+  .chat-muse-loader-emblem .muse-mascot { width: 50px; height: 50px; }
+  .chat-muse-loader-copy strong { font-size: var(--fs-sm); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .chat-muse-loader-emblem::after,
+  .chat-muse-loader-dots i { animation: none; }
+}
+.chat-load-error {
+  flex: 1 0 auto;
+  min-height: 180px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  color: var(--c-fg-2);
+  text-align: center;
+}
+.chat-load-error > svg {
+  width: 26px;
+  height: 26px;
+  color: var(--c-danger);
+}
+.chat-load-error strong { color: var(--c-fg-0); }
+.chat-load-error.has-resident {
+  position: sticky;
+  top: 0;
+  z-index: 3;
+  flex: 0 0 auto;
+  min-height: 0;
+  flex-direction: row;
+  padding: 10px 12px;
+  border: 1px solid var(--c-danger);
+  border-radius: var(--r-md);
+  background: var(--c-bg-1);
+  box-shadow: var(--shadow-sm);
+}
+.chat-load-error.has-resident > svg { width: 18px; height: 18px; }
+.chat-load-error.has-resident .btn-secondary { margin-left: auto; }
 /* Never remove canonical messages from layout while a cold load settles.
    The old display:none gate left only turn separators / virtual spacers visible
    whenever messagesReady missed a callback, producing a full-height blank chat
-   that could not be scrolled to its tail. The skeleton remains the loading cue;
-   already-resident rows stay usable underneath it. */
-.chat-skeleton-msg {
-  display: flex; gap: 10px;
-  align-items: flex-start;
-}
-.chat-skeleton-avatar {
-  width: 32px; height: 32px;
-  border-radius: 50%;
-  background: var(--c-bg-2);
-  flex-shrink: 0;
-  animation: skeleton-shimmer 1.4s ease-in-out infinite;
-}
-.chat-skeleton-bubble {
-  flex: 1;
-  display: flex; flex-direction: column;
-  gap: 6px;
-  max-width: 70%;
-}
-.chat-skeleton-line {
-  height: 10px;
-  background: var(--c-bg-2);
-  border-radius: var(--r-sm);
-  animation: skeleton-shimmer 1.4s ease-in-out infinite;
-}
-.chat-skeleton-line:nth-child(1) { width: 55%; animation-delay: 0s; }
-.chat-skeleton-line:nth-child(2) { width: 92%; animation-delay: 0.15s; }
-.chat-skeleton-line:nth-child(3) { width: 78%; animation-delay: 0.3s; }
-.chat-skeleton-msg:nth-child(even) {
-  flex-direction: row-reverse;   /* alternate "user / assistant" feel */
-}
-.chat-skeleton-msg:nth-child(even) .chat-skeleton-bubble {
-  align-items: flex-end;
-}
+   that could not be scrolled to its tail. The opaque shield is only visual;
+   resident rows continue laying out safely underneath it. */
 @keyframes skeleton-shimmer {
   0%, 100% { opacity: 0.4; }
   50%      { opacity: 0.85; }
@@ -6919,6 +7036,9 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 .tool-task.is-failed .tool-task-badge { color: var(--c-err, #dc2626); }
 .tool-task.is-stopped .tool-task-badge { color: var(--c-fg-3); }
 .tool-task-summary { color: var(--c-fg-2); word-break: break-word; }
+.task-summary-truncated {
+  color: var(--c-fg-3); font-size: var(--fs-2xs); white-space: nowrap;
+}
 .tool-task-open {
   color: var(--c-accent); cursor: pointer; white-space: nowrap;
   text-decoration: none;
@@ -10011,6 +10131,40 @@ html[data-theme="dark"] .bubble :not(pre) > code:not(.has-file-link) * {
     opacity: 0.55;
   }
   .msg-actions.msg-actions-assistant:active { opacity: 1; }
+}
+
+/* Activity move menu follows the same single-pane breakpoint as
+   `_isMobileLayout()`. The portal becomes a bottom sheet so row scroll,
+   browser chrome and the on-screen keyboard can never strand an anchored
+   popup over the chat surface. */
+@media (max-width: 900px), (pointer: coarse) and (max-height: 500px) {
+  .activity-move-layer {
+    display: flex;
+    align-items: flex-end;
+    justify-content: center;
+    padding: 12px 12px calc(12px + env(safe-area-inset-bottom) + var(--kb-inset, 0px));
+    background: color-mix(in srgb, #000 32%, transparent);
+    pointer-events: auto;
+    overscroll-behavior: contain;
+  }
+  .activity-move-menu {
+    position: relative;
+    inset: auto;
+    width: min(100%, 560px);
+    max-height: min(68vh, calc(100vh - var(--kb-inset, 0px) - 24px), 560px);
+    max-height: min(68dvh, calc(100dvh - var(--kb-inset, 0px) - 24px), 560px);
+    overflow-y: auto;
+    border-radius: var(--r-xl);
+    box-shadow: 0 -10px 36px rgba(0, 0, 0, .28);
+  }
+  .activity-move-menu-title {
+    padding: 10px 12px 8px;
+    font-size: var(--fs-xs);
+  }
+  .activity-move-menu > button {
+    min-height: 44px;
+    padding: 8px 12px;
+  }
 }
 
 /* ==========================================================================

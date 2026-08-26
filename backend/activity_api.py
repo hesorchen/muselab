@@ -5,12 +5,13 @@ import json
 from collections.abc import AsyncIterator
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from sse_starlette.sse import EventSourceResponse, ServerSentEvent
 
 from .activity import activity
 from .auth import require_token
 from .capability_tickets import tickets
+from .workspaces import registry as workspace_registry
 
 router = APIRouter(prefix="/api/activity", tags=["activity"])
 _EVENT_TICKET_TTL_S = 45
@@ -21,13 +22,19 @@ class ActivityPatchRequest(BaseModel):
 
 
 class ActivityGroupCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     name: str = Field(min_length=1, max_length=48)
     color: str = Field(default="blue", max_length=16)
+    workspace_id: str | None = Field(default=None, max_length=64)
 
 
 class ActivityGroupUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     name: str | None = Field(default=None, min_length=1, max_length=48)
     color: str | None = Field(default=None, max_length=16)
+    workspace_id: str | None = Field(default=None, max_length=64)
 
 
 class ActivityGroupOrderRequest(BaseModel):
@@ -37,6 +44,15 @@ class ActivityGroupOrderRequest(BaseModel):
 class ActivityGroupAssignmentRequest(BaseModel):
     group_id: str = Field(default="", max_length=64)
     before_event_id: str | None = Field(default=None, max_length=128)
+
+
+def _activity_workspace_binding(workspace_id: str | None):
+    if workspace_id is None:
+        return None
+    try:
+        return workspace_registry.entry_for_id(workspace_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 def _json(request: Request, response: Response, payload: dict):
@@ -129,8 +145,14 @@ def list_activity_groups():
 
 @router.post("/groups", dependencies=[Depends(require_token)])
 def create_activity_group(req: ActivityGroupCreateRequest):
+    workspace = _activity_workspace_binding(req.workspace_id)
     try:
-        update = activity.create_group(req.name, req.color)
+        update = activity.create_group(
+            req.name,
+            req.color,
+            workspace_id=workspace.id if workspace else None,
+            workspace_path=workspace.path if workspace else None,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"ok": True, **update}
@@ -147,12 +169,22 @@ def reorder_activity_groups(req: ActivityGroupOrderRequest):
 
 @router.patch("/groups/{group_id}", dependencies=[Depends(require_token)])
 def update_activity_group(group_id: str, req: ActivityGroupUpdateRequest):
-    try:
-        update = activity.update_group(
-            group_id,
-            name=req.name,
-            color=req.color,
+    workspace_supplied = "workspace_id" in req.model_fields_set
+    workspace = (
+        _activity_workspace_binding(req.workspace_id)
+        if workspace_supplied else None
+    )
+    changes = {
+        "name": req.name,
+        "color": req.color,
+    }
+    if workspace_supplied:
+        changes.update(
+            workspace_id=workspace.id if workspace else None,
+            workspace_path=workspace.path if workspace else None,
         )
+    try:
+        update = activity.update_group(group_id, **changes)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if update is None:

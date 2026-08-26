@@ -5,6 +5,8 @@ import json
 import re
 from typing import Any, Callable
 
+from .task_summaries import normalize_task_summary
+
 
 _CLI_SLASH_TAGS_RE = re.compile(
     r"<(command-name|command-message|command-args|"
@@ -326,7 +328,11 @@ def sdk_messages_to_ui(
                             previous["task_status"] = {
                                 "task_id": notification.get("task_id") or "",
                                 "state": state,
-                                "summary": notification.get("summary") or "",
+                                **normalize_task_summary(
+                                    notification.get("summary"),
+                                    summary_length=notification.get("summary_length"),
+                                    summary_truncated=notification.get("summary_truncated"),
+                                ),
                                 "output_file": notification.get("output_file") or "",
                             }
                             break
@@ -723,7 +729,11 @@ def broadcast_to_ui_messages(broadcast: Any) -> list[dict]:
                 str(data.get("tool_use_id") or ""),
                 str(data.get("task_id") or ""),
                 state=state,
-                summary=data.get("summary") or "",
+                **normalize_task_summary(
+                    data.get("summary"),
+                    summary_length=data.get("summary_length"),
+                    summary_truncated=data.get("summary_truncated"),
+                ),
                 output_file=data.get("output_file") or "",
             )
         elif kind == "ask_user_question":

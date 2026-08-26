@@ -4079,6 +4079,31 @@ def test_turn_broadcast_stamps_stable_identity_and_sequence(stream_env):
     assert all(payload["parent_turn_id"] == "parent-turn" for payload in payloads)
 
 
+def test_turn_broadcast_bounds_task_notification_summary_before_replay(stream_env):
+    from backend.task_summaries import TASK_SUMMARY_PREVIEW_CAP
+
+    chat_mod = stream_env
+    bc = chat_mod.TurnBroadcast(session_id="task-summary-budget")
+    full = "result " * 1000
+    bc.publish({
+        "event": "task_notification",
+        "data": json.dumps({
+            "task_id": "task-1",
+            "tool_use_id": "tool-1",
+            "status": "completed",
+            "summary": full,
+            "output_file": "/tmp/task.output",
+        }),
+    })
+    bc.finish()
+
+    payload = json.loads(bc.events[0]["data"])
+    assert len(payload["summary"]) == TASK_SUMMARY_PREVIEW_CAP
+    assert payload["summary_length"] == len(full)
+    assert payload["summary_truncated"] is True
+    assert payload["output_file"] == "/tmp/task.output"
+
+
 def test_incremental_reconnect_replays_only_missing_events_without_duplicates(
         stream_env):
     chat_mod = stream_env
