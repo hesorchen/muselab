@@ -1566,6 +1566,13 @@ function portal() {
           this.userTodos = this._normalizeUserTodos(
             localStorage.getItem(key) || "[]",
           );
+          return;
+        }
+        if (ev.key === this._chatTabStoreKey) {
+          // Tab-strip state is shared only by same-origin browser pages. Consume
+          // the newest record without writing it back; each page keeps its own
+          // currentId so another window cannot steal focus.
+          void this._applyChatTabStorageEvent();
         }
       });
       // `pagehide` is bfcache-friendly (unlike an unconditional
@@ -6189,16 +6196,78 @@ function portal() {
       });
     },
 
+    _chatTabStoreKey: "muselab_chat_tabs_v1",
+    _chatTabStoreRevision: 0,
+    _readChatTabStore() {
+      const stored = this._getLSJson(this._chatTabStoreKey, null);
+      if (!stored || stored.schema !== 1 || !Array.isArray(stored.openTabIds)) {
+        return null;
+      }
+      return {
+        schema: 1,
+        revision: Math.max(0, Math.floor(Number(stored.revision) || 0)),
+        openTabIds: this._normalizeOpenTabIds(stored.openTabIds),
+      };
+    },
+    _writeChatTabStore(ids = this.openTabIds) {
+      const stored = this._readChatTabStore();
+      const revision = Math.max(
+        this._chatTabStoreRevision,
+        stored ? stored.revision : 0,
+      ) + 1;
+      const openTabIds = this._normalizeOpenTabIds(ids);
+      const ok = this._setLS(this._chatTabStoreKey, JSON.stringify({
+        schema: 1,
+        revision,
+        openTabIds,
+      }));
+      if (ok) this._chatTabStoreRevision = revision;
+      return ok;
+    },
+    _loadChatTabStore(legacyOpenTabIds = []) {
+      const stored = this._readChatTabStore();
+      if (stored) {
+        this._chatTabStoreRevision = stored.revision;
+        this.openTabIds = stored.openTabIds;
+        return;
+      }
+      this.openTabIds = this._normalizeOpenTabIds(legacyOpenTabIds);
+      // Establish the new key even for an empty strip. Once it exists, stale
+      // pages still writing the legacy muselab_prefs field cannot revive tabs.
+      this._writeChatTabStore(this.openTabIds);
+    },
+    async _applyChatTabStorageEvent() {
+      const stored = this._readChatTabStore();
+      if (!stored || stored.revision <= this._chatTabStoreRevision) return;
+      const previousIds = this._normalizeOpenTabIds(this.openTabIds);
+      const previousCurrent = this.currentId;
+      this._chatTabStoreRevision = stored.revision;
+      this.openTabIds = stored.openTabIds;
+      if (!previousCurrent || this.openTabIds.includes(previousCurrent)) return;
+      const previousIndex = previousIds.indexOf(previousCurrent);
+      const currentWorkspace = this.currentWorkspacePath();
+      const sameWorkspace = this.openTabIds.filter(id => {
+        const session = this.sessions.find(row => row.id === id);
+        return !currentWorkspace || (session && session.cwd === currentWorkspace);
+      });
+      const candidates = sameWorkspace.length ? sameWorkspace : this.openTabIds;
+      if (!candidates.length) return;
+      const fallbackIndex = Math.min(
+        Math.max(0, previousIndex), candidates.length - 1,
+      );
+      this.currentId = candidates[fallbackIndex];
+      try { await this.switchSession(); } catch (_) {}
+    },
+
     savePrefs() {
       // Preview-pane state (tabs, selected) persists too so a refresh restores
-      // the exact files the user was looking at — matches the chat-tab strip's
-      // behavior via openTabIds.
+      // the exact files the user was looking at. Chat-tab strip state lives in
+      // muselab_chat_tabs_v1 so unrelated preference saves cannot revive a tab.
       this._setLS("muselab_prefs", JSON.stringify({
-        schema: 9,          // v9 gives the desktop file manager useful room
+        schema: 10,         // v10 moves openTabIds to a versioned standalone key
         model: this.model, defaultModel: this.defaultModel,
         permission: this.permission, defaultPermission: this.defaultPermission,
         currentId: this.currentId,
-        openTabIds: this._normalizeOpenTabIds(this.openTabIds),
         previewTabs: this.tabs.map(t => this._previewTabSnapshot(t)),
         previewSelected: this.selected,
         previewSurface: this.previewSurface,
@@ -6223,10 +6292,10 @@ function portal() {
         // survives a refresh.
         desktopFullPane: this.desktopFullPane,
       }));
-      // Tab strip / preview tab strip / current tab are now device-local
-      // only (persisted in localStorage above). The cross-device ui-state
-      // sync was removed — it yanked the active tab out from under the user
-      // when another device pushed a different state.
+      // Preview tabs and current focus remain browser-local. The chat tab strip
+      // uses its own same-origin localStorage key; no state is sent to the backend.
+      // Cross-device ui-state stays removed because it yanked the active tab out
+      // from under the user when another device pushed a different state.
     },
 
     _scheduleSavePrefs() {
@@ -6285,9 +6354,9 @@ function portal() {
         else if (typeof p.rightWidth === "number") this.previewWidth = p.rightWidth;
         if (typeof p.showHidden === "boolean") this.showHidden = p.showHidden;
         if (p.currentId) this.currentId = p.currentId;
-        if (Array.isArray(p.openTabIds)) {
-          this.openTabIds = this._normalizeOpenTabIds(p.openTabIds);
-        }
+        // The standalone key is authoritative. p.openTabIds is accepted only as
+        // a one-time migration source for users upgrading from schema <= 9.
+        this._loadChatTabStore(p.openTabIds);
         // Preview tabs — restore the strip; the actual content fetch happens
         // lazily when the user clicks back to one (or via restorePreviewSelected
         // which runs once after login).
@@ -6738,7 +6807,10 @@ function portal() {
         newSt._loaded = true;
         newSt.effort = this._normalizeEffort(meta.effort);
         newSt.serviceTier = this._normalizeServiceTier(meta.service_tier);
-        if (!this.openTabIds.includes(meta.id)) this.openTabIds.push(meta.id);
+        if (!this.openTabIds.includes(meta.id)) {
+          this.openTabIds.push(meta.id);
+          this._writeChatTabStore(this.openTabIds);
+        }
         if (this._conversationWorkspaceIsCurrent(ownerWorkspace) && this.currentId === sid) {
           this._captureComposerState(sid);
           this.currentId = meta.id;
@@ -8665,6 +8737,7 @@ function portal() {
           id => id !== sourceSid && id !== childSid);
         if (tabIndex >= 0) this.openTabIds.splice(
           Math.min(tabIndex, this.openTabIds.length), 0, childSid);
+        this._writeChatTabStore(this.openTabIds);
         this._disposeSessionSync(sourceState);
         if (sourceState._streamTimer) clearInterval(sourceState._streamTimer);
         sourceState._streamTimer = null;
@@ -9969,14 +10042,26 @@ function portal() {
         const target = inWorkspace.find(s => s.id === remembered) || inWorkspace[0];
         this.currentId = target.id;
       }
-      // Reconcile openTabIds (restored from prefs) with what still exists on
-      // the server: drop tabs whose session was deleted, then ensure currentId
-      // is in the list. Other tabs are lazy-loaded on first switch.
+      // Reconcile openTabIds (restored from the standalone tab store) with what
+      // still exists on the server: drop deleted sessions, then choose a valid
+      // landing tab without reviving a currentId closed by another page. Other
+      // tabs are lazy-loaded on first switch.
       const validIds = new Set(this.sessions.map(s => s.id));
       this.openTabIds = this._normalizeOpenTabIds(this.openTabIds, validIds);
       if (!this.openTabIds.includes(this.currentId)) {
-        this.openTabIds.push(this.currentId);
+        // A shared tab-strip update may have closed the id saved as this page's
+        // old currentId. Prefer an existing tab instead of reviving that id.
+        const workspaceTab = this.openTabIds.find(id => {
+          const session = this.sessions.find(row => row.id === id);
+          return session && session.cwd === this.currentWorkspacePath();
+        });
+        if (workspaceTab || this.openTabIds.length) {
+          this.currentId = workspaceTab || this.openTabIds[0];
+        } else {
+          this.openTabIds.push(this.currentId);
+        }
       }
+      this._writeChatTabStore(this.openTabIds);
       if (this.currentWorkspacePath() && this.currentId) {
         this.workspaceLastSession = {
           ...this.workspaceLastSession,
@@ -11627,6 +11712,7 @@ function portal() {
         const removedIds = new Set(this.sessions.filter(s => s.cwd === path).map(s => s.id));
         for (const id of removedIds) this._disposeTabRuntime(id);
         this.openTabIds = this.openTabIds.filter(id => !removedIds.has(id));
+        this._writeChatTabStore(this.openTabIds);
         this.sessions = this.sessions.filter(s => !removedIds.has(s.id));
         const surfaces = { ...this.workspaceSurfaces };
         delete surfaces[path];
@@ -11798,7 +11884,10 @@ function portal() {
       st.effort = meta.effort;
       st.serviceTier = meta.service_tier;
       this._activateTabState(id);
-      if (!this.openTabIds.includes(id)) this.openTabIds.push(id);
+      if (!this.openTabIds.includes(id)) {
+        this.openTabIds.push(id);
+        this._writeChatTabStore(this.openTabIds);
+      }
       this._lastNewSessionAt = interactionNow;
       this._lastNewSessionMeta = meta;
       this._touchTranscriptPane(id);
@@ -11821,6 +11910,7 @@ function portal() {
           && this.sessionWorkspaces.some(w => w.path === cwd)) {
         await this._changeWorkspaceSurface(cwd);
       }
+      let opened = false;
       if (!this.openTabIds.includes(id)) {
         const MAX_TABS = 20;
         while (this.openTabIds.length >= MAX_TABS) {
@@ -11829,7 +11919,9 @@ function portal() {
           await this.closeChatTab(oldest);
         }
         this.openTabIds.push(id);
+        opened = true;
       }
+      if (opened) this._writeChatTabStore(this.openTabIds);
       if (makeCurrent && id !== this.currentId) {
         this._captureChatPosition(this.currentId);
         this.currentId = id;
@@ -11912,6 +12004,7 @@ function portal() {
           await this.newSession();
         }
       }
+      this._writeChatTabStore(this.openTabIds);
       this.savePrefs();
       // Closing a tab is a cheap, reversible action (session is still in
       // history picker / sidebar). The previous toast-with-undo was noise
@@ -13935,6 +14028,7 @@ function portal() {
       if (from < 0 || to < 0) return;
       this.openTabIds.splice(from, 1);
       this.openTabIds.splice(to, 0, src);
+      this._writeChatTabStore(this.openTabIds);
       this.savePrefs();
     },
     onTabDragEnd() {
@@ -14641,6 +14735,7 @@ function portal() {
         this._deletePersistedChatDraft(sid);
       }
       this.openTabIds = (this.openTabIds || []).filter(id => !deletedIds.has(id));
+      this._writeChatTabStore(this.openTabIds);
       await this.refreshSessions();
       this.savePrefs();
       const cleared = (resp && resp.deleted) || 0;
@@ -18225,6 +18320,7 @@ function portal() {
           await this.switchSession();
         }
       }
+      this._writeChatTabStore(this.openTabIds);
       this.savePrefs();
       return true;
     },

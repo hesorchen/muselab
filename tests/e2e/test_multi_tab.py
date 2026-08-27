@@ -86,6 +86,150 @@ def test_new_and_switch_and_close_tabs(page: Page, backend_url, auth_token):
     expect(page.locator(SEL_TAB)).to_have_count(initial + 1)
 
 
+def test_closed_tab_stays_closed_after_stale_prefs_write_and_hard_refresh(
+        page: Page, backend_url, auth_token):
+    """A legacy/stale prefs writer must not resurrect a closed chat tab."""
+    _login(page, backend_url, auth_token)
+    page.locator(SEL_TAB_NEW).click()
+    page.locator(SEL_TAB_NEW).click()
+    before = page.evaluate(
+        "document.querySelector('#app')._x_dataStack[0].openTabIds.slice()")
+    closed = before[0]
+
+    page.locator(
+        f'{SEL_TAB}[data-tid="{closed}"] {SEL_TAB_CLOSE}').click()
+    page.wait_for_function(
+        """([sid]) => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const store = JSON.parse(localStorage.getItem(
+            'muselab_chat_tabs_v1') || '{}');
+          return !app.openTabIds.includes(sid)
+            && !store.openTabIds?.includes(sid);
+        }""",
+        arg=[closed],
+    )
+
+    # Simulate a page still running the pre-v10 code: it rewrites the shared
+    # prefs record with an old tab list while changing an unrelated preference.
+    page.evaluate(
+        """([staleIds]) => {
+          const prefs = JSON.parse(localStorage.getItem('muselab_prefs') || '{}');
+          prefs.openTabIds = staleIds;
+          prefs.leftOpen = !prefs.leftOpen;
+          localStorage.setItem('muselab_prefs', JSON.stringify(prefs));
+        }""",
+        arg=[before],
+    )
+    page.reload(wait_until="domcontentloaded")
+    page.wait_for_function(
+        """([sid]) => {
+          const app = document.querySelector('#app')?._x_dataStack?.[0];
+          return app && app._sessionsInitialized && app.currentId
+            && !app.openTabIds.includes(sid);
+        }""",
+        arg=[closed],
+    )
+    restored = page.evaluate(
+        """([sid]) => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const store = JSON.parse(localStorage.getItem(
+            'muselab_chat_tabs_v1') || '{}');
+          return {
+            runtimeHasClosed: app.openTabIds.includes(sid),
+            storedHasClosed: store.openTabIds.includes(sid),
+            prefsStillContainsTabStrip: Array.isArray(JSON.parse(
+              localStorage.getItem('muselab_prefs') || '{}').openTabIds),
+          };
+        }""",
+        arg=[closed],
+    )
+    assert restored == {
+        "runtimeHasClosed": False,
+        "storedHasClosed": False,
+        "prefsStillContainsTabStrip": False,
+    }
+
+
+def test_same_origin_pages_share_strip_without_focus_theft_or_writeback(
+        page: Page, backend_url, auth_token):
+    """Storage events converge the strip but keep each page's active tab local."""
+    _login(page, backend_url, auth_token)
+    page.locator(SEL_TAB_NEW).click()
+    page.locator(SEL_TAB_NEW).click()
+    before = page.evaluate(
+        "document.querySelector('#app')._x_dataStack[0].openTabIds.slice()")
+
+    peer = page.context.new_page()
+    try:
+        _login(peer, backend_url, auth_token)
+        peer_current = before[0]
+        _activate_chat_tab(peer, peer_current)
+        peer.evaluate(
+            """() => {
+              const app = document.querySelector('#app')._x_dataStack[0];
+              window.__chatTabStoreWrites = 0;
+              const original = app._writeChatTabStore.bind(app);
+              app._writeChatTabStore = (...args) => {
+                window.__chatTabStoreWrites += 1;
+                return original(...args);
+              };
+            }"""
+        )
+
+        non_current = before[1]
+        page.locator(
+            f'{SEL_TAB}[data-tid="{non_current}"] {SEL_TAB_CLOSE}').click()
+        peer.wait_for_function(
+            """([sid, current]) => {
+              const app = document.querySelector('#app')._x_dataStack[0];
+              return !app.openTabIds.includes(sid) && app.currentId === current;
+            }""",
+            arg=[non_current, peer_current],
+        )
+        assert peer.evaluate("window.__chatTabStoreWrites") == 0
+
+        # Closing this page's active tab elsewhere selects a local fallback. The
+        # storage-event consumer still must not write the shared strip back.
+        page.locator(
+            f'{SEL_TAB}[data-tid="{peer_current}"] {SEL_TAB_CLOSE}').click()
+        peer.wait_for_function(
+            """([closed]) => {
+              const app = document.querySelector('#app')._x_dataStack[0];
+              return app.currentId !== closed && !app.openTabIds.includes(closed);
+            }""",
+            arg=[peer_current],
+        )
+        assert peer.evaluate("window.__chatTabStoreWrites") == 0
+
+        # Even if the peer's in-memory list is stale, an unrelated savePrefs()
+        # cannot overwrite the standalone authoritative tab record.
+        peer.evaluate(
+            """([staleIds]) => {
+              const app = document.querySelector('#app')._x_dataStack[0];
+              app.openTabIds = staleIds;
+              app.leftOpen = !app.leftOpen;
+              app.savePrefs();
+            }""",
+            arg=[before],
+        )
+        stored = peer.evaluate(
+            "JSON.parse(localStorage.getItem('muselab_chat_tabs_v1'))")
+        assert non_current not in stored["openTabIds"]
+        assert peer_current not in stored["openTabIds"]
+
+        page.reload(wait_until="domcontentloaded")
+        page.wait_for_function(
+            """([closed]) => {
+              const app = document.querySelector('#app')?._x_dataStack?.[0];
+              return app && app._sessionsInitialized
+                && closed.every(id => !app.openTabIds.includes(id));
+            }""",
+            arg=[[non_current, peer_current]],
+        )
+    finally:
+        peer.close()
+
+
 def test_mobile_typing_cannot_duplicate_chat_tabs(page: Page, backend_url, auth_token):
     """Dirty restored ids, Alpine input ticks and duplicate touch activation must
     still produce one DOM tab per session id."""
@@ -99,10 +243,11 @@ def test_mobile_typing_cannot_duplicate_chat_tabs(page: Page, backend_url, auth_
     page.evaluate(
         """([sid]) => {
           const prefs = JSON.parse(localStorage.getItem("muselab_prefs") || "{}");
-          prefs.schema = Math.max(9, Number(prefs.schema) || 0);
+          prefs.schema = 9;
           prefs.currentId = sid;
           prefs.openTabIds = [sid, sid];
           prefs.mobileTab = "chat";
+          localStorage.removeItem("muselab_chat_tabs_v1");
           localStorage.setItem("muselab_prefs", JSON.stringify(prefs));
         }""",
         arg=[sid],

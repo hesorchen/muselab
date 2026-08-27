@@ -173,7 +173,7 @@ def test_desktop_chat_is_center_primary_pane_and_preview_is_right_rail(
     assert result["restored"]["previewDisplay"] == "flex"
     assert result["restored"]["chat"]["right"] <= result["restored"]["preview"]["left"]
     assert result["restored"]["sameChatNode"] is True
-    assert result["prefs"]["schema"] == 9
+    assert result["prefs"]["schema"] == 10
     assert result["prefs"]["previewOpen"] is True
     assert result["prefs"]["previewWidth"] == 440
     assert "rightOpen" not in result["prefs"]

@@ -703,7 +703,7 @@ def test_desktop_layout_is_files_chat_preview_with_one_canonical_chat_dom():
     assert "leftOpen: this.leftOpen, previewOpen: this.previewOpen" in app
     assert "leftWidth: this.leftWidth, previewWidth: this.previewWidth" in app
     assert 'leftWidth: 340' in app
-    assert 'schema: 9' in app
+    assert 'schema: 10' in app
     assert 'Math.abs(p.leftWidth - 280) <= 1' in app
     assert 'else if (typeof p.rightWidth === "number")' in app
     assert 'if (next === "preview") this.previewOpen = true;' in app
@@ -793,19 +793,51 @@ def test_chat_tab_ids_are_normalized_at_restore_render_and_persist_boundaries():
     assert 'typeof id !== "string" || !id || seen.has(id)' in helper
     assert "seen.add(id)" in helper
 
-    save_start = app.index("savePrefs()")
+    store_start = app.index('_chatTabStoreKey: "muselab_chat_tabs_v1"')
+    store_end = app.index("\n    savePrefs()", store_start)
+    store = app[store_start:store_end]
+    assert "schema: 1" in store
+    assert "revision" in store
+    assert "this._normalizeOpenTabIds(stored.openTabIds)" in store
+    assert "this._normalizeOpenTabIds(ids)" in store
+    assert "stored.revision <= this._chatTabStoreRevision" in store
+
+    save_start = app.index("\n    savePrefs() {")
     save_end = app.index("\n    _scheduleSavePrefs()", save_start)
-    assert "openTabIds: this._normalizeOpenTabIds(this.openTabIds)" in app[
-        save_start:save_end]
+    save = app[save_start:save_end]
+    assert "schema: 10" in save
+    assert "openTabIds:" not in save
+    assert "/api/settings/ui-state" not in save
 
     load_start = app.index("loadPrefs()")
     load_end = app.index("\n    loadNotifyPrefs()", load_start)
-    assert "this._normalizeOpenTabIds(p.openTabIds)" in app[load_start:load_end]
+    load = app[load_start:load_end]
+    assert "this._loadChatTabStore(p.openTabIds)" in load
+
+    storage_start = app.index('window.addEventListener("storage"')
+    storage_end = app.index("\n      });", storage_start)
+    storage = app[storage_start:storage_end]
+    assert "void this._applyChatTabStorageEvent()" in storage
+    event_start = app.index("async _applyChatTabStorageEvent()")
+    event_end = app.index("\n    savePrefs()", event_start)
+    event_handler = app[event_start:event_end]
+    assert "_writeChatTabStore" not in event_handler
+    assert "savePrefs" not in event_handler
 
     init_start = app.index("async _initSessionsOnce(options = {})")
     init_end = app.index("\n    async _pullSessionList", init_start)
-    assert "this._normalizeOpenTabIds(this.openTabIds, validIds)" in app[
-        init_start:init_end]
+    init = app[init_start:init_end]
+    assert "this._normalizeOpenTabIds(this.openTabIds, validIds)" in init
+    assert "this._writeChatTabStore(this.openTabIds)" in init
+
+    close_start = app.index("async closeChatTab(id, ev)")
+    close_end = app.index("\n    // Inline rename", close_start)
+    assert "this._writeChatTabStore(this.openTabIds)" in app[
+        close_start:close_end]
+    new_start = app.index("\n    newSession(options = {}) {")
+    new_end = app.index("\n    async openTab", new_start)
+    assert "this._writeChatTabStore(this.openTabIds)" in app[
+        new_start:new_end]
 
     workspace_start = app.index("workspaceOpenTabIds(path = \"\")")
     workspace_end = app.index("\n    sessionInCurrentWorkspace", workspace_start)
