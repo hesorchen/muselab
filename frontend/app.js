@@ -1140,6 +1140,7 @@ function portal() {
       // services are touched only by an explicit probe or an enabled config.
       memory: {
         loading: false, saving: false, probing: false, actionRunning: false,
+        backupRunning: false,
         config: {
           schema_version: 1, mode: "off", owner_id: "default",
           generation_model: "",
@@ -4180,6 +4181,33 @@ function portal() {
       if (d.getFullYear() === now.getFullYear()) return `${M}-${D} ${hh}:${mm}`;
       return `${d.getFullYear()}-${M}-${D} ${hh}:${mm}`;
     },
+    _turnMessageBelongsToActiveTurn(m, pane) {
+      if (!m || !pane || !pane.streaming || !Array.isArray(pane.messages)) {
+        return false;
+      }
+      const index = pane.messages.indexOf(m);
+      if (index < 0) return false;
+
+      let ownerUser = null;
+      for (let k = index; k >= 0; k -= 1) {
+        if (pane.messages[k] && pane.messages[k].role === "user") {
+          ownerUser = pane.messages[k];
+          break;
+        }
+      }
+      if (!ownerUser) return false;
+
+      const ownerTurnId = String(ownerUser._turnId || "");
+      const activeTurnId = String(pane.activeTurnId || "");
+      if (ownerTurnId && activeTurnId) return ownerTurnId === activeTurnId;
+
+      // Before the first turn metadata event arrives, the newest user boundary
+      // is the only reply run that can own the pane-level live state.
+      for (let k = index + 1; k < pane.messages.length; k += 1) {
+        if (pane.messages[k] && pane.messages[k].role === "user") return false;
+      }
+      return true;
+    },
     turnFooterStatus(m, pane) {
       const stored = String((m && m.turn_status)
         || (m && m._interrupted ? "cancelled" : "")
@@ -4190,9 +4218,12 @@ function portal() {
       // live footer appears when the reaction stream actually starts.
       if (pane && pane._continuationAwaitingReaction) return "";
       // Fresh live bubbles are created before the terminal done payload can
-      // stamp turn_status.  A canonical historical footer already has ts, so
-      // never relabel such a prior turn just because a newer stream is active.
-      if (pane && pane.streaming && m && !m.ts) return "running";
+      // stamp turn_status. Only the active user-delimited turn may borrow the
+      // pane-level live state; an older tail can also lack ts while canonical
+      // reconciliation is still adopting its completed metadata.
+      if (m && !m.ts && this._turnMessageBelongsToActiveTurn(m, pane)) {
+        return "running";
+      }
       // Compatibility for cached/front-end-injected records created before
       // turn_status became part of the footer contract.  Their terminal `ts`
       // is already durable proof that the turn closed; keep the footer and
@@ -4252,9 +4283,12 @@ function portal() {
       return Number.isFinite(value) && value >= 0 ? value : null;
     },
     turnFooterModel(m, pane, sid) {
-      const live = String((m && m.model)
-        || (pane && pane.streamingModel) || "");
-      if (live) return live;
+      const stored = String((m && m.model) || "");
+      if (stored) return stored;
+      if (this._turnMessageBelongsToActiveTurn(m, pane)) {
+        const live = String((pane && pane.streamingModel) || "");
+        if (live) return live;
+      }
       const meta = (this.sessions || []).find(session => session.id === sid);
       return String((meta && meta.model) || "");
     },
@@ -14759,13 +14793,12 @@ function portal() {
         this.toast(this.lang === "zh" ? "导出失败" : "Export failed", "error");
       }
     },
-    async menuCopySessionEvidence(id) {
-      this.closeTabMenu();
-      if (!id) return;
+    async _copySessionEvidence(id) {
+      if (!id) return false;
       try {
         const response = await fetch(
           `/api/chat/sessions/${encodeURIComponent(id)}/evidence`,
-          { headers: this.hdr() },
+          { headers: this.hdr(), cache: "no-store" },
         );
         if (!response.ok) throw new Error(await response.text());
         const evidence = await response.json();
@@ -14775,15 +14808,21 @@ function portal() {
         await navigator.clipboard.writeText(JSON.stringify(evidence, null, 2));
         this.toast(
           this.lang === "zh" ? "已复制会话证据 JSON" : "Session evidence JSON copied",
-          "success",
-          1800,
+          "success", 1800,
         );
+        return true;
       } catch (_) {
         this.errToast(
           "copy-session-evidence",
           this.lang === "zh" ? "复制失败，需要 HTTPS 且会话须已有记录" : "Copy failed; HTTPS and an existing transcript are required",
         );
+        return false;
       }
+    },
+
+    async menuCopySessionEvidence(id) {
+      this.closeTabMenu();
+      await this._copySessionEvidence(id);
     },
     async menuDelete(id) {
       this.closeTabMenu();
@@ -16813,21 +16852,29 @@ function portal() {
       };
       const hydrate = async () => {
         const items = Array.isArray(recall.items) ? recall.items : [];
-        const needsDetails = items.some(item => item?.id && !item.content);
+        const needsDetails = items.some(
+          item => item?.id && (!item.content || !item._traceback));
         if (!needsDetails) return;
         const hydrated = await Promise.all(items.map(async item => {
-          if (!item?.id || item.content) return item;
+          if (!item?.id || (item.content && item._traceback)) return item;
           try {
-            const response = await fetch(
-              "/api/memory/items/" + encodeURIComponent(item.id),
-              { headers: this.hdr(), cache: "no-store" },
-            );
-            if (!response.ok) return item;
-            const detail = await response.json();
+            const base = "/api/memory/items/" + encodeURIComponent(item.id);
+            const [detailResponse, tracebackResponse] = await Promise.all([
+              fetch(base, { headers: this.hdr(), cache: "no-store" }),
+              fetch(base + "/traceback", {
+                headers: this.hdr(), cache: "no-store",
+              }),
+            ]);
+            const detail = detailResponse.ok ? await detailResponse.json() : {};
+            const traceback = tracebackResponse.ok
+              ? await tracebackResponse.json() : { sites: [] };
             return {
               ...item,
               kind: detail.kind || item.kind,
-              content: detail.content || "",
+              content: detail.content || item.content || "",
+              sources: detail.sources || item.sources || [],
+              recall_stats: detail.recall_stats || item.recall_stats || null,
+              _traceback: traceback.sites || [],
             };
           } catch (_) { return item; }
         }));
@@ -16956,6 +17003,70 @@ function portal() {
     async openMemoryCenter(tab = "") {
       if (tab) this.settings.memory.tab = tab;
       await this.openSettings("memory");
+    },
+
+    memoryRecallStatsText(item) {
+      const stats = item?.recall_stats;
+      if (!stats) return "";
+      const parts = [this.lang === "zh"
+        ? `召回 ${stats.recall_count || 0} 次`
+        : `${stats.recall_count || 0} recalls`];
+      if (stats.last_recalled_at) parts.push(
+        (this.lang === "zh" ? "最近 " : "last ")
+        + new Date(stats.last_recalled_at * 1000).toLocaleString());
+      parts.push(`↑ ${stats.helpful_count || 0} · ↓ ${stats.unhelpful_count || 0}`);
+      return parts.join(" · ");
+    },
+
+    async loadMemoryTraceback(item) {
+      if (!item?.id) return [];
+      if (Array.isArray(item._traceback)) return item._traceback;
+      try {
+        const response = await fetch(
+          `/api/memory/items/${encodeURIComponent(item.id)}/traceback`,
+          { headers: this.hdr(), cache: "no-store" },
+        );
+        if (!response.ok) throw new Error(await response.text());
+        item._traceback = (await response.json()).sites || [];
+      } catch (_) {
+        item._traceback = [];
+      }
+      return item._traceback;
+    },
+
+    async openMemorySource(item) {
+      const site = (await this.loadMemoryTraceback(item))[0];
+      if (!site?.session_id) {
+        this.toast(this.lang === "zh" ? "没有可打开的来源会话" : "No source session available", "warn");
+        return;
+      }
+      this.closeMemoryRecallPopover();
+      this.settings.show = false;
+      if (site.can_jump_to_message && site.message_id) {
+        await this._jumpToMessage(site.session_id, site.message_id);
+      } else {
+        await this.openTab(site.session_id);
+      }
+    },
+
+    async copyMemorySourceEvidence(item) {
+      const site = (await this.loadMemoryTraceback(item))[0];
+      if (!site?.session_id) {
+        this.toast(this.lang === "zh" ? "没有可复制的来源会话" : "No source session available", "warn");
+        return;
+      }
+      await this._copySessionEvidence(site.session_id);
+    },
+
+    memoryRecallResultsText(item) {
+      const results = Array.isArray(item?.results) ? item.results : [];
+      if (!results.length) return this.lang === "zh" ? "未命中记忆" : "No memories returned";
+      return results.map(result => {
+        const channels = Array.isArray(result.channels) ? result.channels.join("+") : "";
+        const score = Number.isFinite(Number(result.score))
+          ? Number(result.score).toFixed(4) : "-";
+        return `${result.id || "?"} · ${channels || "unknown"} · ${score}`;
+      }).join("\n");
     },
 
     _memoryConfigPayload() {
@@ -17093,6 +17204,7 @@ function portal() {
       else if (mem.tab === "skills") url = "/api/memory/artifacts?kind=skill_candidate&limit=200";
       else if (mem.tab === "jobs") url = "/api/memory/jobs?limit=200";
       else if (mem.tab === "recalls") url = "/api/memory/recalls?limit=200";
+      else if (mem.tab === "backups") url = "/api/memory/backups?limit=200";
       else if (mem.tab === "audit") url = "/api/memory/audit?limit=200";
       if (mem.tab === "items") {
         const qs = new URLSearchParams({ limit: "200" });
@@ -17239,6 +17351,8 @@ function portal() {
           body: JSON.stringify({ useful: !!useful, recall_id: recallId || null }),
         });
       if (!r.ok) { this.toast(await r.text(), "error"); return; }
+      const updated = await r.json().catch(() => ({}));
+      if (updated.recall_stats) item.recall_stats = updated.recall_stats;
       item._feedback = useful ? "up" : "down";
       this.toast(this.lang === "zh" ? "已记录，将影响后续召回排序"
         : "Feedback recorded for future ranking", "success");
@@ -17270,6 +17384,29 @@ function portal() {
           ? (this.lang === "zh" ? "Skill 已停用并移出发现目录" : "Skill disabled and undiscoverable")
           : (this.lang === "zh" ? "候选已拒绝" : "Candidate rejected"), "success");
       await this.refreshMemoryCenter();
+    },
+
+    async memoryCreateBackup() {
+      const mem = this.settings.memory;
+      mem.backupRunning = true;
+      try {
+        const response = await fetch("/api/memory/backup", {
+          method: "POST", headers: this.hdr(),
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(this._memoryErrorDetail(data, response.status));
+        const receipt = data.backup || {};
+        this.toast(this.lang === "zh"
+          ? `备份已验证：${receipt.filename || receipt.id}`
+          : `Verified backup created: ${receipt.filename || receipt.id}`, "success", 5000);
+        mem.tab = "backups";
+        await this.refreshMemoryCenter();
+      } catch (error) {
+        this.toast((this.lang === "zh" ? "备份失败：" : "Backup failed: ")
+          + (error.message || error), "error", 6000);
+      } finally {
+        mem.backupRunning = false;
+      }
     },
 
     async memoryRunAction(action) {

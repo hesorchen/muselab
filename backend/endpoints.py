@@ -1071,6 +1071,8 @@ DUCC_MODELS: tuple[tuple[str, str, str], ...] = (
     ("glm-5", "GLM-5", "GLM 5"),
     ("glm-5-1", "GLM-5.1", "GLM 5.1"),
     ("glm-5-2", "GLM-5.2", "GLM 5.2"),
+    ("glm-5-3", "GLM-5.3", "GLM 5.3"),
+    ("glm-5-3-flash", "GLM-5.3-Flash", "GLM 5.3 Flash"),
     ("glm-5-turbo", "GLM-5-Turbo", "GLM 5 Turbo"),
     ("grok-4-5", "grok-4.5", "Grok 4.5"),
     ("gpt-5-5", "gpt-5.5", "GPT 5.5"),

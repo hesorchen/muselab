@@ -10,6 +10,7 @@ from .auth import require_token
 from .memory_config import (
     MemoryConfig,
     load_config,
+    memory_dir,
     public_config,
     save_config,
 )
@@ -154,9 +155,12 @@ async def list_items(
         rows = store.list_memories(
             cfg.owner_id, query=q, kind=kind, status=status,
             limit=limit, offset=offset)
-        sources = store.memory_sources([row["id"] for row in rows])
+        memory_ids = [row["id"] for row in rows]
+        sources = store.memory_sources(memory_ids)
+        stats = store.memory_recall_stats(cfg.owner_id, memory_ids)
         for row in rows:
             row["sources"] = sources.get(row["id"], [])
+            row["recall_stats"] = stats[row["id"]]
         return {"items": rows, "count": len(rows)}
 
     return await engine._store_call(load)
@@ -186,7 +190,21 @@ async def get_item(memory_id: str) -> dict:
         lambda store: store.memory(memory_id))
     if not item or item.get("owner_id") != cfg.owner_id:
         raise HTTPException(404, "memory not found")
+    item["recall_stats"] = (await engine._store_call(
+        lambda store: store.memory_recall_stats(cfg.owner_id, [memory_id])
+    ))[memory_id]
     return item
+
+
+@router.get("/items/{memory_id}/traceback")
+async def get_item_traceback(memory_id: str) -> dict:
+    cfg = load_config()
+    try:
+        sites = await engine._store_call(
+            lambda store: store.memory_traceback(cfg.owner_id, memory_id))
+    except KeyError:
+        raise HTTPException(404, "memory not found") from None
+    return {"memory_id": memory_id, "sites": sites}
 
 
 @router.post("/items/{memory_id}/correct")
@@ -235,18 +253,23 @@ async def feedback_item(memory_id: str, body: MemoryFeedback) -> dict:
     cfg = load_config()
 
     def apply_feedback(store):
-        item = store.memory(memory_id)
-        if not item or item.get("owner_id") != cfg.owner_id:
-            raise HTTPException(404, "memory not found")
+        try:
+            stats = store.feedback_memory(
+                cfg.owner_id, memory_id, useful=body.useful,
+                recall_id=body.recall_id)
+        except KeyError:
+            raise HTTPException(404, "memory not found") from None
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from None
+        item = store.memory(memory_id) or {}
+        item["recall_stats"] = stats
+        # Response-only compatibility for older clients; normalized stats remain
+        # the sole persisted source of truth.
         attributes = dict(item.get("attributes") or {})
-        key = "helpful_count" if body.useful else "unhelpful_count"
-        attributes[key] = int(attributes.get(key, 0)) + 1
-        attributes["last_feedback_recall_id"] = body.recall_id
-        updated = store.update_memory(memory_id, attributes=attributes)
-        store.audit(
-            cfg.owner_id, "feedback", "memory", memory_id,
-            {"useful": body.useful, "recall_id": body.recall_id})
-        return updated or item
+        attributes["helpful_count"] = stats["helpful_count"]
+        attributes["unhelpful_count"] = stats["unhelpful_count"]
+        item["attributes"] = attributes
+        return item
 
     return await engine._store_call(apply_feedback)
 
@@ -334,6 +357,24 @@ async def list_audit(limit: int = Query(default=100, ge=1, le=500)) -> dict:
     cfg = load_config()
     rows = await engine._store_call(
         lambda store: store.audits(cfg.owner_id, limit=limit))
+    return {"items": rows, "count": len(rows)}
+
+
+@router.post("/backup")
+async def create_backup() -> dict:
+    cfg = load_config()
+    receipt = await engine._store_call(
+        lambda store: store.create_backup(cfg.owner_id, memory_dir() / "backups"))
+    return {"ok": True, "backup": receipt}
+
+
+@router.get("/backups")
+async def list_backups(
+    limit: int = Query(default=100, ge=1, le=500),
+) -> dict:
+    cfg = load_config()
+    rows = await engine._store_call(lambda store: store.list_backups(
+        cfg.owner_id, memory_dir() / "backups", limit=limit))
     return {"items": rows, "count": len(rows)}
 
 

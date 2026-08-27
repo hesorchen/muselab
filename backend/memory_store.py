@@ -8,10 +8,12 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import sqlite3
 import threading
 import time
 import uuid
+from datetime import datetime, timezone
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -284,6 +286,29 @@ class MemoryStore:
           query TEXT NOT NULL, results_json TEXT NOT NULL, latency_ms REAL NOT NULL,
           status TEXT NOT NULL, created_at REAL NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS memory_recall_stats (
+          owner_id TEXT NOT NULL, memory_id TEXT NOT NULL
+            REFERENCES memories(id) ON DELETE CASCADE,
+          recall_count INTEGER NOT NULL DEFAULT 0,
+          first_recalled_at REAL, last_recalled_at REAL,
+          helpful_count INTEGER NOT NULL DEFAULT 0,
+          unhelpful_count INTEGER NOT NULL DEFAULT 0,
+          updated_at REAL NOT NULL,
+          PRIMARY KEY(owner_id,memory_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_memory_recall_stats_owner_last
+          ON memory_recall_stats(owner_id,last_recalled_at DESC);
+        CREATE TABLE IF NOT EXISTS memory_backups (
+          id TEXT PRIMARY KEY, owner_id TEXT NOT NULL, filename TEXT NOT NULL UNIQUE,
+          sha256 TEXT NOT NULL, size_bytes INTEGER NOT NULL,
+          quick_check TEXT NOT NULL, counts_json TEXT NOT NULL,
+          created_at REAL NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_memory_backups_owner_created
+          ON memory_backups(owner_id,created_at DESC);
+        CREATE TABLE IF NOT EXISTS memory_migrations (
+          name TEXT PRIMARY KEY, applied_at REAL NOT NULL, details_json TEXT NOT NULL DEFAULT '{}'
+        );
         CREATE TABLE IF NOT EXISTS audit (
           id TEXT PRIMARY KEY, owner_id TEXT NOT NULL, action TEXT NOT NULL,
           target_type TEXT NOT NULL, target_id TEXT NOT NULL,
@@ -298,6 +323,7 @@ class MemoryStore:
             conn.executescript(schema)
             self._migrate_columns(conn)
             self._migrate_fts(conn)
+            self._migrate_recall_stats(conn)
 
     @staticmethod
     def _migrate_columns(conn: sqlite3.Connection) -> None:
@@ -331,6 +357,86 @@ class MemoryStore:
              for row in rows],
         )
         conn.execute(f"PRAGMA user_version={_FTS_SCHEMA_VERSION}")
+
+    @staticmethod
+    def _migrate_recall_stats(conn: sqlite3.Connection) -> None:
+        """Idempotently backfill normalized per-memory telemetry.
+
+        The migration is independent from PRAGMA user_version because that marker
+        belongs to the rebuildable FTS representation. A single transaction keeps
+        a process interruption from leaving a half-counted historical Registry.
+        Malformed legacy result JSON is skipped rather than blocking startup.
+        """
+        name = "memory-recall-stats-v1"
+        if conn.execute(
+                "SELECT 1 FROM memory_migrations WHERE name=?", (name,)).fetchone():
+            return
+        now = _now()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute("DELETE FROM memory_recall_stats")
+            rows = conn.execute(
+                "SELECT owner_id,results_json,created_at FROM recall_logs "
+                "ORDER BY created_at,id"
+            ).fetchall()
+            for row in rows:
+                try:
+                    results = json.loads(row["results_json"])
+                except Exception:
+                    continue
+                if not isinstance(results, list):
+                    continue
+                memory_ids = {
+                    str(item.get("id")) for item in results
+                    if isinstance(item, dict) and item.get("id")
+                }
+                for memory_id in memory_ids:
+                    if conn.execute(
+                        "SELECT 1 FROM memories WHERE id=? AND owner_id=?",
+                        (memory_id, row["owner_id"]),
+                    ).fetchone() is None:
+                        continue
+                    conn.execute(
+                        """INSERT INTO memory_recall_stats
+                           (owner_id,memory_id,recall_count,first_recalled_at,
+                            last_recalled_at,updated_at) VALUES (?,?,1,?,?,?)
+                           ON CONFLICT(owner_id,memory_id) DO UPDATE SET
+                             recall_count=recall_count+1,
+                             first_recalled_at=min(first_recalled_at,excluded.first_recalled_at),
+                             last_recalled_at=max(last_recalled_at,excluded.last_recalled_at),
+                             updated_at=excluded.updated_at""",
+                        (row["owner_id"], memory_id, row["created_at"],
+                         row["created_at"], now),
+                    )
+            for row in conn.execute(
+                    "SELECT id,owner_id,attributes_json FROM memories"):
+                try:
+                    attributes = json.loads(row["attributes_json"])
+                except Exception:
+                    continue
+                helpful = max(0, int(attributes.get("helpful_count", 0) or 0))
+                unhelpful = max(0, int(attributes.get("unhelpful_count", 0) or 0))
+                if not helpful and not unhelpful:
+                    continue
+                conn.execute(
+                    """INSERT INTO memory_recall_stats
+                       (owner_id,memory_id,helpful_count,unhelpful_count,updated_at)
+                       VALUES (?,?,?,?,?)
+                       ON CONFLICT(owner_id,memory_id) DO UPDATE SET
+                         helpful_count=max(helpful_count,excluded.helpful_count),
+                         unhelpful_count=max(unhelpful_count,excluded.unhelpful_count),
+                         updated_at=excluded.updated_at""",
+                    (row["owner_id"], row["id"], helpful, unhelpful, now),
+                )
+            conn.execute(
+                "INSERT INTO memory_migrations(name,applied_at,details_json) "
+                "VALUES (?,?,?)",
+                (name, now, _json({"recall_logs": len(rows)})),
+            )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
 
     @staticmethod
     def _row(row: sqlite3.Row | None) -> dict | None:
@@ -583,6 +689,52 @@ class MemoryStore:
                 rows.extend(found[item_id] for item_id in chunk if item_id in found)
         return rows
 
+    def memory_recall_stats(self, owner_id: str,
+                            memory_ids: list[str]) -> dict[str, dict]:
+        if not memory_ids:
+            return {}
+        unique_ids = list(dict.fromkeys(memory_ids))
+        grouped = {
+            memory_id: {
+                "recall_count": 0,
+                "first_recalled_at": None,
+                "last_recalled_at": None,
+                "helpful_count": 0,
+                "unhelpful_count": 0,
+            }
+            for memory_id in unique_ids
+        }
+        with self._lock, self._connect() as conn:
+            for start in range(0, len(unique_ids), 500):
+                chunk = unique_ids[start:start + 500]
+                placeholders = ",".join("?" for _ in chunk)
+                rows = conn.execute(
+                    f"""SELECT memory_id,recall_count,first_recalled_at,
+                               last_recalled_at,helpful_count,unhelpful_count
+                        FROM memory_recall_stats
+                        WHERE owner_id=? AND memory_id IN ({placeholders})""",
+                    (owner_id, *chunk),
+                ).fetchall()
+                for row in rows:
+                    grouped[str(row["memory_id"])] = {
+                        "recall_count": int(row["recall_count"]),
+                        "first_recalled_at": row["first_recalled_at"],
+                        "last_recalled_at": row["last_recalled_at"],
+                        "helpful_count": int(row["helpful_count"]),
+                        "unhelpful_count": int(row["unhelpful_count"]),
+                    }
+        return grouped
+
+    def memories_with_stats_by_ids(self, owner_id: str,
+                                   memory_ids: list[str]) -> list[dict]:
+        rows = self.memories_by_ids(memory_ids)
+        stats = self.memory_recall_stats(owner_id, [row["id"] for row in rows])
+        sources = self.memory_sources([row["id"] for row in rows])
+        for row in rows:
+            row["recall_stats"] = stats[row["id"]]
+            row["sources"] = sources.get(row["id"], [])
+        return rows
+
     def mark_memories_indexed(
         self,
         memory_ids: list[str],
@@ -640,6 +792,78 @@ class MemoryStore:
                 "relation": row["relation"],
             })
         return grouped
+
+    @staticmethod
+    def _valid_uuid(value: str) -> bool:
+        try:
+            uuid.UUID(str(value))
+            return True
+        except (ValueError, TypeError, AttributeError):
+            return False
+
+    def memory_traceback(self, owner_id: str, memory_id: str) -> list[dict]:
+        """Resolve provenance to server-owned session/message navigation sites.
+
+        No filesystem path or transcript content leaves this layer. Evidence and
+        Episode sources only open their owning session; a precise message jump is
+        exposed solely for an explicitly stored message source with UUID IDs.
+        """
+        with self._lock, self._connect() as conn:
+            memory = conn.execute(
+                "SELECT 1 FROM memories WHERE id=? AND owner_id=?",
+                (memory_id, owner_id),
+            ).fetchone()
+            if memory is None:
+                raise KeyError(memory_id)
+            sources = conn.execute(
+                """SELECT source_type,source_id,relation FROM memory_sources
+                   WHERE memory_id=? ORDER BY source_type,source_id""",
+                (memory_id,),
+            ).fetchall()
+            sites: list[dict] = []
+            for source in sources:
+                source_type = str(source["source_type"])
+                source_id = str(source["source_id"])
+                session_id: str | None = None
+                message_id: str | None = None
+                if source_type == "episode":
+                    row = conn.execute(
+                        "SELECT primary_session_id FROM episodes "
+                        "WHERE id=? AND owner_id=?",
+                        (source_id, owner_id),
+                    ).fetchone()
+                    session_id = str(row["primary_session_id"]) if row else None
+                elif source_type == "evidence":
+                    row = conn.execute(
+                        "SELECT session_id FROM evidence WHERE id=? AND owner_id=?",
+                        (source_id, owner_id),
+                    ).fetchone()
+                    session_id = str(row["session_id"]) if row else None
+                elif source_type == "message" and ":" in source_id:
+                    candidate_session, candidate_message = source_id.split(":", 1)
+                    if self._valid_uuid(candidate_session):
+                        session_id = candidate_session
+                        if self._valid_uuid(candidate_message):
+                            message_id = candidate_message
+                if not session_id or not self._valid_uuid(session_id):
+                    continue
+                sites.append({
+                    "source_type": source_type,
+                    "source_id": source_id,
+                    "relation": source["relation"],
+                    "session_id": session_id,
+                    "message_id": message_id,
+                    "can_jump_to_message": message_id is not None,
+                })
+        deduped: list[dict] = []
+        seen: set[tuple[str, str | None]] = set()
+        for site in sites:
+            key = (site["session_id"], site["message_id"])
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(site)
+        return deduped
 
     def update_memory(self, memory_id: str, *, content: str | None = None,
                       status: str | None = None, kind: str | None = None,
@@ -889,26 +1113,194 @@ class MemoryStore:
             return [self._row(row) or {} for row in conn.execute(
                 "SELECT * FROM jobs ORDER BY created_at DESC LIMIT ?", (limit,))]
 
+    @staticmethod
+    def new_recall_id() -> str:
+        return _id("recall")
+
     def log_recall(self, owner_id: str, session_id: str, query: str,
-                   results: list[dict], latency_ms: float, status: str) -> str:
-        recall_id = _id("recall")
+                   results: list[dict], latency_ms: float, status: str,
+                   *, recall_id: str | None = None,
+                   created_at: float | None = None) -> str:
+        recall_id = recall_id or self.new_recall_id()
+        recalled_at = created_at or _now()
         safe = [{"id": item.get("id"), "score": item.get("score"),
                  "channels": item.get("channels", [])} for item in results]
-        with self._lock, self._connect() as conn:
+        memory_ids = list(dict.fromkeys(
+            str(item["id"]) for item in safe if item.get("id")))
+        with self._write_tx() as conn:
             conn.execute(
                 """INSERT INTO recall_logs
                    (id,owner_id,session_id,query,results_json,latency_ms,status,created_at)
                    VALUES (?,?,?,?,?,?,?,?)""",
                 (recall_id, owner_id, session_id, query[:2000], _json(safe),
-                 latency_ms, status, _now()),
+                 latency_ms, status, recalled_at),
             )
+            for memory_id in memory_ids:
+                if conn.execute(
+                    "SELECT 1 FROM memories WHERE id=? AND owner_id=?",
+                    (memory_id, owner_id),
+                ).fetchone() is None:
+                    continue
+                conn.execute(
+                    """INSERT INTO memory_recall_stats
+                       (owner_id,memory_id,recall_count,first_recalled_at,
+                        last_recalled_at,updated_at) VALUES (?,?,1,?,?,?)
+                       ON CONFLICT(owner_id,memory_id) DO UPDATE SET
+                         recall_count=recall_count+1,
+                         first_recalled_at=CASE
+                           WHEN first_recalled_at IS NULL THEN excluded.first_recalled_at
+                           ELSE min(first_recalled_at,excluded.first_recalled_at) END,
+                         last_recalled_at=CASE
+                           WHEN last_recalled_at IS NULL THEN excluded.last_recalled_at
+                           ELSE max(last_recalled_at,excluded.last_recalled_at) END,
+                         updated_at=excluded.updated_at""",
+                    (owner_id, memory_id, recalled_at, recalled_at, recalled_at),
+                )
         return recall_id
+
+    def feedback_memory(self, owner_id: str, memory_id: str, *, useful: bool,
+                        recall_id: str | None = None) -> dict:
+        now = _now()
+        with self._write_tx() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM memories WHERE id=? AND owner_id=?",
+                (memory_id, owner_id),
+            ).fetchone()
+            if row is None:
+                raise KeyError(memory_id)
+            if recall_id:
+                recall = conn.execute(
+                    "SELECT results_json FROM recall_logs WHERE id=? AND owner_id=?",
+                    (recall_id, owner_id),
+                ).fetchone()
+                if recall is None:
+                    raise ValueError("recall does not contain this memory")
+                try:
+                    results = json.loads(recall["results_json"])
+                except Exception:
+                    results = []
+                if not isinstance(results, list) or not any(
+                    isinstance(item, dict) and str(item.get("id")) == memory_id
+                    for item in results
+                ):
+                    raise ValueError("recall does not contain this memory")
+            conn.execute(
+                """INSERT INTO memory_recall_stats
+                   (owner_id,memory_id,helpful_count,unhelpful_count,updated_at)
+                   VALUES (?,?,?, ?,?)
+                   ON CONFLICT(owner_id,memory_id) DO UPDATE SET
+                     helpful_count=helpful_count+excluded.helpful_count,
+                     unhelpful_count=unhelpful_count+excluded.unhelpful_count,
+                     updated_at=excluded.updated_at""",
+                (owner_id, memory_id, 1 if useful else 0,
+                 0 if useful else 1, now),
+            )
+            stats = conn.execute(
+                """SELECT recall_count,first_recalled_at,last_recalled_at,
+                          helpful_count,unhelpful_count
+                   FROM memory_recall_stats WHERE owner_id=? AND memory_id=?""",
+                (owner_id, memory_id),
+            ).fetchone()
+        self.audit(owner_id, "feedback", "memory", memory_id,
+                   {"useful": useful, "recall_id": recall_id})
+        return dict(stats)
 
     def recent_recalls(self, owner_id: str, *, limit: int = 100) -> list[dict]:
         with self._lock, self._connect() as conn:
             return [self._row(row) or {} for row in conn.execute(
                 "SELECT * FROM recall_logs WHERE owner_id=? ORDER BY created_at DESC LIMIT ?",
                 (owner_id, limit))]
+
+    def create_backup(self, owner_id: str, backup_dir: Path) -> dict:
+        """Create and verify an online SQLite backup in a trusted directory."""
+        backup_dir = Path(backup_dir)
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        backup_dir.chmod(0o700)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+        backup_id = _id("backup")
+        filename = f"registry-{stamp}-{backup_id[-12:]}.sqlite3"
+        target = backup_dir / filename
+        if target.parent.resolve() != backup_dir.resolve():
+            raise ValueError("backup target escapes trusted directory")
+        counts: dict[str, int] = {}
+        try:
+            with self._lock, self._connect() as source:
+                destination = sqlite3.connect(target)
+                try:
+                    source.backup(destination)
+                    destination.commit()
+                finally:
+                    destination.close()
+            target.chmod(0o600)
+            with target.open("rb") as stream:
+                os.fsync(stream.fileno())
+            with sqlite3.connect(f"file:{target}?mode=ro", uri=True) as check:
+                quick_rows = [str(row[0]) for row in check.execute("PRAGMA quick_check")]
+                quick_check = "\n".join(quick_rows)
+                if quick_rows != ["ok"]:
+                    raise RuntimeError("backup quick_check failed")
+                tables = [
+                    "evidence", "episodes", "episode_evidence", "memories",
+                    "memory_sources", "relations", "artifacts", "jobs",
+                    "recall_logs", "memory_recall_stats", "audit",
+                ]
+                counts = {
+                    table: int(check.execute(
+                        f"SELECT count(*) FROM {table}").fetchone()[0])
+                    for table in tables
+                }
+            digest = hashlib.sha256()
+            with target.open("rb") as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            size_bytes = target.stat().st_size
+            directory_fd = os.open(backup_dir, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+            created_at = _now()
+            with self._lock, self._connect() as conn:
+                conn.execute(
+                    """INSERT INTO memory_backups
+                       (id,owner_id,filename,sha256,size_bytes,quick_check,
+                        counts_json,created_at) VALUES (?,?,?,?,?,?,?,?)""",
+                    (backup_id, owner_id, filename, digest.hexdigest(), size_bytes,
+                     quick_check, _json(counts), created_at),
+                )
+            receipt = {
+                "id": backup_id, "filename": filename,
+                "sha256": digest.hexdigest(), "size_bytes": size_bytes,
+                "quick_check": quick_check, "counts": counts,
+                "created_at": created_at,
+            }
+            self.audit(owner_id, "backup", "registry", backup_id, receipt)
+            return receipt
+        except Exception:
+            try:
+                target.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
+
+    def list_backups(self, owner_id: str, backup_dir: Path,
+                     *, limit: int = 100) -> list[dict]:
+        backup_dir = Path(backup_dir).resolve()
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                """SELECT * FROM memory_backups WHERE owner_id=?
+                   ORDER BY created_at DESC LIMIT ?""",
+                (owner_id, limit),
+            ).fetchall()
+        receipts: list[dict] = []
+        for row in rows:
+            receipt = self._row(row) or {}
+            filename = str(receipt.get("filename", ""))
+            path = backup_dir / filename
+            receipt["exists"] = (
+                path.parent.resolve() == backup_dir and path.is_file())
+            receipts.append(receipt)
+        return receipts
 
     def audit(self, owner_id: str, action: str, target_type: str, target_id: str,
               details: dict | None = None) -> str:

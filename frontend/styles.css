@@ -11750,10 +11750,33 @@ html[data-theme="eyecare"] .tool-error-hint {
   overflow-wrap: anywhere;
   font-size: 12px;
 }
-.memory-source {
+.memory-source,
+.memory-stats,
+.memory-recall-row-meta {
   color: var(--c-fg-3);
   overflow-wrap: anywhere;
   font-size: 10px;
+}
+.memory-stats { margin-top: 5px; font-family: var(--font-mono); }
+.memory-source-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-top: 6px;
+}
+.memory-recall-results {
+  margin: 6px 0;
+  color: var(--c-fg-2);
+  background: transparent;
+  white-space: pre-wrap;
+  font: 10px/1.5 var(--font-mono);
+}
+.memory-backup-receipt { display: grid; gap: 5px; }
+.memory-backup-receipt code {
+  color: var(--c-fg-3);
+  overflow-wrap: anywhere;
+  font: 9px/1.4 var(--font-mono);
 }
 .memory-card-actions { margin-top: 8px; }
 .memory-card details { margin-top: 8px; font-size: 11px; }
