@@ -4052,6 +4052,33 @@ function portal() {
       if (d.getFullYear() === now.getFullYear()) return `${M}-${D} ${hh}:${mm}`;
       return `${d.getFullYear()}-${M}-${D} ${hh}:${mm}`;
     },
+    _turnMessageBelongsToActiveTurn(m, pane) {
+      if (!m || !pane || !pane.streaming || !Array.isArray(pane.messages)) {
+        return false;
+      }
+      const index = pane.messages.indexOf(m);
+      if (index < 0) return false;
+
+      let ownerUser = null;
+      for (let k = index; k >= 0; k -= 1) {
+        if (pane.messages[k] && pane.messages[k].role === "user") {
+          ownerUser = pane.messages[k];
+          break;
+        }
+      }
+      if (!ownerUser) return false;
+
+      const ownerTurnId = String(ownerUser._turnId || "");
+      const activeTurnId = String(pane.activeTurnId || "");
+      if (ownerTurnId && activeTurnId) return ownerTurnId === activeTurnId;
+
+      // Before the first turn metadata event arrives, the newest user boundary
+      // is the only reply run that can own the pane-level live state.
+      for (let k = index + 1; k < pane.messages.length; k += 1) {
+        if (pane.messages[k] && pane.messages[k].role === "user") return false;
+      }
+      return true;
+    },
     turnFooterStatus(m, pane) {
       const stored = String((m && m.turn_status)
         || (m && m._interrupted ? "cancelled" : "")
@@ -4062,9 +4089,12 @@ function portal() {
       // live footer appears when the reaction stream actually starts.
       if (pane && pane._continuationAwaitingReaction) return "";
       // Fresh live bubbles are created before the terminal done payload can
-      // stamp turn_status.  A canonical historical footer already has ts, so
-      // never relabel such a prior turn just because a newer stream is active.
-      if (pane && pane.streaming && m && !m.ts) return "running";
+      // stamp turn_status. Only the active user-delimited turn may borrow the
+      // pane-level live state; an older tail can also lack ts while canonical
+      // reconciliation is still adopting its completed metadata.
+      if (m && !m.ts && this._turnMessageBelongsToActiveTurn(m, pane)) {
+        return "running";
+      }
       // Compatibility for cached/front-end-injected records created before
       // turn_status became part of the footer contract.  Their terminal `ts`
       // is already durable proof that the turn closed; keep the footer and
@@ -4115,9 +4145,12 @@ function portal() {
       return Number.isFinite(value) && value >= 0 ? value : null;
     },
     turnFooterModel(m, pane, sid) {
-      const live = String((m && m.model)
-        || (pane && pane.streamingModel) || "");
-      if (live) return live;
+      const stored = String((m && m.model) || "");
+      if (stored) return stored;
+      if (this._turnMessageBelongsToActiveTurn(m, pane)) {
+        const live = String((pane && pane.streamingModel) || "");
+        if (live) return live;
+      }
       const meta = (this.sessions || []).find(session => session.id === sid);
       return String((meta && meta.model) || "");
     },

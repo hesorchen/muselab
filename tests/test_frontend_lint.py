@@ -4477,6 +4477,33 @@ def test_running_state_is_rendered_once_in_the_turn_separator():
     assert "animation: none" in css
 
 
+def test_running_turn_footer_is_owned_by_active_user_boundary():
+    """A newer stream must not relabel an unannotated historical tail."""
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+
+    helper_start = app.index("_turnMessageBelongsToActiveTurn(m, pane) {")
+    helper_end = app.index("\n    turnFooterStatus(m, pane) {", helper_start)
+    helper = app[helper_start:helper_end]
+
+    status_start = helper_end + 1
+    status_end = app.index("\n    turnStatusLabel(status)", status_start)
+    status = app[status_start:status_end]
+
+    model_start = app.index("turnFooterModel(m, pane, sid) {")
+    model_end = app.index("\n    // True when index", model_start)
+    model = app[model_start:model_end]
+
+    assert "pane.messages.indexOf(m)" in helper
+    assert 'pane.messages[k].role === "user"' in helper
+    assert "ownerUser._turnId" in helper
+    assert "pane.activeTurnId" in helper
+    assert "ownerTurnId === activeTurnId" in helper
+    assert "this._turnMessageBelongsToActiveTurn(m, pane)" in status
+    assert "pane && pane.streaming && m && !m.ts" not in status
+    assert "this._turnMessageBelongsToActiveTurn(m, pane)" in model
+    assert "|| (pane && pane.streamingModel)" not in model
+
+
 def test_turn_footer_is_a_separator_and_hosts_the_only_running_dots():
     """The turn boundary owns the restrained live-state animation."""
     html = (FRONTEND / "index.html").read_text(encoding="utf-8")
