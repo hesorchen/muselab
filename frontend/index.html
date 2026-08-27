@@ -4422,6 +4422,11 @@
                     x-text="lang==='zh' ? '立即做梦' : 'Dream now'"></button>
             <button class="btn-ghost sm" @click="memoryRunAction('reindex')" :disabled="settings.memory.actionRunning || settings.memory.config.mode === 'off'"
                     x-text="lang==='zh' ? '重建索引' : 'Reindex'"></button>
+            <button class="btn-ghost sm" @click="memoryCreateBackup()"
+                    :disabled="settings.memory.backupRunning"
+                    x-text="settings.memory.backupRunning
+                      ? (lang==='zh' ? '备份并校验中…' : 'Backing up & verifying…')
+                      : (lang==='zh' ? '创建已验证备份' : 'Create verified backup')"></button>
             <button class="btn-ghost sm" @click="importLegacyMem0()"
                     x-text="lang==='zh' ? '导入旧 Mem0' : 'Import legacy Mem0'"></button>
           </div>
@@ -4440,7 +4445,9 @@
               ['items', lang==='zh'?'记忆':'Memories'],
               ['episodes','Episodes'], ['reflections',lang==='zh'?'反思':'Dreams'],
               ['skills','Skills'], ['jobs',lang==='zh'?'任务':'Jobs'],
-              ['recalls',lang==='zh'?'召回':'Recalls'], ['audit',lang==='zh'?'审计':'Audit']
+              ['recalls',lang==='zh'?'召回':'Recalls'],
+              ['backups',lang==='zh'?'备份':'Backups'],
+              ['audit',lang==='zh'?'审计':'Audit']
             ]" :key="tab[0]">
               <button :class="{ active: settings.memory.tab === tab[0] }"
                       @click="settings.memory.tab=tab[0]; refreshMemoryCenter()"
@@ -4472,11 +4479,36 @@
                   <time x-text="item.updated_at || item.created_at
                     ? new Date((item.updated_at || item.created_at)*1000).toLocaleString() : ''"></time>
                 </div>
+                <div class="memory-card-content" x-show="settings.memory.tab === 'recalls'">
+                  <strong x-text="item.query || (lang==='zh' ? '空查询' : 'Empty query')"></strong>
+                  <pre class="memory-recall-results" x-text="memoryRecallResultsText(item)"></pre>
+                  <span class="memory-recall-row-meta"
+                        x-text="`${Math.round(item.latency_ms || 0)} ms · ${item.status || ''}`"></span>
+                </div>
+                <div class="memory-card-content memory-backup-receipt"
+                     x-show="settings.memory.tab === 'backups'">
+                  <strong x-text="item.filename || item.id"></strong>
+                  <span x-text="`${item.quick_check || 'unchecked'} · ${item.size_bytes || 0} bytes`"></span>
+                  <code x-text="item.sha256 || ''"></code>
+                  <span x-text="item.exists
+                    ? (lang==='zh' ? '文件存在，收据有效' : 'File present; receipt available')
+                    : (lang==='zh' ? '备份文件缺失' : 'Backup file missing')"></span>
+                </div>
                 <div class="memory-card-content"
+                     x-show="settings.memory.tab !== 'recalls' && settings.memory.tab !== 'backups'"
                      x-text="item.content || item.summary || item.title
                        || item.last_error || item.action || JSON.stringify(item.payload || item.results || {})"></div>
+                <div class="memory-stats" x-show="settings.memory.tab === 'items' && item.recall_stats"
+                     x-text="memoryRecallStatsText(item)"></div>
                 <div class="memory-source" x-show="item.sources?.length"
                      x-text="(lang==='zh' ? '来源：' : 'Sources: ') + (item.sources || []).map(s => s.source_type + ':' + s.source_id).join(' · ')"></div>
+                <div class="memory-source-actions"
+                     x-show="settings.memory.tab === 'items' && item.sources?.length">
+                  <button class="btn-ghost xs" @click="openMemorySource(item)"
+                          x-text="lang==='zh' ? '打开来源' : 'Open source'"></button>
+                  <button class="btn-ghost xs" @click="copyMemorySourceEvidence(item)"
+                          x-text="lang==='zh' ? '复制现场证据' : 'Copy evidence'"></button>
+                </div>
                 <div class="memory-card-actions" x-show="settings.memory.tab === 'items'">
                   <button class="btn-ghost xs" @click="memoryCorrect(item)"
                           x-text="lang==='zh' ? '更正' : 'Correct'"></button>
@@ -5878,6 +5910,14 @@
       <div class="memory-recall-item">
         <span x-text="item.kind"></span>
         <p x-text="item.content"></p>
+        <div class="memory-stats" x-show="item.recall_stats"
+             x-text="memoryRecallStatsText(item)"></div>
+        <div class="memory-source-actions" x-show="item._traceback?.length">
+          <button type="button" class="btn-ghost xs" @click="openMemorySource(item)"
+                  x-text="lang==='zh' ? '打开来源' : 'Open source'"></button>
+          <button type="button" class="btn-ghost xs" @click="copyMemorySourceEvidence(item)"
+                  x-text="lang==='zh' ? '复制现场证据' : 'Copy evidence'"></button>
+        </div>
         <div class="memory-recall-feedback">
           <button type="button"
                   @click="memoryFeedback(item, true, memoryRecallPopover.recall?.id)"

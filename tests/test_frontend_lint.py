@@ -213,6 +213,33 @@ def test_memory_center_and_chat_recall_trace_are_wired():
     assert '@router.post("/skills/{artifact_id}/approve")' in api
 
 
+def test_memory_traceback_stats_recalls_and_backup_ui_are_wired():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    index = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    css = (FRONTEND / "styles.css").read_text(encoding="utf-8")
+    api = (BACKEND / "api_memory.py").read_text(encoding="utf-8")
+
+    assert "loadMemoryTraceback(item)" in app
+    assert "openMemorySource(item)" in app
+    assert "copyMemorySourceEvidence(item)" in app
+    assert "await this._copySessionEvidence(site.session_id)" in app
+    assert "this._jumpToMessage(site.session_id, site.message_id)" in app
+    assert 'fetch(base + "/traceback"' in app
+    assert "memoryRecallStatsText(item)" in app
+    assert "memoryRecallResultsText(item)" in app
+    assert "memoryCreateBackup()" in app
+    assert '@click="openMemorySource(item)"' in index
+    assert '@click="copyMemorySourceEvidence(item)"' in index
+    assert "创建已验证备份" in index
+    assert "memory-backup-receipt" in index
+    assert "memory-recall-results" in css
+    assert '@router.get("/items/{memory_id}/traceback")' in api
+    assert '@router.post("/backup")' in api
+    assert '@router.get("/backups")' in api
+    assert "重建记忆" not in index
+    assert "Restore backup" not in index
+
+
 def test_image_generation_history_prompt_actions_are_wired():
     """History prompt actions need both Alpine handlers and template wiring."""
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
@@ -1568,17 +1595,20 @@ def test_tab_menu_copies_server_authoritative_session_evidence_json():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
 
     assert '@click="menuCopySessionEvidence(tabCtxMenu && tabCtxMenu.id)"' in html
-    start = app.index("async menuCopySessionEvidence(id)")
-    end = app.index("\n    async menuDelete", start)
-    method = app[start:end]
-    assert "/api/chat/sessions/${encodeURIComponent(id)}/evidence" in method
-    assert "{ headers: this.hdr() }" in method
-    assert "const evidence = await response.json()" in method
-    assert "JSON.stringify(evidence, null, 2)" in method
-    assert "navigator.clipboard.writeText" in method
-    assert "this.toast(" in method
-    assert "transcript_path" not in method
-    assert ".cwd" not in method
+    start = app.index("async _copySessionEvidence(id)")
+    end = app.index("\n    async menuCopySessionEvidence", start)
+    helper = app[start:end]
+    assert "/api/chat/sessions/${encodeURIComponent(id)}/evidence" in helper
+    assert 'headers: this.hdr(), cache: "no-store"' in helper
+    assert "const evidence = await response.json()" in helper
+    assert "JSON.stringify(evidence, null, 2)" in helper
+    assert "navigator.clipboard.writeText" in helper
+    assert "this.toast(" in helper
+    assert "transcript_path" not in helper
+    assert ".cwd" not in helper
+    wrapper = app[app.index("async menuCopySessionEvidence(id)"):
+                  app.index("\n    async menuDelete", app.index("async menuCopySessionEvidence(id)"))]
+    assert "await this._copySessionEvidence(id)" in wrapper
 
 
 def test_history_jump_keeps_the_session_that_owned_the_click():
@@ -4808,6 +4838,33 @@ def test_running_state_is_rendered_once_in_the_turn_separator():
     assert "transform: translateY(-1.5px)" in css
     assert "@media (prefers-reduced-motion: reduce)" in css
     assert "animation: none" in css
+
+
+def test_running_turn_footer_is_owned_by_active_user_boundary():
+    """A newer stream must not relabel an unannotated historical tail."""
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+
+    helper_start = app.index("_turnMessageBelongsToActiveTurn(m, pane) {")
+    helper_end = app.index("\n    turnFooterStatus(m, pane) {", helper_start)
+    helper = app[helper_start:helper_end]
+
+    status_start = helper_end + 1
+    status_end = app.index("\n    turnStatusLabel(status)", status_start)
+    status = app[status_start:status_end]
+
+    model_start = app.index("turnFooterModel(m, pane, sid) {")
+    model_end = app.index("\n    // True when index", model_start)
+    model = app[model_start:model_end]
+
+    assert "pane.messages.indexOf(m)" in helper
+    assert 'pane.messages[k].role === "user"' in helper
+    assert "ownerUser._turnId" in helper
+    assert "pane.activeTurnId" in helper
+    assert "ownerTurnId === activeTurnId" in helper
+    assert "this._turnMessageBelongsToActiveTurn(m, pane)" in status
+    assert "pane && pane.streaming && m && !m.ts" not in status
+    assert "this._turnMessageBelongsToActiveTurn(m, pane)" in model
+    assert "|| (pane && pane.streamingModel)" not in model
 
 
 def test_turn_footer_is_a_separator_and_hosts_the_only_running_dots():

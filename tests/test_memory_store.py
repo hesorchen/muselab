@@ -198,6 +198,95 @@ def test_portable_snapshot_round_trip_preserves_governance_and_provenance(
     assert all(value == 0 for value in replay.values())
 
 
+def test_recall_stats_backfill_live_updates_and_feedback_validation(tmp_path: Path):
+    import json
+    import sqlite3
+
+    path = tmp_path / "memory.sqlite3"
+    store = MemoryStore(path)
+    memory = store.create_memory("u", "fact", "可召回事实")
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            """INSERT INTO recall_logs
+               (id,owner_id,session_id,query,results_json,latency_ms,status,created_at)
+               VALUES (?,?,?,?,?,?,?,?)""",
+            ("legacy-recall", "u", "s", "q", json.dumps([
+                {"id": memory["id"]}, {"id": memory["id"]}]),
+             1.0, "ok", 10.0),
+        )
+        conn.execute("DELETE FROM memory_migrations WHERE name='memory-recall-stats-v1'")
+    reopened = MemoryStore(path)
+    stats = reopened.memory_recall_stats("u", [memory["id"]])[memory["id"]]
+    assert stats["recall_count"] == 1
+    assert stats["first_recalled_at"] == 10.0
+    assert stats["last_recalled_at"] == 10.0
+
+    recall_id = reopened.log_recall(
+        "u", "s", "next", [{"id": memory["id"]}, {"id": memory["id"]}],
+        2.0, "ok", created_at=20.0)
+    stats = reopened.memory_recall_stats("u", [memory["id"]])[memory["id"]]
+    assert stats["recall_count"] == 2
+    assert stats["last_recalled_at"] == 20.0
+    assert reopened.feedback_memory(
+        "u", memory["id"], useful=True, recall_id=recall_id
+    )["helpful_count"] == 1
+    try:
+        reopened.feedback_memory(
+            "u", memory["id"], useful=False, recall_id="missing")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("feedback must validate its recall receipt")
+
+
+def test_traceback_resolves_owned_sessions_without_exposing_paths(tmp_path: Path):
+    store = MemoryStore(tmp_path / "memory.sqlite3")
+    session_id = "9cc9a6c1-fcc0-46fe-a67e-503411a07ea6"
+    message_id = "f941e29e-9627-43d1-81c1-0754866a31c6"
+    evidence_id = store.add_evidence("u", session_id, "user", "证据")
+    episode = store.get_or_create_episode("u", session_id, idle_seconds=60)
+    store.attach_evidence(episode["id"], [evidence_id])
+    memory = store.create_memory("u", "fact", "事实", sources=[
+        {"source_type": "episode", "source_id": episode["id"],
+         "relation": "derived_from"},
+        {"source_type": "evidence", "source_id": evidence_id,
+         "relation": "supports"},
+        {"source_type": "message", "source_id": f"{session_id}:{message_id}",
+         "relation": "confirmed_from"},
+    ])
+    sites = store.memory_traceback("u", memory["id"])
+    assert any(site["message_id"] == message_id for site in sites)
+    assert all("path" not in site for site in sites)
+    try:
+        store.memory_traceback("other", memory["id"])
+    except KeyError:
+        pass
+    else:
+        raise AssertionError("traceback must be owner fenced")
+
+
+def test_verified_online_backup_has_receipt_hash_and_private_permissions(
+        tmp_path: Path):
+    import hashlib
+    import sqlite3
+
+    store = MemoryStore(tmp_path / "registry" / "memory.sqlite3")
+    store.create_memory("u", "fact", "备份内容")
+    backup_dir = tmp_path / "trusted-backups"
+    receipt = store.create_backup("u", backup_dir)
+    target = backup_dir / receipt["filename"]
+    assert target.is_file()
+    assert oct(target.stat().st_mode & 0o777) == "0o600"
+    assert oct(backup_dir.stat().st_mode & 0o777) == "0o700"
+    assert hashlib.sha256(target.read_bytes()).hexdigest() == receipt["sha256"]
+    with sqlite3.connect(target) as conn:
+        assert conn.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+        assert conn.execute("SELECT count(*) FROM memories").fetchone()[0] == 1
+    listed = store.list_backups("u", backup_dir)
+    assert listed[0]["id"] == receipt["id"]
+    assert listed[0]["exists"] is True
+
+
 def test_imported_active_skill_requires_local_reapproval(tmp_path: Path):
     source = MemoryStore(tmp_path / "source.sqlite3")
     skill = source.create_artifact(
