@@ -39,6 +39,7 @@ class OverlayHooks:
     turn_uuids_from_boundary: Callable[..., tuple[str | None, str | None, bool]]
     delete_active_turn_sidecar: Callable[[str], None]
     turn_broadcast_factory: Callable[..., Any]
+    resolve_staged_attachment_display: Callable[[list[str]], tuple[list[dict], list[dict]]]
     interrupted_at_startup: dict[str, dict]
     persist_failed_turn_snapshot: Callable[..., bool]
     load_cancelled_turn_snapshots: Callable[[str], tuple[list[dict], str]]
@@ -1585,6 +1586,18 @@ def _recover_interrupted_turn_snapshot(sid: str) -> bool:
     boundary = data.get("transcript_boundary")
     turn.user_images = list(images) if isinstance(images, list) else []
     turn.user_docs = list(docs) if isinstance(docs, list) else []
+    staged = data.get("staged_attachment_ids")
+    turn.staged_attachment_ids = [
+        str(aid) for aid in staged
+        if isinstance(aid, str)
+    ] if isinstance(staged, list) else []
+    if turn.staged_attachment_ids and not (turn.user_images or turn.user_docs):
+        recovered_images, recovered_docs = (
+            _hooks.resolve_staged_attachment_display(
+                turn.staged_attachment_ids)
+        )
+        turn.user_images = recovered_images
+        turn.user_docs = recovered_docs
     turn.transcript_boundary = dict(boundary) if isinstance(boundary, dict) else {}
     try:
         turn.started_at = float(data.get("started_at") or turn.started_at)

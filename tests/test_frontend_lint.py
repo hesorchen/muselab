@@ -5000,7 +5000,7 @@ def test_pre_response_state_uses_the_same_turn_separator_not_a_left_bubble():
     assert 'class="msg assistant"' not in pending
     assert "assistant-avatar" not in pending
     assert 'class="turn-running-dots"' in pending
-    assert "turnStatusLabel('running')" in pending
+    assert "streamPhaseLabel(activeSession.streamPhase)" in pending
     assert "fmtTurnTime(activeSession._streamStartedAt)" in pending
     assert "fmtStreamElapsed(activeSession.streamElapsed)" in pending
     assert "modelLabel(activeSession.streamingModel)" in pending
@@ -5009,6 +5009,33 @@ def test_pre_response_state_uses_the_same_turn_separator_not_a_left_bubble():
     footer = footer[:footer.index('<button class="turn-fork-btn"')]
     assert "m.role !== 'user'" in footer
     assert "turnFooterStatus(m, pane) === 'running'" in footer
+
+
+def test_stream_startup_phase_uses_replayable_footer_state():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    i18n = (FRONTEND / "i18n" / "index.js").read_text(encoding="utf-8")
+
+    assert app.count('streamPhase: ""') >= 2  # empty pane + real per-tab state
+    assert '["startup", "text", "thinking"' in app
+    assert 'es.addEventListener("startup", ev =>' in app
+    assert 'streamState.streamPhase !== "running" && [' in app
+    running_start = app.index('streamState.streamPhase !== "running" && [')
+    running_end = app.index('].includes(ev.type)', running_start)
+    running_events = app[running_start:running_end]
+    assert '"rate_limit"' in running_events
+    assert '"compact_progress"' in running_events
+    assert 'if (!isReconnect || !streamState.streamPhase)' in app
+    startup_start = app.index('es.addEventListener("startup", ev =>')
+    startup_end = app.index('es.addEventListener("text",', startup_start)
+    assert 'if (streamState.streamPhase === "running") return;' in app[
+        startup_start:startup_end
+    ]
+    assert 'streamState.streamPhase = ""' in app
+    assert "streamPhaseLabel(activeSession.streamPhase)" in html
+    assert '"chat.startup_runtime"' in i18n
+    assert '"chat.startup_tools"' in i18n
+    assert '"chat.startup_context"' in i18n
 
 
 def test_auto_compact_drives_the_same_ui_as_a_manual_one():

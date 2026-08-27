@@ -14,6 +14,7 @@ import collections
 import inspect
 import json
 import threading
+import urllib.parse
 from types import SimpleNamespace
 
 import pytest
@@ -2945,11 +2946,13 @@ def test_initial_active_turn_persistence_runs_off_event_loop(stream_env):
     """The first durable prompt write must not block unrelated API/SSE work."""
     import inspect
 
-    source = inspect.getsource(stream_env._start_turn)
-    write_at = source.index('await obs.to_thread_io(\n        "chat.active_turn_write"')
+    source = inspect.getsource(stream_env._admit_turn)
+    write_at = source.index('"chat.active_turn_admit"')
     bind_at = source.index("sess.bind_queue_turn(", write_at)
     assert write_at < bind_at
-    assert "_write_active_turn_sidecar,\n        broadcast" in source[write_at:bind_at]
+    write_block = source[source.rfind("await obs.to_thread_io(", 0, write_at):bind_at]
+    assert "_write_active_turn_sidecar," in write_block
+    assert "broadcast," in write_block
 
 
 def test_continuation_footer_is_durable_before_terminal_publish(stream_env):
@@ -2972,7 +2975,8 @@ def test_continuation_footer_is_durable_before_terminal_publish(stream_env):
     assert stream_env._CONTINUATION_GRACE <= 8
 
 
-def test_watcher_explicitly_resumes_when_auto_continuation_stream_ends(stream_env):
+def test_watcher_explicitly_resumes_when_auto_continuation_stream_ends(
+        stream_env, monkeypatch):
     """A completed task must not silently end with only its notification.
 
     When the CLI closes the notification stream before auto-continuing, the
@@ -2982,6 +2986,12 @@ def test_watcher_explicitly_resumes_when_auto_continuation_stream_ends(stream_en
     import asyncio
 
     chat_mod = stream_env
+    perf_events = []
+    monkeypatch.setattr(
+        chat_mod,
+        "_perf_event",
+        lambda event, **fields: perf_events.append((event, fields)),
+    )
     sid = "sid-watch-explicit-resume"
     chat_mod._sessions_with_inflight_tasks[sid] = {"task_resume"}
     notif = TaskNotificationMessage(
@@ -3024,6 +3034,8 @@ def test_watcher_explicitly_resumes_when_auto_continuation_stream_ends(stream_en
         done = json.loads(bc.events[-1]["data"])
         assert bc.events[-1]["event"] == "done"
         assert not done.get("is_error")
+        assert [event for event, _fields in perf_events].count("chat.turn") == 1
+        assert all(event != "chat.startup" for event, _fields in perf_events)
         assert sid not in chat_mod._sessions_with_inflight_tasks
         assert not chat_mod._active_turn_path(sid).exists()
     finally:
@@ -3085,6 +3097,53 @@ def test_restart_orphan_becomes_durable_failed_history(
             "source_dev": 11,
             "source_inode": 13,
         }
+    finally:
+        chat_mod._interrupted_at_startup.pop(sid, None)
+        chat_mod._delete_active_turn_sidecar(sid)
+
+
+def test_restart_orphan_recovers_staged_attachment_display(
+        stream_env, client, monkeypatch):
+    chat_mod = stream_env
+    sid = _make_session(client)
+    turn = chat_mod.TurnBroadcast(
+        session_id=sid, model="claude-sonnet-4-6")
+    turn.user_text = ""
+    turn.staged_attachment_ids = ["staged-image-1", "staged-doc-1"]
+    chat_mod._write_active_turn_sidecar(turn)
+    sidecar = chat_mod._active_turn_path(sid)
+    chat_mod._interrupted_at_startup[sid] = json.loads(
+        sidecar.read_text(encoding="utf-8"))
+    monkeypatch.setattr(
+        chat_mod,
+        "_resolve_staged_attachment_display",
+        lambda _ids: (
+            [{"mime": "image/png", "available": True}],
+            [{"name": "notes.md", "kind": "text", "available": True}],
+        ),
+    )
+
+    try:
+        assert chat_mod._recover_interrupted_turn_snapshot(sid) is True
+        history = client.get(
+            f"/api/chat/sessions/{sid}",
+            params={"tail": 80},
+            headers={"X-Auth-Token": TEST_TOKEN},
+        )
+        assert history.status_code == 200, history.text
+        user = next(
+            message for message in history.json()["messages"]
+            if message.get("role") == "user"
+        )
+        assert user["text"] == ""
+        assert user["images"] == [
+            {"mime": "image/png", "available": True}
+        ]
+        assert user["docs"] == [
+            {"name": "notes.md", "kind": "text", "available": True}
+        ]
+        assert user["_failed"] is True
+        assert not sidecar.exists()
     finally:
         chat_mod._interrupted_at_startup.pop(sid, None)
         chat_mod._delete_active_turn_sidecar(sid)
@@ -4306,6 +4365,23 @@ def test_shutdown_closes_active_and_recent_broadcast_spools(
     assert recent.session_id not in chat_mod._recent_turns
 
 
+@pytest.mark.asyncio
+async def test_recent_turn_expires_without_followup_access(
+        stream_env, monkeypatch):
+    chat_mod = stream_env
+    monkeypatch.setattr(chat_mod, "_RECENT_TURN_TTL", 0.01)
+    broadcast = chat_mod.TurnBroadcast("recent-active-expiry")
+    replay_path = broadcast.events.path
+    broadcast.finish()
+
+    chat_mod._remember_recent_turn(broadcast.session_id, broadcast)
+    await asyncio.sleep(0.05)
+
+    assert broadcast.session_id not in chat_mod._recent_turns
+    assert broadcast.session_id not in chat_mod._recent_turn_expiry_handles
+    assert not replay_path.exists()
+
+
 def test_stream_error_path_classifies_auth_error(stream_env, client, monkeypatch):
     """If the SDK stream raises an auth-shaped error, the handler emits an
     `error` frame carrying the classification (kind=auth, non-retryable)."""
@@ -4432,6 +4508,93 @@ def test_terminal_replay_failure_keeps_primary_failure_state(
     assert sid not in chat_mod._active_turns
 
 
+@pytest.mark.asyncio
+async def test_stream_sends_headers_and_startup_before_cold_client_ready(
+    app_module,
+    stream_env,
+    client,
+    monkeypatch,
+):
+    """Durable admission, SSE headers and startup must precede SDK readiness."""
+    chat_mod = stream_env
+    sid = _make_session(client)
+    client_entered = asyncio.Event()
+    release_client = asyncio.Event()
+    disconnected = asyncio.Event()
+    fake = _FakeStreamClient(_ok_turn(sid))
+
+    async def gated_get_client(*_args, **_kwargs):
+        client_entered.set()
+        await release_client.wait()
+        return fake
+
+    monkeypatch.setattr(chat_mod, "get_client", gated_get_client)
+    query = urllib.parse.urlencode({
+        "token": TEST_TOKEN,
+        "session_id": sid,
+        "prompt": "early headers",
+        "model": "claude-sonnet-4-6",
+    }).encode("ascii")
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.3"},
+        "http_version": "1.1",
+        "method": "GET",
+        "scheme": "http",
+        "path": "/api/chat/stream",
+        "raw_path": b"/api/chat/stream",
+        "query_string": query,
+        "root_path": "",
+        "headers": [(b"host", b"testserver")],
+        "client": ("testclient", 123),
+        "server": ("testserver", 80),
+        "state": {},
+    }
+    received_request = False
+
+    async def receive():
+        nonlocal received_request
+        if not received_request:
+            received_request = True
+            return {"type": "http.request", "body": b"", "more_body": False}
+        await disconnected.wait()
+        return {"type": "http.disconnect"}
+
+    messages: asyncio.Queue = asyncio.Queue()
+
+    async def send(message):
+        await messages.put(message)
+
+    request_task = asyncio.create_task(app_module.app(scope, receive, send))
+    response_start = await asyncio.wait_for(messages.get(), timeout=2)
+    assert response_start["type"] == "http.response.start"
+    assert response_start["status"] == 200
+    headers = {k.lower(): v for k, v in response_start["headers"]}
+    assert headers[b"content-type"].startswith(b"text/event-stream")
+    assert headers[b"content-encoding"] == b"identity"
+    assert len(scope["state"]["perf_sid8"]) == 8
+    assert len(scope["state"]["perf_turn8"]) == 8
+
+    first_body = await asyncio.wait_for(messages.get(), timeout=2)
+    assert first_body["type"] == "http.response.body"
+    assert b"event: startup" in first_body.get("body", b"")
+    assert b'"phase": "accepted"' in first_body.get("body", b"")
+    assert not release_client.is_set()
+    await asyncio.wait_for(client_entered.wait(), timeout=2)
+    broadcast = chat_mod._active_turns[sid]
+    assert broadcast.startup_owner_task is not None
+    assert chat_mod._active_turn_path(sid).exists()
+
+    disconnected.set()
+    await asyncio.wait_for(request_task, timeout=2)
+    assert chat_mod._active_turns.get(sid) is broadcast
+    assert not broadcast.done
+    release_client.set()
+    while not broadcast.done:
+        await asyncio.sleep(0.01)
+    assert fake.queried == ["early headers"]
+
+
 def test_stream_refuses_submission_when_pending_intent_write_fails(
         stream_env, client, monkeypatch):
     chat_mod = stream_env
@@ -4458,6 +4621,46 @@ def test_stream_refuses_submission_when_pending_intent_write_fails(
     )
     assert "could not be persisted" in error["error"]
     assert client_calls == []
+    assert sid not in chat_mod._active_turns
+
+
+@pytest.mark.parametrize("failed_write", [2, 3])
+def test_stream_refuses_query_when_intent_refresh_returns_false(
+    stream_env, client, monkeypatch, failed_write,
+):
+    chat_mod = stream_env
+    sid = _make_session(client)
+    fake = _FakeStreamClient([])
+    original_write = chat_mod._write_active_turn_sidecar
+    write_count = 0
+
+    def controlled_write(broadcast):
+        nonlocal write_count
+        write_count += 1
+        if write_count == failed_write:
+            return False
+        return original_write(broadcast)
+
+    async def fake_get_client(*_args, **_kwargs):
+        return fake
+
+    monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
+    monkeypatch.setattr(chat_mod, "_write_active_turn_sidecar", controlled_write)
+
+    response = client.get(
+        f"/api/chat/stream?token={TEST_TOKEN}&session_id={sid}"
+        "&prompt=keep-durable&model=claude-sonnet-4-6",
+    )
+
+    assert response.status_code == 200
+    error = next(
+        json.loads(data)
+        for event, data in _parse_sse(response.text)
+        if event == "error"
+    )
+    assert "turn intent" in error["error"]
+    assert "could not be" in error["error"]
+    assert fake.queried == []
     assert sid not in chat_mod._active_turns
 
 
@@ -6895,9 +7098,9 @@ async def test_cancelled_after_final_sidecar_does_not_create_pump(
 
     async def controlled_io(label, _sid, func, *args, **_kwargs):
         nonlocal sidecar_calls
-        if label == "chat.active_turn_write":
+        if label in {"chat.active_turn_admit", "chat.active_turn_refresh"}:
             sidecar_calls += 1
-            if sidecar_calls == 2:
+            if label == "chat.active_turn_refresh":
                 entered.set()
                 await release.wait()
         return func(*args)
@@ -7031,6 +7234,10 @@ async def test_query_error_is_not_visible_until_attachment_cleanup_finishes(
         image_ids=aid,
     )
     subscriber = broadcast.subscribe()
+    startup_events = [await subscriber.get() for _ in range(3)]
+    assert [event["event"] for event in startup_events] == [
+        "startup", "startup", "startup",
+    ]
     next_event = asyncio.create_task(subscriber.get())
     while not cleanup_entered.is_set():
         await asyncio.sleep(0.01)
@@ -7046,6 +7253,132 @@ async def test_query_error_is_not_visible_until_attachment_cleanup_finishes(
     assert busy == []
     assert chat_mod._release_staged_attachment_lease(retry) is True
     chat_mod._image_store.pop(aid, None)
+
+
+@pytest.mark.asyncio
+async def test_admission_cancellation_releases_reserved_turn(
+        app_module, monkeypatch):
+    del app_module
+    from backend import chat
+
+    sid = "admission-cancelled"
+    entered = asyncio.Event()
+
+    async def gated_intent(*_args, **_kwargs):
+        entered.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(chat.obs, "to_thread_io", gated_intent)
+    monkeypatch.setattr(
+        chat, "_persist_failed_turn_snapshot", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(chat, "_delete_active_turn_sidecar", lambda _sid: None)
+
+    owner = asyncio.create_task(chat._admit_turn(sid, "durable prompt"))
+    await asyncio.wait_for(entered.wait(), timeout=1)
+    broadcast = chat._active_turns[sid]
+    owner.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await owner
+
+    assert sid not in chat._active_turns
+    assert broadcast.done is True
+    events = list(broadcast.replay_events())
+    assert events[-1]["event"] == "error"
+    terminal = json.loads(events[-1]["data"])
+    assert terminal["startup"] is True
+    assert terminal["startup_phase"] == "accepted"
+    recent = chat._recent_turns.pop(sid, None)
+    handle = chat._recent_turn_expiry_handles.pop(sid, None)
+    if handle is not None:
+        handle.cancel()
+    if recent is not None:
+        recent.close()
+
+
+@pytest.mark.asyncio
+async def test_queue_bind_failure_uses_shared_startup_abort(
+        app_module, monkeypatch):
+    del app_module
+    from backend import chat
+
+    sid = "queue-bind-failure"
+    releases = []
+
+    async def persisted(*_args, **_kwargs):
+        return True
+
+    monkeypatch.setattr(chat.obs, "to_thread_io", persisted)
+    monkeypatch.setattr(chat.sess, "bind_queue_turn", lambda *_args: True)
+    monkeypatch.setattr(
+        chat._durable_attachment_store,
+        "mark_queue_turn",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("bind failed")),
+    )
+    monkeypatch.setattr(
+        chat.sess,
+        "release_queue_claim",
+        lambda *args, **kwargs: releases.append((args, kwargs)) or True,
+    )
+    monkeypatch.setattr(chat, "_delete_active_turn_sidecar", lambda _sid: None)
+
+    with pytest.raises(chat._TurnStartError) as exc_info:
+        await chat._admit_turn(
+            sid, "queued", queue_item_id="queue-item-1")
+
+    assert exc_info.value.queue_claim_settled is True
+    assert len(releases) == 1
+    assert sid not in chat._active_turns
+    recent = chat._recent_turns.pop(sid, None)
+    assert recent is not None
+    assert recent.done is True
+    assert recent.perf_error_kind == "queue_bind"
+    assert list(recent.replay_events())[-1]["event"] == "error"
+    handle = chat._recent_turn_expiry_handles.pop(sid, None)
+    if handle is not None:
+        handle.cancel()
+    recent.close()
+
+
+@pytest.mark.asyncio
+async def test_detached_internal_cancellation_publishes_startup_error(
+        app_module, monkeypatch):
+    del app_module
+    from backend import chat
+
+    sid = "detached-startup-cancelled"
+    broadcast = chat.TurnBroadcast(sid)
+    broadcast.publish_startup("accepted")
+    chat._active_turns[sid] = broadcast
+    monkeypatch.setattr(
+        chat, "_persist_failed_turn_snapshot", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(chat, "_delete_active_turn_sidecar", lambda _sid: None)
+
+    async def cancelled_start(*_args, **_kwargs):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(chat, "_start_turn", cancelled_start)
+    owner = chat._launch_admitted_turn(
+        broadcast,
+        prompt="hello",
+        model="claude-sonnet-4-6",
+        permission="bypassPermissions",
+        image_ids="",
+    )
+    with pytest.raises(asyncio.CancelledError):
+        await owner
+
+    assert sid not in chat._active_turns
+    events = list(broadcast.replay_events())
+    assert [event["event"] for event in events] == ["startup", "error"]
+    terminal = json.loads(events[-1]["data"])
+    assert terminal["startup"] is True
+    assert terminal["startup_phase"] == "accepted"
+    recent = chat._recent_turns.pop(sid, None)
+    handle = chat._recent_turn_expiry_handles.pop(sid, None)
+    if handle is not None:
+        handle.cancel()
+    if recent is not None:
+        recent.close()
 
 
 @pytest.mark.parametrize("queued_failure", [False, True])

@@ -380,8 +380,12 @@ def test_turn_perf_summary_is_emitted_once_without_content(
     broadcast.finish()
     broadcast.finish()
 
-    assert len(events) == 1
-    event, fields = events[0]
+    assert len(events) == 2
+    startup_event, startup_fields = events[0]
+    assert startup_event == "chat.startup"
+    assert startup_fields["status"] == "ready"
+    assert startup_fields["client"] == "warm"
+    event, fields = events[1]
     assert event == "chat.turn"
     assert fields["sid8"] == "12345678"
     assert len(fields["turn8"]) == 8
@@ -389,10 +393,28 @@ def test_turn_perf_summary_is_emitted_once_without_content(
     assert fields["client"] == "warm"
     assert fields["status"] == "completed"
     assert fields["background_count"] == 2
-    rendered = repr(fields)
+    rendered = repr((startup_fields, fields))
     assert "synthetic-private-prompt" not in rendered
     assert "synthetic-private-response" not in rendered
     assert "private-session" not in rendered
+
+
+def test_startup_perf_summary_passes_real_privacy_field_policy(
+    app_module, monkeypatch, capsys,
+):
+    from backend import chat as chat_mod
+
+    monkeypatch.setenv("MUSELAB_PERF_LOG", "1")
+    capsys.readouterr()
+    broadcast = chat_mod.TurnBroadcast("startup-policy-session")
+    broadcast.perf_query_write_ms = 3
+
+    broadcast.emit_startup_perf("ready")
+
+    logged = capsys.readouterr().err
+    assert '"event":"chat.startup"' in logged
+    assert '"sdk_write_ms":3' in logged
+    assert "query_write_ms" not in logged
 
 
 def test_context_probe_failure_log_is_deduplicated_and_private(

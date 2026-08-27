@@ -529,8 +529,11 @@ async def test_interrupt_cancels_cold_client_startup_immediately(
     assert finished is broadcast
     assert broadcast.cancelled is True
     assert broadcast.done is True
-    assert [event["event"] for event in broadcast.replay_events()] == ["cancelled"]
-    cancelled_payload = json.loads(next(broadcast.replay_events())["data"])
+    replay = list(broadcast.replay_events())
+    assert [event["event"] for event in replay] == [
+        "startup", "startup", "cancelled",
+    ]
+    cancelled_payload = json.loads(replay[-1]["data"])
     assert cancelled_payload["snapshot_ready"] is True
     snapshots, _ = chat_mod._load_cancelled_turn_snapshots(sid)
     assert [message["text"] for message in snapshots[0]["messages"]] == ["stop me"]

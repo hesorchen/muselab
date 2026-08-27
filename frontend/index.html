@@ -2966,7 +2966,7 @@
                x-cloak>
             <span class="turn-status running">
               <span class="turn-running-dots" aria-hidden="true"><span></span><span></span><span></span></span>
-              <span x-text="turnStatusLabel('running')"></span>
+              <span x-text="streamPhaseLabel(activeSession.streamPhase)"></span>
             </span>
             <span x-show="activeSession._streamStartedAt"
                   class="msg-ts"

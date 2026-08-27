@@ -235,6 +235,7 @@ const _EMPTY_ACTIVE_SESSION_PANE = Object.freeze({
   transcriptLoadPhase: "idle",
   _loaded: false,
   streaming: false,
+  streamPhase: "",
   es: null,
   streamingModel: "",
   streamElapsed: 0,
@@ -4207,6 +4208,15 @@ function portal() {
       if (value === "failed") return this.lang === "zh" ? "失败" : "Failed";
       return this.lang === "zh" ? "已中断" : "Interrupted";
     },
+    streamPhaseLabel(phase) {
+      const value = String(phase || "");
+      if (value === "tools") return this.t("chat.startup_tools");
+      if (value === "context") return this.t("chat.startup_context");
+      if (["connecting", "accepted", "runtime"].includes(value)) {
+        return this.t("chat.startup_runtime");
+      }
+      return this.turnStatusLabel("running");
+    },
     _backgroundTaskCount(state) {
       const own = Number(state && state.backgroundTaskCount);
       const inherited = Number(state && state.inheritedBackgroundTaskCount);
@@ -7476,6 +7486,10 @@ function portal() {
                          context_limit_is_estimate: true,
                          context_is_estimate: true },
         streaming: false,
+        // Per-session transport/runtime startup state. This is deliberately
+        // separate from transcriptLoadPhase: an admitted turn keeps resident
+        // history visible and only changes the lightweight pending footer.
+        streamPhase: "",
         // Main ResultMessage may arrive while SDK-native background Agent/Bash
         // tasks keep running. This is a busy state without a live SSE until a
         // task settlement opens a continuation broadcast.
@@ -10303,6 +10317,7 @@ function portal() {
             st._stallWatch = null;
             st.es = null;
             st.streaming = false;
+            st.streamPhase = "";
             this._setBackgroundTaskActive(
               sid, true, d.started_at, d.background_tasks_pending);
             this._ensureBgContPoller(sid);
@@ -10415,6 +10430,7 @@ function portal() {
         st._stallWatch = null;
       }
       st.streaming = false;
+      st.streamPhase = "";
       st.backgroundActive = false;
       st.backgroundTaskCount = 0;
       st._continuationAwaitingReaction = false;
@@ -11440,6 +11456,7 @@ function portal() {
         st._streamStartController = null;
         st._cancelBeforeStream = false;
         st.streaming = false;
+        st.streamPhase = "";
         st.backgroundActive = false;
         st.backgroundTaskCount = 0;
         st.inheritedBackgroundTaskCount = 0;
@@ -28592,6 +28609,9 @@ function portal() {
       // pane into either a loading or error surface when it eventually settles.
       this._releaseTranscriptLoadForLive(streamState);
       streamState.streaming = true;
+      if (!isReconnect || !streamState.streamPhase) {
+        streamState.streamPhase = "connecting";
+      }
       streamState._continuationAwaitingReaction = false;
       // A live turn renders directly into its pane; historical chunk readiness
       // must never hide the user's bubble or the streamed reply.
@@ -28695,6 +28715,7 @@ function portal() {
         streamState._streamStartedAt = 0;
         streamState.streamElapsed = 0;
         streamState.streaming = false;
+        streamState.streamPhase = "";
         streamState._continuationAwaitingReaction = false;
         streamState.es = null;
         streamState._streamStartController = null;
@@ -28839,14 +28860,31 @@ function portal() {
         if (ev && ev.type !== "ping" && ev.type !== "error") {
           streamState._serverActiveObserved = true;
         }
+        if (ev && streamState.streamPhase !== "running" && [
+          "text", "thinking", "tool_use", "tool_result", "compact_progress",
+          "task_started", "task_progress", "task_notification", "rate_limit",
+          "ask_user_question", "permission_request", "permission_request_resolved",
+          "permission_mode_changed", "permission_mode_change_failed",
+        ].includes(ev.type)) {
+          streamState.streamPhase = "running";
+        }
       };
-      ["text", "thinking", "tool_use", "tool_result", "task_started",
+      ["startup", "text", "thinking", "tool_use", "tool_result", "compact_progress", "task_started",
        "task_progress", "task_notification", "rate_limit",
        "ask_user_question", "permission_request", "permission_request_resolved",
        "permission_mode_changed",
        "permission_mode_change_failed", "ping",
        "done", "error", "cancelled", "resync"].forEach(
         t => es.addEventListener(t, _bumpSse));
+      es.addEventListener("startup", ev => {
+        let payload = {};
+        try { payload = JSON.parse(ev.data) || {}; } catch (_) {}
+        const phase = String(payload.phase || "accepted");
+        if (streamState.streamPhase === "running") return;
+        const knownPhase = phase === "accepted" || phase === "runtime"
+          || phase === "tools" || phase === "context";
+        streamState.streamPhase = knownPhase ? phase : "accepted";
+      });
       if (streamState._stallWatch) clearInterval(streamState._stallWatch);
       streamState._stallWatch = setInterval(() => {
         if (!streamState.streaming) return;
@@ -29505,6 +29543,7 @@ function portal() {
         // permission-mode commit never arrived.
         _finalizePendingPermissionRequests();
         streamState.streaming = false;
+        streamState.streamPhase = "";
         streamState._continuationAwaitingReaction = false;
         streamState.es = null;
         if (followedTail) {
@@ -30392,6 +30431,7 @@ function portal() {
         st._streamStartedAt = 0;
         st.streamElapsed = 0;
         st.streaming = false;
+        st.streamPhase = "";
         st._stopping = false;
         st.streamingModel = "";
         if (st.pendingQueue && st.pendingQueue.length > 0) {
@@ -30417,6 +30457,7 @@ function portal() {
       const ownerEs = st.es;
       st._optimisticInterrupt = true;
       st.streaming = false;
+      st.streamPhase = "";
       st._stopping = false;
       if (st._streamTimer) clearInterval(st._streamTimer);
       if (st._stallWatch) clearInterval(st._stallWatch);
