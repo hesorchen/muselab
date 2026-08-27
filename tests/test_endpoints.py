@@ -91,6 +91,8 @@ def test_ducc_group_does_not_require_native_anthropic_auth(monkeypatch):
         "ducc:glm-5",
         "ducc:glm-5-1",
         "ducc:glm-5-2",
+        "ducc:glm-5-3",
+        "ducc:glm-5-3-flash",
         "ducc:glm-5-turbo",
         "ducc:grok-4-5",
         "ducc:gpt-5-5",
@@ -125,6 +127,8 @@ def test_ducc_group_does_not_require_native_anthropic_auth(monkeypatch):
         "GLM-5",
         "GLM-5.1",
         "GLM-5.2",
+        "GLM-5.3",
+        "GLM-5.3-Flash",
         "GLM-5-Turbo",
         "grok-4.5",
         "gpt-5.5",
@@ -157,7 +161,7 @@ def test_ducc_group_honors_model_disable_and_runtime_availability(monkeypatch):
     models = {item["model"] for item in ducc["items"]}
     assert "ducc:auto" not in models
     assert "ducc:glm-5-2" not in models
-    assert len(models) == 23
+    assert len(models) == 25
 
     monkeypatch.setattr(settings, "locate_ducc_executable", lambda: None)
     assert all(group["group"] != "DUCC" for group in ep.available_groups())
