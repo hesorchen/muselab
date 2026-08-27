@@ -5,6 +5,7 @@ import base64
 from collections import deque
 from contextlib import contextmanager, suppress
 import hashlib
+import inspect
 import json
 import asyncio
 import re
@@ -1007,6 +1008,14 @@ class TurnBroadcast:
         self.user_text: str = ""
         self.user_images: list[dict] = []
         self.user_docs: list[dict] = []
+        # Durable pre-prepare attachment intent. These opaque, validated IDs let
+        # restart recovery retain what the admitted turn owned without logging or
+        # persisting file names, paths, MIME payloads, or attachment contents.
+        self.staged_attachment_ids: list[str] = []
+        # Browser-facing startup is separate from transcript loading and model
+        # output. Named startup events are replayable and low-frequency; detailed
+        # timings stay in privacy-bounded performance fields below.
+        self.startup_phase: str = ""
         # Staged uploads remain in the global store until the SDK query write
         # succeeds. These private fields carry their exclusive lease and any
         # pre-query disk artifacts across compact/preflight awaits so every
@@ -1099,6 +1108,21 @@ class TurnBroadcast:
         self.perf_error_kind = "none"
         self.perf_background_count = 0
         self.perf_final_mode = "normal"
+        self.perf_admission_ms = 0
+        self.perf_intent_ms = 0
+        self.perf_runtime_lock_ms = 0
+        self.perf_disconnect_ms = 0
+        self.perf_pool_ms = 0
+        self.perf_creation_lock_ms = 0
+        self.perf_connect_ms = 0
+        self.perf_mcp_ms = 0
+        self.perf_pool_commit_ms = 0
+        self.perf_attachment_ms = 0
+        self.perf_intent_refresh_ms = 0
+        self.perf_query_write_ms = 0
+        self.perf_startup_status = "pending"
+        self.perf_startup_failure_phase = "none"
+        self._startup_perf_emitted = False
         self._perf_emitted = False
 
     @property
@@ -1116,6 +1140,58 @@ class TurnBroadcast:
         if self.queue_item_id:
             return "queued"
         return "direct"
+
+    def publish_startup(self, phase: str) -> None:
+        """Publish one replayable, low-cardinality startup transition."""
+        normalized = str(phase or "").strip().lower()
+        if normalized not in {"accepted", "runtime", "tools", "context"}:
+            normalized = "accepted"
+        if self.done or self.startup_phase == normalized:
+            return
+        self.startup_phase = normalized
+        self.publish({
+            "event": "startup",
+            "data": json.dumps({
+                "phase": normalized,
+                "activity_source": self.activity_source,
+            }),
+        })
+
+    def emit_startup_perf(self, status: str, *, failure_phase: str = "none") -> None:
+        """Emit one privacy-bounded startup summary per logical turn."""
+        if self._startup_perf_emitted:
+            return
+        self._startup_perf_emitted = True
+        self.perf_startup_status = str(status or "unknown")
+        self.perf_startup_failure_phase = str(failure_phase or "none")
+        try:
+            _perf_event(
+                "chat.startup",
+                sid8=obs.short_id(self.session_id),
+                turn8=obs.short_id(self.turn_id),
+                source=self.activity_source,
+                client=self.perf_client,
+                status=self.perf_startup_status,
+                failure_phase=self.perf_startup_failure_phase,
+                error_kind=self.perf_error_kind,
+                admission_ms=self.perf_admission_ms,
+                intent_ms=self.perf_intent_ms,
+                runtime_lock_ms=self.perf_runtime_lock_ms,
+                disconnect_ms=self.perf_disconnect_ms,
+                pool_ms=self.perf_pool_ms,
+                creation_lock_ms=self.perf_creation_lock_ms,
+                connect_ms=self.perf_connect_ms,
+                mcp_ms=self.perf_mcp_ms,
+                pool_commit_ms=self.perf_pool_commit_ms,
+                client_ms=self.perf_client_ms,
+                attachment_ms=self.perf_attachment_ms,
+                intent_refresh_ms=self.perf_intent_refresh_ms,
+                preflight_ms=self.perf_preflight_ms,
+                sdk_write_ms=self.perf_query_write_ms,
+                total_ms=obs.elapsed_ms(self.perf_started),
+            )
+        except Exception:
+            pass
 
     def publish(self, event: dict) -> None:
         """Route one SSE event to the record channel, the live channel, or both.
@@ -1139,7 +1215,7 @@ class TurnBroadcast:
                 and self.perf_first_visible_ms < 0
                 and event_name
                 and event_name not in {
-                    "compact_progress", "done", "error", "cancelled",
+                    "startup", "compact_progress", "done", "error", "cancelled",
                 }):
             self.perf_first_visible_ms = obs.elapsed_ms(
                 self.perf_query_started)
@@ -1266,6 +1342,22 @@ class TurnBroadcast:
                 self.perf_error_kind = "cancelled"
         if self.perf_post_started:
             self.perf_post_ms = obs.elapsed_ms(self.perf_post_started)
+        if not self.is_continuation and not self._startup_perf_emitted:
+            startup_status = (
+                "cancelled" if self.cancelled
+                else "failed" if self.perf_status == "failed"
+                else "ready" if self.perf_query_started
+                else "unknown"
+            )
+            self.emit_startup_perf(
+                startup_status,
+                failure_phase=(
+                    self.perf_startup_failure_phase
+                    if self.perf_startup_failure_phase != "none"
+                    else "startup" if startup_status == "failed"
+                    else "none"
+                ),
+            )
         if not self._perf_emitted:
             self._perf_emitted = True
             try:
@@ -1371,39 +1463,62 @@ _active_turns: dict[str, TurnBroadcast] = {}
 # sees no active turn and the drained turn never renders live — the user must
 # refresh. We keep the finished broadcast here for a short TTL so a slightly-late
 # reconnect still gets the full replay (events + done sentinel). One per sid;
-# a new turn for the same sid overwrites it. TTL-evicted on access.
+# a new turn for the same sid overwrites it. Each entry owns an active expiry
+# callback so its replay spool cannot outlive the grace period without access.
 _recent_turns: dict[str, TurnBroadcast] = {}
+_recent_turn_expiry_handles: dict[str, asyncio.TimerHandle] = {}
 _RECENT_TURN_TTL = env_int("MUSELAB_RECENT_TURN_TTL", 60, min_value=1)
 
 
+def _evict_recent_turn(
+    session_id: str,
+    expected_turn_id: str = "",
+) -> bool:
+    """Close one grace replay only if it is still the expected turn."""
+    broadcast = _recent_turns.get(session_id)
+    if broadcast is None:
+        return False
+    if expected_turn_id and broadcast.turn_id != expected_turn_id:
+        return False
+    _recent_turns.pop(session_id, None)
+    handle = _recent_turn_expiry_handles.pop(session_id, None)
+    if handle is not None:
+        handle.cancel()
+    broadcast.close()
+    return True
+
+
 def _remember_recent_turn(session_id: str, broadcast: TurnBroadcast) -> None:
-    """Stash a just-finished broadcast for grace-keep reconnect, and sweep
-    any expired entries so replay spool files do not outlive their TTL."""
-    now = time.time()
+    """Stash a just-finished broadcast for bounded reconnect grace."""
     previous = _recent_turns.get(session_id)
     if previous is not None and previous is not broadcast:
-        previous.close()
+        _evict_recent_turn(session_id, previous.turn_id)
+    old_handle = _recent_turn_expiry_handles.pop(session_id, None)
+    if old_handle is not None:
+        old_handle.cancel()
     _recent_turns[session_id] = broadcast
-    for sid in [
-        s for s, b in _recent_turns.items()
-        if now - b.finished_at > _RECENT_TURN_TTL
-    ]:
-        expired = _recent_turns.pop(sid, None)
-        if expired is not None:
-            expired.close()
+    age = max(0.0, time.time() - float(broadcast.finished_at or 0))
+    remaining = max(0.001, _RECENT_TURN_TTL - age)
+    _recent_turn_expiry_handles[session_id] = (
+        asyncio.get_running_loop().call_later(
+            remaining,
+            _evict_recent_turn,
+            session_id,
+            broadcast.turn_id,
+        )
+    )
 
 
 def _get_recent_turn(session_id: str) -> TurnBroadcast | None:
     """Return a still-fresh just-finished broadcast for `session_id`, or None.
     Evicts the entry and its replay spool if it has aged past the TTL."""
-    b = _recent_turns.get(session_id)
-    if b is None:
+    broadcast = _recent_turns.get(session_id)
+    if broadcast is None:
         return None
-    if time.time() - b.finished_at > _RECENT_TURN_TTL:
-        _recent_turns.pop(session_id, None)
-        b.close()
+    if time.time() - broadcast.finished_at > _RECENT_TURN_TTL:
+        _evict_recent_turn(session_id, broadcast.turn_id)
         return None
-    return b
+    return broadcast
 # Each CLI subprocess holds ~30-50 MB RSS. Runtime-owned LRU/lock aliases keep
 # the historical chat facade patchable while bounding the shared client pool.
 _client_lru = chat_runtime.CLIENT_LRU
@@ -1761,6 +1876,7 @@ def _write_active_turn_sidecar(bc: TurnBroadcast) -> bool:
                 "turn_id": bc.turn_id,
                 "user_images": bc.user_images,
                 "user_docs": bc.user_docs,
+                "staged_attachment_ids": list(bc.staged_attachment_ids),
                 "transcript_boundary": dict(bc.transcript_boundary or {}),
             }, ensure_ascii=False),
             mode=0o600,
@@ -3570,6 +3686,7 @@ async def get_client(
     effort: str = "",
     service_tier: str = "",
     plan_return_permission: str = "",
+    startup_phase: Callable[[str, int], None] | None = None,
 ) -> ClaudeSDKClient:
     """Compatibility facade for the extracted SDK runtime pool."""
     return await chat_runtime.get_client(
@@ -3579,6 +3696,7 @@ async def get_client(
         effort=effort,
         service_tier=service_tier,
         plan_return_permission=plan_return_permission,
+        startup_phase=startup_phase,
     )
 
 
@@ -3766,6 +3884,9 @@ async def shutdown_runtime() -> None:
     }.values()
     for broadcast in broadcasts:
         broadcast.close()
+    for handle in _recent_turn_expiry_handles.values():
+        handle.cancel()
+    _recent_turn_expiry_handles.clear()
     _recent_turns.clear()
 
     _active_turns.clear()
@@ -6562,6 +6683,9 @@ def _clear_session_runtime_state(sid: str) -> list[asyncio.Task]:
         _bg_task_descriptions.pop(task_id, None)
         _bg_task_tool_use_ids.pop(task_id, None)
         _bg_task_pinned_at.pop(task_id, None)
+    recent_handle = _recent_turn_expiry_handles.pop(sid, None)
+    if recent_handle is not None:
+        recent_handle.cancel()
     recent = _recent_turns.pop(sid, None)
     if recent is not None:
         recent.close()
@@ -10216,6 +10340,68 @@ def _get_staged_entry_locked(aid: str) -> dict | None:
     return _durable_attachment_store.load_entry(aid)
 
 
+def _resolve_staged_attachment_display(
+    attachment_ids: list[str],
+) -> tuple[list[dict], list[dict]]:
+    """Recover bounded display metadata without exposing staged payloads."""
+    images: list[dict] = []
+    docs: list[dict] = []
+    for aid in attachment_ids[:48]:
+        if not _valid_staged_attachment_id(aid):
+            docs.append({
+                "name": "Attachment unavailable",
+                "kind": "unknown",
+                "available": False,
+            })
+            continue
+        with _image_store_lock:
+            hot_entry = _image_store.get(aid)
+            metadata = dict(hot_entry) if isinstance(hot_entry, dict) else None
+        if metadata is None:
+            try:
+                metadata = _durable_attachment_store.metadata(aid)
+            except (DurableAttachmentError, OSError, sqlite3.Error,
+                    UnsafePrivatePath):
+                metadata = None
+        if not isinstance(metadata, dict):
+            docs.append({
+                "name": "Attachment unavailable",
+                "kind": "unknown",
+                "available": False,
+            })
+            continue
+        kind = str(metadata.get("kind") or "image")[:16]
+        if kind == "image":
+            images.append({
+                "mime": str(metadata.get("mime") or "image/*")[:80],
+                "available": True,
+            })
+            continue
+        fallback = "Document"
+        if kind == "pdf":
+            fallback = "Document.pdf"
+        elif kind == "xlsx":
+            fallback = "Workbook.xlsx"
+        docs.append({
+            "name": _safe_attach_name(
+                str(metadata.get("name") or fallback))[:200],
+            "kind": kind,
+            "available": True,
+        })
+    return images, docs
+
+
+def _hydrate_staged_attachment_display(broadcast: TurnBroadcast) -> None:
+    """Fill failure/reconnect display refs before staged ownership settles."""
+    if (not broadcast.staged_attachment_ids
+            or broadcast.user_images or broadcast.user_docs):
+        return
+    images, docs = _resolve_staged_attachment_display(
+        broadcast.staged_attachment_ids)
+    broadcast.user_images = images
+    broadcast.user_docs = docs
+
+
 def _gc_images_locked(now: float | None = None) -> None:
     """Collect expired, unleased entries from cache and durable storage."""
     current = time.time() if now is None else now
@@ -11568,6 +11754,7 @@ def stream_start(req: StreamStartReq) -> dict:
 
 @router.get("/stream")
 async def stream(
+    request: Request,
     prompt: str = Query(default=""),
     token: str = Query(default=""),
     session_id: str = Query(default=""),
@@ -11628,6 +11815,13 @@ async def stream(
     # "no active turn", confusing the user (just dropped an image,
     # got a generic error toast).
     is_image_only = (not prompt.strip()) and bool((image_ids or "").strip())
+
+    def _correlate_stream(broadcast: TurnBroadcast) -> None:
+        scope_state = request.scope.setdefault("state", {})
+        if isinstance(scope_state, dict):
+            scope_state["perf_sid8"] = obs.short_id(session_id)
+            scope_state["perf_turn8"] = obs.short_id(broadcast.turn_id)
+
     if not prompt.strip() and not is_image_only:
         existing = _active_turns.get(session_id)
         if existing is None:
@@ -11639,6 +11833,7 @@ async def stream(
             # of silently requiring a manual refresh.
             recent = _get_recent_turn(session_id)
             if recent is not None:
+                _correlate_stream(recent)
                 if turn_id and recent.turn_id != turn_id:
                     async def _recent_changed_gen():
                         yield {
@@ -11662,6 +11857,7 @@ async def stream(
             async def _no_active_gen():
                 yield _error_event("no active turn")
             return EventSourceResponse(_no_active_gen(), headers=_SSE_HEADERS)
+        _correlate_stream(existing)
         if turn_id and existing.turn_id != turn_id:
             async def _active_changed_gen():
                 yield {
@@ -11689,15 +11885,16 @@ async def stream(
     if is_image_only:
         prompt = _IMAGE_ONLY_PLACEHOLDER
 
-    # Launch the turn via the shared launcher, then become a subscriber.
-    # _start_turn does the reserve-under-lock + attachment parsing +
-    # detached background pump; on failure it raises so we can shape the
-    # SSE error response (the headless queue-drain caller shapes it
-    # differently — pause + push).
+    # Admit only the durable ownership boundary before returning SSE. Runtime
+    # lock wait, CLI/MCP startup, attachment preparation and query preflight run
+    # under a detached owner so a browser disconnect only drops its subscriber.
     try:
-        broadcast = await _start_turn(
-            session_id, prompt, model=model,
-            permission=permission, image_ids=image_ids)
+        broadcast = await _admit_turn(
+            session_id,
+            prompt,
+            model=model,
+            image_ids=image_ids,
+        )
     except _TurnBusy:
         async def _busy_gen():
             yield {
@@ -11711,12 +11908,51 @@ async def stream(
             }
         return EventSourceResponse(_busy_gen(), headers=_SSE_HEADERS)
     except _TurnStartError as e:
-        if getattr(e, "status", None) == 504:
-            raise HTTPException(504, str(e))
         _err_msg = str(e)
         async def _early_err_gen():
             yield _error_event(_err_msg, activity_source="direct")
         return EventSourceResponse(_early_err_gen(), headers=_SSE_HEADERS)
+
+    # Stop may win while admission is finishing its durable writes. In that
+    # case the shared terminal owner has already populated replay; subscribe to
+    # it without publishing a new phase or launching runtime work again.
+    if broadcast.done or broadcast.cancelled:
+        _correlate_stream(broadcast)
+        return EventSourceResponse(
+            _subscribe_broadcast(broadcast, mobile=mobile),
+            headers=_SSE_HEADERS,
+            ping_message_factory=_sse_ping_event,
+        )
+
+    # Write the accepted frame before launching runtime work. If the replay
+    # spool cannot own that frame, fail closed before the prompt can reach the
+    # SDK; otherwise the browser could retry an ambiguously executing turn.
+    try:
+        broadcast.publish_startup("accepted")
+    except Exception:
+        broadcast.perf_error_kind = "startup_event"
+        broadcast.perf_startup_failure_phase = "accepted"
+        await _abort_turn_startup(
+            session_id,
+            broadcast,
+            "failed",
+            pause_queue=True,
+        )
+        async def _startup_spool_err_gen():
+            yield _error_event(
+                "turn could not establish its startup event",
+                activity_source="direct",
+            )
+        return EventSourceResponse(
+            _startup_spool_err_gen(), headers=_SSE_HEADERS)
+    _launch_admitted_turn(
+        broadcast,
+        prompt=prompt,
+        model=model,
+        permission=permission,
+        image_ids=image_ids,
+    )
+    _correlate_stream(broadcast)
     return EventSourceResponse(
         _subscribe_broadcast(broadcast, mobile=mobile),
         headers=_SSE_HEADERS,
@@ -12936,6 +13172,7 @@ async def _finish_cancelled_startup(
     cleanup = broadcast._startup_terminal_cleanup_task
     if cleanup is None:
         async def _cleanup() -> bool:
+            _hydrate_staged_attachment_display(broadcast)
             await _rollback_broadcast_attachments(broadcast)
             queue_settled = False
             if broadcast.queue_item_id:
@@ -13105,12 +13342,14 @@ async def _abort_turn_startup(
     cleanup = broadcast._startup_terminal_cleanup_task
     if cleanup is None:
         async def _cleanup() -> bool:
+            _hydrate_staged_attachment_display(broadcast)
             await _rollback_broadcast_attachments(broadcast)
             broadcast.perf_status = status
             if status != "completed" and broadcast.perf_error_kind == "none":
                 broadcast.perf_error_kind = (
                     "cancelled" if status == "cancelled" else "startup")
             queue_settled = False
+            snapshot_ready = False
             if broadcast.queue_item_id:
                 try:
                     queue_settled = sess.release_queue_claim(
@@ -13161,10 +13400,58 @@ async def _abort_turn_startup(
 
             await _finish_activity(session_id, broadcast, status)
             # Keep the reservation until every durable owner above is settled.
+            # Only then expose a replayable startup terminal event. This ordering
+            # makes an immediate browser retry safe: attachments and queue claims
+            # are already released when the error becomes visible.
             async with _lock:
                 broadcast._startup_queue_settled = queue_settled
                 if _active_turns.get(session_id) is broadcast:
+                    if not broadcast.done:
+                        if status == "cancelled":
+                            terminal = {
+                                "event": "cancelled",
+                                "data": json.dumps({
+                                    "startup": True,
+                                    "startup_phase": (
+                                        broadcast.perf_startup_failure_phase),
+                                    "snapshot_ready": snapshot_ready,
+                                }),
+                            }
+                        else:
+                            terminal_text = error_text or (
+                                "Turn startup ended before the request could be "
+                                "submitted. Please retry."
+                            )
+                            terminal = _error_event(
+                                terminal_text,
+                                activity_source=broadcast.activity_source,
+                            )
+                            try:
+                                terminal_data = json.loads(
+                                    terminal.get("data") or "{}")
+                            except (TypeError, ValueError):
+                                terminal_data = {"error": terminal_text}
+                            terminal_data.update({
+                                "startup": True,
+                                "startup_phase": (
+                                    broadcast.perf_startup_failure_phase),
+                                "snapshot_ready": snapshot_ready,
+                            })
+                            terminal["data"] = json.dumps(
+                                terminal_data, ensure_ascii=False)
+                        try:
+                            broadcast.publish(terminal)
+                        except Exception:
+                            # A broken replay spool must not strand durable
+                            # cleanup, Activity, or the active reservation.
+                            broadcast.perf_error_kind = "startup_event"
+                    broadcast.emit_startup_perf(
+                        "cancelled" if status == "cancelled" else "failed",
+                        failure_phase=broadcast.perf_startup_failure_phase,
+                    )
                     broadcast.finish()
+                    if not sess.session_is_deleting(session_id):
+                        _remember_recent_turn(session_id, broadcast)
                     _active_turns.pop(session_id, None)
             _interrupted_at_startup.pop(session_id, None)
             return queue_settled
@@ -13205,6 +13492,249 @@ async def _fail_queued_attachment_startup(
     )
 
 
+async def _admit_turn(
+    session_id: str,
+    prompt: str,
+    *,
+    model: str = "",
+    image_ids: str = "",
+    queue_item_id: str = "",
+) -> "TurnBroadcast":
+    """Reserve one turn and durably commit its pending intent.
+
+    This is the HTTP admission boundary: once it returns, the caller may expose
+    SSE headers because the active slot, restart sidecar, queue ownership, and
+    detached startup owner can be established without waiting for CLI/MCP startup.
+    """
+    admission_started = obs.monotonic()
+    draining = None
+    async with _lock:
+        if sess.session_is_deleting(session_id):
+            raise _TurnStartError("session is being deleted", status=404)
+        cur = _active_turns.get(session_id)
+        if cur is not None and not cur.done:
+            if not cur.cancelled:
+                raise _TurnBusy()
+            draining = cur
+        elif (_sessions_with_inflight_tasks.get(session_id)
+              or _session_has_live_watcher(session_id)):
+            raise _TurnBusy()
+        else:
+            broadcast = TurnBroadcast(session_id=session_id, model=model or MODEL)
+            _active_turns[session_id] = broadcast
+    if draining is not None:
+        deadline = time.monotonic() + _INTERRUPT_DRAIN_WAIT_S
+        while time.monotonic() < deadline:
+            if draining.done or _active_turns.get(session_id) is not draining:
+                break
+            await asyncio.sleep(0.1)
+        async with _lock:
+            if sess.session_is_deleting(session_id):
+                raise _TurnStartError("session is being deleted", status=404)
+            cur = _active_turns.get(session_id)
+            if cur is not None and not cur.done:
+                raise _TurnBusy()
+            if (_sessions_with_inflight_tasks.get(session_id)
+                    or _session_has_live_watcher(session_id)):
+                raise _TurnBusy()
+            broadcast = TurnBroadcast(session_id=session_id, model=model or MODEL)
+            _active_turns[session_id] = broadcast
+
+    broadcast.user_text = prompt
+    broadcast.staged_attachment_ids = [
+        aid for aid in _attachment_ids(image_ids)
+        if _valid_staged_attachment_id(aid)
+    ]
+    broadcast.startup_owner_task = asyncio.current_task()
+    broadcast.queue_item_id = str(queue_item_id or "")
+    intent_started = 0.0
+
+    async def _release_reservation_only(error_kind: str) -> None:
+        """Drop this new reservation without touching a prior turn's sidecar."""
+        async def _cleanup() -> None:
+            async with _lock:
+                if _active_turns.get(session_id) is broadcast:
+                    broadcast.perf_status = "failed"
+                    broadcast.perf_error_kind = error_kind
+                    broadcast.perf_startup_failure_phase = "accepted"
+                    broadcast.finish()
+                    broadcast.close()
+                    _active_turns.pop(session_id, None)
+        cleanup = asyncio.create_task(_cleanup())
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            while not cleanup.done():
+                try:
+                    await asyncio.shield(cleanup)
+                except asyncio.CancelledError:
+                    continue
+            cleanup.result()
+            raise
+
+    async def _settle_admission_cancellation() -> None:
+        if intent_started:
+            broadcast.perf_intent_ms = obs.elapsed_ms(intent_started)
+        broadcast.perf_admission_ms = obs.elapsed_ms(admission_started)
+        broadcast.perf_startup_failure_phase = "accepted"
+        if broadcast.cancelled:
+            await _finish_cancelled_startup(session_id, broadcast)
+            return
+        broadcast.perf_error_kind = "admission_cancelled"
+        await _abort_turn_startup(
+            session_id,
+            broadcast,
+            "failed",
+            pause_queue=True,
+            error_text="Turn admission was interrupted before startup.",
+        )
+
+    if session_id in _interrupted_at_startup:
+        try:
+            recovered = await _await_thread_completion(
+                _recover_interrupted_turn_snapshot, session_id)
+        except asyncio.CancelledError:
+            # The joined worker may have recovered the old turn, but this new
+            # intent has not been persisted yet. Never let its cancellation
+            # delete or overwrite the prior process's sidecar.
+            await _release_reservation_only("admission_cancelled")
+            raise
+        if not recovered:
+            await _release_reservation_only("interrupted_recovery")
+            raise _TurnStartError(
+                "previous interrupted turn could not be persisted for recovery")
+        _interrupted_at_startup.pop(session_id, None)
+
+    intent_started = obs.monotonic()
+    try:
+        persisted_intent = await obs.to_thread_io(
+            "chat.active_turn_admit",
+            session_id,
+            _write_active_turn_sidecar,
+            broadcast,
+            file_path=_active_turn_path(session_id),
+        )
+    except asyncio.CancelledError:
+        await _settle_admission_cancellation()
+        raise
+    broadcast.perf_intent_ms = obs.elapsed_ms(intent_started)
+    if not persisted_intent:
+        broadcast.perf_error_kind = "intent_persist"
+        broadcast.perf_startup_failure_phase = "accepted"
+        await _abort_turn_startup(
+            session_id,
+            broadcast,
+            "failed",
+            pause_queue=True,
+            error_text="user message could not be persisted before submission",
+        )
+        raise _TurnStartError(
+            "user message could not be persisted before submission")
+
+    if broadcast.queue_item_id:
+        try:
+            sess.bind_queue_turn(
+                session_id, broadcast.queue_item_id, broadcast.turn_id)
+            _durable_attachment_store.mark_queue_turn(
+                session_id, broadcast.queue_item_id, broadcast.turn_id,
+            )
+        except Exception:
+            broadcast.perf_error_kind = "queue_bind"
+            broadcast.perf_startup_failure_phase = "accepted"
+            queue_settled = await _abort_turn_startup(
+                session_id,
+                broadcast,
+                "failed",
+                pause_queue=True,
+                error_text="could not bind queued message to turn",
+            )
+            raise _TurnStartError(
+                "could not bind queued message to turn",
+                queue_claim_settled=queue_settled,
+            )
+
+    try:
+        await _handoff_task_watcher(session_id)
+    except asyncio.CancelledError:
+        await _settle_admission_cancellation()
+        raise
+    except _TurnBusy:
+        await _abort_turn_startup(
+            session_id, broadcast, "failed", pause_queue=False,
+            error_text="Previous background task is still using this session.")
+        raise
+    if broadcast.cancelled:
+        return await _finish_cancelled_startup(session_id, broadcast)
+    broadcast.perf_admission_ms = obs.elapsed_ms(admission_started)
+    return broadcast
+
+
+def _launch_admitted_turn(
+    broadcast: TurnBroadcast,
+    *,
+    prompt: str,
+    model: str,
+    permission: str,
+    image_ids: str,
+) -> asyncio.Task:
+    """Start runtime initialization independently of the SSE subscriber."""
+    session_id = broadcast.session_id
+
+    async def _owner() -> None:
+        try:
+            await _start_turn(
+                session_id,
+                prompt,
+                model=model,
+                permission=permission,
+                image_ids=image_ids,
+                _admitted=broadcast,
+            )
+        except _TurnStartError:
+            # Expected startup failures are durably settled and published by the
+            # shared startup cleanup owner before reaching this boundary.
+            return
+        except asyncio.CancelledError:
+            if broadcast.done:
+                return
+            if broadcast.cancelled:
+                await _finish_cancelled_startup(session_id, broadcast)
+                return
+            broadcast.perf_error_kind = "startup_cancelled"
+            broadcast.perf_startup_failure_phase = (
+                broadcast.startup_phase or "startup")
+            await _abort_turn_startup(
+                session_id,
+                broadcast,
+                "failed",
+                pause_queue=True,
+                error_text="Turn startup ended unexpectedly. Please retry.",
+            )
+            raise
+        except Exception as exc:
+            if broadcast.done:
+                return
+            error_text = str(exc) or type(exc).__name__
+            broadcast.perf_error_kind = str(
+                _classify_stream_error(error_text).get("kind") or "startup")
+            broadcast.perf_startup_failure_phase = (
+                broadcast.startup_phase or "startup")
+            await _abort_turn_startup(
+                session_id,
+                broadcast,
+                "failed",
+                pause_queue=True,
+                error_text=error_text,
+            )
+        finally:
+            if broadcast.startup_owner_task is asyncio.current_task():
+                broadcast.startup_owner_task = None
+
+    task = asyncio.create_task(_owner())
+    broadcast.startup_owner_task = task
+    return task
+
+
 async def _start_turn(
     session_id: str,
     prompt: str,
@@ -13215,184 +13745,41 @@ async def _start_turn(
     image_ids: str = "",
     persist_permission: bool = True,
     queue_item_id: str = "",
+    _admitted: "TurnBroadcast | None" = None,
 ) -> "TurnBroadcast":
-    """Reserve + launch a turn as a detached background task; return its
-    TurnBroadcast (already inserted into _active_turns and pumping via
-    asyncio.create_task).
+    """Run an admitted turn through runtime startup and the detached SDK pump.
 
-    Shared by the /stream HTTP endpoint (which then subscribes to the
-    returned broadcast for replay + live tail) and the server-side queue
-    drain (headless — fire-and-forget; the background pump runs the turn
-    to completion with no client attached). Raises _TurnBusy if a turn is
-    already running on this sid, or _TurnStartError on client-init failure
-    (the reservation is released before raising).
-
-    NOTE: callers handle empty-prompt reconnect + image-only placeholder
-    BEFORE calling — this only handles the NEW-TURN path with a real
-    prompt and optional image_ids."""
-    # NEW-TURN MODE: refuse if there's already an unfinished turn on
-    # this session — otherwise the second turn would overwrite the
-    # broadcast and the user would lose visibility into the first.
-    # Frontend should either reconnect (empty prompt) or wait.
-    #
-    # GRANULARITY NOTE (audit E/249): the busy mutex here is keyed by
-    # `session_id` ALONE, while the SDK client pool is keyed by the wider
-    # `(sid, model, effort, service-tier)` tuple. So two turns on the same sid but
-    # different effort would resolve to two *different* cached clients yet
-    # collide on this single `_active_turns[sid]` slot — the second is
-    # rejected as "previous turn still running." That is intentionally
-    # SAFE today (it errs toward refusing a legitimate concurrent turn,
-    # never toward two clients racing). But it is also why we must NOT
-    # relax this check to a runtime key: two clients pumping the
-    # same session would both append to the same on-disk JSONL and corrupt
-    # it. Keep the mutex coarse (per-sid) until JSONL writes are serialized.
-    #
-    # The check + reservation MUST happen atomically under _lock — two
-    # near-simultaneous SSE requests on the same sid could otherwise both
-    # pass the "busy?" check (neither sees the other's broadcast yet),
-    # both build their own broadcast, and the later one overwrites
-    # `_active_turns[sid]` — making the first turn's reply silently vanish
-    # from the UI. Reserve a placeholder broadcast under the lock; we'll
-    # fill its `user_text` / images / etc. below once we've parsed them.
-    draining = None
-    async with _lock:
-        # Explicit deletion fences queue and direct sends before its first
-        # asynchronous teardown step. A request that began earlier is either
-        # already visible here and will be cancelled by purge, or is rejected.
-        if sess.session_is_deleting(session_id):
-            raise _TurnStartError("session is being deleted", status=404)
-        cur = _active_turns.get(session_id)
-        if cur is not None and not cur.done:
-            if not cur.cancelled:
-                # A legitimate concurrent turn (not user-interrupted) — refuse.
-                raise _TurnBusy()
-            # The current turn is being interrupted (its force-stop watchdog is
-            # tearing it down). Rather than bounce the user's resend with
-            # "previous turn still running", wait below for the slot to free.
-            draining = cur
-        # One pump prevents competing SDK readers, but it cannot correlate an
-        # old background task's late auto-continuation with a simultaneous new
-        # query on the same CLI. Keep the new message in the durable queue
-        # until the watcher fully drains and then advances FIFO itself.
-        elif (_sessions_with_inflight_tasks.get(session_id)
-              or _session_has_live_watcher(session_id)):
-            raise _TurnBusy()
-        else:
-            broadcast = TurnBroadcast(session_id=session_id, model=model or MODEL)
-            _active_turns[session_id] = broadcast
-    if draining is not None:
-        # Outside the lock: poll for the interrupted turn to drain. The
-        # force-stop watchdog guarantees this happens within
-        # _INTERRUPT_FORCE_GRACE_S + teardown, comfortably inside the deadline.
-        deadline = time.monotonic() + _INTERRUPT_DRAIN_WAIT_S
-        while time.monotonic() < deadline:
-            if draining.done or _active_turns.get(session_id) is not draining:
-                break
-            await asyncio.sleep(0.1)
-        async with _lock:
-            if sess.session_is_deleting(session_id):
-                raise _TurnStartError(
-                    "session is being deleted", status=404)
-            cur = _active_turns.get(session_id)
-            if cur is not None and not cur.done:
-                # Teardown still hasn't completed — give up cleanly.
-                raise _TurnBusy()
-            # The interrupted turn can publish its background-task watcher
-            # immediately before releasing `_active_turns`. Re-check that
-            # logical response owner at the same reservation point; otherwise
-            # this draining path bypasses the ordinary background gate above.
-            if (_sessions_with_inflight_tasks.get(session_id)
-                    or _session_has_live_watcher(session_id)):
-                raise _TurnBusy()
-            broadcast = TurnBroadcast(session_id=session_id, model=model or MODEL)
-            _active_turns[session_id] = broadcast
-    # The Stop button can race cold CLI/MCP startup before attachment parsing
-    # and the final model resolution below. Retain the already-submitted text
-    # as soon as this broadcast owns the session so startup cancellation can
-    # persist the same user bubble the browser is displaying.
-    broadcast.user_text = prompt
-    broadcast.startup_owner_task = asyncio.current_task()
-    broadcast.queue_item_id = str(queue_item_id or "")
-    # The reservation is also the pending-intent commit point. Persist before
-    # cold client/MCP startup so a process restart cannot erase a prompt merely
-    # because the SDK had not accepted it yet. A queue item already has its own
-    # durable owner, but mirroring it here keeps direct and queued turn recovery
-    # behavior identical once claimed.
-    if session_id in _interrupted_at_startup:
-        recovered = await asyncio.to_thread(
-            _recover_interrupted_turn_snapshot, session_id)
-        if not recovered:
-            async with _lock:
-                if _active_turns.get(session_id) is broadcast:
-                    broadcast.finish()
-                    _active_turns.pop(session_id, None)
-            raise _TurnStartError(
-                "previous interrupted turn could not be persisted for recovery")
-        _interrupted_at_startup.pop(session_id, None)
-    persisted_intent = await obs.to_thread_io(
-        "chat.active_turn_write",
-        session_id,
-        _write_active_turn_sidecar,
-        broadcast,
-        file_path=_active_turn_path(session_id),
-    )
-    if not persisted_intent:
-        async with _lock:
-            if _active_turns.get(session_id) is broadcast:
-                broadcast.finish()
-                _active_turns.pop(session_id, None)
-        raise _TurnStartError(
-            "user message could not be persisted before submission")
-    # The reservation above is the commit point: bind the durable queue claim
-    # before any SDK startup await can be cancelled. From here, only this turn's
-    # terminal cleanup may ack or release the item.
-    if broadcast.queue_item_id:
+    Ordinary internal callers still receive the historical behavior. The HTTP
+    stream route can admit first, register this coroutine as the detached owner,
+    and return EventSourceResponse while this function waits for runtime startup.
+    """
+    broadcast = _admitted
+    if broadcast is None:
+        broadcast = await _admit_turn(
+            session_id,
+            prompt,
+            model=model,
+            image_ids=image_ids,
+            queue_item_id=queue_item_id,
+        )
+        broadcast.startup_owner_task = asyncio.current_task()
+    if broadcast.done or broadcast.cancelled:
+        return broadcast
+    if not broadcast.startup_phase:
         try:
-            sess.bind_queue_turn(
-                session_id, broadcast.queue_item_id, broadcast.turn_id)
-            _durable_attachment_store.mark_queue_turn(
-                session_id, broadcast.queue_item_id, broadcast.turn_id,
-            )
+            broadcast.publish_startup("accepted")
         except Exception:
-            queue_settled = False
-            try:
-                queue_settled = sess.release_queue_claim(
-                    session_id,
-                    broadcast.queue_item_id,
-                    turn_id=broadcast.turn_id,
-                    pause=True,
-                )
-            except Exception:
-                pass
-            _delete_active_turn_sidecar(session_id)
-            async with _lock:
-                if _active_turns.get(session_id) is broadcast:
-                    broadcast.perf_status = "failed"
-                    broadcast.perf_error_kind = "queue_bind"
-                    broadcast.finish()
-                    _active_turns.pop(session_id, None)
-            raise _TurnStartError(
-                "could not bind queued message to turn",
-                queue_claim_settled=queue_settled,
+            broadcast.perf_error_kind = "startup_event"
+            broadcast.perf_startup_failure_phase = "accepted"
+            await _abort_turn_startup(
+                session_id,
+                broadcast,
+                "failed",
+                pause_queue=True,
             )
-    # Clear a completed watcher defensively. A live watcher must never be
-    # cancelled here: it still owns the stream and its continuation belongs to
-    # the previous turn.
-    try:
-        await _handoff_task_watcher(session_id)
-    except asyncio.CancelledError:
-        if broadcast.cancelled:
-            return await _finish_cancelled_startup(session_id, broadcast)
-        await _abort_turn_startup(
-            session_id, broadcast, "cancelled", pause_queue=True)
-        raise
-    except _TurnBusy:
-        await _abort_turn_startup(
-            session_id, broadcast, "failed", pause_queue=False,
-            error_text="Previous background task is still using this session.")
-        raise
-    if broadcast.cancelled:
-        return await _finish_cancelled_startup(session_id, broadcast)
+            raise _TurnStartError(
+                "turn could not establish its startup event") from None
+
     # Defensive: clear any stale "user cancelled" flag carried over from
     # a previous turn on this session. Normally consumed by the prior
     # turn's ResultMessage handler, but if that handler never reached
@@ -13459,11 +13846,17 @@ async def _start_turn(
     # MODE, otherwise this session's slot stays "busy" forever and
     # subsequent sends get rejected.
     _client_started = obs.monotonic()
+    broadcast.publish_startup("runtime")
+    _runtime_lock_started = obs.monotonic()
+    _runtime_lock_acquired = False
     try:
         # Serialize client creation/replacement with scheduler and /compact.
         # The active-turn reservation above is visible before we wait here, so
         # those paths can fail cleanly instead of mutating this runtime.
         async with _session_runtime_lock_for(session_id):
+            _runtime_lock_acquired = True
+            broadcast.perf_runtime_lock_ms = obs.elapsed_ms(
+                _runtime_lock_started)
             client_kwargs: dict[str, Any] = {
                 "effort": effort_to_use,
                 "service_tier": service_tier_to_use,
@@ -13485,6 +13878,35 @@ async def _start_turn(
                          or _cached_plan_return == plan_return_to_use))
                 else "cold"
             )
+
+            def _record_client_phase(phase: str, duration_ms: int) -> None:
+                value = max(0, int(duration_ms or 0))
+                if phase == "disconnect":
+                    broadcast.perf_disconnect_ms += value
+                elif phase == "pool":
+                    broadcast.perf_pool_ms += value
+                elif phase == "creation_lock":
+                    broadcast.perf_creation_lock_ms += value
+                elif phase == "connect":
+                    broadcast.perf_connect_ms += value
+                elif phase == "tools":
+                    broadcast.publish_startup("tools")
+                elif phase == "mcp":
+                    broadcast.perf_mcp_ms += value
+                elif phase == "pool_commit":
+                    broadcast.perf_pool_commit_ms += value
+
+            try:
+                client_params = inspect.signature(get_client).parameters.values()
+                supports_startup_phase = any(
+                    param.name == "startup_phase"
+                    or param.kind is inspect.Parameter.VAR_KEYWORD
+                    for param in client_params
+                )
+            except (TypeError, ValueError):
+                supports_startup_phase = False
+            if supports_startup_phase:
+                client_kwargs["startup_phase"] = _record_client_phase
             startup_task = asyncio.create_task(
                 get_client(
                     session_id, model_to_use, permission,
@@ -13497,6 +13919,9 @@ async def _start_turn(
                     broadcast.startup_task = None
     except asyncio.TimeoutError:
         broadcast.perf_error_kind = "timeout"
+        broadcast.perf_startup_failure_phase = (
+            "tools" if broadcast.startup_phase == "tools" else "runtime"
+        )
         timeout_error = "Client connection timed out — CLI process may be hung"
         queue_settled = await _abort_turn_startup(
             session_id, broadcast, "failed", pause_queue=True,
@@ -13506,19 +13931,27 @@ async def _start_turn(
             status=504,
             queue_claim_settled=queue_settled)
     except asyncio.CancelledError:
+        broadcast.perf_startup_failure_phase = (
+            "tools" if broadcast.startup_phase == "tools" else "runtime"
+        )
         if broadcast.cancelled:
             return await _finish_cancelled_startup(session_id, broadcast)
-        # FastAPI cancels the handler when the client disconnects mid-
-        # await (browser tab closed, request aborted). Without this the
-        # reservation we made above stays in _active_turns forever and
-        # every subsequent send on this sid is rejected as "previous
-        # turn still running." CancelledError is a BaseException, NOT
-        # an Exception, so the broader handler below would miss it.
+        # Cancellation without the user Stop flag is an internal startup
+        # failure. Publish a replayable error instead of silently ending SSE.
+        broadcast.perf_error_kind = "startup_cancelled"
         await _abort_turn_startup(
-            session_id, broadcast, "cancelled", pause_queue=True)
+            session_id,
+            broadcast,
+            "failed",
+            pause_queue=True,
+            error_text="Turn startup ended unexpectedly. Please retry.",
+        )
         raise
     except Exception as e:
         err_msg = str(e) or f"{type(e).__name__}"
+        broadcast.perf_startup_failure_phase = (
+            "tools" if broadcast.startup_phase == "tools" else "runtime"
+        )
         broadcast.perf_error_kind = str(
             _classify_stream_error(err_msg).get("kind") or "startup")
         # Free the reservation so the user can fix their config (e.g. add an
@@ -13529,6 +13962,9 @@ async def _start_turn(
         raise _TurnStartError(
             err_msg, queue_claim_settled=queue_settled)
     finally:
+        if not _runtime_lock_acquired:
+            broadcast.perf_runtime_lock_ms = obs.elapsed_ms(
+                _runtime_lock_started)
         broadcast.perf_client_ms = obs.elapsed_ms(_client_started)
 
     # Stop can race the final instant of client startup: the client may have
@@ -13540,6 +13976,8 @@ async def _start_turn(
     # Lease staged uploads without consuming them. The payload remains retryable
     # through CPU/disk preparation and native compact preflight; only a
     # successful SDK query write commits the lease.
+    broadcast.publish_startup("context")
+    _attachment_started = obs.monotonic()
     prepared = _PreparedStagedAttachments()
     if image_ids:
         lease, missing_attachments, busy_attachments = await asyncio.to_thread(
@@ -13553,6 +13991,8 @@ async def _start_turn(
         if busy_attachments or (
             broadcast.queue_item_id and missing_attachments
         ):
+            broadcast.perf_attachment_ms = obs.elapsed_ms(_attachment_started)
+            broadcast.perf_startup_failure_phase = "context"
             if broadcast.queue_item_id:
                 queue_settled = await _fail_queued_attachment_startup(
                     session_id, broadcast)
@@ -13577,18 +14017,26 @@ async def _start_turn(
                 prepared = await _prepare_broadcast_attachments(
                     broadcast, session_id, lease)
             except asyncio.CancelledError:
+                broadcast.perf_attachment_ms = obs.elapsed_ms(
+                    _attachment_started)
+                broadcast.perf_startup_failure_phase = "context"
                 if broadcast.cancelled:
                     return await _finish_cancelled_startup(
                         session_id, broadcast)
+                broadcast.perf_error_kind = "startup_cancelled"
                 await _abort_turn_startup(
                     session_id,
                     broadcast,
-                    "cancelled",
+                    "failed",
                     pause_queue=True,
+                    error_text="Attachment preparation ended unexpectedly. Please retry.",
                 )
                 raise
             except Exception:
                 broadcast.perf_error_kind = "attachment"
+                broadcast.perf_attachment_ms = obs.elapsed_ms(
+                    _attachment_started)
+                broadcast.perf_startup_failure_phase = "context"
                 if broadcast.queue_item_id:
                     queue_settled = await _fail_queued_attachment_startup(
                         session_id, broadcast)
@@ -13603,6 +14051,7 @@ async def _start_turn(
                     "attachment preparation failed",
                     queue_claim_settled=queue_settled,
                 ) from None
+    broadcast.perf_attachment_ms = obs.elapsed_ms(_attachment_started)
 
     # Stop may arrive while the worker is in an uninterruptible thread. The
     # wrapper joins its real result; re-check before those files can reach any
@@ -14185,13 +14634,17 @@ async def _start_turn(
                 existing_uuids, transcript_boundary = await asyncio.to_thread(
                     _turn_transcript_boundary, session_id, model_to_use)
                 broadcast.transcript_boundary = transcript_boundary
-                await obs.to_thread_io(
+                persisted_boundary = await obs.to_thread_io(
                     "chat.active_turn_write",
                     session_id,
                     _write_active_turn_sidecar,
                     broadcast,
                     file_path=_active_turn_path(session_id),
                 )
+                if not persisted_boundary:
+                    broadcast.perf_error_kind = "intent_refresh"
+                    broadcast.perf_startup_failure_phase = "context"
+                    raise RuntimeError("turn intent boundary could not be persisted")
                 _preflight_started = obs.monotonic()
                 try:
                     await _preflight_compact_if_needed(_emit_side)
@@ -14220,20 +14673,25 @@ async def _start_turn(
 
                     if not broadcast.perf_query_started:
                         broadcast.perf_query_started = obs.monotonic()
-                    if binary_blocks:
-                        text_block = {"type": "text", "text": prompt}
-                        content = [*binary_blocks, text_block]
+                    _query_write_started = obs.monotonic()
+                    try:
+                        if binary_blocks:
+                            text_block = {"type": "text", "text": prompt}
+                            content = [*binary_blocks, text_block]
 
-                        async def gen():
-                            yield {
-                                "type": "user",
-                                "message": {
-                                    "role": "user", "content": content,
-                                },
-                            }
-                        await client.query(gen())
-                    else:
-                        await client.query(prompt)
+                            async def gen():
+                                yield {
+                                    "type": "user",
+                                    "message": {
+                                        "role": "user", "content": content,
+                                    },
+                                }
+                            await client.query(gen())
+                        else:
+                            await client.query(prompt)
+                    finally:
+                        broadcast.perf_query_write_ms = obs.elapsed_ms(
+                            _query_write_started)
                     # query() is the transport commit point. Until it returns,
                     # the lease is still retryable; after it succeeds, consume
                     # the exact staged objects before receiving any response.
@@ -14244,6 +14702,7 @@ async def _start_turn(
                         # let the next turn adopt it as its own response.
                         _pending_runtime_rebuilds.add(session_id)
                         raise
+                    broadcast.emit_startup_perf("ready")
                     if persisted_imgs:
                         try:
                             await _await_thread_completion(
@@ -15604,15 +16063,19 @@ async def _start_turn(
     # Refresh the pending intent with resolved model, attachment display refs,
     # and the exact pre-query transcript boundary captured above. Keep this
     # filesystem write off the event loop because the sidecar is durable state.
+    _intent_refresh_started = obs.monotonic()
     try:
-        await obs.to_thread_io(
-            "chat.active_turn_write",
+        persisted_intent_refresh = await obs.to_thread_io(
+            "chat.active_turn_refresh",
             session_id,
             _write_active_turn_sidecar,
             broadcast,
             file_path=_active_turn_path(session_id),
         )
     except asyncio.CancelledError:
+        broadcast.perf_intent_refresh_ms = obs.elapsed_ms(
+            _intent_refresh_started)
+        broadcast.perf_startup_failure_phase = "context"
         if broadcast.cancelled:
             return await _finish_cancelled_startup(
                 session_id, broadcast)
@@ -15624,6 +16087,9 @@ async def _start_turn(
         )
         raise
     except Exception:
+        broadcast.perf_intent_refresh_ms = obs.elapsed_ms(
+            _intent_refresh_started)
+        broadcast.perf_startup_failure_phase = "context"
         queue_settled = await _abort_turn_startup(
             session_id,
             broadcast,
@@ -15635,6 +16101,21 @@ async def _start_turn(
             "turn intent could not be refreshed",
             queue_claim_settled=queue_settled,
         ) from None
+    broadcast.perf_intent_refresh_ms = obs.elapsed_ms(_intent_refresh_started)
+    if not persisted_intent_refresh:
+        broadcast.perf_error_kind = "intent_refresh"
+        broadcast.perf_startup_failure_phase = "context"
+        queue_settled = await _abort_turn_startup(
+            session_id,
+            broadcast,
+            "failed",
+            pause_queue=True,
+            error_text="turn intent could not be refreshed",
+        )
+        raise _TurnStartError(
+            "turn intent could not be refreshed",
+            queue_claim_settled=queue_settled,
+        )
     # The durable write may finish after Stop cancelled (or tried to cancel)
     # this owner. Do not create a pump after the user-visible cancellation.
     if broadcast.cancelled:
@@ -16473,6 +16954,7 @@ def session_active_status(sid: str) -> dict:
                     recent.activity_source if recent is not None else ""
                 ),
             }
+    _hydrate_staged_attachment_display(b)
     return {
         "active": True,
         "attachable": True,
@@ -16756,6 +17238,8 @@ chat_overlays.configure_hooks(chat_overlays.OverlayHooks(
     turn_uuids_from_boundary=lambda *a, **k: _turn_uuids_from_boundary(*a, **k),
     delete_active_turn_sidecar=lambda *a, **k: _delete_active_turn_sidecar(*a, **k),
     turn_broadcast_factory=lambda *a, **k: TurnBroadcast(*a, **k),
+    resolve_staged_attachment_display=lambda *a, **k: (
+        _resolve_staged_attachment_display(*a, **k)),
     interrupted_at_startup=_interrupted_at_startup,
     persist_failed_turn_snapshot=lambda *a, **k: _persist_failed_turn_snapshot(*a, **k),
     load_cancelled_turn_snapshots=lambda *a, **k: _load_cancelled_turn_snapshots(*a, **k),

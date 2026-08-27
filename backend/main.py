@@ -816,9 +816,19 @@ class _RequestPerformanceMiddleware:
             method = str(scope.get("method") or "UNKNOWN").upper()
             if not re.fullmatch(r"[A-Z]{1,16}", method):
                 method = "OTHER"
+            scope_state = scope.get("state")
+            if not isinstance(scope_state, dict):
+                scope_state = {}
+            correlation = {
+                key: value for key, value in {
+                    "sid8": scope_state.get("perf_sid8"),
+                    "turn8": scope_state.get("perf_turn8"),
+                }.items() if value
+            }
             _emit_http_perf(
                 method=method,
                 route=_safe_http_route(scope),
+                **correlation,
                 status_code=status_code,
                 duration_ms=duration_ms,
                 headers_ms=headers_ms,

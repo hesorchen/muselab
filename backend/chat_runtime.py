@@ -106,11 +106,31 @@ async def get_client(
     effort: str = "",
     service_tier: str = "",
     plan_return_permission: str = "",
+    startup_phase: Callable[[str, int], None] | None = None,
 ) -> ClaudeSDKClient:
     """Create or fetch one client for a session runtime key."""
     hooks = _require_hooks()
     sess = hooks.sessions
-    if not await hooks.join_session_disconnects(session_id):
+    loop = asyncio.get_running_loop()
+
+    def emit_phase(phase: str, duration_ms: int) -> None:
+        if startup_phase is None:
+            return
+        try:
+            startup_phase(phase, max(0, int(duration_ms or 0)))
+        except Exception:
+            # Observability and browser status must never change client lifecycle.
+            pass
+
+    def record(phase: str, started: float) -> None:
+        emit_phase(phase, round((loop.time() - started) * 1000))
+
+    disconnect_started = loop.time()
+    try:
+        disconnect_ready = await hooks.join_session_disconnects(session_id)
+    finally:
+        record("disconnect", disconnect_started)
+    if not disconnect_ready:
         raise RuntimeCleanupTimeout(
             "session runtime cleanup is still in progress"
         )
@@ -130,6 +150,7 @@ async def get_client(
         permission, plan_return_permission
     )
 
+    pool_started = loop.time()
     async with CLIENT_LOCK:
         cached = CLIENTS.get(key)
         if cached is not None:
@@ -140,6 +161,7 @@ async def get_client(
         cached_plan_return = (
             CLIENT_PLAN_RETURN.get(key, "") if cached is not None else ""
         )
+    record("pool", pool_started)
 
     if cached is not None:
         if sess.session_is_deleting(session_id):
@@ -159,10 +181,13 @@ async def get_client(
                 effort=effort,
                 service_tier=service_tier,
                 plan_return_permission=plan_return_permission,
+                startup_phase=startup_phase,
             )
         return cached
 
+    creation_started = loop.time()
     async with creation_lock_for(key):
+        record("creation_lock", creation_started)
         async with CLIENT_LOCK:
             cached = CLIENTS.get(key)
             if cached is not None:
@@ -189,23 +214,32 @@ async def get_client(
                 return cached
             await hooks.disconnect_client(session_id)
 
-        if permission == "plan":
-            client = await hooks.build_and_connect_client(
-                session_id,
-                model,
-                permission,
-                effort,
-                service_tier,
-                plan_return_permission=plan_return_permission,
-            )
-        else:
-            client = await hooks.build_and_connect_client(
-                session_id, model, permission, effort, service_tier
-            )
+        connect_started = loop.time()
+        try:
+            if permission == "plan":
+                client = await hooks.build_and_connect_client(
+                    session_id,
+                    model,
+                    permission,
+                    effort,
+                    service_tier,
+                    plan_return_permission=plan_return_permission,
+                )
+            else:
+                client = await hooks.build_and_connect_client(
+                    session_id, model, permission, effort, service_tier
+                )
+        finally:
+            record("connect", connect_started)
 
         try:
             if hooks.has_enabled_external_mcp():
-                await hooks.await_mcp_ready(client)
+                emit_phase("tools", 0)
+                mcp_started = loop.time()
+                try:
+                    await hooks.await_mcp_ready(client)
+                finally:
+                    record("mcp", mcp_started)
         except BaseException:
             try:
                 await hooks.disconnect_unpooled_client(client, session_id)
@@ -222,6 +256,7 @@ async def get_client(
             tuple[ClientKey, ClaudeSDKClient, SessionStream | None]
         ] = []
         reject_deleting = False
+        commit_started = loop.time()
         async with CLIENT_LOCK:
             with sess.session_lifecycle_lock(session_id):
                 reject_deleting = sess.session_is_deleting(session_id)
@@ -261,6 +296,7 @@ async def get_client(
                 if old_client is not None:
                     old_stream = SESSION_STREAMS.pop(old_key, None)
                     to_disconnect.append((old_key, old_client, old_stream))
+        record("pool_commit", commit_started)
 
         if reject_deleting:
             await hooks.disconnect_unpooled_client(client, session_id)
