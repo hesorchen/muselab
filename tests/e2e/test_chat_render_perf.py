@@ -2794,6 +2794,7 @@ def test_mobile_transcript_loader_uses_centered_muse_brand(
             noOverflow: overlay.scrollWidth <= overlay.clientWidth,
             emblemVisible: emblem.getClientRects().length > 0,
             copy: copy.textContent.trim(),
+            expectedCopy: app.t('chat.loading_session'),
             skeletonCount: overlay.querySelectorAll('.chat-skeleton').length,
             srOnlyCount: overlay.querySelectorAll('.sr-only').length,
             mascotHref: overlay.querySelector('.muse-mascot use')
@@ -2808,7 +2809,7 @@ def test_mobile_transcript_loader_uses_centered_muse_brand(
     assert geometry["centerDeltaY"] < 2
     assert geometry["noOverflow"] is True
     assert geometry["emblemVisible"] is True
-    assert geometry["copy"].startswith("Muse ")
+    assert geometry["copy"] == geometry["expectedCopy"]
     assert geometry["skeletonCount"] == 0
     assert geometry["srOnlyCount"] == 0
     assert geometry["mascotHref"].startswith("#m-")
@@ -3675,6 +3676,7 @@ def test_load_session_reconnects_active_turn_and_renders_live_assistant(
             phase: st.streamPhase,
             assistantCount: st.messages.filter(m => m.role === "assistant").length,
             footer: document.querySelector(".turn-pending-footer")?.textContent || "",
+            expectedRuntime: app.t("chat.startup_runtime"),
             streaming: st.streaming,
           };
         }"""
@@ -3682,13 +3684,13 @@ def test_load_session_reconnects_active_turn_and_renders_live_assistant(
     assert transport_open["phase"] == "connecting"
     assert transport_open["assistantCount"] == 0
     assert transport_open["streaming"] is True
-    assert "正在启动运行环境" in transport_open["footer"]
+    assert transport_open["expectedRuntime"] in transport_open["footer"]
 
-    for event_seq, phase, label in [
-        (1, "accepted", "正在启动运行环境"),
-        (2, "runtime", "正在启动运行环境"),
-        (3, "tools", "正在准备工具"),
-        (4, "context", "正在准备会话"),
+    for event_seq, phase, label_key in [
+        (1, "accepted", "chat.startup_runtime"),
+        (2, "runtime", "chat.startup_runtime"),
+        (3, "tools", "chat.startup_tools"),
+        (4, "context", "chat.startup_context"),
     ]:
         page.evaluate(
             """({ phase, eventSeq }) => window.__emitSse("startup", {
@@ -3697,14 +3699,14 @@ def test_load_session_reconnects_active_turn_and_renders_live_assistant(
             {"phase": phase, "eventSeq": event_seq},
         )
         page.wait_for_function(
-            """({ phase, label }) => {
+            """({ phase, labelKey }) => {
               const app = document.querySelector("#app")._x_dataStack[0];
               const st = app._ensureTabState(app.currentId);
               const footer = document.querySelector(".turn-pending-footer")?.textContent || "";
-              return st.streamPhase === phase && footer.includes(label)
+              return st.streamPhase === phase && footer.includes(app.t(labelKey))
                 && st.messages.filter(m => m.role === "assistant").length === 0;
             }""",
-            arg={"phase": phase, "label": label},
+            arg={"phase": phase, "labelKey": label_key},
             timeout=5000,
         )
 
