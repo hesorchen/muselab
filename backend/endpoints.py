@@ -432,208 +432,17 @@ def _resolve_base_url(env_key: str, provider: Provider | None = None) -> str:
 # dropdown gives context, model id removes ambiguity.
 CATALOG: tuple[Provider, ...] = (
     Provider(
-        prefix="deepseek-",
-        base_url=_DEFAULT_BASE_URLS["DEEPSEEK_API_KEY"],
-        env_key="DEEPSEEK_API_KEY",
-        display="DeepSeek",
-        models=(
-            ("deepseek-v4-pro",    "V4 Pro"),
-            ("deepseek-v4-flash",  "V4 Flash"),
-        ),
-    ),
-    Provider(
-        prefix="glm-",
-        base_url=_DEFAULT_BASE_URLS["ZHIPUAI_API_KEY"],
-        env_key="ZHIPUAI_API_KEY",
-        display="智谱 GLM",
-        models=(
-            ("glm-5.2-internal", "GLM 5.2"),
-            ("glm-5.1",      "GLM 5.1"),
-            ("glm-5",        "GLM 5"),
-            ("glm-5-air",    "GLM 5 Air"),
-            ("glm-4.7",      "GLM 4.7"),
-            ("glm-4-plus",   "GLM 4 Plus"),
-        ),
-    ),
-    Provider(
-        prefix="minimax-",
-        base_url=_DEFAULT_BASE_URLS["MINIMAX_API_KEY"],
-        env_key="MINIMAX_API_KEY",
-        display="MiniMax",
-        models=(
-            ("minimax-m2.7",            "M2.7"),
-            ("minimax-m2.7-highspeed",  "M2.7 Highspeed"),
-            ("minimax-m2.5",            "M2.5"),
-            ("minimax-m2.5-highspeed",  "M2.5 Highspeed"),
-            ("minimax-m2.1",            "M2.1"),
-            ("minimax-m2.1-highspeed",  "M2.1 Highspeed"),
-        ),
-    ),
-    # MiniMax 国际站 — 海外用户延迟更低。⚠ 注意：国际站需要单独的 API key，
-    # 中国站的 key 在国际站会返回 401。
-    Provider(
-        prefix="minimax-intl:",
-        base_url="https://api.minimax.io/anthropic",
-        env_key="MINIMAX_INTL_API_KEY",
-        display="MiniMax (国际)",
-        models=(
-            ("minimax-intl:minimax-m2.7",            "M2.7"),
-            ("minimax-intl:minimax-m2.7-highspeed",  "M2.7 Highspeed"),
-            ("minimax-intl:minimax-m2.5",            "M2.5"),
-            ("minimax-intl:minimax-m2.5-highspeed",  "M2.5 Highspeed"),
-            ("minimax-intl:minimax-m2.1",            "M2.1"),
-            ("minimax-intl:minimax-m2.1-highspeed",  "M2.1 Highspeed"),
-        ),
-    ),
-    # Moonshot Kimi — re-added 2026-05-22. Removed once on 2026-05-17 for
-    # "inconsistent endpoint behaviour"; the K2.5 / K2.6 releases land on
-    # an updated stack with stable Anthropic-compat per vendor docs +
-    # third-party adapters (liteLLM, kimrel, OpenClaw). Verify tool-use
-    # works for your account before relying on production usage.
-    Provider(
-        prefix="kimi-",
-        base_url="https://api.moonshot.cn/anthropic",
-        env_key="MOONSHOT_API_KEY",
-        display="Kimi",
-        models=(
-            ("kimi-k2.6",          "K2.6"),          # 2026-04 GA
-            ("kimi-k2.5",          "K2.5"),          # 2026-01
-            ("kimi-k2-thinking",   "K2 Thinking"),
-            ("kimi-k2",            "K2"),
-        ),
-    ),
-    # Alibaba DashScope Qwen — 国内站（默认）。Anthropic-compat path is
-    # /apps/anthropic (not /anthropic). Prefix is the bare string "qwen"
-    # (no dash) because model ids alternate "qwen-plus" and "qwen3-max".
-    # 同一把 API key 可用于国内站和国际站，国际用户可选国际站降低延迟。
-    Provider(
-        prefix="qwen",
-        base_url="https://dashscope.aliyuncs.com/apps/anthropic",
-        env_key="DASHSCOPE_API_KEY",
-        display="Qwen",
-        models=(
-            ("qwen3.6-plus",          "Qwen3.6 Plus"),
-            ("qwen3-max",             "Qwen3 Max"),
-            ("qwen3.5-plus",          "Qwen3.5 Plus"),
-            ("qwen3.5-flash",         "Qwen3.5 Flash"),
-            ("qwen3.5-coder-plus",    "Qwen3.5 Coder Plus"),
-            ("qwen-plus",             "Qwen Plus"),
-        ),
-    ),
-    # Qwen 国际站 — 新加坡节点，国际用户延迟更低。与国内站共用同一把 API key。
-    Provider(
-        prefix="qwen-intl:",
-        base_url="https://dashscope-intl.aliyuncs.com/apps/anthropic",
-        env_key="DASHSCOPE_API_KEY",
-        display="Qwen (国际)",
-        models=(
-            ("qwen-intl:qwen3.6-plus",          "Qwen3.6 Plus"),
-            ("qwen-intl:qwen3-max",             "Qwen3 Max"),
-            ("qwen-intl:qwen3.5-plus",          "Qwen3.5 Plus"),
-            ("qwen-intl:qwen3.5-flash",         "Qwen3.5 Flash"),
-            ("qwen-intl:qwen3.5-coder-plus",    "Qwen3.5 Coder Plus"),
-            ("qwen-intl:qwen-plus",             "Qwen Plus"),
-        ),
-    ),
-    # Xiaomi MiMo — added 2026-05-22. V2.5-Pro public beta 2026-04-22.
-    # MIT-licensed weights + Anthropic-compatible API; endpoint format
-    # follows the DeepSeek convention exactly.
-    Provider(
-        prefix="mimo-",
-        base_url=_DEFAULT_BASE_URLS["XIAOMI_MIMO_API_KEY"],
-        env_key="XIAOMI_MIMO_API_KEY",
-        display="Xiaomi MiMo",
-        models=(
-            ("mimo-v2.5-pro",   "V2.5 Pro"),
-            ("mimo-v2.5",       "V2.5"),
-            ("mimo-v2-flash",   "V2 Flash"),
-        ),
-    ),
-    # Baidu Qianfan — Anthropic-compat endpoint confirmed 2026-05-23.
-    # ⚠ Auth uses IAM access token (bce-v3/ALTAK-xxx/xxx), not a plain
-    # sk-xxx key. Qianfan is a model aggregator: in addition to ERNIE
-    # models, it also hosts third-party models (DeepSeek / Kimi / GLM /
-    # MiniMax / Qwen) behind the same endpoint. Model availability may
-    # vary by account — check console.bce.baidu.com/qianfan for your
-    # region's current model list.
-    Provider(
-        prefix="ernie-",
-        base_url=_DEFAULT_BASE_URLS["QIANFAN_API_KEY"],
-        env_key="QIANFAN_API_KEY",
-        display="百度千帆",
-        supports_thinking=False,
-        # Qianfan rejects max_completion_tokens > 12288 with HTTP 400.
-        # The CLI's default sits around 32-64k, so we have to pin this.
-        max_output_tokens=12288,
-        # Model list audited 2026-05-24 by direct probe against
-        # qianfan.baidubce.com/anthropic. ernie-5.0 added (flagship,
-        # ships with thinking output). ernie-x1.1-preview added (new
-        # reasoning preview). deepseek-v3.1 / deepseek-r1 removed —
-        # Qianfan no longer serves them on the Anthropic-compat path
-        # (returns invalid_model).
-        models=(
-            ("ernie-5.0",                 "ERNIE 5.0"),
-            ("ernie-4.5-turbo-20260402",  "ERNIE 4.5 Turbo"),
-            ("ernie-4.5-turbo-128k",      "ERNIE 4.5 Turbo 128K"),
-            ("ernie-4.0-turbo-128k",      "ERNIE 4.0 Turbo"),
-            ("ernie-4.0-8k",              "ERNIE 4.0"),
-            ("ernie-x1.1-preview",        "ERNIE X1.1 推理 (preview)"),
-            ("ernie-x1-turbo-32k",        "ERNIE X1 推理"),
-            ("deepseek-v3.2",             "DeepSeek V3.2 (千帆)"),
-        ),
-    ),
-    # Codex Gateway — local sidecar that speaks Anthropic Messages on one side
-    # and uses the user's own authenticated Codex/OpenAI backend on the other.
-    # This is NOT native OpenAI protocol support inside muselab: the gateway is
-    # responsible for translation, auth, and model availability. Loopback HTTP is
-    # intentional here; remote gateways should be put behind HTTPS + a strong key.
-    Provider(
         prefix="codex:",
         base_url=_DEFAULT_BASE_URLS["CODEX_GATEWAY_API_KEY"],
         env_key="CODEX_GATEWAY_API_KEY",
         display="Codex Gateway",
         supports_thinking=False,
         supports_effort=True,
-        # GPT-5 Codex-style models can emit far beyond Claude Code's default
-        # 32K output cap. Without this env override the CLI aborts long turns
-        # before the gateway/model has a chance to finish.
         max_output_tokens=128000,
         models=(
-            ("codex:gpt-5.6-sol",           "GPT-5.6 Sol"),
-            ("codex:gpt-5.6-terra",         "GPT-5.6 Terra"),
-            ("codex:gpt-5.6-luna",          "GPT-5.6 Luna"),
-            ("codex:gpt-5.5",               "GPT-5.5"),
-            ("codex:gpt-5.4",               "GPT-5.4"),
-            ("codex:gpt-5.4-mini",          "GPT-5.4 Mini"),
-            ("codex:gpt-5.3-codex-spark",   "GPT-5.3 Codex Spark"),
+            ("codex:gpt-5.6-sol", "GPT-5.6 Sol"),
         ),
     ),
-    # GPT 直连 — 与「智谱 GLM」相同的 built-in 接入形态：复用既有的
-    # ZHIPUAI_API_KEY 凭据以及 .env 中 ZHIPUAI_BASE_URL 已指向的内部
-    # Anthropic-compatible 统一网关（即 glm-5.2 当前所走的同一通道），
-    # 无需新增任何 *_API_KEY / *_BASE_URL 变量；此处仅声明一组独立的
-    # prefix + model 名，使 picker 能单独展示并由 longest-prefix 路由。
-    Provider(
-        prefix="gpt-",
-        base_url=_DEFAULT_BASE_URLS["ZHIPUAI_API_KEY"],
-        env_key="ZHIPUAI_API_KEY",
-        display="OpenAI",
-        # 后端实为 Codex/GPT 系列：关闭标准 thinking 配置以防部分兼容层
-        # 对该参数报错；放行 per-session reasoning-effort 由网关自行翻译；
-        # 抬高单次最大输出至 128K 以匹配 GPT-Codex 类长输出特征。
-        supports_thinking=False,
-        supports_effort=True,
-        max_output_tokens=128000,
-        models=(
-            ("gpt-5.6-sol", "GPT-5.6 Sol"),
-        ),
-    ),
-    # Doubao (字节 Volcengine) deliberately NOT added — only
-    # `Doubao-Seed-Code` is documented as Claude-Code-native
-    # Anthropic-compat; the general Doubao endpoint
-    # (ark.cn-beijing.volces.com/api/v3) doesn't expose the standard
-    # /anthropic path. Revisit once Volcengine publishes a stable
-    # /anthropic gateway across model families.
 )
 
 
@@ -1071,6 +880,8 @@ DUCC_MODELS: tuple[tuple[str, str, str], ...] = (
     ("glm-5", "GLM-5", "GLM 5"),
     ("glm-5-1", "GLM-5.1", "GLM 5.1"),
     ("glm-5-2", "GLM-5.2", "GLM 5.2"),
+    ("glm-5-3", "GLM-5.3", "GLM 5.3"),
+    ("glm-5-3-flash", "GLM-5.3-Flash", "GLM 5.3 Flash"),
     ("glm-5-turbo", "GLM-5-Turbo", "GLM 5 Turbo"),
     ("grok-4-5", "grok-4.5", "Grok 4.5"),
     ("gpt-5-5", "gpt-5.5", "GPT 5.5"),
