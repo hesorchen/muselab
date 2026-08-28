@@ -6204,6 +6204,11 @@
         </div>
         <template x-for="group in activityVisibleGroups()" :key="group.key">
           <section class="activity-group"
+                   :style="group.boardColumn ? {
+                     '--activity-board-column': group.boardColumn,
+                     '--activity-board-row': group.boardRow,
+                     '--activity-board-row-span': group.boardRowSpan
+                   } : null"
                    x-show="activityEvents(group).length
                      || (group.custom && !activitySearchQuery())"
                    :class="{

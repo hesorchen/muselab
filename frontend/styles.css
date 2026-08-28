@@ -4020,7 +4020,7 @@ pre.text {
     min-height:0;
     max-height:none;
     display:grid;
-    grid-template-columns:repeat(auto-fit,minmax(300px,1fr));
+    grid-template-columns:repeat(3,minmax(0,1fr));
     /* One lane starts at roughly a header + three session cards. Additional
        sessions stay in the lane and are reached by its own scrollbar. */
     grid-auto-rows:300px;
@@ -4098,6 +4098,8 @@ pre.text {
    empty drop target. The ledger/status views keep their compact row styling. */
 @media (min-width:721px) {
   .activity-body.is-group-board > .activity-group.is-custom {
+    grid-column:var(--activity-board-column);
+    grid-row:var(--activity-board-row) / span var(--activity-board-row-span);
     min-width:0;
     min-height:300px;
     height:100%;

@@ -1829,6 +1829,10 @@ def test_activity_center_groups_by_attention_order_and_read_state():
     assert 'activity.view === "groups"' in app
     assert "activityCustomGroupSections()" in app
     assert 'key: "custom:__ungrouped__"' in app
+    assert "boardColumn: 3" in app
+    assert "boardRowSpan: Math.max(1, Math.ceil(customGroupCount / 2))" in app
+    assert "boardColumn: (index % 2) + 1" in app
+    assert "boardRow: Math.floor(index / 2) + 1" in app
     assert '"/api/activity/groups"' in app
     assert '"/api/activity/groups/order"' in app
     assert '}/group`' in app
@@ -1874,7 +1878,13 @@ def test_activity_center_groups_by_attention_order_and_read_state():
     assert "width:min(1120px,calc(100vw - 64px))" in css
     assert "height:auto" in css
     assert "flex:1 1 auto" in css
-    assert "grid-template-columns:repeat(auto-fit,minmax(300px,1fr))" in css
+    assert "grid-template-columns:repeat(3,minmax(0,1fr))" in css
+    assert "repeat(auto-fit,minmax(300px,1fr))" not in css
+    assert "grid-column:var(--activity-board-column)" in css
+    assert "grid-row:var(--activity-board-row) / span var(--activity-board-row-span)" in css
+    assert "'--activity-board-column': group.boardColumn" in html
+    assert "'--activity-board-row': group.boardRow" in html
+    assert "'--activity-board-row-span': group.boardRowSpan" in html
     assert "grid-auto-rows:300px" in css
     assert ".activity-body.is-group-board > .activity-group.is-custom" in css
     assert "ACTIVITY_CUSTOM_GROUP_CAP: 50" in app

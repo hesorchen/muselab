@@ -31587,6 +31587,7 @@ function portal() {
           workspacePath: String(group.workspace_path || ""),
         },
       ]));
+      const customGroupCount = lookup.size;
       lookup.set("__ungrouped__", {
         key: "custom:__ungrouped__",
         label: this.lang === "zh" ? "未分组" : "Ungrouped",
@@ -31596,8 +31597,26 @@ function portal() {
         color: "gray",
         builtin: true,
       });
+      let customIndex = 0;
       return this.normalizeActivityGroupOrder()
-        .map(groupId => lookup.get(groupId)).filter(Boolean);
+        .map(groupId => lookup.get(groupId)).filter(Boolean)
+        .map(group => {
+          if (group.builtin) {
+            return {
+              ...group,
+              boardColumn: 3,
+              boardRow: 1,
+              boardRowSpan: Math.max(1, Math.ceil(customGroupCount / 2)),
+            };
+          }
+          const index = customIndex++;
+          return {
+            ...group,
+            boardColumn: (index % 2) + 1,
+            boardRow: Math.floor(index / 2) + 1,
+            boardRowSpan: 1,
+          };
+        });
     },
     activityMatchesGroup(item, key) {
       if (!item) return false;
