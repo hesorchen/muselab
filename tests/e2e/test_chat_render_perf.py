@@ -184,6 +184,15 @@ def _install_fake_event_source(page: Page) -> None:
         """
         (() => {
           const streams = [];
+          const originalFetch = window.fetch.bind(window);
+          window.fetch = (url, init) => {
+            if (String(url).includes("/api/chat/stream/mux/start")) {
+              return Promise.resolve(new Response("{}", {
+                status: 404, headers: {"Content-Type": "application/json"},
+              }));
+            }
+            return originalFetch(url, init);
+          };
           class FakeEventSource extends EventTarget {
             constructor(url) {
               super();
@@ -219,6 +228,49 @@ def _install_fake_event_source(page: Page) -> None:
     )
 
 
+def _install_fake_mux_event_source(page: Page) -> None:
+    page.add_init_script(
+        """
+        (() => {
+          const streams = [];
+          class FakeEventSource extends EventTarget {
+            constructor(url) {
+              super();
+              this.url = url;
+              this.readyState = 0;
+              streams.push(this);
+              setTimeout(() => {
+                if (this.readyState === 2) return;
+                this.readyState = 1;
+                if (this.onopen) this.onopen(new Event("open"));
+                this.dispatchEvent(new Event("open"));
+              }, 0);
+            }
+            close() { this.readyState = 2; this.closed = true; }
+          }
+          window.EventSource = FakeEventSource;
+          window.__fakeMuxStreams = () => streams.filter(
+            es => String(es.url || "").includes("/api/chat/stream/mux?")
+          );
+          window.__emitMux = (type, payload, index = -1) => {
+            const mux = window.__fakeMuxStreams();
+            const es = mux[index < 0 ? mux.length - 1 : index];
+            if (!es) throw new Error("no fake mux EventSource");
+            es.dispatchEvent(new MessageEvent(type, {
+              data: typeof payload === "string" ? payload : JSON.stringify(payload || {}),
+            }));
+          };
+          window.__disconnectMux = () => {
+            const mux = window.__fakeMuxStreams();
+            const es = mux[mux.length - 1];
+            if (!es) throw new Error("no fake mux EventSource");
+            es.dispatchEvent(new Event("error"));
+          };
+        })();
+        """
+    )
+
+
 def _visible_pane_with_text_snapshot(page: Page, text: str):
     return page.evaluate(
         """expected => {
@@ -234,6 +286,173 @@ def _visible_pane_with_text_snapshot(page: Page, text: str):
         }""",
         text,
     )
+
+
+def test_mux_routes_two_sessions_reconnects_with_checkpoints_and_defers_watcher_runtime(
+    page: Page, backend_url, auth_token,
+):
+    errors = _capture_browser_errors(page)
+    _install_fake_mux_event_source(page)
+    mux_starts: list[dict] = []
+    turn_starts: list[dict] = []
+
+    def handle_mux_start(route) -> None:
+        mux_starts.append(route.request.post_data_json)
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({"ticket": f"mux-{len(mux_starts)}"}),
+        )
+
+    def handle_turn_start(route) -> None:
+        turn_starts.append(route.request.post_data_json)
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({
+                "accepted": True,
+                "session_id": route.request.post_data_json["session_id"],
+                "turn_id": "turn-local",
+                "started_at": int(time.time()),
+            }),
+        )
+
+    page.route("**/api/chat/stream/mux/start", handle_mux_start)
+    page.route("**/api/chat/turns/start", handle_turn_start)
+    _login(page, backend_url, auth_token)
+    page.wait_for_function("window.__fakeMuxStreams().length === 1")
+
+    watcher_sid = "mux-watcher-session"
+    initial = page.evaluate(
+        """async watcherSid => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const localSid = app.currentId;
+          app._confirmSessionBusy = async () => false;
+          app._awaitRuntimeSettingPatches = async () => true;
+          app.availableModels = [{
+            model: 'mux-e2e-model', label: 'Mux E2E', group: 'e2e',
+            supports_thinking: true,
+          }];
+          app.model = 'mux-e2e-model';
+          app.permission = 'default';
+          app.sessions = app.sessions.map(session => session.id === localSid
+            ? {...session, model: 'mux-e2e-model', permission: 'default'} : session);
+          app._ensureTabState(localSid).permission = 'default';
+          app.sessions.push({
+            id: watcherSid, name: 'Watcher session', model: 'mux-e2e-model',
+            permission: 'default', cwd: app.currentWorkspacePath(), active: true,
+          });
+          window.__emitMux('session_state', {
+            session_id: watcherSid, active: true, attachable: false,
+            background: true, continuation: false, turn_id: 'watcher-gap',
+            started_at: Math.floor(Date.now() / 1000),
+            background_tasks_pending: 1,
+          });
+          await new Promise(resolve => setTimeout(resolve, 30));
+          const watcherCreatedDuringGap = !!app.tabState[watcherSid];
+          const watcher = app._ensureTabState(watcherSid);
+          watcher._loaded = true;
+          if (!app.openTabIds.includes(watcherSid)) app.openTabIds.push(watcherSid);
+          window.__emitMux('session_state', {
+            session_id: watcherSid, active: true, attachable: true,
+            background: false, continuation: true, turn_id: 'turn-watcher',
+            parent_turn_id: 'watcher-gap', started_at: Math.floor(Date.now() / 1000),
+          });
+          for (let i = 0; i < 100 && !watcher.es; i++) {
+            await new Promise(resolve => setTimeout(resolve, 10));
+          }
+          const local = app._ensureTabState(localSid);
+          local.draft.input = 'MUX_LOCAL_PROMPT';
+          app._activateComposerState(localSid);
+          await app.send();
+          return {
+            localSid,
+            watcherCreatedDuringGap,
+            watcherAttached: !!watcher.es,
+            nativeStreamCount: window.__fakeMuxStreams().length,
+          };
+        }""",
+        watcher_sid,
+    )
+    assert initial == {
+        "localSid": initial["localSid"],
+        "watcherCreatedDuringGap": False,
+        "watcherAttached": True,
+        "nativeStreamCount": 1,
+    }
+
+    page.evaluate(
+        """({localSid, watcherSid}) => {
+          window.__emitMux('text', {
+            session_id: localSid, turn_id: 'turn-local', event_seq: 1,
+            text: 'MUX_LOCAL_REPLY',
+          });
+          window.__emitMux('text', {
+            session_id: watcherSid, turn_id: 'turn-watcher', event_seq: 1,
+            text: 'MUX_BACKGROUND_REPLY',
+          });
+        }""",
+        {"localSid": initial["localSid"], "watcherSid": watcher_sid},
+    )
+    page.wait_for_function(
+        """sid => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          return app.tabState[sid]?.lastEventSeq === 1;
+        }""",
+        initial["localSid"],
+    )
+    page.evaluate(
+        """async sid => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          await app.activateTab(sid);
+        }""",
+        watcher_sid,
+    )
+    page.wait_for_function(
+        """sid => document.querySelector('#app')._x_dataStack[0]
+          .tabState[sid].messages.some(m => m.text === 'MUX_BACKGROUND_REPLY')""",
+        watcher_sid,
+    )
+
+    page.evaluate("window.__disconnectMux()")
+    page.wait_for_function("window.__fakeMuxStreams().length === 2", timeout=5000)
+    state = page.evaluate(
+        """({localSid, watcherSid}) => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          return {
+            localStreaming: app.tabState[localSid].streaming,
+            watcherStreaming: app.tabState[watcherSid].streaming,
+            localSeq: app.tabState[localSid].lastEventSeq,
+            watcherSeq: app.tabState[watcherSid].lastEventSeq,
+            nativeStreamCount: window.__fakeMuxStreams().length,
+          };
+        }""",
+        {"localSid": initial["localSid"], "watcherSid": watcher_sid},
+    )
+    assert state == {
+        "localStreaming": True,
+        "watcherStreaming": True,
+        "localSeq": 1,
+        "watcherSeq": 1,
+        "nativeStreamCount": 2,
+    }
+    assert len(turn_starts) == 1
+    assert turn_starts[0] == {
+        "prompt": "MUX_LOCAL_PROMPT",
+        "session_id": initial["localSid"],
+        "model": "mux-e2e-model",
+        "permission": "default",
+        "image_ids": "",
+        "mobile": False,
+    }
+    assert len(mux_starts) == 2
+    checkpoints = {
+        (row["session_id"], row["turn_id"]): row["last_event_seq"]
+        for row in mux_starts[1]["checkpoints"]
+    }
+    assert checkpoints[(initial["localSid"], "turn-local")] == 1
+    assert checkpoints[(watcher_sid, "turn-watcher")] == 1
+    _assert_no_browser_errors(page, errors)
 
 
 def test_deferred_history_bodies_load_without_manual_body_action(

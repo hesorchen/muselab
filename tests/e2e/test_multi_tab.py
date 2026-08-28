@@ -414,7 +414,7 @@ def test_pending_send_text_survives_hard_refresh(
           app._confirmSessionBusy = async () => false;
           const originalFetch = window.fetch.bind(window);
           window.fetch = (url, init) => {
-            if (String(url).includes('/api/chat/stream/start')) {
+            if (String(url).includes('/api/chat/turns/start')) {
               window.__streamStartBlocked = true;
               return new Promise(() => {});
             }
@@ -457,11 +457,11 @@ def test_pending_send_text_survives_hard_refresh(
     expect(page.locator(".chat-input-textarea")).to_have_value(marker)
 
 
-def test_ticket_failure_restores_draft_and_idle_state(
+def test_turn_start_failure_restores_draft_and_idle_state(
         page: Page, backend_url, auth_token):
     attempts = 0
 
-    def reject_ticket(route) -> None:
+    def reject_turn_start(route) -> None:
         nonlocal attempts
         attempts += 1
         route.fulfill(
@@ -470,7 +470,7 @@ def test_ticket_failure_restores_draft_and_idle_state(
             body='{"detail":"ticket unavailable"}',
         )
 
-    page.route("**/api/chat/stream/start", reject_ticket)
+    page.route("**/api/chat/turns/start", reject_turn_start)
     _login(page, backend_url, auth_token)
     marker = "ticket-failure-recovered"
     page.locator(".chat-input-textarea").fill(marker)

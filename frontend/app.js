@@ -310,6 +310,47 @@ function _pruneChatResourceTicketCache(now) {
   }
 }
 
+const CHAT_MUX_STREAM_EVENTS = [
+  "startup", "text", "thinking", "tool_use", "tool_result",
+  "compact_progress", "task_started", "task_progress", "task_notification",
+  "rate_limit", "ask_user_question", "permission_request",
+  "permission_request_resolved", "permission_mode_changed",
+  "permission_mode_change_failed", "ping", "done", "error", "cancelled",
+  "resync",
+];
+const CHAT_MUX_BOOTSTRAP_MAX_EVENTS = 512;
+const CHAT_MUX_BOOTSTRAP_MAX_BYTES = 2 * 1024 * 1024;
+
+class ChatMuxSessionChannel extends EventTarget {
+  constructor(sessionId, turnId, onClose) {
+    super();
+    this.sessionId = sessionId;
+    this.turnId = turnId;
+    this.readyState = 0;
+    this.onopen = null;
+    this._onClose = onClose;
+    this._muxChannel = true;
+  }
+
+  open() {
+    if (this.readyState === 1 || this.readyState === 2) return;
+    this.readyState = 1;
+    const event = new Event("open");
+    if (this.onopen) this.onopen(event);
+    this.dispatchEvent(event);
+  }
+
+  disconnect() {
+    if (this.readyState !== 2) this.readyState = 0;
+  }
+
+  close() {
+    if (this.readyState === 2) return;
+    this.readyState = 2;
+    if (this._onClose) this._onClose(this);
+  }
+}
+
 function portal() {
   return {
     // ===== auth =====
@@ -331,6 +372,15 @@ function portal() {
     _presenceVisibilityHandler: null,
     _presencePagehideHandler: null,
     _sessionsSyncTimer: null,
+    _chatMuxSource: null,
+    _chatMuxChannels: new Map(),
+    _chatMuxPendingEvents: new Map(),
+    _chatMuxAttachPromises: new Map(),
+    _chatMuxStartPromise: null,
+    _chatMuxReconnectTimer: null,
+    _chatMuxReconnectAttempts: 0,
+    _chatMuxSupported: null,
+    _chatMuxConnected: false,
     _splashHintTimer: null,
     _splashHardTimeout: null,
 
@@ -9986,6 +10036,309 @@ function portal() {
       st._virtualRevision++;
     },
 
+    _chatMuxCheckpoints() {
+      const rows = [];
+      const seen = new Set();
+      for (const [sid, channel] of this._chatMuxChannels) {
+        if (!channel || channel.readyState === 2) continue;
+        const st = this.tabState && this.tabState[sid];
+        const turnId = String((st && st.activeTurnId) || channel.turnId || "");
+        if (!turnId) continue;
+        rows.push({
+          session_id: sid,
+          turn_id: turnId,
+          last_event_seq: Math.max(0, Number(st && st.lastEventSeq) || 0),
+        });
+        seen.add(sid);
+      }
+      for (const meta of (this.sessions || [])) {
+        if (!meta || !meta.active || seen.has(meta.id)) continue;
+        const st = this.tabState && this.tabState[meta.id];
+        const turnId = String((st && st.activeTurnId) || meta.turn_id || "");
+        if (!turnId) continue;
+        rows.push({
+          session_id: meta.id,
+          turn_id: turnId,
+          last_event_seq: Math.max(0, Number(st && st.lastEventSeq) || 0),
+        });
+      }
+      return rows;
+    },
+    async _bootstrapChatMuxHistory() {
+      const active = (this.sessions || []).filter(meta => meta && meta.active && meta.id);
+      const concurrency = this._isMobileLayout() ? 1 : 2;
+      let next = 0;
+      const worker = async () => {
+        while (next < active.length) {
+          const meta = active[next++];
+          const st = this._ensureTabState(meta.id);
+          if (st.streaming || st.es || st._loaded) continue;
+          try {
+            await this.loadSession(meta.id, { quiet: true, probeActive: false });
+          } catch (_) { /* the mux replay remains authoritative */ }
+        }
+      };
+      await Promise.all(Array.from(
+        { length: Math.min(concurrency, active.length) }, () => worker()));
+    },
+    _setChatMuxUnsupported() {
+      this._chatMuxSupported = false;
+      this._chatMuxConnected = false;
+      if (this._chatMuxReconnectTimer) clearTimeout(this._chatMuxReconnectTimer);
+      this._chatMuxReconnectTimer = null;
+      try { if (this._chatMuxSource) this._chatMuxSource.close(); } catch (_) {}
+      this._chatMuxSource = null;
+      for (const channel of this._chatMuxChannels.values()) channel.disconnect();
+    },
+    _scheduleChatMuxReconnect() {
+      if (this._chatMuxSupported === false || !this.token
+          || this._chatMuxReconnectTimer) return;
+      const attempts = ++this._chatMuxReconnectAttempts;
+      const delay = Math.min(10_000, 500 * (2 ** Math.min(attempts - 1, 4)));
+      this._chatMuxReconnectTimer = setTimeout(() => {
+        this._chatMuxReconnectTimer = null;
+        void this._ensureChatMux({ reconnect: true });
+      }, delay);
+    },
+    async _ensureChatMux(options = {}) {
+      if (this._chatMuxSupported === false || !this.token
+          || typeof EventSource === "undefined") return false;
+      if (this._chatMuxSource && !options.reconnect) return true;
+      if (this._chatMuxStartPromise) return await this._chatMuxStartPromise;
+      this._chatMuxStartPromise = this._openChatMux();
+      try {
+        return await this._chatMuxStartPromise;
+      } finally {
+        this._chatMuxStartPromise = null;
+      }
+    },
+    async _openChatMux() {
+      try { if (this._chatMuxSource) this._chatMuxSource.close(); } catch (_) {}
+      this._chatMuxSource = null;
+      this._chatMuxConnected = false;
+      for (const channel of this._chatMuxChannels.values()) channel.disconnect();
+      let response;
+      try {
+        response = await fetch("/api/chat/stream/mux/start", {
+          method: "POST",
+          headers: Object.assign({ "Content-Type": "application/json" }, this.hdr()),
+          body: JSON.stringify({
+            checkpoints: this._chatMuxCheckpoints(),
+            mobile: this._isMobileLayout(),
+          }),
+        });
+      } catch (_) {
+        this._scheduleChatMuxReconnect();
+        return false;
+      }
+      if (response.status === 404 || response.status === 405) {
+        this._setChatMuxUnsupported();
+        return false;
+      }
+      if (!response.ok) {
+        this._scheduleChatMuxReconnect();
+        return false;
+      }
+      let payload;
+      try { payload = await response.json(); } catch (_) { payload = {}; }
+      if (!payload.ticket) {
+        this._scheduleChatMuxReconnect();
+        return false;
+      }
+      this._chatMuxSupported = true;
+      const source = new EventSource(
+        "/api/chat/stream/mux?ticket=" + encodeURIComponent(payload.ticket));
+      this._chatMuxSource = source;
+      source.onopen = () => {
+        if (this._chatMuxSource !== source) return;
+        this._chatMuxConnected = true;
+        this._chatMuxReconnectAttempts = 0;
+        for (const channel of this._chatMuxChannels.values()) {
+          if (channel._activated) channel.open();
+        }
+      };
+      source.addEventListener("session_state", ev => {
+        if (this._chatMuxSource !== source) return;
+        let state = {};
+        try { state = JSON.parse(ev.data) || {}; } catch (_) {}
+        void this._handleChatMuxSessionState(state);
+      });
+      for (const type of CHAT_MUX_STREAM_EVENTS) {
+        source.addEventListener(type, ev => {
+          if (this._chatMuxSource !== source) return;
+          if (type === "error" && (ev.data === undefined || ev.data === "")) {
+            this._handleChatMuxDisconnect(source);
+            return;
+          }
+          if (type === "ping" && !ev.data) {
+            for (const channel of this._chatMuxChannels.values()) {
+              if (channel._activated && channel.readyState !== 2) {
+                channel.dispatchEvent(new MessageEvent("ping", { data: "" }));
+              }
+            }
+            return;
+          }
+          this._dispatchChatMuxEvent(type, ev.data);
+        });
+      }
+      source.onerror = ev => {
+        if (ev && ev.data !== undefined && ev.data !== "") return;
+        this._handleChatMuxDisconnect(source);
+      };
+      return true;
+    },
+    _handleChatMuxDisconnect(source) {
+      if (this._chatMuxSource !== source) return;
+      try { source.close(); } catch (_) {}
+      this._chatMuxSource = null;
+      this._chatMuxConnected = false;
+      for (const channel of this._chatMuxChannels.values()) channel.disconnect();
+      // The per-session reducers retain logical ownership while the one native
+      // transport reconnects. In particular, do not synthesize `error`/`done`.
+      this._scheduleChatMuxReconnect();
+    },
+    _queueChatMuxEvent(sid, type, data) {
+      let pending = this._chatMuxPendingEvents.get(sid);
+      if (!pending) {
+        pending = [];
+        pending._bytes = 0;
+      }
+      const bytes = String(data || "").length;
+      if (pending.length >= CHAT_MUX_BOOTSTRAP_MAX_EVENTS
+          || pending._bytes + bytes > CHAT_MUX_BOOTSTRAP_MAX_BYTES) {
+        if (!pending._overflowed) {
+          pending.length = 0;
+          pending._bytes = 0;
+          pending._overflowed = true;
+          pending.push({
+            type: "resync",
+            data: JSON.stringify({
+              session_id: sid,
+              reason: "bootstrap_overflow",
+              fallback: "canonical_history",
+              retryable: false,
+            }),
+          });
+        }
+      } else if (!pending._overflowed) {
+        pending.push({ type, data });
+        pending._bytes += bytes;
+      }
+      this._chatMuxPendingEvents.set(sid, pending);
+    },
+    _dispatchChatMuxEvent(type, data) {
+      let payload = null;
+      try { payload = JSON.parse(data); } catch (_) {}
+      const sid = String(payload && payload.session_id || "");
+      if (!sid) return;
+      const turnId = String(payload.turn_id || "");
+      const channel = this._chatMuxChannels.get(sid);
+      if (!channel || !channel._activated
+          || (channel.turnId && turnId && channel.turnId !== turnId)) {
+        this._queueChatMuxEvent(sid, type, data);
+        return;
+      }
+      channel.dispatchEvent(new MessageEvent(type, { data }));
+    },
+    _chatMuxChannel(sid, turnId) {
+      const existing = this._chatMuxChannels.get(sid);
+      if (existing && existing.readyState !== 2
+          && (!turnId || !existing.turnId || existing.turnId === turnId)) {
+        if (!existing.turnId && turnId) existing.turnId = turnId;
+        return existing;
+      }
+      if (existing) existing.close();
+      const channel = new ChatMuxSessionChannel(sid, turnId, closed => {
+        if (this._chatMuxChannels.get(sid) === closed) {
+          this._chatMuxChannels.delete(sid);
+        }
+      });
+      this._chatMuxChannels.set(sid, channel);
+      return channel;
+    },
+    _activateChatMuxChannel(channel) {
+      if (!channel || channel.readyState === 2) return;
+      channel._activated = true;
+      if (this._chatMuxConnected) channel.open();
+      const pending = this._chatMuxPendingEvents.get(channel.sessionId) || [];
+      this._chatMuxPendingEvents.delete(channel.sessionId);
+      for (const event of pending) {
+        let payload = null;
+        try { payload = JSON.parse(event.data); } catch (_) {}
+        const turnId = String(payload && payload.turn_id || "");
+        if (channel.turnId && turnId && channel.turnId !== turnId) continue;
+        channel.dispatchEvent(new MessageEvent(event.type, { data: event.data }));
+      }
+    },
+    async _handleChatMuxSessionState(payload) {
+      const sid = String(payload && payload.session_id || "");
+      if (!sid) return;
+      const meta = (this.sessions || []).find(session => session.id === sid);
+      if (meta) {
+        meta.active = !!payload.active;
+        meta.turn_active = !!payload.active && !payload.background;
+        meta.background_active = !!payload.active && !!payload.background;
+      }
+      const existingState = this.tabState && this.tabState[sid];
+      if (!payload.active) {
+        this._chatMuxPendingEvents.delete(sid);
+        if (existingState && !existingState.streaming) {
+          this._setBackgroundTaskActive(sid, false, payload.started_at, 0);
+        }
+        return;
+      }
+      if (payload.attachable === false) {
+        // Watcher-only ownership has no replayable turn yet. Preserve its blue
+        // dot/background state, but do not create a reducer runtime until the
+        // continuation broadcast becomes attachable.
+        if (existingState && !existingState.streaming) {
+          this._setBackgroundTaskActive(
+            sid, true, payload.started_at, payload.background_tasks_pending);
+        }
+        return;
+      }
+      const turnId = String(payload.turn_id || "");
+      if (!turnId) return;
+      if (existingState && existingState.es
+          && existingState.activeTurnId === turnId) return;
+      if (existingState && existingState.es && existingState.es._muxChannel
+          && existingState.activeTurnId
+          && existingState.activeTurnId !== turnId) {
+        // The aggregate state frame is authoritative for ABA turn changes. Retire
+        // only the stale logical adapter; the root EventSource remains shared.
+        this._retireStaleSessionStream(sid, existingState);
+        existingState._pendingExternalUpdate = true;
+      }
+      if (this._chatMuxAttachPromises.has(sid)) return;
+      const attach = (async () => {
+        const st = this._ensureTabState(sid);
+        if (!st._loaded && !st.streaming && !st.es) {
+          await this.loadSession(sid, { quiet: true, probeActive: false });
+        }
+        if (st.streaming || st.es || this.tabState[sid] !== st) return;
+        st.parentTurnId = String(payload.parent_turn_id || "");
+        await this.send({
+          reconnect: true,
+          sessionId: sid,
+          turnId,
+          startedAt: payload.started_at,
+          continuation: !!payload.continuation,
+          _muxAttach: true,
+        });
+      })();
+      this._chatMuxAttachPromises.set(sid, attach);
+      try { await attach; } finally {
+        if (this._chatMuxAttachPromises.get(sid) === attach) {
+          this._chatMuxAttachPromises.delete(sid);
+        }
+      }
+    },
+    async _startChatMuxCoordinator() {
+      if (this._chatMuxSupported === false) return false;
+      await this._bootstrapChatMuxHistory();
+      return await this._ensureChatMux();
+    },
+
     async initSessions(options = {}) {
       if (this._sessionInitPromise) return this._sessionInitPromise;
       this._sessionInitPromise = this._initSessionsOnce(options);
@@ -10084,6 +10437,10 @@ function portal() {
       }));
       this._sessionsInitialized = true;
       this._scheduleSavePrefs();
+      // Session discovery and the initial bounded transcript tail are now ready.
+      // Start exactly one root chat EventSource; every active session attaches to
+      // it through a lightweight EventSource-compatible channel.
+      void this._startChatMuxCoordinator();
       return true;
     },
     // Shared session-list pull behind both the explicit refresh and the 10s
@@ -10396,6 +10753,10 @@ function portal() {
         return Promise.resolve(false);
       }
       const ownerEs = st.es;
+      if (ownerEs && ownerEs._muxChannel && !this._chatMuxConnected) {
+        this._scheduleChatMuxReconnect();
+        return Promise.resolve(false);
+      }
       const observedActivity = Number(st._lastSseActivity)
         || Number(st._streamStartedAt) || Date.now();
       const transportClosed = !!(ownerEs && Number(ownerEs.readyState) === 2);
@@ -28897,41 +29258,21 @@ function portal() {
         this.scrollToBottom(true);
       }
 
-      // Ticket flow: POST the prompt + params with header auth, get a
-      // one-time ticket, open the SSE with ONLY the ticket in the URL.
-      // Keeps the user's prompt and the auth token out of access logs /
-      // browser history (EventSource can't send headers or a body).
-      // Legacy query-param fallback ONLY when the endpoint doesn't exist
-      // (old backend → 404/405). A 5xx or network blip must NOT silently
-      // downgrade to putting the prompt + token back into the URL — retry
-      // the ticket once, then surface the failure instead.
+      // Mux flow: one root EventSource receives every session. This send only
+      // admits a new turn, then installs an EventSource-compatible per-session
+      // channel so the reducer below remains the sole event/state implementation.
+      // Legacy per-session SSE is used only after an explicit 404/405 capability
+      // response from the mux or turn-start endpoint.
       let url;
+      let es;
+      let useMux = false;
       this._setComposerClaimPhase(sendState, composerSubmitToken, "stream_start");
       const streamStartController = new AbortController();
       streamState._streamStartController = streamStartController;
       streamState._cancelBeforeStream = false;
-      const _mintTicket = async () => {
-        const tr = await fetch("/api/chat/stream/start", {
-          method: "POST",
-          headers: Object.assign({ "Content-Type": "application/json" }, this.hdr()),
-          signal: streamStartController.signal,
-          body: JSON.stringify({
-            prompt: text,
-            session_id: streamSid,
-            turn_id: expectedTurnId,
-            last_event_seq: resumeEventSeq,
-            model: sendModel,
-            permission: sendPermission,
-            image_ids: attachIds.length ? attachIds.join(",") : "",
-            mobile: streamMobile,
-          }),
-        });
-        return tr;
-      };
-      // Stop/ticket failure before EventSource opens means no backend turn was
-      // created. Remove the optimistic bubble, restore the full local payload,
-      // and reset every stream flag/timer without relying on the later-scoped
-      // _markDone closure.
+      // Stop/start failure before a channel opens removes the optimistic bubble,
+      // restores the full local payload and resets every stream flag/timer without
+      // relying on the later-scoped _markDone closure.
       const rollbackUnstartedSend = (restoreDraft = true) => {
         if (sentUserBubble) {
           this._removePaneMessage(streamState, sentUserBubble);
@@ -28958,38 +29299,115 @@ function portal() {
         streamState.lastEventSeq = 0;
         streamState.streamingModel = "";
       };
+      const _mintLegacyTicket = async () => await fetch("/api/chat/stream/start", {
+        method: "POST",
+        headers: Object.assign({ "Content-Type": "application/json" }, this.hdr()),
+        signal: streamStartController.signal,
+        body: JSON.stringify({
+          prompt: text,
+          session_id: streamSid,
+          turn_id: expectedTurnId,
+          last_event_seq: resumeEventSeq,
+          model: sendModel,
+          permission: sendPermission,
+          image_ids: attachIds.length ? attachIds.join(",") : "",
+          mobile: streamMobile,
+        }),
+      });
       try {
-        let tr = await _mintTicket();
-        if (tr.status === 404 || tr.status === 405) {
-          // Old backend without /stream/start — legacy URL is the contract.
-          url = "/api/chat/stream"
-            + "?prompt=" + encodeURIComponent(text)
-            + "&session_id=" + encodeURIComponent(streamSid)
-            + "&turn_id=" + encodeURIComponent(expectedTurnId)
-            + "&last_event_seq=" + encodeURIComponent(resumeEventSeq)
-            + "&model=" + encodeURIComponent(sendModel)
-            + "&permission=" + encodeURIComponent(sendPermission)
-            + "&mobile=" + (streamMobile ? "1" : "0")
-            + (attachIds.length ? "&image_ids=" + encodeURIComponent(attachIds.join(",")) : "")
-            + "&token=" + encodeURIComponent(this.token);
-        } else {
-          if (!tr.ok) {
-            // Transient 5xx — one retry before giving up.
-            tr = await _mintTicket();
+        const muxReady = await this._ensureChatMux();
+        if (muxReady) {
+          useMux = true;
+          let admittedTurnId = expectedTurnId;
+          if (!isReconnect) {
+            const startTurn = async () => await fetch("/api/chat/turns/start", {
+              method: "POST",
+              headers: Object.assign({ "Content-Type": "application/json" }, this.hdr()),
+              signal: streamStartController.signal,
+              body: JSON.stringify({
+                prompt: text,
+                session_id: streamSid,
+                model: sendModel,
+                permission: sendPermission,
+                image_ids: attachIds.length ? attachIds.join(",") : "",
+                mobile: streamMobile,
+              }),
+            });
+            let tr = await startTurn();
+            if (tr.status === 404 || tr.status === 405) {
+              this._setChatMuxUnsupported();
+              useMux = false;
+            } else {
+              if (tr.status === 409 && !resumed) {
+                const queued = await this._enqueueMessage(streamSid, {
+                  text,
+                  displayText: hasDetachedText ? detachedDisplayText : composerInput,
+                  pendingImages: hasDetachedText ? [] : composerImages,
+                  pendingDocs: hasDetachedText ? [] : composerDocs,
+                  pendingQuotes: hasDetachedText ? [] : composerQuotes,
+                  permission: sendPermission,
+                  plan_return_permission: sendPlanReturnPermission,
+                });
+                if (queued) {
+                  rollbackUnstartedSend(false);
+                  if (isComposerSubmission) {
+                    this._commitChatRecoveryDraft(sendSid, composerInput);
+                  }
+                  this.toast(this.lang === "zh"
+                    ? "当前任务仍在收尾，消息已加入队列"
+                    : "The current task is still finishing; message queued",
+                  "info", 2800);
+                  return true;
+                }
+              }
+              if (!tr.ok) tr = await startTurn();
+              if (!tr.ok) throw new Error("turn start " + tr.status);
+              const admitted = await tr.json();
+              if (admitted.accepted === false || !admitted.turn_id) {
+                throw new Error("turn not accepted");
+              }
+              admittedTurnId = String(admitted.turn_id);
+              streamState.activeTurnId = admittedTurnId;
+              streamState.parentTurnId = "";
+              streamState.lastEventSeq = 0;
+              if (sentUserBubble) sentUserBubble._turnId = admittedTurnId;
+              if (Number(admitted.started_at) > 0) {
+                streamState._streamStartedAt = Number(admitted.started_at) * 1000;
+              }
+            }
           }
-          if (!tr.ok) throw new Error("ticket " + tr.status);
-          const td = await tr.json();
-          url = "/api/chat/stream?ticket=" + encodeURIComponent(td.ticket);
+          if (useMux) {
+            es = this._chatMuxChannel(streamSid, admittedTurnId);
+          }
+        } else if (this._chatMuxSupported !== false) {
+          throw new Error("mux unavailable");
+        }
+        if (!useMux) {
+          let tr = await _mintLegacyTicket();
+          if (tr.status === 404 || tr.status === 405) {
+            url = "/api/chat/stream"
+              + "?prompt=" + encodeURIComponent(text)
+              + "&session_id=" + encodeURIComponent(streamSid)
+              + "&turn_id=" + encodeURIComponent(expectedTurnId)
+              + "&last_event_seq=" + encodeURIComponent(resumeEventSeq)
+              + "&model=" + encodeURIComponent(sendModel)
+              + "&permission=" + encodeURIComponent(sendPermission)
+              + "&mobile=" + (streamMobile ? "1" : "0")
+              + (attachIds.length ? "&image_ids=" + encodeURIComponent(attachIds.join(",")) : "")
+              + "&token=" + encodeURIComponent(this.token);
+          } else {
+            if (!tr.ok) tr = await _mintLegacyTicket();
+            if (!tr.ok) throw new Error("ticket " + tr.status);
+            const td = await tr.json();
+            url = "/api/chat/stream?ticket=" + encodeURIComponent(td.ticket);
+          }
+          es = new EventSource(url);
         }
       } catch (_e) {
         if (streamState._cancelBeforeStream) {
-          // stop() already performed the authoritative local cleanup. The
-          // ticket was never consumed, so no backend turn/transcript exists.
           rollbackUnstartedSend();
           return false;
         }
-        // Could not mint a ticket (server error / network) — fail the send
-        // visibly rather than leaking prompt+token into the URL.
         rollbackUnstartedSend();
         this.toast(this.lang === "zh"
           ? "发送失败：无法建立流式连接，请重试"
@@ -29002,12 +29420,9 @@ function portal() {
         }
       }
       if (streamState._cancelBeforeStream) {
-        // Ticket minted but Stop landed first — same rollback. The ticket is
-        // never consumed and expires on its own.
         rollbackUnstartedSend();
         return false;
       }
-      const es = new EventSource(url);
       streamState.es = es;
       // NOTE — a successful open deliberately does NOT reset
       // _reconnectAttempts. Every reconnect DOES open successfully (the
@@ -29125,10 +29540,14 @@ function portal() {
           || (sync.pending && sync.pending.stream_health)
         ));
         if (silentMs > 40000 && !healthProbePending) {
-          // 40s of total silence (server pings every 15s → ≥2 missed) means
-          // the connection is dead in a way onerror never caught. Tear down
-          // the watchdog and drive the existing reconnect logic via a
-          // synthetic error (no ev.data → JSON.parse throws → transport path).
+          // A mux channel never owns the native socket. Reconnect the one root
+          // transport without sending a synthetic per-session terminal/error.
+          if (es._muxChannel) {
+            this._scheduleChatMuxReconnect();
+            this._recoverStalledStream(streamSid);
+            return;
+          }
+          // Legacy per-session SSE keeps the existing transparent retry path.
           clearInterval(streamState._stallWatch);
           streamState._stallWatch = null;
           try { es.dispatchEvent(new Event("error")); } catch (_) {}
@@ -30698,6 +31117,7 @@ function portal() {
             }, 800);
         }
       });
+      if (useMux) this._activateChatMuxChannel(es);
       // NOTE: errors are owned exclusively by the addEventListener("error")
       // handler above (rich classification + exponential-backoff transparent
       // reconnect). A redundant `es.onerror` here used to also fire on the

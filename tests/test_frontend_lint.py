@@ -95,6 +95,33 @@ def test_app_js_has_no_duplicate_method_definitions():
     )
 
 
+def test_chat_stream_mux_keeps_one_root_source_and_reuses_the_send_reducer():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+
+    assert "class ChatMuxSessionChannel extends EventTarget" in app
+    assert 'fetch("/api/chat/stream/mux/start"' in app
+    assert '"/api/chat/stream/mux?ticket="' in app
+    assert "checkpoints: this._chatMuxCheckpoints()" in app
+    assert "last_event_seq: Math.max(0, Number(st && st.lastEventSeq) || 0)" in app
+    assert 'fetch("/api/chat/turns/start"' in app
+    assert "es = this._chatMuxChannel(streamSid, admittedTurnId)" in app
+    assert "if (useMux) this._activateChatMuxChannel(es)" in app
+    assert "await this.loadSession(meta.id, { quiet: true, probeActive: false })" in app
+    assert "const concurrency = this._isMobileLayout() ? 1 : 2" in app
+    assert "CHAT_MUX_BOOTSTRAP_MAX_EVENTS = 512" in app
+    assert "CHAT_MUX_BOOTSTRAP_MAX_BYTES = 2 * 1024 * 1024" in app
+    assert 'reason: "bootstrap_overflow"' in app
+    assert "if (payload.attachable === false)" in app
+    assert app.index("if (payload.attachable === false)") < app.index(
+        "const st = this._ensureTabState(sid);",
+        app.index("async _handleChatMuxSessionState(payload)"),
+    )
+    assert "if (response.status === 404 || response.status === 405)" in app
+    assert "if (tr.status === 404 || tr.status === 405)" in app
+    assert "this._handleChatMuxDisconnect(source)" in app
+    assert "do not synthesize `error`/`done`" in app
+
+
 def test_i18n_zh_en_key_parity():
     """Both language sections in i18n/index.js must define the same set of
     keys. A missing translation causes `t('foo.bar')` to fall back to the
@@ -5298,8 +5325,8 @@ def test_concise_mode_is_a_device_preference_and_defaults_off():
     assert "Failed tools still show" in i18n
 
 
-def test_stop_aborts_stream_ticket_before_backend_turn_exists():
-    """A Stop click during POST /stream/start must prevent the later turn."""
+def test_stop_aborts_stream_start_before_channel_opens():
+    """A Stop click during turn admission must prevent a later live channel."""
     js = (FRONTEND / "app.js").read_text(encoding="utf-8")
 
     state = js[js.index("_stopping: false,"):]
@@ -5307,10 +5334,11 @@ def test_stop_aborts_stream_ticket_before_backend_turn_exists():
     assert "_streamStartController: null" in state
     assert "_cancelBeforeStream: false" in state
 
-    ticket = js[js.index("const streamStartController = new AbortController()"):]
-    ticket = ticket[:ticket.index("const es = new EventSource(url)")]
-    assert "signal: streamStartController.signal" in ticket
-    assert "if (streamState._cancelBeforeStream)" in ticket
+    start = js[js.index("const streamStartController = new AbortController()"):
+               js.index("streamState.es = es;", js.index(
+                   "const streamStartController = new AbortController()"))]
+    assert "signal: streamStartController.signal" in start
+    assert "if (streamState._cancelBeforeStream)" in start
 
     stop = js[js.index("async stop() {"):]
     stop = stop[:stop.index("// ====== ask_user_question UI helpers")]

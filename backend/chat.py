@@ -11761,6 +11761,11 @@ _STREAM_TICKETS_MAX = 64
 # redeeming GET /stream is async (event-loop thread) — mint and redeem touch
 # the dict from different threads, so all access goes through this lock.
 _STREAM_TICKETS_LOCK = threading.Lock()
+_MUX_STREAM_TICKETS: dict[str, tuple[float, dict]] = {}
+_MUX_STREAM_TICKET_TTL_S = 60.0
+_MUX_STREAM_TICKETS_MAX = 64
+_MUX_STREAM_TICKETS_LOCK = threading.Lock()
+_MUX_RECONCILE_INTERVAL_S = 0.2
 
 
 class StreamStartReq(BaseModel):
@@ -11773,6 +11778,26 @@ class StreamStartReq(BaseModel):
     model: str = ""
     permission: str = "bypassPermissions"
     image_ids: str = ""
+    mobile: bool = False
+
+
+class TurnStartReq(BaseModel):
+    prompt: str = ""
+    session_id: str
+    model: str = ""
+    permission: str = "bypassPermissions"
+    image_ids: str = ""
+    mobile: bool = False
+
+
+class MuxCheckpointReq(BaseModel):
+    session_id: str
+    turn_id: str = ""
+    last_event_seq: int = Field(default=0, ge=0)
+
+
+class MuxStreamStartReq(BaseModel):
+    checkpoints: list[MuxCheckpointReq] = Field(default_factory=list)
     mobile: bool = False
 
 
@@ -11803,6 +11828,96 @@ def stream_start(req: StreamStartReq) -> dict:
             "mobile": req.mobile,
         })
     return {"ticket": ticket}
+
+
+@router.post("/turns/start", dependencies=[Depends(require_token)])
+async def turn_start(req: TurnStartReq) -> dict:
+    """Admit and launch a new turn without coupling it to an SSE request."""
+    permission = _validate_permission(req.permission)
+    _gc_images()
+    prompt = req.prompt
+    is_image_only = (not prompt.strip()) and bool((req.image_ids or "").strip())
+    if is_image_only:
+        prompt = _IMAGE_ONLY_PLACEHOLDER
+    elif not prompt.strip():
+        raise HTTPException(422, "prompt or image_ids required for a new turn")
+    try:
+        broadcast = await _admit_accept_launch_turn(
+            req.session_id,
+            prompt,
+            model=req.model,
+            permission=permission,
+            image_ids=req.image_ids,
+        )
+    except _TurnBusy:
+        raise HTTPException(409, "previous turn still running") from None
+    except _TurnStartError as exc:
+        raise HTTPException(exc.status or 503, str(exc)) from None
+    return {
+        "accepted": True,
+        "session_id": req.session_id,
+        "turn_id": broadcast.turn_id,
+        "started_at": broadcast.started_at,
+    }
+
+
+@router.post("/stream/mux/start", dependencies=[Depends(require_token)])
+def mux_stream_start(req: MuxStreamStartReq) -> dict:
+    """Mint a one-time ticket for the aggregate multi-session SSE."""
+    import secrets as _secrets
+
+    checkpoints: dict[str, dict] = {}
+    for checkpoint in req.checkpoints:
+        session_id = checkpoint.session_id.strip()
+        turn_id = checkpoint.turn_id.strip()
+        if not session_id:
+            raise HTTPException(422, "checkpoint session_id required")
+        if checkpoint.last_event_seq > 0 and not turn_id:
+            raise HTTPException(
+                422, "turn_id required when last_event_seq is provided")
+        normalized = {
+            "session_id": session_id,
+            "turn_id": turn_id,
+            "last_event_seq": checkpoint.last_event_seq,
+        }
+        previous = checkpoints.get(session_id)
+        if previous is not None and previous != normalized:
+            raise HTTPException(
+                422, f"contradictory checkpoints for session_id {session_id!r}")
+        checkpoints[session_id] = normalized
+
+    now = time.time()
+    ticket = _secrets.token_urlsafe(32)
+    with _MUX_STREAM_TICKETS_LOCK:
+        for key in [
+            key for key, (expires_at, _) in _MUX_STREAM_TICKETS.items()
+            if expires_at < now
+        ]:
+            _MUX_STREAM_TICKETS.pop(key, None)
+        while len(_MUX_STREAM_TICKETS) >= _MUX_STREAM_TICKETS_MAX:
+            _MUX_STREAM_TICKETS.pop(next(iter(_MUX_STREAM_TICKETS)), None)
+        _MUX_STREAM_TICKETS[ticket] = (
+            now + _MUX_STREAM_TICKET_TTL_S,
+            {"checkpoints": checkpoints, "mobile": req.mobile},
+        )
+    return {"ticket": ticket}
+
+
+@router.get("/stream/mux")
+async def mux_stream(ticket: str = Query(default="")):
+    with _MUX_STREAM_TICKETS_LOCK:
+        entry = _MUX_STREAM_TICKETS.pop(ticket, None) if ticket else None
+    if entry is None or entry[0] < time.time():
+        raise HTTPException(401, "invalid or expired mux stream ticket")
+    params = entry[1]
+    return EventSourceResponse(
+        _subscribe_multiplex(
+            params.get("checkpoints", {}),
+            mobile=bool(params.get("mobile", False)),
+        ),
+        headers=_SSE_HEADERS,
+        ping_message_factory=_sse_ping_event,
+    )
 
 
 @router.get("/stream")
@@ -11942,10 +12057,11 @@ async def stream(
     # lock wait, CLI/MCP startup, attachment preparation and query preflight run
     # under a detached owner so a browser disconnect only drops its subscriber.
     try:
-        broadcast = await _admit_turn(
+        broadcast = await _admit_accept_launch_turn(
             session_id,
             prompt,
             model=model,
+            permission=permission,
             image_ids=image_ids,
         )
     except _TurnBusy:
@@ -11977,34 +12093,6 @@ async def stream(
             ping_message_factory=_sse_ping_event,
         )
 
-    # Write the accepted frame before launching runtime work. If the replay
-    # spool cannot own that frame, fail closed before the prompt can reach the
-    # SDK; otherwise the browser could retry an ambiguously executing turn.
-    try:
-        broadcast.publish_startup("accepted")
-    except Exception:
-        broadcast.perf_error_kind = "startup_event"
-        broadcast.perf_startup_failure_phase = "accepted"
-        await _abort_turn_startup(
-            session_id,
-            broadcast,
-            "failed",
-            pause_queue=True,
-        )
-        async def _startup_spool_err_gen():
-            yield _error_event(
-                "turn could not establish its startup event",
-                activity_source="direct",
-            )
-        return EventSourceResponse(
-            _startup_spool_err_gen(), headers=_SSE_HEADERS)
-    _launch_admitted_turn(
-        broadcast,
-        prompt=prompt,
-        model=model,
-        permission=permission,
-        image_ids=image_ids,
-    )
     _correlate_stream(broadcast)
     return EventSourceResponse(
         _subscribe_broadcast(broadcast, mobile=mobile),
@@ -13826,6 +13914,46 @@ def _launch_admitted_turn(
     task = asyncio.create_task(_owner())
     broadcast.startup_owner_task = task
     return task
+
+
+async def _admit_accept_launch_turn(
+    session_id: str,
+    prompt: str,
+    *,
+    model: str = "",
+    permission: str = "bypassPermissions",
+    image_ids: str = "",
+) -> TurnBroadcast:
+    """Share the new-turn admission boundary across POST and legacy SSE."""
+    broadcast = await _admit_turn(
+        session_id,
+        prompt,
+        model=model,
+        image_ids=image_ids,
+    )
+    if broadcast.done or broadcast.cancelled:
+        return broadcast
+    try:
+        broadcast.publish_startup("accepted")
+    except Exception:
+        broadcast.perf_error_kind = "startup_event"
+        broadcast.perf_startup_failure_phase = "accepted"
+        await _abort_turn_startup(
+            session_id,
+            broadcast,
+            "failed",
+            pause_queue=True,
+        )
+        raise _TurnStartError(
+            "turn could not establish its startup event") from None
+    _launch_admitted_turn(
+        broadcast,
+        prompt=prompt,
+        model=model,
+        permission=permission,
+        image_ids=image_ids,
+    )
+    return broadcast
 
 
 async def _start_turn(
@@ -16973,6 +17101,188 @@ def _schedule_queue_drain(session_id: str) -> None:
                 _schedule_queue_drain, session_id)
 
     task.add_done_callback(_done)
+
+
+def _mux_wrap_event(session_id: str, event: dict) -> dict:
+    wrapped = dict(event)
+    raw_data = event.get("data", "")
+    try:
+        payload = json.loads(raw_data)
+    except (TypeError, ValueError):
+        payload = {"data": raw_data}
+    if not isinstance(payload, dict):
+        payload = {"data": payload}
+    payload["session_id"] = session_id
+    wrapped["data"] = json.dumps(payload, ensure_ascii=False)
+    return wrapped
+
+
+def _mux_session_state_fingerprint(state: dict) -> str:
+    stable = {
+        key: value for key, value in state.items()
+        if key not in {"events_so_far", "runtime_ui_revision"}
+    }
+    return json.dumps(stable, sort_keys=True, ensure_ascii=False)
+
+
+async def _subscribe_multiplex(
+    checkpoints: dict[str, dict],
+    *,
+    mobile: bool = False,
+):
+    """Merge attachable broadcasts while periodically discovering new ones."""
+    # Bound the aggregate handoff so a stalled HTTP client leaves each child
+    # parked on its disk-backed subscriber cursor instead of growing RAM.
+    output: asyncio.Queue[dict] = asyncio.Queue(maxsize=256)
+    children: dict[tuple[str, str], asyncio.Task] = {}
+    completed: set[tuple[str, str]] = set()
+    reported_mismatches: set[tuple[str, str, str]] = set()
+    state_fingerprints: dict[str, str] = {}
+
+    async def _pump_child(
+        session_id: str,
+        broadcast: TurnBroadcast,
+        last_event_seq: int,
+    ) -> None:
+        try:
+            async for event in _subscribe_broadcast(
+                broadcast,
+                mobile=mobile,
+                last_event_seq=last_event_seq,
+            ):
+                await output.put(_mux_wrap_event(session_id, event))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            await output.put({
+                "event": "resync",
+                "data": json.dumps({
+                    "reason": "child_stream_error",
+                    "fallback": "canonical_history",
+                    "retryable": False,
+                    "session_id": session_id,
+                    "turn_id": broadcast.turn_id,
+                }),
+            })
+
+    def _start_child(
+        session_id: str,
+        broadcast: TurnBroadcast,
+        last_event_seq: int,
+    ) -> None:
+        key = (session_id, broadcast.turn_id)
+        if key in children or key in completed:
+            return
+        children[key] = asyncio.create_task(
+            _pump_child(session_id, broadcast, last_event_seq))
+
+    async def _reconcile() -> None:
+        for key, task in list(children.items()):
+            if task.done():
+                children.pop(key, None)
+                completed.add(key)
+                with suppress(asyncio.CancelledError, Exception):
+                    task.result()
+
+        candidate_ids = set(_active_turns)
+        candidate_ids.update(_sessions_with_inflight_tasks)
+        candidate_ids.update(
+            sid for sid, watcher in _task_watchers.items()
+            if watcher is not None and not watcher.done()
+        )
+        candidate_ids.update(
+            sid for sid, broadcast in _recent_turns.items()
+            if getattr(broadcast, "is_continuation", False)
+            and not getattr(broadcast, "continuation_consumed", False)
+        )
+        candidate_ids.update(checkpoints)
+
+        active_ids: set[str] = set()
+        for session_id in sorted(candidate_ids):
+            state = session_active_status(session_id)
+            checkpoint = checkpoints.get(session_id)
+            checkpoint_recent = None
+            if checkpoint is not None and checkpoint.get("turn_id"):
+                recent = _get_recent_turn(session_id)
+                if (recent is not None
+                        and recent.turn_id == checkpoint.get("turn_id")):
+                    checkpoint_recent = recent
+            if state.get("active"):
+                active_ids.add(session_id)
+                state_payload = dict(state)
+                state_payload["session_id"] = session_id
+                fingerprint = _mux_session_state_fingerprint(state_payload)
+                if state_fingerprints.get(session_id) != fingerprint:
+                    state_fingerprints[session_id] = fingerprint
+                    await output.put({
+                        "event": "session_state",
+                        "data": json.dumps(state_payload, ensure_ascii=False),
+                    })
+
+                if state.get("attachable"):
+                    current_turn_id = str(state.get("turn_id") or "")
+                    broadcast = _active_turns.get(session_id)
+                    if (broadcast is None
+                            or broadcast.turn_id != current_turn_id):
+                        recent = _get_recent_turn(session_id)
+                        broadcast = (
+                            recent if recent is not None
+                            and recent.turn_id == current_turn_id else None
+                        )
+                    if broadcast is not None:
+                        resume_seq = 0
+                        if checkpoint is not None:
+                            requested_turn_id = str(
+                                checkpoint.get("turn_id") or "")
+                            if (requested_turn_id
+                                    and requested_turn_id != current_turn_id
+                                    and checkpoint_recent is None):
+                                mismatch = (
+                                    session_id,
+                                    requested_turn_id,
+                                    current_turn_id,
+                                )
+                                if mismatch not in reported_mismatches:
+                                    reported_mismatches.add(mismatch)
+                                    await output.put({
+                                        "event": "resync",
+                                        "data": json.dumps({
+                                            "reason": "turn_changed",
+                                            "requested_turn_id": requested_turn_id,
+                                            "current_turn_id": current_turn_id,
+                                            "session_id": session_id,
+                                        }),
+                                    })
+                            elif requested_turn_id == current_turn_id:
+                                resume_seq = int(
+                                    checkpoint.get("last_event_seq", 0) or 0)
+                        _start_child(session_id, broadcast, resume_seq)
+
+            if checkpoint_recent is not None:
+                _start_child(
+                    session_id,
+                    checkpoint_recent,
+                    int(checkpoint.get("last_event_seq", 0) or 0),
+                )
+
+        for session_id in list(state_fingerprints):
+            if session_id not in active_ids:
+                state_fingerprints.pop(session_id, None)
+
+    try:
+        while True:
+            await _reconcile()
+            try:
+                event = await asyncio.wait_for(
+                    output.get(), timeout=_MUX_RECONCILE_INTERVAL_S)
+            except asyncio.TimeoutError:
+                continue
+            yield event
+    finally:
+        for task in children.values():
+            task.cancel()
+        if children:
+            await asyncio.gather(*children.values(), return_exceptions=True)
 
 
 async def _subscribe_broadcast(
