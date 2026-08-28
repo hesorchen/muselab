@@ -9430,14 +9430,12 @@ function portal() {
         const hasBoundary = canonicalTurn.some(
           m => m && m.role !== "user" && m.uuid,
         );
-        const hasExpectedAssistant = !expectedAssistantUuid
-          || canonicalTurn.some(m => m && m.uuid === expectedAssistantUuid);
         const hasFinal = expectedAssistantUuid
-          ? hasExpectedAssistant
-          : (!expectedText || canonicalTurn.some(
+          ? canonicalTurn.some(m => m && m.uuid === expectedAssistantUuid)
+          : !!expectedText && canonicalTurn.some(
               m => m && m.role === "assistant" && m.uuid
                 && (m.text || "") === expectedText,
-            ));
+            );
         if (!hasBoundary || !hasFinal) { retry(); return false; }
         if (!stillOwned()) return false;
         const loaded = await this.loadSession(sid, {
@@ -15429,7 +15427,12 @@ function portal() {
           minimumTail,
           quiet ? Math.max(historyPage, st.messages.length) : historyPage,
         );
-        const qs = full ? "?full=1" : "?tail=" + requestedTail;
+        const preserveFullOrder = quiet && st.messageRange.order === "full";
+        const qs = full
+          ? "?full=1"
+          : preserveFullOrder
+            ? "?full=1&tail=" + requestedTail
+            : "?tail=" + requestedTail;
         let r;
         const fetchStarted = perfNow();
         try {
@@ -29415,9 +29418,15 @@ function portal() {
       };
       streamState._flushLivePresentation = flushLivePresentation;
       const flushTerminalPresentation = () => {
-        closeAsst();
+        const completedBubble = ownsCurBubble() ? curBubble : null;
+        if (completedBubble) flushRender();
+        else { cancelPendingPaint(); curBubble = null; acc = ""; }
         closeThinking();
         flushTaskProgress();
+        const completedText = completedBubble ? (completedBubble.text || "") : "";
+        curBubble = null;
+        acc = "";
+        return { bubble: completedBubble, text: completedText };
       };
 
       es.addEventListener("text", ev => {
@@ -30040,7 +30049,7 @@ function portal() {
         }
       };
       es.addEventListener("done", ev => {
-        flushTerminalPresentation();
+        const completedAssistant = flushTerminalPresentation();
         // Guard JSON.parse: a malformed/empty `done` payload must NOT throw
         // before es.close()/_markDone()/_stopTimer() run below, else the
         // EventSource + timer interval leak and the UI stays streaming=true
@@ -30048,11 +30057,11 @@ function portal() {
         // d.* read below is null-safe on a missing field.
         let d;
         try { d = JSON.parse(ev.data); } catch (_) { d = {}; }
-        if (d.total_cost_usd != null && ownsCurBubble()) {
-          curBubble.cost = "$" + d.total_cost_usd.toFixed(4);
+        if (d.total_cost_usd != null && completedAssistant.bubble) {
+          completedAssistant.bubble.cost = "$" + d.total_cost_usd.toFixed(4);
         }
-        if (d.memory_recall && ownsCurBubble()) {
-          curBubble.memoryRecall = d.memory_recall;
+        if (d.memory_recall && completedAssistant.bubble) {
+          completedAssistant.bubble.memoryRecall = d.memory_recall;
         }
         if (d.stats) this.stats = { ...this.stats, ...d.stats };
         if (d.session_usage) {
@@ -30118,7 +30127,7 @@ function portal() {
         // stop — stop closes the ES). The relevant case for this branch
         // is page-reload-then-reconnect picking up a turn that finished
         // after being cancelled before reload.
-        const completedFinalText = ownsCurBubble() ? (curBubble.text || "") : "";
+        const completedFinalText = completedAssistant.text;
         const continuationFinalText = isContinuation ? completedFinalText : "";
         const backgroundPending = !d.cancelled
           ? Math.max(0, Number(d.background_tasks_pending) || 0)

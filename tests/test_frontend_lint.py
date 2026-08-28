@@ -3349,7 +3349,12 @@ def test_done_immediately_stamps_tool_tail_and_quietly_adopts_fork_boundary():
     done_start = app.index('es.addEventListener("done"')
     done_end = app.index('es.addEventListener("error"', done_start)
     done = app[done_start:done_end]
-    assert "const completedFinalText = ownsCurBubble()" in done
+    assert "const completedAssistant = flushTerminalPresentation();" in done
+    assert done.index("const completedAssistant = flushTerminalPresentation();") \
+        < done.index("try { d = JSON.parse(ev.data);")
+    assert "completedAssistant.bubble.cost" in done
+    assert "completedAssistant.bubble.memoryRecall" in done
+    assert "const completedFinalText = completedAssistant.text;" in done
     assert "} else if (!d.cancelled) {" in done
     assert "this._reconcileCompletedTurn(" in done
     assert "streamSid, streamState, d.is_error ? \"\" : completedFinalText" in done
@@ -3371,10 +3376,19 @@ def test_done_immediately_stamps_tool_tail_and_quietly_adopts_fork_boundary():
     assert "m && m.role !== \"user\" && m.uuid" in reconcile
     assert "m.role === \"assistant\" && m.uuid" in reconcile
     assert "m && m.uuid === expectedAssistantUuid" in reconcile
+    assert ": !!expectedText && canonicalTurn.some(" in reconcile
+    assert "!expectedText || canonicalTurn.some(" not in reconcile
     assert "const loaded = await this.loadSession(sid, {" in reconcile
     assert "quiet: true, probeActive: false" in reconcile
     assert "attempt < 30" in reconcile
     assert "Math.min(2000, 250 + options.attempt * 100)" in reconcile
+
+    load_start = app.index("    async loadSession(sid, opts = {}) {")
+    load_end = app.index("\n    async renameSession()", load_start)
+    load = app[load_start:load_end]
+    assert 'const preserveFullOrder = quiet && st.messageRange.order === "full";' in load
+    assert '? "?full=1&tail=" + requestedTail' in load
+    assert ': "?tail=" + requestedTail;' in load
 
     continuity_start = app.index("_messageContinuitySignatures(m)")
     continuity_end = app.index(
@@ -3713,7 +3727,9 @@ def test_history_paging_uses_smaller_mobile_pages_only_on_user_request():
     load_end = app.index("// Warm OPEN-but-inactive tabs", load_start)
     load = app[load_start:load_end]
     assert "_historyWindowSize() { return this._isMobileLayout() ? 20 : 100; }" in app
-    assert 'const qs = full ? "?full=1" : "?tail=" + requestedTail' in load
+    assert 'const preserveFullOrder = quiet && st.messageRange.order === "full";' in load
+    assert '? "?full=1&tail=" + requestedTail' in load
+    assert ': "?tail=" + requestedTail;' in load
     assert "const historyPage = this._historyWindowSize()" in load
     assert "const minimumTail = Math.max(0, Number(opts.minimumTail) || 0)" in load
     assert "Math.max(historyPage, st.messages.length)" in load
@@ -3849,7 +3865,9 @@ def test_long_chat_state_keeps_complete_normalized_history_and_generation_safety
     assert "_MAX_RESIDENT_PANES" not in app
     assert "residentPaneIds" not in app
     assert "_promoteResident" not in app
-    assert 'const qs = full ? "?full=1" : "?tail=" + requestedTail' in app
+    assert 'const preserveFullOrder = quiet && st.messageRange.order === "full";' in app
+    assert '? "?full=1&tail=" + requestedTail' in app
+    assert ': "?tail=" + requestedTail;' in app
     assert "Math.max(historyPage, st.messages.length)" in app
     assert "const _baseInitialLoad" not in app
     assert "if (cst && cst.streaming) continue" not in app
@@ -3934,7 +3952,13 @@ def test_long_chat_state_keeps_complete_normalized_history_and_generation_safety
     assert "if (this.currentId !== streamSid) return;" in app
     assert "const flushPlainBoundary = () =>" in app
     assert "const closeAsst = () => {\n        flushPlainBoundary();" in app
-    assert "flushTerminalPresentation();" in app
+    terminal_start = app.index("const flushTerminalPresentation = () => {")
+    terminal_end = app.index("\n\n      es.addEventListener", terminal_start)
+    terminal = app[terminal_start:terminal_end]
+    assert "const completedBubble = ownsCurBubble() ? curBubble : null;" in terminal
+    assert "if (completedBubble) flushRender();" in terminal
+    assert terminal.index("const completedText") < terminal.rindex("curBubble = null;")
+    assert "return { bubble: completedBubble, text: completedText };" in terminal
     assert ':data-tid="tid"' in pane
     assert 'x-for="row in paneRows" :key="row.key"' in pane
     assert "paneMessageRows(tid)" in pane

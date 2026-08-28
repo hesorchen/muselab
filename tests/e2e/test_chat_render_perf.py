@@ -151,6 +151,7 @@ def _route_windowed_session(page: Page, sid: str, messages: list[dict]) -> list[
             window = messages[offset:offset + limit]
         requests.append({
             "url": url,
+            "full": "full" in qs,
             "tail": int(qs["tail"][0]) if "tail" in qs else None,
             "offset": offset,
             "limit": int(qs["limit"][0]) if "limit" in qs else None,
@@ -169,6 +170,7 @@ def _route_windowed_session(page: Page, sid: str, messages: list[dict]) -> list[
                 "offset": offset,
                 "total": total,
                 "has_more": offset > 0,
+                "history_order": "full" if "full" in qs else "normal",
                 "history_generation": "gen-e2e-1",
             }),
         )
@@ -3998,8 +4000,14 @@ def test_desktop_done_reconcile_preserves_live_message_dom_identity(
     _install_fake_event_source(page)
     sid = "perf-done-canonical-identity"
     prompt = "DOM_IDENTITY_USER_PROMPT"
+    history_marker = "FULL_ORDER_HISTORY_SURVIVES_LRU_REMOUNT"
     final_text = "DOM_IDENTITY_FINAL_REPLY " + ("stable canonical text " * 40)
-    canonical_messages: list[dict] = []
+    canonical_messages: list[dict] = [{
+        "role": "assistant",
+        "text": history_marker,
+        "uuid": "done-full-history-assistant",
+        "ts": 1_700_019_999,
+    }]
     requests = _route_windowed_session(page, sid, canonical_messages)
     page.route(
         "**/api/chat/stream/start",
@@ -4037,6 +4045,16 @@ def test_desktop_done_reconcile_preserves_live_message_dom_identity(
         const st = app._ensureTabState(sid);
         st._loaded = true;
         st._seenUpdated = 1;
+        st.messages.push({
+          role: "assistant", text: arg.historyMarker,
+          html: `<p>${arg.historyMarker}</p>`,
+          uuid: "done-full-history-assistant",
+          _k: `${sid}:uuid:done-full-history-assistant`, _noAnim: true,
+        });
+        Object.assign(st.messageRange, {
+          visibleStart: 0, visibleEnd: 1, offset: 0, total: 1,
+          preTotal: 0, order: "full", generation: "gen-e2e-1",
+        });
         app.currentId = sid;
         app._activateTabState(sid);
         app._ensureTabState(app.currentId).messagesReady = true;
@@ -4046,7 +4064,7 @@ def test_desktop_done_reconcile_preserves_live_message_dom_identity(
         app._ensureTabState(app.currentId).atBottom = true;
         return true;
         """,
-        {"sid": sid, "prompt": prompt},
+        {"sid": sid, "prompt": prompt, "historyMarker": history_marker},
     )
 
     _app_eval(page, "app.send(); return true;")
@@ -4103,6 +4121,7 @@ def test_desktop_done_reconcile_preserves_live_message_dom_identity(
     page.evaluate(
         """() => window.__emitSse("done", {
           total_cost_usd: 0.001,
+          memory_recall: { count: 2, query: "private-query" },
           session_usage: { context_used_pct: 5, context_used: 500, context_limit: 100000 },
           turn_id: "done-reconcile-turn", event_seq: 2,
         })"""
@@ -4149,19 +4168,82 @@ def test_desktop_done_reconcile_preserves_live_message_dom_identity(
             key: last._k,
             uuid: last.uuid || "",
             text: last.text || "",
+            cost: last.cost || "",
+            memoryCount: Number(last.memoryRecall?.count) || 0,
+            historyOrder: st.messageRange.order,
           };
         }""",
         {"sid": sid, "text": final_text},
     )
 
     assert requests, "canonical reconciliation did not request session history"
+    assert any(req["full"] and req["tail"] for req in requests), requests
     assert result["sameNode"] is True, result
     assert result["key"] == result["oldKey"]
     assert result["uuid"] == "done-canonical-assistant"
     assert result["text"] == final_text
+    assert result["cost"] == "$0.0010"
+    assert result["memoryCount"] == 2
+    assert result["historyOrder"] == "full"
     assert result["frames"]
     assert all(frame["ready"] and not frame["loading"] for frame in result["frames"]), result
     assert all(frame["visible"] and frame["count"] > 0 for frame in result["frames"]), result
+
+    remount = _app_eval(
+        page,
+        """
+        const sid = arg.sid;
+        const dummyIds = ["done-lru-a", "done-lru-b", "done-lru-c"];
+        app.sessions = [app.sessions.find(s => s.id === sid), ...dummyIds.map((id, i) => ({
+          id, name: `LRU ${i}`, updated_at: 10 + i,
+          model: "e2e-model", permission: "bypassPermissions", thinking: true,
+        }))];
+        app.openTabIds = [sid, ...dummyIds];
+        app.currentId = sid;
+        app._touchTranscriptPane(sid);
+        await new Promise(resolve => app.$nextTick(resolve));
+        for (const id of dummyIds) {
+          const st = app._blankTabState();
+          st._loaded = true;
+          st.messagesReady = true;
+          st.messagesLoading = false;
+          st.messages.push({
+            role: "assistant", text: id, html: `<p>${id}</p>`,
+            uuid: `${id}-assistant`, _k: `${id}:uuid:${id}-assistant`, _noAnim: true,
+          });
+          Object.assign(st.messageRange, {
+            visibleStart: 0, visibleEnd: 1, offset: 0, total: 1,
+            preTotal: 0, order: "normal", generation: "gen-e2e-1",
+          });
+          app.tabState[id] = st;
+          app.currentId = id;
+          app._touchTranscriptPane(id);
+          app._activateTabState(id);
+          await new Promise(resolve => app.$nextTick(resolve));
+        }
+        const evicted = !app.warmTranscriptTabIds().includes(sid);
+        app.currentId = sid;
+        app._touchTranscriptPane(sid);
+        app._activateTabState(sid);
+        await new Promise(resolve => app.$nextTick(
+          () => requestAnimationFrame(resolve)));
+        const pane = document.querySelector(
+          `.msg-pane[data-tid="${CSS.escape(sid)}"]`);
+        return {
+          evicted,
+          warmCount: app.warmTranscriptTabIds().length,
+          markerVisible: !!pane && pane.textContent.includes(arg.historyMarker),
+          finalVisible: !!pane && pane.textContent.includes(arg.finalText.trim()),
+          historyOrder: app._ensureTabState(sid).messageRange.order,
+        };
+        """,
+        {"sid": sid, "historyMarker": history_marker, "finalText": final_text},
+    )
+    assert remount["evicted"] is True, remount
+    assert remount["warmCount"] <= 3, remount
+    assert remount["markerVisible"] is True, remount
+    assert remount["finalVisible"] is True, remount
+    assert remount["historyOrder"] == "full"
     _assert_no_browser_errors(page, errors)
 
 
