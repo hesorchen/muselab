@@ -201,13 +201,16 @@ def _install_fake_event_source(page: Page) -> None:
           window.__fakeChatStreams = () => streams.filter(
             es => String(es.url || "").includes("/api/chat/stream?")
           );
-          window.__emitSse = (type, payload) => {
-            const chatStreams = window.__fakeChatStreams();
-            const es = chatStreams[chatStreams.length - 1];
-            if (!es) throw new Error("no fake chat EventSource");
+          window.__emitSseAt = (index, type, payload) => {
+            const es = window.__fakeChatStreams()[index];
+            if (!es) throw new Error("no fake chat EventSource at index " + index);
             es.dispatchEvent(new MessageEvent(type, {
               data: typeof payload === "string" ? payload : JSON.stringify(payload || {}),
             }));
+          };
+          window.__emitSse = (type, payload) => {
+            const chatStreams = window.__fakeChatStreams();
+            window.__emitSseAt(chatStreams.length - 1, type, payload);
           };
         })();
         """
@@ -2505,7 +2508,7 @@ def test_mobile_long_history_switching_does_not_blank(page: Page, backend_url, a
 def test_desktop_session_switch_keeps_bounded_warm_panes_and_composer_stable(
     page: Page, backend_url: str, auth_token: str,
 ):
-    """Desktop keeps a bounded warm-pane cache without footer/layout jumps."""
+    """Desktop bounds warm panes even when every inactive session is streaming."""
     errors = _capture_browser_errors(page)
     page.set_viewport_size({"width": 1440, "height": 900})
     _login(page, backend_url, auth_token)
@@ -2543,6 +2546,7 @@ def test_desktop_session_switch_keeps_bounded_warm_panes_and_composer_stable(
           st.messagesReady = true;
           st.messagesLoading = false;
           st.atBottom = true;
+          st.streaming = true;
           app.tabState[id] = st;
           app._ensureTabState(id);
         }
@@ -6670,6 +6674,132 @@ def test_mobile_composer_footer_is_compact_and_never_overflows(
         _assert_no_browser_errors(page, errors)
     finally:
         context.close()
+
+
+def test_background_stream_buffers_token_rate_presentation_until_activation(
+    page: Page, backend_url: str, auth_token: str,
+):
+    """Inactive SSE streams retain complete state without token-rate paints."""
+    errors = _capture_browser_errors(page)
+    page.set_viewport_size({"width": 1440, "height": 900})
+    _install_fake_event_source(page)
+    page.route(
+        "**/api/chat/stream/start",
+        lambda route: route.fulfill(
+            status=200,
+            content_type="application/json",
+            body='{"ticket":"e2e-ticket"}',
+        ),
+    )
+    _login(page, backend_url, auth_token)
+    ids = ["background-buffer-a", "background-buffer-b"]
+    _app_eval(
+        page,
+        """
+        app.refreshSessions = async () => {};
+        app._fetchTabUsage = async () => {};
+        app._scheduleIdlePreload = () => {};
+        app.availableModels = [{
+          model: "e2e-model", label: "E2E model", group: "e2e",
+          supports_thinking: true,
+        }];
+        app.model = app.defaultModel = "e2e-model";
+        app.sessions = arg.map((id, index) => ({
+          id, name: `Buffered ${index}`, updated_at: Date.now() / 1000,
+          model: "e2e-model", permission: "bypassPermissions", thinking: true,
+        }));
+        app.openTabIds = arg.slice();
+        app.tabState = {};
+        for (const id of arg) {
+          const st = app._blankTabState();
+          st._loaded = true;
+          st.messagesReady = true;
+          st.messagesLoading = false;
+          st.atBottom = true;
+          app.tabState[id] = st;
+        }
+        app.currentId = arg[0];
+        app._activateTabState(arg[0]);
+        app.input = "start stream a";
+        return true;
+        """,
+        ids,
+    )
+    _app_eval(page, "app.send(); return true;")
+    page.wait_for_function("() => window.__fakeChatStreams().length === 1")
+    _app_eval(
+        page,
+        """
+        app.currentId = arg;
+        await app.switchSession();
+        app.input = "start stream b";
+        app.send();
+        return true;
+        """,
+        ids[1],
+    )
+    page.wait_for_function("() => window.__fakeChatStreams().length === 2")
+
+    page.evaluate(
+        """() => {
+          for (let i = 0; i < 200; i++) {
+            window.__emitSseAt(0, "text", { text: `BG_TEXT_${i} ` });
+          }
+          for (let i = 0; i < 200; i++) {
+            window.__emitSseAt(0, "thinking", { text: `BG_THINK_${i} ` });
+          }
+        }"""
+    )
+    before = _app_eval(
+        page,
+        """
+        const st = app._ensureTabState(arg);
+        const thinking = [...st.messages].reverse().find(m => m.role === "thinking");
+        return {
+          currentId: app.currentId,
+          streaming: st.streaming,
+          thinkingText: thinking ? thinking.text : null,
+          plainPaints: st._streamPlainRenderCount,
+        };
+        """,
+        ids[0],
+    )
+    assert before["currentId"] == ids[1]
+    assert before["streaming"] is True
+    assert before["thinkingText"] == ""
+    assert before["plainPaints"] == 0
+
+    _app_eval(
+        page,
+        """
+        app.currentId = arg;
+        await app.switchSession();
+        return true;
+        """,
+        ids[0],
+    )
+    page.wait_for_function(
+        """sid => {
+          const app = document.querySelector("#app")._x_dataStack[0];
+          const st = app._ensureTabState(sid);
+          const thinking = [...st.messages].reverse().find(m => m.role === "thinking");
+          return app.currentId === sid
+            && thinking?.text.includes("BG_THINK_199")
+            && document.querySelector(`.msg-pane[data-tid="${sid}"]`)
+              ?.textContent.includes("BG_THINK_199");
+        }""",
+        arg=ids[0],
+    )
+    assert _app_eval(
+        page,
+        """
+        const st = app._ensureTabState(arg);
+        return st.messages.some(m => m.role === "assistant"
+          && m.text.includes("BG_TEXT_199"));
+        """,
+        ids[0],
+    )
+    _assert_no_browser_errors(page, errors)
 
 
 @pytest.mark.parametrize(

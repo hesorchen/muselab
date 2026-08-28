@@ -9671,9 +9671,9 @@ function portal() {
       this._fetchTabUsage(id);
     },
 
-    // Retain ten recently-used virtualized transcript panes. Each pane mounts
-    // only its viewport rows/spacers, so this avoids repeated Alpine/Markdown DOM
-    // reconstruction without retaining a second full-history representation.
+    // Retain a bounded set of recently-used virtualized transcript panes. Stream
+    // transport/state outlives its pane, so inactive live sessions must obey the
+    // same limit instead of keeping an unbounded hidden Alpine tree mounted.
     _touchTranscriptPane(id) {
       if (!id) return false;
       const open = new Set(this.workspaceOpenTabIds());
@@ -9683,18 +9683,8 @@ function portal() {
       const previousLru = (this._transcriptPaneLru || []).filter(tid => open.has(tid));
       const lru = [id, ...previousLru.filter(tid => tid !== id)];
       this._transcriptPaneLru = lru;
-      // A background stream keeps mutating its pane. Never evict that live DOM;
-      // once it settles, the next activation naturally trims it by LRU again.
-      const streaming = Array.from(open).filter(tid => {
-        const st = this.tabState && this.tabState[tid];
-        return st && (st.streaming || st.es);
-      });
-      const streamingSet = new Set(streaming);
       const warmLimit = this._isMobileLayout() ? 1 : this.WARM_TRANSCRIPT_LIMIT;
-      const ordinary = lru
-        .filter(tid => !streamingSet.has(tid))
-        .slice(0, warmLimit);
-      const desired = [...ordinary, ...streaming];
+      const desired = lru.slice(0, warmLimit);
       const desiredSet = new Set(desired);
       // Preserve mount order for panes that remain warm. Reordering the x-for on
       // every click would physically move several large DOM subtrees and recreate
@@ -14940,9 +14930,13 @@ function portal() {
       // Switch the visible tab. We do NOT touch other tabs' streams — each
       // tab's ES is in its own tabState[id], and stream callbacks write
       // there directly. Switching is just "show that tab".
-      // The active pane and the nine most-recent panes stay mounted as bounded
+      // The active pane and a bounded set of recent panes stay mounted as
       // virtualized DOM views. Canonical messages remain owned by tabState.
       this._activateTabState(this.currentId);
+      const activatedState = this.tabState && this.tabState[this.currentId];
+      if (activatedState && typeof activatedState._flushLivePresentation === "function") {
+        activatedState._flushLivePresentation();
+      }
       // Selecting a conversation means opening its latest state, not restoring a
       // stale historical viewport. Reader-controlled position is preserved only
       // while staying inside the same active tab; every explicit tab selection
@@ -29147,6 +29141,9 @@ function portal() {
       // tab is active).
       let curBubble = null;
       let acc = "";
+      let thinkingBubble = null;
+      let thinkingAcc = "";
+      const pendingTaskProgress = new Map();
       if (isReconnect && resumeEventSeq > 0 && !isContinuation) {
         const existing = streamState.messages;
         const tail = existing[existing.length - 1];
@@ -29259,6 +29256,7 @@ function portal() {
         pendingTimer = null;
         pendingFrame = null;
         if (!ownsCurBubble()) { curBubble = null; acc = ""; return; }
+        if (this.currentId !== streamSid) return;
         curBubble.text = acc;
         curBubble._streamText = acc;
         curBubble._streamPlain = true;
@@ -29267,7 +29265,7 @@ function portal() {
         _scrollIfActive();
       };
       const schedulePlainPaint = () => {
-        if (pendingTimer || pendingFrame) return;
+        if (this.currentId !== streamSid || pendingTimer || pendingFrame) return;
         const queueFrame = () => {
           pendingTimer = null;
           if (typeof requestAnimationFrame === "function") {
@@ -29297,7 +29295,28 @@ function portal() {
         if (ownsCurBubble()) renderFinal();
         else { cancelPendingPaint(); curBubble = null; acc = ""; }
       };
-      const closeAsst = () => { flushRender(); curBubble = null; acc = ""; };
+      const flushPlainBoundary = () => {
+        cancelPendingPaint();
+        if (!ownsCurBubble()) { curBubble = null; acc = ""; return; }
+        curBubble.text = acc;
+        curBubble._streamText = acc;
+        curBubble._streamPlain = true;
+        if (this.currentId === streamSid) _scrollIfActive();
+      };
+      const closeAsst = () => {
+        flushPlainBoundary();
+        curBubble = null;
+        acc = "";
+      };
+      const flushThinking = () => {
+        if (!ownsStreamState() || !thinkingBubble) return;
+        thinkingBubble.text = thinkingAcc;
+      };
+      const closeThinking = () => {
+        flushThinking();
+        thinkingBubble = null;
+        thinkingAcc = "";
+      };
       const _setContinuationAwaitingReaction = (waiting) => {
         if (!isContinuation) return;
         const next = !!waiting;
@@ -29368,11 +29387,44 @@ function portal() {
           taskCardByTaskId.set(String(card.task_status.task_id), card);
         }
       };
+      const taskProgressKey = (toolUseId, patch) => String(
+        toolUseId || (patch && patch.task_id) || "",
+      );
+      const queueTaskProgress = (toolUseId, patch) => {
+        const key = taskProgressKey(toolUseId, patch);
+        if (!key) return;
+        const pending = pendingTaskProgress.get(key);
+        pendingTaskProgress.set(key, {
+          toolUseId,
+          patch: Object.assign({}, pending ? pending.patch : {}, patch),
+        });
+      };
+      const flushTaskProgress = () => {
+        if (!ownsStreamState() || !pendingTaskProgress.size) return;
+        for (const pending of pendingTaskProgress.values()) {
+          applyTaskStatus(pending.toolUseId, pending.patch);
+        }
+        pendingTaskProgress.clear();
+      };
+      const flushLivePresentation = () => {
+        if (!ownsStreamState() || this.currentId !== streamSid) return false;
+        if (ownsCurBubble()) paintPlainNow();
+        flushThinking();
+        flushTaskProgress();
+        return true;
+      };
+      streamState._flushLivePresentation = flushLivePresentation;
+      const flushTerminalPresentation = () => {
+        closeAsst();
+        closeThinking();
+        flushTaskProgress();
+      };
 
       es.addEventListener("text", ev => {
         let d;
         try { d = JSON.parse(ev.data); } catch (_) { return; }
         _setContinuationAwaitingReaction(false);
+        closeThinking();
         if (!openAsst()) return;
         acc += d.text;
         // Keep the currently painted snapshot stable while the user selects it.
@@ -29389,27 +29441,26 @@ function portal() {
         try { d = JSON.parse(ev.data); } catch (_) { return; }
         _setContinuationAwaitingReaction(false);
         closeAsst();
-        // Backend yields one SSE event per thinking_delta. Coalesce them
-        // into the most recent thinking message so we see ONE block per
-        // reasoning segment, not N tiny ones. If the tail isn't a thinking
-        // message (e.g. previous was tool_use), start a new one.
-        const msgs = streamState.messages;
-        const last = msgs[msgs.length - 1];
-        let pushed = false;
-        if (last && last.role === "thinking") {
-          last.text = (last.text || "") + (d.text || "");
-        } else {
-          this._appendLiveMessage(streamState, { role: "thinking", text: d.text || "" });
-          pushed = true;
+        // Keep one thinking row per contiguous reasoning segment, but publish
+        // token-rate text only for the visible tab. Background streams retain
+        // the complete closure accumulator and flush once on activation/boundary.
+        if (!thinkingBubble) {
+          thinkingBubble = this._appendLiveMessage(
+            streamState, { role: "thinking", text: "" });
+          thinkingAcc = "";
         }
-
-        _scrollIfActive();
+        thinkingAcc += d.text || "";
+        if (this.currentId === streamSid) {
+          thinkingBubble.text = thinkingAcc;
+          _scrollIfActive();
+        }
       });
       es.addEventListener("tool_use", ev => {
         let d;
         try { d = JSON.parse(ev.data); } catch (_) { return; }
         _setContinuationAwaitingReaction(false);
         closeAsst();
+        closeThinking();
         // `id` is the SDK's toolu_xxx tool_use_id. Critical for
         // _taskSubjectMapForMessages — it pairs each TaskCreate
         // tool_use with the tool_result that carries the assigned
@@ -29482,16 +29533,19 @@ function portal() {
       es.addEventListener("task_progress", ev => {
         let d;
         try { d = JSON.parse(ev.data); } catch (_) { return; }
-        applyTaskStatus(d.tool_use_id, {
+        const patch = {
           task_id: d.task_id,
           state: "running",
           usage: d.usage || null,
           last_tool_name: d.last_tool_name || "",
-        });
+        };
+        if (this.currentId === streamSid) applyTaskStatus(d.tool_use_id, patch);
+        else queueTaskProgress(d.tool_use_id, patch);
       });
       es.addEventListener("task_notification", ev => {
         let d;
         try { d = JSON.parse(ev.data); } catch (_) { return; }
+        flushTaskProgress();
         // SDK status ∈ {completed, failed, stopped}; map unknown → "done"
         // so a future status value still renders a terminal (not stuck)
         // state instead of silently staying on ⏳.
@@ -29564,6 +29618,7 @@ function portal() {
         let d;
         try { d = JSON.parse(ev.data); } catch (_) { return; }
         closeAsst();
+        closeThinking();
         // Pre-populate pendingAnswers with one key per question (multiSelect
         // → []; single → null). Without this, Alpine's Proxy doesn't reliably
         // re-evaluate :class={picked: ...} when we add a brand-new key on
@@ -29593,6 +29648,7 @@ function portal() {
         let d;
         try { d = JSON.parse(ev.data); } catch (_) { return; }
         closeAsst();
+        closeThinking();
         const exitPlan = d.kind === "exit_plan"
           || d.kind === "exit_plan_mode"
           || d.tool === "ExitPlanMode";
@@ -29779,6 +29835,10 @@ function portal() {
         streamState.streamPhase = "";
         streamState._continuationAwaitingReaction = false;
         streamState.es = null;
+        if (streamState._flushLivePresentation === flushLivePresentation) {
+          streamState._flushLivePresentation = null;
+        }
+        pendingTaskProgress.clear();
         if (followedTail) {
           this._boundLiveMessageRange(streamState, true);
           streamState.atBottom = true;
@@ -29980,7 +30040,7 @@ function portal() {
         }
       };
       es.addEventListener("done", ev => {
-        flushRender();
+        flushTerminalPresentation();
         // Guard JSON.parse: a malformed/empty `done` payload must NOT throw
         // before es.close()/_markDone()/_stopTimer() run below, else the
         // EventSource + timer interval leak and the UI stays streaming=true
@@ -30178,7 +30238,7 @@ function portal() {
         this.$nextTick(() => this._ensureBgContPoller(streamSid));
       });
       es.addEventListener("resync", ev => {
-        flushRender();
+        flushTerminalPresentation();
         let payload = {};
         try { payload = JSON.parse(ev.data) || {}; } catch (_) {}
         const reason = payload.reason || "replay_truncated";
@@ -30189,6 +30249,10 @@ function portal() {
         if (streamState._stallWatch) clearInterval(streamState._stallWatch);
         streamState._stallWatch = null;
         streamState.es = null;
+        if (streamState._flushLivePresentation === flushLivePresentation) {
+          streamState._flushLivePresentation = null;
+        }
+        pendingTaskProgress.clear();
         if (streamMobile && reason === "replay_truncated") {
           this.toast(this.lang === "zh"
             ? "回复数据量较大，完成后会自动从会话记录同步"
@@ -30203,7 +30267,7 @@ function portal() {
         streamState._canonicalResyncReason = reason;
       });
       es.addEventListener("error", async ev => {
-        flushRender();
+        flushTerminalPresentation();
         // One terminal server error may be followed by EventSource's own EOF
         // error. Busy handoff performs async durable persistence, so claim the
         // transport before its first await and make every later callback a
@@ -30576,7 +30640,7 @@ function portal() {
         });
       });
       es.addEventListener("cancelled", ev => {
-        flushRender();
+        flushTerminalPresentation();
         let d = {};
         try { d = JSON.parse(ev.data || "{}"); } catch (_) { d = {}; }
         const alreadySettledOptimistically = !!streamState._optimisticInterrupt;

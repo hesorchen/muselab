@@ -7304,8 +7304,11 @@ async def test_queue_bind_failure_uses_shared_startup_abort(
     sid = "queue-bind-failure"
     releases = []
 
-    async def persisted(*_args, **_kwargs):
-        return True
+    async def persisted(_site, _sid, func, *args, **kwargs):
+        kwargs.pop("file_path", None)
+        kwargs.pop("file_size", None)
+        kwargs.pop("owned", None)
+        return func(*args, **kwargs)
 
     monkeypatch.setattr(chat.obs, "to_thread_io", persisted)
     monkeypatch.setattr(chat.sess, "bind_queue_turn", lambda *_args: True)

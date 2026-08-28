@@ -3851,6 +3851,15 @@ async def shutdown_runtime() -> None:
             if isinstance(task, asyncio.Task) and not task.done():
                 protected_cleanup_tasks.add(task)
     tasks.difference_update(protected_cleanup_tasks)
+    # Normal application shutdown runs on the owning loop. Test harnesses and
+    # embedded callers can close that loop before invoking this idempotent cleanup
+    # from a replacement loop; asyncio cannot cancel or wait on those stale tasks.
+    current_loop = asyncio.get_running_loop()
+    tasks = {task for task in tasks if task.get_loop() is current_loop}
+    protected_cleanup_tasks = {
+        task for task in protected_cleanup_tasks
+        if task.get_loop() is current_loop
+    }
     for task in tasks:
         task.cancel()
     if tasks:
@@ -7400,7 +7409,10 @@ def clear_queue_api(sid: str) -> dict:
 
 @router.post("/sessions/{sid}/queue/pause", dependencies=[Depends(require_token)])
 async def pause_queue_api(sid: str, req: QueuePauseReq) -> dict:
-    data = sess.set_queue_paused(sid, req.paused)
+    data = await obs.to_thread_io(
+        "chat.queue_pause", sid, sess.set_queue_paused, sid, req.paused,
+        owned=True,
+    )
     # Resuming kicks the drain in case no turn is currently running for this
     # session (otherwise the next item would wait for a turn that never comes).
     if not req.paused:
@@ -7505,7 +7517,8 @@ async def patch_session_api(sid: str, req: SessionPatchReq) -> dict:
     # Model, effort, and service tier form one runtime contract. Validate the
     # complete *target* tuple before mutating any field in this request; this
     # makes a rejected cross-model combination side-effect free.
-    current_meta = sess.get_session(sid)
+    current_meta = await obs.to_thread_io(
+        "chat.session_read", sid, sess.get_session, sid)
     runtime_controls_requested = any(
         value is not None
         for value in (req.model, req.effort, req.service_tier)
@@ -7569,25 +7582,33 @@ async def patch_session_api(sid: str, req: SessionPatchReq) -> dict:
             # Runtime-rollover postlude propagation uses the same lock and rechecks
             # the inherited title inside it, so a user's explicit rename always
             # wins rather than being overwritten by a late automatic sync.
-            lock_started = time.monotonic()
-            with _session_title_lock(sid):
-                lock_wait_ms = round((time.monotonic() - lock_started) * 1000)
-                local_started = time.monotonic()
-                renamed = sess.rename_session(sid, req.name)
-                local_index_ms = round(
-                    (time.monotonic() - local_started) * 1000)
-                # Also propagate to CLI's JSONL so list_sessions() / manual claude
-                # CLI runs see the new title. Silent no-op if JSONL doesn't exist.
-                sdk_started = time.monotonic()
-                try:
-                    sdk_rename_session(
-                        sid, req.name,
-                        directory=str(sess.session_workspace(sid)))
-                except (FileNotFoundError, ValueError):
-                    pass
-                finally:
-                    sdk_rename_ms = round(
+            def _rename_transaction() -> tuple[bool, int, int, int]:
+                lock_started = time.monotonic()
+                with _session_title_lock(sid):
+                    waited = round((time.monotonic() - lock_started) * 1000)
+                    local_started = time.monotonic()
+                    local_renamed = sess.rename_session(sid, req.name)
+                    local_ms = round(
+                        (time.monotonic() - local_started) * 1000)
+                    # Also propagate to CLI's JSONL so list_sessions() / manual
+                    # claude CLI runs see the new title. Silent no-op if absent.
+                    sdk_started = time.monotonic()
+                    try:
+                        sdk_rename_session(
+                            sid, req.name,
+                            directory=str(sess.session_workspace(sid)))
+                    except (FileNotFoundError, ValueError):
+                        pass
+                    sdk_ms = round(
                         (time.monotonic() - sdk_started) * 1000)
+                    return local_renamed, waited, local_ms, sdk_ms
+
+            renamed, lock_wait_ms, local_index_ms, sdk_rename_ms = (
+                await obs.to_thread_io(
+                    "chat.session_rename", sid, _rename_transaction,
+                    owned=True,
+                )
+            )
             ok = renamed or ok
             if renamed:
                 # The task ledger stores one denormalized display name per
@@ -7618,10 +7639,14 @@ async def patch_session_api(sid: str, req: SessionPatchReq) -> dict:
     if req.tag is not None:
         # Empty string → clear tag. SDK accepts None or str.
         try:
-            sdk_tag_session(
+            await obs.to_thread_io(
+                "chat.session_tag",
+                sid,
+                sdk_tag_session,
                 sid,
                 req.tag or None,
                 directory=str(sess.session_workspace(sid)),
+                owned=True,
             )
             ok = True
         except (FileNotFoundError, ValueError) as e:
@@ -7631,14 +7656,26 @@ async def patch_session_api(sid: str, req: SessionPatchReq) -> dict:
     if req.pinned is not None:
         # Pin is muselab-local (not stored in CLI JSONL). Always idempotent.
         # set_pin runs the load-mutate-save sequence under _INDEX_LOCK.
-        sess.set_pin(sid, req.pinned)
+        await obs.to_thread_io(
+            "chat.session_pin", sid, sess.set_pin, sid, req.pinned,
+            owned=True,
+        )
         ok = True
     if req.permission is not None:
         permission = _validate_permission(req.permission)
-        current_meta = sess.get_session(sid) or {}
+        current_meta = await obs.to_thread_io(
+            "chat.session_read", sid, sess.get_session, sid)
+        current_meta = current_meta or {}
         current_permission = (current_meta.get("permission") or "").strip()
         changed = current_permission != permission
-        updated = sess.update_permission(sid, permission)
+        updated = await obs.to_thread_io(
+            "chat.session_permission",
+            sid,
+            sess.update_permission,
+            sid,
+            permission,
+            owned=True,
+        )
         ok = updated or ok
         if updated and changed:
             # Permission is a launch contract. A busy session defers the
@@ -7664,11 +7701,15 @@ async def patch_session_api(sid: str, req: SessionPatchReq) -> dict:
                             f"[chat] interrupt before model swap failed for "
                             f"{sid}: {type(_e).__name__}: {_e}\n")
         if runtime_controls_changed:
-            updated = sess.update_runtime_controls(
+            updated = await obs.to_thread_io(
+                "chat.session_runtime_controls",
+                sid,
+                sess.update_runtime_controls,
                 sid,
                 model=target_model,
                 effort=target_effort,
                 service_tier=target_tier,
+                owned=True,
             )
             ok = updated or ok
             if updated:
@@ -9720,7 +9761,13 @@ async def interrupt(session_id: str) -> dict:
     # SDK interrupt can race the current turn's finally block and dequeue the
     # next item. The helper is atomic with dequeue_message and is a no-op for an
     # empty queue, so ordinary one-off interrupts do not create paused state.
-    sess.pause_queue_if_nonempty(session_id)
+    await obs.to_thread_io(
+        "chat.queue_pause_nonempty",
+        session_id,
+        sess.pause_queue_if_nonempty,
+        session_id,
+        owned=True,
+    )
     async with _lock:
         targets = [(k, c) for k, c in _clients.items() if k[0] == session_id]
     # Mark the active turn user-cancelled up front (BEFORE calling SDK's
@@ -9900,7 +9947,13 @@ async def _force_stop_after_grace(
         # coroutine finally block, the retained attachment/startup state still
         # exists and has one explicit cleanup owner.
         mem0.pop_recall_trace(session_id)
-        sess.pause_queue_if_nonempty(session_id)
+        await obs.to_thread_io(
+            "chat.queue_pause_nonempty",
+            session_id,
+            sess.pause_queue_if_nonempty,
+            session_id,
+            owned=True,
+        )
         await _finish_cancelled_startup(session_id, bc)
     except Exception as e:
         sys.stderr.write(
@@ -13158,6 +13211,41 @@ async def _handoff_task_watcher(session_id: str) -> None:
         _background_origin_turn_id.pop(session_id, None)
 
 
+async def _release_queue_claim_owned(
+    session_id: str,
+    item_id: str,
+    *,
+    turn_id: str = "",
+    pause: bool = False,
+) -> bool:
+    return await obs.to_thread_io(
+        "chat.queue_release",
+        session_id,
+        sess.release_queue_claim,
+        session_id,
+        item_id,
+        turn_id=turn_id,
+        pause=pause,
+        owned=True,
+    )
+
+
+async def _ack_queue_message_owned(
+    session_id: str,
+    item_id: str,
+    turn_id: str,
+) -> bool:
+    return await obs.to_thread_io(
+        "chat.queue_ack",
+        session_id,
+        sess.ack_queue_message,
+        session_id,
+        item_id,
+        turn_id,
+        owned=True,
+    )
+
+
 async def _finish_cancelled_startup(
     session_id: str,
     broadcast: TurnBroadcast,
@@ -13177,7 +13265,7 @@ async def _finish_cancelled_startup(
             queue_settled = False
             if broadcast.queue_item_id:
                 try:
-                    queue_settled = sess.release_queue_claim(
+                    queue_settled = await _release_queue_claim_owned(
                         session_id,
                         broadcast.queue_item_id,
                         turn_id=broadcast.turn_id,
@@ -13352,7 +13440,7 @@ async def _abort_turn_startup(
             snapshot_ready = False
             if broadcast.queue_item_id:
                 try:
-                    queue_settled = sess.release_queue_claim(
+                    queue_settled = await _release_queue_claim_owned(
                         session_id,
                         broadcast.queue_item_id,
                         turn_id=broadcast.turn_id,
@@ -13613,6 +13701,7 @@ async def _admit_turn(
             _write_active_turn_sidecar,
             broadcast,
             file_path=_active_turn_path(session_id),
+            owned=True,
         )
     except asyncio.CancelledError:
         await _settle_admission_cancellation()
@@ -13633,11 +13722,15 @@ async def _admit_turn(
 
     if broadcast.queue_item_id:
         try:
-            sess.bind_queue_turn(
-                session_id, broadcast.queue_item_id, broadcast.turn_id)
-            _durable_attachment_store.mark_queue_turn(
-                session_id, broadcast.queue_item_id, broadcast.turn_id,
-            )
+            def _bind_queue_turn() -> None:
+                sess.bind_queue_turn(
+                    session_id, broadcast.queue_item_id, broadcast.turn_id)
+                _durable_attachment_store.mark_queue_turn(
+                    session_id, broadcast.queue_item_id, broadcast.turn_id,
+                )
+
+            await obs.to_thread_io(
+                "chat.queue_bind", session_id, _bind_queue_turn, owned=True)
         except Exception:
             broadcast.perf_error_kind = "queue_bind"
             broadcast.perf_startup_failure_phase = "accepted"
@@ -13790,35 +13883,39 @@ async def _start_turn(
     # that wins over whatever the frontend's dropdown happens to say. This
     # prevents the "I tried to switch but it didn't take" class of bugs and
     # avoids cross-vendor thinking-signature corruption.
-    s = sess.get_session(session_id) or {}
-    broadcast.activity_hidden = bool(s.get("activity_hidden", False))
-    locked = (s.get("model") or "").strip()
-    if locked:
-        healed = _heal_unreachable_locked_model(session_id, locked, model)
-        model_to_use = healed
-        if healed != locked:
-            sess.update_model(session_id, healed)
-    else:
-        # Virgin session — frontend's choice gets persisted on first send.
-        model_to_use = model or MODEL
-        sess.update_model(session_id, model_to_use)
-    broadcast.model = model_to_use
+    def _persist_launch_settings() -> tuple[dict, str, str]:
+        launch_meta = sess.get_session(session_id) or {}
+        locked = (launch_meta.get("model") or "").strip()
+        if locked:
+            resolved_model = _heal_unreachable_locked_model(
+                session_id, locked, model)
+            if resolved_model != locked:
+                sess.update_model(session_id, resolved_model)
+        else:
+            # Virgin session — frontend's choice gets persisted on first send.
+            resolved_model = model or MODEL
+            sess.update_model(session_id, resolved_model)
 
-    # Permission is a session setting, not a browser-global preference. A
-    # direct request remains authoritative and is persisted for legacy clients
-    # that do not use PATCH. Queue items deliberately replay their enqueue-time
-    # snapshot without rolling the session's newer selection back afterward.
-    if persist_permission:
-        sess.update_permission(session_id, permission)
-        # update_permission captures the previous non-plan mode atomically when
-        # entering Plan Mode. Re-read so this very first plan turn launches with
-        # the correct ExitPlanMode return capability.
-        s = sess.get_session(session_id) or s
-        plan_return_to_use = _normalize_plan_return_permission(
-            permission, s.get("plan_return_permission"))
-    else:
-        plan_return_to_use = _normalize_plan_return_permission(
-            permission, plan_return_permission)
+        # Queue items replay their enqueue-time permission snapshot without
+        # rolling the session's newer selection back afterward.
+        if persist_permission:
+            sess.update_permission(session_id, permission)
+            launch_meta = sess.get_session(session_id) or launch_meta
+            resolved_plan_return = _normalize_plan_return_permission(
+                permission, launch_meta.get("plan_return_permission"))
+        else:
+            resolved_plan_return = _normalize_plan_return_permission(
+                permission, plan_return_permission)
+        return launch_meta, resolved_model, resolved_plan_return
+
+    s, model_to_use, plan_return_to_use = await obs.to_thread_io(
+        "chat.turn_launch_settings",
+        session_id,
+        _persist_launch_settings,
+        owned=True,
+    )
+    broadcast.activity_hidden = bool(s.get("activity_hidden", False))
+    broadcast.model = model_to_use
 
     # Reasoning effort and Fast service are per-session launch controls.
     # Legacy empty effort is normalized to canonical `auto` before it reaches
@@ -15758,6 +15855,7 @@ async def _start_turn(
                 session_id,
                 _persist_session_summary,
                 file_path=sess.INDEX,
+                owned=True,
             )
             # ``done`` is intentionally published before this slower block. A
             # user can therefore roll over the session while these annotations
@@ -16071,6 +16169,7 @@ async def _start_turn(
             _write_active_turn_sidecar,
             broadcast,
             file_path=_active_turn_path(session_id),
+            owned=True,
         )
     except asyncio.CancelledError:
         broadcast.perf_intent_refresh_ms = obs.elapsed_ms(
@@ -16257,23 +16356,27 @@ async def _start_turn(
                         broadcast.canonical_terminal_published = True
                         if broadcast.queue_item_id:
                             if done_data.get("is_error") or done_data.get("cancelled"):
-                                queue_settled = sess.release_queue_claim(
+                                queue_settled = await _release_queue_claim_owned(
                                     session_id,
                                     broadcast.queue_item_id,
                                     turn_id=broadcast.turn_id,
                                     pause=True,
                                 )
                             else:
-                                queue_settled = sess.ack_queue_message(
+                                queue_settled = await _ack_queue_message_owned(
                                     session_id,
                                     broadcast.queue_item_id,
                                     broadcast.turn_id,
                                 )
                                 if queue_settled:
-                                    _durable_attachment_store.finish_queue_item(
+                                    await obs.to_thread_io(
+                                        "chat.queue_attachment_finish",
+                                        session_id,
+                                        _durable_attachment_store.finish_queue_item,
                                         session_id,
                                         broadcast.queue_item_id,
                                         consume=True,
+                                        owned=True,
                                     )
                             if not queue_settled:
                                 raise RuntimeError("queue terminal ownership mismatch")
@@ -16418,7 +16521,7 @@ async def _start_turn(
             if broadcast.queue_item_id and not queue_settled:
                 try:
                     if turn_errored or broadcast.cancelled:
-                        if not sess.release_queue_claim(
+                        if not await _release_queue_claim_owned(
                             session_id,
                             broadcast.queue_item_id,
                             turn_id=broadcast.turn_id,
@@ -16426,17 +16529,21 @@ async def _start_turn(
                         ):
                             raise RuntimeError("queue terminal ownership mismatch")
                     else:
-                        queue_settled = sess.ack_queue_message(
+                        queue_settled = await _ack_queue_message_owned(
                             session_id,
                             broadcast.queue_item_id,
                             broadcast.turn_id,
                         )
                         if not queue_settled:
                             raise RuntimeError("queue terminal ownership mismatch")
-                        _durable_attachment_store.finish_queue_item(
+                        await obs.to_thread_io(
+                            "chat.queue_attachment_finish",
+                            session_id,
+                            _durable_attachment_store.finish_queue_item,
                             session_id,
                             broadcast.queue_item_id,
                             consume=True,
+                            owned=True,
                         )
                 except Exception as e:
                     # Never duplicate a turn by guessing. The durable inflight
@@ -16497,9 +16604,17 @@ async def _start_turn(
                     # Only pause + notify if items are actually waiting —
                     # a lone failed turn with an empty queue is just a normal
                     # error the user already saw in-stream; no need to buzz.
-                    q = sess.get_queue(session_id)
+                    q = await obs.to_thread_io(
+                        "chat.queue_read", session_id, sess.get_queue, session_id)
                     if q.get("items"):
-                        sess.set_queue_paused(session_id, True)
+                        await obs.to_thread_io(
+                            "chat.queue_pause",
+                            session_id,
+                            sess.set_queue_paused,
+                            session_id,
+                            True,
+                            owned=True,
+                        )
                         _notify_queue_paused_on_error(session_id)
                 elif broadcast.cancelled:
                     # User explicitly stopped this turn — pause the queue so
@@ -16508,7 +16623,13 @@ async def _start_turn(
                     # cleanup used to create ``{items: [], paused: true}``;
                     # the next message then entered a queue that could never
                     # drain, which looked like an intermittent send failure.
-                    sess.pause_queue_if_nonempty(session_id)
+                    await obs.to_thread_io(
+                        "chat.queue_pause_nonempty",
+                        session_id,
+                        sess.pause_queue_if_nonempty,
+                        session_id,
+                        owned=True,
+                    )
                 else:
                     await _maybe_drain_queue(session_id)
             except Exception as e:
@@ -16616,7 +16737,14 @@ async def _maybe_drain_queue(session_id: str) -> None:
         if runtime_meta.get("runtime_shadow"):
             if successor_sid:
                 try:
-                    moved = sess.migrate_queue(session_id, successor_sid)
+                    moved = await obs.to_thread_io(
+                        "chat.queue_migrate",
+                        session_id,
+                        sess.migrate_queue,
+                        session_id,
+                        successor_sid,
+                        owned=True,
+                    )
                 except ValueError:
                     return
                 try:
@@ -16640,7 +16768,8 @@ async def _maybe_drain_queue(session_id: str) -> None:
         # final continuation releases the single SDK pump.
         if (_sessions_with_inflight_tasks.get(session_id)
                 or _session_has_live_watcher(session_id)):
-            queued = sess.get_queue(session_id)
+            queued = await obs.to_thread_io(
+                "chat.queue_read", session_id, sess.get_queue, session_id)
             if queued.get("items") or queued.get("inflight"):
                 try:
                     successor = await _continue_detached_runtime(session_id)
@@ -16669,12 +16798,19 @@ async def _maybe_drain_queue(session_id: str) -> None:
             return
         if _runtime_lineage_has_ready_continuation(session_id):
             return
-        item = sess.claim_queue_message(session_id)
+        item = await obs.to_thread_io(
+            "chat.queue_claim",
+            session_id,
+            sess.claim_queue_message,
+            session_id,
+            owned=True,
+        )
         if item is None:
             return
         item_id = str(item.get("id") or "")
         try:
-            _queue_snapshot = sess.get_queue(session_id)
+            _queue_snapshot = await obs.to_thread_io(
+                "chat.queue_read", session_id, sess.get_queue, session_id)
             _queue_depth = (
                 len(_queue_snapshot.get("items") or [])
                 + int(bool(_queue_snapshot.get("inflight")))
@@ -16726,7 +16862,7 @@ async def _maybe_drain_queue(session_id: str) -> None:
                         if aid not in cached_ids and aid not in durable_ids)
             except (DurableAttachmentError, OSError, sqlite3.Error,
                     UnsafePrivatePath) as exc:
-                restored = sess.release_queue_claim(
+                restored = await _release_queue_claim_owned(
                     session_id, item_id, pause=True)
                 sys.stderr.write(
                     f"[chat] queued attachment precheck failed "
@@ -16736,7 +16872,7 @@ async def _maybe_drain_queue(session_id: str) -> None:
                 sys.stderr.flush()
                 return
             if unavailable_count:
-                restored = sess.release_queue_claim(
+                restored = await _release_queue_claim_owned(
                     session_id, item_id, pause=True)
                 sys.stderr.write(
                     f"[chat] queued attachments unavailable "
@@ -16769,7 +16905,8 @@ async def _maybe_drain_queue(session_id: str) -> None:
             # If startup never bound the claim, it is safe to restore. Once a
             # turn id is bound, its detached pump owns acknowledgement; requeueing
             # here would create the executed+queued duplicate seen in production.
-            q = sess.get_queue(session_id)
+            q = await obs.to_thread_io(
+                "chat.queue_read", session_id, sess.get_queue, session_id)
             inflight = q.get("inflight") or {}
             bound_turn_id = str(inflight.get("turn_id") or "")
             active = _active_turns.get(session_id)
@@ -16778,21 +16915,22 @@ async def _maybe_drain_queue(session_id: str) -> None:
                 and active.turn_id == bound_turn_id
                 and active.queue_item_id == item_id
             )
-            if (sess.get_session(session_id) is not None
-                    and not active_owns_claim):
-                sess.release_queue_claim(
+            session_exists = await obs.to_thread_io(
+                "chat.session_read", session_id, sess.get_session, session_id)
+            if session_exists is not None and not active_owns_claim:
+                await _release_queue_claim_owned(
                     session_id, item_id, turn_id=bound_turn_id)
             raise
         except _TurnBusy:
-            sess.release_queue_claim(session_id, item_id)
+            await _release_queue_claim_owned(session_id, item_id)
         except _TurnStartError as exc:
             # If startup failed before binding, this releases the unbound claim.
             # Bound startup failures settle with their exact turn id in _start_turn.
             if not exc.queue_claim_settled:
-                sess.release_queue_claim(session_id, item_id, pause=True)
+                await _release_queue_claim_owned(session_id, item_id, pause=True)
             _notify_queue_paused_on_error(session_id)
         except Exception as e:
-            sess.release_queue_claim(session_id, item_id, pause=True)
+            await _release_queue_claim_owned(session_id, item_id, pause=True)
             sys.stderr.write(
                 f"[chat] queue drain crashed sid={session_id[:8]} "
                 f"exc={type(e).__name__}\n")

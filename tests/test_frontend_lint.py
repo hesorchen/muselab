@@ -3926,8 +3926,15 @@ def test_long_chat_state_keeps_complete_normalized_history_and_generation_safety
     assert "const warmLimit = this._isMobileLayout() ? 1 : this.WARM_TRANSCRIPT_LIMIT" in app
     assert ".slice(0, warmLimit)" in app
     assert "_touchTranscriptPane(id)" in app
-    assert "st.streaming || st.es" in app
-    assert ".filter(tid => !streamingSet.has(tid))" in app
+    assert "const desired = lru.slice(0, warmLimit)" in app
+    assert "st.streaming || st.es" not in app[
+        app.index("_touchTranscriptPane(id)"):app.index("warmTranscriptTabIds()")
+    ]
+    assert "streamState._flushLivePresentation = flushLivePresentation" in app
+    assert "if (this.currentId !== streamSid) return;" in app
+    assert "const flushPlainBoundary = () =>" in app
+    assert "const closeAsst = () => {\n        flushPlainBoundary();" in app
+    assert "flushTerminalPresentation();" in app
     assert ':data-tid="tid"' in pane
     assert 'x-for="row in paneRows" :key="row.key"' in pane
     assert "paneMessageRows(tid)" in pane
@@ -4989,7 +4996,9 @@ def test_queue_controls_validate_mutations_and_block_send_during_interrupt():
     assert "if (st._stopping)" in app
     assert "queueActionBusy(currentId, 'edit:' + q.id)" in html
     assert "queueActionBusy(currentId, 'remove:' + q.id)" in html
-    assert "sess.pause_queue_if_nonempty(session_id)" in chat
+    assert '"chat.queue_pause_nonempty"' in chat
+    assert "sess.pause_queue_if_nonempty" in chat
+    assert "owned=True" in chat
 
 
 def test_per_message_timestamps_are_plumbed_but_only_shown_on_expand():
