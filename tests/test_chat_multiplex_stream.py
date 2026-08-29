@@ -131,6 +131,35 @@ def test_mux_ticket_validation_dedupes_and_is_single_use(
     )
     assert contradictory.status_code == 422
 
+    too_many = client.post(
+        "/api/chat/stream/mux/start",
+        headers={"X-Auth-Token": TEST_TOKEN},
+        json={
+            "checkpoints": [
+                {
+                    "session_id": f"s-{index}",
+                    "turn_id": "t",
+                    "last_event_seq": 0,
+                }
+                for index in range(65)
+            ],
+        },
+    )
+    assert too_many.status_code == 422
+
+    oversized_id = client.post(
+        "/api/chat/stream/mux/start",
+        headers={"X-Auth-Token": TEST_TOKEN},
+        json={
+            "checkpoints": [{
+                "session_id": "s" * 129,
+                "turn_id": "t",
+                "last_event_seq": 0,
+            }],
+        },
+    )
+    assert oversized_id.status_code == 422
+
     accepted = client.post(
         "/api/chat/stream/mux/start",
         headers={"X-Auth-Token": TEST_TOKEN},
@@ -333,17 +362,114 @@ def test_mux_turn_mismatch_resyncs_and_still_attaches_current_turn(
             for _ in range(3)
         ]
         decoded = [(event["event"], json.loads(event["data"])) for event in seen]
-        assert any(
-            name == "resync"
-            and payload["reason"] == "turn_changed"
-            and payload["current_turn_id"] == broadcast.turn_id
-            for name, payload in decoded
-        )
+        assert decoded[0][0] == "resync"
+        assert decoded[0][1] == {
+            "reason": "turn_changed",
+            "fallback": "canonical_history",
+            "retryable": False,
+            "requested_turn_id": "stale-turn",
+            "current_turn_id": broadcast.turn_id,
+            "session_id": broadcast.session_id,
+            "turn_id": "stale-turn",
+        }
+        assert decoded[1][0] == "session_state"
         assert any(
             name == "text" and payload["text"] == "new turn"
             for name, payload in decoded
         )
         await stream.aclose()
+
+    asyncio.run(exercise())
+
+
+def test_mux_consumes_checkpoint_before_discovering_later_turn(
+        chat_mod, monkeypatch):
+    monkeypatch.setattr(chat_mod, "_MUX_RECONCILE_INTERVAL_S", 0.01)
+    first = chat_mod.TurnBroadcast("checkpoint-once")
+    first.publish({
+        "event": "text", "data": json.dumps({"text": "first turn"})})
+    chat_mod._active_turns[first.session_id] = first
+    monkeypatch.setattr(
+        chat_mod,
+        "session_active_status",
+        lambda sid: _active_state(chat_mod._active_turns[sid]),
+    )
+    checkpoints = {
+        first.session_id: {
+            "session_id": first.session_id,
+            "turn_id": first.turn_id,
+            "last_event_seq": 0,
+        },
+    }
+
+    async def exercise():
+        stream = chat_mod._subscribe_multiplex(checkpoints)
+        initial = [
+            await asyncio.wait_for(anext(stream), timeout=0.2)
+            for _ in range(2)
+        ]
+        assert {event["event"] for event in initial} == {
+            "session_state", "text"}
+
+        first.finish()
+        second = chat_mod.TurnBroadcast(first.session_id)
+        second.publish({
+            "event": "text", "data": json.dumps({"text": "second turn"})})
+        chat_mod._active_turns[first.session_id] = second
+        later = [
+            await asyncio.wait_for(anext(stream), timeout=0.2)
+            for _ in range(2)
+        ]
+        decoded = [
+            (event["event"], json.loads(event["data"]))
+            for event in later
+        ]
+        assert not any(name == "resync" for name, _payload in decoded)
+        assert any(
+            name == "text" and payload["text"] == "second turn"
+            for name, payload in decoded
+        )
+        await stream.aclose()
+        second.close()
+
+    asyncio.run(exercise())
+    first.close()
+
+
+def test_mux_inactive_checkpoint_resyncs_once_and_stops_polling(
+        chat_mod, monkeypatch):
+    monkeypatch.setattr(chat_mod, "_MUX_RECONCILE_INTERVAL_S", 0.01)
+    probes = []
+    monkeypatch.setattr(
+        chat_mod,
+        "session_active_status",
+        lambda sid: probes.append(sid) or {"active": False},
+    )
+    checkpoints = {
+        "inactive-session": {
+            "session_id": "inactive-session",
+            "turn_id": "finished-turn",
+            "last_event_seq": 7,
+        },
+    }
+
+    async def exercise():
+        stream = chat_mod._subscribe_multiplex(checkpoints)
+        resync = await asyncio.wait_for(anext(stream), timeout=0.2)
+        inactive = await asyncio.wait_for(anext(stream), timeout=0.2)
+        assert resync["event"] == "resync"
+        assert json.loads(resync["data"]) == {
+            "reason": "checkpoint_unavailable",
+            "fallback": "canonical_history",
+            "retryable": False,
+            "session_id": "inactive-session",
+            "turn_id": "finished-turn",
+        }
+        assert inactive["event"] == "session_state"
+        assert json.loads(inactive["data"])["active"] is False
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(anext(stream), timeout=0.04)
+        assert probes == ["inactive-session"]
 
     asyncio.run(exercise())
 

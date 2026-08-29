@@ -11984,13 +11984,13 @@ class TurnStartReq(BaseModel):
 
 
 class MuxCheckpointReq(BaseModel):
-    session_id: str
-    turn_id: str = ""
+    session_id: str = Field(min_length=1, max_length=128)
+    turn_id: str = Field(default="", max_length=128)
     last_event_seq: int = Field(default=0, ge=0)
 
 
 class MuxStreamStartReq(BaseModel):
-    checkpoints: list[MuxCheckpointReq] = Field(default_factory=list)
+    checkpoints: list[MuxCheckpointReq] = Field(default_factory=list, max_length=64)
     mobile: bool = False
 
 
@@ -17371,9 +17371,14 @@ async def _subscribe_multiplex(
     output: asyncio.Queue[dict] = asyncio.Queue(maxsize=256)
     children: dict[tuple[str, str], asyncio.Task] = {}
     completed: set[tuple[str, str]] = set()
-    reported_mismatches: set[tuple[str, str, str]] = set()
     state_fingerprints: dict[str, str] = {}
     state_payloads: dict[str, dict] = {}
+    # Checkpoints are one-shot reconnect intents for this root SSE handshake.
+    # Copy them so consumption is private to the subscription lifecycle.
+    pending_checkpoints = {
+        session_id: dict(checkpoint)
+        for session_id, checkpoint in checkpoints.items()
+    }
 
     async def _pump_child(
         session_id: str,
@@ -17431,12 +17436,12 @@ async def _subscribe_multiplex(
             if getattr(broadcast, "is_continuation", False)
             and not getattr(broadcast, "continuation_consumed", False)
         )
-        candidate_ids.update(checkpoints)
+        candidate_ids.update(pending_checkpoints)
 
         active_ids: set[str] = set()
         for session_id in sorted(candidate_ids):
             state = session_active_status(session_id)
-            checkpoint = checkpoints.get(session_id)
+            checkpoint = pending_checkpoints.get(session_id)
             checkpoint_recent = None
             if checkpoint is not None and checkpoint.get("turn_id"):
                 recent = _get_recent_turn(session_id)
@@ -17449,13 +17454,16 @@ async def _subscribe_multiplex(
                 state_payload["session_id"] = session_id
                 fingerprint = _mux_session_state_fingerprint(state_payload)
                 state_payloads[session_id] = state_payload
+                state_event = None
                 if state_fingerprints.get(session_id) != fingerprint:
                     state_fingerprints[session_id] = fingerprint
-                    await output.put({
+                    state_event = {
                         "event": "session_state",
                         "data": json.dumps(state_payload, ensure_ascii=False),
-                    })
+                    }
 
+                current_start = None
+                checkpoint_consumed = False
                 if state.get("attachable"):
                     current_turn_id = str(state.get("turn_id") or "")
                     broadcast = _active_turns.get(session_id)
@@ -17474,26 +17482,34 @@ async def _subscribe_multiplex(
                             if (requested_turn_id
                                     and requested_turn_id != current_turn_id
                                     and checkpoint_recent is None):
-                                mismatch = (
-                                    session_id,
-                                    requested_turn_id,
-                                    current_turn_id,
-                                )
-                                if mismatch not in reported_mismatches:
-                                    reported_mismatches.add(mismatch)
-                                    await output.put({
-                                        "event": "resync",
-                                        "data": json.dumps({
-                                            "reason": "turn_changed",
-                                            "requested_turn_id": requested_turn_id,
-                                            "current_turn_id": current_turn_id,
-                                            "session_id": session_id,
-                                        }),
-                                    })
+                                # Recover only the stale owner.  This targeted
+                                # frame must precede the new turn's state so the
+                                # frontend cannot apply it to the successor.
+                                await output.put({
+                                    "event": "resync",
+                                    "data": json.dumps({
+                                        "reason": "turn_changed",
+                                        "fallback": "canonical_history",
+                                        "retryable": False,
+                                        "requested_turn_id": requested_turn_id,
+                                        "current_turn_id": current_turn_id,
+                                        "session_id": session_id,
+                                        "turn_id": requested_turn_id,
+                                    }),
+                                })
+                                checkpoint_consumed = True
                             elif requested_turn_id == current_turn_id:
                                 resume_seq = int(
                                     checkpoint.get("last_event_seq", 0) or 0)
-                        _start_child(session_id, broadcast, resume_seq)
+                                checkpoint_consumed = True
+                        current_start = (broadcast, resume_seq)
+
+                if state_event is not None:
+                    await output.put(state_event)
+                if current_start is not None:
+                    _start_child(session_id, *current_start)
+                    if checkpoint_consumed:
+                        pending_checkpoints.pop(session_id, None)
 
             if checkpoint_recent is not None:
                 _start_child(
@@ -17501,6 +17517,40 @@ async def _subscribe_multiplex(
                     checkpoint_recent,
                     int(checkpoint.get("last_event_seq", 0) or 0),
                 )
+                pending_checkpoints.pop(session_id, None)
+            elif checkpoint is not None and not state.get("active"):
+                # The requested turn is outside the bounded recent window.
+                # Canonicalize it once, report inactivity, then stop polling.
+                requested_turn_id = str(checkpoint.get("turn_id") or "")
+                await output.put({
+                    "event": "resync",
+                    "data": json.dumps({
+                        "reason": "checkpoint_unavailable",
+                        "fallback": "canonical_history",
+                        "retryable": False,
+                        "session_id": session_id,
+                        "turn_id": requested_turn_id,
+                    }),
+                })
+                pending_checkpoints.pop(session_id, None)
+                if session_id not in state_fingerprints:
+                    await output.put({
+                        "event": "session_state",
+                        "data": json.dumps({
+                            "session_id": session_id,
+                            "turn_id": requested_turn_id,
+                            "active": False,
+                            "stopping": False,
+                            "attachable": False,
+                        }),
+                    })
+
+        retained_completed = set(children)
+        retained_completed.update(
+            (session_id, broadcast.turn_id)
+            for session_id, broadcast in _active_turns.items()
+        )
+        completed.intersection_update(retained_completed)
 
         for session_id in list(state_fingerprints):
             if session_id in active_ids:
