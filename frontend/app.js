@@ -184,13 +184,21 @@ const _mcpFmtCache  = new WeakMap();   // raw msg -> { kind, value }
 const _readLinesCache = new WeakMap(); // raw msg -> { src, lines }
 const _searchHitsCache = new WeakMap();// raw msg -> { src, hits }
 const _toolMdCache = new WeakMap();    // raw msg -> { src, html }
+// Activity grouping/search runs from several Alpine expressions per render.
+// Keep its derived snapshot off reactive state so populating the cache cannot
+// itself schedule another render. Weak keys let each portal instance GC.
+const _activityDerivedCaches = new WeakMap(); // raw portal -> derived snapshot
+function _rawAlpine(value) {
+  try {
+    return (window.Alpine && typeof Alpine.raw === "function")
+      ? Alpine.raw(value) : value;
+  } catch (_) { return value; }
+}
 // Unwrap an Alpine reactive proxy to its stable underlying object so the
 // WeakMap key is identity-stable across renders. Falls back to the proxy
 // (Alpine v3 caches proxies per target, so even that key is stable).
 function _rawMsg(m) {
-  try {
-    return (window.Alpine && typeof Alpine.raw === "function") ? Alpine.raw(m) : m;
-  } catch (_) { return m; }
+  return _rawAlpine(m);
 }
 
 // Module-level constants reused by hot-path helpers below. Hoisted out of the
@@ -223,7 +231,11 @@ const _EMPTY_ACTIVE_SESSION_PANE = Object.freeze({
   }),
   messagesReady: true,
   messagesLoading: false,
+  transcriptLoadGeneration: 0,
+  transcriptLoadPhase: "idle",
+  _loaded: false,
   streaming: false,
+  streamPhase: "",
   es: null,
   streamingModel: "",
   streamElapsed: 0,
@@ -280,6 +292,65 @@ const TERMINAL_ANSI_THEMES = Object.freeze({
   }),
 });
 
+// Header-less chat resources use short-lived, scope-bound credentials. Keep
+// both resolved tickets and in-flight mint requests in memory only so Alpine
+// re-evaluation cannot duplicate requests or persist bearer URLs.
+const CHAT_RESOURCE_TICKET_CACHE = new Map();
+const CHAT_RESOURCE_TICKET_CACHE_MAX = 256;
+function _pruneChatResourceTicketCache(now) {
+  for (const [key, entry] of CHAT_RESOURCE_TICKET_CACHE) {
+    if (!entry.promise && (!entry.expiresAt || entry.expiresAt <= now)) {
+      CHAT_RESOURCE_TICKET_CACHE.delete(key);
+    }
+  }
+  while (CHAT_RESOURCE_TICKET_CACHE.size >= CHAT_RESOURCE_TICKET_CACHE_MAX) {
+    CHAT_RESOURCE_TICKET_CACHE.delete(
+      CHAT_RESOURCE_TICKET_CACHE.keys().next().value,
+    );
+  }
+}
+
+const CHAT_MUX_STREAM_EVENTS = [
+  "startup", "text", "thinking", "tool_use", "tool_result",
+  "compact_progress", "task_started", "task_progress", "task_notification",
+  "rate_limit", "ask_user_question", "permission_request",
+  "permission_request_resolved", "permission_mode_changed",
+  "permission_mode_change_failed", "ping", "done", "error", "cancelled",
+  "resync",
+];
+const CHAT_MUX_BOOTSTRAP_MAX_EVENTS = 512;
+const CHAT_MUX_BOOTSTRAP_MAX_BYTES = 2 * 1024 * 1024;
+
+class ChatMuxSessionChannel extends EventTarget {
+  constructor(sessionId, turnId, onClose) {
+    super();
+    this.sessionId = sessionId;
+    this.turnId = turnId;
+    this.readyState = 0;
+    this.onopen = null;
+    this._onClose = onClose;
+    this._muxChannel = true;
+  }
+
+  open() {
+    if (this.readyState === 1 || this.readyState === 2) return;
+    this.readyState = 1;
+    const event = new Event("open");
+    if (this.onopen) this.onopen(event);
+    this.dispatchEvent(event);
+  }
+
+  disconnect() {
+    if (this.readyState !== 2) this.readyState = 0;
+  }
+
+  close() {
+    if (this.readyState === 2) return;
+    this.readyState = 2;
+    if (this._onClose) this._onClose(this);
+  }
+}
+
 function portal() {
   return {
     // ===== auth =====
@@ -301,6 +372,15 @@ function portal() {
     _presenceVisibilityHandler: null,
     _presencePagehideHandler: null,
     _sessionsSyncTimer: null,
+    _chatMuxSource: null,
+    _chatMuxChannels: new Map(),
+    _chatMuxPendingEvents: new Map(),
+    _chatMuxAttachPromises: new Map(),
+    _chatMuxStartPromise: null,
+    _chatMuxReconnectTimer: null,
+    _chatMuxReconnectAttempts: 0,
+    _chatMuxSupported: null,
+    _chatMuxConnected: false,
     _splashHintTimer: null,
     _splashHardTimeout: null,
 
@@ -568,8 +648,8 @@ function portal() {
 
     // ===== chat =====
     sessions: [], currentId: "",
-    // Keep a bounded LRU of virtualized transcript panes mounted. The canonical
-    // message repository remains the authority; these are disposable DOM views.
+    // Keep a bounded LRU of transcript panes mounted. Each pane renders an exact-
+    // height messageRange window; the canonical repository remains authoritative.
     _warmTranscriptTabs: [],
     _transcriptPaneLru: [],
     WARM_TRANSCRIPT_LIMIT: 3,
@@ -645,6 +725,9 @@ function portal() {
     _sessionTodoEditOwner: null,
     userTodos: [],
     todoRevision: 0,
+    _todoPushGeneration: 0,
+    _todoPushPending: false,
+    _todoPushPromise: null,
     // Lightweight focus ownership shared by modal/popover surfaces. DOM nodes
     // live here only while their surface is open; the stack ensures a nested
     // managed dialog never restores focus behind the dialog above it.
@@ -672,7 +755,9 @@ function portal() {
       customGroups: [],
       groupOrder: ["__ungrouped__"],
       groupEditor: {
-        open: false, id: "", name: "", color: "blue", saving: false,
+        open: false, id: "", name: "", color: "blue",
+        workspaceId: "", originalWorkspaceId: "", workspacePath: "",
+        workspaceDirty: false, owner: 0, saving: false,
       },
       moveMenu: { show: false, eventId: "", style: "" },
       dragEventId: "",
@@ -683,8 +768,14 @@ function portal() {
       dragOverGroupOrderId: "",
       dragGroupInsertAfter: false,
     },
+    REQUEST_DEADLINE_MS: 8000,
+    SESSION_SYNC_DEADLINE_MS: 35000,
     _activityEtags: {},
+    // A successful full snapshot may legally contain zero events. Track that
+    // ownership separately from rows added by optimistic or live updates.
+    _activityEventsSnapshotLoaded: false,
     _activityFetchPromises: {},
+    _activityFetchControllers: {},
     _activityRequestSeq: 0,
     _activityAppliedSeq: 0,
     _activityGeneration: "",
@@ -692,6 +783,8 @@ function portal() {
     _activityLiveSource: null,
     _activityLiveSeq: 0,
     _activityLiveTimer: null,
+    _activityLiveController: null,
+    _activityLiveFailures: 0,
     _activityLiveVisibilityBound: false,
     _todoLiveSource: null,
     _todoLiveSeq: 0,
@@ -701,6 +794,7 @@ function portal() {
     _activityGroupPending: {},
     _activityGroupOrderSeq: 0,
     _activityGroupOrderQueue: null,
+    _activityGroupEditorSeq: 0,
     // Per-task "run-now" inflight flag — disables retry / send buttons until
     // activity SSE reports a terminal state. Keyed by task id.
     schedRunning: {},
@@ -743,6 +837,9 @@ function portal() {
     // active tab. Tabs can be opened from the session picker, closed via × on
     // the tab, or created by the "+ new" button.
     openTabIds: [],
+    _lastNewSessionAt: 0,
+    _lastNewSessionMeta: null,
+    NEW_SESSION_TOUCH_DEDUPE_MS: 500,
     sessionWorkspaces: [],
     activeWorkspace: "",
     workspaceMenuOpen: false,
@@ -1093,6 +1190,7 @@ function portal() {
       // services are touched only by an explicit probe or an enabled config.
       memory: {
         loading: false, saving: false, probing: false, actionRunning: false,
+        backupRunning: false,
         config: {
           schema_version: 1, mode: "off", owner_id: "default",
           generation_model: "",
@@ -1294,6 +1392,7 @@ function portal() {
         ev.preventDefault();
         ev.stopPropagation();
         if (top === "generic-modal" && this.modal.cancel) this.modal.cancel();
+        else if (top === "activity-move") this.closeActivityMoveMenu(true);
         else if (top === "scheduler") this.closeScheduler();
         else if (top === "session-todo") this.closeSessionTodoBoard();
         else if (top === "activity") this.closeActivityCenter();
@@ -1377,6 +1476,20 @@ function portal() {
       // We hijack Ctrl+T and Ctrl+W from the browser. The user is inside a
       // single-page web app — we own these. (Mobile Safari ignores them.)
       if ((ev.ctrlKey || ev.metaKey) && !ev.altKey) {
+        const shortcutTarget = ev.target || document.activeElement;
+        const shortcutTag = shortcutTarget && shortcutTarget.tagName;
+        const editingOnMobile = this._isMobileLayout() && (
+          shortcutTag === "INPUT"
+          || shortcutTag === "TEXTAREA"
+          || (shortcutTarget && shortcutTarget.isContentEditable)
+        );
+        if (editingOnMobile) {
+          // Mobile keyboards and remote-input bridges can briefly report a
+          // stuck Ctrl/Meta modifier during composition. Never create, close,
+          // or switch chat tabs while the user is editing text.
+          ev.preventDefault();
+          return;
+        }
         if (ev.key === "t" || ev.key === "T") {
           ev.preventDefault();
           this.newSession();
@@ -1411,7 +1524,6 @@ function portal() {
       }
       if (ev.key === "Escape") {
         if (this.memoryRecallPopover.show) { this.closeMemoryRecallPopover(); return; }
-        if (this.activity.moveMenu.show) { this.closeActivityMoveMenu(); return; }
         if (this.cheatSheet.show) { this.cheatSheet.show = false; return; }
         if (this.mentionShow) { this._cancelMentionLookup(); return; }
         if (this.ctxMenu.show) { this.ctxMenu.show = false; return; }
@@ -1462,20 +1574,17 @@ function portal() {
       // double. Cheap to gate at the front; expensive to debug after.
       if (this._initialized) return;
       this._initialized = true;
-      // Prewarm the heavy preview vendor bundles (hljs / katex / mermaid)
-      // during browser idle, AFTER first paint. These are lazy-loaded on
-      // first use, but that cold load + compile (mermaid is ~3.3 MB) runs in
-      // the $nextTick AFTER a markdown preview has already painted — so the
-      // content shows, then the page freezes 2–3 s while the bundle parses.
-      // Warming them up front moves that cost off the click path. Fire-and-
-      // forget; failures fall back to the existing on-demand lazy load.
-      this._prewarmPreviewLibs();
       // 全局快捷键（绑在 document，避免每个 textarea 单独处理）
       document.addEventListener("keydown", e => this.onGlobalKeyDown(e));
       this._registerFocusSurfaceWatchers();
       window.addEventListener("resize", () => {
         this._queueMemoryRecallPosition();
-        if (this.activity.moveMenu.show) this.closeActivityMoveMenu();
+        // A mobile sheet tracks the viewport in CSS and should survive browser
+        // chrome / keyboard resizes. Any menu carrying desktop anchor geometry
+        // must close before that inline position can become stale.
+        if (this.activity.moveMenu.show && this.activity.moveMenu.style) {
+          this.closeActivityMoveMenu(false);
+        }
       });
       // (Cross-tab queue sync via localStorage `storage` events was removed
       // when the queue moved server-side: there's one authoritative copy now,
@@ -1507,6 +1616,13 @@ function portal() {
           this.userTodos = this._normalizeUserTodos(
             localStorage.getItem(key) || "[]",
           );
+          return;
+        }
+        if (ev.key === this._chatTabStoreKey) {
+          // Tab-strip state is shared only by same-origin browser pages. Consume
+          // the newest record without writing it back; each page keeps its own
+          // currentId so another window cannot steal focus.
+          void this._applyChatTabStorageEvent();
         }
       });
       // `pagehide` is bfcache-friendly (unlike an unconditional
@@ -1814,6 +1930,13 @@ function portal() {
     // `scroll-margin-bottom: 16px` on the textarea (see styles.css) leaves a
     // breathing-room gap so the input isn't flush against the keyboard top.
     onChatInputFocus() {
+      // A group-assignment menu is portalled outside the activity backdrop. On
+      // iOS, focusing the composer can resize the visual viewport before the
+      // delayed outside-click closes that fixed layer, leaving the menu（and a
+      // clipped activity row）visible between the composer and keyboard. Composer
+      // focus is an unambiguous return to chat, so close both surfaces first.
+      if (this.activity.moveMenu.show) this.closeActivityMoveMenu();
+      if (this.activity.show) this.closeActivityCenter();
       document.documentElement.style.setProperty("--kb-inset", "0px");
       document.body.classList.add("kb-open");
       this._reconcileMobileViewport();
@@ -1938,8 +2061,17 @@ function portal() {
     _initMobileKeyboardWatch() {
       const vv = window.visualViewport;
       if (vv) {
-        vv.addEventListener("resize", () => this._syncMobileKeyboardViewport());
-        vv.addEventListener("scroll", () => this._syncMobileKeyboardViewport());
+        const onVisualViewportChange = () => {
+          // Desktop menus are tied to a row rect and become stale as the visual
+          // viewport moves. Mobile menus are bottom sheets; keeping them open
+          // avoids an input blur / keyboard dismissal immediately undoing the tap.
+          if (this.activity.moveMenu.show && this.activity.moveMenu.style) {
+            this.closeActivityMoveMenu(false);
+          }
+          this._syncMobileKeyboardViewport();
+        };
+        vv.addEventListener("resize", onVisualViewportChange);
+        vv.addEventListener("scroll", onVisualViewportChange);
       }
       window.addEventListener("resize", () => {
         // A resize can flip the (pointer: coarse) / width breakpoints that
@@ -2076,7 +2208,7 @@ function portal() {
       // and let the reconnect banner take over.
       this._splashHardTimeout = setTimeout(() => {
         if (!this.appReady) {
-          this.appReady = true;
+          this._markReady();
           this.connState = "reconnecting";
         }
       }, 8000);
@@ -2094,6 +2226,12 @@ function portal() {
       })).catch(() => false);
       if (!restoredWorkspaceRegistry) await workspaceRegistryReady;
       const rootOwner = this.fileWorkspacePath();
+      // Context cards are the only network dependency that gates splash
+      // readiness. Dispatch them before the file tree, live transports, session
+      // list and decorative snapshots so a high-latency proxy cannot leave the
+      // critical request queued behind non-visible startup work.
+      const contextReady = Promise.resolve(this.fetchContextInfo());
+      void contextReady.catch(() => false);
       // Attach the rejection handler immediately: the rest of boot awaits
       // context/session work before it observes this promise, and a fast tree
       // failure must never surface as an unhandled rejection in that gap.
@@ -2112,7 +2250,7 @@ function portal() {
       // Chat/session/activity transports do not depend on the file index or
       // context cards. Start them before either slow request; the file stream
       // remains gated on rootReady below so its cursor is always trustworthy.
-      this._startLiveConnections({ fileEvents: false });
+      this._startLiveConnections({ fileEvents: false, activitySnapshot: false });
       this.fetchTerminals({ restore: true });
       // Push-notification deep-link: a turn-done notification opens
       // `/?session=<id>` in a fresh tab. After sessions load, jump to that
@@ -2120,16 +2258,6 @@ function portal() {
       // (the already-open-tab case is handled via the SW postMessage above).
       this._openStartupActivityDeeplink();
       this.initSessions().then(() => this._openStartupSessionDeeplink());
-      this.fetchStats();
-      // Trash badge state — light fetch (just count), gated by token
-      // which is already verified at this point. Fire-and-forget;
-      // failures degrade silently to "no badge styling".
-      this.loadTrash();
-      // Surface any in-flight turns that were cut short by a previous
-      // process death (OOM kill / power loss / manual restart mid-stream).
-      // Fire-and-forget — purely informational, doesn't block boot. Backend
-      // returns [] when nothing was interrupted (the common case).
-      this._checkInterruptedTurns();
       // First-run hint — surface key shortcuts so the user doesn't have to
       // hunt for them. Flagged in localStorage so it only fires once. Short
       // delay lets the splash clear first.
@@ -2161,10 +2289,11 @@ function portal() {
       // settles before we override it back to the user's actual last tab.
       // Desktop ignores mobileTab entirely so this is a no-op there.
       this._restorePendingMobileTab();
-      // Block readiness on context-info (the most important one for the
-      // onboarding cards). Others come along in parallel.
+      // Block readiness on the context request dispatched at the start of boot.
+      // Sessions and the file tree continue independently and reveal their own
+      // loading states instead of holding the whole shell behind a waterfall.
       try {
-        await this.fetchContextInfo();
+        await contextReady;
         this._markReady();
       } catch (e) {
         // Will retry via heartbeat
@@ -2185,16 +2314,19 @@ function portal() {
     // of only after a manual refresh. Both underlying starts are idempotent
     // (clearInterval before re-arming), but this is only ever called once per
     // boot path, so there's no double-start.
-    _startLiveConnections({ fileEvents = true } = {}) {
+    _startLiveConnections({ fileEvents = true, activitySnapshot = true } = {}) {
       this._startHeartbeat();
       this._startPresence();
       this._startSessionsSync();
       if (fileEvents) this._startFileEvents();
-      // Source-aware ACK needs the persisted ledger row on a cold boot.  Run
-      // it after the first snapshot instead of racing an empty events array.
-      Promise.resolve(this.fetchActivity()).finally(
-        () => this.ackCurrentActivity(),
-      );
+      // Source-aware ACK needs the persisted ledger row on a cold boot. Saved-
+      // token boot defers this decorative snapshot until after appReady; first
+      // sign-in keeps the original eager behavior through the default option.
+      if (activitySnapshot) {
+        Promise.resolve(this.fetchActivity()).catch(() => false).finally(
+          () => this.ackCurrentActivity(),
+        );
+      }
       this._startActivityEvents();
       this._startTodoEvents();
       this._startMemoryMonitor();
@@ -2234,12 +2366,46 @@ function portal() {
       }, 10_000);
     },
 
+    _scheduleDeferredBootWork() {
+      if (this._deferredBootWorkScheduled) return;
+      this._deferredBootWorkScheduled = true;
+      const run = () => {
+        // These snapshots decorate an already-usable shell. Keeping them off the
+        // critical path prevents six unrelated endpoints and preview bundles
+        // from competing with context/session startup on tunneled connections.
+        void Promise.resolve(this.fetchActivity()).catch(() => false).finally(
+          () => this.ackCurrentActivity(),
+        );
+        void Promise.resolve(this.fetchStats()).catch(() => false);
+        void Promise.resolve(this.loadTrash()).catch(() => false);
+        void Promise.resolve(this._checkInterruptedTurns()).catch(() => false);
+        this._prewarmPreviewLibs();
+      };
+      const schedule = () => {
+        try {
+          if (typeof window !== "undefined" && window.requestIdleCallback) {
+            window.requestIdleCallback(run, { timeout: 1500 });
+          } else {
+            setTimeout(run, 300);
+          }
+        } catch (_) { setTimeout(run, 300); }
+      };
+      // Give Alpine one frame to remove the splash and paint the usable shell
+      // before any best-effort network or parsing work begins.
+      if (typeof requestAnimationFrame === "function") {
+        requestAnimationFrame(() => requestAnimationFrame(schedule));
+      } else {
+        setTimeout(schedule, 0);
+      }
+    },
+
     _markReady() {
       if (this.appReady) return;
       this.appReady = true;
       clearTimeout(this._splashHintTimer);
       clearTimeout(this._splashHardTimeout);
       this.splashHint = "";
+      this._scheduleDeferredBootWork();
     },
 
     // Friendly "5 min ago" / "刚刚" / "3 h ago" formatter for the
@@ -2386,6 +2552,7 @@ function portal() {
         ping();                  // presence: re-arm push suppression
         this.ackCurrentActivity(); // visible current session is already viewed
         this._pingHealth();      // health: refresh conn state immediately
+        this._resumeVisibleSessionSync();
         // Refresh the session list in case another device created/deleted
         // sessions while this tab was hidden (drives the active-dot state).
         // The tab strip itself is device-local — no cross-device merge.
@@ -3847,6 +4014,22 @@ function portal() {
       const mm = String(d.getMinutes()).padStart(2, "0");
       return hh + ":" + mm;
     },
+    openMessageOutline(ev = null) {
+      if (this.msgOutlineOpen) return;
+      const opener = ev && ev.currentTarget
+        ? ev.currentTarget : document.activeElement;
+      this.msgOutlineOpen = true;
+      this._openFocusSurface(
+        "message-outline", ".msg-outline-panel", ".msg-outline-item",
+        opener, true,
+      );
+      void this.refreshOutlineFromBackend(this.currentId);
+    },
+    closeMessageOutline(restoreFocus = true) {
+      if (!this.msgOutlineOpen && !this._focusSurfaceState["message-outline"]) return;
+      this.msgOutlineOpen = false;
+      this._closeFocusSurface("message-outline", restoreFocus);
+    },
     // Filter messages for the sidebar outline. Returns only user prompts
     // (skipping the auto-injected compact summaries) — they're what the
     // user remembers asking, so they make the best jump targets.
@@ -3854,14 +4037,10 @@ function portal() {
       // Touch reactivity ping so the modal re-renders when backend fetch
       // completes (same mechanism conversationOutline uses).
       const _ = this.outlineVersion;
-      // Fire off a background backend fetch so the list reflects the
-      // FULL session, not just the lazy-loaded visible window. This was
-      // the source of "outline shows only 2 user messages on a 45-user
-      // session" — the original filter walked only the active pane window, which
-      // contains the recent slice after the long-history performance
-      // optimization (commit 664304a).
+      // Opening the dialog explicitly refreshes the full-session cache. Keep
+      // this render-time projection pure so Alpine can evaluate the hidden
+      // x-show subtree during boot without starting network work.
       const sid = this.currentId;
-      if (sid) this.refreshOutlineFromBackend(sid);
       // Primary: backend-sourced list, shaped to look like message
       // objects so the modal template (which calls outlineText(m) and
       // _scrollToUserMsg(m.uuid)) keeps working unchanged.
@@ -3883,6 +4062,7 @@ function portal() {
     async _loadAroundMessage(sid, uuid, retryAfterConflict = true) {
       const st = this.tabState && this.tabState[sid];
       if (!st || !uuid || st.streaming || st.es) return false;
+      const historyReplaceToken = this._beginHistoryReplace(st);
       const limit = this._historyWindowSize();
       const generation = st.messageRange.generation
         ? "&history_generation=" + encodeURIComponent(st.messageRange.generation) : "";
@@ -3900,12 +4080,16 @@ function portal() {
       }
       if (!r.ok) return false;
       const data = await r.json();
-      if (this.tabState[sid] !== st) return false;
+      if (this.tabState[sid] !== st
+          || !this._historyReplaceStillOwns(st, historyReplaceToken)) {
+        return false;
+      }
       const win = this._historyEnvelopes(sid, data.messages || []);
       for (const m of win) {
         if (m.role === "assistant" && m.text && !m.html) m.html = this._renderHistoryMessage(m);
       }
       if (!win.some(m => m.uuid === uuid)) return false;
+      if (!this._historyReplaceStillOwns(st, historyReplaceToken)) return false;
       st.messages.splice(0, st.messages.length, ...win);
       Object.assign(st.messageRange, {
         visibleStart: 0,
@@ -3916,6 +4100,8 @@ function portal() {
         generation: data.history_generation || st.messageRange.generation || "",
         order: data.history_order === "normal" ? "normal" : "full",
       });
+      st.atBottom = false;
+      this._enforceMessageRangeInvariant(st);
       // around_uuid replaces both the repository and its server coordinates.
       this._scheduleHistoryViewport(st, "around", uuid);
       st._hasMoreHistory = st.messageRange.offset > 0;
@@ -4109,6 +4295,15 @@ function portal() {
       if (value === "completed") return this.lang === "zh" ? "已完成" : "Completed";
       if (value === "failed") return this.lang === "zh" ? "失败" : "Failed";
       return this.lang === "zh" ? "已中断" : "Interrupted";
+    },
+    streamPhaseLabel(phase) {
+      const value = String(phase || "");
+      if (value === "tools") return this.t("chat.startup_tools");
+      if (value === "context") return this.t("chat.startup_context");
+      if (["connecting", "accepted", "runtime"].includes(value)) {
+        return this.t("chat.startup_runtime");
+      }
+      return this.turnStatusLabel("running");
     },
     _backgroundTaskCount(state) {
       const own = Number(state && state.backgroundTaskCount);
@@ -5093,6 +5288,161 @@ function portal() {
       // add their registered workspace through fileHdr()/conversationHdr().
       return { "X-Auth-Token": this.token };
     },
+    async _mintChatResourceUrl(resource, fields = {}, fresh = false) {
+      const body = { resource, ...fields };
+      const cacheKey = JSON.stringify(body);
+      if (fresh) CHAT_RESOURCE_TICKET_CACHE.delete(cacheKey);
+      const now = Date.now();
+      _pruneChatResourceTicketCache(now);
+      const cached = CHAT_RESOURCE_TICKET_CACHE.get(cacheKey);
+      if (cached && cached.url && cached.expiresAt > now + 5000) {
+        return cached.url;
+      }
+      if (cached && cached.promise) return await cached.promise;
+
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 8000);
+      const promise = (async () => {
+        const response = await fetch("/api/chat/resource-ticket", {
+          method: "POST",
+          headers: { ...this.hdr(), "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+          signal: controller.signal,
+          cache: "no-store",
+        });
+        if (!response.ok) throw new Error("chat resource ticket unavailable");
+        const data = await response.json();
+        if (!data.url || !String(data.url).startsWith("/api/chat/")) {
+          throw new Error("invalid chat resource ticket response");
+        }
+        CHAT_RESOURCE_TICKET_CACHE.set(cacheKey, {
+          url: data.url,
+          expiresAt: Date.now() + Math.max(1, Number(data.expires_in) || 1) * 1000,
+        });
+        return data.url;
+      })();
+      CHAT_RESOURCE_TICKET_CACHE.set(cacheKey, { promise });
+      try {
+        return await promise;
+      } catch (error) {
+        CHAT_RESOURCE_TICKET_CACHE.delete(cacheKey);
+        throw error;
+      } finally {
+        clearTimeout(timeout);
+      }
+    },
+    _attachmentTicketFields(im) {
+      const raw = String((im && im.url) || "");
+      const match = raw.match(/^\/api\/chat\/attachments\/([^/]+)\/(.+)$/);
+      if (!match) return null;
+      try {
+        return {
+          session_id: decodeURIComponent(match[1]),
+          filename: decodeURIComponent(match[2]),
+        };
+      } catch (_) {
+        return null;
+      }
+    },
+    async _ensureMessageAttachmentUrl(im) {
+      const fields = this._attachmentTicketFields(im);
+      if (!fields) throw new Error("invalid attachment URL");
+      return await this._mintChatResourceUrl("attachment", fields);
+    },
+    messageImageSrc(im) {
+      if (!im) return "";
+      if (im.preview) return im.preview;
+      if (im.thumb) return "data:image/jpeg;base64," + im.thumb;
+      if (im._resourceUrl) return im._resourceUrl;
+      if (im.url && !im._resourceTicketPending) {
+        im._resourceTicketPending = true;
+        this._ensureMessageAttachmentUrl(im)
+          .then(url => { im._resourceUrl = url; })
+          .catch(() => { im._resourceUrl = ""; })
+          .finally(() => { im._resourceTicketPending = false; });
+      }
+      return "";
+    },
+    async openMessageImage(im) {
+      if (!im) return;
+      let src = im.preview || (im.thumb
+        ? "data:image/jpeg;base64," + im.thumb : "");
+      if (im.url) {
+        try {
+          src = await this._ensureMessageAttachmentUrl(im);
+          im._resourceUrl = src;
+        } catch (_) {
+          // A thumbnail/blob remains a safe, useful fallback when the full
+          // original expired or the ticket request briefly failed.
+        }
+      }
+      this.openLightbox(src, im.name);
+    },
+    _abortError(message = "request aborted") {
+      const error = new Error(message);
+      error.name = "AbortError";
+      return error;
+    },
+    async _fetchWithDeadline(
+      url, options = {}, deadlineMs = this.REQUEST_DEADLINE_MS,
+    ) {
+      const upstream = options.signal;
+      if (upstream && upstream.aborted) throw this._abortError();
+      const controller = new AbortController();
+      let rejectControl = null;
+      let settled = false;
+      const control = new Promise((_, reject) => { rejectControl = reject; });
+      const abort = (message) => {
+        if (settled) return;
+        try { controller.abort(); } catch (_) {}
+        rejectControl(this._abortError(message));
+      };
+      const onUpstreamAbort = () => abort("request aborted");
+      if (upstream) {
+        upstream.addEventListener("abort", onUpstreamAbort, { once: true });
+      }
+      const timeoutMs = Math.max(
+        1, Number(deadlineMs) || Number(this.REQUEST_DEADLINE_MS) || 8000,
+      );
+      const timer = setTimeout(
+        () => abort("request deadline exceeded"), timeoutMs,
+      );
+      const fetchOptions = { ...options, signal: controller.signal };
+      try {
+        // Keep the explicit race even though native fetch observes AbortSignal:
+        // test doubles and embedded WebViews are not always abort-cooperative.
+        return await Promise.race([fetch(url, fetchOptions), control]);
+      } finally {
+        settled = true;
+        clearTimeout(timer);
+        if (upstream) {
+          upstream.removeEventListener("abort", onUpstreamAbort);
+        }
+      }
+    },
+    _retryDelay(
+      attempt, { baseMs = 800, maxMs = 30000, jitterMs = 250 } = {},
+    ) {
+      const step = Math.max(1, Math.min(16, Math.floor(Number(attempt) || 1)));
+      const base = Math.min(
+        Math.max(1, Number(maxMs) || 30000),
+        Math.max(1, Number(baseMs) || 800) * Math.pow(2, step - 1),
+      );
+      const jitterCap = Math.max(
+        0, Math.min(Number(jitterMs) || 0, Math.floor(base / 4)),
+      );
+      const jitter = jitterCap
+        ? Math.floor(Math.random() * (jitterCap + 1)) : 0;
+      return base + jitter;
+    },
+    _staticAssetUrl(path) {
+      if (!path || !path.startsWith("/static/") || /[?&]v=/.test(path)) return path;
+      const version = typeof document !== "undefined"
+        ? document.querySelector('meta[name="muselab-asset-version"]')?.content
+        : "";
+      if (!version || version === "__MUSELAB_ASSET_VERSION__") return path;
+      return `${path}${path.includes("?") ? "&" : "?"}v=${encodeURIComponent(version)}`;
+    },
     conversationHdr(path = "") {
       const headers = this.hdr();
       const cwd = path || this.currentWorkspacePath();
@@ -5700,6 +6050,9 @@ function portal() {
     _openFocusSurface(key, rootSelector, initialSelector = "", opener = null,
                       modal = false) {
       if (!key || !rootSelector) return;
+      if (modal && key !== "activity-move" && this.activity.moveMenu.show) {
+        this.closeActivityMoveMenu(false);
+      }
       const owner = opener || document.activeElement;
       this._focusSurfaceState[key] = {
         owner: owner && typeof owner.focus === "function" ? owner : null,
@@ -5880,16 +6233,91 @@ function portal() {
     },
 
     // ===== prefs =====
+    _normalizeOpenTabIds(ids, validIds = null) {
+      const allowed = validIds instanceof Set
+        ? validIds
+        : (validIds ? new Set(validIds) : null);
+      const seen = new Set();
+      return (Array.isArray(ids) ? ids : []).filter(id => {
+        if (typeof id !== "string" || !id || seen.has(id)) return false;
+        if (allowed && !allowed.has(id)) return false;
+        seen.add(id);
+        return true;
+      });
+    },
+
+    _chatTabStoreKey: "muselab_chat_tabs_v1",
+    _chatTabStoreRevision: 0,
+    _readChatTabStore() {
+      const stored = this._getLSJson(this._chatTabStoreKey, null);
+      if (!stored || stored.schema !== 1 || !Array.isArray(stored.openTabIds)) {
+        return null;
+      }
+      return {
+        schema: 1,
+        revision: Math.max(0, Math.floor(Number(stored.revision) || 0)),
+        openTabIds: this._normalizeOpenTabIds(stored.openTabIds),
+      };
+    },
+    _writeChatTabStore(ids = this.openTabIds) {
+      const stored = this._readChatTabStore();
+      const revision = Math.max(
+        this._chatTabStoreRevision,
+        stored ? stored.revision : 0,
+      ) + 1;
+      const openTabIds = this._normalizeOpenTabIds(ids);
+      const ok = this._setLS(this._chatTabStoreKey, JSON.stringify({
+        schema: 1,
+        revision,
+        openTabIds,
+      }));
+      if (ok) this._chatTabStoreRevision = revision;
+      return ok;
+    },
+    _loadChatTabStore(legacyOpenTabIds = []) {
+      const stored = this._readChatTabStore();
+      if (stored) {
+        this._chatTabStoreRevision = stored.revision;
+        this.openTabIds = stored.openTabIds;
+        return;
+      }
+      this.openTabIds = this._normalizeOpenTabIds(legacyOpenTabIds);
+      // Establish the new key even for an empty strip. Once it exists, stale
+      // pages still writing the legacy muselab_prefs field cannot revive tabs.
+      this._writeChatTabStore(this.openTabIds);
+    },
+    async _applyChatTabStorageEvent() {
+      const stored = this._readChatTabStore();
+      if (!stored || stored.revision <= this._chatTabStoreRevision) return;
+      const previousIds = this._normalizeOpenTabIds(this.openTabIds);
+      const previousCurrent = this.currentId;
+      this._chatTabStoreRevision = stored.revision;
+      this.openTabIds = stored.openTabIds;
+      if (!previousCurrent || this.openTabIds.includes(previousCurrent)) return;
+      const previousIndex = previousIds.indexOf(previousCurrent);
+      const currentWorkspace = this.currentWorkspacePath();
+      const sameWorkspace = this.openTabIds.filter(id => {
+        const session = this.sessions.find(row => row.id === id);
+        return !currentWorkspace || (session && session.cwd === currentWorkspace);
+      });
+      const candidates = sameWorkspace.length ? sameWorkspace : this.openTabIds;
+      if (!candidates.length) return;
+      const fallbackIndex = Math.min(
+        Math.max(0, previousIndex), candidates.length - 1,
+      );
+      this.currentId = candidates[fallbackIndex];
+      try { await this.switchSession(); } catch (_) {}
+    },
+
     savePrefs() {
       // Preview-pane state (tabs, selected) persists too so a refresh restores
-      // the exact files the user was looking at — matches the chat-tab strip's
-      // behavior via openTabIds.
+      // the exact files the user was looking at. Chat-tab strip state lives in
+      // muselab_chat_tabs_v1 so unrelated preference saves cannot revive a tab.
       this._setLS("muselab_prefs", JSON.stringify({
-        schema: 9,          // v9 gives the desktop file manager useful room
+        schema: 10,         // v10 moves openTabIds to a versioned standalone key
         model: this.model, defaultModel: this.defaultModel,
         permission: this.permission, defaultPermission: this.defaultPermission,
         currentId: this.currentId,
-        openTabIds: this.openTabIds,
         previewTabs: this.tabs.map(t => this._previewTabSnapshot(t)),
         previewSelected: this.selected,
         previewSurface: this.previewSurface,
@@ -5914,10 +6342,10 @@ function portal() {
         // survives a refresh.
         desktopFullPane: this.desktopFullPane,
       }));
-      // Tab strip / preview tab strip / current tab are now device-local
-      // only (persisted in localStorage above). The cross-device ui-state
-      // sync was removed — it yanked the active tab out from under the user
-      // when another device pushed a different state.
+      // Preview tabs and current focus remain browser-local. The chat tab strip
+      // uses its own same-origin localStorage key; no state is sent to the backend.
+      // Cross-device ui-state stays removed because it yanked the active tab out
+      // from under the user when another device pushed a different state.
     },
 
     _scheduleSavePrefs() {
@@ -5976,7 +6404,9 @@ function portal() {
         else if (typeof p.rightWidth === "number") this.previewWidth = p.rightWidth;
         if (typeof p.showHidden === "boolean") this.showHidden = p.showHidden;
         if (p.currentId) this.currentId = p.currentId;
-        if (Array.isArray(p.openTabIds)) this.openTabIds = p.openTabIds;
+        // The standalone key is authoritative. p.openTabIds is accepted only as
+        // a one-time migration source for users upgrading from schema <= 9.
+        this._loadChatTabStore(p.openTabIds);
         // Preview tabs — restore the strip; the actual content fetch happens
         // lazily when the user clicks back to one (or via restorePreviewSelected
         // which runs once after login).
@@ -6427,7 +6857,10 @@ function portal() {
         newSt._loaded = true;
         newSt.effort = this._normalizeEffort(meta.effort);
         newSt.serviceTier = this._normalizeServiceTier(meta.service_tier);
-        if (!this.openTabIds.includes(meta.id)) this.openTabIds.push(meta.id);
+        if (!this.openTabIds.includes(meta.id)) {
+          this.openTabIds.push(meta.id);
+          this._writeChatTabStore(this.openTabIds);
+        }
         if (this._conversationWorkspaceIsCurrent(ownerWorkspace) && this.currentId === sid) {
           this._captureComposerState(sid);
           this.currentId = meta.id;
@@ -7169,6 +7602,10 @@ function portal() {
         },
         messagesReady: true,
         messagesLoading: false,
+        // Visual ownership for a foreground transcript transition. Canonical
+        // response ownership remains separate in _historyReplaceOwner/_historyEpoch.
+        transcriptLoadGeneration: 0,
+        transcriptLoadPhase: "idle",
         runtimeUiRevision: "",
         // Monotonic per-tab sequence for optimistic/live messages. Historical
         // envelopes use transcript identity; live keys never depend on array index.
@@ -7205,6 +7642,10 @@ function portal() {
                          context_limit_is_estimate: true,
                          context_is_estimate: true },
         streaming: false,
+        // Per-session transport/runtime startup state. This is deliberately
+        // separate from transcriptLoadPhase: an admitted turn keeps resident
+        // history visible and only changes the lightweight pending footer.
+        streamPhase: "",
         // Main ResultMessage may arrive while SDK-native background Agent/Bash
         // tasks keep running. This is a busy state without a live SSE until a
         // task settlement opens a continuation broadcast.
@@ -7256,12 +7697,8 @@ function portal() {
         parentTurnId: "",
         lastEventSeq: 0,
         es: null,
-        // Deduplicate stop taps while the interrupt request is in flight.
-        _stopping: false,
-        // The Stop button settles the visible turn immediately while the backend
-        // interrupt/watchdog confirms asynchronously. This marker suppresses a
-        // duplicate terminal toast and lets a failed /active probe restore truth.
-        _optimisticInterrupt: false,
+        // Exact immutable backend turn whose interrupt is still settling.
+        _stoppingTurnId: "",
         // Abort the POST /stream/start ticket request when Stop is clicked
         // before EventSource exists. Without this, the backend has no active
         // turn/client to interrupt yet and the reply starts after Stop.
@@ -7371,6 +7808,12 @@ function portal() {
         // Single-flight guards for older/newer server windows.
         _fetchingOlder: false,
         _fetchingLater: false,
+        // History responses may complete out of order on the same tab. Replacing
+        // requests advance the epoch so older/later page responses cannot write
+        // stale coordinates into a newer canonical repository.
+        _historyRequestSeq: 0,
+        _historyReplaceOwner: 0,
+        _historyEpoch: 0,
       };
     },
     _ensureTabState(id) {
@@ -7406,8 +7849,18 @@ function portal() {
       if (typeof range.generation !== "string") range.generation = "";
       if (st.messagesReady === undefined) st.messagesReady = true;
       if (st.messagesLoading === undefined) st.messagesLoading = false;
+      if (!Number.isInteger(st.transcriptLoadGeneration)) {
+        st.transcriptLoadGeneration = 0;
+      }
+      if (!["idle", "fetching", "mounting", "settling", "error"]
+          .includes(st.transcriptLoadPhase)) {
+        st.transcriptLoadPhase = "idle";
+      }
       if (st.runtimeUiRevision === undefined) st.runtimeUiRevision = "";
       if (st._fetchingLater === undefined) st._fetchingLater = false;
+      if (!Number.isInteger(st._historyRequestSeq)) st._historyRequestSeq = 0;
+      if (!Number.isInteger(st._historyReplaceOwner)) st._historyReplaceOwner = 0;
+      if (!Number.isInteger(st._historyEpoch)) st._historyEpoch = 0;
       if (!Number.isInteger(st._nextLiveKey)) st._nextLiveKey = 1;
       if (!Number.isInteger(st._virtualStart)) st._virtualStart = -1;
       if (!Number.isInteger(st._virtualEnd)) st._virtualEnd = -1;
@@ -7436,9 +7889,6 @@ function portal() {
       }
       if (st._sessionActivityExpected === undefined) {
         st._sessionActivityExpected = null;
-      }
-      if (st._optimisticInterrupt === undefined) {
-        st._optimisticInterrupt = false;
       }
       if (!Number.isFinite(Number(st._installedCanonicalCount))) {
         st._installedCanonicalCount = 0;
@@ -7480,10 +7930,65 @@ function portal() {
       }
       return st;
     },
+    _sessionSyncNeedsVisibility(reason) {
+      return [
+        "active_probe", "busy_probe", "queue_attach",
+        "background_continuation", "inherited_tasks", "stream_health",
+        "transport_retry", "canonical_replay",
+      ].includes(reason);
+    },
+    _resumeVisibleSessionSync() {
+      if (typeof document !== "undefined"
+          && document.visibilityState !== "visible") return;
+      const now = Date.now();
+      for (const [sid, st] of Object.entries(this.tabState || {})) {
+        const sync = st && st.sessionSync;
+        if (!sync) continue;
+        for (const request of Object.values(sync.pending || {})) {
+          if (this._sessionSyncNeedsVisibility(request.reason)) {
+            request.dueAt = Math.min(Number(request.dueAt) || now, now);
+          }
+        }
+        if (sync.inheritedSourceSid && sync.inheritedTicksLeft > 0) {
+          this._requestSessionSync(sid, "inherited_tasks", {
+            sourceSid: sync.inheritedSourceSid,
+          });
+        }
+        if (sync.backgroundTicksLeft > 0
+            && (st.backgroundActive || this._bgHasRunningCard(sid))) {
+          this._requestSessionSync(sid, "background_continuation");
+        }
+        if (st._canonicalResyncPending) {
+          this._requestSessionSync(sid, "canonical_replay", {
+            minimumWaitMs: 0,
+          });
+        }
+        this._scheduleSessionSync(sid, st);
+      }
+      const sid = this.currentId;
+      const st = sid && this.tabState && this.tabState[sid];
+      if (!st) return;
+      if (st.streaming || st.es) {
+        this._requestSessionSync(sid, "stream_health", { ownerEs: st.es });
+      } else {
+        this._requestSessionSync(sid, "active_probe");
+      }
+    },
     _requestSessionSync(sid, reason, options = {}) {
       const st = sid && this.tabState[sid];
       if (!st || !reason) return Promise.resolve(false);
       const sync = st.sessionSync;
+      const historyLoadKey = reason === "history_load"
+        ? JSON.stringify({
+            full: !!options.loadOptions?.full,
+            quiet: !!options.loadOptions?.quiet,
+            probeActive: options.loadOptions?.probeActive,
+          })
+        : "";
+      if (reason === "history_load" && sync.inFlight?.reason === reason
+          && sync.inFlight.historyLoadKey === historyLoadKey) {
+        return new Promise(resolve => sync.inFlight.waiters.push(resolve));
+      }
       const delayMs = Math.max(0, Number(options.delayMs) || 0);
       const dueAt = Date.now() + delayMs;
       return new Promise(resolve => {
@@ -7533,42 +8038,90 @@ function portal() {
         return false;
       }
       const request = ready[0];
+      if (this._sessionSyncNeedsVisibility(request.reason)
+          && typeof document !== "undefined"
+          && document.visibilityState !== "visible") {
+        request.dueAt = Date.now() + 2000;
+        this._scheduleSessionSync(sid, st);
+        return false;
+      }
       delete sync.pending[request.reason];
       const epoch = sync.epoch;
-      const task = (async () => {
+      const controller = new AbortController();
+      const requestOptions = { ...request.options, signal: controller.signal };
+      const operation = (async () => {
         switch (request.reason) {
           case "active_probe":
-            return await this._probeActiveTurn(sid, st, request.options);
+            return await this._probeActiveTurn(sid, st, requestOptions);
           case "busy_probe":
-            return await this._probeSessionBusy(sid, st, request.options);
+            return await this._probeSessionBusy(sid, st, requestOptions);
           case "queue_attach":
-            return await this._runQueueAttach(sid, st, request.options);
+            return await this._runQueueAttach(sid, st, requestOptions);
           case "background_continuation":
-            return await this._pollBackgroundContinuation(sid, st);
+            return await this._pollBackgroundContinuation(sid, st, requestOptions);
           case "inherited_tasks":
-            return await this._pollInheritedTasks(sid, st, request.options);
+            return await this._pollInheritedTasks(sid, st, requestOptions);
           case "history_revision":
-            return await this._runHistoryRevisionSync(sid, st, request.options);
+            return await this._runHistoryRevisionSync(sid, st, requestOptions);
           case "completed_turn":
-            return await this._runCompletedTurnSync(sid, st, request.options);
+            return await this._runCompletedTurnSync(sid, st, requestOptions);
           case "stream_health":
-            return await this._runStreamHealthSync(sid, st, request.options);
+            return await this._runStreamHealthSync(sid, st, requestOptions);
           case "transport_retry":
-            return typeof request.options.run === "function"
-              ? await request.options.run() : false;
+            return typeof requestOptions.run === "function"
+              ? await requestOptions.run(controller.signal) : false;
           case "canonical_replay":
-            return await this._runCanonicalReplaySync(sid, st, request.options);
+            return await this._runCanonicalReplaySync(sid, st, requestOptions);
           case "history_load":
-            return await this._runSessionHistoryLoad(sid, st, request.options);
+            return await this._runSessionHistoryLoad(sid, st, requestOptions);
           default:
             return false;
         }
       })();
-      sync.inFlight = { reason: request.reason, task };
+      let deadlineTimer = null;
+      let cancelResolve = null;
+      const cancelled = new Promise(resolve => { cancelResolve = resolve; });
+      const onAbort = () => cancelResolve(false);
+      controller.signal.addEventListener("abort", onAbort, { once: true });
+      const configuredDeadline = Math.max(
+        1, Number(this.SESSION_SYNC_DEADLINE_MS) || 35000,
+      );
+      const defaultDeadline = request.reason === "history_load"
+          && request.options.loadOptions?.full
+        ? Math.max(configuredDeadline, 90000) : configuredDeadline;
+      const deadlineMs = Math.max(
+        1,
+        Number(request.options.deadlineMs)
+          || defaultDeadline,
+      );
+      const deadline = new Promise(resolve => {
+        deadlineTimer = setTimeout(() => {
+          try { controller.abort(); } catch (_) {}
+          resolve(false);
+        }, deadlineMs);
+      });
+      const task = Promise.race([operation, cancelled, deadline]);
+      const historyLoadKey = request.reason === "history_load"
+        ? JSON.stringify({
+            full: !!request.options.loadOptions?.full,
+            quiet: !!request.options.loadOptions?.quiet,
+            probeActive: request.options.loadOptions?.probeActive,
+          })
+        : "";
+      sync.inFlight = {
+        reason: request.reason,
+        task,
+        controller,
+        epoch,
+        historyLoadKey,
+        waiters: request.waiters,
+      };
       let result = false;
       try { result = await task; }
       catch (_) { result = false; }
       finally {
+        if (deadlineTimer) clearTimeout(deadlineTimer);
+        controller.signal.removeEventListener("abort", onAbort);
         if (this.tabState[sid] === st && sync.epoch === epoch
             && sync.inFlight && sync.inFlight.task === task) {
           sync.inFlight = null;
@@ -7593,9 +8146,13 @@ function portal() {
     _disposeSessionSync(st) {
       if (!st || !st.sessionSync) return;
       const sync = st.sessionSync;
+      const inFlight = sync.inFlight;
       sync.epoch += 1;
       if (sync.timer) clearTimeout(sync.timer);
       sync.timer = null;
+      if (inFlight && inFlight.controller) {
+        try { inFlight.controller.abort(); } catch (_) {}
+      }
       for (const request of Object.values(sync.pending || {})) {
         (request.waiters || []).forEach(resolve => resolve(false));
       }
@@ -7647,7 +8204,7 @@ function portal() {
       }
       const st = this.tabState && this.tabState[sid];
       if (!st) return zh ? "正在准备会话" : "Preparing the session";
-      if (st._stopping) {
+      if (st._stoppingTurnId) {
         return zh ? "正在中断上一条任务" : "Stopping the previous turn";
       }
       if (st._permissionChangePending) return this.t("perm.switching");
@@ -7733,12 +8290,11 @@ function portal() {
     },
     async _probeSessionBusy(sid, st, options = {}) {
       const session = options.session;
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 8000);
       try {
-        const r = await fetch("/api/chat/sessions/" + sid + "/active", {
-          headers: this.hdr(), signal: controller.signal,
-        });
+        const r = await this._fetchWithDeadline(
+          "/api/chat/sessions/" + sid + "/active",
+          { headers: this.hdr(), signal: options.signal },
+        );
         if (!r.ok) return true;
         const status = await r.json();
         if (this.tabState[sid] !== st) return true;
@@ -7751,7 +8307,7 @@ function portal() {
         return status.background ? true : active;
       } catch (_) {
         return true;
-      } finally { clearTimeout(timeout); }
+      }
     },
     // True when the CSS @media single-pane mobile layout is active —
     // EITHER the viewport is narrow (≤900px) OR we're on a touch device
@@ -7766,7 +8322,9 @@ function portal() {
                  && window.matchMedia("(pointer: coarse) and (max-height: 500px)").matches);
     },
     setMobileTab(next) {
-      if (!["files", "preview", "chat"].includes(next) || next === this.mobileTab) return;
+      if (!["files", "preview", "chat"].includes(next)) return;
+      if (this.activity.moveMenu.show) this.closeActivityMoveMenu();
+      if (next === this.mobileTab) return;
       const previous = this.mobileTab;
       if ((previous === "preview" && next !== "preview")
           || (previous === "chat" && next !== "chat"
@@ -7831,14 +8389,18 @@ function portal() {
     // read-only mirror in st.pendingQueue + st._queuePaused for rendering and
     // refreshes it via _syncQueueFromServer on load / tab-activate / after any
     // turn or mutation. Every mutation below hits an endpoint then re-syncs.
-    async _syncQueueFromServer(sid) {
+    async _syncQueueFromServer(sid, options = {}) {
       if (!sid) return;
       const st = this._ensureTabState(sid);
       const seq = ++st._queueSyncSeq;
       let data;
       try {
-        const r = await fetch("/api/chat/sessions/" + sid + "/queue",
-                               { headers: this.hdr(), cache: "no-store" });
+        const r = await this._fetchWithDeadline(
+          "/api/chat/sessions/" + sid + "/queue",
+          {
+            headers: this.hdr(), cache: "no-store", signal: options.signal,
+          },
+        );
         if (!r.ok) return;   // graceful: leave the current mirror untouched
         data = await r.json();
       } catch (_e) { return; }
@@ -7847,20 +8409,19 @@ function portal() {
       if (revision < (Number(st._queueRevision) || 0)) return;
       st._queueAppliedSeq = seq;
       st._queueRevision = revision;
-      st.pendingQueue = (data.items || []).map(it => {
+      const pendingQueue = (data.items || []).map(it => {
         // FIX ③: the server now resolves each upload id against its in-memory
         // store and returns `attachments: [{id, kind, name, mime, available}]`.
-        // Split them into renderable image thumbnails vs doc chips. `src`
-        // points at the queued-image endpoint (in-memory, token in query so a
-        // bare <img> can load it). Expired ids (available:false) are counted
-        // so the bubble can show "附件已过期".
+        // Split them into renderable image thumbnails vs doc chips. A bare
+        // <img> cannot add X-Auth-Token, so each image gets a short-lived,
+        // id-bound resource ticket below. Expired ids (available:false) are
+        // counted so the bubble can show "附件已过期".
         const atts = it.attachments || [];
-        const tok = encodeURIComponent(this.token || "");
         const images = atts
           .filter(a => a.available && a.kind === "image")
           .map(a => ({
             id: a.id, mime: a.mime || "",
-            src: `/api/chat/queued-image/${a.id}?token=${tok}`,
+            src: "",
           }));
         const docs = atts
           .filter(a => a.available && a.kind !== "image")
@@ -7885,6 +8446,25 @@ function portal() {
           pendingDocs: [],
           enqueuedAt: it.enqueued_at || Date.now(),
         };
+      });
+      st.pendingQueue = pendingQueue;
+      Promise.all(pendingQueue.flatMap(item =>
+        item.images.map(async im => {
+          try {
+            im.src = await this._mintChatResourceUrl("queued-image", {
+              attachment_id: im.id,
+            });
+          } catch (_) {
+            im.unavailable = true;
+          }
+        }))).then(() => {
+        if (this.tabState[sid] !== st || st._queueAppliedSeq !== seq) return;
+        for (const item of pendingQueue) {
+          const failed = item.images.filter(im => !im.src).length;
+          item.images = item.images.filter(im => im.src);
+          item.expiredCount += failed;
+        }
+        st.pendingQueue = [...pendingQueue];
       });
       st._queuePaused = !!data.paused;
     },
@@ -8200,6 +8780,7 @@ function portal() {
           id => id !== sourceSid && id !== childSid);
         if (tabIndex >= 0) this.openTabIds.splice(
           Math.min(tabIndex, this.openTabIds.length), 0, childSid);
+        this._writeChatTabStore(this.openTabIds);
         this._disposeSessionSync(sourceState);
         if (sourceState._streamTimer) clearInterval(sourceState._streamTimer);
         sourceState._streamTimer = null;
@@ -8295,7 +8876,7 @@ function portal() {
       if (this.tabState[childSid] !== st) return false;
       const sync = st.sessionSync;
       const sourceSid = String(options.sourceSid || sync.inheritedSourceSid || "");
-      if (!sourceSid || sync.inheritedTicksLeft-- <= 0) {
+      if (!sourceSid) {
         sync.inheritedSourceSid = "";
         return false;
       }
@@ -8306,20 +8887,25 @@ function portal() {
           });
         }
       };
+      if (typeof document !== "undefined"
+          && document.visibilityState !== "visible") {
+        again();
+        return true;
+      }
+      if (sync.inheritedTicksLeft-- <= 0) {
+        sync.inheritedSourceSid = "";
+        return false;
+      }
       let status = null;
-      const controller = new AbortController();
-      const timeout = setTimeout(
-        () => controller.abort(),
-        Math.max(100, Number(this._sessionListTimeoutMs) || 8000),
-      );
       try {
-        const r = await fetch(
+        const r = await this._fetchWithDeadline(
           `/api/chat/sessions/${encodeURIComponent(sourceSid)}/active`,
-          { headers: this.hdr(), signal: controller.signal },
+          { headers: this.hdr(), signal: options.signal },
+          Math.max(100, Number(this._sessionListTimeoutMs) || 8000),
         );
         if (r.ok) status = await r.json();
       } catch (_) { /* retry below */ }
-      finally { clearTimeout(timeout); }
+      if (options.signal?.aborted) return false;
       if (this.tabState[childSid] !== st || sync.inheritedSourceSid !== sourceSid) {
         return false;
       }
@@ -8342,7 +8928,7 @@ function portal() {
             .map(message => String(message.runtime_event_id)),
         );
         const loaded = await this.loadSession(childSid, {
-          quiet: true, probeActive: false,
+          quiet: true, probeActive: false, signal: options.signal,
         });
         if (this.tabState[childSid] !== st) return false;
         if (!loaded) { again(); return false; }
@@ -8371,7 +8957,9 @@ function portal() {
       if (!Number.isFinite(reported) || reported !== 0) { again(); return false; }
       if (st.streaming || st.es || st.compacting) { again(); return true; }
       const loaded = adoptedRevision && !loadedCanonicalThisTick
-        ? await this.loadSession(childSid, { quiet: true, probeActive: false })
+        ? await this.loadSession(childSid, {
+            quiet: true, probeActive: false, signal: options.signal,
+          })
         : true;
       if (this.tabState[childSid] !== st) return false;
       if (!loaded || (desiredRevision && st.runtimeUiRevision !== desiredRevision)) {
@@ -8385,6 +8973,35 @@ function portal() {
       sync.inheritedTicksLeft = 0;
       return true;
     },
+    _activeTurnUserSignature(text = "", images = [], docs = []) {
+      const normalize = (value, seen = new WeakSet()) => {
+        if (value === null || typeof value === "string"
+            || typeof value === "boolean") return value;
+        if (typeof value === "number") {
+          return Number.isFinite(value) ? value : String(value);
+        }
+        if (typeof value === "undefined") return null;
+        if (Array.isArray(value)) {
+          return value.map(item => normalize(item, seen));
+        }
+        if (typeof value === "object") {
+          if (seen.has(value)) return "[circular]";
+          seen.add(value);
+          const normalized = {};
+          Object.keys(value).sort().forEach((key) => {
+            normalized[key] = normalize(value[key], seen);
+          });
+          seen.delete(value);
+          return normalized;
+        }
+        return String(value);
+      };
+      return JSON.stringify(normalize({
+        text: String(text || ""),
+        images: Array.isArray(images) ? images : [],
+        docs: Array.isArray(docs) ? docs : [],
+      }));
+    },
     _installActiveTurnUser(st, turnId, text = "", images = [], docs = []) {
       if (!st || !(text || images.length || docs.length)) return null;
       const messages = st.messages || [];
@@ -8392,19 +9009,17 @@ function portal() {
         ? messages.find(message => message && message.role === "user"
           && message._turnId === turnId)
         : null;
-      let lastUser = null;
-      for (let i = messages.length - 1; i >= 0; i -= 1) {
-        if (messages[i] && messages[i].role === "user") {
-          lastUser = messages[i];
-          break;
-        }
-      }
+      const tailUser = messages[messages.length - 1];
       // A canonical history load may already have installed this prompt without
-      // MuseLab's live turn id. Adopt that newest matching row before appending.
-      if (!turnUser && turnId && lastUser && !lastUser._turnId
-          && (lastUser.text || "") === text) {
-        lastUser._turnId = turnId;
-        turnUser = lastUser;
+      // MuseLab's live turn id. Only the physical tail can belong to the active
+      // turn, and the complete prompt envelope must match before it is adopted.
+      if (!turnUser && turnId && tailUser && tailUser.role === "user"
+          && !tailUser._turnId
+          && this._activeTurnUserSignature(
+            tailUser.text, tailUser.images, tailUser.docs,
+          ) === this._activeTurnUserSignature(text, images, docs)) {
+        tailUser._turnId = turnId;
+        turnUser = tailUser;
       }
       let appended = false;
       if (!turnUser) {
@@ -8435,14 +9050,14 @@ function portal() {
       if (st0 !== ownerState) return false;
       if (this.currentId !== sid || this.activeSessionPane().streaming) {
         if (st0) st0._draining = false;
-        this._syncQueueFromServer(sid);
+        this._syncQueueFromServer(sid, options);
         return;
       }
       // _draining suppresses the idle "Queue waiting" banner during the brief
       // poll window between a turn's `done` and the server starting the next
       // queued turn — otherwise the banner flashes for ~350ms each drain step.
       if (st0) st0._draining = true;
-      await this._syncQueueFromServer(sid);
+      await this._syncQueueFromServer(sid, options);
       const st = this.tabState[sid];
       const expect = !!(st && st.pendingQueue && st.pendingQueue.length && !st._queuePaused);
       let active = false, startedAt = 0, turnId = "";
@@ -8451,8 +9066,10 @@ function portal() {
       let background = false, attachable = true, backgroundTaskCount = 0;
       let activitySource = "";
       try {
-        const r = await fetch("/api/chat/sessions/" + sid + "/active",
-                               { headers: this.hdr() });
+        const r = await this._fetchWithDeadline(
+          "/api/chat/sessions/" + sid + "/active",
+          { headers: this.hdr(), signal: options.signal },
+        );
         if (r.ok) {
           const d = await r.json();
           active = !!d.active; startedAt = d.started_at;
@@ -8468,6 +9085,10 @@ function portal() {
           uDocs = d.user_docs || [];
         }
       } catch (_e) {}
+      if (options.signal?.aborted) {
+        if (st) st._draining = false;
+        return false;
+      }
       // A server-drained queue turn may be shorter than this poll interval. In
       // that case there is no live broadcast left to attach to: /active returns
       // inactive + activity_source=queued, while the queue has already ACKed the
@@ -8485,7 +9106,7 @@ function portal() {
       if (activitySource === "queued"
           && queuedReconcileKey !== reconciledQueuedTurnId) {
         const loaded = await this.loadSession(sid, {
-          quiet: true, probeActive: false,
+          quiet: true, probeActive: false, signal: options.signal,
         });
         if (this.tabState[sid] !== st || this.currentId !== sid) {
           if (this.tabState[sid] === st) st._draining = false;
@@ -8662,11 +9283,10 @@ function portal() {
       }
       this._requestSessionSync(sid, "background_continuation");
     },
-    async _pollBackgroundContinuation(sid, st) {
+    async _pollBackgroundContinuation(sid, st, options = {}) {
       if (this.tabState[sid] !== st) return false;
       const sync = st.sessionSync;
-      if (sync.backgroundTicksLeft-- <= 0
-          || (!this._bgHasRunningCard(sid) && !st.backgroundActive)) {
+      if (!this._bgHasRunningCard(sid) && !st.backgroundActive) {
         this._stopBgContPoller(sid);
         return false;
       }
@@ -8680,51 +9300,52 @@ function portal() {
         again();
         return true;
       }
+      if (sync.backgroundTicksLeft-- <= 0) {
+        this._stopBgContPoller(sid);
+        return false;
+      }
       if (this.currentId !== sid || st.streaming || st.es) {
         again();
         return true;
       }
       let contFound = false;
       try {
-        const controller = new AbortController();
-        const timeout = setTimeout(
-          () => controller.abort(),
+        const r = await this._fetchWithDeadline(
+          "/api/chat/sessions/" + sid + "/active",
+          { headers: this.hdr(), signal: options.signal },
           Math.max(100, Number(this._sessionListTimeoutMs) || 8000),
         );
-        try {
-          const r = await fetch("/api/chat/sessions/" + sid + "/active", {
-            headers: this.hdr(), signal: controller.signal,
-          });
-          if (r.ok) {
-            const d = await r.json();
-            if (d.background && d.active) {
-              this._setBackgroundTaskActive(
-                sid, true, d.started_at, d.background_tasks_pending);
-            } else if (!d.active) {
-              this._setBackgroundTaskActive(sid, false);
-            }
-            if (d.active && d.continuation && !st.streaming && !st.es
-                && this.currentId === sid) {
-              this._consumedConts = this._consumedConts || {};
-              const ckey = sid + ":" + (d.turn_id || d.started_at);
-              if (!this._consumedConts[ckey]) {
-                this._consumedConts[ckey] = true;
-                contFound = true;
-                this.send({ reconnect: true, continuation: true,
-                            sessionId: sid, turnId: d.turn_id || "",
-                            startedAt: d.started_at });
-              }
+        if (r.ok) {
+          const d = await r.json();
+          if (d.background && d.active) {
+            this._setBackgroundTaskActive(
+              sid, true, d.started_at, d.background_tasks_pending);
+          } else if (!d.active) {
+            this._setBackgroundTaskActive(sid, false);
+          }
+          if (d.active && d.continuation && !st.streaming && !st.es
+              && this.currentId === sid) {
+            this._consumedConts = this._consumedConts || {};
+            const ckey = sid + ":" + (d.turn_id || d.started_at);
+            if (!this._consumedConts[ckey]) {
+              this._consumedConts[ckey] = true;
+              contFound = true;
+              this.send({ reconnect: true, continuation: true,
+                          sessionId: sid, turnId: d.turn_id || "",
+                          startedAt: d.started_at });
             }
           }
-        } finally { clearTimeout(timeout); }
+        }
       } catch (_) { /* fallback cadence below */ }
+      if (options.signal?.aborted) return false;
       if (this.tabState[sid] !== st) return false;
       sync.backgroundTickN = (Number(sync.backgroundTickN) || 0) + 1;
       if (!contFound && sync.backgroundTickN % 16 === 0) {
         try {
-          const hr = await fetch("/api/chat/sessions/" + sid + "?tail=80", {
-            headers: this.hdr(),
-          });
+          const hr = await this._fetchWithDeadline(
+            "/api/chat/sessions/" + sid + "?tail=80",
+            { headers: this.hdr(), signal: options.signal },
+          );
           if (hr.ok) {
             const hs = await hr.json();
             if (this.tabState[sid] !== st) return false;
@@ -8802,6 +9423,7 @@ function portal() {
         && !ownerState.streaming && !ownerState.es;
       if (!stillOwned()) return false;
       const retry = () => {
+        if (options.signal?.aborted) return;
         const next = {
           expectedText, expectedAssistantUuid, attempt: attempt + 1,
         };
@@ -8812,12 +9434,10 @@ function portal() {
           });
         }
       };
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 8000);
       try {
-        const activeResponse = await fetch(
+        const activeResponse = await this._fetchWithDeadline(
           "/api/chat/sessions/" + sid + "/active",
-          { headers: this.hdr(), signal: controller.signal },
+          { headers: this.hdr(), signal: options.signal },
         );
         if (!stillOwned()) return false;
         let activity = null;
@@ -8828,9 +9448,9 @@ function portal() {
           return false;
         }
         const reconcileTail = this._historyReconcileWindowSize();
-        const historyResponse = await fetch(
+        const historyResponse = await this._fetchWithDeadline(
           "/api/chat/sessions/" + sid + "?tail=" + reconcileTail,
-          { headers: this.hdr(), signal: controller.signal },
+          { headers: this.hdr(), signal: options.signal },
         );
         if (!stillOwned()) return false;
         if (!historyResponse.ok) { retry(); return false; }
@@ -8853,19 +9473,18 @@ function portal() {
         const hasBoundary = canonicalTurn.some(
           m => m && m.role !== "user" && m.uuid,
         );
-        const hasExpectedAssistant = !expectedAssistantUuid
-          || canonicalTurn.some(m => m && m.uuid === expectedAssistantUuid);
         const hasFinal = expectedAssistantUuid
-          ? hasExpectedAssistant
-          : (!expectedText || canonicalTurn.some(
+          ? canonicalTurn.some(m => m && m.uuid === expectedAssistantUuid)
+          : !!expectedText && canonicalTurn.some(
               m => m && m.role === "assistant" && m.uuid
                 && (m.text || "") === expectedText,
-            ));
+            );
         if (!hasBoundary || !hasFinal) { retry(); return false; }
         if (!stillOwned()) return false;
         const loaded = await this.loadSession(sid, {
           quiet: true, probeActive: false,
           minimumTail: completedTurnWindow,
+          signal: options.signal,
         });
         if (!loaded) retry();
         else {
@@ -8876,7 +9495,7 @@ function portal() {
       } catch (_) {
         retry();
         return false;
-      } finally { clearTimeout(timeout); }
+      }
     },
     _reconcileCompletedContinuation(
       sid, ownerState, expectedText = "", attempt = 0, expectedAssistantUuid = "",
@@ -9093,9 +9712,9 @@ function portal() {
       this._fetchTabUsage(id);
     },
 
-    // Retain ten recently-used virtualized transcript panes. Each pane mounts
-    // only its viewport rows/spacers, so this avoids repeated Alpine/Markdown DOM
-    // reconstruction without retaining a second full-history representation.
+    // Retain a bounded set of recently-used virtualized transcript panes. Stream
+    // transport/state outlives its pane, so inactive live sessions must obey the
+    // same limit instead of keeping an unbounded hidden Alpine tree mounted.
     _touchTranscriptPane(id) {
       if (!id) return false;
       const open = new Set(this.workspaceOpenTabIds());
@@ -9105,18 +9724,8 @@ function portal() {
       const previousLru = (this._transcriptPaneLru || []).filter(tid => open.has(tid));
       const lru = [id, ...previousLru.filter(tid => tid !== id)];
       this._transcriptPaneLru = lru;
-      // A background stream keeps mutating its pane. Never evict that live DOM;
-      // once it settles, the next activation naturally trims it by LRU again.
-      const streaming = Array.from(open).filter(tid => {
-        const st = this.tabState && this.tabState[tid];
-        return st && (st.streaming || st.es);
-      });
-      const streamingSet = new Set(streaming);
       const warmLimit = this._isMobileLayout() ? 1 : this.WARM_TRANSCRIPT_LIMIT;
-      const ordinary = lru
-        .filter(tid => !streamingSet.has(tid))
-        .slice(0, warmLimit);
-      const desired = [...ordinary, ...streaming];
+      const desired = lru.slice(0, warmLimit);
       const desiredSet = new Set(desired);
       // Preserve mount order for panes that remain warm. Reordering the x-for on
       // every click would physically move several large DOM subtrees and recreate
@@ -9164,6 +9773,98 @@ function portal() {
     // root compatibility accessors. Every read resolves through the tab owner.
     activeSessionPane() {
       return this.paneState(this.currentId) || _EMPTY_ACTIVE_SESSION_PANE;
+    },
+    transcriptLoadingVisible() {
+      const st = this.activeSessionPane();
+      if (!this._sessionsInitialized && this.appReady && this.token) return true;
+      if (st?.transcriptLoadPhase === "error") return false;
+      return !!st && (
+        ["fetching", "mounting", "settling"].includes(st.transcriptLoadPhase)
+        || st.messagesLoading === true
+        || (st.messagesReady === false
+          && Array.isArray(st.messages) && st.messages.length > 0)
+      );
+    },
+    transcriptLoadFailed() {
+      const st = this.activeSessionPane();
+      return !!st && st.transcriptLoadPhase === "error";
+    },
+    transcriptEmptyReady() {
+      const st = this.activeSessionPane();
+      return !!st
+        && st._loaded === true
+        && st.messagesReady === true
+        && st.messagesLoading === false
+        && st.transcriptLoadPhase === "idle"
+        && Array.isArray(st.messages)
+        && !st.messages.length;
+    },
+    _beginTranscriptLoad(sid, st, phase = "fetching") {
+      if (!sid || !st || this.tabState[sid] !== st || st._sid !== sid) return null;
+      if ((st.streaming || st.es) && phase !== "mounting") return null;
+      st.transcriptLoadGeneration =
+        (Number(st.transcriptLoadGeneration) || 0) + 1;
+      st.transcriptLoadPhase = phase === "mounting" ? "mounting" : "fetching";
+      return { sid, state: st, generation: st.transcriptLoadGeneration };
+    },
+    _ownsTranscriptLoad(token) {
+      return !!token
+        && this.tabState[token.sid] === token.state
+        && token.state._sid === token.sid
+        && token.state.transcriptLoadGeneration === token.generation;
+    },
+    async _settleTranscriptLoad(token, options = {}) {
+      if (!this._ownsTranscriptLoad(token)) return false;
+      token.state.transcriptLoadPhase = "settling";
+      try {
+        if (!options.skipNextTick) {
+          await new Promise(resolve => this.$nextTick(resolve));
+          if (!this._ownsTranscriptLoad(token)) return false;
+        }
+        if (this.currentId === token.sid && options.returnToLatest !== false) {
+          const latest = await this.returnToLatest(token.sid);
+          if (!latest) throw new Error("transcript tail unavailable");
+          if (!this._ownsTranscriptLoad(token)) return false;
+        }
+        if (this.currentId === token.sid) {
+          if (options.singlePaint && typeof requestAnimationFrame === "function") {
+            await new Promise(resolve => requestAnimationFrame(resolve));
+          } else {
+            await new Promise(resolve => this._afterPaint(resolve));
+          }
+          if (!this._ownsTranscriptLoad(token)) return false;
+        }
+        token.state.transcriptLoadPhase = "idle";
+        return true;
+      } catch (_) {
+        this._failTranscriptLoad(token);
+        return false;
+      }
+    },
+    _failTranscriptLoad(token) {
+      if (!this._ownsTranscriptLoad(token)) return false;
+      // The phase is the visual transaction authority. Clear the legacy loading
+      // gates too so an overlapping history attempt cannot leave the opaque
+      // shield above the resident-content error banner.
+      token.state.messagesLoading = false;
+      token.state.messagesReady = true;
+      token.state.transcriptLoadPhase = "error";
+      return true;
+    },
+    _releaseTranscriptLoadForLive(st) {
+      if (!st) return;
+      st.transcriptLoadGeneration =
+        (Number(st.transcriptLoadGeneration) || 0) + 1;
+      st.transcriptLoadPhase = "idle";
+    },
+    async retryTranscriptLoad() {
+      const sid = this.currentId;
+      const st = sid && this.tabState[sid];
+      if (!sid || !st || st.streaming || st.es
+          || ["fetching", "mounting", "settling"]
+            .includes(st.transcriptLoadPhase)) return false;
+      if (!st.messages.length) st._loaded = false;
+      return await this._ensureSessionLoaded(sid);
     },
     _setActiveSessionPaneField(field, value) {
       const st = this.paneState(this.currentId);
@@ -9317,24 +10018,372 @@ function portal() {
       void forceTail;
     },
     _scheduleMessageViewportSync(tid = this.currentId, forceTail = false) {
-      const st = tid && this.tabState && this.tabState[tid];
-      if (!st) return;
-      st._virtualForceTail = st._virtualForceTail || forceTail;
-      if (st._virtualSyncFrame) return;
-      const run = () => {
-        st._virtualSyncFrame = 0;
-        const shouldForceTail = st._virtualForceTail;
-        st._virtualForceTail = false;
-        this._syncMessageViewport(tid, shouldForceTail);
-      };
-      st._virtualSyncFrame = typeof requestAnimationFrame === "function"
-        ? requestAnimationFrame(run) : setTimeout(run, 0);
+      // Exact-height messageRange windows need no estimated spacer maintenance.
+      void tid;
+      void forceTail;
     },
     _shiftMessageVirtualWindow(st, delta) {
       if (!st || !delta || st._virtualStart < 0) return;
       st._virtualStart += delta;
       st._virtualEnd += delta;
       st._virtualRevision++;
+    },
+
+    _chatMuxCheckpoints() {
+      const rows = [];
+      const seen = new Set();
+      for (const [sid, channel] of this._chatMuxChannels) {
+        if (!channel || channel.readyState === 2) continue;
+        const st = this.tabState && this.tabState[sid];
+        const turnId = String((st && st.activeTurnId) || channel.turnId || "");
+        if (!turnId) continue;
+        rows.push({
+          session_id: sid,
+          turn_id: turnId,
+          last_event_seq: Math.max(0, Number(st && st.lastEventSeq) || 0),
+        });
+        seen.add(sid);
+      }
+      for (const meta of (this.sessions || [])) {
+        if (!meta || !meta.active || seen.has(meta.id)) continue;
+        const st = this.tabState && this.tabState[meta.id];
+        const turnId = String((st && st.activeTurnId) || meta.turn_id || "");
+        if (!turnId) continue;
+        rows.push({
+          session_id: meta.id,
+          turn_id: turnId,
+          last_event_seq: Math.max(0, Number(st && st.lastEventSeq) || 0),
+        });
+      }
+      return rows;
+    },
+    async _bootstrapChatMuxHistory() {
+      const active = (this.sessions || []).filter(meta => meta && meta.active && meta.id);
+      const concurrency = this._isMobileLayout() ? 1 : 2;
+      let next = 0;
+      const worker = async () => {
+        while (next < active.length) {
+          const meta = active[next++];
+          const st = this._ensureTabState(meta.id);
+          if (st.streaming || st.es || st._loaded) continue;
+          try {
+            await this.loadSession(meta.id, { quiet: true, probeActive: false });
+          } catch (_) { /* the mux replay remains authoritative */ }
+        }
+      };
+      await Promise.all(Array.from(
+        { length: Math.min(concurrency, active.length) }, () => worker()));
+    },
+    _setChatMuxUnsupported() {
+      this._chatMuxSupported = false;
+      this._chatMuxConnected = false;
+      if (this._chatMuxReconnectTimer) clearTimeout(this._chatMuxReconnectTimer);
+      this._chatMuxReconnectTimer = null;
+      try { if (this._chatMuxSource) this._chatMuxSource.close(); } catch (_) {}
+      this._chatMuxSource = null;
+      for (const channel of this._chatMuxChannels.values()) channel.disconnect();
+    },
+    _scheduleChatMuxReconnect() {
+      if (this._chatMuxSupported === false || !this.token
+          || this._chatMuxReconnectTimer) return;
+      const attempts = ++this._chatMuxReconnectAttempts;
+      const delay = Math.min(10_000, 500 * (2 ** Math.min(attempts - 1, 4)));
+      this._chatMuxReconnectTimer = setTimeout(() => {
+        this._chatMuxReconnectTimer = null;
+        void this._ensureChatMux({ reconnect: true });
+      }, delay);
+    },
+    async _ensureChatMux(options = {}) {
+      if (this._chatMuxSupported === false || !this.token
+          || typeof EventSource === "undefined") return false;
+      if (this._chatMuxStartPromise) return await this._chatMuxStartPromise;
+      if (this._chatMuxSource && !options.reconnect) {
+        return this._chatMuxConnected;
+      }
+      this._chatMuxStartPromise = this._openChatMux();
+      try {
+        return await this._chatMuxStartPromise;
+      } finally {
+        this._chatMuxStartPromise = null;
+      }
+    },
+    async _openChatMux() {
+      try { if (this._chatMuxSource) this._chatMuxSource.close(); } catch (_) {}
+      this._chatMuxSource = null;
+      this._chatMuxConnected = false;
+      for (const channel of this._chatMuxChannels.values()) channel.disconnect();
+      let response;
+      try {
+        response = await fetch("/api/chat/stream/mux/start", {
+          method: "POST",
+          headers: Object.assign({ "Content-Type": "application/json" }, this.hdr()),
+          body: JSON.stringify({
+            checkpoints: this._chatMuxCheckpoints(),
+            mobile: this._isMobileLayout(),
+          }),
+        });
+      } catch (_) {
+        this._scheduleChatMuxReconnect();
+        return false;
+      }
+      if (response.status === 404 || response.status === 405) {
+        this._setChatMuxUnsupported();
+        return false;
+      }
+      if (!response.ok) {
+        this._scheduleChatMuxReconnect();
+        return false;
+      }
+      let payload;
+      try { payload = await response.json(); } catch (_) { payload = {}; }
+      if (!payload.ticket) {
+        this._scheduleChatMuxReconnect();
+        return false;
+      }
+      this._chatMuxSupported = true;
+      const source = new EventSource(
+        "/api/chat/stream/mux?ticket=" + encodeURIComponent(payload.ticket));
+      this._chatMuxSource = source;
+      let openSettled = false;
+      let settleOpen;
+      const opened = new Promise(resolve => { settleOpen = resolve; });
+      const finishOpen = value => {
+        if (openSettled) return;
+        openSettled = true;
+        settleOpen(value);
+      };
+      const openTimeout = setTimeout(() => {
+        if (this._chatMuxSource !== source || this._chatMuxConnected) return;
+        try { source.close(); } catch (_) {}
+        this._chatMuxSource = null;
+        finishOpen(false);
+        this._scheduleChatMuxReconnect();
+      }, 5000);
+      source.onopen = () => {
+        if (this._chatMuxSource !== source) return;
+        clearTimeout(openTimeout);
+        this._chatMuxConnected = true;
+        this._chatMuxReconnectAttempts = 0;
+        finishOpen(true);
+        for (const channel of this._chatMuxChannels.values()) {
+          if (channel._activated) channel.open();
+        }
+      };
+      source.addEventListener("session_state", ev => {
+        if (this._chatMuxSource !== source) return;
+        let state = {};
+        try { state = JSON.parse(ev.data) || {}; } catch (_) {}
+        void this._handleChatMuxSessionState(state);
+      });
+      for (const type of CHAT_MUX_STREAM_EVENTS) {
+        source.addEventListener(type, ev => {
+          if (this._chatMuxSource !== source) return;
+          if (type === "error" && (ev.data === undefined || ev.data === "")) {
+            this._handleChatMuxDisconnect(source);
+            return;
+          }
+          if (type === "ping" && !ev.data) {
+            for (const channel of this._chatMuxChannels.values()) {
+              if (channel._activated && channel.readyState !== 2) {
+                channel.dispatchEvent(new MessageEvent("ping", { data: "" }));
+              }
+            }
+            return;
+          }
+          this._dispatchChatMuxEvent(type, ev.data);
+        });
+      }
+      source.onerror = ev => {
+        if (ev && ev.data !== undefined && ev.data !== "") return;
+        clearTimeout(openTimeout);
+        finishOpen(false);
+        this._handleChatMuxDisconnect(source);
+      };
+      return await opened;
+    },
+    _handleChatMuxDisconnect(source) {
+      if (this._chatMuxSource !== source) return;
+      try { source.close(); } catch (_) {}
+      this._chatMuxSource = null;
+      this._chatMuxConnected = false;
+      for (const channel of this._chatMuxChannels.values()) channel.disconnect();
+      // The per-session reducers retain logical ownership while the one native
+      // transport reconnects. In particular, do not synthesize `error`/`done`.
+      this._scheduleChatMuxReconnect();
+    },
+    _queueChatMuxEvent(sid, type, data) {
+      let pending = this._chatMuxPendingEvents.get(sid);
+      if (!pending) {
+        pending = [];
+        pending._bytes = 0;
+      }
+      const bytes = String(data || "").length;
+      if (pending.length >= CHAT_MUX_BOOTSTRAP_MAX_EVENTS
+          || pending._bytes + bytes > CHAT_MUX_BOOTSTRAP_MAX_BYTES) {
+        if (!pending._overflowed) {
+          pending.length = 0;
+          pending._bytes = 0;
+          pending._overflowed = true;
+          pending.push({
+            type: "resync",
+            data: JSON.stringify({
+              session_id: sid,
+              reason: "bootstrap_overflow",
+              fallback: "canonical_history",
+              retryable: false,
+            }),
+          });
+        }
+      } else if (!pending._overflowed) {
+        pending.push({ type, data });
+        pending._bytes += bytes;
+      }
+      this._chatMuxPendingEvents.set(sid, pending);
+    },
+    _dispatchChatMuxEvent(type, data) {
+      let payload = null;
+      try { payload = JSON.parse(data); } catch (_) {}
+      const sid = String(payload && payload.session_id || "");
+      if (!sid) return;
+      const turnId = String(payload.turn_id || "");
+      const channel = this._chatMuxChannels.get(sid);
+      if (!channel || !channel._activated
+          || (channel.turnId && turnId && channel.turnId !== turnId)) {
+        this._queueChatMuxEvent(sid, type, data);
+        return;
+      }
+      channel.dispatchEvent(new MessageEvent(type, { data }));
+    },
+    _chatMuxChannel(sid, turnId) {
+      const existing = this._chatMuxChannels.get(sid);
+      if (existing && existing.readyState !== 2
+          && (!turnId || !existing.turnId || existing.turnId === turnId)) {
+        if (!existing.turnId && turnId) existing.turnId = turnId;
+        return existing;
+      }
+      if (existing) existing.close();
+      const channel = new ChatMuxSessionChannel(sid, turnId, closed => {
+        if (this._chatMuxChannels.get(sid) === closed) {
+          this._chatMuxChannels.delete(sid);
+        }
+      });
+      this._chatMuxChannels.set(sid, channel);
+      return channel;
+    },
+    _activateChatMuxChannel(channel) {
+      if (!channel || channel.readyState === 2) return;
+      channel._activated = true;
+      if (this._chatMuxConnected) channel.open();
+      const pending = this._chatMuxPendingEvents.get(channel.sessionId) || [];
+      this._chatMuxPendingEvents.delete(channel.sessionId);
+      for (const event of pending) {
+        let payload = null;
+        try { payload = JSON.parse(event.data); } catch (_) {}
+        const turnId = String(payload && payload.turn_id || "");
+        if (channel.turnId && turnId && channel.turnId !== turnId) continue;
+        channel.dispatchEvent(new MessageEvent(event.type, { data: event.data }));
+      }
+    },
+    async _handleChatMuxSessionState(payload) {
+      const sid = String(payload && payload.session_id || "");
+      if (!sid) return;
+      const meta = (this.sessions || []).find(session => session.id === sid);
+      const existingState = this.tabState && this.tabState[sid];
+      if (!payload.active) {
+        const inactiveTurnId = String(payload.turn_id || "");
+        const currentTurnId = String(existingState && existingState.activeTurnId || "");
+        if (inactiveTurnId && currentTurnId && inactiveTurnId !== currentTurnId) {
+          // A delayed inactive frame for turn A must not retire or relabel its
+          // already-admitted successor turn B in the same session.
+          return;
+        }
+        if (meta) {
+          meta.active = false;
+          meta.turn_active = false;
+          meta.background_active = false;
+        }
+        this._chatMuxPendingEvents.delete(sid);
+        const ownsInactiveTurn = !!(existingState && inactiveTurnId
+          && currentTurnId === inactiveTurnId);
+        if (ownsInactiveTurn) {
+          if (existingState._stoppingTurnId === inactiveTurnId) {
+            existingState._stoppingTurnId = "";
+          }
+          this._retireStaleSessionStream(sid, existingState);
+          this._setSessionActivityExpectation(sid, false);
+          existingState._pendingExternalUpdate = true;
+          this._scheduleCanonicalStreamReload(
+            sid, existingState, { minimumWaitMs: 0 });
+          return;
+        }
+        if (existingState && !existingState.streaming) {
+          this._setBackgroundTaskActive(sid, false, payload.started_at, 0);
+        }
+        return;
+      }
+      if (meta) {
+        meta.active = true;
+        meta.turn_active = !payload.background;
+        meta.background_active = !!payload.background;
+      }
+      if (payload.attachable === false) {
+        // Watcher-only ownership has no replayable turn yet. Preserve its blue
+        // dot/background state, but do not create a reducer runtime until the
+        // continuation broadcast becomes attachable.
+        if (existingState && !existingState.streaming) {
+          this._setBackgroundTaskActive(
+            sid, true, payload.started_at, payload.background_tasks_pending);
+        }
+        return;
+      }
+      const turnId = String(payload.turn_id || "");
+      if (!turnId) return;
+      if (existingState && payload.stopping) {
+        existingState._stoppingTurnId = turnId;
+      }
+      if (existingState && existingState.es
+          && existingState.activeTurnId === turnId) return;
+      if (existingState && existingState.es && existingState.es._muxChannel
+          && existingState.activeTurnId
+          && existingState.activeTurnId !== turnId) {
+        // The aggregate state frame is authoritative for ABA turn changes. Retire
+        // only the stale logical adapter; the root EventSource remains shared.
+        this._retireStaleSessionStream(sid, existingState);
+        existingState._pendingExternalUpdate = true;
+      }
+      if (this._chatMuxAttachPromises.has(sid)) return;
+      const attach = (async () => {
+        const st = this._ensureTabState(sid);
+        if (!st._loaded && !st.streaming && !st.es) {
+          await this.loadSession(sid, { quiet: true, probeActive: false });
+        }
+        if (st.streaming || st.es || this.tabState[sid] !== st) return;
+        st.parentTurnId = String(payload.parent_turn_id || "");
+        await this.send({
+          reconnect: true,
+          sessionId: sid,
+          turnId,
+          startedAt: payload.started_at,
+          continuation: !!payload.continuation,
+          _muxAttach: true,
+        });
+      })();
+      this._chatMuxAttachPromises.set(sid, attach);
+      try { await attach; } finally {
+        if (this._chatMuxAttachPromises.get(sid) === attach) {
+          this._chatMuxAttachPromises.delete(sid);
+        }
+      }
+    },
+    async _startChatMuxCoordinator() {
+      if (this._chatMuxSupported === false) return false;
+      // Establish the one authoritative live transport before any background
+      // transcript warmup. A turn can start while history is loading; mux-first
+      // startup guarantees its accepted/session_state events already have a sink.
+      const connected = await this._ensureChatMux();
+      if (!connected) return false;
+      await this._bootstrapChatMuxHistory();
+      return true;
     },
 
     async initSessions(options = {}) {
@@ -9381,14 +10430,26 @@ function portal() {
         const target = inWorkspace.find(s => s.id === remembered) || inWorkspace[0];
         this.currentId = target.id;
       }
-      // Reconcile openTabIds (restored from prefs) with what still exists on
-      // the server: drop tabs whose session was deleted, then ensure currentId
-      // is in the list. Other tabs are lazy-loaded on first switch.
+      // Reconcile openTabIds (restored from the standalone tab store) with what
+      // still exists on the server: drop deleted sessions, then choose a valid
+      // landing tab without reviving a currentId closed by another page. Other
+      // tabs are lazy-loaded on first switch.
       const validIds = new Set(this.sessions.map(s => s.id));
-      this.openTabIds = (this.openTabIds || []).filter(id => validIds.has(id));
+      this.openTabIds = this._normalizeOpenTabIds(this.openTabIds, validIds);
       if (!this.openTabIds.includes(this.currentId)) {
-        this.openTabIds.push(this.currentId);
+        // A shared tab-strip update may have closed the id saved as this page's
+        // old currentId. Prefer an existing tab instead of reviving that id.
+        const workspaceTab = this.openTabIds.find(id => {
+          const session = this.sessions.find(row => row.id === id);
+          return session && session.cwd === this.currentWorkspacePath();
+        });
+        if (workspaceTab || this.openTabIds.length) {
+          this.currentId = workspaceTab || this.openTabIds[0];
+        } else {
+          this.openTabIds.push(this.currentId);
+        }
       }
+      this._writeChatTabStore(this.openTabIds);
       if (this.currentWorkspacePath() && this.currentId) {
         this.workspaceLastSession = {
           ...this.workspaceLastSession,
@@ -9423,6 +10484,10 @@ function portal() {
       }));
       this._sessionsInitialized = true;
       this._scheduleSavePrefs();
+      // Session discovery and the initial bounded transcript tail are now ready.
+      // Start exactly one root chat EventSource; every active session attaches to
+      // it through a lightweight EventSource-compatible channel.
+      void this._startChatMuxCoordinator();
       return true;
     },
     // Shared session-list pull behind both the explicit refresh and the 10s
@@ -9735,6 +10800,10 @@ function portal() {
         return Promise.resolve(false);
       }
       const ownerEs = st.es;
+      if (ownerEs && ownerEs._muxChannel && !this._chatMuxConnected) {
+        this._scheduleChatMuxReconnect();
+        return Promise.resolve(false);
+      }
       const observedActivity = Number(st._lastSseActivity)
         || Number(st._streamStartedAt) || Date.now();
       const transportClosed = !!(ownerEs && Number(ownerEs.readyState) === 2);
@@ -9746,15 +10815,12 @@ function portal() {
     async _runStreamHealthSync(sid, st, options = {}) {
       const ownerEs = options.ownerEs;
       if (this.tabState[sid] !== st || st.es !== ownerEs) return false;
-      const controller = new AbortController();
-      const timeout = setTimeout(
-        () => controller.abort(),
-        Math.max(100, Number(this._sessionListTimeoutMs) || 8000),
-      );
       try {
-        const r = await fetch(`/api/chat/sessions/${sid}/active`, {
-          headers: this.hdr(), signal: controller.signal,
-        });
+        const r = await this._fetchWithDeadline(
+          `/api/chat/sessions/${sid}/active`,
+          { headers: this.hdr(), signal: options.signal },
+          Math.max(100, Number(this._sessionListTimeoutMs) || 8000),
+        );
         if (!r.ok) return false;
         const d = await r.json();
         if (this.tabState[sid] !== st || st.es !== ownerEs) return false;
@@ -9766,6 +10832,7 @@ function portal() {
             st._stallWatch = null;
             st.es = null;
             st.streaming = false;
+            st.streamPhase = "";
             this._setBackgroundTaskActive(
               sid, true, d.started_at, d.background_tasks_pending);
             this._ensureBgContPoller(sid);
@@ -9796,7 +10863,7 @@ function portal() {
         this._retireStaleSessionStream(sid, st);
         st._pendingExternalUpdate = true;
         const loaded = await this.loadSession(sid, {
-          quiet: true, probeActive: false,
+          quiet: true, probeActive: false, signal: options.signal,
         });
         if (loaded) {
           st._loaded = true;
@@ -9809,7 +10876,7 @@ function portal() {
         return !!loaded;
       } catch (_) {
         return false;
-      } finally { clearTimeout(timeout); }
+      }
     },
 
     _scheduleCanonicalStreamReload(sid, st, { minimumWaitMs = 0 } = {}) {
@@ -9828,15 +10895,15 @@ function portal() {
       const minimumWaitMs = Math.max(0, Number(options.minimumWaitMs) || 0);
       let active = true;
       try {
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 8000);
-        try {
-          const r = await fetch(`/api/chat/sessions/${encodeURIComponent(sid)}/active`, {
-            headers: this.hdr(), signal: controller.signal,
-          });
-          if (r.ok) active = !!(await r.json()).active;
-        } finally { clearTimeout(timeout); }
-      } catch (_) { active = true; }
+        const r = await this._fetchWithDeadline(
+          `/api/chat/sessions/${encodeURIComponent(sid)}/active`,
+          { headers: this.hdr(), signal: options.signal },
+        );
+        if (r.ok) active = !!(await r.json()).active;
+      } catch (_) {
+        if (options.signal?.aborted) return false;
+        active = true;
+      }
       if (this.tabState[sid] !== st) return false;
       const waited = Date.now() - startedAt;
       if ((active || waited < minimumWaitMs) && waited < 31 * 60_000) {
@@ -9847,7 +10914,9 @@ function portal() {
       }
       this._retireStaleSessionStream(sid, st);
       st._pendingExternalUpdate = true;
-      const loaded = await this.loadSession(sid, { quiet: true });
+      const loaded = await this.loadSession(sid, {
+        quiet: true, signal: options.signal,
+      });
       if (this.tabState[sid] !== st) return false;
       st._canonicalResyncPending = false;
       st.sessionSync.canonicalStartedAt = 0;
@@ -9876,6 +10945,7 @@ function portal() {
         st._stallWatch = null;
       }
       st.streaming = false;
+      st.streamPhase = "";
       st.backgroundActive = false;
       st.backgroundTaskCount = 0;
       st._continuationAwaitingReaction = false;
@@ -10037,7 +11107,7 @@ function portal() {
       let succeeded = false;
       try {
         const loaded = await this.loadSession(sid, {
-          quiet: true, probeActive: false,
+          quiet: true, probeActive: false, signal: options.signal,
         });
         if (!loaded) {
           st._pendingExternalUpdate = true;
@@ -10486,7 +11556,7 @@ function portal() {
       const cwd = path || this.currentWorkspacePath();
       const primary = (this.sessionWorkspaces.find(w => w.primary) || {}).path || "";
       const byId = new Map(this.sessions.map(s => [s.id, s]));
-      return (this.openTabIds || []).filter(id => {
+      return this._normalizeOpenTabIds(this.openTabIds).filter(id => {
         const session = byId.get(id);
         return session && (session.cwd || primary) === cwd;
       });
@@ -10901,6 +11971,7 @@ function portal() {
         st._streamStartController = null;
         st._cancelBeforeStream = false;
         st.streaming = false;
+        st.streamPhase = "";
         st.backgroundActive = false;
         st.backgroundTaskCount = 0;
         st.inheritedBackgroundTaskCount = 0;
@@ -11037,6 +12108,7 @@ function portal() {
         const removedIds = new Set(this.sessions.filter(s => s.cwd === path).map(s => s.id));
         for (const id of removedIds) this._disposeTabRuntime(id);
         this.openTabIds = this.openTabIds.filter(id => !removedIds.has(id));
+        this._writeChatTabStore(this.openTabIds);
         this.sessions = this.sessions.filter(s => !removedIds.has(s.id));
         const surfaces = { ...this.workspaceSurfaces };
         delete surfaces[path];
@@ -11115,6 +12187,27 @@ function portal() {
       return ok || !this._optimisticMetas[id];
     },
     newSession(options = {}) {
+      // A touch target can occasionally dispatch two clicks while the mobile
+      // viewport is settling around the software keyboard. Coalesce only a
+      // second, immediately repeated request for the same still-empty tab;
+      // once the user has typed or the first window has elapsed, a deliberate
+      // new-tab action creates a fresh session normally.
+      const interactionNow = performance.now();
+      const requestedCwd = options.cwd || this.currentWorkspacePath();
+      const recentMeta = this._lastNewSessionMeta;
+      const recentState = recentMeta && this.tabState[recentMeta.id];
+      const recentDraft = recentState && recentState.draft
+        ? String(recentState.draft.input || "") : "";
+      if (this._isMobileLayout()
+          && recentMeta
+          && this.currentId === recentMeta.id
+          && (recentMeta.cwd || "") === (requestedCwd || "")
+          && interactionNow - this._lastNewSessionAt
+            < this.NEW_SESSION_TOUCH_DEDUPE_MS
+          && (!recentState || !recentState.messages.length)
+          && !recentDraft) {
+        return recentMeta;
+      }
       // No longer stops streams in OTHER tabs — each tab has its own ES in
       // tabState[id].es. The new session starts fresh in its own tab.
       // Default name uses the user's BROWSER-LOCAL clock — the backend
@@ -11143,7 +12236,7 @@ function portal() {
       // old session you were just viewing). Fall back to this.model only when
       // the default isn't known yet (very first load before /providers lands).
       const seedModel = this.defaultModel || this.model || "";
-      const seedCwd = options.cwd || this.currentWorkspacePath();
+      const seedCwd = requestedCwd;
       // Reflect it in the dropdown immediately — _activateTabState doesn't touch
       // this.model, so without this the selector would still show the old
       // session's model even though the new session is seeded with the default.
@@ -11179,12 +12272,20 @@ function portal() {
       }
       const st = this._ensureTabState(id);
       st.messages.length = 0;
+      st.messagesReady = true;
+      st.messagesLoading = false;
+      st.transcriptLoadPhase = "idle";
       st._loaded = true;
       st.permission = meta.permission;
       st.effort = meta.effort;
       st.serviceTier = meta.service_tier;
       this._activateTabState(id);
-      if (!this.openTabIds.includes(id)) this.openTabIds.push(id);
+      if (!this.openTabIds.includes(id)) {
+        this.openTabIds.push(id);
+        this._writeChatTabStore(this.openTabIds);
+      }
+      this._lastNewSessionAt = interactionNow;
+      this._lastNewSessionMeta = meta;
       this._touchTranscriptPane(id);
       if (this._isMobileLayout()) this.setMobileTab("chat");
       this.savePrefs();
@@ -11205,6 +12306,7 @@ function portal() {
           && this.sessionWorkspaces.some(w => w.path === cwd)) {
         await this._changeWorkspaceSurface(cwd);
       }
+      let opened = false;
       if (!this.openTabIds.includes(id)) {
         const MAX_TABS = 20;
         while (this.openTabIds.length >= MAX_TABS) {
@@ -11213,7 +12315,9 @@ function portal() {
           await this.closeChatTab(oldest);
         }
         this.openTabIds.push(id);
+        opened = true;
       }
+      if (opened) this._writeChatTabStore(this.openTabIds);
       if (makeCurrent && id !== this.currentId) {
         this._captureChatPosition(this.currentId);
         this.currentId = id;
@@ -11296,6 +12400,7 @@ function portal() {
           await this.newSession();
         }
       }
+      this._writeChatTabStore(this.openTabIds);
       this.savePrefs();
       // Closing a tab is a cheap, reversible action (session is still in
       // history picker / sidebar). The previous toast-with-undo was noise
@@ -12257,12 +13362,14 @@ function portal() {
           JSON.stringify(this.sessionTodoItems()),
         );
       } catch (_) { /* private mode / quota: keep the in-memory clipboard */ }
-      this._pushTodosToServer();
+      this._todoPushGeneration += 1;
+      this._todoPushPending = true;
+      void this._pushTodosToServer();
     },
     _applyTodosPayload(payload) {
       if (!payload || !Array.isArray(payload.items)) return;
       const revision = Number(payload.revision) || 0;
-      if (revision === this.todoRevision) return;
+      if (this._todoPushPending || revision < this.todoRevision) return;
       this.userTodos = this._normalizeUserTodos(payload.items);
       this.todoRevision = revision;
       try {
@@ -12273,39 +13380,85 @@ function portal() {
       } catch (_) { /* offline cache is best-effort */ }
     },
     async _pushTodosToServer() {
-      if (!this.token) return;
-      const r = await this.api("/api/todos", {
-        method: "PUT",
-        json: {
-          items: this.sessionTodoItems(),
-          base_revision: this.todoRevision,
-        },
-      });
-      if (r.ok) {
-        this._applyTodosPayload(r.data || {});
-      } else if (r.status === 409) {
-        // A concurrent device won; reconcile to the server-authoritative list.
-        await this._syncTodosFromServer();
+      if (!this.token) {
+        this._todoPushPending = false;
+        return;
       }
+      this._todoPushPending = true;
+      if (this._todoPushPromise) return this._todoPushPromise;
+
+      const drain = async () => {
+        while (this.token && this._todoPushPending) {
+          this._todoPushPending = false;
+          const generation = this._todoPushGeneration;
+          const items = this.sessionTodoItems().map(item => ({ ...item }));
+          const baseRevision = this.todoRevision;
+          const r = await this.api("/api/todos", {
+            method: "PUT",
+            json: { items, base_revision: baseRevision },
+          });
+          if (r.ok) {
+            const payload = r.data || {};
+            const revision = Number(payload.revision) || baseRevision;
+            if (generation === this._todoPushGeneration) {
+              this._applyTodosPayload(payload);
+            } else {
+              // The server committed the captured snapshot. Rebase the newest
+              // local edit on its revision without replacing the local board.
+              this.todoRevision = Math.max(this.todoRevision, revision);
+              this._todoPushPending = true;
+            }
+            continue;
+          }
+          if (r.status !== 409) return;
+
+          const refetch = await this.api("/api/todos");
+          if (!refetch.ok) return;
+          const payload = refetch.data || {};
+          const revision = Number(payload.revision) || baseRevision;
+          if (generation === this._todoPushGeneration) {
+            // No newer local edit exists, so the concurrent device wins.
+            this._applyTodosPayload(payload);
+          } else {
+            this.todoRevision = Math.max(this.todoRevision, revision);
+            this._todoPushPending = true;
+          }
+        }
+      };
+      const owner = drain().finally(() => {
+        if (this._todoPushPromise === owner) this._todoPushPromise = null;
+        // A local edit may arrive after the drain observes an empty queue but
+        // before its owner is cleared.
+        if (this.token && this._todoPushPending) {
+          void this._pushTodosToServer();
+        }
+      });
+      this._todoPushPromise = owner;
+      return owner;
     },
     async _syncTodosFromServer() {
       if (!this.token) return;
+      const generation = this._todoPushGeneration;
       const r = await this.api("/api/todos");
       if (!r.ok) return; // offline / unauthenticated: keep the local cache
-      let data = r.data || {};
+      const data = r.data || {};
+      const revision = Number(data.revision) || 0;
+      if (generation !== this._todoPushGeneration) {
+        // A local edit made while GET was in flight is newer than this
+        // snapshot. Keep it, then serialize it after the observed revision.
+        this.todoRevision = Math.max(this.todoRevision, revision);
+        this._todoPushPending = true;
+        await this._pushTodosToServer();
+        return;
+      }
       const local = this.sessionTodoItems();
       if ((!Array.isArray(data.items) || !data.items.length) && local.length) {
-        // One-time migration of pre-sync localStorage todos up to the server.
-        const pushed = await this.api("/api/todos", {
-          method: "PUT",
-          json: { items: local, base_revision: Number(data.revision) || 0 },
-        });
-        if (pushed.ok) {
-          data = pushed.data || data;
-        } else {
-          const refetch = await this.api("/api/todos");
-          if (refetch.ok) data = refetch.data || data;
-        }
+        // One-time migration shares the same writer as ordinary edits so it
+        // cannot race a user action made while startup sync is in flight.
+        this.todoRevision = Math.max(this.todoRevision, revision);
+        this._todoPushPending = true;
+        await this._pushTodosToServer();
+        return;
       }
       this._applyTodosPayload(data);
     },
@@ -12486,15 +13639,18 @@ function portal() {
           || !["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(ev.key)) return;
       ev.preventDefault();
       ev.stopPropagation();
+      const currentItem = this.sessionTodoItems()
+        .find(candidate => candidate.id === item.id);
+      if (!currentItem) return;
       const priorities = ["high", "medium", "low"];
       let changed = false;
       let action = "";
       if (ev.key === "ArrowLeft" || ev.key === "ArrowRight") {
-        const index = priorities.indexOf(item.priority);
+        const index = priorities.indexOf(currentItem.priority);
         const targetIndex = index + (ev.key === "ArrowLeft" ? -1 : 1);
         if (targetIndex >= 0 && targetIndex < priorities.length) {
           const priority = priorities[targetIndex];
-          changed = this._moveSessionTodoTo(item.id, priority, "", true);
+          changed = this._moveSessionTodoTo(currentItem.id, priority, "", true);
           const label = priority === "high"
             ? (this.lang === "zh" ? "高优先级" : "high priority")
             : priority === "medium"
@@ -12503,20 +13659,22 @@ function portal() {
           action = this.lang === "zh" ? `已移至${label}` : `moved to ${label}`;
         }
       } else {
-        const peers = this.sessionTodosForPriority(item.priority);
-        const index = peers.findIndex(peer => peer.id === item.id);
+        const peers = this.sessionTodosForPriority(currentItem.priority);
+        const index = peers.findIndex(peer => peer.id === currentItem.id);
         if (ev.key === "ArrowUp" && index > 0) {
-          changed = this._moveSessionTodoTo(item.id, item.priority, peers[index - 1].id, true);
+          changed = this._moveSessionTodoTo(
+            currentItem.id, currentItem.priority, peers[index - 1].id, true);
           action = this.lang === "zh" ? "已上移" : "moved up";
         } else if (ev.key === "ArrowDown" && index >= 0 && index + 1 < peers.length) {
           const beforeId = index + 2 < peers.length ? peers[index + 2].id : "";
-          changed = this._moveSessionTodoTo(item.id, item.priority, beforeId, true);
+          changed = this._moveSessionTodoTo(
+            currentItem.id, currentItem.priority, beforeId, true);
           action = this.lang === "zh" ? "已下移" : "moved down";
         }
       }
       if (changed) {
-        this._announceSessionTodoMove(item, action);
-        this._focusSessionTodoGrip(item.id);
+        this._announceSessionTodoMove(currentItem, action);
+        this._focusSessionTodoGrip(currentItem.id);
       }
     },
     onSessionTodoDrop(ev, priority, beforeId = "") {
@@ -13162,7 +14320,7 @@ function portal() {
         this._ensureNonEmptyMessageRange(st);
         st.messagesReady = true;
         this._touchTranscriptPane(tid);
-        this.$nextTick(() => this.scrollToBottom(true));
+        await this.returnToLatest(tid);
         return;
       }
       await this.openTab(tid);
@@ -13266,6 +14424,7 @@ function portal() {
       if (from < 0 || to < 0) return;
       this.openTabIds.splice(from, 1);
       this.openTabIds.splice(to, 0, src);
+      this._writeChatTabStore(this.openTabIds);
       this.savePrefs();
     },
     onTabDragEnd() {
@@ -13682,6 +14841,7 @@ function portal() {
     },
     toggleHistoryPicker(ev) {
       if (this.sessionPickerOpen) { this.closeHistoryPicker(); return; }
+      if (this.activity.moveMenu.show) this.closeActivityMoveMenu();
       const btn = ev && ev.currentTarget;
       const rect = btn ? btn.getBoundingClientRect() : null;
       if (rect) {
@@ -13971,6 +15131,7 @@ function portal() {
         this._deletePersistedChatDraft(sid);
       }
       this.openTabIds = (this.openTabIds || []).filter(id => !deletedIds.has(id));
+      this._writeChatTabStore(this.openTabIds);
       await this.refreshSessions();
       this.savePrefs();
       const cleared = (resp && resp.deleted) || 0;
@@ -14103,30 +15264,32 @@ function portal() {
       this.startRenameTab(id);
     },
     async menuClose(id) { this.closeTabMenu(); await this.closeChatTab(id); },
-    menuExportMarkdown(id) {
-      this.closeTabMenu();
-      if (!id) return;
-      // Use a transient anchor so the browser opens the streaming Response
-      // as a file download. Token goes in the query string because anchor
-      // requests can't carry custom headers.
-      const url = `/api/chat/sessions/${id}/export?token=`
-                  + encodeURIComponent(this.token);
-      const a = document.createElement("a");
-      a.href = url; a.style.display = "none";
-      // download attribute lets the server's Content-Disposition take
-      // precedence but still hints to the browser this isn't navigation.
-      a.setAttribute("download", "");
-      document.body.appendChild(a);
-      a.click();
-      setTimeout(() => a.remove(), 200);
-    },
-    async menuCopySessionEvidence(id) {
+    async menuExportMarkdown(id) {
       this.closeTabMenu();
       if (!id) return;
       try {
+        // Anchors cannot add X-Auth-Token. Mint a fresh, session-bound,
+        // single-use download ticket for every explicit export click.
+        const url = await this._mintChatResourceUrl(
+          "export", { session_id: id }, true,
+        );
+        const a = document.createElement("a");
+        a.href = url; a.style.display = "none";
+        // download lets Content-Disposition choose the final filename.
+        a.setAttribute("download", "");
+        document.body.appendChild(a);
+        a.click();
+        setTimeout(() => a.remove(), 200);
+      } catch (_) {
+        this.toast(this.lang === "zh" ? "导出失败" : "Export failed", "error");
+      }
+    },
+    async _copySessionEvidence(id) {
+      if (!id) return false;
+      try {
         const response = await fetch(
           `/api/chat/sessions/${encodeURIComponent(id)}/evidence`,
-          { headers: this.hdr() },
+          { headers: this.hdr(), cache: "no-store" },
         );
         if (!response.ok) throw new Error(await response.text());
         const evidence = await response.json();
@@ -14136,15 +15299,21 @@ function portal() {
         await navigator.clipboard.writeText(JSON.stringify(evidence, null, 2));
         this.toast(
           this.lang === "zh" ? "已复制会话证据 JSON" : "Session evidence JSON copied",
-          "success",
-          1800,
+          "success", 1800,
         );
+        return true;
       } catch (_) {
         this.errToast(
           "copy-session-evidence",
           this.lang === "zh" ? "复制失败，需要 HTTPS 且会话须已有记录" : "Copy failed; HTTPS and an existing transcript are required",
         );
+        return false;
       }
+    },
+
+    async menuCopySessionEvidence(id) {
+      this.closeTabMenu();
+      await this._copySessionEvidence(id);
     },
     async menuDelete(id) {
       this.closeTabMenu();
@@ -14167,15 +15336,19 @@ function portal() {
       // Switch the visible tab. We do NOT touch other tabs' streams — each
       // tab's ES is in its own tabState[id], and stream callbacks write
       // there directly. Switching is just "show that tab".
-      // The active pane and the nine most-recent panes stay mounted as bounded
+      // The active pane and a bounded set of recent panes stay mounted as
       // virtualized DOM views. Canonical messages remain owned by tabState.
       this._activateTabState(this.currentId);
+      const activatedState = this.tabState && this.tabState[this.currentId];
+      if (activatedState && typeof activatedState._flushLivePresentation === "function") {
+        activatedState._flushLivePresentation();
+      }
       // Selecting a conversation means opening its latest state, not restoring a
       // stale historical viewport. Reader-controlled position is preserved only
       // while staying inside the same active tab; every explicit tab selection
       // re-engages tail follow before loading/remounting the pane.
       const selectedState = this._ensureTabState(this.currentId);
-      selectedState.atBottom = true;
+      this._enforceMessageRangeInvariant(selectedState);
       this.ackCurrentActivity();
       this.savePrefs();
       // Sync the model + permission + effort dropdowns to THIS session's persisted
@@ -14231,11 +15404,10 @@ function portal() {
         if (loadedButBehindCanonical) st._pendingExternalUpdate = true;
         const target = this.currentId;
         await this._ensureSessionLoaded(target);
-        if (this.currentId === target) this.scrollToBottom(true);
       } else {
         const target = this.currentId;
         const stCur = this.tabState && this.tabState[target];
-        stCur.atBottom = true;
+        this._enforceMessageRangeInvariant(stCur);
         if (paneWasWarm) {
           // Warm pane: x-show reveals the existing keyed DOM. Do not flash a
           // skeleton, rebuild directives, or rescan already-highlighted content.
@@ -14243,36 +15415,53 @@ function portal() {
           this.$nextTick(() => {
             if (this.currentId !== target || this.tabState[target] !== stCur) return;
             // This callback runs after x-show has exposed the warm target pane.
-            // Position only this switch path immediately; changing the global
-            // scrollToBottom(force) ordering also affected cold page refreshes.
-            stCur.atBottom = true;
-            this._syncMessageViewport(target, true);
-            this._scrollChatTailNow(target, stCur);
-            this._settleScrollToBottom();
+            // Explicit selection means latest: acquire the logical tail before
+            // any physical scroll so a middle DOM window cannot masquerade as it.
+            void this.returnToLatest(target);
           });
         } else {
-          // Cold LRU miss: the pane is being reconstructed from normalized state.
-          // Paint the tab selection first, then reveal/highlight this new DOM once.
+          // Cold LRU miss: canonical data is resident, but Alpine must reconstruct
+          // the keyed pane. Keep an opaque visual transaction over that mount and
+          // tail-positioning window so partially-created rows never flash.
+          const mountToken = this._beginTranscriptLoad(target, stCur, "mounting");
           stCur.messagesReady = false;
           this.$nextTick(() => {
-            if (this.currentId !== target) return;
+            if (this.tabState[target] !== stCur) return;
+            if (this.currentId !== target) {
+              void this._settleTranscriptLoad(
+                mountToken, { returnToLatest: false });
+              return;
+            }
             stCur.messagesReady = true;
-            // Alpine applies the reveal before this callback, while the browser has
-            // not painted it yet. Position the shared scroller now; highlighting is
-            // post-paint work and must not delay or precede the tail jump.
-            this.$nextTick(() => {
-              if (this.currentId !== target || this.tabState[target] !== stCur) return;
-              stCur.atBottom = true;
-              this._syncMessageViewport(target, true);
-              this._scrollChatTailNow(target, stCur);
-              this._settleScrollToBottom();
-              this._afterPaint(() => {
-                if (this.currentId !== target) return;
-                stCur._highlighted = false;
-                const pane = this._paneElement(target);
-                this.highlightCode(".chat-body", pane ? [pane] : null);
-                stCur._highlighted = true;
-              });
+            this.$nextTick(async () => {
+              if (this.tabState[target] !== stCur) return;
+              if (this.currentId !== target) {
+                await this._settleTranscriptLoad(
+                  mountToken, { returnToLatest: false });
+                return;
+              }
+              try {
+                const latest = await this.returnToLatest(target);
+                if (!latest) {
+                  this._failTranscriptLoad(mountToken);
+                  return;
+                }
+                const settled = await this._settleTranscriptLoad(mountToken, {
+                  returnToLatest: false,
+                  skipNextTick: true,
+                  singlePaint: true,
+                });
+                if (!settled) return;
+                this._afterPaint(() => {
+                  if (this.currentId !== target || this.tabState[target] !== stCur) return;
+                  stCur._highlighted = false;
+                  const pane = this._paneElement(target);
+                  this.highlightCode(".chat-body", pane ? [pane] : null);
+                  stCur._highlighted = true;
+                });
+              } catch (_) {
+                this._failTranscriptLoad(mountToken);
+              }
             });
           });
         }
@@ -14353,20 +15542,18 @@ function portal() {
     _checkActiveTurn(sid) {
       return this._requestSessionSync(sid, "active_probe");
     },
-    async _probeActiveTurn(sid, st) {
+    async _probeActiveTurn(sid, st, options = {}) {
       // Refresh the queue mirror on every load/reconnect probe so a session
       // with server-side queued items shows them immediately (e.g. items that
       // were waiting behind an active turn, or left dormant after a restart).
       if (!sid || !st || this.tabState[sid] !== st) return false;
-      this._syncQueueFromServer(sid);
-      const controller = new AbortController();
-      const timeout = setTimeout(
-        () => controller.abort(),
-        Math.max(100, Number(this._sessionListTimeoutMs) || 8000),
-      );
+      this._syncQueueFromServer(sid, options);
       try {
-        const r = await fetch("/api/chat/sessions/" + sid + "/active",
-                               { headers: this.hdr(), signal: controller.signal });
+        const r = await this._fetchWithDeadline(
+          "/api/chat/sessions/" + sid + "/active",
+          { headers: this.hdr(), signal: options.signal },
+          Math.max(100, Number(this._sessionListTimeoutMs) || 8000),
+        );
         if (!r.ok) return;
         const d = await r.json();
         if (this.tabState[sid] !== st) return;
@@ -14455,7 +15642,6 @@ function portal() {
         // eventual completion surfaces live without a manual reload.
         this._ensureBgContPoller(sid);
       } catch (e) { /* silent */ }
-      finally { clearTimeout(timeout); }
     },
 
     // Hover-prefetch: kick off loadSession when the user's mouse rests
@@ -14507,15 +15693,42 @@ function portal() {
       const st = this._ensureTabState(sid);
       const meta = (this.sessions || []).find(session => session.id === sid);
       const canonicalBehind = this._canonicalMetaBehind(st, meta);
-      if (st._loaded && !canonicalBehind) return true;
+      if (st._loaded && !canonicalBehind) {
+        if (st.transcriptLoadPhase === "error") st.transcriptLoadPhase = "idle";
+        return true;
+      }
       if (canonicalBehind) st._pendingExternalUpdate = true;
-      // A workspace can have a warm tab whose transcript predates the scoped
-      // session row we just fetched. Refresh it off-screen while the tree is
-      // loading; quiet mode also keeps an already-visible pane intact when
-      // this helper is reused by another reconciliation path.
-      return await this._reloadSessionCoalesced(
-        sid, canonicalBehind ? { quiet: true } : {},
-      );
+      // A known-good resident transcript adopts newer canonical state quietly.
+      // Empty/unloaded panes need an opaque foreground transition instead: begin
+      // it synchronously, before the session-sync coordinator's setTimeout, so
+      // Alpine never gets a frame in which the new currentId looks like a new chat.
+      const canonicalLoadOptions = canonicalBehind ? { quiet: true } : {};
+      const quiet = canonicalBehind && st._loaded && st.messages.length > 0;
+      const token = sid === this.currentId && !quiet && !st.streaming && !st.es
+        ? this._beginTranscriptLoad(sid, st, "fetching") : null;
+      let loaded = false;
+      try {
+        loaded = await this._reloadSessionCoalesced(
+          sid, quiet ? canonicalLoadOptions : {},
+        );
+      } catch (_) {
+        loaded = false;
+      }
+      if (!token) {
+        if (loaded && st.transcriptLoadPhase === "error") {
+          st.transcriptLoadPhase = "idle";
+        }
+        if (loaded && quiet && sid === this.currentId) {
+          try { return await this.returnToLatest(sid); }
+          catch (_) { return false; }
+        }
+        return !!loaded;
+      }
+      if (loaded && st._loaded && this._ownsTranscriptLoad(token)) {
+        return await this._settleTranscriptLoad(token);
+      }
+      this._failTranscriptLoad(token);
+      return false;
     },
 
     async loadSession(sid, opts = {}) {
@@ -14553,6 +15766,9 @@ function portal() {
       // Return false so full-history/outline callers know the requested load was
       // deferred instead of recursively treating it as completed.
       if (st.streaming || st.es) return false;
+      const historyReplaceToken = this._beginHistoryReplace(st);
+      const quietRangeSnapshot = quiet
+        ? this._captureMessageRangeSnapshot(st) : null;
       // Skeleton on the active tab during the fetch — markdown rendering of
       // a long history can also take a noticeable beat after the network
       // returns, so the flag must wrap both phases.
@@ -14619,24 +15835,26 @@ function portal() {
           minimumTail,
           quiet ? Math.max(historyPage, st.messages.length) : historyPage,
         );
-        const qs = full ? "?full=1" : "?tail=" + requestedTail;
-        const controller = new AbortController();
-        const timeout = setTimeout(
-          () => controller.abort(),
-          full ? 60_000 : Math.max(100, Number(this._sessionReadTimeoutMs) || 15000),
-        );
+        const preserveFullOrder = quiet && st.messageRange.order === "full";
+        const qs = full
+          ? "?full=1"
+          : preserveFullOrder
+            ? "?full=1&tail=" + requestedTail
+            : "?tail=" + requestedTail;
         let r;
         const fetchStarted = perfNow();
         try {
-          r = await fetch("/api/chat/sessions/" + sid + qs, {
-            headers: this.hdr(), signal: controller.signal,
-          });
+          r = await this._fetchWithDeadline(
+            "/api/chat/sessions/" + sid + qs,
+            { headers: this.hdr(), signal: opts.signal },
+            full ? 60_000
+              : Math.max(100, Number(this._sessionReadTimeoutMs) || 15000),
+          );
         } catch (_) {
           historyPerf.status = "error";
           return false;
         } finally {
           historyPerf.fetch_ms = Math.round(perfNow() - fetchStarted);
-          clearTimeout(timeout);
         }
         if (!r.ok) {
           historyPerf.status = "error";
@@ -14648,7 +15866,10 @@ function portal() {
         const parsedSession = await r.json();
         historyPerf.parse_ms = Math.round(perfNow() - parseStarted);
         const s = this._retainExpectedSessionSettings(parsedSession);
-        if (this.tabState[sid] !== st) return false;
+        if (this.tabState[sid] !== st
+            || !this._historyReplaceStillOwns(st, historyReplaceToken)) {
+          return false;
+        }
         if (st.streaming || st.es) return false;
         const loadedRuntimeUiRevision = String(s.runtime_ui_revision || "");
         const currentRuntimeUiRevision = String(st.runtimeUiRevision || "");
@@ -14731,7 +15952,10 @@ function portal() {
         // The tab may have been disposed/recreated, or a stream may have claimed
         // this state while markdown rendering yielded. Never write into a stale
         // generation or replace an active owner's message array.
-        if (this.tabState[sid] !== st || st.streaming || st.es) return false;
+        if (this.tabState[sid] !== st || st.streaming || st.es
+            || !this._historyReplaceStillOwns(st, historyReplaceToken)) {
+          return false;
+        }
         // Replace the one repository in place. Quiet reconciliation preserves
         // matching message object identity; cold reveal changes only range coords.
         if (st.streaming || st.es) return false;
@@ -14743,28 +15967,32 @@ function portal() {
         // rebase after it, so Alpine never paints one frame with invalid indices.
         const virtualWindowBeforeInstall = quiet
           ? this._captureMessageVirtualWindow(st) : null;
-        const followTailAtInstall = quiet && st.atBottom !== false;
-        const quietRangeBeforeInstall = quiet ? {
-          start: Math.max(0, Number(st.messageRange.visibleStart) || 0),
-          end: Math.max(0, Number(st.messageRange.visibleEnd) || 0),
-        } : null;
+        const followTailAtInstall = quiet && (
+          opts.followTail === true || !!(quietRangeSnapshot && quietRangeSnapshot.followTail)
+        );
+        const quietRangeResolved = quiet
+          ? (followTailAtInstall
+            ? {
+              start: Math.max(0, all.length - this._liveMessageDomCap()),
+              end: all.length,
+            }
+            : this._resolveMessageRangeSnapshot(all, quietRangeSnapshot))
+          : null;
+        // A quiet response that no longer contains the reader's stable message
+        // anchor belongs to another coordinate system (for example full/around vs
+        // normal tail), or was superseded by newer navigation. Preserve the current
+        // repository and expose the jump-to-latest affordance instead of silently
+        // applying old numeric indices to unrelated messages.
+        if (quiet && !quietRangeResolved) {
+          st.atBottom = false;
+          return false;
+        }
         const installStarted = perfNow();
         // Cold loads start from an empty coordinate and reveal the newest rows in
-        // small batches. Quiet reconciliation is different: matching objects and
-        // keys already own live DOM nodes, so collapsing the range to zero and
-        // replaying every row only forces Alpine to reconcile the growing list over
-        // dozens of frames. Preserve its established range and let one keyed patch
-        // mount only genuinely new/changed rows.
-        const quietStart = quietRangeBeforeInstall
-          ? Math.min(quietRangeBeforeInstall.start, all.length) : startIdx;
-        const quietEnd = quietRangeBeforeInstall
-          ? (followTailAtInstall
-            ? all.length
-            : Math.min(
-              all.length,
-              Math.max(quietStart, quietRangeBeforeInstall.end),
-            ))
-          : startIdx;
+        // small batches. Quiet reconciliation uses stable identities so inserts or
+        // order changes before the visible rows cannot retarget the mounted window.
+        const quietStart = quietRangeResolved ? quietRangeResolved.start : startIdx;
+        const quietEnd = quietRangeResolved ? quietRangeResolved.end : startIdx;
         st.messageRange.visibleStart = quiet ? quietStart : startIdx;
         st.messageRange.visibleEnd = quiet ? quietEnd : startIdx;
         st.messages.splice(0, st.messages.length, ...all);
@@ -14777,13 +16005,18 @@ function portal() {
           order: (s.history_order === "full" || full) ? "full" : "normal",
           generation: s.history_generation || "",
         });
+        if (quiet) st.atBottom = followTailAtInstall;
+        this._enforceMessageRangeInvariant(st);
         if (quiet) {
           await new Promise(resolve => this.$nextTick(resolve));
         } else {
           await this._revealMessagesChunked(sid, st, visible, true);
         }
         historyPerf.install_ms = Math.round(perfNow() - installStarted);
-        if (this.tabState[sid] !== st || st.streaming || st.es) return false;
+        if (this.tabState[sid] !== st || st.streaming || st.es
+            || !this._historyReplaceStillOwns(st, historyReplaceToken)) {
+          return false;
+        }
         if (quiet) {
           this._rebaseMessageVirtualWindow(
             st, virtualWindowBeforeInstall, followTailAtInstall);
@@ -14894,7 +16127,6 @@ function portal() {
                 st.atBottom = false;
               }
             });
-            await this._fetchTabUsage(sid);
             historyPerf.status = "ok";
             return true;
           }
@@ -14945,7 +16177,6 @@ function portal() {
             });
           });
         }
-        await this._fetchTabUsage(sid);
         historyPerf.status = "ok";
         return true;
       } finally {
@@ -15257,6 +16488,28 @@ function portal() {
     _historyStoreKey(sid, m) {
       return m && m.block_id ? sid + ":" + m.block_id : "";
     },
+    _normalizeTaskStatusPreview(status) {
+      if (!status || typeof status !== "object") return status;
+      const raw = String(status.summary || "");
+      const cap = 2000;
+      const codePoints = Array.from(raw);
+      const receivedLength = codePoints.length;
+      const declaredLength = Number(status.summary_length);
+      const summaryLength = Math.max(
+        receivedLength, Number.isFinite(declaredLength) ? declaredLength : 0);
+      const previewPoints = codePoints.slice(0, cap);
+      const summary = previewPoints.join("");
+      const declaredTruncated = typeof status.summary_truncated === "string"
+        ? ["1", "true", "yes", "on"].includes(
+          status.summary_truncated.trim().toLowerCase())
+        : !!status.summary_truncated;
+      return {
+        ...status,
+        summary,
+        summary_length: summaryLength,
+        summary_truncated: declaredTruncated || summaryLength > previewPoints.length,
+      };
+    },
     _historyEnvelopes(sid, list) {
       const source = list || [];
       const renderKeys = source.map(m => this._historyMessageKey(sid, m));
@@ -15272,7 +16525,11 @@ function portal() {
         }
         uniqueKeys.add(key);
       }
-      return source.map((m, index) => {
+      return source.map((sourceMessage, index) => {
+        const m = sourceMessage && sourceMessage.task_status
+          ? { ...sourceMessage,
+              task_status: this._normalizeTaskStatusPreview(sourceMessage.task_status) }
+          : sourceMessage;
         const renderKey = renderKeys[index];
         const storeKey = this._historyStoreKey(sid, m);
         if (!storeKey) return { ...m, _k: renderKey };
@@ -15508,13 +16765,15 @@ function portal() {
       }
       this._assignLiveKey(st, m);
       const tailWasVisible = st.messageRange.visibleEnd === st.messages.length;
+      const followTail = tailWasVisible && st.atBottom !== false;
       st.messages.push(m);
       st.messageRange.total = Math.max(
         st.messageRange.total + 1, st.messageRange.offset + st.messages.length);
-      // New live output follows the reader only when the tail was already visible.
-      if (tailWasVisible) st.messageRange.visibleEnd = st.messages.length;
-      this._scheduleHistoryViewport(st, tailWasVisible ? "newer" : "older");
-      this._syncNormalizedHistory(st);
+      // Reader-owned history stays frozen while live output continues. When the
+      // reader follows the tail, move a fixed exact-height window instead of
+      // allowing one long turn to mount every tool/task row indefinitely.
+      if (followTail) this._boundLiveMessageRange(st, true);
+      this._scheduleHistoryViewport(st, followTail ? "newer" : "older");
       // Alpine wraps array entries lazily. Return the entry read back through the
       // reactive array, not the raw object that was pushed, so streaming text,
       // completion metadata and optimistic rollback mutations repaint immediately.
@@ -15524,6 +16783,18 @@ function portal() {
     // Phones use a smaller explicit page because parsing and installing 100 rich
     // tool/Markdown blocks can monopolize their main thread. Desktop keeps 100.
     _historyWindowSize() { return this._isMobileLayout() ? 20 : 100; },
+    _liveMessageDomCap() { return this._isMobileLayout() ? 40 : 100; },
+    _liveMessageHistoryStep() { return Math.max(1, Math.floor(this._liveMessageDomCap() / 2)); },
+    _isLiveMessagePane(st) { return !!(st && (st.streaming || st.es)); },
+    _boundLiveMessageRange(st, followTail = false) {
+      if (!st || !st.messageRange || !Array.isArray(st.messages)) return;
+      const range = st.messageRange;
+      if (followTail) range.visibleEnd = st.messages.length;
+      range.visibleStart = Math.max(0, Math.min(range.visibleStart, range.visibleEnd));
+      if (range.visibleEnd - range.visibleStart > this._liveMessageDomCap()) {
+        range.visibleStart = range.visibleEnd - this._liveMessageDomCap();
+      }
+    },
     _historyReconcileWindowSize() { return 800; },
     _scheduleHistoryViewport(st, direction = "newer", anchorUuid = "") {
       if (!st) return;
@@ -15543,6 +16814,114 @@ function portal() {
     },
     _syncNormalizedHistory(st) {
       if (st) this._syncSessionMessageStore(st);
+    },
+    _historyMessageIdentity(message) {
+      if (!message) return "";
+      if (message.uuid) return "uuid:" + String(message.uuid);
+      if (message._k) return "key:" + String(message._k);
+      return "";
+    },
+    _historyMessageIndex(messages, identity) {
+      if (!identity || !Array.isArray(messages)) return -1;
+      return messages.findIndex(
+        message => this._historyMessageIdentity(message) === identity,
+      );
+    },
+    _captureMessageRangeSnapshot(st) {
+      if (!st || !st.messageRange || !Array.isArray(st.messages)) return null;
+      const range = st.messageRange;
+      const start = Math.max(0, Math.min(range.visibleStart, st.messages.length));
+      const end = Math.max(start, Math.min(range.visibleEnd, st.messages.length));
+      return {
+        followTail: st.atBottom !== false && !this._messageRangeHasLater(st),
+        startIdentity: this._historyMessageIdentity(st.messages[start]),
+        endIdentity: this._historyMessageIdentity(st.messages[end - 1]),
+        visibleCount: Math.max(0, end - start),
+        order: range.order,
+        generation: range.generation,
+      };
+    },
+    _resolveMessageRangeSnapshot(messages, snapshot) {
+      if (!snapshot) return null;
+      if (snapshot.followTail) {
+        const end = messages.length;
+        return {
+          start: Math.max(0, end - this._liveMessageDomCap()),
+          end,
+        };
+      }
+      const count = Math.max(1, Number(snapshot.visibleCount) || 1);
+      const startIndex = this._historyMessageIndex(messages, snapshot.startIdentity);
+      const endIndex = this._historyMessageIndex(messages, snapshot.endIdentity);
+      if (startIndex >= 0 && endIndex >= startIndex) {
+        return { start: startIndex, end: endIndex + 1 };
+      }
+      if (startIndex >= 0) {
+        return { start: startIndex, end: Math.min(messages.length, startIndex + count) };
+      }
+      if (endIndex >= 0) {
+        return { start: Math.max(0, endIndex - count + 1), end: endIndex + 1 };
+      }
+      return null;
+    },
+    _beginHistoryReplace(st) {
+      const seq = (Number(st && st._historyRequestSeq) || 0) + 1;
+      st._historyRequestSeq = seq;
+      st._historyReplaceOwner = seq;
+      st._historyEpoch = (Number(st._historyEpoch) || 0) + 1;
+      return { seq, epoch: st._historyEpoch };
+    },
+    _historyReplaceStillOwns(st, token) {
+      return !!(st && token
+        && st._historyReplaceOwner === token.seq
+        && st._historyEpoch === token.epoch);
+    },
+    _captureHistoryPageToken(st) {
+      const range = st.messageRange;
+      return {
+        epoch: st._historyEpoch,
+        generation: range.generation,
+        order: range.order,
+        offset: range.offset,
+        headIdentity: this._historyMessageIdentity(st.messages[0]),
+        tailIdentity: this._historyMessageIdentity(st.messages[st.messages.length - 1]),
+      };
+    },
+    _historyPageStillOwns(st, token) {
+      if (!st || !token || st._historyEpoch !== token.epoch) return false;
+      const range = st.messageRange;
+      return range.generation === token.generation
+        && range.order === token.order
+        && range.offset === token.offset
+        && this._historyMessageIdentity(st.messages[0]) === token.headIdentity
+        && this._historyMessageIdentity(st.messages[st.messages.length - 1])
+          === token.tailIdentity;
+    },
+    _messageRangeHasLater(st) {
+      if (!st || !st.messageRange || !Array.isArray(st.messages)) return false;
+      const range = st.messageRange;
+      return range.visibleEnd < st.messages.length
+        || range.offset + st.messages.length < range.total;
+    },
+    _enforceMessageRangeInvariant(st) {
+      if (!st || !st.messageRange || !Array.isArray(st.messages)) return;
+      const range = st.messageRange;
+      range.visibleStart = Math.max(
+        0, Math.min(Number(range.visibleStart) || 0, st.messages.length));
+      range.visibleEnd = Math.max(
+        range.visibleStart,
+        Math.min(Number(range.visibleEnd) || 0, st.messages.length),
+      );
+      range.offset = Math.max(0, Number(range.offset) || 0);
+      range.total = Math.max(
+        Number(range.total) || 0,
+        range.offset + st.messages.length,
+      );
+      if (this._messageRangeHasLater(st)) st.atBottom = false;
+    },
+    isAwayFromLatest(sid) {
+      const st = this.tabState[sid || this.currentId];
+      return !!(st && (st.atBottom === false || this._messageRangeHasLater(st)));
     },
     _captureViewportMessageAnchor(scrollEl, sid) {
       if (!scrollEl || !sid) return null;
@@ -15663,6 +17042,7 @@ function portal() {
       if (st._fetchingOlder || !(range.offset > 0)) return 0;
       const pageSize = Math.min(this._historyWindowSize(), range.offset);
       const newOffset = range.offset - pageSize;
+      const pageToken = this._captureHistoryPageToken(st);
       st._fetchingOlder = true;
       st._historyHydrationError = false;
       try {
@@ -15682,7 +17062,8 @@ function portal() {
           return 0;
         }
         const data = await r.json();
-        if (this.tabState[sid] !== st) return 0;
+        if (this.tabState[sid] !== st
+            || !this._historyPageStillOwns(st, pageToken)) return 0;
         const win = this._historyEnvelopes(sid, data.messages || []);
         st.messages.unshift(...win);
         range.visibleStart += win.length;
@@ -15692,6 +17073,7 @@ function portal() {
         if (Number.isInteger(data.pre_total)) range.preTotal = data.pre_total;
         range.generation = data.history_generation || range.generation || "";
         range.order = data.history_order === "full" ? "full" : "normal";
+        this._enforceMessageRangeInvariant(st);
         this._syncNormalizedHistory(st);
         st._hasMoreHistory = range.visibleStart > 0 || range.offset > 0;
         return win.length;
@@ -15711,6 +17093,7 @@ function portal() {
       const start = range.offset + st.messages.length;
       if (start >= range.total) return 0;
       const limit = Math.min(this._historyWindowSize(), range.total - start);
+      const pageToken = this._captureHistoryPageToken(st);
       st._fetchingLater = true;
       try {
         const generation = range.generation
@@ -15726,13 +17109,15 @@ function portal() {
         }
         if (!r.ok) return 0;
         const data = await r.json();
-        if (this.tabState[sid] !== st) return 0;
+        if (this.tabState[sid] !== st
+            || !this._historyPageStillOwns(st, pageToken)) return 0;
         const win = this._historyEnvelopes(sid, data.messages || []);
         st.messages.push(...win);
         if (Number.isInteger(data.total)) range.total = data.total;
         if (Number.isInteger(data.pre_total)) range.preTotal = data.pre_total;
         range.generation = data.history_generation || range.generation || "";
         range.order = data.history_order === "full" ? "full" : "normal";
+        this._enforceMessageRangeInvariant(st);
         this._syncNormalizedHistory(st);
         return win.length;
       } catch (_) {
@@ -15823,7 +17208,10 @@ function portal() {
           st._hasMoreHistory = range.offset > 0 || this._preCompactReachable(st);
           return;
         }
-        const batchSize = this._historyWindowSize();
+        const liveWindow = this._isLiveMessagePane(st);
+        const batchSize = liveWindow
+          ? this._liveMessageHistoryStep() : this._historyWindowSize();
+        const previousEnd = range.visibleEnd;
         const nextStart = Math.max(0, range.visibleStart - batchSize);
         const batch = st.messages.slice(nextStart, range.visibleStart);
         const RENDER_CHUNK = this._isMobileLayout() ? 4 : 16;
@@ -15847,6 +17235,10 @@ function portal() {
         const anchor = this._captureViewportMessageAnchor(scrollEl, sid);
         this._shiftMessageVirtualWindow(st, batch.length);
         range.visibleStart = nextStart;
+        if (liveWindow) {
+          range.visibleEnd = Math.min(
+            previousEnd, nextStart + this._liveMessageDomCap());
+        }
         this._scheduleHistoryViewport(st, "older");
         st._hasMoreHistory = range.visibleStart > 0 || range.offset > 0;
         if (scrollEl) {
@@ -15866,29 +17258,32 @@ function portal() {
       const st = sid && this.tabState[sid];
       if (!st) return false;
       const range = st.messageRange;
+      st.atBottom = false;
       if (range.offset + st.messages.length < range.total) {
-        const loaded = await this.loadSession(sid, { quiet: sid === this.currentId });
+        const loaded = await this.loadSession(sid, {
+          quiet: sid === this.currentId,
+          followTail: true,
+        });
         if (!loaded || this.tabState[sid] !== st) return false;
       } else {
-        const windowSize = this._historyWindowSize();
+        const windowSize = this._isLiveMessagePane(st)
+          ? this._liveMessageDomCap() : this._historyWindowSize();
         range.visibleEnd = st.messages.length;
         range.visibleStart = Math.max(0, range.visibleEnd - windowSize);
         this._scheduleHistoryViewport(st, "newer");
       }
+      this._enforceMessageRangeInvariant(st);
+      if (this._messageRangeHasLater(st)) return false;
       st.atBottom = true;
       if (sid === this.currentId) this.$nextTick(() => this.scrollToBottom(true));
       return true;
     },
     hasLaterMessages(sid) {
-      const st = this.tabState[sid || this.currentId];
-      if (!st) return false;
-      const range = st.messageRange;
-      return range.visibleEnd < st.messages.length
-        || range.offset + st.messages.length < range.total;
+      return this._messageRangeHasLater(this.tabState[sid || this.currentId]);
     },
-    // Live history stays canonical in memory. The viewport row builder, not an
-    // envelope count, bounds the DOM while keeping every interaction target and
-    // normalized object reachable during long streaming turns.
+    // Live history stays canonical in memory. `_appendLiveMessage` bounds the
+    // exact-height messageRange; this compatibility scheduler only lets existing
+    // tail-follow paths share the same frame boundary.
     _scheduleLiveMessageViewport(st) {
       if (!st || !st.messages) return;
       this._scheduleMessageViewportSync(st._sid, st.atBottom !== false);
@@ -15955,21 +17350,29 @@ function portal() {
       };
       const hydrate = async () => {
         const items = Array.isArray(recall.items) ? recall.items : [];
-        const needsDetails = items.some(item => item?.id && !item.content);
+        const needsDetails = items.some(
+          item => item?.id && (!item.content || !item._traceback));
         if (!needsDetails) return;
         const hydrated = await Promise.all(items.map(async item => {
-          if (!item?.id || item.content) return item;
+          if (!item?.id || (item.content && item._traceback)) return item;
           try {
-            const response = await fetch(
-              "/api/memory/items/" + encodeURIComponent(item.id),
-              { headers: this.hdr(), cache: "no-store" },
-            );
-            if (!response.ok) return item;
-            const detail = await response.json();
+            const base = "/api/memory/items/" + encodeURIComponent(item.id);
+            const [detailResponse, tracebackResponse] = await Promise.all([
+              fetch(base, { headers: this.hdr(), cache: "no-store" }),
+              fetch(base + "/traceback", {
+                headers: this.hdr(), cache: "no-store",
+              }),
+            ]);
+            const detail = detailResponse.ok ? await detailResponse.json() : {};
+            const traceback = tracebackResponse.ok
+              ? await tracebackResponse.json() : { sites: [] };
             return {
               ...item,
               kind: detail.kind || item.kind,
-              content: detail.content || "",
+              content: detail.content || item.content || "",
+              sources: detail.sources || item.sources || [],
+              recall_stats: detail.recall_stats || item.recall_stats || null,
+              _traceback: traceback.sites || [],
             };
           } catch (_) { return item; }
         }));
@@ -16098,6 +17501,70 @@ function portal() {
     async openMemoryCenter(tab = "") {
       if (tab) this.settings.memory.tab = tab;
       await this.openSettings("memory");
+    },
+
+    memoryRecallStatsText(item) {
+      const stats = item?.recall_stats;
+      if (!stats) return "";
+      const parts = [this.lang === "zh"
+        ? `召回 ${stats.recall_count || 0} 次`
+        : `${stats.recall_count || 0} recalls`];
+      if (stats.last_recalled_at) parts.push(
+        (this.lang === "zh" ? "最近 " : "last ")
+        + new Date(stats.last_recalled_at * 1000).toLocaleString());
+      parts.push(`↑ ${stats.helpful_count || 0} · ↓ ${stats.unhelpful_count || 0}`);
+      return parts.join(" · ");
+    },
+
+    async loadMemoryTraceback(item) {
+      if (!item?.id) return [];
+      if (Array.isArray(item._traceback)) return item._traceback;
+      try {
+        const response = await fetch(
+          `/api/memory/items/${encodeURIComponent(item.id)}/traceback`,
+          { headers: this.hdr(), cache: "no-store" },
+        );
+        if (!response.ok) throw new Error(await response.text());
+        item._traceback = (await response.json()).sites || [];
+      } catch (_) {
+        item._traceback = [];
+      }
+      return item._traceback;
+    },
+
+    async openMemorySource(item) {
+      const site = (await this.loadMemoryTraceback(item))[0];
+      if (!site?.session_id) {
+        this.toast(this.lang === "zh" ? "没有可打开的来源会话" : "No source session available", "warn");
+        return;
+      }
+      this.closeMemoryRecallPopover();
+      this.settings.show = false;
+      if (site.can_jump_to_message && site.message_id) {
+        await this._jumpToMessage(site.session_id, site.message_id);
+      } else {
+        await this.openTab(site.session_id);
+      }
+    },
+
+    async copyMemorySourceEvidence(item) {
+      const site = (await this.loadMemoryTraceback(item))[0];
+      if (!site?.session_id) {
+        this.toast(this.lang === "zh" ? "没有可复制的来源会话" : "No source session available", "warn");
+        return;
+      }
+      await this._copySessionEvidence(site.session_id);
+    },
+
+    memoryRecallResultsText(item) {
+      const results = Array.isArray(item?.results) ? item.results : [];
+      if (!results.length) return this.lang === "zh" ? "未命中记忆" : "No memories returned";
+      return results.map(result => {
+        const channels = Array.isArray(result.channels) ? result.channels.join("+") : "";
+        const score = Number.isFinite(Number(result.score))
+          ? Number(result.score).toFixed(4) : "-";
+        return `${result.id || "?"} · ${channels || "unknown"} · ${score}`;
+      }).join("\n");
     },
 
     _memoryConfigPayload() {
@@ -16235,6 +17702,7 @@ function portal() {
       else if (mem.tab === "skills") url = "/api/memory/artifacts?kind=skill_candidate&limit=200";
       else if (mem.tab === "jobs") url = "/api/memory/jobs?limit=200";
       else if (mem.tab === "recalls") url = "/api/memory/recalls?limit=200";
+      else if (mem.tab === "backups") url = "/api/memory/backups?limit=200";
       else if (mem.tab === "audit") url = "/api/memory/audit?limit=200";
       if (mem.tab === "items") {
         const qs = new URLSearchParams({ limit: "200" });
@@ -16381,6 +17849,8 @@ function portal() {
           body: JSON.stringify({ useful: !!useful, recall_id: recallId || null }),
         });
       if (!r.ok) { this.toast(await r.text(), "error"); return; }
+      const updated = await r.json().catch(() => ({}));
+      if (updated.recall_stats) item.recall_stats = updated.recall_stats;
       item._feedback = useful ? "up" : "down";
       this.toast(this.lang === "zh" ? "已记录，将影响后续召回排序"
         : "Feedback recorded for future ranking", "success");
@@ -16412,6 +17882,29 @@ function portal() {
           ? (this.lang === "zh" ? "Skill 已停用并移出发现目录" : "Skill disabled and undiscoverable")
           : (this.lang === "zh" ? "候选已拒绝" : "Candidate rejected"), "success");
       await this.refreshMemoryCenter();
+    },
+
+    async memoryCreateBackup() {
+      const mem = this.settings.memory;
+      mem.backupRunning = true;
+      try {
+        const response = await fetch("/api/memory/backup", {
+          method: "POST", headers: this.hdr(),
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(this._memoryErrorDetail(data, response.status));
+        const receipt = data.backup || {};
+        this.toast(this.lang === "zh"
+          ? `备份已验证：${receipt.filename || receipt.id}`
+          : `Verified backup created: ${receipt.filename || receipt.id}`, "success", 5000);
+        mem.tab = "backups";
+        await this.refreshMemoryCenter();
+      } catch (error) {
+        this.toast((this.lang === "zh" ? "备份失败：" : "Backup failed: ")
+          + (error.message || error), "error", 6000);
+      } finally {
+        mem.backupRunning = false;
+      }
     },
 
     async memoryRunAction(action) {
@@ -17230,6 +18723,7 @@ function portal() {
           await this.switchSession();
         }
       }
+      this._writeChatTabStore(this.openTabIds);
       this.savePrefs();
       return true;
     },
@@ -17485,7 +18979,7 @@ function portal() {
     _fileCapabilities() {
       if (!this._fileCapabilitiesPromise) {
         this._fileCapabilitiesPromise = import(
-          "/static/modules/file-capabilities.mjs"
+          this._staticAssetUrl("/static/modules/file-capabilities.mjs")
         ).catch(error => {
           this._fileCapabilitiesPromise = null;
           throw error;
@@ -17496,7 +18990,7 @@ function portal() {
     _persistentCache() {
       if (!this._persistentCachePromise) {
         this._persistentCachePromise = import(
-          "/static/modules/persistent-cache.mjs"
+          this._staticAssetUrl("/static/modules/persistent-cache.mjs")
         ).catch(error => {
           this._persistentCachePromise = null;
           throw error;
@@ -19053,6 +20547,116 @@ function portal() {
         : (hadExpanded ? "toast.hidden_hidden_collapsed" : "toast.hidden_hidden");
       this.toast(this.t(key), "info", hadExpanded ? 2500 : 1500);
       return true;
+    },
+    treeRowTabIndex(n) {
+      if (!n) return -1;
+      const preferred = this.treeFocusPath || this.selected;
+      if (n.path === preferred) return 0;
+      const start = Math.max(
+        0,
+        Math.min(
+          Number(this.fileTreeViewport && this.fileTreeViewport.start) || 0,
+          this.visible.length,
+        ),
+      );
+      const end = Math.max(
+        start,
+        Math.min(
+          Number(this.fileTreeViewport && this.fileTreeViewport.end) || 80,
+          this.visible.length,
+        ),
+      );
+      const firstRendered = this.visible[start] || this.visible[0];
+      if (!firstRendered || n.path !== firstRendered.path) return -1;
+      // Only the first rendered row checks the current window. A logical focus
+      // owner outside the virtual slice cannot be tabbed to, so the mounted
+      // slice still needs exactly one entry point. Keep the scan O(window),
+      // not O(full tree * rendered rows).
+      for (let index = start; preferred && index < end; index += 1) {
+        if (this.visible[index].path === preferred) return -1;
+      }
+      return 0;
+    },
+    onTreeRowFocus(n) {
+      if (n && n.path) this.treeFocusPath = n.path;
+    },
+    _focusTreeRow(path, block = "nearest") {
+      if (!path) return false;
+      this.treeFocusPath = path;
+      this._positionFileTreePath(path, block);
+      const focusRow = () => {
+        const escaped = window.CSS && CSS.escape ? CSS.escape(path) : path;
+        const row = document.querySelector(
+          `.filelist li[role="treeitem"][data-path="${escaped}"]`,
+        );
+        if (!row) return false;
+        this._focusWithoutScroll(row);
+        return true;
+      };
+      this.$nextTick(() => {
+        if (focusRow()) return;
+        // A Home/End jump can replace the virtualized x-for window. Alpine's
+        // first nextTick publishes the slice, while its DOM nodes may not be
+        // mounted until the following paint; retry once without polling.
+        this._afterPaint(focusRow);
+      });
+      return true;
+    },
+    async onTreeRowKeydown(ev, n) {
+      if (!ev || !n || ev.target !== ev.currentTarget) return;
+      const key = ev.key;
+      if (key === "Enter" || key === " ") {
+        ev.preventDefault();
+        ev.stopPropagation();
+        await this.onNodeClick(ev, n);
+        if (this._isMobileLayout() && !n.is_dir) {
+          this.$nextTick(() => {
+            const active = document.querySelector(
+              ".pane.preview .tab.active .tab-main",
+            );
+            if (active) this._focusWithoutScroll(active);
+          });
+        } else {
+          this._focusTreeRow(n.path);
+        }
+        return;
+      }
+      const rows = this.visible;
+      const index = rows.findIndex(node => node.path === n.path);
+      if (index < 0) return;
+      let target = null;
+      if (key === "ArrowDown") target = rows[Math.min(rows.length - 1, index + 1)];
+      else if (key === "ArrowUp") target = rows[Math.max(0, index - 1)];
+      else if (key === "Home") target = rows[0];
+      else if (key === "End") target = rows[rows.length - 1];
+      else if (key === "ArrowRight" && n.is_dir) {
+        if (!this.expanded.has(n.path)) {
+          ev.preventDefault();
+          ev.stopPropagation();
+          await this.expand(n);
+          this.savePrefs();
+          this._focusTreeRow(n.path);
+          return;
+        }
+        const child = rows[index + 1];
+        if (child && child.depth === n.depth + 1) target = child;
+      } else if (key === "ArrowLeft") {
+        if (n.is_dir && this.expanded.has(n.path)) {
+          ev.preventDefault();
+          ev.stopPropagation();
+          this.collapse(n);
+          this.savePrefs();
+          this._focusTreeRow(n.path);
+          return;
+        }
+        const parentPath = n.path.includes("/")
+          ? n.path.split("/").slice(0, -1).join("/") : "";
+        if (parentPath) target = rows.find(node => node.path === parentPath);
+      }
+      if (!target) return;
+      ev.preventDefault();
+      ev.stopPropagation();
+      this._focusTreeRow(target.path);
     },
     async onNodeClick(ev, n) {
       // ---- Desktop multi-select modifiers ----
@@ -20804,8 +22408,12 @@ function portal() {
       if (this._terminalLoadPromise) return this._terminalLoadPromise;
       const assetVersion = String(document.querySelector(
         'meta[name="muselab-asset-version"]')?.content || "");
-      const timeoutMs = 15000;
-      const deadline = Date.now() + 30000;
+      // Mobile Safari on a high-latency proxy can spend most of 15 seconds on
+      // the 489 KB xterm bundle before the tiny fit addon even starts. Give each
+      // request a realistic cellular timeout and keep enough shared budget for
+      // one cache-busting retry.
+      const timeoutMs = 30000;
+      const deadline = Date.now() + 75000;
       const isReady = src => src.endsWith(".css")
         || (src.includes("addon-fit") ? !!window.FitAddon : !!window.Terminal);
       const loadOnce = (src, attempt) => new Promise((resolve, reject) => {
@@ -20893,13 +22501,17 @@ function portal() {
         // loader for retry. Promise.all rejected immediately and left its
         // sibling alive; that stale branch could later remove the fresh DOM
         // node created by the next click.
+        // addon-fit is a standalone UMD bundle: it only needs Terminal when its
+        // exported class is instantiated, not while the script evaluates. Start
+        // all three requests together so a slow xterm download does not postpone
+        // the addon's timeout window on cellular/mobile proxy connections.
         const initial = await Promise.allSettled([
           inject("/static/vendor/xterm/xterm.css"),
           inject("/static/vendor/xterm/xterm.js"),
+          inject("/static/vendor/xterm/addon-fit.js"),
         ]);
         const failed = initial.find(result => result.status === "rejected");
         if (failed) throw failed.reason;
-        await inject("/static/vendor/xterm/addon-fit.js");
         if (!window.Terminal || !window.FitAddon) {
           throw new Error("terminal library globals missing");
         }
@@ -23331,6 +24943,27 @@ function portal() {
         ? (message.displayText || "") : (message.text || "");
     },
 
+    activatePreviewSelectionAction(ev, action) {
+      // iOS Safari can suppress the synthetic click when pointerdown is
+      // preventDefault()'d to preserve a native text selection. Execute real
+      // pointer activation on pointerdown instead, and reserve click for
+      // keyboard／assistive-technology activation（detail === 0）. Ignoring the
+      // later pointer-generated click also prevents a detached button from
+      // running the action twice after the popover has already closed.
+      const pointerDown = ev && ev.type === "pointerdown"
+        && (ev.button == null || ev.button === 0);
+      const keyboardClick = ev && ev.type === "click" && ev.detail === 0;
+      if (!pointerDown && !keyboardClick) return false;
+      if (ev.preventDefault) ev.preventDefault();
+      if (ev.stopPropagation) ev.stopPropagation();
+      if (action === "quote") return this.quotePreviewSelection();
+      if (action === "ask") {
+        this.openPreviewSelectionAsk();
+        return true;
+      }
+      return false;
+    },
+
     quotePreviewSelection() {
       if (!this.currentId || !this.previewQuote.show || !this.previewQuote.text) {
         this.toast(this.lang === "zh" ? "请先打开一个会话" : "Open a chat first", "warn", 2200);
@@ -23814,10 +25447,12 @@ function portal() {
       if (ready()) return Promise.resolve();
       if (this[key]) return this[key];
       const clearOnFail = (err) => { this[key] = null; return Promise.reject(err); };
-      const loadOne = (src) => new Promise((resolve, reject) => {
+      const loadOne = (path) => new Promise((resolve, reject) => {
+        const isCss = path.split(/[?#]/, 1)[0].endsWith(".css");
+        const src = this._staticAssetUrl(path);
         // Already in the DOM (e.g. from a previous lazy-load attempt)? Wait
         // for ready(); don't re-inject the tag.
-        const sel = src.endsWith(".css")
+        const sel = isCss
           ? `link[href="${src}"]`
           : `script[src="${src}"]`;
         if (document.querySelector(sel)) {
@@ -23830,7 +25465,7 @@ function portal() {
           })();
           return;
         }
-        if (src.endsWith(".css")) {
+        if (isCss) {
           const l = document.createElement("link");
           l.rel = "stylesheet"; l.href = src;
           l.onload = resolve; l.onerror = () => reject(new Error("load failed: " + src));
@@ -23870,7 +25505,15 @@ function portal() {
     // never competes with the initial app render. Each step is fire-and-forget
     // and swallows errors — the on-demand lazy loaders remain the fallback.
     _prewarmPreviewLibs() {
-      if (this._previewLibsPrewarmed) return;
+      if (this._previewLibsPrewarmed || !this.appReady) return;
+      // Hidden tabs, data-saver and genuinely slow cellular links should keep
+      // bandwidth and parse budget for user-requested work. On-demand loaders
+      // remain available when the user actually opens rich preview content.
+      if (typeof document !== "undefined" && document.hidden) return;
+      const connection = typeof navigator !== "undefined"
+        ? navigator.connection : null;
+      if (connection && (connection.saveData
+          || ["slow-2g", "2g"].includes(connection.effectiveType))) return;
       this._previewLibsPrewarmed = true;
       // Each job below injects + parses a heavy vendor bundle on the main
       // thread. Firing them all inside ONE idle slice re-creates the freeze
@@ -23927,7 +25570,8 @@ function portal() {
     async _loadHljs() {
       if (window.hljs) return;
       if (this._hljsLoadPromise) return this._hljsLoadPromise;
-      const inject = (src) => new Promise((resolve, reject) => {
+      const inject = (path) => new Promise((resolve, reject) => {
+        const src = this._staticAssetUrl(path);
         if (document.querySelector(`script[src="${src}"]`)) {
           // Already in DOM — just wait for window.hljs to materialize.
           const t0 = Date.now();
@@ -23979,20 +25623,22 @@ function portal() {
       if (window.CodeMirror) return;
       if (this._cmLoadPromise) return this._cmLoadPromise;
       // Inject one asset (css/js), de-duping against an already-present tag.
-      const inject = (src) => new Promise((resolve, reject) => {
-        const sel = src.endsWith(".css")
+      const inject = (path) => new Promise((resolve, reject) => {
+        const isCss = path.split(/[?#]/, 1)[0].endsWith(".css");
+        const src = this._staticAssetUrl(path);
+        const sel = isCss
           ? `link[href="${src}"]` : `script[src="${src}"]`;
         if (document.querySelector(sel)) {
           // Already in flight/loaded from a prior attempt — give it a beat.
           const t0 = Date.now();
           (function wait() {
-            if (src.endsWith(".css") || window.CodeMirror) return resolve();
+            if (isCss || window.CodeMirror) return resolve();
             if (Date.now() - t0 > 5000) return resolve(); // don't hang the chain
             setTimeout(wait, 50);
           })();
           return;
         }
-        const node = src.endsWith(".css")
+        const node = isCss
           ? Object.assign(document.createElement("link"), { rel: "stylesheet", href: src })
           : Object.assign(document.createElement("script"), { src });
         node.onload = resolve;
@@ -24051,7 +25697,7 @@ function portal() {
       };
       this._mermaidLoadPromise = new Promise((resolve, reject) => {
         const s = document.createElement("script");
-        s.src = "/static/vendor/mermaid.min.js";
+        s.src = this._staticAssetUrl("/static/vendor/mermaid.min.js");
         s.onload = () => {
           try {
             // securityLevel: "strict" disables foreign HTML in labels,
@@ -26017,10 +27663,7 @@ function portal() {
           const hit = (this.sessions || []).find(s =>
             s.id.startsWith(arg) || s.name.toLowerCase().includes(q));
           if (!hit) { this.toast(this.t("slash.resume_no_match"), "warn", 2000); return false; }
-          this._captureChatPosition(this.currentId);
-          this.currentId = hit.id;
-          this._activateTabState(hit.id);
-          await this.loadSession(hit.id);
+          await this.openTab(hit.id, true);
           this.toast(this.t("slash.resumed", { name: hit.name }), "success", 1500);
           return true;
         }
@@ -26403,7 +28046,8 @@ function portal() {
         // Reload the compacted session if it's the active one; on a
         // background tab activateTab will reload it lazily later.
         if (sid === this.currentId) {
-          await this.loadSession(sid);
+          await this._reloadSessionCoalesced(
+            sid, { quiet: true, probeActive: false });
         }
         await this.refreshSessions();
         // Refresh ctx-meter — sessionUsage is only auto-updated on stream
@@ -26744,10 +28388,10 @@ function portal() {
       // mis-classify and never re-engage auto-follow).
       const nearBottom = (el.scrollHeight - el.scrollTop - el.clientHeight) < 2;
       if (nearBottom) {
-        // Reaching the bottom always (re-)engages auto-follow, regardless of
-        // what moved us there — that's the unambiguous "I want to follow" state.
+        // The physical bottom of a frozen range is not the logical transcript
+        // tail. Keep the jump affordance until hidden later messages are restored.
         if (st) {
-          st.atBottom = true;
+          st.atBottom = !this.hasLaterMessages(this.currentId);
           st.scrollTop = el.scrollTop;
         }
         return;
@@ -26837,11 +28481,13 @@ function portal() {
           });
           if (!touchesActiveLayout) return;
         }
-        if (!st || st.atBottom === false || this._chatTailPinFrame) return;
+        if (!st || st.atBottom === false || this._messageRangeHasLater(st)
+            || this._chatTailPinFrame) return;
         this._chatTailPinFrame = requestAnimationFrame(() => {
           this._chatTailPinFrame = 0;
           const current = sid && this.tabState && this.tabState[sid];
-          if (this.currentId !== sid || current !== st || st.atBottom === false) return;
+          if (this.currentId !== sid || current !== st || st.atBottom === false
+              || this._messageRangeHasLater(st)) return;
           this.scrollToBottom(false);
         });
       };
@@ -26887,8 +28533,8 @@ function portal() {
       // Keep the explicit scroller assignment as a deterministic fallback for
       // embedded/mobile WebViews whose scrollIntoView chooses an outer scroller.
       el.scrollTop = el.scrollHeight;
-      st.atBottom = true;
       st.scrollTop = el.scrollTop;
+      this._enforceMessageRangeInvariant(st);
     },
     scrollToBottom(force) {
       const el = this._chatBodyElement();
@@ -26906,10 +28552,13 @@ function portal() {
       // viewport stays put until they manually scroll back to the bottom.
       if (!force && st.atBottom === false) return;
       if (force) {
-        // Explicit jump (Send / ↓): mount the virtual tail first. Otherwise a
-        // reader who sent while viewing older rows still had only that old DOM
-        // window mounted; the subsequent settle could scroll merely to the end
-        // of the spacer and an anchor restore would pull it back again.
+        // Physical DOM bottom is not necessarily the logical transcript tail.
+        // Acquire the real tail first; returnToLatest re-enters this path only
+        // after local and server-side later windows have disappeared.
+        if (this._messageRangeHasLater(st)) {
+          void this.returnToLatest(sid);
+          return;
+        }
         st.atBottom = true;
         this._syncMessageViewport(sid, true);
         this.$nextTick(() => {
@@ -26972,7 +28621,8 @@ function portal() {
       let stable = 0;
       const step = () => {
         if (this._settleToken !== myToken) return; // superseded; newer settle owns the flag
-        if (this.currentId !== sid || this.tabState[sid] !== st || st.atBottom === false) {
+        if (this.currentId !== sid || this.tabState[sid] !== st
+            || st.atBottom === false || this._messageRangeHasLater(st)) {
           done();
           return;
         }
@@ -27157,23 +28807,12 @@ function portal() {
       // interrupt endpoint's atomic pause and the turn cleanup's second pause;
       // that new item then appeared accepted but remained paused.  Keep the
       // draft intact and make the short wait explicit instead.
-      if (sendState._stopping && !opts.reconnect && !opts.resumedItem) {
+      if (sendState._stoppingTurnId && !opts.reconnect && !opts.resumedItem) {
         this.toast(this.lang === "zh"
           ? "正在中断上一条任务，请稍候再发送"
           : "The previous turn is still stopping; send again in a moment",
         "warn", 2200);
         return false;
-      }
-      if (sendState._optimisticInterrupt && !opts.reconnect && !opts.resumedItem) {
-        // The user is intentionally moving on before the old cancelled event
-        // arrives. Retire only that old transport ownership now; otherwise its
-        // late _markDone would clear the NEW send's streaming flag/timer on this
-        // shared tab state. Backend snapshot persistence continues independently,
-        // and the canonical poll later merges any retained partial output.
-        try { if (sendState.es) sendState.es.close(); } catch (_) {}
-        sendState.es = null;
-        sendState._optimisticInterrupt = false;
-        sendState._pendingExternalUpdate = true;
       }
       // Do not start a new turn between the optimistic selector change and
       // its persisted session update. Otherwise Plan Mode could launch with a
@@ -27435,6 +29074,9 @@ function portal() {
             return false;
           }
         }
+        // Sending is an explicit request to resume tail-follow. Set ownership
+        // before appending so the optimistic user bubble enters the bounded range.
+        sendState.atBottom = true;
         this._scheduleLiveMessageViewport(sendState);
         sentUserBubble = this._appendLiveMessage(sendState, {
           role: "user", text,
@@ -27587,24 +29229,17 @@ function portal() {
         streamState._reconnectGateCount = 0;
         streamState._reconnectGateAt = 0;
       }
+      // A live owner supersedes any foreground history shield. Advancing the
+      // visual generation makes an older load response unable to turn the live
+      // pane into either a loading or error surface when it eventually settles.
+      this._releaseTranscriptLoadForLive(streamState);
       streamState.streaming = true;
+      if (!isReconnect || !streamState.streamPhase) {
+        streamState.streamPhase = "connecting";
+      }
       streamState._continuationAwaitingReaction = false;
-      // A live turn renders DIRECTLY into the visible pane, so it must never be
-      // hidden by the bulk-reveal gate. `messagesReady=false` drives
-      // `.chat-body.msgs-hidden .msg { display:none }` + the loading skeleton —
-      // a mechanism that exists ONLY for loadSession's chunked reveal of
-      // historical bubbles. But a pane's messagesReady can otherwise only flip
-      // back to true inside switchSession / loadSession reveal callbacks
-      // that are guarded `if (this.currentId !== target) return`. If that reveal
-      // is skipped — rapid tab switch, or hitting "+" (newSession) right after a
-      // session started loading — messagesReady is left STUCK at false. On the
-      // next send, the moment messages.length goes >0 the msgs-hidden class
-      // engages and the ENTIRE reply (and the user's own bubble) renders
-      // display:none. The data still streams + persists to JSONL, so a full PWA
-      // restart re-runs loadSession's reveal and the reply "appears" — exactly
-      // the "new session, first reply invisible until restart" report. Force the
-      // reveal whenever we stream into the ACTIVE tab; there is nothing to
-      // lazy-reveal once the user is actively sending into the pane they see.
+      // A live turn renders directly into its pane; historical chunk readiness
+      // must never hide the user's bubble or the streamed reply.
       streamState.messagesReady = true;
       streamState.messagesLoading = false;
       streamState.streamingModel = sendModel;
@@ -27657,41 +29292,21 @@ function portal() {
         this.scrollToBottom(true);
       }
 
-      // Ticket flow: POST the prompt + params with header auth, get a
-      // one-time ticket, open the SSE with ONLY the ticket in the URL.
-      // Keeps the user's prompt and the auth token out of access logs /
-      // browser history (EventSource can't send headers or a body).
-      // Legacy query-param fallback ONLY when the endpoint doesn't exist
-      // (old backend → 404/405). A 5xx or network blip must NOT silently
-      // downgrade to putting the prompt + token back into the URL — retry
-      // the ticket once, then surface the failure instead.
+      // Mux flow: one root EventSource receives every session. This send only
+      // admits a new turn, then installs an EventSource-compatible per-session
+      // channel so the reducer below remains the sole event/state implementation.
+      // Legacy per-session SSE is used only after an explicit 404/405 capability
+      // response from the mux or turn-start endpoint.
       let url;
+      let es;
+      let useMux = false;
       this._setComposerClaimPhase(sendState, composerSubmitToken, "stream_start");
       const streamStartController = new AbortController();
       streamState._streamStartController = streamStartController;
       streamState._cancelBeforeStream = false;
-      const _mintTicket = async () => {
-        const tr = await fetch("/api/chat/stream/start", {
-          method: "POST",
-          headers: Object.assign({ "Content-Type": "application/json" }, this.hdr()),
-          signal: streamStartController.signal,
-          body: JSON.stringify({
-            prompt: text,
-            session_id: streamSid,
-            turn_id: expectedTurnId,
-            last_event_seq: resumeEventSeq,
-            model: sendModel,
-            permission: sendPermission,
-            image_ids: attachIds.length ? attachIds.join(",") : "",
-            mobile: streamMobile,
-          }),
-        });
-        return tr;
-      };
-      // Stop/ticket failure before EventSource opens means no backend turn was
-      // created. Remove the optimistic bubble, restore the full local payload,
-      // and reset every stream flag/timer without relying on the later-scoped
-      // _markDone closure.
+      // Stop/start failure before a channel opens removes the optimistic bubble,
+      // restores the full local payload and resets every stream flag/timer without
+      // relying on the later-scoped _markDone closure.
       const rollbackUnstartedSend = (restoreDraft = true) => {
         if (sentUserBubble) {
           this._removePaneMessage(streamState, sentUserBubble);
@@ -27705,50 +29320,127 @@ function portal() {
         streamState._streamStartedAt = 0;
         streamState.streamElapsed = 0;
         streamState.streaming = false;
+        streamState.streamPhase = "";
         streamState._continuationAwaitingReaction = false;
         streamState.es = null;
         streamState._streamStartController = null;
         streamState._cancelBeforeStream = false;
-        streamState._stopping = false;
-        streamState._optimisticInterrupt = false;
+        streamState._stoppingTurnId = "";
         streamState._serverActiveObserved = false;
         streamState.activeTurnId = "";
         streamState.parentTurnId = "";
         streamState.lastEventSeq = 0;
         streamState.streamingModel = "";
       };
+      const _mintLegacyTicket = async () => await fetch("/api/chat/stream/start", {
+        method: "POST",
+        headers: Object.assign({ "Content-Type": "application/json" }, this.hdr()),
+        signal: streamStartController.signal,
+        body: JSON.stringify({
+          prompt: text,
+          session_id: streamSid,
+          turn_id: expectedTurnId,
+          last_event_seq: resumeEventSeq,
+          model: sendModel,
+          permission: sendPermission,
+          image_ids: attachIds.length ? attachIds.join(",") : "",
+          mobile: streamMobile,
+        }),
+      });
       try {
-        let tr = await _mintTicket();
-        if (tr.status === 404 || tr.status === 405) {
-          // Old backend without /stream/start — legacy URL is the contract.
-          url = "/api/chat/stream"
-            + "?prompt=" + encodeURIComponent(text)
-            + "&session_id=" + encodeURIComponent(streamSid)
-            + "&turn_id=" + encodeURIComponent(expectedTurnId)
-            + "&last_event_seq=" + encodeURIComponent(resumeEventSeq)
-            + "&model=" + encodeURIComponent(sendModel)
-            + "&permission=" + encodeURIComponent(sendPermission)
-            + "&mobile=" + (streamMobile ? "1" : "0")
-            + (attachIds.length ? "&image_ids=" + encodeURIComponent(attachIds.join(",")) : "")
-            + "&token=" + encodeURIComponent(this.token);
-        } else {
-          if (!tr.ok) {
-            // Transient 5xx — one retry before giving up.
-            tr = await _mintTicket();
+        const muxReady = await this._ensureChatMux();
+        if (muxReady) {
+          useMux = true;
+          let admittedTurnId = expectedTurnId;
+          if (!isReconnect) {
+            const startTurn = async () => await fetch("/api/chat/turns/start", {
+              method: "POST",
+              headers: Object.assign({ "Content-Type": "application/json" }, this.hdr()),
+              signal: streamStartController.signal,
+              body: JSON.stringify({
+                prompt: text,
+                session_id: streamSid,
+                model: sendModel,
+                permission: sendPermission,
+                image_ids: attachIds.length ? attachIds.join(",") : "",
+                mobile: streamMobile,
+              }),
+            });
+            let tr = await startTurn();
+            if (tr.status === 404 || tr.status === 405) {
+              this._setChatMuxUnsupported();
+              useMux = false;
+            } else {
+              if (tr.status === 409 && !resumed) {
+                const queued = await this._enqueueMessage(streamSid, {
+                  text,
+                  displayText: hasDetachedText ? detachedDisplayText : composerInput,
+                  pendingImages: hasDetachedText ? [] : composerImages,
+                  pendingDocs: hasDetachedText ? [] : composerDocs,
+                  pendingQuotes: hasDetachedText ? [] : composerQuotes,
+                  permission: sendPermission,
+                  plan_return_permission: sendPlanReturnPermission,
+                });
+                if (queued) {
+                  rollbackUnstartedSend(false);
+                  if (isComposerSubmission) {
+                    this._commitChatRecoveryDraft(sendSid, composerInput);
+                  }
+                  this.toast(this.lang === "zh"
+                    ? "当前任务仍在收尾，消息已加入队列"
+                    : "The current task is still finishing; message queued",
+                  "info", 2800);
+                  return true;
+                }
+              }
+              if (!tr.ok) tr = await startTurn();
+              if (!tr.ok) throw new Error("turn start " + tr.status);
+              const admitted = await tr.json();
+              if (admitted.accepted === false || !admitted.turn_id) {
+                throw new Error("turn not accepted");
+              }
+              admittedTurnId = String(admitted.turn_id);
+              streamState.activeTurnId = admittedTurnId;
+              streamState.parentTurnId = "";
+              streamState.lastEventSeq = 0;
+              if (sentUserBubble) sentUserBubble._turnId = admittedTurnId;
+              if (Number(admitted.started_at) > 0) {
+                streamState._streamStartedAt = Number(admitted.started_at) * 1000;
+              }
+            }
           }
-          if (!tr.ok) throw new Error("ticket " + tr.status);
-          const td = await tr.json();
-          url = "/api/chat/stream?ticket=" + encodeURIComponent(td.ticket);
+          if (useMux) {
+            es = this._chatMuxChannel(streamSid, admittedTurnId);
+          }
+        } else if (this._chatMuxSupported !== false) {
+          throw new Error("mux unavailable");
+        }
+        if (!useMux) {
+          let tr = await _mintLegacyTicket();
+          if (tr.status === 404 || tr.status === 405) {
+            url = "/api/chat/stream"
+              + "?prompt=" + encodeURIComponent(text)
+              + "&session_id=" + encodeURIComponent(streamSid)
+              + "&turn_id=" + encodeURIComponent(expectedTurnId)
+              + "&last_event_seq=" + encodeURIComponent(resumeEventSeq)
+              + "&model=" + encodeURIComponent(sendModel)
+              + "&permission=" + encodeURIComponent(sendPermission)
+              + "&mobile=" + (streamMobile ? "1" : "0")
+              + (attachIds.length ? "&image_ids=" + encodeURIComponent(attachIds.join(",")) : "")
+              + "&token=" + encodeURIComponent(this.token);
+          } else {
+            if (!tr.ok) tr = await _mintLegacyTicket();
+            if (!tr.ok) throw new Error("ticket " + tr.status);
+            const td = await tr.json();
+            url = "/api/chat/stream?ticket=" + encodeURIComponent(td.ticket);
+          }
+          es = new EventSource(url);
         }
       } catch (_e) {
         if (streamState._cancelBeforeStream) {
-          // stop() already performed the authoritative local cleanup. The
-          // ticket was never consumed, so no backend turn/transcript exists.
           rollbackUnstartedSend();
           return false;
         }
-        // Could not mint a ticket (server error / network) — fail the send
-        // visibly rather than leaking prompt+token into the URL.
         rollbackUnstartedSend();
         this.toast(this.lang === "zh"
           ? "发送失败：无法建立流式连接，请重试"
@@ -27761,13 +29453,11 @@ function portal() {
         }
       }
       if (streamState._cancelBeforeStream) {
-        // Ticket minted but Stop landed first — same rollback. The ticket is
-        // never consumed and expires on its own.
         rollbackUnstartedSend();
         return false;
       }
-      const es = new EventSource(url);
       streamState.es = es;
+      const streamTurnId = String(streamState.activeTurnId || expectedTurnId || "");
       // NOTE — a successful open deliberately does NOT reset
       // _reconnectAttempts. Every reconnect DOES open successfully (the
       // backend replays the turn happily), so resetting here made the
@@ -27849,14 +29539,31 @@ function portal() {
         if (ev && ev.type !== "ping" && ev.type !== "error") {
           streamState._serverActiveObserved = true;
         }
+        if (ev && streamState.streamPhase !== "running" && [
+          "text", "thinking", "tool_use", "tool_result", "compact_progress",
+          "task_started", "task_progress", "task_notification", "rate_limit",
+          "ask_user_question", "permission_request", "permission_request_resolved",
+          "permission_mode_changed", "permission_mode_change_failed",
+        ].includes(ev.type)) {
+          streamState.streamPhase = "running";
+        }
       };
-      ["text", "thinking", "tool_use", "tool_result", "task_started",
+      ["startup", "text", "thinking", "tool_use", "tool_result", "compact_progress", "task_started",
        "task_progress", "task_notification", "rate_limit",
        "ask_user_question", "permission_request", "permission_request_resolved",
        "permission_mode_changed",
        "permission_mode_change_failed", "ping",
        "done", "error", "cancelled", "resync"].forEach(
         t => es.addEventListener(t, _bumpSse));
+      es.addEventListener("startup", ev => {
+        let payload = {};
+        try { payload = JSON.parse(ev.data) || {}; } catch (_) {}
+        const phase = String(payload.phase || "accepted");
+        if (streamState.streamPhase === "running") return;
+        const knownPhase = phase === "accepted" || phase === "runtime"
+          || phase === "tools" || phase === "context";
+        streamState.streamPhase = knownPhase ? phase : "accepted";
+      });
       if (streamState._stallWatch) clearInterval(streamState._stallWatch);
       streamState._stallWatch = setInterval(() => {
         if (!streamState.streaming) return;
@@ -27867,10 +29574,14 @@ function portal() {
           || (sync.pending && sync.pending.stream_health)
         ));
         if (silentMs > 40000 && !healthProbePending) {
-          // 40s of total silence (server pings every 15s → ≥2 missed) means
-          // the connection is dead in a way onerror never caught. Tear down
-          // the watchdog and drive the existing reconnect logic via a
-          // synthetic error (no ev.data → JSON.parse throws → transport path).
+          // A mux channel never owns the native socket. Reconnect the one root
+          // transport without sending a synthetic per-session terminal/error.
+          if (es._muxChannel) {
+            this._scheduleChatMuxReconnect();
+            this._recoverStalledStream(streamSid);
+            return;
+          }
+          // Legacy per-session SSE keeps the existing transparent retry path.
           clearInterval(streamState._stallWatch);
           streamState._stallWatch = null;
           try { es.dispatchEvent(new Event("error")); } catch (_) {}
@@ -27886,6 +29597,9 @@ function portal() {
       // tab is active).
       let curBubble = null;
       let acc = "";
+      let thinkingBubble = null;
+      let thinkingAcc = "";
+      const pendingTaskProgress = new Map();
       if (isReconnect && resumeEventSeq > 0 && !isContinuation) {
         const existing = streamState.messages;
         const tail = existing[existing.length - 1];
@@ -27895,30 +29609,17 @@ function portal() {
         }
       }
       const modelForBubble = sendModel;
-      // Scroll only if the active tab is the one receiving the stream;
-      // otherwise we'd yank the user away from whatever they're reading.
-      const _scrollIfActive = () => {
-        this._scheduleLiveMessageViewport(streamState);
-        if (this.currentId !== streamSid) return;
-        // Refresh the measured viewport window throughout a long agentic turn.
-        // The final streaming rows remain mounted separately when the reader is
-        // scrolled up, while auto-follow still pins the main window to the tail.
-        if (streamState.atBottom !== false) this.scrollToBottom(false);
-      };
-      // Coalesced variant for event bursts. A turn that settles N background
-      // tasks at once delivers N task_notification events back-to-back; calling
-      // _scrollIfActive per event repeatedly recalculates rows and scroll geometry.
-      // Collapse the whole burst to avoid the reported conversation-pane flicker
-      // into one pass on the next frame — the card patches themselves are
-      // already applied synchronously, so nothing visible is delayed beyond a
-      // single frame.
+      // Every event mutates reactive state synchronously, but physical scrolling
+      // is shared and single-flight: one burst gets at most one layout pass/frame.
       let _scrollCoalesceHandle = null;
-      const _scrollIfActiveSoon = () => {
+      const _scrollIfActive = () => {
         if (_scrollCoalesceHandle !== null) return;
         const run = () => {
           _scrollCoalesceHandle = null;
           if (!ownsStreamState()) return;
-          _scrollIfActive();
+          this._scheduleLiveMessageViewport(streamState);
+          if (this.currentId !== streamSid || streamState.atBottom === false) return;
+          this.scrollToBottom(false);
         };
         _scrollCoalesceHandle = (typeof requestAnimationFrame === "function")
           ? requestAnimationFrame(run)
@@ -28011,6 +29712,7 @@ function portal() {
         pendingTimer = null;
         pendingFrame = null;
         if (!ownsCurBubble()) { curBubble = null; acc = ""; return; }
+        if (this.currentId !== streamSid) return;
         curBubble.text = acc;
         curBubble._streamText = acc;
         curBubble._streamPlain = true;
@@ -28019,7 +29721,7 @@ function portal() {
         _scrollIfActive();
       };
       const schedulePlainPaint = () => {
-        if (pendingTimer || pendingFrame) return;
+        if (this.currentId !== streamSid || pendingTimer || pendingFrame) return;
         const queueFrame = () => {
           pendingTimer = null;
           if (typeof requestAnimationFrame === "function") {
@@ -28049,7 +29751,28 @@ function portal() {
         if (ownsCurBubble()) renderFinal();
         else { cancelPendingPaint(); curBubble = null; acc = ""; }
       };
-      const closeAsst = () => { flushRender(); curBubble = null; acc = ""; };
+      const flushPlainBoundary = () => {
+        cancelPendingPaint();
+        if (!ownsCurBubble()) { curBubble = null; acc = ""; return; }
+        curBubble.text = acc;
+        curBubble._streamText = acc;
+        curBubble._streamPlain = true;
+        if (this.currentId === streamSid) _scrollIfActive();
+      };
+      const closeAsst = () => {
+        flushPlainBoundary();
+        curBubble = null;
+        acc = "";
+      };
+      const flushThinking = () => {
+        if (!ownsStreamState() || !thinkingBubble) return;
+        thinkingBubble.text = thinkingAcc;
+      };
+      const closeThinking = () => {
+        flushThinking();
+        thinkingBubble = null;
+        thinkingAcc = "";
+      };
       const _setContinuationAwaitingReaction = (waiting) => {
         if (!isContinuation) return;
         const next = !!waiting;
@@ -28083,43 +29806,87 @@ function portal() {
       };
       streamState._renderStreamingHtml = renderStreamingHtml;
 
-      // Attach SDK-native background-task lifecycle state to the launching
-      // tool_use card. The Task* messages (TaskStarted/Progress/Notification)
-      // carry tool_use_id = the SDK id of the Agent/Bash tool_use that started
-      // the background task, so we locate that message in the live turn and
-      // stamp `task_status` on it. The subagent card (index.html) renders
-      // ⏳ running → ✅/❌ from this. merge=true so a later progress/terminal
-      // event keeps fields an earlier event already set.
+      // Task lifecycle patches can arrive in large terminal bursts. Index the
+      // resident repository once, then update cards in O(1) even when a hard DOM
+      // window has temporarily unmounted the launching row.
+      const taskCardByToolUseId = new Map();
+      const taskCardByTaskId = new Map();
+      let taskCardIndexReady = false;
+      const registerTaskCard = card => {
+        if (!card || card.role !== "tool_use") return;
+        if (card.id) taskCardByToolUseId.set(String(card.id), card);
+        const taskId = card.task_status && card.task_status.task_id;
+        if (taskId) taskCardByTaskId.set(String(taskId), card);
+      };
+      const ensureTaskCardIndex = () => {
+        if (taskCardIndexReady) return;
+        for (const message of streamState.messages) registerTaskCard(message);
+        taskCardIndexReady = true;
+      };
       const applyTaskStatus = (toolUseId, patch, merge = true) => {
-        const msgs = streamState.messages;
-        for (let k = msgs.length - 1; k >= 0; k--) {
-          // role check is LOAD-BEARING: the tool_result bubble carries the
-          // SAME toolu_xxx id as its tool_use card and sits AFTER it, so a
-          // reverse scan on id alone hits the tool_result and stamps
-          // task_status where no template renders it. task_started slipped
-          // through only because the typed message arrives BEFORE the
-          // tool_result; every TERMINAL notification arrived after and was
-          // silently swallowed — the ⏳ card never flipped live (2026-06-11).
-          const byToolUse = !!toolUseId && msgs[k] && msgs[k].id === toolUseId;
-          // TaskUpdatedMessage deliberately has no top-level tool_use_id.
-          // Fall back to the task_id stamped by the earlier TaskStarted event,
-          // otherwise terminal-only task_updated patches leave the card on ⏳.
-          const byTask = !toolUseId && patch && patch.task_id && msgs[k]
-            && msgs[k].task_status
-            && msgs[k].task_status.task_id === patch.task_id;
-          if (msgs[k] && (byToolUse || byTask)
-              && msgs[k].role === "tool_use") {
-            const prev = (merge && msgs[k].task_status) ? msgs[k].task_status : {};
-            msgs[k].task_status = Object.assign({}, prev, patch);
-            return;
-          }
+        ensureTaskCardIndex();
+        let card = toolUseId
+          ? taskCardByToolUseId.get(String(toolUseId)) : null;
+        if (!card && patch && patch.task_id) {
+          card = taskCardByTaskId.get(String(patch.task_id));
         }
+        if (!card || card.role !== "tool_use") {
+          if (toolUseId) taskCardByToolUseId.delete(String(toolUseId));
+          if (patch && patch.task_id) taskCardByTaskId.delete(String(patch.task_id));
+          return;
+        }
+        const prev = (merge && card.task_status) ? card.task_status : {};
+        card.task_status = this._normalizeTaskStatusPreview(
+          Object.assign({}, prev, patch));
+        if (card.id) taskCardByToolUseId.set(String(card.id), card);
+        if (card.task_status.task_id) {
+          taskCardByTaskId.set(String(card.task_status.task_id), card);
+        }
+      };
+      const taskProgressKey = (toolUseId, patch) => String(
+        toolUseId || (patch && patch.task_id) || "",
+      );
+      const queueTaskProgress = (toolUseId, patch) => {
+        const key = taskProgressKey(toolUseId, patch);
+        if (!key) return;
+        const pending = pendingTaskProgress.get(key);
+        pendingTaskProgress.set(key, {
+          toolUseId,
+          patch: Object.assign({}, pending ? pending.patch : {}, patch),
+        });
+      };
+      const flushTaskProgress = () => {
+        if (!ownsStreamState() || !pendingTaskProgress.size) return;
+        for (const pending of pendingTaskProgress.values()) {
+          applyTaskStatus(pending.toolUseId, pending.patch);
+        }
+        pendingTaskProgress.clear();
+      };
+      const flushLivePresentation = () => {
+        if (!ownsStreamState() || this.currentId !== streamSid) return false;
+        if (ownsCurBubble()) paintPlainNow();
+        flushThinking();
+        flushTaskProgress();
+        return true;
+      };
+      streamState._flushLivePresentation = flushLivePresentation;
+      const flushTerminalPresentation = () => {
+        const completedBubble = ownsCurBubble() ? curBubble : null;
+        if (completedBubble) flushRender();
+        else { cancelPendingPaint(); curBubble = null; acc = ""; }
+        closeThinking();
+        flushTaskProgress();
+        const completedText = completedBubble ? (completedBubble.text || "") : "";
+        curBubble = null;
+        acc = "";
+        return { bubble: completedBubble, text: completedText };
       };
 
       es.addEventListener("text", ev => {
         let d;
         try { d = JSON.parse(ev.data); } catch (_) { return; }
         _setContinuationAwaitingReaction(false);
+        closeThinking();
         if (!openAsst()) return;
         acc += d.text;
         // Keep the currently painted snapshot stable while the user selects it.
@@ -28136,27 +29903,26 @@ function portal() {
         try { d = JSON.parse(ev.data); } catch (_) { return; }
         _setContinuationAwaitingReaction(false);
         closeAsst();
-        // Backend yields one SSE event per thinking_delta. Coalesce them
-        // into the most recent thinking message so we see ONE block per
-        // reasoning segment, not N tiny ones. If the tail isn't a thinking
-        // message (e.g. previous was tool_use), start a new one.
-        const msgs = streamState.messages;
-        const last = msgs[msgs.length - 1];
-        let pushed = false;
-        if (last && last.role === "thinking") {
-          last.text = (last.text || "") + (d.text || "");
-        } else {
-          this._appendLiveMessage(streamState, { role: "thinking", text: d.text || "" });
-          pushed = true;
+        // Keep one thinking row per contiguous reasoning segment, but publish
+        // token-rate text only for the visible tab. Background streams retain
+        // the complete closure accumulator and flush once on activation/boundary.
+        if (!thinkingBubble) {
+          thinkingBubble = this._appendLiveMessage(
+            streamState, { role: "thinking", text: "" });
+          thinkingAcc = "";
         }
-
-        _scrollIfActive();
+        thinkingAcc += d.text || "";
+        if (this.currentId === streamSid) {
+          thinkingBubble.text = thinkingAcc;
+          _scrollIfActive();
+        }
       });
       es.addEventListener("tool_use", ev => {
         let d;
         try { d = JSON.parse(ev.data); } catch (_) { return; }
         _setContinuationAwaitingReaction(false);
         closeAsst();
+        closeThinking();
         // `id` is the SDK's toolu_xxx tool_use_id. Critical for
         // _taskSubjectMapForMessages — it pairs each TaskCreate
         // tool_use with the tool_result that carries the assigned
@@ -28179,7 +29945,8 @@ function portal() {
         if (d.todos != null) msg.todos = d.todos;
         if (d.task != null) msg.task = d.task;
         if (d.plan != null) msg.plan = d.plan;
-        this._appendLiveMessage(streamState, msg);
+        const liveToolCard = this._appendLiveMessage(streamState, msg);
+        registerTaskCard(liveToolCard);
         // File-mutating tools invalidate any open preview of the same file.
         // Bump previewVersion → rawUrl picks up a new ?_v= → iframe reloads;
         // _reloadPreviewIfDirty re-fetches md/text contents inline.
@@ -28228,16 +29995,19 @@ function portal() {
       es.addEventListener("task_progress", ev => {
         let d;
         try { d = JSON.parse(ev.data); } catch (_) { return; }
-        applyTaskStatus(d.tool_use_id, {
+        const patch = {
           task_id: d.task_id,
           state: "running",
           usage: d.usage || null,
           last_tool_name: d.last_tool_name || "",
-        });
+        };
+        if (this.currentId === streamSid) applyTaskStatus(d.tool_use_id, patch);
+        else queueTaskProgress(d.tool_use_id, patch);
       });
       es.addEventListener("task_notification", ev => {
         let d;
         try { d = JSON.parse(ev.data); } catch (_) { return; }
+        flushTaskProgress();
         // SDK status ∈ {completed, failed, stopped}; map unknown → "done"
         // so a future status value still renders a terminal (not stuck)
         // state instead of silently staying on ⏳.
@@ -28247,6 +30017,8 @@ function portal() {
           task_id: d.task_id,
           state: st,
           summary: d.summary || "",
+          summary_length: d.summary_length,
+          summary_truncated: d.summary_truncated,
           output_file: d.output_file || "",
         });
         const remaining = Number(d.background_tasks_pending);
@@ -28264,7 +30036,7 @@ function portal() {
         // A task notification only updates its existing card. User-visible
         // completion feedback is the durable Agent continuation bubble; its
         // revision adoption owns the off-screen unread dot exactly once.
-        _scrollIfActiveSoon();
+        _scrollIfActive();
       });
       es.addEventListener("rate_limit", ev => {
         let d;
@@ -28308,6 +30080,7 @@ function portal() {
         let d;
         try { d = JSON.parse(ev.data); } catch (_) { return; }
         closeAsst();
+        closeThinking();
         // Pre-populate pendingAnswers with one key per question (multiSelect
         // → []; single → null). Without this, Alpine's Proxy doesn't reliably
         // re-evaluate :class={picked: ...} when we add a brand-new key on
@@ -28337,6 +30110,7 @@ function portal() {
         let d;
         try { d = JSON.parse(ev.data); } catch (_) { return; }
         closeAsst();
+        closeThinking();
         const exitPlan = d.kind === "exit_plan"
           || d.kind === "exit_plan_mode"
           || d.tool === "ExitPlanMode";
@@ -28513,17 +30287,31 @@ function portal() {
         authoritativeTerminal = false,
         completionMeta = null,
       ) => {
+        const followedTail = streamState.atBottom !== false
+          && !this._messageRangeHasLater(streamState);
         // A terminal stream cannot service permission buttons anymore. Expire
         // untouched cards, and fail an accepted ExitPlan transition if its
         // permission-mode commit never arrived.
         _finalizePendingPermissionRequests();
         streamState.streaming = false;
+        streamState.streamPhase = "";
         streamState._continuationAwaitingReaction = false;
         streamState.es = null;
+        if (streamState._flushLivePresentation === flushLivePresentation) {
+          streamState._flushLivePresentation = null;
+        }
+        pendingTaskProgress.clear();
+        if (followedTail) {
+          this._boundLiveMessageRange(streamState, true);
+          streamState.atBottom = true;
+        }
+        this._enforceMessageRangeInvariant(streamState);
         streamState._streamStartController = null;
         streamState._cancelBeforeStream = false;
-        streamState._stopping = false;
-        streamState._optimisticInterrupt = false;
+        const terminalTurnId = streamTurnId || String(streamState.activeTurnId || "");
+        if (streamState._stoppingTurnId === terminalTurnId) {
+          streamState._stoppingTurnId = "";
+        }
         streamState._serverActiveObserved = false;
         // Belt-and-braces for the auto-compact bubble: a turn that dies inside
         // /compact (transport drop, 10-min timeout) may never deliver the
@@ -28716,7 +30504,7 @@ function portal() {
         }
       };
       es.addEventListener("done", ev => {
-        flushRender();
+        const completedAssistant = flushTerminalPresentation();
         // Guard JSON.parse: a malformed/empty `done` payload must NOT throw
         // before es.close()/_markDone()/_stopTimer() run below, else the
         // EventSource + timer interval leak and the UI stays streaming=true
@@ -28724,11 +30512,11 @@ function portal() {
         // d.* read below is null-safe on a missing field.
         let d;
         try { d = JSON.parse(ev.data); } catch (_) { d = {}; }
-        if (d.total_cost_usd != null && ownsCurBubble()) {
-          curBubble.cost = "$" + d.total_cost_usd.toFixed(4);
+        if (d.total_cost_usd != null && completedAssistant.bubble) {
+          completedAssistant.bubble.cost = "$" + d.total_cost_usd.toFixed(4);
         }
-        if (d.memory_recall && ownsCurBubble()) {
-          curBubble.memoryRecall = d.memory_recall;
+        if (d.memory_recall && completedAssistant.bubble) {
+          completedAssistant.bubble.memoryRecall = d.memory_recall;
         }
         if (d.stats) this.stats = { ...this.stats, ...d.stats };
         if (d.session_usage) {
@@ -28794,7 +30582,7 @@ function portal() {
         // stop — stop closes the ES). The relevant case for this branch
         // is page-reload-then-reconnect picking up a turn that finished
         // after being cancelled before reload.
-        const completedFinalText = ownsCurBubble() ? (curBubble.text || "") : "";
+        const completedFinalText = completedAssistant.text;
         const continuationFinalText = isContinuation ? completedFinalText : "";
         const backgroundPending = !d.cancelled
           ? Math.max(0, Number(d.background_tasks_pending) || 0)
@@ -28914,7 +30702,7 @@ function portal() {
         this.$nextTick(() => this._ensureBgContPoller(streamSid));
       });
       es.addEventListener("resync", ev => {
-        flushRender();
+        flushTerminalPresentation();
         let payload = {};
         try { payload = JSON.parse(ev.data) || {}; } catch (_) {}
         const reason = payload.reason || "replay_truncated";
@@ -28925,6 +30713,10 @@ function portal() {
         if (streamState._stallWatch) clearInterval(streamState._stallWatch);
         streamState._stallWatch = null;
         streamState.es = null;
+        if (streamState._flushLivePresentation === flushLivePresentation) {
+          streamState._flushLivePresentation = null;
+        }
+        pendingTaskProgress.clear();
         if (streamMobile && reason === "replay_truncated") {
           this.toast(this.lang === "zh"
             ? "回复数据量较大，完成后会自动从会话记录同步"
@@ -28939,7 +30731,7 @@ function portal() {
         streamState._canonicalResyncReason = reason;
       });
       es.addEventListener("error", async ev => {
-        flushRender();
+        flushTerminalPresentation();
         // One terminal server error may be followed by EventSource's own EOF
         // error. Busy handoff performs async durable persistence, so claim the
         // transport before its first await and make every later callback a
@@ -29210,16 +31002,17 @@ function portal() {
           return;
         }
 
-        // Exponential backoff: 800 ms, 1.6 s, 3.2 s. _checkActiveTurn
+        // Exponential backoff with bounded jitter (800 ms / 1.6 s / 3.2 s base).
+        // _checkActiveTurn
         // confirms the backend turn is still in flight before opening a
         // fresh SSE — if the turn finished cleanly while we were
         // disconnected, it loads the session view from disk instead, so
         // the user sees the completed reply rather than an in-progress
         // bubble that never resolves.
-        const delay = 800 * Math.pow(2, attempts - 1);
+        const delay = this._retryDelay(attempts);
         this._requestSessionSync(streamSid, "transport_retry", {
           delayMs: delay,
-          run: async () => {
+          run: async (signal) => {
           // User switched to another tab mid-backoff. The ORIGIN tab's turn
           // is still running on the server — don't _markDone() it (that
           // abandons the transparent reconnect and clears the origin owner's
@@ -29233,8 +31026,10 @@ function portal() {
           // streamState.streaming is still true from initial send(); use
           // it as the in-flight gate _checkActiveTurn checks internally.
           try {
-            const r = await fetch(`/api/chat/sessions/${streamSid}/active`,
-                                    { headers: this.hdr() });
+            const r = await this._fetchWithDeadline(
+              `/api/chat/sessions/${streamSid}/active`,
+              { headers: this.hdr(), signal },
+            );
             if (!r.ok) throw new Error("active probe failed");
             const d = await r.json();
             if (!d.active) {
@@ -29294,7 +31089,7 @@ function portal() {
               // Schedule next retry ourselves since the old EventSource is
               // closed and no new transport error will fire.
               this._requestSessionSync(streamSid, "transport_retry", {
-                delayMs: 800 * Math.pow(2, attempts),
+                delayMs: this._retryDelay(attempts + 1),
                 run: () => {
                   if (this.currentId !== streamSid) return false;
                   streamState.streaming = false;
@@ -29309,13 +31104,10 @@ function portal() {
         });
       });
       es.addEventListener("cancelled", ev => {
-        flushRender();
+        flushTerminalPresentation();
         let d = {};
         try { d = JSON.parse(ev.data || "{}"); } catch (_) { d = {}; }
-        const alreadySettledOptimistically = !!streamState._optimisticInterrupt;
-        if (!alreadySettledOptimistically) {
-          this.toast(this.lang === "zh" ? "已中断" : "Interrupted", "warn", 2000);
-        }
+        this.toast(this.lang === "zh" ? "已中断" : "Interrupted", "warn", 2000);
         es.close();
         _markDone(true, false, true, {
           model: modelForBubble,
@@ -29358,6 +31150,7 @@ function portal() {
             }, 800);
         }
       });
+      if (useMux) this._activateChatMuxChannel(es);
       // NOTE: errors are owned exclusively by the addEventListener("error")
       // handler above (rich classification + exponential-backoff transparent
       // reconnect). A redundant `es.onerror` here used to also fire on the
@@ -29381,28 +31174,16 @@ function portal() {
       const sid = this.currentId;
       if (!sid || !this.isTabStreaming(sid)) return;
       const st = this._ensureTabState(sid);
-      if (st._stopping) return;
-      st._stopping = true;
+      const ownerTurnId = String(st.activeTurnId || "");
+      if (ownerTurnId && st._stoppingTurnId === ownerTurnId) return;
       if (st.pendingQueue && st.pendingQueue.length > 0) st._queuePaused = true;
-      // The earliest Stop window is before EventSource exists, while send()
-      // is still minting its one-time ticket. No backend turn exists yet, so
-      // /interrupt cannot find anything. Abort locally and restore idle state
-      // immediately; the ticket is never consumed and expires harmlessly.
-      if (st._streamStartController && !st.es) {
+      // Before a channel and immutable turn id exist, abort only the start
+      // request. send() rollback remains the sole owner of stream flags, timers,
+      // channel state and the draft; Stop must not manufacture optimistic idle.
+      if (st._streamStartController && !st.es && !ownerTurnId) {
         st._cancelBeforeStream = true;
         st._streamStartController.abort();
-        st._streamStartController = null;
-        if (st._streamTimer) clearInterval(st._streamTimer);
-        st._streamTimer = null;
-        st._streamStartedAt = 0;
-        st.streamElapsed = 0;
-        st.streaming = false;
-        st._stopping = false;
-        st.streamingModel = "";
         if (st.pendingQueue && st.pendingQueue.length > 0) {
-          // No backend turn exists yet, but the durable queue may already do.
-          // Persist the same Stop semantics instead of leaving only the local
-          // banner paused while the server remains free to drain it.
           try {
             await fetch(`/api/chat/sessions/${encodeURIComponent(sid)}/queue/pause`, {
               method: "POST",
@@ -29412,41 +31193,54 @@ function portal() {
           } catch (_) { /* queue sync below/next activation reconciles */ }
           this._syncQueueFromServer(sid);
         }
-        this.toast(this.lang === "zh" ? "已中断" : "Interrupted", "warn", 1500);
         return;
       }
-      // Optimistic stop: settle the human-facing state in this same click frame.
-      // Keep the EventSource attached so a cancelled event can still persist and
-      // quietly adopt the final partial-output snapshot. A subsequent send may
-      // replace that transport; its ownership guards make late old-turn events no-op.
+      if (!ownerTurnId) return;
+
       const ownerEs = st.es;
-      st._optimisticInterrupt = true;
-      st.streaming = false;
-      st._stopping = false;
-      if (st._streamTimer) clearInterval(st._streamTimer);
-      if (st._stallWatch) clearInterval(st._stallWatch);
-      st._streamTimer = null;
-      st._stallWatch = null;
-      this._setSessionActivityExpectation(sid, false);
-      this.toast(this.lang === "zh" ? "已中断" : "Interrupted", "warn", 1500);
+      st._stoppingTurnId = ownerTurnId;
+      const stillOwnsTurn = () => this.tabState[sid] === st
+        && st.es === ownerEs
+        && String(st.activeTurnId || "") === ownerTurnId;
+      const applyAuthoritativeStatus = payload => {
+        if (!payload || !stillOwnsTurn()) return "stale";
+        const active = !!payload.active;
+        const turnId = String(payload.turn_id || payload.current_turn_id || "");
+        if (active && turnId !== ownerTurnId) return "successor";
+        if (!active) {
+          if (turnId && turnId !== ownerTurnId) return "successor";
+          if (st._stoppingTurnId === ownerTurnId) st._stoppingTurnId = "";
+          this._retireStaleSessionStream(sid, st);
+          this._setSessionActivityExpectation(sid, false);
+          st._pendingExternalUpdate = true;
+          this._scheduleCanonicalStreamReload(sid, st, { minimumWaitMs: 0 });
+          return "inactive";
+        }
+        if (payload.stopping) return "stopping";
+        if (st._stoppingTurnId === ownerTurnId) st._stoppingTurnId = "";
+        st._sessionActivityExpected = null;
+        this.sessions = (this.sessions || []).map(session => session.id === sid
+          ? { ...session, active: true, turn_active: true, background_active: false }
+          : session);
+        return "running";
+      };
 
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 3000);
       try {
         const r = await fetch(
-          "/api/chat/interrupt?session_id=" + encodeURIComponent(sid),
+          "/api/chat/interrupt?session_id=" + encodeURIComponent(sid)
+            + "&turn_id=" + encodeURIComponent(ownerTurnId),
           { method: "POST", headers: this.hdr(), signal: controller.signal },
         );
         if (!r.ok) throw new Error("interrupt failed");
-        // The backend marks the broadcast cancelled and arms its force-stop
-        // watchdog before replying. An empty `interrupted` list therefore still
-        // means the hard-stop path owns convergence; no visible rollback needed.
+        applyAuthoritativeStatus(await r.json());
       } catch (_e) {
-        // A failed HTTP response is ambiguous: the request may have reached the
-        // backend before the connection dropped. Probe authoritative liveness
-        // before undoing the optimistic transition, and never overwrite a newer
-        // stream that already replaced this EventSource.
-        let active = null;
+        // The request may have reached the backend before the response failed.
+        // Probe exact ownership and apply the same state matrix: retain matching
+        // active+stopping, restore matching active+running, settle inactive, and
+        // never mutate an ABA successor.
+        let status = null;
         try {
           const probeController = new AbortController();
           const probeTimeout = setTimeout(() => probeController.abort(), 2500);
@@ -29454,27 +31248,16 @@ function portal() {
             const probe = await fetch(`/api/chat/sessions/${encodeURIComponent(sid)}/active`, {
               headers: this.hdr(), signal: probeController.signal,
             });
-            if (probe.ok) active = !!(await probe.json()).active;
+            if (probe.ok) status = await probe.json();
           } finally { clearTimeout(probeTimeout); }
-        } catch (_) { active = null; }
-        if (this.tabState[sid] === st && st.es === ownerEs && active === true) {
-          st._optimisticInterrupt = false;
-          st.streaming = true;
-          st._sessionActivityExpected = null;
-          this.sessions = (this.sessions || []).map(session => session.id === sid
-            ? { ...session, active: true, turn_active: true, background_active: false }
-            : session);
-          if (st._streamStartedAt && !st._streamTimer) {
-            st._streamTimer = setInterval(() => {
-              st.streamElapsed = Math.max(
-                0, (Date.now() - st._streamStartedAt) / 1000);
-            }, 1000);
-          }
+        } catch (_) { status = null; }
+        const resolution = applyAuthoritativeStatus(status);
+        if (resolution === "running") {
           this.toast(this.lang === "zh"
             ? "停止失败，当前会话仍在运行"
             : "Could not stop; the session is still running",
           "error", 3000);
-        } else if (active === null) {
+        } else if (status === null) {
           this.toast(this.lang === "zh"
             ? "中断请求已提交，正在自动确认最终状态"
             : "Interrupt requested; confirming the final state",
@@ -30091,6 +31874,8 @@ function portal() {
 
     // ===== global cross-workspace activity center =====
     async fetchActivity(opts = {}) {
+      if (typeof document !== "undefined"
+          && document.visibilityState !== "visible") return false;
       const key = opts.summaryOnly ? "summary" : "events";
       // A full snapshot also satisfies a summary refresh. Conversely, if a
       // cheap summary is already in flight when the user opens the center,
@@ -30108,18 +31893,26 @@ function portal() {
         }
       }
       const seq = ++this._activityRequestSeq;
+      const controller = new AbortController();
+      this._activityFetchControllers[key] = controller;
       const promise = (async () => {
         try {
           const path = opts.summaryOnly ? "/api/activity/summary" : "/api/activity?limit=500";
           const headers = { ...this.hdr() };
           if (this._activityEtags[key]) headers["If-None-Match"] = this._activityEtags[key];
-          let r = await fetch(path, { headers });
-          // A long-lived tab can retain an ETag while Alpine state is rebuilt.
-          // Never accept a 304 as the only source for an empty task list.
-          if (r.status === 304 && !opts.summaryOnly && !this.activity.events.length) {
+          let r = await this._fetchWithDeadline(path, {
+            headers, signal: controller.signal,
+          });
+          // An ETag without a locally owned full snapshot cannot validate the
+          // rows. Recover once without conditionals; a loaded empty snapshot
+          // can safely reuse a 304 just like a non-empty one.
+          if (r.status === 304 && !opts.summaryOnly
+              && !this._activityEventsSnapshotLoaded) {
             delete this._activityEtags[key];
             delete headers["If-None-Match"];
-            r = await fetch(path, { headers, cache: "reload" });
+            r = await this._fetchWithDeadline(path, {
+              headers, cache: "reload", signal: controller.signal,
+            });
           }
           if (r.status === 304 || !r.ok) return false;
           const etag = r.headers.get("etag");
@@ -30148,8 +31941,14 @@ function portal() {
             );
           }
           if (!opts.summaryOnly && Array.isArray(data.events)) {
-            this.activity.events = data.events;
-            this._syncScheduledActivitySnapshot(data.events);
+            const events = data.events.slice(0, this.ACTIVITY_EVENT_CAP);
+            this.activity.events = events;
+            if (this.activity.moveMenu.show
+                && (!this._isMobileLayout() || !this.activityMoveMenuItem())) {
+              this.closeActivityMoveMenu(false);
+            }
+            this._activityEventsSnapshotLoaded = true;
+            this._syncScheduledActivitySnapshot(events);
           }
           if (!opts.summaryOnly) this.applyActivityGroupPayload(data);
           this._syncAppBadge();
@@ -30158,9 +31957,17 @@ function portal() {
       })();
       this._activityFetchPromises[key] = promise;
       try { return await promise; }
-      finally { if (this._activityFetchPromises[key] === promise) delete this._activityFetchPromises[key]; }
+      finally {
+        if (this._activityFetchPromises[key] === promise) {
+          delete this._activityFetchPromises[key];
+        }
+        if (this._activityFetchControllers[key] === controller) {
+          delete this._activityFetchControllers[key];
+        }
+      }
     },
     async openActivityCenter() {
+      this.closeActivityMoveMenu();
       this.closeMemoryRecallPopover();
       if (!this.activity.viewLoaded) {
         this.activity.viewLoaded = true;
@@ -30214,12 +32021,37 @@ function portal() {
         { key: "history", label: zh ? "历史任务" : "History" },
       ];
     },
+    ACTIVITY_EVENT_CAP: 500,
     ACTIVITY_GROUP_CAP: 5,
     ACTIVITY_CUSTOM_GROUP_CAP: 50,
     ACTIVITY_TIMELINE_CAP: 15,
     ACTIVITY_GROUP_COLORS: [
       "blue", "violet", "cyan", "green", "amber", "rose", "gray",
     ],
+    _activityDerivedSnapshot() {
+      const source = Array.isArray(this.activity.events)
+        ? this.activity.events : [];
+      const owner = _rawAlpine(this);
+      const rawSource = _rawAlpine(source);
+      const query = this.activitySearchQuery();
+      const lang = String(this.lang || "");
+      const limit = Math.max(0, Number(this.ACTIVITY_EVENT_CAP) || 0);
+      let cache = _activityDerivedCaches.get(owner);
+      if (!cache || cache.source !== rawSource || cache.query !== query
+          || cache.lang !== lang || cache.limit !== limit) {
+        cache = {
+          source: rawSource,
+          query,
+          lang,
+          limit,
+          events: source.slice(0, limit),
+          groups: new Map(),
+          searchCount: null,
+        };
+        _activityDerivedCaches.set(owner, cache);
+      }
+      return cache;
+    },
     normalizeActivityGroupOrder(order = this.activity.groupOrder) {
       const customIds = (this.activity.customGroups || [])
         .map(group => String(group.id || "")).filter(Boolean);
@@ -30238,6 +32070,17 @@ function portal() {
     applyActivityGroupPayload(data) {
       if (Array.isArray(data?.custom_groups)) {
         this.activity.customGroups = data.custom_groups;
+        const editor = this.activity.groupEditor;
+        if (editor?.open && editor.id && !editor.workspaceDirty) {
+          const current = data.custom_groups.find(
+            group => String(group?.id || "") === String(editor.id),
+          );
+          if (current) {
+            editor.workspaceId = String(current.workspace_id || "");
+            editor.originalWorkspaceId = editor.workspaceId;
+            editor.workspacePath = String(current.workspace_path || "");
+          }
+        }
       }
       if (Array.isArray(data?.group_order)) {
         this.activity.groupOrder = this.normalizeActivityGroupOrder(data.group_order);
@@ -30254,8 +32097,11 @@ function portal() {
           groupId: group.id,
           orderId: String(group.id || ""),
           color: group.color || "blue",
+          workspaceId: String(group.workspace_id || ""),
+          workspacePath: String(group.workspace_path || ""),
         },
       ]));
+      const customGroupCount = lookup.size;
       lookup.set("__ungrouped__", {
         key: "custom:__ungrouped__",
         label: this.lang === "zh" ? "未分组" : "Ungrouped",
@@ -30265,8 +32111,26 @@ function portal() {
         color: "gray",
         builtin: true,
       });
+      let customIndex = 0;
       return this.normalizeActivityGroupOrder()
-        .map(groupId => lookup.get(groupId)).filter(Boolean);
+        .map(groupId => lookup.get(groupId)).filter(Boolean)
+        .map(group => {
+          if (group.builtin) {
+            return {
+              ...group,
+              boardColumn: 3,
+              boardRow: 1,
+              boardRowSpan: Math.max(1, Math.ceil(customGroupCount / 2)),
+            };
+          }
+          const index = customIndex++;
+          return {
+            ...group,
+            boardColumn: (index % 2) + 1,
+            boardRow: Math.floor(index / 2) + 1,
+            boardRowSpan: 1,
+          };
+        });
     },
     activityMatchesGroup(item, key) {
       if (!item) return false;
@@ -30306,8 +32170,13 @@ function portal() {
       return fields.some(value => String(value || "").toLocaleLowerCase().includes(query));
     },
     activitySearchResultCount() {
-      if (!this.activitySearchQuery()) return (this.activity.events || []).length;
-      return (this.activity.events || []).filter(item => this.activityMatchesSearch(item)).length;
+      const cache = this._activityDerivedSnapshot();
+      if (!cache.query) return cache.events.length;
+      if (cache.searchCount === null) {
+        cache.searchCount = cache.events
+          .filter(item => this.activityMatchesSearch(item)).length;
+      }
+      return cache.searchCount;
     },
     clearActivitySearch() {
       if (!this.activitySearchQuery()) {
@@ -30320,6 +32189,11 @@ function portal() {
       return Number(item?.updated_at || item?.finished_at || item?.started_at || 0);
     },
     activityAllEvents(group) {
+      const cache = this._activityDerivedSnapshot();
+      const groupKey = String(group?.key || "");
+      const custom = !!group?.custom;
+      const cacheKey = `${groupKey}|${Number(custom)}`;
+      if (cache.groups.has(cacheKey)) return cache.groups.get(cacheKey);
       const activeRank = { waiting_approval: 0, paused: 1, running: 2 };
       const attentionRank = item => {
         if (this.activityRequiresAction(item)) return 0;
@@ -30327,18 +32201,18 @@ function portal() {
         if (["running", "waiting_approval", "paused"].includes(item.state)) return 2;
         return 3;
       };
-      return (this.activity.events || [])
-        .filter(item => this.activityMatchesGroup(item, group.key))
+      const events = cache.events
+        .filter(item => this.activityMatchesGroup(item, groupKey))
         // Search before applying the per-group row cap so a matching older
         // session remains discoverable even when it was outside the first page.
         .filter(item => this.activityMatchesSearch(item))
         .sort((a, b) => {
-          if (group.key === "timeline") {
+          if (groupKey === "timeline") {
             const pinRank = Number(!!b.pinned) - Number(!!a.pinned);
             if (pinRank) return pinRank;
             return this.activityEventTimestamp(b) - this.activityEventTimestamp(a);
           }
-          if (group.custom) {
+          if (custom) {
             const aManual = Number.isFinite(Number(a.group_order));
             const bManual = Number.isFinite(Number(b.group_order));
             // Newly arrived rows without a manual position remain visible at the
@@ -30348,7 +32222,7 @@ function portal() {
               const order = Number(a.group_order) - Number(b.group_order);
               if (order) return order;
             }
-            if (group.key === "custom:__ungrouped__") {
+            if (groupKey === "custom:__ungrouped__") {
               return this.activityEventTimestamp(b) - this.activityEventTimestamp(a);
             }
             const pinRank = Number(!!b.pinned) - Number(!!a.pinned);
@@ -30357,12 +32231,14 @@ function portal() {
             if (rank) return rank;
             return this.activityEventTimestamp(b) - this.activityEventTimestamp(a);
           }
-          if (group.key === "running") {
+          if (groupKey === "running") {
             const rank = (activeRank[a.state] ?? 9) - (activeRank[b.state] ?? 9);
             if (rank) return rank;
           }
           return this.activityEventTimestamp(b) - this.activityEventTimestamp(a);
         });
+      cache.groups.set(cacheKey, events);
+      return events;
     },
     activityEvents(group) {
       const all = this.activityAllEvents(group);
@@ -30529,7 +32405,51 @@ function portal() {
         this._activityPinPending = pending;
       }
     },
+    activityGroupWorkspaceEntry(group) {
+      const workspaceId = String(group?.workspaceId || group?.workspace_id || "");
+      if (!workspaceId) return null;
+      return (this.sessionWorkspaces || []).find(
+        workspace => String(workspace?.id || "") === workspaceId,
+      ) || null;
+    },
+    activityGroupWorkspaceLabel(group) {
+      const entry = this.activityGroupWorkspaceEntry(group);
+      if (entry) return entry.name || entry.path || this.t("activity.group.workspace");
+      const path = String(group?.workspacePath || group?.workspace_path || "");
+      if (!path) return "";
+      const parts = path.replace(/[\\/]+$/, "").split(/[\\/]/);
+      return parts[parts.length - 1] || path;
+    },
+    activityGroupWorkspaceAvailable(group) {
+      return !!this.activityGroupWorkspaceEntry(group);
+    },
+    async openActivityGroupWorkspace(group) {
+      const groupId = String(group?.groupId || group?.id || "");
+      const expectedWorkspaceId = String(
+        group?.workspaceId || group?.workspace_id || "",
+      );
+      if (!expectedWorkspaceId) return false;
+      const refreshed = await this.fetchSessionWorkspaces({
+        restoreCache: false,
+        validateActive: false,
+      });
+      const currentGroup = (this.activity.customGroups || []).find(
+        row => String(row?.id || "") === groupId,
+      );
+      const currentWorkspaceId = String(currentGroup?.workspace_id || "");
+      const entry = (this.sessionWorkspaces || []).find(
+        workspace => String(workspace?.id || "") === expectedWorkspaceId,
+      );
+      if (!refreshed || currentWorkspaceId !== expectedWorkspaceId || !entry) {
+        this.toast(this.t("activity.group.workspace_rebind"), "error");
+        return false;
+      }
+      this.closeActivityCenter();
+      await this.switchWorkspace(entry.path);
+      return this.currentWorkspacePath() === entry.path;
+    },
     openActivityGroupEditor(group = null) {
+      if (this.activity.groupEditor.saving) return;
       const palette = this.ACTIVITY_GROUP_COLORS;
       const fallback = palette[(this.activity.customGroups || []).length % palette.length];
       this.closeActivityMoveMenu();
@@ -30538,6 +32458,11 @@ function portal() {
         id: group?.groupId || group?.id || "",
         name: group?.label || group?.name || "",
         color: group?.color || fallback,
+        workspaceId: String(group?.workspaceId || group?.workspace_id || ""),
+        originalWorkspaceId: String(group?.workspaceId || group?.workspace_id || ""),
+        workspacePath: String(group?.workspacePath || group?.workspace_path || ""),
+        workspaceDirty: false,
+        owner: ++this._activityGroupEditorSeq,
         saving: false,
       };
       this.$nextTick(() => {
@@ -30545,9 +32470,13 @@ function portal() {
         if (input) input.focus();
       });
     },
-    cancelActivityGroupEditor() {
+    cancelActivityGroupEditor(force = false) {
+      if (this.activity.groupEditor.saving && !force) return;
+      const owner = ++this._activityGroupEditorSeq;
       this.activity.groupEditor = {
-        open: false, id: "", name: "", color: "blue", saving: false,
+        open: false, id: "", name: "", color: "blue",
+        workspaceId: "", originalWorkspaceId: "", workspacePath: "",
+        workspaceDirty: false, owner, saving: false,
       };
     },
     async saveActivityGroup() {
@@ -30555,7 +32484,13 @@ function portal() {
       const name = String(draft.name || "").trim();
       if (!name || draft.saving) return;
       draft.saving = true;
+      const owner = draft.owner;
       const editing = !!draft.id;
+      const payload = { name, color: draft.color || "blue" };
+      const workspaceId = String(draft.workspaceId || "");
+      if (!editing || draft.workspaceDirty) {
+        payload.workspace_id = workspaceId || null;
+      }
       try {
         const { ok, data, error } = await this.api(
           editing
@@ -30563,12 +32498,13 @@ function portal() {
             : "/api/activity/groups",
           {
             method: editing ? "PATCH" : "POST",
-            json: { name, color: draft.color || "blue" },
+            json: payload,
           },
         );
         if (!ok || !Array.isArray(data?.custom_groups)) {
           throw new Error(error || "activity group save failed");
         }
+        if (this.activity.groupEditor.owner !== owner) return false;
         const responseRevision = Number(data.revision) || 0;
         if (!responseRevision || responseRevision >= this._activityRevision) {
           this.applyActivityGroupPayload(data);
@@ -30576,8 +32512,9 @@ function portal() {
           this.fetchActivity().catch(() => {});
         }
         this._activityRevision = Math.max(this._activityRevision, responseRevision);
-        this.cancelActivityGroupEditor();
+        this.cancelActivityGroupEditor(true);
       } catch (error) {
+        if (this.activity.groupEditor.owner !== owner) return false;
         draft.saving = false;
         this.toast(
           this.lang === "zh"
@@ -30677,30 +32614,6 @@ function portal() {
         }
       }
     },
-    async moveActivityGroup(group, delta) {
-      if (this.activitySearchQuery()) return;
-      const orderId = String(group?.orderId || group?.groupId || "");
-      if (!orderId || !delta) return;
-      const previous = this.normalizeActivityGroupOrder();
-      const customOrder = previous.filter(groupId => groupId !== "__ungrouped__");
-      const at = customOrder.indexOf(orderId);
-      const target = at + delta;
-      if (at < 0 || target < 0 || target >= customOrder.length) return;
-      const next = [...customOrder];
-      const [moved] = next.splice(at, 1);
-      next.splice(target, 0, moved);
-      next.push("__ungrouped__");
-      await this.persistActivityGroupOrder(next, previous);
-    },
-    activityGroupCanMove(group, delta) {
-      if (this.activitySearchQuery() || group?.builtin) return false;
-      const orderId = String(group?.orderId || group?.groupId || "");
-      if (!orderId) return false;
-      const order = this.normalizeActivityGroupOrder()
-        .filter(groupId => groupId !== "__ungrouped__");
-      const at = order.indexOf(orderId);
-      return at >= 0 && at + delta >= 0 && at + delta < order.length;
-    },
     onActivityGroupOrderDragStart(ev, group) {
       if (this.activity.view !== "groups" || this.activitySearchQuery()
           || group?.builtin) return;
@@ -30747,7 +32660,19 @@ function portal() {
     },
     openActivityMoveMenu(ev, item) {
       if (!item?.id) return;
-      const rect = ev?.currentTarget?.getBoundingClientRect();
+      const eventId = String(item.id);
+      const opener = ev?.currentTarget || null;
+      const showMenu = (style) => {
+        this.activity.moveMenu = { show: true, eventId, style };
+        this._openFocusSurface(
+          "activity-move", ".activity-move-menu", "button", opener, true,
+        );
+      };
+      if (this._isMobileLayout()) {
+        showMenu("");
+        return;
+      }
+      const rect = opener?.getBoundingClientRect();
       if (!rect) return;
       const width = Math.min(230, window.innerWidth - 16);
       const estimatedHeight = Math.min(
@@ -30759,14 +32684,43 @@ function portal() {
       const top = rect.bottom + 6 + estimatedHeight <= window.innerHeight - 8
         ? rect.bottom + 6
         : Math.max(8, rect.top - estimatedHeight - 6);
-      this.activity.moveMenu = {
-        show: true,
-        eventId: String(item.id),
-        style: `position:fixed;left:${Math.round(left)}px;top:${Math.round(top)}px;width:${Math.round(width)}px;`,
-      };
+      showMenu(
+        `position:fixed;left:${Math.round(left)}px;top:${Math.round(top)}px;width:${Math.round(width)}px;`,
+      );
     },
-    closeActivityMoveMenu() {
+    onActivityMoveMenuKeydown(ev) {
+      if (!ev || !["ArrowDown", "ArrowUp", "Home", "End"].includes(ev.key)) return;
+      const menu = ev.currentTarget;
+      const items = this._focusableElements(menu).filter(
+        item => item.matches('[role="menuitemradio"]'),
+      );
+      if (!items.length) return;
+      const current = items.indexOf(document.activeElement);
+      let index;
+      if (ev.key === "Home") index = 0;
+      else if (ev.key === "End") index = items.length - 1;
+      else if (ev.key === "ArrowUp") {
+        index = current <= 0 ? items.length - 1 : current - 1;
+      } else {
+        index = current < 0 || current === items.length - 1 ? 0 : current + 1;
+      }
+      ev.preventDefault();
+      ev.stopPropagation();
+      this._focusWithoutScroll(items[index]);
+    },
+    closeActivityMoveMenu(restoreFocus = false) {
+      const menu = document.querySelector(".activity-move-menu");
+      const focusWasInside = !!(menu && menu.contains(document.activeElement));
       this.activity.moveMenu = { show: false, eventId: "", style: "" };
+      this._closeFocusSurface("activity-move", restoreFocus);
+      if (!restoreFocus && focusWasInside && this.activity.show) {
+        this.$nextTick(() => {
+          const modal = document.querySelector(".activity-modal");
+          if (modal && !modal.contains(document.activeElement)) {
+            this._focusWithoutScroll(modal);
+          }
+        });
+      }
     },
     activityMoveMenuItem() {
       const eventId = this.activity.moveMenu.eventId;
@@ -30815,7 +32769,7 @@ function portal() {
       const target = String(groupId || "");
       const previous = String(item.group_id || "");
       const hasPlacement = beforeEventId !== null;
-      this.closeActivityMoveMenu();
+      this.closeActivityMoveMenu(true);
       if (!hasPlacement && target === previous) return true;
       const previousPlacement = new Map(this.activity.events.map(row => [
         String(row.id), {
@@ -30984,8 +32938,46 @@ function portal() {
       const item = this.activity.events.find(row => String(row.id) === eventId);
       if (item) await this.assignActivityGroup(item, group.groupId || "", "");
     },
+    _abortActivityFetches() {
+      for (const controller of Object.values(this._activityFetchControllers || {})) {
+        try { controller.abort(); } catch (_) {}
+      }
+      this._activityFetchControllers = {};
+      this._activityFetchPromises = {};
+    },
+    _activityReconnectDelay() {
+      this._activityLiveFailures = Math.min(
+        16, Math.max(0, Number(this._activityLiveFailures) || 0) + 1,
+      );
+      return this._retryDelay(this._activityLiveFailures, {
+        baseMs: 1000, maxMs: 30000, jitterMs: 500,
+      });
+    },
+    _bindActivityVisibility() {
+      if (this._activityLiveVisibilityBound
+          || typeof document === "undefined") return;
+      this._activityLiveVisibilityBound = true;
+      document.addEventListener("visibilitychange", () => {
+        if (document.visibilityState !== "visible") {
+          this._stopActivityEvents();
+          this._abortActivityFetches();
+        } else {
+          this._activityLiveFailures = 0;
+          this._refreshActivityFromSignal();
+          this._startActivityEvents();
+        }
+      });
+      window.addEventListener("pagehide", () => {
+        this._stopActivityEvents();
+        this._abortActivityFetches();
+      });
+    },
     _stopActivityEvents() {
       ++this._activityLiveSeq;
+      if (this._activityLiveController) {
+        try { this._activityLiveController.abort(); } catch (_) {}
+      }
+      this._activityLiveController = null;
       if (this._activityLiveSource) {
         try { this._activityLiveSource.close(); } catch (_) {}
       }
@@ -31111,6 +33103,7 @@ function portal() {
         this.applyActivityGroupPayload(payload);
       }
       if (payload?.resync) {
+        if (this.activity.moveMenu.show) this.closeActivityMoveMenu(false);
         this._activityRevision = Math.max(this._activityRevision, revision);
         this._activityAppliedSeq = ++this._activityRequestSeq;
         Promise.resolve(this._refreshActivityFromSignal()).finally(
@@ -31142,7 +33135,12 @@ function portal() {
         const at = this.activity.events.findIndex(row => row.id === item.id);
         if (at >= 0) this.activity.events.splice(at, 1, item);
         else this.activity.events.unshift(item);
-        this.activity.events = [...this.activity.events];
+        this.activity.events = this.activity.events
+          .slice(0, this.ACTIVITY_EVENT_CAP);
+        if (this.activity.moveMenu.show
+            && (!this._isMobileLayout() || !this.activityMoveMenuItem())) {
+          this.closeActivityMoveMenu(false);
+        }
         this._applyScheduledActivity(item);
       }
       const acked = new Set(
@@ -31153,6 +33151,9 @@ function portal() {
           if (acked.has(row.id)) row.read = true;
         }
         this.activity.events = [...this.activity.events];
+        if (this.activity.moveMenu.show && !this._isMobileLayout()) {
+          this.closeActivityMoveMenu(false);
+        }
       }
       // The terminal payload's summary was captured before the visible ACK.
       // Keep the last read summary until the ACK response/SSE supplies its
@@ -31166,6 +33167,7 @@ function portal() {
     },
     async _startActivityEvents() {
       if (!this.token || typeof EventSource === "undefined") return;
+      this._bindActivityVisibility();
       if (typeof document !== "undefined"
           && document.visibilityState !== "visible") {
         this._stopActivityEvents();
@@ -31174,22 +33176,30 @@ function portal() {
       if (this._activityLiveSource) return;
       this._stopActivityEvents();
       const seq = ++this._activityLiveSeq;
+      const controller = new AbortController();
+      this._activityLiveController = controller;
       let ticket = "";
       try {
-        const r = await fetch("/api/activity/events-ticket", {
-          method: "POST",
-          headers: this.hdr(),
-        });
+        const r = await this._fetchWithDeadline(
+          "/api/activity/events-ticket",
+          {
+            method: "POST", headers: this.hdr(), signal: controller.signal,
+          },
+        );
         if (!r.ok) throw new Error("activity ticket failed");
         ticket = String((await r.json()).ticket || "");
       } catch (_) {
         if (seq === this._activityLiveSeq) {
           this._activityLiveTimer = setTimeout(
             () => this._startActivityEvents(),
-            1500,
+            this._activityReconnectDelay(),
           );
         }
         return;
+      } finally {
+        if (this._activityLiveController === controller) {
+          this._activityLiveController = null;
+        }
       }
       if (seq !== this._activityLiveSeq || !ticket) return;
       const es = new EventSource(
@@ -31201,6 +33211,7 @@ function portal() {
       );
       es.addEventListener("ready", (ev) => {
         if (!owns()) return;
+        this._activityLiveFailures = 0;
         let payload;
         try { payload = JSON.parse(ev.data); } catch (_) { return; }
         const generation = String(payload.generation || "");
@@ -31223,24 +33234,9 @@ function portal() {
         this._activityLiveSource = null;
         this._activityLiveTimer = setTimeout(
           () => this._startActivityEvents(),
-          1500,
+          this._activityReconnectDelay(),
         );
       };
-      if (!this._activityLiveVisibilityBound) {
-        this._activityLiveVisibilityBound = true;
-        document.addEventListener("visibilitychange", () => {
-          if (document.visibilityState !== "visible") {
-            this._stopActivityEvents();
-          } else {
-            this._refreshActivityFromSignal();
-            this._startActivityEvents();
-          }
-        });
-        window.addEventListener(
-          "pagehide",
-          () => this._stopActivityEvents(),
-        );
-      }
     },
     async ackActivityEvent(item, retries = 2) {
       if (!this.activityIsUnreadResult(item)) return true;
