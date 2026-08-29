@@ -217,7 +217,16 @@ def test_same_origin_pages_share_strip_without_focus_theft_or_writeback(
         assert non_current not in stored["openTabIds"]
         assert peer_current not in stored["openTabIds"]
 
-        page.reload(wait_until="domcontentloaded")
+        # Two same-origin pages already hold the app's long-lived SSE surfaces.
+        # Retire both root mux transports before navigation so Chromium always
+        # has a connection available for the reload itself; the fresh document
+        # starts its own coordinator after session initialization.
+        for browser_page in (page, peer):
+            browser_page.evaluate(
+                """() => document.querySelector('#app')._x_dataStack[0]
+                  ._setChatMuxUnsupported()"""
+            )
+        page.reload(wait_until="domcontentloaded", timeout=15000)
         page.wait_for_function(
             """([closed]) => {
               const app = document.querySelector('#app')?._x_dataStack?.[0];

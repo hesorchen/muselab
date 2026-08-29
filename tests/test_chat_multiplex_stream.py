@@ -233,6 +233,44 @@ def test_mux_watcher_state_can_become_attachable_dynamically(
     placeholder.close()
 
 
+def test_mux_emits_inactive_state_with_finished_turn_identity(
+        chat_mod, monkeypatch):
+    monkeypatch.setattr(chat_mod, "_MUX_RECONCILE_INTERVAL_S", 0.01)
+    broadcast = chat_mod.TurnBroadcast("becomes-inactive")
+    phase = {"active": True}
+
+    def state(_sid):
+        if phase["active"]:
+            return _active_state(broadcast)
+        return {"active": False, "background_tasks_pending": 0}
+
+    chat_mod._active_turns[broadcast.session_id] = broadcast
+    monkeypatch.setattr(chat_mod, "session_active_status", state)
+
+    async def exercise():
+        stream = chat_mod._subscribe_multiplex({})
+        active = await asyncio.wait_for(anext(stream), timeout=0.2)
+        assert json.loads(active["data"])["active"] is True
+        broadcast.publish({
+            "event": "done",
+            "data": json.dumps({"turn_id": broadcast.turn_id}),
+        })
+        broadcast.finish()
+        phase["active"] = False
+        chat_mod._active_turns.pop(broadcast.session_id, None)
+        terminal = await asyncio.wait_for(anext(stream), timeout=0.2)
+        assert terminal["event"] == "done"
+        inactive = await asyncio.wait_for(anext(stream), timeout=0.2)
+        payload = json.loads(inactive["data"])
+        assert inactive["event"] == "session_state"
+        assert payload["active"] is False
+        assert payload["turn_id"] == broadcast.turn_id
+        await stream.aclose()
+
+    asyncio.run(exercise())
+    broadcast.close()
+
+
 def test_mux_exact_recent_checkpoint_replays_without_cold_recent_discovery(
         chat_mod, monkeypatch):
     monkeypatch.setattr(chat_mod, "_MUX_RECONCILE_INTERVAL_S", 0.01)

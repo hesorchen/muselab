@@ -120,6 +120,21 @@ def test_chat_stream_mux_keeps_one_root_source_and_reuses_the_send_reducer():
     assert "if (tr.status === 404 || tr.status === 405)" in app
     assert "this._handleChatMuxDisconnect(source)" in app
     assert "do not synthesize `error`/`done`" in app
+    assert "return await opened" in app
+    coordinator = app[app.index("async _startChatMuxCoordinator()"):
+                      app.index("async initSessions(")]
+    assert coordinator.index("await this._ensureChatMux()") < coordinator.index(
+        "await this._bootstrapChatMuxHistory()")
+
+
+def test_background_history_load_does_not_hydrate_usage():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    load_start = app.index("async loadSession(")
+    load_end = app.index("// Warm OPEN-but-inactive tabs", load_start)
+    assert "_fetchTabUsage" not in app[load_start:load_end]
+    activate_start = app.index("_activateTabState(id)")
+    activate_end = app.index("_touchTranscriptPane(id)", activate_start)
+    assert "this._fetchTabUsage(id)" in app[activate_start:activate_end]
 
 
 def test_i18n_zh_en_key_parity():
@@ -2461,24 +2476,24 @@ def test_stop_control_interrupts_session_and_never_removes_queue_items():
 
     assert 'x-show="isTabStreaming(currentId)"' in html
     assert "chat-toolbar-stop" in html
-    assert "if (st._stopping)" in app
+    assert "if (st._stoppingTurnId)" in app
     assert "正在中断上一条任务" in app
     assert "sendButtonHint(currentId)" in html
     assert "撤回队尾" not in html
     assert "removePendingQueueItem" not in stop
-    assert "if (st._stopping) return" in stop
+    assert "st._stoppingTurnId = ownerTurnId" in stop
     assert "const r = await fetch(" in stop
     assert "if (!r.ok) throw" in stop
     assert "const ownerEs = st.es" in stop
-    assert "st._optimisticInterrupt = true" in stop
-    assert "st.streaming = false" in stop
-    assert "this._setSessionActivityExpectation(sid, false)" in stop
-    assert 'this.toast(this.lang === "zh" ? "已中断"' in stop
+    assert "st.streaming = false" not in stop
+    assert "clearInterval(st._streamTimer)" not in stop
+    assert "clearInterval(st._stallWatch)" not in stop
     assert "const timeout = setTimeout(() => controller.abort(), 3000)" in stop
     assert 'fetch(`/api/chat/sessions/${encodeURIComponent(sid)}/active`' in stop
-    assert "st.es === ownerEs && active === true" in stop
-    assert "st.streaming = true" in stop
-    assert "this._retireStaleSessionStream(sid, st)" not in stop
+    assert "const applyAuthoritativeStatus = payload =>" in stop
+    assert 'String(st.activeTurnId || "") === ownerTurnId' in stop
+    assert "if (payload.stopping) return \"stopping\"" in stop
+    assert "this._retireStaleSessionStream(sid, st)" in stop
     assert "if (st._renderStreamingHtml) st._renderStreamingHtml()" not in stop
     assert "waitForTerminalEvent" not in stop
     cancelled_start = app.index('es.addEventListener("cancelled"')
@@ -2487,15 +2502,18 @@ def test_stop_control_interrupts_session_and_never_removes_queue_items():
     assert "_markDone(true, false, true, {" in cancelled
     assert 'turnStatus: "cancelled"' in cancelled
     assert "d.snapshot_ready" in cancelled
-    assert "alreadySettledOptimistically" in cancelled
-    assert "if (!alreadySettledOptimistically)" in cancelled
+    assert "alreadySettledOptimistically" not in cancelled
+    assert 'this.toast(this.lang === "zh" ? "已中断"' in cancelled
     assert "streamState._seenUpdated = undefined" in cancelled
     assert "quiet: true" in cancelled
     assert "probeActive: false" in cancelled
     mark_done_start = app.index("const _markDone = (")
     mark_done_end = app.index("\n      };", mark_done_start)
-    assert "streamState._stopping = false" in app[
-        mark_done_start:mark_done_end]
+    mark_done = app[mark_done_start:mark_done_end]
+    assert "streamState._stoppingTurnId === terminalTurnId" in mark_done
+    assert 'streamState._stoppingTurnId = ""' in mark_done
+    assert "turn_id=" in stop
+    assert "encodeURIComponent(ownerTurnId)" in stop
     assert "this.isTabStreaming(this.currentId)" in app
 
 
@@ -2812,9 +2830,8 @@ def test_composer_send_has_one_claim_owner_without_exposing_internal_phases():
     assert '_composerSubmitPhase: ""' in app
     assert "if (sendState._composerSubmitToken" in send
     assert 'sendState._composerSubmitPhase = "submitting";' in send
-    assert "if (sendState._optimisticInterrupt" in send
-    assert "if (sendState.es) sendState.es.close()" in send
-    assert "sendState._pendingExternalUpdate = true" in send
+    assert "if (sendState._optimisticInterrupt" not in send
+    assert "if (sendState.es) sendState.es.close()" not in send
     assert "this._releaseComposerClaim(composerSubmitToken);" in send
     assert send.index('sendState._composerSubmitPhase = "submitting";') < send.index(
         "await this._awaitRuntimeSettingPatches(sendSid, sendState)"
@@ -2865,7 +2882,7 @@ def test_composer_disabled_state_covers_failures_without_blocking_durable_queue(
     disabled = app[disabled_start:end]
 
     for state in (
-        "workspaceSwitching", "_stopping",
+        "workspaceSwitching", "_stoppingTurnId",
         "_permissionChangePending", "runtimeSettingsPending(sid)",
         "_sendWaitingForUpload", "item.uploading", "item.error || !item.id",
     ):
@@ -5043,8 +5060,8 @@ def test_queue_controls_validate_mutations_and_block_send_during_interrupt():
     send_start = app.index("async send(opts = {})")
     send_end = app.index("\n    // ====== ask_user_question", send_start)
     send = app[send_start:send_end]
-    assert "if (sendState._stopping && !opts.reconnect && !opts.resumedItem)" in send
-    assert "if (st._stopping)" in app
+    assert "if (sendState._stoppingTurnId && !opts.reconnect && !opts.resumedItem)" in send
+    assert "if (st._stoppingTurnId)" in app
     assert "queueActionBusy(currentId, 'edit:' + q.id)" in html
     assert "queueActionBusy(currentId, 'remove:' + q.id)" in html
     assert '"chat.queue_pause_nonempty"' in chat
@@ -5329,7 +5346,7 @@ def test_stop_aborts_stream_start_before_channel_opens():
     """A Stop click during turn admission must prevent a later live channel."""
     js = (FRONTEND / "app.js").read_text(encoding="utf-8")
 
-    state = js[js.index("_stopping: false,"):]
+    state = js[js.index('_stoppingTurnId: "",'):]
     state = state[:state.index("streamingModel:", 0)]
     assert "_streamStartController: null" in state
     assert "_cancelBeforeStream: false" in state
@@ -5342,9 +5359,11 @@ def test_stop_aborts_stream_start_before_channel_opens():
 
     stop = js[js.index("async stop() {"):]
     stop = stop[:stop.index("// ====== ask_user_question UI helpers")]
-    assert "if (st._streamStartController && !st.es)" in stop
+    assert "if (st._streamStartController && !st.es && !ownerTurnId)" in stop
     assert "st._streamStartController.abort()" in stop
-    assert "st.streaming = false" in stop
+    assert "st.streaming = false" not in stop
+    assert "st._streamTimer = null" not in stop
+    assert "st.streamPhase = \"\"" not in stop
 
 
 def test_midturn_reconnect_storm_guards_are_in_place():

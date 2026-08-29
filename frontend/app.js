@@ -7697,12 +7697,8 @@ function portal() {
         parentTurnId: "",
         lastEventSeq: 0,
         es: null,
-        // Deduplicate stop taps while the interrupt request is in flight.
-        _stopping: false,
-        // The Stop button settles the visible turn immediately while the backend
-        // interrupt/watchdog confirms asynchronously. This marker suppresses a
-        // duplicate terminal toast and lets a failed /active probe restore truth.
-        _optimisticInterrupt: false,
+        // Exact immutable backend turn whose interrupt is still settling.
+        _stoppingTurnId: "",
         // Abort the POST /stream/start ticket request when Stop is clicked
         // before EventSource exists. Without this, the backend has no active
         // turn/client to interrupt yet and the reply starts after Stop.
@@ -7893,9 +7889,6 @@ function portal() {
       }
       if (st._sessionActivityExpected === undefined) {
         st._sessionActivityExpected = null;
-      }
-      if (st._optimisticInterrupt === undefined) {
-        st._optimisticInterrupt = false;
       }
       if (!Number.isFinite(Number(st._installedCanonicalCount))) {
         st._installedCanonicalCount = 0;
@@ -8211,7 +8204,7 @@ function portal() {
       }
       const st = this.tabState && this.tabState[sid];
       if (!st) return zh ? "正在准备会话" : "Preparing the session";
-      if (st._stopping) {
+      if (st._stoppingTurnId) {
         return zh ? "正在中断上一条任务" : "Stopping the previous turn";
       }
       if (st._permissionChangePending) return this.t("perm.switching");
@@ -10103,8 +10096,10 @@ function portal() {
     async _ensureChatMux(options = {}) {
       if (this._chatMuxSupported === false || !this.token
           || typeof EventSource === "undefined") return false;
-      if (this._chatMuxSource && !options.reconnect) return true;
       if (this._chatMuxStartPromise) return await this._chatMuxStartPromise;
+      if (this._chatMuxSource && !options.reconnect) {
+        return this._chatMuxConnected;
+      }
       this._chatMuxStartPromise = this._openChatMux();
       try {
         return await this._chatMuxStartPromise;
@@ -10149,10 +10144,27 @@ function portal() {
       const source = new EventSource(
         "/api/chat/stream/mux?ticket=" + encodeURIComponent(payload.ticket));
       this._chatMuxSource = source;
+      let openSettled = false;
+      let settleOpen;
+      const opened = new Promise(resolve => { settleOpen = resolve; });
+      const finishOpen = value => {
+        if (openSettled) return;
+        openSettled = true;
+        settleOpen(value);
+      };
+      const openTimeout = setTimeout(() => {
+        if (this._chatMuxSource !== source || this._chatMuxConnected) return;
+        try { source.close(); } catch (_) {}
+        this._chatMuxSource = null;
+        finishOpen(false);
+        this._scheduleChatMuxReconnect();
+      }, 5000);
       source.onopen = () => {
         if (this._chatMuxSource !== source) return;
+        clearTimeout(openTimeout);
         this._chatMuxConnected = true;
         this._chatMuxReconnectAttempts = 0;
+        finishOpen(true);
         for (const channel of this._chatMuxChannels.values()) {
           if (channel._activated) channel.open();
         }
@@ -10183,9 +10195,11 @@ function portal() {
       }
       source.onerror = ev => {
         if (ev && ev.data !== undefined && ev.data !== "") return;
+        clearTimeout(openTimeout);
+        finishOpen(false);
         this._handleChatMuxDisconnect(source);
       };
-      return true;
+      return await opened;
     },
     _handleChatMuxDisconnect(source) {
       if (this._chatMuxSource !== source) return;
@@ -10282,6 +10296,11 @@ function portal() {
       const existingState = this.tabState && this.tabState[sid];
       if (!payload.active) {
         this._chatMuxPendingEvents.delete(sid);
+        const inactiveTurnId = String(payload.turn_id || "");
+        if (existingState && inactiveTurnId
+            && existingState._stoppingTurnId === inactiveTurnId) {
+          existingState._stoppingTurnId = "";
+        }
         if (existingState && !existingState.streaming) {
           this._setBackgroundTaskActive(sid, false, payload.started_at, 0);
         }
@@ -10299,6 +10318,9 @@ function portal() {
       }
       const turnId = String(payload.turn_id || "");
       if (!turnId) return;
+      if (existingState && payload.stopping) {
+        existingState._stoppingTurnId = turnId;
+      }
       if (existingState && existingState.es
           && existingState.activeTurnId === turnId) return;
       if (existingState && existingState.es && existingState.es._muxChannel
@@ -10335,8 +10357,13 @@ function portal() {
     },
     async _startChatMuxCoordinator() {
       if (this._chatMuxSupported === false) return false;
+      // Establish the one authoritative live transport before any background
+      // transcript warmup. A turn can start while history is loading; mux-first
+      // startup guarantees its accepted/session_state events already have a sink.
+      const connected = await this._ensureChatMux();
+      if (!connected) return false;
       await this._bootstrapChatMuxHistory();
-      return await this._ensureChatMux();
+      return true;
     },
 
     async initSessions(options = {}) {
@@ -16080,7 +16107,6 @@ function portal() {
                 st.atBottom = false;
               }
             });
-            await this._fetchTabUsage(sid);
             historyPerf.status = "ok";
             return true;
           }
@@ -16131,7 +16157,6 @@ function portal() {
             });
           });
         }
-        await this._fetchTabUsage(sid);
         historyPerf.status = "ok";
         return true;
       } finally {
@@ -28762,23 +28787,12 @@ function portal() {
       // interrupt endpoint's atomic pause and the turn cleanup's second pause;
       // that new item then appeared accepted but remained paused.  Keep the
       // draft intact and make the short wait explicit instead.
-      if (sendState._stopping && !opts.reconnect && !opts.resumedItem) {
+      if (sendState._stoppingTurnId && !opts.reconnect && !opts.resumedItem) {
         this.toast(this.lang === "zh"
           ? "正在中断上一条任务，请稍候再发送"
           : "The previous turn is still stopping; send again in a moment",
         "warn", 2200);
         return false;
-      }
-      if (sendState._optimisticInterrupt && !opts.reconnect && !opts.resumedItem) {
-        // The user is intentionally moving on before the old cancelled event
-        // arrives. Retire only that old transport ownership now; otherwise its
-        // late _markDone would clear the NEW send's streaming flag/timer on this
-        // shared tab state. Backend snapshot persistence continues independently,
-        // and the canonical poll later merges any retained partial output.
-        try { if (sendState.es) sendState.es.close(); } catch (_) {}
-        sendState.es = null;
-        sendState._optimisticInterrupt = false;
-        sendState._pendingExternalUpdate = true;
       }
       // Do not start a new turn between the optimistic selector change and
       // its persisted session update. Otherwise Plan Mode could launch with a
@@ -29291,8 +29305,7 @@ function portal() {
         streamState.es = null;
         streamState._streamStartController = null;
         streamState._cancelBeforeStream = false;
-        streamState._stopping = false;
-        streamState._optimisticInterrupt = false;
+        streamState._stoppingTurnId = "";
         streamState._serverActiveObserved = false;
         streamState.activeTurnId = "";
         streamState.parentTurnId = "";
@@ -29424,6 +29437,7 @@ function portal() {
         return false;
       }
       streamState.es = es;
+      const streamTurnId = String(streamState.activeTurnId || expectedTurnId || "");
       // NOTE — a successful open deliberately does NOT reset
       // _reconnectAttempts. Every reconnect DOES open successfully (the
       // backend replays the turn happily), so resetting here made the
@@ -30274,8 +30288,10 @@ function portal() {
         this._enforceMessageRangeInvariant(streamState);
         streamState._streamStartController = null;
         streamState._cancelBeforeStream = false;
-        streamState._stopping = false;
-        streamState._optimisticInterrupt = false;
+        const terminalTurnId = streamTurnId || String(streamState.activeTurnId || "");
+        if (streamState._stoppingTurnId === terminalTurnId) {
+          streamState._stoppingTurnId = "";
+        }
         streamState._serverActiveObserved = false;
         // Belt-and-braces for the auto-compact bubble: a turn that dies inside
         // /compact (transport drop, 10-min timeout) may never deliver the
@@ -31071,10 +31087,7 @@ function portal() {
         flushTerminalPresentation();
         let d = {};
         try { d = JSON.parse(ev.data || "{}"); } catch (_) { d = {}; }
-        const alreadySettledOptimistically = !!streamState._optimisticInterrupt;
-        if (!alreadySettledOptimistically) {
-          this.toast(this.lang === "zh" ? "已中断" : "Interrupted", "warn", 2000);
-        }
+        this.toast(this.lang === "zh" ? "已中断" : "Interrupted", "warn", 2000);
         es.close();
         _markDone(true, false, true, {
           model: modelForBubble,
@@ -31141,29 +31154,16 @@ function portal() {
       const sid = this.currentId;
       if (!sid || !this.isTabStreaming(sid)) return;
       const st = this._ensureTabState(sid);
-      if (st._stopping) return;
-      st._stopping = true;
+      const ownerTurnId = String(st.activeTurnId || "");
+      if (ownerTurnId && st._stoppingTurnId === ownerTurnId) return;
       if (st.pendingQueue && st.pendingQueue.length > 0) st._queuePaused = true;
-      // The earliest Stop window is before EventSource exists, while send()
-      // is still minting its one-time ticket. No backend turn exists yet, so
-      // /interrupt cannot find anything. Abort locally and restore idle state
-      // immediately; the ticket is never consumed and expires harmlessly.
-      if (st._streamStartController && !st.es) {
+      // Before a channel and immutable turn id exist, abort only the start
+      // request. send() rollback remains the sole owner of stream flags, timers,
+      // channel state and the draft; Stop must not manufacture optimistic idle.
+      if (st._streamStartController && !st.es && !ownerTurnId) {
         st._cancelBeforeStream = true;
         st._streamStartController.abort();
-        st._streamStartController = null;
-        if (st._streamTimer) clearInterval(st._streamTimer);
-        st._streamTimer = null;
-        st._streamStartedAt = 0;
-        st.streamElapsed = 0;
-        st.streaming = false;
-        st.streamPhase = "";
-        st._stopping = false;
-        st.streamingModel = "";
         if (st.pendingQueue && st.pendingQueue.length > 0) {
-          // No backend turn exists yet, but the durable queue may already do.
-          // Persist the same Stop semantics instead of leaving only the local
-          // banner paused while the server remains free to drain it.
           try {
             await fetch(`/api/chat/sessions/${encodeURIComponent(sid)}/queue/pause`, {
               method: "POST",
@@ -31173,42 +31173,54 @@ function portal() {
           } catch (_) { /* queue sync below/next activation reconciles */ }
           this._syncQueueFromServer(sid);
         }
-        this.toast(this.lang === "zh" ? "已中断" : "Interrupted", "warn", 1500);
         return;
       }
-      // Optimistic stop: settle the human-facing state in this same click frame.
-      // Keep the EventSource attached so a cancelled event can still persist and
-      // quietly adopt the final partial-output snapshot. A subsequent send may
-      // replace that transport; its ownership guards make late old-turn events no-op.
+      if (!ownerTurnId) return;
+
       const ownerEs = st.es;
-      st._optimisticInterrupt = true;
-      st.streaming = false;
-      st.streamPhase = "";
-      st._stopping = false;
-      if (st._streamTimer) clearInterval(st._streamTimer);
-      if (st._stallWatch) clearInterval(st._stallWatch);
-      st._streamTimer = null;
-      st._stallWatch = null;
-      this._setSessionActivityExpectation(sid, false);
-      this.toast(this.lang === "zh" ? "已中断" : "Interrupted", "warn", 1500);
+      st._stoppingTurnId = ownerTurnId;
+      const stillOwnsTurn = () => this.tabState[sid] === st
+        && st.es === ownerEs
+        && String(st.activeTurnId || "") === ownerTurnId;
+      const applyAuthoritativeStatus = payload => {
+        if (!payload || !stillOwnsTurn()) return "stale";
+        const active = !!payload.active;
+        const turnId = String(payload.turn_id || payload.current_turn_id || "");
+        if (active && turnId !== ownerTurnId) return "successor";
+        if (!active) {
+          if (turnId && turnId !== ownerTurnId) return "successor";
+          if (st._stoppingTurnId === ownerTurnId) st._stoppingTurnId = "";
+          this._retireStaleSessionStream(sid, st);
+          this._setSessionActivityExpectation(sid, false);
+          st._pendingExternalUpdate = true;
+          this._scheduleCanonicalStreamReload(sid, st, { minimumWaitMs: 0 });
+          return "inactive";
+        }
+        if (payload.stopping) return "stopping";
+        if (st._stoppingTurnId === ownerTurnId) st._stoppingTurnId = "";
+        st._sessionActivityExpected = null;
+        this.sessions = (this.sessions || []).map(session => session.id === sid
+          ? { ...session, active: true, turn_active: true, background_active: false }
+          : session);
+        return "running";
+      };
 
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 3000);
       try {
         const r = await fetch(
-          "/api/chat/interrupt?session_id=" + encodeURIComponent(sid),
+          "/api/chat/interrupt?session_id=" + encodeURIComponent(sid)
+            + "&turn_id=" + encodeURIComponent(ownerTurnId),
           { method: "POST", headers: this.hdr(), signal: controller.signal },
         );
         if (!r.ok) throw new Error("interrupt failed");
-        // The backend marks the broadcast cancelled and arms its force-stop
-        // watchdog before replying. An empty `interrupted` list therefore still
-        // means the hard-stop path owns convergence; no visible rollback needed.
+        applyAuthoritativeStatus(await r.json());
       } catch (_e) {
-        // A failed HTTP response is ambiguous: the request may have reached the
-        // backend before the connection dropped. Probe authoritative liveness
-        // before undoing the optimistic transition, and never overwrite a newer
-        // stream that already replaced this EventSource.
-        let active = null;
+        // The request may have reached the backend before the response failed.
+        // Probe exact ownership and apply the same state matrix: retain matching
+        // active+stopping, restore matching active+running, settle inactive, and
+        // never mutate an ABA successor.
+        let status = null;
         try {
           const probeController = new AbortController();
           const probeTimeout = setTimeout(() => probeController.abort(), 2500);
@@ -31216,27 +31228,16 @@ function portal() {
             const probe = await fetch(`/api/chat/sessions/${encodeURIComponent(sid)}/active`, {
               headers: this.hdr(), signal: probeController.signal,
             });
-            if (probe.ok) active = !!(await probe.json()).active;
+            if (probe.ok) status = await probe.json();
           } finally { clearTimeout(probeTimeout); }
-        } catch (_) { active = null; }
-        if (this.tabState[sid] === st && st.es === ownerEs && active === true) {
-          st._optimisticInterrupt = false;
-          st.streaming = true;
-          st._sessionActivityExpected = null;
-          this.sessions = (this.sessions || []).map(session => session.id === sid
-            ? { ...session, active: true, turn_active: true, background_active: false }
-            : session);
-          if (st._streamStartedAt && !st._streamTimer) {
-            st._streamTimer = setInterval(() => {
-              st.streamElapsed = Math.max(
-                0, (Date.now() - st._streamStartedAt) / 1000);
-            }, 1000);
-          }
+        } catch (_) { status = null; }
+        const resolution = applyAuthoritativeStatus(status);
+        if (resolution === "running") {
           this.toast(this.lang === "zh"
             ? "停止失败，当前会话仍在运行"
             : "Could not stop; the session is still running",
           "error", 3000);
-        } else if (active === null) {
+        } else if (status === null) {
           this.toast(this.lang === "zh"
             ? "中断请求已提交，正在自动确认最终状态"
             : "Interrupt requested; confirming the final state",

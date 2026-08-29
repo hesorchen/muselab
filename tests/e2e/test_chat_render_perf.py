@@ -71,7 +71,8 @@ def _app_eval(page: Page, body: str, arg=None):
     return page.evaluate(
         """([body, arg]) => {
             const app = document.querySelector("#app")._x_dataStack[0];
-            return (new Function("app", "arg", body))(app, arg);
+            const AsyncFunction = Object.getPrototypeOf(async function() {}).constructor;
+            return (new AsyncFunction("app", "arg", body))(app, arg);
         }""",
         [body, arg],
     )
@@ -399,7 +400,7 @@ def test_mux_routes_two_sessions_reconnects_with_checkpoints_and_defers_watcher_
           const app = document.querySelector('#app')._x_dataStack[0];
           return app.tabState[sid]?.lastEventSeq === 1;
         }""",
-        initial["localSid"],
+        arg=initial["localSid"],
     )
     page.evaluate(
         """async sid => {
@@ -411,7 +412,7 @@ def test_mux_routes_two_sessions_reconnects_with_checkpoints_and_defers_watcher_
     page.wait_for_function(
         """sid => document.querySelector('#app')._x_dataStack[0]
           .tabState[sid].messages.some(m => m.text === 'MUX_BACKGROUND_REPLY')""",
-        watcher_sid,
+        arg=watcher_sid,
     )
 
     page.evaluate("window.__disconnectMux()")
@@ -453,6 +454,41 @@ def test_mux_routes_two_sessions_reconnects_with_checkpoints_and_defers_watcher_
     assert checkpoints[(initial["localSid"], "turn-local")] == 1
     assert checkpoints[(watcher_sid, "turn-watcher")] == 1
     _assert_no_browser_errors(page, errors)
+
+
+def test_mux_coordinator_connects_before_background_history_warmup(
+    page: Page, backend_url, auth_token,
+):
+    """The root live transport owns events before background history starts."""
+    _login(page, backend_url, auth_token)
+    order = page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          if (app._chatMuxStartPromise) {
+            try { await app._chatMuxStartPromise; } catch (_) {}
+          }
+          app._setChatMuxUnsupported();
+          const originalEnsure = app._ensureChatMux;
+          const originalHistory = app._bootstrapChatMuxHistory;
+          const order = [];
+          app._chatMuxSupported = true;
+          app._ensureChatMux = async () => {
+            order.push('mux:start');
+            await Promise.resolve();
+            order.push('mux:connected');
+            return true;
+          };
+          app._bootstrapChatMuxHistory = async () => order.push('history:start');
+          try {
+            await app._startChatMuxCoordinator();
+            return order;
+          } finally {
+            app._ensureChatMux = originalEnsure;
+            app._bootstrapChatMuxHistory = originalHistory;
+          }
+        }"""
+    )
+    assert order == ["mux:start", "mux:connected", "history:start"]
 
 
 def test_deferred_history_bodies_load_without_manual_body_action(
@@ -5881,16 +5917,20 @@ def test_failed_queue_edit_never_duplicates_and_stopping_turn_rejects_send(
             busy: Object.keys(st._queueMutating || {}),
           };
 
-          st._stopping = true;
-          st.streaming = true;
+          st.activeTurnId = 'authoritative-stop-turn';
+          st._stoppingTurnId = st.activeTurnId;
+          st.streaming = false;
           st.draft.input = 'SEND DURING STOP';
           app._activateComposerState(sid);
+          const disabledReason = app.composerDisabledReason(sid);
           const sendResult = await app.send();
           return {
             afterEdit,
+            disabledReason,
             sendResult,
             stoppingDraft: st.draft.input,
             pendingAfterStop: st.pendingQueue.length,
+            composerClaim: st._composerSubmitToken,
           };
         }""",
         sid,
@@ -5903,9 +5943,13 @@ def test_failed_queue_edit_never_duplicates_and_stopping_turn_rejects_send(
         "draft": "",
         "busy": [],
     }
+    assert result["disabledReason"] in {
+        "Stopping the previous turn", "正在中断上一条任务",
+    }
     assert result["sendResult"] is False
     assert result["stoppingDraft"] == "SEND DURING STOP"
     assert result["pendingAfterStop"] == 1
+    assert result["composerClaim"] is None
 
 
 def test_background_task_gap_leaves_composer_usable_without_empty_reconnect(
@@ -6998,7 +7042,10 @@ def test_background_stream_buffers_token_rate_presentation_until_activation(
         page,
         """
         app.refreshSessions = async () => {};
-        app._fetchTabUsage = async () => {};
+        window.__backgroundUsageFetches = [];
+        app._fetchTabUsage = async sid => {
+          window.__backgroundUsageFetches.push(sid);
+        };
         app._scheduleIdlePreload = () => {};
         app.availableModels = [{
           model: "e2e-model", label: "E2E model", group: "e2e",
@@ -7061,6 +7108,7 @@ def test_background_stream_buffers_token_rate_presentation_until_activation(
           streaming: st.streaming,
           thinkingText: thinking ? thinking.text : null,
           plainPaints: st._streamPlainRenderCount,
+          usageFetches: window.__backgroundUsageFetches.slice(),
         };
         """,
         ids[0],
@@ -7069,6 +7117,7 @@ def test_background_stream_buffers_token_rate_presentation_until_activation(
     assert before["streaming"] is True
     assert before["thinkingText"] == ""
     assert before["plainPaints"] == 0
+    assert ids[0] not in before["usageFetches"]
 
     _app_eval(
         page,
