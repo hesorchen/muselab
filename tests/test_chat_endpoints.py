@@ -384,6 +384,10 @@ def test_interrupt_no_live_client(chat_mod, client):
     assert body["ok"] is True
     assert body["interrupted"] == []
     assert body.get("note") == "no live client"
+    assert body["turn_id"] == ""
+    assert body["active"] is False
+    assert body["stopping"] is False
+    assert body["phase"] == "inactive"
     # No bogus pending-interrupt flag left behind.
     assert "ghost" not in chat_mod._pending_interrupts
 
@@ -399,6 +403,40 @@ def test_interrupt_calls_sdk_and_marks_pending(chat_mod, client):
     assert body["interrupted"] == ["sid-int@claude-sonnet-4-6"]
     assert c.interrupted is True
     assert "sid-int" in chat_mod._pending_interrupts
+
+
+def test_interrupt_response_and_active_status_expose_matching_stopping_turn(
+        chat_mod, client, monkeypatch):
+    sid = "sid-stopping-contract"
+    sdk_client = _seed(
+        chat_mod, (sid, "claude-sonnet-4-6", "auto", ""))
+    broadcast = chat_mod.TurnBroadcast(sid, "claude-sonnet-4-6")
+    broadcast.startup_phase = "query"
+
+    async def no_force_stop(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(chat_mod, "_force_stop_after_grace", no_force_stop)
+    chat_mod._active_turns[sid] = broadcast
+    try:
+        response = client.post(
+            f"/api/chat/interrupt?session_id={sid}&token={TEST_TOKEN}")
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["turn_id"] == broadcast.turn_id
+        assert body["active"] is True
+        assert body["stopping"] is True
+        assert body["phase"] == "query"
+        assert sdk_client.interrupted is True
+
+        active = chat_mod.session_active_status(sid)
+        assert active["turn_id"] == broadcast.turn_id
+        assert active["active"] is True
+        assert active["stopping"] is True
+    finally:
+        chat_mod._active_turns.pop(sid, None)
+        broadcast.finish()
+        broadcast.close()
 
 
 def test_interrupt_swallows_sdk_error_but_still_marks_pending(chat_mod, client):
@@ -529,8 +567,11 @@ async def test_interrupt_cancels_cold_client_startup_immediately(
     assert finished is broadcast
     assert broadcast.cancelled is True
     assert broadcast.done is True
-    assert [event["event"] for event in broadcast.replay_events()] == ["cancelled"]
-    cancelled_payload = json.loads(next(broadcast.replay_events())["data"])
+    replay = list(broadcast.replay_events())
+    assert [event["event"] for event in replay] == [
+        "startup", "startup", "cancelled",
+    ]
+    cancelled_payload = json.loads(replay[-1]["data"])
     assert cancelled_payload["snapshot_ready"] is True
     snapshots, _ = chat_mod._load_cancelled_turn_snapshots(sid)
     assert [message["text"] for message in snapshots[0]["messages"]] == ["stop me"]
@@ -1465,8 +1506,13 @@ def test_cancelled_turn_snapshot_survives_reload_export_and_delete(
         assert second.status_code == 200, second.text
         assert second.json()["messages"] == messages
 
-        exported = client.get(
-            f"/api/chat/sessions/{sid}/export?token={TEST_TOKEN}")
+        ticket = client.post(
+            "/api/chat/resource-ticket",
+            headers=auth,
+            json={"resource": "export", "session_id": sid},
+        )
+        assert ticket.status_code == 200, ticket.text
+        exported = client.get(ticket.json()["url"])
         assert exported.status_code == 200, exported.text
         assert "keep this interrupted prompt" in exported.text
         assert "partial assistant text" in exported.text
@@ -2922,3 +2968,93 @@ def test_native_compact_returns_after_verification_and_schedules_recount(
     assert scheduled
     assert scheduled[0][0] == sid
     assert scheduled[0][2]["totalTokens"] == 50_000
+
+
+@pytest.mark.parametrize("owner_state", ["absent", "pre_cancelled", "hung"])
+@pytest.mark.asyncio
+async def test_force_stop_finalizes_attachments_for_every_owner_state(
+    chat_mod,
+    monkeypatch,
+    owner_state,
+):
+    sid = f"force-attachment-{owner_state}"
+    aid = f"force-aid-{owner_state}"
+    entry = {
+        "kind": "text",
+        "mime": "text/plain",
+        "name": "force.txt",
+        "raw": b"force",
+        "text": "force",
+        "ts": chat_mod.time.time(),
+    }
+    with chat_mod._image_store_lock:
+        chat_mod._image_store[aid] = entry
+    lease, _missing, _busy = chat_mod._lease_staged_attachments(
+        aid, require_all=True)
+    broadcast = chat_mod.TurnBroadcast(sid)
+    broadcast._attachment_lease = lease
+    artifact = (
+        chat_mod._attachments_base() / sid / f"{aid}-force.txt")
+    artifact.parent.mkdir(parents=True, exist_ok=True)
+    artifact.write_bytes(b"artifact")
+    broadcast._prepared_attachments = (
+        chat_mod._PreparedStagedAttachments(
+            artifact_paths=[str(artifact)])
+    )
+    owner_release = asyncio.Event()
+    owner = None
+
+    async def ignore_cancel_until_released():
+        while not owner_release.is_set():
+            try:
+                await owner_release.wait()
+            except asyncio.CancelledError:
+                continue
+
+    if owner_state == "pre_cancelled":
+        owner = asyncio.create_task(asyncio.Event().wait())
+        owner.cancel()
+        await asyncio.gather(owner, return_exceptions=True)
+        broadcast.task = owner
+    elif owner_state == "hung":
+        owner = asyncio.create_task(ignore_cancel_until_released())
+        broadcast.task = owner
+        await asyncio.sleep(0)
+
+    disconnect_release = asyncio.Event()
+
+    async def stuck_disconnect(_sid):
+        await disconnect_release.wait()
+
+    monkeypatch.setattr(chat_mod, "disconnect_client", stuck_disconnect)
+    monkeypatch.setattr(
+        chat_mod, "_INTERRUPT_FORCE_OWNER_JOIN_S", 0.01)
+    monkeypatch.setattr(
+        chat_mod, "_INTERRUPT_FORCE_DISCONNECT_JOIN_S", 0.01)
+    monkeypatch.setattr(
+        chat_mod, "_persist_cancelled_turn_snapshot",
+        lambda _broadcast: True,
+    )
+    chat_mod._active_turns[sid] = broadcast
+    try:
+        await chat_mod._force_stop_after_grace(
+            sid, broadcast, grace=0.001)
+        assert sid not in chat_mod._active_turns
+        assert broadcast.done is True
+        assert not artifact.exists()
+        assert chat_mod._image_store.get(aid) is entry
+        assert aid not in chat_mod._staged_attachment_claims
+        assert lease.state == "released"
+    finally:
+        owner_release.set()
+        disconnect_release.set()
+        if owner is not None:
+            await asyncio.gather(owner, return_exceptions=True)
+        for _ in range(100):
+            if not chat_mod._maintenance_tasks:
+                break
+            await asyncio.sleep(0.01)
+        chat_mod._active_turns.pop(sid, None)
+        with chat_mod._image_store_lock:
+            chat_mod._image_store.pop(aid, None)
+            chat_mod._staged_attachment_claims.pop(aid, None)

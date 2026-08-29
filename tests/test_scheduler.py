@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import pytest
 from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
 
@@ -18,7 +19,12 @@ def _sched_mod(app_module):
     # temp ROOT every time, so _STATE_FILE doesn't exist on disk yet, but
     # the module-global `_state` may carry over from a prior test in the
     # same process. Reset explicitly for isolation.
-    sched._state = {"tasks": {}, "history": [], "unread_count": 0}
+    sched._state = {
+        "tasks": {},
+        "history": [],
+        "unread_count": 0,
+        "cleanup_pending": {},
+    }
     sched._STATE_ERROR = ""
     return sched
 
@@ -86,7 +92,12 @@ def test_corrupt_state_enters_degraded_mode_without_overwriting_original(
     assert sched.persistence_status()["available"] is False
     with pytest.raises(sched.SchedulerPersistenceError):
         sched.create_task("must-not-write", "prompt", _daily_at())
-    assert sched._state == {"tasks": {}, "history": [], "unread_count": 0}
+    assert sched._state == {
+        "tasks": {},
+        "history": [],
+        "unread_count": 0,
+        "cleanup_pending": {},
+    }
     assert state_file.read_bytes() == original
 
 
@@ -682,6 +693,7 @@ async def test_delete_task_endpoint_joins_running_owner_before_purge(
     }
     assert running.cancelled()
     assert task["id"] not in sched._state["tasks"]
+    assert sched.get_task_cleanup(task["id"]) is None
     assert transitions == [
         ("start", task["session_id"]),
         ("finish", task["session_id"], "cancelled"),
@@ -737,6 +749,326 @@ def test_delete_task_legacy_no_mode_removes_session(app_module):
     }
     assert sched.delete_task("legacy") is True
     assert all(x["id"] != s["id"] for x in sess.list_sessions())
+
+
+def test_load_state_accepts_legacy_file_without_cleanup_intents(app_module):
+    sched = _sched_mod(app_module)
+    state_file = sched._STATE_FILE
+    assert state_file is not None
+    state_file.parent.mkdir(parents=True, exist_ok=True)
+    state_file.write_text(
+        json.dumps({"tasks": {}, "history": [], "unread_count": 0}),
+        encoding="utf-8",
+    )
+
+    sched._load_state()
+
+    assert sched._state["cleanup_pending"] == {}
+    assert sched.persistence_status()["available"] is True
+
+
+def test_load_state_rejects_unsafe_cleanup_intent_without_rewrite(app_module):
+    sched = _sched_mod(app_module)
+    state_file = sched._STATE_FILE
+    assert state_file is not None
+    state_file.parent.mkdir(parents=True, exist_ok=True)
+    original = json.dumps({
+        "tasks": {},
+        "history": [],
+        "unread_count": 0,
+        "cleanup_pending": {
+            "../escape": {
+                "task_id": "../escape",
+                "cleanup_id": "cleanup-id",
+                "session_mode": "reuse",
+                "session_id": "session-id",
+                "runtime_session_ids": [],
+                "created_at": 1,
+            },
+        },
+    }).encode()
+    state_file.write_bytes(original)
+
+    with pytest.raises(
+        sched.SchedulerPersistenceError,
+        match="original file preserved",
+    ):
+        sched._load_state()
+
+    assert state_file.read_bytes() == original
+    assert sched.persistence_status()["available"] is False
+
+
+def test_delete_task_intent_save_failure_rolls_back_task_and_fence(
+    app_module,
+    monkeypatch,
+):
+    sched = _sched_mod(app_module)
+    task = sched.create_task("rollback", "p", _daily_at())
+    state_file = sched._STATE_FILE
+    assert state_file is not None
+    durable_before = state_file.read_bytes()
+
+    def fail_save():
+        raise OSError("simulated cleanup intent write failure")
+
+    monkeypatch.setattr(sched, "_save_state", fail_save)
+    with pytest.raises(OSError, match="cleanup intent write failure"):
+        sched.delete_task(task["id"], purge_bound_session=False)
+
+    assert task["id"] in sched._state["tasks"]
+    assert sched._state["cleanup_pending"] == {}
+    assert task["id"] not in sched._REVOKED_TASK_IDS
+    assert state_file.read_bytes() == durable_before
+
+
+def test_delete_task_sync_purge_failure_survives_reload_and_retries(
+    app_module,
+    monkeypatch,
+):
+    sched = _sched_mod(app_module)
+    from backend import chat
+
+    task = sched.create_task("retry-sync", "p", _daily_at(), session_mode="reuse")
+    sid = task["session_id"]
+    attempts = []
+
+    def flaky_purge(target_sid):
+        attempts.append(target_sid)
+        if len(attempts) == 1:
+            raise OSError("simulated purge failure")
+        return True
+
+    monkeypatch.setattr(chat, "purge_session_storage", flaky_purge)
+    with pytest.raises(OSError, match="simulated purge failure"):
+        sched.delete_task(task["id"])
+
+    state_file = sched._STATE_FILE
+    assert state_file is not None
+    durable = json.loads(state_file.read_text(encoding="utf-8"))
+    assert task["id"] not in durable["tasks"]
+    assert durable["cleanup_pending"][task["id"]]["session_id"] == sid
+
+    sched._state = {
+        "tasks": {},
+        "history": [],
+        "unread_count": 0,
+        "cleanup_pending": {},
+    }
+    sched._STATE_ERROR = ""
+    sched._REVOKED_TASK_IDS.clear()
+    sched._load_state()
+
+    assert sched.get_task_cleanup(task["id"]) is not None
+    assert sched.delete_task(task["id"]) is True
+    assert attempts == [sid, sid]
+    assert sched.get_task_cleanup(task["id"]) is None
+    durable = json.loads(state_file.read_text(encoding="utf-8"))
+    assert durable["cleanup_pending"] == {}
+
+
+@pytest.mark.asyncio
+async def test_delete_task_api_purge_failure_is_retryable_and_idempotent(
+    app_module,
+    monkeypatch,
+):
+    sched = _sched_mod(app_module)
+    from backend import api_scheduler, chat
+
+    task = sched.create_task("retry-api", "p", _daily_at(), session_mode="reuse")
+    sid = task["session_id"]
+    attempts = []
+
+    async def flaky_purge(target_sid):
+        attempts.append(target_sid)
+        if len(attempts) == 1:
+            raise OSError("simulated async purge failure")
+        return True
+
+    monkeypatch.setattr(chat, "purge_session_storage_async", flaky_purge)
+    with pytest.raises(OSError, match="simulated async purge failure"):
+        await api_scheduler.delete_task_endpoint(task["id"])
+
+    intent = sched.get_task_cleanup(task["id"])
+    assert intent is not None
+    assert intent["session_id"] == sid
+    assert sched.get_task(task["id"]) is None
+
+    expected = {"deleted": task["id"]}
+    assert await api_scheduler.delete_task_endpoint(task["id"]) == expected
+    assert await api_scheduler.delete_task_endpoint(task["id"]) == expected
+    assert attempts == [sid, sid]
+    assert sched.get_task_cleanup(task["id"]) is None
+
+
+@pytest.mark.asyncio
+async def test_cleanup_completion_write_failure_keeps_retryable_intent(
+    app_module,
+    monkeypatch,
+):
+    sched = _sched_mod(app_module)
+    from backend import chat
+
+    task = sched.create_task(
+        "retry-completion",
+        "p",
+        _daily_at(),
+        session_mode="reuse",
+    )
+    assert sched.delete_task(task["id"], purge_bound_session=False) is True
+    attempts = []
+
+    async def idempotent_purge(sid):
+        attempts.append(sid)
+        return True
+
+    monkeypatch.setattr(chat, "purge_session_storage_async", idempotent_purge)
+    original_save = sched._save_state
+
+    def fail_save():
+        raise OSError("simulated cleanup acknowledgement failure")
+
+    monkeypatch.setattr(sched, "_save_state", fail_save)
+    with pytest.raises(OSError, match="acknowledgement failure"):
+        await sched.finish_task_cleanup(task["id"])
+    assert sched.get_task_cleanup(task["id"]) is not None
+
+    monkeypatch.setattr(sched, "_save_state", original_save)
+    assert await sched.finish_task_cleanup(task["id"]) is True
+    assert attempts == [task["session_id"], task["session_id"]]
+    assert sched.get_task_cleanup(task["id"]) is None
+
+
+@pytest.mark.asyncio
+async def test_fresh_task_runtime_disconnect_failure_retries_recorded_owner(
+    app_module,
+    monkeypatch,
+):
+    sched = _sched_mod(app_module)
+    from backend import api_scheduler, chat
+
+    task = sched.create_task("fresh-owner", "p", _daily_at())
+    runtime_sid = "runtime-fresh-session"
+    running = sched._track_task(
+        asyncio.create_task(asyncio.Event().wait()),
+        task_id=task["id"],
+        session_id=runtime_sid,
+    )
+    disconnects = []
+
+    async def flaky_disconnect(sid):
+        disconnects.append(sid)
+        if len(disconnects) == 1:
+            raise OSError("simulated disconnect failure")
+
+    async def must_not_purge(_sid):
+        raise AssertionError("fresh task sessions must be retained")
+
+    monkeypatch.setattr(chat, "disconnect_client", flaky_disconnect)
+    monkeypatch.setattr(chat, "purge_session_storage_async", must_not_purge)
+    try:
+        with pytest.raises(OSError, match="simulated disconnect failure"):
+            await api_scheduler.delete_task_endpoint(task["id"])
+
+        assert running.cancelled()
+        intent = sched.get_task_cleanup(task["id"])
+        assert intent is not None
+        assert intent["session_mode"] == "fresh"
+        assert intent["runtime_session_ids"] == [runtime_sid]
+
+        assert await api_scheduler.delete_task_endpoint(task["id"]) == {
+            "deleted": task["id"]
+        }
+        assert disconnects == [runtime_sid, runtime_sid]
+        assert sched.get_task_cleanup(task["id"]) is None
+    finally:
+        if not running.done():
+            running.cancel()
+            await asyncio.gather(running, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_runtime_join_timeout_keeps_cleanup_intent_for_retry(
+    app_module,
+    monkeypatch,
+):
+    sched = _sched_mod(app_module)
+    from backend import api_scheduler, chat
+
+    task = sched.create_task("join-timeout", "p", _daily_at())
+    runtime_sid = "runtime-join-timeout"
+    running = sched._track_task(
+        asyncio.create_task(asyncio.Event().wait()),
+        task_id=task["id"],
+        session_id=runtime_sid,
+    )
+    original_join = sched.join_cancelled_runs
+    joins = []
+
+    async def timeout_once(tasks, *, timeout=5.0):
+        joins.append(list(tasks))
+        if len(joins) == 1:
+            return False
+        return await original_join(tasks, timeout=timeout)
+
+    async def disconnect_noop(_sid):
+        return None
+
+    monkeypatch.setattr(sched, "join_cancelled_runs", timeout_once)
+    monkeypatch.setattr(chat, "disconnect_client", disconnect_noop)
+    try:
+        with pytest.raises(RuntimeError, match="did not stop"):
+            await api_scheduler.delete_task_endpoint(task["id"])
+        assert sched.get_task_cleanup(task["id"]) is not None
+
+        assert await api_scheduler.delete_task_endpoint(task["id"]) == {
+            "deleted": task["id"]
+        }
+        assert len(joins) == 2
+        assert sched.get_task_cleanup(task["id"]) is None
+    finally:
+        if not running.done():
+            running.cancel()
+            await asyncio.gather(running, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_start_scheduler_recovers_pending_cleanup_after_reload(
+    app_module,
+    monkeypatch,
+):
+    sched = _sched_mod(app_module)
+    from backend import chat
+
+    task = sched.create_task(
+        "startup-recovery",
+        "p",
+        _daily_at(),
+        session_mode="reuse",
+    )
+    assert sched.delete_task(task["id"], purge_bound_session=False) is True
+
+    sched._state = {
+        "tasks": {},
+        "history": [],
+        "unread_count": 0,
+        "cleanup_pending": {},
+    }
+    sched._STATE_ERROR = ""
+    sched._REVOKED_TASK_IDS.clear()
+    recovered = []
+
+    async def recover_purge(sid):
+        recovered.append(sid)
+        return True
+
+    monkeypatch.setattr(chat, "purge_session_storage_async", recover_purge)
+    try:
+        await sched.start_scheduler()
+        assert recovered == [task["session_id"]]
+        assert sched.get_task_cleanup(task["id"]) is None
+    finally:
+        await sched.stop_scheduler()
 
 
 # ---- list_task_history ----

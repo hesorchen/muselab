@@ -2,6 +2,8 @@
 
 from urllib.parse import quote
 
+import pytest
+
 
 def _make_workspace(tmp_path, name="other"):
     path = tmp_path / name
@@ -52,6 +54,27 @@ def test_readding_same_path_gets_new_workspace_generation(
     assert first.id != second.id
 
 
+def test_workspace_registry_resolves_only_the_exact_generation_id(
+    app_module,
+    tmp_path,
+):
+    from backend.workspaces import WorkspaceRegistry
+
+    primary = tmp_path / "primary"
+    primary.mkdir()
+    other = _make_workspace(tmp_path)
+    registry = WorkspaceRegistry(primary)
+    first = registry.register(other)
+
+    assert registry.entry_for_id(first.id) == first
+    registry.remove(other)
+    second = registry.register(other)
+    assert second.id != first.id
+    with pytest.raises(ValueError, match="workspace is not registered"):
+        registry.entry_for_id(first.id)
+    assert registry.entry_for_id(second.id) == second
+
+
 def test_removed_workspace_sessions_keep_their_attachments(
     client, auth, temp_root, tmp_path,
 ):
@@ -90,7 +113,9 @@ def test_legacy_registry_rows_receive_stable_workspace_ids(
 
     other = _make_workspace(tmp_path)
     registry_dir = temp_root / ".muselab"
-    registry_dir.mkdir()
+    # Other private stores may initialize the shared internal container before
+    # the workspace registry migrates a legacy workspaces.json file.
+    registry_dir.mkdir(exist_ok=True)
     (registry_dir / "workspaces.json").write_text(
         json.dumps({
             "workspaces": [
@@ -256,6 +281,88 @@ def test_nested_workspace_can_browse_symlink_into_registered_primary(
     )
     assert restored.status_code == 200
     assert (shared / "renamed").is_dir()
+
+    permanent_dir = shared / "permanent"
+    permanent_dir.mkdir()
+    (permanent_dir / "payload.txt").write_text(
+        "delete permanently\n",
+        encoding="utf-8",
+    )
+    permanently_removed = client.request(
+        "DELETE",
+        "/api/files/delete",
+        headers=workspace_headers,
+        params={"permanent": True},
+        json={"path": "project-link/permanent"},
+    )
+    assert permanently_removed.status_code == 200
+    assert permanently_removed.json() == {"ok": True, "permanent": True}
+    assert not permanent_dir.exists()
+
+
+def test_soft_delete_rolls_back_when_registered_symlink_parent_is_swapped(
+    client,
+    auth,
+    temp_root,
+    monkeypatch,
+):
+    from backend import files
+
+    shared = temp_root / "shared"
+    shared.mkdir()
+    original_payload = shared / "payload.txt"
+    original_payload.write_text("registered\n", encoding="utf-8")
+
+    nested = temp_root / "agent_workspaces"
+    nested.mkdir()
+    project_link = nested / "project-link"
+    project_link.symlink_to(shared, target_is_directory=True)
+
+    outside = temp_root.parent / "unregistered-target"
+    outside.mkdir()
+    outside_payload = outside / "payload.txt"
+    outside_payload.write_text("outside\n", encoding="utf-8")
+
+    registered = client.post(
+        "/api/chat/workspaces",
+        headers=auth,
+        json={"path": str(nested)},
+    )
+    assert registered.status_code == 200
+    workspace_headers = {
+        **auth,
+        "X-Muselab-Workspace": quote(str(nested.resolve()), safe=""),
+    }
+
+    original_rename = files._rename_noreplace
+    swapped = False
+
+    def swap_parent_then_rename(*args, **kwargs):
+        nonlocal swapped
+        if not swapped:
+            swapped = True
+            project_link.unlink()
+            project_link.symlink_to(outside, target_is_directory=True)
+        return original_rename(*args, **kwargs)
+
+    monkeypatch.setattr(files, "_rename_noreplace", swap_parent_then_rename)
+
+    removed = client.request(
+        "DELETE",
+        "/api/files/delete",
+        headers=workspace_headers,
+        json={"path": "project-link/payload.txt"},
+    )
+
+    assert swapped is True
+    assert removed.status_code == 400
+    assert "no longer reachable" in removed.json()["detail"]
+    assert original_payload.read_text(encoding="utf-8") == "registered\n"
+    assert outside_payload.read_text(encoding="utf-8") == "outside\n"
+    assert project_link.resolve() == outside.resolve()
+    trash = client.get("/api/files/trash/list", headers=workspace_headers)
+    assert trash.status_code == 200
+    assert trash.json()["items"] == []
 
 
 def test_nested_workspace_cannot_traverse_directly_into_registered_primary(

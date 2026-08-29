@@ -1,6 +1,8 @@
 """Episode consolidation, verification, hybrid recall and Skill approval."""
 import asyncio
+import sqlite3
 import threading
+import time
 
 import httpx
 import pytest
@@ -31,6 +33,175 @@ def _run(coro):
     return asyncio.run(coro)
 
 
+def test_preflight_can_disable_background_memory_worker(tmp_path, monkeypatch):
+    from backend.memory_engine import MemoryEngine
+    from backend.memory_store import MemoryStore
+
+    instance = MemoryEngine(MemoryStore(tmp_path / "registry.sqlite3"))
+    cfg = _config()
+    monkeypatch.setattr(instance, "config", lambda: cfg)
+    monkeypatch.setenv("MUSELAB_MEMORY_WORKER_DISABLED", "1")
+
+    async def scenario():
+        instance.start()
+        await asyncio.sleep(0)
+        assert instance._workers == set()
+        await instance.stop()
+
+    _run(scenario())
+
+
+def test_registry_lock_wait_does_not_freeze_event_loop(tmp_path, monkeypatch):
+    """A ten-second SQLite busy wait must not stall unrelated coroutines."""
+    from backend import memory_engine as module
+    from backend.memory_engine import MemoryEngine
+    from backend.memory_store import MemoryStore
+
+    path = tmp_path / "registry.sqlite3"
+    instance = MemoryEngine(MemoryStore(path))
+    cfg = _config()
+    monkeypatch.setattr(instance, "config", lambda: cfg)
+    evidence_id = instance.store.add_evidence(
+        "default", "session", "user", "需要归档")
+    episode = instance.store.get_or_create_episode(
+        "default", "session", idle_seconds=60)
+    instance.store.attach_evidence(episode["id"], [evidence_id])
+
+    async def fake_json(_self, _system, _prompt):
+        return {
+            "episode": {
+                "title": "归档", "summary": "已归档", "outcome": "success",
+                "entities": [], "attributes": {},
+            },
+            "memories": [],
+        }
+
+    monkeypatch.setattr(module.GenerationProvider, "complete_json", fake_json)
+    blocker = sqlite3.connect(path, isolation_level=None)
+    blocker.execute("BEGIN IMMEDIATE")
+
+    async def scenario():
+        task = asyncio.create_task(
+            instance._consolidate_episode(episode["id"]))
+        ticks = 0
+        deadline = asyncio.get_running_loop().time() + 0.08
+        while asyncio.get_running_loop().time() < deadline:
+            ticks += 1
+            await asyncio.sleep(0.005)
+        assert not task.done()
+        blocker.execute("ROLLBACK")
+        await asyncio.wait_for(task, timeout=1)
+        await instance.stop()
+        return ticks
+
+    try:
+        ticks = _run(scenario())
+    finally:
+        if blocker.in_transaction:
+            blocker.execute("ROLLBACK")
+        blocker.close()
+
+    assert ticks >= 3
+    assert instance.store.episode(
+        episode["id"], with_evidence=False)["summary"] == "已归档"
+
+
+def test_registry_initialization_runs_on_actor_thread(tmp_path, monkeypatch):
+    """Schema migration and first open stay off the asyncio thread."""
+    from backend import memory_engine as module
+    from backend.memory_engine import MemoryEngine
+
+    path = tmp_path / "lazy.sqlite3"
+    real_store = module.MemoryStore
+    constructor_threads: list[int] = []
+
+    def slow_store(store_path):
+        constructor_threads.append(threading.get_ident())
+        time.sleep(0.08)
+        return real_store(store_path)
+
+    monkeypatch.setattr(module, "MemoryStore", slow_store)
+    monkeypatch.setattr(module, "database_path", lambda: path)
+    instance = MemoryEngine()
+
+    async def scenario():
+        loop_thread = threading.get_ident()
+        task = asyncio.create_task(
+            instance._store_call(lambda store: store.stats("default")))
+        ticks = 0
+        deadline = asyncio.get_running_loop().time() + 0.04
+        while asyncio.get_running_loop().time() < deadline:
+            ticks += 1
+            await asyncio.sleep(0.005)
+        assert not task.done()
+        stats = await asyncio.wait_for(task, timeout=1)
+        await instance.stop()
+        return loop_thread, ticks, stats
+
+    loop_thread, ticks, stats = _run(scenario())
+    assert ticks >= 2
+    assert stats["memories"] == 0
+    assert constructor_threads
+    assert constructor_threads[0] != loop_thread
+
+
+def test_store_actor_cancellation_preserves_fifo_and_stop_drains(tmp_path):
+    """Cancellation drops the waiter, never a submitted DB transaction."""
+    from backend.memory_engine import MemoryEngine
+    from backend.memory_store import MemoryStore
+
+    instance = MemoryEngine(MemoryStore(tmp_path / "registry.sqlite3"))
+    started = threading.Event()
+    release = threading.Event()
+    order: list[str] = []
+    actor_threads: list[int] = []
+
+    def first(store):
+        actor_threads.append(threading.get_ident())
+        order.append("first-start")
+        started.set()
+        assert release.wait(timeout=1)
+        store.create_memory("default", "fact", "committed after cancellation")
+        order.append("first-commit")
+
+    def second(store):
+        actor_threads.append(threading.get_ident())
+        order.append("second-read")
+        return store.stats("default")["memories"]
+
+    async def scenario():
+        first_task = asyncio.create_task(instance._store_call(first))
+        async with asyncio.timeout(1):
+            while not started.is_set():
+                await asyncio.sleep(0.001)
+        second_task = asyncio.create_task(instance._store_call(second))
+        await asyncio.sleep(0)
+        first_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first_task
+
+        stop_task = asyncio.create_task(instance.stop())
+        await asyncio.sleep(0.03)
+        assert not stop_task.done()
+        release.set()
+        await asyncio.wait_for(stop_task, timeout=1)
+        count = await second_task
+        with pytest.raises(RuntimeError, match="closed"):
+            await instance._store_call(lambda store: store.stats("default"))
+        return count
+
+    try:
+        count = _run(scenario())
+    finally:
+        release.set()
+
+    assert count == 1
+    assert order == ["first-start", "first-commit", "second-read"]
+    assert len(set(actor_threads)) == 1
+    actor_thread = actor_threads[0]
+    assert not any(thread.ident == actor_thread for thread in threading.enumerate())
+
+
 def test_dreamer_and_verifier_create_traceable_memory(tmp_path, monkeypatch):
     from backend import memory_engine as module
     from backend.memory_engine import MemoryEngine
@@ -51,7 +222,17 @@ def test_dreamer_and_verifier_create_traceable_memory(tmp_path, monkeypatch):
     async def fake_json(_self, _system, prompt):
         if "possibly_related_existing_memories" in prompt:
             return {
-                "supported": True, "conflict": False,
+                "decision": "accept", "supported": True, "conflict": False,
+                "self_contained": True, "specific": True, "durable": True,
+                "generic": False, "rewrite_required": False,
+                "final_content": "用户要求报告先核对数字",
+                "rewritten_content": "",
+                "supported_claims": [{
+                    "claim": "用户要求报告先核对数字",
+                    "source_ids": [user], "evidence_type": "direct",
+                    "runtime_status": "not_applicable",
+                }],
+                "unsupported_claims": [], "removed_claims": [],
                 "prediction_value": 0.9, "reason": "direct user evidence",
             }
         return {
@@ -75,9 +256,145 @@ def test_dreamer_and_verifier_create_traceable_memory(tmp_path, monkeypatch):
     assert {source["source_type"] for source in detail["sources"]} == {
         "episode", "evidence"}
     assert detail["attributes"]["verification"]["supported"] is True
-    assert instance.store.episode(episode["id"])["extractor_version"].startswith(
-        "dreamer-v1:")
+    assert instance.store.episode(episode["id"])["extractor_version"] == (
+        "dreamer-v3:model=provider:test-model")
+    assert detail["attributes"]["dreamer_prompt_version"] == "dreamer-v3"
+    assert detail["attributes"]["verifier_prompt_version"] == "verifier-v3"
     assert any(job["kind"] == "reindex_memory" for job in instance.store.list_jobs())
+
+
+def test_verifier_minimally_rewrites_fragment_and_rejects_generic_candidate(
+        tmp_path, monkeypatch):
+    from backend import memory_engine as module
+    from backend.memory_engine import MemoryEngine
+    from backend.memory_store import MemoryStore
+
+    instance = MemoryEngine(MemoryStore(tmp_path / "registry.sqlite3"))
+    cfg = _config()
+    monkeypatch.setattr(instance, "config", lambda: cfg)
+    evidence_id = instance.store.add_evidence(
+        "default", "s", "user", "MuseLab 上线前必须先运行冷启动预检")
+    episode = instance.store.get_or_create_episode(
+        "default", "s", idle_seconds=60)
+    instance.store.attach_evidence(episode["id"], [evidence_id])
+    responses = [{"schema": {
+        "decision": "rewrite", "supported": True, "conflict": False,
+        "self_contained": True, "specific": True, "durable": True,
+        "generic": False, "rewrite_required": True,
+        "final_content": "MuseLab 上线前必须先运行冷启动预检。",
+        "rewritten_content": "MuseLab 上线前必须先运行冷启动预检。",
+        "supported_claims": [{
+            "claim": "MuseLab 上线前必须先运行冷启动预检",
+            "source_ids": [evidence_id], "evidence_type": "direct",
+            "runtime_status": "not_applicable",
+        }],
+        "unsupported_claims": [],
+        "removed_claims": [{
+            "claim": "这个上线前要先预检", "reason": "dangling reference",
+        }],
+        "prediction_value": 0.9, "reason": "adds the missing subject only",
+    }}, {
+        "decision": "reject", "supported": False, "conflict": False,
+        "self_contained": True, "specific": False, "durable": True,
+        "generic": True, "rewrite_required": False,
+        "final_content": "", "rewritten_content": "",
+        "supported_claims": [],
+        "unsupported_claims": [{
+            "claim": "面对重复流程，应当重视自动化", "reason": "generic advice",
+        }],
+        "removed_claims": [], "prediction_value": 0.8,
+        "reason": "generic advice",
+    }]
+
+    async def fake_json(_self, _system, _prompt):
+        return responses.pop(0)
+
+    monkeypatch.setattr(module.GenerationProvider, "complete_json", fake_json)
+    rewritten = _run(instance._verify_and_store({
+        "kind": "decision", "content": "这个上线前要先预检",
+        "confidence": 0.9, "future_use": 0.9,
+    }, episode["id"], [evidence_id]))
+    assert rewritten["content"] == "MuseLab 上线前必须先运行冷启动预检。"
+    assert rewritten["attributes"]["verification"]["rewrite_applied"] is True
+    assert rewritten["attributes"]["verification"]["conflict"] is False
+    rejected = _run(instance._verify_and_store({
+        "kind": "reflection", "content": "面对重复流程，应当重视自动化。",
+        "confidence": 0.8, "future_use": 0.8,
+    }, episode["id"], [evidence_id]))
+    assert rejected is None
+
+
+def test_verifier_v3_enforces_claim_sources_and_untested_marker(
+        tmp_path, monkeypatch):
+    from backend import memory_engine as module
+    from backend.memory_engine import MemoryEngine
+    from backend.memory_store import MemoryStore
+
+    instance = MemoryEngine(MemoryStore(tmp_path / "registry.sqlite3"))
+    cfg = _config()
+    monkeypatch.setattr(instance, "config", lambda: cfg)
+    evidence_id = instance.store.add_evidence(
+        "default", "s", "tool", "静态符号提示 8+8 可能支持，但尚未实测")
+    episode = instance.store.get_or_create_episode(
+        "default", "s", idle_seconds=60)
+    instance.store.attach_evidence(episode["id"], [evidence_id])
+    responses = [{
+        "decision": "accept", "supported": True, "conflict": False,
+        "self_contained": True, "specific": True, "durable": True,
+        "generic": False, "rewrite_required": False,
+        "final_content": "8+8 是候选方案，尚未实测。", "rewritten_content": "",
+        "supported_claims": [{
+            "claim": "8+8 是尚未实测的候选方案",
+            "source_ids": ["mem_not_evidence"], "evidence_type": "derived",
+            "runtime_status": "untested",
+        }],
+        "unsupported_claims": [], "removed_claims": [],
+        "prediction_value": 0.8, "reason": "wrong source type",
+    }, {
+        "decision": "rewrite", "supported": True, "conflict": False,
+        "self_contained": True, "specific": True, "durable": True,
+        "generic": False, "rewrite_required": True,
+        "final_content": "8+8 可以运行。",
+        "rewritten_content": "8+8 可以运行。",
+        "supported_claims": [{
+            "claim": "8+8 可能支持", "source_ids": [evidence_id],
+            "evidence_type": "derived", "runtime_status": "untested",
+        }],
+        "unsupported_claims": [], "removed_claims": [],
+        "prediction_value": 0.8, "reason": "missing untested marker",
+    }, {
+        "decision": "rewrite", "supported": True, "conflict": False,
+        "self_contained": True, "specific": True, "durable": True,
+        "generic": False, "rewrite_required": True,
+        "final_content": "8+8 是静态上可能支持的候选方案，尚未实测。",
+        "rewritten_content": "8+8 是静态上可能支持的候选方案，尚未实测。",
+        "supported_claims": [{
+            "claim": "8+8 是尚未实测的候选方案",
+            "source_ids": [evidence_id], "evidence_type": "derived",
+            "runtime_status": "untested",
+        }],
+        "unsupported_claims": [],
+        "removed_claims": [{
+            "claim": "8+8 可以运行", "reason": "no runtime success evidence",
+        }],
+        "prediction_value": 0.8, "reason": "certainty downgraded",
+    }]
+
+    async def fake_json(_self, _system, _prompt):
+        return responses.pop(0)
+
+    monkeypatch.setattr(module.GenerationProvider, "complete_json", fake_json)
+    candidate = {
+        "kind": "decision", "content": "8+8 可以运行。",
+        "confidence": 0.8, "future_use": 0.9,
+    }
+    assert _run(instance._verify_and_store(
+        candidate, episode["id"], [evidence_id])) is None
+    assert _run(instance._verify_and_store(
+        candidate, episode["id"], [evidence_id])) is None
+    accepted = _run(instance._verify_and_store(
+        candidate, episode["id"], [evidence_id]))
+    assert accepted["content"] == "8+8 是静态上可能支持的候选方案，尚未实测。"
 
 
 def test_shadow_mode_keeps_inference_pending_review(tmp_path, monkeypatch):
@@ -93,7 +410,15 @@ def test_shadow_mode_keeps_inference_pending_review(tmp_path, monkeypatch):
 
     async def fake_json(_self, _system, _prompt):
         return {
-            "supported": True, "conflict": False,
+            "decision": "accept", "supported": True, "conflict": False,
+            "self_contained": True, "specific": True, "durable": True,
+            "generic": False, "rewrite_required": False,
+            "final_content": "稳定偏好", "rewritten_content": "",
+            "supported_claims": [{
+                "claim": "稳定偏好", "source_ids": [ev],
+                "evidence_type": "direct", "runtime_status": "not_applicable",
+            }],
+            "unsupported_claims": [], "removed_claims": [],
             "prediction_value": 0.9, "reason": "supported",
         }
 
@@ -239,6 +564,55 @@ def test_hybrid_recall_fuses_channels_and_exposes_trace(tmp_path, monkeypatch):
     assert io_threads["log"] != event_loop_thread
 
 
+def test_recall_returns_before_slow_telemetry_and_shutdown_drains(
+        tmp_path, monkeypatch):
+    from backend import memory_engine as module
+    from backend.memory_engine import MemoryEngine
+    from backend.memory_store import MemoryStore
+
+    instance = MemoryEngine(MemoryStore(tmp_path / "registry.sqlite3"))
+    cfg = _config()
+    monkeypatch.setattr(instance, "config", lambda: cfg)
+    memory = instance.store.create_memory(
+        "default", "fact", "召回遥测不能阻塞回答",
+        authority="confirmed", confidence=1.0)
+    real_log = instance.store.log_recall
+
+    def slow_log(*args, **kwargs):
+        time.sleep(0.15)
+        return real_log(*args, **kwargs)
+
+    monkeypatch.setattr(instance.store, "log_recall", slow_log)
+
+    class FakeEmbedding:
+        def __init__(self, _config): pass
+
+        async def embed(self, _texts):
+            return [[1.0, 0.0, 0.0]]
+
+    class FakeVector:
+        async def search(self, _vector, *, owner_id, limit):
+            return [{"id": memory["id"], "channel": "dense"}]
+
+    monkeypatch.setattr(module, "EmbeddingProvider", FakeEmbedding)
+    monkeypatch.setattr(module, "vector_store", lambda _config: FakeVector())
+
+    async def scenario():
+        started = time.perf_counter()
+        rows = await instance.recall("遥测", "session")
+        elapsed = time.perf_counter() - started
+        assert rows[0]["id"] == memory["id"]
+        assert elapsed < 0.12
+        assert instance._telemetry_tasks
+        await instance.stop(timeout=1)
+        return elapsed
+
+    _run(scenario())
+    stats = instance.store.memory_recall_stats(
+        "default", [memory["id"]])[memory["id"]]
+    assert stats["recall_count"] == 1
+
+
 def test_skill_draft_is_inert_until_explicit_approval(tmp_path, monkeypatch):
     from backend import memory_engine as module
     from backend.memory_engine import MemoryEngine
@@ -257,10 +631,10 @@ def test_skill_draft_is_inert_until_explicit_approval(tmp_path, monkeypatch):
 
     discoverable = home / ".claude" / "skills" / "muselab-generated-safe-workflow"
     assert not discoverable.exists()
-    approved = instance.approve_skill(candidate["id"])
+    approved = _run(instance.approve_skill(candidate["id"]))
     assert approved["status"] == "active"
     assert (discoverable / "SKILL.md").is_file()
-    disabled = instance.disable_skill(candidate["id"])
+    disabled = _run(instance.disable_skill(candidate["id"]))
     assert disabled["status"] == "disabled"
     assert not (discoverable / "SKILL.md").exists()
 
@@ -289,7 +663,7 @@ def test_disable_skill_rejects_snapshot_controlled_path(tmp_path, monkeypatch):
     )
 
     with pytest.raises(ValueError, match="escapes"):
-        instance.disable_skill(artifact["id"])
+        _run(instance.disable_skill(artifact["id"]))
 
     assert victim.read_text(encoding="utf-8") == "private"
     assert instance.store.artifact(artifact["id"])["status"] == "active"
@@ -548,7 +922,7 @@ def test_reindex_all_queues_one_batch_job(tmp_path, monkeypatch):
         instance.store.create_memory(
             "default", "fact", f"批量索引 {index}")
 
-    assert instance.reindex_all() == 5
+    assert _run(instance.reindex_all()) == 5
     jobs = instance.store.list_jobs()
     assert len(jobs) == 1
     assert jobs[0]["kind"] == "reindex_memories"

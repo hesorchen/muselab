@@ -1495,3 +1495,100 @@ async def test_drain_rechecks_and_atomically_rolls_back_attachment_after_slow_st
     assert activity_row["state"] == "failed"
     assert activity_row["activity_source"] == "queued"
     assert notifications == [sid]
+
+
+@pytest.mark.asyncio
+async def test_queued_required_attachment_write_failure_retries_same_id(
+        app_module, monkeypatch,
+):
+    """A failed queued startup restores the durable row and staged object."""
+    from claude_agent_sdk import ResultMessage
+    from backend import chat
+
+    sess = _sess(app_module)
+    sid = sess.create_session(model="claude-sonnet-4-6")["id"]
+    aid = "queued-write-retry"
+    entry = {
+        "kind": "text",
+        "mime": "text/plain",
+        "name": "retry.txt",
+        "raw": b"retryable contents",
+        "text": "retryable contents",
+        "ts": chat.time.time(),
+    }
+    with chat._image_store_lock:
+        chat._image_store[aid] = entry
+    queued = sess.enqueue_message(
+        sid,
+        "use the retryable attachment",
+        image_ids=aid,
+    )["item"]
+
+    original_persist = chat._persist_attachment
+    fail_writes = True
+    queried = []
+
+    def flaky_persist(*args, **kwargs):
+        if fail_writes:
+            return None
+        return original_persist(*args, **kwargs)
+
+    class SuccessClient:
+        async def query(self, prompt):
+            queried.append(prompt)
+
+        async def receive_response(self):
+            yield ResultMessage(
+                subtype="success",
+                duration_ms=10,
+                duration_api_ms=9,
+                is_error=False,
+                num_turns=1,
+                session_id=sid,
+                total_cost_usd=0.0,
+                usage={"input_tokens": 1, "output_tokens": 1},
+            )
+
+        async def get_context_usage(self):
+            return {"maxTokens": 200_000, "totalTokens": 1234}
+
+    async def fake_get_client(*_args, **_kwargs):
+        return SuccessClient()
+
+    monkeypatch.setattr(chat, "_persist_attachment", flaky_persist)
+    monkeypatch.setattr(chat, "get_client", fake_get_client)
+    monkeypatch.setattr(chat, "_notify_queue_paused_on_error", lambda _sid: None)
+    monkeypatch.setattr(chat, "_get_session_msgs", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(
+        chat,
+        "_turn_uuids_from_boundary",
+        lambda *_args, **_kwargs: (
+            "queued-retry-assistant",
+            "queued-retry-user",
+            True,
+        ),
+    )
+
+    await chat._maybe_drain_queue(sid)
+
+    failed = sess.get_queue(sid)
+    assert queried == []
+    assert failed["paused"] is True
+    assert failed["inflight"] is None
+    assert [row["id"] for row in failed["items"]] == [queued["id"]]
+    assert chat._image_store.get(aid) is entry
+    assert aid not in chat._staged_attachment_claims
+
+    fail_writes = False
+    sess.set_queue_paused(sid, False)
+    await chat._maybe_drain_queue(sid)
+    broadcast = chat._active_turns[sid]
+    assert broadcast.task is not None
+    await broadcast.task
+
+    succeeded = sess.get_queue(sid)
+    assert queried
+    assert succeeded["items"] == []
+    assert succeeded["inflight"] is None
+    assert aid not in chat._image_store
+    assert aid not in chat._staged_attachment_claims

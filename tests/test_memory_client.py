@@ -290,6 +290,27 @@ def test_schedule_store_tracks_and_drains(monkeypatch, fake_httpx):
     _run(scenario())
 
 
+def test_persisted_native_recall_receipt_remains_privacy_minimal():
+    from backend.chat import _persistable_memory_recall
+
+    private = "private memory text"
+    receipt = _persistable_memory_recall({
+        "id": "recall-1", "count": 1, "latency_ms": 12.3, "status": "ok",
+        "items": [{
+            "id": "mem-1", "kind": "fact", "score": 0.9,
+            "content": private,
+            "sources": [{"session_id": "private-session"}],
+            "recall_stats": {"recall_count": 8},
+        }],
+    })
+    encoded = json.dumps(receipt)
+    assert receipt["items"] == [{"id": "mem-1", "kind": "fact", "score": 0.9}]
+    assert private not in encoded
+    assert "sources" not in encoded
+    assert "private-session" not in encoded
+    assert "recall_stats" not in encoded
+
+
 def test_shutdown_awaits_task_cancellation(monkeypatch, fake_httpx):
     mc = _load(monkeypatch)
     cancelled = asyncio.Event()

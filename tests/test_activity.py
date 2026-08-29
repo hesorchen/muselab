@@ -1007,6 +1007,129 @@ def test_activity_pin_endpoint_is_authenticated_and_returns_live_envelope(
     assert payload["generation"] == service.generation
 
 
+def test_activity_group_workspace_binding_migrates_and_does_not_filter_members(
+    tmp_path,
+    monkeypatch,
+):
+    storage = tmp_path / ".muselab"
+    storage.mkdir()
+    groups_path = storage / "activity-groups.json"
+    groups_path.write_text(json.dumps({
+        "version": 2,
+        "groups": [{"id": "legacy", "name": "Legacy", "color": "blue"}],
+        "assignments": {},
+        "order": ["legacy", "__ungrouped__"],
+    }), encoding="utf-8")
+
+    service = _service(tmp_path, monkeypatch)
+    assert service.list_groups()[0] == {
+        "id": "legacy", "name": "Legacy", "color": "blue",
+    }
+    assert json.loads(groups_path.read_text(encoding="utf-8"))["version"] == 2
+
+    bound = service.create_group(
+        "Bound",
+        "violet",
+        workspace_id="workspace-a",
+        workspace_path="/workspaces/a",
+    )["group"]
+    persisted = json.loads(groups_path.read_text(encoding="utf-8"))
+    assert persisted["version"] == 3
+    assert bound["workspace_id"] == "workspace-a"
+    assert bound["workspace_path"] == "/workspaces/a"
+
+    monkeypatch.setattr(
+        service,
+        "_metadata",
+        lambda sid: (f"Session {sid}", "/workspaces/b", "Workspace B"),
+    )
+    item = service.start("session-from-workspace-b", summary="cross workspace")
+    assert item["workspace"] == "/workspaces/b"
+    moved = service.set_group(item["id"], bound["id"])
+    assert moved["item"]["group_id"] == bound["id"]
+
+    with pytest.raises(ValueError, match="workspace binding is incomplete"):
+        service.update_group(
+            bound["id"],
+            name="Must not leak",
+            workspace_id="workspace-b",
+            workspace_path=None,
+        )
+    assert next(group for group in service.list_groups()
+                if group["id"] == bound["id"])["name"] == "Bound"
+
+    renamed = service.update_group(bound["id"], name="Still bound")["group"]
+    assert renamed["workspace_id"] == "workspace-a"
+    unbound = service.update_group(
+        bound["id"], workspace_id=None, workspace_path=None,
+    )["group"]
+    assert "workspace_id" not in unbound
+    assert "workspace_path" not in unbound
+
+    reloaded = ActivityService(tmp_path)
+    assert next(group for group in reloaded.list_groups()
+                if group["id"] == bound["id"])["name"] == "Still bound"
+
+
+def test_activity_group_workspace_binding_api_lifecycle(
+    client,
+    auth,
+    tmp_path,
+    monkeypatch,
+):
+    from backend import activity_api
+
+    service = _service(tmp_path, monkeypatch)
+    monkeypatch.setattr(activity_api, "activity", service)
+    workspace = activity_api.workspace_registry.list()[0]
+
+    created = client.post(
+        "/api/activity/groups",
+        headers=auth,
+        json={
+            "name": "Workspace group",
+            "color": "cyan",
+            "workspace_id": workspace.id,
+        },
+    )
+    assert created.status_code == 200
+    group = created.json()["group"]
+    assert group["workspace_id"] == workspace.id
+    assert group["workspace_path"] == workspace.path
+
+    renamed = client.patch(
+        f"/api/activity/groups/{group['id']}",
+        headers=auth,
+        json={"name": "Renamed only"},
+    )
+    assert renamed.status_code == 200
+    assert renamed.json()["group"]["workspace_id"] == workspace.id
+
+    unknown = client.patch(
+        f"/api/activity/groups/{group['id']}",
+        headers=auth,
+        json={"workspace_id": "missing-generation"},
+    )
+    assert unknown.status_code == 400
+    assert service.list_groups()[0]["workspace_id"] == workspace.id
+
+    forbidden_path = client.patch(
+        f"/api/activity/groups/{group['id']}",
+        headers=auth,
+        json={"workspace_path": workspace.path},
+    )
+    assert forbidden_path.status_code == 422
+
+    cleared = client.patch(
+        f"/api/activity/groups/{group['id']}",
+        headers=auth,
+        json={"workspace_id": None},
+    )
+    assert cleared.status_code == 200
+    assert "workspace_id" not in cleared.json()["group"]
+    assert "workspace_path" not in cleared.json()["group"]
+
+
 def test_activity_group_endpoints_manage_and_assign_custom_groups(
     client,
     auth,

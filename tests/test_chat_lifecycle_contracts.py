@@ -567,6 +567,7 @@ def test_chat_runtime_facades_and_hooks_remain_patchable(
                 "effort": "high",
                 "service_tier": "",
                 "plan_return_permission": "",
+                "startup_phase": None,
             })
         ]
 

@@ -169,6 +169,56 @@ def test_qdrant_refuses_existing_collection_with_wrong_dimension(monkeypatch):
         _run(store.ensure(1024))
 
 
+def test_qdrant_cutover_point_io_is_batched_and_waits(monkeypatch):
+    from backend.memory_config import VectorConfig
+    from backend.memory_providers import QdrantVectorStore
+
+    class Response:
+        def __init__(self, result):
+            self.result = result
+
+        def json(self):
+            return {"result": self.result}
+
+    store = QdrantVectorStore(VectorConfig(
+        provider="qdrant", url="http://qdrant:6333", collection="memory"))
+    calls = []
+
+    async def request(method, path, **kwargs):
+        calls.append((method, path, kwargs["json"]))
+        if path.endswith("/points"):
+            return Response([{"id": point_id} for point_id in kwargs["json"]["ids"]])
+        return Response({"status": "acknowledged"})
+
+    monkeypatch.setattr(store, "_request", request)
+    item_ids = [f"memory-{index}" for index in range(257)]
+    points = _run(store.retrieve_many(item_ids))
+    _run(store.set_payload_many(item_ids, {"owner_id": "new-owner"}))
+
+    expected_ids = [store._point_id(item_id) for item_id in item_ids]
+    assert [point["id"] for point in points] == expected_ids
+    assert calls == [
+        ("POST", "/collections/memory/points", {
+            "ids": expected_ids[:256],
+            "with_payload": True,
+            "with_vector": True,
+        }),
+        ("POST", "/collections/memory/points", {
+            "ids": expected_ids[256:],
+            "with_payload": True,
+            "with_vector": True,
+        }),
+        ("POST", "/collections/memory/points/payload?wait=true", {
+            "payload": {"owner_id": "new-owner"},
+            "points": expected_ids[:256],
+        }),
+        ("POST", "/collections/memory/points/payload?wait=true", {
+            "payload": {"owner_id": "new-owner"},
+            "points": expected_ids[256:],
+        }),
+    ]
+
+
 def test_pgvector_table_name_is_not_interpolatable():
     from backend.memory_config import VectorConfig
     from backend.memory_providers import PgVectorStore
