@@ -4005,12 +4005,15 @@ def test_long_chat_state_keeps_complete_normalized_history_and_generation_safety
     assert "streamState._flushLivePresentation = flushLivePresentation" in app
     assert "if (this.currentId !== streamSid) return;" in app
     assert "const flushPlainBoundary = () =>" in app
-    assert "const closeAsst = () => {\n        flushPlainBoundary();" in app
+    assert "const closeAsst = () => {" in app
+    assert "this._queueDeferredStreamRich(streamSid, streamState, completedBubble)" in app
     terminal_start = app.index("const flushTerminalPresentation = () => {")
     terminal_end = app.index("\n\n      es.addEventListener", terminal_start)
     terminal = app[terminal_start:terminal_end]
     assert "const completedBubble = ownsCurBubble() ? curBubble : null;" in terminal
-    assert "if (completedBubble) flushRender();" in terminal
+    assert "completedBubble && this.currentId === streamSid" in terminal
+    assert "flushPlainBoundary();" in terminal
+    assert "this._queueDeferredStreamRich" in terminal
     assert terminal.index("const completedText") < terminal.rindex("curBubble = null;")
     assert "return { bubble: completedBubble, text: completedText };" in terminal
     assert ':data-tid="tid"' in pane
@@ -4128,6 +4131,9 @@ def test_stream_deltas_use_throttled_plain_snapshots_and_final_rich_render():
     assert "curBubble._streamText = acc" in render
     assert "curBubble.html = this._renderHistoryMessage(curBubble)" in render
     assert "curBubble._streamPlain = false" in render
+    assert "_scheduleDeferredStreamRich(sid, st)" in app
+    assert "message._deferredRichReady = true" in app
+    assert "requestIdleCallback(run, { timeout: 160 })" in app
     assert "_streamRichRenderCount" in app
     assert "_streamPlainRenderCount" in app
     assert "}, 1000);" in app

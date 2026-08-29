@@ -36,7 +36,7 @@ def _login(page: Page, base: str, token: str) -> None:
     page.wait_for_function(
         """() => {
           const app = document.querySelector("#app")?._x_dataStack?.[0];
-          return app && app.authed === true && app.appReady
+          return app && app.authed === true && app.appReady && app._modelsLoaded
             && app._sessionsInitialized && app.currentId
             && app.openTabIds.includes(app.currentId) && app.sessions.length > 0;
         }"""
@@ -851,6 +851,7 @@ def _bootstrap_session_for_real_load(page: Page, sid: str, name: str) -> None:
           model: "e2e-model", label: "E2E model", group: "e2e",
           supports_thinking: true,
         }];
+        app._modelsLoaded = true;
         app.sessions = [{ id: arg.sid, name: arg.name, updated_at: Date.now() / 1000,
           model: "e2e-model", permission: "bypassPermissions", thinking: true }];
         app.openTabIds = [arg.sid];
@@ -7204,6 +7205,7 @@ def test_background_stream_buffers_token_rate_presentation_until_activation(
         ids[1],
     )
     page.wait_for_function("() => window.__fakeChatStreams().length === 2")
+    page.evaluate("() => { window.__backgroundUsageFetches.length = 0; }")
 
     page.evaluate(
         """() => {
@@ -7236,6 +7238,52 @@ def test_background_stream_buffers_token_rate_presentation_until_activation(
     assert before["plainPaints"] == 0
     assert ids[0] not in before["usageFetches"]
 
+    terminal = page.evaluate(
+        """([sid]) => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const originalRender = app._mdRenderUncached.bind(app);
+          window.__backgroundRichCalls = 0;
+          app._mdRenderUncached = (text, opts) => {
+            if ((text || '').includes('BG_FINAL_RICH_MARKER')) {
+              window.__backgroundRichCalls += 1;
+            }
+            return originalRender(text, opts);
+          };
+          const finalText = '**BG_FINAL_RICH_MARKER**\\n\\n'
+            + 'background payload '.repeat(7500);
+          window.__emitSseAt(0, 'text', {text: finalText});
+          const started = performance.now();
+          window.__emitSseAt(0, 'done', {
+            total_cost_usd: 0.001,
+            session_usage: {
+              context_used_pct: 10,
+              context_used: 1000,
+              context_limit: 100000,
+            },
+          });
+          const st = app._ensureTabState(sid);
+          const last = [...st.messages].reverse().find(m =>
+            m.role === 'assistant' && (m.text || '').includes('BG_FINAL_RICH_MARKER'));
+          return {
+            dispatchMs: performance.now() - started,
+            streaming: st.streaming,
+            richCalls: window.__backgroundRichCalls,
+            plain: last?._streamPlain,
+            deferred: last?._deferredRichReady,
+            htmlLength: (last?.html || '').length,
+            textLength: (last?.text || '').length,
+          };
+        }""",
+        arg=[ids[0]],
+    )
+    assert terminal["streaming"] is False
+    assert terminal["richCalls"] == 0
+    assert terminal["plain"] is True
+    assert terminal["deferred"] is True
+    assert terminal["htmlLength"] == 0
+    assert terminal["textLength"] >= 120_000
+    assert terminal["dispatchMs"] < 250
+
     _app_eval(
         page,
         """
@@ -7249,14 +7297,31 @@ def test_background_stream_buffers_token_rate_presentation_until_activation(
         """sid => {
           const app = document.querySelector("#app")._x_dataStack[0];
           const st = app._ensureTabState(sid);
-          const thinking = [...st.messages].reverse().find(m => m.role === "thinking");
-          return app.currentId === sid
-            && thinking?.text.includes("BG_THINK_199")
-            && document.querySelector(`.msg-pane[data-tid="${sid}"]`)
-              ?.textContent.includes("BG_THINK_199");
+          return [...st.messages].reverse().some(m =>
+            m.role === 'assistant'
+            && m.text.includes('BG_FINAL_RICH_MARKER')
+            && m._streamPlain === false
+            && m._deferredRichReady === false
+            && m.html.includes('BG_FINAL_RICH_MARKER'));
         }""",
         arg=ids[0],
     )
+    activation = _app_eval(
+        page,
+        """
+        const st = app._ensureTabState(arg);
+        const thinking = [...st.messages].reverse().find(m => m.role === "thinking");
+        return {
+          currentId: app.currentId,
+          thinkingText: thinking?.text || "",
+          richCalls: window.__backgroundRichCalls,
+        };
+        """,
+        ids[0],
+    )
+    assert activation["currentId"] == ids[0]
+    assert "BG_THINK_199" in activation["thinkingText"]
+    assert activation["richCalls"] == 1
     assert _app_eval(
         page,
         """

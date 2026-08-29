@@ -844,6 +844,8 @@ function portal() {
     activeWorkspace: "",
     workspaceMenuOpen: false,
     workspaceSwitching: false,
+    workspaceRegistryBusy: false,
+    workspaceOrderSaving: false,
     // The file tree and preview switch ownership before the target transcript
     // is ready. Keep that valid intermediate state behind one visual barrier
     // so the three workspace surfaces are revealed together.
@@ -984,7 +986,10 @@ function portal() {
       pollTimer: null,
       error: "",
       ownerSid: "",
+      submitController: null,
+      submitSeq: 0,
     },
+    IMAGE_GEN_SUBMIT_DEADLINE_MS: 20000,
     // Active-tab mirror of tabState[currentId].draft._sendWaitingForUpload.
     // Each session owns its own wait flag, so an upload in A never disables B.
     // It disables duplicate sends only while that draft's attachment upload is
@@ -3820,7 +3825,17 @@ function portal() {
       });
     },
     closeImageGen() {
+      this.cancelImageGenSubmit();
       this.imageGen.show = false;
+    },
+    cancelImageGenSubmit() {
+      const controller = this.imageGen.submitController;
+      this.imageGen.submitSeq = (Number(this.imageGen.submitSeq) || 0) + 1;
+      this.imageGen.submitController = null;
+      this.imageGen.loading = false;
+      if (controller) {
+        try { controller.abort(); } catch (_) {}
+      }
     },
     ensureImageGenPolling() {
       if (this.imageGen.pollTimer) return;
@@ -3895,11 +3910,21 @@ function portal() {
     async runImageGen() {
       const prompt = (this.imageGen.prompt || "").trim();
       if (!prompt || this.imageGen.loading) return;
+      const submitSeq = (Number(this.imageGen.submitSeq) || 0) + 1;
+      const controller = new AbortController();
+      let timedOut = false;
+      this.imageGen.submitSeq = submitSeq;
+      this.imageGen.submitController = controller;
       this.imageGen.loading = true;
       this.imageGen.error = "";
+      const timer = setTimeout(() => {
+        timedOut = true;
+        controller.abort();
+      }, this.IMAGE_GEN_SUBMIT_DEADLINE_MS);
       try {
         const res = await this.api("/api/chat/image-generate/jobs", {
           method: "POST",
+          signal: controller.signal,
           json: {
             prompt,
             model: this.imageGen.model || "gpt-image-2",
@@ -3910,6 +3935,11 @@ function portal() {
             image_ids: this.imageGenReferenceIds(),
           },
         });
+        if (submitSeq !== this.imageGen.submitSeq) return;
+        if (controller.signal.aborted) {
+          throw new Error(timedOut
+            ? "image generation submission timed out" : "cancelled");
+        }
         if (!res.ok) throw new Error(res.error || `HTTP ${res.status}`);
         const job = res.data.job;
         if (job && job.id) {
@@ -3920,12 +3950,23 @@ function portal() {
                    "success", 1800);
         this.ensureImageGenPolling();
       } catch (e) {
-        const msg = e && e.message ? e.message : String(e || "");
+        if (submitSeq !== this.imageGen.submitSeq) return;
+        const msg = timedOut
+          ? (this.lang === "zh"
+            ? "提交确认超时，请先刷新历史记录，确认后再重试"
+            : "Submission confirmation timed out. Refresh history before retrying")
+          : (e && e.message ? e.message : String(e || ""));
         this.imageGen.error = msg;
         this.toast((this.lang === "zh" ? "提交失败：" : "Submit failed: ") + msg,
                    "error", 5000);
       } finally {
-        this.imageGen.loading = false;
+        clearTimeout(timer);
+        if (submitSeq === this.imageGen.submitSeq) {
+          if (this.imageGen.submitController === controller) {
+            this.imageGen.submitController = null;
+          }
+          this.imageGen.loading = false;
+        }
       }
     },
     async attachGeneratedImage(img, ownerSid = this.imageGen.ownerSid || this.currentId) {
@@ -4667,6 +4708,82 @@ function portal() {
         cache.delete(oldestKey);
       }
       return html;
+    },
+
+    _cancelDeferredStreamRich(st, clear = false) {
+      const handle = st && st._deferredStreamRichHandle;
+      if (handle) {
+        if (handle.kind === "idle" && typeof cancelIdleCallback === "function") {
+          cancelIdleCallback(handle.id);
+        } else {
+          clearTimeout(handle.id);
+        }
+        st._deferredStreamRichHandle = null;
+      }
+      if (clear && st) st._deferredStreamRich = [];
+    },
+
+    _queueDeferredStreamRich(sid, st, message) {
+      if (!sid || !st || this.tabState[sid] !== st || !message
+          || message.role !== "assistant" || !message.text) return false;
+      message._streamText = message.text;
+      message._streamPlain = true;
+      message._deferredRichReady = true;
+      const queue = st._deferredStreamRich || (st._deferredStreamRich = []);
+      if (!queue.includes(message)) queue.push(message);
+      if (sid === this.currentId) this._scheduleDeferredStreamRich(sid, st);
+      return true;
+    },
+
+    _scheduleDeferredStreamRich(sid, st) {
+      if (!sid || !st || this.tabState[sid] !== st || sid !== this.currentId) return;
+      const queue = st._deferredStreamRich || (st._deferredStreamRich = []);
+      for (const message of (st.messages || [])) {
+        if (message && message._deferredRichReady && !queue.includes(message)) {
+          queue.push(message);
+        }
+      }
+      if (!queue.length || st._deferredStreamRichHandle) return;
+
+      const run = () => {
+        st._deferredStreamRichHandle = null;
+        if (this.tabState[sid] !== st || sid !== this.currentId) return;
+        const maxChunk = this._isMobileLayout() ? 1 : 2;
+        const frameBudgetMs = this._isMobileLayout() ? 6 : 12;
+        const started = performance.now();
+        let rendered = 0;
+        while (queue.length && rendered < maxChunk) {
+          if (rendered > 0 && performance.now() - started >= frameBudgetMs) break;
+          const message = queue.shift();
+          if (!message || !this._containsPaneMessage(st, message)
+              || !message._deferredRichReady || !message.text) continue;
+          message.html = this._renderHistoryMessage(message);
+          message._streamPlain = false;
+          message._deferredRichReady = false;
+          st._streamRichRenderCount++;
+          rendered++;
+        }
+        if (queue.length) {
+          this._scheduleDeferredStreamRich(sid, st);
+          return;
+        }
+        this.$nextTick(() => {
+          if (this.tabState[sid] !== st || sid !== this.currentId) return;
+          const pane = this._paneElement(sid);
+          void this.highlightCode(".chat-body", pane ? [pane] : null);
+        });
+      };
+      if (typeof requestIdleCallback === "function") {
+        st._deferredStreamRichHandle = {
+          kind: "idle",
+          id: requestIdleCallback(run, { timeout: 160 }),
+        };
+      } else {
+        st._deferredStreamRichHandle = {
+          kind: "timer",
+          id: setTimeout(run, 0),
+        };
+      }
     },
 
     _historyHtmlDelete(m) {
@@ -6407,6 +6524,10 @@ function portal() {
         // The standalone key is authoritative. p.openTabIds is accepted only as
         // a one-time migration source for users upgrading from schema <= 9.
         this._loadChatTabStore(p.openTabIds);
+        if (Object.prototype.hasOwnProperty.call(p, "openTabIds")) {
+          delete p.openTabIds;
+          this._setLS("muselab_prefs", JSON.stringify(p));
+        }
         // Preview tabs — restore the strip; the actual content fetch happens
         // lazily when the user clicks back to one (or via restorePreviewSelected
         // which runs once after login).
@@ -7710,6 +7831,8 @@ function portal() {
         _streamStartedAt: 0,
         _streamRichRenderCount: 0,
         _streamPlainRenderCount: 0,
+        _deferredStreamRich: [],
+        _deferredStreamRichHandle: null,
         _lastSseActivity: 0,
         _stallWatch: null,
         _serverActiveObserved: false,
@@ -11802,7 +11925,8 @@ function portal() {
       }
     },
     closeWorkspaceBrowser() {
-      if (!this.workspaceBrowser.show || this.workspaceSwitching) return;
+      if (!this.workspaceBrowser.show || this.workspaceSwitching
+          || this.workspaceRegistryBusy) return;
       this.workspaceBrowser.show = false;
       this.workspaceBrowser.requestSeq++;
       this.workspaceBrowser.loading = false;
@@ -11860,8 +11984,8 @@ function portal() {
       return (this.lang === "zh" ? "将添加：" : "Add: ") + name;
     },
     async _registerWorkspacePath(path) {
-      if (!path || this.workspaceSwitching) return null;
-      this.workspaceSwitching = true;
+      if (!path || this.workspaceSwitching || this.workspaceRegistryBusy) return null;
+      this.workspaceRegistryBusy = true;
       let entry = null;
       try {
         const response = await fetch("/api/chat/workspaces", {
@@ -11879,7 +12003,7 @@ function portal() {
           : "The directory is invalid, unreadable, or no longer available.";
         this.toast(this.lang === "zh" ? "目录无法登记" : "Could not register that directory", "error");
       } finally {
-        this.workspaceSwitching = false;
+        this.workspaceRegistryBusy = false;
       }
       return entry;
     },
@@ -11890,7 +12014,7 @@ function portal() {
       await this.switchWorkspace(entry.path);
     },
     async addWorkspacePathManually() {
-      if (this.workspaceSwitching) return;
+      if (this.workspaceSwitching || this.workspaceRegistryBusy) return;
       const value = await this.prompt({
         title: this.lang === "zh" ? "输入工作目录路径" : "Enter workspace path",
         body: this.lang === "zh"
@@ -11908,7 +12032,7 @@ function portal() {
     },
     async addWorkspace() {
       this.workspaceMenuOpen = false;
-      if (this.workspaceSwitching) return;
+      if (this.workspaceSwitching || this.workspaceRegistryBusy) return;
       const browser = this.workspaceBrowser;
       browser.show = true;
       browser.error = "";
@@ -11947,6 +12071,7 @@ function portal() {
           this.imageEditor._snapshot = null;
         }
         if (this.imageGen.ownerSid === id) {
+          this.cancelImageGenSubmit();
           this.imageGen.show = false;
           this.imageGen.ownerSid = "";
         }
@@ -11958,6 +12083,7 @@ function portal() {
         if (st._streamTimer) clearInterval(st._streamTimer);
         if (st._stallWatch) clearInterval(st._stallWatch);
         if (st._reconnectTimer) clearTimeout(st._reconnectTimer);
+        this._cancelDeferredStreamRich(st, true);
         this._disposeSessionSync(st);
         if (st._virtualSyncFrame) {
           if (typeof cancelAnimationFrame === "function") {
@@ -11995,7 +12121,9 @@ function portal() {
       this._clearSessionWarnFlags(id);
     },
     _startWorkspaceDrag(path, pointerId = null) {
-      if (this.workspaceSwitching || !this.sessionWorkspaces.some(row => row.path === path)) return false;
+      if (this.workspaceSwitching || this.workspaceRegistryBusy
+          || this.workspaceOrderSaving
+          || !this.sessionWorkspaces.some(row => row.path === path)) return false;
       this.workspaceDrag = {
         path, overPath: path, pointerId,
         originalPaths: this.sessionWorkspaces.map(row => row.path),
@@ -12052,14 +12180,14 @@ function portal() {
     },
     async finishWorkspaceDrag() {
       const drag = this.workspaceDrag;
-      if (!drag.path) return;
+      if (!drag.path || this.workspaceOrderSaving) return;
       const currentPaths = this.sessionWorkspaces.map(row => row.path);
       const changed = currentPaths.some((path, index) => path !== drag.originalPaths[index]);
       this.workspaceDrag = { path: "", overPath: "", pointerId: null, originalPaths: [] };
       if (!changed) return;
 
       this._saveWorkspaceOrder();
-      this.workspaceSwitching = true;
+      this.workspaceOrderSaving = true;
       try {
         const response = await fetch("/api/chat/workspaces/order", {
           method: "PUT",
@@ -12078,12 +12206,13 @@ function portal() {
         this._saveWorkspaceOrder();
         this.toast(this.lang === "zh" ? "工作目录排序保存失败" : "Could not save workspace order", "error");
       } finally {
-        this.workspaceSwitching = false;
+        this.workspaceOrderSaving = false;
       }
     },
     async removeWorkspace(path) {
       const entry = this.sessionWorkspaces.find(w => w.path === path);
-      if (!entry || entry.primary || this.workspaceSwitching) return;
+      if (!entry || entry.primary || this.workspaceSwitching
+          || this.workspaceRegistryBusy) return;
       const ok = await this.confirm({
         title: this.lang === "zh" ? "移除工作目录" : "Remove workspace",
         body: this.lang === "zh"
@@ -12093,12 +12222,22 @@ function portal() {
         okText: this.lang === "zh" ? "移除" : "Remove",
       });
       if (!ok) return;
-      this.workspaceSwitching = true;
-      try {
+      if (this.workspaceSwitching || this.workspaceRegistryBusy) return;
+      if (this.activeWorkspace === path) {
+        const primary = this.sessionWorkspaces.find(w => w.primary);
+        if (!primary) return;
+        await this.switchWorkspace(primary.path);
         if (this.activeWorkspace === path) {
-          const primary = this.sessionWorkspaces.find(w => w.primary);
-          if (primary) await this._changeWorkspaceSurface(primary.path);
+          this.toast(this.lang === "zh"
+            ? "切换到主工作目录失败，未执行移除"
+            : "Could not switch to the primary workspace; nothing was removed",
+          "error");
+          return;
         }
+      }
+      if (this.workspaceSwitching || this.workspaceRegistryBusy) return;
+      this.workspaceRegistryBusy = true;
+      try {
         const response = await fetch(
           "/api/chat/workspaces?path=" + encodeURIComponent(path),
           { method: "DELETE", headers: this.hdr() },
@@ -12127,7 +12266,7 @@ function portal() {
       } catch (_) {
         this.toast(this.lang === "zh" ? "移除工作目录失败" : "Could not remove workspace", "error");
       } finally {
-        this.workspaceSwitching = false;
+        this.workspaceRegistryBusy = false;
       }
     },
     _registerOptimisticSession(meta) {
@@ -15342,6 +15481,9 @@ function portal() {
       const activatedState = this.tabState && this.tabState[this.currentId];
       if (activatedState && typeof activatedState._flushLivePresentation === "function") {
         activatedState._flushLivePresentation();
+      }
+      if (activatedState) {
+        this._scheduleDeferredStreamRich(this.currentId, activatedState);
       }
       // Selecting a conversation means opening its latest state, not restoring a
       // stale historical viewport. Reader-controlled position is preserved only
@@ -29080,6 +29222,11 @@ function portal() {
         this._scheduleLiveMessageViewport(sendState);
         sentUserBubble = this._appendLiveMessage(sendState, {
           role: "user", text,
+          // The bubble exists before the server decides whether this prompt
+          // owns a turn or a queue slot.  Keep pane-level Running hidden until
+          // admission is authoritative.
+          _admissionPending: true,
+          _optimisticQueue: false,
           displayText: hasDetachedText ? detachedDisplayText : composerInput,
           selectionQuotes: composerQuotes.map(q => ({ ...q })),
           images: readyImages.map(im => ({
@@ -29125,6 +29272,7 @@ function portal() {
         ? await this._confirmSessionBusy(sendSid, sendState)
         : false;
       if (confirmedBusy) {
+        if (sentUserBubble) sentUserBubble._optimisticQueue = true;
         this._setComposerClaimPhase(sendState, composerSubmitToken, "queue");
         const shouldHandoffBackground = !sendState.streaming
           && !sendState.compacting
@@ -29372,6 +29520,7 @@ function portal() {
               useMux = false;
             } else {
               if (tr.status === 409 && !resumed) {
+                if (sentUserBubble) sentUserBubble._optimisticQueue = true;
                 const queued = await this._enqueueMessage(streamSid, {
                   text,
                   displayText: hasDetachedText ? detachedDisplayText : composerInput,
@@ -29403,7 +29552,10 @@ function portal() {
               streamState.activeTurnId = admittedTurnId;
               streamState.parentTurnId = "";
               streamState.lastEventSeq = 0;
-              if (sentUserBubble) sentUserBubble._turnId = admittedTurnId;
+              if (sentUserBubble) {
+                sentUserBubble._turnId = admittedTurnId;
+                sentUserBubble._admissionPending = false;
+              }
               if (Number(admitted.started_at) > 0) {
                 streamState._streamStartedAt = Number(admitted.started_at) * 1000;
               }
@@ -29533,6 +29685,9 @@ function portal() {
             }
           }
         }
+        if (sentUserBubble && !["ping", "error", "resync"].includes(ev && ev.type)) {
+          sentUserBubble._admissionPending = false;
+        }
         if (ev && ev.type !== "error") {
           this._cancelSessionSyncReason(streamState, "transport_retry");
         }
@@ -29644,7 +29799,8 @@ function portal() {
         // empty / null so x-show defaults match "not yet computed".
         const bubble = {
           role: "assistant",
-          text: "", html: "", _streamText: "", _streamPlain: true, cost: "",
+          text: "", html: "", _streamText: "", _streamPlain: true,
+          _deferredRichReady: false, cost: "",
           model: modelForBubble,
           ts: null,
           elapsed: 0,
@@ -29744,6 +29900,7 @@ function portal() {
         curBubble._streamText = acc;
         curBubble.html = this._renderHistoryMessage(curBubble);
         curBubble._streamPlain = false;
+        curBubble._deferredRichReady = false;
         streamState._streamRichRenderCount++;
         _scrollIfActive();
       };
@@ -29760,7 +29917,11 @@ function portal() {
         if (this.currentId === streamSid) _scrollIfActive();
       };
       const closeAsst = () => {
+        const completedBubble = ownsCurBubble() ? curBubble : null;
         flushPlainBoundary();
+        if (completedBubble) {
+          this._queueDeferredStreamRich(streamSid, streamState, completedBubble);
+        }
         curBubble = null;
         acc = "";
       };
@@ -29872,8 +30033,14 @@ function portal() {
       streamState._flushLivePresentation = flushLivePresentation;
       const flushTerminalPresentation = () => {
         const completedBubble = ownsCurBubble() ? curBubble : null;
-        if (completedBubble) flushRender();
-        else { cancelPendingPaint(); curBubble = null; acc = ""; }
+        if (completedBubble && this.currentId === streamSid) {
+          flushRender();
+        } else if (completedBubble) {
+          flushPlainBoundary();
+          this._queueDeferredStreamRich(streamSid, streamState, completedBubble);
+        } else {
+          cancelPendingPaint(); curBubble = null; acc = "";
+        }
         closeThinking();
         flushTaskProgress();
         const completedText = completedBubble ? (completedBubble.text || "") : "";
@@ -30798,6 +30965,7 @@ function portal() {
         // items never re-enqueue, which prevents duplicates.
         if (serverError && errKind === "turn_busy"
             && !isReconnect && !resumed) {
+          if (sentUserBubble) sentUserBubble._optimisticQueue = true;
           streamState._busyQueueHandoff = es;
           try { es.close(); } catch (_) {}
           const queued = await this._enqueueMessage(streamSid, {

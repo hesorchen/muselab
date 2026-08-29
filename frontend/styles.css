@@ -6842,6 +6842,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
    ============================================================================ */
 .tool-prefix-icon svg,
 .queued-icon svg,
+.optimistic-queue-status svg,
 .compact-pending-icon svg,
 .queue-paused-icon svg,
 .settings-menu-icon svg,
@@ -7665,6 +7666,20 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 }
 .queued-icon { font-size: var(--fs-sm); }
 .queued-label { white-space: nowrap; }
+.user-bubble.is-queueing {
+  border: 1px dashed rgba(255, 255, 255, 0.6);
+}
+.optimistic-queue-status {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin-top: 6px;
+  padding-top: 5px;
+  border-top: 1px dotted rgba(255, 255, 255, 0.35);
+  color: rgba(255, 255, 255, 0.82);
+  font-size: var(--fs-xs);
+}
+.optimistic-queue-status svg { width: 1em; height: 1em; }
 /* Paused marker on a queued bubble. Warn-colored so it separates from the
    neutral "已排队 1/2" counter beside it — this one is a blocked state, not
    a position. */
