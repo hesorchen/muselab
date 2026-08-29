@@ -121,6 +121,16 @@ def test_chat_stream_mux_keeps_one_root_source_and_reuses_the_send_reducer():
     assert "this._handleChatMuxDisconnect(source)" in app
     assert "do not synthesize `error`/`done`" in app
     assert "return await opened" in app
+    mux_state = app[
+        app.index("async _handleChatMuxSessionState(payload)"):
+        app.index("async _startChatMuxCoordinator()")
+    ]
+    assert "inactiveTurnId !== currentTurnId" in mux_state
+    assert "currentTurnId === inactiveTurnId" in mux_state
+    assert "this._retireStaleSessionStream(sid, existingState)" in mux_state
+    assert "this._setSessionActivityExpectation(sid, false)" in mux_state
+    assert "existingState._pendingExternalUpdate = true" in mux_state
+    assert "this._scheduleCanonicalStreamReload(" in mux_state
     coordinator = app[app.index("async _startChatMuxCoordinator()"):
                       app.index("async initSessions(")]
     assert coordinator.index("await this._ensureChatMux()") < coordinator.index(

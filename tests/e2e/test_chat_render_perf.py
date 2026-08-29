@@ -456,6 +456,123 @@ def test_mux_routes_two_sessions_reconnects_with_checkpoints_and_defers_watcher_
     _assert_no_browser_errors(page, errors)
 
 
+def test_mux_inactive_retires_matching_turn_without_harming_successor(
+    page: Page, backend_url, auth_token,
+):
+    errors = _capture_browser_errors(page)
+    _install_fake_mux_event_source(page)
+    page.route(
+        "**/api/chat/stream/mux/start",
+        lambda route: route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({"ticket": "mux-inactive-settlement"}),
+        ),
+    )
+    _login(page, backend_url, auth_token)
+    page.wait_for_function("window.__fakeMuxStreams().length === 1")
+
+    result = page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const sid = app.currentId;
+          const st = app._ensureTabState(sid);
+          const meta = app.sessions.find(session => session.id === sid);
+          const originalReload = app._scheduleCanonicalStreamReload;
+          let reloads = 0;
+          app._scheduleCanonicalStreamReload = () => { reloads += 1; return true; };
+          try {
+            st._loaded = true;
+            st.messages = [{ role: 'assistant', text: 'VISIBLE_COMPLETED_REPLY' }];
+            st.streaming = true;
+            st.streamPhase = 'runtime';
+            st.activeTurnId = 'turn-a';
+            st._stoppingTurnId = 'turn-a';
+            st.es = app._chatMuxChannel(sid, 'turn-a');
+            app._activateChatMuxChannel(st.es);
+            st._streamStartedAt = Date.now() - 5000;
+            st.streamElapsed = 5;
+            st._streamTimer = setInterval(() => {}, 1000);
+            st._stallWatch = setInterval(() => {}, 1000);
+            if (meta) meta.active = true;
+
+            window.__emitMux('session_state', {
+              session_id: sid, turn_id: 'turn-a', active: false,
+              stopping: false, attachable: false,
+            });
+            await new Promise(resolve => setTimeout(resolve, 30));
+            const matching = {
+              streaming: st.streaming,
+              phase: st.streamPhase,
+              es: st.es,
+              timer: st._streamTimer,
+              stall: st._stallWatch,
+              stoppingTurn: st._stoppingTurnId,
+              elapsed: st.streamElapsed,
+              reloads,
+              text: st.messages[0] && st.messages[0].text,
+              metaActive: meta && meta.active,
+            };
+
+            st.streaming = true;
+            st.streamPhase = 'runtime';
+            st.activeTurnId = 'turn-b';
+            st._stoppingTurnId = '';
+            st.es = app._chatMuxChannel(sid, 'turn-b');
+            app._activateChatMuxChannel(st.es);
+            st._streamTimer = setInterval(() => {}, 1000);
+            st._stallWatch = setInterval(() => {}, 1000);
+            if (meta) meta.active = true;
+            const successorEs = st.es;
+            const successorTimer = st._streamTimer;
+
+            window.__emitMux('session_state', {
+              session_id: sid, turn_id: 'turn-a', active: false,
+              stopping: false, attachable: false,
+            });
+            await new Promise(resolve => setTimeout(resolve, 30));
+            const successor = {
+              streaming: st.streaming,
+              phase: st.streamPhase,
+              sameEs: st.es === successorEs,
+              sameTimer: st._streamTimer === successorTimer,
+              activeTurnId: st.activeTurnId,
+              reloads,
+              metaActive: meta && meta.active,
+            };
+            clearInterval(st._streamTimer);
+            clearInterval(st._stallWatch);
+            if (st.es) st.es.close();
+            return { matching, successor };
+          } finally {
+            app._scheduleCanonicalStreamReload = originalReload;
+          }
+        }"""
+    )
+    assert result["matching"] == {
+        "streaming": False,
+        "phase": "",
+        "es": None,
+        "timer": None,
+        "stall": None,
+        "stoppingTurn": "",
+        "elapsed": 0,
+        "reloads": 1,
+        "text": "VISIBLE_COMPLETED_REPLY",
+        "metaActive": False,
+    }
+    assert result["successor"] == {
+        "streaming": True,
+        "phase": "runtime",
+        "sameEs": True,
+        "sameTimer": True,
+        "activeTurnId": "turn-b",
+        "reloads": 1,
+        "metaActive": True,
+    }
+    _assert_no_browser_errors(page, errors)
+
+
 def test_mux_coordinator_connects_before_background_history_warmup(
     page: Page, backend_url, auth_token,
 ):

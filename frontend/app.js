@@ -10288,23 +10288,43 @@ function portal() {
       const sid = String(payload && payload.session_id || "");
       if (!sid) return;
       const meta = (this.sessions || []).find(session => session.id === sid);
-      if (meta) {
-        meta.active = !!payload.active;
-        meta.turn_active = !!payload.active && !payload.background;
-        meta.background_active = !!payload.active && !!payload.background;
-      }
       const existingState = this.tabState && this.tabState[sid];
       if (!payload.active) {
-        this._chatMuxPendingEvents.delete(sid);
         const inactiveTurnId = String(payload.turn_id || "");
-        if (existingState && inactiveTurnId
-            && existingState._stoppingTurnId === inactiveTurnId) {
-          existingState._stoppingTurnId = "";
+        const currentTurnId = String(existingState && existingState.activeTurnId || "");
+        if (inactiveTurnId && currentTurnId && inactiveTurnId !== currentTurnId) {
+          // A delayed inactive frame for turn A must not retire or relabel its
+          // already-admitted successor turn B in the same session.
+          return;
+        }
+        if (meta) {
+          meta.active = false;
+          meta.turn_active = false;
+          meta.background_active = false;
+        }
+        this._chatMuxPendingEvents.delete(sid);
+        const ownsInactiveTurn = !!(existingState && inactiveTurnId
+          && currentTurnId === inactiveTurnId);
+        if (ownsInactiveTurn) {
+          if (existingState._stoppingTurnId === inactiveTurnId) {
+            existingState._stoppingTurnId = "";
+          }
+          this._retireStaleSessionStream(sid, existingState);
+          this._setSessionActivityExpectation(sid, false);
+          existingState._pendingExternalUpdate = true;
+          this._scheduleCanonicalStreamReload(
+            sid, existingState, { minimumWaitMs: 0 });
+          return;
         }
         if (existingState && !existingState.streaming) {
           this._setBackgroundTaskActive(sid, false, payload.started_at, 0);
         }
         return;
+      }
+      if (meta) {
+        meta.active = true;
+        meta.turn_active = !payload.background;
+        meta.background_active = !!payload.background;
       }
       if (payload.attachable === false) {
         // Watcher-only ownership has no replayable turn yet. Preserve its blue
