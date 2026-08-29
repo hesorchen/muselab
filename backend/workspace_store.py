@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import os
+import shutil
 import sqlite3
 import threading
 import time
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -64,12 +65,14 @@ _RECONCILE_REPLAY_LIMIT = 500
 # sibling set independently so one generated/dump directory cannot turn a cold
 # page load into a multi-megabyte JSON response and browser main-thread stall.
 _BOOTSTRAP_CHILDREN_PER_PARENT = 500
-# Database maintenance runs only during service startup, before the file index
-# is exposed.  Avoid churning small databases: both an absolute and a relative
-# threshold must be crossed before any page-moving operation is attempted.
+# Automatic service startup never moves database pages. New indexes enable
+# incremental auto-vacuum before creating the schema; legacy indexes report an
+# explicit offline full-vacuum requirement instead of delaying readiness.
+# Both thresholds must be crossed before any reclaim operation is considered.
 _VACUUM_MIN_RECLAIM_BYTES = 16 * 1024 * 1024
 _VACUUM_MIN_FREE_RATIO = 0.25
 _INCREMENTAL_VACUUM_MAX_PAGES = 4096
+_FULL_VACUUM_MIN_FREE_BYTES = 64 * 1024 * 1024
 
 
 class WorkspaceScanIncomplete(RuntimeError):
@@ -123,8 +126,8 @@ def scan_workspace(
     root = root.resolve()
     scan_progress = progress if progress is not None else {}
     seen_paths: set[str] = scan_progress.setdefault("seen_paths", set())
-    stack: list[tuple[Path, Path, int]] = scan_progress.setdefault(
-        "stack", [(root, Path(), 0)]
+    stack: list[tuple[Path, Path, int, bytes | None]] = scan_progress.setdefault(
+        "stack", [(root, Path(), 0, None)]
     )
     resumed = bool(seen_paths)
     rows: list[dict[str, Any]] = []
@@ -137,32 +140,58 @@ def scan_workspace(
         if max_seconds is not None and time.monotonic() - started >= max_seconds:
             partial_reason = "time_limit"
             break
-        directory, logical_parent, skip = stack.pop()
+        directory, logical_parent, skip, expected_prefix = stack.pop()
+        # scandir order is not stable across passes. Hash the exact consumed
+        # prefix so an order or membership change restarts instead of skipping
+        # a live entry and later inferring its deletion.
+        prefix = hashlib.blake2b(digest_size=16)
+        prefix_verified = skip == 0
+        index = 0
         try:
             with os.scandir(directory) as iterator:
-                index = 0
                 for child in iterator:
+                    if child.name in _EXCLUDED_DIRS:
+                        continue
                     if index < skip:
+                        prefix.update(os.fsencode(child.name))
+                        prefix.update(b"\0")
                         index += 1
+                        if index == skip:
+                            if (
+                                expected_prefix is None
+                                or prefix.digest() != expected_prefix
+                            ):
+                                scan_progress.clear()
+                                raise WorkspaceScanIncomplete(
+                                    f"directory changed during resumed scan: {directory}"
+                                )
+                            prefix_verified = True
                         continue
                     if cancel_event is not None and cancel_event.is_set():
                         raise WorkspaceScanCancelled(
                             "workspace scan cancelled"
                         )
                     if max_files is not None and scanned_files >= max_files:
-                        stack.append((directory, logical_parent, index))
+                        stack.append((
+                            directory,
+                            logical_parent,
+                            index,
+                            prefix.digest(),
+                        ))
                         partial_reason = "file_limit"
                         break
                     if (
                         max_seconds is not None
                         and time.monotonic() - started >= max_seconds
                     ):
-                        stack.append((directory, logical_parent, index))
+                        stack.append((
+                            directory,
+                            logical_parent,
+                            index,
+                            prefix.digest(),
+                        ))
                         partial_reason = "time_limit"
                         break
-                    index += 1
-                    if child.name in _EXCLUDED_DIRS:
-                        continue
                     logical = logical_parent / child.name
                     try:
                         is_symlink = child.is_symlink()
@@ -173,6 +202,9 @@ def scan_workspace(
                         # A disappearing or temporarily unreadable entry makes
                         # this snapshot non-authoritative for deletion.
                         raise WorkspaceScanIncomplete(str(child.path)) from exc
+                    prefix.update(os.fsencode(child.name))
+                    prefix.update(b"\0")
+                    index += 1
                     path = logical.as_posix()
                     seen_paths.add(path)
                     rows.append(_entry(path, is_dir, stat))
@@ -182,7 +214,12 @@ def scan_workspace(
                         and not is_symlink
                         and child.name not in _IGNORED_SUBTREES
                     ):
-                        stack.append((Path(child.path), logical, 0))
+                        stack.append((Path(child.path), logical, 0, None))
+            if not prefix_verified:
+                scan_progress.clear()
+                raise WorkspaceScanIncomplete(
+                    f"directory changed during resumed scan: {directory}"
+                )
         except OSError as exc:
             scan_progress.clear()
             # Keep the last-good index instead of inventing deletes for an
@@ -206,6 +243,75 @@ def scan_workspace(
         if complete_paths is not None:
             report["_snapshot_paths"] = complete_paths
     return rows
+
+
+ScanRow = tuple[str, bool, int, float, int, int, int]
+
+
+def compact_scan_rows(rows: Iterable[dict[str, Any]]) -> list[ScanRow]:
+    """Encode filesystem rows compactly for scanner-process IPC."""
+    return [
+        (
+            row["path"],
+            bool(row["is_dir"]),
+            int(row["size"]),
+            float(row["mtime"]),
+            int(row["mtime_ns"]),
+            int(row["ctime_ns"]),
+            int(row["inode"]),
+        )
+        for row in rows
+    ]
+
+
+def expand_scan_rows(
+    rows: Iterable[ScanRow | Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Decode compact IPC rows while accepting direct in-process test rows."""
+    expanded: list[dict[str, Any]] = []
+    for row in rows:
+        if isinstance(row, Mapping):
+            expanded.append(dict(row))
+            continue
+        path, is_dir, size, mtime, mtime_ns, ctime_ns, inode = row
+        expanded.append({
+            "path": path,
+            "name": Path(path).name,
+            "is_dir": is_dir,
+            "size": size,
+            "mtime": mtime,
+            "mtime_ns": mtime_ns,
+            "ctime_ns": ctime_ns,
+            "inode": inode,
+        })
+    return expanded
+
+
+def workspace_scan_worker(connection: Any, cancel_event: Any) -> None:
+    """Serve compact scan requests in one reusable spawned worker process."""
+    try:
+        while True:
+            request = connection.recv()
+            if request is None:
+                return
+            root, max_files, max_seconds, progress = request
+            report: dict[str, Any] = {}
+            try:
+                rows = scan_workspace(
+                    Path(root),
+                    cancel_event=cancel_event,
+                    max_files=max_files,
+                    max_seconds=max_seconds,
+                    report=report,
+                    progress=progress,
+                )
+                connection.send(("ok", compact_scan_rows(rows), report, progress))
+            except BaseException as exc:
+                connection.send(("error", type(exc).__name__, str(exc), progress))
+    except (EOFError, BrokenPipeError, OSError):
+        return
+    finally:
+        connection.close()
 
 
 class WorkspaceStore:
@@ -240,8 +346,9 @@ class WorkspaceStore:
                 # read connection used by bootstrap/delta hot paths.
                 db.execute("PRAGMA journal_mode = WAL")
                 # New databases adopt incremental auto-vacuum before their
-                # schema is created. Existing databases switch during the
-                # threshold-gated one-time full VACUUM in maintain_database().
+                # schema is created. Legacy databases only switch through an
+                # explicitly opted-in offline maintain_database() call; normal
+                # service startup never performs a full VACUUM.
                 db.execute("PRAGMA auto_vacuum = INCREMENTAL")
                 db.executescript(
                     """
@@ -340,17 +447,23 @@ class WorkspaceStore:
             self._secure_database_files()
             self._ready = True
 
-    def maintain_database(self) -> dict[str, Any]:
-        """Reclaim meaningful freelist bloat outside interactive hot paths.
+    def maintain_database(
+        self,
+        *,
+        allow_full_vacuum: bool = False,
+    ) -> dict[str, Any]:
+        """Reclaim freelist bloat only when explicitly invoked.
 
-        The first maintenance of an older database performs the one required
-        full VACUUM to enable incremental auto-vacuum. Later startups reclaim
-        at most 4096 pages, bounding routine work while still reducing a large
-        high-water mark over time. SQLite's own locking keeps this safe; the
-        caller invokes it before the file index is exposed to requests.
+        New databases use incremental auto-vacuum from their first schema
+        transaction. A legacy database needs one full VACUUM to switch modes,
+        but that operation is never implicit: it can copy the whole database
+        and must not sit on the service readiness path. An offline maintenance
+        command may opt in after stopping MuseLab; even then, require enough
+        free space for both the original and replacement database.
         """
         self.initialize()
         started = time.monotonic()
+        required_headroom = 0
         with self._lock, self._connect() as db:
             before = self._database_stats(db)
             should_reclaim = (
@@ -358,25 +471,41 @@ class WorkspaceStore:
                 and before["free_ratio"] >= _VACUUM_MIN_FREE_RATIO
             )
             action = "none"
-            if should_reclaim:
-                db.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
-                if before["auto_vacuum"] != 2:
-                    db.execute("PRAGMA auto_vacuum = INCREMENTAL")
-                    db.execute("VACUUM")
-                    action = "full"
-                else:
-                    pages = min(
-                        before["freelist_count"],
-                        _INCREMENTAL_VACUUM_MAX_PAGES,
+            full_vacuum_required = False
+            if should_reclaim and before["auto_vacuum"] != 2:
+                full_vacuum_required = True
+                action = "full-required"
+                if allow_full_vacuum:
+                    database_bytes = self.path.stat().st_size
+                    required_headroom = max(
+                        database_bytes * 2,
+                        _FULL_VACUUM_MIN_FREE_BYTES,
                     )
-                    db.execute(f"PRAGMA incremental_vacuum({pages})")
-                    action = "incremental"
+                    free_bytes = shutil.disk_usage(self.path.parent).free
+                    if free_bytes >= required_headroom:
+                        db.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
+                        db.execute("PRAGMA auto_vacuum = INCREMENTAL")
+                        db.execute("VACUUM")
+                        action = "full"
+                        full_vacuum_required = False
+                    else:
+                        action = "full-skipped-no-space"
+            elif should_reclaim:
+                db.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
+                pages = min(
+                    before["freelist_count"],
+                    _INCREMENTAL_VACUUM_MAX_PAGES,
+                )
+                db.execute(f"PRAGMA incremental_vacuum({pages})")
+                action = "incremental"
             after = self._database_stats(db)
         self._secure_database_files()
         return {
             "action": action,
             "before": before,
             "after": after,
+            "full_vacuum_required": full_vacuum_required,
+            "required_headroom_bytes": required_headroom,
             "duration_ms": round((time.monotonic() - started) * 1000, 1),
         }
 
@@ -533,31 +662,35 @@ class WorkspaceStore:
         max_seconds: float | None = _SCAN_MAX_SECONDS,
         report: dict[str, Any] | None = None,
         scan_progress: dict[str, Any] | None = None,
-    ) -> int:
-        """Scan disk, update only changed rows, and log offline changes."""
+        snapshot: list[dict[str, Any]] | None = None,
+        expected_cursor: int | None = None,
+        return_payload: bool = False,
+    ) -> int | dict[str, Any]:
+        """Scan or apply a snapshot, logging offline changes atomically."""
         root = root.resolve()
         scan_report: dict[str, Any] = report if report is not None else {}
-        # Keep a watcher batch from committing after our snapshot but before the
-        # reconciliation transaction. Different workspaces may still scan in
-        # parallel, while bootstrap/delta reads keep using the last-good index.
+        # Filesystem walking may happen in a separate process. The workspace lock
+        # serializes only durable application and native watcher transactions.
         with self._workspace_lock(workspace_id):
-            snapshot = scan_workspace(
-                root,
-                cancel_event=cancel_event,
-                max_files=max_files,
-                max_seconds=max_seconds,
-                report=scan_report,
-                progress=scan_progress,
-            )
+            if snapshot is None:
+                snapshot = scan_workspace(
+                    root,
+                    cancel_event=cancel_event,
+                    max_files=max_files,
+                    max_seconds=max_seconds,
+                    report=scan_report,
+                    progress=scan_progress,
+                )
             partial = bool(scan_report.get("partial"))
             if cancel_event is not None and cancel_event.is_set():
                 raise WorkspaceScanCancelled("workspace scan cancelled")
-            self.register_workspace(
-                workspace_id,
-                root,
-                name,
-                primary=primary,
-            )
+            if expected_cursor is None:
+                self.register_workspace(
+                    workspace_id,
+                    root,
+                    name,
+                    primary=primary,
+                )
             if cancel_event is not None and cancel_event.is_set():
                 raise WorkspaceScanCancelled("workspace scan cancelled")
             with self._connect() as db:
@@ -566,13 +699,27 @@ class WorkspaceStore:
                 db.execute("BEGIN IMMEDIATE")
                 state = db.execute(
                     """
-                    SELECT initialized, current_seq
+                    SELECT initialized, current_seq, path
                     FROM workspaces WHERE id = ?
                     """,
                     (workspace_id,),
                 ).fetchone()
-                initialized = bool(state["initialized"]) if state else False
-                seq = int(state["current_seq"]) if state else 0
+                if state is None:
+                    db.rollback()
+                    raise KeyError(f"unknown workspace: {workspace_id}")
+                initialized = bool(state["initialized"])
+                seq = int(state["current_seq"])
+                if expected_cursor is not None and (
+                    seq != expected_cursor
+                    or state["path"] != str(root)
+                ):
+                    db.rollback()
+                    return {
+                        "_stale": True,
+                        "cursor": seq,
+                        "changes": [],
+                        "resync": True,
+                    }
                 old = {
                     row["path"]: row
                     for row in self._file_rows(db, workspace_id)
@@ -585,6 +732,7 @@ class WorkspaceStore:
                 resumed = bool(scan_report.get("resumed"))
 
                 changes: list[dict[str, Any]] = []
+                resync = False
                 if not initialized:
                     # A failed first scan may have left watcher-created rows. A
                     # complete baseline replaces them authoritatively; a bounded
@@ -627,6 +775,7 @@ class WorkspaceStore:
                         )
                         self._insert_files(db, workspace_id, snapshot)
                         seq = self._reset_replay(db, workspace_id, seq)
+                        resync = True
                     else:
                         if deleted:
                             db.executemany(
@@ -646,6 +795,7 @@ class WorkspaceStore:
                             # Preserve the incrementally assembled index but use
                             # a cursor gap instead of retaining a huge replay.
                             seq = self._reset_replay(db, workspace_id, seq)
+                            resync = True
                         else:
                             changes.extend(
                                 {"type": "deleted", "path": path}
@@ -685,7 +835,40 @@ class WorkspaceStore:
                 if cancel_event is not None and cancel_event.is_set():
                     raise WorkspaceScanCancelled("workspace scan cancelled")
                 db.commit()
+                if return_payload:
+                    return {
+                        "cursor": seq,
+                        "changes": [] if resync else self._wire_changes(changes),
+                        "resync": resync,
+                    }
                 return seq
+
+    def apply_reconcile_snapshot(
+        self,
+        workspace_id: str,
+        root: Path,
+        name: str,
+        snapshot: Iterable[ScanRow],
+        scan_report: dict[str, Any],
+        *,
+        expected_cursor: int,
+        primary: bool = False,
+        cancel_event: threading.Event | None = None,
+    ) -> dict[str, Any]:
+        """Verify the durable cursor, apply a scan, and return its exact payload."""
+        result = self.reconcile(
+            workspace_id,
+            root,
+            name,
+            primary=primary,
+            cancel_event=cancel_event,
+            report=scan_report,
+            snapshot=expand_scan_rows(snapshot),
+            expected_cursor=expected_cursor,
+            return_payload=True,
+        )
+        assert isinstance(result, dict)
+        return result
 
     def apply_changes(
         self,

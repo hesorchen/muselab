@@ -96,6 +96,23 @@ class WorkspaceRegistry:
                 id=self._ids[path],
             )
 
+    def entry_for_id(self, workspace_id: str) -> WorkspaceEntry:
+        clean_id = str(workspace_id or "").strip()
+        with self._lock:
+            path = next(
+                (path for path, entry_id in self._ids.items()
+                 if entry_id == clean_id),
+                "",
+            )
+            if not path:
+                raise ValueError("workspace is not registered")
+            return WorkspaceEntry(
+                path=path,
+                name=self._workspaces[path],
+                primary=path == str(self.primary),
+                id=self._ids[path],
+            )
+
     def paths(self) -> tuple[Path, ...]:
         with self._lock:
             return tuple(Path(path) for path in self._workspaces)

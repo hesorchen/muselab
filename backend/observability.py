@@ -110,6 +110,7 @@ async def to_thread_io(
     *args: Any,
     file_path: Path | Callable[[], Path | None] | None = None,
     file_size: int | None = None,
+    owned: bool = False,
     **kwargs: Any,
 ) -> _T:
     """Run blocking I/O off-loop and report only slow, privacy-safe calls.
@@ -136,7 +137,24 @@ async def to_thread_io(
             measured["file_size"] = size
 
     try:
-        return await asyncio.to_thread(invoke)
+        if not owned:
+            return await asyncio.to_thread(invoke)
+        worker = asyncio.create_task(asyncio.to_thread(invoke))
+        try:
+            return await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            # A commit-point write may not outlive its owner: cleanup must observe
+            # the real disk result before deciding whether rollback is necessary.
+            while not worker.done():
+                try:
+                    await asyncio.shield(worker)
+                except asyncio.CancelledError:
+                    continue
+            try:
+                worker.result()
+            except Exception:
+                pass
+            raise
     finally:
         duration = measured.get("duration_ms")
         if duration is not None and is_slow(duration, threshold_ms=slow_io_ms()):

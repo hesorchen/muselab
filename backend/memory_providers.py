@@ -182,6 +182,35 @@ class QdrantVectorStore(VectorStore):
                 ]},
             )
 
+    async def retrieve_many(self, item_ids: list[str]) -> list[dict]:
+        points: list[dict] = []
+        for start in range(0, len(item_ids), 256):
+            chunk = item_ids[start:start + 256]
+            response = await self._request(
+                "POST", f"/collections/{self.config.collection}/points",
+                json={
+                    "ids": [self._point_id(item_id) for item_id in chunk],
+                    "with_payload": True,
+                    "with_vector": True,
+                },
+            )
+            result = response.json().get("result", [])
+            if isinstance(result, list):
+                points.extend(point for point in result if isinstance(point, dict))
+        return points
+
+    async def set_payload_many(self, item_ids: list[str], payload: dict) -> None:
+        for start in range(0, len(item_ids), 256):
+            chunk = item_ids[start:start + 256]
+            await self._request(
+                "POST",
+                f"/collections/{self.config.collection}/points/payload?wait=true",
+                json={
+                    "payload": payload,
+                    "points": [self._point_id(item_id) for item_id in chunk],
+                },
+            )
+
     async def search(self, vector: list[float], *, owner_id: str,
                      limit: int) -> list[dict]:
         response = await self._request(

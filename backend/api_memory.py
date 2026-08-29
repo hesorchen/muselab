@@ -1,7 +1,6 @@
 """Authenticated white-box API for memory configuration and governance."""
 from __future__ import annotations
 
-import asyncio
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -11,6 +10,7 @@ from .auth import require_token
 from .memory_config import (
     MemoryConfig,
     load_config,
+    memory_dir,
     public_config,
     save_config,
 )
@@ -97,7 +97,7 @@ async def put_config(config: dict, probe: bool = Query(default=True)) -> dict:
             raise HTTPException(400, _failure_detail(exc)) from None
     save_config(merged)
     await engine.reconfigure()
-    return {"config": public_config(merged), "status": engine.status()}
+    return {"config": public_config(merged), "status": await engine.status()}
 
 
 @router.post("/probe")
@@ -137,12 +137,12 @@ def _resolve_config_input(raw: dict, current: MemoryConfig) -> MemoryConfig:
 
 
 @router.get("/status")
-def get_status() -> dict:
-    return engine.status()
+async def get_status() -> dict:
+    return await engine.status()
 
 
 @router.get("/items")
-def list_items(
+async def list_items(
     q: str | None = None,
     kind: str | None = None,
     status: str | None = None,
@@ -150,12 +150,20 @@ def list_items(
     offset: int = Query(default=0, ge=0),
 ) -> dict:
     cfg = load_config()
-    rows = engine.store.list_memories(
-        cfg.owner_id, query=q, kind=kind, status=status, limit=limit, offset=offset)
-    sources = engine.store.memory_sources([row["id"] for row in rows])
-    for row in rows:
-        row["sources"] = sources.get(row["id"], [])
-    return {"items": rows, "count": len(rows)}
+
+    def load(store):
+        rows = store.list_memories(
+            cfg.owner_id, query=q, kind=kind, status=status,
+            limit=limit, offset=offset)
+        memory_ids = [row["id"] for row in rows]
+        sources = store.memory_sources(memory_ids)
+        stats = store.memory_recall_stats(cfg.owner_id, memory_ids)
+        for row in rows:
+            row["sources"] = sources.get(row["id"], [])
+            row["recall_stats"] = stats[row["id"]]
+        return {"items": rows, "count": len(rows)}
+
+    return await engine._store_call(load)
 
 
 @router.post("/items")
@@ -176,12 +184,27 @@ async def create_item(body: MemoryCreate) -> dict:
 
 
 @router.get("/items/{memory_id}")
-def get_item(memory_id: str) -> dict:
+async def get_item(memory_id: str) -> dict:
     cfg = load_config()
-    item = engine.store.memory(memory_id)
+    item = await engine._store_call(
+        lambda store: store.memory(memory_id))
     if not item or item.get("owner_id") != cfg.owner_id:
         raise HTTPException(404, "memory not found")
+    item["recall_stats"] = (await engine._store_call(
+        lambda store: store.memory_recall_stats(cfg.owner_id, [memory_id])
+    ))[memory_id]
     return item
+
+
+@router.get("/items/{memory_id}/traceback")
+async def get_item_traceback(memory_id: str) -> dict:
+    cfg = load_config()
+    try:
+        sites = await engine._store_call(
+            lambda store: store.memory_traceback(cfg.owner_id, memory_id))
+    except KeyError:
+        raise HTTPException(404, "memory not found") from None
+    return {"memory_id": memory_id, "sites": sites}
 
 
 @router.post("/items/{memory_id}/correct")
@@ -197,16 +220,23 @@ async def correct_item(memory_id: str, body: MemoryCorrection) -> dict:
 @router.post("/items/{memory_id}/approve")
 async def approve_item(memory_id: str) -> dict:
     cfg = load_config()
-    item = engine.store.memory(memory_id)
-    if not item or item.get("owner_id") != cfg.owner_id:
-        raise HTTPException(404, "memory not found")
-    updated = engine.store.approve_memory(memory_id, cfg.owner_id)
-    if updated is None:
-        raise HTTPException(
-            409, f"memory is {item.get('status')} and cannot be approved")
+
+    def approve(store):
+        item = store.memory(memory_id)
+        if not item or item.get("owner_id") != cfg.owner_id:
+            raise HTTPException(404, "memory not found")
+        updated = store.approve_memory(memory_id, cfg.owner_id)
+        if updated is None:
+            raise HTTPException(
+                409, f"memory is {item.get('status')} and cannot be approved")
+        if cfg.enabled:
+            store.enqueue(
+                "reindex_memory", {"memory_id": memory_id},
+                owner_id=cfg.owner_id)
+        return updated
+
+    updated = await engine._store_call(approve)
     if cfg.enabled:
-        engine.store.enqueue("reindex_memory", {"memory_id": memory_id},
-                             owner_id=cfg.owner_id)
         engine._wake.set()
     return updated
 
@@ -219,57 +249,70 @@ async def delete_item(memory_id: str) -> dict:
 
 
 @router.post("/items/{memory_id}/feedback")
-def feedback_item(memory_id: str, body: MemoryFeedback) -> dict:
+async def feedback_item(memory_id: str, body: MemoryFeedback) -> dict:
     cfg = load_config()
-    item = engine.store.memory(memory_id)
-    if not item or item.get("owner_id") != cfg.owner_id:
-        raise HTTPException(404, "memory not found")
-    attributes = dict(item.get("attributes") or {})
-    key = "helpful_count" if body.useful else "unhelpful_count"
-    attributes[key] = int(attributes.get(key, 0)) + 1
-    attributes["last_feedback_recall_id"] = body.recall_id
-    updated = engine.store.update_memory(memory_id, attributes=attributes)
-    engine.store.audit(
-        cfg.owner_id, "feedback", "memory", memory_id,
-        {"useful": body.useful, "recall_id": body.recall_id})
-    return updated or item
+
+    def apply_feedback(store):
+        try:
+            stats = store.feedback_memory(
+                cfg.owner_id, memory_id, useful=body.useful,
+                recall_id=body.recall_id)
+        except KeyError:
+            raise HTTPException(404, "memory not found") from None
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from None
+        item = store.memory(memory_id) or {}
+        item["recall_stats"] = stats
+        # Response-only compatibility for older clients; normalized stats remain
+        # the sole persisted source of truth.
+        attributes = dict(item.get("attributes") or {})
+        attributes["helpful_count"] = stats["helpful_count"]
+        attributes["unhelpful_count"] = stats["unhelpful_count"]
+        item["attributes"] = attributes
+        return item
+
+    return await engine._store_call(apply_feedback)
 
 
 @router.get("/episodes")
-def list_episodes(
+async def list_episodes(
     status: str | None = None,
     limit: int = Query(default=100, ge=1, le=500),
 ) -> dict:
     cfg = load_config()
-    rows = engine.store.list_episodes(cfg.owner_id, status=status, limit=limit)
+    rows = await engine._store_call(
+        lambda store: store.list_episodes(
+            cfg.owner_id, status=status, limit=limit))
     return {"items": rows, "count": len(rows)}
 
 
 @router.get("/episodes/{episode_id}")
-def get_episode(episode_id: str) -> dict:
+async def get_episode(episode_id: str) -> dict:
     cfg = load_config()
-    item = engine.store.episode(episode_id)
+    item = await engine._store_call(
+        lambda store: store.episode(episode_id))
     if not item or item.get("owner_id") != cfg.owner_id:
         raise HTTPException(404, "episode not found")
     return item
 
 
 @router.get("/artifacts")
-def list_artifacts(
+async def list_artifacts(
     kind: str | None = None,
     status: str | None = None,
     limit: int = Query(default=100, ge=1, le=500),
 ) -> dict:
     cfg = load_config()
-    rows = engine.store.list_artifacts(
-        cfg.owner_id, kind=kind, status=status, limit=limit)
+    rows = await engine._store_call(
+        lambda store: store.list_artifacts(
+            cfg.owner_id, kind=kind, status=status, limit=limit))
     return {"items": rows, "count": len(rows)}
 
 
 @router.post("/skills/{artifact_id}/approve")
-def approve_skill(artifact_id: str, body: SkillApproval) -> dict:
+async def approve_skill(artifact_id: str, body: SkillApproval) -> dict:
     try:
-        return engine.approve_skill(artifact_id, body.markdown)
+        return await engine.approve_skill(artifact_id, body.markdown)
     except KeyError:
         raise HTTPException(404, "pending skill candidate not found") from None
     except ValueError as exc:
@@ -277,17 +320,17 @@ def approve_skill(artifact_id: str, body: SkillApproval) -> dict:
 
 
 @router.post("/skills/{artifact_id}/reject")
-def reject_skill(artifact_id: str) -> dict:
+async def reject_skill(artifact_id: str) -> dict:
     try:
-        return engine.reject_skill(artifact_id)
+        return await engine.reject_skill(artifact_id)
     except KeyError:
         raise HTTPException(404, "skill candidate not found") from None
 
 
 @router.post("/skills/{artifact_id}/disable")
-def disable_skill(artifact_id: str) -> dict:
+async def disable_skill(artifact_id: str) -> dict:
     try:
-        return engine.disable_skill(artifact_id)
+        return await engine.disable_skill(artifact_id)
     except KeyError:
         raise HTTPException(404, "skill candidate not found") from None
     except ValueError as exc:
@@ -295,46 +338,67 @@ def disable_skill(artifact_id: str) -> dict:
 
 
 @router.get("/jobs")
-def list_jobs(limit: int = Query(default=100, ge=1, le=500)) -> dict:
-    rows = engine.store.list_jobs(limit=limit)
+async def list_jobs(limit: int = Query(default=100, ge=1, le=500)) -> dict:
+    rows = await engine._store_call(
+        lambda store: store.list_jobs(limit=limit))
     return {"items": rows, "count": len(rows)}
 
 
 @router.get("/recalls")
-def list_recalls(limit: int = Query(default=100, ge=1, le=500)) -> dict:
+async def list_recalls(limit: int = Query(default=100, ge=1, le=500)) -> dict:
     cfg = load_config()
-    rows = engine.store.recent_recalls(cfg.owner_id, limit=limit)
+    rows = await engine._store_call(
+        lambda store: store.recent_recalls(cfg.owner_id, limit=limit))
     return {"items": rows, "count": len(rows)}
 
 
 @router.get("/audit")
-def list_audit(limit: int = Query(default=100, ge=1, le=500)) -> dict:
+async def list_audit(limit: int = Query(default=100, ge=1, le=500)) -> dict:
     cfg = load_config()
-    rows = engine.store.audits(cfg.owner_id, limit=limit)
+    rows = await engine._store_call(
+        lambda store: store.audits(cfg.owner_id, limit=limit))
+    return {"items": rows, "count": len(rows)}
+
+
+@router.post("/backup")
+async def create_backup() -> dict:
+    cfg = load_config()
+    receipt = await engine._store_call(
+        lambda store: store.create_backup(cfg.owner_id, memory_dir() / "backups"))
+    return {"ok": True, "backup": receipt}
+
+
+@router.get("/backups")
+async def list_backups(
+    limit: int = Query(default=100, ge=1, le=500),
+) -> dict:
+    cfg = load_config()
+    rows = await engine._store_call(lambda store: store.list_backups(
+        cfg.owner_id, memory_dir() / "backups", limit=limit))
     return {"items": rows, "count": len(rows)}
 
 
 @router.post("/dream")
-def trigger_dream() -> dict:
+async def trigger_dream() -> dict:
     cfg = load_config()
     if not cfg.enabled:
         raise HTTPException(409, "memory is disabled")
     if not cfg.consolidation.dreamer_enabled:
         raise HTTPException(409, "Dreamer is disabled")
     engine.start()
-    return {"ok": True, "job_id": engine.trigger_dream()}
+    return {"ok": True, "job_id": await engine.trigger_dream()}
 
 
 @router.post("/reindex")
-def trigger_reindex() -> dict:
+async def trigger_reindex() -> dict:
     if not load_config().enabled:
         raise HTTPException(409, "memory is disabled")
     engine.start()
-    return {"ok": True, "queued": engine.reindex_all()}
+    return {"ok": True, "queued": await engine.reindex_all()}
 
 
 @router.get("/export")
-def export_memory() -> dict:
+async def export_memory() -> dict:
     """Portable canonical export; vector embeddings are intentionally absent.
 
     The v2 snapshot carries every row verbatim, including retired ones and their
@@ -345,9 +409,11 @@ def export_memory() -> dict:
     an imported active Skill candidate returns to pending review.
     """
     cfg = load_config()
+    snapshot = await engine._store_call(
+        lambda store: store.export_snapshot(cfg.owner_id))
     return {
         "schema": "muselab-memory-export-v2",
-        **engine.store.export_snapshot(cfg.owner_id),
+        **snapshot,
     }
 
 
@@ -368,11 +434,12 @@ async def import_memory(body: MemoryImport) -> dict:
             exclude={"export_schema", "items"},
         )
         try:
-            counts = await asyncio.to_thread(
-                engine.store.import_snapshot, snapshot, cfg.owner_id)
+            counts = await engine._store_call(
+                lambda store: store.import_snapshot(snapshot, cfg.owner_id))
         except (ValueError, TypeError) as exc:
             raise HTTPException(422, _failure_detail(exc)) from None
-        queued = engine.reindex_all() if cfg.enabled and body.memories else 0
+        queued = (
+            await engine.reindex_all() if cfg.enabled and body.memories else 0)
         return {
             "ok": True,
             "created": counts.get("memories", 0),
@@ -390,10 +457,10 @@ async def import_memory(body: MemoryImport) -> dict:
         raise HTTPException(422, "memory import contains no items")
     if len(incoming) > 10_000:
         raise HTTPException(422, "memory import exceeds 10000 items")
-    existing = {
+    existing = await engine._store_call(lambda store: {
         " ".join(item["content"].casefold().split())
-        for item in engine.store.list_memories(cfg.owner_id, limit=100_000)
-    }
+        for item in store.list_memories(cfg.owner_id, limit=100_000)
+    })
     created = 0
     for item in incoming:
         key = " ".join(item.content.casefold().split())
@@ -422,21 +489,27 @@ async def import_legacy_mem0() -> dict:
     except Exception as exc:
         raise HTTPException(400, _failure_detail(exc)) from None
     cfg = load_config()
-    existing = {
-        " ".join(item["content"].casefold().split())
-        for item in engine.store.list_memories(cfg.owner_id, limit=100_000)
-    }
-    created = 0
-    for value in values:
-        key = " ".join(value.casefold().split())
-        if key in existing:
-            continue
-        engine.store.create_memory(
-            cfg.owner_id, "fact", value, authority="legacy_import",
-            confidence=0.5, status="pending_review",
-            sources=[{"source_type": "legacy_mem0", "source_id": "muselab",
-                      "relation": "imported_from"}])
-        existing.add(key)
-        created += 1
+    def import_values(store):
+        existing = {
+            " ".join(item["content"].casefold().split())
+            for item in store.list_memories(cfg.owner_id, limit=100_000)
+        }
+        created = 0
+        for value in values:
+            key = " ".join(value.casefold().split())
+            if key in existing:
+                continue
+            store.create_memory(
+                cfg.owner_id, "fact", value, authority="legacy_import",
+                confidence=0.5, status="pending_review",
+                sources=[{
+                    "source_type": "legacy_mem0", "source_id": "muselab",
+                    "relation": "imported_from",
+                }])
+            existing.add(key)
+            created += 1
+        return created
+
+    created = await engine._store_call(import_values)
     return {"ok": True, "found": len(values), "created": created,
             "status": "pending_review"}

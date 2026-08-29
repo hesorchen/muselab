@@ -25,6 +25,7 @@ _GROUP_COLORS = frozenset({
 })
 _TERMINAL = {"completed", "failed", "cancelled"}
 _ACTIVE = {"running", "waiting_approval", "paused"}
+_UNSET = object()
 
 
 def _activity_at(item: dict[str, Any]) -> float:
@@ -101,7 +102,7 @@ class ActivityService:
             asyncio.Queue[dict[str, Any]], asyncio.AbstractEventLoop
         ] = {}
         self._initialized = False
-        self._custom_groups: list[dict[str, str]] = []
+        self._custom_groups: list[dict[str, Any]] = []
         self._group_assignments: dict[str, str] = {}
         self._group_order: list[str] = [_UNGROUPED_GROUP_ID]
         self._events: list[dict[str, Any]] = []
@@ -214,7 +215,7 @@ class ActivityService:
 
     def _load_group_state(
         self,
-    ) -> tuple[list[dict[str, str]], dict[str, str], list[str]]:
+    ) -> tuple[list[dict[str, Any]], dict[str, str], list[str]]:
         try:
             raw = json.loads(self.groups_path.read_text(encoding="utf-8"))
         except FileNotFoundError:
@@ -234,7 +235,7 @@ class ActivityService:
                 or not isinstance(source_order, list)):
             raise RuntimeError("invalid activity group state")
 
-        groups: list[dict[str, str]] = []
+        groups: list[dict[str, Any]] = []
         seen: set[str] = set()
         for row in source_groups[:_MAX_CUSTOM_GROUPS]:
             if not isinstance(row, dict):
@@ -247,8 +248,18 @@ class ActivityService:
                 color = self._group_color(row.get("color"))
             except ValueError:
                 continue
+            group: dict[str, Any] = {
+                "id": group_id,
+                "name": name,
+                "color": color,
+            }
+            workspace_id = str(row.get("workspace_id") or "").strip()
+            workspace_path = str(row.get("workspace_path") or "").strip()
+            if workspace_id and workspace_path:
+                group["workspace_id"] = workspace_id
+                group["workspace_path"] = workspace_path
             seen.add(group_id)
-            groups.append({"id": group_id, "name": name, "color": color})
+            groups.append(group)
 
         assignments = {
             str(sid): str(group_id)
@@ -280,13 +291,13 @@ class ActivityService:
         self._ensure_writes_available()
         self.ensure_private_storage()
         atomic_write_text(self.groups_path, json.dumps({
-            "version": 2,
+            "version": 3,
             "groups": self._custom_groups,
             "assignments": self._group_assignments,
             "order": self._group_order,
         }, ensure_ascii=False, indent=2), mode=0o600)
 
-    def _group_payload_locked(self) -> list[dict[str, str]]:
+    def _group_payload_locked(self) -> list[dict[str, Any]]:
         return [dict(group) for group in self._custom_groups]
 
     def _group_order_payload_locked(self) -> list[str]:
@@ -329,7 +340,7 @@ class ActivityService:
             item["group_order"] = index
 
     def _group_event_snapshot_locked(self) -> tuple[
-        list[dict[str, Any]], list[dict[str, str]], dict[str, str], list[str]
+        list[dict[str, Any]], list[dict[str, Any]], dict[str, str], list[str]
     ]:
         return (
             copy.deepcopy(self._events),
@@ -341,7 +352,7 @@ class ActivityService:
     def _save_group_event_state_locked(
         self,
         snapshot: tuple[
-            list[dict[str, Any]], list[dict[str, str]], dict[str, str], list[str]
+            list[dict[str, Any]], list[dict[str, Any]], dict[str, str], list[str]
         ],
     ) -> None:
         old_events, old_groups, old_assignments, old_order = snapshot
@@ -350,7 +361,7 @@ class ActivityService:
             "version": 1,
             "events": old_events,
             "group_state": {
-                "version": 2,
+                "version": 3,
                 "groups": old_groups,
                 "assignments": old_assignments,
                 "order": old_order,
@@ -836,7 +847,7 @@ class ActivityService:
             "group_order": group_order,
         }
 
-    def list_groups(self) -> list[dict[str, str]]:
+    def list_groups(self) -> list[dict[str, Any]]:
         self.initialize_runtime_state()
         with self._lock:
             return self._group_payload_locked()
@@ -849,21 +860,35 @@ class ActivityService:
                 "group_order": self._group_order_payload_locked(),
             }
 
-    def create_group(self, name: str, color: str = "blue") -> dict[str, Any]:
+    def create_group(
+        self,
+        name: str,
+        color: str = "blue",
+        *,
+        workspace_id: str | None = None,
+        workspace_path: str | None = None,
+    ) -> dict[str, Any]:
         self.initialize_runtime_state()
         clean_name = self._group_name(name)
         clean_color = self._group_color(color)
+        clean_workspace_id = str(workspace_id or "").strip()
+        clean_workspace_path = str(workspace_path or "").strip()
+        if bool(clean_workspace_id) != bool(clean_workspace_path):
+            raise ValueError("workspace binding is incomplete")
         with self._lock:
             if len(self._custom_groups) >= _MAX_CUSTOM_GROUPS:
                 raise ValueError("too many custom groups")
             if any(group["name"].casefold() == clean_name.casefold()
                    for group in self._custom_groups):
                 raise ValueError("group name already exists")
-            group = {
+            group: dict[str, Any] = {
                 "id": uuid.uuid4().hex,
                 "name": clean_name,
                 "color": clean_color,
             }
+            if clean_workspace_id:
+                group["workspace_id"] = clean_workspace_id
+                group["workspace_path"] = clean_workspace_path
             self._custom_groups.append(group)
             ungrouped_at = self._group_order.index(_UNGROUPED_GROUP_ID)
             self._group_order.insert(ungrouped_at, group["id"])
@@ -883,8 +908,12 @@ class ActivityService:
         *,
         name: str | None = None,
         color: str | None = None,
+        workspace_id: Any = _UNSET,
+        workspace_path: Any = _UNSET,
     ) -> dict[str, Any] | None:
         self.initialize_runtime_state()
+        if (workspace_id is _UNSET) != (workspace_path is _UNSET):
+            raise ValueError("workspace binding is incomplete")
         with self._lock:
             group = next((row for row in self._custom_groups
                           if row["id"] == group_id), None)
@@ -900,8 +929,31 @@ class ActivityService:
                    and row["name"].casefold() == clean_name.casefold()
                    for row in self._custom_groups):
                 raise ValueError("group name already exists")
-            changed = group["name"] != clean_name or group["color"] != clean_color
+            clean_workspace_id = ""
+            clean_workspace_path = ""
+            binding_changed = False
+            if workspace_id is not _UNSET:
+                clean_workspace_id = str(workspace_id or "").strip()
+                clean_workspace_path = str(workspace_path or "").strip()
+                if bool(clean_workspace_id) != bool(clean_workspace_path):
+                    raise ValueError("workspace binding is incomplete")
+                binding_changed = (
+                    str(group.get("workspace_id") or ""),
+                    str(group.get("workspace_path") or ""),
+                ) != (clean_workspace_id, clean_workspace_path)
+            changed = (
+                group["name"] != clean_name
+                or group["color"] != clean_color
+                or binding_changed
+            )
             group.update(name=clean_name, color=clean_color)
+            if workspace_id is not _UNSET:
+                if clean_workspace_id:
+                    group["workspace_id"] = clean_workspace_id
+                    group["workspace_path"] = clean_workspace_path
+                else:
+                    group.pop("workspace_id", None)
+                    group.pop("workspace_path", None)
             if changed:
                 self._save_group_state()
                 self._publish_locked()

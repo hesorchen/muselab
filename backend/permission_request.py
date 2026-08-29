@@ -1,16 +1,14 @@
 """
 permission_request — bridge SDK's can_use_tool callback to a UI prompt.
 
-Two responsibilities now share one callback (SDK 0.2.82 routes both through
-`can_use_tool`):
+The callback surfaces SDK tool approvals (when permission_mode is not
+bypassPermissions), awaits Allow / Deny / Always, and returns the SDK-native
+PermissionResult shape.
 
-1. **Tool approval** (when permission_mode != bypassPermissions):
-   surface a permission card, await Allow / Deny / Always.
-
-2. **AskUserQuestion**: SDK's native multiple-choice tool. Normal permission
-   modes route it through `can_use_tool`; bypass mode routes it through a
-   dedicated PreToolUse hook because the SDK auto-approves tools before calling
-   the permission callback.
+It also provides the PreToolUse adapter that bridges SDK-native
+AskUserQuestion into MuseLab's browser UI in every permission mode. A hook is
+required because can_use_tool can be bypassed by allow rules and live mode
+transitions.
 
 "Always allow" works at the muselab session level (in-memory): subsequent calls
 to the same (tool, key) pair bypass the prompt for the rest of this session.
@@ -311,29 +309,21 @@ def _input_key(tool_name: str, tool_input: dict[str, Any]) -> str:
     return ""
 
 
+def _native_answer_payload(answers: dict[str, Any]) -> dict[str, str]:
+    """Convert browser answer values to AskUserQuestion's native string map."""
+    out: dict[str, str] = {}
+    for question, answer in answers.items():
+        if isinstance(answer, list):
+            out[str(question)] = ", ".join(str(item) for item in answer)
+        else:
+            out[str(question)] = str(answer)
+    return out
+
+
 async def _handle_ask_user_question(
         session_id: str, tool_input: dict[str, Any]
 ) -> PermissionResultAllow | PermissionResultDeny:
-    """SDK calls can_use_tool with tool_name='AskUserQuestion' when the model
-    invokes the trained-in multiple-choice tool. We forward the questions to
-    muselab's existing ask UI (same SSE event + Future registry as the MCP
-    fallback), then return PermissionResultAllow(updated_input=...) per SDK
-    contract.
-
-    IMPORTANT: must return PermissionResultAllow / PermissionResultDeny class
-    instances, NOT plain dicts. Older code returned `{behavior, ...}` dicts
-    that worked with a previous SDK shape; current SDK raises
-    "Tool permission callback must return PermissionResult" if you hand it a
-    dict. Discovered the hard way 2026-05-23 when my first attempt at this
-    fix made every AskUserQuestion call crash on the SDK side.
-
-    Questions go through `auq._normalize_questions` first so the frontend
-    always sees the canonical `{question, header, multiSelect, options:
-    [{label, description}]}` shape — same as the MCP fallback. Without
-    normalization, a model that emits options as bare strings (`["yes",
-    "no"]`) or with `text`/`name`/`value` keys would render a question
-    card with no clickable buttons (silent "user can't pick" symptom).
-    """
+    """Collect a native AskUserQuestion answer through MuseLab's browser UI."""
     raw_questions = tool_input.get("questions") or []
     if not raw_questions:
         return PermissionResultDeny(
@@ -356,39 +346,29 @@ async def _handle_ask_user_question(
     await q.put({
         "event": "ask_user_question",
         "data": json.dumps({"id": question_id, "questions": questions},
-                            ensure_ascii=False),
+                           ensure_ascii=False),
     })
-    # FIX ⑨: the MCP-alias path (ask_user_question.py) already pushes a
-    # "Muse 需要你拍板" notification, but the SDK's built-in AskUserQuestion
-    # routes through HERE and previously pushed nothing — so a headless queued
-    # turn that hit the built-in tool left the user with no signal. Presence-
-    # gated + fire-and-forget inside.
     auq._maybe_push_needs_input(session_id)
 
     try:
         answers = await asyncio.wait_for(fut, timeout=auq.ANSWER_TIMEOUT_S)
     except asyncio.TimeoutError:
         return PermissionResultDeny(
-            message="User did not respond within 10 minutes.")
+            message="User did not respond within 30 minutes.")
     except asyncio.CancelledError:
         return PermissionResultDeny(
             message="User session ended before answering.")
     finally:
         auq._pending.pop((session_id, question_id), None)
 
-    # answers shape: {question_text: chosen_label_or_list}
-    # SDK requires both `questions` and `answers` in updated_input.
-    return PermissionResultAllow(
-        updated_input={"questions": questions, "answers": answers})
+    return PermissionResultAllow(updated_input={
+        "questions": questions,
+        "answers": _native_answer_payload(answers),
+    })
 
 
 def build_ask_user_question_hook_for_session(session_id: str):
-    """Route native AskUserQuestion through MuseLab in bypass mode.
-
-    ``can_use_tool`` is shadowed by ``bypassPermissions``, but PreToolUse hooks
-    still run. Reuse the same question bridge and translate its SDK permission
-    result into the hook result shape expected by Claude Code.
-    """
+    """Route native AskUserQuestion through the browser in bypass mode."""
     async def hook(input_data, _tool_use_id, _context):
         data = input_data if isinstance(input_data, dict) else {}
         tool_input = data.get("tool_input")
@@ -522,24 +502,16 @@ def build_callback_for_session(
 ):
     """Return an async callable matching the SDK's can_use_tool signature.
 
-    The callback is installed only for permission modes that can ask. The SDK
-    explicitly does not invoke it for calls already approved by bypass,
-    acceptEdits, allow rules, or whole-tool Skill grants. It is therefore a
-    prompt resolver, not a universal tool gate. Use a PreToolUse hook when an
-    operation must observe every tool call."""
+    The callback is installed for every ordinary workspace runtime, including
+    bypass. The SDK still does not invoke it for calls already approved by
+    bypass, acceptEdits, allow rules, or whole-tool Skill grants; keeping it
+    attached lets a native EnterPlanMode transition use the same stdio control
+    bridge for ExitPlanMode. It remains a prompt resolver, not a universal tool
+    gate. Use a PreToolUse hook when an operation must observe every tool call."""
 
     async def can_use_tool(
             tool_name: str, tool_input: dict[str, Any], context: Any
     ) -> PermissionResultAllow | PermissionResultDeny:
-        # AskUserQuestion is interactive — always route to the muselab UI
-        # regardless of permission_mode. Without this, models that call
-        # the SDK's built-in `AskUserQuestion` (rather than the MCP
-        # alias) get no UI prompt on bypassPermissions and the user
-        # sees no options to pick. See _handle_ask_user_question above
-        # for the SDK-contract details.
-        if tool_name == "AskUserQuestion":
-            return await _handle_ask_user_question(session_id, tool_input)
-
         if tool_name == "ExitPlanMode":
             return await _handle_exit_plan_mode(
                 session_id,

@@ -150,21 +150,22 @@ def atomic_write_text(
     # random suffix so each call's tmp is distinct.
     tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}.{secrets.token_hex(4)}")
     try:
-        # Sensitive callers opt into an exact mode.  `os.open(..., mode)` makes
-        # the inode private from creation; a post-open chmod leaves a brief
-        # umask-dependent group-readable window.  The default preserves this
-        # general helper's historical behavior for user workspace files.
+        # Sensitive callers opt into an exact mode.  `os.open(..., mode)`
+        # creates the inode no broader than requested; fchmod restores bits
+        # removed by the process umask while the inode is still temporary and
+        # before data is written.  The default preserves this general helper's
+        # historical behavior for user workspace files.
         if mode is None:
             fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
         else:
             fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
         with os.fdopen(fd, "w", encoding=encoding) as f:
+            if mode is not None:
+                os.fchmod(f.fileno(), mode)
             f.write(data)
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, path)
-        if mode is not None:
-            os.chmod(path, mode)
         # fsync the directory so the rename itself survives power loss.
         try:
             dfd = os.open(path.parent, os.O_RDONLY)
