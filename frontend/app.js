@@ -377,6 +377,7 @@ function portal() {
     _chatMuxPendingEvents: new Map(),
     _chatMuxAttachPromises: new Map(),
     _chatMuxStartPromise: null,
+    _chatMuxCoordinatorPromise: null,
     _chatMuxReconnectTimer: null,
     _chatMuxReconnectAttempts: 0,
     _chatMuxSupported: null,
@@ -10505,13 +10506,26 @@ function portal() {
     },
     async _startChatMuxCoordinator() {
       if (this._chatMuxSupported === false) return false;
-      // Establish the one authoritative live transport before any background
-      // transcript warmup. A turn can start while history is loading; mux-first
-      // startup guarantees its accepted/session_state events already have a sink.
-      const connected = await this._ensureChatMux();
-      if (!connected) return false;
-      await this._bootstrapChatMuxHistory();
-      return true;
+      if (this._chatMuxCoordinatorPromise) {
+        return await this._chatMuxCoordinatorPromise;
+      }
+      const coordinator = (async () => {
+        // Establish the one authoritative live transport before any background
+        // transcript warmup. A turn can start while history is loading; mux-first
+        // startup guarantees its accepted/session_state events already have a sink.
+        const connected = await this._ensureChatMux();
+        if (!connected) return false;
+        await this._bootstrapChatMuxHistory();
+        return true;
+      })();
+      this._chatMuxCoordinatorPromise = coordinator;
+      try {
+        return await coordinator;
+      } finally {
+        if (this._chatMuxCoordinatorPromise === coordinator) {
+          this._chatMuxCoordinatorPromise = null;
+        }
+      }
     },
 
     async initSessions(options = {}) {
