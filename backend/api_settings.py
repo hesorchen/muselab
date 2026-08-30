@@ -12,7 +12,7 @@ import sys
 import tempfile
 import threading
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException
 from claude_agent_sdk.types import PermissionMode
@@ -72,6 +72,7 @@ _CUSTOM_ENV_RE = re.compile(r"^MUSELAB_PROVIDER_[A-Z0-9_]+_API_KEY$")
 DEFAULT_KEYS = [
     "MUSELAB_DEFAULT_MODEL",
     "MUSELAB_DEFAULT_PERMISSION",
+    "MUSELAB_BUSY_SEND_MODE",
 ]
 
 
@@ -105,6 +106,7 @@ class SettingsIn(BaseModel):
     # Defaults
     default_model: str | None = None
     default_permission: PermissionMode | None = None
+    busy_send_mode: Literal["adjust", "queue"] | None = None
     # (Removed 2026-05-28) notify_scheduled / notify_normal —
     # The 4-toggle notification panel collapsed to a single client-side
     # "notify me" switch. Subscription state IS the on/off; no per-class
@@ -202,6 +204,7 @@ _SETTING_DEFAULTS: dict[str, str] = {
     "MUSELAB_MODEL":                "claude-sonnet-4-6",
     "MUSELAB_DEFAULT_MODEL":        "claude-sonnet-4-6",
     "MUSELAB_DEFAULT_PERMISSION":   "bypassPermissions",
+    "MUSELAB_BUSY_SEND_MODE":       "adjust",
 }
 
 
@@ -276,6 +279,7 @@ def get_settings() -> dict:
                 "MUSELAB_DEFAULT_MODEL",
                 os.environ.get("MUSELAB_MODEL", _SETTING_DEFAULTS["MUSELAB_MODEL"])),
             "permission": _current("MUSELAB_DEFAULT_PERMISSION"),
+            "busy_send_mode": _current("MUSELAB_BUSY_SEND_MODE"),
         },
         # `params` retained as an empty dict for FE backwards-compat — old
         # builds spread `d.params` into draftParams and would TypeError on
@@ -370,6 +374,9 @@ def put_settings(req: SettingsIn) -> dict:
     if req.default_permission is not None and _changed(
             "MUSELAB_DEFAULT_PERMISSION", req.default_permission):
         updates["MUSELAB_DEFAULT_PERMISSION"] = req.default_permission
+    if req.busy_send_mode is not None and _changed(
+            "MUSELAB_BUSY_SEND_MODE", req.busy_send_mode):
+        updates["MUSELAB_BUSY_SEND_MODE"] = req.busy_send_mode
     if req.provider_disabled is not None:
         raw = os.environ.get("MUSELAB_DISABLED_PROVIDERS", "").strip()
         disabled_models = set(raw.split(",")) if raw else set()

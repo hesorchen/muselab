@@ -20,6 +20,7 @@ def _capture_build_options(chat_mod, monkeypatch):
 
     monkeypatch.setattr(chat_mod, "ClaudeAgentOptions", FakeOptions)
     monkeypatch.setattr(chat_mod, "ClaudeSDKClient", FakeClient)
+    monkeypatch.setattr(chat_mod, "MuseLabSDKClient", FakeClient)
     # Third-party models take the compatibility subclass, NOT ClaudeSDKClient
     # (see _build_and_connect_client). Patching only the latter left the real
     # SDK client in the third-party tests, and its connect() reads concrete

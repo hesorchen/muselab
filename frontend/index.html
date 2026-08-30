@@ -2098,7 +2098,7 @@
                         <span class="user-msg-text" x-show="userVisibleText(m)"
                               x-html="userTextHtml(userVisibleText(m))"></span>
                       </template>
-                      <div x-show="m._optimisticQueue"
+                      <div x-show="m._admissionPending"
                            class="optimistic-queue-status"
                            role="status"
                            aria-live="polite"
@@ -2106,7 +2106,9 @@
                         <span class="queued-icon" aria-hidden="true">
                           <svg><use href="#i-clock"/></svg>
                         </span>
-                        <span x-text="lang==='zh' ? '排队中' : 'Queueing'"></span>
+                        <span x-text="m._optimisticQueue
+                          ? (lang==='zh' ? '正在确认发送方式' : 'Confirming delivery')
+                          : (lang==='zh' ? '正在发送' : 'Sending')"></span>
                       </div>
                     </div>
                   </div>
@@ -3016,7 +3018,7 @@
                   <div class="queued-header">
                     <span class="queued-icon"><svg><use href="#i-clock"/></svg></span>
                     <span class="queued-label"
-                          x-text="(lang==='zh' ? '已排队 ' : 'Queued ') + (qi+1) + ' / '
+                          x-text="queueDeliveryLabel(q) + ' ' + (qi+1) + ' / '
                                    + activeSession.pendingQueue.length"></span>
                     <!-- "已排队 1/2" alone reads as "will send shortly", which
                          is wrong while the queue is paused — the item will
@@ -5254,6 +5256,19 @@
               <option value="plan">plan</option>
             </select>
           </div>
+          <div class="settings-row">
+            <label x-text="lang==='zh' ? '回复进行中发送' : 'Send while busy'"></label>
+            <select x-model="settings.draftDefaults.busy_send_mode" class="settings-input">
+              <option value="adjust"
+                      x-text="lang==='zh' ? '尽快调整当前任务' : 'Adjust the current task soon'"></option>
+              <option value="queue"
+                      x-text="lang==='zh' ? '当前任务完成后发送' : 'Send after the current task finishes'"></option>
+            </select>
+          </div>
+          <div class="settings-hint"
+               x-text="lang==='zh'
+                 ? '“尽快调整”会在安全的工具边界交给当前任务；含附件或任务已变化时会自动改为排队。'
+                 : 'Adjust hands the message to the current task at a safe tool boundary; attachments or a changed task automatically fall back to the queue.'"></div>
           <div class="settings-hint warn"
                x-show="settings.draftDefaults.permission === 'bypassPermissions'"
                x-text="lang==='zh'

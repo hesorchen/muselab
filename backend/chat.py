@@ -99,7 +99,11 @@ from .attachment_queue_store import (
     DurableAttachmentError,
     DurableAttachmentStore,
 )
-from .sdk_compat import UnsignedThinkingCompatibleClient
+from .sdk_compat import (
+    CommandLifecycleMessage,
+    MuseLabSDKClient,
+    UnsignedThinkingCompatibleClient,
+)
 
 # Compatibility export: tests and local tooling construct durable interrupted
 # snapshots through the historical chat-module schema constant.
@@ -988,6 +992,22 @@ class TurnBroadcast:
         # Queue ownership is durable. A claimed item stays in the queue sidecar
         # until this exact turn finishes and acknowledges it.
         self.queue_item_id: str = ""
+        # Mid-turn steering is also backed by the durable queue. The browser
+        # first commits an item there, then the enqueue response schedules a
+        # UUID-stamped ``priority=next`` write to this exact SDK runtime. The
+        # item is removed only after the CLI emits command_lifecycle=completed.
+        # Keeping the exact client/turn here closes the session-id ABA race.
+        self.runtime_client: "MuseLabSDKClient | None" = None
+        self.query_committed = False
+        self.result_forwarded = False
+        self.permission = ""
+        self.active_tool_use_ids: set[str] = set()
+        # Synchronously closed before any terminal cleanup await. This prevents
+        # a late enqueue from registering a new native command after the error
+        # finalizer has already snapshotted the old command map.
+        self.steering_closed = False
+        self.steering_commands: dict[str, dict[str, str]] = {}
+        self.steering_write_events: dict[str, asyncio.Event] = {}
         # Headless background-task continuations are separate turns, linked to
         # the user turn that launched the task for observability and recovery.
         self.parent_turn_id: str = ""
@@ -2265,7 +2285,8 @@ def _parse_codex_gateway_catalog(body: Any) -> dict[str, dict]:
 
 
 # Read-only compatibility when the live catalog is temporarily unavailable.
-# This mirrors CLIProxyAPI 7.2.111; the dynamic catalog always wins so a
+# This mirrors the tested CLIProxyAPI 7.2.145 baseline; the dynamic catalog
+# always wins so a
 # Gateway upgrade changes the UI without a MuseLab release.
 _CODEX_CONTROL_FALLBACKS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     "gpt-5.6-sol": (("low", "medium", "high", "xhigh", "max", "ultra"),
@@ -3068,7 +3089,7 @@ async def _build_and_connect_client(
         max_buffer_size=max_buf,
         stderr=_cli_stderr,
         # Block harness-only tools the SDK exposes by default. AskUserQuestion
-        # is intentionally kept: SDK 0.2.144 / CLI 2.1.239 correctly turns the
+        # is intentionally kept: SDK 0.2.148 / CLI 2.1.251 correctly turns the
         # browser-injected answers into a native tool_result in every supported
         # permission mode; permission_request.py owns that UI bridge.
         #
@@ -3088,10 +3109,10 @@ async def _build_and_connect_client(
             "CronCreate", "CronDelete", "CronList",
             "EnterWorktree", "ExitWorktree",
             "Monitor", "PushNotification",
-            # Claude CLI 2.1.211 additions whose protocol is owned by a
+            # Claude CLI host features whose protocol is owned by a
             # Claude Code / claude.ai host. muselab has no matching design,
             # review-findings, remote-trigger, or teammate-message surface.
-            "DesignSync", "ListAgents", "RemoteTrigger", "ReportFindings",
+            "DesignSync", "RemoteTrigger", "ReportFindings",
             "SendMessage",
         ],
         # Load CLAUDE.md from user (~/.claude/CLAUDE.md), project
@@ -3440,7 +3461,7 @@ async def _build_and_connect_client(
     client_cls = (
         UnsignedThinkingCompatibleClient
         if endpoints.is_third_party(model)
-        else ClaudeSDKClient
+        else MuseLabSDKClient
     )
     try:
         client = client_cls(options=ClaudeAgentOptions(**opts_kwargs))
@@ -7164,6 +7185,12 @@ class QueueEnqueueReq(BaseModel):
     # Plan Mode additionally snapshots the mode ExitPlanMode should return to.
     # Legacy/malformed values are normalized to fail-closed `default`.
     plan_return_permission: str | None = None
+    # Busy-send policy. Old clients omit this and retain the historical
+    # turn-boundary queue behavior. The current frontend sends ``adjust`` when
+    # Settings asks MuseLab to fold text into the exact active foreground turn
+    # at the CLI's next post-tool boundary.
+    delivery: str = "queue"
+    active_turn_id: str = ""
 
 
 class QueuePauseReq(BaseModel):
@@ -7256,6 +7283,411 @@ async def _schedule_queue_drain_after_response(session_id: str) -> None:
     _schedule_queue_drain(session_id)
 
 
+def _eligible_steering_turn(
+    session_id: str,
+    turn_id: str,
+    *,
+    permission: str = "",
+) -> TurnBroadcast | None:
+    """Return the exact foreground turn that can accept native steering.
+
+    A session id is not sufficient: an old enqueue response can arrive after
+    turn A ended and turn B reused the same pooled client.  The immutable turn
+    id, query commit point and final-result flag together close that ABA window.
+    Queue-owned/background turns are deliberately left to ordinary FIFO drain.
+    """
+    bc = _active_turns.get(session_id)
+    if (
+        bc is None
+        or bc.done
+        or bc.cancelled
+        or not turn_id
+        or bc.turn_id != turn_id
+        or bc.is_continuation
+        or bool(bc.queue_item_id)
+        or not bc.query_committed
+        or bc.result_forwarded
+        or bc.steering_closed
+        or not isinstance(bc.runtime_client, MuseLabSDKClient)
+        or _sessions_with_inflight_tasks.get(session_id)
+        or _session_has_live_watcher(session_id)
+    ):
+        return None
+    requested_permission = (permission or "").strip()
+    if requested_permission and requested_permission != bc.permission:
+        return None
+    return bc
+
+
+def _publish_queue_steering(
+    bc: TurnBroadcast | None,
+    *,
+    item_id: str,
+    command_uuid: str,
+    state: str,
+    effective_delivery: str,
+) -> None:
+    """Publish one privacy-bounded queue state transition when possible."""
+    if bc is None or bc.done:
+        return
+    try:
+        bc.publish({
+            "event": "queue_steering",
+            "data": json.dumps({
+                "item_id": item_id,
+                "command_uuid": command_uuid,
+                "state": state,
+                "effective_delivery": effective_delivery,
+            }),
+        })
+    except Exception:
+        # The durable queue remains authoritative; GET /queue repairs any
+        # missed browser transition after a reconnect.
+        pass
+
+
+async def _fallback_steering_item(
+    session_id: str,
+    *,
+    item_id: str,
+    command_uuid: str,
+    bc: TurnBroadcast | None,
+) -> dict | None:
+    item = await obs.to_thread_io(
+        "chat.queue_steering_fallback",
+        session_id,
+        sess.fallback_queue_steering,
+        session_id,
+        item_id=item_id,
+        command_uuid=command_uuid,
+        owned=True,
+    )
+    if item is not None:
+        _publish_queue_steering(
+            bc,
+            item_id=item_id,
+            command_uuid=command_uuid,
+            state="fallback",
+            effective_delivery="queue",
+        )
+        _schedule_queue_drain(session_id)
+    return item
+
+
+async def _deliver_steering_command(
+    session_id: str,
+    *,
+    turn_id: str,
+    item_id: str,
+    command_uuid: str,
+    text: str,
+    permission: str,
+) -> tuple[str, str, dict | None]:
+    """Write one durable queue item to the exact active CLI command queue.
+
+    The write is registered on the broadcast before the first await.  If a
+    Result frame races this HTTP request, the sole stream reader waits for this
+    write outcome before deciding whether that Result is the final boundary.
+    """
+    bc: TurnBroadcast | None = None
+    write_event: asyncio.Event | None = None
+    async with _lock:
+        bc = _eligible_steering_turn(
+            session_id, turn_id, permission=permission)
+        if bc is not None:
+            write_event = asyncio.Event()
+            bc.steering_commands[command_uuid] = {
+                "item_id": item_id,
+                "state": "pending",
+            }
+            bc.steering_write_events[command_uuid] = write_event
+
+    if bc is None or write_event is None:
+        fallback = await _fallback_steering_item(
+            session_id,
+            item_id=item_id,
+            command_uuid=command_uuid,
+            bc=bc,
+        )
+        return "queue", "queued", fallback
+
+    try:
+        await bc.runtime_client.query_steering(
+            text,
+            session_id=session_id,
+            command_uuid=command_uuid,
+        )
+    except BaseException:
+        current = bc.steering_commands.get(command_uuid)
+        if current is not None and current.get("item_id") == item_id:
+            bc.steering_commands.pop(command_uuid, None)
+        write_event.set()
+        bc.steering_write_events.pop(command_uuid, None)
+        fallback = await _fallback_steering_item(
+            session_id,
+            item_id=item_id,
+            command_uuid=command_uuid,
+            bc=bc,
+        )
+        if fallback is not None:
+            return "queue", "queued", fallback
+        # A terminal lifecycle may have won the race and removed the item.
+        return "adjust", "completed", None
+
+    current = bc.steering_commands.get(command_uuid)
+    updated: dict | None = None
+    if current is not None and current.get("state") == "pending":
+        updated = await obs.to_thread_io(
+            "chat.queue_steering_wait",
+            session_id,
+            sess.update_queue_steering_state,
+            session_id,
+            "waiting_tool",
+            item_id=item_id,
+            command_uuid=command_uuid,
+            owned=True,
+        )
+        # A lifecycle event can advance the same dict while the durable write
+        # runs. Never move queued/started back to waiting_tool in memory.
+        current = bc.steering_commands.get(command_uuid)
+        if current is not None and current.get("state") == "pending":
+            current["state"] = "waiting_tool"
+    write_event.set()
+    bc.steering_write_events.pop(command_uuid, None)
+
+    current = bc.steering_commands.get(command_uuid)
+    if current is None:
+        return "adjust", "completed", updated
+    state = str(current.get("state") or "waiting_tool")
+    _publish_queue_steering(
+        bc,
+        item_id=item_id,
+        command_uuid=command_uuid,
+        state=state,
+        effective_delivery="adjust",
+    )
+    return "adjust", state, updated
+
+
+async def _settle_steering_lifecycle(
+    bc: TurnBroadcast,
+    message: CommandLifecycleMessage,
+) -> bool:
+    """Persist one CLI delivery ACK; return True for a terminal state."""
+    command_uuid = message.command_uuid
+    info = bc.steering_commands.get(command_uuid)
+    if info is None:
+        # A late ACK for a command already cancelled/fallen back must never
+        # mutate a normal FIFO item. Fallback clears the durable command UUID.
+        return message.state in {
+            "completed", "cancelled", "discarded", "refused",
+        }
+    item_id = str(info.get("item_id") or "")
+    state = message.state
+    if state in {"queued", "started"}:
+        info["state"] = state
+        try:
+            await obs.to_thread_io(
+                "chat.queue_steering_lifecycle",
+                bc.session_id,
+                sess.update_queue_steering_state,
+                bc.session_id,
+                state,
+                item_id=item_id,
+                command_uuid=command_uuid,
+                owned=True,
+            )
+        except Exception as exc:
+            # The live CLI still owns the command. Retaining the in-memory map
+            # keeps Result suppression correct; restart recovery pauses the
+            # older durable state rather than risking duplicate execution.
+            sys.stderr.write(
+                f"[chat] steering state persist failed "
+                f"sid={obs.short_id(bc.session_id)} "
+                f"state={state} exc={type(exc).__name__}\n"
+            )
+        _publish_queue_steering(
+            bc,
+            item_id=item_id,
+            command_uuid=command_uuid,
+            state=state,
+            effective_delivery="adjust",
+        )
+        return False
+
+    if state == "completed":
+        try:
+            removed = await obs.to_thread_io(
+                "chat.queue_steering_complete",
+                bc.session_id,
+                sess.update_queue_steering_state,
+                bc.session_id,
+                "completed",
+                item_id=item_id,
+                command_uuid=command_uuid,
+                owned=True,
+            )
+            if removed is not None and str(removed.get("image_ids") or ""):
+                await obs.to_thread_io(
+                    "chat.queue_attachment_finish",
+                    bc.session_id,
+                    _durable_attachment_store.finish_queue_item,
+                    bc.session_id,
+                    item_id,
+                    consume=True,
+                    owned=True,
+                )
+        except Exception as exc:
+            # The CLI says the command ran. Never convert an ACK-persistence
+            # failure into an automatic resend: the still-adjust queue row
+            # remains non-claimable and startup recovery pauses it for review.
+            sys.stderr.write(
+                f"[chat] steering completion persist failed "
+                f"sid={obs.short_id(bc.session_id)} "
+                f"exc={type(exc).__name__}\n"
+            )
+        bc.steering_commands.pop(command_uuid, None)
+        event = bc.steering_write_events.pop(command_uuid, None)
+        if event is not None:
+            event.set()
+        _publish_queue_steering(
+            bc,
+            item_id=item_id,
+            command_uuid=command_uuid,
+            state="completed",
+            effective_delivery="adjust",
+        )
+        return True
+
+    bc.steering_commands.pop(command_uuid, None)
+    event = bc.steering_write_events.pop(command_uuid, None)
+    if event is not None:
+        event.set()
+    if state in {"discarded", "refused"}:
+        await _fallback_steering_item(
+            bc.session_id,
+            item_id=item_id,
+            command_uuid=command_uuid,
+            bc=bc,
+        )
+    else:  # cancelled
+        try:
+            await obs.to_thread_io(
+                "chat.queue_steering_cancelled",
+                bc.session_id,
+                sess.update_queue_steering_state,
+                bc.session_id,
+                "cancelled",
+                item_id=item_id,
+                command_uuid=command_uuid,
+                pause=True,
+                owned=True,
+            )
+        except Exception as exc:
+            sys.stderr.write(
+                f"[chat] steering cancellation persist failed "
+                f"sid={obs.short_id(bc.session_id)} "
+                f"exc={type(exc).__name__}\n"
+            )
+        finally:
+            _publish_queue_steering(
+                bc,
+                item_id=item_id,
+                command_uuid=command_uuid,
+                state="cancelled",
+                effective_delivery="adjust",
+            )
+    return True
+
+
+async def _cancel_outstanding_steering_commands(
+    bc: TurnBroadcast,
+) -> None:
+    """Fail closed any native commands left when their turn loses its reader.
+
+    A transport/model failure is allowed to arrive after the CLI reported a
+    command as started but before its terminal lifecycle frame. Once this
+    broadcast ends no exact live owner can cancel or settle that row. Retain it
+    as cancelled+paused so the user can explicitly resume, delete, or clear it.
+    """
+    # Close admission before the first await and before snapshotting the map.
+    # Error finalization otherwise has a window where a new enqueue can attach
+    # after this snapshot and lose its owner when the broadcast is popped.
+    bc.steering_closed = True
+    steering = list(bc.steering_commands.items())
+    bc.steering_commands.clear()
+    for command_uuid, info in steering:
+        event = bc.steering_write_events.pop(command_uuid, None)
+        if event is not None:
+            event.set()
+        item_id = str(info.get("item_id") or "")
+        persisted: dict | None = None
+        try:
+            persisted = await obs.to_thread_io(
+                "chat.queue_steering_cancelled",
+                bc.session_id,
+                sess.update_queue_steering_state,
+                bc.session_id,
+                "cancelled",
+                item_id=item_id,
+                command_uuid=command_uuid,
+                pause=True,
+                owned=True,
+            )
+        except Exception as exc:
+            sys.stderr.write(
+                f"[chat] steering terminal pause failed "
+                f"sid={obs.short_id(bc.session_id)} "
+                f"exc={type(exc).__name__}\n"
+            )
+        if persisted is not None:
+            _publish_queue_steering(
+                bc,
+                item_id=item_id,
+                command_uuid=command_uuid,
+                state="cancelled",
+                effective_delivery="adjust",
+            )
+
+
+async def _await_steering_write_stability(
+    bc: TurnBroadcast,
+    *,
+    timeout_s: float = 10.0,
+) -> bool:
+    """Wait until every writer registered before the stable check has settled.
+
+    Writers can register while Result is awaiting an older writer, so one
+    snapshot is insufficient. Returning ``False`` means at least one write is
+    still delivery-ambiguous at the bounded deadline.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + max(0.0, timeout_s)
+    while True:
+        pending_writes = tuple(
+            event
+            for event in bc.steering_write_events.values()
+            if not event.is_set()
+        )
+        if not pending_writes:
+            return True
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            return False
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*(
+                    event.wait() for event in pending_writes
+                )),
+                timeout=remaining,
+            )
+        except asyncio.TimeoutError:
+            return False
+        # A second enqueue can register while Result waits for the first write.
+        # Re-snapshot until there are no unfinished writers. The caller checks
+        # the command map immediately afterward without another await.
+
+
 @router.post("/sessions/{sid}/queue", dependencies=[Depends(require_token)])
 async def enqueue_api(
     sid: str,
@@ -7264,6 +7696,10 @@ async def enqueue_api(
 ) -> dict:
     text = (req.text or "").strip()
     attachment_ids = _attachment_ids(req.image_ids or "")
+    requested_delivery = (req.delivery or "queue").strip().lower()
+    if requested_delivery not in {"adjust", "queue"}:
+        raise HTTPException(400, "invalid queue delivery")
+    requested_turn_id = (req.active_turn_id or "").strip()
     if any(not _valid_staged_attachment_id(aid) for aid in attachment_ids):
         raise HTTPException(400, "bad attachment id")
     if not text and not attachment_ids:
@@ -7277,6 +7713,19 @@ async def enqueue_api(
         if selection_quotes
         else (req.display_text or text)
     )
+
+    # Native steering is text-only. Attachment ownership spans staged uploads,
+    # the queue sidecar and the eventual canonical user UUID; replaying that
+    # transaction inside a mid-turn CLI fold would make crash recovery
+    # ambiguous, so attachment messages retain ordinary turn-boundary FIFO.
+    steering_turn = (
+        _eligible_steering_turn(
+            sid, requested_turn_id, permission=req.permission or "")
+        if requested_delivery == "adjust" and not attachment_ids
+        else None
+    )
+    effective_delivery = "adjust" if steering_turn is not None else "queue"
+    command_uuid = str(uuid.uuid4()) if steering_turn is not None else ""
 
     # Bind blobs before the queue JSON commit. A crash may leave an orphan ref
     # (startup reconciliation releases it), but can never leave an accepted
@@ -7324,6 +7773,12 @@ async def enqueue_api(
             selection_quotes=selection_quotes,
             plan_return_permission=req.plan_return_permission,
             item_id=queue_item_id,
+            delivery=effective_delivery,
+            target_turn_id=(requested_turn_id
+                            if effective_delivery == "adjust" else ""),
+            command_uuid=command_uuid,
+            steering_state=("pending"
+                            if effective_delivery == "adjust" else ""),
         )
     )
     try:
@@ -7336,6 +7791,19 @@ async def enqueue_api(
                 continue
         res = enqueue_task.result()
         if res.get("ok"):
+            if effective_delivery == "adjust":
+                fallback_task = asyncio.create_task(_fallback_steering_item(
+                    sid,
+                    item_id=queue_item_id,
+                    command_uuid=command_uuid,
+                    bc=steering_turn,
+                ))
+                while not fallback_task.done():
+                    try:
+                        await asyncio.shield(fallback_task)
+                    except asyncio.CancelledError:
+                        continue
+                fallback_task.result()
             _schedule_queue_drain(sid)
         elif attachment_ids:
             await asyncio.to_thread(
@@ -7368,6 +7836,19 @@ async def enqueue_api(
             # complete queue reconciliation instead of risking data loss.
             queue_committed = True
         if queue_committed:
+            if effective_delivery == "adjust":
+                try:
+                    await asyncio.shield(_fallback_steering_item(
+                        sid,
+                        item_id=queue_item_id,
+                        command_uuid=command_uuid,
+                        bc=steering_turn,
+                    ))
+                except Exception:
+                    # Unknown ownership remains fail-closed in the queue. Its
+                    # active steering state blocks ordinary duplicate drain;
+                    # startup recovery pauses it for review.
+                    pass
             _schedule_queue_drain(sid)
         elif attachment_ids:
             await asyncio.to_thread(
@@ -7388,28 +7869,149 @@ async def enqueue_api(
         if res.get("error") == "session_not_found":
             raise HTTPException(404, "session not found")
         raise HTTPException(409, res.get("error", "enqueue failed"))
-    background_tasks.add_task(_schedule_queue_drain_after_response, sid)
+    if effective_delivery == "adjust":
+        delivery_task = asyncio.create_task(_deliver_steering_command(
+            sid,
+            turn_id=requested_turn_id,
+            item_id=queue_item_id,
+            command_uuid=command_uuid,
+            text=text,
+            permission=req.permission or "",
+        ))
+        try:
+            delivered_as, delivery_status, updated_item = await asyncio.shield(
+                delivery_task)
+        except asyncio.CancelledError:
+            # The durable item and CLI command must reach one known ownership
+            # state even when the browser drops the enqueue response.
+            while not delivery_task.done():
+                try:
+                    await asyncio.shield(delivery_task)
+                except asyncio.CancelledError:
+                    continue
+            delivered_as, delivery_status, updated_item = delivery_task.result()
+            if delivered_as == "queue":
+                _schedule_queue_drain(sid)
+            raise
+        effective_delivery = delivered_as
+        if updated_item is not None:
+            res["item"] = updated_item
+        # Lifecycle can beat the HTTP response. Return the authoritative small
+        # queue snapshot so the frontend never re-adds an already-completed
+        # optimistic row after its completed SSE event was delivered.
+        res["queue"] = await asyncio.to_thread(sess.get_queue, sid)
+    else:
+        delivery_status = "queued"
+        background_tasks.add_task(_schedule_queue_drain_after_response, sid)
+    res["effective_delivery"] = effective_delivery
+    res["delivery_status"] = delivery_status
     return res
 
 
-@router.delete("/sessions/{sid}/queue/{item_id}", dependencies=[Depends(require_token)])
-def remove_queue_item_api(sid: str, item_id: str) -> dict:
+async def _cancel_waiting_steering_item(
+    sid: str, item: dict,
+) -> bool:
+    """Cancel one still-queued native command before its durable row is removed."""
+    command_uuid = str(item.get("command_uuid") or "")
+    target_turn_id = str(item.get("target_turn_id") or "")
+    bc = _active_turns.get(sid)
+    if (
+        not command_uuid
+        or bc is None
+        or bc.done
+        or bc.turn_id != target_turn_id
+        or not isinstance(bc.runtime_client, MuseLabSDKClient)
+        or str((bc.steering_commands.get(command_uuid) or {}).get(
+            "item_id") or "") != str(item.get("id") or "")
+    ):
+        return False
     try:
-        updated, removed_ids = sess.remove_queue_item_with_removed(
-            sid, item_id)
+        cancelled = await bc.runtime_client.cancel_async_message(command_uuid)
+    except Exception:
+        return False
+    if not cancelled:
+        return False
+    bc.steering_commands.pop(command_uuid, None)
+    event = bc.steering_write_events.pop(command_uuid, None)
+    if event is not None:
+        event.set()
+    return True
+
+
+@router.delete("/sessions/{sid}/queue/{item_id}", dependencies=[Depends(require_token)])
+async def remove_queue_item_api(sid: str, item_id: str) -> dict:
+    snapshot = await asyncio.to_thread(sess.get_queue, sid)
+    item = next(
+        (row for row in snapshot.get("items") or []
+         if str(row.get("id") or "") == item_id),
+        None,
+    )
+    if (
+        item is not None
+        and item.get("delivery") == "adjust"
+        and item.get("steering_state") in {
+            "pending", "waiting_tool", "queued", "started",
+        }
+        and not await _cancel_waiting_steering_item(sid, item)
+    ):
+        raise HTTPException(
+            409,
+            "message is already being adjusted and cannot be withdrawn safely",
+        )
+    try:
+        updated, removed_ids = await asyncio.to_thread(
+            sess.remove_queue_item_with_removed, sid, item_id)
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     for removed_id in removed_ids:
-        _durable_attachment_store.finish_queue_item(
+        await asyncio.to_thread(
+            _durable_attachment_store.finish_queue_item,
             sid, removed_id, consume=False)
     return updated
 
 
 @router.delete("/sessions/{sid}/queue", dependencies=[Depends(require_token)])
-def clear_queue_api(sid: str) -> dict:
-    updated, item_ids = sess.clear_queue_with_removed(sid)
+async def clear_queue_api(sid: str) -> dict:
+    snapshot = await asyncio.to_thread(sess.get_queue, sid)
+    snapshot_item_ids = tuple(
+        str(item.get("id") or "")
+        for item in snapshot.get("items") or []
+        if item.get("id")
+    )
+    active_adjustments = [
+        item for item in snapshot.get("items") or []
+        if item.get("delivery") == "adjust"
+        and item.get("steering_state") in {
+            "pending", "waiting_tool", "queued", "started",
+        }
+    ]
+    cancelled: list[dict] = []
+    for item in active_adjustments:
+        if await _cancel_waiting_steering_item(sid, item):
+            cancelled.append(item)
+            continue
+        for prior in cancelled:
+            await asyncio.to_thread(
+                sess.update_queue_steering_state,
+                sid,
+                "cancelled",
+                item_id=str(prior.get("id") or ""),
+                command_uuid=str(prior.get("command_uuid") or ""),
+                pause=True,
+            )
+        raise HTTPException(
+            409,
+            "one or more adjusted messages cannot be cleared safely",
+        )
+    # Remove exactly the rows represented by the snapshot above. A concurrent
+    # enqueue may already have crossed the native CLI write boundary by now;
+    # an unconditional clear would erase its durable owner without cancelling
+    # the accepted command.
+    updated, item_ids = await asyncio.to_thread(
+        sess.remove_queue_items_with_removed, sid, snapshot_item_ids)
     for item_id in item_ids:
-        _durable_attachment_store.finish_queue_item(
+        await asyncio.to_thread(
+            _durable_attachment_store.finish_queue_item,
             sid, item_id, consume=False)
     return {"ok": True, **updated}
 
@@ -9939,15 +10541,67 @@ async def interrupt(
     # Stop means "do not continue autonomously". Pause queued work only after
     # the immutable owner check, before the SDK interrupt can race cleanup and
     # dequeue the next item.
-    await obs.to_thread_io(
-        "chat.queue_pause_nonempty",
-        session_id,
-        sess.pause_queue_if_nonempty,
-        session_id,
-        owned=True,
-    )
+    stale_after_pause = False
     async with _lock:
-        targets = [(k, c) for k, c in _clients.items() if k[0] == session_id]
+        current = _active_turns.get(session_id)
+        owner_matches = (
+            current is bc
+            and (
+                bc is None
+                or (
+                    not bc.done
+                    and (
+                        not requested_turn_id
+                        or bc.turn_id == requested_turn_id
+                    )
+                )
+            )
+        )
+        if not owner_matches:
+            stale_after_pause = True
+            targets = []
+        else:
+            # Keep admission serialized with both exact-owner checks. Turn
+            # cleanup can still pop its own broadcast outside this lock, so a
+            # second check after the disk await is required before snapshotting
+            # any pooled client.
+            await obs.to_thread_io(
+                "chat.queue_pause_nonempty",
+                session_id,
+                sess.pause_queue_if_nonempty,
+                session_id,
+                owned=True,
+            )
+            current = _active_turns.get(session_id)
+            owner_matches = (
+                current is bc
+                and (
+                    bc is None
+                    or (
+                        not bc.done
+                        and (
+                            not requested_turn_id
+                            or bc.turn_id == requested_turn_id
+                        )
+                    )
+                )
+            )
+            if not owner_matches:
+                stale_after_pause = True
+                targets = []
+            else:
+                targets = [
+                    (k, c) for k, c in _clients.items()
+                    if k[0] == session_id
+                ]
+    if stale_after_pause:
+        return _interrupt_response(
+            session_id,
+            bc,
+            requested_turn_id=requested_turn_id,
+            interrupted=[],
+            stale=True,
+        )
     # Mark the active turn user-cancelled up front (BEFORE calling SDK's
     # interrupt — the ResultMessage handler races with us, and we'd rather flag
     # too early than too late). This also lets the force-stop watchdog and the
@@ -10006,8 +10660,14 @@ async def interrupt(
 
     async def _interrupt_one(k, c) -> str | None:
         try:
+            interrupt_call = (
+                c.interrupt(cancel_queued=bool(
+                    bc is not None and bc.steering_commands))
+                if isinstance(c, MuseLabSDKClient)
+                else c.interrupt()
+            )
             await asyncio.wait_for(
-                c.interrupt(), timeout=_INTERRUPT_ACK_TIMEOUT_S)
+                interrupt_call, timeout=_INTERRUPT_ACK_TIMEOUT_S)
             return f"{k[0]}@{k[1]}"
         except asyncio.TimeoutError:
             sys.stderr.write(
@@ -10023,6 +10683,12 @@ async def interrupt(
     results = await asyncio.gather(
         *(_interrupt_one(k, c) for k, c in targets))
     interrupted = [result for result in results if result is not None]
+    if bc is not None and bc.steering_commands:
+        # Stop is an explicit request not to continue autonomously. Even when
+        # an older CLI omits its cancel_queued receipt, retain each durable
+        # adjustment as cancelled+paused for review; never blindly resend a
+        # command that may already have crossed the dequeue boundary.
+        await _cancel_outstanding_steering_commands(bc)
     # The watchdog was armed before these control requests, so a slow/broken
     # acknowledgement cannot postpone the hard-stop deadline.
     return _interrupt_response(
@@ -14233,6 +14899,7 @@ async def _start_turn(
     )
     broadcast.activity_hidden = bool(s.get("activity_hidden", False))
     broadcast.model = model_to_use
+    broadcast.permission = permission
 
     # Reasoning effort and Fast service are per-session launch controls.
     # Legacy empty effort is normalized to canonical `auto` before it reaches
@@ -14386,6 +15053,13 @@ async def _start_turn(
     # list. Do not send the prompt after the user has already cancelled.
     if broadcast.cancelled:
         return await _finish_cancelled_startup(session_id, broadcast)
+
+    # Publish the exact connected runtime only after the immutable active-turn
+    # owner has survived startup cancellation. The busy-send endpoint never
+    # looks clients up by session id alone; it rechecks this broadcast, turn id,
+    # query commit and an in-flight tool before scheduling a steering write.
+    if isinstance(client, MuseLabSDKClient):
+        broadcast.runtime_client = client
 
     # Lease staged uploads without consuming them. The payload remains retryable
     # through CPU/disk preparation and native compact preflight; only a
@@ -15116,6 +15790,7 @@ async def _start_turn(
                         # let the next turn adopt it as its own response.
                         _pending_runtime_rebuilds.add(session_id)
                         raise
+                    broadcast.query_committed = True
                     broadcast.emit_startup_perf("ready")
                     if persisted_imgs:
                         try:
@@ -15132,14 +15807,58 @@ async def _start_turn(
                             sys.stderr.flush()
 
                 replay_dropped = 0
+                deferred_result: ResultMessage | None = None
 
                 async def _dispatch(msg) -> str:
                     """Classify one message and forward it to the turn."""
-                    nonlocal replay_dropped
+                    nonlocal replay_dropped, deferred_result
+                    if isinstance(msg, CommandLifecycleMessage):
+                        terminal = await _settle_steering_lifecycle(
+                            broadcast, msg)
+                        if (
+                            terminal
+                            and not broadcast.steering_commands
+                            and deferred_result is not None
+                        ):
+                            final_result = deferred_result
+                            deferred_result = None
+                            broadcast.result_forwarded = True
+                            broadcast.active_tool_use_ids.clear()
+                            await merge_q.put(("claude", final_result))
+                            return "current_result"
+                        return "forward"
                     decision = boundary.classify(msg)
                     if decision in ("drop", "stale_result"):
                         replay_dropped += 1
                         return decision
+
+                    # Keep an exact, live view of tool execution. The native
+                    # priority=next queue consumes at PostToolBatch; these IDs
+                    # are also useful to explain why a command is still
+                    # waiting, but eligibility does not require one — a command
+                    # sent before the next tool is chosen can still fold there.
+                    if isinstance(msg, (AssistantMessage, UserMessage)):
+                        for block in (getattr(msg, "content", None) or []):
+                            if isinstance(block, ToolUseBlock) and block.id:
+                                broadcast.active_tool_use_ids.add(block.id)
+                            elif isinstance(block, ToolResultBlock):
+                                tool_id = str(
+                                    getattr(block, "tool_use_id", "") or "")
+                                if tool_id:
+                                    broadcast.active_tool_use_ids.discard(tool_id)
+
+                    if decision == "current_result":
+                        # A Result can race the enqueue HTTP request while its
+                        # one-frame write is in progress. Wait briefly for that
+                        # known write outcome; a failed write removes the map
+                        # and lets this Result close normally, while an accepted
+                        # command keeps the sole stream reader attached.
+                        await _await_steering_write_stability(broadcast)
+                        if broadcast.steering_commands:
+                            deferred_result = msg
+                            return "steering_pending_result"
+                        broadcast.result_forwarded = True
+                        broadcast.active_tool_use_ids.clear()
                     if (broadcast.perf_query_started
                             and broadcast.perf_first_event_ms < 0):
                         broadcast.perf_first_event_ms = obs.elapsed_ms(
@@ -16824,8 +17543,15 @@ async def _start_turn(
             # Activity/queue/sidecar settlement again reintroduces the race the
             # watchdog was meant to close.
             if broadcast._startup_terminal_cleanup_task is not None:
+                await _cancel_outstanding_steering_commands(broadcast)
                 await _finish_cancelled_startup(session_id, broadcast)
                 return
+
+            if turn_errored or broadcast.cancelled:
+                # Call even when the map is empty: the helper closes admission
+                # synchronously before its first possible await, preventing a
+                # late enqueue during the rest of terminal bookkeeping.
+                await _cancel_outstanding_steering_commands(broadcast)
 
             if broadcast.cancelled:
                 broadcast.perf_status = "cancelled"
@@ -17882,10 +18608,15 @@ async def providers_list() -> dict:
         # A stale hand-edited env value must not leak invalid state into the
         # selector or the SDK launch contract.
         default_permission = "bypassPermissions"
+    busy_send_mode = os.environ.get(
+        "MUSELAB_BUSY_SEND_MODE", "adjust").strip().lower()
+    if busy_send_mode not in {"adjust", "queue"}:
+        busy_send_mode = "adjust"
     return {
         "models": flat,
         "default_model": _resolve_default_model(""),
         "default_permission": default_permission,
+        "busy_send_mode": busy_send_mode,
     }
 
 def recover_durable_queue_attachments_at_startup(

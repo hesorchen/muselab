@@ -757,6 +757,280 @@ def test_queue_plan_return_permission_roundtrip_and_legacy_migration(app_module)
     assert requeued["items"][0]["plan_return_permission"] == "default"
 
 
+def test_native_adjustment_lifecycle_is_durable_and_not_double_claimed(
+        app_module):
+    from backend import sessions as sess
+
+    sid = "s-native-adjustment"
+    adjusted = sess.enqueue_message(
+        sid,
+        "use this after the next tool",
+        image_ids="img-a,img-b",
+        delivery="adjust",
+        target_turn_id="turn-running",
+        command_uuid="command-1",
+        steering_state="pending",
+    )
+    ordinary = sess.enqueue_message(sid, "ordinary follow-up")
+    initial_revision = adjusted["queue"]["revision"]
+
+    assert adjusted["item"]["delivery"] == "adjust"
+    assert adjusted["item"]["target_turn_id"] == "turn-running"
+    assert adjusted["item"]["command_uuid"] == "command-1"
+    assert adjusted["item"]["steering_state"] == "pending"
+    # The native command owns the FIFO head. The ordinary drain must neither
+    # duplicate it nor jump over it to execute the later message.
+    assert sess.claim_queue_message(sid) is None
+    assert [item["id"] for item in sess.get_queue(sid)["items"]] == [
+        adjusted["item"]["id"], ordinary["item"]["id"],
+    ]
+
+    started = sess.update_queue_steering_state(
+        sid, "started", command_uuid="command-1",
+    )
+    assert started is not None
+    assert started["steering_state"] == "started"
+    started_snapshot = sess.get_queue(sid)
+    assert started_snapshot["revision"] == initial_revision + 2
+    assert started_snapshot["items"][0]["steering_state"] == "started"
+
+    # Replayed lifecycle frames are idempotent and do not manufacture a new
+    # revision. A selector mismatch must not remove anything.
+    assert sess.update_queue_steering_state(
+        sid, "started", command_uuid="command-1",
+    ) == started
+    assert sess.get_queue(sid)["revision"] == started_snapshot["revision"]
+    assert sess.update_queue_steering_state(
+        sid,
+        "completed",
+        item_id=adjusted["item"]["id"],
+        command_uuid="different-command",
+    ) is None
+
+    completed = sess.update_queue_steering_state(
+        sid, "completed", item_id=adjusted["item"]["id"],
+    )
+    assert completed is not None
+    assert completed["steering_state"] == "completed"
+    assert completed["image_ids"] == "img-a,img-b"
+    remaining = sess.get_queue(sid)
+    assert [item["id"] for item in remaining["items"]] == [
+        ordinary["item"]["id"],
+    ]
+    assert sess.update_queue_steering_state(
+        sid, "completed", item_id=adjusted["item"]["id"],
+    ) is None
+    assert sess.claim_queue_message(sid)["id"] == ordinary["item"]["id"]
+
+
+def test_native_adjustment_lifecycle_cannot_regress_after_fast_ack(app_module):
+    from backend import sessions as sess
+
+    sid = "s-native-fast-ack"
+    item = sess.enqueue_message(
+        sid,
+        "apply this after the current tool",
+        delivery="adjust",
+        command_uuid="command-fast-ack",
+        steering_state="pending",
+    )["item"]
+
+    queued = sess.update_queue_steering_state(
+        sid, "queued", item_id=item["id"],
+    )
+    queued_revision = sess.get_queue(sid)["revision"]
+    assert queued is not None
+    assert queued["steering_state"] == "queued"
+
+    # The lifecycle reader can receive queued/started before the HTTP task
+    # persists its post-write waiting_tool state. Those late writes must be
+    # idempotent instead of moving the durable UI status backwards.
+    assert sess.update_queue_steering_state(
+        sid, "waiting_tool", item_id=item["id"],
+    )["steering_state"] == "queued"
+    assert sess.get_queue(sid)["revision"] == queued_revision
+
+    started = sess.update_queue_steering_state(
+        sid, "started", item_id=item["id"],
+    )
+    started_revision = sess.get_queue(sid)["revision"]
+    assert started is not None
+    assert started["steering_state"] == "started"
+    assert sess.update_queue_steering_state(
+        sid, "queued", item_id=item["id"],
+    )["steering_state"] == "started"
+    assert sess.update_queue_steering_state(
+        sid, "waiting_tool", item_id=item["id"],
+    )["steering_state"] == "started"
+    assert sess.get_queue(sid)["revision"] == started_revision
+
+
+def test_cancelled_native_adjustment_cannot_be_resurrected_by_late_write(
+        app_module):
+    from backend import sessions as sess
+
+    sid = "s-native-cancel-race"
+    item = sess.enqueue_message(
+        sid,
+        "do not resurrect this",
+        delivery="adjust",
+        command_uuid="command-cancel-race",
+        steering_state="pending",
+    )["item"]
+
+    cancelled = sess.update_queue_steering_state(
+        sid, "cancelled", item_id=item["id"], pause=True,
+    )
+    cancelled_revision = sess.get_queue(sid)["revision"]
+    assert cancelled is not None
+    assert cancelled["steering_state"] == "cancelled"
+
+    late = sess.update_queue_steering_state(
+        sid,
+        "waiting_tool",
+        item_id=item["id"],
+        command_uuid="command-cancel-race",
+    )
+    assert late is not None
+    assert late["steering_state"] == "cancelled"
+    snapshot = sess.get_queue(sid)
+    assert snapshot["paused"] is True
+    assert snapshot["revision"] == cancelled_revision
+
+
+def test_native_adjustment_fallback_becomes_an_ordinary_fifo_item(app_module):
+    from backend import sessions as sess
+
+    sid = "s-native-fallback"
+    adjusted = sess.enqueue_message(
+        sid,
+        "preserve all payload data",
+        image_ids="img-durable",
+        delivery="adjust",
+        target_turn_id="turn-old",
+        command_uuid="command-fallback",
+        steering_state="waiting_tool",
+    )["item"]
+    later = sess.enqueue_message(sid, "later ordinary message")["item"]
+
+    fallback = sess.fallback_queue_steering(
+        sid, command_uuid="command-fallback",
+    )
+    assert fallback is not None
+    assert fallback["id"] == adjusted["id"]
+    assert fallback["image_ids"] == "img-durable"
+    assert fallback["delivery"] == "queue"
+    assert fallback["steering_state"] == "fallback"
+    assert "target_turn_id" not in fallback
+    assert "command_uuid" not in fallback
+    snapshot = sess.get_queue(sid)
+    assert [item["id"] for item in snapshot["items"]] == [
+        adjusted["id"], later["id"],
+    ]
+    assert sess.claim_queue_message(sid)["id"] == adjusted["id"]
+    # A late lifecycle callback for the detached CLI command cannot consume the
+    # now-ordinary inflight item.
+    assert sess.update_queue_steering_state(
+        sid, "completed", command_uuid="command-fallback",
+    ) is None
+
+
+def test_cancelled_native_adjustment_is_retained_and_pauses_queue(app_module):
+    from backend import sessions as sess
+
+    sid = "s-native-cancelled"
+    item = sess.enqueue_message(
+        sid,
+        "review before retry",
+        delivery="adjust",
+        command_uuid="command-cancelled",
+        steering_state="queued",
+    )["item"]
+
+    cancelled = sess.update_queue_steering_state(
+        sid, "cancelled", item_id=item["id"],
+    )
+
+    assert cancelled is not None
+    assert cancelled["steering_state"] == "cancelled"
+    snapshot = sess.get_queue(sid)
+    assert snapshot["paused"] is True
+    assert snapshot["items"][0]["id"] == item["id"]
+    assert sess.claim_queue_message(sid) is None
+
+
+def test_restart_detaches_and_pauses_uncertain_native_adjustment(app_module):
+    from backend import sessions as sess
+
+    sid = "s-native-restart"
+    item = sess.enqueue_message(
+        sid,
+        "the CLI may already have accepted this",
+        delivery="adjust",
+        target_turn_id="turn-before-crash",
+        command_uuid="command-before-crash",
+        steering_state="started",
+    )["item"]
+    assert sess.get_queue(sid)["paused"] is False
+
+    recovered = sess.recover_queue_inflight(sid)
+
+    assert recovered["paused"] is True
+    assert recovered["items"][0]["id"] == item["id"]
+    assert recovered["items"][0]["delivery"] == "queue"
+    assert recovered["items"][0]["steering_state"] == "cancelled"
+    assert "target_turn_id" not in recovered["items"][0]
+    assert "command_uuid" not in recovered["items"][0]
+    assert sess.claim_queue_message(sid) is None
+
+    # Recovery is conservative but not a dead end: explicit Resume makes the
+    # retained payload claimable as an ordinary turn. It can also be deleted
+    # or cleared because no nonexistent CLI owner remains attached.
+    sess.set_queue_paused(sid, False)
+    assert sess.claim_queue_message(sid)["id"] == item["id"]
+
+
+def test_native_command_uuid_is_unique_across_waiting_and_inflight(app_module):
+    from backend import sessions as sess
+
+    sid = "s-native-command-dedup"
+    first = sess.enqueue_message(
+        sid,
+        "first",
+        delivery="queue",
+        command_uuid="same-command",
+        steering_state="fallback",
+    )
+    assert first["ok"] is True
+    assert sess.claim_queue_message(sid)["id"] == first["item"]["id"]
+
+    duplicate = sess.enqueue_message(
+        sid,
+        "must not become ambiguous",
+        delivery="adjust",
+        command_uuid="same-command",
+        steering_state="pending",
+    )
+    assert duplicate["ok"] is False
+    assert duplicate["error"] == "duplicate_command_uuid"
+    assert duplicate["queue"]["items"] == []
+    assert duplicate["queue"]["inflight"]["item"]["id"] == first["item"]["id"]
+
+
+def test_snapshot_batch_remove_preserves_later_enqueue(app_module):
+    from backend import sessions as sess
+
+    sid = "s-snapshot-batch-remove"
+    first = sess.enqueue_message(sid, "present in clear snapshot")["item"]
+    snapshot_ids = [first["id"]]
+    later = sess.enqueue_message(sid, "committed after snapshot")["item"]
+
+    queue, removed = sess.remove_queue_items_with_removed(sid, snapshot_ids)
+
+    assert removed == (first["id"],)
+    assert [item["id"] for item in queue["items"]] == [later["id"]]
+
+
 def _sdk_session_info(sid: str, *, title: str | None = None):
     return SimpleNamespace(
         session_id=sid,

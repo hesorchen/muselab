@@ -2291,16 +2291,40 @@ def set_message_count(sid: str, message_count: int,
 # lock keeps the two independent.
 #
 # Shape: {"items": [{"id","text","display_text","selection_quotes",
-#                    "image_ids","permission",
-#                    "plan_return_permission","enqueued_at"}], "paused": bool}
+#                    "image_ids","permission","plan_return_permission",
+#                    "enqueued_at","delivery"?,"target_turn_id"?,
+#                    "command_uuid"?,"steering_state"?}], "paused": bool}
 #   - items: FIFO; head is sent next by the drain trigger in chat.py
 #   - paused: set True when a queued turn errors / hits ask_user_question /
 #     is user-cancelled; auto-drain stops until the user resumes
+#   - delivery="adjust": the live CLI owns delivery; the ordinary FIFO drain
+#     must not claim it until an explicit fallback changes delivery to "queue"
 #
 # Attachment ids resolve through chat.py's durable blob/SQLite registry. The
 # JSON sidecar deliberately retains only opaque ids and presentation data.
 _QUEUE_LOCK = threading.Lock()
 _QUEUE_MAX = 10   # mirror the frontend cap
+_QUEUE_DELIVERIES = frozenset({"adjust", "queue"})
+_QUEUE_STEERING_STATES = frozenset({
+    "pending",
+    "waiting_tool",
+    "queued",
+    "started",
+    "cancelled",
+    "fallback",
+})
+_QUEUE_ACTIVE_STEERING_STATES = frozenset({
+    "pending", "waiting_tool", "queued", "started",
+})
+_QUEUE_STEERING_STATE_RANK = {
+    "pending": 0,
+    "waiting_tool": 1,
+    "queued": 2,
+    "started": 3,
+}
+_QUEUE_STEERING_ITEM_FIELDS = (
+    "delivery", "target_turn_id", "command_uuid", "steering_state",
+)
 # Process-local deletion fence. It is always read/written under _QUEUE_LOCK.
 # Disk deletion alone is insufficient: a cancelled drain can retain an old
 # queue snapshot and otherwise write it back after unlink.
@@ -2319,6 +2343,40 @@ def _queue_path(sid: str) -> Path:
 
 def _empty_queue() -> dict:
     return {"revision": 0, "items": [], "inflight": None, "paused": False}
+
+
+def _normalize_queue_item(item: dict, *, strict: bool = False) -> dict:
+    """Return one canonical queue item without inventing steering metadata.
+
+    Steering fields are optional so sidecars created before native adjustment
+    support remain ordinary FIFO work. Compatibility reads normalize values in
+    memory only; the next mutation persists the canonical representation.
+    """
+    normalized = _normalize_session_permission_fields(item)
+    for field in _QUEUE_STEERING_ITEM_FIELDS:
+        if field not in normalized:
+            continue
+        value = normalized.get(field)
+        if strict and not isinstance(value, str):
+            raise ValueError(f"queue item {field} must be a string")
+        candidate = value.strip() if isinstance(value, str) else ""
+        if candidate:
+            normalized[field] = candidate
+        else:
+            normalized.pop(field, None)
+    if strict:
+        delivery = normalized.get("delivery", "")
+        if delivery and delivery not in _QUEUE_DELIVERIES:
+            raise ValueError("queue item delivery is invalid")
+        state = normalized.get("steering_state", "")
+        if state and state not in _QUEUE_STEERING_STATES:
+            raise ValueError("queue item steering_state is invalid")
+    return normalized
+
+
+def _queue_command_uuid(item: dict) -> str:
+    value = item.get("command_uuid")
+    return value.strip() if isinstance(value, str) else ""
 
 
 def _load_queue(sid: str, *, strict: bool = False) -> dict:
@@ -2360,7 +2418,7 @@ def _load_queue(sid: str, *, strict: bool = False) -> dict:
             # Compatibility is read-only here: legacy Plan items immediately
             # behave as default-on-exit, while GET does not rewrite the file.
             d["items"] = [
-                _normalize_session_permission_fields(item)
+                _normalize_queue_item(item, strict=strict)
                 if isinstance(item, dict) else item
                 for item in d["items"]
             ]
@@ -2379,7 +2437,9 @@ def _load_queue(sid: str, *, strict: bool = False) -> dict:
                 raise ValueError("queue inflight must contain an item object")
             d["inflight"] = None
         else:
-            inflight_item = _normalize_session_permission_fields(inflight["item"])
+            inflight_item = _normalize_queue_item(
+                inflight["item"], strict=strict,
+            )
             inflight_id = str(inflight_item.get("id") or "")
             if strict and not inflight_id:
                 raise ValueError("queue inflight item must have an id")
@@ -2392,6 +2452,18 @@ def _load_queue(sid: str, *, strict: bool = False) -> dict:
                 "turn_id": str(inflight.get("turn_id") or ""),
                 "claimed_at": int(inflight.get("claimed_at") or 0),
             }
+        if strict:
+            command_uuids = [
+                _queue_command_uuid(item) for item in d["items"]
+                if _queue_command_uuid(item)
+            ]
+            inflight_command_uuid = _queue_command_uuid(
+                ((d.get("inflight") or {}).get("item") or {})
+            )
+            if inflight_command_uuid:
+                command_uuids.append(inflight_command_uuid)
+            if len(set(command_uuids)) != len(command_uuids):
+                raise ValueError("queue command_uuid values must be unique")
         if strict and not isinstance(d.get("paused"), bool):
             raise ValueError("queue paused must be a boolean")
         # ``paused`` only governs work still waiting in ``items``. The claimed
@@ -2418,14 +2490,14 @@ def _save_queue(sid: str, data: dict, *, bump: bool = True) -> bool:
     items = canonical.get("items")
     if isinstance(items, list):
         canonical["items"] = [
-            _normalize_session_permission_fields(item)
+            _normalize_queue_item(item)
             if isinstance(item, dict) else item
             for item in items
         ]
     inflight = canonical.get("inflight")
     if isinstance(inflight, dict) and isinstance(inflight.get("item"), dict):
         canonical["inflight"] = {
-            "item": _normalize_session_permission_fields(inflight["item"]),
+            "item": _normalize_queue_item(inflight["item"]),
             "turn_id": str(inflight.get("turn_id") or ""),
             "claimed_at": int(inflight.get("claimed_at") or 0),
         }
@@ -2552,6 +2624,11 @@ def _enqueue_message_locked(
     selection_quotes: list[dict] | None,
     plan_return_permission: str | None,
     item_id: str = "",
+    *,
+    delivery: str = "",
+    target_turn_id: str = "",
+    command_uuid: str = "",
+    steering_state: str = "",
 ) -> dict:
     """Append one item while the caller owns ``_QUEUE_LOCK``."""
     if sid in _DELETED_SESSION_IDS:
@@ -2575,6 +2652,29 @@ def _enqueue_message_locked(
         ),
         "enqueued_at": int(time.time() * 1000),
     }
+    optional_fields = {
+        "delivery": delivery,
+        "target_turn_id": target_turn_id,
+        "command_uuid": command_uuid,
+        "steering_state": steering_state,
+    }
+    item.update({key: value for key, value in optional_fields.items() if value})
+    item = _normalize_queue_item(item, strict=True)
+    queued_command_uuid = _queue_command_uuid(item)
+    if queued_command_uuid:
+        existing_items = list(data["items"])
+        inflight_item = ((data.get("inflight") or {}).get("item") or {})
+        if inflight_item:
+            existing_items.append(inflight_item)
+        if any(
+            _queue_command_uuid(existing) == queued_command_uuid
+            for existing in existing_items
+        ):
+            return {
+                "ok": False,
+                "error": "duplicate_command_uuid",
+                "queue": data,
+            }
     data["items"].append(item)
     _save_queue(sid, data)
     return {"ok": True, "item": item, "queue": data}
@@ -2586,7 +2686,11 @@ def enqueue_message(sid: str, text: str, image_ids: str = "",
                     selection_quotes: list[dict] | None = None,
                     plan_return_permission: str | None = None,
                     item_id: str = "",
-                    *, require_session: bool = False,
+                    *, delivery: str = "",
+                    target_turn_id: str = "",
+                    command_uuid: str = "",
+                    steering_state: str = "",
+                    require_session: bool = False,
                     existing_session: dict | None = None,
                     sdk_verified: bool = False) -> dict:
     """Append a message to the session's queue. Returns
@@ -2653,6 +2757,10 @@ def enqueue_message(sid: str, text: str, image_ids: str = "",
                     selection_quotes,
                     plan_return_permission,
                     item_id,
+                    delivery=delivery,
+                    target_turn_id=target_turn_id,
+                    command_uuid=command_uuid,
+                    steering_state=steering_state,
                 )
         return _enqueue_message_locked(
             sid,
@@ -2663,6 +2771,10 @@ def enqueue_message(sid: str, text: str, image_ids: str = "",
             selection_quotes,
             plan_return_permission,
             item_id,
+            delivery=delivery,
+            target_turn_id=target_turn_id,
+            command_uuid=command_uuid,
+            steering_state=steering_state,
         )
 
 
@@ -2675,6 +2787,11 @@ def enqueue_existing_message(
     selection_quotes: list[dict] | None = None,
     plan_return_permission: str | None = None,
     item_id: str = "",
+    *,
+    delivery: str = "",
+    target_turn_id: str = "",
+    command_uuid: str = "",
+    steering_state: str = "",
 ) -> dict:
     """Atomically resolve an existing session and append one queued message.
 
@@ -2722,6 +2839,10 @@ def enqueue_existing_message(
                     selection_quotes,
                     plan_return_permission,
                     item_id,
+                    delivery=delivery,
+                    target_turn_id=target_turn_id,
+                    command_uuid=command_uuid,
+                    steering_state=steering_state,
                 )
 
     # An SDK-only session needs a potentially slow workspace probe and a
@@ -2746,10 +2867,180 @@ def enqueue_existing_message(
             selection_quotes=selection_quotes,
             plan_return_permission=plan_return_permission,
             item_id=item_id,
+            delivery=delivery,
+            target_turn_id=target_turn_id,
+            command_uuid=command_uuid,
+            steering_state=steering_state,
             require_session=True,
             existing_session=current,
             sdk_verified=sdk_verified,
         )
+
+
+def _find_queue_item(
+    data: dict,
+    *,
+    item_id: str = "",
+    command_uuid: str = "",
+) -> tuple[str, int | None, dict] | None:
+    """Locate exactly one waiting/inflight item using stable identifiers."""
+    wanted_id = str(item_id or "").strip()
+    wanted_command_uuid = str(command_uuid or "").strip()
+    if not wanted_id and not wanted_command_uuid:
+        raise ValueError("item_id or command_uuid is required")
+
+    matches: list[tuple[str, int | None, dict]] = []
+    for index, item in enumerate(data.get("items") or []):
+        if wanted_id and str(item.get("id") or "") != wanted_id:
+            continue
+        if (
+            wanted_command_uuid
+            and _queue_command_uuid(item) != wanted_command_uuid
+        ):
+            continue
+        matches.append(("items", index, item))
+    inflight_item = ((data.get("inflight") or {}).get("item") or {})
+    if inflight_item:
+        if (
+            (not wanted_id or str(inflight_item.get("id") or "") == wanted_id)
+            and (
+                not wanted_command_uuid
+                or _queue_command_uuid(inflight_item) == wanted_command_uuid
+            )
+        ):
+            matches.append(("inflight", None, inflight_item))
+    if len(matches) > 1:
+        # Strict loads enforce both identifiers' uniqueness. Keep this guard so
+        # future schema changes cannot make a terminal update remove two items.
+        raise RuntimeError("queue item selector is ambiguous")
+    return matches[0] if matches else None
+
+
+def update_queue_steering_state(
+    sid: str,
+    steering_state: str,
+    *,
+    item_id: str = "",
+    command_uuid: str = "",
+    pause: bool = False,
+) -> dict | None:
+    """Atomically transition one native-adjustment item.
+
+    Non-terminal states stay durable, including ``started``. ``completed`` is
+    the sole terminal update that removes the exact matched item and returns
+    its full payload so chat.py can finish attachment ownership separately.
+    A cancelled command remains visible and pauses the waiting queue.
+    """
+    state = str(steering_state or "").strip()
+    if state != "completed" and state not in _QUEUE_STEERING_STATES:
+        raise ValueError("invalid queue steering_state")
+    with _QUEUE_LOCK:
+        if sid in _DELETED_SESSION_IDS:
+            return None
+        data = _load_queue(sid, strict=True)
+        found = _find_queue_item(
+            data, item_id=item_id, command_uuid=command_uuid,
+        )
+        if found is None:
+            return None
+        location, index, item = found
+        current_state = str(item.get("steering_state") or "")
+        if (
+            current_state == "cancelled"
+            and state in _QUEUE_STEERING_STATE_RANK
+        ):
+            # Cancellation is terminal from the durable queue's perspective.
+            # The HTTP writer can still finish its post-query waiting_tool
+            # update after Stop/cancel has already won; never resurrect a CLI
+            # command that the UI now correctly treats as paused for review.
+            return dict(item)
+        if (
+            state in _QUEUE_STEERING_STATE_RANK
+            and current_state in _QUEUE_STEERING_STATE_RANK
+            and _QUEUE_STEERING_STATE_RANK[current_state]
+            > _QUEUE_STEERING_STATE_RANK[state]
+        ):
+            # HTTP write completion and stdout lifecycle frames are handled by
+            # independent tasks. A fast `queued`/`started` ACK can overtake the
+            # post-write `waiting_tool` persistence; never let that race move
+            # the durable UI state backwards.
+            return dict(item)
+        updated = dict(item)
+        updated["steering_state"] = state
+
+        if state == "completed":
+            if location == "inflight":
+                data["inflight"] = None
+            else:
+                assert index is not None
+                data["items"].pop(index)
+            _save_queue(sid, data)
+            return updated
+
+        changed = updated != item
+        if state == "cancelled" and location == "inflight":
+            # A native-adjustment item should never enter the ordinary inflight
+            # slot, but preserving and pausing it is safer than leaving a
+            # cancelled item owned by a nonexistent turn after a race/upgrade.
+            data["inflight"] = None
+            data["items"].insert(0, updated)
+            location = "items"
+            changed = True
+        elif location == "inflight":
+            data["inflight"]["item"] = updated
+        else:
+            assert index is not None
+            data["items"][index] = updated
+
+        if (pause or state == "cancelled") and data["items"]:
+            if not data.get("paused"):
+                changed = True
+            data["paused"] = True
+        if changed:
+            _save_queue(sid, data)
+        return updated
+
+
+def fallback_queue_steering(
+    sid: str,
+    *,
+    item_id: str = "",
+    command_uuid: str = "",
+) -> dict | None:
+    """Atomically detach one failed native command into the ordinary FIFO.
+
+    The old target/command identifiers are removed so a late lifecycle event
+    cannot consume the fallback turn. Text, selection data and attachment ids
+    remain owned by the same queue item. A defensive inflight match is restored
+    to the FIFO head; an already-waiting item keeps its relative position.
+    """
+    with _QUEUE_LOCK:
+        if sid in _DELETED_SESSION_IDS:
+            return None
+        data = _load_queue(sid, strict=True)
+        found = _find_queue_item(
+            data, item_id=item_id, command_uuid=command_uuid,
+        )
+        if found is None:
+            return None
+        location, index, item = found
+        updated = dict(item)
+        updated["delivery"] = "queue"
+        updated["steering_state"] = "fallback"
+        updated.pop("target_turn_id", None)
+        updated.pop("command_uuid", None)
+
+        changed = updated != item
+        if location == "inflight":
+            data["inflight"] = None
+            data["items"].insert(0, updated)
+            changed = True
+        else:
+            assert index is not None
+            data["items"][index] = updated
+        if changed:
+            _save_queue(sid, data)
+        return updated
 
 
 def claim_queue_message(sid: str) -> dict | None:
@@ -2764,6 +3055,14 @@ def claim_queue_message(sid: str) -> dict | None:
             return None
         data = _load_queue(sid, strict=True)
         if data.get("inflight") or data.get("paused") or not data["items"]:
+            return None
+        head = data["items"][0]
+        if (
+            head.get("delivery") == "adjust"
+            and head.get("steering_state") in _QUEUE_ACTIVE_STEERING_STATES
+        ):
+            # The live CLI has accepted (or may already have executed) this
+            # command. Never skip over it or launch a duplicate ordinary turn.
             return None
         item = data["items"].pop(0)
         data["inflight"] = {
@@ -2842,8 +3141,10 @@ def recover_queue_inflight(sid: str) -> dict:
     A bound claim may already have performed external side effects.  An
     unbound claim is safe from duplicate execution, but the process restart
     still erased the preceding turn's in-memory terminal truth and all staged
-    attachments.  Restore either claim exactly once, then pause every surviving
-    item so only an explicit user review/resume can execute it.
+    attachments. Native-adjustment items already waiting are equally
+    uncertain: the CLI may have accepted/executed them before MuseLab persisted
+    its lifecycle ACK. Detach their dead CLI ownership, retain every payload,
+    then pause all surviving work so only explicit review/resume can execute it.
     """
     with _QUEUE_LOCK:
         if sid in _DELETED_SESSION_IDS:
@@ -2859,6 +3160,25 @@ def recover_queue_inflight(sid: str) -> dict:
                                    for row in data["items"]):
                 data["items"].insert(0, item)
             changed = True
+        for index, waiting in enumerate(data["items"]):
+            if (
+                waiting.get("delivery") == "adjust"
+                and waiting.get("steering_state")
+                in _QUEUE_ACTIVE_STEERING_STATES
+            ):
+                # Process restart destroys the CLI command queue and its
+                # lifecycle reader. Retain the user's exact payload, but detach
+                # the now-unverifiable native owner and pause it as cancelled.
+                # An explicit Resume can then run it as an ordinary turn, while
+                # Delete/Clear remain available if the user suspects it already
+                # executed before the crash.
+                recovered = dict(waiting)
+                recovered["delivery"] = "queue"
+                recovered["steering_state"] = "cancelled"
+                recovered.pop("target_turn_id", None)
+                recovered.pop("command_uuid", None)
+                data["items"][index] = recovered
+                changed = True
         should_pause = bool(data["items"])
         if bool(data.get("paused")) != should_pause:
             data["paused"] = should_pause
@@ -2880,7 +3200,7 @@ def requeue_head(sid: str, item: dict) -> dict:
         data = _load_queue(sid, strict=True)
         if not any(str(row.get("id") or "") == item_id
                    for row in data["items"]):
-            data["items"].insert(0, _normalize_session_permission_fields(item))
+            data["items"].insert(0, _normalize_queue_item(item))
             _save_queue(sid, data)
         return data
 
@@ -2932,6 +3252,38 @@ def clear_queue_with_removed(sid: str) -> tuple[dict, tuple[str, ...]]:
         current["items"] = []
         current["paused"] = False
         _save_queue(sid, current)
+        return current, removed
+
+
+def remove_queue_items_with_removed(
+    sid: str,
+    item_ids: list[str] | tuple[str, ...] | set[str],
+) -> tuple[dict, tuple[str, ...]]:
+    """Remove only the waiting ids captured by a caller's queue snapshot.
+
+    Unlike ``clear_queue_with_removed``, this is safe when a concurrent enqueue
+    commits after that snapshot: the new row is not silently deleted. An item
+    that became inflight in the meantime is likewise left under its turn's
+    ownership and omitted from the returned removal receipt.
+    """
+    wanted = {str(item_id or "") for item_id in item_ids}
+    wanted.discard("")
+    with _QUEUE_LOCK:
+        current = _load_queue(sid, strict=True)
+        removed = tuple(
+            str(item.get("id") or "")
+            for item in current["items"]
+            if str(item.get("id") or "") in wanted
+        )
+        if removed:
+            removed_set = set(removed)
+            current["items"] = [
+                item for item in current["items"]
+                if str(item.get("id") or "") not in removed_set
+            ]
+            if not current["items"]:
+                current["paused"] = False
+            _save_queue(sid, current)
         return current, removed
 
 

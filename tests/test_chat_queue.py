@@ -1112,6 +1112,486 @@ async def test_late_enqueue_after_empty_completion_check_kicks_idle_queue(
 
 
 @pytest.mark.asyncio
+async def test_busy_adjust_is_durable_then_uses_exact_native_command(
+    app_module, monkeypatch,
+):
+    from backend import chat
+
+    sess = _sess(app_module)
+    sid = sess.create_session()["id"]
+    writes = []
+
+    class SteeringClient:
+        async def query_steering(
+            self, prompt, *, session_id, command_uuid,
+        ):
+            writes.append((prompt, session_id, command_uuid))
+
+    monkeypatch.setattr(chat, "MuseLabSDKClient", SteeringClient)
+    broadcast = chat.TurnBroadcast(sid)
+    broadcast.query_committed = True
+    broadcast.runtime_client = SteeringClient()
+    chat._active_turns[sid] = broadcast
+    try:
+        response = await chat.enqueue_api(
+            sid,
+            chat.QueueEnqueueReq(
+                text="adjust this task",
+                delivery="adjust",
+                active_turn_id=broadcast.turn_id,
+            ),
+            chat.BackgroundTasks(),
+        )
+
+        assert response["effective_delivery"] == "adjust"
+        assert response["delivery_status"] == "waiting_tool"
+        item = response["queue"]["items"][0]
+        assert item["delivery"] == "adjust"
+        assert item["target_turn_id"] == broadcast.turn_id
+        assert item["steering_state"] == "waiting_tool"
+        assert writes == [(
+            "adjust this task", sid, item["command_uuid"],
+        )]
+        assert broadcast.steering_commands[item["command_uuid"]] == {
+            "item_id": item["id"],
+            "state": "waiting_tool",
+        }
+
+        await chat._settle_steering_lifecycle(
+            broadcast,
+            chat.CommandLifecycleMessage(
+                command_uuid=item["command_uuid"],
+                state="queued",
+                session_id=sid,
+                uuid="life-queued",
+            ),
+        )
+        assert sess.get_queue(sid)["items"][0]["steering_state"] == "queued"
+
+        terminal = await chat._settle_steering_lifecycle(
+            broadcast,
+            chat.CommandLifecycleMessage(
+                command_uuid=item["command_uuid"],
+                state="completed",
+                session_id=sid,
+                uuid="life-completed",
+            ),
+        )
+        assert terminal is True
+        assert sess.get_queue(sid)["items"] == []
+        assert broadcast.steering_commands == {}
+    finally:
+        chat._active_turns.pop(sid, None)
+        broadcast.close()
+
+
+@pytest.mark.asyncio
+async def test_busy_adjust_stale_turn_falls_back_without_native_write(
+    app_module, monkeypatch,
+):
+    from backend import chat
+
+    sess = _sess(app_module)
+    sid = sess.create_session()["id"]
+
+    class SteeringClient:
+        async def query_steering(self, *_args, **_kwargs):
+            raise AssertionError("stale turn must not receive steering")
+
+    monkeypatch.setattr(chat, "MuseLabSDKClient", SteeringClient)
+    successor = chat.TurnBroadcast(sid)
+    successor.query_committed = True
+    successor.runtime_client = SteeringClient()
+    chat._active_turns[sid] = successor
+    try:
+        response = await chat.enqueue_api(
+            sid,
+            chat.QueueEnqueueReq(
+                text="belongs after successor",
+                delivery="adjust",
+                active_turn_id="old-turn-id",
+            ),
+            chat.BackgroundTasks(),
+        )
+        assert response["effective_delivery"] == "queue"
+        assert response["delivery_status"] == "queued"
+        item = sess.get_queue(sid)["items"][0]
+        assert item.get("delivery") == "queue"
+        assert not item.get("command_uuid")
+        assert not successor.steering_commands
+    finally:
+        chat._active_turns.pop(sid, None)
+        successor.close()
+
+
+@pytest.mark.asyncio
+async def test_busy_adjust_write_failure_becomes_claimable_fifo_once(
+    app_module, monkeypatch,
+):
+    from backend import chat
+
+    sess = _sess(app_module)
+    sid = sess.create_session()["id"]
+
+    class FailingSteeringClient:
+        async def query_steering(self, *_args, **_kwargs):
+            raise RuntimeError("transport unavailable")
+
+    monkeypatch.setattr(chat, "MuseLabSDKClient", FailingSteeringClient)
+    broadcast = chat.TurnBroadcast(sid)
+    broadcast.query_committed = True
+    broadcast.runtime_client = FailingSteeringClient()
+    chat._active_turns[sid] = broadcast
+    try:
+        response = await chat.enqueue_api(
+            sid,
+            chat.QueueEnqueueReq(
+                text="safe fallback",
+                delivery="adjust",
+                active_turn_id=broadcast.turn_id,
+            ),
+            chat.BackgroundTasks(),
+        )
+        assert response["effective_delivery"] == "queue"
+        assert response["delivery_status"] == "queued"
+        item = sess.get_queue(sid)["items"][0]
+        assert item["delivery"] == "queue"
+        assert item["steering_state"] == "fallback"
+        assert not item.get("command_uuid")
+        assert broadcast.steering_commands == {}
+    finally:
+        chat._active_turns.pop(sid, None)
+        broadcast.close()
+        drain = chat._queue_drain_tasks.get(sid)
+        if drain is not None:
+            await drain
+
+
+@pytest.mark.asyncio
+async def test_withdraw_adjustment_requires_cli_cancel_receipt(
+    app_module, monkeypatch,
+):
+    from backend import chat
+
+    sess = _sess(app_module)
+    sid = sess.create_session()["id"]
+    cancelled = []
+
+    class SteeringClient:
+        async def query_steering(self, *_args, **_kwargs):
+            return None
+
+        async def cancel_async_message(self, command_uuid):
+            cancelled.append(command_uuid)
+            return True
+
+    monkeypatch.setattr(chat, "MuseLabSDKClient", SteeringClient)
+    broadcast = chat.TurnBroadcast(sid)
+    broadcast.query_committed = True
+    broadcast.runtime_client = SteeringClient()
+    chat._active_turns[sid] = broadcast
+    try:
+        response = await chat.enqueue_api(
+            sid,
+            chat.QueueEnqueueReq(
+                text="withdraw me",
+                delivery="adjust",
+                active_turn_id=broadcast.turn_id,
+            ),
+            chat.BackgroundTasks(),
+        )
+        item = response["queue"]["items"][0]
+        updated = await chat.remove_queue_item_api(sid, item["id"])
+        assert cancelled == [item["command_uuid"]]
+        assert updated["items"] == []
+        assert broadcast.steering_commands == {}
+    finally:
+        chat._active_turns.pop(sid, None)
+        broadcast.close()
+
+
+@pytest.mark.asyncio
+async def test_clear_queue_preserves_adjustment_accepted_after_snapshot(
+    app_module, monkeypatch,
+):
+    from backend import chat
+
+    sess = _sess(app_module)
+    sid = sess.create_session()["id"]
+    cancel_started = asyncio.Event()
+    release_cancel = asyncio.Event()
+    writes = []
+
+    class SteeringClient:
+        async def query_steering(
+            self, prompt, *, session_id, command_uuid,
+        ):
+            writes.append((prompt, session_id, command_uuid))
+
+        async def cancel_async_message(self, _command_uuid):
+            cancel_started.set()
+            await release_cancel.wait()
+            return True
+
+    monkeypatch.setattr(chat, "MuseLabSDKClient", SteeringClient)
+    broadcast = chat.TurnBroadcast(sid)
+    broadcast.query_committed = True
+    broadcast.runtime_client = SteeringClient()
+    chat._active_turns[sid] = broadcast
+    try:
+        first = await chat.enqueue_api(
+            sid,
+            chat.QueueEnqueueReq(
+                text="clear snapshot owner",
+                delivery="adjust",
+                active_turn_id=broadcast.turn_id,
+            ),
+            chat.BackgroundTasks(),
+        )
+        first_item = first["queue"]["items"][0]
+
+        clear_task = asyncio.create_task(chat.clear_queue_api(sid))
+        await asyncio.wait_for(cancel_started.wait(), timeout=1)
+
+        second = await chat.enqueue_api(
+            sid,
+            chat.QueueEnqueueReq(
+                text="accepted after clear snapshot",
+                delivery="adjust",
+                active_turn_id=broadcast.turn_id,
+            ),
+            chat.BackgroundTasks(),
+        )
+        second_item = next(
+            item for item in second["queue"]["items"]
+            if item["text"] == "accepted after clear snapshot"
+        )
+        release_cancel.set()
+        cleared = await asyncio.wait_for(clear_task, timeout=1)
+
+        assert writes == [
+            ("clear snapshot owner", sid, first_item["command_uuid"]),
+            ("accepted after clear snapshot", sid, second_item["command_uuid"]),
+        ]
+        assert [item["id"] for item in cleared["items"]] == [
+            second_item["id"],
+        ]
+        assert [item["id"] for item in sess.get_queue(sid)["items"]] == [
+            second_item["id"],
+        ]
+        assert set(broadcast.steering_commands) == {
+            second_item["command_uuid"],
+        }
+    finally:
+        release_cancel.set()
+        chat._active_turns.pop(sid, None)
+        broadcast.close()
+
+
+@pytest.mark.asyncio
+async def test_turn_error_cancels_unsettled_adjustment_without_trapping_it(
+    app_module, monkeypatch,
+):
+    from backend import chat
+
+    sess = _sess(app_module)
+    sid = sess.create_session()["id"]
+    queued = sess.enqueue_message(
+        sid,
+        "retain after transport failure",
+        delivery="adjust",
+        target_turn_id="turn-that-failed",
+        command_uuid="command-that-lost-terminal",
+        steering_state="started",
+    )["item"]
+    broadcast = chat.TurnBroadcast(sid)
+    broadcast.steering_commands["command-that-lost-terminal"] = {
+        "item_id": queued["id"],
+        "state": "started",
+    }
+    write_finished = asyncio.Event()
+    broadcast.steering_write_events[
+        "command-that-lost-terminal"
+    ] = write_finished
+    published = []
+    monkeypatch.setattr(broadcast, "publish", published.append)
+    try:
+        await chat._cancel_outstanding_steering_commands(broadcast)
+
+        assert broadcast.steering_commands == {}
+        assert broadcast.steering_write_events == {}
+        assert write_finished.is_set()
+        recovered = sess.get_queue(sid)
+        assert recovered["paused"] is True
+        assert recovered["items"][0]["steering_state"] == "cancelled"
+        assert published and published[-1]["event"] == "queue_steering"
+
+        # The row is no longer an unclaimable active adjustment. An explicit
+        # Resume can retry it as an ordinary turn; Delete/Clear can also remove
+        # it without a nonexistent live CLI cancellation receipt.
+        sess.set_queue_paused(sid, False)
+        assert sess.claim_queue_message(sid)["id"] == queued["id"]
+    finally:
+        broadcast.close()
+
+
+@pytest.mark.asyncio
+async def test_terminal_cleanup_closes_new_steering_admission_before_await(
+    app_module, monkeypatch,
+):
+    from backend import chat
+
+    sess = _sess(app_module)
+    sid = sess.create_session()["id"]
+    old = sess.enqueue_message(
+        sid,
+        "old accepted adjustment",
+        delivery="adjust",
+        target_turn_id="turn-terminal-cleanup",
+        command_uuid="command-terminal-cleanup",
+        steering_state="started",
+    )["item"]
+    persist_entered = threading.Event()
+    release_persist = threading.Event()
+    native_writes = []
+
+    class SteeringClient:
+        async def query_steering(self, prompt, **_kwargs):
+            native_writes.append(prompt)
+
+    monkeypatch.setattr(chat, "MuseLabSDKClient", SteeringClient)
+    broadcast = chat.TurnBroadcast(sid)
+    broadcast.query_committed = True
+    broadcast.runtime_client = SteeringClient()
+    broadcast.steering_commands["command-terminal-cleanup"] = {
+        "item_id": old["id"],
+        "state": "started",
+    }
+    chat._active_turns[sid] = broadcast
+    real_update = sess.update_queue_steering_state
+
+    def blocked_update(*args, **kwargs):
+        persist_entered.set()
+        assert release_persist.wait(1)
+        return real_update(*args, **kwargs)
+
+    monkeypatch.setattr(sess, "update_queue_steering_state", blocked_update)
+    cleanup = None
+    try:
+        cleanup = asyncio.create_task(
+            chat._cancel_outstanding_steering_commands(broadcast)
+        )
+        assert await asyncio.to_thread(persist_entered.wait, 1)
+        assert broadcast.steering_closed is True
+
+        response = await chat.enqueue_api(
+            sid,
+            chat.QueueEnqueueReq(
+                text="arrived during terminal cleanup",
+                delivery="adjust",
+                active_turn_id=broadcast.turn_id,
+            ),
+            chat.BackgroundTasks(),
+        )
+        assert response["effective_delivery"] == "queue"
+        assert native_writes == []
+        queued = next(
+            item for item in sess.get_queue(sid)["items"]
+            if item["text"] == "arrived during terminal cleanup"
+        )
+        assert queued.get("delivery") == "queue"
+        assert not queued.get("command_uuid")
+
+        release_persist.set()
+        await asyncio.wait_for(cleanup, timeout=1)
+        assert broadcast.steering_commands == {}
+    finally:
+        release_persist.set()
+        if cleanup is not None and not cleanup.done():
+            cleanup.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await cleanup
+        chat._active_turns.pop(sid, None)
+        broadcast.close()
+
+
+@pytest.mark.asyncio
+async def test_terminal_cleanup_closes_admission_with_empty_command_map(
+    app_module, monkeypatch,
+):
+    from backend import chat
+
+    sess = _sess(app_module)
+    sid = sess.create_session()["id"]
+    native_writes = []
+
+    class SteeringClient:
+        async def query_steering(self, prompt, **_kwargs):
+            native_writes.append(prompt)
+
+    monkeypatch.setattr(chat, "MuseLabSDKClient", SteeringClient)
+    monkeypatch.setattr(chat, "_schedule_queue_drain", lambda _sid: None)
+    broadcast = chat.TurnBroadcast(sid)
+    broadcast.query_committed = True
+    broadcast.runtime_client = SteeringClient()
+    chat._active_turns[sid] = broadcast
+    try:
+        # Terminal finalization invokes this helper unconditionally, including
+        # the zero-map case. It must close admission synchronously even though
+        # there is no durable command to settle.
+        await chat._cancel_outstanding_steering_commands(broadcast)
+        assert broadcast.steering_closed is True
+
+        response = await chat.enqueue_api(
+            sid,
+            chat.QueueEnqueueReq(
+                text="arrived after empty-map terminal gate",
+                delivery="adjust",
+                active_turn_id=broadcast.turn_id,
+            ),
+            chat.BackgroundTasks(),
+        )
+        assert response["effective_delivery"] == "queue"
+        assert native_writes == []
+    finally:
+        chat._active_turns.pop(sid, None)
+        broadcast.close()
+
+
+@pytest.mark.asyncio
+async def test_result_write_barrier_includes_writer_registered_while_waiting(
+    app_module,
+):
+    from backend import chat
+
+    broadcast = chat.TurnBroadcast("s-result-write-barrier")
+    first = asyncio.Event()
+    second = asyncio.Event()
+    broadcast.steering_write_events["first"] = first
+    try:
+        barrier = asyncio.create_task(
+            chat._await_steering_write_stability(
+                broadcast, timeout_s=1,
+            )
+        )
+        await asyncio.sleep(0)
+
+        # This is the critical interleaving: Result already awaits the first
+        # HTTP write when a second busy-send request registers its own writer.
+        broadcast.steering_write_events["second"] = second
+        first.set()
+        await asyncio.sleep(0)
+        assert barrier.done() is False
+
+        second.set()
+        assert await asyncio.wait_for(barrier, timeout=1) is True
+    finally:
+        first.set()
+        second.set()
+        broadcast.close()
+
+
+@pytest.mark.asyncio
 async def test_concurrent_drain_kicks_serialize_dequeue_and_preserve_fifo(
     app_module, monkeypatch,
 ):

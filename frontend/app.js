@@ -313,6 +313,7 @@ function _pruneChatResourceTicketCache(now) {
 const CHAT_MUX_STREAM_EVENTS = [
   "startup", "text", "thinking", "tool_use", "tool_result",
   "compact_progress", "task_started", "task_progress", "task_notification",
+  "queue_steering",
   "rate_limit", "ask_user_question", "permission_request",
   "permission_request_resolved", "permission_mode_changed",
   "permission_mode_change_failed", "ping", "done", "error", "cancelled",
@@ -908,6 +909,10 @@ function portal() {
     // Configured default for NEW sessions. Kept separate from `permission`,
     // which always mirrors the currently viewed session.
     defaultPermission: "bypassPermissions",
+    // Global busy-send preference. New clients ask the backend to steer the
+    // active turn at its next safe tool boundary; the backend may downgrade an
+    // ineligible prompt (attachments, stale/missing turn id) to durable FIFO.
+    busySendMode: "adjust",
     permission: "bypassPermissions",
     // Mobile-only: collapses the per-session settings (permission / effort)
     // behind a gear in the composer toolbar so the row stays single-line on
@@ -1169,7 +1174,7 @@ function portal() {
       show: false,
       providers: [],
       draftKeys: {},
-      draftDefaults: { model: "", permission: "" },
+      draftDefaults: { model: "", permission: "", busy_send_mode: "adjust" },
       // (Removed 2026-05-28) draftParams — used to carry notify_scheduled /
       // notify_normal server-side toggles. Subscription state is now the
       // sole on/off; see `notifyEnabled` at the top of this object.
@@ -6440,6 +6445,7 @@ function portal() {
         schema: 10,         // v10 moves openTabIds to a versioned standalone key
         model: this.model, defaultModel: this.defaultModel,
         permission: this.permission, defaultPermission: this.defaultPermission,
+        busySendMode: this.busySendMode,
         currentId: this.currentId,
         previewTabs: this.tabs.map(t => this._previewTabSnapshot(t)),
         previewSelected: this.selected,
@@ -6500,6 +6506,9 @@ function portal() {
         // The server-authoritative value arrives next via fetchStats() regardless,
         // so leaving defaultPermission untouched when absent is correct & safe.
         if (p.defaultPermission) this.defaultPermission = p.defaultPermission;
+        if (p.busySendMode) {
+          this.busySendMode = this._normalizeBusySendMode(p.busySendMode);
+        }
         if (typeof p.activeWorkspace === "string") this.activeWorkspace = p.activeWorkspace;
         if (p.workspaceLastSession && typeof p.workspaceLastSession === "object"
             && !Array.isArray(p.workspaceLastSession)) {
@@ -6620,6 +6629,10 @@ function portal() {
             if (d.default_model) { this.defaultModel = d.default_model; this.savePrefs(); }
             if (d.default_permission) {
               this.defaultPermission = d.default_permission;
+              this.savePrefs();
+            }
+            if (d.busy_send_mode) {
+              this.busySendMode = this._normalizeBusySendMode(d.busy_send_mode);
               this.savePrefs();
             }
             this._ensureValidModel();
@@ -7190,6 +7203,10 @@ function portal() {
         "bypassPermissions", "acceptEdits", "default",
         "dontAsk", "auto", "plan",
       ].includes(mode) ? mode : fallback;
+    },
+    _normalizeBusySendMode(value, fallback = "adjust") {
+      const mode = String(value || "");
+      return mode === "adjust" || mode === "queue" ? mode : fallback;
     },
     _sessionPermissionMode(sid) {
       if (!sid) {
@@ -8374,7 +8391,10 @@ function portal() {
       if (this.composerClaimed(sid)) return this.t("btn.send");
       const disabled = this.composerDisabledReason(sid);
       if (disabled) return disabled;
-      return this._isBusy(sid) ? this.t("queue.button_hint") : this.t("btn.send");
+      if (!this._isBusy(sid)) return this.t("btn.send");
+      return this._normalizeBusySendMode(this.busySendMode) === "adjust"
+        ? (this.lang === "zh" ? "尽快调整当前任务" : "Adjust the current task soon")
+        : this.t("queue.button_hint");
     },
     _setComposerClaimPhase(st, token, phase) {
       if (st && st._composerSubmitToken === token) {
@@ -8518,6 +8538,47 @@ function portal() {
     // read-only mirror in st.pendingQueue + st._queuePaused for rendering and
     // refreshes it via _syncQueueFromServer on load / tab-activate / after any
     // turn or mutation. Every mutation below hits an endpoint then re-syncs.
+    queueDeliveryLabel(item) {
+      const state = String(item && item.deliveryStatus || "");
+      const delivery = this._normalizeBusySendMode(
+        item && item.delivery,
+        "queue",
+      );
+      if (delivery !== "adjust" || state === "fallback"
+          || state === "cancelled") {
+        return this.lang === "zh" ? "排队中" : "Queued";
+      }
+      if (state === "started") {
+        return this.lang === "zh" ? "已交给当前任务" : "Handed to current task";
+      }
+      return this.lang === "zh"
+        ? "等待当前工具完成" : "Waiting for current tool";
+    },
+    _applyQueueSteeringEvent(sid, payload) {
+      const st = sid && this.tabState[sid];
+      const itemId = String(payload && payload.item_id || "");
+      const state = String(payload && payload.state || "");
+      if (!st || !itemId || !state) return;
+      if (state === "completed") {
+        st.pendingQueue = (st.pendingQueue || []).filter(q => q.id !== itemId);
+        return;
+      }
+      const item = (st.pendingQueue || []).find(q => q.id === itemId);
+      if (!item) {
+        this._syncQueueFromServer(sid);
+        return;
+      }
+      item.delivery = this._normalizeBusySendMode(
+        payload.effective_delivery || item.delivery,
+        "queue",
+      );
+      item.deliveryStatus = state;
+      if (state === "fallback") item.delivery = "queue";
+      if (state === "cancelled") st._queuePaused = true;
+      // Replace the array so Alpine updates the status text immediately even
+      // when the item object originated from the POST acceptance mirror.
+      st.pendingQueue = [...st.pendingQueue];
+    },
     async _syncQueueFromServer(sid, options = {}) {
       if (!sid) return;
       const st = this._ensureTabState(sid);
@@ -8573,6 +8634,9 @@ function portal() {
           expiredCount,
           pendingImages: [],
           pendingDocs: [],
+          delivery: this._normalizeBusySendMode(it.delivery, "queue"),
+          deliveryStatus: String(it.steering_state
+            || (it.delivery === "adjust" ? "pending" : "queued")),
           enqueuedAt: it.enqueued_at || Date.now(),
         };
       });
@@ -8647,6 +8711,10 @@ function portal() {
             "",
           )
         : "";
+      const delivery = this._normalizeBusySendMode(
+        item.delivery || this.busySendMode,
+      );
+      const activeTurnId = String(item.active_turn_id || "");
       let accepted = null;
       try {
         const r = await fetch("/api/chat/sessions/" + sid + "/queue", {
@@ -8659,7 +8727,9 @@ function portal() {
                                  display_text: item.displayText || "",
                                  selection_quotes: item.pendingQuotes || [],
                                  permission,
-                                 plan_return_permission: planReturnPermission }),
+                                 plan_return_permission: planReturnPermission,
+                                 delivery,
+                                 active_turn_id: activeTurnId }),
         });
         if (r.status === 409) {
           this.toast(this.lang === "zh"
@@ -8690,10 +8760,29 @@ function portal() {
       const mirrorState = successor && successor._handoffSourceSid === sid
         ? successor : (this.tabState[sid] === enqueueState ? enqueueState : null);
       const mirrorSid = mirrorState === successor ? successorSid : sid;
+      // Steering lifecycle can complete before the HTTP continuation resumes.
+      // In that race `accepted.item` may be the earlier waiting snapshot while
+      // `accepted.queue.items` already proves it was removed (or cancelled).
+      // Prefer the authoritative queue snapshot whenever the backend supplied it
+      // so a completed adjustment never flashes back as a queued row.
+      const acceptedQueueItems = accepted && accepted.queue
+        && Array.isArray(accepted.queue.items) ? accepted.queue.items : null;
+      const acceptedQueueItem = acceptedQueueItems && accepted.item
+        ? acceptedQueueItems.find(q => q.id === accepted.item.id) : null;
+      const acceptedItem = acceptedQueueItems === null
+        ? (accepted && accepted.item) : acceptedQueueItem;
       if (mirrorState
-          && accepted && accepted.item && accepted.item.id
-          && !mirrorState.pendingQueue.some(q => q.id === accepted.item.id)) {
-        const queued = accepted.item;
+          && acceptedItem && acceptedItem.id
+          && !mirrorState.pendingQueue.some(q => q.id === acceptedItem.id)) {
+        const queued = acceptedItem;
+        const effectiveDelivery = this._normalizeBusySendMode(
+          queued.delivery || accepted.effective_delivery,
+          "queue",
+        );
+        const deliveryStatus = String(
+          queued.steering_state || accepted.delivery_status
+          || (effectiveDelivery === "adjust" ? "pending" : "queued"),
+        );
         const optimisticImages = (item.pendingImages || [])
           .filter(im => im.id && !im.error)
           .map(im => ({
@@ -8725,14 +8814,17 @@ function portal() {
             expiredCount: 0,
             pendingImages: [],
             pendingDocs: [],
+            delivery: effectiveDelivery,
+            deliveryStatus,
             enqueuedAt: queued.enqueued_at || Date.now(),
           },
         ];
-        const acceptedRevision = Number(accepted.queue && accepted.queue.revision);
-        if (Number.isFinite(acceptedRevision)) {
-          mirrorState._queueRevision = Math.max(
-            Number(mirrorState._queueRevision) || 0, acceptedRevision);
-        }
+      }
+      const acceptedRevision = Number(accepted && accepted.queue
+        && accepted.queue.revision);
+      if (mirrorState && Number.isFinite(acceptedRevision)) {
+        mirrorState._queueRevision = Math.max(
+          Number(mirrorState._queueRevision) || 0, acceptedRevision);
       }
       if (mirrorState === successor) {
         // The handoff's first attach probe may have observed the child before
@@ -17638,9 +17730,18 @@ function portal() {
         d.providers.map(p => [p.id, this._draftFromProvider(p)])
       );
       this.settings.providerNew = { show: false, base_url: "", prefix: "", models: "", api_key: "" };
-      this.settings.draftDefaults = { ...d.defaults };
+      this.settings.draftDefaults = {
+        ...d.defaults,
+        busy_send_mode: this._normalizeBusySendMode(
+          d.defaults && d.defaults.busy_send_mode,
+        ),
+      };
       if (d.defaults && d.defaults.permission) {
         this.defaultPermission = d.defaults.permission;
+        this.savePrefs();
+      }
+      if (d.defaults && d.defaults.busy_send_mode) {
+        this.busySendMode = this._normalizeBusySendMode(d.defaults.busy_send_mode);
         this.savePrefs();
       }
       // `d.params` is empty since 2026-05-28 (kept as {} for FE back-compat).
@@ -18768,6 +18869,10 @@ function portal() {
             this.defaultPermission = d.default_permission;
             this.savePrefs();
           }
+          if (d.busy_send_mode) {
+            this.busySendMode = this._normalizeBusySendMode(d.busy_send_mode);
+            this.savePrefs();
+          }
           this._ensureValidModel();
         }
       } catch (e) {
@@ -19017,6 +19122,9 @@ function portal() {
       const body = {
         default_model: this.settings.draftDefaults.model,
         default_permission: this.settings.draftDefaults.permission,
+        busy_send_mode: this._normalizeBusySendMode(
+          this.settings.draftDefaults.busy_send_mode,
+        ),
       };
       // Send every typed provider key through the generic provider_keys
       // map. Backend whitelists against PROVIDER_KEYS (derived from
@@ -19073,6 +19181,13 @@ function portal() {
         const newDefaultPerm = this.settings.draftDefaults.permission;
         if (newDefaultPerm && newDefaultPerm !== this.defaultPermission) {
           this.defaultPermission = newDefaultPerm;
+          this.savePrefs();
+        }
+        const newBusySendMode = this._normalizeBusySendMode(
+          this.settings.draftDefaults.busy_send_mode,
+        );
+        if (newBusySendMode !== this.busySendMode) {
+          this.busySendMode = newBusySendMode;
           this.savePrefs();
         }
         // 刷新可用 provider 列表
@@ -29124,6 +29239,12 @@ function portal() {
       const expectedTurnId = isReconnect
         ? (opts.turnId || sendState.activeTurnId || "")
         : "";
+      // Preserve the exact turn that was active when the user pressed Send.
+      // The direct-turn path clears activeTurnId below while it attempts fresh
+      // admission; busy delivery still needs the old immutable id so the
+      // backend can reject stale steering rather than targeting a successor.
+      const busyActiveTurnId = !isReconnect
+        ? String(sendState.activeTurnId || "") : "";
       // Resume only when this pane still owns the exact same immutable turn.
       // A cold reload or ABA turn change has no trustworthy checkpoint and uses
       // the full replay path (sequence zero). Mid-turn transport reconnects keep
@@ -29245,7 +29366,7 @@ function portal() {
           // owns a turn or a queue slot.  Keep pane-level Running hidden until
           // admission is authoritative.
           _admissionPending: true,
-          _optimisticQueue: false,
+          _optimisticQueue: !resumed && this._isBusy(sendSid),
           displayText: hasDetachedText ? detachedDisplayText : composerInput,
           selectionQuotes: composerQuotes.map(q => ({ ...q })),
           images: readyImages.map(im => ({
@@ -29305,6 +29426,7 @@ function portal() {
           pendingQuotes: composerQuotes,
           permission: sendPermission,
           plan_return_permission: sendPlanReturnPermission,
+          active_turn_id: busyActiveTurnId,
         });
         if (!ok) {
           rollbackOptimisticSubmission();
@@ -29548,6 +29670,7 @@ function portal() {
                   pendingQuotes: hasDetachedText ? [] : composerQuotes,
                   permission: sendPermission,
                   plan_return_permission: sendPlanReturnPermission,
+                  active_turn_id: busyActiveTurnId,
                 });
                 if (queued) {
                   rollbackUnstartedSend(false);
@@ -30223,6 +30346,11 @@ function portal() {
         // completion feedback is the durable Agent continuation bubble; its
         // revision adoption owns the off-screen unread dot exactly once.
         _scrollIfActive();
+      });
+      es.addEventListener("queue_steering", ev => {
+        let payload = {};
+        try { payload = JSON.parse(ev.data) || {}; } catch (_) {}
+        this._applyQueueSteeringEvent(streamSid, payload);
       });
       es.addEventListener("rate_limit", ev => {
         let d;
@@ -30995,6 +31123,10 @@ function portal() {
             pendingQuotes: hasDetachedText ? [] : composerQuotes,
             permission: sendPermission,
             plan_return_permission: sendPlanReturnPermission,
+            active_turn_id: String(
+              errorMeta.active_turn_id || errorMeta.turn_id
+              || busyActiveTurnId || "",
+            ),
           });
           if (queued) {
             if (sentUserBubble) {
