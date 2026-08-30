@@ -247,7 +247,10 @@ def test_send_to_all_records_non_fatal_error(push_mod):
             super().__init__(msg)
             self.response = response
 
+    seen = {}
+
     def _fake_webpush(**kwargs):
+        seen.update(kwargs)
         raise _FakeWebPushException("server error", response=_FakeResp())
 
     class _FakeVapid:
@@ -264,6 +267,40 @@ def test_send_to_all_records_non_fatal_error(push_mod):
     assert res["dropped"] == 0
     assert len(res["errors"]) == 1
     assert "500" in res["errors"][0]
+    assert seen["timeout"] == push_mod._PUSH_HTTP_TIMEOUT_S
+    assert 0 < seen["timeout"] <= 15
     # Sub retained for the next attempt.
     assert any(s["endpoint"] == "https://flaky.example.com/x"
                for s in push_mod.list_subscriptions())
+
+
+def test_send_to_all_redacts_endpoint_and_proxy_details(
+        push_mod, capsys):
+    """Push logs/results must not expose opaque subscription device tokens."""
+    endpoint = "https://push.example.com/private-device-token"
+    push_mod.add_subscription(_sub_body(endpoint=endpoint))
+
+    import unittest.mock as mock
+
+    import py_vapid
+    import pywebpush
+
+    class _FakeVapid:
+        @staticmethod
+        def from_pem(pem):
+            return object()
+
+    def _fake_webpush(**kwargs):
+        raise ConnectionError(
+            f"proxy failed while posting {endpoint}?auth=private-auth-token")
+
+    with mock.patch.object(pywebpush, "webpush", _fake_webpush), \
+         mock.patch.object(py_vapid, "Vapid", _FakeVapid):
+        res = push_mod.send_to_all(
+            title="t", body="b", context="privacy-regression")
+
+    diagnostics = capsys.readouterr().err
+    assert res["errors"] == ["ConnectionError"]
+    assert endpoint not in diagnostics
+    assert "private-auth-token" not in diagnostics
+    assert "ConnectionError" in diagnostics

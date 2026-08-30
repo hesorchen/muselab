@@ -8,6 +8,7 @@ regression classes that static lint cannot see.
 from __future__ import annotations
 
 import json
+import re
 import time
 from urllib.parse import parse_qs, unquote, urlparse
 
@@ -576,6 +577,217 @@ def test_mux_inactive_retires_matching_turn_without_harming_successor(
         "activeTurnId": "turn-b",
         "reloads": 1,
         "metaActive": True,
+    }
+    _assert_no_browser_errors(page, errors)
+
+
+def test_terminal_turn_cannot_be_reattached_by_stale_active_state(
+    page: Page, backend_url, auth_token,
+):
+    """A completed immutable turn stays completed while postlude state lags."""
+    errors = _capture_browser_errors(page)
+    _install_fake_mux_event_source(page)
+    page.route(
+        "**/api/chat/stream/mux/start",
+        lambda route: route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({"ticket": "mux-stale-terminal"}),
+        ),
+    )
+    _login(page, backend_url, auth_token)
+    page.wait_for_function("window.__fakeMuxStreams().length === 1")
+
+    result = page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const sid = app.currentId;
+          const st = app._ensureTabState(sid);
+          const originals = {
+            send: app.send,
+            fetch: app._fetchWithDeadline,
+            queue: app._syncQueueFromServer,
+            resume: app._resumePendingCanonicalSync,
+            bgPoller: app._ensureBgContPoller,
+          };
+          const sends = [];
+          let resumes = 0;
+          let probePayload = {
+            active: true, attachable: true, background: false,
+            continuation: false, turn_id: 'turn-completed',
+            started_at: Math.floor(Date.now() / 1000),
+          };
+          try {
+            st._loaded = true;
+            st.messages = [{ role: 'assistant', text: 'VISIBLE_DONE_REPLY' }];
+            st.streaming = false;
+            st.es = null;
+            st.activeTurnId = '';
+            st._lastTerminalTurnId = 'turn-completed';
+            app.sessions = app.sessions.map(session => session.id === sid
+              ? {...session, active: false, turn_active: false,
+                  background_active: false}
+              : session);
+            app.send = async options => { sends.push(options); return true; };
+            app._syncQueueFromServer = () => Promise.resolve(true);
+            app._resumePendingCanonicalSync = () => { resumes += 1; };
+            app._ensureBgContPoller = () => {};
+            app._fetchWithDeadline = async () => new Response(
+              JSON.stringify(probePayload),
+              {status: 200, headers: {'Content-Type': 'application/json'}},
+            );
+
+            const probeResult = await app._probeActiveTurn(sid, st);
+            window.__emitMux('session_state', {
+              session_id: sid, active: true, attachable: true,
+              background: false, continuation: false,
+              turn_id: 'turn-completed',
+              started_at: Math.floor(Date.now() / 1000),
+            });
+            await new Promise(resolve => setTimeout(resolve, 30));
+            const afterStale = {
+              probeResult,
+              sends: sends.length,
+              resumes,
+              streaming: st.streaming,
+              hasEs: !!st.es,
+              activeTurnId: st.activeTurnId,
+              text: st.messages[0] && st.messages[0].text,
+              metaActive: !!app.sessions.find(session => session.id === sid)?.active,
+            };
+
+            // The main Result can legitimately leave SDK background tasks
+            // attached to the same origin turn id. That background-only busy
+            // state remains visible and must not be mistaken for stale foreground.
+            probePayload = {
+              active: true, attachable: false, background: true,
+              continuation: false, turn_id: 'turn-completed',
+              started_at: Math.floor(Date.now() / 1000),
+              background_tasks_pending: 1,
+            };
+            await app._probeActiveTurn(sid, st);
+            window.__emitMux('session_state', {
+              session_id: sid, active: true, attachable: false,
+              background: true, continuation: false,
+              turn_id: 'turn-completed',
+              started_at: Math.floor(Date.now() / 1000),
+              background_tasks_pending: 1,
+            });
+            await new Promise(resolve => setTimeout(resolve, 30));
+            const backgroundAccepted = {
+              sends: sends.length,
+              backgroundActive: st.backgroundActive,
+              backgroundTaskCount: st.backgroundTaskCount,
+              activeTurnId: st.activeTurnId,
+              metaActive: !!app.sessions.find(session => session.id === sid)?.active,
+            };
+
+            // The foreground broadcast can linger during its postlude while
+            // background tasks already exist. Suppress only its stale reattach;
+            // retain the legitimate background busy state and task count.
+            probePayload = {
+              active: true, attachable: true, background: false,
+              continuation: false, turn_id: 'turn-completed',
+              started_at: Math.floor(Date.now() / 1000),
+              background_tasks_pending: 1,
+            };
+            await app._probeActiveTurn(sid, st);
+            window.__emitMux('session_state', probePayload);
+            await new Promise(resolve => setTimeout(resolve, 30));
+            const backgroundSurvivesPostlude = {
+              sends: sends.length,
+              backgroundActive: st.backgroundActive,
+              backgroundTaskCount: st.backgroundTaskCount,
+              metaBackground: !!app.sessions.find(
+                session => session.id === sid)?.background_active,
+            };
+
+            window.__emitMux('session_state', {
+              session_id: sid, active: true, attachable: true,
+              background: false, continuation: false, turn_id: 'turn-successor',
+              started_at: Math.floor(Date.now() / 1000),
+            });
+            for (let i = 0; i < 50 && sends.length < 1; i++) {
+              await new Promise(resolve => setTimeout(resolve, 10));
+            }
+            st.streaming = true;
+            st.activeTurnId = 'turn-successor';
+            st.es = app._chatMuxChannel(sid, 'turn-successor');
+            app._activateChatMuxChannel(st.es);
+            const successorEs = st.es;
+            probePayload = {
+              active: true, attachable: true, background: false,
+              continuation: false, turn_id: 'turn-completed',
+              started_at: Math.floor(Date.now() / 1000),
+            };
+            await app._probeActiveTurn(sid, st);
+            window.__emitMux('session_state', {
+              session_id: sid, active: true, attachable: true,
+              background: false, continuation: false,
+              turn_id: 'turn-completed',
+              started_at: Math.floor(Date.now() / 1000),
+            });
+            await new Promise(resolve => setTimeout(resolve, 30));
+            const successorPreserved = {
+              streaming: st.streaming,
+              sameEs: st.es === successorEs,
+              activeTurnId: st.activeTurnId,
+              sends: sends.length,
+            };
+            if (st.es) st.es.close();
+            st.es = null;
+            st.streaming = false;
+            return {
+              afterStale,
+              backgroundAccepted,
+              backgroundSurvivesPostlude,
+              successorPreserved,
+              successorSends: sends.length,
+              successorTurnId: sends[0] && sends[0].turnId,
+              successorMuxAttach: !!(sends[0] && sends[0]._muxAttach),
+            };
+          } finally {
+            app.send = originals.send;
+            app._fetchWithDeadline = originals.fetch;
+            app._syncQueueFromServer = originals.queue;
+            app._resumePendingCanonicalSync = originals.resume;
+            app._ensureBgContPoller = originals.bgPoller;
+          }
+        }"""
+    )
+    assert result == {
+        "afterStale": {
+            "probeResult": False,
+            "sends": 0,
+            "resumes": 2,
+            "streaming": False,
+            "hasEs": False,
+            "activeTurnId": "",
+            "text": "VISIBLE_DONE_REPLY",
+            "metaActive": False,
+        },
+        "backgroundAccepted": {
+            "sends": 0,
+            "backgroundActive": True,
+            "backgroundTaskCount": 1,
+            "activeTurnId": "turn-completed",
+            "metaActive": True,
+        },
+        "backgroundSurvivesPostlude": {
+            "sends": 0,
+            "backgroundActive": True,
+            "backgroundTaskCount": 1,
+            "metaBackground": True,
+        },
+        "successorPreserved": {
+            "streaming": True,
+            "sameEs": True,
+            "activeTurnId": "turn-successor",
+            "sends": 1,
+        },
+        "successorSends": 1,
+        "successorTurnId": "turn-successor",
+        "successorMuxAttach": True,
     }
     _assert_no_browser_errors(page, errors)
 
@@ -3650,6 +3862,73 @@ def test_message_outline_traps_focus_and_supports_keyboard_selection(
     expect(opener).to_be_focused()
     assert page.evaluate("() => window.__outlineKeyboardSelection") == "outline-second"
     assert len(requests) == 1
+    _assert_no_browser_errors(page, errors)
+
+
+@pytest.mark.parametrize("viewport", [
+    {"width": 738, "height": 828},
+    {"width": 390, "height": 844},
+])
+def test_queued_message_avoids_visible_tail_navigation_fabs(
+    page: Page, backend_url, auth_token, viewport,
+):
+    """Queue edit/remove controls stay clear of the three tail FABs."""
+    page.set_viewport_size(viewport)
+    errors = _capture_browser_errors(page)
+    _login(page, backend_url, auth_token)
+    _app_eval(
+        page,
+        """
+        const st = app._ensureTabState(app.currentId);
+        st.pendingQueue.splice(0, st.pendingQueue.length, {
+          id: "q-tail-nav-overlap",
+          text: "queued message",
+          displayText: "queued message",
+          pendingQuotes: [], images: [], docs: [],
+        });
+        st.atBottom = false;
+        """,
+    )
+
+    queued = page.locator(".queued-row:visible")
+    expect(queued).to_be_visible()
+    expect(queued).to_have_class(re.compile(r"\bavoids-tail-nav\b"))
+    for selector in (
+        ".jump-bottom:visible",
+        ".chat-outline-fab:visible",
+        ".chat-prevuser-fab:visible",
+    ):
+        expect(page.locator(selector)).to_be_visible()
+
+    geometry = queued.locator(".queued-bubble").evaluate(
+        """bubble => {
+          const bubbleRect = bubble.getBoundingClientRect();
+          const selectors = ['.jump-bottom', '.chat-outline-fab', '.chat-prevuser-fab'];
+          return selectors.map(selector => {
+            const node = Array.from(document.querySelectorAll(selector))
+              .find(el => el.getClientRects().length);
+            const rect = node.getBoundingClientRect();
+            const overlaps = !(
+              bubbleRect.right <= rect.left || bubbleRect.left >= rect.right
+              || bubbleRect.bottom <= rect.top || bubbleRect.top >= rect.bottom
+            );
+            return {selector, overlaps};
+          });
+        }"""
+    )
+    assert not any(item["overlaps"] for item in geometry), geometry
+
+    _app_eval(
+        page,
+        """
+        const st = app._ensureTabState(app.currentId);
+        st.atBottom = true;
+        if (st.messageRange) {
+          st.messageRange.total = st.messageRange.offset + st.messages.length;
+        }
+        """,
+    )
+    expect(queued).not_to_have_class(re.compile(r"\bavoids-tail-nav\b"))
     _assert_no_browser_errors(page, errors)
 
 

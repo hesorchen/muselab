@@ -3015,7 +3015,8 @@
                + dashed border distinguishes them from real user bubbles. -->
           <template x-for="(q, qi) in activeSession.pendingQueue" :key="q.id">
             <div class="msg user queued">
-              <div class="msg-row queued-row">
+              <div class="msg-row queued-row"
+                   :class="{ 'avoids-tail-nav': isAwayFromLatest() }">
                 <div class="bubble user-bubble queued-bubble">
                   <div class="queued-header">
                     <span class="queued-icon"><svg><use href="#i-clock"/></svg></span>

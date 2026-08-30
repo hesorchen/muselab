@@ -4972,6 +4972,66 @@ def _ok_turn(sid):
     ]
 
 
+@pytest.mark.asyncio
+async def test_turn_done_push_cannot_hold_active_slot_or_queue_rollover(
+        stream_env, client, monkeypatch):
+    """A dead Web Push endpoint must not extend the completed chat turn."""
+    chat_mod = stream_env
+    sid = _make_session(client)
+    fake = _FakeStreamClient(_ok_turn(sid))
+    push_entered = threading.Event()
+    push_release = threading.Event()
+    drain_triggered = asyncio.Event()
+
+    async def fake_get_client(*_args, **_kwargs):
+        return fake
+
+    def blocked_push(**_kwargs):
+        push_entered.set()
+        assert push_release.wait(timeout=5)
+        return {"sent": 0, "dropped": 0, "errors": ["timeout"]}
+
+    async def fake_maybe_drain_queue(drained_sid):
+        assert drained_sid == sid
+        drain_triggered.set()
+
+    from backend import presence, push
+    monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
+    monkeypatch.setattr(presence, "recently_active", lambda: False)
+    monkeypatch.setattr(push, "send_to_all", blocked_push)
+    monkeypatch.setattr(chat_mod, "_maybe_drain_queue", fake_maybe_drain_queue)
+    before_tasks = set(chat_mod._maintenance_tasks)
+
+    async def wait_finished():
+        while not (
+            broadcast.done
+            and sid not in chat_mod._active_turns
+            and drain_triggered.is_set()
+        ):
+            await asyncio.sleep(0.01)
+
+    try:
+        broadcast = await chat_mod._start_turn(
+            sid, "finish independently of push",
+            model="claude-sonnet-4-6",
+        )
+        await asyncio.wait_for(
+            asyncio.to_thread(push_entered.wait, 3), timeout=4)
+        await asyncio.wait_for(wait_finished(), timeout=3)
+
+        assert sid not in chat_mod._active_turns
+        assert drain_triggered.is_set()
+        assert broadcast.canonical_terminal_published is True
+        push_tasks = set(chat_mod._maintenance_tasks) - before_tasks
+        assert push_tasks
+        assert any(not task.done() for task in push_tasks)
+    finally:
+        push_release.set()
+        push_tasks = set(chat_mod._maintenance_tasks) - before_tasks
+        if push_tasks:
+            await asyncio.gather(*push_tasks, return_exceptions=True)
+
+
 def test_turn_has_no_wall_clock_cap_by_default(stream_env, client, monkeypatch):
     """A turn must run unbounded unless an operator opts in.
 

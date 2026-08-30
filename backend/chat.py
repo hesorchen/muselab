@@ -16975,48 +16975,14 @@ async def _start_turn(
             # Body intentionally minimal: session name + "Muse 已回复". No
             # preview text — the actual reply is one tap away in chat.
             if not was_cancelled:
-                from . import presence as _presence
-                if _presence.recently_active():
-                    # User is at one of their devices and will see the reply
-                    # in-app.  This successful high-frequency gate is silent;
-                    # actual push failures remain logged below.
-                    pass
-                else:
-                    try:
-                        from . import push as _push
-                        sname = ""
-                        try:
-                            for s in sess.list_sessions():
-                                if s.get("id") == session_id:
-                                    sname = s.get("name", "")
-                                    break
-                        except Exception:
-                            pass
-                        # Body intentionally carries NO reply content. Workspace
-                        # replies can contain private source text, credentials-
-                        # adjacent details, or unpublished work; a preview would
-                        # surface it on the lock screen. The actual reply is one
-                        # tap away in-app. (This matches the "No preview text"
-                        # comment above — an earlier version put reply text here
-                        # and contradicted that privacy boundary.)
-                        _body = "Muse 已回复"
-                        # pywebpush does synchronous per-subscription HTTPS
-                        # (TTL + retries); offload to a thread so a slow/dead
-                        # push endpoint can't block this turn's done event and
-                        # every other concurrent SSE/HTTP request on the loop.
-                        await asyncio.to_thread(
-                            _push.send_to_all,
-                            title=sname or "muselab",
-                            body=_body,
-                            url=f"/?session={session_id}",
-                            tag=f"turn-{session_id}",
-                            context=f"turn-done {session_id[:8]}",
-                        )
-                    except Exception as e:
-                        sys.stderr.write(
-                            f"[chat] turn push failed "
-                            f"sid={session_id[:8]} "
-                            f"exc={type(e).__name__}\n")
+                # Notification delivery is not part of the turn transaction.
+                # A broken proxy previously kept the completed broadcast in
+                # ``_active_turns`` for 405s, so the UI stayed "running" and the
+                # next queued prompt could not claim the session.  Schedule the
+                # best-effort fan-out independently; push.py bounds each HTTP
+                # attempt as a second line of defence.
+                _notify_turn_done(
+                    session_id, session_name=str(s.get("name") or ""))
             # Strip unverifiable thinking-block signatures so this session
             # stays resumable via `claude --resume` (and the official
             # Anthropic API). Third-party vendors (DeepSeek / GLM /
@@ -17734,6 +17700,43 @@ async def _start_turn(
     return broadcast
 
 
+def _notify_turn_done(session_id: str, *, session_name: str = "") -> None:
+    """Best-effort turn notification that never owns the active-turn slot."""
+    async def _go():
+        try:
+            from . import presence as _presence
+            if _presence.recently_active():
+                return
+            from . import push as _push
+            display_name = session_name
+            try:
+                latest = await asyncio.to_thread(sess.get_session, session_id)
+                display_name = str((latest or {}).get("name") or display_name)
+            except Exception:
+                pass
+            # Never put reply content on a lock screen. The actual response is
+            # one tap away in the authenticated application.
+            await asyncio.to_thread(
+                _push.send_to_all,
+                title=display_name or "muselab",
+                body="Muse 已回复",
+                url=f"/?session={session_id}",
+                tag=f"turn-{session_id}",
+                context=f"turn-done {session_id[:8]}",
+            )
+        except Exception as e:
+            sys.stderr.write(
+                f"[chat] turn push failed sid={session_id[:8]} "
+                f"exc={type(e).__name__}\n")
+            sys.stderr.flush()
+
+    try:
+        task = asyncio.get_running_loop().create_task(_go())
+        _retain_detached_cleanup(task)
+    except RuntimeError:
+        pass  # no running loop (shouldn't happen in request context)
+
+
 def _notify_queue_paused_on_error(session_id: str) -> None:
     """Push 'Muse 暂停了队列（出错）' when the headless drain pauses the queue
     after a turn errored. Best-effort + presence-gated (don't buzz a user
@@ -17746,7 +17749,8 @@ def _notify_queue_paused_on_error(session_id: str) -> None:
             from . import push as _push
             sname = ""
             try:
-                for s in sess.list_sessions():
+                sessions = await asyncio.to_thread(sess.list_sessions)
+                for s in sessions:
                     if s.get("id") == session_id:
                         sname = s.get("name", "")
                         break
@@ -17765,7 +17769,8 @@ def _notify_queue_paused_on_error(session_id: str) -> None:
                 f"[chat] queue-paused push failed "
                 f"sid={session_id[:8]} exc={type(e).__name__}\n")
     try:
-        asyncio.create_task(_go())
+        task = asyncio.get_running_loop().create_task(_go())
+        _retain_detached_cleanup(task)
     except RuntimeError:
         pass  # no running loop (shouldn't happen in request context)
 
