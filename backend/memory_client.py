@@ -35,8 +35,15 @@ _legacy_recall_traces: dict[str, dict] = {}
 _LEGACY_TRACE_MAX = 256
 
 _USER_ID = "muselab"
-_SEARCH_TIMEOUT = 3.0
-RECALL_HOOK_TIMEOUT = _SEARCH_TIMEOUT + 0.5
+# Memory is optional context, never part of the message commit path. Finish the
+# callback before the SDK CLI's wall-clock hook watchdog: its timeout sets
+# preventContinuation=true and rejects the user's prompt. The inner deadline
+# converts a slow recall into empty additionalContext. The outer allowance must
+# also absorb event-loop stalls and the sibling runtime-handoff context hook;
+# a 0.5s margin proved insufficient under normal service load.
+_RECALL_DEADLINE = 3.0
+_SEARCH_TIMEOUT = _RECALL_DEADLINE
+RECALL_HOOK_TIMEOUT = 10.0
 _STORE_TIMEOUT = 10.0
 _SEARCH_LIMIT = 5
 _MAX_MEM_CHARS = 400
@@ -45,6 +52,28 @@ _MAX_RESPONSE_BYTES = 64 * 1024
 _MAX_EXPORT_BYTES = 10 * 1024 * 1024
 _MAX_QUERY_CHARS = 8_000
 _MAX_STORE_TEXT_CHARS = 50_000
+
+
+def _failure_metadata(exc: BaseException) -> dict[str, object]:
+    from .memory_engine import classify_memory_failure
+    return classify_memory_failure(exc)[1]
+
+
+def _failure_record(failure: dict[str, object]) -> str:
+    return json.dumps(failure, sort_keys=True, separators=(",", ":"))
+
+
+def _log_failure(level: int, event: str, exc: BaseException) -> None:
+    failure = _failure_metadata(exc)
+    log.log(
+        level,
+        "%s category=%s exception_class=%s status=%s",
+        event,
+        failure["category"],
+        failure["exception_class"],
+        failure.get("status"),
+    )
+
 
 _ZERO_WIDTH_RE = re.compile(r"[​-‏‪-‮⁠-⁯﻿]")
 _FENCE_RE = re.compile(r"-{2,}.*?memory.*?-{2,}", re.IGNORECASE)
@@ -79,7 +108,7 @@ def start() -> None:
         from .memory_engine import engine
         engine.start()
     except Exception as exc:
-        log.warning("native memory start skipped: %s", exc)
+        _log_failure(logging.WARNING, "native memory start skipped", exc)
 
 
 def base_url() -> str:
@@ -101,13 +130,7 @@ def base_url() -> str:
 
 
 def enabled() -> bool:
-    try:
-        from .memory_engine import engine
-        if engine.enabled():
-            return True
-    except Exception:
-        pass
-    return bool(base_url())
+    return native_enabled() or bool(base_url())
 
 
 def native_enabled() -> bool:
@@ -284,7 +307,8 @@ async def export_legacy_memories() -> list[str]:
                 return values
             errors.append(f"{path}: empty or unsupported response")
         except Exception as exc:
-            errors.append(f"{path}: {type(exc).__name__}")
+            failure = _failure_metadata(exc)
+            errors.append(_failure_record(failure))
     raise RuntimeError("legacy Mem0 export is unavailable (" + "; ".join(errors) + ")")
 
 
@@ -299,7 +323,7 @@ async def search_context(query: str, session_id: str) -> str:
                 if (clean := _sanitize(str(row.get("content", ""))))
             ], max_chars=engine.config().retrieval.max_context_chars)
         except Exception as exc:
-            log.debug("native memory search skipped: %s", exc)
+            _log_failure(logging.DEBUG, "native memory search skipped", exc)
             return ""
     url = base_url()
     query = _cap_text(query.strip(), _MAX_QUERY_CHARS)
@@ -325,15 +349,26 @@ async def search_context(query: str, session_id: str) -> str:
             latency_ms=round((time.perf_counter() - started) * 1000),
             status="error",
         )
-        log.debug("mem0 search skipped: %s", exc)
+        _log_failure(logging.DEBUG, "mem0 search skipped", exc)
         return ""
 
 
 def build_recall_hook(session_id: str):
-    """Build an SDK UserPromptSubmit hook bound to one muselab session."""
+    """Build a fail-open UserPromptSubmit hook for optional memory context.
+
+    Returning before ``RECALL_HOOK_TIMEOUT`` is a correctness requirement, not a
+    latency optimization.  If the SDK watchdog fires it rejects the user prompt
+    with ``preventContinuation=true``.  A slow or broken memory backend must
+    therefore degrade to no recalled context instead of aborting the turn.
+    """
     async def recall_hook(input_data, _tool_use_id, _context):
         prompt = input_data.get("prompt", "") if isinstance(input_data, dict) else ""
-        block = await search_context(str(prompt), session_id)
+        try:
+            async with asyncio.timeout(_RECALL_DEADLINE):
+                block = await search_context(str(prompt), session_id)
+        except Exception as exc:
+            _log_failure(logging.DEBUG, "memory recall hook skipped", exc)
+            return {}
         if not block:
             return {}
         return {
@@ -355,7 +390,7 @@ async def store_turn(session_id: str, model: str, user_text: str,
                 session_id, model, user_text, assistant_text, outcome="success",
                 turn_id=turn_id)
         except Exception as exc:
-            log.debug("native memory store skipped: %s", exc)
+            _log_failure(logging.DEBUG, "native memory store skipped", exc)
         return
     del session_id
     url = base_url()
@@ -373,7 +408,7 @@ async def store_turn(session_id: str, model: str, user_text: str,
         }
         await _post_no_result(f"{url}/add", payload, _STORE_TIMEOUT)
     except Exception as exc:
-        log.debug("mem0 store skipped: %s", exc)
+        _log_failure(logging.DEBUG, "mem0 store skipped", exc)
 
 
 def schedule_store(session_id: str, model: str, user_text: str,
@@ -455,4 +490,4 @@ async def aclose(timeout: float = _STORE_TIMEOUT + 1.0) -> None:
         from .memory_engine import engine
         await engine.stop(timeout=min(timeout, 5.0))
     except Exception as exc:
-        log.debug("native memory shutdown skipped: %s", exc)
+        _log_failure(logging.DEBUG, "native memory shutdown skipped", exc)

@@ -110,31 +110,22 @@ def test_client_error_logs_only_strict_safe_projection(client, caplog):
     assert '"trace_fp":' in caplog.text
 
 
-def test_render_key_diagnostic_logs_aggregate_counts_only(client, caplog):
+def test_render_key_diagnostic_schema_is_removed(client, caplog):
     from backend import main
 
     main._CLIENT_ERR_BUCKETS.clear()
-    private = "private-session-and-pane"
-    payload = {
-        "kind": "message_render_key",
-        "session": private,
-        "pane": private,
-        "issues": [
-            {"issue": "duplicate", "count": 4},
-            {"issue": "duplicate", "count": 3},
-            {"issue": "missing", "count": 2},
-            {"issue": "private-issue", "count": 999},
-        ],
-    }
+    with caplog.at_level(logging.DEBUG, logger="muselab.client"):
+        response = client.post(
+            "/api/log/client-error",
+            json={
+                "kind": "message_render_key",
+                "issues": [{"issue": "duplicate", "count": 1}],
+            },
+        )
 
-    with caplog.at_level(logging.WARNING, logger="muselab.client"):
-        response = client.post("/api/log/client-error", json=payload)
-
-    assert response.status_code == 200
-    assert private not in caplog.text
-    assert "private-issue" not in caplog.text
-    assert '"duplicate_count":7' in caplog.text
-    assert '"missing_count":2' in caplog.text
+    assert response.status_code == 422
+    assert response.json() == {"ok": False, "error": "invalid_payload"}
+    assert "message_render_key" not in caplog.text
 
 
 def test_client_error_rejects_unknown_schema_without_logging_payload(

@@ -21,6 +21,7 @@ def _load(monkeypatch, url="http://127.0.0.1:8800"):
     importlib.reload(settings)
     import backend.memory_client as mc
     importlib.reload(mc)
+    monkeypatch.setattr(mc, "native_enabled", lambda: False)
     return mc
 
 
@@ -94,7 +95,7 @@ def test_disabled_when_no_or_invalid_url(monkeypatch):
     for url in ("", "ftp://127.0.0.1:8800", "http://host:8800?token=x",
                 "http://127.0.0.1:notaport", "http://127.0.0.1:70000"):
         mc = _load(monkeypatch, url=url)
-        assert mc.enabled() is False
+        assert mc.enabled() is False, url
         assert _run(mc.search_context("q", "sid")) == ""
 
 
@@ -150,6 +151,41 @@ def test_recall_hook_uses_additional_context(monkeypatch, fake_httpx):
     assert fake_httpx.calls[-1][2]["query"] == "original user prompt"
 
 
+def test_recall_hook_times_out_before_sdk_watchdog_and_fails_open(monkeypatch):
+    mc = _load(monkeypatch)
+    monkeypatch.setattr(mc, "_RECALL_DEADLINE", 0.01)
+    cancelled = asyncio.Event()
+
+    async def stalled_recall(_query, _session_id):
+        try:
+            await asyncio.sleep(10)
+        finally:
+            cancelled.set()
+
+    monkeypatch.setattr(mc, "search_context", stalled_recall)
+    hook = mc.build_recall_hook("session-timeout")
+
+    async def scenario():
+        result = await hook({"prompt": "must still be submitted"}, None, None)
+        assert result == {}
+        assert cancelled.is_set()
+
+    _run(scenario())
+    assert mc.RECALL_HOOK_TIMEOUT > mc._RECALL_DEADLINE
+    assert mc.RECALL_HOOK_TIMEOUT - mc._SEARCH_TIMEOUT >= 5.0
+
+
+def test_recall_hook_backend_error_fails_open(monkeypatch):
+    mc = _load(monkeypatch)
+
+    async def broken_recall(_query, _session_id):
+        raise RuntimeError("memory backend unavailable")
+
+    monkeypatch.setattr(mc, "search_context", broken_recall)
+    hook = mc.build_recall_hook("session-error")
+    assert _run(hook({"prompt": "must still be submitted"}, None, None)) == {}
+
+
 def test_store_payload_has_no_run_id(monkeypatch, fake_httpx):
     mc = _load(monkeypatch)
     _run(mc.store_turn("session-A", "model", "remember X", "X noted"))
@@ -157,6 +193,31 @@ def test_store_payload_has_no_run_id(monkeypatch, fake_httpx):
     assert url.endswith("/add")
     assert "run_id" not in payload
     assert payload["user_id"] == "muselab"
+
+
+def test_failsoft_logging_never_renders_exception_secrets(
+        monkeypatch, fake_httpx, caplog):
+    import httpx
+
+    mc = _load(monkeypatch)
+    secret = "sk-private-memory-client-secret"
+
+    async def fail(*_args, **_kwargs):
+        raise httpx.HTTPStatusError(
+            f"private body {secret}",
+            request=httpx.Request("POST", f"https://example.test/{secret}"),
+            response=httpx.Response(529),
+        )
+
+    monkeypatch.setattr(mc, "_post_json", fail)
+    caplog.set_level("DEBUG", logger="muselab.mem0")
+    assert _run(mc.search_context("private prompt", "s")) == ""
+    assert "category=transient_http" in caplog.text
+    assert "exception_class=HTTPStatusError" in caplog.text
+    assert "status=529" in caplog.text
+    assert secret not in caplog.text
+    assert "example.test" not in caplog.text
+    assert "private prompt" not in caplog.text
 
 
 def test_failsoft_wall_clock_timeout(monkeypatch, fake_httpx):
@@ -227,6 +288,27 @@ def test_schedule_store_tracks_and_drains(monkeypatch, fake_httpx):
         assert mc.schedule_store("s", "model", "u", "a") is False
 
     _run(scenario())
+
+
+def test_persisted_native_recall_receipt_remains_privacy_minimal():
+    from backend.chat import _persistable_memory_recall
+
+    private = "private memory text"
+    receipt = _persistable_memory_recall({
+        "id": "recall-1", "count": 1, "latency_ms": 12.3, "status": "ok",
+        "items": [{
+            "id": "mem-1", "kind": "fact", "score": 0.9,
+            "content": private,
+            "sources": [{"session_id": "private-session"}],
+            "recall_stats": {"recall_count": 8},
+        }],
+    })
+    encoded = json.dumps(receipt)
+    assert receipt["items"] == [{"id": "mem-1", "kind": "fact", "score": 0.9}]
+    assert private not in encoded
+    assert "sources" not in encoded
+    assert "private-session" not in encoded
+    assert "recall_stats" not in encoded
 
 
 def test_shutdown_awaits_task_cancellation(monkeypatch, fake_httpx):

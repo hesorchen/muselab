@@ -3,7 +3,7 @@
 GET    /api/scheduler/tasks         — list + current unread count
 POST   /api/scheduler/tasks         — create
 PATCH  /api/scheduler/tasks/{id}    — edit (rename / change time / toggle enabled)
-DELETE /api/scheduler/tasks/{id}    — remove (does NOT delete the bound session)
+DELETE /api/scheduler/tasks/{id}    — remove + transactionally clean runtime/session ownership
 GET    /api/scheduler/history       — most-recent-first run log
 DELETE /api/scheduler/history       — clear ALL history entries
 DELETE /api/scheduler/history/{ts}  — delete a single history entry (by timestamp,
@@ -19,6 +19,7 @@ from pydantic import BaseModel, Field
 
 from .auth import require_token
 from . import scheduler as sched
+from . import observability as obs
 
 
 router = APIRouter(prefix="/api/scheduler", tags=["scheduler"])
@@ -131,56 +132,39 @@ def patch_task_endpoint(tid: str, req: TaskPatch) -> dict:
 
 @router.delete("/tasks/{tid}", dependencies=[Depends(require_token)])
 async def delete_task_endpoint(tid: str) -> dict:
-    task = sched.get_task(tid)
-    if not task:
-        raise HTTPException(404, "task not found")
-    # Remove scheduler ownership first, then use chat's async purge path so
-    # asyncio turns/watchers are cancelled on the event-loop thread. The sync
-    # scheduler helper remains available for non-server callers and tests.
-    if not sched.delete_task(tid, purge_bound_session=False):
-        raise HTTPException(404, "task not found")
-    # delete_task() installs the durable in-process revocation fence before it
-    # returns.  Now cancel and join every tracked incarnation so a run that was
-    # already inside the SDK cannot append history/unread state after DELETE
-    # has acknowledged success.  This is required for fresh tasks too even
-    # though their completed sessions are intentionally retained.
-    async def _finish_cleanup() -> None:
-        runs, _, session_ids = sched.cancel_runs_for_task_now(tid)
-        # A cancelled SDK receive/connect may not unwind until its CLI
-        # transport is closed. Disconnect captured runtimes before waiting
-        # for the owners; fresh sessions remain on disk, this only releases
-        # live clients.
-        if session_ids:
-            from .chat import disconnect_client
-            results = await asyncio.gather(
-                *(disconnect_client(sid) for sid in session_ids),
-                return_exceptions=True,
-            )
-            for result in results:
-                if isinstance(result, BaseException):
-                    raise result
-        await sched.join_cancelled_runs(runs)
-        if (sched._effective_session_mode(task) == "reuse"
-                and task.get("session_id")):
-            from .chat import purge_session_storage_async
-            await purge_session_storage_async(task["session_id"])
+    # delete_task() commits the task removal and durable cleanup intent in one
+    # replacement. A prior failed attempt therefore reaches the same intent
+    # here instead of becoming an unrecoverable 404.
+    async def _delete_and_cleanup() -> bool:
+        deleted = await obs.to_thread_io(
+            "scheduler.task_delete",
+            tid,
+            sched.delete_task,
+            tid,
+            purge_bound_session=False,
+            owned=True,
+        )
+        if not deleted:
+            return False
+        await sched.finish_task_cleanup(tid)
+        return True
 
-    cleanup = asyncio.create_task(_finish_cleanup())
+    owner = asyncio.create_task(_delete_and_cleanup())
     try:
-        await asyncio.shield(cleanup)
+        deleted = await asyncio.shield(owner)
     except asyncio.CancelledError:
-        # Once the task has been durably removed/revoked, an HTTP disconnect
-        # must not leave its runtime half-cleaned. Preserve caller cancellation
-        # only after the exact cleanup owner reaches a terminal result.
-        while not cleanup.done():
+        # Once deletion starts, an HTTP disconnect must not leave a durable
+        # cleanup intent without an owner. Join the complete transaction first.
+        while not owner.done():
             try:
-                await asyncio.shield(cleanup)
+                await asyncio.shield(owner)
             except asyncio.CancelledError:
                 continue
-        cleanup.result()
+        owner.result()
         raise
+    if not deleted:
+        raise HTTPException(404, "task not found")
     return {"deleted": tid}
-
 
 @router.post("/tasks/{tid}/run", dependencies=[Depends(require_token)])
 async def run_task_now_endpoint(tid: str) -> dict:
@@ -191,7 +175,7 @@ async def run_task_now_endpoint(tid: str) -> dict:
 
     Used for: (a) "retry" on a failed history entry; (b) manual smoke-test
     after editing prompt / model without waiting for the next fire window."""
-    task = sched.get_task(tid)
+    task = await asyncio.to_thread(sched.get_task, tid)
     if not task:
         raise HTTPException(404, "task not found")
     await sched.run_task_now(tid)

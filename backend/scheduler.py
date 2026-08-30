@@ -18,6 +18,8 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import math
+import re
 import sys
 import threading
 import time
@@ -31,6 +33,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
 
 from .settings import ROOT, atomic_write_text, env_int, is_chinese_locale
+from . import observability as obs
 
 
 def _scheduled_label_prefix() -> str:
@@ -97,6 +100,10 @@ _state: dict[str, Any] = {
     "tasks": {},        # task_id -> task
     "history": [],      # list of run entries (capped to 200)
     "unread_count": 0,  # results since user last acked
+    # task_id -> immutable deletion cleanup intent.  The task and intent are
+    # committed in one scheduler.json replacement; external runtime/session
+    # cleanup removes the intent only after every owner reaches terminal state.
+    "cleanup_pending": {},
 }
 
 
@@ -271,6 +278,7 @@ _STATE_LOCK = threading.Lock()
 # replies interleave / drop messages. Lock is dict-resident keyed by
 # task id; locks are never deleted (one per task max, negligible memory).
 _task_locks: dict[str, asyncio.Lock] = {}
+_cleanup_locks: dict[str, asyncio.Lock] = {}
 
 
 def _task_lock(tid: str) -> asyncio.Lock:
@@ -279,8 +287,77 @@ def _task_lock(tid: str) -> asyncio.Lock:
         lock = asyncio.Lock()
         _task_locks[tid] = lock
     return lock
+
+
+def _cleanup_lock(tid: str) -> asyncio.Lock:
+    """Serialize idempotent cleanup retries for one deleted task."""
+    lock = _cleanup_locks.get(tid)
+    if lock is None:
+        lock = asyncio.Lock()
+        _cleanup_locks[tid] = lock
+    return lock
+
 _HISTORY_CAP = 200
 _PREVIEW_CAP_CHARS = 240
+_CLEANUP_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,199}\Z")
+
+
+def _valid_cleanup_id(value: Any, *, allow_empty: bool = False) -> bool:
+    if not isinstance(value, str):
+        return False
+    if not value:
+        return allow_empty
+    return bool(_CLEANUP_ID_RE.fullmatch(value))
+
+
+def _normalize_cleanup_intents(raw: Any, tasks: dict[str, Any]) -> dict[str, dict]:
+    """Validate cleanup records before any startup recovery can act on them.
+
+    scheduler.json is user-editable and may also be truncated/corrupted. A
+    malformed deletion record must fence the scheduler instead of turning an
+    arbitrary string into a session filesystem target.
+    """
+    if not isinstance(raw, dict):
+        raise ValueError("scheduler cleanup_pending must be an object")
+    normalized: dict[str, dict] = {}
+    for tid, intent in raw.items():
+        if not _valid_cleanup_id(tid):
+            raise ValueError("scheduler cleanup task id is invalid")
+        if tid in tasks:
+            raise ValueError("scheduler task cannot also be pending cleanup")
+        if not isinstance(intent, dict) or intent.get("task_id") != tid:
+            raise ValueError("scheduler cleanup intent has an invalid task id")
+        cleanup_id = intent.get("cleanup_id")
+        if not _valid_cleanup_id(cleanup_id):
+            raise ValueError("scheduler cleanup intent id is invalid")
+        mode = intent.get("session_mode")
+        if mode not in ("reuse", "fresh"):
+            raise ValueError("scheduler cleanup session mode is invalid")
+        sid = intent.get("session_id", "")
+        if not _valid_cleanup_id(sid, allow_empty=True):
+            raise ValueError("scheduler cleanup session id is invalid")
+        runtime_sids = intent.get("runtime_session_ids", [])
+        if not isinstance(runtime_sids, list) or len(runtime_sids) > 64:
+            raise ValueError("scheduler cleanup runtime sessions are invalid")
+        if any(not _valid_cleanup_id(item) for item in runtime_sids):
+            raise ValueError("scheduler cleanup runtime session id is invalid")
+        created_at = intent.get("created_at")
+        if (
+            isinstance(created_at, bool)
+            or not isinstance(created_at, (int, float))
+            or not math.isfinite(created_at)
+            or created_at < 0
+        ):
+            raise ValueError("scheduler cleanup created_at is invalid")
+        normalized[tid] = {
+            "task_id": tid,
+            "cleanup_id": cleanup_id,
+            "session_mode": mode,
+            "session_id": sid,
+            "runtime_session_ids": sorted(set(runtime_sids)),
+            "created_at": float(created_at),
+        }
+    return normalized
 
 
 def _load_state() -> None:
@@ -299,11 +376,17 @@ def _load_state() -> None:
             raise ValueError("scheduler tasks/history have invalid types")
         if isinstance(unread, bool) or not isinstance(unread, int) or unread < 0:
             raise ValueError("scheduler unread_count must be a non-negative integer")
+        cleanup_pending = _normalize_cleanup_intents(
+            loaded.get("cleanup_pending", {}), tasks
+        )
         _state = {
             "tasks": tasks,
             "history": history,
             "unread_count": unread,
+            "cleanup_pending": cleanup_pending,
         }
+        _REVOKED_TASK_IDS.clear()
+        _REVOKED_TASK_IDS.update(cleanup_pending)
         _STATE_ERROR = ""
     except Exception as e:
         _STATE_ERROR = "scheduler state could not be loaded; original file preserved"
@@ -714,68 +797,270 @@ def list_task_history(tid: str, limit: int = 100) -> list[dict]:
     return out
 
 
+def _pending_cleanups_unlocked() -> dict[str, dict]:
+    pending = _state.setdefault("cleanup_pending", {})
+    if not isinstance(pending, dict):
+        raise SchedulerPersistenceError(
+            "scheduler cleanup state is invalid; writes are disabled"
+        )
+    return pending
+
+
+def _make_task_cleanup_intent(
+    tid: str,
+    task: dict,
+    runtime_session_ids: set[str],
+) -> dict:
+    intent = {
+        "task_id": tid,
+        "cleanup_id": str(uuid.uuid4()),
+        "session_mode": _effective_session_mode(task),
+        "session_id": str(task.get("session_id") or ""),
+        "runtime_session_ids": sorted(runtime_session_ids),
+        "created_at": time.time(),
+    }
+    # Reuse the load-time validator so an unsafe legacy task id/session id
+    # cannot be promoted into an automatically executed deletion target.
+    return _normalize_cleanup_intents({tid: intent}, {})[tid]
+
+
+def get_task_cleanup(tid: str) -> dict | None:
+    """Return the durable cleanup intent for an already-removed task."""
+    ensure_available()
+    with _STATE_LOCK:
+        intent = _pending_cleanups_unlocked().get(tid)
+        return copy.deepcopy(intent) if intent is not None else None
+
+
+def list_pending_task_cleanups() -> list[dict]:
+    """Stable snapshot used by startup recovery."""
+    ensure_available()
+    with _STATE_LOCK:
+        return copy.deepcopy(list(_pending_cleanups_unlocked().values()))
+
+
+def _record_task_cleanup_runtime_sessions(
+    tid: str,
+    cleanup_id: str,
+    session_ids: set[str],
+) -> dict | None:
+    """Persist newly observed live owners before attempting disconnects."""
+    invalid = [sid for sid in session_ids if not _valid_cleanup_id(sid)]
+    if invalid:
+        raise SchedulerPersistenceError(
+            "scheduler cleanup observed an invalid runtime session id"
+        )
+    with _STATE_LOCK:
+        pending = _pending_cleanups_unlocked()
+        current = pending.get(tid)
+        if current is None:
+            return None
+        if current.get("cleanup_id") != cleanup_id:
+            raise RuntimeError("scheduler cleanup intent changed during retry")
+        merged = sorted(set(current.get("runtime_session_ids", [])) | session_ids)
+        if merged == current.get("runtime_session_ids", []):
+            return copy.deepcopy(current)
+        snapshot = copy.deepcopy(_state)
+        current["runtime_session_ids"] = merged
+        try:
+            _save_state()
+        except Exception:
+            _restore_state(snapshot)
+            raise
+        return copy.deepcopy(current)
+
+
+def _complete_task_cleanup(tid: str, cleanup_id: str) -> bool:
+    """Atomically acknowledge one exact cleanup intent."""
+    with _STATE_LOCK:
+        pending = _pending_cleanups_unlocked()
+        current = pending.get(tid)
+        if current is None:
+            return False
+        if current.get("cleanup_id") != cleanup_id:
+            raise RuntimeError("scheduler cleanup intent changed during completion")
+        snapshot = copy.deepcopy(_state)
+        pending.pop(tid)
+        try:
+            _save_state()
+        except Exception:
+            _restore_state(snapshot)
+            raise
+        return True
+
+
 def delete_task(tid: str, *, purge_bound_session: bool = True) -> bool:
-    """Delete a task and (only for reuse-mode) its bound session.
+    """Durably remove a task, then finish or expose its cleanup transaction.
 
-    Behavior by mode (chosen 2026-05-28 per user spec):
-      * reuse — delete the bound session too. There's exactly one; no
-        per-run history apart from what's inside that JSONL; orphaning
-        it would litter the history picker with un-attributable
-        `[定时] xxx` rows.
-      * fresh — DON'T touch any sessions. Each prior run is its own
-        independent session with potentially valuable history snapshots;
-        cascading delete could nuke dozens at once. The user can multi-
-        select and delete in the regular sessions list if they want.
-
-    Returns True if the task existed and got removed."""
+    The task row and cleanup intent are committed by one atomic scheduler.json
+    replacement. Failed external cleanup therefore leaves a stable tid that
+    synchronous callers and the HTTP endpoint can retry idempotently.
+    """
     ensure_available()
     with _RUN_REGISTRY_LOCK:
-        if purge_bound_session and any(
-            owner_tid == tid and not task.done()
+        active_owners = [
+            task
             for task, owner_tid in tuple(_RUN_TASK_IDS.items())
-        ):
+            if owner_tid == tid and not task.done()
+        ]
+        runtime_session_ids = {
+            sid
+            for task in active_owners
+            if (sid := _RUN_SESSION_IDS.get(task))
+        }
+        if purge_bound_session and active_owners:
             raise RuntimeError(
                 "cannot synchronously delete a running scheduler task; "
                 "use the async API cleanup path"
             )
         with _STATE_LOCK:
+            pending = _pending_cleanups_unlocked()
+            task = _state["tasks"].get(tid)
+            intent = pending.get(tid)
+            if task is None and intent is None:
+                return tid in _REVOKED_TASK_IDS
+            if task is not None and intent is not None:
+                raise SchedulerPersistenceError(
+                    "scheduler task conflicts with a pending cleanup intent"
+                )
+
             snapshot = copy.deepcopy(_state)
-            t = _state["tasks"].pop(tid, None)
-            if not t:
-                return False
-            # Fence while registration is excluded. A task created just
-            # before this critical section either appears above and rejects
-            # the sync cascade, or starts afterward and observes revocation.
             was_revoked = tid in _REVOKED_TASK_IDS
-            _REVOKED_TASK_IDS.add(tid)
-            mode = _effective_session_mode(t)
-            sid = t.get("session_id")
             try:
+                if task is not None:
+                    intent = _make_task_cleanup_intent(
+                        tid, task, runtime_session_ids
+                    )
+                    _state["tasks"].pop(tid)
+                    pending[tid] = intent
+                else:
+                    merged = sorted(
+                        set(intent.get("runtime_session_ids", []))
+                        | runtime_session_ids
+                    )
+                    if merged != intent.get("runtime_session_ids", []):
+                        intent["runtime_session_ids"] = merged
+                _REVOKED_TASK_IDS.add(tid)
                 _save_state()
             except Exception:
                 _restore_state(snapshot)
                 if not was_revoked:
                     _REVOKED_TASK_IDS.discard(tid)
                 raise
-    # Cascade OUTSIDE the lock — the purge touches disk (SDK JSONL, sidecar,
-    # attachments) and must not stall other scheduler state operations.
-    # purge_session_storage is the same full-cleanup path the HTTP session
-    # delete uses; the old sess.delete_session-only call left the SDK JSONL
-    # behind, so the "deleted" session could re-appear in the session list.
-    if purge_bound_session and mode == "reuse" and sid:
+            intent = copy.deepcopy(intent)
+
+    if not purge_bound_session:
+        return True
+    if intent.get("runtime_session_ids"):
+        raise RuntimeError(
+            "cannot synchronously finish cleanup with recorded runtime owners; "
+            "use the async API cleanup path"
+        )
+    if intent["session_mode"] == "reuse" and intent.get("session_id"):
         try:
             from .chat import purge_session_storage
-            purge_session_storage(sid)
+            purge_session_storage(intent["session_id"])
         except Exception as e:
             sys.stderr.write(
-                f"[scheduler] delete_task({tid}): bound session {sid} "
-                f"cleanup failed: {e}\n")
-            # The task removal is already durable and cannot be safely rolled
-            # back after a potentially-partial filesystem purge. Still, never
-            # report the compound operation as success while its bound session
-            # may remain visible; callers can surface/retry the cleanup error.
+                f"[scheduler] delete_task({tid}): bound session "
+                f"{intent['session_id']} cleanup failed: {e}\n"
+            )
             raise
+    # A concurrent idempotent cleaner may already have acknowledged the exact
+    # intent. Missing here is success; a different cleanup_id raises above.
+    _complete_task_cleanup(tid, intent["cleanup_id"])
     return True
+
+
+async def finish_task_cleanup(tid: str) -> bool:
+    """Finish one durable deletion intent; safe to retry by task id."""
+    ensure_available()
+    async with _cleanup_lock(tid):
+        intent = await obs.to_thread_io(
+            "scheduler.cleanup_read", tid, get_task_cleanup, tid)
+        if intent is None:
+            return tid in _REVOKED_TASK_IDS
+
+        runs, _, observed_session_ids = cancel_runs_for_task_now(tid)
+        runtime_session_ids = (
+            set(intent.get("runtime_session_ids", []))
+            | observed_session_ids
+        )
+        record_error: Exception | None = None
+        try:
+            refreshed = await obs.to_thread_io(
+                "scheduler.cleanup_record",
+                tid,
+                _record_task_cleanup_runtime_sessions,
+                tid,
+                intent["cleanup_id"],
+                runtime_session_ids,
+                owned=True,
+            )
+            if refreshed is not None:
+                intent = refreshed
+        except Exception as exc:
+            # Runtime owners are already cancelled. Still disconnect and join
+            # them before surfacing the persistence failure; the durable intent
+            # remains available after restart.
+            record_error = exc
+
+        disconnect_errors: list[BaseException] = []
+        if runtime_session_ids:
+            from .chat import disconnect_client
+            results = await asyncio.gather(
+                *(disconnect_client(sid) for sid in sorted(runtime_session_ids)),
+                return_exceptions=True,
+            )
+            disconnect_errors = [
+                result
+                for result in results
+                if isinstance(result, BaseException)
+            ]
+        joined = await join_cancelled_runs(runs)
+
+        if record_error is not None:
+            raise record_error
+        if disconnect_errors:
+            raise disconnect_errors[0]
+        if not joined:
+            raise RuntimeError(
+                "scheduler runtime owner did not stop before cleanup timeout"
+            )
+
+        if intent["session_mode"] == "reuse" and intent.get("session_id"):
+            from .chat import purge_session_storage_async
+            await purge_session_storage_async(intent["session_id"])
+
+        if await obs.to_thread_io(
+            "scheduler.cleanup_complete",
+            tid,
+            _complete_task_cleanup,
+            tid,
+            intent["cleanup_id"],
+            owned=True,
+        ):
+            return True
+        # Another idempotent cleaner may have acknowledged the same record.
+        if await obs.to_thread_io(
+            "scheduler.cleanup_read", tid, get_task_cleanup, tid) is None:
+            return True
+        raise RuntimeError("scheduler cleanup intent changed during completion")
+
+
+async def _resume_pending_task_cleanups() -> None:
+    """Best-effort startup recovery for deletion transactions."""
+    for intent in list_pending_task_cleanups():
+        tid = intent["task_id"]
+        try:
+            await finish_task_cleanup(tid)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            sys.stderr.write(
+                f"[scheduler] pending cleanup {tid} remains retryable "
+                f"after {type(exc).__name__}: {exc}\n"
+            )
 
 
 def list_history(limit: int = 50) -> list[dict]:
@@ -935,12 +1220,16 @@ async def _run_sdk_task_turn(
                 # owner-specific missing-row finish is a no-op, so a failure
                 # before persistence cannot synthesize a ghost event.
                 _mark_current_run_activity_started()
-                _activity.start(
+                await obs.to_thread_io(
+                    "scheduler.activity_start",
+                    session_id,
+                    _activity.start,
                     session_id,
                     summary=activity_summary or prompt,
                     kind="scheduled",
                     source_id=activity_source_id,
                     owner_id=activity_owner_id,
+                    owned=True,
                 )
             except Exception as e:
                 sys.stderr.write(
@@ -1042,8 +1331,13 @@ async def run_task_now(tid: str) -> bool:
     Useful as a "retry" affordance after a failure, and as a smoke test
     after editing a task without having to wait for the next fire window."""
     ensure_available()
-    with _STATE_LOCK:
-        task = _state["tasks"].get(tid)
+
+    def _read_task_for_run() -> dict | None:
+        with _STATE_LOCK:
+            return _state["tasks"].get(tid)
+
+    task = await obs.to_thread_io(
+        "scheduler.task_read", tid, _read_task_for_run)
     if not task:
         return False
     t = _track_task(
@@ -1100,34 +1394,62 @@ async def _execute_task(task: dict) -> None:
             sid = ""
             try:
                 from . import sessions as sess
+
+                def _delete_fresh_session() -> None:
+                    sess.begin_session_delete(sid)
+                    sess.delete_session(sid)
+
                 ts_label = datetime.now().strftime("%m-%d %H:%M")
-                sess_meta = sess.create_session(
+                sess_meta = await obs.to_thread_io(
+                    "scheduler.session_create",
+                    tid,
+                    sess.create_session,
                     name=f"{_scheduled_label_prefix()}{task['name']} · {ts_label}",
-                    model=task.get("model", ""))
+                    model=task.get("model", ""),
+                    owned=True,
+                )
                 sid = sess_meta["id"]
-                with _STATE_LOCK:
-                    snapshot = copy.deepcopy(_state)
-                    revoked = tid in _REVOKED_TASK_IDS
-                    if not revoked:
-                        # "most recent run" pointer
-                        task["session_id"] = sid
-                        try:
-                            _save_state()
-                        except Exception:
-                            _restore_state(snapshot)
-                            raise
+
+                def _commit_fresh_session() -> bool:
+                    with _STATE_LOCK:
+                        snapshot = copy.deepcopy(_state)
+                        is_revoked = tid in _REVOKED_TASK_IDS
+                        if not is_revoked:
+                            # "most recent run" pointer
+                            task["session_id"] = sid
+                            try:
+                                _save_state()
+                            except Exception:
+                                _restore_state(snapshot)
+                                raise
+                        return is_revoked
+
+                revoked = await obs.to_thread_io(
+                    "scheduler.fresh_session_commit",
+                    tid,
+                    _commit_fresh_session,
+                    owned=True,
+                )
                 if revoked:
                     # A synchronous compatibility caller can revoke while
                     # create_session is doing disk I/O in another thread.
                     # This run never owned the freshly minted empty session.
-                    sess.begin_session_delete(sid)
-                    sess.delete_session(sid)
+                    await obs.to_thread_io(
+                        "scheduler.session_delete",
+                        tid,
+                        _delete_fresh_session,
+                        owned=True,
+                    )
                     return
             except Exception as e:
                 if sid:
                     try:
-                        sess.begin_session_delete(sid)
-                        sess.delete_session(sid)
+                        await obs.to_thread_io(
+                            "scheduler.session_delete",
+                            tid,
+                            _delete_fresh_session,
+                            owned=True,
+                        )
                     except Exception as cleanup_error:
                         sys.stderr.write(
                             "[scheduler] failed to roll back fresh session "
@@ -1144,28 +1466,36 @@ async def _execute_task(task: dict) -> None:
                 # remain visible in history when that history can be saved.
                 if not isinstance(e, SchedulerPersistenceError):
                     now = time.time()
-                    with _STATE_LOCK:
-                        snapshot = copy.deepcopy(_state)
-                        if tid not in _REVOKED_TASK_IDS:
-                            _state["history"].append({
-                                "task_id": tid,
-                                "task_name": task["name"],
-                                "session_id": "",
-                                "ts": now,
-                                "ok": False,
-                                "error": (
-                                    "session mint failed: "
-                                    f"{type(e).__name__}: {e}"
-                                ),
-                                "reply_preview": None,
-                            })
-                            _state["unread_count"] = (
-                                _state.get("unread_count", 0) + 1
-                            )
-                            try:
-                                _save_state()
-                            except Exception:
-                                _restore_state(snapshot)
+                    mint_error = f"{type(e).__name__}: {e}"
+
+                    def _persist_mint_failure() -> None:
+                        with _STATE_LOCK:
+                            snapshot = copy.deepcopy(_state)
+                            if tid not in _REVOKED_TASK_IDS:
+                                _state["history"].append({
+                                    "task_id": tid,
+                                    "task_name": task["name"],
+                                    "session_id": "",
+                                    "ts": now,
+                                    "ok": False,
+                                    "error": f"session mint failed: {mint_error}",
+                                    "reply_preview": None,
+                                })
+                                _state["unread_count"] = (
+                                    _state.get("unread_count", 0) + 1
+                                )
+                                try:
+                                    _save_state()
+                                except Exception:
+                                    _restore_state(snapshot)
+                                    raise
+
+                    await obs.to_thread_io(
+                        "scheduler.mint_failure",
+                        tid,
+                        _persist_mint_failure,
+                        owned=True,
+                    )
                 return
         else:
             sid = task["session_id"]
@@ -1227,17 +1557,19 @@ async def _execute_task(task: dict) -> None:
                 "error": error,
                 "reply_preview": preview if error is None else None,
             }
-            with _STATE_LOCK:
-                revoked = (
-                    tid in _REVOKED_TASK_IDS
-                    or session_store.session_is_deleting(sid)
-                )
-                if not revoked:
+            def _persist_run_result() -> bool:
+                with _STATE_LOCK:
+                    is_revoked = (
+                        tid in _REVOKED_TASK_IDS
+                        or session_store.session_is_deleting(sid)
+                    )
+                    if is_revoked:
+                        return True
                     snapshot = copy.deepcopy(_state)
                     task["last_run"] = now
                     _state["history"].append(entry)
-                    # Successful runs bump unread; errors also bump so the
-                    # user notices them — but they show as red in the UI.
+                    # Successful runs and errors both bump unread so the result
+                    # remains visible in the bell drawer.
                     _state["unread_count"] = (
                         _state.get("unread_count", 0) + 1
                     )
@@ -1245,13 +1577,25 @@ async def _execute_task(task: dict) -> None:
                         _state["history"] = _state["history"][-_HISTORY_CAP:]
                     try:
                         _save_state()
-                    except SchedulerPersistenceError as exc:
+                    except SchedulerPersistenceError:
                         _restore_state(snapshot)
-                        error = f"SchedulerPersistenceError: {exc}"
-                        sys.stderr.write(
-                            f"[scheduler] task {tid} result was not persisted; "
-                            "in-memory mutation rolled back\n"
-                        )
+                        raise
+                    return False
+
+            try:
+                revoked = await obs.to_thread_io(
+                    "scheduler.run_result",
+                    tid,
+                    _persist_run_result,
+                    owned=True,
+                )
+            except SchedulerPersistenceError as exc:
+                revoked = False
+                error = f"SchedulerPersistenceError: {exc}"
+                sys.stderr.write(
+                    f"[scheduler] task {tid} result was not persisted; "
+                    "in-memory mutation rolled back\n"
+                )
             try:
                 from .activity import activity as _activity
                 current = asyncio.current_task()
@@ -1261,11 +1605,15 @@ async def _execute_task(task: dict) -> None:
                         or current in _RUN_ACTIVITY_STARTED
                     )
                 if should_finish_activity:
-                    _activity.finish(
+                    await obs.to_thread_io(
+                        "scheduler.activity_finish",
+                        sid,
+                        _activity.finish,
                         sid,
                         "cancelled" if (cancelled or revoked) else (
                             "failed" if error else "completed"),
                         owner_id=activity_owner_id,
+                        owned=True,
                     )
             except Exception as e:
                 sys.stderr.write(
@@ -1357,31 +1705,44 @@ async def _scheduler_loop() -> None:
     while True:
         try:
             now = time.time()
-            with _STATE_LOCK:
-                snapshot = list(_state["tasks"].values())
-            for task in snapshot:
-                if not task.get("enabled", True):
-                    continue
-                nr = task.get("next_run")
-                if nr and nr <= now:
-                    # Advance next_run optimistically so a long-running
-                    # task doesn't fire twice if we tick again before it
-                    # finishes.
-                    with _STATE_LOCK:
-                        state_snapshot = copy.deepcopy(_state)
+
+            committed_due: list[dict] = []
+
+            def _advance_due_tasks() -> list[dict]:
+                with _STATE_LOCK:
+                    due = [
+                        task for task in _state["tasks"].values()
+                        if task.get("enabled", True)
+                        and task.get("next_run")
+                        and task["next_run"] <= now
+                    ]
+                    if not due:
+                        return []
+                    state_snapshot = copy.deepcopy(_state)
+                    for task in due:
+                        # Persist advancement before launch so a long-running
+                        # task cannot fire twice on a later scheduler tick.
                         task["next_run"] = _compute_next_run(task["schedule"])
-                        # A `once` task fires exactly once — after firing it
-                        # has no future next_run, so disable it too. This
-                        # flips the UI toggle off so the user sees it's spent,
-                        # instead of a dead-enabled task that can never fire
-                        # again.
                         if (task.get("schedule") or {}).get("kind") == "once":
                             task["enabled"] = False
-                        try:
-                            _save_state()
-                        except Exception:
-                            _restore_state(state_snapshot)
-                            raise
+                    try:
+                        _save_state()
+                    except Exception:
+                        _restore_state(state_snapshot)
+                        raise
+                    committed_due.extend(due)
+                    return due
+
+            try:
+                due_tasks = await obs.to_thread_io(
+                    "scheduler.advance_due", "scheduler", _advance_due_tasks,
+                    owned=True,
+                )
+            except asyncio.CancelledError:
+                # owned I/O joined the commit. Preserve launch-after-commit even
+                # when shutdown arrives during fsync, then propagate cancellation.
+                due_tasks = list(committed_due)
+                for task in due_tasks:
                     task_obj = _track_task(
                         asyncio.create_task(_execute_task(task)),
                         task_id=str(task.get("id") or ""),
@@ -1391,7 +1752,20 @@ async def _scheduler_loop() -> None:
                             else ""
                         ),
                     )
-                    task_obj.add_done_callback(_make_task_done(task.get("id", "?")))
+                    task_obj.add_done_callback(
+                        _make_task_done(task.get("id", "?")))
+                raise
+            for task in due_tasks:
+                task_obj = _track_task(
+                    asyncio.create_task(_execute_task(task)),
+                    task_id=str(task.get("id") or ""),
+                    session_id=(
+                        str(task.get("session_id") or "")
+                        if _effective_session_mode(task) == "reuse"
+                        else ""
+                    ),
+                )
+                task_obj.add_done_callback(_make_task_done(task.get("id", "?")))
         except Exception as e:
             sys.stderr.write(f"[scheduler] loop error: {e}\n")
         await asyncio.sleep(60)
@@ -1421,39 +1795,66 @@ async def start_scheduler() -> None:
     # generous enough to cover overnight outages while filtering
     # actually-stale entries.
     _CATCHUP_MAX_AGE_S = 24 * 3600
-    with _STATE_LOCK:
-        _load_state()
-        state_snapshot = copy.deepcopy(_state)
-        for task in _state["tasks"].values():
-            sched = task.get("schedule")
-            if not sched:
-                continue
-            nr = task.get("next_run")
-            # If next_run is in the past AND the task is enabled, the window
-            # was missed while we were down. Disabled tasks just get next_run
-            # rolled forward (no catch-up), matching their "don't fire" intent.
-            if (nr and nr <= now and task.get("enabled", True)
-                    and (now - nr) < _CATCHUP_MAX_AGE_S):
-                missed.append(task)
-            elif nr and nr <= now and task.get("enabled", True):
-                sys.stderr.write(
-                    f"[scheduler] skipping stale catch-up for task "
-                    f"{task.get('id','?')} ({task.get('name','?')}): "
-                    f"missed {(now - nr) / 3600:.1f}h ago, beyond 24h window\n")
-            task["next_run"] = _compute_next_run(sched)
-            # A spent `once` task (date in the past → no future next_run)
-            # should be disabled, not left dead-enabled. Covers both tasks
-            # that just missed their window (already queued for catch-up
-            # above, so they still fire one final time) and ones that fired
-            # in a previous run but stayed enabled. Future-dated `once` tasks
-            # keep next_run set, so they stay enabled until they fire.
-            if sched.get("kind") == "once" and task["next_run"] is None:
-                task["enabled"] = False
-        try:
-            _save_state()
-        except Exception:
-            _restore_state(state_snapshot)
-            raise
+    startup_snapshot: dict | None = None
+
+    def _load_and_advance_startup() -> list[dict]:
+        nonlocal startup_snapshot
+        startup_missed: list[dict] = []
+        with _STATE_LOCK:
+            _load_state()
+            state_snapshot = copy.deepcopy(_state)
+            startup_snapshot = state_snapshot
+            for task in _state["tasks"].values():
+                sched = task.get("schedule")
+                if not sched:
+                    continue
+                nr = task.get("next_run")
+                # Enabled tasks missed within the bounded outage window catch up
+                # once; stale or disabled tasks only roll their schedule forward.
+                if (nr and nr <= now and task.get("enabled", True)
+                        and (now - nr) < _CATCHUP_MAX_AGE_S):
+                    startup_missed.append(task)
+                elif nr and nr <= now and task.get("enabled", True):
+                    sys.stderr.write(
+                        f"[scheduler] skipping stale catch-up for task "
+                        f"{task.get('id','?')} ({task.get('name','?')}): "
+                        f"missed {(now - nr) / 3600:.1f}h ago, beyond 24h window\n")
+                task["next_run"] = _compute_next_run(sched)
+                if sched.get("kind") == "once" and task["next_run"] is None:
+                    task["enabled"] = False
+            try:
+                _save_state()
+            except Exception:
+                _restore_state(state_snapshot)
+                raise
+        return startup_missed
+
+    try:
+        missed = await obs.to_thread_io(
+            "scheduler.startup_state", "scheduler", _load_and_advance_startup,
+            owned=True,
+        )
+    except asyncio.CancelledError:
+        # Startup did not reach its catch-up launch boundary. Restore the exact
+        # pre-advance schedule so the next process can recover the missed window.
+        if startup_snapshot is not None:
+            def _rollback_startup_advance() -> None:
+                with _STATE_LOCK:
+                    _restore_state(startup_snapshot)
+                    _save_state()
+
+            await obs.to_thread_io(
+                "scheduler.startup_rollback",
+                "scheduler",
+                _rollback_startup_advance,
+                owned=True,
+            )
+        raise
+    # Resolve crash-interrupted deletions before starting new scheduled work.
+    # Failures are logged and retain their exact durable intent, so scheduler
+    # availability does not depend on one damaged external session tree.
+    await _resume_pending_task_cleanups()
+
     # Kick off catch-up runs — staggered so an overnight outage with many
     # daily tasks doesn't spawn every CLI subprocess at once (thundering
     # herd). Each carries the same done-callback the tick loop uses, so a

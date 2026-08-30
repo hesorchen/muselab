@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
+import shutil
 import sqlite3
 import threading
 import time
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -15,8 +17,9 @@ from .files import INTERNAL_DIR_NAME, TRASH_DIR_NAME
 
 _DB_NAME = "workspace-state.sqlite3"
 _EXCLUDED_DIRS = frozenset({INTERNAL_DIR_NAME, TRASH_DIR_NAME})
-# These generated/control trees stay addressable through the lazy `/list` API,
-# but persisting every descendant makes home-directory workspaces unusable.
+# Explicitly prune generated, dependency, VCS, cache, and bulk-data trees. The
+# directory node stays addressable through the lazy `/list` API, but recursive
+# reconciliation must never walk these common multi-gigabyte subtrees.
 _IGNORED_SUBTREES = frozenset({
     ".git",
     ".hg",
@@ -28,14 +31,31 @@ _IGNORED_SUBTREES = frozenset({
     ".codex",
     ".claude",
     ".npm",
-    "venv",
-    "node_modules",
-    "__pycache__",
+    ".next",
     ".mypy_cache",
     ".pytest_cache",
     ".tox",
     ".hypothesis",
+    ".jumbo",
+    ".jumbo.bak",
+    "venv",
+    "node_modules",
+    "__pycache__",
+    "build",
+    "dist",
+    "coverage",
+    "target",
+    "tmp",
+    "output",
+    "pdc_space",
+    "share_space",
+    "content_agent_freshdoc",
 })
+# A pathological workspace must yield the worker back instead of monopolizing a
+# thread indefinitely. Partial scans merge only observed rows and never infer
+# deletions; a later pass can still establish an authoritative full snapshot.
+_SCAN_MAX_FILES = 50_000
+_SCAN_MAX_SECONDS = 5.0
 _EVENT_LIMIT = 20_000
 # A reconciliation can discover tens of thousands of offline changes at once
 # (for example when a formerly indexed cache tree becomes opaque). Replaying
@@ -45,12 +65,14 @@ _RECONCILE_REPLAY_LIMIT = 500
 # sibling set independently so one generated/dump directory cannot turn a cold
 # page load into a multi-megabyte JSON response and browser main-thread stall.
 _BOOTSTRAP_CHILDREN_PER_PARENT = 500
-# Database maintenance runs only during service startup, before the file index
-# is exposed.  Avoid churning small databases: both an absolute and a relative
-# threshold must be crossed before any page-moving operation is attempted.
+# Automatic service startup never moves database pages. New indexes enable
+# incremental auto-vacuum before creating the schema; legacy indexes report an
+# explicit offline full-vacuum requirement instead of delaying readiness.
+# Both thresholds must be crossed before any reclaim operation is considered.
 _VACUUM_MIN_RECLAIM_BYTES = 16 * 1024 * 1024
 _VACUUM_MIN_FREE_RATIO = 0.25
 _INCREMENTAL_VACUUM_MAX_PAGES = 4096
+_FULL_VACUUM_MIN_FREE_BYTES = 64 * 1024 * 1024
 
 
 class WorkspaceScanIncomplete(RuntimeError):
@@ -94,53 +116,202 @@ def is_ignored_descendant(path: str | Path) -> bool:
 def scan_workspace(
     root: Path,
     cancel_event: threading.Event | None = None,
+    *,
+    max_files: int | None = _SCAN_MAX_FILES,
+    max_seconds: float | None = _SCAN_MAX_SECONDS,
+    report: dict[str, Any] | None = None,
+    progress: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    """Return a complete metadata snapshot without following directory links."""
+    """Return one bounded, optionally resumable filesystem snapshot pass."""
     root = root.resolve()
+    scan_progress = progress if progress is not None else {}
+    seen_paths: set[str] = scan_progress.setdefault("seen_paths", set())
+    stack: list[tuple[Path, Path, int, bytes | None]] = scan_progress.setdefault(
+        "stack", [(root, Path(), 0, None)]
+    )
+    resumed = bool(seen_paths)
     rows: list[dict[str, Any]] = []
-    stack: list[tuple[Path, Path]] = [(root, Path())]
-    while stack:
+    started = time.monotonic()
+    scanned_files = 0
+    partial_reason: str | None = None
+    while stack and partial_reason is None:
         if cancel_event is not None and cancel_event.is_set():
             raise WorkspaceScanCancelled("workspace scan cancelled")
-        directory, logical_parent = stack.pop()
+        if max_seconds is not None and time.monotonic() - started >= max_seconds:
+            partial_reason = "time_limit"
+            break
+        directory, logical_parent, skip, expected_prefix = stack.pop()
+        # scandir order is not stable across passes. Hash the exact consumed
+        # prefix so an order or membership change restarts instead of skipping
+        # a live entry and later inferring its deletion.
+        prefix = hashlib.blake2b(digest_size=16)
+        prefix_verified = skip == 0
+        index = 0
         try:
             with os.scandir(directory) as iterator:
-                children = []
                 for child in iterator:
+                    if child.name in _EXCLUDED_DIRS:
+                        continue
+                    if index < skip:
+                        prefix.update(os.fsencode(child.name))
+                        prefix.update(b"\0")
+                        index += 1
+                        if index == skip:
+                            if (
+                                expected_prefix is None
+                                or prefix.digest() != expected_prefix
+                            ):
+                                scan_progress.clear()
+                                raise WorkspaceScanIncomplete(
+                                    f"directory changed during resumed scan: {directory}"
+                                )
+                            prefix_verified = True
+                        continue
                     if cancel_event is not None and cancel_event.is_set():
                         raise WorkspaceScanCancelled(
                             "workspace scan cancelled"
                         )
-                    children.append(child)
+                    if max_files is not None and scanned_files >= max_files:
+                        stack.append((
+                            directory,
+                            logical_parent,
+                            index,
+                            prefix.digest(),
+                        ))
+                        partial_reason = "file_limit"
+                        break
+                    if (
+                        max_seconds is not None
+                        and time.monotonic() - started >= max_seconds
+                    ):
+                        stack.append((
+                            directory,
+                            logical_parent,
+                            index,
+                            prefix.digest(),
+                        ))
+                        partial_reason = "time_limit"
+                        break
+                    logical = logical_parent / child.name
+                    try:
+                        is_symlink = child.is_symlink()
+                        is_dir = child.is_dir()
+                        stat = child.stat(follow_symlinks=not is_symlink)
+                    except OSError as exc:
+                        scan_progress.clear()
+                        # A disappearing or temporarily unreadable entry makes
+                        # this snapshot non-authoritative for deletion.
+                        raise WorkspaceScanIncomplete(str(child.path)) from exc
+                    prefix.update(os.fsencode(child.name))
+                    prefix.update(b"\0")
+                    index += 1
+                    path = logical.as_posix()
+                    seen_paths.add(path)
+                    rows.append(_entry(path, is_dir, stat))
+                    scanned_files += 1
+                    if (
+                        is_dir
+                        and not is_symlink
+                        and child.name not in _IGNORED_SUBTREES
+                    ):
+                        stack.append((Path(child.path), logical, 0, None))
+            if not prefix_verified:
+                scan_progress.clear()
+                raise WorkspaceScanIncomplete(
+                    f"directory changed during resumed scan: {directory}"
+                )
         except OSError as exc:
-            # A partial snapshot cannot distinguish an unreadable subtree from a
-            # deleted one. Keep the last-good index instead of inventing deletes.
+            scan_progress.clear()
+            # Keep the last-good index instead of inventing deletes for an
+            # unreadable subtree.
             raise WorkspaceScanIncomplete(str(directory)) from exc
-        for child in children:
-            if cancel_event is not None and cancel_event.is_set():
-                raise WorkspaceScanCancelled("workspace scan cancelled")
-            if child.name in _EXCLUDED_DIRS:
-                continue
-            logical = logical_parent / child.name
-            try:
-                is_symlink = child.is_symlink()
-                is_dir = child.is_dir()
-                stat = child.stat(follow_symlinks=not is_symlink)
-            except OSError as exc:
-                # A disappearing or temporarily unreadable entry makes this
-                # snapshot non-authoritative for deletion. Reconcile again on
-                # the next pass instead of erasing its last-good row/subtree.
-                raise WorkspaceScanIncomplete(str(child.path)) from exc
-            path = logical.as_posix()
-            rows.append(_entry(path, is_dir, stat))
-            if (
-                is_dir
-                and not is_symlink
-                and child.name not in _IGNORED_SUBTREES
-            ):
-                stack.append((Path(child.path), logical))
     rows.sort(key=lambda row: row["path"])
+    partial = partial_reason is not None
+    snapshot_files = len(seen_paths)
+    complete_paths = None if partial else set(seen_paths)
+    if not partial:
+        scan_progress.clear()
+    if report is not None:
+        report.update({
+            "partial": partial,
+            "partial_reason": partial_reason,
+            "scanned_files": scanned_files,
+            "snapshot_files": snapshot_files,
+            "resumed": resumed,
+            "scan_ms": int((time.monotonic() - started) * 1000),
+        })
+        if complete_paths is not None:
+            report["_snapshot_paths"] = complete_paths
     return rows
+
+
+ScanRow = tuple[str, bool, int, float, int, int, int]
+
+
+def compact_scan_rows(rows: Iterable[dict[str, Any]]) -> list[ScanRow]:
+    """Encode filesystem rows compactly for scanner-process IPC."""
+    return [
+        (
+            row["path"],
+            bool(row["is_dir"]),
+            int(row["size"]),
+            float(row["mtime"]),
+            int(row["mtime_ns"]),
+            int(row["ctime_ns"]),
+            int(row["inode"]),
+        )
+        for row in rows
+    ]
+
+
+def expand_scan_rows(
+    rows: Iterable[ScanRow | Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Decode compact IPC rows while accepting direct in-process test rows."""
+    expanded: list[dict[str, Any]] = []
+    for row in rows:
+        if isinstance(row, Mapping):
+            expanded.append(dict(row))
+            continue
+        path, is_dir, size, mtime, mtime_ns, ctime_ns, inode = row
+        expanded.append({
+            "path": path,
+            "name": Path(path).name,
+            "is_dir": is_dir,
+            "size": size,
+            "mtime": mtime,
+            "mtime_ns": mtime_ns,
+            "ctime_ns": ctime_ns,
+            "inode": inode,
+        })
+    return expanded
+
+
+def workspace_scan_worker(connection: Any, cancel_event: Any) -> None:
+    """Serve compact scan requests in one reusable spawned worker process."""
+    try:
+        while True:
+            request = connection.recv()
+            if request is None:
+                return
+            root, max_files, max_seconds, progress = request
+            report: dict[str, Any] = {}
+            try:
+                rows = scan_workspace(
+                    Path(root),
+                    cancel_event=cancel_event,
+                    max_files=max_files,
+                    max_seconds=max_seconds,
+                    report=report,
+                    progress=progress,
+                )
+                connection.send(("ok", compact_scan_rows(rows), report, progress))
+            except BaseException as exc:
+                connection.send(("error", type(exc).__name__, str(exc), progress))
+    except (EOFError, BrokenPipeError, OSError):
+        return
+    finally:
+        connection.close()
 
 
 class WorkspaceStore:
@@ -157,6 +328,11 @@ class WorkspaceStore:
         self.event_limit = max(100, event_limit)
         self._lock = threading.RLock()
         self._workspace_locks: dict[str, threading.RLock] = {}
+        # Native watchers may emit duplicate `modified` notifications while this
+        # host filesystem exposes only second-resolution ctime/mtime. Keep a
+        # bounded-content fingerprint for touched files so a real same-metadata
+        # rewrite is not dropped, while an immediate duplicate remains a no-op.
+        self._native_content_signatures: dict[tuple[str, str], str] = {}
         self._ready = False
 
     def initialize(self) -> None:
@@ -170,8 +346,9 @@ class WorkspaceStore:
                 # read connection used by bootstrap/delta hot paths.
                 db.execute("PRAGMA journal_mode = WAL")
                 # New databases adopt incremental auto-vacuum before their
-                # schema is created. Existing databases switch during the
-                # threshold-gated one-time full VACUUM in maintain_database().
+                # schema is created. Legacy databases only switch through an
+                # explicitly opted-in offline maintain_database() call; normal
+                # service startup never performs a full VACUUM.
                 db.execute("PRAGMA auto_vacuum = INCREMENTAL")
                 db.executescript(
                     """
@@ -270,17 +447,23 @@ class WorkspaceStore:
             self._secure_database_files()
             self._ready = True
 
-    def maintain_database(self) -> dict[str, Any]:
-        """Reclaim meaningful freelist bloat outside interactive hot paths.
+    def maintain_database(
+        self,
+        *,
+        allow_full_vacuum: bool = False,
+    ) -> dict[str, Any]:
+        """Reclaim freelist bloat only when explicitly invoked.
 
-        The first maintenance of an older database performs the one required
-        full VACUUM to enable incremental auto-vacuum. Later startups reclaim
-        at most 4096 pages, bounding routine work while still reducing a large
-        high-water mark over time. SQLite's own locking keeps this safe; the
-        caller invokes it before the file index is exposed to requests.
+        New databases use incremental auto-vacuum from their first schema
+        transaction. A legacy database needs one full VACUUM to switch modes,
+        but that operation is never implicit: it can copy the whole database
+        and must not sit on the service readiness path. An offline maintenance
+        command may opt in after stopping MuseLab; even then, require enough
+        free space for both the original and replacement database.
         """
         self.initialize()
         started = time.monotonic()
+        required_headroom = 0
         with self._lock, self._connect() as db:
             before = self._database_stats(db)
             should_reclaim = (
@@ -288,25 +471,41 @@ class WorkspaceStore:
                 and before["free_ratio"] >= _VACUUM_MIN_FREE_RATIO
             )
             action = "none"
-            if should_reclaim:
-                db.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
-                if before["auto_vacuum"] != 2:
-                    db.execute("PRAGMA auto_vacuum = INCREMENTAL")
-                    db.execute("VACUUM")
-                    action = "full"
-                else:
-                    pages = min(
-                        before["freelist_count"],
-                        _INCREMENTAL_VACUUM_MAX_PAGES,
+            full_vacuum_required = False
+            if should_reclaim and before["auto_vacuum"] != 2:
+                full_vacuum_required = True
+                action = "full-required"
+                if allow_full_vacuum:
+                    database_bytes = self.path.stat().st_size
+                    required_headroom = max(
+                        database_bytes * 2,
+                        _FULL_VACUUM_MIN_FREE_BYTES,
                     )
-                    db.execute(f"PRAGMA incremental_vacuum({pages})")
-                    action = "incremental"
+                    free_bytes = shutil.disk_usage(self.path.parent).free
+                    if free_bytes >= required_headroom:
+                        db.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
+                        db.execute("PRAGMA auto_vacuum = INCREMENTAL")
+                        db.execute("VACUUM")
+                        action = "full"
+                        full_vacuum_required = False
+                    else:
+                        action = "full-skipped-no-space"
+            elif should_reclaim:
+                db.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
+                pages = min(
+                    before["freelist_count"],
+                    _INCREMENTAL_VACUUM_MAX_PAGES,
+                )
+                db.execute(f"PRAGMA incremental_vacuum({pages})")
+                action = "incremental"
             after = self._database_stats(db)
         self._secure_database_files()
         return {
             "action": action,
             "before": before,
             "after": after,
+            "full_vacuum_required": full_vacuum_required,
+            "required_headroom_bytes": required_headroom,
             "duration_ms": round((time.monotonic() - started) * 1000, 1),
         }
 
@@ -459,22 +658,39 @@ class WorkspaceStore:
         *,
         primary: bool = False,
         cancel_event: threading.Event | None = None,
-    ) -> int:
-        """Scan disk, update only changed rows, and log offline changes."""
+        max_files: int | None = _SCAN_MAX_FILES,
+        max_seconds: float | None = _SCAN_MAX_SECONDS,
+        report: dict[str, Any] | None = None,
+        scan_progress: dict[str, Any] | None = None,
+        snapshot: list[dict[str, Any]] | None = None,
+        expected_cursor: int | None = None,
+        return_payload: bool = False,
+    ) -> int | dict[str, Any]:
+        """Scan or apply a snapshot, logging offline changes atomically."""
         root = root.resolve()
-        # Keep a watcher batch from committing after our snapshot but before the
-        # reconciliation transaction. Different workspaces may still scan in
-        # parallel, while bootstrap/delta reads keep using the last-good index.
+        scan_report: dict[str, Any] = report if report is not None else {}
+        # Filesystem walking may happen in a separate process. The workspace lock
+        # serializes only durable application and native watcher transactions.
         with self._workspace_lock(workspace_id):
-            snapshot = scan_workspace(root, cancel_event=cancel_event)
+            if snapshot is None:
+                snapshot = scan_workspace(
+                    root,
+                    cancel_event=cancel_event,
+                    max_files=max_files,
+                    max_seconds=max_seconds,
+                    report=scan_report,
+                    progress=scan_progress,
+                )
+            partial = bool(scan_report.get("partial"))
             if cancel_event is not None and cancel_event.is_set():
                 raise WorkspaceScanCancelled("workspace scan cancelled")
-            self.register_workspace(
-                workspace_id,
-                root,
-                name,
-                primary=primary,
-            )
+            if expected_cursor is None:
+                self.register_workspace(
+                    workspace_id,
+                    root,
+                    name,
+                    primary=primary,
+                )
             if cancel_event is not None and cancel_event.is_set():
                 raise WorkspaceScanCancelled("workspace scan cancelled")
             with self._connect() as db:
@@ -483,31 +699,60 @@ class WorkspaceStore:
                 db.execute("BEGIN IMMEDIATE")
                 state = db.execute(
                     """
-                    SELECT initialized, current_seq
+                    SELECT initialized, current_seq, path
                     FROM workspaces WHERE id = ?
                     """,
                     (workspace_id,),
                 ).fetchone()
-                initialized = bool(state["initialized"]) if state else False
-                seq = int(state["current_seq"]) if state else 0
+                if state is None:
+                    db.rollback()
+                    raise KeyError(f"unknown workspace: {workspace_id}")
+                initialized = bool(state["initialized"])
+                seq = int(state["current_seq"])
+                if expected_cursor is not None and (
+                    seq != expected_cursor
+                    or state["path"] != str(root)
+                ):
+                    db.rollback()
+                    return {
+                        "_stale": True,
+                        "cursor": seq,
+                        "changes": [],
+                        "resync": True,
+                    }
                 old = {
                     row["path"]: row
                     for row in self._file_rows(db, workspace_id)
                 }
                 new = {row["path"]: row for row in snapshot}
+                complete_paths = scan_report.pop(
+                    "_snapshot_paths",
+                    set(new),
+                )
+                resumed = bool(scan_report.get("resumed"))
 
                 changes: list[dict[str, Any]] = []
+                resync = False
                 if not initialized:
-                    # A failed first scan may have left watcher-created rows.
-                    # Establish one authoritative baseline without replaying it
-                    # as thousands of synthetic "added" events.
-                    db.execute(
-                        "DELETE FROM files WHERE workspace_id = ?",
-                        (workspace_id,),
-                    )
-                    self._insert_files(db, workspace_id, snapshot)
+                    # A failed first scan may have left watcher-created rows. A
+                    # complete baseline replaces them authoritatively; a bounded
+                    # partial scan only merges observations because absence was
+                    # not proven for the unvisited remainder.
+                    if not partial:
+                        db.execute(
+                            "DELETE FROM files WHERE workspace_id = ?",
+                            (workspace_id,),
+                        )
+                        self._insert_files(db, workspace_id, snapshot)
+                    else:
+                        for row in snapshot:
+                            self._upsert_file(db, workspace_id, row)
                 else:
-                    deleted = sorted(old.keys() - new.keys())
+                    deleted = (
+                        []
+                        if partial
+                        else sorted(old.keys() - complete_paths)
+                    )
                     added = sorted(new.keys() - old.keys())
                     modified = sorted(
                         path
@@ -516,21 +761,21 @@ class WorkspaceStore:
                         != self._signature(new[path])
                     )
                     change_count = len(deleted) + len(added) + len(modified)
-                    if change_count > self._replay_limit():
-                        # A generated-tree policy change can invalidate tens of
-                        # thousands of rows at once. Replacing that workspace's
-                        # index in two bulk statements is substantially cheaper
-                        # than issuing one DELETE/UPSERT per stale path, and the
-                        # cursor gap below already requires clients to bootstrap.
+                    if (
+                        change_count > self._replay_limit()
+                        and not partial
+                        and not resumed
+                    ):
+                        # A complete one-pass snapshot can replace the index in
+                        # bulk. Resumed/partial passes contain only this pass's
+                        # metadata, so they must preserve rows observed earlier.
                         db.execute(
                             "DELETE FROM files WHERE workspace_id = ?",
                             (workspace_id,),
                         )
                         self._insert_files(db, workspace_id, snapshot)
-                        # Create a deliberate cursor gap. `delta()` turns any
-                        # pre-reset cursor into `resync=true`, while a client
-                        # bootstrapped at the new cursor continues normally.
                         seq = self._reset_replay(db, workspace_id, seq)
+                        resync = True
                     else:
                         if deleted:
                             db.executemany(
@@ -546,24 +791,30 @@ class WorkspaceStore:
                                 workspace_id,
                                 new[path],
                             )
-                        changes.extend(
-                            {"type": "deleted", "path": path}
-                            for path in deleted
-                        )
-                        changes.extend(
-                            {"type": "added", **new[path]}
-                            for path in added
-                        )
-                        changes.extend(
-                            {"type": "modified", **new[path]}
-                            for path in modified
-                        )
-                        seq = self._append_events(
-                            db,
-                            workspace_id,
-                            seq,
-                            changes,
-                        )
+                        if change_count > self._replay_limit():
+                            # Preserve the incrementally assembled index but use
+                            # a cursor gap instead of retaining a huge replay.
+                            seq = self._reset_replay(db, workspace_id, seq)
+                            resync = True
+                        else:
+                            changes.extend(
+                                {"type": "deleted", "path": path}
+                                for path in deleted
+                            )
+                            changes.extend(
+                                {"type": "added", **new[path]}
+                                for path in added
+                            )
+                            changes.extend(
+                                {"type": "modified", **new[path]}
+                                for path in modified
+                            )
+                            seq = self._append_events(
+                                db,
+                                workspace_id,
+                                seq,
+                                changes,
+                            )
 
                 # Cancellation cannot pre-empt a single sqlite C call, but it
                 # can prevent a fully computed, now-stale snapshot from being
@@ -584,7 +835,40 @@ class WorkspaceStore:
                 if cancel_event is not None and cancel_event.is_set():
                     raise WorkspaceScanCancelled("workspace scan cancelled")
                 db.commit()
+                if return_payload:
+                    return {
+                        "cursor": seq,
+                        "changes": [] if resync else self._wire_changes(changes),
+                        "resync": resync,
+                    }
                 return seq
+
+    def apply_reconcile_snapshot(
+        self,
+        workspace_id: str,
+        root: Path,
+        name: str,
+        snapshot: Iterable[ScanRow],
+        scan_report: dict[str, Any],
+        *,
+        expected_cursor: int,
+        primary: bool = False,
+        cancel_event: threading.Event | None = None,
+    ) -> dict[str, Any]:
+        """Verify the durable cursor, apply a scan, and return its exact payload."""
+        result = self.reconcile(
+            workspace_id,
+            root,
+            name,
+            primary=primary,
+            cancel_event=cancel_event,
+            report=scan_report,
+            snapshot=expand_scan_rows(snapshot),
+            expected_cursor=expected_cursor,
+            return_payload=True,
+        )
+        assert isinstance(result, dict)
+        return result
 
     def apply_changes(
         self,
@@ -790,9 +1074,29 @@ class WorkspaceStore:
                         """,
                         (workspace_id, path),
                     ).fetchone()
+                    force_file_modified = False
+                    if (
+                        not row["is_dir"]
+                        and "modified" in kinds_by_path.get(path, set())
+                    ):
+                        try:
+                            content_signature = self._content_signature(
+                                root / path, int(row["size"]),
+                            )
+                        except OSError:
+                            content_signature = ""
+                        cache_key = (workspace_id, path)
+                        force_file_modified = (
+                            not content_signature
+                            or self._native_content_signatures.get(cache_key)
+                            != content_signature
+                        )
+                        if content_signature:
+                            self._native_content_signatures[cache_key] = content_signature
                     if (
                         old is not None
                         and self._signature(old) == self._signature(row)
+                        and not force_file_modified
                     ):
                         continue
                     watch_refresh = (
@@ -1066,6 +1370,23 @@ class WorkspaceStore:
                 path.chmod(0o600)
             except FileNotFoundError:
                 continue
+
+    @staticmethod
+    def _content_signature(path: Path, size: int) -> str:
+        """Hash bounded samples from one watcher-touched file."""
+        chunk = 64 * 1024
+        digest = hashlib.blake2b(digest_size=16)
+        digest.update(str(size).encode("ascii"))
+        with path.open("rb") as handle:
+            if size <= chunk * 3:
+                digest.update(handle.read())
+            else:
+                digest.update(handle.read(chunk))
+                handle.seek(max(chunk, size // 2 - chunk // 2))
+                digest.update(handle.read(chunk))
+                handle.seek(max(0, size - chunk))
+                digest.update(handle.read(chunk))
+        return digest.hexdigest()
 
     @staticmethod
     def _signature(row: dict[str, Any] | sqlite3.Row) -> tuple[Any, ...]:

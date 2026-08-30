@@ -16,6 +16,19 @@ def _service(tmp_path, monkeypatch):
         "_metadata",
         lambda sid: (f"Session {sid}", workspace, "ws"),
     )
+    # Service-unit fixtures use synthetic session ids rather than creating full
+    # chat sessions. Treat their ledger rows as live unless a test explicitly
+    # overrides this source to exercise phantom-session filtering.
+    from backend import activity as activity_module
+    monkeypatch.setattr(
+        activity_module.sessions,
+        "list_sessions",
+        lambda: [
+            {"id": row.get("session_id")}
+            for row in service._events
+            if row.get("session_id")
+        ],
+    )
     return service
 
 
@@ -500,6 +513,149 @@ def test_custom_groups_persist_reorder_and_assignment_without_rewriting_task(
     assert state["assignments"] == {}
 
 
+def test_compact_successor_atomically_inherits_activity_lineage_and_placement(
+    tmp_path,
+    monkeypatch,
+):
+    service = _service(tmp_path, monkeypatch)
+    source = service.start("source", summary="compact me")
+    service.finish("source", "completed")
+    group = service.create_group("Recovery", "violet")["group"]
+    service.set_group(source["id"], group["id"], before_event_id="")
+    service.set_pin(source["id"], True)
+    before = next(row for row in service.list() if row["id"] == source["id"])
+
+    inherited = service.inherit_session("source", "child", successor=True)
+
+    assert inherited["item"]["id"] == source["id"]
+    assert inherited["item"]["session_id"] == "child"
+    assert inherited["item"]["session_name"] == "Session child"
+    assert inherited["group_id"] == group["id"]
+    assert all(row["session_id"] != "source" for row in service.list())
+    after = next(row for row in service.list() if row["session_id"] == "child")
+    for field in (
+        "id", "updated_at", "started_at", "finished_at", "state", "read",
+        "task_summary", "turn_count", "pinned", "group_id", "group_order",
+    ):
+        assert after[field] == before[field]
+    assert service._group_assignments == {"child": group["id"]}
+
+    revision = service.revision
+    retry = service.inherit_session("source", "child", successor=True)
+    assert retry["item"]["id"] == source["id"]
+    assert service.revision == revision
+
+    restarted = _service(tmp_path, monkeypatch)
+    restored = restarted.list()[0]
+    assert restored["id"] == source["id"]
+    assert restored["session_id"] == "child"
+    assert restarted._group_assignments == {"child": group["id"]}
+
+
+def test_successor_does_not_inherit_owner_from_completed_human_turn(
+    tmp_path,
+    monkeypatch,
+):
+    service = _service(tmp_path, monkeypatch)
+    source = service.start(
+        "source",
+        summary="launch background work",
+        activity_source="direct",
+        owner_id="source-turn",
+    )
+    source_done = service.finish(
+        "source",
+        "completed",
+        activity_source="direct",
+        owner_id="source-turn",
+    )
+    assert source_done["state"] == "completed"
+    assert source_done["owner_id"] == "source-turn"
+    assert "active_owner_ids" not in source_done
+
+    inherited = service.inherit_session("source", "child", successor=True)
+    assert inherited["item"]["session_id"] == "child"
+    assert inherited["item"]["owner_id"] == "source-turn"
+    assert "active_owner_ids" not in inherited["item"]
+
+    child = service.start(
+        "child",
+        summary="independent child turn",
+        activity_source="direct",
+        owner_id="child-turn",
+    )
+    assert child["id"] == source["id"]
+    assert child["owner_id"] == "child-turn"
+    assert "active_owner_ids" not in child
+
+    child_done = service.finish(
+        "child",
+        "completed",
+        activity_source="direct",
+        owner_id="child-turn",
+    )
+    assert child_done["state"] == "completed"
+    assert child_done["session_id"] == "child"
+    assert child_done["owner_id"] == "child-turn"
+    assert "active_owner_ids" not in child_done
+    assert service.summary()["running"] == 0
+
+
+def test_ordinary_fork_inherits_group_without_stealing_source_lineage(
+    tmp_path,
+    monkeypatch,
+):
+    service = _service(tmp_path, monkeypatch)
+    source = service.start("source", summary="branch me")
+    group = service.create_group("Branches", "green")["group"]
+    service.set_group(source["id"], group["id"])
+
+    inherited = service.inherit_session("source", "child")
+
+    assert inherited["item"] is None
+    assert inherited["group_id"] == group["id"]
+    assert next(row for row in service.list() if row["session_id"] == "source")
+    child = service.start("child", summary="new branch")
+    assert child["id"] != source["id"]
+    assert child["group_id"] == group["id"]
+    assert {row["session_id"] for row in service.list()} == {"source", "child"}
+    assert service._group_assignments == {
+        "source": group["id"],
+        "child": group["id"],
+    }
+
+
+def test_successor_inheritance_rolls_back_both_activity_files_on_failure(
+    tmp_path,
+    monkeypatch,
+):
+    service = _service(tmp_path, monkeypatch)
+    source = service.start("source", summary="keep source")
+    group = service.create_group("Stable", "amber")["group"]
+    service.set_group(source["id"], group["id"], before_event_id="")
+    real_save = service._save
+    calls = 0
+
+    def fail_once():
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OSError("simulated successor write failure")
+        real_save()
+
+    monkeypatch.setattr(service, "_save", fail_once)
+    with pytest.raises(OSError, match="simulated successor write failure"):
+        service.inherit_session("source", "child", successor=True)
+
+    row = service.list()[0]
+    assert row["session_id"] == "source"
+    assert row["id"] == source["id"]
+    assert service._group_assignments == {"source": group["id"]}
+    restarted = _service(tmp_path, monkeypatch)
+    assert restarted.list()[0]["session_id"] == "source"
+    assert restarted._group_assignments == {"source": group["id"]}
+
+
 def test_group_layout_order_includes_ungrouped_and_persists(
     tmp_path,
     monkeypatch,
@@ -719,13 +875,26 @@ async def test_rename_persists_and_pushes_without_reordering_task(
 
 def test_restart_marks_running_as_failed(tmp_path, monkeypatch):
     service = _service(tmp_path, monkeypatch)
-    service.start("s1", summary="long task")
+    service.start(
+        "s1",
+        summary="long task",
+        owner_id="pre-restart-owner",
+    )
     restarted = _service(tmp_path, monkeypatch)
     row = restarted.list()[0]
     assert row["state"] == "failed"
     assert row["needs_attention"] is False
     assert row["read"] is False
     assert row["updated_at"] == row["finished_at"]
+    assert "owner_id" not in row
+    assert "active_owner_ids" not in row
+
+    resumed = restarted.start("s1", summary="next turn", owner_id="new-owner")
+    assert resumed["owner_id"] == "new-owner"
+    assert "active_owner_ids" not in resumed
+    finished = restarted.finish("s1", "completed", owner_id="new-owner")
+    assert finished["state"] == "completed"
+    assert restarted.summary()["running"] == 0
     assert json.loads((Path(tmp_path) / ".muselab" / "activity.json").read_text())
 
 
@@ -745,6 +914,34 @@ async def test_subscriber_receives_task_transition_without_polling(
     assert payload["summary"]["running"] == 1
     assert payload["summary"]["revision"] == 1
     assert payload["summary"]["generation"] == payload["generation"]
+
+
+@pytest.mark.asyncio
+async def test_sse_summary_excludes_unopenable_unread_rows(
+    tmp_path,
+    monkeypatch,
+):
+    service = _service(tmp_path, monkeypatch)
+    from backend import activity as activity_module
+
+    live_ids = {"deleted", "running"}
+    monkeypatch.setattr(
+        activity_module.sessions,
+        "list_sessions",
+        lambda: [{"id": sid} for sid in sorted(live_ids)],
+    )
+    service.start("deleted", summary="old completed task")
+    service.finish("deleted", "completed")
+    live_ids.remove("deleted")
+
+    async with service.subscribe() as queue:
+        await asyncio.to_thread(
+            service.start, "running", summary="current running task")
+        payload = await asyncio.wait_for(queue.get(), timeout=1)
+
+    assert payload["summary"]["running"] == 1
+    assert payload["summary"]["unread"] == 0
+    assert payload["summary"] == service.summary(filter_live=True)
 
 
 @pytest.mark.asyncio
@@ -808,6 +1005,129 @@ def test_activity_pin_endpoint_is_authenticated_and_returns_live_envelope(
     assert payload["item"]["pinned"] is True
     assert payload["revision"] == service.revision
     assert payload["generation"] == service.generation
+
+
+def test_activity_group_workspace_binding_migrates_and_does_not_filter_members(
+    tmp_path,
+    monkeypatch,
+):
+    storage = tmp_path / ".muselab"
+    storage.mkdir()
+    groups_path = storage / "activity-groups.json"
+    groups_path.write_text(json.dumps({
+        "version": 2,
+        "groups": [{"id": "legacy", "name": "Legacy", "color": "blue"}],
+        "assignments": {},
+        "order": ["legacy", "__ungrouped__"],
+    }), encoding="utf-8")
+
+    service = _service(tmp_path, monkeypatch)
+    assert service.list_groups()[0] == {
+        "id": "legacy", "name": "Legacy", "color": "blue",
+    }
+    assert json.loads(groups_path.read_text(encoding="utf-8"))["version"] == 2
+
+    bound = service.create_group(
+        "Bound",
+        "violet",
+        workspace_id="workspace-a",
+        workspace_path="/workspaces/a",
+    )["group"]
+    persisted = json.loads(groups_path.read_text(encoding="utf-8"))
+    assert persisted["version"] == 3
+    assert bound["workspace_id"] == "workspace-a"
+    assert bound["workspace_path"] == "/workspaces/a"
+
+    monkeypatch.setattr(
+        service,
+        "_metadata",
+        lambda sid: (f"Session {sid}", "/workspaces/b", "Workspace B"),
+    )
+    item = service.start("session-from-workspace-b", summary="cross workspace")
+    assert item["workspace"] == "/workspaces/b"
+    moved = service.set_group(item["id"], bound["id"])
+    assert moved["item"]["group_id"] == bound["id"]
+
+    with pytest.raises(ValueError, match="workspace binding is incomplete"):
+        service.update_group(
+            bound["id"],
+            name="Must not leak",
+            workspace_id="workspace-b",
+            workspace_path=None,
+        )
+    assert next(group for group in service.list_groups()
+                if group["id"] == bound["id"])["name"] == "Bound"
+
+    renamed = service.update_group(bound["id"], name="Still bound")["group"]
+    assert renamed["workspace_id"] == "workspace-a"
+    unbound = service.update_group(
+        bound["id"], workspace_id=None, workspace_path=None,
+    )["group"]
+    assert "workspace_id" not in unbound
+    assert "workspace_path" not in unbound
+
+    reloaded = ActivityService(tmp_path)
+    assert next(group for group in reloaded.list_groups()
+                if group["id"] == bound["id"])["name"] == "Still bound"
+
+
+def test_activity_group_workspace_binding_api_lifecycle(
+    client,
+    auth,
+    tmp_path,
+    monkeypatch,
+):
+    from backend import activity_api
+
+    service = _service(tmp_path, monkeypatch)
+    monkeypatch.setattr(activity_api, "activity", service)
+    workspace = activity_api.workspace_registry.list()[0]
+
+    created = client.post(
+        "/api/activity/groups",
+        headers=auth,
+        json={
+            "name": "Workspace group",
+            "color": "cyan",
+            "workspace_id": workspace.id,
+        },
+    )
+    assert created.status_code == 200
+    group = created.json()["group"]
+    assert group["workspace_id"] == workspace.id
+    assert group["workspace_path"] == workspace.path
+
+    renamed = client.patch(
+        f"/api/activity/groups/{group['id']}",
+        headers=auth,
+        json={"name": "Renamed only"},
+    )
+    assert renamed.status_code == 200
+    assert renamed.json()["group"]["workspace_id"] == workspace.id
+
+    unknown = client.patch(
+        f"/api/activity/groups/{group['id']}",
+        headers=auth,
+        json={"workspace_id": "missing-generation"},
+    )
+    assert unknown.status_code == 400
+    assert service.list_groups()[0]["workspace_id"] == workspace.id
+
+    forbidden_path = client.patch(
+        f"/api/activity/groups/{group['id']}",
+        headers=auth,
+        json={"workspace_path": workspace.path},
+    )
+    assert forbidden_path.status_code == 422
+
+    cleared = client.patch(
+        f"/api/activity/groups/{group['id']}",
+        headers=auth,
+        json={"workspace_id": None},
+    )
+    assert cleared.status_code == 200
+    assert "workspace_id" not in cleared.json()["group"]
+    assert "workspace_path" not in cleared.json()["group"]
 
 
 def test_activity_group_endpoints_manage_and_assign_custom_groups(

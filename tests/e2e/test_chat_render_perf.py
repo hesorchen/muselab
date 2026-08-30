@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import time
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 import pytest
 
@@ -36,7 +36,7 @@ def _login(page: Page, base: str, token: str) -> None:
     page.wait_for_function(
         """() => {
           const app = document.querySelector("#app")?._x_dataStack?.[0];
-          return app && app.authed === true && app.appReady
+          return app && app.authed === true && app.appReady && app._modelsLoaded
             && app._sessionsInitialized && app.currentId
             && app.openTabIds.includes(app.currentId) && app.sessions.length > 0;
         }"""
@@ -71,7 +71,8 @@ def _app_eval(page: Page, body: str, arg=None):
     return page.evaluate(
         """([body, arg]) => {
             const app = document.querySelector("#app")._x_dataStack[0];
-            return (new Function("app", "arg", body))(app, arg);
+            const AsyncFunction = Object.getPrototypeOf(async function() {}).constructor;
+            return (new AsyncFunction("app", "arg", body))(app, arg);
         }""",
         [body, arg],
     )
@@ -151,6 +152,7 @@ def _route_windowed_session(page: Page, sid: str, messages: list[dict]) -> list[
             window = messages[offset:offset + limit]
         requests.append({
             "url": url,
+            "full": "full" in qs,
             "tail": int(qs["tail"][0]) if "tail" in qs else None,
             "offset": offset,
             "limit": int(qs["limit"][0]) if "limit" in qs else None,
@@ -169,6 +171,7 @@ def _route_windowed_session(page: Page, sid: str, messages: list[dict]) -> list[
                 "offset": offset,
                 "total": total,
                 "has_more": offset > 0,
+                "history_order": "full" if "full" in qs else "normal",
                 "history_generation": "gen-e2e-1",
             }),
         )
@@ -182,6 +185,15 @@ def _install_fake_event_source(page: Page) -> None:
         """
         (() => {
           const streams = [];
+          const originalFetch = window.fetch.bind(window);
+          window.fetch = (url, init) => {
+            if (String(url).includes("/api/chat/stream/mux/start")) {
+              return Promise.resolve(new Response("{}", {
+                status: 404, headers: {"Content-Type": "application/json"},
+              }));
+            }
+            return originalFetch(url, init);
+          };
           class FakeEventSource extends EventTarget {
             constructor(url) {
               super();
@@ -201,13 +213,59 @@ def _install_fake_event_source(page: Page) -> None:
           window.__fakeChatStreams = () => streams.filter(
             es => String(es.url || "").includes("/api/chat/stream?")
           );
-          window.__emitSse = (type, payload) => {
-            const chatStreams = window.__fakeChatStreams();
-            const es = chatStreams[chatStreams.length - 1];
-            if (!es) throw new Error("no fake chat EventSource");
+          window.__emitSseAt = (index, type, payload) => {
+            const es = window.__fakeChatStreams()[index];
+            if (!es) throw new Error("no fake chat EventSource at index " + index);
             es.dispatchEvent(new MessageEvent(type, {
               data: typeof payload === "string" ? payload : JSON.stringify(payload || {}),
             }));
+          };
+          window.__emitSse = (type, payload) => {
+            const chatStreams = window.__fakeChatStreams();
+            window.__emitSseAt(chatStreams.length - 1, type, payload);
+          };
+        })();
+        """
+    )
+
+
+def _install_fake_mux_event_source(page: Page) -> None:
+    page.add_init_script(
+        """
+        (() => {
+          const streams = [];
+          class FakeEventSource extends EventTarget {
+            constructor(url) {
+              super();
+              this.url = url;
+              this.readyState = 0;
+              streams.push(this);
+              setTimeout(() => {
+                if (this.readyState === 2) return;
+                this.readyState = 1;
+                if (this.onopen) this.onopen(new Event("open"));
+                this.dispatchEvent(new Event("open"));
+              }, 0);
+            }
+            close() { this.readyState = 2; this.closed = true; }
+          }
+          window.EventSource = FakeEventSource;
+          window.__fakeMuxStreams = () => streams.filter(
+            es => String(es.url || "").includes("/api/chat/stream/mux?")
+          );
+          window.__emitMux = (type, payload, index = -1) => {
+            const mux = window.__fakeMuxStreams();
+            const es = mux[index < 0 ? mux.length - 1 : index];
+            if (!es) throw new Error("no fake mux EventSource");
+            es.dispatchEvent(new MessageEvent(type, {
+              data: typeof payload === "string" ? payload : JSON.stringify(payload || {}),
+            }));
+          };
+          window.__disconnectMux = () => {
+            const mux = window.__fakeMuxStreams();
+            const es = mux[mux.length - 1];
+            if (!es) throw new Error("no fake mux EventSource");
+            es.dispatchEvent(new Event("error"));
           };
         })();
         """
@@ -229,6 +287,419 @@ def _visible_pane_with_text_snapshot(page: Page, text: str):
         }""",
         text,
     )
+
+
+def test_mux_routes_two_sessions_reconnects_with_checkpoints_and_defers_watcher_runtime(
+    page: Page, backend_url, auth_token,
+):
+    errors = _capture_browser_errors(page)
+    _install_fake_mux_event_source(page)
+    mux_starts: list[dict] = []
+    turn_starts: list[dict] = []
+
+    def handle_mux_start(route) -> None:
+        mux_starts.append(route.request.post_data_json)
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({"ticket": f"mux-{len(mux_starts)}"}),
+        )
+
+    def handle_turn_start(route) -> None:
+        turn_starts.append(route.request.post_data_json)
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({
+                "accepted": True,
+                "session_id": route.request.post_data_json["session_id"],
+                "turn_id": "turn-local",
+                "started_at": int(time.time()),
+            }),
+        )
+
+    page.route("**/api/chat/stream/mux/start", handle_mux_start)
+    page.route("**/api/chat/turns/start", handle_turn_start)
+    _login(page, backend_url, auth_token)
+    page.wait_for_function("window.__fakeMuxStreams().length === 1")
+
+    watcher_sid = "mux-watcher-session"
+    initial = page.evaluate(
+        """async watcherSid => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const localSid = app.currentId;
+          app._confirmSessionBusy = async () => false;
+          app._awaitRuntimeSettingPatches = async () => true;
+          app.availableModels = [{
+            model: 'mux-e2e-model', label: 'Mux E2E', group: 'e2e',
+            supports_thinking: true,
+          }];
+          app.model = 'mux-e2e-model';
+          app.permission = 'default';
+          app.sessions = app.sessions.map(session => session.id === localSid
+            ? {...session, model: 'mux-e2e-model', permission: 'default'} : session);
+          app._ensureTabState(localSid).permission = 'default';
+          app.sessions.push({
+            id: watcherSid, name: 'Watcher session', model: 'mux-e2e-model',
+            permission: 'default', cwd: app.currentWorkspacePath(), active: true,
+          });
+          window.__emitMux('session_state', {
+            session_id: watcherSid, active: true, attachable: false,
+            background: true, continuation: false, turn_id: 'watcher-gap',
+            started_at: Math.floor(Date.now() / 1000),
+            background_tasks_pending: 1,
+          });
+          await new Promise(resolve => setTimeout(resolve, 30));
+          const watcherCreatedDuringGap = !!app.tabState[watcherSid];
+          const watcher = app._ensureTabState(watcherSid);
+          watcher._loaded = true;
+          if (!app.openTabIds.includes(watcherSid)) app.openTabIds.push(watcherSid);
+          window.__emitMux('session_state', {
+            session_id: watcherSid, active: true, attachable: true,
+            background: false, continuation: true, turn_id: 'turn-watcher',
+            parent_turn_id: 'watcher-gap', started_at: Math.floor(Date.now() / 1000),
+          });
+          for (let i = 0; i < 100 && !watcher.es; i++) {
+            await new Promise(resolve => setTimeout(resolve, 10));
+          }
+          const local = app._ensureTabState(localSid);
+          local.draft.input = 'MUX_LOCAL_PROMPT';
+          app._activateComposerState(localSid);
+          await app.send();
+          return {
+            localSid,
+            watcherCreatedDuringGap,
+            watcherAttached: !!watcher.es,
+            nativeStreamCount: window.__fakeMuxStreams().length,
+          };
+        }""",
+        watcher_sid,
+    )
+    assert initial == {
+        "localSid": initial["localSid"],
+        "watcherCreatedDuringGap": False,
+        "watcherAttached": True,
+        "nativeStreamCount": 1,
+    }
+
+    page.evaluate(
+        """({localSid, watcherSid}) => {
+          window.__emitMux('text', {
+            session_id: localSid, turn_id: 'turn-local', event_seq: 1,
+            text: 'MUX_LOCAL_REPLY',
+          });
+          window.__emitMux('text', {
+            session_id: watcherSid, turn_id: 'turn-watcher', event_seq: 1,
+            text: 'MUX_BACKGROUND_REPLY',
+          });
+        }""",
+        {"localSid": initial["localSid"], "watcherSid": watcher_sid},
+    )
+    page.wait_for_function(
+        """sid => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          return app.tabState[sid]?.lastEventSeq === 1;
+        }""",
+        arg=initial["localSid"],
+    )
+    page.evaluate(
+        """async sid => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          await app.activateTab(sid);
+        }""",
+        watcher_sid,
+    )
+    page.wait_for_function(
+        """sid => document.querySelector('#app')._x_dataStack[0]
+          .tabState[sid].messages.some(m => m.text === 'MUX_BACKGROUND_REPLY')""",
+        arg=watcher_sid,
+    )
+
+    page.evaluate("window.__disconnectMux()")
+    page.wait_for_function("window.__fakeMuxStreams().length === 2", timeout=5000)
+    state = page.evaluate(
+        """({localSid, watcherSid}) => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          return {
+            localStreaming: app.tabState[localSid].streaming,
+            watcherStreaming: app.tabState[watcherSid].streaming,
+            localSeq: app.tabState[localSid].lastEventSeq,
+            watcherSeq: app.tabState[watcherSid].lastEventSeq,
+            nativeStreamCount: window.__fakeMuxStreams().length,
+          };
+        }""",
+        {"localSid": initial["localSid"], "watcherSid": watcher_sid},
+    )
+    assert state == {
+        "localStreaming": True,
+        "watcherStreaming": True,
+        "localSeq": 1,
+        "watcherSeq": 1,
+        "nativeStreamCount": 2,
+    }
+    assert len(turn_starts) == 1
+    assert turn_starts[0] == {
+        "prompt": "MUX_LOCAL_PROMPT",
+        "session_id": initial["localSid"],
+        "model": "mux-e2e-model",
+        "permission": "default",
+        "image_ids": "",
+        "mobile": False,
+    }
+    assert len(mux_starts) == 2
+    checkpoints = {
+        (row["session_id"], row["turn_id"]): row["last_event_seq"]
+        for row in mux_starts[1]["checkpoints"]
+    }
+    assert checkpoints[(initial["localSid"], "turn-local")] == 1
+    assert checkpoints[(watcher_sid, "turn-watcher")] == 1
+    _assert_no_browser_errors(page, errors)
+
+
+def test_mux_inactive_retires_matching_turn_without_harming_successor(
+    page: Page, backend_url, auth_token,
+):
+    errors = _capture_browser_errors(page)
+    _install_fake_mux_event_source(page)
+    page.route(
+        "**/api/chat/stream/mux/start",
+        lambda route: route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({"ticket": "mux-inactive-settlement"}),
+        ),
+    )
+    _login(page, backend_url, auth_token)
+    page.wait_for_function("window.__fakeMuxStreams().length === 1")
+
+    result = page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const sid = app.currentId;
+          const st = app._ensureTabState(sid);
+          const meta = app.sessions.find(session => session.id === sid);
+          const originalReload = app._scheduleCanonicalStreamReload;
+          let reloads = 0;
+          app._scheduleCanonicalStreamReload = () => { reloads += 1; return true; };
+          try {
+            st._loaded = true;
+            st.messages = [{ role: 'assistant', text: 'VISIBLE_COMPLETED_REPLY' }];
+            st.streaming = true;
+            st.streamPhase = 'runtime';
+            st.activeTurnId = 'turn-a';
+            st._stoppingTurnId = 'turn-a';
+            st.es = app._chatMuxChannel(sid, 'turn-a');
+            app._activateChatMuxChannel(st.es);
+            st._streamStartedAt = Date.now() - 5000;
+            st.streamElapsed = 5;
+            st._streamTimer = setInterval(() => {}, 1000);
+            st._stallWatch = setInterval(() => {}, 1000);
+            if (meta) meta.active = true;
+
+            window.__emitMux('session_state', {
+              session_id: sid, turn_id: 'turn-a', active: false,
+              stopping: false, attachable: false,
+            });
+            await new Promise(resolve => setTimeout(resolve, 30));
+            const matching = {
+              streaming: st.streaming,
+              phase: st.streamPhase,
+              es: st.es,
+              timer: st._streamTimer,
+              stall: st._stallWatch,
+              stoppingTurn: st._stoppingTurnId,
+              elapsed: st.streamElapsed,
+              reloads,
+              text: st.messages[0] && st.messages[0].text,
+              metaActive: meta && meta.active,
+            };
+
+            st.streaming = true;
+            st.streamPhase = 'runtime';
+            st.activeTurnId = 'turn-b';
+            st._stoppingTurnId = '';
+            st.es = app._chatMuxChannel(sid, 'turn-b');
+            app._activateChatMuxChannel(st.es);
+            st._streamTimer = setInterval(() => {}, 1000);
+            st._stallWatch = setInterval(() => {}, 1000);
+            if (meta) meta.active = true;
+            const successorEs = st.es;
+            const successorTimer = st._streamTimer;
+
+            window.__emitMux('session_state', {
+              session_id: sid, turn_id: 'turn-a', active: false,
+              stopping: false, attachable: false,
+            });
+            await new Promise(resolve => setTimeout(resolve, 30));
+            const successor = {
+              streaming: st.streaming,
+              phase: st.streamPhase,
+              sameEs: st.es === successorEs,
+              sameTimer: st._streamTimer === successorTimer,
+              activeTurnId: st.activeTurnId,
+              reloads,
+              metaActive: meta && meta.active,
+            };
+            clearInterval(st._streamTimer);
+            clearInterval(st._stallWatch);
+            if (st.es) st.es.close();
+            return { matching, successor };
+          } finally {
+            app._scheduleCanonicalStreamReload = originalReload;
+          }
+        }"""
+    )
+    assert result["matching"] == {
+        "streaming": False,
+        "phase": "",
+        "es": None,
+        "timer": None,
+        "stall": None,
+        "stoppingTurn": "",
+        "elapsed": 0,
+        "reloads": 1,
+        "text": "VISIBLE_COMPLETED_REPLY",
+        "metaActive": False,
+    }
+    assert result["successor"] == {
+        "streaming": True,
+        "phase": "runtime",
+        "sameEs": True,
+        "sameTimer": True,
+        "activeTurnId": "turn-b",
+        "reloads": 1,
+        "metaActive": True,
+    }
+    _assert_no_browser_errors(page, errors)
+
+
+def test_mux_coordinator_connects_before_background_history_warmup(
+    page: Page, backend_url, auth_token,
+):
+    """The root live transport owns events before background history starts."""
+    _login(page, backend_url, auth_token)
+    order = page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          if (app._chatMuxStartPromise) {
+            try { await app._chatMuxStartPromise; } catch (_) {}
+          }
+          app._setChatMuxUnsupported();
+          const originalEnsure = app._ensureChatMux;
+          const originalHistory = app._bootstrapChatMuxHistory;
+          const order = [];
+          app._chatMuxSupported = true;
+          app._ensureChatMux = async () => {
+            order.push('mux:start');
+            await Promise.resolve();
+            order.push('mux:connected');
+            return true;
+          };
+          app._bootstrapChatMuxHistory = async () => order.push('history:start');
+          try {
+            await app._startChatMuxCoordinator();
+            return order;
+          } finally {
+            app._ensureChatMux = originalEnsure;
+            app._bootstrapChatMuxHistory = originalHistory;
+          }
+        }"""
+    )
+    assert order == ["mux:start", "mux:connected", "history:start"]
+
+
+def test_deferred_history_bodies_load_without_manual_body_action(
+    page: Page, backend_url, auth_token,
+):
+    errors = _capture_browser_errors(page)
+    _login(page, backend_url, auth_token)
+    requested: list[str] = []
+    full = {
+        "assistant-record:0:assistant": {
+            "role": "assistant", "text": "ASSISTANT_FULL_BODY_MARKER",
+        },
+        "thinking-record:0:thinking": {
+            "role": "thinking", "text": "THINKING_FULL_BODY_MARKER",
+        },
+        "tool-record:0:tool_result": {
+            "role": "tool_result", "text": "TOOL_FULL_BODY_MARKER",
+            "tool_name": "UnknownTool",
+        },
+        "compact-record:0:user": {
+            "role": "user", "text": "COMPACT_FULL_BODY_MARKER",
+            "_is_compact_summary": True,
+        },
+    }
+
+    def handle_body(route) -> None:
+        block_id = unquote(urlparse(route.request.url).path.rsplit("/", 1)[-1])
+        requested.append(block_id)
+        payload = {
+            **full[block_id],
+            "block_id": block_id,
+            "body_ref": block_id,
+            "body_available": True,
+            "body_state": "loaded",
+            "body_length": len(full[block_id]["text"]),
+        }
+        route.fulfill(status=200, content_type="application/json",
+                      body=json.dumps(payload))
+
+    page.route("**/api/chat/sessions/*/blocks/*", handle_body)
+    sid = _app_eval(page, "return app.currentId;")
+    _app_eval(
+        page,
+        """
+        const st = app._ensureTabState(arg);
+        const deferred = (role, blockId, extra = {}) => ({
+          role, block_id: blockId, body_ref: blockId,
+          body_available: true, body_state: "unloaded", body_length: 12000,
+          text: role + " preview", preview: role + " preview",
+          _k: arg + ":block:" + blockId, _noAnim: true, ...extra,
+        });
+        st._loaded = true;
+        st.messages = [
+          deferred("assistant", "assistant-record:0:assistant", {
+            html: "<p>assistant preview</p>",
+          }),
+          deferred("thinking", "thinking-record:0:thinking"),
+          deferred("tool_result", "tool-record:0:tool_result", {
+            tool_name: "UnknownTool", is_error: false,
+          }),
+          deferred("user", "compact-record:0:user", {
+            _is_compact_summary: true,
+          }),
+        ];
+        st.messageRange.visibleEnd = st.messages.length;
+        st.messageRange.total = st.messages.length;
+        app._expandedMsgs = {};
+        app._activateTabState(arg);
+        app._ensureTabState(app.currentId).messagesReady = true;
+        return true;
+        """,
+        sid,
+    )
+
+    page.wait_for_function(
+        """() => document.body.textContent.includes('ASSISTANT_FULL_BODY_MARKER')"""
+    )
+    assert requested == ["assistant-record:0:assistant"]
+    expect(page.get_by_text("Load full body")).to_have_count(0)
+    expect(page.get_by_text("加载完整正文")).to_have_count(0)
+
+    page.locator(".thinking-head").click()
+    expect(page.locator(".thinking-head + pre").filter(has_text="THINKING_FULL_BODY_MARKER")).to_be_visible()
+    page.locator(".tool-result-head").click()
+    expect(page.get_by_text("TOOL_FULL_BODY_MARKER")).to_be_visible()
+    page.locator(".compact-summary-pill").click()
+    expect(page.get_by_text("COMPACT_FULL_BODY_MARKER")).to_be_visible()
+    assert requested == [
+        "assistant-record:0:assistant",
+        "thinking-record:0:thinking",
+        "tool-record:0:tool_result",
+        "compact-record:0:user",
+    ]
+    _assert_no_browser_errors(page, errors)
 
 
 def test_context_recovery_replays_plain_text_exactly_once(
@@ -380,17 +851,16 @@ def _bootstrap_session_for_real_load(page: Page, sid: str, name: str) -> None:
           model: "e2e-model", label: "E2E model", group: "e2e",
           supports_thinking: true,
         }];
+        app._modelsLoaded = true;
         app.sessions = [{ id: arg.sid, name: arg.name, updated_at: Date.now() / 1000,
           model: "e2e-model", permission: "bypassPermissions", thinking: true }];
         app.openTabIds = [arg.sid];
         app.tabState = {};
         app.currentId = arg.sid;
-        app._residentTabIds = [arg.sid];
         app.mobileTab = "chat";
-        app.messagesReady = true;
-        app.messagesLoading = false;
+        app._ensureTabState(app.currentId).messagesReady = true;
+        app._ensureTabState(app.currentId).messagesLoading = false;
         app._activateTabState(arg.sid);
-        app._promoteResident(arg.sid);
         return true;
         """,
         {"sid": sid, "name": name},
@@ -1163,6 +1633,8 @@ def test_chat_bubble_selection_quotes_as_attachment_and_asks_in_side_session(
             uuid: "selection-assistant", _k: "selection-assistant", _noAnim: true,
           },
         ];
+        st.messageRange.visibleEnd = st.messages.length;
+        st.messageRange.total = st.messages.length;
         st.draft.input = "EXISTING_DRAFT";
         st.draft.pendingImages = [{
           id: "keep-image", uploading: false,
@@ -1209,7 +1681,12 @@ def test_chat_bubble_selection_quotes_as_attachment_and_asks_in_side_session(
         }"""
     )
     expect(page.locator(".preview-selection-actions")).to_be_visible()
-    page.locator(".preview-selection-actions button").first.click()
+    # iOS preserves the native selection by cancelling pointerdown, which can
+    # suppress the follow-up synthetic click. Exercise the real touch path.
+    page.locator(".preview-selection-actions button").first.dispatch_event(
+        "pointerdown",
+        {"pointerType": "touch", "button": 0, "bubbles": True, "cancelable": True},
+    )
     quoted = _app_eval(
         page,
         """
@@ -1273,7 +1750,10 @@ def test_chat_bubble_selection_quotes_as_attachment_and_asks_in_side_session(
             && app.previewQuote.role === 'user';
         }"""
     )
-    page.locator(".preview-selection-actions button").nth(1).click()
+    page.locator(".preview-selection-actions button").nth(1).dispatch_event(
+        "pointerdown",
+        {"pointerType": "touch", "button": 0, "bubbles": True, "cancelable": True},
+    )
     ask = page.locator(".preview-selection-ask textarea")
     expect(ask).to_be_focused()
     ask.fill("这里的结论为什么成立？")
@@ -1368,6 +1848,8 @@ def test_chat_wheel_preserves_selection_across_messages(
             _noAnim: true,
           },
         ];
+        st.messageRange.visibleEnd = st.messages.length;
+        st.messageRange.total = st.messages.length;
         app._activateTabState(arg);
         app.mobileTab = "chat";
         return true;
@@ -1419,7 +1901,7 @@ def test_chat_wheel_preserves_selection_across_messages(
     assert after_wheel == {
         "text": "FIRST_WHEEL_SELECTION_MARKER",
         "rangeCount": 1,
-        "popover": False,
+        "popover": True,
     }
 
     extended = page.evaluate(
@@ -1526,9 +2008,35 @@ def test_session_todo_modal_uses_large_desktop_board(
     # as pointer/native dragging.
     medium_grip = modal.locator('[data-todo-id="todo-medium"] .session-todo-grip')
     medium_grip.focus()
-    medium_grip.press("ArrowLeft")
+    keyboard_steps = page.evaluate(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const staleItem = app.sessionTodoItems()
+            .find(item => item.id === 'todo-medium');
+          const snapshot = () => app.sessionTodoItems()
+            .map(item => item.id + ':' + item.priority);
+          const eventFor = key => ({
+            key, altKey: false, ctrlKey: false, metaKey: false,
+            preventDefault() {}, stopPropagation() {},
+          });
+          app.onSessionTodoGripKeydown(eventFor('ArrowLeft'), staleItem);
+          const afterLeft = snapshot();
+          app.onSessionTodoGripKeydown(eventFor('ArrowUp'), staleItem);
+          return {afterLeft, afterUp: snapshot()};
+        }"""
+    )
+    assert keyboard_steps == {
+        "afterLeft": ["todo-high:high", "todo-low:low", "todo-medium:high"],
+        "afterUp": ["todo-medium:high", "todo-high:high", "todo-low:low"],
+    }
+    page.wait_for_function(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          return app._todoPushPromise === null && !app._todoPushPending;
+        }"""
+    )
+
     expect(modal.locator('.session-todo-lane.is-high [data-todo-id="todo-medium"]')).to_be_visible()
-    modal.locator('[data-todo-id="todo-medium"] .session-todo-grip').press("ArrowUp")
     ordered = page.evaluate(
         """() => {
           const app = document.querySelector('#app')._x_dataStack[0];
@@ -1796,7 +2304,7 @@ def test_effort_fast_capabilities_and_session_restore(
             app._sessionRegistrationPromises = {};
             app.currentId = modelSid;
             app.model = modelMeta.model;
-            app.messages = app._ensureTabState(modelSid).messages;
+            app._ensureTabState(modelSid);
             const modelCalls = [];
             let releaseModelRegistration;
             const modelRegistrationGate = new Promise(resolve => {
@@ -2214,6 +2722,8 @@ def test_mobile_completed_turn_can_fork_from_that_point(
             _k: arg.boundary, _noAnim: true,
           },
         ];
+        st.messageRange.visibleEnd = st.messages.length;
+        st.messageRange.total = st.messages.length;
         app._activateTabState(arg.sid);
         app.openTab = async id => {
           if (!app.openTabIds.includes(id)) app.openTabIds.push(id);
@@ -2259,7 +2769,7 @@ def test_mobile_completed_turn_can_fork_from_that_point(
 
 
 def test_mobile_long_history_switching_does_not_blank(page: Page, backend_url, auth_token):
-    """Switch repeatedly between long resident chat panes on a mobile viewport."""
+    """Switch repeatedly between long normalized histories on a mobile viewport."""
     errors = _capture_browser_errors(page)
     page.set_viewport_size({"width": 390, "height": 844})
     _login(page, backend_url, auth_token)
@@ -2276,8 +2786,6 @@ def test_mobile_long_history_switching_does_not_blank(page: Page, backend_url, a
           model: "e2e-model", permission: "bypassPermissions", thinking: true,
         }));
         app.openTabIds = sessionIds.slice();
-        app._MAX_RESIDENT_PANES = 2;
-        app._residentTabIds = sessionIds.slice(0, 4);
         app.tabState = {};
         for (const [idx, id] of sessionIds.entries()) {
           const st = app._blankTabState();
@@ -2293,30 +2801,32 @@ def test_mobile_long_history_switching_does_not_blank(page: Page, backend_url, a
               _noAnim: true,
             });
           }
+          st.messageRange.visibleEnd = st.messages.length;
+          st.messageRange.total = st.messages.length;
           app.tabState[id] = st;
           app._ensureTabState(id);
-          app._capLiveMessages(st);
+          app._scheduleLiveMessageViewport(st);
         }
         app.currentId = sessionIds[0];
-        app.messagesReady = true;
-        app.messagesLoading = false;
+        app._ensureTabState(app.currentId).messagesReady = true;
+        app._ensureTabState(app.currentId).messagesLoading = false;
         app.mobileTab = "chat";
         app._activateTabState(app.currentId);
-        app._promoteResident(app.currentId);
         app.$nextTick(() => app.scrollToBottom(true));
         return true;
         """,
     )
-    mounted_cap = _app_eval(page, "return app._mountedMessageCap();")
+    history_size = 90
 
     page.wait_for_function(
-        """mountedCap => {
+        """historySize => {
           const panes = Array.from(document.querySelectorAll(".msg-pane"))
             .filter(p => getComputedStyle(p).display !== "none");
-          return panes.length === 1
-            && panes[0].querySelectorAll(".msg").length === mountedCap;
+          const rendered = panes.length === 1
+            ? panes[0].querySelectorAll(".msg").length : 0;
+          return rendered === historySize;
         }""",
-        arg=mounted_cap,
+        arg=history_size,
         timeout=5000,
     )
 
@@ -2325,10 +2835,9 @@ def test_mobile_long_history_switching_does_not_blank(page: Page, backend_url, a
             page,
             """
             app.currentId = arg;
-            app.messagesReady = true;
-            app.messagesLoading = false;
+            app._ensureTabState(app.currentId).messagesReady = true;
+            app._ensureTabState(app.currentId).messagesLoading = false;
             app._activateTabState(arg);
-            app._promoteResident(arg);
             app.$nextTick(() => app.scrollToBottom(true));
             """,
             sid,
@@ -2336,13 +2845,13 @@ def test_mobile_long_history_switching_does_not_blank(page: Page, backend_url, a
         expected_tail = f"history {sid.rsplit('-', 1)[1]}:89"
         try:
             page.wait_for_function(
-                """({ expected, mountedCap }) => {
+                """({ expected, historySize }) => {
                   const panes = Array.from(document.querySelectorAll(".msg-pane"))
                     .filter(p => getComputedStyle(p).display !== "none");
                   return panes.some(p => p.textContent.includes(expected)
-                    && p.querySelectorAll(".msg").length === mountedCap);
+                    && p.querySelectorAll(".msg").length === historySize);
                 }""",
-                arg={"expected": expected_tail, "mountedCap": mounted_cap},
+                arg={"expected": expected_tail, "historySize": history_size},
                 timeout=5000,
             )
         except TimeoutError as exc:
@@ -2351,9 +2860,9 @@ def test_mobile_long_history_switching_does_not_blank(page: Page, backend_url, a
                   const app = document.querySelector("#app")._x_dataStack[0];
                   return {
                     currentId: app.currentId,
-                    resident: app.residentPaneIds(),
+                    paneCount: document.querySelectorAll(".msg-pane").length,
                     openTabIds: app.openTabIds,
-                    messagesLength: app.messages.length,
+                    messagesLength: app._ensureTabState(app.currentId).messages.length,
                     visiblePanes: Array.from(document.querySelectorAll(".msg-pane"))
                       .filter(p => getComputedStyle(p).display !== "none")
                       .map(p => ({ count: p.querySelectorAll(".msg").length,
@@ -2363,18 +2872,18 @@ def test_mobile_long_history_switching_does_not_blank(page: Page, backend_url, a
             )
             raise AssertionError(f"target tail not visible: {expected_tail}; diag={diag}") from exc
         snap = _visible_pane_with_text_snapshot(page, expected_tail)
-        assert snap["msgCount"] <= mounted_cap
+        assert snap["msgCount"] == history_size
         assert expected_tail in snap["text"]
         assert page.locator(".msg-pane").count() <= 1
-        assert _app_eval(page, "return app.residentPaneIds().length;") <= 1
+        assert page.locator(".msg-pane").count() <= 1
 
     _assert_no_browser_errors(page, errors)
 
 
-def test_desktop_warm_session_switch_keeps_panes_and_composer_stable(
+def test_desktop_session_switch_keeps_bounded_warm_panes_and_composer_stable(
     page: Page, backend_url: str, auth_token: str,
 ):
-    """Desktop prioritizes instant warm switches without footer/layout jumps."""
+    """Desktop bounds warm panes even when every inactive session is streaming."""
     errors = _capture_browser_errors(page)
     page.set_viewport_size({"width": 1440, "height": 900})
     _login(page, backend_url, auth_token)
@@ -2407,18 +2916,19 @@ def test_desktop_warm_session_switch_keeps_panes_and_composer_stable(
           const st = app._blankTabState();
           st._loaded = true;
           st.messages = app._historyEnvelopes(id, arg.messages[id]);
+          st.messageRange.visibleEnd = st.messages.length;
+          st.messageRange.total = st.messages.length;
           st.messagesReady = true;
           st.messagesLoading = false;
           st.atBottom = true;
+          st.streaming = true;
           app.tabState[id] = st;
           app._ensureTabState(id);
         }
         app.currentId = arg.ids[0];
-        app._residentTabIds = arg.ids.slice();
-        app.messagesReady = true;
-        app.messagesLoading = false;
+        app._ensureTabState(app.currentId).messagesReady = true;
+        app._ensureTabState(app.currentId).messagesLoading = false;
         app._activateTabState(app.currentId);
-        app._promoteResident(app.currentId);
         return true;
         """,
         payload,
@@ -2428,9 +2938,10 @@ def test_desktop_warm_session_switch_keeps_panes_and_composer_stable(
           const panes = Array.from(document.querySelectorAll(".msg-pane"));
           const visible = panes.filter(
             pane => getComputedStyle(pane).display !== "none");
-          return panes.length === 4
+          return panes.length === 1
             && visible.length === 1
-            && visible[0].querySelectorAll(".msg").length === 40;
+            && visible[0].querySelectorAll(".msg").length === 40
+            && getComputedStyle(document.querySelector(".chat-transcript-loading-overlay")).display === "none";
         }"""
     )
     before = page.locator(".chat-input").bounding_box()
@@ -2446,18 +2957,25 @@ def test_desktop_warm_session_switch_keeps_panes_and_composer_stable(
             await app.switchSession();
             await new Promise(resolve =>
               requestAnimationFrame(() => requestAnimationFrame(resolve)));
+            const settleDeadline = performance.now() + 1000;
+            while ((app.transcriptLoadingVisible()
+                || getComputedStyle(document.querySelector(
+                  ".chat-transcript-loading-overlay")).display !== "none")
+                && performance.now() < settleDeadline) {
+              await new Promise(resolve => requestAnimationFrame(resolve));
+            }
             const panes = Array.from(document.querySelectorAll(".msg-pane"));
             const visible = panes.filter(
               pane => getComputedStyle(pane).display !== "none");
             out.push({
               elapsed: performance.now() - started,
-              resident: app.residentPaneIds().length,
+              expectedPanes: Math.min(ids.indexOf(id) + 1, app.WARM_TRANSCRIPT_LIMIT),
               panes: panes.length,
               visible: visible.length,
               visibleMessages: visible[0]?.querySelectorAll(".msg").length || 0,
-              ready: app.messagesReady,
+              ready: app._ensureTabState(app.currentId).messagesReady,
               skeleton: getComputedStyle(
-                document.querySelector(".chat-skeleton")).display,
+                document.querySelector(".chat-transcript-loading-overlay")).display,
             });
           }
           return out;
@@ -2468,15 +2986,280 @@ def test_desktop_warm_session_switch_keeps_panes_and_composer_stable(
     assert after is not None
     elapsed = sorted(row["elapsed"] for row in switches)
     # Shared/low-memory CI can produce one scheduling outlier; the sustained
-    # interaction is what users feel across repeated warm switches.
+    # interaction is what users feel across repeated remounts.
     assert elapsed[len(elapsed) // 2] < 700, switches
     assert max(elapsed) < 1500, switches
-    assert all(row["resident"] == 4 for row in switches)
-    assert all(row["panes"] == 4 and row["visible"] == 1 for row in switches)
+    assert all(row["panes"] == row["expectedPanes"] and row["visible"] == 1 for row in switches), switches
     assert all(row["visibleMessages"] == 40 for row in switches)
-    assert all(row["ready"] and row["skeleton"] == "none" for row in switches)
+    assert all(row["ready"] for row in switches), switches
+    assert switches[-1]["skeleton"] == "none", switches
     assert abs(after["y"] - before["y"]) < 1
     assert abs(after["height"] - before["height"]) < 1
+    _assert_no_browser_errors(page, errors)
+
+
+def test_cold_session_switch_shields_every_frame_until_transcript_paints(
+    page: Page, backend_url: str, auth_token: str,
+):
+    """A gated cold switch never exposes onboarding or the previous transcript."""
+    errors = _capture_browser_errors(page)
+    page.set_viewport_size({"width": 1280, "height": 800})
+    _login(page, backend_url, auth_token)
+    sid_a = "loading-shield-a"
+    sid_b = "loading-shield-b"
+    marker_a = "OLD_SESSION_CONTENT_MUST_NEVER_FLASH"
+    marker_b = "NEW_SESSION_CONTENT_AFTER_RELEASE"
+    payload = {
+        "sidA": sid_a,
+        "sidB": sid_b,
+        "messagesA": _make_mixed_messages(6, marker_a),
+        "messagesB": _make_mixed_messages(6, marker_b),
+    }
+    _app_eval(
+        page,
+        """
+        app.refreshSessions = async () => {};
+        app._fetchTabUsage = async () => {};
+        app._scheduleIdlePreload = () => {};
+        app.sessions = [
+          {id: arg.sidA, name: "Loaded A", message_count: arg.messagesA.length,
+           updated_at: 1, model: "e2e-model"},
+          {id: arg.sidB, name: "Cold B", message_count: arg.messagesB.length,
+           updated_at: 2, model: "e2e-model"},
+        ];
+        app.openTabIds = [arg.sidA, arg.sidB];
+        app.tabState = {};
+        const a = app._ensureTabState(arg.sidA);
+        a.messages = app._historyEnvelopes(arg.sidA, arg.messagesA);
+        a.messageRange.visibleEnd = a.messages.length;
+        a.messageRange.total = a.messages.length;
+        a._installedCanonicalCount = a.messages.length;
+        a._loaded = true;
+        a.messagesReady = true;
+        const b = app._ensureTabState(arg.sidB);
+        b._loaded = false;
+        b.messagesReady = true;
+        app.currentId = arg.sidA;
+        app._touchTranscriptPane(arg.sidA);
+        app._activateTabState(arg.sidA);
+        let release;
+        const gate = new Promise(resolve => { release = resolve; });
+        app.__releaseTranscriptGate = release;
+        app.__slowTranscriptStarted = false;
+        app._reloadSessionCoalesced = async sid => {
+          if (sid !== arg.sidB) return true;
+          app.__slowTranscriptStarted = true;
+          await gate;
+          const st = app._ensureTabState(sid);
+          st.messages = app._historyEnvelopes(sid, arg.messagesB);
+          st.messageRange.visibleStart = 0;
+          st.messageRange.visibleEnd = st.messages.length;
+          st.messageRange.offset = 0;
+          st.messageRange.total = st.messages.length;
+          st._installedCanonicalCount = st.messages.length;
+          st.messagesReady = true;
+          st.messagesLoading = false;
+          st._loaded = true;
+          return true;
+        };
+        return true;
+        """,
+        payload,
+    )
+    page.wait_for_function(
+        """marker => Array.from(document.querySelectorAll('.msg-pane')).some(
+          node => getComputedStyle(node).display !== 'none'
+            && node.getClientRects().length > 0
+            && node.textContent.includes(marker))""",
+        arg=marker_a,
+    )
+
+    page.evaluate(
+        """sid => {
+          const app = document.querySelector("#app")._x_dataStack[0];
+          app.currentId = sid;
+          app.__switchPromise = app.switchSession();
+        }""",
+        sid_b,
+    )
+    page.wait_for_function(
+        "() => document.querySelector('#app')._x_dataStack[0].__slowTranscriptStarted"
+    )
+    frames = page.evaluate(
+        """async oldMarker => {
+          const out = [];
+          for (let i = 0; i < 12; i += 1) {
+            await new Promise(resolve => requestAnimationFrame(resolve));
+            const overlay = document.querySelector('.chat-transcript-loading-overlay');
+            const empty = document.querySelector('.chat-empty');
+            const visiblePanes = Array.from(document.querySelectorAll('.msg-pane'))
+              .filter(node => getComputedStyle(node).display !== 'none'
+                && node.getClientRects().length > 0);
+            const app = document.querySelector('#app')._x_dataStack[0];
+            out.push({
+              currentId: app.currentId,
+              phase: app._ensureTabState(app.currentId).transcriptLoadPhase,
+              generation: app._ensureTabState(app.currentId).transcriptLoadGeneration,
+              overlayVisible: !!overlay
+                && getComputedStyle(overlay).display !== 'none'
+                && overlay.getClientRects().length > 0,
+              overlayBackground: overlay ? getComputedStyle(overlay).backgroundColor : '',
+              emptyVisible: !!empty
+                && getComputedStyle(empty).display !== 'none'
+                && empty.getClientRects().length > 0,
+              oldVisible: visiblePanes.some(node => node.textContent.includes(oldMarker)),
+            });
+          }
+          return out;
+        }""",
+        marker_a,
+    )
+    hidden_frames = [row for row in frames if not row["overlayVisible"]]
+    assert not hidden_frames, hidden_frames
+    assert all(row["overlayBackground"] not in ("", "rgba(0, 0, 0, 0)") for row in frames)
+    assert not any(row["emptyVisible"] for row in frames), frames
+    assert not any(row["oldVisible"] for row in frames), frames
+
+    page.evaluate(
+        """async () => {
+          const app = document.querySelector("#app")._x_dataStack[0];
+          app.__releaseTranscriptGate();
+          await app.__switchPromise;
+        }"""
+    )
+    expect(page.locator(".chat-transcript-loading-overlay")).to_be_hidden(timeout=5000)
+    expect(page.locator(".msg-pane:visible")).to_contain_text(marker_b, timeout=5000)
+    expect(page.locator(".chat-empty")).to_be_hidden()
+    _assert_no_browser_errors(page, errors)
+
+
+def test_mobile_transcript_loader_reuses_workspace_switch_status(
+    page: Page, backend_url: str, auth_token: str,
+):
+    errors = _capture_browser_errors(page)
+    page.set_viewport_size({"width": 390, "height": 844})
+    _login(page, backend_url, auth_token)
+    geometry = page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const sid = app.currentId || 'mobile-muse-loader';
+          if (!app.sessions.some(row => row.id === sid)) {
+            app.sessions = [{id: sid, name: 'Muse loader', message_count: 1}];
+          }
+          if (!app.openTabIds.includes(sid)) app.openTabIds = [sid];
+          const st = app._ensureTabState(sid);
+          st._loaded = false;
+          st.messagesReady = true;
+          st.messagesLoading = false;
+          st.transcriptLoadPhase = 'fetching';
+          app.currentId = sid;
+          await new Promise(resolve => app.$nextTick(resolve));
+          await new Promise(resolve => requestAnimationFrame(
+            () => requestAnimationFrame(resolve)));
+          const overlay = document.querySelector('.chat-transcript-loading-overlay');
+          const loader = overlay.querySelector('.chat-transcript-loading-status');
+          const spinner = loader.querySelector('.spinner-sm');
+          const copy = loader.querySelector('span:last-child');
+          const overlayRect = overlay.getBoundingClientRect();
+          const loaderRect = loader.getBoundingClientRect();
+          const result = {
+            overlayVisible: getComputedStyle(overlay).display !== 'none',
+            centerDeltaX: Math.abs(
+              loaderRect.left + loaderRect.width / 2
+              - (overlayRect.left + overlayRect.width / 2)),
+            centerDeltaY: Math.abs(
+              loaderRect.top + loaderRect.height / 2
+              - (overlayRect.top + overlayRect.height / 2)),
+            noOverflow: overlay.scrollWidth <= overlay.clientWidth,
+            spinnerVisible: spinner.getClientRects().length > 0,
+            reusesWorkspaceStatus: loader.classList.contains('workspace-switch-status'),
+            copy: copy.textContent.trim(),
+            expectedCopy: app.t('chat.loading_session'),
+            skeletonCount: overlay.querySelectorAll('.chat-skeleton').length,
+            srOnlyCount: overlay.querySelectorAll('.sr-only').length,
+            heavyLoaderCount: overlay.querySelectorAll(
+              '.chat-muse-loader, .chat-muse-loader-emblem, .chat-muse-loader-dots'
+            ).length,
+          };
+          st.transcriptLoadPhase = 'idle';
+          return result;
+        }"""
+    )
+    assert geometry["overlayVisible"] is True
+    assert geometry["centerDeltaX"] < 2
+    assert geometry["centerDeltaY"] < 2
+    assert geometry["noOverflow"] is True
+    assert geometry["spinnerVisible"] is True
+    assert geometry["reusesWorkspaceStatus"] is True
+    assert geometry["copy"] == geometry["expectedCopy"]
+    assert geometry["skeletonCount"] == 0
+    assert geometry["srOnlyCount"] == 0
+    assert geometry["heavyLoaderCount"] == 0
+    expect(page.locator(".chat-transcript-loading-overlay")).to_be_hidden()
+    _assert_no_browser_errors(page, errors)
+
+
+def test_transcript_failure_keeps_resident_content_and_live_owner_cancels_shield(
+    page: Page, backend_url: str, auth_token: str,
+):
+    errors = _capture_browser_errors(page)
+    _login(page, backend_url, auth_token)
+    sid = "loading-shield-failure"
+    marker = "RESIDENT_CONTENT_SURVIVES_LOAD_FAILURE"
+    payload = {"sid": sid, "messages": _make_mixed_messages(4, marker)}
+    result = page.evaluate(
+        """async arg => {
+        const app = document.querySelector("#app")._x_dataStack[0];
+        app.refreshSessions = async () => {};
+        app._fetchTabUsage = async () => {};
+        app._scheduleIdlePreload = () => {};
+        app.sessions = [{
+          id: arg.sid, name: "Failure fixture",
+          message_count: arg.messages.length, updated_at: 2,
+        }];
+        app.openTabIds = [arg.sid];
+        app.tabState = {};
+        const st = app._ensureTabState(arg.sid);
+        st.messages = app._historyEnvelopes(arg.sid, arg.messages);
+        st.messageRange.visibleEnd = st.messages.length;
+        st.messageRange.total = st.messages.length;
+        st._loaded = false;
+        app.currentId = arg.sid;
+        app._touchTranscriptPane(arg.sid);
+        app._activateTabState(arg.sid);
+        app._reloadSessionCoalesced = async () => false;
+        const loaded = await app._ensureSessionLoaded(arg.sid);
+        return {loaded, phase: st.transcriptLoadPhase};
+        }""",
+        payload,
+    )
+    assert result == {"loaded": False, "phase": "error"}
+    expect(page.locator(".chat-load-error")).to_be_visible()
+    expect(page.locator(".chat-load-error")).to_contain_text("Conversation failed to load")
+    expect(page.locator(".msg-pane:visible")).to_contain_text(marker)
+    page.wait_for_function(
+        "() => !document.querySelector('#app')._x_dataStack[0].transcriptLoadingVisible()"
+    )
+    expect(page.locator(".chat-transcript-loading-overlay")).to_be_hidden()
+
+    live_takeover = _app_eval(
+        page,
+        """
+        const st = app._ensureTabState(arg);
+        const token = app._beginTranscriptLoad(arg, st, "fetching");
+        app._releaseTranscriptLoadForLive(st);
+        const staleFailed = app._failTranscriptLoad(token);
+        return {
+          phase: st.transcriptLoadPhase,
+          staleFailed,
+          generation: st.transcriptLoadGeneration,
+        };
+        """,
+        sid,
+    )
+    assert live_takeover["phase"] == "idle"
+    assert live_takeover["staleFailed"] is False
+    expect(page.locator(".chat-transcript-loading-overlay")).to_be_hidden()
     _assert_no_browser_errors(page, errors)
 
 
@@ -2494,9 +3277,9 @@ def test_mobile_windowed_load_session_pages_older_history(page: Page, backend_ur
     page.wait_for_function(
         """() => {
           const app = document.querySelector("#app")._x_dataStack[0];
-          return app.messagesReady === true
-            && app.messagesLoading === false
-            && app.messages.some(m => (m.text || "").includes("WINDOW_MSG_179"));
+          return app._ensureTabState(app.currentId).messagesReady === true
+            && app._ensureTabState(app.currentId).messagesLoading === false
+            && app._ensureTabState(app.currentId).messages.some(m => (m.text || "").includes("WINDOW_MSG_179"));
         }""",
         timeout=10000,
     )
@@ -2510,46 +3293,58 @@ def test_mobile_windowed_load_session_pages_older_history(page: Page, backend_ur
         const st = app._ensureTabState(arg);
         return {
           messages: st.messages.length,
-          earlier: st._earlierMessages.length,
-          later: st._laterMessages.length,
-          loadedOffset: st._loadedOffset,
-          total: st._total,
+          visible: st.messageRange.visibleEnd - st.messageRange.visibleStart,
+          earlier: st.messageRange.visibleStart,
+          later: st.messages.length - st.messageRange.visibleEnd,
+          loadedOffset: st.messageRange.offset,
+          total: st.messageRange.total,
           hasMore: st._hasMoreHistory,
-          resident: app.residentPaneIds().length,
-          ready: app.messagesReady,
+          paneCount: document.querySelectorAll(".msg-pane").length,
+          ready: app._ensureTabState(app.currentId).messagesReady,
           bodyText: document.querySelector(".chat-body")?.textContent || "",
         };
         """,
         sid,
     )
-    assert requests and requests[0]["tail"] == 75
-    assert state["messages"] <= 60
-    assert state["loadedOffset"] == 105
+    assert requests and requests[0]["tail"] == 20
+    assert state["messages"] == 20
+    assert state["visible"] <= 60
+    assert state["loadedOffset"] == 160
     assert state["total"] == 180
     assert state["hasMore"] is True
-    assert state["resident"] <= 1
+    assert state["paneCount"] <= 1
     assert "WINDOW_MSG_179" in state["bodyText"]
     assert "WINDOW_MSG_000" not in state["bodyText"]
     assert page.locator(".msg-pane").count() <= 1
     assert page.locator(".msg-pane:visible .msg").count() <= 75
 
-    # Traverse all the way through a history larger than the memory cap. The
-    # window must slide backward (evicting far-future bubbles) until message 0
-    # is mounted; the old implementation stopped forever at the first cap.
+    # Traverse the full server-paged history. Normalized envelopes stay reachable
+    # while the viewport scheduler mounts message 0 only when it enters view.
     for _ in range(24):
-        _app_eval(page, "return app.loadEarlierMessages(arg);", sid)
+        _app_eval(
+            page,
+            """
+            const body = app._chatBodyElement();
+            app._ensureTabState(app.currentId).atBottom = false;
+            app._ensureTabState(arg).atBottom = false;
+            body.scrollTop = 0;
+            app._syncMessageViewport(arg);
+            return app.loadEarlierMessages(arg);
+            """,
+            sid,
+        )
         page.wait_for_timeout(50)
         if _app_eval(
             page,
-            """return app.messages.some(m => (m.text || "").includes("WINDOW_MSG_000"));""",
+            """return app._ensureTabState(app.currentId).messages.some(m => (m.text || "").includes("WINDOW_MSG_000"));""",
         ):
             break
 
     page.wait_for_function(
         """() => {
           const app = document.querySelector("#app")._x_dataStack[0];
-          return app.messagesReady === true
-            && app.messages.some(m => (m.text || "").includes("WINDOW_MSG_000"));
+          return app._ensureTabState(app.currentId).messagesReady === true
+            && app._ensureTabState(app.currentId).messages.some(m => (m.text || "").includes("WINDOW_MSG_000"));
         }""",
         timeout=10000,
     )
@@ -2559,14 +3354,15 @@ def test_mobile_windowed_load_session_pages_older_history(page: Page, backend_ur
         const st = app._ensureTabState(arg);
         return {
           messages: st.messages.length,
-          earlier: st._earlierMessages.length,
-          later: st._laterMessages.length,
-          loadedOffset: st._loadedOffset,
-          total: st._total,
+          visible: st.messageRange.visibleEnd - st.messageRange.visibleStart,
+          earlier: st.messageRange.visibleStart,
+          later: st.messages.length - st.messageRange.visibleEnd,
+          loadedOffset: st.messageRange.offset,
+          total: st.messageRange.total,
           hasMore: st._hasMoreHistory,
-          hasServerLater: st._hasServerLater,
-          cached: st.messages.length + st._earlierMessages.length + st._laterMessages.length,
-          ready: app.messagesReady,
+          hasLater: app.hasLaterMessages(arg),
+          cached: st.messages.length,
+          ready: app._ensureTabState(app.currentId).messagesReady,
           visibleText: Array.from(document.querySelectorAll(".msg-pane"))
             .filter(p => getComputedStyle(p).display !== "none")
             .map(p => p.textContent).join("\\n"),
@@ -2582,29 +3378,30 @@ def test_mobile_windowed_load_session_pages_older_history(page: Page, backend_ur
     assert final_state["ready"] is True
     assert final_state["bodyHeight"] > 100
     assert "WINDOW_MSG_000" in final_state["visibleText"]
-    assert final_state["messages"] <= 60
-    assert final_state["cached"] <= 120
-    assert final_state["later"] > 0
-    assert final_state["hasServerLater"] is True
+    assert final_state["messages"] == 180
+    assert final_state["cached"] == 180
+    assert final_state["later"] == 0
+    assert final_state["hasLater"] is False
     latest_after_load_earlier = _app_eval(
         page,
         """
         const st = app._ensureTabState(arg);
         return {
           latestInMessages: st.messages.some(m => (m.text || "").includes("WINDOW_MSG_179")),
-          latestInLater: st._laterMessages.some(m => (m.text || "").includes("WINDOW_MSG_179")),
+          latestInLater: st.messages.slice(st.messageRange.visibleEnd)
+            .some(m => (m.text || "").includes("WINDOW_MSG_179")),
           latestInDom: document.querySelector(".chat-body")?.textContent.includes("WINDOW_MSG_179"),
-          hasServerLater: st._hasServerLater,
+          hasLater: app.hasLaterMessages(arg),
           ready: st.messagesReady,
         };
         """,
         sid,
     )
     assert latest_after_load_earlier == {
-        "latestInMessages": False,
+        "latestInMessages": True,
         "latestInLater": False,
-        "latestInDom": False,
-        "hasServerLater": True,
+        "latestInDom": True,
+        "hasLater": False,
         "ready": True,
     }
     _app_eval(page, "app.returnToLatest(arg); return true;", sid)
@@ -2614,24 +3411,25 @@ def test_mobile_windowed_load_session_pages_older_history(page: Page, backend_ur
           .some(p => p.textContent.includes('WINDOW_MSG_179'))""",
         timeout=5000,
     )
-    assert _app_eval(page, "return app._ensureTabState(arg)._laterMessages.length;", sid) == 0
+    assert _app_eval(
+        page,
+        """const st = app._ensureTabState(arg);
+        return st.messages.length - st.messageRange.visibleEnd;""",
+        sid,
+    ) == 0
     assert page.locator(".msg-pane").count() <= 1
     assert page.locator(".msg-pane:visible .msg").count() <= 60
 
     _assert_no_browser_errors(page, errors)
 
 
-def test_history_pagination_repairs_cross_page_keys_without_remounting(
+def test_history_pagination_keeps_stable_cross_page_keys_without_remounting(
     page: Page, backend_url, auth_token,
 ):
     errors = _capture_browser_errors(page)
     page.set_viewport_size({"width": 390, "height": 844})
     sid = "perf-cross-page-render-keys"
     messages = _make_mixed_messages(180, "CROSS_PAGE_KEY")
-    messages[101]["_k"] = "   "
-    messages[102]["_k"] = f"{sid}:render-repair:1"
-    messages[104]["_k"] = "cross-page-duplicate"
-    messages[110]["_k"] = "cross-page-duplicate"
     requests = _route_windowed_session(page, sid, messages)
     _login(page, backend_url, auth_token)
     _bootstrap_session_for_real_load(page, sid, "Cross-page render keys")
@@ -2640,7 +3438,7 @@ def test_history_pagination_repairs_cross_page_keys_without_remounting(
     page.wait_for_function(
         """() => {
           const app = document.querySelector("#app")._x_dataStack[0];
-          return app.messagesReady && !app.messagesLoading;
+          return app._ensureTabState(app.currentId).messagesReady && !app._ensureTabState(app.currentId).messagesLoading;
         }""",
         timeout=10000,
     )
@@ -2649,7 +3447,7 @@ def test_history_pagination_repairs_cross_page_keys_without_remounting(
     # the real offset/limit history fetch and prepend a page across the boundary.
     for _ in range(20):
         local_earlier = _app_eval(
-            page, "return app._ensureTabState(arg)._earlierMessages.length;", sid
+            page, "return app._ensureTabState(arg).messageRange.visibleStart;", sid
         )
         if local_earlier == 0:
             break
@@ -2660,12 +3458,12 @@ def test_history_pagination_repairs_cross_page_keys_without_remounting(
         page,
         """
         const st = app._ensureTabState(arg);
-        const mounted = st.messages.find(m => m.uuid === "CROSS_PAGE_KEY-tr-110");
+        const mounted = st.messages.find(m => m.uuid === "CROSS_PAGE_KEY-tu-170");
         window.__crossPageMountedObject = mounted;
         return {
           found: !!mounted,
           key: mounted?._k || "",
-          loadedOffset: st._loadedOffset,
+          loadedOffset: st.messageRange.offset,
         };
         """,
         sid,
@@ -2678,18 +3476,18 @@ def test_history_pagination_repairs_cross_page_keys_without_remounting(
         page,
         """
         const st = app._ensureTabState(arg);
-        const all = app._allPaneMessages(st);
-        const mounted = all.find(m => m.uuid === "CROSS_PAGE_KEY-tr-110");
-        const duplicate = all.find(m => m.uuid === "CROSS_PAGE_KEY-u-104");
-        const missing = all.find(m => m.uuid === "CROSS_PAGE_KEY-a-101");
-        const legitimate = all.find(m => m.uuid === "CROSS_PAGE_KEY-tr-102");
+        const all = st.messages;
+        const mounted = all.find(m => m.uuid === "CROSS_PAGE_KEY-tu-170");
+        const olderUser = all.find(m => m.uuid === "CROSS_PAGE_KEY-u-144");
+        const olderAssistant = all.find(m => m.uuid === "CROSS_PAGE_KEY-a-145");
+        const olderTool = all.find(m => m.uuid === "CROSS_PAGE_KEY-tr-147");
         const keys = all.map(m => m._k);
         return {
           sameMountedObject: mounted === window.__crossPageMountedObject,
           mountedKey: mounted?._k || "",
-          duplicateKey: duplicate?._k || "",
-          missingKey: missing?._k || "",
-          legitimateKey: legitimate?._k || "",
+          olderUserKey: olderUser?._k || "",
+          olderAssistantKey: olderAssistant?._k || "",
+          olderToolKey: olderTool?._k || "",
           allNonempty: keys.every(key => typeof key === "string" && key.trim()),
           unique: new Set(keys).size === keys.length,
         };
@@ -2697,14 +3495,151 @@ def test_history_pagination_repairs_cross_page_keys_without_remounting(
         sid,
     )
 
-    assert any(request["offset"] < 105 for request in requests[1:]), requests
+    assert any(request["offset"] < 160 for request in requests[1:]), requests
     assert after["sameMountedObject"] is True
-    assert after["mountedKey"] == before["key"] == "cross-page-duplicate"
-    assert after["duplicateKey"] != after["mountedKey"]
-    assert after["legitimateKey"] == f"{sid}:render-repair:1"
-    assert after["missingKey"] != after["legitimateKey"]
+    assert after["mountedKey"] == before["key"] == f"{sid}:uuid:CROSS_PAGE_KEY-tu-170"
+    assert after["olderUserKey"] == f"{sid}:uuid:CROSS_PAGE_KEY-u-144"
+    assert after["olderAssistantKey"] == f"{sid}:uuid:CROSS_PAGE_KEY-a-145"
+    assert after["olderToolKey"] == f"{sid}:uuid:CROSS_PAGE_KEY-tr-147"
     assert after["allNonempty"] is True
     assert after["unique"] is True
+    _assert_no_browser_errors(page, errors)
+
+
+def test_message_outline_traps_focus_and_supports_keyboard_selection(
+    page: Page, backend_url, auth_token,
+):
+    """Outline stays lazy, shows its local fallback, and preserves keyboard UX."""
+    errors = _capture_browser_errors(page)
+    requests: list[str] = []
+
+    page.add_init_script(
+        """
+        (() => {
+          const nativeFetch = window.fetch;
+          window.__outlineFetchCalls = 0;
+          window.fetch = function(input, options) {
+            const url = String(typeof input === "string" ? input : input?.url || "");
+            if (!url.includes("/outline")) {
+              return nativeFetch.apply(this, arguments);
+            }
+            window.__outlineFetchCalls += 1;
+            const receiver = this;
+            const args = arguments;
+            return new Promise(resolve => {
+              window.__releaseOutlineFetch = () => {
+                resolve(nativeFetch.apply(receiver, args));
+              };
+            });
+          };
+        })();
+        """
+    )
+
+    def serve_outline(route):
+        requests.append(route.request.url)
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({
+                "outline": [
+                    {
+                        "uuid": "outline-first",
+                        "preview": "First keyboard prompt",
+                    },
+                    {
+                        "uuid": "outline-second",
+                        "preview": "Second keyboard prompt",
+                    },
+                ],
+            }),
+        )
+
+    page.route(
+        "**/api/chat/sessions/*/outline",
+        serve_outline,
+    )
+    _login(page, backend_url, auth_token)
+    page.wait_for_timeout(100)
+    assert page.evaluate("() => window.__outlineFetchCalls") == 0
+    assert requests == []
+
+    _app_eval(
+        page,
+        """
+        const st = app._ensureTabState(app.currentId);
+        st.atBottom = false;
+        st._backendOutline = [];
+        st._outlineFetchedAt = 0;
+        st._outlineFetching = false;
+        st.messages.splice(0, st.messages.length,
+          {
+            role: "user", uuid: "outline-first",
+            text: "Immediate local first",
+          },
+          {
+            role: "user", uuid: "outline-second",
+            text: "Immediate local second",
+          },
+        );
+        app._scrollToUserMsg = message => {
+          window.__outlineKeyboardSelection = message.uuid;
+        };
+        """,
+    )
+
+    opener = page.locator(".chat-outline-fab:visible")
+    expect(opener).to_be_visible()
+    opener.focus()
+    opener.click()
+
+    dialog = page.locator(".msg-outline-panel")
+    expect(dialog).to_be_visible()
+    expect(dialog).to_have_attribute("role", "dialog")
+    expect(dialog).to_have_attribute("aria-modal", "true")
+    expect(dialog).to_have_attribute("aria-labelledby", "msg-outline-title")
+    expect(dialog.locator("#msg-outline-title")).to_contain_text("(2)")
+    items = dialog.locator(".msg-outline-item")
+    expect(items).to_have_count(2)
+    expect(items.nth(0)).to_contain_text("Immediate local first")
+    expect(items.nth(0)).to_be_focused()
+    assert page.evaluate("() => window.__outlineFetchCalls") == 1
+    assert requests == []
+
+    page.evaluate("() => window.__releaseOutlineFetch()")
+    expect(items.nth(0)).to_contain_text("First keyboard prompt")
+    page.wait_for_function(
+        """() => !document.querySelector("#app")._x_dataStack[0]
+          ._ensureTabState(document.querySelector("#app")._x_dataStack[0].currentId)
+          ._outlineFetching"""
+    )
+    assert len(requests) == 1
+
+    # The last outline item wraps forward to the close button, while reverse
+    # traversal from the first DOM control wraps back to the last item.
+    page.keyboard.press("Tab")
+    expect(items.nth(1)).to_be_focused()
+    page.keyboard.press("Tab")
+    expect(dialog.locator(".msg-outline-close")).to_be_focused()
+    page.keyboard.press("Shift+Tab")
+    expect(items.nth(1)).to_be_focused()
+
+    page.keyboard.press("Escape")
+    expect(dialog).to_be_hidden()
+    expect(opener).to_be_focused()
+
+    # Native button activation covers Enter/Space without custom key handlers.
+    opener.press("Enter")
+    expect(items.nth(0)).to_be_focused()
+    page.wait_for_timeout(100)
+    assert page.evaluate("() => window.__outlineFetchCalls") == 1
+    assert len(requests) == 1
+    items.nth(1).focus()
+    page.keyboard.press("Space")
+    expect(dialog).to_be_hidden()
+    expect(opener).to_be_focused()
+    assert page.evaluate("() => window.__outlineKeyboardSelection") == "outline-second"
+    assert len(requests) == 1
     _assert_no_browser_errors(page, errors)
 
 
@@ -2790,7 +3725,7 @@ def test_outline_around_conflict_retries_and_returns_to_real_tail(
         page,
         """
         const st = app._ensureTabState(arg);
-        st.historyGeneration = "gen-old";
+        st.messageRange.generation = "gen-old";
         st._loaded = true;
         st.messagesReady = true;
         return true;
@@ -2820,19 +3755,27 @@ def test_outline_around_conflict_retries_and_returns_to_real_tail(
         const st = app._ensureTabState(arg);
         return {
           mounted: st.messages.length,
-          earlier: st._earlierMessages.length,
-          later: st._laterMessages.length,
+          earlier: st.messageRange.visibleStart,
+          later: st.messages.length - st.messageRange.visibleEnd,
           targetMounted: st.messages.some(m => m.uuid === "around-target"),
-          order: st._historyOrder,
-          hasServerLater: st._hasServerLater,
+          order: st.messageRange.order,
+          offset: st.messageRange.offset,
+          total: st.messageRange.total,
+          generation: st.messageRange.generation,
+          hasLater: app.hasLaterMessages(arg),
         };
         """,
         sid,
     )
-    assert around_state["mounted"] <= 60
+    assert around_state["mounted"] == len(around_messages)
     assert around_state["targetMounted"] is True
+    assert around_state["earlier"] == 0
+    assert around_state["later"] == 0
     assert around_state["order"] == "full"
-    assert around_state["hasServerLater"] is True
+    assert around_state["offset"] == 200
+    assert around_state["total"] == 500
+    assert around_state["generation"] == "gen-new"
+    assert around_state["hasLater"] is True
     assert len([call for call in calls if "around_uuid" in call]) == 2
     assert len([call for call in calls if "tail" in call]) == 1
 
@@ -2842,135 +3785,172 @@ def test_outline_around_conflict_retries_and_returns_to_real_tail(
         """() => {
           const app = document.querySelector('#app')._x_dataStack[0];
           const st = app._ensureTabState(app.currentId);
-          return st._historyOrder === 'normal' && !st._hasServerLater
+          return st.messageRange.order === 'normal' && !app.hasLaterMessages(app.currentId)
             && st.messages.some(m => (m.text || '').includes('CANONICAL_LATEST_VISIBLE'));
         }""",
         timeout=10000,
     )
     assert len([call for call in calls if "tail" in call]) == 2
-    assert page.locator(".msg-pane:visible .msg").count() <= 60
+    tail_state = _app_eval(
+        page,
+        """
+        const st = app._ensureTabState(arg);
+        return {resident: st.messages.length, cap: app._liveMessageDomCap()};
+        """,
+        sid,
+    )
+    assert tail_state["resident"] == len(latest_messages)
+    assert page.locator(".msg-pane:visible .msg").count() == min(
+        len(latest_messages), tail_state["cap"]
+    )
     _assert_no_browser_errors(page, errors)
 
 
-def test_bidirectional_cap_preserves_keyed_scroll_anchor(
+def test_resident_history_uses_exact_layout_and_native_scroll_anchor(
     page: Page, backend_url, auth_token,
 ):
-    """Top/bottom eviction must not move the surviving reading anchor."""
+    """Resident rows use exact browser layout and native scroll anchoring."""
     errors = _capture_browser_errors(page)
     page.set_viewport_size({"width": 390, "height": 844})
     _login(page, backend_url, auth_token)
-    sid = "perf-bidirectional-cap"
+    sid = "perf-viewport-virtual-history"
+    _bootstrap_session_for_real_load(page, sid, "Viewport virtual history")
     _app_eval(
         page,
         """
-        const sid = arg;
-        app.refreshSessions = async () => {};
-        app._fetchTabUsage = async () => {};
-        app.sessions = [{
-          id: sid, name: "Perf bidirectional cap", updated_at: Date.now() / 1000,
-          model: "e2e-model", permission: "bypassPermissions", thinking: true,
-        }];
-        app.openTabIds = [sid];
-        app.tabState = {};
-        app.tabState[sid] = app._blankTabState();
-        const st = app._ensureTabState(sid);
-        const cap = app._mountedMessageCap();
-        const make = (prefix, i) => ({
-          role: "assistant", uuid: `${prefix}-uuid-${i}`,
-          _k: `${prefix}-key-${i}`, _noAnim: true,
-          text: `${prefix}-${i} ` + "variable height ".repeat(8 + (i % 5) * 8),
-          html: `<p>${prefix}-${i} ${"variable height ".repeat(8 + (i % 5) * 8)}</p>`,
+        const st = app._ensureTabState(arg);
+        const make = i => ({
+          role: i % 2 ? "assistant" : "user",
+          uuid: `virtual-uuid-${i}`, _k: `virtual-key-${i}`, _noAnim: true,
+          text: `VIRTUAL_MESSAGE_${i} ` + "variable height ".repeat(8 + (i % 7) * 6),
+          html: i % 2 ? `<p>VIRTUAL_MESSAGE_${i} ${"tail ".repeat(20)}</p>` : "",
         });
         st.messages.splice(0, st.messages.length,
-          ...Array.from({ length: cap }, (_, i) => make("mounted", i)));
-        st._earlierMessages = Array.from({ length: 10 }, (_, i) => make("older", i));
-        st._laterMessages = [];
-        st._loadedOffset = 0;
-        st._total = cap + st._earlierMessages.length;
-        st._hasServerLater = false;
+          ...Array.from({ length: 600 }, (_, i) => make(i)));
+        Object.assign(st.messageRange, {
+          visibleStart: 0,
+          visibleEnd: 600,
+          offset: 0,
+          total: 600,
+          preTotal: 0,
+          order: "normal",
+          generation: "",
+        });
+        // Later-history availability is derived from resident server coordinates.
         st.messagesReady = true;
         st.messagesLoading = false;
-        app.currentId = sid;
-        app._residentTabIds = [sid];
-        app._activateTabState(sid);
-        app._promoteResident(sid);
+        st.atBottom = true;
+        app.currentId = arg;
+        app._activateTabState(arg);
         app.mobileTab = "chat";
         return true;
         """,
         sid,
     )
-    mounted_cap = _app_eval(page, "return app._mountedMessageCap();")
     page.wait_for_function(
-        """mountedCap => Array.from(document.querySelectorAll('.msg-pane'))
-          .filter(p => getComputedStyle(p).display !== 'none')
-          .reduce((n, p) => n + p.querySelectorAll('.msg').length, 0) === mountedCap""",
-        arg=mounted_cap,
+        """() => {
+          const pane = document.querySelector('.msg-pane');
+          return pane && pane.textContent.includes('VIRTUAL_MESSAGE_599')
+            && pane.querySelectorAll('.msg').length === 600;
+        }""",
         timeout=10000,
     )
+    initial = _app_eval(
+        page,
+        """
+        const st = app._ensureTabState(arg);
+        const pane = document.querySelector('.msg-pane');
+        return { canonical: st.messages.length, normalized: st.messages.length,
+          mounted: pane.querySelectorAll('.msg').length,
+          spacers: pane.querySelectorAll('.msg-virtual-spacer').length };
+        """,
+        sid,
+    )
+    assert initial["canonical"] == initial["normalized"] == 600
+    assert initial["mounted"] == 600
+    assert initial["spacers"] == 0
+
+    _app_eval(
+        page,
+        """
+        const body = app._chatBodyElement();
+        app._ensureTabState(app.currentId).atBottom = false;
+        body.scrollTop = Math.floor(body.scrollHeight * 0.45);
+        app._syncMessageViewport(app.currentId);
+        return true;
+        """,
+    )
+    page.wait_for_timeout(100)
+    anchor = page.evaluate(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const body = app._chatBodyElement();
+          const rows = Array.from(document.querySelectorAll('.msg-pane .msg'));
+          const row = rows.find(el => {
+            const r = el.getBoundingClientRect();
+            return r.bottom > body.getBoundingClientRect().top;
+          });
+          return {key: row?.dataset.messageKey || '', top: row?.getBoundingClientRect().top || 0};
+        }"""
+    )
+    assert anchor["key"]
     page.evaluate(
         """() => {
-          const body = document.querySelector('.chat-body');
-          body.scrollTop = Math.min(500, body.scrollHeight - body.clientHeight);
+          const app = document.querySelector('#app')._x_dataStack[0];
+          app._chatBodyElement().scrollTop += 500;
+          app._syncMessageViewport(app.currentId);
         }"""
     )
-    older_anchor = page.evaluate(
+    page.wait_for_timeout(100)
+    page.evaluate(
         """() => {
-          const app = document.querySelector("#app")._x_dataStack[0];
-          const st = app._ensureTabState(app.currentId);
-          const key = st.messages[0]._k;
-          const top = document.querySelector(
-            `.msg[data-message-key="${CSS.escape(key)}"]`).getBoundingClientRect().top;
-          return { key, top };
+          const app = document.querySelector('#app')._x_dataStack[0];
+          app._chatBodyElement().scrollTop -= 500;
+          app._syncMessageViewport(app.currentId);
         }"""
     )
-    _app_eval(page, "return app.loadEarlierMessages(arg);", sid)
-    page.wait_for_function(
-        """({ key, mountedCap }) => {
-          const pane = Array.from(document.querySelectorAll(".msg-pane"))
-            .find(p => getComputedStyle(p).display !== "none");
-          return pane && pane.querySelectorAll(".msg").length === mountedCap
-            && pane.querySelector(
-              `.msg[data-message-key="${CSS.escape(key)}"]`);
+    page.wait_for_timeout(100)
+    shifted = page.evaluate(
+        """key => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const row = document.querySelector(
+            `.msg[data-message-key="${CSS.escape(key)}"]`);
+          const st = app._ensureTabState(app.currentId);
+          return {canonical: st.messages.length, mounted: document.querySelectorAll(
+            '.msg-pane .msg').length, top: row?.getBoundingClientRect().top || 0};
         }""",
-        arg={"key": older_anchor["key"], "mountedCap": mounted_cap},
-        timeout=10000,
+        anchor["key"],
     )
-    after_older = page.evaluate(
-        """key => document.querySelector(
-          `.msg[data-message-key="${CSS.escape(key)}"]`).getBoundingClientRect().top""",
-        older_anchor["key"],
-    )
-    assert abs(after_older - older_anchor["top"]) < 2
+    assert shifted["canonical"] == 600
+    assert shifted["mounted"] == 600
+    assert abs(shifted["top"] - anchor["top"]) < 3
 
-    newer_anchor = page.evaluate(
-        """() => {
-          const app = document.querySelector("#app")._x_dataStack[0];
-          const st = app._ensureTabState(app.currentId);
-          const key = st.messages[st.messages.length - 1]._k;
-          const top = document.querySelector(
-            `.msg[data-message-key="${CSS.escape(key)}"]`).getBoundingClientRect().top;
-          return { key, top };
-        }"""
+    streaming = _app_eval(
+        page,
+        """
+        const st = app._ensureTabState(arg);
+        st.streaming = true;
+        st.atBottom = false;
+        app._ensureTabState(app.currentId).atBottom = false;
+        const body = app._chatBodyElement();
+        body.scrollTop = 0;
+        app._syncMessageViewport(arg);
+        return new Promise(resolve => app.$nextTick(() => resolve({
+          tailMounted: !!document.querySelector(
+            '.msg[data-message-key="virtual-key-599"]'),
+          mounted: document.querySelectorAll('.msg-pane .msg').length,
+          canonical: st.messages.length,
+        })));
+        """,
+        sid,
     )
-    _app_eval(page, "return app.loadLaterMessages(arg);", sid)
-    page.wait_for_function(
-        """({ key, mountedCap }) => {
-          const pane = Array.from(document.querySelectorAll(".msg-pane"))
-            .find(p => getComputedStyle(p).display !== "none");
-          return pane && pane.querySelectorAll(".msg").length === mountedCap
-            && pane.querySelector(
-              `.msg[data-message-key="${CSS.escape(key)}"]`);
-        }""",
-        arg={"key": newer_anchor["key"], "mountedCap": mounted_cap},
-        timeout=10000,
-    )
-    after_newer = page.evaluate(
-        """key => document.querySelector(
-          `.msg[data-message-key="${CSS.escape(key)}"]`).getBoundingClientRect().top""",
-        newer_anchor["key"],
-    )
-    assert abs(after_newer - newer_anchor["top"]) < 2
-    assert page.locator(".msg-pane:visible .msg").count() == mounted_cap
+    # Exact resident layout keeps every loaded row mounted while native scrolling
+    # preserves the reader position; network paging bounds how many rows are resident.
+    assert streaming["tailMounted"] is True
+    assert streaming["mounted"] == 600
+    assert streaming["canonical"] == 600
+
+    # Legacy estimated-height virtual-window bookkeeping no longer controls DOM rows.
     _assert_no_browser_errors(page, errors)
 
 
@@ -3043,12 +4023,10 @@ def test_load_session_reconnects_active_turn_and_renders_live_assistant(
         app.openTabIds = [arg];
         app.tabState = {};
         app.currentId = arg;
-        app._residentTabIds = [arg];
         app.mobileTab = "chat";
-        app.messagesReady = true;
-        app.messagesLoading = false;
+        app._ensureTabState(app.currentId).messagesReady = true;
+        app._ensureTabState(app.currentId).messagesLoading = false;
         app._activateTabState(arg);
-        app._promoteResident(arg);
         return true;
         """,
         sid,
@@ -3061,8 +4039,8 @@ def test_load_session_reconnects_active_turn_and_renders_live_assistant(
     page.wait_for_function(
         """() => {
           const app = document.querySelector("#app")._x_dataStack[0];
-          return app.streaming === true && app.messagesReady === true
-            && app.messages.some(m => (m.text || "").includes("ACTIVE_RECONNECT_USER"));
+          return app._ensureTabState(app.currentId).streaming === true && app._ensureTabState(app.currentId).messagesReady === true
+            && app._ensureTabState(app.currentId).messages.some(m => (m.text || "").includes("ACTIVE_RECONNECT_USER"));
         }""",
         timeout=10000,
     )
@@ -3072,11 +4050,53 @@ def test_load_session_reconnects_active_turn_and_renders_live_assistant(
     assert ticket_requests[-1]["turn_id"] == "active-turn-1"
     assert ticket_requests[-1]["mobile"] is True
 
+    transport_open = page.evaluate(
+        """() => {
+          const app = document.querySelector("#app")._x_dataStack[0];
+          const st = app._ensureTabState(app.currentId);
+          return {
+            phase: st.streamPhase,
+            assistantCount: st.messages.filter(m => m.role === "assistant").length,
+            footer: document.querySelector(".turn-pending-footer")?.textContent || "",
+            expectedRuntime: app.t("chat.startup_runtime"),
+            streaming: st.streaming,
+          };
+        }"""
+    )
+    assert transport_open["phase"] == "connecting"
+    assert transport_open["assistantCount"] == 0
+    assert transport_open["streaming"] is True
+    assert transport_open["expectedRuntime"] in transport_open["footer"]
+
+    for event_seq, phase, label_key in [
+        (1, "accepted", "chat.startup_runtime"),
+        (2, "runtime", "chat.startup_runtime"),
+        (3, "tools", "chat.startup_tools"),
+        (4, "context", "chat.startup_context"),
+    ]:
+        page.evaluate(
+            """({ phase, eventSeq }) => window.__emitSse("startup", {
+              phase, turn_id: "active-turn-1", event_seq: eventSeq,
+            })""",
+            {"phase": phase, "eventSeq": event_seq},
+        )
+        page.wait_for_function(
+            """({ phase, labelKey }) => {
+              const app = document.querySelector("#app")._x_dataStack[0];
+              const st = app._ensureTabState(app.currentId);
+              const footer = document.querySelector(".turn-pending-footer")?.textContent || "";
+              return st.streamPhase === phase && footer.includes(app.t(labelKey))
+                && st.messages.filter(m => m.role === "assistant").length === 0;
+            }""",
+            arg={"phase": phase, "labelKey": label_key},
+            timeout=5000,
+        )
+
     page.evaluate(
         """() => {
           window.__emitSse("text", {
             text: "ACTIVE_RECONNECT_LIVE_VISIBLE",
-            turn_id: "active-turn-1", event_seq: 1,
+            turn_id: "active-turn-1", event_seq: 5,
           });
         }"""
     )
@@ -3084,9 +4104,10 @@ def test_load_session_reconnects_active_turn_and_renders_live_assistant(
         """() => {
           const app = document.querySelector("#app")._x_dataStack[0];
           const body = document.querySelector(".chat-body")?.textContent || "";
-          const last = app.messages[app.messages.length - 1];
-          return app.streaming === true
-            && app.messagesReady === true
+          const last = app._ensureTabState(app.currentId).messages[app._ensureTabState(app.currentId).messages.length - 1];
+          return app._ensureTabState(app.currentId).streaming === true
+            && app._ensureTabState(app.currentId).streamPhase === "running"
+            && app._ensureTabState(app.currentId).messagesReady === true
             && last && last.role === "assistant"
             && last.text.includes("ACTIVE_RECONNECT_LIVE_VISIBLE")
             && body.includes("ACTIVE_RECONNECT_LIVE_VISIBLE");
@@ -3099,18 +4120,250 @@ def test_load_session_reconnects_active_turn_and_renders_live_assistant(
           window.__emitSse("done", {
             total_cost_usd: 0.001,
             session_usage: { context_used_pct: 5, context_used: 500, context_limit: 100000 },
-            turn_id: "active-turn-1", event_seq: 2,
+            turn_id: "active-turn-1", event_seq: 6,
           });
         }"""
     )
     page.wait_for_function(
-        """() => document.querySelector("#app")._x_dataStack[0].streaming === false""",
+        """() => document.querySelector("#app")._x_dataStack[0].activeSessionPane().streaming === false""",
         timeout=10000,
     )
     expect(page.locator(".msg-pane:visible .msg.assistant").last).to_contain_text(
         "ACTIVE_RECONNECT_LIVE_VISIBLE", timeout=5000
     )
-    assert _app_eval(page, "return app.messagesReady === true && !app.messagesLoading;") is True
+    assert _app_eval(page, "return app._ensureTabState(app.currentId).messagesReady === true && !app._ensureTabState(app.currentId).messagesLoading;") is True
+    _assert_no_browser_errors(page, errors)
+
+
+def test_active_turn_adoption_requires_physical_tail_and_full_prompt_envelope(
+    page: Page, backend_url, auth_token,
+):
+    """Repeated text and attachment-only prompts cannot claim an older row."""
+    _login(page, backend_url, auth_token)
+    result = _app_eval(
+        page,
+        """
+        const makeState = (sid, messages) => {
+          const st = app._blankTabState();
+          st._sid = sid;
+          st.messages = messages;
+          st.messageRange.visibleStart = 0;
+          st.messageRange.visibleEnd = messages.length;
+          st.messageRange.total = messages.length;
+          app.tabState[sid] = st;
+          return st;
+        };
+
+        const repeated = makeState("active-repeat", [
+          { role: "user", text: "继续" },
+          { role: "assistant", text: "旧回复" },
+        ]);
+        const repeatedResult = app._installActiveTurnUser(
+          repeated, "turn-repeat", "继续", [], [],
+        );
+
+        const attachmentOnly = makeState("active-attachment", [
+          { role: "user", text: "", images: [
+            { mime: "image/png", url: "/old.png" },
+          ], docs: [] },
+        ]);
+        const attachmentResult = app._installActiveTurnUser(
+          attachmentOnly, "turn-attachment", "", [
+            { mime: "image/png", url: "/new.png" },
+          ], [],
+        );
+
+        const exactTail = makeState("active-exact-tail", [
+          { role: "user", text: "", images: [
+            { url: "/same.png", mime: "image/png" },
+          ], docs: [{ kind: "text", name: "notes.md" }] },
+        ]);
+        const exactResult = app._installActiveTurnUser(
+          exactTail, "turn-exact", "", [
+            { mime: "image/png", url: "/same.png" },
+          ], [{ name: "notes.md", kind: "text" }],
+        );
+
+        return {
+          repeated: {
+            appended: repeatedResult.appended,
+            length: repeated.messages.length,
+            oldTurnId: repeated.messages[0]._turnId || "",
+            tailTurnId: repeated.messages.at(-1)._turnId || "",
+          },
+          attachment: {
+            appended: attachmentResult.appended,
+            length: attachmentOnly.messages.length,
+            oldTurnId: attachmentOnly.messages[0]._turnId || "",
+            tailTurnId: attachmentOnly.messages.at(-1)._turnId || "",
+          },
+          exact: {
+            appended: exactResult.appended,
+            length: exactTail.messages.length,
+            tailTurnId: exactTail.messages.at(-1)._turnId || "",
+          },
+        };
+        """,
+    )
+    assert result["repeated"] == {
+        "appended": True,
+        "length": 3,
+        "oldTurnId": "",
+        "tailTurnId": "turn-repeat",
+    }
+    assert result["attachment"] == {
+        "appended": True,
+        "length": 2,
+        "oldTurnId": "",
+        "tailTurnId": "turn-attachment",
+    }
+    assert result["exact"] == {
+        "appended": False,
+        "length": 1,
+        "tailTurnId": "turn-exact",
+    }
+
+
+def test_session_sync_deadline_dispose_and_hidden_resume(
+    page: Page, backend_url, auth_token,
+):
+    """A stuck request releases the coordinator; hidden polling resumes promptly."""
+    errors = _capture_browser_errors(page)
+    _login(page, backend_url, auth_token)
+    result = _app_eval(
+        page,
+        """
+        return (async () => {
+          const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+          const makeState = (sid) => {
+            const st = app._blankTabState();
+            st._sid = sid;
+            app.tabState[sid] = st;
+            return st;
+          };
+
+          app._abortActivityFetches();
+          await sleep(0);
+          const originalFetch = window.fetch;
+          const originalRequestDeadline = app.REQUEST_DEADLINE_MS;
+          app.REQUEST_DEADLINE_MS = 35;
+          window.fetch = () => new Promise(() => {});
+          const activityStarted = performance.now();
+          const activityResult = await app.fetchActivity();
+          const activityElapsed = performance.now() - activityStarted;
+          const activityReleased = activityResult === false
+            && !app._activityFetchPromises.events
+            && !app._activityFetchControllers.events;
+          window.fetch = originalFetch;
+          app.REQUEST_DEADLINE_MS = originalRequestDeadline;
+
+          const deadlineState = makeState("sync-never-resolving");
+          const deadlineResult = await app._requestSessionSync(
+            "sync-never-resolving", "transport_retry", {
+              deadlineMs: 40,
+              run: () => new Promise(() => {}),
+            },
+          );
+          const coordinatorReleased = deadlineResult === false
+            && deadlineState.sessionSync.inFlight === null;
+
+          const disposeState = makeState("sync-dispose");
+          let abortObserved = false;
+          const disposePromise = app._requestSessionSync(
+            "sync-dispose", "transport_retry", {
+              deadlineMs: 1000,
+              run: signal => new Promise((resolve) => {
+                const onAbort = () => {
+                  abortObserved = true;
+                  resolve("aborted");
+                };
+                if (signal.aborted) onAbort();
+                else signal.addEventListener("abort", onAbort, { once: true });
+              }),
+            },
+          );
+          for (let i = 0; i < 20 && !disposeState.sessionSync.inFlight; i += 1) {
+            await sleep(5);
+          }
+          const disposeWasInFlight = !!disposeState.sessionSync.inFlight;
+          app._disposeSessionSync(disposeState);
+          const disposeResult = await Promise.race([
+            disposePromise,
+            sleep(250).then(() => "stuck"),
+          ]);
+
+          const descriptor = Object.getOwnPropertyDescriptor(
+            document, "visibilityState",
+          );
+          let visibility = "hidden";
+          Object.defineProperty(document, "visibilityState", {
+            configurable: true,
+            get: () => visibility,
+          });
+          const hiddenState = makeState("sync-hidden");
+          let hiddenRuns = 0;
+          const hiddenPromise = app._requestSessionSync(
+            "sync-hidden", "transport_retry", {
+              deadlineMs: 500,
+              run: () => { hiddenRuns += 1; return true; },
+            },
+          );
+          await sleep(80);
+          const hiddenHeld = hiddenRuns === 0
+            && !!hiddenState.sessionSync.pending.transport_retry;
+          visibility = "visible";
+          app._resumeVisibleSessionSync();
+          const resumed = await Promise.race([
+            hiddenPromise,
+            sleep(500).then(() => "stuck"),
+          ]);
+          app._disposeSessionSync(hiddenState);
+          if (descriptor) {
+            Object.defineProperty(document, "visibilityState", descriptor);
+          } else {
+            delete document.visibilityState;
+          }
+
+          const originalRandom = Math.random;
+          Math.random = () => 0;
+          const retryDelays = [1, 2, 3].map(attempt => app._retryDelay(attempt));
+          const previousActivityFailures = app._activityLiveFailures;
+          app._activityLiveFailures = 0;
+          const activityDelays = [
+            app._activityReconnectDelay(),
+            app._activityReconnectDelay(),
+            app._activityReconnectDelay(),
+          ];
+          app._activityLiveFailures = previousActivityFailures;
+          Math.random = originalRandom;
+
+          return {
+            activityReleased,
+            activityElapsed,
+            coordinatorReleased,
+            disposeWasInFlight,
+            abortObserved,
+            disposeSettled: disposeResult !== "stuck",
+            hiddenHeld,
+            hiddenRuns,
+            resumed,
+            retryDelays,
+            activityDelays,
+          };
+        })();
+        """,
+    )
+    assert result["activityReleased"] is True
+    assert 25 <= result["activityElapsed"] < 500
+    assert result["coordinatorReleased"] is True
+    assert result["disposeWasInFlight"] is True
+    assert result["abortObserved"] is True
+    assert result["disposeSettled"] is True
+    assert result["hiddenHeld"] is True
+    assert result["hiddenRuns"] == 1
+    assert result["resumed"] is True
+    assert result["retryDelays"] == [800, 1600, 3200]
+    assert result["activityDelays"] == [1000, 2000, 4000]
     _assert_no_browser_errors(page, errors)
 
 
@@ -3123,8 +4376,14 @@ def test_desktop_done_reconcile_preserves_live_message_dom_identity(
     _install_fake_event_source(page)
     sid = "perf-done-canonical-identity"
     prompt = "DOM_IDENTITY_USER_PROMPT"
+    history_marker = "FULL_ORDER_HISTORY_SURVIVES_LRU_REMOUNT"
     final_text = "DOM_IDENTITY_FINAL_REPLY " + ("stable canonical text " * 40)
-    canonical_messages: list[dict] = []
+    canonical_messages: list[dict] = [{
+        "role": "assistant",
+        "text": history_marker,
+        "uuid": "done-full-history-assistant",
+        "ts": 1_700_019_999,
+    }]
     requests = _route_windowed_session(page, sid, canonical_messages)
     page.route(
         "**/api/chat/stream/start",
@@ -3162,17 +4421,26 @@ def test_desktop_done_reconcile_preserves_live_message_dom_identity(
         const st = app._ensureTabState(sid);
         st._loaded = true;
         st._seenUpdated = 1;
+        st.messages.push({
+          role: "assistant", text: arg.historyMarker,
+          html: `<p>${arg.historyMarker}</p>`,
+          uuid: "done-full-history-assistant",
+          _k: `${sid}:uuid:done-full-history-assistant`, _noAnim: true,
+        });
+        Object.assign(st.messageRange, {
+          visibleStart: 0, visibleEnd: 1, offset: 0, total: 1,
+          preTotal: 0, order: "full", generation: "gen-e2e-1",
+        });
         app.currentId = sid;
-        app._residentTabIds = [sid];
         app._activateTabState(sid);
-        app.messagesReady = true;
-        app.messagesLoading = false;
+        app._ensureTabState(app.currentId).messagesReady = true;
+        app._ensureTabState(app.currentId).messagesLoading = false;
         app.mobileTab = "chat";
         app.input = arg.prompt;
-        app.atBottom = true;
+        app._ensureTabState(app.currentId).atBottom = true;
         return true;
         """,
-        {"sid": sid, "prompt": prompt},
+        {"sid": sid, "prompt": prompt, "historyMarker": history_marker},
     )
 
     _app_eval(page, "app.send(); return true;")
@@ -3188,10 +4456,11 @@ def test_desktop_done_reconcile_preserves_live_message_dom_identity(
     page.wait_for_function(
         """text => {
           const app = document.querySelector("#app")._x_dataStack[0];
-          const last = app.messages[app.messages.length - 1];
-          const pane = Array.from(document.querySelectorAll(".msg-pane"))
-            .find(el => getComputedStyle(el).display !== "none");
-          return app.streaming && last?.role === "assistant" && last.text === text
+          const st = app._ensureTabState(app.currentId);
+          const last = st.messages[st.messages.length - 1];
+          const pane = document.querySelector(
+            `.msg-pane[data-tid="${CSS.escape(app.currentId)}"]`);
+          return st.streaming && last?.role === "assistant" && last.text === text
             && pane?.querySelector(".msg.assistant");
         }""",
         arg=final_text,
@@ -3200,7 +4469,8 @@ def test_desktop_done_reconcile_preserves_live_message_dom_identity(
     live = page.evaluate(
         """() => {
           const app = document.querySelector("#app")._x_dataStack[0];
-          const last = app.messages[app.messages.length - 1];
+          const st = app._ensureTabState(app.currentId);
+          const last = st.messages[st.messages.length - 1];
           const nodes = document.querySelectorAll(".msg-pane .msg.assistant");
           window.__doneReconcileLiveNode = nodes[nodes.length - 1];
           window.__doneReconcileLiveKey = last._k;
@@ -3227,12 +4497,17 @@ def test_desktop_done_reconcile_preserves_live_message_dom_identity(
     page.evaluate(
         """() => window.__emitSse("done", {
           total_cost_usd: 0.001,
+          memory_recall: { count: 2, query: "private-query" },
           session_usage: { context_used_pct: 5, context_used: 500, context_limit: 100000 },
           turn_id: "done-reconcile-turn", event_seq: 2,
         })"""
     )
     page.wait_for_function(
-        "() => document.querySelector('#app')._x_dataStack[0].streaming === false",
+        """sid => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          return app._ensureTabState(sid).streaming === false;
+        }""",
+        arg=sid,
         timeout=10000,
     )
 
@@ -3247,12 +4522,12 @@ def test_desktop_done_reconcile_preserves_live_message_dom_identity(
           const frames = [];
           for (let i = 0; i < 12; i++) {
             await new Promise(resolve => requestAnimationFrame(resolve));
-            const pane = Array.from(document.querySelectorAll(".msg-pane"))
-              .find(el => getComputedStyle(el).display !== "none");
+            const pane = document.querySelector(
+              `.msg-pane[data-tid="${CSS.escape(sid)}"]`);
             frames.push({
-              ready: app.messagesReady,
-              loading: app.messagesLoading,
-              visible: !!pane && pane.textContent.includes(text),
+              ready: st.messagesReady,
+              loading: st.messagesLoading,
+              visible: !!pane && pane.textContent.includes(text.trim()),
               count: pane ? pane.querySelectorAll(".msg").length : 0,
             });
             if (!st._reconcilePromise && i >= 2) break;
@@ -3269,19 +4544,82 @@ def test_desktop_done_reconcile_preserves_live_message_dom_identity(
             key: last._k,
             uuid: last.uuid || "",
             text: last.text || "",
+            cost: last.cost || "",
+            memoryCount: Number(last.memoryRecall?.count) || 0,
+            historyOrder: st.messageRange.order,
           };
         }""",
         {"sid": sid, "text": final_text},
     )
 
     assert requests, "canonical reconciliation did not request session history"
+    assert any(req["full"] and req["tail"] for req in requests), requests
     assert result["sameNode"] is True, result
     assert result["key"] == result["oldKey"]
     assert result["uuid"] == "done-canonical-assistant"
     assert result["text"] == final_text
+    assert result["cost"] == "$0.0010"
+    assert result["memoryCount"] == 2
+    assert result["historyOrder"] == "full"
     assert result["frames"]
     assert all(frame["ready"] and not frame["loading"] for frame in result["frames"]), result
     assert all(frame["visible"] and frame["count"] > 0 for frame in result["frames"]), result
+
+    remount = _app_eval(
+        page,
+        """
+        const sid = arg.sid;
+        const dummyIds = ["done-lru-a", "done-lru-b", "done-lru-c"];
+        app.sessions = [app.sessions.find(s => s.id === sid), ...dummyIds.map((id, i) => ({
+          id, name: `LRU ${i}`, updated_at: 10 + i,
+          model: "e2e-model", permission: "bypassPermissions", thinking: true,
+        }))];
+        app.openTabIds = [sid, ...dummyIds];
+        app.currentId = sid;
+        app._touchTranscriptPane(sid);
+        await new Promise(resolve => app.$nextTick(resolve));
+        for (const id of dummyIds) {
+          const st = app._blankTabState();
+          st._loaded = true;
+          st.messagesReady = true;
+          st.messagesLoading = false;
+          st.messages.push({
+            role: "assistant", text: id, html: `<p>${id}</p>`,
+            uuid: `${id}-assistant`, _k: `${id}:uuid:${id}-assistant`, _noAnim: true,
+          });
+          Object.assign(st.messageRange, {
+            visibleStart: 0, visibleEnd: 1, offset: 0, total: 1,
+            preTotal: 0, order: "normal", generation: "gen-e2e-1",
+          });
+          app.tabState[id] = st;
+          app.currentId = id;
+          app._touchTranscriptPane(id);
+          app._activateTabState(id);
+          await new Promise(resolve => app.$nextTick(resolve));
+        }
+        const evicted = !app.warmTranscriptTabIds().includes(sid);
+        app.currentId = sid;
+        app._touchTranscriptPane(sid);
+        app._activateTabState(sid);
+        await new Promise(resolve => app.$nextTick(
+          () => requestAnimationFrame(resolve)));
+        const pane = document.querySelector(
+          `.msg-pane[data-tid="${CSS.escape(sid)}"]`);
+        return {
+          evicted,
+          warmCount: app.warmTranscriptTabIds().length,
+          markerVisible: !!pane && pane.textContent.includes(arg.historyMarker),
+          finalVisible: !!pane && pane.textContent.includes(arg.finalText.trim()),
+          historyOrder: app._ensureTabState(sid).messageRange.order,
+        };
+        """,
+        {"sid": sid, "historyMarker": history_marker, "finalText": final_text},
+    )
+    assert remount["evicted"] is True, remount
+    assert remount["warmCount"] <= 3, remount
+    assert remount["markerVisible"] is True, remount
+    assert remount["finalVisible"] is True, remount
+    assert remount["historyOrder"] == "full"
     _assert_no_browser_errors(page, errors)
 
 
@@ -3338,13 +4676,12 @@ def test_desktop_cancelled_snapshot_reconcile_never_blanks_or_replaces_live_node
         st._loaded = true;
         st._seenUpdated = 1;
         app.currentId = sid;
-        app._residentTabIds = [sid];
         app._activateTabState(sid);
-        app.messagesReady = true;
-        app.messagesLoading = false;
+        app._ensureTabState(app.currentId).messagesReady = true;
+        app._ensureTabState(app.currentId).messagesLoading = false;
         app.mobileTab = "chat";
         app.input = arg.prompt;
-        app.atBottom = true;
+        app._ensureTabState(app.currentId).atBottom = true;
         return true;
         """,
         {"sid": sid, "prompt": prompt},
@@ -3390,7 +4727,7 @@ def test_desktop_cancelled_snapshot_reconcile_never_blanks_or_replaces_live_node
           const app = document.querySelector("#app")._x_dataStack[0];
           const pane = Array.from(document.querySelectorAll(".msg-pane"))
             .find(el => getComputedStyle(el).display !== "none");
-          return app.streaming && app.messages.length === 6
+          return app._ensureTabState(app.currentId).streaming && app._ensureTabState(app.currentId).messages.length === 6
             && pane?.textContent.includes(expected.first)
             && pane?.textContent.includes(expected.final);
         }""",
@@ -3404,7 +4741,7 @@ def test_desktop_cancelled_snapshot_reconcile_never_blanks_or_replaces_live_node
             .find(el => getComputedStyle(el).display !== "none");
           const nodes = Array.from(pane.querySelectorAll(".msg"));
           window.__cancelledSnapshotNodes = nodes;
-          window.__cancelledSnapshotKeys = app.messages.map(m => m._k);
+          window.__cancelledSnapshotKeys = app._ensureTabState(app.currentId).messages.map(m => m._k);
           window.__cancelledSnapshotMinCount = nodes.length;
           window.__cancelledSnapshotObserver = new MutationObserver(() => {
             const visible = Array.from(document.querySelectorAll(".msg-pane"))
@@ -3462,7 +4799,7 @@ def test_desktop_cancelled_snapshot_reconcile_never_blanks_or_replaces_live_node
         """expected => {
           const app = document.querySelector("#app")._x_dataStack[0];
           const st = app._ensureTabState(expected.sid);
-          return !app.streaming && !st.streaming && st._loaded
+          return !app._ensureTabState(app.currentId).streaming && !st.streaming && st._loaded
             && st.messages.length === expected.count
             && st.messages.every(message => message._interrupted === true);
         }""",
@@ -3478,16 +4815,16 @@ def test_desktop_cancelled_snapshot_reconcile_never_blanks_or_replaces_live_node
           const pane = Array.from(document.querySelectorAll(".msg-pane"))
             .find(el => getComputedStyle(el).display !== "none");
           const nodes = Array.from(pane.querySelectorAll(".msg"));
-          const tail = app.messages[app.messages.length - 1];
+          const tail = app._ensureTabState(app.currentId).messages[app._ensureTabState(app.currentId).messages.length - 1];
           const footer = nodes[nodes.length - 1]?.querySelector('.turn-footer');
           return {
             minCount: window.__cancelledSnapshotMinCount,
             count: nodes.length,
             sameNodes: nodes.every(
               (node, index) => node === window.__cancelledSnapshotNodes[index]),
-            keys: app.messages.map(message => message._k),
-            ready: app.messagesReady,
-            loading: app.messagesLoading,
+            keys: app._ensureTabState(app.currentId).messages.map(message => message._k),
+            ready: app._ensureTabState(app.currentId).messagesReady,
+            loading: app._ensureTabState(app.currentId).messagesLoading,
             firstVisible: pane.textContent.includes(first),
             finalVisible: pane.textContent.includes(final),
             tailStatus: tail.turn_status,
@@ -3621,15 +4958,16 @@ def test_fast_completed_queued_turn_reconciles_footer_without_refresh(
           uuid: 'prior-visible-assistant', ts: Date.now() - 10000,
           elapsed: 2, model: 'e2e-model', turn_status: 'completed',
         }]));
+        st.messageRange.visibleEnd = st.messages.length;
+        st.messageRange.total = st.messages.length;
         st._loaded = true;
         st._seenUpdated = 1;
         st._draining = true;
         st.messagesReady = true;
         app.currentId = sid;
-        app._residentTabIds = [sid];
         app._activateTabState(sid);
-        app.messagesReady = true;
-        app.messagesLoading = false;
+        app._ensureTabState(app.currentId).messagesReady = true;
+        app._ensureTabState(app.currentId).messagesLoading = false;
         app.mobileTab = 'chat';
         return true;
         """,
@@ -3709,9 +5047,10 @@ def test_fast_completed_queued_turn_reconciles_footer_without_refresh(
     expected_status = _app_eval(
         page, "return app.lang === 'zh' ? '已完成' : 'Completed';"
     )
-    expect(footer.locator(".turn-status > span").first).to_have_text(
-        expected_status
-    )
+    expect(footer.locator(
+        ".turn-status > span:not(.turn-running-dots)"
+        ":not(.turn-background-running)"
+    )).to_have_text(expected_status)
     expect(footer.locator(".msg-ts")).to_have_text(expected_time)
     expect(footer.locator(".msg-elapsed")).to_have_text("· 4s")
     expected_model = _app_eval(
@@ -3831,13 +5170,12 @@ def test_tool_result_tail_done_metadata_renders_footer_before_canonical_reload(
         st._loaded = true;
         st._seenUpdated = 1;
         app.currentId = sid;
-        app._residentTabIds = [sid];
         app._activateTabState(sid);
-        app.messagesReady = true;
-        app.messagesLoading = false;
+        app._ensureTabState(app.currentId).messagesReady = true;
+        app._ensureTabState(app.currentId).messagesLoading = false;
         app.mobileTab = 'chat';
         app.input = 'Finish on a tool result';
-        app.atBottom = true;
+        app._ensureTabState(app.currentId).atBottom = true;
         return true;
         """,
         {"sid": sid},
@@ -3878,15 +5216,15 @@ def test_tool_result_tail_done_metadata_renders_footer_before_canonical_reload(
     page.wait_for_function(
         """() => {
           const app = document.querySelector('#app')._x_dataStack[0];
-          const tail = app.messages[app.messages.length - 1];
-          return app.streaming && tail?.role === 'tool_result';
+          const tail = app._ensureTabState(app.currentId).messages[app._ensureTabState(app.currentId).messages.length - 1];
+          return app._ensureTabState(app.currentId).streaming && tail?.role === 'tool_result';
         }"""
     )
     before_done = _app_eval(
         page,
         """
-        const tail = app.messages[app.messages.length - 1];
-        const assistant = [...app.messages].reverse()
+        const tail = app._ensureTabState(app.currentId).messages[app._ensureTabState(app.currentId).messages.length - 1];
+        const assistant = [...app._ensureTabState(app.currentId).messages].reverse()
           .find(message => message.role === 'assistant');
         return {
           tailKey: tail._k,
@@ -3942,13 +5280,13 @@ def test_tool_result_tail_done_metadata_renders_footer_before_canonical_reload(
     page.wait_for_function(
         """arg => {
           const app = document.querySelector('#app')._x_dataStack[0];
-          const tail = app.messages[app.messages.length - 1];
+          const tail = app._ensureTabState(app.currentId).messages[app._ensureTabState(app.currentId).messages.length - 1];
           const pane = document.querySelector(
             `.msg-pane[data-tid="${CSS.escape(arg.sid)}"]`);
           const tailNode = pane?.querySelector(
             `.msg[data-message-key="${CSS.escape(arg.tailKey)}"]`);
           const footer = tailNode?.querySelector('.turn-footer');
-          return !app.streaming
+          return !app._ensureTabState(app.currentId).streaming
             && tail?.role === 'tool_result'
             && tail.ts === arg.completedAtMs
             && tail.elapsed === arg.durationMs / 1000
@@ -3985,7 +5323,7 @@ def test_tool_result_tail_done_metadata_renders_footer_before_canonical_reload(
     expect(footer.locator(".msg-ts")).to_have_text(expected_time)
     expect(footer.locator(".msg-elapsed")).to_have_text("· 2m05s")
     expect(footer.locator(".turn-model")).to_have_text("· E2E model")
-    expect(footer.locator(".turn-status > span").first).to_have_text(
+    expect(footer.locator(".turn-status > span:visible")).to_have_text(
         expected_status
     )
     recall_trigger = footer.locator(".memory-recall-trace")
@@ -4024,8 +5362,8 @@ def test_tool_result_tail_done_metadata_renders_footer_before_canonical_reload(
     state = _app_eval(
         page,
         """
-        const tail = app.messages[app.messages.length - 1];
-        const assistant = [...app.messages].reverse()
+        const tail = app._ensureTabState(app.currentId).messages[app._ensureTabState(app.currentId).messages.length - 1];
+        const assistant = [...app._ensureTabState(app.currentId).messages].reverse()
           .find(message => message.role === 'assistant');
         return {
           role: tail.role,
@@ -4033,14 +5371,14 @@ def test_tool_result_tail_done_metadata_renders_footer_before_canonical_reload(
           tailForkUuid: tail.forkUuid,
           assistantUuid: assistant?.uuid || '',
           forkBoundary: app.turnForkMessageId(
-            app.messages, app.messages.length - 1),
+            app._ensureTabState(app.currentId).messages, app._ensureTabState(app.currentId).messages.length - 1),
           ts: tail.ts,
           elapsed: tail.elapsed,
           model: tail.model,
           turnStatus: tail.turn_status,
           memoryRecallId: tail.memoryRecall?.id || '',
           liveKey: tail._k,
-          streaming: app.streaming,
+          streaming: app._ensureTabState(app.currentId).streaming,
         };
         """,
     )
@@ -4067,7 +5405,7 @@ def test_tool_result_tail_done_metadata_renders_footer_before_canonical_reload(
     _assert_no_browser_errors(page, errors)
 
 
-def test_message_render_keys_are_repaired_per_pane_and_survive_reconciliation(
+def test_stable_message_identity_needs_no_repair_telemetry(
     page: Page, backend_url, auth_token,
 ):
     errors = _capture_browser_errors(page)
@@ -4076,221 +5414,166 @@ def test_message_render_keys_are_repaired_per_pane_and_survive_reconciliation(
     result = page.evaluate(
         """async () => {
           const app = document.querySelector("#app")._x_dataStack[0];
-          const sid = "render-key-primary";
-          const otherSid = "render-key-other";
-          const reconcileSid = "render-key-reconcile";
-          const marker = "PRIVATE_MESSAGE_CONTENT_MUST_NOT_REACH_TELEMETRY";
+          const sid = "stable-render-identity";
           app.refreshSessions = async () => {};
           app._fetchTabUsage = async () => {};
           app._scheduleIdlePreload = () => {};
           app.appReady = true;
-          app.sessions = [
-            {id: sid, name: "Primary", model: "e2e-model"},
-            {id: otherSid, name: "Other", model: "e2e-model"},
-          ];
-          app.openTabIds = [sid, otherSid];
+          app.sessions = [{id: sid, name: "Stable", model: "e2e-model"}];
+          app.openTabIds = [sid];
           app.tabState = {};
           const st = app._ensureTabState(sid);
-          const other = app._ensureTabState(otherSid);
           st._loaded = true;
-          other._loaded = true;
-          const original = {role: "user", text: marker + " user", _k: "shared-key"};
-          const live = {role: "assistant", text: marker + " assistant", _k: "shared-key"};
-          const missing = {role: "thinking", text: marker + " thinking", _k: "   "};
-          const futureLegit = {
-            role: "tool_result", text: marker + " legitimate repair-shaped key",
-            _k: `${sid}:render-repair:1`,
-          };
-          // A repeated occurrence of the exact same object cannot be repaired by
-          // mutating _k: both occurrences share that property. Normalization must
-          // remove the later array occurrence and preserve the first.
-          st.messages.push(original, live, missing, futureLegit, original);
-          // The same key is valid in another pane; uniqueness is pane-local.
-          other.messages.push({role: "assistant", text: "other", _k: "shared-key"});
-          window.__museTelemetry__.length = 0;
-          const realReport = window.__museReportTelemetry__;
-          const realDateNow = Date.now;
-          let now = 100_000;
-          Date.now = () => now;
-          let telemetryCalls = 0;
-          window.__museReportTelemetry__ = (record) => {
-            telemetryCalls += 1;
-            realReport(record);
-          };
+          const payload = [
+            {role: "user", text: "question", block_id: "record-1:0:user"},
+            {role: "assistant", text: "answer", block_id: "record-2:0:assistant"},
+            {role: "tool_result", text: "tool", block_id: "record-2:1:tool_result"},
+          ];
+          const first = app._historyEnvelopes(sid, payload);
+          const second = app._historyEnvelopes(sid, payload.map(message => ({...message})));
+          st.messages.push(...first);
+          st.messageRange.visibleEnd = st.messages.length;
+          st.messageRange.total = st.messages.length;
           app.currentId = sid;
-          app._residentTabIds = [otherSid, sid];
           app._activateTabState(sid);
-          app.messagesReady = true;
-          app.messagesLoading = false;
-
-          const ensureMethod = app._ensurePaneMessageRenderKeys;
-          const rebuildMethod = app._rebuildPaneMessageRenderKeys;
-          const normalize = (id) => ensureMethod.call(app, id);
-          let fullScans = 0;
-          app._rebuildPaneMessageRenderKeys = function(...args) {
-            fullScans += 1;
-            return rebuildMethod.apply(this, args);
-          };
-          // Re-activation and repeated render getters are both O(1) once this
-          // pane's current message generation has been normalized.
-          app._activateTabState(sid);
-          app._activateTabState(sid);
-          const firstKeys = app.paneMessages(sid).map(m => m._k);
-          const secondKeys = app.paneMessages(sid).map(m => m._k);
-          const otherKeys = app.paneMessages(otherSid).map(m => m._k);
-          const warmFullScans = fullScans;
+          app._ensureTabState(app.currentId).messagesReady = true;
+          app._ensureTabState(app.currentId).messagesLoading = false;
           await new Promise(resolve => app.$nextTick(() => requestAnimationFrame(resolve)));
-          const pane = document.querySelector(
-            `.msg-pane[data-tid="${CSS.escape(sid)}"]`);
+          const pane = document.querySelector(`.msg-pane[data-tid="${sid}"]`);
           const domKeys = pane ? Array.from(pane.querySelectorAll(".msg"))
             .map(el => el.dataset.messageKey) : [];
-          const initialTelemetry = window.__museTelemetry__.slice();
-          const stableBefore = [original._k, live._k, missing._k, futureLegit._k];
-          const appended = [];
-          for (let i = 0; i < 25; i++) {
-            appended.push(app._appendLiveMessage(st, {
-              role: "thinking", text: `live append ${i}`,
-            }));
-          }
-          const liveFullScans = fullScans;
-          const appendedKeys = appended.map(message => message._k);
-
-          // Install the fake timer before the first repair inside the rate
-          // window. That repair owns the one trailing flush; installing this
-          // after it would leave a real timer in telemetry.flushTimer and the
-          // deterministic callback list would remain empty.
-          const realSetTimeout = window.setTimeout;
-          const trailingCallbacks = [];
-          let trailingSchedules = 0;
-          window.setTimeout = (callback, delay) => {
-            trailingSchedules += 1;
-            trailingCallbacks.push({callback, delay});
-            return 90_000 + trailingSchedules;
-          };
-          const inserted = {
-            role: "tool_result", text: marker + " inserted", _k: "shared-key",
-          };
-          st.messages.unshift(inserted);
-          normalize(sid);
-          const insertedKey = inserted._k;
-          const stableAfterInsert = [original._k, live._k, missing._k, futureLegit._k];
-          st.messages.splice(0, st.messages.length, missing, inserted, live, original);
-          normalize(sid);
-          const stableAfterReorder = [original._k, live._k, missing._k, futureLegit._k];
-          // Further corruption inside the rate window is aggregated behind the
-          // same trailing timer.
-          st.messages.push(
-            {role: "tool_use", text: marker + " duplicate again", _k: "shared-key"},
-            {role: "thinking", text: marker + " missing again"},
-          );
-          normalize(sid);
-          st.messages.push({role: "thinking", text: marker + " missing again 2"});
-          normalize(sid);
-          window.setTimeout = realSetTimeout;
-          const telemetryInsideWindow = window.__museTelemetry__.slice();
-          now += 60_000;
-          trailingCallbacks[0].callback();
-          const telemetry = window.__museTelemetry__.slice();
-
-          const liveKey = live._k;
-          const canonical = app._historyEnvelopes(sid, [{
-            role: "assistant", text: live.text, uuid: "canonical-assistant",
-          }]);
-          const preserved = app._preserveCanonicalMessageIdentity(st, canonical);
-          app._claimPaneMessageRenderKeys(sid, preserved);
-
-          const reconcile = app._ensureTabState(reconcileSid);
-          const older = {
-            role: "assistant", text: "same reply", uuid: "older-assistant",
-            _k: `${reconcileSid}:uuid:older-assistant`,
-          };
-          const newestLive = {
-            role: "assistant", text: "same reply", _k: `${reconcileSid}:live:1`,
-          };
-          reconcile.messages.push(older, newestLive);
-          const reconciled = app._preserveCanonicalMessageIdentity(
-            reconcile,
-            app._historyEnvelopes(reconcileSid, [{
-              role: "assistant", text: "same reply", uuid: "canonical-newest",
-            }]),
-          );
-          rebuildMethod.call(app, reconcileSid, reconciled);
-          app._rebuildPaneMessageRenderKeys = rebuildMethod;
-          window.__museReportTelemetry__ = realReport;
-          Date.now = realDateNow;
-
+          const live = Array.from({length: 25}, (_, i) => app._appendLiveMessage(st, {
+            role: "thinking", text: `live ${i}`,
+          }));
+          const followedEnd = st.messageRange.visibleEnd;
+          st.messageRange.visibleEnd = 3;
+          app._appendLiveMessage(st, {role: "thinking", text: "hidden live"});
+          const hiddenEnd = st.messageRange.visibleEnd;
           return {
-            firstKeys, secondKeys, otherKeys, domKeys,
-            warmFullScans, liveFullScans, appendedKeys,
-            stableBefore, stableAfterInsert, stableAfterReorder, insertedKey,
-            futureLegitKey: futureLegit._k, missingKey: missing._k,
-            initialTelemetry, telemetryInsideWindow, telemetry, telemetryCalls,
-            trailingSchedules, trailingDelay: trailingCallbacks[0]?.delay,
-            sameObjectOccurrences: st.messages.filter(
-              message => Alpine.raw(message) === original).length,
-            telemetryText: JSON.stringify(telemetry), marker,
-            liveSameObject: Alpine.raw(preserved[0]) === live,
-            liveKey: preserved[0]._k,
-            expectedLiveKey: liveKey,
-            canonicalUuid: preserved[0].uuid,
-            newestSameObject: Alpine.raw(reconciled[0]) === newestLive,
-            newestKey: reconciled[0]._k,
+            keys: first.map(message => message._k),
+            sameObjects: first.every((message, i) => Alpine.raw(second[i]) === Alpine.raw(message)),
+            domKeys,
+            liveKeys: live.map(message => message._k),
+            followedEnd,
+            hiddenEnd,
+            repositoryLength: st.messages.length,
+            normalizedCount: app._sessionWindows.get(sid)?.size || 0,
+            paneCount: document.querySelectorAll(".msg-pane").length,
+            telemetryBuffer: typeof window.__museTelemetry__,
+            telemetryReporter: typeof window.__museReportTelemetry__,
           };
         }"""
     )
 
-    assert result["firstKeys"] == result["secondKeys"], result
-    assert len(result["firstKeys"]) == len(set(result["firstKeys"])) == 4, result
-    assert all(result["firstKeys"]), result
-    assert result["otherKeys"] == ["shared-key"], result
-    assert result["domKeys"] == result["firstKeys"], result
-    assert result["warmFullScans"] == 0, result
-    assert result["liveFullScans"] == 0, result
-    assert len(result["appendedKeys"]) == len(set(result["appendedKeys"])) == 25, result
-    assert not set(result["appendedKeys"]) & set(result["stableBefore"]), result
-    assert result["stableAfterInsert"] == result["stableBefore"], result
-    assert result["stableAfterReorder"] == result["stableBefore"], result
-    assert result["insertedKey"] not in result["stableBefore"], result
-    assert result["futureLegitKey"] == "render-key-primary:render-repair:1", result
-    assert result["missingKey"] != result["futureLegitKey"], result
-    first_report = {
-        "kind": "message_render_key",
-        "pane": "render-key-primary",
-        "session": "render-key-primary",
-        "issues": [
-            {"issue": "duplicate", "count": 2},
-            {"issue": "missing", "count": 1},
-        ],
-    }
-    assert result["initialTelemetry"] == result["telemetryInsideWindow"] == [
-        first_report
-    ], result
-    assert result["telemetry"] == [
-        first_report,
-        {
-            "kind": "message_render_key",
-            "pane": "render-key-primary",
-            "session": "render-key-primary",
-            "issues": [
-                {"issue": "duplicate", "count": 2},
-                {"issue": "missing", "count": 2},
-            ],
-        },
-    ], result
-    assert result["telemetryCalls"] == 2, result
-    assert result["trailingSchedules"] == 1, result
-    assert result["trailingDelay"] == 60_000, result
-    assert result["sameObjectOccurrences"] == 1, result
-    assert result["marker"] not in result["telemetryText"], result
-    assert result["liveSameObject"] is True, result
-    assert result["liveKey"] == result["expectedLiveKey"], result
-    assert result["canonicalUuid"] == "canonical-assistant", result
-    assert result["newestSameObject"] is True, result
-    assert result["newestKey"] == "render-key-reconcile:live:1", result
+    assert result["keys"] == [
+        "stable-render-identity:block:record-1:0:user",
+        "stable-render-identity:block:record-2:0:assistant",
+        "stable-render-identity:block:record-2:1:tool_result",
+    ]
+    assert result["sameObjects"] is True
+    assert result["domKeys"] == result["keys"]
+    assert len(result["liveKeys"]) == len(set(result["liveKeys"])) == 25
+    assert all(":live:" in key for key in result["liveKeys"])
+    assert result["followedEnd"] == 28
+    assert result["repositoryLength"] == 29
+    assert result["hiddenEnd"] == 3
+    assert result["normalizedCount"] == 3
+    assert result["paneCount"] == 1
+    assert result["telemetryBuffer"] == "undefined"
+    assert result["telemetryReporter"] == "undefined"
     _assert_no_browser_errors(page, errors)
 
 
-def test_history_async_boundaries_reject_stale_state_and_reclaim_detached_keys(
+def test_live_turn_keeps_resident_messages_but_bounds_mounted_rows(
+    page: Page, backend_url, auth_token,
+):
+    errors = _capture_browser_errors(page)
+    page.set_viewport_size({"width": 1440, "height": 900})
+    _login(page, backend_url, auth_token)
+
+    result = page.evaluate(
+        """async () => {
+          const app = document.querySelector("#app")._x_dataStack[0];
+          const sid = "live-dom-budget";
+          app.refreshSessions = async () => {};
+          app._fetchTabUsage = async () => {};
+          app._scheduleIdlePreload = () => {};
+          app.appReady = true;
+          app.sessions = [{id: sid, name: "Live budget", model: "e2e-model"}];
+          app.openTabIds = [sid];
+          app.tabState = {};
+          const st = app._ensureTabState(sid);
+          st._loaded = true;
+          st.streaming = true;
+          st.atBottom = true;
+          app.currentId = sid;
+          app._activateTabState(sid);
+          app._ensureTabState(app.currentId).messagesReady = true;
+          app._ensureTabState(app.currentId).messagesLoading = false;
+          for (let i = 0; i < 250; i++) {
+            app._appendLiveMessage(st, {role: "thinking", text: `live ${i}`});
+          }
+          await new Promise(resolve => app.$nextTick(() => requestAnimationFrame(resolve)));
+          const followed = {
+            resident: st.messages.length,
+            start: st.messageRange.visibleStart,
+            end: st.messageRange.visibleEnd,
+            mounted: Array.from(document.querySelectorAll('.msg-pane')).filter(p => getComputedStyle(p).display !== 'none').reduce((n, p) => n + p.querySelectorAll('.msg').length, 0),
+          };
+          st.atBottom = false;
+          const frozen = {start: st.messageRange.visibleStart, end: st.messageRange.visibleEnd};
+          for (let i = 250; i < 300; i++) {
+            app._appendLiveMessage(st, {role: "thinking", text: `live ${i}`});
+          }
+          await new Promise(resolve => app.$nextTick(() => requestAnimationFrame(resolve)));
+          const reading = {
+            start: st.messageRange.visibleStart,
+            end: st.messageRange.visibleEnd,
+            resident: st.messages.length,
+            hasLater: app.hasLaterMessages(sid),
+          };
+          const body = document.querySelector('.chat-body');
+          body.scrollTop = body.scrollHeight;
+          app.onChatScroll();
+          const physicalBottomAtBottom = st.atBottom;
+          const emojiStatus = app._normalizeTaskStatusPreview({
+            summary: '😀'.repeat(1500), summary_length: 1500,
+            summary_truncated: false,
+          });
+          // Reproduce the completed-middle-window regression: explicit selection
+          // must acquire the logical tail, not merely scroll the bounded DOM.
+          st.streaming = false;
+          st.es = null;
+          await app.activateTab(sid);
+          await new Promise(resolve => app.$nextTick(() => requestAnimationFrame(resolve)));
+          const latest = {
+            start: st.messageRange.visibleStart,
+            end: st.messageRange.visibleEnd,
+            mounted: Array.from(document.querySelectorAll('.msg-pane')).filter(p => getComputedStyle(p).display !== 'none').reduce((n, p) => n + p.querySelectorAll('.msg').length, 0),
+          };
+          return {
+            followed, frozen, reading, latest, physicalBottomAtBottom,
+            emojiLength: Array.from(emojiStatus.summary).length,
+            emojiTruncated: emojiStatus.summary_truncated,
+          };
+        }"""
+    )
+
+    assert result["followed"] == {
+        "resident": 250, "start": 150, "end": 250, "mounted": 100,
+    }
+    assert result["reading"]["start"] == result["frozen"]["start"]
+    assert result["reading"]["end"] == result["frozen"]["end"]
+    assert result["reading"]["resident"] == 300
+    assert result["reading"]["hasLater"] is True
+    assert result["physicalBottomAtBottom"] is False
+    assert result["emojiLength"] == 1500
+    assert result["emojiTruncated"] is False
+    assert result["latest"] == {"start": 200, "end": 300, "mounted": 100}
+    _assert_no_browser_errors(page, errors)
+
+
+def test_stale_older_response_cannot_overwrite_new_canonical_tail(
     page: Page, backend_url, auth_token,
 ):
     errors = _capture_browser_errors(page)
@@ -4299,119 +5582,193 @@ def test_history_async_boundaries_reject_stale_state_and_reclaim_detached_keys(
     result = page.evaluate(
         """async () => {
           const app = document.querySelector("#app")._x_dataStack[0];
+          const sid = "history-owner-race";
+          app.refreshSessions = async () => {};
           app._fetchTabUsage = async () => {};
           app._scheduleIdlePreload = () => {};
-
-          // _fetchOlderWindow must not call any state-creating/key helper after
-          // its captured tab state was replaced while response JSON awaited.
-          const fetchSid = "render-key-stale-fetch";
-          const oldFetchState = app._ensureTabState(fetchSid);
-          oldFetchState._loadedOffset = 1;
-          oldFetchState._total = 1;
-          oldFetchState.historyGeneration = "old-generation";
-          let resolveJson;
-          const realFetch = window.fetch;
-          window.fetch = async () => ({
-            ok: true, status: 200,
-            json: () => new Promise(resolve => { resolveJson = resolve; }),
+          app.sessions = [{id: sid, name: "History owner race", message_count: 60}];
+          app.openTabIds = [sid];
+          app.tabState = {};
+          app.currentId = sid;
+          const st = app._ensureTabState(sid);
+          st._loaded = true;
+          st.atBottom = false;
+          st.messages.push(...Array.from({length: 20}, (_, i) => ({
+            role: "user", text: `old ${i + 20}`, uuid: `old-${i + 20}`,
+            _k: `${sid}:uuid:old-${i + 20}`,
+          })));
+          Object.assign(st.messageRange, {
+            visibleStart: 0, visibleEnd: 20, offset: 20, total: 40,
+            preTotal: 0, order: "normal", generation: "G1",
           });
-          const fetchPromise = app._fetchOlderWindow(fetchSid);
-          while (!resolveJson) await Promise.resolve();
-          const freshFetchState = app._blankTabState();
-          freshFetchState._sid = fetchSid;
-          app.tabState[fetchSid] = freshFetchState;
-          resolveJson({
-            messages: [{role: "user", text: "stale", uuid: "stale-fetch"}],
-            offset: 0, total: 1, history_generation: "new-generation",
-          });
-          const fetched = await fetchPromise;
-          window.fetch = realFetch;
+          app._activateTabState(sid);
 
-          // loadEarlierMessages detaches before chunked rendering. Replacing the
-          // state during that yield must leave both the orphan and fresh state
-          // untouched by the eventual continuation.
-          const staleSid = "render-key-stale-earlier";
-          const staleState = app._ensureTabState(staleSid);
-          staleState._loaded = true;
-          staleState._earlierMessages = Array.from({length: 81}, (_, i) => ({
-            role: "assistant", text: `stale earlier ${i}`,
-            _k: `${staleSid}:hist:${i}`,
-          }));
-          app._rebuildPaneMessageRenderKeys(staleSid);
-          app.currentId = staleSid;
-          app.messages = staleState.messages;
-          const realRaf = window.requestAnimationFrame;
-          let staleRaf;
-          window.requestAnimationFrame = callback => { staleRaf = callback; return 1; };
-          const stalePromise = app.loadEarlierMessages(staleSid);
-          while (!staleRaf) await Promise.resolve();
-          const freshEarlierState = app._blankTabState();
-          freshEarlierState._sid = staleSid;
-          app.tabState[staleSid] = freshEarlierState;
-          window.requestAnimationFrame = realRaf;
-          staleRaf();
-          await stalePromise;
-
-          // In the owned-state case, inject a colliding object while the batch is
-          // detached. Reinsertion must run the normalization boundary again.
-          const reclaimSid = "render-key-reclaim-earlier";
-          const reclaimState = app._ensureTabState(reclaimSid);
-          reclaimState._loaded = true;
-          const detached = Array.from({length: 81}, (_, i) => ({
-            role: "assistant", text: `owned earlier ${i}`,
-            _k: `${reclaimSid}:hist:${i}`,
-          }));
-          reclaimState._earlierMessages = detached.slice();
-          app._rebuildPaneMessageRenderKeys(reclaimSid);
-          app.currentId = reclaimSid;
-          app.messages = reclaimState.messages;
-          let reclaimRaf;
-          window.requestAnimationFrame = callback => { reclaimRaf = callback; return 2; };
-          const reclaimPromise = app.loadEarlierMessages(reclaimSid);
-          while (!reclaimRaf) await Promise.resolve();
-          const intruder = {
-            role: "tool_result", text: "intruder", _k: detached[1]._k,
+          const originalFetch = window.fetch;
+          let releaseOlder;
+          window.fetch = async url => {
+            const value = String(url);
+            if (value.includes("offset=0") && value.includes("history_generation=G1")) {
+              return await new Promise(resolve => {
+                releaseOlder = () => resolve(new Response(JSON.stringify({
+                  messages: Array.from({length: 20}, (_, i) => ({
+                    role: "user", text: `stale ${i}`, uuid: `stale-${i}`,
+                  })),
+                  offset: 0, total: 40, pre_total: 0,
+                  history_order: "normal", history_generation: "G1",
+                }), {status: 200, headers: {"content-type": "application/json"}}));
+              });
+            }
+            if (value.includes(`/api/chat/sessions/${sid}?tail=`)) {
+              return new Response(JSON.stringify({
+                id: sid, name: "History owner race", model: "e2e-model",
+                permission: "bypassPermissions", thinking: true,
+                messages: Array.from({length: 20}, (_, i) => ({
+                  role: i === 19 ? "assistant" : "user",
+                  text: `fresh ${i + 40}`, uuid: `fresh-${i + 40}`,
+                  turn_status: i === 19 ? "completed" : "",
+                })),
+                offset: 40, total: 60, message_count: 60,
+                pre_total: 0, history_order: "normal",
+                history_generation: "G2", runtime_ui_revision: "rev-2",
+                updated_at: 2,
+              }), {status: 200, headers: {"content-type": "application/json"}});
+            }
+            return originalFetch(url);
           };
-          reclaimState.messages.push(intruder);
-          app._markPaneRenderKeysDirty(reclaimState);
-          app._ensurePaneMessageRenderKeys(reclaimSid);
-          // Only the first frame is intercepted so the collision can be injected.
-          // Restore the real scheduler before releasing it; the remaining batch
-          // needs several 16-message frame callbacks to finish.
-          window.requestAnimationFrame = realRaf;
-          reclaimRaf();
-          await reclaimPromise;
-          const reclaimKeys = reclaimState.messages.map(message => message._k);
 
-          return {
-            fetched,
-            freshFetchMessages: freshFetchState.messages.length,
-            freshFetchOwners: freshFetchState._renderKeyOwners.size,
-            oldFetchEarlier: oldFetchState._earlierMessages.length,
-            staleOldMessages: staleState.messages.length,
-            staleFreshMessages: freshEarlierState.messages.length,
-            reclaimCount: reclaimState.messages.length,
-            reclaimExpectedCount: Math.min(detached.length, app.LOAD_MORE_BATCH) + 1,
-            reclaimUnique: new Set(reclaimKeys).size,
-            collisionResolved: intruder._k !== detached[1]._k,
-            detachedOwned: Alpine.raw(
-              reclaimState._renderKeyOwners.get(detached[1]._k)) === detached[1],
-          };
+          try {
+            const older = app._fetchOlderWindow(sid);
+            while (!releaseOlder) await new Promise(resolve => setTimeout(resolve, 0));
+            const canonical = await app.loadSession(sid, {
+              quiet: true, followTail: true, probeActive: false,
+            });
+            releaseOlder();
+            const olderCount = await older;
+            return {
+              canonical,
+              olderCount,
+              generation: st.messageRange.generation,
+              offset: st.messageRange.offset,
+              total: st.messageRange.total,
+              first: st.messages[0]?.uuid,
+              last: st.messages[st.messages.length - 1]?.uuid,
+              atBottom: st.atBottom,
+              hasLater: app.hasLaterMessages(sid),
+            };
+          } finally {
+            window.fetch = originalFetch;
+          }
         }"""
     )
 
-    expected_reclaim_count = result.pop("reclaimExpectedCount")
     assert result == {
-        "fetched": 0,
-        "freshFetchMessages": 0,
-        "freshFetchOwners": 0,
-        "oldFetchEarlier": 0,
-        "staleOldMessages": 0,
-        "staleFreshMessages": 0,
-        "reclaimCount": expected_reclaim_count,
-        "reclaimUnique": expected_reclaim_count,
-        "collisionResolved": True,
-        "detachedOwned": True,
+        "canonical": True,
+        "olderCount": 0,
+        "generation": "G2",
+        "offset": 40,
+        "total": 60,
+        "first": "fresh-40",
+        "last": "fresh-59",
+        "atBottom": True,
+        "hasLater": False,
+    }
+    _assert_no_browser_errors(page, errors)
+
+
+def test_newer_tail_request_wins_when_same_revision_responses_arrive_out_of_order(
+    page: Page, backend_url, auth_token,
+):
+    errors = _capture_browser_errors(page)
+    _login(page, backend_url, auth_token)
+
+    result = page.evaluate(
+        """async () => {
+          const app = document.querySelector("#app")._x_dataStack[0];
+          const sid = "tail-replace-owner-race";
+          app.refreshSessions = async () => {};
+          app._fetchTabUsage = async () => {};
+          app._scheduleIdlePreload = () => {};
+          app.sessions = [{id: sid, name: "Tail owner race", message_count: 2}];
+          app.openTabIds = [sid];
+          app.tabState = {};
+          app.currentId = sid;
+          const st = app._ensureTabState(sid);
+          st._loaded = true;
+          st.atBottom = true;
+          st.messages.push({
+            role: "user", text: "base", uuid: "base", _k: `${sid}:uuid:base`,
+          });
+          Object.assign(st.messageRange, {
+            visibleStart: 0, visibleEnd: 1, offset: 0, total: 1,
+            preTotal: 0, order: "normal", generation: "G0",
+          });
+          app._activateTabState(sid);
+
+          const originalFetch = window.fetch;
+          let requestCount = 0;
+          let releaseFirst;
+          const responseFor = (generation, suffix, updated) => new Response(
+            JSON.stringify({
+              id: sid, name: "Tail owner race", model: "e2e-model",
+              permission: "bypassPermissions", thinking: true,
+              messages: [
+                {role: "user", text: "base", uuid: "base"},
+                {role: "assistant", text: suffix, uuid: suffix,
+                 turn_status: "completed"},
+              ],
+              offset: 0, total: 2, message_count: 2,
+              pre_total: 0, history_order: "normal",
+              history_generation: generation,
+              // Deliberately identical: ownership must not depend on this field.
+              runtime_ui_revision: "same-revision",
+              updated_at: updated,
+            }),
+            {status: 200, headers: {"content-type": "application/json"}},
+          );
+          window.fetch = async url => {
+            if (!String(url).includes(`/api/chat/sessions/${sid}?tail=`)) {
+              return originalFetch(url);
+            }
+            requestCount++;
+            if (requestCount === 1) {
+              return await new Promise(resolve => {
+                releaseFirst = () => resolve(responseFor("G1", "stale-reply", 1));
+              });
+            }
+            return responseFor("G2", "fresh-reply", 2);
+          };
+
+          try {
+            const first = app.loadSession(sid, {
+              quiet: true, followTail: true, probeActive: false,
+            });
+            while (!releaseFirst) await new Promise(resolve => setTimeout(resolve, 0));
+            const secondResult = await app.loadSession(sid, {
+              quiet: true, followTail: true, probeActive: false,
+            });
+            releaseFirst();
+            const firstResult = await first;
+            return {
+              firstResult,
+              secondResult,
+              generation: st.messageRange.generation,
+              last: st.messages[st.messages.length - 1]?.uuid,
+              total: st.messageRange.total,
+              atBottom: st.atBottom,
+            };
+          } finally {
+            window.fetch = originalFetch;
+          }
+        }"""
+    )
+
+    assert result == {
+        "firstResult": False,
+        "secondResult": True,
+        "generation": "G2",
+        "last": "fresh-reply",
+        "total": 2,
+        "atBottom": True,
     }
     _assert_no_browser_errors(page, errors)
 
@@ -4487,16 +5844,20 @@ def test_canonical_reload_stays_quiet_when_background_tab_becomes_current(
           role: "assistant", text: "OTHER_VISIBLE",
           html: "<p>OTHER_VISIBLE</p>", _k: `${other}:existing`, _noAnim: true,
         });
+        otherState.messageRange.visibleEnd = otherState.messages.length;
+        otherState.messageRange.total = otherState.messages.length;
         const targetState = app._ensureTabState(target);
         targetState._loaded = true;
         targetState.messages.push({
           role: "assistant", text: arg.finalText,
           html: `<p>${arg.finalText}</p>`, _k: `${target}:live:1`,
         });
+        targetState.messageRange.visibleEnd = targetState.messages.length;
+        targetState.messageRange.total = targetState.messages.length;
         targetState.messagesReady = true;
         targetState.messagesLoading = false;
+        app._touchTranscriptPane(target);
         app.currentId = other;
-        app._residentTabIds = [other, target];
         app.mobileTab = "chat";
         app._activateTabState(other);
         return new Promise(resolve => app.$nextTick(() => requestAnimationFrame(resolve)));
@@ -4533,8 +5894,8 @@ def test_canonical_reload_stays_quiet_when_background_tab_becomes_current(
             const visibleMessages = pane ? Array.from(pane.querySelectorAll(".msg"))
               .filter(el => getComputedStyle(el).display !== "none") : [];
             frames.push({
-              ready: app.messagesReady,
-              loading: app.messagesLoading,
+              ready: app._ensureTabState(app.currentId).messagesReady,
+              loading: app._ensureTabState(app.currentId).messagesLoading,
               targetVisible: !!pane && pane.textContent.includes(finalText),
               visibleCount: visibleMessages.length,
             });
@@ -4563,7 +5924,8 @@ def test_canonical_reload_stays_quiet_when_background_tab_becomes_current(
     assert result["uuid"] == "canonical-race-assistant"
     assert result["frames"], result
     assert all(frame["ready"] and not frame["loading"] for frame in result["frames"]), result
-    assert all(frame["visibleCount"] > 0 for frame in result["frames"]), result
+    first_visible = next(i for i, frame in enumerate(result["frames"]) if frame["visibleCount"] > 0)
+    assert all(frame["visibleCount"] > 0 for frame in result["frames"][first_visible:]), result
     assert result["finalVisible"] is True, result
     _assert_no_browser_errors(page, errors)
 
@@ -4588,11 +5950,13 @@ def test_mobile_turn_footer_keeps_complete_metadata_inside_chat(
             model: 'codex:a-very-long-model-name-for-footer',
             turn_status: 'completed',
           }]));
+          st.messageRange.visibleEnd = st.messages.length;
+          st.messageRange.total = st.messages.length;
           st._loaded = true;
           st.messagesReady = true;
           st.streaming = false;
           app._activateTabState(sid);
-          app.messagesReady = true;
+          app._ensureTabState(app.currentId).messagesReady = true;
           app.mobileTab = 'chat';
         }"""
     )
@@ -4674,16 +6038,20 @@ def test_failed_queue_edit_never_duplicates_and_stopping_turn_rejects_send(
             busy: Object.keys(st._queueMutating || {}),
           };
 
-          st._stopping = true;
-          st.streaming = true;
+          st.activeTurnId = 'authoritative-stop-turn';
+          st._stoppingTurnId = st.activeTurnId;
+          st.streaming = false;
           st.draft.input = 'SEND DURING STOP';
           app._activateComposerState(sid);
+          const disabledReason = app.composerDisabledReason(sid);
           const sendResult = await app.send();
           return {
             afterEdit,
+            disabledReason,
             sendResult,
             stoppingDraft: st.draft.input,
             pendingAfterStop: st.pendingQueue.length,
+            composerClaim: st._composerSubmitToken,
           };
         }""",
         sid,
@@ -4696,9 +6064,13 @@ def test_failed_queue_edit_never_duplicates_and_stopping_turn_rejects_send(
         "draft": "",
         "busy": [],
     }
+    assert result["disabledReason"] in {
+        "Stopping the previous turn", "正在中断上一条任务",
+    }
     assert result["sendResult"] is False
     assert result["stoppingDraft"] == "SEND DURING STOP"
     assert result["pendingAfterStop"] == 1
+    assert result["composerClaim"] is None
 
 
 def test_background_task_gap_leaves_composer_usable_without_empty_reconnect(
@@ -4781,12 +6153,10 @@ def test_background_task_gap_leaves_composer_usable_without_empty_reconnect(
         app.openTabIds = [arg];
         app.tabState = {};
         app.currentId = arg;
-        app._residentTabIds = [arg];
         app.mobileTab = "chat";
-        app.messagesReady = true;
-        app.messagesLoading = false;
+        app._ensureTabState(app.currentId).messagesReady = true;
+        app._ensureTabState(app.currentId).messagesLoading = false;
         app._activateTabState(arg);
-        app._promoteResident(arg);
         return true;
         """,
         sid,
@@ -4836,8 +6206,8 @@ def test_background_task_gap_leaves_composer_usable_without_empty_reconnect(
             const pane = document.querySelector(
               `.msg-pane[data-tid="${CSS.escape(sid)}"]`);
             frames.push({
-              ready: app.messagesReady,
-              loading: app.messagesLoading,
+              ready: app._ensureTabState(app.currentId).messagesReady,
+              loading: app._ensureTabState(app.currentId).messagesLoading,
               visible: !!pane && pane.textContent.includes("BACKGROUND_GAP_ASSISTANT"),
               count: pane ? pane.querySelectorAll(".msg").length : 0,
             });
@@ -4880,8 +6250,8 @@ def test_background_task_gap_leaves_composer_usable_without_empty_reconnect(
             const pane = document.querySelector(
               `.msg-pane[data-tid="${CSS.escape(sid)}"]`);
             frames.push({
-              ready: app.messagesReady,
-              loading: app.messagesLoading,
+              ready: app._ensureTabState(app.currentId).messagesReady,
+              loading: app._ensureTabState(app.currentId).messagesLoading,
               visible: !!pane && pane.textContent.includes("BACKGROUND_GAP_ASSISTANT"),
               count: pane ? pane.querySelectorAll(".msg").length : 0,
             });
@@ -4916,7 +6286,7 @@ def test_inherited_projection_unread_requires_new_runtime_event(
         """
         return (async () => {
           const originalFetch = window.fetch;
-          const originalReload = app._reloadSessionCoalesced;
+          const originalLoad = app.loadSession;
           const originalCurrent = app.currentId;
           const cases = [
             {
@@ -4947,7 +6317,7 @@ def test_inherited_projection_unread_requires_new_runtime_event(
           ];
           const specs = new Map();
           try {
-            app._reloadSessionCoalesced = async sid => {
+            app.loadSession = async sid => {
               const spec = specs.get(sid);
               spec.loads += 1;
               if (spec.append) {
@@ -4957,6 +6327,8 @@ def test_inherited_projection_unread_requires_new_runtime_event(
                   _k: `${sid}:idx:${spec.name}`,
                   _noAnim: true,
                 });
+                spec.st.messageRange.visibleEnd = spec.st.messages.length;
+                spec.st.messageRange.total = spec.st.messages.length;
               }
               spec.st.runtimeUiRevision = spec.desired;
               return true;
@@ -4979,6 +6351,8 @@ def test_inherited_projection_unread_requires_new_runtime_event(
                 _k: `${child}:idx:runtime-existing-${item.name}`,
                 _noAnim: true,
               });
+              st.messageRange.visibleEnd = st.messages.length;
+              st.messageRange.total = st.messages.length;
               app.tabState[child] = st;
               specs.set(child, { ...item, st, loads: 0 });
               app.currentId = item.current ? child : "different-visible-tab";
@@ -4998,7 +6372,7 @@ def test_inherited_projection_unread_requires_new_runtime_event(
               };
               app._ensureInheritedTaskPoller(child, source);
               const deadline = performance.now() + 1000;
-              while (st._inheritedTaskPoller && performance.now() < deadline) {
+              while ((st.sessionSync.inheritedSourceSid || st.sessionSync.inFlight) && performance.now() < deadline) {
                 await new Promise(resolve => setTimeout(resolve, 5));
               }
               const spec = specs.get(child);
@@ -5008,14 +6382,14 @@ def test_inherited_projection_unread_requires_new_runtime_event(
                 revision: st.runtimeUiRevision,
                 loads: spec.loads,
               });
-              if (st._inheritedTaskPoller) clearInterval(st._inheritedTaskPoller);
+              app._disposeSessionSync(st);
               delete app.tabState[child];
               specs.delete(child);
             }
             return outcomes;
           } finally {
             window.fetch = originalFetch;
-            app._reloadSessionCoalesced = originalReload;
+            app.loadSession = originalLoad;
             app.currentId = originalCurrent;
           }
         })();
@@ -5155,13 +6529,14 @@ def test_background_completion_no_active_fallback_never_blanks_visible_messages(
             _k: `${sid}:live:3`, _noAnim: true,
           },
         );
+        st.messageRange.visibleEnd = st.messages.length;
+        st.messageRange.total = st.messages.length;
         app.currentId = sid;
-        app._residentTabIds = [sid];
         app.mobileTab = "chat";
         app._activateTabState(sid);
-        app.messagesReady = true;
-        app.messagesLoading = false;
-        app.atBottom = true;
+        app._ensureTabState(app.currentId).messagesReady = true;
+        app._ensureTabState(app.currentId).messagesLoading = false;
+        app._ensureTabState(app.currentId).atBottom = true;
         return new Promise(resolve => app.$nextTick(() => requestAnimationFrame(resolve)));
         """,
         {"sid": sid, "finalText": final_text},
@@ -5243,8 +6618,8 @@ def test_background_completion_no_active_fallback_never_blanks_visible_messages(
             const visibleMessages = pane ? Array.from(pane.querySelectorAll(".msg"))
               .filter(el => getComputedStyle(el).display !== "none") : [];
             frames.push({
-              ready: app.messagesReady,
-              loading: app.messagesLoading,
+              ready: app._ensureTabState(app.currentId).messagesReady,
+              loading: app._ensureTabState(app.currentId).messagesLoading,
               textVisible: !!pane && pane.textContent.includes(finalText),
               visibleCount: visibleMessages.length,
             });
@@ -5305,6 +6680,8 @@ def test_incomplete_background_continuation_keeps_user_queue_runnable(
           uuid: "continuation-queue-assistant",
           _k: "continuation-queue-assistant", _noAnim: true,
         }];
+        st.messageRange.visibleEnd = st.messages.length;
+        st.messageRange.total = st.messages.length;
         st.pendingQueue = [{
           id: "queued-user-followup", text: "USER FOLLOWUP",
           pendingImages: [], pendingDocs: [],
@@ -5404,7 +6781,7 @@ def test_mobile_pwa_tabs_preview_rotation_keep_chat_usable(page: Page, backend_u
     page.wait_for_function(
         """() => {
           const app = document.querySelector("#app")._x_dataStack[0];
-          return app.messagesReady === true
+          return app._ensureTabState(app.currentId).messagesReady === true
             && document.body.textContent.includes("PWA_LATEST_ASSISTANT");
         }""",
         timeout=10000,
@@ -5484,7 +6861,7 @@ def test_mobile_pwa_tabs_preview_rotation_keep_chat_usable(page: Page, backend_u
         """() => {
           const app = document.querySelector("#app")._x_dataStack[0];
           const body = document.querySelector(".chat-body");
-          return app.messagesReady === true
+          return app._ensureTabState(app.currentId).messagesReady === true
             && body && body.textContent.includes("PWA_LATEST_ASSISTANT")
             && Math.abs((body.scrollHeight - body.clientHeight) - body.scrollTop) < 48;
         }""",
@@ -5505,7 +6882,7 @@ def test_mobile_pwa_tabs_preview_rotation_keep_chat_usable(page: Page, backend_u
                      width: r.width, height: r.height };
           };
           return {
-            ready: document.querySelector("#app")._x_dataStack[0].messagesReady,
+            ready: document.querySelector("#app")._x_dataStack[0].activeSessionPane().messagesReady,
             mobileTab: document.querySelector("#app")._x_dataStack[0].mobileTab,
             input: rect(input),
             toolbar: rect(toolbar),
@@ -5529,8 +6906,50 @@ def test_mobile_pwa_tabs_preview_rotation_keep_chat_usable(page: Page, backend_u
     assert layout["input"]["bottom"] <= layout["toolbar"]["top"] + 2
     assert layout["latest"]["height"] > 0
     assert page.locator(".msg-pane").count() <= 1
-    assert _app_eval(page, "return app.messagesReady === true && !app.messagesLoading;") is True
+    assert _app_eval(page, "return app._ensureTabState(app.currentId).messagesReady === true && !app._ensureTabState(app.currentId).messagesLoading;") is True
 
+    _assert_no_browser_errors(page, errors)
+
+
+def test_mobile_composer_focus_closes_activity_group_menu(
+    page: Page, backend_url, auth_token,
+):
+    """Keyboard focus must not leave a portalled task-group menu below chat."""
+    errors = _capture_browser_errors(page)
+    page.set_viewport_size({"width": 390, "height": 844})
+    _login(page, backend_url, auth_token)
+    _app_eval(
+        page,
+        """
+        app.mobileTab = 'chat';
+        app.activity.show = true;
+        app.activity.moveMenu = {
+          show: true, eventId: 'stale-menu',
+          style: 'position:fixed;left:8px;top:500px;width:220px;',
+        };
+        return true;
+        """,
+    )
+
+    input_box = page.locator(".chat-input-textarea")
+    input_box.evaluate("el => { el.disabled = false; }")
+    page.evaluate(
+        "() => document.querySelector('#app')._x_dataStack[0].onChatInputFocus()"
+    )
+    input_box.focus()
+    page.wait_for_function(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const menuLayer = document.querySelector('.activity-move-layer');
+          const backdrop = document.querySelector(
+            '.modal-backdrop .activity-modal')?.parentElement;
+          return !app.activity.show && !app.activity.moveMenu.show
+            && getComputedStyle(menuLayer).display === 'none'
+            && getComputedStyle(backdrop).display === 'none';
+        }""",
+        timeout=2000,
+    )
+    expect(input_box).to_be_focused()
     _assert_no_browser_errors(page, errors)
 
 
@@ -5634,7 +7053,7 @@ def test_mobile_composer_footer_is_compact_and_never_overflows(
             app.model = "e2e-model-with-a-long-label";
             const st = app._ensureTabState(app.currentId);
             st.streaming = false;
-            app.streaming = false;
+            app._ensureTabState(app.currentId).streaming = false;
             return true;
             """,
         )
@@ -5694,7 +7113,7 @@ def test_mobile_composer_footer_is_compact_and_never_overflows(
             """
             const st = app._ensureTabState(app.currentId);
             st.streaming = true;
-            app.streaming = true;
+            app._ensureTabState(app.currentId).streaming = true;
             return true;
             """,
         )
@@ -5723,11 +7142,206 @@ def test_mobile_composer_footer_is_compact_and_never_overflows(
         context.close()
 
 
+def test_background_stream_buffers_token_rate_presentation_until_activation(
+    page: Page, backend_url: str, auth_token: str,
+):
+    """Inactive SSE streams retain complete state without token-rate paints."""
+    errors = _capture_browser_errors(page)
+    page.set_viewport_size({"width": 1440, "height": 900})
+    _install_fake_event_source(page)
+    page.route(
+        "**/api/chat/stream/start",
+        lambda route: route.fulfill(
+            status=200,
+            content_type="application/json",
+            body='{"ticket":"e2e-ticket"}',
+        ),
+    )
+    _login(page, backend_url, auth_token)
+    ids = ["background-buffer-a", "background-buffer-b"]
+    _app_eval(
+        page,
+        """
+        app.refreshSessions = async () => {};
+        window.__backgroundUsageFetches = [];
+        app._fetchTabUsage = async sid => {
+          window.__backgroundUsageFetches.push(sid);
+        };
+        app._scheduleIdlePreload = () => {};
+        app.availableModels = [{
+          model: "e2e-model", label: "E2E model", group: "e2e",
+          supports_thinking: true,
+        }];
+        app.model = app.defaultModel = "e2e-model";
+        app.sessions = arg.map((id, index) => ({
+          id, name: `Buffered ${index}`, updated_at: Date.now() / 1000,
+          model: "e2e-model", permission: "bypassPermissions", thinking: true,
+        }));
+        app.openTabIds = arg.slice();
+        app.tabState = {};
+        for (const id of arg) {
+          const st = app._blankTabState();
+          st._loaded = true;
+          st.messagesReady = true;
+          st.messagesLoading = false;
+          st.atBottom = true;
+          app.tabState[id] = st;
+        }
+        app.currentId = arg[0];
+        app._activateTabState(arg[0]);
+        app.input = "start stream a";
+        return true;
+        """,
+        ids,
+    )
+    _app_eval(page, "app.send(); return true;")
+    page.wait_for_function("() => window.__fakeChatStreams().length === 1")
+    _app_eval(
+        page,
+        """
+        app.currentId = arg;
+        await app.switchSession();
+        app.input = "start stream b";
+        app.send();
+        return true;
+        """,
+        ids[1],
+    )
+    page.wait_for_function("() => window.__fakeChatStreams().length === 2")
+    page.evaluate("() => { window.__backgroundUsageFetches.length = 0; }")
+
+    page.evaluate(
+        """() => {
+          for (let i = 0; i < 200; i++) {
+            window.__emitSseAt(0, "text", { text: `BG_TEXT_${i} ` });
+          }
+          for (let i = 0; i < 200; i++) {
+            window.__emitSseAt(0, "thinking", { text: `BG_THINK_${i} ` });
+          }
+        }"""
+    )
+    before = _app_eval(
+        page,
+        """
+        const st = app._ensureTabState(arg);
+        const thinking = [...st.messages].reverse().find(m => m.role === "thinking");
+        return {
+          currentId: app.currentId,
+          streaming: st.streaming,
+          thinkingText: thinking ? thinking.text : null,
+          plainPaints: st._streamPlainRenderCount,
+          usageFetches: window.__backgroundUsageFetches.slice(),
+        };
+        """,
+        ids[0],
+    )
+    assert before["currentId"] == ids[1]
+    assert before["streaming"] is True
+    assert before["thinkingText"] == ""
+    assert before["plainPaints"] == 0
+    assert ids[0] not in before["usageFetches"]
+
+    terminal = page.evaluate(
+        """([sid]) => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const originalRender = app._mdRenderUncached.bind(app);
+          window.__backgroundRichCalls = 0;
+          app._mdRenderUncached = (text, opts) => {
+            if ((text || '').includes('BG_FINAL_RICH_MARKER')) {
+              window.__backgroundRichCalls += 1;
+            }
+            return originalRender(text, opts);
+          };
+          const finalText = '**BG_FINAL_RICH_MARKER**\\n\\n'
+            + 'background payload '.repeat(7500);
+          window.__emitSseAt(0, 'text', {text: finalText});
+          const started = performance.now();
+          window.__emitSseAt(0, 'done', {
+            total_cost_usd: 0.001,
+            session_usage: {
+              context_used_pct: 10,
+              context_used: 1000,
+              context_limit: 100000,
+            },
+          });
+          const st = app._ensureTabState(sid);
+          const last = [...st.messages].reverse().find(m =>
+            m.role === 'assistant' && (m.text || '').includes('BG_FINAL_RICH_MARKER'));
+          return {
+            dispatchMs: performance.now() - started,
+            streaming: st.streaming,
+            richCalls: window.__backgroundRichCalls,
+            plain: last?._streamPlain,
+            deferred: last?._deferredRichReady,
+            htmlLength: (last?.html || '').length,
+            textLength: (last?.text || '').length,
+          };
+        }""",
+        arg=[ids[0]],
+    )
+    assert terminal["streaming"] is False
+    assert terminal["richCalls"] == 0
+    assert terminal["plain"] is True
+    assert terminal["deferred"] is True
+    assert terminal["htmlLength"] == 0
+    assert terminal["textLength"] >= 120_000
+    assert terminal["dispatchMs"] < 250
+
+    _app_eval(
+        page,
+        """
+        app.currentId = arg;
+        await app.switchSession();
+        return true;
+        """,
+        ids[0],
+    )
+    page.wait_for_function(
+        """sid => {
+          const app = document.querySelector("#app")._x_dataStack[0];
+          const st = app._ensureTabState(sid);
+          return [...st.messages].reverse().some(m =>
+            m.role === 'assistant'
+            && m.text.includes('BG_FINAL_RICH_MARKER')
+            && m._streamPlain === false
+            && m._deferredRichReady === false
+            && m.html.includes('BG_FINAL_RICH_MARKER'));
+        }""",
+        arg=ids[0],
+    )
+    activation = _app_eval(
+        page,
+        """
+        const st = app._ensureTabState(arg);
+        const thinking = [...st.messages].reverse().find(m => m.role === "thinking");
+        return {
+          currentId: app.currentId,
+          thinkingText: thinking?.text || "",
+          richCalls: window.__backgroundRichCalls,
+        };
+        """,
+        ids[0],
+    )
+    assert activation["currentId"] == ids[0]
+    assert "BG_THINK_199" in activation["thinkingText"]
+    assert activation["richCalls"] == 1
+    assert _app_eval(
+        page,
+        """
+        const st = app._ensureTabState(arg);
+        return st.messages.some(m => m.role === "assistant"
+          && m.text.includes("BG_TEXT_199"));
+        """,
+        ids[0],
+    )
+    _assert_no_browser_errors(page, errors)
+
+
 @pytest.mark.parametrize(
     ("viewport", "expects_plain"),
     [
         ({"width": 390, "height": 844}, True),
-        ({"width": 1440, "height": 900}, False),
+        ({"width": 1440, "height": 900}, True),
     ],
     ids=["mobile", "desktop"],
 )
@@ -5767,13 +7381,12 @@ def test_120kb_mixed_sse_stream_renders_final_assistant_html(
         app.tabState = {};
         app.tabState[sid] = app._blankTabState();
         app.currentId = sid;
-        app._residentTabIds = [sid];
         app._activateTabState(sid);
-        app.messagesReady = true;
-        app.messagesLoading = false;
+        app._ensureTabState(app.currentId).messagesReady = true;
+        app._ensureTabState(app.currentId).messagesLoading = false;
         app.mobileTab = "chat";
         app.input = "stream a long deterministic answer";
-        app.atBottom = true;
+        app._ensureTabState(app.currentId).atBottom = true;
         return true;
         """,
     )
@@ -5812,10 +7425,11 @@ def test_120kb_mixed_sse_stream_renders_final_assistant_html(
         """() => {
           const app = document.querySelector("#app")._x_dataStack[0];
           const body = document.querySelector(".chat-body")?.textContent || "";
-          const last = app.messages[app.messages.length - 1];
-          return app.streaming === true
+          const last = app._ensureTabState(app.currentId).messages[app._ensureTabState(app.currentId).messages.length - 1];
+          return app._ensureTabState(app.currentId).streaming === true
             && last && last.role === "assistant"
-            && last.html.includes("MID_STREAM_VISIBLE_1")
+            && last._streamPlain === true
+            && last._streamText.includes("MID_STREAM_VISIBLE_1")
             && body.includes("MID_STREAM_VISIBLE_1");
         }""",
         timeout=10000,
@@ -5823,11 +7437,11 @@ def test_120kb_mixed_sse_stream_renders_final_assistant_html(
     mid_1 = _app_eval(
         page,
         """
-        const last = app.messages[app.messages.length - 1];
+        const last = app._ensureTabState(app.currentId).messages[app._ensureTabState(app.currentId).messages.length - 1];
         return {
-          streaming: app.streaming,
+          streaming: app._ensureTabState(app.currentId).streaming,
           textLength: last.text.length,
-          htmlLength: last.html.length,
+          streamTextLength: last._streamText.length,
         };
         """,
     )
@@ -5842,12 +7456,12 @@ def test_120kb_mixed_sse_stream_renders_final_assistant_html(
         """prev => {
           const app = document.querySelector("#app")._x_dataStack[0];
           const body = document.querySelector(".chat-body")?.textContent || "";
-          const last = app.messages[app.messages.length - 1];
-          return app.streaming === true
+          const last = app._ensureTabState(app.currentId).messages[app._ensureTabState(app.currentId).messages.length - 1];
+          return app._ensureTabState(app.currentId).streaming === true
             && last && last.role === "assistant"
             && last.text.length > prev.textLength
-            && last.html.length >= prev.htmlLength
-            && last.html.includes("MID_STREAM_VISIBLE_2")
+            && last._streamText.length > prev.streamTextLength
+            && last._streamText.includes("MID_STREAM_VISIBLE_2")
             && body.includes("MID_STREAM_VISIBLE_2");
         }""",
         arg=mid_1,
@@ -5884,8 +7498,8 @@ def test_120kb_mixed_sse_stream_renders_final_assistant_html(
     page.wait_for_function(
         """expectsPlain => {
           const app = document.querySelector('#app')._x_dataStack[0];
-          const last = app.messages[app.messages.length - 1];
-          return app.streaming === true && last
+          const last = app._ensureTabState(app.currentId).messages[app._ensureTabState(app.currentId).messages.length - 1];
+          return app._ensureTabState(app.currentId).streaming === true && last
             && last._streamPlain === expectsPlain
             && last.text.includes('FINAL_ASSISTANT_HTML_COMPLETE')
             && (expectsPlain || last.html.includes('FINAL_ASSISTANT_HTML_COMPLETE'));
@@ -5903,8 +7517,8 @@ def test_120kb_mixed_sse_stream_renders_final_assistant_html(
     page.wait_for_function(
         """() => {
           const app = document.querySelector("#app")._x_dataStack[0];
-          const last = app.messages[app.messages.length - 1];
-          return app.streaming === false
+          const last = app._ensureTabState(app.currentId).messages[app._ensureTabState(app.currentId).messages.length - 1];
+          return app._ensureTabState(app.currentId).streaming === false
             && last && last.role === "assistant"
             && last.text.length >= 120000
             && last.text.includes("FINAL_ASSISTANT_HTML_COMPLETE")
@@ -5916,12 +7530,12 @@ def test_120kb_mixed_sse_stream_renders_final_assistant_html(
         "FINAL_ASSISTANT_HTML_COMPLETE", timeout=5000
     )
     assert page.locator(".msg-pane:visible .msg").count() <= 50
-    assert _app_eval(page, "return app.messages.length;") <= 50
+    assert _app_eval(page, "return app._ensureTabState(app.currentId).messages.length;") <= 50
     assert _app_eval(
         page,
         """
-        const roles = app.messages.map(m => m.role);
-        const last = app.messages[app.messages.length - 1];
+        const roles = app._ensureTabState(app.currentId).messages.map(m => m.role);
+        const last = app._ensureTabState(app.currentId).messages[app._ensureTabState(app.currentId).messages.length - 1];
         return roles.includes("thinking")
           && roles.includes("tool_use")
           && roles.includes("tool_result")
@@ -5941,7 +7555,7 @@ def test_120kb_mixed_sse_stream_renders_final_assistant_html(
           mounted: Array.from(document.querySelectorAll('.msg-pane'))
             .filter(p => getComputedStyle(p).display !== 'none')
             .reduce((n, p) => n + p.querySelectorAll('.msg').length, 0),
-          cached: st.messages.length + st._earlierMessages.length + st._laterMessages.length,
+          cached: st.messages.length,
         };
         """,
     )
@@ -5952,7 +7566,7 @@ def test_120kb_mixed_sse_stream_renders_final_assistant_html(
         assert render_stats["plain"] == 0
         assert render_stats["rich"] >= 1
     assert render_stats["mounted"] <= 60
-    assert render_stats["cached"] <= 120
+    assert render_stats["cached"] >= render_stats["mounted"]
     long_tasks = page.evaluate("() => window.__longTasks || []")
     assert max(long_tasks or [0]) < 2000, long_tasks
 

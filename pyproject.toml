@@ -40,15 +40,13 @@ classifiers = [
 ]
 requires-python = ">=3.12"
 dependencies = [
-    # Upper bound is a DELIBERATE guard, not pessimism: muselab is an adapter
-    # over the SDK and hand-maintains assumptions the SDK doesn't expose as a
-    # programmatic contract — the harness-tool denylist (chat.py disallowed_tools)
-    # and the CLI JSONL transcript format (jsonl_cleanup.py, _full_session_msgs).
-    # An unbounded `>=` lets any minor bump silently expose a new tool or break
-    # JSONL parsing with zero signal. <0.3 makes SDK upgrades an explicit action.
+    # Exact pin is deliberate: muselab adapts both SDK and bundled-CLI contracts
+    # that are not capability-negotiated — the harness-tool denylist, JSONL
+    # transcript shape, and native AskUserQuestion answer injection. Every SDK
+    # upgrade must refresh the tool catalog and rerun the native question matrix.
     # Path/effort drift is already auto-eliminated via
     # project_key_for_directory() + EffortLevel.
-    "claude-agent-sdk>=0.2.136,<0.3",
+    "claude-agent-sdk==0.2.144",
     "fastapi>=0.138.1",
     # Pin starlette above the fastapi-transitive 1.0.0, which carries
     # PYSEC-2026-161 (fixed in 1.0.1). Direct constraint so the pip-audit
@@ -101,6 +99,9 @@ Container     = "https://github.com/hesorchen/muselab/pkgs/container/muselab"
 dev = [
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
+    # Starlette 1.2+ prefers httpx2 for TestClient. Keep production httpx
+    # separately because memory_client imports that package directly.
+    "httpx2>=2.0.0",
     # Browser regressions cover Alpine rendering races and trusted mobile
     # touch gestures that static source assertions cannot exercise.
     "pytest-playwright>=0.7.0",

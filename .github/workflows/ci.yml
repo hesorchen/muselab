@@ -133,9 +133,9 @@ jobs:
         # `uv run --with` so it doesn't touch the frozen lockfile.
         run: uv run --with pip-audit pip-audit
 
-  # Small, deliberately stable browser contract. The full suite below remains
-  # observational while its workspace-SSE race is being fixed; these critical
-  # user journeys have been green on the latest main run and must block regressions.
+  # Small, deliberately stable browser subset fails fast on critical journeys.
+  # The required full suite below remains the release gate for the complete
+  # browser behavior matrix, so early feedback does not reduce coverage.
   e2e-core:
     name: e2e core (playwright)
     runs-on: ubuntu-latest
@@ -167,20 +167,14 @@ jobs:
             tests/e2e/test_multi_tab.py::test_pending_send_text_survives_hard_refresh
 
   # End-to-end Playwright browser tests. Gated behind RUN_E2E=1 (default-skip
-  # locally so contributors don't need Chromium). This job installs the browser
-  # and runs them. Marked continue-on-error to start: browser tests are
-  # inherently flakier than unit tests, and we don't want a transient timeout
-  # to block merges before the suite has proven stable. Promote to required
-  # once it's reliably green.
+  # locally so contributors don't need Chromium). This required job installs
+  # Chromium and runs the complete browser suite.
   #
   # pytest-rerunfailures retries each failing test up to 2× (3 attempts total)
-  # with a 1s backoff, so a single transient timeout (e.g. the multi-tab
-  # open/close timing flake) no longer paints the whole job red. A test that
-  # fails all 3 attempts is a genuine regression worth investigating.
+  # with a 1s backoff. A test that fails all 3 attempts blocks the change.
   e2e:
-    name: e2e (playwright, allow-failure)
+    name: e2e (playwright)
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v3

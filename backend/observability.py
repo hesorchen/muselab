@@ -10,13 +10,15 @@ new file logger (and therefore without a third rotation/retention policy).
 
 from __future__ import annotations
 
+import asyncio
 import json
 import math
 import os
 import re
 import sys
 import time
-from typing import Any
+from pathlib import Path
+from typing import Any, Callable, TypeVar
 
 
 _FALSE_VALUES = frozenset({"0", "false", "no", "off"})
@@ -28,6 +30,7 @@ _SENSITIVE_FIELD_PARTS = frozenset({
 _SAFE_FIELD_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _SAFE_EVENT_RE = re.compile(r"^[a-z][a-z0-9_.-]{0,63}$")
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]+")
+_T = TypeVar("_T")
 
 
 def perf_enabled() -> bool:
@@ -45,6 +48,18 @@ def slow_request_ms() -> float:
     if not math.isfinite(value):
         value = 500.0
     return min(60_000.0, max(25.0, value))
+
+
+def slow_io_ms() -> float:
+    """Threshold for privacy-safe worker-thread I/O diagnostics."""
+    raw = os.getenv("MUSELAB_SLOW_IO_MS", "50")
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        value = 50.0
+    if not math.isfinite(value):
+        value = 50.0
+    return min(60_000.0, max(1.0, value))
 
 
 def monotonic() -> float:
@@ -85,6 +100,71 @@ def _safe_value(value: Any) -> bool | int | float | str | None:
     # Call sites only pass bounded classifications and identifiers.  This final
     # guard prevents control-character log injection and accidental large rows.
     return _CONTROL_RE.sub(" ", str(value)).strip()[:160]
+
+
+async def to_thread_io(
+    site: str,
+    session_id: str,
+    func: Callable[..., _T],
+    /,
+    *args: Any,
+    file_path: Path | Callable[[], Path | None] | None = None,
+    file_size: int | None = None,
+    owned: bool = False,
+    **kwargs: Any,
+) -> _T:
+    """Run blocking I/O off-loop and report only slow, privacy-safe calls.
+
+    ``site`` is a bounded code-location label, ``session`` is shortened, and the
+    optional path is used only to measure bytes inside the worker. The path or
+    file name is never retained or logged.
+    """
+    measured: dict[str, int] = {}
+
+    def invoke() -> _T:
+        size = max(0, int(file_size or 0))
+        path = file_path() if callable(file_path) else file_path
+        if path is not None:
+            try:
+                size = max(0, int(path.stat().st_size))
+            except OSError:
+                pass
+        started = monotonic()
+        try:
+            return func(*args, **kwargs)
+        finally:
+            measured["duration_ms"] = elapsed_ms(started)
+            measured["file_size"] = size
+
+    try:
+        if not owned:
+            return await asyncio.to_thread(invoke)
+        worker = asyncio.create_task(asyncio.to_thread(invoke))
+        try:
+            return await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            # A commit-point write may not outlive its owner: cleanup must observe
+            # the real disk result before deciding whether rollback is necessary.
+            while not worker.done():
+                try:
+                    await asyncio.shield(worker)
+                except asyncio.CancelledError:
+                    continue
+            try:
+                worker.result()
+            except Exception:
+                pass
+            raise
+    finally:
+        duration = measured.get("duration_ms")
+        if duration is not None and is_slow(duration, threshold_ms=slow_io_ms()):
+            perf_event(
+                "runtime.io",
+                site=site,
+                session=short_id(session_id) or "none",
+                duration_ms=duration,
+                file_size=measured.get("file_size", 0),
+            )
 
 
 def perf_event(event: str, /, **fields: Any) -> None:

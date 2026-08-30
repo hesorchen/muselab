@@ -11,7 +11,9 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -109,6 +111,88 @@ def test_session_lifecycle(client, auth):
     assert r.status_code == 404
 
 
+def test_session_evidence_returns_validated_canonical_paths(
+        client, auth, app_module, temp_root, tmp_path, monkeypatch):
+    from backend import chat, sessions as sess
+
+    meta = sess.create_session(
+        "evidence session", model="claude-sonnet-4-6", cwd=temp_root,
+    )
+    sid = meta["id"]
+    projects = tmp_path / "claude" / "projects"
+    transcript = projects / chat._cli_encode_cwd(str(temp_root)) / f"{sid}.jsonl"
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text('{"type":"user"}\n', encoding="utf-8")
+    monkeypatch.setattr(chat, "_cli_project_roots", lambda: [projects])
+    chat._JSONL_PATH_CACHE.clear()
+
+    response = client.get(f"/api/chat/sessions/{sid}/evidence", headers=auth)
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "session_name": "evidence session",
+        "session_id": sid,
+        "transcript_path": str(transcript.resolve()),
+        "workspace": str(temp_root),
+        "model": "claude-sonnet-4-6",
+        "sidecar_path": str(sess._sidecar_path(sid).resolve()),
+    }
+
+
+def test_session_evidence_requires_auth_and_existing_transcript(
+        client, auth, app_module):
+    from backend import sessions as sess
+
+    meta = sess.create_session("no transcript")
+    path = f"/api/chat/sessions/{meta['id']}/evidence"
+
+    assert client.get(path).status_code == 401
+    assert client.get(path, headers=auth).status_code == 404
+    invalid = client.get(
+        "/api/chat/sessions/not-a-uuid/evidence", headers=auth,
+    )
+    assert invalid.status_code == 400
+
+
+def test_session_evidence_rejects_transcript_from_wrong_workspace(
+        client, auth, app_module, temp_root, tmp_path, monkeypatch):
+    from backend import chat, sessions as sess
+
+    meta = sess.create_session("wrong workspace", cwd=temp_root)
+    sid = meta["id"]
+    projects = tmp_path / "claude" / "projects"
+    transcript = projects / "-somewhere-else" / f"{sid}.jsonl"
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text("{}\n", encoding="utf-8")
+    monkeypatch.setattr(chat, "_cli_project_roots", lambda: [projects])
+    chat._JSONL_PATH_CACHE.clear()
+
+    response = client.get(f"/api/chat/sessions/{sid}/evidence", headers=auth)
+
+    assert response.status_code == 404
+    assert "transcript_path" not in response.text
+
+
+def test_session_evidence_omits_missing_sidecar(
+        client, auth, app_module, temp_root, tmp_path, monkeypatch):
+    from backend import chat, sessions as sess
+
+    meta = sess.create_session("without sidecar", cwd=temp_root)
+    sid = meta["id"]
+    sess._sidecar_path(sid).unlink()
+    projects = tmp_path / "claude" / "projects"
+    transcript = projects / chat._cli_encode_cwd(str(temp_root)) / f"{sid}.jsonl"
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text("{}\n", encoding="utf-8")
+    monkeypatch.setattr(chat, "_cli_project_roots", lambda: [projects])
+    chat._JSONL_PATH_CACHE.clear()
+
+    response = client.get(f"/api/chat/sessions/{sid}/evidence", headers=auth)
+
+    assert response.status_code == 200
+    assert "sidecar_path" not in response.json()
+
+
 def test_fork_annotation_copy_rekeys_message_uuid(app_module):
     from backend import sessions as sess
 
@@ -131,6 +215,50 @@ def test_fork_annotation_copy_rekeys_message_uuid(app_module):
     assert annotation["turn_status"] == "completed"
     assert annotation["memory_recall"] == {"count": 2}
     assert annotation["docs"] == [{"name": "note.md"}]
+
+
+def test_runtime_task_overlay_bounds_summary_on_write(app_module):
+    from backend import sessions as sess
+    from backend.task_summaries import TASK_SUMMARY_PREVIEW_CAP
+
+    sid = sess.create_session("runtime-overlay-summary-budget")["id"]
+    full = "summary " * 1000
+
+    assert sess.set_runtime_task_overlay(
+        sid, "task-long", state="completed", summary=full,
+    )
+
+    overlay = sess.get_runtime_task_overlays(sid)["task-long"]
+    assert len(overlay["summary"]) == TASK_SUMMARY_PREVIEW_CAP
+    assert overlay["summary_length"] == len(full)
+    assert overlay["summary_truncated"] is True
+    raw = json.loads(sess._sidecar_path(sid).read_text(encoding="utf-8"))
+    assert raw["runtime_task_overlays"]["task-long"] == overlay
+
+
+def test_runtime_task_overlay_legacy_summary_is_bounded_then_compacted(app_module):
+    from backend import sessions as sess
+    from backend.task_summaries import TASK_SUMMARY_PREVIEW_CAP
+
+    sid = sess.create_session("runtime-overlay-legacy-summary")["id"]
+    full = "legacy " * 1000
+    sess._save_sidecar(sid, {
+        "runtime_task_overlays": {
+            "task-old": {"task_id": "task-old", "state": "completed", "summary": full},
+        },
+    })
+
+    overlay = sess.get_runtime_task_overlays(sid)["task-old"]
+    assert len(overlay["summary"]) == TASK_SUMMARY_PREVIEW_CAP
+    assert len(json.loads(sess._sidecar_path(sid).read_text(encoding="utf-8"))
+               ["runtime_task_overlays"]["task-old"]["summary"]) == len(full)
+
+    assert sess.set_runtime_task_overlay(sid, "task-new", state="running")
+    raw = json.loads(sess._sidecar_path(sid).read_text(encoding="utf-8"))
+    compacted = raw["runtime_task_overlays"]["task-old"]
+    assert len(compacted["summary"]) == TASK_SUMMARY_PREVIEW_CAP
+    assert compacted["summary_length"] == len(full)
+    assert compacted["summary_truncated"] is True
 
 
 @pytest.mark.parametrize(
@@ -331,7 +459,8 @@ def test_runtime_task_overlay_owner_and_terminal_state_are_monotonic(app_module)
     )
 
 
-def test_reconcile_runtime_task_overlay_chains_repairs_forward_copies(app_module):
+def test_reconcile_runtime_task_overlay_chains_repairs_forward_copies(
+        app_module, monkeypatch):
     from backend import sessions as sess
 
     source = sess.create_session("runtime-source")["id"]
@@ -364,7 +493,17 @@ def test_reconcile_runtime_task_overlay_chains_repairs_forward_copies(app_module
         description="child launch",
     )
 
+    original_load = sess._load_sidecar
+    mutation_loads = []
+
+    def tracked_load(sid, *, use_cache=True):
+        if not use_cache:
+            mutation_loads.append(sid)
+        return original_load(sid, use_cache=use_cache)
+
+    monkeypatch.setattr(sess, "_load_sidecar", tracked_load)
     assert sess.reconcile_runtime_task_overlay_chains() == 3
+    assert sorted(mutation_loads) == sorted([child, grandchild])
     assert sess.reconcile_runtime_task_overlay_chains() == 0
 
     source_visible = sess.get_authoritative_runtime_task_overlays(source)
@@ -400,6 +539,16 @@ def test_corrupt_sidecar_is_never_overwritten_by_a_mutator(app_module):
 
     with pytest.raises(RuntimeError, match="cannot parse session sidecar"):
         sess.set_message_annotation(meta["id"], "msg-1", cost="$1")
+    with pytest.raises(RuntimeError, match="cannot parse session sidecar"):
+        sess.set_session_usage_summary(
+            meta["id"],
+            {
+                "schema": 1,
+                "source": {"dev": 1, "inode": 2, "size": 3, "mtime_ns": 4},
+                "update": {"turn_id": "turn-corrupt", "at": 1.0},
+                "normalized": {"input_tokens": 1},
+            },
+        )
 
     assert path.read_text(encoding="utf-8") == broken
 
@@ -608,6 +757,110 @@ def test_queue_plan_return_permission_roundtrip_and_legacy_migration(app_module)
     assert requeued["items"][0]["plan_return_permission"] == "default"
 
 
+def _sdk_session_info(sid: str, *, title: str | None = None):
+    return SimpleNamespace(
+        session_id=sid,
+        custom_title=title,
+        first_prompt="transcript prompt",
+        created_at=1_000,
+        last_modified=2_000,
+        tag=None,
+    )
+
+
+def _wait_for_list_refresh(sess, timeout: float = 2.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        with sess._LIST_CACHE_LOCK:
+            if not sess._LIST_REFRESHING["v"]:
+                return
+        time.sleep(0.01)
+    raise AssertionError("session list refresh did not finish")
+
+
+def test_sessions_first_page_does_not_wait_for_workspace_jsonl_scan(
+    client, auth, app_module, monkeypatch,
+):
+    from backend import sessions as sess
+
+    local = sess.create_session("cached metadata")
+    sess.invalidate_sessions_cache()
+    scan_started = threading.Event()
+    release_scan = threading.Event()
+
+    def blocked_scan(**_kwargs):
+        scan_started.set()
+        release_scan.wait(60)
+        return [_sdk_session_info(local["id"], title="transcript title")]
+
+    monkeypatch.setattr(sess, "sdk_list_sessions", blocked_scan)
+    try:
+        # Start the background flight outside TestClient. Starlette waits for
+        # request-owned worker activity on some runners, which makes a wall-clock
+        # assertion measure TestClient shutdown rather than this cache contract.
+        initial, _generation = sess.list_sessions_snapshot()
+        listed = {row["id"]: row for row in initial}
+        assert listed[local["id"]]["name"] == "cached metadata"
+        assert scan_started.wait(1)
+
+        response = client.get("/api/chat/sessions", headers=auth)
+        assert response.status_code == 200
+        initial_etag = response.headers["etag"]
+    finally:
+        release_scan.set()
+        _wait_for_list_refresh(sess)
+
+    refreshed_response = client.get(
+        "/api/chat/sessions",
+        headers={**auth, "If-None-Match": initial_etag},
+    )
+    assert refreshed_response.status_code == 200
+    assert refreshed_response.headers["etag"] != initial_etag
+    refreshed = {
+        row["id"]: row for row in refreshed_response.json()["sessions"]
+    }
+    assert refreshed[local["id"]]["name"] == "transcript title"
+    assert refreshed[local["id"]]["first_prompt"] == "transcript prompt"
+
+
+def test_single_session_stat_update_preserves_transcript_list_cache(
+    app_module, monkeypatch,
+):
+    from backend import sessions as sess
+
+    first = sess.create_session("first")
+    second = sess.create_session("second")
+    calls = 0
+
+    def scan(**_kwargs):
+        nonlocal calls
+        calls += 1
+        return [
+            _sdk_session_info(first["id"]),
+            _sdk_session_info(second["id"]),
+        ]
+
+    monkeypatch.setattr(sess, "sdk_list_sessions", scan)
+    sess.invalidate_sessions_cache()
+    sess.list_sessions()
+    _wait_for_list_refresh(sess)
+    assert calls == 1
+    with sess._LIST_CACHE_LOCK:
+        transcript_layer = sess._LIST_CACHE["transcripts"]
+        generation = sess._LIST_CACHE["gen"]
+
+    sess.set_message_count(first["id"], 17, turn_count=4)
+    listed = {row["id"]: row for row in sess.list_sessions()}
+
+    assert calls == 1
+    assert listed[first["id"]]["message_count"] == 17
+    assert listed[first["id"]]["turn_count"] == 4
+    assert listed[second["id"]]["first_prompt"] == "transcript prompt"
+    with sess._LIST_CACHE_LOCK:
+        assert sess._LIST_CACHE["transcripts"] is transcript_layer
+        assert sess._LIST_CACHE["gen"] == generation + 1
+
+
 def test_sessions_list_conditional_get(client, auth):
     """GET /sessions is a conditional resource: a matching If-None-Match
     yields 304 (lets the picker skip transfer + Alpine re-render), and any
@@ -722,6 +975,83 @@ def test_annotation_partial_update_preserves_other_fields(app_module):
     assert anns["uuid-x"]["cost"] == "$0.01"
     assert anns["uuid-x"]["model"] == "m1"
     assert anns["uuid-x"]["images"] == [{"mime": "image/png"}]
+
+
+def test_terminal_annotation_and_usage_summary_share_one_sidecar_write(app_module):
+    from backend import sessions as sess
+
+    sid = sess.create_session()["id"]
+    usage = {
+        "input_tokens": 12,
+        "output_tokens": 3,
+        "context_used": 12,
+        "context_limit": 200_000,
+    }
+    summary = {
+        "schema": 1,
+        "source": {"dev": 7, "inode": 11, "size": 4321, "mtime_ns": 99},
+        "update": {"turn_id": "turn-1", "at": 1_700_000_000.0},
+        "normalized": usage,
+    }
+    sess.set_terminal_annotation_and_usage(
+        sid,
+        "uuid-terminal",
+        summary,
+        turn_status="completed",
+        cost="$0.0100",
+    )
+
+    assert sess.get_message_annotations(sid)["uuid-terminal"] == {
+        "turn_status": "completed",
+        "cost": "$0.0100",
+    }
+    assert sess.get_session_usage_summary(sid) == summary
+
+
+def test_usage_summary_refinement_requires_matching_terminal_turn(app_module):
+    from backend import sessions as sess
+
+    sid = sess.create_session()["id"]
+    original = {
+        "schema": 1,
+        "source": {"dev": 1, "inode": 2, "size": 3, "mtime_ns": 4},
+        "update": {"turn_id": "turn-new", "at": 2.0},
+        "normalized": {"input_tokens": 20},
+    }
+    stale = {
+        **original,
+        "update": {"turn_id": "turn-old", "at": 3.0},
+        "normalized": {"input_tokens": 10},
+    }
+    sess.set_session_usage_summary(sid, original)
+
+    assert sess.set_session_usage_summary_if_turn_matches(
+        sid, "turn-old", stale) is False
+    assert sess.get_session_usage_summary(sid) == original
+    assert sess.set_session_usage_summary_if_turn_matches(
+        sid, "turn-new", {**original, "normalized": {"input_tokens": 21}})
+    assert sess.get_session_usage_summary(sid)["normalized"] == {
+        "input_tokens": 21,
+    }
+
+
+def test_usage_summary_write_respects_session_deletion_fence(app_module):
+    from backend import sessions as sess
+
+    sid = "00000000-0000-4000-8000-00000000f001"
+    path = sess._sidecar_path(sid)
+    path.unlink(missing_ok=True)
+    sess.begin_session_delete(sid)
+    assert sess.set_session_usage_summary(
+        sid,
+        {
+            "schema": 1,
+            "source": {"dev": 1, "inode": 2, "size": 3, "mtime_ns": 4},
+            "update": {"turn_id": "turn-deleted", "at": 1.0},
+            "normalized": {"input_tokens": 1},
+        },
+    ) is False
+    assert not path.exists()
 
 
 def test_cancelled_annotation_is_not_downgraded_by_late_completion(app_module):
@@ -1058,10 +1388,12 @@ def test_export_session_markdown_empty(client, auth, app_module):
     r = client.post("/api/chat/sessions", headers=auth,
                      json={"name": "export-empty"})
     sid = r.json()["id"]
-    r = client.get(
-        f"/api/chat/sessions/{sid}/export",
-        params={"token": "test-token-1234567890abcdef-secure-min-32"},
+    ticket = client.post(
+        "/api/chat/resource-ticket", headers=auth,
+        json={"resource": "export", "session_id": sid},
     )
+    assert ticket.status_code == 200
+    r = client.get(ticket.json()["url"])
     assert r.status_code == 200
     assert r.headers["content-type"].startswith("text/markdown")
     cd = r.headers["content-disposition"]
@@ -1078,9 +1410,10 @@ def test_export_session_markdown_empty(client, auth, app_module):
 
 
 def test_export_session_markdown_404_for_unknown(client, auth):
-    r = client.get(
-        "/api/chat/sessions/no-such-session/export",
-        params={"token": "test-token-1234567890abcdef-secure-min-32"},
+    r = client.post(
+        "/api/chat/resource-ticket",
+        headers=auth,
+        json={"resource": "export", "session_id": "no-such-session"},
     )
     assert r.status_code == 404
 

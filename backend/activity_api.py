@@ -5,12 +5,13 @@ import json
 from collections.abc import AsyncIterator
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from sse_starlette.sse import EventSourceResponse, ServerSentEvent
 
 from .activity import activity
 from .auth import require_token
 from .capability_tickets import tickets
+from .workspaces import registry as workspace_registry
 
 router = APIRouter(prefix="/api/activity", tags=["activity"])
 _EVENT_TICKET_TTL_S = 45
@@ -21,13 +22,19 @@ class ActivityPatchRequest(BaseModel):
 
 
 class ActivityGroupCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     name: str = Field(min_length=1, max_length=48)
     color: str = Field(default="blue", max_length=16)
+    workspace_id: str | None = Field(default=None, max_length=64)
 
 
 class ActivityGroupUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     name: str | None = Field(default=None, min_length=1, max_length=48)
     color: str | None = Field(default=None, max_length=16)
+    workspace_id: str | None = Field(default=None, max_length=64)
 
 
 class ActivityGroupOrderRequest(BaseModel):
@@ -37,6 +44,15 @@ class ActivityGroupOrderRequest(BaseModel):
 class ActivityGroupAssignmentRequest(BaseModel):
     group_id: str = Field(default="", max_length=64)
     before_event_id: str | None = Field(default=None, max_length=128)
+
+
+def _activity_workspace_binding(workspace_id: str | None):
+    if workspace_id is None:
+        return None
+    try:
+        return workspace_registry.entry_for_id(workspace_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 def _json(request: Request, response: Response, payload: dict):
@@ -53,12 +69,12 @@ def _json(request: Request, response: Response, payload: dict):
 @router.get("", dependencies=[Depends(require_token)])
 def list_activity(request: Request, response: Response,
                   limit: int = Query(100, ge=1, le=500)):
-    return _json(request, response, activity.snapshot(limit))
+    return _json(request, response, activity.snapshot(limit, filter_live=True))
 
 
 @router.get("/summary", dependencies=[Depends(require_token)])
 def activity_summary(request: Request, response: Response):
-    return _json(request, response, activity.summary())
+    return _json(request, response, activity.summary(filter_live=True))
 
 
 @router.post("/events-ticket", dependencies=[Depends(require_token)])
@@ -119,7 +135,7 @@ async def activity_events() -> EventSourceResponse:
 
 @router.post("/ack-all", dependencies=[Depends(require_token)])
 def ack_all():
-    return {"ok": True, "changed": activity.ack(), "summary": activity.summary()}
+    return {"ok": True, "changed": activity.ack(), "summary": activity.summary(filter_live=True)}
 
 
 @router.get("/groups", dependencies=[Depends(require_token)])
@@ -129,8 +145,14 @@ def list_activity_groups():
 
 @router.post("/groups", dependencies=[Depends(require_token)])
 def create_activity_group(req: ActivityGroupCreateRequest):
+    workspace = _activity_workspace_binding(req.workspace_id)
     try:
-        update = activity.create_group(req.name, req.color)
+        update = activity.create_group(
+            req.name,
+            req.color,
+            workspace_id=workspace.id if workspace else None,
+            workspace_path=workspace.path if workspace else None,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"ok": True, **update}
@@ -147,12 +169,22 @@ def reorder_activity_groups(req: ActivityGroupOrderRequest):
 
 @router.patch("/groups/{group_id}", dependencies=[Depends(require_token)])
 def update_activity_group(group_id: str, req: ActivityGroupUpdateRequest):
-    try:
-        update = activity.update_group(
-            group_id,
-            name=req.name,
-            color=req.color,
+    workspace_supplied = "workspace_id" in req.model_fields_set
+    workspace = (
+        _activity_workspace_binding(req.workspace_id)
+        if workspace_supplied else None
+    )
+    changes = {
+        "name": req.name,
+        "color": req.color,
+    }
+    if workspace_supplied:
+        changes.update(
+            workspace_id=workspace.id if workspace else None,
+            workspace_path=workspace.path if workspace else None,
         )
+    try:
+        update = activity.update_group(group_id, **changes)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if update is None:
@@ -193,9 +225,9 @@ def patch_activity(event_id: str, req: ActivityPatchRequest):
 
 @router.post("/{event_id}/ack", dependencies=[Depends(require_token)])
 def ack_event(event_id: str):
-    return {"ok": True, "changed": activity.ack(event_id), "summary": activity.summary()}
+    return {"ok": True, "changed": activity.ack(event_id), "summary": activity.summary(filter_live=True)}
 
 
 @router.post("/session/{sid}/ack", dependencies=[Depends(require_token)])
 def ack_session(sid: str):
-    return {"ok": True, "changed": activity.ack(sid=sid), "summary": activity.summary()}
+    return {"ok": True, "changed": activity.ack(sid=sid), "summary": activity.summary(filter_live=True)}

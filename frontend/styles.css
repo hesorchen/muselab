@@ -643,6 +643,10 @@ a:hover { color: var(--c-accent-hover); text-decoration: underline; }
   backdrop-filter: blur(5px);
   -webkit-backdrop-filter: blur(5px);
   cursor: progress;
+  /* Status only: workspace bootstrap must never become a modal input shield.
+     The active pane may still be loading, but mobile navigation, Activity,
+     Settings and the composer remain independently reachable underneath. */
+  pointer-events: none;
 }
 .workspace-switch-status {
   display: inline-flex;
@@ -1252,19 +1256,30 @@ body.kb-open .layout:focus-within .mobile-tab-bar { display: none; }
   flex: 1;
 }
 .msg-outline-list li {
+  border-bottom: 1px solid var(--c-border);
+}
+.msg-outline-list li:last-child { border-bottom: none; }
+.msg-outline-item {
   display: grid;
   grid-template-columns: auto 1fr auto;
   gap: 10px;
   align-items: center;
+  width: 100%;
   padding: 8px 14px;
   cursor: pointer;
   font-size: var(--fs-sm);
+  font-family: inherit;
+  text-align: left;
+  color: inherit;
+  background: transparent;
+  border-top: none;
+  border-right: none;
+  border-bottom: none;
   border-left: 2px solid transparent;
-  border-bottom: 1px solid var(--c-border);
   transition: background var(--t-fast), border-color var(--t-fast);
 }
-.msg-outline-list li:last-child { border-bottom: none; }
-.msg-outline-list li:hover {
+.msg-outline-item:hover,
+.msg-outline-item:focus-visible {
   background: var(--c-bg-2);
   border-left-color: var(--c-accent);
 }
@@ -1866,6 +1881,17 @@ body.kb-open .layout:focus-within .mobile-tab-bar { display: none; }
   cursor: pointer;
   color: var(--c-fg-1);
 }
+.open-files-main {
+  grid-column: 1 / 3;
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 6px;
+  width: 100%; min-width: 0; min-height: 20px;
+  padding: 0; border: 0;
+  background: transparent; color: inherit;
+  font: inherit; text-align: left; cursor: pointer;
+}
 .open-files-list li:hover { background: var(--c-bg-2); }
 /* Drag-to-reorder: horizontal insertion bar at the top of the hovered row
    (vertical list ⇒ top edge, mirroring the tab bar's left-edge indicator). */
@@ -1971,6 +1997,11 @@ body.kb-open .layout:focus-within .mobile-tab-bar { display: none; }
   opacity: 0.5; pointer-events: none;
 }
 .filelist li:hover { background: var(--c-bg-2); }
+.filelist li[role="treeitem"]:focus-visible {
+  outline: 2px solid var(--c-accent);
+  outline-offset: -2px;
+  box-shadow: inset 0 0 0 1px var(--c-accent-soft);
+}
 
 /* One stable trailing column owns either metadata or actions. Hover swaps the
    two in-place, so buttons never squeeze the file name or sit beside a size. */
@@ -2200,6 +2231,15 @@ body.kb-open .layout:focus-within .mobile-tab-bar { display: none; }
   border-bottom: 2px solid var(--c-accent); padding-bottom: 4px;
 }
 .tab.active .icon { color: var(--c-accent); }
+.tab-main {
+  display: flex; align-items: center; gap: 6px;
+  align-self: stretch; flex: 1; min-width: 0;
+  padding: 0; border: 0;
+  background: transparent; color: inherit;
+  font: inherit; text-align: left; cursor: pointer;
+  white-space: nowrap;
+}
+.tab-main .tab-name { min-width: 0; }
 /* VSCode-style preview tab: a single-click-opened, not-yet-pinned file shows
    its name in italics. Double-clicking the tab (or editing the file) pins it,
    dropping the italics. Only the name italicizes — icon/close stay upright. */
@@ -2312,15 +2352,11 @@ body.kb-open .layout:focus-within .mobile-tab-bar { display: none; }
   letter-spacing: 0.5px;
 }
 .muse-mascot.greet { animation: muse-bounce .9s ease; }
-/* `.is-streaming` — slow breathing animation. Previously this class was
-   intentionally STATIC ("流式状态由 pending bubble 的 thinking-dots
-   表达") but the pending bubble disappears the moment the first chunk
-   arrives, leaving the user with no in-flight indicator for the rest
-   of the reply. Breathing is gentle enough not to compete with content
-   yet clearly signals "still working". Stream-caret on the bubble itself
-   carries the per-token feedback; mascot carries the session-level one.
-   Note: avoid using the .thinking class name — it has unrelated bubble
-   styling elsewhere that crushes the 20px mascot. */
+/* `.is-streaming` — slow breathing animation. The turn footer carries the
+   explicit in-flight state; breathing remains a gentle secondary cue on
+   mascot instances that are already part of message content. Note: avoid
+   using the .thinking class name — it has unrelated bubble styling elsewhere
+   that crushes the 20px mascot. */
 .muse-mascot.is-streaming {
   color: var(--c-accent);
   animation: muse-breath 2.4s ease-in-out infinite;
@@ -2508,6 +2544,7 @@ body.kb-open .layout:focus-within .mobile-tab-bar { display: none; }
   font: inherit;
   font-weight: var(--fw-medium);
   cursor: pointer;
+  touch-action: manipulation;
   transition: color var(--t-fast), background var(--t-fast);
 }
 .preview-selection-actions button:hover,
@@ -2531,12 +2568,76 @@ body.kb-open .layout:focus-within .mobile-tab-bar { display: none; }
   width: min(420px, calc(100vw - 24px));
 }
 .preview-selection-ask-shell {
+  position: relative;
   width: 100%;
   max-height: min(560px, calc(100vh - 28px));
   overflow: hidden;
   border: 1px solid var(--c-border-strong);
   border-radius: var(--r-lg);
   background: var(--c-bg-2);
+}
+.preview-selection-resize-handle { display: none; }
+@media (min-width: 601px) {
+  .preview-selection-popover.is-asking {
+    width: min(var(--preview-question-width, 560px), calc(100vw - 24px));
+    height: min(var(--preview-question-height, 520px), calc(100vh - 24px));
+    min-width: min(360px, calc(100vw - 24px));
+    min-height: min(260px, calc(100vh - 24px));
+    max-width: calc(100vw - 24px);
+    max-height: calc(100vh - 24px);
+  }
+  .preview-selection-popover.is-asking .preview-selection-ask-shell {
+    height: 100%;
+    max-height: none;
+  }
+  .preview-selection-popover.is-asking .preview-selection-ask {
+    height: 100%;
+    overflow: auto;
+  }
+  .preview-selection-popover.is-asking .preview-selection-answer {
+    height: 100%;
+    max-height: none;
+  }
+  .preview-selection-popover.is-asking .preview-selection-conversation {
+    flex: 1;
+    max-height: none;
+  }
+  .preview-selection-resize-handle {
+    position: absolute;
+    z-index: 2;
+    display: block;
+    touch-action: none;
+    user-select: none;
+  }
+  .preview-selection-resize-handle.is-n,
+  .preview-selection-resize-handle.is-s {
+    left: 10px;
+    right: 10px;
+    height: 8px;
+    cursor: ns-resize;
+  }
+  .preview-selection-resize-handle.is-n { top: 0; }
+  .preview-selection-resize-handle.is-s { bottom: 0; }
+  .preview-selection-resize-handle.is-e,
+  .preview-selection-resize-handle.is-w {
+    top: 10px;
+    bottom: 10px;
+    width: 8px;
+    cursor: ew-resize;
+  }
+  .preview-selection-resize-handle.is-e { right: 0; }
+  .preview-selection-resize-handle.is-w { left: 0; }
+  .preview-selection-resize-handle.is-ne,
+  .preview-selection-resize-handle.is-se,
+  .preview-selection-resize-handle.is-sw,
+  .preview-selection-resize-handle.is-nw {
+    width: 14px;
+    height: 14px;
+  }
+  .preview-selection-resize-handle.is-ne { top: 0; right: 0; cursor: nesw-resize; }
+  .preview-selection-resize-handle.is-se { right: 0; bottom: 0; cursor: nwse-resize; }
+  .preview-selection-resize-handle.is-sw { bottom: 0; left: 0; cursor: nesw-resize; }
+  .preview-selection-resize-handle.is-nw { top: 0; left: 0; cursor: nwse-resize; }
 }
 .preview-selection-ask {
   width: 100%;
@@ -3873,9 +3974,13 @@ pre.text {
 .activity-groups-toolbar small { overflow:hidden; color:var(--c-fg-3); font-size:var(--fs-xs); text-overflow:ellipsis; white-space:nowrap; }
 .activity-groups-toolbar .btn-ghost { flex:0 0 auto; display:inline-flex; align-items:center; gap:5px; }
 .activity-groups-toolbar .btn-ghost svg { width:13px; height:13px; }
-.activity-group-editor { display:grid; grid-template-columns:minmax(160px,1fr) auto auto; align-items:center; gap:10px; padding:10px 14px; border-bottom:1px solid var(--c-border); background:var(--c-bg-2); }
+.activity-group-editor { flex:0 0 auto; display:grid; grid-template-columns:minmax(150px,1fr) minmax(180px,.9fr) auto auto; align-items:center; gap:10px; padding:10px 14px; border-bottom:1px solid var(--c-border); background:var(--c-bg-2); }
 .activity-group-editor > input { min-width:0; height:32px; padding:0 9px; border:1px solid var(--c-border-strong); border-radius:var(--r-sm); outline:0; background:var(--c-bg-1); color:var(--c-fg-0); font:inherit; font-size:var(--fs-sm); }
 .activity-group-editor > input:focus { border-color:var(--c-accent); box-shadow:0 0 0 2px var(--c-accent-soft); }
+.activity-group-workspace-field { min-width:0; display:flex; align-items:center; gap:7px; color:var(--c-fg-3); font-size:var(--fs-xs); }
+.activity-group-workspace-field > span { flex:0 0 auto; }
+.activity-group-workspace-field select { min-width:0; width:100%; height:32px; padding:0 28px 0 8px; border:1px solid var(--c-border-strong); border-radius:var(--r-sm); outline:0; background:var(--c-bg-1); color:var(--c-fg-1); font:inherit; font-size:var(--fs-sm); }
+.activity-group-workspace-field select:focus { border-color:var(--c-accent); box-shadow:0 0 0 2px var(--c-accent-soft); }
 .activity-group-colors { display:flex; align-items:center; gap:6px; }
 .activity-group-swatch { width:18px; height:18px; padding:0; border:2px solid transparent; border-radius:50%; background:var(--activity-group-color,var(--c-fg-3)); cursor:pointer; box-shadow:0 0 0 1px color-mix(in srgb,var(--activity-group-color,var(--c-fg-3)) 45%,transparent); }
 .activity-group-swatch.active { border-color:var(--c-bg-1); box-shadow:0 0 0 2px var(--activity-group-color,var(--c-accent)); }
@@ -3915,7 +4020,7 @@ pre.text {
     min-height:0;
     max-height:none;
     display:grid;
-    grid-template-columns:repeat(auto-fit,minmax(300px,1fr));
+    grid-template-columns:repeat(3,minmax(0,1fr));
     /* One lane starts at roughly a header + three session cards. Additional
        sessions stay in the lane and are reached by its own scrollbar. */
     grid-auto-rows:300px;
@@ -3974,6 +4079,12 @@ pre.text {
 .activity-custom-group-dot.is-gray,.activity-group-swatch.is-gray { --activity-group-color:var(--c-fg-3); }
 .activity-custom-group-count { min-width:18px; color:var(--c-fg-3); font:10px var(--font-mono); text-align:center; }
 .activity-custom-group-attention { min-width:18px; padding:1px 5px; border-radius:var(--r-full); background:var(--c-accent-soft); color:var(--c-accent); font:10px var(--font-mono); text-align:center; }
+.activity-group-workspace-chip { min-width:0; max-width:150px; height:27px; display:inline-flex; align-items:center; gap:5px; padding:0 7px; border:1px solid var(--c-border); border-radius:var(--r-full); background:var(--c-bg-1); color:var(--c-fg-2); font:inherit; font-size:var(--fs-xs); cursor:pointer; }
+.activity-group-workspace-chip:hover { border-color:var(--c-accent); color:var(--c-accent); }
+.activity-group-workspace-chip svg { width:12px; height:12px; flex:0 0 12px; }
+.activity-group-workspace-chip > span { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.activity-group-workspace-chip small { flex:0 0 auto; color:var(--c-warn); font-size:10px; white-space:nowrap; }
+.activity-group-workspace-chip.unavailable { border-style:dashed; color:var(--c-fg-4); }
 .activity-custom-group-actions { margin-left:auto; display:flex; align-items:center; gap:2px; opacity:0; transition:opacity var(--t-fast); }
 .activity-group.is-custom:hover .activity-custom-group-actions,.activity-custom-group-actions:focus-within { opacity:1; }
 .activity-custom-group-actions button { width:26px; height:26px; display:flex; align-items:center; justify-content:center; padding:0; border:0; border-radius:var(--r-sm); background:transparent; color:var(--c-fg-3); font:12px var(--font-mono); cursor:pointer; }
@@ -3987,6 +4098,8 @@ pre.text {
    empty drop target. The ledger/status views keep their compact row styling. */
 @media (min-width:721px) {
   .activity-body.is-group-board > .activity-group.is-custom {
+    grid-column:var(--activity-board-column);
+    grid-row:var(--activity-board-row) / span var(--activity-board-row-span);
     min-width:0;
     min-height:300px;
     height:100%;
@@ -4013,6 +4126,7 @@ pre.text {
   .activity-body.is-group-board .activity-custom-group-head > strong {
     font-size:var(--fs-md);
   }
+  .activity-body.is-group-board .activity-group-workspace-chip { max-width:110px; }
   .activity-body.is-group-board .activity-custom-group-dot {
     width:9px;
     height:9px;
@@ -4090,7 +4204,8 @@ pre.text {
 @media (hover:none), (pointer:coarse) {
   .activity-pin,.activity-row-group,.activity-custom-group-actions { opacity:0.72; }
 }
-.activity-move-menu { position:fixed; z-index:1100; max-height:min(360px,calc(100vh - 16px)); overflow:auto; padding:5px; border:1px solid var(--c-border-strong); border-radius:var(--r-md); background:var(--c-bg-1); box-shadow:var(--shadow-pop); }
+.activity-move-layer { position:fixed; inset:0; z-index:1100; pointer-events:auto; }
+.activity-move-menu { position:fixed; max-height:min(360px,calc(100vh - 16px)); overflow:auto; overscroll-behavior:contain; padding:5px; border:1px solid var(--c-border-strong); border-radius:var(--r-md); background:var(--c-bg-1); box-shadow:var(--shadow-pop); pointer-events:auto; }
 .activity-move-menu-title { padding:6px 8px 5px; color:var(--c-fg-3); font-size:10px; font-weight:var(--fw-medium); }
 .activity-move-menu > button { width:100%; min-height:32px; display:flex; align-items:center; gap:8px; padding:5px 8px; border:0; border-radius:var(--r-sm); background:transparent; color:var(--c-fg-1); font:inherit; font-size:var(--fs-sm); text-align:left; cursor:pointer; }
 .activity-move-menu > button:hover { background:var(--c-bg-2); }
@@ -4103,9 +4218,14 @@ pre.text {
   .activity-view-switch { order:3; width:100%; margin-left:0; }
   .activity-view-switch button { flex:1; }
   .activity-groups-toolbar small { white-space:normal; }
-  .activity-group-editor { grid-template-columns:1fr; }
+  .activity-group-editor { max-height:min(58dvh,460px); overflow-y:auto; grid-template-columns:1fr; }
+  .activity-group-workspace-field { align-items:stretch; flex-direction:column; gap:4px; }
+  .activity-group-workspace-field select { width:100%; min-height:42px; }
   .activity-group-colors { padding:2px; }
   .activity-group-editor-actions { justify-content:flex-end; }
+  .activity-custom-group-head { flex-wrap:wrap; }
+  .activity-group-workspace-chip { order:5; max-width:100%; min-height:40px; }
+  .activity-custom-group-actions button { width:40px; height:40px; }
 }
 @media (max-width:600px) {
   .files-head-workspace { flex:1 1 auto; max-width:none; margin-left:2px; }
@@ -4159,6 +4279,9 @@ pre.text {
   position: relative;
   display: flex;
   flex-direction: column;
+  /* Transcript content owns the scroll, never the pane. This hard boundary
+     keeps a very tall block/compact summary from sizing the composer away. */
+  overflow: hidden;
 }
 .chat-body {
   flex: 1; overflow-y: auto;
@@ -4199,31 +4322,29 @@ pre.text {
   flex-direction: column;
   gap: var(--sp-2);
 }
-.load-later-wrap {
-  display: flex;
-  justify-content: center;
-  gap: var(--sp-2);
-  padding-block: var(--sp-2);
+.msg-virtual-spacer {
+  flex: 0 0 auto;
+  width: 100%;
+  min-height: 0;
+  overflow: hidden;
+  pointer-events: none;
 }
-.load-later-wrap .latest { font-weight: 600; }
-.stream-plain {
+.msg-virtual-spacer > * { display: none !important; }
+.chat-bottom-anchor {
+  flex: 0 0 1px;
+  width: 100%;
+  height: 1px;
+  pointer-events: none;
+}
+.load-earlier-status {
+  color: var(--c-fg-2);
+  font-size: var(--fs-xs);
+}
+.stream-plain,
+.history-plain {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
   font: inherit;
-}
-.long-answer-rest {
-  margin-top: var(--sp-2);
-  color: var(--c-fg-1);
-}
-.long-answer-rest > summary {
-  width: fit-content;
-  cursor: pointer;
-  color: var(--c-accent);
-  font-size: var(--fs-sm);
-  user-select: none;
-}
-.long-answer-rest > div {
-  margin-top: var(--sp-2);
 }
 .msg {
   display: flex;
@@ -4233,7 +4354,7 @@ pre.text {
   /* Render eagerly (no content-visibility:auto). content-visibility:auto used
      to skip layout/paint for off-screen bubbles, added back when a long
      conversation kept EVERY message in the DOM. But history is now lazy-loaded
-     (INITIAL_LOAD window + paged batches + live cap), so only ~50 bubbles are
+     (paged history + a bounded live messageRange), so only a fixed window is
      ever in the DOM — and `auto` deferred each bubble's layout+paint to the
      moment it scrolled into view, which on phone CPUs meant per-bubble frame
      drops while scrolling through history (measured: 1244ms total scroll jank,
@@ -4242,16 +4363,10 @@ pre.text {
      so eager rendering just lets the browser paint the bounded window up front
      instead of stuttering every scroll. */
 }
-/* Desktop keeps several warm conversation panes mounted for instant tab
-   switches. Lay out only the visible slice of a newly revealed history;
-   off-screen bubbles use the per-message intrinsic height estimate already
-   written inline. Phones stay eager because their sequential touch scrolling
-   is more sensitive to on-demand realization and they retain only one pane. */
-@media (min-width: 769px) and (pointer: fine) {
-  .msg-pane .msg {
-    content-visibility: auto;
-  }
-}
+/* Render the bounded resident history eagerly on every device. Combining
+   content-visibility:auto with estimated virtual spacers made fast wheel
+   movement enter unpainted space and repeatedly resize the scrollbar as real
+   heights replaced estimates. Transport paging now bounds history work. */
 /* Paged-in history bubbles ("Load earlier" / live-cap restore) mount as a
    batch of 20+ at once. Each .msg would play the msg-in entrance animation on
    mount, so the whole batch fades+slides in simultaneously the instant you load
@@ -4631,9 +4746,8 @@ html[data-theme="light"] .msg.user .bubble { color: white; }
 
 /* Compact-in-progress placeholder bubble. Sits at the very bottom of the
    message list while native /compact is running (can be 20-60s on a long
-   session). Reuses .bubble.pending layout — adds a 📦 prefix icon + a
-   subtle border-pulse to differentiate it from the assistant-thinking
-   pending bubble (otherwise the two look identical). */
+   session). Reuses .bubble.pending layout and adds a 📦 prefix icon plus a
+   subtle border pulse; normal response startup now uses a turn separator. */
 .compact-pending .bubble.pending {
   border: 1px solid var(--c-accent);
   animation: compact-pending-pulse 1.6s ease-in-out infinite;
@@ -4650,52 +4764,58 @@ html[data-theme="light"] .msg.user .bubble { color: white; }
   50%      { box-shadow: 0 0 0 4px rgba(96, 147, 255, 0.22); }
 }
 
-/* Chat skeleton — placeholder rows while loadSession is fetching. The
-   shimmer pulse signals "loading, please wait" without taking over the
-   pane the way a spinner would. Three skeleton bubbles match the
-   typical short reply density; longer histories render the real
-   messages directly once fetched. */
-.chat-skeleton {
-  padding: 16px 20px;
-  display: flex; flex-direction: column;
-  gap: 18px;
+/* Foreground transcript loads use a fully opaque, pane-local shield. Keep the
+   canonical DOM mounted underneath so virtual ranges and tail geometry continue
+   to settle normally, but never expose old/partial rows or onboarding between
+   currentId selection and the target pane's first completed paint. */
+.chat-transcript-loading-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 6;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  pointer-events: auto;
+  background: var(--c-bg-1);
 }
-/* FIX ⑤: keep already-mounted message rows hidden behind the skeleton until
-   loadSession finishes highlighting (messagesReady). Prevents the half-rendered
-   "partway then stuck" flash on big sessions, especially on mobile. */
-.chat-body.msgs-hidden .msg { display: none; }
-.chat-skeleton-msg {
-  display: flex; gap: 10px;
-  align-items: flex-start;
+.chat-load-error {
+  flex: 1 0 auto;
+  min-height: 180px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  color: var(--c-fg-2);
+  text-align: center;
 }
-.chat-skeleton-avatar {
-  width: 32px; height: 32px;
-  border-radius: 50%;
-  background: var(--c-bg-2);
-  flex-shrink: 0;
-  animation: skeleton-shimmer 1.4s ease-in-out infinite;
+.chat-load-error > svg {
+  width: 26px;
+  height: 26px;
+  color: var(--c-danger);
 }
-.chat-skeleton-bubble {
-  flex: 1;
-  display: flex; flex-direction: column;
-  gap: 6px;
-  max-width: 70%;
+.chat-load-error strong { color: var(--c-fg-0); }
+.chat-load-error.has-resident {
+  position: sticky;
+  top: 0;
+  z-index: 3;
+  flex: 0 0 auto;
+  min-height: 0;
+  flex-direction: row;
+  padding: 10px 12px;
+  border: 1px solid var(--c-danger);
+  border-radius: var(--r-md);
+  background: var(--c-bg-1);
+  box-shadow: var(--shadow-sm);
 }
-.chat-skeleton-line {
-  height: 10px;
-  background: var(--c-bg-2);
-  border-radius: var(--r-sm);
-  animation: skeleton-shimmer 1.4s ease-in-out infinite;
-}
-.chat-skeleton-line:nth-child(1) { width: 55%; animation-delay: 0s; }
-.chat-skeleton-line:nth-child(2) { width: 92%; animation-delay: 0.15s; }
-.chat-skeleton-line:nth-child(3) { width: 78%; animation-delay: 0.3s; }
-.chat-skeleton-msg:nth-child(even) {
-  flex-direction: row-reverse;   /* alternate "user / assistant" feel */
-}
-.chat-skeleton-msg:nth-child(even) .chat-skeleton-bubble {
-  align-items: flex-end;
-}
+.chat-load-error.has-resident > svg { width: 18px; height: 18px; }
+.chat-load-error.has-resident .btn-secondary { margin-left: auto; }
+/* Never remove canonical messages from layout while a cold load settles.
+   The old display:none gate left only turn separators / virtual spacers visible
+   whenever messagesReady missed a callback, producing a full-height blank chat
+   that could not be scrolled to its tail. The opaque shield is only visual;
+   resident rows continue laying out safely underneath it. */
 @keyframes skeleton-shimmer {
   0%, 100% { opacity: 0.4; }
   50%      { opacity: 0.85; }
@@ -4732,22 +4852,17 @@ html[data-theme="light"] .msg.user .bubble { color: white; }
   .cost-skeleton-kpis { grid-template-columns: repeat(2, 1fr); }
 }
 
-/* Per-bubble streaming caret retired — the new .streaming-tail row at
-   the bottom of the chat body (see index.html, after the pending
-   bubble) handles "muse is still generating" universally, including
-   when the last block is a thinking card or tool result rather than
-   a text bubble. Avoids double-pulsing dots stacked in two places. */
-/* Per-turn footer. Sits under the tail block of every muse turn —
-   carries the streaming dots while in flight and the HH:MM
-   completion stamp once done. One footer per turn, regardless of
-   how many blocks (thinking / tool_use / tool_result / assistant)
-   are in the turn. Aligned to the muse-side content column (avatar
-   width 32px + gap 8px = 40px gutter). */
-/* Now also the turn SEPARATOR: two hairlines bracket the stamp so the row
-   reads as a boundary rather than a caption hanging off the last card. The
-   40px content-column indent is gone with them — a boundary should span the
-   full width, and there is no longer an avatar-aligned run of dots to line up
-   with (those moved to .turn-running-bar). */
+/* Per-bubble streaming caret retired. The per-turn footer is the single
+   live status source once a muse-side block exists, avoiding duplicate
+   pulsing indicators in the same turn. */
+/* Per-turn footer. Sits under the tail block of every muse turn and carries
+   live state while in flight, then the completion metadata once done. One
+   footer per turn, regardless of how many blocks (thinking / tool_use /
+   tool_result / assistant) are in the turn. */
+/* The footer also acts as the turn SEPARATOR: two hairlines bracket the stamp
+   so the row reads as a boundary rather than a caption hanging off the last
+   card. A boundary spans the full width rather than following the avatar
+   gutter. */
 .turn-footer {
   padding: 0;
   margin: 6px 0 2px;
@@ -4772,7 +4887,37 @@ html[data-theme="light"] .msg.user .bubble { color: white; }
 }
 .turn-status {
   min-width: 48px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 5px;
   text-align: right;
+}
+.turn-running-dots {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+}
+.turn-running-dots > span {
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: currentColor;
+  opacity: 0.38;
+  animation: turn-running-wave 1.35s ease-in-out infinite;
+}
+.turn-running-dots > span:nth-child(2) { animation-delay: 0.14s; }
+.turn-running-dots > span:nth-child(3) { animation-delay: 0.28s; }
+@keyframes turn-running-wave {
+  0%, 56%, 100% { opacity: 0.38; transform: translateY(0); }
+  28% { opacity: 0.92; transform: translateY(-1.5px); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .turn-running-dots > span {
+    animation: none;
+    opacity: 0.7;
+    transform: none;
+  }
 }
 .turn-status.background-pending {
   min-width: 0;
@@ -4843,38 +4988,13 @@ html[data-theme="light"] .msg.user .bubble { color: white; }
     height: 30px;
   }
 }
-/* Sticky "still running" row — see the comment on .turn-running-bar in
-   index.html for why this exists instead of the trailing dots it replaced.
-   Opaque bg-1 (the chat pane's own background) so message content scrolls
-   UNDER it cleanly; the hairline gives it an edge without a heavy shadow. */
-.turn-running-bar {
-  position: sticky;
-  bottom: 0;
-  z-index: 5;
-  display: flex;
-  align-items: center;
-  gap: var(--sp-2);
-  margin-top: 4px;
-  padding: 6px 2px 4px;
-  background: var(--c-bg-1);
-  border-top: 1px solid var(--c-border);
-}
-.turn-running-label {
-  font-size: var(--fs-xs);
-  color: var(--c-fg-3);
-  font-family: var(--font-mono);
-  letter-spacing: 0.3px;
-}
-
 .thinking-dots { display: inline-flex; gap: var(--sp-1); align-items: center; }
 .thinking-dots span {
   width: 6px; height: 6px; border-radius: 50%; background: var(--c-accent);
   animation: thinking-pulse 1.2s ease-in-out infinite;
 }
-/* `.turn-footer .stream-elapsed` removed: the footer became a turn separator
-   and its elapsed counter moved to .turn-running-bar. The only remaining
-   .stream-elapsed is inside the pending bubble, where it is sibling-inline
-   and inherits .thinking-label's styling — it never needed this rule. */
+/* Turn separators render live and final elapsed values through `.msg-elapsed`;
+   no separate streaming elapsed style is needed. */
 .background-task-footer-label {
   color: var(--c-warn);
   font-size: var(--fs-xs);
@@ -5593,6 +5713,10 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 .img-attachments {
   display: flex; flex-wrap: wrap; gap: 6px;
   padding: 6px 4px;
+  max-height: 132px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  flex: 0 1 auto;
 }
 .selection-quote-chip {
   position: relative;
@@ -6623,6 +6747,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
    ============================================================================ */
 .tool-prefix-icon svg,
 .queued-icon svg,
+.optimistic-queue-status svg,
 .compact-pending-icon svg,
 .queue-paused-icon svg,
 .settings-menu-icon svg,
@@ -6819,6 +6944,9 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 .tool-task.is-failed .tool-task-badge { color: var(--c-err, #dc2626); }
 .tool-task.is-stopped .tool-task-badge { color: var(--c-fg-3); }
 .tool-task-summary { color: var(--c-fg-2); word-break: break-word; }
+.task-summary-truncated {
+  color: var(--c-fg-3); font-size: var(--fs-2xs); white-space: nowrap;
+}
 .tool-task-open {
   color: var(--c-accent); cursor: pointer; white-space: nowrap;
   text-decoration: none;
@@ -7094,10 +7222,14 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
      row 3: chat-toolbar — every control compactly stacked here */
 .chat-input {
   display: flex; flex-direction: column;
-  flex-shrink: 0;
+  flex: 0 0 auto;
+  min-height: 0;
+  max-height: 420px;
+  max-height: min(50dvh, 420px);
   gap: 6px; padding: var(--sp-2);
   border-top: 1px solid var(--c-border); background: var(--c-bg-1);
   position: relative;
+  z-index: 6;
   /* Match .chat-body's centered reading column on wide viewports so
      the input field aligns visually with the message bubbles instead
      of stretching corner-to-corner under a narrow message column.
@@ -7161,6 +7293,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
    share the same 26px height + same hover behavior. */
 .chat-toolbar {
   display: flex; align-items: center; gap: 2px;
+  min-width: 0;
   padding: 4px 6px;
   border-top: 1px solid var(--c-border);
   background: var(--c-bg-1);
@@ -7389,6 +7522,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
    swaps to a danger-style stop button automatically. */
 .chat-toolbar-send {
   height: 26px; width: 26px; padding: 0;
+  flex: 0 0 26px;
   display: inline-flex; align-items: center; justify-content: center;
   border: 0; border-radius: var(--r-md); cursor: pointer;
   background: var(--c-btn-primary-bg); color: var(--c-on-accent);
@@ -7437,6 +7571,20 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 }
 .queued-icon { font-size: var(--fs-sm); }
 .queued-label { white-space: nowrap; }
+.user-bubble.is-queueing {
+  border: 1px dashed rgba(255, 255, 255, 0.6);
+}
+.optimistic-queue-status {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin-top: 6px;
+  padding-top: 5px;
+  border-top: 1px dotted rgba(255, 255, 255, 0.35);
+  color: rgba(255, 255, 255, 0.82);
+  font-size: var(--fs-xs);
+}
+.optimistic-queue-status svg { width: 1em; height: 1em; }
 /* Paused marker on a queued bubble. Warn-colored so it separates from the
    neutral "已排队 1/2" counter beside it — this one is a blocked state, not
    a position. */
@@ -9907,6 +10055,40 @@ html[data-theme="dark"] .bubble :not(pre) > code:not(.has-file-link) * {
   .msg-actions.msg-actions-assistant:active { opacity: 1; }
 }
 
+/* Activity move menu follows the same single-pane breakpoint as
+   `_isMobileLayout()`. The portal becomes a bottom sheet so row scroll,
+   browser chrome and the on-screen keyboard can never strand an anchored
+   popup over the chat surface. */
+@media (max-width: 900px), (pointer: coarse) and (max-height: 500px) {
+  .activity-move-layer {
+    display: flex;
+    align-items: flex-end;
+    justify-content: center;
+    padding: 12px 12px calc(12px + env(safe-area-inset-bottom) + var(--kb-inset, 0px));
+    background: color-mix(in srgb, #000 32%, transparent);
+    pointer-events: auto;
+    overscroll-behavior: contain;
+  }
+  .activity-move-menu {
+    position: relative;
+    inset: auto;
+    width: min(100%, 560px);
+    max-height: min(68vh, calc(100vh - var(--kb-inset, 0px) - 24px), 560px);
+    max-height: min(68dvh, calc(100dvh - var(--kb-inset, 0px) - 24px), 560px);
+    overflow-y: auto;
+    border-radius: var(--r-xl);
+    box-shadow: 0 -10px 36px rgba(0, 0, 0, .28);
+  }
+  .activity-move-menu-title {
+    padding: 10px 12px 8px;
+    font-size: var(--fs-xs);
+  }
+  .activity-move-menu > button {
+    min-height: 44px;
+    padding: 8px 12px;
+  }
+}
+
 /* ==========================================================================
    "Avatar per turn" visual: every assistant-side msg renders its own
    .msg-row + .msg-avatar in the template (kept reactive-friendly), but
@@ -9984,6 +10166,7 @@ html[data-theme="dark"] .bubble :not(pre) > code:not(.has-file-link) * {
     padding-top: 2px;
     padding-bottom: 2px;
   }
+  .open-files-main { min-height: 36px; }
   .open-files-x { width: 36px; height: 36px; font-size: 20px; }
   .srow { min-height: 44px; padding-top: 9px; padding-bottom: 9px; }
   .csv-toolbar { flex-wrap: wrap; gap: 6px; }
@@ -10317,6 +10500,7 @@ html[data-theme="dark"] .bubble :not(pre) > code:not(.has-file-link) * {
   color: var(--c-accent);
 }
 .load-earlier-btn:active { background: var(--c-bg-4); }
+.load-earlier-btn:disabled { opacity: .6; cursor: wait; }
 .load-earlier-truncated-note {
   font-size: var(--fs-xs);
   color: var(--c-fg-3);
@@ -11488,10 +11672,33 @@ html[data-theme="eyecare"] .tool-error-hint {
   overflow-wrap: anywhere;
   font-size: 12px;
 }
-.memory-source {
+.memory-source,
+.memory-stats,
+.memory-recall-row-meta {
   color: var(--c-fg-3);
   overflow-wrap: anywhere;
   font-size: 10px;
+}
+.memory-stats { margin-top: 5px; font-family: var(--font-mono); }
+.memory-source-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-top: 6px;
+}
+.memory-recall-results {
+  margin: 6px 0;
+  color: var(--c-fg-2);
+  background: transparent;
+  white-space: pre-wrap;
+  font: 10px/1.5 var(--font-mono);
+}
+.memory-backup-receipt { display: grid; gap: 5px; }
+.memory-backup-receipt code {
+  color: var(--c-fg-3);
+  overflow-wrap: anywhere;
+  font: 9px/1.4 var(--font-mono);
 }
 .memory-card-actions { margin-top: 8px; }
 .memory-card details { margin-top: 8px; font-size: 11px; }

@@ -204,6 +204,19 @@ def test_claude_oauth_generation_uses_fresh_no_tool_sdk_query(
     assert seen["options"].skills == []
 
 
+def test_ducc_generation_model_never_routes_through_http(monkeypatch):
+    from backend.memory_config import MemoryConfig
+    from backend.memory_providers import GenerationProvider
+
+    # Even when a native Anthropic key is present, ducc:-prefixed models are a
+    # CLI runtime and must never be sent to an HTTP /v1/messages endpoint.
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+    provider = GenerationProvider(MemoryConfig(
+        generation_model="ducc:deepseek-v4-pro"))
+    assert provider._route() is None
+    assert provider.metadata() == ("ducc", "ducc:deepseek-v4-pro")
+
+
 def test_generation_timeout_has_compatible_default_and_env_override(monkeypatch):
     from backend.memory_providers import generation_timeout_seconds
 

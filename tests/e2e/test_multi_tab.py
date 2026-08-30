@@ -57,7 +57,7 @@ def _login(page: Page, base: str, token: str) -> None:
     page.wait_for_function(
         """() => {
           const app = document.querySelector("#app")?._x_dataStack?.[0];
-          return app && app.authed === true && app.currentId
+          return app && app.authed === true && app._modelsLoaded && app.currentId
             && app.openTabIds.includes(app.currentId) && app.sessions.length > 0;
         }"""
     )
@@ -84,6 +84,268 @@ def test_new_and_switch_and_close_tabs(page: Page, backend_url, auth_token):
     # Close the active tab via its × button.
     page.locator(f"{SEL_TAB_ACTIVE} {SEL_TAB_CLOSE}").click()
     expect(page.locator(SEL_TAB)).to_have_count(initial + 1)
+
+
+def test_closed_tab_stays_closed_after_stale_prefs_write_and_hard_refresh(
+        page: Page, backend_url, auth_token):
+    """A legacy/stale prefs writer must not resurrect a closed chat tab."""
+    _login(page, backend_url, auth_token)
+    page.locator(SEL_TAB_NEW).click()
+    page.locator(SEL_TAB_NEW).click()
+    before = page.evaluate(
+        "document.querySelector('#app')._x_dataStack[0].openTabIds.slice()")
+    closed = before[0]
+
+    page.locator(
+        f'{SEL_TAB}[data-tid="{closed}"] {SEL_TAB_CLOSE}').click()
+    page.wait_for_function(
+        """([sid]) => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const store = JSON.parse(localStorage.getItem(
+            'muselab_chat_tabs_v1') || '{}');
+          return !app.openTabIds.includes(sid)
+            && !store.openTabIds?.includes(sid);
+        }""",
+        arg=[closed],
+    )
+
+    # Simulate a page still running the pre-v10 code: it rewrites the shared
+    # prefs record with an old tab list while changing an unrelated preference.
+    page.evaluate(
+        """([staleIds]) => {
+          const prefs = JSON.parse(localStorage.getItem('muselab_prefs') || '{}');
+          prefs.openTabIds = staleIds;
+          prefs.leftOpen = !prefs.leftOpen;
+          localStorage.setItem('muselab_prefs', JSON.stringify(prefs));
+        }""",
+        arg=[before],
+    )
+    page.reload(wait_until="domcontentloaded")
+    page.wait_for_function(
+        """([sid]) => {
+          const app = document.querySelector('#app')?._x_dataStack?.[0];
+          return app && app._sessionsInitialized && app.currentId
+            && !app.openTabIds.includes(sid);
+        }""",
+        arg=[closed],
+    )
+    restored = page.evaluate(
+        """([sid]) => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const store = JSON.parse(localStorage.getItem(
+            'muselab_chat_tabs_v1') || '{}');
+          return {
+            runtimeHasClosed: app.openTabIds.includes(sid),
+            storedHasClosed: store.openTabIds.includes(sid),
+            prefsStillContainsTabStrip: Array.isArray(JSON.parse(
+              localStorage.getItem('muselab_prefs') || '{}').openTabIds),
+          };
+        }""",
+        arg=[closed],
+    )
+    assert restored == {
+        "runtimeHasClosed": False,
+        "storedHasClosed": False,
+        "prefsStillContainsTabStrip": False,
+    }
+
+
+def test_same_origin_pages_share_strip_without_focus_theft_or_writeback(
+        page: Page, backend_url, auth_token):
+    """Storage events converge the strip but keep each page's active tab local."""
+    _login(page, backend_url, auth_token)
+    page.locator(SEL_TAB_NEW).click()
+    page.locator(SEL_TAB_NEW).click()
+    before = page.evaluate(
+        "document.querySelector('#app')._x_dataStack[0].openTabIds.slice()")
+
+    peer = page.context.new_page()
+    try:
+        _login(peer, backend_url, auth_token)
+        peer_current = before[0]
+        _activate_chat_tab(peer, peer_current)
+        peer.evaluate(
+            """() => {
+              const app = document.querySelector('#app')._x_dataStack[0];
+              window.__chatTabStoreWrites = 0;
+              const original = app._writeChatTabStore.bind(app);
+              app._writeChatTabStore = (...args) => {
+                window.__chatTabStoreWrites += 1;
+                return original(...args);
+              };
+            }"""
+        )
+
+        non_current = before[1]
+        page.locator(
+            f'{SEL_TAB}[data-tid="{non_current}"] {SEL_TAB_CLOSE}').click()
+        peer.wait_for_function(
+            """([sid, current]) => {
+              const app = document.querySelector('#app')._x_dataStack[0];
+              return !app.openTabIds.includes(sid) && app.currentId === current;
+            }""",
+            arg=[non_current, peer_current],
+        )
+        assert peer.evaluate("window.__chatTabStoreWrites") == 0
+
+        # Closing this page's active tab elsewhere selects a local fallback. The
+        # storage-event consumer still must not write the shared strip back.
+        page.locator(
+            f'{SEL_TAB}[data-tid="{peer_current}"] {SEL_TAB_CLOSE}').click()
+        peer.wait_for_function(
+            """([closed]) => {
+              const app = document.querySelector('#app')._x_dataStack[0];
+              return app.currentId !== closed && !app.openTabIds.includes(closed);
+            }""",
+            arg=[peer_current],
+        )
+        assert peer.evaluate("window.__chatTabStoreWrites") == 0
+
+        # Even if the peer's in-memory list is stale, an unrelated savePrefs()
+        # cannot overwrite the standalone authoritative tab record.
+        peer.evaluate(
+            """([staleIds]) => {
+              const app = document.querySelector('#app')._x_dataStack[0];
+              app.openTabIds = staleIds;
+              app.leftOpen = !app.leftOpen;
+              app.savePrefs();
+            }""",
+            arg=[before],
+        )
+        stored = peer.evaluate(
+            "JSON.parse(localStorage.getItem('muselab_chat_tabs_v1'))")
+        assert non_current not in stored["openTabIds"]
+        assert peer_current not in stored["openTabIds"]
+
+        # Two same-origin pages already hold the app's long-lived SSE surfaces.
+        # Retire both root mux transports before navigation so Chromium always
+        # has a connection available for the reload itself; the fresh document
+        # starts its own coordinator after session initialization.
+        for browser_page in (page, peer):
+            browser_page.evaluate(
+                """() => document.querySelector('#app')._x_dataStack[0]
+                  ._setChatMuxUnsupported()"""
+            )
+        page.reload(wait_until="domcontentloaded", timeout=15000)
+        page.wait_for_function(
+            """([closed]) => {
+              const app = document.querySelector('#app')?._x_dataStack?.[0];
+              return app && app._sessionsInitialized
+                && closed.every(id => !app.openTabIds.includes(id));
+            }""",
+            arg=[[non_current, peer_current]],
+        )
+    finally:
+        peer.close()
+
+
+def test_mobile_typing_cannot_duplicate_chat_tabs(page: Page, backend_url, auth_token):
+    """Dirty restored ids, Alpine input ticks and duplicate touch activation must
+    still produce one DOM tab per session id."""
+    page.set_viewport_size({"width": 390, "height": 844})
+    browser_errors: list[str] = []
+    page.on("pageerror", lambda error: browser_errors.append(str(error)))
+    _login(page, backend_url, auth_token)
+
+    sid = page.evaluate(
+        "document.querySelector('#app')._x_dataStack[0].currentId")
+    page.evaluate(
+        """([sid]) => {
+          const prefs = JSON.parse(localStorage.getItem("muselab_prefs") || "{}");
+          prefs.schema = 9;
+          prefs.currentId = sid;
+          prefs.openTabIds = [sid, sid];
+          prefs.mobileTab = "chat";
+          localStorage.removeItem("muselab_chat_tabs_v1");
+          localStorage.setItem("muselab_prefs", JSON.stringify(prefs));
+        }""",
+        arg=[sid],
+    )
+    page.reload(wait_until="domcontentloaded")
+    page.wait_for_function(
+        """([sid]) => {
+          const app = document.querySelector("#app")?._x_dataStack?.[0];
+          return app && app._sessionsInitialized && app.currentId === sid;
+        }""",
+        arg=[sid],
+    )
+
+    composer = page.locator(".chat-input-textarea")
+    expect(composer).to_be_visible()
+    composer.fill("mobile duplicate-tab probe")
+    restored = page.evaluate(
+        """([sid]) => {
+          const app = document.querySelector("#app")._x_dataStack[0];
+          return {
+            storedCount: app.openTabIds.filter(id => id === sid).length,
+            projectedCount: app.workspaceOpenTabIds().filter(id => id === sid).length,
+            domCount: document.querySelectorAll(
+              `.chat-tab[data-tid="${CSS.escape(sid)}"]`).length,
+            activeCount: document.querySelectorAll(".chat-tab.active").length,
+          };
+        }""",
+        arg=[sid],
+    )
+    assert restored == {
+        "storedCount": 1,
+        "projectedCount": 1,
+        "domCount": 1,
+        "activeCount": 1,
+    }
+
+    # Runtime defence: even if a stale caller pollutes the array after boot,
+    # the render projection must never hand duplicate keys to Alpine.
+    page.evaluate(
+        """([sid]) => {
+          const app = document.querySelector("#app")._x_dataStack[0];
+          app.openTabIds = [sid, sid];
+        }""",
+        arg=[sid],
+    )
+    composer.fill("mobile duplicate-tab probe 2")
+    runtime = page.evaluate(
+        """([sid]) => {
+          const app = document.querySelector("#app")._x_dataStack[0];
+          return {
+            projectedCount: app.workspaceOpenTabIds().filter(id => id === sid).length,
+            domCount: document.querySelectorAll(
+              `.chat-tab[data-tid="${CSS.escape(sid)}"]`).length,
+          };
+        }""",
+        arg=[sid],
+    )
+    assert runtime == {"projectedCount": 1, "domCount": 1}
+
+    # Two immediate mobile activations are one user intent. The second call
+    # returns the same optimistic session rather than opening another blank tab.
+    deduped = page.evaluate(
+        """() => {
+          const app = document.querySelector("#app")._x_dataStack[0];
+          const before = app.workspaceOpenTabIds().length;
+          const first = app.newSession();
+          const second = app.newSession();
+          return {
+            sameId: first.id === second.id,
+            delta: app.workspaceOpenTabIds().length - before,
+            currentId: app.currentId,
+            createdId: first.id,
+          };
+        }"""
+    )
+    assert deduped["sameId"] is True
+    assert deduped["delta"] == 1
+    assert deduped["currentId"] == deduped["createdId"]
+
+    # A stuck modifier from a mobile IME or remote keyboard must not turn a
+    # composer keystroke into another new chat tab.
+    composer = page.locator(".chat-input-textarea")
+    composer.focus()
+    before_shortcut = page.locator(SEL_TAB).count()
+    composer.dispatch_event("keydown", {"key": "t", "ctrlKey": True,
+                                         "bubbles": True})
+    page.wait_for_timeout(50)
+    assert page.locator(SEL_TAB).count() == before_shortcut
+    assert browser_errors == []
 
 
 def test_inline_rename_via_dblclick(page: Page, backend_url, auth_token):
@@ -158,9 +420,12 @@ def test_pending_send_text_survives_hard_refresh(
     page.evaluate(
         """() => {
           const app = document.querySelector('#app')._x_dataStack[0];
+          app._ensureChatMux = async () => true;
+          app._confirmSessionBusy = async () => false;
           const originalFetch = window.fetch.bind(window);
           window.fetch = (url, init) => {
-            if (String(url).includes('/api/chat/stream/start')) {
+            if (String(url).includes('/api/chat/turns/start')) {
+              window.__streamStartBlocked = true;
               return new Promise(() => {});
             }
             return originalFetch(url, init);
@@ -173,7 +438,7 @@ def test_pending_send_text_survives_hard_refresh(
           const app = document.querySelector('#app')._x_dataStack[0];
           const store = JSON.parse(localStorage.getItem(
             'muselab_chat_drafts_v1') || '{}');
-          return app.streaming && app.input === ''
+          return window.__streamStartBlocked === true && app.input === ''
             && store.drafts?.[app.currentId]?.pending === marker;
         }""",
         arg=[marker],
@@ -202,11 +467,11 @@ def test_pending_send_text_survives_hard_refresh(
     expect(page.locator(".chat-input-textarea")).to_have_value(marker)
 
 
-def test_ticket_failure_restores_draft_and_idle_state(
+def test_turn_start_failure_restores_draft_and_idle_state(
         page: Page, backend_url, auth_token):
     attempts = 0
 
-    def reject_ticket(route) -> None:
+    def reject_turn_start(route) -> None:
         nonlocal attempts
         attempts += 1
         route.fulfill(
@@ -215,13 +480,14 @@ def test_ticket_failure_restores_draft_and_idle_state(
             body='{"detail":"ticket unavailable"}',
         )
 
-    page.route("**/api/chat/stream/start", reject_ticket)
+    page.route("**/api/chat/turns/start", reject_turn_start)
     _login(page, backend_url, auth_token)
     marker = "ticket-failure-recovered"
     page.locator(".chat-input-textarea").fill(marker)
     page.evaluate(
         """() => {
           const app = document.querySelector('#app')._x_dataStack[0];
+          app._ensureChatMux = async () => true;
           app.pendingImages.push({
             id: 'recover-image', mime: 'image/png', preview: 'data:image/png;base64,',
             uploading: false, error: false,
@@ -240,14 +506,16 @@ def test_ticket_failure_restores_draft_and_idle_state(
           return {
             returned,
             input: app.input,
-            streaming: app.streaming,
+            streaming: app._ensureTabState(app.currentId).streaming,
             pending: record.pending,
             storedText: record.text,
             imageIds: app.pendingImages.map(item => item.id),
             docIds: app.pendingDocs.map(item => item.id),
-            bubbleCount: app.messages.filter(
+            bubbleCount: app._ensureTabState(app.currentId).messages.filter(
               m => m.role === 'user' && m.text === 'ticket-failure-recovered'
             ).length,
+            claimToken: app.tabState[app.currentId]._composerSubmitToken,
+            claimPhase: app.tabState[app.currentId]._composerSubmitPhase,
             hasToast: app.toasts.some(t => t.msg.includes('发送失败')
               || t.msg.includes('Send failed')),
           };
@@ -263,6 +531,8 @@ def test_ticket_failure_restores_draft_and_idle_state(
         "imageIds": ["recover-image"],
         "docIds": ["recover-doc"],
         "bubbleCount": 0,
+        "claimToken": None,
+        "claimPhase": "",
         "hasToast": True,
     }
     assert not page.locator("#jserr").is_visible()
@@ -397,6 +667,113 @@ def test_send_upload_wait_is_owned_by_starting_tab(
     assert settled == [False, False, False]
 
 
+def test_composer_internal_phases_stay_hidden_and_busy_states_still_queue(
+        page: Page, backend_url, auth_token):
+    _login(page, backend_url, auth_token)
+    page.locator(".chat-input-textarea").fill("NEXT")
+    page.evaluate(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const st = app._ensureTabState(app.currentId);
+          app.lang = 'en';
+          app._modelsLoaded = true;
+          app.availableModels = [{model: 'fake-model', group: 'test'}];
+          st.compacting = true;
+        }"""
+    )
+    send = page.locator(".chat-toolbar-queue")
+    expect(send).to_be_enabled()
+    expect(page.locator("#composer-send-status")).to_have_count(0)
+    assert "queue" in (send.get_attribute("title") or "").lower()
+
+    states = page.evaluate(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const st = app.tabState[app.currentId];
+          const reason = phase => {
+            st._composerSubmitToken = 'claim-visible';
+            st._composerSubmitPhase = phase;
+            return app.composerDisabledReason(app.currentId);
+          };
+          const values = {
+            queue: reason('queue'),
+            streamStart: reason('stream_start'),
+            rollover: reason('rollover'),
+          };
+          app._releaseComposerClaim('claim-visible');
+          st.compacting = false;
+          st.draft.pendingDocs = [{id: '', uploading: false, error: true}];
+          values.uploadError = app.composerDisabledReason(app.currentId);
+          values.uploadErrorStatus = app.composerStatusReason(app.currentId);
+          return values;
+        }"""
+    )
+    assert states == {
+        "queue": "",
+        "streamStart": "",
+        "rollover": "",
+        "uploadError": "An attachment failed to upload; remove or re-upload it",
+        "uploadErrorStatus": "An attachment failed to upload; remove or re-upload it",
+    }
+    expect(send).to_be_disabled()
+    expect(page.locator("#composer-send-status")).to_have_count(0)
+
+    empty = page.evaluate(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const st = app.tabState[app.currentId];
+          st.draft.pendingDocs = [];
+          st.draft.input = '';
+          app._activateComposerState(app.currentId);
+          return {
+            disabled: app.composerDisabledReason(app.currentId),
+            status: app.composerStatusReason(app.currentId),
+          };
+        }"""
+    )
+    assert empty == {"disabled": "Type a message to send", "status": ""}
+    expect(send).to_be_disabled()
+    expect(send).to_have_attribute("title", "Type a message to send")
+    expect(send).to_have_attribute("aria-label", "Type a message to send")
+    expect(page.locator("#composer-send-status")).to_have_count(0)
+
+
+def test_composer_and_send_stay_visible_with_tall_content(
+        page: Page, backend_url, auth_token):
+    _login(page, backend_url, auth_token)
+    metrics = page.evaluate(
+        """() => {
+          const body = document.querySelector('.chat-body');
+          const pane = document.querySelector('.pane.chat');
+          const composer = document.querySelector('.chat-input');
+          const send = document.querySelector('.chat-toolbar-queue');
+          const attachments = document.querySelector('.img-attachments');
+          const tall = document.createElement('div');
+          tall.style.height = '6000px';
+          tall.style.flex = '0 0 6000px';
+          body.appendChild(tall);
+          attachments.style.display = 'flex';
+          for (let i = 0; i < 40; i += 1) {
+            const chip = document.createElement('div');
+            chip.className = 'doc-chip';
+            chip.textContent = 'attachment-' + i;
+            attachments.appendChild(chip);
+          }
+          const rect = el => {
+            const r = el.getBoundingClientRect();
+            return {top: r.top, bottom: r.bottom, height: r.height};
+          };
+          return {pane: rect(pane), composer: rect(composer), send: rect(send),
+                  attachments: rect(attachments)};
+        }"""
+    )
+    assert metrics["composer"]["top"] >= metrics["pane"]["top"]
+    assert metrics["composer"]["bottom"] <= metrics["pane"]["bottom"] + 1
+    assert metrics["send"]["top"] >= metrics["composer"]["top"]
+    assert metrics["send"]["bottom"] <= metrics["composer"]["bottom"]
+    assert metrics["attachments"]["height"] <= 132
+
+
 def test_repeated_enter_while_background_busy_submits_one_draft(
         page: Page, backend_url, auth_token):
     """Rapid and repeated Enter events share one composer submission claim."""
@@ -445,7 +822,7 @@ def test_repeated_enter_while_background_busy_submits_one_draft(
     assert page.evaluate(
         "() => document.querySelector('#app')._x_dataStack[0]"
         ".tabState[document.querySelector('#app')._x_dataStack[0].currentId]"
-        "._composerSubmitting") is True
+        "._composerSubmitToken") is not None
     expect(page.locator(".chat-toolbar-queue")).to_be_disabled()
 
     page.evaluate("() => window.__releaseBusy()")
@@ -453,9 +830,13 @@ def test_repeated_enter_while_background_busy_submits_one_draft(
     page.wait_for_function(
         """() => {
           const app = document.querySelector('#app')._x_dataStack[0];
-          return app.tabState[app.currentId]._composerSubmitting === false;
+          return app.tabState[app.currentId]._composerSubmitToken === null;
         }"""
     )
+    # The handoff is intentionally fire-and-forget after queue commit. Join
+    # its observable start before releasing the test-owned promise.
+    page.wait_for_function(
+        "() => typeof window.__releaseHandoff === 'function'")
     result = page.evaluate(
         """() => {
           const app = document.querySelector('#app')._x_dataStack[0];
@@ -472,6 +853,160 @@ def test_repeated_enter_while_background_busy_submits_one_draft(
         "queued": [{"text": "ONLY_ONCE", "displayText": "ONLY_ONCE"}],
         "input": "",
         "draft": "",
+    }
+
+
+def test_server_busy_admission_never_borrows_running_footer(
+        page: Page, backend_url, auth_token):
+    """A 409 admission race shows Queueing without a one-frame Running lie."""
+    _login(page, backend_url, auth_token)
+    page.locator(".chat-input-textarea").fill("QUEUE_ON_409")
+    page.wait_for_function(
+        "() => document.querySelector('#app')._x_dataStack[0].input === 'QUEUE_ON_409'")
+    page.evaluate(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const sid = app.currentId;
+          const st = app._ensureTabState(sid);
+          app.lang = 'zh';
+          app.availableModels = [{model: 'fake-model', group: 'test'}];
+          app._modelsLoaded = true;
+          st.streaming = false;
+          st.backgroundActive = false;
+          st.compacting = false;
+          app._awaitRuntimeSettingPatches = async () => true;
+          app._confirmSessionBusy = async () => false;
+          app._ensureChatMux = async () => true;
+          window.__turnStartCalls = 0;
+          window.__queueCalls = 0;
+          window.__queueGate = new Promise(resolve => {
+            window.__releaseQueuePost = resolve;
+          });
+          window.__acceptedQueueItem = {
+            id: 'q-admission-race',
+            text: 'QUEUE_ON_409',
+            display_text: 'QUEUE_ON_409',
+            image_ids: '',
+            selection_quotes: [],
+            enqueued_at: Date.now(),
+          };
+          const originalFetch = window.fetch.bind(window);
+          window.fetch = async (url, init = {}) => {
+            const value = String(url);
+            const method = (init.method || 'GET').toUpperCase();
+            if (value === '/api/chat/turns/start') {
+              window.__turnStartCalls += 1;
+              return new Response('{}', {
+                status: 409,
+                headers: {'Content-Type': 'application/json'},
+              });
+            }
+            if (value.includes('/api/chat/sessions/') && value.endsWith('/queue')) {
+              if (method === 'POST') {
+                window.__queueCalls += 1;
+                await window.__queueGate;
+                return new Response(JSON.stringify({
+                  item: window.__acceptedQueueItem,
+                  queue: {revision: 11},
+                }), {status: 200, headers: {'Content-Type': 'application/json'}});
+              }
+              return new Response(JSON.stringify({
+                revision: 11,
+                paused: false,
+                items: [window.__acceptedQueueItem],
+              }), {status: 200, headers: {'Content-Type': 'application/json'}});
+            }
+            return originalFetch(url, init);
+          };
+          window.__admissionRaceSend = app.send();
+        }"""
+    )
+    page.wait_for_function("() => window.__queueCalls === 1")
+    expect(page.locator(".optimistic-queue-status")).to_be_visible()
+    expect(page.locator(".optimistic-queue-status")).to_contain_text("排队中")
+    expect(page.locator(".turn-pending-footer")).to_be_hidden()
+    assert page.evaluate("() => window.__turnStartCalls") == 1
+
+    page.evaluate("() => window.__releaseQueuePost()")
+    assert page.evaluate("() => window.__admissionRaceSend") is True
+    page.wait_for_function(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          return app.tabState[app.currentId].pendingQueue.length === 1;
+        }"""
+    )
+    expect(page.locator(".optimistic-queue-status")).to_have_count(0)
+    expect(page.locator(".msg.user.queued")).to_have_count(1)
+    assert page.evaluate("() => window.__queueCalls") == 1
+
+
+def test_image_generation_submit_timeout_and_close_cancel_are_local(
+        page: Page, backend_url, auth_token):
+    """A wedged image submit times out; closing cancels without stale errors."""
+    _login(page, backend_url, auth_token)
+    result = page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          app.lang = 'zh';
+          app.imageGen.prompt = 'timeout probe';
+          app.IMAGE_GEN_SUBMIT_DEADLINE_MS = 25;
+          const toasts = [];
+          app.toast = (...args) => { toasts.push(args); };
+          app.api = async (_path, opts = {}) => await new Promise(resolve => {
+            opts.signal.addEventListener('abort', () => resolve({
+              ok: false, status: 0, error: 'aborted',
+            }), {once: true});
+          });
+          await app.runImageGen();
+          const timeout = {
+            loading: app.imageGen.loading,
+            controller: app.imageGen.submitController,
+            error: app.imageGen.error,
+            errorToasts: toasts.filter(row => row[1] === 'error').length,
+          };
+
+          let closeAborted = false;
+          app.imageGen.show = true;
+          app.imageGen.prompt = 'cancel probe';
+          app.IMAGE_GEN_SUBMIT_DEADLINE_MS = 1000;
+          app.api = async (_path, opts = {}) => await new Promise(resolve => {
+            opts.signal.addEventListener('abort', () => {
+              closeAborted = true;
+              resolve({ok: false, status: 0, error: 'aborted'});
+            }, {once: true});
+          });
+          const beforeCloseToastCount = toasts.length;
+          const pending = app.runImageGen();
+          app.closeImageGen();
+          await pending;
+          return {
+            timeout,
+            close: {
+              aborted: closeAborted,
+              show: app.imageGen.show,
+              loading: app.imageGen.loading,
+              controller: app.imageGen.submitController,
+              error: app.imageGen.error,
+              newToasts: toasts.length - beforeCloseToastCount,
+            },
+          };
+        }"""
+    )
+    assert result == {
+        "timeout": {
+            "loading": False,
+            "controller": None,
+            "error": "提交确认超时，请先刷新历史记录，确认后再重试",
+            "errorToasts": 1,
+        },
+        "close": {
+            "aborted": True,
+            "show": False,
+            "loading": False,
+            "controller": None,
+            "error": "",
+            "newToasts": 0,
+        },
     }
 
 
@@ -531,7 +1066,7 @@ def test_background_send_resolves_before_runtime_handoff(
           return {
             order: window.__sendOrder,
             input: app.input,
-            submitting: app.tabState[app.currentId]._composerSubmitting,
+            submitting: !!app.tabState[app.currentId]._composerSubmitToken,
           };
         }"""
     )
@@ -624,10 +1159,10 @@ def test_background_handoff_during_queue_post_settles_successor_composer(
           const app = document.querySelector('#app')._x_dataStack[0];
           const st = app.tabState[app.currentId];
           return {input: app.input, draft: st.draft.input,
-                  submitting: st._composerSubmitting};
+                  submitting: !!st._composerSubmitToken};
         }"""
     )
-    assert before == {"input": "RACE_ONCE", "draft": "RACE_ONCE", "submitting": True}
+    assert before == {"input": "", "draft": "", "submitting": True}
 
     result = page.evaluate(
         """async () => {
@@ -637,7 +1172,7 @@ def test_background_handoff_during_queue_post_settles_successor_composer(
           const app = document.querySelector('#app')._x_dataStack[0];
           const st = app.tabState[app.currentId];
           return {input: app.input, draft: st.draft.input,
-                  submitting: st._composerSubmitting,
+                  submitting: !!st._composerSubmitToken,
                   token: st._composerSubmitToken, queueCalls: window.__queueCalls,
                   queueIds: st.pendingQueue.map(item => item.id),
                   attachSids: window.__attachSids};
@@ -839,6 +1374,109 @@ def test_workspace_picker_switches_files_preview_and_conversation_together(
     )
 
 
+def test_workspace_registry_and_order_requests_do_not_disable_chat(
+        page: Page, backend_url, auth_token):
+    """Registry/order persistence owns its controls, never the composer."""
+    _login(page, backend_url, auth_token)
+    page.locator(".chat-input-textarea").fill("CHAT_STAYS_READY")
+    page.wait_for_function(
+        "() => document.querySelector('#app')._x_dataStack[0].input === 'CHAT_STAYS_READY'")
+    page.evaluate(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          app.availableModels = [{model: 'fake-model', group: 'test'}];
+          app._modelsLoaded = true;
+          app.fetchSessionWorkspaces = async () => app.sessionWorkspaces;
+          app._refreshSessionsAfterWorkspaceRegistryChange = async () => true;
+          window.__registryGate = new Promise(resolve => {
+            window.__releaseRegistry = resolve;
+          });
+          window.__orderGate = new Promise(resolve => {
+            window.__releaseOrder = resolve;
+          });
+          window.__registryCalls = 0;
+          window.__orderCalls = 0;
+          const originalFetch = window.fetch.bind(window);
+          window.fetch = async (url, init = {}) => {
+            const value = String(url);
+            const method = (init.method || 'GET').toUpperCase();
+            if (value === '/api/chat/workspaces' && method === 'POST') {
+              window.__registryCalls += 1;
+              await window.__registryGate;
+              return new Response(JSON.stringify({
+                path: '/registry-only', name: 'registry-only', primary: false,
+              }), {status: 200, headers: {'Content-Type': 'application/json'}});
+            }
+            if (value === '/api/chat/workspaces/order' && method === 'PUT') {
+              window.__orderCalls += 1;
+              await window.__orderGate;
+              return new Response(JSON.stringify({
+                workspaces: app.sessionWorkspaces,
+              }), {status: 200, headers: {'Content-Type': 'application/json'}});
+            }
+            return originalFetch(url, init);
+          };
+          window.__registryPromise = app._registerWorkspacePath('/registry-only');
+        }"""
+    )
+    page.wait_for_function("() => window.__registryCalls === 1")
+    registry_state = page.evaluate(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          return {
+            registryBusy: app.workspaceRegistryBusy,
+            switching: app.workspaceSwitching,
+            reason: app.composerStatusReason(app.currentId),
+            sendDisabled: document.querySelector('.chat-toolbar-send').disabled,
+          };
+        }"""
+    )
+    assert registry_state == {
+        "registryBusy": True,
+        "switching": False,
+        "reason": "",
+        "sendDisabled": False,
+    }
+    page.evaluate("() => window.__releaseRegistry()")
+    page.evaluate("() => window.__registryPromise")
+
+    page.evaluate(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const fake = {path: '/order-only', name: 'order-only', primary: false};
+          app.sessionWorkspaces = [...app.sessionWorkspaces, fake];
+          const current = app.sessionWorkspaces.map(row => row.path);
+          app.workspaceDrag = {
+            path: current[0],
+            overPath: current[0],
+            pointerId: null,
+            originalPaths: [...current].reverse(),
+          };
+          window.__orderPromise = app.finishWorkspaceDrag();
+        }"""
+    )
+    page.wait_for_function("() => window.__orderCalls === 1")
+    order_state = page.evaluate(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          return {
+            orderSaving: app.workspaceOrderSaving,
+            switching: app.workspaceSwitching,
+            reason: app.composerStatusReason(app.currentId),
+            sendDisabled: document.querySelector('.chat-toolbar-send').disabled,
+          };
+        }"""
+    )
+    assert order_state == {
+        "orderSaving": True,
+        "switching": False,
+        "reason": "",
+        "sendDisabled": False,
+    }
+    page.evaluate("() => window.__releaseOrder()")
+    page.evaluate("() => window.__orderPromise")
+
+
 def test_workspace_switch_overlaps_tree_sessions_and_transcript_without_early_activation(
         page: Page, backend_url, auth_token):
     """Cold switch latency is max(tree, sessions+transcript), not their sum."""
@@ -873,6 +1511,7 @@ def test_workspace_switch_overlaps_tree_sessions_and_transcript_without_early_ac
             savePrefs: app.savePrefs,
             persist: app._scheduleWorkspaceTreePersist,
             toast: app.toast,
+            openActivityCenter: app.openActivityCenter,
           };
           const events = {};
           const opened = [];
@@ -913,10 +1552,14 @@ def test_workspace_switch_overlaps_tree_sessions_and_transcript_without_early_ac
             events.currentAtPreloadEnd = app.currentId;
             return sid === targetId;
           };
-          app.openTab = async sid => {
+          app.openTab = async (sid, makeCurrent = true, options = {}) => {
             events.currentBeforeOpen = app.currentId;
+            events.openOptions = {...options};
             opened.push(sid);
-            app.currentId = sid;
+            if (makeCurrent) app.currentId = sid;
+            const loading = app._ensureSessionLoaded(sid);
+            if (options.deferLoad) void loading;
+            else await loading;
           };
           app.newSession = () => { newCount += 1; };
           app._startFileEvents = () => {};
@@ -928,6 +1571,11 @@ def test_workspace_switch_overlaps_tree_sessions_and_transcript_without_early_ac
             const started = performance.now();
             await app.switchWorkspace(targetPath);
             const elapsed = performance.now() - started;
+            events.switchEnd = performance.now();
+            events.activityClicks = 0;
+            app.openActivityCenter = () => { events.activityClicks += 1; };
+            document.querySelector('.activity-center-btn').click();
+            await Promise.resolve();
             return {
               elapsed, events, originalCurrent, targetId,
               current: app.currentId, opened, newCount,
@@ -949,24 +1597,31 @@ def test_workspace_switch_overlaps_tree_sessions_and_transcript_without_early_ac
             app.savePrefs = originals.savePrefs;
             app._scheduleWorkspaceTreePersist = originals.persist;
             app.toast = originals.toast;
+            app.openActivityCenter = originals.openActivityCenter;
           }
         }"""
     )
+    # Alpine schedules the declared 120 ms leave transition across animation
+    # frames. Wait for its observable DOM end state instead of assuming a
+    # fixed wall-clock delay is enough on a loaded headless CI runner.
+    page.wait_for_function(
+        """() => getComputedStyle(document.querySelector(
+          '.workspace-switch-shield'
+        )).display === 'none'""",
+        timeout=2000,
+    )
     events = result["events"]
-    tree_duration = events["treeEnd"] - events["treeStart"]
-    target_duration = events["preloadEnd"] - events["sessionsStart"]
-    concurrent_duration = max(events["treeEnd"], events["preloadEnd"]) \
-        - min(events["treeStart"], events["sessionsStart"])
     assert abs(events["treeStart"] - events["sessionsStart"]) < 75
-    assert events["preloadStart"] < events["treeEnd"]
-    # Measure the network/preload window directly.  ``elapsed`` also includes
-    # synchronous Alpine surface teardown/capture before either mocked request
-    # starts, which grows under a CPU-starved browser and is unrelated to
-    # whether these two I/O chains overlap.
-    assert concurrent_duration < tree_duration + target_duration - 80
-    assert events["currentAtPreloadStart"] == result["originalCurrent"]
-    assert events["currentAtPreloadEnd"] == result["originalCurrent"]
+    # Tree bootstrap and transcript loading continue behind pane-local state.
+    # Neither may extend the global shield/composer-disabled transition.
+    if "treeEnd" in events:
+        assert events["switchEnd"] < events["treeEnd"]
+    if "preloadEnd" in events:
+        assert events["switchEnd"] < events["preloadEnd"]
+    assert events["currentAtPreloadStart"] == result["targetId"]
     assert events["shieldDuringPreload"] is True
+    assert events["activityClicks"] == 1
+    assert events["openOptions"]["deferLoad"] is True
     assert events["currentBeforeOpen"] == result["originalCurrent"]
     assert events["preloadedSid"] == result["targetId"]
     assert result["stalePresent"] is False
@@ -979,73 +1634,104 @@ def test_workspace_switch_overlaps_tree_sessions_and_transcript_without_early_ac
 
 def test_concurrent_session_list_does_not_advance_an_older_transcript_revision(
         page: Page, backend_url, auth_token):
-    """A U2 list racing a U1 transcript must schedule a canonical retry."""
+    """A U2 list queued behind a U1 transcript must run a canonical retry."""
     _login(page, backend_url, auth_token)
     result = page.evaluate(
         """async () => {
           const app = document.querySelector('#app')._x_dataStack[0];
           const sid = app.currentId;
-          const meta = app.sessions.find(row => row.id === sid);
-          const st = app._ensureTabState(sid);
-          if (st._reconcilePromise) await st._reconcilePromise;
           if (app._sessionsSyncTimer) clearInterval(app._sessionsSyncTimer);
           app._sessionsSyncTimer = null;
+          // Let the login-time list owner settle before installing synthetic
+          // revisions; otherwise its late response can overwrite this fixture.
+          if (app._sessionListPullPromise) {
+            try { await app._sessionListPullPromise; } catch (_) {}
+          }
+          const meta = app.sessions.find(row => row.id === sid);
+          const st = app._ensureTabState(sid);
+          const settleDeadline = performance.now() + 3000;
+          while ((st.messagesLoading || st.sessionSync.inFlight
+                  || Object.keys(st.sessionSync.pending || {}).length)
+                 && performance.now() < settleDeadline) {
+            await new Promise(resolve => setTimeout(resolve, 20));
+          }
+          if (st.messagesLoading || st.sessionSync.inFlight
+              || Object.keys(st.sessionSync.pending || {}).length) {
+            throw new Error(
+              "initial session synchronization did not settle");
+          }
+          app._disposeSessionSync(st);
           const originals = {
             loadSession: app.loadSession,
             updatedAt: meta.updated_at,
+            active: meta.active,
+            turnActive: meta.turn_active,
+            backgroundActive: meta.background_active,
             seen: st._seenUpdated,
             target: st._reconcileTargetUpdated,
             pending: st._pendingExternalUpdate,
             loaded: st._loaded,
           };
-          let retryLoads = 0;
+          let loadCalls = 0;
+          let releaseOlder;
+          let markOlderStarted;
+          const olderGate = new Promise(resolve => { releaseOlder = resolve; });
+          const olderStarted = new Promise(resolve => { markOlderStarted = resolve; });
           meta.updated_at = 20;
+          meta.active = false;
+          meta.turn_active = false;
+          meta.background_active = false;
           st._seenUpdated = 10;
           st._reconcileTargetUpdated = 10;
           st._pendingExternalUpdate = false;
           st._loaded = true;
           st.streaming = false;
           st.es = null;
-          const olderTranscript = new Promise(resolve => {
-            setTimeout(() => {
-              st._seenUpdated = 11;
-              delete app._sessionLoadPromises[sid];
-              resolve(true);
-            }, 20);
-          });
-          app._sessionLoadPromises[sid] = olderTranscript;
           app.loadSession = async requested => {
-            retryLoads += 1;
+            loadCalls += 1;
+            if (loadCalls === 1) {
+              markOlderStarted();
+              await olderGate;
+              st._seenUpdated = 11;
+              return requested === sid;
+            }
             if (requested === sid) st._seenUpdated = 20;
             return requested === sid;
           };
           try {
+            const olderTranscript = app._requestSessionSync(sid, 'history_load');
+            await olderStarted;
             app._reconcileOpenSession([meta]);
-            const first = st._reconcilePromise;
-            await first;
+            const queuedBeforeRelease =
+              !!st.sessionSync.pending.history_revision;
+            releaseOlder();
+            await olderTranscript;
             const afterFirst = {
               seen: st._seenUpdated,
               pending: st._pendingExternalUpdate,
-              retryScheduled: !!st._reconcileRetryTimer,
+              retryQueued: !!st.sessionSync.pending.history_revision,
             };
             const deadline = performance.now() + 1500;
-            while ((retryLoads < 1 || st._reconcilePromise
-                    || st._reconcileRetryTimer)
+            while ((loadCalls < 2 || st.sessionSync.inFlight
+                    || st.sessionSync.pending.history_revision)
                    && performance.now() < deadline) {
               await new Promise(resolve => setTimeout(resolve, 20));
             }
             return {
+              queuedBeforeRelease,
               afterFirst,
               finalSeen: st._seenUpdated,
               finalPending: st._pendingExternalUpdate,
-              retryLoads,
+              loadCalls,
             };
           } finally {
+            releaseOlder();
+            app._disposeSessionSync(st);
             app.loadSession = originals.loadSession;
-            delete app._sessionLoadPromises[sid];
-            if (st._reconcileRetryTimer) clearTimeout(st._reconcileRetryTimer);
-            st._reconcileRetryTimer = null;
             meta.updated_at = originals.updatedAt;
+            meta.active = originals.active;
+            meta.turn_active = originals.turnActive;
+            meta.background_active = originals.backgroundActive;
             st._seenUpdated = originals.seen;
             st._reconcileTargetUpdated = originals.target;
             st._pendingExternalUpdate = originals.pending;
@@ -1053,15 +1739,15 @@ def test_concurrent_session_list_does_not_advance_an_older_transcript_revision(
           }
         }"""
     )
+    assert result["queuedBeforeRelease"] is True
     assert result["afterFirst"] == {
         "seen": 11,
-        "pending": True,
-        "retryScheduled": True,
+        "pending": False,
+        "retryQueued": True,
     }
-    assert result["retryLoads"] == 1
+    assert result["loadCalls"] == 2
     assert result["finalSeen"] == 20
     assert result["finalPending"] is False
-
 
 def test_workspace_folder_browser_is_fullscreen_and_navigable_on_mobile(
         page: Page, backend_url, auth_token, tmp_path):

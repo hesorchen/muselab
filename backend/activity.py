@@ -25,6 +25,7 @@ _GROUP_COLORS = frozenset({
 })
 _TERMINAL = {"completed", "failed", "cancelled"}
 _ACTIVE = {"running", "waiting_approval", "paused"}
+_UNSET = object()
 
 
 def _activity_at(item: dict[str, Any]) -> float:
@@ -101,7 +102,7 @@ class ActivityService:
             asyncio.Queue[dict[str, Any]], asyncio.AbstractEventLoop
         ] = {}
         self._initialized = False
-        self._custom_groups: list[dict[str, str]] = []
+        self._custom_groups: list[dict[str, Any]] = []
         self._group_assignments: dict[str, str] = {}
         self._group_order: list[str] = [_UNGROUPED_GROUP_ID]
         self._events: list[dict[str, Any]] = []
@@ -137,6 +138,12 @@ class ActivityService:
                         needs_attention=False,
                         read=False,
                     )
+                    # Activity owners are process-local lifecycle claims. Once a
+                    # restart terminalizes the row, retaining them lets the next
+                    # turn inherit dead owners and remain running after its real
+                    # owner finishes.
+                    item.pop("owner_id", None)
+                    item.pop("active_owner_ids", None)
                     changed = True
             if changed:
                 self._save()
@@ -208,7 +215,7 @@ class ActivityService:
 
     def _load_group_state(
         self,
-    ) -> tuple[list[dict[str, str]], dict[str, str], list[str]]:
+    ) -> tuple[list[dict[str, Any]], dict[str, str], list[str]]:
         try:
             raw = json.loads(self.groups_path.read_text(encoding="utf-8"))
         except FileNotFoundError:
@@ -228,7 +235,7 @@ class ActivityService:
                 or not isinstance(source_order, list)):
             raise RuntimeError("invalid activity group state")
 
-        groups: list[dict[str, str]] = []
+        groups: list[dict[str, Any]] = []
         seen: set[str] = set()
         for row in source_groups[:_MAX_CUSTOM_GROUPS]:
             if not isinstance(row, dict):
@@ -241,8 +248,18 @@ class ActivityService:
                 color = self._group_color(row.get("color"))
             except ValueError:
                 continue
+            group: dict[str, Any] = {
+                "id": group_id,
+                "name": name,
+                "color": color,
+            }
+            workspace_id = str(row.get("workspace_id") or "").strip()
+            workspace_path = str(row.get("workspace_path") or "").strip()
+            if workspace_id and workspace_path:
+                group["workspace_id"] = workspace_id
+                group["workspace_path"] = workspace_path
             seen.add(group_id)
-            groups.append({"id": group_id, "name": name, "color": color})
+            groups.append(group)
 
         assignments = {
             str(sid): str(group_id)
@@ -274,13 +291,13 @@ class ActivityService:
         self._ensure_writes_available()
         self.ensure_private_storage()
         atomic_write_text(self.groups_path, json.dumps({
-            "version": 2,
+            "version": 3,
             "groups": self._custom_groups,
             "assignments": self._group_assignments,
             "order": self._group_order,
         }, ensure_ascii=False, indent=2), mode=0o600)
 
-    def _group_payload_locked(self) -> list[dict[str, str]]:
+    def _group_payload_locked(self) -> list[dict[str, Any]]:
         return [dict(group) for group in self._custom_groups]
 
     def _group_order_payload_locked(self) -> list[str]:
@@ -323,7 +340,7 @@ class ActivityService:
             item["group_order"] = index
 
     def _group_event_snapshot_locked(self) -> tuple[
-        list[dict[str, Any]], list[dict[str, str]], dict[str, str], list[str]
+        list[dict[str, Any]], list[dict[str, Any]], dict[str, str], list[str]
     ]:
         return (
             copy.deepcopy(self._events),
@@ -335,7 +352,7 @@ class ActivityService:
     def _save_group_event_state_locked(
         self,
         snapshot: tuple[
-            list[dict[str, Any]], list[dict[str, str]], dict[str, str], list[str]
+            list[dict[str, Any]], list[dict[str, Any]], dict[str, str], list[str]
         ],
     ) -> None:
         old_events, old_groups, old_assignments, old_order = snapshot
@@ -344,7 +361,7 @@ class ActivityService:
             "version": 1,
             "events": old_events,
             "group_state": {
-                "version": 2,
+                "version": 3,
                 "groups": old_groups,
                 "assignments": old_assignments,
                 "order": old_order,
@@ -452,7 +469,12 @@ class ActivityService:
         loops and delivery crosses the boundary via ``call_soon_threadsafe``.
         """
         self._revision += 1
-        summary = _summarize([dict(x) for x in self._events])
+        # SSE and HTTP must summarize the same visible ledger. Keeping deleted
+        # sessions in the durable audit trail is fine, but letting their unread
+        # terminal rows leak only through SSE resurrects a green completion dot
+        # while every openable Activity row is still running.
+        visible_events = self._filter_live([dict(x) for x in self._events])
+        summary = _summarize(visible_events)
         summary["generation"] = self._generation
         summary["revision"] = self._revision
         payload: dict[str, Any] = {
@@ -534,6 +556,50 @@ class ActivityService:
         return next((x for x in reversed(self._events)
                      if x.get("session_id") == sid), None)
 
+    @staticmethod
+    def _active_owner_ids(item: dict[str, Any]) -> list[str]:
+        values = item.get("active_owner_ids")
+        if not isinstance(values, list):
+            return []
+        return list(dict.fromkeys(
+            str(value)[:200] for value in values if str(value or "").strip()
+        ))
+
+    def _latest_by_owner(self, owner_id: str) -> dict[str, Any] | None:
+        owner = str(owner_id or "")[:200]
+        if not owner:
+            return None
+        return next((
+            item for item in reversed(self._events)
+            if item.get("owner_id") == owner
+            or owner in self._active_owner_ids(item)
+        ), None)
+
+    def _live_session_ids(self) -> set[str]:
+        """Session ids the frontend can still open.
+
+        ``sessions.list_sessions()`` already excludes deleted sessions and rows
+        owned by a removed workspace — exactly the sessions a task-center click
+        would fail to open. Matching it here keeps the activity center from
+        showing (and erroring on) phantom rows.
+        """
+        return {
+            str(s.get("id"))
+            for s in sessions.list_sessions()
+            if s.get("id")
+        }
+
+    def _filter_live(self, events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Drop ledger rows whose backing session no longer opens. Anonymous
+        rows (no session_id) are always kept."""
+        if not events:
+            return []
+        live = self._live_session_ids()
+        return [
+            x for x in events
+            if not x.get("session_id") or str(x.get("session_id")) in live
+        ]
+
     def start(
         self,
         sid: str,
@@ -553,6 +619,10 @@ class ActivityService:
                 item = {"id": uuid.uuid4().hex, "session_id": sid,
                         "turn_count": 0}
                 self._events.append(item)
+            inherited_owners = (
+                self._active_owner_ids(item)
+                if item.get("state") in _ACTIVE else []
+            )
             item.update(
                 kind=(kind or "turn")[:40],
                 # Chat turns use this delivery-class field to distinguish a
@@ -576,9 +646,17 @@ class ActivityService:
             else:
                 item.pop("source_id", None)
             if owner_id:
-                item["owner_id"] = owner_id[:200]
+                owner = owner_id[:200]
+                item["owner_id"] = owner
+                if inherited_owners:
+                    item["active_owner_ids"] = list(dict.fromkeys(
+                        [*inherited_owners, owner]
+                    ))
+                else:
+                    item.pop("active_owner_ids", None)
             else:
                 item.pop("owner_id", None)
+                item.pop("active_owner_ids", None)
             self._events = self._events[-_MAX_EVENTS:]
             self._save()
             self._publish_locked(item=item)
@@ -629,6 +707,12 @@ class ActivityService:
             "cancelled" if status in {"cancelled", "interrupted"} else "failed")
         with self._lock:
             item = self._latest(sid)
+            if item is None and owner_id:
+                # A successor moves the visible Activity row to its child SID,
+                # while the inherited watcher still settles through the source
+                # SID. Resolve that durable logical owner before treating the
+                # finish as an orphan.
+                item = self._latest_by_owner(owner_id)
             if item is None:
                 # A normal owner may only close the Activity incarnation it
                 # successfully started. If its start failed before persisting
@@ -648,10 +732,24 @@ class ActivityService:
                 item = self._latest(sid)
             assert item is not None
             # A detached watcher can finish after a newer foreground turn has
-            # reused this session row. Only the owner that started the current
-            # incarnation may close it; deletion intentionally omits owner_id
-            # to force a terminal state for whichever incarnation remains.
-            if owner_id and item.get("owner_id") != owner_id:
+            # reused this session row. Ordinary rows still have one replaceable
+            # owner. Successor inheritance promotes that owner into a small set,
+            # because the child may run a foreground turn while predecessor-owned
+            # background work remains active.
+            active_owners = self._active_owner_ids(item)
+            if owner_id and active_owners:
+                owner = owner_id[:200]
+                if owner not in active_owners:
+                    return dict(item)
+                remaining_owners = [value for value in active_owners if value != owner]
+                if remaining_owners:
+                    item["active_owner_ids"] = remaining_owners
+                    if item.get("owner_id") == owner:
+                        item["owner_id"] = remaining_owners[-1]
+                    self._save()
+                    return dict(item)
+                item.pop("active_owner_ids", None)
+            elif owner_id and item.get("owner_id") != owner_id:
                 return dict(item)
             owner_revoked = False
             if not owner_id:
@@ -659,6 +757,8 @@ class ActivityService:
                 # Revoke the current incarnation so its late ordinary owner can
                 # no longer overwrite this authoritative terminal state.
                 owner_revoked = item.pop("owner_id", None) is not None
+                owner_revoked = item.pop("active_owner_ids", None) is not None \
+                    or owner_revoked
             # Terminal delivery can be observed by more than one cleanup path
             # (for example the Result boundary and an outer pump fallback).
             # Repeating the same terminal state must be a true no-op: rewriting
@@ -686,12 +786,10 @@ class ActivityService:
             now = time.time()
             if activity_source:
                 item["activity_source"] = activity_source[:40]
-            # Background logical turns surface their result as a normal Agent
-            # bubble in chat.  Their Activity row remains useful history, but
-            # must become terminal+read in this same locked mutation: publishing
-            # an unread finish and ACKing it afterwards exposes a transient red
-            # badge to SSE clients.  Other callers retain the established unread
-            # completion/failure semantics by leaving ``mark_read`` unspecified.
+            # Callers may atomically finish as read when the result was already
+            # visible to the user. Otherwise completion/failure retains the normal
+            # unread-result semantics; the frontend ACKs a visibly mounted session
+            # after receiving the terminal Activity transition.
             terminal_read = (
                 bool(mark_read) if mark_read is not None
                 else state == "cancelled"
@@ -705,21 +803,29 @@ class ActivityService:
             self._publish_locked(item=item)
             return dict(item)
 
-    def list(self, limit: int = 100) -> list[dict[str, Any]]:
+    def list(self, limit: int = 100, *, filter_live: bool = False) -> list[dict[str, Any]]:
         self.initialize_runtime_state()
         with self._lock:
-            events = sorted(self._events, key=_activity_at, reverse=True)
-            return [dict(x) for x in events[:min(max(limit, 1), _MAX_EVENTS)]]
+            events = [dict(x) for x in self._events]
+        if filter_live:
+            events = self._filter_live(events)
+        events.sort(key=_activity_at, reverse=True)
+        return events[:min(max(limit, 1), _MAX_EVENTS)]
 
-    def summary(self) -> dict[str, Any]:
+    def summary(self, *, filter_live: bool = False) -> dict[str, Any]:
         self.initialize_runtime_state()
         with self._lock:
-            result = _summarize([dict(x) for x in self._events])
-            result["generation"] = self._generation
-            result["revision"] = self._revision
-            return result
+            events = [dict(x) for x in self._events]
+            generation = self._generation
+            revision = self._revision
+        if filter_live:
+            events = self._filter_live(events)
+        result = _summarize(events)
+        result["generation"] = generation
+        result["revision"] = revision
+        return result
 
-    def snapshot(self, limit: int = 100) -> dict[str, Any]:
+    def snapshot(self, limit: int = 100, *, filter_live: bool = False) -> dict[str, Any]:
         """Return rows and counters from the same locked ledger snapshot."""
         self.initialize_runtime_state()
         with self._lock:
@@ -728,10 +834,12 @@ class ActivityService:
             group_order = self._group_order_payload_locked()
             generation = self._generation
             revision = self._revision
-        ordered = sorted(events, key=_activity_at, reverse=True)
+        if filter_live:
+            events = self._filter_live(events)
         summary = _summarize(events)
         summary["generation"] = generation
         summary["revision"] = revision
+        ordered = sorted(events, key=_activity_at, reverse=True)
         return {
             "events": ordered[:min(max(limit, 1), _MAX_EVENTS)],
             "summary": summary,
@@ -739,7 +847,7 @@ class ActivityService:
             "group_order": group_order,
         }
 
-    def list_groups(self) -> list[dict[str, str]]:
+    def list_groups(self) -> list[dict[str, Any]]:
         self.initialize_runtime_state()
         with self._lock:
             return self._group_payload_locked()
@@ -752,21 +860,35 @@ class ActivityService:
                 "group_order": self._group_order_payload_locked(),
             }
 
-    def create_group(self, name: str, color: str = "blue") -> dict[str, Any]:
+    def create_group(
+        self,
+        name: str,
+        color: str = "blue",
+        *,
+        workspace_id: str | None = None,
+        workspace_path: str | None = None,
+    ) -> dict[str, Any]:
         self.initialize_runtime_state()
         clean_name = self._group_name(name)
         clean_color = self._group_color(color)
+        clean_workspace_id = str(workspace_id or "").strip()
+        clean_workspace_path = str(workspace_path or "").strip()
+        if bool(clean_workspace_id) != bool(clean_workspace_path):
+            raise ValueError("workspace binding is incomplete")
         with self._lock:
             if len(self._custom_groups) >= _MAX_CUSTOM_GROUPS:
                 raise ValueError("too many custom groups")
             if any(group["name"].casefold() == clean_name.casefold()
                    for group in self._custom_groups):
                 raise ValueError("group name already exists")
-            group = {
+            group: dict[str, Any] = {
                 "id": uuid.uuid4().hex,
                 "name": clean_name,
                 "color": clean_color,
             }
+            if clean_workspace_id:
+                group["workspace_id"] = clean_workspace_id
+                group["workspace_path"] = clean_workspace_path
             self._custom_groups.append(group)
             ungrouped_at = self._group_order.index(_UNGROUPED_GROUP_ID)
             self._group_order.insert(ungrouped_at, group["id"])
@@ -786,8 +908,12 @@ class ActivityService:
         *,
         name: str | None = None,
         color: str | None = None,
+        workspace_id: Any = _UNSET,
+        workspace_path: Any = _UNSET,
     ) -> dict[str, Any] | None:
         self.initialize_runtime_state()
+        if (workspace_id is _UNSET) != (workspace_path is _UNSET):
+            raise ValueError("workspace binding is incomplete")
         with self._lock:
             group = next((row for row in self._custom_groups
                           if row["id"] == group_id), None)
@@ -803,8 +929,31 @@ class ActivityService:
                    and row["name"].casefold() == clean_name.casefold()
                    for row in self._custom_groups):
                 raise ValueError("group name already exists")
-            changed = group["name"] != clean_name or group["color"] != clean_color
+            clean_workspace_id = ""
+            clean_workspace_path = ""
+            binding_changed = False
+            if workspace_id is not _UNSET:
+                clean_workspace_id = str(workspace_id or "").strip()
+                clean_workspace_path = str(workspace_path or "").strip()
+                if bool(clean_workspace_id) != bool(clean_workspace_path):
+                    raise ValueError("workspace binding is incomplete")
+                binding_changed = (
+                    str(group.get("workspace_id") or ""),
+                    str(group.get("workspace_path") or ""),
+                ) != (clean_workspace_id, clean_workspace_path)
+            changed = (
+                group["name"] != clean_name
+                or group["color"] != clean_color
+                or binding_changed
+            )
             group.update(name=clean_name, color=clean_color)
+            if workspace_id is not _UNSET:
+                if clean_workspace_id:
+                    group["workspace_id"] = clean_workspace_id
+                    group["workspace_path"] = clean_workspace_path
+                else:
+                    group.pop("workspace_id", None)
+                    group.pop("workspace_path", None)
             if changed:
                 self._save_group_state()
                 self._publish_locked()
@@ -994,6 +1143,101 @@ class ActivityService:
                 "group_order": self._group_order_payload_locked(),
             }
 
+    def inherit_session(
+        self,
+        source_sid: str,
+        child_sid: str,
+        *,
+        successor: bool = False,
+    ) -> dict[str, Any]:
+        """Inherit a fork's durable group placement and optional activity row.
+
+        Ordinary forks copy only the custom-group assignment: the source remains
+        an independent conversation and the child gets its own row on first use.
+        A true successor (for example compact recovery) moves the existing row,
+        preserving its id, ordering, pin/read state and turn lineage.  The shared
+        group/event journal makes the mutation atomic, while the child-key checks
+        make a committed retry a no-op.
+        """
+        self.initialize_runtime_state()
+        source = str(source_sid or "").strip()
+        child = str(child_sid or "").strip()
+        if not source or not child or source == child:
+            raise ValueError("distinct source and child sessions are required")
+        child_name, _, _ = self._metadata(child)
+        with self._lock:
+            source_item = self._latest(source)
+            child_item = self._latest(child)
+            source_group = self._group_assignments.get(source, "")
+            child_group = self._group_assignments.get(child, "")
+
+            if child_group and source_group and child_group != source_group:
+                raise ValueError("child activity group already differs from source")
+            if successor and source_item is not None and child_item is not None:
+                raise ValueError("child activity lineage already exists")
+
+            snapshot = self._group_event_snapshot_locked()
+            changed = False
+            if source_group and not child_group:
+                self._group_assignments[child] = source_group
+                changed = True
+            if successor:
+                if source_item is not None:
+                    # A running predecessor watcher keeps settling with its old
+                    # SID/owner after this row moves to the child. Preserve that
+                    # owner explicitly so a child foreground turn can coexist
+                    # without completing the shared logical task prematurely.
+                    inherited_owners = self._active_owner_ids(source_item)
+                    current_owner = str(source_item.get("owner_id") or "")[:200]
+                    if source_item.get("state") in _ACTIVE and current_owner:
+                        if current_owner not in inherited_owners:
+                            inherited_owners.append(current_owner)
+                        source_item["active_owner_ids"] = inherited_owners
+                    source_item["session_id"] = child
+                    source_item.pop("thread_id", None)
+                    source_item["session_name"] = child_name
+                    child_item = source_item
+                    changed = True
+                if source in self._group_assignments:
+                    self._group_assignments.pop(source, None)
+                    changed = True
+
+            if changed:
+                self._save_group_event_state_locked(snapshot)
+                if successor and child_item is not None:
+                    self._publish_locked(item=child_item)
+            return {
+                "generation": self._generation,
+                "revision": self._revision,
+                "item": dict(child_item) if child_item is not None else None,
+                "group_id": self._group_assignments.get(child, ""),
+                "successor": successor,
+            }
+
+    def discard_session(self, sid: str) -> bool:
+        """Remove a provisional child's Activity projection transactionally."""
+        self.initialize_runtime_state()
+        target = str(sid or "").strip()
+        if not target:
+            return False
+        with self._lock:
+            has_assignment = target in self._group_assignments
+            has_event = any(
+                str(item.get("session_id") or item.get("thread_id") or "") == target
+                for item in self._events
+            )
+            if not has_assignment and not has_event:
+                return False
+            snapshot = self._group_event_snapshot_locked()
+            self._group_assignments.pop(target, None)
+            self._events = [
+                item for item in self._events
+                if str(item.get("session_id") or item.get("thread_id") or "") != target
+            ]
+            self._save_group_event_state_locked(snapshot)
+            self._publish_locked(resync=True)
+            return True
+
     def rename_session(self, sid: str, name: str) -> dict[str, Any] | None:
         """Update only the mutable display name for a conversation row.
 
@@ -1019,6 +1263,37 @@ class ActivityService:
                 "revision": self._revision,
                 "item": dict(item),
             }
+
+    def migrate_group_to_successor(
+        self,
+        source_sid: str,
+        successor_sid: str,
+    ) -> bool:
+        """Carry a runtime rollover's activity-group lane onto its fork.
+
+        When a session with pending background work forks a same-named
+        successor (runtime rollover), the source is hidden and the fork keeps
+        running.  If the source had been assigned to a custom activity group,
+        the fork must inherit that lane so the rollover stays invisible to the
+        user instead of surfacing a new ungrouped row.
+        """
+        self.initialize_runtime_state()
+        source_sid = str(source_sid or "")
+        successor_sid = str(successor_sid or "")
+        if not source_sid or not successor_sid or source_sid == successor_sid:
+            return False
+        with self._lock:
+            assigned = self._group_assignments.get(source_sid, "")
+            if not assigned:
+                return False
+            self._group_assignments.pop(source_sid, None)
+            self._group_assignments[successor_sid] = assigned
+            events_changed = self._reconcile_event_groups()
+            if events_changed:
+                self._save()
+            self._save_group_state()
+            self._publish_locked(resync=True)
+            return True
 
     def set_pin(self, event_id: str, pinned: bool) -> dict[str, Any] | None:
         """Persist a pin and return the exact ledger revision it belongs to."""

@@ -7,6 +7,7 @@ fan-out, response shape) runs for real without spawning a CLI.
 import asyncio
 import json
 import os
+from pathlib import Path
 import threading
 from types import SimpleNamespace
 
@@ -121,12 +122,17 @@ def test_session_rename_updates_activity_ledger(chat_mod, client, monkeypatch):
     assert created.status_code == 200, created.text
     sid = created.json()["id"]
     calls = []
+    perf_events = []
 
     def rename_activity(target_sid, name):
         calls.append((target_sid, name))
 
     monkeypatch.setattr(activity_module.activity, "rename_session", rename_activity)
     monkeypatch.setattr(chat_mod, "sdk_rename_session", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        chat_mod, "_perf_event",
+        lambda event, **fields: perf_events.append((event, fields)),
+    )
 
     response = client.patch(
         f"/api/chat/sessions/{sid}",
@@ -137,6 +143,19 @@ def test_session_rename_updates_activity_ledger(chat_mod, client, monkeypatch):
     assert response.status_code == 200, response.text
     assert chat_mod.sess.get_session(sid)["name"] == "After rename"
     assert calls == [(sid, "After rename")]
+    assert len(perf_events) == 1
+    event, fields = perf_events[0]
+    assert event == "session.rename"
+    assert fields["session"] == sid[:8]
+    assert fields["status"] == "ok"
+    for key in (
+        "lock_wait_ms", "local_index_ms", "sdk_rename_ms", "activity_ms",
+        "total_ms",
+    ):
+        assert isinstance(fields[key], int)
+        assert fields[key] >= 0
+    assert "Before rename" not in repr(perf_events)
+    assert "After rename" not in repr(perf_events)
 
 
 def test_session_effort_and_fast_patch_persist_and_rebuild(
@@ -379,7 +398,44 @@ def test_interrupt_calls_sdk_and_marks_pending(chat_mod, client):
     assert body["ok"] is True
     assert body["interrupted"] == ["sid-int@claude-sonnet-4-6"]
     assert c.interrupted is True
-    assert "sid-int" in chat_mod._pending_interrupts
+    assert ("sid-int", "") in chat_mod._pending_interrupts
+
+
+def test_interrupt_rejects_stale_turn_before_touching_client_or_queue(
+        chat_mod, client, monkeypatch):
+    sid = "sid-stale-stop"
+    sdk_client = _seed(
+        chat_mod, (sid, "claude-sonnet-4-6", "auto", ""))
+    current = chat_mod.TurnBroadcast(sid)
+    chat_mod._active_turns[sid] = current
+    pauses = []
+    monkeypatch.setattr(
+        chat_mod.sess,
+        "pause_queue_if_nonempty",
+        lambda stopped_sid: pauses.append(stopped_sid),
+    )
+    try:
+        response = client.post(
+            f"/api/chat/interrupt?session_id={sid}&turn_id=older-turn"
+            f"&token={TEST_TOKEN}")
+        assert response.status_code == 200, response.text
+        assert response.json() == {
+            "ok": True,
+            "interrupted": [],
+            "stale": True,
+            "requested_turn_id": "older-turn",
+            "current_turn_id": current.turn_id,
+            "turn_id": current.turn_id,
+            "active": True,
+            "stopping": False,
+            "phase": "running",
+        }
+        assert sdk_client.interrupted is False
+        assert pauses == []
+        assert (sid, "older-turn") not in chat_mod._pending_interrupts
+    finally:
+        chat_mod._active_turns.pop(sid, None)
+        current.close()
 
 
 def test_interrupt_swallows_sdk_error_but_still_marks_pending(chat_mod, client):
@@ -394,7 +450,7 @@ def test_interrupt_swallows_sdk_error_but_still_marks_pending(chat_mod, client):
     body = r.json()
     assert body["ok"] is True
     assert body["interrupted"] == []   # failing client omitted
-    assert "sid-boom" in chat_mod._pending_interrupts
+    assert ("sid-boom", "") in chat_mod._pending_interrupts
 
 
 def test_stop_background_task_uses_sdk_control_channel(chat_mod, client):
@@ -455,7 +511,7 @@ def test_interrupt_does_not_inherit_sdk_60_second_ack_timeout(
 
     assert response.status_code == 200, response.text
     assert response.json()["interrupted"] == []
-    assert sid in chat_mod._pending_interrupts
+    assert (sid, "") in chat_mod._pending_interrupts
 
 
 @pytest.mark.asyncio
@@ -510,8 +566,11 @@ async def test_interrupt_cancels_cold_client_startup_immediately(
     assert finished is broadcast
     assert broadcast.cancelled is True
     assert broadcast.done is True
-    assert [event["event"] for event in broadcast.replay_events()] == ["cancelled"]
-    cancelled_payload = json.loads(next(broadcast.replay_events())["data"])
+    replay = list(broadcast.replay_events())
+    assert [event["event"] for event in replay] == [
+        "startup", "startup", "cancelled",
+    ]
+    cancelled_payload = json.loads(replay[-1]["data"])
     assert cancelled_payload["snapshot_ready"] is True
     snapshots, _ = chat_mod._load_cancelled_turn_snapshots(sid)
     assert [message["text"] for message in snapshots[0]["messages"]] == ["stop me"]
@@ -784,7 +843,7 @@ async def test_session_runtime_cleanup_invalidates_continuation_owner(chat_mod):
 
 
 @pytest.mark.asyncio
-async def test_async_purge_keeps_runtime_mutation_on_event_loop(
+async def test_async_purge_does_not_treat_background_watcher_as_activity(
         chat_mod, monkeypatch):
     from backend import activity as activity_module
 
@@ -814,12 +873,13 @@ async def test_async_purge_keeps_runtime_mutation_on_event_loop(
         lambda activity_sid, status, *, activity_source="", owner_id="", mark_read=None:
             activity_finishes.append((activity_sid, status, activity_source)),
     )
-    chat_mod._background_activity_finishes[sid] = (
-        "completed", "background-owner")
+    watcher = asyncio.create_task(asyncio.sleep(0))
+    await watcher
+    chat_mod._task_watchers[sid] = watcher
 
     assert await chat_mod.purge_session_storage_async(sid) is True
     assert observed_threads == [loop_thread]
-    assert activity_finishes == [(sid, "cancelled", "background")]
+    assert activity_finishes == []
 
 
 @pytest.mark.asyncio
@@ -1269,7 +1329,7 @@ async def test_sync_and_async_purge_from_leaf_clear_full_runtime_lineage(
 
 
 @pytest.mark.asyncio
-async def test_force_stop_tears_down_stuck_turn(chat_mod):
+async def test_force_stop_tears_down_stuck_turn(chat_mod, monkeypatch):
     """The SDK's client.interrupt() is best-effort; for an agentic turn the CLI
     may keep running, pinning the slot in _active_turns and bouncing every
     subsequent send with 'previous turn still running'. The force-stop watchdog
@@ -1277,6 +1337,32 @@ async def test_force_stop_tears_down_stuck_turn(chat_mod):
     sid = "sid-stuck"
     c = _seed(chat_mod, (sid, "claude-sonnet-4-6", "auto", ""))
     bc = chat_mod.TurnBroadcast(session_id=sid, model="claude-sonnet-4-6")
+    bc.queue_item_id = "q-stuck"
+    bc.activity_started = True
+    activity_finishes = []
+    queue_releases = []
+    queue_pauses = []
+    memory_clears = []
+    remembered = []
+
+    async def finish_activity(got_sid, got_bc, status):
+        activity_finishes.append((got_sid, got_bc.turn_id, status))
+        got_bc.activity_started = False
+
+    monkeypatch.setattr(chat_mod, "_finish_activity", finish_activity)
+    monkeypatch.setattr(
+        chat_mod.sess, "release_queue_claim",
+        lambda got_sid, item_id, **kwargs: queue_releases.append(
+            (got_sid, item_id, kwargs.get("turn_id"), kwargs.get("pause"))) or True,
+    )
+    monkeypatch.setattr(
+        chat_mod.sess, "pause_queue_if_nonempty", queue_pauses.append)
+    monkeypatch.setattr(
+        chat_mod.mem0, "pop_recall_trace", memory_clears.append)
+    monkeypatch.setattr(
+        chat_mod, "_remember_recent_turn",
+        lambda got_sid, got_bc: remembered.append((got_sid, got_bc.turn_id)),
+    )
     chat_mod._active_turns[sid] = bc
     try:
         # Tiny grace; the (absent) pump never frees the slot, so the watchdog
@@ -1286,7 +1372,51 @@ async def test_force_stop_tears_down_stuck_turn(chat_mod):
         assert sid not in chat_mod._active_turns  # slot freed → next send works
         assert bc.cancelled is True
         assert bc.done is True                    # subscribers get the sentinel
+        assert activity_finishes == [(sid, bc.turn_id, "cancelled")]
+        assert queue_releases == [(sid, "q-stuck", bc.turn_id, True)]
+        assert queue_pauses == [sid]
+        assert memory_clears == [sid]
+        assert remembered == [(sid, bc.turn_id)]
     finally:
+        chat_mod._active_turns.pop(sid, None)
+
+
+@pytest.mark.asyncio
+async def test_force_stop_lets_cancelled_pump_own_terminal_cleanup(
+    chat_mod, monkeypatch,
+):
+    """Cancelling the real pump must not race a second manual settlement."""
+    sid = "sid-pump-cleanup"
+    _seed(chat_mod, (sid, "claude-sonnet-4-6", "auto", ""))
+    bc = chat_mod.TurnBroadcast(session_id=sid, model="claude-sonnet-4-6")
+    manual_finishes = []
+    monkeypatch.setattr(
+        chat_mod,
+        "_finish_activity",
+        lambda *args, **kwargs: manual_finishes.append((args, kwargs)),
+    )
+
+    async def pump():
+        try:
+            await asyncio.Event().wait()
+        finally:
+            bc.finish()
+            chat_mod._active_turns.pop(sid, None)
+
+    task = asyncio.create_task(pump())
+    bc.task = task
+    chat_mod._active_turns[sid] = bc
+    await asyncio.sleep(0)
+    try:
+        await chat_mod._force_stop_after_grace(sid, bc, grace=0.01)
+        assert task.done()
+        assert bc.done is True
+        assert sid not in chat_mod._active_turns
+        assert manual_finishes == []
+    finally:
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
         chat_mod._active_turns.pop(sid, None)
 
 
@@ -1375,8 +1505,13 @@ def test_cancelled_turn_snapshot_survives_reload_export_and_delete(
         assert second.status_code == 200, second.text
         assert second.json()["messages"] == messages
 
-        exported = client.get(
-            f"/api/chat/sessions/{sid}/export?token={TEST_TOKEN}")
+        ticket = client.post(
+            "/api/chat/resource-ticket",
+            headers=auth,
+            json={"resource": "export", "session_id": sid},
+        )
+        assert ticket.status_code == 200, ticket.text
+        exported = client.get(ticket.json()["url"])
         assert exported.status_code == 200, exported.text
         assert "keep this interrupted prompt" in exported.text
         assert "partial assistant text" in exported.text
@@ -1501,7 +1636,13 @@ def test_native_compact_rejects_in_band_context_error(chat_mod, client, monkeypa
         return fake
 
     monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
-    key = (sid, "claude-sonnet-4-6", "auto", "")
+    meta = chat_mod.sess.get_session_meta(sid)
+    key = (
+        sid,
+        meta["model"] or chat_mod.MODEL,
+        meta["effort"],
+        meta["service_tier"],
+    )
     chat_mod._client_permission[key] = "default"
 
     r = client.post(
@@ -1566,11 +1707,52 @@ def test_vendor_fork_uses_vendor_session_store_and_restores_env(
     assert os.environ["CLAUDE_CONFIG_DIR"] == "original-config"
 
 
+def test_existing_native_transcript_overrides_third_party_model_store(
+    chat_mod, client, monkeypatch,
+):
+    r = client.post(
+        "/api/chat/sessions",
+        headers={"X-Auth-Token": TEST_TOKEN, "Content-Type": "application/json"},
+        json={"name": "native transcript", "model": "claude-sonnet-4-6"},
+    )
+    assert r.status_code == 200, r.text
+    sid = r.json()["id"]
+    chat_mod.sess.update_model(sid, "codex:gpt-5.6-sol")
+    native_path = (
+        Path.home() / ".claude" / "projects" / "-workspace" / f"{sid}.jsonl"
+    )
+    original_find = chat_mod._find_session_jsonl
+    monkeypatch.setattr(
+        chat_mod,
+        "_find_session_jsonl",
+        lambda requested: native_path if requested == sid else original_find(requested),
+    )
+    observed = {}
+
+    def fake_fork(*_args, **_kwargs):
+        observed["config_dir"] = os.environ.get("CLAUDE_CONFIG_DIR")
+        return SimpleNamespace(session_id="21111111-2222-4333-8444-555555555555")
+
+    monkeypatch.setattr(chat_mod, "sdk_fork_session", fake_fork)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "inherited-vendor-config")
+    response = client.post(
+        f"/api/chat/sessions/{sid}/fork",
+        headers={"X-Auth-Token": TEST_TOKEN, "Content-Type": "application/json"},
+        json={"title": "native store fork"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert observed["config_dir"] is None
+    assert os.environ["CLAUDE_CONFIG_DIR"] == "inherited-vendor-config"
+
+
 def test_fork_inherits_session_settings_and_records_lineage(
     chat_mod,
     client,
     monkeypatch,
 ):
+    from backend import activity as activity_module
+
     source = client.post(
         "/api/chat/sessions",
         headers={"X-Auth-Token": TEST_TOKEN, "Content-Type": "application/json"},
@@ -1594,6 +1776,13 @@ def test_fork_inherits_session_settings_and_records_lineage(
         chat_mod,
         "sdk_fork_session",
         lambda *_args, **_kwargs: SimpleNamespace(session_id=new_sid),
+    )
+    activity_inherits = []
+    monkeypatch.setattr(
+        activity_module.activity,
+        "inherit_session",
+        lambda source_sid, child_sid, **kwargs: activity_inherits.append(
+            (source_sid, child_sid, kwargs)),
     )
     response = client.post(
         f"/api/chat/sessions/{sid}/fork",
@@ -1627,6 +1816,215 @@ def test_fork_inherits_session_settings_and_records_lineage(
     assert body["activity_hidden"] is True
     assert body["runtime_profile"] == "side_question"
     assert body["cwd"] == source.json()["cwd"]
+    assert activity_inherits == [(sid, new_sid, {})]
+
+
+def test_fork_activity_inheritance_failure_removes_provisional_child(
+    chat_mod,
+    client,
+    monkeypatch,
+):
+    from backend import activity as activity_module
+
+    source = client.post(
+        "/api/chat/sessions",
+        headers={"X-Auth-Token": TEST_TOKEN, "Content-Type": "application/json"},
+        json={"name": "atomic fork source"},
+    ).json()
+    child_sid = "22222222-3333-4444-8555-666666666666"
+    sdk_deletes = []
+    monkeypatch.setattr(
+        chat_mod,
+        "sdk_fork_session",
+        lambda *_args, **_kwargs: SimpleNamespace(session_id=child_sid),
+    )
+    monkeypatch.setattr(
+        activity_module.activity,
+        "inherit_session",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("activity disk")),
+    )
+    monkeypatch.setattr(
+        chat_mod,
+        "sdk_delete_session",
+        lambda sid, **_kwargs: sdk_deletes.append(sid),
+    )
+
+    response = client.post(
+        f"/api/chat/sessions/{source['id']}/fork",
+        headers={"X-Auth-Token": TEST_TOKEN, "Content-Type": "application/json"},
+        json={},
+    )
+
+    assert response.status_code == 500
+    assert chat_mod.sess.get_session_meta(child_sid) is None
+    assert sdk_deletes == [child_sid]
+
+
+def test_fork_child_stays_hidden_until_all_projections_commit(
+    chat_mod,
+    client,
+    monkeypatch,
+):
+    source = client.post(
+        "/api/chat/sessions",
+        headers={"X-Auth-Token": TEST_TOKEN, "Content-Type": "application/json"},
+        json={"name": "hidden provisional source"},
+    ).json()
+    child_sid = "23232323-3434-4567-8789-676767676767"
+    monkeypatch.setattr(
+        chat_mod,
+        "sdk_fork_session",
+        lambda *_args, **_kwargs: SimpleNamespace(session_id=child_sid),
+    )
+    monkeypatch.setattr(
+        chat_mod, "_runtime_fork_uuid_mapping", lambda _sid: {})
+    real_copy = chat_mod.sess.copy_message_annotations
+    observed = []
+
+    def inspect_hidden(source_sid, target_sid, mapping):
+        meta = chat_mod.sess.get_session_meta(target_sid)
+        assert meta is not None and meta["runtime_shadow"] is True
+        assert target_sid not in {
+            row["id"] for row in chat_mod.sess.list_sessions()
+        }
+        observed.append(target_sid)
+        return real_copy(source_sid, target_sid, mapping)
+
+    monkeypatch.setattr(
+        chat_mod.sess, "copy_message_annotations", inspect_hidden)
+
+    response = client.post(
+        f"/api/chat/sessions/{source['id']}/fork",
+        headers={"X-Auth-Token": TEST_TOKEN, "Content-Type": "application/json"},
+        json={},
+    )
+
+    assert response.status_code == 200, response.text
+    assert observed == [child_sid]
+    assert chat_mod.sess.get_session_meta(child_sid)["runtime_shadow"] is False
+    assert child_sid in {row["id"] for row in chat_mod.sess.list_sessions()}
+
+
+def test_existing_successor_retry_repairs_every_durable_projection(
+    chat_mod,
+    client,
+    monkeypatch,
+):
+    from backend import activity as activity_module
+
+    source = client.post(
+        "/api/chat/sessions",
+        headers={"X-Auth-Token": TEST_TOKEN, "Content-Type": "application/json"},
+        json={"name": "retry source"},
+    ).json()
+    source_sid = source["id"]
+    child_sid = "24242424-3535-4678-889a-787878787878"
+    chat_mod.sess.register_session(
+        child_sid,
+        name="retry child",
+        model=source["model"],
+        runtime_predecessor=source_sid,
+        cwd=source["cwd"],
+    )
+    assert chat_mod.sess.link_runtime_successor(source_sid, child_sid)
+
+    old_uuid = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+    new_uuid = "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff"
+    chat_mod.sess.set_message_annotation(
+        source_sid, old_uuid, turn_status="completed", model="Claude")
+    queued = chat_mod.sess.enqueue_message(source_sid, "migrate me")
+    assert queued["ok"] is True
+    chat_mod.sess.set_runtime_task_overlay(
+        source_sid,
+        "task-retry",
+        owner_session_id=source_sid,
+        state="running",
+    )
+    event = activity_module.activity.start(source_sid, summary="preserve me")
+    group = activity_module.activity.create_group("Retry lane", "cyan")["group"]
+    activity_module.activity.set_group(event["id"], group["id"])
+    monkeypatch.setattr(
+        chat_mod,
+        "_runtime_fork_uuid_mapping",
+        lambda sid: {old_uuid: new_uuid} if sid == child_sid else {},
+    )
+
+    lifecycle = chat_mod._commit_fork_lifecycle(
+        source_sid,
+        chat_mod.sess.get_session_meta(source_sid),
+        fork_child=lambda: pytest.fail("retry must not fork again"),
+        register_kwargs={},
+        successor=True,
+        copy_runtime_overlays=True,
+    )
+
+    assert lifecycle["reused"] is True
+    assert lifecycle["child_sid"] == child_sid
+    assert chat_mod.sess.get_message_annotations(child_sid)[new_uuid][
+        "turn_status"
+    ] == "completed"
+    assert [row["text"] for row in chat_mod.sess.get_queue(child_sid)["items"]] == [
+        "migrate me"
+    ]
+    overlay = chat_mod.sess.get_runtime_task_overlays(child_sid)["task-retry"]
+    assert overlay["owner_session_id"] == source_sid
+    activity_row = next(
+        row for row in activity_module.activity.list()
+        if row["session_id"] == child_sid
+    )
+    assert activity_row["id"] == event["id"]
+    assert activity_row["group_id"] == group["id"]
+    assert chat_mod.sess.get_session_meta(source_sid)["runtime_shadow"] is True
+    assert chat_mod.sess.get_session_meta(child_sid)["runtime_shadow"] is False
+
+
+def test_successor_projection_failure_rolls_back_queue_activity_and_child(
+    chat_mod,
+    client,
+    monkeypatch,
+):
+    from backend import activity as activity_module
+
+    source = client.post(
+        "/api/chat/sessions",
+        headers={"X-Auth-Token": TEST_TOKEN, "Content-Type": "application/json"},
+        json={"name": "rollback source"},
+    ).json()
+    source_sid = source["id"]
+    child_sid = "25252525-3636-4789-89ab-898989898989"
+    event = activity_module.activity.start(source_sid, summary="stay here")
+    queued = chat_mod.sess.enqueue_message(source_sid, "restore me")
+    assert queued["ok"] is True
+    monkeypatch.setattr(
+        chat_mod, "_runtime_fork_uuid_mapping", lambda _sid: {})
+    monkeypatch.setattr(
+        chat_mod.sess, "link_runtime_successor", lambda *_args: False)
+    monkeypatch.setattr(chat_mod, "sdk_delete_session", lambda *_args, **_kwargs: None)
+
+    with pytest.raises(ValueError, match="successor link changed"):
+        chat_mod._commit_fork_lifecycle(
+            source_sid,
+            chat_mod.sess.get_session_meta(source_sid),
+            fork_child=lambda: SimpleNamespace(session_id=child_sid),
+            register_kwargs={
+                "name": "rollback child",
+                "model": source["model"],
+                "cwd": source["cwd"],
+            },
+            successor=True,
+            copy_runtime_overlays=True,
+        )
+
+    assert chat_mod.sess.get_session_meta(child_sid) is None
+    assert chat_mod.sess.get_session_meta(source_sid)["runtime_shadow"] is False
+    assert [row["text"] for row in chat_mod.sess.get_queue(source_sid)["items"]] == [
+        "restore me"
+    ]
+    row = next(
+        row for row in activity_module.activity.list()
+        if row["session_id"] == source_sid
+    )
+    assert row["id"] == event["id"]
 
 
 def test_fork_rejects_active_source_session(
@@ -1707,6 +2105,17 @@ def test_continue_detached_forks_once_hides_source_and_migrates_queue(
     sid = source["id"]
     boundary = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
     child_sid = "11111111-2222-4333-8444-555555555555"
+    chat_mod.sess.update_model(sid, "codex:gpt-5.6-sol")
+    native_path = (
+        Path.home() / ".claude" / "projects" / "-workspace" / f"{sid}.jsonl"
+    )
+    original_find = chat_mod._find_session_jsonl
+    monkeypatch.setattr(
+        chat_mod,
+        "_find_session_jsonl",
+        lambda requested: native_path if requested == sid else original_find(requested),
+    )
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "inherited-vendor-config")
     chat_mod.sess.set_runtime_background_boundary(sid, boundary)
     chat_mod._sessions_with_inflight_tasks[sid] = {"task-a"}
     chat_mod.sess.set_runtime_task_overlay(
@@ -1717,8 +2126,10 @@ def test_continue_detached_forks_once_hides_source_and_migrates_queue(
         sid, "continue now", permission="default")
     assert queued["ok"] is True
     fork_calls = []
+    observed = {}
 
     def fake_fork(source_sid, **kwargs):
+        observed["config_dir"] = os.environ.get("CLAUDE_CONFIG_DIR")
         fork_calls.append((source_sid, kwargs))
         return SimpleNamespace(session_id=child_sid)
 
@@ -1743,6 +2154,8 @@ def test_continue_detached_forks_once_hides_source_and_migrates_queue(
     assert second.json()["reused"] is True
     assert len(fork_calls) == 1
     assert fork_calls[0][1]["up_to_message_id"] == boundary
+    assert observed["config_dir"] is None
+    assert os.environ["CLAUDE_CONFIG_DIR"] == "inherited-vendor-config"
     assert chat_mod.sess.get_session_meta(sid)["runtime_shadow"] is True
     child_meta = chat_mod.sess.get_session_meta(child_sid)
     assert child_meta["runtime_predecessor"] == sid
@@ -2190,6 +2603,110 @@ def test_native_compact_rejects_success_without_token_drop(chat_mod, client, mon
     assert "did not decrease" in r.json()["detail"]
 
 
+def test_compact_recovery_publishes_activity_successor_only_after_registration(
+    chat_mod,
+    client,
+    monkeypatch,
+    tmp_path,
+):
+    from backend import activity as activity_module
+
+    sid = _make_compact_session(client)
+    child_sid = "33333333-4444-4555-8666-777777777777"
+    source_path = tmp_path / f"{sid}.jsonl"
+    source_path.write_text("{}\n", encoding="utf-8")
+    child_path = tmp_path / f"{child_sid}.jsonl"
+    child_path.write_text("{}\n", encoding="utf-8")
+    stats = SimpleNamespace(
+        included_messages=1,
+        omitted_messages=0,
+        truncated_messages=0,
+        estimated_post_tokens=123,
+    )
+    monkeypatch.setattr(chat_mod, "_find_session_jsonl", lambda _sid: source_path)
+    monkeypatch.setattr(
+        chat_mod.context_recovery,
+        "create_recovery_fork",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            session_id=child_sid,
+            path=child_path,
+            stats=stats,
+        ),
+    )
+    calls = []
+
+    def inherit(source_sid, recovered_sid, **kwargs):
+        assert chat_mod.sess.get_session_meta(recovered_sid) is not None
+        calls.append((source_sid, recovered_sid, kwargs))
+
+    monkeypatch.setattr(activity_module.activity, "inherit_session", inherit)
+
+    result = chat_mod._create_context_recovery_session(
+        sid,
+        "claude-sonnet-4-6",
+        pre_tokens=456,
+        context_limit=200_000,
+    )
+
+    assert result["session"]["id"] == child_sid
+    assert calls == [(sid, child_sid, {"successor": True})]
+
+
+def test_compact_recovery_retry_reuses_linked_child_and_repairs_projections(
+    chat_mod,
+    client,
+    monkeypatch,
+):
+    from backend import activity as activity_module
+
+    source_sid = _make_compact_session(client)
+    source_meta = chat_mod.sess.get_session_meta(source_sid)
+    child_sid = "34343434-4545-4789-89ab-909090909090"
+    chat_mod.sess.register_session(
+        child_sid,
+        name="existing compact child",
+        model=source_meta["model"],
+        runtime_predecessor=source_sid,
+        cwd=source_meta["cwd"],
+    )
+    assert chat_mod.sess.link_runtime_successor(source_sid, child_sid)
+    monkeypatch.setattr(chat_mod, "_find_session_jsonl", lambda _sid: None)
+    monkeypatch.setattr(
+        chat_mod.context_recovery,
+        "create_recovery_fork",
+        lambda *_args, **_kwargs: pytest.fail("retry must reuse linked child"),
+    )
+    old_uuid = "cccccccc-dddd-4eee-8fff-111111111111"
+    new_uuid = "dddddddd-eeee-4fff-8111-222222222222"
+    chat_mod.sess.set_message_annotation(source_sid, old_uuid, cost=1.25)
+    chat_mod.sess.enqueue_message(source_sid, "compact retry queue")
+    event = activity_module.activity.start(source_sid, summary="compact retry")
+    monkeypatch.setattr(
+        chat_mod,
+        "_runtime_fork_uuid_mapping",
+        lambda sid: {old_uuid: new_uuid} if sid == child_sid else {},
+    )
+
+    result = chat_mod._create_context_recovery_session(
+        source_sid,
+        source_meta["model"],
+        pre_tokens=456,
+        context_limit=200_000,
+    )
+
+    assert result["session"]["id"] == child_sid
+    assert result["stats"]["included_messages"] == 0
+    assert chat_mod.sess.get_message_annotations(child_sid)[new_uuid]["cost"] == 1.25
+    assert [row["text"] for row in chat_mod.sess.get_queue(child_sid)["items"]] == [
+        "compact retry queue"
+    ]
+    activity_row = next(
+        row for row in activity_module.activity.list()
+        if row["session_id"] == child_sid
+    )
+    assert activity_row["id"] == event["id"]
+
+
 def test_native_codex_compact_recovers_verified_no_shrink(
     chat_mod, client, monkeypatch,
 ):
@@ -2450,3 +2967,93 @@ def test_native_compact_returns_after_verification_and_schedules_recount(
     assert scheduled
     assert scheduled[0][0] == sid
     assert scheduled[0][2]["totalTokens"] == 50_000
+
+
+@pytest.mark.parametrize("owner_state", ["absent", "pre_cancelled", "hung"])
+@pytest.mark.asyncio
+async def test_force_stop_finalizes_attachments_for_every_owner_state(
+    chat_mod,
+    monkeypatch,
+    owner_state,
+):
+    sid = f"force-attachment-{owner_state}"
+    aid = f"force-aid-{owner_state}"
+    entry = {
+        "kind": "text",
+        "mime": "text/plain",
+        "name": "force.txt",
+        "raw": b"force",
+        "text": "force",
+        "ts": chat_mod.time.time(),
+    }
+    with chat_mod._image_store_lock:
+        chat_mod._image_store[aid] = entry
+    lease, _missing, _busy = chat_mod._lease_staged_attachments(
+        aid, require_all=True)
+    broadcast = chat_mod.TurnBroadcast(sid)
+    broadcast._attachment_lease = lease
+    artifact = (
+        chat_mod._attachments_base() / sid / f"{aid}-force.txt")
+    artifact.parent.mkdir(parents=True, exist_ok=True)
+    artifact.write_bytes(b"artifact")
+    broadcast._prepared_attachments = (
+        chat_mod._PreparedStagedAttachments(
+            artifact_paths=[str(artifact)])
+    )
+    owner_release = asyncio.Event()
+    owner = None
+
+    async def ignore_cancel_until_released():
+        while not owner_release.is_set():
+            try:
+                await owner_release.wait()
+            except asyncio.CancelledError:
+                continue
+
+    if owner_state == "pre_cancelled":
+        owner = asyncio.create_task(asyncio.Event().wait())
+        owner.cancel()
+        await asyncio.gather(owner, return_exceptions=True)
+        broadcast.task = owner
+    elif owner_state == "hung":
+        owner = asyncio.create_task(ignore_cancel_until_released())
+        broadcast.task = owner
+        await asyncio.sleep(0)
+
+    disconnect_release = asyncio.Event()
+
+    async def stuck_disconnect(_sid):
+        await disconnect_release.wait()
+
+    monkeypatch.setattr(chat_mod, "disconnect_client", stuck_disconnect)
+    monkeypatch.setattr(
+        chat_mod, "_INTERRUPT_FORCE_OWNER_JOIN_S", 0.01)
+    monkeypatch.setattr(
+        chat_mod, "_INTERRUPT_FORCE_DISCONNECT_JOIN_S", 0.01)
+    monkeypatch.setattr(
+        chat_mod, "_persist_cancelled_turn_snapshot",
+        lambda _broadcast: True,
+    )
+    chat_mod._active_turns[sid] = broadcast
+    try:
+        await chat_mod._force_stop_after_grace(
+            sid, broadcast, grace=0.001)
+        assert sid not in chat_mod._active_turns
+        assert broadcast.done is True
+        assert not artifact.exists()
+        assert chat_mod._image_store.get(aid) is entry
+        assert aid not in chat_mod._staged_attachment_claims
+        assert lease.state == "released"
+    finally:
+        owner_release.set()
+        disconnect_release.set()
+        if owner is not None:
+            await asyncio.gather(owner, return_exceptions=True)
+        for _ in range(100):
+            if not chat_mod._maintenance_tasks:
+                break
+            await asyncio.sleep(0.01)
+        chat_mod._active_turns.pop(sid, None)
+        with chat_mod._image_store_lock:
+            chat_mod._image_store.pop(aid, None)
+            chat_mod._staged_attachment_claims.pop(aid, None)
