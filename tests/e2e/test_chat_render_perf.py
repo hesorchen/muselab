@@ -581,6 +581,9 @@ def test_mux_coordinator_connects_before_background_history_warmup(
     order = page.evaluate(
         """async () => {
           const app = document.querySelector('#app')._x_dataStack[0];
+          if (app._chatMuxCoordinatorPromise) {
+            try { await app._chatMuxCoordinatorPromise; } catch (_) {}
+          }
           if (app._chatMuxStartPromise) {
             try { await app._chatMuxStartPromise; } catch (_) {}
           }

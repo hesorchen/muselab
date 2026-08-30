@@ -377,6 +377,7 @@ function portal() {
     _chatMuxPendingEvents: new Map(),
     _chatMuxAttachPromises: new Map(),
     _chatMuxStartPromise: null,
+    _chatMuxCoordinatorPromise: null,
     _chatMuxReconnectTimer: null,
     _chatMuxReconnectAttempts: 0,
     _chatMuxSupported: null,
@@ -2237,6 +2238,11 @@ function portal() {
       // critical request queued behind non-visible startup work.
       const contextReady = Promise.resolve(this.fetchContextInfo());
       void contextReady.catch(() => false);
+      // The model list is composer-critical. Queue it before always-on SSE
+      // transports: on HTTP/1.1, several same-origin pages can otherwise fill
+      // the browser's connection budget with live streams and leave a deferred
+      // /api/chat/providers request waiting forever.
+      void Promise.resolve(this._fetchModels()).catch(() => false);
       // Attach the rejection handler immediately: the rest of boot awaits
       // context/session work before it observes this promise, and a fast tree
       // failure must never surface as an unhandled rejection in that gap.
@@ -10500,13 +10506,26 @@ function portal() {
     },
     async _startChatMuxCoordinator() {
       if (this._chatMuxSupported === false) return false;
-      // Establish the one authoritative live transport before any background
-      // transcript warmup. A turn can start while history is loading; mux-first
-      // startup guarantees its accepted/session_state events already have a sink.
-      const connected = await this._ensureChatMux();
-      if (!connected) return false;
-      await this._bootstrapChatMuxHistory();
-      return true;
+      if (this._chatMuxCoordinatorPromise) {
+        return await this._chatMuxCoordinatorPromise;
+      }
+      const coordinator = (async () => {
+        // Establish the one authoritative live transport before any background
+        // transcript warmup. A turn can start while history is loading; mux-first
+        // startup guarantees its accepted/session_state events already have a sink.
+        const connected = await this._ensureChatMux();
+        if (!connected) return false;
+        await this._bootstrapChatMuxHistory();
+        return true;
+      })();
+      this._chatMuxCoordinatorPromise = coordinator;
+      try {
+        return await coordinator;
+      } finally {
+        if (this._chatMuxCoordinatorPromise === coordinator) {
+          this._chatMuxCoordinatorPromise = null;
+        }
+      }
     },
 
     async initSessions(options = {}) {

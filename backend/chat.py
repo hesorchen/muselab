@@ -17366,6 +17366,16 @@ async def _subscribe_multiplex(
     mobile: bool = False,
 ):
     """Merge attachable broadcasts while periodically discovering new ones."""
+    # Flush the SSE response headers before discovery. Starlette's global
+    # GZipMiddleware deliberately skips compressing ``text/event-stream``, but
+    # its responder still buffers ``http.response.start`` until it sees the
+    # first body frame. An idle mux (no checkpoints and no active turns) has no
+    # session event to yield, so without this handshake frame the browser waits
+    # for sse-starlette's 15-second heartbeat and our 5-second EventSource open
+    # timeout fires first. ``ping`` is already part of the mux protocol and is
+    # ignored by panes that have no active channel.
+    yield {"event": "ping", "data": ""}
+
     # Bound the aggregate handoff so a stalled HTTP client leaves each child
     # parked on its disk-backed subscriber cursor instead of growing RAM.
     output: asyncio.Queue[dict] = asyncio.Queue(maxsize=256)

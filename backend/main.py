@@ -692,10 +692,10 @@ async def runtime_cleanup_timeout_handler(
 # assets (app.js / index.html / styles.css) plus JSON-heavy API responses
 # (cost-dashboard / settings / skills) — all highly compressible (~75-80%).
 # This is the single biggest cold-load TTI win and costs one line.
-# SSE streams are NOT touched: chat.py's EventSourceResponse sets
-# `Content-Encoding: identity`, and Starlette's GZipMiddleware skips any
-# response that already carries a Content-Encoding header (gzip.py:55-57),
-# so live token streaming is never buffered/compressed.
+# SSE bodies are not compressed: chat.py's EventSourceResponse sets
+# `Content-Encoding: identity`. Starlette's responder still retains the
+# response start until the first body frame, so every SSE generator must emit
+# an immediate handshake event; see chat._subscribe_multiplex.
 app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=6)
 
 
