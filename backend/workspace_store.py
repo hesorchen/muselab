@@ -8,7 +8,7 @@ import shutil
 import sqlite3
 import threading
 import time
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -243,6 +243,75 @@ def scan_workspace(
         if complete_paths is not None:
             report["_snapshot_paths"] = complete_paths
     return rows
+
+
+ScanRow = tuple[str, bool, int, float, int, int, int]
+
+
+def compact_scan_rows(rows: Iterable[dict[str, Any]]) -> list[ScanRow]:
+    """Encode filesystem rows compactly for scanner-process IPC."""
+    return [
+        (
+            row["path"],
+            bool(row["is_dir"]),
+            int(row["size"]),
+            float(row["mtime"]),
+            int(row["mtime_ns"]),
+            int(row["ctime_ns"]),
+            int(row["inode"]),
+        )
+        for row in rows
+    ]
+
+
+def expand_scan_rows(
+    rows: Iterable[ScanRow | Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Decode compact IPC rows while accepting direct in-process test rows."""
+    expanded: list[dict[str, Any]] = []
+    for row in rows:
+        if isinstance(row, Mapping):
+            expanded.append(dict(row))
+            continue
+        path, is_dir, size, mtime, mtime_ns, ctime_ns, inode = row
+        expanded.append({
+            "path": path,
+            "name": Path(path).name,
+            "is_dir": is_dir,
+            "size": size,
+            "mtime": mtime,
+            "mtime_ns": mtime_ns,
+            "ctime_ns": ctime_ns,
+            "inode": inode,
+        })
+    return expanded
+
+
+def workspace_scan_worker(connection: Any, cancel_event: Any) -> None:
+    """Serve compact scan requests in one reusable spawned worker process."""
+    try:
+        while True:
+            request = connection.recv()
+            if request is None:
+                return
+            root, max_files, max_seconds, progress = request
+            report: dict[str, Any] = {}
+            try:
+                rows = scan_workspace(
+                    Path(root),
+                    cancel_event=cancel_event,
+                    max_files=max_files,
+                    max_seconds=max_seconds,
+                    report=report,
+                    progress=progress,
+                )
+                connection.send(("ok", compact_scan_rows(rows), report, progress))
+            except BaseException as exc:
+                connection.send(("error", type(exc).__name__, str(exc), progress))
+    except (EOFError, BrokenPipeError, OSError):
+        return
+    finally:
+        connection.close()
 
 
 class WorkspaceStore:
@@ -593,31 +662,35 @@ class WorkspaceStore:
         max_seconds: float | None = _SCAN_MAX_SECONDS,
         report: dict[str, Any] | None = None,
         scan_progress: dict[str, Any] | None = None,
-    ) -> int:
-        """Scan disk, update only changed rows, and log offline changes."""
+        snapshot: list[dict[str, Any]] | None = None,
+        expected_cursor: int | None = None,
+        return_payload: bool = False,
+    ) -> int | dict[str, Any]:
+        """Scan or apply a snapshot, logging offline changes atomically."""
         root = root.resolve()
         scan_report: dict[str, Any] = report if report is not None else {}
-        # Keep a watcher batch from committing after our snapshot but before the
-        # reconciliation transaction. Different workspaces may still scan in
-        # parallel, while bootstrap/delta reads keep using the last-good index.
+        # Filesystem walking may happen in a separate process. The workspace lock
+        # serializes only durable application and native watcher transactions.
         with self._workspace_lock(workspace_id):
-            snapshot = scan_workspace(
-                root,
-                cancel_event=cancel_event,
-                max_files=max_files,
-                max_seconds=max_seconds,
-                report=scan_report,
-                progress=scan_progress,
-            )
+            if snapshot is None:
+                snapshot = scan_workspace(
+                    root,
+                    cancel_event=cancel_event,
+                    max_files=max_files,
+                    max_seconds=max_seconds,
+                    report=scan_report,
+                    progress=scan_progress,
+                )
             partial = bool(scan_report.get("partial"))
             if cancel_event is not None and cancel_event.is_set():
                 raise WorkspaceScanCancelled("workspace scan cancelled")
-            self.register_workspace(
-                workspace_id,
-                root,
-                name,
-                primary=primary,
-            )
+            if expected_cursor is None:
+                self.register_workspace(
+                    workspace_id,
+                    root,
+                    name,
+                    primary=primary,
+                )
             if cancel_event is not None and cancel_event.is_set():
                 raise WorkspaceScanCancelled("workspace scan cancelled")
             with self._connect() as db:
@@ -626,13 +699,27 @@ class WorkspaceStore:
                 db.execute("BEGIN IMMEDIATE")
                 state = db.execute(
                     """
-                    SELECT initialized, current_seq
+                    SELECT initialized, current_seq, path
                     FROM workspaces WHERE id = ?
                     """,
                     (workspace_id,),
                 ).fetchone()
-                initialized = bool(state["initialized"]) if state else False
-                seq = int(state["current_seq"]) if state else 0
+                if state is None:
+                    db.rollback()
+                    raise KeyError(f"unknown workspace: {workspace_id}")
+                initialized = bool(state["initialized"])
+                seq = int(state["current_seq"])
+                if expected_cursor is not None and (
+                    seq != expected_cursor
+                    or state["path"] != str(root)
+                ):
+                    db.rollback()
+                    return {
+                        "_stale": True,
+                        "cursor": seq,
+                        "changes": [],
+                        "resync": True,
+                    }
                 old = {
                     row["path"]: row
                     for row in self._file_rows(db, workspace_id)
@@ -645,6 +732,7 @@ class WorkspaceStore:
                 resumed = bool(scan_report.get("resumed"))
 
                 changes: list[dict[str, Any]] = []
+                resync = False
                 if not initialized:
                     # A failed first scan may have left watcher-created rows. A
                     # complete baseline replaces them authoritatively; a bounded
@@ -687,6 +775,7 @@ class WorkspaceStore:
                         )
                         self._insert_files(db, workspace_id, snapshot)
                         seq = self._reset_replay(db, workspace_id, seq)
+                        resync = True
                     else:
                         if deleted:
                             db.executemany(
@@ -706,6 +795,7 @@ class WorkspaceStore:
                             # Preserve the incrementally assembled index but use
                             # a cursor gap instead of retaining a huge replay.
                             seq = self._reset_replay(db, workspace_id, seq)
+                            resync = True
                         else:
                             changes.extend(
                                 {"type": "deleted", "path": path}
@@ -745,7 +835,40 @@ class WorkspaceStore:
                 if cancel_event is not None and cancel_event.is_set():
                     raise WorkspaceScanCancelled("workspace scan cancelled")
                 db.commit()
+                if return_payload:
+                    return {
+                        "cursor": seq,
+                        "changes": [] if resync else self._wire_changes(changes),
+                        "resync": resync,
+                    }
                 return seq
+
+    def apply_reconcile_snapshot(
+        self,
+        workspace_id: str,
+        root: Path,
+        name: str,
+        snapshot: Iterable[ScanRow],
+        scan_report: dict[str, Any],
+        *,
+        expected_cursor: int,
+        primary: bool = False,
+        cancel_event: threading.Event | None = None,
+    ) -> dict[str, Any]:
+        """Verify the durable cursor, apply a scan, and return its exact payload."""
+        result = self.reconcile(
+            workspace_id,
+            root,
+            name,
+            primary=primary,
+            cancel_event=cancel_event,
+            report=scan_report,
+            snapshot=expand_scan_rows(snapshot),
+            expected_cursor=expected_cursor,
+            return_payload=True,
+        )
+        assert isinstance(result, dict)
+        return result
 
     def apply_changes(
         self,

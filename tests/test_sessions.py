@@ -217,6 +217,50 @@ def test_fork_annotation_copy_rekeys_message_uuid(app_module):
     assert annotation["docs"] == [{"name": "note.md"}]
 
 
+def test_runtime_task_overlay_bounds_summary_on_write(app_module):
+    from backend import sessions as sess
+    from backend.task_summaries import TASK_SUMMARY_PREVIEW_CAP
+
+    sid = sess.create_session("runtime-overlay-summary-budget")["id"]
+    full = "summary " * 1000
+
+    assert sess.set_runtime_task_overlay(
+        sid, "task-long", state="completed", summary=full,
+    )
+
+    overlay = sess.get_runtime_task_overlays(sid)["task-long"]
+    assert len(overlay["summary"]) == TASK_SUMMARY_PREVIEW_CAP
+    assert overlay["summary_length"] == len(full)
+    assert overlay["summary_truncated"] is True
+    raw = json.loads(sess._sidecar_path(sid).read_text(encoding="utf-8"))
+    assert raw["runtime_task_overlays"]["task-long"] == overlay
+
+
+def test_runtime_task_overlay_legacy_summary_is_bounded_then_compacted(app_module):
+    from backend import sessions as sess
+    from backend.task_summaries import TASK_SUMMARY_PREVIEW_CAP
+
+    sid = sess.create_session("runtime-overlay-legacy-summary")["id"]
+    full = "legacy " * 1000
+    sess._save_sidecar(sid, {
+        "runtime_task_overlays": {
+            "task-old": {"task_id": "task-old", "state": "completed", "summary": full},
+        },
+    })
+
+    overlay = sess.get_runtime_task_overlays(sid)["task-old"]
+    assert len(overlay["summary"]) == TASK_SUMMARY_PREVIEW_CAP
+    assert len(json.loads(sess._sidecar_path(sid).read_text(encoding="utf-8"))
+               ["runtime_task_overlays"]["task-old"]["summary"]) == len(full)
+
+    assert sess.set_runtime_task_overlay(sid, "task-new", state="running")
+    raw = json.loads(sess._sidecar_path(sid).read_text(encoding="utf-8"))
+    compacted = raw["runtime_task_overlays"]["task-old"]
+    assert len(compacted["summary"]) == TASK_SUMMARY_PREVIEW_CAP
+    assert compacted["summary_length"] == len(full)
+    assert compacted["summary_truncated"] is True
+
+
 @pytest.mark.parametrize(
     "terminal_state", ["completed", "failed", "stopped", "done"],
 )
@@ -495,6 +539,16 @@ def test_corrupt_sidecar_is_never_overwritten_by_a_mutator(app_module):
 
     with pytest.raises(RuntimeError, match="cannot parse session sidecar"):
         sess.set_message_annotation(meta["id"], "msg-1", cost="$1")
+    with pytest.raises(RuntimeError, match="cannot parse session sidecar"):
+        sess.set_session_usage_summary(
+            meta["id"],
+            {
+                "schema": 1,
+                "source": {"dev": 1, "inode": 2, "size": 3, "mtime_ns": 4},
+                "update": {"turn_id": "turn-corrupt", "at": 1.0},
+                "normalized": {"input_tokens": 1},
+            },
+        )
 
     assert path.read_text(encoding="utf-8") == broken
 
@@ -921,6 +975,83 @@ def test_annotation_partial_update_preserves_other_fields(app_module):
     assert anns["uuid-x"]["cost"] == "$0.01"
     assert anns["uuid-x"]["model"] == "m1"
     assert anns["uuid-x"]["images"] == [{"mime": "image/png"}]
+
+
+def test_terminal_annotation_and_usage_summary_share_one_sidecar_write(app_module):
+    from backend import sessions as sess
+
+    sid = sess.create_session()["id"]
+    usage = {
+        "input_tokens": 12,
+        "output_tokens": 3,
+        "context_used": 12,
+        "context_limit": 200_000,
+    }
+    summary = {
+        "schema": 1,
+        "source": {"dev": 7, "inode": 11, "size": 4321, "mtime_ns": 99},
+        "update": {"turn_id": "turn-1", "at": 1_700_000_000.0},
+        "normalized": usage,
+    }
+    sess.set_terminal_annotation_and_usage(
+        sid,
+        "uuid-terminal",
+        summary,
+        turn_status="completed",
+        cost="$0.0100",
+    )
+
+    assert sess.get_message_annotations(sid)["uuid-terminal"] == {
+        "turn_status": "completed",
+        "cost": "$0.0100",
+    }
+    assert sess.get_session_usage_summary(sid) == summary
+
+
+def test_usage_summary_refinement_requires_matching_terminal_turn(app_module):
+    from backend import sessions as sess
+
+    sid = sess.create_session()["id"]
+    original = {
+        "schema": 1,
+        "source": {"dev": 1, "inode": 2, "size": 3, "mtime_ns": 4},
+        "update": {"turn_id": "turn-new", "at": 2.0},
+        "normalized": {"input_tokens": 20},
+    }
+    stale = {
+        **original,
+        "update": {"turn_id": "turn-old", "at": 3.0},
+        "normalized": {"input_tokens": 10},
+    }
+    sess.set_session_usage_summary(sid, original)
+
+    assert sess.set_session_usage_summary_if_turn_matches(
+        sid, "turn-old", stale) is False
+    assert sess.get_session_usage_summary(sid) == original
+    assert sess.set_session_usage_summary_if_turn_matches(
+        sid, "turn-new", {**original, "normalized": {"input_tokens": 21}})
+    assert sess.get_session_usage_summary(sid)["normalized"] == {
+        "input_tokens": 21,
+    }
+
+
+def test_usage_summary_write_respects_session_deletion_fence(app_module):
+    from backend import sessions as sess
+
+    sid = "00000000-0000-4000-8000-00000000f001"
+    path = sess._sidecar_path(sid)
+    path.unlink(missing_ok=True)
+    sess.begin_session_delete(sid)
+    assert sess.set_session_usage_summary(
+        sid,
+        {
+            "schema": 1,
+            "source": {"dev": 1, "inode": 2, "size": 3, "mtime_ns": 4},
+            "update": {"turn_id": "turn-deleted", "at": 1.0},
+            "normalized": {"input_tokens": 1},
+        },
+    ) is False
+    assert not path.exists()
 
 
 def test_cancelled_annotation_is_not_downgraded_by_late_completion(app_module):

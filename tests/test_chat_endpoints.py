@@ -398,7 +398,44 @@ def test_interrupt_calls_sdk_and_marks_pending(chat_mod, client):
     assert body["ok"] is True
     assert body["interrupted"] == ["sid-int@claude-sonnet-4-6"]
     assert c.interrupted is True
-    assert "sid-int" in chat_mod._pending_interrupts
+    assert ("sid-int", "") in chat_mod._pending_interrupts
+
+
+def test_interrupt_rejects_stale_turn_before_touching_client_or_queue(
+        chat_mod, client, monkeypatch):
+    sid = "sid-stale-stop"
+    sdk_client = _seed(
+        chat_mod, (sid, "claude-sonnet-4-6", "auto", ""))
+    current = chat_mod.TurnBroadcast(sid)
+    chat_mod._active_turns[sid] = current
+    pauses = []
+    monkeypatch.setattr(
+        chat_mod.sess,
+        "pause_queue_if_nonempty",
+        lambda stopped_sid: pauses.append(stopped_sid),
+    )
+    try:
+        response = client.post(
+            f"/api/chat/interrupt?session_id={sid}&turn_id=older-turn"
+            f"&token={TEST_TOKEN}")
+        assert response.status_code == 200, response.text
+        assert response.json() == {
+            "ok": True,
+            "interrupted": [],
+            "stale": True,
+            "requested_turn_id": "older-turn",
+            "current_turn_id": current.turn_id,
+            "turn_id": current.turn_id,
+            "active": True,
+            "stopping": False,
+            "phase": "running",
+        }
+        assert sdk_client.interrupted is False
+        assert pauses == []
+        assert (sid, "older-turn") not in chat_mod._pending_interrupts
+    finally:
+        chat_mod._active_turns.pop(sid, None)
+        current.close()
 
 
 def test_interrupt_swallows_sdk_error_but_still_marks_pending(chat_mod, client):
@@ -413,7 +450,7 @@ def test_interrupt_swallows_sdk_error_but_still_marks_pending(chat_mod, client):
     body = r.json()
     assert body["ok"] is True
     assert body["interrupted"] == []   # failing client omitted
-    assert "sid-boom" in chat_mod._pending_interrupts
+    assert ("sid-boom", "") in chat_mod._pending_interrupts
 
 
 def test_stop_background_task_uses_sdk_control_channel(chat_mod, client):
@@ -474,7 +511,7 @@ def test_interrupt_does_not_inherit_sdk_60_second_ack_timeout(
 
     assert response.status_code == 200, response.text
     assert response.json()["interrupted"] == []
-    assert sid in chat_mod._pending_interrupts
+    assert (sid, "") in chat_mod._pending_interrupts
 
 
 @pytest.mark.asyncio
@@ -529,8 +566,11 @@ async def test_interrupt_cancels_cold_client_startup_immediately(
     assert finished is broadcast
     assert broadcast.cancelled is True
     assert broadcast.done is True
-    assert [event["event"] for event in broadcast.replay_events()] == ["cancelled"]
-    cancelled_payload = json.loads(next(broadcast.replay_events())["data"])
+    replay = list(broadcast.replay_events())
+    assert [event["event"] for event in replay] == [
+        "startup", "startup", "cancelled",
+    ]
+    cancelled_payload = json.loads(replay[-1]["data"])
     assert cancelled_payload["snapshot_ready"] is True
     snapshots, _ = chat_mod._load_cancelled_turn_snapshots(sid)
     assert [message["text"] for message in snapshots[0]["messages"]] == ["stop me"]

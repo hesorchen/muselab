@@ -33,6 +33,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
 
 from .settings import ROOT, atomic_write_text, env_int, is_chinese_locale
+from . import observability as obs
 
 
 def _scheduled_label_prefix() -> str:
@@ -975,7 +976,8 @@ async def finish_task_cleanup(tid: str) -> bool:
     """Finish one durable deletion intent; safe to retry by task id."""
     ensure_available()
     async with _cleanup_lock(tid):
-        intent = get_task_cleanup(tid)
+        intent = await obs.to_thread_io(
+            "scheduler.cleanup_read", tid, get_task_cleanup, tid)
         if intent is None:
             return tid in _REVOKED_TASK_IDS
 
@@ -986,10 +988,14 @@ async def finish_task_cleanup(tid: str) -> bool:
         )
         record_error: Exception | None = None
         try:
-            refreshed = _record_task_cleanup_runtime_sessions(
+            refreshed = await obs.to_thread_io(
+                "scheduler.cleanup_record",
+                tid,
+                _record_task_cleanup_runtime_sessions,
                 tid,
                 intent["cleanup_id"],
                 runtime_session_ids,
+                owned=True,
             )
             if refreshed is not None:
                 intent = refreshed
@@ -1026,10 +1032,18 @@ async def finish_task_cleanup(tid: str) -> bool:
             from .chat import purge_session_storage_async
             await purge_session_storage_async(intent["session_id"])
 
-        if _complete_task_cleanup(tid, intent["cleanup_id"]):
+        if await obs.to_thread_io(
+            "scheduler.cleanup_complete",
+            tid,
+            _complete_task_cleanup,
+            tid,
+            intent["cleanup_id"],
+            owned=True,
+        ):
             return True
         # Another idempotent cleaner may have acknowledged the same record.
-        if get_task_cleanup(tid) is None:
+        if await obs.to_thread_io(
+            "scheduler.cleanup_read", tid, get_task_cleanup, tid) is None:
             return True
         raise RuntimeError("scheduler cleanup intent changed during completion")
 
@@ -1206,12 +1220,16 @@ async def _run_sdk_task_turn(
                 # owner-specific missing-row finish is a no-op, so a failure
                 # before persistence cannot synthesize a ghost event.
                 _mark_current_run_activity_started()
-                _activity.start(
+                await obs.to_thread_io(
+                    "scheduler.activity_start",
+                    session_id,
+                    _activity.start,
                     session_id,
                     summary=activity_summary or prompt,
                     kind="scheduled",
                     source_id=activity_source_id,
                     owner_id=activity_owner_id,
+                    owned=True,
                 )
             except Exception as e:
                 sys.stderr.write(
@@ -1313,8 +1331,13 @@ async def run_task_now(tid: str) -> bool:
     Useful as a "retry" affordance after a failure, and as a smoke test
     after editing a task without having to wait for the next fire window."""
     ensure_available()
-    with _STATE_LOCK:
-        task = _state["tasks"].get(tid)
+
+    def _read_task_for_run() -> dict | None:
+        with _STATE_LOCK:
+            return _state["tasks"].get(tid)
+
+    task = await obs.to_thread_io(
+        "scheduler.task_read", tid, _read_task_for_run)
     if not task:
         return False
     t = _track_task(
@@ -1371,34 +1394,62 @@ async def _execute_task(task: dict) -> None:
             sid = ""
             try:
                 from . import sessions as sess
+
+                def _delete_fresh_session() -> None:
+                    sess.begin_session_delete(sid)
+                    sess.delete_session(sid)
+
                 ts_label = datetime.now().strftime("%m-%d %H:%M")
-                sess_meta = sess.create_session(
+                sess_meta = await obs.to_thread_io(
+                    "scheduler.session_create",
+                    tid,
+                    sess.create_session,
                     name=f"{_scheduled_label_prefix()}{task['name']} · {ts_label}",
-                    model=task.get("model", ""))
+                    model=task.get("model", ""),
+                    owned=True,
+                )
                 sid = sess_meta["id"]
-                with _STATE_LOCK:
-                    snapshot = copy.deepcopy(_state)
-                    revoked = tid in _REVOKED_TASK_IDS
-                    if not revoked:
-                        # "most recent run" pointer
-                        task["session_id"] = sid
-                        try:
-                            _save_state()
-                        except Exception:
-                            _restore_state(snapshot)
-                            raise
+
+                def _commit_fresh_session() -> bool:
+                    with _STATE_LOCK:
+                        snapshot = copy.deepcopy(_state)
+                        is_revoked = tid in _REVOKED_TASK_IDS
+                        if not is_revoked:
+                            # "most recent run" pointer
+                            task["session_id"] = sid
+                            try:
+                                _save_state()
+                            except Exception:
+                                _restore_state(snapshot)
+                                raise
+                        return is_revoked
+
+                revoked = await obs.to_thread_io(
+                    "scheduler.fresh_session_commit",
+                    tid,
+                    _commit_fresh_session,
+                    owned=True,
+                )
                 if revoked:
                     # A synchronous compatibility caller can revoke while
                     # create_session is doing disk I/O in another thread.
                     # This run never owned the freshly minted empty session.
-                    sess.begin_session_delete(sid)
-                    sess.delete_session(sid)
+                    await obs.to_thread_io(
+                        "scheduler.session_delete",
+                        tid,
+                        _delete_fresh_session,
+                        owned=True,
+                    )
                     return
             except Exception as e:
                 if sid:
                     try:
-                        sess.begin_session_delete(sid)
-                        sess.delete_session(sid)
+                        await obs.to_thread_io(
+                            "scheduler.session_delete",
+                            tid,
+                            _delete_fresh_session,
+                            owned=True,
+                        )
                     except Exception as cleanup_error:
                         sys.stderr.write(
                             "[scheduler] failed to roll back fresh session "
@@ -1415,28 +1466,36 @@ async def _execute_task(task: dict) -> None:
                 # remain visible in history when that history can be saved.
                 if not isinstance(e, SchedulerPersistenceError):
                     now = time.time()
-                    with _STATE_LOCK:
-                        snapshot = copy.deepcopy(_state)
-                        if tid not in _REVOKED_TASK_IDS:
-                            _state["history"].append({
-                                "task_id": tid,
-                                "task_name": task["name"],
-                                "session_id": "",
-                                "ts": now,
-                                "ok": False,
-                                "error": (
-                                    "session mint failed: "
-                                    f"{type(e).__name__}: {e}"
-                                ),
-                                "reply_preview": None,
-                            })
-                            _state["unread_count"] = (
-                                _state.get("unread_count", 0) + 1
-                            )
-                            try:
-                                _save_state()
-                            except Exception:
-                                _restore_state(snapshot)
+                    mint_error = f"{type(e).__name__}: {e}"
+
+                    def _persist_mint_failure() -> None:
+                        with _STATE_LOCK:
+                            snapshot = copy.deepcopy(_state)
+                            if tid not in _REVOKED_TASK_IDS:
+                                _state["history"].append({
+                                    "task_id": tid,
+                                    "task_name": task["name"],
+                                    "session_id": "",
+                                    "ts": now,
+                                    "ok": False,
+                                    "error": f"session mint failed: {mint_error}",
+                                    "reply_preview": None,
+                                })
+                                _state["unread_count"] = (
+                                    _state.get("unread_count", 0) + 1
+                                )
+                                try:
+                                    _save_state()
+                                except Exception:
+                                    _restore_state(snapshot)
+                                    raise
+
+                    await obs.to_thread_io(
+                        "scheduler.mint_failure",
+                        tid,
+                        _persist_mint_failure,
+                        owned=True,
+                    )
                 return
         else:
             sid = task["session_id"]
@@ -1498,17 +1557,19 @@ async def _execute_task(task: dict) -> None:
                 "error": error,
                 "reply_preview": preview if error is None else None,
             }
-            with _STATE_LOCK:
-                revoked = (
-                    tid in _REVOKED_TASK_IDS
-                    or session_store.session_is_deleting(sid)
-                )
-                if not revoked:
+            def _persist_run_result() -> bool:
+                with _STATE_LOCK:
+                    is_revoked = (
+                        tid in _REVOKED_TASK_IDS
+                        or session_store.session_is_deleting(sid)
+                    )
+                    if is_revoked:
+                        return True
                     snapshot = copy.deepcopy(_state)
                     task["last_run"] = now
                     _state["history"].append(entry)
-                    # Successful runs bump unread; errors also bump so the
-                    # user notices them — but they show as red in the UI.
+                    # Successful runs and errors both bump unread so the result
+                    # remains visible in the bell drawer.
                     _state["unread_count"] = (
                         _state.get("unread_count", 0) + 1
                     )
@@ -1516,13 +1577,25 @@ async def _execute_task(task: dict) -> None:
                         _state["history"] = _state["history"][-_HISTORY_CAP:]
                     try:
                         _save_state()
-                    except SchedulerPersistenceError as exc:
+                    except SchedulerPersistenceError:
                         _restore_state(snapshot)
-                        error = f"SchedulerPersistenceError: {exc}"
-                        sys.stderr.write(
-                            f"[scheduler] task {tid} result was not persisted; "
-                            "in-memory mutation rolled back\n"
-                        )
+                        raise
+                    return False
+
+            try:
+                revoked = await obs.to_thread_io(
+                    "scheduler.run_result",
+                    tid,
+                    _persist_run_result,
+                    owned=True,
+                )
+            except SchedulerPersistenceError as exc:
+                revoked = False
+                error = f"SchedulerPersistenceError: {exc}"
+                sys.stderr.write(
+                    f"[scheduler] task {tid} result was not persisted; "
+                    "in-memory mutation rolled back\n"
+                )
             try:
                 from .activity import activity as _activity
                 current = asyncio.current_task()
@@ -1532,11 +1605,15 @@ async def _execute_task(task: dict) -> None:
                         or current in _RUN_ACTIVITY_STARTED
                     )
                 if should_finish_activity:
-                    _activity.finish(
+                    await obs.to_thread_io(
+                        "scheduler.activity_finish",
+                        sid,
+                        _activity.finish,
                         sid,
                         "cancelled" if (cancelled or revoked) else (
                             "failed" if error else "completed"),
                         owner_id=activity_owner_id,
+                        owned=True,
                     )
             except Exception as e:
                 sys.stderr.write(
@@ -1628,31 +1705,44 @@ async def _scheduler_loop() -> None:
     while True:
         try:
             now = time.time()
-            with _STATE_LOCK:
-                snapshot = list(_state["tasks"].values())
-            for task in snapshot:
-                if not task.get("enabled", True):
-                    continue
-                nr = task.get("next_run")
-                if nr and nr <= now:
-                    # Advance next_run optimistically so a long-running
-                    # task doesn't fire twice if we tick again before it
-                    # finishes.
-                    with _STATE_LOCK:
-                        state_snapshot = copy.deepcopy(_state)
+
+            committed_due: list[dict] = []
+
+            def _advance_due_tasks() -> list[dict]:
+                with _STATE_LOCK:
+                    due = [
+                        task for task in _state["tasks"].values()
+                        if task.get("enabled", True)
+                        and task.get("next_run")
+                        and task["next_run"] <= now
+                    ]
+                    if not due:
+                        return []
+                    state_snapshot = copy.deepcopy(_state)
+                    for task in due:
+                        # Persist advancement before launch so a long-running
+                        # task cannot fire twice on a later scheduler tick.
                         task["next_run"] = _compute_next_run(task["schedule"])
-                        # A `once` task fires exactly once — after firing it
-                        # has no future next_run, so disable it too. This
-                        # flips the UI toggle off so the user sees it's spent,
-                        # instead of a dead-enabled task that can never fire
-                        # again.
                         if (task.get("schedule") or {}).get("kind") == "once":
                             task["enabled"] = False
-                        try:
-                            _save_state()
-                        except Exception:
-                            _restore_state(state_snapshot)
-                            raise
+                    try:
+                        _save_state()
+                    except Exception:
+                        _restore_state(state_snapshot)
+                        raise
+                    committed_due.extend(due)
+                    return due
+
+            try:
+                due_tasks = await obs.to_thread_io(
+                    "scheduler.advance_due", "scheduler", _advance_due_tasks,
+                    owned=True,
+                )
+            except asyncio.CancelledError:
+                # owned I/O joined the commit. Preserve launch-after-commit even
+                # when shutdown arrives during fsync, then propagate cancellation.
+                due_tasks = list(committed_due)
+                for task in due_tasks:
                     task_obj = _track_task(
                         asyncio.create_task(_execute_task(task)),
                         task_id=str(task.get("id") or ""),
@@ -1662,7 +1752,20 @@ async def _scheduler_loop() -> None:
                             else ""
                         ),
                     )
-                    task_obj.add_done_callback(_make_task_done(task.get("id", "?")))
+                    task_obj.add_done_callback(
+                        _make_task_done(task.get("id", "?")))
+                raise
+            for task in due_tasks:
+                task_obj = _track_task(
+                    asyncio.create_task(_execute_task(task)),
+                    task_id=str(task.get("id") or ""),
+                    session_id=(
+                        str(task.get("session_id") or "")
+                        if _effective_session_mode(task) == "reuse"
+                        else ""
+                    ),
+                )
+                task_obj.add_done_callback(_make_task_done(task.get("id", "?")))
         except Exception as e:
             sys.stderr.write(f"[scheduler] loop error: {e}\n")
         await asyncio.sleep(60)
@@ -1692,39 +1795,61 @@ async def start_scheduler() -> None:
     # generous enough to cover overnight outages while filtering
     # actually-stale entries.
     _CATCHUP_MAX_AGE_S = 24 * 3600
-    with _STATE_LOCK:
-        _load_state()
-        state_snapshot = copy.deepcopy(_state)
-        for task in _state["tasks"].values():
-            sched = task.get("schedule")
-            if not sched:
-                continue
-            nr = task.get("next_run")
-            # If next_run is in the past AND the task is enabled, the window
-            # was missed while we were down. Disabled tasks just get next_run
-            # rolled forward (no catch-up), matching their "don't fire" intent.
-            if (nr and nr <= now and task.get("enabled", True)
-                    and (now - nr) < _CATCHUP_MAX_AGE_S):
-                missed.append(task)
-            elif nr and nr <= now and task.get("enabled", True):
-                sys.stderr.write(
-                    f"[scheduler] skipping stale catch-up for task "
-                    f"{task.get('id','?')} ({task.get('name','?')}): "
-                    f"missed {(now - nr) / 3600:.1f}h ago, beyond 24h window\n")
-            task["next_run"] = _compute_next_run(sched)
-            # A spent `once` task (date in the past → no future next_run)
-            # should be disabled, not left dead-enabled. Covers both tasks
-            # that just missed their window (already queued for catch-up
-            # above, so they still fire one final time) and ones that fired
-            # in a previous run but stayed enabled. Future-dated `once` tasks
-            # keep next_run set, so they stay enabled until they fire.
-            if sched.get("kind") == "once" and task["next_run"] is None:
-                task["enabled"] = False
-        try:
-            _save_state()
-        except Exception:
-            _restore_state(state_snapshot)
-            raise
+    startup_snapshot: dict | None = None
+
+    def _load_and_advance_startup() -> list[dict]:
+        nonlocal startup_snapshot
+        startup_missed: list[dict] = []
+        with _STATE_LOCK:
+            _load_state()
+            state_snapshot = copy.deepcopy(_state)
+            startup_snapshot = state_snapshot
+            for task in _state["tasks"].values():
+                sched = task.get("schedule")
+                if not sched:
+                    continue
+                nr = task.get("next_run")
+                # Enabled tasks missed within the bounded outage window catch up
+                # once; stale or disabled tasks only roll their schedule forward.
+                if (nr and nr <= now and task.get("enabled", True)
+                        and (now - nr) < _CATCHUP_MAX_AGE_S):
+                    startup_missed.append(task)
+                elif nr and nr <= now and task.get("enabled", True):
+                    sys.stderr.write(
+                        f"[scheduler] skipping stale catch-up for task "
+                        f"{task.get('id','?')} ({task.get('name','?')}): "
+                        f"missed {(now - nr) / 3600:.1f}h ago, beyond 24h window\n")
+                task["next_run"] = _compute_next_run(sched)
+                if sched.get("kind") == "once" and task["next_run"] is None:
+                    task["enabled"] = False
+            try:
+                _save_state()
+            except Exception:
+                _restore_state(state_snapshot)
+                raise
+        return startup_missed
+
+    try:
+        missed = await obs.to_thread_io(
+            "scheduler.startup_state", "scheduler", _load_and_advance_startup,
+            owned=True,
+        )
+    except asyncio.CancelledError:
+        # Startup did not reach its catch-up launch boundary. Restore the exact
+        # pre-advance schedule so the next process can recover the missed window.
+        if startup_snapshot is not None:
+            def _rollback_startup_advance() -> None:
+                with _STATE_LOCK:
+                    _restore_state(startup_snapshot)
+                    _save_state()
+
+            await obs.to_thread_io(
+                "scheduler.startup_rollback",
+                "scheduler",
+                _rollback_startup_advance,
+                owned=True,
+            )
+        raise
     # Resolve crash-interrupted deletions before starting new scheduled work.
     # Failures are logged and retain their exact durable intent, so scheduler
     # availability does not depend on one damaged external session tree.

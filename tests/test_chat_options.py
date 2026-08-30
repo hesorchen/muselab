@@ -91,8 +91,8 @@ def test_third_party_provider_enables_sdk_skills(app_module, monkeypatch, tmp_pa
     assert captured["connected"] is True
     assert client is not None
     assert captured["skills"] == "all"
-    assert "can_use_tool" not in captured
-    assert captured["permission_prompt_tool_name"] == "stdio"
+    assert callable(captured["can_use_tool"])
+    assert "permission_prompt_tool_name" not in captured
     assert [m.matcher for m in captured["hooks"]["PreToolUse"]] == [
         "AskUserQuestion"
     ]
@@ -380,8 +380,12 @@ def test_turn_perf_summary_is_emitted_once_without_content(
     broadcast.finish()
     broadcast.finish()
 
-    assert len(events) == 1
-    event, fields = events[0]
+    assert len(events) == 2
+    startup_event, startup_fields = events[0]
+    assert startup_event == "chat.startup"
+    assert startup_fields["status"] == "ready"
+    assert startup_fields["client"] == "warm"
+    event, fields = events[1]
     assert event == "chat.turn"
     assert fields["sid8"] == "12345678"
     assert len(fields["turn8"]) == 8
@@ -389,10 +393,28 @@ def test_turn_perf_summary_is_emitted_once_without_content(
     assert fields["client"] == "warm"
     assert fields["status"] == "completed"
     assert fields["background_count"] == 2
-    rendered = repr(fields)
+    rendered = repr((startup_fields, fields))
     assert "synthetic-private-prompt" not in rendered
     assert "synthetic-private-response" not in rendered
     assert "private-session" not in rendered
+
+
+def test_startup_perf_summary_passes_real_privacy_field_policy(
+    app_module, monkeypatch, capsys,
+):
+    from backend import chat as chat_mod
+
+    monkeypatch.setenv("MUSELAB_PERF_LOG", "1")
+    capsys.readouterr()
+    broadcast = chat_mod.TurnBroadcast("startup-policy-session")
+    broadcast.perf_query_write_ms = 3
+
+    broadcast.emit_startup_perf("ready")
+
+    logged = capsys.readouterr().err
+    assert '"event":"chat.startup"' in logged
+    assert '"sdk_write_ms":3' in logged
+    assert "query_write_ms" not in logged
 
 
 def test_context_probe_failure_log_is_deduplicated_and_private(
@@ -504,10 +526,11 @@ def test_plan_runtime_can_return_to_bypass_and_installs_exit_hooks(
     assert "muselab" not in captured["mcp_servers"]
     for hook_name in ("PostToolUse", "PostToolUseFailure"):
         matchers = captured["hooks"][hook_name]
-        assert len(matchers) == 1
-        assert matchers[0].matcher == "ExitPlanMode"
-        assert len(matchers[0].hooks) == 1
-        assert callable(matchers[0].hooks[0])
+        assert [matcher.matcher for matcher in matchers] == [
+            "EnterPlanMode", "ExitPlanMode",
+        ]
+        assert all(len(matcher.hooks) == 1 for matcher in matchers)
+        assert all(callable(matcher.hooks[0]) for matcher in matchers)
 
 
 def test_plan_runtime_with_default_return_does_not_gain_bypass_capability(
@@ -579,7 +602,8 @@ def test_codex_gateway_effort_reaches_sdk_options(app_module, monkeypatch, tmp_p
     assert [m.matcher for m in pre_tool_hooks] == [
         "Skill", "AskUserQuestion"
     ]
-    assert captured["permission_prompt_tool_name"] == "stdio"
+    assert callable(captured["can_use_tool"])
+    assert "permission_prompt_tool_name" not in captured
     assert "AskUserQuestion" not in captured["disallowed_tools"]
     skill_guard = pre_tool_hooks[0]
 
@@ -602,7 +626,8 @@ def test_codex_gateway_effort_reaches_sdk_options(app_module, monkeypatch, tmp_p
     assert [m.matcher for m in opted_out["hooks"]["PreToolUse"]] == [
         "AskUserQuestion"
     ]
-    assert opted_out["permission_prompt_tool_name"] == "stdio"
+    assert callable(opted_out["can_use_tool"])
+    assert "permission_prompt_tool_name" not in opted_out
     assert "AskUserQuestion" not in opted_out["disallowed_tools"]
 
 
@@ -700,7 +725,8 @@ def test_bare_gpt_provider_never_inherits_codex_gateway_headers(
     assert [m.matcher for m in captured["hooks"]["PreToolUse"]] == [
         "AskUserQuestion"
     ]
-    assert captured["permission_prompt_tool_name"] == "stdio"
+    assert callable(captured["can_use_tool"])
+    assert "permission_prompt_tool_name" not in captured
     assert "AskUserQuestion" not in captured["disallowed_tools"]
 
 

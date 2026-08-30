@@ -153,6 +153,44 @@ def test_cancelled_reconcile_rolls_back_before_commit(
     assert store.bootstrap(workspace_id) == baseline
 
 
+def test_detached_apply_verifies_cursor_and_root_in_one_transaction(
+    app_module,
+    temp_root: Path,
+):
+    from backend.workspace_store import (
+        WorkspaceStore,
+        compact_scan_rows,
+        scan_workspace,
+    )
+    from backend.workspaces import registry
+
+    workspace_id = registry.id_for(temp_root)
+    store = WorkspaceStore(temp_root)
+    store.reconcile(workspace_id, temp_root, "root", primary=True)
+    cursor = store.current_cursor(workspace_id)
+    report = {}
+    rows = compact_scan_rows(scan_workspace(temp_root, report=report))
+
+    stale = store.apply_reconcile_snapshot(
+        workspace_id,
+        temp_root.parent / "different-root",
+        "root",
+        rows,
+        report,
+        expected_cursor=cursor,
+        primary=True,
+    )
+
+    assert stale == {
+        "_stale": True,
+        "cursor": cursor,
+        "changes": [],
+        "resync": True,
+    }
+    assert store.current_cursor(workspace_id) == cursor
+    assert store.bootstrap(workspace_id)["root"] == str(temp_root.resolve())
+
+
 def test_compact_bootstrap_caps_each_expanded_directory(
     app_module,
     temp_root: Path,

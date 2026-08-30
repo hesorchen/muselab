@@ -502,11 +502,12 @@ def build_callback_for_session(
 ):
     """Return an async callable matching the SDK's can_use_tool signature.
 
-    The callback is installed only for permission modes that can ask. The SDK
-    explicitly does not invoke it for calls already approved by bypass,
-    acceptEdits, allow rules, or whole-tool Skill grants. It is therefore a
-    prompt resolver, not a universal tool gate. Use a PreToolUse hook when an
-    operation must observe every tool call."""
+    The callback is installed for every ordinary workspace runtime, including
+    bypass. The SDK still does not invoke it for calls already approved by
+    bypass, acceptEdits, allow rules, or whole-tool Skill grants; keeping it
+    attached lets a native EnterPlanMode transition use the same stdio control
+    bridge for ExitPlanMode. It remains a prompt resolver, not a universal tool
+    gate. Use a PreToolUse hook when an operation must observe every tool call."""
 
     async def can_use_tool(
             tool_name: str, tool_input: dict[str, Any], context: Any

@@ -112,6 +112,103 @@ def test_cache_hit_reuses_same_client(chat_mod, monkeypatch):
         ("sid-1", "claude-sonnet-4-6", "auto", "")]
 
 
+def test_startup_phase_observer_cannot_break_client_creation(
+    chat_mod, monkeypatch,
+):
+    _patch_builder(monkeypatch, chat_mod)
+    monkeypatch.setattr(chat_mod, "_has_enabled_external_mcp", lambda: True)
+
+    async def ready(_client):
+        return None
+
+    monkeypatch.setattr(chat_mod, "_await_mcp_ready", ready)
+    observed = []
+
+    def broken_observer(phase, duration_ms):
+        observed.append((phase, duration_ms))
+        raise RuntimeError("observer failure")
+
+    client = asyncio.run(chat_mod.get_client(
+        "sid-observer", "claude-sonnet-4-6", "bypassPermissions",
+        startup_phase=broken_observer,
+    ))
+
+    assert client is chat_mod._clients[
+        ("sid-observer", "claude-sonnet-4-6", "auto", "")
+    ]
+    assert {phase for phase, _duration in observed} >= {
+        "disconnect", "pool", "creation_lock", "connect", "tools", "mcp",
+        "pool_commit",
+    }
+    assert all(duration >= 0 for _phase, duration in observed)
+
+
+def test_startup_phase_records_connect_and_mcp_failures(
+    chat_mod, monkeypatch,
+):
+    phases = []
+
+    async def connect_failure(*_args, **_kwargs):
+        await asyncio.sleep(0)
+        raise RuntimeError("connect failed")
+
+    monkeypatch.setattr(chat_mod, "_build_and_connect_client", connect_failure)
+    with pytest.raises(RuntimeError, match="connect failed"):
+        asyncio.run(chat_mod.get_client(
+            "sid-connect-fail", "claude-sonnet-4-6", "bypassPermissions",
+            startup_phase=lambda phase, duration: phases.append((phase, duration)),
+        ))
+    assert any(phase == "connect" and duration >= 0
+               for phase, duration in phases)
+
+    _patch_builder(monkeypatch, chat_mod)
+    monkeypatch.setattr(chat_mod, "_has_enabled_external_mcp", lambda: True)
+
+    async def mcp_failure(_client):
+        await asyncio.sleep(0)
+        raise RuntimeError("mcp failed")
+
+    monkeypatch.setattr(chat_mod, "_await_mcp_ready", mcp_failure)
+    phases.clear()
+    with pytest.raises(RuntimeError, match="mcp failed"):
+        asyncio.run(chat_mod.get_client(
+            "sid-mcp-fail", "claude-sonnet-4-6", "bypassPermissions",
+            startup_phase=lambda phase, duration: phases.append((phase, duration)),
+        ))
+    names = [phase for phase, _duration in phases]
+    assert "tools" in names
+    assert any(phase == "mcp" and duration >= 0
+               for phase, duration in phases)
+    assert not any(key[0] == "sid-mcp-fail" for key in chat_mod._clients)
+
+
+def test_startup_phase_records_disconnect_fence_failure(chat_mod, monkeypatch):
+    phases = []
+
+    async def disconnect_not_ready(*_args, **_kwargs):
+        await asyncio.sleep(0)
+        return False
+
+    monkeypatch.setattr(
+        chat_mod, "_join_session_disconnects", disconnect_not_ready)
+    with pytest.raises(
+        chat_mod.RuntimeCleanupTimeout,
+        match="cleanup is still in progress",
+    ):
+        asyncio.run(chat_mod.get_client(
+            "sid-disconnect-fail",
+            "claude-sonnet-4-6",
+            "bypassPermissions",
+            startup_phase=lambda phase, duration: phases.append(
+                (phase, duration)),
+        ))
+
+    assert any(
+        phase == "disconnect" and duration >= 0
+        for phase, duration in phases
+    )
+
+
 def test_different_key_builds_new_client(chat_mod, monkeypatch):
     """Switching model, effort, or service tier builds a distinct runtime."""
     _patch_builder(monkeypatch, chat_mod)

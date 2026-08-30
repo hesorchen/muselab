@@ -48,6 +48,7 @@ from claude_agent_sdk import list_sessions as sdk_list_sessions
 from claude_agent_sdk import get_session_info as sdk_get_session_info
 from claude_agent_sdk.types import PermissionMode
 from .settings import ROOT, atomic_write_text
+from .task_summaries import normalize_task_summary_fields
 from .workspaces import registry as workspace_registry
 
 
@@ -1357,6 +1358,41 @@ def update_permission(
         return False
 
 
+def commit_plan_enter(
+    sid: str,
+    *,
+    expected_permission: str,
+    plan_return_permission: str,
+) -> bool:
+    """Compare-and-set a completed native EnterPlanMode transition.
+
+    The live CLI changes mode before its PostToolUse hook runs. Persist that
+    transition only when no browser or sibling runtime changed the session's
+    launch permission in the meantime; otherwise the caller discards the stale
+    runtime instead of overwriting the newer choice.
+    """
+    if expected_permission == "plan":
+        return False
+    target = _normalize_plan_return_permission("plan", plan_return_permission)
+    with _INDEX_LOCK:
+        idx = _load_index()
+        for s in idx:
+            if s["id"] != sid:
+                continue
+            current = (
+                s.get("permission", "").strip()
+                if isinstance(s.get("permission"), str)
+                else ""
+            )
+            if current != expected_permission:
+                return False
+            s["permission"] = "plan"
+            s["plan_return_permission"] = target
+            _save_index(idx)
+            return True
+        return False
+
+
 def commit_plan_exit(
     sid: str,
     permission: str,
@@ -1480,7 +1516,7 @@ def _normalize_runtime_task_overlays(raw: Any) -> dict[str, dict]:
     if not isinstance(raw, dict):
         return {}
     return {
-        str(task_id): dict(value)
+        str(task_id): normalize_task_summary_fields(value)
         for task_id, value in raw.items()
         if task_id and isinstance(value, dict)
     }
@@ -1529,6 +1565,7 @@ _RUNTIME_TASK_TERMINAL_STATES = frozenset({
 _RUNTIME_TASK_CROSS_COPY_IDENTITY_FIELDS = frozenset({
     "tool_use_id", "description",
 })
+_RUNTIME_TASK_OVERLAY_COMPACTED_SIDS: set[str] = set()
 
 
 def _normalized_runtime_task_state(value: Any) -> Any:
@@ -1570,7 +1607,13 @@ def set_runtime_task_overlay(
             overlays = data.setdefault("runtime_task_overlays", {})
             if not isinstance(overlays, dict):
                 overlays = {}
-                data["runtime_task_overlays"] = overlays
+            overlays_compacted = False
+            if sid not in _RUNTIME_TASK_OVERLAY_COMPACTED_SIDS:
+                normalized_overlays = _normalize_runtime_task_overlays(overlays)
+                overlays_compacted = normalized_overlays != overlays
+                overlays = normalized_overlays
+                _RUNTIME_TASK_OVERLAY_COMPACTED_SIDS.add(sid)
+            data["runtime_task_overlays"] = overlays
             stored = overlays.get(task_id)
             current = dict(stored) if isinstance(stored, dict) else {
                 "task_id": task_id,
@@ -1585,6 +1628,7 @@ def set_runtime_task_overlay(
                 key: value for key, value in fields.items()
                 if value is not None
             }
+            incoming = normalize_task_summary_fields(incoming)
             if "state" in incoming:
                 incoming["state"] = _normalized_runtime_task_state(
                     incoming["state"]
@@ -1634,9 +1678,11 @@ def set_runtime_task_overlay(
                     updated["state"]
                 )
             updated["task_id"] = task_id
-            if isinstance(stored, dict) and stored == updated:
+            target_changed = not isinstance(stored, dict) or stored != updated
+            if not target_changed and not overlays_compacted:
                 return False
-            overlays[task_id] = updated
+            if target_changed:
+                overlays[task_id] = updated
             _save_sidecar(sid, data)
             return True
 
@@ -1739,16 +1785,19 @@ def _replace_runtime_task_overlay_snapshots(
             overlays = data.setdefault("runtime_task_overlays", {})
             if not isinstance(overlays, dict):
                 overlays = {}
-                data["runtime_task_overlays"] = overlays
+            normalized_overlays = _normalize_runtime_task_overlays(overlays)
+            overlays_compacted = normalized_overlays != overlays
+            overlays = normalized_overlays
+            data["runtime_task_overlays"] = overlays
             changed = 0
             for task_id, snapshot in snapshots.items():
-                replacement = dict(snapshot)
+                replacement = normalize_task_summary_fields(snapshot)
                 replacement["task_id"] = task_id
                 if overlays.get(task_id) == replacement:
                     continue
                 overlays[task_id] = replacement
                 changed += 1
-            if changed:
+            if changed or overlays_compacted:
                 _save_sidecar(sid, data)
             return changed
 
@@ -1909,34 +1958,102 @@ def sidecar_signature(sid: str) -> tuple[float, int] | None:
         return None
 
 
+def get_session_usage_summary(sid: str) -> dict | None:
+    """Return the persisted usage summary without hiding malformed schemas."""
+    summary = _load_sidecar(sid).get("usage_summary")
+    return dict(summary) if isinstance(summary, dict) else None
+
+
+def set_session_usage_summary(sid: str, summary: dict) -> bool:
+    """Persist usage hydration under the deletion and corruption fences."""
+    with session_lifecycle_lock(sid):
+        with _QUEUE_LOCK:
+            if sid in _DELETED_SESSION_IDS:
+                return False
+        with _SIDECAR_LOCK:
+            data = _load_sidecar(sid, use_cache=False)
+            data["usage_summary"] = dict(summary)
+            _save_sidecar(sid, data)
+            return True
+
+
+def set_session_usage_summary_if_turn_matches(
+    sid: str,
+    expected_turn_id: str,
+    summary: dict,
+) -> bool:
+    """Refine usage only while the same terminal turn owns the sidecar."""
+    with session_lifecycle_lock(sid):
+        with _QUEUE_LOCK:
+            if sid in _DELETED_SESSION_IDS:
+                return False
+        with _SIDECAR_LOCK:
+            data = _load_sidecar(sid, use_cache=False)
+            current = data.get("usage_summary")
+            update = current.get("update") if isinstance(current, dict) else None
+            current_turn_id = (
+                str(update.get("turn_id") or "")
+                if isinstance(update, dict) else ""
+            )
+            if not expected_turn_id or current_turn_id != expected_turn_id:
+                return False
+            data["usage_summary"] = dict(summary)
+            _save_sidecar(sid, data)
+            return True
+
+
+def set_terminal_annotation_and_usage(
+    sid: str,
+    msg_uuid: str,
+    summary: dict | None,
+    **fields: Any,
+) -> bool:
+    """Persist the terminal footer and optional usage summary in one replace."""
+    with session_lifecycle_lock(sid):
+        with _QUEUE_LOCK:
+            if sid in _DELETED_SESSION_IDS:
+                return False
+        with _SIDECAR_LOCK:
+            data = _load_sidecar(sid, use_cache=False)
+            _merge_message_annotation(data, msg_uuid, fields)
+            if isinstance(summary, dict):
+                data["usage_summary"] = dict(summary)
+            _save_sidecar(sid, data)
+            return True
+
+
+def _merge_message_annotation(
+    data: dict,
+    msg_uuid: str,
+    fields: dict[str, Any],
+) -> None:
+    msgs = data.setdefault("messages", {})
+    cur = msgs.setdefault(msg_uuid, {})
+    sticky_cancelled = (
+        cur.get("turn_status") == "cancelled"
+        and fields.get("turn_status") not in (None, "cancelled")
+    )
+    for key, value in fields.items():
+        if value is None:
+            continue
+        if sticky_cancelled and key in {"turn_status", "ts", "elapsed_s"}:
+            continue
+        cur[key] = value
+
+
 def set_message_annotation(sid: str, msg_uuid: str, **fields: Any) -> None:
     """Update one message's annotations (cost, model, images, etc.).
     Fields with value None are skipped (use update with explicit empty
     if you want to clear). Atomic per-call write."""
-    # Linearize terminal footer writes with explicit deletion. A Result worker
-    # every worker arriving after the tombstone is a no-op and cannot recreate
-    # the deleted sidecar.
+    # Linearize terminal footer writes with explicit deletion. Every worker
+    # arriving after the tombstone is a no-op and cannot recreate the sidecar.
     with session_lifecycle_lock(sid):
         with _QUEUE_LOCK:
             if sid in _DELETED_SESSION_IDS:
                 return
         with _SIDECAR_LOCK:
             data = _load_sidecar(sid, use_cache=False)
-            msgs = data.setdefault("messages", {})
-            cur = msgs.setdefault(msg_uuid, {})
-            # Explicit user cancellation is monotonic truth.  A force-stopped
-            # CLI can append its AssistantMessage/ResultMessage late; generic
-            # terminal bookkeeping then attempts to write ``completed``.
-            sticky_cancelled = (
-                cur.get("turn_status") == "cancelled"
-                and fields.get("turn_status") not in (None, "cancelled")
-            )
-            for k, v in fields.items():
-                if v is None:
-                    continue
-                if sticky_cancelled and k in {"turn_status", "ts", "elapsed_s"}:
-                    continue
-                cur[k] = v
+            _merge_message_annotation(data, msg_uuid, fields)
             _save_sidecar(sid, data)
 
 

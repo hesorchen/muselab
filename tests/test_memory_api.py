@@ -22,9 +22,13 @@ def test_confirm_correct_and_forget_via_api(client, auth):
     assert detail["sources"][0]["source_type"] == "user_action"
     feedback = client.post(
         f"/api/memory/items/{item['id']}/feedback", headers=auth,
-        json={"useful": True, "recall_id": "recall-1"})
+        json={"useful": True})
     assert feedback.status_code == 200
-    assert feedback.json()["attributes"]["helpful_count"] == 1
+    assert feedback.json()["recall_stats"]["helpful_count"] == 1
+    invalid_feedback = client.post(
+        f"/api/memory/items/{item['id']}/feedback", headers=auth,
+        json={"useful": False, "recall_id": "missing-recall"})
+    assert invalid_feedback.status_code == 409
 
     corrected = client.post(
         f"/api/memory/items/{item['id']}/correct", headers=auth,
@@ -38,6 +42,36 @@ def test_confirm_correct_and_forget_via_api(client, auth):
     assert client.delete(f"/api/memory/items/{new_id}", headers=auth).status_code == 200
     assert client.get(
         f"/api/memory/items/{new_id}", headers=auth).json()["status"] == "deleted"
+
+
+def test_memory_traceback_stats_and_verified_backup_api(client, auth):
+    session_id = "4b1cb19f-d124-4f94-95eb-f1fc31c69b23"
+    message_id = "fb20ecb0-a200-422c-9705-fe780cfc0921"
+    created = client.post("/api/memory/items", headers=auth, json={
+        "kind": "fact", "content": "带现场的记忆", "tags": [],
+        "source_session_id": session_id,
+        "source_message_id": message_id,
+        "source_role": "user",
+    }).json()
+    listed = client.get("/api/memory/items", headers=auth).json()["items"]
+    item = next(row for row in listed if row["id"] == created["id"])
+    assert item["recall_stats"]["recall_count"] == 0
+    traceback = client.get(
+        f"/api/memory/items/{created['id']}/traceback", headers=auth)
+    assert traceback.status_code == 200
+    site = traceback.json()["sites"][0]
+    assert site["session_id"] == session_id
+    assert site["message_id"] == message_id
+    assert "path" not in site
+
+    backed_up = client.post("/api/memory/backup", headers=auth)
+    assert backed_up.status_code == 200
+    receipt = backed_up.json()["backup"]
+    assert receipt["quick_check"] == "ok"
+    assert receipt["size_bytes"] > 0
+    listed_backups = client.get("/api/memory/backups", headers=auth).json()
+    assert listed_backups["items"][0]["id"] == receipt["id"]
+    assert listed_backups["items"][0]["exists"] is True
 
 
 def test_config_defaults_off_and_secrets_are_never_returned(client, auth, app_module):
