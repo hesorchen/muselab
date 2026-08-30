@@ -56,12 +56,19 @@ Check the logs:
 ```bash
 # Linux
 journalctl --user -u muselab -n 50
+# Privacy-safe performance summaries only
+journalctl --user -u muselab -f | grep '\[perf\]'
 # macOS
 log show --predicate 'process == "muselab"' --last 5m
 ```
 
 Most often a missing `.env` value (e.g. `MUSELAB_TOKEN` too short) or a port
 collision.
+
+`[perf]` rows contain stage durations, counts, status classifications, and
+short correlation IDs only. Tune the slow-request boundary with
+`MUSELAB_SLOW_REQUEST_MS` (default `500`); set `MUSELAB_PERF_LOG=0` only when
+you need to disable these summaries entirely.
 
 **Service stops when I log out (Linux).**
 Enable lingering so the user service keeps running:

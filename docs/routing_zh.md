@@ -19,13 +19,13 @@
 
 ## SDK 客户端池
 
-客户端缓存键为 `(session_id, model, effort)`，默认最多保活 3 个，可用 `MUSELAB_CLIENT_POOL_CAP` 调整。
+客户端缓存键为 `(session_id, model, effort, service_tier)`，默认最多保活 3 个，可用 `MUSELAB_CLIENT_POOL_CAP` 调整。
 
 - 同一个键的并发创建由专用锁合并。
 - 命中缓存时更新 LRU。
 - 权限模式是 SDK 进程的启动契约；与缓存运行时不符时会在安全边界重建，而不是悄悄沿用旧权限。
 - 活跃回合或仍有 SDK 后台任务的客户端不会被淘汰；必要时池可暂时超过上限。
-- 修改模型、effort、thinking 或权限后，下一次安全时机重建该会话运行时。
+- 修改模型、effort、service tier、thinking 或权限后，下一次安全时机重建该会话运行时。
 - 配置外部 MCP 时，首次连接会等待工具集稳定后再开始回合。
 
 同一会话的交互回合、定时任务、原生 compact 和其他 SDK 操作共享串行锁，防止同时读取同一个 CLI 流。
@@ -116,7 +116,9 @@ Activity Center 把每个会话的当前状态持久化在 `$MUSELAB_ROOT/.musel
 
 ## effort 与 thinking
 
-- `effort` 按会话保存，也是客户端缓存键的一部分；有效值为 `low`、`medium`、`high`、`xhigh`、`max`，空值使用 SDK 默认。
+- `effort` 按会话保存，也是客户端缓存键的一部分；规范值为 `auto`、`low`、`medium`、`high`、`xhigh`、`max` 与按模型开放的 `ultra`；旧空值会规范化为 `auto`。
+- Codex 的 `service_tier` 独立保存；`fast` 映射到 Gateway 的 `priority` 服务层，也参与缓存键，因为该 header 在 SDK client 启动时即固定。
+- Ultra 在线路上使用 `max` 推理，并保留 subagent spawn depth 与 concurrency 上限；它不激活预装工作流，不安装自定义 system prompt，也不改写用户 transcript。
 - 扩展思考预算默认 10,000 token，可用 `MUSELAB_THINKING_BUDGET` 调整。
 - provider 是否显示 effort、是否支持 thinking，以 `/api/chat/providers` 返回的能力为准。
 - 部分 Anthropic 兼容 provider 会省略 thinking 块必需的 `signature` 键。第三方路由会在内存解析副本中以空串占位，让 SDK 流能够走完，随后从持久化 JSONL 中删除无法验证的 thinking 块。原生 Claude 路由仍使用 SDK 严格解析；muselab 不会伪造有效签名。

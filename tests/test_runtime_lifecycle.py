@@ -53,25 +53,99 @@ def test_restart_dispatch_is_non_blocking(app_module, monkeypatch):
     assert calls[0][1]["start_new_session"] is True
 
 
-def test_access_log_filter_redacts_tokens_and_tickets(app_module):
-    record = logging.LogRecord(
+def _access_record(path: str, status: int = 200) -> logging.LogRecord:
+    return logging.LogRecord(
         "uvicorn.access",
         logging.INFO,
         "",
         0,
         '%s - "%s %s HTTP/%s" %d',
-        (
-            "127.0.0.1",
-            "GET",
-            "/events?ticket=once-secret&token=reusable-secret&path=x",
-            "1.1",
-            200,
-        ),
+        ("127.0.0.1", "GET", path, "1.1", status),
         None,
     )
 
-    assert app_module._TokenFilter().filter(record)
-    assert record.args[2] == "/events?ticket=***&token=***&path=x"
+
+def test_access_log_filter_redacts_every_query_value_and_uuid(app_module):
+    session_id = "123e4567-e89b-42d3-a456-426614174000"
+    record = _access_record(
+        f"/api/chat/sessions/{session_id}?ticket=once-secret&token=reusable-secret"
+        "&path=private%2Fnotes.md&q=secret+search&bad%20name=also-secret"
+    )
+
+    assert app_module._TokenFilter().filter(record) is False
+    target = record.args[2]
+    assert target == (
+        "/api/chat/sessions/:id?ticket=***&token=***&path=***&q=***&param=***"
+    )
+    assert "once-secret" not in target
+    assert "reusable-secret" not in target
+    assert session_id not in target
+    assert "private" not in target
+
+
+def test_access_log_filter_drops_success_error_and_poll_records(app_module):
+    successful_poll = _access_record(
+        "/api/chat/sessions?limit=15&ids=private", status=304)
+    failed_poll = _access_record(
+        "/api/chat/sessions?limit=15&ids=private", status=503)
+    ordinary = _access_record("/api/chat/sessions/not-a-uuid?full=true", status=200)
+
+    assert app_module._TokenFilter().filter(successful_poll) is False
+    assert successful_poll.args[2] == "/api/chat/sessions?limit=***&ids=***"
+    assert app_module._TokenFilter().filter(failed_poll) is False
+    assert failed_poll.args[2] == "/api/chat/sessions?limit=***&ids=***"
+    assert app_module._TokenFilter().filter(ordinary) is False
+
+
+def test_access_log_filter_fails_closed_on_unknown_record_shape(app_module):
+    record = logging.LogRecord(
+        "uvicorn.access",
+        logging.INFO,
+        "",
+        0,
+        "GET /legacy?prompt=private-content",
+        (),
+        None,
+    )
+
+    assert app_module._TokenFilter().filter(record) is False
+    assert record.getMessage() == "access event suppressed: unsupported log shape"
+    assert "private-content" not in record.getMessage()
+
+
+def test_access_log_filter_install_replaces_prior_generation(app_module):
+    logger = logging.getLogger("uvicorn.access")
+    unrelated = logging.Filter("keep-me")
+    logger.addFilter(unrelated)
+    try:
+        previous = next(
+            item for item in logger.filters
+            if getattr(item, "_muselab_access_filter", False)
+        )
+        app_module._install_access_log_filter()
+        installed = [
+            item for item in logger.filters
+            if getattr(item, "_muselab_access_filter", False)
+        ]
+        assert len(installed) == 1
+        assert installed[0] is not previous
+        assert unrelated in logger.filters
+    finally:
+        logger.removeFilter(unrelated)
+
+
+def test_startup_config_banner_does_not_log_root_path(
+    app_module, monkeypatch, capsys,
+):
+    private_root = "/private/workspace/customer-project"
+    monkeypatch.setenv("MUSELAB_ROOT", private_root)
+    capsys.readouterr()
+
+    app_module._startup_config_banner()
+
+    stderr = capsys.readouterr().err
+    assert "root_configured=true" in stderr
+    assert private_root not in stderr
 
 
 def test_scheduler_shutdown_cancels_loop_and_runs(app_module):

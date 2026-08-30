@@ -64,7 +64,7 @@ The `Dockerfile` uses two stages to keep the final image slim:
 
 **Stage 1 — builder:** `python:3.12-slim` base; copies pinned `uv`/`uvx`; installs production Python dependencies with `uv sync --frozen --no-dev --no-install-project`.
 
-**Stage 2 — runtime:** fresh `python:3.12-slim`; installs `curl`, `git`, Node 20, and a pinned Claude Code CLI; copies the pre-built `.venv` plus `backend/`, `frontend/`, `skills/`, and `scripts/templates/`; creates a non-root `muse` user; exposes port 8765; and declares an `/api/health` health check.
+**Stage 2 — runtime:** fresh `python:3.12-slim`; installs `curl`, `git`, Node 20, and a pinned Claude Code CLI; copies the pre-built `.venv`, `backend/`, `frontend/`, the empty `skills/` extension slot, and `scripts/templates/`; creates a non-root `muse` user; exposes port 8765; and declares an `/api/health` health check.
 
 ### docker-compose.yml
 

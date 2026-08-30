@@ -2,174 +2,106 @@
 
 > [简体中文](skills_zh.md)
 
-Skills are SKILL.md instruction packs that the Claude Agent SDK loads at
-startup and makes available to Muse. When a task matches a skill's trigger,
-the model reads the skill's body and follows its protocol — no extra wiring
-required on your end. Skills work the same way in interactive chat,
-[scheduled tasks](scheduler.md), and any other context that runs the full
-agent loop.
+Skills are `SKILL.md` instruction packs discovered by the Claude Agent SDK.
+When a task matches a Skill's description, the model can load its reusable
+workflow. The same mechanism is available in interactive chat,
+[scheduled tasks](scheduler.md), and other contexts that run the full agent
+loop.
 
-**Example.** A skill called `changelog-formatter` might have a
-`description` starting with `"USE WHEN the user asks to format or generate
-a CHANGELOG entry"`. Whenever you ask Muse to write a changelog, the SDK
-surfaces that skill and the model adopts its output conventions
-automatically.
+Muselab's default checkout does **not** bundle any Skill payloads. The
+repository keeps an empty `skills/` extension slot and the general discovery,
+listing, and reviewed-generation mechanisms.
 
----
+Upgrades do not preserve the former preset names. Saved prompts, scheduled
+tasks, or external clients that explicitly invoke names such as
+`archive-curator`, `workspace-curator`, or `web-search` must be rewritten to
+describe the task directly or supplied with a user/plugin replacement Skill.
 
-## Bundled skills
+## Supported sources
 
-Muselab ships 12 supported skills out of the box: eight muselab-native
-(MIT) and four community-contributed. A deprecated native compatibility
-alias remains discoverable for one transition cycle, so the repository
-contains 13 skill directories in total. See `THIRD_PARTY_LICENSES.md` for
-upstream URLs and license details.
+Muselab preserves Skills from these sources:
 
-| Skill | What it does | Origin | External deps |
-|---|---|---|---|
-| `web-search` | Translates vague queries into targeted searches, opens at least one source to confirm recency, returns a cited answer with dates | muselab-native | `WebSearch` / `WebFetch` tool or `mcp__fetch__fetch` |
-| `markdown-formatter` | Normalises heading hierarchy, lists, tables, code fences, math delimiters, and Chinese full-width punctuation; returns the rewritten doc only | muselab-native | none |
-| `mermaid-helper` | Picks the right Mermaid diagram type, writes validated syntax, returns a fenced block plus a short explanation | muselab-native | none |
-| `code-reviewer` | Reviews code by severity order (bugs → security → correctness → performance → maintainability), with line references and fix snippets | muselab-native | none |
-| `citation-formatter` | Converts DOIs, arXiv IDs, PubMed IDs, and raw text into APA 7 / IEEE / GB/T 7714 / BibTeX; fetches authoritative metadata when possible | muselab-native | `WebFetch` or `mcp__fetch__fetch` (optional) |
-| `task-decomposer` | Turns a vague goal into an ordered task list with size estimates, a Definition of Done, critical-path steps, and flagged unknowns | muselab-native | none |
-| `summary-distiller` | Picks the right summary shape (TL;DR, key points, structured, action items) based on source type; preserves numbers, names, and dates verbatim | muselab-native | none |
-| `workspace-curator` | Organises the active workspace with a scan-first, proposal-first workflow and explicit confirmation before material changes | muselab-native | none |
-| `archive-curator` | Deprecated compatibility alias for `workspace-curator`, with the same proposal and safety boundaries | muselab-native | none |
-| `pptx` | Generates PowerPoint files by writing and running inline Python with `python-pptx` via the Bash tool | community | `python-pptx` (`pip install python-pptx`) |
-| `csv-analyzer` | Loads a CSV with `pandas`, profiles column types, generates conditional charts (PNG), outputs a complete analysis in one response | community | `pandas`; `matplotlib`/`seaborn` optional |
-| `translate` | Three-stage internal pipeline (literal → issue identification → polished reinterpretation); outputs final Chinese text only, preserving technical terms | community | none |
-| `meeting-notes` | Extracts decisions, action items (with owners and due dates), and next steps from raw notes or transcripts using four ready-made templates | community | none |
+- user-global Skills under `~/.claude/skills/`;
+- project and local Skills discovered from the active workspace;
+- installed Claude plugins;
+- reviewed generated Skills;
+- optional repository-local Skills added under `<muselab-repo>/skills/`.
 
----
+The Settings and chat Skills views dynamically enumerate repository-extension,
+user-global, and installed-plugin Skills. Active-workspace project/local Skills
+remain SDK-native runtime discovery and are not represented by that management
+list. Neither path relies on a fixed preset catalog.
 
 ## How discovery works
 
-Skill discovery is controlled by SDK-native options passed to
-`ClaudeAgentOptions`:
-
-**`setting_sources`:**
+Muselab passes SDK-native discovery options to `ClaudeAgentOptions`:
 
 ```python
 setting_sources=["user", "project", "local"]
-```
-
-This tells the SDK to load `CLAUDE.md` and Claude configuration from three
-scopes:
-
-| Scope | Resolves to |
-|---|---|
-| `user` | `~/.claude/` — user-global config shared with Claude Code CLI |
-| `project` | the active workspace `cwd` (see below) |
-| `local` | `.claude/` inside `cwd` |
-
-**`cwd` is the active workspace:**
-
-```python
 cwd=str(workspace_root)
-```
-
-Because the active workspace is not the muselab checkout, muselab also passes
-its repository as a local SDK plugin:
-
-```python
 plugins=[{"type": "local", "path": "<muselab-repo>"}]
+skills="all"
 ```
 
-That plugin exposes the bundled `skills/` directory in every workspace.
-Output files produced by skills such as `pptx` or `csv-analyzer` still land
-in the active workspace unless you specify an explicit path.
+`cwd` is the active workspace, so project and local configuration follow the
+workspace selected for the session. The local plugin keeps the repository's
+empty `skills/` extension slot available without copying or symlinking files.
+User and plugin Skills continue to use the SDK's normal discovery paths.
 
-**`skills="all"`:**
+Third-party providers use an isolated `CLAUDE_CONFIG_DIR` to prevent Claude
+OAuth credentials from leaking or being used as a fallback. Muselab maps only
+`~/.claude/skills/` into that isolated user scope; active-workspace project/local
+Skills and the explicit repository-extension plugin remain available, while
+installed user plugins, settings, hooks, credentials, and transcripts stay
+isolated. A Skill supplied only by an installed user plugin is therefore not
+available on an isolated third-party route.
 
-```python
-if not skills_off:
-    opts_kwargs["skills"] = "all"
-```
+`GET /api/settings/skills` independently enumerates repository-extension,
+user-global, and installed-plugin Skills for the read-only frontend list. Both
+`SKILL.md` and `skill.md` filenames are accepted. The UI listing does not include
+active-workspace project/local Skills and does not control runtime activation.
 
-When this flag is set, the SDK loads discoverable `SKILL.md` files for every
-provider. There is no copy or symlink step: bundled skills are exposed by the
-local plugin.
+## Adding a Skill
 
-Third-party providers still use an isolated `CLAUDE_CONFIG_DIR` to prevent
-Claude OAuth credentials from leaking or being used as a fallback. muselab
-maps only `~/.claude/skills/` into that isolated root, so user Skills behave
-the same as with Claude models while credentials, settings, hooks, plugins,
-and transcripts remain isolated.
+Common locations are:
 
-**UI listing.** The `GET /api/settings/skills` endpoint independently
-enumerates bundled, user-global, and installed-plugin skills for the frontend.
-Both `SKILL.md` and `skill.md` filenames are accepted. This listing is
-read-only and has no effect on what the model uses at runtime.
+| Location | Scope |
+|---|---|
+| `<workspace>/.claude/skills/your-skill/SKILL.md` | active workspace |
+| `~/.claude/skills/your-skill/SKILL.md` | user-global |
+| `<muselab-repo>/skills/your-skill/SKILL.md` | muselab repository extension |
 
----
-
-## Adding your own skill
-
-### Where to put it
-
-| Location | Scope | Visible to |
-|---|---|---|
-| `<muselab-repo>/skills/your-skill/SKILL.md` | project | muselab only |
-| `~/.claude/skills/your-skill/SKILL.md` | user | muselab + all Claude Code projects |
-
-Repository skills are plugin-qualified internally, so they can coexist with a
-user-global skill of the same short name.
-
-### Required structure
-
-```
-skills/your-skill/
-└── SKILL.md          ← must contain YAML frontmatter
-```
-
-The frontmatter block must include at minimum `name` and `description`:
+A minimal Skill looks like this:
 
 ```yaml
 ---
 name: your-skill
-description: "USE WHEN ... — one sentence describing the trigger and capability"
+description: "USE WHEN ... — describe the trigger and capability"
 ---
 ```
 
-The body is free-form Markdown that the model reads on every invocation —
-keep it concise. Recommended practices are listed in `skills/README.md`:
+Put the reusable workflow and its safety boundaries in the Markdown body. Keep
+it concise, include non-trigger examples where useful, and place optional
+scripts or references beside `SKILL.md`. Restart a native installation after
+adding or editing a Skill so new SDK clients can discover it. Docker deployments
+copy `skills/` into the image, so rebuild and recreate the service instead of
+only restarting it:
 
-- Start `description` with `"USE WHEN ..."` — this is the primary signal
-  the model uses to select a skill.
-- Use a table to map scenarios to actions.
-- Include a `NOT use when` section to prevent overuse.
-- Optional: place reference scripts (`*.py`) or config (`config.yaml`) in
-  the same subdirectory and reference them from the SKILL.md body.
-
-### Restart required
-
-Skills are loaded during SDK initialisation. After adding or editing a
-skill, restart the muselab service:
-
-**Linux (systemd):**
 ```bash
-systemctl --user restart muselab
+docker compose up -d --build --force-recreate
 ```
-
-**macOS (launchd):**
-```bash
-launchctl kickstart -k "gui/$(id -u)/com.muselab"
-```
-
----
 
 ## Kill switch
 
-Skills are enabled for every provider by default. To disable them globally,
-set the following in your `.env`:
+Skills are enabled for every full agent runtime by default. To disable them
+for muselab sessions, set:
 
-```
+```text
 MUSELAB_DISABLE_SKILLS=1
 ```
 
-Accepted values: `1`, `true`, `yes` (case-insensitive).
-
----
+Accepted values are `1`, `true`, and `yes` (case-insensitive). Muselab then
+passes an explicit empty Skill list (`skills=[]`) to the SDK so SDK defaults
+cannot re-enable discovery.
 
 *Related: [architecture.md](architecture.md) · [routing.md](routing.md) · [providers.md](providers.md)*

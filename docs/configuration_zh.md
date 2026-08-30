@@ -87,6 +87,8 @@ muselab 只作为 Images API 客户端，不再启动本地生图模型或 Codex
 |---|---|---|
 | `MUSELAB_PROMPT_CACHE_TTL` | Claude prompt cache TTL | `1h` |
 | `MUSELAB_BUDGET_USD` | 月度 UI 软预算，不会硬中断 | `0` |
+| `MUSELAB_PERF_LOG` | 输出核心链路的隐私受限性能摘要；设为 `0` 可关闭 | `1` |
+| `MUSELAB_SLOW_REQUEST_MS` | 慢 HTTP 请求和工作区操作的耗时阈值，限制在 25–60000 毫秒 | `500` |
 | `MUSELAB_MAX_UPLOAD_MB` | Files API 单文件上传上限 MiB | `100` |
 | `MUSELAB_MAX_TURNS` | 每会话最大回合数，`0` 表示不额外限制 | `0` |
 | `MUSELAB_THINKING_BUDGET` | 扩展思考 token 预算 | `10000` |

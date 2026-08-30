@@ -36,11 +36,15 @@ Web UI 用 `.env` 里的 `MUSELAB_TOKEN` 鉴权，以 `X-Auth-Token` header 发�
 ```bash
 # Linux
 journalctl --user -u muselab -n 50
+# 只看隐私安全的性能摘要
+journalctl --user -u muselab -f | grep '\[perf\]'
 # macOS
 log show --predicate 'process == "muselab"' --last 5m
 ```
 
 多数是 `.env` 缺值（如 `MUSELAB_TOKEN` 太短）或端口冲突。
+
+`[perf]` 行只包含阶段耗时、计数、状态分类和短关联 ID。慢请求阈值可通过 `MUSELAB_SLOW_REQUEST_MS` 调整（默认 `500`）；仅在确实要完全关闭性能摘要时设置 `MUSELAB_PERF_LOG=0`。
 
 **注销后服务就停了（Linux）。**
 开启 lingering，让用户服务持续运行：`sudo loginctl enable-linger $USER`。

@@ -1,5 +1,8 @@
 """File CRUD + search + hidden-toggle endpoints."""
 import io
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 
 # ---- list / read ----
@@ -206,6 +209,183 @@ def test_delete_nonempty_dir_permanent_still_works(client, auth, temp_root):
     assert not (temp_root / ".muselab-dustbin" / "notes").exists()
 
 
+def test_delete_rejects_selected_workspace_root(client, auth, temp_root):
+    marker = temp_root / "README.md"
+
+    soft = client.request(
+        "DELETE",
+        "/api/files/delete",
+        headers=auth,
+        json={"path": "."},
+    )
+    permanent = client.request(
+        "DELETE",
+        "/api/files/delete?permanent=true",
+        headers=auth,
+        json={"path": ""},
+    )
+
+    assert soft.status_code == 400
+    assert permanent.status_code == 400
+    assert soft.json() == {"detail": "cannot delete a workspace root"}
+    assert permanent.json() == {"detail": "cannot delete a workspace root"}
+    assert temp_root.is_dir()
+    assert marker.is_file()
+
+
+def test_delete_unlinks_symlink_to_registered_workspace_without_following_it(
+    client,
+    auth,
+    temp_root,
+    tmp_path,
+):
+    other = tmp_path / "registered-workspace"
+    other.mkdir()
+    marker = other / "must-survive.txt"
+    marker.write_text("preserve", encoding="utf-8")
+    registered = client.post(
+        "/api/chat/workspaces",
+        headers=auth,
+        json={"path": str(other)},
+    )
+    assert registered.status_code == 200
+    link = temp_root / "registered-root-link"
+    link.symlink_to(other, target_is_directory=True)
+
+    response = client.request(
+        "DELETE",
+        "/api/files/delete?permanent=true",
+        headers=auth,
+        json={"path": link.name},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"ok": True, "permanent": True}
+    assert not link.exists()
+    assert not link.is_symlink()
+    assert other.is_dir()
+    assert marker.read_text(encoding="utf-8") == "preserve"
+
+
+def test_permanent_delete_failure_is_not_reported_as_success(
+    client,
+    auth,
+    temp_root,
+    monkeypatch,
+):
+    from backend import files
+
+    def fail_remove(_path, **_kwargs):
+        raise OSError("simulated permanent delete failure")
+
+    monkeypatch.setattr(files.shutil, "rmtree", fail_remove)
+    response = client.request(
+        "DELETE",
+        "/api/files/delete?permanent=true",
+        headers=auth,
+        json={"path": "notes"},
+    )
+
+    assert response.status_code == 500
+    assert response.headers["X-MuseLab-Error-Code"] == "partial_delete"
+    assert response.json() == {
+        "detail": (
+            "permanent delete committed; physical cleanup is deferred"
+        )
+    }
+    assert not (temp_root / "notes").exists()
+    dustbin = temp_root / ".muselab-dustbin"
+    tombstones = [
+        path for path in dustbin.iterdir()
+        if path.name.startswith(".permanent-")
+    ]
+    assert len(tombstones) == 1
+    assert tombstones[0].stat().st_mode & 0o777 == 0o700
+
+
+def test_permanent_delete_permission_failure_is_classified(
+    client,
+    auth,
+    temp_root,
+    monkeypatch,
+):
+    from backend import files
+
+    monkeypatch.setattr(
+        files.shutil,
+        "rmtree",
+        lambda _path, **_kwargs: (
+            _ for _ in ()
+        ).throw(PermissionError("denied")),
+    )
+    response = client.request(
+        "DELETE",
+        "/api/files/delete?permanent=true",
+        headers=auth,
+        json={"path": "notes"},
+    )
+
+    assert response.status_code == 403
+    assert response.headers["X-MuseLab-Error-Code"] == "permission_denied"
+    assert not (temp_root / "notes").exists()
+
+
+def test_trash_purge_cleanup_failure_is_committed_and_idempotent(
+    client,
+    auth,
+    temp_root,
+    monkeypatch,
+):
+    moved = client.request(
+        "DELETE",
+        "/api/files/delete",
+        headers=auth,
+        json={"path": "notes"},
+    )
+    assert moved.status_code == 200, moved.text
+    trash_id = moved.json()["trash_id"]
+    dustbin = temp_root / ".muselab-dustbin"
+    payload = dustbin / trash_id
+    manifest = dustbin / f"{trash_id}.json"
+    assert payload.is_dir()
+    assert manifest.is_file()
+
+    from backend import files
+
+    def fail_remove(path, **kwargs):
+        assert Path(path).name.startswith(".purging-")
+        assert kwargs["dir_fd"] >= 0
+        raise OSError("simulated trash purge failure")
+
+    monkeypatch.setattr(files.shutil, "rmtree", fail_remove)
+    response = client.request(
+        "DELETE",
+        "/api/files/trash/purge",
+        headers=auth,
+        json={"trash_id": trash_id},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "ok": True,
+        "idempotent": False,
+        "cleanup_deferred": True,
+    }
+    assert not payload.exists()
+    assert not manifest.exists()
+    assert (dustbin / f"{trash_id}.purged-receipt").is_file()
+    assert any(path.name.startswith(".purging-") for path in dustbin.iterdir())
+
+    response = client.request(
+        "DELETE",
+        "/api/files/trash/purge",
+        headers=auth,
+        json={"trash_id": trash_id},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["idempotent"] is True
+
+
 def test_trash_purge_rejects_path_traversal_in_trash_id(client, auth, temp_root):
     # Without trash_id validation, `"../../tmp/x"` would resolve outside
     # the dustbin and trash_purge would happily rmtree() arbitrary dirs.
@@ -311,6 +491,28 @@ def test_search_by_filename(client, auth):
     r = client.get("/api/files/search?q=read", headers=auth)
     names = [e["name"] for e in r.json()["entries"]]
     assert "README.md" in names
+
+
+def test_search_by_exact_filename_skips_substring_siblings(
+    client,
+    auth,
+    temp_root,
+):
+    nested = temp_root / "test"
+    nested.mkdir()
+    (nested / "f4_seq_features_16d_spec.md").write_text("target\n")
+    (nested / "f4_seq_features_16d_spec.md.bak").write_text("backup\n")
+
+    response = client.get(
+        "/api/files/search",
+        headers=auth,
+        params={"q": "F4_SEQ_FEATURES_16D_SPEC.MD", "exact": "true"},
+    )
+
+    assert response.status_code == 200
+    assert [entry["path"] for entry in response.json()["entries"]] == [
+        "test/f4_seq_features_16d_spec.md",
+    ]
 
 
 def test_grep_content(client, auth):
@@ -448,6 +650,38 @@ def test_copy_bak_increments_on_conflict(client, auth, temp_root):
         assert (temp_root / expected).exists()
 
 
+def test_copy_bak_concurrent_requests_allocate_distinct_names(
+    app_module,
+    monkeypatch,
+    temp_root,
+):
+    from backend import files
+
+    real_copy2 = files.shutil.copy2
+    copies_ready = threading.Barrier(2)
+
+    def synchronized_copy(src, dst, *args, **kwargs):
+        copies_ready.wait(timeout=5)
+        return real_copy2(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(files.shutil, "copy2", synchronized_copy)
+    request = files.CopyBakReq(src="README.md")
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(
+            lambda _index: files.copy_bak(request, root=temp_root),
+            range(2),
+        ))
+
+    assert {result["path"] for result in results} == {
+        "README.md.bak",
+        "README.md.bak.2",
+    }
+    original = (temp_root / "README.md").read_bytes()
+    assert (temp_root / "README.md.bak").read_bytes() == original
+    assert (temp_root / "README.md.bak.2").read_bytes() == original
+    assert list(temp_root.glob(".~README.md.*.copying")) == []
+
+
 def test_copy_bak_cross_dir(client, auth, temp_root):
     r = client.post("/api/files/copy-bak", headers=auth,
                     json={"src": "README.md", "dst_dir": "notes"})
@@ -498,6 +732,22 @@ def test_list_truncated_flag(client, auth, temp_root):
     d = r.json()
     assert d["truncated"] is True
     assert len(d["entries"]) == 500   # MAX_LIST_ENTRIES
+    assert [row["name"] for row in d["entries"]] == [
+        f"f{i:04d}.txt" for i in range(500)
+    ]
+
+
+def test_large_list_uses_bounded_top_page_selection():
+    """The implementation must not collect and sort every DirEntry in memory."""
+    source = Path(__file__).parents[1].joinpath("backend/files.py").read_text(
+        encoding="utf-8"
+    )
+    start = source.index("def list_dir(")
+    end = source.index("\n\n# xlsx preview caps", start)
+    listing = source[start:end]
+    assert "heapq.nsmallest(" in listing
+    assert "MAX_LIST_ENTRIES + 1" in listing
+    assert "candidates.sort(" not in listing
 
 
 def test_no_extension_text_file(client, auth, temp_root):

@@ -756,6 +756,214 @@ def test_mobile_terminal_sheet_create_and_real_touch_scrollback(
         context.close()
 
 
+def test_mobile_terminal_asset_failure_retries_before_single_create(
+        browser: Browser, browser_name: str, backend_url: str, auth_token: str):
+    """One transient xterm failure must recover without spawning orphan PTYs."""
+    if browser_name != "chromium":
+        pytest.skip("mobile asset retry coverage runs on Chromium")
+
+    context = browser.new_context(
+        viewport={"width": 390, "height": 844},
+        device_scale_factor=2,
+        has_touch=True,
+        is_mobile=True,
+    )
+    page = context.new_page()
+    baseline_ids: set[str] | None = None
+    created_id = ""
+    xterm_requests: list[str] = []
+    xterm_finished: list[str] = []
+    terminal_posts: list[tuple[str, int]] = []
+
+    def fail_first_xterm(route) -> None:
+        xterm_requests.append(route.request.url)
+        if len(xterm_requests) == 1:
+            route.abort("failed")
+        else:
+            route.continue_()
+
+    def observe_request(request) -> None:
+        if (request.method == "POST"
+                and re.search(r"/api/terminals(?:\?|$)", request.url)):
+            # Renderer loading must finish before backend PTY allocation.
+            terminal_posts.append((request.url, len(xterm_finished)))
+
+    def observe_finished(request) -> None:
+        if re.search(r"/static/vendor/xterm/xterm\.js(?:\?.*)?$", request.url):
+            xterm_finished.append(request.url)
+
+    page.route(re.compile(r"/static/vendor/xterm/xterm\.js(?:\?.*)?$"),
+               fail_first_xterm)
+    page.on("request", observe_request)
+    page.on("requestfinished", observe_finished)
+    try:
+        _login(page, backend_url, auth_token)
+        baseline_ids = set(page.evaluate(
+            """async () => {
+              const app = document.querySelector("#app")._x_dataStack[0];
+              const result = await app.api("/api/terminals", {
+                headers: app.fileHdr(),
+              });
+              if (!result.ok) throw new Error(result.error || "list failed");
+              return result.data.terminals.map(row => row.id);
+            }"""
+        ))
+
+        page.evaluate(
+            """() => document.querySelector("#app")._x_dataStack[0]
+              .setMobileTab("preview")"""
+        )
+        page.locator(".terminal-manager-btn").click()
+        create = page.locator(
+            ".terminal-manager-pop .terminal-manager-head .terminal-create-btn")
+        expect(create).to_be_visible()
+        create.click()
+
+        page.wait_for_function(
+            """() => {
+              const app = document.querySelector("#app")?._x_dataStack?.[0];
+              return app?.terminalConnection === "connected"
+                && app?._terminal
+                && document.querySelector(".terminal-host .xterm");
+            }""",
+            timeout=30000,
+        )
+        created_id = page.evaluate(
+            """() => document.querySelector("#app")._x_dataStack[0]
+              .activeTerminalId"""
+        )
+        after_ids = set(page.evaluate(
+            """async () => {
+              const app = document.querySelector("#app")._x_dataStack[0];
+              const result = await app.api("/api/terminals", {
+                headers: app.fileHdr(),
+              });
+              if (!result.ok) throw new Error(result.error || "list failed");
+              return result.data.terminals.map(row => row.id);
+            }"""
+        ))
+
+        assert len(xterm_requests) == 2
+        assert len(xterm_finished) == 1
+        assert "retry=" in xterm_requests[1]
+        assert len(terminal_posts) == 1
+        assert terminal_posts[0][1] == 1
+        assert after_ids - baseline_ids == {created_id}
+    finally:
+        # Derive the created id again if the assertion failed between the POST
+        # and the connected state. This keeps a failed retry regression from
+        # leaking a shell into the shared E2E backend.
+        cleanup_ids: set[str] = {created_id} if created_id else set()
+        if baseline_ids is not None:
+            try:
+                cleanup_ids.update(page.evaluate(
+                    """async before => {
+                      const app = document.querySelector("#app")?._x_dataStack?.[0];
+                      if (!app) return [];
+                      const result = await app.api("/api/terminals", {
+                        headers: app.fileHdr(),
+                      });
+                      if (!result.ok) return [];
+                      return result.data.terminals
+                        .map(row => row.id).filter(id => !before.includes(id));
+                    }""",
+                    list(baseline_ids),
+                ))
+            except Exception:
+                pass
+        for terminal_id in cleanup_ids:
+            try:
+                page.evaluate(
+                    """id => document.querySelector("#app")?._x_dataStack?.[0]
+                      ?.closeTerminal(id, {confirm: false})""",
+                    terminal_id,
+                )
+            except Exception:
+                pass
+        context.close()
+
+
+def test_terminal_create_does_not_drift_across_workspace_switch(
+        browser: Browser, browser_name: str, backend_url: str, auth_token: str):
+    """A delayed renderer must not move a create click to the next workspace."""
+    if browser_name != "chromium":
+        pytest.skip("workspace ownership coverage runs on Chromium")
+
+    context = browser.new_context(viewport={"width": 390, "height": 844})
+    page = context.new_page()
+    terminal_posts: list[str] = []
+    baseline_ids: set[str] | None = None
+
+    def observe_request(request) -> None:
+        if (request.method == "POST"
+                and re.search(r"/api/terminals(?:\?|$)", request.url)):
+            terminal_posts.append(request.url)
+
+    page.on("request", observe_request)
+    owner = ""
+    try:
+        _login(page, backend_url, auth_token)
+        state = page.evaluate(
+            """async () => {
+              const app = document.querySelector("#app")._x_dataStack[0];
+              const owner = app.currentWorkspacePath();
+              const listed = await app.api("/api/terminals", {
+                headers: app.fileHdr(owner),
+              });
+              if (!listed.ok) throw new Error(listed.error || "list failed");
+              window.__originalTerminalLoader = app._loadTerminalLib;
+              app._loadTerminalLib = () => new Promise(resolve => {
+                window.__releaseTerminalLoader = resolve;
+              });
+              window.__pendingTerminalCreate = app.createTerminal();
+              return {owner, ids: listed.data.terminals.map(row => row.id)};
+            }"""
+        )
+        owner = state["owner"]
+        baseline_ids = set(state["ids"])
+        page.wait_for_function(
+            """() => document.querySelector("#app")._x_dataStack[0]
+              .terminalCreating && !!window.__releaseTerminalLoader"""
+        )
+        page.evaluate(
+            """owner => {
+              const app = document.querySelector("#app")._x_dataStack[0];
+              app.activeWorkspace = owner + ".switched-during-terminal-load";
+              window.__releaseTerminalLoader();
+            }""",
+            owner,
+        )
+        page.evaluate("""() => window.__pendingTerminalCreate""")
+        assert terminal_posts == []
+    finally:
+        if owner:
+            try:
+                page.evaluate(
+                    """async ({owner, baseline}) => {
+                      const app = document.querySelector("#app")?._x_dataStack?.[0];
+                      if (!app) return;
+                      app.activeWorkspace = owner;
+                      if (window.__originalTerminalLoader) {
+                        app._loadTerminalLib = window.__originalTerminalLoader;
+                      }
+                      const listed = await app.api("/api/terminals", {
+                        headers: app.fileHdr(owner),
+                      });
+                      if (!listed.ok) return;
+                      const leaked = listed.data.terminals
+                        .map(row => row.id).filter(id => !baseline.includes(id));
+                      await Promise.all(leaked.map(id => app.api(
+                        `/api/terminals/${encodeURIComponent(id)}`,
+                        {method: "DELETE", headers: app.fileHdr(owner)},
+                      )));
+                    }""",
+                    {"owner": owner, "baseline": list(baseline_ids or set())},
+                )
+            except Exception:
+                pass
+        context.close()
+
+
 def test_mobile_reopen_keeps_last_pane_while_terminal_restores(
         browser: Browser, browser_name: str, backend_url: str, auth_token: str):
     """A restored/reconnecting terminal must not route a phone away from chat/files."""

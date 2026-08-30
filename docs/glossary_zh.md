@@ -22,9 +22,11 @@ muselab 代码库与文档中使用的专有术语，集中定义，供各处引
 
 **CLAUDE_CONFIG_DIR isolation（CLAUDE_CONFIG_DIR 隔离）** — 对于第三方提供商，muselab 将 `CLAUDE_CONFIG_DIR` 设置为持久的每用户状态目录（`${XDG_STATE_HOME:-~/.local/state}/muselab/vendor-cli/`），其中不含 `credentials.json`。这既可防止 CLI 静默回退到 Claude Pro OAuth、避免将第三方流量计入你的 Anthropic 账单，也能跨重启保留第三方会话。参见 [`routing.md — CLAUDE_CONFIG_DIR isolation`](routing.md)。
 
-**client pool（客户端池）** — 活跃 `ClaudeSDKClient` 实例的内存缓存，以 `(session_id, model, effort)` 为键。默认容量为 3 个条目（可通过 `MUSELAB_CLIENT_POOL_CAP` 配置）；超出上限时按最近最少使用（LRU）策略淘汰，但有活跃回合或后台任务进行中的条目除外。参见 [`routing.md — The Client Pool`](routing.md)。
+**client pool（客户端池）** — 活跃 `ClaudeSDKClient` 实例的内存缓存，以 `(session_id, model, effort, service_tier)` 为键。默认容量为 3 个条目（可通过 `MUSELAB_CLIENT_POOL_CAP` 配置）；超出上限时按最近最少使用（LRU）策略淘汰，但有活跃回合或后台任务进行中的条目除外。参见 [`routing.md — The Client Pool`](routing.md)。
 
-**effort（推理强度）** — 传给 `ClaudeAgentOptions` 的推理强度等级。有效值为 `"low"`、`"medium"`、`"high"`、`"xhigh"`、`"max"` 或 `""`（SDK 自适应默认值）。按会话存储于 `$MUSELAB_SESSIONS_DIR/index.json`；修改后会断开缓存的 client，下次回合以新值重建。effort 是 client pool 缓存键的组成部分。参见 [`routing.md — Reasoning Effort and Extended Thinking`](routing.md)。
+**effort（推理强度）** — 按会话保存的推理等级。规范值为 `"auto"`、`"low"`、`"medium"`、`"high"`、`"xhigh"`、`"max"` 和按模型开放的 `"ultra"`；旧空值会规范化为 `"auto"`。SDK 原生等级传给 `ClaudeAgentOptions`，Codex 专属传输值由 Gateway payload 规则完成；修改 effort 会重建缓存 client。参见 [`routing.md — Effort and thinking`](routing.md)。
+
+**service tier（服务层）** — 与 effort 独立的 Codex 会话级传输控制。`"fast"` 映射为 Gateway 的 `service_tier: priority`，空值使用标准服务。它是 client-pool key 的组成部分，因为 custom header 在 SDK client 启动时即固定。参见 [`codex-gateway_zh.md`](codex-gateway_zh.md)。
 
 **extended thinking / thinking signature（扩展思考 / 思考签名）** — `ThinkingConfigEnabled` 激活时 Claude 产生的推理轨迹。thinking 块通过 `thinking` SSE 事件流式传输。签名是不可修改的不透明令牌；muselab 将会话锁定到单一模型以避免跨提供商的签名损坏。对于 Opus 4.7+，需要 `display="summarized"` 才能获得纯文本 thinking 块，而非仅有签名。参见 [`routing.md — budget_tokens and display`](routing.md)。
 
@@ -34,7 +36,7 @@ muselab 代码库与文档中使用的专有术语，集中定义，供各处引
 
 **longest-prefix routing（最长前缀路由）** — muselab 用于将模型 ID 映射到其提供商的算法。`backend/endpoints.py` 中的 `lookup(model)` 将所有提供商前缀按长度降序排列，返回第一个匹配项（不区分大小写）。冒号标记的前缀（如 `qwen-intl:`）在将模型 ID 发送给提供商前会被规范化，提供商永远看不到路由标签。
 
-**MCP（Model Context Protocol，模型上下文协议）** — 将外部工具服务器附加到 agent 的标准。muselab 在「设置 → MCP」中暴露 MCP 配置，并将自身的 `mcp.json` 与 Claude Code 的全局配置合并。`ask_user_question` MCP 工具受到特殊处理：muselab 不会阻塞它，而是通过进程内队列重新路由，以便浏览器能在行内显示问题。
+**MCP（Model Context Protocol，模型上下文协议）** — 将外部工具服务器附加到 agent 的标准。muselab 在「设置 → MCP」中暴露 MCP 配置，并将自身的 `mcp.json` 与 Claude Code 的全局配置合并。交互问答不再使用 MCP；SDK 原生 `AskUserQuestion` 通过进程内队列连接浏览器界面。
 
 **message queue（消息队列）** — 每会话的 FIFO 队列（`$MUSELAB_SESSIONS_DIR/<sid>.queue.json`），在一个回合已在运行时暂存提交的 prompt。当前回合完成后，排空循环自动启动下一个回合。最大深度为 10。若回合出错或被取消，队列自动暂停。参见 [`backend-sessions.md — The message queue`](backend-sessions.md)。
 
@@ -68,9 +70,9 @@ muselab 代码库与文档中使用的专有术语，集中定义，供各处引
 
 **sidecar** — 文件 `$MUSELAB_SESSIONS_DIR/<sid>.sidecar.json`，存储叠加在 CLI JSONL 之上的每条消息注解：成本（USD）、模型标识、时间戳、上传图片缩略图和文档引用。每次回合后写入；从不存储对话记录本身。参见 [`backend-sessions.md — Sidecar files`](backend-sessions.md)。
 
-**setting_sources** — 在 `ClaudeAgentOptions` 中传入的 SDK 参数 `["user", "project", "local"]`，告知 Claude Agent SDK 要加载哪些配置作用域。活动工作区中的 `CLAUDE.md` 和 Claude 配置按这些作用域加载；muselab 的内置 `skills/` 则通过本地 plugin 暴露。
+**setting_sources** — 在 `ClaudeAgentOptions` 中传入的 SDK 参数 `["user", "project", "local"]`，告知 Claude Agent SDK 要加载哪些配置作用域。`CLAUDE.md`、Skills 与 Claude 配置按用户和活动 workspace scope 加载；本地 plugin 保留 muselab 的空仓库级 Skill 扩展槽。
 
-**skill / SKILL.md** — skill 是 `skills/`（或 `~/.claude/skills/`）下包含带 YAML frontmatter 的 `SKILL.md` 文件的目录。`description` 字段（以 `"USE WHEN …"` 开头）是模型决定是否激活该 skill 的主要信号。设置 `skills="all"` 后，Claude Agent SDK 将所有可发现的 `SKILL.md` 提供给模型。Skills 默认对所有 provider 启用，可通过 `MUSELAB_DISABLE_SKILLS` 全局关闭。
+**skill / SKILL.md** — Skill 是包含带 YAML frontmatter 的 `SKILL.md` 文件的目录，可来自用户、workspace、plugin、经审核生成或仓库扩展来源。`description` 字段（以 `"USE WHEN …"` 开头）是主要激活信号。设置 `skills="all"` 后 SDK 暴露所有可发现 Skills；设置 `MUSELAB_DISABLE_SKILLS` 后 muselab 显式传入 `skills=[]`。
 
 **SSE / replay spool** — 浏览器先以带 header 鉴权的 POST 提交回合并取得短期一次性 ticket，再用 ticket 连接 `GET /api/chat/stream`。回合事件持续写入磁盘 replay spool；重新连接的浏览器按 cursor 补发，而不是依赖进程内保存完整事件列表。后台执行在浏览器断开后继续。参见 [`routing.md`](routing.md)。
 

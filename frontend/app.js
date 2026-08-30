@@ -38,28 +38,41 @@
     return [rec.kind, rec.message || "", rec.filename || "", rec.lineno || ""].join("|");
   }
 
-  function _report(rec) {
-    const sig = _sig(rec);
-    const now = Date.now();
-    const last = seen.get(sig) || 0;
-    if (now - last < DEDUP_WINDOW_MS) return;
-    seen.set(sig, now);
+  function _clientErrorWireRecord(rec) {
+    const kind = String((rec && rec.kind) || "");
+    if (!["error", "unhandledrejection", "resource"].includes(kind)) return null;
+    const record = {
+      kind,
+      name: String((rec && rec.name) || "").slice(0, 64),
+      lineno: Math.max(0, Math.min(Number(rec && rec.lineno) || 0, 10_000_000)),
+      colno: Math.max(0, Math.min(Number(rec && rec.colno) || 0, 10_000_000)),
+    };
+    const method = String((rec && rec.lastFetch && rec.lastFetch.method) || "")
+      .toUpperCase();
+    if (["DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT"].includes(method)) {
+      record.lastFetch = { method };
+    }
+    if (kind === "resource") {
+      record.tagName = String((rec && rec.tagName) || "").toUpperCase().slice(0, 16);
+    }
+    return record;
+  }
 
-    rec.ts = new Date(now).toISOString();
-    rec.ua = navigator.userAgent;
-    rec.url = location.href;
-    rec.lastFetch = window.__museLastFetch__;
-
-    ring.push(rec);
-    if (ring.length > RING_MAX) ring.shift();
-
-    try { console.error("[muse-capture]", rec); } catch (_) { /* noop */ }
+  function _deliverClientErrorRecord(rec, targetRing, label, consoleMethod = "error") {
+    targetRing.push(rec);
+    if (targetRing.length > RING_MAX) targetRing.shift();
+    try { console[consoleMethod](label, rec); } catch (_) { /* noop */ }
 
     // sendBeacon is fire-and-forget, survives page-unload, and Safari
     // supports it. Falls back to fetch+keepalive if sendBeacon refuses
     // the blob (rare; some Safari versions reject non-form blobs).
     try {
-      const body = JSON.stringify(rec);
+      // Keep rich diagnostics local. The wire record deliberately excludes
+      // URL, UA, filename, message, stack, resource src and request target;
+      // reverse proxies may retain request bodies before MuseLab sees them.
+      const wireRecord = _clientErrorWireRecord(rec);
+      if (!wireRecord) return;
+      const body = JSON.stringify(wireRecord);
       const ok = navigator.sendBeacon &&
                  navigator.sendBeacon("/api/log/client-error",
                                       new Blob([body], { type: "application/json" }));
@@ -71,6 +84,20 @@
         }).catch(() => { /* swallow — don't recurse into the handler */ });
       }
     } catch (_) { /* never let logging break the app */ }
+  }
+
+  function _report(rec) {
+    const sig = _sig(rec);
+    const now = Date.now();
+    const last = seen.get(sig) || 0;
+    if (now - last < DEDUP_WINDOW_MS) return;
+    seen.set(sig, now);
+
+    rec.ts = new Date(now).toISOString();
+    rec.ua = navigator.userAgent;
+    rec.url = location.href;
+    rec.lastFetch = window.__museLastFetch__;
+    void _deliverClientErrorRecord(rec, ring, "[muse-capture]");
   }
 
   window.addEventListener("unhandledrejection", (ev) => {
@@ -157,13 +184,21 @@ const _mcpFmtCache  = new WeakMap();   // raw msg -> { kind, value }
 const _readLinesCache = new WeakMap(); // raw msg -> { src, lines }
 const _searchHitsCache = new WeakMap();// raw msg -> { src, hits }
 const _toolMdCache = new WeakMap();    // raw msg -> { src, html }
+// Activity grouping/search runs from several Alpine expressions per render.
+// Keep its derived snapshot off reactive state so populating the cache cannot
+// itself schedule another render. Weak keys let each portal instance GC.
+const _activityDerivedCaches = new WeakMap(); // raw portal -> derived snapshot
+function _rawAlpine(value) {
+  try {
+    return (window.Alpine && typeof Alpine.raw === "function")
+      ? Alpine.raw(value) : value;
+  } catch (_) { return value; }
+}
 // Unwrap an Alpine reactive proxy to its stable underlying object so the
 // WeakMap key is identity-stable across renders. Falls back to the proxy
 // (Alpine v3 caches proxies per target, so even that key is stable).
 function _rawMsg(m) {
-  try {
-    return (window.Alpine && typeof Alpine.raw === "function") ? Alpine.raw(m) : m;
-  } catch (_) { return m; }
+  return _rawAlpine(m);
 }
 
 // Module-level constants reused by hot-path helpers below. Hoisted out of the
@@ -174,6 +209,48 @@ function _rawMsg(m) {
 //   (every tool_use bubble, every render).
 const _HTML_ESCAPE_MAP = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
 const _FILE_TOOLS = new Set(["Read", "Edit", "Write", "NotebookEdit", "MultiEdit"]);
+const _EMPTY_SESSION_USAGE = Object.freeze({
+  input_tokens: 0,
+  output_tokens: 0,
+  cache_read_tokens: 0,
+  cache_creation_tokens: 0,
+  context_limit: 0,
+  context_used: 0,
+  context_used_pct: 0,
+  context_used_source: "none",
+  context_used_is_estimate: false,
+  context_limit_source: "",
+  context_limit_is_estimate: true,
+  context_is_estimate: true,
+});
+const _EMPTY_ACTIVE_SESSION_PANE = Object.freeze({
+  messages: Object.freeze([]),
+  messageRange: Object.freeze({
+    visibleStart: 0, visibleEnd: 0, offset: 0, total: 0,
+    preTotal: 0, order: "normal", generation: "",
+  }),
+  messagesReady: true,
+  messagesLoading: false,
+  transcriptLoadGeneration: 0,
+  transcriptLoadPhase: "idle",
+  _loaded: false,
+  streaming: false,
+  streamPhase: "",
+  es: null,
+  streamingModel: "",
+  streamElapsed: 0,
+  _streamTimer: null,
+  _streamStartedAt: 0,
+  sessionUsage: _EMPTY_SESSION_USAGE,
+  pendingQueue: Object.freeze([]),
+  _queuePaused: false,
+  backgroundActive: false,
+  compacting: false,
+  _draining: false,
+  _loadingEarlier: false,
+  _historyHydrationError: false,
+  atBottom: true,
+});
 
 // xterm's 16 ANSI colors need separate palettes for light backgrounds.
 // Reusing the dark palette made bright white literally white-on-white and
@@ -215,6 +292,65 @@ const TERMINAL_ANSI_THEMES = Object.freeze({
   }),
 });
 
+// Header-less chat resources use short-lived, scope-bound credentials. Keep
+// both resolved tickets and in-flight mint requests in memory only so Alpine
+// re-evaluation cannot duplicate requests or persist bearer URLs.
+const CHAT_RESOURCE_TICKET_CACHE = new Map();
+const CHAT_RESOURCE_TICKET_CACHE_MAX = 256;
+function _pruneChatResourceTicketCache(now) {
+  for (const [key, entry] of CHAT_RESOURCE_TICKET_CACHE) {
+    if (!entry.promise && (!entry.expiresAt || entry.expiresAt <= now)) {
+      CHAT_RESOURCE_TICKET_CACHE.delete(key);
+    }
+  }
+  while (CHAT_RESOURCE_TICKET_CACHE.size >= CHAT_RESOURCE_TICKET_CACHE_MAX) {
+    CHAT_RESOURCE_TICKET_CACHE.delete(
+      CHAT_RESOURCE_TICKET_CACHE.keys().next().value,
+    );
+  }
+}
+
+const CHAT_MUX_STREAM_EVENTS = [
+  "startup", "text", "thinking", "tool_use", "tool_result",
+  "compact_progress", "task_started", "task_progress", "task_notification",
+  "rate_limit", "ask_user_question", "permission_request",
+  "permission_request_resolved", "permission_mode_changed",
+  "permission_mode_change_failed", "ping", "done", "error", "cancelled",
+  "resync",
+];
+const CHAT_MUX_BOOTSTRAP_MAX_EVENTS = 512;
+const CHAT_MUX_BOOTSTRAP_MAX_BYTES = 2 * 1024 * 1024;
+
+class ChatMuxSessionChannel extends EventTarget {
+  constructor(sessionId, turnId, onClose) {
+    super();
+    this.sessionId = sessionId;
+    this.turnId = turnId;
+    this.readyState = 0;
+    this.onopen = null;
+    this._onClose = onClose;
+    this._muxChannel = true;
+  }
+
+  open() {
+    if (this.readyState === 1 || this.readyState === 2) return;
+    this.readyState = 1;
+    const event = new Event("open");
+    if (this.onopen) this.onopen(event);
+    this.dispatchEvent(event);
+  }
+
+  disconnect() {
+    if (this.readyState !== 2) this.readyState = 0;
+  }
+
+  close() {
+    if (this.readyState === 2) return;
+    this.readyState = 2;
+    if (this._onClose) this._onClose(this);
+  }
+}
+
 function portal() {
   return {
     // ===== auth =====
@@ -236,6 +372,15 @@ function portal() {
     _presenceVisibilityHandler: null,
     _presencePagehideHandler: null,
     _sessionsSyncTimer: null,
+    _chatMuxSource: null,
+    _chatMuxChannels: new Map(),
+    _chatMuxPendingEvents: new Map(),
+    _chatMuxAttachPromises: new Map(),
+    _chatMuxStartPromise: null,
+    _chatMuxReconnectTimer: null,
+    _chatMuxReconnectAttempts: 0,
+    _chatMuxSupported: null,
+    _chatMuxConnected: false,
     _splashHintTimer: null,
     _splashHardTimeout: null,
 
@@ -273,11 +418,14 @@ function portal() {
     // workspace and coalesces structural changes before touching Alpine state.
     _fileEvents: null,
     _fileEventsWorkspace: "",
+    _fileEventsGeneration: "",
     _fileEventsSeq: 0,
     _fileEventsTimer: null,
     _fileEventsPending: null,
+    _fileEventsReconnectFailures: 0,
     _fileTreeDirty: false,
     _fileTreeRefreshBusy: false,
+    _fileTreeRefreshGeneration: "",
     _fileEventsVisibilityBound: false,
     dragOver: "",
     // Highlight flag for the sticky root bar while a tree node / OS file is
@@ -313,6 +461,10 @@ function portal() {
     // and the drop falls through to the browser, which opens the file
     // as a navigation away from muselab). See init() for the listeners.
     osFileDragging: false,
+    // The whole app is an OS-file drop surface.  Empty means workspace root;
+    // only a real directory row may set a nested destination.
+    osFileDropDir: "",
+    osFileDropOnDirectory: false,
     _dragCounter: 0,
     // Right-click context menu on a preview tab. { path, x, y } when open.
     previewTabCtxMenu: null,
@@ -369,6 +521,8 @@ function portal() {
     // nothing is open or the stat fetch 404s (stale/phantom tab).
     selectedMeta: null,
     _selectedMetaSeq: 0,
+    fileMetaClock: Date.now(),
+    _fileMetaClockTimer: null,
     // Set when a preview READ fails (404/413/403/…), so the unsupported empty
     // state can show a status-aware reason instead of always blaming the file
     // type. null = no error (genuine "unsupported type" or normal preview).
@@ -382,6 +536,39 @@ function portal() {
     previewFind: { open: false, query: "", matches: [], active: -1, count: 0, listOpen: false, truncated: false },
     _pfEls: [],
     PREVIEW_FIND_MAX_MATCHES: 500,
+    // Text selected in a parent-DOM file preview or a rendered chat bubble.
+    // The source snapshot is kept as plain serializable data; Range /
+    // Selection / DOM nodes never enter Alpine's reactive graph. HTML and PDF
+    // previews intentionally stay out of scope because their browsing
+    // contexts are sandboxed/browser-owned.
+    previewQuote: {
+      show: false, mode: "actions", source: "", role: "", sessionId: "",
+      messageId: "", text: "", path: "", question: "", followup: "",
+      x: 0, y: 0, width: 560, height: 520,
+      above: false, truncated: false, sending: false,
+      askSessionId: "", askSessionName: "", askPrompt: "", askError: "",
+      askAutoScroll: true,
+      // Ask mode starts anchored to the selection. The first title-bar drag
+      // converts x/y to viewport-relative top/left coordinates until close.
+      dragged: false, dragging: false,
+    },
+    // Per-turn memory recall details are rendered in a root-level fixed
+    // popover. Keeping the card outside .chat-body is load-bearing: every pane
+    // intentionally clips overflow, so no descendant z-index can escape the
+    // transcript/composer/preview boundaries.
+    memoryRecallPopover: {
+      show: false, recall: null, style: "",
+    },
+    _memoryRecallAnchor: null,
+    _memoryRecallOwner: null,
+    _memoryRecallPositionFrame: 0,
+    _previewSelectionBound: false,
+    _previewSelectionTimer: null,
+    _previewQuoteDrag: null,
+    _previewQuoteResize: null,
+    _previewQuoteConstraintFrame: null,
+    _previewQuoteResizeObserver: null,
+    PREVIEW_QUOTE_MAX_CHARS: 6000,
     _previewLoadSeq: 0,
     _previewAbort: null,
     // Path-bound, short-lived credentials for script-capable HTML iframes.
@@ -461,20 +648,29 @@ function portal() {
 
     // ===== chat =====
     sessions: [], currentId: "",
-    // True while loadSession(currentId) is in flight. UI uses this to swap
-    // the brand-empty placeholder for a shimmer skeleton, so users don't
-    // see "Muse · Calliope / empty chat" for the second a big session
-    // takes to fetch.
-    messagesLoading: false,
-    // Compatibility mirrors for the active tab only. The authoritative values
-    // live in tabState[currentId]; resident panes must read their own pane state.
-    historyGeneration: "",
-    // Gates revealing a freshly-loaded session: stays false from load-start
-    // until syntax-highlight + artifacts finish, so the whole conversation
-    // appears at once instead of janking in code-block-by-code-block (the
-    // skeleton covers the gap). Default true so empty/streaming views aren't
-    // hidden. Only loadSession flips it false→true.
-    messagesReady: true,
+    // Keep a bounded LRU of transcript panes mounted. Each pane renders an exact-
+    // height messageRange window; the canonical repository remains authoritative.
+    _warmTranscriptTabs: [],
+    _transcriptPaneLru: [],
+    WARM_TRANSCRIPT_LIMIT: 3,
+    // Canonical history is normalized by stable block identity. Each tab keeps
+    // one chronological repository and one explicit revealed/server range.
+    _messagesById: new Map(),
+    _sessionWindows: new Map(),
+    _assistantBodyObserver: null,
+    _assistantBodyTargets: new Map(),
+    // Rich history rendering is deliberately serialized. Alpine can mount many
+    // assistant rows in one tick; scheduling one marked/DOMPurify pass per row in
+    // the same animation frame turns those callbacks into one browser long task
+    // and freezes unrelated controls. Plain text remains complete and visible
+    // while this queue upgrades one mounted bubble per event-loop turn.
+    _historyRichRenderQueue: [],
+    _historyRichRenderScheduled: false,
+    // Final assistant HTML is also retained by the same stable render key. This
+    // survives window object eviction/reload without keying rich output by an
+    // ever-growing text value, while the bounded LRU keeps memory predictable.
+    _historyHtmlByKey: new Map(),
+    _historyHtmlBytes: 0,
 
     // ===== scheduled tasks (bell drawer) =====
     // Daily-fire prompts that dispatch into a dedicated muselab session.
@@ -516,11 +712,32 @@ function portal() {
         session_mode: "fresh",
       },
     },
+    // User-owned global scratch TODO clipboard. It is deliberately independent
+    // from Muse/Claude Task tools and shared across every conversation and
+    // workspace in this browser.
+    sessionTodoOpen: false,
+    sessionTodoDraft: "",
+    sessionTodoDragId: "",
+    sessionTodoPointerId: null,
+    sessionTodoAnnouncement: "",
+    sessionTodoEditId: "",
+    sessionTodoEditDraft: "",
+    _sessionTodoEditOwner: null,
+    userTodos: [],
+    todoRevision: 0,
+    _todoPushGeneration: 0,
+    _todoPushPending: false,
+    _todoPushPromise: null,
+    // Lightweight focus ownership shared by modal/popover surfaces. DOM nodes
+    // live here only while their surface is open; the stack ensures a nested
+    // managed dialog never restores focus behind the dialog above it.
+    _focusSurfaceState: {},
+    _modalFocusStack: [],
     activity: {
       show: false, loading: false, events: [],
-      // Status groups remain the default operational view. The alternate
-      // timeline shows every state by its latest transition time.
-      view: "status",
+      // Custom groups are the primary organization surface. An explicit user
+      // choice is still restored from localStorage.
+      view: "groups",
       viewLoaded: false,
       summary: {
         running: 0, unread: 0, attention: 0,
@@ -532,9 +749,33 @@ function portal() {
       expanded: {},
       // Selected group keys. Empty array = no filter = show every group.
       filter: [],
+      // Local search over the loaded activity snapshot. Keep this derived from
+      // events so SSE updates and session renames appear without another query.
+      query: "",
+      customGroups: [],
+      groupOrder: ["__ungrouped__"],
+      groupEditor: {
+        open: false, id: "", name: "", color: "blue",
+        workspaceId: "", originalWorkspaceId: "", workspacePath: "",
+        workspaceDirty: false, owner: 0, saving: false,
+      },
+      moveMenu: { show: false, eventId: "", style: "" },
+      dragEventId: "",
+      dragOverGroupId: null,
+      dragOverEventId: "",
+      dragInsertAfter: false,
+      dragGroupId: "",
+      dragOverGroupOrderId: "",
+      dragGroupInsertAfter: false,
     },
+    REQUEST_DEADLINE_MS: 8000,
+    SESSION_SYNC_DEADLINE_MS: 35000,
     _activityEtags: {},
+    // A successful full snapshot may legally contain zero events. Track that
+    // ownership separately from rows added by optimistic or live updates.
+    _activityEventsSnapshotLoaded: false,
     _activityFetchPromises: {},
+    _activityFetchControllers: {},
     _activityRequestSeq: 0,
     _activityAppliedSeq: 0,
     _activityGeneration: "",
@@ -542,7 +783,18 @@ function portal() {
     _activityLiveSource: null,
     _activityLiveSeq: 0,
     _activityLiveTimer: null,
+    _activityLiveController: null,
+    _activityLiveFailures: 0,
     _activityLiveVisibilityBound: false,
+    _todoLiveSource: null,
+    _todoLiveSeq: 0,
+    _todoLiveTimer: null,
+    _todoLiveVisibilityBound: false,
+    _activityPinPending: {},
+    _activityGroupPending: {},
+    _activityGroupOrderSeq: 0,
+    _activityGroupOrderQueue: null,
+    _activityGroupEditorSeq: 0,
     // Per-task "run-now" inflight flag — disables retry / send buttons until
     // activity SSE reports a terminal state. Keyed by task id.
     schedRunning: {},
@@ -585,10 +837,20 @@ function portal() {
     // active tab. Tabs can be opened from the session picker, closed via × on
     // the tab, or created by the "+ new" button.
     openTabIds: [],
+    _lastNewSessionAt: 0,
+    _lastNewSessionMeta: null,
+    NEW_SESSION_TOUCH_DEDUPE_MS: 500,
     sessionWorkspaces: [],
     activeWorkspace: "",
     workspaceMenuOpen: false,
     workspaceSwitching: false,
+    workspaceRegistryBusy: false,
+    workspaceOrderSaving: false,
+    // The file tree and preview switch ownership before the target transcript
+    // is ready. Keep that valid intermediate state behind one visual barrier
+    // so the three workspace surfaces are revealed together.
+    workspaceSurfaceTransition: false,
+    _workspaceSwitchSeq: 0,
     workspaceDrag: { path: "", overPath: "", pointerId: null, originalPaths: [] },
     workspaceBrowser: {
       show: false, loading: false, error: "", path: "", name: "", parent: "",
@@ -597,10 +859,12 @@ function portal() {
     },
     workspaceLastSession: {},
     _loadedPrefsSchema: 5,
+    _workspaceRegistrySeq: 0,
     workspaceSurfaces: {},
     _workspaceRuntimeCaches: new Map(),
     _workspaceTreeCacheTimers: new Map(),
     _workspaceTreeCursors: new Map(),
+    _workspaceEpochs: new Map(),
     _workspaceSyncChains: new Map(),
     _workspaceSyncRetryTimers: new Map(),
     _workspaceEventBatches: new Map(),
@@ -608,9 +872,10 @@ function portal() {
     WORKSPACE_TREE_PERSIST_DEBOUNCE_MS: 1500,
     WORKSPACE_EVENT_BATCH_DESKTOP_MS: 40,
     WORKSPACE_EVENT_BATCH_MOBILE_MS: 250,
+    SESSION_SETTING_EXPECTED_TTL_MS: 15_000,
+    IME_STALE_AFTER_MS: 5000,
     _fileMetaCache: new Map(),
     _paletteFileSeq: 0,
-    _sessionLoadPromises: {},
     _sessionsInitialized: false,
     _sessionInitPromise: null,
     _sessionListPullPromise: null,
@@ -620,23 +885,6 @@ function portal() {
     _mobileKeyboardPollTimer: null,
     _mobileViewportSettleTimers: [],
     _mobileRootResetTimers: [],
-    // [resident-panes] Which tabs keep their message-pane DOM mounted. The chat
-    // panes (index.html) render one .msg-pane per id HERE — not per openTabIds —
-    // so far-back tabs are unmounted, bounding how much retained DOM the browser
-    // reflows on every switch (the mobile switch-lag root cause: cost scaled with
-    // total nodes across ALL open tabs, not the target session). LRU: current +
-    // the most-recent few. Switching to an evicted-but-loaded tab rebuilds its
-    // bubbles from tabState[id].messages (data always survives; only the DOM is
-    // dropped). _MAX_RESIDENT_PANES caps the set.
-    _residentTabIds: [],
-    // Recency is tracked separately from the DOM-facing resident id list.
-    // Reordering an Alpine keyed x-for physically moves entire message panes;
-    // keeping membership stable makes desktop warm switches a pure x-show.
-    _residentTabLru: [],
-    // Mobile retains only the visible pane. Desktop keeps a wider working set so
-    // normal tab switching is a pure x-show flip instead of a bubble rebuild.
-    // Streaming in a hidden tab keeps its data/SSE even after its DOM is evicted.
-    _MAX_RESIDENT_PANES: 4,
     renamingTabId: "",   // session id whose name is currently being inline-edited
     renameDraft: "",     // current value of the inline rename <input>
     tabCtxMenu: null,    // {id, x, y} for the right-click tab menu, or null
@@ -644,15 +892,10 @@ function portal() {
                           //  has a different shape — overlapping names crash
                           //  Alpine when one side reads .show on the other's null)
     forkingSessionId: "",
-    // Per-tab runtime state. Keyed by session id. Each entry is a "snapshot"
-    // of {messages, sessionUsage, streaming, es, streamingModel, ...} that the
-    // active tab mirrors into root state (this.messages, this.es, etc.) via
-    // _activateTabState(). Background tabs' stream callbacks write to their
-    // own tabState[sid] so switching away doesn't lose / mis-route events.
-    // The active tab's `this.messages` and `tabState[currentId].messages` are
-    // the SAME array reference — we mutate in place, never replace.
+    // Per-tab runtime state. Keyed by session id and authoritative for every
+    // session-panel field. Background callbacks keep their captured owner state;
+    // the mounted pane resolves the current owner through activeSessionPane().
     tabState: {},
-    messages: [],
     model: "claude-sonnet-4-6",
     // The configured "new-session default" model (Settings → 新会话). Kept
     // SEPARATE from `model`, which tracks the CURRENTLY-VIEWED session and is
@@ -669,10 +912,15 @@ function portal() {
     // behind a gear in the composer toolbar so the row stays single-line on
     // narrow phones. Desktop shows those selects inline and ignores this.
     composerSettingsOpen: false,
-    // Reasoning effort override for the current session — "" means let the
-    // SDK pick adaptively (the existing default). Persisted on the session
-    // via PATCH so each tab keeps its own setting across reloads.
-    effort: "",
+    // Reasoning effort for the current session. `auto` delegates the choice to
+    // the runtime; every explicit level is advertised per model by
+    // /api/chat/providers. Persisted on the session so each tab restores its
+    // own value after reloads and workspace switches.
+    effort: "auto",
+    // Fast is an independent service-tier choice, not another effort level.
+    // Empty means the provider's standard tier; "fast" requests priority
+    // service when the selected model advertises supports_fast=true.
+    serviceTier: "",
     // Extended thinking on/off for the current session — default true.
     // NOTE this is NOT the old `showThinking` (which controlled DISPLAY of
     // thinking blocks and was removed 2026-05-20). This toggles the backend
@@ -690,16 +938,14 @@ function portal() {
     // Active-tab composer mirror. The durable-in-memory owner is
     // tabState[currentId].draft; capture/activate keeps these template-facing
     // fields aligned without persisting drafts across a page reload.
-    input: "", streaming: false, es: null,
-    // 锁定当前在跑的那条请求用的模型——dropdown 切到别的，pending bubble 不能跟着变。
-    streamingModel: "",
-    // Elapsed seconds since send() — pending bubble shows it after 1s so the
-    // user knows the system isn't stuck.
-    streamElapsed: 0,
-    _streamTimer: null,
-    _streamStartedAt: 0,
+    input: "",
     pendingImages: [],    // [{id, mime, preview (data URL), uploading, error, file}]
     pendingDocs: [],      // [{id, name, kind: 'pdf'|'text', uploading, error}]
+    // Selected preview/chat text attached to the current draft. Unlike the
+    // old quote action, these never rewrite `input`; they render as removable
+    // context chips above the composer and are folded into the actual prompt
+    // only when Send snapshots this exact tab's draft.
+    pendingQuotes: [],    // [{id, source, role, sessionId, messageId, path, text, truncated}]
     // Image annotation editor (L1: pen / rect / arrow / eraser + 5 colors + 3 sizes).
     // Opened via the ✎ button on an .img-chip. State is module-scoped on `this`
     // so the modal template can read it via x-show / :class. _baseBitmap is the
@@ -740,7 +986,10 @@ function portal() {
       pollTimer: null,
       error: "",
       ownerSid: "",
+      submitController: null,
+      submitSeq: 0,
     },
+    IMAGE_GEN_SUBMIT_DEADLINE_MS: 20000,
     // Active-tab mirror of tabState[currentId].draft._sendWaitingForUpload.
     // Each session owns its own wait flag, so an upload in A never disables B.
     // It disables duplicate sends only while that draft's attachment upload is
@@ -767,19 +1016,13 @@ function portal() {
     slashShow: false,
     slashIdx: 0,
     slashAnchor: -1,      // input position where the leading '/' is
+    // Defined in /static/data/constants.js. Slash stays dormant when the
+    // feature flag is false; `/...` then follows the ordinary message path.
+    SLASH_ENABLED: window.MUSELAB_SLASH_ENABLED === true,
     // Defined in /static/data/constants.js (window.MUSELAB_SLASH_CMDS). Kept
     // as a component property so `this.SLASH_CMDS` references throughout the
     // file keep working without changes.
     SLASH_CMDS: window.MUSELAB_SLASH_CMDS || [],
-    // Per-session context meter snapshot, updated on every SSE `done` event
-    sessionUsage: { input_tokens: 0, output_tokens: 0,
-                     cache_read_tokens: 0, cache_creation_tokens: 0,
-                     context_limit: 0, context_used: 0, context_used_pct: 0,
-                     context_used_source: "none",
-                     context_used_is_estimate: false,
-                     context_limit_source: "",
-                     context_limit_is_estimate: true,
-                     context_is_estimate: true },
     stats: { total_cost_usd: 0, total_messages: 0, total_input_tokens: 0,
               total_output_tokens: 0, total_cache_read_tokens: 0,
               total_cache_creation_tokens: 0, cache_hit_pct: 0,
@@ -808,12 +1051,14 @@ function portal() {
     // nothing. Deliberately stays false if the fetch fails: an unreachable
     // backend is not evidence of a missing provider either.
     _modelsLoaded: false,
-    atBottom: true,
     // Timestamp (ms) of the last genuine user scroll gesture on the chat body.
     // onChatScroll uses it to disengage auto-follow ONLY on user-driven
     // scroll-up, never on layout-induced scroll events. See _userScrollIntent.
     _userScrollAt: 0,
     theme: "dark",
+    // Eyecare level 2 is the historical palette, so existing users keep the
+    // exact same appearance until they deliberately choose softer/warmer.
+    eyecareLevel: 2,
     accent: "#6093ff",
     ACCENT_PRESETS,
 
@@ -839,9 +1084,11 @@ function portal() {
     mascotGreet: false,
 
     leftOpen: true,
-    rightOpen: true,
-    leftWidth: 280,
-    rightWidth: 440,
+    // Desktop's secondary right rail is the preview. Chat is the primary,
+    // always-mounted center pane and therefore has no open/closed flag.
+    previewOpen: true,
+    leftWidth: 340,
+    previewWidth: 440,
     showHidden: false,
     // ===== Trash =====
     // Files /delete moves into <ROOT>/.muselab-dustbin/ instead of unlink
@@ -948,6 +1195,7 @@ function portal() {
       // services are touched only by an explicit probe or an enabled config.
       memory: {
         loading: false, saving: false, probing: false, actionRunning: false,
+        backupRunning: false,
         config: {
           schema_version: 1, mode: "off", owner_id: "default",
           generation_model: "",
@@ -1124,6 +1372,43 @@ function portal() {
           && focused && focused.closest && focused.closest(".terminal-host")) {
         return;
       }
+      // Composition candidate navigation/confirmation belongs wholly to the
+      // IME. Some WebViews report the commit Enter as an ordinary keydown
+      // immediately after compositionend; the per-element lifecycle guard
+      // below keeps global shortcuts from treating it as a real command.
+      if (this._isImeComposingEvent(ev)) {
+        // The candidate UI owns Escape too. Stop it at document level so old
+        // `.window` listeners cannot close one or several dialogs while the
+        // user is merely dismissing an IME candidate list.
+        if (ev.key === "Escape") ev.stopPropagation();
+        return;
+      }
+      if (ev.key === "Escape" && this.sessionPickerOpen) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        this.closeHistoryPicker();
+        return;
+      }
+      // Managed dialogs own Escape before any app-global action (especially
+      // the chat's Escape-to-stop shortcut). Close only the top surface so a
+      // modal opened over another modal cannot collapse both in one keypress.
+      if (ev.key === "Escape" && this._modalFocusStack.length) {
+        const top = this._modalFocusStack[this._modalFocusStack.length - 1];
+        ev.preventDefault();
+        ev.stopPropagation();
+        if (top === "generic-modal" && this.modal.cancel) this.modal.cancel();
+        else if (top === "activity-move") this.closeActivityMoveMenu(true);
+        else if (top === "scheduler") this.closeScheduler();
+        else if (top === "session-todo") this.closeSessionTodoBoard();
+        else if (top === "activity") this.closeActivityCenter();
+        else if (top === "settings") this.settings.show = false;
+        else if (top === "image-gen") this.closeImageGen();
+        else if (top === "cheatsheet") this.cheatSheet.show = false;
+        else if (top === "workspace-browser") this.closeWorkspaceBrowser();
+        else if (top === "claude-auth") this.closeClaudeAuthModal();
+        else if (top === "trash") this.closeTrashModal();
+        return;
+      }
       // ---- Command palette ----
       // Cmd/Ctrl+K from anywhere opens it. While open, palette owns
       // ↑/↓/Enter; everything else falls through to the input.
@@ -1196,6 +1481,20 @@ function portal() {
       // We hijack Ctrl+T and Ctrl+W from the browser. The user is inside a
       // single-page web app — we own these. (Mobile Safari ignores them.)
       if ((ev.ctrlKey || ev.metaKey) && !ev.altKey) {
+        const shortcutTarget = ev.target || document.activeElement;
+        const shortcutTag = shortcutTarget && shortcutTarget.tagName;
+        const editingOnMobile = this._isMobileLayout() && (
+          shortcutTag === "INPUT"
+          || shortcutTag === "TEXTAREA"
+          || (shortcutTarget && shortcutTarget.isContentEditable)
+        );
+        if (editingOnMobile) {
+          // Mobile keyboards and remote-input bridges can briefly report a
+          // stuck Ctrl/Meta modifier during composition. Never create, close,
+          // or switch chat tabs while the user is editing text.
+          ev.preventDefault();
+          return;
+        }
         if (ev.key === "t" || ev.key === "T") {
           ev.preventDefault();
           this.newSession();
@@ -1229,12 +1528,14 @@ function portal() {
         }
       }
       if (ev.key === "Escape") {
+        if (this.memoryRecallPopover.show) { this.closeMemoryRecallPopover(); return; }
         if (this.cheatSheet.show) { this.cheatSheet.show = false; return; }
         if (this.mentionShow) { this._cancelMentionLookup(); return; }
         if (this.ctxMenu.show) { this.ctxMenu.show = false; return; }
         if (this.tabCtxMenu) { this.closeTabMenu(); return; }
         if (this.settings.show) { this.settings.show = false; return; }
         if (this.modal.show && this.modal.cancel) { this.modal.cancel(); return; }
+        if (this.previewQuote.show) { this.dismissPreviewQuote(true); return; }
         // 退出编辑 — guard against silently discarding unsaved edits when ESC
         // is pressed out of habit (blur the focus). Only confirm when dirty.
         if (this.editing) { if (this._confirmLoseEdits()) this.editing = false; return; }
@@ -1278,16 +1579,18 @@ function portal() {
       // double. Cheap to gate at the front; expensive to debug after.
       if (this._initialized) return;
       this._initialized = true;
-      // Prewarm the heavy preview vendor bundles (hljs / katex / mermaid)
-      // during browser idle, AFTER first paint. These are lazy-loaded on
-      // first use, but that cold load + compile (mermaid is ~3.3 MB) runs in
-      // the $nextTick AFTER a markdown preview has already painted — so the
-      // content shows, then the page freezes 2–3 s while the bundle parses.
-      // Warming them up front moves that cost off the click path. Fire-and-
-      // forget; failures fall back to the existing on-demand lazy load.
-      this._prewarmPreviewLibs();
       // 全局快捷键（绑在 document，避免每个 textarea 单独处理）
       document.addEventListener("keydown", e => this.onGlobalKeyDown(e));
+      this._registerFocusSurfaceWatchers();
+      window.addEventListener("resize", () => {
+        this._queueMemoryRecallPosition();
+        // A mobile sheet tracks the viewport in CSS and should survive browser
+        // chrome / keyboard resizes. Any menu carrying desktop anchor geometry
+        // must close before that inline position can become stale.
+        if (this.activity.moveMenu.show && this.activity.moveMenu.style) {
+          this.closeActivityMoveMenu(false);
+        }
+      });
       // (Cross-tab queue sync via localStorage `storage` events was removed
       // when the queue moved server-side: there's one authoritative copy now,
       // and each tab refreshes its mirror via _syncQueueFromServer on load /
@@ -1305,12 +1608,42 @@ function portal() {
         }
         localStorage.removeItem(oldK);
       }
+      this.userTodos = this._loadGlobalUserTodos();
+      // Pull the server-authoritative board once at boot (and one-time-migrate
+      // any existing localStorage todos up). Best-effort: offline keeps cache.
+      this._syncTodosFromServer();
+      window.addEventListener("storage", ev => {
+        const key = this._globalUserTodoStorageKey();
+        if (ev.key === key) {
+          // Read the authoritative current value instead of the event snapshot:
+          // rapid writes from multiple tabs can deliver an older event after a
+          // newer write has already landed in localStorage.
+          this.userTodos = this._normalizeUserTodos(
+            localStorage.getItem(key) || "[]",
+          );
+          return;
+        }
+        if (ev.key === this._chatTabStoreKey) {
+          // Tab-strip state is shared only by same-origin browser pages. Consume
+          // the newest record without writing it back; each page keeps its own
+          // currentId so another window cannot steal focus.
+          void this._applyChatTabStorageEvent();
+        }
+      });
+      // `pagehide` is bfcache-friendly (unlike an unconditional
+      // beforeunload handler) and still fires for browser refresh/PWA close.
+      // Flush the current composer synchronously so even a refresh immediately
+      // after the last keystroke keeps the draft.
+      window.addEventListener("pagehide", () => {
+        this._captureComposerState(this.currentId);
+      });
       this.initTheme();
       this.initLang();
       this.initMascot();
       this.configureMarked();
       this._initArtifacts();
       this._initStreamSelectionGuard();
+      this._initPreviewSelection();
       this._initAriaLabelMirror();
       // NOTE: loadTrash() does NOT run here — init() executes before the
       // user has supplied a token (token gating happens in _bootApp /
@@ -1326,6 +1659,12 @@ function portal() {
       // picker, slash /resume, etc. without requiring each entry point
       // to remember to call _scrollTabIntoView.
       this.$watch("currentId", (tid) => {
+        this.closeMemoryRecallPopover();
+        this.closeActivityMoveMenu();
+        if (this.previewQuote.show && this.previewQuote.sessionId
+            && this.previewQuote.sessionId !== tid) {
+          this.dismissTransientPreviewQuote(true);
+        }
         if (!tid) return;
         this.$nextTick(() => this._scrollTabIntoView(tid));
       });
@@ -1386,16 +1725,21 @@ function portal() {
       };
       document.addEventListener("dragenter", (e) => {
         if (!_hasFileType(e.dataTransfer)) return;
+        e.preventDefault();
+        e.stopPropagation();
         this._dragCounter++;
-        if (this._dragCounter === 1) this.osFileDragging = true;
-      });
+        this._setOsFileDropTarget(e.target);
+      }, true);
       document.addEventListener("dragleave", (e) => {
         // Some browsers (Firefox) don't expose types on dragleave; we
         // decrement unconditionally because every leave matches an
         // earlier enter and the counter floor at 0 prevents drift.
+        if (this._dragCounter <= 0) return;
+        e.preventDefault();
+        e.stopPropagation();
         if (this._dragCounter > 0) this._dragCounter--;
-        if (this._dragCounter === 0) this.osFileDragging = false;
-      });
+        if (this._dragCounter === 0) this._resetOsFileDragState();
+      }, true);
       // Required for drop to fire: dragover MUST be preventDefault'd at
       // some level. The preview overlay does this when visible, but for
       // areas of the page that aren't drop targets we also need a
@@ -1405,14 +1749,22 @@ function portal() {
       document.addEventListener("dragover", (e) => {
         if (!_hasFileType(e.dataTransfer)) return;
         e.preventDefault();
-      });
+        e.stopPropagation();
+        this._setOsFileDropTarget(e.target);
+        if (e.dataTransfer) e.dataTransfer.dropEffect = "copy";
+      }, true);
       document.addEventListener("drop", (e) => {
-        // If the drop wasn't handled by an explicit zone (preview /
-        // chat input), suppress browser default and reset state.
-        if (_hasFileType(e.dataTransfer)) e.preventDefault();
-        this._dragCounter = 0;
-        this.osFileDragging = false;
-      });
+        if (!_hasFileType(e.dataTransfer)) return;
+        // Capture before the composer/preview/tree handlers: an OS file is a
+        // workspace upload, never an implicit chat attachment.  Internal tab
+        // and tree drags carry custom MIME types and never enter this branch.
+        e.preventDefault();
+        e.stopPropagation();
+        const dropTarget = this._externalFileDropTarget(e.target);
+        const files = Array.from((e.dataTransfer && e.dataTransfer.files) || []);
+        this._resetOsFileDragState();
+        if (files.length) void this._uploadFilesToDir(dropTarget.dir, files);
+      }, true);
 
       // HTML preview bridge. Each live sandboxed frame reports image clicks,
       // readiness and internal scrolling through postMessage.
@@ -1511,22 +1863,34 @@ function portal() {
         console.error("file:", ev.filename, "line:", ev.lineno, "col:", ev.colno);
         console.error("stack:", ev.error.stack);
         console.error("currentId:", this.currentId,
-                      "messages.length:", (this.messages || []).length,
+                      "messages.length:", this.activeSessionPane().messages.length,
                       "sessions.length:", (this.sessions || []).length,
                       "previewTabCtxMenu:", JSON.stringify(this.previewTabCtxMenu),
                       "ctxBreakdown:", JSON.stringify(this.ctxBreakdown));
         console.groupEnd();
       });
-      this.$watch("editing", v => v ? this.mountCM() : this.unmountCM());
-      // Removed: rightOpen toast ("Muse 回来了") — the panel opening is self-evident.
+      this.$watch("editing", v => {
+        this.dismissTransientPreviewQuote(true);
+        v ? this.mountCM() : this.unmountCM();
+      });
+      // Removed: pane-open toast — the panel opening is self-evident.
       // 编辑模式下切换文件时，重新挂载 CM 加载新文件内容
       this.$watch("selected", () => { if (this.editing) { this.unmountCM(); this.mountCM(); } });
       // Preview-header path + mtime strip: refresh the on-disk metadata
       // whenever the active file changes (tree click, tab switch, chat link,
       // boot restore). Fire once now too in case `selected` was restored
       // before this watcher attached.
-      this.$watch("selected", (p) => this.loadSelectedMeta(p));
+      this.$watch("selected", (p) => {
+        this.dismissTransientPreviewQuote(true);
+        this.loadSelectedMeta(p);
+      });
       this.loadSelectedMeta(this.selected);
+      // Relative file times should age naturally while a preview remains
+      // open. One shared minute tick is enough; never attach a timer or stat
+      // request to each tree row.
+      this._fileMetaClockTimer = setInterval(() => {
+        this.fileMetaClock = Date.now();
+      }, 60_000);
       // beforeunload guard for the editor: register a handler ONLY while there
       // are unsaved edits, and remove it the moment they're saved/discarded.
       // Attaching beforeunload unconditionally would defeat the browser's
@@ -1571,6 +1935,13 @@ function portal() {
     // `scroll-margin-bottom: 16px` on the textarea (see styles.css) leaves a
     // breathing-room gap so the input isn't flush against the keyboard top.
     onChatInputFocus() {
+      // A group-assignment menu is portalled outside the activity backdrop. On
+      // iOS, focusing the composer can resize the visual viewport before the
+      // delayed outside-click closes that fixed layer, leaving the menu（and a
+      // clipped activity row）visible between the composer and keyboard. Composer
+      // focus is an unambiguous return to chat, so close both surfaces first.
+      if (this.activity.moveMenu.show) this.closeActivityMoveMenu();
+      if (this.activity.show) this.closeActivityCenter();
       document.documentElement.style.setProperty("--kb-inset", "0px");
       document.body.classList.add("kb-open");
       this._reconcileMobileViewport();
@@ -1586,7 +1957,21 @@ function portal() {
     // shrinks the layout with no keyboard present → a big blank band appears
     // at the bottom of the chat. Zeroing the inset here keeps the two CSS
     // inputs (.kb-open class + --kb-inset) in lockstep, exactly like update().
-    onChatInputBlur() {
+    onChatInputBlur(ev) {
+      this._resetImeCompositionState(ev);
+      const target = ev && (ev.target || ev.currentTarget);
+      const settledOwner = target && target._museImeSettledOwnerSid;
+      // The composer bridge intentionally ignores model writes while focused.
+      // When focus leaves (for example, the user clicks Send), commit exactly
+      // what is visibly in the native control before the click handler reads
+      // the draft. A composition settled for a different tab is excluded.
+      if (target && (!settledOwner || settledOwner === this.currentId)) {
+        if (this.input !== target.value) this.input = target.value;
+        const state = this.currentId && this.tabState && this.tabState[this.currentId];
+        if (state && state.draft) state.draft.input = target.value;
+        if (this.currentId) this._persistChatDraft(this.currentId, target.value);
+      }
+      if (target) delete target._museImeSettledOwnerSid;
       document.body.classList.remove("kb-open");
       document.documentElement.style.setProperty("--kb-inset", "0px");
       this._scheduleMobileRootReset();
@@ -1681,8 +2066,17 @@ function portal() {
     _initMobileKeyboardWatch() {
       const vv = window.visualViewport;
       if (vv) {
-        vv.addEventListener("resize", () => this._syncMobileKeyboardViewport());
-        vv.addEventListener("scroll", () => this._syncMobileKeyboardViewport());
+        const onVisualViewportChange = () => {
+          // Desktop menus are tied to a row rect and become stale as the visual
+          // viewport moves. Mobile menus are bottom sheets; keeping them open
+          // avoids an input blur / keyboard dismissal immediately undoing the tap.
+          if (this.activity.moveMenu.show && this.activity.moveMenu.style) {
+            this.closeActivityMoveMenu(false);
+          }
+          this._syncMobileKeyboardViewport();
+        };
+        vv.addEventListener("resize", onVisualViewportChange);
+        vv.addEventListener("scroll", onVisualViewportChange);
       }
       window.addEventListener("resize", () => {
         // A resize can flip the (pointer: coarse) / width breakpoints that
@@ -1819,20 +2213,49 @@ function portal() {
       // and let the reconnect banner take over.
       this._splashHardTimeout = setTimeout(() => {
         if (!this.appReady) {
-          this.appReady = true;
+          this._markReady();
           this.connState = "reconnecting";
         }
       }, 8000);
 
       this.loadPrefs();
-      // Resolve the persisted workspace before the first file request; file
-      // paths are relative and must never flash content from the primary root.
-      await this.fetchSessionWorkspaces();
+      // A fresh sessionStorage registry is sufficient to resolve the first
+      // owner immediately. Revalidate it in the background; a network failure
+      // must not throw away the last known-good workspace list or hold the
+      // splash on a request that is independent of the first paint.
+      const restoredWorkspaceRegistry = this._restoreSessionWorkspaceCache();
+      const workspaceRegistryReady = Promise.resolve(this.fetchSessionWorkspaces({
+        restoreCache: false,
+        validateActive: !restoredWorkspaceRegistry,
+        returnResolution: true,
+      })).catch(() => false);
+      if (!restoredWorkspaceRegistry) await workspaceRegistryReady;
       const rootOwner = this.fileWorkspacePath();
+      // Context cards are the only network dependency that gates splash
+      // readiness. Dispatch them before the file tree, live transports, session
+      // list and decorative snapshots so a high-latency proxy cannot leave the
+      // critical request queued behind non-visible startup work.
+      const contextReady = Promise.resolve(this.fetchContextInfo());
+      void contextReady.catch(() => false);
       // Attach the rejection handler immediately: the rest of boot awaits
       // context/session work before it observes this promise, and a fast tree
       // failure must never surface as an unhandled rejection in that gap.
       const rootReady = Promise.resolve(this.loadRoot()).catch(() => false);
+      if (restoredWorkspaceRegistry) {
+        void workspaceRegistryReady.then(result => {
+          if (!result || !result.invalidActive || !result.fallback
+              || !this._workspaceIsCurrent(result.requested)
+              || result.fallback === result.requested) return;
+          // The cached owner was removed on another device. The remote list was
+          // applied without mutating activeWorkspace, so the normal owner-
+          // scoped switch path can invalidate the stale bootstrap safely.
+          return this._changeWorkspaceSurface(result.fallback);
+        }).catch(() => false);
+      }
+      // Chat/session/activity transports do not depend on the file index or
+      // context cards. Start them before either slow request; the file stream
+      // remains gated on rootReady below so its cursor is always trustworthy.
+      this._startLiveConnections({ fileEvents: false, activitySnapshot: false });
       this.fetchTerminals({ restore: true });
       // Push-notification deep-link: a turn-done notification opens
       // `/?session=<id>` in a fresh tab. After sessions load, jump to that
@@ -1840,16 +2263,6 @@ function portal() {
       // (the already-open-tab case is handled via the SW postMessage above).
       this._openStartupActivityDeeplink();
       this.initSessions().then(() => this._openStartupSessionDeeplink());
-      this.fetchStats();
-      // Trash badge state — light fetch (just count), gated by token
-      // which is already verified at this point. Fire-and-forget;
-      // failures degrade silently to "no badge styling".
-      this.loadTrash();
-      // Surface any in-flight turns that were cut short by a previous
-      // process death (OOM kill / power loss / manual restart mid-stream).
-      // Fire-and-forget — purely informational, doesn't block boot. Backend
-      // returns [] when nothing was interrupted (the common case).
-      this._checkInterruptedTurns();
       // First-run hint — surface key shortcuts so the user doesn't have to
       // hunt for them. Flagged in localStorage so it only fires once. Short
       // delay lets the splash clear first.
@@ -1857,8 +2270,8 @@ function portal() {
         setTimeout(() => {
           this.toast(
             this.lang === "zh"
-              ? "Tip：⌘K 命令面板 · / 斜杠命令 · @ 引用文件或目录 · ↑ 回滚上一条"
-              : "Tip: ⌘K command palette · / slash commands · @ to reference files or folders · ↑ to recall last message",
+              ? "Tip：⌘K 命令面板 · @ 引用文件或目录 · ↑ 回滚上一条"
+              : "Tip: ⌘K command palette · @ to reference files or folders · ↑ to recall last message",
             "info", 7000);
           this._setLS("muselab_seen_help", "1");
         }, 1500);
@@ -1872,7 +2285,7 @@ function portal() {
         // selection must not silently pin a tab that was left in preview.
         const _restored = this.tabs.find(t => t.path === path);
         this.openFile({ path, name: path.split("/").pop() },
-                      { preview: !!(_restored && _restored.preview) })
+                      { preview: !!(_restored && _restored.preview), reveal: false })
             .catch(() => { /* file gone — silent */ });
       }
       // Restore mobile tab choice AFTER openFile (which would otherwise
@@ -1881,18 +2294,15 @@ function portal() {
       // settles before we override it back to the user's actual last tab.
       // Desktop ignores mobileTab entirely so this is a no-op there.
       this._restorePendingMobileTab();
-      // Block readiness on context-info (the most important one for the
-      // onboarding cards). Others come along in parallel.
+      // Block readiness on the context request dispatched at the start of boot.
+      // Sessions and the file tree continue independently and reveal their own
+      // loading states instead of holding the whole shell behind a waterfall.
       try {
-        await this.fetchContextInfo();
+        await contextReady;
         this._markReady();
       } catch (e) {
         // Will retry via heartbeat
       }
-      // Chat/session/activity connections are independent of the filesystem.
-      // Start them immediately; only the file replay stream waits for a trusted
-      // snapshot/cursor so a slow workspace cannot delay the rest of the app.
-      this._startLiveConnections({ fileEvents: false });
       void rootReady.then(treeOk => {
         if (!this._workspaceIsCurrent(rootOwner)) return;
         this._fileTreeDirty = treeOk !== true;
@@ -1909,17 +2319,22 @@ function portal() {
     // of only after a manual refresh. Both underlying starts are idempotent
     // (clearInterval before re-arming), but this is only ever called once per
     // boot path, so there's no double-start.
-    _startLiveConnections({ fileEvents = true } = {}) {
+    _startLiveConnections({ fileEvents = true, activitySnapshot = true } = {}) {
       this._startHeartbeat();
       this._startPresence();
       this._startSessionsSync();
       if (fileEvents) this._startFileEvents();
-      this.fetchActivity();
+      // Source-aware ACK needs the persisted ledger row on a cold boot. Saved-
+      // token boot defers this decorative snapshot until after appReady; first
+      // sign-in keeps the original eager behavior through the default option.
+      if (activitySnapshot) {
+        Promise.resolve(this.fetchActivity()).catch(() => false).finally(
+          () => this.ackCurrentActivity(),
+        );
+      }
       this._startActivityEvents();
+      this._startTodoEvents();
       this._startMemoryMonitor();
-      // Restoring a saved current session means the user is already looking at
-      // it; clear any completion that landed before this page loaded.
-      this.ackCurrentActivity();
     },
 
     // FIX ⑪: near-real-time multi-device sync for the session LIST while the
@@ -1956,12 +2371,46 @@ function portal() {
       }, 10_000);
     },
 
+    _scheduleDeferredBootWork() {
+      if (this._deferredBootWorkScheduled) return;
+      this._deferredBootWorkScheduled = true;
+      const run = () => {
+        // These snapshots decorate an already-usable shell. Keeping them off the
+        // critical path prevents six unrelated endpoints and preview bundles
+        // from competing with context/session startup on tunneled connections.
+        void Promise.resolve(this.fetchActivity()).catch(() => false).finally(
+          () => this.ackCurrentActivity(),
+        );
+        void Promise.resolve(this.fetchStats()).catch(() => false);
+        void Promise.resolve(this.loadTrash()).catch(() => false);
+        void Promise.resolve(this._checkInterruptedTurns()).catch(() => false);
+        this._prewarmPreviewLibs();
+      };
+      const schedule = () => {
+        try {
+          if (typeof window !== "undefined" && window.requestIdleCallback) {
+            window.requestIdleCallback(run, { timeout: 1500 });
+          } else {
+            setTimeout(run, 300);
+          }
+        } catch (_) { setTimeout(run, 300); }
+      };
+      // Give Alpine one frame to remove the splash and paint the usable shell
+      // before any best-effort network or parsing work begins.
+      if (typeof requestAnimationFrame === "function") {
+        requestAnimationFrame(() => requestAnimationFrame(schedule));
+      } else {
+        setTimeout(schedule, 0);
+      }
+    },
+
     _markReady() {
       if (this.appReady) return;
       this.appReady = true;
       clearTimeout(this._splashHintTimer);
       clearTimeout(this._splashHardTimeout);
       this.splashHint = "";
+      this._scheduleDeferredBootWork();
     },
 
     // Friendly "5 min ago" / "刚刚" / "3 h ago" formatter for the
@@ -2108,6 +2557,7 @@ function portal() {
         ping();                  // presence: re-arm push suppression
         this.ackCurrentActivity(); // visible current session is already viewed
         this._pingHealth();      // health: refresh conn state immediately
+        this._resumeVisibleSessionSync();
         // Refresh the session list in case another device created/deleted
         // sessions while this tab was hidden (drives the active-dot state).
         // The tab strip itself is device-local — no cross-device merge.
@@ -2156,7 +2606,7 @@ function portal() {
             const knownLocal = localVer
               && localVer !== "__MUSELAB_ASSET_VERSION__";
             if (knownLocal && localVer !== String(remoteVer)
-                && !this.streaming) {
+                && !this.activeSessionPane().streaming) {
               this._appVersionReloadFired = true;
               console.info("[muselab] asset version changed",
                            localVer, "→", remoteVer, "— reloading");
@@ -2410,6 +2860,10 @@ function portal() {
       } else if (window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches) {
         this.theme = "light";
       }
+      const savedEyecareLevel = Number(localStorage.getItem("muselab_eyecare_level"));
+      if (Number.isInteger(savedEyecareLevel) && savedEyecareLevel >= 1 && savedEyecareLevel <= 3) {
+        this.eyecareLevel = savedEyecareLevel;
+      }
       const savedAccent = localStorage.getItem("muselab_accent");
       if (savedAccent) this.accent = savedAccent;
       this.applyTheme();
@@ -2431,6 +2885,7 @@ function portal() {
     },
     applyTheme() {
       document.documentElement.setAttribute("data-theme", this.theme);
+      document.documentElement.setAttribute("data-eyecare-level", String(this.eyecareLevel));
       const link = document.getElementById("hljs-theme");
       if (link) {
         // Eyecare is still a light-background theme. Reusing the dark syntax
@@ -2452,7 +2907,10 @@ function portal() {
       // manually picks dark/eyecare would get a mismatched status bar. Force
       // every theme-color meta to the active in-app theme so whichever one the
       // browser picks agrees with what's actually rendered.
-      const themeColor = ({ light: "#ffffff", dark: "#0f1115", eyecare: "#f5f0e0" })[this.theme] || "#0f1115";
+      // Read the active surface token instead of maintaining a second color
+      // table here; CSS is the single source of truth for every intensity.
+      const themeColor = getComputedStyle(document.documentElement)
+        .getPropertyValue("--c-bg-0").trim() || "#0f1115";
       document.querySelectorAll('meta[name="theme-color"]').forEach(m => {
         m.setAttribute("content", themeColor);
       });
@@ -2554,7 +3012,7 @@ function portal() {
     // 命中的是「每一个 assistant 轮次的首条」——历史里每个轮次都满足，
     // 于是流式时所有轮次的头像一起动。正确语义是「仅当前（最新）轮」：
     // 既是轮首（前一条是 user 或开头），又是最后一轮（自此往后不再有 user）。
-    isStreamingTurnAvatar(i, msgs = this.messages, streaming = this.streaming) {
+    isStreamingTurnAvatar(i, msgs = this.activeSessionPane().messages, streaming = this.activeSessionPane().streaming) {
       if (!streaming) return false;
       if (!msgs || !msgs.length) return false;
       // 最新轮的轮首 = 最后一个 user 之后紧邻的第一条 assistant。这等价于旧
@@ -2638,7 +3096,7 @@ function portal() {
     },
     greetMascot(msg) {
       // 去重：同一条 msg 在 1.5s 内重复调用只 toast 一次（Alpine $watch 在某些场景会双触发，
-      // 比如 rightOpen 既被 loadPrefs 写又被点击 toggle 时的 render 顺序）。
+      // 比如 previewOpen 既被 loadPrefs 写又被点击 toggle 时的 render 顺序）。
       const now = Date.now();
       if (msg && this._lastGreetMsg === msg && now - this._lastGreetAt < 1500) {
         return;
@@ -2656,15 +3114,23 @@ function portal() {
       const idx = order.indexOf(this.theme);
       this.setTheme(order[(idx + 1) % order.length]);
     },
-    // Direct theme set — used by the Settings → Appearance picker. Mobile
-    // hides the files-pane-head toggle (styles.css), so Settings is the
-    // ONLY theme entry point on phones; this backs it.
+    // Direct theme set — used by Settings → Appearance and by the global
+    // one-tap theme cycle. Intensity stays in Settings so the quick action's
+    // long-standing light → dark → eyecare behavior remains predictable.
     setTheme(t) {
       if (!["light", "dark", "eyecare"].includes(t)) return;
       this.theme = t;
       this.applyTheme();
       this.applyAccent();   // 派生色对深浅敏感，重算
       this._setLS("muselab_theme", this.theme);
+      if (this._terminal) this._terminal.options.theme = this._terminalTheme();
+    },
+    setEyecareLevel(level) {
+      const next = Number(level);
+      if (!Number.isInteger(next) || next < 1 || next > 3) return;
+      this.eyecareLevel = next;
+      this._setLS("muselab_eyecare_level", String(next));
+      this.applyTheme();
       if (this._terminal) this._terminal.options.theme = this._terminalTheme();
     },
 
@@ -2984,7 +3450,8 @@ function portal() {
     },
     async onAttachDrop(ev) {
       const files = Array.from((ev.dataTransfer && ev.dataTransfer.files) || []);
-      for (const f of files) await this._attachFile(f);
+      this._resetOsFileDragState();
+      await this._uploadFilesToDir("", files);
     },
     async onImagePaste(ev) {
       // Only handle pasted image data; let normal text paste through.
@@ -3358,7 +3825,17 @@ function portal() {
       });
     },
     closeImageGen() {
+      this.cancelImageGenSubmit();
       this.imageGen.show = false;
+    },
+    cancelImageGenSubmit() {
+      const controller = this.imageGen.submitController;
+      this.imageGen.submitSeq = (Number(this.imageGen.submitSeq) || 0) + 1;
+      this.imageGen.submitController = null;
+      this.imageGen.loading = false;
+      if (controller) {
+        try { controller.abort(); } catch (_) {}
+      }
     },
     ensureImageGenPolling() {
       if (this.imageGen.pollTimer) return;
@@ -3433,11 +3910,21 @@ function portal() {
     async runImageGen() {
       const prompt = (this.imageGen.prompt || "").trim();
       if (!prompt || this.imageGen.loading) return;
+      const submitSeq = (Number(this.imageGen.submitSeq) || 0) + 1;
+      const controller = new AbortController();
+      let timedOut = false;
+      this.imageGen.submitSeq = submitSeq;
+      this.imageGen.submitController = controller;
       this.imageGen.loading = true;
       this.imageGen.error = "";
+      const timer = setTimeout(() => {
+        timedOut = true;
+        controller.abort();
+      }, this.IMAGE_GEN_SUBMIT_DEADLINE_MS);
       try {
         const res = await this.api("/api/chat/image-generate/jobs", {
           method: "POST",
+          signal: controller.signal,
           json: {
             prompt,
             model: this.imageGen.model || "gpt-image-2",
@@ -3448,6 +3935,11 @@ function portal() {
             image_ids: this.imageGenReferenceIds(),
           },
         });
+        if (submitSeq !== this.imageGen.submitSeq) return;
+        if (controller.signal.aborted) {
+          throw new Error(timedOut
+            ? "image generation submission timed out" : "cancelled");
+        }
         if (!res.ok) throw new Error(res.error || `HTTP ${res.status}`);
         const job = res.data.job;
         if (job && job.id) {
@@ -3458,12 +3950,23 @@ function portal() {
                    "success", 1800);
         this.ensureImageGenPolling();
       } catch (e) {
-        const msg = e && e.message ? e.message : String(e || "");
+        if (submitSeq !== this.imageGen.submitSeq) return;
+        const msg = timedOut
+          ? (this.lang === "zh"
+            ? "提交确认超时，请先刷新历史记录，确认后再重试"
+            : "Submission confirmation timed out. Refresh history before retrying")
+          : (e && e.message ? e.message : String(e || ""));
         this.imageGen.error = msg;
         this.toast((this.lang === "zh" ? "提交失败：" : "Submit failed: ") + msg,
                    "error", 5000);
       } finally {
-        this.imageGen.loading = false;
+        clearTimeout(timer);
+        if (submitSeq === this.imageGen.submitSeq) {
+          if (this.imageGen.submitController === controller) {
+            this.imageGen.submitController = null;
+          }
+          this.imageGen.loading = false;
+        }
       }
     },
     async attachGeneratedImage(img, ownerSid = this.imageGen.ownerSid || this.currentId) {
@@ -3552,6 +4055,22 @@ function portal() {
       const mm = String(d.getMinutes()).padStart(2, "0");
       return hh + ":" + mm;
     },
+    openMessageOutline(ev = null) {
+      if (this.msgOutlineOpen) return;
+      const opener = ev && ev.currentTarget
+        ? ev.currentTarget : document.activeElement;
+      this.msgOutlineOpen = true;
+      this._openFocusSurface(
+        "message-outline", ".msg-outline-panel", ".msg-outline-item",
+        opener, true,
+      );
+      void this.refreshOutlineFromBackend(this.currentId);
+    },
+    closeMessageOutline(restoreFocus = true) {
+      if (!this.msgOutlineOpen && !this._focusSurfaceState["message-outline"]) return;
+      this.msgOutlineOpen = false;
+      this._closeFocusSurface("message-outline", restoreFocus);
+    },
     // Filter messages for the sidebar outline. Returns only user prompts
     // (skipping the auto-injected compact summaries) — they're what the
     // user remembers asking, so they make the best jump targets.
@@ -3559,14 +4078,10 @@ function portal() {
       // Touch reactivity ping so the modal re-renders when backend fetch
       // completes (same mechanism conversationOutline uses).
       const _ = this.outlineVersion;
-      // Fire off a background backend fetch so the list reflects the
-      // FULL session, not just the lazy-loaded visible window. This was
-      // the source of "outline shows only 2 user messages on a 45-user
-      // session" — the original filter walked this.messages which only
-      // contains the recent slice after the long-history performance
-      // optimization (commit 664304a).
+      // Opening the dialog explicitly refreshes the full-session cache. Keep
+      // this render-time projection pure so Alpine can evaluate the hidden
+      // x-show subtree during boot without starting network work.
       const sid = this.currentId;
-      if (sid) this.refreshOutlineFromBackend(sid);
       // Primary: backend-sourced list, shaped to look like message
       // objects so the modal template (which calls outlineText(m) and
       // _scrollToUserMsg(m.uuid)) keeps working unchanged.
@@ -3582,15 +4097,16 @@ function portal() {
         }));
       }
       // Fallback: live filter on the visible window (original behavior).
-      return (this.messages || []).filter(
+      return this.activeSessionPane().messages.filter(
         m => m && m.role === "user" && !m._is_compact_summary);
     },
     async _loadAroundMessage(sid, uuid, retryAfterConflict = true) {
       const st = this.tabState && this.tabState[sid];
       if (!st || !uuid || st.streaming || st.es) return false;
-      const limit = this._mountedMessageCap();
-      const generation = st.historyGeneration
-        ? "&history_generation=" + encodeURIComponent(st.historyGeneration) : "";
+      const historyReplaceToken = this._beginHistoryReplace(st);
+      const limit = this._historyWindowSize();
+      const generation = st.messageRange.generation
+        ? "&history_generation=" + encodeURIComponent(st.messageRange.generation) : "";
       const r = await fetch("/api/chat/sessions/" + sid
         + "?around_uuid=" + encodeURIComponent(uuid) + "&limit=" + limit + generation,
         { headers: this.hdr() });
@@ -3598,37 +4114,39 @@ function portal() {
         if (!retryAfterConflict) return false;
         const reloaded = await this._reloadHistoryTailAfterConflict(sid, st);
         if (!reloaded || this.tabState[sid] !== st) return false;
-        // Reloading the tail refreshes historyGeneration but does not load an
+        // Reloading the tail refreshes the range generation but does not load an
         // old outline target. Retry around_uuid exactly once against the new
         // generation instead of reporting the tail reload as target success.
         return this._loadAroundMessage(sid, uuid, false);
       }
       if (!r.ok) return false;
       const data = await r.json();
-      if (this.tabState[sid] !== st) return false;
+      if (this.tabState[sid] !== st
+          || !this._historyReplaceStillOwns(st, historyReplaceToken)) {
+        return false;
+      }
       const win = this._historyEnvelopes(sid, data.messages || []);
       for (const m of win) {
-        if (m.role === "assistant" && m.text && !m.html) m.html = this.mdRender(m.text);
+        if (m.role === "assistant" && m.text && !m.html) m.html = this._renderHistoryMessage(m);
       }
       if (!win.some(m => m.uuid === uuid)) return false;
+      if (!this._historyReplaceStillOwns(st, historyReplaceToken)) return false;
       st.messages.splice(0, st.messages.length, ...win);
-      st._earlierMessages = [];
-      st._laterMessages = [];
-      st._loadedOffset = Number.isInteger(data.offset) ? data.offset : 0;
-      st._total = Number.isInteger(data.total) ? data.total : win.length;
-      st._preTotal = Number.isInteger(data.pre_total) ? data.pre_total : 0;
-      st.historyGeneration = data.history_generation || st.historyGeneration || "";
-      st._historyOrder = data.history_order === "normal" ? "normal" : "full";
-      st._hasServerLater = !!data.has_later;
-      // Set the server coordinate before defensive trimming: if a malformed
-      // or older backend returns more than the cache cap, _capHistoryCache
-      // advances _loadedOffset for every discarded head bubble.
-      this._capMountedWindow(st, "around", uuid);
-      st._hasMoreHistory = st._earlierMessages.length > 0 || st._loadedOffset > 0;
-      if (sid === this.currentId) {
-        this.messages = st.messages;
-        this.historyGeneration = st.historyGeneration;
-      }
+      Object.assign(st.messageRange, {
+        visibleStart: 0,
+        visibleEnd: win.length,
+        offset: Number.isInteger(data.offset) ? data.offset : 0,
+        total: Number.isInteger(data.total) ? data.total : win.length,
+        preTotal: Number.isInteger(data.pre_total) ? data.pre_total : 0,
+        generation: data.history_generation || st.messageRange.generation || "",
+        order: data.history_order === "normal" ? "normal" : "full",
+      });
+      st.atBottom = false;
+      this._enforceMessageRangeInvariant(st);
+      // around_uuid replaces both the repository and its server coordinates.
+      this._scheduleHistoryViewport(st, "around", uuid);
+      st._hasMoreHistory = st.messageRange.offset > 0;
+      this._syncNormalizedHistory(st);
       return st.messages.some(m => m.uuid === uuid);
     },
 
@@ -3642,10 +4160,9 @@ function portal() {
       if (this._isMobileLayout()) this.setMobileTab("chat");
       const activeState = this.tabState && this.tabState[sid];
       if (activeState) activeState.atBottom = false;
-      if (sid === this.currentId) this.atBottom = false;
       const tryScroll = () => {
         if (sid !== this.currentId) return false;
-        const body = this.$refs && this.$refs.chatBody;
+        const body = this._chatBodyElement();
         const el = body && body.querySelector(
           `.msg[data-uuid="${CSS.escape(uuid)}"]`);
         if (!el) return false;
@@ -3657,14 +4174,11 @@ function portal() {
       this.$nextTick(() => {
         if (sid !== this.currentId) return;
         if (tryScroll()) return;
-        // Target not in DOM — it lives in the lazy stash. Find it there
-        // and pull everything from that index forward into visible
-        // messages, then retry scroll. Mirrors jumpToOutlineItem's
-        // backend branch but for the modal outline path.
+        // Target not in DOM — reveal it from the resident repository when
+        // possible; otherwise replace the repository through around_uuid.
         const st = this.tabState && this.tabState[sid];
         if (!st) return;
-        const earlier = (st && st._earlierMessages) || [];
-        const idx = earlier.findIndex(em => em && em.uuid === uuid);
+        const idx = st.messages.findIndex(em => em && em.uuid === uuid);
         if (idx < 0) {
           (async () => {
             const loaded = await this._loadAroundMessage(sid, uuid);
@@ -3677,17 +4191,17 @@ function portal() {
           })();
           return;
         }
-        const batch = earlier.splice(idx);
-        batch.forEach(em => {
+        for (let i = idx; i < st.messageRange.visibleStart; i++) {
+          const em = st.messages[i];
           if (em.role === "assistant" && em.text && !em.html) {
-            em.html = this.mdRender(em.text);
+            em.html = this._renderHistoryMessage(em);
           }
-        });
-        st.messages.unshift(...batch);
-        this._capMountedWindow(st, "around", uuid);
-        if (sid === this.currentId) this.messages = st.messages;
-        st._hasMoreHistory =
-          (st._earlierMessages || []).length > 0 || st._loadedOffset > 0;
+        }
+        st.messageRange.visibleStart = Math.min(idx, st.messageRange.visibleStart);
+        st.messageRange.visibleEnd = Math.max(idx + 1, st.messageRange.visibleEnd);
+        this._scheduleHistoryViewport(st, "around", uuid);
+        st._hasMoreHistory = st.messageRange.visibleStart > 0
+          || st.messageRange.offset > 0;
         this.$nextTick(() => {
           if (this.tabState[sid] !== st || sid !== this.currentId) return;
           const pane = this._paneElement(sid);
@@ -3736,8 +4250,11 @@ function portal() {
     // Compact, no decimals at minute granularity — second-precision past
     // ~30s adds visual noise without information value.
     fmtStreamElapsed(secs) {
-      if (!secs || secs < 1) return "";
-      const s = Math.floor(secs);
+      if (secs === null || secs === undefined || secs === "") return "";
+      const numeric = Number(secs);
+      if (!Number.isFinite(numeric) || numeric < 0) return "";
+      if (numeric < 1) return "<1s";
+      const s = Math.floor(numeric);
       if (s < 60) return `${s}s`;
       const m = Math.floor(s / 60);
       const rs = s % 60;
@@ -3762,6 +4279,117 @@ function portal() {
       if (d.getFullYear() === now.getFullYear()) return `${M}-${D} ${hh}:${mm}`;
       return `${d.getFullYear()}-${M}-${D} ${hh}:${mm}`;
     },
+    _turnMessageBelongsToActiveTurn(m, pane) {
+      if (!m || !pane || !pane.streaming || !Array.isArray(pane.messages)) {
+        return false;
+      }
+      const index = pane.messages.indexOf(m);
+      if (index < 0) return false;
+
+      let ownerUser = null;
+      for (let k = index; k >= 0; k -= 1) {
+        if (pane.messages[k] && pane.messages[k].role === "user") {
+          ownerUser = pane.messages[k];
+          break;
+        }
+      }
+      if (!ownerUser) return false;
+
+      const ownerTurnId = String(ownerUser._turnId || "");
+      const activeTurnId = String(pane.activeTurnId || "");
+      if (ownerTurnId && activeTurnId) return ownerTurnId === activeTurnId;
+
+      // Before the first turn metadata event arrives, the newest user boundary
+      // is the only reply run that can own the pane-level live state.
+      for (let k = index + 1; k < pane.messages.length; k += 1) {
+        if (pane.messages[k] && pane.messages[k].role === "user") return false;
+      }
+      return true;
+    },
+    turnFooterStatus(m, pane) {
+      const stored = String((m && m.turn_status)
+        || (m && m._interrupted ? "cancelled" : "")
+        || (m && m._failed ? "failed" : ""));
+      if (stored) return stored;
+      // A continuation can pause after its main response while background work
+      // settles. Do not present that quiet handoff as a newly running turn; the
+      // live footer appears when the reaction stream actually starts.
+      if (pane && pane._continuationAwaitingReaction) return "";
+      // Fresh live bubbles are created before the terminal done payload can
+      // stamp turn_status. Only the active user-delimited turn may borrow the
+      // pane-level live state; an older tail can also lack ts while canonical
+      // reconciliation is still adopting its completed metadata.
+      if (m && !m.ts && this._turnMessageBelongsToActiveTurn(m, pane)) {
+        return "running";
+      }
+      // Compatibility for cached/front-end-injected records created before
+      // turn_status became part of the footer contract.  Their terminal `ts`
+      // is already durable proof that the turn closed; keep the footer and
+      // point-fork action available until the next canonical reload enriches
+      // the record with an explicit status.
+      if (m && m.ts) return "completed";
+      return "";
+    },
+    turnStatusLabel(status) {
+      const value = String(status || "");
+      if (value === "running") return this.lang === "zh" ? "运行中" : "Running";
+      if (value === "completed") return this.lang === "zh" ? "已完成" : "Completed";
+      if (value === "failed") return this.lang === "zh" ? "失败" : "Failed";
+      return this.lang === "zh" ? "已中断" : "Interrupted";
+    },
+    streamPhaseLabel(phase) {
+      const value = String(phase || "");
+      if (value === "tools") return this.t("chat.startup_tools");
+      if (value === "context") return this.t("chat.startup_context");
+      if (["connecting", "accepted", "runtime"].includes(value)) {
+        return this.t("chat.startup_runtime");
+      }
+      return this.turnStatusLabel("running");
+    },
+    _backgroundTaskCount(state) {
+      const own = Number(state && state.backgroundTaskCount);
+      const inherited = Number(state && state.inheritedBackgroundTaskCount);
+      const count = (Number.isFinite(own) && own > 0 ? Math.floor(own) : 0)
+        + (Number.isFinite(inherited) && inherited > 0 ? Math.floor(inherited) : 0);
+      return count > 0 ? count : 1;
+    },
+    turnHasPendingBackground(m, pane, isLatest = false) {
+      // This is deliberately a display-only composite state. The canonical
+      // turn_status remains "completed"; backgroundActive belongs to the
+      // session watcher lifecycle and must never be persisted onto the turn.
+      return !!(isLatest
+        && pane && (pane.backgroundActive || pane.inheritedBackgroundTaskCount > 0)
+        && !pane.streaming
+        && m && !m._failed && !m._interrupted
+        && this.turnFooterStatus(m, pane) === "completed");
+    },
+    turnFooterTime(m, pane) {
+      const status = this.turnFooterStatus(m, pane);
+      if (status === "running") {
+        return Number((m && m.turn_started_at)
+          || (pane && pane._streamStartedAt) || (m && m.mts) || 0);
+      }
+      return Number((m && (m.ts || m.mts || m.turn_started_at)) || 0);
+    },
+    turnFooterElapsed(m, pane) {
+      const value = this.turnFooterStatus(m, pane) === "running"
+        ? Math.max(
+            Number((m && m.elapsed) || 0),
+            Number((pane && pane.streamElapsed) || 0),
+          )
+        : Number(m && m.elapsed);
+      return Number.isFinite(value) && value >= 0 ? value : null;
+    },
+    turnFooterModel(m, pane, sid) {
+      const stored = String((m && m.model) || "");
+      if (stored) return stored;
+      if (this._turnMessageBelongsToActiveTurn(m, pane)) {
+        const live = String((pane && pane.streamingModel) || "");
+        if (live) return live;
+      }
+      const meta = (this.sessions || []).find(session => session.id === sid);
+      return String((meta && meta.model) || "");
+    },
     // True when index i in messages[] is the tail of a turn — i.e. it
     // is muse-side AND the next message is either nonexistent or
     // user-role. Used by the per-turn footer (index.html) to decide
@@ -3769,12 +4397,13 @@ function portal() {
     // lookup; Alpine re-evaluates it per render which is fine since
     // it's a few comparisons.
     isTurnTail(i) {
-      const arr = this.messages;
+      const arr = this.activeSessionPane().messages;
       if (!arr || i < 0 || i >= arr.length) return false;
       const m = arr[i];
       if (!m || m.role === "user") return false;
       const next = arr[i + 1];
-      return !next || next.role === "user";
+      return !next || next.role === "user"
+        || next.display_kind === "runtime_continuation";
     },
     // Resolve a persisted message UUID for a footer mounted on the actual turn
     // tail. Agentic turns often end in a tool_result/status bubble; the backend
@@ -3787,8 +4416,11 @@ function portal() {
       if (i < 0 || i >= arr.length) return "";
       const tail = arr[i];
       if (!tail || tail.role === "user") return "";
+      if (tail.display_kind === "runtime_continuation"
+          || tail.forkable === false || tail.presentation_only) return "";
       const next = arr[i + 1];
-      if (next && next.role !== "user") return "";
+      if (next && next.role !== "user"
+          && next.display_kind !== "runtime_continuation") return "";
       for (let k = i; k >= 0; k -= 1) {
         const message = arr[k];
         if (!message || message.role === "user") break;
@@ -3832,6 +4464,24 @@ function portal() {
         }
       }
       return p;
+    },
+
+    // Convert a local file: URL emitted by the model into its decoded absolute
+    // pathname so the normal workspace-root safety check can handle it. Browsers
+    // block http(s) pages from navigating to file://, so these links must be
+    // intercepted by Muse. Remote file hosts stay rejected instead of being
+    // mistaken for local workspace paths. Returns null for non-file schemes and
+    // "" for malformed or non-local file URLs.
+    _localFileUrlPath(href) {
+      if (!/^file:/i.test(String(href || ""))) return null;
+      try {
+        const url = new URL(href);
+        if (url.protocol !== "file:") return "";
+        if (url.hostname && url.hostname !== "localhost") return "";
+        return decodeURIComponent(url.pathname || "");
+      } catch (_) {
+        return "";
+      }
     },
 
     // Rewrite author-relative <img src> in rendered-markdown HTML to the backend
@@ -4004,9 +4654,8 @@ function portal() {
     // tool-result / MCP / plan bubble on re-render, and the load-earlier path
     // runs it in batches; without a cache those are all full re-parses. Cache
     // is keyed by exact input text and LRU-evicted at a hard cap so memory
-    // stays bounded. The live streaming bubble deliberately bypasses this
-    // (calls _mdRenderUncached) so its ever-growing intermediate strings never
-    // pollute the cache or evict useful static-message entries.
+    // stays bounded. Open SSE segments stay plain and do not enter this cache;
+    // their final rich render is cached only after a terminal/tool boundary.
     mdRender(text) {
       if (!text) return "";
       const cache = this._mdCache || (this._mdCache = new Map());
@@ -4030,6 +4679,120 @@ function portal() {
         cache.delete(k);
       }
       return out;
+    },
+
+    _renderHistoryMessage(m) {
+      if (!m || m.role !== "assistant" || !m.text) return "";
+      const key = m._k || "";
+      if (!key) return this.mdRender(m.text);
+      const cache = this._historyHtmlByKey;
+      const hit = cache.get(key);
+      if (hit && hit.text === m.text) {
+        cache.delete(key);
+        cache.set(key, hit);
+        return hit.html;
+      }
+      if (hit) {
+        this._historyHtmlBytes = Math.max(0, this._historyHtmlBytes - hit.bytes);
+        cache.delete(key);
+      }
+      const html = this.mdRender(m.text);
+      const entry = { text: m.text, html, bytes: (m.text.length + html.length) * 2 };
+      cache.set(key, entry);
+      this._historyHtmlBytes += entry.bytes;
+      while (cache.size > 400 || (this._historyHtmlBytes > 16 * 1024 * 1024 && cache.size > 1)) {
+        const oldestKey = cache.keys().next().value;
+        const oldest = cache.get(oldestKey);
+        this._historyHtmlBytes = Math.max(
+          0, this._historyHtmlBytes - (oldest ? oldest.bytes : 0));
+        cache.delete(oldestKey);
+      }
+      return html;
+    },
+
+    _cancelDeferredStreamRich(st, clear = false) {
+      const handle = st && st._deferredStreamRichHandle;
+      if (handle) {
+        if (handle.kind === "idle" && typeof cancelIdleCallback === "function") {
+          cancelIdleCallback(handle.id);
+        } else {
+          clearTimeout(handle.id);
+        }
+        st._deferredStreamRichHandle = null;
+      }
+      if (clear && st) st._deferredStreamRich = [];
+    },
+
+    _queueDeferredStreamRich(sid, st, message) {
+      if (!sid || !st || this.tabState[sid] !== st || !message
+          || message.role !== "assistant" || !message.text) return false;
+      message._streamText = message.text;
+      message._streamPlain = true;
+      message._deferredRichReady = true;
+      const queue = st._deferredStreamRich || (st._deferredStreamRich = []);
+      if (!queue.includes(message)) queue.push(message);
+      if (sid === this.currentId) this._scheduleDeferredStreamRich(sid, st);
+      return true;
+    },
+
+    _scheduleDeferredStreamRich(sid, st) {
+      if (!sid || !st || this.tabState[sid] !== st || sid !== this.currentId) return;
+      const queue = st._deferredStreamRich || (st._deferredStreamRich = []);
+      for (const message of (st.messages || [])) {
+        if (message && message._deferredRichReady && !queue.includes(message)) {
+          queue.push(message);
+        }
+      }
+      if (!queue.length || st._deferredStreamRichHandle) return;
+
+      const run = () => {
+        st._deferredStreamRichHandle = null;
+        if (this.tabState[sid] !== st || sid !== this.currentId) return;
+        const maxChunk = this._isMobileLayout() ? 1 : 2;
+        const frameBudgetMs = this._isMobileLayout() ? 6 : 12;
+        const started = performance.now();
+        let rendered = 0;
+        while (queue.length && rendered < maxChunk) {
+          if (rendered > 0 && performance.now() - started >= frameBudgetMs) break;
+          const message = queue.shift();
+          if (!message || !this._containsPaneMessage(st, message)
+              || !message._deferredRichReady || !message.text) continue;
+          message.html = this._renderHistoryMessage(message);
+          message._streamPlain = false;
+          message._deferredRichReady = false;
+          st._streamRichRenderCount++;
+          rendered++;
+        }
+        if (queue.length) {
+          this._scheduleDeferredStreamRich(sid, st);
+          return;
+        }
+        this.$nextTick(() => {
+          if (this.tabState[sid] !== st || sid !== this.currentId) return;
+          const pane = this._paneElement(sid);
+          void this.highlightCode(".chat-body", pane ? [pane] : null);
+        });
+      };
+      if (typeof requestIdleCallback === "function") {
+        st._deferredStreamRichHandle = {
+          kind: "idle",
+          id: requestIdleCallback(run, { timeout: 160 }),
+        };
+      } else {
+        st._deferredStreamRichHandle = {
+          kind: "timer",
+          id: setTimeout(run, 0),
+        };
+      }
+    },
+
+    _historyHtmlDelete(m) {
+      const key = m && m._k;
+      if (!key) return;
+      const hit = this._historyHtmlByKey.get(key);
+      if (!hit) return;
+      this._historyHtmlBytes = Math.max(0, this._historyHtmlBytes - hit.bytes);
+      this._historyHtmlByKey.delete(key);
     },
 
     _mdCacheDelete(text) {
@@ -4070,7 +4833,7 @@ function portal() {
     // of an in-flight bubble: parse + sanitize only. The expensive passes
     // (KaTeX math typesetting + the full-DOM _linkifyFilePaths walk) are
     // skipped mid-stream and run ONCE on the final render (flushRender →
-    // renderNow(true) → opts.streaming falsy). Doing them on every chunk was
+    // renderFinal). Doing them on every chunk was
     // a big chunk of the "long reply pegs the phone CPU / freezes" cost:
     // each tick re-walked the entire rendered DOM for code/anchor nodes and
     // re-ran KaTeX over the whole bubble. File-links + math only need to be
@@ -4086,23 +4849,23 @@ function portal() {
       // breaks. This is both safe (no raw HTML enters the result) and visually
       // equivalent for ordinary prose.
       if (text.length >= 64 * 1024) {
+        // A single huge fenced dump is common in agent output and does not need
+        // marked + DOMPurify to discover its structure. Escaping it directly is
+        // equivalent, keeps the full code available, and avoids a multi-second
+        // uninterruptible parse on mobile. highlightCode still decorates ordinary
+        // sized blocks later and already leaves very large blocks as plain code.
+        const fenced = text.match(/^\s*(```|~~~)\s*([\w+#.\-]*)[^\n]*\n([\s\S]*?)\n\1\s*$/);
+        if (fenced) {
+          const lang = fenced[2] ? ` class="language-${fenced[2]}"` : "";
+          return `<pre><code${lang}>${this.escape(fenced[3])}</code></pre>`;
+        }
         const hasRichSyntax = /```|~~~|`|\[[^\]]+\]\(|<\/?[A-Za-z][^>]*>|\*\*|__|~~|\$\$|\\\(|\\\[|(^|\n)\s{0,3}(?:#{1,6}\s|>\s|[-+*]\s|\d+[.)]\s)/m.test(text);
         if (!hasRichSyntax) {
-          const visibleLimit = 48 * 1024;
-          const head = this.escape(text.slice(0, visibleLimit));
-          const renderLines = value => value
+          const escaped = this.escape(text);
+          const rendered = escaped
             .replace(/\r?\n\r?\n+/g, "</p><p>")
             .replace(/\r?\n/g, "<br>");
-          if (text.length > visibleLimit) {
-            const tail = this.escape(text.slice(visibleLimit));
-            const label = this.lang === "zh"
-              ? `展开剩余 ${Math.ceil((text.length - visibleLimit) / 1024)} KB`
-              : `Show remaining ${Math.ceil((text.length - visibleLimit) / 1024)} KB`;
-            return `<div class="long-answer-preview"><p>${renderLines(head)}</p></div>`
-              + `<details class="long-answer-rest"><summary>${label}</summary>`
-              + `<div><p>${renderLines(tail)}</p></div></details>`;
-          }
-          return "<p>" + renderLines(head) + "</p>";
+          return "<p>" + rendered + "</p>";
         }
       }
       // Streaming-friendly preprocess: close any unclosed ``` or ~~~ fenced
@@ -4143,6 +4906,11 @@ function portal() {
         FORBID_TAGS: ["style", "iframe", "form", "object", "embed"],
         FORBID_ATTR: ["style", "formaction"],
         ADD_ATTR: ["aria-hidden"],                            // KaTeX uses these
+        // DOMPurify drops file: hrefs by default before _linkifyFilePaths can
+        // convert them into workspace-safe links. Keep the upstream allowlist
+        // plus file:, then intercept every file URL below; local paths are
+        // normalized under MUSELAB_ROOT and remote/malformed hosts are disabled.
+        ALLOWED_URI_REGEXP: /^(?:(?:(?:f|ht)tps?|file|mailto|tel|callto|sms|cid|xmpp):|[^a-z]|[a-z+.\-]+(?:[^a-z+.\-:]|$))/i,
       });
       // Restore protected math (HTML-escaped) now that markdown can no longer
       // mangle it. Done before the length-loss heuristic so short placeholders
@@ -4253,11 +5021,13 @@ function portal() {
     _rerenderMathMessages() {
       if (!window.renderMathInElement) return;
       const RE = /\$\$|\\\(|\\\[|\$[^$\n]+\$/;
-      if (Array.isArray(this.messages)) {
-        for (const m of this.messages) {
+      const messages = this.activeSessionPane().messages;
+      if (Array.isArray(messages)) {
+        for (const m of messages) {
           if (m && typeof m.text === "string" && m.html && RE.test(m.text)) {
             this._mdCacheDelete(m.text);  // drop stale (raw-$$) cache entry
-            m.html = this.mdRender(m.text);
+            this._historyHtmlDelete(m);
+            m.html = this._renderHistoryMessage(m);
           }
         }
       }
@@ -4301,14 +5071,21 @@ function portal() {
         code.classList.add("has-file-link");
       }
       // 2) markdown links — [label](path/to/file.md) — marked renders as <a>.
-      // Convert to .file-link if href is relative (no protocol) and matches the
-      // path regex; otherwise leave the anchor alone (real URLs stay clickable).
+      // Convert relative, workspace-absolute, and local file:/// links to
+      // .file-link; otherwise leave real external URLs clickable.
       const anchors = rootEl.querySelectorAll("a[href]");
       for (const a of anchors) {
         if (a.classList.contains("file-link")) continue;
         let href = a.getAttribute("href") || "";
         if (!href || href.startsWith("#")) continue;
-        if (/^[a-z]+:/i.test(href)) {                  // http: / https: / mailto: / etc.
+        const localFilePath = this._localFileUrlPath(href);
+        if (localFilePath !== null) {
+          href = localFilePath;
+          if (!href) {
+            a.removeAttribute("href");
+            continue;
+          }
+        } else if (/^[a-z]+:/i.test(href)) {            // http: / https: / mailto: / etc.
           // External web links open in a NEW tab so a click never unloads the
           // chat SPA (the default same-tab navigation threw the user out of
           // the conversation). rel guards against tab-nabbing + referrer leak.
@@ -4318,11 +5095,13 @@ function portal() {
             a.setAttribute("rel", "noopener noreferrer");
           }
           continue;
+        } else {
+          // marked / the model may URL-encode the href (e.g. Chinese filenames
+          // come through as %E8%B5%84...). Decode so the regex + backend list
+          // lookup operate on the raw UTF-8 form. file: paths were decoded by
+          // _localFileUrlPath already.
+          try { href = decodeURIComponent(href); } catch (_) { /* malformed → leave as-is */ }
         }
-        // marked / the model may URL-encode the href (e.g. Chinese filenames
-        // come through as %E8%B5%84...). Decode so the regex + backend list
-        // lookup operate on the raw UTF-8 form.
-        try { href = decodeURIComponent(href); } catch (_) { /* malformed → leave as-is */ }
         const m = href.match(RE);
         if (!m) continue;
         const path = toRel(m[1]);
@@ -4360,9 +5139,16 @@ function portal() {
         window.open(href, "_blank", "noopener,noreferrer");
         return;
       }
-      if (/^[a-z]+:/i.test(href)) return;             // mailto:/tel:/… → let browser handle
-      try { href = decodeURIComponent(href); } catch (_) { /* malformed → leave as-is */ }
-      ev.preventDefault();
+      const localFilePath = this._localFileUrlPath(href);
+      if (localFilePath !== null) {
+        ev.preventDefault();
+        if (!localFilePath) return;
+        href = localFilePath;
+      } else {
+        if (/^[a-z]+:/i.test(href)) return;           // mailto:/tel:/… → let browser handle
+        try { href = decodeURIComponent(href); } catch (_) { /* malformed → leave as-is */ }
+        ev.preventDefault();
+      }
       // Try ROOT-relative normalization first (absolute under ROOT, or ROOT
       // basename duplicated as prefix). If that returns "" (e.g. /etc/passwd),
       // fall back to the raw href minus leading slash so the user at least
@@ -4372,20 +5158,28 @@ function portal() {
       this.openByPathToasted(p);
     },
 
-    // Fallback resolver for chat-link clicks whose path doesn't resolve
-    // workspace-relative. Searches the workspace by basename and returns every
-    // ROOT-relative path whose full path ends with the clicked path (same
-    // file, just a missing prefix). Caller decides: 0 → not-found toast,
+    // Fallback resolver for chat-link clicks whose path doesn't resolve from
+    // the workspace root. Prefer candidates whose full path ends with the
+    // clicked path (only a prefix is missing). If none do, fall back to every
+    // exact-basename match: models often preserve the filename but hallucinate
+    // or omit its parent directory. Caller decides: 0 → not-found toast,
     // 1 → open, >1 → disambiguation picker. Returns [{path,name}, ...].
-    async _findBySuffix(path, name, requestHeaders = this.fileHdr()) {
+    async _findChatFileCandidates(path, name, requestHeaders = this.fileHdr()) {
       try {
-        const r = await fetch("/api/files/search?q=" + encodeURIComponent(name) + "&limit=50",
+        const r = await fetch("/api/files/search?q=" + encodeURIComponent(name)
+          + "&exact=true&limit=200",
           { headers: requestHeaders });
         if (!r.ok) return [];
         const d = await r.json();
-        const suffix = "/" + path.replace(/^\/+/, "");
-        return (d.entries || []).filter(e =>
-          !e.is_dir && e.name === name && ("/" + e.path).endsWith(suffix));
+        const requested = String(path || "").replace(/\\/g, "/")
+          .replace(/^\.\//, "").replace(/^\/+/, "");
+        const suffix = "/" + requested;
+        const wantedName = String(name || "").toLowerCase();
+        const exactNameMatches = (d.entries || []).filter(e =>
+          !e.is_dir && String(e.name || "").toLowerCase() === wantedName);
+        const suffixMatches = exactNameMatches.filter(e =>
+          ("/" + String(e.path || "").replace(/\\/g, "/")).endsWith(suffix));
+        return suffixMatches.length ? suffixMatches : exactNameMatches;
       } catch (_) { return []; }
     },
 
@@ -4397,14 +5191,26 @@ function portal() {
     chooseOne({ title, body = "", choices }) {
       const zh = this.lang === "zh";
       if (!title) title = zh ? "请选择" : "Choose";
+      const opener = document.activeElement;
       return new Promise((resolve) => {
         this.modal = {
           show: true, title, body, input: null, choices,
           okText: "", cancelText: zh ? "取消" : "Cancel", danger: false,
           confirm: null,
-          pick: (v) => { this.modal.show = false; resolve(v); },
-          cancel: () => { this.modal.show = false; resolve(null); },
+          pick: (v) => {
+            this.modal.show = false;
+            this._closeFocusSurface("generic-modal");
+            resolve(v);
+          },
+          cancel: () => {
+            this.modal.show = false;
+            this._closeFocusSurface("generic-modal");
+            resolve(null);
+          },
         };
+        this._openFocusSurface(
+          "generic-modal", ".confirm-modal", ".modal-choice", opener, true,
+        );
       });
     },
 
@@ -4434,11 +5240,11 @@ function portal() {
         // Direct ROOT-relative lookup missed. The model commonly emits a path
         // relative to a subdirectory of the workspace root (e.g. "learning/x.html"
         // when the file actually lives at "claude_space/learning/x.html").
-        // Search the workspace by basename and accept a UNIQUE hit whose full
-        // path ends with the clicked path — same file, just a missing prefix.
-        // Generic (no hardcoded dir) and safe (suffix + exact-name + sole-match).
+        // Search by exact basename. Full-path suffix matches win; when the
+        // model got the directory wrong, a unique basename is still safe to
+        // open. Multiple candidates always go through explicit disambiguation.
         if (!hit) {
-          const matches = await this._findBySuffix(path, name, requestHeaders);
+          const matches = await this._findChatFileCandidates(path, name, requestHeaders);
           if (!this._workspaceIsCurrent(ownerWorkspace)) return;
           let resolved = "";
           if (matches.length === 1) {
@@ -4456,7 +5262,7 @@ function portal() {
             if (!resolved) return;   // cancelled
           }
           if (resolved) {
-            await this.openFile({ path: resolved, name });
+            await this.openFile({ path: resolved, name }, { reveal: true });
             if (!this._workspaceIsCurrent(ownerWorkspace)) return;
             this.revealInTree(resolved, { mode: "background" }).catch(() => {});
             return;
@@ -4468,7 +5274,7 @@ function portal() {
           this.toast(this.lang === "zh" ? `这是目录：${path}` : `Is a directory: ${path}`, "warn");
           return;
         }
-        await this.openFile({ path, name });
+        await this.openFile({ path, name }, { reveal: true });
         if (!this._workspaceIsCurrent(ownerWorkspace)) return;
         // Mirror the click into the file tree: expand parents + scroll the
         // row into view so the user sees where the file lives. Use background
@@ -4495,11 +5301,12 @@ function portal() {
       }
       const path = ts.output_file;
       const name = path.split("/").pop();
+      const ownerSid = ts.owner_session_id || this.currentId;
       const url = "/api/chat/task-output?session_id="
-        + encodeURIComponent(this.currentId)
+        + encodeURIComponent(ownerSid)
         + "&path=" + encodeURIComponent(path);
       try {
-        await this.openFile({ path, name }, { readUrl: url });
+        await this.openFile({ path, name }, { readUrl: url, reveal: true });
       } catch (e) {
         this.toast(this.lang === "zh" ? `打开失败：${path}` : `Open failed: ${path}`, "warn");
       }
@@ -4514,7 +5321,8 @@ function portal() {
       if (!ts || !ts.task_id) return;
       const zh = this.lang === "zh";
       try {
-        const r = await fetch("/api/chat/sessions/" + this.currentId
+        const ownerSid = ts.owner_session_id || this.currentId;
+        const r = await fetch("/api/chat/sessions/" + ownerSid
           + "/tasks/" + encodeURIComponent(ts.task_id) + "/stop",
           { method: "POST", headers: this.hdr() });
         if (r.ok) {
@@ -4562,7 +5370,7 @@ function portal() {
           // Preserve the restored tab's preview/pinned state (see _bootApp).
           const _restored = this.tabs.find(t => t.path === path);
           this.openFile({ path, name: path.split("/").pop() },
-                        { preview: !!(_restored && _restored.preview) })
+                        { preview: !!(_restored && _restored.preview), reveal: false })
               .catch(() => { /* file went away — nothing to do */ });
         }
         // login() is the first-sign-in counterpart of _bootApp(). Keep the
@@ -4597,15 +5405,170 @@ function portal() {
       // add their registered workspace through fileHdr()/conversationHdr().
       return { "X-Auth-Token": this.token };
     },
+    async _mintChatResourceUrl(resource, fields = {}, fresh = false) {
+      const body = { resource, ...fields };
+      const cacheKey = JSON.stringify(body);
+      if (fresh) CHAT_RESOURCE_TICKET_CACHE.delete(cacheKey);
+      const now = Date.now();
+      _pruneChatResourceTicketCache(now);
+      const cached = CHAT_RESOURCE_TICKET_CACHE.get(cacheKey);
+      if (cached && cached.url && cached.expiresAt > now + 5000) {
+        return cached.url;
+      }
+      if (cached && cached.promise) return await cached.promise;
+
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 8000);
+      const promise = (async () => {
+        const response = await fetch("/api/chat/resource-ticket", {
+          method: "POST",
+          headers: { ...this.hdr(), "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+          signal: controller.signal,
+          cache: "no-store",
+        });
+        if (!response.ok) throw new Error("chat resource ticket unavailable");
+        const data = await response.json();
+        if (!data.url || !String(data.url).startsWith("/api/chat/")) {
+          throw new Error("invalid chat resource ticket response");
+        }
+        CHAT_RESOURCE_TICKET_CACHE.set(cacheKey, {
+          url: data.url,
+          expiresAt: Date.now() + Math.max(1, Number(data.expires_in) || 1) * 1000,
+        });
+        return data.url;
+      })();
+      CHAT_RESOURCE_TICKET_CACHE.set(cacheKey, { promise });
+      try {
+        return await promise;
+      } catch (error) {
+        CHAT_RESOURCE_TICKET_CACHE.delete(cacheKey);
+        throw error;
+      } finally {
+        clearTimeout(timeout);
+      }
+    },
+    _attachmentTicketFields(im) {
+      const raw = String((im && im.url) || "");
+      const match = raw.match(/^\/api\/chat\/attachments\/([^/]+)\/(.+)$/);
+      if (!match) return null;
+      try {
+        return {
+          session_id: decodeURIComponent(match[1]),
+          filename: decodeURIComponent(match[2]),
+        };
+      } catch (_) {
+        return null;
+      }
+    },
+    async _ensureMessageAttachmentUrl(im) {
+      const fields = this._attachmentTicketFields(im);
+      if (!fields) throw new Error("invalid attachment URL");
+      return await this._mintChatResourceUrl("attachment", fields);
+    },
+    messageImageSrc(im) {
+      if (!im) return "";
+      if (im.preview) return im.preview;
+      if (im.thumb) return "data:image/jpeg;base64," + im.thumb;
+      if (im._resourceUrl) return im._resourceUrl;
+      if (im.url && !im._resourceTicketPending) {
+        im._resourceTicketPending = true;
+        this._ensureMessageAttachmentUrl(im)
+          .then(url => { im._resourceUrl = url; })
+          .catch(() => { im._resourceUrl = ""; })
+          .finally(() => { im._resourceTicketPending = false; });
+      }
+      return "";
+    },
+    async openMessageImage(im) {
+      if (!im) return;
+      let src = im.preview || (im.thumb
+        ? "data:image/jpeg;base64," + im.thumb : "");
+      if (im.url) {
+        try {
+          src = await this._ensureMessageAttachmentUrl(im);
+          im._resourceUrl = src;
+        } catch (_) {
+          // A thumbnail/blob remains a safe, useful fallback when the full
+          // original expired or the ticket request briefly failed.
+        }
+      }
+      this.openLightbox(src, im.name);
+    },
+    _abortError(message = "request aborted") {
+      const error = new Error(message);
+      error.name = "AbortError";
+      return error;
+    },
+    async _fetchWithDeadline(
+      url, options = {}, deadlineMs = this.REQUEST_DEADLINE_MS,
+    ) {
+      const upstream = options.signal;
+      if (upstream && upstream.aborted) throw this._abortError();
+      const controller = new AbortController();
+      let rejectControl = null;
+      let settled = false;
+      const control = new Promise((_, reject) => { rejectControl = reject; });
+      const abort = (message) => {
+        if (settled) return;
+        try { controller.abort(); } catch (_) {}
+        rejectControl(this._abortError(message));
+      };
+      const onUpstreamAbort = () => abort("request aborted");
+      if (upstream) {
+        upstream.addEventListener("abort", onUpstreamAbort, { once: true });
+      }
+      const timeoutMs = Math.max(
+        1, Number(deadlineMs) || Number(this.REQUEST_DEADLINE_MS) || 8000,
+      );
+      const timer = setTimeout(
+        () => abort("request deadline exceeded"), timeoutMs,
+      );
+      const fetchOptions = { ...options, signal: controller.signal };
+      try {
+        // Keep the explicit race even though native fetch observes AbortSignal:
+        // test doubles and embedded WebViews are not always abort-cooperative.
+        return await Promise.race([fetch(url, fetchOptions), control]);
+      } finally {
+        settled = true;
+        clearTimeout(timer);
+        if (upstream) {
+          upstream.removeEventListener("abort", onUpstreamAbort);
+        }
+      }
+    },
+    _retryDelay(
+      attempt, { baseMs = 800, maxMs = 30000, jitterMs = 250 } = {},
+    ) {
+      const step = Math.max(1, Math.min(16, Math.floor(Number(attempt) || 1)));
+      const base = Math.min(
+        Math.max(1, Number(maxMs) || 30000),
+        Math.max(1, Number(baseMs) || 800) * Math.pow(2, step - 1),
+      );
+      const jitterCap = Math.max(
+        0, Math.min(Number(jitterMs) || 0, Math.floor(base / 4)),
+      );
+      const jitter = jitterCap
+        ? Math.floor(Math.random() * (jitterCap + 1)) : 0;
+      return base + jitter;
+    },
+    _staticAssetUrl(path) {
+      if (!path || !path.startsWith("/static/") || /[?&]v=/.test(path)) return path;
+      const version = typeof document !== "undefined"
+        ? document.querySelector('meta[name="muselab-asset-version"]')?.content
+        : "";
+      if (!version || version === "__MUSELAB_ASSET_VERSION__") return path;
+      return `${path}${path.includes("?") ? "&" : "?"}v=${encodeURIComponent(version)}`;
+    },
     conversationHdr(path = "") {
       const headers = this.hdr();
       const cwd = path || this.currentWorkspacePath();
       if (cwd) headers["X-Muselab-Workspace"] = encodeURIComponent(cwd);
       return headers;
     },
-    fileHdr() {
+    fileHdr(path = "") {
       const headers = this.hdr();
-      const root = this.fileWorkspacePath();
+      const root = path || this.fileWorkspacePath();
       if (root) headers["X-Muselab-Workspace"] = encodeURIComponent(root);
       return headers;
     },
@@ -4725,6 +5688,125 @@ function portal() {
       }
     },
 
+    // Chat drafts are browser-local and session-scoped. Keep the text in a
+    // small standalone store instead of muselab_prefs so a hard refresh can
+    // recover what the user was typing without serialising File objects or
+    // short-lived upload handles. `pending` is a tiny outbox: while the
+    // stream ticket/SSE handshake is still in flight the composer is visually
+    // cleared, but the submitted text remains recoverable until onopen proves
+    // that the backend accepted the turn.
+    _chatDraftStoreKey: "muselab_chat_drafts_v1",
+    _chatDraftStore() {
+      const stored = this._getLSJson(this._chatDraftStoreKey, null);
+      if (!stored || stored.schema !== 1 || !stored.drafts
+          || typeof stored.drafts !== "object" || Array.isArray(stored.drafts)) {
+        return { schema: 1, drafts: {} };
+      }
+      return stored;
+    },
+    _chatDraftRecord(id) {
+      if (!id) return { text: "", pending: "", updatedAt: 0 };
+      const raw = this._chatDraftStore().drafts[id];
+      if (!raw || typeof raw !== "object") {
+        return { text: "", pending: "", updatedAt: 0 };
+      }
+      return {
+        text: typeof raw.text === "string" ? raw.text : "",
+        pending: typeof raw.pending === "string" ? raw.pending : "",
+        updatedAt: Number(raw.updatedAt) || 0,
+      };
+    },
+    _writeChatDraftRecord(id, record) {
+      if (!id) return false;
+      const store = this._chatDraftStore();
+      const drafts = { ...store.drafts };
+      const text = typeof record.text === "string" ? record.text : "";
+      const pending = typeof record.pending === "string" ? record.pending : "";
+      if (text || pending) {
+        drafts[id] = { text, pending, updatedAt: Date.now() };
+      } else {
+        delete drafts[id];
+      }
+      // A closed tab keeps its draft, but bound abandoned entries so stale
+      // session ids can never consume localStorage indefinitely.
+      const ids = Object.keys(drafts);
+      if (ids.length > 100) {
+        ids.sort((a, b) => (Number(drafts[b]?.updatedAt) || 0)
+          - (Number(drafts[a]?.updatedAt) || 0));
+        for (const staleId of ids.slice(100)) delete drafts[staleId];
+      }
+      return this._setLS(this._chatDraftStoreKey, JSON.stringify({
+        schema: 1, drafts,
+      }));
+    },
+    _mergeChatDraftText(first, second) {
+      first = typeof first === "string" ? first : "";
+      second = typeof second === "string" ? second : "";
+      if (!first || first === second) return second || first;
+      if (!second) return first;
+      return first + "\n\n" + second;
+    },
+    _cancelChatDraftTimer(id) {
+      if (!id || !this._chatDraftTimers || !this._chatDraftTimers[id]) return;
+      clearTimeout(this._chatDraftTimers[id]);
+      delete this._chatDraftTimers[id];
+    },
+    _persistChatDraft(id, text) {
+      if (!id) return false;
+      this._cancelChatDraftTimer(id);
+      const record = this._chatDraftRecord(id);
+      record.text = typeof text === "string" ? text : "";
+      return this._writeChatDraftRecord(id, record);
+    },
+    _schedulePersistChatDraft(id, text) {
+      if (!id) return;
+      if (!this._chatDraftTimers) this._chatDraftTimers = {};
+      clearTimeout(this._chatDraftTimers[id]);
+      const snapshot = typeof text === "string" ? text : "";
+      this._chatDraftTimers[id] = setTimeout(() => {
+        delete this._chatDraftTimers[id];
+        this._persistChatDraft(id, snapshot);
+      }, 120);
+    },
+    _stageChatRecoveryDraft(id, text) {
+      if (!id || typeof text !== "string" || !text) return;
+      this._cancelChatDraftTimer(id);
+      const record = this._chatDraftRecord(id);
+      record.pending = this._mergeChatDraftText(record.pending, text);
+      if (record.text === text) record.text = "";
+      this._writeChatDraftRecord(id, record);
+    },
+    _commitChatRecoveryDraft(id, text) {
+      if (!id || typeof text !== "string" || !text) return;
+      const record = this._chatDraftRecord(id);
+      if (record.pending === text) {
+        record.pending = "";
+        this._writeChatDraftRecord(id, record);
+      }
+    },
+    _consumePersistedChatDraft(id) {
+      const record = this._chatDraftRecord(id);
+      const recovered = this._mergeChatDraftText(record.pending, record.text);
+      if (record.pending) {
+        record.text = recovered;
+        record.pending = "";
+        this._writeChatDraftRecord(id, record);
+      }
+      return recovered;
+    },
+    _resolveChatRecoveryDraft(id, text) {
+      if (!id) return;
+      this._cancelChatDraftTimer(id);
+      this._writeChatDraftRecord(id, {
+        text: typeof text === "string" ? text : "", pending: "",
+      });
+    },
+    _deletePersistedChatDraft(id) {
+      if (!id) return;
+      this._cancelChatDraftTimer(id);
+      this._writeChatDraftRecord(id, { text: "", pending: "" });
+    },
+
     // Convenience: bilingual error toast for common "<verb> failed: <body>"
     // patterns. Call sites used to inline `this.toast("保存失败：" + …, "error")`
     // which gave English users a Chinese-only message. Pass the verb key
@@ -4777,20 +5859,388 @@ function portal() {
       try { t.action && t.action.onClick && t.action.onClick(); }
       finally { this.dismissToast(t.id); }
     },
-
     // Enter pressed while a CJK IME is composing confirms the highlighted
     // candidate; it must not also submit the surrounding prompt or rename.
     // `isComposing` is the standard signal, while keyCode/which 229 and
     // key="Process" cover older Safari/WebView and Windows IME variants.
-    _isImeComposingEvent(ev) {
-      return !!(ev && (ev.isComposing || ev.keyCode === 229 || ev.which === 229
-        || ev.key === "Process"));
+    //
+    // The chat textarea deliberately has no x-model. While it owns focus,
+    // native DOM text is authoritative and reactive model effects do not
+    // write `textarea.value`. This is essential for Windows Pinyin and
+    // macOS marked text. Reassigning value during an active composition can
+    // detach Chromium from the OS IME; afterwards Latin keys still work but a
+    // newly selected Chinese IME produces no text until the page is rebuilt.
+    // Programmatic composer edits go through _setChatInput(), which also
+    // refuses DOM writes for the short marked-text window.
+    _markLocalImeComposition(target, restart = false) {
+      if (!target) return;
+      // beforeinput/input can repeat many times during one composition. Keep
+      // the original start time so those updates cannot postpone stale-state
+      // recovery forever. A real compositionstart explicitly begins a new
+      // lifecycle and therefore requests a fresh timestamp.
+      const startedAt = Number(target._museImeStartedAt) || 0;
+      if (restart || !target._museImeComposing || startedAt <= 0) {
+        target._museImeStartedAt = Date.now();
+      }
+      target._museImeComposing = true;
+      target._museImeEndedAt = 0;
     },
-    _claimNonImeEnter(ev) {
-      if (!ev || this._isImeComposingEvent(ev)) return false;
+    _clearImeCommitEnterGuard(target) {
+      if (!target) return;
+      target._museImeCommitEnterDown = false;
+      target._museImeCommitEnterAt = 0;
+      target._museImeEndedAt = 0;
+    },
+    _trackImeCommitKeydown(ev) {
+      const target = ev && (ev.target || ev.currentTarget);
+      if (!target || !this._isImeComposingEvent(ev)) return;
+      const isEnter = ev.key === "Enter" || ev.code === "Enter"
+        || ev.keyCode === 13 || ev.which === 13;
+      if (isEnter) {
+        target._museImeCommitEnterDown = true;
+        target._museImeCommitEnterAt = Number(ev.timeStamp) || 0;
+      } else {
+        // Space and mouse-driven candidate commits must not make a later,
+        // ordinary Enter look like a duplicate candidate-confirming key.
+        target._museImeCommitEnterDown = false;
+        target._museImeCommitEnterAt = 0;
+      }
+    },
+    onLocalImeKeydown(ev) {
+      this._trackImeCommitKeydown(ev);
+    },
+    onImeEnterKeyup(ev) {
+      const target = ev && (ev.target || ev.currentTarget);
+      this._clearImeCommitEnterGuard(target);
+    },
+    onLocalImeCompositionStart(ev) {
+      const target = ev && (ev.target || ev.currentTarget);
+      this._clearImeCommitEnterGuard(target);
+      this._markLocalImeComposition(target, true);
+    },
+    onLocalImeBeforeInput(ev) {
+      const target = ev && (ev.target || ev.currentTarget);
+      if (!target) return;
+      if (ev.isComposing || ev.inputType === "insertCompositionText") {
+        this._markLocalImeComposition(target);
+      }
+    },
+    onLocalImeInput(ev) {
+      const target = ev && (ev.target || ev.currentTarget);
+      if (!target) return;
+      if (ev.isComposing === true) {
+        this._markLocalImeComposition(target);
+      } else if (target._museImeComposing) {
+        // Android/WebView can omit compositionend while still labeling the
+        // final, explicitly non-composing input as insertCompositionText.
+        // Trust isComposing=false so the editor cannot remain permanently
+        // attached to a dead IME session.
+        target._museImeComposing = false;
+        target._museImeStartedAt = 0;
+        target._museImeEndedAt = target._museImeCommitEnterDown
+          ? (Number(ev.timeStamp) || 0) : 0;
+      }
+    },
+    onLocalImeCompositionEnd(ev) {
+      const target = ev && (ev.target || ev.currentTarget);
+      if (!target) return;
+      target._museImeComposing = false;
+      target._museImeStartedAt = 0;
+      target._museImeEndedAt = target._museImeCommitEnterDown
+        ? (Number(ev.timeStamp) || 0) : 0;
+    },
+    _markImeComposition(target, restart = false) {
+      if (!target) return;
+      this._markLocalImeComposition(target, restart);
+      delete target._museImeSettledOwnerSid;
+      if (!target._museImeOwnerSid) {
+        target._museImeOwnerSid = this.currentId || "";
+      }
+    },
+    onImeCompositionStart(ev) {
+      const target = ev && (ev.target || ev.currentTarget);
+      if (!target) return;
+      this._clearImeCommitEnterGuard(target);
+      this._markImeComposition(target, true);
+    },
+    onImeKeydown(ev) {
+      this._trackImeCommitKeydown(ev);
+    },
+    onChatBeforeInput(ev) {
+      const target = ev && (ev.target || ev.currentTarget);
+      if (!target) return;
+      // A few embedded Chromium builds omit compositionstart but still expose
+      // the standard beforeinput signal. Marking here closes that gap before
+      // Alpine or any app handler can reconcile the draft.
+      if (ev.isComposing || ev.inputType === "insertCompositionText") {
+        this._markImeComposition(target);
+      }
+    },
+    onImeCompositionEnd(ev) {
+      const target = ev && (ev.target || ev.currentTarget);
+      if (!target) return;
+      this._finishImeComposition(target);
+      target._museImeEndedAt = target._museImeCommitEnterDown
+        ? (Number(ev.timeStamp) || 0) : 0;
+    },
+    _finishImeComposition(target) {
+      if (!target) return;
+      // Chromium can emit compositionend and then blur for the same commit.
+      // onChatInput's missing-compositionend fallback can also run first. A
+      // second settlement must be a no-op; otherwise the shared textarea's
+      // old value is copied into whichever session became current meanwhile.
+      if (!target._museImeComposing && !target._museImeOwnerSid) return;
+      const ownerSid = target._museImeOwnerSid || this.currentId || "";
+      target._museImeComposing = false;
+      target._museImeStartedAt = 0;
+      delete target._museImeOwnerSid;
+      target._museImeSettledOwnerSid = ownerSid;
+      // Safari/WebView may fire compositionend before its final non-composing
+      // input event.  Commit the DOM value now; the later input is idempotent.
+      // If a tab switch completed first, save the commit back to the textarea's
+      // original draft instead of leaking it into the newly active session.
+      if (ownerSid && ownerSid !== this.currentId) {
+        const ownerState = this.tabState && this.tabState[ownerSid];
+        if (ownerState && ownerState.draft) {
+          ownerState.draft.input = target.value;
+          this._persistChatDraft(ownerSid, target.value);
+        }
+        this.$nextTick(() => this._syncChatInputDom(this.input));
+        return;
+      }
+      if (this.input !== target.value) this.input = target.value;
+      const state = ownerSid && this.tabState && this.tabState[ownerSid];
+      if (state && state.draft) state.draft.input = target.value;
+      if (ownerSid) this._persistChatDraft(ownerSid, target.value);
+    },
+    _resetImeCompositionState(ev) {
+      const target = ev && (ev.target || ev.currentTarget);
+      if (!target) return;
+      this._finishImeComposition(target);
+      this._clearImeCommitEnterGuard(target);
+    },
+    _isImeComposingEvent(ev) {
+      if (!ev) return false;
+      const target = ev.target || ev.currentTarget;
+      return this._hasExplicitImeSignal(ev)
+        || !!(target && target._museImeComposing);
+    },
+    _hasExplicitImeSignal(ev) {
+      return !!(ev && (ev.isComposing === true || ev.keyCode === 229
+        || ev.which === 229 || ev.key === "Process"));
+    },
+    _recoverStaleImeCompositionOnPlainEnter(ev) {
+      if (!ev) return false;
+      const target = ev.target || ev.currentTarget;
+      const isEnter = ev.key === "Enter" || ev.code === "Enter"
+        || ev.keyCode === 13 || ev.which === 13;
+      // Never second-guess a live signal from the OS/browser, even if the
+      // locally remembered lifecycle is old. Only an otherwise ordinary
+      // Enter may repair a missing compositionend.
+      if (!isEnter || !target || !target._museImeComposing
+          || ev.shiftKey || ev.ctrlKey || ev.metaKey || ev.altKey
+          || this._hasExplicitImeSignal(ev)) return false;
+      const startedAt = Number(target._museImeStartedAt) || 0;
+      if (startedAt <= 0
+          || Date.now() - startedAt < this.IME_STALE_AFTER_MS) return false;
+
+      // Chat composition owns a session draft and must settle through the
+      // normal bridge. Rename/side-question inputs use the DOM-local guard and
+      // only need their stale marker cleared; copying those values into the
+      // chat draft would corrupt the composer.
+      const chatTarget = this.$refs && this.$refs.chatInput;
+      const ownsChatDraft = target === chatTarget
+        || Object.prototype.hasOwnProperty.call(target, "_museImeOwnerSid");
+      if (ownsChatDraft) this._finishImeComposition(target);
+      else {
+        target._museImeComposing = false;
+        target._museImeStartedAt = 0;
+      }
+      this._clearImeCommitEnterGuard(target);
+      return true;
+    },
+    _isRecentImeCommitEnter(ev) {
+      if (!ev || ev.key !== "Enter") return false;
+      const target = ev.target || ev.currentTarget;
+      const endedAt = Number(target && target._museImeEndedAt) || 0;
+      const eventAt = Number(ev.timeStamp) || 0;
+      // Scope suppression to the same physical Enter key that ended the IME
+      // composition. A keyup clears the guard, so a later deliberate Enter is
+      // never swallowed merely because it followed a mouse/Space commit.
+      return !!(target && target._museImeCommitEnterDown)
+        && endedAt > 0 && eventAt >= endedAt && eventAt - endedAt <= 1000;
+    },
+    _consumeRecentImeCommitEnter(ev) {
+      if (!this._isRecentImeCommitEnter(ev)) return false;
+      const target = ev.target || ev.currentTarget;
+      this._clearImeCommitEnterGuard(target);
       ev.preventDefault();
       ev.stopPropagation();
       return true;
+    },
+    _syncChatInputDom(value = this.input, options = {}) {
+      const target = options.target || (this.$refs && this.$refs.chatInput);
+      if (!target || target._museImeComposing) return false;
+      // Ordinary reactive reconciliation must never replace a focused native
+      // editor. Explicit user-facing app actions call with force=true below.
+      if (!options.force && document.activeElement === target) return false;
+      const next = value == null ? "" : String(value);
+      if (target.value !== next) target.value = next;
+      return true;
+    },
+    _setChatInput(value) {
+      const next = value == null ? "" : String(value);
+      this.input = next;
+      // Explicit app actions (history, @ mention, clear, tab activation) may
+      // update a focused textarea, but still never overwrite marked text.
+      this._syncChatInputDom(next, { force: true });
+      return next;
+    },
+    _claimNonImeEnter(ev) {
+      if (!ev) return false;
+      // Some WebViews report the candidate-confirming Enter as a plain keydown
+      // immediately after compositionend.  It must not submit, but it must be
+      // consumed: leaving it to the textarea inserts a line break and makes
+      // the next intended send look like "Enter only adds a newline".  Clear
+      // the grace marker once so a rapid second Enter can send immediately.
+      if (this._consumeRecentImeCommitEnter(ev)) return false;
+      // A WebView can lose compositionend (and, rarely, the final non-
+      // composing input) when its native editor is detached. Keep a short
+      // safety window for genuine candidate work, then let a plain Enter heal
+      // that stale local flag. Explicit isComposing/229/Process signals below
+      // still win regardless of age.
+      this._recoverStaleImeCompositionOnPlainEnter(ev);
+      // Active marked text remains entirely owned by the IME; preventing that
+      // event can cancel or corrupt candidate selection on native WebViews.
+      if (this._isImeComposingEvent(ev)) {
+        this._trackImeCommitKeydown(ev);
+        return false;
+      }
+      ev.preventDefault();
+      ev.stopPropagation();
+      return true;
+    },
+
+    // ===== focus-managed surfaces =====
+    _focusableElements(root) {
+      if (!root || !root.querySelectorAll) return [];
+      const selector = [
+        "a[href]", "area[href]", "button:not([disabled])",
+        "input:not([disabled]):not([type='hidden'])", "select:not([disabled])",
+        "textarea:not([disabled])", "[contenteditable='true']",
+        "[tabindex]:not([tabindex='-1'])",
+      ].join(",");
+      return Array.from(root.querySelectorAll(selector)).filter(el => {
+        if (el.hidden || el.getAttribute("aria-hidden") === "true") return false;
+        const style = window.getComputedStyle(el);
+        return style.display !== "none" && style.visibility !== "hidden"
+          && (el.getClientRects().length > 0 || el === document.activeElement);
+      });
+    },
+    _focusWithoutScroll(el) {
+      if (!el || typeof el.focus !== "function") return false;
+      try { el.focus({ preventScroll: true }); }
+      catch (_) { try { el.focus(); } catch (_) { return false; } }
+      return document.activeElement === el;
+    },
+    _registerFocusSurfaceWatchers() {
+      const surfaces = [
+        ["settings.show", "settings", ".settings-modal", ".settings-menu-item.active"],
+        ["imageGen.show", "image-gen", ".image-gen-modal", ".image-gen-prompt"],
+        ["cheatSheet.show", "cheatsheet", ".cheatsheet-modal", ".modal-close"],
+        ["workspaceBrowser.show", "workspace-browser", ".workspace-browser-modal", ".workspace-browser-up:not([disabled])"],
+        ["claudeAuthModal.open", "claude-auth", ".claude-auth-modal", ".modal-close"],
+        ["trash.modalOpen", "trash", ".trash-modal", ".modal-close"],
+      ];
+      for (const [path, key, root, initial] of surfaces) {
+        this.$watch(path, show => {
+          if (show) {
+            this._openFocusSurface(
+              key, root, initial, document.activeElement, true,
+            );
+          } else {
+            this._closeFocusSurface(key);
+          }
+        });
+      }
+    },
+    _openFocusSurface(key, rootSelector, initialSelector = "", opener = null,
+                      modal = false) {
+      if (!key || !rootSelector) return;
+      if (modal && key !== "activity-move" && this.activity.moveMenu.show) {
+        this.closeActivityMoveMenu(false);
+      }
+      const owner = opener || document.activeElement;
+      this._focusSurfaceState[key] = {
+        owner: owner && typeof owner.focus === "function" ? owner : null,
+        rootSelector,
+        initialSelector,
+        modal: !!modal,
+      };
+      if (modal) {
+        this._modalFocusStack = this._modalFocusStack.filter(item => item !== key);
+        this._modalFocusStack.push(key);
+      }
+      this.$nextTick(() => {
+        const state = this._focusSurfaceState[key];
+        if (!state) return;
+        const root = document.querySelector(state.rootSelector);
+        if (!root) return;
+        const focusable = this._focusableElements(root);
+        const preferred = state.initialSelector
+          ? root.querySelector(state.initialSelector) : null;
+        const target = focusable.includes(preferred) ? preferred : (focusable[0] || root);
+        this._focusWithoutScroll(target);
+      });
+    },
+    _closeFocusSurface(key, restore = true) {
+      const state = this._focusSurfaceState[key];
+      if (!state) return;
+      delete this._focusSurfaceState[key];
+      if (state.modal) {
+        this._modalFocusStack = this._modalFocusStack.filter(item => item !== key);
+      }
+      if (!restore) return;
+      this.$nextTick(() => {
+        // If another managed modal is still open, keep focus in that surface
+        // instead of restoring an opener hidden behind it.
+        const topKey = this._modalFocusStack[this._modalFocusStack.length - 1];
+        const top = topKey && this._focusSurfaceState[topKey];
+        if (top) {
+          const root = document.querySelector(top.rootSelector);
+          if (root && !root.contains(document.activeElement)) {
+            const owner = state.owner;
+            const target = owner && owner.isConnected && !owner.disabled
+              && root.contains(owner) ? owner : (this._focusableElements(root)[0] || root);
+            this._focusWithoutScroll(target);
+          }
+          return;
+        }
+        const owner = state.owner;
+        if (owner && owner.isConnected && !owner.disabled) {
+          this._focusWithoutScroll(owner);
+        }
+      });
+    },
+    trapDialogFocus(ev, key) {
+      if (!ev || ev.key !== "Tab" || ev.defaultPrevented) return;
+      if (this._modalFocusStack[this._modalFocusStack.length - 1] !== key) return;
+      const state = this._focusSurfaceState[key];
+      const root = state && document.querySelector(state.rootSelector);
+      if (!root) return;
+      const focusable = this._focusableElements(root);
+      if (!focusable.length) {
+        ev.preventDefault();
+        this._focusWithoutScroll(root);
+        return;
+      }
+      const current = focusable.indexOf(document.activeElement);
+      const target = ev.shiftKey
+        ? (current <= 0 ? focusable[focusable.length - 1] : null)
+        : (current < 0 || current === focusable.length - 1 ? focusable[0] : null);
+      if (!target) return;
+      ev.preventDefault();
+      this._focusWithoutScroll(target);
     },
 
     // ===== modal =====
@@ -4809,13 +6259,26 @@ function portal() {
       if (!title) title = zh ? "确认" : "Confirm";
       if (!okText) okText = zh ? "确认" : "Confirm";
       if (!cancelText) cancelText = zh ? "取消" : "Cancel";
+      const opener = document.activeElement;
       return new Promise((resolve) => {
         this.modal = {
           show: true, title, body, input: null,
           okText, cancelText, danger,
-          confirm: () => { this.modal.show = false; resolve(true); },
-          cancel: () => { this.modal.show = false; resolve(false); },
+          confirm: () => {
+            this.modal.show = false;
+            this._closeFocusSurface("generic-modal");
+            resolve(true);
+          },
+          cancel: () => {
+            this.modal.show = false;
+            this._closeFocusSurface("generic-modal");
+            resolve(false);
+          },
         };
+        this._openFocusSurface(
+          "generic-modal", ".confirm-modal", ".modal-foot button:last-child",
+          opener, true,
+        );
       });
     },
     prompt({ title, body = "", placeholder = "", value = "", okText, cancelText }) {
@@ -4824,14 +6287,26 @@ function portal() {
       if (!title) title = zh ? "输入" : "Input";
       if (!okText) okText = zh ? "确认" : "Confirm";
       if (!cancelText) cancelText = zh ? "取消" : "Cancel";
+      const opener = document.activeElement;
       return new Promise((resolve) => {
         this.modal = {
           show: true, title, body, input: value, placeholder,
           okText, cancelText, danger: false,
-          confirm: () => { const v = this.modal.input; this.modal.show = false; resolve(v); },
-          cancel: () => { this.modal.show = false; resolve(null); },
+          confirm: () => {
+            const v = this.modal.input;
+            this.modal.show = false;
+            this._closeFocusSurface("generic-modal");
+            resolve(v);
+          },
+          cancel: () => {
+            this.modal.show = false;
+            this._closeFocusSurface("generic-modal");
+            resolve(null);
+          },
         };
-        this.$nextTick(() => { if (this.$refs.modalInput) this.$refs.modalInput.focus(); });
+        this._openFocusSurface(
+          "generic-modal", ".confirm-modal", "input", opener, true,
+        );
       });
     },
 
@@ -4848,6 +6323,7 @@ function portal() {
       // Best-effort: persist current state first in case savePrefs hasn't
       // run recently (e.g. user has been streaming for a while and prefs
       // didn't change). Cheap, idempotent.
+      try { this._captureComposerState(this.currentId); } catch (_) {}
       try { this.savePrefs(); } catch (_) {}
       this.toast(this.lang === "zh" ? "正在刷新…" : "Reloading…", "info", 1500);
       // Slight delay lets the toast render before the page tears down.
@@ -4861,27 +6337,104 @@ function portal() {
     async refreshChat() {
       this.toast(this.lang === "zh" ? "刷新中…" : "Refreshing…", "info", 1500);
       // Manual refresh re-pulls server-side data (context, session list,
-      // stats) and reloads the current session. The tab strip is
-      // device-local, so there's no cross-device tab state to merge.
+      // transcript) concurrently. Stats are independent toolbar decoration;
+      // refresh them in the background so four unrelated endpoints cannot
+      // hold the visible conversation refresh behind a waterfall.
+      const sid = this.currentId;
+      void Promise.resolve(this.fetchStats()).catch(() => {});
       await Promise.all([
         this.fetchContextInfo(),
         this.refreshSessions(),
-        this.fetchStats(),
+        sid ? this._reloadSessionCoalesced(sid, { quiet: true }) : Promise.resolve(true),
       ]);
-      if (this.currentId) await this.loadSession(this.currentId);
     },
 
     // ===== prefs =====
+    _normalizeOpenTabIds(ids, validIds = null) {
+      const allowed = validIds instanceof Set
+        ? validIds
+        : (validIds ? new Set(validIds) : null);
+      const seen = new Set();
+      return (Array.isArray(ids) ? ids : []).filter(id => {
+        if (typeof id !== "string" || !id || seen.has(id)) return false;
+        if (allowed && !allowed.has(id)) return false;
+        seen.add(id);
+        return true;
+      });
+    },
+
+    _chatTabStoreKey: "muselab_chat_tabs_v1",
+    _chatTabStoreRevision: 0,
+    _readChatTabStore() {
+      const stored = this._getLSJson(this._chatTabStoreKey, null);
+      if (!stored || stored.schema !== 1 || !Array.isArray(stored.openTabIds)) {
+        return null;
+      }
+      return {
+        schema: 1,
+        revision: Math.max(0, Math.floor(Number(stored.revision) || 0)),
+        openTabIds: this._normalizeOpenTabIds(stored.openTabIds),
+      };
+    },
+    _writeChatTabStore(ids = this.openTabIds) {
+      const stored = this._readChatTabStore();
+      const revision = Math.max(
+        this._chatTabStoreRevision,
+        stored ? stored.revision : 0,
+      ) + 1;
+      const openTabIds = this._normalizeOpenTabIds(ids);
+      const ok = this._setLS(this._chatTabStoreKey, JSON.stringify({
+        schema: 1,
+        revision,
+        openTabIds,
+      }));
+      if (ok) this._chatTabStoreRevision = revision;
+      return ok;
+    },
+    _loadChatTabStore(legacyOpenTabIds = []) {
+      const stored = this._readChatTabStore();
+      if (stored) {
+        this._chatTabStoreRevision = stored.revision;
+        this.openTabIds = stored.openTabIds;
+        return;
+      }
+      this.openTabIds = this._normalizeOpenTabIds(legacyOpenTabIds);
+      // Establish the new key even for an empty strip. Once it exists, stale
+      // pages still writing the legacy muselab_prefs field cannot revive tabs.
+      this._writeChatTabStore(this.openTabIds);
+    },
+    async _applyChatTabStorageEvent() {
+      const stored = this._readChatTabStore();
+      if (!stored || stored.revision <= this._chatTabStoreRevision) return;
+      const previousIds = this._normalizeOpenTabIds(this.openTabIds);
+      const previousCurrent = this.currentId;
+      this._chatTabStoreRevision = stored.revision;
+      this.openTabIds = stored.openTabIds;
+      if (!previousCurrent || this.openTabIds.includes(previousCurrent)) return;
+      const previousIndex = previousIds.indexOf(previousCurrent);
+      const currentWorkspace = this.currentWorkspacePath();
+      const sameWorkspace = this.openTabIds.filter(id => {
+        const session = this.sessions.find(row => row.id === id);
+        return !currentWorkspace || (session && session.cwd === currentWorkspace);
+      });
+      const candidates = sameWorkspace.length ? sameWorkspace : this.openTabIds;
+      if (!candidates.length) return;
+      const fallbackIndex = Math.min(
+        Math.max(0, previousIndex), candidates.length - 1,
+      );
+      this.currentId = candidates[fallbackIndex];
+      try { await this.switchSession(); } catch (_) {}
+    },
+
     savePrefs() {
       // Preview-pane state (tabs, selected) persists too so a refresh restores
-      // the exact files the user was looking at — matches the chat-tab strip's
-      // behavior via openTabIds.
+      // the exact files the user was looking at. Chat-tab strip state lives in
+      // muselab_chat_tabs_v1 so unrelated preference saves cannot revive a tab.
       this._setLS("muselab_prefs", JSON.stringify({
-        schema: 7,          // v7 remembers the selected terminal profile
+        schema: 10,         // v10 moves openTabIds to a versioned standalone key
         model: this.model, defaultModel: this.defaultModel,
         permission: this.permission, defaultPermission: this.defaultPermission,
         currentId: this.currentId,
-        openTabIds: this.openTabIds,
         previewTabs: this.tabs.map(t => this._previewTabSnapshot(t)),
         previewSelected: this.selected,
         previewSurface: this.previewSurface,
@@ -4891,8 +6444,8 @@ function portal() {
         activeWorkspace: this.activeWorkspace,
         workspaceLastSession: this.workspaceLastSession,
         workspaceSurfaces: this.workspaceSurfaces,
-        leftOpen: this.leftOpen, rightOpen: this.rightOpen,
-        leftWidth: this.leftWidth, rightWidth: this.rightWidth,
+        leftOpen: this.leftOpen, previewOpen: this.previewOpen,
+        leftWidth: this.leftWidth, previewWidth: this.previewWidth,
         showHidden: this.showHidden,
         openFilesCollapsed: this.openFilesCollapsed,
         openFilesHeight: this.openFilesHeight,
@@ -4906,10 +6459,10 @@ function portal() {
         // survives a refresh.
         desktopFullPane: this.desktopFullPane,
       }));
-      // Tab strip / preview tab strip / current tab are now device-local
-      // only (persisted in localStorage above). The cross-device ui-state
-      // sync was removed — it yanked the active tab out from under the user
-      // when another device pushed a different state.
+      // Preview tabs and current focus remain browser-local. The chat tab strip
+      // uses its own same-origin localStorage key; no state is sent to the backend.
+      // Cross-device ui-state stays removed because it yanked the active tab out
+      // from under the user when another device pushed a different state.
     },
 
     _scheduleSavePrefs() {
@@ -4951,12 +6504,30 @@ function portal() {
           this.workspaceSurfaces = p.workspaceSurfaces;
         }
         if (typeof p.leftOpen === "boolean") this.leftOpen = p.leftOpen;
-        if (typeof p.rightOpen === "boolean") this.rightOpen = p.rightOpen;
-        if (typeof p.leftWidth === "number") this.leftWidth = p.leftWidth;
-        if (typeof p.rightWidth === "number") this.rightWidth = p.rightWidth;
+        if (typeof p.leftWidth === "number") {
+          // v8 shipped the file manager at 280px.  Migrating only that exact
+          // old default gives existing users the roomier desktop layout while
+          // preserving any width they deliberately resized themselves.
+          this.leftWidth = this._loadedPrefsSchema < 9
+            && Math.abs(p.leftWidth - 280) <= 1
+            ? 340 : p.leftWidth;
+        }
+        // v7's rightOpen/rightWidth described the CHAT rail. In v8 chat is the
+        // always-visible center pane and PREVIEW owns the right rail. Preserve
+        // a useful old width, but never turn an old hidden-chat preference into
+        // a hidden preview on first load — the new layout should arrive intact.
+        if (typeof p.previewOpen === "boolean") this.previewOpen = p.previewOpen;
+        if (typeof p.previewWidth === "number") this.previewWidth = p.previewWidth;
+        else if (typeof p.rightWidth === "number") this.previewWidth = p.rightWidth;
         if (typeof p.showHidden === "boolean") this.showHidden = p.showHidden;
         if (p.currentId) this.currentId = p.currentId;
-        if (Array.isArray(p.openTabIds)) this.openTabIds = p.openTabIds;
+        // The standalone key is authoritative. p.openTabIds is accepted only as
+        // a one-time migration source for users upgrading from schema <= 9.
+        this._loadChatTabStore(p.openTabIds);
+        if (Object.prototype.hasOwnProperty.call(p, "openTabIds")) {
+          delete p.openTabIds;
+          this._setLS("muselab_prefs", JSON.stringify(p));
+        }
         // Preview tabs — restore the strip; the actual content fetch happens
         // lazily when the user clicks back to one (or via restorePreviewSelected
         // which runs once after login).
@@ -4986,11 +6557,10 @@ function portal() {
         if (typeof p.desktopFullPane === "string"
             && ["", "preview", "chat"].includes(p.desktopFullPane)) {
           this.desktopFullPane = p.desktopFullPane;
-          // Mirror toggleDesktopFull's invariant: fullscreen chat needs the
-          // right pane open or it restores to a blank screen (chat is hidden
-          // by .pane-hidden when rightOpen is false). rightOpen is restored
-          // just above, but guard against a persisted false slipping through.
-          if (p.desktopFullPane === "chat") this.rightOpen = true;
+          // Mirror toggleDesktopFull's invariant: fullscreen preview needs its
+          // optional right rail open or `.pane-hidden` would win over the
+          // fullscreen grid rule and restore a blank screen.
+          if (p.desktopFullPane === "preview") this.previewOpen = true;
         }
         if (typeof p.openFilesCollapsed === "boolean") this.openFilesCollapsed = p.openFilesCollapsed;
         // null = auto-fit; only restore an explicit user override.
@@ -5025,30 +6595,38 @@ function portal() {
     },
 
     async fetchStats() {
-      try {
-        const r = await fetch("/api/chat/usage", { headers: this.hdr() });
-        if (r.ok) {
-          const d = await r.json();
-          this.stats = { ...this.stats, total_cost_usd: d.total_cost_usd, total_messages: d.total_messages };
-        }
-      } catch {}
-      await this.fetchMcp();
-      await this.fetchRateLimit();
-      try {
-        const r = await fetch("/api/chat/providers", { headers: this.hdr() });
-        if (r.ok) {
-          const d = await r.json();
-          this.availableModels = d.models || [];
-          this._modelsLoaded = true;
-          if (d.default_model) { this.defaultModel = d.default_model; this.savePrefs(); }
-          if (d.default_permission) {
-            this.defaultPermission = d.default_permission;
-            this.savePrefs();
+      const usage = (async () => {
+        try {
+          const r = await fetch("/api/chat/usage", { headers: this.hdr() });
+          if (r.ok) {
+            const d = await r.json();
+            this.stats = { ...this.stats, total_cost_usd: d.total_cost_usd, total_messages: d.total_messages };
           }
-          this._ensureValidModel();
-          await this._rebindModelSelect();
-        }
-      } catch {}
+        } catch {}
+      })();
+      const providers = (async () => {
+        try {
+          const r = await fetch("/api/chat/providers", { headers: this.hdr() });
+          if (r.ok) {
+            const d = await r.json();
+            this.availableModels = d.models || [];
+            this._modelsLoaded = true;
+            if (d.default_model) { this.defaultModel = d.default_model; this.savePrefs(); }
+            if (d.default_permission) {
+              this.defaultPermission = d.default_permission;
+              this.savePrefs();
+            }
+            this._ensureValidModel();
+            await this._rebindModelSelect();
+          }
+        } catch {}
+      })();
+      await Promise.allSettled([
+        usage,
+        this.fetchMcp(),
+        this.fetchRateLimit(),
+        providers,
+      ]);
     },
 
     async fetchCodexRateLimit(opts = {}) {
@@ -5223,66 +6801,140 @@ function portal() {
       const sid = this.currentId;
       const ownerWorkspace = this.currentWorkspacePath();
       const cur = this.sessions.find(s => s.id === sid);
-      const oldM = cur ? cur.model : "";
-      if (newM === oldM) return;
-      // If the new model doesn't honor the current effort (e.g. switched
-      // from Opus 4.7 → Sonnet with effort=xhigh, or to any non-Claude
-      // vendor), reset to "" (auto). Without this the option becomes
-      // hidden by _effortAllowed but the select still reports the stale
-      // value, and the backend would forward a no-op effort param on
-      // every turn. Fire-and-forget the PATCH — the local reset already
-      // makes the UI consistent.
-      if (!this._effortAllowed(this.effort, newM)) {
-        this.effort = "";
-        this.onEffortChange();
+      let oldM = cur ? cur.model : "";
+      if (this.workspaceSwitching) {
+        this.model = oldM;
+        return false;
       }
+      if (newM === oldM) return;
+      const ownerState = this._ensureTabState(sid);
+      const ownsSelection = () => !this.workspaceSwitching
+        && this.currentId === sid
+        && this.tabState[sid] === ownerState
+        && this._conversationWorkspaceIsCurrent(ownerWorkspace);
+      // Finish any already-requested effort/tier write before deciding what the
+      // current session owns. Crucially, do not PATCH a compatibility reset yet:
+      // a history-session model switch still has a confirm step, and Cancel must
+      // leave the source session byte-for-byte unchanged.
+      if (!await this._awaitRuntimeSettingPatches(sid, ownerState)) return;
+      if (!ownsSelection()) {
+        if (this.currentId === sid) this.model = oldM;
+        return false;
+      }
+      const ownerMeta = this.sessions.find(s => s.id === sid) || {};
+      // A prior serialized runtime write may have completed while we waited.
+      // Roll back to that latest owner value, never the pre-wait snapshot.
+      oldM = ownerMeta.model || oldM;
+      const currentEffort = this._normalizeEffort(
+        ownerMeta.effort || ownerState.effort,
+      );
+      const currentTier = this._normalizeServiceTier(
+        Object.prototype.hasOwnProperty.call(ownerMeta, "service_tier")
+          ? ownerMeta.service_tier : ownerState.serviceTier,
+      );
+      const nextEffort = this._effortAllowed(currentEffort, newM)
+        ? currentEffort : "auto";
+      const nextTier = this._supportsFast(newM) ? currentTier : "";
 
       // Decide empty vs has-messages from BOTH the persisted message_count
       // AND the in-memory messages array — take the max. Two failure modes
       // we need to cover simultaneously:
       //   (a) sessions list metadata loaded before messages stream in →
-      //       this.messages temporarily empty but persisted count > 0 →
+      //       the active pane is temporarily empty but persisted count > 0 →
       //       prefer persisted count.
       //   (b) user switches model mid-first-turn (or before the FIRST turn's
-      //       bump_session has fired) → persisted count still 0 but
-      //       this.messages already has user + streaming-assistant bubbles →
+      //       bump_session has fired) → persisted count still 0 but the active
+      //       pane already has user + streaming-assistant bubbles →
       //       prefer in-memory length. The old single-source logic took
       //       persisted=0 here and silently switched without the "新建会话?"
       //       confirm (2026-05-23 user feedback).
       const persistedFromMeta = (cur && typeof cur.message_count === "number")
         ? cur.message_count : 0;
-      const persistedCount = Math.max(persistedFromMeta, this.messages.length || 0);
+      const persistedCount = Math.max(persistedFromMeta, this.activeSessionPane().messages.length || 0);
 
       // Empty session — switch in place (no point creating an empty fork).
       // Still toast so the user gets visual confirmation the switch happened.
       if (persistedCount === 0) {
-        try {
-          const r = await fetch("/api/chat/sessions/" + encodeURIComponent(sid), {
-            method: "PATCH",
-            headers: { ...this.hdr(), "Content-Type": "application/json" },
-            body: JSON.stringify({ model: newM }),
-          });
-          if (!r.ok) {
+        const seq = ++ownerState._modelPatchSeq;
+        ownerState._runtimeSettingsGeneration += 1;
+        const expected = {
+          seq,
+          value: newM,
+          fallback: oldM,
+          at: Date.now(),
+        };
+        ownerState._modelExpected = expected;
+        const abandon = () => {
+          if (this.tabState[sid] === ownerState
+              && ownerState._modelPatchSeq === seq
+              && ownerState._modelExpected === expected) {
+            ownerState._modelExpected = null;
             if (this.currentId === sid) this.model = oldM;
+          }
+          return false;
+        };
+        try {
+          if (!await this._ensureSessionRegistered(sid)) {
+            throw new Error("session registration failed");
+          }
+          // Registration can take long enough for a workspace/tab switch or a
+          // newer model intent. Never send this PATCH to that stale owner.
+          if (!ownsSelection() || ownerState._modelPatchSeq !== seq) {
+            return abandon();
+          }
+          const r = await this._serializeRuntimeSettingPatch(ownerState, async () => {
+            if (!ownsSelection() || ownerState._modelPatchSeq !== seq) return null;
+            return fetch("/api/chat/sessions/" + encodeURIComponent(sid), {
+              method: "PATCH",
+              headers: { ...this.hdr(), "Content-Type": "application/json" },
+              body: JSON.stringify({
+                model: newM,
+                effort: nextEffort,
+                service_tier: nextTier,
+              }),
+            });
+          });
+          if (!r) return abandon();
+          if (!r.ok) {
+            abandon();
             if (this.currentId === sid) this.toast(this.t("slash.failed"), "error");
-            return;
+            return false;
+          }
+          if (this.tabState[sid] !== ownerState
+              || ownerState._modelPatchSeq !== seq) return false;
+          const active = this.sessions.find(s => s.id === sid);
+          if (active) {
+            active.model = newM;
+            active.effort = nextEffort;
+            active.service_tier = nextTier;
+          }
+          ownerState.effort = nextEffort;
+          ownerState.serviceTier = nextTier;
+          if (ownerState._modelExpected) {
+            ownerState._modelExpected.fallback = newM;
+          }
+          if (ownsSelection()) {
+            this.model = newM;
+            this.effort = nextEffort;
+            this.serviceTier = nextTier;
           }
           await this.refreshSessions();
-          if (this.currentId === sid) this.savePrefs();
+          if (ownsSelection()) this.savePrefs();
           const label = this.modelLabel(newM);
-          if (this.currentId === sid) {
+          if (ownsSelection()) {
             this.toast(this.lang === "zh"
               ? `已切到 ${label}（空会话，无需新建）`
               : `Switched to ${label} (empty session, no fork needed)`,
               "success", 1800);
           }
         } catch (e) {
-          if (this.currentId === sid) {
-            this.model = oldM;
+          abandon();
+          if (ownsSelection()) {
             this.toast(this.t("slash.failed"), "error");
           }
+          return false;
         }
-        return;
+        return true;
       }
 
       // Session has history — confirm + create new.
@@ -5296,6 +6948,10 @@ function portal() {
         if (this.currentId === sid) this.model = oldM;
         return;
       }
+      if (!ownsSelection()) {
+        if (this.currentId === sid) this.model = oldM;
+        return false;
+      }
       try {
         const r = await fetch("/api/chat/sessions", {
           method: "POST",
@@ -5304,6 +6960,7 @@ function portal() {
           // also creates a session, which triggers the empty-session recycler).
           body: JSON.stringify({
             name: "", model: newM, cwd: ownerWorkspace,
+            effort: "auto", service_tier: "",
             open_ids: this.openTabIds || [],
           }),
         });
@@ -5319,7 +6976,12 @@ function portal() {
         const newSt = this._ensureTabState(meta.id);
         newSt.messages.length = 0;
         newSt._loaded = true;
-        if (!this.openTabIds.includes(meta.id)) this.openTabIds.push(meta.id);
+        newSt.effort = this._normalizeEffort(meta.effort);
+        newSt.serviceTier = this._normalizeServiceTier(meta.service_tier);
+        if (!this.openTabIds.includes(meta.id)) {
+          this.openTabIds.push(meta.id);
+          this._writeChatTabStore(this.openTabIds);
+        }
         if (this._conversationWorkspaceIsCurrent(ownerWorkspace) && this.currentId === sid) {
           this._captureComposerState(sid);
           this.currentId = meta.id;
@@ -5344,18 +7006,10 @@ function portal() {
     // Backend disconnects the cached client so the next turn rebuilds with
     // the new value.
     //
-    // Effort support varies by model. Per claude_agent_sdk types.py:
-    //   - "low"/"medium"/"high"/"max"  → all Anthropic models honor
-    //   - "xhigh"                       → Opus 4.7 / 4.8 only; SDK silently
-    //                                     falls back to "high" on Sonnet / Haiku
-    //   - non-Claude providers           → show only when /api/chat/providers
-    //                                     marks supports_effort=true. Codex
-    //                                     Gateway opts in because its sidecar
-    //                                     translates the Anthropic-compatible
-    //                                     request to a Codex/OpenAI backend.
-    // Per "无效的直接隐藏" feedback (2026-05-22) we don't grey-out — we
-    // hide. User feedback: greyed options still look pick-able and waste
-    // dropdown space.
+    // Effort support is model-specific. The backend publishes the exact list
+    // as `effort_levels`; the UI must not infer Codex/Claude capability from a
+    // model name (Sol, for example, exposes xhigh/max/ultra). Legacy backends
+    // without the list retain the old conservative fallback below.
     _modelMeta(model) {
       const m = model || "";
       const list = this.availableModels || [];
@@ -5373,7 +7027,12 @@ function portal() {
       return null;
     },
     _isClaudeModel(model) {
-      return (model || "").startsWith("claude-");
+      const m = String(model || "").replace(/^ducc:/i, "");
+      return m.startsWith("claude-");
+    },
+    _isClaudeXHighModel(model) {
+      const m = String(model || "").replace(/^ducc:/i, "");
+      return /^claude-opus-4-(7|8)(?:$|[-.])/.test(m);
     },
     _isCodexModel(model) {
       const m = model || "";
@@ -5381,20 +7040,65 @@ function portal() {
       const meta = this._modelMeta(m);
       return !!(meta && /codex/i.test(meta.group || ""));
     },
-    _isOpus47(model) {
-      // Misnomer kept for blast-radius reasons: this gate fires for any
-      // Opus model that supports the `xhigh` effort level. Per Anthropic's
-      // effort-level docs, that is Opus 4.7 AND Opus 4.8 — both are listed
-      // as "Available on Claude Opus 4.8 and Claude Opus 4.7". Future
-      // Opus models will likely keep the privilege; extend this match
-      // when they ship.
-      const m = (model || "");
-      return m.startsWith("claude-opus-4-7") || m.startsWith("claude-opus-4-8");
+    _normalizeEffort(value) {
+      const level = String(value || "auto").trim() || "auto";
+      return ["auto", "low", "medium", "high", "xhigh", "max", "ultra"]
+        .includes(level) ? level : "auto";
+    },
+    _normalizeServiceTier(value) {
+      return String(value || "").trim() === "fast" ? "fast" : "";
+    },
+    _effortLevels(model) {
+      const meta = this._modelMeta(model);
+      if (meta && Array.isArray(meta.effort_levels)) {
+        const valid = new Set(
+          meta.effort_levels.map(level => this._normalizeEffort(level)),
+        );
+        // Auto is the universal escape hatch that clears an explicit override.
+        valid.add("auto");
+        let levels = ["auto", "low", "medium", "high", "xhigh", "max", "ultra"]
+          .filter(level => valid.has(level));
+        // The Claude SDK may publish its full enum even though Ultra is a
+        // Codex-only UI choice and xhigh is only valid for Opus 4.7/4.8.
+        // Keep this product contract at the model boundary instead of trusting
+        // a provider-wide capability list verbatim.
+        if (this._isClaudeModel(model)) {
+          levels = levels.filter(level =>
+            level !== "ultra"
+            && (level !== "xhigh" || this._isClaudeXHighModel(model)));
+        }
+        return levels;
+      }
+      // Compatibility with a pre-capability-list backend. Keep this branch
+      // conservative; current servers always return effort_levels.
+      if (this._isClaudeModel(model)) {
+        const levels = ["auto", "low", "medium", "high", "max"];
+        if (this._isClaudeXHighModel(model)) levels.splice(4, 0, "xhigh");
+        return levels;
+      }
+      if (meta && meta.supports_effort === true) {
+        return ["auto", "low", "medium", "high", "max"];
+      }
+      return ["auto"];
     },
     _supportsEffort(model) {
-      if (this._isClaudeModel(model)) return true;
+      return this._effortLevels(model).some(level => level !== "auto");
+    },
+    _supportsFast(model) {
       const meta = this._modelMeta(model);
-      return !!(meta && meta.supports_effort === true);
+      return !!(meta && meta.supports_fast === true);
+    },
+    _showEffortControl(model = this.model) {
+      // A catalog refresh can withdraw a capability while an existing session
+      // still persists an explicit value. Keep the control visible so the user
+      // can clear that now-unsupported override back to auto.
+      return this._supportsEffort(model)
+        || this._normalizeEffort(this.effort) !== "auto";
+    },
+    _showFastControl(model = this.model) {
+      // Same escape hatch for a persisted Fast tier after capability drift.
+      return this._supportsFast(model)
+        || this._normalizeServiceTier(this.serviceTier) === "fast";
     },
     _supportsThinking(model) {
       // Thinking toggle shows for any provider whose endpoint honors the
@@ -5408,18 +7112,17 @@ function portal() {
       return meta.supports_thinking !== false;
     },
     _effortAllowed(level, model) {
-      if (level === "") return true;            // "auto" always available
-      if (!this._supportsEffort(model)) return false;
-      if (level === "xhigh") return this._isOpus47(model);
-      return true;                              // low / medium / high / max
+      return this._effortLevels(model).includes(this._normalizeEffort(level));
     },
     effortChoices(model) {
       // Avoid x-show directly on <option>: iOS Safari's native picker can cache
       // or ignore dynamically hidden option nodes, leaving only the selected
       // "auto" visible. Render the filtered option list instead.
-      return ["", "low", "medium", "high", "xhigh", "max"]
-        .filter(level => this._effortAllowed(level, model))
-        .map(level => ({ value: level, labelKey: "effort." + (level || "auto") }));
+      const selected = model === this.model
+        ? this._normalizeEffort(this.effort) : "auto";
+      return ["auto", "low", "medium", "high", "xhigh", "max", "ultra"]
+        .filter(level => this._effortAllowed(level, model) || level === selected)
+        .map(level => ({ value: level, labelKey: "effort." + level }));
     },
     // Label for the 📦 compact-in-progress bubble. An auto-compact rides the
     // turn's own stream, so streamElapsed (already ticking once a second) is
@@ -5429,8 +7132,8 @@ function portal() {
     compactPendingLabel() {
       const zh = this.lang === "zh";
       const base = zh ? "压缩对话中…" : "Compacting conversation…";
-      const st = this.tabState[this.currentId];
-      if (!st || !st._compactStartedAt) return base;
+      const st = this.activeSessionPane();
+      if (!st._compactStartedAt) return base;
       const secs = st.streamElapsed || 0;
       if (secs < 2) return base;
       return base + " · " + this.fmtStreamElapsed(secs);
@@ -5454,20 +7157,156 @@ function portal() {
         if (st[tailKey] === run) st[tailKey] = null;
       }
     },
+    async _serializeRuntimeSettingPatch(st, work) {
+      // Effort and service tier both rebuild the same session runtime. Put them
+      // on ONE queue so two quick control changes cannot overtake each other.
+      return this._serializeTabSettingPatch(st, "_runtimeSettingPatchTail", work);
+    },
+    runtimeSettingsPending(sid = this.currentId) {
+      const st = sid && this.tabState && this.tabState[sid];
+      return !!(st && st._runtimeSettingPatchTail);
+    },
+    async _awaitRuntimeSettingPatches(sid, st = this.tabState && this.tabState[sid]) {
+      if (!sid || !st) return true;
+      // A second setting can be queued while the first request is in flight.
+      // Follow the moving tail until the exact session has no writes pending.
+      while (this.tabState[sid] === st) {
+        const tail = st._runtimeSettingPatchTail;
+        if (!tail) return true;
+        try { await tail; } catch (_) { /* change handler restores fallback */ }
+        if (st._runtimeSettingPatchTail === tail) return true;
+      }
+      return false;
+    },
+    _normalizePermissionMode(value, fallback = "") {
+      const mode = String(value || "");
+      return [
+        "bypassPermissions", "acceptEdits", "default",
+        "dontAsk", "auto", "plan",
+      ].includes(mode) ? mode : fallback;
+    },
+    _sessionPermissionMode(sid) {
+      if (!sid) {
+        return this._normalizePermissionMode(this.defaultPermission, "default");
+      }
+      const st = this.tabState && this.tabState[sid];
+      if (st && st._permissionExpected) {
+        return this._normalizePermissionMode(st._permissionExpected.value, "default");
+      }
+      const meta = (this.sessions || []).find(s => s.id === sid);
+      return this._normalizePermissionMode(
+        (meta && meta.permission) || (st && st.permission)
+          || this.defaultPermission,
+        "default",
+      );
+    },
+    permissionControlDisabled(sid = this.currentId) {
+      if (!sid || this.workspaceSwitching) return true;
+      const st = this.tabState && this.tabState[sid];
+      return !!((st && (st._permissionChangePending || st.compacting))
+        || this.isTabStreaming(sid));
+    },
+    permissionControlTitle(sid = this.currentId) {
+      const st = sid && this.tabState && this.tabState[sid];
+      if (st && st._permissionChangePending) return this.t("perm.switching");
+      if (sid && (this.isTabStreaming(sid) || (st && st.compacting))) {
+        return this.t("perm.switch_wait_stream");
+      }
+      return this.t("set.label.default_permission");
+    },
+    _applySessionPermissionMode(
+      sid,
+      rawMode,
+      { previousPermission = "", authoritative = false } = {},
+    ) {
+      const mode = this._normalizePermissionMode(rawMode);
+      if (!sid || !mode) return "";
+      const st = this._ensureTabState(sid);
+      const current = (this.sessions || []).find(s => s.id === sid);
+      const priorMode = this._normalizePermissionMode(
+        previousPermission || (current && current.permission) || st.permission,
+        "default",
+      );
+      const existingReturn = (current && current.plan_return_permission) || "";
+      const planReturnPermission = mode === "plan"
+        ? this._normalizePermissionMode(
+            (priorMode !== "plan" && priorMode) || existingReturn,
+            "",
+          )
+        : "";
+
+      this.sessions = (this.sessions || []).map(session =>
+        session.id === sid
+          ? {
+              ...session,
+              permission: mode,
+              plan_return_permission: planReturnPermission,
+            }
+          : session);
+      if (this._optimisticMetas && this._optimisticMetas[sid]) {
+        this._optimisticMetas[sid] = {
+          ...this._optimisticMetas[sid],
+          permission: mode,
+          plan_return_permission: planReturnPermission,
+        };
+      }
+      st.permission = mode;
+      st._permissionChangePending = false;
+      if (authoritative) {
+        // The SSE event is newer than both the current UI value and any
+        // in-flight PATCH. Keep it pinned until the next session-list response
+        // echoes the server-persisted mode.
+        const seq = ++st._permissionPatchSeq;
+        st._permissionExpected = {
+          seq,
+          value: mode,
+          fallback: mode,
+          planReturnPermission,
+          source: "permission_mode_changed",
+        };
+      }
+      if (this.currentId === sid) this.permission = mode;
+      this._scheduleSavePrefs();
+      return mode;
+    },
     async onPermissionChange() {
       if (!this.currentId) return false;
       const sid = this.currentId;
       const st = this._ensureTabState(sid);
+      const stable = this._sessionPermissionMode(sid);
+      if (this.permissionControlDisabled(sid)) {
+        this.permission = stable;
+        if (this.isTabStreaming(sid) || st.compacting) {
+          this.toast(this.t("perm.switch_wait_stream"), "warn", 2500);
+        }
+        return false;
+      }
       const seq = ++st._permissionPatchSeq;
-      const value = this.permission || "default";
+      const value = this._normalizePermissionMode(this.permission, "default");
       const session = this.sessions.find(s => s.id === sid);
-      const previous = (session && session.permission) || "default";
+      const previous = this._normalizePermissionMode(
+        st.permission || (session && session.permission),
+        "default",
+      );
+      const previousPlanReturn = (session && session.plan_return_permission) || "";
       const priorExpected = st._permissionExpected;
       const expected = {
         seq, value,
         fallback: priorExpected ? priorExpected.fallback : previous,
+        fallbackPlanReturn: priorExpected
+          && priorExpected.fallbackPlanReturn !== undefined
+          ? priorExpected.fallbackPlanReturn
+          : previousPlanReturn,
+        planReturnPermission: value === "plan"
+          ? this._normalizePermissionMode(
+              (previous !== "plan" && previous) || previousPlanReturn,
+              "",
+            )
+          : "",
       };
       st._permissionExpected = expected;
+      st.permission = value;
+      st._permissionChangePending = true;
       try {
         const r = await this._serializeTabSettingPatch(
           st, "_permissionPatchTail", async () => {
@@ -5483,9 +7322,14 @@ function portal() {
         if (!r.ok) throw new Error(await r.text());
         if (this.tabState[sid] !== st) return false;
         const current = this.sessions.find(s => s.id === sid);
-        if (current) current.permission = value;
+        if (current) {
+          current.permission = value;
+          current.plan_return_permission = expected.planReturnPermission;
+        }
+        st.permission = value;
         if (st._permissionExpected) {
           st._permissionExpected.fallback = value;
+          st._permissionExpected.fallbackPlanReturn = expected.planReturnPermission;
           if (st._permissionExpected.seq === seq && st._permissionExpected.echoed) {
             st._permissionExpected = null;
           }
@@ -5499,61 +7343,293 @@ function portal() {
         const fallback = expected.fallback;
         if (st._permissionExpected === expected) st._permissionExpected = null;
         const current = this.sessions.find(s => s.id === sid);
-        if (current) current.permission = fallback;
+        if (current) {
+          current.permission = fallback;
+          current.plan_return_permission = expected.fallbackPlanReturn || "";
+        }
+        st.permission = fallback;
         if (this.currentId === sid) this.permission = fallback;
         this.toast(this.lang === "zh" ? "权限切换失败" : "Permission switch failed", "error");
         return false;
+      } finally {
+        if (this.tabState[sid] === st && st._permissionPatchSeq === seq) {
+          st._permissionChangePending = false;
+        }
       }
     },
     async onEffortChange() {
       if (!this.currentId) return false;
       const sid = this.currentId;
       const st = this._ensureTabState(sid);
-      const seq = ++st._effortPatchSeq;
-      const e = this.effort || "";
       const session = this.sessions.find(s => s.id === sid);
-      const previous = (session && session.effort) || "";
+      if (this.workspaceSwitching) {
+        this.effort = this._normalizeEffort(
+          st._effortExpected
+            ? st._effortExpected.value
+            : ((session && session.effort) || st.effort),
+        );
+        return false;
+      }
+      const ownerWorkspace = this.currentWorkspacePath();
+      const seq = ++st._effortPatchSeq;
+      st._runtimeSettingsGeneration += 1;
+      const requested = this._normalizeEffort(this.effort);
+      const e = this._effortAllowed(requested, this.model) ? requested : "auto";
+      this.effort = e;
+      const previous = this._normalizeEffort(
+        (session && session.effort) || st.effort,
+      );
       const priorExpected = st._effortExpected;
+      const priorTierExpected = st._serviceTierExpected;
+      const previousTier = this._normalizeServiceTier(
+        priorTierExpected
+          ? priorTierExpected.value
+          : (session && Object.prototype.hasOwnProperty.call(
+            session, "service_tier") ? session.service_tier : st.serviceTier),
+      );
+      const compatibleTier = this._supportsFast(this.model)
+        ? previousTier : "";
+      const resetsTier = compatibleTier !== previousTier;
+      const companionTierSeq = resetsTier
+        ? ++st._serviceTierPatchSeq : st._serviceTierPatchSeq;
       const expected = {
         seq, value: e,
         fallback: priorExpected ? priorExpected.fallback : previous,
+        at: Date.now(),
       };
       st._effortExpected = expected;
+      st.effort = e;
+      const tierExpected = resetsTier ? {
+        seq: companionTierSeq,
+        value: compatibleTier,
+        fallback: priorTierExpected
+          ? priorTierExpected.fallback : previousTier,
+        at: Date.now(),
+      } : null;
+      if (tierExpected) {
+        st._serviceTierExpected = tierExpected;
+        st.serviceTier = compatibleTier;
+        this.serviceTier = compatibleTier;
+      }
+      const ownsIntent = () => !this.workspaceSwitching
+        && this.currentId === sid
+        && this.tabState[sid] === st
+        && st._effortPatchSeq === seq
+        && (!tierExpected
+          || st._serviceTierPatchSeq === companionTierSeq)
+        && this._conversationWorkspaceIsCurrent(ownerWorkspace);
+      const abandon = () => {
+        if (this.tabState[sid] === st && st._effortPatchSeq === seq
+            && st._effortExpected === expected) {
+          st._effortExpected = null;
+          st.effort = expected.fallback;
+          if (this.currentId === sid) this.effort = expected.fallback;
+        }
+        if (tierExpected && this.tabState[sid] === st
+            && st._serviceTierPatchSeq === companionTierSeq
+            && st._serviceTierExpected === tierExpected) {
+          st._serviceTierExpected = null;
+          st.serviceTier = tierExpected.fallback;
+          if (this.currentId === sid) {
+            this.serviceTier = tierExpected.fallback;
+          }
+        }
+        return false;
+      };
       try {
-        const r = await this._serializeTabSettingPatch(
-          st, "_effortPatchTail", async () => {
-            if (this.tabState[sid] !== st || st._effortPatchSeq !== seq) return null;
+        if (!await this._ensureSessionRegistered(sid)) {
+          throw new Error("session registration failed");
+        }
+        if (!ownsIntent()) return abandon();
+        const r = await this._serializeRuntimeSettingPatch(
+          st, async () => {
+            if (!ownsIntent()) return null;
             return fetch("/api/chat/sessions/" + encodeURIComponent(sid), {
               method: "PATCH",
               headers: { ...this.hdr(), "Content-Type": "application/json" },
-              body: JSON.stringify({ effort: e }),
+              body: JSON.stringify({
+                effort: e,
+                service_tier: compatibleTier,
+              }),
             });
           },
         );
-        if (!r) return false;
+        if (!r) return abandon();
         if (!r.ok) throw new Error(await r.text());
-        if (this.tabState[sid] !== st) return false;
+        if (!ownsIntent()) return false;
         const cur = this.sessions.find(s => s.id === sid);
-        if (cur) cur.effort = e;
+        if (cur) {
+          cur.effort = e;
+          cur.service_tier = compatibleTier;
+        }
+        st.effort = e;
+        st.serviceTier = compatibleTier;
         if (st._effortExpected) {
           st._effortExpected.fallback = e;
-          if (st._effortExpected.seq === seq && st._effortExpected.echoed) {
-            st._effortExpected = null;
-          }
+        }
+        if (tierExpected && st._serviceTierExpected === tierExpected) {
+          st._serviceTierExpected.fallback = compatibleTier;
         }
         if (st._effortPatchSeq !== seq) return false;
-        const label = this.t("effort." + (e || "auto"));
-        this.toast(this.t("effort.changed", { label }), "info", 1800);
-        if (this.currentId === sid) this.effort = e;
+        const label = this.t("effort." + e);
+        if (ownsIntent()) {
+          this.toast(this.t("effort.changed", { label }), "info", 1800);
+          this.effort = e;
+          this.serviceTier = compatibleTier;
+        }
         return true;
       } catch (err) {
         if (this.tabState[sid] !== st || st._effortPatchSeq !== seq) return false;
         const fallback = expected.fallback;
-        if (st._effortExpected === expected) st._effortExpected = null;
+        const rollsBackTier = !!(tierExpected
+          && st._serviceTierPatchSeq === companionTierSeq
+          && st._serviceTierExpected === tierExpected);
+        abandon();
         const actual = this.sessions.find(s => s.id === sid);
-        if (actual) actual.effort = fallback;
+        if (actual) {
+          actual.effort = fallback;
+          if (rollsBackTier) actual.service_tier = tierExpected.fallback;
+        }
+        st.effort = fallback;
         if (this.currentId === sid) this.effort = fallback;
-        this.toast(this.lang === "zh" ? "切换失败" : "Switch failed", "error");
+        if (ownsIntent()) {
+          this.toast(this.lang === "zh" ? "切换失败" : "Switch failed", "error");
+        }
+        return false;
+      }
+    },
+    async onServiceTierChange(enabled = this.serviceTier === "fast") {
+      if (!this.currentId) return false;
+      const sid = this.currentId;
+      const st = this._ensureTabState(sid);
+      const session = this.sessions.find(s => s.id === sid);
+      if (this.workspaceSwitching) {
+        this.serviceTier = this._normalizeServiceTier(
+          st._serviceTierExpected
+            ? st._serviceTierExpected.value
+            : (session && Object.prototype.hasOwnProperty.call(
+              session, "service_tier") ? session.service_tier : st.serviceTier),
+        );
+        return false;
+      }
+      const ownerWorkspace = this.currentWorkspacePath();
+      const seq = ++st._serviceTierPatchSeq;
+      st._runtimeSettingsGeneration += 1;
+      const tier = enabled && this._supportsFast(this.model) ? "fast" : "";
+      this.serviceTier = tier;
+      const previous = this._normalizeServiceTier(
+        session && Object.prototype.hasOwnProperty.call(session, "service_tier")
+          ? session.service_tier : st.serviceTier,
+      );
+      const priorExpected = st._serviceTierExpected;
+      const priorEffortExpected = st._effortExpected;
+      const previousEffort = this._normalizeEffort(
+        priorEffortExpected
+          ? priorEffortExpected.value
+          : ((session && session.effort) || st.effort),
+      );
+      const compatibleEffort = this._effortAllowed(
+        previousEffort, this.model,
+      ) ? previousEffort : "auto";
+      const resetsEffort = compatibleEffort !== previousEffort;
+      const companionEffortSeq = resetsEffort
+        ? ++st._effortPatchSeq : st._effortPatchSeq;
+      const expected = {
+        seq, value: tier,
+        fallback: priorExpected ? priorExpected.fallback : previous,
+        at: Date.now(),
+      };
+      st._serviceTierExpected = expected;
+      st.serviceTier = tier;
+      const effortExpected = resetsEffort ? {
+        seq: companionEffortSeq,
+        value: compatibleEffort,
+        fallback: priorEffortExpected
+          ? priorEffortExpected.fallback : previousEffort,
+        at: Date.now(),
+      } : null;
+      if (effortExpected) {
+        st._effortExpected = effortExpected;
+        st.effort = compatibleEffort;
+        this.effort = compatibleEffort;
+      }
+      const ownsIntent = () => !this.workspaceSwitching
+        && this.currentId === sid
+        && this.tabState[sid] === st
+        && st._serviceTierPatchSeq === seq
+        && (!effortExpected
+          || st._effortPatchSeq === companionEffortSeq)
+        && this._conversationWorkspaceIsCurrent(ownerWorkspace);
+      const abandon = () => {
+        if (this.tabState[sid] === st && st._serviceTierPatchSeq === seq
+            && st._serviceTierExpected === expected) {
+          st._serviceTierExpected = null;
+          st.serviceTier = expected.fallback;
+          if (this.currentId === sid) this.serviceTier = expected.fallback;
+        }
+        if (effortExpected && this.tabState[sid] === st
+            && st._effortPatchSeq === companionEffortSeq
+            && st._effortExpected === effortExpected) {
+          st._effortExpected = null;
+          st.effort = effortExpected.fallback;
+          if (this.currentId === sid) this.effort = effortExpected.fallback;
+        }
+        return false;
+      };
+      try {
+        if (!await this._ensureSessionRegistered(sid)) {
+          throw new Error("session registration failed");
+        }
+        if (!ownsIntent()) return abandon();
+        const r = await this._serializeRuntimeSettingPatch(st, async () => {
+          if (!ownsIntent()) return null;
+          return fetch("/api/chat/sessions/" + encodeURIComponent(sid), {
+            method: "PATCH",
+            headers: { ...this.hdr(), "Content-Type": "application/json" },
+            body: JSON.stringify({
+              effort: compatibleEffort,
+              service_tier: tier,
+            }),
+          });
+        });
+        if (!r) return abandon();
+        if (!r.ok) throw new Error(await r.text());
+        if (!ownsIntent()) return false;
+        const cur = this.sessions.find(s => s.id === sid);
+        if (cur) {
+          cur.effort = compatibleEffort;
+          cur.service_tier = tier;
+        }
+        st.effort = compatibleEffort;
+        st.serviceTier = tier;
+        if (st._serviceTierExpected) {
+          st._serviceTierExpected.fallback = tier;
+        }
+        if (effortExpected && st._effortExpected === effortExpected) {
+          st._effortExpected.fallback = compatibleEffort;
+        }
+        if (st._serviceTierPatchSeq !== seq) return false;
+        if (ownsIntent()) {
+          this.effort = compatibleEffort;
+          this.serviceTier = tier;
+          this.toast(this.t(tier === "fast" ? "service_tier.on" : "service_tier.off"), "info", 1800);
+        }
+        return true;
+      } catch (_) {
+        if (this.tabState[sid] !== st || st._serviceTierPatchSeq !== seq) return false;
+        const fallback = expected.fallback;
+        const rollsBackEffort = !!(effortExpected
+          && st._effortPatchSeq === companionEffortSeq
+          && st._effortExpected === effortExpected);
+        abandon();
+        const actual = this.sessions.find(s => s.id === sid);
+        if (actual) {
+          if (rollsBackEffort) actual.effort = effortExpected.fallback;
+          actual.service_tier = fallback;
+        }
+        st.serviceTier = fallback;
+        if (this.currentId === sid) this.serviceTier = fallback;
+        if (ownsIntent()) this.toast(this.t("service_tier.failed"), "error");
         return false;
       }
     },
@@ -5632,27 +7708,47 @@ function portal() {
     // forever — we mutate in place so Alpine's reactivity stays bound.
     _blankTabState() {
       return {
+        // One chronological normalized repository. messageRange owns the
+        // revealed slice and the matching server coordinates; render-only
+        // virtualization is layered over that slice below.
         messages: [],
+        messageRange: {
+          visibleStart: 0,
+          visibleEnd: 0,
+          offset: 0,
+          total: 0,
+          preTotal: 0,
+          order: "normal",
+          generation: "",
+        },
         messagesReady: true,
         messagesLoading: false,
-        historyGeneration: "",
-        // Bubble offsets are meaningful only inside one server order. Normal
-        // tail loads use the active chain; outline/around windows use full
-        // file order (including pre-compact history).
-        _historyOrder: "normal",
-        _hasServerLater: false,
+        // Visual ownership for a foreground transcript transition. Canonical
+        // response ownership remains separate in _historyReplaceOwner/_historyEpoch.
+        transcriptLoadGeneration: 0,
+        transcriptLoadPhase: "idle",
+        runtimeUiRevision: "",
         // Monotonic per-tab sequence for optimistic/live messages. Historical
         // envelopes use transcript identity; live keys never depend on array index.
         _nextLiveKey: 1,
-        // Newer half of the bounded bidirectional window. Chronological order is
-        // always: _earlierMessages + messages + _laterMessages.
-        _laterMessages: [],
-        // Composer state is intentionally memory-only. Closing/deleting the tab
-        // drops this object; savePrefs never serializes it, so refresh does too.
+        // Render-only coordinates over messageRange's visible slice.
+        _virtualStart: -1,
+        _virtualEnd: -1,
+        _virtualHeights: Object.create(null),
+        _virtualSyncFrame: 0,
+        _virtualForceTail: false,
+        _virtualRevision: 0,
+        // Attachments/controllers stay memory-only; text is restored from the
+        // browser-local per-session draft store by _ensureTabState().
         draft: {
           input: "",
+          // False until _activateComposerState mirrors this slot into the
+          // root textarea. Prevents a second refresh during cold boot from
+          // copying the still-empty root input over a recovered draft.
+          _activated: false,
           pendingImages: [],
           pendingDocs: [],
+          pendingQuotes: [],
           _historyIndex: -1,
           _historyDraft: "",
           _sendWaitingForUpload: false,
@@ -5667,11 +7763,51 @@ function portal() {
                          context_limit_is_estimate: true,
                          context_is_estimate: true },
         streaming: false,
+        // Per-session transport/runtime startup state. This is deliberately
+        // separate from transcriptLoadPhase: an admitted turn keeps resident
+        // history visible and only changes the lightweight pending footer.
+        streamPhase: "",
         // Main ResultMessage may arrive while SDK-native background Agent/Bash
         // tasks keep running. This is a busy state without a live SSE until a
         // task settlement opens a continuation broadcast.
         backgroundActive: false,
         backgroundTaskCount: 0,
+        // A detached task still belongs to the pre-rollover runtime. The
+        // visible successor can run foreground turns independently while this
+        // separate counter keeps the inherited task card/footer live.
+        inheritedBackgroundOwner: "",
+        inheritedBackgroundTaskCount: 0,
+        // One coordinator owns every asynchronous read/retry for this session.
+        // Reasons are explicit and deduplicated; at most one handler may run, so
+        // active probes, continuation discovery and canonical adoption cannot
+        // race each other into duplicate reconnects or stale history swaps.
+        sessionSync: {
+          pending: Object.create(null),
+          timer: null,
+          inFlight: null,
+          epoch: 0,
+          backgroundTicksLeft: 0,
+          inheritedTicksLeft: 0,
+          inheritedSourceSid: "",
+          canonicalStartedAt: 0,
+        },
+        _backgroundHandoffPromise: null,
+        // Runtime rollover replaces the source tabState while a queue POST can
+        // still be in flight. Keep a primitive lineage in both directions so
+        // that send's finally block can finish against the successor instead
+        // of leaving its cloned composer locked (and its submitted text live).
+        _backgroundSuccessorSid: "",
+        _handoffSourceSid: "",
+        // A user send owns the composer until the prompt is durably accepted
+        // by either the turn endpoint or the server-side queue.  Background
+        // runtime rollover can take seconds on a long transcript; without a
+        // per-composer claim every Enter during that wait submits the same
+        // still-visible draft again.
+        _composerSubmitToken: null,
+        // Human-readable phase for the unique composer claim above. The token
+        // owns exclusion; this phase only explains that ownership to the user.
+        _composerSubmitPhase: "",
+        _backgroundHandoffScheduled: false,
         // A background task can settle before Claude starts its automatic
         // follow-up reaction. Keep the transport attached, but suppress the
         // generic running footer during that idle protocol gap.
@@ -5682,8 +7818,8 @@ function portal() {
         parentTurnId: "",
         lastEventSeq: 0,
         es: null,
-        // Deduplicate stop taps while the interrupt request is in flight.
-        _stopping: false,
+        // Exact immutable backend turn whose interrupt is still settling.
+        _stoppingTurnId: "",
         // Abort the POST /stream/start ticket request when Stop is clicked
         // before EventSource exists. Without this, the backend has no active
         // turn/client to interrupt yet and the reply starts after Stop.
@@ -5695,6 +7831,8 @@ function portal() {
         _streamStartedAt: 0,
         _streamRichRenderCount: 0,
         _streamPlainRenderCount: 0,
+        _deferredStreamRich: [],
+        _deferredStreamRichHandle: null,
         _lastSseActivity: 0,
         _stallWatch: null,
         _serverActiveObserved: false,
@@ -5703,27 +7841,45 @@ function portal() {
         // list echoes the same state, so an in-flight stale response cannot
         // relight the tab's running dot for another poll interval.
         _sessionActivityExpected: null,
-        _streamHealthProbe: null,
         _reconnectTimer: null,
-        _canonicalResyncTimer: null,
         _canonicalResyncPending: false,
+        // Per-session permission mirror. The active tab copies this primitive
+        // into root `permission`; background tabs never read another tab's
+        // selector value.
+        permission: "",
+        effort: "auto",
+        serviceTier: "",
+        _permissionChangePending: false,
         _permissionPatchSeq: 0,
+        _modelPatchSeq: 0,
         _effortPatchSeq: 0,
+        _serviceTierPatchSeq: 0,
         _thinkingPatchSeq: 0,
         _queueSyncSeq: 0,
         _queueAppliedSeq: 0,
+        _queueRevision: 0,
         _permissionExpected: null,
+        _modelExpected: null,
         _effortExpected: null,
+        _serviceTierExpected: null,
         _thinkingExpected: null,
-        _effortPatchTail: null,
+        _runtimeSettingsGeneration: 0,
+        _runtimeSettingPatchTail: null,
         _permissionPatchTail: null,
         _thinkingPatchTail: null,
         _loaded: false,   // set true after first loadSession populates messages
+        // Canonical history installation watermark. Unlike messages.length this
+        // never advances for optimistic/live bubbles, so a non-empty pane can
+        // still detect that the server has committed a newer missing suffix.
+        _installedCanonicalCount: 0,
         _seenUpdated: undefined,
         _reconcileTargetUpdated: 0,
-        _reconcilePromise: null,
-        _reconcileRetryTimer: null,
+        _reconcileRetryN: 0,
         _pendingExternalUpdate: false,
+        // A Result boundary may race with the next stream taking ownership of
+        // the same pane. Retain the latest completion check until an owner-free
+        // moment instead of silently consuming the reconciliation request.
+        _pendingCompletedTurnSync: null,
         atBottom: true,
         scrollTop: 0,
         _userScrollAt: 0,
@@ -5744,6 +7900,11 @@ function portal() {
         // quota/auth error and confuse the user). Cleared by explicit
         // resume-queue or discard-queue actions on the failed user bubble.
         _queuePaused: false,
+        // Durable queue mutations are async.  Track them per action/item so a
+        // double-click cannot issue duplicate DELETE/resume requests, and so
+        // an edit is never copied back into the composer unless the server
+        // actually removed the queued original.
+        _queueMutating: {},
         // True only during _attachToServerTurn's poll window (between a turn's
         // done and the server starting the next queued turn) — suppresses the
         // idle "Queue waiting" banner so it doesn't flash mid-drain.
@@ -5757,48 +7918,32 @@ function portal() {
         // True while an async _fetchTabUsage request is in flight for this
         // session — prevents concurrent duplicate fetches from piling up.
         _usageFetching: false,
-        // Lazy-load stash: older messages from this session that haven't
-        // been rendered yet. Populated by loadSession() when history
-        // exceeds INITIAL_LOAD; drained in batches by loadEarlierMessages.
-        // mdRender on these is deferred — they hold raw text only.
-        _earlierMessages: [],
-        // True iff _earlierMessages is non-empty — drives the "Load earlier"
-        // button visibility.
         _hasMoreHistory: false,
-        // True iff the absolute MAX_TOTAL cap kicked in during loadSession
-        // (sessions with thousands of messages). Shows a hint that not
-        // every message is reachable from the UI, full history is in JSONL.
         _truncatedFromTop: false,
-        // Backend windowing cursor: index (in the full server-side bubble
-        // chain) of the OLDEST bubble currently held in memory — i.e. the
-        // first bubble of the in-memory contiguous block (messages[] is the
-        // tail of that block; _earlierMessages is its head). After a
-        // `?tail=N` load this is the server's reported `offset`. >0 means
-        // older bubbles still live on the server and can be paged in via
-        // _fetchOlderWindow. 0 means we hold history back to the start.
-        _loadedOffset: 0,
-        // Total bubble count in the full server-side chain (server `total`),
-        // so earlierMessageCount() can show how many older messages exist
-        // beyond what's in memory.
-        _total: 0,
-        // Server `pre_total`: bubbles stranded BEFORE the root of the chain we
-        // are reading — i.e. everything from before a `/compact` (or a fork).
-        // They are not counted in `_total` and not reachable by decrementing
-        // `_loadedOffset`, because they sit in a different order (full) whose
-        // coordinates don't line up with normal's. Non-zero here is the only
-        // signal that "Load earlier" still has somewhere to go once
-        // `_loadedOffset` hits 0; _switchToFullOrder() does the crossing.
-        _preTotal: 0,
-        // True while an async backend older-window fetch is in flight, so
-        // rapid "Load earlier" clicks don't fire duplicate requests.
+        _loadingEarlier: false,
+        // Set when an explicit "Load earlier" request fails; the button remains
+        // available so the reader can retry without losing the current window.
+        _historyHydrationError: false,
+        _lastVirtualScrollTop: 0,
+        _lastVirtualScrollAt: 0,
+        _virtualScrollVelocity: 0,
+        _virtualScrollDirection: 0,
+        // Single-flight guards for older/newer server windows.
         _fetchingOlder: false,
         _fetchingLater: false,
+        // History responses may complete out of order on the same tab. Replacing
+        // requests advance the epoch so older/later page responses cannot write
+        // stale coordinates into a newer canonical repository.
+        _historyRequestSeq: 0,
+        _historyReplaceOwner: 0,
+        _historyEpoch: 0,
       };
     },
     _ensureTabState(id) {
       if (!this.tabState[id]) {
         this.tabState[id] = this._blankTabState();
         this.tabState[id]._sid = id;
+        this.tabState[id].draft.input = this._consumePersistedChatDraft(id);
         // The queue now lives server-side (sessions/{sid}.queue.json). We do
         // NOT pull it here — _ensureTabState is called synchronously all over
         // the place and shouldn't fire a fetch each time. The queue mirror is
@@ -5807,21 +7952,347 @@ function portal() {
       }
       const st = this.tabState[id];
       if (!st._sid) st._sid = id;
-      if (!Array.isArray(st._laterMessages)) st._laterMessages = [];
+      if (!st.messageRange || typeof st.messageRange !== "object") {
+        st.messageRange = {
+          visibleStart: 0, visibleEnd: st.messages.length,
+          offset: 0, total: st.messages.length, preTotal: 0,
+          order: "normal", generation: "",
+        };
+      }
+      const range = st.messageRange;
+      if (!Number.isInteger(range.visibleStart)) range.visibleStart = 0;
+      if (!Number.isInteger(range.visibleEnd)) range.visibleEnd = st.messages.length;
+      range.visibleStart = Math.max(0, Math.min(range.visibleStart, st.messages.length));
+      range.visibleEnd = Math.max(
+        range.visibleStart, Math.min(range.visibleEnd, st.messages.length));
+      if (!Number.isInteger(range.offset)) range.offset = 0;
+      if (!Number.isInteger(range.total)) range.total = st.messages.length;
+      if (!Number.isInteger(range.preTotal)) range.preTotal = 0;
+      if (range.order !== "full") range.order = "normal";
+      if (typeof range.generation !== "string") range.generation = "";
       if (st.messagesReady === undefined) st.messagesReady = true;
       if (st.messagesLoading === undefined) st.messagesLoading = false;
-      if (st.historyGeneration === undefined) st.historyGeneration = "";
-      if (st._historyOrder !== "full") st._historyOrder = "normal";
-      if (st._hasServerLater === undefined) st._hasServerLater = false;
+      if (!Number.isInteger(st.transcriptLoadGeneration)) {
+        st.transcriptLoadGeneration = 0;
+      }
+      if (!["idle", "fetching", "mounting", "settling", "error"]
+          .includes(st.transcriptLoadPhase)) {
+        st.transcriptLoadPhase = "idle";
+      }
+      if (st.runtimeUiRevision === undefined) st.runtimeUiRevision = "";
       if (st._fetchingLater === undefined) st._fetchingLater = false;
+      if (!Number.isInteger(st._historyRequestSeq)) st._historyRequestSeq = 0;
+      if (!Number.isInteger(st._historyReplaceOwner)) st._historyReplaceOwner = 0;
+      if (!Number.isInteger(st._historyEpoch)) st._historyEpoch = 0;
       if (!Number.isInteger(st._nextLiveKey)) st._nextLiveKey = 1;
+      if (!Number.isInteger(st._virtualStart)) st._virtualStart = -1;
+      if (!Number.isInteger(st._virtualEnd)) st._virtualEnd = -1;
+      if (!st._virtualHeights || typeof st._virtualHeights !== "object") {
+        st._virtualHeights = Object.create(null);
+      }
+      if (!Number.isFinite(st._virtualSyncFrame)) st._virtualSyncFrame = 0;
+      if (st._virtualForceTail === undefined) st._virtualForceTail = false;
+      if (!Number.isFinite(st._virtualRevision)) st._virtualRevision = 0;
       if (st.activeTurnId === undefined) st.activeTurnId = "";
       if (st.parentTurnId === undefined) st.parentTurnId = "";
       if (!Number.isFinite(st.lastEventSeq)) st.lastEventSeq = 0;
+      if (st.permission === undefined) st.permission = "";
+      if (st.effort === undefined) st.effort = "auto";
+      if (st.serviceTier === undefined) st.serviceTier = "";
+      if (!Number.isFinite(st._modelPatchSeq)) st._modelPatchSeq = 0;
+      if (st._modelExpected === undefined) st._modelExpected = null;
+      if (!Number.isFinite(st._serviceTierPatchSeq)) st._serviceTierPatchSeq = 0;
+      if (st._serviceTierExpected === undefined) st._serviceTierExpected = null;
+      if (!Number.isFinite(st._runtimeSettingsGeneration)) {
+        st._runtimeSettingsGeneration = 0;
+      }
+      if (st._runtimeSettingPatchTail === undefined) st._runtimeSettingPatchTail = null;
+      if (st._permissionChangePending === undefined) {
+        st._permissionChangePending = false;
+      }
       if (st._sessionActivityExpected === undefined) {
         st._sessionActivityExpected = null;
       }
+      if (!Number.isFinite(Number(st._installedCanonicalCount))) {
+        st._installedCanonicalCount = 0;
+      }
+      if (st._pendingCompletedTurnSync === undefined) {
+        st._pendingCompletedTurnSync = null;
+      }
+      if (!Number.isFinite(Number(st.inheritedBackgroundTaskCount))) {
+        st.inheritedBackgroundTaskCount = 0;
+      }
+      if (st.inheritedBackgroundOwner === undefined) {
+        st.inheritedBackgroundOwner = "";
+      }
+      if (!st.sessionSync || typeof st.sessionSync !== "object") {
+        st.sessionSync = {
+          pending: Object.create(null), timer: null, inFlight: null, epoch: 0,
+          backgroundTicksLeft: 0, inheritedTicksLeft: 0, inheritedSourceSid: "",
+          canonicalStartedAt: 0,
+        };
+      }
+      if (!st.sessionSync.pending || typeof st.sessionSync.pending !== "object") {
+        st.sessionSync.pending = Object.create(null);
+      }
+      if (st._backgroundHandoffPromise === undefined) {
+        st._backgroundHandoffPromise = null;
+      }
+      if (st._backgroundSuccessorSid === undefined) {
+        st._backgroundSuccessorSid = "";
+      }
+      if (st._handoffSourceSid === undefined) st._handoffSourceSid = "";
+      if (st._composerSubmitToken === undefined) st._composerSubmitToken = null;
+      if (st._composerSubmitPhase === undefined) st._composerSubmitPhase = "";
+      if (st._backgroundHandoffScheduled === undefined) {
+        st._backgroundHandoffScheduled = false;
+      }
+      if (!Array.isArray(st.draft.pendingQuotes)) st.draft.pendingQuotes = [];
+      if (!st._queueMutating || typeof st._queueMutating !== "object") {
+        st._queueMutating = {};
+      }
       return st;
+    },
+    _sessionSyncNeedsVisibility(reason) {
+      return [
+        "active_probe", "busy_probe", "queue_attach",
+        "background_continuation", "inherited_tasks", "stream_health",
+        "transport_retry", "canonical_replay",
+      ].includes(reason);
+    },
+    _resumeVisibleSessionSync() {
+      if (typeof document !== "undefined"
+          && document.visibilityState !== "visible") return;
+      const now = Date.now();
+      for (const [sid, st] of Object.entries(this.tabState || {})) {
+        const sync = st && st.sessionSync;
+        if (!sync) continue;
+        for (const request of Object.values(sync.pending || {})) {
+          if (this._sessionSyncNeedsVisibility(request.reason)) {
+            request.dueAt = Math.min(Number(request.dueAt) || now, now);
+          }
+        }
+        if (sync.inheritedSourceSid && sync.inheritedTicksLeft > 0) {
+          this._requestSessionSync(sid, "inherited_tasks", {
+            sourceSid: sync.inheritedSourceSid,
+          });
+        }
+        if (sync.backgroundTicksLeft > 0
+            && (st.backgroundActive || this._bgHasRunningCard(sid))) {
+          this._requestSessionSync(sid, "background_continuation");
+        }
+        if (st._canonicalResyncPending) {
+          this._requestSessionSync(sid, "canonical_replay", {
+            minimumWaitMs: 0,
+          });
+        }
+        this._scheduleSessionSync(sid, st);
+      }
+      const sid = this.currentId;
+      const st = sid && this.tabState && this.tabState[sid];
+      if (!st) return;
+      if (st.streaming || st.es) {
+        this._requestSessionSync(sid, "stream_health", { ownerEs: st.es });
+      } else {
+        this._requestSessionSync(sid, "active_probe");
+      }
+    },
+    _requestSessionSync(sid, reason, options = {}) {
+      const st = sid && this.tabState[sid];
+      if (!st || !reason) return Promise.resolve(false);
+      const sync = st.sessionSync;
+      const historyLoadKey = reason === "history_load"
+        ? JSON.stringify({
+            full: !!options.loadOptions?.full,
+            quiet: !!options.loadOptions?.quiet,
+            probeActive: options.loadOptions?.probeActive,
+          })
+        : "";
+      if (reason === "history_load" && sync.inFlight?.reason === reason
+          && sync.inFlight.historyLoadKey === historyLoadKey) {
+        return new Promise(resolve => sync.inFlight.waiters.push(resolve));
+      }
+      const delayMs = Math.max(0, Number(options.delayMs) || 0);
+      const dueAt = Date.now() + delayMs;
+      return new Promise(resolve => {
+        const current = sync.pending[reason];
+        if (current) {
+          current.options = { ...current.options, ...options };
+          current.dueAt = Math.min(current.dueAt, dueAt);
+          current.waiters.push(resolve);
+        } else {
+          sync.pending[reason] = {
+            reason, options: { ...options }, dueAt, waiters: [resolve],
+          };
+        }
+        this._scheduleSessionSync(sid, st);
+      });
+    },
+    _scheduleSessionSync(sid, st) {
+      if (!sid || !st || this.tabState[sid] !== st) return;
+      const sync = st.sessionSync;
+      if (sync.inFlight) return;
+      const pending = Object.values(sync.pending);
+      if (!pending.length) {
+        if (sync.timer) clearTimeout(sync.timer);
+        sync.timer = null;
+        return;
+      }
+      const next = pending.reduce((best, item) => (
+        !best || item.dueAt < best.dueAt ? item : best
+      ), null);
+      if (sync.timer) clearTimeout(sync.timer);
+      sync.timer = setTimeout(
+        () => this._runSessionSync(sid, st),
+        Math.max(0, next.dueAt - Date.now()),
+      );
+    },
+    async _runSessionSync(sid, st) {
+      if (!sid || !st || this.tabState[sid] !== st) return false;
+      const sync = st.sessionSync;
+      sync.timer = null;
+      if (sync.inFlight) return false;
+      const now = Date.now();
+      const ready = Object.values(sync.pending)
+        .filter(item => item.dueAt <= now)
+        .sort((a, b) => a.dueAt - b.dueAt);
+      if (!ready.length) {
+        this._scheduleSessionSync(sid, st);
+        return false;
+      }
+      const request = ready[0];
+      if (this._sessionSyncNeedsVisibility(request.reason)
+          && typeof document !== "undefined"
+          && document.visibilityState !== "visible") {
+        request.dueAt = Date.now() + 2000;
+        this._scheduleSessionSync(sid, st);
+        return false;
+      }
+      delete sync.pending[request.reason];
+      const epoch = sync.epoch;
+      const controller = new AbortController();
+      const requestOptions = { ...request.options, signal: controller.signal };
+      const operation = (async () => {
+        switch (request.reason) {
+          case "active_probe":
+            return await this._probeActiveTurn(sid, st, requestOptions);
+          case "busy_probe":
+            return await this._probeSessionBusy(sid, st, requestOptions);
+          case "queue_attach":
+            return await this._runQueueAttach(sid, st, requestOptions);
+          case "background_continuation":
+            return await this._pollBackgroundContinuation(sid, st, requestOptions);
+          case "inherited_tasks":
+            return await this._pollInheritedTasks(sid, st, requestOptions);
+          case "history_revision":
+            return await this._runHistoryRevisionSync(sid, st, requestOptions);
+          case "completed_turn":
+            return await this._runCompletedTurnSync(sid, st, requestOptions);
+          case "stream_health":
+            return await this._runStreamHealthSync(sid, st, requestOptions);
+          case "transport_retry":
+            return typeof requestOptions.run === "function"
+              ? await requestOptions.run(controller.signal) : false;
+          case "canonical_replay":
+            return await this._runCanonicalReplaySync(sid, st, requestOptions);
+          case "history_load":
+            return await this._runSessionHistoryLoad(sid, st, requestOptions);
+          default:
+            return false;
+        }
+      })();
+      let deadlineTimer = null;
+      let cancelResolve = null;
+      const cancelled = new Promise(resolve => { cancelResolve = resolve; });
+      const onAbort = () => cancelResolve(false);
+      controller.signal.addEventListener("abort", onAbort, { once: true });
+      const configuredDeadline = Math.max(
+        1, Number(this.SESSION_SYNC_DEADLINE_MS) || 35000,
+      );
+      const defaultDeadline = request.reason === "history_load"
+          && request.options.loadOptions?.full
+        ? Math.max(configuredDeadline, 90000) : configuredDeadline;
+      const deadlineMs = Math.max(
+        1,
+        Number(request.options.deadlineMs)
+          || defaultDeadline,
+      );
+      const deadline = new Promise(resolve => {
+        deadlineTimer = setTimeout(() => {
+          try { controller.abort(); } catch (_) {}
+          resolve(false);
+        }, deadlineMs);
+      });
+      const task = Promise.race([operation, cancelled, deadline]);
+      const historyLoadKey = request.reason === "history_load"
+        ? JSON.stringify({
+            full: !!request.options.loadOptions?.full,
+            quiet: !!request.options.loadOptions?.quiet,
+            probeActive: request.options.loadOptions?.probeActive,
+          })
+        : "";
+      sync.inFlight = {
+        reason: request.reason,
+        task,
+        controller,
+        epoch,
+        historyLoadKey,
+        waiters: request.waiters,
+      };
+      let result = false;
+      try { result = await task; }
+      catch (_) { result = false; }
+      finally {
+        if (deadlineTimer) clearTimeout(deadlineTimer);
+        controller.signal.removeEventListener("abort", onAbort);
+        if (this.tabState[sid] === st && sync.epoch === epoch
+            && sync.inFlight && sync.inFlight.task === task) {
+          sync.inFlight = null;
+        }
+        request.waiters.forEach(resolve => resolve(result));
+        if (this.tabState[sid] === st && sync.epoch === epoch) {
+          this._scheduleSessionSync(sid, st);
+        }
+      }
+      return result;
+    },
+    _cancelSessionSyncReason(st, reason) {
+      const sync = st && st.sessionSync;
+      const request = sync && sync.pending && sync.pending[reason];
+      if (!request) return;
+      delete sync.pending[reason];
+      (request.waiters || []).forEach(resolve => resolve(false));
+      if (st._sid && this.tabState[st._sid] === st) {
+        this._scheduleSessionSync(st._sid, st);
+      }
+    },
+    _disposeSessionSync(st) {
+      if (!st || !st.sessionSync) return;
+      const sync = st.sessionSync;
+      const inFlight = sync.inFlight;
+      sync.epoch += 1;
+      if (sync.timer) clearTimeout(sync.timer);
+      sync.timer = null;
+      if (inFlight && inFlight.controller) {
+        try { inFlight.controller.abort(); } catch (_) {}
+      }
+      for (const request of Object.values(sync.pending || {})) {
+        (request.waiters || []).forEach(resolve => resolve(false));
+      }
+      sync.pending = Object.create(null);
+      sync.inFlight = null;
+    },
+    async _runSessionHistoryLoad(sid, st, options = {}) {
+      if (this.tabState[sid] !== st) return false;
+      const loadOptions = { ...(options.loadOptions || options) };
+      delete loadOptions.delayMs;
+      delete loadOptions.loadOptions;
+      const ok = await this.loadSession(sid, loadOptions);
+      if (ok && this.tabState[sid] === st) {
+        st._loaded = true;
+        st._pendingExternalUpdate = false;
+      }
+      return !!ok;
     },
 
     // ===== Per-session message queue =====
@@ -5836,43 +8307,129 @@ function portal() {
       if (!sid) return false;
       const st = this.tabState[sid];
       return !!(this.isTabStreaming(sid)
-        || (st && st.compacting));
+        || (st && (st.compacting || st.backgroundActive || st._draining
+          || (st.pendingQueue && st.pendingQueue.length))));
+    },
+    composerClaimed(sid = this.currentId) {
+      const st = sid && this.tabState && this.tabState[sid];
+      return !!(st && st._composerSubmitToken);
+    },
+    composerStatusReason(sid = this.currentId) {
+      const zh = this.lang === "zh";
+      if (this.workspaceSwitching) {
+        return zh ? "正在切换工作区" : "Switching workspace";
+      }
+      if (!sid) return zh ? "请先打开会话" : "Open a session first";
+      if (!this.availableModels || !this.availableModels.length) {
+        return !this._modelsLoaded
+          ? (zh ? "正在加载可用模型" : "Loading available models")
+          : (zh ? "请先配置可用模型" : "Configure an available model first");
+      }
+      const st = this.tabState && this.tabState[sid];
+      if (!st) return zh ? "正在准备会话" : "Preparing the session";
+      if (st._stoppingTurnId) {
+        return zh ? "正在中断上一条任务" : "Stopping the previous turn";
+      }
+      if (st._permissionChangePending) return this.t("perm.switching");
+      if (this.runtimeSettingsPending(sid)) {
+        return zh ? "正在保存运行设置" : "Saving runtime settings";
+      }
+      const draft = st.draft || {};
+      const images = draft.pendingImages || [];
+      const docs = draft.pendingDocs || [];
+      if (draft._sendWaitingForUpload
+          || images.some(item => item.uploading)
+          || docs.some(item => item.uploading)) {
+        return zh ? "附件仍在上传" : "Attachments are still uploading";
+      }
+      if (images.some(item => item.error || !item.id)
+          || docs.some(item => item.error || !item.id)) {
+        return zh
+          ? "附件上传失败，请移除失败项或重新上传"
+          : "An attachment failed to upload; remove or re-upload it";
+      }
+      return "";
+    },
+    composerDisabledReason(sid = this.currentId) {
+      const status = this.composerStatusReason(sid);
+      if (status) return status;
+      const st = this.tabState[sid];
+      const draft = st.draft || {};
+      const hasContent = !!(String(draft.input || "").trim()
+        || (draft.pendingQuotes || []).length
+        || (draft.pendingImages || []).length
+        || (draft.pendingDocs || []).length);
+      if (!hasContent) {
+        return this.lang === "zh" ? "输入消息后即可发送" : "Type a message to send";
+      }
+      return "";
+    },
+    sendButtonHint(sid) {
+      if (this.composerClaimed(sid)) return this.t("btn.send");
+      const disabled = this.composerDisabledReason(sid);
+      if (disabled) return disabled;
+      return this._isBusy(sid) ? this.t("queue.button_hint") : this.t("btn.send");
+    },
+    _setComposerClaimPhase(st, token, phase) {
+      if (st && st._composerSubmitToken === token) {
+        st._composerSubmitPhase = phase || "submitting";
+      }
+    },
+    _releaseComposerClaim(token) {
+      if (!token) return;
+      for (const st of Object.values(this.tabState || {})) {
+        if (!st || st._composerSubmitToken !== token) continue;
+        st._composerSubmitToken = null;
+        st._composerSubmitPhase = "";
+      }
     },
     async _confirmSessionBusy(sid, st = this.tabState[sid]) {
       if (!sid) return false;
-      // A pending SDK background task no longer blocks a prompt: the backend
-      // pump owns the session stream, so the task's completion just arrives
-      // later as its own message instead of colliding with this turn.
-      if (st && (st.streaming || st.compacting)) return true;
+      // These are locally authoritative busy states. In particular, a
+      // background watcher cannot accept a foreground turn on its source
+      // runtime, and the durable queue endpoint owns the settle-vs-enqueue
+      // race. Probing /active first added a full request (and sometimes an
+      // 8-second timeout on a loaded server) before the queue POST, making
+      // Enter appear inert even though the local state already knew the
+      // answer. A migrated/draining queue also remains FIFO: never launch a
+      // direct turn in the short child handoff gap.
+      if (st && (st.streaming || st.compacting || st.backgroundActive
+          || st._draining || (st.pendingQueue && st.pendingQueue.length))) {
+        return true;
+      }
       const session = (this.sessions || []).find(s => s.id === sid);
-      if (!session || !session.active) return false;
+      // A runtime predecessor is hidden from the refreshed session list once
+      // another browser has already rolled it over.  The still-open local tab
+      // nevertheless retains its background watcher state and must probe the
+      // source instead of treating the missing row as idle; otherwise a
+      // second device can try to start a foreground turn on the old CLI.
+      if ((!session || !session.active) && !(st && st.backgroundActive)) {
+        return false;
+      }
       // session.active is a polled cache and can remain true for one response
       // after a turn's final drain already ran. Confirm it before enqueueing;
       // otherwise an idle queue item can be stranded with no turn left to drain.
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 8000);
+      return await this._requestSessionSync(sid, "busy_probe", { session });
+    },
+    async _probeSessionBusy(sid, st, options = {}) {
+      const session = options.session;
       try {
-        const r = await fetch("/api/chat/sessions/" + sid + "/active", {
-          headers: this.hdr(), signal: controller.signal,
-        });
-        if (!r.ok) return true; // conservative on an unknown server state
+        const r = await this._fetchWithDeadline(
+          "/api/chat/sessions/" + sid + "/active",
+          { headers: this.hdr(), signal: options.signal },
+        );
+        if (!r.ok) return true;
         const status = await r.json();
+        if (this.tabState[sid] !== st) return true;
         const active = !!status.active;
-        if (st && status.background) {
+        if (status.background) {
           this._setBackgroundTaskActive(
             sid, active, status.started_at, status.background_tasks_pending);
         }
         if (!active && session) session.active = false;
-        // `active` is the union of "a turn is streaming" and "a background
-        // task is pending"; the response distinguishes them via `background`.
-        // Only the former blocks a prompt — keep the task card and footer
-        // alive (done above) without parking the message on the queue.
-        if (status.background) return false;
-        return active;
+        return status.background ? true : active;
       } catch (_) {
         return true;
-      } finally {
-        clearTimeout(timeout);
       }
     },
     // True when the CSS @media single-pane mobile layout is active —
@@ -5888,8 +8445,15 @@ function portal() {
                  && window.matchMedia("(pointer: coarse) and (max-height: 500px)").matches);
     },
     setMobileTab(next) {
-      if (!["files", "preview", "chat"].includes(next) || next === this.mobileTab) return;
+      if (!["files", "preview", "chat"].includes(next)) return;
+      if (this.activity.moveMenu.show) this.closeActivityMoveMenu();
+      if (next === this.mobileTab) return;
       const previous = this.mobileTab;
+      if ((previous === "preview" && next !== "preview")
+          || (previous === "chat" && next !== "chat"
+              && this.previewQuote.source === "chat")) {
+        this.dismissTransientPreviewQuote(true);
+      }
       const ownerPath = this.selected;
       const ownerLoadSeq = this._previewLoadSeq;
       const tabSeq = this._mobileTabSeq = (this._mobileTabSeq || 0) + 1;
@@ -5908,7 +8472,6 @@ function portal() {
       const deferChat = next === "chat" && this._isMobileLayout() && chatLen > 0;
       if (deferChat) {
         chatState.messagesReady = false;
-        this.messagesReady = false;
       }
       if (previous === "preview" && next !== "preview") {
         this._capturePreviewViewState(ownerPath);
@@ -5927,7 +8490,6 @@ function portal() {
           if (this._mobileTabSeq !== tabSeq || this.mobileTab !== "chat"
               || this.currentId !== target || this.tabState[target] !== chatState) return;
           chatState.messagesReady = true;
-          this.messagesReady = true;
           this._afterPaint(() => {
             if (this._mobileTabSeq === tabSeq && this.mobileTab === "chat"
                 && this.currentId === target) {
@@ -5950,33 +8512,39 @@ function portal() {
     // read-only mirror in st.pendingQueue + st._queuePaused for rendering and
     // refreshes it via _syncQueueFromServer on load / tab-activate / after any
     // turn or mutation. Every mutation below hits an endpoint then re-syncs.
-    async _syncQueueFromServer(sid) {
+    async _syncQueueFromServer(sid, options = {}) {
       if (!sid) return;
       const st = this._ensureTabState(sid);
       const seq = ++st._queueSyncSeq;
       let data;
       try {
-        const r = await fetch("/api/chat/sessions/" + sid + "/queue",
-                               { headers: this.hdr() });
+        const r = await this._fetchWithDeadline(
+          "/api/chat/sessions/" + sid + "/queue",
+          {
+            headers: this.hdr(), cache: "no-store", signal: options.signal,
+          },
+        );
         if (!r.ok) return;   // graceful: leave the current mirror untouched
         data = await r.json();
       } catch (_e) { return; }
       if (this.tabState[sid] !== st || seq < st._queueAppliedSeq) return;
+      const revision = Math.max(0, Number(data.revision) || 0);
+      if (revision < (Number(st._queueRevision) || 0)) return;
       st._queueAppliedSeq = seq;
-      st.pendingQueue = (data.items || []).map(it => {
+      st._queueRevision = revision;
+      const pendingQueue = (data.items || []).map(it => {
         // FIX ③: the server now resolves each upload id against its in-memory
         // store and returns `attachments: [{id, kind, name, mime, available}]`.
-        // Split them into renderable image thumbnails vs doc chips. `src`
-        // points at the queued-image endpoint (in-memory, token in query so a
-        // bare <img> can load it). Expired ids (available:false) are counted
-        // so the bubble can show "附件已过期".
+        // Split them into renderable image thumbnails vs doc chips. A bare
+        // <img> cannot add X-Auth-Token, so each image gets a short-lived,
+        // id-bound resource ticket below. Expired ids (available:false) are
+        // counted so the bubble can show "附件已过期".
         const atts = it.attachments || [];
-        const tok = encodeURIComponent(this.token || "");
         const images = atts
           .filter(a => a.available && a.kind === "image")
           .map(a => ({
             id: a.id, mime: a.mime || "",
-            src: `/api/chat/queued-image/${a.id}?token=${tok}`,
+            src: "",
           }));
         const docs = atts
           .filter(a => a.available && a.kind !== "image")
@@ -5988,6 +8556,10 @@ function portal() {
         return {
           id: it.id,
           text: it.text || "",
+          displayText: Object.prototype.hasOwnProperty.call(it, "display_text")
+            ? (it.display_text || "") : (it.text || ""),
+          pendingQuotes: Array.isArray(it.selection_quotes)
+            ? it.selection_quotes : [],
           image_ids: it.image_ids || "",
           hasAttach: !!((it.image_ids || "").trim()),
           images,
@@ -5998,14 +8570,61 @@ function portal() {
           enqueuedAt: it.enqueued_at || Date.now(),
         };
       });
+      st.pendingQueue = pendingQueue;
+      Promise.all(pendingQueue.flatMap(item =>
+        item.images.map(async im => {
+          try {
+            im.src = await this._mintChatResourceUrl("queued-image", {
+              attachment_id: im.id,
+            });
+          } catch (_) {
+            im.unavailable = true;
+          }
+        }))).then(() => {
+        if (this.tabState[sid] !== st || st._queueAppliedSeq !== seq) return;
+        for (const item of pendingQueue) {
+          const failed = item.images.filter(im => !im.src).length;
+          item.images = item.images.filter(im => im.src);
+          item.expiredCount += failed;
+        }
+        st.pendingQueue = [...pendingQueue];
+      });
       st._queuePaused = !!data.paused;
     },
     _currentQueueLen() {
-      const st = this.tabState[this.currentId];
-      return (st && st.pendingQueue) ? st.pendingQueue.length : 0;
+      return this.activeSessionPane().pendingQueue.length;
+    },
+    queueActionBusy(sid, key) {
+      const st = sid && this.tabState[sid];
+      return !!(st && st._queueMutating && st._queueMutating[key]);
+    },
+    _setQueueActionBusy(st, key, busy) {
+      if (!st || !key) return;
+      const next = { ...(st._queueMutating || {}) };
+      if (busy) next[key] = true;
+      else delete next[key];
+      // Replace the object so Alpine sees keys introduced after mount.
+      st._queueMutating = next;
+    },
+    async _runQueueMutation(sid, st, key, url, options, failureZh, failureEn) {
+      if (!sid || !st || this.tabState[sid] !== st
+          || this.queueActionBusy(sid, key)) return null;
+      this._setQueueActionBusy(st, key, true);
+      try {
+        const r = await fetch(url, options);
+        if (!r.ok) throw new Error(`queue mutation failed: HTTP ${r.status}`);
+        return r;
+      } catch (_e) {
+        if (this.tabState[sid] === st) {
+          this.toast(this.lang === "zh" ? failureZh : failureEn, "error", 3500);
+        }
+        return null;
+      } finally {
+        if (this.tabState[sid] === st) this._setQueueActionBusy(st, key, false);
+      }
     },
     async _enqueueMessage(sid, item) {
-      this._ensureTabState(sid);
+      const enqueueState = this._ensureTabState(sid);
       // Only ready (uploaded, error-free) attachment IDs go to the server.
       // Preview blobs aren't persisted; if these IDs expire (10 min) before
       // the server drains the item, _start_turn skips them and sends text.
@@ -6013,6 +8632,16 @@ function portal() {
         .concat((item.pendingImages || []).filter(im => im.id && !im.error).map(im => im.id))
         .concat((item.pendingDocs || []).filter(d => d.id && !d.error).map(d => d.id));
       const image_ids = ids.join(",");
+      const permission = this._normalizePermissionMode(item.permission, "");
+      const session = (this.sessions || []).find(row => row.id === sid);
+      const planReturnPermission = permission === "plan"
+        ? this._normalizePermissionMode(
+            item.plan_return_permission
+              || (session && session.plan_return_permission),
+            "",
+          )
+        : "";
+      let accepted = null;
       try {
         const r = await fetch("/api/chat/sessions/" + sid + "/queue", {
           method: "POST",
@@ -6021,7 +8650,10 @@ function portal() {
           // drain replays the turn under this mode (fixes queued messages
           // bypassing tool approval the UI said was required).
           body: JSON.stringify({ text: item.text || "", image_ids,
-                                 permission: item.permission || "" }),
+                                 display_text: item.displayText || "",
+                                 selection_quotes: item.pendingQuotes || [],
+                                 permission,
+                                 plan_return_permission: planReturnPermission }),
         });
         if (r.status === 409) {
           this.toast(this.lang === "zh"
@@ -6034,12 +8666,80 @@ function portal() {
           this.toast(this.lang === "zh" ? "加入队列失败" : "Failed to queue", "error", 3000);
           return false;
         }
+        try { accepted = await r.json(); } catch (_) { accepted = null; }
       } catch (_e) {
         this.toast(this.lang === "zh" ? "网络错误，未能入队" : "Network error — not queued",
                    "error", 3000);
         return false;
       }
-      await this._syncQueueFromServer(sid);
+      // The POST response is the durable acceptance boundary. Reflect its item
+      // immediately and reconcile in the background: waiting on a second GET
+      // can contend with the just-scheduled multi-megabyte transcript fork and
+      // make a successfully queued send look frozen for seconds.
+      // The proactive fork may have replaced `sid` while this POST was in
+      // flight. Follow the published lineage so the accepted bubble and queue
+      // revision land on the visible successor, not on an orphaned source.
+      const successorSid = String(enqueueState._backgroundSuccessorSid || "");
+      const successor = successorSid && this.tabState[successorSid];
+      const mirrorState = successor && successor._handoffSourceSid === sid
+        ? successor : (this.tabState[sid] === enqueueState ? enqueueState : null);
+      const mirrorSid = mirrorState === successor ? successorSid : sid;
+      if (mirrorState
+          && accepted && accepted.item && accepted.item.id
+          && !mirrorState.pendingQueue.some(q => q.id === accepted.item.id)) {
+        const queued = accepted.item;
+        const optimisticImages = (item.pendingImages || [])
+          .filter(im => im.id && !im.error)
+          .map(im => ({
+            id: im.id,
+            mime: im.mime || "",
+            src: im.preview || im.src || "",
+          }));
+        const optimisticDocs = (item.pendingDocs || [])
+          .filter(doc => doc.id && !doc.error)
+          .map(doc => ({
+            id: doc.id,
+            kind: doc.kind || "text",
+            name: doc.name || "file",
+          }));
+        mirrorState.pendingQueue = [
+          ...mirrorState.pendingQueue,
+          {
+            id: queued.id,
+            text: queued.text || item.text || "",
+            displayText: Object.prototype.hasOwnProperty.call(
+              queued, "display_text")
+              ? (queued.display_text || "") : (item.displayText || item.text || ""),
+            pendingQuotes: Array.isArray(queued.selection_quotes)
+              ? queued.selection_quotes : (item.pendingQuotes || []),
+            image_ids: queued.image_ids || image_ids,
+            hasAttach: !!String(queued.image_ids || image_ids).trim(),
+            images: optimisticImages,
+            docs: optimisticDocs,
+            expiredCount: 0,
+            pendingImages: [],
+            pendingDocs: [],
+            enqueuedAt: queued.enqueued_at || Date.now(),
+          },
+        ];
+        const acceptedRevision = Number(accepted.queue && accepted.queue.revision);
+        if (Number.isFinite(acceptedRevision)) {
+          mirrorState._queueRevision = Math.max(
+            Number(mirrorState._queueRevision) || 0, acceptedRevision);
+        }
+      }
+      if (mirrorState === successor) {
+        // The handoff's first attach probe may have observed the child before
+        // this POST committed. Re-arm it now; the backend owns idempotent drain
+        // and this only reconnects the visible UI to the resulting turn.
+        successor._draining = true;
+        this._syncQueueFromServer(successorSid);
+        if (this.currentId === successorSid) {
+          this.$nextTick(() => this._attachToServerTurn(successorSid, 20));
+        }
+      } else {
+        this._syncQueueFromServer(sid);
+      }
       return true;
     },
     // Post-turn / on-activate hook. The SERVER drains the queue (pops the next
@@ -6058,32 +8758,441 @@ function portal() {
       }
       this._attachToServerTurn(sid, 8, completedTurnId);
     },
+    _cloneRolloverValue(value) {
+      if (value === undefined || value === null) return value;
+      if (typeof structuredClone === "function") {
+        try { return structuredClone(value); } catch (_) {}
+      }
+      try { return JSON.parse(JSON.stringify(value)); } catch (_) { return value; }
+    },
+    _stateForDetachedSuccessor(sourceSid, childSid, sourceState, pendingCount) {
+      const child = this._blankTabState();
+      child._sid = childSid;
+      const cloneMessages = rows => (rows || []).map(row =>
+        this._cloneRolloverValue(row));
+      child.messages = cloneMessages(sourceState.messages);
+      child.messageRange = { ...sourceState.messageRange };
+      this._ensureNonEmptyMessageRange(child);
+      child.messagesReady = sourceState.messagesReady !== false;
+      child.messagesLoading = false;
+      child.runtimeUiRevision = sourceState.runtimeUiRevision || "";
+      child._truncatedFromTop = !!sourceState._truncatedFromTop;
+      child._hasMoreHistory = !!sourceState._hasMoreHistory;
+      child.sessionUsage = this._cloneRolloverValue(sourceState.sessionUsage);
+      child.permission = sourceState.permission || "";
+      child.effort = sourceState.effort || "auto";
+      child.serviceTier = sourceState.serviceTier || "";
+      child.atBottom = sourceState.atBottom !== false;
+      child.scrollTop = Number(sourceState.scrollTop) || 0;
+      // A detached successor can be created while its off-screen predecessor has
+      // tab state but no resident canonical window. Marking that empty clone as
+      // loaded makes every later tab click skip loadSession until a full refresh.
+      child._loaded = !!sourceState._loaded && child.messages.length > 0;
+      child._installedCanonicalCount = Math.max(
+        0, Number(sourceState._installedCanonicalCount) || 0);
+      child._seenUpdated = sourceState._seenUpdated;
+      child.pendingQueue = this._cloneRolloverValue(sourceState.pendingQueue || []);
+      child._queuePaused = !!sourceState._queuePaused;
+      child._draining = !!sourceState._draining || child.pendingQueue.length > 0;
+      child._handoffSourceSid = sourceSid;
+      // A send can be waiting on its durable queue POST while the runtime fork
+      // finishes. Transfer the primitive claim with the draft. Otherwise the
+      // newly visible child enables Send again with the submitted text still
+      // present, and a second Enter can enqueue a duplicate before the first
+      // POST's finally block gets a chance to run.
+      child._composerSubmitToken = sourceState._composerSubmitToken || null;
+      child._composerSubmitPhase = child._composerSubmitToken
+        ? "rollover" : "";
+      // The composer moves to the successor, but it must be a different owner
+      // object. Upload entries may hold browser File objects, so copy their
+      // arrays rather than JSON-serialising them.
+      child.draft = {
+        ...sourceState.draft,
+        pendingImages: (sourceState.draft.pendingImages || []).slice(),
+        pendingDocs: (sourceState.draft.pendingDocs || []).slice(),
+        pendingQuotes: (sourceState.draft.pendingQuotes || []).map(q => ({ ...q })),
+        _uploadControllers: new Set(sourceState.draft._uploadControllers || []),
+      };
+      child.inheritedBackgroundOwner = sourceSid;
+      child.inheritedBackgroundTaskCount = Math.max(1, Number(pendingCount) || 1);
+      // A cloned running card must keep addressing the runtime that owns it.
+      for (const message of child.messages) {
+        if (message && message.task_status
+            && message.task_status.state === "running") {
+          message.task_status = {
+            ...message.task_status,
+            owner_session_id: message.task_status.owner_session_id || sourceSid,
+          };
+        }
+      }
+      return child;
+    },
+    _claimDetachedRolloverSlot(handoff) {
+      // Stateful slash commands cannot overtake work migrated into a real
+      // successor.  A 409/settled watcher returns the source id and is not a
+      // rollover, so the slash command may retry there normally.
+      return !!(handoff && handoff.rolledOver);
+    },
+    async _handoffBackgroundSession(sourceSid, sourceState = this.tabState[sourceSid]) {
+      if (!sourceSid || !sourceState || this.tabState[sourceSid] !== sourceState) {
+        return null;
+      }
+      if (sourceState._backgroundHandoffPromise) {
+        return await sourceState._backgroundHandoffPromise;
+      }
+      const task = (async () => {
+        if (sourceState._composerSubmitToken) {
+          sourceState._composerSubmitPhase = "rollover";
+        }
+        const sourceMeta = (this.sessions || []).find(s => s.id === sourceSid) || {};
+        let response;
+        try {
+          response = await fetch(
+            `/api/chat/sessions/${encodeURIComponent(sourceSid)}/continue-detached`,
+            { method: "POST", headers: this.hdr() },
+          );
+        } catch (_) {
+          return null;
+        }
+        // A watcher can settle between /active and this request. Let the caller
+        // retry the ordinary send path against the now-idle source.
+        if (response.status === 409) {
+          return { sessionId: sourceSid, queuePending: false, rolledOver: false };
+        }
+        if (!response.ok) return null;
+        let payload = null;
+        try { payload = await response.json(); } catch (_) { return null; }
+        const childSid = String(payload.id || payload.session_id || "");
+        if (!childSid || childSid === sourceSid) {
+          return { sessionId: sourceSid, queuePending: false, rolledOver: false };
+        }
+        const pending = Number(
+          payload.inherited_background_tasks_pending
+          ?? payload.background_tasks_pending
+          ?? sourceState.backgroundTaskCount,
+        );
+        const wasDraining = !!sourceState._draining;
+        const childState = this._stateForDetachedSuccessor(
+          sourceSid, childSid, sourceState, pending,
+        );
+        const childMeta = {
+          ...sourceMeta,
+          ...payload,
+          id: childSid,
+          name: payload.name || sourceMeta.name || "",
+          model: payload.model || sourceMeta.model || "",
+          cwd: payload.cwd || sourceMeta.cwd || this.currentWorkspacePath(),
+          active: false,
+          turn_active: false,
+          background_active: false,
+        };
+        const sourceIndex = this.sessions.findIndex(s => s.id === sourceSid);
+        const withoutBoth = this.sessions.filter(
+          s => s.id !== sourceSid && s.id !== childSid);
+        if (sourceIndex >= 0) withoutBoth.splice(
+          Math.min(sourceIndex, withoutBoth.length), 0, childMeta);
+        else withoutBoth.unshift(childMeta);
+        this.sessions = withoutBoth;
+        // Publish the lineage before installing/removing tab state. An
+        // overlapping send closure still holds sourceState after this point
+        // and uses the link to settle its cloned composer on the child.
+        sourceState._backgroundSuccessorSid = childSid;
+        this.tabState[childSid] = childState;
+        const tabIndex = this.openTabIds.indexOf(sourceSid);
+        this.openTabIds = this.openTabIds.filter(
+          id => id !== sourceSid && id !== childSid);
+        if (tabIndex >= 0) this.openTabIds.splice(
+          Math.min(tabIndex, this.openTabIds.length), 0, childSid);
+        this._writeChatTabStore(this.openTabIds);
+        this._disposeSessionSync(sourceState);
+        if (sourceState._streamTimer) clearInterval(sourceState._streamTimer);
+        sourceState._streamTimer = null;
+        delete this.tabState[sourceSid];
+        this._deletePersistedChatDraft(sourceSid);
+        this._persistChatDraft(childSid, childState.draft.input || "");
+        // Preserve focus ownership: only replace the visible source tab. A
+        // user who switched tabs while the POST was in flight stays there.
+        if (this.currentId === sourceSid) {
+          this.currentId = childSid;
+          this._activateTabState(childSid);
+          if (childMeta.cwd) {
+            this.workspaceLastSession = {
+              ...this.workspaceLastSession,
+              [childMeta.cwd]: childSid,
+            };
+          }
+        }
+        // Do not wait for the inherited-task poller to eventually notice an
+        // incomplete clone. Start canonical hydration as soon as the successor
+        // owns tab state; the coalescer keeps it serialized with later polling.
+        if (!childState._loaded) {
+          this._requestSessionSync(childSid, "history_load", { loadOptions: {} });
+        }
+        this._sessionsEtag = "";
+        this.savePrefs();
+        this._ensureInheritedTaskPoller(childSid, sourceSid);
+        // Establish whether the triggering prompt must join the migrated tail
+        // BEFORE send() retries. The endpoint schedules the old queue drain;
+        // blindly starting this prompt could otherwise overtake accepted work.
+        await this._syncQueueFromServer(childSid);
+        const advertisedDepth = Number(
+          payload.target_queue_depth
+          ?? payload.queue_depth
+          ?? payload.queue_pending
+          ?? 0);
+        const queuePending = Number(payload.queue_migrated) > 0
+          || (Number.isFinite(advertisedDepth) && advertisedDepth > 0)
+          || childState.pendingQueue.length > 0;
+        // Keep later sends on the durable FIFO until the poller observes the
+        // migrated turn. _attachToServerTurn clears this when the queue is
+        // genuinely idle; without this handoff guard a fast second Enter could
+        // mint a direct turn between queue migration and active-turn attach.
+        childState._draining = queuePending || wasDraining;
+        return { sessionId: childSid, queuePending, rolledOver: true };
+      })();
+      sourceState._backgroundHandoffPromise = task;
+      try { return await task; }
+      finally {
+        if (this.tabState[sourceSid] === sourceState) {
+          sourceState._backgroundHandoffPromise = null;
+        }
+      }
+    },
+    _scheduleBackgroundHandoff(sourceSid, sourceState) {
+      // Queue acceptance is the user-facing completion boundary.  The costly
+      // transcript fork is follow-up bookkeeping and must never keep the
+      // composer looking stuck.  The backend performs the same idempotent
+      // rollover from its queue drain, while this task obtains the successor
+      // id and swaps the visible tab once that work commits.
+      if (!sourceSid || !sourceState
+          || this.tabState[sourceSid] !== sourceState
+          || sourceState._backgroundHandoffScheduled) return;
+      sourceState._backgroundHandoffScheduled = true;
+      Promise.resolve().then(async () => {
+        const handoff = await this._handoffBackgroundSession(
+          sourceSid, sourceState);
+        if (handoff && handoff.rolledOver && handoff.sessionId) {
+          const child = this.tabState[handoff.sessionId];
+          if (child) child._draining = !!handoff.queuePending;
+          this._attachToServerTurn(handoff.sessionId, 20);
+        }
+      }).catch(() => {
+        // The server-side queue drain owns retries.  Keep the accepted prompt
+        // durable and let normal session polling discover the successor.
+      }).finally(() => {
+        if (this.tabState[sourceSid] === sourceState) {
+          sourceState._backgroundHandoffScheduled = false;
+        }
+      });
+    },
+    _ensureInheritedTaskPoller(childSid, sourceSid) {
+      const st = childSid && this.tabState[childSid];
+      if (!st || !sourceSid) return;
+      const sync = st.sessionSync;
+      if (sync.inheritedSourceSid !== sourceSid || sync.inheritedTicksLeft <= 0) {
+        sync.inheritedSourceSid = sourceSid;
+        sync.inheritedTicksLeft = 1810;
+      }
+      this._requestSessionSync(childSid, "inherited_tasks", { sourceSid });
+    },
+    async _pollInheritedTasks(childSid, st, options = {}) {
+      if (this.tabState[childSid] !== st) return false;
+      const sync = st.sessionSync;
+      const sourceSid = String(options.sourceSid || sync.inheritedSourceSid || "");
+      if (!sourceSid) {
+        sync.inheritedSourceSid = "";
+        return false;
+      }
+      const again = () => {
+        if (this.tabState[childSid] === st && sync.inheritedSourceSid === sourceSid) {
+          this._requestSessionSync(childSid, "inherited_tasks", {
+            sourceSid, delayMs: 2000,
+          });
+        }
+      };
+      if (typeof document !== "undefined"
+          && document.visibilityState !== "visible") {
+        again();
+        return true;
+      }
+      if (sync.inheritedTicksLeft-- <= 0) {
+        sync.inheritedSourceSid = "";
+        return false;
+      }
+      let status = null;
+      try {
+        const r = await this._fetchWithDeadline(
+          `/api/chat/sessions/${encodeURIComponent(sourceSid)}/active`,
+          { headers: this.hdr(), signal: options.signal },
+          Math.max(100, Number(this._sessionListTimeoutMs) || 8000),
+        );
+        if (r.ok) status = await r.json();
+      } catch (_) { /* retry below */ }
+      if (options.signal?.aborted) return false;
+      if (this.tabState[childSid] !== st || sync.inheritedSourceSid !== sourceSid) {
+        return false;
+      }
+      if (!status) { again(); return false; }
+      const reported = Number(
+        status.runtime_background_tasks_pending ?? status.background_tasks_pending,
+      );
+      const continuationPending = !!status.runtime_continuation_pending;
+      const desiredRevision = String(status.runtime_ui_revision || "");
+      const revisionBeforeAdoption = String(st.runtimeUiRevision || "");
+      let adoptedRevision = desiredRevision
+        ? revisionBeforeAdoption === desiredRevision : true;
+      let loadedCanonicalThisTick = false;
+      if (!adoptedRevision && !st.streaming && !st.es && !st.compacting) {
+        const continuationEventIdsBefore = new Set(
+          st.messages
+            .filter(message => message
+              && message.display_kind === "runtime_continuation"
+              && message.runtime_event_id)
+            .map(message => String(message.runtime_event_id)),
+        );
+        const loaded = await this.loadSession(childSid, {
+          quiet: true, probeActive: false, signal: options.signal,
+        });
+        if (this.tabState[childSid] !== st) return false;
+        if (!loaded) { again(); return false; }
+        st._loaded = true;
+        loadedCanonicalThisTick = true;
+        adoptedRevision = st.runtimeUiRevision === desiredRevision;
+        const hasNewRuntimeContinuation = st.messages.some(
+          message => message
+            && message.display_kind === "runtime_continuation"
+            && message.runtime_event_id
+            && !continuationEventIdsBefore.has(String(message.runtime_event_id)),
+        );
+        if (adoptedRevision
+            && revisionBeforeAdoption !== desiredRevision
+            && hasNewRuntimeContinuation
+            && childSid !== this.currentId) {
+          st.unread = true;
+        }
+      }
+      if (Number.isFinite(reported) && reported > 0) {
+        st.inheritedBackgroundTaskCount = Math.floor(reported);
+        again();
+        return true;
+      }
+      if (continuationPending) { again(); return true; }
+      if (!Number.isFinite(reported) || reported !== 0) { again(); return false; }
+      if (st.streaming || st.es || st.compacting) { again(); return true; }
+      const loaded = adoptedRevision && !loadedCanonicalThisTick
+        ? await this.loadSession(childSid, {
+            quiet: true, probeActive: false, signal: options.signal,
+          })
+        : true;
+      if (this.tabState[childSid] !== st) return false;
+      if (!loaded || (desiredRevision && st.runtimeUiRevision !== desiredRevision)) {
+        again();
+        return false;
+      }
+      st._loaded = true;
+      st.inheritedBackgroundTaskCount = 0;
+      st.inheritedBackgroundOwner = "";
+      sync.inheritedSourceSid = "";
+      sync.inheritedTicksLeft = 0;
+      return true;
+    },
+    _activeTurnUserSignature(text = "", images = [], docs = []) {
+      const normalize = (value, seen = new WeakSet()) => {
+        if (value === null || typeof value === "string"
+            || typeof value === "boolean") return value;
+        if (typeof value === "number") {
+          return Number.isFinite(value) ? value : String(value);
+        }
+        if (typeof value === "undefined") return null;
+        if (Array.isArray(value)) {
+          return value.map(item => normalize(item, seen));
+        }
+        if (typeof value === "object") {
+          if (seen.has(value)) return "[circular]";
+          seen.add(value);
+          const normalized = {};
+          Object.keys(value).sort().forEach((key) => {
+            normalized[key] = normalize(value[key], seen);
+          });
+          seen.delete(value);
+          return normalized;
+        }
+        return String(value);
+      };
+      return JSON.stringify(normalize({
+        text: String(text || ""),
+        images: Array.isArray(images) ? images : [],
+        docs: Array.isArray(docs) ? docs : [],
+      }));
+    },
+    _installActiveTurnUser(st, turnId, text = "", images = [], docs = []) {
+      if (!st || !(text || images.length || docs.length)) return null;
+      const messages = st.messages || [];
+      let turnUser = turnId
+        ? messages.find(message => message && message.role === "user"
+          && message._turnId === turnId)
+        : null;
+      const tailUser = messages[messages.length - 1];
+      // A canonical history load may already have installed this prompt without
+      // MuseLab's live turn id. Only the physical tail can belong to the active
+      // turn, and the complete prompt envelope must match before it is adopted.
+      if (!turnUser && turnId && tailUser && tailUser.role === "user"
+          && !tailUser._turnId
+          && this._activeTurnUserSignature(
+            tailUser.text, tailUser.images, tailUser.docs,
+          ) === this._activeTurnUserSignature(text, images, docs)) {
+        tailUser._turnId = turnId;
+        turnUser = tailUser;
+      }
+      let appended = false;
+      if (!turnUser) {
+        turnUser = this._appendLiveMessage(st, {
+          role: "user", text, images, docs, _turnId: turnId,
+        });
+        appended = true;
+      }
+      return { message: turnUser, appended };
+    },
     // Poll /active + re-subscribe to a server-started turn. Retries a few
     // times because the server's drain runs a beat AFTER it publishes the
     // previous turn's `done` (in the background task's finally), so /active
     // can flip to true just after we land here. Stops once we attach, run
     // out of tries, or the queue turns out empty/paused.
-    async _attachToServerTurn(sid, tries, completedTurnId = "") {
+    _attachToServerTurn(
+      sid, tries, completedTurnId = "", reconciledQueuedTurnId = "",
+    ) {
+      return this._requestSessionSync(sid, "queue_attach", {
+        tries, completedTurnId, reconciledQueuedTurnId,
+      });
+    },
+    async _runQueueAttach(sid, ownerState, options = {}) {
+      const tries = Math.max(0, Number(options.tries) || 0);
+      const completedTurnId = String(options.completedTurnId || "");
+      const reconciledQueuedTurnId = String(options.reconciledQueuedTurnId || "");
       const st0 = this.tabState[sid];
-      if (this.currentId !== sid || this.streaming) {
+      if (st0 !== ownerState) return false;
+      if (this.currentId !== sid || this.activeSessionPane().streaming) {
         if (st0) st0._draining = false;
-        this._syncQueueFromServer(sid);
+        this._syncQueueFromServer(sid, options);
         return;
       }
       // _draining suppresses the idle "Queue waiting" banner during the brief
       // poll window between a turn's `done` and the server starting the next
       // queued turn — otherwise the banner flashes for ~350ms each drain step.
       if (st0) st0._draining = true;
-      await this._syncQueueFromServer(sid);
+      await this._syncQueueFromServer(sid, options);
       const st = this.tabState[sid];
       const expect = !!(st && st.pendingQueue && st.pendingQueue.length && !st._queuePaused);
       let active = false, startedAt = 0, turnId = "";
       let uText = "", uImages = [], uDocs = [];
       let continuation = false;
       let background = false, attachable = true, backgroundTaskCount = 0;
+      let activitySource = "";
       try {
-        const r = await fetch("/api/chat/sessions/" + sid + "/active",
-                               { headers: this.hdr() });
+        const r = await this._fetchWithDeadline(
+          "/api/chat/sessions/" + sid + "/active",
+          { headers: this.hdr(), signal: options.signal },
+        );
         if (r.ok) {
           const d = await r.json();
           active = !!d.active; startedAt = d.started_at;
@@ -6091,6 +9200,7 @@ function portal() {
           continuation = !!d.continuation;
           background = !!d.background;
           attachable = d.attachable !== false;
+          activitySource = String(d.activity_source || "");
           backgroundTaskCount = Math.max(
             0, Number(d.background_tasks_pending) || 0);
           uText = d.user_text || "";
@@ -6098,6 +9208,66 @@ function portal() {
           uDocs = d.user_docs || [];
         }
       } catch (_e) {}
+      if (options.signal?.aborted) {
+        if (st) st._draining = false;
+        return false;
+      }
+      // A server-drained queue turn may be shorter than this poll interval. In
+      // that case there is no live broadcast left to attach to: /active returns
+      // inactive + activity_source=queued, while the queue has already ACKed the
+      // item and therefore also looks empty. The canonical transcript is the
+      // only remaining delivery channel. Pull it quietly so the completed reply
+      // and its persisted footer appear without a manual page refresh.
+      //
+      // Reconcile before attaching an ACTIVE queued turn too. One or more faster
+      // predecessors may have completed between probes; attaching only the newest
+      // broadcast would otherwise skip their user/reply/footer rows until reload.
+      // Re-probe after the await because the observed turn can finish or advance
+      // while the canonical fetch is in flight. The turn-id marker makes the
+      // second probe attach instead of recursively reloading the same turn.
+      const queuedReconcileKey = active ? turnId : "__recent_queued__";
+      if (activitySource === "queued"
+          && queuedReconcileKey !== reconciledQueuedTurnId) {
+        const loaded = await this.loadSession(sid, {
+          quiet: true, probeActive: false, signal: options.signal,
+        });
+        if (this.tabState[sid] !== st || this.currentId !== sid) {
+          if (this.tabState[sid] === st) st._draining = false;
+          this._syncQueueFromServer(sid);
+          return;
+        }
+        if (!active) {
+          if (loaded) {
+            // The inactive snapshot predates the history fetch. Probe once more
+            // after the merge: a newly-enqueued item may already have started
+            // while that request was in flight. The marker prevents the same
+            // recent queued completion from triggering another history pull.
+            this._requestSessionSync(sid, "queue_attach", {
+              tries: Math.max(1, tries - 1), completedTurnId,
+              reconciledQueuedTurnId: queuedReconcileKey,
+            });
+            return true;
+          }
+          if (tries <= 1) {
+            st._draining = false;
+            this._syncQueueFromServer(sid);
+          } else {
+            this._requestSessionSync(sid, "queue_attach", {
+              tries: tries - 1, completedTurnId, reconciledQueuedTurnId,
+              delayMs: 350,
+            });
+          }
+          return;
+        }
+        // Whether the history request succeeded or not, never attach using the
+        // pre-await active snapshot. A fresh probe prevents a completed/replaced
+        // broadcast from receiving this reconnect.
+        this._requestSessionSync(sid, "queue_attach", {
+          tries: Math.max(1, tries - 1), completedTurnId,
+          reconciledQueuedTurnId: queuedReconcileKey,
+        });
+        return true;
+      }
       // `done` is intentionally emitted before slow post-turn persistence
       // finishes, so /active can briefly still expose the broadcast that just
       // completed. Never mistake that SAME turn for the next queue item and
@@ -6106,13 +9276,10 @@ function portal() {
       // turn has a different immutable turn_id and remains attachable below.
       if (active && completedTurnId
           && (!turnId || turnId === completedTurnId)) {
-        if (expect && tries > 1 && !this.streaming && this.currentId === sid) {
-          setTimeout(
-            () => this._attachToServerTurn(
-              sid, tries - 1, completedTurnId,
-            ),
-            350,
-          );
+        if (expect && tries > 1 && !this.activeSessionPane().streaming && this.currentId === sid) {
+          this._requestSessionSync(sid, "queue_attach", {
+            tries: tries - 1, completedTurnId, delayMs: 350,
+          });
         } else if (st) {
           st._draining = false;
         }
@@ -6123,10 +9290,19 @@ function portal() {
         if (st && turnId) st.activeTurnId = turnId;
         this._setBackgroundTaskActive(
           sid, true, startedAt, backgroundTaskCount);
+        if (expect) {
+          const handoff = await this._handoffBackgroundSession(sid, st);
+          const childSid = handoff && handoff.sessionId;
+          if (childSid && childSid !== sid) {
+            this.$nextTick(() => this._attachToServerTurn(
+              childSid, Math.max(1, tries - 1), completedTurnId));
+            return;
+          }
+        }
         this._ensureBgContPoller(sid);
         return;
       }
-      if (active && continuation && !this.streaming && this.currentId === sid) {
+      if (active && continuation && !this.activeSessionPane().streaming && this.currentId === sid) {
         // The slot holds a bg-task continuation turn, not a queued item. Hand
         // it to the continuation poller (no user bubble, no truncation) instead
         // of the queue-drain reconnect below.
@@ -6135,7 +9311,7 @@ function portal() {
                     turnId, startedAt });
         return;
       }
-      if (active && !this.streaming && this.currentId === sid) {
+      if (active && !this.activeSessionPane().streaming && this.currentId === sid) {
         if (st) st._draining = false;
         // FIX (queue live-render): when the SERVER drained a queued item and
         // started its turn headlessly, the browser never pushed a user bubble
@@ -6148,29 +9324,11 @@ function portal() {
         // case (loadSession already rebuilt this bubble): adopt an unlabelled
         // matching tail bubble. Identity, not text, is the durable dedupe key:
         // two queued turns are allowed to contain identical prompts.
-        const msgs = st ? this._allPaneMessages(st) : [];
-        let lastUser = null;
-        for (let i = msgs.length - 1; i >= 0; i--) {
-          if (msgs[i].role === "user") { lastUser = msgs[i]; break; }
-        }
-        let turnUser = turnId
-          ? msgs.find(m => m && m.role === "user" && m._turnId === turnId)
-          : null;
-        if (!turnUser && turnId && lastUser && !lastUser._turnId
-            && (lastUser.text || "") === uText) {
-          lastUser._turnId = turnId;
-          turnUser = lastUser;
-        }
-        if ((uText || uImages.length || uDocs.length) && !turnUser) {
-          this._capLiveMessages(st);
-          turnUser = this._appendLiveMessage(st, {
-            role: "user",
-            text: uText,
-            images: uImages,
-            docs: uDocs,
-            _turnId: turnId,
-          });
-          this.atBottom = true;
+        const turnUser = this._installActiveTurnUser(
+          st, turnId, uText, uImages, uDocs);
+        if (turnUser && turnUser.appended) {
+          this._scheduleLiveMessageViewport(st);
+          st.atBottom = true;
           this.scrollToBottom(true);
         }
         if (st && turnId) st.activeTurnId = turnId;
@@ -6178,13 +9336,10 @@ function portal() {
         this.$nextTick(() => this._syncQueueFromServer(sid));
         return;
       }
-      if (expect && tries > 1 && !this.streaming && this.currentId === sid) {
-        setTimeout(
-          () => this._attachToServerTurn(
-            sid, tries - 1, completedTurnId,
-          ),
-          350,
-        );
+      if (expect && tries > 1 && !this.activeSessionPane().streaming && this.currentId === sid) {
+        this._requestSessionSync(sid, "queue_attach", {
+          tries: tries - 1, completedTurnId, delayMs: 350,
+        });
       } else if (st) {
         st._draining = false;
       }
@@ -6219,16 +9374,10 @@ function portal() {
             const elapsed = Math.max(
               0, (Date.now() - (st._streamStartedAt || Date.now())) / 1000);
             st.streamElapsed = elapsed;
-            if (this.currentId === sid) this.streamElapsed = elapsed;
           }, 1000);
         }
         st.streamElapsed = Math.max(
           0, (Date.now() - st._streamStartedAt) / 1000);
-        if (this.currentId === sid) {
-          this._streamStartedAt = st._streamStartedAt;
-          this._streamTimer = st._streamTimer;
-          this.streamElapsed = st.streamElapsed;
-        }
         return;
       }
       // A live continuation still owns the timer. Its terminal handler will
@@ -6239,212 +9388,243 @@ function portal() {
       st._streamTimer = null;
       st._streamStartedAt = 0;
       st.streamElapsed = 0;
-      if (this.currentId === sid) {
-        this._streamTimer = null;
-        this._streamStartedAt = 0;
-        this.streamElapsed = 0;
-      }
     },
     _bgHasRunningCard(sid) {
       const st = this.tabState[sid];
       if (!st || !st.messages) return false;
       return st.messages.some(m =>
         m && m.role === "tool_use" && m.task_status
-        && m.task_status.state === "running");
+        && m.task_status.state === "running"
+        && (!m.task_status.owner_session_id
+          || m.task_status.owner_session_id === sid));
     },
     _ensureBgContPoller(sid) {
-      this._bgContPollers = this._bgContPollers || {};
-      if (this._bgContPollers[sid]) return;          // already polling
-      const bgState = this.tabState[sid];
-      if (!this._bgHasRunningCard(sid)
-          && !(bgState && bgState.backgroundActive)) return;
-      // Hard cap mirrors the server's MUSELAB_TASK_WATCH_TIMEOUT (1800s): at a
-      // 2s cadence that's ~900 ticks. Prevents an interval lingering forever if
-      // the user navigates away and the running card never resolves on the FE.
-      let ticksLeft = 910;
-      const tick = async () => {
-        if (ticksLeft-- <= 0) { this._stopBgContPoller(sid); return; }
-        const ownerState = this.tabState[sid];
-        // Card settled and the server no longer reports a detached watcher.
-        if (!this._bgHasRunningCard(sid)
-            && !(ownerState && ownerState.backgroundActive)) {
-          this._stopBgContPoller(sid);
-          return;
+      const st = sid && this.tabState[sid];
+      if (!st || (!this._bgHasRunningCard(sid) && !st.backgroundActive)) return;
+      if (st.sessionSync.backgroundTicksLeft <= 0) {
+        st.sessionSync.backgroundTicksLeft = 1810;
+      }
+      this._requestSessionSync(sid, "background_continuation");
+    },
+    async _pollBackgroundContinuation(sid, st, options = {}) {
+      if (this.tabState[sid] !== st) return false;
+      const sync = st.sessionSync;
+      if (!this._bgHasRunningCard(sid) && !st.backgroundActive) {
+        this._stopBgContPoller(sid);
+        return false;
+      }
+      const again = () => {
+        if (this.tabState[sid] === st && sync.backgroundTicksLeft > 0) {
+          this._requestSessionSync(sid, "background_continuation", { delayMs: 2000 });
         }
-        // Tab hidden → skip the network work entirely (same battery/radio
-        // rationale as _pingHealth). The card badge isn't visible anyway;
-        // the next visible tick reconciles. ticksLeft still counts down so
-        // the hard cap holds even for a permanently-backgrounded tab.
-        if (typeof document !== "undefined"
-            && document.visibilityState !== "visible") return;
-        // Not viewing this session, or already streaming → retry next tick.
-        if (this.currentId !== sid || this.streaming) return;
-        // PRIMARY completion path (since the 2026-06-11 typed-message
-        // alignment): the cross-turn watcher reliably receives the typed
-        // TaskNotificationMessage and opens a continuation broadcast, so
-        // /active — a cheap, tiny JSON probe — discovers it on the next
-        // tick and reconnects in continuation mode; the replayed
-        // task_notification flips the card and streams the auto-continue.
-        // (The browser has no persistent SSE channel in the turn gap — the
-        // per-turn EventSource closes on done — so SOME polling is the only
-        // discovery mechanism; this probe is the lightest one.)
-        let contFound = false;
-        try {
-          const r = await fetch("/api/chat/sessions/" + sid + "/active",
-                                 { headers: this.hdr() });
-          if (r.ok) {
-            const d = await r.json();
-            if (d.background && d.active) {
-              this._setBackgroundTaskActive(
-                sid, true, d.started_at, d.background_tasks_pending);
-            } else if (!d.active) {
-              this._setBackgroundTaskActive(sid, false);
-            }
-            if (d.active && d.continuation && !this.streaming
-                && this.currentId === sid) {
-              // Dedup: /active surfaces a finished continuation from the
-              // server's _recent_turns for the full 60s TTL, so if ANOTHER
-              // bg task keeps this poller alive the same continuation would
-              // be re-reconnected every 8s → duplicate reaction bubbles. Key
-              // on the continuation's immutable turn_id. started_at is the
-              // originating turn's epoch and is intentionally shared by every
-              // continuation, so it is not a valid identity.
-              // and replay each one at most once. The normal single-task case
-              // self-stops on the card flip and never reaches a second tick,
-              // but this makes the multi-task case safe too.
-              this._consumedConts = this._consumedConts || {};
-              const ckey = sid + ":" + (d.turn_id || d.started_at);
-              if (!this._consumedConts[ckey]) {
-                this._consumedConts[ckey] = true;
-                contFound = true;
-                this.send({ reconnect: true, continuation: true,
-                             sessionId: sid, turnId: d.turn_id || "",
-                             startedAt: d.started_at });
-              }
+      };
+      if (typeof document !== "undefined"
+          && document.visibilityState !== "visible") {
+        again();
+        return true;
+      }
+      if (sync.backgroundTicksLeft-- <= 0) {
+        this._stopBgContPoller(sid);
+        return false;
+      }
+      if (this.currentId !== sid || st.streaming || st.es) {
+        again();
+        return true;
+      }
+      let contFound = false;
+      try {
+        const r = await this._fetchWithDeadline(
+          "/api/chat/sessions/" + sid + "/active",
+          { headers: this.hdr(), signal: options.signal },
+          Math.max(100, Number(this._sessionListTimeoutMs) || 8000),
+        );
+        if (r.ok) {
+          const d = await r.json();
+          if (d.background && d.active) {
+            this._setBackgroundTaskActive(
+              sid, true, d.started_at, d.background_tasks_pending);
+          } else if (!d.active) {
+            this._setBackgroundTaskActive(sid, false);
+          }
+          if (d.active && d.continuation && !st.streaming && !st.es
+              && this.currentId === sid) {
+            this._consumedConts = this._consumedConts || {};
+            const ckey = sid + ":" + (d.turn_id || d.started_at);
+            if (!this._consumedConts[ckey]) {
+              this._consumedConts[ckey] = true;
+              contFound = true;
+              this.send({ reconnect: true, continuation: true,
+                          sessionId: sid, turnId: d.turn_id || "",
+                          startedAt: d.started_at });
             }
           }
-        } catch (_e) {}
-        if (contFound) return;   // continuation replay will flip the card
-        // FALLBACK reconciliation, every 4th tick (~32s): pull the history
-        // tail and stamp terminal task_status onto still-running cards. This
-        // covers the cases the /active probe can't see — the watcher died
-        // (server restart), the continuation's 60s TTL expired before a
-        // hidden tab came back, or an older CLI that only round-trips the
-        // <task-notification> JSONL record. Demoted from every-tick PRIMARY
-        // (it fetches an 80-message tail vs /active's ~100 bytes) on
-        // 2026-06-11 when the typed-message path made the continuation
-        // broadcast reliable.
-        this._bgContTickN = (this._bgContTickN || 0) + 1;
-        if (this._bgContTickN % 4 !== 0) return;
+        }
+      } catch (_) { /* fallback cadence below */ }
+      if (options.signal?.aborted) return false;
+      if (this.tabState[sid] !== st) return false;
+      sync.backgroundTickN = (Number(sync.backgroundTickN) || 0) + 1;
+      if (!contFound && sync.backgroundTickN % 16 === 0) {
         try {
-          const hr = await fetch("/api/chat/sessions/" + sid + "?tail=80",
-                                  { headers: this.hdr() });
+          const hr = await this._fetchWithDeadline(
+            "/api/chat/sessions/" + sid + "?tail=80",
+            { headers: this.hdr(), signal: options.signal },
+          );
           if (hr.ok) {
             const hs = await hr.json();
+            if (this.tabState[sid] !== st) return false;
             const settled = {};
             (hs.messages || []).forEach(m => {
               if (m && m.role === "tool_use" && m.id && m.task_status
-                  && m.task_status.state
-                  && m.task_status.state !== "running") {
+                  && m.task_status.state && m.task_status.state !== "running") {
                 settled[m.id] = m.task_status;
               }
             });
-            const st = this.tabState[sid];
-            if (st && st.messages) {
-              st.messages.forEach(m => {
-                if (m && m.role === "tool_use" && m.task_status
-                    && m.task_status.state === "running" && settled[m.id]) {
-                  // Reassign the whole object so Alpine's :class re-evaluates.
-                  m.task_status = Object.assign({}, m.task_status, settled[m.id]);
-                }
-              });
-            }
+            st.messages.forEach(m => {
+              if (m && m.role === "tool_use" && m.task_status
+                  && m.task_status.state === "running" && settled[m.id]) {
+                m.task_status = Object.assign({}, m.task_status, settled[m.id]);
+              }
+            });
           }
-        } catch (_e) {}
-      };
-      this._bgContPollers[sid] = setInterval(tick, 2000);
-      tick();   // kick once immediately
+        } catch (_) { /* retry on the next fallback cadence */ }
+      }
+      again();
+      return true;
     },
     _stopBgContPoller(sid) {
-      if (this._bgContPollers && this._bgContPollers[sid]) {
-        clearInterval(this._bgContPollers[sid]);
-        delete this._bgContPollers[sid];
+      const st = sid && this.tabState[sid];
+      if (!st) return;
+      st.sessionSync.backgroundTicksLeft = 0;
+      this._cancelSessionSyncReason(st, "background_continuation");
+    },
+    _canonicalMetaBehind(st, meta) {
+      if (!st || !meta || !st._loaded) return false;
+      const canonicalCount = Math.max(0, Number(meta.message_count) || 0);
+      const installedCount = Math.max(0, Number(st._installedCanonicalCount) || 0);
+      if (canonicalCount > installedCount) return true;
+      const updated = Number(meta.updated_at) || 0;
+      const seen = Number(st._seenUpdated);
+      return st._seenUpdated !== undefined && Number.isFinite(seen) && updated > seen;
+    },
+    _resumePendingCanonicalSync(sid, st) {
+      if (!sid || !st || this.tabState[sid] !== st || st.streaming || st.es) return;
+      const pending = st._pendingCompletedTurnSync;
+      if (pending) {
+        this._requestSessionSync(sid, "completed_turn", {
+          ...pending, delayMs: 0,
+        });
+        return;
+      }
+      if (st._pendingExternalUpdate) {
+        this._requestSessionSync(sid, "history_revision", {
+          targetUpdated: Number(st._reconcileTargetUpdated) || 0,
+          delayMs: 0,
+        });
       }
     },
-    _reconcileCompletedTurn(sid, ownerState, expectedText = "", attempt = 0) {
-      // The live turn is an optimistic rendering of the server-owned
-      // transcript. `done` deliberately arrives before slow UUID/annotation
-      // bookkeeping, so poll the cheap tail until it contains a persisted
-      // boundary for THIS turn, then merge it through quiet loadSession. This
-      // gives the footer a fork id without waiting for the 10s session-list
-      // poll and never blanks/remounts the live bubbles.
+    _reconcileCompletedTurn(
+      sid, ownerState, expectedText = "", attempt = 0, expectedAssistantUuid = "",
+    ) {
+      if (!sid || this.tabState[sid] !== ownerState) return Promise.resolve(false);
+      const options = {
+        expectedText: String(expectedText || ""),
+        expectedAssistantUuid: String(expectedAssistantUuid || ""),
+        attempt: Math.max(0, Number(attempt) || 0),
+      };
+      ownerState._pendingCompletedTurnSync = options;
+      return this._requestSessionSync(sid, "completed_turn", {
+        ...options,
+        delayMs: options.attempt
+          ? Math.min(2000, 250 + options.attempt * 100) : 80,
+      });
+    },
+    async _runCompletedTurnSync(sid, ownerState, options = {}) {
+      const attempt = Math.max(0, Number(options.attempt) || 0);
+      const expectedText = String(options.expectedText || "");
+      const expectedAssistantUuid = String(options.expectedAssistantUuid || "");
+      const stillOwned = () => this.tabState[sid] === ownerState
+        && !ownerState.streaming && !ownerState.es;
+      if (!stillOwned()) return false;
       const retry = () => {
-        if (attempt < 30) {
-          this._reconcileCompletedTurn(
-            sid, ownerState, expectedText, attempt + 1,
-          );
+        if (options.signal?.aborted) return;
+        const next = {
+          expectedText, expectedAssistantUuid, attempt: attempt + 1,
+        };
+        ownerState._pendingCompletedTurnSync = next;
+        if (attempt < 30 && stillOwned()) {
+          this._requestSessionSync(sid, "completed_turn", {
+            ...next, delayMs: Math.min(2000, 350 + attempt * 100),
+          });
         }
       };
-      setTimeout(async () => {
-        if (this.tabState[sid] !== ownerState || ownerState.streaming || ownerState.es) return;
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 8000);
-        const stillOwned = () => this.tabState[sid] === ownerState
-          && !ownerState.streaming && !ownerState.es;
-        try {
-          // `done` is intentionally early; wait for the detached backend pump
-          // to retire before swapping canonical history. The footer already
-          // has done.assistant_uuid/completed_at_ms/duration_ms, so this wait
-          // does not delay any visible completion affordance.
-          const activeResponse = await fetch(
-            "/api/chat/sessions/" + sid + "/active",
-            { headers: this.hdr(), signal: controller.signal },
-          );
-          if (!stillOwned()) return;
-          if (!activeResponse.ok || !!(await activeResponse.json()).active) {
-            retry();
-            return;
-          }
-          const historyResponse = await fetch(
-            "/api/chat/sessions/" + sid + "?tail=80",
-            { headers: this.hdr(), signal: controller.signal },
-          );
-          if (!stillOwned()) return;
-          if (!historyResponse.ok) { retry(); return; }
-          const history = await historyResponse.json();
-          const messages = Array.isArray(history.messages) ? history.messages : [];
-          let turnStart = 0;
-          for (let i = messages.length - 1; i >= 0; i -= 1) {
-            if (messages[i] && messages[i].role === "user") {
-              turnStart = i + 1;
-              break;
-            }
-          }
-          const canonicalTurn = messages.slice(turnStart);
-          const hasBoundary = canonicalTurn.some(
-            m => m && m.role !== "user" && m.uuid,
-          );
-          const hasFinal = !expectedText || canonicalTurn.some(
-            m => m && m.role === "assistant" && m.uuid
-              && (m.text || "") === expectedText,
-          );
-          if (!hasBoundary || !hasFinal) { retry(); return; }
-          if (!stillOwned()) return;
-          const loaded = await this.loadSession(sid, { quiet: true });
-          if (!loaded) retry();
-        } catch (_) {
+      try {
+        const activeResponse = await this._fetchWithDeadline(
+          "/api/chat/sessions/" + sid + "/active",
+          { headers: this.hdr(), signal: options.signal },
+        );
+        if (!stillOwned()) return false;
+        let activity = null;
+        try { activity = activeResponse.ok ? await activeResponse.json() : null; }
+        catch (_) { activity = null; }
+        if (!activity || (activity.active && !activity.background)) {
           retry();
-        } finally {
-          clearTimeout(timeout);
+          return false;
         }
-      // Post-turn context accounting/transcript annotation can legitimately
-      // take tens of seconds on large sessions. Back off to a 2s ceiling for
-      // an overall ~45s barrier without generating a hot polling loop.
-      }, attempt ? Math.min(2000, 250 + attempt * 100) : 80);
+        const reconcileTail = this._historyReconcileWindowSize();
+        const historyResponse = await this._fetchWithDeadline(
+          "/api/chat/sessions/" + sid + "?tail=" + reconcileTail,
+          { headers: this.hdr(), signal: options.signal },
+        );
+        if (!stillOwned()) return false;
+        if (!historyResponse.ok) { retry(); return false; }
+        const history = await historyResponse.json();
+        const messages = Array.isArray(history.messages) ? history.messages : [];
+        let latestUserIndex = -1;
+        for (let i = messages.length - 1; i >= 0; i -= 1) {
+          if (messages[i] && messages[i].role === "user") {
+            latestUserIndex = i;
+            break;
+          }
+        }
+        const turnStart = latestUserIndex + 1;
+        const canonicalTurn = messages.slice(turnStart);
+        // Mobile's normal 20-block window can start inside a tool-heavy turn.
+        // Reconcile at least through this turn's user boundary so canonical
+        // installation never keeps the reply while dropping its prompt.
+        const completedTurnWindow = latestUserIndex >= 0
+          ? messages.length - latestUserIndex : reconcileTail;
+        const hasBoundary = canonicalTurn.some(
+          m => m && m.role !== "user" && m.uuid,
+        );
+        const hasFinal = expectedAssistantUuid
+          ? canonicalTurn.some(m => m && m.uuid === expectedAssistantUuid)
+          : !!expectedText && canonicalTurn.some(
+              m => m && m.role === "assistant" && m.uuid
+                && (m.text || "") === expectedText,
+            );
+        if (!hasBoundary || !hasFinal) { retry(); return false; }
+        if (!stillOwned()) return false;
+        const loaded = await this.loadSession(sid, {
+          quiet: true, probeActive: false,
+          minimumTail: completedTurnWindow,
+          signal: options.signal,
+        });
+        if (!loaded) retry();
+        else {
+          ownerState._loaded = true;
+          ownerState._pendingCompletedTurnSync = null;
+        }
+        return !!loaded;
+      } catch (_) {
+        retry();
+        return false;
+      }
     },
-    _reconcileCompletedContinuation(sid, ownerState, expectedText = "", attempt = 0) {
+    _reconcileCompletedContinuation(
+      sid, ownerState, expectedText = "", attempt = 0, expectedAssistantUuid = "",
+    ) {
       return this._reconcileCompletedTurn(
-        sid, ownerState, expectedText, attempt,
+        sid, ownerState, expectedText, attempt, expectedAssistantUuid,
       );
     },
     async removePendingQueueItem(sid, idx) {
@@ -6452,10 +9632,15 @@ function portal() {
       if (!st || !st.pendingQueue) return;
       const item = st.pendingQueue[idx];
       if (!item) return;
-      try {
-        await fetch("/api/chat/sessions/" + sid + "/queue/" + encodeURIComponent(item.id),
-                    { method: "DELETE", headers: this.hdr() });
-      } catch (_e) {}
+      const key = "remove:" + item.id;
+      const r = await this._runQueueMutation(
+        sid, st, key,
+        "/api/chat/sessions/" + sid + "/queue/" + encodeURIComponent(item.id),
+        { method: "DELETE", headers: this.hdr() },
+        "移除排队消息失败，原消息仍保留",
+        "Could not remove the queued message; it is still queued",
+      );
+      if (!r) return;
       await this._syncQueueFromServer(sid);
     },
     async editPendingQueueItem(sid, idx) {
@@ -6470,16 +9655,27 @@ function portal() {
       if (!item) return;
       // Snapshot before _syncQueueFromServer wipes the mirror.
       const text = item.text || "";
+      const displayText = Object.prototype.hasOwnProperty.call(item, "displayText")
+        ? (item.displayText || "") : text;
+      const quotes = (item.pendingQuotes || []).slice();
       const imgs = (item.images || []).slice();
       const docs = (item.docs || []).slice();
-      try {
-        await fetch("/api/chat/sessions/" + sid + "/queue/" + encodeURIComponent(item.id),
-                    { method: "DELETE", headers: this.hdr() });
-      } catch (_e) {}
+      const key = "edit:" + item.id;
+      const r = await this._runQueueMutation(
+        sid, st, key,
+        "/api/chat/sessions/" + sid + "/queue/" + encodeURIComponent(item.id),
+        { method: "DELETE", headers: this.hdr() },
+        "编辑排队消息失败，原消息仍保留",
+        "Could not edit the queued message; the original is still queued",
+      );
+      // Never create an editable duplicate when DELETE failed.  Previously the
+      // draft was restored unconditionally, so re-send could execute both the
+      // untouched queue item and its apparent replacement.
+      if (!r) return;
       await this._syncQueueFromServer(sid);
       if (this.tabState[sid] !== st) return;
       const draft = st.draft;
-      draft.input = text;
+      draft.input = displayText;
       // Rebuild the input-tray chips. No `file` on restored images, so the
       // in-chip "Annotate" button stays disabled (it guards on `!img.file`),
       // but the thumbnail + re-send path work fully.
@@ -6491,6 +9687,9 @@ function portal() {
         id: d.id, name: d.name, kind: d.kind,
         uploading: false, error: false,
       })));
+      draft.pendingQuotes.splice(
+        0, draft.pendingQuotes.length, ...quotes.map(q => ({ ...q })),
+      );
       if (sid === this.currentId) {
         this._activateComposerState(sid);
         this.$nextTick(() => {
@@ -6504,21 +9703,34 @@ function portal() {
       // turn it starts. Also the manual "kick" for the post-restart case —
       // the server intentionally does NOT auto-resume draining on boot, so
       // dormant items wait here until the user hits Resume.
-      try {
-        await fetch("/api/chat/sessions/" + sid + "/queue/pause", {
+      const st = this.tabState[sid];
+      if (!st) return;
+      const r = await this._runQueueMutation(
+        sid, st, "resume",
+        "/api/chat/sessions/" + sid + "/queue/pause",
+        {
           method: "POST",
           headers: Object.assign({ "Content-Type": "application/json" }, this.hdr()),
           body: JSON.stringify({ paused: false }),
-        });
-      } catch (_e) {}
+        },
+        "继续队列失败，请检查连接后重试",
+        "Could not resume the queue; check the connection and retry",
+      );
+      if (!r) return;
       await this._syncQueueFromServer(sid);
       this._drainPendingQueue(sid);
     },
     async discardQueue(sid) {
-      try {
-        await fetch("/api/chat/sessions/" + sid + "/queue",
-                    { method: "DELETE", headers: this.hdr() });
-      } catch (_e) {}
+      const st = this.tabState[sid];
+      if (!st) return;
+      const r = await this._runQueueMutation(
+        sid, st, "discard",
+        "/api/chat/sessions/" + sid + "/queue",
+        { method: "DELETE", headers: this.hdr() },
+        "清空队列失败，消息仍保留",
+        "Could not discard the queue; messages are still queued",
+      );
+      if (!r) return;
       await this._syncQueueFromServer(sid);
     },
     // Pull the per-session context meter (input/output tokens, limit, %)
@@ -6542,27 +9754,41 @@ function portal() {
         if (!ur.ok) return;
         const u = await ur.json();
         Object.assign(st.sessionUsage, u);
-        if (sid === this.currentId) this.sessionUsage = st.sessionUsage;
       } catch (e) { /* non-fatal */ } finally {
         st._usageFetching = false;
       }
     },
 
-    _captureComposerState(id = this.currentId) {
+    _captureComposerState(id = this.currentId, { persist = true } = {}) {
       if (!id || id !== this.currentId) return;
       const st = this.tabState && this.tabState[id];
       if (!st || !st.draft) return;
+      if (st.draft._activated === false) return;
       st.draft.input = this.input || "";
       st.draft.pendingImages = this.pendingImages || [];
       st.draft.pendingDocs = this.pendingDocs || [];
+      st.draft.pendingQuotes = this.pendingQuotes || [];
       st.draft._sendWaitingForUpload = !!this._sendWaitingForUpload;
+      if (persist) this._persistChatDraft(id, st.draft.input);
     },
     _activateComposerState(id) {
       const st = this._ensureTabState(id);
       const draft = st.draft;
-      this.input = draft.input || "";
+      draft._activated = true;
+      const ta = this.$refs && this.$refs.chatInput;
+      // Switching ownership while an IME buffer is live must end the old
+      // editor session before the shared textarea receives the new draft.
+      // blur normally emits compositionend; the explicit reset is a fallback
+      // for WebViews that omit it when focus moves programmatically.
+      if (ta && ta._museImeComposing && ta._museImeOwnerSid
+          && ta._museImeOwnerSid !== id) {
+        ta.blur();
+        if (ta._museImeComposing) this._resetImeCompositionState({ target: ta });
+      }
+      this._setChatInput(draft.input || "");
       this.pendingImages = draft.pendingImages;
       this.pendingDocs = draft.pendingDocs;
+      this.pendingQuotes = draft.pendingQuotes;
       this._sendWaitingForUpload = !!draft._sendWaitingForUpload;
       this.$nextTick(() => {
         if (this.currentId === id && this.$refs.chatInput) {
@@ -6572,46 +9798,88 @@ function portal() {
       return draft;
     },
 
-    // Mirror this tab's state into root fields so the UI sees it. Object refs
-    // (messages, sessionUsage, composer attachments) are shared — mutations
-    // from anywhere reflect. Primitives are copied and explicitly captured
-    // before ownership changes.
+    // Activate the shared composer and current-session compatibility controls.
+    // Session-panel fields stay owned by tabState[id] and are read through the
+    // pane façade instead of being copied into root state.
     _activateTabState(id) {
       const st = this._ensureTabState(id);
+      const meta = (this.sessions || []).find(s => s.id === id);
+      const selectedModel = st._modelExpected
+        ? st._modelExpected.value : (meta && meta.model);
+      if (selectedModel) this.model = selectedModel;
+      const mode = this._normalizePermissionMode(
+        st._permissionExpected
+          ? st._permissionExpected.value
+          : ((meta && meta.permission) || st.permission || this.defaultPermission),
+        "default",
+      );
+      st.permission = mode;
+      this.permission = mode;
+      st.effort = this._normalizeEffort(
+        st._effortExpected
+          ? st._effortExpected.value
+          : ((meta && meta.effort) || st.effort),
+      );
+      this.effort = st.effort;
+      st.serviceTier = this._normalizeServiceTier(
+        st._serviceTierExpected
+          ? st._serviceTierExpected.value
+          : (meta && Object.prototype.hasOwnProperty.call(meta, "service_tier")
+            ? meta.service_tier : st.serviceTier),
+      );
+      this.serviceTier = st.serviceTier;
       this._activateComposerState(id);
-      this.messages = st.messages;
-      this.sessionUsage = st.sessionUsage;
-      this.streaming = st.streaming;
-      this.es = st.es;
-      this.streamingModel = st.streamingModel;
-      this.streamElapsed = st.streamElapsed;
-      this.messagesReady = st.messagesReady !== false;
-      this.messagesLoading = !!st.messagesLoading;
-      this.historyGeneration = st.historyGeneration || "";
-      this._streamTimer = st._streamTimer;
-      this._streamStartedAt = st._streamStartedAt;
-      this.atBottom = st.atBottom !== false;
       // Tab cache may hold an out-of-date sessionUsage (e.g. backend table
       // updated since we last polled). Fire-and-forget a re-fetch so the
       // meter reflects current truth without blocking the UI swap.
       this._fetchTabUsage(id);
     },
 
-    // P1 (chat-perf-redesign): per-tab DOM persistence. The chat message
-    // list is rendered once PER OPEN TAB (outer x-for over openTabIds), each
-    // pane bound to ITS OWN message array via this method. Switching tabs
-    // then only toggles x-show on the panes instead of swapping the array
-    // backing a single x-for — which used to force Alpine to teardown +
-    // rebuild the entire message subtree (measured: ~88% of switch time was
-    // that JS rebuild, scaling O(messages) and making long/agentic sessions
-    // the worst case). The active tab's
-    // array is still mirrored to this.messages by _activateTabState, so
-    // every existing `messages`-reading binding stays correct for the
-    // VISIBLE pane (paneMessages(currentId) === this.messages by identity).
-    // Hidden panes' bindings still evaluate against this.messages but are
-    // display:none, so the (possibly stale) result is never seen.
+    // Retain a bounded set of recently-used virtualized transcript panes. Stream
+    // transport/state outlives its pane, so inactive live sessions must obey the
+    // same limit instead of keeping an unbounded hidden Alpine tree mounted.
+    _touchTranscriptPane(id) {
+      if (!id) return false;
+      const open = new Set(this.workspaceOpenTabIds());
+      open.add(id);
+      const mounted = (this._warmTranscriptTabs || []).filter(tid => open.has(tid));
+      const wasWarm = mounted.includes(id);
+      const previousLru = (this._transcriptPaneLru || []).filter(tid => open.has(tid));
+      const lru = [id, ...previousLru.filter(tid => tid !== id)];
+      this._transcriptPaneLru = lru;
+      const warmLimit = this._isMobileLayout() ? 1 : this.WARM_TRANSCRIPT_LIMIT;
+      const desired = lru.slice(0, warmLimit);
+      const desiredSet = new Set(desired);
+      // Preserve mount order for panes that remain warm. Reordering the x-for on
+      // every click would physically move several large DOM subtrees and recreate
+      // the very tab-switch cost this cache is meant to remove.
+      this._warmTranscriptTabs = [
+        ...mounted.filter(tid => desiredSet.has(tid)),
+        ...desired.filter(tid => !mounted.includes(tid)),
+      ];
+      return wasWarm;
+    },
+    warmTranscriptTabIds() {
+      const open = new Set(this.workspaceOpenTabIds());
+      const warm = (this._warmTranscriptTabs || []).filter(tid => open.has(tid));
+      if (this.currentId && open.has(this.currentId) && !warm.includes(this.currentId)) {
+        return [this.currentId, ...warm];
+      }
+      return warm;
+    },
+    _chatBodyElement() {
+      // chatBody lives below a nested x-data scope (`activeSession` façade).
+      // Alpine does not expose descendant component refs through the root
+      // portal's `$refs`, so every root-owned scroll path previously received
+      // undefined and returned before touching scrollTop. Querying the single
+      // physical chat scroller is the stable cross-scope ownership boundary.
+      const fromRefs = this.$refs && this.$refs.chatBody;
+      if (fromRefs) return fromRefs;
+      return typeof document !== "undefined"
+        ? document.querySelector(".chat-body") : null;
+    },
     _paneElement(tid) {
-      const body = this.$refs && this.$refs.chatBody;
+      const body = this._chatBodyElement();
       if (!body || !tid) return null;
       return body.querySelector(`.msg-pane[data-tid="${CSS.escape(tid)}"]`);
     },
@@ -6624,77 +9892,621 @@ function portal() {
       if (!tid) return null;
       return (this.tabState && this.tabState[tid]) || null;
     },
+    // Alpine-facing façade for single-instance transcript decorations and the
+    // root compatibility accessors. Every read resolves through the tab owner.
+    activeSessionPane() {
+      return this.paneState(this.currentId) || _EMPTY_ACTIVE_SESSION_PANE;
+    },
+    transcriptLoadingVisible() {
+      const st = this.activeSessionPane();
+      if (!this._sessionsInitialized && this.appReady && this.token) return true;
+      if (st?.transcriptLoadPhase === "error") return false;
+      return !!st && (
+        ["fetching", "mounting", "settling"].includes(st.transcriptLoadPhase)
+        || st.messagesLoading === true
+        || (st.messagesReady === false
+          && Array.isArray(st.messages) && st.messages.length > 0)
+      );
+    },
+    transcriptLoadFailed() {
+      const st = this.activeSessionPane();
+      return !!st && st.transcriptLoadPhase === "error";
+    },
+    transcriptEmptyReady() {
+      const st = this.activeSessionPane();
+      return !!st
+        && st._loaded === true
+        && st.messagesReady === true
+        && st.messagesLoading === false
+        && st.transcriptLoadPhase === "idle"
+        && Array.isArray(st.messages)
+        && !st.messages.length;
+    },
+    _beginTranscriptLoad(sid, st, phase = "fetching") {
+      if (!sid || !st || this.tabState[sid] !== st || st._sid !== sid) return null;
+      if ((st.streaming || st.es) && phase !== "mounting") return null;
+      st.transcriptLoadGeneration =
+        (Number(st.transcriptLoadGeneration) || 0) + 1;
+      st.transcriptLoadPhase = phase === "mounting" ? "mounting" : "fetching";
+      return { sid, state: st, generation: st.transcriptLoadGeneration };
+    },
+    _ownsTranscriptLoad(token) {
+      return !!token
+        && this.tabState[token.sid] === token.state
+        && token.state._sid === token.sid
+        && token.state.transcriptLoadGeneration === token.generation;
+    },
+    async _settleTranscriptLoad(token, options = {}) {
+      if (!this._ownsTranscriptLoad(token)) return false;
+      token.state.transcriptLoadPhase = "settling";
+      try {
+        if (!options.skipNextTick) {
+          await new Promise(resolve => this.$nextTick(resolve));
+          if (!this._ownsTranscriptLoad(token)) return false;
+        }
+        if (this.currentId === token.sid && options.returnToLatest !== false) {
+          const latest = await this.returnToLatest(token.sid);
+          if (!latest) throw new Error("transcript tail unavailable");
+          if (!this._ownsTranscriptLoad(token)) return false;
+        }
+        if (this.currentId === token.sid) {
+          if (options.singlePaint && typeof requestAnimationFrame === "function") {
+            await new Promise(resolve => requestAnimationFrame(resolve));
+          } else {
+            await new Promise(resolve => this._afterPaint(resolve));
+          }
+          if (!this._ownsTranscriptLoad(token)) return false;
+        }
+        token.state.transcriptLoadPhase = "idle";
+        return true;
+      } catch (_) {
+        this._failTranscriptLoad(token);
+        return false;
+      }
+    },
+    _failTranscriptLoad(token) {
+      if (!this._ownsTranscriptLoad(token)) return false;
+      // The phase is the visual transaction authority. Clear the legacy loading
+      // gates too so an overlapping history attempt cannot leave the opaque
+      // shield above the resident-content error banner.
+      token.state.messagesLoading = false;
+      token.state.messagesReady = true;
+      token.state.transcriptLoadPhase = "error";
+      return true;
+    },
+    _releaseTranscriptLoadForLive(st) {
+      if (!st) return;
+      st.transcriptLoadGeneration =
+        (Number(st.transcriptLoadGeneration) || 0) + 1;
+      st.transcriptLoadPhase = "idle";
+    },
+    async retryTranscriptLoad() {
+      const sid = this.currentId;
+      const st = sid && this.tabState[sid];
+      if (!sid || !st || st.streaming || st.es
+          || ["fetching", "mounting", "settling"]
+            .includes(st.transcriptLoadPhase)) return false;
+      if (!st.messages.length) st._loaded = false;
+      return await this._ensureSessionLoaded(sid);
+    },
+    _setActiveSessionPaneField(field, value) {
+      const st = this.paneState(this.currentId);
+      if (st) st[field] = value;
+    },
+    _visiblePaneMessages(st) {
+      if (!st || !Array.isArray(st.messages)) return [];
+      const range = st.messageRange;
+      if (!range) return st.messages;
+      // Enforce the visible-range invariant at the final pane boundary too.
+      // State handoff/clone paths can outlive the load generation that would
+      // normally repair an interrupted reveal; a non-empty repository must
+      // never derive an empty mounted pane.
+      this._ensureNonEmptyMessageRange(st);
+      if (range.visibleStart === 0 && range.visibleEnd === st.messages.length) {
+        return st.messages;
+      }
+      return st.messages.slice(range.visibleStart, range.visibleEnd);
+    },
+    _ensureNonEmptyMessageRange(st) {
+      if (!st || !Array.isArray(st.messages) || !st.messages.length) return false;
+      const range = st.messageRange;
+      if (!range) return true;
+      const length = st.messages.length;
+      range.visibleStart = Math.max(
+        0, Math.min(Number(range.visibleStart) || 0, length));
+      range.visibleEnd = Math.max(
+        range.visibleStart, Math.min(Number(range.visibleEnd) || 0, length));
+      if (range.visibleEnd <= range.visibleStart) {
+        range.visibleEnd = length;
+        range.visibleStart = Math.max(0, length - 1);
+      }
+      return true;
+    },
+    _containsPaneMessage(st, message) {
+      // Streaming ownership must be checked against the authoritative resident
+      // repository, not only the currently revealed/virtualized slice. The old
+      // three-array adapter supplied this helper implicitly; removing it without
+      // this direct replacement made every text event throw before auto-follow.
+      return !!(st && Array.isArray(st.messages) && st.messages.includes(message));
+    },
     paneMessages(tid) {
-      // Pure read: must NOT mutate tabState (this runs inside an x-for render
-      // getter — creating state here via _ensureTabState both side-effects the
-      // store during render AND races tab teardown, which surfaced as an
-      // uncaught "reading 'length'" when a closing pane briefly resolved to an
-      // undefined iterable). Always hand Alpine a real array.
+      // The repository remains authoritative; this is only its revealed slice.
       if (!tid) return [];
-      const st = this.tabState && this.tabState[tid];
-      return (st && st.messages) || [];
+      return this._visiblePaneMessages(this.tabState && this.tabState[tid]);
+    },
+    _messageVirtualHeight(st, message) {
+      const key = message && message._k;
+      const measured = key && Number(st._virtualHeights[key]);
+      return measured > 0 ? measured : this.estIntrinsicH(message);
+    },
+    messageIntrinsicH(st, message) {
+      return st ? this._messageVirtualHeight(st, message) : this.estIntrinsicH(message);
+    },
+    _messageVirtualGap(pane) {
+      if (!pane || typeof getComputedStyle !== "function") return 8;
+      const gap = parseFloat(getComputedStyle(pane).rowGap || "8");
+      return Number.isFinite(gap) ? gap : 8;
+    },
+    _messageVirtualRangeHeight(st, messages, start, end, gap = 8) {
+      let height = 0;
+      for (let i = start; i < end; i++) {
+        height += this._messageVirtualHeight(st, messages[i]);
+      }
+      if (end > start) height += Math.max(0, end - start - 1) * gap;
+      return Math.max(0, Math.round(height));
+    },
+    _initialMessageVirtualRange(st) {
+      const messages = this._visiblePaneMessages(st);
+      const target = 2400;
+      let start = messages.length;
+      let height = 0;
+      while (start > 0 && height < target) {
+        start--;
+        height += this._messageVirtualHeight(st, messages[start]) + 8;
+      }
+      return { start, end: messages.length };
+    },
+    _captureMessageVirtualWindow(st) {
+      const messages = this._visiblePaneMessages(st);
+      if (!messages.length || st._virtualStart < 0 || st._virtualEnd <= st._virtualStart) {
+        return null;
+      }
+      const start = Math.max(0, Math.min(st._virtualStart, messages.length - 1));
+      const end = Math.max(start + 1, Math.min(st._virtualEnd, messages.length));
+      return {
+        startKey: messages[start] && messages[start]._k,
+        endKey: messages[end - 1] && messages[end - 1]._k,
+      };
+    },
+    _rebaseMessageVirtualWindow(st, snapshot, followTail = false) {
+      const messages = this._visiblePaneMessages(st);
+      if (!messages.length) {
+        st._virtualStart = -1;
+        st._virtualEnd = -1;
+        st._virtualRevision++;
+        return;
+      }
+      let next = null;
+      if (followTail) {
+        next = this._initialMessageVirtualRange(st);
+      } else if (snapshot) {
+        const start = messages.findIndex(m => m && m._k === snapshot.startKey);
+        const end = messages.findIndex(m => m && m._k === snapshot.endKey);
+        if (start >= 0 || end >= 0) {
+          next = {
+            start: start >= 0 ? start : Math.max(0, end - 24),
+            end: end >= 0 ? end + 1 : Math.min(messages.length, start + 25),
+          };
+        }
+      }
+      if (!next) next = this._initialMessageVirtualRange(st);
+      st._virtualStart = next.start;
+      st._virtualEnd = next.end;
+      st._virtualRevision++;
+    },
+    paneMessageRows(tid) {
+      const st = tid && this.tabState && this.tabState[tid];
+      const messages = this._visiblePaneMessages(st);
+      if (!st || !messages.length) return [];
+      // Render the resident window directly. The custom estimated-height spacers
+      // could not keep up with fast wheel/touch movement: readers outran the
+      // mounted range into blank space, then each measured-height correction
+      // resized the scrollbar and flashed the pane. Network paging still bounds
+      // the resident range; the browser now owns layout with exact row heights.
+      return messages.map((message, index) => ({
+        key: message._k, index, message, spacer: false,
+      }));
+    },
+    _measureMessageVirtualRows(tid, st) {
+      const pane = this._paneElement(tid);
+      if (!pane || this.tabState[tid] !== st) return false;
+      let changed = false;
+      for (const el of pane.querySelectorAll(".msg[data-message-key]")) {
+        const key = el.getAttribute("data-message-key");
+        const height = Math.max(1, Math.round(el.getBoundingClientRect().height));
+        if (key && st._virtualHeights[key] !== height) {
+          st._virtualHeights[key] = height;
+          changed = true;
+        }
+      }
+      if (changed) st._virtualRevision++;
+      return changed;
+    },
+    _syncMessageViewport(tid = this.currentId, forceTail = false) {
+      // Intentionally no-op: paneMessageRows renders the resident range with
+      // exact browser layout. Keeping the old velocity/estimated-height window
+      // updater active would continue rewriting indexes and restoring anchors
+      // on every scroll frame even though there are no virtual spacers left.
+      void tid;
+      void forceTail;
+    },
+    _scheduleMessageViewportSync(tid = this.currentId, forceTail = false) {
+      // Exact-height messageRange windows need no estimated spacer maintenance.
+      void tid;
+      void forceTail;
+    },
+    _shiftMessageVirtualWindow(st, delta) {
+      if (!st || !delta || st._virtualStart < 0) return;
+      st._virtualStart += delta;
+      st._virtualEnd += delta;
+      st._virtualRevision++;
     },
 
-    // [resident-panes] The id list the message-pane x-for iterates. Returns the
-    // LRU resident set, but ALWAYS overlays currentId so the VISIBLE pane is
-    // mounted even if some code path set currentId without going through
-    // switchSession's promote (defensive — switchSession + initSessions keep
-    // currentId in _residentTabIds in the normal flow). Pure read: NO mutation
-    // (runs inside x-for render). Reactive on _residentTabIds + currentId, so the
-    // pane set re-evaluates exactly when either changes; :key="tid" keeps stable
-    // panes from rebuilding.
-    residentPaneIds() {
-      const budget = this._isMobileLayout() ? 1 : this._MAX_RESIDENT_PANES;
-      const list = (this._residentTabIds || []).filter(Boolean);
-      if (this._isMobileLayout()) {
-        return this.currentId ? [this.currentId] : list.slice(0, 1);
+    _chatMuxCheckpoints() {
+      const rows = [];
+      const seen = new Set();
+      for (const [sid, channel] of this._chatMuxChannels) {
+        if (!channel || channel.readyState === 2) continue;
+        const st = this.tabState && this.tabState[sid];
+        const turnId = String((st && st.activeTurnId) || channel.turnId || "");
+        if (!turnId) continue;
+        rows.push({
+          session_id: sid,
+          turn_id: turnId,
+          last_event_seq: Math.max(0, Number(st && st.lastEventSeq) || 0),
+        });
+        seen.add(sid);
       }
-      const stable = list.slice(0, budget);
-      if (this.currentId && !stable.includes(this.currentId)) {
-        if (stable.length >= budget) stable.pop();
-        stable.push(this.currentId);
+      for (const meta of (this.sessions || [])) {
+        if (!meta || !meta.active || seen.has(meta.id)) continue;
+        const st = this.tabState && this.tabState[meta.id];
+        const turnId = String((st && st.activeTurnId) || meta.turn_id || "");
+        if (!turnId) continue;
+        rows.push({
+          session_id: meta.id,
+          turn_id: turnId,
+          last_event_seq: Math.max(0, Number(st && st.lastEventSeq) || 0),
+        });
       }
-      return stable;
+      return rows;
     },
-    // [resident-panes] LRU bookkeeping. Promote `tid` to most-recently-used, then
-    // evict panes past _MAX_RESIDENT_PANES from the LRU end — but NEVER evict the
-    // current tab (it's on-screen) or a tab with a live stream (its bubbles are
-    // being written by SSE handlers; unmounting would drop the in-progress reply
-    // from view until a rebuild). An evicted tab's _highlighted is reset so its
-    // future rebuilt DOM re-runs syntax highlight.
-    _promoteResident(tid) {
-      if (!tid) return;
-      const budget = this._isMobileLayout() ? 1 : this._MAX_RESIDENT_PANES;
-      let residents = Array.from(new Set(
-        (this._residentTabIds || []).filter(Boolean)));
-      let lru = (this._residentTabLru || []).filter(
-        x => residents.includes(x) && x !== tid);
-      // Bootstrap recency for state created before this field existed and for
-      // deterministic browser fixtures that seed resident ids directly.
-      for (const id of residents) {
-        if (id !== tid && !lru.includes(id)) lru.push(id);
+    async _bootstrapChatMuxHistory() {
+      const active = (this.sessions || []).filter(meta => meta && meta.active && meta.id);
+      const concurrency = this._isMobileLayout() ? 1 : 2;
+      let next = 0;
+      const worker = async () => {
+        while (next < active.length) {
+          const meta = active[next++];
+          const st = this._ensureTabState(meta.id);
+          if (st.streaming || st.es || st._loaded) continue;
+          try {
+            await this.loadSession(meta.id, { quiet: true, probeActive: false });
+          } catch (_) { /* the mux replay remains authoritative */ }
+        }
+      };
+      await Promise.all(Array.from(
+        { length: Math.min(concurrency, active.length) }, () => worker()));
+    },
+    _setChatMuxUnsupported() {
+      this._chatMuxSupported = false;
+      this._chatMuxConnected = false;
+      if (this._chatMuxReconnectTimer) clearTimeout(this._chatMuxReconnectTimer);
+      this._chatMuxReconnectTimer = null;
+      try { if (this._chatMuxSource) this._chatMuxSource.close(); } catch (_) {}
+      this._chatMuxSource = null;
+      for (const channel of this._chatMuxChannels.values()) channel.disconnect();
+    },
+    _scheduleChatMuxReconnect() {
+      if (this._chatMuxSupported === false || !this.token
+          || this._chatMuxReconnectTimer) return;
+      const attempts = ++this._chatMuxReconnectAttempts;
+      const delay = Math.min(10_000, 500 * (2 ** Math.min(attempts - 1, 4)));
+      this._chatMuxReconnectTimer = setTimeout(() => {
+        this._chatMuxReconnectTimer = null;
+        void this._ensureChatMux({ reconnect: true });
+      }, delay);
+    },
+    async _ensureChatMux(options = {}) {
+      if (this._chatMuxSupported === false || !this.token
+          || typeof EventSource === "undefined") return false;
+      if (this._chatMuxStartPromise) return await this._chatMuxStartPromise;
+      if (this._chatMuxSource && !options.reconnect) {
+        return this._chatMuxConnected;
       }
-      lru.unshift(tid);
-      if (!residents.includes(tid)) residents.push(tid);
-      while (residents.length > budget) {
-        const cand = [...lru].reverse().find(
-          id => id !== tid && id !== this.currentId && residents.includes(id));
-        if (!cand) break;
-        residents = residents.filter(id => id !== cand);
-        lru = lru.filter(id => id !== cand);
-        const cst = this.tabState && this.tabState[cand];
-        // DOM residency is independent from stream ownership. Hidden streams keep
-        // mutating their tab state through SSE and rebuild when activated.
-        if (cst) cst._highlighted = false;
+      this._chatMuxStartPromise = this._openChatMux();
+      try {
+        return await this._chatMuxStartPromise;
+      } finally {
+        this._chatMuxStartPromise = null;
       }
-      this._residentTabLru = lru;
-      // Avoid touching the x-for dependency when membership did not change.
-      // Assignment itself makes Alpine reconcile every pane even if the ids
-      // are semantically equal.
-      if (residents.length !== (this._residentTabIds || []).length
-          || residents.some((id, i) => id !== this._residentTabIds[i])) {
-        this._residentTabIds = residents;
+    },
+    async _openChatMux() {
+      try { if (this._chatMuxSource) this._chatMuxSource.close(); } catch (_) {}
+      this._chatMuxSource = null;
+      this._chatMuxConnected = false;
+      for (const channel of this._chatMuxChannels.values()) channel.disconnect();
+      let response;
+      try {
+        response = await fetch("/api/chat/stream/mux/start", {
+          method: "POST",
+          headers: Object.assign({ "Content-Type": "application/json" }, this.hdr()),
+          body: JSON.stringify({
+            checkpoints: this._chatMuxCheckpoints(),
+            mobile: this._isMobileLayout(),
+          }),
+        });
+      } catch (_) {
+        this._scheduleChatMuxReconnect();
+        return false;
       }
+      if (response.status === 404 || response.status === 405) {
+        this._setChatMuxUnsupported();
+        return false;
+      }
+      if (!response.ok) {
+        this._scheduleChatMuxReconnect();
+        return false;
+      }
+      let payload;
+      try { payload = await response.json(); } catch (_) { payload = {}; }
+      if (!payload.ticket) {
+        this._scheduleChatMuxReconnect();
+        return false;
+      }
+      this._chatMuxSupported = true;
+      const source = new EventSource(
+        "/api/chat/stream/mux?ticket=" + encodeURIComponent(payload.ticket));
+      this._chatMuxSource = source;
+      let openSettled = false;
+      let settleOpen;
+      const opened = new Promise(resolve => { settleOpen = resolve; });
+      const finishOpen = value => {
+        if (openSettled) return;
+        openSettled = true;
+        settleOpen(value);
+      };
+      const openTimeout = setTimeout(() => {
+        if (this._chatMuxSource !== source || this._chatMuxConnected) return;
+        try { source.close(); } catch (_) {}
+        this._chatMuxSource = null;
+        finishOpen(false);
+        this._scheduleChatMuxReconnect();
+      }, 5000);
+      source.onopen = () => {
+        if (this._chatMuxSource !== source) return;
+        clearTimeout(openTimeout);
+        this._chatMuxConnected = true;
+        this._chatMuxReconnectAttempts = 0;
+        finishOpen(true);
+        for (const channel of this._chatMuxChannels.values()) {
+          if (channel._activated) channel.open();
+        }
+      };
+      source.addEventListener("session_state", ev => {
+        if (this._chatMuxSource !== source) return;
+        let state = {};
+        try { state = JSON.parse(ev.data) || {}; } catch (_) {}
+        void this._handleChatMuxSessionState(state);
+      });
+      for (const type of CHAT_MUX_STREAM_EVENTS) {
+        source.addEventListener(type, ev => {
+          if (this._chatMuxSource !== source) return;
+          if (type === "error" && (ev.data === undefined || ev.data === "")) {
+            this._handleChatMuxDisconnect(source);
+            return;
+          }
+          if (type === "ping" && !ev.data) {
+            for (const channel of this._chatMuxChannels.values()) {
+              if (channel._activated && channel.readyState !== 2) {
+                channel.dispatchEvent(new MessageEvent("ping", { data: "" }));
+              }
+            }
+            return;
+          }
+          this._dispatchChatMuxEvent(type, ev.data);
+        });
+      }
+      source.onerror = ev => {
+        if (ev && ev.data !== undefined && ev.data !== "") return;
+        clearTimeout(openTimeout);
+        finishOpen(false);
+        this._handleChatMuxDisconnect(source);
+      };
+      return await opened;
+    },
+    _handleChatMuxDisconnect(source) {
+      if (this._chatMuxSource !== source) return;
+      try { source.close(); } catch (_) {}
+      this._chatMuxSource = null;
+      this._chatMuxConnected = false;
+      for (const channel of this._chatMuxChannels.values()) channel.disconnect();
+      // The per-session reducers retain logical ownership while the one native
+      // transport reconnects. In particular, do not synthesize `error`/`done`.
+      this._scheduleChatMuxReconnect();
+    },
+    _queueChatMuxEvent(sid, type, data) {
+      let pending = this._chatMuxPendingEvents.get(sid);
+      if (!pending) {
+        pending = [];
+        pending._bytes = 0;
+      }
+      const bytes = String(data || "").length;
+      if (pending.length >= CHAT_MUX_BOOTSTRAP_MAX_EVENTS
+          || pending._bytes + bytes > CHAT_MUX_BOOTSTRAP_MAX_BYTES) {
+        if (!pending._overflowed) {
+          pending.length = 0;
+          pending._bytes = 0;
+          pending._overflowed = true;
+          pending.push({
+            type: "resync",
+            data: JSON.stringify({
+              session_id: sid,
+              reason: "bootstrap_overflow",
+              fallback: "canonical_history",
+              retryable: false,
+            }),
+          });
+        }
+      } else if (!pending._overflowed) {
+        pending.push({ type, data });
+        pending._bytes += bytes;
+      }
+      this._chatMuxPendingEvents.set(sid, pending);
+    },
+    _dispatchChatMuxEvent(type, data) {
+      let payload = null;
+      try { payload = JSON.parse(data); } catch (_) {}
+      const sid = String(payload && payload.session_id || "");
+      if (!sid) return;
+      const turnId = String(payload.turn_id || "");
+      const channel = this._chatMuxChannels.get(sid);
+      if (!channel || !channel._activated
+          || (channel.turnId && turnId && channel.turnId !== turnId)) {
+        this._queueChatMuxEvent(sid, type, data);
+        return;
+      }
+      channel.dispatchEvent(new MessageEvent(type, { data }));
+    },
+    _chatMuxChannel(sid, turnId) {
+      const existing = this._chatMuxChannels.get(sid);
+      if (existing && existing.readyState !== 2
+          && (!turnId || !existing.turnId || existing.turnId === turnId)) {
+        if (!existing.turnId && turnId) existing.turnId = turnId;
+        return existing;
+      }
+      if (existing) existing.close();
+      const channel = new ChatMuxSessionChannel(sid, turnId, closed => {
+        if (this._chatMuxChannels.get(sid) === closed) {
+          this._chatMuxChannels.delete(sid);
+        }
+      });
+      this._chatMuxChannels.set(sid, channel);
+      return channel;
+    },
+    _activateChatMuxChannel(channel) {
+      if (!channel || channel.readyState === 2) return;
+      channel._activated = true;
+      if (this._chatMuxConnected) channel.open();
+      const pending = this._chatMuxPendingEvents.get(channel.sessionId) || [];
+      this._chatMuxPendingEvents.delete(channel.sessionId);
+      for (const event of pending) {
+        let payload = null;
+        try { payload = JSON.parse(event.data); } catch (_) {}
+        const turnId = String(payload && payload.turn_id || "");
+        if (channel.turnId && turnId && channel.turnId !== turnId) continue;
+        channel.dispatchEvent(new MessageEvent(event.type, { data: event.data }));
+      }
+    },
+    async _handleChatMuxSessionState(payload) {
+      const sid = String(payload && payload.session_id || "");
+      if (!sid) return;
+      const meta = (this.sessions || []).find(session => session.id === sid);
+      const existingState = this.tabState && this.tabState[sid];
+      if (!payload.active) {
+        const inactiveTurnId = String(payload.turn_id || "");
+        const currentTurnId = String(existingState && existingState.activeTurnId || "");
+        if (inactiveTurnId && currentTurnId && inactiveTurnId !== currentTurnId) {
+          // A delayed inactive frame for turn A must not retire or relabel its
+          // already-admitted successor turn B in the same session.
+          return;
+        }
+        if (meta) {
+          meta.active = false;
+          meta.turn_active = false;
+          meta.background_active = false;
+        }
+        this._chatMuxPendingEvents.delete(sid);
+        const ownsInactiveTurn = !!(existingState && inactiveTurnId
+          && currentTurnId === inactiveTurnId);
+        if (ownsInactiveTurn) {
+          if (existingState._stoppingTurnId === inactiveTurnId) {
+            existingState._stoppingTurnId = "";
+          }
+          this._retireStaleSessionStream(sid, existingState);
+          this._setSessionActivityExpectation(sid, false);
+          existingState._pendingExternalUpdate = true;
+          this._scheduleCanonicalStreamReload(
+            sid, existingState, { minimumWaitMs: 0 });
+          return;
+        }
+        if (existingState && !existingState.streaming) {
+          this._setBackgroundTaskActive(sid, false, payload.started_at, 0);
+        }
+        return;
+      }
+      if (meta) {
+        meta.active = true;
+        meta.turn_active = !payload.background;
+        meta.background_active = !!payload.background;
+      }
+      if (payload.attachable === false) {
+        // Watcher-only ownership has no replayable turn yet. Preserve its blue
+        // dot/background state, but do not create a reducer runtime until the
+        // continuation broadcast becomes attachable.
+        if (existingState && !existingState.streaming) {
+          this._setBackgroundTaskActive(
+            sid, true, payload.started_at, payload.background_tasks_pending);
+        }
+        return;
+      }
+      const turnId = String(payload.turn_id || "");
+      if (!turnId) return;
+      if (existingState && payload.stopping) {
+        existingState._stoppingTurnId = turnId;
+      }
+      if (existingState && existingState.es
+          && existingState.activeTurnId === turnId) return;
+      if (existingState && existingState.es && existingState.es._muxChannel
+          && existingState.activeTurnId
+          && existingState.activeTurnId !== turnId) {
+        // The aggregate state frame is authoritative for ABA turn changes. Retire
+        // only the stale logical adapter; the root EventSource remains shared.
+        this._retireStaleSessionStream(sid, existingState);
+        existingState._pendingExternalUpdate = true;
+      }
+      if (this._chatMuxAttachPromises.has(sid)) return;
+      const attach = (async () => {
+        const st = this._ensureTabState(sid);
+        if (!st._loaded && !st.streaming && !st.es) {
+          await this.loadSession(sid, { quiet: true, probeActive: false });
+        }
+        if (st.streaming || st.es || this.tabState[sid] !== st) return;
+        st.parentTurnId = String(payload.parent_turn_id || "");
+        await this.send({
+          reconnect: true,
+          sessionId: sid,
+          turnId,
+          startedAt: payload.started_at,
+          continuation: !!payload.continuation,
+          _muxAttach: true,
+        });
+      })();
+      this._chatMuxAttachPromises.set(sid, attach);
+      try { await attach; } finally {
+        if (this._chatMuxAttachPromises.get(sid) === attach) {
+          this._chatMuxAttachPromises.delete(sid);
+        }
+      }
+    },
+    async _startChatMuxCoordinator() {
+      if (this._chatMuxSupported === false) return false;
+      // Establish the one authoritative live transport before any background
+      // transcript warmup. A turn can start while history is loading; mux-first
+      // startup guarantees its accepted/session_state events already have a sink.
+      const connected = await this._ensureChatMux();
+      if (!connected) return false;
+      await this._bootstrapChatMuxHistory();
+      return true;
     },
 
     async initSessions(options = {}) {
@@ -6720,6 +10532,15 @@ function portal() {
         this.connState = "reconnecting";
         return false;
       }
+      // An empty session can be recycled server-side while the browser is
+      // refreshing (especially after a send failed before its turn existed).
+      // Preserve the old landing tab's local text before choosing/creating a
+      // replacement id, then move it to that replacement below.
+      const previousId = this.currentId;
+      const previousState = previousId && this.tabState[previousId];
+      const previousDraft = previousState && previousState.draft
+        ? (previousState.draft.input || "")
+        : (previousId ? this._consumePersistedChatDraft(previousId) : "");
       const inWorkspace = this.workspaceSessions();
       const remembered = this.workspaceLastSession[this.currentWorkspacePath()];
       if (!inWorkspace.length) {
@@ -6732,32 +10553,64 @@ function portal() {
         const target = inWorkspace.find(s => s.id === remembered) || inWorkspace[0];
         this.currentId = target.id;
       }
-      // Reconcile openTabIds (restored from prefs) with what still exists on
-      // the server: drop tabs whose session was deleted, then ensure currentId
-      // is in the list. Other tabs are lazy-loaded on first switch.
+      // Reconcile openTabIds (restored from the standalone tab store) with what
+      // still exists on the server: drop deleted sessions, then choose a valid
+      // landing tab without reviving a currentId closed by another page. Other
+      // tabs are lazy-loaded on first switch.
       const validIds = new Set(this.sessions.map(s => s.id));
-      this.openTabIds = (this.openTabIds || []).filter(id => validIds.has(id));
+      this.openTabIds = this._normalizeOpenTabIds(this.openTabIds, validIds);
       if (!this.openTabIds.includes(this.currentId)) {
-        this.openTabIds.push(this.currentId);
+        // A shared tab-strip update may have closed the id saved as this page's
+        // old currentId. Prefer an existing tab instead of reviving that id.
+        const workspaceTab = this.openTabIds.find(id => {
+          const session = this.sessions.find(row => row.id === id);
+          return session && session.cwd === this.currentWorkspacePath();
+        });
+        if (workspaceTab || this.openTabIds.length) {
+          this.currentId = workspaceTab || this.openTabIds[0];
+        } else {
+          this.openTabIds.push(this.currentId);
+        }
       }
+      this._writeChatTabStore(this.openTabIds);
       if (this.currentWorkspacePath() && this.currentId) {
         this.workspaceLastSession = {
           ...this.workspaceLastSession,
           [this.currentWorkspacePath()]: this.currentId,
         };
       }
-      // [resident-panes] Seed the LRU with the landing tab only. Other restored
-      // tabs lazy-mount on first switch (rebuild path), so a multi-tab restore
-      // doesn't pay to render every pane up front.
-      this._residentTabIds = [this.currentId];
-      this._residentTabLru = [this.currentId];
+      if (previousId && previousId !== this.currentId && previousDraft) {
+        const landingState = this._ensureTabState(this.currentId);
+        landingState.draft.input = this._mergeChatDraftText(
+          previousDraft, landingState.draft.input || "",
+        );
+        this._persistChatDraft(this.currentId, landingState.draft.input);
+        this._deletePersistedChatDraft(previousId);
+      }
+      this._touchTranscriptPane(this.currentId);
       this._activateTabState(this.currentId);
       const st = this._ensureTabState(this.currentId);
       if (!st._loaded) {
         await this._ensureSessionLoaded(this.currentId);
       }
+      // Reproduce the already-active tab click once after cold restoration. The
+      // transcript load resolves before Alpine has necessarily mounted its pane;
+      // if the earlier tail scroll ran in that gap, only the virtual top spacer
+      // remains visible until the user clicks the selected tab manually.
+      const restoredId = this.currentId;
+      this.$nextTick(() => this._afterPaint(() => {
+        const restored = this.tabState && this.tabState[restoredId];
+        if (this.currentId !== restoredId || !restored
+            || !restored.messages.length || restored.atBottom === false) return;
+        restored.messagesReady = true;
+        this.scrollToBottom(true);
+      }));
       this._sessionsInitialized = true;
       this._scheduleSavePrefs();
+      // Session discovery and the initial bounded transcript tail are now ready.
+      // Start exactly one root chat EventSource; every active session attaches to
+      // it through a lightweight EventSource-compatible channel.
+      void this._startChatMuxCoordinator();
       return true;
     },
     // Shared session-list pull behind both the explicit refresh and the 10s
@@ -6871,26 +10724,59 @@ function portal() {
       const st = meta && this.tabState && this.tabState[meta.id];
       if (!st) return meta;
       let out = meta;
+      const permissionExpected = st._permissionExpected;
       const fields = [
         ["_permissionExpected", "_permissionPatchTail", "permission",
-          value => value || "default"],
-        ["_effortExpected", "_effortPatchTail", "effort",
-          value => value || ""],
+          value => value || "default", false],
+        ["_modelExpected", "_runtimeSettingPatchTail", "model",
+          value => String(value || ""), true],
+        ["_effortExpected", "_runtimeSettingPatchTail", "effort",
+          value => this._normalizeEffort(value), true],
+        ["_serviceTierExpected", "_runtimeSettingPatchTail", "service_tier",
+          value => this._normalizeServiceTier(value), true],
         ["_thinkingExpected", "_thinkingPatchTail", "thinking",
-          value => value !== false],
+          value => value !== false, false],
       ];
-      for (const [expectedKey, tailKey, field, normalize] of fields) {
+      const now = Date.now();
+      for (const [expectedKey, tailKey, field, normalize, bounded] of fields) {
         const expected = st[expectedKey];
         if (!expected) continue;
+        if (bounded) {
+          const expectedAt = Number(expected.at);
+          if (!Number.isFinite(expectedAt) || expectedAt <= 0) {
+            expected.at = now;
+          } else if (now - expectedAt
+              > this.SESSION_SETTING_EXPECTED_TTL_MS) {
+            // A successful local write normally clears as soon as the server
+            // echoes it. Bound the optimistic shadow when that echo is missed,
+            // otherwise a later cross-device authoritative value is hidden for
+            // the lifetime of this browser tab.
+            st[expectedKey] = null;
+            continue;
+          }
+        }
         const incoming = normalize(meta[field]);
         if (incoming === expected.value) {
           expected.fallback = incoming;
-          if (st[tailKey]) expected.echoed = true;
+          if (bounded) {
+            // Keep the short lease even after the first matching echo: an HTTP
+            // response that started before the PATCH can still arrive later.
+            // The fixed TTL is the bound that eventually yields to remote truth.
+            expected.echoed = true;
+          } else if (st[tailKey]) expected.echoed = true;
           else st[expectedKey] = null;
           continue;
         }
         if (out === meta) out = { ...meta };
         out[field] = expected.value;
+      }
+      // A mode transition and its plan return target are one atomic session
+      // setting. When a stale list response is held behind an expected
+      // permission value, hold its companion field too.
+      if (permissionExpected && st._permissionExpected
+          && permissionExpected.planReturnPermission !== undefined) {
+        if (out === meta) out = { ...meta };
+        out.plan_return_permission = permissionExpected.planReturnPermission;
       }
       return out;
     },
@@ -6946,9 +10832,55 @@ function portal() {
       if (_pending.length) {
         next = [...(_pending.map(id => _om[id])), ...next];
       }
+      // An eager detached-runtime fork deliberately hides its predecessor from
+      // the canonical list before this browser has received/adopted the child
+      // id. Retain the already-open local row only for that bounded handoff
+      // window; otherwise workspaceOpenTabIds filters it out and the active tab
+      // visibly disappears between the quiet poll and continue-detached.
+      const _handoffRows = (this.sessions || []).filter(meta => {
+        if (!meta || _present.has(meta.id)
+            || !(this.openTabIds || []).includes(meta.id)) return false;
+        const state = this.tabState && this.tabState[meta.id];
+        return !!(state && (state._backgroundHandoffScheduled
+          || state._backgroundHandoffPromise));
+      });
+      if (_handoffRows.length) next = [..._handoffRows, ...next];
       next = next
         .map(meta => this._retainExpectedSessionSettings(meta))
         .map(meta => this._retainExpectedSessionActivity(meta));
+      // Keep every warm tab's primitive mirror aligned even when the rendered
+      // session list is shallow-equal and takes the fast return below.
+      for (const meta of next) {
+        const st = this.tabState && this.tabState[meta.id];
+        if (!st) continue;
+        st.permission = this._normalizePermissionMode(
+          st._permissionExpected
+            ? st._permissionExpected.value
+            : (meta.permission || st.permission || this.defaultPermission),
+          "default",
+        );
+        st.effort = this._normalizeEffort(
+          st._effortExpected ? st._effortExpected.value : meta.effort,
+        );
+        st.serviceTier = this._normalizeServiceTier(
+          st._serviceTierExpected
+            ? st._serviceTierExpected.value : meta.service_tier,
+        );
+      }
+      const activeMeta = next.find(meta => meta.id === this.currentId);
+      if (activeMeta) {
+        const activeState = this._ensureTabState(this.currentId);
+        this.permission = this._normalizePermissionMode(
+          activeState._permissionExpected
+            ? activeState._permissionExpected.value
+            : (activeMeta.permission || activeState.permission
+              || this.defaultPermission),
+          "default",
+        );
+        activeState.permission = this.permission;
+        this.effort = activeState.effort;
+        this.serviceTier = activeState.serviceTier;
+      }
       // Keep the OPEN conversation's messages live too — not just the session
       // LIST. Runs BEFORE the equality early-return so it fires every pull even
       // when the picker itself doesn't need a re-render (e.g. a turn still
@@ -6985,154 +10917,147 @@ function portal() {
     // "nothing changed" tick. `_openSeenUpdated` is the updated_at the rendered
     // messages reflect; a real load / switch / our-own-stream-done re-baselines
     // it (set to undefined) so we never reload a session we just pulled.
-    async _recoverStalledStream(sid = this.currentId) {
+    _recoverStalledStream(sid = this.currentId) {
       const st = sid && this.tabState && this.tabState[sid];
-      if (!st || (!st.streaming && !st.es) || st._reconnectTimer) return false;
-      if (st._streamHealthProbe) return st._streamHealthProbe;
-
+      if (!st || (!st.streaming && !st.es) || st._reconnectTimer) {
+        return Promise.resolve(false);
+      }
       const ownerEs = st.es;
+      if (ownerEs && ownerEs._muxChannel && !this._chatMuxConnected) {
+        this._scheduleChatMuxReconnect();
+        return Promise.resolve(false);
+      }
       const observedActivity = Number(st._lastSseActivity)
         || Number(st._streamStartedAt) || Date.now();
       const transportClosed = !!(ownerEs && Number(ownerEs.readyState) === 2);
-      if (!transportClosed && Date.now() - observedActivity < 18_000) return false;
-
-      const task = (async () => {
-        const controller = new AbortController();
-        const timeout = setTimeout(
-          () => controller.abort(),
+      if (!transportClosed && Date.now() - observedActivity < 18_000) {
+        return Promise.resolve(false);
+      }
+      return this._requestSessionSync(sid, "stream_health", { ownerEs });
+    },
+    async _runStreamHealthSync(sid, st, options = {}) {
+      const ownerEs = options.ownerEs;
+      if (this.tabState[sid] !== st || st.es !== ownerEs) return false;
+      try {
+        const r = await this._fetchWithDeadline(
+          `/api/chat/sessions/${sid}/active`,
+          { headers: this.hdr(), signal: options.signal },
           Math.max(100, Number(this._sessionListTimeoutMs) || 8000),
         );
-        try {
-          const r = await fetch(`/api/chat/sessions/${sid}/active`, {
-            headers: this.hdr(), signal: controller.signal,
-          });
-          if (!r.ok) return false;
-          const d = await r.json();
-          if (this.tabState[sid] !== st || st.es !== ownerEs) return false;
-
-          if (d.active) {
-            st._serverActiveObserved = true;
-            if (d.background && d.attachable === false) {
-              try { if (st.es) st.es.close(); } catch (_) {}
-              if (st._stallWatch) clearInterval(st._stallWatch);
-              st._stallWatch = null;
-              st.es = null;
-              st.streaming = false;
-              if (sid === this.currentId) {
-                this.es = null;
-                this.streaming = false;
-              }
-              this._setBackgroundTaskActive(
-                sid, true, d.started_at, d.background_tasks_pending);
-              this._ensureBgContPoller(sid);
-              return true;
-            }
-            const silenceMs = Date.now() - (Number(st._lastSseActivity)
-              || Number(st._streamStartedAt) || Date.now());
-            const serverHasReplay = Math.max(0, Number(d.events_so_far) || 0) > 0;
-            const closedNow = !!(st.es && Number(st.es.readyState) === 2);
-            if (!st.es || (!closedNow && (!serverHasReplay || silenceMs < 18_000))) {
-              return false;
-            }
-            try { st.es.close(); } catch (_) {}
+        if (!r.ok) return false;
+        const d = await r.json();
+        if (this.tabState[sid] !== st || st.es !== ownerEs) return false;
+        if (d.active) {
+          st._serverActiveObserved = true;
+          if (d.background && d.attachable === false) {
+            try { if (st.es) st.es.close(); } catch (_) {}
             if (st._stallWatch) clearInterval(st._stallWatch);
             st._stallWatch = null;
             st.es = null;
             st.streaming = false;
-            st._reconnectAttempts = 0;
-            if (sid === this.currentId) {
-              this.es = null;
-              this.streaming = false;
-            }
-            await this.send({
-              reconnect: true,
-              sessionId: sid,
-              turnId: d.turn_id || st.activeTurnId || "",
-              startedAt: d.started_at,
-            });
+            st.streamPhase = "";
+            this._setBackgroundTaskActive(
+              sid, true, d.started_at, d.background_tasks_pending);
+            this._ensureBgContPoller(sid);
             return true;
           }
-
-          if (!st._serverActiveObserved && !st._pendingExternalUpdate) return false;
-          this._retireStaleSessionStream(sid, st);
-          st._pendingExternalUpdate = true;
-          const loaded = await this.loadSession(sid, { quiet: true });
-          if (loaded) {
-            st._loaded = true;
-            st._pendingExternalUpdate = false;
-            this._syncQueueFromServer(sid);
+          const silenceMs = Date.now() - (Number(st._lastSseActivity)
+            || Number(st._streamStartedAt) || Date.now());
+          const serverHasReplay = Math.max(0, Number(d.events_so_far) || 0) > 0;
+          const closedNow = !!(st.es && Number(st.es.readyState) === 2);
+          if (!st.es || (!closedNow && (!serverHasReplay || silenceMs < 18_000))) {
+            return false;
           }
-          return !!loaded;
-        } catch (_) {
-          return false;
-        } finally {
-          clearTimeout(timeout);
+          if (!this._allowReconnect(sid, d.turn_id || st.activeTurnId)) return false;
+          try { st.es.close(); } catch (_) {}
+          if (st._stallWatch) clearInterval(st._stallWatch);
+          st._stallWatch = null;
+          st.es = null;
+          st.streaming = false;
+          await this.send({
+            reconnect: true,
+            sessionId: sid,
+            turnId: d.turn_id || st.activeTurnId || "",
+            startedAt: d.started_at,
+          });
+          return true;
         }
-      })();
-      st._streamHealthProbe = task;
-      try {
-        return await task;
-      } finally {
-        if (this.tabState[sid] === st && st._streamHealthProbe === task) {
-          st._streamHealthProbe = null;
+        if (!st._serverActiveObserved && !st._pendingExternalUpdate) return false;
+        this._retireStaleSessionStream(sid, st);
+        st._pendingExternalUpdate = true;
+        const loaded = await this.loadSession(sid, {
+          quiet: true, probeActive: false, signal: options.signal,
+        });
+        if (loaded) {
+          st._loaded = true;
+          st._pendingExternalUpdate = false;
+          this._syncQueueFromServer(sid);
+          this.$nextTick(() => this._drainPendingQueue(
+            sid, st.activeTurnId || "",
+          ));
         }
+        return !!loaded;
+      } catch (_) {
+        return false;
       }
     },
 
     _scheduleCanonicalStreamReload(sid, st, { minimumWaitMs = 0 } = {}) {
       if (!sid || !st || this.tabState[sid] !== st) return;
-      if (st._canonicalResyncTimer) return;
       st._canonicalResyncPending = true;
-      const started = Date.now();
-      const poll = async () => {
-        st._canonicalResyncTimer = null;
-        if (this.tabState[sid] !== st) return;
-        let active = true;
-        try {
-          const controller = new AbortController();
-          const timeout = setTimeout(() => controller.abort(), 8000);
-          try {
-            const r = await fetch(`/api/chat/sessions/${encodeURIComponent(sid)}/active`, {
-              headers: this.hdr(), signal: controller.signal,
-            });
-            if (r.ok) active = !!(await r.json()).active;
-          } finally {
-            clearTimeout(timeout);
-          }
-        } catch (_) {
-          active = true;
-        }
-        const waited = Date.now() - started;
-        if (active || waited < minimumWaitMs) {
-          // Backend turns are capped at 30 minutes. Keep the poll itself
-          // bounded too; after that canonical history is the only safe truth.
-          if (waited < 31 * 60_000) {
-            st._canonicalResyncTimer = setTimeout(poll, 1000);
-            return;
-          }
-        }
-        this._retireStaleSessionStream(sid, st);
-        st._pendingExternalUpdate = true;
-        // This is reconciliation of an already-rendered stream, never a cold
-        // open. Keep quiet semantics even if the tab changes while the fetch is
-        // in flight, so becoming current cannot clear the pane and enter the
-        // chunked skeleton path mid-recovery.
-        const loaded = await this.loadSession(sid, { quiet: true });
-        if (this.tabState[sid] !== st) return;
-        st._canonicalResyncPending = false;
-        if (loaded) {
-          st._loaded = true;
-          st._pendingExternalUpdate = false;
-          this._syncQueueFromServer(sid);
-        }
-      };
-      st._canonicalResyncTimer = setTimeout(poll, 250);
+      if (!st.sessionSync.canonicalStartedAt) {
+        st.sessionSync.canonicalStartedAt = Date.now();
+      }
+      this._requestSessionSync(sid, "canonical_replay", {
+        minimumWaitMs, delayMs: 250,
+      });
+    },
+    async _runCanonicalReplaySync(sid, st, options = {}) {
+      if (this.tabState[sid] !== st) return false;
+      const startedAt = Number(st.sessionSync.canonicalStartedAt) || Date.now();
+      const minimumWaitMs = Math.max(0, Number(options.minimumWaitMs) || 0);
+      let active = true;
+      try {
+        const r = await this._fetchWithDeadline(
+          `/api/chat/sessions/${encodeURIComponent(sid)}/active`,
+          { headers: this.hdr(), signal: options.signal },
+        );
+        if (r.ok) active = !!(await r.json()).active;
+      } catch (_) {
+        if (options.signal?.aborted) return false;
+        active = true;
+      }
+      if (this.tabState[sid] !== st) return false;
+      const waited = Date.now() - startedAt;
+      if ((active || waited < minimumWaitMs) && waited < 31 * 60_000) {
+        this._requestSessionSync(sid, "canonical_replay", {
+          minimumWaitMs, delayMs: 1000,
+        });
+        return true;
+      }
+      this._retireStaleSessionStream(sid, st);
+      st._pendingExternalUpdate = true;
+      const loaded = await this.loadSession(sid, {
+        quiet: true, signal: options.signal,
+      });
+      if (this.tabState[sid] !== st) return false;
+      st._canonicalResyncPending = false;
+      st.sessionSync.canonicalStartedAt = 0;
+      if (loaded) {
+        st._loaded = true;
+        st._pendingExternalUpdate = false;
+        this._syncQueueFromServer(sid);
+        this.$nextTick(() => this._drainPendingQueue(
+          sid, st.activeTurnId || "",
+        ));
+      }
+      return !!loaded;
     },
 
     _retireStaleSessionStream(sid, st) {
       if (st.es) { try { st.es.close(); } catch (_) {} st.es = null; }
-      if (st._canonicalResyncTimer) clearTimeout(st._canonicalResyncTimer);
-      st._canonicalResyncTimer = null;
+      this._cancelSessionSyncReason(st, "canonical_replay");
+      st.sessionSync.canonicalStartedAt = 0;
       st._canonicalResyncPending = false;
       if (st._streamTimer) {
         clearInterval(st._streamTimer);
@@ -7143,21 +11068,65 @@ function portal() {
         st._stallWatch = null;
       }
       st.streaming = false;
+      st.streamPhase = "";
       st.backgroundActive = false;
       st.backgroundTaskCount = 0;
       st._continuationAwaitingReaction = false;
       st._draining = false;
-      st._reconnectAttempts = 0;
+      // NOTE — do NOT reset _reconnectAttempts here. Retiring a stream means
+      // "give up on this transport and reconcile from canonical history", not
+      // "the turn is new". Zeroing it let the retire→reconnect→retire cycle
+      // run without ever reaching MAX_ATTEMPTS (2026-08-04 flicker storm).
+      // The counter is cleared when a genuinely new turn is submitted.
       st._serverActiveObserved = false;
       st.streamElapsed = 0;
       st._streamStartedAt = 0;
-      if (sid === this.currentId) {
-        this.streaming = false;
-        this.es = null;
-        this._streamTimer = null;
-        this.streamElapsed = 0;
-        this._streamStartedAt = 0;
+    },
+
+    // Central brake on transparent reconnects. Incremental resume makes the
+    // normal path cheap, but a cold checkpoint or replay gap still reconciles
+    // a full turn/history suffix. Any path that can fire faster than a turn lasts
+    // can therefore still create transport churn and visible fallback work, and
+    // shows up as a continuous flicker storm — 2026-08-04 measured ~60 full
+    // teardown+replay cycles in 20-30 s, driven by list-poll reconciliation
+    // rather than by a real transport failure.
+    //
+    // The brake distinguishes a LOOP from a flaky network by spacing, not by a
+    // hard lifetime cap: a loop re-fires within seconds, while sleep/wake or a
+    // dropped link re-fires minutes apart. So the budget is per-turn and
+    // recovers once reconnects stop coming in a burst. Callers that are refused
+    // must NOT reconnect anyway — they wait for the next probe (10 s list poll,
+    // 18 s stall watchdog), or fall back to _scheduleCanonicalStreamReload,
+    // which is flicker-free because it waits for the turn to end and then
+    // quiet-loads canonical history.
+    _allowReconnect(sid, turnId) {
+      const st = sid && this.tabState && this.tabState[sid];
+      if (!st) return false;
+      const MIN_GAP_MS = 1500;         // never twice in one visual beat
+      const BURST_MAX = 6;             // close-together reconnects per turn
+      const BURST_WINDOW_MS = 60_000;  // quiet this long ⇒ not a loop, reset
+      const key = String(turnId || st.activeTurnId || "");
+      const now = Date.now();
+      let last = Number(st._reconnectGateAt) || 0;
+      // A different turn is different work, and the 60 s idle window means a
+      // reconnect that far apart cannot be a loop. Either way, start clean —
+      // otherwise the spacing rule would refuse a legitimate attach to the
+      // NEXT turn (e.g. the queue drain, which attaches ~350 ms after `done`).
+      if (st._reconnectGateTurn !== key || (last && now - last >= BURST_WINDOW_MS)) {
+        st._reconnectGateTurn = key;
+        st._reconnectGateCount = 0;
+        last = 0;
       }
+      if (last && now - last < MIN_GAP_MS) return false;
+      if ((Number(st._reconnectGateCount) || 0) >= BURST_MAX) {
+        // Budget spent in a burst ⇒ treat it as a loop. Stop replaying; let the
+        // turn finish and reconcile from canonical history instead.
+        this._scheduleCanonicalStreamReload(sid, st);
+        return false;
+      }
+      st._reconnectGateAt = now;
+      st._reconnectGateCount = (Number(st._reconnectGateCount) || 0) + 1;
+      return true;
     },
 
     _reconcileOpenSession(next) {
@@ -7174,12 +11143,30 @@ function portal() {
         const baselineN = Number(baseline);
         const hasBaseline = baseline !== undefined && Number.isFinite(baselineN);
         const newer = hasBaseline && newU > baselineN;
-        st._reconcileTargetUpdated = Math.max(
-          Number(st._reconcileTargetUpdated) || 0,
-          newU,
+        const priorTarget = Number(st._reconcileTargetUpdated) || 0;
+        const backgroundOnly = !!cur.background_active && !cur.turn_active;
+        const canonicalCount = Math.max(0, Number(cur.message_count) || 0);
+        const installedCount = Math.max(
+          0, Number(st._installedCanonicalCount) || 0);
+        const canonicalSuffixMissing = st._loaded
+          && canonicalCount > installedCount;
+        const canonicalMissingLocally = canonicalCount > 0
+          && !st.messages.length && !st.streaming && !st.es;
+        if (canonicalMissingLocally) {
+          // Session-list polling is the final convergence owner. Even if a tab
+          // activation or runtime handoff was interrupted, a visible non-empty
+          // canonical session cannot remain an empty local pane indefinitely.
+          st._loaded = false;
+          this._requestSessionSync(sid, "history_load", { loadOptions: {} });
+          continue;
+        }
+        const messageCountChanged = !!previous
+          && Number(cur.message_count || 0) !== Number(previous.message_count || 0);
+        const turnCountChanged = !!previous
+          && Number(cur.turn_count || 0) !== Number(previous.turn_count || 0);
+        const visibleNewer = newer && (
+          !backgroundOnly || messageCountChanged || turnCountChanged
         );
-        const acceptedTarget = Number(st._reconcileTargetUpdated) || newU;
-
         const streamAgeMs = st._streamStartedAt
           ? Math.max(0, Date.now() - st._streamStartedAt) : Infinity;
         if (cur.active) st._serverActiveObserved = true;
@@ -7189,64 +11176,90 @@ function portal() {
           || (newer && streamAgeMs >= 5000)
         );
         if ((st.streaming || st.es) && serverSettled) {
-          this._retireStaleSessionStream(sid, st);
+          const sseSilentMs = Date.now() - (Number(st._lastSseActivity)
+            || Number(st._streamStartedAt) || Date.now());
+          const transportDead = !st.es
+            || Number(st.es.readyState) === 2
+            || sseSilentMs >= 32_000;
+          if (transportDead) this._retireStaleSessionStream(sid, st);
           st._pendingExternalUpdate = true;
         }
         if (st.streaming || st.es) {
-          if (newer) st._pendingExternalUpdate = true;
-          continue;
-        }
-
-        const needsRefresh = !!cur.active || st._pendingExternalUpdate || newer;
-        if (st._reconcilePromise) {
-          if (needsRefresh) st._pendingExternalUpdate = true;
-          continue;
-        }
-        if (!needsRefresh) {
-          if (!hasBaseline && st._loaded && newU) st._seenUpdated = newU;
-          continue;
-        }
-
-        const attach = !!cur.active;
-        st._pendingExternalUpdate = false;
-        let succeeded = false;
-        const task = (async () => {
-          try {
-            const loaded = this._sessionLoadPromises[sid]
-              ? await this._sessionLoadPromises[sid]
-              : await this.loadSession(sid, { quiet: true });
-            if (!loaded) {
-              st._pendingExternalUpdate = true;
-              return;
-            }
-            succeeded = true;
-            st._loaded = true;
-            st._seenUpdated = Math.max(
-              Number(st._seenUpdated) || 0,
-              acceptedTarget,
-            );
-            if (attach) await this._checkActiveTurn(sid);
-          } catch (_) {
+          if (visibleNewer || canonicalSuffixMissing) {
             st._pendingExternalUpdate = true;
-          } finally {
-            if (st._reconcilePromise === task) st._reconcilePromise = null;
-            const seen = Number(st._seenUpdated);
-            const hasSeen = st._seenUpdated !== undefined && Number.isFinite(seen);
-            const target = Number(st._reconcileTargetUpdated) || 0;
-            const stillBehind = target > 0 && (!hasSeen || target > seen);
-            if (stillBehind) st._pendingExternalUpdate = true;
-            else if (succeeded) st._pendingExternalUpdate = false;
-            if (succeeded && stillBehind && !st.streaming && !st.es
-                && !st._reconcileRetryTimer) {
-              st._reconcileRetryTimer = setTimeout(() => {
-                st._reconcileRetryTimer = null;
-                const latest = (this.sessions || []).find(s => s && s.id === sid);
-                if (latest) this._reconcileOpenSession([latest]);
-              }, 250);
-            }
           }
-        })();
-        st._reconcilePromise = task;
+          continue;
+        }
+        const needsRefresh = st._pendingExternalUpdate
+          || visibleNewer || canonicalSuffixMissing;
+        const hasTurnActivityFlag = Object.prototype.hasOwnProperty.call(
+          cur, "turn_active",
+        );
+        const wantsAttach = (
+          hasTurnActivityFlag ? !!cur.turn_active
+            : (!!cur.active && !cur.background_active)
+        ) && !st.streaming && !st.es;
+        if (!needsRefresh) {
+          // Do not consume the first post-done metadata snapshot as a baseline
+          // when its canonical count is ahead of the last installed history.
+          if (!hasBaseline && st._loaded && newU
+              && canonicalCount <= installedCount) st._seenUpdated = newU;
+          if (wantsAttach && st._loaded) this._checkActiveTurn(sid);
+          continue;
+        }
+        if (newU > priorTarget) st._reconcileRetryN = 0;
+        st._reconcileTargetUpdated = Math.max(priorTarget, newU);
+        st._pendingExternalUpdate = false;
+        this._requestSessionSync(sid, "history_revision", {
+          attach: wantsAttach,
+          targetUpdated: st._reconcileTargetUpdated,
+        });
+      }
+    },
+    async _runHistoryRevisionSync(sid, st, options = {}) {
+      if (this.tabState[sid] !== st) return false;
+      if (st.streaming || st.es) {
+        st._pendingExternalUpdate = true;
+        return false;
+      }
+      const targetUpdated = Math.max(
+        Number(st._reconcileTargetUpdated) || 0,
+        Number(options.targetUpdated) || 0,
+      );
+      st._reconcileTargetUpdated = targetUpdated;
+      let succeeded = false;
+      try {
+        const loaded = await this.loadSession(sid, {
+          quiet: true, probeActive: false, signal: options.signal,
+        });
+        if (!loaded) {
+          st._pendingExternalUpdate = true;
+          return false;
+        }
+        succeeded = true;
+        st._loaded = true;
+        if (options.attach) this._checkActiveTurn(sid);
+        return true;
+      } catch (_) {
+        st._pendingExternalUpdate = true;
+        return false;
+      } finally {
+        if (this.tabState[sid] !== st) return;
+        const seen = Number(st._seenUpdated);
+        const hasSeen = st._seenUpdated !== undefined && Number.isFinite(seen);
+        const stillBehind = targetUpdated > 0 && (!hasSeen || targetUpdated > seen);
+        if (stillBehind) st._pendingExternalUpdate = true;
+        else if (succeeded) st._pendingExternalUpdate = false;
+        const retries = Number(st._reconcileRetryN) || 0;
+        if (!stillBehind) st._reconcileRetryN = 0;
+        if (succeeded && stillBehind && !st.streaming && !st.es && retries < 6) {
+          st._reconcileRetryN = retries + 1;
+          this._requestSessionSync(sid, "history_revision", {
+            attach: !!options.attach,
+            targetUpdated,
+            delayMs: Math.min(2000, 250 * (retries + 1)),
+          });
+        }
       }
     },
     // Field-level equality over the rendered session metadata. Returns true
@@ -7269,7 +11282,12 @@ function portal() {
         if (!!x.background_active !== !!y.background_active) return false;
         if ((x.updated_at || 0) !== (y.updated_at || 0)) return false;
         if ((x.message_count || 0) !== (y.message_count || 0)) return false;
-        if ((x.effort || "") !== (y.effort || "")) return false;
+        if ((x.permission || "") !== (y.permission || "")) return false;
+        if ((x.plan_return_permission || "")
+            !== (y.plan_return_permission || "")) return false;
+        if (this._normalizeEffort(x.effort) !== this._normalizeEffort(y.effort)) return false;
+        if (this._normalizeServiceTier(x.service_tier)
+            !== this._normalizeServiceTier(y.service_tier)) return false;
         if ((x.thinking !== false) !== (y.thinking !== false)) return false;
         if ((x.cwd || "") !== (y.cwd || "")) return false;
         if ((x.forked_from || "") !== (y.forked_from || "")) return false;
@@ -7293,9 +11311,9 @@ function portal() {
       // reply yanked the user back to the very first message. Snapshot the
       // scroller here and re-pin it after the tickle. The `model` tickle
       // doesn't touch the panes, so it skips this.
-      const chatEl = field === "currentId" ? this.$refs.chatBody : null;
+      const chatEl = field === "currentId" ? this._chatBodyElement() : null;
       const savedTop = chatEl ? chatEl.scrollTop : 0;
-      const wasAtBottom = this.atBottom;
+      const wasAtBottom = this.activeSessionPane().atBottom !== false;
       await this.$nextTick();
       this[field] = "";
       await this.$nextTick();
@@ -7332,6 +11350,13 @@ function portal() {
     },
     fileWorkspacePath() {
       return this.currentWorkspacePath();
+    },
+    absoluteFilePath(path) {
+      const root = String(this.fileWorkspacePath() || "");
+      const relative = String(path || "").replace(/^\/+/, "");
+      if (!root) return relative;
+      if (!relative) return root;
+      return root.endsWith("/") ? root + relative : root + "/" + relative;
     },
     currentWorkspacePath() {
       if (this.activeWorkspace) return this.activeWorkspace;
@@ -7375,48 +11400,71 @@ function portal() {
           JSON.stringify(this.sessionWorkspaces.map(workspace => workspace.path)));
       } catch (_) {}
     },
-    async fetchSessionWorkspaces() {
+    _applySessionWorkspaceRegistry(workspaces, { validateActive = true } = {}) {
+      this.sessionWorkspaces = this._applySavedWorkspaceOrder(
+        Array.isArray(workspaces) ? workspaces : [],
+      );
+      const primaryFileRoot = this.primaryWorkspacePath();
+      if (this._loadedPrefsSchema < 4 && primaryFileRoot) {
+        const surface = this.workspaceSurfaces[primaryFileRoot];
+        if (surface && typeof surface === "object") {
+          this.tabs = this._workspacePreviewTabs(surface);
+          this._pendingPreviewSelected = typeof surface.previewSelected === "string"
+            ? surface.previewSelected : "";
+          this.showHidden = typeof surface.showHidden === "boolean"
+            ? surface.showHidden : this.showHidden;
+          this.openFilesCollapsed = !!surface.openFilesCollapsed;
+          this.openFilesHeight = typeof surface.openFilesHeight === "number"
+            ? surface.openFilesHeight : null;
+          this._pendingExpanded = Array.isArray(surface.expanded) ? surface.expanded : [];
+        } else if (this.activeWorkspace && this.activeWorkspace !== primaryFileRoot) {
+          this.tabs = [];
+          this._pendingPreviewSelected = "";
+          this._pendingExpanded = [];
+        }
+        this._loadedPrefsSchema = 4;
+      }
+      const valid = new Set(this.sessionWorkspaces.map(w => w.path));
+      const session = this.sessions.find(s => s.id === this.currentId);
+      const fallback = (session && valid.has(session.cwd) && session.cwd)
+        || ((this.sessionWorkspaces.find(w => w.primary) || {}).path || "");
+      const requested = this.activeWorkspace;
+      const invalidActive = !valid.has(requested);
+      if (invalidActive && validateActive) this.activeWorkspace = fallback;
+      return { invalidActive, requested, fallback };
+    },
+    _restoreSessionWorkspaceCache() {
       const cacheKey = "muselab_workspace_registry_v1";
       try {
         const cached = JSON.parse(sessionStorage.getItem(cacheKey) || "null");
         if (cached && Array.isArray(cached.workspaces)
             && Date.now() - Number(cached.savedAt || 0) < 10 * 60_000) {
-          this.sessionWorkspaces = this._applySavedWorkspaceOrder(cached.workspaces);
+          this._applySessionWorkspaceRegistry(cached.workspaces);
+          return this.sessionWorkspaces.length > 0;
         }
       } catch (_) {}
+      return false;
+    },
+    async fetchSessionWorkspaces({
+      restoreCache = true,
+      validateActive = true,
+      returnResolution = false,
+    } = {}) {
+      if (restoreCache) this._restoreSessionWorkspaceCache();
+      const cacheKey = "muselab_workspace_registry_v1";
+      const requestSeq = ++this._workspaceRegistrySeq;
       try {
         const response = await fetch("/api/chat/workspaces", { headers: this.hdr() });
         if (!response.ok) return false;
         const payload = await response.json();
-        this.sessionWorkspaces = this._applySavedWorkspaceOrder(payload.workspaces);
+        // A newer add/remove/reorder refresh owns the registry. Never let this
+        // older response restore a directory the user has already moved past.
+        if (requestSeq !== this._workspaceRegistrySeq) return false;
+        const resolution = this._applySessionWorkspaceRegistry(
+          payload.workspaces, { validateActive },
+        );
         try { sessionStorage.setItem(cacheKey, JSON.stringify({ savedAt: Date.now(), workspaces: this.sessionWorkspaces })); } catch (_) {}
-        const primaryFileRoot = this.primaryWorkspacePath();
-        if (this._loadedPrefsSchema < 4 && primaryFileRoot) {
-          const surface = this.workspaceSurfaces[primaryFileRoot];
-          if (surface && typeof surface === "object") {
-            this.tabs = this._workspacePreviewTabs(surface);
-            this._pendingPreviewSelected = typeof surface.previewSelected === "string"
-              ? surface.previewSelected : "";
-            this.showHidden = typeof surface.showHidden === "boolean"
-              ? surface.showHidden : this.showHidden;
-            this.openFilesCollapsed = !!surface.openFilesCollapsed;
-            this.openFilesHeight = typeof surface.openFilesHeight === "number"
-              ? surface.openFilesHeight : null;
-            this._pendingExpanded = Array.isArray(surface.expanded) ? surface.expanded : [];
-          } else if (this.activeWorkspace && this.activeWorkspace !== primaryFileRoot) {
-            this.tabs = [];
-            this._pendingPreviewSelected = "";
-            this._pendingExpanded = [];
-          }
-          this._loadedPrefsSchema = 4;
-        }
-        const valid = new Set(this.sessionWorkspaces.map(w => w.path));
-        const session = this.sessions.find(s => s.id === this.currentId);
-        const fallback = (session && valid.has(session.cwd) && session.cwd)
-          || ((this.sessionWorkspaces.find(w => w.primary) || {}).path || "");
-        const requested = this.activeWorkspace;
-        if (!valid.has(requested)) this.activeWorkspace = fallback;
-        return true;
+        return returnResolution ? { ok: true, ...resolution } : true;
       } catch (_) {
         return false;
       }
@@ -7434,15 +11482,204 @@ function portal() {
         return false;
       }
     },
+    _mergeWorkspaceSessionList(raw, path) {
+      const primary = (this.sessionWorkspaces.find(w => w.primary) || {}).path || "";
+      const belongs = session => session
+        && (session.cwd || primary) === path;
+      const incoming = (Array.isArray(raw) ? raw : [])
+        .filter(session => session && typeof session.id === "string" && session.id);
+      const incomingIds = new Set(incoming.map(session => session.id));
+      // A successful scoped response is authoritative for this workspace's
+      // top window plus every forced remembered/open id. Replace that slice so
+      // a session deleted on another device cannot survive as a phantom row.
+      // _applySessionList re-injects open optimistic rows from _optimisticMetas,
+      // preserving sessions whose registration POST is still in flight.
+      const otherWorkspaces = (this.sessions || []).filter(
+        session => !belongs(session) && !incomingIds.has(session.id));
+      this._applySessionList([...incoming, ...otherWorkspaces]);
+      const confirmedIds = new Set(incomingIds);
+      return this.workspaceSessions(path).filter(session =>
+        confirmedIds.has(session.id)
+        || !!(this._optimisticMetas && this._optimisticMetas[session.id]));
+    },
+    async _pullWorkspaceSessions(path) {
+      if (!path) return { ok: false, sessions: [] };
+      const forcedIds = new Set(this.openTabIds || []);
+      const remembered = this.workspaceLastSession[path];
+      if (remembered) forcedIds.add(remembered);
+      const params = new URLSearchParams({
+        limit: "20",
+        workspace_only: "1",
+        ids: Array.from(forcedIds).join(","),
+      });
+      const controller = new AbortController();
+      const timeout = setTimeout(
+        () => controller.abort(),
+        Math.max(100, Number(this._sessionListTimeoutMs) || 8000),
+      );
+      try {
+        const response = await fetch(`/api/chat/sessions?${params.toString()}`, {
+          headers: this.conversationHdr(path),
+          signal: controller.signal,
+        });
+        if (!response.ok) return { ok: false, sessions: [] };
+        let data = null;
+        try { data = await response.json(); }
+        catch (_) { return { ok: false, sessions: [] }; }
+        const sessions = this._mergeWorkspaceSessionList(
+          (data && data.sessions) || [], path,
+        );
+        return { ok: true, sessions };
+      } catch (_) {
+        return { ok: false, sessions: [] };
+      } finally {
+        clearTimeout(timeout);
+      }
+    },
     async _refreshSessionsAfterWorkspaceRegistryChange() {
       this._sessionsEtag = "";
       return await this._pullAllSessions();
+    },
+    _workspaceEpoch(path) {
+      const value = Number(this._workspaceEpochs.get(path));
+      return Number.isFinite(value) ? value : 0;
+    },
+    _workspaceRegistryId(path) {
+      const entry = (this.sessionWorkspaces || []).find(
+        workspace => workspace && workspace.path === path,
+      );
+      return String((entry && entry.id) || "");
+    },
+    _workspaceGeneration(path) {
+      return `${this._workspaceEpoch(path)}\0${this._workspaceRegistryId(path)}`;
+    },
+    _workspaceGenerationIsCurrent(path, generation) {
+      return this._workspaceGeneration(path) === String(generation || "");
+    },
+    async _purgeWorkspaceTreeState(path) {
+      const ownerWorkspace = String(path || "");
+      if (!ownerWorkspace) return false;
+      const wasCurrent = this._workspaceIsCurrent(ownerWorkspace);
+
+      // A registered workspace is identified by its path, so remove -> re-add
+      // is an ABA transition. Keep a process-local epoch even after deleting all
+      // cached state: late work from the old registration must not become valid
+      // merely because the same path is current again.
+      this._workspaceEpochs.set(
+        ownerWorkspace, this._workspaceEpoch(ownerWorkspace) + 1,
+      );
+      this._workspaceRuntimeCaches.delete(ownerWorkspace);
+      this._workspaceTreeCursors.delete(ownerWorkspace);
+
+      const pendingPersist = this._workspaceTreeCacheTimers.get(ownerWorkspace);
+      if (pendingPersist) {
+        if (pendingPersist.timer) clearTimeout(pendingPersist.timer);
+        if (pendingPersist.idle != null && typeof window !== "undefined"
+            && window.cancelIdleCallback) {
+          window.cancelIdleCallback(pendingPersist.idle);
+        }
+      }
+      this._workspaceTreeCacheTimers.delete(ownerWorkspace);
+      this._clearWorkspaceSyncRetry(ownerWorkspace);
+      this._clearWorkspaceEventBatch(ownerWorkspace);
+      // Promises cannot be cancelled, but dropping the owner chain lets a new
+      // registration start immediately. The epoch checks make the detached old
+      // chain fail closed when it eventually resumes.
+      this._workspaceSyncChains.delete(ownerWorkspace);
+      if (this._childFetches) {
+        const prefix = `${ownerWorkspace}\0`;
+        for (const key of Array.from(this._childFetches.keys())) {
+          if (String(key).startsWith(prefix)) this._childFetches.delete(key);
+        }
+      }
+      if (this._fileEventsWorkspace === ownerWorkspace) {
+        this._stopFileEvents(false);
+      }
+      if (wasCurrent) {
+        // Runtime tree state is not keyed, so explicitly empty it when another
+        // tab replaced the registration that currently owns this surface.
+        // The next bootstrap is intentionally cold and cannot reuse old rows.
+        ++this._treeLoadSeq;
+        this.visible = [];
+        this.childCache = {};
+        this.expanded = new Set();
+        this._pendingExpanded = [];
+        this._fileEventsPending = new Map();
+        this._fileTreeRefreshBusy = false;
+        this._fileTreeRefreshGeneration = "";
+        this.treeLoading = false;
+        this.treeError = "";
+        this._fileTreeDirty = true;
+        this._scheduleFileTreeViewportSync(true);
+      }
+
+      try {
+        const cache = await this._persistentCache();
+        await cache.deleteWorkspaceSnapshot(ownerWorkspace);
+      } catch (_) { /* persistent cache is an optional acceleration */ }
+      return true;
+    },
+    async _recoverWorkspaceRegistrationMismatch(
+      ownerWorkspace,
+      observedWorkspaceId,
+      workspaceGeneration,
+    ) {
+      if (!this._workspaceIsCurrent(ownerWorkspace)
+          || !this._workspaceGenerationIsCurrent(
+            ownerWorkspace, workspaceGeneration,
+          )) return false;
+
+      // A second tab can remove and re-add the same path while this tab still
+      // owns an SSE stream and a cursor from the old registration. Path-only
+      // checks cannot distinguish that ABA transition. Purge first, then read
+      // the registry without restoring sessionStorage's stale copy.
+      await this._purgeWorkspaceTreeState(ownerWorkspace);
+      const resolution = await this.fetchSessionWorkspaces({
+        restoreCache: false,
+        validateActive: false,
+        returnResolution: true,
+      });
+      if (!resolution || resolution.ok !== true) {
+        if (this._workspaceIsCurrent(ownerWorkspace)) {
+          this._fileEventsTimer = setTimeout(
+            () => this._startFileEvents(), 1500,
+          );
+        }
+        return false;
+      }
+      if (resolution.invalidActive) {
+        if (resolution.fallback
+            && this._workspaceIsCurrent(ownerWorkspace)) {
+          await this._changeWorkspaceSurface(resolution.fallback);
+          // _changeWorkspaceSurface captures the outgoing surface. Remove that
+          // newly-created empty runtime entry for the no-longer registered path.
+          await this._purgeWorkspaceTreeState(ownerWorkspace);
+        }
+        return false;
+      }
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return false;
+
+      const registeredWorkspaceId = this._workspaceRegistryId(ownerWorkspace);
+      if (observedWorkspaceId && registeredWorkspaceId
+          && observedWorkspaceId !== registeredWorkspaceId) {
+        // The registry changed yet again while it was being refreshed. Reopen
+        // the stream and let its authoritative ready event identify the winner.
+        this._fileEventsTimer = setTimeout(
+          () => this._startFileEvents(), 1500,
+        );
+        return false;
+      }
+      const loaded = await this.loadRoot({ runtimeSnapshot: false });
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return false;
+      this._fileTreeDirty = loaded !== true;
+      this._startFileEvents();
+      return loaded === true;
     },
     workspaceOpenTabIds(path = "") {
       const cwd = path || this.currentWorkspacePath();
       const primary = (this.sessionWorkspaces.find(w => w.primary) || {}).path || "";
       const byId = new Map(this.sessions.map(s => [s.id, s]));
-      return (this.openTabIds || []).filter(id => {
+      return this._normalizeOpenTabIds(this.openTabIds).filter(id => {
         const session = byId.get(id);
         return session && (session.cwd || primary) === cwd;
       });
@@ -7586,10 +11823,6 @@ function portal() {
       void Promise.resolve(
         this.fetchTerminals({ restore: true }),
       ).catch(() => false);
-      let coldTreeOk = null;
-      if (!runtime) {
-        coldTreeOk = await treeReady;
-      }
       if (this.previewSurface === "file"
           && selected && this.tabs.some(t => t.path === selected)) {
         const tab = this.tabs.find(t => t.path === selected);
@@ -7610,14 +11843,12 @@ function portal() {
         if (treeOk !== true) this._scheduleWorkspaceSyncRetry(path);
         this._startFileEvents();
       };
-      if (runtime) {
-        // The restored runtime tree paints synchronously. Revalidate it in the
-        // background and only then open the cursor replay stream; switching the
-        // workspace must not wait for a bootstrap/delta round trip.
-        void treeReady.then(startFileEvents);
-      } else {
-        startFileEvents(coldTreeOk);
-      }
+      // The workspace identity and cached surface are already committed above.
+      // File-tree bootstrap is pane-local work: a cold or wedged tree request must
+      // not keep the whole layout shielded, disable the composer, or cover mobile
+      // navigation. Revalidate in the background for both warm and cold surfaces;
+      // owner/sequence guards prevent a late response from mutating another root.
+      void treeReady.then(startFileEvents);
       this.savePrefs();
       return true;
     },
@@ -7628,26 +11859,74 @@ function portal() {
         this.toast(this.lang === "zh" ? "工作目录未登记" : "Workspace is not registered", "error");
         return;
       }
+      const switchSeq = ++this._workspaceSwitchSeq;
+      const previousMobileTab = this.mobileTab;
       this.workspaceSwitching = true;
+      this.workspaceSurfaceTransition = true;
       try {
         // A workspace owns the conversation cwd, file tree, preview tabs, and
-        // editor together. Preserve the old surface and restore the target one.
-        await this._changeWorkspaceSurface(path);
-        if (!this.workspaceSessions(path).length) await this._pullAllSessions();
-        const remembered = this.workspaceLastSession[path];
-        const target = this.sessions.find(s => s.id === remembered && s.cwd === path)
-          || this.workspaceOpenTabIds(path).map(id => this.sessions.find(s => s.id === id)).find(Boolean)
-          || this.workspaceSessions(path)[0];
-        if (target) await this.openTab(target.id);
+        // editor together. Resolve only the target session identity under the
+        // workspace-wide transition. Transcript loading is pane-local and must
+        // not keep the shell shielded or the composer disabled.
+        const surfaceReady = Promise.resolve(
+          this._changeWorkspaceSurface(path),
+        ).catch(() => false);
+        const targetReady = (async () => {
+          const pulled = await this._pullWorkspaceSessions(path);
+          const remembered = this.workspaceLastSession[path];
+          // A 200 scoped response is authoritative: select only a row it
+          // confirmed (or an explicitly preserved optimistic row). On a
+          // transport/server failure, retain the previous offline fallback.
+          const workspaceRows = pulled && pulled.ok
+            ? pulled.sessions : this.workspaceSessions(path);
+          const target = workspaceRows.find(s => s.id === remembered)
+            || this.workspaceOpenTabIds(path)
+              .map(id => this.sessions.find(s => s.id === id)).find(Boolean)
+            || workspaceRows[0];
+          return target || null;
+        })().catch(() => null);
+        const [surfaceOk, target] = await Promise.all([surfaceReady, targetReady]);
+        if (switchSeq !== this._workspaceSwitchSeq
+            || !surfaceOk || !this._workspaceIsCurrent(path)) return;
+        if (target) await this.openTab(target.id, true, { deferLoad: true });
         else this.newSession({ cwd: path });
+        if (switchSeq !== this._workspaceSwitchSeq
+            || !this._workspaceIsCurrent(path)) return;
+        // A normal session activation intentionally reveals Chat on phones.
+        // A workspace switch is different: Files/Preview is often where the
+        // user initiated it, so preserve that page across the atomic reveal.
+        if (this._isMobileLayout()) this.setMobileTab(previousMobileTab);
         this.toast((this.lang === "zh" ? "已切换到 " : "Switched to ")
           + this.workspaceLabel(path), "success", 1600);
       } finally {
-        this.workspaceSwitching = false;
+        if (switchSeq === this._workspaceSwitchSeq) {
+          // Let Alpine commit the target tree, panes, and conversation behind
+          // the shield before its leave transition begins.
+          await this.$nextTick();
+          if (switchSeq === this._workspaceSwitchSeq) {
+            await new Promise(resolve => {
+              let settled = false;
+              const done = () => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(fallback);
+                resolve();
+              };
+              const fallback = setTimeout(done, 80);
+              if (typeof requestAnimationFrame === "function") requestAnimationFrame(done);
+              else done();
+            });
+          }
+          if (switchSeq === this._workspaceSwitchSeq) {
+            this.workspaceSwitching = false;
+            this.workspaceSurfaceTransition = false;
+          }
+        }
       }
     },
     closeWorkspaceBrowser() {
-      if (!this.workspaceBrowser.show || this.workspaceSwitching) return;
+      if (!this.workspaceBrowser.show || this.workspaceSwitching
+          || this.workspaceRegistryBusy) return;
       this.workspaceBrowser.show = false;
       this.workspaceBrowser.requestSeq++;
       this.workspaceBrowser.loading = false;
@@ -7705,8 +11984,8 @@ function portal() {
       return (this.lang === "zh" ? "将添加：" : "Add: ") + name;
     },
     async _registerWorkspacePath(path) {
-      if (!path || this.workspaceSwitching) return null;
-      this.workspaceSwitching = true;
+      if (!path || this.workspaceSwitching || this.workspaceRegistryBusy) return null;
+      this.workspaceRegistryBusy = true;
       let entry = null;
       try {
         const response = await fetch("/api/chat/workspaces", {
@@ -7724,7 +12003,7 @@ function portal() {
           : "The directory is invalid, unreadable, or no longer available.";
         this.toast(this.lang === "zh" ? "目录无法登记" : "Could not register that directory", "error");
       } finally {
-        this.workspaceSwitching = false;
+        this.workspaceRegistryBusy = false;
       }
       return entry;
     },
@@ -7735,7 +12014,7 @@ function portal() {
       await this.switchWorkspace(entry.path);
     },
     async addWorkspacePathManually() {
-      if (this.workspaceSwitching) return;
+      if (this.workspaceSwitching || this.workspaceRegistryBusy) return;
       const value = await this.prompt({
         title: this.lang === "zh" ? "输入工作目录路径" : "Enter workspace path",
         body: this.lang === "zh"
@@ -7753,7 +12032,7 @@ function portal() {
     },
     async addWorkspace() {
       this.workspaceMenuOpen = false;
-      if (this.workspaceSwitching) return;
+      if (this.workspaceSwitching || this.workspaceRegistryBusy) return;
       const browser = this.workspaceBrowser;
       browser.show = true;
       browser.error = "";
@@ -7774,6 +12053,7 @@ function portal() {
           draft.input = "";
           draft.pendingImages.splice(0);
           draft.pendingDocs.splice(0);
+          draft.pendingQuotes.splice(0);
           draft._sendWaitingForUpload = false;
         }
         if (this.imageEditor.ownerSid === id) {
@@ -7791,6 +12071,7 @@ function portal() {
           this.imageEditor._snapshot = null;
         }
         if (this.imageGen.ownerSid === id) {
+          this.cancelImageGenSubmit();
           this.imageGen.show = false;
           this.imageGen.ownerSid = "";
         }
@@ -7802,42 +12083,47 @@ function portal() {
         if (st._streamTimer) clearInterval(st._streamTimer);
         if (st._stallWatch) clearInterval(st._stallWatch);
         if (st._reconnectTimer) clearTimeout(st._reconnectTimer);
-        if (st._canonicalResyncTimer) clearTimeout(st._canonicalResyncTimer);
-        if (st._reconcileRetryTimer) clearTimeout(st._reconcileRetryTimer);
+        this._cancelDeferredStreamRich(st, true);
+        this._disposeSessionSync(st);
+        if (st._virtualSyncFrame) {
+          if (typeof cancelAnimationFrame === "function") {
+            cancelAnimationFrame(st._virtualSyncFrame);
+          } else {
+            clearTimeout(st._virtualSyncFrame);
+          }
+          st._virtualSyncFrame = 0;
+        }
         st.es = null;
         st._streamStartController = null;
         st._cancelBeforeStream = false;
         st.streaming = false;
+        st.streamPhase = "";
         st.backgroundActive = false;
         st.backgroundTaskCount = 0;
+        st.inheritedBackgroundTaskCount = 0;
+        st.inheritedBackgroundOwner = "";
         st._streamTimer = null;
         st._stallWatch = null;
         st._reconnectTimer = null;
-        st._canonicalResyncTimer = null;
         st._canonicalResyncPending = false;
-        st._streamHealthProbe = null;
         st._serverActiveObserved = false;
-        st._reconcileRetryTimer = null;
-        st._reconcilePromise = null;
         st._permissionPatchSeq = (Number(st._permissionPatchSeq) || 0) + 1;
+        st._modelPatchSeq = (Number(st._modelPatchSeq) || 0) + 1;
         st._effortPatchSeq = (Number(st._effortPatchSeq) || 0) + 1;
+        st._serviceTierPatchSeq = (Number(st._serviceTierPatchSeq) || 0) + 1;
         st._thinkingPatchSeq = (Number(st._thinkingPatchSeq) || 0) + 1;
-        if (this.currentId === id && this.es === ownedEs) {
-          this.es = null;
-          this.streaming = false;
-          this._streamTimer = null;
-        }
       }
-      this._stopBgContPoller(id);
-      if (this._sessionLoadPromises) delete this._sessionLoadPromises[id];
       if (this._prefetching) delete this._prefetching[id];
+      this._warmTranscriptTabs = (this._warmTranscriptTabs || []).filter(tid => tid !== id);
+      this._transcriptPaneLru = (this._transcriptPaneLru || []).filter(tid => tid !== id);
       if (this.tabState[id] === st) delete this.tabState[id];
-      this._residentTabIds = (this._residentTabIds || []).filter(x => x !== id);
-      this._residentTabLru = (this._residentTabLru || []).filter(x => x !== id);
+      this._dropSessionMessageStore(id);
       this._clearSessionWarnFlags(id);
     },
     _startWorkspaceDrag(path, pointerId = null) {
-      if (this.workspaceSwitching || !this.sessionWorkspaces.some(row => row.path === path)) return false;
+      if (this.workspaceSwitching || this.workspaceRegistryBusy
+          || this.workspaceOrderSaving
+          || !this.sessionWorkspaces.some(row => row.path === path)) return false;
       this.workspaceDrag = {
         path, overPath: path, pointerId,
         originalPaths: this.sessionWorkspaces.map(row => row.path),
@@ -7894,14 +12180,14 @@ function portal() {
     },
     async finishWorkspaceDrag() {
       const drag = this.workspaceDrag;
-      if (!drag.path) return;
+      if (!drag.path || this.workspaceOrderSaving) return;
       const currentPaths = this.sessionWorkspaces.map(row => row.path);
       const changed = currentPaths.some((path, index) => path !== drag.originalPaths[index]);
       this.workspaceDrag = { path: "", overPath: "", pointerId: null, originalPaths: [] };
       if (!changed) return;
 
       this._saveWorkspaceOrder();
-      this.workspaceSwitching = true;
+      this.workspaceOrderSaving = true;
       try {
         const response = await fetch("/api/chat/workspaces/order", {
           method: "PUT",
@@ -7920,12 +12206,13 @@ function portal() {
         this._saveWorkspaceOrder();
         this.toast(this.lang === "zh" ? "工作目录排序保存失败" : "Could not save workspace order", "error");
       } finally {
-        this.workspaceSwitching = false;
+        this.workspaceOrderSaving = false;
       }
     },
     async removeWorkspace(path) {
       const entry = this.sessionWorkspaces.find(w => w.path === path);
-      if (!entry || entry.primary || this.workspaceSwitching) return;
+      if (!entry || entry.primary || this.workspaceSwitching
+          || this.workspaceRegistryBusy) return;
       const ok = await this.confirm({
         title: this.lang === "zh" ? "移除工作目录" : "Remove workspace",
         body: this.lang === "zh"
@@ -7935,20 +12222,32 @@ function portal() {
         okText: this.lang === "zh" ? "移除" : "Remove",
       });
       if (!ok) return;
-      this.workspaceSwitching = true;
-      try {
+      if (this.workspaceSwitching || this.workspaceRegistryBusy) return;
+      if (this.activeWorkspace === path) {
+        const primary = this.sessionWorkspaces.find(w => w.primary);
+        if (!primary) return;
+        await this.switchWorkspace(primary.path);
         if (this.activeWorkspace === path) {
-          const primary = this.sessionWorkspaces.find(w => w.primary);
-          if (primary) await this._changeWorkspaceSurface(primary.path);
+          this.toast(this.lang === "zh"
+            ? "切换到主工作目录失败，未执行移除"
+            : "Could not switch to the primary workspace; nothing was removed",
+          "error");
+          return;
         }
+      }
+      if (this.workspaceSwitching || this.workspaceRegistryBusy) return;
+      this.workspaceRegistryBusy = true;
+      try {
         const response = await fetch(
           "/api/chat/workspaces?path=" + encodeURIComponent(path),
           { method: "DELETE", headers: this.hdr() },
         );
         if (!response.ok) throw new Error(await response.text());
+        await this._purgeWorkspaceTreeState(path);
         const removedIds = new Set(this.sessions.filter(s => s.cwd === path).map(s => s.id));
         for (const id of removedIds) this._disposeTabRuntime(id);
         this.openTabIds = this.openTabIds.filter(id => !removedIds.has(id));
+        this._writeChatTabStore(this.openTabIds);
         this.sessions = this.sessions.filter(s => !removedIds.has(s.id));
         const surfaces = { ...this.workspaceSurfaces };
         delete surfaces[path];
@@ -7967,7 +12266,7 @@ function portal() {
       } catch (_) {
         this.toast(this.lang === "zh" ? "移除工作目录失败" : "Could not remove workspace", "error");
       } finally {
-        this.workspaceSwitching = false;
+        this.workspaceRegistryBusy = false;
       }
     },
     _registerOptimisticSession(meta) {
@@ -7985,6 +12284,8 @@ function portal() {
             body: JSON.stringify({
               id, name: meta.name, model: meta.model || "", cwd: meta.cwd || "",
               permission: meta.permission || this.defaultPermission || "bypassPermissions",
+              effort: this._normalizeEffort(meta.effort),
+              service_tier: this._normalizeServiceTier(meta.service_tier),
               open_ids: this.openTabIds || [],
             }),
           });
@@ -7994,7 +12295,11 @@ function portal() {
           delete this._optimisticMetas[id];
           if (srv && srv.id === id) {
             const i = this.sessions.findIndex(s => s.id === id);
-            if (i >= 0) this.sessions[i] = { ...this.sessions[i], ...srv };
+            if (i >= 0) {
+              this.sessions[i] = this._retainExpectedSessionSettings({
+                ...this.sessions[i], ...srv,
+              });
+            }
           }
           this._fetchTabUsage(id);
           return true;
@@ -8021,6 +12326,27 @@ function portal() {
       return ok || !this._optimisticMetas[id];
     },
     newSession(options = {}) {
+      // A touch target can occasionally dispatch two clicks while the mobile
+      // viewport is settling around the software keyboard. Coalesce only a
+      // second, immediately repeated request for the same still-empty tab;
+      // once the user has typed or the first window has elapsed, a deliberate
+      // new-tab action creates a fresh session normally.
+      const interactionNow = performance.now();
+      const requestedCwd = options.cwd || this.currentWorkspacePath();
+      const recentMeta = this._lastNewSessionMeta;
+      const recentState = recentMeta && this.tabState[recentMeta.id];
+      const recentDraft = recentState && recentState.draft
+        ? String(recentState.draft.input || "") : "";
+      if (this._isMobileLayout()
+          && recentMeta
+          && this.currentId === recentMeta.id
+          && (recentMeta.cwd || "") === (requestedCwd || "")
+          && interactionNow - this._lastNewSessionAt
+            < this.NEW_SESSION_TOUCH_DEDUPE_MS
+          && (!recentState || !recentState.messages.length)
+          && !recentDraft) {
+        return recentMeta;
+      }
       // No longer stops streams in OTHER tabs — each tab has its own ES in
       // tabState[id].es. The new session starts fresh in its own tab.
       // Default name uses the user's BROWSER-LOCAL clock — the backend
@@ -8049,7 +12375,7 @@ function portal() {
       // old session you were just viewing). Fall back to this.model only when
       // the default isn't known yet (very first load before /providers lands).
       const seedModel = this.defaultModel || this.model || "";
-      const seedCwd = options.cwd || this.currentWorkspacePath();
+      const seedCwd = requestedCwd;
       // Reflect it in the dropdown immediately — _activateTabState doesn't touch
       // this.model, so without this the selector would still show the old
       // session's model even though the new session is seeded with the default.
@@ -8059,6 +12385,9 @@ function portal() {
         name: prefix + stamp,
         model: seedModel,
         permission: this.defaultPermission || "bypassPermissions",
+        plan_return_permission: options.plan_return_permission || "",
+        effort: "auto",
+        service_tier: "",
         created_at: ts,
         updated_at: ts,
         message_count: 0,
@@ -8082,9 +12411,21 @@ function portal() {
       }
       const st = this._ensureTabState(id);
       st.messages.length = 0;
+      st.messagesReady = true;
+      st.messagesLoading = false;
+      st.transcriptLoadPhase = "idle";
       st._loaded = true;
+      st.permission = meta.permission;
+      st.effort = meta.effort;
+      st.serviceTier = meta.service_tier;
       this._activateTabState(id);
-      if (!this.openTabIds.includes(id)) this.openTabIds.push(id);
+      if (!this.openTabIds.includes(id)) {
+        this.openTabIds.push(id);
+        this._writeChatTabStore(this.openTabIds);
+      }
+      this._lastNewSessionAt = interactionNow;
+      this._lastNewSessionMeta = meta;
+      this._touchTranscriptPane(id);
       if (this._isMobileLayout()) this.setMobileTab("chat");
       this.savePrefs();
       // Start registration without delaying the new-tab interaction. send()
@@ -8097,13 +12438,14 @@ function portal() {
     // ===== tabs =====
     // Switch to (and if needed open) a tab. Used by the picker dropdown to
     // promote a history session into a tab.
-    async openTab(id, makeCurrent = true) {
+    async openTab(id, makeCurrent = true, options = {}) {
       const session = this.sessions.find(s => s.id === id);
       const cwd = session && session.cwd;
       if (cwd && cwd !== this.currentWorkspacePath()
           && this.sessionWorkspaces.some(w => w.path === cwd)) {
         await this._changeWorkspaceSurface(cwd);
       }
+      let opened = false;
       if (!this.openTabIds.includes(id)) {
         const MAX_TABS = 20;
         while (this.openTabIds.length >= MAX_TABS) {
@@ -8112,11 +12454,22 @@ function portal() {
           await this.closeChatTab(oldest);
         }
         this.openTabIds.push(id);
+        opened = true;
       }
+      if (opened) this._writeChatTabStore(this.openTabIds);
       if (makeCurrent && id !== this.currentId) {
         this._captureChatPosition(this.currentId);
         this.currentId = id;
-        await this.switchSession();
+        const switching = this.switchSession();
+        if (options.deferLoad) {
+          // Workspace switching owns only the shell transition. switchSession()
+          // synchronously commits the selected tab and then waits on the target
+          // transcript; let that wait continue behind the pane-local skeleton so
+          // unrelated controls regain input after the next shell paint.
+          void switching.catch(() => false);
+        } else {
+          await switching;
+        }
       }
       if (cwd) {
         this.workspaceLastSession = { ...this.workspaceLastSession, [cwd]: id };
@@ -8186,6 +12539,7 @@ function portal() {
           await this.newSession();
         }
       }
+      this._writeChatTabStore(this.openTabIds);
       this.savePrefs();
       // Closing a tab is a cheap, reversible action (session is still in
       // history picker / sidebar). The previous toast-with-undo was noise
@@ -8214,18 +12568,11 @@ function portal() {
       const id = this.renamingTabId;
       const name = (this.renameDraft || "").trim();
       this.renamingTabId = "";
-      const draft = this.renameDraft;
       this.renameDraft = "";
       if (!id || !name) return;
       const cur = this.sessions.find(x => x.id === id);
       if (!cur || cur.name === name) return;
-      const r = await fetch("/api/chat/sessions/" + id, {
-        method: "PATCH",
-        headers: { ...this.hdr(), "Content-Type": "application/json" },
-        body: JSON.stringify({ name }),
-      });
-      if (r.ok) { await this.refreshSessions(); this.toast(this.t("toast.renamed"), "success"); }
-      else { this.toast(this.lang === "zh" ? "重命名失败" : "Rename failed", "error"); }
+      await this._renameSessionOptimistically(id, name, cur.name, true, "tab");
     },
     cancelRenameTab() { this.renamingTabId = ""; this.renameDraft = ""; },
 
@@ -8274,7 +12621,7 @@ function portal() {
     },
     isTabBackgroundActive(tid) {
       const st = this.tabState[tid];
-      if (st && st.backgroundActive) return true;
+      if (st && (st.backgroundActive || st.inheritedBackgroundTaskCount > 0)) return true;
       const s = this.sessions.find(x => x.id === tid);
       return !!(s && s.background_active);
     },
@@ -8341,7 +12688,7 @@ function portal() {
     pageTitle() {
       const cur = this.sessions.find(s => s.id === this.currentId);
       const name = (cur && cur.name) || "";
-      const prefix = this.streaming ? "● " : "";
+      const prefix = this.activeSessionPane().streaming ? "● " : "";
       return name ? `${prefix}${name} · muselab` : "muselab — Meet Muse";
     },
     // ===== thinking / tool_result collapse =====
@@ -8385,8 +12732,8 @@ function portal() {
       // user's explicit toggle (the _expandedMsgs check above).
       if (defaultOpen) return true;
       // Default: only the actively-streaming last block is expanded.
-      const msgs = paneMsgs || this.messages || [];
-      const streaming = paneState ? !!paneState.streaming : !!this.streaming;
+      const msgs = paneMsgs || this.activeSessionPane().messages;
+      const streaming = paneState ? !!paneState.streaming : !!this.activeSessionPane().streaming;
       return streaming && i === msgs.length - 1;
     },
     // `defaultOpen` MUST mirror whatever the caller passed to isMsgExpanded()
@@ -8394,14 +12741,139 @@ function portal() {
     // state for anything that renders open by default (the compact summary),
     // computes !false === true, writes "expanded" over an already-expanded
     // block — and the first tap visibly does nothing.
-    toggleMsgExpanded(m, i, defaultOpen = false) {
+    async _loadMessageBody(m, sid = this.currentId) {
+      if (!m || m.body_state !== "unloaded" || !m.body_ref) return true;
+      if (m._bodyLoadPromise) return m._bodyLoadPromise;
+      m.body_state = "loading";
+      m._bodyLoadPromise = (async () => {
+        try {
+          const r = await fetch(
+            "/api/chat/sessions/" + encodeURIComponent(sid)
+              + "/blocks/" + encodeURIComponent(m.body_ref),
+            { headers: this.hdr() },
+          );
+          if (!r.ok) throw new Error("HTTP " + r.status);
+          const loaded = await r.json();
+          const localKey = m._k;
+          Object.assign(m, loaded, { _k: localKey, body_state: "loaded" });
+          if (m.role === "assistant") this._queueHistoryRichRender(m, sid);
+          if (m._is_compact_summary) delete m._compactHtml;
+          return true;
+        } catch (_) {
+          m.body_state = "error";
+          this.toast(
+            this.lang === "zh" ? "正文加载失败，请重试" : "Failed to load body; retry",
+            "error", 3000,
+          );
+          return false;
+        } finally {
+          delete m._bodyLoadPromise;
+        }
+      })();
+      return m._bodyLoadPromise;
+    },
+    _queueHistoryRichRender(m, sid = this.currentId, el = null) {
+      if (!m || m.role !== "assistant" || !m.text || m.html || m._richRenderQueued) return;
+      m._richRenderQueued = true;
+      this._historyRichRenderQueue.push({ message: m, sid, el });
+      this._scheduleHistoryRichRender();
+    },
+    _scheduleHistoryRichRender() {
+      if (this._historyRichRenderScheduled) return;
+      this._historyRichRenderScheduled = true;
+      const run = () => {
+        this._historyRichRenderScheduled = false;
+        let pending = null;
+        while (this._historyRichRenderQueue.length && !pending) {
+          const candidate = this._historyRichRenderQueue.shift();
+          const m = candidate && candidate.message;
+          if (m) delete m._richRenderQueued;
+          if (!m || m.html || !m.text) continue;
+          if (candidate.el && !candidate.el.isConnected) continue;
+          const st = this.tabState[candidate.sid];
+          if (!st || !st.messages.includes(m)) continue;
+          pending = candidate;
+        }
+        if (!pending) return;
+        const m = pending.message;
+        m.html = this._renderHistoryMessage(m);
+        if (pending.el && pending.el.isConnected) {
+          this.$nextTick(() => this._afterPaint(() => {
+            if (pending.el.isConnected) {
+              this.highlightCode(".chat-body", [pending.el]);
+            }
+          }));
+        }
+        // A macrotask boundary between every rich bubble is intentional. A frame
+        // budget cannot pre-empt marked/DOMPurify inside one message, but it can
+        // prevent twenty independently-mounted rows from becoming one long task.
+        if (this._historyRichRenderQueue.length) this._scheduleHistoryRichRender();
+      };
+      // Visible text is already present through `.history-plain`; rich decoration
+      // can wait for idle time without hiding content or delaying input handlers.
+      if (typeof window !== "undefined" && window.requestIdleCallback) {
+        window.requestIdleCallback(run, { timeout: 250 });
+      } else {
+        setTimeout(run, 0);
+      }
+    },
+    observeAssistantBody(el, m, sid) {
+      if (!el || !m || m.role !== "assistant") return;
+      if (m.body_state === "loaded" || !m.body_available) {
+        this._queueHistoryRichRender(m, sid, el);
+        return;
+      }
+      const load = async () => {
+        if (!el.isConnected || m.body_state === "loaded") return true;
+        if (m.body_state === "error") m.body_state = "unloaded";
+        return this._loadMessageBody(m, sid);
+      };
+      if (typeof IntersectionObserver === "undefined") {
+        setTimeout(load, 0);
+        return;
+      }
+      if (!this._assistantBodyObserver) {
+        this._assistantBodyObserver = new IntersectionObserver(entries => {
+          for (const entry of entries) {
+            const target = entry.target;
+            const pending = this._assistantBodyTargets.get(target);
+            if (!pending) continue;
+            if (!target.isConnected || pending.message.body_state === "loaded") {
+              this._assistantBodyObserver.unobserve(target);
+              this._assistantBodyTargets.delete(target);
+              continue;
+            }
+            if (!entry.isIntersecting) continue;
+            pending.load().then(ok => {
+              if (!ok || !this._assistantBodyObserver) return;
+              this._assistantBodyObserver.unobserve(target);
+              this._assistantBodyTargets.delete(target);
+            });
+          }
+        }, {
+          root: (this._chatBodyElement()) || null,
+          rootMargin: "500% 0px",
+        });
+      }
+      for (const target of this._assistantBodyTargets.keys()) {
+        if (target.isConnected) continue;
+        this._assistantBodyObserver.unobserve(target);
+        this._assistantBodyTargets.delete(target);
+      }
+      this._assistantBodyTargets.set(el, { message: m, load });
+      this._assistantBodyObserver.observe(el);
+    },
+    async toggleMsgExpanded(m, i, defaultOpen = false) {
       if (!m) return;
-      const idx = (i ?? (this.messages || []).indexOf(m));
+      const idx = (i ?? this.activeSessionPane().messages.indexOf(m));
       const k = this._msgKey(idx, m);
       const cur = this.isMsgExpanded(idx, m, defaultOpen);
-      const newState = !cur;
+      if (!cur && m.body_available && m.body_state !== "loaded") {
+        if (m.body_state === "error") m.body_state = "unloaded";
+        if (!await this._loadMessageBody(m)) return;
+      }
       // Spread-assign so Alpine sees the replacement and re-evaluates.
-      this._expandedMsgs = { ...this._expandedMsgs, [k]: newState };
+      this._expandedMsgs = { ...this._expandedMsgs, [k]: !cur };
     },
     // Rendered markdown for a /compact summary body. Cached onto the message
     // because the summary runs 10-20k chars and x-html re-evaluates on every
@@ -8424,7 +12896,7 @@ function portal() {
       if (kind) cls += " kind-" + kind;
       return cls;
     },
-    toolResultSummary(m, i, paneMsgs = this.messages) {
+    toolResultSummary(m, i, paneMsgs = this.activeSessionPane().messages) {
       const text = (m && (m.text || m.preview)) || "";
       const lines = text.split("\n").length;
       const kind = this.toolResultKind(m);
@@ -8612,7 +13084,7 @@ function portal() {
     // Find the matching tool_use for a given tool_result by walking
     // backwards through messages and matching tool_use_id. Used by the
     // diff preview renderer to count +/- on Edit/Write/MultiEdit.
-    findToolUseFor(toolResult, fromIdx, paneMsgs = this.messages) {
+    findToolUseFor(toolResult, fromIdx, paneMsgs = this.activeSessionPane().messages) {
       if (!toolResult || fromIdx === undefined || fromIdx === null) return null;
       const id = toolResult.tool_use_id || toolResult.tool_id;
       if (!id) {
@@ -8624,7 +13096,7 @@ function portal() {
         return null;
       }
       for (let j = fromIdx - 1; j >= 0; j--) {
-        const c = this.messages[j];
+        const c = this.activeSessionPane().messages[j];
         if (c && c.role === "tool_use" &&
             (c.id === id || c.tool_use_id === id)) return c;
       }
@@ -8730,7 +13202,7 @@ function portal() {
     // 不会出现 footer 了". Cost: a 28px timestamp-only row at the end of
     // turns whose last msg has no body content — acceptable visual artifact
     // since it preserves the "turn ended at HH:MM" signal.
-    isMsgRenderable(m, i, paneMsgs = this.messages) {
+    isMsgRenderable(m, i, paneMsgs = this.activeSessionPane().messages) {
       if (!m) return false;
       // Tail check first: dominates any "body is empty" judgment below.
       const msgs = paneMsgs || [];
@@ -8764,7 +13236,10 @@ function portal() {
           // a wrapper left visible around a body that no longer renders is the
           // 30-40px blank-gap bug this whole method exists to prevent.
           if (this.conciseHidesToolUse(m)) return false;
-          // TodoWrite / Task|Agent / ExitPlanMode always render their own card.
+          // TodoWrite / Task|Agent / ExitPlanMode render their own card. Once
+          // ExitPlanMode's actionable permission card arrives, suppress the
+          // earlier passive duplicate.
+          if (m.name === "ExitPlanMode" && m._approvalSuperseded) return false;
           if (m.name === "TodoWrite" || m.name === "Task" || m.name === "Agent"
               || m.name === "ExitPlanMode") return true;
           // Task* (TaskList / TaskGet / TaskOutput) family uses one-line
@@ -8796,7 +13271,7 @@ function portal() {
     // index are appends / evictions (length changes) and tab switches
     // (currentId changes); in-place streaming text mutations don't. Writing
     // the cache only on key change keeps it loop-safe under Alpine.
-    _latestEditToolIdx(paneMsgs = this.messages, tid = this.currentId) {
+    _latestEditToolIdx(paneMsgs = this.activeSessionPane().messages, tid = this.currentId) {
       const msgs = paneMsgs || [];
       const key = (tid || "_") + ":" + msgs.length;
       const cached = this._cachedLatestEditIdx;
@@ -8824,7 +13299,7 @@ function portal() {
       this._cachedLatestEditIdx = { key, idx };
       return idx;
     },
-    isLatestEditTool(i, m, paneMsgs = this.messages, tid = this.currentId) {
+    isLatestEditTool(i, m, paneMsgs = this.activeSessionPane().messages, tid = this.currentId) {
       if (!m || !(m.name === "Edit" || m.name === "Write" || m.name === "MultiEdit")) return false;
       return i === this._latestEditToolIdx(paneMsgs, tid);
     },
@@ -8921,7 +13396,7 @@ function portal() {
       } catch (_) { /* best-effort housekeeping — never block the UI */ }
     },
     _taskSubjectMapForMessages() {
-      const msgs = this.messages || [];
+      const msgs = this.activeSessionPane().messages;
       // Cache key includes session id — switching tabs/sessions must
       // invalidate even when message count happens to match.
       const cacheKey = (this.currentId || "_") + ":" + msgs.length;
@@ -8971,6 +13446,410 @@ function portal() {
       if (dirty) this._storeTaskSubjects(map);
       this._cachedTaskSubjectMap = { key: cacheKey, map };
       return map;
+    },
+    _globalUserTodoStorageKey() {
+      return "muselab.userTodos.global";
+    },
+    _normalizeUserTodos(value) {
+      try {
+        const parsed = typeof value === "string" ? JSON.parse(value) : value;
+        return Array.isArray(parsed)
+          ? parsed.filter(item => item && item.text).slice(-100).map((item, index) => ({
+              ...item,
+              id: String(item.id || `u-migrated-${index}`),
+              text: String(item.text).slice(0, 240),
+              completed: !!item.completed,
+              priority: ["high", "medium", "low"].includes(item.priority)
+                ? item.priority : "medium",
+            })) : [];
+      } catch (_) { return []; }
+    },
+    _loadGlobalUserTodos() {
+      try {
+        const storageKey = this._globalUserTodoStorageKey();
+        const saved = localStorage.getItem(storageKey);
+        if (saved != null) return this._normalizeUserTodos(saved);
+
+        // One-time migration from the original per-session clipboard. Keep the
+        // old keys as a recovery backup; the presence of the global key prevents
+        // deleted global items from ever being re-imported on a later refresh.
+        const migrated = [];
+        for (let index = 0; index < localStorage.length; index++) {
+          const key = localStorage.key(index) || "";
+          if (!key.startsWith("muselab.userTodos.") || key === storageKey) continue;
+          migrated.push(...this._normalizeUserTodos(localStorage.getItem(key) || "[]"));
+        }
+        const seen = new Set();
+        const result = migrated.filter(item => {
+          if (seen.has(item.id)) return false;
+          seen.add(item.id);
+          return true;
+        }).slice(-100);
+        try {
+          localStorage.setItem(storageKey, JSON.stringify(result));
+        } catch (_) {
+          // Quota/private-mode failure must not hide successfully recovered
+          // per-session items from the current in-memory board.
+        }
+        return result;
+      } catch (_) { return []; }
+    },
+    _persistGlobalUserTodos() {
+      try {
+        localStorage.setItem(
+          this._globalUserTodoStorageKey(),
+          JSON.stringify(this.sessionTodoItems()),
+        );
+      } catch (_) { /* private mode / quota: keep the in-memory clipboard */ }
+      this._todoPushGeneration += 1;
+      this._todoPushPending = true;
+      void this._pushTodosToServer();
+    },
+    _applyTodosPayload(payload) {
+      if (!payload || !Array.isArray(payload.items)) return;
+      const revision = Number(payload.revision) || 0;
+      if (this._todoPushPending || revision < this.todoRevision) return;
+      this.userTodos = this._normalizeUserTodos(payload.items);
+      this.todoRevision = revision;
+      try {
+        localStorage.setItem(
+          this._globalUserTodoStorageKey(),
+          JSON.stringify(this.userTodos),
+        );
+      } catch (_) { /* offline cache is best-effort */ }
+    },
+    async _pushTodosToServer() {
+      if (!this.token) {
+        this._todoPushPending = false;
+        return;
+      }
+      this._todoPushPending = true;
+      if (this._todoPushPromise) return this._todoPushPromise;
+
+      const drain = async () => {
+        while (this.token && this._todoPushPending) {
+          this._todoPushPending = false;
+          const generation = this._todoPushGeneration;
+          const items = this.sessionTodoItems().map(item => ({ ...item }));
+          const baseRevision = this.todoRevision;
+          const r = await this.api("/api/todos", {
+            method: "PUT",
+            json: { items, base_revision: baseRevision },
+          });
+          if (r.ok) {
+            const payload = r.data || {};
+            const revision = Number(payload.revision) || baseRevision;
+            if (generation === this._todoPushGeneration) {
+              this._applyTodosPayload(payload);
+            } else {
+              // The server committed the captured snapshot. Rebase the newest
+              // local edit on its revision without replacing the local board.
+              this.todoRevision = Math.max(this.todoRevision, revision);
+              this._todoPushPending = true;
+            }
+            continue;
+          }
+          if (r.status !== 409) return;
+
+          const refetch = await this.api("/api/todos");
+          if (!refetch.ok) return;
+          const payload = refetch.data || {};
+          const revision = Number(payload.revision) || baseRevision;
+          if (generation === this._todoPushGeneration) {
+            // No newer local edit exists, so the concurrent device wins.
+            this._applyTodosPayload(payload);
+          } else {
+            this.todoRevision = Math.max(this.todoRevision, revision);
+            this._todoPushPending = true;
+          }
+        }
+      };
+      const owner = drain().finally(() => {
+        if (this._todoPushPromise === owner) this._todoPushPromise = null;
+        // A local edit may arrive after the drain observes an empty queue but
+        // before its owner is cleared.
+        if (this.token && this._todoPushPending) {
+          void this._pushTodosToServer();
+        }
+      });
+      this._todoPushPromise = owner;
+      return owner;
+    },
+    async _syncTodosFromServer() {
+      if (!this.token) return;
+      const generation = this._todoPushGeneration;
+      const r = await this.api("/api/todos");
+      if (!r.ok) return; // offline / unauthenticated: keep the local cache
+      const data = r.data || {};
+      const revision = Number(data.revision) || 0;
+      if (generation !== this._todoPushGeneration) {
+        // A local edit made while GET was in flight is newer than this
+        // snapshot. Keep it, then serialize it after the observed revision.
+        this.todoRevision = Math.max(this.todoRevision, revision);
+        this._todoPushPending = true;
+        await this._pushTodosToServer();
+        return;
+      }
+      const local = this.sessionTodoItems();
+      if ((!Array.isArray(data.items) || !data.items.length) && local.length) {
+        // One-time migration shares the same writer as ordinary edits so it
+        // cannot race a user action made while startup sync is in flight.
+        this.todoRevision = Math.max(this.todoRevision, revision);
+        this._todoPushPending = true;
+        await this._pushTodosToServer();
+        return;
+      }
+      this._applyTodosPayload(data);
+    },
+    sessionTodoItems() {
+      return Array.isArray(this.userTodos) ? this.userTodos : [];
+    },
+    sessionTodoCount(completed = null) {
+      const items = this.sessionTodoItems();
+      return completed == null
+        ? items.length : items.filter(item => !!item.completed === completed).length;
+    },
+    sessionTodoIndicatorPriority() {
+      const active = this.sessionTodoItems().filter(item => !item.completed);
+      if (active.some(item => item.priority === "high")) return "high";
+      if (active.some(item => item.priority === "medium")) return "medium";
+      return "";
+    },
+    addSessionUserTodo() {
+      const text = String(this.sessionTodoDraft || "").trim();
+      if (!text) return;
+      this.userTodos = [
+        ...this.sessionTodoItems(),
+        { id: `u-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+          text, completed: false, priority: "medium" },
+      ].slice(-100);
+      this.sessionTodoDraft = "";
+      this._persistGlobalUserTodos();
+    },
+    toggleSessionUserTodo(id) {
+      this.userTodos = this.sessionTodoItems().map(item =>
+        item.id === id ? { ...item, completed: !item.completed } : item);
+      this._persistGlobalUserTodos();
+    },
+    deleteSessionUserTodo(id) {
+      this.userTodos = this.sessionTodoItems().filter(item => item.id !== id);
+      if (this.sessionTodoEditId === id) this.cancelSessionTodoEdit();
+      this._persistGlobalUserTodos();
+    },
+    startSessionTodoEdit(item, ev) {
+      const explicit = !!ev?.currentTarget?.matches?.(".session-todo-edit-button");
+      const interactive = ev?.target?.closest?.("button, input, select, textarea, a");
+      if (!item || !item.id || (!explicit && interactive)) return;
+      const host = explicit
+        ? ev?.currentTarget?.closest?.(".session-todo-item") : ev?.currentTarget;
+      this._sessionTodoEditOwner = explicit
+        ? ev.currentTarget
+        : host?.querySelector?.(".session-todo-edit-button");
+      this.sessionTodoEditId = item.id;
+      this.sessionTodoEditDraft = String(item.text || "");
+      this.$nextTick(() => {
+        // Run after the browser finishes the native dblclick sequence; focusing
+        // in the same event microtask is immediately undone by Chromium's
+        // default double-click text-selection step.
+        setTimeout(() => {
+          const input = host?.querySelector?.(".session-todo-edit");
+          if (input) { input.focus(); input.select(); }
+        }, 0);
+      });
+    },
+    _finishSessionTodoEdit(restoreFocus = false) {
+      const owner = this._sessionTodoEditOwner;
+      this._sessionTodoEditOwner = null;
+      this.sessionTodoEditId = "";
+      this.sessionTodoEditDraft = "";
+      if (restoreFocus && owner) {
+        this.$nextTick(() => this._focusWithoutScroll(owner));
+      }
+    },
+    saveSessionTodoEdit(id = this.sessionTodoEditId, restoreFocus = false) {
+      if (!id || id !== this.sessionTodoEditId) return;
+      const text = String(this.sessionTodoEditDraft || "").trim();
+      if (text) {
+        this.userTodos = this.sessionTodoItems().map(item =>
+          item.id === id ? { ...item, text: text.slice(0, 240) } : item);
+        this._persistGlobalUserTodos();
+      }
+      this._finishSessionTodoEdit(restoreFocus);
+    },
+    cancelSessionTodoEdit(restoreFocus = false) {
+      this._finishSessionTodoEdit(restoreFocus);
+    },
+    clearCompletedSessionUserTodos() {
+      this.userTodos = this.sessionTodoItems().filter(item => !item.completed);
+      this._persistGlobalUserTodos();
+    },
+    sessionTodosForPriority(priority) {
+      return this.sessionTodoItems().filter(item => item.priority === priority);
+    },
+    onSessionTodoDragStart(ev, item) {
+      this.sessionTodoPointerId = null;
+      this.sessionTodoDragId = item.id;
+      if (ev?.dataTransfer) {
+        ev.dataTransfer.effectAllowed = "move";
+        ev.dataTransfer.setData("text/plain", item.id);
+      }
+    },
+    onSessionTodoDragEnd() {
+      this.sessionTodoDragId = "";
+    },
+    _focusSessionTodoGrip(id) {
+      this.$nextTick(() => {
+        const selector = `.session-todo-item[data-todo-id="${CSS.escape(id)}"] .session-todo-grip`;
+        this._focusWithoutScroll(document.querySelector(selector));
+      });
+    },
+    _announceSessionTodoMove(item, action) {
+      this.sessionTodoAnnouncement = "";
+      this.$nextTick(() => {
+        const text = String(item?.text || "");
+        this.sessionTodoAnnouncement = this.lang === "zh"
+          ? `${text}${action}` : `${text} ${action}`;
+      });
+    },
+    _moveSessionTodoTo(id, priority, beforeId = "", persist = true) {
+      if (!id || !["high", "medium", "low"].includes(priority)) return false;
+      const previous = this.sessionTodoItems();
+      const current = previous.slice();
+      const source = current.findIndex(item => item.id === id);
+      if (source < 0) return false;
+      const [sourceItem] = current.splice(source, 1);
+      const moved = { ...sourceItem, priority };
+      const target = beforeId && beforeId !== id
+        ? current.findIndex(item => item.id === beforeId) : -1;
+      if (target >= 0) current.splice(target, 0, moved);
+      else current.push(moved);
+      const changed = current.length !== previous.length || current.some((item, index) =>
+        item.id !== previous[index]?.id || item.priority !== previous[index]?.priority);
+      if (!changed) return false;
+      this.userTodos = current;
+      if (persist) this._persistGlobalUserTodos();
+      return true;
+    },
+    _sessionTodoDropAnchor(target, clientY, movingId) {
+      if (!target) return "";
+      const targetId = target.dataset?.todoId || "";
+      const priority = target.closest?.("[data-todo-priority]")?.dataset?.todoPriority || "";
+      if (!targetId || targetId === movingId || !priority) return "";
+      const rect = target.getBoundingClientRect();
+      if (!Number.isFinite(clientY) || clientY <= rect.top + rect.height / 2) return targetId;
+      const peers = this.sessionTodosForPriority(priority)
+        .filter(item => item.id !== movingId);
+      const index = peers.findIndex(item => item.id === targetId);
+      return index >= 0 && index + 1 < peers.length ? peers[index + 1].id : "";
+    },
+    onSessionTodoPointerDown(ev, item) {
+      if (!item?.id || ev?.pointerType === "mouse"
+          || (ev?.button != null && ev.button !== 0)
+          || this.sessionTodoEditId === item.id) return;
+      this.sessionTodoPointerId = ev.pointerId;
+      this.sessionTodoDragId = item.id;
+      ev.preventDefault?.();
+      try { ev.currentTarget?.setPointerCapture?.(ev.pointerId); } catch (_) {}
+    },
+    onSessionTodoPointerMove(ev) {
+      if (this.sessionTodoPointerId !== ev?.pointerId || !this.sessionTodoDragId) return;
+      ev.preventDefault?.();
+      const hit = document.elementFromPoint(ev.clientX, ev.clientY);
+      const lane = hit?.closest?.("[data-todo-priority]");
+      if (!lane) return;
+      const priority = lane.dataset.todoPriority;
+      const target = hit.closest?.(".session-todo-item");
+      if (target?.dataset?.todoId === this.sessionTodoDragId) return;
+      const beforeId = this._sessionTodoDropAnchor(
+        target, Number(ev.clientY), this.sessionTodoDragId,
+      );
+      this._moveSessionTodoTo(this.sessionTodoDragId, priority, beforeId, false);
+    },
+    onSessionTodoPointerEnd(ev) {
+      if (this.sessionTodoPointerId !== ev?.pointerId || !this.sessionTodoDragId) return;
+      const id = this.sessionTodoDragId;
+      this.sessionTodoPointerId = null;
+      this.sessionTodoDragId = "";
+      this._persistGlobalUserTodos();
+      this._focusSessionTodoGrip(id);
+    },
+    onSessionTodoGripKeydown(ev, item) {
+      if (!item?.id || ev?.altKey || ev?.ctrlKey || ev?.metaKey
+          || !["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(ev.key)) return;
+      ev.preventDefault();
+      ev.stopPropagation();
+      const currentItem = this.sessionTodoItems()
+        .find(candidate => candidate.id === item.id);
+      if (!currentItem) return;
+      const priorities = ["high", "medium", "low"];
+      let changed = false;
+      let action = "";
+      if (ev.key === "ArrowLeft" || ev.key === "ArrowRight") {
+        const index = priorities.indexOf(currentItem.priority);
+        const targetIndex = index + (ev.key === "ArrowLeft" ? -1 : 1);
+        if (targetIndex >= 0 && targetIndex < priorities.length) {
+          const priority = priorities[targetIndex];
+          changed = this._moveSessionTodoTo(currentItem.id, priority, "", true);
+          const label = priority === "high"
+            ? (this.lang === "zh" ? "高优先级" : "high priority")
+            : priority === "medium"
+              ? (this.lang === "zh" ? "中优先级" : "medium priority")
+              : (this.lang === "zh" ? "低优先级" : "low priority");
+          action = this.lang === "zh" ? `已移至${label}` : `moved to ${label}`;
+        }
+      } else {
+        const peers = this.sessionTodosForPriority(currentItem.priority);
+        const index = peers.findIndex(peer => peer.id === currentItem.id);
+        if (ev.key === "ArrowUp" && index > 0) {
+          changed = this._moveSessionTodoTo(
+            currentItem.id, currentItem.priority, peers[index - 1].id, true);
+          action = this.lang === "zh" ? "已上移" : "moved up";
+        } else if (ev.key === "ArrowDown" && index >= 0 && index + 1 < peers.length) {
+          const beforeId = index + 2 < peers.length ? peers[index + 2].id : "";
+          changed = this._moveSessionTodoTo(
+            currentItem.id, currentItem.priority, beforeId, true);
+          action = this.lang === "zh" ? "已下移" : "moved down";
+        }
+      }
+      if (changed) {
+        this._announceSessionTodoMove(currentItem, action);
+        this._focusSessionTodoGrip(currentItem.id);
+      }
+    },
+    onSessionTodoDrop(ev, priority, beforeId = "") {
+      ev?.preventDefault?.();
+      const id = this.sessionTodoDragId
+        || ev?.dataTransfer?.getData("text/plain") || "";
+      if (!id || !["high", "medium", "low"].includes(priority)) return;
+      if (beforeId === id) {
+        this.sessionTodoDragId = "";
+        return;
+      }
+      const anchor = beforeId
+        ? this._sessionTodoDropAnchor(ev?.currentTarget, Number(ev?.clientY), id)
+        : "";
+      this._moveSessionTodoTo(id, priority, anchor, true);
+      this.sessionTodoDragId = "";
+    },
+    toggleSessionTodoBoard() {
+      if (this.sessionTodoOpen) this.closeSessionTodoBoard();
+      else {
+        const opener = document.activeElement;
+        this.sessionTodoOpen = true;
+        this._openFocusSurface(
+          "session-todo", ".session-todo-modal", ".session-todo-compose input",
+          opener, true,
+        );
+      }
+    },
+    closeSessionTodoBoard() {
+      const wasOpen = this.sessionTodoOpen;
+      this.sessionTodoOpen = false;
+      this.sessionTodoDraft = "";
+      this.sessionTodoPointerId = null;
+      this.sessionTodoDragId = "";
+      this.cancelSessionTodoEdit();
+      if (wasOpen) this._closeFocusSurface("session-todo");
     },
     taskLogLine(m) {
       if (!m || !m.name) return null;
@@ -9493,7 +14372,7 @@ function portal() {
     },
 
     ctxRingTitle() {
-      const u = this.sessionUsage || {};
+      const u = this.activeSessionPane().sessionUsage || {};
       const used = u.context_used || 0;
       const limit = u.context_limit || 0;
       const pct = u.context_used_pct || 0;
@@ -9562,7 +14441,27 @@ function portal() {
     },
 
     async activateTab(tid) {
-      if (tid === this.currentId) return;
+      if (tid === this.currentId) {
+        const st = this._ensureTabState(tid);
+        const meta = (this.sessions || []).find(session => session.id === tid);
+        const canonicalCount = Math.max(
+          0, Number(meta && meta.message_count) || 0);
+        const canonicalBehind = this._canonicalMetaBehind(st, meta);
+        if ((canonicalBehind || (canonicalCount > 0 && !st.messages.length))
+            && !st.streaming && !st.es) {
+          // Clicking an already-selected tab is also a convergence point. Recover
+          // both an empty stale cache and a non-empty pane missing its canonical
+          // suffix; quiet mode preserves the mounted bubbles and controls.
+          if (!st.messages.length) st._loaded = false;
+          st._pendingExternalUpdate = canonicalBehind;
+          await this._ensureSessionLoaded(tid);
+        }
+        this._ensureNonEmptyMessageRange(st);
+        st.messagesReady = true;
+        this._touchTranscriptPane(tid);
+        await this.returnToLatest(tid);
+        return;
+      }
       await this.openTab(tid);
       if (this.currentId !== tid) return;
       // Clear the green "task done while you were elsewhere" dot now that
@@ -9664,6 +14563,7 @@ function portal() {
       if (from < 0 || to < 0) return;
       this.openTabIds.splice(from, 1);
       this.openTabIds.splice(to, 0, src);
+      this._writeChatTabStore(this.openTabIds);
       this.savePrefs();
     },
     onTabDragEnd() {
@@ -9704,7 +14604,7 @@ function portal() {
           // Switch first, mutate second. openFile owns the dirty-editor guard;
           // if the user cancels, keep the original tab array intact.
           if (this.selected !== path) {
-            await this.switchTab(path);
+            await this.switchTab(path, { reveal: true });
             if (this.selected !== path) return;
           }
           this.tabs = this.tabs.filter(t => t.path === path);
@@ -9714,7 +14614,7 @@ function portal() {
           const idx = this.tabs.findIndex(t => t.path === path);
           const selectedIdx = this.tabs.findIndex(t => t.path === this.selected);
           if (idx >= 0 && selectedIdx > idx) {
-            await this.switchTab(path);
+            await this.switchTab(path, { reveal: true });
             if (this.selected !== path) return;
           }
           if (idx >= 0) this.tabs = this.tabs.slice(0, idx + 1);
@@ -9737,13 +14637,20 @@ function portal() {
                                             ? "需要 HTTPS"
                                             : "HTTPS required"));
           break;
+        case "copyAbsolutePath": {
+          const absolutePath = this.absoluteFilePath(path);
+          navigator.clipboard?.writeText(absolutePath).then(
+            () => this.toast(this.t("toast.copied") + ": " + absolutePath, "success", 1500),
+            () => this.errToast("copy", this.lang === "zh"
+                                            ? "需要 HTTPS"
+                                            : "HTTPS required"));
+          break;
+        }
       }
     },
 
     async onPreviewDrop(ev) {
-      this.previewDragHover = false;
-      this.osFileDragging = false;
-      this._dragCounter = 0;
+      this._resetOsFileDragState();
       const files = Array.from((ev.dataTransfer && ev.dataTransfer.files) || []);
       if (!files.length) return;
       const ownerWorkspace = this.fileWorkspacePath();
@@ -10072,7 +14979,8 @@ function portal() {
       ].filter(Boolean);
     },
     toggleHistoryPicker(ev) {
-      if (this.sessionPickerOpen) { this.sessionPickerOpen = false; return; }
+      if (this.sessionPickerOpen) { this.closeHistoryPicker(); return; }
+      if (this.activity.moveMenu.show) this.closeActivityMoveMenu();
       const btn = ev && ev.currentTarget;
       const rect = btn ? btn.getBoundingClientRect() : null;
       if (rect) {
@@ -10088,9 +14996,19 @@ function portal() {
       }
       this.sessionPickerOpen = true;
       this.pickerGroupExpanded = {};  // reset collapse state on each open
+      this._openFocusSurface(
+        "history-picker", ".chat-tab-history .session-picker-pop",
+        ".session-picker-search", btn, false,
+      );
+    },
+    closeHistoryPicker(restoreFocus = true, cancelRename = true) {
+      if (!this.sessionPickerOpen && !this._focusSurfaceState["history-picker"]) return;
+      this.sessionPickerOpen = false;
+      if (cancelRename) this.pickerCancelInlineRename();
+      this._closeFocusSurface("history-picker", restoreFocus);
     },
     pickerOpenSession(sid) {
-      this.sessionPickerOpen = false;
+      this.closeHistoryPicker();
       // A search hit may live OUTSIDE the recent window, so its metadata isn't
       // in this.sessions yet — merge it in so the tab title / model resolve
       // immediately (the next _pullSessionList keeps it via ?ids=). Without
@@ -10124,11 +15042,11 @@ function portal() {
     },
     pickEditorTab(path) {
       this.editorTabPickerOpen = false;
-      this.switchTab(path);
+      this.switchTab(path, { reveal: true });
     },
     pickerRowMenu(ev, sid) {
       if (ev && ev.stopPropagation) ev.stopPropagation();
-      this.sessionPickerOpen = false;
+      this.closeHistoryPicker();
       this.showTabMenu(ev, sid);
     },
     // Inline rename inside the picker row (✎ icon). MUST be fully
@@ -10154,6 +15072,98 @@ function portal() {
       if (!this._claimNonImeEnter(ev)) return;
       this.pickerCommitInlineRename();
     },
+    _applyRenamedSession(sid, name) {
+      const session = this.sessions.find(row => row.id === sid);
+      if (session) {
+        session.name = name;
+        session.auto_named = false;
+      }
+      // Activity rows carry a denormalized display name. Patch this browser in
+      // the same optimistic update; the backend sends the persisted row over
+      // Activity SSE so other tabs converge after the request succeeds.
+      // Never reload the conversation or the full Activity Center for a title
+      // change — both are unrelated surfaces and a reload can visibly churn
+      // their keyed DOM.
+      let activityChanged = false;
+      for (const item of this.activity.events || []) {
+        const itemSid = item.session_id || item.thread_id || "";
+        if (itemSid !== sid || item.session_name === name) continue;
+        item.session_name = name;
+        activityChanged = true;
+      }
+      if (activityChanged) this.activity.events = [...this.activity.events];
+    },
+    async _renameSessionOptimistically(
+      sid, name, previousName, announce = false, surface = "modal",
+    ) {
+      // The backend also mirrors the title into the CLI transcript and Activity
+      // ledger, which can take seconds. The local session index is authoritative
+      // for this view, so update immediately and let persistence finish without
+      // making the tab label feel blocked on unrelated disk work.
+      const perfNow = (typeof performance !== "undefined" && performance.now)
+        ? () => performance.now() : () => Date.now();
+      const started = perfNow();
+      const renamePerf = {
+        surface, status: "error", optimistic_apply_ms: 0,
+        optimistic_paint_ms: 0, request_ms: 0, total_ms: 0,
+        long_task_count: 0, longest_task_ms: 0,
+      };
+      let longTaskObserver = null;
+      if (typeof PerformanceObserver !== "undefined") {
+        try {
+          longTaskObserver = new PerformanceObserver(list => {
+            for (const entry of list.getEntries()) {
+              renamePerf.long_task_count++;
+              renamePerf.longest_task_ms = Math.max(
+                renamePerf.longest_task_ms, Math.round(entry.duration || 0));
+            }
+          });
+          longTaskObserver.observe({ entryTypes: ["longtask"] });
+        } catch (_) { longTaskObserver = null; }
+      }
+      this._applyRenamedSession(sid, name);
+      renamePerf.optimistic_apply_ms = Math.round(perfNow() - started);
+      const painted = new Promise(resolve => {
+        this._afterPaint(() => {
+          renamePerf.optimistic_paint_ms = Math.round(perfNow() - started);
+          resolve();
+        });
+      });
+      let response = null;
+      const requestStarted = perfNow();
+      try {
+        response = await fetch("/api/chat/sessions/" + sid, {
+          method: "PATCH",
+          headers: { ...this.hdr(), "Content-Type": "application/json" },
+          body: JSON.stringify({ name }),
+        });
+      } catch (_) { /* handled by the rollback below */ }
+      renamePerf.request_ms = Math.round(perfNow() - requestStarted);
+      const ok = !!(response && response.ok);
+      if (!ok) {
+        // Do not undo a newer rename that completed while this request was in
+        // flight. Roll back only when our optimistic value still owns the row.
+        const current = this.sessions.find(row => row.id === sid);
+        if (current && current.name === name) {
+          this._applyRenamedSession(sid, previousName);
+          renamePerf.status = "rollback";
+        }
+        this.toast(this.lang === "zh" ? "重命名失败" : "Rename failed", "error", 3000);
+      } else {
+        renamePerf.status = "ok";
+        if (announce) this.toast(this.t("toast.renamed"), "success");
+      }
+      // Hidden/background tabs may suspend requestAnimationFrame indefinitely.
+      // Bound diagnostics so observing first paint can never hold this action open.
+      await Promise.race([
+        painted,
+        new Promise(resolve => setTimeout(resolve, 250)),
+      ]);
+      if (longTaskObserver) longTaskObserver.disconnect();
+      renamePerf.total_ms = Math.round(perfNow() - started);
+      this._reportSessionRenamePerf(renamePerf);
+      return ok;
+    },
     async pickerCommitInlineRename() {
       const sid = this.renamingPickerSid;
       const name = (this.pickerRenameDraft || "").trim();
@@ -10162,17 +15172,7 @@ function portal() {
       if (!sid || !name) return;
       const cur = this.sessions.find(x => x.id === sid);
       if (!cur || cur.name === name) return;
-      const r = await fetch("/api/chat/sessions/" + sid, {
-        method: "PATCH",
-        headers: { ...this.hdr(), "Content-Type": "application/json" },
-        body: JSON.stringify({ name }),
-      });
-      if (r.ok) {
-        cur.name = name;
-        cur.auto_named = false;
-      } else {
-        this.toast(this.lang === "zh" ? "重命名失败" : "Rename failed", "error", 3000);
-      }
+      await this._renameSessionOptimistically(sid, name, cur.name, false, "picker");
     },
     pickerCancelInlineRename() {
       this.renamingPickerSid = "";
@@ -10182,6 +15182,11 @@ function portal() {
       if (ev && ev.stopPropagation) ev.stopPropagation();
       const s = this.sessions.find(x => x.id === sid);
       const name = (s && s.name) || sid.slice(0, 8);
+      // The confirmation dialog is a separate modal surface. Close the picker
+      // first and make its still-visible trigger the focus owner; otherwise
+      // confirm/cancel tries to restore focus to a hidden row button.
+      this.closeHistoryPicker(false);
+      this._focusWithoutScroll(document.getElementById("history-picker-trigger"));
       const ok = await this.confirm({
         title: this.t("modal.delete_session_title"),
         body: this.t("modal.delete_session_body", { name }),
@@ -10210,7 +15215,7 @@ function portal() {
       // Close the picker popup first — its z-index (1500) sits ABOVE the global
       // confirm modal, so leaving it open would bury the confirm dialog behind
       // the session list. The popup has done its job once the action fires.
-      this.sessionPickerOpen = false;
+      this.closeHistoryPicker();
       // 1) Ask the server how many would be deleted (no mutation).
       let preview;
       try {
@@ -10262,8 +15267,10 @@ function portal() {
       const deletedIds = new Set((resp && resp.ids) || []);
       for (const sid of deletedIds) {
         this._disposeTabRuntime(sid);
+        this._deletePersistedChatDraft(sid);
       }
       this.openTabIds = (this.openTabIds || []).filter(id => !deletedIds.has(id));
+      this._writeChatTabStore(this.openTabIds);
       await this.refreshSessions();
       this.savePrefs();
       const cleared = (resp && resp.deleted) || 0;
@@ -10285,7 +15292,7 @@ function portal() {
       const x = Math.min(cx, window.innerWidth - 220);
       const y = Math.min(cy, window.innerHeight - 200);
       setTimeout(() => {
-        this.sessionPickerOpen = false;
+        if (this.sessionPickerOpen) this.closeHistoryPicker();
         this.tabCtxMenu = { id, x, y };
       }, 0);
     },
@@ -10396,22 +15403,56 @@ function portal() {
       this.startRenameTab(id);
     },
     async menuClose(id) { this.closeTabMenu(); await this.closeChatTab(id); },
-    menuExportMarkdown(id) {
+    async menuExportMarkdown(id) {
       this.closeTabMenu();
       if (!id) return;
-      // Use a transient anchor so the browser opens the streaming Response
-      // as a file download. Token goes in the query string because anchor
-      // requests can't carry custom headers.
-      const url = `/api/chat/sessions/${id}/export?token=`
-                  + encodeURIComponent(this.token);
-      const a = document.createElement("a");
-      a.href = url; a.style.display = "none";
-      // download attribute lets the server's Content-Disposition take
-      // precedence but still hints to the browser this isn't navigation.
-      a.setAttribute("download", "");
-      document.body.appendChild(a);
-      a.click();
-      setTimeout(() => a.remove(), 200);
+      try {
+        // Anchors cannot add X-Auth-Token. Mint a fresh, session-bound,
+        // single-use download ticket for every explicit export click.
+        const url = await this._mintChatResourceUrl(
+          "export", { session_id: id }, true,
+        );
+        const a = document.createElement("a");
+        a.href = url; a.style.display = "none";
+        // download lets Content-Disposition choose the final filename.
+        a.setAttribute("download", "");
+        document.body.appendChild(a);
+        a.click();
+        setTimeout(() => a.remove(), 200);
+      } catch (_) {
+        this.toast(this.lang === "zh" ? "导出失败" : "Export failed", "error");
+      }
+    },
+    async _copySessionEvidence(id) {
+      if (!id) return false;
+      try {
+        const response = await fetch(
+          `/api/chat/sessions/${encodeURIComponent(id)}/evidence`,
+          { headers: this.hdr(), cache: "no-store" },
+        );
+        if (!response.ok) throw new Error(await response.text());
+        const evidence = await response.json();
+        if (!navigator.clipboard || !navigator.clipboard.writeText) {
+          throw new Error("clipboard unavailable");
+        }
+        await navigator.clipboard.writeText(JSON.stringify(evidence, null, 2));
+        this.toast(
+          this.lang === "zh" ? "已复制会话证据 JSON" : "Session evidence JSON copied",
+          "success", 1800,
+        );
+        return true;
+      } catch (_) {
+        this.errToast(
+          "copy-session-evidence",
+          this.lang === "zh" ? "复制失败，需要 HTTPS 且会话须已有记录" : "Copy failed; HTTPS and an existing transcript are required",
+        );
+        return false;
+      }
+    },
+
+    async menuCopySessionEvidence(id) {
+      this.closeTabMenu();
+      await this._copySessionEvidence(id);
     },
     async menuDelete(id) {
       this.closeTabMenu();
@@ -10430,20 +15471,29 @@ function portal() {
       // Earlier we only did this in openTab, which left chat-tabs taps and
       // a few other paths needing a second tap on the bottom Muse icon.
       if (this._isMobileLayout()) this.setMobileTab("chat");
+      const paneWasWarm = this._touchTranscriptPane(this.currentId);
       // Switch the visible tab. We do NOT touch other tabs' streams — each
       // tab's ES is in its own tabState[id], and stream callbacks write
       // there directly. Switching is just "show that tab".
-      // [resident-panes] Decide warm vs rebuild BEFORE promoting: was this tab's
-      // pane already mounted? Yes → warm (pure x-show flip, DOM already present).
-      // No (LRU-evicted, or first activation of a background-opened tab) → rebuild
-      // (Alpine re-mounts its bubbles from tabState). Then promote currentId so its
-      // pane is (or stays) resident and any LRU eviction happens now.
-      const _wasResident = (this._residentTabIds || []).includes(this.currentId);
-      this._promoteResident(this.currentId);
+      // The active pane and a bounded set of recent panes stay mounted as
+      // virtualized DOM views. Canonical messages remain owned by tabState.
       this._activateTabState(this.currentId);
+      const activatedState = this.tabState && this.tabState[this.currentId];
+      if (activatedState && typeof activatedState._flushLivePresentation === "function") {
+        activatedState._flushLivePresentation();
+      }
+      if (activatedState) {
+        this._scheduleDeferredStreamRich(this.currentId, activatedState);
+      }
+      // Selecting a conversation means opening its latest state, not restoring a
+      // stale historical viewport. Reader-controlled position is preserved only
+      // while staying inside the same active tab; every explicit tab selection
+      // re-engages tail follow before loading/remounting the pane.
+      const selectedState = this._ensureTabState(this.currentId);
+      this._enforceMessageRangeInvariant(selectedState);
       this.ackCurrentActivity();
       this.savePrefs();
-      // Sync the model + effort dropdowns to THIS session's persisted
+      // Sync the model + permission + effort dropdowns to THIS session's persisted
       // values on every tab switch. Without this, the dropdowns are
       // tied to root state (this.model / this.effort) which carries
       // over from whatever the user last picked on the previous tab.
@@ -10458,110 +15508,105 @@ function portal() {
         if (cwd) {
           this.workspaceLastSession = { ...this.workspaceLastSession, [cwd]: cur.id };
         }
-        if (cur.model) this.model = cur.model;
-        // effort: explicit assignment even when empty — switching from
-        // a high-effort tab to one with no override should clear the
-        // dropdown, not inherit the old value.
-        this.effort = cur.effort || "";
+        const curState = this._ensureTabState(cur.id);
+        const curModel = curState._modelExpected
+          ? curState._modelExpected.value : cur.model;
+        if (curModel) this.model = curModel;
+        const curPermission = this._normalizePermissionMode(
+          curState._permissionExpected
+            ? curState._permissionExpected.value
+            : (cur.permission || curState.permission || this.defaultPermission),
+          "default",
+        );
+        curState.permission = curPermission;
+        this.permission = curPermission;
+        // Explicitly restore both independent runtime controls. Legacy empty
+        // effort normalizes to auto; an empty service tier must clear Fast.
+        this.effort = curState.effort = this._normalizeEffort(
+          curState._effortExpected
+            ? curState._effortExpected.value : cur.effort,
+        );
+        this.serviceTier = curState.serviceTier = this._normalizeServiceTier(
+          curState._serviceTierExpected
+            ? curState._serviceTierExpected.value : cur.service_tier,
+        );
         // thinking: default true when the field is absent (legacy sessions).
         this.thinkingEnabled = cur.thinking !== false;
       }
       const st = this._ensureTabState(this.currentId);
-      if (!st._loaded) {
-        await this._ensureSessionLoaded(this.currentId);
-      } else if (_wasResident) {
-        // Already loaded — content is in the DOM, the switch is just an x-show
-        // flip. The click→switch lag came from the browser laying out the
-        // newly-revealed pane (style/layout of every .msg scales with that
-        // tab's history) PLUS scrollToBottom's forced reflow + highlightCode's
-        // full-body walk, all BEFORE the browser could paint the currentId
-        // change — so a big tab "froze" ~1.5s and even small tabs lagged
-        // ~100-200ms.
-        const stCur = this.tabState && this.tabState[this.currentId];
-        const shouldFollow = !stCur || stCur.atBottom !== false;
-        this.atBottom = shouldFollow;
-        const histLen = (stCur && stCur.messages && stCur.messages.length) || 0;
-        // On mobile, heavy history keeps the bubbles display:none'd for one frame
-        // (`.chat-body.msgs-hidden .msg { display:none }`, driven by
-        // messagesReady=false) so the tab-bar flip + a loading skeleton PAINT
-        // immediately with ZERO bubble layout. Then reveal on the next frame —
-        // the (unavoidable) layout of N bubbles now happens AFTER the switch is
-        // already on screen, so the click feels instant with a brief loading
-        // state. Desktop favours visual continuity and keeps warm panes visible;
-        // the wider resident set makes these switches a direct x-show flip.
-        // Guard the deferred callbacks against a rapid re-switch: if the user
-        // tabs away again before the next frame, the stale callback must not
-        // flip messagesReady / scroll / highlight for a tab that's no longer
-        // visible (it would clobber the now-current tab's state).
+      const canonicalCount = Math.max(0, Number(cur && cur.message_count) || 0);
+      const loadedButMissingCanonical = st._loaded
+        && canonicalCount > 0 && !st.messages.length;
+      const loadedButBehindCanonical = this._canonicalMetaBehind(st, cur);
+      if (!st._loaded || loadedButMissingCanonical || loadedButBehindCanonical) {
+        // `_loaded` is only a cache hint. A runtime handoff from an off-screen
+        // predecessor can leave an empty local clone for a non-empty canonical
+        // session; explicit tab selection must fail open to a real history load.
+        if (loadedButMissingCanonical) st._loaded = false;
+        if (loadedButBehindCanonical) st._pendingExternalUpdate = true;
         const target = this.currentId;
-        // Already-highlighted tabs don't need another full-body highlight pass
-        // on every switch: the per-node data-hl sentinel already early-returns,
-        // but the `.chat-body pre code` querySelectorAll still walks EVERY open
-        // pane's DOM each time. Streaming new code sets its own data-hl via the
-        // stream path, so a warm re-activation has nothing new to do. Skip it.
-        const reHighlight = () => { if (!stCur || !stCur._highlighted) { this.highlightCode(".chat-body"); if (stCur) stCur._highlighted = true; } };
-        // Warm switch: settle to the bottom. The loop early-exits as soon as
-        // scrollHeight is stable (2 frames) — a couple frames for a tab whose
-        // heights are already realized, more for tall content-visibility
-        // bubbles that realize as they scroll in — and onChatScroll is
-        // suppressed during it, so the default cap is cheap in the common case
-        // while still landing correctly on tall histories.
-        const settle = () => this._restoreChatPosition(target);
-        if (this._isMobileLayout()
-            && histLen >= Math.ceil(this._mountedMessageCap() / 2)
-            && shouldFollow) {
-          stCur.messagesReady = false;
-          this.messagesReady = false;          // msgs-hidden → bubbles display:none + skeleton
-          this._afterPaint(() => {
-            if (this.currentId !== target) return;
-            stCur.messagesReady = true;
-            this.messagesReady = true;         // reveal bubbles (layout now, post-switch-paint)
-            this._afterPaint(() => {
-              if (this.currentId !== target) return;
-              settle();
-              reHighlight();
-            });
+        await this._ensureSessionLoaded(target);
+      } else {
+        const target = this.currentId;
+        const stCur = this.tabState && this.tabState[target];
+        this._enforceMessageRangeInvariant(stCur);
+        if (paneWasWarm) {
+          // Warm pane: x-show reveals the existing keyed DOM. Do not flash a
+          // skeleton, rebuild directives, or rescan already-highlighted content.
+          stCur.messagesReady = true;
+          this.$nextTick(() => {
+            if (this.currentId !== target || this.tabState[target] !== stCur) return;
+            // This callback runs after x-show has exposed the warm target pane.
+            // Explicit selection means latest: acquire the logical tail before
+            // any physical scroll so a middle DOM window cannot masquerade as it.
+            void this.returnToLatest(target);
           });
         } else {
-          stCur.messagesReady = true;
-          this.messagesReady = true;           // cheap reveal → no skeleton flash
-          this._afterPaint(() => {
-            if (this.currentId !== target) return;
-            settle();
-            reHighlight();
+          // Cold LRU miss: canonical data is resident, but Alpine must reconstruct
+          // the keyed pane. Keep an opaque visual transaction over that mount and
+          // tail-positioning window so partially-created rows never flash.
+          const mountToken = this._beginTranscriptLoad(target, stCur, "mounting");
+          stCur.messagesReady = false;
+          this.$nextTick(() => {
+            if (this.tabState[target] !== stCur) return;
+            if (this.currentId !== target) {
+              void this._settleTranscriptLoad(
+                mountToken, { returnToLatest: false });
+              return;
+            }
+            stCur.messagesReady = true;
+            this.$nextTick(async () => {
+              if (this.tabState[target] !== stCur) return;
+              if (this.currentId !== target) {
+                await this._settleTranscriptLoad(
+                  mountToken, { returnToLatest: false });
+                return;
+              }
+              try {
+                const latest = await this.returnToLatest(target);
+                if (!latest) {
+                  this._failTranscriptLoad(mountToken);
+                  return;
+                }
+                const settled = await this._settleTranscriptLoad(mountToken, {
+                  returnToLatest: false,
+                  skipNextTick: true,
+                  singlePaint: true,
+                });
+                if (!settled) return;
+                this._afterPaint(() => {
+                  if (this.currentId !== target || this.tabState[target] !== stCur) return;
+                  stCur._highlighted = false;
+                  const pane = this._paneElement(target);
+                  this.highlightCode(".chat-body", pane ? [pane] : null);
+                  stCur._highlighted = true;
+                });
+              } catch (_) {
+                this._failTranscriptLoad(mountToken);
+              }
+            });
           });
         }
-      } else {
-        // [resident-panes] REBUILD: history is loaded in tabState but this pane
-        // was NOT mounted (LRU-evicted, or first activation of a tab opened in
-        // the background). Promoting currentId above added it to _residentTabIds,
-        // so the message-pane x-for will MOUNT a fresh .msg-pane and render its
-        // bubbles from tabState[id].messages on the next Alpine tick. No refetch
-        // (skip net/parse/md) — wait for the mount to paint, then highlight +
-        // settle scroll. Cost is O(target history), bounded by THIS session, not
-        // the sum of every open tab's retained DOM (that was the lag root cause).
-        const target = this.currentId;
-        const stCur = this.tabState && this.tabState[this.currentId];
-        const shouldFollow = !stCur || stCur.atBottom !== false;
-        this.atBottom = shouldFollow;
-        // Hide bubbles for one frame so the tab-bar flip + skeleton paint
-        // instantly; reveal next frame so the O(M) fresh-mount layout lands AFTER
-        // the switch is on-screen (same trick as the heavy-warm path above).
-        stCur.messagesReady = false;
-        this.messagesReady = false;
-        this._afterPaint(() => {
-          if (this.currentId !== target) return;
-          stCur.messagesReady = true;
-          this.messagesReady = true;
-          this._afterPaint(() => {
-            if (this.currentId !== target) return;
-            this._restoreChatPosition(target);
-            // Fresh DOM → always (re)highlight; reset the sentinel first.
-            if (stCur) stCur._highlighted = false;
-            this.highlightCode(".chat-body");
-            if (stCur) stCur._highlighted = true;
-          });
-        });
       }
     },
     // Run `fn` AFTER the browser has painted the current frame. A single
@@ -10573,6 +15618,62 @@ function portal() {
       if (typeof requestAnimationFrame !== "function") { setTimeout(fn, 0); return; }
       requestAnimationFrame(() => requestAnimationFrame(fn));
     },
+    _reportHistoryLoadPerf(fields) {
+      // One privacy-bounded summary per canonical history load. Never include a
+      // session id, message text, URL, model name, or error string.
+      const numeric = [
+        "total_ms", "fetch_ms", "parse_ms", "shape_ms", "markdown_ms",
+        "install_ms", "response_bytes", "block_count", "assistant_blocks",
+        "long_task_count", "longest_task_ms",
+      ];
+      const payload = {
+        status: ["ok", "cancelled", "error"].includes(fields.status)
+          ? fields.status : "error",
+        mode: ["cold", "quiet", "prefetch"].includes(fields.mode)
+          ? fields.mode : "cold",
+        foreground: !!fields.foreground,
+      };
+      for (const name of numeric) {
+        const value = Math.round(Number(fields[name]) || 0);
+        payload[name] = Math.max(0, Math.min(value, 100_000_000));
+      }
+      try {
+        fetch("/api/log/client-perf", {
+          method: "POST",
+          headers: { ...this.hdr(), "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+          keepalive: true,
+        }).catch(() => { /* diagnostics must never affect the UI */ });
+      } catch (_) { /* diagnostics must never affect the UI */ }
+    },
+    _reportSessionRenamePerf(fields) {
+      // Rename diagnostics contain timings and closed-set labels only. In
+      // particular, never send the session id or either title value.
+      const numeric = [
+        "optimistic_apply_ms", "optimistic_paint_ms", "request_ms", "total_ms",
+        "long_task_count", "longest_task_ms",
+      ];
+      const payload = {
+        surface: ["tab", "picker", "modal"].includes(fields.surface)
+          ? fields.surface : "modal",
+        status: ["ok", "error", "rollback"].includes(fields.status)
+          ? fields.status : "error",
+        asset_version: String(document.querySelector(
+          'meta[name="muselab-asset-version"]')?.content || "").slice(0, 32),
+      };
+      for (const name of numeric) {
+        const value = Math.round(Number(fields[name]) || 0);
+        payload[name] = Math.max(0, Math.min(value, 100_000_000));
+      }
+      try {
+        fetch("/api/log/session-rename", {
+          method: "POST",
+          headers: { ...this.hdr(), "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+          keepalive: true,
+        }).catch(() => { /* diagnostics must never affect the UI */ });
+      } catch (_) { /* diagnostics must never affect the UI */ }
+    },
     // Background-completion hook: after loadSession populates the
     // JSONL-derived history, ask the backend whether this session has
     // an in-flight turn still running. If yes, transparently
@@ -10580,24 +15681,64 @@ function portal() {
     // an empty-prompt SSE to the same endpoint, and the backend's
     // reconnect mode replays the existing event buffer then streams
     // live. User sees the reply continue right where it left off.
-    async _checkActiveTurn(sid) {
+    _checkActiveTurn(sid) {
+      return this._requestSessionSync(sid, "active_probe");
+    },
+    async _probeActiveTurn(sid, st, options = {}) {
       // Refresh the queue mirror on every load/reconnect probe so a session
       // with server-side queued items shows them immediately (e.g. items that
       // were waiting behind an active turn, or left dormant after a restart).
-      const st = this.tabState && this.tabState[sid];
-      if (!sid || !st) return;
-      this._syncQueueFromServer(sid);
-      const controller = new AbortController();
-      const timeout = setTimeout(
-        () => controller.abort(),
-        Math.max(100, Number(this._sessionListTimeoutMs) || 8000),
-      );
+      if (!sid || !st || this.tabState[sid] !== st) return false;
+      this._syncQueueFromServer(sid, options);
       try {
-        const r = await fetch("/api/chat/sessions/" + sid + "/active",
-                               { headers: this.hdr(), signal: controller.signal });
+        const r = await this._fetchWithDeadline(
+          "/api/chat/sessions/" + sid + "/active",
+          { headers: this.hdr(), signal: options.signal },
+          Math.max(100, Number(this._sessionListTimeoutMs) || 8000),
+        );
         if (!r.ok) return;
         const d = await r.json();
         if (this.tabState[sid] !== st) return;
+        // A hard refresh reconstructs a rollover child from its own history,
+        // not from the in-memory handoff path. Restore the inherited watcher
+        // badge/poller from the presentation-only task overlay reported by
+        // /active; otherwise an ancestor-owned card stays "running" forever
+        // with no yellow dot until the user refreshes again after settlement.
+        const inheritedPending = Number(d.runtime_background_tasks_pending);
+        const runtimeContinuationPending = !!d.runtime_continuation_pending;
+        const remoteRuntimeUiRevision = String(d.runtime_ui_revision || "");
+        const runtimeRevisionBehind = !!remoteRuntimeUiRevision
+          && st.runtimeUiRevision !== remoteRuntimeUiRevision;
+        const sessionMeta = (this.sessions || []).find(row => row.id === sid);
+        const predecessorSid = String(
+          (sessionMeta && sessionMeta.runtime_predecessor) || "",
+        );
+        if (predecessorSid && (
+          (Number.isFinite(inheritedPending) && inheritedPending > 0)
+          || runtimeContinuationPending
+          || runtimeRevisionBehind
+        )) {
+          st.inheritedBackgroundOwner = predecessorSid;
+          st.inheritedBackgroundTaskCount = Number.isFinite(inheritedPending)
+            ? Math.max(0, Math.floor(inheritedPending))
+            : Number(st.inheritedBackgroundTaskCount) || 0;
+          this._ensureInheritedTaskPoller(sid, predecessorSid);
+        }
+        const activeTurnUser = d.active && !d.continuation
+          ? this._installActiveTurnUser(
+              st,
+              String(d.turn_id || ""),
+              String(d.user_text || ""),
+              Array.isArray(d.user_images) ? d.user_images : [],
+              Array.isArray(d.user_docs) ? d.user_docs : [],
+            )
+          : null;
+        if (activeTurnUser && activeTurnUser.appended) {
+          this._scheduleLiveMessageViewport(st);
+          if (this.currentId === sid && st.atBottom !== false) {
+            this.scrollToBottom(true);
+          }
+        }
         if (d.active && d.background && d.attachable === false) {
           st._serverActiveObserved = true;
           if (d.turn_id) st.activeTurnId = d.turn_id;
@@ -10608,6 +15749,10 @@ function portal() {
         }
         if (d.active && !st.streaming && !st.es) {
           st._serverActiveObserved = true;
+          // Rate-limited: a reconnect replays the whole turn over a wiped
+          // pane, and this probe runs from ~8 different pollers. Without the
+          // gate they compound into a visible reconnect storm (2026-08-04).
+          if (!this._allowReconnect(sid, d.turn_id)) return;
           // Reconnect any time the backend says there's an active turn.
           // get_session_api returns SDK-only messages (no broadcast
           // overlay), so loadSession's view is just the user msg — the
@@ -10639,7 +15784,6 @@ function portal() {
         // eventual completion surfaces live without a manual reload.
         this._ensureBgContPoller(sid);
       } catch (e) { /* silent */ }
-      finally { clearTimeout(timeout); }
     },
 
     // Hover-prefetch: kick off loadSession when the user's mouse rests
@@ -10657,7 +15801,7 @@ function portal() {
     // only the row the user actually pauses on triggers a fetch.
     //
     // Safety: loadSession is per-session safe (writes only into
-    // tabState[sid].messages, never touches this.messages or
+    // tabState[sid].messages and never touches another pane or
     // messagesLoading unless sid === currentId), so prefetching an
     // off-screen session can't disturb the active view.
     prefetchSession(sid) {
@@ -10681,26 +15825,52 @@ function portal() {
       }, 300);
     },
 
+    _reloadSessionCoalesced(sid, opts = {}) {
+      if (!sid) return Promise.resolve(false);
+      this._ensureTabState(sid);
+      return this._requestSessionSync(sid, "history_load", { loadOptions: opts });
+    },
     async _ensureSessionLoaded(sid) {
       if (!sid) return false;
       const st = this._ensureTabState(sid);
-      if (st._loaded) return true;
-      if (this._sessionLoadPromises[sid]) {
-        return this._sessionLoadPromises[sid];
+      const meta = (this.sessions || []).find(session => session.id === sid);
+      const canonicalBehind = this._canonicalMetaBehind(st, meta);
+      if (st._loaded && !canonicalBehind) {
+        if (st.transcriptLoadPhase === "error") st.transcriptLoadPhase = "idle";
+        return true;
       }
-      const task = (async () => {
-        const ok = await this.loadSession(sid);
-        if (ok) st._loaded = true;
-        return !!ok;
-      })();
-      this._sessionLoadPromises[sid] = task;
+      if (canonicalBehind) st._pendingExternalUpdate = true;
+      // A known-good resident transcript adopts newer canonical state quietly.
+      // Empty/unloaded panes need an opaque foreground transition instead: begin
+      // it synchronously, before the session-sync coordinator's setTimeout, so
+      // Alpine never gets a frame in which the new currentId looks like a new chat.
+      const canonicalLoadOptions = canonicalBehind ? { quiet: true } : {};
+      const quiet = canonicalBehind && st._loaded && st.messages.length > 0;
+      const token = sid === this.currentId && !quiet && !st.streaming && !st.es
+        ? this._beginTranscriptLoad(sid, st, "fetching") : null;
+      let loaded = false;
       try {
-        return await task;
-      } finally {
-        if (this._sessionLoadPromises[sid] === task) {
-          delete this._sessionLoadPromises[sid];
-        }
+        loaded = await this._reloadSessionCoalesced(
+          sid, quiet ? canonicalLoadOptions : {},
+        );
+      } catch (_) {
+        loaded = false;
       }
+      if (!token) {
+        if (loaded && st.transcriptLoadPhase === "error") {
+          st.transcriptLoadPhase = "idle";
+        }
+        if (loaded && quiet && sid === this.currentId) {
+          try { return await this.returnToLatest(sid); }
+          catch (_) { return false; }
+        }
+        return !!loaded;
+      }
+      if (loaded && st._loaded && this._ownsTranscriptLoad(token)) {
+        return await this._settleTranscriptLoad(token);
+      }
+      this._failTranscriptLoad(token);
+      return false;
     },
 
     async loadSession(sid, opts = {}) {
@@ -10717,7 +15887,19 @@ function portal() {
       // messages never blanks the conversation or jumps the scroll. Cold opens
       // and tab switches keep the normal skeleton + chunked-reveal path.
       const quiet = !!opts.quiet;
+      // probeActive:false → do NOT run _checkActiveTurn after the load.
+      // _checkActiveTurn reconnects whenever the backend reports a live turn,
+      // and a reconnect replays the entire turn over a wiped pane. Cold opens
+      // and tab switches genuinely need that probe (it's how a page reload
+      // re-attaches to a running turn), but the quiet reconciliation callers
+      // do NOT: each of them already probed /active itself and decided what to
+      // do, so probing again here just turned every poll-driven quiet reload
+      // into a reconnect — the inner half of the 2026-08-04 flicker loop.
+      const probeActive = opts.probeActive !== undefined
+        ? !!opts.probeActive : !quiet;
       const st = this._ensureTabState(sid);
+      const runtimeSettingsGenerationAtLoad = st._runtimeSettingsGeneration;
+      const runtimeUiRevisionAtLoad = String(st.runtimeUiRevision || "");
       // A live stream owns st.messages and every SSE closure points directly at
       // objects inside that array. No load mode may clear/splice it while the
       // owner is active — continuation text otherwise keeps mutating an orphaned
@@ -10726,6 +15908,9 @@ function portal() {
       // Return false so full-history/outline callers know the requested load was
       // deferred instead of recursively treating it as completed.
       if (st.streaming || st.es) return false;
+      const historyReplaceToken = this._beginHistoryReplace(st);
+      const quietRangeSnapshot = quiet
+        ? this._captureMessageRangeSnapshot(st) : null;
       // Skeleton on the active tab during the fetch — markdown rendering of
       // a long history can also take a noticeable beat after the network
       // returns, so the flag must wrap both phases.
@@ -10735,8 +15920,10 @@ function portal() {
       // mid-load corrupts the now-active tab (messages not assigned / skeleton
       // stuck / model/effort overwritten by the old session). See loadSession race.
       const isCurrent = sid === this.currentId;
-      const quietScrollEl = quiet && isCurrent ? this.$refs.chatBody : null;
+      const quietScrollEl = quiet && isCurrent ? this._chatBodyElement() : null;
       const quietScrollTop = quietScrollEl ? quietScrollEl.scrollTop : 0;
+      const quietAnchor = quietScrollEl && !st.atBottom
+        ? this._captureViewportMessageAnchor(quietScrollEl, sid) : null;
       // Quiet refresh keeps the existing bubbles on screen (morph swap below) —
       // raising the skeleton would defeat the point, so only cold/switch loads
       // flip it. Also re-baseline the open-session resync cursor on a real load
@@ -10745,53 +15932,100 @@ function portal() {
       if (!quiet) {
         st.messagesLoading = true;
         st.messagesReady = false;
-        if (isCurrent) {
-          this.messagesLoading = true;
-          this.messagesReady = false;
-          this._openSeenUpdated = undefined;
-        }
+        if (isCurrent) this._openSeenUpdated = undefined;
       }
       // Set true once we've scheduled the reveal (highlight→show). Guards the
       // finally so error / empty-result paths don't leave the skeleton stuck.
       let scheduledReveal = false;
-      try {
-        // Backend windowing (perf): a long / un-compacted session can shape
-        // into thousands of bubbles and many MB of JSON. Shipping + parsing
-        // the whole thing on every entry was the dominant freeze ("卡死").
-        // So unless full mode is requested, ask the server for only the TAIL
-        // we'll actually paint up front. The tail must be wide enough that
-        // pickVisibleStart's "at least 2 user turns" guarantee still holds
-        // (it can rewind up to INITIAL_LOAD*5), so we request that much; we
-        // still render only ~INITIAL_LOAD and stash the rest. Older history
-        // pages in from the server via _fetchOlderWindow on "Load earlier".
-        const _coldEarly = !this.appReady;
-        const _mobileEarly = this._isMobileLayout();
-        const _initialLoadEarly = _mobileEarly
-          ? (_coldEarly ? 8 : 15)
-          : (_coldEarly ? 30 : 60);
-        const FETCH_TAIL = _initialLoadEarly * 5;
-        const qs = full ? "?full=1" : ("?tail=" + FETCH_TAIL);
-        const controller = new AbortController();
-        const timeout = setTimeout(
-          () => controller.abort(),
-          full ? 60_000 : Math.max(100, Number(this._sessionReadTimeoutMs) || 15000),
-        );
-        let r;
+      const perfNow = (typeof performance !== "undefined" && performance.now)
+        ? () => performance.now() : () => Date.now();
+      const historyPerf = {
+        status: "cancelled",
+        mode: quiet ? "quiet" : (isCurrent ? "cold" : "prefetch"),
+        foreground: isCurrent,
+        total_ms: 0, fetch_ms: 0, parse_ms: 0, shape_ms: 0,
+        markdown_ms: 0, install_ms: 0, response_bytes: 0,
+        block_count: 0, assistant_blocks: 0,
+        long_task_count: 0, longest_task_ms: 0,
+      };
+      const historyPerfStarted = perfNow();
+      let longTaskObserver = null;
+      if (typeof PerformanceObserver !== "undefined") {
         try {
-          r = await fetch("/api/chat/sessions/" + sid + qs, {
-            headers: this.hdr(), signal: controller.signal,
+          longTaskObserver = new PerformanceObserver(list => {
+            for (const entry of list.getEntries()) {
+              historyPerf.long_task_count++;
+              historyPerf.longest_task_ms = Math.max(
+                historyPerf.longest_task_ms, Math.round(entry.duration || 0));
+            }
           });
+          longTaskObserver.observe({ entryTypes: ["longtask"] });
+        } catch (_) { longTaskObserver = null; }
+      }
+      try {
+        // Bound cold session entry by canonical UI-block count. Long transcripts
+        // can contain thousands of tool/thinking/result blocks, so fetching and
+        // parsing the complete JSON response makes the whole app appear frozen.
+        // A normal open gets only the latest viewport-sized page (20 blocks on
+        // phones, 100 on desktop). History remains canonical on the server and
+        // the reader can explicitly prepend another same-sized page through the
+        // "Load earlier" control. Quiet reconciliation keeps blocks the user
+        // already chose to load, but never expands the resident window by itself.
+        const historyPage = this._historyWindowSize();
+        const minimumTail = Math.max(0, Number(opts.minimumTail) || 0);
+        const requestedTail = Math.max(
+          minimumTail,
+          quiet ? Math.max(historyPage, st.messages.length) : historyPage,
+        );
+        const preserveFullOrder = quiet && st.messageRange.order === "full";
+        const qs = full
+          ? "?full=1"
+          : preserveFullOrder
+            ? "?full=1&tail=" + requestedTail
+            : "?tail=" + requestedTail;
+        let r;
+        const fetchStarted = perfNow();
+        try {
+          r = await this._fetchWithDeadline(
+            "/api/chat/sessions/" + sid + qs,
+            { headers: this.hdr(), signal: opts.signal },
+            full ? 60_000
+              : Math.max(100, Number(this._sessionReadTimeoutMs) || 15000),
+          );
         } catch (_) {
+          historyPerf.status = "error";
           return false;
         } finally {
-          clearTimeout(timeout);
+          historyPerf.fetch_ms = Math.round(perfNow() - fetchStarted);
         }
         if (!r.ok) {
+          historyPerf.status = "error";
           return false;
         }
-        const s = this._retainExpectedSessionSettings(await r.json());
-        if (this.tabState[sid] !== st) return false;
+        historyPerf.response_bytes = Math.max(
+          0, Number(r.headers.get("content-length")) || 0);
+        const parseStarted = perfNow();
+        const parsedSession = await r.json();
+        historyPerf.parse_ms = Math.round(perfNow() - parseStarted);
+        const s = this._retainExpectedSessionSettings(parsedSession);
+        if (this.tabState[sid] !== st
+            || !this._historyReplaceStillOwns(st, historyReplaceToken)) {
+          return false;
+        }
+        if (st.streaming || st.es) return false;
+        const loadedRuntimeUiRevision = String(s.runtime_ui_revision || "");
+        const currentRuntimeUiRevision = String(st.runtimeUiRevision || "");
+        // A different load for this same tab adopted another presentation
+        // revision while this request was in flight.  Never let the older
+        // response remove that bubble and roll the local watermark backward.
+        // Equal responses remain safe to coalesce, while a genuinely newer
+        // server revision is picked up by the existing poll/reconcile retry.
+        if (currentRuntimeUiRevision !== runtimeUiRevisionAtLoad
+            && currentRuntimeUiRevision !== loadedRuntimeUiRevision) {
+          return false;
+        }
         const loadedUpdated = Number(s.updated_at) || 0;
+        const shapeStarted = perfNow();
         // Build a lookup of blob preview URLs from the current in-memory
         // messages so we can carry them over after the server rebuild.
         // Server messages only store {mime} for images — no preview URL —
@@ -10838,158 +16072,168 @@ function portal() {
           // them as `sid:uuid:*` / `sid:hist:*`.
           all = this._preserveCanonicalMessageIdentity(st, all);
         }
-        // Lazy-load thresholds — only render the tail of the conversation on
-        // first paint; older messages stay in a "to-render" stash and get
-        // mdRender'd on demand when the user clicks "Load earlier".
-        // Rationale: a long indie-coding session can rack up hundreds of
-        // assistant messages, each potentially with a 200-line code block.
-        // mdRender + Alpine x-for over all of them locks up the main thread
-        // for several seconds on initial load. Rendering only the recent
-        // 30 keeps switch-to-session snappy; "Load earlier" lets the user
-        // page back in batches of 50 as needed.
-        // Narrower first paint on mobile — WebViews have far less headroom
-        // than desktop, so render fewer bubbles up front and let "Load
-        // earlier" page the rest in on demand.
-        // Cold-boot guard: when this is the FIRST session loaded on app start
-        // (appReady still false), the heavy markdown+highlight render competes
-        // with Alpine's full-tree mount, first-time hljs/mermaid download+parse
-        // and the boot fetches — landing directly in a long session froze the
-        // page ("卡死"). Render far fewer bubbles up front in that window; the
-        // rest page in via "Load earlier" once the app is warm. After boot the
-        // normal thresholds apply, so warm tab-switches are unchanged.
-        const INITIAL_LOAD = _initialLoadEarly;
-        const renderMarkdown = (m) => {
-          if (m.role === "assistant" && m.text && !m.html) {
-            m.html = this.mdRender(m.text);
-          }
-        };
-        // Split into earlier (deferred) vs visible (rendered now).
-        //
-        // Naive `slice(-INITIAL_LOAD)` breaks badly when the tail of the
-        // conversation is tool-call heavy: one turn can easily have 20+
-        // tool_use/tool_result/task-update messages, so the last 30 may
-        // contain zero user/assistant TEXT — the user opens the session
-        // and sees only Task-update bubbles with no actual conversation.
-        //
-        // Smarter strategy: rewind from the end until we've included AT
-        // LEAST the last two user messages (so there's at least one full
-        // back-and-forth visible), capped at INITIAL_LOAD * 5 so a
-        // pathological 500-tool-call turn doesn't render everything.
-        const pickVisibleStart = (msgs) => {
-          if (msgs.length <= INITIAL_LOAD) return 0;
-          // Default tail position
-          let start = msgs.length - INITIAL_LOAD;
-          // Walk backwards collecting user-message indices
-          const userIdx = [];
-          for (let j = msgs.length - 1; j >= 0; j--) {
-            if (msgs[j] && msgs[j].role === "user") {
-              userIdx.push(j);
-              if (userIdx.length >= 2) break;
-            }
-          }
-          // Anchor on the 2nd-most-recent user msg if we found one
-          if (userIdx.length >= 2) start = Math.min(start, userIdx[1]);
-          else if (userIdx.length === 1) start = Math.min(start, userIdx[0]);
-          // Safety cap so a single huge turn doesn't render hundreds
-          const HARD_CAP = INITIAL_LOAD * 5;
-          if (msgs.length - start > HARD_CAP) start = msgs.length - HARD_CAP;
-          return Math.max(0, start);
-        };
-        const startIdx = pickVisibleStart(all);
-        const visible = all.slice(startIdx);
-        const earlier = all.slice(0, startIdx);
-        // E5: when pickVisibleStart rewound `visible` past the bottom
-        // INITIAL_LOAD (agentic / tool-heavy sessions hit HARD_CAP≈90), that
-        // rewound HEAD sits ABOVE the fold once we scroll to the bottom on first
-        // paint. Rendering its markdown synchronously here — marked + DOMPurify +
-        // KaTeX over up to ~90 bubbles, all while the skeleton is up — is the
-        // remaining pre-reveal main-thread FREEZE on long-session open. So render
-        // only the on-screen tail synchronously (messagesReady can flip with real
-        // content immediately) and stash the head for a post-paint, idle-chunked,
-        // scroll-anchored fill (see _fillDeferredHead). Un-rewound windows keep
-        // the original one-shot path — zero behaviour change for short sessions.
-        let _deferHead = null;
-        if (sid === this.currentId && quiet) {
-          // Quiet refresh: render the whole visible window synchronously (small —
-          // it's a refresh, not a cold open) so the in-place swap below morphs in
-          // fully-rendered bubbles with no deferred-head dance.
-          visible.forEach(renderMarkdown);
-        } else if (sid === this.currentId) {
-          if (visible.length > INITIAL_LOAD) {
-            const _headCount = visible.length - INITIAL_LOAD;
-            for (let j = _headCount; j < visible.length; j++) renderMarkdown(visible[j]);
-            _deferHead = visible.slice(0, _headCount);
-          } else {
-            // No rewind: the whole window is the first screen — render it now so
-            // html is ready before the skeleton reveals.
-            visible.forEach(renderMarkdown);
-          }
-        } else {
-          // Desktop may prewarm one envelope only; mobile background markdown
-          // work is disabled entirely. No hidden pane DOM is mounted here.
-          if (!this._isMobileLayout() && visible.length) {
-            renderMarkdown(visible[visible.length - 1]);
-          }
-        }
+        const incomingCount = all.length;
+        historyPerf.block_count = incomingCount;
+        historyPerf.assistant_blocks = all.reduce(
+          (count, message) => count + (message && message.role === "assistant" ? 1 : 0), 0);
+        historyPerf.shape_ms = Math.round(perfNow() - shapeStarted);
+        // The response is already server-windowed. Keep every fetched normalized
+        // block; viewport virtualization makes a second count-based client trim
+        // unnecessary and would discard interaction state on full/around loads.
+        const trimmedHead = 0;
+        // Install the bounded canonical window before rich rendering. Assistant
+        // rows have a complete plain-text fallback, and only physically-mounted
+        // rows enqueue marked/DOMPurify work from observeAssistantBody(). Doing the
+        // rich pass here — even chunked between messages — still lets one giant
+        // Markdown message monopolize the browser main thread before any shell
+        // button or composer input can paint.
+        const startIdx = 0;
+        const visible = all;
+        const _deferHead = null;
+        historyPerf.markdown_ms = 0;
         // The tab may have been disposed/recreated, or a stream may have claimed
         // this state while markdown rendering yielded. Never write into a stale
         // generation or replace an active owner's message array.
-        if (this.tabState[sid] !== st || st.streaming || st.es) return true;
-        // Mutate in place — preserves the Array reference Alpine is watching.
-        if (sid === this.currentId && quiet) {
-          // Re-check after the fetch await: if a stream started meanwhile, abort
-          // the swap so we don't wipe live bubbles (see up-front guard above).
-          if (st.streaming || st.es) return true;
-          // One-shot splice swap after `_preserveCanonicalMessageIdentity`:
-          // matching live/canonical bubbles retain both their object identity
-          // and `_k`, so only genuinely new/removed transcript rows touch DOM.
-          this.messages = st.messages;
-          st.messages.splice(0, st.messages.length, ...visible);
-        } else {
-          st.messages.length = 0;
-          // Foreground tab fills st.messages INCREMENTALLY via
-          // _revealMessagesChunked below (spreads Alpine's bubble instantiation
-          // over several frames instead of one multi-second main-thread burst).
-          // Off-screen tabs aren't painted (display:none), so there's no freeze
-          // to spread — push them in one shot.
-          if (sid !== this.currentId) st.messages.push(...visible);
+        if (this.tabState[sid] !== st || st.streaming || st.es
+            || !this._historyReplaceStillOwns(st, historyReplaceToken)) {
+          return false;
         }
-        // Stash older messages on the per-tab state; the "Load earlier"
-        // button reads from here.
-        st._earlierMessages = earlier;
-        st._laterMessages = [];
-        st.historyGeneration = s.history_generation || s.historyGeneration || "";
-        st._historyOrder = (s.history_order === "full" || full) ? "full" : "normal";
-        st._hasServerLater = !!s.has_later;
-        if (sid === this.currentId) this.historyGeneration = st.historyGeneration;
-        // Backend windowing cursor. The server told us the index of the
-        // first bubble it returned (`s.offset`); everything before that
-        // still lives on disk and pages in via _fetchOlderWindow. full /
-        // no-window responses report offset 0 (whole chain in hand).
-        st._loadedOffset = Number.isInteger(s.offset) ? s.offset : 0;
-        st._total = Number.isInteger(s.total) ? s.total : all.length;
-        st._preTotal = Number.isInteger(s.pre_total) ? s.pre_total : 0;
-        // Trimming may evict the oldest cached bubbles and advance the cursor,
-        // so it must run after the response coordinate has been installed.
-        // A canonical load is anchored at the newest end. If the selected
-        // visible slice exceeds the DOM cap, retain its tail so the actual
-        // latest reply remains mounted.
-        this._capMountedWindow(st, "newer");
-        // More history exists if either the in-memory stash has older
-        // bubbles OR the server holds bubbles before our window.
-        st._hasMoreHistory = st._earlierMessages.length > 0 || st._loadedOffset > 0;
+        // Replace the one repository in place. Quiet reconciliation preserves
+        // matching message object identity; cold reveal changes only range coords.
+        if (st.streaming || st.es) return false;
+        // _virtualStart/_virtualEnd are LOCAL to the revealed slice. A quiet
+        // canonical refresh can move visibleStart from a narrow recent tail to
+        // an older coordinate; carrying the same numbers across that change
+        // points the DOM at entirely different (usually much earlier) messages.
+        // Snapshot stable keys before replacing the range and synchronously
+        // rebase after it, so Alpine never paints one frame with invalid indices.
+        const virtualWindowBeforeInstall = quiet
+          ? this._captureMessageVirtualWindow(st) : null;
+        const followTailAtInstall = quiet && (
+          opts.followTail === true || !!(quietRangeSnapshot && quietRangeSnapshot.followTail)
+        );
+        const quietRangeResolved = quiet
+          ? (followTailAtInstall
+            ? {
+              start: Math.max(0, all.length - this._liveMessageDomCap()),
+              end: all.length,
+            }
+            : this._resolveMessageRangeSnapshot(all, quietRangeSnapshot))
+          : null;
+        // A quiet response that no longer contains the reader's stable message
+        // anchor belongs to another coordinate system (for example full/around vs
+        // normal tail), or was superseded by newer navigation. Preserve the current
+        // repository and expose the jump-to-latest affordance instead of silently
+        // applying old numeric indices to unrelated messages.
+        if (quiet && !quietRangeResolved) {
+          st.atBottom = false;
+          return false;
+        }
+        const installStarted = perfNow();
+        // Cold loads start from an empty coordinate and reveal the newest rows in
+        // small batches. Quiet reconciliation uses stable identities so inserts or
+        // order changes before the visible rows cannot retarget the mounted window.
+        const quietStart = quietRangeResolved ? quietRangeResolved.start : startIdx;
+        const quietEnd = quietRangeResolved ? quietRangeResolved.end : startIdx;
+        st.messageRange.visibleStart = quiet ? quietStart : startIdx;
+        st.messageRange.visibleEnd = quiet ? quietEnd : startIdx;
+        st.messages.splice(0, st.messages.length, ...all);
+        Object.assign(st.messageRange, {
+          visibleStart: quiet ? quietStart : startIdx,
+          visibleEnd: quiet ? quietEnd : startIdx,
+          offset: (Number.isInteger(s.offset) ? s.offset : 0) + trimmedHead,
+          total: Number.isInteger(s.total) ? s.total : incomingCount,
+          preTotal: Number.isInteger(s.pre_total) ? s.pre_total : 0,
+          order: (s.history_order === "full" || full) ? "full" : "normal",
+          generation: s.history_generation || "",
+        });
+        if (quiet) st.atBottom = followTailAtInstall;
+        this._enforceMessageRangeInvariant(st);
+        if (quiet) {
+          await new Promise(resolve => this.$nextTick(resolve));
+        } else {
+          await this._revealMessagesChunked(sid, st, visible, true);
+        }
+        historyPerf.install_ms = Math.round(perfNow() - installStarted);
+        if (this.tabState[sid] !== st || st.streaming || st.es
+            || !this._historyReplaceStillOwns(st, historyReplaceToken)) {
+          return false;
+        }
+        if (quiet) {
+          this._rebaseMessageVirtualWindow(
+            st, virtualWindowBeforeInstall, followTailAtInstall);
+        } else if (sid === this.currentId) {
+          // Seed the physical tail synchronously. Waiting for a scheduled viewport
+          // sync left cold refreshes with only the giant top spacer mounted for the
+          // first paint, so scrollHeight existed but no message row was visible.
+          this._rebaseMessageVirtualWindow(st, null, true);
+        }
+        st.runtimeUiRevision = loadedRuntimeUiRevision;
+        // Seed the render-only viewport at the newest end after installing the
+        // response coordinates. Canonical envelopes remain untouched.
+        this._scheduleHistoryViewport(st, "newer");
+        this._syncSessionMessageStore(st);
+        st._hasMoreHistory = st.messageRange.visibleStart > 0
+          || st.messageRange.offset > 0 || this._preCompactReachable(st);
         // Remember whether this load pulled the full raw-JSONL history, so
         // _scrollToUserMsg knows it can stop retrying after one full reload.
-        st._fullLoaded = full;
+        st._fullLoaded = full || s.history_order === "full";
         st._truncatedFromTop = false;
         // Advance the rendered revision only after this state generation actually
         // accepted the canonical message window. A stream claiming the pane mid-
         // read returns above without falsely marking an unseen revision as loaded.
         if (loadedUpdated) st._seenUpdated = loadedUpdated;
+        st._installedCanonicalCount = Math.max(
+          0, Number(s.message_count) || Number(s.total) || incomingCount,
+        );
         // (The session outline is sourced from the backend via
         // refreshOutlineFromBackend (GET …/outline), not built here.)
+        const permissionExpected = st._permissionExpected;
+        st.permission = this._normalizePermissionMode(
+          permissionExpected
+            ? permissionExpected.value
+            : (s.permission || st.permission || this.defaultPermission),
+          "default",
+        );
+        const runtimeSettingsStillCurrent =
+          st._runtimeSettingsGeneration === runtimeSettingsGenerationAtLoad;
+        const loadedMeta = (this.sessions || []).find(row => row.id === sid);
+        const resolvedModel = String(
+          st._modelExpected
+            ? st._modelExpected.value
+            : (runtimeSettingsStillCurrent
+              ? (s.model || (loadedMeta && loadedMeta.model) || "")
+              : ((sid === this.currentId ? this.model : "")
+                || (loadedMeta && loadedMeta.model)
+                || s.model || "")),
+        );
+        const resolvedEffort = this._normalizeEffort(
+          st._effortExpected
+            ? st._effortExpected.value
+            : (runtimeSettingsStillCurrent ? s.effort : st.effort),
+        );
+        const resolvedServiceTier = this._normalizeServiceTier(
+          st._serviceTierExpected
+            ? st._serviceTierExpected.value
+            : (runtimeSettingsStillCurrent ? s.service_tier : st.serviceTier),
+        );
+        if (loadedMeta) {
+          if (resolvedModel) loadedMeta.model = resolvedModel;
+          loadedMeta.permission = st.permission;
+          if (permissionExpected
+              && permissionExpected.planReturnPermission !== undefined) {
+            loadedMeta.plan_return_permission =
+              permissionExpected.planReturnPermission;
+          } else if (Object.prototype.hasOwnProperty.call(
+            s, "plan_return_permission")) {
+            loadedMeta.plan_return_permission = s.plan_return_permission || "";
+          }
+          loadedMeta.effort = resolvedEffort;
+          loadedMeta.service_tier = resolvedServiceTier;
+        }
+        st.effort = resolvedEffort;
+        st.serviceTier = resolvedServiceTier;
         if (sid === this.currentId) {
-          this.messages = st.messages;
           // Background-completion: if there's an in-flight turn on this
           // session that finished while we were elsewhere, the JSONL we
           // just loaded already has its complete output — nothing to do.
@@ -10997,19 +16241,13 @@ function portal() {
           // know the reply isn't done yet. A proper "reconnect SSE for
           // live streaming" UI is a larger refactor; for now we just
           // surface the state. The user can wait + reload to see more.
-          this._checkActiveTurn(sid);
-          if (s.model) this.model = s.model;
-          this.permission = st._permissionExpected
-            ? st._permissionExpected.value
-            // 2026-07-21: legacy/blank sessions had no stored permission and fell
-            // through to a hard-coded "default". That value then leaked out via
-            // savePrefs() into the NEXT newly-created chat's starting mode,
-            // overriding the user's configured global default ("新建会话还是
-            // default"). Honor the server-authoritative defaultPermission first.
-            : (s.permission || this.defaultPermission || "default");
-          // effort defaults to "" (adaptive); always assign so switching from
-          // a high-effort tab to a fresh one doesn't leave the old value visible.
-          this.effort = s.effort || "";
+          if (probeActive) this._checkActiveTurn(sid);
+          if (resolvedModel) this.model = resolvedModel;
+          // Per-tab state owns the primitive; root permission is only the
+          // currently visible selector mirror.
+          this.permission = st.permission;
+          this.effort = st.effort;
+          this.serviceTier = st.serviceTier;
           // thinking: default true when absent (legacy sessions had no field).
           this.thinkingEnabled = s.thinking !== false;
           if (quiet) {
@@ -11017,71 +16255,112 @@ function portal() {
             // re-highlight the freshly-added tail and re-pin to the bottom IF the
             // user was following it — _reconcileOpenSession only quiet-reloads
             // when atBottom, so this won't yank anyone reading history.
-            const _wasAtBottom = this.atBottom;
+            const _wasAtBottom = st.atBottom !== false;
             this.$nextTick(async () => {
               try { await this.highlightCode(".chat-body"); st._highlighted = true; }
               catch (_e) { /* highlight best-effort */ }
               if (sid === this.currentId && _wasAtBottom) {
-                this.atBottom = true; this.scrollToBottom(true);
+                st.atBottom = true; this.scrollToBottom(true);
               } else if (sid === this.currentId && quietScrollEl) {
-                quietScrollEl.scrollTop = quietScrollTop;
-                st.scrollTop = quietScrollTop;
+                const restored = this._restoreMessageAnchor(
+                  quietScrollEl, quietAnchor);
+                if (!restored) quietScrollEl.scrollTop = quietScrollTop;
+                st.scrollTop = quietScrollEl.scrollTop;
                 st.atBottom = false;
               }
             });
-            await this._fetchTabUsage(sid);
+            historyPerf.status = "ok";
             return true;
           }
-          this.atBottom = true;
+          st.atBottom = true;
           // Hold the skeleton until highlight + artifacts finish, then reveal
           // the whole conversation at once. Without this, a big session paints
           // un-highlighted text first, then janks code-block-by-code-block as
           // the chunked highlighter catches up — very visible on mobile.
           // scrollToBottom runs AFTER reveal so it measures the final layout.
           scheduledReveal = true;
-          // Instantiate bubbles in small chunks (yield to the browser between
-          // each) so a long session's first paint never blocks the main thread
-          // in a single multi-second task. The skeleton stays up until this
-          // resolves, so the user sees a responsive page (tabs / sidebar stay
-          // clickable) instead of a frozen one ("卡死").
-          await this._revealMessagesChunked(sid, st, visible);
-          if (this.tabState[sid] !== st || st.streaming || st.es) return true;
-          this.$nextTick(async () => {
-            try { await this.highlightCode(".chat-body"); st._highlighted = true; }
-            catch (_e) { /* highlight best-effort — reveal regardless */ }
-            if (sid === this.currentId) {
-              st.messagesReady = true;
-              this.messagesReady = true;
-              this.$nextTick(() => {
-                this.atBottom = true; this.scrollToBottom(true);
-                // E5: the on-screen tail is now painted + pinned to the bottom.
-                // Fill the deferred head above the fold (idle-chunked + scroll-
-                // anchored) so the rewound bubbles are ready before the user
-                // scrolls up, without blocking this first paint.
-                if (_deferHead && _deferHead.length) {
-                  const _kick = () => this._fillDeferredHead(sid, st, _deferHead);
-                  if (typeof window !== "undefined" && window.requestIdleCallback) {
-                    window.requestIdleCallback(_kick, { timeout: 300 });
-                  } else { setTimeout(_kick, 32); }
-                }
+          // The canonical fetched range is already resident and viewport
+          // virtualization mounts only the tail rows. Do not replay the obsolete
+          // visibleEnd chunk expansion here: it first collapses the range back to
+          // empty, then repeatedly rebuilds Alpine state before the initial scroll.
+          if (this.tabState[sid] !== st || st.streaming || st.es) return false;
+          this.$nextTick(() => {
+            if (sid !== this.currentId || this.tabState[sid] !== st) return;
+            // Never keep the transcript hidden behind markdown highlighting.
+            // While messagesReady=false CSS removes every `.msg` but leaves the
+            // virtual spacer in layout, producing a huge blank pane at scrollTop=0
+            // on refresh. Reveal first, mount the virtual tail, and position the
+            // physical scroller before any best-effort decoration work.
+            st.messagesReady = true;
+            this.$nextTick(() => {
+              if (sid !== this.currentId || this.tabState[sid] !== st) return;
+              st.atBottom = true;
+              this._syncMessageViewport(sid, true);
+              this._scrollChatTailNow(sid, st);
+              this._settleScrollToBottom();
+              this._afterPaint(async () => {
+                if (sid !== this.currentId || this.tabState[sid] !== st) return;
+                try {
+                  const pane = this._paneElement(sid);
+                  await this.highlightCode(".chat-body", pane ? [pane] : null);
+                  st._highlighted = true;
+                } catch (_e) { /* highlight best-effort */ }
               });
-            }
+              // E5: the on-screen tail is now painted + pinned to the bottom.
+              // Fill the deferred head above the fold (idle-chunked + scroll-
+              // anchored) so the rewound bubbles are ready before the user
+              // scrolls up, without blocking this first paint.
+              if (_deferHead && _deferHead.length) {
+                const _kick = () => this._fillDeferredHead(sid, st, _deferHead);
+                if (typeof window !== "undefined" && window.requestIdleCallback) {
+                  window.requestIdleCallback(_kick, { timeout: 300 });
+                } else { setTimeout(_kick, 32); }
+              }
+            });
           });
         }
-        await this._fetchTabUsage(sid);
+        historyPerf.status = "ok";
         return true;
       } finally {
+        if (longTaskObserver) {
+          try {
+            for (const entry of longTaskObserver.takeRecords()) {
+              historyPerf.long_task_count++;
+              historyPerf.longest_task_ms = Math.max(
+                historyPerf.longest_task_ms, Math.round(entry.duration || 0));
+            }
+            longTaskObserver.disconnect();
+          } catch (_) { /* best-effort diagnostics */ }
+        }
+        historyPerf.total_ms = Math.round(perfNow() - historyPerfStarted);
+        historyPerf.foreground = sid === this.currentId;
+        this._reportHistoryLoadPerf(historyPerf);
         // Re-check live: only clear the skeleton if this sid is STILL the
         // active tab. If the user switched away mid-load, the now-active tab
         // owns messagesLoading and must not be cleared by our stale completion.
         if (this.tabState[sid] === st) {
           st.messagesLoading = false;
+          // Readiness must never coexist with a non-empty repository and an empty
+          // revealed slice. This is the final fail-open for any interrupted reveal
+          // path (SSE takeover, tab ownership change, or skipped Alpine callback).
+          this._ensureNonEmptyMessageRange(st);
           if (!scheduledReveal || sid !== this.currentId) st.messagesReady = true;
           if (sid === this.currentId) {
-            this.messagesLoading = false;
-            // No reveal scheduled (error / early return) → don't trap the
-            // skeleton: show whatever we have.
-            if (!scheduledReveal) this.messagesReady = true;
+            // A cold reveal must fail open. If an async highlight/reveal callback
+            // was skipped or superseded, never leave the active transcript hidden
+            // with only its turn separator/spacer in layout. Reassert the tail in
+            // the next Alpine tick; duplicate settle calls cancel by token.
+            if (!quiet && st.messages.length) {
+              st.messagesReady = true;
+              this.$nextTick(() => {
+                if (this.currentId !== sid || this.tabState[sid] !== st
+                    || st.atBottom === false) return;
+                st.atBottom = true;
+                this._syncMessageViewport(sid, true);
+                this._scrollChatTailNow(sid, st);
+                this._settleScrollToBottom();
+              });
+            }
             // The active tab is now warm — opportunistically warm one desktop
             // envelope without mounting another pane.
             this._scheduleIdlePreload();
@@ -11096,7 +16375,7 @@ function portal() {
     // requestIdleCallback (falls back to a short timeout) so it yields to
     // any foreground work; skipped entirely while the visible tab is
     // streaming so it can't steal main-thread time from a live reply.
-    // loadSession is per-session safe (only touches this.messages when
+    // loadSession is per-session safe (only mounts the requested owner when
     // sid === currentId), so preloading an off-screen tab can't disturb the
     // active view; the backend parse it triggers is now cached by
     // (mtime, size), making repeat/preload loads cheap.
@@ -11129,9 +16408,10 @@ function portal() {
     _renderMessagesChunked(list, renderFn, budgetMs = 8) {
       return new Promise((resolve) => {
         if (!list || !list.length) { resolve(); return; }
-        const yieldToLoop = (typeof window !== "undefined" && window.requestIdleCallback)
-          ? (fn) => window.requestIdleCallback(fn, { timeout: 200 })
-          : (fn) => setTimeout(fn, 0);
+        // A zero-delay task reliably yields to input/paint and keeps making
+        // progress under continuous interaction. requestIdleCallback can starve
+        // for seconds on a busy long-session mount, even with its timeout.
+        const yieldToLoop = (fn) => setTimeout(fn, 0);
         const nowMs = (typeof performance !== "undefined" && performance.now)
           ? () => performance.now() : () => Date.now();
         let i = 0;
@@ -11148,37 +16428,96 @@ function portal() {
         pump();
       });
     },
-    // Push `visible` into the foreground tab's reactive messages array in small
-    // chunks, yielding a frame between each so Alpine's x-for instantiates the
-    // (directive-heavy) bubble templates incrementally. A single bulk push of
-    // ~30 rich bubbles blocks the main thread for seconds on a long session /
-    // throttled device — the dominant remaining cold-open freeze after the hljs
-    // fix. st.messages is the SAME array Alpine watches (bound via
-    // this.messages = st.messages just before this call), so each push reacts.
-    async _revealMessagesChunked(sid, st, visible) {
-      const CH = this._isMobileLayout() ? 4 : 15;
-      let i = 0;
-      while (i < visible.length) {
-        // Tab was closed+reopened mid-reveal (a fresh st replaced ours, or it
-        // was deleted): our st is now orphaned. Stop pushing — the new
-        // loadSession owns the reveal. Prevents double-fill / duplicate keys.
-        if (this.tabState[sid] !== st || st.streaming || st.es) return;
-        st.messages.push(...visible.slice(i, i + CH));
-        i += CH;
-        // Tab switched away mid-reveal: the array is no longer on screen and a
-        // later return won't re-run loadSession (st._loaded is set by the
-        // caller), so finish filling it in one shot to keep it complete, then
-        // stop yielding.
-        if (sid !== this.currentId) {
-          if (i < visible.length) st.messages.push(...visible.slice(i));
-          return;
+    _yieldHistoryInstall() {
+      if (!this._isMobileLayout()) {
+        return new Promise(resolve => (typeof requestAnimationFrame === "function"
+          ? requestAnimationFrame(() => resolve()) : setTimeout(resolve, 16)));
+      }
+      // Mobile DOM installation shares the UI thread with taps, scrolling and the
+      // soft keyboard. A RAF loop still monopolizes every frame even when it mounts
+      // only one row at a time. Let user-visible work run first, then automatically
+      // continue filling the already-resident history in background/idle tasks.
+      if (typeof window !== "undefined" && window.scheduler
+          && typeof window.scheduler.postTask === "function") {
+        return window.scheduler.postTask(() => {}, { priority: "background" })
+          .catch(() => new Promise(resolve => setTimeout(resolve, 50)));
+      }
+      if (typeof window !== "undefined" && window.requestIdleCallback) {
+        return new Promise(resolve => window.requestIdleCallback(
+          () => resolve(), { timeout: 250 }));
+      }
+      return new Promise(resolve => setTimeout(resolve, 50));
+    },
+    // Reveal the resident repository in small coordinate steps. The newest tail is
+    // immediate; older rows are installed through _yieldHistoryInstall so mobile
+    // input gets priority instead of Alpine occupying every animation frame.
+    async _revealMessagesChunked(sid, st, visible, tailFirst = true) {
+      // Alpine row creation is the remaining dominant long task: one row can
+      // contain many nested directives, tool cards and x-html bodies. Keep each
+      // commit deliberately small so transcript installation yields to shell
+      // buttons and the composer between batches instead of freezing the app.
+      const CH = this._isMobileLayout() ? 1 : 2;
+      if (!tailFirst) {
+        // Quiet canonical reconciliation preserves an existing viewport anchor.
+        // Keep its established chronological expansion; exposing only the tail
+        // first would temporarily remove the anchored row before the final restore.
+        const start = st.messageRange.visibleStart;
+        let i = 0;
+        while (i < visible.length) {
+          if (this.tabState[sid] !== st || st.streaming || st.es) return;
+          i = Math.min(visible.length, i + CH);
+          st.messageRange.visibleEnd = start + i;
+          await new Promise(resolve => this.$nextTick(resolve));
+          if (!this._paneElement(sid)) {
+            st.messageRange.visibleEnd = start + visible.length;
+            break;
+          }
+          if (i < visible.length) {
+            await this._yieldHistoryInstall();
+          }
         }
-        if (i < visible.length) {
-          await new Promise(r => (window.requestAnimationFrame
-            ? requestAnimationFrame(() => r()) : setTimeout(r, 16)));
+        if (this.tabState[sid] === st) this._scheduleHistoryViewport(st, "older");
+        return;
+      }
+      const finalStart = st.messageRange.visibleStart;
+      const finalEnd = finalStart + visible.length;
+      let cursor = finalEnd;
+      while (cursor > finalStart) {
+        const nextStart = Math.max(finalStart, cursor - CH);
+        // Establish a real tail batch before any ownership/cancellation exit.
+        // The previous order first collapsed the range to [finalEnd, finalEnd]
+        // and only expanded it after this guard. If SSE claimed the tab in that
+        // interval, finally marked the pane ready with a permanently empty slice.
+        st.messageRange.visibleStart = nextStart;
+        st.messageRange.visibleEnd = finalEnd;
+        cursor = nextStart;
+        if (this.tabState[sid] !== st || st.streaming || st.es) return;
+        const active = sid === this.currentId;
+        const scrollEl = active ? this._chatBodyElement() : null;
+        const anchor = scrollEl && st.atBottom === false
+          ? this._captureViewportMessageAnchor(scrollEl, sid) : null;
+        // Wait for Alpine to instantiate this keyed batch. As soon as the active
+        // pane owns its newest rows, remove only the transcript skeleton and pin
+        // the physical scroller; the remaining resident rows continue prepending
+        // between frames without blocking the composer or surrounding controls.
+        await new Promise(resolve => this.$nextTick(resolve));
+        if (active && sid === this.currentId && this.tabState[sid] === st) {
+          if (!st.messagesReady) st.messagesReady = true;
+          if (st.atBottom !== false) {
+            this._scrollChatTailNow(sid, st);
+          } else if (scrollEl) {
+            this._restoreMessageAnchor(scrollEl, anchor);
+          }
+        }
+        if (!this._paneElement(sid)) {
+          st.messageRange.visibleStart = finalStart;
+          break;
+        }
+        if (cursor > finalStart) {
+          await this._yieldHistoryInstall();
         }
       }
-      if (this.tabState[sid] === st) this._capMountedWindow(st, "older");
+      if (this.tabState[sid] === st) this._scheduleHistoryViewport(st, "older");
     },
     // E5: render the deferred HEAD — the rewound, above-the-fold bubbles whose
     // markdown loadSession skipped so first paint wasn't blocked on the whole
@@ -11195,7 +16534,7 @@ function portal() {
     async _fillDeferredHead(sid, st, head) {
       if (!head || !head.length) return;
       const renderOne = (m) => {
-        if (m && m.role === "assistant" && m.text && !m.html) m.html = this.mdRender(m.text);
+        if (m && m.role === "assistant" && m.text && !m.html) m.html = this._renderHistoryMessage(m);
       };
       const CH = this._isMobileLayout() ? 4 : 12;
       let i = 0;
@@ -11209,7 +16548,7 @@ function portal() {
           for (; i < head.length; i++) renderOne(head[i]);
           return;
         }
-        const scrollEl = this.$refs.chatBody;
+        const scrollEl = this._chatBodyElement();
         const oldH = scrollEl ? scrollEl.scrollHeight : 0;
         const oldTop = scrollEl ? scrollEl.scrollTop : 0;
         const end = Math.min(i + CH, head.length);
@@ -11245,7 +16584,7 @@ function portal() {
         return !(this._prefetching && this._prefetching[id]);
       });
       if (!next) return;                       // all open tabs warm — done
-      if (this.streaming) {                    // don't fight a live reply
+      if (this.activeSessionPane().streaming) {                    // don't fight a live reply
         this._scheduleIdlePreload();
         return;
       }
@@ -11280,6 +16619,7 @@ function portal() {
     },
     _historyMessageKey(sid, m) {
       if (m && m._k) return m._k;
+      if (m && m.block_id) return sid + ":block:" + m.block_id;
       if (m && m._key) return sid + ":idx:" + m._key;
       if (m && m.uuid) return sid + ":uuid:" + m.uuid;
       const identity = [m && m.role, m && (m.id || m.tool_use_id || ""),
@@ -11287,14 +16627,109 @@ function portal() {
         m && (m.text || m.preview || m.summary || "")].join("");
       return sid + ":hist:" + this._stableHash(identity);
     },
+    _historyStoreKey(sid, m) {
+      return m && m.block_id ? sid + ":" + m.block_id : "";
+    },
+    _normalizeTaskStatusPreview(status) {
+      if (!status || typeof status !== "object") return status;
+      const raw = String(status.summary || "");
+      const cap = 2000;
+      const codePoints = Array.from(raw);
+      const receivedLength = codePoints.length;
+      const declaredLength = Number(status.summary_length);
+      const summaryLength = Math.max(
+        receivedLength, Number.isFinite(declaredLength) ? declaredLength : 0);
+      const previewPoints = codePoints.slice(0, cap);
+      const summary = previewPoints.join("");
+      const declaredTruncated = typeof status.summary_truncated === "string"
+        ? ["1", "true", "yes", "on"].includes(
+          status.summary_truncated.trim().toLowerCase())
+        : !!status.summary_truncated;
+      return {
+        ...status,
+        summary,
+        summary_length: summaryLength,
+        summary_truncated: declaredTruncated || summaryLength > previewPoints.length,
+      };
+    },
     _historyEnvelopes(sid, list) {
-      const seen = new Map();
-      return (list || []).map(m => {
-        const base = this._historyMessageKey(sid, m);
-        const n = seen.get(base) || 0;
-        seen.set(base, n + 1);
-        return { ...m, _k: n ? base + ":dup:" + n : base };
+      const source = list || [];
+      const renderKeys = source.map(m => this._historyMessageKey(sid, m));
+      const uniqueKeys = new Set();
+      for (const key of renderKeys) {
+        if (!key || uniqueKeys.has(key)) {
+          // Stable block identity is a transport invariant. Do not invent a
+          // response-local suffix or silently remove a colliding message: keep
+          // the previous pane intact and make the producer defect explicit.
+          try { console.error("[muse-invariant] duplicate or missing message identity", sid); }
+          catch (_) { /* diagnostics must not mask the invariant failure */ }
+          throw new Error("message identity invariant violated for session " + sid);
+        }
+        uniqueKeys.add(key);
+      }
+      return source.map((sourceMessage, index) => {
+        const m = sourceMessage && sourceMessage.task_status
+          ? { ...sourceMessage,
+              task_status: this._normalizeTaskStatusPreview(sourceMessage.task_status) }
+          : sourceMessage;
+        const renderKey = renderKeys[index];
+        const storeKey = this._historyStoreKey(sid, m);
+        if (!storeKey) return { ...m, _k: renderKey };
+        const sessionKeys = this._sessionWindows.get(sid) || new Set();
+        sessionKeys.add(storeKey);
+        this._sessionWindows.set(sid, sessionKeys);
+        const existing = this._messagesById.get(storeKey);
+        if (!existing) {
+          const created = { ...m, _k: renderKey };
+          this._messagesById.set(storeKey, created);
+          return created;
+        }
+        // A quiet reload returns transport previews again. Never replace a body
+        // the user already loaded from the canonical block endpoint with that
+        // unloaded preview; block_id identifies immutable transcript content.
+        const loadedBody = existing.body_state === "loaded"
+          && m.body_state === "unloaded"
+          ? {
+              text: existing.text,
+              preview: existing.preview,
+              html: existing.html,
+              bash: existing.bash,
+              body_state: "loaded",
+              body_available: existing.body_available,
+              body_length: existing.body_length,
+              body_ref: existing.body_ref,
+            }
+          : null;
+        Object.assign(existing, m, { _k: renderKey });
+        if (loadedBody) Object.assign(existing, loadedBody);
+        return existing;
       });
+    },
+    _syncSessionMessageStore(st) {
+      const sid = st && st._sid;
+      if (!sid) return;
+      const retained = new Set();
+      for (const message of st.messages) {
+        const storeKey = this._historyStoreKey(sid, message);
+        if (!storeKey) continue;
+        retained.add(storeKey);
+        // Live → canonical reconciliation may deliberately retain the live
+        // object. Make that adopted object the normalized canonical instance.
+        this._messagesById.set(storeKey, message);
+      }
+      const previous = this._sessionWindows.get(sid) || new Set();
+      for (const storeKey of previous) {
+        if (!retained.has(storeKey)) this._messagesById.delete(storeKey);
+      }
+      this._sessionWindows.set(sid, retained);
+    },
+    _dropSessionMessageStore(sid) {
+      const keys = this._sessionWindows.get(sid) || new Set();
+      for (const storeKey of keys) {
+        this._historyHtmlDelete(this._messagesById.get(storeKey));
+        this._messagesById.delete(storeKey);
+      }
+      this._sessionWindows.delete(sid);
     },
     _messageContinuitySignatures(m) {
       if (!m) return [];
@@ -11304,10 +16739,24 @@ function portal() {
         if (value === undefined || value === null || value === "") return;
         out.push(role + ":" + kind + ":" + this._stableHash(String(value)));
       };
+      // Presentation-only runtime replies may legitimately have identical
+      // prose (for example two "后台任务已完成" continuations). Their durable
+      // event id is the sole identity; text fallback would reuse the older DOM
+      // object/key and collapse two distinct Agent turns during quiet reload.
+      if (m.display_kind === "runtime_continuation") {
+        push("runtime-event", m.runtime_event_id);
+        return out;
+      }
       // Tool/task identifiers survive the live → canonical boundary. UUID is
       // also useful for canonical → canonical refreshes, but a live assistant
       // bubble usually has no UUID yet, so text remains a required fallback.
-      for (const value of [m.uuid, m.id, m.tool_use_id, m.task_id]) {
+      // `forkUuid` is the backend's early AssistantMessage boundary from done;
+      // use it only for assistant continuity so a synthetic API error whose
+      // displayed wording differs from its canonical TextBlock can still keep
+      // the same mounted DOM node through the quiet reconciliation.
+      const continuityIds = [m.uuid, m.id, m.tool_use_id, m.task_id];
+      if (role === "assistant") continuityIds.push(m.forkUuid);
+      for (const value of continuityIds) {
         push("id", value);
       }
       push("text", m.text);
@@ -11317,11 +16766,17 @@ function portal() {
       return out;
     },
     _preserveCanonicalMessageIdentity(st, incoming) {
-      const existing = this._allPaneMessages(st);
+      const existing = st.messages;
       if (!existing.length || !(incoming && incoming.length)) return incoming || [];
       const existingTail = existing[existing.length - 1];
       const liveFooter = existingTail && existingTail.role !== "user"
-        ? { ts: existingTail.ts, elapsed: existingTail.elapsed }
+        ? {
+            ts: existingTail.ts,
+            elapsed: existingTail.elapsed,
+            model: existingTail.model,
+            turn_status: existingTail.turn_status,
+            memoryRecall: existingTail.memoryRecall,
+          }
         : null;
       const candidates = new Map();
       for (const message of existing) {
@@ -11356,6 +16811,8 @@ function portal() {
         const liveFields = mountedKey.includes(":live:") ? {
           ts: matched.ts,
           elapsed: matched.elapsed,
+          model: matched.model,
+          turn_status: matched.turn_status,
           memoryRecall: matched.memoryRecall,
         } : null;
         const canonicalFields = { ...canonical };
@@ -11364,6 +16821,10 @@ function portal() {
         if (liveFields) {
           if (liveFields.ts) matched.ts = liveFields.ts;
           if (liveFields.elapsed) matched.elapsed = liveFields.elapsed;
+          if (liveFields.model && !matched.model) matched.model = liveFields.model;
+          if (liveFields.turn_status && !matched.turn_status) {
+            matched.turn_status = liveFields.turn_status;
+          }
           if (liveFields.memoryRecall) matched.memoryRecall = liveFields.memoryRecall;
         }
         matched._k = mountedKey;
@@ -11375,34 +16836,58 @@ function portal() {
       // The footer still belongs to the canonical tail, so carry its immediate
       // done-time stamp across without overwriting authoritative fields.
       const canonicalTail = result[result.length - 1];
-      if (liveFooter && canonicalTail && canonicalTail.role !== "user") {
+      if (liveFooter && canonicalTail && canonicalTail.role !== "user"
+          && canonicalTail.display_kind !== "runtime_continuation") {
         if (!canonicalTail.ts && liveFooter.ts) canonicalTail.ts = liveFooter.ts;
         if (!canonicalTail.elapsed && liveFooter.elapsed) {
           canonicalTail.elapsed = liveFooter.elapsed;
+        }
+        if (!canonicalTail.model && liveFooter.model) {
+          canonicalTail.model = liveFooter.model;
+        }
+        if (!canonicalTail.turn_status && liveFooter.turn_status) {
+          canonicalTail.turn_status = liveFooter.turn_status;
+        }
+        if (!canonicalTail.memoryRecall && liveFooter.memoryRecall) {
+          canonicalTail.memoryRecall = liveFooter.memoryRecall;
         }
       }
       return result;
     },
     _assignLiveKey(st, m) {
+      // Live identities are allocated once by the owning tab and remain stable
+      // through incremental reconnect. Canonical reconciliation may deliberately
+      // retain this key for the already-mounted object.
+      if (this.tabState[st._sid] !== st) return m;
       if (!m._k) m._k = (st._sid || "tab") + ":live:" + st._nextLiveKey++;
       return m;
     },
-    _allPaneMessages(st) {
-      return [].concat(st._earlierMessages || [], st.messages || [], st._laterMessages || []);
-    },
-    _containsPaneMessage(st, m) {
-      return !!m && ((st.messages || []).includes(m)
-        || (st._earlierMessages || []).includes(m)
-        || (st._laterMessages || []).includes(m));
-    },
     _removePaneMessage(st, m) {
       if (!st || !m) return false;
-      for (const list of [st.messages, st._earlierMessages, st._laterMessages]) {
-        if (!list) continue;
-        const idx = list.indexOf(m);
-        if (idx >= 0) { list.splice(idx, 1); return true; }
+      const idx = st.messages.indexOf(m);
+      if (idx < 0) return false;
+      st.messages.splice(idx, 1);
+      const range = st.messageRange;
+      if (idx < range.visibleStart) {
+        range.visibleStart--;
+        range.visibleEnd--;
+      } else if (idx < range.visibleEnd) {
+        range.visibleEnd--;
       }
-      return false;
+      range.total = Math.max(range.offset + st.messages.length, range.total - 1);
+      this._syncNormalizedHistory(st);
+      return true;
+    },
+    _truncatePaneMessagesFrom(st, m) {
+      if (!st || !m) return false;
+      const idx = st.messages.indexOf(m);
+      if (idx < 0) return false;
+      st.messages.splice(idx);
+      st.messageRange.visibleStart = Math.min(st.messageRange.visibleStart, idx);
+      st.messageRange.visibleEnd = Math.min(st.messageRange.visibleEnd, idx);
+      st.messageRange.total = st.messageRange.offset + st.messages.length;
+      this._syncNormalizedHistory(st);
+      return true;
     },
     _appendLiveMessage(st, m) {
       // Alpine must see footer dependencies when the live object first enters
@@ -11413,90 +16898,186 @@ function portal() {
       if (!Object.prototype.hasOwnProperty.call(m, "forkUuid")) m.forkUuid = "";
       if (!Object.prototype.hasOwnProperty.call(m, "ts")) m.ts = null;
       if (!Object.prototype.hasOwnProperty.call(m, "elapsed")) m.elapsed = 0;
+      if (!Object.prototype.hasOwnProperty.call(m, "model")) m.model = "";
+      if (!Object.prototype.hasOwnProperty.call(m, "turn_status")) {
+        m.turn_status = "";
+      }
+      if (!Object.prototype.hasOwnProperty.call(m, "memoryRecall")) {
+        m.memoryRecall = null;
+      }
       this._assignLiveKey(st, m);
-      const target = (st._laterMessages && st._laterMessages.length)
-        ? st._laterMessages : st.messages;
-      target.push(m);
-      if (target === st.messages) this._capMountedWindow(st, "newer");
-      this._capHistoryCache(st);
-      return target[target.length - 1];
+      const tailWasVisible = st.messageRange.visibleEnd === st.messages.length;
+      const followTail = tailWasVisible && st.atBottom !== false;
+      st.messages.push(m);
+      st.messageRange.total = Math.max(
+        st.messageRange.total + 1, st.messageRange.offset + st.messages.length);
+      // Reader-owned history stays frozen while live output continues. When the
+      // reader follows the tail, move a fixed exact-height window instead of
+      // allowing one long turn to mount every tool/task row indefinitely.
+      if (followTail) this._boundLiveMessageRange(st, true);
+      this._scheduleHistoryViewport(st, followTail ? "newer" : "older");
+      // Alpine wraps array entries lazily. Return the entry read back through the
+      // reactive array, not the raw object that was pushed, so streaming text,
+      // completion metadata and optimistic rollback mutations repaint immediately.
+      return st.messages[st.messages.length - 1];
     },
-    // Keep the phone DOM deliberately small. Rich tool/diff/code bubbles can
-    // expand into hundreds of descendants each; 60 envelopes was still enough
-    // to exhaust a mobile WebView during a display:none → flex reveal. Evicted
-    // envelopes stay in the bounded history cache and remain reachable through
-    // "Load earlier", so this is windowing rather than data loss.
-    _mountedMessageCap() { return this._isMobileLayout() ? 36 : 300; },
-    _historyCacheCap() { return this._isMobileLayout() ? 120 : 800; },
-    _capMountedWindow(st, direction = "newer", anchorUuid = "") {
-      const cap = this._mountedMessageCap();
-      if (!st || !st.messages || st.messages.length <= cap) {
-        return { head: [], tail: [] };
+    // Server/history windows are independent of the rendered DOM row count.
+    // Phones use a smaller explicit page because parsing and installing 100 rich
+    // tool/Markdown blocks can monopolize their main thread. Desktop keeps 100.
+    _historyWindowSize() { return this._isMobileLayout() ? 20 : 100; },
+    _liveMessageDomCap() { return this._isMobileLayout() ? 40 : 100; },
+    _liveMessageHistoryStep() { return Math.max(1, Math.floor(this._liveMessageDomCap() / 2)); },
+    _isLiveMessagePane(st) { return !!(st && (st.streaming || st.es)); },
+    _boundLiveMessageRange(st, followTail = false) {
+      if (!st || !st.messageRange || !Array.isArray(st.messages)) return;
+      const range = st.messageRange;
+      if (followTail) range.visibleEnd = st.messages.length;
+      range.visibleStart = Math.max(0, Math.min(range.visibleStart, range.visibleEnd));
+      if (range.visibleEnd - range.visibleStart > this._liveMessageDomCap()) {
+        range.visibleStart = range.visibleEnd - this._liveMessageDomCap();
       }
-      let head = [];
-      let tail = [];
-      if (direction === "older") {
-        tail = st.messages.splice(cap);
-        st._laterMessages = tail.concat(st._laterMessages || []);
-      } else if (direction === "around") {
-        const target = st.messages.findIndex(m => m && m.uuid === anchorUuid);
-        const centered = target < 0 ? 0 : target - Math.floor(cap / 2);
-        const start = Math.max(0, Math.min(centered, st.messages.length - cap));
-        head = st.messages.splice(0, start);
-        tail = st.messages.splice(cap);
-        st._earlierMessages = (st._earlierMessages || []).concat(head);
-        st._laterMessages = tail.concat(st._laterMessages || []);
-      } else {
-        head = st.messages.splice(0, st.messages.length - cap);
-        st._earlierMessages = (st._earlierMessages || []).concat(head);
-      }
-      this._capHistoryCache(st, direction);
-      return { head, tail };
     },
-    _capHistoryCache(st, direction = "newer") {
+    _historyReconcileWindowSize() { return 800; },
+    _scheduleHistoryViewport(st, direction = "newer", anchorUuid = "") {
       if (!st) return;
-      const cap = this._historyCacheCap();
-      let held = (st._earlierMessages || []).length + (st.messages || []).length
-        + (st._laterMessages || []).length;
-      const dropEarlier = () => {
-        if (!(st._earlierMessages && st._earlierMessages.length) || held <= cap) return;
-        const drop = Math.min(held - cap, st._earlierMessages.length);
-        st._earlierMessages.splice(0, drop);
-        st._loadedOffset = (st._loadedOffset || 0) + drop;
-        held -= drop;
-      };
-      const dropLater = () => {
-        if (!(st._laterMessages && st._laterMessages.length) || held <= cap) return;
-        // Keep the messages adjacent to the mounted window. Dropping from the
-        // front creates an unrecoverable hole before loadLaterMessages' next
-        // item; dropping the far future preserves one contiguous range.
-        const drop = Math.min(held - cap, st._laterMessages.length);
-        st._laterMessages.splice(st._laterMessages.length - drop, drop);
-        st._hasServerLater = true;
-        held -= drop;
-      };
-      if (direction === "older") {
-        // Paging backward must retain the newly fetched past and evict the far
-        // future. The old earlier-first policy hit the cap once and made every
-        // older server page permanently unreachable.
-        dropLater();
-        dropEarlier();
-      } else if (direction === "around") {
-        // Defensive path for an oversized around response. Preserve the
-        // mounted target and discard whichever off-screen side is farther.
-        while (held > cap) {
-          const earlier = (st._earlierMessages || []).length;
-          const later = (st._laterMessages || []).length;
-          if (later >= earlier && later) dropLater();
-          else if (earlier) dropEarlier();
-          else break;
+      if (direction === "around" && anchorUuid) {
+        const target = st.messages.findIndex(m => m && m.uuid === anchorUuid);
+        if (target >= 0) {
+          st.messageRange.visibleStart = Math.min(st.messageRange.visibleStart, target);
+          st.messageRange.visibleEnd = Math.max(st.messageRange.visibleEnd, target + 1);
+          const visibleTarget = target - st.messageRange.visibleStart;
+          const visibleLength = st.messageRange.visibleEnd - st.messageRange.visibleStart;
+          st._virtualStart = Math.max(0, visibleTarget - 12);
+          st._virtualEnd = Math.min(visibleLength, visibleTarget + 13);
+          st._virtualRevision++;
         }
-      } else {
-        // Latest/newer navigation is the mirror image: keep the future and
-        // evict the far past, advancing the absolute first-held coordinate.
-        dropEarlier();
-        dropLater();
       }
+      this._scheduleMessageViewportSync(st._sid, direction === "newer" && st.atBottom !== false);
+    },
+    _syncNormalizedHistory(st) {
+      if (st) this._syncSessionMessageStore(st);
+    },
+    _historyMessageIdentity(message) {
+      if (!message) return "";
+      if (message.uuid) return "uuid:" + String(message.uuid);
+      if (message._k) return "key:" + String(message._k);
+      return "";
+    },
+    _historyMessageIndex(messages, identity) {
+      if (!identity || !Array.isArray(messages)) return -1;
+      return messages.findIndex(
+        message => this._historyMessageIdentity(message) === identity,
+      );
+    },
+    _captureMessageRangeSnapshot(st) {
+      if (!st || !st.messageRange || !Array.isArray(st.messages)) return null;
+      const range = st.messageRange;
+      const start = Math.max(0, Math.min(range.visibleStart, st.messages.length));
+      const end = Math.max(start, Math.min(range.visibleEnd, st.messages.length));
+      return {
+        followTail: st.atBottom !== false && !this._messageRangeHasLater(st),
+        startIdentity: this._historyMessageIdentity(st.messages[start]),
+        endIdentity: this._historyMessageIdentity(st.messages[end - 1]),
+        visibleCount: Math.max(0, end - start),
+        order: range.order,
+        generation: range.generation,
+      };
+    },
+    _resolveMessageRangeSnapshot(messages, snapshot) {
+      if (!snapshot) return null;
+      if (snapshot.followTail) {
+        const end = messages.length;
+        return {
+          start: Math.max(0, end - this._liveMessageDomCap()),
+          end,
+        };
+      }
+      const count = Math.max(1, Number(snapshot.visibleCount) || 1);
+      const startIndex = this._historyMessageIndex(messages, snapshot.startIdentity);
+      const endIndex = this._historyMessageIndex(messages, snapshot.endIdentity);
+      if (startIndex >= 0 && endIndex >= startIndex) {
+        return { start: startIndex, end: endIndex + 1 };
+      }
+      if (startIndex >= 0) {
+        return { start: startIndex, end: Math.min(messages.length, startIndex + count) };
+      }
+      if (endIndex >= 0) {
+        return { start: Math.max(0, endIndex - count + 1), end: endIndex + 1 };
+      }
+      return null;
+    },
+    _beginHistoryReplace(st) {
+      const seq = (Number(st && st._historyRequestSeq) || 0) + 1;
+      st._historyRequestSeq = seq;
+      st._historyReplaceOwner = seq;
+      st._historyEpoch = (Number(st._historyEpoch) || 0) + 1;
+      return { seq, epoch: st._historyEpoch };
+    },
+    _historyReplaceStillOwns(st, token) {
+      return !!(st && token
+        && st._historyReplaceOwner === token.seq
+        && st._historyEpoch === token.epoch);
+    },
+    _captureHistoryPageToken(st) {
+      const range = st.messageRange;
+      return {
+        epoch: st._historyEpoch,
+        generation: range.generation,
+        order: range.order,
+        offset: range.offset,
+        headIdentity: this._historyMessageIdentity(st.messages[0]),
+        tailIdentity: this._historyMessageIdentity(st.messages[st.messages.length - 1]),
+      };
+    },
+    _historyPageStillOwns(st, token) {
+      if (!st || !token || st._historyEpoch !== token.epoch) return false;
+      const range = st.messageRange;
+      return range.generation === token.generation
+        && range.order === token.order
+        && range.offset === token.offset
+        && this._historyMessageIdentity(st.messages[0]) === token.headIdentity
+        && this._historyMessageIdentity(st.messages[st.messages.length - 1])
+          === token.tailIdentity;
+    },
+    _messageRangeHasLater(st) {
+      if (!st || !st.messageRange || !Array.isArray(st.messages)) return false;
+      const range = st.messageRange;
+      return range.visibleEnd < st.messages.length
+        || range.offset + st.messages.length < range.total;
+    },
+    _enforceMessageRangeInvariant(st) {
+      if (!st || !st.messageRange || !Array.isArray(st.messages)) return;
+      const range = st.messageRange;
+      range.visibleStart = Math.max(
+        0, Math.min(Number(range.visibleStart) || 0, st.messages.length));
+      range.visibleEnd = Math.max(
+        range.visibleStart,
+        Math.min(Number(range.visibleEnd) || 0, st.messages.length),
+      );
+      range.offset = Math.max(0, Number(range.offset) || 0);
+      range.total = Math.max(
+        Number(range.total) || 0,
+        range.offset + st.messages.length,
+      );
+      if (this._messageRangeHasLater(st)) st.atBottom = false;
+    },
+    isAwayFromLatest(sid) {
+      const st = this.tabState[sid || this.currentId];
+      return !!(st && (st.atBottom === false || this._messageRangeHasLater(st)));
+    },
+    _captureViewportMessageAnchor(scrollEl, sid) {
+      if (!scrollEl || !sid) return null;
+      const pane = scrollEl.querySelector(
+        `.msg-pane[data-tid="${CSS.escape(sid)}"]`);
+      if (!pane) return null;
+      const viewportTop = scrollEl.getBoundingClientRect().top;
+      for (const el of pane.querySelectorAll(".msg[data-message-key]")) {
+        const rect = el.getBoundingClientRect();
+        if (rect.bottom <= viewportTop) continue;
+        const key = el.getAttribute("data-message-key");
+        if (key) return { key, tid: sid, top: rect.top };
+      }
+      return null;
     },
     _captureMessageAnchor(scrollEl, m) {
       const key = m && m._k;
@@ -11506,25 +17087,21 @@ function portal() {
       const el = (pane || scrollEl).querySelector(
         `.msg[data-message-key="${CSS.escape(key)}"]`);
       if (!el) return null;
-      return { key, top: el.getBoundingClientRect().top };
+      return { key, tid: this.currentId || "", top: el.getBoundingClientRect().top };
     },
     _restoreMessageAnchor(scrollEl, anchor) {
-      if (!scrollEl || !anchor) return;
-      const el = scrollEl.querySelector(
+      if (!scrollEl || !anchor) return false;
+      const pane = scrollEl.querySelector(
+        `.msg-pane[data-tid="${CSS.escape(anchor.tid || "")}"]`);
+      const el = (pane || scrollEl).querySelector(
         `.msg[data-message-key="${CSS.escape(anchor.key)}"]`);
-      if (!el) return;
+      if (!el) return false;
       scrollEl.scrollTop += el.getBoundingClientRect().top - anchor.top;
+      return true;
     },
-    // Pop the next batch of older messages off the per-tab stash, mdRender
-    // them on demand, prepend to messages[]. Critical: preserve scroll
-    // position so the user's current viewport doesn't jump when older
-    // content unfolds above.
-    LOAD_MORE_BATCH: 80,
-    // How many older bubbles to pull from the server in one backend page
-    // when the in-memory stash runs dry (see _fetchOlderWindow). Larger
-    // than LOAD_MORE_BATCH so several "Load earlier" clicks are served from
-    // memory between network round-trips.
-    HISTORY_PAGE: 240,
+    // History is paged in one explicit, count-based unit per viewport: phones
+    // load 20 canonical UI blocks, while desktop keeps 100. The viewport anchor
+    // below keeps the currently-read block stationary when older blocks prepend.
     // Reactivity ping: bumped whenever refreshOutlineFromBackend writes
     // new data. outlineMessages() reads it so Alpine knows to re-render
     // the msg-outline-modal when async fetch completes. Without this,
@@ -11534,8 +17111,8 @@ function portal() {
 
     // Build a navigable outline of the CURRENT session: every user
     // message becomes a clickable jump target. Spans both the visible
-    // messages (already rendered) AND the deferred _earlierMessages
-    // stash, so the user can scan the entire conversation arc and
+    // revealed messages and the resident repository, so the user can scan
+    // the entire conversation arc and
     // jump to any point — even into history we haven't rendered yet.
     // Trigger a background fetch of session-level outline if we don't
     // have one yet or it's stale (>30s). Stores result on tabState so
@@ -11581,23 +17158,20 @@ function portal() {
       if (!sid || this.tabState[sid] !== ownerState || ownerState.streaming || ownerState.es) {
         return false;
       }
-      ownerState._earlierMessages = [];
-      ownerState._laterMessages = [];
-      ownerState._loadedOffset = 0;
-      ownerState.historyGeneration = "";
+      ownerState.messageRange.generation = "";
       // Conflict recovery drops back to normal order by design: the chain was
       // rewritten under us, so a full-order cursor is stale. A reader who had
       // crossed into pre-compact history gets returned to the live tail and
-      // has to cross again — loadSession() repopulates _preTotal so the
+      // has to cross again — loadSession() repopulates preTotal so the
       // button is there waiting.
-      ownerState._historyOrder = "normal";
-      ownerState._preTotal = 0;
-      ownerState._hasServerLater = false;
+      ownerState.messageRange.order = "normal";
+      ownerState.messageRange.preTotal = 0;
       return this.loadSession(sid, { quiet: sid === this.currentId });
     },
 
+
     // Pull the next older window of bubbles from the server into the FRONT
-    // of the in-memory stash and rewind _loadedOffset. Used when the stash
+    // of the resident repository and rewind its server offset. Used when the range
     // is exhausted but the server still holds older history (the backend-
     // paging counterpart to the in-memory stash drain). Idempotent under
     // concurrent calls via the _fetchingOlder guard. Returns the number of
@@ -11606,52 +17180,47 @@ function portal() {
       sid = sid || this.currentId;
       if (!sid) return 0;
       const st = this._ensureTabState(sid);
-      if (st._fetchingOlder) return 0;
-      if (!(st._loadedOffset > 0)) return 0;
-      const held = (st.messages ? st.messages.length : 0)
-                 + (st._earlierMessages ? st._earlierMessages.length : 0)
-                 + (st._laterMessages ? st._laterMessages.length : 0);
-      // Reclaim the far-future cache while moving backward. This keeps a
-      // bounded contiguous window that can slide through the entire history,
-      // instead of treating the memory cap as a permanent navigation wall.
-      const room = Math.max(0, this._historyCacheCap() - held)
-        + (st._laterMessages ? st._laterMessages.length : 0);
-      const pageSize = Math.min(this.HISTORY_PAGE, st._loadedOffset, room);
-      if (pageSize <= 0) return 0;
-      const newOffset = st._loadedOffset - pageSize;
-      const limit = st._loadedOffset - newOffset;
+      const range = st.messageRange;
+      if (st._fetchingOlder || !(range.offset > 0)) return 0;
+      const pageSize = Math.min(this._historyWindowSize(), range.offset);
+      const newOffset = range.offset - pageSize;
+      const pageToken = this._captureHistoryPageToken(st);
       st._fetchingOlder = true;
+      st._historyHydrationError = false;
       try {
-        const generation = st.historyGeneration
-          ? "&history_generation=" + encodeURIComponent(st.historyGeneration) : "";
-        const order = st._historyOrder === "full" ? "&full=1" : "";
+        const generation = range.generation
+          ? "&history_generation=" + encodeURIComponent(range.generation) : "";
+        const order = range.order === "full" ? "&full=1" : "";
         const r = await fetch(
-          "/api/chat/sessions/" + sid + "?offset=" + newOffset + "&limit=" + limit
+          "/api/chat/sessions/" + sid + "?offset=" + newOffset + "&limit=" + pageSize
           + order + generation,
           { headers: this.hdr() });
         if (r.status === 409) {
           await this._reloadHistoryTailAfterConflict(sid, st);
           return 0;
         }
-        if (!r.ok) return 0;
+        if (!r.ok) {
+          st._historyHydrationError = true;
+          return 0;
+        }
         const data = await r.json();
+        if (this.tabState[sid] !== st
+            || !this._historyPageStillOwns(st, pageToken)) return 0;
         const win = this._historyEnvelopes(sid, data.messages || []);
-        // Prepend (older bubbles go to the front of the stash). mdRender is
-        // still deferred until a bubble is paged into messages[].
-        st._earlierMessages = win.concat(st._earlierMessages || []);
-        st._loadedOffset = Number.isInteger(data.offset) ? data.offset : newOffset;
-        if (Number.isInteger(data.total)) st._total = data.total;
-        if (Number.isInteger(data.pre_total)) st._preTotal = data.pre_total;
-        st.historyGeneration = data.history_generation || st.historyGeneration || "";
-        st._historyOrder = data.history_order === "full" ? "full" : "normal";
-        if (sid === this.currentId) this.historyGeneration = st.historyGeneration;
-        this._capHistoryCache(st, "older");
-        st._hasServerLater = (st._loadedOffset + this._allPaneMessages(st).length)
-          < st._total;
-        st._hasMoreHistory =
-          (st._earlierMessages.length > 0) || st._loadedOffset > 0;
+        st.messages.unshift(...win);
+        range.visibleStart += win.length;
+        range.visibleEnd += win.length;
+        range.offset = Number.isInteger(data.offset) ? data.offset : newOffset;
+        if (Number.isInteger(data.total)) range.total = data.total;
+        if (Number.isInteger(data.pre_total)) range.preTotal = data.pre_total;
+        range.generation = data.history_generation || range.generation || "";
+        range.order = data.history_order === "full" ? "full" : "normal";
+        this._enforceMessageRangeInvariant(st);
+        this._syncNormalizedHistory(st);
+        st._hasMoreHistory = range.visibleStart > 0 || range.offset > 0;
         return win.length;
       } catch (_) {
+        st._historyHydrationError = true;
         return 0;
       } finally {
         st._fetchingOlder = false;
@@ -11661,24 +17230,17 @@ function portal() {
       sid = sid || this.currentId;
       if (!sid) return 0;
       const st = this._ensureTabState(sid);
-      if (st._fetchingLater || !st._hasServerLater) return 0;
-      const held = this._allPaneMessages(st).length;
-      const start = (st._loadedOffset || 0) + held;
-      if (start >= (st._total || 0)) {
-        st._hasServerLater = false;
-        return 0;
-      }
-      // Mirror the older-page policy: reclaim the far-past stash so forward
-      // paging can also slide through history without exceeding the cache.
-      const room = Math.max(0, this._historyCacheCap() - held)
-        + (st._earlierMessages ? st._earlierMessages.length : 0);
-      const limit = Math.min(this.HISTORY_PAGE, st._total - start, room);
-      if (limit <= 0) return 0;
+      const range = st.messageRange;
+      if (st._fetchingLater) return 0;
+      const start = range.offset + st.messages.length;
+      if (start >= range.total) return 0;
+      const limit = Math.min(this._historyWindowSize(), range.total - start);
+      const pageToken = this._captureHistoryPageToken(st);
       st._fetchingLater = true;
       try {
-        const generation = st.historyGeneration
-          ? "&history_generation=" + encodeURIComponent(st.historyGeneration) : "";
-        const order = st._historyOrder === "full" ? "&full=1" : "";
+        const generation = range.generation
+          ? "&history_generation=" + encodeURIComponent(range.generation) : "";
+        const order = range.order === "full" ? "&full=1" : "";
         const r = await fetch(
           "/api/chat/sessions/" + sid + "?offset=" + start + "&limit=" + limit
           + order + generation,
@@ -11689,17 +17251,16 @@ function portal() {
         }
         if (!r.ok) return 0;
         const data = await r.json();
-        if (this.tabState[sid] !== st) return 0;
+        if (this.tabState[sid] !== st
+            || !this._historyPageStillOwns(st, pageToken)) return 0;
         const win = this._historyEnvelopes(sid, data.messages || []);
-        st._laterMessages = (st._laterMessages || []).concat(win);
-        if (Number.isInteger(data.total)) st._total = data.total;
-        if (Number.isInteger(data.pre_total)) st._preTotal = data.pre_total;
-        st.historyGeneration = data.history_generation || st.historyGeneration || "";
-        st._historyOrder = data.history_order === "full" ? "full" : "normal";
-        if (sid === this.currentId) this.historyGeneration = st.historyGeneration;
-        this._capHistoryCache(st, "newer");
-        st._hasServerLater = (st._loadedOffset + this._allPaneMessages(st).length)
-          < st._total;
+        st.messages.push(...win);
+        if (Number.isInteger(data.total)) range.total = data.total;
+        if (Number.isInteger(data.pre_total)) range.preTotal = data.pre_total;
+        range.generation = data.history_generation || range.generation || "";
+        range.order = data.history_order === "full" ? "full" : "normal";
+        this._enforceMessageRangeInvariant(st);
+        this._syncNormalizedHistory(st);
         return win.length;
       } catch (_) {
         return 0;
@@ -11736,7 +17297,7 @@ function portal() {
     // real beginning (full order), landing at the coordinate the reader is
     // already looking at.
     //
-    // Deliberately NOT `_loadedOffset += pre_total` with `&full=1`: full order
+    // Deliberately NOT translating offset by pre_total with `&full=1`: full order
     // keeps the sidechain / team / meta records that normal filters out, so
     // the two orders interleave rather than translate — any arithmetic across
     // them mis-seats the window by however many subagent turns happen to sit
@@ -11750,18 +17311,18 @@ function portal() {
       if (!this._preCompactReachable(st)) return false;
       // Anchor on the OLDEST bubble we hold: after the swap everything newly
       // revealed lands above it, which is what "load earlier" should feel like.
-      const anchor = (this._allPaneMessages(st) || []).find(m => m && m.uuid);
+      const anchor = (st.messages || []).find(m => m && m.uuid);
       if (!anchor) return false;
       const anchorUuid = anchor.uuid;
       const ok = await this._loadAroundMessage(sid, anchorUuid);
       if (!ok || this.tabState[sid] !== st) return false;
-      // _loadAroundMessage replaces the mounted window, so without re-anchoring
+      // _loadAroundMessage replaces the canonical history window, so without re-anchoring
       // the viewport the reader gets teleported mid-transcript. Jump-to-start
       // (not centred, no highlight flash) keeps the message they were reading
       // at the fold with the recovered history stacked above it.
       this.$nextTick(() => {
         if (this.tabState[sid] !== st || sid !== this.currentId) return;
-        const body = this.$refs && this.$refs.chatBody;
+        const body = this._chatBodyElement();
         const el = body && body.querySelector(
           `.msg[data-uuid="${CSS.escape(anchorUuid)}"]`);
         if (el) el.scrollIntoView({ block: "start" });
@@ -11772,246 +17333,273 @@ function portal() {
       sid = sid || this.currentId;
       if (!sid) return;
       const st = this._ensureTabState(sid);
-      // Re-entrancy guard. The mdRender pass below now yields to the browser
-      // between chunks (so a 50-message batch doesn't freeze the main thread
-      // in one long task). That await window lets a second click / rapid
-      // double-tap re-enter before the first prepend lands — two concurrent
-      // renders would unshift out of order (the older batch could end up
-      // BELOW the newer one). Serialize: ignore re-entry until the in-flight
-      // page finishes.
+      const range = st.messageRange;
       if (st._loadingEarlier) return;
       st._loadingEarlier = true;
       try {
-      // Exhausted this order (nothing stashed, offset at 0) but the chain we
-      // are reading isn't the transcript's start — cross orders instead of
-      // reporting "no more". One click = one crossing; the swap itself brings
-      // the older window in, so we're done for this press.
-      if ((!st._earlierMessages || !st._earlierMessages.length)
-          && !(st._loadedOffset > 0)
-          && this._preCompactReachable(st)) {
-        await this._switchToFullOrder(sid);
-        return;
-      }
-      // Stash empty but server holds older history → page a window in first.
-      if ((!st._earlierMessages || !st._earlierMessages.length)
-          && st._loadedOffset > 0) {
-        await this._fetchOlderWindow(sid);
-      }
-      if (!st._earlierMessages || !st._earlierMessages.length) {
-        // Nothing local and nothing (more) on the server: recompute flags
-        // so the button hides itself. Pre-chain history counts as "more" —
-        // hiding the button here would strand it behind an unreachable state.
-        st._hasMoreHistory = st._loadedOffset > 0 || this._preCompactReachable(st);
-        return;
-      }
-      // Take from the END of the earlier stash (those are the messages
-      // immediately preceding what's currently shown — "closest in time").
-      const batchSize = this._isMobileLayout() ? 10 : this.LOAD_MORE_BATCH;
-      const batch = st._earlierMessages.splice(-batchSize);
-      // Deferred mdRender pass on this batch only — chunked so a full 50-item
-      // batch parses across several frames instead of one blocking long task
-      // (marked + DOMPurify + KaTeX per message froze the click for ~hundreds
-      // of ms on long histories). The bubbles aren't in the DOM yet (prepend
-      // happens after), so yielding here just spreads CPU, no visible reflow.
-      const RENDER_CHUNK = this._isMobileLayout() ? 4 : 16;
-      for (let j = 0; j < batch.length; j += RENDER_CHUNK) {
-        const end = Math.min(j + RENDER_CHUNK, batch.length);
-        for (let k = j; k < end; k++) {
-          const m = batch[k];
-          if (m.role === "assistant" && m.text && !m.html) {
-            m.html = this.mdRender(m.text);
+        if (range.visibleStart === 0 && range.offset === 0
+            && this._preCompactReachable(st)) {
+          const switched = await this._switchToFullOrder(sid);
+          return;
+        }
+        if (range.visibleStart === 0 && range.offset > 0) {
+          await this._fetchOlderWindow(sid);
+          if (this.tabState[sid] !== st) return;
+        }
+        if (range.visibleStart === 0) {
+          st._hasMoreHistory = range.offset > 0 || this._preCompactReachable(st);
+          return;
+        }
+        const liveWindow = this._isLiveMessagePane(st);
+        const batchSize = liveWindow
+          ? this._liveMessageHistoryStep() : this._historyWindowSize();
+        const previousEnd = range.visibleEnd;
+        const nextStart = Math.max(0, range.visibleStart - batchSize);
+        const batch = st.messages.slice(nextStart, range.visibleStart);
+        const RENDER_CHUNK = this._isMobileLayout() ? 4 : 16;
+        for (let j = 0; j < batch.length; j += RENDER_CHUNK) {
+          const chunkEnd = Math.min(j + RENDER_CHUNK, batch.length);
+          for (let k = j; k < chunkEnd; k++) {
+            const m = batch[k];
+            if (m.role === "assistant" && m.text && !m.html) {
+              m.html = this._renderHistoryMessage(m);
+            }
+            m._noAnim = true;
+          }
+          if (chunkEnd < batch.length) {
+            await new Promise(r => (typeof requestAnimationFrame !== "undefined"
+              ? requestAnimationFrame(() => r()) : setTimeout(r, 0)));
+            if (this.tabState[sid] !== st) return;
           }
         }
-        if (end < batch.length) {
-          await new Promise(r => (typeof requestAnimationFrame !== "undefined"
-            ? requestAnimationFrame(() => r()) : setTimeout(r, 0)));
+        if (this.tabState[sid] !== st) return;
+        const scrollEl = sid === this.currentId ? this._chatBodyElement() : null;
+        const anchor = this._captureViewportMessageAnchor(scrollEl, sid);
+        this._shiftMessageVirtualWindow(st, batch.length);
+        range.visibleStart = nextStart;
+        if (liveWindow) {
+          range.visibleEnd = Math.min(
+            previousEnd, nextStart + this._liveMessageDomCap());
         }
-      }
-      // These are OLD history bubbles being revealed, not new arrivals — flag
-      // them so the .msg entrance animation (msg-in) doesn't replay across the
-      // whole batch the instant they mount, which janks the scroll-to-top load.
-      for (const m of batch) m._noAnim = true;
-      const isCurrent = sid === this.currentId;
-      // Capture scroll geometry BEFORE the DOM grows so we can restore the
-      // user's visible-content offset after Alpine re-renders.
-      const scrollEl = isCurrent ? this.$refs.chatBody : null;
-      // The previous first bubble survives an older-direction cap. Anchoring
-      // that exact keyed element stays correct even when the same mutation
-      // also removes tall bubbles from the bottom.
-      const anchor = this._captureMessageAnchor(scrollEl, st.messages[0]);
-      st.messages.unshift(...batch);
-      this._capMountedWindow(st, "older");
-      if (isCurrent) this.messages = st.messages;
-      st._hasMoreHistory = st._earlierMessages.length > 0 || st._loadedOffset > 0;
-      // Restore scroll position so the message the user was looking at
-      // stays in place. Without this the viewport snaps to the new top.
-      if (scrollEl) {
-        this.$nextTick(() => {
-          this._restoreMessageAnchor(scrollEl, anchor);
-          // Re-run code highlighting ONLY on the newly prepended bubbles
-          // (the first batch.length `.msg` children). Rescanning the whole
-          // chat body each click is O(total) — wasteful once a long history
-          // has been paged in. Falls back to a full scan if the elements
-          // can't be resolved.
-          const newEls = this._leadingMsgEls(batch.length);
-          this.highlightCode(".chat-body", newEls.length ? newEls : null);
-        });
-      }
+        this._scheduleHistoryViewport(st, "older");
+        st._hasMoreHistory = range.visibleStart > 0 || range.offset > 0;
+        if (scrollEl) {
+          this.$nextTick(() => {
+            this._restoreMessageAnchor(scrollEl, anchor);
+            this._scheduleMessageViewportSync(sid);
+            const newEls = this._leadingMsgEls(batch.length);
+            this.highlightCode(".chat-body", newEls.length ? newEls : null);
+          });
+        }
       } finally {
         st._loadingEarlier = false;
-      }
-    },
-    async loadLaterMessages(sid) {
-      sid = sid || this.currentId;
-      const st = sid && this.tabState[sid];
-      if (!st) return;
-      if ((!st._laterMessages || !st._laterMessages.length) && st._hasServerLater) {
-        await this._fetchLaterWindow(sid);
-      }
-      if (!st._laterMessages || !st._laterMessages.length) return;
-      const batchSize = this._isMobileLayout() ? 20 : this.LOAD_MORE_BATCH;
-      const batch = st._laterMessages.splice(0, batchSize);
-      const scrollEl = sid === this.currentId ? this.$refs.chatBody : null;
-      // The previous last bubble survives a newer-direction cap; preserve its
-      // screen coordinate instead of restoring an absolute scrollTop after
-      // removing an arbitrary-height prefix.
-      const anchor = this._captureMessageAnchor(
-        scrollEl, st.messages[st.messages.length - 1]);
-      st.messages.push(...batch);
-      this._capMountedWindow(st, "newer");
-      if (sid === this.currentId) {
-        this.messages = st.messages;
-        this.$nextTick(() => this._restoreMessageAnchor(scrollEl, anchor));
       }
     },
     async returnToLatest(sid) {
       sid = sid || this.currentId;
       const st = sid && this.tabState[sid];
       if (!st) return false;
-      if (st._hasServerLater) {
-        // An around/full-order window intentionally holds only a bounded
-        // middle slice. A local reshuffle cannot reach the canonical tail;
-        // reload it from the normal active order instead.
-        const loaded = await this.loadSession(sid, { quiet: sid === this.currentId });
+      const range = st.messageRange;
+      st.atBottom = false;
+      if (range.offset + st.messages.length < range.total) {
+        const loaded = await this.loadSession(sid, {
+          quiet: sid === this.currentId,
+          followTail: true,
+        });
         if (!loaded || this.tabState[sid] !== st) return false;
-        st.atBottom = true;
-        if (sid === this.currentId) {
-          this.atBottom = true;
-          this.$nextTick(() => this.scrollToBottom(true));
-        }
-        return true;
+      } else {
+        const windowSize = this._isLiveMessagePane(st)
+          ? this._liveMessageDomCap() : this._historyWindowSize();
+        range.visibleEnd = st.messages.length;
+        range.visibleStart = Math.max(0, range.visibleEnd - windowSize);
+        this._scheduleHistoryViewport(st, "newer");
       }
-      const all = this._allPaneMessages(st);
-      const cap = this._mountedMessageCap();
-      st.messages.splice(0, st.messages.length, ...all.slice(-cap));
-      st._earlierMessages = all.slice(0, Math.max(0, all.length - cap));
-      st._laterMessages = [];
-      this._capHistoryCache(st, "newer");
+      this._enforceMessageRangeInvariant(st);
+      if (this._messageRangeHasLater(st)) return false;
       st.atBottom = true;
-      if (sid === this.currentId) {
-        this.messages = st.messages;
-        this.atBottom = true;
-        this.$nextTick(() => this.scrollToBottom(true));
-      }
+      if (sid === this.currentId) this.$nextTick(() => this.scrollToBottom(true));
       return true;
     },
     hasLaterMessages(sid) {
-      const st = this.tabState[sid || this.currentId];
-      return !!(st && ((st._laterMessages && st._laterMessages.length)
-        || st._hasServerLater));
+      return this._messageRangeHasLater(this.tabState[sid || this.currentId]);
     },
-    laterMessageCount(sid) {
-      const st = this.tabState[sid || this.currentId];
-      if (!st) return 0;
-      const local = st._laterMessages ? st._laterMessages.length : 0;
-      const held = this._allPaneMessages(st).length;
-      const server = st._hasServerLater
-        ? Math.max(0, (st._total || 0) - (st._loadedOffset || 0) - held) : 0;
-      return local + server;
-    },
-
-    // Evict the oldest rendered messages back to the lazy stash so a long
-    // LIVE session doesn't accumulate unbounded DOM (the mobile OOM root
-    // cause). Called right before a new user turn is appended — the mirror
-    // image of loadEarlierMessages: front-of-messages[] → end-of-stash.
-    // The evicted bubbles already carry .html, so paging them back via
-    // "Load earlier" re-renders nothing. Eviction happens at the TOP while
-    // the user sits at the bottom sending, so there's no scroll jump.
-    _capLiveMessages(st) {
+    // Live history stays canonical in memory. `_appendLiveMessage` bounds the
+    // exact-height messageRange; this compatibility scheduler only lets existing
+    // tail-follow paths share the same frame boundary.
+    _scheduleLiveMessageViewport(st) {
       if (!st || !st.messages) return;
-      const cap = this._mountedMessageCap();
-      const overflow = st.messages.length - cap;
-      if (overflow <= 0) return;
-      const evicted = st.messages.splice(0, overflow);
-      // Append to the END of the stash: these bubbles are newer than
-      // everything already stashed but older than what stays visible, so
-      // they're the "closest in time" batch loadEarlierMessages pops first.
-      st._earlierMessages = (st._earlierMessages || []).concat(evicted);
-      this._capHistoryCache(st);
-      st._hasMoreHistory = st._earlierMessages.length > 0 || st._loadedOffset > 0;
+      this._scheduleMessageViewportSync(st._sid, st.atBottom !== false);
     },
     hasMoreHistory(sid) {
       sid = sid || this.currentId;
-      if (!sid) return false;
-      const st = this.tabState[sid];
+      const st = sid && this.tabState[sid];
       if (!st) return false;
-      // The bounded cache is a sliding window: reaching its size cap no longer
-      // blocks older paging because the far-future side is evicted on demand.
-      if (st._earlierMessages && st._earlierMessages.length) return true;
-      if (st._loadedOffset > 0) return true;
-      // Sitting at offset 0 of a chain that itself starts partway into the
-      // transcript (post-/compact). Nothing is "earlier" in THIS order, but
-      // _switchToFullOrder can cross into the order where there is.
-      return this._preCompactReachable(st);
+      return st.messageRange.visibleStart > 0
+        || st.messageRange.offset > 0
+        || this._preCompactReachable(st);
     },
-    // True iff stranded pre-chain history exists and we haven't crossed into
-    // it yet. Once _historyOrder is "full" those bubbles are inside _total and
-    // ordinary offset paging owns them, so the predicate must go quiet or the
-    // button would never turn off at the true start of history.
     _preCompactReachable(st) {
       if (!st) return false;
-      return st._historyOrder !== "full" && (st._preTotal || 0) > 0;
+      return st.messageRange.order !== "full" && st.messageRange.preTotal > 0;
     },
     earlierMessageCount(sid) {
       sid = sid || this.currentId;
-      if (!sid) return 0;
-      const st = this.tabState[sid];
+      const st = sid && this.tabState[sid];
       if (!st) return 0;
-      // Older messages = those still on the server (before our window) plus
-      // those held in the in-memory stash, plus anything stranded before this
-      // chain's root (pre-/compact) that we haven't crossed into yet.
-      const stash = st._earlierMessages ? st._earlierMessages.length : 0;
-      const pre = this._preCompactReachable(st) ? (st._preTotal || 0) : 0;
-      return (st._loadedOffset || 0) + stash + pre;
+      const range = st.messageRange;
+      const pre = this._preCompactReachable(st) ? range.preTotal : 0;
+      return range.offset + range.visibleStart + pre;
     },
     historyTruncated(sid) {
       sid = sid || this.currentId;
       if (!sid) return false;
       const st = this.tabState[sid];
       if (!st) return false;
-      // Retained as a compatibility hook for the template. Sliding-window
-      // paging now makes every indexed bubble reachable within the cap.
+      // Retained as a compatibility hook for the template. Transparent paging
+      // and normalized history keep every indexed bubble reachable.
       return false;
     },
 
     async renameSession() {
       const cur = this.sessions.find(x => x.id === this.currentId);
       if (!cur) return;
-      const name = await this.prompt({
+      const answer = await this.prompt({
         title: this.lang === "zh" ? "重命名会话" : "Rename session",
         value: cur.name,
       });
-      if (!name) return;
-      const r = await fetch("/api/chat/sessions/" + cur.id, {
-        method: "PATCH",
-        headers: { ...this.hdr(), "Content-Type": "application/json" },
-        body: JSON.stringify({ name }),
+      const name = (answer || "").trim();
+      if (!name || name === cur.name) return;
+      await this._renameSessionOptimistically(cur.id, name, cur.name, true, "modal");
+    },
+
+    toggleMemoryRecallPopover(ev, message) {
+      if (this.memoryRecallPopover.show && this._memoryRecallOwner === message) {
+        this.closeMemoryRecallPopover();
+        return;
+      }
+      const recall = message?.memoryRecall;
+      const anchor = ev?.currentTarget;
+      if (!recall || !anchor) return;
+      if (this.previewQuote.show && this.previewQuote.mode !== "ask") {
+        this.dismissPreviewQuote(true);
+      }
+      this._memoryRecallOwner = message;
+      this._memoryRecallAnchor = anchor;
+      this.memoryRecallPopover = {
+        show: true,
+        recall,
+        style: "position:fixed;left:12px;top:12px;visibility:hidden;",
+      };
+      const hydrate = async () => {
+        const items = Array.isArray(recall.items) ? recall.items : [];
+        const needsDetails = items.some(
+          item => item?.id && (!item.content || !item._traceback));
+        if (!needsDetails) return;
+        const hydrated = await Promise.all(items.map(async item => {
+          if (!item?.id || (item.content && item._traceback)) return item;
+          try {
+            const base = "/api/memory/items/" + encodeURIComponent(item.id);
+            const [detailResponse, tracebackResponse] = await Promise.all([
+              fetch(base, { headers: this.hdr(), cache: "no-store" }),
+              fetch(base + "/traceback", {
+                headers: this.hdr(), cache: "no-store",
+              }),
+            ]);
+            const detail = detailResponse.ok ? await detailResponse.json() : {};
+            const traceback = tracebackResponse.ok
+              ? await tracebackResponse.json() : { sites: [] };
+            return {
+              ...item,
+              kind: detail.kind || item.kind,
+              content: detail.content || item.content || "",
+              sources: detail.sources || item.sources || [],
+              recall_stats: detail.recall_stats || item.recall_stats || null,
+              _traceback: traceback.sites || [],
+            };
+          } catch (_) { return item; }
+        }));
+        if (!this.memoryRecallPopover.show
+            || this._memoryRecallOwner !== message) return;
+        const nextRecall = { ...recall, items: hydrated };
+        message.memoryRecall = nextRecall;
+        this.memoryRecallPopover.recall = nextRecall;
+      };
+      this.$nextTick(() => {
+        this._positionMemoryRecallPopover();
+        hydrate().finally(() => this.$nextTick(
+          () => this._positionMemoryRecallPopover()));
       });
-      if (r.ok) { await this.refreshSessions(); this.toast(this.t("toast.renamed"), "success"); }
+    },
+
+    _queueMemoryRecallPosition() {
+      if (!this.memoryRecallPopover.show || this._memoryRecallPositionFrame) return;
+      this._memoryRecallPositionFrame = requestAnimationFrame(() => {
+        this._memoryRecallPositionFrame = 0;
+        this._positionMemoryRecallPopover();
+      });
+    },
+
+    _positionMemoryRecallPopover() {
+      if (!this.memoryRecallPopover.show) return;
+      const anchor = this._memoryRecallAnchor;
+      const popover = document.querySelector(".memory-recall-global");
+      if (!anchor?.isConnected || !popover) {
+        this.closeMemoryRecallPopover();
+        return;
+      }
+      const viewportWidth = window.innerWidth;
+      const viewportHeight = window.innerHeight;
+      const pad = 12;
+      const gap = 8;
+      const anchorRect = anchor.getBoundingClientRect();
+      if (anchorRect.bottom < 0 || anchorRect.top > viewportHeight) {
+        this.closeMemoryRecallPopover();
+        return;
+      }
+      const width = Math.max(1, Math.min(420, viewportWidth - pad * 2));
+      const maxHeight = Math.max(1, Math.min(420, viewportHeight - pad * 2));
+      // Measure at the final width.  Measuring the unconstrained portal first
+      // makes long memory text look like one short line; after width is
+      // applied it wraps taller and can fall below the viewport even though
+      // the initial geometry appeared to fit.
+      popover.style.width = `${Math.round(width)}px`;
+      popover.style.maxHeight = `${Math.round(maxHeight)}px`;
+      popover.style.left = `${pad}px`;
+      popover.style.top = `${pad}px`;
+      const measuredHeight = Math.min(
+        maxHeight,
+        Math.max(1, popover.getBoundingClientRect().height || popover.scrollHeight),
+      );
+      const centered = anchorRect.left + anchorRect.width / 2 - width / 2;
+      const left = Math.max(pad, Math.min(centered, viewportWidth - width - pad));
+      const roomAbove = anchorRect.top - pad - gap;
+      const roomBelow = viewportHeight - anchorRect.bottom - pad - gap;
+      const openAbove = roomAbove >= measuredHeight || roomAbove > roomBelow;
+      const top = openAbove
+        ? Math.max(pad, anchorRect.top - gap - measuredHeight)
+        : Math.min(viewportHeight - pad - measuredHeight, anchorRect.bottom + gap);
+      this.memoryRecallPopover.style = [
+        "position:fixed",
+        `left:${Math.round(left)}px`,
+        `top:${Math.round(Math.max(pad, top))}px`,
+        `width:${Math.round(width)}px`,
+        `max-height:${Math.round(maxHeight)}px`,
+        "visibility:visible",
+      ].join(";");
+    },
+
+    closeMemoryRecallPopover() {
+      if (this._memoryRecallPositionFrame) {
+        cancelAnimationFrame(this._memoryRecallPositionFrame);
+        this._memoryRecallPositionFrame = 0;
+      }
+      this.memoryRecallPopover = { show: false, recall: null, style: "" };
+      this._memoryRecallAnchor = null;
+      this._memoryRecallOwner = null;
     },
 
     // ===== settings modal =====
-    async openSettings() {
+    async openSettings(activePage = "") {
       const r = await fetch("/api/settings", { headers: this.hdr() });
       if (!r.ok) {
         this.toast(this.lang === "zh" ? "无法加载设置" : "Failed to load settings", "error");
@@ -12041,7 +17629,8 @@ function portal() {
       // (provider — the most-used section) and render only that pane.
       // Mobile: stay at the top-level menu (activePage=null) and let the
       // user drill in; selecting a row shows that section + a Back button.
-      this.settings.activePage = this.isWideScreen ? "provider" : null;
+      this.settings.activePage = activePage === "memory"
+        ? "memory" : (this.isWideScreen ? "provider" : null);
       this.settings.show = true;
       // Load MCP + Skill in parallel — non-fatal if any fails. Cost dashboard
       // stays lazy because Codex quota refresh intentionally runs a CLI probe.
@@ -12049,6 +17638,75 @@ function portal() {
       this.refreshSkillList();
       this.loadClaudeAuthStatus();
       this.loadMemorySettings();
+    },
+
+    async openMemoryCenter(tab = "") {
+      if (tab) this.settings.memory.tab = tab;
+      await this.openSettings("memory");
+    },
+
+    memoryRecallStatsText(item) {
+      const stats = item?.recall_stats;
+      if (!stats) return "";
+      const parts = [this.lang === "zh"
+        ? `召回 ${stats.recall_count || 0} 次`
+        : `${stats.recall_count || 0} recalls`];
+      if (stats.last_recalled_at) parts.push(
+        (this.lang === "zh" ? "最近 " : "last ")
+        + new Date(stats.last_recalled_at * 1000).toLocaleString());
+      parts.push(`↑ ${stats.helpful_count || 0} · ↓ ${stats.unhelpful_count || 0}`);
+      return parts.join(" · ");
+    },
+
+    async loadMemoryTraceback(item) {
+      if (!item?.id) return [];
+      if (Array.isArray(item._traceback)) return item._traceback;
+      try {
+        const response = await fetch(
+          `/api/memory/items/${encodeURIComponent(item.id)}/traceback`,
+          { headers: this.hdr(), cache: "no-store" },
+        );
+        if (!response.ok) throw new Error(await response.text());
+        item._traceback = (await response.json()).sites || [];
+      } catch (_) {
+        item._traceback = [];
+      }
+      return item._traceback;
+    },
+
+    async openMemorySource(item) {
+      const site = (await this.loadMemoryTraceback(item))[0];
+      if (!site?.session_id) {
+        this.toast(this.lang === "zh" ? "没有可打开的来源会话" : "No source session available", "warn");
+        return;
+      }
+      this.closeMemoryRecallPopover();
+      this.settings.show = false;
+      if (site.can_jump_to_message && site.message_id) {
+        await this._jumpToMessage(site.session_id, site.message_id);
+      } else {
+        await this.openTab(site.session_id);
+      }
+    },
+
+    async copyMemorySourceEvidence(item) {
+      const site = (await this.loadMemoryTraceback(item))[0];
+      if (!site?.session_id) {
+        this.toast(this.lang === "zh" ? "没有可复制的来源会话" : "No source session available", "warn");
+        return;
+      }
+      await this._copySessionEvidence(site.session_id);
+    },
+
+    memoryRecallResultsText(item) {
+      const results = Array.isArray(item?.results) ? item.results : [];
+      if (!results.length) return this.lang === "zh" ? "未命中记忆" : "No memories returned";
+      return results.map(result => {
+        const channels = Array.isArray(result.channels) ? result.channels.join("+") : "";
+        const score = Number.isFinite(Number(result.score))
+          ? Number(result.score).toFixed(4) : "-";
+        return `${result.id || "?"} · ${channels || "unknown"} · ${score}`;
+      }).join("\n");
     },
 
     _memoryConfigPayload() {
@@ -12096,12 +17754,7 @@ function portal() {
               : `${unseen.length} new Skill candidate(s) await review`,
             "info", 8000, {
               label: this.lang === "zh" ? "打开记忆中心" : "Open Memory Center",
-              onClick: async () => {
-                await this.openSettings();
-                this.settings.activePage = "memory";
-                this.settings.memory.tab = "skills";
-                await this.refreshMemoryCenter();
-              },
+              onClick: () => this.openMemoryCenter("skills"),
             });
           const merged = [...new Set([...seen, ...unseen])].slice(-100);
           this._setLS("muselab_memory_artifacts_seen", JSON.stringify(merged));
@@ -12129,6 +17782,13 @@ function portal() {
       }
     },
 
+    _memoryErrorDetail(d, status) {
+      const detail = d && d.detail;
+      if (detail == null) return `HTTP ${status}`;
+      if (typeof detail === "string") return detail;
+      return detail.message || detail.category || JSON.stringify(detail);
+    },
+
     async probeMemory() {
       const mem = this.settings.memory;
       mem.probing = true; mem.probeResult = null;
@@ -12139,7 +17799,7 @@ function portal() {
           body: JSON.stringify(this._memoryConfigPayload()),
         });
         const d = await r.json().catch(() => ({}));
-        if (!r.ok) throw new Error(d.detail || `HTTP ${r.status}`);
+        if (!r.ok) throw new Error(this._memoryErrorDetail(d, r.status));
         mem.probeResult = d;
         this.toast(this.lang === "zh" ? "记忆环境检查通过" : "Memory environment is healthy",
           "success");
@@ -12162,7 +17822,7 @@ function portal() {
           body: JSON.stringify(this._memoryConfigPayload()),
         });
         const d = await r.json().catch(() => ({}));
-        if (!r.ok) throw new Error(d.detail || `HTTP ${r.status}`);
+        if (!r.ok) throw new Error(this._memoryErrorDetail(d, r.status));
         mem.config = d.config; mem.status = d.status;
         this._memoryMonitorEnabled = d.config.mode !== "off";
         this._startMemoryMonitor();
@@ -12184,6 +17844,7 @@ function portal() {
       else if (mem.tab === "skills") url = "/api/memory/artifacts?kind=skill_candidate&limit=200";
       else if (mem.tab === "jobs") url = "/api/memory/jobs?limit=200";
       else if (mem.tab === "recalls") url = "/api/memory/recalls?limit=200";
+      else if (mem.tab === "backups") url = "/api/memory/backups?limit=200";
       else if (mem.tab === "audit") url = "/api/memory/audit?limit=200";
       if (mem.tab === "items") {
         const qs = new URLSearchParams({ limit: "200" });
@@ -12242,7 +17903,7 @@ function portal() {
       const st = Object.values(this.tabState || {}).find(
         s => s && s.streaming && this._containsPaneMessage(s, message));
       if (st) {
-        const msgs = this._allPaneMessages(st);
+        const msgs = st.messages;
         const idx = msgs.indexOf(message);
         const lastUserIdx = msgs.map(m => m && m.role).lastIndexOf("user");
         if (idx >= 0 && idx > lastUserIdx) {
@@ -12330,6 +17991,8 @@ function portal() {
           body: JSON.stringify({ useful: !!useful, recall_id: recallId || null }),
         });
       if (!r.ok) { this.toast(await r.text(), "error"); return; }
+      const updated = await r.json().catch(() => ({}));
+      if (updated.recall_stats) item.recall_stats = updated.recall_stats;
       item._feedback = useful ? "up" : "down";
       this.toast(this.lang === "zh" ? "已记录，将影响后续召回排序"
         : "Feedback recorded for future ranking", "success");
@@ -12361,6 +18024,29 @@ function portal() {
           ? (this.lang === "zh" ? "Skill 已停用并移出发现目录" : "Skill disabled and undiscoverable")
           : (this.lang === "zh" ? "候选已拒绝" : "Candidate rejected"), "success");
       await this.refreshMemoryCenter();
+    },
+
+    async memoryCreateBackup() {
+      const mem = this.settings.memory;
+      mem.backupRunning = true;
+      try {
+        const response = await fetch("/api/memory/backup", {
+          method: "POST", headers: this.hdr(),
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(this._memoryErrorDetail(data, response.status));
+        const receipt = data.backup || {};
+        this.toast(this.lang === "zh"
+          ? `备份已验证：${receipt.filename || receipt.id}`
+          : `Verified backup created: ${receipt.filename || receipt.id}`, "success", 5000);
+        mem.tab = "backups";
+        await this.refreshMemoryCenter();
+      } catch (error) {
+        this.toast((this.lang === "zh" ? "备份失败：" : "Backup failed: ")
+          + (error.message || error), "error", 6000);
+      } finally {
+        mem.backupRunning = false;
+      }
     },
 
     async memoryRunAction(action) {
@@ -13162,6 +18848,7 @@ function portal() {
         return false;
       }
       this._disposeTabRuntime(sid);
+      this._deletePersistedChatDraft(sid);
       await this.refreshSessions();
       this.openTabIds = (this.openTabIds || []).filter(id => id !== sid);
       if (this.currentId === sid) {
@@ -13178,6 +18865,7 @@ function portal() {
           await this.switchSession();
         }
       }
+      this._writeChatTabStore(this.openTabIds);
       this.savePrefs();
       return true;
     },
@@ -13409,6 +19097,13 @@ function portal() {
       if (this._isMobileLayout()) return this.mobileTab === "files";
       return !!this.leftOpen && !this.desktopFullPane;
     },
+    _nextFileEventsReconnectDelay() {
+      this._fileEventsReconnectFailures += 1;
+      return Math.min(
+        500 * Math.pow(2, this._fileEventsReconnectFailures - 1),
+        8000,
+      );
+    },
     _stopFileEvents(markDirty = false) {
       const workspace = this._fileEventsWorkspace;
       ++this._fileEventsSeq;
@@ -13417,6 +19112,7 @@ function portal() {
       }
       this._fileEvents = null;
       this._fileEventsWorkspace = "";
+      this._fileEventsGeneration = "";
       if (workspace) this._clearWorkspaceEventBatch(workspace);
       if (this._fileEventsTimer) clearTimeout(this._fileEventsTimer);
       this._fileEventsTimer = null;
@@ -13425,7 +19121,7 @@ function portal() {
     _fileCapabilities() {
       if (!this._fileCapabilitiesPromise) {
         this._fileCapabilitiesPromise = import(
-          "/static/modules/file-capabilities.mjs"
+          this._staticAssetUrl("/static/modules/file-capabilities.mjs")
         ).catch(error => {
           this._fileCapabilitiesPromise = null;
           throw error;
@@ -13436,7 +19132,7 @@ function portal() {
     _persistentCache() {
       if (!this._persistentCachePromise) {
         this._persistentCachePromise = import(
-          "/static/modules/persistent-cache.mjs"
+          this._staticAssetUrl("/static/modules/persistent-cache.mjs")
         ).catch(error => {
           this._persistentCachePromise = null;
           throw error;
@@ -13444,7 +19140,11 @@ function portal() {
       }
       return this._persistentCachePromise;
     },
-    async _hydrateWorkspaceTree(ownerWorkspace, treeSeq) {
+    async _hydrateWorkspaceTree(
+      ownerWorkspace,
+      treeSeq,
+      workspaceGeneration = this._workspaceGeneration(ownerWorkspace),
+    ) {
       if (!ownerWorkspace || this.visible.length) return false;
       let cached;
       try {
@@ -13454,6 +19154,11 @@ function portal() {
       if (!cached || cached.owner !== ownerWorkspace
           || !!cached.showHidden !== !!this.showHidden
           || treeSeq !== this._treeLoadSeq
+          || !this._workspaceGenerationIsCurrent(
+            ownerWorkspace, workspaceGeneration,
+          )
+          || (this._workspaceRegistryId(ownerWorkspace)
+            && cached.workspaceId !== this._workspaceRegistryId(ownerWorkspace))
           || !this._workspaceIsCurrent(ownerWorkspace)) return false;
       const visible = Array.isArray(cached.visible) ? cached.visible : [];
       const childCache = cached.childCache && typeof cached.childCache === "object"
@@ -13472,6 +19177,7 @@ function portal() {
       ownerWorkspace = this.fileWorkspacePath(), capturedSnapshot = null,
     ) {
       if (!ownerWorkspace) return;
+      const workspaceGeneration = this._workspaceGeneration(ownerWorkspace);
       const previous = this._workspaceTreeCacheTimers.get(ownerWorkspace);
       if (previous) {
         if (previous.timer) clearTimeout(previous.timer);
@@ -13480,19 +19186,28 @@ function portal() {
           window.cancelIdleCallback(previous.idle);
         }
       }
-      const handle = { timer: null, idle: null };
+      // Alpine's reactive Map wraps object values on read, so comparing the
+      // retrieved handle object by identity can reject the still-current job.
+      // A Symbol remains stable through that proxy boundary.
+      const token = Symbol("workspace-tree-persist");
+      const handle = { timer: null, idle: null, token, workspaceGeneration };
       const persist = async () => {
-        if (this._workspaceTreeCacheTimers.get(ownerWorkspace) !== handle) return;
+        const current = this._workspaceTreeCacheTimers.get(ownerWorkspace);
+        if (!current || current.token !== token) return;
         this._workspaceTreeCacheTimers.delete(ownerWorkspace);
+        if (!this._workspaceGenerationIsCurrent(
+          ownerWorkspace, workspaceGeneration,
+        )) return;
         // A captured snapshot belongs to an inactive workspace. If that owner
         // became current again before idle time, loadRoot/delta will schedule a
         // fresh, cursor-consistent snapshot instead.
         if (capturedSnapshot && this._workspaceIsCurrent(ownerWorkspace)) return;
         if (!capturedSnapshot && !this._workspaceIsCurrent(ownerWorkspace)) return;
-        // IndexedDB is optional acceleration. Never serialize a complete tree
-        // while xterm is the foreground surface; the old snapshot/cursor remains
-        // valid and the next delta can catch it up.
-        if (this.previewSurface === "terminal") return;
+        // IndexedDB is optional acceleration. This runs after both the trailing
+        // debounce and an idle callback, so persisting the slim, cursor-matched
+        // snapshot is safe even while xterm is the foreground surface. Skipping
+        // it there left an old cursor behind and forced a large replay/resync on
+        // the next refresh.
         const source = capturedSnapshot || {
           showHidden: !!this.showHidden,
           cursor: this._workspaceTreeCursors.get(ownerWorkspace) ?? null,
@@ -13517,6 +19232,7 @@ function portal() {
           }
         }
         const snapshot = {
+          workspaceId: this._workspaceRegistryId(ownerWorkspace),
           showHidden,
           cursor: source.cursor ?? null,
           visible: (source.visible || []).map(node => ({ ...node })),
@@ -13525,7 +19241,18 @@ function portal() {
         };
         try {
           const cache = await this._persistentCache();
+          if (!this._workspaceGenerationIsCurrent(
+            ownerWorkspace, workspaceGeneration,
+          )) return;
           await cache.putWorkspaceSnapshot(ownerWorkspace, snapshot);
+          // Deletion can race the IndexedDB transaction after the pre-write
+          // generation check. If so, make the stale writer clean up its own
+          // late row so remove remains authoritative on disk as well.
+          if (!this._workspaceGenerationIsCurrent(
+            ownerWorkspace, workspaceGeneration,
+          )) {
+            await cache.deleteWorkspaceSnapshot(ownerWorkspace);
+          }
         } catch (_) { /* persistent cache is an optional acceleration */ }
       };
       handle.timer = setTimeout(() => {
@@ -13788,9 +19515,25 @@ function portal() {
       }
       return true;
     },
-    async _syncWorkspaceTree(ownerWorkspace, treeSeq, hydrated) {
+    async _syncWorkspaceTree(
+      ownerWorkspace,
+      treeSeq,
+      hydrated,
+      workspaceGeneration = this._workspaceGeneration(ownerWorkspace),
+    ) {
+      if (!this._workspaceGenerationIsCurrent(
+        ownerWorkspace, workspaceGeneration,
+      )) return false;
+      const expectedWorkspaceId = this._workspaceRegistryId(ownerWorkspace);
       const cursor = this._workspaceTreeCursors.get(ownerWorkspace);
       const hasCursor = hydrated && cursor != null && cursor !== "";
+      // Pin every request in this sync pass to its initiating owner. fileHdr()
+      // resolves the live workspace and is therefore unsafe for a second
+      // compatibility request after an awaited POST.
+      const ownerHeaders = this.hdr();
+      if (ownerWorkspace) {
+        ownerHeaders["X-Muselab-Workspace"] = encodeURIComponent(ownerWorkspace);
+      }
       const params = new URLSearchParams();
       if (hasCursor) {
         params.set("cursor", String(cursor));
@@ -13798,22 +19541,68 @@ function portal() {
         params.set("show_hidden", "true");
       }
       const query = params.toString();
-      const endpoint = hasCursor
-        ? `/api/files/delta?${query}`
-        : `/api/files/bootstrap${query ? `?${query}` : ""}`;
       let response;
       try {
-        response = await fetch(endpoint, { headers: this.fileHdr() });
+        if (hasCursor) {
+          response = await fetch(`/api/files/delta?${query}`, {
+            headers: ownerHeaders,
+          });
+        } else {
+          // Request only root children plus the child listings needed to paint
+          // currently-expanded branches. Parents are depth-sorted so a bounded
+          // backend cap always retains ancestors before deeper descendants.
+          const expandedParentSet = new Set();
+          for (const rawPath of Array.from(this.expanded || [])) {
+            if (typeof rawPath !== "string" || !rawPath
+                || rawPath.startsWith("/") || rawPath.split("/").includes("..")) continue;
+            const parts = rawPath.split("/").filter(Boolean);
+            for (let depth = 1; depth <= parts.length; depth++) {
+              expandedParentSet.add(parts.slice(0, depth).join("/"));
+            }
+          }
+          const expandedParents = Array.from(expandedParentSet)
+            .sort((a, b) => a.split("/").length - b.split("/").length
+              || a.localeCompare(b))
+            .slice(0, 100);
+          response = await fetch("/api/files/bootstrap", {
+            method: "POST",
+            headers: { ...ownerHeaders, "Content-Type": "application/json" },
+            body: JSON.stringify({
+              show_hidden: !!this.showHidden,
+              parents: expandedParents,
+            }),
+          });
+          if ([404, 405, 501].includes(response.status)) {
+            // Never fall back to the legacy full-snapshot GET here: one expanded
+            // dump directory can make that response unbounded and freeze the
+            // browser before virtual scrolling gets a chance to help. Returning
+            // false lets _loadRootNow use the already-capped /api/files/list
+            // compatibility path instead.
+            return false;
+          }
+        }
       } catch (_) { return false; }
-      if (treeSeq !== this._treeLoadSeq || !this._workspaceIsCurrent(ownerWorkspace)) return false;
+      if (treeSeq !== this._treeLoadSeq
+          || !this._workspaceIsCurrent(ownerWorkspace)
+          || !this._workspaceGenerationIsCurrent(
+            ownerWorkspace, workspaceGeneration,
+          )) return false;
       if (response.status === 404 || response.status === 405 || response.status === 501) return false;
       if (response.status === 204) return !!hydrated;
       if (!response.ok) return false;
       let payload;
       try { payload = await response.json(); } catch (_) { return false; }
-      if (treeSeq !== this._treeLoadSeq || !this._workspaceIsCurrent(ownerWorkspace)) return false;
+      if (treeSeq !== this._treeLoadSeq
+          || !this._workspaceIsCurrent(ownerWorkspace)
+          || !this._workspaceGenerationIsCurrent(
+            ownerWorkspace, workspaceGeneration,
+          )) return false;
+      const responseWorkspaceId = String(payload.workspace_id || "");
+      if (expectedWorkspaceId && responseWorkspaceId
+          && responseWorkspaceId !== expectedWorkspaceId) return false;
       const nextCursor = payload.cursor ?? payload.next_cursor ?? payload.nextCursor;
       let applied = false;
+      let snapshotHasTruncatedParents = false;
       if (!hasCursor && Array.isArray(payload.entries)) {
         const tree = this._materializeFileSnapshot(
           payload.entries, Array.from(this.expanded || []),
@@ -13823,16 +19612,38 @@ function portal() {
         this.expanded = tree.expanded;
         this._pendingExpanded = Array.from(this.expanded);
         this._scheduleFileTreeViewportSync(true);
+        const truncatedParents = Array.isArray(payload.truncated_parents)
+          ? payload.truncated_parents : [];
+        snapshotHasTruncatedParents = truncatedParents.length > 0;
+        if (snapshotHasTruncatedParents) {
+          const sample = truncatedParents[0] || "/";
+          const limit = Number(payload.children_per_parent_limit) || 500;
+          this.toast(
+            this.t("toast.dir_truncated", { path: sample, n: limit })
+              + (truncatedParents.length > 1
+                ? ` (+${truncatedParents.length - 1})` : ""),
+            "warn", 4500,
+          );
+        }
         applied = true;
       } else if (payload.resync === true) {
         this._workspaceTreeCursors.delete(ownerWorkspace);
-        return await this._syncWorkspaceTree(ownerWorkspace, treeSeq, false);
+        return await this._syncWorkspaceTree(
+          ownerWorkspace, treeSeq, false, workspaceGeneration,
+        );
       } else if (Array.isArray(payload.changes) && hydrated) {
         applied = payload.changes.length
           ? this._applyFileTreeDelta(payload.changes) : true;
       }
       if (!applied) return false;
-      if (nextCursor != null) {
+      if (snapshotHasTruncatedParents) {
+        // A capped sibling list is not a complete delta base. Keeping its
+        // workspace cursor would let later add/delete events grow it beyond the
+        // cap or leave it under-filled because the hidden 501st row emits no
+        // compensating event. Force the next sync through another bounded
+        // compact snapshot instead of applying deltas to incomplete parents.
+        this._workspaceTreeCursors.delete(ownerWorkspace);
+      } else if (nextCursor != null) {
         const currentCursor = Number(this._workspaceTreeCursors.get(ownerWorkspace) || 0);
         const numericCursor = Number(nextCursor);
         if (Number.isFinite(numericCursor)) {
@@ -13843,7 +19654,9 @@ function portal() {
       }
       if (payload.has_more === true) {
         if (nextCursor == null || String(nextCursor) === String(cursor ?? "")) return false;
-        return await this._syncWorkspaceTree(ownerWorkspace, treeSeq, true);
+        return await this._syncWorkspaceTree(
+          ownerWorkspace, treeSeq, true, workspaceGeneration,
+        );
       }
       this._scheduleWorkspaceTreePersist(ownerWorkspace);
       return true;
@@ -13853,40 +19666,77 @@ function portal() {
       if (pending && pending.timer) clearTimeout(pending.timer);
       this._workspaceSyncRetryTimers.delete(ownerWorkspace);
     },
-    _scheduleWorkspaceSyncRetry(ownerWorkspace, attempt = 0) {
-      if (!ownerWorkspace || !this._workspaceIsCurrent(ownerWorkspace)) return;
+    _scheduleWorkspaceSyncRetry(
+      ownerWorkspace,
+      attempt = 0,
+      workspaceGeneration = this._workspaceGeneration(ownerWorkspace),
+    ) {
+      if (!ownerWorkspace || !this._workspaceIsCurrent(ownerWorkspace)
+          || !this._workspaceGenerationIsCurrent(
+            ownerWorkspace, workspaceGeneration,
+          )) return;
       // One retry owner at a time. A later successful bootstrap clears it;
       // repeated SSE failures must not reset exponential backoff to zero.
-      if (this._workspaceSyncRetryTimers.has(ownerWorkspace)) return;
+      const existing = this._workspaceSyncRetryTimers.get(ownerWorkspace);
+      if (existing && existing.workspaceGeneration === workspaceGeneration) return;
+      if (existing && existing.timer) clearTimeout(existing.timer);
       const delay = Math.min(8000, 600 * (2 ** Math.min(attempt, 4)));
-      const record = { timer: null, attempt };
+      const record = { timer: null, attempt, workspaceGeneration };
       record.timer = setTimeout(() => {
         if (this._workspaceSyncRetryTimers.get(ownerWorkspace) !== record) return;
         this._workspaceSyncRetryTimers.delete(ownerWorkspace);
-        if (!this._workspaceIsCurrent(ownerWorkspace)) return;
+        if (!this._workspaceIsCurrent(ownerWorkspace)
+            || !this._workspaceGenerationIsCurrent(
+              ownerWorkspace, workspaceGeneration,
+            )) return;
         void Promise.resolve(this.loadRoot({ scheduleRetry: false }))
           .catch(() => false)
           .then(ok => {
-            if (ok !== true && this._workspaceIsCurrent(ownerWorkspace)) {
-              this._scheduleWorkspaceSyncRetry(ownerWorkspace, attempt + 1);
+            if (ok !== true && this._workspaceIsCurrent(ownerWorkspace)
+                && this._workspaceGenerationIsCurrent(
+                  ownerWorkspace, workspaceGeneration,
+                )) {
+              this._scheduleWorkspaceSyncRetry(
+                ownerWorkspace, attempt + 1, workspaceGeneration,
+              );
             }
           });
       }, delay);
       this._workspaceSyncRetryTimers.set(ownerWorkspace, record);
     },
-    _markWorkspaceTreeSynced(ownerWorkspace) {
+    _markWorkspaceTreeSynced(
+      ownerWorkspace,
+      workspaceGeneration = this._workspaceGeneration(ownerWorkspace),
+    ) {
+      if (!this._workspaceGenerationIsCurrent(
+        ownerWorkspace, workspaceGeneration,
+      )) return;
       this._clearWorkspaceSyncRetry(ownerWorkspace);
       if (this._workspaceIsCurrent(ownerWorkspace)) this._fileTreeDirty = false;
     },
-    async _recoverWorkspaceTree(ownerWorkspace, { hydrated = false } = {}) {
-      if (!this._workspaceIsCurrent(ownerWorkspace)) return false;
+    async _recoverWorkspaceTree(
+      ownerWorkspace,
+      { hydrated = false } = {},
+      workspaceGeneration = this._workspaceGeneration(ownerWorkspace),
+    ) {
+      if (!this._workspaceIsCurrent(ownerWorkspace)
+          || !this._workspaceGenerationIsCurrent(
+            ownerWorkspace, workspaceGeneration,
+          )) return false;
       this._fileTreeDirty = true;
       if (!hydrated) this._workspaceTreeCursors.delete(ownerWorkspace);
       const seq = ++this._treeLoadSeq;
-      const ok = await this._syncWorkspaceTree(ownerWorkspace, seq, hydrated);
-      if (ok) this._markWorkspaceTreeSynced(ownerWorkspace);
+      const ok = await this._syncWorkspaceTree(
+        ownerWorkspace, seq, hydrated, workspaceGeneration,
+      );
+      if (!this._workspaceGenerationIsCurrent(
+        ownerWorkspace, workspaceGeneration,
+      )) return false;
+      if (ok) this._markWorkspaceTreeSynced(ownerWorkspace, workspaceGeneration);
       else if (this._workspaceIsCurrent(ownerWorkspace)) {
-        this._scheduleWorkspaceSyncRetry(ownerWorkspace);
+        this._scheduleWorkspaceSyncRetry(
+          ownerWorkspace, 0, workspaceGeneration,
+        );
       }
       return ok;
     },
@@ -13895,12 +19745,18 @@ function portal() {
       if (batch && batch.timer) clearTimeout(batch.timer);
       this._workspaceEventBatches.delete(ownerWorkspace);
     },
-    _flushWorkspaceEventBatch(ownerWorkspace) {
+    _flushWorkspaceEventBatch(
+      ownerWorkspace,
+      workspaceGeneration = this._workspaceGeneration(ownerWorkspace),
+    ) {
       const batch = this._workspaceEventBatches.get(ownerWorkspace);
-      if (!batch) return;
+      if (!batch || batch.workspaceGeneration !== workspaceGeneration) return;
       this._workspaceEventBatches.delete(ownerWorkspace);
       if (batch.timer) clearTimeout(batch.timer);
-      if (!this._workspaceIsCurrent(ownerWorkspace)) return;
+      if (!this._workspaceIsCurrent(ownerWorkspace)
+          || !this._workspaceGenerationIsCurrent(
+            ownerWorkspace, workspaceGeneration,
+          )) return;
       const changes = [];
       let cursor = null;
       for (const payload of batch.payloads) {
@@ -13915,16 +19771,27 @@ function portal() {
         () => this._applyWorkspaceEventPayload(
           { changes, ...(cursor == null ? {} : { cursor }) },
           ownerWorkspace,
+          workspaceGeneration,
         ),
+        workspaceGeneration,
       );
       void task.catch(() => {
-        if (!this._workspaceIsCurrent(ownerWorkspace)) return;
+        if (!this._workspaceIsCurrent(ownerWorkspace)
+            || !this._workspaceGenerationIsCurrent(
+              ownerWorkspace, workspaceGeneration,
+            )) return;
         this._fileTreeDirty = true;
-        this._scheduleWorkspaceSyncRetry(ownerWorkspace);
+        this._scheduleWorkspaceSyncRetry(
+          ownerWorkspace, 0, workspaceGeneration,
+        );
       });
     },
     _queueWorkspaceEventPayload(payload, ownerWorkspace) {
-      if (!payload || !this._workspaceIsCurrent(ownerWorkspace)) return;
+      const workspaceGeneration = this._workspaceGeneration(ownerWorkspace);
+      if (!payload || !this._workspaceIsCurrent(ownerWorkspace)
+          || !this._workspaceGenerationIsCurrent(
+            ownerWorkspace, workspaceGeneration,
+          )) return;
       if (payload.resync === true) {
         this._clearWorkspaceEventBatch(ownerWorkspace);
         const task = this._enqueueWorkspaceSync(
@@ -13932,12 +19799,19 @@ function portal() {
           () => this._applyWorkspaceEventPayload(
             { ...payload, resync: true },
             ownerWorkspace,
+            workspaceGeneration,
           ),
+          workspaceGeneration,
         );
         void task.catch(() => {
-          if (!this._workspaceIsCurrent(ownerWorkspace)) return;
+          if (!this._workspaceIsCurrent(ownerWorkspace)
+              || !this._workspaceGenerationIsCurrent(
+                ownerWorkspace, workspaceGeneration,
+              )) return;
           this._fileTreeDirty = true;
-          this._scheduleWorkspaceSyncRetry(ownerWorkspace);
+          this._scheduleWorkspaceSyncRetry(
+            ownerWorkspace, 0, workspaceGeneration,
+          );
         });
         return;
       }
@@ -13946,12 +19820,15 @@ function portal() {
         !Number.isFinite(Number(change && change.seq)))) {
         // Compatibility with the pre-cursor backend keeps its existing
         // structural debounce and lazy parent refresh behavior.
-        this._queueFileChanges(payload.changes, ownerWorkspace);
+        this._queueFileChanges(
+          payload.changes, ownerWorkspace, workspaceGeneration,
+        );
         return;
       }
       let batch = this._workspaceEventBatches.get(ownerWorkspace);
-      if (!batch) {
-        batch = { payloads: [], timer: null };
+      if (!batch || batch.workspaceGeneration !== workspaceGeneration) {
+        if (batch && batch.timer) clearTimeout(batch.timer);
+        batch = { payloads: [], timer: null, workspaceGeneration };
         this._workspaceEventBatches.set(ownerWorkspace, batch);
       }
       batch.payloads.push(payload);
@@ -13960,13 +19837,24 @@ function portal() {
         ? this.WORKSPACE_EVENT_BATCH_MOBILE_MS
         : this.WORKSPACE_EVENT_BATCH_DESKTOP_MS;
       batch.timer = setTimeout(
-        () => this._flushWorkspaceEventBatch(ownerWorkspace),
+        () => this._flushWorkspaceEventBatch(
+          ownerWorkspace, workspaceGeneration,
+        ),
         delay,
       );
     },
-    _enqueueWorkspaceSync(ownerWorkspace, operation) {
+    _enqueueWorkspaceSync(
+      ownerWorkspace,
+      operation,
+      workspaceGeneration = this._workspaceGeneration(ownerWorkspace),
+    ) {
       const previous = this._workspaceSyncChains.get(ownerWorkspace) || Promise.resolve();
-      const task = previous.catch(() => {}).then(operation);
+      const task = previous.catch(() => {}).then(() => {
+        if (!this._workspaceGenerationIsCurrent(
+          ownerWorkspace, workspaceGeneration,
+        )) return false;
+        return operation();
+      });
       this._workspaceSyncChains.set(ownerWorkspace, task);
       const release = () => {
         if (this._workspaceSyncChains.get(ownerWorkspace) === task) {
@@ -13979,10 +19867,19 @@ function portal() {
       void task.then(release, release);
       return task;
     },
-    async _applyWorkspaceEventPayload(payload, ownerWorkspace) {
-      if (!payload || !this._workspaceIsCurrent(ownerWorkspace)) return false;
+    async _applyWorkspaceEventPayload(
+      payload,
+      ownerWorkspace,
+      workspaceGeneration = this._workspaceGeneration(ownerWorkspace),
+    ) {
+      if (!payload || !this._workspaceIsCurrent(ownerWorkspace)
+          || !this._workspaceGenerationIsCurrent(
+            ownerWorkspace, workspaceGeneration,
+          )) return false;
       if (payload.resync === true) {
-        return await this._recoverWorkspaceTree(ownerWorkspace, { hydrated: false });
+        return await this._recoverWorkspaceTree(
+          ownerWorkspace, { hydrated: false }, workspaceGeneration,
+        );
       }
       if (!Array.isArray(payload.changes)) return false;
       const current = Number(this._workspaceTreeCursors.get(ownerWorkspace) || 0);
@@ -13994,7 +19891,9 @@ function portal() {
       const sequenced = Array.from(bySeq.values())
         .sort((a, b) => Number(a.seq) - Number(b.seq));
       if (!sequenced.length && payload.changes.length) {
-        this._queueFileChanges(payload.changes, ownerWorkspace);
+        this._queueFileChanges(
+          payload.changes, ownerWorkspace, workspaceGeneration,
+        );
         return true;
       }
       const fresh = sequenced.filter(change => Number(change.seq) > current);
@@ -14003,6 +19902,7 @@ function portal() {
         if (Number(change.seq) !== expected) {
           return await this._recoverWorkspaceTree(
             ownerWorkspace, { hydrated: true },
+            workspaceGeneration,
           );
         }
         expected += 1;
@@ -14025,11 +19925,13 @@ function portal() {
       if (Number.isFinite(advertisedCursor) && advertisedCursor > replayedCursor) {
         return await this._recoverWorkspaceTree(
           ownerWorkspace, { hydrated: true },
+          workspaceGeneration,
         );
       }
       if (fresh.length && !this._applyFileTreeDelta(fresh)) {
         return await this._recoverWorkspaceTree(
           ownerWorkspace, { hydrated: true },
+          workspaceGeneration,
         );
       }
       this._workspaceTreeCursors.set(
@@ -14040,19 +19942,22 @@ function portal() {
           Number.isFinite(advertisedCursor) ? advertisedCursor : current,
         ),
       );
-      this._markWorkspaceTreeSynced(ownerWorkspace);
+      this._markWorkspaceTreeSynced(ownerWorkspace, workspaceGeneration);
       this._scheduleWorkspaceTreePersist(ownerWorkspace);
       return true;
     },
     async _startFileEvents() {
       const workspace = this.fileWorkspacePath();
       if (!this.token || !workspace || typeof EventSource === "undefined") return;
+      const workspaceGeneration = this._workspaceGeneration(workspace);
       if (!this._fileTreeIsVisible()) {
         this._stopFileEvents(true);
         this._fileTreeDirty = true;
         return;
       }
-      if (this._fileEvents && this._fileEventsWorkspace === workspace) return;
+      if (this._fileEvents
+          && this._fileEventsWorkspace === workspace
+          && this._fileEventsGeneration === workspaceGeneration) return;
       this._stopFileEvents(false);
       const seq = ++this._fileEventsSeq;
       let ticket;
@@ -14063,26 +19968,52 @@ function portal() {
           this.fileHdr(),
         );
       } catch (_) {
-        if (seq === this._fileEventsSeq && this._fileTreeIsVisible()) {
-          this._fileEventsTimer = setTimeout(() => this._startFileEvents(), 1500);
+        if (seq === this._fileEventsSeq && this._fileTreeIsVisible()
+            && this._workspaceGenerationIsCurrent(
+              workspace, workspaceGeneration,
+            )) {
+          this._fileEventsTimer = setTimeout(
+            () => this._startFileEvents(),
+            this._nextFileEventsReconnectDelay(),
+          );
         }
         return;
       }
-      if (seq !== this._fileEventsSeq || !this._fileTreeIsVisible() || !ticket) return;
+      if (seq !== this._fileEventsSeq || !this._fileTreeIsVisible() || !ticket
+          || !this._workspaceGenerationIsCurrent(
+            workspace, workspaceGeneration,
+          )) return;
       const params = new URLSearchParams({ ticket, workspace });
       const cursor = this._workspaceTreeCursors.get(workspace);
       if (cursor != null && cursor !== "") params.set("cursor", String(cursor));
       const es = new EventSource(`/api/files/events?${params.toString()}`);
       this._fileEvents = es;
       this._fileEventsWorkspace = workspace;
+      this._fileEventsGeneration = workspaceGeneration;
       this._fileEventsPending = this._fileEventsPending || new Map();
       const owns = () => seq === this._fileEventsSeq
         && this._fileEvents === es
-        && this._workspaceIsCurrent(workspace);
+        && this._fileEventsGeneration === workspaceGeneration
+        && this._workspaceIsCurrent(workspace)
+        && this._workspaceGenerationIsCurrent(
+          workspace, workspaceGeneration,
+        );
       es.addEventListener("ready", (ev) => {
         if (!owns()) return;
+        this._fileEventsReconnectFailures = 0;
         let payload = {};
         try { payload = JSON.parse(ev.data); } catch (_) {}
+        const readyWorkspaceId = String(payload.workspace_id || "");
+        const expectedWorkspaceId = this._workspaceRegistryId(workspace);
+        if (readyWorkspaceId && expectedWorkspaceId
+            && readyWorkspaceId !== expectedWorkspaceId) {
+          void this._recoverWorkspaceRegistrationMismatch(
+            workspace,
+            readyWorkspaceId,
+            workspaceGeneration,
+          );
+          return;
+        }
         const localCursor = Number(this._workspaceTreeCursors.get(workspace));
         const readyCursor = Number(payload.cursor ?? payload.latest_cursor);
         if (!Number.isFinite(readyCursor)) {
@@ -14121,8 +20052,12 @@ function portal() {
         try { es.close(); } catch (_) {}
         this._fileEvents = null;
         this._fileEventsWorkspace = "";
+        this._fileEventsGeneration = "";
         if (this._fileTreeIsVisible()) {
-          this._fileEventsTimer = setTimeout(() => this._startFileEvents(), 1500);
+          this._fileEventsTimer = setTimeout(
+            () => this._startFileEvents(),
+            this._nextFileEventsReconnectDelay(),
+          );
         }
       };
       if (!this._fileEventsVisibilityBound) {
@@ -14138,8 +20073,16 @@ function portal() {
         window.addEventListener("pageshow", () => this._startFileEvents());
       }
     },
-    _queueFileChanges(changes, ownerWorkspace) {
-      if (!this._workspaceIsCurrent(ownerWorkspace) || !Array.isArray(changes)) return;
+    _queueFileChanges(
+      changes,
+      ownerWorkspace,
+      workspaceGeneration = this._workspaceGeneration(ownerWorkspace),
+    ) {
+      if (!this._workspaceIsCurrent(ownerWorkspace)
+          || !this._workspaceGenerationIsCurrent(
+            ownerWorkspace, workspaceGeneration,
+          )
+          || !Array.isArray(changes)) return;
       this._fileEventsPending = this._fileEventsPending || new Map();
       for (const row of changes) {
         if (!row || typeof row.path !== "string") continue;
@@ -14178,16 +20121,24 @@ function portal() {
       const delay = this._isMobileLayout() ? 650 : 250;
       this._fileEventsTimer = setTimeout(() => {
         this._fileEventsTimer = null;
-        this._flushFileChanges(ownerWorkspace);
+        this._flushFileChanges(ownerWorkspace, workspaceGeneration);
       }, delay);
     },
-    async _flushFileChanges(ownerWorkspace = this.fileWorkspacePath()) {
-      if (!this._workspaceIsCurrent(ownerWorkspace)) return false;
+    async _flushFileChanges(
+      ownerWorkspace = this.fileWorkspacePath(),
+      workspaceGeneration = this._workspaceGeneration(ownerWorkspace),
+    ) {
+      const isCurrent = () => this._workspaceIsCurrent(ownerWorkspace)
+        && this._workspaceGenerationIsCurrent(
+          ownerWorkspace, workspaceGeneration,
+        );
+      if (!isCurrent()) return false;
       if (!this._fileTreeIsVisible()) {
         this._fileTreeDirty = true;
         return false;
       }
-      if (this._fileTreeRefreshBusy) {
+      if (this._fileTreeRefreshBusy
+          && this._fileTreeRefreshGeneration === workspaceGeneration) {
         this._fileTreeDirty = true;
         return false;
       }
@@ -14204,25 +20155,32 @@ function portal() {
         }
       }
       this._fileTreeRefreshBusy = true;
+      this._fileTreeRefreshGeneration = workspaceGeneration;
       let ok = true;
       try {
         // Root changes require rebuilding the root slice; a large multi-dir
         // burst is also cheaper as one transactional reload than N subtree
         // refreshes. loadRoot preserves expanded paths and last-good content.
         if (representativeByParent.has("") || representativeByParent.size > 6) {
-          ok = await this.reloadTree();
+          ok = await this.reloadTree({ workspaceGeneration });
         } else {
           const rows = Array.from(representativeByParent.entries())
             .sort((a, b) => a[0].split("/").length - b[0].split("/").length);
           for (const [, path] of rows) {
-            const refreshed = await this._refreshParentInTree(path, ownerWorkspace);
-            if (!this._workspaceIsCurrent(ownerWorkspace)) return false;
+            const refreshed = await this._refreshParentInTree(
+              path, ownerWorkspace, workspaceGeneration,
+            );
+            if (!isCurrent()) return false;
             if (refreshed === false) ok = false;
           }
         }
       } finally {
-        this._fileTreeRefreshBusy = false;
+        if (this._fileTreeRefreshGeneration === workspaceGeneration) {
+          this._fileTreeRefreshBusy = false;
+          this._fileTreeRefreshGeneration = "";
+        }
       }
+      if (!isCurrent()) return false;
       this._fileTreeDirty = !ok;
       if (ok) this._scheduleWorkspaceTreePersist(ownerWorkspace);
       return ok;
@@ -14231,15 +20189,23 @@ function portal() {
       if (!this._fileTreeDirty || !this._fileTreeIsVisible()) return false;
       if (this._fileTreeRefreshBusy) return false;
       const ownerWorkspace = this.fileWorkspacePath();
+      const workspaceGeneration = this._workspaceGeneration(ownerWorkspace);
       this._fileTreeRefreshBusy = true;
+      this._fileTreeRefreshGeneration = workspaceGeneration;
       this._fileEventsPending = new Map();
       let ok = false;
       try {
-        ok = await this.reloadTree();
+        ok = await this.reloadTree({ workspaceGeneration });
       } finally {
-        this._fileTreeRefreshBusy = false;
+        if (this._fileTreeRefreshGeneration === workspaceGeneration) {
+          this._fileTreeRefreshBusy = false;
+          this._fileTreeRefreshGeneration = "";
+        }
       }
-      if (this._workspaceIsCurrent(ownerWorkspace)) this._fileTreeDirty = !ok;
+      if (this._workspaceIsCurrent(ownerWorkspace)
+          && this._workspaceGenerationIsCurrent(
+            ownerWorkspace, workspaceGeneration,
+          )) this._fileTreeDirty = !ok;
       return ok;
     },
     _fileTreeRowHeight() {
@@ -14342,7 +20308,14 @@ function portal() {
       runtimeSnapshot = false,
       ownerWorkspace = this.fileWorkspacePath(),
       treeSeq = this._treeLoadSeq,
+      workspaceGeneration = this._workspaceGeneration(ownerWorkspace),
     } = {}) {
+      const isCurrent = () => treeSeq === this._treeLoadSeq
+        && this._workspaceIsCurrent(ownerWorkspace)
+        && this._workspaceGenerationIsCurrent(
+          ownerWorkspace, workspaceGeneration,
+        );
+      if (!isCurrent()) return false;
       this.treeLoading = true;
       this.treeError = "";
       // A warm workspace already owns an in-memory tree and cursor; an empty
@@ -14350,12 +20323,14 @@ function portal() {
       // from IndexedDB. Either path can revalidate with a small delta instead
       // of downloading and rebuilding the full workspace snapshot.
       const hydrated = !!runtimeSnapshot
-        || await this._hydrateWorkspaceTree(ownerWorkspace, treeSeq);
-      if (treeSeq !== this._treeLoadSeq
-          || !this._workspaceIsCurrent(ownerWorkspace)) return false;
-      if (await this._syncWorkspaceTree(ownerWorkspace, treeSeq, hydrated)) {
-        if (treeSeq !== this._treeLoadSeq
-            || !this._workspaceIsCurrent(ownerWorkspace)) return false;
+        || await this._hydrateWorkspaceTree(
+          ownerWorkspace, treeSeq, workspaceGeneration,
+        );
+      if (!isCurrent()) return false;
+      if (await this._syncWorkspaceTree(
+        ownerWorkspace, treeSeq, hydrated, workspaceGeneration,
+      )) {
+        if (!isCurrent()) return false;
         this.treeLoading = false;
         this.treeError = "";
         return true;
@@ -14371,9 +20346,10 @@ function portal() {
         // any failure.
         children = await this.fetchChildren("", {
           force: true, cache: false, treeSeq, ownerWorkspace,
+          workspaceGeneration,
         });
       } catch (_e) {
-        if (treeSeq === this._treeLoadSeq) {
+        if (isCurrent()) {
           this.treeLoading = false;
           this.treeError = this.lang === "zh"
             ? "文件列表加载失败，请检查连接后重试。"
@@ -14385,7 +20361,7 @@ function portal() {
         }
         return false;
       }
-      if (treeSeq !== this._treeLoadSeq) return false;
+      if (!isCurrent()) return false;
       const nextCache = { [`:${showHidden}`]: children };
       const nextExpanded = new Set();
       let nestedRefreshFailed = false;
@@ -14393,7 +20369,7 @@ function portal() {
       const buildRows = async (items, depth) => {
         const rows = [];
         for (const child of this._uniqueFileNodes(items)) {
-          if (treeSeq !== this._treeLoadSeq) return rows;
+          if (!isCurrent()) return rows;
           const node = { ...child, depth };
           rows.push(node);
           if (!node.is_dir || !wantedExpanded.has(node.path)) continue;
@@ -14402,13 +20378,14 @@ function portal() {
           try {
             grandchildren = await this.fetchChildren(node.path, {
               force: true, cache: false, treeSeq, ownerWorkspace,
+              workspaceGeneration,
             });
           } catch (_e) {
             nestedRefreshFailed = true;
             grandchildren = oldChildCache[cacheKey];
             if (!Array.isArray(grandchildren)) continue;
           }
-          if (treeSeq !== this._treeLoadSeq) return rows;
+          if (!isCurrent()) return rows;
           nextCache[cacheKey] = grandchildren;
           nextExpanded.add(node.path);
           rows.push(...await buildRows(grandchildren, depth + 1));
@@ -14416,7 +20393,7 @@ function portal() {
         return rows;
       };
       const nextVisible = await buildRows(children, 0);
-      if (treeSeq !== this._treeLoadSeq) return false;
+      if (!isCurrent()) return false;
       this.childCache = nextCache;
       this.visible = nextVisible;
       this.expanded = nextExpanded;
@@ -14432,9 +20409,15 @@ function portal() {
       this._scheduleWorkspaceTreePersist(ownerWorkspace);
       return true;
     },
-    loadRoot({ runtimeSnapshot = false, scheduleRetry = true } = {}) {
+    loadRoot({
+      runtimeSnapshot = false,
+      scheduleRetry = true,
+      workspaceGeneration = "",
+    } = {}) {
       const ownerWorkspace = this.fileWorkspacePath();
       if (!ownerWorkspace) return Promise.resolve(false);
+      const generation = workspaceGeneration
+        || this._workspaceGeneration(ownerWorkspace);
       // Allocate the generation before queueing so a newer manual refresh can
       // invalidate an older queued request immediately. The operation itself
       // shares the same owner chain as SSE replay/resync, preventing a snapshot
@@ -14443,25 +20426,34 @@ function portal() {
       const task = this._enqueueWorkspaceSync(
         ownerWorkspace,
         () => this._loadRootNow({
-          runtimeSnapshot, ownerWorkspace, treeSeq,
+          runtimeSnapshot,
+          ownerWorkspace,
+          treeSeq,
+          workspaceGeneration: generation,
         }),
+        generation,
       );
       return Promise.resolve(task).catch(() => false).then(ok => {
-        const current = this._workspaceIsCurrent(ownerWorkspace);
+        const current = this._workspaceIsCurrent(ownerWorkspace)
+          && this._workspaceGenerationIsCurrent(ownerWorkspace, generation);
         const latest = treeSeq === this._treeLoadSeq;
         if (ok === true && current) {
-          this._markWorkspaceTreeSynced(ownerWorkspace);
+          this._markWorkspaceTreeSynced(ownerWorkspace, generation);
         } else if (current && latest) {
           this.treeLoading = false;
           this._fileTreeDirty = true;
-          if (scheduleRetry) this._scheduleWorkspaceSyncRetry(ownerWorkspace);
+          if (scheduleRetry) {
+            this._scheduleWorkspaceSyncRetry(
+              ownerWorkspace, 0, generation,
+            );
+          }
         }
         return ok === true;
       });
     },
-    reloadTree() {
+    reloadTree(options = {}) {
       this._pendingExpanded = Array.from(this.expanded);
-      return this.loadRoot();
+      return this.loadRoot(options);
     },
     // In-place removal of a node (and its descendants, if a dir) from the
     // visible flat-list. Avoids the full reloadTree() that delete used to
@@ -14512,15 +20504,20 @@ function portal() {
     async _refreshParentInTree(
       restoredPath,
       ownerWorkspace = this.fileWorkspacePath(),
+      workspaceGeneration = this._workspaceGeneration(ownerWorkspace),
     ) {
-      if (!this._workspaceIsCurrent(ownerWorkspace)) return false;
-      if (!restoredPath) return this.reloadTree();
+      const isCurrent = () => this._workspaceIsCurrent(ownerWorkspace)
+        && this._workspaceGenerationIsCurrent(
+          ownerWorkspace, workspaceGeneration,
+        );
+      if (!isCurrent()) return false;
+      if (!restoredPath) return this.reloadTree({ workspaceGeneration });
       const parent = restoredPath.split("/").slice(0, -1).join("/");
       delete this.childCache[`${parent}:true`];
       delete this.childCache[`${parent}:false`];
       if (!parent) {
         // Root-level restore: re-merge root children, preserving expanded subtrees.
-        return this.reloadTree();
+        return this.reloadTree({ workspaceGeneration });
       }
       if (!this.expanded.has(parent)) {
         // Parent is collapsed → nothing visible changes; expanding later
@@ -14528,7 +20525,7 @@ function portal() {
         return;
       }
       const parentIdx = this.visible.findIndex(n => n.path === parent);
-      if (parentIdx < 0) return this.reloadTree();
+      if (parentIdx < 0) return this.reloadTree({ workspaceGeneration });
       const parentNode = this.visible[parentIdx];
       // Snapshot inner-expanded subtrees so we can restore them after
       // re-rendering the parent's children.
@@ -14539,17 +20536,17 @@ function portal() {
       let children;
       try {
         children = await this.fetchChildren(parent, {
-          force: true, ownerWorkspace,
+          force: true, ownerWorkspace, workspaceGeneration,
         });
       } catch (e) {
-        if (!e.staleWorkspace && this._workspaceIsCurrent(ownerWorkspace)) {
+        if (!e.staleWorkspace && isCurrent()) {
           this.toast(this.lang === "zh"
             ? "目录刷新失败，已保留原内容"
             : "Could not refresh folder; kept the previous contents", "error", 3500);
         }
         return false;
       }
-      if (!this._workspaceIsCurrent(ownerWorkspace)) return false;
+      if (!isCurrent()) return false;
       // Splice out parent's current rendered subtree.
       let end = parentIdx + 1;
       while (end < this.visible.length
@@ -14571,8 +20568,10 @@ function portal() {
       for (const p of innerExpanded.sort((a, b) => a.length - b.length)) {
         const node = this.visible.find(n => n.path === p);
         if (node && node.is_dir) {
-          await this.expand(node, { ownerWorkspace, quiet: true });
-          if (!this._workspaceIsCurrent(ownerWorkspace)) return false;
+          await this.expand(node, {
+            ownerWorkspace, workspaceGeneration, quiet: true,
+          });
+          if (!isCurrent()) return false;
         }
       }
       this.expanded = new Set(this.expanded);
@@ -14581,7 +20580,12 @@ function portal() {
     },
     async fetchChildren(path, opts = {}) {
       const ownerWorkspace = opts.ownerWorkspace || this.fileWorkspacePath();
+      const workspaceGeneration = opts.workspaceGeneration
+        || this._workspaceGeneration(ownerWorkspace);
       const isOwner = () => this._workspaceIsCurrent(ownerWorkspace)
+        && this._workspaceGenerationIsCurrent(
+          ownerWorkspace, workspaceGeneration,
+        )
         && (opts.treeSeq == null || opts.treeSeq === this._treeLoadSeq);
       if (!isOwner()) {
         const stale = new Error("stale workspace file request");
@@ -14594,7 +20598,7 @@ function portal() {
         return this.childCache[cacheKey];
       }
       if (!this._childFetches) this._childFetches = new Map();
-      const pendingKey = `${ownerWorkspace}\0${cacheKey}:${opts.force ? "force" : "normal"}`;
+      const pendingKey = `${ownerWorkspace}\0${workspaceGeneration}\0${cacheKey}:${opts.force ? "force" : "normal"}`;
       if (this._childFetches.has(pendingKey)) return this._childFetches.get(pendingKey);
       const url = "/api/files/list?path=" + encodeURIComponent(path)
         + (showHidden ? "&show_hidden=true" : "");
@@ -14619,7 +20623,15 @@ function portal() {
             stale.staleWorkspace = true;
             throw stale;
           }
-          throw new Error(detail || `HTTP ${r.status}`);
+          let parsedDetail = detail;
+          try {
+            const parsed = JSON.parse(detail);
+            parsedDetail = parsed && (parsed.detail || parsed.error) || detail;
+          } catch (_) {}
+          const error = new Error(parsedDetail || `HTTP ${r.status}`);
+          error.status = r.status;
+          error.detail = parsedDetail;
+          throw error;
         }
         const d = await r.json();
         if (!isOwner()) {
@@ -14678,6 +20690,116 @@ function portal() {
       this.toast(this.t(key), "info", hadExpanded ? 2500 : 1500);
       return true;
     },
+    treeRowTabIndex(n) {
+      if (!n) return -1;
+      const preferred = this.treeFocusPath || this.selected;
+      if (n.path === preferred) return 0;
+      const start = Math.max(
+        0,
+        Math.min(
+          Number(this.fileTreeViewport && this.fileTreeViewport.start) || 0,
+          this.visible.length,
+        ),
+      );
+      const end = Math.max(
+        start,
+        Math.min(
+          Number(this.fileTreeViewport && this.fileTreeViewport.end) || 80,
+          this.visible.length,
+        ),
+      );
+      const firstRendered = this.visible[start] || this.visible[0];
+      if (!firstRendered || n.path !== firstRendered.path) return -1;
+      // Only the first rendered row checks the current window. A logical focus
+      // owner outside the virtual slice cannot be tabbed to, so the mounted
+      // slice still needs exactly one entry point. Keep the scan O(window),
+      // not O(full tree * rendered rows).
+      for (let index = start; preferred && index < end; index += 1) {
+        if (this.visible[index].path === preferred) return -1;
+      }
+      return 0;
+    },
+    onTreeRowFocus(n) {
+      if (n && n.path) this.treeFocusPath = n.path;
+    },
+    _focusTreeRow(path, block = "nearest") {
+      if (!path) return false;
+      this.treeFocusPath = path;
+      this._positionFileTreePath(path, block);
+      const focusRow = () => {
+        const escaped = window.CSS && CSS.escape ? CSS.escape(path) : path;
+        const row = document.querySelector(
+          `.filelist li[role="treeitem"][data-path="${escaped}"]`,
+        );
+        if (!row) return false;
+        this._focusWithoutScroll(row);
+        return true;
+      };
+      this.$nextTick(() => {
+        if (focusRow()) return;
+        // A Home/End jump can replace the virtualized x-for window. Alpine's
+        // first nextTick publishes the slice, while its DOM nodes may not be
+        // mounted until the following paint; retry once without polling.
+        this._afterPaint(focusRow);
+      });
+      return true;
+    },
+    async onTreeRowKeydown(ev, n) {
+      if (!ev || !n || ev.target !== ev.currentTarget) return;
+      const key = ev.key;
+      if (key === "Enter" || key === " ") {
+        ev.preventDefault();
+        ev.stopPropagation();
+        await this.onNodeClick(ev, n);
+        if (this._isMobileLayout() && !n.is_dir) {
+          this.$nextTick(() => {
+            const active = document.querySelector(
+              ".pane.preview .tab.active .tab-main",
+            );
+            if (active) this._focusWithoutScroll(active);
+          });
+        } else {
+          this._focusTreeRow(n.path);
+        }
+        return;
+      }
+      const rows = this.visible;
+      const index = rows.findIndex(node => node.path === n.path);
+      if (index < 0) return;
+      let target = null;
+      if (key === "ArrowDown") target = rows[Math.min(rows.length - 1, index + 1)];
+      else if (key === "ArrowUp") target = rows[Math.max(0, index - 1)];
+      else if (key === "Home") target = rows[0];
+      else if (key === "End") target = rows[rows.length - 1];
+      else if (key === "ArrowRight" && n.is_dir) {
+        if (!this.expanded.has(n.path)) {
+          ev.preventDefault();
+          ev.stopPropagation();
+          await this.expand(n);
+          this.savePrefs();
+          this._focusTreeRow(n.path);
+          return;
+        }
+        const child = rows[index + 1];
+        if (child && child.depth === n.depth + 1) target = child;
+      } else if (key === "ArrowLeft") {
+        if (n.is_dir && this.expanded.has(n.path)) {
+          ev.preventDefault();
+          ev.stopPropagation();
+          this.collapse(n);
+          this.savePrefs();
+          this._focusTreeRow(n.path);
+          return;
+        }
+        const parentPath = n.path.includes("/")
+          ? n.path.split("/").slice(0, -1).join("/") : "";
+        if (parentPath) target = rows.find(node => node.path === parentPath);
+      }
+      if (!target) return;
+      ev.preventDefault();
+      ev.stopPropagation();
+      this._focusTreeRow(target.path);
+    },
     async onNodeClick(ev, n) {
       // ---- Desktop multi-select modifiers ----
       // Ctrl/Cmd-click toggles a single row in/out of the batch set; Shift-
@@ -14710,7 +20832,9 @@ function portal() {
         // reliable double-click gesture to pin it, so recycling A when B is
         // tapped would also discard A's saved reading position. Mobile taps
         // therefore open normal, closable tabs.
-        await this.openFile(n, { preview: !this._isMobileLayout() });
+        await this.openFile(n, {
+          preview: !this._isMobileLayout(), reveal: true,
+        });
       }
     },
     // ===== multi-select helpers =====
@@ -14843,7 +20967,9 @@ function portal() {
     // promotes that slot to permanent (openFile's `existing && !asPreview`
     // branch clears the preview flag).
     async onNodeDblClick(n) {
-      if (n && !n.is_dir) await this.openFile(n, { preview: false });
+      if (n && !n.is_dir) {
+        await this.openFile(n, { preview: false, reveal: true });
+      }
     },
     // Pin a preview (italic) tab so it stays open: double-clicking the tab
     // itself, or starting to edit its file, promotes it to permanent.
@@ -14855,6 +20981,19 @@ function portal() {
         this.savePrefs();
       }
     },
+    _fileTreeOpenError(path, error) {
+      const detail = String((error && (error.detail || error.message)) || "").trim();
+      const displayPath = "/" + String(path || "").replace(/^\/+/, "");
+      if (detail === "path escapes root") {
+        return this.lang === "zh"
+          ? `无法打开 ${displayPath}：该目录的实际位置不在当前工作区或已添加的工作区中。若这是软链接，请先把目标目录添加为工作区。`
+          : `Could not open ${displayPath}: its resolved location is outside the current or registered workspaces. If this is a symlink, add its target directory as a workspace first.`;
+      }
+      if (this.lang === "zh") {
+        return `无法打开 ${displayPath}${detail ? "：" + detail : ""}`;
+      }
+      return `Could not open ${displayPath}${detail ? ": " + detail : ""}`;
+    },
     async expand(n, opts = {}) {
       // Idempotency guard (both sides of the await): two concurrent reveals
       // — e.g. a fire-and-forget revealInTree racing an awaited one after a
@@ -14863,22 +21002,26 @@ function portal() {
       // async fetch so the loser bails out instead of inserting duplicates.
       if (this.expanded.has(n.path)) return;
       const ownerWorkspace = opts.ownerWorkspace || this.fileWorkspacePath();
+      const workspaceGeneration = opts.workspaceGeneration
+        || this._workspaceGeneration(ownerWorkspace);
+      const isCurrent = () => this._workspaceIsCurrent(ownerWorkspace)
+        && this._workspaceGenerationIsCurrent(
+          ownerWorkspace, workspaceGeneration,
+        )
+        && (opts.treeSeq == null || opts.treeSeq === this._treeLoadSeq);
       let children;
       try {
         children = await this.fetchChildren(n.path, {
-          treeSeq: opts.treeSeq, ownerWorkspace,
+          treeSeq: opts.treeSeq, ownerWorkspace, workspaceGeneration,
         });
       } catch (e) {
         if (!opts.quiet && !e.staleWorkspace
-            && this._workspaceIsCurrent(ownerWorkspace)
-            && (opts.treeSeq == null || opts.treeSeq === this._treeLoadSeq)) {
-          this.toast(this.lang === "zh"
-            ? `无法展开 /${n.path}` : `Could not open /${n.path}`, "error", 3000);
+            && isCurrent()) {
+          this.toast(this._fileTreeOpenError(n.path, e), "error", 6000);
         }
         return false;
       }
-      if (!this._workspaceIsCurrent(ownerWorkspace)) return false;
-      if (opts.treeSeq != null && opts.treeSeq !== this._treeLoadSeq) return false;
+      if (!isCurrent()) return false;
       if (this.expanded.has(n.path)) return;
       const idx = this.visible.findIndex(x => x.path === n.path);
       if (idx < 0) return;
@@ -14927,7 +21070,7 @@ function portal() {
       }
       if (n) this.treeFocusPath = n.path;
       // Clamp to viewport so menu doesn't overflow.
-      const MENU_W = 200, MENU_H = 280;
+      const MENU_W = 200, MENU_H = 312;
       const x = Math.min(ev.clientX, window.innerWidth - MENU_W - 8);
       const y = Math.min(ev.clientY, window.innerHeight - MENU_H - 8);
       this.ctxMenu = { show: true, x, y, node: n, multi };
@@ -14938,7 +21081,7 @@ function portal() {
       if (!n) return;
       switch (action) {
         case "open":
-          if (!n.is_dir) await this.openFile(n);
+          if (!n.is_dir) await this.openFile(n, { reveal: true });
           break;
         case "mention":
           this.insertFileMention(n.path, !!n.is_dir);
@@ -14947,6 +21090,12 @@ function portal() {
           await navigator.clipboard?.writeText(n.path);
           this.toast(this.t("toast.copied") + ": " + n.path, "success", 1500);
           break;
+        case "copyAbsolutePath": {
+          const absolutePath = this.absoluteFilePath(n.path);
+          await navigator.clipboard?.writeText(absolutePath);
+          this.toast(this.t("toast.copied") + ": " + absolutePath, "success", 1500);
+          break;
+        }
         case "copyAsBak":
           // Right-click "Copy as .bak" — paste-target defaults to the
           // source's own parent dir, matching user expectation of an
@@ -15010,7 +21159,7 @@ function portal() {
         if (!this._workspaceIsCurrent(ownerWorkspace)) return;
         this.toast(this.t("toast.created_name", { name }), "success");
         // 自动打开编辑
-        await this.openFile({ path, name });
+        await this.openFile({ path, name }, { reveal: true });
         if (!this._workspaceIsCurrent(ownerWorkspace)) return;
         if (this.selected === path) await this.toggleEdit();
       } else {
@@ -15699,6 +21848,7 @@ function portal() {
       return saved;
     },
     onPreviewViewportScroll() {
+      this.dismissTransientPreviewQuote(true);
       clearTimeout(this._previewViewSaveTimer);
       const ownerPath = this.selected;
       const ownerLoadSeq = this._previewLoadSeq;
@@ -16149,6 +22299,14 @@ function portal() {
     },
     async createTerminal(profileId) {
       if (!this.terminalEnabled || this.terminalCreating) return;
+      const ownerWorkspace = this.currentWorkspacePath();
+      const workspaceGeneration = this._workspaceGeneration(ownerWorkspace);
+      const isOwner = () => this._workspaceIsCurrent(ownerWorkspace)
+        && this._workspaceGenerationIsCurrent(
+          ownerWorkspace, workspaceGeneration,
+        );
+      if (!ownerWorkspace || !isOwner()) return;
+      const requestHeaders = this.fileHdr(ownerWorkspace);
       // Read the native select value at click time. Mobile browsers can commit
       // their picker value one event turn later than Alpine's x-model update;
       // relying only on terminalProfileId could therefore create the previous
@@ -16171,11 +22329,27 @@ function portal() {
       this._scheduleSavePrefs();
       this.terminalCreating = true;
       try {
+        // Load the local renderer before allocating a backend PTY. A mobile
+        // network can transiently fail a lazy script request; creating first
+        // used to leave one unreachable terminal behind for every retry.
+        try {
+          await this._loadTerminalLib();
+        } catch (error) {
+          if (!isOwner()) return;
+          const detail = error && error.message ? error.message : String(error || "");
+          this.toast((this.lang === "zh"
+            ? "终端资源加载失败，请检查网络后重试："
+            : "Terminal assets failed to load. Check the network and retry: ")
+            + detail, "error");
+          return;
+        }
+        if (!isOwner()) return;
         const { ok, data, error } = await this.api("/api/terminals", {
           method: "POST",
-          headers: this.fileHdr(),
+          headers: requestHeaders,
           json: { rows: 30, cols: 100, profile_id: selectedProfileId },
         });
+        if (!isOwner()) return;
         if (!ok) {
           this.toast((this.lang === "zh" ? "新建终端失败：" : "Could not create terminal: ")
             + (error || ""), "error");
@@ -16374,36 +22548,112 @@ function portal() {
     async _loadTerminalLib() {
       if (window.Terminal && window.FitAddon) return;
       if (this._terminalLoadPromise) return this._terminalLoadPromise;
-      const inject = (src) => new Promise((resolve, reject) => {
-        const selector = src.endsWith(".css")
-          ? `link[href="${src}"]` : `script[src="${src}"]`;
-        if (document.querySelector(selector)) {
-          const started = Date.now();
-          (function wait() {
-            if (src.endsWith(".css")
-                || (window.Terminal && (!src.includes("fit") || window.FitAddon))) {
-              resolve();
-            } else if (Date.now() - started > 5000) {
-              reject(new Error("terminal asset load timeout"));
-            } else {
-              setTimeout(wait, 50);
-            }
-          })();
+      const assetVersion = String(document.querySelector(
+        'meta[name="muselab-asset-version"]')?.content || "");
+      // Mobile Safari on a high-latency proxy can spend most of 15 seconds on
+      // the 489 KB xterm bundle before the tiny fit addon even starts. Give each
+      // request a realistic cellular timeout and keep enough shared budget for
+      // one cache-busting retry.
+      const timeoutMs = 30000;
+      const deadline = Date.now() + 75000;
+      const isReady = src => src.endsWith(".css")
+        || (src.includes("addon-fit") ? !!window.FitAddon : !!window.Terminal);
+      const loadOnce = (src, attempt) => new Promise((resolve, reject) => {
+        const isCss = src.endsWith(".css");
+        if (isReady(src) && !isCss) {
+          resolve();
           return;
         }
-        const node = src.endsWith(".css")
-          ? Object.assign(document.createElement("link"), { rel: "stylesheet", href: src })
-          : Object.assign(document.createElement("script"), { src });
-        node.onload = resolve;
-        node.onerror = () => reject(new Error("load failed: " + src));
+
+        // A failed <script> stays in the DOM but will never emit load again.
+        // Remove every unready copy so retrying means a real network request,
+        // including tags left by the pre-fix loader in a long-lived PWA tab.
+        const attr = isCss ? "href" : "src";
+        const candidates = document.querySelectorAll(isCss
+          ? 'link[rel="stylesheet"][href]' : "script[src]");
+        for (const existing of candidates) {
+          const raw = String(existing.getAttribute(attr) || "");
+          const sameAsset = existing.dataset.muselabTerminalAsset === src
+            || raw === src || raw.startsWith(src + "?");
+          if (!sameAsset) continue;
+          if (isCss && existing.sheet) {
+            resolve();
+            return;
+          }
+          existing.remove();
+        }
+
+        const remainingMs = deadline - Date.now();
+        if (remainingMs <= 0) {
+          reject(new Error("terminal asset load deadline exceeded: " + src));
+          return;
+        }
+
+        const versioned = assetVersion && !assetVersion.startsWith("__")
+          ? `${src}?v=${encodeURIComponent(assetVersion)}` : src;
+        const requestUrl = attempt
+          ? `${versioned}${versioned.includes("?") ? "&" : "?"}retry=${Date.now()}`
+          : versioned;
+        const node = isCss
+          ? Object.assign(document.createElement("link"), {
+              rel: "stylesheet", href: requestUrl,
+            })
+          : Object.assign(document.createElement("script"), { src: requestUrl });
+        node.dataset.muselabTerminalAsset = src;
+        node.dataset.muselabTerminalState = "loading";
+        let settled = false;
+        const finish = error => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          node.onload = null;
+          node.onerror = null;
+          if (error) {
+            node.dataset.muselabTerminalState = "error";
+            node.remove();
+            reject(error);
+          } else {
+            node.dataset.muselabTerminalState = "loaded";
+            resolve();
+          }
+        };
+        const timer = setTimeout(
+          () => finish(new Error("terminal asset load timeout: " + src)),
+          Math.min(timeoutMs, remainingMs),
+        );
+        node.onload = () => finish(isReady(src) ? null : new Error(
+          "terminal asset globals missing: " + src));
+        node.onerror = () => finish(new Error("load failed: " + src));
         document.head.appendChild(node);
       });
+      const inject = async src => {
+        let lastError = null;
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+          try {
+            await loadOnce(src, attempt);
+            return;
+          } catch (error) {
+            lastError = error;
+          }
+        }
+        throw lastError || new Error("terminal asset load failed: " + src);
+      };
       this._terminalLoadPromise = (async () => {
-        await Promise.all([
+        // Wait for both parallel branches to settle before exposing a failed
+        // loader for retry. Promise.all rejected immediately and left its
+        // sibling alive; that stale branch could later remove the fresh DOM
+        // node created by the next click.
+        // addon-fit is a standalone UMD bundle: it only needs Terminal when its
+        // exported class is instantiated, not while the script evaluates. Start
+        // all three requests together so a slow xterm download does not postpone
+        // the addon's timeout window on cellular/mobile proxy connections.
+        const initial = await Promise.allSettled([
           inject("/static/vendor/xterm/xterm.css"),
           inject("/static/vendor/xterm/xterm.js"),
+          inject("/static/vendor/xterm/addon-fit.js"),
         ]);
-        await inject("/static/vendor/xterm/addon-fit.js");
+        const failed = initial.find(result => result.status === "rejected");
+        if (failed) throw failed.reason;
         if (!window.Terminal || !window.FitAddon) {
           throw new Error("terminal library globals missing");
         }
@@ -17094,25 +23344,42 @@ function portal() {
 
     async openFile(n, opts = {}) {
       if (!n || !n.path) return false;
-      if (this.previewSurface === "terminal") this._teardownTerminalView();
-      this.previewSurface = "file";
+      // Loading file content and revealing the preview rail are separate
+      // operations. Background refresh/restore/remap paths call openFile too;
+      // only a direct user gesture opts into layout changes with reveal:true.
+      const reveal = opts.reveal === true;
+      const keepCurrentEditor = this.editing
+        && n.path === this.selected && !opts.forceReload;
+      // Confirm before mutating layout or surface ownership. Cancelling a dirty
+      // file switch must leave a hidden rail/fullscreen pane and terminal intact.
+      if (!keepCurrentEditor && this.editing
+          && !opts.editsConfirmed && !this._confirmLoseEdits()) {
+        return false;
+      }
+      if (reveal && !this._isMobileLayout()
+          && (!this.previewOpen || this.desktopFullPane)) {
+        this.desktopFullPane = "";
+        this.previewOpen = true;
+        this.savePrefs();
+      }
+      this.dismissTransientPreviewQuote(true);
+      // A hidden background reload must not evict a terminal that currently
+      // owns the preview surface. Direct user opens explicitly activate files.
+      if (this.previewSurface !== "terminal" || reveal) {
+        if (this.previewSurface === "terminal") this._teardownTerminalView();
+        this.previewSurface = "file";
+      }
       // Clicking / double-clicking the file that already owns the editor is a
       // focus or pin gesture, not a request to throw the buffer away and read
       // it again. The old path guard only prompted for a *different* file, but
       // then unconditionally set editing=false below — so one innocent repeat
       // click silently discarded dirty text. Explicit force-reload is the one
       // same-path operation that is allowed to replace the buffer.
-      if (this.editing && n.path === this.selected && !opts.forceReload) {
+      if (keepCurrentEditor) {
         if (!opts.preview) this.pinTab(n.path);
         this.treeFocusPath = n.path;
+        if (this._isMobileLayout() && reveal) this.setMobileTab("preview");
         return true;
-      }
-      // Unsaved-edits guard: switching to a DIFFERENT file while the editor
-      // is dirty, or explicitly force-reloading the current one, would replace
-      // the buffer. Confirm first; reloadPreview can pass the confirmation it
-      // already obtained so the user never sees the same dialog twice.
-      if (this.editing && !opts.editsConfirmed && !this._confirmLoseEdits()) {
-        return false;
       }
       this._capturePreviewViewState(this.selected);
       this._cancelPreviewViewRestore();
@@ -17181,7 +23448,7 @@ function portal() {
       this._scheduleSavePrefs();
       // Mobile: opening a file should jump to the preview pane (otherwise
       // the user is still on `files` tab and sees nothing change).
-      if (this._isMobileLayout() && opts.reveal !== false) {
+      if (this._isMobileLayout() && reveal) {
         this.setMobileTab("preview");
       }
       // When many files are open, the active row/tab can end up off-screen
@@ -17484,10 +23751,22 @@ function portal() {
       };
       return map[ext] || "plaintext";
     },
-    async openByPath(path) { await this.openFile({ path, name: path.split("/").pop() }); },
+    async openByPath(path, opts = {}) {
+      await this.openFile(
+        { path, name: path.split("/").pop() },
+        { reveal: opts.reveal === true },
+      );
+    },
 
-    async switchTab(path) {
-      if (!path || (path === this.selected && this.previewSurface === "file")) return true;
+    async switchTab(path, opts = {}) {
+      if (!path) return true;
+      const revealNeeded = opts.reveal === true && (
+        this._isMobileLayout()
+          ? this.mobileTab !== "preview"
+          : (!this.previewOpen || !!this.desktopFullPane)
+      );
+      if (path === this.selected && this.previewSurface === "file"
+          && !revealNeeded) return true;
       // A terminal overlays the last selected file without clearing
       // `selected`. Clicking that same (usually rightmost) file tab must still
       // route through openFile so the preview surface leaves terminal mode.
@@ -17499,7 +23778,7 @@ function portal() {
       const cur = this.tabs.find(t => t.path === path);
       const opened = await this.openFile(
         { path, name: path.split("/").pop() },
-        { preview: !!(cur && cur.preview) },
+        { preview: !!(cur && cur.preview), reveal: opts.reveal === true },
       );
       if (!opened) return false;
       // Pass mode:"background" so we expand/scroll the tree quietly —
@@ -17666,17 +23945,86 @@ function portal() {
         if (!isOwner()) return;
         if (!r.ok) { this.selectedMeta = null; return; }
         const d = await r.json();
-        if (isOwner()) this.selectedMeta = d;
+        if (isOwner()) {
+          this.fileMetaClock = Date.now();
+          this.selectedMeta = d;
+        }
       } catch { if (isOwner()) this.selectedMeta = null; }
     },
-    // Format a unix-seconds mtime as "YYYY-MM-DD HH:mm" in local time for the
-    // preview-header strip. Returns "" for a falsy timestamp.
+    // Format a unix-seconds timestamp and its surrounding file metadata for
+    // the compact preview-header presentation below.
+    fileBreadcrumb(path) {
+      const parts = String(path || "").split("/").filter(Boolean);
+      parts.pop(); // the pane title already owns the basename
+      const root = this.lang === "zh" ? "根目录" : "Workspace root";
+      if (!parts.length) return root;
+      const tail = parts.slice(-3);
+      return `${parts.length > 3 ? "…" : root} › ${tail.join(" › ")}`;
+    },
+    // Exact local timestamp for metadata tooltips. The visible strip uses a
+    // quieter relative/calendar label instead.
     fmtMtime(ts) {
       if (!ts) return "";
       const d = new Date(ts * 1000);
       const p = (n) => String(n).padStart(2, "0");
       return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} `
-             + `${p(d.getHours())}:${p(d.getMinutes())}`;
+             + `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+    },
+    fmtRelativeMtime(ts) {
+      if (!ts) return "";
+      const nowMs = Number(this.fileMetaClock) || Date.now();
+      const then = new Date(Number(ts) * 1000);
+      const diffSeconds = Math.max(0, Math.floor((nowMs - then.getTime()) / 1000));
+      const zh = this.lang === "zh";
+      if (diffSeconds < 60) return zh ? "刚刚" : "just now";
+      if (diffSeconds < 3600) {
+        const minutes = Math.floor(diffSeconds / 60);
+        return zh ? `${minutes} 分钟前` : `${minutes} min ago`;
+      }
+      if (diffSeconds < 6 * 3600) {
+        const hours = Math.floor(diffSeconds / 3600);
+        return zh ? `${hours} 小时前` : `${hours} hr ago`;
+      }
+      const now = new Date(nowMs);
+      const dayKey = d => `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
+      const clock = then.toLocaleTimeString(zh ? "zh-CN" : "en-US", {
+        hour: "2-digit", minute: "2-digit", hour12: !zh,
+      });
+      if (dayKey(then) === dayKey(now)) return zh ? `今天 ${clock}` : `Today ${clock}`;
+      const yesterday = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1);
+      if (dayKey(then) === dayKey(yesterday)) {
+        return zh ? `昨天 ${clock}` : `Yesterday ${clock}`;
+      }
+      if (then.getFullYear() === now.getFullYear()) {
+        return then.toLocaleDateString(zh ? "zh-CN" : "en-US", {
+          month: "short", day: "numeric",
+        });
+      }
+      return then.toLocaleDateString(zh ? "zh-CN" : "en-US", {
+        year: "numeric", month: "short", day: "numeric",
+      });
+    },
+    fileSizeTitle(value) {
+      const size = Number(value);
+      if (!Number.isFinite(size) || size < 0) return "";
+      const exact = new Intl.NumberFormat(
+        this.lang === "zh" ? "zh-CN" : "en-US",
+      ).format(Math.round(size));
+      return this.lang === "zh" ? `${exact} 字节` : `${exact} bytes`;
+    },
+    fileMetaTitle(meta) {
+      if (!meta) return "";
+      const parts = [];
+      const size = Number(meta.size);
+      if (Number.isFinite(size) && size >= 0) {
+        parts.push(`${this.fmtSize(size)}（${this.fileSizeTitle(size)}）`);
+      }
+      if (meta.mtime) {
+        parts.push(this.lang === "zh"
+          ? `修改于 ${this.fmtMtime(meta.mtime)}`
+          : `Modified ${this.fmtMtime(meta.mtime)}`);
+      }
+      return parts.join(" · ");
     },
     closeAllTabs() {
       if (!this.tabs.length) return;
@@ -17884,9 +24232,18 @@ function portal() {
       return "";
     },
     fmtSize(n) {
-      if (n < 1024) return n + "B";
-      if (n < 1024 * 1024) return (n / 1024).toFixed(1) + "K";
-      return (n / 1024 / 1024).toFixed(1) + "M";
+      let value = Number(n);
+      if (!Number.isFinite(value) || value < 0) return "";
+      const units = ["B", "KB", "MB", "GB", "TB"];
+      let unit = 0;
+      while (value >= 1024 && unit < units.length - 1) {
+        value /= 1024;
+        unit += 1;
+      }
+      if (unit === 0) return `${Math.round(value)} B`;
+      const digits = value >= 100 ? 0 : 1;
+      const compact = value.toFixed(digits).replace(/\.0$/, "");
+      return `${compact} ${units[unit]}`;
     },
     // Returns a Promise that resolves once every block in `root` is
     // highlighted AND artifacts (mermaid/HTML) are rendered. Most callers
@@ -18002,7 +24359,7 @@ function portal() {
     // (unshift puts them at the front). Stops as soon as it has n, so it's
     // O(n) regardless of how much history is already rendered.
     _leadingMsgEls(n) {
-      const body = this.$refs.chatBody;
+      const body = this._chatBodyElement();
       if (!body || n <= 0) return [];
       const out = [];
       const panes = Array.from(body.querySelectorAll(".msg-pane"))
@@ -18145,6 +24502,996 @@ function portal() {
       });
     },
 
+    // Selection actions live in the parent document so the same small helper
+    // works for rendered chat bubbles, Markdown, plain text/code and table
+    // previews without weakening the HTML iframe sandbox. PDF remains
+    // browser-owned and is deliberately unsupported here as well.
+    _initPreviewSelection() {
+      if (this._previewSelectionBound) return;
+      this._previewSelectionBound = true;
+      this._loadPreviewQuoteDesktopSize();
+      document.addEventListener("selectionchange", () => {
+        // Focusing the inline question field collapses the document selection.
+        // The selected source has already been snapshotted, so retain the ask
+        // panel until the user explicitly closes it or opens the full branch.
+        if (this.previewQuote.show && this.previewQuote.mode === "ask") return;
+        clearTimeout(this._previewSelectionTimer);
+        this._previewSelectionTimer = setTimeout(() => {
+          this._previewSelectionTimer = null;
+          this._syncPreviewSelection();
+        }, 60);
+      });
+      document.addEventListener("pointerdown", (ev) => {
+        const inPopover = ev.target && ev.target.closest
+          && ev.target.closest(".preview-selection-popover");
+        if (!inPopover) this.dismissTransientPreviewQuote(false);
+      }, true);
+      const onViewportResize = () => {
+        // Mobile keyboards can resize the visual viewport while the question
+        // textarea is focused. Do not interpret that as a cancellation.
+        if (this.previewQuote.show && this.previewQuote.mode !== "ask") {
+          this.dismissPreviewQuote(false);
+        } else if (this.previewQuote.show && this.previewQuote.dragged) {
+          this._schedulePreviewQuoteConstraint();
+        }
+      };
+      window.addEventListener("resize", onViewportResize);
+      if (window.visualViewport) {
+        window.visualViewport.addEventListener("resize", onViewportResize);
+        window.visualViewport.addEventListener("scroll", onViewportResize);
+      }
+      this.$nextTick(() => {
+        const popover = this._previewQuoteElement();
+        if (!popover || !window.ResizeObserver) return;
+        this._previewQuoteResizeObserver = new ResizeObserver(() => {
+          // The compact answer grows while streaming. If the user parked the
+          // window near an edge, keep the growing shell in view without
+          // disturbing its position during ordinary content updates.
+          if (this.previewQuote.show && this.previewQuote.dragged
+              && !this.previewQuote.dragging && !this._previewQuoteResize) {
+            this._schedulePreviewQuoteConstraint();
+          }
+        });
+        this._previewQuoteResizeObserver.observe(popover);
+      });
+    },
+
+    _loadPreviewQuoteDesktopSize() {
+      try {
+        const saved = JSON.parse(
+          localStorage.getItem("muselab_side_question_size") || "null",
+        );
+        if (!saved || typeof saved !== "object") return;
+        const width = Number(saved.width);
+        const height = Number(saved.height);
+        if (Number.isFinite(width) && width >= 360 && width <= 2400) {
+          this.previewQuote.width = Math.round(width);
+        }
+        if (Number.isFinite(height) && height >= 260 && height <= 1800) {
+          this.previewQuote.height = Math.round(height);
+        }
+      } catch (_) {}
+    },
+
+    _savePreviewQuoteDesktopSize() {
+      try {
+        localStorage.setItem("muselab_side_question_size", JSON.stringify({
+          width: Math.round(this.previewQuote.width),
+          height: Math.round(this.previewQuote.height),
+        }));
+      } catch (_) {}
+    },
+
+    _previewQuoteDesktop() {
+      return !!(window.matchMedia
+        && window.matchMedia("(min-width: 601px)").matches);
+    },
+
+    _preparePreviewQuoteDesktopWindow() {
+      if (!this._previewQuoteDesktop()) return false;
+      const popover = this._previewQuoteElement();
+      if (!popover || !popover.getClientRects().length) return false;
+      const rect = popover.getBoundingClientRect();
+      const next = this._clampPreviewQuotePosition(
+        rect.left, rect.top, rect.width, rect.height,
+      );
+      Object.assign(this.previewQuote, {
+        x: next.x,
+        y: next.y,
+        above: false,
+        dragged: true,
+      });
+      return true;
+    },
+
+    _previewQuoteElement() {
+      return this.$refs.previewSelectionPopover
+        || document.querySelector(".preview-selection-popover");
+    },
+
+    _previewQuoteViewport() {
+      const viewport = window.visualViewport;
+      return {
+        left: viewport ? viewport.offsetLeft : 0,
+        top: viewport ? viewport.offsetTop : 0,
+        width: Math.max(1, viewport ? viewport.width : window.innerWidth),
+        height: Math.max(1, viewport ? viewport.height : window.innerHeight),
+      };
+    },
+
+    _clampPreviewQuotePosition(left, top, width, height) {
+      const viewport = this._previewQuoteViewport();
+      const margin = 12;
+      const minLeft = viewport.left + margin;
+      const minTop = viewport.top + margin;
+      const maxLeft = Math.max(
+        minLeft, viewport.left + viewport.width - Math.max(0, width) - margin,
+      );
+      const maxTop = Math.max(
+        minTop, viewport.top + viewport.height - Math.max(0, height) - margin,
+      );
+      return {
+        x: Math.min(maxLeft, Math.max(minLeft, Number(left) || 0)),
+        y: Math.min(maxTop, Math.max(minTop, Number(top) || 0)),
+      };
+    },
+
+    _constrainPreviewQuoteToViewport() {
+      if (!this.previewQuote.show || this.previewQuote.mode !== "ask"
+          || !this.previewQuote.dragged || this.previewQuote.dragging) return false;
+      const popover = this._previewQuoteElement();
+      if (!popover || !popover.getClientRects().length) return false;
+      const rect = popover.getBoundingClientRect();
+      const next = this._clampPreviewQuotePosition(
+        this.previewQuote.x, this.previewQuote.y, rect.width, rect.height,
+      );
+      if (next.x === this.previewQuote.x && next.y === this.previewQuote.y) {
+        return false;
+      }
+      this.previewQuote.x = next.x;
+      this.previewQuote.y = next.y;
+      return true;
+    },
+
+    _schedulePreviewQuoteConstraint() {
+      if (this._previewQuoteConstraintFrame != null) return;
+      const schedule = window.requestAnimationFrame || ((fn) => setTimeout(fn, 0));
+      this._previewQuoteConstraintFrame = schedule(() => {
+        this._previewQuoteConstraintFrame = null;
+        this._constrainPreviewQuoteToViewport();
+      });
+    },
+
+    startPreviewQuoteDrag(ev) {
+      if (!ev || !this.previewQuote.show || this.previewQuote.mode !== "ask"
+          || (ev.button != null && ev.button !== 0)
+          || ev.isPrimary === false) return false;
+      const target = ev.target && ev.target.closest ? ev.target : null;
+      const head = target && target.closest(".preview-selection-ask-head");
+      if (!head || (target.closest
+          && target.closest("button, input, textarea, select, a"))) return false;
+      const popover = this._previewQuoteElement();
+      if (!popover || !popover.contains(head)) return false;
+      const rect = popover.getBoundingClientRect();
+      const handle = ev.currentTarget || head;
+      this._previewQuoteDrag = {
+        pointerId: ev.pointerId,
+        startX: ev.clientX,
+        startY: ev.clientY,
+        left: rect.left,
+        top: rect.top,
+        handle,
+      };
+      Object.assign(this.previewQuote, {
+        x: rect.left,
+        y: rect.top,
+        above: false,
+        dragged: true,
+        dragging: true,
+      });
+      try { handle.setPointerCapture(ev.pointerId); } catch (_) {}
+      if (ev.cancelable) ev.preventDefault();
+      return true;
+    },
+
+    movePreviewQuoteDrag(ev) {
+      const drag = this._previewQuoteDrag;
+      if (!drag || !ev || ev.pointerId !== drag.pointerId) return false;
+      const popover = this._previewQuoteElement();
+      if (!popover) return false;
+      const rect = popover.getBoundingClientRect();
+      const next = this._clampPreviewQuotePosition(
+        drag.left + ev.clientX - drag.startX,
+        drag.top + ev.clientY - drag.startY,
+        rect.width,
+        rect.height,
+      );
+      this.previewQuote.x = next.x;
+      this.previewQuote.y = next.y;
+      if (ev.cancelable) ev.preventDefault();
+      return true;
+    },
+
+    finishPreviewQuoteDrag(ev) {
+      const drag = this._previewQuoteDrag;
+      if (!drag || (ev && ev.pointerId != null
+          && ev.pointerId !== drag.pointerId)) return false;
+      this._previewQuoteDrag = null;
+      this.previewQuote.dragging = false;
+      try {
+        if (drag.handle && drag.handle.hasPointerCapture
+            && drag.handle.hasPointerCapture(drag.pointerId)) {
+          drag.handle.releasePointerCapture(drag.pointerId);
+        }
+      } catch (_) {}
+      this._constrainPreviewQuoteToViewport();
+      if (ev && ev.cancelable) ev.preventDefault();
+      return true;
+    },
+
+    _cancelPreviewQuoteDrag() {
+      const drag = this._previewQuoteDrag;
+      this._previewQuoteDrag = null;
+      if (drag && drag.handle) {
+        try {
+          if (drag.handle.hasPointerCapture
+              && drag.handle.hasPointerCapture(drag.pointerId)) {
+            drag.handle.releasePointerCapture(drag.pointerId);
+          }
+        } catch (_) {}
+      }
+      this.previewQuote.dragging = false;
+    },
+
+    startPreviewQuoteResize(ev, edge) {
+      if (!ev || !this._previewQuoteDesktop()
+          || !this.previewQuote.show || this.previewQuote.mode !== "ask"
+          || (ev.button != null && ev.button !== 0) || ev.isPrimary === false
+          || !/^(n|ne|e|se|s|sw|w|nw)$/.test(edge)) return false;
+      const popover = this._previewQuoteElement();
+      if (!popover) return false;
+      this._cancelPreviewQuoteDrag();
+      const rect = popover.getBoundingClientRect();
+      const handle = ev.currentTarget;
+      this._previewQuoteResize = {
+        pointerId: ev.pointerId,
+        edge,
+        startX: ev.clientX,
+        startY: ev.clientY,
+        left: rect.left,
+        top: rect.top,
+        right: rect.right,
+        bottom: rect.bottom,
+        handle,
+      };
+      Object.assign(this.previewQuote, {
+        x: rect.left,
+        y: rect.top,
+        width: rect.width,
+        height: rect.height,
+        above: false,
+        dragged: true,
+      });
+      try { handle.setPointerCapture(ev.pointerId); } catch (_) {}
+      if (ev.cancelable) ev.preventDefault();
+      return true;
+    },
+
+    movePreviewQuoteResize(ev) {
+      const resize = this._previewQuoteResize;
+      if (!resize || !ev || ev.pointerId !== resize.pointerId) return false;
+      const viewport = this._previewQuoteViewport();
+      const margin = 12;
+      const minWidth = Math.min(360, Math.max(1, viewport.width - margin * 2));
+      const minHeight = Math.min(260, Math.max(1, viewport.height - margin * 2));
+      const dx = ev.clientX - resize.startX;
+      const dy = ev.clientY - resize.startY;
+      let left = resize.left;
+      let right = resize.right;
+      let top = resize.top;
+      let bottom = resize.bottom;
+      if (resize.edge.includes("w")) {
+        left = Math.min(resize.right - minWidth,
+          Math.max(viewport.left + margin, resize.left + dx));
+      }
+      if (resize.edge.includes("e")) {
+        right = Math.max(resize.left + minWidth,
+          Math.min(viewport.left + viewport.width - margin, resize.right + dx));
+      }
+      if (resize.edge.includes("n")) {
+        top = Math.min(resize.bottom - minHeight,
+          Math.max(viewport.top + margin, resize.top + dy));
+      }
+      if (resize.edge.includes("s")) {
+        bottom = Math.max(resize.top + minHeight,
+          Math.min(viewport.top + viewport.height - margin, resize.bottom + dy));
+      }
+      Object.assign(this.previewQuote, {
+        x: left,
+        y: top,
+        width: right - left,
+        height: bottom - top,
+      });
+      if (ev.cancelable) ev.preventDefault();
+      return true;
+    },
+
+    finishPreviewQuoteResize(ev) {
+      const resize = this._previewQuoteResize;
+      if (!resize || (ev && ev.pointerId != null
+          && ev.pointerId !== resize.pointerId)) return false;
+      this._previewQuoteResize = null;
+      try {
+        if (resize.handle && resize.handle.hasPointerCapture
+            && resize.handle.hasPointerCapture(resize.pointerId)) {
+          resize.handle.releasePointerCapture(resize.pointerId);
+        }
+      } catch (_) {}
+      this._constrainPreviewQuoteToViewport();
+      this._savePreviewQuoteDesktopSize();
+      if (ev && ev.cancelable) ev.preventDefault();
+      return true;
+    },
+
+    _cancelPreviewQuoteResize() {
+      const resize = this._previewQuoteResize;
+      this._previewQuoteResize = null;
+      if (!resize || !resize.handle) return;
+      try {
+        if (resize.handle.hasPointerCapture
+            && resize.handle.hasPointerCapture(resize.pointerId)) {
+          resize.handle.releasePointerCapture(resize.pointerId);
+        }
+      } catch (_) {}
+    },
+
+    _previewSelectionHost(node) {
+      if (!node || this.previewSurface !== "file" || !this.selected) return null;
+      const body = this.$refs.previewBody;
+      const el = node.nodeType === 1 ? node : node.parentElement;
+      if (!body || !el || !body.contains(el) || !el.closest) return null;
+      const host = el.closest(".markdown, pre.text, .xlsx-preview");
+      if (!host || !body.contains(host) || !host.getClientRects().length) return null;
+      if (this.editing) {
+        return host.matches(".markdown") && !!host.closest(".editor-live-preview")
+          ? host : null;
+      }
+      if (host.closest(".editor-wrap")) return null;
+      if (this.previewMode === "md" && host.matches(".markdown")) return host;
+      if (this.previewMode === "text" && host.matches("pre.text")) return host;
+      if (this.previewMode === "csv" && host.matches(".csv-preview")) return host;
+      if (this.previewMode === "xlsx" && host.matches(".xlsx-preview")
+          && !host.matches(".csv-preview")) return host;
+      return null;
+    },
+
+    _chatSelectionHost(node) {
+      if (!node || !this.currentId) return null;
+      const body = this._chatBodyElement();
+      const el = node.nodeType === 1 ? node : node.parentElement;
+      if (!body || !el || !body.contains(el) || !el.closest) return null;
+      if (el.closest("textarea, input, button, [contenteditable='true'], .edit-msg-wrap")) {
+        return null;
+      }
+      const pane = el.closest(".msg-pane[data-tid]");
+      if (!pane || pane.dataset.tid !== this.currentId || !body.contains(pane)
+          || !pane.getClientRects().length) return null;
+      const message = el.closest(".msg");
+      const bubble = el.closest(".bubble");
+      if (!message || !bubble || !message.contains(bubble)
+          || message.classList.contains("is-hidden") || !bubble.getClientRects().length) {
+        return null;
+      }
+      if (message.classList.contains("user")) {
+        const text = el.closest(".user-msg-text");
+        return text && bubble.classList.contains("user-bubble")
+          ? { host: bubble, role: "user", messageId: message.dataset.uuid || "" }
+          : null;
+      }
+      if (message.classList.contains("assistant")) {
+        return {
+          host: bubble,
+          role: "assistant",
+          messageId: message.dataset.uuid || "",
+        };
+      }
+      return null;
+    },
+
+    _syncPreviewSelection() {
+      if (this.previewQuote.show && this.previewQuote.mode === "ask") return;
+      const selection = window.getSelection && window.getSelection();
+      if (!selection || selection.isCollapsed || !selection.rangeCount) {
+        this.dismissPreviewQuote(false);
+        return;
+      }
+      const previewAnchor = this._previewSelectionHost(selection.anchorNode);
+      const previewFocus = this._previewSelectionHost(selection.focusNode);
+      const chatAnchor = previewAnchor ? null : this._chatSelectionHost(selection.anchorNode);
+      const chatFocus = previewAnchor ? null : this._chatSelectionHost(selection.focusNode);
+      let source = "";
+      let role = "";
+      let messageId = "";
+      if (previewAnchor && previewAnchor === previewFocus) {
+        source = "preview";
+      } else if (chatAnchor && chatFocus && chatAnchor.host === chatFocus.host
+                 && chatAnchor.role === chatFocus.role) {
+        source = "chat";
+        role = chatAnchor.role;
+        messageId = chatAnchor.messageId || "";
+      } else {
+        this.dismissPreviewQuote(false);
+        return;
+      }
+      let selectedText = String(selection.toString() || "")
+        .replace(/\u00a0/g, " ")
+        .replace(/\r\n?/g, "\n")
+        .trim();
+      if (!selectedText) {
+        this.dismissPreviewQuote(false);
+        return;
+      }
+      const truncated = selectedText.length > this.PREVIEW_QUOTE_MAX_CHARS;
+      if (truncated) {
+        selectedText = selectedText.slice(0, this.PREVIEW_QUOTE_MAX_CHARS).trimEnd();
+      }
+      const range = selection.getRangeAt(0);
+      const rects = Array.from(range.getClientRects()).filter(r => r.width || r.height);
+      const rect = rects[rects.length - 1] || range.getBoundingClientRect();
+      if (!rect || (!rect.width && !rect.height)) {
+        this.dismissPreviewQuote(false);
+        return;
+      }
+      const viewportWidth = Math.max(1, window.innerWidth || 0);
+      const viewportHeight = Math.max(1, window.innerHeight || 0);
+      const popoverHalf = Math.min(170, Math.max(70, (viewportWidth - 24) / 2));
+      const above = viewportHeight - rect.bottom < 220 && rect.top > 220;
+      Object.assign(this.previewQuote, {
+        show: true,
+        mode: "actions",
+        source,
+        role,
+        sessionId: this.currentId,
+        messageId,
+        text: selectedText,
+        path: source === "preview" ? this.selected : "",
+        question: "",
+        followup: "",
+        x: Math.min(viewportWidth - popoverHalf - 12,
+          Math.max(popoverHalf + 12, rect.left + rect.width / 2)),
+        y: above ? rect.top : rect.bottom,
+        above,
+        truncated,
+        sending: false,
+        askSessionId: "",
+        askSessionName: "",
+        askPrompt: "",
+        askError: "",
+        askAutoScroll: true,
+        dragged: false,
+        dragging: false,
+      });
+    },
+
+    dismissTransientPreviewQuote(clearSelection = false) {
+      // The tiny selection-actions bubble is contextual and should disappear
+      // when its selection loses ownership. Once expanded into an independent
+      // question, however, it is a real floating window: page clicks, file or
+      // chat switches, scrolling and editor changes must not close it. Only
+      // its close button, Escape, or "open full chat" dismisses that state.
+      if (!this.previewQuote.show || this.previewQuote.mode === "ask") {
+        return false;
+      }
+      this.dismissPreviewQuote(clearSelection);
+      return true;
+    },
+
+    dismissPreviewQuote(clearSelection = false) {
+      clearTimeout(this._previewSelectionTimer);
+      this._previewSelectionTimer = null;
+      this._cancelPreviewQuoteDrag();
+      this._cancelPreviewQuoteResize();
+      Object.assign(this.previewQuote, {
+        show: false, mode: "actions", source: "", role: "", sessionId: "",
+        messageId: "", text: "", path: "", question: "", followup: "",
+        x: 0, y: 0, above: false, truncated: false, sending: false,
+        dragged: false, dragging: false, askSessionId: "",
+        askSessionName: "", askPrompt: "", askError: "", askAutoScroll: true,
+      });
+      if (clearSelection) {
+        try {
+          const selection = window.getSelection && window.getSelection();
+          if (selection) selection.removeAllRanges();
+        } catch (_) {}
+      }
+    },
+
+    _previewQuoteBlock(snapshot = this.previewQuote) {
+      const quote = String(snapshot.text || "")
+        .split("\n")
+        .map(line => "> " + line)
+        .join("\n");
+      const clipped = snapshot.truncated
+        ? (this.lang === "zh" ? "\n> …（选区过长，已截断）" : "\n> … (selection truncated)")
+        : "";
+      if (snapshot.source === "chat") {
+        const mine = snapshot.role === "user";
+        const label = this.lang === "zh"
+          ? (mine ? "引用自我的消息：" : "引用自 Muse 回复：")
+          : (mine ? "Quoted from my message:" : "Quoted from Muse:");
+        return `${label}\n\n${quote}${clipped}`;
+      }
+      const sourcePath = String(snapshot.path || this.selected || "")
+        .replace(/`/g, "\\`");
+      const label = this.lang === "zh" ? "引用自" : "Quoted from";
+      const colon = this.lang === "zh" ? "：" : ":";
+      return `${label} \`${sourcePath}\`${colon}\n\n${quote}${clipped}`;
+    },
+
+    previewQuoteExcerpt(snapshot = this.previewQuote) {
+      const text = String((snapshot && snapshot.text) || "")
+        .replace(/\s+/g, " ").trim();
+      return text.length > 120 ? text.slice(0, 120).trimEnd() + "…" : text;
+    },
+
+    previewQuoteSourceName(snapshot = this.previewQuote) {
+      if (snapshot && snapshot.source === "chat") {
+        if (snapshot.role === "user") {
+          return this.lang === "zh" ? "我的消息" : "My message";
+        }
+        return this.lang === "zh" ? "Muse 回复" : "Muse reply";
+      }
+      const path = String((snapshot && snapshot.path) || "");
+      return path.split("/").pop() || path;
+    },
+
+    previewQuoteSourceIcon(snapshot = this.previewQuote) {
+      if (snapshot && snapshot.source === "chat") {
+        return snapshot.role === "user" ? "#i-user" : "#i-brain";
+      }
+      return "#i-file-text";
+    },
+
+    _selectionQuoteSnapshot(snapshot = this.previewQuote) {
+      return {
+        id: this._uuid(),
+        source: snapshot.source || "preview",
+        role: snapshot.role || "",
+        sessionId: snapshot.sessionId || this.currentId || "",
+        messageId: snapshot.messageId || "",
+        path: snapshot.path || "",
+        text: snapshot.text || "",
+        truncated: !!snapshot.truncated,
+      };
+    },
+
+    _composerPromptText(input, quotes) {
+      const blocks = (quotes || [])
+        .filter(q => q && String(q.text || "").trim())
+        .map(q => this._previewQuoteBlock(q));
+      const body = String(input || "").trim();
+      if (body) blocks.push(body);
+      return blocks.join("\n\n").trim();
+    },
+
+    userSelectionQuotes(message) {
+      return Array.isArray(message && message.selectionQuotes)
+        ? message.selectionQuotes : [];
+    },
+
+    userVisibleText(message) {
+      if (!message) return "";
+      return Object.prototype.hasOwnProperty.call(message, "displayText")
+        ? (message.displayText || "") : (message.text || "");
+    },
+
+    activatePreviewSelectionAction(ev, action) {
+      // iOS Safari can suppress the synthetic click when pointerdown is
+      // preventDefault()'d to preserve a native text selection. Execute real
+      // pointer activation on pointerdown instead, and reserve click for
+      // keyboard／assistive-technology activation（detail === 0）. Ignoring the
+      // later pointer-generated click also prevents a detached button from
+      // running the action twice after the popover has already closed.
+      const pointerDown = ev && ev.type === "pointerdown"
+        && (ev.button == null || ev.button === 0);
+      const keyboardClick = ev && ev.type === "click" && ev.detail === 0;
+      if (!pointerDown && !keyboardClick) return false;
+      if (ev.preventDefault) ev.preventDefault();
+      if (ev.stopPropagation) ev.stopPropagation();
+      if (action === "quote") return this.quotePreviewSelection();
+      if (action === "ask") {
+        this.openPreviewSelectionAsk();
+        return true;
+      }
+      return false;
+    },
+
+    quotePreviewSelection() {
+      if (!this.currentId || !this.previewQuote.show || !this.previewQuote.text) {
+        this.toast(this.lang === "zh" ? "请先打开一个会话" : "Open a chat first", "warn", 2200);
+        return false;
+      }
+      this._captureComposerState(this.currentId);
+      const draft = this._ensureTabState(this.currentId).draft;
+      if (draft.pendingQuotes.length >= 4) {
+        this.toast(
+          this.lang === "zh" ? "一次最多引用 4 段内容" : "Up to 4 quotes per message",
+          "warn", 2200,
+        );
+        return false;
+      }
+      draft.pendingQuotes.push(this._selectionQuoteSnapshot());
+      this.pendingQuotes = draft.pendingQuotes;
+      this.dismissPreviewQuote(true);
+      if (this._isMobileLayout()) this.setMobileTab("chat");
+      this.$nextTick(() => {
+        // Do not let this delayed convenience-focus steal a newer selection.
+        // A fast user (or a busy renderer) can begin selecting another bubble
+        // before Alpine reaches this tick; focusing the textarea would then
+        // collapse that fresh range and the selection actions never appear.
+        const selection = window.getSelection && window.getSelection();
+        if (selection && selection.rangeCount && !selection.isCollapsed) return;
+        const ta = this.$refs.chatInput;
+        if (ta) ta.focus();
+      });
+      return true;
+    },
+
+    removePendingQuote(index) {
+      if (!Number.isInteger(index) || index < 0) return;
+      this.pendingQuotes.splice(index, 1);
+    },
+
+    openPreviewSelectionAsk() {
+      if (!this.previewQuote.show || !this.previewQuote.text) return;
+      this._cancelPreviewQuoteDrag();
+      this._cancelPreviewQuoteResize();
+      this.previewQuote.mode = "ask";
+      this.previewQuote.dragged = false;
+      this.previewQuote.question = "";
+      this.previewQuote.followup = "";
+      this.previewQuote.askSessionId = "";
+      this.previewQuote.askSessionName = "";
+      this.previewQuote.askPrompt = "";
+      this.previewQuote.askError = "";
+      this.previewQuote.askAutoScroll = true;
+      this.$nextTick(() => {
+        this._preparePreviewQuoteDesktopWindow();
+        // x-ref inside an x-if template is not guaranteed to join Alpine's
+        // root $refs collection on the same tick in every browser build.
+        const input = this.$refs.previewQuoteInput
+          || document.querySelector(".preview-selection-popover .preview-selection-ask textarea");
+        if (input) input.focus();
+      });
+    },
+
+    onPreviewQuoteAskEnter(ev) {
+      if (!ev || this._consumeRecentImeCommitEnter(ev)
+          || this._isImeComposingEvent(ev)) return;
+      const isTouch = (window.matchMedia
+        && window.matchMedia("(pointer: coarse)").matches) || window.innerWidth < 768;
+      if (isTouch || ev.shiftKey || ev.ctrlKey || ev.metaKey) return;
+      ev.preventDefault();
+      ev.stopPropagation();
+      this.sendPreviewSelectionQuestion();
+    },
+
+    async _createPreviewSelectionAskSession(snapshot, question) {
+      const sourceId = snapshot.sessionId || this.currentId;
+      const source = (this.sessions || []).find(s => s.id === sourceId);
+      const fallbackName = this.lang === "zh" ? "独立侧问" : "Side question";
+      const sourceName = (source && source.name) || (this.lang === "zh" ? "会话" : "Chat");
+      const questionHint = String(question || "").replace(/\s+/g, " ").trim().slice(0, 36);
+      const title = `${sourceName} · ${fallbackName}${questionHint ? `：${questionHint}` : ""}`;
+      const headers = { ...this.hdr(), "Content-Type": "application/json" };
+      let payload = null;
+      let forked = false;
+
+      // Prefer a real point-in-time fork so the side question inherits the
+      // conversation's useful context. A streaming/empty source cannot be
+      // forked safely; in that case fall back to an isolated session whose
+      // prompt still carries the selected text explicitly.
+      if (sourceId && source && !this.isTabStreaming(sourceId)) {
+        const response = await fetch(
+          `/api/chat/sessions/${encodeURIComponent(sourceId)}/fork`,
+          {
+            method: "POST",
+            headers,
+            body: JSON.stringify({
+              up_to_message_id: snapshot.source === "chat"
+                ? (snapshot.messageId || null) : null,
+              title,
+              activity_hidden: true,
+              runtime_profile: "side_question",
+            }),
+          },
+        );
+        if (response.ok) {
+          payload = await response.json();
+          forked = true;
+        } else if (![400, 404, 409].includes(response.status)) {
+          throw new Error(`selection fork ${response.status}`);
+        }
+      }
+
+      if (!payload) {
+        const response = await fetch("/api/chat/sessions", {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            name: title,
+            model: (source && source.model) || this.model || "",
+            permission: "default",
+            cwd: (source && source.cwd) || this.currentWorkspacePath(),
+            open_ids: this.openTabIds || [],
+            activity_hidden: true,
+            runtime_profile: "side_question",
+          }),
+        });
+        if (!response.ok) throw new Error(`selection session ${response.status}`);
+        payload = await response.json();
+      }
+
+      const id = payload.id || payload.session_id;
+      if (!id) throw new Error("selection session missing id");
+      const meta = {
+        ...payload,
+        id,
+        name: payload.name || title,
+        active: false,
+        cwd: payload.cwd || (source && source.cwd) || this.currentWorkspacePath(),
+        _selectionAsk: true,
+        _selectionAskForked: forked,
+        activity_hidden: true,
+        runtime_profile: "side_question",
+      };
+      this.sessions = [meta, ...this.sessions.filter(s => s.id !== id)];
+      this._sessionsEtag = "";
+      const state = this._ensureTabState(id);
+      // The compact panel only needs this branch-local turn. Canonical
+      // reconciliation may later hydrate inherited fork history in-place.
+      state._loaded = true;
+      state.permission = "default";
+      state.effort = this._normalizeEffort(meta.effort);
+      state.serviceTier = this._normalizeServiceTier(meta.service_tier);
+      return meta;
+    },
+
+    previewSelectionAskMessages() {
+      const sid = this.previewQuote.askSessionId;
+      const state = sid && this.tabState && this.tabState[sid];
+      const messages = state ? state.messages : [];
+      if (!messages.length) return [];
+      const expected = this.previewQuote.askPrompt || "";
+      let userIndex = -1;
+      for (let i = messages.length - 1; i >= 0; i--) {
+        if (messages[i] && messages[i].role === "user"
+            && (!expected || messages[i].text === expected)) {
+          userIndex = i;
+          break;
+        }
+      }
+      // Keep the branch-local user turns as well as assistant replies so the
+      // floating window can behave like a compact multi-turn conversation.
+      // Inherited fork history stays before the exact first side-question
+      // prompt and is therefore intentionally excluded.
+      return messages.slice(Math.max(0, userIndex));
+    },
+
+    previewSelectionAskConversation() {
+      return this.previewSelectionAskMessages().filter(message => (
+        message && message.text
+        && (message.role === "user" || message.role === "assistant")
+      ));
+    },
+
+    previewSelectionAskUserText(message) {
+      if (!message) return "";
+      if (message.text === this.previewQuote.askPrompt) {
+        return this.previewQuote.question || "";
+      }
+      return this.userVisibleText(message);
+    },
+
+    previewSelectionAskMessageHtml(message) {
+      const text = String((message && message.text) || "").trim();
+      return text ? this.mdRender(text) : "";
+    },
+
+    previewSelectionAskText() {
+      return this.previewSelectionAskMessages()
+        .filter(m => m && m.role === "assistant" && m.text)
+        .map(m => m.text)
+        .join("\n\n")
+        .trim();
+    },
+
+    previewSelectionAskHtml(message = null) {
+      const text = message ? String(message.text || "").trim()
+        : this.previewSelectionAskText();
+      return text ? this.mdRender(text) : "";
+    },
+
+    previewSelectionAskSearching() {
+      if (!this.previewSelectionAskRunning()) return false;
+      const messages = this.previewSelectionAskMessages();
+      let lastUser = -1;
+      for (let i = messages.length - 1; i >= 0; i--) {
+        if (messages[i] && messages[i].role === "user") {
+          lastUser = i;
+          break;
+        }
+      }
+      return messages.slice(lastUser + 1).some(message => (
+        message && message.role === "tool_use"
+        && (message.name === "WebSearch" || message.name === "WebFetch")
+      ));
+    },
+
+    onPreviewSelectionAskScroll(ev) {
+      const el = ev && ev.currentTarget;
+      if (!el) return;
+      this.previewQuote.askAutoScroll = (
+        el.scrollHeight - el.scrollTop - el.clientHeight < 48
+      );
+    },
+
+    scrollPreviewSelectionAskConversation(force = false) {
+      if (!force && !this.previewQuote.askAutoScroll) return false;
+      const el = document.querySelector(
+        ".preview-selection-popover .preview-selection-conversation",
+      );
+      if (!el || !el.getClientRects().length) return false;
+      el.scrollTop = el.scrollHeight;
+      return true;
+    },
+
+    previewSelectionAskRunning() {
+      const sid = this.previewQuote.askSessionId;
+      const state = sid && this.tabState && this.tabState[sid];
+      return !!(this.previewQuote.sending
+        || (state && (state.streaming || state.backgroundActive)));
+    },
+
+    previewSelectionAskFailed() {
+      const sid = this.previewQuote.askSessionId;
+      const state = sid && this.tabState && this.tabState[sid];
+      if (!state) return false;
+      const messages = state.messages;
+      for (let i = messages.length - 1; i >= 0; i--) {
+        if (messages[i] && messages[i].role === "user") return !!messages[i]._failed;
+      }
+      return false;
+    },
+
+    async openPreviewSelectionAskSession() {
+      const sid = this.previewQuote.askSessionId;
+      if (!sid) return false;
+      const state = this.tabState && this.tabState[sid];
+      // Once the side turn is done, opening the branch should reveal its
+      // inherited history too. While streaming, retain the live object graph.
+      if (state && !state.streaming && !state.es) state._loaded = false;
+      this.dismissPreviewQuote(true);
+      await this.openTab(sid);
+      if (this._isMobileLayout()) this.setMobileTab("chat");
+      return true;
+    },
+
+    _previewSelectionAskPrompt(question, snapshot = null) {
+      const instruction = this.lang === "zh"
+        ? "这是一个独立侧问。请基于这个侧问分支已有的上下文回答。必要时可以使用 WebSearch 或 WebFetch 核实公开信息；不得调用其他工具或修改文件。搜索时不要把文件路径、凭证、私人信息或选中原文直接放入查询词或 URL，应先抽象成最少必要的公开关键词。"
+        : "This is an independent side question. Answer from the context already present in this side branch. You may use WebSearch or WebFetch when public information needs verification; do not use other tools or modify files. Never put file paths, credentials, private data, or the selected passage verbatim into a query or URL; reduce it to the minimum necessary public keywords first.";
+      const label = this.lang === "zh"
+        ? (snapshot ? "问题：" : "追问：")
+        : (snapshot ? "Question:" : "Follow-up:");
+      const parts = [];
+      if (snapshot) parts.push(this._previewQuoteBlock(snapshot));
+      parts.push(instruction, `${label}\n${question}`);
+      return parts.join("\n\n");
+    },
+
+    onPreviewQuoteFollowupEnter(ev) {
+      if (!ev || this._consumeRecentImeCommitEnter(ev)
+          || this._isImeComposingEvent(ev)) return;
+      const isTouch = (window.matchMedia
+        && window.matchMedia("(pointer: coarse)").matches) || window.innerWidth < 768;
+      if (isTouch || ev.shiftKey || ev.ctrlKey || ev.metaKey) return;
+      ev.preventDefault();
+      ev.stopPropagation();
+      this.sendPreviewSelectionFollowup();
+    },
+
+    async sendPreviewSelectionFollowup() {
+      const sid = this.previewQuote.askSessionId;
+      const question = String(this.previewQuote.followup || "").trim();
+      if (!sid || !question || this.previewSelectionAskRunning()
+          || this.workspaceSwitching) return false;
+      const prompt = this._previewSelectionAskPrompt(question);
+      this.previewQuote.sending = true;
+      this.previewQuote.askError = "";
+      this.previewQuote.askAutoScroll = true;
+      try {
+        const result = await this.send({
+          sessionId: sid,
+          detachedText: prompt,
+          detachedDisplayText: question,
+          permissionMode: "default",
+        });
+        if (result === false) {
+          this.previewQuote.askError = this.lang === "zh"
+            ? "追问发送失败，请重试"
+            : "Could not send the follow-up; please retry";
+          return false;
+        }
+        this.previewQuote.followup = "";
+        this.$nextTick(() => this.scrollPreviewSelectionAskConversation(true));
+        return true;
+      } catch (_) {
+        this.previewQuote.askError = this.lang === "zh"
+          ? "追问发送失败，请重试"
+          : "Could not send the follow-up; please retry";
+        return false;
+      } finally {
+        this.previewQuote.sending = false;
+      }
+    },
+
+    async sendPreviewSelectionQuestion() {
+      if (!this.previewQuote.show || this.previewQuote.mode !== "ask"
+          || this.previewQuote.sending) return false;
+      const question = String(this.previewQuote.question || "").trim();
+      if (!question) return false;
+      if (!this.currentId) {
+        this.toast(this.lang === "zh" ? "请先打开一个会话" : "Open a chat first", "warn", 2200);
+        return false;
+      }
+      if (!this.availableModels || !this.availableModels.length) {
+        this.toast(this.lang === "zh" ? "请先在设置里配置一个模型" : "Configure a model in Settings first", "warn", 3000);
+        this.openSettings();
+        return false;
+      }
+      if (this.workspaceSwitching) return false;
+      const snapshot = {
+        source: this.previewQuote.source,
+        role: this.previewQuote.role,
+        sessionId: this.previewQuote.sessionId,
+        messageId: this.previewQuote.messageId,
+        path: this.previewQuote.path,
+        text: this.previewQuote.text,
+        truncated: this.previewQuote.truncated,
+      };
+      const prompt = this._previewSelectionAskPrompt(question, snapshot);
+      this.previewQuote.sending = true;
+      this.previewQuote.askError = "";
+      try {
+        const target = await this._createPreviewSelectionAskSession(snapshot, question);
+        this.previewQuote.askSessionId = target.id;
+        this.previewQuote.askSessionName = target.name || "";
+        this.previewQuote.askPrompt = prompt;
+        const result = await this.send({
+          sessionId: target.id,
+          detachedText: prompt,
+          detachedDisplayText: question,
+          permissionMode: "default",
+        });
+        if (result === false) {
+          this.previewQuote.askError = this.lang === "zh"
+            ? "侧问未能启动，可打开会话后重试"
+            : "Could not start the side question; open the chat to retry";
+          return false;
+        }
+        return true;
+      } catch (_) {
+        this.previewQuote.askError = this.lang === "zh"
+          ? "创建独立侧问失败，请重试"
+          : "Could not create the side question; please retry";
+        this.toast(this.previewQuote.askError, "error", 3000);
+        return false;
+      } finally {
+        this.previewQuote.sending = false;
+      }
+    },
+
     // A11y: mirror every button's `title` attribute into `aria-label` so
     // screen readers announce the localized tooltip text. Alpine renders
     // ~170 buttons across the app, the vast majority already have a
@@ -18242,10 +25589,12 @@ function portal() {
       if (ready()) return Promise.resolve();
       if (this[key]) return this[key];
       const clearOnFail = (err) => { this[key] = null; return Promise.reject(err); };
-      const loadOne = (src) => new Promise((resolve, reject) => {
+      const loadOne = (path) => new Promise((resolve, reject) => {
+        const isCss = path.split(/[?#]/, 1)[0].endsWith(".css");
+        const src = this._staticAssetUrl(path);
         // Already in the DOM (e.g. from a previous lazy-load attempt)? Wait
         // for ready(); don't re-inject the tag.
-        const sel = src.endsWith(".css")
+        const sel = isCss
           ? `link[href="${src}"]`
           : `script[src="${src}"]`;
         if (document.querySelector(sel)) {
@@ -18258,7 +25607,7 @@ function portal() {
           })();
           return;
         }
-        if (src.endsWith(".css")) {
+        if (isCss) {
           const l = document.createElement("link");
           l.rel = "stylesheet"; l.href = src;
           l.onload = resolve; l.onerror = () => reject(new Error("load failed: " + src));
@@ -18298,7 +25647,15 @@ function portal() {
     // never competes with the initial app render. Each step is fire-and-forget
     // and swallows errors — the on-demand lazy loaders remain the fallback.
     _prewarmPreviewLibs() {
-      if (this._previewLibsPrewarmed) return;
+      if (this._previewLibsPrewarmed || !this.appReady) return;
+      // Hidden tabs, data-saver and genuinely slow cellular links should keep
+      // bandwidth and parse budget for user-requested work. On-demand loaders
+      // remain available when the user actually opens rich preview content.
+      if (typeof document !== "undefined" && document.hidden) return;
+      const connection = typeof navigator !== "undefined"
+        ? navigator.connection : null;
+      if (connection && (connection.saveData
+          || ["slow-2g", "2g"].includes(connection.effectiveType))) return;
       this._previewLibsPrewarmed = true;
       // Each job below injects + parses a heavy vendor bundle on the main
       // thread. Firing them all inside ONE idle slice re-creates the freeze
@@ -18341,8 +25698,13 @@ function portal() {
       const drain = () => {
         const job = queue.shift();
         if (!job) return;
-        Promise.resolve().then(job).catch(() => {});
-        if (queue.length) idle(drain);
+        // Do not schedule the next heavy parse until this job has settled.
+        // One idle callback per item alone is not enough: requestIdleCallback
+        // may run again while the previous asset is still downloading or
+        // evaluating, clustering hljs and KaTeX work on the main thread.
+        Promise.resolve().then(job).catch(() => {}).finally(() => {
+          if (queue.length) idle(drain);
+        });
       };
       idle(drain);
     },
@@ -18350,7 +25712,8 @@ function portal() {
     async _loadHljs() {
       if (window.hljs) return;
       if (this._hljsLoadPromise) return this._hljsLoadPromise;
-      const inject = (src) => new Promise((resolve, reject) => {
+      const inject = (path) => new Promise((resolve, reject) => {
+        const src = this._staticAssetUrl(path);
         if (document.querySelector(`script[src="${src}"]`)) {
           // Already in DOM — just wait for window.hljs to materialize.
           const t0 = Date.now();
@@ -18402,20 +25765,22 @@ function portal() {
       if (window.CodeMirror) return;
       if (this._cmLoadPromise) return this._cmLoadPromise;
       // Inject one asset (css/js), de-duping against an already-present tag.
-      const inject = (src) => new Promise((resolve, reject) => {
-        const sel = src.endsWith(".css")
+      const inject = (path) => new Promise((resolve, reject) => {
+        const isCss = path.split(/[?#]/, 1)[0].endsWith(".css");
+        const src = this._staticAssetUrl(path);
+        const sel = isCss
           ? `link[href="${src}"]` : `script[src="${src}"]`;
         if (document.querySelector(sel)) {
           // Already in flight/loaded from a prior attempt — give it a beat.
           const t0 = Date.now();
           (function wait() {
-            if (src.endsWith(".css") || window.CodeMirror) return resolve();
+            if (isCss || window.CodeMirror) return resolve();
             if (Date.now() - t0 > 5000) return resolve(); // don't hang the chain
             setTimeout(wait, 50);
           })();
           return;
         }
-        const node = src.endsWith(".css")
+        const node = isCss
           ? Object.assign(document.createElement("link"), { rel: "stylesheet", href: src })
           : Object.assign(document.createElement("script"), { src });
         node.onload = resolve;
@@ -18474,7 +25839,7 @@ function portal() {
       };
       this._mermaidLoadPromise = new Promise((resolve, reject) => {
         const s = document.createElement("script");
-        s.src = "/static/vendor/mermaid.min.js";
+        s.src = this._staticAssetUrl("/static/vendor/mermaid.min.js");
         s.onload = () => {
           try {
             // securityLevel: "strict" disables foreign HTML in labels,
@@ -18791,7 +26156,7 @@ function portal() {
     },
     async onSearchClick(n) {
       if (n.is_dir) { this.clearSearch(); await this.expandPath(n.path); }
-      else { await this.openFile(n); }
+      else { await this.openFile(n, { reveal: true }); }
     },
     async expandPath(path) {
       const parts = path.split("/");
@@ -18804,6 +26169,37 @@ function portal() {
     },
 
     // ===== upload / drag-drop / mkdir =====
+    _externalFileDropTarget(target) {
+      const el = target && target.nodeType === 1
+        ? target
+        : (target && target.parentElement);
+      const row = el && el.closest
+        ? el.closest(".filelist li.dir[data-path]")
+        : null;
+      return {
+        dir: row ? String(row.dataset.path || "") : "",
+        explicitDirectory: !!row,
+      };
+    },
+    _setOsFileDropTarget(target) {
+      const drop = this._externalFileDropTarget(target);
+      this.osFileDragging = true;
+      this.osFileDropDir = drop.dir;
+      this.osFileDropOnDirectory = drop.explicitDirectory;
+      this.dragOver = drop.explicitDirectory ? drop.dir : "";
+      this.dragOverRoot = !drop.explicitDirectory;
+      return drop;
+    },
+    _resetOsFileDragState() {
+      this._dragCounter = 0;
+      this.osFileDragging = false;
+      this.osFileDropDir = "";
+      this.osFileDropOnDirectory = false;
+      this.dragOver = "";
+      this.dragOverRoot = false;
+      this.previewDragHover = false;
+      this.dragHover = false;
+    },
     async upload(ev) {
       // Multi-file picker: upload all selected files in parallel to the
       // workspace root and refresh the tree ONCE, mirroring onPreviewDrop.
@@ -18998,6 +26394,17 @@ function portal() {
       this._lpStart = null;
     },
     onTreeNodeDragOver(ev, n) {
+      const types = Array.from(ev.dataTransfer?.types || []);
+      if (types.includes("Files")
+          && !types.includes(this._DRAG_MIME_INTERNAL)) {
+        // External files are deliberately stricter than tree moves: only a
+        // directory row is an explicit nested destination.  A file row is
+        // just another part of the window and therefore means workspace root.
+        this.dragOver = n.is_dir ? n.path : "";
+        this.dragOverRoot = !n.is_dir;
+        ev.dataTransfer.dropEffect = "copy";
+        return;
+      }
       // Target dir = the node itself when it's a folder, or its parent
       // directory when it's a file. Dropping onto a file lands the
       // item next to that file (matches Finder / VSCode behavior).
@@ -19044,10 +26451,11 @@ function portal() {
         return;
       }
 
-      // OS file upload — dropping onto a file uploads into that file's
-      // parent dir (same dir-resolution as internal moves).
+      // OS file upload — only a directory row is a nested target. Dropping on
+      // a file row follows the app-wide default and uploads to workspace root.
       const files = Array.from(ev.dataTransfer?.files || []);
-      await this._uploadFilesToDir(targetDir, files);
+      this._resetOsFileDragState();
+      await this._uploadFilesToDir(n.is_dir ? n.path : "", files);
     },
     // Parallel-upload a set of OS files into `targetDir` (empty string =
     // workspace root), then refresh the tree once and surface a single
@@ -19122,6 +26530,7 @@ function portal() {
       }
       // OS file upload → workspace root.
       const files = Array.from(ev.dataTransfer?.files || []);
+      this._resetOsFileDragState();
       await this._uploadFilesToDir("", files);
     },
     async moveTreeItem(srcPath, targetDir) {
@@ -19438,16 +26847,9 @@ function portal() {
       return EDITABLE_EXT.has(ext);
     },
 
-    // Files-pane visibility toggle wired to the preview-pane header's chevron
-    // button. Special-cased for fullscreen: when the preview pane is in
-    // desktop-fullscreen mode (this.desktopFullPane === "preview"), the files
-    // pane is already hidden by the fullscreen layout CSS — so tapping the
-    // chevron in that state should EXIT fullscreen (not just flip a flag
-    // that does nothing visible). We also force leftOpen=true on the exit
-    // path so the user lands on a layout where the files pane IS visible,
-    // matching the affordance the chevron just promised them.
-    // 2026-05-28 user request: "全屏预览模式下，点击 隐藏文件区按钮，
-    // 应该要自动退出全屏预览".
+    // Files visibility toggle in the center chat header. In chat fullscreen
+    // the side rail is already hidden by CSS, so the chevron exits focus mode
+    // and explicitly restores Files instead of flipping an invisible flag.
     toggleFilesPane() {
       if (this.desktopFullPane) {
         this.desktopFullPane = "";
@@ -19459,21 +26861,15 @@ function portal() {
       this.savePrefs();
     },
 
-    // Chat (Muse) pane visibility toggle, wired to the preview-pane header's
-    // right-hand chevron. Mirrors toggleFilesPane's fullscreen special-case:
-    // when the preview pane is fullscreen (desktopFullPane === "preview") the
-    // Muse pane is already hidden by the fullscreen layout, so tapping
-    // "hide Muse" would flip a flag that changes nothing visible. Instead we
-    // EXIT fullscreen and force the Muse pane open, landing the user on a
-    // layout where Muse IS visible — matching the affordance the button
-    // promises. 2026-05-29 user request: "预览区全屏的情况下，点击隐藏 Muse
-    // 按钮，应该自动退出全屏".
-    toggleChatPane() {
+    // Preview visibility toggle, wired to the center chat header's right-hand
+    // chevron. In either desktop fullscreen mode the side rail is already
+    // hidden, so the chevron exits fullscreen and explicitly restores preview.
+    togglePreviewPane() {
       if (this.desktopFullPane) {
         this.desktopFullPane = "";
-        this.rightOpen = true;
+        this.previewOpen = true;
       } else {
-        this.rightOpen = !this.rightOpen;
+        this.previewOpen = !this.previewOpen;
       }
       this.savePrefs();
     },
@@ -19481,7 +26877,7 @@ function portal() {
     layoutStyle() {
       // Desktop fullscreen on one pane — collapse to a single 1fr column
       // and let the CSS rule for [data-desktop-full="..."] handle hiding
-      // the others. Skips the persisted leftWidth/rightWidth so the
+      // the others. Skips the persisted leftWidth/previewWidth so the
       // chosen pane truly fills the viewport (no 280px ghost gutter).
       if (this.desktopFullPane) {
         return { gridTemplateColumns: "1fr" };
@@ -19496,7 +26892,7 @@ function portal() {
       const cols = [];
       if (this.leftOpen) cols.push(Math.min(this.leftWidth, maxW) + "px", "4px");
       cols.push("1fr");
-      if (this.rightOpen) cols.push("4px", Math.min(this.rightWidth, maxW) + "px");
+      if (this.previewOpen) cols.push("4px", Math.min(this.previewWidth, maxW) + "px");
       return { gridTemplateColumns: cols.join(" ") };
     },
     // Toggle desktop fullscreen for a pane. Click the same pane's
@@ -19515,16 +26911,13 @@ function portal() {
 
       const next = (this.desktopFullPane === pane) ? "" : pane;
       this.desktopFullPane = next;
-      // Force the target pane open — otherwise "fullscreen chat" with
-      // rightOpen=false would land on a blank screen (chat is hidden by
-      // `.pane-hidden` regardless of the data-desktop-full rules).
-      // Preview shares the center column so always rendered; only the
-      // chat side needs rightOpen forced. Skipped on exit (next === "")
-      // to preserve the user's prior leftOpen/rightOpen layout.
-      if (next === "chat") this.rightOpen = true;
+      // Force preview open when it is the target — `.pane-hidden` otherwise
+      // wins regardless of the fullscreen grid rule. Chat is always mounted in
+      // the center, so it needs no corresponding visibility flag.
+      if (next === "preview") this.previewOpen = true;
       // FIX ⑥ (2026-05-30 follow-up): persist the fullscreen state so a
       // refresh restores it. There's no $watch("desktopFullPane"), and the
-      // sibling exit paths (toggleFilesPane / toggleChatPane) already call
+      // sibling exit paths (toggleFilesPane / togglePreviewPane) already call
       // savePrefs — this entry/exit path was the one gap, so toggling
       // fullscreen via the maximize button never stuck across a reload.
       this.savePrefs();
@@ -19614,7 +27007,7 @@ function portal() {
     startResize(which, ev) {
       ev.preventDefault();
       const startX = ev.clientX;
-      const startW = which === "left" ? this.leftWidth : this.rightWidth;
+      const startW = which === "left" ? this.leftWidth : this.previewWidth;
       const target = ev.currentTarget;
       document.body.style.cursor = "col-resize";
       document.body.style.userSelect = "none";
@@ -19661,26 +27054,26 @@ function portal() {
       const onMove = (e) => {
         const delta = isLeft ? (e.clientX - startX) : (startX - e.clientX);
         const targetW = startW + delta;
-        const isOpenNow = isLeft ? this.leftOpen : this.rightOpen;
+        const isOpenNow = isLeft ? this.leftOpen : this.previewOpen;
         if (isOpenNow && targetW < HIDE_AT) {
           // Going-down threshold crossed. Hide and remember the pre-drag
           // width so chevron-reopen later restores that size (rather than
           // showing a sliver). Drag continues so you can pull back out.
           if (isLeft) { this.leftWidth = startW; this.leftOpen = false; }
-          else        { this.rightWidth = startW; this.rightOpen = false; }
+          else        { this.previewWidth = startW; this.previewOpen = false; }
           return;
         }
         if (!isOpenNow && targetW >= SHOW_AT) {
           // Going-up threshold crossed during the same drag — re-open.
           if (isLeft) this.leftOpen = true;
-          else        this.rightOpen = true;
+          else        this.previewOpen = true;
         }
         // Only resize when actually open (post-show transition counts).
         const reopened = !isOpenNow && targetW >= SHOW_AT;
         if (isOpenNow || reopened) {
           const w = Math.max(SHOW_AT, Math.min(maxW, targetW));
           if (isLeft) this.leftWidth = w;
-          else        this.rightWidth = w;
+          else        this.previewWidth = w;
         }
         refreshCmSoon();   // keep CM in step with the editor pane's new width
       };
@@ -19937,7 +27330,8 @@ function portal() {
     insertFileMention(path, isDir = false) {
       const mentionPath = this._mentionPath(path, isDir);
       const mention = "@" + mentionPath + " ";
-      this.input = (this.input || "") + (this.input && !this.input.endsWith(" ") ? " " : "") + mention;
+      this._setChatInput((this.input || "")
+        + (this.input && !this.input.endsWith(" ") ? " " : "") + mention);
       if (this.$refs.chatInput) this.$refs.chatInput.focus();
       this.toast(this.t("toast.mention_added", { path: mentionPath }), "success", 1500);
       // Mobile: @ mention is a chat-side action, jump to the chat pane
@@ -20010,7 +27404,128 @@ function portal() {
     },
 
     // ===== slash commands =====
-    slashResults: [],   // filled by onChatInput
+    // Every entry comes from MUSELAB_SLASH_CMDS. The palette, aliases, busy
+    // policy and execution path deliberately share that registry so a mouse
+    // click cannot behave differently from Enter, Tab or the send button.
+    slashResults: [],   // command rows or second-stage argument rows
+    slashStage: "command",
+    _slashDispatching: false,
+    _resolveSlashCommand(rawName) {
+      const name = String(rawName || "").trim().toLowerCase();
+      if (!name) return null;
+      return this.SLASH_CMDS.find(command => command.name === name
+        || (command.aliases || []).includes(name)) || null;
+    },
+    _slashCommandResults(rawQuery) {
+      const query = String(rawQuery || "").toLowerCase();
+      const rows = [];
+      for (const command of this.SLASH_CMDS) {
+        const names = [command.name, ...(command.aliases || [])];
+        const displayName = names.find(name => name.startsWith(query));
+        if (!displayName) continue;
+        rows.push({
+          ...command,
+          _kind: "command",
+          _displayName: displayName,
+          _key: `command:${displayName}`,
+        });
+      }
+      return rows;
+    },
+    _slashArgumentResults(command, rawQuery) {
+      if (!command || !command.argKind) return [];
+      const query = String(rawQuery || "").trim().toLowerCase();
+      const current = {
+        model: this.model,
+        permission: this.permission,
+        effort: this.effort,
+        session: this.currentId,
+      }[command.argKind] || "";
+      const row = (value, label, hint = "", searchExtra = "") => ({
+        _kind: "argument",
+        _key: `argument:${command.name}:${value}`,
+        command: command.name,
+        value: String(value),
+        label: String(label || value),
+        hint: String(hint || ""),
+        current: String(value) === String(current),
+        _search: `${value} ${label || ""} ${hint || ""} ${searchExtra || ""}`.toLowerCase(),
+      });
+      let rows = [];
+      if (command.argKind === "model") {
+        rows = (this.availableModels || []).map(model => row(
+          model.model,
+          model.label || model.model,
+          model.group || "",
+          model.model,
+        ));
+      } else if (command.argKind === "permission") {
+        rows = [
+          row("bypassPermissions", "bypass", "bypassPermissions"),
+          row("acceptEdits", "acceptEdits"),
+          row("default", "default"),
+          row("dontAsk", "dontAsk"),
+          row("auto", "auto"),
+          row("plan", "plan"),
+        ];
+      } else if (command.argKind === "effort") {
+        rows = this.effortChoices(this.model).map(option => row(
+          option.value,
+          this.t(option.labelKey),
+        ));
+      } else if (command.argKind === "session") {
+        rows = (this.sessions || []).slice(0, 50).map(session => row(
+          session.id,
+          session.name || session.id.slice(0, 8),
+          `${session.id.slice(0, 8)} · ${session.turn_count
+            ?? Math.floor((session.message_count || 0) / 2)}t`,
+          session.first_prompt || "",
+        ));
+      }
+      if (query) rows = rows.filter(item => item._search.includes(query));
+      return rows.slice(0, 30);
+    },
+    _refreshSlashPalette(prefix = this.input) {
+      const text = String(prefix || "");
+      if (!text.startsWith("/")) {
+        this.slashShow = false;
+        return false;
+      }
+      const raw = text.slice(1);
+      const splitAt = raw.search(/\s/);
+      if (splitAt < 0) {
+        this.slashStage = "command";
+        this.slashResults = this._slashCommandResults(raw);
+      } else {
+        const command = this._resolveSlashCommand(raw.slice(0, splitAt));
+        this.slashStage = "argument";
+        this.slashResults = command
+          ? this._slashArgumentResults(command, raw.slice(splitAt + 1))
+          : [];
+      }
+      this.slashIdx = 0;
+      // Keep the shell visible for a zero-result query so the user gets the
+      // promised "no matching command/value" feedback instead of a blink.
+      this.slashShow = true;
+      this.slashAnchor = 0;
+      return true;
+    },
+    _setSlashComposerValue(value, refreshPalette = false) {
+      const sid = this.currentId;
+      const next = this._setChatInput(value);
+      const st = sid && this._ensureTabState(sid);
+      if (st && st.draft) st.draft.input = next;
+      if (sid) this._persistChatDraft(sid, next);
+      this.$nextTick(() => {
+        const input = this.$refs.chatInput;
+        if (!input || this.currentId !== sid) return;
+        input.focus();
+        input.setSelectionRange(next.length, next.length);
+        this.autoGrow(input);
+        if (refreshPalette) this._refreshSlashPalette(next);
+      });
+      return next;
+    },
     _navPop(delta) {
       // shared up/down handler for either @ mention or / slash popup
       if (this.slashShow) {
@@ -20025,26 +27540,200 @@ function portal() {
       }
       return false;
     },
-    pickSlash(i) {
-      const c = this.slashResults[i];
-      if (!c) return;
-      // Replace current input with the canonical form so user sees what's submitted
-      this.input = "/" + c.name + (c.name === "model" || c.name === "resume" ? " " : "");
+    pickSlash(i = this.slashIdx) {
+      const item = this.slashResults[i];
+      if (!item) return false;
+      if (item._kind === "argument") {
+        const command = this._resolveSlashCommand(item.command);
+        if (!command) return false;
+        const submitted = this._setSlashComposerValue(
+          `/${command.name} ${item.value}`,
+        );
+        this.slashShow = false;
+        void this._dispatchSlash(command.name, item.value, { submitted });
+        return true;
+      }
+
+      const command = this._resolveSlashCommand(item.name);
+      if (!command) return false;
+      if (command.argKind) {
+        this._setSlashComposerValue(`/${command.name} `, true);
+        return true;
+      }
+      const submitted = this._setSlashComposerValue(`/${command.name}`);
       this.slashShow = false;
-      if (this.$refs.chatInput) this.$refs.chatInput.focus();
-      // For commands with NO argument needed, auto-execute on selection
-      if (!["model", "resume"].includes(c.name)) {
-        this._runSlash(c.name, "");
-        this.input = "";
+      void this._dispatchSlash(command.name, "", { submitted });
+      return true;
+    },
+
+    onSlashTab(ev) {
+      if (!this.slashShow || !this.slashResults.length
+          || this._isImeComposingEvent(ev)) return false;
+      ev.preventDefault();
+      this.pickSlash();
+      return true;
+    },
+
+    _slashDraftHasAttachments(sid = this.currentId) {
+      const st = sid && this.tabState && this.tabState[sid];
+      const draft = st && st.draft;
+      if (!draft) return false;
+      return !!((draft.pendingImages && draft.pendingImages.length)
+        || (draft.pendingDocs && draft.pendingDocs.length)
+        || (draft.pendingQuotes && draft.pendingQuotes.length));
+    },
+
+    async _dispatchSlash(rawCommand, rawArg, opts = {}) {
+      const command = this._resolveSlashCommand(rawCommand);
+      if (!command) {
+        this.toast(this.t("slash.unknown", { cmd: rawCommand }), "warn", 2000);
+        return false;
+      }
+      const ownsDispatchLock = command.policy !== "immediate";
+      if (this._slashDispatching && ownsDispatchLock) return false;
+      const sid = this.currentId;
+      const ownerState = sid && this._ensureTabState(sid);
+      const submitted = opts.submitted == null
+        ? String(this.input || "") : String(opts.submitted);
+      const arg = String(rawArg || "").trim();
+
+      if (!command.argKind && arg) {
+        this.toast(this.t("slash.no_args_allowed", { cmd: command.name }), "warn", 2500);
+        return false;
+      }
+
+      // Slash controls and chat attachments have different ownership/lifetime.
+      // Refuse the mixed draft before clearing anything so neither the command
+      // text nor an uploaded attachment disappears unexpectedly.
+      if (this._slashDraftHasAttachments(sid)) {
+        this.toast(this.t("slash.attachments_blocked"), "warn", 3000);
+        return false;
+      }
+
+      if (ownsDispatchLock) this._slashDispatching = true;
+      try {
+        if (command.policy === "stateful") {
+          const st = sid && this._ensureTabState(sid);
+          if (await this._confirmSessionBusy(sid, st)) {
+            this.toast(this.t("queue.slash_blocked"), "warn", 3000);
+            return false;
+          }
+        }
+        const handled = await this._runSlashHandler(
+          command.name,
+          arg,
+        );
+        // Only clear the exact draft that launched this command. A handler can
+        // show a confirm, switch sessions, or take long enough for the user to
+        // type again; none of those may erase newer input.
+        if (handled !== false && sid && this.tabState[sid] === ownerState
+            && ownerState.draft && ownerState.draft.input === submitted) {
+          ownerState.draft.input = "";
+          this._resetChatInputHistory(ownerState.draft);
+          this._persistChatDraft(sid, "");
+          if (this.currentId === sid && this.input === submitted) {
+            this._setChatInput("");
+            this.$nextTick(() => {
+              if (this.currentId === sid && this.$refs.chatInput) {
+                this.autoGrow(this.$refs.chatInput);
+              }
+            });
+          }
+          this.slashShow = false;
+        }
+        return handled !== false;
+      } catch (error) {
+        this.toast(this.t("slash.failed"), "error", 3000);
+        return false;
+      } finally {
+        if (ownsDispatchLock) this._slashDispatching = false;
       }
     },
 
-    async _runSlash(cmd, arg) {
-      arg = (arg || "").trim();
+    async _runSlashHandler(cmd, arg) {
       switch (cmd) {
+        case "context":
+          await this.showCtxBreakdown();
+          return true;
+        case "compact":
+          await this.runCompact();
+          return true;
+        case "model": {
+          if (!arg) {
+            const list = (this.availableModels || [])
+              .map(model => `- ${model.group || ""} · **${model.model}**`)
+              .join("\n");
+            this._injectAssistantNote(this.t("slash.model_list_title") + "\n\n" + list);
+            return true;
+          }
+          const found = (this.availableModels || []).find(model => model.model === arg);
+          if (!found) {
+            this.toast(this.t("slash.model_unknown", { id: arg }), "warn", 3000);
+            return false;
+          }
+          this.model = found.model;
+          return (await this.onModelChange()) !== false;
+        }
+        case "permission": {
+          if (!arg) {
+            this._injectAssistantNote(this.t("slash.permission_list"));
+            return true;
+          }
+          const aliases = { bypass: "bypassPermissions" };
+          const value = aliases[arg] || arg;
+          if (!this._normalizePermissionMode(value)) {
+            this.toast(this.t("slash.permission_unknown", { mode: arg }), "warn", 3000);
+            return false;
+          }
+          this.permission = value;
+          return (await this.onPermissionChange()) !== false;
+        }
+        case "mcp":
+          if (!this.mcpDrawerOpen) this.toggleMcpDrawer();
+          else await this.fetchMcp();
+          return true;
+        case "stop":
+          if (this.isTabStreaming(this.currentId)) await this.stop();
+          else this.toast(this.t("slash.stop_idle"), "info", 1800);
+          return true;
+        case "usage": {
+          await this.fetchStats();
+          const s = this.stats;
+          const usage = this.activeSessionPane().sessionUsage;
+          const lines = [
+            `**${this.t("slash.cost_title")}**`,
+            `- ${this.t("cost.total")}: $${s.total_cost_usd.toFixed(4)}`,
+            `- ${this.t("cost.in_out")}: ${s.total_input_tokens.toLocaleString()} in / ${s.total_output_tokens.toLocaleString()} out`,
+            `- ${this.t("cost.cache_hit")}: ${s.cache_hit_pct}% (${s.total_cache_read_tokens.toLocaleString()} cached read)`,
+            s.budget_usd > 0
+              ? `- ${this.t("cost.budget")}: $${s.budget_usd} (${s.budget_used_pct}% used)`
+              : `- ${this.t("cost.no_budget")}`,
+            `- ${this.t("cost.context")}: ${((usage.context_used || usage.input_tokens || 0) / 1000).toFixed(1)}K / ${(usage.context_limit / 1000).toFixed(0)}K (${usage.context_used_pct}%)`,
+          ];
+          this._injectAssistantNote(lines.join("\n"));
+          return true;
+        }
+        case "effort": {
+          if (!arg) {
+            const levels = this._effortLevels(this.model).join(" / ");
+            this._injectAssistantNote(this.t("slash.effort_list", { levels }));
+            return true;
+          }
+          const value = this._normalizeEffort(arg);
+          if (value !== arg || !this._effortAllowed(value, this.model)) {
+            this.toast(this.t("slash.effort_unknown", { level: arg }), "warn", 3000);
+            return false;
+          }
+          this.effort = value;
+          return (await this.onEffortChange()) !== false;
+        }
         case "help": {
           const cmds = this.SLASH_CMDS
-            .map(c => `**/${c.name}** — ${c.desc[this.lang] || c.desc.zh}`)
+            .map(command => {
+              const aliases = (command.aliases || []).length
+                ? ` (/${command.aliases.join(", /")})` : "";
+              return `**/${command.name}**${aliases} — ${command.desc[this.lang] || command.desc.zh}`;
+            })
             .join("\n");
           const md = [
             `## ${this.t("slash.help_title")}`,
@@ -20061,10 +27750,10 @@ function portal() {
             `${this.t("help.docs_link")} → [README.md](README.md)`,
           ].join("\n");
           this._injectAssistantNote(md);
-          return;
+          return true;
         }
         case "clear": {
-          if (!this.currentId) return;
+          if (!this.currentId) return false;
           // /clear permanently DELETEs the session (CLI JSONL + sidecar +
           // uploaded attachments), no trash, no undo — despite the CLI-muscle-
           // memory expectation that /clear just resets context. Gate it behind
@@ -20078,7 +27767,7 @@ function portal() {
             danger: true,
             okText: zh ? "删除并新建" : "Delete & start fresh",
           });
-          if (!ok) return;
+          if (!ok) return true;
           const oldId = this.currentId;
           // Token via header (not query) so it never lands in access / proxy
           // logs or browser history. /reset accepts header-or-query backend-side.
@@ -20090,44 +27779,17 @@ function portal() {
             // Network failure mid-clear — surface it rather than throwing an
             // unhandledrejection and leaving the user staring at the old session.
             this.errToast("delete", String((e && e.message) || e));
-            return;
+            return false;
           }
           await this.refreshSessions();
           // Drop the old session's tab + cached state, then open a fresh one
           // in its slot. newSession() handles tabState + openTabIds + switch.
           this._disposeTabRuntime(oldId);
+          this._deletePersistedChatDraft(oldId);
           this.openTabIds = this.openTabIds.filter(x => x !== oldId);
           await this.newSession();
           this.toast(this.t("slash.cleared"), "success", 1500);
-          return;
-        }
-        case "compact": {
-          if (!this.currentId) return;
-          const r = await fetch(`/api/chat/sessions/${this.currentId}/compact`,
-                                  { method: "POST", headers: this.hdr() });
-          if (!r.ok) { this.toast(this.t("slash.failed"), "error"); return; }
-          const meta = await r.json();
-          await this.refreshSessions();
-          this._captureChatPosition(this.currentId);
-          this.currentId = meta.id;
-          this._activateTabState(meta.id);
-          await this.loadSession(meta.id);
-          // Pre-fill input with the compact prompt — user reviews then sends
-          this.input = this.t("slash.compact_prompt");
-          this.toast(this.t("slash.compact_ok"), "success", 2500);
-          return;
-        }
-        case "model": {
-          if (!arg) {
-            const list = (this.availableModels || []).map(m => `- ${m.group} · **${m.model}**`).join("\n");
-            this._injectAssistantNote(this.t("slash.model_list_title") + "\n\n" + list);
-            return;
-          }
-          const found = (this.availableModels || []).find(m => m.model === arg);
-          if (!found) { this.toast(this.t("slash.model_unknown", { id: arg }), "warn", 3000); return; }
-          this.model = arg;
-          this.toast(this.t("slash.model_switched", { id: arg }), "success", 1500);
-          return;
+          return true;
         }
         case "resume": {
           if (!arg) {
@@ -20137,40 +27799,28 @@ function portal() {
                 return `- **${s.name}** (${turns}t, ${s.id.slice(0, 8)})`;
               }).join("\n");
             this._injectAssistantNote(this.t("slash.resume_list_title") + "\n\n" + list);
-            return;
+            return true;
           }
           const q = arg.toLowerCase();
           const hit = (this.sessions || []).find(s =>
             s.id.startsWith(arg) || s.name.toLowerCase().includes(q));
-          if (!hit) { this.toast(this.t("slash.resume_no_match"), "warn", 2000); return; }
-          this._captureChatPosition(this.currentId);
-          this.currentId = hit.id;
-          this._activateTabState(hit.id);
-          await this.loadSession(hit.id);
+          if (!hit) { this.toast(this.t("slash.resume_no_match"), "warn", 2000); return false; }
+          await this.openTab(hit.id, true);
           this.toast(this.t("slash.resumed", { name: hit.name }), "success", 1500);
-          return;
+          return true;
         }
-        case "cost": {
-          await this.fetchStats();
-          const s = this.stats;
-          const lines = [
-            `**${this.t("slash.cost_title")}**`,
-            `- ${this.t("cost.total")}: $${s.total_cost_usd.toFixed(4)}`,
-            `- ${this.t("cost.in_out")}: ${s.total_input_tokens.toLocaleString()} in / ${s.total_output_tokens.toLocaleString()} out`,
-            `- ${this.t("cost.cache_hit")}: ${s.cache_hit_pct}% (${s.total_cache_read_tokens.toLocaleString()} cached read)`,
-            s.budget_usd > 0
-              ? `- ${this.t("cost.budget")}: $${s.budget_usd} (${s.budget_used_pct}% used)`
-              : `- ${this.t("cost.no_budget")}`,
-            `- ${this.t("cost.context")}: ${((this.sessionUsage.context_used || this.sessionUsage.input_tokens || 0)/1000).toFixed(1)}K / ${(this.sessionUsage.context_limit/1000).toFixed(0)}K (${this.sessionUsage.context_used_pct}%)`,
-          ];
-          this._injectAssistantNote(lines.join("\n"));
-          return;
-        }
-        case "config": this.openSettings(); return;
-        case "stop":   if (this.isTabStreaming(this.currentId)) await this.stop(); return;
+        case "config": this.openSettings(); return true;
         default:
           this.toast(this.t("slash.unknown", { cmd }), "warn", 2000);
+          return false;
       }
+    },
+
+    // Compatibility entry point for extensions that used the old private
+    // helper. It intentionally delegates to the dispatcher rather than
+    // bypassing attachment and busy-state policy.
+    async _runSlash(cmd, arg) {
+      return this._dispatchSlash(cmd, arg);
     },
 
     // Inject a synthetic assistant bubble (markdown rendered) for slash output.
@@ -20214,7 +27864,7 @@ function portal() {
       if (this.settings && this.settings.show) this.settings.show = false;
       // Close skills drawer if open
       if (this.skillsDrawerOpen) this.skillsDrawerOpen = false;
-      this.input = prompt;
+      this._setChatInput(prompt);
       this.$nextTick(() => {
         const ta = this.$refs.chatInput;
         if (ta) {
@@ -20288,7 +27938,7 @@ function portal() {
         || (zh ? `用 ${s.name} MCP 帮我：` : `Use the ${s.name} MCP to: `);
       this.mcpDrawerOpen = false;
       if (this.settings && this.settings.show) this.settings.show = false;
-      this.input = prompt;
+      this._setChatInput(prompt);
       this.$nextTick(() => {
         const ta = this.$refs.chatInput;
         if (ta) {
@@ -20336,7 +27986,9 @@ function portal() {
       if (!r.ok) { this.toast(this.t("slash.failed"), "error"); return; }
       await this.loadRoot();
       if (!this._workspaceIsCurrent(ownerWorkspace)) return;
-      await this.openFile({ path: trimmed, name: trimmed });
+      await this.openFile(
+        { path: trimmed, name: trimmed }, { reveal: true },
+      );
       if (!this._workspaceIsCurrent(ownerWorkspace)) return;
       // Enter through the normal editor setup so CodeMirror receives the
       // newly-created body instead of reusing a previous file's buffer.
@@ -20377,18 +28029,19 @@ function portal() {
     // is still tracked server-side and exposed via /api/chat/usage for
     // anyone integrating muselab into a wider dashboard.
     ctxMeterLabel() {
-      const limit = this.sessionUsage.context_limit || 0;
+      const usage = this.activeSessionPane().sessionUsage;
+      const limit = usage.context_limit || 0;
       // Pre-fetch state — backend hasn't told us the real limit yet.
       // Show a placeholder rather than rendering "0K / 0K · NaN%".
       if (!limit) return this.lang === "zh" ? "上下文 …" : "Context …";
-      const pct = this.sessionUsage.context_used_pct || 0;
-      const usedTokens = (this.sessionUsage.context_used != null)
-        ? this.sessionUsage.context_used
-        : (this.sessionUsage.input_tokens || 0)
-          + (this.sessionUsage.cache_read_tokens || 0)
-          + (this.sessionUsage.cache_creation_tokens || 0);
-      const cachedTokens = (this.sessionUsage.cache_read_tokens || 0)
-                         + (this.sessionUsage.cache_creation_tokens || 0);
+      const pct = usage.context_used_pct || 0;
+      const usedTokens = (usage.context_used != null)
+        ? usage.context_used
+        : (usage.input_tokens || 0)
+          + (usage.cache_read_tokens || 0)
+          + (usage.cache_creation_tokens || 0);
+      const cachedTokens = (usage.cache_read_tokens || 0)
+                         + (usage.cache_creation_tokens || 0);
       const usedK = (usedTokens / 1000).toFixed(1);
       const cachedK = (cachedTokens / 1000).toFixed(1);
       const limitK = (limit / 1000).toFixed(0);
@@ -20399,11 +28052,34 @@ function portal() {
     },
     // Real compact: a) make sure the OLD session has been summarized in chat,
     // b) fork it, c) the fork inherits the summary as starting context.
-    // Easier path: just send a /compact instruction to the CURRENT session that
-    // asks the model to produce a self-contained summary, which the user can
-    // copy / use as basis. The "true" compact is a feature of the underlying
-    // CLI we don't have direct API for, so we implement it as a synthesized
-    // summarize-and-fork workflow.
+    async _adoptRecoveredSession(payload, sourceSid, opts = {}) {
+      const raw = payload && (payload.recovered_session || payload.session || payload);
+      const newId = String(raw && (raw.id || raw.session_id) || "");
+      if (!newId) return null;
+      const source = (this.sessions || []).find(session => session.id === sourceSid) || {};
+      const meta = {
+        ...raw,
+        id: newId,
+        session_id: newId,
+        active: false,
+        cwd: raw.cwd || source.cwd || this.currentWorkspacePath(),
+      };
+      const alreadyKnown = !!(this.sessions || []).find(session => session.id === newId);
+      this.sessions = [
+        meta,
+        ...(this.sessions || []).filter(session => session.id !== newId),
+      ];
+      this._sessionsEtag = "";
+      const state = this._ensureTabState(newId);
+      if (!alreadyKnown) state._loaded = false;
+      const shouldFocus = opts.focus !== false && this.currentId === sourceSid;
+      await this.openTab(newId, shouldFocus);
+      return { meta, state, shouldFocus, alreadyKnown };
+    },
+
+    // Run the CLI-native compact on the target session. If the transcript is
+    // already too large for that command itself, the backend preserves the
+    // source and returns a bounded recovery fork instead.
     async runCompact(targetSid, opts = {}) {
       // Default to the active session — the manual ctx-ring click + the
       // command palette both want "compact what I'm looking at". The
@@ -20413,8 +28089,8 @@ function portal() {
       const sid = targetSid || this.currentId;
       if (!sid) return;
       const st = this.tabState[sid];
-      // streaming check is per-target-session, not on `this.streaming`
-      // (which mirrors the active tab — wrong source of truth when the
+      // The streaming check is per target session, not through the active-pane
+      // façade, which would be the wrong owner when the
       // call comes from a background stream's done handler).
       if (st && st.streaming) {
         this.toast(this.t("ctx.compact_wait_streaming"), "warn", 2500);
@@ -20423,7 +28099,7 @@ function portal() {
       // Empty-session guard. The target session's frontend message
       // mirror may be transiently empty (loadSession in flight on
       // background tabs), so fall back to backend's message_count.
-      const targetMessages = (st && st.messages) || (sid === this.currentId ? this.messages : []);
+      const targetMessages = (st && st.messages) || [];
       const hasFrontendContent = targetMessages.some(
         m => m.role === "assistant" && m.text);
       const meta = this.sessions.find(s => s.id === sid);
@@ -20464,6 +28140,7 @@ function portal() {
       // along to unrelated tabs.
       const cst = this._ensureTabState(sid);
       cst.compacting = true;
+      let recoveredSession = null;
       // A short toast confirms the kick — the bottom pending bubble is what
       // the user actually watches for the full 20–60s window, not the toast.
       this.toast(this.lang === "zh" ? "📦 开始压缩..." : "📦 Compacting…", "info", 2000);
@@ -20494,10 +28171,25 @@ function portal() {
               : undefined);
           return;
         }
+        const compactResult = await r.json();
+        if (compactResult && compactResult.recovered_session) {
+          recoveredSession = await this._adoptRecoveredSession(
+            compactResult, sid, { focus: true },
+          );
+          await this.refreshSessions();
+          this.toast(
+            this.lang === "zh"
+              ? "原会话已超出原地压缩范围，已保留原记录并创建恢复会话"
+              : "The original session was too large to compact in place; a recovered session was created",
+            "success", 5000,
+          );
+          return;
+        }
         // Reload the compacted session if it's the active one; on a
         // background tab activateTab will reload it lazily later.
         if (sid === this.currentId) {
-          await this.loadSession(sid);
+          await this._reloadSessionCoalesced(
+            sid, { quiet: true, probeActive: false });
         }
         await this.refreshSessions();
         // Refresh ctx-meter — sessionUsage is only auto-updated on stream
@@ -20514,7 +28206,9 @@ function portal() {
         // Auto-drain runs against the compacted session, not currentId —
         // a background auto-compact must drain its own queue, not the
         // user's currently-visible tab's queue.
-        this.$nextTick(() => this._drainPendingQueue(sid));
+        if (!recoveredSession) {
+          this.$nextTick(() => this._drainPendingQueue(sid));
+        }
         // Refresh ctx-meter for background compacts — when compact finishes
         // on a non-current tab the try-block's _refreshCtxMeter is skipped,
         // so we re-run it here unconditionally (it's cheap and idempotent).
@@ -20526,13 +28220,7 @@ function portal() {
 
     _chatInputHistory() {
       const st = this.currentId && this.tabState && this.tabState[this.currentId];
-      const messages = st
-        ? [
-            ...(st._earlierMessages || []),
-            ...(st.messages || []),
-            ...(st._laterMessages || []),
-          ]
-        : (this.messages || []);
+      const messages = st ? st.messages : this.activeSessionPane().messages;
       return messages
         .filter(m => m && m.role === "user" && typeof m.text === "string"
           && m.text.length)
@@ -20546,7 +28234,7 @@ function portal() {
       draft._historyDraft = "";
     },
     _showChatHistoryInput(text, ev) {
-      this.input = text;
+      this._setChatInput(text);
       ev.preventDefault();
       this.$nextTick(() => {
         const ta = this.$refs.chatInput;
@@ -20617,24 +28305,34 @@ function portal() {
       this.mentionShow = false;
     },
     onChatInput(ev) {
-      // A real edit forks away from the recalled entry. Programmatic history
-      // navigation updates x-model directly and does not emit an input event.
-      this._resetChatInputHistory();
       const ta = ev.target;
+      // Do not depend on Alpine directive listener order. The native control
+      // is the source of truth while focused, especially during composition.
+      if (this.input !== ta.value) this.input = ta.value;
+      if (ev.isComposing === true) {
+        this._markImeComposition(ta);
+      } else if (ta._museImeComposing) {
+        // Some Android/embedded Chromium builds commit through input without
+        // a compositionend event. Some still label the final event
+        // insertCompositionText, so explicit isComposing=false is the only
+        // reliable signal that the native editor has released marked text.
+        this._finishImeComposition(ta);
+        ta._museImeEndedAt = ta._museImeCommitEnterDown
+          ? (Number(ev.timeStamp) || 0) : 0;
+      }
+      // A real edit forks away from the recalled entry. Programmatic history
+      // navigation goes through _setChatInput and does not emit an input event.
+      this._resetChatInputHistory();
+      this._captureComposerState(this.currentId, { persist: false });
+      this._schedulePersistChatDraft(this.currentId, this.input || "");
       const pos = ta.selectionStart;
       const text = this.input.slice(0, pos);
 
-      // Slash command palette — only when input starts with '/' (no leading space).
-      if (text.startsWith("/")) {
-        const q = text.slice(1).toLowerCase();
-        // Hide once user typed a space (means they're past the command name)
-        if (/\s/.test(q)) { this.slashShow = false; }
-        else {
-          this.slashResults = this.SLASH_CMDS.filter(c => c.name.startsWith(q));
-          this.slashIdx = 0;
-          this.slashShow = this.slashResults.length > 0;
-          this.slashAnchor = 0;
-        }
+      // Slash command palette — only when input starts with '/' (no leading
+      // space). `_refreshSlashPalette` also owns the second-stage argument
+      // results, aliases and zero-match shell.
+      if (this.SLASH_ENABLED && text.startsWith("/")) {
+        this._refreshSlashPalette(text);
         this._cancelMentionLookup();
         return;
       } else {
@@ -20724,7 +28422,7 @@ function portal() {
       const before = this.input.slice(0, this.mentionAnchor);
       const after = this.input.slice(ta.selectionStart);
       const mentionPath = this._mentionPath(item.path, !!item.is_dir);
-      this.input = before + "@" + mentionPath + " " + after;
+      this._setChatInput(before + "@" + mentionPath + " " + after);
       this._cancelMentionLookup();
       this.$nextTick(() => {
         const newPos = (before + "@" + mentionPath + " ").length;
@@ -20739,28 +28437,39 @@ function portal() {
       // Enter, claim the event here instead of using Alpine's `.prevent`
       // modifier, which would preventDefault even during composition.
       if (!this._claimNonImeEnter(ev)) return;
+      // Holding Enter emits repeated keydown events.  Once the first event has
+      // claimed this draft, later repeats must not become duplicate sends.
+      if (ev.repeat) return;
       if (this.mentionShow) { this.pickMention(); return; }
+      if (this.slashShow && this.slashResults.length) {
+        this.pickSlash();
+        return;
+      }
       // Newline-at-cursor for: Shift+Enter, Ctrl+Enter, Meta+Enter, and
       // touch devices (where bare Enter is a newline because send is via
       // the on-screen button). Inserting at selectionStart/End preserves
       // mid-paragraph editing — previously `input += "\n"` always tacked
       // the newline onto the end, which made it impossible to split a
       // paragraph at the caret.
-      const isTouch = (window.matchMedia
-                        && window.matchMedia("(pointer: coarse)").matches)
-                      || window.innerWidth < 768;
-      const wantNewline = ev.shiftKey || ev.ctrlKey || ev.metaKey || isTouch;
+      // Use the actual single-pane layout, not bare `(pointer: coarse)`.
+      // Windows touch laptops and desktop tablets still have a physical
+      // keyboard; treating their Enter as mobile input made it insert a line
+      // break instead of sending, despite a wide PC layout. `_isMobileLayout`
+      // mirrors the CSS breakpoint and only includes coarse pointers for a
+      // phone-sized landscape viewport.
+      const wantNewline = ev.shiftKey || ev.ctrlKey || ev.metaKey
+        || this._isMobileLayout();
       if (wantNewline) {
         const ta = this.$refs.chatInput;
         if (ta) {
           const s = ta.selectionStart, e = ta.selectionEnd;
-          this.input = this.input.slice(0, s) + "\n" + this.input.slice(e);
+          this._setChatInput(this.input.slice(0, s) + "\n" + this.input.slice(e));
           this.$nextTick(() => {
             ta.setSelectionRange(s + 1, s + 1);
             this.autoGrow(ta);
           });
         } else {
-          this.input += "\n";
+          this._setChatInput(this.input + "\n");
         }
         return;
       }
@@ -20772,17 +28481,15 @@ function portal() {
     _captureChatPosition(sid = this.currentId) {
       this._captureComposerState(sid);
       const st = sid && this.tabState && this.tabState[sid];
-      const el = this.$refs.chatBody;
+      const el = this._chatBodyElement();
       if (!st || !el || sid !== this.currentId) return;
       st.scrollTop = el.scrollTop;
-      st.atBottom = !!this.atBottom;
     },
     _restoreChatPosition(sid = this.currentId) {
       const st = sid && this.tabState && this.tabState[sid];
-      const el = this.$refs.chatBody;
+      const el = this._chatBodyElement();
       if (!st || !el || sid !== this.currentId) return;
       const shouldFollow = st.atBottom !== false;
-      this.atBottom = shouldFollow;
       if (shouldFollow) {
         this._settleScrollToBottom();
       } else {
@@ -20790,9 +28497,26 @@ function portal() {
       }
     },
     onChatScroll() {
-      const el = this.$refs.chatBody;
+      this._queueMemoryRecallPosition();
+      const el = this._chatBodyElement();
       if (!el) return;
       const st = this.currentId && this.tabState && this.tabState[this.currentId];
+      if (st) {
+        const now = (typeof performance !== "undefined" && performance.now)
+          ? performance.now() : Date.now();
+        const previousTop = Number(st._lastVirtualScrollTop) || 0;
+        const previousAt = Number(st._lastVirtualScrollAt) || now;
+        const delta = el.scrollTop - previousTop;
+        const elapsed = Math.max(8, now - previousAt);
+        st._virtualScrollDirection = delta < -1 ? -1 : (delta > 1 ? 1 : st._virtualScrollDirection);
+        st._virtualScrollVelocity = Math.min(20000, Math.abs(delta) * 1000 / elapsed);
+        st._lastVirtualScrollTop = el.scrollTop;
+        st._lastVirtualScrollAt = now;
+        // Older history is user-triggered. Do not fetch or mount another page
+        // merely because a wheel/touch gesture reaches the top; that behavior
+        // made long-session scrolling compete with the gesture itself.
+      }
+      this._scheduleMessageViewportSync(this.currentId);
       // While WE are programmatically pinning to the bottom (the settle loop),
       // every per-frame `scrollTop = scrollHeight` fires this handler. Its
       // geometry read (scrollHeight/clientHeight) forces a synchronous reflow,
@@ -20806,11 +28530,10 @@ function portal() {
       // mis-classify and never re-engage auto-follow).
       const nearBottom = (el.scrollHeight - el.scrollTop - el.clientHeight) < 2;
       if (nearBottom) {
-        // Reaching the bottom always (re-)engages auto-follow, regardless of
-        // what moved us there — that's the unambiguous "I want to follow" state.
-        this.atBottom = true;
+        // The physical bottom of a frozen range is not the logical transcript
+        // tail. Keep the jump affordance until hidden later messages are restored.
         if (st) {
-          st.atBottom = true;
+          st.atBottom = !this.hasLaterMessages(this.currentId);
           st.scrollTop = el.scrollTop;
         }
         return;
@@ -20820,9 +28543,8 @@ function portal() {
       // ANY scroll event whose geometry read > 2px — but several NON-user events
       // fire scroll with a transiently-wrong distance and silently broke
       // mid-stream follow ("某些 block 导致停止追随"):
-      //   1. _capLiveMessages evicting top bubbles on a long agentic turn shifts
-      //      content up; content-visibility:auto height estimates make the
-      //      distance read briefly > 2px.
+      //   1. A measured virtual-window shift replaces estimated spacer height;
+      //      the distance read can briefly exceed 2px during that correction.
       //   2. A late-realizing block (image / iframe / mermaid / highlighted code)
       //      growing height triggers the browser's scroll-anchoring, which moves
       //      scrollTop without any user input.
@@ -20831,23 +28553,137 @@ function portal() {
       // so the next streaming tick re-pins to the bottom.
       const userDriven = (Date.now() - ((st && st._userScrollAt)
         || this._userScrollAt || 0)) < 400;
-      if (userDriven) {
-        this.atBottom = false;
-        if (st) st.atBottom = false;
-      }
+      if (userDriven && st) st.atBottom = false;
       if (st) st.scrollTop = el.scrollTop;
     },
     // Stamp the last genuine user scroll gesture. Bound to wheel / touchmove /
     // pointerdown on the chat body (see index.html) so onChatScroll can tell a
     // user scroll-up apart from a layout-induced scroll event.
-    _userScrollIntent() {
+    _chatTouchStart(ev) {
+      const touch = ev && ev.touches && ev.touches[0];
+      this._chatTouchY = touch ? touch.clientY : null;
+    },
+    _userScrollIntent(ev) {
+      const el = this._chatBodyElement();
+      let movesTowardHistory = true;
+      if (ev && ev.type === "wheel") {
+        movesTowardHistory = Number(ev.deltaY) < 0;
+      } else if (ev && ev.type === "touchmove") {
+        const touch = ev.touches && ev.touches[0];
+        const previousY = Number(this._chatTouchY);
+        const currentY = touch ? touch.clientY : previousY;
+        movesTowardHistory = Number.isFinite(previousY) && currentY > previousY;
+        this._chatTouchY = currentY;
+      } else if (ev && ev.type === "pointerdown" && el) {
+        // A pointer press inside message content is selection/clicking, not a
+        // scroll request. Only the scrollbar gutter claims pointerdown as a
+        // possible reader-controlled scroll; wheel/touch paths know direction.
+        const rect = el.getBoundingClientRect();
+        movesTowardHistory = Number(ev.clientX) >= rect.right - 20;
+      }
+      if (!movesTowardHistory) return;
+      if (this.previewQuote.show && this.previewQuote.source === "chat"
+          && this.previewQuote.mode !== "ask") {
+        // Hide the contextual actions while the transcript moves, but preserve
+        // the browser selection. Clearing it here made wheel-assisted text
+        // selection impossible: once the actions popover appeared, the next
+        // wheel tick called removeAllRanges() even while the mouse button was
+        // still held, so users could not extend a selection across viewports.
+        this.dismissPreviewQuote(false);
+      }
       this._userScrollAt = Date.now();
       const st = this.currentId && this.tabState && this.tabState[this.currentId];
-      if (st) st._userScrollAt = this._userScrollAt;
+      if (st) {
+        st._userScrollAt = this._userScrollAt;
+        st.atBottom = false;
+      }
+      // A real upward gesture immediately owns the viewport. Cancel any tail
+      // settle that was still realizing content-visibility rows; waiting for its
+      // next synthetic scroll event would let it yank the reader back down.
+      this._settleToken = (this._settleToken || 0) + 1;
+      this._autoScrolling = false;
+    },
+    _ensureChatTailObserver() {
+      const body = this._chatBodyElement();
+      if (!body || typeof ResizeObserver !== "function") return;
+      if (this._chatTailObservedBody === body) return;
+      if (this._chatTailResizeObserver) this._chatTailResizeObserver.disconnect();
+      if (this._chatTailMutationObserver) this._chatTailMutationObserver.disconnect();
+      this._chatTailObservedBody = body;
+      const schedule = entries => {
+        const sid = this.currentId;
+        const st = sid && this.tabState && this.tabState[sid];
+        if (Array.isArray(entries) && entries.length) {
+          const touchesActiveLayout = entries.some(entry => {
+            const target = entry && entry.target;
+            if (!target || target === body) return true;
+            const owner = target.classList && target.classList.contains("msg-pane")
+              ? target : null;
+            return !owner || owner.dataset.tid === sid;
+          });
+          if (!touchesActiveLayout) return;
+        }
+        if (!st || st.atBottom === false || this._messageRangeHasLater(st)
+            || this._chatTailPinFrame) return;
+        this._chatTailPinFrame = requestAnimationFrame(() => {
+          this._chatTailPinFrame = 0;
+          const current = sid && this.tabState && this.tabState[sid];
+          if (this.currentId !== sid || current !== st || st.atBottom === false
+              || this._messageRangeHasLater(st)) return;
+          this.scrollToBottom(false);
+        });
+      };
+      const observeLayoutOwners = () => {
+        this._chatTailResizeObserver.disconnect();
+        this._chatTailResizeObserver.observe(body);
+        for (const child of body.children) this._chatTailResizeObserver.observe(child);
+      };
+      this._chatTailResizeObserver = new ResizeObserver(schedule);
+      this._chatTailMutationObserver = new MutationObserver(records => {
+        // Streaming x-text/x-html updates happen below the direct message row.
+        // The event handler's scroll request can run before Alpine commits that
+        // descendant mutation, while the old childList-only observer never saw it.
+        // Re-pin on the committed DOM change; only refresh ResizeObserver owners
+        // when the body's direct children themselves changed.
+        if (records.some(record => record.type === "childList"
+            && record.target === body)) {
+          observeLayoutOwners();
+        }
+        const activeSid = this.currentId;
+        const touchesActivePane = records.some(record => {
+          if (record.target === body) return true;
+          const owner = record.target && record.target.closest
+            ? record.target.closest(".msg-pane") : null;
+          return !owner || owner.dataset.tid === activeSid;
+        });
+        if (touchesActivePane) schedule();
+      });
+      this._chatTailMutationObserver.observe(body, {
+        childList: true,
+        subtree: true,
+        characterData: true,
+      });
+      observeLayoutOwners();
+    },
+    _scrollChatTailNow(sid, st) {
+      const el = this._chatBodyElement();
+      if (!el || !st || this.currentId !== sid || this.tabState[sid] !== st) return;
+      const tail = this.$refs && this.$refs.chatBottom;
+      if (tail && typeof tail.scrollIntoView === "function") {
+        tail.scrollIntoView({ block: "end", inline: "nearest", behavior: "auto" });
+      }
+      // Keep the explicit scroller assignment as a deterministic fallback for
+      // embedded/mobile WebViews whose scrollIntoView chooses an outer scroller.
+      el.scrollTop = el.scrollHeight;
+      st.scrollTop = el.scrollTop;
+      this._enforceMessageRangeInvariant(st);
     },
     scrollToBottom(force) {
-      const el = this.$refs.chatBody;
-      if (!el) return;
+      const el = this._chatBodyElement();
+      const sid = this.currentId;
+      const st = sid && this.tabState && this.tabState[sid];
+      if (!el || !st) return;
+      this._ensureChatTailObserver();
       // Strict semantics: when not forced, respect the user's atBottom
       // intent exclusively. Don't re-sample geometry — the prior
       // "sample-then-decide" approach used a 150px window that meant
@@ -20856,32 +28692,33 @@ function portal() {
       // chunk's small height kept distance briefly under 150). With
       // this guard, once the user is meaningfully scrolled up the
       // viewport stays put until they manually scroll back to the bottom.
-      if (!force && !this.atBottom) return;
+      if (!force && st.atBottom === false) return;
       if (force) {
-        // Explicit jump (the ↓ FAB). `.msg` uses content-visibility:auto,
-        // so off-screen bubbles report an ESTIMATED height (the 200px
-        // contain-intrinsic-size placeholder). A one-shot scrollTop =
-        // scrollHeight therefore lands short — as bottom content scrolls
-        // into view and realizes its (taller) real height, scrollHeight
-        // keeps growing. Re-slam to the bottom each frame until scrollHeight
-        // stops growing. See _settleScrollToBottom.
-        this._settleScrollToBottom();
-        this.atBottom = true;
-        const st = this.currentId && this.tabState && this.tabState[this.currentId];
-        if (st) st.atBottom = true;
+        // Physical DOM bottom is not necessarily the logical transcript tail.
+        // Acquire the real tail first; returnToLatest re-enters this path only
+        // after local and server-side later windows have disappeared.
+        if (this._messageRangeHasLater(st)) {
+          void this.returnToLatest(sid);
+          return;
+        }
+        st.atBottom = true;
+        this._syncMessageViewport(sid, true);
+        this.$nextTick(() => {
+          if (this.currentId !== sid || this.tabState[sid] !== st) return;
+          // `.msg` uses `content-visibility:auto`, so keep pinning until the newly
+          // mounted tail's real heights settle rather than trusting one scroll.
+          this._settleScrollToBottom();
+        });
         return;
       }
-      // Streaming auto-follow path: bottom region is already realized,
-      // so the cheap single-shot is accurate and avoids per-chunk rAF.
-      this.$nextTick(() => {
-        el.scrollTop = el.scrollHeight;
-        this.atBottom = true;
-        const st = this.currentId && this.tabState && this.tabState[this.currentId];
-        if (st) {
-          st.atBottom = true;
-          st.scrollTop = el.scrollTop;
-        }
-      });
+      // Streaming auto-follow must mount the tail BEFORE the scroll microtask.
+      // _scheduleLiveMessageViewport uses requestAnimationFrame; relying on it
+      // meant this nextTick ran first and scrolled the previous DOM window, then
+      // the rAF moved the virtual window without another scroll. Synchronizing
+      // here is normally a no-op once the tail is mounted, and guarantees the
+      // ordering when a new row first extends it.
+      this._syncMessageViewport(sid, true);
+      this.$nextTick(() => this._scrollChatTailNow(sid, st));
     },
 
     // Re-slam the viewport to the very bottom each frame until the
@@ -20894,8 +28731,10 @@ function portal() {
     // been stable for two consecutive frames (heights realized) or the
     // frame budget is spent.
     _settleScrollToBottom({ maxFrames } = {}) {
-      const el = this.$refs.chatBody;
-      if (!el) return;
+      const el = this._chatBodyElement();
+      const sid = this.currentId;
+      const st = sid && this.tabState && this.tabState[sid];
+      if (!el || !st) return;
       // Mobile WebViews pay a far higher per-frame reflow cost: each
       // `scrollTop = scrollHeight` below forces a synchronous layout of the
       // whole content-visibility:auto pane, and 40 of them on a tab switch /
@@ -20924,7 +28763,12 @@ function portal() {
       let stable = 0;
       const step = () => {
         if (this._settleToken !== myToken) return; // superseded; newer settle owns the flag
-        el.scrollTop = el.scrollHeight; // browser clamps to valid range
+        if (this.currentId !== sid || this.tabState[sid] !== st
+            || st.atBottom === false || this._messageRangeHasLater(st)) {
+          done();
+          return;
+        }
+        this._scrollChatTailNow(sid, st);
         frames++;
         const h = el.scrollHeight;
         if (Math.abs(h - lastH) < 1) {
@@ -20950,7 +28794,7 @@ function portal() {
     // distance from the top and nudge scrollTop by the residual, so the
     // landing stays accurate even as upstream heights change underfoot.
     _settleScrollToEl(getEl, desiredRelTop = 0, { maxFrames = 40 } = {}) {
-      const el = this.$refs.chatBody;
+      const el = this._chatBodyElement();
       if (!el) return;
       let frames = 0;
       let onTarget = 0;
@@ -20997,7 +28841,7 @@ function portal() {
     // If nothing is above (already at/above the first question) we snap to
     // the very first user message.
     jumpToPrevUser() {
-      const el = this.$refs.chatBody;
+      const el = this._chatBodyElement();
       if (!el) return;
       // Exclude queued (not-yet-sent) bubbles — they render as .msg.user.queued
       // but jumping to them is meaningless; the FAB should only target real
@@ -21030,7 +28874,7 @@ function portal() {
       // ===== Pin target session at function entry =====
       // CRITICAL (fixes 2026-05-22 cross-tab leak): send() has multiple
       // await points downstream (stillUploading polling loop, queue drain
-      // hand-off, etc). If `this.currentId` / `this.messages` are read
+      // hand-off, etc). If `this.currentId` / the active pane are read
       // AFTER one of those awaits, a tab switch by the user during the
       // await silently retargets the entire send — the user msg bubble
       // ends up in the new tab, the stream URL still references the new
@@ -21041,10 +28885,9 @@ function portal() {
       // queuing/draining on the old tab.
       //
       // Fix: snapshot the target session ID right here, before any await,
-      // and route every downstream write through `_ensureTabState(sendSid)`
-      // (NOT through `this.messages` which is just a proxy to
-      // tabState[currentId].messages and may have been re-aliased by
-      // activateTab during an await). The stream URL also uses sendSid.
+      // and route every downstream write through `_ensureTabState(sendSid)`,
+      // not through the currently mounted pane, whose owner may change during
+      // an await. The stream URL also uses sendSid.
       // If the user switches tabs while we're sending, the bubble + reply
       // both stay in the original tab — visible only when they switch
       // back — which is the contract `streamSid` was supposed to enforce
@@ -21057,31 +28900,166 @@ function portal() {
       if (!sendSid) return false;
       if (sendSid === this.currentId) this._captureComposerState(sendSid);
       const sendState = this._ensureTabState(sendSid);
+      const isComposerSubmission = !opts.reconnect && !opts.resumedItem
+        && typeof opts.detachedText !== "string";
+      // Slash controls must stay responsive even while a turn/background task
+      // is active or a runtime-setting PATCH is settling. Detect the exact
+      // composer draft before the regular send gates; `_dispatchSlash` applies
+      // the registry's per-command policy and preserves mixed attachment
+      // drafts. Queue drains/reconnects never contain slash controls.
+      if (this.SLASH_ENABLED && isComposerSubmission) {
+        const slashDraft = String((sendState.draft && sendState.draft.input) || "");
+        const slashText = slashDraft.trim();
+        if (slashText.startsWith("/")) {
+          const match = slashText.match(/^\/([^\s]+)(?:\s+([\s\S]*))?$/);
+          if (match) {
+            return await this._dispatchSlash(match[1], match[2] || "", {
+              submitted: slashDraft,
+            });
+          }
+          this.toast(this.t("slash.unknown", { cmd: slashText.slice(1) }), "warn", 2000);
+          return false;
+        }
+      }
+      // Keep the ownership token primitive. Alpine proxies objects assigned to
+      // reactive state, which would break identity comparison in finally and
+      // leave the send button permanently locked after a successful submit.
+      const composerSubmitToken = opts._composerSubmitToken
+        || `composer-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      if (isComposerSubmission) {
+        if (sendState._composerSubmitToken
+            && sendState._composerSubmitToken !== composerSubmitToken) {
+          return false;
+        }
+        sendState._composerSubmitToken = composerSubmitToken;
+        sendState._composerSubmitPhase = "submitting";
+      }
+      // `finally` must be able to release a composer claim after a proactive
+      // handoff replaces the source tabState. Keep this resolver in send()'s
+      // outer scope: declarations inside the `try` block are not visible from
+      // its sibling `finally` block in JavaScript.
+      const successorState = () => {
+        const childSid = String(sendState._backgroundSuccessorSid || "");
+        const child = childSid && this.tabState[childSid];
+        return child && child._handoffSourceSid === sendSid ? child : null;
+      };
+      try {
+      // Stop is an acknowledged control handshake, not an idle gap.  Sending
+      // while it is still settling used to enqueue a fresh message between the
+      // interrupt endpoint's atomic pause and the turn cleanup's second pause;
+      // that new item then appeared accepted but remained paused.  Keep the
+      // draft intact and make the short wait explicit instead.
+      if (sendState._stoppingTurnId && !opts.reconnect && !opts.resumedItem) {
+        this.toast(this.lang === "zh"
+          ? "正在中断上一条任务，请稍候再发送"
+          : "The previous turn is still stopping; send again in a moment",
+        "warn", 2200);
+        return false;
+      }
+      // Do not start a new turn between the optimistic selector change and
+      // its persisted session update. Otherwise Plan Mode could launch with a
+      // stale/missing return capability. Reconnects and queued snapshots own
+      // their existing runtime contract and are intentionally exempt.
+      if (sendState._permissionChangePending
+          && !opts.reconnect && !opts.resumedItem) {
+        this.toast(this.t("perm.switching"), "warn", 2000);
+        return false;
+      }
       const sendDraft = sendState.draft;
+      // A preview-selection question is an independent prompt, not a rewrite
+      // of the visible composer. Keep the current draft and every attachment
+      // untouched while still reusing the normal current-session queue/SSE
+      // lifecycle. This also makes ticket failure recovery a no-op for the
+      // unrelated composer.
+      const hasDetachedText = typeof opts.detachedText === "string";
+      const detachedDisplayText = typeof opts.detachedDisplayText === "string"
+        ? opts.detachedDisplayText : opts.detachedText;
       // Snapshot the pinned session's draft before any await. Every later read,
       // clear, upload wait and enqueue remains owned by this exact state object.
-      const composerText = sendDraft.input || "";
-      const composerImages = sendDraft.pendingImages.slice();
-      const composerDocs = sendDraft.pendingDocs.slice();
+      const composerInput = hasDetachedText ? opts.detachedText : (sendDraft.input || "");
+      const composerImages = hasDetachedText ? [] : sendDraft.pendingImages.slice();
+      const composerDocs = hasDetachedText ? [] : sendDraft.pendingDocs.slice();
+      const composerQuotes = hasDetachedText ? [] : sendDraft.pendingQuotes.slice();
+      const composerText = hasDetachedText
+        ? composerInput : this._composerPromptText(composerInput, composerQuotes);
       const ownsSendDraft = () => this.tabState[sendSid] === sendState
         && sendState.draft === sendDraft;
-      const clearSubmittedComposer = () => {
-        if (!ownsSendDraft()) return;
-        if (sendDraft.input === composerText) sendDraft.input = "";
-        this._resetChatInputHistory(sendDraft);
+      const ownsSubmittedDraft = state => !!(state
+        && state._composerSubmitToken === composerSubmitToken
+        && state.draft && state.draft.input === composerInput);
+      let sentUserBubble = null;
+      const clearSubmittedComposer = ({ preserveForHandshake = false } = {}) => {
+        if (hasDetachedText) return;
+        // A proactive background rollover can replace sourceState while this
+        // send awaits the queue POST. Settle whichever state currently owns
+        // the transferred primitive claim; never clear a newer draft.
+        const ownerState = ownsSendDraft() && ownsSubmittedDraft(sendState)
+          ? sendState : (ownsSubmittedDraft(successorState())
+            ? successorState() : null);
+        if (!ownerState) return;
+        const ownerSid = ownerState === sendState
+          ? sendSid : String(sendState._backgroundSuccessorSid || "");
+        const ownerDraft = ownerState.draft;
+        if (preserveForHandshake) {
+          this._stageChatRecoveryDraft(ownerSid, composerInput);
+        }
+        if (ownerDraft.input === composerInput) ownerDraft.input = "";
+        this._resetChatInputHistory(ownerDraft);
         const removeOwned = (items, sent) => {
           for (let i = items.length - 1; i >= 0; i--) {
             if (sent.has(items[i])) items.splice(i, 1);
           }
         };
-        removeOwned(sendDraft.pendingImages, new Set(composerImages));
-        removeOwned(sendDraft.pendingDocs, new Set(composerDocs));
-        if (sendSid === this.currentId) {
-          this._activateComposerState(sendSid);
+        removeOwned(ownerDraft.pendingImages, new Set(composerImages));
+        removeOwned(ownerDraft.pendingDocs, new Set(composerDocs));
+        removeOwned(ownerDraft.pendingQuotes, new Set(composerQuotes));
+        // Clearing the visible composer must not clear the durable backup
+        // until the SSE handshake succeeds. A newer draft typed during an
+        // await is persisted alongside that pending outgoing text.
+        this._persistChatDraft(ownerSid, ownerDraft.input);
+        if (ownerSid === this.currentId) {
+          this._activateComposerState(ownerSid);
           this.$nextTick(() => {
             if (this.$refs.chatInput) this.autoGrow(this.$refs.chatInput);
           });
         }
+      };
+      // Once the payload is valid, the composer clears and its bubble appears
+      // before registration/settings/busy probes. Any pre-ticket failure restores
+      // the exact submitted payload without overwriting text typed meanwhile.
+      let submittedDraftRestored = false;
+      const restoreSubmittedComposer = (restoreAttachments = false) => {
+        if (!isComposerSubmission || submittedDraftRestored) return;
+        submittedDraftRestored = true;
+        if (ownsSendDraft()) {
+          sendDraft.input = this._mergeChatDraftText(
+            composerInput, sendDraft.input || "",
+          );
+          if (restoreAttachments) {
+            const restoreOwned = (items, sent) => {
+              const missing = sent.filter(item => !items.includes(item));
+              if (missing.length) items.unshift(...missing);
+            };
+            restoreOwned(sendDraft.pendingImages, composerImages);
+            restoreOwned(sendDraft.pendingDocs, composerDocs);
+            restoreOwned(sendDraft.pendingQuotes, composerQuotes);
+          }
+          this._resolveChatRecoveryDraft(sendSid, sendDraft.input);
+          if (sendSid === this.currentId) this._activateComposerState(sendSid);
+          return;
+        }
+        const persisted = this._chatDraftRecord(sendSid);
+        this._resolveChatRecoveryDraft(sendSid, this._mergeChatDraftText(
+          composerInput,
+          this._mergeChatDraftText(persisted.pending, persisted.text),
+        ));
+      };
+      const rollbackOptimisticSubmission = () => {
+        if (sentUserBubble) {
+          this._removePaneMessage(sendState, sentUserBubble);
+          sentUserBubble = null;
+        }
+        restoreSubmittedComposer(true);
       };
       // Snapshot model/permission alongside sendSid — the attachment-upload
       // awaits below can span a tab switch, after which this.model /
@@ -21091,14 +29069,32 @@ function portal() {
       const sendMeta = (this.sessions || []).find(s => s.id === sendSid);
       const sendModel = sendSid === this.currentId
         ? this.model : ((sendMeta && sendMeta.model) || this.model);
-      const sendPermission = sendSid === this.currentId
+      const inheritedPermission = sendSid === this.currentId
         ? this.permission : ((sendMeta && sendMeta.permission) || "default");
+      const sendPermission = this._normalizePermissionMode(
+        opts.permissionMode || inheritedPermission,
+        "default",
+      );
+      const sendPlanReturnPermission = sendPermission === "plan"
+        ? ((sendMeta && sendMeta.plan_return_permission) || "")
+        : "";
       // Reconnect mode: skip user-input validation + user-msg push.
       // Used by _reconnectActiveTurn() when loadSession discovers an
       // in-flight background turn on the current session — we just want
       // to subscribe to the existing TurnBroadcast (empty prompt =
       // attach), all the EventSource handlers below stay the same.
       const isReconnect = !!opts.reconnect;
+      // A context-recovery replay owns the one automatic retry allowed for
+      // its original turn. Preserve that fact across transport reconnects,
+      // but reset it for every later user/queue turn in the same session.
+      // Without this turn-scoped marker, a recovery fork that also exceeds
+      // context returns a new recovered_session id and the id-based guards
+      // below mistake it for permission to fork + resend forever.
+      const contextRecoveryAttempted = !!opts.contextRecoveryAttempted
+        || (isReconnect && !!sendState._contextRecoveryAttempted);
+      if (!isReconnect) {
+        sendState._contextRecoveryAttempted = contextRecoveryAttempted;
+      }
       // Continuation mode: a reconnect that attaches to the bg-task watcher's
       // HEADLESS CONTINUATION turn (it published the finished task's card flip
       // + the model's auto-continue reaction). Unlike a queue-drain reconnect,
@@ -21109,11 +29105,15 @@ function portal() {
       const expectedTurnId = isReconnect
         ? (opts.turnId || sendState.activeTurnId || "")
         : "";
-      // A normal reconnect rebuilds its in-flight suffix from replay, so its
-      // sequence checkpoint resets. Continuation reconnects append and retain
-      // their checkpoint only when retrying the exact same continuation.
-      if (!isReconnect || !isContinuation
-          || sendState.activeTurnId !== expectedTurnId) {
+      // Resume only when this pane still owns the exact same immutable turn.
+      // A cold reload or ABA turn change has no trustworthy checkpoint and uses
+      // the full replay path (sequence zero). Mid-turn transport reconnects keep
+      // their rendered suffix and ask only for events after this checkpoint.
+      const resumeEventSeq = isReconnect && !!expectedTurnId
+        && sendState.activeTurnId === expectedTurnId
+        ? Math.max(0, Number(sendState.lastEventSeq) || 0)
+        : 0;
+      if (!isReconnect || sendState.activeTurnId !== expectedTurnId) {
         sendState.lastEventSeq = 0;
       }
       if (expectedTurnId) sendState.activeTurnId = expectedTurnId;
@@ -21126,12 +29126,13 @@ function portal() {
       // the item (NOT from this.input / this.pendingImages — those may
       // hold a different draft the user has typed since enqueue).
       const resumed = opts.resumedItem || null;
-      // No-provider gate: with zero configured models every send would 401
-      // the Anthropic auth pre-check AND lock the session to the unreachable
-      // claude fallback on first send. Refuse the turn and route the user to
-      // Settings instead. Reconnect (attach to an in-flight turn) is exempt —
-      // it adds no new turn. This is the frontend half of the fix; the
-      // backend leaves new sessions' model empty until a provider exists.
+      let text;
+      if (isReconnect) text = "";
+      else if (resumed) text = (resumed.text || "").trim();
+      else text = composerText.trim();
+      // No-provider gate: with zero configured models every regular send would
+      // 401 the auth pre-check and pin the first turn to an unreachable
+      // fallback. Reconnects and the slash controls above are exempt.
       if (!isReconnect && (!this.availableModels || !this.availableModels.length)) {
         this.toast(
           this.lang === "zh" ? "请先在设置里配置一个模型" : "Configure a model in Settings first",
@@ -21139,41 +29140,13 @@ function portal() {
         this.openSettings();
         return;
       }
-      let text;
-      if (isReconnect) text = "";
-      else if (resumed) text = (resumed.text || "").trim();
-      else text = composerText.trim();
-      // Slash command: intercept BEFORE hitting the SDK. /word or /word arg.
-      // Resumed items can't reach the slash branch — slash is processed
-      // before enqueue, so a queued item is always plain text. While
-      // busy (streaming/compacting), slash commands are intentionally NOT
-      // enqueued — they're meta-actions (/clear, /compact, /export) that
-      // depend on session state at execution time, not user intent at
-      // type time. We toast "wait for this turn to finish" instead.
-      if (!isReconnect && !resumed && text.startsWith("/")) {
-        const m = text.match(/^\/(\w+)(?:\s+(.*))?$/);
-        if (m) {
-          if (await this._confirmSessionBusy(sendSid, sendState)) {
-            this.toast(this.t("queue.slash_blocked"), "warn", 3000);
-            return;
-          }
-          if (ownsSendDraft() && sendDraft.input === composerText) {
-            sendDraft.input = "";
-            this._resetChatInputHistory(sendDraft);
-            if (this.currentId === sendSid) this.input = "";
-          }
-          this.$nextTick(() => { if (this.currentId === sendSid && this.$refs.chatInput) this.autoGrow(this.$refs.chatInput); });
-          await this._runSlash(m[1], m[2] || "");
-          return;
-        }
-      }
       let readyImages = [], readyDocs = [];
       if (isReconnect) {
         if (sendState.streaming || sendState.es) return;
       } else {
         const hasAttachments = resumed
           ? !!((resumed.pendingImages || []).length || (resumed.pendingDocs || []).length)
-          : !!(composerImages.length || composerDocs.length);
+          : !!(composerImages.length || composerDocs.length || composerQuotes.length);
         if (!text && !hasAttachments) return;
       }
       // If any attachment is still mid-upload, silently wait for it to
@@ -21188,7 +29161,6 @@ function portal() {
       // exits naturally with a red-border chip the user can remove + retry.
       // The send button stays disabled (_sendWaitingForUpload) so a double-
       // tap can't enqueue a second send while we wait.
-      let sentUserBubble = null;
       if (!isReconnect) {
         // For resumed items use their own snapshot; otherwise use the composer
         // snapshot captured before any await. Never drift to another tab's
@@ -21198,6 +29170,7 @@ function portal() {
         const stillUploading = () => ownedImages.some(im => im.uploading)
           || ownedDocs.some(d => d.uploading);
         if (stillUploading()) {
+          this._setComposerClaimPhase(sendState, composerSubmitToken, "upload");
           sendDraft._sendWaitingForUpload = true;
           if (sendSid === this.currentId) this._sendWaitingForUpload = true;
           try {
@@ -21211,6 +29184,7 @@ function portal() {
             }
           }
           if (!ownsSendDraft()) return false;
+          this._setComposerClaimPhase(sendState, composerSubmitToken, "submitting");
         }
         // An attachment is part of the user's send intent. If any upload failed,
         // keep every chip/draft in place and refuse the send instead of silently
@@ -21227,66 +29201,36 @@ function portal() {
         readyImages = ownedImages.slice();
         readyDocs = ownedDocs.slice();
       }
-      // A newly opened tab is optimistic until POST /sessions lands. Do not
-      // launch the first turn before that durable index row exists: if the user
-      // cancels before the SDK writes its JSONL, activity would otherwise point
-      // at a session that was never persisted. Registration failure leaves the
-      // composer/attachments untouched so the user can retry safely.
-      if (!isReconnect && this._optimisticMetas[sendSid]) {
-        const registered = await this._ensureSessionRegistered(sendSid);
-        if (!registered) {
-          this.toast(this.lang === "zh"
-            ? "发送失败：新会话未能保存，请检查连接后重试"
-            : "Send failed: the new session could not be saved — check your connection and retry",
-            "error", 4500);
-          return false;
-        }
-      }
-      // Busy: streaming OR compacting → park on the pinned session's queue.
-      // Upload waiting and failure validation happen first so a programmatic
-      // send can never enqueue a text-only fallback while its attachment fails.
-      if (!isReconnect && !resumed
-          && await this._confirmSessionBusy(sendSid, sendState)) {
-        const ok = await this._enqueueMessage(sendSid, {
-          text,
-          pendingImages: composerImages,
-          pendingDocs: composerDocs,
-          permission: sendPermission,
-        });
-        if (!ok) return false;
-        clearSubmittedComposer();
-        if (this.currentId === sendSid) {
-          this.atBottom = true;
-          this.scrollToBottom(true);
-        }
-        return true;
-      }
-      // Push to the SENDING tab's messages array (looked up via sendSid),
-      // not this.messages — `this.messages` may have been re-aliased to a
-      // different tab if the user switched mid-await. See the "Pin target
-      // session" block at function entry for the full story.
-      // Reconnect mode skips pushing a user msg — the backend already
-      // has the user prompt from the original turn, and the
-      // broadcast-rebuild on `/sessions/{sid}` GET produced it for us.
+
+      // Commit the interaction to the screen before any network preflight. The
+      // payload snapshot above is immutable, so later registration/settings/busy
+      // checks can safely run after the textarea clears and the user bubble paints.
       if (!isReconnect) {
-        // Sending starts a new latest turn. If the user paged into an older
-        // window, collapse the bounded cache back to its newest window first.
+        if (!resumed && !hasDetachedText) {
+          clearSubmittedComposer({ preserveForHandshake: true });
+        }
         if (this.hasLaterMessages(sendSid)) {
           const latestLoaded = await this.returnToLatest(sendSid);
-          if (!latestLoaded || this.tabState[sendSid] !== sendState) return false;
+          if (!latestLoaded || this.tabState[sendSid] !== sendState) {
+            restoreSubmittedComposer(true);
+            return false;
+          }
         }
-        // Trim the live backlog before growing it again — keeps long
-        // sessions from ballooning the DOM past the mobile crash point.
-        this._capLiveMessages(sendState);
+        // Sending is an explicit request to resume tail-follow. Set ownership
+        // before appending so the optimistic user bubble enters the bounded range.
+        sendState.atBottom = true;
+        this._scheduleLiveMessageViewport(sendState);
         sentUserBubble = this._appendLiveMessage(sendState, {
           role: "user", text,
+          // The bubble exists before the server decides whether this prompt
+          // owns a turn or a queue slot.  Keep pane-level Running hidden until
+          // admission is authoritative.
+          _admissionPending: true,
+          _optimisticQueue: false,
+          displayText: hasDetachedText ? detachedDisplayText : composerInput,
+          selectionQuotes: composerQuotes.map(q => ({ ...q })),
           images: readyImages.map(im => ({
             preview: im.preview,
-            // Pre-compute the URL the backend will serve once it
-            // persists the full-res original (it does so the moment
-            // the SSE stream consumes the upload's aid). This makes
-            // the lightbox work even if the user reloads before the
-            // stream-completion annotation hook fires.
             url: (im.id && im.attach_ext && sendSid)
               ? `/api/chat/attachments/${sendSid}/${im.id}.${im.attach_ext}`
               : undefined,
@@ -21294,18 +29238,85 @@ function portal() {
           })),
           docs: readyDocs.map(d => ({ name: d.name, kind: d.kind })),
         });
-      } else if (!isContinuation) {
-        // Truncate the in-flight portion: the backend broadcast will
-        // replay every event from the start of the turn (thinking +
-        // assistant + tool_use + ...), and our handlers below push
-        // them as messages. The mid-turn rebuild that loadSession
-        // already populated would otherwise be duplicated, so drop
-        // anything after the most recent user msg before the replay
-        // fills it back in.
+        if (this.currentId === sendSid) {
+          sendState.atBottom = true;
+          this.scrollToBottom(true);
+        }
+      }
+
+      // A newly opened tab is optimistic until POST /sessions lands. Do not
+      // launch the first turn before that durable index row exists: if the user
+      // cancels before the SDK writes its JSONL, activity would otherwise point
+      // at a session that was never persisted. Registration failure leaves the
+      // failure rolls the optimistic bubble back and restores the exact payload.
+      if (!isReconnect && this._optimisticMetas[sendSid]) {
+        const registered = await this._ensureSessionRegistered(sendSid);
+        if (!registered) {
+          rollbackOptimisticSubmission();
+          this.toast(this.lang === "zh"
+            ? "发送失败：新会话未能保存，请检查连接后重试"
+            : "Send failed: the new session could not be saved — check your connection and retry",
+            "error", 4500);
+          return false;
+        }
+      }
+      if (!isReconnect
+          && !await this._awaitRuntimeSettingPatches(sendSid, sendState)) {
+        rollbackOptimisticSubmission();
+        return false;
+      }
+      // Busy: streaming OR compacting → park on the pinned session's queue.
+      // Upload waiting and failure validation happen first so a programmatic
+      // send can never enqueue a text-only fallback while its attachment fails.
+      const confirmedBusy = !isReconnect && !resumed
+        ? await this._confirmSessionBusy(sendSid, sendState)
+        : false;
+      if (confirmedBusy) {
+        if (sentUserBubble) sentUserBubble._optimisticQueue = true;
+        this._setComposerClaimPhase(sendState, composerSubmitToken, "queue");
+        const shouldHandoffBackground = !sendState.streaming
+          && !sendState.compacting
+          && sendState.backgroundActive
+          && !opts._backgroundRolloverAttempted;
+        const ok = await this._enqueueMessage(sendSid, {
+          text,
+          displayText: composerInput,
+          pendingImages: composerImages,
+          pendingDocs: composerDocs,
+          pendingQuotes: composerQuotes,
+          permission: sendPermission,
+          plan_return_permission: sendPlanReturnPermission,
+        });
+        if (!ok) {
+          rollbackOptimisticSubmission();
+          return false;
+        }
+        if (sentUserBubble) {
+          this._removePaneMessage(sendState, sentUserBubble);
+          sentUserBubble = null;
+        }
+        if (isComposerSubmission) {
+          this._commitChatRecoveryDraft(sendSid, composerInput);
+        }
+        if (shouldHandoffBackground) {
+          this._scheduleBackgroundHandoff(sendSid, sendState);
+        }
+        if (this.currentId === sendSid) {
+          sendState.atBottom = true;
+          this.scrollToBottom(true);
+        }
+        return true;
+      }
+      // Reconnect mode has no optimistic user bubble: the backend already owns
+      // the prompt and its canonical replay replaces any stale rendered suffix.
+      if (isReconnect && !isContinuation && resumeEventSeq === 0) {
+        // Cold/legacy reconnect: the backend will replay every event from the
+        // start of the turn, so discard the already-rendered suffix first.
+        // Incremental reconnects retain it and request only missing sequences.
         const roles = sendState.messages.map(m => m.role);
         const lastUserIdx = roles.lastIndexOf("user");
         if (lastUserIdx >= 0 && lastUserIdx < sendState.messages.length - 1) {
-          sendState.messages.splice(lastUserIdx + 1);
+          this._truncatePaneMessagesFrom(sendState, sendState.messages[lastUserIdx + 1]);
         }
       }
       // (isContinuation: keep the existing messages intact — the watcher's
@@ -21317,13 +29328,9 @@ function portal() {
         ...readyImages.map(im => im.id),
         ...readyDocs.map(d => d.id),
       ];
-      // Reconnect: nothing to clear. Resumed: input/pendingImages were
-      // already cleared at enqueue time, and the user may have typed a
-      // new draft since — don't touch their work-in-progress.
-      if (!isReconnect && !resumed) {
-        // Remove only the captured payload; a newer draft typed during an await
-        // stays in the still-global Phase 1 composer.
-        clearSubmittedComposer();
+      // The ordinary composer was already cleared before network preflight.
+      // Restore desktop focus after those awaits without touching a newer draft.
+      if (!isReconnect && !resumed && !hasDetachedText) {
         this.$nextTick(() => {
           if (this.currentId !== sendSid) return;
           const ta = this.$refs.chatInput;
@@ -21341,7 +29348,7 @@ function portal() {
           if (!this._isMobileLayout()) ta.focus();
         });
       }
-      this._cancelMentionLookup();
+      if (!hasDetachedText) this._cancelMentionLookup();
       // streamSid + streamState alias the sendSid snapshot taken at function
       // entry. We KEEP the local names `streamSid` / `streamState` because
       // every downstream event handler (text / thinking / tool_use / done /
@@ -21361,42 +29368,30 @@ function portal() {
         streamState._serverActiveObserved = false;
         // A real new local turn supersedes any just-finished list expectation.
         streamState._sessionActivityExpected = null;
+        // Fresh turn ⇒ fresh reconnect budget. This is the ONLY place the
+        // transport-retry counter is cleared; see es.onopen /
+        // _retireStaleSessionStream for why resetting it elsewhere made the
+        // MAX_ATTEMPTS ceiling unreachable.
+        streamState._reconnectAttempts = 0;
+        streamState._reconnectGateTurn = "";
+        streamState._reconnectGateCount = 0;
+        streamState._reconnectGateAt = 0;
       }
+      // A live owner supersedes any foreground history shield. Advancing the
+      // visual generation makes an older load response unable to turn the live
+      // pane into either a loading or error surface when it eventually settles.
+      this._releaseTranscriptLoadForLive(streamState);
       streamState.streaming = true;
+      if (!isReconnect || !streamState.streamPhase) {
+        streamState.streamPhase = "connecting";
+      }
       streamState._continuationAwaitingReaction = false;
-      if (streamSid === this.currentId) this.streaming = true;
-      // A live turn renders DIRECTLY into the visible pane, so it must never be
-      // hidden by the bulk-reveal gate. `messagesReady=false` drives
-      // `.chat-body.msgs-hidden .msg { display:none }` + the loading skeleton —
-      // a mechanism that exists ONLY for loadSession's chunked reveal of
-      // historical bubbles. But messagesReady is GLOBAL root state and only
-      // flips back to true inside switchSession / loadSession reveal callbacks
-      // that are guarded `if (this.currentId !== target) return`. If that reveal
-      // is skipped — rapid tab switch, or hitting "+" (newSession) right after a
-      // session started loading — messagesReady is left STUCK at false. On the
-      // next send, the moment messages.length goes >0 the msgs-hidden class
-      // engages and the ENTIRE reply (and the user's own bubble) renders
-      // display:none. The data still streams + persists to JSONL, so a full PWA
-      // restart re-runs loadSession's reveal and the reply "appears" — exactly
-      // the "new session, first reply invisible until restart" report. Force the
-      // reveal whenever we stream into the ACTIVE tab; there is nothing to
-      // lazy-reveal once the user is actively sending into the pane they see.
+      // A live turn renders directly into its pane; historical chunk readiness
+      // must never hide the user's bubble or the streamed reply.
       streamState.messagesReady = true;
       streamState.messagesLoading = false;
-      if (streamSid === this.currentId) {
-        this.messagesReady = true;
-        this.messagesLoading = false;
-      }
-      // [resident-panes] A tab with a live stream must stay mounted even if the
-      // user tabs away — its bubbles are being written by the SSE handlers below.
-      // Promote it now (streamState.streaming is already true, so the LRU's
-      // streaming guard will refuse to evict it). When streamSid === currentId
-      // (the common case) this is a harmless re-promote of the front entry.
-      this._promoteResident(streamSid);
       streamState.streamingModel = sendModel;
-      // 锁定 — pending bubble 用它，不跟着 dropdown。只在 streamSid 仍是当前
-      // tab 时写 root 状态，否则只污染后台 tab 的显示。
-      if (streamSid === this.currentId) this.streamingModel = sendModel;
+      // 锁定在 origin owner 上——pending bubble 不跟着当前 dropdown 或切 tab 变化。
       // Start the wall-clock NOW, at submit-time — not later in es.onopen.
       // The previous setup waited for the SSE handshake (which can take
       // 1-3s on slow networks / cold backends) before the counter began
@@ -21431,126 +29426,206 @@ function portal() {
         _streamStartMs = Date.now();
       }
       streamState._streamStartedAt = _streamStartMs;
-      if (streamSid === this.currentId) this._streamStartedAt = _streamStartMs;
       const _initElapsed = Math.max(0, (Date.now() - _streamStartMs) / 1000);
       streamState.streamElapsed = _initElapsed;
-      if (streamSid === this.currentId) this.streamElapsed = _initElapsed;
       // Tick immediately so the footer shows 0.0s right after submit
       // (without waiting for the first 200ms interval tick).
       if (streamState._streamTimer) clearInterval(streamState._streamTimer);
       streamState._streamTimer = setInterval(() => {
         const elapsed = (Date.now() - streamState._streamStartedAt) / 1000;
         streamState.streamElapsed = elapsed;
-        if (this.currentId === streamSid) this.streamElapsed = elapsed;
       }, 1000);
-      if (streamSid === this.currentId) this._streamTimer = streamState._streamTimer;
       if (streamSid === this.currentId) {
-        this.atBottom = true;
+        streamState.atBottom = true;
         this.scrollToBottom(true);
       }
 
-      // Ticket flow: POST the prompt + params with header auth, get a
-      // one-time ticket, open the SSE with ONLY the ticket in the URL.
-      // Keeps the user's prompt and the auth token out of access logs /
-      // browser history (EventSource can't send headers or a body).
-      // Legacy query-param fallback ONLY when the endpoint doesn't exist
-      // (old backend → 404/405). A 5xx or network blip must NOT silently
-      // downgrade to putting the prompt + token back into the URL — retry
-      // the ticket once, then surface the failure instead.
+      // Mux flow: one root EventSource receives every session. This send only
+      // admits a new turn, then installs an EventSource-compatible per-session
+      // channel so the reducer below remains the sole event/state implementation.
+      // Legacy per-session SSE is used only after an explicit 404/405 capability
+      // response from the mux or turn-start endpoint.
       let url;
+      let es;
+      let useMux = false;
+      this._setComposerClaimPhase(sendState, composerSubmitToken, "stream_start");
       const streamStartController = new AbortController();
       streamState._streamStartController = streamStartController;
       streamState._cancelBeforeStream = false;
-      const _mintTicket = async () => {
-        const tr = await fetch("/api/chat/stream/start", {
-          method: "POST",
-          headers: Object.assign({ "Content-Type": "application/json" }, this.hdr()),
-          signal: streamStartController.signal,
-          body: JSON.stringify({
-            prompt: text,
-            session_id: streamSid,
-            turn_id: expectedTurnId,
-            model: sendModel,
-            permission: sendPermission,
-            image_ids: attachIds.length ? attachIds.join(",") : "",
-            mobile: streamMobile,
-          }),
-        });
-        return tr;
-      };
-      // Stop pressed while the ticket POST was still in flight: no backend turn
-      // was ever created, so the optimistic user bubble is a lie — it would sit
-      // in the transcript forever, unanswered and unrecoverable (a reload drops
-      // it because the server never persisted it). Roll the send back to the
-      // composer so the text stays editable and re-sendable.
-      const discardCancelledSend = () => {
+      // Stop/start failure before a channel opens removes the optimistic bubble,
+      // restores the full local payload and resets every stream flag/timer without
+      // relying on the later-scoped _markDone closure.
+      const rollbackUnstartedSend = (restoreDraft = true) => {
         if (sentUserBubble) {
           this._removePaneMessage(streamState, sentUserBubble);
           sentUserBubble = null;
         }
-        if (ownsSendDraft() && !sendDraft.input) sendDraft.input = composerText;
-        if (sendSid === this.currentId) this._activateComposerState(sendSid);
+        if (restoreDraft) restoreSubmittedComposer(true);
+        if (streamState._streamTimer) clearInterval(streamState._streamTimer);
+        if (streamState._stallWatch) clearInterval(streamState._stallWatch);
+        streamState._streamTimer = null;
+        streamState._stallWatch = null;
+        streamState._streamStartedAt = 0;
+        streamState.streamElapsed = 0;
+        streamState.streaming = false;
+        streamState.streamPhase = "";
+        streamState._continuationAwaitingReaction = false;
+        streamState.es = null;
+        streamState._streamStartController = null;
+        streamState._cancelBeforeStream = false;
+        streamState._stoppingTurnId = "";
+        streamState._serverActiveObserved = false;
+        streamState.activeTurnId = "";
+        streamState.parentTurnId = "";
+        streamState.lastEventSeq = 0;
+        streamState.streamingModel = "";
       };
+      const _mintLegacyTicket = async () => await fetch("/api/chat/stream/start", {
+        method: "POST",
+        headers: Object.assign({ "Content-Type": "application/json" }, this.hdr()),
+        signal: streamStartController.signal,
+        body: JSON.stringify({
+          prompt: text,
+          session_id: streamSid,
+          turn_id: expectedTurnId,
+          last_event_seq: resumeEventSeq,
+          model: sendModel,
+          permission: sendPermission,
+          image_ids: attachIds.length ? attachIds.join(",") : "",
+          mobile: streamMobile,
+        }),
+      });
       try {
-        let tr = await _mintTicket();
-        if (tr.status === 404 || tr.status === 405) {
-          // Old backend without /stream/start — legacy URL is the contract.
-          url = "/api/chat/stream"
-            + "?prompt=" + encodeURIComponent(text)
-            + "&session_id=" + encodeURIComponent(streamSid)
-            + "&turn_id=" + encodeURIComponent(expectedTurnId)
-            + "&model=" + encodeURIComponent(sendModel)
-            + "&permission=" + encodeURIComponent(sendPermission)
-            + "&mobile=" + (streamMobile ? "1" : "0")
-            + (attachIds.length ? "&image_ids=" + encodeURIComponent(attachIds.join(",")) : "")
-            + "&token=" + encodeURIComponent(this.token);
-        } else {
-          if (!tr.ok) {
-            // Transient 5xx — one retry before giving up.
-            tr = await _mintTicket();
+        const muxReady = await this._ensureChatMux();
+        if (muxReady) {
+          useMux = true;
+          let admittedTurnId = expectedTurnId;
+          if (!isReconnect) {
+            const startTurn = async () => await fetch("/api/chat/turns/start", {
+              method: "POST",
+              headers: Object.assign({ "Content-Type": "application/json" }, this.hdr()),
+              signal: streamStartController.signal,
+              body: JSON.stringify({
+                prompt: text,
+                session_id: streamSid,
+                model: sendModel,
+                permission: sendPermission,
+                image_ids: attachIds.length ? attachIds.join(",") : "",
+                mobile: streamMobile,
+              }),
+            });
+            let tr = await startTurn();
+            if (tr.status === 404 || tr.status === 405) {
+              this._setChatMuxUnsupported();
+              useMux = false;
+            } else {
+              if (tr.status === 409 && !resumed) {
+                if (sentUserBubble) sentUserBubble._optimisticQueue = true;
+                const queued = await this._enqueueMessage(streamSid, {
+                  text,
+                  displayText: hasDetachedText ? detachedDisplayText : composerInput,
+                  pendingImages: hasDetachedText ? [] : composerImages,
+                  pendingDocs: hasDetachedText ? [] : composerDocs,
+                  pendingQuotes: hasDetachedText ? [] : composerQuotes,
+                  permission: sendPermission,
+                  plan_return_permission: sendPlanReturnPermission,
+                });
+                if (queued) {
+                  rollbackUnstartedSend(false);
+                  if (isComposerSubmission) {
+                    this._commitChatRecoveryDraft(sendSid, composerInput);
+                  }
+                  this.toast(this.lang === "zh"
+                    ? "当前任务仍在收尾，消息已加入队列"
+                    : "The current task is still finishing; message queued",
+                  "info", 2800);
+                  return true;
+                }
+              }
+              if (!tr.ok) tr = await startTurn();
+              if (!tr.ok) throw new Error("turn start " + tr.status);
+              const admitted = await tr.json();
+              if (admitted.accepted === false || !admitted.turn_id) {
+                throw new Error("turn not accepted");
+              }
+              admittedTurnId = String(admitted.turn_id);
+              streamState.activeTurnId = admittedTurnId;
+              streamState.parentTurnId = "";
+              streamState.lastEventSeq = 0;
+              if (sentUserBubble) {
+                sentUserBubble._turnId = admittedTurnId;
+                sentUserBubble._admissionPending = false;
+              }
+              if (Number(admitted.started_at) > 0) {
+                streamState._streamStartedAt = Number(admitted.started_at) * 1000;
+              }
+            }
           }
-          if (!tr.ok) throw new Error("ticket " + tr.status);
-          const td = await tr.json();
-          url = "/api/chat/stream?ticket=" + encodeURIComponent(td.ticket);
+          if (useMux) {
+            es = this._chatMuxChannel(streamSid, admittedTurnId);
+          }
+        } else if (this._chatMuxSupported !== false) {
+          throw new Error("mux unavailable");
+        }
+        if (!useMux) {
+          let tr = await _mintLegacyTicket();
+          if (tr.status === 404 || tr.status === 405) {
+            url = "/api/chat/stream"
+              + "?prompt=" + encodeURIComponent(text)
+              + "&session_id=" + encodeURIComponent(streamSid)
+              + "&turn_id=" + encodeURIComponent(expectedTurnId)
+              + "&last_event_seq=" + encodeURIComponent(resumeEventSeq)
+              + "&model=" + encodeURIComponent(sendModel)
+              + "&permission=" + encodeURIComponent(sendPermission)
+              + "&mobile=" + (streamMobile ? "1" : "0")
+              + (attachIds.length ? "&image_ids=" + encodeURIComponent(attachIds.join(",")) : "")
+              + "&token=" + encodeURIComponent(this.token);
+          } else {
+            if (!tr.ok) tr = await _mintLegacyTicket();
+            if (!tr.ok) throw new Error("ticket " + tr.status);
+            const td = await tr.json();
+            url = "/api/chat/stream?ticket=" + encodeURIComponent(td.ticket);
+          }
+          es = new EventSource(url);
         }
       } catch (_e) {
         if (streamState._cancelBeforeStream) {
-          // stop() already performed the authoritative local cleanup. The
-          // ticket was never consumed, so no backend turn/transcript exists.
-          discardCancelledSend();
+          rollbackUnstartedSend();
           return false;
         }
-        // Could not mint a ticket (server error / network) — fail the send
-        // visibly rather than leaking prompt+token into the URL.
-        this._markDone(streamSid);
+        rollbackUnstartedSend();
         this.toast(this.lang === "zh"
           ? "发送失败：无法建立流式连接，请重试"
           : "Send failed: could not start the stream — please retry",
           "error", 4000);
-        return;
+        return false;
       } finally {
         if (streamState._streamStartController === streamStartController) {
           streamState._streamStartController = null;
         }
       }
       if (streamState._cancelBeforeStream) {
-        // Ticket minted but Stop landed first — same rollback. The ticket is
-        // never consumed and expires on its own.
-        discardCancelledSend();
+        rollbackUnstartedSend();
         return false;
       }
-      const es = new EventSource(url);
       streamState.es = es;
-      if (streamSid === this.currentId) this.es = es;
-      // Reset auto-reconnect counter on each successful SSE open. NOTE
-      // — we deliberately do NOT (re)start the elapsed-time counter
-      // here. Timer + _streamStartedAt are set above at submit time so
-      // (a) the footer shows "0.0s" immediately instead of waiting
-      // through the SSE handshake, and (b) mid-stream reconnects don't
-      // visibly reset the displayed elapsed back to zero.
+      const streamTurnId = String(streamState.activeTurnId || expectedTurnId || "");
+      // NOTE — a successful open deliberately does NOT reset
+      // _reconnectAttempts. Every reconnect DOES open successfully (the
+      // backend replays the turn happily), so resetting here made the
+      // MAX_ATTEMPTS ceiling unreachable and let a reconnect loop run
+      // forever (2026-08-04 flicker storm). The budget is per-turn: it is
+      // cleared where a genuinely new turn is submitted (`!isReconnect` in
+      // send()), not on every transport open. We also deliberately
+      // do NOT (re)start the elapsed-time counter here: timer +
+      // _streamStartedAt are set above at submit time so (a) the footer shows
+      // "0.0s" immediately instead of waiting through the SSE handshake, and
+      // (b) mid-stream reconnects don't visibly reset the displayed elapsed.
       es.onopen = () => {
-        streamState._reconnectAttempts = 0;
         streamState._lastSseActivity = Date.now();
+        if (!hasDetachedText && !isReconnect && !resumed) {
+          this._commitChatRecoveryDraft(sendSid, composerInput);
+        }
       };
 
       // ── Silent-stall watchdog ──────────────────────────────────────────
@@ -21591,7 +29666,6 @@ function portal() {
               streamState._canonicalResyncReason = "turn_changed";
               try { es.close(); } catch (_) {}
               if (streamState.es === es) streamState.es = null;
-              if (this.currentId === streamSid && this.es === es) this.es = null;
               this._scheduleCanonicalStreamReload(streamSid, streamState);
               return;
             }
@@ -21611,24 +29685,58 @@ function portal() {
             }
           }
         }
+        if (sentUserBubble && !["ping", "error", "resync"].includes(ev && ev.type)) {
+          sentUserBubble._admissionPending = false;
+        }
+        if (ev && ev.type !== "error") {
+          this._cancelSessionSyncReason(streamState, "transport_retry");
+        }
         if (ev && ev.type !== "ping" && ev.type !== "error") {
           streamState._serverActiveObserved = true;
         }
+        if (ev && streamState.streamPhase !== "running" && [
+          "text", "thinking", "tool_use", "tool_result", "compact_progress",
+          "task_started", "task_progress", "task_notification", "rate_limit",
+          "ask_user_question", "permission_request", "permission_request_resolved",
+          "permission_mode_changed", "permission_mode_change_failed",
+        ].includes(ev.type)) {
+          streamState.streamPhase = "running";
+        }
       };
-      ["text", "thinking", "tool_use", "tool_result", "task_started",
+      ["startup", "text", "thinking", "tool_use", "tool_result", "compact_progress", "task_started",
        "task_progress", "task_notification", "rate_limit",
-       "ask_user_question", "permission_request", "ping",
+       "ask_user_question", "permission_request", "permission_request_resolved",
+       "permission_mode_changed",
+       "permission_mode_change_failed", "ping",
        "done", "error", "cancelled", "resync"].forEach(
         t => es.addEventListener(t, _bumpSse));
+      es.addEventListener("startup", ev => {
+        let payload = {};
+        try { payload = JSON.parse(ev.data) || {}; } catch (_) {}
+        const phase = String(payload.phase || "accepted");
+        if (streamState.streamPhase === "running") return;
+        const knownPhase = phase === "accepted" || phase === "runtime"
+          || phase === "tools" || phase === "context";
+        streamState.streamPhase = knownPhase ? phase : "accepted";
+      });
       if (streamState._stallWatch) clearInterval(streamState._stallWatch);
       streamState._stallWatch = setInterval(() => {
         if (!streamState.streaming) return;
         const silentMs = Date.now() - (streamState._lastSseActivity || 0);
-        if (silentMs > 40000 && !streamState._streamHealthProbe) {
-          // 40s of total silence (server pings every 15s → ≥2 missed) means
-          // the connection is dead in a way onerror never caught. Tear down
-          // the watchdog and drive the existing reconnect logic via a
-          // synthetic error (no ev.data → JSON.parse throws → transport path).
+        const sync = streamState.sessionSync;
+        const healthProbePending = !!(sync && (
+          (sync.inFlight && sync.inFlight.reason === "stream_health")
+          || (sync.pending && sync.pending.stream_health)
+        ));
+        if (silentMs > 40000 && !healthProbePending) {
+          // A mux channel never owns the native socket. Reconnect the one root
+          // transport without sending a synthetic per-session terminal/error.
+          if (es._muxChannel) {
+            this._scheduleChatMuxReconnect();
+            this._recoverStalledStream(streamSid);
+            return;
+          }
+          // Legacy per-session SSE keeps the existing transparent retry path.
           clearInterval(streamState._stallWatch);
           streamState._stallWatch = null;
           try { es.dispatchEvent(new Event("error")); } catch (_) {}
@@ -21644,24 +29752,33 @@ function portal() {
       // tab is active).
       let curBubble = null;
       let acc = "";
+      let thinkingBubble = null;
+      let thinkingAcc = "";
+      const pendingTaskProgress = new Map();
+      if (isReconnect && resumeEventSeq > 0 && !isContinuation) {
+        const existing = streamState.messages;
+        const tail = existing[existing.length - 1];
+        if (tail && tail.role === "assistant") {
+          curBubble = tail;
+          acc = tail.text || "";
+        }
+      }
       const modelForBubble = sendModel;
-      // Scroll only if the active tab is the one receiving the stream;
-      // otherwise we'd yank the user away from whatever they're reading.
+      // Every event mutates reactive state synchronously, but physical scrolling
+      // is shared and single-flight: one burst gets at most one layout pass/frame.
+      let _scrollCoalesceHandle = null;
       const _scrollIfActive = () => {
-        this._capLiveMessages(streamState);
-        if (this.currentId !== streamSid) return;
-        // Mid-stream DOM cap (root-cause fix for the mobile freeze on long
-        // turns). _capLiveMessages otherwise only runs at user-send, so a
-        // SINGLE long agentic turn — dozens of thinking / tool_use /
-        // tool_result bubbles pushed before the user types again — grows
-        // messages[] (and the rendered DOM) without bound. On phones the
-        // ballooning DOM eventually freezes the WebView. Trim from the
-        // front on every render/append tick: it's O(1) when under cap, and
-        // splice(0, overflow) can never touch the streaming tail bubble.
-        // Gate on atBottom — the same guard scrollToBottom uses — so we
-        // never evict (and visually jump) while the user has scrolled up to
-        // read history. Evicted bubbles land in the "Load earlier" stash.
-        if (this.atBottom) this.scrollToBottom(false);
+        if (_scrollCoalesceHandle !== null) return;
+        const run = () => {
+          _scrollCoalesceHandle = null;
+          if (!ownsStreamState()) return;
+          this._scheduleLiveMessageViewport(streamState);
+          if (this.currentId !== streamSid || streamState.atBottom === false) return;
+          this.scrollToBottom(false);
+        };
+        _scrollCoalesceHandle = (typeof requestAnimationFrame === "function")
+          ? requestAnimationFrame(run)
+          : setTimeout(run, 16);
       };
       const ownsStreamState = () => this.tabState[streamSid] === streamState;
       const ownsCurBubble = () => ownsStreamState() && !!curBubble
@@ -21682,7 +29799,8 @@ function portal() {
         // empty / null so x-show defaults match "not yet computed".
         const bubble = {
           role: "assistant",
-          text: "", html: "", cost: "",
+          text: "", html: "", _streamText: "", _streamPlain: true,
+          _deferredRichReady: false, cost: "",
           model: modelForBubble,
           ts: null,
           elapsed: 0,
@@ -21703,83 +29821,119 @@ function portal() {
         acc = "";
         return true;
       };
-      // Throttle markdown rendering during fast token streams. mdRender
-      // re-parses the FULL accumulated text every tick, so the per-render cost
-      // grows with reply length (O(n) per render → O(n²) over the whole
-      // reply). On long replies — and especially on phones — re-parsing every
-      // 80ms pegs the CPU and heats the device. Stretch the interval as `acc`
-      // grows so total re-parse work stays bounded; short replies keep the
-      // snappy 80ms feel. flushRender() always paints the complete final text
-      // on done/close, so stretching never loses content.
-      const _renderInterval = () => {
-        // Desktop always keeps rich markdown, but very long replies still need
-        // a modest cadence increase to avoid reparsing 100+ KiB every 80 ms.
-        const n = acc.length;
-        if (!streamMobile) {
-          if (n < 32 * 1024) return 80;
-          if (n < 128 * 1024) return 160;
-          return 320;
+      const surfaceTerminalError = detail => {
+        const text = String(detail || "");
+        if (!text) return;
+        if (ownsCurBubble()) {
+          if (!acc) {
+            acc = text;
+            curBubble.text = text;
+            curBubble.error = text;
+            renderFinal();
+            return;
+          }
+          if (acc === text) {
+            curBubble.error = text;
+            return;
+          }
+          // Preserve a legitimate partial/complete answer and surface the
+          // terminal failure as its own visible row. `m.error` is metadata,
+          // not rendered prose, so stamping it on a non-empty prior bubble
+          // would leave the actual failure visible only in the toast.
+          closeAsst();
         }
-        if (n < 2000) return 80;
-        if (n < 8000) return 160;
-        if (n < 20000) return 320;
-        // Very long replies: stretch the interval hard so the total re-parse
-        // work stays bounded. marked.parse + DOMPurify is O(n) per render, so
-        // a 100KB reply re-parsed every 600ms pegs a phone CPU at 100% for the
-        // whole stream (heat + freeze). flushRender() always paints the
-        // complete final text on done, so stretching never drops content.
-        if (n < 50000) return 600;
-        if (n < 120000) return 1000;
-        return 1600;
+        if (!openAsst() || !ownsCurBubble()) return;
+        acc = text;
+        curBubble.text = text;
+        curBubble.error = text;
+        renderFinal();
       };
-      let lastRender = 0;
+      // SSE deltas only append to `acc`. While the segment is open, paint a
+      // lightweight text snapshot at most once per frame/time slice; never feed
+      // the ever-growing prefix back through marked/DOMPurify. A tool/thinking
+      // boundary or terminal event performs the one complete rich render.
+      const STREAM_PAINT_MS = streamMobile ? 50 : 32;
+      let lastPlainPaint = 0;
+      let pendingFrame = null;
       let pendingTimer = null;
-      // final=true → the message is complete (done / tool boundary): run the
-      // full render (KaTeX + file-link linkify). final=false → throttled
-      // in-flight tick: cheap parse+sanitize only.
-      const renderNow = (final = false) => {
-        if (!ownsCurBubble()) {
-          curBubble = null; acc = ""; pendingTimer = null; return;
+      const cancelPendingPaint = () => {
+        if (pendingTimer) clearTimeout(pendingTimer);
+        if (pendingFrame && typeof cancelAnimationFrame === "function") {
+          cancelAnimationFrame(pendingFrame);
         }
-        // Beyond 32 KiB, repeatedly reparsing the full accumulated markdown is
-        // quadratic. Keep a safe x-text preview until the segment/done boundary,
-        // then perform exactly one final rich render.
-        if (!final && streamMobile && acc.length > 32 * 1024) {
-          curBubble._streamPlain = true;
-          curBubble.html = "";
-          streamState._streamPlainRenderCount++;
-        } else {
-          curBubble.html = this._mdRenderUncached(acc, { streaming: !final });
-          curBubble._streamPlain = false;
-          streamState._streamRichRenderCount++;
-        }
-        lastRender = Date.now();
         pendingTimer = null;
-        // Coalesce auto-scroll onto the throttled render tick. Scrolling on
-        // every token forced a full reflow (scrollHeight read) of the entire
-        // message DOM per chunk — O(conversation length) per token, the main
-        // reason long conversations froze mid-stream. Now it fires at most
-        // once per render instead of once per token.
+        pendingFrame = null;
+      };
+      const paintPlainNow = () => {
+        pendingTimer = null;
+        pendingFrame = null;
+        if (!ownsCurBubble()) { curBubble = null; acc = ""; return; }
+        if (this.currentId !== streamSid) return;
+        curBubble.text = acc;
+        curBubble._streamText = acc;
+        curBubble._streamPlain = true;
+        lastPlainPaint = Date.now();
+        streamState._streamPlainRenderCount++;
         _scrollIfActive();
       };
-      const scheduleRender = () => {
-        const interval = _renderInterval();
-        const since = Date.now() - lastRender;
-        if (since >= interval) {
-          renderNow();
-        } else if (!pendingTimer) {
-          pendingTimer = setTimeout(renderNow, interval - since);
+      const schedulePlainPaint = () => {
+        if (this.currentId !== streamSid || pendingTimer || pendingFrame) return;
+        const queueFrame = () => {
+          pendingTimer = null;
+          if (typeof requestAnimationFrame === "function") {
+            pendingFrame = requestAnimationFrame(paintPlainNow);
+          } else {
+            pendingTimer = setTimeout(paintPlainNow, 0);
+          }
+        };
+        const wait = Math.max(0, STREAM_PAINT_MS - (Date.now() - lastPlainPaint));
+        if (wait) pendingTimer = setTimeout(queueFrame, wait);
+        else queueFrame();
+      };
+      const renderFinal = () => {
+        if (!ownsCurBubble()) {
+          cancelPendingPaint();
+          curBubble = null; acc = ""; return;
         }
+        cancelPendingPaint();
+        curBubble.text = acc;
+        curBubble._streamText = acc;
+        curBubble.html = this._renderHistoryMessage(curBubble);
+        curBubble._streamPlain = false;
+        curBubble._deferredRichReady = false;
+        streamState._streamRichRenderCount++;
+        _scrollIfActive();
       };
       const flushRender = () => {
-        if (pendingTimer) { clearTimeout(pendingTimer); pendingTimer = null; }
-        // final=true: this bubble is done (stream end / tool boundary), so do
-        // the full render incl. KaTeX + file-path linkify that the throttled
-        // ticks skipped.
-        if (ownsCurBubble()) renderNow(true);
-        else { curBubble = null; acc = ""; }
+        if (ownsCurBubble()) renderFinal();
+        else { cancelPendingPaint(); curBubble = null; acc = ""; }
       };
-      const closeAsst = () => { flushRender(); curBubble = null; acc = ""; };
+      const flushPlainBoundary = () => {
+        cancelPendingPaint();
+        if (!ownsCurBubble()) { curBubble = null; acc = ""; return; }
+        curBubble.text = acc;
+        curBubble._streamText = acc;
+        curBubble._streamPlain = true;
+        if (this.currentId === streamSid) _scrollIfActive();
+      };
+      const closeAsst = () => {
+        const completedBubble = ownsCurBubble() ? curBubble : null;
+        flushPlainBoundary();
+        if (completedBubble) {
+          this._queueDeferredStreamRich(streamSid, streamState, completedBubble);
+        }
+        curBubble = null;
+        acc = "";
+      };
+      const flushThinking = () => {
+        if (!ownsStreamState() || !thinkingBubble) return;
+        thinkingBubble.text = thinkingAcc;
+      };
+      const closeThinking = () => {
+        flushThinking();
+        thinkingBubble = null;
+        thinkingAcc = "";
+      };
       const _setContinuationAwaitingReaction = (waiting) => {
         if (!isContinuation) return;
         const next = !!waiting;
@@ -21792,11 +29946,6 @@ function portal() {
           }
           streamState._streamStartedAt = 0;
           streamState.streamElapsed = 0;
-          if (this.currentId === streamSid) {
-            this._streamTimer = null;
-            this._streamStartedAt = 0;
-            this.streamElapsed = 0;
-          }
           return;
         }
         if (!streamState.streaming || streamState._streamTimer) return;
@@ -21805,95 +29954,115 @@ function portal() {
           const elapsed = Math.max(
             0, (Date.now() - streamState._streamStartedAt) / 1000);
           streamState.streamElapsed = elapsed;
-          if (this.currentId === streamSid) this.streamElapsed = elapsed;
         }, 1000);
-        if (this.currentId === streamSid) {
-          this._streamStartedAt = streamState._streamStartedAt;
-          this._streamTimer = streamState._streamTimer;
-        }
       };
 
-      // Re-render the in-flight assistant bubble from the accumulated text.
-      // Exposed on streamState so the global selectionchange guard (see
-      // _initStreamSelectionGuard) can flush a deferred render once the user
-      // releases their text selection. Re-reads curBubble/acc from the closure
-      // every call, so it stays correct even after openAsst/closeAsst swap
-      // bubbles mid-stream.
+      // Exposed on streamState so the global selectionchange guard can publish
+      // the latest plain snapshot after the user releases a selection. Rich HTML
+      // remains reserved for closeAsst()/done boundaries.
       const renderStreamingHtml = () => {
-        // Mid-stream deferred render (selection cleared): cheap path. The
-        // done-handler's flushRender does the full final pass.
-        if (ownsCurBubble()) {
-          if (streamMobile && acc.length > 32 * 1024) {
-            curBubble._streamPlain = true;
-            curBubble.html = "";
-            streamState._streamPlainRenderCount++;
-          } else {
-            curBubble.html = this._mdRenderUncached(acc, { streaming: true });
-            curBubble._streamPlain = false;
-            streamState._streamRichRenderCount++;
-          }
-        } else { curBubble = null; acc = ""; }
+        if (ownsCurBubble()) schedulePlainPaint();
+        else { cancelPendingPaint(); curBubble = null; acc = ""; }
         streamState._pendingHtmlRender = null;
       };
       streamState._renderStreamingHtml = renderStreamingHtml;
 
-      // Attach SDK-native background-task lifecycle state to the launching
-      // tool_use card. The Task* messages (TaskStarted/Progress/Notification)
-      // carry tool_use_id = the SDK id of the Agent/Bash tool_use that started
-      // the background task, so we locate that message in the live turn and
-      // stamp `task_status` on it. The subagent card (index.html) renders
-      // ⏳ running → ✅/❌ from this. merge=true so a later progress/terminal
-      // event keeps fields an earlier event already set.
+      // Task lifecycle patches can arrive in large terminal bursts. Index the
+      // resident repository once, then update cards in O(1) even when a hard DOM
+      // window has temporarily unmounted the launching row.
+      const taskCardByToolUseId = new Map();
+      const taskCardByTaskId = new Map();
+      let taskCardIndexReady = false;
+      const registerTaskCard = card => {
+        if (!card || card.role !== "tool_use") return;
+        if (card.id) taskCardByToolUseId.set(String(card.id), card);
+        const taskId = card.task_status && card.task_status.task_id;
+        if (taskId) taskCardByTaskId.set(String(taskId), card);
+      };
+      const ensureTaskCardIndex = () => {
+        if (taskCardIndexReady) return;
+        for (const message of streamState.messages) registerTaskCard(message);
+        taskCardIndexReady = true;
+      };
       const applyTaskStatus = (toolUseId, patch, merge = true) => {
-        const msgs = this._allPaneMessages(streamState);
-        for (let k = msgs.length - 1; k >= 0; k--) {
-          // role check is LOAD-BEARING: the tool_result bubble carries the
-          // SAME toolu_xxx id as its tool_use card and sits AFTER it, so a
-          // reverse scan on id alone hits the tool_result and stamps
-          // task_status where no template renders it. task_started slipped
-          // through only because the typed message arrives BEFORE the
-          // tool_result; every TERMINAL notification arrived after and was
-          // silently swallowed — the ⏳ card never flipped live (2026-06-11).
-          const byToolUse = !!toolUseId && msgs[k] && msgs[k].id === toolUseId;
-          // TaskUpdatedMessage deliberately has no top-level tool_use_id.
-          // Fall back to the task_id stamped by the earlier TaskStarted event,
-          // otherwise terminal-only task_updated patches leave the card on ⏳.
-          const byTask = !toolUseId && patch && patch.task_id && msgs[k]
-            && msgs[k].task_status
-            && msgs[k].task_status.task_id === patch.task_id;
-          if (msgs[k] && (byToolUse || byTask)
-              && msgs[k].role === "tool_use") {
-            const prev = (merge && msgs[k].task_status) ? msgs[k].task_status : {};
-            msgs[k].task_status = Object.assign({}, prev, patch);
-            return;
-          }
+        ensureTaskCardIndex();
+        let card = toolUseId
+          ? taskCardByToolUseId.get(String(toolUseId)) : null;
+        if (!card && patch && patch.task_id) {
+          card = taskCardByTaskId.get(String(patch.task_id));
         }
+        if (!card || card.role !== "tool_use") {
+          if (toolUseId) taskCardByToolUseId.delete(String(toolUseId));
+          if (patch && patch.task_id) taskCardByTaskId.delete(String(patch.task_id));
+          return;
+        }
+        const prev = (merge && card.task_status) ? card.task_status : {};
+        card.task_status = this._normalizeTaskStatusPreview(
+          Object.assign({}, prev, patch));
+        if (card.id) taskCardByToolUseId.set(String(card.id), card);
+        if (card.task_status.task_id) {
+          taskCardByTaskId.set(String(card.task_status.task_id), card);
+        }
+      };
+      const taskProgressKey = (toolUseId, patch) => String(
+        toolUseId || (patch && patch.task_id) || "",
+      );
+      const queueTaskProgress = (toolUseId, patch) => {
+        const key = taskProgressKey(toolUseId, patch);
+        if (!key) return;
+        const pending = pendingTaskProgress.get(key);
+        pendingTaskProgress.set(key, {
+          toolUseId,
+          patch: Object.assign({}, pending ? pending.patch : {}, patch),
+        });
+      };
+      const flushTaskProgress = () => {
+        if (!ownsStreamState() || !pendingTaskProgress.size) return;
+        for (const pending of pendingTaskProgress.values()) {
+          applyTaskStatus(pending.toolUseId, pending.patch);
+        }
+        pendingTaskProgress.clear();
+      };
+      const flushLivePresentation = () => {
+        if (!ownsStreamState() || this.currentId !== streamSid) return false;
+        if (ownsCurBubble()) paintPlainNow();
+        flushThinking();
+        flushTaskProgress();
+        return true;
+      };
+      streamState._flushLivePresentation = flushLivePresentation;
+      const flushTerminalPresentation = () => {
+        const completedBubble = ownsCurBubble() ? curBubble : null;
+        if (completedBubble && this.currentId === streamSid) {
+          flushRender();
+        } else if (completedBubble) {
+          flushPlainBoundary();
+          this._queueDeferredStreamRich(streamSid, streamState, completedBubble);
+        } else {
+          cancelPendingPaint(); curBubble = null; acc = "";
+        }
+        closeThinking();
+        flushTaskProgress();
+        const completedText = completedBubble ? (completedBubble.text || "") : "";
+        curBubble = null;
+        acc = "";
+        return { bubble: completedBubble, text: completedText };
       };
 
       es.addEventListener("text", ev => {
         let d;
         try { d = JSON.parse(ev.data); } catch (_) { return; }
         _setContinuationAwaitingReaction(false);
+        closeThinking();
         if (!openAsst()) return;
         acc += d.text;
-        curBubble.text = acc;
-        // Skip the mdRender → x-html assignment while the user has an active
-        // text selection in the chat body. x-html replaces innerHTML on every
-        // chunk, which forces the browser to collapse any selection inside the
-        // bubble — making "select while streaming, then Ctrl+C" impossible.
-        // We still accumulate `acc`; the selectionchange listener flushes a
-        // deferred render the moment the selection clears, and the `done`
-        // handler's flushRender catches anything still pending at stream end.
+        // Keep the currently painted snapshot stable while the user selects it.
+        // The closure accumulates every delta; reactive `text` and `_streamText`
+        // advance together only on the throttled paint or terminal flush.
         if (this._selectionInChatBody()) {
           streamState._pendingHtmlRender = renderStreamingHtml;
         } else {
-          // Throttle instead of re-parsing the full accumulated text on every
-          // token. scheduleRender() drives renderNow (which also coalesces the
-          // auto-scroll); flushRender() on done/close catches any trailing
-          // chunk still inside the throttle window. The scroll used to fire
-          // here on every token (forcing a full-DOM reflow per chunk) — it's
-          // now folded into renderNow so it runs at most once per render.
-          scheduleRender();
+          schedulePlainPaint();
         }
       });
       es.addEventListener("thinking", ev => {
@@ -21901,27 +30070,26 @@ function portal() {
         try { d = JSON.parse(ev.data); } catch (_) { return; }
         _setContinuationAwaitingReaction(false);
         closeAsst();
-        // Backend yields one SSE event per thinking_delta. Coalesce them
-        // into the most recent thinking message so we see ONE block per
-        // reasoning segment, not N tiny ones. If the tail isn't a thinking
-        // message (e.g. previous was tool_use), start a new one.
-        const msgs = this._allPaneMessages(streamState);
-        const last = msgs[msgs.length - 1];
-        let pushed = false;
-        if (last && last.role === "thinking") {
-          last.text = (last.text || "") + (d.text || "");
-        } else {
-          this._appendLiveMessage(streamState, { role: "thinking", text: d.text || "" });
-          pushed = true;
+        // Keep one thinking row per contiguous reasoning segment, but publish
+        // token-rate text only for the visible tab. Background streams retain
+        // the complete closure accumulator and flush once on activation/boundary.
+        if (!thinkingBubble) {
+          thinkingBubble = this._appendLiveMessage(
+            streamState, { role: "thinking", text: "" });
+          thinkingAcc = "";
         }
-
-        _scrollIfActive();
+        thinkingAcc += d.text || "";
+        if (this.currentId === streamSid) {
+          thinkingBubble.text = thinkingAcc;
+          _scrollIfActive();
+        }
       });
       es.addEventListener("tool_use", ev => {
         let d;
         try { d = JSON.parse(ev.data); } catch (_) { return; }
         _setContinuationAwaitingReaction(false);
         closeAsst();
+        closeThinking();
         // `id` is the SDK's toolu_xxx tool_use_id. Critical for
         // _taskSubjectMapForMessages — it pairs each TaskCreate
         // tool_use with the tool_result that carries the assigned
@@ -21932,6 +30100,9 @@ function portal() {
         // just forgot to copy it across).
         const msg = { role: "tool_use", name: d.name, id: d.id,
                        summary: d.summary, input: d.input,
+                       // ExitPlanMode's later permission_request replaces this
+                       // passive plan card with the actionable approval card.
+                       _approvalSuperseded: false,
                        // Pre-declare the reactive key so a later
                        // task_started/notification event (applyTaskStatus)
                        // reliably triggers Alpine re-render. Adding a
@@ -21941,7 +30112,8 @@ function portal() {
         if (d.todos != null) msg.todos = d.todos;
         if (d.task != null) msg.task = d.task;
         if (d.plan != null) msg.plan = d.plan;
-        this._appendLiveMessage(streamState, msg);
+        const liveToolCard = this._appendLiveMessage(streamState, msg);
+        registerTaskCard(liveToolCard);
         // File-mutating tools invalidate any open preview of the same file.
         // Bump previewVersion → rawUrl picks up a new ?_v= → iframe reloads;
         // _reloadPreviewIfDirty re-fetches md/text contents inline.
@@ -21990,16 +30162,19 @@ function portal() {
       es.addEventListener("task_progress", ev => {
         let d;
         try { d = JSON.parse(ev.data); } catch (_) { return; }
-        applyTaskStatus(d.tool_use_id, {
+        const patch = {
           task_id: d.task_id,
           state: "running",
           usage: d.usage || null,
           last_tool_name: d.last_tool_name || "",
-        });
+        };
+        if (this.currentId === streamSid) applyTaskStatus(d.tool_use_id, patch);
+        else queueTaskProgress(d.tool_use_id, patch);
       });
       es.addEventListener("task_notification", ev => {
         let d;
         try { d = JSON.parse(ev.data); } catch (_) { return; }
+        flushTaskProgress();
         // SDK status ∈ {completed, failed, stopped}; map unknown → "done"
         // so a future status value still renders a terminal (not stuck)
         // state instead of silently staying on ⏳.
@@ -22009,6 +30184,8 @@ function portal() {
           task_id: d.task_id,
           state: st,
           summary: d.summary || "",
+          summary_length: d.summary_length,
+          summary_truncated: d.summary_truncated,
           output_file: d.output_file || "",
         });
         const remaining = Number(d.background_tasks_pending);
@@ -22023,24 +30200,9 @@ function portal() {
         if (isContinuation && (!Number.isFinite(remaining) || remaining <= 0)) {
           _setContinuationAwaitingReaction(true);
         }
-        // User-perceivable settle feedback (mirrors the server's
-        // _on_task_settled which handles the away-from-screen case via
-        // presence-gated Web Push; this branch covers the at-screen case):
-        //   - toast, so a completion is noticed even when the card has
-        //     scrolled far off-screen;
-        //   - green unread dot when the launching session isn't the tab
-        //     being viewed (same affordance as a turn finishing elsewhere).
-        const zh = this.lang === "zh";
-        const label = st === "failed"
-          ? (zh ? "后台任务失败" : "Background task failed")
-          : st === "stopped"
-            ? (zh ? "后台任务已停止" : "Background task stopped")
-            : (zh ? "后台任务已完成" : "Background task finished");
-        this.toast(label, st === "failed" ? "error" : "info");
-        if (streamSid !== this.currentId) {
-          const ts = this.tabState[streamSid];
-          if (ts && !ts.streaming) ts.unread = true;
-        }
+        // A task notification only updates its existing card. User-visible
+        // completion feedback is the durable Agent continuation bubble; its
+        // revision adoption owns the off-screen unread dot exactly once.
         _scrollIfActive();
       });
       es.addEventListener("rate_limit", ev => {
@@ -22085,6 +30247,7 @@ function portal() {
         let d;
         try { d = JSON.parse(ev.data); } catch (_) { return; }
         closeAsst();
+        closeThinking();
         // Pre-populate pendingAnswers with one key per question (multiSelect
         // → []; single → null). Without this, Alpine's Proxy doesn't reliably
         // re-evaluate :class={picked: ...} when we add a brand-new key on
@@ -22114,17 +30277,156 @@ function portal() {
         let d;
         try { d = JSON.parse(ev.data); } catch (_) { return; }
         closeAsst();
+        closeThinking();
+        const exitPlan = d.kind === "exit_plan"
+          || d.kind === "exit_plan_mode"
+          || d.tool === "ExitPlanMode";
+        let planTool = null;
+        if (exitPlan) {
+          const toolUseId = d.tool_use_id || d.toolUseId || "";
+          const messages = streamState.messages;
+          for (let i = messages.length - 1; i >= 0; i--) {
+            const candidate = messages[i];
+            if (!candidate || candidate.role !== "tool_use"
+                || candidate.name !== "ExitPlanMode") continue;
+            if (toolUseId && candidate.id !== toolUseId) continue;
+            planTool = candidate;
+            break;
+          }
+          if (planTool) planTool._approvalSuperseded = true;
+        }
         this._appendLiveMessage(streamState, {
           role: "permission_request",
           id: d.id,
           tool: d.tool,
           summary: d.summary,
+          sessionId: streamSid,
+          kind: d.kind || (exitPlan ? "exit_plan" : "tool"),
+          suggestions: Array.isArray(d.suggestions) ? d.suggestions : [],
+          return_mode: d.return_mode || "",
+          title: d.title || "",
+          display_name: d.display_name || "",
+          description: d.description || "",
+          input: d.input || {},
+          tool_use_id: d.tool_use_id || d.toolUseId
+            || (planTool && planTool.id) || "",
+          plan: d.plan
+            || (d.input && (d.input.plan || d.input.plan_content))
+            || (planTool && (planTool.plan
+              || (planTool.input && planTool.input.plan)))
+            || "",
           resolved: false,
           decision: null,
+          mode: null,
+          submitting: false,
+          awaitingTransition: false,
+          _decisionAcknowledged: false,
+          failure_message: "",
         });
 
         _scrollIfActive();
       });
+      es.addEventListener("permission_request_resolved", ev => {
+        let d;
+        try { d = JSON.parse(ev.data); } catch (_) { return; }
+        if (!d.id) return;
+        const messages = streamState.messages;
+        for (let i = messages.length - 1; i >= 0; i--) {
+          const msg = messages[i];
+          if (msg.role !== "permission_request" || msg.id !== d.id) continue;
+          const exitPlan = this.isExitPlanPermission(msg)
+            || d.kind === "exit_plan";
+          // Mark the SSE as authoritative so a losing same-card POST from
+          // another browser tab cannot roll this decision back in its catch.
+          msg._decisionAcknowledged = true;
+          msg.submitting = false;
+          msg.failure_message = "";
+          msg.decision = d.decision || null;
+          msg.mode = this._normalizePermissionMode(d.mode, "") || null;
+          if (exitPlan && d.decision === "allow") {
+            // The decision only releases the SDK callback. Persisting the new
+            // permission and rebuilding the runtime is a separate commit.
+            msg.resolved = false;
+            msg.awaitingTransition = true;
+          } else {
+            // Generic approvals and "keep planning" are complete at decision.
+            msg.resolved = true;
+            msg.awaitingTransition = false;
+          }
+          break;
+        }
+      });
+      es.addEventListener("permission_mode_changed", ev => {
+        let d;
+        try { d = JSON.parse(ev.data); } catch (_) { return; }
+        const mode = this._applySessionPermissionMode(streamSid, d.permission, {
+          previousPermission: d.previous_permission || "",
+          authoritative: true,
+        });
+        if (!mode) return;
+
+        // Resolve the newest matching plan approval in the origin session. The
+        // transport's streamSid — never currentId — owns both the card and mode.
+        if (d.source === "exit_plan") {
+          const messages = streamState.messages;
+          for (let i = messages.length - 1; i >= 0; i--) {
+            const msg = messages[i];
+            if (!this.isExitPlanPermission(msg)) continue;
+            if (!msg.awaitingTransition) continue;
+            if (d.tool_use_id && msg.tool_use_id
+                && d.tool_use_id !== msg.tool_use_id) continue;
+            msg.submitting = false;
+            msg.awaitingTransition = false;
+            msg.failure_message = "";
+            msg._decisionAcknowledged = true;
+            msg.resolved = true;
+            msg.decision = "allow";
+            msg.mode = mode;
+            break;
+          }
+        }
+      });
+      es.addEventListener("permission_mode_change_failed", ev => {
+        let d;
+        try { d = JSON.parse(ev.data); } catch (_) { return; }
+        this._applySessionPermissionMode(streamSid, d.permission || "plan", {
+          previousPermission: "plan",
+          authoritative: true,
+        });
+        // External hooks can fail without a MuseLab approval card, but the
+        // reported permission is still authoritative for this session.
+        if (d.source !== "exit_plan") return;
+        const messages = streamState.messages;
+        for (let i = messages.length - 1; i >= 0; i--) {
+          const msg = messages[i];
+          if (!this.isExitPlanPermission(msg)) continue;
+          if (!msg.awaitingTransition) continue;
+          if (d.tool_use_id && msg.tool_use_id
+              && d.tool_use_id !== msg.tool_use_id) continue;
+          msg.submitting = false;
+          msg.awaitingTransition = false;
+          msg._decisionAcknowledged = true;
+          msg.resolved = true;
+          msg.decision = "failed";
+          msg.failure_message = d.message || "";
+          break;
+        }
+      });
+      const _finalizePendingPermissionRequests = (message = "") => {
+        const messages = streamState.messages;
+        for (let i = messages.length - 1; i >= 0; i--) {
+          const msg = messages[i];
+          if (!msg || msg.role !== "permission_request" || msg.resolved) continue;
+          const exitPlan = this.isExitPlanPermission(msg);
+          const transitionFailed = exitPlan && msg.awaitingTransition;
+          msg.submitting = false;
+          msg.awaitingTransition = false;
+          msg._decisionAcknowledged = true;
+          msg.resolved = true;
+          msg.decision = transitionFailed ? "failed" : "expired";
+          msg.failure_message = transitionFailed ? message : "";
+        }
+      };
       const _stopTimer = (keepBackgroundElapsed = false) => {
         if (!keepBackgroundElapsed && streamState._streamTimer) {
           clearInterval(streamState._streamTimer);
@@ -22138,10 +30440,6 @@ function portal() {
         }
         if (keepBackgroundElapsed) return;
         streamState.streamElapsed = 0;
-        if (this.currentId === streamSid) {
-          this._streamTimer = null;
-          this.streamElapsed = 0;
-        }
       };
       // Mark the stream done for the ORIGIN tab. If the user is on a
       // different tab, we still update tabState[streamSid] silently — they'll
@@ -22156,12 +30454,31 @@ function portal() {
         authoritativeTerminal = false,
         completionMeta = null,
       ) => {
+        const followedTail = streamState.atBottom !== false
+          && !this._messageRangeHasLater(streamState);
+        // A terminal stream cannot service permission buttons anymore. Expire
+        // untouched cards, and fail an accepted ExitPlan transition if its
+        // permission-mode commit never arrived.
+        _finalizePendingPermissionRequests();
         streamState.streaming = false;
+        streamState.streamPhase = "";
         streamState._continuationAwaitingReaction = false;
         streamState.es = null;
+        if (streamState._flushLivePresentation === flushLivePresentation) {
+          streamState._flushLivePresentation = null;
+        }
+        pendingTaskProgress.clear();
+        if (followedTail) {
+          this._boundLiveMessageRange(streamState, true);
+          streamState.atBottom = true;
+        }
+        this._enforceMessageRangeInvariant(streamState);
         streamState._streamStartController = null;
         streamState._cancelBeforeStream = false;
-        streamState._stopping = false;
+        const terminalTurnId = streamTurnId || String(streamState.activeTurnId || "");
+        if (streamState._stoppingTurnId === terminalTurnId) {
+          streamState._stoppingTurnId = "";
+        }
         streamState._serverActiveObserved = false;
         // Belt-and-braces for the auto-compact bubble: a turn that dies inside
         // /compact (transport drop, 10-min timeout) may never deliver the
@@ -22180,6 +30497,11 @@ function portal() {
           streamState._streamStartedAt / 1000,
           backgroundPending,
         );
+        // A previous completion/history reconciliation may have been deferred
+        // when this stream claimed the pane. Ownership is clear now; resume it
+        // without waiting for a page refresh or another 10-second list tick.
+        this.$nextTick(() => this._resumePendingCanonicalSync(
+          streamSid, streamState));
         if (authoritativeTerminal) {
           this._setSessionActivityExpectation(
             streamSid,
@@ -22191,7 +30513,9 @@ function portal() {
         // _markDone covers every termination path (done / error /
         // cancelled / reconnect-give-up) — no scattered flagging logic.
         // EXCEPT user-cancelled — they don't need a "ding, ready!" cue.
-        if (this.currentId !== streamSid && !cancelled) {
+        const visibleSideQuestion = this.previewQuote.show
+          && this.previewQuote.askSessionId === streamSid;
+        if (this.currentId !== streamSid && !cancelled && !visibleSideQuestion) {
           streamState.unread = true;
         }
         // Stamp the tail of the just-finished turn with completion
@@ -22209,32 +30533,90 @@ function portal() {
         const completedAtMs = Number(meta.completedAtMs) || 0;
         const durationMs = Number(meta.durationMs) || 0;
         const assistantUuid = String(meta.assistantUuid || "");
+        const completedTurnId = String(meta.turnId || "");
+        const completedModel = String(
+          meta.model || streamState.streamingModel || modelForBubble || "",
+        );
+        const turnStatus = String(meta.turnStatus || "");
+        const memoryRecall = meta.memoryRecall || null;
         const _now = completedAtMs > 0 ? completedAtMs : Date.now();
         const _elapsed = durationMs > 0
           ? durationMs / 1000
           : (streamState.streamElapsed || 0);
-        const turnMessages = this._allPaneMessages(streamState);
+        const turnMessages = streamState.messages;
         const _stamp = (m) => {
           if (!m.ts) m.ts = _now;
           if (!m.elapsed && _elapsed >= 1) m.elapsed = _elapsed;
+          if (!m.model && completedModel) m.model = completedModel;
+          if ((!m.turn_status || m.turn_status === "running") && turnStatus) {
+            m.turn_status = turnStatus;
+          }
+          if (!m.memoryRecall && memoryRecall) m.memoryRecall = memoryRecall;
         };
         // Tail-most muse-side message of THIS turn, used when the turn has no
         // assistant text bubble of its own to hang the footer on.
         let tailCandidate = null;
         let stampedAssistant = null;
-        for (let k = turnMessages.length - 1; k >= 0; k--) {
-          const m = turnMessages[k];
-          if (m.role === "user") break;          // entered the previous turn
-          if (tailCandidate === null) tailCandidate = m;
-          // Skip tool blocks / standalone thinking; they're not the
-          // "reply" the user reads time off.
-          if (m.role !== "assistant") continue;
-          // An assistant bubble that already carries a stamp belongs to an
-          // earlier, finished turn — we've walked out of this one.
-          if (m.ts) break;
-          _stamp(m);                              // found the tail text bubble
-          stampedAssistant = m;
-          break;                                  // stop after the first one (most recent)
+        let lastUserCandidate = null;
+        // A server-started queued turn gives its optimistic user envelope the
+        // immutable turn id before replay starts. Prefer that exact boundary:
+        // handoff clones and a rapid queue chain can leave another turn at the
+        // array tail, so "walk back to the newest user" is not authoritative.
+        let exactUserIndex = -1;
+        if (completedTurnId) {
+          for (let k = turnMessages.length - 1; k >= 0; k--) {
+            const candidate = turnMessages[k];
+            if (candidate && candidate.role === "user"
+                && candidate._turnId === completedTurnId) {
+              exactUserIndex = k;
+              break;
+            }
+          }
+        }
+        if (exactUserIndex >= 0) {
+          lastUserCandidate = turnMessages[exactUserIndex];
+          let exactTail = turnMessages.length - 1;
+          for (let k = exactUserIndex + 1; k < turnMessages.length; k++) {
+            if (turnMessages[k] && turnMessages[k].role === "user") {
+              exactTail = k - 1;
+              break;
+            }
+          }
+          for (let k = exactTail; k > exactUserIndex; k--) {
+            const m = turnMessages[k];
+            if (tailCandidate === null) tailCandidate = m;
+            if (!m || m.role !== "assistant") continue;
+            _stamp(m);
+            stampedAssistant = m;
+            break;
+          }
+        } else {
+          // Legacy/direct turns may not yet have a turn id on their user row.
+          // Retain the tail scan as a compatibility fallback.
+          for (let k = turnMessages.length - 1; k >= 0; k--) {
+            const m = turnMessages[k];
+            if (m.role === "user") {
+              lastUserCandidate = m;
+              break;                               // entered the previous turn
+            }
+            if (tailCandidate === null) tailCandidate = m;
+            // Skip tool blocks / standalone thinking; they're not the
+            // "reply" the user reads time off.
+            if (m.role !== "assistant") continue;
+            // An assistant bubble that already carries a stamp belongs to an
+            // earlier, finished turn — we've walked out of this one.
+            if (m.ts) break;
+            _stamp(m);                              // found the tail text bubble
+            stampedAssistant = m;
+            break;                                  // stop after the first one (most recent)
+          }
+        }
+        // An interrupt/error can land before the SDK emits any muse-side
+        // block.  Stamp that turn's user envelope so the terminal footer does
+        // not vanish with the pending bubble; the template explicitly allows
+        // a status-bearing user tail for this one exceptional shape.
+        if (!tailCandidate && lastUserCandidate && turnStatus) {
+          tailCandidate = lastUserCandidate;
         }
         // The footer is mounted on the actual turn-tail node. Stamp that node
         // regardless of whether an assistant bubble was found above; otherwise
@@ -22252,8 +30634,6 @@ function portal() {
           tailCandidate.forkUuid = assistantUuid;
         }
         if (this.currentId === streamSid) {
-          this.streaming = false;
-          this.es = null;
           // textarea was :disabled while streaming → focus during stream was
           // a no-op. Re-focus now so the user can immediately type the next
           // message (supports rapid-fire conversation).
@@ -22277,7 +30657,7 @@ function portal() {
         }
       };
       const markUserFailed = (errorText, kind, cta, retryable) => {
-        const allMessages = this._allPaneMessages(streamState);
+        const allMessages = streamState.messages;
         for (let i = allMessages.length - 1; i >= 0; i--) {
           const m = allMessages[i];
           if (m.role === "user") {
@@ -22291,7 +30671,7 @@ function portal() {
         }
       };
       es.addEventListener("done", ev => {
-        flushRender();
+        const completedAssistant = flushTerminalPresentation();
         // Guard JSON.parse: a malformed/empty `done` payload must NOT throw
         // before es.close()/_markDone()/_stopTimer() run below, else the
         // EventSource + timer interval leak and the UI stays streaming=true
@@ -22299,16 +30679,15 @@ function portal() {
         // d.* read below is null-safe on a missing field.
         let d;
         try { d = JSON.parse(ev.data); } catch (_) { d = {}; }
-        if (d.total_cost_usd != null && ownsCurBubble()) {
-          curBubble.cost = "$" + d.total_cost_usd.toFixed(4);
+        if (d.total_cost_usd != null && completedAssistant.bubble) {
+          completedAssistant.bubble.cost = "$" + d.total_cost_usd.toFixed(4);
         }
-        if (d.memory_recall && ownsCurBubble()) {
-          curBubble.memoryRecall = d.memory_recall;
+        if (d.memory_recall && completedAssistant.bubble) {
+          completedAssistant.bubble.memoryRecall = d.memory_recall;
         }
         if (d.stats) this.stats = { ...this.stats, ...d.stats };
         if (d.session_usage) {
           Object.assign(streamState.sessionUsage, d.session_usage);
-          if (this.currentId === streamSid) this.sessionUsage = streamState.sessionUsage;
         }
         this._budgetWarned = this._budgetWarned || {};
         if (d.budget_usd > 0 && d.budget_used_pct >= 90 && !this._budgetWarned[streamSid]) {
@@ -22349,7 +30728,7 @@ function portal() {
         // SDK-level turn failure (max turns / budget / permission denied /
         // API error) arrives as a NORMAL done event with is_error=true —
         // previously rendered identically to success. Surface it.
-        if (d.is_error) {
+        if (d.is_error && !d.cancelled) {
           const _detail = d.error || ((Array.isArray(d.errors) && d.errors.length)
             ? d.errors.join("; ")
             : (d.result_subtype || "unknown"));
@@ -22357,7 +30736,11 @@ function portal() {
           if (!isContinuation) {
             markUserFailed(_detail, d.kind, d.cta, d.retryable);
           }
-          if (ownsCurBubble()) curBubble.error = _detail;
+          restoreSubmittedComposer(false);
+          // Synthetic SDK/API errors are suppressed from the ordinary text
+          // stream so they are never mistaken for a normal Muse answer. They
+          // still need a visible terminal bubble in this same frame.
+          surfaceTerminalError(_detail);
         }
         // Pass the backend's `cancelled` flag through to _markDone so it
         // can skip the green-dot unread cue for user-cancelled turns.
@@ -22366,7 +30749,7 @@ function portal() {
         // stop — stop closes the ES). The relevant case for this branch
         // is page-reload-then-reconnect picking up a turn that finished
         // after being cancelled before reload.
-        const completedFinalText = ownsCurBubble() ? (curBubble.text || "") : "";
+        const completedFinalText = completedAssistant.text;
         const continuationFinalText = isContinuation ? completedFinalText : "";
         const backgroundPending = !d.cancelled
           ? Math.max(0, Number(d.background_tasks_pending) || 0)
@@ -22376,27 +30759,50 @@ function portal() {
         );
         es.close();
         _markDone(!!d.cancelled, backgroundPending, true, {
+          turnId: completedTurnId,
           assistantUuid: d.assistant_uuid,
           completedAtMs: d.completed_at_ms,
           durationMs: d.duration_ms,
+          model: d.model,
+          turnStatus: d.cancelled
+            ? "cancelled" : (d.is_error ? "failed" : "completed"),
+          memoryRecall: d.memory_recall,
         });
         _stopTimer();
-        if (isContinuation && !d.cancelled) {
+        // The main reply has reached its durable boundary, but a detached SDK
+        // task can keep the source runtime alive for minutes. Publish the
+        // handoff intent before the quiet session-list pull below: the backend
+        // may already hide an eagerly-forked predecessor, and the tab must not
+        // blink out while the browser adopts that successor. Continuation
+        // turns are reactions on the source runtime and never fork again.
+        if (backgroundPending > 0 && !isContinuation && !d.cancelled) {
+          this._scheduleBackgroundHandoff(streamSid, streamState);
+        }
+        if (d.is_error && !d.cancelled && d.snapshot_ready) {
+          // A terminal failure's private display snapshot owns both any valid
+          // partial answer and the separate error bubble. Adopt it only after
+          // the backend confirms the atomic write; otherwise retain the live
+          // objects instead of replacing them with an older canonical view.
+          this._reloadSessionCoalesced(streamSid, { quiet: true });
+        } else if (d.is_error && !d.cancelled) {
+          streamState._seenUpdated = undefined;
+          if (streamSid === this.currentId) this._openSeenUpdated = undefined;
+        } else if (isContinuation && !d.cancelled) {
           this._reconcileCompletedContinuation(
-            streamSid, streamState, continuationFinalText,
+            streamSid, streamState, continuationFinalText, 0,
+            String(d.assistant_uuid || ""),
           );
         } else if (!d.cancelled) {
           this._reconcileCompletedTurn(
-            streamSid, streamState, completedFinalText,
+            streamSid, streamState, d.is_error ? "" : completedFinalText, 0,
+            String(d.assistant_uuid || ""),
           );
         }
-        const _viewedStream = this.currentId === streamSid
-          || (this.tabState && this.tabState[this.currentId] === streamState);
-        if (!d.cancelled && _viewedStream) {
-          // The user watched this reply finish in the current foreground tab.
-          // Resolve through currentId so an adopted/aliased session id cannot
-          // make the acknowledgement miss the durable activity row.
-          this.ackCurrentActivity(3);
+        if (!d.cancelled) {
+          // Delivery source does not matter once the result is actually
+          // rendered in the visible conversation. Non-current/headless work
+          // remains unread because it fails the visibility/ownership guard.
+          this._ackViewedActivity(streamSid, streamState, 3);
         }
         // We rendered this reply live — re-baseline the open-session resync
         // cursor so the post-done list poll (updated_at now advanced) doesn't
@@ -22404,7 +30810,12 @@ function portal() {
         // reload on top of it.
         streamState._seenUpdated = undefined;
         if (streamSid === this.currentId) this._openSeenUpdated = undefined;
-        this.refreshSessions();
+        // Quiet ETag pull, NOT refreshSessions(): the latter also runs
+        // _recoverStalledStream, a second reconnect source. It early-returns
+        // here (streaming already false), but wiring a reconnect probe into
+        // the turn-completion path is how the 2026-08-04 storm kept re-arming
+        // itself. The list refresh is all this needs.
+        this._syncSessionListQuiet();
         if (this.currentId === streamSid) {
           // highlightCode resolves AFTER syntax highlight + artifact render
           // (mermaid / HTML preview iframes), which can grow the tail block's
@@ -22416,7 +30827,9 @@ function portal() {
           this.$nextTick(() => {
             const pane = this._paneElement(streamSid);
             this.highlightCode(".chat-body", pane ? [pane] : null).then(() => {
-              if (this.currentId === streamSid && this.atBottom) this.scrollToBottom(true);
+              if (this.currentId === streamSid && streamState.atBottom !== false) {
+                this.scrollToBottom(true);
+              }
             });
           });
         }
@@ -22426,7 +30839,14 @@ function portal() {
         // drain will hit st.compacting=true and bail; the compact-finally
         // path will pick it up. If the queue's tab isn't the active one,
         // drain bails too and activateTab handles it on return.
-        if (d.is_error) {
+        // A normal user turn error pauses the durable queue server-side, so
+        // mirror that state immediately while the final queue sync catches up.
+        // A background continuation is different: its originating task has
+        // already settled and the backend deliberately keeps queued user input
+        // runnable. Treating its incomplete auto-reaction as a queue failure
+        // stranded otherwise-valid follow-ups in the completion window.
+        const queueBlockingError = !!d.is_error && !isContinuation;
+        if (queueBlockingError) {
           if (streamState.pendingQueue && streamState.pendingQueue.length > 0) {
             streamState._queuePaused = true;
             setTimeout(() => {
@@ -22449,29 +30869,41 @@ function portal() {
         this.$nextTick(() => this._ensureBgContPoller(streamSid));
       });
       es.addEventListener("resync", ev => {
-        flushRender();
-        let reason = "replay_truncated";
-        try { reason = JSON.parse(ev.data).reason || reason; } catch (_) {}
+        flushTerminalPresentation();
+        let payload = {};
+        try { payload = JSON.parse(ev.data) || {}; } catch (_) {}
+        const reason = payload.reason || "replay_truncated";
+        const fallback = payload.fallback || "canonical_history";
         streamState._canonicalResyncPending = true;
         streamState._serverActiveObserved = true;
         try { es.close(); } catch (_) {}
         if (streamState._stallWatch) clearInterval(streamState._stallWatch);
         streamState._stallWatch = null;
         streamState.es = null;
-        if (this.currentId === streamSid) this.es = null;
+        if (streamState._flushLivePresentation === flushLivePresentation) {
+          streamState._flushLivePresentation = null;
+        }
+        pendingTaskProgress.clear();
         if (streamMobile && reason === "replay_truncated") {
           this.toast(this.lang === "zh"
             ? "回复数据量较大，完成后会自动从会话记录同步"
             : "This reply exceeded the live replay window; canonical history will sync when it finishes",
             "info", 5000);
         }
+        // The protocol names the authoritative recovery source. Unknown/older
+        // values still fail closed to canonical history rather than reconnecting
+        // the same unavailable sequence in a loop.
+        streamState._canonicalResyncFallback = fallback;
         this._scheduleCanonicalStreamReload(streamSid, streamState);
-        // `reason` is intentionally retained for browser diagnostics without
-        // changing user-facing retry semantics.
         streamState._canonicalResyncReason = reason;
       });
-      es.addEventListener("error", ev => {
-        flushRender();
+      es.addEventListener("error", async ev => {
+        flushTerminalPresentation();
+        // One terminal server error may be followed by EventSource's own EOF
+        // error. Busy handoff performs async durable persistence, so claim the
+        // transport before its first await and make every later callback a
+        // no-op instead of allowing a reconnect to steal tab ownership.
+        if (streamState._busyQueueHandoff === es) return;
         // A deliberate bounded-stream resync closes EventSource and can queue
         // a transport `error` event. Its canonical poll owns recovery; never
         // enter the ordinary reconnect loop (which would immediately receive
@@ -22492,8 +30924,10 @@ function portal() {
         let errKind = "unknown";
         let errCta = "retry";
         let errRetryable = true;
+        let errorMeta = {};
         try {
           const d = JSON.parse(ev.data);
+          if (d && typeof d === "object") errorMeta = d;
           if (d && d.error) serverError = d.error;
           if (d && d.kind) errKind = d.kind;
           if (d && typeof d.cta === "string") errCta = d.cta;
@@ -22510,18 +30944,109 @@ function portal() {
         // let the queue drain continue.
         if (serverError === "no active turn") {
           es.close(); _markDone(false, false, true); _stopTimer();
-          this.loadSession(streamSid).then(() => {
+          this._ackViewedActivity(streamSid, streamState, 3);
+          // This is a terminal reconciliation of content that is already on
+          // screen (especially a background continuation whose task-complete
+          // toast just fired), not a cold session open. A normal load flips
+          // messagesReady off and clears/rebuilds the array, producing an
+          // empty/skeleton flash before the same transcript returns. Quiet
+          // mode morphs canonical history into the mounted keyed messages.
+          this._reloadSessionCoalesced(streamSid, { quiet: true }).then(() => {
             this.$nextTick(() => this._drainPendingQueue(streamSid));
           });
           return;
         }
 
+        // The busy probe and stream start cannot be one browser transaction:
+        // a background watcher may claim the session in between. This precise
+        // server response guarantees the prompt was NOT executed, so move the
+        // immutable send snapshot into the durable queue instead of marking
+        // it failed and forcing a manual resend. Reconnects/resumed queue
+        // items never re-enqueue, which prevents duplicates.
+        if (serverError && errKind === "turn_busy"
+            && !isReconnect && !resumed) {
+          if (sentUserBubble) sentUserBubble._optimisticQueue = true;
+          streamState._busyQueueHandoff = es;
+          try { es.close(); } catch (_) {}
+          const queued = await this._enqueueMessage(streamSid, {
+            text,
+            displayText: hasDetachedText ? detachedDisplayText : composerInput,
+            pendingImages: hasDetachedText ? [] : composerImages,
+            pendingDocs: hasDetachedText ? [] : composerDocs,
+            pendingQuotes: hasDetachedText ? [] : composerQuotes,
+            permission: sendPermission,
+            plan_return_permission: sendPlanReturnPermission,
+          });
+          if (queued) {
+            if (sentUserBubble) {
+              this._removePaneMessage(streamState, sentUserBubble);
+              sentUserBubble = null;
+            }
+            // Reset only while this closed transport still owns the tab. A
+            // user action that started a newer send during persistence wins.
+            if (streamState.es === es) rollbackUnstartedSend(false);
+            if (streamState._busyQueueHandoff === es) {
+              streamState._busyQueueHandoff = null;
+            }
+            this.toast(
+              this.lang === "zh"
+                ? "当前任务仍在收尾，消息已加入队列"
+                : "The current task is still finishing; message queued",
+              "info", 2800,
+            );
+            return;
+          }
+          if (streamState._busyQueueHandoff === es) {
+            streamState._busyQueueHandoff = null;
+          }
+          // Queue persistence failed. Continue through the ordinary terminal
+          // error path, which restores the user's draft for a safe retry.
+        }
+
         if (serverError) {
-          this.toast(this._humanizeStreamError(serverError), "error", 6000);
+          // A recovered retry may itself overflow. Its payload can contain a
+          // fresh recovery id, but this original turn has already consumed
+          // its one automatic recovery. Treat the second failure as ordinary
+          // and never adopt/resend into an unbounded recovery chain.
+          const hasContextRecovery = !!(
+            errorMeta && errorMeta.recovered_session
+            && !contextRecoveryAttempted
+          );
+          const sourceWasViewed = this.currentId === streamSid
+            && (typeof document === "undefined" || document.visibilityState === "visible");
+          this.toast(
+            hasContextRecovery
+              ? (this.lang === "zh"
+                ? "原会话已满，正在切换到安全恢复会话…"
+                : "The original session is full; switching to a safe recovered session…")
+              : this._humanizeStreamError(serverError),
+            hasContextRecovery ? "info" : "error", 6000,
+          );
           if (!isContinuation) {
             markUserFailed(serverError, errKind, errCta, errRetryable);
           }
-          es.close(); _markDone(false, false, true); _stopTimer();
+          if (!hasContextRecovery) restoreSubmittedComposer(false);
+          surfaceTerminalError(serverError);
+          es.close();
+          _markDone(false, false, true, {
+            assistantUuid: errorMeta.assistant_uuid,
+            completedAtMs: errorMeta.completed_at_ms,
+            durationMs: errorMeta.duration_ms,
+            model: errorMeta.model || modelForBubble,
+            turnStatus: "failed",
+            memoryRecall: errorMeta.memory_recall,
+          });
+          _stopTimer();
+          this._ackViewedActivity(streamSid, streamState, 3);
+          // Adopt canonical+snapshot history only after the backend confirms
+          // the atomic display write. On disk/permission failure, retaining
+          // live objects is safer than immediately erasing the visible error.
+          if (errorMeta.snapshot_ready) {
+            this._reloadSessionCoalesced(streamSid, { quiet: true });
+          } else {
+            streamState._seenUpdated = undefined;
+            if (streamSid === this.currentId) this._openSeenUpdated = undefined;
+          }
           // Pause auto-drain — same context likely fails the next message
           // too (quota / auth / cross-vendor signature). The failed user
           // bubble surfaces a "resume queue (N)" CTA so the user can
@@ -22537,6 +31062,83 @@ function portal() {
               }
             }, 800);
           }
+          if (hasContextRecovery) {
+            const recoveryId = String(
+              errorMeta.recovered_session.id
+              || errorMeta.recovered_session.session_id
+              || "",
+            );
+            this._contextRecoveryHandled = this._contextRecoveryHandled || {};
+            if (recoveryId && !this._contextRecoveryHandled[recoveryId]) {
+              this._contextRecoveryHandled[recoveryId] = true;
+              const attachmentRecovery = attachIds.length > 0;
+              const canRetryOnce = sourceWasViewed
+                && !isReconnect && !isContinuation && !resumed
+                && !attachmentRecovery && !!text;
+              Promise.resolve(this._adoptRecoveredSession(
+                errorMeta, streamSid, { focus: sourceWasViewed },
+              )).then(async adopted => {
+                if (!adopted) {
+                  restoreSubmittedComposer(false);
+                  return;
+                }
+                if (canRetryOnce) {
+                  this._contextRecoveryAutoSent = this._contextRecoveryAutoSent || {};
+                  if (!this._contextRecoveryAutoSent[recoveryId]) {
+                    this._contextRecoveryAutoSent[recoveryId] = true;
+                    const retryStarted = await this.send({
+                      sessionId: recoveryId,
+                      detachedText: text,
+                      detachedDisplayText: composerInput || text,
+                      contextRecoveryAttempted: true,
+                    });
+                    if (retryStarted === false) {
+                      adopted.state.draft.input = this._mergeChatDraftText(
+                        composerInput || text, adopted.state.draft.input || "",
+                      );
+                      this._persistChatDraft(
+                        recoveryId, adopted.state.draft.input,
+                      );
+                      if (this.currentId === recoveryId) {
+                        this._activateComposerState(recoveryId);
+                      }
+                    }
+                  }
+                  return;
+                }
+                // Upload ids are single-use and their durable files belong to
+                // the source sid. Never replay them into the fork. Preserve
+                // only the user's plain text so they can review/re-attach.
+                const recoveryDraft = composerInput || text;
+                if (recoveryDraft) {
+                  adopted.state.draft.input = this._mergeChatDraftText(
+                    recoveryDraft, adopted.state.draft.input || "",
+                  );
+                  this._persistChatDraft(recoveryId, adopted.state.draft.input);
+                  if (this.currentId === recoveryId) {
+                    this._activateComposerState(recoveryId);
+                  }
+                }
+                this.toast(
+                  attachmentRecovery
+                    ? (this.lang === "zh"
+                      ? "已创建恢复会话；为避免误用旧附件，请重新添加附件后发送"
+                      : "Recovered session created; re-attach files before sending")
+                    : (this.lang === "zh"
+                      ? "已创建恢复会话，原消息已保留在输入框"
+                      : "Recovered session created; the original message is in the composer"),
+                  "warn", 5200,
+                );
+              }).catch(() => {
+                restoreSubmittedComposer(false);
+                this.toast(
+                  this.lang === "zh" ? "恢复会话打开失败，请从会话列表重试"
+                    : "Could not open the recovered session; retry from the session list",
+                  "error", 5000,
+                );
+              });
+            }
+          }
           return;
         }
 
@@ -22551,65 +31153,69 @@ function portal() {
         // send({ reconnect:true }) refuses while an ES handle is present, even
         // when that EventSource is already CLOSED.
         if (streamState.es === es) streamState.es = null;
-        if (this.currentId === streamSid && this.es === es) this.es = null;
 
         if (attempts > MAX_ATTEMPTS) {
-          // Given up. Surface manual retry UI.
+          // Transport exhaustion is not a server-authenticated terminal result.
+          // Keep the logical turn running and reconcile at low frequency; the
+          // detached backend pump may still complete, settle its queue claim and
+          // start the next queued turn while this browser is offline.
           this.toast(this.lang === "zh"
-                      ? "和 Muse 的连接断开了，重试一下"
-                      : "Lost connection to Muse — try again",
-                      "error");
-          if (!isContinuation) markUserFailed();
-          _markDone(); _stopTimer();
-          if (streamState.pendingQueue && streamState.pendingQueue.length > 0) {
-            // Optimistic — the server also pauses the queue in the turn's
-            // finally (Task 3) when an errored turn has items waiting. Show
-            // the banner now, reconcile with server truth a beat later.
-            streamState._queuePaused = true;
-            setTimeout(() => {
-              if (this.tabState[streamSid] === streamState) {
-                this._syncQueueFromServer(streamSid);
-              }
-            }, 800);
-          }
+                      ? "连接暂时中断，正在后台恢复会话状态"
+                      : "Connection interrupted; recovering session state",
+                      "warn", 4000);
+          streamState._serverActiveObserved = true;
+          this._scheduleCanonicalStreamReload(streamSid, streamState, {
+            minimumWaitMs: 1000,
+          });
           return;
         }
 
-        // Exponential backoff: 800 ms, 1.6 s, 3.2 s. _checkActiveTurn
+        // Exponential backoff with bounded jitter (800 ms / 1.6 s / 3.2 s base).
+        // _checkActiveTurn
         // confirms the backend turn is still in flight before opening a
         // fresh SSE — if the turn finished cleanly while we were
         // disconnected, it loads the session view from disk instead, so
         // the user sees the completed reply rather than an in-progress
         // bubble that never resolves.
-        const delay = 800 * Math.pow(2, attempts - 1);
-        setTimeout(async () => {
+        const delay = this._retryDelay(attempts);
+        this._requestSessionSync(streamSid, "transport_retry", {
+          delayMs: delay,
+          run: async (signal) => {
           // User switched to another tab mid-backoff. The ORIGIN tab's turn
           // is still running on the server — don't _markDone() it (that
-          // abandons the transparent reconnect AND, via `this.streaming`,
-          // wrongly unlocks/locks the CURRENT tab's composer which belongs
-          // to a different session). Keep tabState[streamSid].streaming
-          // true; when the user switches back, loadSession's
-          // _checkActiveTurn(streamSid) re-attaches (or loads the finished
-          // reply from disk). Only the timer is stopped — it writes
-          // root-level streamElapsed which is now another tab's display.
+          // abandons the transparent reconnect and clears the origin owner's
+          // running state. Keep tabState[streamSid].streaming true; when the user
+          // switches back, loadSession's _checkActiveTurn(streamSid) re-attaches
+          // (or loads the finished reply from disk). Only the origin timer stops.
           if (this.currentId !== streamSid) {
             _stopTimer();
-            streamState._reconnectAttempts = 0;
             return;
           }
           // streamState.streaming is still true from initial send(); use
           // it as the in-flight gate _checkActiveTurn checks internally.
           try {
-            const r = await fetch(`/api/chat/sessions/${streamSid}/active`,
-                                    { headers: this.hdr() });
+            const r = await this._fetchWithDeadline(
+              `/api/chat/sessions/${streamSid}/active`,
+              { headers: this.hdr(), signal },
+            );
             if (!r.ok) throw new Error("active probe failed");
             const d = await r.json();
             if (!d.active) {
               // Backend turn already finished while we were disconnected.
-              // Refresh session from disk to pick up the completed reply.
+              // Refresh session from disk to pick up the completed reply. The
+              // partial/live transcript is already visible, so keep this a
+              // quiet reconciliation rather than flashing a cold-load skeleton.
               _markDone(false, false, true); _stopTimer();
-              if (this.currentId === streamSid) this.loadSession(streamSid);
-              streamState._reconnectAttempts = 0;
+              this._ackViewedActivity(streamSid, streamState, 3);
+              if (this.currentId === streamSid) {
+                this._reloadSessionCoalesced(streamSid, { quiet: true }).then(loaded => {
+                  if (loaded && this.tabState[streamSid] === streamState) {
+                    this.$nextTick(() => this._drainPendingQueue(
+                      streamSid, streamState.activeTurnId || "",
+                    ));
+                  }
+                });
+              }
               return;
             }
             if (d.background && d.attachable === false) {
@@ -22620,14 +31226,12 @@ function portal() {
               _markDone(false, true, true);
               _stopTimer();
               this._ensureBgContPoller(streamSid);
-              streamState._reconnectAttempts = 0;
               return;
             }
             // Re-subscribe via the existing reconnect plumbing.
             // streaming flag must be cleared first or send() bails as
             // "already streaming."
             streamState.streaming = false;
-            if (this.currentId === streamSid) this.streaming = false;
             // Anchor the elapsed timer to the backend turn's real start so
             // the footer resumes from the true start, not from reconnect.
             this.send({ reconnect: true, sessionId: streamSid,
@@ -22641,30 +31245,64 @@ function portal() {
             // the running footer and temporarily unlock the composer even
             // though the server-side turn was still alive.
             if (attempts >= MAX_ATTEMPTS) {
-              _markDone(); _stopTimer();
               this.toast(this.lang === "zh"
-                          ? "和 Muse 的连接断开了，重试一下"
-                          : "Lost connection to Muse — try again",
-                          "error");
-              if (!isContinuation) markUserFailed();
+                          ? "连接暂时中断，正在后台恢复会话状态"
+                          : "Connection interrupted; recovering session state",
+                          "warn", 4000);
+              streamState._serverActiveObserved = true;
+              this._scheduleCanonicalStreamReload(streamSid, streamState, {
+                minimumWaitMs: 1000,
+              });
             } else {
               // Schedule next retry ourselves since the old EventSource is
               // closed and no new transport error will fire.
-              setTimeout(() => {
-                if (this.currentId !== streamSid) return;
-                streamState.streaming = false;
-                if (this.currentId === streamSid) this.streaming = false;
-                this.send({ reconnect: true, sessionId: streamSid,
-                            turnId: streamState.activeTurnId || "" });
-              }, 800 * Math.pow(2, attempts));
+              this._requestSessionSync(streamSid, "transport_retry", {
+                delayMs: this._retryDelay(attempts + 1),
+                run: () => {
+                  if (this.currentId !== streamSid) return false;
+                  streamState.streaming = false;
+                  this.send({ reconnect: true, sessionId: streamSid,
+                              turnId: streamState.activeTurnId || "" });
+                  return true;
+                },
+              });
             }
           }
-        }, delay);
+          },
+        });
       });
-      es.addEventListener("cancelled", () => {
-        flushRender();
+      es.addEventListener("cancelled", ev => {
+        flushTerminalPresentation();
+        let d = {};
+        try { d = JSON.parse(ev.data || "{}"); } catch (_) { d = {}; }
         this.toast(this.lang === "zh" ? "已中断" : "Interrupted", "warn", 2000);
-        es.close(); _markDone(true, false, true); _stopTimer();
+        es.close();
+        _markDone(true, false, true, {
+          model: modelForBubble,
+          turnStatus: "cancelled",
+        });
+        _stopTimer();
+        // A force-stopped CLI may never commit this turn to canonical JSONL.
+        // The backend writes the already-rendered SSE record to a private,
+        // display-only snapshot BEFORE emitting snapshot_ready. Reconcile that
+        // snapshot quietly now so a list poll / tab switch / page reload sees
+        // the same content and Alpine can retain matching live objects + keys.
+        // If persistence failed, keep the live pane and clear its old revision
+        // baseline so stop()'s delayed list refresh cannot replace it with an
+        // older transcript immediately after the user clicks Stop.
+        streamState._seenUpdated = undefined;
+        if (streamSid === this.currentId) this._openSeenUpdated = undefined;
+        if (d && d.snapshot_ready) {
+          this._reloadSessionCoalesced(streamSid, {
+            quiet: true,
+            probeActive: false,
+          }).then(loaded => {
+            if (loaded && this.tabState[streamSid] === streamState) {
+              streamState._loaded = true;
+              streamState._pendingExternalUpdate = false;
+            }
+          });
+        }
         // User explicitly stopped — pause the queue too. Auto-draining
         // here would be surprising (they cancelled for a reason, almost
         // never "just this one but please send the rest"). The paused
@@ -22680,6 +31318,7 @@ function portal() {
             }, 800);
         }
       });
+      if (useMux) this._activateChatMuxChannel(es);
       // NOTE: errors are owned exclusively by the addEventListener("error")
       // handler above (rich classification + exponential-backoff transparent
       // reconnect). A redundant `es.onerror` here used to also fire on the
@@ -22688,6 +31327,14 @@ function portal() {
       // readyState === CLOSED and call _markDone() prematurely, flipping the
       // turn to "done" (input re-enabled, footer stamped, unread dot) ~800ms
       // before the reconnect restored streaming. Removing it stops that flicker.
+      } finally {
+        if (isComposerSubmission) {
+          // Runtime rollover may replace the source more than once while an
+          // async queue/start request settles. The token is globally unique, so
+          // release every surviving holder instead of guessing one successor.
+          this._releaseComposerClaim(composerSubmitToken);
+        }
+      }
     },
     async stop() {
       // Stop has exactly one meaning: interrupt the active turn for the current
@@ -22695,87 +31342,99 @@ function portal() {
       const sid = this.currentId;
       if (!sid || !this.isTabStreaming(sid)) return;
       const st = this._ensureTabState(sid);
-      if (st._stopping) return;
-      st._stopping = true;
+      const ownerTurnId = String(st.activeTurnId || "");
+      if (ownerTurnId && st._stoppingTurnId === ownerTurnId) return;
       if (st.pendingQueue && st.pendingQueue.length > 0) st._queuePaused = true;
-      // The earliest Stop window is before EventSource exists, while send()
-      // is still minting its one-time ticket. No backend turn exists yet, so
-      // /interrupt cannot find anything. Abort locally and restore idle state
-      // immediately; the ticket is never consumed and expires harmlessly.
-      if (st._streamStartController && !st.es) {
+      // Before a channel and immutable turn id exist, abort only the start
+      // request. send() rollback remains the sole owner of stream flags, timers,
+      // channel state and the draft; Stop must not manufacture optimistic idle.
+      if (st._streamStartController && !st.es && !ownerTurnId) {
         st._cancelBeforeStream = true;
         st._streamStartController.abort();
-        st._streamStartController = null;
-        if (st._streamTimer) clearInterval(st._streamTimer);
-        st._streamTimer = null;
-        st._streamStartedAt = 0;
-        st.streamElapsed = 0;
-        st.streaming = false;
-        st._stopping = false;
-        st.streamingModel = "";
-        if (sid === this.currentId) {
-          this.streaming = false;
-          this.es = null;
-          this._streamTimer = null;
-          this._streamStartedAt = 0;
-          this.streamElapsed = 0;
-          this.streamingModel = "";
+        if (st.pendingQueue && st.pendingQueue.length > 0) {
+          try {
+            await fetch(`/api/chat/sessions/${encodeURIComponent(sid)}/queue/pause`, {
+              method: "POST",
+              headers: Object.assign({ "Content-Type": "application/json" }, this.hdr()),
+              body: JSON.stringify({ paused: true }),
+            });
+          } catch (_) { /* queue sync below/next activation reconciles */ }
+          this._syncQueueFromServer(sid);
         }
-        this.toast(this.lang === "zh" ? "已中断" : "Interrupted", "warn", 1500);
         return;
       }
+      if (!ownerTurnId) return;
+
+      const ownerEs = st.es;
+      st._stoppingTurnId = ownerTurnId;
+      const stillOwnsTurn = () => this.tabState[sid] === st
+        && st.es === ownerEs
+        && String(st.activeTurnId || "") === ownerTurnId;
+      const applyAuthoritativeStatus = payload => {
+        if (!payload || !stillOwnsTurn()) return "stale";
+        const active = !!payload.active;
+        const turnId = String(payload.turn_id || payload.current_turn_id || "");
+        if (active && turnId !== ownerTurnId) return "successor";
+        if (!active) {
+          if (turnId && turnId !== ownerTurnId) return "successor";
+          if (st._stoppingTurnId === ownerTurnId) st._stoppingTurnId = "";
+          this._retireStaleSessionStream(sid, st);
+          this._setSessionActivityExpectation(sid, false);
+          st._pendingExternalUpdate = true;
+          this._scheduleCanonicalStreamReload(sid, st, { minimumWaitMs: 0 });
+          return "inactive";
+        }
+        if (payload.stopping) return "stopping";
+        if (st._stoppingTurnId === ownerTurnId) st._stoppingTurnId = "";
+        st._sessionActivityExpected = null;
+        this.sessions = (this.sessions || []).map(session => session.id === sid
+          ? { ...session, active: true, turn_active: true, background_active: false }
+          : session);
+        return "running";
+      };
+
       const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 15000);
-      let waitForTerminalEvent = false;
+      const timeout = setTimeout(() => controller.abort(), 3000);
       try {
         const r = await fetch(
-          "/api/chat/interrupt?session_id=" + encodeURIComponent(sid),
+          "/api/chat/interrupt?session_id=" + encodeURIComponent(sid)
+            + "&turn_id=" + encodeURIComponent(ownerTurnId),
           { method: "POST", headers: this.hdr(), signal: controller.signal },
         );
         if (!r.ok) throw new Error("interrupt failed");
-        let stopResult = {};
-        try { stopResult = await r.json(); } catch (_) { stopResult = {}; }
-        const hasInterruptedList = Array.isArray(stopResult.interrupted);
-        // Claude clients are keyed as "session@model" in the pool, while older
-        // backends returned the bare session id. Accept both response shapes.
-        const didInterrupt = !hasInterruptedList || stopResult.interrupted.some(
-          item => item === sid || String(item).startsWith(sid + "@"),
-        );
-        if (this.tabState[sid] !== st) return;
-        // The HTTP response only acknowledges the control request. Keep the
-        // EventSource alive until its cancelled/done event flushes the final
-        // markdown/tool boundary and performs the one authoritative cleanup.
-        // Closing it here used to strand partially rendered blocks and race a
-        // subsequent history reload.
-        waitForTerminalEvent = !!st.streaming;
-        if (!didInterrupt) {
-          // An empty interrupted list means the SDK client was detached or its
-          // best-effort interrupt failed. The backend watchdog is now forcing the
-          // turn down; keep the EventSource/Stop control alive until its terminal
-          // event arrives instead of falsely presenting an idle session.
-          this.toast(this.lang === "zh" ? "正在强制中断当前会话…"
-                                        : "Forcing the current session to stop…",
-                     "warn", 2500);
-          return;
-        }
-        if (waitForTerminalEvent) {
-          this.toast(this.lang === "zh" ? "正在中断当前会话…"
-                                        : "Interrupting the current session…",
-                     "warn", 2000);
-        }
+        applyAuthoritativeStatus(await r.json());
       } catch (_e) {
-        this.toast(this.lang === "zh"
-                    ? "停止失败，当前会话仍在运行"
-                    : "Could not stop; the session is still running",
-                   "error", 3000);
+        // The request may have reached the backend before the response failed.
+        // Probe exact ownership and apply the same state matrix: retain matching
+        // active+stopping, restore matching active+running, settle inactive, and
+        // never mutate an ABA successor.
+        let status = null;
+        try {
+          const probeController = new AbortController();
+          const probeTimeout = setTimeout(() => probeController.abort(), 2500);
+          try {
+            const probe = await fetch(`/api/chat/sessions/${encodeURIComponent(sid)}/active`, {
+              headers: this.hdr(), signal: probeController.signal,
+            });
+            if (probe.ok) status = await probe.json();
+          } finally { clearTimeout(probeTimeout); }
+        } catch (_) { status = null; }
+        const resolution = applyAuthoritativeStatus(status);
+        if (resolution === "running") {
+          this.toast(this.lang === "zh"
+            ? "停止失败，当前会话仍在运行"
+            : "Could not stop; the session is still running",
+          "error", 3000);
+        } else if (status === null) {
+          this.toast(this.lang === "zh"
+            ? "中断请求已提交，正在自动确认最终状态"
+            : "Interrupt requested; confirming the final state",
+          "warn", 3000);
+        }
       } finally {
         clearTimeout(timeout);
-        if (this.tabState[sid] === st) {
-          // A successfully accepted interrupt stays deduplicated until the
-          // stream's terminal event clears _stopping in _markDone().
-          if (!waitForTerminalEvent || !st.streaming) st._stopping = false;
-          this._syncQueueFromServer(sid);
-        }
+        if (this.tabState[sid] === st) this._syncQueueFromServer(sid);
+        this._syncSessionListQuiet();
         setTimeout(() => this.refreshSessions(), 800);
       }
     },
@@ -22914,28 +31573,81 @@ function portal() {
       }
     },
     // ====== permission_request helpers ======
-    async decidePermission(msg, decision) {
-      if (msg.resolved) return;
-      msg.resolved = true;
+    isExitPlanPermission(msg) {
+      return !!(msg && msg.role === "permission_request"
+        && (msg.kind === "exit_plan"
+          || msg.kind === "exit_plan_mode"
+          || msg.tool === "ExitPlanMode"));
+    },
+    planModeSuggestions(msg) {
+      const seen = new Set();
+      const suggestions = [];
+      for (const suggestion of ((msg && msg.suggestions) || [])) {
+        const mode = this._normalizePermissionMode(
+          suggestion && suggestion.mode,
+          "",
+        );
+        if (!mode || seen.has(mode)) continue;
+        seen.add(mode);
+        suggestions.push({ ...suggestion, mode });
+      }
+      return suggestions;
+    },
+    planPermissionMarkdown(msg) {
+      const input = (msg && msg.input) || {};
+      return (msg && msg.plan) || input.plan || input.plan_content || "";
+    },
+    permissionModeLabel(mode) {
+      const key = "perm.mode." + String(mode || "");
+      const label = this.t(key);
+      return label === key ? String(mode || "") : label;
+    },
+    planSuggestionLabel(mode) {
+      const key = "plan.approve." + String(mode || "");
+      const label = this.t(key);
+      return label === key
+        ? this.t("plan.approve_mode", { mode: this.permissionModeLabel(mode) })
+        : label;
+    },
+    async decidePermission(msg, decision, mode = null) {
+      if (msg.resolved || msg.submitting || msg.awaitingTransition) return;
+      const sid = msg.sessionId || this.currentId;
+      if (!sid) return;
+      mode = this._normalizePermissionMode(mode, "") || null;
+      const waitsForTransition = this.isExitPlanPermission(msg)
+        && decision === "allow";
+      msg.submitting = true;
+      msg.awaitingTransition = waitsForTransition;
+      msg.failure_message = "";
       msg.decision = decision;
+      msg.mode = mode;
       try {
         const r = await fetch(
-          `/api/chat/permission/${encodeURIComponent(this.currentId)}/${encodeURIComponent(msg.id)}`,
+          `/api/chat/permission/${encodeURIComponent(sid)}/${encodeURIComponent(msg.id)}`,
           {
             method: "POST",
             headers: { ...this.hdr(), "Content-Type": "application/json" },
-            body: JSON.stringify({ decision }),
+            body: JSON.stringify({ decision, mode }),
           },
         );
         if (!r.ok) {
-          msg.resolved = false;
-          msg.decision = null;
-          this.toast(this.t("perm.submit_failed"), "error", 3000);
+          throw new Error(await r.text());
         }
+        // ExitPlanMode is a two-phase transaction: POST only wakes the SDK
+        // callback. The later permission_mode_changed SSE is the commit.
+        if (!waitsForTransition) msg.resolved = true;
       } catch (e) {
+        // Another subscriber may have won the same pending request while this
+        // fetch was in flight. Its resolution event is authoritative; the
+        // losing POST commonly returns 404/409 and must not reopen the card.
+        if (msg._decisionAcknowledged) return;
         msg.resolved = false;
+        msg.awaitingTransition = false;
         msg.decision = null;
+        msg.mode = null;
         this.toast(this.t("perm.submit_failed"), "error", 3000);
+      } finally {
+        msg.submitting = false;
       }
     },
 
@@ -22980,9 +31692,13 @@ function portal() {
       if (!m || m.role !== "user" || !m._failed) return;
       if (this.workspaceSwitching) return;
       // Drop the failed bubble, put text back in input, and send.
-      const idx = this.messages.indexOf(m);
-      if (idx >= 0) this.messages.splice(idx, 1);
-      this.input = m.text || "";
+      const st = this.tabState[this.currentId];
+      if (!st || !this._removePaneMessage(st, m)) return;
+      this._setChatInput(this.userVisibleText(m));
+      this.pendingQuotes.splice(
+        0, this.pendingQuotes.length,
+        ...this.userSelectionQuotes(m).map(q => ({ ...q, id: this._uuid() })),
+      );
       // pendingImages/Docs we don't have here (preview state) — re-prompt
       // user to re-attach if they had files. Acceptable: error retry is rare.
       this.$nextTick(() => {
@@ -23015,8 +31731,10 @@ function portal() {
         return;
       }
       // Close any other open edit first (only one inline editor at a time).
-      (this.messages || []).forEach(msg => { if (msg !== m && msg._editing) msg._editing = false; });
-      m._editText = m.text || "";
+      this.activeSessionPane().messages.forEach(msg => {
+        if (msg !== m && msg._editing) msg._editing = false;
+      });
+      m._editText = this.userVisibleText(m);
       m._editing = true;
     },
 
@@ -23036,10 +31754,9 @@ function portal() {
       // (original message + all replies that followed) is discarded from
       // the in-memory view. The JSONL on disk is NOT modified; a reload
       // will show both branches, which is acceptable for now.
-      const msgs = this.messages;
-      const idx = msgs.indexOf(m);
-      if (idx >= 0) msgs.splice(idx);
-      this.input = newText;
+      const st = this.tabState[this.currentId];
+      if (!this._truncatePaneMessagesFrom(st, m)) return;
+      this._setChatInput(newText);
       this.$nextTick(() => {
         const ta = this.$refs.chatInput;
         if (ta) this.autoGrow(ta);
@@ -23077,7 +31794,7 @@ function portal() {
       return (zh ? "Muse 出错：" : "Muse error: ") + s;
     },
     copyMsg(m) {
-      const text = m.text || "";
+      const text = m.role === "user" ? this.userVisibleText(m) : (m.text || "");
       navigator.clipboard?.writeText(text).then(
         () => {
           this.toast(this.t("toast.copied"), "success", 1500);
@@ -23159,7 +31876,7 @@ function portal() {
       if (this.currentId !== sid) return;
       // openTab fires loadSession async — give it a tick or two to render.
       const scroll = () => {
-        const body = this.$refs && this.$refs.chatBody;
+        const body = this._chatBodyElement();
         const target = body && body.querySelector(
           `.msg[data-uuid="${CSS.escape(uuid)}"]`);
         if (!target) return false;
@@ -23267,7 +31984,7 @@ function portal() {
           type: "file",
           label: n.name,
           hint: n.path,
-          run: () => this.openFile(n),
+          run: () => this.openFile(n, { reveal: true }),
         });
       }
 
@@ -23325,6 +32042,8 @@ function portal() {
 
     // ===== global cross-workspace activity center =====
     async fetchActivity(opts = {}) {
+      if (typeof document !== "undefined"
+          && document.visibilityState !== "visible") return false;
       const key = opts.summaryOnly ? "summary" : "events";
       // A full snapshot also satisfies a summary refresh. Conversely, if a
       // cheap summary is already in flight when the user opens the center,
@@ -23342,26 +32061,41 @@ function portal() {
         }
       }
       const seq = ++this._activityRequestSeq;
+      const controller = new AbortController();
+      this._activityFetchControllers[key] = controller;
       const promise = (async () => {
         try {
           const path = opts.summaryOnly ? "/api/activity/summary" : "/api/activity?limit=500";
           const headers = { ...this.hdr() };
           if (this._activityEtags[key]) headers["If-None-Match"] = this._activityEtags[key];
-          let r = await fetch(path, { headers });
-          // A long-lived tab can retain an ETag while Alpine state is rebuilt.
-          // Never accept a 304 as the only source for an empty task list.
-          if (r.status === 304 && !opts.summaryOnly && !this.activity.events.length) {
+          let r = await this._fetchWithDeadline(path, {
+            headers, signal: controller.signal,
+          });
+          // An ETag without a locally owned full snapshot cannot validate the
+          // rows. Recover once without conditionals; a loaded empty snapshot
+          // can safely reuse a 304 just like a non-empty one.
+          if (r.status === 304 && !opts.summaryOnly
+              && !this._activityEventsSnapshotLoaded) {
             delete this._activityEtags[key];
             delete headers["If-None-Match"];
-            r = await fetch(path, { headers, cache: "reload" });
+            r = await this._fetchWithDeadline(path, {
+              headers, cache: "reload", signal: controller.signal,
+            });
           }
           if (r.status === 304 || !r.ok) return false;
           const etag = r.headers.get("etag");
           if (etag) this._activityEtags[key] = etag;
           const data = await r.json();
           if (seq < this._activityAppliedSeq) return false;
-          this._activityAppliedSeq = seq;
           const summary = opts.summaryOnly ? data : data.summary;
+          const incomingGeneration = String(summary?.generation || "");
+          const incomingRevision = Number(summary?.revision) || 0;
+          const sameGeneration = !incomingGeneration
+            || !this._activityGeneration
+            || incomingGeneration === this._activityGeneration;
+          if (sameGeneration && incomingRevision
+              && incomingRevision < this._activityRevision) return false;
+          this._activityAppliedSeq = seq;
           if (summary) {
             this.activity.summary = summary;
             const generation = String(summary.generation || "");
@@ -23375,23 +32109,39 @@ function portal() {
             );
           }
           if (!opts.summaryOnly && Array.isArray(data.events)) {
-            this.activity.events = data.events;
-            this._syncScheduledActivitySnapshot(data.events);
+            const events = data.events.slice(0, this.ACTIVITY_EVENT_CAP);
+            this.activity.events = events;
+            if (this.activity.moveMenu.show
+                && (!this._isMobileLayout() || !this.activityMoveMenuItem())) {
+              this.closeActivityMoveMenu(false);
+            }
+            this._activityEventsSnapshotLoaded = true;
+            this._syncScheduledActivitySnapshot(events);
           }
+          if (!opts.summaryOnly) this.applyActivityGroupPayload(data);
           this._syncAppBadge();
           return true;
         } catch (_) { return false; }
       })();
       this._activityFetchPromises[key] = promise;
       try { return await promise; }
-      finally { if (this._activityFetchPromises[key] === promise) delete this._activityFetchPromises[key]; }
+      finally {
+        if (this._activityFetchPromises[key] === promise) {
+          delete this._activityFetchPromises[key];
+        }
+        if (this._activityFetchControllers[key] === controller) {
+          delete this._activityFetchControllers[key];
+        }
+      }
     },
     async openActivityCenter() {
+      this.closeActivityMoveMenu();
+      this.closeMemoryRecallPopover();
       if (!this.activity.viewLoaded) {
         this.activity.viewLoaded = true;
         try {
           const saved = localStorage.getItem("muselab_activity_view");
-          if (saved === "status" || saved === "timeline") {
+          if (["status", "groups", "timeline"].includes(saved)) {
             this.activity.view = saved;
           } else if (saved === "finished") {
             // Migrate the short-lived terminal-only view to the corrected
@@ -23400,13 +32150,31 @@ function portal() {
           }
         } catch (_) {}
       }
+      const opener = document.activeElement;
       this.activity.show = true;
       this.activity.loading = true;
+      this._openFocusSurface(
+        "activity", ".activity-modal", ".activity-searchbar input",
+        opener, true,
+      );
       await this.fetchActivity();
       this.activity.loading = false;
     },
+    closeActivityCenter() {
+      const wasOpen = this.activity.show;
+      this.activity.show = false;
+      this.closeActivityMoveMenu();
+      this.cancelActivityGroupEditor();
+      this.onActivityDragEnd();
+      this.onActivityGroupOrderDragEnd();
+      if (wasOpen) this._closeFocusSurface("activity");
+    },
     setActivityView(view) {
-      if (view !== "status" && view !== "timeline") return;
+      if (!["status", "groups", "timeline"].includes(view)) return;
+      this.closeActivityMoveMenu();
+      this.cancelActivityGroupEditor();
+      this.onActivityDragEnd();
+      this.onActivityGroupOrderDragEnd();
       this.activity.view = view;
       try { localStorage.setItem("muselab_activity_view", view); } catch (_) {}
     },
@@ -23421,11 +32189,124 @@ function portal() {
         { key: "history", label: zh ? "历史任务" : "History" },
       ];
     },
+    ACTIVITY_EVENT_CAP: 500,
     ACTIVITY_GROUP_CAP: 5,
-    ACTIVITY_TIMELINE_CAP: 10,
+    ACTIVITY_CUSTOM_GROUP_CAP: 50,
+    ACTIVITY_TIMELINE_CAP: 15,
+    ACTIVITY_GROUP_COLORS: [
+      "blue", "violet", "cyan", "green", "amber", "rose", "gray",
+    ],
+    _activityDerivedSnapshot() {
+      const source = Array.isArray(this.activity.events)
+        ? this.activity.events : [];
+      const owner = _rawAlpine(this);
+      const rawSource = _rawAlpine(source);
+      const query = this.activitySearchQuery();
+      const lang = String(this.lang || "");
+      const limit = Math.max(0, Number(this.ACTIVITY_EVENT_CAP) || 0);
+      let cache = _activityDerivedCaches.get(owner);
+      if (!cache || cache.source !== rawSource || cache.query !== query
+          || cache.lang !== lang || cache.limit !== limit) {
+        cache = {
+          source: rawSource,
+          query,
+          lang,
+          limit,
+          events: source.slice(0, limit),
+          groups: new Map(),
+          searchCount: null,
+        };
+        _activityDerivedCaches.set(owner, cache);
+      }
+      return cache;
+    },
+    normalizeActivityGroupOrder(order = this.activity.groupOrder) {
+      const customIds = (this.activity.customGroups || [])
+        .map(group => String(group.id || "")).filter(Boolean);
+      const valid = new Set(customIds);
+      const result = [];
+      for (const value of Array.isArray(order) ? order : []) {
+        const groupId = String(value || "");
+        if (valid.has(groupId) && !result.includes(groupId)) result.push(groupId);
+      }
+      for (const groupId of customIds) {
+        if (!result.includes(groupId)) result.push(groupId);
+      }
+      result.push("__ungrouped__");
+      return result;
+    },
+    applyActivityGroupPayload(data) {
+      if (Array.isArray(data?.custom_groups)) {
+        this.activity.customGroups = data.custom_groups;
+        const editor = this.activity.groupEditor;
+        if (editor?.open && editor.id && !editor.workspaceDirty) {
+          const current = data.custom_groups.find(
+            group => String(group?.id || "") === String(editor.id),
+          );
+          if (current) {
+            editor.workspaceId = String(current.workspace_id || "");
+            editor.originalWorkspaceId = editor.workspaceId;
+            editor.workspacePath = String(current.workspace_path || "");
+          }
+        }
+      }
+      if (Array.isArray(data?.group_order)) {
+        this.activity.groupOrder = this.normalizeActivityGroupOrder(data.group_order);
+      } else {
+        this.activity.groupOrder = this.normalizeActivityGroupOrder();
+      }
+    },
+    activityCustomGroupSections() {
+      const lookup = new Map((this.activity.customGroups || []).map(group => [
+        String(group.id || ""), {
+          key: `custom:${group.id}`,
+          label: group.name,
+          custom: true,
+          groupId: group.id,
+          orderId: String(group.id || ""),
+          color: group.color || "blue",
+          workspaceId: String(group.workspace_id || ""),
+          workspacePath: String(group.workspace_path || ""),
+        },
+      ]));
+      const customGroupCount = lookup.size;
+      lookup.set("__ungrouped__", {
+        key: "custom:__ungrouped__",
+        label: this.lang === "zh" ? "未分组" : "Ungrouped",
+        custom: true,
+        groupId: "",
+        orderId: "__ungrouped__",
+        color: "gray",
+        builtin: true,
+      });
+      let customIndex = 0;
+      return this.normalizeActivityGroupOrder()
+        .map(groupId => lookup.get(groupId)).filter(Boolean)
+        .map(group => {
+          if (group.builtin) {
+            return {
+              ...group,
+              boardColumn: 3,
+              boardRow: 1,
+              boardRowSpan: Math.max(1, Math.ceil(customGroupCount / 2)),
+            };
+          }
+          const index = customIndex++;
+          return {
+            ...group,
+            boardColumn: (index % 2) + 1,
+            boardRow: Math.floor(index / 2) + 1,
+            boardRowSpan: 1,
+          };
+        });
+    },
     activityMatchesGroup(item, key) {
       if (!item) return false;
       if (key === "timeline") return true;
+      if (key === "custom:__ungrouped__") return !String(item.group_id || "");
+      if (key.startsWith("custom:")) {
+        return String(item.group_id || "") === key.slice("custom:".length);
+      }
       if (key === "review") return item.state === "completed" && !item.read;
       if (key === "running") return ["running", "waiting_approval", "paused"].includes(item.state);
       if (key === "failed") return item.state === "failed";
@@ -23434,23 +32315,98 @@ function portal() {
       }
       return false;
     },
+    activitySearchQuery() {
+      return String(this.activity.query || "").trim().toLocaleLowerCase();
+    },
+    activityMatchesSearch(item) {
+      const query = this.activitySearchQuery();
+      if (!query) return true;
+      const fields = [
+        item?.session_name,
+        item?.task_summary,
+        item?.session_id,
+        item?.thread_id,
+        item?.workspace,
+        item?.workspace_name,
+        item?.state,
+        this.activityStateLabel(item?.state),
+        item?.status_detail,
+        item?.kind,
+        item?.source_id,
+        item?.id,
+      ];
+      return fields.some(value => String(value || "").toLocaleLowerCase().includes(query));
+    },
+    activitySearchResultCount() {
+      const cache = this._activityDerivedSnapshot();
+      if (!cache.query) return cache.events.length;
+      if (cache.searchCount === null) {
+        cache.searchCount = cache.events
+          .filter(item => this.activityMatchesSearch(item)).length;
+      }
+      return cache.searchCount;
+    },
+    clearActivitySearch() {
+      if (!this.activitySearchQuery()) {
+        this.closeActivityCenter();
+        return;
+      }
+      this.activity.query = "";
+    },
     activityEventTimestamp(item) {
       return Number(item?.updated_at || item?.finished_at || item?.started_at || 0);
     },
     activityAllEvents(group) {
+      const cache = this._activityDerivedSnapshot();
+      const groupKey = String(group?.key || "");
+      const custom = !!group?.custom;
+      const cacheKey = `${groupKey}|${Number(custom)}`;
+      if (cache.groups.has(cacheKey)) return cache.groups.get(cacheKey);
       const activeRank = { waiting_approval: 0, paused: 1, running: 2 };
-      return (this.activity.events || [])
-        .filter(item => this.activityMatchesGroup(item, group.key))
+      const attentionRank = item => {
+        if (this.activityRequiresAction(item)) return 0;
+        if (this.activityIsUnreadResult(item)) return 1;
+        if (["running", "waiting_approval", "paused"].includes(item.state)) return 2;
+        return 3;
+      };
+      const events = cache.events
+        .filter(item => this.activityMatchesGroup(item, groupKey))
+        // Search before applying the per-group row cap so a matching older
+        // session remains discoverable even when it was outside the first page.
+        .filter(item => this.activityMatchesSearch(item))
         .sort((a, b) => {
-          if (group.key === "timeline") {
+          if (groupKey === "timeline") {
+            const pinRank = Number(!!b.pinned) - Number(!!a.pinned);
+            if (pinRank) return pinRank;
             return this.activityEventTimestamp(b) - this.activityEventTimestamp(a);
           }
-          if (group.key === "running") {
+          if (custom) {
+            const aManual = Number.isFinite(Number(a.group_order));
+            const bManual = Number.isFinite(Number(b.group_order));
+            // Newly arrived rows without a manual position remain visible at the
+            // top. Once the user drags a lane, numbered rows keep that exact order.
+            if (aManual !== bManual) return aManual ? 1 : -1;
+            if (aManual && bManual) {
+              const order = Number(a.group_order) - Number(b.group_order);
+              if (order) return order;
+            }
+            if (groupKey === "custom:__ungrouped__") {
+              return this.activityEventTimestamp(b) - this.activityEventTimestamp(a);
+            }
+            const pinRank = Number(!!b.pinned) - Number(!!a.pinned);
+            if (pinRank) return pinRank;
+            const rank = attentionRank(a) - attentionRank(b);
+            if (rank) return rank;
+            return this.activityEventTimestamp(b) - this.activityEventTimestamp(a);
+          }
+          if (groupKey === "running") {
             const rank = (activeRank[a.state] ?? 9) - (activeRank[b.state] ?? 9);
             if (rank) return rank;
           }
           return this.activityEventTimestamp(b) - this.activityEventTimestamp(a);
         });
+      cache.groups.set(cacheKey, events);
+      return events;
     },
     activityEvents(group) {
       const all = this.activityAllEvents(group);
@@ -23458,8 +32414,9 @@ function portal() {
       return all.slice(0, this.activityGroupCap(group));
     },
     activityGroupCap(group) {
-      return group?.key === "timeline"
-        ? this.ACTIVITY_TIMELINE_CAP : this.ACTIVITY_GROUP_CAP;
+      if (group?.key === "timeline") return this.ACTIVITY_TIMELINE_CAP;
+      if (group?.custom) return this.ACTIVITY_CUSTOM_GROUP_CAP;
+      return this.ACTIVITY_GROUP_CAP;
     },
     activityHiddenCount(group) {
       return Math.max(
@@ -23469,6 +32426,11 @@ function portal() {
       this.activity.expanded[key] = !this.activity.expanded[key];
     },
     activityGroupCount(group) {
+      // While searching, counts must describe the visible result set rather
+      // than the unfiltered backend summary.
+      if (group?.custom || this.activitySearchQuery()) {
+        return this.activityAllEvents(group).length;
+      }
       const count = this.activity.summary?.groups?.[group.key];
       return Number.isFinite(Number(count))
         ? Number(count) : this.activityAllEvents(group).length;
@@ -23478,9 +32440,12 @@ function portal() {
         return [{
           key: "timeline",
           label: this.lang === "zh"
-            ? "全部会话（按时间倒序）"
-            : "All sessions (newest first)",
+            ? "全部任务（置顶优先 · 时间倒序）"
+            : "All tasks (pinned, then newest)",
         }];
+      }
+      if (this.activity.view === "groups") {
+        return this.activityCustomGroupSections();
       }
       const groups = this.activityGroups();
       const on = this.activity.filter || [];
@@ -23507,6 +32472,11 @@ function portal() {
       return !!item && ["waiting_approval", "paused"].includes(item.state);
     },
     activityGroupUnread(group) {
+      if (group?.custom || this.activitySearchQuery()) {
+        return this.activityAllEvents(group)
+          .filter(item => this.activityIsUnreadResult(item)
+            || this.activityRequiresAction(item)).length;
+      }
       const count = this.activity.summary?.group_unread?.[group.key];
       if (Number.isFinite(Number(count))) return Number(count);
       return this.activityAllEvents(group)
@@ -23518,13 +32488,664 @@ function portal() {
         paused: zh ? "已暂停" : "Paused", completed: zh ? "已完成" : "Completed",
         failed: zh ? "失败" : "Failed", cancelled: zh ? "已取消" : "Cancelled" })[state] || state;
     },
+    activityTaskSummary(item) {
+      const summary = String(item?.task_summary || "").trim();
+      const session = String(item?.session_name || "").trim();
+      return summary && summary !== session ? summary : "";
+    },
+    activityTurnLabel(item) {
+      const count = Math.max(0, Math.floor(Number(item?.turn_count) || 0));
+      if (count <= 1) return "";
+      return this.lang === "zh" ? `${count}轮` : `${count} turns`;
+    },
+    activityWorkspaceLabel(item) {
+      if ((this.activity.summary?.workspaces || []).length <= 1) return "";
+      return String(item?.workspace_name || "").trim();
+    },
+    activityStatusDetail(item) {
+      const detail = String(item?.status_detail || "").trim();
+      if (!detail || ["Task completed", "Task failed", "Task cancelled"].includes(detail)) {
+        return "";
+      }
+      return detail;
+    },
     activityTime(item) {
       const ts = this.activityEventTimestamp(item) * 1000;
       return ts ? new Date(ts).toLocaleString(this.lang === "zh" ? "zh-CN" : "en-US",
         { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "";
     },
+    activityRelativeTime(item) {
+      const ts = this.activityEventTimestamp(item) * 1000;
+      if (!ts) return "";
+      const elapsed = Math.max(0, Math.floor((Date.now() - ts) / 1000));
+      if (elapsed < 45) return this.lang === "zh" ? "刚刚" : "Just now";
+      if (elapsed < 3600) {
+        const minutes = Math.max(1, Math.floor(elapsed / 60));
+        return this.lang === "zh" ? `${minutes}分钟前` : `${minutes}m ago`;
+      }
+      if (elapsed < 86400) {
+        const hours = Math.max(1, Math.floor(elapsed / 3600));
+        return this.lang === "zh" ? `${hours}小时前` : `${hours}h ago`;
+      }
+      if (elapsed < 7 * 86400) {
+        const days = Math.max(1, Math.floor(elapsed / 86400));
+        return this.lang === "zh" ? `${days}天前` : `${days}d ago`;
+      }
+      return this.activityTime(item);
+    },
+    async toggleActivityPin(item) {
+      if (!item?.id || this.activity.view !== "timeline") return false;
+      const eventId = String(item.id);
+      if (this._activityPinPending[eventId]) return false;
+      const previous = !!item.pinned;
+      const target = !previous;
+      this._activityPinPending = {
+        ...this._activityPinPending,
+        [eventId]: true,
+      };
+
+      // Reorder immediately, and retire any snapshot that started before this
+      // mutation so it cannot briefly restore the old pin state.
+      const current = this.activity.events.find(row => row.id === eventId);
+      if (current) current.pinned = target;
+      this.activity.events = [...this.activity.events];
+      this._activityAppliedSeq = ++this._activityRequestSeq;
+      try {
+        const { ok, data, error } = await this.api(
+          `/api/activity/${encodeURIComponent(eventId)}`,
+          { method: "PATCH", json: { pinned: target } },
+        );
+        if (!ok || !data?.item) throw new Error(error || "activity pin failed");
+        // The PATCH response has the same envelope as an SSE update, so this
+        // also works when the live channel is unavailable. A duplicate SSE
+        // revision is ignored by _applyActivityUpdate.
+        this._applyActivityUpdate(data);
+        return true;
+      } catch (_) {
+        const latest = this.activity.events.find(row => row.id === eventId);
+        if (latest && !!latest.pinned === target) latest.pinned = previous;
+        this.activity.events = [...this.activity.events];
+        this.toast(this.lang === "zh" ? "置顶操作失败" : "Could not update pin", "error");
+        return false;
+      } finally {
+        const pending = { ...this._activityPinPending };
+        delete pending[eventId];
+        this._activityPinPending = pending;
+      }
+    },
+    activityGroupWorkspaceEntry(group) {
+      const workspaceId = String(group?.workspaceId || group?.workspace_id || "");
+      if (!workspaceId) return null;
+      return (this.sessionWorkspaces || []).find(
+        workspace => String(workspace?.id || "") === workspaceId,
+      ) || null;
+    },
+    activityGroupWorkspaceLabel(group) {
+      const entry = this.activityGroupWorkspaceEntry(group);
+      if (entry) return entry.name || entry.path || this.t("activity.group.workspace");
+      const path = String(group?.workspacePath || group?.workspace_path || "");
+      if (!path) return "";
+      const parts = path.replace(/[\\/]+$/, "").split(/[\\/]/);
+      return parts[parts.length - 1] || path;
+    },
+    activityGroupWorkspaceAvailable(group) {
+      return !!this.activityGroupWorkspaceEntry(group);
+    },
+    async openActivityGroupWorkspace(group) {
+      const groupId = String(group?.groupId || group?.id || "");
+      const expectedWorkspaceId = String(
+        group?.workspaceId || group?.workspace_id || "",
+      );
+      if (!expectedWorkspaceId) return false;
+      const refreshed = await this.fetchSessionWorkspaces({
+        restoreCache: false,
+        validateActive: false,
+      });
+      const currentGroup = (this.activity.customGroups || []).find(
+        row => String(row?.id || "") === groupId,
+      );
+      const currentWorkspaceId = String(currentGroup?.workspace_id || "");
+      const entry = (this.sessionWorkspaces || []).find(
+        workspace => String(workspace?.id || "") === expectedWorkspaceId,
+      );
+      if (!refreshed || currentWorkspaceId !== expectedWorkspaceId || !entry) {
+        this.toast(this.t("activity.group.workspace_rebind"), "error");
+        return false;
+      }
+      this.closeActivityCenter();
+      await this.switchWorkspace(entry.path);
+      return this.currentWorkspacePath() === entry.path;
+    },
+    openActivityGroupEditor(group = null) {
+      if (this.activity.groupEditor.saving) return;
+      const palette = this.ACTIVITY_GROUP_COLORS;
+      const fallback = palette[(this.activity.customGroups || []).length % palette.length];
+      this.closeActivityMoveMenu();
+      this.activity.groupEditor = {
+        open: true,
+        id: group?.groupId || group?.id || "",
+        name: group?.label || group?.name || "",
+        color: group?.color || fallback,
+        workspaceId: String(group?.workspaceId || group?.workspace_id || ""),
+        originalWorkspaceId: String(group?.workspaceId || group?.workspace_id || ""),
+        workspacePath: String(group?.workspacePath || group?.workspace_path || ""),
+        workspaceDirty: false,
+        owner: ++this._activityGroupEditorSeq,
+        saving: false,
+      };
+      this.$nextTick(() => {
+        const input = document.querySelector(".activity-group-editor input");
+        if (input) input.focus();
+      });
+    },
+    cancelActivityGroupEditor(force = false) {
+      if (this.activity.groupEditor.saving && !force) return;
+      const owner = ++this._activityGroupEditorSeq;
+      this.activity.groupEditor = {
+        open: false, id: "", name: "", color: "blue",
+        workspaceId: "", originalWorkspaceId: "", workspacePath: "",
+        workspaceDirty: false, owner, saving: false,
+      };
+    },
+    async saveActivityGroup() {
+      const draft = this.activity.groupEditor;
+      const name = String(draft.name || "").trim();
+      if (!name || draft.saving) return;
+      draft.saving = true;
+      const owner = draft.owner;
+      const editing = !!draft.id;
+      const payload = { name, color: draft.color || "blue" };
+      const workspaceId = String(draft.workspaceId || "");
+      if (!editing || draft.workspaceDirty) {
+        payload.workspace_id = workspaceId || null;
+      }
+      try {
+        const { ok, data, error } = await this.api(
+          editing
+            ? `/api/activity/groups/${encodeURIComponent(draft.id)}`
+            : "/api/activity/groups",
+          {
+            method: editing ? "PATCH" : "POST",
+            json: payload,
+          },
+        );
+        if (!ok || !Array.isArray(data?.custom_groups)) {
+          throw new Error(error || "activity group save failed");
+        }
+        if (this.activity.groupEditor.owner !== owner) return false;
+        const responseRevision = Number(data.revision) || 0;
+        if (!responseRevision || responseRevision >= this._activityRevision) {
+          this.applyActivityGroupPayload(data);
+        } else {
+          this.fetchActivity().catch(() => {});
+        }
+        this._activityRevision = Math.max(this._activityRevision, responseRevision);
+        this.cancelActivityGroupEditor(true);
+      } catch (error) {
+        if (this.activity.groupEditor.owner !== owner) return false;
+        draft.saving = false;
+        this.toast(
+          this.lang === "zh"
+            ? `保存分组失败：${String(error?.message || error)}`
+            : `Could not save group: ${String(error?.message || error)}`,
+          "error",
+        );
+      }
+    },
+    async deleteActivityGroup(group) {
+      if (!group?.groupId) return;
+      const ok = await this.confirm({
+        title: this.lang === "zh" ? "删除分组？" : "Delete group?",
+        body: this.lang === "zh"
+          ? `“${group.label}”中的会话会移回“未分组”，会话本身不会删除。`
+          : `Sessions in “${group.label}” will move to Ungrouped. No session will be deleted.`,
+        okText: this.lang === "zh" ? "删除分组" : "Delete group",
+        danger: true,
+      });
+      if (!ok) return;
+      const groupId = group.groupId;
+      const { ok: deleted, data, error } = await this.api(
+        `/api/activity/groups/${encodeURIComponent(groupId)}`,
+        { method: "DELETE" },
+      );
+      if (!deleted) {
+        this.toast(
+          this.lang === "zh" ? "删除分组失败" : (error || "Could not delete group"),
+          "error",
+        );
+        return;
+      }
+      const responseRevision = Number(data?.revision) || 0;
+      if (!responseRevision || responseRevision >= this._activityRevision) {
+        this.applyActivityGroupPayload(data || {});
+        if (Array.isArray(data?.items)) {
+          const byId = new Map(data.items.map(row => [String(row.id), row]));
+          this.activity.events = this.activity.events.map(
+            row => byId.get(String(row.id)) || row,
+          );
+        } else {
+          for (const item of this.activity.events) {
+            if (String(item.group_id || "") === groupId) {
+              delete item.group_id;
+              delete item.group_order;
+            }
+          }
+          this.activity.events = [...this.activity.events];
+        }
+      } else {
+        this.fetchActivity().catch(() => {});
+      }
+      this.activity.expanded = {};
+      this._activityRevision = Math.max(this._activityRevision, responseRevision);
+    },
+    async persistActivityGroupOrder(next, previous) {
+      const opSeq = ++this._activityGroupOrderSeq;
+      const baseRevision = this._activityRevision;
+      const requestedOrder = this.normalizeActivityGroupOrder(next);
+      this.activity.groupOrder = requestedOrder;
+      const lookup = new Map((this.activity.customGroups || [])
+        .map(group => [String(group.id || ""), group]));
+      this.activity.customGroups = requestedOrder
+        .map(groupId => lookup.get(groupId)).filter(Boolean);
+
+      const run = async () => {
+        const { ok, data } = await this.api("/api/activity/groups/order", {
+          method: "PUT",
+          json: { ids: requestedOrder },
+        });
+        if (opSeq !== this._activityGroupOrderSeq) return false;
+        const responseRevision = Number(data?.revision) || 0;
+        if (!ok) {
+          if (this._activityRevision <= baseRevision) {
+            this.activity.groupOrder = this.normalizeActivityGroupOrder(previous);
+            this.activity.customGroups = this.activity.groupOrder
+              .map(groupId => lookup.get(groupId)).filter(Boolean);
+          } else {
+            this.fetchActivity().catch(() => {});
+          }
+          this.toast(this.lang === "zh" ? "分组排序失败" : "Could not reorder groups", "error");
+          return false;
+        }
+        if (responseRevision && responseRevision < this._activityRevision) return true;
+        this.applyActivityGroupPayload(data || {});
+        this._activityRevision = Math.max(this._activityRevision, responseRevision);
+        return true;
+      };
+      const prior = this._activityGroupOrderQueue || Promise.resolve();
+      const task = prior.catch(() => {}).then(run);
+      this._activityGroupOrderQueue = task;
+      try {
+        return await task;
+      } finally {
+        if (this._activityGroupOrderQueue === task) {
+          this._activityGroupOrderQueue = null;
+        }
+      }
+    },
+    onActivityGroupOrderDragStart(ev, group) {
+      if (this.activity.view !== "groups" || this.activitySearchQuery()
+          || group?.builtin) return;
+      const orderId = String(group?.orderId || group?.groupId || "");
+      if (!orderId) return;
+      this.onActivityDragEnd();
+      this.activity.dragGroupId = orderId;
+      if (ev?.dataTransfer) {
+        ev.dataTransfer.effectAllowed = "move";
+        ev.dataTransfer.setData("application/x-muselab-activity-group", orderId);
+        ev.dataTransfer.setData("text/plain", orderId);
+      }
+    },
+    onActivityGroupOrderDragOver(ev, group) {
+      if (!this.activity.dragGroupId || this.activitySearchQuery()) return;
+      const orderId = String(group?.orderId || group?.groupId || "");
+      if (!orderId || orderId === this.activity.dragGroupId) return;
+      const rect = ev?.currentTarget?.getBoundingClientRect();
+      const vertical = rect && Math.abs((ev?.clientY || 0) - rect.top - rect.height / 2)
+        > Math.abs((ev?.clientX || 0) - rect.left - rect.width / 2);
+      this.activity.dragOverGroupOrderId = orderId;
+      this.activity.dragGroupInsertAfter = !!rect && (vertical
+        ? (ev.clientY > rect.top + rect.height / 2)
+        : (ev.clientX > rect.left + rect.width / 2));
+    },
+    async onActivityGroupOrderDrop(group) {
+      const sourceId = this.activity.dragGroupId;
+      const targetId = String(group?.orderId || group?.groupId || "");
+      const insertAfter = this.activity.dragGroupInsertAfter;
+      this.onActivityGroupOrderDragEnd();
+      if (!sourceId || !targetId || sourceId === targetId) return;
+      const previous = this.normalizeActivityGroupOrder();
+      const next = previous.filter(groupId => groupId !== sourceId);
+      let targetAt = next.indexOf(targetId);
+      if (targetAt < 0) return;
+      if (insertAfter) targetAt += 1;
+      next.splice(targetAt, 0, sourceId);
+      await this.persistActivityGroupOrder(next, previous);
+    },
+    onActivityGroupOrderDragEnd() {
+      this.activity.dragGroupId = "";
+      this.activity.dragOverGroupOrderId = "";
+      this.activity.dragGroupInsertAfter = false;
+    },
+    openActivityMoveMenu(ev, item) {
+      if (!item?.id) return;
+      const eventId = String(item.id);
+      const opener = ev?.currentTarget || null;
+      const showMenu = (style) => {
+        this.activity.moveMenu = { show: true, eventId, style };
+        this._openFocusSurface(
+          "activity-move", ".activity-move-menu", "button", opener, true,
+        );
+      };
+      if (this._isMobileLayout()) {
+        showMenu("");
+        return;
+      }
+      const rect = opener?.getBoundingClientRect();
+      if (!rect) return;
+      const width = Math.min(230, window.innerWidth - 16);
+      const estimatedHeight = Math.min(
+        360, 48 + ((this.activity.customGroups || []).length + 1) * 34,
+      );
+      const left = Math.max(
+        8, Math.min(rect.right - width, window.innerWidth - width - 8),
+      );
+      const top = rect.bottom + 6 + estimatedHeight <= window.innerHeight - 8
+        ? rect.bottom + 6
+        : Math.max(8, rect.top - estimatedHeight - 6);
+      showMenu(
+        `position:fixed;left:${Math.round(left)}px;top:${Math.round(top)}px;width:${Math.round(width)}px;`,
+      );
+    },
+    onActivityMoveMenuKeydown(ev) {
+      if (!ev || !["ArrowDown", "ArrowUp", "Home", "End"].includes(ev.key)) return;
+      const menu = ev.currentTarget;
+      const items = this._focusableElements(menu).filter(
+        item => item.matches('[role="menuitemradio"]'),
+      );
+      if (!items.length) return;
+      const current = items.indexOf(document.activeElement);
+      let index;
+      if (ev.key === "Home") index = 0;
+      else if (ev.key === "End") index = items.length - 1;
+      else if (ev.key === "ArrowUp") {
+        index = current <= 0 ? items.length - 1 : current - 1;
+      } else {
+        index = current < 0 || current === items.length - 1 ? 0 : current + 1;
+      }
+      ev.preventDefault();
+      ev.stopPropagation();
+      this._focusWithoutScroll(items[index]);
+    },
+    closeActivityMoveMenu(restoreFocus = false) {
+      const menu = document.querySelector(".activity-move-menu");
+      const focusWasInside = !!(menu && menu.contains(document.activeElement));
+      this.activity.moveMenu = { show: false, eventId: "", style: "" };
+      this._closeFocusSurface("activity-move", restoreFocus);
+      if (!restoreFocus && focusWasInside && this.activity.show) {
+        this.$nextTick(() => {
+          const modal = document.querySelector(".activity-modal");
+          if (modal && !modal.contains(document.activeElement)) {
+            this._focusWithoutScroll(modal);
+          }
+        });
+      }
+    },
+    activityMoveMenuItem() {
+      const eventId = this.activity.moveMenu.eventId;
+      return this.activity.events.find(row => String(row.id) === eventId) || null;
+    },
+    activityGroupSectionForId(groupId = "") {
+      return this.activityCustomGroupSections().find(
+        group => String(group.groupId || "") === String(groupId || ""),
+      ) || null;
+    },
+    placeActivityEventLocally(item, groupId, beforeEventId) {
+      const eventId = String(item?.id || "");
+      if (!eventId) return;
+      const sourceId = String(item.group_id || "");
+      const targetId = String(groupId || "");
+      const sourceGroup = this.activityGroupSectionForId(sourceId);
+      const targetGroup = this.activityGroupSectionForId(targetId);
+      if (!targetGroup) return;
+      const sourceItems = sourceGroup
+        ? this.activityAllEvents(sourceGroup).filter(row => String(row.id) !== eventId)
+        : [];
+      const targetItems = sourceId === targetId
+        ? sourceItems
+        : this.activityAllEvents(targetGroup).filter(row => String(row.id) !== eventId);
+      let insertAt = targetItems.length;
+      const before = String(beforeEventId || "");
+      if (before) {
+        const found = targetItems.findIndex(row => String(row.id) === before);
+        if (found >= 0) insertAt = found;
+      }
+      if (targetId) item.group_id = targetId;
+      else delete item.group_id;
+      targetItems.splice(insertAt, 0, item);
+      if (sourceId !== targetId) {
+        sourceItems.forEach((row, index) => { row.group_order = index; });
+      }
+      targetItems.forEach((row, index) => { row.group_order = index; });
+      this.activity.events = [...this.activity.events];
+      return [...new Set([...sourceItems, ...targetItems]
+        .map(row => String(row.id || "")).filter(Boolean))];
+    },
+    async assignActivityGroup(item, groupId = "", beforeEventId = null) {
+      if (!item?.id) return false;
+      const eventId = String(item.id);
+      if (this._activityGroupPending[eventId]) return false;
+      const target = String(groupId || "");
+      const previous = String(item.group_id || "");
+      const hasPlacement = beforeEventId !== null;
+      this.closeActivityMoveMenu(true);
+      if (!hasPlacement && target === previous) return true;
+      const previousPlacement = new Map(this.activity.events.map(row => [
+        String(row.id), {
+          hasGroup: Object.prototype.hasOwnProperty.call(row, "group_id"),
+          groupId: String(row.group_id || ""),
+          hasOrder: Object.prototype.hasOwnProperty.call(row, "group_order"),
+          order: row.group_order,
+        },
+      ]));
+      this._activityGroupPending = {
+        ...this._activityGroupPending,
+        [eventId]: true,
+      };
+      let affectedIds;
+      if (hasPlacement) {
+        affectedIds = this.placeActivityEventLocally(item, target, beforeEventId) || [eventId];
+      } else {
+        if (target) item.group_id = target;
+        else delete item.group_id;
+        delete item.group_order;
+        this.activity.events = [...this.activity.events];
+        affectedIds = [eventId];
+      }
+      const baseRevision = this._activityRevision;
+      const optimisticPlacement = new Map(affectedIds.map(id => {
+        const row = this.activity.events.find(itemRow => String(itemRow.id) === id);
+        return [id, {
+          groupId: String(row?.group_id || ""),
+          hasOrder: !!row && Object.prototype.hasOwnProperty.call(row, "group_order"),
+          order: row?.group_order,
+        }];
+      }));
+      this._activityAppliedSeq = ++this._activityRequestSeq;
+      try {
+        const json = { group_id: target };
+        if (hasPlacement) json.before_event_id = String(beforeEventId || "");
+        const { ok, data, error } = await this.api(
+          `/api/activity/${encodeURIComponent(eventId)}/group`,
+          { method: "PUT", json },
+        );
+        if (!ok || !data?.item) throw new Error(error || "group assignment failed");
+        const responseRevision = Number(data.revision) || 0;
+        if (!responseRevision || responseRevision >= this._activityRevision) {
+          const updates = Array.isArray(data.items) ? data.items : [data.item];
+          const byId = new Map(updates.map(row => [String(row.id), row]));
+          this.activity.events = this.activity.events.map(row => {
+            const update = byId.get(String(row.id));
+            if (!update) return row;
+            if (update.group_id) row.group_id = update.group_id;
+            else delete row.group_id;
+            if (Object.prototype.hasOwnProperty.call(update, "group_order")) {
+              row.group_order = update.group_order;
+            } else {
+              delete row.group_order;
+            }
+            return row;
+          });
+          this.activity.events = [...this.activity.events];
+          this.applyActivityGroupPayload(data);
+        }
+        this._activityRevision = Math.max(this._activityRevision, responseRevision);
+        return true;
+      } catch (_) {
+        if (this._activityRevision > baseRevision) {
+          this.fetchActivity().catch(() => {});
+          this.toast(this.lang === "zh" ? "移动会话失败" : "Could not move session", "error");
+          return false;
+        }
+        const affected = new Set(affectedIds);
+        for (const row of this.activity.events) {
+          const id = String(row.id);
+          if (!affected.has(id)) continue;
+          const optimistic = optimisticPlacement.get(id);
+          const currentOrder = Object.prototype.hasOwnProperty.call(row, "group_order")
+            ? row.group_order : undefined;
+          if (!optimistic
+              || String(row.group_id || "") !== optimistic.groupId
+              || currentOrder !== (optimistic.hasOrder ? optimistic.order : undefined)) {
+            continue;
+          }
+          const prior = previousPlacement.get(id);
+          if (!prior) continue;
+          if (prior.hasGroup) row.group_id = prior.groupId;
+          else delete row.group_id;
+          if (prior.hasOrder) row.group_order = prior.order;
+          else delete row.group_order;
+        }
+        this.activity.events = [...this.activity.events];
+        this.toast(this.lang === "zh" ? "移动会话失败" : "Could not move session", "error");
+        return false;
+      } finally {
+        const pending = { ...this._activityGroupPending };
+        delete pending[eventId];
+        this._activityGroupPending = pending;
+      }
+    },
+    onActivityDragStart(ev, item) {
+      if (this.activity.view !== "groups" || this.activitySearchQuery() || !item?.id) return;
+      this.onActivityGroupOrderDragEnd();
+      this.activity.dragEventId = String(item.id);
+      if (ev?.dataTransfer) {
+        ev.dataTransfer.effectAllowed = "move";
+        ev.dataTransfer.setData("application/x-muselab-activity-event", String(item.id));
+        ev.dataTransfer.setData("text/plain", String(item.id));
+      }
+    },
+    onActivityDragEnd() {
+      this.activity.dragEventId = "";
+      this.activity.dragOverGroupId = null;
+      this.activity.dragOverEventId = "";
+      this.activity.dragInsertAfter = false;
+    },
+    onActivityLaneDragOver(ev, group) {
+      if (this.activity.dragGroupId) {
+        this.onActivityGroupOrderDragOver(ev, group);
+        return;
+      }
+      if (!this.activity.dragEventId || this.activitySearchQuery()) return;
+      this.activity.dragOverGroupId = group.groupId || "";
+      this.activity.dragOverEventId = "";
+      this.activity.dragInsertAfter = false;
+    },
+    onActivityRowDragOver(ev, group, item) {
+      if (this.activity.dragGroupId) {
+        this.onActivityGroupOrderDragOver(ev, group);
+        return;
+      }
+      if (!this.activity.dragEventId || this.activitySearchQuery()
+          || String(item?.id || "") === this.activity.dragEventId) return;
+      const rect = ev?.currentTarget?.getBoundingClientRect();
+      this.activity.dragOverGroupId = group.groupId || "";
+      this.activity.dragOverEventId = String(item.id);
+      this.activity.dragInsertAfter = !!rect && ev.clientY > rect.top + rect.height / 2;
+    },
+    activityDropBeforeId(group, targetItem, insertAfter) {
+      if (!targetItem?.id) return "";
+      if (!insertAfter) return String(targetItem.id);
+      const sourceId = this.activity.dragEventId;
+      const rows = this.activityAllEvents(group)
+        .filter(row => String(row.id) !== sourceId);
+      const at = rows.findIndex(row => String(row.id) === String(targetItem.id));
+      return at >= 0 && at + 1 < rows.length ? String(rows[at + 1].id) : "";
+    },
+    async onActivityRowDrop(group, targetItem) {
+      if (this.activity.dragGroupId) {
+        await this.onActivityGroupOrderDrop(group);
+        return;
+      }
+      const eventId = this.activity.dragEventId;
+      const beforeId = this.activityDropBeforeId(
+        group, targetItem, this.activity.dragInsertAfter,
+      );
+      this.onActivityDragEnd();
+      if (!eventId) return;
+      const item = this.activity.events.find(row => String(row.id) === eventId);
+      if (item) await this.assignActivityGroup(item, group.groupId || "", beforeId);
+    },
+    async onActivityLaneDrop(group) {
+      if (this.activity.dragGroupId) {
+        await this.onActivityGroupOrderDrop(group);
+        return;
+      }
+      const eventId = this.activity.dragEventId;
+      this.onActivityDragEnd();
+      if (!eventId) return;
+      const item = this.activity.events.find(row => String(row.id) === eventId);
+      if (item) await this.assignActivityGroup(item, group.groupId || "", "");
+    },
+    _abortActivityFetches() {
+      for (const controller of Object.values(this._activityFetchControllers || {})) {
+        try { controller.abort(); } catch (_) {}
+      }
+      this._activityFetchControllers = {};
+      this._activityFetchPromises = {};
+    },
+    _activityReconnectDelay() {
+      this._activityLiveFailures = Math.min(
+        16, Math.max(0, Number(this._activityLiveFailures) || 0) + 1,
+      );
+      return this._retryDelay(this._activityLiveFailures, {
+        baseMs: 1000, maxMs: 30000, jitterMs: 500,
+      });
+    },
+    _bindActivityVisibility() {
+      if (this._activityLiveVisibilityBound
+          || typeof document === "undefined") return;
+      this._activityLiveVisibilityBound = true;
+      document.addEventListener("visibilitychange", () => {
+        if (document.visibilityState !== "visible") {
+          this._stopActivityEvents();
+          this._abortActivityFetches();
+        } else {
+          this._activityLiveFailures = 0;
+          this._refreshActivityFromSignal();
+          this._startActivityEvents();
+        }
+      });
+      window.addEventListener("pagehide", () => {
+        this._stopActivityEvents();
+        this._abortActivityFetches();
+      });
+    },
     _stopActivityEvents() {
       ++this._activityLiveSeq;
+      if (this._activityLiveController) {
+        try { this._activityLiveController.abort(); } catch (_) {}
+      }
+      this._activityLiveController = null;
       if (this._activityLiveSource) {
         try { this._activityLiveSource.close(); } catch (_) {}
       }
@@ -23536,6 +33157,73 @@ function portal() {
       return await this.fetchActivity({
         summaryOnly: !this.activity.show && this.activity.events.length > 0,
       });
+    },
+    async _startTodoEvents() {
+      if (!this.token || typeof EventSource === "undefined") return;
+      if (typeof document !== "undefined"
+          && document.visibilityState !== "visible") {
+        this._stopTodoEvents();
+        return;
+      }
+      if (this._todoLiveSource) return;
+      this._stopTodoEvents();
+      const seq = ++this._todoLiveSeq;
+      let ticket = "";
+      try {
+        const r = await fetch("/api/todos/events-ticket", {
+          method: "POST",
+          headers: this.hdr(),
+        });
+        if (!r.ok) throw new Error("todos ticket failed");
+        ticket = String((await r.json()).ticket || "");
+      } catch (_) {
+        if (seq === this._todoLiveSeq) {
+          this._todoLiveTimer = setTimeout(() => this._startTodoEvents(), 1500);
+        }
+        return;
+      }
+      if (seq !== this._todoLiveSeq || !ticket) return;
+      const es = new EventSource(
+        `/api/todos/events?ticket=${encodeURIComponent(ticket)}`,
+      );
+      this._todoLiveSource = es;
+      const owns = () => (
+        seq === this._todoLiveSeq && this._todoLiveSource === es
+      );
+      const apply = (ev) => {
+        if (!owns()) return;
+        let payload;
+        try { payload = JSON.parse(ev.data); } catch (_) { return; }
+        this._applyTodosPayload(payload);
+      };
+      es.addEventListener("ready", apply);
+      es.addEventListener("update", apply);
+      es.onerror = () => {
+        if (!owns()) return;
+        try { es.close(); } catch (_) {}
+        this._todoLiveSource = null;
+        this._todoLiveTimer = setTimeout(() => this._startTodoEvents(), 1500);
+      };
+      if (!this._todoLiveVisibilityBound) {
+        this._todoLiveVisibilityBound = true;
+        document.addEventListener("visibilitychange", () => {
+          if (document.visibilityState !== "visible") {
+            this._stopTodoEvents();
+          } else {
+            this._startTodoEvents();
+          }
+        });
+        window.addEventListener("pagehide", () => this._stopTodoEvents());
+      }
+    },
+    _stopTodoEvents() {
+      ++this._todoLiveSeq;
+      if (this._todoLiveSource) {
+        try { this._todoLiveSource.close(); } catch (_) {}
+      }
+      this._todoLiveSource = null;
+      if (this._todoLiveTimer) clearTimeout(this._todoLiveTimer);
+      this._todoLiveTimer = null;
     },
     _syncScheduledActivitySnapshot(events) {
       const scheduled = (events || []).filter(
@@ -23579,7 +33267,11 @@ function portal() {
       }
       const revision = Number(payload?.revision) || 0;
       if (revision && revision <= this._activityRevision) return;
+      if (Array.isArray(payload?.custom_groups) || Array.isArray(payload?.group_order)) {
+        this.applyActivityGroupPayload(payload);
+      }
       if (payload?.resync) {
+        if (this.activity.moveMenu.show) this.closeActivityMoveMenu(false);
         this._activityRevision = Math.max(this._activityRevision, revision);
         this._activityAppliedSeq = ++this._activityRequestSeq;
         Promise.resolve(this._refreshActivityFromSignal()).finally(
@@ -23591,12 +33283,32 @@ function portal() {
       // flight. Retire those requests so a slow response cannot roll back the
       // just-applied live state.
       this._activityAppliedSeq = ++this._activityRequestSeq;
-      const item = payload?.item;
+      let item = payload?.item;
+      let viewedTerminalAck = false;
+      if (item && item.id && !item.read
+          && ["completed", "failed"].includes(item.state)) {
+        const sid = String(item.session_id || item.thread_id || "");
+        // Activity and chat use independent SSE connections, so either can
+        // win the network race after the backend commits the terminal row.
+        // If this result belongs to the conversation visibly mounted here,
+        // treat it as read in this frame and reconcile the durable ACK in the
+        // background. Otherwise an older read:false Activity frame can flash
+        // a notification after the chat's done ACK already succeeded.
+        viewedTerminalAck = this._ackViewedActivity(
+          sid, this.tabState?.[sid], 0,
+        ) !== false;
+        if (viewedTerminalAck) item = { ...item, read: true };
+      }
       if (item && item.id) {
         const at = this.activity.events.findIndex(row => row.id === item.id);
         if (at >= 0) this.activity.events.splice(at, 1, item);
         else this.activity.events.unshift(item);
-        this.activity.events = [...this.activity.events];
+        this.activity.events = this.activity.events
+          .slice(0, this.ACTIVITY_EVENT_CAP);
+        if (this.activity.moveMenu.show
+            && (!this._isMobileLayout() || !this.activityMoveMenuItem())) {
+          this.closeActivityMoveMenu(false);
+        }
         this._applyScheduledActivity(item);
       }
       const acked = new Set(
@@ -23607,13 +33319,23 @@ function portal() {
           if (acked.has(row.id)) row.read = true;
         }
         this.activity.events = [...this.activity.events];
+        if (this.activity.moveMenu.show && !this._isMobileLayout()) {
+          this.closeActivityMoveMenu(false);
+        }
       }
-      if (payload?.summary) this.activity.summary = payload.summary;
+      // The terminal payload's summary was captured before the visible ACK.
+      // Keep the last read summary until the ACK response/SSE supplies its
+      // newer revision; adopting this stale unread count causes the toolbar
+      // badge to blink even though the row above is already marked read.
+      if (payload?.summary && !viewedTerminalAck) {
+        this.activity.summary = payload.summary;
+      }
       this._activityRevision = Math.max(this._activityRevision, revision);
       this._syncAppBadge();
     },
     async _startActivityEvents() {
       if (!this.token || typeof EventSource === "undefined") return;
+      this._bindActivityVisibility();
       if (typeof document !== "undefined"
           && document.visibilityState !== "visible") {
         this._stopActivityEvents();
@@ -23622,22 +33344,30 @@ function portal() {
       if (this._activityLiveSource) return;
       this._stopActivityEvents();
       const seq = ++this._activityLiveSeq;
+      const controller = new AbortController();
+      this._activityLiveController = controller;
       let ticket = "";
       try {
-        const r = await fetch("/api/activity/events-ticket", {
-          method: "POST",
-          headers: this.hdr(),
-        });
+        const r = await this._fetchWithDeadline(
+          "/api/activity/events-ticket",
+          {
+            method: "POST", headers: this.hdr(), signal: controller.signal,
+          },
+        );
         if (!r.ok) throw new Error("activity ticket failed");
         ticket = String((await r.json()).ticket || "");
       } catch (_) {
         if (seq === this._activityLiveSeq) {
           this._activityLiveTimer = setTimeout(
             () => this._startActivityEvents(),
-            1500,
+            this._activityReconnectDelay(),
           );
         }
         return;
+      } finally {
+        if (this._activityLiveController === controller) {
+          this._activityLiveController = null;
+        }
       }
       if (seq !== this._activityLiveSeq || !ticket) return;
       const es = new EventSource(
@@ -23649,6 +33379,7 @@ function portal() {
       );
       es.addEventListener("ready", (ev) => {
         if (!owns()) return;
+        this._activityLiveFailures = 0;
         let payload;
         try { payload = JSON.parse(ev.data); } catch (_) { return; }
         const generation = String(payload.generation || "");
@@ -23671,24 +33402,9 @@ function portal() {
         this._activityLiveSource = null;
         this._activityLiveTimer = setTimeout(
           () => this._startActivityEvents(),
-          1500,
+          this._activityReconnectDelay(),
         );
       };
-      if (!this._activityLiveVisibilityBound) {
-        this._activityLiveVisibilityBound = true;
-        document.addEventListener("visibilitychange", () => {
-          if (document.visibilityState !== "visible") {
-            this._stopActivityEvents();
-          } else {
-            this._refreshActivityFromSignal();
-            this._startActivityEvents();
-          }
-        });
-        window.addEventListener(
-          "pagehide",
-          () => this._stopActivityEvents(),
-        );
-      }
     },
     async ackActivityEvent(item, retries = 2) {
       if (!this.activityIsUnreadResult(item)) return true;
@@ -23713,7 +33429,7 @@ function portal() {
     },
     async openActivityEvent(item) {
       if (!item) return;
-      this.activity.show = false;
+      this.closeActivityCenter();
       const ack = this.ackActivityEvent(item);
       const sid = item.session_id || item.thread_id;
       const opened = sid
@@ -23740,32 +33456,57 @@ function portal() {
         this._syncAppBadge();
       } catch (_) {}
     },
+    _ackViewedActivity(sid, streamState, retries = 0) {
+      if (!sid || typeof document === "undefined"
+          || document.visibilityState !== "visible") return false;
+      const viewed = this.currentId === sid
+        || (streamState && this.tabState && this.tabState[this.currentId] === streamState);
+      if (!viewed) return false;
+      // Resolve through currentId when two ids alias the same mounted state;
+      // the durable activity row follows the adopted session id.
+      return this.ackActivitySession(this.currentId || sid, retries);
+    },
     ackCurrentActivity(retries = 0) {
-      if (!this.currentId || typeof document === "undefined"
-          || document.visibilityState !== "visible") return;
-      return this.ackActivitySession(this.currentId, retries);
+      if (!this.currentId) return false;
+      return this._ackViewedActivity(
+        this.currentId,
+        this.tabState?.[this.currentId],
+        retries,
+      );
     },
     async ackActivitySession(sid, retries = 0) {
       if (!sid) return;
-      try {
-        const r = await fetch(`/api/activity/session/${encodeURIComponent(sid)}/ack`,
-          { method: "POST", headers: this.hdr() });
-        if (!r.ok) return;
-        const d = await r.json();
-        this._activityAppliedSeq = ++this._activityRequestSeq;
-        if (d.summary) this.activity.summary = d.summary;
-        if (Number(d.changed) > 0) {
+      const attempts = Math.max(0, Number(retries) || 0) + 1;
+      for (let attempt = 0; attempt < attempts; attempt += 1) {
+        try {
+          const r = await fetch(`/api/activity/session/${encodeURIComponent(sid)}/ack`,
+            { method: "POST", headers: this.hdr() });
+          if (!r.ok) throw new Error("activity ACK failed");
+          const d = await r.json();
+          this._activityAppliedSeq = ++this._activityRequestSeq;
+          if (d.summary) this.activity.summary = d.summary;
+          // changed=0 also means the server already considers this session
+          // read (usually because the done ACK beat a delayed Activity SSE).
+          // The local row may still carry that older read:false snapshot, so
+          // successful reconciliation always clears it.
           for (const item of this.activity.events || []) {
             if ((item.session_id || item.thread_id) === sid) item.read = true;
           }
           this.activity.events = [...this.activity.events];
+          this._syncAppBadge();
+          if (Number(d.changed) > 0 || attempt + 1 >= attempts) return true;
+        } catch (_) {
+          if (attempt + 1 >= attempts) {
+            // Re-read authoritative state after the retry budget. If the ACK
+            // truly failed, the unread result reappears instead of being
+            // hidden forever by the optimistic visible-frame suppression.
+            this._refreshActivityFromSignal().catch(() => {});
+            return false;
+          }
         }
-        this._syncAppBadge();
-        if (Number(d.changed) === 0 && retries > 0
-            && this.currentId === sid && document.visibilityState === "visible") {
-          setTimeout(() => this.ackActivitySession(sid, retries - 1), 400);
-        }
-      } catch (_) {}
+        await new Promise(resolve => setTimeout(resolve, 400));
+      }
+      return false;
     },
     _syncAppBadge() {
       const count = Number(this.activity?.summary?.unread) || 0;
@@ -23777,7 +33518,12 @@ function portal() {
 
     // ===== scheduler drawer =====
     async openScheduler() {
+      const opener = document.activeElement;
       this.scheduler.show = true;
+      this._openFocusSurface(
+        "scheduler", ".sched-modal", ".sched-input-name",
+        opener, true,
+      );
       await this.loadSchedulerTasks();
       await this.loadSchedulerHistory();
       // Opening the drawer = user has seen unread results. Server-side
@@ -23790,7 +33536,11 @@ function portal() {
         this.scheduler.draft.model = this.model || "";
       }
     },
-    closeScheduler() { this.scheduler.show = false; },
+    closeScheduler() {
+      const wasOpen = this.scheduler.show;
+      this.scheduler.show = false;
+      if (wasOpen) this._closeFocusSurface("scheduler");
+    },
     _resetSchedDraft() {
       this.scheduler.draft = {
         editingId: null,

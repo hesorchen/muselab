@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 
 import pytest
 
@@ -29,7 +30,1675 @@ def _login(page: Page, base: str, token: str) -> None:
     )
 
 
+def test_activity_event_retention_and_derived_cache_are_bounded(
+    page: Page, backend_url, auth_token,
+):
+    _login(page, backend_url, auth_token)
+
+    result = page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          app._stopActivityEvents();
+          app._abortActivityFetches();
+          await Promise.allSettled(
+            Object.values(app._activityFetchPromises || {}));
+          const nativeFetch = window.fetch;
+          try {
+            const sourceRows = Array.from({length: 620}, (_, index) => ({
+              id: `evt-${index}`,
+              kind: 'turn',
+              session_id: `session-${index}`,
+              task_summary: `task ${index}`,
+              state: 'completed',
+              read: true,
+              updated_at: 620 - index,
+            }));
+            window.fetch = async url => {
+              if (String(url).startsWith('/api/activity?')) {
+                return new Response(JSON.stringify({
+                  events: sourceRows,
+                  summary: {
+                    generation: 'cap-test', revision: 1,
+                    running: 0, unread: 0, attention: 0,
+                    groups: {
+                      review: 0, running: 0, failed: 0, history: 620,
+                    },
+                    group_unread: {
+                      review: 0, running: 0, failed: 0, history: 0,
+                    },
+                    workspaces: [],
+                  },
+                }), {
+                  status: 200,
+                  headers: {
+                    'Content-Type': 'application/json',
+                    'ETag': '"cap-test"',
+                  },
+                });
+              }
+              return nativeFetch(url);
+            };
+            app._activityEtags = {};
+            app._activityGeneration = '';
+            app._activityRevision = 0;
+            app._activityAppliedSeq = 0;
+            app._activityRequestSeq = 0;
+            app._activityEventsSnapshotLoaded = false;
+            app.activity.events = [];
+            const loaded = await app.fetchActivity();
+            const snapshotLength = app.activity.events.length;
+            const timeline = {key: 'timeline'};
+            const firstDerived = app.activityAllEvents(timeline);
+            const repeatedDerived = app.activityAllEvents(timeline);
+
+            app._applyActivityUpdate({
+              generation: 'cap-test',
+              revision: 2,
+              item: {
+                id: 'evt-live', kind: 'turn', session_id: 'session-live',
+                task_summary: 'live task', state: 'running', read: true,
+                updated_at: 10_000,
+              },
+            });
+            const afterUpdate = app.activityAllEvents(timeline);
+            const repeatedAfterUpdate = app.activityAllEvents(timeline);
+            const stateLengthAfterUpdate = app.activity.events.length;
+            const newestAfterUpdate = afterUpdate[0]?.id || '';
+            const droppedOldest = !app.activity.events.some(
+              row => row.id === 'evt-499');
+
+            app.activity.events = Array.from({length: 700}, (_, index) => ({
+              id: `overflow-${index}`,
+              state: 'completed',
+              read: true,
+              updated_at: index,
+            }));
+            app.activity.query = '';
+            const boundedDerived = app.activityAllEvents(timeline).length;
+            const boundedCount = app.activitySearchResultCount();
+            app.activity.query = 'overflow';
+            const boundedSearchCount = app.activitySearchResultCount();
+            return {
+              loaded,
+              snapshotLoaded: app._activityEventsSnapshotLoaded,
+              snapshotLength, stateLengthAfterUpdate,
+              newestAfterUpdate, droppedOldest,
+              reusedSnapshot: firstDerived === repeatedDerived,
+              invalidatedOnUpdate: firstDerived !== afterUpdate,
+              reusedAfterUpdate: afterUpdate === repeatedAfterUpdate,
+              boundedDerived, boundedCount, boundedSearchCount,
+            };
+          } finally {
+            window.fetch = nativeFetch;
+          }
+        }"""
+    )
+
+    assert result == {
+        "loaded": True,
+        "snapshotLoaded": True,
+        "snapshotLength": 500,
+        "stateLengthAfterUpdate": 500,
+        "newestAfterUpdate": "evt-live",
+        "droppedOldest": True,
+        "reusedSnapshot": True,
+        "invalidatedOnUpdate": True,
+        "reusedAfterUpdate": True,
+        "boundedDerived": 500,
+        "boundedCount": 500,
+        "boundedSearchCount": 500,
+    }
+
+
+def test_activity_conditional_fetch_distinguishes_loaded_empty_snapshot(
+    page: Page, backend_url, auth_token,
+):
+    """A valid empty snapshot reuses 304; only a missing snapshot recovers."""
+    _login(page, backend_url, auth_token)
+    page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          app._stopActivityEvents();
+          app.ackCurrentActivity = () => false;
+          const pending = Object.values(app._activityFetchPromises || {});
+          app._abortActivityFetches();
+          await Promise.allSettled(pending);
+          if (app.activity.show) app.closeActivityCenter();
+        }"""
+    )
+
+    requests: list[dict[str, str]] = []
+
+    def conditional_activity(route):
+        request = route.request
+        if_none_match = request.headers.get("if-none-match", "")
+        requests.append({
+            "url": request.url,
+            "if_none_match": if_none_match,
+        })
+        if if_none_match:
+            route.fulfill(status=304, headers={"ETag": if_none_match})
+            return
+        route.fulfill(
+            status=200,
+            headers={
+                "Content-Type": "application/json",
+                "ETag": '"recovered-empty"',
+            },
+            body=json.dumps({
+                "events": [],
+                "summary": {
+                    "generation": "empty-snapshot-e2e",
+                    "revision": 1,
+                    "running": 0,
+                    "unread": 0,
+                    "attention": 0,
+                    "groups": {
+                        "review": 0,
+                        "running": 0,
+                        "failed": 0,
+                        "history": 0,
+                    },
+                    "group_unread": {
+                        "review": 0,
+                        "running": 0,
+                        "failed": 0,
+                        "history": 0,
+                    },
+                    "workspaces": [],
+                },
+            }),
+        )
+
+    page.route(
+        re.compile(r"/api/activity\?limit=500$"),
+        conditional_activity,
+    )
+
+    loaded_empty = page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          app._activityEtags = {events: '"loaded-empty"'};
+          app._activityEventsSnapshotLoaded = true;
+          app.activity.events = [];
+          app.activity.viewLoaded = true;
+          app.activity.show = false;
+          const opening = app.openActivityCenter();
+          const duplicate = app.fetchActivity();
+          const immediate = {
+            show: app.activity.show,
+            loading: app.activity.loading,
+          };
+          const [, duplicateResult] = await Promise.all([opening, duplicate]);
+          return {
+            immediate,
+            duplicateResult,
+            loading: app.activity.loading,
+            eventCount: app.activity.events.length,
+            snapshotLoaded: app._activityEventsSnapshotLoaded,
+            etag: app._activityEtags.events,
+            pending: Object.keys(app._activityFetchPromises),
+          };
+        }"""
+    )
+    assert loaded_empty == {
+        "immediate": {"show": True, "loading": True},
+        "duplicateResult": False,
+        "loading": False,
+        "eventCount": 0,
+        "snapshotLoaded": True,
+        "etag": '"loaded-empty"',
+        "pending": [],
+    }
+    expect(page.locator(".activity-modal")).to_be_visible()
+    assert [item["if_none_match"] for item in requests] == [
+        '"loaded-empty"'
+    ]
+    assert all(item["url"].endswith("/api/activity?limit=500")
+               for item in requests)
+
+    page.evaluate(
+        """() => document.querySelector('#app')._x_dataStack[0]
+          .closeActivityCenter()"""
+    )
+    requests.clear()
+    missing_empty = page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          app._activityEtags = {events: '"etag-without-snapshot"'};
+          app._activityEventsSnapshotLoaded = false;
+          app._activityGeneration = '';
+          app._activityRevision = 0;
+          app._activityAppliedSeq = 0;
+          app.activity.events = [];
+          const recovered = await app.fetchActivity();
+          return {
+            recovered,
+            eventCount: app.activity.events.length,
+            snapshotLoaded: app._activityEventsSnapshotLoaded,
+            etag: app._activityEtags.events,
+            pending: Object.keys(app._activityFetchPromises),
+          };
+        }"""
+    )
+    assert missing_empty == {
+        "recovered": True,
+        "eventCount": 0,
+        "snapshotLoaded": True,
+        "etag": '"recovered-empty"',
+        "pending": [],
+    }
+    assert [item["if_none_match"] for item in requests] == [
+        '"etag-without-snapshot"',
+        "",
+    ]
+    assert len({item["url"] for item in requests}) == 1
+
+    requests.clear()
+    concurrent_full = page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          app._activityEtags = {};
+          app._activityEventsSnapshotLoaded = false;
+          app._activityGeneration = '';
+          app._activityRevision = 0;
+          app._activityAppliedSeq = 0;
+          app.activity.events = [];
+          const results = await Promise.all([
+            app.fetchActivity(), app.fetchActivity(),
+          ]);
+          return {
+            results,
+            snapshotLoaded: app._activityEventsSnapshotLoaded,
+            pending: Object.keys(app._activityFetchPromises),
+          };
+        }"""
+    )
+    assert concurrent_full == {
+        "results": [True, True],
+        "snapshotLoaded": True,
+        "pending": [],
+    }
+    assert [item["if_none_match"] for item in requests] == [""]
+
+    requests.clear()
+    non_empty = page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          app._activityEtags = {events: '"loaded-non-empty"'};
+          app._activityEventsSnapshotLoaded = true;
+          app.activity.events = [{
+            id: 'preserved-event', state: 'completed', read: true,
+          }];
+          const result = await app.fetchActivity();
+          return {
+            result,
+            ids: app.activity.events.map(item => item.id),
+            snapshotLoaded: app._activityEventsSnapshotLoaded,
+            etag: app._activityEtags.events,
+          };
+        }"""
+    )
+    assert non_empty == {
+        "result": False,
+        "ids": ["preserved-event"],
+        "snapshotLoaded": True,
+        "etag": '"loaded-non-empty"',
+    }
+    assert [item["if_none_match"] for item in requests] == [
+        '"loaded-non-empty"'
+    ]
+
+
+def test_memory_shortcut_opens_memory_settings_page(
+    page: Page, backend_url, auth_token
+):
+    _login(page, backend_url, auth_token)
+
+    shortcut = page.locator(
+        ".pane.chat > .pane-head button.icon-btn",
+        has=page.locator('use[href="#i-brain"]'),
+    )
+    expect(shortcut).to_have_count(1)
+    shortcut.click()
+
+    expect(page.locator(".settings-modal")).to_be_visible()
+    page.wait_for_function(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          return app.settings.show && app.settings.activePage === 'memory';
+        }"""
+    )
+    expect(page.locator(".memory-settings-section")).to_be_visible()
+
+
+def test_auto_ack_accepts_any_result_rendered_in_current_visible_turn(
+    page: Page, backend_url, auth_token,
+):
+    """Visible results are read; non-current completions remain notifications."""
+    _login(page, backend_url, auth_token)
+
+    result = page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const directSid = 'activity-source-direct';
+          const otherSid = 'activity-source-other';
+          const directState = app._ensureTabState(directSid);
+          const otherState = app._ensureTabState(otherSid);
+          app.currentId = directSid;
+          app._activateTabState(directSid);
+          const calls = [];
+          app.ackActivitySession = async (sid, retries) => {
+            calls.push({sid, retries});
+            return true;
+          };
+
+          const accepted = await app._ackViewedActivity(
+            directSid, directState, 3);
+          const queued = await app._ackViewedActivity(
+            directSid, directState, 3);
+          const background = await app._ackViewedActivity(
+            directSid, directState, 3);
+          const nonCurrent = app._ackViewedActivity(
+            otherSid, otherState, 3);
+
+          app.activity.events = [{
+            id: 'direct-row', session_id: directSid,
+            activity_source: 'direct', state: 'completed', read: false,
+          }];
+          await app.ackCurrentActivity(2);
+          app.activity.events = [{
+            id: 'queued-row', session_id: directSid,
+            activity_source: 'queued', state: 'completed', read: false,
+          }];
+          const currentQueued = await app.ackCurrentActivity(2);
+          return {
+            accepted, queued, background, nonCurrent, currentQueued, calls,
+          };
+        }"""
+    )
+
+    assert result["accepted"] is True
+    assert result["queued"] is True
+    assert result["background"] is True
+    assert result["nonCurrent"] is False
+    assert result["currentQueued"] is True
+    assert result["calls"] == [
+        {"sid": "activity-source-direct", "retries": 3},
+        {"sid": "activity-source-direct", "retries": 3},
+        {"sid": "activity-source-direct", "retries": 3},
+        {"sid": "activity-source-direct", "retries": 2},
+        {"sid": "activity-source-direct", "retries": 2},
+    ]
+
+
+def test_visible_completion_ack_wins_both_done_and_activity_sse_orders(
+    page: Page, backend_url, auth_token,
+):
+    """Independent chat/activity transports cannot revive a viewed unread row."""
+    _login(page, backend_url, auth_token)
+
+    result = page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const sid = 'activity-visible-race';
+          app._stopActivityEvents();
+          await Promise.allSettled(
+            Object.values(app._activityFetchPromises || {}));
+          app.currentId = sid;
+          const st = app._ensureTabState(sid);
+          st._loaded = true;
+          app._activateTabState(sid);
+
+          const realFetch = window.fetch;
+          const ackCalls = [];
+          let serverRead = false;
+          window.fetch = async (url, options) => {
+            if (String(url).includes('/api/activity/session/'
+                + encodeURIComponent(sid) + '/ack')) {
+              const changed = serverRead ? 0 : 1;
+              serverRead = true;
+              ackCalls.push(changed);
+              return new Response(JSON.stringify({
+                ok: true,
+                changed,
+                summary: {
+                  generation: 'ack-race-generation', revision: 3,
+                  running: 0, unread: 0, attention: 0,
+                  groups: {review: 0, running: 0, failed: 0, history: 1},
+                  group_unread: {
+                    review: 0, running: 0, failed: 0, history: 0,
+                  },
+                  workspaces: [],
+                },
+              }), {status: 200, headers: {'Content-Type': 'application/json'}});
+            }
+            return realFetch(url, options);
+          };
+
+          const reset = () => {
+            app._activityGeneration = 'ack-race-generation';
+            app._activityRevision = 1;
+            app.activity.events = [{
+              id: 'race-row', session_id: sid, activity_source: 'direct',
+              state: 'running', read: true, updated_at: 1,
+            }];
+            app.activity.summary = {
+              generation: 'ack-race-generation', revision: 1,
+              running: 1, unread: 0, attention: 0,
+              groups: {review: 0, running: 1, failed: 0, history: 0},
+              group_unread: {
+                review: 0, running: 0, failed: 0, history: 0,
+              },
+              workspaces: [],
+            };
+          };
+          const terminalPayload = () => ({
+            generation: 'ack-race-generation', revision: 2,
+            item: {
+              id: 'race-row', session_id: sid, activity_source: 'direct',
+              state: 'completed', read: false, updated_at: 2,
+            },
+            summary: {
+              generation: 'ack-race-generation', revision: 2,
+              running: 0, unread: 1, attention: 0,
+              groups: {review: 1, running: 0, failed: 0, history: 0},
+              group_unread: {
+                review: 1, running: 0, failed: 0, history: 0,
+              },
+              workspaces: [{workspace: '/tmp', unread: 1, attention: 0}],
+            },
+          });
+
+          try {
+            // Activity SSE reaches the page just before chat done. Applying it
+            // must be read in the same frame, before its ACK round trip.
+            reset();
+            serverRead = false;
+            app._applyActivityUpdate(terminalPayload());
+            const activityFirstImmediate = {
+              state: app.activity.events[0].state,
+              read: app.activity.events[0].read,
+              unread: app.activity.summary.unread,
+            };
+            await new Promise(resolve => setTimeout(resolve, 0));
+            const activityFirstSettled = {
+              read: app.activity.events[0].read,
+              unread: app.activity.summary.unread,
+            };
+
+            // Chat done ACK succeeds first, then an already-buffered older
+            // read:false Activity frame arrives. It must still render the
+            // terminal state without reviving the notification.
+            reset();
+            serverRead = false;
+            await app.ackActivitySession(sid, 0);
+            app._applyActivityUpdate(terminalPayload());
+            const doneFirstImmediate = {
+              state: app.activity.events[0].state,
+              read: app.activity.events[0].read,
+              unread: app.activity.summary.unread,
+            };
+            await new Promise(resolve => setTimeout(resolve, 0));
+            const doneFirstSettled = {
+              read: app.activity.events[0].read,
+              unread: app.activity.summary.unread,
+            };
+            return {
+              activityFirstImmediate, activityFirstSettled,
+              doneFirstImmediate, doneFirstSettled, ackCalls,
+            };
+          } finally {
+            window.fetch = realFetch;
+          }
+        }"""
+    )
+
+    expected_immediate = {"state": "completed", "read": True, "unread": 0}
+    expected_settled = {"read": True, "unread": 0}
+    assert result["activityFirstImmediate"] == expected_immediate
+    assert result["activityFirstSettled"] == expected_settled
+    assert result["doneFirstImmediate"] == expected_immediate
+    assert result["doneFirstSettled"] == expected_settled
+    assert result["ackCalls"].count(1) == 2 and result["ackCalls"][-1] == 0
+
+
+def test_cached_activity_refresh_does_not_shift_rows_or_modal(
+    page: Page, backend_url, auth_token,
+):
+    """The loading indicator must be out of flow when cached rows exist."""
+    page.set_viewport_size({"width": 1440, "height": 900})
+    _login(page, backend_url, auth_token)
+
+    page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          app._stopActivityEvents();
+          await Promise.allSettled(Object.values(app._activityFetchPromises || {}));
+          app.activity.viewLoaded = true;
+          app.activity.view = 'timeline';
+          app.activity.events = [{
+            id: 'stable-refresh-row', kind: 'turn',
+            session_id: 'stable-refresh-session',
+            session_name: 'Stable activity row',
+            task_summary: 'Must not jump when loading disappears',
+            workspace: '/tmp/e2e', workspace_name: 'e2e',
+            state: 'running', read: true,
+            started_at: 100, finished_at: 0, updated_at: 100,
+          }];
+          app.activity.summary = {
+            running: 1, unread: 0, attention: 0,
+            groups: {review: 0, running: 1, failed: 0, history: 0},
+            group_unread: {review: 0, running: 0, failed: 0, history: 0},
+            workspaces: [],
+          };
+          app.fetchActivity = () => new Promise(resolve => {
+            window.__finishStableActivityRefresh = resolve;
+          });
+          void app.openActivityCenter();
+        }"""
+    )
+    expect(page.locator(".activity-modal")).to_be_visible()
+    expect(page.locator(".activity-refreshing")).to_be_visible()
+    row = page.locator(".activity-row").filter(has_text="Stable activity row")
+    expect(row).to_be_visible()
+    # Measure only the loading/refresh transition.  The modal has its own
+    # short open scale transition; CI can reach this assertion while that
+    # unrelated animation is still changing geometry by ~1-2px.
+    page.wait_for_timeout(250)
+
+    before = page.evaluate(
+        """async () => {
+          await new Promise(resolve => requestAnimationFrame(
+            () => requestAnimationFrame(resolve)));
+          const modal = document.querySelector('.activity-modal');
+          const body = document.querySelector('.activity-body');
+          const row = Array.from(document.querySelectorAll('.activity-row'))
+            .find(node => node.textContent.includes('Stable activity row'));
+          return {
+            modalHeight: modal.getBoundingClientRect().height,
+            bodyHeight: body.getBoundingClientRect().height,
+            rowTop: row.getBoundingClientRect().top,
+          };
+        }"""
+    )
+    page.evaluate("() => window.__finishStableActivityRefresh(true)")
+    page.wait_for_function(
+        "() => !document.querySelector('#app')._x_dataStack[0].activity.loading"
+    )
+    after = page.evaluate(
+        """async () => {
+          await new Promise(resolve => requestAnimationFrame(
+            () => requestAnimationFrame(resolve)));
+          const modal = document.querySelector('.activity-modal');
+          const body = document.querySelector('.activity-body');
+          const row = Array.from(document.querySelectorAll('.activity-row'))
+            .find(node => node.textContent.includes('Stable activity row'));
+          return {
+            modalHeight: modal.getBoundingClientRect().height,
+            bodyHeight: body.getBoundingClientRect().height,
+            rowTop: row.getBoundingClientRect().top,
+          };
+        }"""
+    )
+
+    for key in ("modalHeight", "bodyHeight", "rowTop"):
+        assert abs(after[key] - before[key]) < 1, (before, after)
+
+
+def test_desktop_timeline_defaults_to_fifteen_rows_in_larger_modal(
+    page: Page, backend_url, auth_token,
+):
+    page.set_viewport_size({"width": 1440, "height": 900})
+    _login(page, backend_url, auth_token)
+
+    page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          app._stopActivityEvents();
+          await Promise.allSettled(Object.values(app._activityFetchPromises || {}));
+          app.lang = 'zh';
+          app.activity.viewLoaded = true;
+          app.activity.view = 'timeline';
+          app.activity.expanded = {};
+          app.activity.loading = false;
+          app.activity.events = Array.from({length: 20}, (_, index) => ({
+            id: `timeline-cap-${index}`,
+            kind: 'turn',
+            session_id: `timeline-session-${index}`,
+            session_name: `Timeline session ${index + 1}`,
+            task_summary: `Timeline task ${index + 1}`,
+            workspace: '/tmp/e2e',
+            workspace_name: 'e2e',
+            state: 'completed',
+            read: true,
+            started_at: 100 + index,
+            finished_at: 200 + index,
+            updated_at: 300 + index,
+          }));
+          app.activity.summary = {
+            running: 0, unread: 0, attention: 0,
+            groups: {review: 0, running: 0, failed: 0, history: 20},
+            group_unread: {review: 0, running: 0, failed: 0, history: 0},
+            workspaces: [],
+          };
+          app.activity.show = true;
+          await new Promise(resolve => app.$nextTick(resolve));
+        }"""
+    )
+
+    modal = page.locator(".activity-modal")
+    expect(modal).to_be_visible()
+    expect(page.locator(".activity-row")).to_have_count(15)
+    expect(page.locator(".activity-group-more")).to_have_text("还有 5 条")
+    page.wait_for_timeout(250)
+
+    geometry = page.evaluate(
+        """() => {
+          const modal = document.querySelector('.activity-modal');
+          const body = document.querySelector('.activity-body');
+          const modalRect = modal.getBoundingClientRect();
+          const bodyRect = body.getBoundingClientRect();
+          return {
+            modalWidth: modalRect.width,
+            modalHeight: modalRect.height,
+            modalTop: modalRect.top,
+            modalBottom: modalRect.bottom,
+            bodyHeight: bodyRect.height,
+            bodyScrollHeight: body.scrollHeight,
+            viewportHeight: window.innerHeight,
+          };
+        }"""
+    )
+    assert geometry["modalWidth"] >= 690
+    assert geometry["modalHeight"] >= 560
+    assert geometry["bodyHeight"] >= 500
+    assert geometry["bodyScrollHeight"] >= geometry["bodyHeight"]
+    assert geometry["modalTop"] >= 0
+    assert geometry["modalBottom"] <= geometry["viewportHeight"]
+
+    page.locator(".activity-group-more").click()
+    expect(page.locator(".activity-row")).to_have_count(20)
+    expect(page.locator(".activity-group-more")).to_have_text("收起")
+
+    # The larger ledger is desktop-only. The existing phone contract remains
+    # a full-width modal with an internally scrolling body.
+    page.set_viewport_size({"width": 390, "height": 844})
+    mobile_geometry = page.evaluate(
+        """() => {
+          const modal = document.querySelector('.activity-modal');
+          const body = document.querySelector('.activity-body');
+          const rect = modal.getBoundingClientRect();
+          return {
+            left: rect.left,
+            right: rect.right,
+            width: rect.width,
+            bottom: rect.bottom,
+            viewportWidth: window.innerWidth,
+            viewportHeight: window.innerHeight,
+            bodyMaxHeight: getComputedStyle(body).maxHeight,
+          };
+        }"""
+    )
+    assert mobile_geometry["left"] == 0
+    assert mobile_geometry["right"] <= mobile_geometry["viewportWidth"]
+    assert mobile_geometry["width"] == mobile_geometry["viewportWidth"]
+    assert mobile_geometry["bottom"] <= mobile_geometry["viewportHeight"]
+    assert mobile_geometry["bodyMaxHeight"] == "none"
+
+
+def test_activity_search_finds_capped_sessions_and_combines_with_status_filter(
+    page: Page, backend_url, auth_token,
+):
+    page.set_viewport_size({"width": 1200, "height": 820})
+    _login(page, backend_url, auth_token)
+
+    page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          app._stopActivityEvents();
+          await Promise.allSettled(Object.values(app._activityFetchPromises || {}));
+          app.lang = 'zh';
+          app.activity.viewLoaded = true;
+          app.activity.view = 'timeline';
+          app.activity.filter = [];
+          app.activity.query = '';
+          app.activity.expanded = {};
+          app.activity.loading = false;
+          app.activity.customGroups = [];
+          app.activity.events = Array.from({length: 20}, (_, index) => ({
+            id: `search-row-${index}`,
+            kind: 'turn',
+            session_id: index === 0 ? 'needle-session-uuid' : `session-${index}`,
+            session_name: index === 0 ? 'Needle Alpha' : `Generic session ${index}`,
+            task_summary: index === 0 ? 'Quant platform audit' : `Generic task ${index}`,
+            workspace: index === 0 ? '/srv/quant-research' : '/tmp/e2e',
+            workspace_name: index === 0 ? 'quant-research' : 'e2e',
+            state: 'completed', read: true,
+            started_at: 100 + index,
+            finished_at: 200 + index,
+            updated_at: 300 + index,
+          }));
+          app.activity.events.push({
+            id: 'failed-search-row', kind: 'scheduled',
+            session_id: 'failed-session', session_name: 'Broken delivery',
+            task_summary: 'Publish report', status_detail: 'Renderer crashed',
+            workspace: '/srv/delivery', workspace_name: 'delivery',
+            state: 'failed', read: false,
+            started_at: 500, finished_at: 510, updated_at: 510,
+          });
+          app.activity.summary = {
+            running: 0, unread: 1, attention: 1,
+            groups: {review: 0, running: 0, failed: 1, history: 20},
+            group_unread: {review: 0, running: 0, failed: 1, history: 0},
+            workspaces: ['/tmp/e2e', '/srv/quant-research', '/srv/delivery'],
+          };
+          app.activity.show = true;
+          await new Promise(resolve => app.$nextTick(resolve));
+        }"""
+    )
+
+    search = page.locator(".activity-searchbar input")
+    expect(search).to_be_visible()
+    expect(page.locator(".activity-row")).to_have_count(15)
+
+    # The target is older than the timeline cap, so filtering must happen before
+    # the 15-row slice rather than against the already-visible rows.
+    search.fill("Needle")
+    expect(page.locator(".activity-row")).to_have_count(1)
+    expect(page.locator(".activity-row")).to_contain_text("Needle Alpha")
+    expect(page.locator(".activity-search-count")).to_have_text("1 条匹配")
+
+    search.fill("quant-research")
+    expect(page.locator(".activity-row")).to_have_count(1)
+    search.fill("needle-session-uuid")
+    expect(page.locator(".activity-row")).to_have_count(1)
+
+    page.get_by_role("button", name="按状态").click()
+    page.locator(".activity-chip.failed").click()
+    expect(page.locator(".activity-search-empty")).to_be_visible()
+
+    # Localized state labels and status details are searchable, and the text
+    # query intersects with the selected failed-status group.
+    search.fill("失败")
+    expect(page.locator(".activity-row")).to_have_count(1)
+    expect(page.locator(".activity-row")).to_contain_text("Broken delivery")
+    search.fill("Renderer crashed")
+    expect(page.locator(".activity-row")).to_have_count(1)
+
+    page.locator(".activity-search-clear").click()
+    expect(search).to_have_value("")
+    expect(page.locator(".activity-row")).to_have_count(1)
+
+
+def test_custom_groups_show_empty_sections_and_move_sessions(
+    page: Page, backend_url, auth_token,
+):
+    page.set_viewport_size({"width": 1440, "height": 900})
+    _login(page, backend_url, auth_token)
+
+    page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          app._stopActivityEvents();
+          await Promise.allSettled(Object.values(app._activityFetchPromises || {}));
+          app.lang = 'zh';
+          app.activity.viewLoaded = true;
+          app.activity.view = 'groups';
+          app.activity.loading = false;
+          app.activity.expanded = {};
+          app.activity.customGroups = [
+            {id: 'research', name: 'Research', color: 'violet'},
+            {id: 'delivery', name: 'Delivery', color: 'green'},
+          ];
+          app.activity.groupOrder = ['research', 'delivery', '__ungrouped__'];
+          app.activity.events = [{
+            id: 'grouped-row', session_id: 'grouped-session',
+            session_name: 'Research session', task_summary: 'Grouped task',
+            workspace: '/tmp/e2e', workspace_name: 'e2e',
+            state: 'completed', read: false, group_id: 'research',
+            started_at: 10, finished_at: 20, updated_at: 20,
+          }, {
+            id: 'ungrouped-row', session_id: 'ungrouped-session',
+            session_name: 'Ungrouped session', task_summary: 'Move this task',
+            workspace: '/tmp/e2e', workspace_name: 'e2e',
+            state: 'running', read: true,
+            started_at: 30, finished_at: 0, updated_at: 30,
+          }];
+          app.activity.summary = {
+            running: 1, unread: 1, attention: 0,
+            groups: {review: 1, running: 1, failed: 0, history: 0},
+            group_unread: {review: 1, running: 0, failed: 0, history: 0},
+            workspaces: [],
+          };
+          window.__activityGroupCalls = [];
+          app.api = async (path, options = {}) => {
+            window.__activityGroupCalls.push({path, options});
+            if (path === '/api/activity/groups' && options.method === 'POST') {
+              const group = {
+                id: 'writing', name: options.json.name,
+                color: options.json.color,
+              };
+              return {ok: true, data: {
+                revision: app._activityRevision + 1,
+                custom_groups: [...app.activity.customGroups, group],
+                group_order: [...app.activity.groupOrder.filter(id => id !== '__ungrouped__'), 'writing', '__ungrouped__'],
+              }};
+            }
+            if (path === '/api/activity/groups/order' && options.method === 'PUT') {
+              const lookup = new Map(app.activity.customGroups.map(group => [group.id, group]));
+              return {ok: true, data: {
+                revision: app._activityRevision + 1,
+                custom_groups: options.json.ids.map(id => lookup.get(id)).filter(Boolean),
+                group_order: [...options.json.ids],
+              }};
+            }
+            if (path.endsWith('/group') && options.method === 'PUT') {
+              const id = decodeURIComponent(path.split('/').at(-2));
+              const item = app.activity.events.find(row => row.id === id);
+              const updated = {...item};
+              if (options.json.group_id) updated.group_id = options.json.group_id;
+              else delete updated.group_id;
+              return {ok: true, data: {
+                revision: app._activityRevision + 1,
+                item: updated,
+                items: [{...updated}],
+                custom_groups: [...app.activity.customGroups],
+                group_order: [...app.activity.groupOrder],
+              }};
+            }
+            return {ok: false, data: null, error: 'unexpected test request'};
+          };
+          app.activity.show = true;
+          await new Promise(resolve => app.$nextTick(resolve));
+        }"""
+    )
+
+    groups = page.locator(".activity-group.is-custom")
+    expect(groups).to_have_count(3)
+    assert page.locator(
+        ".activity-custom-group-head > strong"
+    ).all_text_contents() == ["Research", "Delivery", "未分组"]
+    board_geometry = page.evaluate(
+        """() => {
+          const modal = document.querySelector('.activity-modal');
+          const body = document.querySelector('.activity-body');
+          const lanes = Array.from(body.querySelectorAll('.activity-group.is-custom'));
+          const rects = lanes.map(node => node.getBoundingClientRect());
+          return {
+            modalWidth: modal.getBoundingClientRect().width,
+            modalHeight: modal.getBoundingClientRect().height,
+            bodyDisplay: getComputedStyle(body).display,
+            columns: getComputedStyle(body).gridTemplateColumns.split(' ').length,
+            laneWidths: rects.map(rect => rect.width),
+            laneTops: rects.map(rect => Math.round(rect.top)),
+          };
+        }"""
+    )
+    assert board_geometry["modalWidth"] >= 1050
+    # One board row should size the modal to its content instead of stretching
+    # it to most of the viewport and leaving a large empty area underneath.
+    assert 450 <= board_geometry["modalHeight"] <= 650, board_geometry
+    assert board_geometry["bodyDisplay"] == "grid"
+    assert board_geometry["columns"] == 3
+    assert min(board_geometry["laneWidths"]) >= 300
+    assert len(set(board_geometry["laneTops"])) == 1
+    delivery = groups.filter(has_text="Delivery")
+    expect(delivery.locator(".activity-custom-group-empty")).to_be_visible()
+
+    ungrouped_row = page.locator(".activity-row-wrap").filter(
+        has_text="Ungrouped session"
+    )
+    ungrouped_row.hover()
+    ungrouped_row.locator(".activity-row-group").click()
+    menu = page.locator(".activity-move-menu")
+    expect(menu).to_be_visible()
+    expect(menu.locator("button")).to_have_count(3)
+    expect(menu.locator("button").first).to_be_focused()
+    page.keyboard.press("ArrowDown")
+    expect(menu.locator("button").nth(1)).to_be_focused()
+    page.keyboard.press("End")
+    expect(menu.locator("button").last).to_be_focused()
+    page.keyboard.press("Home")
+    expect(menu.locator("button").first).to_be_focused()
+    page.keyboard.press("Shift+Tab")
+    expect(menu.locator("button").last).to_be_focused()
+    desktop_menu_geometry = menu.evaluate(
+        """node => {
+          const rect = node.getBoundingClientRect();
+          return {
+            position: getComputedStyle(node).position,
+            left: rect.left, top: rect.top,
+            right: rect.right, bottom: rect.bottom,
+            viewportWidth: window.innerWidth, viewportHeight: window.innerHeight,
+          };
+        }"""
+    )
+    assert desktop_menu_geometry["position"] == "fixed"
+    assert desktop_menu_geometry["left"] >= 0
+    assert desktop_menu_geometry["top"] >= 0
+    assert desktop_menu_geometry["right"] <= desktop_menu_geometry["viewportWidth"]
+    assert desktop_menu_geometry["bottom"] <= desktop_menu_geometry["viewportHeight"]
+    page.keyboard.press("Escape")
+    expect(menu).to_be_hidden()
+    expect(page.locator(".activity-modal")).to_be_visible()
+    expect(ungrouped_row.locator(".activity-row-group")).to_be_focused()
+
+    ungrouped_row.locator(".activity-row-group").click()
+    expect(menu).to_be_visible()
+    menu.locator("button").filter(has_text="Research").click()
+    expect(menu).to_be_hidden()
+    page.wait_for_function(
+        "() => window.__activityGroupCalls.some(call => call.path.endsWith('/ungrouped-row/group'))"
+    )
+    moved_state = page.evaluate(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          return app.activity.events.map(row => ({
+            id: row.id, group: row.group_id || '', order: row.group_order,
+          }));
+        }"""
+    )
+    assert next(row for row in moved_state if row["id"] == "ungrouped-row")["group"] == "research", moved_state
+
+    research = groups.filter(has_text="Research")
+    expect(research.locator(".activity-row-wrap")).to_have_count(2)
+    expect(groups.filter(has_text="未分组").locator(
+        ".activity-custom-group-empty"
+    )).to_be_visible()
+
+    group_calls_before = page.evaluate(
+        """() => window.__activityGroupCalls.filter(
+          call => call.path.endsWith('/ungrouped-row/group')).length"""
+    )
+    moved_row = page.locator(".activity-row-wrap").filter(
+        has_text="Ungrouped session"
+    )
+    moved_row.hover()
+    moved_row.locator(".activity-row-group").click()
+    expect(menu.locator("button.active")).to_have_text("Research")
+    menu.locator("button.active").click()
+    expect(menu).to_be_hidden()
+    group_calls_after = page.evaluate(
+        """() => window.__activityGroupCalls.filter(
+          call => call.path.endsWith('/ungrouped-row/group')).length"""
+    )
+    assert group_calls_after == group_calls_before
+
+    page.locator(".activity-groups-toolbar .btn-ghost").click()
+    editor = page.locator(".activity-group-editor")
+    expect(editor).to_be_visible()
+    editor.locator("input").fill("Writing")
+    editor.locator(".activity-group-swatch.is-rose").click()
+    editor.locator('button[type="submit"]').click()
+    expect(page.locator(".activity-custom-group-head > strong")).to_contain_text(
+        ["Research", "Delivery", "Writing", "未分组"]
+    )
+
+    # Rows can be inserted at an exact position, and every visible lane —
+    # including the built-in Ungrouped lane — participates in board ordering.
+    drag_state = page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const research = app.activityCustomGroupSections()
+            .find(group => group.groupId === 'research');
+          const source = app.activity.events.find(row => row.id === 'ungrouped-row');
+          const target = app.activity.events.find(row => row.id === 'grouped-row');
+          app.activity.dragEventId = source.id;
+          app.activity.dragInsertAfter = false;
+          await app.onActivityRowDrop(research, target);
+
+          const writing = app.activityCustomGroupSections()
+            .find(group => group.orderId === 'writing');
+          app.activity.dragGroupId = writing.orderId;
+          const fakeRect = {left: 0, top: 0, width: 300, height: 300};
+          app.onActivityRowDragOver({
+            clientX: 10, clientY: 10,
+            currentTarget: {getBoundingClientRect: () => fakeRect},
+          }, research, target);
+          const forwardedTarget = app.activity.dragOverGroupOrderId;
+          await app.onActivityRowDrop(research, target);
+          await new Promise(resolve => app.$nextTick(resolve));
+          return {
+            forwardedTarget,
+            groupOrder: [...app.activity.groupOrder],
+            researchOrder: app.activityAllEvents(research).map(row => row.id),
+          };
+        }"""
+    )
+    assert drag_state["forwardedTarget"] == "research"
+    assert drag_state["researchOrder"] == ["ungrouped-row", "grouped-row"]
+    assert drag_state["groupOrder"] == [
+        "writing", "research", "delivery", "__ungrouped__",
+    ]
+    assert page.locator(
+        ".activity-custom-group-head > strong"
+    ).all_text_contents() == ["Writing", "Research", "Delivery", "未分组"]
+    expect(page.locator(".activity-group.is-custom").last.locator(
+        ".activity-group-drag-handle"
+    )).to_be_hidden()
+
+    calls = page.evaluate("() => window.__activityGroupCalls")
+    placement = next(
+        call for call in calls
+        if call["path"].endswith("/ungrouped-row/group")
+        and call["options"]["json"].get("before_event_id") == "grouped-row"
+    )
+    assert placement["options"]["json"]["group_id"] == "research"
+    reorder = next(
+        call for call in reversed(calls)
+        if call["path"] == "/api/activity/groups/order"
+    )
+    assert reorder["options"]["json"]["ids"] == [
+        "writing", "research", "delivery", "__ungrouped__",
+    ]
+
+    # A busy group is an independently scrollable lane. The old five-row cap
+    # plus a constrained grid lane clipped everything below roughly four rows,
+    # including the "more" control, so there was no way to reach older sessions.
+    page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          app.activity.events = Array.from({length: 12}, (_, index) => ({
+            id: `busy-group-${index}`,
+            session_id: `busy-session-${index}`,
+            session_name: `Busy session ${index + 1}`,
+            task_summary: `Busy task ${index + 1}`,
+            workspace: '/tmp/e2e', workspace_name: 'e2e',
+            state: 'completed', read: true, group_id: 'research',
+            started_at: index, finished_at: index + 10, updated_at: index + 20,
+          }));
+          await new Promise(resolve => app.$nextTick(resolve));
+        }"""
+    )
+    research = page.locator(".activity-group.is-custom").filter(
+        has=page.locator(".activity-custom-group-head > strong", has_text="Research")
+    )
+    expect(research.locator(".activity-row-wrap")).to_have_count(12)
+    busy_row = research.locator(".activity-row-wrap").first
+    busy_row.hover()
+    busy_row.locator(".activity-row-group").click()
+    expect(menu).to_be_visible()
+    lane_scroll = research.evaluate(
+        """lane => {
+          const before = {clientHeight: lane.clientHeight, scrollHeight: lane.scrollHeight};
+          lane.scrollTop = lane.scrollHeight;
+          return {...before, scrollTop: lane.scrollTop};
+        }"""
+    )
+    assert 280 <= lane_scroll["clientHeight"] <= 320
+    assert lane_scroll["scrollHeight"] > lane_scroll["clientHeight"]
+    assert lane_scroll["scrollTop"] > 0
+    expect(menu).to_be_hidden()
+    expect(research.locator(".activity-session-name").last).to_have_text(
+        "Busy session 1"
+    )
+
+    calls = page.evaluate("() => window.__activityGroupCalls")
+    assert any(call["path"].endswith("/ungrouped-row/group") for call in calls)
+    assert any(call["path"] == "/api/activity/groups" for call in calls)
+
+
+def test_group_board_pins_ungrouped_to_third_desktop_column(
+        page: Page, backend_url, auth_token):
+    page.set_viewport_size({"width": 1440, "height": 900})
+    _login(page, backend_url, auth_token)
+    page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          app._stopActivityEvents();
+          await Promise.allSettled(Object.values(app._activityFetchPromises || {}));
+          app.lang = 'zh';
+          app.activity.viewLoaded = true;
+          app.activity.view = 'groups';
+          app.activity.loading = false;
+          app.activity.events = [];
+          app.activity.customGroups = [
+            {id: 'research', name: 'Research', color: 'violet'},
+            {id: 'delivery', name: 'Delivery', color: 'green'},
+            {id: 'planning', name: 'Planning', color: 'cyan'},
+            {id: 'review', name: 'Review', color: 'amber'},
+          ];
+          app.activity.groupOrder = [
+            'research', 'delivery', 'planning', 'review', '__ungrouped__',
+          ];
+          app.activity.show = true;
+          await new Promise(resolve => app.$nextTick(resolve));
+        }"""
+    )
+
+    expect(page.locator(".activity-group.is-custom")).to_have_count(5)
+    desktop = page.evaluate(
+        """() => {
+          const body = document.querySelector('.activity-body.is-group-board');
+          const lanes = Array.from(body.querySelectorAll('.activity-group.is-custom'));
+          return {
+            columns: getComputedStyle(body).gridTemplateColumns.split(' ').length,
+            lanes: lanes.map(lane => {
+              const rect = lane.getBoundingClientRect();
+              return {
+                name: lane.querySelector('.activity-custom-group-head > strong')?.textContent,
+                left: Math.round(rect.left), top: Math.round(rect.top),
+                height: Math.round(rect.height),
+              };
+            }),
+          };
+        }"""
+    )
+    assert desktop["columns"] == 3
+    by_name = {lane["name"]: lane for lane in desktop["lanes"]}
+    assert by_name["Research"]["left"] == by_name["Planning"]["left"]
+    assert by_name["Delivery"]["left"] == by_name["Review"]["left"]
+    assert by_name["Research"]["left"] < by_name["Delivery"]["left"]
+    assert by_name["Delivery"]["left"] < by_name["未分组"]["left"]
+    assert by_name["Research"]["top"] == by_name["Delivery"]["top"]
+    assert by_name["Planning"]["top"] == by_name["Review"]["top"]
+    assert by_name["Planning"]["top"] > by_name["Research"]["top"]
+    assert by_name["未分组"]["top"] == by_name["Research"]["top"]
+    assert by_name["未分组"]["height"] > by_name["Research"]["height"] * 1.9
+
+    page.set_viewport_size({"width": 390, "height": 844})
+    page.wait_for_timeout(100)
+    mobile = page.evaluate(
+        """() => {
+          const body = document.querySelector('.activity-body.is-group-board');
+          const lanes = Array.from(body.querySelectorAll('.activity-group.is-custom'));
+          return {
+            display: getComputedStyle(body).display,
+            rects: lanes.map(lane => {
+              const rect = lane.getBoundingClientRect();
+              return {left: Math.round(rect.left), top: Math.round(rect.top)};
+            }),
+          };
+        }"""
+    )
+    assert mobile["display"] != "grid"
+    assert len({rect["left"] for rect in mobile["rects"]}) == 1
+    assert [rect["top"] for rect in mobile["rects"]] == sorted(
+        rect["top"] for rect in mobile["rects"])
+
+
+def test_mobile_move_menu_is_bottom_sheet_and_cleans_up_lifecycle(
+    page: Page, backend_url, auth_token,
+):
+    page.set_viewport_size({"width": 390, "height": 844})
+    _login(page, backend_url, auth_token)
+
+    page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          app._stopActivityEvents();
+          await Promise.allSettled(Object.values(app._activityFetchPromises || {}));
+          app.lang = 'zh';
+          app.activity.viewLoaded = true;
+          app.activity.view = 'groups';
+          app.activity.loading = false;
+          app.activity.customGroups = [
+            {id: 'mobile-group', name: '移动分组', color: 'cyan'},
+          ];
+          app.activity.groupOrder = ['mobile-group', '__ungrouped__'];
+          app.activity.events = [{
+            id: 'mobile-row', session_id: 'mobile-session',
+            session_name: 'Mobile session', task_summary: 'Move on phone',
+            workspace: '/tmp/e2e', workspace_name: 'e2e',
+            state: 'completed', read: true,
+            started_at: 10, finished_at: 20, updated_at: 20,
+          }];
+          window.__mobileActivityGroupCalls = [];
+          app.api = async (path, options = {}) => {
+            window.__mobileActivityGroupCalls.push({path, options});
+            if (path.endsWith('/group') && options.method === 'PUT') {
+              const item = app.activity.events.find(row => row.id === 'mobile-row');
+              return {ok: true, data: {
+                revision: app._activityRevision + 1,
+                item: {...item, group_id: options.json.group_id},
+                items: [{...item, group_id: options.json.group_id}],
+                custom_groups: [...app.activity.customGroups],
+                group_order: [...app.activity.groupOrder],
+              }};
+            }
+            return {ok: false, data: null, error: 'unexpected test request'};
+          };
+          app.activity.show = true;
+          await new Promise(resolve => app.$nextTick(resolve));
+        }"""
+    )
+
+    row = page.locator(".activity-row-wrap").filter(has_text="Mobile session")
+    trigger = row.locator(".activity-row-group")
+    trigger.click()
+    layer = page.locator(".activity-move-layer")
+    menu = page.locator(".activity-move-menu")
+    expect(layer).to_be_visible()
+    expect(menu).to_be_visible()
+    expect(menu.locator("button").first).to_be_focused()
+    expect(menu.locator('button[aria-checked="true"]')).to_have_count(1)
+    geometry = menu.evaluate(
+        """node => {
+          const rect = node.getBoundingClientRect();
+          const vv = window.visualViewport;
+          return {
+            position: getComputedStyle(node).position,
+            left: rect.left, right: rect.right,
+            top: rect.top, bottom: rect.bottom,
+            visibleTop: vv ? vv.offsetTop : 0,
+            visibleBottom: vv ? vv.offsetTop + vv.height : window.innerHeight,
+            viewportWidth: window.innerWidth,
+            pageWidth: document.documentElement.scrollWidth,
+            itemHeights: Array.from(node.querySelectorAll('button'))
+              .map(button => button.getBoundingClientRect().height),
+          };
+        }"""
+    )
+    assert geometry["position"] == "relative"
+    assert geometry["left"] >= 0
+    assert geometry["right"] <= geometry["viewportWidth"]
+    assert geometry["top"] >= geometry["visibleTop"]
+    assert geometry["bottom"] <= geometry["visibleBottom"]
+    assert geometry["pageWidth"] <= geometry["viewportWidth"]
+    assert min(geometry["itemHeights"]) >= 44
+    inline_style = menu.get_attribute("style") or ""
+    assert "left:" not in inline_style
+    assert "top:" not in inline_style
+
+    keyboard_geometry = page.evaluate(
+        """async () => {
+          document.documentElement.style.setProperty('--kb-inset', '260px');
+          await new Promise(resolve => requestAnimationFrame(
+            () => requestAnimationFrame(resolve)));
+          const rect = document.querySelector('.activity-move-menu').getBoundingClientRect();
+          return {bottom: rect.bottom, keyboardTop: window.innerHeight - 260};
+        }"""
+    )
+    assert keyboard_geometry["bottom"] <= keyboard_geometry["keyboardTop"]
+    page.evaluate(
+        "() => document.documentElement.style.setProperty('--kb-inset', '0px')"
+    )
+
+    layer.click(position={"x": 5, "y": 5})
+    expect(menu).to_be_hidden()
+    expect(page.locator(".activity-modal")).to_be_visible()
+
+    trigger.click()
+    page.keyboard.press("Escape")
+    expect(menu).to_be_hidden()
+    expect(page.locator(".activity-modal")).to_be_visible()
+
+    trigger.click()
+    page.locator(".activity-body").dispatch_event("scroll")
+    expect(menu).to_be_hidden()
+
+    trigger.click()
+    page.evaluate(
+        """() => window.visualViewport?.dispatchEvent(new Event('resize'))"""
+    )
+    expect(menu).to_be_visible()
+    page.set_viewport_size({"width": 400, "height": 800})
+    expect(menu).to_be_visible()
+    page.locator(".activity-move-layer").click(position={"x": 5, "y": 5})
+    expect(menu).to_be_hidden()
+
+    lifecycle = page.evaluate(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const arm = () => {
+            app.activity.show = true;
+            app.activity.moveMenu = {
+              show: true, eventId: 'mobile-row', style: '',
+            };
+          };
+          arm();
+          app.setMobileTab(app.mobileTab);
+          const mobileTabClosed = !app.activity.moveMenu.show;
+          arm();
+          app.toggleHistoryPicker();
+          const pickerClosed = !app.activity.moveMenu.show;
+          app.closeHistoryPicker(false);
+          arm();
+          app.closeActivityCenter();
+          const centerClosed = !app.activity.moveMenu.show;
+          return {mobileTabClosed, pickerClosed, centerClosed};
+        }"""
+    )
+    assert lifecycle == {
+        "mobileTabClosed": True,
+        "pickerClosed": True,
+        "centerClosed": True,
+    }
+
+    page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          app.activity.show = true;
+          await new Promise(resolve => app.$nextTick(resolve));
+        }"""
+    )
+    trigger.click()
+    menu.locator("button").filter(has_text="移动分组").click()
+    expect(menu).to_be_hidden()
+    page.wait_for_function(
+        "() => window.__mobileActivityGroupCalls.some(call => call.path.endsWith('/mobile-row/group'))"
+    )
+    assigned = page.evaluate(
+        """() => document.querySelector('#app')._x_dataStack[0]
+          .activity.events.find(row => row.id === 'mobile-row').group_id || ''"""
+    )
+    assert assigned == "mobile-group"
+
+    live_cleanup = page.evaluate(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          app._activityRevision = 0;
+          app.activity.events = Array.from({length: app.ACTIVITY_EVENT_CAP}, (_, index) => ({
+            id: index === app.ACTIVITY_EVENT_CAP - 1 ? 'live-menu-target' : `live-${index}`,
+            session_id: `live-session-${index}`,
+            state: 'completed', read: true, updated_at: app.ACTIVITY_EVENT_CAP - index,
+          }));
+          app.activity.moveMenu = {
+            show: true, eventId: 'live-menu-target', style: '',
+          };
+          app._applyActivityUpdate({
+            revision: 1,
+            item: {
+              id: 'live-new', session_id: 'live-new-session',
+              state: 'running', read: true, updated_at: 10_000,
+            },
+          });
+          return {
+            targetPresent: !!app.activityMoveMenuItem(),
+            menuOpen: app.activity.moveMenu.show,
+            eventId: app.activity.moveMenu.eventId,
+          };
+        }"""
+    )
+    assert live_cleanup == {
+        "targetPresent": False,
+        "menuOpen": False,
+        "eventId": "",
+    }
+
+    snapshot_cleanup = page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const pending = Object.values(app._activityFetchPromises || {});
+          app._abortActivityFetches();
+          await Promise.allSettled(pending);
+          const nativeFetch = window.fetch;
+          try {
+            app.activity.events = [{
+              id: 'snapshot-target', session_id: 'snapshot-session',
+              state: 'completed', read: true, updated_at: 1,
+            }];
+            app.activity.moveMenu = {
+              show: true, eventId: 'snapshot-target', style: '',
+            };
+            app._activityEtags = {};
+            app._activityGeneration = '';
+            app._activityRevision = 0;
+            app._activityAppliedSeq = 0;
+            app._activityRequestSeq = 0;
+            window.fetch = async url => {
+              if (String(url).startsWith('/api/activity?')) {
+                return new Response(JSON.stringify({
+                  events: [],
+                  custom_groups: [], group_order: ['__ungrouped__'],
+                  summary: {
+                    generation: 'mobile-snapshot', revision: 1,
+                    running: 0, unread: 0, attention: 0,
+                    groups: {review: 0, running: 0, failed: 0, history: 0},
+                    group_unread: {review: 0, running: 0, failed: 0, history: 0},
+                    workspaces: [],
+                  },
+                }), {status: 200, headers: {'Content-Type': 'application/json'}});
+              }
+              return nativeFetch(url);
+            };
+            const loaded = await app.fetchActivity();
+            return {
+              loaded,
+              menuOpen: app.activity.moveMenu.show,
+              eventId: app.activity.moveMenu.eventId,
+            };
+          } finally {
+            window.fetch = nativeFetch;
+          }
+        }"""
+    )
+    assert snapshot_cleanup == {
+        "loaded": True,
+        "menuOpen": False,
+        "eventId": "",
+    }
+
+
+def test_custom_group_workspace_binding_opens_changes_and_unbinds(
+    page: Page, backend_url, auth_token,
+):
+    page.set_viewport_size({"width": 1440, "height": 900})
+    _login(page, backend_url, auth_token)
+
+    page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          app._stopActivityEvents();
+          await Promise.allSettled(Object.values(app._activityFetchPromises || {}));
+          app.lang = 'zh';
+          app.sessionWorkspaces = [
+            {id: 'workspace-a', path: '/tmp/workspace-a', name: 'Workspace A', primary: true},
+            {id: 'workspace-b', path: '/tmp/workspace-b', name: 'Workspace B', primary: false},
+          ];
+          app.activity.viewLoaded = true;
+          app.activity.view = 'groups';
+          app.activity.loading = false;
+          app.activity.customGroups = [{
+            id: 'mixed', name: 'Mixed work', color: 'cyan',
+            workspace_id: 'workspace-a', workspace_path: '/tmp/workspace-a',
+          }];
+          app.activity.groupOrder = ['mixed', '__ungrouped__'];
+          app.activity.events = [{
+            id: 'from-a', session_id: 'session-a', session_name: 'From A',
+            task_summary: 'Task from A', workspace: '/tmp/workspace-a',
+            workspace_name: 'Workspace A', state: 'completed', read: true,
+            group_id: 'mixed', started_at: 1, finished_at: 2, updated_at: 2,
+          }, {
+            id: 'from-b', session_id: 'session-b', session_name: 'From B',
+            task_summary: 'Task from B', workspace: '/tmp/workspace-b',
+            workspace_name: 'Workspace B', state: 'completed', read: true,
+            group_id: 'mixed', started_at: 3, finished_at: 4, updated_at: 4,
+          }];
+          window.__workspaceBindingCalls = [];
+          app.fetchSessionWorkspaces = async () => true;
+          app.switchWorkspace = async path => {
+            window.__workspaceBindingCalls.push({kind: 'switch', path});
+          };
+          app.api = async (path, options = {}) => {
+            window.__workspaceBindingCalls.push({kind: 'api', path, options});
+            if (path === '/api/activity/groups/mixed' && options.method === 'PATCH') {
+              const workspaceId = Object.hasOwn(options.json, 'workspace_id')
+                ? options.json.workspace_id : app.activity.customGroups[0].workspace_id;
+              const workspace = app.sessionWorkspaces.find(row => row.id === workspaceId);
+              const group = {
+                id: 'mixed', name: options.json.name, color: options.json.color,
+              };
+              if (workspace) {
+                group.workspace_id = workspace.id;
+                group.workspace_path = workspace.path;
+              }
+              return {ok: true, data: {
+                revision: app._activityRevision + 1,
+                custom_groups: [group], group_order: ['mixed', '__ungrouped__'],
+              }};
+            }
+            return {ok: false, data: null, error: 'unexpected request'};
+          };
+          app.activity.show = true;
+          await new Promise(resolve => app.$nextTick(resolve));
+        }"""
+    )
+
+    lane = page.locator(".activity-group.is-custom").filter(has_text="Mixed work")
+    expect(lane.locator(".activity-row-wrap")).to_have_count(2)
+    chip = lane.locator(".activity-group-workspace-chip")
+    expect(chip).to_be_visible()
+    expect(chip).to_contain_text("Workspace A")
+    chip.click()
+    page.wait_for_function(
+        "() => window.__workspaceBindingCalls.some(call => call.kind === 'switch')")
+    calls = page.evaluate("() => window.__workspaceBindingCalls")
+    assert next(call for call in calls if call["kind"] == "switch")["path"] == "/tmp/workspace-a"
+
+    page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          app.activity.show = true;
+          await new Promise(resolve => app.$nextTick(resolve));
+        }"""
+    )
+    lane = page.locator(".activity-group.is-custom").filter(has_text="Mixed work")
+    lane.hover()
+    lane.locator('.activity-custom-group-actions button[title="编辑分组"]').click()
+    editor = page.locator(".activity-group-editor")
+    editor.locator("select").select_option("workspace-b")
+    editor.locator('button[type="submit"]').click()
+    expect(lane.locator(".activity-group-workspace-chip")).to_contain_text("Workspace B")
+
+    lane.hover()
+    lane.locator('.activity-custom-group-actions button[title="编辑分组"]').click()
+    editor.locator("select").select_option("")
+    editor.locator('button[type="submit"]').click()
+    expect(lane.locator(".activity-group-workspace-chip")).to_be_hidden()
+    expect(lane.locator(".activity-row-wrap")).to_have_count(2)
+
+    calls = page.evaluate("() => window.__workspaceBindingCalls")
+    patches = [call for call in calls if call["kind"] == "api"]
+    assert patches[-2]["options"]["json"]["workspace_id"] == "workspace-b"
+    assert patches[-1]["options"]["json"]["workspace_id"] is None
+
+    # A removed generation remains visible but cannot silently bind to a new
+    # workspace at the same path.
+    page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          app.sessionWorkspaces = [{
+            id: 'new-generation', path: '/tmp/workspace-a',
+            name: 'Workspace A again', primary: true,
+          }];
+          app.activity.customGroups = [{
+            id: 'mixed', name: 'Mixed work', color: 'cyan',
+            workspace_id: 'old-generation', workspace_path: '/tmp/workspace-a',
+          }];
+          await new Promise(resolve => app.$nextTick(resolve));
+        }"""
+    )
+    lane = page.locator(".activity-group.is-custom").filter(has_text="Mixed work")
+    chip = lane.locator(".activity-group-workspace-chip")
+    expect(chip).to_have_attribute("aria-disabled", "true")
+    expect(chip).to_contain_text("workspace-a")
+    expect(chip).to_contain_text("工作区已移除")
+    stale_open = page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const group = app.activityCustomGroupSections()[0];
+          const switchCallsBefore = window.__workspaceBindingCalls.filter(
+            call => call.kind === 'switch').length;
+          app.fetchSessionWorkspaces = async () => {
+            app.sessionWorkspaces = [{
+              id: 'new-generation', path: '/tmp/workspace-a',
+              name: 'Workspace A again', primary: true,
+            }];
+            return true;
+          };
+          const opened = await app.openActivityGroupWorkspace(group);
+          return {
+            opened,
+            switchDelta: window.__workspaceBindingCalls.filter(
+              call => call.kind === 'switch').length - switchCallsBefore,
+          };
+        }"""
+    )
+    assert stale_open == {"opened": False, "switchDelta": 0}
+
+    page.set_viewport_size({"width": 390, "height": 844})
+    page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          app.activity.show = true;
+          app.activity.view = 'groups';
+          app.openActivityGroupEditor(app.activityCustomGroupSections()[0]);
+          await new Promise(resolve => app.$nextTick(resolve));
+        }"""
+    )
+    expect(page.locator(".activity-group-editor")).to_be_visible()
+    expect(page.locator(".activity-group-workspace-field select")).to_be_visible()
+    geometry = page.evaluate(
+        """() => {
+          const editor = document.querySelector('.activity-group-editor');
+          const select = document.querySelector('.activity-group-workspace-field select');
+          const chip = document.querySelector('.activity-group-workspace-chip');
+          return {
+            scrollWidth: document.documentElement.scrollWidth,
+            viewportWidth: window.innerWidth,
+            editorClientHeight: editor.clientHeight,
+            editorScrollHeight: editor.scrollHeight,
+            selectHeight: select.getBoundingClientRect().height,
+            chipHeight: chip.getBoundingClientRect().height,
+          };
+        }"""
+    )
+    assert geometry["scrollWidth"] <= geometry["viewportWidth"]
+    assert geometry["editorClientHeight"] >= 190
+    assert geometry["editorClientHeight"] == geometry["editorScrollHeight"]
+    assert geometry["selectHeight"] >= 40
+    assert geometry["chipHeight"] >= 40
+
+
+def test_session_rename_updates_loaded_activity_row_immediately(
+    page: Page, backend_url, auth_token
+):
+    _login(page, backend_url, auth_token)
+
+    result = page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          app._stopActivityEvents();
+          await Promise.allSettled(Object.values(app._activityFetchPromises || {}));
+          const sid = app.currentId;
+          const before = app.sessions.find(row => row.id === sid)?.name || '';
+          app.activity.events = [{
+            id: 'rename-target',
+            session_id: sid,
+            session_name: before,
+            task_summary: 'Keep task summary',
+            workspace: app.currentWorkspacePath(),
+            workspace_name: 'e2e',
+            state: 'completed',
+            read: true,
+            started_at: 1,
+            finished_at: 2,
+            updated_at: 2,
+          }];
+          app.renamingPickerSid = sid;
+          app.pickerRenameDraft = 'Renamed activity row';
+          await app.pickerCommitInlineRename();
+          return {
+            sessionName: app.sessions.find(row => row.id === sid)?.name,
+            activityName: app.activity.events[0]?.session_name,
+            taskSummary: app.activity.events[0]?.task_summary,
+            updatedAt: app.activity.events[0]?.updated_at,
+          };
+        }"""
+    )
+
+    assert result == {
+        "sessionName": "Renamed activity row",
+        "activityName": "Renamed activity row",
+        "taskSummary": "Keep task summary",
+        "updatedAt": 2,
+    }
+
+
 def test_live_updates_and_all_status_time_view(page: Page, backend_url, auth_token):
+    page.add_init_script("localStorage.removeItem('muselab_activity_view')")
     _login(page, backend_url, auth_token)
     page.wait_for_function(
         """() => {
@@ -42,6 +1711,59 @@ def test_live_updates_and_all_status_time_view(page: Page, backend_url, auth_tok
 
     page.locator(".activity-center-btn").click()
     expect(page.locator(".activity-modal")).to_be_visible()
+    expect(page.locator(".activity-view-switch button").nth(0)).to_have_class(
+        "active"
+    )
+    page.locator(".activity-view-switch button").nth(2).click()
+    expect(page.locator(".activity-view-switch button").nth(2)).to_have_class(
+        "active"
+    )
+
+    pin_requests: list[dict] = []
+
+    def patch_pin(route):
+        request = route.request.post_data_json
+        pin_requests.append(request)
+        pinned = bool(request["pinned"])
+        revision = 3 + len(pin_requests)
+        summary = {
+            "generation": "e2e-generation",
+            "revision": revision,
+            "running": 1,
+            "unread": 0,
+            "attention": 0,
+            "groups": {"review": 0, "running": 1, "failed": 1, "history": 1},
+            "group_unread": {"review": 0, "running": 0, "failed": 0, "history": 0},
+            "workspaces": [],
+        }
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({
+                "ok": True,
+                "generation": "e2e-generation",
+                "revision": revision,
+                "item": {
+                    "kind": "turn",
+                    "workspace": "/tmp/e2e",
+                    "workspace_name": "e2e",
+                    "session_name": "Activity test",
+                    "status_detail": "",
+                    "read": True,
+                    "id": "older",
+                    "session_id": "older-session",
+                    "task_summary": "Older completed task",
+                    "state": "completed",
+                    "started_at": 10,
+                    "finished_at": 100,
+                    "updated_at": 100,
+                    "pinned": pinned,
+                },
+                "summary": summary,
+            }),
+        )
+
+    page.route("**/api/activity/older", patch_pin)
 
     page.evaluate(
         """() => {
@@ -54,6 +1776,8 @@ def test_live_updates_and_all_status_time_view(page: Page, backend_url, auth_tok
             status_detail: '',
             read: true,
           };
+          app.activity.events = [];
+          app.activity.expanded = {};
           app._applyActivityUpdate({
             generation: 'e2e-generation',
             revision: 1,
@@ -126,7 +1850,7 @@ def test_live_updates_and_all_status_time_view(page: Page, backend_url, auth_tok
               workspaces: [],
             },
           });
-          for (let index = 0; index < 9; index += 1) {
+          for (let index = 0; index < 14; index += 1) {
             app.activity.events.push({
               ...base,
               id: `extra-${index}`,
@@ -138,24 +1862,52 @@ def test_live_updates_and_all_status_time_view(page: Page, backend_url, auth_tok
               updated_at: 90 - index,
             });
           }
-          app.setActivityView('timeline');
         }"""
     )
 
-    expect(page.locator(".activity-view-switch button").nth(1)).to_have_class(
-        "active"
-    )
-    labels = page.locator(".activity-group .activity-row strong")
-    expect(labels).to_have_count(10)
-    assert labels.all_text_contents()[:3] == [
+    session_labels = page.locator(".activity-group .activity-session-name")
+    task_labels = page.locator(".activity-group .activity-task-summary")
+    expect(session_labels).to_have_count(15)
+    expect(task_labels).to_have_count(15)
+    assert session_labels.all_text_contents()[:3] == [
+        "Activity test", "Activity test", "Activity test",
+    ]
+    assert task_labels.all_text_contents()[:3] == [
         "Newest running task",
         "Newer failed task",
         "Older completed task",
     ]
+
+    older = page.locator(".activity-row-wrap").filter(
+        has_text="Older completed task"
+    )
+    pin = older.locator(".activity-pin")
+    expect(pin).to_have_attribute("aria-pressed", "false")
+    pin.click()
+    expect(pin).to_be_enabled()
+    expect(pin).to_have_attribute("aria-pressed", "true")
+    assert task_labels.all_text_contents()[:3] == [
+        "Older completed task",
+        "Newest running task",
+        "Newer failed task",
+    ]
+    expect(page.locator(".activity-modal")).to_be_visible()
+
+    pin.click()
+    expect(pin).to_be_enabled()
+    expect(pin).to_have_attribute("aria-pressed", "false")
+    assert task_labels.all_text_contents()[:3] == [
+        "Newest running task",
+        "Newer failed task",
+        "Older completed task",
+    ]
+    assert pin_requests == [{"pinned": True}, {"pinned": False}]
+
     more = page.locator(".activity-group-more")
     expect(more).to_have_text("2 more")
     more.click()
-    expect(labels).to_have_count(12)
+    expect(session_labels).to_have_count(17)
+    expect(task_labels).to_have_count(17)
 
 
 def test_terminal_event_wins_over_stale_tab_activity_snapshot(
@@ -386,6 +2138,7 @@ def test_activity_row_targeted_lookup_opens_mobile_session_and_workspace(
           app._checkActiveTurn = () => {};
           app._fetchTabUsage = async () => {};
           app._scheduleIdlePreload = () => {};
+          app._stopActivityEvents(); Object.values(app._activityFetchControllers || {}).forEach(controller => controller.abort()); app._activityFetchPromises = Object.create(null);
           app.fetchActivity = async () => true;
           app.setMobileTab('files');
           app._sessionListPullPromise = null;

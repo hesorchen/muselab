@@ -64,7 +64,7 @@ tail -f ~/Library/Logs/muselab/stderr.log
 
 **阶段 1 —— 构建器：** 基础镜像 `python:3.12-slim`；复制固定版本的 `uv`/`uvx`；通过 `uv sync --frozen --no-dev --no-install-project` 仅安装生产 Python 依赖。
 
-**阶段 2 —— 运行时：** 全新 `python:3.12-slim`；安装 `curl`、`git`、Node 20 与固定版本的 Claude Code CLI；从构建器复制预构建的 `.venv`，并复制 `backend/`、`frontend/`、`skills/` 与 `scripts/templates/`；创建非 root 用户 `muse`；暴露端口 8765；声明针对 `/api/health` 的 `HEALTHCHECK`。
+**阶段 2 —— 运行时：** 全新 `python:3.12-slim`；安装 `curl`、`git`、Node 20 与固定版本的 Claude Code CLI；从构建器复制预构建的 `.venv`，并复制 `backend/`、`frontend/`、空的 `skills/` 扩展槽与 `scripts/templates/`；创建非 root 用户 `muse`；暴露端口 8765；声明针对 `/api/health` 的 `HEALTHCHECK`。
 
 ### docker-compose.yml
 

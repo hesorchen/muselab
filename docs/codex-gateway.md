@@ -10,8 +10,8 @@ request to the user's own Codex/OpenAI backend and translates the response back.
 muselab does **not** store Codex OAuth credentials and does **not** call
 OpenAI-native APIs directly.
 
-The compatibility baseline tested on 2026-07-16 is CLIProxyAPI `v7.2.80`,
-Claude Agent SDK `0.2.120`, and its bundled Claude CLI `2.1.211`. Newer
+The compatibility baseline tested on 2026-08-12 is CLIProxyAPI `v7.2.111`,
+Claude Agent SDK `0.2.136`, and its bundled Claude CLI `2.1.228`. Newer
 CLIProxyAPI builds include fixes relevant to this bridge for Codex cache-token
 accounting, reasoning effort, tool-call replay, and Anthropic response
 translation.
@@ -37,10 +37,19 @@ The model catalog includes a disabled-by-default provider preset:
 
 The `codex:` prefix is muselab-internal. Before sending the model id to the
 gateway, muselab strips the prefix, so `codex:gpt-5.6-sol` becomes
-`gpt-5.6-sol` on the gateway side. Codex Gateway also opts into muselab's per-session reasoning
-`effort` selector; muselab passes the selected value through the Claude Agent
-SDK, and the sidecar is expected to translate it to the backend's reasoning
-parameter.
+`gpt-5.6-sol` on the gateway side. Codex Gateway also opts into muselab's
+per-session reasoning `effort` selector and the independent **Fast** service
+tier. The Claude Agent SDK has no native fields for `auto`, `ultra`, or Fast,
+so muselab carries the canonical values in `X-MuseLab-Effort` and
+`X-MuseLab-Service-Tier`. The `payload` rules in the recommended CLIProxyAPI
+config apply those controls after Anthropic-to-Codex translation:
+
+- `auto` removes the translator's synthetic effort so the model catalog
+  default remains authoritative;
+- `low` through `max` map directly to `reasoning.effort`;
+- `ultra` maps to wire-level `max` and keeps muselab's subagent spawn-depth
+  and concurrency bounds;
+- Fast maps independently to `service_tier: priority`.
 
 ## Enable it
 
@@ -55,7 +64,9 @@ parameter.
 
    - replace `replace-with-a-random-local-token` with a strong local token;
    - keep `disable-cooling: true` and `session-affinity: false` unless you
-     explicitly want the proxy to add local cooldown windows.
+     explicitly want the proxy to add local cooldown windows;
+   - keep the provided `payload.override` and `payload.filter` rules. Removing
+     them makes effort/Fast controls silently degrade after translation.
 
 3. Run CLIProxyAPI locally and bind it to loopback only:
 
@@ -75,6 +86,37 @@ parameter.
    **Settings → Providers → Codex Gateway** to apply it without restart.
 
 6. Pick a `codex:*` model in the chat model dropdown.
+
+## Upgrade existing Gateway configs
+
+Copying the example is a one-time install step: upgrading muselab does **not**
+rewrite `~/.cli-proxy-muselab/config.yaml`. Existing installations must merge
+the complete `payload:` block from
+`examples/cli-proxy-muselab.config.yaml` into their current config while
+preserving their own token, auth directory, and routing settings. Then restart
+the sidecar with the supervisor used on that machine.
+
+Before restarting, this static check should show the effort header, service-tier
+header, `reasoning.effort`, and `service_tier` rules:
+
+```bash
+rg -n 'X-MuseLab-Effort|X-MuseLab-Service-Tier|reasoning\.effort|service_tier' \
+  ~/.cli-proxy-muselab/config.yaml
+```
+
+After restart, verify the sidecar and Codex catalog are reachable with the
+same local token muselab uses:
+
+```bash
+curl -fsS \
+  -H "x-api-key: ${CODEX_GATEWAY_API_KEY}" \
+  'http://127.0.0.1:8317/v1/models?client_version' >/dev/null
+```
+
+A successful catalog request proves the restarted config is active; the static
+rule check proves the required post-translation mappings were retained. If the
+rules are absent, the UI can still discover model capabilities, but Auto, Ultra,
+and Fast may silently fall back to the translator defaults.
 
 The recommended CLIProxyAPI template disables the proxy's local auth/model
 cooldown scheduling. This makes muselab avoid extra proxy-side blackout windows
@@ -121,6 +163,7 @@ reference config. It intentionally uses these defaults:
 | `session-affinity` | `false` | Do not bind muselab sessions to a specific credential by default |
 | `logging-to-file` | `false` | Reduce the risk of writing prompts, tokens, or upstream errors to disk |
 | `remote-management.allow-remote` | `false` | Disable the remote management surface |
+| `payload` rules | keep the example block | Map muselab's effort/Fast headers after protocol translation |
 
 `usage-statistics-enabled` intentionally stays `false`. CLIProxyAPI `v7.2.80`
 exposes request details through `/v0/management/usage-queue`, but that endpoint
@@ -163,9 +206,10 @@ The sidecar must implement enough of the Anthropic Messages API for agent use:
   failures;
 - support for the headers muselab sends: `x-api-key` and/or
   `Authorization: Bearer`;
-- support for the reasoning `effort` field that Claude Agent SDK emits, mapping
-  at least `low`, `medium`, `high`, and `max` to the Codex/OpenAI backend's
-  equivalent reasoning-effort control.
+- support CLIProxyAPI's header-aware `payload` rules from the recommended
+  config. They map `X-MuseLab-Effort` to `reasoning.effort`, remove the field
+  for `auto`, map Ultra to `max`, and map `X-MuseLab-Service-Tier: fast` to
+  `service_tier: priority` after protocol translation.
 
 If plain chat works but tools fail, the gateway is chat-only and should not be
 advertised as full muselab agent support.
@@ -213,9 +257,12 @@ The effective meter/compact window is resolved in this order:
 `max_context_window` is displayed as a configurable ceiling only; it never
 silently inflates the active denominator. When muselab creates a Codex SDK
 client, it also injects the resolved effective value through
-`CLAUDE_CODE_MAX_CONTEXT_TOKENS`. Claude CLI's `/context`, native auto-compact,
+`CLAUDE_CODE_MAX_CONTEXT_TOKENS` and explicitly enables that same window through
+`CLAUDE_CODE_AUTO_COMPACT_WINDOW`. Claude CLI's `/context`, native auto-compact,
 muselab's preflight compact, the breakdown popup, and the bottom ring therefore
-share one denominator.
+share one denominator. The full effective value is passed to both variables;
+Claude CLI applies its own output/compaction reserve when deriving the lower
+auto-compact threshold.
 
 The bottom ring distinguishes both halves of the measurement:
 
@@ -230,7 +277,11 @@ Before sending a new user message, muselab asks the SDK for current context usag
 If the session is close to the effective window, it runs Claude Code's native
 `/compact` first, then sends the user's message. This preflight compact happens
 earlier than the post-reply auto-compact path and reduces gateway-side
-`input exceeds the context window` failures at request entry.
+`input exceeds the context window` failures at request entry. If a Codex runtime
+created with older compaction settings reports success or an in-band API error
+but makes no measurable room, muselab safely rebuilds that runtime and retries
+`/compact` once. It never performs this rebuild while a background task is
+attached, and it never retries the user's prompt as part of recovery.
 
 A gateway can still fail with `input exceeds the context window` if its
 translation layer, selected backend model, or account tier has an even smaller

@@ -96,6 +96,23 @@ class WorkspaceRegistry:
                 id=self._ids[path],
             )
 
+    def entry_for_id(self, workspace_id: str) -> WorkspaceEntry:
+        clean_id = str(workspace_id or "").strip()
+        with self._lock:
+            path = next(
+                (path for path, entry_id in self._ids.items()
+                 if entry_id == clean_id),
+                "",
+            )
+            if not path:
+                raise ValueError("workspace is not registered")
+            return WorkspaceEntry(
+                path=path,
+                name=self._workspaces[path],
+                primary=path == str(self.primary),
+                id=self._ids[path],
+            )
+
     def paths(self) -> tuple[Path, ...]:
         with self._lock:
             return tuple(Path(path) for path in self._workspaces)
@@ -135,7 +152,11 @@ class WorkspaceRegistry:
             updated = dict(self._workspaces)
             updated[path_value] = clean_name
             updated_ids = dict(self._ids)
-            updated_ids.setdefault(path_value, _stable_workspace_id(path))
+            # A remove followed by re-registering the same path is a new
+            # workspace generation. Reusing the path-derived legacy ID makes a
+            # cursor-0 snapshot indistinguishable from the deleted generation
+            # in another tab/device, so new registrations get a fresh UUID.
+            updated_ids.setdefault(path_value, str(uuid.uuid4()))
             self._save(updated, updated_ids)
             self._workspaces = updated
             self._ids = updated_ids
@@ -409,14 +430,14 @@ def browse_workspaces(path: str = Query("")) -> dict[str, Any]:
 @router.post("", dependencies=[Depends(require_token)])
 async def register_workspace(body: WorkspaceRequest) -> dict[str, Any]:
     try:
-        entry = registry.register(body.path, body.name or None)
+        from .file_events import manager as file_watch_manager
+        entry = await file_watch_manager.register_workspace(
+            Path(body.path), body.name or None)
         # Session discovery is cached.  A newly registered directory may
         # already contain Claude JSONL history, so invalidate before the next
         # list pull instead of making the user wait for the stale TTL.
         from . import sessions
-        from .file_events import manager as file_watch_manager
         sessions.invalidate_sessions_cache()
-        await file_watch_manager.ensure_workspace(Path(entry.path))
         return asdict(entry)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
@@ -434,12 +455,10 @@ def reorder_workspaces(body: WorkspaceOrderRequest) -> dict[str, Any]:
 @router.delete("", dependencies=[Depends(require_token)])
 async def remove_workspace(path: str = Query(...)) -> dict[str, bool]:
     try:
-        entry = registry.entry_for(path)
-        registry.remove(path)
+        from .file_events import manager as file_watch_manager
+        await file_watch_manager.unregister_workspace(Path(path))
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     from . import sessions
-    from .file_events import manager as file_watch_manager
     sessions.invalidate_sessions_cache()
-    await file_watch_manager.remove_workspace(entry.id)
     return {"ok": True}

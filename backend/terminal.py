@@ -276,6 +276,7 @@ class TerminalManager:
     def __init__(self) -> None:
         self.sessions: dict[str, TerminalSession] = {}
         self.tickets: dict[str, tuple[str, float]] = {}
+        self._reservations: dict[str, Path] = {}
         self.lock = asyncio.Lock()
         self.reaper_task: asyncio.Task | None = None
 
@@ -302,47 +303,86 @@ class TerminalManager:
     async def create(self, workspace: Path, request: TerminalCreate) -> TerminalSession:
         self.ensure_enabled()
         await self.start()
+        reservation_id = str(uuid.uuid4())
         async with self.lock:
             live = sum(1 for session in self.sessions.values()
                        if session.status == "running")
-            if live >= MAX_SESSIONS:
+            if live + len(self._reservations) >= MAX_SESSIONS:
                 raise HTTPException(409, f"terminal limit reached ({MAX_SESSIONS})")
-        profile = profiles.get(request.profile_id, use_default=True)
-        shell = _shell_path()
-        worker = Path(__file__).with_name("terminal_worker.py")
-        env = _terminal_env(shell, workspace)
-        process = await asyncio.create_subprocess_exec(
-            sys.executable, str(worker), shell, str(workspace),
-            str(request.rows), str(request.cols),
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=env,
-        )
-        now = time.time()
-        terminal_id = str(uuid.uuid4())
-        default_name = f"Terminal {sum(1 for s in self.sessions.values() if s.workspace == workspace) + 1}"
-        session = TerminalSession(
-            id=terminal_id,
-            name=request.name.strip() or (profile["name"] if profile else default_name),
-            workspace=workspace,
-            shell=shell,
-            profile_id=profile["id"] if profile else "",
-            profile_name=profile["name"] if profile else "",
-            process=process,
-            created_at=now,
-            last_activity=now,
-        )
+            default_number = (
+                sum(1 for session in self.sessions.values()
+                    if session.workspace == workspace)
+                + sum(1 for root in self._reservations.values()
+                      if root == workspace)
+                + 1
+            )
+            self._reservations[reservation_id] = workspace
+
+        session: TerminalSession | None = None
+        try:
+            profile = profiles.get(request.profile_id, use_default=True)
+            shell = _shell_path()
+            worker = Path(__file__).with_name("terminal_worker.py")
+            env = _terminal_env(shell, workspace)
+            process = await asyncio.create_subprocess_exec(
+                sys.executable, str(worker), shell, str(workspace),
+                str(request.rows), str(request.cols),
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
+            )
+            now = time.time()
+            terminal_id = str(uuid.uuid4())
+            session = TerminalSession(
+                id=terminal_id,
+                name=request.name.strip() or (
+                    profile["name"] if profile else f"Terminal {default_number}"
+                ),
+                workspace=workspace,
+                shell=shell,
+                profile_id=profile["id"] if profile else "",
+                profile_name=profile["name"] if profile else "",
+                process=process,
+                created_at=now,
+                last_activity=now,
+            )
+            if profile:
+                command = profile["command"].encode("utf-8")
+                if not command.endswith((b"\n", b"\r")):
+                    command += b"\n"
+                await self._write_worker(session, _INPUT, command)
+            async with self.lock:
+                self.sessions[terminal_id] = session
+                self._reservations.pop(reservation_id, None)
+            session.reader_task = asyncio.create_task(self._read_worker(session))
+            session.stderr_task = asyncio.create_task(self._read_stderr(session))
+            return session
+        except BaseException:
+            cleanup_task = asyncio.create_task(
+                self._rollback_create(reservation_id, session)
+            )
+            while not cleanup_task.done():
+                try:
+                    await asyncio.shield(cleanup_task)
+                except asyncio.CancelledError:
+                    # The caller may cancel repeatedly, but ownership of a spawned
+                    # process cannot be abandoned until rollback has finished.
+                    continue
+            cleanup_task.result()
+            raise
+
+    async def _rollback_create(
+        self,
+        reservation_id: str,
+        session: TerminalSession | None,
+    ) -> None:
         async with self.lock:
-            self.sessions[terminal_id] = session
-        session.reader_task = asyncio.create_task(self._read_worker(session))
-        session.stderr_task = asyncio.create_task(self._read_stderr(session))
-        if profile:
-            command = profile["command"].encode("utf-8")
-            if not command.endswith((b"\n", b"\r")):
-                command += b"\n"
-            await self._write_worker(session, _INPUT, command)
-        return session
+            self._reservations.pop(reservation_id, None)
+            if session is not None:
+                self.sessions.pop(session.id, None)
+        if session is not None:
+            await self._terminate_process(session)
 
     async def list(self, workspace: Path) -> list[dict[str, Any]]:
         self.ensure_enabled()
@@ -696,28 +736,6 @@ async def terminal_websocket(websocket: WebSocket, terminal_id: str) -> None:
 
     await websocket.accept(subprotocol=PROTOCOL)
     subscriber, replay = await manager.attach(session)
-    await websocket.send_json({
-        "type": "ready",
-        "terminal": session.public(),
-        "replay_bytes": len(replay),
-    })
-    if session.buffer_truncated:
-        await websocket.send_bytes(
-            b"\x1b[33m[muselab: earlier terminal output was truncated]\x1b[0m\r\n")
-    if replay:
-        # Historical terminal output may contain device queries (DA/DSR/OSC).
-        # Delimit replay explicitly so the browser can render it without
-        # forwarding newly-generated xterm replies into today's foreground
-        # process.
-        await websocket.send_json({"type": "replay_start"})
-        await websocket.send_bytes(replay)
-        await websocket.send_json({"type": "replay_end"})
-    if session.status != "running":
-        await websocket.send_json({"type": "exit", "exit_code": session.exit_code})
-        await websocket.close(code=1000)
-        await manager.detach(session, subscriber)
-        return
-
     writer = WebSocketWriter(websocket)
 
     async def send_loop() -> None:
@@ -763,9 +781,39 @@ async def terminal_websocket(websocket: WebSocket, terminal_id: str) -> None:
                 if not await writer.send_json({"type": "pong"}):
                     return
 
-    sender = asyncio.create_task(send_loop())
-    receiver = asyncio.create_task(receive_loop())
+    sender: asyncio.Task | None = None
+    receiver: asyncio.Task | None = None
     try:
+        # Initial ready/replay writes are part of the subscribed lifecycle too.
+        # Any disconnect from this point must reach the one detach in finally;
+        # otherwise the PTY reaper sees a phantom subscriber forever.
+        if not await writer.send_json({
+            "type": "ready",
+            "terminal": session.public(),
+            "replay_bytes": len(replay),
+        }):
+            return
+        if session.buffer_truncated and not await writer.send_bytes(
+            b"\x1b[33m[muselab: earlier terminal output was truncated]\x1b[0m\r\n"
+        ):
+            return
+        if replay:
+            # Historical terminal output may contain device queries
+            # (DA/DSR/OSC). Delimit replay explicitly so the browser renders
+            # it without forwarding replay-generated replies into today's PTY.
+            if not await writer.send_json({"type": "replay_start"}):
+                return
+            if not await writer.send_bytes(replay):
+                return
+            if not await writer.send_json({"type": "replay_end"}):
+                return
+        if session.status != "running":
+            await writer.send_json({"type": "exit", "exit_code": session.exit_code})
+            await writer.close(code=1000)
+            return
+
+        sender = asyncio.create_task(send_loop())
+        receiver = asyncio.create_task(receive_loop())
         done, pending = await asyncio.wait(
             {sender, receiver}, return_when=asyncio.FIRST_COMPLETED)
         for task in pending:
@@ -779,4 +827,12 @@ async def terminal_websocket(websocket: WebSocket, terminal_id: str) -> None:
     except (WebSocketDisconnect, asyncio.CancelledError):
         pass
     finally:
+        pending = [
+            task for task in (sender, receiver)
+            if task is not None and not task.done()
+        ]
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
         await manager.detach(session, subscriber)

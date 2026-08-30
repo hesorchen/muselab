@@ -40,15 +40,13 @@ classifiers = [
 ]
 requires-python = ">=3.12"
 dependencies = [
-    # Upper bound is a DELIBERATE guard, not pessimism: muselab is an adapter
-    # over the SDK and hand-maintains assumptions the SDK doesn't expose as a
-    # programmatic contract — the harness-tool denylist (chat.py disallowed_tools)
-    # and the CLI JSONL transcript format (jsonl_cleanup.py, _full_session_msgs).
-    # An unbounded `>=` lets any minor bump silently expose a new tool or break
-    # JSONL parsing with zero signal. <0.3 makes SDK upgrades an explicit action.
+    # Exact pin is deliberate: muselab adapts both SDK and bundled-CLI contracts
+    # that are not capability-negotiated — the harness-tool denylist, JSONL
+    # transcript shape, and native AskUserQuestion answer injection. Every SDK
+    # upgrade must refresh the tool catalog and rerun the native question matrix.
     # Path/effort drift is already auto-eliminated via
     # project_key_for_directory() + EffortLevel.
-    "claude-agent-sdk>=0.2.120,<0.3",
+    "claude-agent-sdk==0.2.144",
     "fastapi>=0.138.1",
     # Pin starlette above the fastapi-transitive 1.0.0, which carries
     # PYSEC-2026-161 (fixed in 1.0.1). Direct constraint so the pip-audit
@@ -68,10 +66,10 @@ dependencies = [
     # /api/push/subscribe. Has a transitive cryptography dep but no
     # external binaries.
     "pywebpush>=2.0.0",
-    # Pin aiohttp above the pywebpush-transitive 3.13.5, which carries
-    # CVE-2026-34993 + CVE-2026-47265 (both fixed in 3.14.0). Direct
-    # constraint so the pip-audit CVE-scan CI job stays green.
-    "aiohttp>=3.14.0",
+    # Keep aiohttp at the currently audited security floor rather than the
+    # older pywebpush-transitive range. Direct constraint keeps fresh lock
+    # resolutions aligned with the pip-audit CI baseline.
+    "aiohttp>=3.14.3",
     "pillow>=12.3.0",
     # Pin pyjwt above the mcp-transitive 2.12.1, which carries
     # PYSEC-2026-175/177/178/179 (all fixed in 2.13.0). Direct constraint
@@ -101,6 +99,9 @@ Container     = "https://github.com/hesorchen/muselab/pkgs/container/muselab"
 dev = [
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
+    # Starlette 1.2+ prefers httpx2 for TestClient. Keep production httpx
+    # separately because memory_client imports that package directly.
+    "httpx2>=2.0.0",
     # Browser regressions cover Alpine rendering races and trusted mobile
     # touch gestures that static source assertions cannot exercise.
     "pytest-playwright>=0.7.0",
