@@ -7557,6 +7557,12 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
    tried color-mix tints and opacity washes — both produced unreadable
    text on dark theme (user feedback 2026-05-22). */
 .msg.user.queued { align-items: flex-end; }
+.queued-row.avoids-tail-nav {
+  /* The three tail-navigation FABs occupy the rightmost 54px whenever the
+     reader is away from the latest message. Keep queued edit/remove controls
+     clickable without permanently changing normal right alignment. */
+  padding-inline-end: 54px;
+}
 .msg.user.queued .bubble {
   background: var(--c-accent);
   color: white;

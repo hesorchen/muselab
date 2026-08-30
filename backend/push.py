@@ -39,6 +39,12 @@ _VAPID_FILE = (_DIR / "vapid.json") if _DIR else None
 _SUBS_FILE = (_DIR / "push_subs.json") if _DIR else None
 
 _vapid: dict[str, str] | None = None
+# ``pywebpush.webpush`` exposes ``timeout=None`` and forwards that explicit
+# value to requests.  That disables requests' own timeout entirely: a dead
+# proxy once held a completed chat turn open for almost seven minutes while
+# three subscriptions failed serially.  Keep every endpoint attempt bounded;
+# chat/scheduler callers may still run the fan-out in a worker thread.
+_PUSH_HTTP_TIMEOUT_S = 10.0
 # Parsed Vapid object cache: (private_pem, Vapid). Vapid.from_pem does an
 # ASN.1 parse + EC key load on every call; send_to_all re-parsed the same
 # unchanging PEM on every push. Cache keyed by the PEM string so a key
@@ -310,6 +316,7 @@ def send_to_all(title: str, body: str, *, url: str = "/",
                 vapid_claims={"sub": os.environ.get(
                     "MUSELAB_VAPID_SUBJECT", "mailto:noreply@muselab.dev")},
                 ttl=24 * 3600,
+                timeout=_PUSH_HTTP_TIMEOUT_S,
             )
             sent += 1
         except WebPushException as e:
@@ -331,9 +338,15 @@ def send_to_all(title: str, body: str, *, url: str = "/",
                 # removal; applied at the end under the lock.
                 dropped.append(endpoint)
             else:
-                errors.append(f"{code}: {e}")
+                # Push exception strings commonly embed the full subscription
+                # endpoint (including its opaque device token) and proxy URL.
+                # Return/log only bounded diagnostics; operators need the class
+                # and status, not private protocol payloads.
+                label = type(e).__name__
+                errors.append(
+                    f"{label} status={code}" if code is not None else label)
         except Exception as e:
-            errors.append(f"{type(e).__name__}: {e}")
+            errors.append(type(e).__name__)
     if dropped:
         with _subs_lock:
             _load_subs()
@@ -347,6 +360,7 @@ def send_to_all(title: str, body: str, *, url: str = "/",
     sys.stderr.write(
         f"[push] {context or tag}: sent={sent} dropped={len(dropped)}"
         + (f" errors={errors}" if errors else "") + "\n")
+    sys.stderr.flush()
     return result
 
 

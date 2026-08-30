@@ -7838,6 +7838,10 @@ function portal() {
         // Exact backend turn currently owned by this tab. Session id is not
         // sufficient: a reconnect for turn A must never attach to newer B.
         activeTurnId: "",
+        // Immutable turn id of the most recent authenticated terminal frame.
+        // Post-result work may briefly leave /active or a mux state snapshot
+        // stale; never re-attach that already-rendered turn as "running".
+        _lastTerminalTurnId: "",
         parentTurnId: "",
         lastEventSeq: 0,
         es: null,
@@ -8017,6 +8021,7 @@ function portal() {
       if (st._virtualForceTail === undefined) st._virtualForceTail = false;
       if (!Number.isFinite(st._virtualRevision)) st._virtualRevision = 0;
       if (st.activeTurnId === undefined) st.activeTurnId = "";
+      if (st._lastTerminalTurnId === undefined) st._lastTerminalTurnId = "";
       if (st.parentTurnId === undefined) st.parentTurnId = "";
       if (!Number.isFinite(st.lastEventSeq)) st.lastEventSeq = 0;
       if (st.permission === undefined) st.permission = "";
@@ -10565,6 +10570,41 @@ function portal() {
         }
         return;
       }
+      const turnId = String(payload.turn_id || "");
+      if (existingState && !payload.background && turnId
+          && turnId === String(existingState._lastTerminalTurnId || "")) {
+        // `done` is the authoritative boundary for this immutable turn. A
+        // synchronous postlude used to leave the aggregate state active long
+        // enough for mux/list reconciliation to re-attach the completed turn;
+        // its child had already consumed `done`, so the UI then ran forever.
+        const currentTurnId = String(existingState.activeTurnId || "");
+        if (currentTurnId && currentTurnId !== turnId) {
+          // A delayed frame for completed A cannot touch successor B.
+          return;
+        }
+        const backgroundPending = Math.max(
+          0,
+          Number(existingState.backgroundTaskCount) || 0,
+          Number(payload.background_tasks_pending) || 0,
+        );
+        const preserveBackground = !!existingState.backgroundActive
+          || backgroundPending > 0;
+        if (existingState.streaming || existingState.es) {
+          this._retireStaleSessionStream(sid, existingState);
+          if (preserveBackground) {
+            this._setBackgroundTaskActive(
+              sid, true, payload.started_at, backgroundPending);
+          }
+        }
+        this._setSessionActivityExpectation(sid, preserveBackground);
+        existingState._pendingExternalUpdate = true;
+        this._resumePendingCanonicalSync(sid, existingState);
+        return;
+      }
+      if (existingState && turnId
+          && turnId !== String(existingState._lastTerminalTurnId || "")) {
+        existingState._sessionActivityExpected = null;
+      }
       if (meta) {
         meta.active = true;
         meta.turn_active = !payload.background;
@@ -10580,7 +10620,6 @@ function portal() {
         }
         return;
       }
-      const turnId = String(payload.turn_id || "");
       if (!turnId) return;
       if (existingState && payload.stopping) {
         existingState._stoppingTurnId = turnId;
@@ -15833,6 +15872,37 @@ function portal() {
         if (!r.ok) return;
         const d = await r.json();
         if (this.tabState[sid] !== st) return;
+        const probedTurnId = String(d.turn_id || "");
+        if (d.active && !d.background && probedTurnId
+            && probedTurnId === String(st._lastTerminalTurnId || "")) {
+          // A terminal event wins over a stale /active snapshot for the exact
+          // same immutable turn. Keep the completed DOM in place and let the
+          // existing canonical completion sync adopt the persisted suffix.
+          const currentTurnId = String(st.activeTurnId || "");
+          if (currentTurnId && currentTurnId !== probedTurnId) return false;
+          const backgroundPending = Math.max(
+            0,
+            Number(st.backgroundTaskCount) || 0,
+            Number(d.background_tasks_pending) || 0,
+          );
+          const preserveBackground = !!st.backgroundActive
+            || backgroundPending > 0;
+          if (st.streaming || st.es) {
+            this._retireStaleSessionStream(sid, st);
+            if (preserveBackground) {
+              this._setBackgroundTaskActive(
+                sid, true, d.started_at, backgroundPending);
+            }
+          }
+          this._setSessionActivityExpectation(sid, preserveBackground);
+          st._pendingExternalUpdate = true;
+          this._resumePendingCanonicalSync(sid, st);
+          return false;
+        }
+        if (d.active && probedTurnId
+            && probedTurnId !== String(st._lastTerminalTurnId || "")) {
+          st._sessionActivityExpected = null;
+        }
         // A hard refresh reconstructs a rollover child from its own history,
         // not from the in-memory handoff path. Restore the inherited watcher
         // badge/poller from the presentation-only task overlay reported by
@@ -30654,6 +30724,9 @@ function portal() {
         streamState._streamStartController = null;
         streamState._cancelBeforeStream = false;
         const terminalTurnId = streamTurnId || String(streamState.activeTurnId || "");
+        if (authoritativeTerminal && terminalTurnId) {
+          streamState._lastTerminalTurnId = terminalTurnId;
+        }
         if (streamState._stoppingTurnId === terminalTurnId) {
           streamState._stoppingTurnId = "";
         }
