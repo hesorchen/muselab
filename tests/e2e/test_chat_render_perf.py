@@ -133,7 +133,13 @@ def _make_mixed_messages(total: int, prefix: str) -> list[dict]:
     return messages
 
 
-def _route_windowed_session(page: Page, sid: str, messages: list[dict]) -> list[dict]:
+def _route_windowed_session(
+    page: Page,
+    sid: str,
+    messages: list[dict],
+    *,
+    updated_at: float | None = None,
+) -> list[dict]:
     requests: list[dict] = []
 
     def handle(route):
@@ -173,6 +179,7 @@ def _route_windowed_session(page: Page, sid: str, messages: list[dict]) -> list[
                 "has_more": offset > 0,
                 "history_order": "full" if "full" in qs else "normal",
                 "history_generation": "gen-e2e-1",
+                **({"updated_at": updated_at} if updated_at is not None else {}),
             }),
         )
 
@@ -4387,7 +4394,9 @@ def test_desktop_done_reconcile_preserves_live_message_dom_identity(
         "uuid": "done-full-history-assistant",
         "ts": 1_700_019_999,
     }]
-    requests = _route_windowed_session(page, sid, canonical_messages)
+    requests = _route_windowed_session(
+        page, sid, canonical_messages, updated_at=2,
+    )
     page.route(
         "**/api/chat/stream/start",
         lambda route: route.fulfill(
@@ -4402,6 +4411,10 @@ def test_desktop_done_reconcile_preserves_live_message_dom_identity(
         """
         const sid = arg.sid;
         app.refreshSessions = async () => {};
+        // done uses the quiet list path directly now. Keep this synthetic
+        // session resident so the test observes canonical message morphing,
+        // not an unrelated real session-list pull removing its fake sid.
+        app._pullSessionList = async () => false;
         app._fetchTabUsage = async () => {};
         app._checkActiveTurn = () => {};
         app._scheduleIdlePreload = () => {};
@@ -4523,7 +4536,18 @@ def test_desktop_done_reconcile_preserves_live_message_dom_identity(
             ...app.sessions[0], id: sid, updated_at: 2, active: false,
           }]);
           const frames = [];
-          for (let i = 0; i < 12; i++) {
+          const canonicalSyncBusy = () => {
+            const sync = st.sessionSync || {};
+            const reasons = new Set(["completed_turn", "history_revision"]);
+            return reasons.has(sync.inFlight?.reason)
+              || Object.keys(sync.pending || {}).some(reason => reasons.has(reason));
+          };
+          // Reconciliation is owned by sessionSync now. The old
+          // `_reconcilePromise` field no longer exists, so checking it made
+          // this test race the coordinator on fast runners and assert against
+          // the earlier tail-only completion probe. Observe every frame while
+          // the real coordinator drains instead.
+          for (let i = 0; i < 240; i++) {
             await new Promise(resolve => requestAnimationFrame(resolve));
             const pane = document.querySelector(
               `.msg-pane[data-tid="${CSS.escape(sid)}"]`);
@@ -4533,9 +4557,10 @@ def test_desktop_done_reconcile_preserves_live_message_dom_identity(
               visible: !!pane && pane.textContent.includes(text.trim()),
               count: pane ? pane.querySelectorAll(".msg").length : 0,
             });
-            if (!st._reconcilePromise && i >= 2) break;
+            const canonicalReady = st.messages.some(
+              message => message?.uuid === "done-canonical-assistant");
+            if (canonicalReady && !canonicalSyncBusy() && i >= 2) break;
           }
-          if (st._reconcilePromise) await st._reconcilePromise;
           await new Promise(resolve => app.$nextTick(() => requestAnimationFrame(resolve)));
           const last = st.messages[st.messages.length - 1];
           const nodes = document.querySelectorAll(".msg-pane .msg.assistant");
