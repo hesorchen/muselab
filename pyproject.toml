@@ -58,7 +58,7 @@ dependencies = [
     # Live file-tree refresh for Agent / terminal / external-editor changes.
     # One on-demand watcher per subscribed workspace feeds the durable SQLite
     # index; offline reconciliation runs when that workspace is reactivated.
-    "watchfiles>=1.1.1",
+    "watchfiles>=1.2.0",
     # xlsx preview — read-only, used by /api/files/xlsx. Pure-Python, no
     # native deps; safe to ship in the muselab Docker image.
     "openpyxl>=3.1.5",
