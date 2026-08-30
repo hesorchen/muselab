@@ -1139,6 +1139,85 @@ def test_custom_groups_show_empty_sections_and_move_sessions(
     assert any(call["path"] == "/api/activity/groups" for call in calls)
 
 
+def test_group_board_pins_ungrouped_to_third_desktop_column(
+        page: Page, backend_url, auth_token):
+    page.set_viewport_size({"width": 1440, "height": 900})
+    _login(page, backend_url, auth_token)
+    page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          app._stopActivityEvents();
+          await Promise.allSettled(Object.values(app._activityFetchPromises || {}));
+          app.lang = 'zh';
+          app.activity.viewLoaded = true;
+          app.activity.view = 'groups';
+          app.activity.loading = false;
+          app.activity.events = [];
+          app.activity.customGroups = [
+            {id: 'research', name: 'Research', color: 'violet'},
+            {id: 'delivery', name: 'Delivery', color: 'green'},
+            {id: 'planning', name: 'Planning', color: 'cyan'},
+            {id: 'review', name: 'Review', color: 'amber'},
+          ];
+          app.activity.groupOrder = [
+            'research', 'delivery', 'planning', 'review', '__ungrouped__',
+          ];
+          app.activity.show = true;
+          await new Promise(resolve => app.$nextTick(resolve));
+        }"""
+    )
+
+    expect(page.locator(".activity-group.is-custom")).to_have_count(5)
+    desktop = page.evaluate(
+        """() => {
+          const body = document.querySelector('.activity-body.is-group-board');
+          const lanes = Array.from(body.querySelectorAll('.activity-group.is-custom'));
+          return {
+            columns: getComputedStyle(body).gridTemplateColumns.split(' ').length,
+            lanes: lanes.map(lane => {
+              const rect = lane.getBoundingClientRect();
+              return {
+                name: lane.querySelector('.activity-custom-group-head > strong')?.textContent,
+                left: Math.round(rect.left), top: Math.round(rect.top),
+                height: Math.round(rect.height),
+              };
+            }),
+          };
+        }"""
+    )
+    assert desktop["columns"] == 3
+    by_name = {lane["name"]: lane for lane in desktop["lanes"]}
+    assert by_name["Research"]["left"] == by_name["Planning"]["left"]
+    assert by_name["Delivery"]["left"] == by_name["Review"]["left"]
+    assert by_name["Research"]["left"] < by_name["Delivery"]["left"]
+    assert by_name["Delivery"]["left"] < by_name["未分组"]["left"]
+    assert by_name["Research"]["top"] == by_name["Delivery"]["top"]
+    assert by_name["Planning"]["top"] == by_name["Review"]["top"]
+    assert by_name["Planning"]["top"] > by_name["Research"]["top"]
+    assert by_name["未分组"]["top"] == by_name["Research"]["top"]
+    assert by_name["未分组"]["height"] > by_name["Research"]["height"] * 1.9
+
+    page.set_viewport_size({"width": 390, "height": 844})
+    page.wait_for_timeout(100)
+    mobile = page.evaluate(
+        """() => {
+          const body = document.querySelector('.activity-body.is-group-board');
+          const lanes = Array.from(body.querySelectorAll('.activity-group.is-custom'));
+          return {
+            display: getComputedStyle(body).display,
+            rects: lanes.map(lane => {
+              const rect = lane.getBoundingClientRect();
+              return {left: Math.round(rect.left), top: Math.round(rect.top)};
+            }),
+          };
+        }"""
+    )
+    assert mobile["display"] != "grid"
+    assert len({rect["left"] for rect in mobile["rects"]}) == 1
+    assert [rect["top"] for rect in mobile["rects"]] == sorted(
+        rect["top"] for rect in mobile["rects"])
+
+
 def test_mobile_move_menu_is_bottom_sheet_and_cleans_up_lifecycle(
     page: Page, backend_url, auth_token,
 ):

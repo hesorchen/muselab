@@ -2899,7 +2899,102 @@ async def test_watcher_shutdown_partial_never_projects_completed_bubble(
         chat_mod._delete_cancelled_turn_snapshots(child_sid)
 
 
-def test_usage_transcript_hydration_does_not_block_event_loop(
+def test_usage_reads_valid_sidecar_summary_without_scanning_transcript(
+        stream_env, monkeypatch):
+    sid = "12345678-usage-summary"
+    stream_env._session_usage.pop(sid, None)
+    durable = {
+        "input_tokens": 40,
+        "output_tokens": 5,
+        "context_used": 40,
+        "context_limit": 200_000,
+    }
+    source = {"dev": 1, "inode": 2, "size": 20, "mtime_ns": 10}
+    monkeypatch.setattr(
+        stream_env, "_find_session_jsonl", lambda _sid: object())
+    monkeypatch.setattr(
+        stream_env, "_usage_source_signature", lambda _path: source)
+    monkeypatch.setattr(
+        stream_env.sess,
+        "get_session_usage_summary",
+        lambda _sid: {
+            "schema": 1,
+            "source": source,
+            "update": {"turn_id": "turn-usage", "at": 1.0},
+            "normalized": durable,
+        },
+    )
+    monkeypatch.setattr(
+        stream_env,
+        "_session_usage_from_jsonl",
+        lambda _sid: pytest.fail("valid summary must not scan JSONL"),
+    )
+
+    async def no_capability(_model):
+        return {}
+
+    monkeypatch.setattr(
+        stream_env, "_detect_gateway_context_capability", no_capability)
+    result = asyncio.run(stream_env.session_usage(sid))
+    assert result["input_tokens"] == 40
+    assert result["context_used"] == 40
+    assert stream_env._session_usage_turns[sid] == "turn-usage"
+    stream_env._session_usage.pop(sid, None)
+    stream_env._session_usage_turns.pop(sid, None)
+
+
+def test_usage_summary_requires_full_transcript_identity(stream_env, monkeypatch):
+    sid = "12345678-usage-identity"
+    source = {"dev": 1, "inode": 2, "size": 20, "mtime_ns": 10}
+    monkeypatch.setattr(stream_env, "_find_session_jsonl", lambda _sid: object())
+    monkeypatch.setattr(
+        stream_env, "_usage_source_signature", lambda _path: source)
+    monkeypatch.setattr(
+        stream_env.sess,
+        "get_session_usage_summary",
+        lambda _sid: {
+            "schema": 1,
+            "source": {**source, "inode": 999},
+            "update": {"turn_id": "old-turn", "at": 1.0},
+            "normalized": {"input_tokens": 40},
+        },
+    )
+    assert stream_env._load_session_usage_summary(sid) is None
+
+
+def test_late_usage_refinement_cannot_overwrite_successor(stream_env):
+    sid = "12345678-usage-refine"
+    stream_env._session_usage[sid] = {"context_used": 20}
+    stream_env._session_usage_turns[sid] = "turn-2"
+    try:
+        assert stream_env._refine_session_usage_for_turn(
+            sid, "turn-1", {"context_used": 10}) is False
+        assert stream_env._session_usage[sid] == {"context_used": 20}
+        assert stream_env._refine_session_usage_for_turn(
+            sid, "turn-2", {"context_used": 25}) is True
+        assert stream_env._session_usage[sid] == {"context_used": 25}
+    finally:
+        stream_env._session_usage.pop(sid, None)
+        stream_env._session_usage_turns.pop(sid, None)
+
+
+def test_usage_summary_repair_is_best_effort(stream_env, monkeypatch):
+    source = {"dev": 1, "inode": 2, "size": 20, "mtime_ns": 10}
+    monkeypatch.setattr(
+        stream_env.sess,
+        "set_session_usage_summary",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("corrupt sidecar")),
+    )
+    assert stream_env._persist_session_usage_summary(
+        "12345678-usage-corrupt",
+        {"input_tokens": 1},
+        turn_id="turn-1",
+        source=source,
+    ) is False
+
+
+def test_usage_transcript_repair_does_not_block_event_loop(
     stream_env, monkeypatch,
 ):
     import time
@@ -6375,6 +6470,7 @@ def test_watcher_without_a_task_pin_is_not_user_visible_active(stream_env):
         chat_mod._task_watchers[sid] = LiveWatcher()
         assert chat_mod.session_active_status(sid) == {
             "active": False,
+            "stopping": False,
             "background_tasks_pending": 0,
             "runtime_background_tasks_pending": 0,
             "runtime_continuation_pending": False,
@@ -7304,8 +7400,11 @@ async def test_queue_bind_failure_uses_shared_startup_abort(
     sid = "queue-bind-failure"
     releases = []
 
-    async def persisted(*_args, **_kwargs):
-        return True
+    async def persisted(_site, _sid, func, *args, **kwargs):
+        kwargs.pop("file_path", None)
+        kwargs.pop("file_size", None)
+        kwargs.pop("owned", None)
+        return func(*args, **kwargs)
 
     monkeypatch.setattr(chat.obs, "to_thread_io", persisted)
     monkeypatch.setattr(chat.sess, "bind_queue_turn", lambda *_args: True)

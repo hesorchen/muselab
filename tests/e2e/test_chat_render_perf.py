@@ -36,7 +36,7 @@ def _login(page: Page, base: str, token: str) -> None:
     page.wait_for_function(
         """() => {
           const app = document.querySelector("#app")?._x_dataStack?.[0];
-          return app && app.authed === true && app.appReady
+          return app && app.authed === true && app.appReady && app._modelsLoaded
             && app._sessionsInitialized && app.currentId
             && app.openTabIds.includes(app.currentId) && app.sessions.length > 0;
         }"""
@@ -71,7 +71,8 @@ def _app_eval(page: Page, body: str, arg=None):
     return page.evaluate(
         """([body, arg]) => {
             const app = document.querySelector("#app")._x_dataStack[0];
-            return (new Function("app", "arg", body))(app, arg);
+            const AsyncFunction = Object.getPrototypeOf(async function() {}).constructor;
+            return (new AsyncFunction("app", "arg", body))(app, arg);
         }""",
         [body, arg],
     )
@@ -151,6 +152,7 @@ def _route_windowed_session(page: Page, sid: str, messages: list[dict]) -> list[
             window = messages[offset:offset + limit]
         requests.append({
             "url": url,
+            "full": "full" in qs,
             "tail": int(qs["tail"][0]) if "tail" in qs else None,
             "offset": offset,
             "limit": int(qs["limit"][0]) if "limit" in qs else None,
@@ -169,6 +171,7 @@ def _route_windowed_session(page: Page, sid: str, messages: list[dict]) -> list[
                 "offset": offset,
                 "total": total,
                 "has_more": offset > 0,
+                "history_order": "full" if "full" in qs else "normal",
                 "history_generation": "gen-e2e-1",
             }),
         )
@@ -182,6 +185,15 @@ def _install_fake_event_source(page: Page) -> None:
         """
         (() => {
           const streams = [];
+          const originalFetch = window.fetch.bind(window);
+          window.fetch = (url, init) => {
+            if (String(url).includes("/api/chat/stream/mux/start")) {
+              return Promise.resolve(new Response("{}", {
+                status: 404, headers: {"Content-Type": "application/json"},
+              }));
+            }
+            return originalFetch(url, init);
+          };
           class FakeEventSource extends EventTarget {
             constructor(url) {
               super();
@@ -201,13 +213,59 @@ def _install_fake_event_source(page: Page) -> None:
           window.__fakeChatStreams = () => streams.filter(
             es => String(es.url || "").includes("/api/chat/stream?")
           );
-          window.__emitSse = (type, payload) => {
-            const chatStreams = window.__fakeChatStreams();
-            const es = chatStreams[chatStreams.length - 1];
-            if (!es) throw new Error("no fake chat EventSource");
+          window.__emitSseAt = (index, type, payload) => {
+            const es = window.__fakeChatStreams()[index];
+            if (!es) throw new Error("no fake chat EventSource at index " + index);
             es.dispatchEvent(new MessageEvent(type, {
               data: typeof payload === "string" ? payload : JSON.stringify(payload || {}),
             }));
+          };
+          window.__emitSse = (type, payload) => {
+            const chatStreams = window.__fakeChatStreams();
+            window.__emitSseAt(chatStreams.length - 1, type, payload);
+          };
+        })();
+        """
+    )
+
+
+def _install_fake_mux_event_source(page: Page) -> None:
+    page.add_init_script(
+        """
+        (() => {
+          const streams = [];
+          class FakeEventSource extends EventTarget {
+            constructor(url) {
+              super();
+              this.url = url;
+              this.readyState = 0;
+              streams.push(this);
+              setTimeout(() => {
+                if (this.readyState === 2) return;
+                this.readyState = 1;
+                if (this.onopen) this.onopen(new Event("open"));
+                this.dispatchEvent(new Event("open"));
+              }, 0);
+            }
+            close() { this.readyState = 2; this.closed = true; }
+          }
+          window.EventSource = FakeEventSource;
+          window.__fakeMuxStreams = () => streams.filter(
+            es => String(es.url || "").includes("/api/chat/stream/mux?")
+          );
+          window.__emitMux = (type, payload, index = -1) => {
+            const mux = window.__fakeMuxStreams();
+            const es = mux[index < 0 ? mux.length - 1 : index];
+            if (!es) throw new Error("no fake mux EventSource");
+            es.dispatchEvent(new MessageEvent(type, {
+              data: typeof payload === "string" ? payload : JSON.stringify(payload || {}),
+            }));
+          };
+          window.__disconnectMux = () => {
+            const mux = window.__fakeMuxStreams();
+            const es = mux[mux.length - 1];
+            if (!es) throw new Error("no fake mux EventSource");
+            es.dispatchEvent(new Event("error"));
           };
         })();
         """
@@ -229,6 +287,325 @@ def _visible_pane_with_text_snapshot(page: Page, text: str):
         }""",
         text,
     )
+
+
+def test_mux_routes_two_sessions_reconnects_with_checkpoints_and_defers_watcher_runtime(
+    page: Page, backend_url, auth_token,
+):
+    errors = _capture_browser_errors(page)
+    _install_fake_mux_event_source(page)
+    mux_starts: list[dict] = []
+    turn_starts: list[dict] = []
+
+    def handle_mux_start(route) -> None:
+        mux_starts.append(route.request.post_data_json)
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({"ticket": f"mux-{len(mux_starts)}"}),
+        )
+
+    def handle_turn_start(route) -> None:
+        turn_starts.append(route.request.post_data_json)
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({
+                "accepted": True,
+                "session_id": route.request.post_data_json["session_id"],
+                "turn_id": "turn-local",
+                "started_at": int(time.time()),
+            }),
+        )
+
+    page.route("**/api/chat/stream/mux/start", handle_mux_start)
+    page.route("**/api/chat/turns/start", handle_turn_start)
+    _login(page, backend_url, auth_token)
+    page.wait_for_function("window.__fakeMuxStreams().length === 1")
+
+    watcher_sid = "mux-watcher-session"
+    initial = page.evaluate(
+        """async watcherSid => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const localSid = app.currentId;
+          app._confirmSessionBusy = async () => false;
+          app._awaitRuntimeSettingPatches = async () => true;
+          app.availableModels = [{
+            model: 'mux-e2e-model', label: 'Mux E2E', group: 'e2e',
+            supports_thinking: true,
+          }];
+          app.model = 'mux-e2e-model';
+          app.permission = 'default';
+          app.sessions = app.sessions.map(session => session.id === localSid
+            ? {...session, model: 'mux-e2e-model', permission: 'default'} : session);
+          app._ensureTabState(localSid).permission = 'default';
+          app.sessions.push({
+            id: watcherSid, name: 'Watcher session', model: 'mux-e2e-model',
+            permission: 'default', cwd: app.currentWorkspacePath(), active: true,
+          });
+          window.__emitMux('session_state', {
+            session_id: watcherSid, active: true, attachable: false,
+            background: true, continuation: false, turn_id: 'watcher-gap',
+            started_at: Math.floor(Date.now() / 1000),
+            background_tasks_pending: 1,
+          });
+          await new Promise(resolve => setTimeout(resolve, 30));
+          const watcherCreatedDuringGap = !!app.tabState[watcherSid];
+          const watcher = app._ensureTabState(watcherSid);
+          watcher._loaded = true;
+          if (!app.openTabIds.includes(watcherSid)) app.openTabIds.push(watcherSid);
+          window.__emitMux('session_state', {
+            session_id: watcherSid, active: true, attachable: true,
+            background: false, continuation: true, turn_id: 'turn-watcher',
+            parent_turn_id: 'watcher-gap', started_at: Math.floor(Date.now() / 1000),
+          });
+          for (let i = 0; i < 100 && !watcher.es; i++) {
+            await new Promise(resolve => setTimeout(resolve, 10));
+          }
+          const local = app._ensureTabState(localSid);
+          local.draft.input = 'MUX_LOCAL_PROMPT';
+          app._activateComposerState(localSid);
+          await app.send();
+          return {
+            localSid,
+            watcherCreatedDuringGap,
+            watcherAttached: !!watcher.es,
+            nativeStreamCount: window.__fakeMuxStreams().length,
+          };
+        }""",
+        watcher_sid,
+    )
+    assert initial == {
+        "localSid": initial["localSid"],
+        "watcherCreatedDuringGap": False,
+        "watcherAttached": True,
+        "nativeStreamCount": 1,
+    }
+
+    page.evaluate(
+        """({localSid, watcherSid}) => {
+          window.__emitMux('text', {
+            session_id: localSid, turn_id: 'turn-local', event_seq: 1,
+            text: 'MUX_LOCAL_REPLY',
+          });
+          window.__emitMux('text', {
+            session_id: watcherSid, turn_id: 'turn-watcher', event_seq: 1,
+            text: 'MUX_BACKGROUND_REPLY',
+          });
+        }""",
+        {"localSid": initial["localSid"], "watcherSid": watcher_sid},
+    )
+    page.wait_for_function(
+        """sid => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          return app.tabState[sid]?.lastEventSeq === 1;
+        }""",
+        arg=initial["localSid"],
+    )
+    page.evaluate(
+        """async sid => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          await app.activateTab(sid);
+        }""",
+        watcher_sid,
+    )
+    page.wait_for_function(
+        """sid => document.querySelector('#app')._x_dataStack[0]
+          .tabState[sid].messages.some(m => m.text === 'MUX_BACKGROUND_REPLY')""",
+        arg=watcher_sid,
+    )
+
+    page.evaluate("window.__disconnectMux()")
+    page.wait_for_function("window.__fakeMuxStreams().length === 2", timeout=5000)
+    state = page.evaluate(
+        """({localSid, watcherSid}) => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          return {
+            localStreaming: app.tabState[localSid].streaming,
+            watcherStreaming: app.tabState[watcherSid].streaming,
+            localSeq: app.tabState[localSid].lastEventSeq,
+            watcherSeq: app.tabState[watcherSid].lastEventSeq,
+            nativeStreamCount: window.__fakeMuxStreams().length,
+          };
+        }""",
+        {"localSid": initial["localSid"], "watcherSid": watcher_sid},
+    )
+    assert state == {
+        "localStreaming": True,
+        "watcherStreaming": True,
+        "localSeq": 1,
+        "watcherSeq": 1,
+        "nativeStreamCount": 2,
+    }
+    assert len(turn_starts) == 1
+    assert turn_starts[0] == {
+        "prompt": "MUX_LOCAL_PROMPT",
+        "session_id": initial["localSid"],
+        "model": "mux-e2e-model",
+        "permission": "default",
+        "image_ids": "",
+        "mobile": False,
+    }
+    assert len(mux_starts) == 2
+    checkpoints = {
+        (row["session_id"], row["turn_id"]): row["last_event_seq"]
+        for row in mux_starts[1]["checkpoints"]
+    }
+    assert checkpoints[(initial["localSid"], "turn-local")] == 1
+    assert checkpoints[(watcher_sid, "turn-watcher")] == 1
+    _assert_no_browser_errors(page, errors)
+
+
+def test_mux_inactive_retires_matching_turn_without_harming_successor(
+    page: Page, backend_url, auth_token,
+):
+    errors = _capture_browser_errors(page)
+    _install_fake_mux_event_source(page)
+    page.route(
+        "**/api/chat/stream/mux/start",
+        lambda route: route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({"ticket": "mux-inactive-settlement"}),
+        ),
+    )
+    _login(page, backend_url, auth_token)
+    page.wait_for_function("window.__fakeMuxStreams().length === 1")
+
+    result = page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const sid = app.currentId;
+          const st = app._ensureTabState(sid);
+          const meta = app.sessions.find(session => session.id === sid);
+          const originalReload = app._scheduleCanonicalStreamReload;
+          let reloads = 0;
+          app._scheduleCanonicalStreamReload = () => { reloads += 1; return true; };
+          try {
+            st._loaded = true;
+            st.messages = [{ role: 'assistant', text: 'VISIBLE_COMPLETED_REPLY' }];
+            st.streaming = true;
+            st.streamPhase = 'runtime';
+            st.activeTurnId = 'turn-a';
+            st._stoppingTurnId = 'turn-a';
+            st.es = app._chatMuxChannel(sid, 'turn-a');
+            app._activateChatMuxChannel(st.es);
+            st._streamStartedAt = Date.now() - 5000;
+            st.streamElapsed = 5;
+            st._streamTimer = setInterval(() => {}, 1000);
+            st._stallWatch = setInterval(() => {}, 1000);
+            if (meta) meta.active = true;
+
+            window.__emitMux('session_state', {
+              session_id: sid, turn_id: 'turn-a', active: false,
+              stopping: false, attachable: false,
+            });
+            await new Promise(resolve => setTimeout(resolve, 30));
+            const matching = {
+              streaming: st.streaming,
+              phase: st.streamPhase,
+              es: st.es,
+              timer: st._streamTimer,
+              stall: st._stallWatch,
+              stoppingTurn: st._stoppingTurnId,
+              elapsed: st.streamElapsed,
+              reloads,
+              text: st.messages[0] && st.messages[0].text,
+              metaActive: meta && meta.active,
+            };
+
+            st.streaming = true;
+            st.streamPhase = 'runtime';
+            st.activeTurnId = 'turn-b';
+            st._stoppingTurnId = '';
+            st.es = app._chatMuxChannel(sid, 'turn-b');
+            app._activateChatMuxChannel(st.es);
+            st._streamTimer = setInterval(() => {}, 1000);
+            st._stallWatch = setInterval(() => {}, 1000);
+            if (meta) meta.active = true;
+            const successorEs = st.es;
+            const successorTimer = st._streamTimer;
+
+            window.__emitMux('session_state', {
+              session_id: sid, turn_id: 'turn-a', active: false,
+              stopping: false, attachable: false,
+            });
+            await new Promise(resolve => setTimeout(resolve, 30));
+            const successor = {
+              streaming: st.streaming,
+              phase: st.streamPhase,
+              sameEs: st.es === successorEs,
+              sameTimer: st._streamTimer === successorTimer,
+              activeTurnId: st.activeTurnId,
+              reloads,
+              metaActive: meta && meta.active,
+            };
+            clearInterval(st._streamTimer);
+            clearInterval(st._stallWatch);
+            if (st.es) st.es.close();
+            return { matching, successor };
+          } finally {
+            app._scheduleCanonicalStreamReload = originalReload;
+          }
+        }"""
+    )
+    assert result["matching"] == {
+        "streaming": False,
+        "phase": "",
+        "es": None,
+        "timer": None,
+        "stall": None,
+        "stoppingTurn": "",
+        "elapsed": 0,
+        "reloads": 1,
+        "text": "VISIBLE_COMPLETED_REPLY",
+        "metaActive": False,
+    }
+    assert result["successor"] == {
+        "streaming": True,
+        "phase": "runtime",
+        "sameEs": True,
+        "sameTimer": True,
+        "activeTurnId": "turn-b",
+        "reloads": 1,
+        "metaActive": True,
+    }
+    _assert_no_browser_errors(page, errors)
+
+
+def test_mux_coordinator_connects_before_background_history_warmup(
+    page: Page, backend_url, auth_token,
+):
+    """The root live transport owns events before background history starts."""
+    _login(page, backend_url, auth_token)
+    order = page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          if (app._chatMuxStartPromise) {
+            try { await app._chatMuxStartPromise; } catch (_) {}
+          }
+          app._setChatMuxUnsupported();
+          const originalEnsure = app._ensureChatMux;
+          const originalHistory = app._bootstrapChatMuxHistory;
+          const order = [];
+          app._chatMuxSupported = true;
+          app._ensureChatMux = async () => {
+            order.push('mux:start');
+            await Promise.resolve();
+            order.push('mux:connected');
+            return true;
+          };
+          app._bootstrapChatMuxHistory = async () => order.push('history:start');
+          try {
+            await app._startChatMuxCoordinator();
+            return order;
+          } finally {
+            app._ensureChatMux = originalEnsure;
+            app._bootstrapChatMuxHistory = originalHistory;
+          }
+        }"""
+    )
+    assert order == ["mux:start", "mux:connected", "history:start"]
 
 
 def test_deferred_history_bodies_load_without_manual_body_action(
@@ -474,6 +851,7 @@ def _bootstrap_session_for_real_load(page: Page, sid: str, name: str) -> None:
           model: "e2e-model", label: "E2E model", group: "e2e",
           supports_thinking: true,
         }];
+        app._modelsLoaded = true;
         app.sessions = [{ id: arg.sid, name: arg.name, updated_at: Date.now() / 1000,
           model: "e2e-model", permission: "bypassPermissions", thinking: true }];
         app.openTabIds = [arg.sid];
@@ -2505,7 +2883,7 @@ def test_mobile_long_history_switching_does_not_blank(page: Page, backend_url, a
 def test_desktop_session_switch_keeps_bounded_warm_panes_and_composer_stable(
     page: Page, backend_url: str, auth_token: str,
 ):
-    """Desktop keeps a bounded warm-pane cache without footer/layout jumps."""
+    """Desktop bounds warm panes even when every inactive session is streaming."""
     errors = _capture_browser_errors(page)
     page.set_viewport_size({"width": 1440, "height": 900})
     _login(page, backend_url, auth_token)
@@ -2543,6 +2921,7 @@ def test_desktop_session_switch_keeps_bounded_warm_panes_and_composer_stable(
           st.messagesReady = true;
           st.messagesLoading = false;
           st.atBottom = true;
+          st.streaming = true;
           app.tabState[id] = st;
           app._ensureTabState(id);
         }
@@ -2754,7 +3133,7 @@ def test_cold_session_switch_shields_every_frame_until_transcript_paints(
     _assert_no_browser_errors(page, errors)
 
 
-def test_mobile_transcript_loader_uses_centered_muse_brand(
+def test_mobile_transcript_loader_reuses_workspace_switch_status(
     page: Page, backend_url: str, auth_token: str,
 ):
     errors = _capture_browser_errors(page)
@@ -2778,9 +3157,9 @@ def test_mobile_transcript_loader_uses_centered_muse_brand(
           await new Promise(resolve => requestAnimationFrame(
             () => requestAnimationFrame(resolve)));
           const overlay = document.querySelector('.chat-transcript-loading-overlay');
-          const loader = overlay.querySelector('.chat-muse-loader');
-          const emblem = overlay.querySelector('.chat-muse-loader-emblem');
-          const copy = overlay.querySelector('.chat-muse-loader-copy strong');
+          const loader = overlay.querySelector('.chat-transcript-loading-status');
+          const spinner = loader.querySelector('.spinner-sm');
+          const copy = loader.querySelector('span:last-child');
           const overlayRect = overlay.getBoundingClientRect();
           const loaderRect = loader.getBoundingClientRect();
           const result = {
@@ -2792,13 +3171,15 @@ def test_mobile_transcript_loader_uses_centered_muse_brand(
               loaderRect.top + loaderRect.height / 2
               - (overlayRect.top + overlayRect.height / 2)),
             noOverflow: overlay.scrollWidth <= overlay.clientWidth,
-            emblemVisible: emblem.getClientRects().length > 0,
+            spinnerVisible: spinner.getClientRects().length > 0,
+            reusesWorkspaceStatus: loader.classList.contains('workspace-switch-status'),
             copy: copy.textContent.trim(),
             expectedCopy: app.t('chat.loading_session'),
             skeletonCount: overlay.querySelectorAll('.chat-skeleton').length,
             srOnlyCount: overlay.querySelectorAll('.sr-only').length,
-            mascotHref: overlay.querySelector('.muse-mascot use')
-              ?.getAttribute('href') || '',
+            heavyLoaderCount: overlay.querySelectorAll(
+              '.chat-muse-loader, .chat-muse-loader-emblem, .chat-muse-loader-dots'
+            ).length,
           };
           st.transcriptLoadPhase = 'idle';
           return result;
@@ -2808,11 +3189,12 @@ def test_mobile_transcript_loader_uses_centered_muse_brand(
     assert geometry["centerDeltaX"] < 2
     assert geometry["centerDeltaY"] < 2
     assert geometry["noOverflow"] is True
-    assert geometry["emblemVisible"] is True
+    assert geometry["spinnerVisible"] is True
+    assert geometry["reusesWorkspaceStatus"] is True
     assert geometry["copy"] == geometry["expectedCopy"]
     assert geometry["skeletonCount"] == 0
     assert geometry["srOnlyCount"] == 0
-    assert geometry["mascotHref"].startswith("#m-")
+    assert geometry["heavyLoaderCount"] == 0
     expect(page.locator(".chat-transcript-loading-overlay")).to_be_hidden()
     _assert_no_browser_errors(page, errors)
 
@@ -3994,8 +4376,14 @@ def test_desktop_done_reconcile_preserves_live_message_dom_identity(
     _install_fake_event_source(page)
     sid = "perf-done-canonical-identity"
     prompt = "DOM_IDENTITY_USER_PROMPT"
+    history_marker = "FULL_ORDER_HISTORY_SURVIVES_LRU_REMOUNT"
     final_text = "DOM_IDENTITY_FINAL_REPLY " + ("stable canonical text " * 40)
-    canonical_messages: list[dict] = []
+    canonical_messages: list[dict] = [{
+        "role": "assistant",
+        "text": history_marker,
+        "uuid": "done-full-history-assistant",
+        "ts": 1_700_019_999,
+    }]
     requests = _route_windowed_session(page, sid, canonical_messages)
     page.route(
         "**/api/chat/stream/start",
@@ -4033,6 +4421,16 @@ def test_desktop_done_reconcile_preserves_live_message_dom_identity(
         const st = app._ensureTabState(sid);
         st._loaded = true;
         st._seenUpdated = 1;
+        st.messages.push({
+          role: "assistant", text: arg.historyMarker,
+          html: `<p>${arg.historyMarker}</p>`,
+          uuid: "done-full-history-assistant",
+          _k: `${sid}:uuid:done-full-history-assistant`, _noAnim: true,
+        });
+        Object.assign(st.messageRange, {
+          visibleStart: 0, visibleEnd: 1, offset: 0, total: 1,
+          preTotal: 0, order: "full", generation: "gen-e2e-1",
+        });
         app.currentId = sid;
         app._activateTabState(sid);
         app._ensureTabState(app.currentId).messagesReady = true;
@@ -4042,7 +4440,7 @@ def test_desktop_done_reconcile_preserves_live_message_dom_identity(
         app._ensureTabState(app.currentId).atBottom = true;
         return true;
         """,
-        {"sid": sid, "prompt": prompt},
+        {"sid": sid, "prompt": prompt, "historyMarker": history_marker},
     )
 
     _app_eval(page, "app.send(); return true;")
@@ -4099,6 +4497,7 @@ def test_desktop_done_reconcile_preserves_live_message_dom_identity(
     page.evaluate(
         """() => window.__emitSse("done", {
           total_cost_usd: 0.001,
+          memory_recall: { count: 2, query: "private-query" },
           session_usage: { context_used_pct: 5, context_used: 500, context_limit: 100000 },
           turn_id: "done-reconcile-turn", event_seq: 2,
         })"""
@@ -4145,19 +4544,82 @@ def test_desktop_done_reconcile_preserves_live_message_dom_identity(
             key: last._k,
             uuid: last.uuid || "",
             text: last.text || "",
+            cost: last.cost || "",
+            memoryCount: Number(last.memoryRecall?.count) || 0,
+            historyOrder: st.messageRange.order,
           };
         }""",
         {"sid": sid, "text": final_text},
     )
 
     assert requests, "canonical reconciliation did not request session history"
+    assert any(req["full"] and req["tail"] for req in requests), requests
     assert result["sameNode"] is True, result
     assert result["key"] == result["oldKey"]
     assert result["uuid"] == "done-canonical-assistant"
     assert result["text"] == final_text
+    assert result["cost"] == "$0.0010"
+    assert result["memoryCount"] == 2
+    assert result["historyOrder"] == "full"
     assert result["frames"]
     assert all(frame["ready"] and not frame["loading"] for frame in result["frames"]), result
     assert all(frame["visible"] and frame["count"] > 0 for frame in result["frames"]), result
+
+    remount = _app_eval(
+        page,
+        """
+        const sid = arg.sid;
+        const dummyIds = ["done-lru-a", "done-lru-b", "done-lru-c"];
+        app.sessions = [app.sessions.find(s => s.id === sid), ...dummyIds.map((id, i) => ({
+          id, name: `LRU ${i}`, updated_at: 10 + i,
+          model: "e2e-model", permission: "bypassPermissions", thinking: true,
+        }))];
+        app.openTabIds = [sid, ...dummyIds];
+        app.currentId = sid;
+        app._touchTranscriptPane(sid);
+        await new Promise(resolve => app.$nextTick(resolve));
+        for (const id of dummyIds) {
+          const st = app._blankTabState();
+          st._loaded = true;
+          st.messagesReady = true;
+          st.messagesLoading = false;
+          st.messages.push({
+            role: "assistant", text: id, html: `<p>${id}</p>`,
+            uuid: `${id}-assistant`, _k: `${id}:uuid:${id}-assistant`, _noAnim: true,
+          });
+          Object.assign(st.messageRange, {
+            visibleStart: 0, visibleEnd: 1, offset: 0, total: 1,
+            preTotal: 0, order: "normal", generation: "gen-e2e-1",
+          });
+          app.tabState[id] = st;
+          app.currentId = id;
+          app._touchTranscriptPane(id);
+          app._activateTabState(id);
+          await new Promise(resolve => app.$nextTick(resolve));
+        }
+        const evicted = !app.warmTranscriptTabIds().includes(sid);
+        app.currentId = sid;
+        app._touchTranscriptPane(sid);
+        app._activateTabState(sid);
+        await new Promise(resolve => app.$nextTick(
+          () => requestAnimationFrame(resolve)));
+        const pane = document.querySelector(
+          `.msg-pane[data-tid="${CSS.escape(sid)}"]`);
+        return {
+          evicted,
+          warmCount: app.warmTranscriptTabIds().length,
+          markerVisible: !!pane && pane.textContent.includes(arg.historyMarker),
+          finalVisible: !!pane && pane.textContent.includes(arg.finalText.trim()),
+          historyOrder: app._ensureTabState(sid).messageRange.order,
+        };
+        """,
+        {"sid": sid, "historyMarker": history_marker, "finalText": final_text},
+    )
+    assert remount["evicted"] is True, remount
+    assert remount["warmCount"] <= 3, remount
+    assert remount["markerVisible"] is True, remount
+    assert remount["finalVisible"] is True, remount
+    assert remount["historyOrder"] == "full"
     _assert_no_browser_errors(page, errors)
 
 
@@ -5576,16 +6038,20 @@ def test_failed_queue_edit_never_duplicates_and_stopping_turn_rejects_send(
             busy: Object.keys(st._queueMutating || {}),
           };
 
-          st._stopping = true;
-          st.streaming = true;
+          st.activeTurnId = 'authoritative-stop-turn';
+          st._stoppingTurnId = st.activeTurnId;
+          st.streaming = false;
           st.draft.input = 'SEND DURING STOP';
           app._activateComposerState(sid);
+          const disabledReason = app.composerDisabledReason(sid);
           const sendResult = await app.send();
           return {
             afterEdit,
+            disabledReason,
             sendResult,
             stoppingDraft: st.draft.input,
             pendingAfterStop: st.pendingQueue.length,
+            composerClaim: st._composerSubmitToken,
           };
         }""",
         sid,
@@ -5598,9 +6064,13 @@ def test_failed_queue_edit_never_duplicates_and_stopping_turn_rejects_send(
         "draft": "",
         "busy": [],
     }
+    assert result["disabledReason"] in {
+        "Stopping the previous turn", "正在中断上一条任务",
+    }
     assert result["sendResult"] is False
     assert result["stoppingDraft"] == "SEND DURING STOP"
     assert result["pendingAfterStop"] == 1
+    assert result["composerClaim"] is None
 
 
 def test_background_task_gap_leaves_composer_usable_without_empty_reconnect(
@@ -6670,6 +7140,201 @@ def test_mobile_composer_footer_is_compact_and_never_overflows(
         _assert_no_browser_errors(page, errors)
     finally:
         context.close()
+
+
+def test_background_stream_buffers_token_rate_presentation_until_activation(
+    page: Page, backend_url: str, auth_token: str,
+):
+    """Inactive SSE streams retain complete state without token-rate paints."""
+    errors = _capture_browser_errors(page)
+    page.set_viewport_size({"width": 1440, "height": 900})
+    _install_fake_event_source(page)
+    page.route(
+        "**/api/chat/stream/start",
+        lambda route: route.fulfill(
+            status=200,
+            content_type="application/json",
+            body='{"ticket":"e2e-ticket"}',
+        ),
+    )
+    _login(page, backend_url, auth_token)
+    ids = ["background-buffer-a", "background-buffer-b"]
+    _app_eval(
+        page,
+        """
+        app.refreshSessions = async () => {};
+        window.__backgroundUsageFetches = [];
+        app._fetchTabUsage = async sid => {
+          window.__backgroundUsageFetches.push(sid);
+        };
+        app._scheduleIdlePreload = () => {};
+        app.availableModels = [{
+          model: "e2e-model", label: "E2E model", group: "e2e",
+          supports_thinking: true,
+        }];
+        app.model = app.defaultModel = "e2e-model";
+        app.sessions = arg.map((id, index) => ({
+          id, name: `Buffered ${index}`, updated_at: Date.now() / 1000,
+          model: "e2e-model", permission: "bypassPermissions", thinking: true,
+        }));
+        app.openTabIds = arg.slice();
+        app.tabState = {};
+        for (const id of arg) {
+          const st = app._blankTabState();
+          st._loaded = true;
+          st.messagesReady = true;
+          st.messagesLoading = false;
+          st.atBottom = true;
+          app.tabState[id] = st;
+        }
+        app.currentId = arg[0];
+        app._activateTabState(arg[0]);
+        app.input = "start stream a";
+        return true;
+        """,
+        ids,
+    )
+    _app_eval(page, "app.send(); return true;")
+    page.wait_for_function("() => window.__fakeChatStreams().length === 1")
+    _app_eval(
+        page,
+        """
+        app.currentId = arg;
+        await app.switchSession();
+        app.input = "start stream b";
+        app.send();
+        return true;
+        """,
+        ids[1],
+    )
+    page.wait_for_function("() => window.__fakeChatStreams().length === 2")
+    page.evaluate("() => { window.__backgroundUsageFetches.length = 0; }")
+
+    page.evaluate(
+        """() => {
+          for (let i = 0; i < 200; i++) {
+            window.__emitSseAt(0, "text", { text: `BG_TEXT_${i} ` });
+          }
+          for (let i = 0; i < 200; i++) {
+            window.__emitSseAt(0, "thinking", { text: `BG_THINK_${i} ` });
+          }
+        }"""
+    )
+    before = _app_eval(
+        page,
+        """
+        const st = app._ensureTabState(arg);
+        const thinking = [...st.messages].reverse().find(m => m.role === "thinking");
+        return {
+          currentId: app.currentId,
+          streaming: st.streaming,
+          thinkingText: thinking ? thinking.text : null,
+          plainPaints: st._streamPlainRenderCount,
+          usageFetches: window.__backgroundUsageFetches.slice(),
+        };
+        """,
+        ids[0],
+    )
+    assert before["currentId"] == ids[1]
+    assert before["streaming"] is True
+    assert before["thinkingText"] == ""
+    assert before["plainPaints"] == 0
+    assert ids[0] not in before["usageFetches"]
+
+    terminal = page.evaluate(
+        """([sid]) => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const originalRender = app._mdRenderUncached.bind(app);
+          window.__backgroundRichCalls = 0;
+          app._mdRenderUncached = (text, opts) => {
+            if ((text || '').includes('BG_FINAL_RICH_MARKER')) {
+              window.__backgroundRichCalls += 1;
+            }
+            return originalRender(text, opts);
+          };
+          const finalText = '**BG_FINAL_RICH_MARKER**\\n\\n'
+            + 'background payload '.repeat(7500);
+          window.__emitSseAt(0, 'text', {text: finalText});
+          const started = performance.now();
+          window.__emitSseAt(0, 'done', {
+            total_cost_usd: 0.001,
+            session_usage: {
+              context_used_pct: 10,
+              context_used: 1000,
+              context_limit: 100000,
+            },
+          });
+          const st = app._ensureTabState(sid);
+          const last = [...st.messages].reverse().find(m =>
+            m.role === 'assistant' && (m.text || '').includes('BG_FINAL_RICH_MARKER'));
+          return {
+            dispatchMs: performance.now() - started,
+            streaming: st.streaming,
+            richCalls: window.__backgroundRichCalls,
+            plain: last?._streamPlain,
+            deferred: last?._deferredRichReady,
+            htmlLength: (last?.html || '').length,
+            textLength: (last?.text || '').length,
+          };
+        }""",
+        arg=[ids[0]],
+    )
+    assert terminal["streaming"] is False
+    assert terminal["richCalls"] == 0
+    assert terminal["plain"] is True
+    assert terminal["deferred"] is True
+    assert terminal["htmlLength"] == 0
+    assert terminal["textLength"] >= 120_000
+    assert terminal["dispatchMs"] < 250
+
+    _app_eval(
+        page,
+        """
+        app.currentId = arg;
+        await app.switchSession();
+        return true;
+        """,
+        ids[0],
+    )
+    page.wait_for_function(
+        """sid => {
+          const app = document.querySelector("#app")._x_dataStack[0];
+          const st = app._ensureTabState(sid);
+          return [...st.messages].reverse().some(m =>
+            m.role === 'assistant'
+            && m.text.includes('BG_FINAL_RICH_MARKER')
+            && m._streamPlain === false
+            && m._deferredRichReady === false
+            && m.html.includes('BG_FINAL_RICH_MARKER'));
+        }""",
+        arg=ids[0],
+    )
+    activation = _app_eval(
+        page,
+        """
+        const st = app._ensureTabState(arg);
+        const thinking = [...st.messages].reverse().find(m => m.role === "thinking");
+        return {
+          currentId: app.currentId,
+          thinkingText: thinking?.text || "",
+          richCalls: window.__backgroundRichCalls,
+        };
+        """,
+        ids[0],
+    )
+    assert activation["currentId"] == ids[0]
+    assert "BG_THINK_199" in activation["thinkingText"]
+    assert activation["richCalls"] == 1
+    assert _app_eval(
+        page,
+        """
+        const st = app._ensureTabState(arg);
+        return st.messages.some(m => m.role === "assistant"
+          && m.text.includes("BG_TEXT_199"));
+        """,
+        ids[0],
+    )
+    _assert_no_browser_errors(page, errors)
 
 
 @pytest.mark.parametrize(

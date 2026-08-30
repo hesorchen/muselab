@@ -554,7 +554,12 @@ def test_hybrid_recall_fuses_channels_and_exposes_trace(tmp_path, monkeypatch):
 
     monkeypatch.setattr(module, "EmbeddingProvider", FakeEmbedding)
     monkeypatch.setattr(module, "vector_store", lambda _config: FakeVector())
-    rows = _run(instance.recall("推荐系统 小流量 验证", "session-x"))
+    async def recall_and_drain_telemetry():
+        rows = await instance.recall("推荐系统 小流量 验证", "session-x")
+        await instance.stop(timeout=1)
+        return rows
+
+    rows = _run(recall_and_drain_telemetry())
     assert rows[0]["id"] == memory["id"]
     assert "dense" in rows[0]["channels"]
     trace = instance.pop_recall_trace("session-x")

@@ -851,49 +851,45 @@ async def test_shutdown_waits_for_pending_subscription_registration(
 
 
 @pytest.mark.asyncio
-async def test_reconcile_budget_caps_threads_without_holding_workspace_lock(
+async def test_reconcile_scans_share_one_worker_without_holding_workspace_lock(
     app_module,
     temp_root,
+    monkeypatch,
 ):
     import backend.file_events as file_events
 
     class CappedStore:
-        def __init__(self):
-            self.lock = threading.Lock()
-            self.four_entered = threading.Event()
-            self.release = threading.Semaphore(0)
-            self.calls = 0
-            self.active = 0
-            self.max_active = 0
-
         def current_cursor(self, _workspace_id):
             return 0
 
-        def reconcile(self, *_args, **_kwargs):
-            with self.lock:
-                self.calls += 1
-                self.active += 1
-                self.max_active = max(self.max_active, self.active)
-                if self.calls >= 4:
-                    self.four_entered.set()
-            assert self.release.acquire(timeout=3)
-            with self.lock:
-                self.active -= 1
-            return 0
-
-        def delta(self, *_args, **_kwargs):
-            return {
-                "cursor": 0,
-                "changes": [],
-                "resync": False,
-                "has_more": False,
-            }
+        def apply_reconcile_snapshot(self, *_args, **_kwargs):
+            return {"cursor": 0, "changes": [], "resync": False}
 
         def close(self):
             return None
 
-    store = CappedStore()
-    manager = file_events.FileWatchManager(store)
+    manager = file_events.FileWatchManager(CappedStore())
+    entered = threading.Event()
+    release = threading.Semaphore(0)
+    lock = threading.Lock()
+    calls = 0
+    active = 0
+    max_active = 0
+
+    def controlled_exchange(_request):
+        nonlocal calls, active, max_active
+        with lock:
+            calls += 1
+            active += 1
+            max_active = max(max_active, active)
+            entered.set()
+        assert release.acquire(timeout=3)
+        with lock:
+            active -= 1
+        return ("ok", [], {}, {})
+
+    monkeypatch.setattr(manager, "_ensure_scan_worker_locked", lambda: None)
+    monkeypatch.setattr(manager, "_exchange_scan_request", controlled_exchange)
     states = [
         file_events._WatchState(
             root=temp_root / f"scan-budget-{index}",
@@ -906,34 +902,70 @@ async def test_reconcile_budget_caps_threads_without_holding_workspace_lock(
         asyncio.create_task(manager._reconcile_and_broadcast(state))
         for state in states
     ]
-    assert await asyncio.to_thread(store.four_entered.wait, 1)
+    assert await asyncio.to_thread(entered.wait, 1)
     await asyncio.sleep(0.02)
-    assert store.calls == 4
-    assert store.max_active == 4
+    assert calls == 1
+    assert max_active == 1
 
     # Waiters do not consume their workspace mutation lock while queued behind
-    # the process-wide scan gate.
+    # the single process exchange.
     await asyncio.wait_for(states[4].mutation_lock.acquire(), timeout=0.2)
     states[4].mutation_lock.release()
-    heartbeat = asyncio.Event()
-    asyncio.get_running_loop().call_soon(heartbeat.set)
-    await asyncio.wait_for(heartbeat.wait(), timeout=0.2)
-
     tasks[5].cancel()
     with pytest.raises(asyncio.CancelledError):
         await tasks[5]
-    store.release.release()
-    for _ in range(100):
-        if store.calls == 5:
-            break
-        await asyncio.sleep(0.01)
-    assert store.calls == 5
-    for _ in range(4):
-        store.release.release()
+    for expected_calls in range(2, 6):
+        release.release()
+        for _ in range(100):
+            if calls == expected_calls:
+                break
+            await asyncio.sleep(0.01)
+        assert calls == expected_calls
+    release.release()
     await asyncio.gather(*tasks[:5])
-    assert store.max_active == 4
+    assert max_active == 1
     assert manager._reconcile_slots._value == 4
     await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_spawned_scanner_is_reused_and_recovers_after_exit(
+    app_module,
+    temp_root,
+):
+    import backend.file_events as file_events
+
+    manager = file_events.FileWatchManager(
+        file_events.WorkspaceStore(temp_root)
+    )
+    state = file_events._WatchState(
+        root=temp_root.resolve(),
+        workspace_id="spawned-scanner",
+    )
+    first_snapshot, _ = await manager._scan_workspace(state)
+    assert first_snapshot
+    assert all(isinstance(row, tuple) for row in first_snapshot)
+    first_process = manager._scan_process
+    assert first_process is not None
+    assert first_process.is_alive()
+    first_pid = first_process.pid
+
+    second_snapshot, _ = await manager._scan_workspace(state)
+    assert manager._scan_process is first_process
+    assert second_snapshot == first_snapshot
+
+    first_process.terminate()
+    await asyncio.to_thread(first_process.join, 1)
+    recovered_snapshot, _ = await manager._scan_workspace(state)
+    recovered_process = manager._scan_process
+    assert recovered_process is not None
+    assert recovered_process.is_alive()
+    assert recovered_process.pid != first_pid
+    assert recovered_snapshot == first_snapshot
+
+    await manager.shutdown()
+    assert manager._scan_process is None
+    assert manager._scan_connection is None
 
 
 @pytest.mark.asyncio
@@ -1242,7 +1274,7 @@ async def test_native_directory_budget_reprices_refreshed_paths(
     assert manager._native_directory_watches == 2
     assert state.native_watch_cost == 2
 
-    manager._request_watch_refresh(state)
+    await manager._request_watch_refresh(state)
     await asyncio.wait_for(second_started.wait(), timeout=1)
     assert awatch_calls == [
         (root, nested),
@@ -1399,6 +1431,7 @@ async def test_failed_generation_reconciles_only_after_retry_is_armed(
     monkeypatch,
 ):
     import backend.file_events as file_events
+    from backend.workspace_store import scan_workspace
     from backend.workspaces import registry
 
     store = file_events.WorkspaceStore(temp_root)
@@ -1409,15 +1442,21 @@ async def test_failed_generation_reconciles_only_after_retry_is_armed(
     second_armed = asyncio.Event()
     generations = 0
     reconciles = 0
-    real_reconcile = store.reconcile
 
-    def guarded_reconcile(*args, **kwargs):
+    async def guarded_scan(state):
         nonlocal reconciles
         reconciles += 1
         # The synchronously failed first `anext` must not set watch_ready or
         # permit a closing scan before the polling/native retry is installed.
         assert second_armed.is_set()
-        return real_reconcile(*args, **kwargs)
+        report = {}
+        snapshot = await asyncio.to_thread(
+            scan_workspace,
+            state.root,
+            report=report,
+            progress=state.scan_progress,
+        )
+        return snapshot, report
 
     async def flaky_awatch(*_paths, **options):
         nonlocal generations
@@ -1431,10 +1470,10 @@ async def test_failed_generation_reconciles_only_after_retry_is_armed(
         return
         yield set()
 
-    monkeypatch.setattr(store, "reconcile", guarded_reconcile)
     monkeypatch.setattr(file_events, "awatch", flaky_awatch)
     monkeypatch.setattr(file_events, "_WATCH_RETRY_S", 0)
     manager = file_events.FileWatchManager(store)
+    monkeypatch.setattr(manager, "_scan_workspace", guarded_scan)
     async with manager.subscribe(temp_root):
         await asyncio.wait_for(second_armed.wait(), timeout=1)
         state = manager._states[temp_root.resolve()]
@@ -1486,6 +1525,41 @@ def test_reconcile_backoff_is_scoped_to_each_workspace(
 
 
 @pytest.mark.asyncio
+async def test_partial_reconcile_uses_fairness_yield_not_failure_backoff(
+    app_module,
+    temp_root,
+    monkeypatch,
+):
+    import backend.file_events as file_events
+
+    monkeypatch.setattr(file_events, "_PARTIAL_RECONCILE_YIELD_S", 0.02)
+    manager = file_events.FileWatchManager(file_events.WorkspaceStore(temp_root))
+    state = file_events._WatchState(
+        root=temp_root,
+        workspace_id="partial-fairness",
+        initialized=True,
+    )
+    calls: list[float] = []
+
+    async def partial_then_complete(_state):
+        calls.append(file_events.monotonic())
+        return len(calls) == 1
+
+    monkeypatch.setattr(
+        manager,
+        "_reconcile_and_broadcast",
+        partial_then_complete,
+    )
+    await manager._reconcile_after_watch(state)
+
+    assert len(calls) == 2
+    assert calls[1] - calls[0] >= 0.015
+    assert state.reconcile_failures == 0
+    assert state.reconcile_retry_at == 0.0
+    await manager.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_reconcile_perf_event_splits_wait_scan_and_replay(
     app_module,
     temp_root,
@@ -1497,15 +1571,11 @@ async def test_reconcile_perf_event_splits_wait_scan_and_replay(
         def current_cursor(self, _workspace_id):
             return 9
 
-        def reconcile(self, *_args, **_kwargs):
-            return 9
-
-        def delta(self, *_args, **_kwargs):
+        def apply_reconcile_snapshot(self, *_args, **_kwargs):
             return {
                 "cursor": 9,
-                "changes": [{"path": "private-replay.txt"}],
-                "resync": False,
-                "has_more": True,
+                "changes": [],
+                "resync": True,
             }
 
         def close(self):
@@ -1518,6 +1588,11 @@ async def test_reconcile_perf_event_splits_wait_scan_and_replay(
         lambda event, **fields: events.append((event, fields)),
     )
     manager = file_events.FileWatchManager(FakeStore())
+
+    async def fake_scan(_state):
+        return [], {}
+
+    monkeypatch.setattr(manager, "_scan_workspace", fake_scan)
     state = file_events._WatchState(
         root=temp_root,
         workspace_id="workspace-sensitive-identifier",
@@ -1546,7 +1621,7 @@ async def test_reconcile_perf_event_splits_wait_scan_and_replay(
     assert fields["snapshot_files"] == 0
     assert fields["partial"] is False
     assert fields["partial_reason"] is None
-    assert fields["changes"] == 1
+    assert fields["changes"] == 0
     assert fields["resync"] is True
     assert fields["total_ms"] >= 10
     captured = repr(events)
@@ -1556,140 +1631,96 @@ async def test_reconcile_perf_event_splits_wait_scan_and_replay(
 
 
 @pytest.mark.asyncio
-async def test_workspace_reconciles_run_independently_off_event_loop(
+async def test_detached_scan_retries_after_watcher_mutation(
     app_module,
     temp_root,
+    monkeypatch,
 ):
     import backend.file_events as file_events
 
     class ConcurrentStore:
         def __init__(self):
-            self.lock = threading.Lock()
-            self.entered = threading.Event()
-            self.release = threading.Event()
-            self.active = 0
-            self.max_active = 0
-            self.calls = 0
-            self.block_delta = False
-            self.delta_entered = threading.Event()
-            self.delta_release = threading.Event()
-            self.delta_release.set()
+            self.cursor = 0
+            self.applications = 0
+            self.apply_entered = threading.Event()
+            self.apply_release = threading.Event()
 
         def current_cursor(self, _workspace_id):
-            return 0
+            return self.cursor
 
-        def reconcile(self, *_args, **_kwargs):
-            with self.lock:
-                self.calls += 1
-                self.active += 1
-                self.max_active = max(self.max_active, self.active)
-                self.entered.set()
-            assert self.release.wait(timeout=3)
-            with self.lock:
-                self.active -= 1
-
-        def delta(self, *_args, **_kwargs):
-            if self.block_delta:
-                self.delta_entered.set()
-                assert self.delta_release.wait(timeout=3)
+        def apply_reconcile_snapshot(self, *_args, expected_cursor=None, **_kwargs):
+            if expected_cursor != self.cursor:
+                return {
+                    "_stale": True,
+                    "cursor": self.cursor,
+                    "changes": [],
+                    "resync": True,
+                }
+            self.applications += 1
+            self.apply_entered.set()
+            assert self.apply_release.wait(timeout=3)
             return {
-                "cursor": 0,
+                "cursor": self.cursor,
                 "changes": [],
                 "resync": False,
-                "has_more": False,
             }
+
+        def delta(self, *_args, **_kwargs):
+            raise AssertionError("reconcile must return its atomic payload directly")
 
         def close(self):
             return None
 
     store = ConcurrentStore()
     manager = file_events.FileWatchManager(store)
-    first = file_events._WatchState(
-        root=temp_root / "first",
-        workspace_id="first",
-        name="first",
+    state = file_events._WatchState(
+        root=temp_root / "detached",
+        workspace_id="detached",
         initialized=True,
     )
-    second = file_events._WatchState(
-        root=temp_root / "second",
-        workspace_id="second",
-        name="second",
-        initialized=True,
-    )
-    first_task = asyncio.create_task(
-        manager._reconcile_and_broadcast(first)
-    )
-    assert await asyncio.to_thread(store.entered.wait, 1)
-    second_task = asyncio.create_task(
-        manager._reconcile_and_broadcast(second)
-    )
-    for _ in range(20):
-        if store.calls == 2:
-            break
-        await asyncio.sleep(0.01)
-    assert store.calls == 2
-    assert store.max_active == 2
+    first_scan_entered = asyncio.Event()
+    release_first_scan = asyncio.Event()
+    scan_calls = 0
 
-    # Both blocking scans are worker-thread work: the event loop must continue
-    # servicing unrelated coroutines while neither filesystem pass can finish.
+    async def controlled_scan(_state):
+        nonlocal scan_calls
+        scan_calls += 1
+        if scan_calls == 1:
+            first_scan_entered.set()
+            await release_first_scan.wait()
+        return [], {}
+
+    monkeypatch.setattr(manager, "_scan_workspace", controlled_scan)
+    reconcile = asyncio.create_task(manager._reconcile_and_broadcast(state))
+    await asyncio.wait_for(first_scan_entered.wait(), timeout=1)
+
+    # The filesystem walk no longer owns the watcher mutation lock. A native
+    # batch can commit and advance the applicability cursor while it is running.
+    async with state.mutation_lock:
+        store.cursor += 1
+        state.native_mutation_revision += 1
     heartbeat = asyncio.Event()
     asyncio.get_running_loop().call_soon(heartbeat.set)
     await asyncio.wait_for(heartbeat.wait(), timeout=0.2)
-    store.release.set()
-    await asyncio.gather(first_task, second_task)
+    release_first_scan.set()
 
-    # A watcher can restart while its own mutation lock is queued. The pass must
-    # follow the replacement generation and wait for it to arm instead of
-    # scanning inside the new watch gap.
-    async def parked_watcher():
-        await asyncio.Future()
-
-    queued = file_events._WatchState(
-        root=temp_root / "queued",
-        workspace_id="queued",
-        name="queued",
-        initialized=True,
-        task=asyncio.create_task(parked_watcher()),
-    )
-    queued.watch_ready.set()
-    queued.watch_paths = (queued.root,)
-    await queued.mutation_lock.acquire()
-    queued_scan = asyncio.create_task(
-        manager._reconcile_and_broadcast(queued)
-    )
-    await asyncio.sleep(0.02)
-    queued.watch_ready.clear()
-    queued.mutation_lock.release()
-    await asyncio.sleep(0.05)
-    assert store.calls == 2
-    queued.watch_ready.set()
-    await asyncio.wait_for(queued_scan, timeout=1)
-    assert store.calls == 3
-    queued.task.cancel()
-    await asyncio.gather(queued.task, return_exceptions=True)
-    queued.task = None
-
-    # The watcher mutation lock covers cursor-before through replay-after, not
-    # just the scan itself, so a native batch cannot slip into the replay window
-    # and get broadcast twice.
-    store.block_delta = True
-    store.delta_release.clear()
-    window_task = asyncio.create_task(
-        manager._reconcile_and_broadcast(first)
-    )
-    assert await asyncio.to_thread(store.delta_entered.wait, 1)
+    # The stale first result is discarded. The fresh result is applied once and
+    # its exact payload is built while the mutation lock is still owned.
+    assert await asyncio.to_thread(store.apply_entered.wait, 1)
     mutation_acquired = asyncio.Event()
 
     async def watcher_mutation():
-        async with first.mutation_lock:
+        async with state.mutation_lock:
             mutation_acquired.set()
 
-    mutation_task = asyncio.create_task(watcher_mutation())
+    mutation = asyncio.create_task(watcher_mutation())
     await asyncio.sleep(0.05)
     assert mutation_acquired.is_set() is False
-    store.delta_release.set()
-    await asyncio.gather(window_task, mutation_task)
-    assert mutation_acquired.is_set() is True
+    store.apply_release.set()
+    await asyncio.gather(reconcile, mutation)
+    assert scan_calls == 2
+    assert store.applications == 1
+    assert state.scan_progress == {}
     await manager.shutdown()
 
 
@@ -1797,6 +1828,7 @@ async def test_manager_start_is_nonblocking_and_reconciles_on_first_use(
     monkeypatch,
 ):
     import backend.file_events as file_events
+    from backend.workspace_store import scan_workspace
     from backend.workspaces import registry
 
     store = file_events.WorkspaceStore(temp_root)
@@ -1806,20 +1838,25 @@ async def test_manager_start_is_nonblocking_and_reconciles_on_first_use(
 
     entered = threading.Event()
     release = threading.Event()
-    real_reconcile = store.reconcile
-
-    def blocking_reconcile(*args, **kwargs):
+    async def blocking_scan(state):
         entered.set()
-        assert release.wait(timeout=5)
-        return real_reconcile(*args, **kwargs)
+        assert await asyncio.to_thread(release.wait, 5)
+        report = {}
+        snapshot = await asyncio.to_thread(
+            scan_workspace,
+            state.root,
+            report=report,
+            progress=state.scan_progress,
+        )
+        return snapshot, report
 
     async def fake_awatch(*_args, **_kwargs):
         await asyncio.Future()
         yield set()
 
-    monkeypatch.setattr(store, "reconcile", blocking_reconcile)
     monkeypatch.setattr(file_events, "awatch", fake_awatch)
     manager = file_events.FileWatchManager(store)
+    monkeypatch.setattr(manager, "_scan_workspace", blocking_scan)
 
     await asyncio.wait_for(manager.start(), timeout=1)
     assert manager._started is True
@@ -1947,18 +1984,17 @@ async def test_remove_waits_for_inflight_reconcile_thread(
     entry = registry.register(extra_root, "race")
     store = file_events.WorkspaceStore(temp_root)
     manager = file_events.FileWatchManager(store)
-    reconcile_started = threading.Event()
-    allow_reconcile = threading.Event()
-    real_reconcile = store.reconcile
+    reconcile_started = asyncio.Event()
+    allow_reconcile = asyncio.Event()
 
-    def paused_reconcile(*args, **kwargs):
+    async def paused_scan(_state):
         reconcile_started.set()
-        assert allow_reconcile.wait(timeout=2)
-        return real_reconcile(*args, **kwargs)
+        await allow_reconcile.wait()
+        return [], {}
 
-    monkeypatch.setattr(store, "reconcile", paused_reconcile)
+    monkeypatch.setattr(manager, "_scan_workspace", paused_scan)
     state = await manager.ensure_workspace(extra_root)
-    assert await asyncio.to_thread(reconcile_started.wait, 2)
+    await asyncio.wait_for(reconcile_started.wait(), timeout=2)
 
     registry.remove(extra_root)
     remove_task = asyncio.create_task(
@@ -2041,20 +2077,20 @@ async def test_failed_initial_reconcile_retries_on_next_ensure(
     import backend.file_events as file_events
 
     store = file_events.WorkspaceStore(temp_root)
-    real_reconcile = store.reconcile
+    manager = file_events.FileWatchManager(store)
+    real_scan = manager._scan_workspace
     calls = 0
 
-    def fail_once(*args, **kwargs):
+    async def fail_once(state):
         nonlocal calls
         calls += 1
         if calls == 1:
             raise file_events.WorkspaceScanIncomplete(
                 "synthetic transient scan failure"
             )
-        return real_reconcile(*args, **kwargs)
+        return await real_scan(state)
 
-    monkeypatch.setattr(store, "reconcile", fail_once)
-    manager = file_events.FileWatchManager(store)
+    monkeypatch.setattr(manager, "_scan_workspace", fail_once)
     with pytest.raises(file_events.HTTPException) as first:
         await manager.bootstrap(temp_root)
     assert first.value.status_code == 503
@@ -2080,20 +2116,21 @@ async def test_reconcile_failures_back_off_coalesce_and_reset(
     import backend.file_events as file_events
 
     store = file_events.WorkspaceStore(temp_root)
-    real_reconcile = store.reconcile
+    manager = file_events.FileWatchManager(store)
+    real_scan = manager._scan_workspace
     calls = 0
     events = []
 
-    def fail_twice(*args, **kwargs):
+    async def fail_twice(state):
         nonlocal calls
         calls += 1
         if calls <= 2:
             raise file_events.WorkspaceScanIncomplete(
                 f"private failure under {temp_root}/secret-{calls}"
             )
-        return real_reconcile(*args, **kwargs)
+        return await real_scan(state)
 
-    monkeypatch.setattr(store, "reconcile", fail_twice)
+    monkeypatch.setattr(manager, "_scan_workspace", fail_twice)
     monkeypatch.setattr(file_events, "_RECONCILE_BACKOFF_START_S", 0.02)
     monkeypatch.setattr(file_events, "_RECONCILE_BACKOFF_CAP_S", 0.04)
     monkeypatch.setattr(
@@ -2101,7 +2138,6 @@ async def test_reconcile_failures_back_off_coalesce_and_reset(
         "perf_event",
         lambda event, **fields: events.append((event, fields)),
     )
-    manager = file_events.FileWatchManager(store)
 
     with pytest.raises(file_events.HTTPException) as first:
         await manager.bootstrap(temp_root)
@@ -2267,6 +2303,7 @@ async def test_http_exception_after_sse_ready_becomes_clean_eof(
 async def test_large_reconcile_reloads_cursor_without_bad_arguments(
     app_module,
     temp_root,
+    monkeypatch,
 ):
     from backend.file_events import FileWatchManager, _WatchState
 
@@ -2278,19 +2315,26 @@ async def test_large_reconcile_reloads_cursor_without_bad_arguments(
             self.cursor_calls.append(workspace_id)
             return 9001
 
-        def reconcile(self, *_args, **_kwargs):
-            return 9001
+        def apply_reconcile_snapshot(self, *_args, **_kwargs):
+            return {
+                "cursor": 9001,
+                "changes": [],
+                "resync": True,
+            }
 
         def delta(self, *_args, **_kwargs):
-            return {
-                "cursor": 5000,
-                "changes": [],
-                "resync": False,
-                "has_more": True,
-            }
+            raise AssertionError("reconcile must not perform a separate delta")
+
+        def close(self):
+            return None
 
     store = FakeStore()
     manager = FileWatchManager(store)
+
+    async def fake_scan(_state):
+        return [], {}
+
+    monkeypatch.setattr(manager, "_scan_workspace", fake_scan)
     queue = asyncio.Queue()
     state = _WatchState(
         root=temp_root,
@@ -2301,12 +2345,13 @@ async def test_large_reconcile_reloads_cursor_without_bad_arguments(
         subscribers={queue},
     )
     await manager._reconcile_and_broadcast(state)
-    assert store.cursor_calls == ["workspace-id", "workspace-id"]
+    assert store.cursor_calls == ["workspace-id"]
     assert queue.get_nowait() == {
         "resync": True,
         "changes": [],
         "cursor": 9001,
     }
+    await manager.shutdown()
 
 
 @pytest.mark.asyncio
@@ -2338,6 +2383,83 @@ async def test_watcher_broadcasts_large_batch_resync(
         "cursor": 42,
         "changes": [],
         "resync": True,
+    }
+    assert state.native_mutation_revision == 1
+
+
+@pytest.mark.asyncio
+async def test_relevant_native_noop_invalidates_detached_scan_token(
+    app_module,
+    temp_root,
+    monkeypatch,
+):
+    import backend.file_events as file_events
+
+    class NoopStore:
+        def apply_changes(self, *_args, **_kwargs):
+            return {"cursor": 7, "changes": []}
+
+        def close(self):
+            return None
+
+    target = temp_root / "unchanged.txt"
+    target.write_text("same", encoding="utf-8")
+
+    async def fake_awatch(*_args, **_kwargs):
+        yield {(Change.modified, str(target))}
+
+    monkeypatch.setattr(file_events, "awatch", fake_awatch)
+    manager = file_events.FileWatchManager(NoopStore())
+    state = file_events._WatchState(
+        root=temp_root,
+        workspace_id="workspace-id",
+        initialized=True,
+    )
+    await manager._watch(state)
+
+    assert state.native_mutation_revision == 1
+    await manager.shutdown()
+
+
+def test_detached_snapshot_rejects_a_changed_cursor(
+    app_module,
+    temp_root,
+):
+    import backend.workspace_store as workspace_store
+    from backend.workspaces import registry
+
+    workspace_id = registry.id_for(temp_root)
+    store = workspace_store.WorkspaceStore(temp_root)
+    store.reconcile(workspace_id, temp_root, "root", primary=True)
+    before = store.current_cursor(workspace_id)
+    report = {}
+    snapshot = workspace_store.scan_workspace(temp_root, report=report)
+
+    added = temp_root / "after-detached-scan.txt"
+    added.write_text("newer\n", encoding="utf-8")
+    store.apply_changes(
+        workspace_id,
+        temp_root,
+        [{"type": "added", "path": added.name}],
+    )
+    stale = store.apply_reconcile_snapshot(
+        workspace_id,
+        temp_root,
+        "root",
+        workspace_store.compact_scan_rows(snapshot),
+        report,
+        primary=True,
+        expected_cursor=before,
+    )
+    assert stale == {
+        "_stale": True,
+        "cursor": before + 1,
+        "changes": [],
+        "resync": True,
+    }
+
+    assert added.name in {
+        row["path"] for row in store.bootstrap(workspace_id)["entries"]
     }
 
 

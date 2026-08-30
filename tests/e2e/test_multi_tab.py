@@ -57,7 +57,7 @@ def _login(page: Page, base: str, token: str) -> None:
     page.wait_for_function(
         """() => {
           const app = document.querySelector("#app")?._x_dataStack?.[0];
-          return app && app.authed === true && app.currentId
+          return app && app.authed === true && app._modelsLoaded && app.currentId
             && app.openTabIds.includes(app.currentId) && app.sessions.length > 0;
         }"""
     )
@@ -217,7 +217,16 @@ def test_same_origin_pages_share_strip_without_focus_theft_or_writeback(
         assert non_current not in stored["openTabIds"]
         assert peer_current not in stored["openTabIds"]
 
-        page.reload(wait_until="domcontentloaded")
+        # Two same-origin pages already hold the app's long-lived SSE surfaces.
+        # Retire both root mux transports before navigation so Chromium always
+        # has a connection available for the reload itself; the fresh document
+        # starts its own coordinator after session initialization.
+        for browser_page in (page, peer):
+            browser_page.evaluate(
+                """() => document.querySelector('#app')._x_dataStack[0]
+                  ._setChatMuxUnsupported()"""
+            )
+        page.reload(wait_until="domcontentloaded", timeout=15000)
         page.wait_for_function(
             """([closed]) => {
               const app = document.querySelector('#app')?._x_dataStack?.[0];
@@ -411,10 +420,11 @@ def test_pending_send_text_survives_hard_refresh(
     page.evaluate(
         """() => {
           const app = document.querySelector('#app')._x_dataStack[0];
+          app._ensureChatMux = async () => true;
           app._confirmSessionBusy = async () => false;
           const originalFetch = window.fetch.bind(window);
           window.fetch = (url, init) => {
-            if (String(url).includes('/api/chat/stream/start')) {
+            if (String(url).includes('/api/chat/turns/start')) {
               window.__streamStartBlocked = true;
               return new Promise(() => {});
             }
@@ -457,11 +467,11 @@ def test_pending_send_text_survives_hard_refresh(
     expect(page.locator(".chat-input-textarea")).to_have_value(marker)
 
 
-def test_ticket_failure_restores_draft_and_idle_state(
+def test_turn_start_failure_restores_draft_and_idle_state(
         page: Page, backend_url, auth_token):
     attempts = 0
 
-    def reject_ticket(route) -> None:
+    def reject_turn_start(route) -> None:
         nonlocal attempts
         attempts += 1
         route.fulfill(
@@ -470,13 +480,14 @@ def test_ticket_failure_restores_draft_and_idle_state(
             body='{"detail":"ticket unavailable"}',
         )
 
-    page.route("**/api/chat/stream/start", reject_ticket)
+    page.route("**/api/chat/turns/start", reject_turn_start)
     _login(page, backend_url, auth_token)
     marker = "ticket-failure-recovered"
     page.locator(".chat-input-textarea").fill(marker)
     page.evaluate(
         """() => {
           const app = document.querySelector('#app')._x_dataStack[0];
+          app._ensureChatMux = async () => true;
           app.pendingImages.push({
             id: 'recover-image', mime: 'image/png', preview: 'data:image/png;base64,',
             uploading: false, error: false,
@@ -845,6 +856,160 @@ def test_repeated_enter_while_background_busy_submits_one_draft(
     }
 
 
+def test_server_busy_admission_never_borrows_running_footer(
+        page: Page, backend_url, auth_token):
+    """A 409 admission race shows Queueing without a one-frame Running lie."""
+    _login(page, backend_url, auth_token)
+    page.locator(".chat-input-textarea").fill("QUEUE_ON_409")
+    page.wait_for_function(
+        "() => document.querySelector('#app')._x_dataStack[0].input === 'QUEUE_ON_409'")
+    page.evaluate(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const sid = app.currentId;
+          const st = app._ensureTabState(sid);
+          app.lang = 'zh';
+          app.availableModels = [{model: 'fake-model', group: 'test'}];
+          app._modelsLoaded = true;
+          st.streaming = false;
+          st.backgroundActive = false;
+          st.compacting = false;
+          app._awaitRuntimeSettingPatches = async () => true;
+          app._confirmSessionBusy = async () => false;
+          app._ensureChatMux = async () => true;
+          window.__turnStartCalls = 0;
+          window.__queueCalls = 0;
+          window.__queueGate = new Promise(resolve => {
+            window.__releaseQueuePost = resolve;
+          });
+          window.__acceptedQueueItem = {
+            id: 'q-admission-race',
+            text: 'QUEUE_ON_409',
+            display_text: 'QUEUE_ON_409',
+            image_ids: '',
+            selection_quotes: [],
+            enqueued_at: Date.now(),
+          };
+          const originalFetch = window.fetch.bind(window);
+          window.fetch = async (url, init = {}) => {
+            const value = String(url);
+            const method = (init.method || 'GET').toUpperCase();
+            if (value === '/api/chat/turns/start') {
+              window.__turnStartCalls += 1;
+              return new Response('{}', {
+                status: 409,
+                headers: {'Content-Type': 'application/json'},
+              });
+            }
+            if (value.includes('/api/chat/sessions/') && value.endsWith('/queue')) {
+              if (method === 'POST') {
+                window.__queueCalls += 1;
+                await window.__queueGate;
+                return new Response(JSON.stringify({
+                  item: window.__acceptedQueueItem,
+                  queue: {revision: 11},
+                }), {status: 200, headers: {'Content-Type': 'application/json'}});
+              }
+              return new Response(JSON.stringify({
+                revision: 11,
+                paused: false,
+                items: [window.__acceptedQueueItem],
+              }), {status: 200, headers: {'Content-Type': 'application/json'}});
+            }
+            return originalFetch(url, init);
+          };
+          window.__admissionRaceSend = app.send();
+        }"""
+    )
+    page.wait_for_function("() => window.__queueCalls === 1")
+    expect(page.locator(".optimistic-queue-status")).to_be_visible()
+    expect(page.locator(".optimistic-queue-status")).to_contain_text("排队中")
+    expect(page.locator(".turn-pending-footer")).to_be_hidden()
+    assert page.evaluate("() => window.__turnStartCalls") == 1
+
+    page.evaluate("() => window.__releaseQueuePost()")
+    assert page.evaluate("() => window.__admissionRaceSend") is True
+    page.wait_for_function(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          return app.tabState[app.currentId].pendingQueue.length === 1;
+        }"""
+    )
+    expect(page.locator(".optimistic-queue-status")).to_have_count(0)
+    expect(page.locator(".msg.user.queued")).to_have_count(1)
+    assert page.evaluate("() => window.__queueCalls") == 1
+
+
+def test_image_generation_submit_timeout_and_close_cancel_are_local(
+        page: Page, backend_url, auth_token):
+    """A wedged image submit times out; closing cancels without stale errors."""
+    _login(page, backend_url, auth_token)
+    result = page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          app.lang = 'zh';
+          app.imageGen.prompt = 'timeout probe';
+          app.IMAGE_GEN_SUBMIT_DEADLINE_MS = 25;
+          const toasts = [];
+          app.toast = (...args) => { toasts.push(args); };
+          app.api = async (_path, opts = {}) => await new Promise(resolve => {
+            opts.signal.addEventListener('abort', () => resolve({
+              ok: false, status: 0, error: 'aborted',
+            }), {once: true});
+          });
+          await app.runImageGen();
+          const timeout = {
+            loading: app.imageGen.loading,
+            controller: app.imageGen.submitController,
+            error: app.imageGen.error,
+            errorToasts: toasts.filter(row => row[1] === 'error').length,
+          };
+
+          let closeAborted = false;
+          app.imageGen.show = true;
+          app.imageGen.prompt = 'cancel probe';
+          app.IMAGE_GEN_SUBMIT_DEADLINE_MS = 1000;
+          app.api = async (_path, opts = {}) => await new Promise(resolve => {
+            opts.signal.addEventListener('abort', () => {
+              closeAborted = true;
+              resolve({ok: false, status: 0, error: 'aborted'});
+            }, {once: true});
+          });
+          const beforeCloseToastCount = toasts.length;
+          const pending = app.runImageGen();
+          app.closeImageGen();
+          await pending;
+          return {
+            timeout,
+            close: {
+              aborted: closeAborted,
+              show: app.imageGen.show,
+              loading: app.imageGen.loading,
+              controller: app.imageGen.submitController,
+              error: app.imageGen.error,
+              newToasts: toasts.length - beforeCloseToastCount,
+            },
+          };
+        }"""
+    )
+    assert result == {
+        "timeout": {
+            "loading": False,
+            "controller": None,
+            "error": "提交确认超时，请先刷新历史记录，确认后再重试",
+            "errorToasts": 1,
+        },
+        "close": {
+            "aborted": True,
+            "show": False,
+            "loading": False,
+            "controller": None,
+            "error": "",
+            "newToasts": 0,
+        },
+    }
+
+
 def test_background_send_resolves_before_runtime_handoff(
         page: Page, backend_url, auth_token):
     """Queue commit is synchronous; the expensive runtime fork is not."""
@@ -1207,6 +1372,109 @@ def test_workspace_picker_switches_files_preview_and_conversation_together(
         }""",
         arg=[str(other)],
     )
+
+
+def test_workspace_registry_and_order_requests_do_not_disable_chat(
+        page: Page, backend_url, auth_token):
+    """Registry/order persistence owns its controls, never the composer."""
+    _login(page, backend_url, auth_token)
+    page.locator(".chat-input-textarea").fill("CHAT_STAYS_READY")
+    page.wait_for_function(
+        "() => document.querySelector('#app')._x_dataStack[0].input === 'CHAT_STAYS_READY'")
+    page.evaluate(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          app.availableModels = [{model: 'fake-model', group: 'test'}];
+          app._modelsLoaded = true;
+          app.fetchSessionWorkspaces = async () => app.sessionWorkspaces;
+          app._refreshSessionsAfterWorkspaceRegistryChange = async () => true;
+          window.__registryGate = new Promise(resolve => {
+            window.__releaseRegistry = resolve;
+          });
+          window.__orderGate = new Promise(resolve => {
+            window.__releaseOrder = resolve;
+          });
+          window.__registryCalls = 0;
+          window.__orderCalls = 0;
+          const originalFetch = window.fetch.bind(window);
+          window.fetch = async (url, init = {}) => {
+            const value = String(url);
+            const method = (init.method || 'GET').toUpperCase();
+            if (value === '/api/chat/workspaces' && method === 'POST') {
+              window.__registryCalls += 1;
+              await window.__registryGate;
+              return new Response(JSON.stringify({
+                path: '/registry-only', name: 'registry-only', primary: false,
+              }), {status: 200, headers: {'Content-Type': 'application/json'}});
+            }
+            if (value === '/api/chat/workspaces/order' && method === 'PUT') {
+              window.__orderCalls += 1;
+              await window.__orderGate;
+              return new Response(JSON.stringify({
+                workspaces: app.sessionWorkspaces,
+              }), {status: 200, headers: {'Content-Type': 'application/json'}});
+            }
+            return originalFetch(url, init);
+          };
+          window.__registryPromise = app._registerWorkspacePath('/registry-only');
+        }"""
+    )
+    page.wait_for_function("() => window.__registryCalls === 1")
+    registry_state = page.evaluate(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          return {
+            registryBusy: app.workspaceRegistryBusy,
+            switching: app.workspaceSwitching,
+            reason: app.composerStatusReason(app.currentId),
+            sendDisabled: document.querySelector('.chat-toolbar-send').disabled,
+          };
+        }"""
+    )
+    assert registry_state == {
+        "registryBusy": True,
+        "switching": False,
+        "reason": "",
+        "sendDisabled": False,
+    }
+    page.evaluate("() => window.__releaseRegistry()")
+    page.evaluate("() => window.__registryPromise")
+
+    page.evaluate(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const fake = {path: '/order-only', name: 'order-only', primary: false};
+          app.sessionWorkspaces = [...app.sessionWorkspaces, fake];
+          const current = app.sessionWorkspaces.map(row => row.path);
+          app.workspaceDrag = {
+            path: current[0],
+            overPath: current[0],
+            pointerId: null,
+            originalPaths: [...current].reverse(),
+          };
+          window.__orderPromise = app.finishWorkspaceDrag();
+        }"""
+    )
+    page.wait_for_function("() => window.__orderCalls === 1")
+    order_state = page.evaluate(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          return {
+            orderSaving: app.workspaceOrderSaving,
+            switching: app.workspaceSwitching,
+            reason: app.composerStatusReason(app.currentId),
+            sendDisabled: document.querySelector('.chat-toolbar-send').disabled,
+          };
+        }"""
+    )
+    assert order_state == {
+        "orderSaving": True,
+        "switching": False,
+        "reason": "",
+        "sendDisabled": False,
+    }
+    page.evaluate("() => window.__releaseOrder()")
+    page.evaluate("() => window.__orderPromise")
 
 
 def test_workspace_switch_overlaps_tree_sessions_and_transcript_without_early_activation(

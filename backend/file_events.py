@@ -6,9 +6,9 @@ import asyncio
 import contextlib
 import errno
 import json
+import multiprocessing
 import os
 import sys
-import threading
 from collections import OrderedDict
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
@@ -25,9 +25,13 @@ from .capability_tickets import tickets
 from .files import INTERNAL_DIR_NAME, TRASH_DIR_NAME
 from .observability import elapsed_ms, is_slow, monotonic, perf_event, short_id
 from .workspace_store import (
+    _SCAN_MAX_FILES,
+    _SCAN_MAX_SECONDS,
     WorkspaceScanCancelled,
+    WorkspaceScanIncomplete,
     WorkspaceStore,
     is_ignored_descendant,
+    workspace_scan_worker,
 )
 from .workspaces import registry, resolve_workspace_root
 
@@ -43,6 +47,8 @@ _RECONCILE_RETRY_MAX_S = 30.0
 _MAX_WATCHED_ROOTS = 16
 _MAX_EVENT_SUBSCRIBERS = 64
 _MAX_CONCURRENT_RECONCILES = 4
+_SCAN_CANCEL_GRACE_S = 0.25
+_PARTIAL_RECONCILE_YIELD_S = 0.01
 _NATIVE_DIRECTORY_WATCH_HARD_CAP = 131_072
 _WATCH_LINGER_S = 30.0
 _MAX_IDLE_WATCHERS = 3
@@ -111,7 +117,9 @@ class _WatchState:
     reconcile_error: Exception | None = None
     ready: asyncio.Event = field(default_factory=asyncio.Event)
     mutation_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    lifecycle_generation: int = 0
     watch_revision: int = 0
+    native_mutation_revision: int = 0
     watch_stop_event: asyncio.Event | None = None
     watch_ready: asyncio.Event = field(default_factory=asyncio.Event)
     watch_paths: tuple[Path, ...] = ()
@@ -123,13 +131,22 @@ class _WatchState:
     reconcile_retry_at: float = 0.0
     reconcile_cancel: asyncio.Event = field(default_factory=asyncio.Event)
     scan_progress: dict[str, Any] = field(default_factory=dict)
-    scan_cancel: threading.Event = field(default_factory=threading.Event)
     stop_task: asyncio.Task[None] | None = None
     queue_overflow_active: bool = False
     native_budget_ready: asyncio.Event = field(default_factory=asyncio.Event)
     native_budget_wait_cost: int = 0
     native_watch_cost: int = 0
     native_budget_degraded: bool = False
+
+
+@dataclass(frozen=True)
+class _ReconcileApplicability:
+    workspace_id: str
+    root: Path
+    lifecycle_generation: int
+    watch_revision: int
+    native_mutation_revision: int
+    cursor: int
 
 
 def _normalise_bootstrap_parents(
@@ -255,12 +272,18 @@ class FileWatchManager:
         self._pending_subscribers = 0
         self._pending_watched_roots: dict[Path, int] = {}
         self._subscription_generation = 0
+        self._lifecycle_generation = 0
         self._subscription_setups: set[asyncio.Task[Any]] = set()
         self._accepting_subscriptions = True
         self._lock = asyncio.Lock()
         self._reconcile_slots = asyncio.Semaphore(
             _MAX_CONCURRENT_RECONCILES,
         )
+        self._scan_worker_lock = asyncio.Lock()
+        self._scan_context = multiprocessing.get_context("spawn")
+        self._scan_process: multiprocessing.Process | None = None
+        self._scan_connection: Any | None = None
+        self._scan_cancel = self._scan_context.Event()
         self._native_watcher_slots = asyncio.Semaphore(
             _MAX_WATCHED_ROOTS,
         )
@@ -597,6 +620,7 @@ class FileWatchManager:
             state = self._states.get(root)
             created = state is None
             if state is None:
+                self._lifecycle_generation += 1
                 state = _WatchState(
                     root=root,
                     workspace_id=entry.id,
@@ -604,11 +628,22 @@ class FileWatchManager:
                     primary=entry.primary,
                     force_polling=_FORCE_POLLING,
                     initialized=bool(status["initialized"]),
+                    lifecycle_generation=self._lifecycle_generation,
                 )
                 if state.initialized:
                     state.ready.set()
                 self._states[root] = state
             else:
+                if (
+                    state.workspace_id != entry.id
+                    or state.root != root
+                    or state.name != entry.name
+                    or state.primary != entry.primary
+                ):
+                    self._lifecycle_generation += 1
+                    state.lifecycle_generation = self._lifecycle_generation
+                    state.scan_progress.clear()
+                state.root = root
                 state.workspace_id = entry.id
                 state.name = entry.name
                 state.primary = entry.primary
@@ -661,6 +696,8 @@ class FileWatchManager:
                 if state.workspace_id != workspace_id:
                     continue
                 self._states.pop(root, None)
+                self._lifecycle_generation += 1
+                state.lifecycle_generation = self._lifecycle_generation
                 self._idle_watchers.pop(root, None)
                 cancel_tasks = [
                     task
@@ -676,7 +713,6 @@ class FileWatchManager:
                 ):
                     reconcile_task = state.reconcile_task
                     state.reconcile_cancel.set()
-                    state.scan_cancel.set()
                     if not state.reconcile_running:
                         reconcile_task.cancel()
                 state.reconcile_pending = False
@@ -1170,13 +1206,162 @@ class FileWatchManager:
             return True
         return False
 
+    def _ensure_scan_worker_locked(self) -> None:
+        """Lazily start the manager's single spawned filesystem scanner."""
+        process = self._scan_process
+        if (
+            process is not None
+            and process.is_alive()
+            and self._scan_connection is not None
+        ):
+            return
+        if self._scan_connection is not None:
+            self._scan_connection.close()
+        if process is not None:
+            if process.is_alive():
+                process.terminate()
+            process.join(timeout=_SCAN_CANCEL_GRACE_S)
+            if process.is_alive():
+                process.kill()
+                process.join(timeout=_SCAN_CANCEL_GRACE_S)
+            process.close()
+        self._scan_cancel.clear()
+        parent, child = self._scan_context.Pipe()
+        process = self._scan_context.Process(
+            target=workspace_scan_worker,
+            args=(child, self._scan_cancel),
+            name="muselab-files-scanner",
+            daemon=True,
+        )
+        try:
+            process.start()
+        except BaseException:
+            parent.close()
+            child.close()
+            process.close()
+            raise
+        child.close()
+        self._scan_process = process
+        self._scan_connection = parent
+
+    def _exchange_scan_request(self, request: tuple[Any, ...]) -> tuple[Any, ...]:
+        connection = self._scan_connection
+        if connection is None:
+            raise RuntimeError("workspace scanner is not running")
+        connection.send(request)
+        response = connection.recv()
+        if not isinstance(response, tuple) or len(response) != 4:
+            raise RuntimeError("workspace scanner returned an invalid response")
+        return response
+
+    async def _stop_scan_worker_locked(self) -> None:
+        """Stop the isolated scanner, escalating to terminate and kill."""
+        connection = self._scan_connection
+        process = self._scan_process
+        self._scan_connection = None
+        self._scan_process = None
+        if process is None:
+            if connection is not None:
+                connection.close()
+            return
+        if connection is not None and process.is_alive():
+            with contextlib.suppress(BrokenPipeError, EOFError, OSError):
+                connection.send(None)
+        await asyncio.to_thread(process.join, _SCAN_CANCEL_GRACE_S)
+        if process.is_alive():
+            process.terminate()
+            await asyncio.to_thread(process.join, _SCAN_CANCEL_GRACE_S)
+        if process.is_alive():
+            process.kill()
+            await asyncio.to_thread(process.join, _SCAN_CANCEL_GRACE_S)
+        if connection is not None:
+            connection.close()
+        process.close()
+
+    async def _cancel_scan_exchange(
+        self,
+        exchange: asyncio.Task[tuple[Any, ...]],
+    ) -> None:
+        """Request cooperative scan cancellation, then terminate if blocked."""
+        self._scan_cancel.set()
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(exchange),
+                timeout=_SCAN_CANCEL_GRACE_S,
+            )
+        except TimeoutError:
+            await self._stop_scan_worker_locked()
+            await asyncio.gather(exchange, return_exceptions=True)
+        except BaseException:
+            await asyncio.gather(exchange, return_exceptions=True)
+
+    async def _scan_workspace(
+        self,
+        state: _WatchState,
+    ) -> tuple[list[Any], dict[str, Any]]:
+        """Run one bounded scan in the reusable spawned worker."""
+        if state.reconcile_cancel.is_set():
+            raise WorkspaceScanCancelled("workspace scan cancelled")
+        async with self._scan_worker_lock:
+            if state.reconcile_cancel.is_set():
+                raise WorkspaceScanCancelled("workspace scan cancelled")
+            self._ensure_scan_worker_locked()
+            self._scan_cancel.clear()
+            request = (
+                str(state.root),
+                _SCAN_MAX_FILES,
+                _SCAN_MAX_SECONDS,
+                state.scan_progress,
+            )
+            exchange = asyncio.create_task(
+                asyncio.to_thread(self._exchange_scan_request, request),
+                name=f"muselab-files-scan-exchange:{state.workspace_id}",
+            )
+            cancelled = asyncio.create_task(state.reconcile_cancel.wait())
+            try:
+                done, _ = await asyncio.wait(
+                    {exchange, cancelled},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if cancelled in done:
+                    await self._cancel_scan_exchange(exchange)
+                    raise WorkspaceScanCancelled("workspace scan cancelled")
+                cancelled.cancel()
+                await asyncio.gather(cancelled, return_exceptions=True)
+                response = exchange.result()
+            except asyncio.CancelledError:
+                cancelled.cancel()
+                await self._cancel_scan_exchange(exchange)
+                await asyncio.gather(cancelled, return_exceptions=True)
+                raise
+            except WorkspaceScanCancelled:
+                raise
+            except BaseException:
+                cancelled.cancel()
+                await self._stop_scan_worker_locked()
+                await asyncio.gather(cancelled, return_exceptions=True)
+                raise
+
+            status, rows, report, progress = response
+            state.scan_progress = progress if isinstance(progress, dict) else {}
+            if status == "error":
+                error_type = str(rows or "")
+                detail = str(report or "workspace scan failed")
+                if error_type == "WorkspaceScanIncomplete":
+                    raise WorkspaceScanIncomplete(detail)
+                if error_type == "WorkspaceScanCancelled":
+                    raise WorkspaceScanCancelled(detail)
+                raise RuntimeError(
+                    f"workspace scanner failed ({error_type or 'unknown'})"
+                )
+            if status != "ok" or not isinstance(rows, list) or not isinstance(report, dict):
+                raise RuntimeError("workspace scanner returned invalid scan data")
+            return rows, report
+
     async def _reconcile_after_watch(self, state: _WatchState) -> None:
         """Reconcile downtime after the watcher gets a chance to register."""
         while True:
             state.reconcile_pending = False
-            retry_delay = max(0.0, state.reconcile_retry_at - monotonic())
-            if retry_delay:
-                await asyncio.sleep(retry_delay)
             try:
                 if not await self._wait_for_reconcile_backoff(state):
                     return
@@ -1190,7 +1375,12 @@ class FileWatchManager:
                         return
                 partial = await self._reconcile_and_broadcast(state)
                 if partial:
-                    self._record_reconcile_retry(state)
+                    # An accepted bounded continuation is healthy work. Yield
+                    # briefly for other roots instead of entering failure backoff.
+                    self._reset_reconcile_retry(state)
+                    state.reconcile_retry_at = (
+                        monotonic() + _PARTIAL_RECONCILE_YIELD_S
+                    )
                     state.reconcile_pending = True
                 else:
                     self._reset_reconcile_retry(state)
@@ -1314,6 +1504,53 @@ class FileWatchManager:
             )
         return partial
 
+    async def _capture_reconcile_applicability(
+        self,
+        state: _WatchState,
+    ) -> _ReconcileApplicability:
+        async with self._lock:
+            registered = self._states.get(state.root)
+            if registered is not state and state.lifecycle_generation != 0:
+                raise WorkspaceScanCancelled("workspace lifecycle changed")
+            workspace_id = state.workspace_id
+            root = state.root
+            lifecycle_generation = state.lifecycle_generation
+            watch_revision = state.watch_revision
+            native_mutation_revision = state.native_mutation_revision
+        cursor = await asyncio.to_thread(
+            self.store.current_cursor,
+            workspace_id,
+        )
+        return _ReconcileApplicability(
+            workspace_id=workspace_id,
+            root=root,
+            lifecycle_generation=lifecycle_generation,
+            watch_revision=watch_revision,
+            native_mutation_revision=native_mutation_revision,
+            cursor=cursor,
+        )
+
+    def _applicability_matches_locked(
+        self,
+        state: _WatchState,
+        token: _ReconcileApplicability,
+    ) -> bool:
+        registered = self._states.get(token.root)
+        return (
+            (registered is state or token.lifecycle_generation == 0)
+            and state.workspace_id == token.workspace_id
+            and state.root == token.root
+            and state.lifecycle_generation == token.lifecycle_generation
+            and state.watch_revision == token.watch_revision
+            and state.native_mutation_revision
+            == token.native_mutation_revision
+            and not state.reconcile_cancel.is_set()
+            and (
+                state.task is None
+                or state.watch_ready.is_set()
+            )
+        )
+
     async def _reconcile_and_broadcast_impl(
         self,
         state: _WatchState,
@@ -1322,102 +1559,98 @@ class FileWatchManager:
         broadcast_payload: dict[str, Any] | None = None
         partial = False
         while True:
+            if state.task is not None and not state.watch_ready.is_set():
+                if not await self._wait_for_armed_watcher(state):
+                    raise RuntimeError(
+                        "watcher stopped before closing reconciliation"
+                    )
+                continue
+
             scan_slot_started = monotonic()
             await self._reconcile_slots.acquire()
             metrics["scan_slot_wait_ms"] = int(
                 metrics["scan_slot_wait_ms"]
             ) + elapsed_ms(scan_slot_started)
-            mutation_lock_started = monotonic()
+            stale_snapshot = False
             try:
-                await state.mutation_lock.acquire()
-            except BaseException:
-                self._reconcile_slots.release()
-                raise
-            metrics["mutation_lock_wait_ms"] = int(
-                metrics["mutation_lock_wait_ms"]
-            ) + elapsed_ms(mutation_lock_started)
-            retry_after_arm = False
-            try:
-                # A watcher may restart while this workspace waits for an older
-                # mutation. Never scan inside the replacement generation's gap.
-                if state.task is not None and not state.watch_ready.is_set():
-                    retry_after_arm = True
-                else:
-                    state.reconcile_running = True
-                    # Keep the replay window consistent with watcher mutations.
-                    # Reading `before` or `delta` outside this lock lets a native
-                    # batch commit between them and be broadcast twice.
-                    before = await asyncio.to_thread(
-                        self.store.current_cursor,
-                        state.workspace_id,
-                    )
-                    scan_report: dict[str, Any] = {}
-                    scan_started = monotonic()
+                mutation_lock_started = monotonic()
+                async with state.mutation_lock:
+                    metrics["mutation_lock_wait_ms"] = int(
+                        metrics["mutation_lock_wait_ms"]
+                    ) + elapsed_ms(mutation_lock_started)
+                    if state.task is not None and not state.watch_ready.is_set():
+                        stale_snapshot = True
+                    else:
+                        token = await self._capture_reconcile_applicability(state)
+
+                if stale_snapshot:
+                    continue
+                state.reconcile_running = True
+                scan_started = monotonic()
+                try:
+                    snapshot, scan_report = await self._scan_workspace(state)
+                finally:
+                    metrics["scan_ms"] = int(
+                        metrics["scan_ms"]
+                    ) + elapsed_ms(scan_started)
+                partial = bool(scan_report.get("partial"))
+                metrics["partial"] = partial
+                metrics["partial_reason"] = scan_report.get(
+                    "partial_reason"
+                )
+                metrics["scanned_files"] = int(
+                    scan_report.get("scanned_files") or 0
+                )
+                metrics["snapshot_files"] = int(
+                    scan_report.get("snapshot_files") or 0
+                )
+
+                mutation_lock_started = monotonic()
+                async with state.mutation_lock:
+                    metrics["mutation_lock_wait_ms"] = int(
+                        metrics["mutation_lock_wait_ms"]
+                    ) + elapsed_ms(mutation_lock_started)
+                    apply_started = monotonic()
                     try:
-                        await asyncio.to_thread(
-                            self.store.reconcile,
-                            state.workspace_id,
-                            state.root,
-                            state.name,
-                            primary=state.primary,
-                            cancel_event=state.scan_cancel,
-                            report=scan_report,
-                            scan_progress=state.scan_progress,
-                        )
-                    finally:
-                        metrics["scan_ms"] = int(
-                            metrics["scan_ms"]
-                        ) + elapsed_ms(scan_started)
-                    partial = bool(scan_report.get("partial"))
-                    metrics["partial"] = partial
-                    metrics["partial_reason"] = scan_report.get(
-                        "partial_reason"
-                    )
-                    metrics["scanned_files"] = int(
-                        scan_report.get("scanned_files") or 0
-                    )
-                    metrics["snapshot_files"] = int(
-                        scan_report.get("snapshot_files") or 0
-                    )
-                    replay_started = monotonic()
-                    try:
-                        replay = await asyncio.to_thread(
-                            self.store.delta,
-                            state.workspace_id,
-                            before,
-                            limit=5000,
-                        )
-                        metrics["changes"] = len(
-                            replay.get("changes") or ()
-                        )
-                        metrics["resync"] = bool(
-                            replay.get("resync") or replay.get("has_more")
-                        )
-                        if replay.get("resync") or replay.get("has_more"):
-                            cursor = await asyncio.to_thread(
-                                self.store.current_cursor,
-                                state.workspace_id,
-                            )
-                            broadcast_payload = {
-                                "resync": True,
-                                "changes": [],
-                                "cursor": cursor,
-                            }
-                        elif replay.get("changes"):
-                            broadcast_payload = replay
+                        # Lifecycle/watch changes own the manager lock; native
+                        # batches own mutation_lock. Hold both through the store's
+                        # atomic cursor/root check and payload construction.
+                        async with self._lock:
+                            if not self._applicability_matches_locked(state, token):
+                                stale_snapshot = True
+                            else:
+                                result = await asyncio.to_thread(
+                                    self.store.apply_reconcile_snapshot,
+                                    token.workspace_id,
+                                    token.root,
+                                    state.name,
+                                    snapshot,
+                                    scan_report,
+                                    expected_cursor=token.cursor,
+                                    primary=state.primary,
+                                    cancel_event=state.reconcile_cancel,
+                                )
                     finally:
                         metrics["replay_ms"] = int(
                             metrics["replay_ms"]
-                        ) + elapsed_ms(replay_started)
+                        ) + elapsed_ms(apply_started)
+                    if not stale_snapshot and result.pop("_stale", False):
+                        stale_snapshot = True
+                    if not stale_snapshot:
+                        metrics["changes"] = len(
+                            result.get("changes") or ()
+                        )
+                        metrics["resync"] = bool(result.get("resync"))
+                        if result.get("resync") or result.get("changes"):
+                            broadcast_payload = result
             finally:
-                state.mutation_lock.release()
                 self._reconcile_slots.release()
-            if not retry_after_arm:
-                break
-            if not await self._wait_for_armed_watcher(state):
-                raise RuntimeError(
-                    "watcher stopped before closing reconciliation"
-                )
+            if stale_snapshot:
+                # A token change invalidates accumulated resume state; a new
+                # applicability window must establish its own complete snapshot.
+                state.scan_progress.clear()
+                continue
+            break
         state.initialized = True
         state.reconcile_error = None
         if broadcast_payload is not None:
@@ -1425,7 +1658,7 @@ class FileWatchManager:
         if state.task is not None:
             latest_paths = await self._watch_directories(state)
             if latest_paths != state.watch_paths:
-                self._request_watch_refresh(state)
+                await self._request_watch_refresh(state)
                 await self._schedule_reconcile(state)
         return partial
 
@@ -1435,12 +1668,12 @@ class FileWatchManager:
                 return
             self._queue_reconcile_locked(state)
 
-    @staticmethod
-    def _request_watch_refresh(state: _WatchState) -> None:
-        state.watch_revision += 1
-        state.watch_ready.clear()
-        if state.watch_stop_event is not None:
-            state.watch_stop_event.set()
+    async def _request_watch_refresh(self, state: _WatchState) -> None:
+        async with self._lock:
+            state.watch_revision += 1
+            state.watch_ready.clear()
+            if state.watch_stop_event is not None:
+                state.watch_stop_event.set()
 
     async def _watch_directories(
         self,
@@ -1752,6 +1985,9 @@ class FileWatchManager:
                     if not rows:
                         continue
                     async with state.mutation_lock:
+                        # Every relevant native batch invalidates a detached scan,
+                        # even when durable deduplication emits no replay event.
+                        state.native_mutation_revision += 1
                         payload = await asyncio.to_thread(
                             self.store.apply_changes,
                             state.workspace_id,
@@ -1767,7 +2003,7 @@ class FileWatchManager:
                     if payload.get("resync") or payload["changes"]:
                         self._broadcast(state, payload)
                     if watch_refresh:
-                        self._request_watch_refresh(state)
+                        await self._request_watch_refresh(state)
                     if needs_reconcile or watch_refresh:
                         await self._schedule_reconcile(state)
                     if watch_refresh:
@@ -1911,7 +2147,6 @@ class FileWatchManager:
             ]
             for state in states:
                 state.reconcile_cancel.set()
-                state.scan_cancel.set()
                 if (state.reconcile_task is not None
                         and not state.reconcile_task.done()):
                     reconcile_tasks.append(state.reconcile_task)
@@ -1927,20 +2162,18 @@ class FileWatchManager:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
-        # Do not cancel an outer to_thread await: cancellation would detach the
-        # Python worker and let it keep scanning against a store we immediately
-        # close. The cooperative event makes ordinary scans unwind promptly;
-        # runtime_lifecycle still owns the hard shutdown budget for a blocked
-        # kernel/network filesystem call.
         try:
             if reconcile_tasks:
                 await asyncio.gather(*reconcile_tasks, return_exceptions=True)
             if subscription_setups:
                 await asyncio.gather(*subscription_setups, return_exceptions=True)
         finally:
+            # A blocked filesystem syscall lives only in the disposable scanner;
+            # terminating it cannot strand a Python thread against the SQLite
+            # store. The next manager lifecycle starts a fresh spawned worker.
+            async with self._scan_worker_lock:
+                await self._stop_scan_worker_locked()
             # close() only resets lazy state and uses a short RLock section.
-            # Run it synchronously in finally so an outer lifecycle deadline
-            # cannot cancel the to_thread wrapper before this invariant lands.
             self.store.close()
 
 

@@ -310,6 +310,47 @@ function _pruneChatResourceTicketCache(now) {
   }
 }
 
+const CHAT_MUX_STREAM_EVENTS = [
+  "startup", "text", "thinking", "tool_use", "tool_result",
+  "compact_progress", "task_started", "task_progress", "task_notification",
+  "rate_limit", "ask_user_question", "permission_request",
+  "permission_request_resolved", "permission_mode_changed",
+  "permission_mode_change_failed", "ping", "done", "error", "cancelled",
+  "resync",
+];
+const CHAT_MUX_BOOTSTRAP_MAX_EVENTS = 512;
+const CHAT_MUX_BOOTSTRAP_MAX_BYTES = 2 * 1024 * 1024;
+
+class ChatMuxSessionChannel extends EventTarget {
+  constructor(sessionId, turnId, onClose) {
+    super();
+    this.sessionId = sessionId;
+    this.turnId = turnId;
+    this.readyState = 0;
+    this.onopen = null;
+    this._onClose = onClose;
+    this._muxChannel = true;
+  }
+
+  open() {
+    if (this.readyState === 1 || this.readyState === 2) return;
+    this.readyState = 1;
+    const event = new Event("open");
+    if (this.onopen) this.onopen(event);
+    this.dispatchEvent(event);
+  }
+
+  disconnect() {
+    if (this.readyState !== 2) this.readyState = 0;
+  }
+
+  close() {
+    if (this.readyState === 2) return;
+    this.readyState = 2;
+    if (this._onClose) this._onClose(this);
+  }
+}
+
 function portal() {
   return {
     // ===== auth =====
@@ -331,6 +372,15 @@ function portal() {
     _presenceVisibilityHandler: null,
     _presencePagehideHandler: null,
     _sessionsSyncTimer: null,
+    _chatMuxSource: null,
+    _chatMuxChannels: new Map(),
+    _chatMuxPendingEvents: new Map(),
+    _chatMuxAttachPromises: new Map(),
+    _chatMuxStartPromise: null,
+    _chatMuxReconnectTimer: null,
+    _chatMuxReconnectAttempts: 0,
+    _chatMuxSupported: null,
+    _chatMuxConnected: false,
     _splashHintTimer: null,
     _splashHardTimeout: null,
 
@@ -794,6 +844,8 @@ function portal() {
     activeWorkspace: "",
     workspaceMenuOpen: false,
     workspaceSwitching: false,
+    workspaceRegistryBusy: false,
+    workspaceOrderSaving: false,
     // The file tree and preview switch ownership before the target transcript
     // is ready. Keep that valid intermediate state behind one visual barrier
     // so the three workspace surfaces are revealed together.
@@ -934,7 +986,10 @@ function portal() {
       pollTimer: null,
       error: "",
       ownerSid: "",
+      submitController: null,
+      submitSeq: 0,
     },
+    IMAGE_GEN_SUBMIT_DEADLINE_MS: 20000,
     // Active-tab mirror of tabState[currentId].draft._sendWaitingForUpload.
     // Each session owns its own wait flag, so an upload in A never disables B.
     // It disables duplicate sends only while that draft's attachment upload is
@@ -3770,7 +3825,17 @@ function portal() {
       });
     },
     closeImageGen() {
+      this.cancelImageGenSubmit();
       this.imageGen.show = false;
+    },
+    cancelImageGenSubmit() {
+      const controller = this.imageGen.submitController;
+      this.imageGen.submitSeq = (Number(this.imageGen.submitSeq) || 0) + 1;
+      this.imageGen.submitController = null;
+      this.imageGen.loading = false;
+      if (controller) {
+        try { controller.abort(); } catch (_) {}
+      }
     },
     ensureImageGenPolling() {
       if (this.imageGen.pollTimer) return;
@@ -3845,11 +3910,21 @@ function portal() {
     async runImageGen() {
       const prompt = (this.imageGen.prompt || "").trim();
       if (!prompt || this.imageGen.loading) return;
+      const submitSeq = (Number(this.imageGen.submitSeq) || 0) + 1;
+      const controller = new AbortController();
+      let timedOut = false;
+      this.imageGen.submitSeq = submitSeq;
+      this.imageGen.submitController = controller;
       this.imageGen.loading = true;
       this.imageGen.error = "";
+      const timer = setTimeout(() => {
+        timedOut = true;
+        controller.abort();
+      }, this.IMAGE_GEN_SUBMIT_DEADLINE_MS);
       try {
         const res = await this.api("/api/chat/image-generate/jobs", {
           method: "POST",
+          signal: controller.signal,
           json: {
             prompt,
             model: this.imageGen.model || "gpt-image-2",
@@ -3860,6 +3935,11 @@ function portal() {
             image_ids: this.imageGenReferenceIds(),
           },
         });
+        if (submitSeq !== this.imageGen.submitSeq) return;
+        if (controller.signal.aborted) {
+          throw new Error(timedOut
+            ? "image generation submission timed out" : "cancelled");
+        }
         if (!res.ok) throw new Error(res.error || `HTTP ${res.status}`);
         const job = res.data.job;
         if (job && job.id) {
@@ -3870,12 +3950,23 @@ function portal() {
                    "success", 1800);
         this.ensureImageGenPolling();
       } catch (e) {
-        const msg = e && e.message ? e.message : String(e || "");
+        if (submitSeq !== this.imageGen.submitSeq) return;
+        const msg = timedOut
+          ? (this.lang === "zh"
+            ? "提交确认超时，请先刷新历史记录，确认后再重试"
+            : "Submission confirmation timed out. Refresh history before retrying")
+          : (e && e.message ? e.message : String(e || ""));
         this.imageGen.error = msg;
         this.toast((this.lang === "zh" ? "提交失败：" : "Submit failed: ") + msg,
                    "error", 5000);
       } finally {
-        this.imageGen.loading = false;
+        clearTimeout(timer);
+        if (submitSeq === this.imageGen.submitSeq) {
+          if (this.imageGen.submitController === controller) {
+            this.imageGen.submitController = null;
+          }
+          this.imageGen.loading = false;
+        }
       }
     },
     async attachGeneratedImage(img, ownerSid = this.imageGen.ownerSid || this.currentId) {
@@ -4617,6 +4708,82 @@ function portal() {
         cache.delete(oldestKey);
       }
       return html;
+    },
+
+    _cancelDeferredStreamRich(st, clear = false) {
+      const handle = st && st._deferredStreamRichHandle;
+      if (handle) {
+        if (handle.kind === "idle" && typeof cancelIdleCallback === "function") {
+          cancelIdleCallback(handle.id);
+        } else {
+          clearTimeout(handle.id);
+        }
+        st._deferredStreamRichHandle = null;
+      }
+      if (clear && st) st._deferredStreamRich = [];
+    },
+
+    _queueDeferredStreamRich(sid, st, message) {
+      if (!sid || !st || this.tabState[sid] !== st || !message
+          || message.role !== "assistant" || !message.text) return false;
+      message._streamText = message.text;
+      message._streamPlain = true;
+      message._deferredRichReady = true;
+      const queue = st._deferredStreamRich || (st._deferredStreamRich = []);
+      if (!queue.includes(message)) queue.push(message);
+      if (sid === this.currentId) this._scheduleDeferredStreamRich(sid, st);
+      return true;
+    },
+
+    _scheduleDeferredStreamRich(sid, st) {
+      if (!sid || !st || this.tabState[sid] !== st || sid !== this.currentId) return;
+      const queue = st._deferredStreamRich || (st._deferredStreamRich = []);
+      for (const message of (st.messages || [])) {
+        if (message && message._deferredRichReady && !queue.includes(message)) {
+          queue.push(message);
+        }
+      }
+      if (!queue.length || st._deferredStreamRichHandle) return;
+
+      const run = () => {
+        st._deferredStreamRichHandle = null;
+        if (this.tabState[sid] !== st || sid !== this.currentId) return;
+        const maxChunk = this._isMobileLayout() ? 1 : 2;
+        const frameBudgetMs = this._isMobileLayout() ? 6 : 12;
+        const started = performance.now();
+        let rendered = 0;
+        while (queue.length && rendered < maxChunk) {
+          if (rendered > 0 && performance.now() - started >= frameBudgetMs) break;
+          const message = queue.shift();
+          if (!message || !this._containsPaneMessage(st, message)
+              || !message._deferredRichReady || !message.text) continue;
+          message.html = this._renderHistoryMessage(message);
+          message._streamPlain = false;
+          message._deferredRichReady = false;
+          st._streamRichRenderCount++;
+          rendered++;
+        }
+        if (queue.length) {
+          this._scheduleDeferredStreamRich(sid, st);
+          return;
+        }
+        this.$nextTick(() => {
+          if (this.tabState[sid] !== st || sid !== this.currentId) return;
+          const pane = this._paneElement(sid);
+          void this.highlightCode(".chat-body", pane ? [pane] : null);
+        });
+      };
+      if (typeof requestIdleCallback === "function") {
+        st._deferredStreamRichHandle = {
+          kind: "idle",
+          id: requestIdleCallback(run, { timeout: 160 }),
+        };
+      } else {
+        st._deferredStreamRichHandle = {
+          kind: "timer",
+          id: setTimeout(run, 0),
+        };
+      }
     },
 
     _historyHtmlDelete(m) {
@@ -6357,6 +6524,10 @@ function portal() {
         // The standalone key is authoritative. p.openTabIds is accepted only as
         // a one-time migration source for users upgrading from schema <= 9.
         this._loadChatTabStore(p.openTabIds);
+        if (Object.prototype.hasOwnProperty.call(p, "openTabIds")) {
+          delete p.openTabIds;
+          this._setLS("muselab_prefs", JSON.stringify(p));
+        }
         // Preview tabs — restore the strip; the actual content fetch happens
         // lazily when the user clicks back to one (or via restorePreviewSelected
         // which runs once after login).
@@ -7647,12 +7818,8 @@ function portal() {
         parentTurnId: "",
         lastEventSeq: 0,
         es: null,
-        // Deduplicate stop taps while the interrupt request is in flight.
-        _stopping: false,
-        // The Stop button settles the visible turn immediately while the backend
-        // interrupt/watchdog confirms asynchronously. This marker suppresses a
-        // duplicate terminal toast and lets a failed /active probe restore truth.
-        _optimisticInterrupt: false,
+        // Exact immutable backend turn whose interrupt is still settling.
+        _stoppingTurnId: "",
         // Abort the POST /stream/start ticket request when Stop is clicked
         // before EventSource exists. Without this, the backend has no active
         // turn/client to interrupt yet and the reply starts after Stop.
@@ -7664,6 +7831,8 @@ function portal() {
         _streamStartedAt: 0,
         _streamRichRenderCount: 0,
         _streamPlainRenderCount: 0,
+        _deferredStreamRich: [],
+        _deferredStreamRichHandle: null,
         _lastSseActivity: 0,
         _stallWatch: null,
         _serverActiveObserved: false,
@@ -7843,9 +8012,6 @@ function portal() {
       }
       if (st._sessionActivityExpected === undefined) {
         st._sessionActivityExpected = null;
-      }
-      if (st._optimisticInterrupt === undefined) {
-        st._optimisticInterrupt = false;
       }
       if (!Number.isFinite(Number(st._installedCanonicalCount))) {
         st._installedCanonicalCount = 0;
@@ -8161,7 +8327,7 @@ function portal() {
       }
       const st = this.tabState && this.tabState[sid];
       if (!st) return zh ? "正在准备会话" : "Preparing the session";
-      if (st._stopping) {
+      if (st._stoppingTurnId) {
         return zh ? "正在中断上一条任务" : "Stopping the previous turn";
       }
       if (st._permissionChangePending) return this.t("perm.switching");
@@ -9430,14 +9596,12 @@ function portal() {
         const hasBoundary = canonicalTurn.some(
           m => m && m.role !== "user" && m.uuid,
         );
-        const hasExpectedAssistant = !expectedAssistantUuid
-          || canonicalTurn.some(m => m && m.uuid === expectedAssistantUuid);
         const hasFinal = expectedAssistantUuid
-          ? hasExpectedAssistant
-          : (!expectedText || canonicalTurn.some(
+          ? canonicalTurn.some(m => m && m.uuid === expectedAssistantUuid)
+          : !!expectedText && canonicalTurn.some(
               m => m && m.role === "assistant" && m.uuid
                 && (m.text || "") === expectedText,
-            ));
+            );
         if (!hasBoundary || !hasFinal) { retry(); return false; }
         if (!stillOwned()) return false;
         const loaded = await this.loadSession(sid, {
@@ -9671,9 +9835,9 @@ function portal() {
       this._fetchTabUsage(id);
     },
 
-    // Retain ten recently-used virtualized transcript panes. Each pane mounts
-    // only its viewport rows/spacers, so this avoids repeated Alpine/Markdown DOM
-    // reconstruction without retaining a second full-history representation.
+    // Retain a bounded set of recently-used virtualized transcript panes. Stream
+    // transport/state outlives its pane, so inactive live sessions must obey the
+    // same limit instead of keeping an unbounded hidden Alpine tree mounted.
     _touchTranscriptPane(id) {
       if (!id) return false;
       const open = new Set(this.workspaceOpenTabIds());
@@ -9683,18 +9847,8 @@ function portal() {
       const previousLru = (this._transcriptPaneLru || []).filter(tid => open.has(tid));
       const lru = [id, ...previousLru.filter(tid => tid !== id)];
       this._transcriptPaneLru = lru;
-      // A background stream keeps mutating its pane. Never evict that live DOM;
-      // once it settles, the next activation naturally trims it by LRU again.
-      const streaming = Array.from(open).filter(tid => {
-        const st = this.tabState && this.tabState[tid];
-        return st && (st.streaming || st.es);
-      });
-      const streamingSet = new Set(streaming);
       const warmLimit = this._isMobileLayout() ? 1 : this.WARM_TRANSCRIPT_LIMIT;
-      const ordinary = lru
-        .filter(tid => !streamingSet.has(tid))
-        .slice(0, warmLimit);
-      const desired = [...ordinary, ...streaming];
+      const desired = lru.slice(0, warmLimit);
       const desiredSet = new Set(desired);
       // Preserve mount order for panes that remain warm. Reordering the x-for on
       // every click would physically move several large DOM subtrees and recreate
@@ -9998,6 +10152,363 @@ function portal() {
       st._virtualRevision++;
     },
 
+    _chatMuxCheckpoints() {
+      const rows = [];
+      const seen = new Set();
+      for (const [sid, channel] of this._chatMuxChannels) {
+        if (!channel || channel.readyState === 2) continue;
+        const st = this.tabState && this.tabState[sid];
+        const turnId = String((st && st.activeTurnId) || channel.turnId || "");
+        if (!turnId) continue;
+        rows.push({
+          session_id: sid,
+          turn_id: turnId,
+          last_event_seq: Math.max(0, Number(st && st.lastEventSeq) || 0),
+        });
+        seen.add(sid);
+      }
+      for (const meta of (this.sessions || [])) {
+        if (!meta || !meta.active || seen.has(meta.id)) continue;
+        const st = this.tabState && this.tabState[meta.id];
+        const turnId = String((st && st.activeTurnId) || meta.turn_id || "");
+        if (!turnId) continue;
+        rows.push({
+          session_id: meta.id,
+          turn_id: turnId,
+          last_event_seq: Math.max(0, Number(st && st.lastEventSeq) || 0),
+        });
+      }
+      return rows;
+    },
+    async _bootstrapChatMuxHistory() {
+      const active = (this.sessions || []).filter(meta => meta && meta.active && meta.id);
+      const concurrency = this._isMobileLayout() ? 1 : 2;
+      let next = 0;
+      const worker = async () => {
+        while (next < active.length) {
+          const meta = active[next++];
+          const st = this._ensureTabState(meta.id);
+          if (st.streaming || st.es || st._loaded) continue;
+          try {
+            await this.loadSession(meta.id, { quiet: true, probeActive: false });
+          } catch (_) { /* the mux replay remains authoritative */ }
+        }
+      };
+      await Promise.all(Array.from(
+        { length: Math.min(concurrency, active.length) }, () => worker()));
+    },
+    _setChatMuxUnsupported() {
+      this._chatMuxSupported = false;
+      this._chatMuxConnected = false;
+      if (this._chatMuxReconnectTimer) clearTimeout(this._chatMuxReconnectTimer);
+      this._chatMuxReconnectTimer = null;
+      try { if (this._chatMuxSource) this._chatMuxSource.close(); } catch (_) {}
+      this._chatMuxSource = null;
+      for (const channel of this._chatMuxChannels.values()) channel.disconnect();
+    },
+    _scheduleChatMuxReconnect() {
+      if (this._chatMuxSupported === false || !this.token
+          || this._chatMuxReconnectTimer) return;
+      const attempts = ++this._chatMuxReconnectAttempts;
+      const delay = Math.min(10_000, 500 * (2 ** Math.min(attempts - 1, 4)));
+      this._chatMuxReconnectTimer = setTimeout(() => {
+        this._chatMuxReconnectTimer = null;
+        void this._ensureChatMux({ reconnect: true });
+      }, delay);
+    },
+    async _ensureChatMux(options = {}) {
+      if (this._chatMuxSupported === false || !this.token
+          || typeof EventSource === "undefined") return false;
+      if (this._chatMuxStartPromise) return await this._chatMuxStartPromise;
+      if (this._chatMuxSource && !options.reconnect) {
+        return this._chatMuxConnected;
+      }
+      this._chatMuxStartPromise = this._openChatMux();
+      try {
+        return await this._chatMuxStartPromise;
+      } finally {
+        this._chatMuxStartPromise = null;
+      }
+    },
+    async _openChatMux() {
+      try { if (this._chatMuxSource) this._chatMuxSource.close(); } catch (_) {}
+      this._chatMuxSource = null;
+      this._chatMuxConnected = false;
+      for (const channel of this._chatMuxChannels.values()) channel.disconnect();
+      let response;
+      try {
+        response = await fetch("/api/chat/stream/mux/start", {
+          method: "POST",
+          headers: Object.assign({ "Content-Type": "application/json" }, this.hdr()),
+          body: JSON.stringify({
+            checkpoints: this._chatMuxCheckpoints(),
+            mobile: this._isMobileLayout(),
+          }),
+        });
+      } catch (_) {
+        this._scheduleChatMuxReconnect();
+        return false;
+      }
+      if (response.status === 404 || response.status === 405) {
+        this._setChatMuxUnsupported();
+        return false;
+      }
+      if (!response.ok) {
+        this._scheduleChatMuxReconnect();
+        return false;
+      }
+      let payload;
+      try { payload = await response.json(); } catch (_) { payload = {}; }
+      if (!payload.ticket) {
+        this._scheduleChatMuxReconnect();
+        return false;
+      }
+      this._chatMuxSupported = true;
+      const source = new EventSource(
+        "/api/chat/stream/mux?ticket=" + encodeURIComponent(payload.ticket));
+      this._chatMuxSource = source;
+      let openSettled = false;
+      let settleOpen;
+      const opened = new Promise(resolve => { settleOpen = resolve; });
+      const finishOpen = value => {
+        if (openSettled) return;
+        openSettled = true;
+        settleOpen(value);
+      };
+      const openTimeout = setTimeout(() => {
+        if (this._chatMuxSource !== source || this._chatMuxConnected) return;
+        try { source.close(); } catch (_) {}
+        this._chatMuxSource = null;
+        finishOpen(false);
+        this._scheduleChatMuxReconnect();
+      }, 5000);
+      source.onopen = () => {
+        if (this._chatMuxSource !== source) return;
+        clearTimeout(openTimeout);
+        this._chatMuxConnected = true;
+        this._chatMuxReconnectAttempts = 0;
+        finishOpen(true);
+        for (const channel of this._chatMuxChannels.values()) {
+          if (channel._activated) channel.open();
+        }
+      };
+      source.addEventListener("session_state", ev => {
+        if (this._chatMuxSource !== source) return;
+        let state = {};
+        try { state = JSON.parse(ev.data) || {}; } catch (_) {}
+        void this._handleChatMuxSessionState(state);
+      });
+      for (const type of CHAT_MUX_STREAM_EVENTS) {
+        source.addEventListener(type, ev => {
+          if (this._chatMuxSource !== source) return;
+          if (type === "error" && (ev.data === undefined || ev.data === "")) {
+            this._handleChatMuxDisconnect(source);
+            return;
+          }
+          if (type === "ping" && !ev.data) {
+            for (const channel of this._chatMuxChannels.values()) {
+              if (channel._activated && channel.readyState !== 2) {
+                channel.dispatchEvent(new MessageEvent("ping", { data: "" }));
+              }
+            }
+            return;
+          }
+          this._dispatchChatMuxEvent(type, ev.data);
+        });
+      }
+      source.onerror = ev => {
+        if (ev && ev.data !== undefined && ev.data !== "") return;
+        clearTimeout(openTimeout);
+        finishOpen(false);
+        this._handleChatMuxDisconnect(source);
+      };
+      return await opened;
+    },
+    _handleChatMuxDisconnect(source) {
+      if (this._chatMuxSource !== source) return;
+      try { source.close(); } catch (_) {}
+      this._chatMuxSource = null;
+      this._chatMuxConnected = false;
+      for (const channel of this._chatMuxChannels.values()) channel.disconnect();
+      // The per-session reducers retain logical ownership while the one native
+      // transport reconnects. In particular, do not synthesize `error`/`done`.
+      this._scheduleChatMuxReconnect();
+    },
+    _queueChatMuxEvent(sid, type, data) {
+      let pending = this._chatMuxPendingEvents.get(sid);
+      if (!pending) {
+        pending = [];
+        pending._bytes = 0;
+      }
+      const bytes = String(data || "").length;
+      if (pending.length >= CHAT_MUX_BOOTSTRAP_MAX_EVENTS
+          || pending._bytes + bytes > CHAT_MUX_BOOTSTRAP_MAX_BYTES) {
+        if (!pending._overflowed) {
+          pending.length = 0;
+          pending._bytes = 0;
+          pending._overflowed = true;
+          pending.push({
+            type: "resync",
+            data: JSON.stringify({
+              session_id: sid,
+              reason: "bootstrap_overflow",
+              fallback: "canonical_history",
+              retryable: false,
+            }),
+          });
+        }
+      } else if (!pending._overflowed) {
+        pending.push({ type, data });
+        pending._bytes += bytes;
+      }
+      this._chatMuxPendingEvents.set(sid, pending);
+    },
+    _dispatchChatMuxEvent(type, data) {
+      let payload = null;
+      try { payload = JSON.parse(data); } catch (_) {}
+      const sid = String(payload && payload.session_id || "");
+      if (!sid) return;
+      const turnId = String(payload.turn_id || "");
+      const channel = this._chatMuxChannels.get(sid);
+      if (!channel || !channel._activated
+          || (channel.turnId && turnId && channel.turnId !== turnId)) {
+        this._queueChatMuxEvent(sid, type, data);
+        return;
+      }
+      channel.dispatchEvent(new MessageEvent(type, { data }));
+    },
+    _chatMuxChannel(sid, turnId) {
+      const existing = this._chatMuxChannels.get(sid);
+      if (existing && existing.readyState !== 2
+          && (!turnId || !existing.turnId || existing.turnId === turnId)) {
+        if (!existing.turnId && turnId) existing.turnId = turnId;
+        return existing;
+      }
+      if (existing) existing.close();
+      const channel = new ChatMuxSessionChannel(sid, turnId, closed => {
+        if (this._chatMuxChannels.get(sid) === closed) {
+          this._chatMuxChannels.delete(sid);
+        }
+      });
+      this._chatMuxChannels.set(sid, channel);
+      return channel;
+    },
+    _activateChatMuxChannel(channel) {
+      if (!channel || channel.readyState === 2) return;
+      channel._activated = true;
+      if (this._chatMuxConnected) channel.open();
+      const pending = this._chatMuxPendingEvents.get(channel.sessionId) || [];
+      this._chatMuxPendingEvents.delete(channel.sessionId);
+      for (const event of pending) {
+        let payload = null;
+        try { payload = JSON.parse(event.data); } catch (_) {}
+        const turnId = String(payload && payload.turn_id || "");
+        if (channel.turnId && turnId && channel.turnId !== turnId) continue;
+        channel.dispatchEvent(new MessageEvent(event.type, { data: event.data }));
+      }
+    },
+    async _handleChatMuxSessionState(payload) {
+      const sid = String(payload && payload.session_id || "");
+      if (!sid) return;
+      const meta = (this.sessions || []).find(session => session.id === sid);
+      const existingState = this.tabState && this.tabState[sid];
+      if (!payload.active) {
+        const inactiveTurnId = String(payload.turn_id || "");
+        const currentTurnId = String(existingState && existingState.activeTurnId || "");
+        if (inactiveTurnId && currentTurnId && inactiveTurnId !== currentTurnId) {
+          // A delayed inactive frame for turn A must not retire or relabel its
+          // already-admitted successor turn B in the same session.
+          return;
+        }
+        if (meta) {
+          meta.active = false;
+          meta.turn_active = false;
+          meta.background_active = false;
+        }
+        this._chatMuxPendingEvents.delete(sid);
+        const ownsInactiveTurn = !!(existingState && inactiveTurnId
+          && currentTurnId === inactiveTurnId);
+        if (ownsInactiveTurn) {
+          if (existingState._stoppingTurnId === inactiveTurnId) {
+            existingState._stoppingTurnId = "";
+          }
+          this._retireStaleSessionStream(sid, existingState);
+          this._setSessionActivityExpectation(sid, false);
+          existingState._pendingExternalUpdate = true;
+          this._scheduleCanonicalStreamReload(
+            sid, existingState, { minimumWaitMs: 0 });
+          return;
+        }
+        if (existingState && !existingState.streaming) {
+          this._setBackgroundTaskActive(sid, false, payload.started_at, 0);
+        }
+        return;
+      }
+      if (meta) {
+        meta.active = true;
+        meta.turn_active = !payload.background;
+        meta.background_active = !!payload.background;
+      }
+      if (payload.attachable === false) {
+        // Watcher-only ownership has no replayable turn yet. Preserve its blue
+        // dot/background state, but do not create a reducer runtime until the
+        // continuation broadcast becomes attachable.
+        if (existingState && !existingState.streaming) {
+          this._setBackgroundTaskActive(
+            sid, true, payload.started_at, payload.background_tasks_pending);
+        }
+        return;
+      }
+      const turnId = String(payload.turn_id || "");
+      if (!turnId) return;
+      if (existingState && payload.stopping) {
+        existingState._stoppingTurnId = turnId;
+      }
+      if (existingState && existingState.es
+          && existingState.activeTurnId === turnId) return;
+      if (existingState && existingState.es && existingState.es._muxChannel
+          && existingState.activeTurnId
+          && existingState.activeTurnId !== turnId) {
+        // The aggregate state frame is authoritative for ABA turn changes. Retire
+        // only the stale logical adapter; the root EventSource remains shared.
+        this._retireStaleSessionStream(sid, existingState);
+        existingState._pendingExternalUpdate = true;
+      }
+      if (this._chatMuxAttachPromises.has(sid)) return;
+      const attach = (async () => {
+        const st = this._ensureTabState(sid);
+        if (!st._loaded && !st.streaming && !st.es) {
+          await this.loadSession(sid, { quiet: true, probeActive: false });
+        }
+        if (st.streaming || st.es || this.tabState[sid] !== st) return;
+        st.parentTurnId = String(payload.parent_turn_id || "");
+        await this.send({
+          reconnect: true,
+          sessionId: sid,
+          turnId,
+          startedAt: payload.started_at,
+          continuation: !!payload.continuation,
+          _muxAttach: true,
+        });
+      })();
+      this._chatMuxAttachPromises.set(sid, attach);
+      try { await attach; } finally {
+        if (this._chatMuxAttachPromises.get(sid) === attach) {
+          this._chatMuxAttachPromises.delete(sid);
+        }
+      }
+    },
+    async _startChatMuxCoordinator() {
+      if (this._chatMuxSupported === false) return false;
+      // Establish the one authoritative live transport before any background
+      // transcript warmup. A turn can start while history is loading; mux-first
+      // startup guarantees its accepted/session_state events already have a sink.
+      const connected = await this._ensureChatMux();
+      if (!connected) return false;
+      await this._bootstrapChatMuxHistory();
+      return true;
+    },
+
     async initSessions(options = {}) {
       if (this._sessionInitPromise) return this._sessionInitPromise;
       this._sessionInitPromise = this._initSessionsOnce(options);
@@ -10096,6 +10607,10 @@ function portal() {
       }));
       this._sessionsInitialized = true;
       this._scheduleSavePrefs();
+      // Session discovery and the initial bounded transcript tail are now ready.
+      // Start exactly one root chat EventSource; every active session attaches to
+      // it through a lightweight EventSource-compatible channel.
+      void this._startChatMuxCoordinator();
       return true;
     },
     // Shared session-list pull behind both the explicit refresh and the 10s
@@ -10408,6 +10923,10 @@ function portal() {
         return Promise.resolve(false);
       }
       const ownerEs = st.es;
+      if (ownerEs && ownerEs._muxChannel && !this._chatMuxConnected) {
+        this._scheduleChatMuxReconnect();
+        return Promise.resolve(false);
+      }
       const observedActivity = Number(st._lastSseActivity)
         || Number(st._streamStartedAt) || Date.now();
       const transportClosed = !!(ownerEs && Number(ownerEs.readyState) === 2);
@@ -11406,7 +11925,8 @@ function portal() {
       }
     },
     closeWorkspaceBrowser() {
-      if (!this.workspaceBrowser.show || this.workspaceSwitching) return;
+      if (!this.workspaceBrowser.show || this.workspaceSwitching
+          || this.workspaceRegistryBusy) return;
       this.workspaceBrowser.show = false;
       this.workspaceBrowser.requestSeq++;
       this.workspaceBrowser.loading = false;
@@ -11464,8 +11984,8 @@ function portal() {
       return (this.lang === "zh" ? "将添加：" : "Add: ") + name;
     },
     async _registerWorkspacePath(path) {
-      if (!path || this.workspaceSwitching) return null;
-      this.workspaceSwitching = true;
+      if (!path || this.workspaceSwitching || this.workspaceRegistryBusy) return null;
+      this.workspaceRegistryBusy = true;
       let entry = null;
       try {
         const response = await fetch("/api/chat/workspaces", {
@@ -11483,7 +12003,7 @@ function portal() {
           : "The directory is invalid, unreadable, or no longer available.";
         this.toast(this.lang === "zh" ? "目录无法登记" : "Could not register that directory", "error");
       } finally {
-        this.workspaceSwitching = false;
+        this.workspaceRegistryBusy = false;
       }
       return entry;
     },
@@ -11494,7 +12014,7 @@ function portal() {
       await this.switchWorkspace(entry.path);
     },
     async addWorkspacePathManually() {
-      if (this.workspaceSwitching) return;
+      if (this.workspaceSwitching || this.workspaceRegistryBusy) return;
       const value = await this.prompt({
         title: this.lang === "zh" ? "输入工作目录路径" : "Enter workspace path",
         body: this.lang === "zh"
@@ -11512,7 +12032,7 @@ function portal() {
     },
     async addWorkspace() {
       this.workspaceMenuOpen = false;
-      if (this.workspaceSwitching) return;
+      if (this.workspaceSwitching || this.workspaceRegistryBusy) return;
       const browser = this.workspaceBrowser;
       browser.show = true;
       browser.error = "";
@@ -11551,6 +12071,7 @@ function portal() {
           this.imageEditor._snapshot = null;
         }
         if (this.imageGen.ownerSid === id) {
+          this.cancelImageGenSubmit();
           this.imageGen.show = false;
           this.imageGen.ownerSid = "";
         }
@@ -11562,6 +12083,7 @@ function portal() {
         if (st._streamTimer) clearInterval(st._streamTimer);
         if (st._stallWatch) clearInterval(st._stallWatch);
         if (st._reconnectTimer) clearTimeout(st._reconnectTimer);
+        this._cancelDeferredStreamRich(st, true);
         this._disposeSessionSync(st);
         if (st._virtualSyncFrame) {
           if (typeof cancelAnimationFrame === "function") {
@@ -11599,7 +12121,9 @@ function portal() {
       this._clearSessionWarnFlags(id);
     },
     _startWorkspaceDrag(path, pointerId = null) {
-      if (this.workspaceSwitching || !this.sessionWorkspaces.some(row => row.path === path)) return false;
+      if (this.workspaceSwitching || this.workspaceRegistryBusy
+          || this.workspaceOrderSaving
+          || !this.sessionWorkspaces.some(row => row.path === path)) return false;
       this.workspaceDrag = {
         path, overPath: path, pointerId,
         originalPaths: this.sessionWorkspaces.map(row => row.path),
@@ -11656,14 +12180,14 @@ function portal() {
     },
     async finishWorkspaceDrag() {
       const drag = this.workspaceDrag;
-      if (!drag.path) return;
+      if (!drag.path || this.workspaceOrderSaving) return;
       const currentPaths = this.sessionWorkspaces.map(row => row.path);
       const changed = currentPaths.some((path, index) => path !== drag.originalPaths[index]);
       this.workspaceDrag = { path: "", overPath: "", pointerId: null, originalPaths: [] };
       if (!changed) return;
 
       this._saveWorkspaceOrder();
-      this.workspaceSwitching = true;
+      this.workspaceOrderSaving = true;
       try {
         const response = await fetch("/api/chat/workspaces/order", {
           method: "PUT",
@@ -11682,12 +12206,13 @@ function portal() {
         this._saveWorkspaceOrder();
         this.toast(this.lang === "zh" ? "工作目录排序保存失败" : "Could not save workspace order", "error");
       } finally {
-        this.workspaceSwitching = false;
+        this.workspaceOrderSaving = false;
       }
     },
     async removeWorkspace(path) {
       const entry = this.sessionWorkspaces.find(w => w.path === path);
-      if (!entry || entry.primary || this.workspaceSwitching) return;
+      if (!entry || entry.primary || this.workspaceSwitching
+          || this.workspaceRegistryBusy) return;
       const ok = await this.confirm({
         title: this.lang === "zh" ? "移除工作目录" : "Remove workspace",
         body: this.lang === "zh"
@@ -11697,12 +12222,22 @@ function portal() {
         okText: this.lang === "zh" ? "移除" : "Remove",
       });
       if (!ok) return;
-      this.workspaceSwitching = true;
-      try {
+      if (this.workspaceSwitching || this.workspaceRegistryBusy) return;
+      if (this.activeWorkspace === path) {
+        const primary = this.sessionWorkspaces.find(w => w.primary);
+        if (!primary) return;
+        await this.switchWorkspace(primary.path);
         if (this.activeWorkspace === path) {
-          const primary = this.sessionWorkspaces.find(w => w.primary);
-          if (primary) await this._changeWorkspaceSurface(primary.path);
+          this.toast(this.lang === "zh"
+            ? "切换到主工作目录失败，未执行移除"
+            : "Could not switch to the primary workspace; nothing was removed",
+          "error");
+          return;
         }
+      }
+      if (this.workspaceSwitching || this.workspaceRegistryBusy) return;
+      this.workspaceRegistryBusy = true;
+      try {
         const response = await fetch(
           "/api/chat/workspaces?path=" + encodeURIComponent(path),
           { method: "DELETE", headers: this.hdr() },
@@ -11731,7 +12266,7 @@ function portal() {
       } catch (_) {
         this.toast(this.lang === "zh" ? "移除工作目录失败" : "Could not remove workspace", "error");
       } finally {
-        this.workspaceSwitching = false;
+        this.workspaceRegistryBusy = false;
       }
     },
     _registerOptimisticSession(meta) {
@@ -14940,9 +15475,16 @@ function portal() {
       // Switch the visible tab. We do NOT touch other tabs' streams — each
       // tab's ES is in its own tabState[id], and stream callbacks write
       // there directly. Switching is just "show that tab".
-      // The active pane and the nine most-recent panes stay mounted as bounded
+      // The active pane and a bounded set of recent panes stay mounted as
       // virtualized DOM views. Canonical messages remain owned by tabState.
       this._activateTabState(this.currentId);
+      const activatedState = this.tabState && this.tabState[this.currentId];
+      if (activatedState && typeof activatedState._flushLivePresentation === "function") {
+        activatedState._flushLivePresentation();
+      }
+      if (activatedState) {
+        this._scheduleDeferredStreamRich(this.currentId, activatedState);
+      }
       // Selecting a conversation means opening its latest state, not restoring a
       // stale historical viewport. Reader-controlled position is preserved only
       // while staying inside the same active tab; every explicit tab selection
@@ -15435,7 +15977,12 @@ function portal() {
           minimumTail,
           quiet ? Math.max(historyPage, st.messages.length) : historyPage,
         );
-        const qs = full ? "?full=1" : "?tail=" + requestedTail;
+        const preserveFullOrder = quiet && st.messageRange.order === "full";
+        const qs = full
+          ? "?full=1"
+          : preserveFullOrder
+            ? "?full=1&tail=" + requestedTail
+            : "?tail=" + requestedTail;
         let r;
         const fetchStarted = perfNow();
         try {
@@ -15722,7 +16269,6 @@ function portal() {
                 st.atBottom = false;
               }
             });
-            await this._fetchTabUsage(sid);
             historyPerf.status = "ok";
             return true;
           }
@@ -15773,7 +16319,6 @@ function portal() {
             });
           });
         }
-        await this._fetchTabUsage(sid);
         historyPerf.status = "ok";
         return true;
       } finally {
@@ -28404,23 +28949,12 @@ function portal() {
       // interrupt endpoint's atomic pause and the turn cleanup's second pause;
       // that new item then appeared accepted but remained paused.  Keep the
       // draft intact and make the short wait explicit instead.
-      if (sendState._stopping && !opts.reconnect && !opts.resumedItem) {
+      if (sendState._stoppingTurnId && !opts.reconnect && !opts.resumedItem) {
         this.toast(this.lang === "zh"
           ? "正在中断上一条任务，请稍候再发送"
           : "The previous turn is still stopping; send again in a moment",
         "warn", 2200);
         return false;
-      }
-      if (sendState._optimisticInterrupt && !opts.reconnect && !opts.resumedItem) {
-        // The user is intentionally moving on before the old cancelled event
-        // arrives. Retire only that old transport ownership now; otherwise its
-        // late _markDone would clear the NEW send's streaming flag/timer on this
-        // shared tab state. Backend snapshot persistence continues independently,
-        // and the canonical poll later merges any retained partial output.
-        try { if (sendState.es) sendState.es.close(); } catch (_) {}
-        sendState.es = null;
-        sendState._optimisticInterrupt = false;
-        sendState._pendingExternalUpdate = true;
       }
       // Do not start a new turn between the optimistic selector change and
       // its persisted session update. Otherwise Plan Mode could launch with a
@@ -28688,6 +29222,11 @@ function portal() {
         this._scheduleLiveMessageViewport(sendState);
         sentUserBubble = this._appendLiveMessage(sendState, {
           role: "user", text,
+          // The bubble exists before the server decides whether this prompt
+          // owns a turn or a queue slot.  Keep pane-level Running hidden until
+          // admission is authoritative.
+          _admissionPending: true,
+          _optimisticQueue: false,
           displayText: hasDetachedText ? detachedDisplayText : composerInput,
           selectionQuotes: composerQuotes.map(q => ({ ...q })),
           images: readyImages.map(im => ({
@@ -28733,6 +29272,7 @@ function portal() {
         ? await this._confirmSessionBusy(sendSid, sendState)
         : false;
       if (confirmedBusy) {
+        if (sentUserBubble) sentUserBubble._optimisticQueue = true;
         this._setComposerClaimPhase(sendState, composerSubmitToken, "queue");
         const shouldHandoffBackground = !sendState.streaming
           && !sendState.compacting
@@ -28900,41 +29440,21 @@ function portal() {
         this.scrollToBottom(true);
       }
 
-      // Ticket flow: POST the prompt + params with header auth, get a
-      // one-time ticket, open the SSE with ONLY the ticket in the URL.
-      // Keeps the user's prompt and the auth token out of access logs /
-      // browser history (EventSource can't send headers or a body).
-      // Legacy query-param fallback ONLY when the endpoint doesn't exist
-      // (old backend → 404/405). A 5xx or network blip must NOT silently
-      // downgrade to putting the prompt + token back into the URL — retry
-      // the ticket once, then surface the failure instead.
+      // Mux flow: one root EventSource receives every session. This send only
+      // admits a new turn, then installs an EventSource-compatible per-session
+      // channel so the reducer below remains the sole event/state implementation.
+      // Legacy per-session SSE is used only after an explicit 404/405 capability
+      // response from the mux or turn-start endpoint.
       let url;
+      let es;
+      let useMux = false;
       this._setComposerClaimPhase(sendState, composerSubmitToken, "stream_start");
       const streamStartController = new AbortController();
       streamState._streamStartController = streamStartController;
       streamState._cancelBeforeStream = false;
-      const _mintTicket = async () => {
-        const tr = await fetch("/api/chat/stream/start", {
-          method: "POST",
-          headers: Object.assign({ "Content-Type": "application/json" }, this.hdr()),
-          signal: streamStartController.signal,
-          body: JSON.stringify({
-            prompt: text,
-            session_id: streamSid,
-            turn_id: expectedTurnId,
-            last_event_seq: resumeEventSeq,
-            model: sendModel,
-            permission: sendPermission,
-            image_ids: attachIds.length ? attachIds.join(",") : "",
-            mobile: streamMobile,
-          }),
-        });
-        return tr;
-      };
-      // Stop/ticket failure before EventSource opens means no backend turn was
-      // created. Remove the optimistic bubble, restore the full local payload,
-      // and reset every stream flag/timer without relying on the later-scoped
-      // _markDone closure.
+      // Stop/start failure before a channel opens removes the optimistic bubble,
+      // restores the full local payload and resets every stream flag/timer without
+      // relying on the later-scoped _markDone closure.
       const rollbackUnstartedSend = (restoreDraft = true) => {
         if (sentUserBubble) {
           this._removePaneMessage(streamState, sentUserBubble);
@@ -28953,46 +29473,126 @@ function portal() {
         streamState.es = null;
         streamState._streamStartController = null;
         streamState._cancelBeforeStream = false;
-        streamState._stopping = false;
-        streamState._optimisticInterrupt = false;
+        streamState._stoppingTurnId = "";
         streamState._serverActiveObserved = false;
         streamState.activeTurnId = "";
         streamState.parentTurnId = "";
         streamState.lastEventSeq = 0;
         streamState.streamingModel = "";
       };
+      const _mintLegacyTicket = async () => await fetch("/api/chat/stream/start", {
+        method: "POST",
+        headers: Object.assign({ "Content-Type": "application/json" }, this.hdr()),
+        signal: streamStartController.signal,
+        body: JSON.stringify({
+          prompt: text,
+          session_id: streamSid,
+          turn_id: expectedTurnId,
+          last_event_seq: resumeEventSeq,
+          model: sendModel,
+          permission: sendPermission,
+          image_ids: attachIds.length ? attachIds.join(",") : "",
+          mobile: streamMobile,
+        }),
+      });
       try {
-        let tr = await _mintTicket();
-        if (tr.status === 404 || tr.status === 405) {
-          // Old backend without /stream/start — legacy URL is the contract.
-          url = "/api/chat/stream"
-            + "?prompt=" + encodeURIComponent(text)
-            + "&session_id=" + encodeURIComponent(streamSid)
-            + "&turn_id=" + encodeURIComponent(expectedTurnId)
-            + "&last_event_seq=" + encodeURIComponent(resumeEventSeq)
-            + "&model=" + encodeURIComponent(sendModel)
-            + "&permission=" + encodeURIComponent(sendPermission)
-            + "&mobile=" + (streamMobile ? "1" : "0")
-            + (attachIds.length ? "&image_ids=" + encodeURIComponent(attachIds.join(",")) : "")
-            + "&token=" + encodeURIComponent(this.token);
-        } else {
-          if (!tr.ok) {
-            // Transient 5xx — one retry before giving up.
-            tr = await _mintTicket();
+        const muxReady = await this._ensureChatMux();
+        if (muxReady) {
+          useMux = true;
+          let admittedTurnId = expectedTurnId;
+          if (!isReconnect) {
+            const startTurn = async () => await fetch("/api/chat/turns/start", {
+              method: "POST",
+              headers: Object.assign({ "Content-Type": "application/json" }, this.hdr()),
+              signal: streamStartController.signal,
+              body: JSON.stringify({
+                prompt: text,
+                session_id: streamSid,
+                model: sendModel,
+                permission: sendPermission,
+                image_ids: attachIds.length ? attachIds.join(",") : "",
+                mobile: streamMobile,
+              }),
+            });
+            let tr = await startTurn();
+            if (tr.status === 404 || tr.status === 405) {
+              this._setChatMuxUnsupported();
+              useMux = false;
+            } else {
+              if (tr.status === 409 && !resumed) {
+                if (sentUserBubble) sentUserBubble._optimisticQueue = true;
+                const queued = await this._enqueueMessage(streamSid, {
+                  text,
+                  displayText: hasDetachedText ? detachedDisplayText : composerInput,
+                  pendingImages: hasDetachedText ? [] : composerImages,
+                  pendingDocs: hasDetachedText ? [] : composerDocs,
+                  pendingQuotes: hasDetachedText ? [] : composerQuotes,
+                  permission: sendPermission,
+                  plan_return_permission: sendPlanReturnPermission,
+                });
+                if (queued) {
+                  rollbackUnstartedSend(false);
+                  if (isComposerSubmission) {
+                    this._commitChatRecoveryDraft(sendSid, composerInput);
+                  }
+                  this.toast(this.lang === "zh"
+                    ? "当前任务仍在收尾，消息已加入队列"
+                    : "The current task is still finishing; message queued",
+                  "info", 2800);
+                  return true;
+                }
+              }
+              if (!tr.ok) tr = await startTurn();
+              if (!tr.ok) throw new Error("turn start " + tr.status);
+              const admitted = await tr.json();
+              if (admitted.accepted === false || !admitted.turn_id) {
+                throw new Error("turn not accepted");
+              }
+              admittedTurnId = String(admitted.turn_id);
+              streamState.activeTurnId = admittedTurnId;
+              streamState.parentTurnId = "";
+              streamState.lastEventSeq = 0;
+              if (sentUserBubble) {
+                sentUserBubble._turnId = admittedTurnId;
+                sentUserBubble._admissionPending = false;
+              }
+              if (Number(admitted.started_at) > 0) {
+                streamState._streamStartedAt = Number(admitted.started_at) * 1000;
+              }
+            }
           }
-          if (!tr.ok) throw new Error("ticket " + tr.status);
-          const td = await tr.json();
-          url = "/api/chat/stream?ticket=" + encodeURIComponent(td.ticket);
+          if (useMux) {
+            es = this._chatMuxChannel(streamSid, admittedTurnId);
+          }
+        } else if (this._chatMuxSupported !== false) {
+          throw new Error("mux unavailable");
+        }
+        if (!useMux) {
+          let tr = await _mintLegacyTicket();
+          if (tr.status === 404 || tr.status === 405) {
+            url = "/api/chat/stream"
+              + "?prompt=" + encodeURIComponent(text)
+              + "&session_id=" + encodeURIComponent(streamSid)
+              + "&turn_id=" + encodeURIComponent(expectedTurnId)
+              + "&last_event_seq=" + encodeURIComponent(resumeEventSeq)
+              + "&model=" + encodeURIComponent(sendModel)
+              + "&permission=" + encodeURIComponent(sendPermission)
+              + "&mobile=" + (streamMobile ? "1" : "0")
+              + (attachIds.length ? "&image_ids=" + encodeURIComponent(attachIds.join(",")) : "")
+              + "&token=" + encodeURIComponent(this.token);
+          } else {
+            if (!tr.ok) tr = await _mintLegacyTicket();
+            if (!tr.ok) throw new Error("ticket " + tr.status);
+            const td = await tr.json();
+            url = "/api/chat/stream?ticket=" + encodeURIComponent(td.ticket);
+          }
+          es = new EventSource(url);
         }
       } catch (_e) {
         if (streamState._cancelBeforeStream) {
-          // stop() already performed the authoritative local cleanup. The
-          // ticket was never consumed, so no backend turn/transcript exists.
           rollbackUnstartedSend();
           return false;
         }
-        // Could not mint a ticket (server error / network) — fail the send
-        // visibly rather than leaking prompt+token into the URL.
         rollbackUnstartedSend();
         this.toast(this.lang === "zh"
           ? "发送失败：无法建立流式连接，请重试"
@@ -29005,13 +29605,11 @@ function portal() {
         }
       }
       if (streamState._cancelBeforeStream) {
-        // Ticket minted but Stop landed first — same rollback. The ticket is
-        // never consumed and expires on its own.
         rollbackUnstartedSend();
         return false;
       }
-      const es = new EventSource(url);
       streamState.es = es;
+      const streamTurnId = String(streamState.activeTurnId || expectedTurnId || "");
       // NOTE — a successful open deliberately does NOT reset
       // _reconnectAttempts. Every reconnect DOES open successfully (the
       // backend replays the turn happily), so resetting here made the
@@ -29087,6 +29685,9 @@ function portal() {
             }
           }
         }
+        if (sentUserBubble && !["ping", "error", "resync"].includes(ev && ev.type)) {
+          sentUserBubble._admissionPending = false;
+        }
         if (ev && ev.type !== "error") {
           this._cancelSessionSyncReason(streamState, "transport_retry");
         }
@@ -29128,10 +29729,14 @@ function portal() {
           || (sync.pending && sync.pending.stream_health)
         ));
         if (silentMs > 40000 && !healthProbePending) {
-          // 40s of total silence (server pings every 15s → ≥2 missed) means
-          // the connection is dead in a way onerror never caught. Tear down
-          // the watchdog and drive the existing reconnect logic via a
-          // synthetic error (no ev.data → JSON.parse throws → transport path).
+          // A mux channel never owns the native socket. Reconnect the one root
+          // transport without sending a synthetic per-session terminal/error.
+          if (es._muxChannel) {
+            this._scheduleChatMuxReconnect();
+            this._recoverStalledStream(streamSid);
+            return;
+          }
+          // Legacy per-session SSE keeps the existing transparent retry path.
           clearInterval(streamState._stallWatch);
           streamState._stallWatch = null;
           try { es.dispatchEvent(new Event("error")); } catch (_) {}
@@ -29147,6 +29752,9 @@ function portal() {
       // tab is active).
       let curBubble = null;
       let acc = "";
+      let thinkingBubble = null;
+      let thinkingAcc = "";
+      const pendingTaskProgress = new Map();
       if (isReconnect && resumeEventSeq > 0 && !isContinuation) {
         const existing = streamState.messages;
         const tail = existing[existing.length - 1];
@@ -29191,7 +29799,8 @@ function portal() {
         // empty / null so x-show defaults match "not yet computed".
         const bubble = {
           role: "assistant",
-          text: "", html: "", _streamText: "", _streamPlain: true, cost: "",
+          text: "", html: "", _streamText: "", _streamPlain: true,
+          _deferredRichReady: false, cost: "",
           model: modelForBubble,
           ts: null,
           elapsed: 0,
@@ -29259,6 +29868,7 @@ function portal() {
         pendingTimer = null;
         pendingFrame = null;
         if (!ownsCurBubble()) { curBubble = null; acc = ""; return; }
+        if (this.currentId !== streamSid) return;
         curBubble.text = acc;
         curBubble._streamText = acc;
         curBubble._streamPlain = true;
@@ -29267,7 +29877,7 @@ function portal() {
         _scrollIfActive();
       };
       const schedulePlainPaint = () => {
-        if (pendingTimer || pendingFrame) return;
+        if (this.currentId !== streamSid || pendingTimer || pendingFrame) return;
         const queueFrame = () => {
           pendingTimer = null;
           if (typeof requestAnimationFrame === "function") {
@@ -29290,6 +29900,7 @@ function portal() {
         curBubble._streamText = acc;
         curBubble.html = this._renderHistoryMessage(curBubble);
         curBubble._streamPlain = false;
+        curBubble._deferredRichReady = false;
         streamState._streamRichRenderCount++;
         _scrollIfActive();
       };
@@ -29297,7 +29908,32 @@ function portal() {
         if (ownsCurBubble()) renderFinal();
         else { cancelPendingPaint(); curBubble = null; acc = ""; }
       };
-      const closeAsst = () => { flushRender(); curBubble = null; acc = ""; };
+      const flushPlainBoundary = () => {
+        cancelPendingPaint();
+        if (!ownsCurBubble()) { curBubble = null; acc = ""; return; }
+        curBubble.text = acc;
+        curBubble._streamText = acc;
+        curBubble._streamPlain = true;
+        if (this.currentId === streamSid) _scrollIfActive();
+      };
+      const closeAsst = () => {
+        const completedBubble = ownsCurBubble() ? curBubble : null;
+        flushPlainBoundary();
+        if (completedBubble) {
+          this._queueDeferredStreamRich(streamSid, streamState, completedBubble);
+        }
+        curBubble = null;
+        acc = "";
+      };
+      const flushThinking = () => {
+        if (!ownsStreamState() || !thinkingBubble) return;
+        thinkingBubble.text = thinkingAcc;
+      };
+      const closeThinking = () => {
+        flushThinking();
+        thinkingBubble = null;
+        thinkingAcc = "";
+      };
       const _setContinuationAwaitingReaction = (waiting) => {
         if (!isContinuation) return;
         const next = !!waiting;
@@ -29368,11 +30004,56 @@ function portal() {
           taskCardByTaskId.set(String(card.task_status.task_id), card);
         }
       };
+      const taskProgressKey = (toolUseId, patch) => String(
+        toolUseId || (patch && patch.task_id) || "",
+      );
+      const queueTaskProgress = (toolUseId, patch) => {
+        const key = taskProgressKey(toolUseId, patch);
+        if (!key) return;
+        const pending = pendingTaskProgress.get(key);
+        pendingTaskProgress.set(key, {
+          toolUseId,
+          patch: Object.assign({}, pending ? pending.patch : {}, patch),
+        });
+      };
+      const flushTaskProgress = () => {
+        if (!ownsStreamState() || !pendingTaskProgress.size) return;
+        for (const pending of pendingTaskProgress.values()) {
+          applyTaskStatus(pending.toolUseId, pending.patch);
+        }
+        pendingTaskProgress.clear();
+      };
+      const flushLivePresentation = () => {
+        if (!ownsStreamState() || this.currentId !== streamSid) return false;
+        if (ownsCurBubble()) paintPlainNow();
+        flushThinking();
+        flushTaskProgress();
+        return true;
+      };
+      streamState._flushLivePresentation = flushLivePresentation;
+      const flushTerminalPresentation = () => {
+        const completedBubble = ownsCurBubble() ? curBubble : null;
+        if (completedBubble && this.currentId === streamSid) {
+          flushRender();
+        } else if (completedBubble) {
+          flushPlainBoundary();
+          this._queueDeferredStreamRich(streamSid, streamState, completedBubble);
+        } else {
+          cancelPendingPaint(); curBubble = null; acc = "";
+        }
+        closeThinking();
+        flushTaskProgress();
+        const completedText = completedBubble ? (completedBubble.text || "") : "";
+        curBubble = null;
+        acc = "";
+        return { bubble: completedBubble, text: completedText };
+      };
 
       es.addEventListener("text", ev => {
         let d;
         try { d = JSON.parse(ev.data); } catch (_) { return; }
         _setContinuationAwaitingReaction(false);
+        closeThinking();
         if (!openAsst()) return;
         acc += d.text;
         // Keep the currently painted snapshot stable while the user selects it.
@@ -29389,27 +30070,26 @@ function portal() {
         try { d = JSON.parse(ev.data); } catch (_) { return; }
         _setContinuationAwaitingReaction(false);
         closeAsst();
-        // Backend yields one SSE event per thinking_delta. Coalesce them
-        // into the most recent thinking message so we see ONE block per
-        // reasoning segment, not N tiny ones. If the tail isn't a thinking
-        // message (e.g. previous was tool_use), start a new one.
-        const msgs = streamState.messages;
-        const last = msgs[msgs.length - 1];
-        let pushed = false;
-        if (last && last.role === "thinking") {
-          last.text = (last.text || "") + (d.text || "");
-        } else {
-          this._appendLiveMessage(streamState, { role: "thinking", text: d.text || "" });
-          pushed = true;
+        // Keep one thinking row per contiguous reasoning segment, but publish
+        // token-rate text only for the visible tab. Background streams retain
+        // the complete closure accumulator and flush once on activation/boundary.
+        if (!thinkingBubble) {
+          thinkingBubble = this._appendLiveMessage(
+            streamState, { role: "thinking", text: "" });
+          thinkingAcc = "";
         }
-
-        _scrollIfActive();
+        thinkingAcc += d.text || "";
+        if (this.currentId === streamSid) {
+          thinkingBubble.text = thinkingAcc;
+          _scrollIfActive();
+        }
       });
       es.addEventListener("tool_use", ev => {
         let d;
         try { d = JSON.parse(ev.data); } catch (_) { return; }
         _setContinuationAwaitingReaction(false);
         closeAsst();
+        closeThinking();
         // `id` is the SDK's toolu_xxx tool_use_id. Critical for
         // _taskSubjectMapForMessages — it pairs each TaskCreate
         // tool_use with the tool_result that carries the assigned
@@ -29482,16 +30162,19 @@ function portal() {
       es.addEventListener("task_progress", ev => {
         let d;
         try { d = JSON.parse(ev.data); } catch (_) { return; }
-        applyTaskStatus(d.tool_use_id, {
+        const patch = {
           task_id: d.task_id,
           state: "running",
           usage: d.usage || null,
           last_tool_name: d.last_tool_name || "",
-        });
+        };
+        if (this.currentId === streamSid) applyTaskStatus(d.tool_use_id, patch);
+        else queueTaskProgress(d.tool_use_id, patch);
       });
       es.addEventListener("task_notification", ev => {
         let d;
         try { d = JSON.parse(ev.data); } catch (_) { return; }
+        flushTaskProgress();
         // SDK status ∈ {completed, failed, stopped}; map unknown → "done"
         // so a future status value still renders a terminal (not stuck)
         // state instead of silently staying on ⏳.
@@ -29564,6 +30247,7 @@ function portal() {
         let d;
         try { d = JSON.parse(ev.data); } catch (_) { return; }
         closeAsst();
+        closeThinking();
         // Pre-populate pendingAnswers with one key per question (multiSelect
         // → []; single → null). Without this, Alpine's Proxy doesn't reliably
         // re-evaluate :class={picked: ...} when we add a brand-new key on
@@ -29593,6 +30277,7 @@ function portal() {
         let d;
         try { d = JSON.parse(ev.data); } catch (_) { return; }
         closeAsst();
+        closeThinking();
         const exitPlan = d.kind === "exit_plan"
           || d.kind === "exit_plan_mode"
           || d.tool === "ExitPlanMode";
@@ -29779,6 +30464,10 @@ function portal() {
         streamState.streamPhase = "";
         streamState._continuationAwaitingReaction = false;
         streamState.es = null;
+        if (streamState._flushLivePresentation === flushLivePresentation) {
+          streamState._flushLivePresentation = null;
+        }
+        pendingTaskProgress.clear();
         if (followedTail) {
           this._boundLiveMessageRange(streamState, true);
           streamState.atBottom = true;
@@ -29786,8 +30475,10 @@ function portal() {
         this._enforceMessageRangeInvariant(streamState);
         streamState._streamStartController = null;
         streamState._cancelBeforeStream = false;
-        streamState._stopping = false;
-        streamState._optimisticInterrupt = false;
+        const terminalTurnId = streamTurnId || String(streamState.activeTurnId || "");
+        if (streamState._stoppingTurnId === terminalTurnId) {
+          streamState._stoppingTurnId = "";
+        }
         streamState._serverActiveObserved = false;
         // Belt-and-braces for the auto-compact bubble: a turn that dies inside
         // /compact (transport drop, 10-min timeout) may never deliver the
@@ -29980,7 +30671,7 @@ function portal() {
         }
       };
       es.addEventListener("done", ev => {
-        flushRender();
+        const completedAssistant = flushTerminalPresentation();
         // Guard JSON.parse: a malformed/empty `done` payload must NOT throw
         // before es.close()/_markDone()/_stopTimer() run below, else the
         // EventSource + timer interval leak and the UI stays streaming=true
@@ -29988,11 +30679,11 @@ function portal() {
         // d.* read below is null-safe on a missing field.
         let d;
         try { d = JSON.parse(ev.data); } catch (_) { d = {}; }
-        if (d.total_cost_usd != null && ownsCurBubble()) {
-          curBubble.cost = "$" + d.total_cost_usd.toFixed(4);
+        if (d.total_cost_usd != null && completedAssistant.bubble) {
+          completedAssistant.bubble.cost = "$" + d.total_cost_usd.toFixed(4);
         }
-        if (d.memory_recall && ownsCurBubble()) {
-          curBubble.memoryRecall = d.memory_recall;
+        if (d.memory_recall && completedAssistant.bubble) {
+          completedAssistant.bubble.memoryRecall = d.memory_recall;
         }
         if (d.stats) this.stats = { ...this.stats, ...d.stats };
         if (d.session_usage) {
@@ -30058,7 +30749,7 @@ function portal() {
         // stop — stop closes the ES). The relevant case for this branch
         // is page-reload-then-reconnect picking up a turn that finished
         // after being cancelled before reload.
-        const completedFinalText = ownsCurBubble() ? (curBubble.text || "") : "";
+        const completedFinalText = completedAssistant.text;
         const continuationFinalText = isContinuation ? completedFinalText : "";
         const backgroundPending = !d.cancelled
           ? Math.max(0, Number(d.background_tasks_pending) || 0)
@@ -30178,7 +30869,7 @@ function portal() {
         this.$nextTick(() => this._ensureBgContPoller(streamSid));
       });
       es.addEventListener("resync", ev => {
-        flushRender();
+        flushTerminalPresentation();
         let payload = {};
         try { payload = JSON.parse(ev.data) || {}; } catch (_) {}
         const reason = payload.reason || "replay_truncated";
@@ -30189,6 +30880,10 @@ function portal() {
         if (streamState._stallWatch) clearInterval(streamState._stallWatch);
         streamState._stallWatch = null;
         streamState.es = null;
+        if (streamState._flushLivePresentation === flushLivePresentation) {
+          streamState._flushLivePresentation = null;
+        }
+        pendingTaskProgress.clear();
         if (streamMobile && reason === "replay_truncated") {
           this.toast(this.lang === "zh"
             ? "回复数据量较大，完成后会自动从会话记录同步"
@@ -30203,7 +30898,7 @@ function portal() {
         streamState._canonicalResyncReason = reason;
       });
       es.addEventListener("error", async ev => {
-        flushRender();
+        flushTerminalPresentation();
         // One terminal server error may be followed by EventSource's own EOF
         // error. Busy handoff performs async durable persistence, so claim the
         // transport before its first await and make every later callback a
@@ -30270,6 +30965,7 @@ function portal() {
         // items never re-enqueue, which prevents duplicates.
         if (serverError && errKind === "turn_busy"
             && !isReconnect && !resumed) {
+          if (sentUserBubble) sentUserBubble._optimisticQueue = true;
           streamState._busyQueueHandoff = es;
           try { es.close(); } catch (_) {}
           const queued = await this._enqueueMessage(streamSid, {
@@ -30576,13 +31272,10 @@ function portal() {
         });
       });
       es.addEventListener("cancelled", ev => {
-        flushRender();
+        flushTerminalPresentation();
         let d = {};
         try { d = JSON.parse(ev.data || "{}"); } catch (_) { d = {}; }
-        const alreadySettledOptimistically = !!streamState._optimisticInterrupt;
-        if (!alreadySettledOptimistically) {
-          this.toast(this.lang === "zh" ? "已中断" : "Interrupted", "warn", 2000);
-        }
+        this.toast(this.lang === "zh" ? "已中断" : "Interrupted", "warn", 2000);
         es.close();
         _markDone(true, false, true, {
           model: modelForBubble,
@@ -30625,6 +31318,7 @@ function portal() {
             }, 800);
         }
       });
+      if (useMux) this._activateChatMuxChannel(es);
       // NOTE: errors are owned exclusively by the addEventListener("error")
       // handler above (rich classification + exponential-backoff transparent
       // reconnect). A redundant `es.onerror` here used to also fire on the
@@ -30648,29 +31342,16 @@ function portal() {
       const sid = this.currentId;
       if (!sid || !this.isTabStreaming(sid)) return;
       const st = this._ensureTabState(sid);
-      if (st._stopping) return;
-      st._stopping = true;
+      const ownerTurnId = String(st.activeTurnId || "");
+      if (ownerTurnId && st._stoppingTurnId === ownerTurnId) return;
       if (st.pendingQueue && st.pendingQueue.length > 0) st._queuePaused = true;
-      // The earliest Stop window is before EventSource exists, while send()
-      // is still minting its one-time ticket. No backend turn exists yet, so
-      // /interrupt cannot find anything. Abort locally and restore idle state
-      // immediately; the ticket is never consumed and expires harmlessly.
-      if (st._streamStartController && !st.es) {
+      // Before a channel and immutable turn id exist, abort only the start
+      // request. send() rollback remains the sole owner of stream flags, timers,
+      // channel state and the draft; Stop must not manufacture optimistic idle.
+      if (st._streamStartController && !st.es && !ownerTurnId) {
         st._cancelBeforeStream = true;
         st._streamStartController.abort();
-        st._streamStartController = null;
-        if (st._streamTimer) clearInterval(st._streamTimer);
-        st._streamTimer = null;
-        st._streamStartedAt = 0;
-        st.streamElapsed = 0;
-        st.streaming = false;
-        st.streamPhase = "";
-        st._stopping = false;
-        st.streamingModel = "";
         if (st.pendingQueue && st.pendingQueue.length > 0) {
-          // No backend turn exists yet, but the durable queue may already do.
-          // Persist the same Stop semantics instead of leaving only the local
-          // banner paused while the server remains free to drain it.
           try {
             await fetch(`/api/chat/sessions/${encodeURIComponent(sid)}/queue/pause`, {
               method: "POST",
@@ -30680,42 +31361,54 @@ function portal() {
           } catch (_) { /* queue sync below/next activation reconciles */ }
           this._syncQueueFromServer(sid);
         }
-        this.toast(this.lang === "zh" ? "已中断" : "Interrupted", "warn", 1500);
         return;
       }
-      // Optimistic stop: settle the human-facing state in this same click frame.
-      // Keep the EventSource attached so a cancelled event can still persist and
-      // quietly adopt the final partial-output snapshot. A subsequent send may
-      // replace that transport; its ownership guards make late old-turn events no-op.
+      if (!ownerTurnId) return;
+
       const ownerEs = st.es;
-      st._optimisticInterrupt = true;
-      st.streaming = false;
-      st.streamPhase = "";
-      st._stopping = false;
-      if (st._streamTimer) clearInterval(st._streamTimer);
-      if (st._stallWatch) clearInterval(st._stallWatch);
-      st._streamTimer = null;
-      st._stallWatch = null;
-      this._setSessionActivityExpectation(sid, false);
-      this.toast(this.lang === "zh" ? "已中断" : "Interrupted", "warn", 1500);
+      st._stoppingTurnId = ownerTurnId;
+      const stillOwnsTurn = () => this.tabState[sid] === st
+        && st.es === ownerEs
+        && String(st.activeTurnId || "") === ownerTurnId;
+      const applyAuthoritativeStatus = payload => {
+        if (!payload || !stillOwnsTurn()) return "stale";
+        const active = !!payload.active;
+        const turnId = String(payload.turn_id || payload.current_turn_id || "");
+        if (active && turnId !== ownerTurnId) return "successor";
+        if (!active) {
+          if (turnId && turnId !== ownerTurnId) return "successor";
+          if (st._stoppingTurnId === ownerTurnId) st._stoppingTurnId = "";
+          this._retireStaleSessionStream(sid, st);
+          this._setSessionActivityExpectation(sid, false);
+          st._pendingExternalUpdate = true;
+          this._scheduleCanonicalStreamReload(sid, st, { minimumWaitMs: 0 });
+          return "inactive";
+        }
+        if (payload.stopping) return "stopping";
+        if (st._stoppingTurnId === ownerTurnId) st._stoppingTurnId = "";
+        st._sessionActivityExpected = null;
+        this.sessions = (this.sessions || []).map(session => session.id === sid
+          ? { ...session, active: true, turn_active: true, background_active: false }
+          : session);
+        return "running";
+      };
 
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 3000);
       try {
         const r = await fetch(
-          "/api/chat/interrupt?session_id=" + encodeURIComponent(sid),
+          "/api/chat/interrupt?session_id=" + encodeURIComponent(sid)
+            + "&turn_id=" + encodeURIComponent(ownerTurnId),
           { method: "POST", headers: this.hdr(), signal: controller.signal },
         );
         if (!r.ok) throw new Error("interrupt failed");
-        // The backend marks the broadcast cancelled and arms its force-stop
-        // watchdog before replying. An empty `interrupted` list therefore still
-        // means the hard-stop path owns convergence; no visible rollback needed.
+        applyAuthoritativeStatus(await r.json());
       } catch (_e) {
-        // A failed HTTP response is ambiguous: the request may have reached the
-        // backend before the connection dropped. Probe authoritative liveness
-        // before undoing the optimistic transition, and never overwrite a newer
-        // stream that already replaced this EventSource.
-        let active = null;
+        // The request may have reached the backend before the response failed.
+        // Probe exact ownership and apply the same state matrix: retain matching
+        // active+stopping, restore matching active+running, settle inactive, and
+        // never mutate an ABA successor.
+        let status = null;
         try {
           const probeController = new AbortController();
           const probeTimeout = setTimeout(() => probeController.abort(), 2500);
@@ -30723,27 +31416,16 @@ function portal() {
             const probe = await fetch(`/api/chat/sessions/${encodeURIComponent(sid)}/active`, {
               headers: this.hdr(), signal: probeController.signal,
             });
-            if (probe.ok) active = !!(await probe.json()).active;
+            if (probe.ok) status = await probe.json();
           } finally { clearTimeout(probeTimeout); }
-        } catch (_) { active = null; }
-        if (this.tabState[sid] === st && st.es === ownerEs && active === true) {
-          st._optimisticInterrupt = false;
-          st.streaming = true;
-          st._sessionActivityExpected = null;
-          this.sessions = (this.sessions || []).map(session => session.id === sid
-            ? { ...session, active: true, turn_active: true, background_active: false }
-            : session);
-          if (st._streamStartedAt && !st._streamTimer) {
-            st._streamTimer = setInterval(() => {
-              st.streamElapsed = Math.max(
-                0, (Date.now() - st._streamStartedAt) / 1000);
-            }, 1000);
-          }
+        } catch (_) { status = null; }
+        const resolution = applyAuthoritativeStatus(status);
+        if (resolution === "running") {
           this.toast(this.lang === "zh"
             ? "停止失败，当前会话仍在运行"
             : "Could not stop; the session is still running",
           "error", 3000);
-        } else if (active === null) {
+        } else if (status === null) {
           this.toast(this.lang === "zh"
             ? "中断请求已提交，正在自动确认最终状态"
             : "Interrupt requested; confirming the final state",
@@ -31587,6 +32269,7 @@ function portal() {
           workspacePath: String(group.workspace_path || ""),
         },
       ]));
+      const customGroupCount = lookup.size;
       lookup.set("__ungrouped__", {
         key: "custom:__ungrouped__",
         label: this.lang === "zh" ? "未分组" : "Ungrouped",
@@ -31596,8 +32279,26 @@ function portal() {
         color: "gray",
         builtin: true,
       });
+      let customIndex = 0;
       return this.normalizeActivityGroupOrder()
-        .map(groupId => lookup.get(groupId)).filter(Boolean);
+        .map(groupId => lookup.get(groupId)).filter(Boolean)
+        .map(group => {
+          if (group.builtin) {
+            return {
+              ...group,
+              boardColumn: 3,
+              boardRow: 1,
+              boardRowSpan: Math.max(1, Math.ceil(customGroupCount / 2)),
+            };
+          }
+          const index = customIndex++;
+          return {
+            ...group,
+            boardColumn: (index % 2) + 1,
+            boardRow: Math.floor(index / 2) + 1,
+            boardRowSpan: 1,
+          };
+        });
     },
     activityMatchesGroup(item, key) {
       if (!item) return false;

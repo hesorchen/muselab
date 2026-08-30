@@ -113,3 +113,31 @@ def test_to_thread_io_offloads_and_logs_only_bounded_metadata(
     assert events[0][1]["duration_ms"] >= 1
     assert "private-transcript-name" not in repr(events)
     assert "rest-is-private" not in repr(events)
+
+
+def test_owned_to_thread_io_joins_worker_before_propagating_cancellation():
+    from backend import observability as obs
+
+    entered = threading.Event()
+    release = threading.Event()
+    completed = threading.Event()
+
+    def commit():
+        entered.set()
+        release.wait(timeout=5)
+        completed.set()
+
+    async def scenario():
+        task = asyncio.create_task(obs.to_thread_io(
+            "chat.commit", "session-private", commit, owned=True,
+        ))
+        await asyncio.to_thread(entered.wait, 2)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert completed.is_set()
+
+    asyncio.run(scenario())

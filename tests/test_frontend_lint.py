@@ -95,6 +95,58 @@ def test_app_js_has_no_duplicate_method_definitions():
     )
 
 
+def test_chat_stream_mux_keeps_one_root_source_and_reuses_the_send_reducer():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+
+    assert "class ChatMuxSessionChannel extends EventTarget" in app
+    assert 'fetch("/api/chat/stream/mux/start"' in app
+    assert '"/api/chat/stream/mux?ticket="' in app
+    assert "checkpoints: this._chatMuxCheckpoints()" in app
+    assert "last_event_seq: Math.max(0, Number(st && st.lastEventSeq) || 0)" in app
+    assert 'fetch("/api/chat/turns/start"' in app
+    assert "es = this._chatMuxChannel(streamSid, admittedTurnId)" in app
+    assert "if (useMux) this._activateChatMuxChannel(es)" in app
+    assert "await this.loadSession(meta.id, { quiet: true, probeActive: false })" in app
+    assert "const concurrency = this._isMobileLayout() ? 1 : 2" in app
+    assert "CHAT_MUX_BOOTSTRAP_MAX_EVENTS = 512" in app
+    assert "CHAT_MUX_BOOTSTRAP_MAX_BYTES = 2 * 1024 * 1024" in app
+    assert 'reason: "bootstrap_overflow"' in app
+    assert "if (payload.attachable === false)" in app
+    assert app.index("if (payload.attachable === false)") < app.index(
+        "const st = this._ensureTabState(sid);",
+        app.index("async _handleChatMuxSessionState(payload)"),
+    )
+    assert "if (response.status === 404 || response.status === 405)" in app
+    assert "if (tr.status === 404 || tr.status === 405)" in app
+    assert "this._handleChatMuxDisconnect(source)" in app
+    assert "do not synthesize `error`/`done`" in app
+    assert "return await opened" in app
+    mux_state = app[
+        app.index("async _handleChatMuxSessionState(payload)"):
+        app.index("async _startChatMuxCoordinator()")
+    ]
+    assert "inactiveTurnId !== currentTurnId" in mux_state
+    assert "currentTurnId === inactiveTurnId" in mux_state
+    assert "this._retireStaleSessionStream(sid, existingState)" in mux_state
+    assert "this._setSessionActivityExpectation(sid, false)" in mux_state
+    assert "existingState._pendingExternalUpdate = true" in mux_state
+    assert "this._scheduleCanonicalStreamReload(" in mux_state
+    coordinator = app[app.index("async _startChatMuxCoordinator()"):
+                      app.index("async initSessions(")]
+    assert coordinator.index("await this._ensureChatMux()") < coordinator.index(
+        "await this._bootstrapChatMuxHistory()")
+
+
+def test_background_history_load_does_not_hydrate_usage():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    load_start = app.index("async loadSession(")
+    load_end = app.index("// Warm OPEN-but-inactive tabs", load_start)
+    assert "_fetchTabUsage" not in app[load_start:load_end]
+    activate_start = app.index("_activateTabState(id)")
+    activate_end = app.index("_touchTranscriptPane(id)", activate_start)
+    assert "this._fetchTabUsage(id)" in app[activate_start:activate_end]
+
+
 def test_i18n_zh_en_key_parity():
     """Both language sections in i18n/index.js must define the same set of
     keys. A missing translation causes `t('foo.bar')` to fall back to the
@@ -1829,6 +1881,10 @@ def test_activity_center_groups_by_attention_order_and_read_state():
     assert 'activity.view === "groups"' in app
     assert "activityCustomGroupSections()" in app
     assert 'key: "custom:__ungrouped__"' in app
+    assert "boardColumn: 3" in app
+    assert "boardRowSpan: Math.max(1, Math.ceil(customGroupCount / 2))" in app
+    assert "boardColumn: (index % 2) + 1" in app
+    assert "boardRow: Math.floor(index / 2) + 1" in app
     assert '"/api/activity/groups"' in app
     assert '"/api/activity/groups/order"' in app
     assert '}/group`' in app
@@ -1874,7 +1930,13 @@ def test_activity_center_groups_by_attention_order_and_read_state():
     assert "width:min(1120px,calc(100vw - 64px))" in css
     assert "height:auto" in css
     assert "flex:1 1 auto" in css
-    assert "grid-template-columns:repeat(auto-fit,minmax(300px,1fr))" in css
+    assert "grid-template-columns:repeat(3,minmax(0,1fr))" in css
+    assert "repeat(auto-fit,minmax(300px,1fr))" not in css
+    assert "grid-column:var(--activity-board-column)" in css
+    assert "grid-row:var(--activity-board-row) / span var(--activity-board-row-span)" in css
+    assert "'--activity-board-column': group.boardColumn" in html
+    assert "'--activity-board-row': group.boardRow" in html
+    assert "'--activity-board-row-span': group.boardRowSpan" in html
     assert "grid-auto-rows:300px" in css
     assert ".activity-body.is-group-board > .activity-group.is-custom" in css
     assert "ACTIVITY_CUSTOM_GROUP_CAP: 50" in app
@@ -2424,24 +2486,24 @@ def test_stop_control_interrupts_session_and_never_removes_queue_items():
 
     assert 'x-show="isTabStreaming(currentId)"' in html
     assert "chat-toolbar-stop" in html
-    assert "if (st._stopping)" in app
+    assert "if (st._stoppingTurnId)" in app
     assert "正在中断上一条任务" in app
     assert "sendButtonHint(currentId)" in html
     assert "撤回队尾" not in html
     assert "removePendingQueueItem" not in stop
-    assert "if (st._stopping) return" in stop
+    assert "st._stoppingTurnId = ownerTurnId" in stop
     assert "const r = await fetch(" in stop
     assert "if (!r.ok) throw" in stop
     assert "const ownerEs = st.es" in stop
-    assert "st._optimisticInterrupt = true" in stop
-    assert "st.streaming = false" in stop
-    assert "this._setSessionActivityExpectation(sid, false)" in stop
-    assert 'this.toast(this.lang === "zh" ? "已中断"' in stop
+    assert "st.streaming = false" not in stop
+    assert "clearInterval(st._streamTimer)" not in stop
+    assert "clearInterval(st._stallWatch)" not in stop
     assert "const timeout = setTimeout(() => controller.abort(), 3000)" in stop
     assert 'fetch(`/api/chat/sessions/${encodeURIComponent(sid)}/active`' in stop
-    assert "st.es === ownerEs && active === true" in stop
-    assert "st.streaming = true" in stop
-    assert "this._retireStaleSessionStream(sid, st)" not in stop
+    assert "const applyAuthoritativeStatus = payload =>" in stop
+    assert 'String(st.activeTurnId || "") === ownerTurnId' in stop
+    assert "if (payload.stopping) return \"stopping\"" in stop
+    assert "this._retireStaleSessionStream(sid, st)" in stop
     assert "if (st._renderStreamingHtml) st._renderStreamingHtml()" not in stop
     assert "waitForTerminalEvent" not in stop
     cancelled_start = app.index('es.addEventListener("cancelled"')
@@ -2450,15 +2512,18 @@ def test_stop_control_interrupts_session_and_never_removes_queue_items():
     assert "_markDone(true, false, true, {" in cancelled
     assert 'turnStatus: "cancelled"' in cancelled
     assert "d.snapshot_ready" in cancelled
-    assert "alreadySettledOptimistically" in cancelled
-    assert "if (!alreadySettledOptimistically)" in cancelled
+    assert "alreadySettledOptimistically" not in cancelled
+    assert 'this.toast(this.lang === "zh" ? "已中断"' in cancelled
     assert "streamState._seenUpdated = undefined" in cancelled
     assert "quiet: true" in cancelled
     assert "probeActive: false" in cancelled
     mark_done_start = app.index("const _markDone = (")
     mark_done_end = app.index("\n      };", mark_done_start)
-    assert "streamState._stopping = false" in app[
-        mark_done_start:mark_done_end]
+    mark_done = app[mark_done_start:mark_done_end]
+    assert "streamState._stoppingTurnId === terminalTurnId" in mark_done
+    assert 'streamState._stoppingTurnId = ""' in mark_done
+    assert "turn_id=" in stop
+    assert "encodeURIComponent(ownerTurnId)" in stop
     assert "this.isTabStreaming(this.currentId)" in app
 
 
@@ -2775,9 +2840,8 @@ def test_composer_send_has_one_claim_owner_without_exposing_internal_phases():
     assert '_composerSubmitPhase: ""' in app
     assert "if (sendState._composerSubmitToken" in send
     assert 'sendState._composerSubmitPhase = "submitting";' in send
-    assert "if (sendState._optimisticInterrupt" in send
-    assert "if (sendState.es) sendState.es.close()" in send
-    assert "sendState._pendingExternalUpdate = true" in send
+    assert "if (sendState._optimisticInterrupt" not in send
+    assert "if (sendState.es) sendState.es.close()" not in send
     assert "this._releaseComposerClaim(composerSubmitToken);" in send
     assert send.index('sendState._composerSubmitPhase = "submitting";') < send.index(
         "await this._awaitRuntimeSettingPatches(sendSid, sendState)"
@@ -2828,7 +2892,7 @@ def test_composer_disabled_state_covers_failures_without_blocking_durable_queue(
     disabled = app[disabled_start:end]
 
     for state in (
-        "workspaceSwitching", "_stopping",
+        "workspaceSwitching", "_stoppingTurnId",
         "_permissionChangePending", "runtimeSettingsPending(sid)",
         "_sendWaitingForUpload", "item.uploading", "item.error || !item.id",
     ):
@@ -3339,7 +3403,12 @@ def test_done_immediately_stamps_tool_tail_and_quietly_adopts_fork_boundary():
     done_start = app.index('es.addEventListener("done"')
     done_end = app.index('es.addEventListener("error"', done_start)
     done = app[done_start:done_end]
-    assert "const completedFinalText = ownsCurBubble()" in done
+    assert "const completedAssistant = flushTerminalPresentation();" in done
+    assert done.index("const completedAssistant = flushTerminalPresentation();") \
+        < done.index("try { d = JSON.parse(ev.data);")
+    assert "completedAssistant.bubble.cost" in done
+    assert "completedAssistant.bubble.memoryRecall" in done
+    assert "const completedFinalText = completedAssistant.text;" in done
     assert "} else if (!d.cancelled) {" in done
     assert "this._reconcileCompletedTurn(" in done
     assert "streamSid, streamState, d.is_error ? \"\" : completedFinalText" in done
@@ -3361,10 +3430,19 @@ def test_done_immediately_stamps_tool_tail_and_quietly_adopts_fork_boundary():
     assert "m && m.role !== \"user\" && m.uuid" in reconcile
     assert "m.role === \"assistant\" && m.uuid" in reconcile
     assert "m && m.uuid === expectedAssistantUuid" in reconcile
+    assert ": !!expectedText && canonicalTurn.some(" in reconcile
+    assert "!expectedText || canonicalTurn.some(" not in reconcile
     assert "const loaded = await this.loadSession(sid, {" in reconcile
     assert "quiet: true, probeActive: false" in reconcile
     assert "attempt < 30" in reconcile
     assert "Math.min(2000, 250 + options.attempt * 100)" in reconcile
+
+    load_start = app.index("    async loadSession(sid, opts = {}) {")
+    load_end = app.index("\n    async renameSession()", load_start)
+    load = app[load_start:load_end]
+    assert 'const preserveFullOrder = quiet && st.messageRange.order === "full";' in load
+    assert '? "?full=1&tail=" + requestedTail' in load
+    assert ': "?tail=" + requestedTail;' in load
 
     continuity_start = app.index("_messageContinuitySignatures(m)")
     continuity_end = app.index(
@@ -3703,7 +3781,9 @@ def test_history_paging_uses_smaller_mobile_pages_only_on_user_request():
     load_end = app.index("// Warm OPEN-but-inactive tabs", load_start)
     load = app[load_start:load_end]
     assert "_historyWindowSize() { return this._isMobileLayout() ? 20 : 100; }" in app
-    assert 'const qs = full ? "?full=1" : "?tail=" + requestedTail' in load
+    assert 'const preserveFullOrder = quiet && st.messageRange.order === "full";' in load
+    assert '? "?full=1&tail=" + requestedTail' in load
+    assert ': "?tail=" + requestedTail;' in load
     assert "const historyPage = this._historyWindowSize()" in load
     assert "const minimumTail = Math.max(0, Number(opts.minimumTail) || 0)" in load
     assert "Math.max(historyPage, st.messages.length)" in load
@@ -3839,7 +3919,9 @@ def test_long_chat_state_keeps_complete_normalized_history_and_generation_safety
     assert "_MAX_RESIDENT_PANES" not in app
     assert "residentPaneIds" not in app
     assert "_promoteResident" not in app
-    assert 'const qs = full ? "?full=1" : "?tail=" + requestedTail' in app
+    assert 'const preserveFullOrder = quiet && st.messageRange.order === "full";' in app
+    assert '? "?full=1&tail=" + requestedTail' in app
+    assert ': "?tail=" + requestedTail;' in app
     assert "Math.max(historyPage, st.messages.length)" in app
     assert "const _baseInitialLoad" not in app
     assert "if (cst && cst.streaming) continue" not in app
@@ -3916,8 +3998,24 @@ def test_long_chat_state_keeps_complete_normalized_history_and_generation_safety
     assert "const warmLimit = this._isMobileLayout() ? 1 : this.WARM_TRANSCRIPT_LIMIT" in app
     assert ".slice(0, warmLimit)" in app
     assert "_touchTranscriptPane(id)" in app
-    assert "st.streaming || st.es" in app
-    assert ".filter(tid => !streamingSet.has(tid))" in app
+    assert "const desired = lru.slice(0, warmLimit)" in app
+    assert "st.streaming || st.es" not in app[
+        app.index("_touchTranscriptPane(id)"):app.index("warmTranscriptTabIds()")
+    ]
+    assert "streamState._flushLivePresentation = flushLivePresentation" in app
+    assert "if (this.currentId !== streamSid) return;" in app
+    assert "const flushPlainBoundary = () =>" in app
+    assert "const closeAsst = () => {" in app
+    assert "this._queueDeferredStreamRich(streamSid, streamState, completedBubble)" in app
+    terminal_start = app.index("const flushTerminalPresentation = () => {")
+    terminal_end = app.index("\n\n      es.addEventListener", terminal_start)
+    terminal = app[terminal_start:terminal_end]
+    assert "const completedBubble = ownsCurBubble() ? curBubble : null;" in terminal
+    assert "completedBubble && this.currentId === streamSid" in terminal
+    assert "flushPlainBoundary();" in terminal
+    assert "this._queueDeferredStreamRich" in terminal
+    assert terminal.index("const completedText") < terminal.rindex("curBubble = null;")
+    assert "return { bubble: completedBubble, text: completedText };" in terminal
     assert ':data-tid="tid"' in pane
     assert 'x-for="row in paneRows" :key="row.key"' in pane
     assert "paneMessageRows(tid)" in pane
@@ -4033,6 +4131,9 @@ def test_stream_deltas_use_throttled_plain_snapshots_and_final_rich_render():
     assert "curBubble._streamText = acc" in render
     assert "curBubble.html = this._renderHistoryMessage(curBubble)" in render
     assert "curBubble._streamPlain = false" in render
+    assert "_scheduleDeferredStreamRich(sid, st)" in app
+    assert "message._deferredRichReady = true" in app
+    assert "requestIdleCallback(run, { timeout: 160 })" in app
     assert "_streamRichRenderCount" in app
     assert "_streamPlainRenderCount" in app
     assert "}, 1000);" in app
@@ -4975,11 +5076,13 @@ def test_queue_controls_validate_mutations_and_block_send_during_interrupt():
     send_start = app.index("async send(opts = {})")
     send_end = app.index("\n    // ====== ask_user_question", send_start)
     send = app[send_start:send_end]
-    assert "if (sendState._stopping && !opts.reconnect && !opts.resumedItem)" in send
-    assert "if (st._stopping)" in app
+    assert "if (sendState._stoppingTurnId && !opts.reconnect && !opts.resumedItem)" in send
+    assert "if (st._stoppingTurnId)" in app
     assert "queueActionBusy(currentId, 'edit:' + q.id)" in html
     assert "queueActionBusy(currentId, 'remove:' + q.id)" in html
-    assert "sess.pause_queue_if_nonempty(session_id)" in chat
+    assert '"chat.queue_pause_nonempty"' in chat
+    assert "sess.pause_queue_if_nonempty" in chat
+    assert "owned=True" in chat
 
 
 def test_per_message_timestamps_are_plumbed_but_only_shown_on_expand():
@@ -5255,25 +5358,28 @@ def test_concise_mode_is_a_device_preference_and_defaults_off():
     assert "Failed tools still show" in i18n
 
 
-def test_stop_aborts_stream_ticket_before_backend_turn_exists():
-    """A Stop click during POST /stream/start must prevent the later turn."""
+def test_stop_aborts_stream_start_before_channel_opens():
+    """A Stop click during turn admission must prevent a later live channel."""
     js = (FRONTEND / "app.js").read_text(encoding="utf-8")
 
-    state = js[js.index("_stopping: false,"):]
+    state = js[js.index('_stoppingTurnId: "",'):]
     state = state[:state.index("streamingModel:", 0)]
     assert "_streamStartController: null" in state
     assert "_cancelBeforeStream: false" in state
 
-    ticket = js[js.index("const streamStartController = new AbortController()"):]
-    ticket = ticket[:ticket.index("const es = new EventSource(url)")]
-    assert "signal: streamStartController.signal" in ticket
-    assert "if (streamState._cancelBeforeStream)" in ticket
+    start = js[js.index("const streamStartController = new AbortController()"):
+               js.index("streamState.es = es;", js.index(
+                   "const streamStartController = new AbortController()"))]
+    assert "signal: streamStartController.signal" in start
+    assert "if (streamState._cancelBeforeStream)" in start
 
     stop = js[js.index("async stop() {"):]
     stop = stop[:stop.index("// ====== ask_user_question UI helpers")]
-    assert "if (st._streamStartController && !st.es)" in stop
+    assert "if (st._streamStartController && !st.es && !ownerTurnId)" in stop
     assert "st._streamStartController.abort()" in stop
-    assert "st.streaming = false" in stop
+    assert "st.streaming = false" not in stop
+    assert "st._streamTimer = null" not in stop
+    assert "st.streamPhase = \"\"" not in stop
 
 
 def test_midturn_reconnect_storm_guards_are_in_place():
@@ -5710,23 +5816,21 @@ def test_transcript_loading_overlay_has_generation_owned_visual_contract():
     assert "msgs-hidden" not in transcript
 
     overlay_start = css.index(".chat-transcript-loading-overlay {")
-    overlay_end = css.index(".chat-muse-loader {", overlay_start)
+    overlay_end = css.index(".chat-load-error {", overlay_start)
     overlay = css[overlay_start:overlay_end]
     assert "position: absolute" in overlay
     assert "inset: 0" in overlay
     assert "var(--c-bg-1)" in overlay
     assert "pointer-events: auto" in overlay
-    assert 'class="chat-muse-loader"' in transcript
-    assert 'class="chat-muse-loader-emblem"' in transcript
-    assert 'class="muse-mascot lg is-streaming"' in transcript
-    assert ':href="mascotHref()"' in transcript
-    assert 'class="chat-muse-loader-dots"' in transcript
+    assert 'class="workspace-switch-status chat-transcript-loading-status"' in transcript
+    assert 'class="spinner-sm" aria-hidden="true"' in transcript
+    assert "x-text=\"t('chat.loading_session')\"" in transcript
     assert 'class="sr-only"' not in transcript
     assert 'class="chat-skeleton"' not in transcript
-    assert ".chat-muse-loader-emblem::after" in css
-    assert "@keyframes chat-muse-orbit" in css
-    assert "@keyframes chat-muse-dot" in css
-    assert '@media (prefers-reduced-motion: reduce)' in css
+    assert "chat-muse-loader" not in transcript
+    assert ".chat-muse-loader" not in css
+    assert "@keyframes chat-muse-orbit" not in css
+    assert "@keyframes chat-muse-dot" not in css
     assert ':inert="transcriptLoadingVisible()"' in transcript
 
     for key in ("chat.loading_session", "chat.load_failed", "chat.load_retry"):

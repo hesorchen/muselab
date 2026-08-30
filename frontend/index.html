@@ -328,11 +328,14 @@
                         @dragstart="onWorkspaceDragStart($event, workspace.path)"
                         @dragend="onWorkspaceDragEnd()"
                         @pointerdown.stop="onWorkspacePointerDown($event, workspace.path)"
+                        :disabled="workspaceSwitching || workspaceRegistryBusy || workspaceOrderSaving"
                         :title="lang==='zh' ? '拖拽排序' : 'Drag to reorder'"
                         :aria-label="lang==='zh' ? '拖拽排序' : 'Drag to reorder'">
                   <svg><use href="#i-grip-vertical"/></svg>
                 </button>
-                <button class="workspace-picker-select" @click="switchWorkspace(workspace.path)">
+                <button class="workspace-picker-select"
+                        :disabled="workspaceSwitching"
+                        @click="switchWorkspace(workspace.path)">
                   <span class="workspace-picker-check" x-text="workspace.path === currentWorkspacePath() ? '✓' : ''"></span>
                   <span class="workspace-picker-meta"><strong x-text="workspace.name"></strong><small x-text="workspace.path"></small></span>
                   <span class="workspace-activity-mini" x-show="workspaceActivity(workspace.path).running || workspaceActivity(workspace.path).unread">
@@ -340,10 +343,14 @@
                     <span class="unread" x-show="workspaceActivity(workspace.path).unread" x-text="'✓ ' + workspaceActivity(workspace.path).unread"></span>
                   </span>
                 </button>
-                <button class="workspace-picker-remove" x-show="!workspace.primary" @click.stop="removeWorkspace(workspace.path)"><svg><use href="#i-x"/></svg></button>
+                <button class="workspace-picker-remove" x-show="!workspace.primary"
+                        :disabled="workspaceSwitching || workspaceRegistryBusy"
+                        @click.stop="removeWorkspace(workspace.path)"><svg><use href="#i-x"/></svg></button>
               </div>
             </template>
-            <button class="workspace-picker-add" @click="addWorkspace()"><svg><use href="#i-folder-plus"/></svg><span x-text="lang==='zh' ? '添加工作目录…' : 'Add workspace…'"></span></button>
+            <button class="workspace-picker-add"
+                    :disabled="workspaceSwitching || workspaceRegistryBusy"
+                    @click="addWorkspace()"><svg><use href="#i-folder-plus"/></svg><span x-text="workspaceRegistryBusy ? (lang==='zh' ? '工作目录处理中…' : 'Updating workspaces…') : (lang==='zh' ? '添加工作目录…' : 'Add workspace…')"></span></button>
           </div>
         </div>
         <!-- 全局任务中心入口已迁至对话区头栏 Skills 左侧 (2026-07-21) -->
@@ -2015,7 +2022,9 @@
                 <div>
                   <div class="msg-row">
                     <span class="msg-avatar user-avatar" x-text="userAvatarText()"></span>
-                    <div class="bubble user-bubble" @click="onUserBubbleClick(m)">
+                    <div class="bubble user-bubble"
+                         :class="{ 'is-queueing': m._optimisticQueue }"
+                         @click="onUserBubbleClick(m)">
                       <template x-if="userSelectionQuotes(m).length">
                         <div class="user-msg-quotes">
                           <template x-for="(quote, qidx) in userSelectionQuotes(m)"
@@ -2089,6 +2098,16 @@
                         <span class="user-msg-text" x-show="userVisibleText(m)"
                               x-html="userTextHtml(userVisibleText(m))"></span>
                       </template>
+                      <div x-show="m._optimisticQueue"
+                           class="optimistic-queue-status"
+                           role="status"
+                           aria-live="polite"
+                           x-cloak>
+                        <span class="queued-icon" aria-hidden="true">
+                          <svg><use href="#i-clock"/></svg>
+                        </span>
+                        <span x-text="lang==='zh' ? '排队中' : 'Queueing'"></span>
+                      </div>
                     </div>
                   </div>
                   <div class="msg-actions">
@@ -2960,6 +2979,8 @@
                quiet until its reaction stream actually starts. -->
           <div x-show="activeSession.streaming && (!activeSession.messages.length
                                        || activeSession.messages[activeSession.messages.length-1].role === 'user')
+                       && (!activeSession.messages.length
+                         || !activeSession.messages[activeSession.messages.length-1]._admissionPending)
                        && !activeSession.compacting
                        && !activeSession._continuationAwaitingReaction"
                class="turn-footer turn-pending-footer"
@@ -3132,18 +3153,9 @@
              role="status"
              aria-live="polite"
              :aria-label="t('chat.loading_session')">
-          <div class="chat-muse-loader">
-            <div class="chat-muse-loader-emblem" aria-hidden="true">
-              <span class="muse-mascot lg is-streaming">
-                <svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg>
-              </span>
-            </div>
-            <div class="chat-muse-loader-copy">
-              <strong x-text="t('chat.loading_session')"></strong>
-              <span class="chat-muse-loader-dots" aria-hidden="true">
-                <i></i><i></i><i></i>
-              </span>
-            </div>
+          <div class="workspace-switch-status chat-transcript-loading-status">
+            <span class="spinner-sm" aria-hidden="true"></span>
+            <span x-text="t('chat.loading_session')"></span>
           </div>
         </div>
         <button class="jump-bottom" x-show="isAwayFromLatest()" @click="returnToLatest()" :title="lang==='zh'?'最新':'Jump to latest'" :aria-label="lang==='zh' ? '跳到最新消息' : 'Jump to latest'"><svg><use href="#i-arrow-down"/></svg></button>
@@ -3913,6 +3925,7 @@
     <div class="modal image-gen-modal" tabindex="-1"
          @keydown.tab="trapDialogFocus($event, 'image-gen')"
          role="dialog" aria-modal="true"
+         :aria-busy="imageGen.loading || imageGen.jobsLoading"
          :aria-label="lang==='zh' ? 'Codex Image 2 生图' : 'Codex Image 2 image generation'">
       <div class="modal-head">
         <span class="modal-title">
@@ -3921,8 +3934,7 @@
         </span>
         <button class="modal-close"
                 @click="closeImageGen()"
-                :disabled="imageGen.loading"
-                :title="lang==='zh' ? '关闭' : 'Close'">×</button>
+                :title="imageGen.loading ? (lang==='zh' ? '取消提交并关闭' : 'Cancel submission and close') : (lang==='zh' ? '关闭' : 'Close')">×</button>
       </div>
       <div class="modal-body image-gen-body">
         <textarea x-ref="imageGenPrompt"
@@ -3976,13 +3988,19 @@
           <input type="checkbox" x-model="imageGen.useReferences">
           <span x-text="lang==='zh' ? '用当前待发送图片作为参考' : 'Use current pending images as references'"></span>
         </label>
-        <div class="settings-hint warn" x-show="imageGen.error" x-text="imageGen.error"></div>
+        <div class="settings-hint warn" x-show="imageGen.error"
+             role="status" aria-live="polite" x-text="imageGen.error"></div>
         <div class="image-gen-history-head">
           <span x-text="lang==='zh' ? '历史生成' : 'History'"></span>
           <button class="btn-ghost sm" type="button"
                   @click="refreshImageGenJobs()"
                   :disabled="imageGen.jobsLoading"
                   x-text="imageGen.jobsLoading ? (lang==='zh' ? '刷新中…' : 'Refreshing…') : (lang==='zh' ? '刷新' : 'Refresh')"></button>
+        </div>
+        <div class="image-gen-job-pending" x-show="imageGen.jobsLoading"
+             role="status" aria-live="polite">
+          <span class="spinner-sm" aria-hidden="true"></span>
+          <span x-text="lang==='zh' ? '正在加载生成记录…' : 'Loading generation history…'"></span>
         </div>
         <div class="image-gen-empty" x-show="!imageGen.jobs.length && !imageGen.jobsLoading"
              x-text="lang==='zh' ? '还没有生成记录。' : 'No generated images yet.'"></div>
@@ -4037,7 +4055,10 @@
         <button class="btn-primary"
                 @click="runImageGen()"
                 :disabled="imageGen.loading || !imageGen.prompt.trim()"
-                x-text="imageGen.loading ? (lang==='zh' ? '提交中…' : 'Submitting…') : (lang==='zh' ? '提交后台任务' : 'Submit job')"></button>
+                :aria-busy="imageGen.loading">
+          <span class="spinner-sm" x-show="imageGen.loading" aria-hidden="true"></span>
+          <span x-text="imageGen.loading ? (lang==='zh' ? '提交中…' : 'Submitting…') : (lang==='zh' ? '提交后台任务' : 'Submit job')"></span>
+        </button>
       </div>
     </div>
   </div>
@@ -5658,7 +5679,7 @@
           <span x-text="lang==='zh' ? '选择工作目录' : 'Select workspace folder'"></span>
         </span>
         <button class="modal-close" @click="closeWorkspaceBrowser()"
-                :disabled="workspaceSwitching"
+                :disabled="workspaceSwitching || workspaceRegistryBusy"
                 :title="lang==='zh' ? '关闭' : 'Close'" aria-label="Close">×</button>
       </div>
       <div class="workspace-browser-location">
@@ -5672,15 +5693,16 @@
              x-text="workspaceBrowser.path || (lang==='zh' ? '正在读取…' : 'Loading…')"></div>
         <button type="button" class="workspace-browser-manual"
                 @click="addWorkspacePathManually()"
-                :disabled="workspaceSwitching"
+                :disabled="workspaceSwitching || workspaceRegistryBusy"
                 :title="lang==='zh' ? '手动输入选择器范围外的绝对路径' : 'Enter an absolute path outside the browser roots'"
                 x-text="lang==='zh' ? '输入路径' : 'Enter path'"></button>
       </div>
       <div class="modal-body workspace-browser-body">
         <div class="workspace-browser-error" x-show="workspaceBrowser.error"
              x-text="workspaceBrowser.error"></div>
-        <div class="workspace-browser-loading" x-show="workspaceBrowser.loading">
-          <span class="spinner"></span>
+        <div class="workspace-browser-loading" x-show="workspaceBrowser.loading"
+             role="status" aria-live="polite">
+          <span class="spinner-sm" aria-hidden="true"></span>
           <span x-text="lang==='zh' ? '正在检测文件夹…' : 'Detecting folders…'"></span>
         </div>
         <div class="workspace-browser-empty"
@@ -5720,12 +5742,12 @@
         <span class="workspace-browser-selection" :title="workspaceBrowserTarget()"
               x-text="workspaceBrowserTargetLabel()"></span>
         <button type="button" class="btn-ghost" @click="closeWorkspaceBrowser()"
-                :disabled="workspaceSwitching"
+                :disabled="workspaceSwitching || workspaceRegistryBusy"
                 x-text="lang==='zh' ? '取消' : 'Cancel'"></button>
         <button type="button" class="btn-primary workspace-browser-confirm"
                 @click="confirmWorkspaceBrowser()"
-                :disabled="workspaceBrowser.loading || workspaceSwitching || !workspaceBrowserTarget()"
-                x-text="workspaceSwitching ? (lang==='zh' ? '添加中…' : 'Adding…') : (lang==='zh' ? '添加目录' : 'Add folder')"></button>
+                :disabled="workspaceBrowser.loading || workspaceSwitching || workspaceRegistryBusy || !workspaceBrowserTarget()"
+                x-text="workspaceRegistryBusy ? (lang==='zh' ? '添加中…' : 'Adding…') : (lang==='zh' ? '添加目录' : 'Add folder')"></button>
       </div>
     </div>
   </div>
@@ -6204,6 +6226,11 @@
         </div>
         <template x-for="group in activityVisibleGroups()" :key="group.key">
           <section class="activity-group"
+                   :style="group.boardColumn ? {
+                     '--activity-board-column': group.boardColumn,
+                     '--activity-board-row': group.boardRow,
+                     '--activity-board-row-span': group.boardRowSpan
+                   } : null"
                    x-show="activityEvents(group).length
                      || (group.custom && !activitySearchQuery())"
                    :class="{

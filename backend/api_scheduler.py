@@ -19,6 +19,7 @@ from pydantic import BaseModel, Field
 
 from .auth import require_token
 from . import scheduler as sched
+from . import observability as obs
 
 
 router = APIRouter(prefix="/api/scheduler", tags=["scheduler"])
@@ -134,22 +135,35 @@ async def delete_task_endpoint(tid: str) -> dict:
     # delete_task() commits the task removal and durable cleanup intent in one
     # replacement. A prior failed attempt therefore reaches the same intent
     # here instead of becoming an unrecoverable 404.
-    if not sched.delete_task(tid, purge_bound_session=False):
-        raise HTTPException(404, "task not found")
+    async def _delete_and_cleanup() -> bool:
+        deleted = await obs.to_thread_io(
+            "scheduler.task_delete",
+            tid,
+            sched.delete_task,
+            tid,
+            purge_bound_session=False,
+            owned=True,
+        )
+        if not deleted:
+            return False
+        await sched.finish_task_cleanup(tid)
+        return True
 
-    cleanup = asyncio.create_task(sched.finish_task_cleanup(tid))
+    owner = asyncio.create_task(_delete_and_cleanup())
     try:
-        await asyncio.shield(cleanup)
+        deleted = await asyncio.shield(owner)
     except asyncio.CancelledError:
-        # Once deletion is durable, an HTTP disconnect must not abandon its
-        # runtime owner. Preserve caller cancellation after cleanup terminates.
-        while not cleanup.done():
+        # Once deletion starts, an HTTP disconnect must not leave a durable
+        # cleanup intent without an owner. Join the complete transaction first.
+        while not owner.done():
             try:
-                await asyncio.shield(cleanup)
+                await asyncio.shield(owner)
             except asyncio.CancelledError:
                 continue
-        cleanup.result()
+        owner.result()
         raise
+    if not deleted:
+        raise HTTPException(404, "task not found")
     return {"deleted": tid}
 
 @router.post("/tasks/{tid}/run", dependencies=[Depends(require_token)])
@@ -161,7 +175,7 @@ async def run_task_now_endpoint(tid: str) -> dict:
 
     Used for: (a) "retry" on a failed history entry; (b) manual smoke-test
     after editing prompt / model without waiting for the next fire window."""
-    task = sched.get_task(tid)
+    task = await asyncio.to_thread(sched.get_task, tid)
     if not task:
         raise HTTPException(404, "task not found")
     await sched.run_task_now(tid)

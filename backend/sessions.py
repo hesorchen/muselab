@@ -1958,34 +1958,102 @@ def sidecar_signature(sid: str) -> tuple[float, int] | None:
         return None
 
 
+def get_session_usage_summary(sid: str) -> dict | None:
+    """Return the persisted usage summary without hiding malformed schemas."""
+    summary = _load_sidecar(sid).get("usage_summary")
+    return dict(summary) if isinstance(summary, dict) else None
+
+
+def set_session_usage_summary(sid: str, summary: dict) -> bool:
+    """Persist usage hydration under the deletion and corruption fences."""
+    with session_lifecycle_lock(sid):
+        with _QUEUE_LOCK:
+            if sid in _DELETED_SESSION_IDS:
+                return False
+        with _SIDECAR_LOCK:
+            data = _load_sidecar(sid, use_cache=False)
+            data["usage_summary"] = dict(summary)
+            _save_sidecar(sid, data)
+            return True
+
+
+def set_session_usage_summary_if_turn_matches(
+    sid: str,
+    expected_turn_id: str,
+    summary: dict,
+) -> bool:
+    """Refine usage only while the same terminal turn owns the sidecar."""
+    with session_lifecycle_lock(sid):
+        with _QUEUE_LOCK:
+            if sid in _DELETED_SESSION_IDS:
+                return False
+        with _SIDECAR_LOCK:
+            data = _load_sidecar(sid, use_cache=False)
+            current = data.get("usage_summary")
+            update = current.get("update") if isinstance(current, dict) else None
+            current_turn_id = (
+                str(update.get("turn_id") or "")
+                if isinstance(update, dict) else ""
+            )
+            if not expected_turn_id or current_turn_id != expected_turn_id:
+                return False
+            data["usage_summary"] = dict(summary)
+            _save_sidecar(sid, data)
+            return True
+
+
+def set_terminal_annotation_and_usage(
+    sid: str,
+    msg_uuid: str,
+    summary: dict | None,
+    **fields: Any,
+) -> bool:
+    """Persist the terminal footer and optional usage summary in one replace."""
+    with session_lifecycle_lock(sid):
+        with _QUEUE_LOCK:
+            if sid in _DELETED_SESSION_IDS:
+                return False
+        with _SIDECAR_LOCK:
+            data = _load_sidecar(sid, use_cache=False)
+            _merge_message_annotation(data, msg_uuid, fields)
+            if isinstance(summary, dict):
+                data["usage_summary"] = dict(summary)
+            _save_sidecar(sid, data)
+            return True
+
+
+def _merge_message_annotation(
+    data: dict,
+    msg_uuid: str,
+    fields: dict[str, Any],
+) -> None:
+    msgs = data.setdefault("messages", {})
+    cur = msgs.setdefault(msg_uuid, {})
+    sticky_cancelled = (
+        cur.get("turn_status") == "cancelled"
+        and fields.get("turn_status") not in (None, "cancelled")
+    )
+    for key, value in fields.items():
+        if value is None:
+            continue
+        if sticky_cancelled and key in {"turn_status", "ts", "elapsed_s"}:
+            continue
+        cur[key] = value
+
+
 def set_message_annotation(sid: str, msg_uuid: str, **fields: Any) -> None:
     """Update one message's annotations (cost, model, images, etc.).
     Fields with value None are skipped (use update with explicit empty
     if you want to clear). Atomic per-call write."""
-    # Linearize terminal footer writes with explicit deletion. A Result worker
-    # every worker arriving after the tombstone is a no-op and cannot recreate
-    # the deleted sidecar.
+    # Linearize terminal footer writes with explicit deletion. Every worker
+    # arriving after the tombstone is a no-op and cannot recreate the sidecar.
     with session_lifecycle_lock(sid):
         with _QUEUE_LOCK:
             if sid in _DELETED_SESSION_IDS:
                 return
         with _SIDECAR_LOCK:
             data = _load_sidecar(sid, use_cache=False)
-            msgs = data.setdefault("messages", {})
-            cur = msgs.setdefault(msg_uuid, {})
-            # Explicit user cancellation is monotonic truth.  A force-stopped
-            # CLI can append its AssistantMessage/ResultMessage late; generic
-            # terminal bookkeeping then attempts to write ``completed``.
-            sticky_cancelled = (
-                cur.get("turn_status") == "cancelled"
-                and fields.get("turn_status") not in (None, "cancelled")
-            )
-            for k, v in fields.items():
-                if v is None:
-                    continue
-                if sticky_cancelled and k in {"turn_status", "ts", "elapsed_s"}:
-                    continue
-                cur[k] = v
+            _merge_message_annotation(data, msg_uuid, fields)
             _save_sidecar(sid, data)
 
 

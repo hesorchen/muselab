@@ -31,6 +31,55 @@ def _login(page: Page, base: str, token: str) -> None:
     )
 
 
+def _install_fake_mux_chat_transport(page: Page, turn_bodies: list[dict]) -> None:
+    page.add_init_script(
+        """
+        (() => {
+          class FakeEventSource extends EventTarget {
+            constructor(url) {
+              super();
+              this.url = url;
+              this.readyState = 0;
+              setTimeout(() => {
+                if (this.readyState === 2) return;
+                this.readyState = 1;
+                if (this.onopen) this.onopen(new Event('open'));
+                this.dispatchEvent(new Event('open'));
+              }, 0);
+            }
+            close() { this.readyState = 2; }
+          }
+          window.EventSource = FakeEventSource;
+        })();
+        """
+    )
+
+    page.route(
+        "**/api/chat/stream/mux/start",
+        lambda route: route.fulfill(
+            status=200,
+            content_type="application/json",
+            body='{"ticket":"preview-mux-ticket"}',
+        ),
+    )
+
+    def handle_turn_start(route) -> None:
+        body = route.request.post_data_json
+        turn_bodies.append(body)
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({
+                "accepted": True,
+                "session_id": body["session_id"],
+                "turn_id": f"preview-turn-{len(turn_bodies)}",
+                "started_at": 1_700_000_000,
+            }),
+        )
+
+    page.route("**/api/chat/turns/start", handle_turn_start)
+
+
 def _select_rendered_preview_text(page: Page) -> str:
     # Alpine can publish ``previewMode`` one render tick before the Markdown
     # body is mounted.  Wait for the actual selectable surface so callers do
@@ -995,40 +1044,17 @@ def test_selection_side_question_window_supports_touch_drag(
 
 def test_detached_preview_question_uses_send_pipeline_without_touching_draft(
         page: Page, backend_url, auth_token):
+    turn_bodies: list[dict] = []
+    _install_fake_mux_chat_transport(page, turn_bodies)
     _login(page, backend_url, auth_token)
-    ticket_bodies: list[dict] = []
-
-    def handle_ticket(route) -> None:
-        ticket_bodies.append(route.request.post_data_json)
-        route.fulfill(
-            status=200,
-            content_type="application/json",
-            body=json.dumps({"ticket": "preview-detached-ticket"}),
-        )
-
-    page.route("**/api/chat/stream/start", handle_ticket)
     result = page.evaluate(
         """async () => {
           const app = document.querySelector('#app')._x_dataStack[0];
           app.availableModels = [{model: 'e2e-model', label: 'E2E', group: 'e2e'}];
           app.model = 'e2e-model';
-          class FakeEventSource extends EventTarget {
-            constructor(url) {
-              super();
-              this.url = url;
-              this.readyState = 0;
-              setTimeout(() => {
-                this.readyState = 1;
-                if (this.onopen) this.onopen(new Event('open'));
-              }, 0);
-            }
-            close() { this.readyState = 2; }
-          }
-          const originalEventSource = window.EventSource;
           const originalBusy = app._confirmSessionBusy;
           const originalRuntimeWait = app._awaitRuntimeSettingPatches;
           const originalCommit = app._commitChatRecoveryDraft;
-          window.EventSource = FakeEventSource;
           app._confirmSessionBusy = async () => false;
           app._awaitRuntimeSettingPatches = async () => true;
           let recoveryCommits = 0;
@@ -1061,7 +1087,6 @@ def test_detached_preview_question_uses_send_pipeline_without_touching_draft(
             };
           } finally {
             app.tabState[app.currentId]?.es?.close();
-            window.EventSource = originalEventSource;
             app._confirmSessionBusy = originalBusy;
             app._awaitRuntimeSettingPatches = originalRuntimeWait;
             app._commitChatRecoveryDraft = originalCommit;
@@ -1069,9 +1094,9 @@ def test_detached_preview_question_uses_send_pipeline_without_touching_draft(
         }"""
     )
 
-    assert len(ticket_bodies) == 1
-    assert ticket_bodies[0]["prompt"] == "DETACHED PREVIEW QUESTION"
-    assert ticket_bodies[0]["image_ids"] == ""
+    assert len(turn_bodies) == 1
+    assert turn_bodies[0]["prompt"] == "DETACHED PREVIEW QUESTION"
+    assert turn_bodies[0]["image_ids"] == ""
     assert result["sendResult"] == "undefined"
     assert result["input"] == result["draft"] == "PRESERVE THIS DRAFT"
     assert result["images"] == ["draft-image"]
@@ -1085,39 +1110,16 @@ def test_detached_preview_question_uses_send_pipeline_without_touching_draft(
 
 def test_composer_quote_sends_context_without_rewriting_visible_text(
         page: Page, backend_url, auth_token):
+    turn_bodies: list[dict] = []
+    _install_fake_mux_chat_transport(page, turn_bodies)
     _login(page, backend_url, auth_token)
-    ticket_bodies: list[dict] = []
-
-    def handle_ticket(route) -> None:
-        ticket_bodies.append(route.request.post_data_json)
-        route.fulfill(
-            status=200,
-            content_type="application/json",
-            body=json.dumps({"ticket": "selection-quote-ticket"}),
-        )
-
-    page.route("**/api/chat/stream/start", handle_ticket)
     result = page.evaluate(
         """async () => {
           const app = document.querySelector('#app')._x_dataStack[0];
           app.availableModels = [{model: 'e2e-model', label: 'E2E', group: 'e2e'}];
           app.model = 'e2e-model';
-          class FakeEventSource extends EventTarget {
-            constructor(url) {
-              super();
-              this.url = url;
-              this.readyState = 0;
-              setTimeout(() => {
-                this.readyState = 1;
-                if (this.onopen) this.onopen(new Event('open'));
-              }, 0);
-            }
-            close() { this.readyState = 2; }
-          }
-          const originalEventSource = window.EventSource;
           const originalBusy = app._confirmSessionBusy;
           const originalRuntimeWait = app._awaitRuntimeSettingPatches;
-          window.EventSource = FakeEventSource;
           app._confirmSessionBusy = async () => false;
           app._awaitRuntimeSettingPatches = async () => true;
           try {
@@ -1146,15 +1148,14 @@ def test_composer_quote_sends_context_without_rewriting_visible_text(
             };
           } finally {
             app.tabState[app.currentId]?.es?.close();
-            window.EventSource = originalEventSource;
             app._confirmSessionBusy = originalBusy;
             app._awaitRuntimeSettingPatches = originalRuntimeWait;
           }
         }"""
     )
 
-    assert len(ticket_bodies) == 1
-    prompt = ticket_bodies[0]["prompt"]
+    assert len(turn_bodies) == 1
+    prompt = turn_bodies[0]["prompt"]
     assert "引用自 `README.md`" in prompt
     assert "SELECTED CONTEXT" in prompt
     assert prompt.endswith("VISIBLE QUESTION")

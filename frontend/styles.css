@@ -4020,7 +4020,7 @@ pre.text {
     min-height:0;
     max-height:none;
     display:grid;
-    grid-template-columns:repeat(auto-fit,minmax(300px,1fr));
+    grid-template-columns:repeat(3,minmax(0,1fr));
     /* One lane starts at roughly a header + three session cards. Additional
        sessions stay in the lane and are reached by its own scrollbar. */
     grid-auto-rows:300px;
@@ -4098,6 +4098,8 @@ pre.text {
    empty drop target. The ledger/status views keep their compact row styling. */
 @media (min-width:721px) {
   .activity-body.is-group-board > .activity-group.is-custom {
+    grid-column:var(--activity-board-column);
+    grid-row:var(--activity-board-row) / span var(--activity-board-row-span);
     min-width:0;
     min-height:300px;
     height:100%;
@@ -4775,102 +4777,7 @@ html[data-theme="light"] .msg.user .bubble { color: white; }
   justify-content: center;
   overflow: hidden;
   pointer-events: auto;
-  background:
-    radial-gradient(circle at 50% 48%, var(--c-accent-soft) 0, transparent 30%),
-    var(--c-bg-1);
-}
-.chat-muse-loader {
-  width: min(100% - 32px, 360px);
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 18px;
-  color: var(--c-fg-2);
-  text-align: center;
-}
-.chat-muse-loader-emblem {
-  position: relative;
-  width: 108px;
-  height: 108px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  border-radius: 50%;
-  background: color-mix(in srgb, var(--c-accent-soft) 72%, var(--c-bg-1));
-  box-shadow:
-    0 0 0 1px color-mix(in srgb, var(--c-accent) 18%, transparent),
-    0 18px 42px color-mix(in srgb, var(--c-accent) 16%, transparent);
-}
-.chat-muse-loader-emblem::before,
-.chat-muse-loader-emblem::after {
-  content: "";
-  position: absolute;
-  border-radius: 50%;
-  pointer-events: none;
-}
-.chat-muse-loader-emblem::before {
-  inset: 7px;
-  border: 1px solid color-mix(in srgb, var(--c-accent) 24%, transparent);
-}
-.chat-muse-loader-emblem::after {
-  inset: -7px;
-  border: 2px solid transparent;
-  border-top-color: var(--c-accent);
-  border-right-color: color-mix(in srgb, var(--c-accent) 28%, transparent);
-  animation: chat-muse-orbit 3.2s linear infinite;
-}
-.chat-muse-loader-emblem .muse-mascot {
-  position: relative;
-  z-index: 1;
-  width: 58px;
-  height: 58px;
-  margin: 0;
-  cursor: default;
-  filter: drop-shadow(0 0 12px color-mix(in srgb, var(--c-accent) 34%, transparent));
-}
-.chat-muse-loader-copy {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 8px;
-  min-height: 24px;
-}
-.chat-muse-loader-copy strong {
-  color: var(--c-fg-1);
-  font-size: var(--fs-md);
-  font-weight: var(--fw-medium);
-  letter-spacing: .01em;
-}
-.chat-muse-loader-dots {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-}
-.chat-muse-loader-dots i {
-  width: 4px;
-  height: 4px;
-  border-radius: 50%;
-  background: var(--c-accent);
-  animation: chat-muse-dot 1.35s ease-in-out infinite;
-}
-.chat-muse-loader-dots i:nth-child(2) { animation-delay: .16s; }
-.chat-muse-loader-dots i:nth-child(3) { animation-delay: .32s; }
-@keyframes chat-muse-orbit {
-  to { transform: rotate(360deg); }
-}
-@keyframes chat-muse-dot {
-  0%, 70%, 100% { opacity: .28; transform: translateY(0); }
-  35% { opacity: 1; transform: translateY(-3px); }
-}
-@media (max-width: 600px) {
-  .chat-muse-loader { gap: 15px; }
-  .chat-muse-loader-emblem { width: 92px; height: 92px; }
-  .chat-muse-loader-emblem .muse-mascot { width: 50px; height: 50px; }
-  .chat-muse-loader-copy strong { font-size: var(--fs-sm); }
-}
-@media (prefers-reduced-motion: reduce) {
-  .chat-muse-loader-emblem::after,
-  .chat-muse-loader-dots i { animation: none; }
+  background: var(--c-bg-1);
 }
 .chat-load-error {
   flex: 1 0 auto;
@@ -6840,6 +6747,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
    ============================================================================ */
 .tool-prefix-icon svg,
 .queued-icon svg,
+.optimistic-queue-status svg,
 .compact-pending-icon svg,
 .queue-paused-icon svg,
 .settings-menu-icon svg,
@@ -7663,6 +7571,20 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 }
 .queued-icon { font-size: var(--fs-sm); }
 .queued-label { white-space: nowrap; }
+.user-bubble.is-queueing {
+  border: 1px dashed rgba(255, 255, 255, 0.6);
+}
+.optimistic-queue-status {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin-top: 6px;
+  padding-top: 5px;
+  border-top: 1px dotted rgba(255, 255, 255, 0.35);
+  color: rgba(255, 255, 255, 0.82);
+  font-size: var(--fs-xs);
+}
+.optimistic-queue-status svg { width: 1em; height: 1em; }
 /* Paused marker on a queued bubble. Warn-colored so it separates from the
    neutral "已排队 1/2" counter beside it — this one is a blocked state, not
    a position. */
