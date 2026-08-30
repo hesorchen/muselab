@@ -14,8 +14,10 @@ Adding a new provider:
 from __future__ import annotations
 import copy
 import json
+import logging
 import os
 import re
+import shutil
 import tempfile
 import threading
 from dataclasses import dataclass, replace
@@ -104,28 +106,240 @@ _BASE_URL_ENV_BY_KEY: dict[str, str] = {
 }
 
 
-# Per-OS-user path so multiple muselab installs on the same host (e.g. a
-# real user + a `muselab` test user) don't collide. Earlier this was a
-# single shared `/tmp/muselab-vendor-cli-config`, so whichever user
-# created it first locked the others out with PermissionError on Read,
-# which then surfaced as a 504 on the chat SSE stream.
-_VENDOR_CONFIG_DIR = (
+_LOG = logging.getLogger(__name__)
+
+
+def _default_vendor_config_dir() -> Path:
+    """Return the durable per-user state root for the isolated vendor CLI."""
+    state_home = os.environ.get("XDG_STATE_HOME", "").strip()
+    base = (
+        Path(state_home).expanduser()
+        if state_home
+        else Path.home() / ".local" / "state"
+    )
+    return base / "muselab" / "vendor-cli"
+
+
+# Third-party transcripts, tasks, and shell snapshots are durable state, not
+# disposable cache. Keep them under XDG_STATE_HOME while preserving the old
+# per-OS-user temp path solely as a one-time migration source.
+_VENDOR_CONFIG_DIR = _default_vendor_config_dir()
+_LEGACY_VENDOR_CONFIG_DIR = (
     Path(tempfile.gettempdir())
     / f"muselab-vendor-cli-config-{os.getuid()}"
 )
-_VENDOR_CONFIG_LOCK = threading.Lock()
+_VENDOR_CONFIG_LOCK = threading.RLock()
+
+
+def _path_exists(path: Path) -> bool:
+    """Like Path.exists(), but also treat a broken symlink as occupied."""
+    return path.exists() or path.is_symlink()
+
+
+def _merge_newer_jsonl(source: Path, destination: Path) -> bool:
+    """Append unique records from a newer legacy JSONL.
+
+    This covers the narrow rolling-restart race where the old process writes a
+    final record after its config directory has moved. Invalid, older, or
+    non-file conflicts are left untouched for archival.
+    """
+    if (
+        source.suffix != ".jsonl"
+        or source.is_symlink()
+        or destination.is_symlink()
+        or not source.is_file()
+        or not destination.is_file()
+    ):
+        return False
+    try:
+        if source.stat().st_mtime_ns <= destination.stat().st_mtime_ns:
+            return False
+        source_lines = [line for line in source.read_bytes().splitlines() if line.strip()]
+        destination_data = destination.read_bytes()
+        destination_lines = {
+            line for line in destination_data.splitlines() if line.strip()
+        }
+        for line in source_lines:
+            json.loads(line)
+        missing = [line for line in source_lines if line not in destination_lines]
+        if missing:
+            prefix = (
+                b""
+                if not destination_data or destination_data.endswith(b"\n")
+                else b"\n"
+            )
+            with destination.open("ab") as handle:
+                handle.write(prefix + b"\n".join(missing) + b"\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+        source.unlink()
+        return True
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def _recover_newer_jsonl_conflicts(target: Path) -> None:
+    conflict_root = target / ".migration-conflicts"
+    if not conflict_root.is_dir() or conflict_root.is_symlink():
+        return
+    for source in conflict_root.rglob("*.jsonl"):
+        destination = target / source.relative_to(conflict_root)
+        _merge_newer_jsonl(source, destination)
+    for directory in sorted(
+        (path for path in conflict_root.rglob("*") if path.is_dir()),
+        key=lambda path: len(path.parts),
+        reverse=True,
+    ):
+        try:
+            directory.rmdir()
+        except OSError:
+            pass
+    try:
+        conflict_root.rmdir()
+    except OSError:
+        pass
+
+
+def _merge_legacy_vendor_state(
+    source: Path,
+    target: Path,
+    conflict_root: Path,
+    relative: Path = Path(),
+) -> None:
+    """Move legacy state without overwriting durable files.
+
+    Conflicts are preserved under ``.migration-conflicts`` in the durable root
+    so no user state remains dependent on temporary-directory retention.
+    """
+    for child in source.iterdir():
+        destination = target / child.name
+        if child.name == ".credentials.json":
+            # OAuth material must never enter the third-party config root.
+            if child.is_symlink() or child.is_file():
+                child.unlink(missing_ok=True)
+            continue
+        if not _path_exists(destination):
+            shutil.move(str(child), str(destination))
+            continue
+        if (
+            child.is_dir()
+            and not child.is_symlink()
+            and destination.is_dir()
+            and not destination.is_symlink()
+        ):
+            _merge_legacy_vendor_state(
+                child,
+                destination,
+                conflict_root,
+                relative / child.name,
+            )
+            try:
+                child.rmdir()
+            except OSError:
+                pass
+            continue
+        if _merge_newer_jsonl(child, destination):
+            continue
+        conflict = conflict_root / relative / child.name
+        if not _path_exists(conflict):
+            conflict.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            shutil.move(str(child), str(conflict))
+
+
+def _remove_vendor_credentials(config_dir: Path) -> None:
+    credential = config_dir / ".credentials.json"
+    if credential.is_symlink() or credential.is_file():
+        credential.unlink(missing_ok=True)
 
 
 def _vendor_config_dir() -> Path:
-    """Returns the isolated config dir used by third-party providers. Shared
-    across all three-party sessions FOR THE CURRENT OS USER — it has no
+    """Return the durable isolated config dir used by third-party providers.
+
+    On first access, migrate the former temp-directory state. If both roots
+    contain data, only missing paths move; durable-state collisions win and
+    conflicting legacy files move under ``.migration-conflicts`` for manual
+    recovery.
+
+    Shared across all third-party sessions FOR THE CURRENT OS USER — it has no
     .credentials.json, so the CLI subprocess cannot fall back to Pro OAuth
     and send the wrong token to vendor.
 
     chat.py also reads from here when loading session messages for vendor
     sessions."""
-    _VENDOR_CONFIG_DIR.mkdir(exist_ok=True, mode=0o700)
-    return _VENDOR_CONFIG_DIR
+    target = _VENDOR_CONFIG_DIR
+    legacy = _LEGACY_VENDOR_CONFIG_DIR
+    with _VENDOR_CONFIG_LOCK:
+        target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        same_path = target.resolve(strict=False) == legacy.resolve(strict=False)
+        if not same_path and legacy.is_dir() and not legacy.is_symlink():
+            try:
+                if not _path_exists(target):
+                    shutil.move(str(legacy), str(target))
+                elif target.is_dir() and not target.is_symlink():
+                    _merge_legacy_vendor_state(
+                        legacy,
+                        target,
+                        target / ".migration-conflicts",
+                    )
+                    try:
+                        legacy.rmdir()
+                    except OSError:
+                        _LOG.warning(
+                            "Legacy vendor CLI state still has conflicts at %s",
+                            legacy,
+                        )
+            except OSError:
+                _LOG.exception(
+                    "Could not migrate vendor CLI state from %s to %s",
+                    legacy,
+                    target,
+                )
+                if legacy.is_dir() and not _path_exists(target):
+                    _remove_vendor_credentials(legacy)
+                    return legacy
+        target.mkdir(parents=True, exist_ok=True, mode=0o700)
+        try:
+            target.chmod(0o700)
+        except OSError:
+            _LOG.warning("Could not set vendor CLI state permissions on %s", target)
+        _remove_vendor_credentials(target)
+        _recover_newer_jsonl_conflicts(target)
+        return target
+
+
+def ensure_vendor_user_skills() -> Path:
+    """Expose only user Skills inside the isolated vendor CLI config.
+
+    ``CLAUDE_CONFIG_DIR`` deliberately moves third-party sessions away from
+    the real ``~/.claude`` so they cannot read Claude OAuth credentials.
+    Unfortunately the CLI resolves user-scope Skills relative to that same
+    config root, which used to make ``~/.claude/skills`` disappear whenever a
+    non-Claude model was selected.
+
+    A directory symlink preserves the native user-scope layout and keeps skill
+    scripts/assets live without copying the rest of ``~/.claude``. Settings,
+    credentials, plugins, hooks, and transcripts remain isolated. The target
+    may not exist yet; keeping a broken directory link is intentional so a
+    later ``~/.claude/skills`` creation becomes visible automatically.
+    """
+    user_skills = (Path.home() / ".claude" / "skills").resolve(strict=False)
+    vendor_skills = _vendor_config_dir() / "skills"
+    with _VENDOR_CONFIG_LOCK:
+        if vendor_skills.is_symlink():
+            if vendor_skills.resolve(strict=False) == user_skills:
+                return vendor_skills
+            # This exact path is muselab-owned compatibility state. Replace a
+            # stale link but never remove a real directory a user may have
+            # intentionally populated inside the isolated config.
+            vendor_skills.unlink()
+        if vendor_skills.exists():
+            return vendor_skills
+        try:
+            vendor_skills.symlink_to(user_skills, target_is_directory=True)
+        except FileExistsError:
+            # Another request won the race between exists() and symlink_to().
+            pass
+    return vendor_skills
 
 
 def ensure_vendor_workspace_trusted(workspace: Path) -> None:
@@ -824,6 +1038,7 @@ def provider_meta() -> list[dict]:
 # Pretty labels for Claude (Pro OAuth) models — the IDs themselves are ugly
 # (e.g. "claude-haiku-4-5-20251001") so we display human-friendly names.
 CLAUDE_LABELS: dict[str, str] = {
+    "claude-opus-5":                "Opus 5",
     "claude-opus-4-8":              "Opus 4.8",
     "claude-opus-4-7":              "Opus 4.7",
     "claude-sonnet-4-6":            "Sonnet 4.6",
@@ -836,9 +1051,68 @@ CLAUDE_LABELS: dict[str, str] = {
 ANTHROPIC_DEFAULT_MODELS: tuple[str, ...] = (
     "claude-sonnet-4-6",
     "claude-haiku-4-5-20251001",
+    "claude-opus-5",
     "claude-opus-4-8",
     "claude-opus-4-7",
 )
+
+# DUCC is a Claude Code-compatible CLI runtime, not an HTTP endpoint provider.
+# Prefix its picker values so a session can select the DUCC executable. DUCC's
+# model proxy expects its exact catalog names (not public API ids); passing
+# `claude-opus-4-8` through unchanged reaches OneAPI's default group and 503s.
+# Keep this ordered catalog aligned with the factory `ducc models` output.
+DUCC_PREFIX = "ducc:"
+DUCC_MODELS: tuple[tuple[str, str, str], ...] = (
+    ("auto-internal", "auto-内部", "Auto · 内部"),
+    ("deepseek-v4-flash-internal", "DeepSeek-V4-Flash-内部", "DeepSeek V4 Flash · 内部"),
+    ("glm-5-2-internal", "GLM-5.2-内部", "GLM 5.2 · 内部"),
+    ("kimi-k2-7-code-internal", "Kimi-K2.7-Code-内部", "Kimi K2.7 Code · 内部"),
+    ("auto", "auto", "Auto"),
+    ("glm-5", "GLM-5", "GLM 5"),
+    ("glm-5-1", "GLM-5.1", "GLM 5.1"),
+    ("glm-5-2", "GLM-5.2", "GLM 5.2"),
+    ("glm-5-3", "GLM-5.3", "GLM 5.3"),
+    ("glm-5-3-flash", "GLM-5.3-Flash", "GLM 5.3 Flash"),
+    ("glm-5-turbo", "GLM-5-Turbo", "GLM 5 Turbo"),
+    ("grok-4-5", "grok-4.5", "Grok 4.5"),
+    ("gpt-5-5", "gpt-5.5", "GPT 5.5"),
+    ("gpt-5-6-luna", "gpt-5.6-luna", "GPT 5.6 Luna"),
+    ("gpt-5-6-terra", "gpt-5.6-terra", "GPT 5.6 Terra"),
+    ("gpt-5-6-sol", "gpt-5.6-sol", "GPT 5.6 Sol"),
+    ("claude-haiku-4-5", "Claude Haiku 4.5", "Claude Haiku 4.5"),
+    ("claude-sonnet-4-6", "Claude Sonnet 4.6", "Claude Sonnet 4.6"),
+    ("claude-sonnet-5", "Claude Sonnet 5", "Claude Sonnet 5"),
+    ("claude-opus-4-6", "Claude Opus 4.6", "Claude Opus 4.6"),
+    ("claude-opus-4-7", "Claude Opus 4.7", "Claude Opus 4.7"),
+    ("claude-opus-4-8", "Opus 4.8", "Claude Opus 4.8"),
+    ("claude-opus-5", "Opus 5", "Claude Opus 5"),
+    ("kimi-k2-6", "Kimi-K2.6", "Kimi K2.6"),
+    ("minimax-m3", "MiniMax-M3", "MiniMax M3"),
+    ("deepseek-v4-flash", "DeepSeek-V4-Flash", "DeepSeek V4 Flash"),
+    ("deepseek-v4-pro", "DeepSeek-V4-Pro", "DeepSeek V4 Pro"),
+)
+_DUCC_CLI_MODELS = {
+    model_id: cli_name for model_id, cli_name, _label in DUCC_MODELS
+}
+# Sessions created by the first DUCC integration used Anthropic's dated Haiku
+# id. Continue accepting it even though the picker now emits the stable id.
+_DUCC_CLI_MODELS["claude-haiku-4-5-20251001"] = "Claude Haiku 4.5"
+
+
+def ducc_is_claude_model(model: str) -> bool:
+    """Whether a DUCC picker id names a known Claude-family catalog entry."""
+    raw = model[len(DUCC_PREFIX):] if is_ducc_model(model) else model
+    return raw.startswith("claude-")
+
+
+def is_ducc_model(model: str) -> bool:
+    return bool(model) and model.lower().startswith(DUCC_PREFIX)
+
+
+def ducc_cli_model(model: str) -> str:
+    """Translate a prefixed picker value to DUCC's model-catalog name."""
+    raw = model[len(DUCC_PREFIX):] if is_ducc_model(model) else model
+    return _DUCC_CLI_MODELS.get(raw, raw)
 
 
 def _overrides_get(key: str, default=None):
@@ -990,6 +1264,8 @@ def normalize_model_id(model: str) -> str:
     user-created providers using a colon-tag prefix work the same way. The
     legacy literals are kept as a fallback in case lookup() can't resolve the
     provider (e.g. it was deleted)."""
+    if is_ducc_model(model):
+        return model[len(DUCC_PREFIX):]
     p = lookup(model)
     if p and p.prefix.endswith(":") and model.startswith(p.prefix):
         return model[len(p.prefix):]
@@ -1032,6 +1308,7 @@ def env_override(model: str) -> dict[str, str] | None:
     # providers we redirect the CLI to a throwaway CLAUDE_CONFIG_DIR with no
     # credentials.json — forcing it to fall back to env-based auth.
     isolated_cfg = _vendor_config_dir()
+    ensure_vendor_user_skills()
     # Make sure NO credentials file leaks in.
     cred = isolated_cfg / ".credentials.json"
     if cred.exists():
@@ -1117,6 +1394,24 @@ def available_groups() -> list[dict]:
             groups.append({"group": "Claude", "items": claude_items,
                            "supports_thinking": True,
                            "supports_effort": True})
+    # DUCC supplies its own authentication, proxy and dynamically signed
+    # comate_custom_header. It therefore remains available even when native
+    # Anthropic OAuth/API-key auth is absent. The internal prefix selects the
+    # runtime and is stripped before --model reaches DUCC.
+    from .settings import locate_ducc_executable
+    if locate_ducc_executable() and "ducc" not in disabled_models:
+        ducc_items = [
+            {"label": label, "model": f"{DUCC_PREFIX}{model_id}"}
+            for model_id, _cli_name, label in DUCC_MODELS
+            if f"{DUCC_PREFIX}{model_id}" not in disabled_models
+        ]
+        if ducc_items:
+            # DUCC exposes heterogeneous model families. Do not claim that every
+            # entry accepts Claude thinking/effort controls; chat.py enables the
+            # legacy DUCC thinking shape only for known Claude-family entries.
+            groups.append({"group": "DUCC", "items": ducc_items,
+                           "supports_thinking": False,
+                           "supports_effort": False})
     for p in catalog():
         if not p.models:
             continue

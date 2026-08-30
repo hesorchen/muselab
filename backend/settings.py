@@ -92,7 +92,48 @@ def locate_executable(name: str) -> str | None:
     return None
 
 
-def atomic_write_text(path: Path, data: str, encoding: str = "utf-8") -> None:
+def locate_ducc_executable() -> str | None:
+    """Resolve the real DUCC wrapper without depending on an interactive shell.
+
+    ``ducc`` commonly lives below the Comate extension rather than on the
+    service's PATH.  ``MUSELAB_DUCC_CLI`` is an operator override; the remaining
+    paths cover the two layouts used by current and standalone installations.
+    Only executable regular files are accepted.
+    """
+    candidates: list[Path] = []
+    configured = os.environ.get("MUSELAB_DUCC_CLI", "").strip()
+    if configured:
+        candidates.append(Path(configured).expanduser())
+    found = locate_executable("ducc")
+    if found:
+        candidates.append(Path(found))
+    home = Path.home()
+    candidates.extend([
+        home / ".comate" / "baidu-cc" / "bin" / "ducc",
+        home / ".baidu-cc" / "baidu-cc" / "bin" / "ducc",
+    ])
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+            if resolved.is_file() and os.access(resolved, os.X_OK):
+                return str(resolved)
+        except OSError:
+            continue
+    return None
+
+
+def ducc_cli_wrapper() -> str:
+    """Return MuseLab's environment-sanitising DUCC launcher."""
+    return str(Path(__file__).resolve().parent.parent / "scripts" / "muselab-ducc")
+
+
+def atomic_write_text(
+    path: Path,
+    data: str,
+    encoding: str = "utf-8",
+    *,
+    mode: int | None = None,
+) -> None:
     """Write text atomically: tmpfile in same dir + os.replace().
 
     Survives crash / OOM-kill mid-write — the destination either holds the
@@ -109,7 +150,18 @@ def atomic_write_text(path: Path, data: str, encoding: str = "utf-8") -> None:
     # random suffix so each call's tmp is distinct.
     tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}.{secrets.token_hex(4)}")
     try:
-        with open(tmp, "w", encoding=encoding) as f:
+        # Sensitive callers opt into an exact mode.  `os.open(..., mode)`
+        # creates the inode no broader than requested; fchmod restores bits
+        # removed by the process umask while the inode is still temporary and
+        # before data is written.  The default preserves this general helper's
+        # historical behavior for user workspace files.
+        if mode is None:
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+        else:
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+        with os.fdopen(fd, "w", encoding=encoding) as f:
+            if mode is not None:
+                os.fchmod(f.fileno(), mode)
             f.write(data)
             f.flush()
             os.fsync(f.fileno())
@@ -238,6 +290,14 @@ DEEPSEEK_BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.co
 ZHIPUAI_BASE_URL = os.environ.get("ZHIPUAI_BASE_URL", "https://open.bigmodel.cn/api/anthropic")
 MINIMAX_BASE_URL = os.environ.get("MINIMAX_BASE_URL", "https://api.minimaxi.com/anthropic")
 
+# Self-hosted mem0 semantic-memory daemon (optional). Empty = feature OFF
+# (chat runs exactly as before). When set to the daemon's base URL, each turn
+# does a best-effort memory search (recalled facts prepended to the prompt) +
+# an async store of the completed turn. All calls are fail-soft: any error is
+# swallowed so a down / slow daemon never breaks or delays a chat turn.
+# See backend/memory_client.py for the client and the daemon contract.
+MEM0_DAEMON_URL = os.environ.get("MEM0_DAEMON_URL", "")
+
 if not TOKEN:
     raise RuntimeError("MUSELAB_TOKEN must be set in .env")
 if len(TOKEN) < 16:
@@ -278,11 +338,8 @@ def is_chinese_locale() -> bool:
     """Best-effort host-locale check — True when LANG / LC_ALL / LC_MESSAGES
     indicates a Chinese system.
 
-    Used to choose between bilingual template assets at runtime
-    (`default-CLAUDE.md` vs `default-CLAUDE.en.md`, archive-skeleton READMEs,
-    session labels). Mirrors the env-var probe in
-    `scripts/install-*.{sh,ps1}` and `scripts/intake.{sh,ps1}` so install-time
-    + runtime decisions agree.
+    Used for locale-aware runtime labels. Mirrors the env-var probe in the
+    install and intake scripts so install-time + runtime decisions agree.
 
     Conservative: only returns True when one of the locale env vars contains
     "zh" (zh / zh_CN / zh_TW / zh_HK). Everything else falls through to

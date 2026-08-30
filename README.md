@@ -9,39 +9,48 @@
   <a href="README_en.md"><img src="https://img.shields.io/badge/lang-English-red" alt="English"></a>
 </p>
 
-<p align="center"><strong>muselab 是一个基于 Claude Agent SDK 构建的自托管 AI 个人工作台</strong></p>
+<p align="center"><strong>muselab 是一个基于 Claude Agent SDK 构建的自托管 Agent 工作台</strong></p>
 
 <p align="center"><em>Muse 来自希腊神话中的缪斯女神，象征灵感、艺术与知识。</em></p>
 
 <table align="center">
 <tr>
-<td align="center"><img src="promo/media/screenshot-mobile-files.jpeg" width="100"></td>
-<td align="center"><img src="promo/media/screenshot-mobile-preview.png" width="100"></td>
-<td align="center"><img src="promo/media/screenshot-mobile-chat.png" width="100"></td>
-<td align="center"><img src="promo/media/screenshot-desktop.png" width="360"></td>
+<td align="center"><a href="promo/media/screenshot-desktop.png"><img src="promo/media/screenshot-desktop.png" width="500" alt="桌面端文件、预览与 Agent 会话"></a></td>
+<td align="center"><a href="promo/media/screenshot-desktop-terminal.png"><img src="promo/media/screenshot-desktop-terminal.png" width="500" alt="桌面端真实 PTY 多终端"></a></td>
 </tr>
 <tr>
-<td align="center">移动端 · 文件区</td>
-<td align="center">移动端 · 预览区</td>
-<td align="center">移动端 · 对话区</td>
-<td align="center">桌面端 · 黑夜主题 + HTML 渲染效果</td>
+<td align="center">桌面端 · 文件、预览与 Agent 会话</td>
+<td align="center">桌面端 · 真实 PTY 多终端</td>
 </tr>
 </table>
 
-<p align="center"><sub>点击任意图片放大查看</sub></p>
+<table align="center">
+<tr>
+<td align="center"><a href="promo/media/screenshot-mobile-files.jpeg"><img src="promo/media/screenshot-mobile-files.jpeg" width="180" alt="移动端文件区"></a></td>
+<td align="center"><a href="promo/media/screenshot-mobile-chat.png"><img src="promo/media/screenshot-mobile-chat.png" width="180" alt="移动端 Agent 对话"></a></td>
+<td align="center"><a href="promo/media/screenshot-mobile.png"><img src="promo/media/screenshot-mobile.png" width="180" alt="移动端深色预览"></a></td>
+</tr>
+<tr>
+<td align="center">移动端 · 文件区</td>
+<td align="center">移动端 · Agent 对话</td>
+<td align="center">移动端 · 深色主题</td>
+</tr>
+</table>
+
+<p align="center"><sub>公开演示数据；点击图片查看原图</sub></p>
 
 ## 核心特性
 
 | | |
 |---|---|
-| **复用已有订阅额度** | Claude 走 OAuth 复用 Pro / Max；GPT 通过本地 Codex Gateway 复用 Codex / GPT Plus / Pro|
-| **完整的用户上下文** | 不断累积的个人档案，越用越懂你，产生 context 复利 |
-| **领先的 Agent Harness** | 基于 Claude Agent SDK 构建，具备工具调用、Skills、MCP 扩展等 Agent 能力|
-| **灵活切换的基座模型** | Claude / DeepSeek / GLM / MiniMax / Kimi / Qwen / MiMo / ERNIE / Codex Gateway 等 9 类模型提供方一键切换 |
-| **跨领域交叉分析** | 家庭信息 ✖️ 职业规划 ✖️ 健康档案 ✖️ 财务数据 ，Muse 给出跨领域洞察 |
-| **原生渲染能力** | HTML 页面、Markdown 文档即写即渲染，无需插件 |
-| **多工作目录与多会话** | 文件树、预览标签和会话按工作目录一起切换，每个目录保留自己的浏览状态 |
-| **移动端 PWA** | 获得接近原生 App 的体验，电脑手机多端同步会话，出门在外手机接着聊 |
+| **复用已有订阅** | Claude 支持 OAuth；Codex 可通过 Gateway 接入，复用已有的 Claude、ChatGPT 订阅服务 |
+| **一体化 Agent 工作台** | 在同一个页面中浏览文件、预览报告、与 Agent 对话交互，并通过真实终端运行和检查结果 |
+| **多工作目录** | 创建并一键切换多个工作目录；每个工作目录都是一整套完整的 Agent 上下文和运行环境 |
+| **真实 Unix PTY 多终端** | 创建、重命名和切换多个真实终端；每个终端绑定创建时的工作目录，并支持 Terminal Profile |
+| **Claude Agent SDK** | 原生支持文件读写、工具调用、Skills 和 MCP，让 Agent 可以直接执行任务并生成成果 |
+| **原生文件预览** | 支持 Markdown、文本、HTML、图片、PDF、XLSX、CSV 和 TSV 等文件格式 |
+| **多模型与多 Provider** | 内置 Claude、Codex Gateway 等 Provider，也可接入所有 Anthropic-compatible 模型服务，如 Kimi、GLM、Deepseek 等 |
+| **自托管与多端访问** | 工作目录、会话状态和生成文件保存在本地，可通过桌面浏览器和移动端 PWA 访问，移动端与 PC 端内容实时同步 |
 
 ## 快速开始
 
@@ -73,13 +82,11 @@ bash scripts/install-linux.sh    # 或 install-macos.sh
 
 ## 会话实践
 
-> 「这是我今年的体检报告，你帮我和去年那份对比一下，把指标变化做成一页 HTML 趋势报告。」
+> 「检查这个项目最近的改动，找出测试变慢的原因，修复后跑验证，并把结论写到 `docs/performance-note.md`。」
 
-Muse 在 `health/` 里找到两份 PDF，读取文件，提取指标，写出带图表的单文件 HTML——预览区直接渲染。你接着说：
+Muse 在当前工作目录中读取代码和 Git diff，通过真实终端运行定向测试，修改相关文件并复验；生成的说明文档可以直接在预览区查看。切换到另一个工作目录后，文件树、终端、新会话和上下文也会随之切换。
 
-> 「再结合 `money/` 里的保单，看看这些变化指标有没有保障缺口。」
-
-两个领域的档案在同一个会话里交叉分析，提供具体指导。
+代码、研究资料或知识库都可以作为普通工作目录使用，不要求固定目录结构。
 
 🌐 更多场景演示见 [muselab 介绍页](https://hesorchen.github.io/muselab/promo/)。
 
@@ -87,29 +94,32 @@ Muse 在 `health/` 里找到两份 PDF，读取文件，提取指标，写出带
 
 | 方案 | 局限 | muselab 怎么做 |
 |---|---|---|
-| ChatGPT / Claude.ai | 文件临时上传、记忆内容黑盒 | 归档文件常驻本地，白盒记忆机制 |
-| Claude Code | 生在终端、为代码而生 | 同一套 Agent Harness，面向生活，电脑手机多端可用 |
-| RAG 文档问答 | 切块 + 检索，跨文档语义有损，适合海量文档 | 保存资料文档，完整文件理解，零语义损耗 |
+| ChatGPT / Claude.ai | 文件通常需要上传，工作目录与执行环境不连续 | 本地工作目录、生成文件和可检查的上下文持续保留 |
+| Claude Code | 终端优先，适合直接在本机 CLI 中工作 | 同一套 Agent Harness，增加浏览器文件、预览、真实终端、多工作目录与移动端访问 |
+| RAG 文档问答 | 切块 + 检索适合海量文档，但不提供完整执行环境 | Agent 按需读取完整文件，并可通过工具与终端执行多步骤任务 |
 
 完整对比（Open WebUI / LobeChat / AnythingLLM / claudecodeui 等）见[同类对比](docs/comparison_zh.md)。
 
 ## 实用细节
 
 - **现代文件树** —— 现代化的文件操作，拖拽上传、模糊搜索、重命名、回收站
-- **连续预览体验** —— Markdown、文本、表格和 HTML 切换后恢复上次阅读位置；最近 4 个 HTML 保留活动页面状态
+- **文件与终端双预览面** —— Markdown、文本、表格和 HTML 恢复上次阅读位置；真实 PTY 终端支持多实例、Profile 与移动端操作
 - **工作目录隔离** —— 可登记并切换多个本地目录，文件、预览、会话标签和新会话 cwd 作为一个整体切换
+- **会话工作台** —— 多会话标签、置顶与搜索、后台流式回复、持久消息队列、上下文用量与回合耗时
+- **全局搜索** —— 文件名、文件内容、会话、历史消息和常用操作统一检索
+- **编辑与预览** —— Markdown 编辑、分屏预览、页内查找、缩放和 HTML 活动页面状态保留
 - **会话自动同步** —— 移动端休眠或 SSE 静默断开后自动探测、重连并补齐最终消息
 - **多模式多主题** —— 亮色 / 暗色 / 护眼，自选主题色
 - **中英双语** —— 一键切换，不刷新页面
 - **消息队列** —— Muse 思考时继续发送消息，消息队列依次执行，不错过每一个灵感
-- **定时任务** —— 创建夜晚定时任务，早上醒来查看结果
+- **任务与通知** —— 定时任务、后台任务、活动中心与 Web Push 统一反馈执行结果
 
 ## 文档
 
 **[📚 完整文档索引](docs/README_zh.md)**
 
 - **上手：** [快速入门](docs/quickstart_zh.md) · [Linux 安装](docs/install-linux_zh.md) · [macOS 安装](docs/install-macos_zh.md) · [升级](docs/upgrade_zh.md)
-- **使用：** [定制 CLAUDE.md](docs/personalize-claude-md_zh.md) · [Skills](docs/skills_zh.md) · [手机端 PWA](docs/mobile_zh.md) · [定时任务](docs/scheduler_zh.md)
+- **使用：** [配置工作区 CLAUDE.md](docs/personalize-claude-md_zh.md) · [Skills](docs/skills_zh.md) · [终端](docs/terminal_zh.md) · [手机端 PWA](docs/mobile_zh.md) · [定时任务](docs/scheduler_zh.md)
 - **模型：** [Providers](docs/providers_zh.md) · [Codex Gateway](docs/codex-gateway_zh.md) · [接入新 provider](docs/add-provider_zh.md) · [模型路由](docs/routing_zh.md)
 - **内部机制：** [架构](docs/architecture_zh.md) · [会话](docs/backend-sessions_zh.md) · [Files API](docs/backend-files_zh.md) · [安全模型](docs/backend-security_zh.md) · [前端](docs/frontend_zh.md) · [基础设施](docs/infrastructure_zh.md)
 - **参考：** [配置](docs/configuration_zh.md) · [数据与备份](docs/data-and-backup_zh.md) · [排错](docs/troubleshooting_zh.md) · [词汇表](docs/glossary_zh.md)
@@ -118,6 +128,6 @@ Muse 在 `health/` 里找到两份 PDF，读取文件，提取指标，写出带
 
 ## 状态
 
-v1.1 — 首个稳定增强版本。
+v1.2 — 多工作区、真实终端与更完整的 Agent 工作流。
 
 [MIT](LICENSE)

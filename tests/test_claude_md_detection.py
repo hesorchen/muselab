@@ -11,6 +11,7 @@ Covers:
 """
 from __future__ import annotations
 import os
+import shutil
 from pathlib import Path
 
 
@@ -206,13 +207,13 @@ def test_context_info_picks_up_subdir_claude_md(temp_root, client):
     assert info["claude_md_meaningfully_filled"] is True
 
 
-def test_context_info_skips_archives_subdir(temp_root, client):
-    """archives/ is cold storage — its CLAUDE.md (if any) shouldn't show
-    up as a configured profile source."""
-    _seed(temp_root, {"archives/CLAUDE.md": FILLED_FIXTURE})
+def test_context_info_scans_any_visible_subdir_without_archive_semantics(
+    temp_root, client
+):
+    _seed(temp_root, {"records/CLAUDE.md": FILLED_FIXTURE})
     info = _ctx(client)
     scopes = {s["scope"] for s in info["claude_md_sources"]}
-    assert "subdir:archives" not in scopes, scopes
+    assert "subdir:records" in scopes, scopes
 
 
 def test_context_info_back_compat_fields(temp_root, client):
@@ -225,3 +226,30 @@ def test_context_info_back_compat_fields(temp_root, client):
     assert info["claude_md_mtime"] > 0
     # New field exists too
     assert "claude_md_meaningfully_filled" in info
+
+
+def test_context_info_workspace_fields_are_canonical_with_legacy_aliases(
+    temp_root, client
+):
+    info = _ctx(client)
+    assert info["workspace_root"] == str(temp_root)
+    assert info["archive_root"] == info["workspace_root"]
+    assert info["archive_empty"] == info["workspace_empty"]
+    assert info["workspace_empty"] is False
+    assert info["subdir_present"] == {"notes": True}
+    assert "health" not in info["subdir_present"]
+    assert "money" not in info["subdir_present"]
+    assert "people" not in info["subdir_present"]
+
+
+def test_context_info_empty_ignores_instruction_and_hidden_control_files(
+    temp_root, client
+):
+    (temp_root / "README.md").unlink()
+    shutil.rmtree(temp_root / "notes")
+    _seed(temp_root, {"CLAUDE.md": FILLED_FIXTURE})
+
+    info = _ctx(client)
+    assert info["workspace_empty"] is True
+    assert info["archive_empty"] is True
+    assert info["subdir_present"] == {}

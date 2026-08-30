@@ -18,7 +18,7 @@ Web UI 用 `.env` 里的 `MUSELAB_TOKEN` 鉴权，以 `X-Auth-Token` header 发�
 后端需要 `~/.claude/.credentials.json`（来自 `claude login`）或 `ANTHROPIC_API_KEY` 二者之一。若安装器提示"claude CLI 已装但未登录"，跑一次 `claude login`。
 
 **第三方 provider（DeepSeek/GLM 等）报"invalid api key"，但我确定 key 没错。**
-确认 key 配在了*正确*的环境变量下（见 [配置 → Provider 密钥](configuration_zh.md#provider-密钥)）。muselab 把厂商流量经隔离 CLI 配置转发，绝不会把你的 Anthropic OAuth 发给它们 —— 所以这里的 401 是真的厂商 key 问题。
+确认 key 配在了*正确*的环境变量下（见 [配置参考](configuration_zh.md)）。muselab 把厂商流量经隔离 CLI 配置转发，绝不会把你的 Anthropic OAuth 发给它们 —— 所以这里的 401 是真的厂商 key 问题。
 
 **MiniMax 用有效 key 仍 401。** 国内与国际是不同的账户/密钥：`minimaxi.com` 用 `MINIMAX_API_KEY`，`minimax.io` 用 `MINIMAX_INTL_API_KEY`。配与账户匹配的那个。
 
@@ -36,11 +36,15 @@ Web UI 用 `.env` 里的 `MUSELAB_TOKEN` 鉴权，以 `X-Auth-Token` header 发�
 ```bash
 # Linux
 journalctl --user -u muselab -n 50
+# 只看隐私安全的性能摘要
+journalctl --user -u muselab -f | grep '\[perf\]'
 # macOS
 log show --predicate 'process == "muselab"' --last 5m
 ```
 
 多数是 `.env` 缺值（如 `MUSELAB_TOKEN` 太短）或端口冲突。
+
+`[perf]` 行只包含阶段耗时、计数、状态分类和短关联 ID。慢请求阈值可通过 `MUSELAB_SLOW_REQUEST_MS` 调整（默认 `500`）；仅在确实要完全关闭性能摘要时设置 `MUSELAB_PERF_LOG=0`。
 
 **注销后服务就停了（Linux）。**
 开启 lingering，让用户服务持续运行：`sudo loginctl enable-linger $USER`。
@@ -57,7 +61,61 @@ log show --predicate 'process == "muselab"' --last 5m
 
 **iOS 无法注册 PWA 或开启通知。** iOS 要求安全上下文（HTTPS）。裸 `http://192.168.x.x:端口` 不行。用 Tailscale 的 `*.ts.net` 地址（自动 HTTPS）或跑 `scripts/setup-https.sh`。*先*把应用加到主屏，再开通知。完整步骤：[手机端 PWA](mobile_zh.md)。
 
-**所有设备的推送同时失效。** `<archive>/.muselab/vapid.json` 的 VAPID 密钥对读不出来了。muselab 不会静默重建（那会作废所有订阅）。从备份恢复它，或主动删掉以生成新密钥对 —— 之后每台设备会重新订阅。
+**所有设备的推送同时失效。** `<主工作区>/.muselab/vapid.json` 的 VAPID 密钥对读不出来了。muselab 不会静默重建（那会作废所有订阅）。从备份恢复它，或主动删掉以生成新密钥对 —— 之后每台设备会重新订阅。
+
+## 会话流、队列与 Footer
+
+**发送后提示“无法建立流式连接”。**
+先确认 `/api/chat/stream/start` 没有被反向代理拦截。浏览器会先用 header 鉴权
+请求一次性 ticket，再用 ticket 建立 SSE；不要在代理规则中只放行
+`/api/chat/stream`。检查服务日志和浏览器网络面板中的 `stream/start` 状态码。
+
+**回复完成了，但页面仍显示运行中。**
+等待一次自动恢复，客户端会通过活动探测和磁盘回放校正状态。如果超过一分钟仍未
+恢复，刷新页面；已持久化的回复不会因为刷新丢失。若问题反复出现，检查反向代理
+是否缓冲 SSE 或阻断 15 秒心跳。
+
+**排队消息没有继续执行。**
+出错、手动停止、用户问题和权限确认都会暂停服务端队列。回到对应会话，根据队列
+提示选择继续或清空。队列是服务端状态，关闭浏览器不会自动取消。
+
+**切换标签后 Footer 计时或 Context 看起来不对。**
+切回对应会话并等待一次状态同步。计时以服务端回合开始时间为准；Context 以 SDK
+返回的数据为准。如果显示仍未更新，刷新页面不会停止服务端正在执行的回合。
+
+## 终端
+
+**找不到“新建终端”。**
+先点击预览顶栏或移动端会话顶栏的 `>_`，打开终端管理器。“新建终端”位于二级
+窗口顶部；Profile 选择器在按钮下方。
+
+**选择了 Profile，但启动了默认命令。**
+创建前确认选择器显示的是目标 Profile。移动端系统选择器关闭后再点击“新建终端”；
+如仍异常，刷新页面以重新同步 Profile。已经运行的终端不会因修改 Profile 而改变。
+
+**移动端终端无法上下滑动。**
+在终端正文中用单指竖直拖动，不要从底部扩展键条开始。终端滚动与页面滚动彼此
+隔离；移动端 scrollback 上限为 3,000 行。
+
+**移动键盘找不到反斜杠或控制键。**
+使用终端底部的扩展键条，其中包含 `\`、Ctrl+C、Esc、Tab 和方向键。
+
+**点击或滑动后自动出现 `2;276;` 一类字符。**
+这是全屏终端程序异常退出后残留的鼠标坐标上报，不是 Shell 自动输入。新版前端会
+在返回普通 Shell 缓冲区后丢弃并复位残留模式，也会隔离移动端滑动；旧页面需刷新。
+
+**切换 tab 或刷新后出现 `0;276;0c`。**
+这是历史输出中的设备查询在重放时再次触发了 xterm 响应。新版前端会识别服务端的
+重放边界，不再把重放产生的响应发送给当前 Shell；升级后刷新页面即可。
+
+**终端连接失败或反复重连。**
+确认反向代理允许 WebSocket 升级，并同时放行
+`/api/terminals/{id}/ticket` 和 `/api/terminals/{id}/ws`。终端 ticket 有效期短且
+只能使用一次，不能缓存或复用。
+
+**提示终端数量达到上限。**
+关闭不再使用的运行终端，或调整 `MUSELAB_TERMINAL_MAX_SESSIONS` 后重启服务。
+更多说明见 [终端](terminal_zh.md)。
 
 ## 还是没解决？
 

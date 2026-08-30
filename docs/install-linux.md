@@ -32,12 +32,19 @@ The script will:
 
 1. Verify `uv` and `systemctl` are available
 2. Run `uv sync` to install Python deps
-3. **Ask you** for the archive directory (the only folder Muse can read/write),
-   defaults to `~/muselab-archive`
-4. Generate `.env` with a random `MUSELAB_TOKEN` and `MUSELAB_HOST=127.0.0.1`
+3. **Ask you** for the primary workspace (the project or data directory
+   muselab can read and modify), defaulting to `~/muselab-workspace`
+4. Generate `.env` with a random `MUSELAB_TOKEN`,
+   `MUSELAB_HOST=127.0.0.1`, and an absolute repo-local
+   `MUSELAB_SESSIONS_DIR`
 5. Write `~/.config/systemd/user/muselab.service` and `systemctl --user enable --now`
 
-If `.env` already exists, the script leaves it alone (re-running is safe).
+If `.env` already exists, the script preserves every existing value. It only
+appends `MUSELAB_SESSIONS_DIR=<current-checkout>/sessions` when that key is
+missing, so re-running is safe and a custom session path is never overwritten.
+The installer collects no personal profile, creates no predefined directories,
+and does not write `CLAUDE.md` automatically.
+Choose or configure a Provider in Settings after logging in.
 
 ## Verify
 
@@ -70,20 +77,45 @@ journalctl --user -u muselab -f       # tail logs
 journalctl --user -u muselab -n 200   # last 200 lines
 
 bash scripts/doctor.sh                # re-verify install + probe service
-bash scripts/intake.sh                # (re)run profile intake / update CLAUDE.md
+bash scripts/intake.sh                # optional: create or refresh workspace CLAUDE.md
 ```
 
-## Re-run intake / refresh profile
+## Optional local `screen` deployment with bounded logs
 
-The 7-question profile intake from the installer can be re-run any time:
+The standard systemd service above still writes to journald; its rotation and
+retention remain managed by journald. For a separate local `screen` deployment,
+use the tracked launcher to keep a bounded combined stdout/stderr archive:
+
+```bash
+REPO="$(pwd)"
+screen -dmS muselab-local \
+  python3 "$REPO/scripts/rotating_log_launcher.py" \
+    --log "$REPO/muselab.log" --max-bytes 52428800 --keep 5 -- \
+    uv run python -m backend.main
+```
+
+The launcher has no built-in repository, user, or command path. It rotates while
+the child is running and forwards `SIGTERM`, `SIGINT`, and `SIGHUP` to the
+child process group. Each retained generation is capped at `--max-bytes`;
+rotation may split an unusually long line across two generations.
+
+Severe event-loop attribution is privacy-bounded to Python module and function
+names (no locals, source lines, paths, prompts, or identifiers). The defaults
+can be adjusted with `MUSELAB_LOOP_HEARTBEAT_MS`, `MUSELAB_LOOP_LAG_WARN_MS`,
+`MUSELAB_LOOP_STALL_MS`, and `MUSELAB_LOOP_STALL_RATE_LIMIT_S`. Set
+`MUSELAB_PERF_LOG=0` to disable all performance events, including the watchdog.
+
+## Optional workspace instructions
+
+To record durable project conventions for the primary workspace, run:
 
 ```bash
 bash scripts/intake.sh
 ```
 
-Useful after life changes (job / move / new family member) or if you skipped
-intake at install time. Existing `CLAUDE.md` gets backed up to `CLAUDE.md.bak`
-before overwrite.
+The helper writes only a generic `CLAUDE.md`; it does not create a predefined
+directory structure. After confirmation, an existing file is backed up to
+`CLAUDE.md.bak`. See [Configure workspace CLAUDE.md](personalize-claude-md.md).
 
 ## Verify install / debug weirdness
 
@@ -145,8 +177,9 @@ tablets on the same WiFi connect:
 bash scripts/uninstall-linux.sh
 ```
 
-Stops the service and deletes the unit file. `.env`, `sessions/`, and your
-archive directory are **not** touched — delete the repo to remove fully.
+Stops the service and deletes the unit file. `.env`, the configured session
+metadata directory, and the primary workspace are **not** touched — delete
+them separately to remove fully.
 
 ## Troubleshooting
 

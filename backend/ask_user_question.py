@@ -1,27 +1,12 @@
-"""
-ask_user_question — muselab's analogue of Claude Code's AskUserQuestion.
+"""Browser-side state bridge for the SDK-native AskUserQuestion tool.
 
-Flow:
-  1. Model calls `mcp__muselab__ask_user_question` with a list of questions
-  2. Our in-process MCP handler:
-     a. Generates a question_id, creates an asyncio.Future
-     b. Pushes the question to the session's SSE event queue (forwarded to UI)
-     c. await future (with 10-min timeout)
-  3. User clicks a button in the UI
-  4. Frontend POSTs to /api/chat/answer/{session_id}/{question_id}
-  5. submit_answer() resolves the Future
-  6. Handler returns the user's choice as a tool result
-  7. Model continues, sees the answer in tool_result block
-
-The handler captures session_id via closure — each ClaudeSDKClient instance
-gets its own handler bound to its session. This avoids ContextVar propagation
-issues across SDK-managed tasks.
+permission_request.py receives the native tool call through can_use_tool, or a
+PreToolUse hook in bypassPermissions mode. It publishes the normalized question
+to this module's per-session queue, awaits the Future resolved by the browser's
+answer endpoint, and injects that answer back into the native tool input.
 """
 import asyncio
-import json
-import uuid
 from typing import Any
-from claude_agent_sdk import tool, create_sdk_mcp_server
 
 # Per-session pending registry: (session_id, question_id) -> Future of answers dict.
 _pending: dict[tuple[str, str], asyncio.Future] = {}
@@ -188,122 +173,13 @@ def submit_answer(session_id: str, question_id: str, answers: dict[str, Any]) ->
     fut = _pending.get((session_id, question_id))
     if fut is None or fut.done():
         return False
+    # Move the current turn back to running before resolving the Future. Once
+    # resolved, the model can immediately finish or ask another question, so a
+    # later resume write could overwrite a newer state.
+    try:
+        from .activity import activity
+        activity.resume(session_id)
+    except Exception:
+        pass
     fut.set_result(answers)
     return True
-
-
-def build_server_for_session(session_id: str):
-    """Build an SDK MCP server whose `ask_user_question` tool is bound to this
-    session via closure. One server per ClaudeSDKClient instance — cheap; just
-    a few Python objects."""
-
-    @tool(
-        "ask_user_question",
-        (
-            "Ask the user one or more structured questions with predefined options. "
-            "Use this when you need quick disambiguation or a decision from the user "
-            "(2-4 mutually exclusive choices) instead of long free-text reply. The UI "
-            "renders each option as a clickable button. Returns the user's chosen "
-            "label(s) as text. "
-            "Input format: {questions: [{question, header, multiSelect, options: "
-            "[{label, description}, ...]}, ...]} where header is a <12-char chip tag, "
-            "and each option has a 1-5 word label + short description."
-        ),
-        # Schema is DELIBERATELY loose ({"questions": list}) rather than a
-        # strict JSON Schema. Models frequently emit malformed shapes here —
-        # `options: ["yes","no"]` (bare strings), `[{text: ...}]` (wrong key),
-        # or a missing `multiSelect`. A strict schema would make the SDK
-        # harness REJECT those tool calls outright, leaving the user staring
-        # at the question text with no buttons and no error. Instead we accept
-        # anything list-shaped and repair it in `_normalize_questions` below,
-        # so a slightly-wrong tool call still renders. Tightening only the
-        # top-level (questions must be a non-empty list) would be safe, but
-        # the SDK's `{key: type}` mini-schema can't express "non-empty" — the
-        # handler already returns a clean is_error for empty/unusable input,
-        # which covers it. See 2026-05-21 frontend feedback + audit E/250.
-        {"questions": list},
-    )
-    async def handler(args: dict[str, Any]) -> dict[str, Any]:
-        raw_questions = args.get("questions") or []
-        if not raw_questions:
-            return {
-                "content": [{"type": "text", "text": "Error: no questions provided"}],
-                "is_error": True,
-            }
-        # Normalize every question into the exact shape the frontend's Alpine
-        # template expects:
-        #   {question: str, header: str, multiSelect: bool,
-        #    options: [{label: str, description: str}, ...]}
-        # Without this, models that hand us `options: ["yes", "no"]` (bare
-        # strings), or `options: [{text: "yes"}]` (wrong key), or skip
-        # `multiSelect` entirely, render as a question with NO clickable
-        # buttons — the user sees the question text and dead air. See
-        # 2026-05-21 frontend feedback.
-        questions = _normalize_questions(raw_questions)
-        if not questions:
-            return {
-                "content": [{"type": "text",
-                              "text": "Error: questions payload had no usable options"}],
-                "is_error": True,
-            }
-
-        question_id = uuid.uuid4().hex[:12]
-        loop = asyncio.get_running_loop()
-        fut: asyncio.Future = loop.create_future()
-        _pending[(session_id, question_id)] = fut
-
-        # Push to SSE so the UI can render.
-        q = _session_queues.get(session_id)
-        if q is None:
-            # Stream not subscribed — shouldn't happen in normal flow, but be safe.
-            _pending.pop((session_id, question_id), None)
-            return {
-                "content": [{"type": "text", "text": "Error: no active UI session"}],
-                "is_error": True,
-            }
-
-        await q.put({
-            "event": "ask_user_question",
-            "data": json.dumps({"id": question_id, "questions": questions},
-                                ensure_ascii=False),
-        })
-        # Headless-turn nudge: if nobody's at a screen, push so the user knows
-        # Muse is blocked on their decision. The question already sits in the
-        # session's broadcast buffer, so opening the session later replays it
-        # and they can answer — as long as we're still within the timeout
-        # window below. (Browser present → no push; they see it in-app.)
-        _maybe_push_needs_input(session_id)
-
-        try:
-            answers = await asyncio.wait_for(fut, timeout=ANSWER_TIMEOUT_S)
-        except asyncio.TimeoutError:
-            return {
-                "content": [{"type": "text",
-                              "text": "User did not respond within 30 minutes."}],
-                "is_error": True,
-            }
-        except asyncio.CancelledError:
-            return {
-                "content": [{"type": "text",
-                              "text": "User session ended before answering."}],
-                "is_error": True,
-            }
-        finally:
-            _pending.pop((session_id, question_id), None)
-
-        # `answers` shape: {question_text: chosen_label_or_list, ...}
-        # Format as readable text the model can act on.
-        lines = []
-        for q_text, ans in answers.items():
-            if isinstance(ans, list):
-                ans_text = " + ".join(ans) if ans else "(none)"
-            else:
-                ans_text = str(ans)
-            lines.append(f"Q: {q_text}\nA: {ans_text}")
-        return {"content": [{"type": "text", "text": "\n\n".join(lines)}]}
-
-    return create_sdk_mcp_server(
-        name="muselab",
-        version="1.1.0",
-        tools=[handler],
-    )

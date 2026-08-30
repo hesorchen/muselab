@@ -1,5 +1,6 @@
 """Shared pytest fixtures: spin up a backend.main app against a temp ROOT and
 fresh sessions dir, with a known token. Each test gets a clean filesystem."""
+import asyncio
 import sys
 from pathlib import Path
 
@@ -33,6 +34,8 @@ def app_module(monkeypatch, temp_root, tmp_path):
     monkeypatch.setenv("MUSELAB_TOKEN", TEST_TOKEN)
     monkeypatch.setenv("MUSELAB_ROOT", str(temp_root))
     monkeypatch.setenv("MUSELAB_PORT", "9999")
+    monkeypatch.setenv("MUSELAB_TERMINAL_ENABLED", "1")
+    monkeypatch.setenv("MUSELAB_TERMINAL_SHELL", "/bin/sh")
     # Critical: redirect ENV_PATH to a throwaway file so PUT /api/settings
     # tests don't clobber the developer's real ~/muselab/.env. Without
     # this, test_regressions.py was silently overwriting DEEPSEEK_API_KEY
@@ -54,23 +57,18 @@ def app_module(monkeypatch, temp_root, tmp_path):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_IMAGE_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_IMAGE_BASE_URL", raising=False)
-    monkeypatch.delenv("MUSELAB_IMAGE_PROVIDER", raising=False)
-    monkeypatch.delenv("CODEX_IMAGEGEN_ENABLED", raising=False)
-    monkeypatch.delenv("CODEX_BIN", raising=False)
 
-    # NOTE (audit I/312 — fragility, intentionally left as-is for now):
     # Deleting every `backend.*` module forces a full re-import of the whole
     # tree on each test, which re-runs module-level init (e.g. backend.chat
     # snapshots SESS_DIR/active_turns at import) so the monkeypatched ROOT /
     # SESS_DIR / env take effect. The downside is that any module-level mutable
     # global (chat._clients, scheduler._state, …) is recreated per test — which
-    # mostly isolates state, but couples correctness to import order and means a
-    # module that caches a path/handle BEFORE the relevant monkeypatch silently
-    # leaks (see the SESS_DIR ordering dance below; test_scheduler.py:20 also
-    # resets _state by hand). The proper fix is to move that global state into
-    # injectable objects (e.g. an app-scoped registry) so tests construct a
-    # fresh instance instead of nuking sys.modules — that's a larger refactor
-    # touching backend/, out of scope for this CI/test-hardening pass.
+    # isolates state but makes the fixture the owner of each imported
+    # generation. The teardown below closes the same runtime resources that
+    # the application lifespan owns in production.
+    # Keep path monkeypatches before their owning module's import (see the
+    # SESS_DIR ordering below; test_scheduler.py also resets its explicit
+    # state holder).
     for name in [n for n in list(sys.modules) if n.startswith("backend")]:
         del sys.modules[name]
 
@@ -90,11 +88,22 @@ def app_module(monkeypatch, temp_root, tmp_path):
     # change default-model resolution, provider lists, or auth status behavior.
     from backend import endpoints as ep_mod
     monkeypatch.setattr(ep_mod, "OVERRIDES_PATH", tmp_path / "provider_overrides.json")
+    monkeypatch.setattr(ep_mod, "_VENDOR_CONFIG_DIR", tmp_path / "vendor-cli")
+    monkeypatch.setattr(
+        ep_mod,
+        "_LEGACY_VENDOR_CONFIG_DIR",
+        tmp_path / "legacy-vendor-cli",
+    )
     ep_mod._OVERRIDES_CACHE = None
     ep_mod._CATALOG_CACHE = None
     ep_mod._SORTED_CATALOG_CACHE = None
 
     import backend.main as main_mod  # type: ignore[import]
+
+    # DUCC is installed on some developer machines but absent in CI. Keep the
+    # general suite host-independent; DUCC-specific tests opt back in explicitly.
+    from backend import settings as settings_mod
+    monkeypatch.setattr(settings_mod, "locate_ducc_executable", lambda: None)
 
     # Isolate Claude Auth status/disconnect tests from the developer's real
     # ~/.claude/.credentials.json. Individual tests that need a credentials file
@@ -115,20 +124,46 @@ def app_module(monkeypatch, temp_root, tmp_path):
               "MOONSHOT_API_KEY", "DASHSCOPE_API_KEY", "XIAOMI_MIMO_API_KEY",
               "QIANFAN_API_KEY", "CODEX_GATEWAY_API_KEY",
               "OPENAI_API_KEY", "OPENAI_IMAGE_API_KEY", "OPENAI_IMAGE_BASE_URL",
-              "MUSELAB_IMAGE_PROVIDER", "CODEX_IMAGEGEN_ENABLED", "CODEX_BIN",
               "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN",
               "MUSELAB_MODEL", "MUSELAB_DEFAULT_MODEL",
               "MUSELAB_DEFAULT_PERMISSION", "MUSELAB_THINKING_BUDGET",
-              "MUSELAB_MAX_TURNS"):
+              "MUSELAB_MAX_TURNS",
+              # memory_dir() honours this override ahead of ROOT, and a
+              # deployment sets it (run-local points it at
+              # .memory-runtime/data) — so the /api/memory tests were reading
+              # and mutating the REAL registry: list returned the developer's
+              # live memories and an import pushed test rows into production
+              # Qdrant. It has to be cleared here rather than before the
+              # import, because load_dotenv() repopulates it from .env.
+              "MUSELAB_MEMORY_DIR"):
         monkeypatch.delenv(k, raising=False)
 
-    return main_mod
+    # Tests intentionally bypass the application's lifespan in order to keep
+    # endpoint fixtures small. They must therefore own the equivalent runtime
+    # teardown before the next test evicts this module tree from sys.modules.
+    from backend import chat as chat_mod
+    from backend import memory_client as memory_mod
+
+    async def shutdown_test_runtime() -> None:
+        try:
+            await chat_mod.shutdown_runtime()
+        finally:
+            await memory_mod.aclose()
+
+    try:
+        yield main_mod
+    finally:
+        asyncio.run(shutdown_test_runtime())
 
 
 @pytest.fixture()
 def client(app_module):
     from fastapi.testclient import TestClient
-    return TestClient(app_module.app)
+    test_client = TestClient(app_module.app)
+    try:
+        yield test_client
+    finally:
+        test_client.close()
 
 
 @pytest.fixture()

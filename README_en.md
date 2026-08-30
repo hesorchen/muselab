@@ -9,38 +9,48 @@
   <a href="README.md"><img src="https://img.shields.io/badge/lang-中文-red" alt="中文"></a>
 </p>
 
-<p align="center"><strong>muselab is a self-hosted AI personal workspace built on the Claude Agent SDK.</strong></p>
+<p align="center"><strong>muselab is a self-hosted agent workspace built on the Claude Agent SDK.</strong></p>
 
 <p align="center"><em>Muse comes from the Muses of Greek mythology, goddesses of inspiration, art, and knowledge.</em></p>
 
 <table align="center">
 <tr>
-<td align="center"><img src="promo/media/screenshot-mobile-files.jpeg" width="100"></td>
-<td align="center"><img src="promo/media/screenshot-mobile-preview.png" width="100"></td>
-<td align="center"><img src="promo/media/screenshot-mobile-chat.png" width="100"></td>
-<td align="center"><img src="promo/media/screenshot-desktop.png" width="360"></td>
+<td align="center"><a href="promo/media/screenshot-desktop.png"><img src="promo/media/screenshot-desktop.png" width="500" alt="Desktop files, preview, and Agent conversation"></a></td>
+<td align="center"><a href="promo/media/screenshot-desktop-terminal.png"><img src="promo/media/screenshot-desktop-terminal.png" width="500" alt="Desktop real PTY terminals"></a></td>
 </tr>
 <tr>
-<td align="center">Mobile · files</td>
-<td align="center">Mobile · preview</td>
-<td align="center">Mobile · chat</td>
-<td align="center">Desktop · dark theme + live HTML</td>
+<td align="center">Desktop · files, preview, and Agent conversation</td>
+<td align="center">Desktop · real PTY terminals</td>
 </tr>
 </table>
 
-<p align="center"><sub>Click any image to enlarge.</sub></p>
+<table align="center">
+<tr>
+<td align="center"><a href="promo/media/screenshot-mobile-files.jpeg"><img src="promo/media/screenshot-mobile-files.jpeg" width="180" alt="Mobile file browser"></a></td>
+<td align="center"><a href="promo/media/screenshot-mobile-chat.png"><img src="promo/media/screenshot-mobile-chat.png" width="180" alt="Mobile Agent conversation"></a></td>
+<td align="center"><a href="promo/media/screenshot-mobile.png"><img src="promo/media/screenshot-mobile.png" width="180" alt="Mobile dark-theme preview"></a></td>
+</tr>
+<tr>
+<td align="center">Mobile · files</td>
+<td align="center">Mobile · Agent conversation</td>
+<td align="center">Mobile · dark theme</td>
+</tr>
+</table>
+
+<p align="center"><sub>Public demo data; click an image to view the original.</sub></p>
 
 ## Core features
 
 | | |
 |---|---|
-| **Complete user context** | Your personal archive keeps accumulating; the more you use it, the better Muse understands you, creating compounding context |
-| **Leading Agent Harness** | Built on the Claude Agent SDK, with agent capabilities such as tool use, Skills, and MCP extensions |
-| **Switchable foundation models** | One-click switching across 9 provider families: Claude (OAuth) / GPT via local Codex Gateway / DeepSeek / GLM / MiniMax / Kimi / Qwen / MiMo / ERNIE |
-| **Cross-domain analysis** | Family information, career planning, health records, and financial data live in one context, so Muse can surface cross-domain insights |
-| **Native rendering** | HTML pages and Markdown documents render live as they are written, with no plugins required |
-| **Multiple workspaces and sessions** | File trees, preview tabs, and sessions switch together by working directory, each retaining its own browsing state |
-| **Mobile PWA** | Near-native App experience, synced sessions across desktop and phone, and continued work while you are away from your desk |
+| **Reuse existing subscriptions** | Claude supports OAuth; Codex can connect through Gateway, allowing you to reuse existing Claude and ChatGPT subscription services |
+| **Integrated Agent workspace** | Browse files, preview reports, interact with an Agent, and run or inspect results in a real terminal—all on the same page |
+| **Multiple working directories** | Create and switch among multiple working directories with one click; each directory is a complete Agent context and runtime environment |
+| **Real Unix PTY terminals** | Create, rename, and switch among multiple real terminals; each terminal stays bound to the directory where it was created and supports Terminal Profiles |
+| **Claude Agent SDK** | Native file operations, tool use, Skills, and MCP support let the Agent execute tasks directly and produce persistent artifacts |
+| **Native file preview** | Preview Markdown, text, HTML, images, PDF, XLSX, CSV, TSV, and more |
+| **Multiple models and Providers** | Built-in Claude and Codex Gateway Providers, plus support for Anthropic-compatible model services such as Kimi, GLM, and DeepSeek |
+| **Self-hosted, multi-device access** | Working directories, session state, and generated files stay local, while desktop browsers and the mobile PWA keep content in sync across devices |
 
 ## Quick start
 
@@ -72,13 +82,11 @@ Something wrong? Run `bash scripts/doctor.sh` for layered diagnostics and concre
 
 ## Session practice
 
-> "This is my checkup report from this year. Compare it with last year's report and turn the metric changes into a one-page HTML trend report."
+> "Inspect the latest changes in this project, find why the tests became slower, fix the cause, run verification, and write the result to `docs/performance-note.md`."
 
-Muse finds both PDFs in `health/`, reads the files, extracts the metrics, and writes a single-file HTML report with charts — rendered directly in the preview pane. Then you say:
+Muse reads the code and Git diff in the active working directory, runs targeted tests in a real terminal, edits the relevant files, and verifies the result. The generated note opens directly in the preview pane. When you switch to another working directory, the file tree, terminals, new sessions, and context switch with it.
 
-> "Now check the insurance policies in `money/`. Do these metric changes reveal any coverage gaps?"
-
-Archives from two domains are analyzed in the same session, producing concrete guidance.
+Code, research collections, and knowledge bases can all be ordinary workspaces; no fixed directory structure is required.
 
 🌐 More scene demos on the [muselab promo page](https://hesorchen.github.io/muselab/promo/).
 
@@ -86,29 +94,32 @@ Archives from two domains are analyzed in the same session, producing concrete g
 
 | Solution | Limitation | How muselab works |
 |---|---|---|
-| ChatGPT / Claude.ai | Files are uploaded temporarily; memory is a black box | Archived files stay local, with a transparent memory mechanism |
-| Claude Code | Born in the terminal, built for code | The same Agent Harness, aimed at life files, usable on desktop and phone |
-| RAG document chat | Chunking + retrieval loses cross-document meaning; better suited for massive document sets | Stores source documents and reads complete files for lossless understanding |
+| ChatGPT / Claude.ai | Files are usually uploaded; workspace and execution context are not continuous | Local workspaces, generated files, and inspectable context remain available |
+| Claude Code | Terminal-first, ideal for direct local CLI work | The same Agent Harness with browser files, previews, real terminals, multiple workspaces, and mobile access |
+| RAG document chat | Chunking + retrieval fits large document sets but does not provide a complete execution environment | The Agent reads full files on demand and uses tools and terminals for multi-step work |
 
 Full comparison (Open WebUI / LobeChat / AnythingLLM / claudecodeui, etc.): [How it compares](docs/comparison.md).
 
 ## Practical details
 
 - **Modern file tree** — Modern file operations: drag-and-drop upload, fuzzy search, rename, and trash
-- **Continuous previews** — Markdown, text, spreadsheets, and HTML restore their reading position; the four most recent HTML reports keep their live page state
+- **Files and terminals in one preview surface** — Markdown, text, spreadsheets, and HTML restore their reading position; real PTY terminals support multiple instances, profiles, and mobile controls
 - **Workspace isolation** — Register multiple local directories and switch files, previews, session tabs, and new-session cwd as one surface
+- **Session workspace** — Multi-session tabs, pinning and search, background streaming, persistent queues, context usage, and turn timing
+- **Global search** — Search file names, file contents, sessions, message history, and common actions from one place
+- **Editing and previewing** — Markdown editing, split preview, find-in-preview, zoom, and retained live HTML page state
 - **Self-healing sessions** — After mobile suspension or a silent SSE drop, muselab probes, reconnects, and pulls the final message automatically
 - **Multiple modes and themes** — Light / dark / eye-care themes, with your own accent color
 - **Bilingual UI** — Switch between English and Chinese in one click, without refreshing the page
 - **Message queue** — Keep sending messages while Muse thinks; the queue runs them in order so no idea is lost
-- **Scheduled tasks** — Create overnight tasks and check the results when you wake up
+- **Tasks and notifications** — Scheduled jobs, background work, the activity center, and Web Push report results in one flow
 
 ## Docs
 
 **[📚 Full documentation index](docs/README.md)**
 
 - **Get started:** [Quick start](docs/quickstart.md) · [Linux install](docs/install-linux.md) · [macOS install](docs/install-macos.md) · [Upgrade](docs/upgrade.md)
-- **Usage:** [Personalize CLAUDE.md](docs/personalize-claude-md.md) · [Skills](docs/skills.md) · [Mobile PWA](docs/mobile.md) · [Scheduled tasks](docs/scheduler.md)
+- **Usage:** [Configure workspace CLAUDE.md](docs/personalize-claude-md.md) · [Skills](docs/skills.md) · [Terminal](docs/terminal.md) · [Mobile PWA](docs/mobile.md) · [Scheduled tasks](docs/scheduler.md)
 - **Models:** [Providers](docs/providers.md) · [Codex Gateway](docs/codex-gateway.md) · [Add a provider](docs/add-provider.md) · [Model routing](docs/routing.md)
 - **Internals:** [Architecture](docs/architecture.md) · [Sessions](docs/backend-sessions.md) · [Files API](docs/backend-files.md) · [Security model](docs/backend-security.md) · [Frontend](docs/frontend.md) · [Infrastructure](docs/infrastructure.md)
 - **Reference:** [Configuration](docs/configuration.md) · [Data & backup](docs/data-and-backup.md) · [Troubleshooting](docs/troubleshooting.md) · [Glossary](docs/glossary.md)
@@ -117,6 +128,6 @@ Full comparison (Open WebUI / LobeChat / AnythingLLM / claudecodeui, etc.): [How
 
 ## Status
 
-v1.1 — first stable enhancement release.
+v1.2 — multi-workspace support, a real terminal, and richer agent workflows.
 
 [MIT](LICENSE)

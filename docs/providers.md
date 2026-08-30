@@ -11,46 +11,47 @@ of it.
 
 | Provider | How to enable | Tool use | Where to get the key |
 |---|---|---|---|
-| **Anthropic Claude** (Opus / Sonnet / Haiku) | `claude login` once | ✅ | Reuses Pro / Max OAuth — no API key, no per-token bill |
-| **DeepSeek** (V4 series) | `DEEPSEEK_API_KEY` in Settings | ✅ | platform.deepseek.com |
-| **智谱 GLM** (GLM 5 / 5 Air / 5.1 / 4.7 / 4 Plus) | `ZHIPUAI_API_KEY` | ✅ | bigmodel.cn (free tier available) |
-| **MiniMax** (M2.1 / M2.5 / M2.7 + Highspeed variants; 国际 endpoint via `MINIMAX_INTL_API_KEY`) | `MINIMAX_API_KEY` | ✅ | minimaxi.com (国内) / minimax.io (国际) — returns thinking blocks by default |
-| **Kimi** (K2 / K2.5 / K2.6 / K2 Thinking) | `MOONSHOT_API_KEY` | ✅ | platform.moonshot.cn |
-| **Qwen** (Qwen3 / 3.5 / 3.6 series — Max / Plus / Flash / Coder; 国际 endpoint via same key) | `DASHSCOPE_API_KEY` | ✅ | dashscope.console.aliyun.com — one key works for 国内 + 国际 (latency-only difference) |
-| **Xiaomi MiMo** (V2.5 Pro / V2.5 / V2 Flash) | `XIAOMI_MIMO_API_KEY` | ✅ | platform.xiaomimimo.com (beta) |
-| **Baidu Qianfan** (ERNIE 4 / 4.5 / 5 series + X1 reasoning + DeepSeek V3.2 via Qianfan) | `QIANFAN_API_KEY` | ✅ | console.bce.baidu.com/qianfan — Anthropic-compat path needs an IAM **access token** (`bce-v3/ALTAK-xxx/xxx`), not a plain `sk-xxx` key |
+| **Anthropic Claude** | `claude login` once | ✅ | Reuses Pro / Max OAuth; no API key |
+| **DeepSeek** | `DEEPSEEK_API_KEY` in Settings | ✅ | platform.deepseek.com |
+| **Zhipu GLM** | `ZHIPUAI_API_KEY` | ✅ | bigmodel.cn |
+| **MiniMax** (domestic / international) | `MINIMAX_API_KEY` / `MINIMAX_INTL_API_KEY` | ✅ | minimaxi.com / minimax.io |
+| **Kimi** | `MOONSHOT_API_KEY` | ✅ | platform.moonshot.cn |
+| **Qwen** (domestic / international) | `DASHSCOPE_API_KEY` | ✅ | dashscope.console.aliyun.com |
+| **Xiaomi MiMo** | `XIAOMI_MIMO_API_KEY` | ✅ | platform.xiaomimimo.com |
+| **Baidu Qianfan** | `QIANFAN_API_KEY` | ✅ | console.bce.baidu.com/qianfan; the Anthropic-compatible path needs an IAM access token |
 | **Codex Gateway** (local sidecar) | `CODEX_GATEWAY_API_KEY` | ✅* | A user-run Anthropic-compatible gateway at `127.0.0.1`; see [codex-gateway.md](codex-gateway.md) |
+| **OpenAI** (Anthropic-compatible route) | The current built-in reuses `ZHIPUAI_API_KEY` and its compatible endpoint | ✅* | Supplied by the operator; muselab does not call the native OpenAI Chat/Responses API |
+| **Custom provider** | Add endpoint, prefix, models, and key in Settings → Providers | endpoint-dependent | Any Anthropic Messages-compatible service |
 
 \* Tool use depends on the gateway translating Anthropic `tool_use` / `tool_result` correctly.
 
-Exact model ids in each family come from the UI dropdown — they're sourced
-from the effective catalog (built-in defaults + your Settings overrides) and
-may evolve faster than this table.
+Exact model IDs and availability come from the UI dropdown. It reflects the
+effective catalog (built-in defaults, overrides, and custom entries) and
+evolves faster than this page, so this table deliberately avoids model counts.
 
 ## Image generation
 
-The composer image button is not a chat provider. `MUSELAB_IMAGE_PROVIDER=auto`
-uses the native OpenAI Image API when `OPENAI_IMAGE_API_KEY` (or
-`OPENAI_API_KEY`) is configured. The local Codex `$imagegen` path is explicit
-opt-in: set `MUSELAB_IMAGE_PROVIDER=codex_imagegen` and
-`CODEX_IMAGEGEN_ENABLED=true` to use the logged-in `codex` CLI. Set
-`MUSELAB_IMAGE_PROVIDER=openai` to force the OpenAI-compatible path.
+The composer image button is separate from chat providers. It calls an
+OpenAI-compatible Images API configured with `OPENAI_IMAGE_API_KEY` (or the
+`OPENAI_API_KEY` fallback) and `OPENAI_IMAGE_BASE_URL`. The endpoint may be
+OpenAI itself or a narrow self-hosted adapter such as
+[codex-image-api](https://github.com/hesorchen/codex-image-api).
 
-Generated images are staged as normal muselab image attachments, so they can be
-previewed, annotated, and sent into the current chat. Image requests run as
-background jobs and are also kept in the image history drawer, so refreshing the
-page does not lose completed outputs. The Codex imagegen path is intended for
-localhost single-user deployments; do not expose a muselab instance with local
-Codex access to the public internet.
+muselab does not launch Codex or hold Codex OAuth state. Keeping image execution
+behind a dedicated API makes the credential and process boundary independent of
+the web application. Generated images are staged as ordinary muselab image
+attachments, so they can be previewed, annotated, and sent into the current
+chat. Requests run as background jobs and remain available in the image history
+drawer after a page refresh.
 
 ## Switching model mid-conversation
 
 If the current session already has messages, the dropdown opens a confirm
-modal and forks a fresh session with the new model — the original is kept
-in history. Empty sessions switch in place (no fork). The fork avoids
-cross-vendor thinking-signature drift, which causes silent breakage when
-one provider's signed thinking blocks are sent back to a different
-provider.
+modal and creates an empty session with the new model — the original is kept
+in history and its transcript is not copied. Empty sessions switch in place.
+Starting from a blank transcript avoids cross-vendor thinking-signature drift,
+which causes silent breakage when one provider's signed thinking blocks are
+sent back to a different provider.
 
 Each assistant message stores its own `model` field, so badges remain
 accurate even after a page reload that re-renders the whole transcript.

@@ -1,5 +1,6 @@
 """Third-party provider catalog: prefix→endpoint+key dispatch."""
 import json
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -19,6 +20,13 @@ def _reload_endpoints(monkeypatch, env: dict):
     # Keep catalog tests hermetic: a developer's local provider_overrides.json
     # (gitignored runtime state) must not change built-in routing assertions.
     monkeypatch.setattr(ep, "OVERRIDES_PATH", Path(tempfile.mkdtemp()) / "provider_overrides.json")
+    isolated_root = Path(tempfile.mkdtemp())
+    monkeypatch.setattr(ep, "_VENDOR_CONFIG_DIR", isolated_root / "vendor-cli")
+    monkeypatch.setattr(
+        ep,
+        "_LEGACY_VENDOR_CONFIG_DIR",
+        isolated_root / "legacy-vendor-cli",
+    )
     ep._OVERRIDES_CACHE = None
     ep._CATALOG_CACHE = None
     ep._SORTED_CATALOG_CACHE = None
@@ -39,6 +47,126 @@ def test_lookup_unknown_model(monkeypatch):
     assert ep.lookup("claude-sonnet-4-6") is None  # claude not in catalog
 
 
+def test_ducc_model_prefix_selects_runtime_and_catalog_model(monkeypatch):
+    ep = _reload_endpoints(monkeypatch, {})
+
+    assert ep.is_ducc_model("ducc:claude-opus-4-8")
+    assert not ep.is_ducc_model("claude-opus-4-8")
+    assert ep.normalize_model_id("ducc:claude-opus-4-8") == "claude-opus-4-8"
+    assert ep.ducc_cli_model("ducc:auto") == "auto"
+    assert ep.ducc_cli_model("ducc:glm-5-2") == "GLM-5.2"
+    assert ep.ducc_cli_model("ducc:gpt-5-6-sol") == "gpt-5.6-sol"
+    assert ep.ducc_cli_model("ducc:claude-opus-4-8") == "Opus 4.8"
+    assert (
+        ep.ducc_cli_model("ducc:claude-haiku-4-5-20251001")
+        == "Claude Haiku 4.5"
+    )
+    assert ep.ducc_cli_model("ducc:unknown-model") == "unknown-model"
+    assert ep.ducc_is_claude_model("ducc:claude-opus-4-8")
+    assert not ep.ducc_is_claude_model("ducc:gpt-5-6-sol")
+    assert ep.lookup("ducc:claude-opus-4-8") is None
+
+
+def test_ducc_group_does_not_require_native_anthropic_auth(monkeypatch):
+    ep = _reload_endpoints(monkeypatch, {
+        "ANTHROPIC_API_KEY": None,
+        "ANTHROPIC_AUTH_TOKEN": None,
+        "MUSELAB_DISABLED_PROVIDERS": None,
+    })
+    from backend import settings
+    monkeypatch.setattr(settings, "locate_ducc_executable", lambda: "/tmp/ducc")
+    monkeypatch.setattr(ep.Path, "home", lambda: Path("/nonexistent-home"))
+
+    groups = ep.available_groups()
+    ducc = next(group for group in groups if group["group"] == "DUCC")
+
+    assert ducc["supports_thinking"] is False
+    assert ducc["supports_effort"] is False
+    assert [item["model"] for item in ducc["items"]] == [
+        "ducc:auto-internal",
+        "ducc:deepseek-v4-flash-internal",
+        "ducc:glm-5-2-internal",
+        "ducc:kimi-k2-7-code-internal",
+        "ducc:auto",
+        "ducc:glm-5",
+        "ducc:glm-5-1",
+        "ducc:glm-5-2",
+        "ducc:glm-5-3",
+        "ducc:glm-5-3-flash",
+        "ducc:glm-5-turbo",
+        "ducc:grok-4-5",
+        "ducc:gpt-5-5",
+        "ducc:gpt-5-6-luna",
+        "ducc:gpt-5-6-terra",
+        "ducc:gpt-5-6-sol",
+        "ducc:claude-haiku-4-5",
+        "ducc:claude-sonnet-4-6",
+        "ducc:claude-sonnet-5",
+        "ducc:claude-opus-4-6",
+        "ducc:claude-opus-4-7",
+        "ducc:claude-opus-4-8",
+        "ducc:claude-opus-5",
+        "ducc:kimi-k2-6",
+        "ducc:minimax-m3",
+        "ducc:deepseek-v4-flash",
+        "ducc:deepseek-v4-pro",
+    ]
+    assert [item["label"] for item in ducc["items"]][:5] == [
+        "Auto · 内部",
+        "DeepSeek V4 Flash · 内部",
+        "GLM 5.2 · 内部",
+        "Kimi K2.7 Code · 内部",
+        "Auto",
+    ]
+    assert [cli_name for _model_id, cli_name, _label in ep.DUCC_MODELS] == [
+        "auto-内部",
+        "DeepSeek-V4-Flash-内部",
+        "GLM-5.2-内部",
+        "Kimi-K2.7-Code-内部",
+        "auto",
+        "GLM-5",
+        "GLM-5.1",
+        "GLM-5.2",
+        "GLM-5.3",
+        "GLM-5.3-Flash",
+        "GLM-5-Turbo",
+        "grok-4.5",
+        "gpt-5.5",
+        "gpt-5.6-luna",
+        "gpt-5.6-terra",
+        "gpt-5.6-sol",
+        "Claude Haiku 4.5",
+        "Claude Sonnet 4.6",
+        "Claude Sonnet 5",
+        "Claude Opus 4.6",
+        "Claude Opus 4.7",
+        "Opus 4.8",
+        "Opus 5",
+        "Kimi-K2.6",
+        "MiniMax-M3",
+        "DeepSeek-V4-Flash",
+        "DeepSeek-V4-Pro",
+    ]
+
+
+def test_ducc_group_honors_model_disable_and_runtime_availability(monkeypatch):
+    ep = _reload_endpoints(monkeypatch, {
+        "MUSELAB_DISABLED_PROVIDERS": "ducc:auto,ducc:glm-5-2",
+    })
+    from backend import settings
+
+    monkeypatch.setattr(settings, "locate_ducc_executable", lambda: "/tmp/ducc")
+    groups = ep.available_groups()
+    ducc = next(group for group in groups if group["group"] == "DUCC")
+    models = {item["model"] for item in ducc["items"]}
+    assert "ducc:auto" not in models
+    assert "ducc:glm-5-2" not in models
+    assert len(models) == 25
+
+    monkeypatch.setattr(settings, "locate_ducc_executable", lambda: None)
+    assert all(group["group"] != "DUCC" for group in ep.available_groups())
+
+
 def test_env_override_missing_key(monkeypatch):
     ep = _reload_endpoints(monkeypatch, {"DEEPSEEK_API_KEY": None})
     assert ep.env_override("deepseek-v4-pro") is None
@@ -57,6 +185,173 @@ def test_env_override_present(monkeypatch):
     assert env["ANTHROPIC_AUTH_TOKEN"] == "sk-test"
     assert env["CLAUDE_CODE_OAUTH_TOKEN"] == ""
     assert env["CLAUDE_OAUTH_TOKEN"] == ""
+
+
+def test_vendor_config_exposes_only_live_user_skills(monkeypatch, tmp_path):
+    user_home = tmp_path / "home"
+    user_skill = user_home / ".claude" / "skills" / "research"
+    user_skill.mkdir(parents=True)
+    skill_md = user_skill / "SKILL.md"
+    skill_md.write_text(
+        "---\nname: research\ndescription: test\n---\noriginal\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(user_home))
+    ep = _reload_endpoints(monkeypatch, {"DEEPSEEK_API_KEY": "sk-test"})
+    vendor_dir = tmp_path / "vendor-config"
+    vendor_dir.mkdir()
+    monkeypatch.setattr(ep, "_VENDOR_CONFIG_DIR", vendor_dir)
+
+    env = ep.env_override("deepseek-v4-pro")
+
+    assert env is not None
+    assert env["CLAUDE_CONFIG_DIR"] == str(vendor_dir)
+    vendor_skills = vendor_dir / "skills"
+    assert vendor_skills.is_symlink()
+    assert vendor_skills.resolve() == (user_home / ".claude" / "skills").resolve()
+    assert (vendor_skills / "research" / "SKILL.md").read_text(
+        encoding="utf-8",
+    ).endswith("original\n")
+    # The mapping is live rather than a stale copy.
+    skill_md.write_text(
+        "---\nname: research\ndescription: test\n---\nupdated\n",
+        encoding="utf-8",
+    )
+    assert (vendor_skills / "research" / "SKILL.md").read_text(
+        encoding="utf-8",
+    ).endswith("updated\n")
+    # Only skills are bridged; credentials and settings stay isolated.
+    assert not (vendor_dir / ".credentials.json").exists()
+    assert not (vendor_dir / "settings.json").exists()
+
+
+def test_vendor_config_migrates_legacy_state_without_oauth(
+    monkeypatch,
+    tmp_path,
+):
+    ep = _reload_endpoints(monkeypatch, {})
+    legacy = tmp_path / "legacy-vendor-config"
+    transcript = legacy / "projects" / "workspace" / "session.jsonl"
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text('{"type":"user"}\n', encoding="utf-8")
+    (legacy / ".credentials.json").write_text("secret", encoding="utf-8")
+    target = tmp_path / "state" / "muselab" / "vendor-cli"
+    monkeypatch.setattr(ep, "_VENDOR_CONFIG_DIR", target)
+    monkeypatch.setattr(ep, "_LEGACY_VENDOR_CONFIG_DIR", legacy)
+
+    resolved = ep._vendor_config_dir()
+
+    assert resolved == target
+    assert (target / "projects" / "workspace" / "session.jsonl").read_text(
+        encoding="utf-8",
+    ) == '{"type":"user"}\n'
+    assert not (target / ".credentials.json").exists()
+    assert not legacy.exists()
+    assert target.stat().st_mode & 0o777 == 0o700
+
+
+def test_vendor_config_merge_preserves_durable_conflicts(
+    monkeypatch,
+    tmp_path,
+):
+    ep = _reload_endpoints(monkeypatch, {})
+    legacy = tmp_path / "legacy-vendor-config"
+    target = tmp_path / "state" / "muselab" / "vendor-cli"
+    (legacy / "projects").mkdir(parents=True)
+    (target / "projects").mkdir(parents=True)
+    (legacy / "projects" / "same.jsonl").write_text("legacy", encoding="utf-8")
+    (target / "projects" / "same.jsonl").write_text("durable", encoding="utf-8")
+    (legacy / "projects" / "missing.jsonl").write_text("move", encoding="utf-8")
+    monkeypatch.setattr(ep, "_VENDOR_CONFIG_DIR", target)
+    monkeypatch.setattr(ep, "_LEGACY_VENDOR_CONFIG_DIR", legacy)
+
+    ep._vendor_config_dir()
+
+    assert (target / "projects" / "same.jsonl").read_text(
+        encoding="utf-8",
+    ) == "durable"
+    assert (target / "projects" / "missing.jsonl").read_text(
+        encoding="utf-8",
+    ) == "move"
+    assert (
+        target / ".migration-conflicts" / "projects" / "same.jsonl"
+    ).read_text(
+        encoding="utf-8",
+    ) == "legacy"
+    assert not legacy.exists()
+
+
+def test_vendor_config_uses_legacy_root_if_migration_fails(
+    monkeypatch,
+    tmp_path,
+):
+    ep = _reload_endpoints(monkeypatch, {})
+    legacy = tmp_path / "legacy-vendor-config"
+    legacy.mkdir()
+    (legacy / "projects").mkdir()
+    (legacy / ".credentials.json").write_text("secret", encoding="utf-8")
+    target = tmp_path / "state" / "muselab" / "vendor-cli"
+    monkeypatch.setattr(ep, "_VENDOR_CONFIG_DIR", target)
+    monkeypatch.setattr(ep, "_LEGACY_VENDOR_CONFIG_DIR", legacy)
+
+    def fail_move(_source, _target):
+        raise OSError("simulated cross-device failure")
+
+    monkeypatch.setattr(ep.shutil, "move", fail_move)
+
+    assert ep._vendor_config_dir() == legacy
+    assert (legacy / "projects").is_dir()
+    assert not (legacy / ".credentials.json").exists()
+    assert not target.exists()
+
+
+def test_vendor_config_merges_newer_jsonl_tail(
+    monkeypatch,
+    tmp_path,
+):
+    ep = _reload_endpoints(monkeypatch, {})
+    legacy = tmp_path / "legacy-vendor-config"
+    target = tmp_path / "state" / "muselab" / "vendor-cli"
+    old_file = legacy / "projects" / "same.jsonl"
+    new_file = target / "projects" / "same.jsonl"
+    old_file.parent.mkdir(parents=True)
+    new_file.parent.mkdir(parents=True)
+    first = b'{"type":"user","uuid":"one"}\n'
+    tail = b'{"type":"assistant","uuid":"two"}\n'
+    new_file.write_bytes(first)
+    old_file.write_bytes(first + tail)
+    os.utime(new_file, ns=(1_000_000_000, 1_000_000_000))
+    os.utime(old_file, ns=(2_000_000_000, 2_000_000_000))
+    monkeypatch.setattr(ep, "_VENDOR_CONFIG_DIR", target)
+    monkeypatch.setattr(ep, "_LEGACY_VENDOR_CONFIG_DIR", legacy)
+
+    ep._vendor_config_dir()
+
+    assert new_file.read_bytes() == first + tail
+    assert not legacy.exists()
+    assert not (target / ".migration-conflicts").exists()
+
+
+def test_vendor_skill_bridge_preserves_real_isolated_directory(
+    monkeypatch,
+    tmp_path,
+):
+    user_home = tmp_path / "home"
+    (user_home / ".claude" / "skills").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(user_home))
+    ep = _reload_endpoints(monkeypatch, {"DEEPSEEK_API_KEY": "sk-test"})
+    vendor_dir = tmp_path / "vendor-config"
+    vendor_skills = vendor_dir / "skills"
+    vendor_skills.mkdir(parents=True)
+    marker = vendor_skills / "keep.txt"
+    marker.write_text("keep", encoding="utf-8")
+    monkeypatch.setattr(ep, "_VENDOR_CONFIG_DIR", vendor_dir)
+
+    ep.env_override("deepseek-v4-pro")
+
+    assert vendor_skills.is_dir()
+    assert not vendor_skills.is_symlink()
+    assert marker.read_text(encoding="utf-8") == "keep"
 
 
 def test_is_third_party(monkeypatch):

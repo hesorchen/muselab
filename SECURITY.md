@@ -8,13 +8,13 @@ muselab is a single-user, self-hosted web application. Whoever holds the
 - Read, write, upload, and delete files under `MUSELAB_ROOT` and every directory registered in the workspace picker
 - Drive a Claude Agent SDK session running with `permission_mode="bypassPermissions"` and the selected workspace as `cwd`
 
-This is intentional — muselab is an AI archive manager, not a sandbox. The
+This is intentional — muselab is a local Agent workbench, not a sandbox. The
 practical implication is that **a leaked token is equivalent to remote code
 execution with the service user's OS permissions**, not merely file-API access
 inside a workspace. Operate accordingly:
 
 - Run the service as a dedicated unprivileged user (not `root`, not your login account)
-- Point `MUSELAB_ROOT` at a dedicated directory you own, and register only intended project/archive directories (broad system roots such as `/`, `/etc`, `/root`, `/home`, `/var`, `/usr`, `/boot` are refused)
+- Point `MUSELAB_ROOT` at a dedicated directory you own, and register only intended workspace directories (broad system roots such as `/`, `/etc`, `/root`, `/home`, `/var`, `/usr`, `/boot` are refused)
 - Place it behind nginx or Caddy with HTTPS; never expose port `8765` directly to the public internet
 - Treat `MUSELAB_TOKEN` like a password: keep it long, random, and rotate it if a leak is suspected
 - Add HTTP basic auth as a second factor in front of muselab when exposed beyond your LAN
@@ -64,7 +64,7 @@ log {
 
 - A compromised `MUSELAB_TOKEN` — full access is granted by design
 - Tool or shell access beyond a registered workspace — `bypassPermissions` intentionally gives the agent the service user's authority; file-API containment is not an OS sandbox
-- Resource exhaustion at the request layer — upload size is capped (100 MB by default, configurable via `MUSELAB_MAX_UPLOAD_MB`); `/api/files/grep` has a soft 8-second time budget and a 1 MB per-file cap; `/api/log/client-error` is rate-limited to 30 requests per IP per minute. Other endpoints do not have per-IP rate limiting. If muselab is exposed to more than one trusted user, place a reverse proxy (Caddy or nginx) in front with global rate limits.
+- Resource exhaustion at the request layer — upload size is capped (100 MB by default, configurable via `MUSELAB_MAX_UPLOAD_MB`); `/api/files/grep` has a soft 8-second time budget and a 1 MB per-file cap; `/api/log/client-error` is limited to an 8 KiB streaming body and 30 requests per IP per minute. The generated Caddy configuration also rejects oversized bodies for that unauthenticated route. Other endpoints do not have per-IP rate limiting. If muselab is exposed to more than one trusted user, place a reverse proxy (Caddy or nginx) in front with global rate limits.
 
 ## Reporting a vulnerability
 

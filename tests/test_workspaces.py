@@ -2,6 +2,8 @@
 
 from urllib.parse import quote
 
+import pytest
+
 
 def _make_workspace(tmp_path, name="other"):
     path = tmp_path / name
@@ -16,9 +18,11 @@ def test_register_list_and_remove_workspace(client, auth, temp_root, tmp_path):
     created = client.post(
         "/api/chat/workspaces", headers=auth, json={"path": str(other)})
     assert created.status_code == 200
-    assert created.json() == {
-        "path": str(other.resolve()), "name": "other", "primary": False,
-    }
+    created_payload = created.json()
+    assert created_payload["path"] == str(other.resolve())
+    assert created_payload["name"] == "other"
+    assert created_payload["primary"] is False
+    assert created_payload["id"]
 
     rows = client.get("/api/chat/workspaces", headers=auth).json()["workspaces"]
     assert rows[0]["path"] == str(temp_root.resolve())
@@ -30,6 +34,104 @@ def test_register_list_and_remove_workspace(client, auth, temp_root, tmp_path):
     assert removed.status_code == 200
     rows = client.get("/api/chat/workspaces", headers=auth).json()["workspaces"]
     assert [row["path"] for row in rows] == [str(temp_root.resolve())]
+
+
+def test_readding_same_path_gets_new_workspace_generation(
+    app_module,
+    tmp_path,
+):
+    from backend.workspaces import WorkspaceRegistry
+
+    primary = tmp_path / "primary"
+    primary.mkdir()
+    other = _make_workspace(tmp_path)
+    registry = WorkspaceRegistry(primary)
+    first = registry.register(other)
+    registry.remove(other)
+    second = registry.register(other)
+
+    assert first.path == second.path
+    assert first.id != second.id
+
+
+def test_workspace_registry_resolves_only_the_exact_generation_id(
+    app_module,
+    tmp_path,
+):
+    from backend.workspaces import WorkspaceRegistry
+
+    primary = tmp_path / "primary"
+    primary.mkdir()
+    other = _make_workspace(tmp_path)
+    registry = WorkspaceRegistry(primary)
+    first = registry.register(other)
+
+    assert registry.entry_for_id(first.id) == first
+    registry.remove(other)
+    second = registry.register(other)
+    assert second.id != first.id
+    with pytest.raises(ValueError, match="workspace is not registered"):
+        registry.entry_for_id(first.id)
+    assert registry.entry_for_id(second.id) == second
+
+
+def test_removed_workspace_sessions_keep_their_attachments(
+    client, auth, temp_root, tmp_path,
+):
+    from backend import chat, sessions
+
+    other = _make_workspace(tmp_path)
+    assert client.post(
+        "/api/chat/workspaces", headers=auth, json={"path": str(other)}
+    ).status_code == 200
+    session = sessions.create_session("kept", cwd=other)
+    kept = chat._attachments_base() / session["id"]
+    kept.mkdir(parents=True)
+    (kept / "image.png").write_bytes(b"image")
+    orphan = chat._attachments_base() / "actually-orphaned"
+    orphan.mkdir()
+
+    assert client.delete(
+        "/api/chat/workspaces",
+        headers=auth,
+        params={"path": str(other)},
+    ).status_code == 200
+    chat._gc_orphan_attachments()
+
+    assert kept.exists()
+    assert not orphan.exists()
+
+
+def test_legacy_registry_rows_receive_stable_workspace_ids(
+    app_module,
+    temp_root,
+    tmp_path,
+):
+    import json
+
+    from backend.workspaces import WorkspaceRegistry
+
+    other = _make_workspace(tmp_path)
+    registry_dir = temp_root / ".muselab"
+    # Other private stores may initialize the shared internal container before
+    # the workspace registry migrates a legacy workspaces.json file.
+    registry_dir.mkdir(exist_ok=True)
+    (registry_dir / "workspaces.json").write_text(
+        json.dumps({
+            "workspaces": [
+                {"path": str(temp_root), "name": "primary"},
+                {"path": str(other), "name": "other"},
+            ],
+        }),
+        encoding="utf-8",
+    )
+
+    first = WorkspaceRegistry(temp_root)
+    second = WorkspaceRegistry(temp_root)
+    assert [row.id for row in first.list()] == [
+        row.id for row in second.list()
+    ]
+    assert all(row.id for row in first.list())
 
 
 def test_reorder_workspaces_persists_complete_order(client, auth, temp_root, tmp_path):
@@ -86,6 +188,211 @@ def test_workspace_header_and_query_scope_file_access(client, auth, tmp_path):
     assert primary.status_code == 404
 
 
+def test_nested_workspace_can_browse_symlink_into_registered_primary(
+    client,
+    auth,
+    temp_root,
+):
+    shared = temp_root / "shared"
+    shared.mkdir()
+    (shared / "linked.txt").write_text("through-link\n", encoding="utf-8")
+    nested = temp_root / "agent_workspaces"
+    nested.mkdir()
+    (nested / "project-link").symlink_to(shared, target_is_directory=True)
+
+    registered = client.post(
+        "/api/chat/workspaces",
+        headers=auth,
+        json={"path": str(nested)},
+    )
+    assert registered.status_code == 200
+    workspace_headers = {
+        **auth,
+        "X-Muselab-Workspace": quote(str(nested.resolve()), safe=""),
+    }
+
+    listing = client.get(
+        "/api/files/list?path=project-link",
+        headers=workspace_headers,
+    )
+    assert listing.status_code == 200
+    assert listing.json()["entries"] == [{
+        "name": "linked.txt",
+        "path": "project-link/linked.txt",
+        "is_dir": False,
+        "size": len("through-link\n"),
+        "mtime": (shared / "linked.txt").stat().st_mtime,
+    }]
+
+    opened = client.get(
+        "/api/files/read?path=project-link/linked.txt",
+        headers=workspace_headers,
+    )
+    assert opened.status_code == 200
+    assert opened.text == "through-link\n"
+
+    metadata = client.get(
+        "/api/files/stat?path=project-link/linked.txt",
+        headers=workspace_headers,
+    )
+    assert metadata.status_code == 200
+    assert metadata.json()["path"] == "project-link/linked.txt"
+
+    saved = client.put(
+        "/api/files/write",
+        headers=workspace_headers,
+        json={"path": "project-link/linked.txt", "content": "updated\n"},
+    )
+    assert saved.status_code == 200
+    assert (shared / "linked.txt").read_text(encoding="utf-8") == "updated\n"
+
+    created = client.post(
+        "/api/files/mkdir",
+        headers=workspace_headers,
+        json={"path": "project-link/generated"},
+    )
+    assert created.status_code == 200
+    assert created.json()["path"] == "project-link/generated"
+
+    renamed = client.post(
+        "/api/files/rename",
+        headers=workspace_headers,
+        json={
+            "src": "project-link/generated",
+            "dst": "project-link/renamed",
+        },
+    )
+    assert renamed.status_code == 200
+    assert renamed.json()["path"] == "project-link/renamed"
+    assert (shared / "renamed").is_dir()
+
+    removed = client.request(
+        "DELETE",
+        "/api/files/delete",
+        headers=workspace_headers,
+        json={"path": "project-link/renamed"},
+    )
+    assert removed.status_code == 200
+    assert removed.json()["manifest"]["original_path"] == "project-link/renamed"
+    restored = client.post(
+        "/api/files/trash/restore",
+        headers=workspace_headers,
+        json={"trash_id": removed.json()["trash_id"]},
+    )
+    assert restored.status_code == 200
+    assert (shared / "renamed").is_dir()
+
+    permanent_dir = shared / "permanent"
+    permanent_dir.mkdir()
+    (permanent_dir / "payload.txt").write_text(
+        "delete permanently\n",
+        encoding="utf-8",
+    )
+    permanently_removed = client.request(
+        "DELETE",
+        "/api/files/delete",
+        headers=workspace_headers,
+        params={"permanent": True},
+        json={"path": "project-link/permanent"},
+    )
+    assert permanently_removed.status_code == 200
+    assert permanently_removed.json() == {"ok": True, "permanent": True}
+    assert not permanent_dir.exists()
+
+
+def test_soft_delete_rolls_back_when_registered_symlink_parent_is_swapped(
+    client,
+    auth,
+    temp_root,
+    monkeypatch,
+):
+    from backend import files
+
+    shared = temp_root / "shared"
+    shared.mkdir()
+    original_payload = shared / "payload.txt"
+    original_payload.write_text("registered\n", encoding="utf-8")
+
+    nested = temp_root / "agent_workspaces"
+    nested.mkdir()
+    project_link = nested / "project-link"
+    project_link.symlink_to(shared, target_is_directory=True)
+
+    outside = temp_root.parent / "unregistered-target"
+    outside.mkdir()
+    outside_payload = outside / "payload.txt"
+    outside_payload.write_text("outside\n", encoding="utf-8")
+
+    registered = client.post(
+        "/api/chat/workspaces",
+        headers=auth,
+        json={"path": str(nested)},
+    )
+    assert registered.status_code == 200
+    workspace_headers = {
+        **auth,
+        "X-Muselab-Workspace": quote(str(nested.resolve()), safe=""),
+    }
+
+    original_rename = files._rename_noreplace
+    swapped = False
+
+    def swap_parent_then_rename(*args, **kwargs):
+        nonlocal swapped
+        if not swapped:
+            swapped = True
+            project_link.unlink()
+            project_link.symlink_to(outside, target_is_directory=True)
+        return original_rename(*args, **kwargs)
+
+    monkeypatch.setattr(files, "_rename_noreplace", swap_parent_then_rename)
+
+    removed = client.request(
+        "DELETE",
+        "/api/files/delete",
+        headers=workspace_headers,
+        json={"path": "project-link/payload.txt"},
+    )
+
+    assert swapped is True
+    assert removed.status_code == 400
+    assert "no longer reachable" in removed.json()["detail"]
+    assert original_payload.read_text(encoding="utf-8") == "registered\n"
+    assert outside_payload.read_text(encoding="utf-8") == "outside\n"
+    assert project_link.resolve() == outside.resolve()
+    trash = client.get("/api/files/trash/list", headers=workspace_headers)
+    assert trash.status_code == 200
+    assert trash.json()["items"] == []
+
+
+def test_nested_workspace_cannot_traverse_directly_into_registered_primary(
+    client,
+    auth,
+    temp_root,
+):
+    shared = temp_root / "shared"
+    shared.mkdir()
+    (shared / "blocked.txt").write_text("not-through-link\n", encoding="utf-8")
+    nested = temp_root / "agent_workspaces"
+    nested.mkdir()
+    assert client.post(
+        "/api/chat/workspaces",
+        headers=auth,
+        json={"path": str(nested)},
+    ).status_code == 200
+    workspace_headers = {
+        **auth,
+        "X-Muselab-Workspace": quote(str(nested.resolve()), safe=""),
+    }
+
+    response = client.get(
+        "/api/files/read?path=../shared/blocked.txt",
+        headers=workspace_headers,
+    )
+    assert response.status_code == 400
+    assert "not-through-link" not in response.text
+
+
 def test_session_cwd_must_be_registered_and_is_returned(client, auth, tmp_path):
     other = _make_workspace(tmp_path)
     unregistered = tmp_path / "not-registered"
@@ -108,6 +415,103 @@ def test_session_cwd_must_be_registered_and_is_returned(client, auth, tmp_path):
 
     rows = client.get("/api/chat/sessions", headers=auth).json()["sessions"]
     assert next(row for row in rows if row["id"] == sid)["cwd"] == str(other.resolve())
+
+
+def test_sessions_can_be_scoped_to_workspace_before_limit_and_ids(
+    client, auth, temp_root, tmp_path,
+):
+    other = _make_workspace(tmp_path)
+    empty_a = _make_workspace(tmp_path, "empty-a")
+    empty_b = _make_workspace(tmp_path, "empty-b")
+    for workspace in (other, empty_a, empty_b):
+        assert client.post(
+            "/api/chat/workspaces",
+            headers=auth,
+            json={"path": str(workspace)},
+        ).status_code == 200
+
+    primary_old = client.post(
+        "/api/chat/sessions",
+        headers=auth,
+        json={"name": "primary old", "cwd": str(temp_root)},
+    ).json()
+    primary_new = client.post(
+        "/api/chat/sessions",
+        headers=auth,
+        json={"name": "primary new", "cwd": str(temp_root)},
+    ).json()
+    other_old = client.post(
+        "/api/chat/sessions",
+        headers=auth,
+        json={"name": "other old", "cwd": str(other)},
+    ).json()
+    other_new = client.post(
+        "/api/chat/sessions",
+        headers=auth,
+        json={"name": "other new", "cwd": str(other)},
+    ).json()
+
+    # The default representation remains the unfiltered, cross-workspace list.
+    default = client.get("/api/chat/sessions", headers=auth)
+    assert default.status_code == 200
+    assert default.json()["total"] == 4
+    assert {row["id"] for row in default.json()["sessions"]} == {
+        primary_old["id"], primary_new["id"], other_old["id"], other_new["id"],
+    }
+
+    other_headers = {
+        **auth,
+        "X-Muselab-Workspace": quote(str(other.resolve()), safe=""),
+    }
+    scoped = client.get(
+        "/api/chat/sessions",
+        headers=other_headers,
+        params={
+            "workspace_only": "1",
+            "limit": 1,
+            # The local old row is force-included; the foreign id is ignored.
+            "ids": f'{other_old["id"]},{primary_old["id"]}',
+        },
+    )
+    assert scoped.status_code == 200
+    assert "X-Muselab-Workspace" in scoped.headers["vary"]
+    payload = scoped.json()
+    assert payload["total"] == 2
+    assert payload["returned"] == 2
+    assert {row["id"] for row in payload["sessions"]} == {
+        other_old["id"], other_new["id"],
+    }
+    assert all(row["cwd"] == str(other.resolve()) for row in payload["sessions"])
+
+    # Conditional requests are stable for one scoped representation.
+    etag = scoped.headers["etag"]
+    unchanged = client.get(
+        "/api/chat/sessions",
+        headers={**other_headers, "If-None-Match": etag},
+        params={
+            "workspace_only": "1",
+            "limit": 1,
+            "ids": f'{other_old["id"]},{primary_old["id"]}',
+        },
+    )
+    assert unchanged.status_code == 304
+    assert "X-Muselab-Workspace" in unchanged.headers["vary"]
+
+    # Header-selected workspaces are distinct ETag variants even when both
+    # bodies are the same empty list.
+    empty_responses = []
+    for workspace in (empty_a, empty_b):
+        empty_responses.append(client.get(
+            "/api/chat/sessions",
+            headers={
+                **auth,
+                "X-Muselab-Workspace": quote(str(workspace.resolve()), safe=""),
+            },
+            params={"workspace_only": "1"},
+        ))
+    assert all(response.status_code == 200 for response in empty_responses)
+    assert all(response.json()["total"] == 0 for response in empty_responses)
+    assert empty_responses[0].headers["etag"] != empty_responses[1].headers["etag"]
 
 
 def test_removing_workspace_hides_but_does_not_delete_its_session(

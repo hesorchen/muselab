@@ -11,15 +11,17 @@
 
 ## Use
 
-- [Personalize your CLAUDE.md](personalize-claude-md.md) — teach Muse about you
+- [Configure workspace CLAUDE.md](personalize-claude-md.md) — add optional durable project instructions
 - [Skills](skills.md) — what ships out of the box, and how to add your own
 - [Mobile (PWA)](mobile.md) — install to home screen, push notifications, HTTPS
+- [Terminal](terminal.md) — real PTY, terminal list, Profiles, and mobile controls
 - [Scheduled tasks](scheduler.md) — run a saved prompt on a cadence
+- [Long-term memory](memory.md) — Episodes, Dreamer/Verifier, hybrid recall, and reviewed Skills
 
 ## Models
 
-- [Providers](providers.md) — the built-in catalog (Claude, DeepSeek, GLM,
-  MiniMax, Kimi, Qwen, Xiaomi MiMo, Baidu ERNIE, Codex Gateway)
+- [Providers](providers.md) — built-in Claude, OpenAI, Codex Gateway, and
+  compatible providers, plus custom providers
 - [Codex Gateway](codex-gateway.md) — connect a local Codex-backed Anthropic-compatible sidecar
 - [Add a provider](add-provider.md) — wire any Anthropic-compatible endpoint
 - [Model routing & the chat loop](routing.md) — how a model is chosen, pooled,
@@ -27,7 +29,7 @@
 
 ## Architecture & internals
 
-Source-linked deep dives — start at [Architecture](architecture.md) for the map.
+Implementation guides — start at [Architecture](architecture.md) for the map.
 
 - [Architecture](architecture.md) — directory map + how a request flows
 - [Session internals](backend-sessions.md) — index, sidecars, queue, fork,
@@ -37,13 +39,13 @@ Source-linked deep dives — start at [Architecture](architecture.md) for the ma
   limitations
 - [Frontend internals](frontend.md) — no-build SPA, rendering pipeline, SSE
   client, service worker
-- [MCP architecture](mcp-architecture.md) — connector strategy and the
-  three-layer model
+- [Terminal](terminal.md) — lifecycle, connection protocol, Profiles, and
+  security boundary
 - [Infrastructure](infrastructure.md) — scripts, services, Docker, tests, CI/CD
 
 ## Reference
 
-- [Configuration](configuration.md) — every `.env` variable + defaults
+- [Configuration](configuration.md) — supported environment variables, config files, state, and defaults
 - [Data & backup](data-and-backup.md) — what to back up, how to restore
 - [Troubleshooting](troubleshooting.md) — common failures and fixes
 - [Glossary](glossary.md) — muselab's terms of art, defined once

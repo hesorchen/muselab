@@ -148,7 +148,7 @@ def test_provider_routing_correct(monkeypatch, model, expected_host):
 A：是的。muselab 不负责账单管理。仅 Pro OAuth 使用订阅包含的免费配额。
 
 **Q：同一个会话可以跨厂商连续对话吗？**
-A：不能。如果当前会话已有消息，切换模型会弹确认 → fork 出一个用新模型的新会话；原会话保留在历史。空会话允许原地切换。这是为了避开跨厂商的思考签名漂移和 `tool_use` 上下文不可访问 —— 详见 [providers_zh.md](providers_zh.md) 的「对话中切换模型」段。
+A：不能。如果当前会话已有消息，切换模型会先确认，再创建一个使用新模型的空会话；原会话保留在历史，对话记录不会复制。空会话允许原地切换。这是为了避开跨厂商的思考签名漂移和 `tool_use` 上下文不可访问 —— 详见 [providers_zh.md](providers_zh.md) 的「对话中切换模型」段。
 
 **Q：配置项中 `prefix` 和 `models` 是否重复？**
 A：`prefix` 供分发器匹配路由使用；`models` 是界面下拉菜单显示的具体型号列表。`models` 中的每个值均须以 `prefix` 开头。

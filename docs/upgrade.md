@@ -48,7 +48,10 @@ git add uv.lock pyproject.toml && git commit -m "chore: bump claude-agent-sdk"
 
 ## What's preserved
 
-Upgrades never touch `.env`, `sessions/`, or your archive. The pinned `claude`
+Upgrades never remove `.env`, the configured session metadata directory, or
+workspace data. Re-running the platform installer preserves existing `.env`
+values and only adds an absent `MUSELAB_SESSIONS_DIR` with the current
+checkout's absolute `sessions/` path. The pinned `claude`
 CLI version lives in `scripts/versions.env` (and is mirrored in the Dockerfile);
 `upgrade.sh` moves you to the latest. There is no schema migration step — the
 JSON state files are forward-tolerant, and the few migrations that exist (e.g.
@@ -62,4 +65,4 @@ Pull the new image and recreate the container:
 docker compose pull && docker compose up -d
 ```
 
-Your archive and `.env` are bind-mounted, so they survive the recreate.
+The host workspace and `.env` are bind-mounted, so they survive the recreate.

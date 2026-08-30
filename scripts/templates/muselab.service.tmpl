@@ -1,5 +1,5 @@
 [Unit]
-Description=muselab — your archive + Muse, the AI inside
+Description=muselab — self-hosted Agent workspace
 Documentation=https://github.com/hesorchen/muselab
 After=network-online.target
 Wants=network-online.target
@@ -13,13 +13,20 @@ StartLimitBurst=5
 Type=simple
 WorkingDirectory={{REPO_PATH}}
 EnvironmentFile={{REPO_PATH}}/.env
+Environment=MUSELAB_SERVICE_NAME=muselab.service
 ExecStart={{UV_PATH}} run python -m backend.main
 Restart=on-failure
 RestartSec=10
+# `uv run` forwards systemd's expected SIGTERM and exits 143 after the Python
+# child finishes its graceful shutdown. Treat that wrapper status as success.
+SuccessExitStatus=143 SIGTERM
+# Keep the deployment deadline above Uvicorn's connection drain plus the
+# bounded FastAPI lifespan shutdown.
+TimeoutStopSec=15
 # Hardening: forbid the service (or any subprocess: MCP servers, skills, the
 # SDK-spawned claude CLI) from gaining new privileges via setuid/setgid/caps.
 # Zero-cost — muselab never needs to escalate. (ProtectHome is intentionally
-# omitted: the service must read/write your archive ROOT under $HOME.)
+# omitted: the service must read/write workspace roots under $HOME.)
 NoNewPrivileges=true
 # Resource limits — generous but bounded
 LimitNOFILE=8192

@@ -63,3 +63,82 @@ oauth-model-alias:
       alias: "gpt-5.4-mini"
     - name: "gpt-5.3-codex-spark"
       alias: "gpt-5.3-codex-spark"
+
+# Claude Agent SDK has no native `auto`, `ultra`, or service-tier fields.
+# muselab carries those session controls in private headers; apply them after
+# CLIProxyAPI translates the Anthropic request to the Codex protocol. Keep
+# these rules when copying the example or Fast/Ultra will silently degrade.
+payload:
+  override:
+    - models:
+        - name: "gpt-*"
+          protocol: "codex"
+          from-protocol: "claude"
+          headers:
+            X-MuseLab-Effort: "low"
+      params:
+        "reasoning.effort": "low"
+    - models:
+        - name: "gpt-*"
+          protocol: "codex"
+          from-protocol: "claude"
+          headers:
+            X-MuseLab-Effort: "medium"
+      params:
+        "reasoning.effort": "medium"
+    - models:
+        - name: "gpt-*"
+          protocol: "codex"
+          from-protocol: "claude"
+          headers:
+            X-MuseLab-Effort: "high"
+      params:
+        "reasoning.effort": "high"
+    - models:
+        - name: "gpt-*"
+          protocol: "codex"
+          from-protocol: "claude"
+          headers:
+            X-MuseLab-Effort: "xhigh"
+      params:
+        "reasoning.effort": "xhigh"
+    - models:
+        - name: "gpt-*"
+          protocol: "codex"
+          from-protocol: "claude"
+          headers:
+            X-MuseLab-Effort: "max"
+      params:
+        "reasoning.effort": "max"
+    - models:
+        - name: "gpt-5.6-sol"
+          protocol: "codex"
+          from-protocol: "claude"
+          headers:
+            X-MuseLab-Effort: "ultra"
+        - name: "gpt-5.6-terra"
+          protocol: "codex"
+          from-protocol: "claude"
+          headers:
+            X-MuseLab-Effort: "ultra"
+      params:
+        # Ultra's native Skill supplies bounded orchestration; the Codex wire
+        # contract currently accepts reasoning effort only through `max`.
+        "reasoning.effort": "max"
+    - models:
+        - name: "gpt-*"
+          protocol: "codex"
+          from-protocol: "claude"
+          headers:
+            X-MuseLab-Service-Tier: "fast"
+      params:
+        "service_tier": "priority"
+  filter:
+    - models:
+        - name: "gpt-*"
+          protocol: "codex"
+          from-protocol: "claude"
+          headers:
+            X-MuseLab-Effort: "auto"
+      params:
+        - "reasoning.effort"

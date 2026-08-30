@@ -42,7 +42,7 @@ jobs:
         env:
           # Use a minimal env so backend.settings doesn't refuse to import.
           MUSELAB_TOKEN: "ci-test-token-1234567890abcdef-min-32"
-          MUSELAB_ROOT: ${{ github.workspace }}/.ci-archive
+          MUSELAB_ROOT: ${{ github.workspace }}/.ci-workspace
         run: |
           mkdir -p $MUSELAB_ROOT
           uv run pytest tests/ -v
@@ -57,7 +57,7 @@ jobs:
         continue-on-error: true
         env:
           MUSELAB_TOKEN: "ci-test-token-1234567890abcdef-min-32"
-          MUSELAB_ROOT: ${{ github.workspace }}/.ci-cov-archive
+          MUSELAB_ROOT: ${{ github.workspace }}/.ci-cov-workspace
         run: |
           mkdir -p $MUSELAB_ROOT
           uv run --with pytest-cov pytest tests/ -q \
@@ -103,7 +103,9 @@ jobs:
         run: |
           set -e
           for f in frontend/app.js frontend/sw.js \
-                   frontend/data/constants.js frontend/i18n/index.js; do
+                   frontend/data/constants.js frontend/i18n/index.js \
+                   frontend/modules/file-capabilities.mjs \
+                   frontend/modules/persistent-cache.mjs; do
             echo "node --check $f"
             node --check "$f"
           done
@@ -112,13 +114,12 @@ jobs:
 
   # Dependency vulnerability scan. dependabot keeps deps current, but doesn't
   # surface KNOWN CVEs in the currently-pinned set — pip-audit does. Runs
-  # against the frozen lockfile so it reflects what actually ships. Non-blocking
-  # for now (informational) so a freshly-disclosed advisory doesn't wedge all
-  # PRs before maintainers can triage; flip to blocking once the baseline is clean.
+  # against the frozen lockfile so it reflects what actually ships. The current
+  # frozen baseline is clean, so a newly introduced known vulnerability blocks
+  # the change instead of being hidden behind a green workflow conclusion.
   security:
     name: pip-audit (dependency CVE scan)
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v3
@@ -132,21 +133,48 @@ jobs:
         # `uv run --with` so it doesn't touch the frozen lockfile.
         run: uv run --with pip-audit pip-audit
 
+  # Small, deliberately stable browser subset fails fast on critical journeys.
+  # The required full suite below remains the release gate for the complete
+  # browser behavior matrix, so early feedback does not reduce coverage.
+  e2e-core:
+    name: e2e core (playwright)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+      - name: Set up Python
+        run: uv python install 3.12
+      - name: Install Chromium
+        run: uv run --with pytest-playwright playwright install --with-deps chromium
+      - name: Run blocking browser contracts
+        env:
+          RUN_E2E: "1"
+          MUSELAB_TOKEN: "ci-test-token-1234567890abcdef-min-32"
+          MUSELAB_ROOT: ${{ github.workspace }}/.e2e-core-workspace
+        run: |
+          mkdir -p $MUSELAB_ROOT
+          uv run --with pytest-playwright pytest -q \
+            tests/e2e/test_activity_center.py::test_memory_shortcut_opens_memory_settings_page \
+            tests/e2e/test_chat_render_perf.py::test_chat_ime_commit_enter_keeps_chinese_text_and_next_enter_sends \
+            tests/e2e/test_chat_render_perf.py::test_desktop_done_reconcile_preserves_live_message_dom_identity \
+            tests/e2e/test_chat_render_perf.py::test_background_completion_no_active_fallback_never_blanks_visible_messages \
+            tests/e2e/test_chat_render_perf.py::test_fast_completed_queued_turn_reconciles_footer_without_refresh \
+            tests/e2e/test_files_preview.py::test_os_file_drop_uses_whole_window_root_except_explicit_directory \
+            tests/e2e/test_files_preview.py::test_external_file_changes_refresh_tree_without_manual_reload \
+            tests/e2e/test_multi_tab.py::test_pending_send_text_survives_hard_refresh
+
   # End-to-end Playwright browser tests. Gated behind RUN_E2E=1 (default-skip
-  # locally so contributors don't need Chromium). This job installs the browser
-  # and runs them. Marked continue-on-error to start: browser tests are
-  # inherently flakier than unit tests, and we don't want a transient timeout
-  # to block merges before the suite has proven stable. Promote to required
-  # once it's reliably green.
+  # locally so contributors don't need Chromium). This required job installs
+  # Chromium and runs the complete browser suite.
   #
   # pytest-rerunfailures retries each failing test up to 2× (3 attempts total)
-  # with a 1s backoff, so a single transient timeout (e.g. the multi-tab
-  # open/close timing flake) no longer paints the whole job red. A test that
-  # fails all 3 attempts is a genuine regression worth investigating.
+  # with a 1s backoff. A test that fails all 3 attempts blocks the change.
   e2e:
-    name: e2e (playwright, allow-failure)
+    name: e2e (playwright)
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v3
@@ -162,7 +190,7 @@ jobs:
         env:
           RUN_E2E: "1"
           MUSELAB_TOKEN: "ci-test-token-1234567890abcdef-min-32"
-          MUSELAB_ROOT: ${{ github.workspace }}/.e2e-archive
+          MUSELAB_ROOT: ${{ github.workspace }}/.e2e-workspace
         run: |
           mkdir -p $MUSELAB_ROOT
           uv run --with pytest-playwright --with pytest-rerunfailures \

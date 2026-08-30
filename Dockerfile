@@ -31,9 +31,10 @@ FROM python:3.12-slim
 # extended thinking) already cover what the old presets did, and pre-baking
 # unused servers bloats the image. Users add external connectors via the UI;
 # those resolve at add-time, not in the image. Keep curl (HEALTHCHECK) and
-# git (common in archives / user-added git MCP).
+# git (common in archives / user-added git MCP). procps supplies `ps` for the
+# real terminal and lets terminal teardown find every job in a PTY session.
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends curl ca-certificates gnupg git && \
+    apt-get install -y --no-install-recommends curl ca-certificates gnupg git procps && \
     curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
     apt-get install -y --no-install-recommends nodejs && \
     # claude-code pin — keep in lockstep with CLAUDE_CLI_VERSION in
@@ -60,6 +61,8 @@ ENV PATH="/app/.venv/bin:${PATH}" \
 # App code
 COPY backend ./backend
 COPY frontend ./frontend
+COPY skills ./skills
+COPY scripts/templates ./scripts/templates
 COPY pyproject.toml ./
 
 # Non-root user (uid 1000 — matches default host user on Linux/Mac)

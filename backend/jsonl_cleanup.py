@@ -205,21 +205,38 @@ def clean_all_under(root: Path) -> list[CleanupReport]:
     return out
 
 
-def clean_session(session_id: str, claude_projects_root: Path | None = None) -> CleanupReport | None:
-    """Clean exactly one session by id. We don't know which project
-    dir it belongs to, so we search every project under
-    ~/.claude/projects/ and clean the first match. Used by chat.py
-    in the turn-done hook so each session stays resumable immediately
-    after the assistant finishes a reply that included a stripped
-    thinking block."""
-    if claude_projects_root is None:
-        claude_projects_root = Path.home() / ".claude" / "projects"
-    if not claude_projects_root.exists():
-        return None
-    for proj in claude_projects_root.iterdir():
-        if not proj.is_dir():
+def clean_session(
+    session_id: str,
+    claude_projects_root: Path | None = None,
+) -> CleanupReport | None:
+    """Clean exactly one session by id across native and vendor stores.
+
+    An explicit ``claude_projects_root`` preserves the original single-root
+    behavior for callers/tests. By default we search both Claude's normal
+    store and muselab's durable vendor-isolated store; third-party sessions
+    never live under ``~/.claude/projects``.
+    """
+    if claude_projects_root is not None:
+        project_roots = [claude_projects_root]
+    else:
+        state_home = os.environ.get("XDG_STATE_HOME", "").strip()
+        state_root = (
+            Path(state_home).expanduser()
+            if state_home
+            else Path.home() / ".local" / "state"
+        )
+        project_roots = [
+            Path.home() / ".claude" / "projects",
+            state_root / "muselab" / "vendor-cli" / "projects",
+        ]
+
+    for projects_root in project_roots:
+        if not projects_root.exists():
             continue
-        target = proj / f"{session_id}.jsonl"
-        if target.exists():
-            return clean_jsonl(target)
+        for proj in projects_root.iterdir():
+            if not proj.is_dir():
+                continue
+            target = proj / f"{session_id}.jsonl"
+            if target.exists():
+                return clean_jsonl(target)
     return None

@@ -6,37 +6,38 @@ muselab 以 **Claude Agent SDK** 作为唯一对话后端。非 Claude 模型通
 
 | 提供商 | 启用方式 | 工具调用 | 在哪里拿 key |
 |---|---|---|---|
-| **Anthropic Claude**（Opus / Sonnet / Haiku） | 执行一次 `claude login` | ✅ | 复用 Pro / Max OAuth，无需 API key，无按 token 计费 |
-| **DeepSeek**（V4 系列） | 在设置中填入 `DEEPSEEK_API_KEY` | ✅ | platform.deepseek.com |
-| **智谱 GLM**（GLM 5 / 5 Air / 5.1 / 4.7 / 4 Plus） | `ZHIPUAI_API_KEY` | ✅ | bigmodel.cn（提供免费额度） |
-| **MiniMax**（M2.1 / M2.5 / M2.7 + 各自 Highspeed；国际站走 `MINIMAX_INTL_API_KEY`） | `MINIMAX_API_KEY` | ✅ | minimaxi.com（国内）/ minimax.io（国际）— 默认返回思考块 |
-| **Kimi**（K2 / K2.5 / K2.6 / K2 Thinking） | `MOONSHOT_API_KEY` | ✅ | platform.moonshot.cn |
-| **Qwen**（Qwen3 / 3.5 / 3.6 系列 —— Max / Plus / Flash / Coder；国际站同一把 key） | `DASHSCOPE_API_KEY` | ✅ | dashscope.console.aliyun.com — 国内 + 国际共用一把 key，仅延迟差异 |
-| **小米 MiMo**（V2.5 Pro / V2.5 / V2 Flash） | `XIAOMI_MIMO_API_KEY` | ✅ | platform.xiaomimimo.com（公测） |
-| **百度千帆**（ERNIE 4 / 4.5 / 5 系列 + X1 推理 + 千帆托管的 DeepSeek V3.2） | `QIANFAN_API_KEY` | ✅ | console.bce.baidu.com/qianfan — Anthropic 兼容路径需要 IAM **access token**（`bce-v3/ALTAK-xxx/xxx`），不是普通的 `sk-xxx` key |
+| **Anthropic Claude** | 执行一次 `claude login` | ✅ | 复用 Pro / Max OAuth，无需 API key |
+| **DeepSeek** | 在设置中填入 `DEEPSEEK_API_KEY` | ✅ | platform.deepseek.com |
+| **智谱 GLM** | `ZHIPUAI_API_KEY` | ✅ | bigmodel.cn |
+| **MiniMax**（国内／国际） | `MINIMAX_API_KEY`／`MINIMAX_INTL_API_KEY` | ✅ | minimaxi.com／minimax.io |
+| **Kimi** | `MOONSHOT_API_KEY` | ✅ | platform.moonshot.cn |
+| **Qwen**（国内／国际） | `DASHSCOPE_API_KEY` | ✅ | dashscope.console.aliyun.com |
+| **小米 MiMo** | `XIAOMI_MIMO_API_KEY` | ✅ | platform.xiaomimimo.com |
+| **百度千帆** | `QIANFAN_API_KEY` | ✅ | console.bce.baidu.com/qianfan；Anthropic 兼容路径需要 IAM access token |
 | **Codex Gateway**（本地 sidecar） | `CODEX_GATEWAY_API_KEY` | ✅* | 用户自备运行在 `127.0.0.1` 的 Anthropic 兼容网关；见 [codex-gateway_zh.md](codex-gateway_zh.md) |
+| **OpenAI**（Anthropic 兼容通路） | 当前内置项复用 `ZHIPUAI_API_KEY` 及其兼容端点 | ✅* | 由部署方提供兼容端点；muselab 不直连 OpenAI 原生 Chat/Responses API |
+| **自定义提供商** | 在 Settings → Providers 中填写端点、前缀、模型和 key | 取决于端点 | 任意 Anthropic Messages 兼容服务 |
 
 \* 工具调用取决于网关是否正确转换 Anthropic `tool_use` / `tool_result`。
 
-各家具体型号以 UI 下拉为准 —— 来源是生效中的 catalog（内置默认 + 你在 Settings 里的改动），更新频率比本表高。
+各家具体型号与可用性以 UI 下拉为准——来源是当前生效的 catalog（内置默认、覆盖和自定义项），更新频率比本表高。这里刻意不维护容易过时的型号数量。
 
 ## 生图
 
-Composer 里的图片按钮不是聊天 provider。`MUSELAB_IMAGE_PROVIDER=auto` 时，
-如果配置了 `OPENAI_IMAGE_API_KEY`（或 `OPENAI_API_KEY`），会走 OpenAI Image
-API。本机 Codex `$imagegen` 通路必须显式 opt-in：设置
-`MUSELAB_IMAGE_PROVIDER=codex_imagegen` 与 `CODEX_IMAGEGEN_ENABLED=true` 后，
-才会调用已登录的 `codex` CLI。也可以设置 `MUSELAB_IMAGE_PROVIDER=openai`
-强制使用 OpenAI-compatible 通路。
+Composer 里的图片按钮独立于聊天 provider。它调用由 `OPENAI_IMAGE_API_KEY`
+（或回退的 `OPENAI_API_KEY`）和 `OPENAI_IMAGE_BASE_URL` 配置的
+OpenAI-compatible Images API。该端点可以是 OpenAI，也可以是狭窄职责的
+自托管适配器，例如
+[codex-image-api](https://github.com/hesorchen/codex-image-api)。
 
-生成结果会作为普通 muselab 图片附件暂存，因此可预览、画笔标注，并加入当前聊天发送。
-生图请求会作为后台任务执行，并保留在生图历史里，刷新页面也不会丢掉已完成结果。
-Codex imagegen 通路只适合 localhost 单用户部署；不要把带本机 Codex 能力的 muselab
-实例暴露到公网。
+muselab 不再直接启动 Codex，也不持有 Codex OAuth 状态。把生图执行放在独立 API
+之后，可以让凭据和进程边界与 Web 应用解耦。生成结果仍会作为普通 muselab
+图片附件暂存，因此可预览、画笔标注，并加入当前聊天发送。生图请求会作为后台
+任务执行，并保留在生图历史里，刷新页面也不会丢掉已完成结果。
 
 ## 对话中切换模型
 
-当前会话已有消息时，下拉菜单弹确认 → fork 一个使用新模型的新会话，原会话保留在历史。空会话则直接原地切换（不 fork）。fork 是为了避免跨厂商的思考签名漂移——将一家厂商签名的思考块直接发送给另一家厂商会导致难以排查的错误。
+当前会话已有消息时，下拉菜单会先确认，再创建一个使用新模型的空会话；原会话保留在历史，对话记录不会复制过去。空会话则直接原地切换。从空上下文开始可避免跨厂商的思考签名漂移——将一家厂商签名的思考块直接发送给另一家厂商会导致难以排查的错误。
 
 每条助手消息存储各自的 `model` 字段，因此即使页面刷新并重新渲染整段对话，模型标识也保持准确。
 

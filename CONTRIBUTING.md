@@ -21,7 +21,7 @@ edit `frontend/*.html|js|css`, hard-refresh the browser.
 - **Bug fixes** with a regression test
 - **New providers** that have an Anthropic-compatible Messages endpoint
   (a single `CATALOG` entry in `backend/endpoints.py`, see [docs/add-provider.md](docs/add-provider.md))
-- **MCP / skill presets** under `mcp.json.example` / `skills/`
+- **MCP presets and Skill discovery/extensions** under `mcp.json.example` / `skills/`
 - **UI translations** (see the `zh` / `en` key tables in `frontend/i18n/index.js`)
 - **Documentation improvements** — clearer install instructions, personalization guidance, or FAQ entries
 - **Visual / UX polish** — please open an issue first describing the problem
@@ -29,12 +29,12 @@ edit `frontend/*.html|js|css`, hard-refresh the browser.
 ## What will likely be declined
 
 - Adding a build step (webpack / vite / etc.) — this would eliminate the "clone and run" property
-- Generic AI chat UI features that fall outside muselab's "personal archive
-  assistant" scope (e.g. plugin marketplace, document RAG over crawled content)
+- Generic AI chat UI features that do not strengthen muselab's local,
+  workspace-bound Agent workflow (e.g. a hosted account system or social feed)
 - Provider integrations that require an OpenAI-only protocol (muselab routes
   through the Claude Agent SDK, which expects Anthropic-compatible endpoints)
 - Anything that requires real personal data to test (all tests must work with
-  a throwaway archive directory)
+  a throwaway workspace directory)
 
 ## Pull request checklist
 

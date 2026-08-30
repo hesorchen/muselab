@@ -182,6 +182,10 @@ def test_codex_gateway_catalog_parser_preserves_raw_and_max_windows(app_module):
             "slug": "gpt-5.4",
             "context_window": 272_000,
             "max_context_window": 1_000_000,
+            "supported_reasoning_levels": [
+                {"effort": "low"}, {"effort": "xhigh"},
+            ],
+            "service_tiers": [{"id": "priority"}],
         }],
     })
     cap = parsed["gpt-5.4"]
@@ -191,6 +195,14 @@ def test_codex_gateway_catalog_parser_preserves_raw_and_max_windows(app_module):
     assert cap["context_effective_percent"] == 95
     assert cap["context_limit_source"] == "gateway_catalog"
     assert cap["context_limit_is_estimate"] is False
+    assert cap["supported_reasoning_levels"] == ["low", "xhigh"]
+    assert cap["service_tiers"] == ["priority"]
+    assert chat_mod._model_control_capability(
+        "codex:gpt-5.4", cap) == {
+            "effort_levels": ["auto", "low", "xhigh"],
+            "service_tiers": ["fast"],
+            "supports_fast": True,
+        }
 
 
 def test_codex_usage_catalog_overrides_stale_200k_session(
@@ -397,7 +409,7 @@ def test_interrupted_turn_sidecar_round_trip(app_module, client, auth, tmp_path)
 
     # Drop a fake sidecar (mimics what _write_active_turn_sidecar does
     # on turn start, then a process death before _delete... could fire).
-    fake_sid = "TEST-CRASHED-TURN-001"
+    fake_sid = "11111111-2222-4333-8444-555555555555"
     sidecar_path = chat_mod._active_turn_path(fake_sid)
     sidecar_path.write_text(json.dumps({
         "sid": fake_sid,
@@ -450,6 +462,76 @@ def test_security_headers_present_on_every_response(client, auth):
     assert r.headers.get("X-Frame-Options") == "SAMEORIGIN"
 
 
+def test_security_header_asgi_middleware_preserves_explicit_headers(app_module):
+    import asyncio
+
+    sent = []
+
+    async def endpoint(scope, receive, send):
+        await send({
+            "type": "http.response.start",
+            "status": 200,
+            "headers": ((b"x-frame-options", b"DENY"),),
+        })
+        await send({"type": "http.response.body", "body": b"ok"})
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message):
+        sent.append(message)
+
+    middleware = app_module._SecurityHeadersMiddleware(endpoint)
+    asyncio.run(middleware({"type": "http"}, receive, send))
+
+    headers = dict(sent[0]["headers"])
+    assert headers[b"x-content-type-options"] == b"nosniff"
+    assert headers[b"referrer-policy"] == b"same-origin"
+    assert headers[b"x-frame-options"] == b"DENY"
+
+
+def test_security_header_asgi_middleware_passes_non_http_scope_unchanged(
+        app_module):
+    import asyncio
+
+    observed = []
+
+    async def endpoint(scope, receive, send):
+        observed.append(scope)
+
+    middleware = app_module._SecurityHeadersMiddleware(endpoint)
+    scope = {"type": "websocket", "path": "/socket"}
+    asyncio.run(middleware(scope, None, None))
+    assert observed == [scope]
+
+
+def test_security_header_asgi_middleware_propagates_disconnect_cancellation(
+    app_module,
+):
+    import asyncio
+    import pytest
+
+    sent = []
+
+    async def streaming_endpoint(scope, receive, send):
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        message = await receive()
+        assert message["type"] == "http.disconnect"
+        raise asyncio.CancelledError
+
+    async def receive():
+        return {"type": "http.disconnect"}
+
+    async def send(message):
+        sent.append(message)
+
+    middleware = app_module._SecurityHeadersMiddleware(streaming_endpoint)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(middleware({"type": "http"}, receive, send))
+
+    assert sent[0]["type"] == "http.response.start"
+
+
 def test_robots_txt_disallows_all(client):
     """Defense-in-depth for accidental public exposure. If a user
     misconfigures their reverse proxy or Cloudflare tunnel, at least
@@ -462,21 +544,18 @@ def test_robots_txt_disallows_all(client):
 
 
 # ============================================================================
-# Profile-intake session: chat-driven CLAUDE.md setup (replaces direct edit UI)
+# Workspace organizer and deprecated profile-intake compatibility route
 # ============================================================================
 
-def test_profile_intake_session_seeds_template_when_claude_md_missing(
+def test_organize_session_does_not_seed_profile_or_personal_directories(
     client, auth, temp_root
 ):
-    """First-time user with no CLAUDE.md should get one seeded from the
-    template when they start a profile-intake session — so the agent's
-    first Read tool call succeeds. The chat workflow assumes the file
-    exists; if it doesn't, the agent would fail on the first turn."""
+    """Starting the generic organizer must be side-effect free."""
     claude_md = temp_root / "CLAUDE.md"
-    assert not claude_md.exists()  # fixture starts clean
+    assert not claude_md.exists()
 
     r = client.post(
-        "/api/chat/sessions/profile-intake",
+        "/api/chat/sessions/organize",
         headers={**auth, "Content-Type": "application/json"},
         json={},
     )
@@ -488,20 +567,37 @@ def test_profile_intake_session_seeds_template_when_claude_md_missing(
     assert "initial_message" in body
     assert "zh" in body["initial_message"]
     assert "en" in body["initial_message"]
-    # The file should now exist with the template content (date substituted).
-    assert claude_md.exists()
-    content = claude_md.read_text(encoding="utf-8")
-    assert "CLAUDE.md" in content  # template header
-    assert "%DATE%" not in content  # date placeholder was substituted
+    assert "read-only scan" in body["initial_message"]["en"]
+    assert "explicit confirmation" in body["initial_message"]["en"]
+    assert "CLAUDE.md" in body["initial_message"]["en"]
+    assert not claude_md.exists()
+    for name in ("health", "work", "money", "people", "archives"):
+        assert not (temp_root / name).exists()
+
+
+def test_profile_intake_is_a_side_effect_free_compatibility_forward(
+    client, auth, temp_root
+):
+    claude_md = temp_root / "CLAUDE.md"
+    r = client.post(
+        "/api/chat/sessions/profile-intake",
+        headers={**auth, "Content-Type": "application/json"},
+        json={},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert "read-only scan" in body["initial_message"]["en"]
+    assert "explicit confirmation" in body["initial_message"]["en"]
+    assert "CLAUDE.md" in body["initial_message"]["en"]
+    assert not claude_md.exists()
+    for name in ("health", "work", "money", "people", "archives"):
+        assert not (temp_root / name).exists()
 
 
 def test_profile_intake_session_doesnt_clobber_existing_claude_md(
     client, auth, temp_root
 ):
-    """If the user already has a CLAUDE.md (from the install-time CLI
-    intake or a previous profile-intake session), the new session must
-    NOT overwrite it — the in-chat workflow is meant to refine, not
-    reset."""
+    """The compatibility forward must leave existing instructions untouched."""
     claude_md = temp_root / "CLAUDE.md"
     custom_content = "# my hand-edited profile\n\n- name: Alice\n"
     claude_md.write_text(custom_content, encoding="utf-8")

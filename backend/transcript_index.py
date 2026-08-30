@@ -21,8 +21,9 @@ from .settings import atomic_write_text
 
 # Increment whenever persisted descriptor semantics (bubble expansion, preview,
 # tool/task metadata) change, not only when the JSON container shape changes.
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 _TRANSCRIPT_TYPES = {"user", "assistant", "progress", "system", "attachment"}
+_PREFIX_GUARD_BYTES = 1024 * 1024
 
 @dataclass
 class _LockSlot:
@@ -67,30 +68,26 @@ def _source_stat(path: Path) -> dict[str, int]:
     }
 
 
-def _prefix_digest(path: Path, length: int, block: int = 1024 * 1024) -> str:
-    """Fingerprint every byte in an indexed prefix.
+def _prefix_guard(path: Path, end: int) -> tuple[int, str]:
+    """Fingerprint a fixed-size suffix of the indexed prefix.
 
-    Unchanged requests return from ``ensure_index`` before calling this helper.
-    On append, however, correctness requires proving that the already-indexed
-    prefix was not rewritten in place.  Sampling only the first/last blocks can
-    accept stale byte offsets when a sync/restore process changes the middle
-    and then grows the file, so append refreshes deliberately hash the prefix.
+    Claude CLI transcripts are append-only. Inode/size checks catch replacement
+    and truncation; this bounded guard catches torn tails and recent in-place
+    rewrites without re-reading an arbitrarily large history on every append.
+    A writer that rewrites old bytes in place while also growing the same inode
+    violates that source contract and must use atomic replacement instead.
     """
-    if length <= 0:
-        return ""
-    remaining = length
+    end = max(0, int(end))
+    start = max(0, end - _PREFIX_GUARD_BYTES)
     digest = hashlib.blake2b(digest_size=16)
-    digest.update(str(length).encode("ascii"))
+    digest.update(f"{start}:{end}".encode("ascii"))
     with path.open("rb") as handle:
-        while remaining > 0:
-            chunk = handle.read(min(block, remaining))
-            if not chunk:
-                break
-            digest.update(chunk)
-            remaining -= len(chunk)
-    if remaining:
-        raise OSError(f"transcript prefix shortened while hashing: {path}")
-    return digest.hexdigest()
+        handle.seek(start)
+        raw = handle.read(end - start)
+    if len(raw) != end - start:
+        raise OSError(f"transcript prefix shortened while guarding: {path}")
+    digest.update(raw)
+    return start, digest.hexdigest()
 
 
 def _empty_index(generation: str | None = None) -> dict[str, Any]:
@@ -103,7 +100,8 @@ def _empty_index(generation: str | None = None) -> dict[str, Any]:
             "size": 0,
             "mtime_ns": 0,
             "scanned_bytes": 0,
-            "prefix_digest": "",
+            "guard_start": 0,
+            "guard_digest": "",
         },
         "records": [],
         "orders": {"normal": [], "full": []},
@@ -330,17 +328,20 @@ def ensure_index(
         if index is not None:
             source = index["source"]
             scanned_before = int(source.get("scanned_bytes") or 0)
-            prefix_changed = (
-                stat["size"] > int(source.get("size") or 0)
-                and source.get("prefix_digest", "")
-                != _prefix_digest(transcript_path, scanned_before)
-            )
+            guard_changed = False
+            if stat["size"] > int(source.get("size") or 0):
+                guard_start, guard_digest = _prefix_guard(
+                    transcript_path, scanned_before)
+                guard_changed = (
+                    int(source.get("guard_start") or 0) != guard_start
+                    or str(source.get("guard_digest") or "") != guard_digest
+                )
             rebuild = (
                 source.get("dev") != stat["dev"]
                 or source.get("inode") != stat["inode"]
                 or stat["size"] < scanned_before
                 or stat["size"] < int(source.get("size") or 0)
-                or prefix_changed
+                or guard_changed
                 # Same-size content changes cannot be an append.
                 or (stat["size"] == source.get("size")
                     and stat["mtime_ns"] != source.get("mtime_ns"))
@@ -358,15 +359,18 @@ def ensure_index(
                 transcript_path, index, start, stat["size"], describe_record)
             if not rebuild and len(index["records"]) != records_before:
                 index["history_generation"] = uuid.uuid4().hex
+            guard_start, guard_digest = _prefix_guard(transcript_path, scanned)
             index["source"] = {
                 **stat,
                 "scanned_bytes": scanned,
-                "prefix_digest": _prefix_digest(transcript_path, scanned),
+                "guard_start": guard_start,
+                "guard_digest": guard_digest,
             }
             _rebuild_derived(index)
             atomic_write_text(
                 index_path,
                 json.dumps(index, ensure_ascii=False, separators=(",", ":")),
+                mode=0o600,
             )
         _index_cache.pop(sid, None)
         _index_cache[sid] = (index_path, _index_signature(index_path), index)
@@ -392,6 +396,46 @@ def record_indices_for_bubble_window(
     first = min(len(order_ids) - 1, bisect_right(prefix, start) - 1)
     last = min(len(order_ids), bisect_left(prefix, end))
     return order_ids[first:last], start - prefix[first], total
+
+
+def pre_chain_bubbles(index: dict[str, Any]) -> int:
+    """Full-order bubbles sitting BEFORE the start of the normal chain.
+
+    After a `/compact`, compaction writes a fresh root: the summary's parent is
+    a `system` record with parentUuid=None, so the pre-compact turns live on a
+    genuinely disconnected branch. The normal order (parentUuid walk back from
+    the leaf) therefore *starts* at the summary, `total` collapses to the
+    post-compact slice, `offset` is 0 — and the client's "Load earlier" button,
+    which keys off `offset > 0`, never appears. The older turns are still on
+    disk and still in `orders["full"]`; they're just unreachable from the chat
+    pane.
+
+    This returns how many full-order bubbles are stranded that way, which the
+    client uses both as the "is there anything back there" predicate and as the
+    count it shows on the button.
+
+    Deliberately NOT `full_total - normal_total`: `full` keeps sidechain /
+    team / meta records that `normal` filters out, so the two orders are not a
+    simple translation of each other — the difference is non-zero for any
+    session that merely used a subagent, and the arithmetic would mis-seat the
+    window. Anchoring on where the visible chain actually begins is exact, and
+    falls out to 0 for an uncompacted session (`normal[0] is full[0]`). Forked
+    sessions, whose rewired parentUuid chain also bypasses earlier records,
+    get the correct non-zero answer for free.
+    """
+    normal = index["orders"]["normal"]
+    if not normal:
+        return 0
+    full = index["orders"]["full"]
+    prefix = index["bubble_prefix"]["full"]
+    try:
+        pos = full.index(normal[0])
+    except ValueError:
+        # normal[0] absent from full only if duplicate-uuid dedup kept a
+        # different occurrence (full keeps the first, normal resolves the
+        # last). Degrade to "nothing stranded" rather than guess an offset.
+        return 0
+    return prefix[pos]
 
 
 def record_indices_around_uuid(

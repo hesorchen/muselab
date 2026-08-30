@@ -3,23 +3,23 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<meta name="description" content="muselab — 自托管的多模型 AI 工作台。指向你机器上的一个目录，里面的原文件直接成为 AI 的上下文，不上云、不向量化。">
-<meta property="og:title" content="muselab · 自托管的多模型 AI 工作台">
-<meta property="og:description" content="你机器上的一个文件夹，就是 AI 的工作台。八家模型共用一套 agent loop，复用 Claude 订阅，跑在你自己的机器上。">
+<meta name="description" content="muselab — 自托管的多模型 Agent 工作台。选择本地工作区，文件、会话、预览与终端围绕当前目录协同。">
+<meta property="og:title" content="muselab · 自托管的多模型 Agent 工作台">
+<meta property="og:description" content="本地目录就是 Agent 的工作区。八家模型共用一套 agent loop，复用 Claude 订阅，运行在你自己的机器上。">
 <meta property="og:type" content="website">
 <meta property="og:url" content="https://hesorchen.github.io/muselab/promo/">
 <meta property="og:image" content="og-image.png">
 <meta property="og:image:width" content="1200">
 <meta property="og:image:height" content="630">
 <meta name="twitter:card" content="summary_large_image">
-<meta name="twitter:title" content="muselab · 自托管的多模型 AI 工作台">
-<meta name="twitter:description" content="你机器上的一个文件夹，就是 AI 的工作台。八家模型共用一套 agent loop，复用 Claude 订阅，跑在你自己的机器上。">
+<meta name="twitter:title" content="muselab · 自托管的多模型 Agent 工作台">
+<meta name="twitter:description" content="本地目录就是 Agent 的工作区。八家模型共用一套 agent loop，复用 Claude 订阅，运行在你自己的机器上。">
 <meta name="twitter:image" content="og-image.png">
 <meta name="theme-color" content="#11100e">
 <link rel="canonical" href="https://hesorchen.github.io/muselab/promo/">
 <link rel="icon" type="image/svg+xml" href="icon.svg">
 <link rel="apple-touch-icon" href="apple-touch-icon.png">
-<title>muselab · 自托管的多模型 AI 工作台</title>
+<title>muselab · 自托管的多模型 Agent 工作台</title>
 <script type="application/ld+json">
 {
   "@context": "https://schema.org",
@@ -27,7 +27,7 @@
   "name": "muselab",
   "applicationCategory": "DeveloperApplication",
   "operatingSystem": "Linux, macOS, Windows (WSL2)",
-  "description": "Self-hosted, single-user, multi-model AI workspace built on the Claude Agent SDK. Point it at a folder; the files inside become the AI's working context — no cloud, no vectorizing.",
+  "description": "A self-hosted, single-user, multi-model Agent workbench for switchable local workspaces, files, sessions, previews, and terminals.",
   "url": "https://hesorchen.github.io/muselab/promo/",
   "license": "https://opensource.org/licenses/MIT",
   "isAccessibleForFree": true,
@@ -420,7 +420,7 @@
     font-family: var(--mono); font-size: 0.72em;
   }
 
-  /* ===== hero product screenshots (real desktop + mobile) ===== */
+  /* ===== hero product screenshots (sanitised public demo data) ===== */
   .hero-shots {
     --shot-h: 400px;                 /* shared visual height of both shots */
     margin: 3rem auto 0;
@@ -428,14 +428,6 @@
     max-width: 1000px;
     display: flex; align-items: center; justify-content: center;
     gap: 1.4rem;
-  }
-  /* desktop block = 30px chrome bar + image → image height = shared − bar.
-     width:max-content overrides .mock's width:100% so the frame shrink-wraps
-     to the image instead of leaving empty chrome on the right. */
-  .hero-shot-desktop { flex: 0 0 auto; width: max-content; }
-  .hero-shot-desktop img {
-    display: block; width: auto;
-    height: calc(var(--shot-h) - 30px);
   }
   .hero-shot-phone {
     flex: 0 0 auto;
@@ -454,35 +446,8 @@
   }
   @media (max-width: 900px) {
     .hero-shots { flex-direction: column; align-items: center; gap: 1.6rem; }
-    .hero-shot-desktop { width: 100%; }
-    .hero-shot-desktop img { width: 100%; height: auto; }
     .hero-shot-phone { width: 210px; }
     .hero-shot-phone img { width: 100%; height: auto; }
-  }
-
-  /* ===== demo reel: two real screen recordings (muted autoplay loops) ===== */
-  .demo-reel {
-    max-width: 1100px; margin: 0 auto; padding: 0 1.5rem;
-    display: grid; grid-template-columns: 1fr 1fr; gap: 1.8rem;
-  }
-  .demo-card .mock { position: relative; }
-  .demo-card video {
-    display: block; width: 100%; height: auto; background: var(--bg-1);
-  }
-  .demo-zoom-hint {
-    position: absolute; top: 40px; right: 12px;
-    padding: 3px 7px; border-radius: 6px;
-    background: rgba(0,0,0,0.55); color: #fff;
-    font-family: var(--mono); font-size: 0.78rem; line-height: 1;
-    pointer-events: none; opacity: 0.8;
-  }
-  .demo-cap {
-    margin: 0.9rem 0 0; color: var(--fg-2);
-    font-size: 0.92rem; line-height: 1.5;
-  }
-  .demo-cap strong { color: var(--fg-1); font-weight: 600; }
-  @media (max-width: 760px) {
-    .demo-reel { grid-template-columns: 1fr; gap: 2rem; }
   }
 
   /* ===== IDEA ===== */
@@ -2128,10 +2093,10 @@
     </div>
     <h1 data-i18n="hero.h1">你的文件夹，<br>就是 AI 的<span class="hl">工作台</span>。</h1>
     <p class="hero-claim" data-i18n="hero.claim">
-      职业规划、体检报告、资产配置、家庭信息——<br>全丢进一个目录，Muse <span class="hl">全部记住</span>，跨领域随问随答。
+      选择任意本地目录，Muse 就在其中<span class="hl">读取、执行、产出</span>——<br>切换工作区，也同时切换 Agent 的完整上下文。
     </p>
     <p class="hero-sub" data-i18n="hero.sub">
-      自托管的多模型 AI 工作台。原文件直接当上下文——不上云、不切片、不向量化。八家厂商的模型共用同一套 agent loop，全程跑在你自己的机器上。
+      自托管的多模型 Agent 工作台。文件、会话、预览和终端围绕当前工作区协同；八家厂商的模型共用同一套 agent loop，全程跑在你自己的机器上。
     </p>
     <div class="hero-cta">
       <a href="#install" class="btn btn-primary" data-i18n="hero.cta">→ 一行命令装上</a>
@@ -2144,21 +2109,17 @@
       <span>curl -fsSL …/quick-install.sh | bash</span>
       <button class="copy-btn" onclick="copyInstall(this)" data-i18n="hero.copy">Copy</button>
     </div>
-    <!-- Product preview: real screenshots (desktop three-pane + mobile) -->
+    <!-- Product preview: sanitised screenshots with public demo data only -->
     <div class="hero-shots">
-      <div class="mock hero-shot-desktop">
-        <div class="mock-bar">
-          <div class="dot"></div><div class="dot"></div><div class="dot"></div>
-          <div class="title">localhost:8765 · muselab</div>
-        </div>
-        <img src="media/screenshot-desktop.png" loading="lazy"
-             data-i18n-attr="alt:hero.shot.desktop.alt"
-             alt="muselab 桌面三栏界面：文件树、对话、预览区实时渲染">
+      <div class="hero-shot-phone">
+        <img src="media/screenshot-mobile-preview.png" loading="lazy"
+             data-i18n-attr="alt:hero.shot.light.alt"
+             alt="muselab 移动端浅色预览">
       </div>
       <div class="hero-shot-phone">
         <img src="media/screenshot-mobile.png" loading="lazy"
-             data-i18n-attr="alt:hero.shot.mobile.alt"
-             alt="muselab 手机端单栏渲染，同一会话接着聊">
+             data-i18n-attr="alt:hero.shot.dark.alt"
+             alt="muselab 移动端深色预览">
       </div>
     </div>
     <p class="hero-shot-cap" data-i18n="hero.shot.cap">报告、表格、图表即写即渲染，多端同步会话</p>
@@ -2169,32 +2130,12 @@
 <!-- SCENES: 4 real use cases, each with inline mock -->
 <!-- ============================================================ -->
 <section id="scenes" style="padding:5rem 1.5rem;border-top:1px solid rgba(255,255,255,0.04)">
-  <!-- Demo reel: two real screen recordings (muted autoplay loops) -->
-  <div class="demo-reel reveal">
-    <div class="demo-card">
-      <div class="mock">
-        <div class="mock-bar"><div class="dot"></div><div class="dot"></div><div class="dot"></div><div class="title">localhost:8765 · 整理档案</div></div>
-        <video src="media/demo-organize.mp4" poster="media/demo-organize.poster.jpg" autoplay muted loop playsinline preload="metadata" onclick="zoomVideo(this)" style="cursor:zoom-in"></video>
-        <span class="demo-zoom-hint" aria-hidden="true">⤢</span>
-      </div>
-      <p class="demo-cap" data-i18n="demo.org.cap"><strong>建档：</strong>体检单、保单、各种记录直接拖进归档，Muse 自动归进 health / money / notes / work 并生成 README——空目录几秒变成有结构的工作台。</p>
-    </div>
-    <div class="demo-card">
-      <div class="mock">
-        <div class="mock-bar"><div class="dot"></div><div class="dot"></div><div class="dot"></div><div class="title">localhost:8765 · 三亚行程</div></div>
-        <video src="media/demo-travel.mp4" poster="media/demo-travel.poster.jpg" autoplay muted loop playsinline preload="metadata" onclick="zoomVideo(this)" style="cursor:zoom-in"></video>
-        <span class="demo-zoom-hint" aria-hidden="true">⤢</span>
-      </div>
-      <p class="demo-cap" data-i18n="demo.travel.cap"><strong>调用：</strong>一句话让 Muse 规划一周三亚旅行，它跨归档调出证件有效期、预算、笔记，直接排出一份带预算的完整行程。</p>
-    </div>
-  </div>
-
   <div class="container">
     <div class="section-label" style="justify-content:center;margin-top:3rem">
       <svg class="muse"><use href="#m-spark"/></svg>
       <span data-i18n="scenes.label">WHAT IT DOES</span>
     </div>
-    <h2 style="text-align:center;margin-bottom:1rem" data-i18n="scenes.h2">跨领域决策、内容生成、多端同步、定时任务——<br>四个场景看懂 muselab。</h2>
+    <h2 style="text-align:center;margin-bottom:1rem" data-i18n="scenes.h2">多工作区、成果生成、多端同步、定时任务——<br>四个场景看懂 muselab。</h2>
 
   </div>
 </section>
@@ -2205,33 +2146,33 @@
     <div class="spot-text">
       <div class="section-label">
         <svg class="muse"><use href="#m-trio"/></svg>
-        <span data-i18n="s1.label">SCENE 1 · 跨领域决策</span>
+        <span data-i18n="s1.label">SCENE 1 · 多工作区</span>
       </div>
-      <h2 data-i18n="s1.h2">一句话，调动所有归档，<br>做出<span class="hl">跨领域决策</span>。</h2>
+      <h2 data-i18n="s1.h2">切换目录，就是切换<br>完整的 <span class="hl">Agent 上下文</span>。</h2>
       <p class="lead" data-i18n="s1.lead">
-        投资、旅行、笔记都在同一个归档里。问一句“下个月关西玩一周，预算够吗”，Muse 检索整个归档、跨目录取出相关文件，一次答完。
+        代码库、研究目录和运营资料可以分别登记为工作区。文件树、会话、预览和终端 cwd 会作为一个整体切换，Agent 始终在正确的目录里工作。
       </p>
-      <div class="micro" data-i18n="s1.micro">一问跨多个目录 · 自动收齐相关文件 · 归档越全，答得越准</div>
+      <div class="micro" data-i18n="s1.micro">工作区隔离 · 会话绑定 cwd · 文件与终端同步切换</div>
     </div>
     <div class="spot-mock" aria-hidden="true">
       <div class="mock">
         <div class="mock-bar"><div class="dot"></div><div class="dot"></div><div class="dot"></div><div class="title" data-i18n="s1.mock.title">chat · 跨目录</div></div>
         <div class="chat-area">
-          <div class="msg-user" data-i18n="s1.mock.user">下个月关西旅行一周，预算 2 万够吗？顺便把行程和要带的也理一下</div>
+          <div class="msg-user" data-i18n="s1.mock.user">检查这个项目的最新改动，找出风险并跑相关测试</div>
           <div class="thinking-head"><span class="chevron">▾</span><span data-i18n="s1.mock.think">思考中 · 14 秒</span></div>
           <div class="exec-phase">
-            <div class="tk-step"><span data-i18n="s1.mock.t1">预算够不够要对照真实资金 — 先从整个归档里把「关西」相关的都查出来</span></div>
-            <div class="exec-item exec-done"><span class="exec-icon">▾</span><span class="exec-tool">Grep</span><span class="exec-arg" data-i18n="s1.mock.grep">归档全局 · “关西”</span><span class="exec-meta" data-i18n="s1.mock.grepmeta">命中 4 处</span></div>
-            <div class="tk-step"><span data-i18n="s1.mock.t2">命中落在 <span class="tk-ok">旅行/ · 投资/ · 笔记/</span> 三个目录</span></div>
-            <div class="exec-item exec-done exec-batch"><span class="exec-icon">▾</span><span class="exec-tool">Read × 2</span><span class="exec-arg" data-i18n="s1.mock.r1">旅行/关西-行程.md · 旅行/机酒清单.md</span></div>
-            <div class="exec-item exec-done"><span class="exec-icon">▾</span><span class="exec-tool">Read</span><span class="exec-arg" data-i18n="s1.mock.r2">投资/持仓.csv</span></div>
-            <div class="exec-item exec-done"><span class="exec-icon">▾</span><span class="exec-tool">Read</span><span class="exec-arg" data-i18n="s1.mock.r3">笔记/日语速记.md</span></div>
+            <div class="tk-step"><span data-i18n="s1.mock.t1">先确认工作区规则和改动范围，再定位受影响的调用链</span></div>
+            <div class="exec-item exec-done"><span class="exec-icon">▾</span><span class="exec-tool">Grep</span><span class="exec-arg" data-i18n="s1.mock.grep">当前工作区 · changed symbols</span><span class="exec-meta" data-i18n="s1.mock.grepmeta">命中 4 处</span></div>
+            <div class="tk-step"><span data-i18n="s1.mock.t2">改动落在 <span class="tk-ok">backend/ · frontend/ · tests/</span> 三个目录</span></div>
+            <div class="exec-item exec-done exec-batch"><span class="exec-icon">▾</span><span class="exec-tool">Read × 2</span><span class="exec-arg" data-i18n="s1.mock.r1">backend/workspaces.py · frontend/app.js</span></div>
+            <div class="exec-item exec-done"><span class="exec-icon">▾</span><span class="exec-tool">Read</span><span class="exec-arg" data-i18n="s1.mock.r2">tests/test_workspaces.py</span></div>
+            <div class="exec-item exec-done"><span class="exec-icon">▾</span><span class="exec-tool">Read</span><span class="exec-arg" data-i18n="s1.mock.r3">AGENTS.md</span></div>
           </div>
           <div class="exec-result">
-            <div class="exec-result-head" data-i18n="s1.mock.rhead">回答 · 跨 4 个目录 · 示例数据</div>
+            <div class="exec-result-head" data-i18n="s1.mock.rhead">审查结果 · 3 个目录 · 相关测试已运行</div>
             <div class="exec-result-body">
-              <span class="exec-md-h2" data-i18n="s1.mock.rh2">## 关西一周 · 一次理清</span>
-              <span data-i18n="s1.mock.rbody">预算：现金仓 <strong>¥100,000</strong>，本次预估 <strong>¥18,600</strong>，占 19% → 赎货币基金即可 ✓<br>行程：6 天 5 晚 大阪 → 京都 → 奈良 → 大阪<br>交通：ICOCA + 关西周游 3 日券<br>美食：6 家按动线就近排···</span>
+              <span class="exec-md-h2" data-i18n="s1.mock.rh2">## 工作区切换 · 审查完成</span>
+              <span data-i18n="s1.mock.rbody">范围：后端解析、前端状态与回归测试共 <strong>3</strong> 层<br>风险：发现 <strong>1</strong> 处旧状态回写窗口，已给出修复位置<br>验证：定向测试 27 项通过 ✓<br>结论：改动可继续合入，保留旧字段兼容一个版本</span>
             </div>
           </div>
         </div>
@@ -2250,36 +2191,36 @@
       </div>
       <h2 data-i18n="s2.h2">不只是对话——Muse <span class="hl">生成</span>新报告、新图表、新资料。</h2>
       <p class="lead" data-i18n="s2.lead">
-        把体检 PDF 交给它，Muse 通读全文、挑出异常指标、按机制配补剂，再生成一份可存档的 HTML 报告——自动落回归档，成为新的上下文。
+        让 Agent 读取源码、测试结果或业务数据，调用 Skill 生成可分享的 HTML 报告，并直接写回当前工作区；预览区马上渲染结果。
       </p>
-      <div class="micro" data-i18n="s2.micro">读数据 → 生成 → 落回归档 · 一句话让 Muse 改稿 · 所见即所得</div>
+      <div class="micro" data-i18n="s2.micro">读取 → 执行 → 生成成果 · 一句话改稿 · 所见即所得</div>
     </div>
     <div class="spot-mock" aria-hidden="true">
       <div class="mock">
-        <div class="mock-bar"><div class="dot"></div><div class="dot"></div><div class="dot"></div><div class="title" data-i18n="s2.mock.title">chat · 生成补剂建议</div></div>
+        <div class="mock-bar"><div class="dot"></div><div class="dot"></div><div class="dot"></div><div class="title" data-i18n="s2.mock.title">chat · 生成质量报告</div></div>
         <div class="chat-area">
-          <div class="msg-user" data-i18n="s2.mock.user">照我的体检报告，给一份能存档的补剂建议</div>
+          <div class="msg-user" data-i18n="s2.mock.user">读取测试结果，生成一份可分享的项目质量报告</div>
           <div class="thinking-head"><span class="chevron">▾</span><span data-i18n="s2.mock.think">思考中 · 23 秒</span></div>
           <div class="exec-phase">
-            <div class="tk-step"><span data-i18n="s2.mock.t1">先读完整份体检 PDF，定位偏离参考区间的指标</span></div>
-            <div class="exec-item exec-done"><span class="exec-icon">▾</span><span class="exec-tool">Read</span><span class="exec-arg" data-i18n="s2.mock.read">体检/2026-体检.pdf</span><span class="exec-meta" data-i18n="s2.mock.readmeta">~8 页</span></div>
-            <div class="tk-step"><span data-i18n="s2.mock.t2">5 项偏离，逐项按机制选补剂：<span class="tk-flag">25-OH-D 低</span>→D₃、<span class="tk-flag">甘油三酯高</span>→Omega-3、镁低→甘氨酸镁；D₃ 配 K₂ 引导钙代谢，锌与铁/铜竞争 → 与正餐错开，各项核对在安全上限（UL）内</span></div>
+            <div class="tk-step"><span data-i18n="s2.mock.t1">先读取结构化测试结果，核对通过率、耗时和覆盖率</span></div>
+            <div class="exec-item exec-done"><span class="exec-icon">▾</span><span class="exec-tool">Read</span><span class="exec-arg" data-i18n="s2.mock.read">reports/test-results.json</span><span class="exec-meta" data-i18n="s2.mock.readmeta">3 个测试套件</span></div>
+            <div class="tk-step"><span data-i18n="s2.mock.t2">三套测试全部通过；提取慢测试、覆盖率薄弱模块和关键链路，形成可执行结论</span></div>
             <div class="exec-item exec-done"><span class="exec-icon">▾</span><span class="exec-tool">Skill</span><span class="exec-arg">tufte-report</span></div>
-            <div class="tk-step"><span data-i18n="s2.mock.t3">把 补剂/剂量/时机/依据 整理成可存档的 HTML，落回归档</span></div>
-            <div class="exec-item exec-done"><span class="exec-icon">▾</span><span class="exec-tool exec-tool-write">Write</span><span class="exec-arg" data-i18n="s2.mock.write">补剂建议.html</span><span class="exec-badge plus">+42</span></div>
+            <div class="tk-step"><span data-i18n="s2.mock.t3">把通过率、耗时、覆盖率和建议整理成单文件 HTML，写回当前工作区</span></div>
+            <div class="exec-item exec-done"><span class="exec-icon">▾</span><span class="exec-tool exec-tool-write">Write</span><span class="exec-arg" data-i18n="s2.mock.write">reports/quality-report.html</span><span class="exec-badge plus">+42</span></div>
           </div>
           <div class="exec-result">
-            <div class="exec-result-head" data-i18n="s2.mock.rhead">补剂建议.html · 已渲染 · 示例数据</div>
+            <div class="exec-result-head" data-i18n="s2.mock.rhead">quality-report.html · 已渲染 · 示例数据</div>
             <div class="portfolio-preview" style="padding:0.7em 0.85em">
               <table class="holdings holdings--text">
-                <thead><tr><th data-i18n="s2.col.sup">补剂</th><th data-i18n="s2.col.dose">剂量</th><th data-i18n="s2.col.time">时机</th><th data-i18n="s2.col.basis">依据</th></tr></thead>
+                <thead><tr><th data-i18n="s2.col.sup">测试套件</th><th data-i18n="s2.col.dose">结果</th><th data-i18n="s2.col.time">耗时</th><th data-i18n="s2.col.basis">覆盖率</th></tr></thead>
                 <tbody>
-                  <tr><td data-i18n="s2.row1.n">维生素 D₃</td><td class="num">2000 IU</td><td data-i18n="s2.row1.t">随餐</td><td data-i18n="s2.row1.b">25-OH-D 偏低</td></tr>
-                  <tr><td data-i18n="s2.row2.n">Omega-3</td><td class="num">1000 mg</td><td data-i18n="s2.row2.t">随餐</td><td data-i18n="s2.row2.b">甘油三酯偏高</td></tr>
-                  <tr><td data-i18n="s2.row3.n">镁·甘氨酸</td><td class="num">200 mg</td><td data-i18n="s2.row3.t">睡前</td><td data-i18n="s2.row3.b">镁摄入不足</td></tr>
+                  <tr><td data-i18n="s2.row1.n">Backend</td><td class="num">312 ✓</td><td data-i18n="s2.row1.t">4m 20s</td><td data-i18n="s2.row1.b">86%</td></tr>
+                  <tr><td data-i18n="s2.row2.n">Frontend</td><td class="num">79 ✓</td><td data-i18n="s2.row2.t">11s</td><td data-i18n="s2.row2.b">91%</td></tr>
+                  <tr><td data-i18n="s2.row3.n">E2E</td><td class="num">7 ✓</td><td data-i18n="s2.row3.t">1m 54s</td><td data-i18n="s2.row3.b">关键流程</td></tr>
                 </tbody>
               </table>
-              <div class="pf-card-sub" style="margin-top:0.4em" data-i18n="s2.mock.foot">仅据体检偏离项 · 剂量与禁忌请遵医嘱</div>
+              <div class="pf-card-sub" style="margin-top:0.4em" data-i18n="s2.mock.foot">所有必需检查通过 · 2 个覆盖率改进建议</div>
             </div>
           </div>
         </div>
@@ -2297,7 +2238,7 @@
     </div>
     <h2 style="text-align:center" data-i18n="s3.h2">电脑上的话题，<br>手机<span class="hl">接着聊</span>。</h2>
     <p class="lead" style="margin:0 auto 3.5rem;text-align:center" data-i18n="s3.lead">
-      同一台服务器、同一个会话、同一份归档，多个设备一起聊。
+      同一台服务器、同一个会话、同一个工作区，多个设备无缝接续。
     </p>
     <div class="device-pair">
       <!-- Desktop mock -->
@@ -2349,7 +2290,7 @@
                 <div class="dt-thinking" data-i18n="s3.dt.think">▾ 思考中 · 18 秒</div>
                 <div class="dt-plan">
                   <div class="dt-plan-head"><svg class="muse" style="width:11px;height:11px"><use href="#m-orbit"/></svg> rebalance-2026Q2.md</div>
-                  <div class="dt-plan-body" data-i18n="s3.dt.plan">① 读持仓快照 + 最新净值<br>② 对照目标配置算偏离<br>③ 生成再平衡建议，落回归档</div>
+                  <div class="dt-plan-body" data-i18n="s3.dt.plan">① 读持仓快照 + 最新净值<br>② 对照目标配置算偏离<br>③ 生成再平衡建议，写回工作区</div>
                 </div>
                 <div class="exec-item exec-done"><span class="exec-icon">▾</span><span class="exec-tool">Read</span><span class="exec-arg">holdings.md</span></div>
                 <div class="exec-item exec-done"><span class="exec-icon">▾</span><span class="exec-tool">Read</span><span class="exec-arg" data-i18n="s3.dt.tr2">行情快照 · 今日</span></div>
@@ -2372,7 +2313,7 @@
             <div class="phone-daysep" data-i18n="s3.ph.sep0">刚才 · 在桌面</div>
             <div class="phone-line ai">
               <span class="phone-av muse"><svg class="muse"><use href="#m-spark"/></svg></span>
-              <div class="phone-msg ai" data-i18n="s3.ph.m0">组合偏离 2 项，再平衡建议已存档</div>
+              <div class="phone-msg ai" data-i18n="s3.ph.m0">组合偏离 2 项，再平衡建议已写入工作区</div>
             </div>
             <div class="phone-line ai">
               <span class="phone-av muse"><svg class="muse"><use href="#m-spark"/></svg></span>
@@ -2422,9 +2363,9 @@
       </div>
       <h2 data-i18n="s4.h2">常用 prompt，<br><span class="hl">定时自动跑</span>。</h2>
       <p class="lead" data-i18n="s4.lead">
-        把常跑的 prompt 存成每天 / 每周 / 一次性任务，到点 Muse 自动读归档、跑工具、出结果，任务完成推送手机通知。
+        把常跑的 prompt 存成每天 / 每周 / 一次性任务，到点 Muse 自动读取所选工作区、运行工具、产出结果，任务完成后推送手机通知。
       </p>
-      <div class="micro" data-i18n="s4.micro">每天早上 8 点 · 自动读归档 · 结果推送到手机 · 无需打开浏览器</div>
+      <div class="micro" data-i18n="s4.micro">每天早上 8 点 · 自动读取工作区 · 结果推送到手机 · 无需打开浏览器</div>
     </div>
     <div class="spot-mock" aria-hidden="true" style="max-width:240px;margin:0 auto">
       <div class="phone" style="aspect-ratio:9/15">
@@ -2435,13 +2376,13 @@
           <div class="lock-pushes">
             <div class="lock-push">
               <div class="lock-push-head"><svg class="muse"><use href="#m-hex"/></svg><span class="lock-push-app">MUSELAB</span><span class="lock-push-cadence" data-i18n="s4.lock.cad1">每天</span><span class="lock-push-time" data-i18n="s4.lock.time">1 分钟前</span></div>
-              <div class="lock-push-title" data-i18n="s4.lock.title">每日投资研判</div>
-              <div class="lock-push-body" data-i18n="s4.lock.body">已读 投资/ 持仓 + 今日行情：组合偏离 1.8%，未触发再平衡；2 个关注点已记进 watchlist。</div>
+              <div class="lock-push-title" data-i18n="s4.lock.title">每日项目巡检</div>
+              <div class="lock-push-body" data-i18n="s4.lock.body">已检查当前工作区：CI 全部通过；发现 2 个待处理告警，已写入 reports/daily-check.md。</div>
             </div>
             <div class="lock-push is-secondary">
               <div class="lock-push-head"><svg class="muse"><use href="#m-hex"/></svg><span class="lock-push-app">MUSELAB</span><span class="lock-push-cadence" data-i18n="s4.lock.cad2">每周</span><span class="lock-push-time" data-i18n="s4.lock.time2">9 分钟前</span></div>
-              <div class="lock-push-title" data-i18n="s4.lock.title2">本周待办提醒</div>
-              <div class="lock-push-body" data-i18n="s4.lock.body2">本周 3 项待办：① 季度复盘待写 ② 1 份保险月底到期 ③ 上次调仓建议待确认。</div>
+              <div class="lock-push-title" data-i18n="s4.lock.title2">本周项目待办</div>
+              <div class="lock-push-body" data-i18n="s4.lock.body2">本周 3 项待办：① 处理 2 个 issue ② 更新部署文档 ③ 检查依赖升级。</div>
             </div>
           </div>
         </div>
@@ -2459,7 +2400,7 @@
       <svg class="muse"><use href="#m-lens"/></svg>
       <span data-i18n="why.label">WHY MUSELAB</span>
     </div>
-    <h2 style="text-align:center;margin-bottom:1rem" data-i18n="why.h2">告别语义丢失<br>muselab 让文件直接成为<span class="hl">能读能写</span>的活档案。</h2>
+    <h2 style="text-align:center;margin-bottom:1rem" data-i18n="why.h2">不只检索片段——<br>muselab 让 Agent 直接在本地工作区<span class="hl">读取、执行、写回</span>。</h2>
     <p style="text-align:center;color:var(--fg-2);font-size:0.95rem;max-width:34em;margin:0 auto 3rem;line-height:1.7" data-i18n="why.lead">RAG 先切片、再向量化、最后检索——每一步都在丢语义。muselab 中原文件就是上下文，agent 直接读写，零语义损失。</p>
     <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:1.5rem">
       <div style="background:var(--bg-1);border:1px solid var(--border-strong);border-radius:10px;padding:1.8rem;text-align:center">
@@ -2470,7 +2411,7 @@
       <div style="background:var(--bg-1);border:1px solid var(--border-strong);border-radius:10px;padding:1.8rem;text-align:center">
         <div style="font-size:1.8rem;margin-bottom:0.8rem">🔄 → 📈</div>
         <div style="font-weight:700;color:var(--fg-0);margin-bottom:0.5rem;font-size:1.05rem" data-i18n="why.c2.t">越用越准</div>
-        <div style="color:var(--fg-2);font-size:0.9rem;line-height:1.65" data-i18n="why.c2.d">归档只增不减。存得越多，每次回答的起点越高。不是每次清零的会话，而是持续积累的上下文。</div>
+        <div style="color:var(--fg-2);font-size:0.9rem;line-height:1.65" data-i18n="why.c2.d">工作区中的代码、文档和成果持续积累。切换回来时，Agent 仍从同一份真实文件和会话上下文继续工作。</div>
       </div>
       <div style="background:var(--bg-1);border:1px solid var(--border-strong);border-radius:10px;padding:1.8rem;text-align:center">
         <div style="font-size:1.8rem;margin-bottom:0.8rem">🔒 → 🏠</div>
@@ -2497,8 +2438,8 @@
     <div class="capability-grid">
       <div class="capability-card">
         <svg class="muse"><use href="#m-lens"/></svg>
-        <div class="cap-title" data-i18n="caps.capture.t">拍照落档</div>
-        <div class="cap-desc" data-i18n="caps.capture.d">白板、收据、截图发给 Muse，它读图、提取要点，写成笔记——一张照片就是下次的上下文。</div>
+        <div class="cap-title" data-i18n="caps.capture.t">图片转工作区笔记</div>
+        <div class="cap-desc" data-i18n="caps.capture.d">把白板、界面截图或图表发给 Muse，它会读图、提取要点，并把结构化笔记写进当前工作区。</div>
       </div>
       <div class="capability-card">
         <svg class="muse"><use href="#m-lens"/></svg>
@@ -2527,8 +2468,8 @@
       </div>
       <div class="capability-card">
         <svg class="muse"><use href="#m-halo"/></svg>
-        <div class="cap-title" data-i18n="caps.skills.t">Skills · 11 个预置技能包</div>
-        <div class="cap-desc" data-i18n="caps.skills.d">模型按任务自动选用——web-search、code-reviewer、csv-analyzer、pptx、translate…… 放一个 <span class="kbd">SKILL.md</span> 进目录，就能加你自己的。</div>
+        <div class="cap-title" data-i18n="caps.skills.t">Skills · 动态发现你的能力包</div>
+        <div class="cap-desc" data-i18n="caps.skills.d">模型按任务自动选用用户、workspace、plugin 和经审核生成的 Skills；放一个 <span class="kbd">SKILL.md</span> 到可发现目录，就能扩展自己的工作流。</div>
       </div>
       <div class="capability-card">
         <svg class="muse"><use href="#m-orbit"/></svg>
@@ -2607,8 +2548,8 @@
       <svg class="muse"><use href="#m-lens"/></svg>
       <span data-i18n="compare.label">HOW IT COMPARES</span>
     </div>
-    <h2 data-i18n="compare.h2">归档之于 muselab，<br>犹如<span class="hl">代码库</span>之于 Claude Code。</h2>
-    <p class="lead" data-i18n="compare.lead">不是 IDE，不是 RAG，不是插件市场——而是把私人档案当作直接上下文的 AI 工作台。</p>
+    <h2 data-i18n="compare.h2">工作区之于 muselab，<br>就是 Agent <span class="hl">执行任务</span>的完整现场。</h2>
+    <p class="lead" data-i18n="compare.lead">不是只聊天，也不只是 RAG——它把本地目录、会话、终端和成果预览整合成一个可切换的 Agent 工作台。</p>
     <div class="compare-table-wrap">
     <table class="compare-table">
       <thead>
@@ -2618,7 +2559,7 @@
         <tr><td data-i18n="compare.r1">Self-hosted</td><td class="us yes">✓</td><td class="yes">✓</td><td class="yes">✓</td><td class="yes">✓</td><td class="no">—</td></tr>
         <tr><td data-i18n="compare.r2">Full agent SDK · all models</td><td class="us yes">✓</td><td class="no" data-i18n="compare.r2.lobe">chat only</td><td class="no" data-i18n="compare.r2.any">RAG focus</td><td class="partial" data-i18n="compare.r2.ccui">Claude only</td><td class="partial" data-i18n="compare.r2.cc">Claude only</td></tr>
         <tr><td data-i18n="compare.r3">Reuse Claude Pro sub</td><td class="us yes">✓</td><td class="no">—</td><td class="no">—</td><td class="yes">✓</td><td class="yes">✓</td></tr>
-        <tr><td data-i18n="compare.r4">Archive as 1st-class context</td><td class="us yes">✓</td><td class="no">—</td><td class="partial" data-i18n="compare.r4.any">vectorized</td><td class="no" data-i18n="compare.r4.ccui">codebase</td><td class="no" data-i18n="compare.r4.cc">codebase</td></tr>
+        <tr><td data-i18n="compare.r4">Local workspace as context</td><td class="us yes">✓</td><td class="no">—</td><td class="partial" data-i18n="compare.r4.any">vectorized</td><td class="no" data-i18n="compare.r4.ccui">codebase</td><td class="no" data-i18n="compare.r4.cc">codebase</td></tr>
         <tr><td data-i18n="compare.r5">Mobile PWA + push</td><td class="us yes">✓</td><td class="yes">✓</td><td class="no">—</td><td class="partial" data-i18n="compare.r5.ccui">resp</td><td class="no">—</td></tr>
         <tr><td data-i18n="compare.r6">No build step</td><td class="us yes">✓</td><td class="no">npm</td><td class="no">docker</td><td class="yes">✓</td><td class="no">n/a</td></tr>
       </tbody>
@@ -2718,7 +2659,7 @@
     <div class="faq-grid">
       <div class="faq-item">
         <div class="faq-q" data-i18n="faq.q1">和 ChatGPT / Claude 网页版有什么不同？</div>
-        <div class="faq-a" data-i18n="faq.a1">网页版是通用聊天，每次对话从零开始。muselab 把你机器上的原文件当成持久上下文——体检报告、投资记录、笔记都在里面，跨对话、跨领域随时调用。而且模型可换、引擎可改、数据不出本机。</div>
+        <div class="faq-a" data-i18n="faq.a1">网页版是通用聊天，每次对话从零开始。muselab 让 Agent 直接在你选择的本地工作区里读写文件、运行终端、生成成果，并让会话持续绑定正确目录。模型可换、引擎可改、数据仍由你掌控。</div>
       </div>
       <div class="faq-item">
         <div class="faq-q" data-i18n="faq.q2">需要 API key 吗？</div>
@@ -2726,7 +2667,7 @@
       </div>
       <div class="faq-item">
         <div class="faq-q" data-i18n="faq.q3">我的数据存在哪？</div>
-        <div class="faq-a" data-i18n="faq.a3">全部在你的机器上：archive 是一个本地目录，对话记录是本地 JSONL 文件。没有云端副本，没有第三方账号，没有数据搬运。</div>
+        <div class="faq-a" data-i18n="faq.a3">全部在你的机器上：工作区是你选择的本地目录，对话记录是本地 JSONL 文件。没有 muselab 托管的云端副本，也不要求第三方 muselab 账号。</div>
       </div>
       <div class="faq-item">
         <div class="faq-q" data-i18n="faq.q4">需要什么硬件？能跑在 NAS / 树莓派上吗？</div>
@@ -2734,11 +2675,11 @@
       </div>
       <div class="faq-item">
         <div class="faq-q" data-i18n="faq.q5">效果和 Claude Code 比怎么样？</div>
-        <div class="faq-a" data-i18n="faq.a5">底层都是 Claude Agent SDK，agent 能力完全一致。区别在于 Claude Code 的上下文是代码仓库，muselab 的上下文是你的私人归档——面向的场景不同，引擎相同。</div>
+        <div class="faq-a" data-i18n="faq.a5">两者都使用 Agent SDK 能力。Claude Code 更贴近终端与代码开发；muselab 把可切换工作区、文件、会话、预览、多端访问和定时任务放在同一个 Web 工作台里。</div>
       </div>
       <div class="faq-item">
         <div class="faq-q" data-i18n="faq.q6">怎么升级和卸载？</div>
-        <div class="faq-a" data-i18n="faq.a6">升级跑 <span class="kbd">upgrade.sh</span>，卸载跑 <span class="kbd">uninstall-linux.sh</span> / <span class="kbd">uninstall-macos.sh</span>。卸载只移除系统服务——你的 <span class="kbd">.env</span>、对话记录和 archive 文件原样保留。</div>
+        <div class="faq-a" data-i18n="faq.a6">升级跑 <span class="kbd">upgrade.sh</span>，卸载跑 <span class="kbd">uninstall-linux.sh</span> / <span class="kbd">uninstall-macos.sh</span>。卸载只移除系统服务——你的 <span class="kbd">.env</span>、对话记录和工作区文件原样保留。</div>
       </div>
     </div>
   </div>
@@ -2827,28 +2768,13 @@
     }
   }
 
-  // Click a demo video to enlarge it fullscreen. Desktop uses the
-  // Fullscreen API on the <video>; iOS Safari only allows fullscreen via
-  // the element-specific webkitEnterFullscreen(), so fall back to that.
-  function zoomVideo(v) {
-    if (document.fullscreenElement || document.webkitFullscreenElement) {
-      (document.exitFullscreen || document.webkitExitFullscreen || function(){}).call(document);
-      return;
-    }
-    // A user tap is a valid gesture to start playback — covers iOS Low Power
-    // Mode and any browser that blocked the autoplay attempt.
-    try { const p = v.play(); if (p && p.catch) p.catch(function(){}); } catch (_) {}
-    const fn = v.requestFullscreen || v.webkitRequestFullscreen || v.webkitEnterFullscreen;
-    if (fn) { try { fn.call(v); } catch (_) {} }
-  }
-
   // ===== i18n: bilingual (中文 / English), live toggle, no reload =====
   // The in-HTML copy is Chinese (the default for crawlers + no-JS users);
   // I18N.zh mirrors that copy verbatim so applying 'zh' restores the source.
   const I18N = {
     zh: {
-      'doc.title': 'muselab · 自托管的多模型 AI 工作台',
-      'doc.desc': 'muselab — 自托管的多模型 AI 工作台。指向你机器上的一个目录，里面的原文件直接成为 AI 的上下文，不上云、不向量化。',
+      'doc.title': 'muselab · 自托管的多模型 Agent 工作台',
+      'doc.desc': 'muselab — 自托管的多模型 Agent 工作台。选择本地工作区，文件、会话、预览与终端围绕当前目录协同。',
 
       'nav.usecases': 'Use cases',
       'nav.why': 'Why',
@@ -2858,64 +2784,62 @@
 
       'hero.pill': 'Open source · MIT · self-hosted',
       'hero.h1': '你的文件夹，<br>就是 AI 的<span class="hl">工作台</span>。',
-      'hero.claim': '职业规划、体检报告、资产配置、家庭信息——<br>全丢进一个目录，Muse <span class="hl">全部记住</span>，跨领域随问随答。',
-      'hero.sub': '自托管的多模型 AI 工作台。原文件直接当上下文——不上云、不切片、不向量化。八家厂商的模型共用同一套 agent loop，全程跑在你自己的机器上。',
+      'hero.claim': '选择任意本地目录，Muse 就在其中<span class="hl">读取、执行、产出</span>——<br>切换工作区，也同时切换 Agent 的完整上下文。',
+      'hero.sub': '自托管的多模型 Agent 工作台。文件、会话、预览和终端围绕当前工作区协同；八家厂商的模型共用同一套 agent loop，全程跑在你自己的机器上。',
       'hero.cta': '→ 一行命令装上',
       'hero.star': 'Star on GitHub',
       'hero.copy': 'Copy',
       'hero.shot.cap': '报告、表格、图表即写即渲染，多端同步会话',
-      'hero.shot.desktop.alt': 'muselab 桌面三栏界面：文件树、对话、预览区实时渲染',
-      'hero.shot.mobile.alt': 'muselab 手机端单栏渲染，同一会话接着聊',
+      'hero.shot.light.alt': 'muselab 移动端浅色预览',
+      'hero.shot.dark.alt': 'muselab 移动端深色预览',
 
       'scenes.label': 'WHAT IT DOES',
-      'scenes.h2': '跨领域决策、内容生成、多端同步、定时任务——<br>四个场景看懂 muselab。',
-      'demo.org.cap': '<strong>建档：</strong>体检单、保单、各种记录直接拖进归档，Muse 自动归进 health / money / notes / work 并生成 README——空目录几秒变成有结构的工作台。',
-      'demo.travel.cap': '<strong>调用：</strong>一句话让 Muse 规划一周三亚旅行，它跨归档调出证件有效期、预算、笔记，直接排出一份带预算的完整行程。',
+      'scenes.h2': '多工作区、成果生成、多端同步、定时任务——<br>四个场景看懂 muselab。',
 
-      's1.label': 'SCENE 1 · 跨领域决策',
-      's1.h2': '一句话，调动所有归档，<br>做出<span class="hl">跨领域决策</span>。',
-      's1.lead': '投资、旅行、笔记都在同一个归档里。问一句“下个月关西玩一周，预算够吗”，Muse 检索整个归档、跨目录取出相关文件，一次答完。',
-      's1.micro': '一问跨多个目录 · 自动收齐相关文件 · 归档越全，答得越准',
+      's1.label': 'SCENE 1 · 多工作区',
+      's1.h2': '切换目录，就是切换<br>完整的 <span class="hl">Agent 上下文</span>。',
+      's1.lead': '代码库、研究目录和运营资料可以分别登记为工作区。文件树、会话、预览和终端 cwd 会作为一个整体切换，Agent 始终在正确的目录里工作。',
+      's1.micro': '工作区隔离 · 会话绑定 cwd · 文件与终端同步切换',
       's1.mock.title': 'chat · 跨目录',
-      's1.mock.user': '下个月关西旅行一周，预算 2 万够吗？顺便把行程和要带的也理一下',
+      's1.mock.user': '检查这个项目的最新改动，找出风险并跑相关测试',
       's1.mock.think': '思考中 · 14 秒',
-      's1.mock.t1': '预算够不够要对照真实资金 — 先从整个归档里把「关西」相关的都查出来',
-      's1.mock.grep': '归档全局 · “关西”',
+      's1.mock.t1': '先确认工作区规则和改动范围，再定位受影响的调用链',
+      's1.mock.grep': '当前工作区 · changed symbols',
       's1.mock.grepmeta': '命中 4 处',
-      's1.mock.t2': '命中落在 <span class="tk-ok">旅行/ · 投资/ · 笔记/</span> 三个目录',
-      's1.mock.r1': '旅行/关西-行程.md · 旅行/机酒清单.md',
-      's1.mock.r2': '投资/持仓.csv',
-      's1.mock.r3': '笔记/日语速记.md',
-      's1.mock.rhead': '回答 · 跨 4 个目录 · 示例数据',
-      's1.mock.rh2': '## 关西一周 · 一次理清',
-      's1.mock.rbody': '预算：现金仓 <strong>¥100,000</strong>，本次预估 <strong>¥18,600</strong>，占 19% → 赎货币基金即可 ✓<br>行程：6 天 5 晚 大阪 → 京都 → 奈良 → 大阪<br>交通：ICOCA + 关西周游 3 日券<br>美食：6 家按动线就近排···',
+      's1.mock.t2': '改动落在 <span class="tk-ok">backend/ · frontend/ · tests/</span> 三个目录',
+      's1.mock.r1': 'backend/workspaces.py · frontend/app.js',
+      's1.mock.r2': 'tests/test_workspaces.py',
+      's1.mock.r3': 'AGENTS.md',
+      's1.mock.rhead': '审查结果 · 3 个目录 · 相关测试已运行',
+      's1.mock.rh2': '## 工作区切换 · 审查完成',
+      's1.mock.rbody': '范围：后端解析、前端状态与回归测试共 <strong>3</strong> 层<br>风险：发现 <strong>1</strong> 处旧状态回写窗口，已给出修复位置<br>验证：定向测试 27 项通过 ✓<br>结论：改动可继续合入，保留旧字段兼容一个版本',
 
       's2.label': 'SCENE 2 · 内容生成',
       's2.h2': '不只是对话——Muse <span class="hl">生成</span>新报告、新图表、新资料。',
-      's2.lead': '把体检 PDF 交给它，Muse 通读全文、挑出异常指标、按机制配补剂，再生成一份可存档的 HTML 报告——自动落回归档，成为新的上下文。',
-      's2.micro': '读数据 → 生成 → 落回归档 · 一句话让 Muse 改稿 · 所见即所得',
-      's2.mock.title': 'chat · 生成补剂建议',
-      's2.mock.user': '照我的体检报告，给一份能存档的补剂建议',
+      's2.lead': '让 Agent 读取源码、测试结果或业务数据，调用 Skill 生成可分享的 HTML 报告，并直接写回当前工作区；预览区马上渲染结果。',
+      's2.micro': '读取 → 执行 → 生成成果 · 一句话改稿 · 所见即所得',
+      's2.mock.title': 'chat · 生成质量报告',
+      's2.mock.user': '读取测试结果，生成一份可分享的项目质量报告',
       's2.mock.think': '思考中 · 23 秒',
-      's2.mock.t1': '先读完整份体检 PDF，定位偏离参考区间的指标',
-      's2.mock.read': '体检/2026-体检.pdf',
-      's2.mock.readmeta': '~8 页',
-      's2.mock.t2': '5 项偏离，逐项按机制选补剂：<span class="tk-flag">25-OH-D 低</span>→D₃、<span class="tk-flag">甘油三酯高</span>→Omega-3、镁低→甘氨酸镁；D₃ 配 K₂ 引导钙代谢，锌与铁/铜竞争 → 与正餐错开，各项核对在安全上限（UL）内',
-      's2.mock.t3': '把 补剂/剂量/时机/依据 整理成可存档的 HTML，落回归档',
-      's2.mock.write': '补剂建议.html',
-      's2.mock.rhead': '补剂建议.html · 已渲染 · 示例数据',
-      's2.col.sup': '补剂',
-      's2.col.dose': '剂量',
-      's2.col.time': '时机',
-      's2.col.basis': '依据',
-      's2.row1.n': '维生素 D₃', 's2.row1.t': '随餐', 's2.row1.b': '25-OH-D 偏低',
-      's2.row2.n': 'Omega-3', 's2.row2.t': '随餐', 's2.row2.b': '甘油三酯偏高',
-      's2.row3.n': '镁·甘氨酸', 's2.row3.t': '睡前', 's2.row3.b': '镁摄入不足',
-      's2.mock.foot': '仅据体检偏离项 · 剂量与禁忌请遵医嘱',
+      's2.mock.t1': '先读取结构化测试结果，核对通过率、耗时和覆盖率',
+      's2.mock.read': 'reports/test-results.json',
+      's2.mock.readmeta': '3 个测试套件',
+      's2.mock.t2': '三套测试全部通过；提取慢测试、覆盖率薄弱模块和关键链路，形成可执行结论',
+      's2.mock.t3': '把通过率、耗时、覆盖率和建议整理成单文件 HTML，写回当前工作区',
+      's2.mock.write': 'reports/quality-report.html',
+      's2.mock.rhead': 'quality-report.html · 已渲染 · 示例数据',
+      's2.col.sup': '测试套件',
+      's2.col.dose': '结果',
+      's2.col.time': '耗时',
+      's2.col.basis': '覆盖率',
+      's2.row1.n': 'Backend', 's2.row1.t': '4m 20s', 's2.row1.b': '86%',
+      's2.row2.n': 'Frontend', 's2.row2.t': '11s', 's2.row2.b': '91%',
+      's2.row3.n': 'E2E', 's2.row3.t': '1m 54s', 's2.row3.b': '关键流程',
+      's2.mock.foot': '所有必需检查通过 · 2 个覆盖率改进建议',
 
       's3.label': 'SCENE 3 · 多端同步',
       's3.h2': '电脑上的话题，<br>手机<span class="hl">接着聊</span>。',
-      's3.lead': '同一台服务器、同一个会话、同一份归档，多个设备一起聊。',
+      's3.lead': '同一台服务器、同一个会话、同一个工作区，多个设备无缝接续。',
       's3.dt.fileshead': '▣ 文件',
       's3.dt.synced': '● 已同步',
       's3.dt.ph2': '再平衡建议 · 2026 Q2',
@@ -2933,14 +2857,14 @@
       's3.dt.pfoot': '来源 holdings.md · 今天更新',
       's3.dt.user': '帮我看下组合偏离没有，要不要再平衡？',
       's3.dt.think': '▾ 思考中 · 18 秒',
-      's3.dt.plan': '① 读持仓快照 + 最新净值<br>② 对照目标配置算偏离<br>③ 生成再平衡建议，落回归档',
+      's3.dt.plan': '① 读持仓快照 + 最新净值<br>② 对照目标配置算偏离<br>③ 生成再平衡建议，写回工作区',
       's3.dt.tr2': '行情快照 · 今日',
       's3.dt.done': '✓ 已生成 rebalance-2026Q2.md。地铁上也能接着问。',
       's3.dt.user2': '顺便记进这季度复盘',
       's3.dt.done2': '✓ 已追加到 notes/review-2026Q1.md，含本次操作明细。',
       's3.dt.input': '输入消息…',
       's3.ph.sep0': '刚才 · 在桌面',
-      's3.ph.m0': '组合偏离 2 项，再平衡建议已存档',
+      's3.ph.m0': '组合偏离 2 项，再平衡建议已写入工作区',
       's3.ph.m0b': '全球股票超配 2%，建议转入债券补回',
       's3.ph.sep1': '5 分钟后 · 地铁上',
       's3.ph.m1': '按目标比例，把约 2% 仓位从股票转入债券',
@@ -2953,33 +2877,33 @@
 
       's4.label': 'SCENE 4 · 定时任务',
       's4.h2': '常用 prompt，<br><span class="hl">定时自动跑</span>。',
-      's4.lead': '把常跑的 prompt 存成每天 / 每周 / 一次性任务，到点 Muse 自动读归档、跑工具、出结果，任务完成推送手机通知。',
-      's4.micro': '每天早上 8 点 · 自动读归档 · 结果推送到手机 · 无需打开浏览器',
+      's4.lead': '把常跑的 prompt 存成每天 / 每周 / 一次性任务，到点 Muse 自动读取所选工作区、运行工具、产出结果，任务完成后推送手机通知。',
+      's4.micro': '每天早上 8 点 · 自动读取工作区 · 结果推送到手机 · 无需打开浏览器',
       's4.lock.date': '周一 · 5 月 26 日',
       's4.lock.cad1': '每天',
       's4.lock.time': '1 分钟前',
-      's4.lock.title': '每日投资研判',
-      's4.lock.body': '已读 投资/ 持仓 + 今日行情：组合偏离 1.8%，未触发再平衡；2 个关注点已记进 watchlist。',
+      's4.lock.title': '每日项目巡检',
+      's4.lock.body': '已检查当前工作区：CI 全部通过；发现 2 个待处理告警，已写入 reports/daily-check.md。',
       's4.lock.cad2': '每周',
       's4.lock.time2': '9 分钟前',
-      's4.lock.title2': '本周待办提醒',
-      's4.lock.body2': '本周 3 项待办：① 季度复盘待写 ② 1 份保险月底到期 ③ 上次调仓建议待确认。',
+      's4.lock.title2': '本周项目待办',
+      's4.lock.body2': '本周 3 项待办：① 处理 2 个 issue ② 更新部署文档 ③ 检查依赖升级。',
 
       'why.label': 'WHY MUSELAB',
-      'why.h2': '告别语义丢失<br>muselab 让文件直接成为<span class="hl">能读能写</span>的活档案。',
+      'why.h2': '不只检索片段——<br>muselab 让 Agent 直接在本地工作区<span class="hl">读取、执行、写回</span>。',
       'why.lead': 'RAG 先切片、再向量化、最后检索——每一步都在丢语义。muselab 中原文件就是上下文，agent 直接读写，零语义损失。',
       'why.c1.t': '不向量化',
       'why.c1.d': '原始文件就是上下文。不切片、不上云、不丢失语义。你随时能用文件管理器直接打开。',
       'why.c2.t': '越用越准',
-      'why.c2.d': '归档只增不减。存得越多，每次回答的起点越高。不是每次清零的会话，而是持续积累的上下文。',
+      'why.c2.d': '工作区中的代码、文档和成果持续积累。切换回来时，Agent 仍从同一份真实文件和会话上下文继续工作。',
       'why.c3.t': '全程本地',
       'why.c3.d': '自托管、零遥测、MIT 开源。文件在你的磁盘上，密钥在你的 .env 里，没有云端副本。',
       'why.cmplink': '和 LobeChat / AnythingLLM / Claude Code 有什么不同？→ 详细对比表',
 
       'caps.label': 'CAPABILITIES',
       'caps.h2': '不只是聊天框，<br>是<span class="hl">完整的 agent 能力</span>。',
-      'caps.capture.t': '拍照落档',
-      'caps.capture.d': '白板、收据、截图发给 Muse，它读图、提取要点，写成笔记——一张照片就是下次的上下文。',
+      'caps.capture.t': '图片转工作区笔记',
+      'caps.capture.d': '把白板、界面截图或图表发给 Muse，它会读图、提取要点，并把结构化笔记写进当前工作区。',
       'caps.diff.t': '红绿 diff',
       'caps.diff.d': '每次 Edit / Write，气泡里直接渲染 inline diff——绿加红减，看完再决定，不用切到 git。',
       'caps.sched.t': '定时任务',
@@ -2990,8 +2914,8 @@
       'caps.queue.d': '回答还在进行时就能接着发下一条，当前轮结束后自动按序发出。刷新不丢，多标签页同步。',
       'caps.plan.t': 'Plan 模式',
       'caps.plan.d': '复杂任务先列计划再执行——Muse 给出步骤，经你批准才动手。',
-      'caps.skills.t': 'Skills · 11 个预置技能包',
-      'caps.skills.d': '模型按任务自动选用——web-search、code-reviewer、csv-analyzer、pptx、translate…… 放一个 <span class="kbd">SKILL.md</span> 进目录，就能加你自己的。',
+      'caps.skills.t': 'Skills · 动态发现你的能力包',
+      'caps.skills.d': '模型按任务自动选用用户、workspace、plugin 和经审核生成的 Skills；放一个 <span class="kbd">SKILL.md</span> 到可发现目录，就能扩展自己的工作流。',
       'caps.mcp.t': 'MCP · 接外部工具与数据源',
       'caps.mcp.d': '通过 Model Context Protocol 接入 filesystem、git、fetch、memory、time 等 server，能力随开放生态持续扩展。',
       'caps.subagent.t': 'Subagent · 拆分子任务并行',
@@ -3007,13 +2931,13 @@
       'models.opt.new': '+ 新建 provider…',
 
       'compare.label': 'HOW IT COMPARES',
-      'compare.h2': '归档之于 muselab，<br>犹如<span class="hl">代码库</span>之于 Claude Code。',
-      'compare.lead': '不是 IDE，不是 RAG，不是插件市场——而是把私人档案当作直接上下文的 AI 工作台。',
+      'compare.h2': '工作区之于 muselab，<br>就是 Agent <span class="hl">执行任务</span>的完整现场。',
+      'compare.lead': '不是只聊天，也不只是 RAG——它把本地目录、会话、终端和成果预览整合成一个可切换的 Agent 工作台。',
       'compare.r1': 'Self-hosted',
       'compare.r2': 'Full agent SDK · all models',
       'compare.r2.lobe': 'chat only', 'compare.r2.any': 'RAG focus', 'compare.r2.ccui': 'Claude only', 'compare.r2.cc': 'Claude only',
       'compare.r3': 'Reuse Claude Pro sub',
-      'compare.r4': 'Archive as 1st-class context',
+      'compare.r4': 'Local workspace as context',
       'compare.r4.any': 'vectorized', 'compare.r4.ccui': 'codebase', 'compare.r4.cc': 'codebase',
       'compare.r5': 'Mobile PWA + push',
       'compare.r5.ccui': 'resp',
@@ -3042,25 +2966,25 @@
       'faq.label': 'FAQ',
       'faq.h2': '开工前，<br>你可能想问的<span class="hl">几件事</span>。',
       'faq.q1': '和 ChatGPT / Claude 网页版有什么不同？',
-      'faq.a1': '网页版是通用聊天，每次对话从零开始。muselab 把你机器上的原文件当成持久上下文——体检报告、投资记录、笔记都在里面，跨对话、跨领域随时调用。而且模型可换、引擎可改、数据不出本机。',
+      'faq.a1': '网页版是通用聊天，每次对话从零开始。muselab 让 Agent 直接在你选择的本地工作区里读写文件、运行终端、生成成果，并让会话持续绑定正确目录。模型可换、引擎可改、数据仍由你掌控。',
       'faq.q2': '需要 API key 吗？',
       'faq.a2': 'Claude 走一次 <span class="kbd">claude login</span> 的 OAuth，复用你的 Pro / Max 订阅，无需 API key，也不按 token 另计费。其他七家在设置里各填自己的 API key。',
       'faq.q3': '我的数据存在哪？',
-      'faq.a3': '全部在你的机器上：archive 是一个本地目录，对话记录是本地 JSONL 文件。没有云端副本，没有第三方账号，没有数据搬运。',
+      'faq.a3': '全部在你的机器上：工作区是你选择的本地目录，对话记录是本地 JSONL 文件。没有 muselab 托管的云端副本，也不要求第三方 muselab 账号。',
       'faq.q4': '需要什么硬件？能跑在 NAS / 树莓派上吗？',
       'faq.a4': 'muselab 本身很轻——它只是一个 HTTP 服务 + agent loop，计算全在云端模型侧。任何能跑 Python 3.10+ 的机器都行：笔记本、Mac mini、NAS、树莓派 4（4GB+）。',
       'faq.q5': '效果和 Claude Code 比怎么样？',
-      'faq.a5': '底层都是 Claude Agent SDK，agent 能力完全一致。区别在于 Claude Code 的上下文是代码仓库，muselab 的上下文是你的私人归档——面向的场景不同，引擎相同。',
+      'faq.a5': '两者都使用 Agent SDK 能力。Claude Code 更贴近终端与代码开发；muselab 把可切换工作区、文件、会话、预览、多端访问和定时任务放在同一个 Web 工作台里。',
       'faq.q6': '怎么升级和卸载？',
-      'faq.a6': '升级跑 <span class="kbd">upgrade.sh</span>，卸载跑 <span class="kbd">uninstall-linux.sh</span> / <span class="kbd">uninstall-macos.sh</span>。卸载只移除系统服务——你的 <span class="kbd">.env</span>、对话记录和 archive 文件原样保留。',
+      'faq.a6': '升级跑 <span class="kbd">upgrade.sh</span>，卸载跑 <span class="kbd">uninstall-linux.sh</span> / <span class="kbd">uninstall-macos.sh</span>。卸载只移除系统服务——你的 <span class="kbd">.env</span>、对话记录和工作区文件原样保留。',
 
       'footer.tag': '9 位缪斯 · 1 个 Muse · 你自己的 muselab',
       'footer.quickstart': 'Quick start',
       'footer.security': 'Security'
     },
     en: {
-      'doc.title': 'muselab · self-hosted multi-model AI workspace',
-      'doc.desc': 'muselab — a self-hosted, multi-model AI workspace. Point it at a directory on your machine and the raw files inside become the AI’s context — no cloud, no vectorizing.',
+      'doc.title': 'muselab · self-hosted multi-model Agent workbench',
+      'doc.desc': 'muselab — a self-hosted, multi-model Agent workbench where files, sessions, previews, and terminals stay aligned with the active local workspace.',
 
       'nav.usecases': 'Use cases',
       'nav.why': 'Why',
@@ -3070,64 +2994,62 @@
 
       'hero.pill': 'Open source · MIT · self-hosted',
       'hero.h1': 'Your folder is<br>the AI’s <span class="hl">workbench</span>.',
-      'hero.claim': 'Career plans, checkups, investments, family info —<br>drop them all in one folder and Muse <span class="hl">remembers the lot</span>, ready to answer across domains.',
-      'hero.sub': 'A self-hosted, multi-model AI workspace. Raw files are the context — no cloud, no chunking, no vectorizing. Models from eight vendors share one agent loop, all running on your own machine.',
+      'hero.claim': 'Choose any local directory and Muse can <span class="hl">read, run, and create</span> inside it —<br>switching workspaces switches the Agent’s complete context.',
+      'hero.sub': 'A self-hosted, multi-model Agent workspace. Files, sessions, previews, and terminals stay aligned with the active workspace; models from eight vendors share one agent loop on your own machine.',
       'hero.cta': '→ Install in one line',
       'hero.star': 'Star on GitHub',
       'hero.copy': 'Copy',
       'hero.shot.cap': 'Reports, tables and charts render live — one session across your devices',
-      'hero.shot.desktop.alt': 'muselab desktop three-pane UI: file tree, chat, live preview pane',
-      'hero.shot.mobile.alt': 'muselab mobile single-column render, same session continued',
+      'hero.shot.light.alt': 'muselab mobile light-theme preview',
+      'hero.shot.dark.alt': 'muselab mobile dark-theme preview',
 
       'scenes.label': 'WHAT IT DOES',
-      'scenes.h2': 'Across domains, generating, multi-device, scheduled —<br>four scenes to get muselab.',
-      'demo.org.cap': '<strong>Onboarding:</strong> drag checkups, policies, and assorted records into the archive — Muse files them into health / money / notes / work and writes a README. An empty folder becomes a structured workspace in seconds.',
-      'demo.travel.cap': '<strong>Recall:</strong> ask Muse to plan a week in Sanya — it pulls passport validity, budget, and notes from across the archive and lays out a full, budgeted itinerary.',
+      'scenes.h2': 'Multiple workspaces, artifact creation, multi-device, scheduled —<br>four scenes to get muselab.',
 
-      's1.label': 'SCENE 1 · CROSS-DOMAIN',
-      's1.h2': 'One sentence,<br>and it makes <span class="hl">cross-domain decisions</span>.',
-      's1.lead': 'Investing, travel, notes — all in one archive. Ask “a week in Kansai next month, can I afford it?” and Muse searches the whole archive, pulls the relevant files across folders, and answers in one pass.',
-      's1.micro': 'One question, many folders · relevant files gathered automatically · the fuller the archive, the sharper the answer',
+      's1.label': 'SCENE 1 · MULTIPLE WORKSPACES',
+      's1.h2': 'Switch directories,<br>switch the complete <span class="hl">Agent context</span>.',
+      's1.lead': 'Register codebases, research folders, and operations material as separate workspaces. The file tree, sessions, preview, and terminal cwd switch together, so the Agent always works in the right directory.',
+      's1.micro': 'Workspace isolation · sessions bound to cwd · files and terminal switch together',
       's1.mock.title': 'chat · cross-folder',
-      's1.mock.user': 'A week in Kansai next month — is ¥20k enough? While you’re at it, sort out the itinerary and what to pack.',
+      's1.mock.user': 'Review the latest changes in this project, identify risks, and run the relevant tests.',
       's1.mock.think': 'Thinking · 14s',
-      's1.mock.t1': 'Budget can’t be a guess — start by pulling everything “Kansai”-related from the whole archive',
-      's1.mock.grep': 'whole archive · “Kansai”',
+      's1.mock.t1': 'First confirm workspace rules and the change scope, then trace the affected call paths',
+      's1.mock.grep': 'current workspace · changed symbols',
       's1.mock.grepmeta': '4 hits',
-      's1.mock.t2': 'Hits land in <span class="tk-ok">Travel/ · Investing/ · Notes/</span> — three folders',
-      's1.mock.r1': 'Travel/kansai-itinerary.md · Travel/flights-hotels.md',
-      's1.mock.r2': 'Investing/holdings.csv',
-      's1.mock.r3': 'Notes/japanese-phrases.md',
-      's1.mock.rhead': 'answer · across 4 folders · sample data',
-      's1.mock.rh2': '## Kansai week · sorted in one go',
-      's1.mock.rbody': 'Budget: cash position <strong>¥100,000</strong>, est. <strong>¥18,600</strong> this trip = 19% → just redeem the money-market fund ✓<br>Itinerary: 6 days / 5 nights, Osaka → Kyoto → Nara → Osaka<br>Transit: ICOCA + 3-day Kansai pass<br>Food: 6 spots ordered along the route···',
+      's1.mock.t2': 'Changes span <span class="tk-ok">backend/ · frontend/ · tests/</span>',
+      's1.mock.r1': 'backend/workspaces.py · frontend/app.js',
+      's1.mock.r2': 'tests/test_workspaces.py',
+      's1.mock.r3': 'AGENTS.md',
+      's1.mock.rhead': 'review result · 3 directories · relevant tests run',
+      's1.mock.rh2': '## Workspace switching · review complete',
+      's1.mock.rbody': 'Scope: backend parsing, frontend state, and regression tests across <strong>3</strong> layers<br>Risk: found <strong>1</strong> stale-state writeback window and located the fix<br>Validation: 27 targeted tests passed ✓<br>Conclusion: ready to proceed while retaining legacy-field compatibility for one release',
 
       's2.label': 'SCENE 2 · CREATE',
       's2.h2': 'Not just chat — Muse <span class="hl">generates</span> new reports, charts, and insights.',
-      's2.lead': 'Hand it a checkup PDF: Muse reads it in full, flags out-of-range markers, picks supplements by mechanism, then generates an archivable HTML report — landed back in the archive as context for next time.',
-      's2.micro': 'read data → produce → back into the archive · revise in one line · WYSIWYG',
-      's2.mock.title': 'chat · supplement plan',
-      's2.mock.user': 'Based on my checkup, draft a supplement plan I can file away',
+      's2.lead': 'Let the Agent read source code, test output, or business data, call a Skill to create a shareable HTML report, and write it straight into the current workspace for instant preview.',
+      's2.micro': 'read → run → create an artifact · revise in one line · WYSIWYG',
+      's2.mock.title': 'chat · quality report',
+      's2.mock.user': 'Read the test results and create a shareable project quality report.',
       's2.mock.think': 'Thinking · 23s',
-      's2.mock.t1': 'First read through the checkup PDF, locating markers outside the reference range',
-      's2.mock.read': 'Health/2026-checkup.pdf',
-      's2.mock.readmeta': '~8 pages',
-      's2.mock.t2': '5 out-of-range markers, pick a supplement per mechanism: <span class="tk-flag">25-OH-D low</span>→D₃, <span class="tk-flag">triglycerides high</span>→Omega-3, low Mg→Mg glycinate; D₃ pairs with K₂ for calcium, zinc competes with iron/copper → space from meals, each checked within the upper limit (UL)',
-      's2.mock.t3': 'Lay out supplement / dose / timing / basis as an archivable HTML, back into the archive',
-      's2.mock.write': 'supplement-plan.html',
-      's2.mock.rhead': 'supplement-plan.html · rendered · sample data',
-      's2.col.sup': 'Supplement',
-      's2.col.dose': 'Dose',
-      's2.col.time': 'Timing',
-      's2.col.basis': 'Basis',
-      's2.row1.n': 'Vitamin D₃', 's2.row1.t': 'with meal', 's2.row1.b': '25-OH-D low',
-      's2.row2.n': 'Omega-3', 's2.row2.t': 'with meal', 's2.row2.b': 'triglycerides high',
-      's2.row3.n': 'Mg glycinate', 's2.row3.t': 'before bed', 's2.row3.b': 'low Mg intake',
-      's2.mock.foot': 'From out-of-range markers only · doses & contraindications: consult a doctor',
+      's2.mock.t1': 'First read the structured test output and verify pass rate, duration, and coverage',
+      's2.mock.read': 'reports/test-results.json',
+      's2.mock.readmeta': '3 test suites',
+      's2.mock.t2': 'All three suites pass; extract slow tests, low-coverage modules, and critical paths into actionable findings',
+      's2.mock.t3': 'Lay out pass rate, duration, coverage, and recommendations as a single HTML file in the workspace',
+      's2.mock.write': 'reports/quality-report.html',
+      's2.mock.rhead': 'quality-report.html · rendered · sample data',
+      's2.col.sup': 'Suite',
+      's2.col.dose': 'Result',
+      's2.col.time': 'Duration',
+      's2.col.basis': 'Coverage',
+      's2.row1.n': 'Backend', 's2.row1.t': '4m 20s', 's2.row1.b': '86%',
+      's2.row2.n': 'Frontend', 's2.row2.t': '11s', 's2.row2.b': '91%',
+      's2.row3.n': 'E2E', 's2.row3.t': '1m 54s', 's2.row3.b': 'critical flows',
+      's2.mock.foot': 'All required checks passed · 2 coverage improvement suggestions',
 
       's3.label': 'SCENE 3 · MULTI-DEVICE',
       's3.h2': 'Start on desktop,<br><span class="hl">keep going</span> on your phone.',
-      's3.lead': 'Same server, same session, same archive, all your devices in one conversation.',
+      's3.lead': 'Same server, same session, same workspace — continue seamlessly across devices.',
       's3.dt.fileshead': '▣ Files',
       's3.dt.synced': '● Synced',
       's3.dt.ph2': 'Rebalance plan · 2026 Q2',
@@ -3145,14 +3067,14 @@
       's3.dt.pfoot': 'Source: holdings.md · updated today',
       's3.dt.user': 'Check if my portfolio has drifted — do I need to rebalance?',
       's3.dt.think': '▾ Thinking · 18s',
-      's3.dt.plan': '① Read holdings + latest prices<br>② Compute drift vs target allocation<br>③ Write the rebalance plan back to the archive',
+      's3.dt.plan': '① Read holdings + latest prices<br>② Compute drift vs target allocation<br>③ Write the rebalance plan back to the workspace',
       's3.dt.tr2': 'Price snapshot · today',
       's3.dt.done': '✓ rebalance-2026Q2.md is ready. Keep asking on the subway.',
       's3.dt.user2': 'Also log it into this quarter\'s review',
       's3.dt.done2': '✓ Appended to notes/review-2026Q1.md with the full rebalance detail.',
       's3.dt.input': 'Message…',
       's3.ph.sep0': 'Just now · on desktop',
-      's3.ph.m0': 'Portfolio drifted on 2 holdings, rebalance plan filed',
+      's3.ph.m0': 'Portfolio drifted on 2 holdings; plan written to the workspace',
       's3.ph.m0b': 'Global equities 2% overweight — shift into bonds to fix it',
       's3.ph.sep1': '5 min later · on the subway',
       's3.ph.m1': 'To hit target, move about 2% from equities into bonds',
@@ -3165,33 +3087,33 @@
 
       's4.label': 'SCENE 4 · SCHEDULED',
       's4.h2': 'Your go-to prompts,<br><span class="hl">run on a schedule</span>.',
-      's4.lead': 'Save a recurring prompt as a daily / weekly / one-off task; at the set time Muse reads the archive, runs its tools and produces a result, then pushes a notification to your phone.',
-      's4.micro': '8 a.m. daily · reads the archive automatically · result pushed to your phone · no browser needed',
+      's4.lead': 'Save a recurring prompt as a daily / weekly / one-off task; at the set time Muse reads the selected workspace, runs its tools, produces a result, and pushes a notification to your phone.',
+      's4.micro': '8 a.m. daily · reads the workspace automatically · result pushed to your phone · no browser needed',
       's4.lock.date': 'Monday, May 26',
       's4.lock.cad1': 'Daily',
       's4.lock.time': '1 min ago',
-      's4.lock.title': 'Daily market read',
-      's4.lock.body': 'Read investing/ holdings + today\'s prices: portfolio drift 1.8%, no rebalance triggered; 2 watch items logged to watchlist.',
+      's4.lock.title': 'Daily project check',
+      's4.lock.body': 'Checked the current workspace: CI passed; 2 warnings need attention and were written to reports/daily-check.md.',
       's4.lock.cad2': 'Weekly',
       's4.lock.time2': '9 min ago',
-      's4.lock.title2': 'This week\'s to-dos',
-      's4.lock.body2': '3 to-dos this week: ① quarterly review to write ② 1 policy expiring end of month ③ last rebalance to confirm.',
+      's4.lock.title2': 'This week\'s project tasks',
+      's4.lock.body2': '3 tasks this week: ① resolve 2 issues ② update deployment docs ③ review dependency upgrades.',
 
       'why.label': 'WHY MUSELAB',
-      'why.h2': 'No semantic loss —<br>muselab turns files into a living archive the agent <span class="hl">reads and writes</span> directly.',
+      'why.h2': 'Beyond retrieved snippets —<br>muselab lets the Agent <span class="hl">read, run, and write back</span> in a local workspace.',
       'why.lead': 'RAG chunks, vectorizes, then retrieves — losing meaning at every step. In muselab the raw file is the context; the agent reads and writes it directly, zero semantic loss.',
       'why.c1.t': 'No vectorizing',
       'why.c1.d': 'The raw file is the context. No chunking, no cloud, no lost meaning. Open it in your file manager anytime.',
       'why.c2.t': 'Sharper over time',
-      'why.c2.d': 'The archive only grows. The more you store, the higher every answer starts — context that compounds, not a session that resets each time.',
+      'why.c2.d': 'Code, documents, and artifacts keep accumulating in the workspace. Return later and the Agent continues from the same real files and session context.',
       'why.c3.t': 'Fully local',
       'why.c3.d': 'Self-hosted, zero telemetry, MIT open source. Files stay on your disk, keys stay in your .env, no cloud copy.',
       'why.cmplink': 'How is it different from LobeChat / AnythingLLM / Claude Code? → Full comparison',
 
       'caps.label': 'CAPABILITIES',
       'caps.h2': 'Not just a chat box —<br>a <span class="hl">complete agent</span>.',
-      'caps.capture.t': 'Snap to archive',
-      'caps.capture.d': 'Send whiteboards, receipts, screenshots to Muse — it reads the image, pulls the key points and writes a note. One photo becomes context for the next answer.',
+      'caps.capture.t': 'Image to workspace note',
+      'caps.capture.d': 'Send a whiteboard, UI screenshot, or chart to Muse — it reads the image, extracts the key points, and writes a structured note into the current workspace.',
       'caps.diff.t': 'Red/green diff',
       'caps.diff.d': 'Every Edit / Write renders an inline diff right in the bubble — green adds, red removes. Decide after you see it, no switching to git.',
       'caps.sched.t': 'Scheduled tasks',
@@ -3202,8 +3124,8 @@
       'caps.queue.d': 'Queue the next message while an answer is still streaming — it fires in order once the current turn ends. Survives a refresh, syncs across tabs.',
       'caps.plan.t': 'Plan mode',
       'caps.plan.d': 'Complex tasks get a plan first — Muse lays out the steps and executes only after you approve.',
-      'caps.skills.t': 'Skills · 11 preset packs',
-      'caps.skills.d': 'The model picks them per task — web-search, code-reviewer, csv-analyzer, pptx, translate… drop a <span class="kbd">SKILL.md</span> into a folder to add your own.',
+      'caps.skills.t': 'Skills · dynamically discovered',
+      'caps.skills.d': 'The model picks user, workspace, plugin, and reviewed generated Skills per task — add a <span class="kbd">SKILL.md</span> to a discoverable location to extend your workflows.',
       'caps.mcp.t': 'MCP · external tools & data',
       'caps.mcp.d': 'Through the Model Context Protocol, plug in filesystem, git, fetch, memory, time and other servers — capabilities grow with the open ecosystem.',
       'caps.subagent.t': 'Subagent · split & parallelize',
@@ -3219,13 +3141,13 @@
       'models.opt.new': '+ New provider…',
 
       'compare.label': 'HOW IT COMPARES',
-      'compare.h2': 'The archive is to muselab<br>what the <span class="hl">codebase</span> is to Claude Code.',
-      'compare.lead': 'Not an IDE, not RAG, not a plugin marketplace — an AI workspace that treats your private archive as first-class context.',
+      'compare.h2': 'A workspace is the complete scene<br>where the Agent <span class="hl">gets work done</span>.',
+      'compare.lead': 'Not just chat and not just RAG — muselab combines local directories, sessions, terminals, and artifact previews in one switchable Agent workspace.',
       'compare.r1': 'Self-hosted',
       'compare.r2': 'Full agent SDK · all models',
       'compare.r2.lobe': 'chat only', 'compare.r2.any': 'RAG focus', 'compare.r2.ccui': 'Claude only', 'compare.r2.cc': 'Claude only',
       'compare.r3': 'Reuse Claude Pro sub',
-      'compare.r4': 'Archive as 1st-class context',
+      'compare.r4': 'Local workspace as context',
       'compare.r4.any': 'vectorized', 'compare.r4.ccui': 'codebase', 'compare.r4.cc': 'codebase',
       'compare.r5': 'Mobile PWA + push',
       'compare.r5.ccui': 'resp',
@@ -3254,17 +3176,17 @@
       'faq.label': 'FAQ',
       'faq.h2': 'Before you start,<br>a <span class="hl">few things</span> you might ask.',
       'faq.q1': 'How is this different from the ChatGPT / Claude web app?',
-      'faq.a1': 'The web apps are general chat, starting from zero each time. muselab treats the raw files on your machine as persistent context — checkups, holdings, notes all live there, called on across conversations and domains. And the model is swappable, the engine is editable, and your data never leaves your machine.',
+      'faq.a1': 'Web apps are general chat and start from zero each time. muselab lets an Agent read and write files, run a terminal, and create artifacts inside the local workspace you select, while sessions remain bound to the right directory. Models are swappable, the engine is editable, and you retain control of the data.',
       'faq.q2': 'Do I need an API key?',
       'faq.a2': 'Claude uses a one-time <span class="kbd">claude login</span> OAuth and reuses your Pro / Max subscription — no API key, no per-token billing. The other seven each take their own API key in settings.',
       'faq.q3': 'Where is my data stored?',
-      'faq.a3': 'All on your machine: the archive is a local directory, chat history is local JSONL files. No cloud copy, no third-party account, no data shipping.',
+      'faq.a3': 'All on your machine: workspaces are local directories you select, and chat history is stored as local JSONL files. muselab hosts no cloud copy and requires no third-party muselab account.',
       'faq.q4': 'What hardware do I need? Can it run on a NAS / Raspberry Pi?',
       'faq.a4': 'muselab itself is light — just an HTTP service + agent loop, with all compute on the cloud model side. Anything that runs Python 3.10+ works: a laptop, a Mac mini, a NAS, a Raspberry Pi 4 (4GB+).',
       'faq.q5': 'How does it compare to Claude Code?',
-      'faq.a5': 'Both run on the Claude Agent SDK, so agent capabilities are identical. The difference is context: Claude Code’s is a codebase, muselab’s is your private archive — different use case, same engine.',
+      'faq.a5': 'Both use Agent SDK capabilities. Claude Code stays close to terminals and coding; muselab combines switchable workspaces, files, sessions, previews, multi-device access, and scheduled tasks in one web workbench.',
       'faq.q6': 'How do I upgrade and uninstall?',
-      'faq.a6': 'Upgrade with <span class="kbd">upgrade.sh</span>, uninstall with <span class="kbd">uninstall-linux.sh</span> / <span class="kbd">uninstall-macos.sh</span>. Uninstall only removes the system service — your <span class="kbd">.env</span>, chat history and archive files stay as-is.',
+      'faq.a6': 'Upgrade with <span class="kbd">upgrade.sh</span>, uninstall with <span class="kbd">uninstall-linux.sh</span> / <span class="kbd">uninstall-macos.sh</span>. Uninstall only removes the system service — your <span class="kbd">.env</span>, chat history, and workspace files stay as-is.',
 
       'footer.tag': '9 Muses · 1 Muse · your own muselab',
       'footer.quickstart': 'Quick start',

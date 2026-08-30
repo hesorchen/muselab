@@ -23,7 +23,7 @@ v2 (2026-06-12): per-device records with an explicit hidden signal.
   before the beacon got out — a stale visible record then expires after
   GRACE_SECONDS instead of suppressing pushes forever.
 
-This is a single-user app (one MUSELAB_TOKEN, one archive), so a small
+This is a single-user app (one MUSELAB_TOKEN, one primary workspace), so a small
 device_id-keyed dict is enough — device_id is a random UUID the frontend
 mints once into localStorage, purely to tell records apart; it carries
 no auth meaning. Old clients that POST without a body land on the
