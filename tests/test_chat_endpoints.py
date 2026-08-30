@@ -438,6 +438,50 @@ def test_interrupt_rejects_stale_turn_before_touching_client_or_queue(
         current.close()
 
 
+@pytest.mark.asyncio
+async def test_interrupt_rechecks_exact_owner_after_queue_pause(
+        chat_mod, monkeypatch):
+    sid = "sid-stop-owner-race"
+    sdk_client = _seed(
+        chat_mod, (sid, "claude-sonnet-4-6", "auto", ""))
+    old = chat_mod.TurnBroadcast(sid)
+    replacement = chat_mod.TurnBroadcast(sid)
+    chat_mod._active_turns[sid] = old
+    pause_entered = threading.Event()
+    release_pause = threading.Event()
+
+    def blocked_pause(_sid):
+        pause_entered.set()
+        assert release_pause.wait(1)
+        return {"items": [], "paused": False}
+
+    monkeypatch.setattr(
+        chat_mod.sess, "pause_queue_if_nonempty", blocked_pause)
+    try:
+        stop_task = asyncio.create_task(
+            chat_mod.interrupt(sid, turn_id=old.turn_id))
+        assert await asyncio.to_thread(pause_entered.wait, 1)
+
+        # Model the old pump finishing and a successor taking the same session
+        # while the queue pause is in flight. The delayed Stop belongs only to
+        # `old`; its pooled runtime snapshot must never reach `replacement`.
+        chat_mod._active_turns[sid] = replacement
+        release_pause.set()
+        response = await asyncio.wait_for(stop_task, timeout=1)
+
+        assert response["stale"] is True
+        assert response["requested_turn_id"] == old.turn_id
+        assert response["current_turn_id"] == replacement.turn_id
+        assert sdk_client.interrupted is False
+        assert replacement.cancelled is False
+        assert (sid, old.turn_id) not in chat_mod._pending_interrupts
+    finally:
+        release_pause.set()
+        chat_mod._active_turns.pop(sid, None)
+        old.close()
+        replacement.close()
+
+
 def test_interrupt_swallows_sdk_error_but_still_marks_pending(chat_mod, client):
     """If client.interrupt() raises, the route must not 500 — it logs and
     returns ok with that client omitted from `interrupted`. Pending flag

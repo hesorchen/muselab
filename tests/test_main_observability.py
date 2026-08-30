@@ -182,6 +182,10 @@ def test_session_rename_client_perf_is_strict_and_title_free(
     app_module, client, monkeypatch,
 ):
     events = []
+    # This test owns the client-side event contract.  Keep an incidentally
+    # slow TestClient request from adding the independent http.request event
+    # to the same monkeypatched sink on loaded CI workers.
+    monkeypatch.setattr(app_module, "_perf_enabled", lambda: False)
     monkeypatch.setattr(
         app_module, "perf_event",
         lambda event, **fields: events.append((event, fields)),

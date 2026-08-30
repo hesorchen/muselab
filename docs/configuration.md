@@ -9,7 +9,7 @@ muselab configuration has four layers. Not every setting belongs in `.env`:
 3. **Durable runtime state:** sessions, scheduler, Activity, Push, and image-generation jobs.
 4. **Browser preferences:** language, layout, open tabs, and other local UI state.
 
-Restart after editing `.env` manually. Provider keys, default model, and default permission saved in Settings are written atomically to the file selected by `MUSELAB_ENV_PATH` and to the current process, so they normally apply without restart. The UI does not expose the token, root directory, or bind address.
+Restart after editing `.env` manually. Provider keys, default model, default permission, and busy-send behavior saved in Settings are written atomically to the file selected by `MUSELAB_ENV_PATH` and to the current process, so they normally apply without restart. The UI does not expose the token, root directory, or bind address.
 
 ## Required and network settings
 
@@ -25,6 +25,7 @@ Restart after editing `.env` manually. Provider keys, default model, and default
 | `MUSELAB_MODEL` | Default model for new sessions; the built-in Claude default is effective when unset | `claude-sonnet-4-6` |
 | `MUSELAB_DEFAULT_MODEL` | Settings-managed default, synchronized with `MUSELAB_MODEL` | `claude-sonnet-4-6` |
 | `MUSELAB_DEFAULT_PERMISSION` | Default SDK permission mode | `bypassPermissions` |
+| `MUSELAB_BUSY_SEND_MODE` | Busy-session send behavior: `adjust` steers the current task at the next safe tool boundary; `queue` waits for the current turn to finish | `adjust` |
 | `MUSELAB_MEMORY_DIR` | Optional long-term-memory Registry/config directory | `$MUSELAB_ROOT/.muselab/memory` |
 
 `MUSELAB_ROOT` must exist. System-level roots such as `/`, `/etc`, `/root`, `/home`, `/var`, `/usr`, and `/boot` are rejected. A user's own home directory or a directory beneath it is allowed. Older documentation called this the archive root; the environment-variable name remains compatible, while the product concept is now the primary workspace.

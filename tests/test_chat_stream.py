@@ -1547,6 +1547,144 @@ def test_turn_response_boundary_accepts_lifecycle_and_uuid_less_error(stream_env
     assert boundary.classify(error_result) == "current_result"
 
 
+@pytest.mark.asyncio
+async def test_result_barrier_releases_after_two_concurrent_writes_fail(
+        stream_env, monkeypatch):
+    """Result waiting on A must include B when B registers during that wait."""
+    chat_mod = stream_env
+    from backend import sessions as sess
+
+    sid = sess.create_session(model="claude-sonnet-4-6")["id"]
+    main_written = asyncio.Event()
+    allow_result = asyncio.Event()
+    generator_resumed = asyncio.Event()
+    keep_generator_open = asyncio.Event()
+    fail_a = asyncio.Event()
+    fail_b = asyncio.Event()
+    write_lock = asyncio.Lock()
+
+    class RaceClient:
+        async def query(self, _prompt, session_id="default"):
+            main_written.set()
+
+        async def query_steering(
+            self, prompt, *, session_id, command_uuid,
+        ):
+            async with write_lock:
+                await (fail_a if prompt == "A" else fail_b).wait()
+                raise RuntimeError("synthetic steering write failure")
+
+        async def receive_response(self):
+            await allow_result.wait()
+            yield ResultMessage(
+                subtype="success",
+                duration_ms=1,
+                duration_api_ms=1,
+                is_error=False,
+                num_turns=1,
+                session_id=sid,
+                total_cost_usd=0.0,
+                usage={"input_tokens": 1, "output_tokens": 1},
+            )
+            # The old one-shot barrier deferred Result on B and then asked the
+            # iterator for another frame, where it could wait forever because
+            # B's failed write emitted no lifecycle message.
+            generator_resumed.set()
+            await keep_generator_open.wait()
+
+        async def get_context_usage(self):
+            return {"maxTokens": 200_000, "totalTokens": 10}
+
+    fake = RaceClient()
+
+    async def fake_get_client(*_args, **_kwargs):
+        return fake
+
+    async def wait_until(predicate, *, timeout=1):
+        deadline = asyncio.get_running_loop().time() + timeout
+        while not predicate():
+            if asyncio.get_running_loop().time() >= deadline:
+                raise AssertionError("condition did not become true")
+            await asyncio.sleep(0)
+
+    monkeypatch.setattr(chat_mod, "MuseLabSDKClient", RaceClient)
+    monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
+    monkeypatch.setattr(chat_mod, "_schedule_queue_drain", lambda _sid: None)
+    broadcast = None
+    first_task = None
+    second_task = None
+    try:
+        broadcast = await chat_mod._start_turn(
+            sid, "main", model="claude-sonnet-4-6")
+        await asyncio.wait_for(main_written.wait(), timeout=1)
+        await wait_until(lambda: broadcast.query_committed)
+
+        first_task = asyncio.create_task(chat_mod.enqueue_api(
+            sid,
+            chat_mod.QueueEnqueueReq(
+                text="A",
+                delivery="adjust",
+                active_turn_id=broadcast.turn_id,
+            ),
+            chat_mod.BackgroundTasks(),
+        ))
+        await wait_until(lambda: len(broadcast.steering_commands) == 1)
+        allow_result.set()
+        await asyncio.sleep(0)
+
+        second_task = asyncio.create_task(chat_mod.enqueue_api(
+            sid,
+            chat_mod.QueueEnqueueReq(
+                text="B",
+                delivery="adjust",
+                active_turn_id=broadcast.turn_id,
+            ),
+            chat_mod.BackgroundTasks(),
+        ))
+        await wait_until(lambda: len(broadcast.steering_commands) == 2)
+
+        fail_a.set()
+        first_response = await asyncio.wait_for(first_task, timeout=1)
+        assert first_response["effective_delivery"] == "queue"
+        assert broadcast.result_forwarded is False
+        assert broadcast.task.done() is False
+
+        fail_b.set()
+        second_response = await asyncio.wait_for(second_task, timeout=1)
+        assert second_response["effective_delivery"] == "queue"
+        await asyncio.wait_for(broadcast.task, timeout=2)
+
+        assert broadcast.steering_commands == {}
+        assert broadcast.steering_write_events == {}
+        assert broadcast.result_forwarded is True
+        assert generator_resumed.is_set() is False
+        assert any(
+            event.get("event") == "done"
+            for event in broadcast.replay_events()
+        )
+    finally:
+        fail_a.set()
+        fail_b.set()
+        keep_generator_open.set()
+        pending = [
+            task for task in (first_task, second_task)
+            if task is not None and not task.done()
+        ]
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        if (broadcast is not None and broadcast.task is not None
+                and not broadcast.task.done()):
+            broadcast.task.cancel()
+            await asyncio.gather(broadcast.task, return_exceptions=True)
+        chat_mod._active_turns.pop(sid, None)
+        recent = chat_mod._recent_turns.pop(sid, None)
+        if recent is not None:
+            recent.close()
+        sess.clear_queue(sid)
+
+
 def test_preflight_compact_failure_blocks_original_prompt(
         stream_env, client, monkeypatch, capsys):
     chat_mod = stream_env

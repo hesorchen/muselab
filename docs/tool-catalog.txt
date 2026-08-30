@@ -6,7 +6,6 @@ DesignSync
 Edit
 EnterWorktree
 ExitWorktree
-ListAgents
 Monitor
 NotebookEdit
 PushNotification
@@ -16,12 +15,9 @@ ScheduleWakeup
 SendMessage
 Skill
 Task
-TaskCreate
-TaskGet
-TaskList
 TaskOutput
 TaskStop
-TaskUpdate
+ToolSearch
 WebFetch
 WebSearch
 Workflow

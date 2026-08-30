@@ -6,10 +6,10 @@ muselab 通过**本地 Anthropic 兼容网关**支持 Codex 后端模型。网�
 
 muselab **不保存 Codex OAuth 凭据**，也**不直接调用 OpenAI 原生接口**。
 
-截至 2026-08-12，已验证的兼容基线是 CLIProxyAPI `v7.2.111`、Claude Agent
-SDK `0.2.136` 以及其内置 Claude CLI `2.1.228`。新版 CLIProxyAPI 对这条
-链路相关的 Codex 缓存 token 统计、reasoning effort、工具调用回放和
-Anthropic 响应转换都有修复。
+截至 2026-08-30，已验证的兼容基线是 CLIProxyAPI `v7.2.145`、Claude Agent
+SDK `0.2.148` 以及其内置 Claude CLI `2.1.251`。这套基线包含这条链路所需的
+Codex 缓存 token 统计、reasoning effort、工具调用回放和 Anthropic 响应
+转换修复。
 
 ```text
 muselab → Claude Agent SDK → Anthropic Messages 请求

@@ -72,6 +72,33 @@ def test_put_settings_rejects_non_sdk_permission_mode(client, auth):
     assert r.status_code == 422
 
 
+def test_busy_send_mode_defaults_validates_and_persists(
+        client, auth, monkeypatch, tmp_path):
+    from backend import api_settings as api_s
+
+    monkeypatch.delenv("MUSELAB_BUSY_SEND_MODE", raising=False)
+    current = client.get("/api/settings", headers=auth)
+    assert current.status_code == 200
+    assert current.json()["defaults"]["busy_send_mode"] == "adjust"
+
+    fake_env = tmp_path / ".env"
+    fake_env.write_text("MUSELAB_TOKEN=existing-test-token-1234567890\n")
+    monkeypatch.setattr(api_s, "ENV_PATH", fake_env)
+    saved = client.put(
+        "/api/settings", headers=auth, json={"busy_send_mode": "queue"},
+    )
+    assert saved.status_code == 200
+    assert saved.json()["updated"] == ["MUSELAB_BUSY_SEND_MODE"]
+    assert saved.json()["updated_count"] == 1
+    assert "MUSELAB_BUSY_SEND_MODE=queue" in fake_env.read_text()
+    assert os.environ["MUSELAB_BUSY_SEND_MODE"] == "queue"
+
+    invalid = client.put(
+        "/api/settings", headers=auth, json={"busy_send_mode": "interrupt"},
+    )
+    assert invalid.status_code == 422
+
+
 def test_put_settings_skips_empty_values(client, auth, monkeypatch, tmp_path):
     """Empty / None provider key = 'don't touch'; existing value preserved."""
     from backend import api_settings as api_s

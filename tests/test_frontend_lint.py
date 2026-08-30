@@ -2887,7 +2887,7 @@ def test_composer_disabled_state_covers_failures_without_blocking_durable_queue(
     css = (FRONTEND / "styles.css").read_text(encoding="utf-8")
     status_start = app.index("    composerStatusReason(sid = this.currentId) {")
     disabled_start = app.index("    composerDisabledReason(sid = this.currentId) {")
-    end = app.index("\n    sendButtonHint(sid) {", disabled_start)
+    end = app.index("\n    _busySendDelivery(sid", disabled_start)
     status = app[status_start:disabled_start]
     disabled = app[disabled_start:end]
 
@@ -2909,7 +2909,8 @@ def test_composer_disabled_state_covers_failures_without_blocking_durable_queue(
     assert ".streaming" not in disabled
     assert ".compacting" not in disabled
     assert "pendingQueue" not in disabled
-    assert 'this._isBusy(sid) ? this.t("queue.button_hint")' in app
+    assert 'return this._busySendDelivery(sid) === "adjust"' in app
+    assert 'this.t("queue.button_hint")' in app
     assert 'this._setComposerClaimPhase(sendState, composerSubmitToken, "queue")' in app
     assert 'this._setComposerClaimPhase(sendState, composerSubmitToken, "stream_start")' in app
     assert 'sourceState._composerSubmitPhase = "rollover"' in app
@@ -5494,6 +5495,78 @@ def test_turn_busy_race_falls_back_to_durable_queue():
         "await this._enqueueMessage(streamSid"
     )
     assert "this._removePaneMessage(streamState, sentUserBubble);" in busy
+
+
+def test_busy_send_mode_uses_authoritative_delivery_and_steering_state():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+
+    assert 'busySendMode: "adjust"' in app
+    assert 'busy_send_mode: "adjust"' in app
+    assert 'this._normalizeBusySendMode(d.busy_send_mode)' in app
+    assert 'busy_send_mode: this._normalizeBusySendMode(' in app
+    assert 'value="adjust"' in html
+    assert "尽快调整当前任务" in html
+    assert 'value="queue"' in html
+    assert "当前任务完成后发送" in html
+
+    enqueue_start = app.index("    async _enqueueMessage(sid, item) {")
+    enqueue_end = app.index("\n    // Post-turn / on-activate hook", enqueue_start)
+    enqueue = app[enqueue_start:enqueue_end]
+    assert 'item.delivery || this.busySendMode' in enqueue
+    assert 'activeTurnId = String(item.active_turn_id || "")' in enqueue
+    assert "delivery," in enqueue
+    assert "active_turn_id: activeTurnId" in enqueue
+    assert "accepted.queue.items" in enqueue
+    assert "acceptedQueueItems === null" in enqueue
+    assert "queued.delivery || accepted.effective_delivery" in enqueue
+    assert "queued.steering_state || accepted.delivery_status" in enqueue
+
+    sync_start = app.index("    async _syncQueueFromServer(sid, options = {})")
+    sync_end = app.index("\n    _currentQueueLen", sync_start)
+    sync = app[sync_start:sync_end]
+    assert 'delivery: this._normalizeBusySendMode(it.delivery, "queue")' in sync
+    assert "it.steering_state" in sync
+
+    steering_start = app.index("    _applyQueueSteeringEvent(sid, payload) {")
+    steering_end = app.index("\n    async _syncQueueFromServer", steering_start)
+    steering = app[steering_start:steering_end]
+    assert 'state === "completed"' in steering
+    assert 'state === "fallback"' in steering
+    assert 'state === "cancelled"' in steering
+    assert 'es.addEventListener("queue_steering"' in app
+    assert '"queue_steering",' in app
+
+    label_start = app.index("    queueDeliveryLabel(item) {")
+    label_end = app.index("\n    _applyQueueSteeringEvent", label_start)
+    labels = app[label_start:label_end]
+    assert "等待当前工具完成" in labels
+    assert "已交给当前任务" in labels
+    assert "排队中" in labels
+    assert "queueDeliveryLabel(q)" in html
+
+    send_start = app.index("    async send(opts = {}) {")
+    send_end = app.index("\n    // ====== ask_user_question", send_start)
+    send = app[send_start:send_end]
+    delivery_start = app.index("    _busySendDelivery(sid")
+    delivery_end = app.index("\n    sendButtonHint(sid)", delivery_start)
+    delivery = app[delivery_start:delivery_end]
+    assert 'this.busySendMode) !== "adjust"' in delivery
+    assert "!turnId || attachmentIntent || st.compacting" in delivery
+    assert "st.backgroundActive || st._draining || st.parentTurnId" in delivery
+    assert "st.pendingQueue && st.pendingQueue.length" in delivery
+    assert 'const busyActiveTurnId = !isReconnect' in send
+    assert "const busyDelivery = this._busySendDelivery(" in send
+    assert "_optimisticDelivery: busyDelivery" in send
+    assert "delivery: busyDelivery" in send
+    assert "delivery: handoffDelivery" in send
+    assert 'active_turn_id: busyActiveTurnId' in send
+    assert 'errorMeta.active_turn_id || errorMeta.turn_id' in send
+    assert '_optimisticQueue: !resumed && this._isBusy(sendSid)' in send
+    assert 'x-show="m._admissionPending"' in html
+    assert "正在确认发送方式" in html
+    assert "m._optimisticDelivery === 'queue'" in html
+    assert "'排队中' : 'Queued'" in html
 
 
 def test_slash_registry_has_core_commands_aliases_and_busy_policies():
