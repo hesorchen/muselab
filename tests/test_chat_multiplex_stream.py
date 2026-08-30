@@ -1,5 +1,6 @@
 import asyncio
 import json
+import urllib.parse
 
 import pytest
 from fastapi import HTTPException
@@ -31,6 +32,13 @@ def _active_state(broadcast, *, attachable=True, background=False):
         "user_images": [],
         "user_docs": [],
     }
+
+
+async def _open_mux(chat_mod, checkpoints, *, mobile=False):
+    stream = chat_mod._subscribe_multiplex(checkpoints, mobile=mobile)
+    handshake = await asyncio.wait_for(anext(stream), timeout=0.2)
+    assert handshake == {"event": "ping", "data": ""}
+    return stream
 
 
 def test_turn_start_admits_accepts_and_launches(
@@ -180,6 +188,72 @@ def test_mux_ticket_validation_dedupes_and_is_single_use(
     assert exc_info.value.status_code == 401
 
 
+def test_idle_mux_flushes_headers_through_gzip(
+        chat_mod, app_module):
+    ticket = chat_mod.mux_stream_start(
+        chat_mod.MuxStreamStartReq(checkpoints=[], mobile=False),
+    )["ticket"]
+
+    async def exercise():
+        query = urllib.parse.urlencode({"ticket": ticket}).encode("ascii")
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0", "spec_version": "2.3"},
+            "http_version": "1.1",
+            "method": "GET",
+            "scheme": "http",
+            "path": "/api/chat/stream/mux",
+            "raw_path": b"/api/chat/stream/mux",
+            "query_string": query,
+            "root_path": "",
+            "headers": [
+                (b"host", b"testserver"),
+                (b"accept-encoding", b"gzip"),
+            ],
+            "client": ("testclient", 123),
+            "server": ("testserver", 80),
+            "state": {},
+        }
+        disconnected = asyncio.Event()
+        request_received = False
+
+        async def receive():
+            nonlocal request_received
+            if not request_received:
+                request_received = True
+                return {"type": "http.request", "body": b"", "more_body": False}
+            await disconnected.wait()
+            return {"type": "http.disconnect"}
+
+        messages: asyncio.Queue = asyncio.Queue()
+
+        async def send(message):
+            await messages.put(message)
+
+        request_task = asyncio.create_task(
+            app_module.app(scope, receive, send),
+        )
+        try:
+            response_start = await asyncio.wait_for(messages.get(), timeout=2)
+            assert response_start["type"] == "http.response.start"
+            assert response_start["status"] == 200
+            headers = {
+                key.lower(): value
+                for key, value in response_start["headers"]
+            }
+            assert headers[b"content-type"].startswith(b"text/event-stream")
+            assert headers[b"content-encoding"] == b"identity"
+
+            first_body = await asyncio.wait_for(messages.get(), timeout=2)
+            assert first_body["type"] == "http.response.body"
+            assert b"event: ping" in first_body.get("body", b"")
+        finally:
+            disconnected.set()
+            await asyncio.wait_for(request_task, timeout=2)
+
+    asyncio.run(exercise())
+
+
 def test_mux_auto_discovers_wraps_events_and_disconnect_only_unsubscribes(
         chat_mod, monkeypatch):
     monkeypatch.setattr(chat_mod, "_MUX_RECONCILE_INTERVAL_S", 0.01)
@@ -195,7 +269,7 @@ def test_mux_auto_discovers_wraps_events_and_disconnect_only_unsubscribes(
     async def exercise():
         owner = asyncio.create_task(asyncio.sleep(10))
         broadcast.startup_owner_task = owner
-        stream = chat_mod._subscribe_multiplex({}, mobile=False)
+        stream = await _open_mux(chat_mod, {}, mobile=False)
         first = await anext(stream)
         second = await anext(stream)
 
@@ -236,7 +310,7 @@ def test_mux_watcher_state_can_become_attachable_dynamically(
     monkeypatch.setattr(chat_mod, "session_active_status", state)
 
     async def exercise():
-        stream = chat_mod._subscribe_multiplex({}, mobile=False)
+        stream = await _open_mux(chat_mod, {}, mobile=False)
         watcher_state = await anext(stream)
         watcher_payload = json.loads(watcher_state["data"])
         assert watcher_state["event"] == "session_state"
@@ -277,7 +351,7 @@ def test_mux_emits_inactive_state_with_finished_turn_identity(
     monkeypatch.setattr(chat_mod, "session_active_status", state)
 
     async def exercise():
-        stream = chat_mod._subscribe_multiplex({})
+        stream = await _open_mux(chat_mod, {})
         active = await asyncio.wait_for(anext(stream), timeout=0.2)
         assert json.loads(active["data"])["active"] is True
         broadcast.publish({
@@ -319,7 +393,7 @@ def test_mux_exact_recent_checkpoint_replays_without_cold_recent_discovery(
     )
 
     async def exercise():
-        stream = chat_mod._subscribe_multiplex({
+        stream = await _open_mux(chat_mod, {
             exact.session_id: {
                 "session_id": exact.session_id,
                 "turn_id": exact.turn_id,
@@ -350,7 +424,7 @@ def test_mux_turn_mismatch_resyncs_and_still_attaches_current_turn(
     )
 
     async def exercise():
-        stream = chat_mod._subscribe_multiplex({
+        stream = await _open_mux(chat_mod, {
             broadcast.session_id: {
                 "session_id": broadcast.session_id,
                 "turn_id": "stale-turn",
@@ -403,7 +477,7 @@ def test_mux_consumes_checkpoint_before_discovering_later_turn(
     }
 
     async def exercise():
-        stream = chat_mod._subscribe_multiplex(checkpoints)
+        stream = await _open_mux(chat_mod, checkpoints)
         initial = [
             await asyncio.wait_for(anext(stream), timeout=0.2)
             for _ in range(2)
@@ -454,7 +528,7 @@ def test_mux_inactive_checkpoint_resyncs_once_and_stops_polling(
     }
 
     async def exercise():
-        stream = chat_mod._subscribe_multiplex(checkpoints)
+        stream = await _open_mux(chat_mod, checkpoints)
         resync = await asyncio.wait_for(anext(stream), timeout=0.2)
         inactive = await asyncio.wait_for(anext(stream), timeout=0.2)
         assert resync["event"] == "resync"
@@ -492,7 +566,7 @@ def test_mux_child_resync_does_not_close_other_sessions(
     )
 
     async def exercise():
-        stream = chat_mod._subscribe_multiplex({
+        stream = await _open_mux(chat_mod, {
             gap.session_id: {
                 "session_id": gap.session_id,
                 "turn_id": gap.turn_id,
