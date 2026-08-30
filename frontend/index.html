@@ -2107,7 +2107,9 @@
                           <svg><use href="#i-clock"/></svg>
                         </span>
                         <span x-text="m._optimisticQueue
-                          ? (lang==='zh' ? '正在确认发送方式' : 'Confirming delivery')
+                          ? (m._optimisticDelivery === 'queue'
+                            ? (lang==='zh' ? '排队中' : 'Queued')
+                            : (lang==='zh' ? '正在确认发送方式' : 'Confirming delivery'))
                           : (lang==='zh' ? '正在发送' : 'Sending')"></span>
                       </div>
                     </div>

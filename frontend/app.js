@@ -8387,12 +8387,35 @@ function portal() {
       }
       return "";
     },
+    _busySendDelivery(sid, activeTurnId = undefined, hasAttachments = undefined) {
+      if (this._normalizeBusySendMode(this.busySendMode) !== "adjust") {
+        return "queue";
+      }
+      const st = sid && this.tabState && this.tabState[sid];
+      const turnId = activeTurnId === undefined
+        ? String((st && st.activeTurnId) || "")
+        : String(activeTurnId || "");
+      const draft = (st && st.draft) || {};
+      const attachmentIntent = hasAttachments === undefined
+        ? !!((draft.pendingImages || []).length || (draft.pendingDocs || []).length)
+        : !!hasAttachments;
+      // Native SDK steering is bound to one immutable foreground turn and is
+      // text-only.  Every state that is already known to be ineligible should
+      // advertise ordinary FIFO immediately instead of briefly promising an
+      // adjustment that the queue endpoint must downgrade after the POST.
+      if (!st || !turnId || attachmentIntent || st.compacting
+          || st.backgroundActive || st._draining || st.parentTurnId
+          || (st.pendingQueue && st.pendingQueue.length)) {
+        return "queue";
+      }
+      return "adjust";
+    },
     sendButtonHint(sid) {
       if (this.composerClaimed(sid)) return this.t("btn.send");
       const disabled = this.composerDisabledReason(sid);
       if (disabled) return disabled;
       if (!this._isBusy(sid)) return this.t("btn.send");
-      return this._normalizeBusySendMode(this.busySendMode) === "adjust"
+      return this._busySendDelivery(sid) === "adjust"
         ? (this.lang === "zh" ? "尽快调整当前任务" : "Adjust the current task soon")
         : this.t("queue.button_hint");
     },
@@ -29245,6 +29268,11 @@ function portal() {
       // backend can reject stale steering rather than targeting a successor.
       const busyActiveTurnId = !isReconnect
         ? String(sendState.activeTurnId || "") : "";
+      const busyHasAttachments = !isReconnect
+        && !!(composerImages.length || composerDocs.length);
+      const busyDelivery = this._busySendDelivery(
+        sendSid, busyActiveTurnId, busyHasAttachments,
+      );
       // Resume only when this pane still owns the exact same immutable turn.
       // A cold reload or ABA turn change has no trustworthy checkpoint and uses
       // the full replay path (sequence zero). Mid-turn transport reconnects keep
@@ -29367,6 +29395,7 @@ function portal() {
           // admission is authoritative.
           _admissionPending: true,
           _optimisticQueue: !resumed && this._isBusy(sendSid),
+          _optimisticDelivery: busyDelivery,
           displayText: hasDetachedText ? detachedDisplayText : composerInput,
           selectionQuotes: composerQuotes.map(q => ({ ...q })),
           images: readyImages.map(im => ({
@@ -29426,6 +29455,7 @@ function portal() {
           pendingQuotes: composerQuotes,
           permission: sendPermission,
           plan_return_permission: sendPlanReturnPermission,
+          delivery: busyDelivery,
           active_turn_id: busyActiveTurnId,
         });
         if (!ok) {
@@ -29670,6 +29700,7 @@ function portal() {
                   pendingQuotes: hasDetachedText ? [] : composerQuotes,
                   permission: sendPermission,
                   plan_return_permission: sendPlanReturnPermission,
+                  delivery: busyDelivery,
                   active_turn_id: busyActiveTurnId,
                 });
                 if (queued) {
@@ -31112,7 +31143,17 @@ function portal() {
         // items never re-enqueue, which prevents duplicates.
         if (serverError && errKind === "turn_busy"
             && !isReconnect && !resumed) {
-          if (sentUserBubble) sentUserBubble._optimisticQueue = true;
+          const handoffTurnId = String(
+            errorMeta.active_turn_id || errorMeta.turn_id
+            || busyActiveTurnId || "",
+          );
+          const handoffDelivery = this._busySendDelivery(
+            streamSid, handoffTurnId, busyHasAttachments,
+          );
+          if (sentUserBubble) {
+            sentUserBubble._optimisticQueue = true;
+            sentUserBubble._optimisticDelivery = handoffDelivery;
+          }
           streamState._busyQueueHandoff = es;
           try { es.close(); } catch (_) {}
           const queued = await this._enqueueMessage(streamSid, {
@@ -31123,10 +31164,8 @@ function portal() {
             pendingQuotes: hasDetachedText ? [] : composerQuotes,
             permission: sendPermission,
             plan_return_permission: sendPlanReturnPermission,
-            active_turn_id: String(
-              errorMeta.active_turn_id || errorMeta.turn_id
-              || busyActiveTurnId || "",
-            ),
+            delivery: handoffDelivery,
+            active_turn_id: handoffTurnId,
           });
           if (queued) {
             if (sentUserBubble) {
