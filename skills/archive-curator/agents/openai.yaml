@@ -1,4 +1,0 @@
-interface:
-  display_name: "Archive Curator (Deprecated)"
-  short_description: "workspace-curator 的旧名称兼容入口"
-  default_prompt: "Use $archive-curator as a compatibility alias to organize the current workspace safely."

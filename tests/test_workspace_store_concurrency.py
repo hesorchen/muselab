@@ -114,6 +114,128 @@ def test_compact_bootstrap_reads_only_root_and_expanded_children(
     }
 
 
+def test_cancelled_reconcile_rolls_back_before_commit(
+    app_module,
+    temp_root: Path,
+    monkeypatch,
+):
+    from backend.workspace_store import (
+        WorkspaceScanCancelled,
+        WorkspaceStore,
+    )
+    from backend.workspaces import registry
+
+    workspace_id = registry.id_for(temp_root)
+    store = WorkspaceStore(temp_root)
+    store.reconcile(workspace_id, temp_root, "root", primary=True)
+    baseline = store.bootstrap(workspace_id)
+    baseline_cursor = store.current_cursor(workspace_id)
+    (temp_root / "late-file.txt").write_text("late", encoding="utf-8")
+    cancel_event = threading.Event()
+    original_prune = store._prune
+
+    def cancel_before_commit(*args, **kwargs):
+        result = original_prune(*args, **kwargs)
+        cancel_event.set()
+        return result
+
+    monkeypatch.setattr(store, "_prune", cancel_before_commit)
+    with pytest.raises(WorkspaceScanCancelled):
+        store.reconcile(
+            workspace_id,
+            temp_root,
+            "root",
+            primary=True,
+            cancel_event=cancel_event,
+        )
+
+    assert store.current_cursor(workspace_id) == baseline_cursor
+    assert store.bootstrap(workspace_id) == baseline
+
+
+def test_detached_apply_verifies_cursor_and_root_in_one_transaction(
+    app_module,
+    temp_root: Path,
+):
+    from backend.workspace_store import (
+        WorkspaceStore,
+        compact_scan_rows,
+        scan_workspace,
+    )
+    from backend.workspaces import registry
+
+    workspace_id = registry.id_for(temp_root)
+    store = WorkspaceStore(temp_root)
+    store.reconcile(workspace_id, temp_root, "root", primary=True)
+    cursor = store.current_cursor(workspace_id)
+    report = {}
+    rows = compact_scan_rows(scan_workspace(temp_root, report=report))
+
+    stale = store.apply_reconcile_snapshot(
+        workspace_id,
+        temp_root.parent / "different-root",
+        "root",
+        rows,
+        report,
+        expected_cursor=cursor,
+        primary=True,
+    )
+
+    assert stale == {
+        "_stale": True,
+        "cursor": cursor,
+        "changes": [],
+        "resync": True,
+    }
+    assert store.current_cursor(workspace_id) == cursor
+    assert store.bootstrap(workspace_id)["root"] == str(temp_root.resolve())
+
+
+def test_compact_bootstrap_caps_each_expanded_directory(
+    app_module,
+    temp_root: Path,
+):
+    from backend.workspace_store import WorkspaceStore
+    from backend.workspaces import registry
+
+    huge = temp_root / "huge"
+    huge.mkdir()
+    for index in range(550):
+        (huge / f"item-{index:04d}.txt").write_text("x", encoding="utf-8")
+
+    workspace_id = registry.id_for(temp_root)
+    store = WorkspaceStore(temp_root)
+    store.reconcile(workspace_id, temp_root, "root", primary=True)
+    snapshot = store.bootstrap(workspace_id, parents=["huge"])
+
+    huge_rows = [
+        row for row in snapshot["entries"]
+        if row["path"].startswith("huge/")
+    ]
+    assert len(huge_rows) == 500
+    assert huge_rows[0]["path"] == "huge/item-0000.txt"
+    assert huge_rows[-1]["path"] == "huge/item-0499.txt"
+    assert snapshot["truncated_parents"] == ["huge"]
+    assert snapshot["children_per_parent_limit"] == 500
+
+    with store._connect() as db:
+        plan = db.execute(
+            """
+            EXPLAIN QUERY PLAN
+            SELECT path, name
+            FROM files INDEXED BY files_workspace_parent_kind_name
+            WHERE workspace_id = ? AND parent = ?
+            ORDER BY is_dir DESC, name COLLATE NOCASE, name, path
+            LIMIT ?
+            """,
+            (workspace_id, "huge", 501),
+        ).fetchall()
+    assert any(
+        "files_workspace_parent_kind_name" in str(row["detail"])
+        for row in plan
+    ), plan
+
+
 def test_bootstrap_cursor_and_rows_share_one_read_snapshot(
     app_module,
     temp_root: Path,

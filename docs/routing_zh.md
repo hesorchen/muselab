@@ -118,7 +118,7 @@ Activity Center 把每个会话的当前状态持久化在 `$MUSELAB_ROOT/.musel
 
 - `effort` 按会话保存，也是客户端缓存键的一部分；规范值为 `auto`、`low`、`medium`、`high`、`xhigh`、`max` 与按模型开放的 `ultra`；旧空值会规范化为 `auto`。
 - Codex 的 `service_tier` 独立保存；`fast` 映射到 Gateway 的 `priority` 服务层，也参与缓存键，因为该 header 在 SDK client 启动时即固定。
-- Ultra 在线路上使用 `max` 推理，并通过临时 `UserPromptSubmit.additionalContext` 激活内置 `ultra-orchestrator` Skill；它不会安装自定义 system prompt，也不会改写用户 transcript。
+- Ultra 在线路上使用 `max` 推理，并保留 subagent spawn depth 与 concurrency 上限；它不激活预装工作流，不安装自定义 system prompt，也不改写用户 transcript。
 - 扩展思考预算默认 10,000 token，可用 `MUSELAB_THINKING_BUDGET` 调整。
 - provider 是否显示 effort、是否支持 thinking，以 `/api/chat/providers` 返回的能力为准。
 - 部分 Anthropic 兼容 provider 会省略 thinking 块必需的 `signature` 键。第三方路由会在内存解析副本中以空串占位，让 SDK 流能够走完，随后从持久化 JSONL 中删除无法验证的 thinking 块。原生 Claude 路由仍使用 SDK 严格解析；muselab 不会伪造有效签名。

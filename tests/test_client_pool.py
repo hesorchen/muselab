@@ -44,6 +44,7 @@ def chat_mod(app_module):
     """The freshly-reloaded backend.chat, with all pool state cleared so a
     leftover entry from another test can't leak in."""
     from backend import chat as chat_mod
+    from backend import chat_runtime
     chat_mod._clients.clear()
     chat_mod._client_permission.clear()
     chat_mod._client_plan_return.clear()
@@ -53,6 +54,10 @@ def chat_mod(app_module):
     chat_mod._session_runtime_locks.clear()
     chat_mod._pending_runtime_rebuilds.clear()
     chat_mod._sessions_with_inflight_tasks.clear()
+    chat_runtime.SESSION_DISCONNECT_TASKS.clear()
+    chat_runtime.SESSION_DISCONNECT_FAILED.clear()
+    chat_runtime.SESSION_DISCONNECT_CLIENTS.clear()
+    chat_runtime.CLIENT_DISCONNECT_OWNERS.clear()
     yield chat_mod
     chat_mod._clients.clear()
     chat_mod._client_permission.clear()
@@ -63,6 +68,10 @@ def chat_mod(app_module):
     chat_mod._session_runtime_locks.clear()
     chat_mod._pending_runtime_rebuilds.clear()
     chat_mod._sessions_with_inflight_tasks.clear()
+    chat_runtime.SESSION_DISCONNECT_TASKS.clear()
+    chat_runtime.SESSION_DISCONNECT_FAILED.clear()
+    chat_runtime.SESSION_DISCONNECT_CLIENTS.clear()
+    chat_runtime.CLIENT_DISCONNECT_OWNERS.clear()
 
 
 def _patch_builder(monkeypatch, chat_mod):
@@ -101,6 +110,103 @@ def test_cache_hit_reuses_same_client(chat_mod, monkeypatch):
         ("sid-1", "claude-sonnet-4-6", "auto", "")]
     assert chat_mod._client_lru == [
         ("sid-1", "claude-sonnet-4-6", "auto", "")]
+
+
+def test_startup_phase_observer_cannot_break_client_creation(
+    chat_mod, monkeypatch,
+):
+    _patch_builder(monkeypatch, chat_mod)
+    monkeypatch.setattr(chat_mod, "_has_enabled_external_mcp", lambda: True)
+
+    async def ready(_client):
+        return None
+
+    monkeypatch.setattr(chat_mod, "_await_mcp_ready", ready)
+    observed = []
+
+    def broken_observer(phase, duration_ms):
+        observed.append((phase, duration_ms))
+        raise RuntimeError("observer failure")
+
+    client = asyncio.run(chat_mod.get_client(
+        "sid-observer", "claude-sonnet-4-6", "bypassPermissions",
+        startup_phase=broken_observer,
+    ))
+
+    assert client is chat_mod._clients[
+        ("sid-observer", "claude-sonnet-4-6", "auto", "")
+    ]
+    assert {phase for phase, _duration in observed} >= {
+        "disconnect", "pool", "creation_lock", "connect", "tools", "mcp",
+        "pool_commit",
+    }
+    assert all(duration >= 0 for _phase, duration in observed)
+
+
+def test_startup_phase_records_connect_and_mcp_failures(
+    chat_mod, monkeypatch,
+):
+    phases = []
+
+    async def connect_failure(*_args, **_kwargs):
+        await asyncio.sleep(0)
+        raise RuntimeError("connect failed")
+
+    monkeypatch.setattr(chat_mod, "_build_and_connect_client", connect_failure)
+    with pytest.raises(RuntimeError, match="connect failed"):
+        asyncio.run(chat_mod.get_client(
+            "sid-connect-fail", "claude-sonnet-4-6", "bypassPermissions",
+            startup_phase=lambda phase, duration: phases.append((phase, duration)),
+        ))
+    assert any(phase == "connect" and duration >= 0
+               for phase, duration in phases)
+
+    _patch_builder(monkeypatch, chat_mod)
+    monkeypatch.setattr(chat_mod, "_has_enabled_external_mcp", lambda: True)
+
+    async def mcp_failure(_client):
+        await asyncio.sleep(0)
+        raise RuntimeError("mcp failed")
+
+    monkeypatch.setattr(chat_mod, "_await_mcp_ready", mcp_failure)
+    phases.clear()
+    with pytest.raises(RuntimeError, match="mcp failed"):
+        asyncio.run(chat_mod.get_client(
+            "sid-mcp-fail", "claude-sonnet-4-6", "bypassPermissions",
+            startup_phase=lambda phase, duration: phases.append((phase, duration)),
+        ))
+    names = [phase for phase, _duration in phases]
+    assert "tools" in names
+    assert any(phase == "mcp" and duration >= 0
+               for phase, duration in phases)
+    assert not any(key[0] == "sid-mcp-fail" for key in chat_mod._clients)
+
+
+def test_startup_phase_records_disconnect_fence_failure(chat_mod, monkeypatch):
+    phases = []
+
+    async def disconnect_not_ready(*_args, **_kwargs):
+        await asyncio.sleep(0)
+        return False
+
+    monkeypatch.setattr(
+        chat_mod, "_join_session_disconnects", disconnect_not_ready)
+    with pytest.raises(
+        chat_mod.RuntimeCleanupTimeout,
+        match="cleanup is still in progress",
+    ):
+        asyncio.run(chat_mod.get_client(
+            "sid-disconnect-fail",
+            "claude-sonnet-4-6",
+            "bypassPermissions",
+            startup_phase=lambda phase, duration: phases.append(
+                (phase, duration)),
+        ))
+
+    assert any(
+        phase == "disconnect" and duration >= 0
+        for phase, duration in phases
+    )
 
 
 def test_different_key_builds_new_client(chat_mod, monkeypatch):
@@ -150,6 +256,90 @@ def test_disconnect_client_evicts_entry_and_all_side_dicts(chat_mod, monkeypatch
     assert key not in chat_mod._client_permission
     assert key not in chat_mod._creation_locks
     assert key not in chat_mod._client_lru
+
+
+def test_failed_disconnect_retains_client_and_retries(chat_mod, monkeypatch):
+    """A failed SDK close keeps the exact owner and the next DELETE retries."""
+    from backend import chat_runtime
+
+    class FlakyClient(_FakeSDKClient):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.attempts = 0
+
+        async def disconnect(self):
+            self.attempts += 1
+            if self.attempts == 1:
+                raise RuntimeError("first close failed")
+            self.disconnected = True
+
+    async def fake_build(
+        session_id, model, permission, effort, service_tier="",
+        plan_return_permission="",
+    ):
+        return FlakyClient(session_id, model, effort, service_tier)
+
+    monkeypatch.setattr(chat_mod, "_build_and_connect_client", fake_build)
+    monkeypatch.setattr(
+        chat_mod,
+        "_ensure_session_stream",
+        lambda key, client: _FakeSessionStream(key, client),
+    )
+
+    async def run():
+        client = await chat_mod.get_client(
+            "sid-retry", "claude-sonnet-4-6", "bypassPermissions"
+        )
+        with pytest.raises(chat_mod.RuntimeCleanupTimeout):
+            await chat_mod.disconnect_client("sid-retry")
+        assert client.attempts == 1
+        assert chat_runtime.SESSION_DISCONNECT_CLIENTS["sid-retry"] == {
+            id(client): client
+        }
+        await chat_mod.disconnect_client("sid-retry")
+        assert client.attempts == 2
+        assert client.disconnected is True
+        assert "sid-retry" not in chat_runtime.SESSION_DISCONNECT_CLIENTS
+        assert "sid-retry" not in chat_runtime.SESSION_DISCONNECT_FAILED
+
+    asyncio.run(run())
+
+
+def test_cancelled_unpooled_cleanup_remains_joinable(chat_mod):
+    """Cancelling a caller cannot orphan a connected, never-pooled client."""
+    from backend import chat_runtime
+
+    class SlowClient:
+        def __init__(self):
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+            self.disconnected = False
+
+        async def disconnect(self):
+            self.started.set()
+            await self.release.wait()
+            self.disconnected = True
+
+    async def run():
+        client = SlowClient()
+        owner = asyncio.create_task(
+            chat_mod._disconnect_unpooled_client(client, "sid-unpooled")
+        )
+        await client.started.wait()
+        owner.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await owner
+        assert id(client) in chat_runtime.SESSION_DISCONNECT_CLIENTS[
+            "sid-unpooled"
+        ]
+        client.release.set()
+        assert await chat_mod._join_session_disconnects(
+            "sid-unpooled", timeout=1.0
+        )
+        assert client.disconnected is True
+        assert "sid-unpooled" not in chat_runtime.SESSION_DISCONNECT_CLIENTS
+
+    asyncio.run(run())
 
 
 def test_permission_switch_rebuilds_runtime(chat_mod, monkeypatch):

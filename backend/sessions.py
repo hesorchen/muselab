@@ -27,6 +27,7 @@ Replaces the pre-2026-05-17 design where muselab stored the full transcript
 in sessions/{sid}.json — double-write with CLI's JSONL caused compact_boundary
 to be invisible in the UI after native /compact ran.
 """
+import contextlib
 import json
 import os
 import re
@@ -34,7 +35,7 @@ import sys
 import threading
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, get_args
 
@@ -47,6 +48,7 @@ from claude_agent_sdk import list_sessions as sdk_list_sessions
 from claude_agent_sdk import get_session_info as sdk_get_session_info
 from claude_agent_sdk.types import PermissionMode
 from .settings import ROOT, atomic_write_text
+from .task_summaries import normalize_task_summary_fields
 from .workspaces import registry as workspace_registry
 
 
@@ -86,6 +88,30 @@ SESS_DIR = (
 SESS_DIR.mkdir(parents=True, exist_ok=True)
 INDEX = SESS_DIR / "index.json"
 
+
+def ensure_private_session_storage() -> None:
+    """Create/repair MuseLab-owned session state with private permissions.
+
+    This is deliberately invoked from application startup instead of module
+    import.  Test fixtures replace ``SESS_DIR`` after importing this module;
+    an import-time recursive chmod would therefore mutate the real deployment
+    while a hermetic test suite was merely being collected.
+    """
+    SESS_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with contextlib.suppress(OSError):
+        SESS_DIR.chmod(0o700)
+
+    # Repair files created by older releases under a permissive umask.  Skip
+    # symlinks so session storage can never be used to chmod workspace files.
+    for private_path in SESS_DIR.rglob("*"):
+        with contextlib.suppress(OSError):
+            if private_path.is_symlink():
+                continue
+            if private_path.is_dir():
+                private_path.chmod(0o700)
+            elif private_path.is_file():
+                private_path.chmod(0o600)
+
 # A Plan-mode process still needs a concrete permission mode to return to after
 # ExitPlanMode.  Keep that launch contract beside the visible session
 # permission because the Claude JSONL transcript does not persist MuseLab's
@@ -96,6 +122,57 @@ _VALID_PLAN_RETURN_PERMISSIONS = (
     frozenset(get_args(PermissionMode)) - {"plan"}
 )
 _PLAN_RETURN_PERMISSION_FALLBACK = "default"
+
+
+_STRICT_ISO_DATETIME_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}"
+    r"(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})$"
+)
+
+
+def _normalize_iso_utc(value: Any) -> str:
+    """Return one strict, timezone-aware ISO timestamp in canonical UTC.
+
+    Runtime rollover timestamps cross the index/sidecar boundary and are later
+    compared with CLI JSONL timestamps.  Accepting naive datetimes (or the very
+    permissive forms ``datetime.fromisoformat`` otherwise tolerates) makes that
+    comparison depend on the host timezone.  Reject those inputs and expose one
+    stable spelling with an explicit ``Z`` suffix and microsecond precision.
+    """
+    parsed: datetime
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str):
+        candidate = value.strip()
+        if not _STRICT_ISO_DATETIME_RE.fullmatch(candidate):
+            return ""
+        try:
+            parsed = datetime.fromisoformat(
+                candidate[:-1] + "+00:00"
+                if candidate.endswith("Z") else candidate
+            )
+        except ValueError:
+            return ""
+    else:
+        return ""
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return ""
+    try:
+        utc = parsed.astimezone(timezone.utc)
+    except (OverflowError, ValueError):
+        return ""
+    return utc.isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
+def normalize_runtime_fork_boundary_at(value: Any) -> str:
+    """Public normalizer for the timestamp captured at SDK fork creation.
+
+    The chat runtime records this value before registering the successor.  Keep
+    the permissive-to-empty behavior here so callers can decide whether an
+    absent SDK timestamp should abort a rollover, while ``register_session``
+    still rejects an explicitly supplied malformed value.
+    """
+    return _normalize_iso_utc(value)
 
 
 def _normalize_plan_return_permission(permission: Any, value: Any) -> str:
@@ -129,6 +206,36 @@ def _normalize_session_permission_fields(row: dict) -> dict:
     )
     normalized["service_tier"] = (
         "fast" if normalized.get("service_tier") == "fast" else ""
+    )
+    normalized["activity_hidden"] = bool(
+        normalized.get("activity_hidden", False)
+    )
+    # Runtime profiles are deliberately closed rather than free-form.  The
+    # side-question profile narrows the SDK tool surface to public web lookup;
+    # an unknown/legacy value must fall back to the ordinary session runtime.
+    normalized["runtime_profile"] = (
+        "side_question"
+        if normalized.get("runtime_profile") == "side_question"
+        else ""
+    )
+    # Runtime rollover keeps an SDK-owned background task on its original
+    # process while the visible conversation continues in a point-in-time
+    # fork.  These links are MuseLab-only metadata: the predecessor remains
+    # addressable for task controls, but is hidden from the ordinary picker.
+    normalized["runtime_shadow"] = bool(
+        normalized.get("runtime_shadow", False)
+    )
+    normalized["runtime_successor"] = str(
+        normalized.get("runtime_successor") or ""
+    )
+    normalized["runtime_predecessor"] = str(
+        normalized.get("runtime_predecessor") or ""
+    )
+    normalized["runtime_boundary_message_id"] = str(
+        normalized.get("runtime_boundary_message_id") or ""
+    )
+    normalized["runtime_fork_boundary_at"] = _normalize_iso_utc(
+        normalized.get("runtime_fork_boundary_at")
     )
     return normalized
 
@@ -164,11 +271,12 @@ def _save_index(items: list[dict]) -> None:
         if isinstance(item, dict) else item
         for item in items
     ]
-    atomic_write_text(INDEX, json.dumps(canonical, ensure_ascii=False, indent=2))
-    # Index was just rewritten — invalidate any cached list_sessions() output
-    # so the next caller sees the rename / delete / bump immediately rather
-    # than waiting for the TTL to expire.
-    invalidate_sessions_cache()
+    atomic_write_text(
+        INDEX, json.dumps(canonical, ensure_ascii=False, indent=2), mode=0o600)
+    # Keep the cheap metadata layer live in-place.  A one-session rename/count
+    # update must not discard the independently cached transcript metadata and
+    # force the next /sessions poll to enumerate every workspace JSONL again.
+    _apply_index_snapshot(canonical)
 
 
 # Serialize all index R-M-W. The mutators below (toggle_pin /
@@ -182,6 +290,19 @@ def _save_index(items: list[dict]) -> None:
 # threadpool, or via await asyncio.to_thread-style wrappers); the lock
 # is non-reentrant but no mutator calls another while holding it.
 _INDEX_LOCK = threading.Lock()
+
+# Explicit deletion and SDK-only queue adoption must be one linearizable
+# lifecycle operation.  Fixed striping avoids an unbounded lock registry while
+# keeping unrelated sessions concurrent in the common case.  Lock order is:
+# lifecycle stripe -> queue -> index/sidecar.
+_SESSION_LIFECYCLE_LOCKS = tuple(threading.RLock() for _ in range(64))
+
+
+@contextlib.contextmanager
+def session_lifecycle_lock(sid: str):
+    lock = _SESSION_LIFECYCLE_LOCKS[hash(sid) % len(_SESSION_LIFECYCLE_LOCKS)]
+    with lock:
+        yield
 
 # Same rationale as _INDEX_LOCK, but for the per-session sidecar files
 # (annotations + pending attachments). set_message_annotation /
@@ -197,99 +318,61 @@ _SIDECAR_LOCK = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
-# list_sessions() TTL cache
+# Incremental list_sessions() cache
 # ---------------------------------------------------------------------------
-# Profile on a 270-session archive showed `list_sessions()` takes 150-480ms,
-# dominated by `sdk_list_sessions()` walking every JSONL for metadata. The
-# function is called multiple times per request flow:
-#   - /api/chat/sessions (UI refresh)
-#   - search endpoint (builds id→name map)
-#   - compact cross-session lookups
-#   - heartbeat reconnect path
+# The public list has two sources with very different costs:
+#   * index: MuseLab metadata + cached transcript statistics (cheap JSON file)
+#   * transcripts: SDK metadata collected by stat/head/tail reads across every
+#     workspace JSONL (hundreds of milliseconds on a large archive)
 #
-# Caching with a short TTL deduplicates "refresh storms" (heartbeat reconnect
-# triggers refreshSessions + fetchContextInfo + scheduler unread simultaneously)
-# without staling user-visible state for more than ~0.5s. Internal mutations
-# (bump_session / rename / delete / pin) call `invalidate_sessions_cache()`
-# via `_save_index` so muselab-driven changes appear immediately; only
-# external JSONL writes (rare in muselab context) wait for the TTL.
-#
-# TTL was 2.0s until 2026-05-28 — multi-device + external CLI use cases
-# (running `claude --resume xxx` in a terminal while muselab is open in a
-# browser tab) noticed the new turns missing from the list for up to 2s
-# after each external write. 0.5s feels live without sacrificing the
-# refresh-storm dedup (a typical storm completes in ~50 ms anyway).
-#
-# 2026-06-07: raised 0.5s → 30s. The 0.5s TTL meant the 10s foreground poll
-# ALWAYS missed the cache and paid the full ~400ms cold rebuild every time
-# (sdk_list_sessions walks every JSONL for metadata — measured 0.38-0.43s on a
-# 330-session archive). Since EVERY muselab-internal mutation (bump_session /
-# rename / delete / pin / create) calls invalidate_sessions_cache() via
-# _save_index, the cache is already correct for muselab-driven changes — the
-# only staleness window is an EXTERNAL `claude --resume` write, which now takes
-# up to 30s to surface in the list (acceptable; rare workflow). The live
-# `active` streaming dots are computed per-request OUTSIDE the cache (from
-# _active_turns in chat.py), so they stay real-time regardless of this TTL.
-
-_LIST_CACHE: dict[str, Any] = {"at": 0.0, "data": None, "gen": 0}
+# Keep the layers separate. A cold request installs the index layer and returns
+# immediately, while transcript metadata refreshes in a background single-
+# flight. Local writes patch only the index layer, preserving the transcript
+# layer, so one session's count/title change never forces an archive-wide scan.
+_LIST_CACHE: dict[str, Any] = {
+    "index": {},
+    "transcripts": {},
+    "data": None,
+    "transcript_at": 0.0,
+    "gen": 0,
+    "epoch": 0,
+}
 _LIST_CACHE_TTL_S = 30.0
 _LIST_CACHE_LOCK = threading.Lock()
-
-
-# Single-flight flag for the stale-while-revalidate background rebuild.
 _LIST_REFRESHING: dict[str, bool] = {"v": False}
-
-
-def _refresh_list_cache_bg() -> None:
-    """Background single-flight rebuild for stale-while-revalidate. Builds a
-    fresh snapshot via _build_sessions_list() and installs it unless an
-    invalidation happened mid-build (data=None) — in that case the next
-    caller must rebuild synchronously to see the post-mutation state, so we
-    must not overwrite the invalidation with our possibly-pre-mutation
-    snapshot."""
-    try:
-        result = _build_sessions_list()
-        now = time.time()
-        with _LIST_CACHE_LOCK:
-            if _LIST_CACHE["data"] is not None:
-                _LIST_CACHE["data"] = result
-                _LIST_CACHE["at"] = now
-                _LIST_CACHE["gen"] += 1
-    except Exception as e:
-        sys.stderr.write(f"[sessions] bg list refresh failed: "
-                         f"{type(e).__name__}: {e}\n")
-    finally:
-        _LIST_REFRESHING["v"] = False
-
-
-def list_sessions_generation() -> int:
-    """Monotonic counter bumped on every fresh list_sessions() rebuild and
-    on invalidation. Lets callers cache values derived from the list (e.g.
-    the /sessions ETag digest) keyed on this instead of re-hashing the same
-    snapshot on every poll."""
-    with _LIST_CACHE_LOCK:
-        return _LIST_CACHE["gen"]
-
-
-def invalidate_sessions_cache() -> None:
-    """Drop the cached list_sessions() snapshot. Call after any mutation that
-    changes index.json or adds/removes a session sidecar."""
-    with _LIST_CACHE_LOCK:
-        _LIST_CACHE["at"] = 0.0
-        _LIST_CACHE["data"] = None
-        _LIST_CACHE["gen"] += 1
-    _META_CACHE.clear()
 
 
 # Short-TTL per-sid metadata cache. A single GET /sessions/{sid} request can
 # call get_session_meta up to 3 times (meta + cost + ctx paths), and EACH
 # call does a full index.json read plus an SDK get_session_info JSONL probe.
-# 2s is short enough that externally-visible staleness is negligible (the
-# sessions LIST already tolerates 30s), and any muselab-side mutation goes
-# through _save_index → invalidate_sessions_cache which clears this too.
+# Index mutations evict only the ids whose metadata actually changed.
 _META_CACHE: dict[str, tuple[float, dict]] = {}
 _META_CACHE_TTL_S = 2.0
 _META_CACHE_MAX = 256
+
+
+def list_sessions_generation() -> int:
+    """Revision of the composed public list used by the endpoint ETag."""
+    with _LIST_CACHE_LOCK:
+        return _LIST_CACHE["gen"]
+
+
+def invalidate_sessions_cache() -> None:
+    """Fully reset both layers after workspace topology/external test changes.
+
+    Ordinary index mutations must use :func:`_apply_index_snapshot` instead;
+    they retain cached transcript metadata and update the public revision only
+    when the composed response changes.
+    """
+    with _LIST_CACHE_LOCK:
+        _LIST_CACHE["index"] = {}
+        _LIST_CACHE["transcripts"] = {}
+        _LIST_CACHE["data"] = None
+        _LIST_CACHE["transcript_at"] = 0.0
+        _LIST_CACHE["gen"] += 1
+        _LIST_CACHE["epoch"] += 1
+        _LIST_REFRESHING["v"] = False
+    _META_CACHE.clear()
 
 
 # Parsed-sidecar cache keyed by sid → (mtime, size, dict). Sidecars are
@@ -339,7 +422,8 @@ def _load_sidecar(sid: str, *, use_cache: bool = True) -> dict:
 
 
 def _save_sidecar(sid: str, data: dict) -> None:
-    atomic_write_text(_sidecar_path(sid), json.dumps(data, ensure_ascii=False))
+    atomic_write_text(
+        _sidecar_path(sid), json.dumps(data, ensure_ascii=False), mode=0o600)
     # Drop rather than refresh: the next _load_sidecar re-stats and caches
     # the just-written file, keeping cache state derived purely from disk.
     _SIDECAR_CACHE.pop(sid, None)
@@ -424,6 +508,25 @@ def _merge_sdk_with_index(
         "forked_from": m.get("forked_from", ""),
         "forked_from_name": m.get("forked_from_name", ""),
         "forked_from_message_id": m.get("forked_from_message_id", ""),
+        # Lightweight side-question branches are real resumable sessions, but
+        # they are deliberately absent from the global task ledger. Keep that
+        # distinction in durable session metadata so reloads and later turns
+        # do not accidentally promote them into Task Center.
+        "activity_hidden": bool(m.get("activity_hidden", False)),
+        "runtime_profile": (
+            "side_question"
+            if m.get("runtime_profile") == "side_question"
+            else ""
+        ),
+        "runtime_shadow": bool(m.get("runtime_shadow", False)),
+        "runtime_successor": str(m.get("runtime_successor") or ""),
+        "runtime_predecessor": str(m.get("runtime_predecessor") or ""),
+        "runtime_boundary_message_id": str(
+            m.get("runtime_boundary_message_id") or ""
+        ),
+        "runtime_fork_boundary_at": _normalize_iso_utc(
+            m.get("runtime_fork_boundary_at")
+        ),
         # Every conversation is bound to the directory the Claude SDK was
         # started in.  Keep it in the sidecar so history, files and previews
         # switch as one workspace instead of silently falling back to ROOT.
@@ -482,95 +585,157 @@ def set_pin(sid: str, val: bool) -> bool:
         return bool(val)
 
 
-def list_sessions() -> list[dict]:
-    """List sessions, preferring SDK truth (CLI JSONL last_modified +
-    custom_title) and falling back to muselab index for muselab-specific
-    fields and pre-first-query sessions.
+def _index_list_layer(items: list[dict]) -> dict[str, dict]:
+    return {
+        str(row["id"]): dict(row)
+        for row in items
+        if isinstance(row, dict) and row.get("id")
+    }
 
-    Cached for `_LIST_CACHE_TTL_S` seconds — see cache block in this module.
-    Mutations call `invalidate_sessions_cache()` so cache staleness only
-    affects external-to-muselab JSONL writes.
 
-    Stale-while-revalidate: when the TTL has expired but a snapshot still
-    exists, return the stale snapshot immediately and rebuild in a single
-    background thread (single-flight via _LIST_REFRESHING). The caller
-    never blocks on the ~400ms sdk_list_sessions walk; the refreshed data
-    lands for the NEXT call. invalidate_sessions_cache() drops the data
-    outright, so muselab-driven mutations still rebuild synchronously on
-    the next call (immediate consistency preserved)."""
-    now = time.time()
+def _compose_sessions_list(
+    index_by_id: dict[str, dict],
+    transcript_by_id: dict[str, tuple[Any, Path]],
+) -> list[dict]:
+    """Compose the public list from already-cached source layers only."""
+    # Tombstones are process-local and mutations are serialized under the GIL;
+    # copying the set here avoids taking _QUEUE_LOCK while _save_index may
+    # already be called from a queue transaction.
+    deleted_ids = set(_DELETED_SESSION_IDS)
+    out: list[dict] = []
+    seen: set[str] = set()
+    for sid, (info, workspace) in transcript_by_id.items():
+        if sid in deleted_ids:
+            continue
+        merged = _merge_sdk_with_index(
+            info, index_by_id.get(sid, {}), workspace)
+        if not merged.get("runtime_shadow"):
+            out.append(merged)
+        seen.add(sid)
+    for sid, stored in index_by_id.items():
+        if sid in seen or sid in deleted_ids:
+            continue
+        # Removed workspaces retain durable metadata for later re-registration,
+        # but are absent from the active picker.
+        if stored.get("cwd") and not workspace_registry.contains(stored.get("cwd")):
+            continue
+        row = _normalize_session_permission_fields(stored)
+        if row.get("runtime_shadow"):
+            continue
+        row.pop("system_prompt", None)
+        row.setdefault("cwd", str(ROOT))
+        out.append(row)
+    return sorted(
+        out,
+        key=lambda row: (
+            1 if row.get("pinned") else 0,
+            row.get("updated_at", 0),
+        ),
+        reverse=True,
+    )
+
+
+def _apply_index_snapshot(items: list[dict]) -> None:
+    """Install the cheap metadata/statistics layer without dropping transcripts."""
+    new_index = _index_list_layer(items)
     with _LIST_CACHE_LOCK:
-        cached = _LIST_CACHE.get("data")
-        if cached is not None:
-            fresh = (now - _LIST_CACHE["at"]) < _LIST_CACHE_TTL_S
-            if not fresh and not _LIST_REFRESHING["v"]:
-                _LIST_REFRESHING["v"] = True
-                threading.Thread(
-                    target=_refresh_list_cache_bg, daemon=True,
-                ).start()
-            # Return a shallow copy of the list so callers that mutate-in-place
-            # (e.g. add a transient field for rendering) don't poison the cache.
-            # Inner dicts are still shared — read-only callers won't notice.
-            return list(cached)
-    result = _build_sessions_list()
-    with _LIST_CACHE_LOCK:
-        _LIST_CACHE["data"] = result
-        _LIST_CACHE["at"] = now
-        _LIST_CACHE["gen"] += 1
-    # Return a shallow copy so caller mutations don't bleed back into cache.
-    return list(result)
+        old_index = _LIST_CACHE["index"]
+        changed_ids = {
+            sid for sid in old_index.keys() | new_index.keys()
+            if old_index.get(sid) != new_index.get(sid)
+        }
+        previous = _LIST_CACHE["data"]
+        _LIST_CACHE["index"] = new_index
+        current = _compose_sessions_list(
+            new_index, _LIST_CACHE["transcripts"])
+        _LIST_CACHE["data"] = current
+        if previous != current:
+            _LIST_CACHE["gen"] += 1
+    for sid in changed_ids:
+        _META_CACHE.pop(sid, None)
 
 
-def _build_sessions_list() -> list[dict]:
-    """The uncached list build: SDK walk + index merge + sort. Called by
-    list_sessions() (sync, cache miss) and _refresh_list_cache_bg() (async,
-    stale-while-revalidate)."""
-    index = _load_index()
-    index_by_id = {s["id"]: s for s in index}
-    sdk_list: list[tuple[Any, Path]] = []
+def _scan_transcript_metadata() -> dict[str, tuple[Any, Path]]:
+    """Enumerate transcript metadata for all registered workspaces."""
+    result: dict[str, tuple[Any, Path]] = {}
     for workspace in workspace_registry.paths():
         try:
-            sdk_list.extend(
-                (info, workspace)
-                for info in sdk_list_sessions(directory=str(workspace))
-            )
-        except Exception as e:
+            for info in sdk_list_sessions(directory=str(workspace)):
+                result.setdefault(info.session_id, (info, workspace))
+        except Exception as exc:
             sys.stderr.write(
                 f"[sessions] sdk_list_sessions failed for {workspace}, "
                 f"falling back to index.json for that workspace: "
-                f"{type(e).__name__}: {e}\n")
-    out: list[dict] = []
-    seen: set[str] = set()
-    for info, workspace in sdk_list:
-        if info.session_id in seen:
-            continue
-        m = index_by_id.get(info.session_id, {})
-        out.append(_merge_sdk_with_index(info, m, workspace))
-        seen.add(info.session_id)
-    # Append muselab-only entries (no JSONL on disk yet — usually because
-    # the user just created the session but hasn't sent the first message).
-    for s in index:
-        if s["id"] not in seen:
-            # Rows owned by a workspace that has since been removed stay in
-            # index.json (so re-registering the directory restores them), but
-            # must not leak into the active session list meanwhile.  Legacy
-            # rows without cwd belong to the primary workspace.
-            if s.get("cwd") and not workspace_registry.contains(s.get("cwd")):
-                continue
-            row = dict(s)
-            row = _normalize_session_permission_fields(row)
-            # Legacy muselab releases persisted per-session system prompts.
-            # Keep the inert key on disk for non-destructive compatibility,
-            # but never expose or execute it.
-            row.pop("system_prompt", None)
-            row.setdefault("cwd", str(ROOT))
-            out.append(row)
-    # Sort: pinned sessions first (descending), then by updated_at desc.
-    return sorted(
-        out,
-        key=lambda s: (1 if s.get("pinned") else 0, s.get("updated_at", 0)),
-        reverse=True,
-    )
+                f"{type(exc).__name__}: {exc}\n"
+            )
+    return result
+
+
+def _refresh_list_cache_bg(epoch: int) -> None:
+    """Refresh only the expensive transcript layer in one background flight."""
+    try:
+        transcripts = _scan_transcript_metadata()
+        with _LIST_CACHE_LOCK:
+            if _LIST_CACHE["epoch"] != epoch:
+                return
+            previous = _LIST_CACHE["data"]
+            _LIST_CACHE["transcripts"] = transcripts
+            _LIST_CACHE["transcript_at"] = time.time()
+            current = _compose_sessions_list(
+                _LIST_CACHE["index"], transcripts)
+            _LIST_CACHE["data"] = current
+            if previous != current:
+                _LIST_CACHE["gen"] += 1
+    except Exception as exc:
+        sys.stderr.write(
+            f"[sessions] bg transcript refresh failed: "
+            f"{type(exc).__name__}: {exc}\n"
+        )
+    finally:
+        with _LIST_CACHE_LOCK:
+            if _LIST_CACHE["epoch"] == epoch:
+                _LIST_REFRESHING["v"] = False
+
+
+def _ensure_index_list_layer() -> None:
+    with _LIST_CACHE_LOCK:
+        if _LIST_CACHE["data"] is not None:
+            return
+    # Serialize with writers so a cold reader cannot install an index snapshot
+    # captured just before a concurrent mutation committed.
+    with _INDEX_LOCK:
+        _apply_index_snapshot(_load_index())
+
+
+def list_sessions_snapshot() -> tuple[list[dict], int]:
+    """Return one list snapshot and its matching monotonic revision."""
+    _ensure_index_list_layer()
+    now = time.time()
+    with _LIST_CACHE_LOCK:
+        stale = (
+            now - float(_LIST_CACHE["transcript_at"] or 0)
+            >= _LIST_CACHE_TTL_S
+        )
+        if stale and not _LIST_REFRESHING["v"]:
+            _LIST_REFRESHING["v"] = True
+            epoch = _LIST_CACHE["epoch"]
+            threading.Thread(
+                target=_refresh_list_cache_bg,
+                args=(epoch,),
+                name="muselab-session-list-refresh",
+                daemon=True,
+            ).start()
+        return list(_LIST_CACHE["data"] or []), _LIST_CACHE["gen"]
+
+
+def list_sessions() -> list[dict]:
+    """Return cached sessions without synchronously walking transcript JSONL.
+
+    Index metadata (including cached message/turn counts) is immediately
+    consistent with MuseLab writes. SDK title/first-prompt/timestamp changes and
+    SDK-only sessions converge on the next poll after the background refresh.
+    """
+    return list_sessions_snapshot()[0]
 
 
 def create_session(
@@ -579,11 +744,15 @@ def create_session(
     cwd: str | Path | None = None,
     permission: str = "",
     plan_return_permission: str | None = None,
+    activity_hidden: bool = False,
+    runtime_profile: str = "",
 ) -> dict:
     return register_session(str(uuid.uuid4()), name=name, model=model,
                             permission=permission,
                             plan_return_permission=plan_return_permission,
-                            auto_named=True, cwd=cwd)
+                            auto_named=True, cwd=cwd,
+                            activity_hidden=activity_hidden,
+                            runtime_profile=runtime_profile)
 
 
 def register_session(sid: str, *, name: str = "", model: str = "",
@@ -598,12 +767,24 @@ def register_session(sid: str, *, name: str = "", model: str = "",
                      forked_from: str = "",
                      forked_from_name: str = "",
                      forked_from_message_id: str = "",
+                     activity_hidden: bool = False,
+                     runtime_profile: str = "",
+                     runtime_predecessor: str = "",
+                     runtime_fork_boundary_at: str | datetime = "",
+                     runtime_shadow: bool = False,
                      cwd: str | Path | None = None) -> dict:
     """Add a session that already has a UUID (e.g. one minted by SDK
     fork_session) to the muselab index. Same shape as create_session
     but without generating a fresh UUID."""
     now = time.time()
     workspace = workspace_registry.resolve(cwd)
+    if runtime_profile not in ("", "side_question"):
+        raise ValueError("invalid runtime profile")
+    normalized_runtime_fork_boundary_at = _normalize_iso_utc(
+        runtime_fork_boundary_at
+    )
+    if runtime_fork_boundary_at and not normalized_runtime_fork_boundary_at:
+        raise ValueError("runtime_fork_boundary_at must be timezone-aware ISO 8601")
     meta = {
         "id": sid,
         "name": name or _default_session_name(),
@@ -625,29 +806,52 @@ def register_session(sid: str, *, name: str = "", model: str = "",
         "effort": str(effort or "").strip() or "auto",
         "service_tier": "fast" if service_tier == "fast" else "",
         "thinking": bool(thinking),
+        "activity_hidden": bool(activity_hidden),
+        "runtime_profile": runtime_profile,
+        "runtime_predecessor": str(runtime_predecessor or ""),
+        # Fork children stay absent from the public picker until every durable
+        # projection has committed. Successor publication clears this flag in
+        # the same index write that hides the source; ordinary forks clear it
+        # explicitly after their projections are complete.
+        "runtime_shadow": bool(runtime_shadow),
+        "runtime_successor": "",
+        "runtime_boundary_message_id": "",
+        "runtime_fork_boundary_at": normalized_runtime_fork_boundary_at,
         "cwd": str(workspace),
     }
     if forked_from:
         meta["forked_from"] = forked_from
         meta["forked_from_name"] = forked_from_name
         meta["forked_from_message_id"] = forked_from_message_id
-    with _INDEX_LOCK:
-        idx = _load_index()
-        # Idempotent: if this id is already registered (client retry / keepalive
-        # resend of an optimistic-create POST, or a fork that re-registers),
-        # return the existing row instead of appending a duplicate. Duplicate
-        # ids would break list dedupe and x-for :key bindings on the frontend.
-        existing = next((s for s in idx if s.get("id") == sid), None)
-        if existing is not None:
-            public_existing = _normalize_session_permission_fields(existing)
-            public_existing.pop("system_prompt", None)
-            return public_existing
-        idx.append(meta)
-        _save_index(idx)
-    try:
-        _save_sidecar(sid, {"messages": {}})
-    except Exception as e:
-        sys.stderr.write(f"[sessions] warning: sidecar write failed for {sid}: {e}\n")
+    with session_lifecycle_lock(sid):
+        with _QUEUE_LOCK:
+            with _INDEX_LOCK:
+                idx = _load_index()
+                # Idempotent: if this id is already registered (client retry /
+                # keepalive resend of an optimistic-create POST, or a fork that
+                # re-registers), return the existing row instead of appending a
+                # duplicate. Duplicate ids break list dedupe and x-for keys.
+                existing = next((s for s in idx if s.get("id") == sid), None)
+                if existing is not None:
+                    public_existing = _normalize_session_permission_fields(existing)
+                    public_existing.pop("system_prompt", None)
+                    return public_existing
+                # A stale optimistic-create retry may arrive after DELETE has
+                # fenced the id but before its final disk sweep. Never let that
+                # retry clear the process tombstone and admit a new turn into
+                # the deletion window. Fresh sessions always use a new UUID.
+                if sid in _DELETED_SESSION_IDS:
+                    raise ValueError("session is being deleted")
+                idx.append(meta)
+                _save_index(idx)
+        # Keep lifecycle ownership through the final sidecar write. Otherwise
+        # DELETE can remove the new index row in the gap and this write would
+        # leave an orphan metadata file after deletion already returned.
+        try:
+            _save_sidecar(sid, {"messages": {}})
+        except Exception as e:
+            sys.stderr.write(
+                f"[sessions] warning: sidecar write failed for {sid}: {e}\n")
     return meta
 
 
@@ -704,6 +908,49 @@ def get_session_meta(sid: str) -> dict | None:
 get_session = get_session_meta
 
 
+def get_session_for_queue(sid: str) -> tuple[dict | None, bool]:
+    """Return queue-launch metadata plus an explicit SDK-truth flag.
+
+    Queue enqueue cannot use :func:`get_session_meta` here: its merged/cache
+    result does not reveal whether the session came from the durable MuseLab
+    index or from an SDK transcript.  That distinction matters when pruning
+    races an enqueue.  A stale index snapshot must never be allowed to recreate
+    a row that prune already removed; only a session that was *already*
+    SDK-only at this preflight may self-heal its missing index row.
+
+    This helper deliberately bypasses the metadata cache.  Callers run it in a
+    worker thread because the SDK probe can touch multiple workspace files.
+    """
+    with _INDEX_LOCK:
+        indexed = next(
+            (
+                dict(row)
+                for row in _load_index()
+                if isinstance(row, dict) and row.get("id") == sid
+            ),
+            None,
+        )
+    if indexed is not None:
+        meta = _normalize_session_permission_fields(
+            {**indexed, "cwd": str(indexed.get("cwd") or ROOT)}
+        )
+        meta.pop("system_prompt", None)
+        return meta, False
+
+    for workspace in workspace_registry.paths():
+        try:
+            info = sdk_get_session_info(sid, directory=str(workspace))
+        except Exception as exc:
+            sys.stderr.write(
+                f"[sessions] sdk queue preflight failed for {sid}: "
+                f"{type(exc).__name__}: {exc}\n"
+            )
+            continue
+        if info is not None:
+            return _merge_sdk_with_index(info, {}, workspace), True
+    return None, False
+
+
 def session_workspace(sid: str) -> Path:
     """Return the registered working directory owned by ``sid``.
 
@@ -720,34 +967,55 @@ def session_workspace(sid: str) -> Path:
         return workspace_registry.resolve()
 
 
+def begin_session_delete(sid: str) -> None:
+    """Prevent any later queue mutation from recreating ``sid`` this process."""
+    with session_lifecycle_lock(sid):
+        with _QUEUE_LOCK:
+            _DELETED_SESSION_IDS.add(sid)
+
+
 def delete_session(sid: str) -> bool:
-    """Removes muselab's sidecar + index entry. Caller is responsible for
-    also calling SDK delete_session() to remove the CLI JSONL."""
-    with _INDEX_LOCK:
-        idx = _load_index()
-        new = [s for s in idx if s["id"] != sid]
-        if len(new) == len(idx):
-            return False
-        _save_index(new)
-    p = _sidecar_path(sid)
-    if p.exists():
-        try:
-            p.unlink()
-        except OSError:
-            pass
-    transcript_index = SESS_DIR / f"{sid}.transcript-index.json"
-    if transcript_index.exists():
-        try:
-            transcript_index.unlink()
-        except OSError:
-            pass
-    q = _queue_path(sid)
-    if q.exists():
-        try:
-            q.unlink()
-        except OSError:
-            pass
-    return True
+    """Atomically remove MuseLab metadata and queue state for ``sid``.
+
+    Caller is responsible for deleting the SDK transcript.  The lifecycle and
+    queue locks make this linearizable with enqueue/claim/ack/release: a queue
+    mutation either lands before deletion and is then removed, or observes the
+    process tombstone and cannot recreate an orphan sidecar afterward.
+    """
+    removed = False
+    with session_lifecycle_lock(sid):
+        with _QUEUE_LOCK:
+            _DELETED_SESSION_IDS.add(sid)
+            with _INDEX_LOCK:
+                idx = _load_index()
+                new = [s for s in idx if s.get("id") != sid]
+                if len(new) != len(idx):
+                    _save_index(new)
+                    removed = True
+            # Sidecar readers may also bind a pending attachment as part of a
+            # GET. Serialize its unlink with every sidecar RMW so an old
+            # snapshot cannot be saved after deletion and recreate private
+            # attachment metadata.
+            with _SIDECAR_LOCK:
+                sidecar = _sidecar_path(sid)
+                if sidecar.exists():
+                    try:
+                        sidecar.unlink()
+                        _SIDECAR_CACHE.pop(sid, None)
+                        removed = True
+                    except OSError:
+                        pass
+            for path in (
+                SESS_DIR / f"{sid}.transcript-index.json",
+                _queue_path(sid),
+            ):
+                if path.exists():
+                    try:
+                        path.unlink()
+                        removed = True
+                    except OSError:
+                        pass
+    return removed
 
 
 def prune_empty_sessions(keep_ids: tuple | list = ()) -> list[str]:
@@ -787,41 +1055,71 @@ def prune_empty_sessions(keep_ids: tuple | list = ()) -> list[str]:
             # If we can't confirm which sessions have transcripts, fail SAFE:
             # delete nothing rather than risk nuking real history.
             return []
-    with _INDEX_LOCK:
-        idx = _load_index()
-        to_delete = [
-            s["id"] for s in idx
-            if s.get("message_count", 0) == 0
-            and s["id"] not in transcript_ids  # has a JSONL → real content, keep
-            and not s.get("pinned")
-            and s.get("auto_named", True)
-            and s.get("created_at", 0) > cutoff  # 只删 2 小时内的空会话
-            and s["id"] not in keep
-        ]
-        if not to_delete:
-            return []
-        to_delete_set = set(to_delete)
-        _save_index([s for s in idx if s["id"] not in to_delete_set])
-    # Outside the lock: remove sidecar files + SDK JSOBLs (best-effort).
+    # Queue state and its sidecar deletion share one lock. An enqueue that
+    # commits before this section is therefore visible and protects its
+    # session; none can slip between the final queue check and file removal.
+    # A malformed/unreadable queue also fails SAFE: uncertainty is work, so
+    # preserve the session rather than deleting a possibly accepted message.
+    with _QUEUE_LOCK:
+        with _INDEX_LOCK:
+            idx = _load_index()
+            to_delete = []
+            for row in idx:
+                sid = row["id"]
+                if not (
+                    row.get("message_count", 0) == 0
+                    and sid not in transcript_ids
+                    and not row.get("pinned")
+                    and row.get("auto_named", True)
+                    and row.get("created_at", 0) > cutoff
+                    and sid not in keep
+                ):
+                    continue
+                try:
+                    queue = _load_queue(sid, strict=True)
+                except RuntimeError:
+                    continue
+                if queue.get("items") or queue.get("inflight"):
+                    continue
+                to_delete.append(sid)
+            if not to_delete:
+                return []
+            to_delete_set = set(to_delete)
+            _save_index([s for s in idx if s["id"] not in to_delete_set])
+
+        # A late queue task may have captured this sid before the prune. The
+        # tombstone makes every later queue save a no-op instead of recreating
+        # the just-removed sidecar.
+        _DELETED_SESSION_IDS.update(to_delete)
+
+        # Remove MuseLab-owned state before releasing the queue lock. This
+        # keeps the check + index mutation + queue-sidecar removal one atomic
+        # transaction with respect to every queue mutator.
+        for sid in to_delete:
+            with _SIDECAR_LOCK:
+                p = _sidecar_path(sid)
+                if p.exists():
+                    try:
+                        p.unlink()
+                        _SIDECAR_CACHE.pop(sid, None)
+                    except OSError:
+                        pass
+            q = _queue_path(sid)
+            if q.exists():
+                try:
+                    q.unlink()
+                except OSError:
+                    pass
+            transcript_index = SESS_DIR / f"{sid}.transcript-index.json"
+            if transcript_index.exists():
+                try:
+                    transcript_index.unlink()
+                except OSError:
+                    pass
+
+    # SDK JSONLs are independent of the MuseLab queue lock and can be slow to
+    # remove. Keep this best-effort cleanup outside both local locks.
     for sid in to_delete:
-        p = _sidecar_path(sid)
-        if p.exists():
-            try:
-                p.unlink()
-            except OSError:
-                pass
-        q = _queue_path(sid)
-        if q.exists():
-            try:
-                q.unlink()
-            except OSError:
-                pass
-        transcript_index = SESS_DIR / f"{sid}.transcript-index.json"
-        if transcript_index.exists():
-            try:
-                transcript_index.unlink()
-            except OSError:
-                pass
         try:
             workspace = next(
                 (s.get("cwd") for s in idx if s.get("id") == sid),
@@ -849,6 +1147,145 @@ def rename_session(sid: str, name: str) -> bool:
                 _save_index(idx)
                 return True
         return False
+
+
+def set_runtime_background_boundary(sid: str, message_id: str) -> bool:
+    """Persist the last ordinary assistant record safe for runtime rollover.
+
+    A background-task notification can later append an implicit user record
+    and an automatic assistant continuation to the source transcript.  Forking
+    at this explicit boundary keeps those source-only records out of the new
+    interactive runtime.
+    """
+    boundary = str(message_id or "")
+    if not boundary:
+        return False
+    with _INDEX_LOCK:
+        idx = _load_index()
+        for row in idx:
+            if row.get("id") != sid:
+                continue
+            if row.get("runtime_boundary_message_id") == boundary:
+                return True
+            row["runtime_boundary_message_id"] = boundary
+            _save_index(idx)
+            return True
+    return False
+
+
+def publish_fork_child(sid: str) -> bool:
+    """Make one fully projected ordinary fork visible, idempotently."""
+    with _INDEX_LOCK:
+        idx = _load_index()
+        child = next((row for row in idx if row.get("id") == sid), None)
+        if child is None:
+            return False
+        if not child.get("runtime_shadow"):
+            return True
+        child["runtime_shadow"] = False
+        _save_index(idx)
+        return True
+
+
+def link_runtime_successor(source_sid: str, successor_sid: str) -> bool:
+    """Atomically publish ``successor`` and hide its replaced source runtime."""
+    if not source_sid or not successor_sid or source_sid == successor_sid:
+        return False
+    with _INDEX_LOCK:
+        idx = _load_index()
+        source = next(
+            (row for row in idx if row.get("id") == source_sid), None)
+        successor = next(
+            (row for row in idx if row.get("id") == successor_sid), None)
+        if source is None or successor is None:
+            return False
+        existing = str(source.get("runtime_successor") or "")
+        if existing and existing != successor_sid:
+            return False
+        predecessor = str(successor.get("runtime_predecessor") or "")
+        if predecessor and predecessor != source_sid:
+            return False
+        source["runtime_shadow"] = True
+        source["runtime_successor"] = successor_sid
+        successor["runtime_predecessor"] = source_sid
+        successor["runtime_shadow"] = False
+        _save_index(idx)
+        return True
+
+
+def unlink_runtime_successor(source_sid: str, successor_sid: str) -> bool:
+    """Best-effort rollback for a rollover that failed after metadata link."""
+    with _INDEX_LOCK:
+        idx = _load_index()
+        source = next(
+            (row for row in idx if row.get("id") == source_sid), None)
+        successor = next(
+            (row for row in idx if row.get("id") == successor_sid), None)
+        if source is None:
+            return False
+        if str(source.get("runtime_successor") or "") != successor_sid:
+            return False
+        source["runtime_shadow"] = False
+        source["runtime_successor"] = ""
+        if successor is not None and str(
+                successor.get("runtime_predecessor") or "") == source_sid:
+            successor["runtime_predecessor"] = ""
+        _save_index(idx)
+        return True
+
+
+_RUNTIME_LINEAGE_MAX = 32
+
+
+def _runtime_lineage_from_rows(sid: str, rows: list[dict]) -> list[str]:
+    """Return the linked runtime chain containing ``sid``, oldest first."""
+    sid = str(sid or "")
+    by_id = {
+        str(row.get("id")): row
+        for row in rows
+        if isinstance(row, dict) and row.get("id")
+    }
+    if not sid or sid not in by_id:
+        return []
+
+    predecessors: list[str] = []
+    seen = {sid}
+    current = sid
+    while len(seen) < _RUNTIME_LINEAGE_MAX:
+        predecessor = str(
+            by_id.get(current, {}).get("runtime_predecessor") or ""
+        )
+        if not predecessor or predecessor in seen or predecessor not in by_id:
+            break
+        predecessors.append(predecessor)
+        seen.add(predecessor)
+        current = predecessor
+
+    lineage = list(reversed(predecessors)) + [sid]
+    current = sid
+    while len(lineage) < _RUNTIME_LINEAGE_MAX:
+        successor = str(
+            by_id.get(current, {}).get("runtime_successor") or ""
+        )
+        if not successor or successor in seen or successor not in by_id:
+            break
+        lineage.append(successor)
+        seen.add(successor)
+        current = successor
+    return lineage
+
+
+def runtime_lineage(sid: str) -> list[str]:
+    """Return the durable rollover lineage containing ``sid``, oldest first.
+
+    One index snapshot is used for the entire walk.  Reading predecessor and
+    successor links through separate ``get_session_meta`` calls could otherwise
+    splice together two generations while a rollover commits or rolls back.
+    Broken links and cycles are bounded defensively rather than followed beyond
+    the indexed chain.
+    """
+    with _INDEX_LOCK:
+        return _runtime_lineage_from_rows(sid, _load_index())
 
 
 def update_model(sid: str, model: str) -> None:
@@ -918,6 +1355,41 @@ def update_permission(
                 s["permission"] = permission
                 _save_index(idx)
                 return True
+        return False
+
+
+def commit_plan_enter(
+    sid: str,
+    *,
+    expected_permission: str,
+    plan_return_permission: str,
+) -> bool:
+    """Compare-and-set a completed native EnterPlanMode transition.
+
+    The live CLI changes mode before its PostToolUse hook runs. Persist that
+    transition only when no browser or sibling runtime changed the session's
+    launch permission in the meantime; otherwise the caller discards the stale
+    runtime instead of overwriting the newer choice.
+    """
+    if expected_permission == "plan":
+        return False
+    target = _normalize_plan_return_permission("plan", plan_return_permission)
+    with _INDEX_LOCK:
+        idx = _load_index()
+        for s in idx:
+            if s["id"] != sid:
+                continue
+            current = (
+                s.get("permission", "").strip()
+                if isinstance(s.get("permission"), str)
+                else ""
+            )
+            if current != expected_permission:
+                return False
+            s["permission"] = "plan"
+            s["plan_return_permission"] = target
+            _save_index(idx)
+            return True
         return False
 
 
@@ -1011,6 +1483,463 @@ def get_message_annotations(sid: str) -> dict[str, dict]:
     return _load_sidecar(sid).get("messages", {})
 
 
+_RUNTIME_TASK_OVERLAY_MARKER = b'"runtime_task_overlays"'
+
+
+def _sidecar_has_runtime_task_overlays(sid: str) -> bool:
+    """Check for the overlay section without parsing a potentially huge sidecar.
+
+    Message annotations can make sidecars tens of megabytes. Startup only needs
+    the small minority containing runtime task state, so parsing every indexed
+    sidecar made each cold start spend about two minutes in JSON decoding.
+    False positives are safe (the normal loader validates them); I/O failures
+    deliberately return true so the authoritative loader still fails closed.
+    """
+    path = _sidecar_path(sid)
+    overlap = len(_RUNTIME_TASK_OVERLAY_MARKER) - 1
+    carry = b""
+    try:
+        with path.open("rb") as stream:
+            while chunk := stream.read(64 * 1024):
+                data = carry + chunk
+                if _RUNTIME_TASK_OVERLAY_MARKER in data:
+                    return True
+                carry = data[-overlap:]
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return False
+
+
+def _normalize_runtime_task_overlays(raw: Any) -> dict[str, dict]:
+    if not isinstance(raw, dict):
+        return {}
+    return {
+        str(task_id): normalize_task_summary_fields(value)
+        for task_id, value in raw.items()
+        if task_id and isinstance(value, dict)
+    }
+
+
+def _load_runtime_task_overlays_section(sid: str) -> dict[str, dict]:
+    """Decode only the overlay object, not the sidecar's large message map."""
+    path = _sidecar_path(sid)
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {}
+    except UnicodeDecodeError as exc:
+        raise RuntimeError(f"cannot parse session sidecar: {path}") from exc
+    marker_at = raw.find(_RUNTIME_TASK_OVERLAY_MARKER.decode("ascii"))
+    if marker_at < 0:
+        return {}
+    colon_at = raw.find(":", marker_at + len(_RUNTIME_TASK_OVERLAY_MARKER))
+    if colon_at < 0:
+        raise RuntimeError(f"cannot parse session sidecar: {path}")
+    value_at = colon_at + 1
+    while value_at < len(raw) and raw[value_at].isspace():
+        value_at += 1
+    try:
+        value, _ = json.JSONDecoder().raw_decode(raw, value_at)
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
+        raise RuntimeError(f"cannot parse session sidecar: {path}") from exc
+    return _normalize_runtime_task_overlays(value)
+
+
+def get_runtime_task_overlays(sid: str) -> dict[str, dict]:
+    """Return UI-only background task cards keyed by task id.
+
+    Runtime-rollover children never resume the predecessor's CLI process.  The
+    overlay lets their copied tool card reflect that process's lifecycle while
+    remaining completely absent from model context.
+    """
+    return _normalize_runtime_task_overlays(
+        _load_sidecar(sid).get("runtime_task_overlays") or {}
+    )
+
+
+_RUNTIME_TASK_TERMINAL_STATES = frozenset({
+    "completed", "failed", "stopped",
+})
+_RUNTIME_TASK_CROSS_COPY_IDENTITY_FIELDS = frozenset({
+    "tool_use_id", "description",
+})
+_RUNTIME_TASK_OVERLAY_COMPACTED_SIDS: set[str] = set()
+
+
+def _normalized_runtime_task_state(value: Any) -> Any:
+    """Normalize legacy terminal spellings without coercing unknown values."""
+    if not isinstance(value, str):
+        return value
+    normalized = value.strip().lower()
+    if normalized == "done":
+        return "completed"
+    if normalized == "killed":
+        return "stopped"
+    return normalized
+
+
+def set_runtime_task_overlay(
+    sid: str,
+    task_id: str,
+    *,
+    owner_session_id: str | None = None,
+    **fields: Any,
+) -> bool:
+    """Merge one durable UI-only task status into a session sidecar.
+
+    The first writer establishes the process owner.  Copies in rollover
+    successors retain that owner forever, and a task that has reached one
+    terminal state can neither be revived nor rewritten as a different
+    terminal outcome by a delayed notification.  The return value says whether
+    durable state actually changed.
+    """
+    task_id = str(task_id or "")
+    if not task_id:
+        return False
+    with session_lifecycle_lock(sid):
+        with _QUEUE_LOCK:
+            if sid in _DELETED_SESSION_IDS:
+                return False
+        with _SIDECAR_LOCK:
+            data = _load_sidecar(sid, use_cache=False)
+            overlays = data.setdefault("runtime_task_overlays", {})
+            if not isinstance(overlays, dict):
+                overlays = {}
+            overlays_compacted = False
+            if sid not in _RUNTIME_TASK_OVERLAY_COMPACTED_SIDS:
+                normalized_overlays = _normalize_runtime_task_overlays(overlays)
+                overlays_compacted = normalized_overlays != overlays
+                overlays = normalized_overlays
+                _RUNTIME_TASK_OVERLAY_COMPACTED_SIDS.add(sid)
+            data["runtime_task_overlays"] = overlays
+            stored = overlays.get(task_id)
+            current = dict(stored) if isinstance(stored, dict) else {
+                "task_id": task_id,
+            }
+            existing_owner = str(current.get("owner_session_id") or "")
+            requested_owner = str(owner_session_id or "")
+            if existing_owner and requested_owner not in ("", existing_owner):
+                return False
+            effective_owner = existing_owner or requested_owner or sid
+
+            incoming = {
+                key: value for key, value in fields.items()
+                if value is not None
+            }
+            incoming = normalize_task_summary_fields(incoming)
+            if "state" in incoming:
+                incoming["state"] = _normalized_runtime_task_state(
+                    incoming["state"]
+                )
+            current_state = _normalized_runtime_task_state(
+                current.get("state")
+            )
+            incoming_state = incoming.get("state")
+
+            # At-least-once delivery can reorder terminal TaskNotification
+            # records.  Once terminal, a different terminal result is never a
+            # harmless enrichment: rejecting the complete patch keeps summary,
+            # usage and timestamps tied to the authoritative outcome.
+            if (
+                current_state in _RUNTIME_TASK_TERMINAL_STATES
+                and incoming_state in _RUNTIME_TASK_TERMINAL_STATES
+                and incoming_state != current_state
+            ):
+                return False
+
+            # Task lifecycle delivery is at-least-once and can be reordered:
+            # a delayed launch/backfill patch may arrive after the terminal
+            # TaskNotification. Terminality is durable truth, so that stale
+            # ``running`` state may enrich immutable card identity only.  It
+            # must not replace terminal summary/usage/timing metadata.
+            late_running_patch = (
+                current_state in _RUNTIME_TASK_TERMINAL_STATES
+                and incoming_state == "running"
+            )
+            if late_running_patch:
+                incoming = {
+                    key: value for key, value in incoming.items()
+                    if (
+                        key in _RUNTIME_TASK_CROSS_COPY_IDENTITY_FIELDS
+                        and not current.get(key)
+                    )
+                }
+
+            updated = dict(current)
+            updated["owner_session_id"] = effective_owner
+            for key, value in incoming.items():
+                updated[key] = value
+            if current_state in _RUNTIME_TASK_TERMINAL_STATES:
+                updated["state"] = current_state
+            elif "state" in updated:
+                updated["state"] = _normalized_runtime_task_state(
+                    updated["state"]
+                )
+            updated["task_id"] = task_id
+            target_changed = not isinstance(stored, dict) or stored != updated
+            if not target_changed and not overlays_compacted:
+                return False
+            if target_changed:
+                overlays[task_id] = updated
+            _save_sidecar(sid, data)
+            return True
+
+
+def _authoritative_runtime_task_snapshot(
+    task_id: str,
+    lineage: list[str],
+    overlays_by_sid: dict[str, dict[str, dict]],
+) -> tuple[str, dict] | None:
+    """Resolve a task once, from its earliest durable lineage appearance.
+
+    Successor overlays are replicated UI views.  Their later lifecycle state
+    is never allowed to overrule the process owner's record; they may only fill
+    missing card identity fields.
+    """
+    candidates: list[tuple[int, str, dict]] = []
+    for position, row_sid in enumerate(lineage):
+        value = overlays_by_sid.get(row_sid, {}).get(task_id)
+        if isinstance(value, dict):
+            candidates.append((position, row_sid, value))
+    if not candidates:
+        return None
+
+    first_position, first_sid, first = candidates[0]
+    declared_owner = str(first.get("owner_session_id") or "")
+    try:
+        declared_position = lineage.index(declared_owner)
+    except ValueError:
+        declared_position = -1
+    # A copied task may first survive in a child while correctly naming an
+    # earlier owner whose sidecar was lost.  A claimed future owner is not a
+    # valid provenance edge and falls back to the first durable appearance.
+    owner_sid = (
+        declared_owner
+        if 0 <= declared_position <= first_position
+        else first_sid
+    )
+    owner_record = overlays_by_sid.get(owner_sid, {}).get(task_id)
+    authority = (
+        owner_record if isinstance(owner_record, dict) else first
+    )
+    canonical = dict(authority)
+    canonical["task_id"] = task_id
+    canonical["owner_session_id"] = owner_sid
+    if "state" in canonical:
+        canonical["state"] = _normalized_runtime_task_state(
+            canonical["state"]
+        )
+    for _position, _row_sid, candidate in candidates:
+        for key in _RUNTIME_TASK_CROSS_COPY_IDENTITY_FIELDS:
+            if not canonical.get(key) and candidate.get(key) is not None:
+                canonical[key] = candidate[key]
+    return owner_sid, canonical
+
+
+def get_authoritative_runtime_task_overlays(sid: str) -> dict[str, dict]:
+    """Return lineage-visible task cards resolved from their true owner.
+
+    A source runtime cannot see tasks launched by a later successor.  A child
+    can see predecessor-owned tasks even if a crash interrupted the physical
+    overlay copy, because those owners precede it in the durable lineage.
+    """
+    lineage = runtime_lineage(sid)
+    if not lineage or sid not in lineage:
+        return get_runtime_task_overlays(sid)
+    current_position = lineage.index(sid)
+    visible_lineage = lineage[:current_position + 1]
+    overlays_by_sid = {
+        row_sid: get_runtime_task_overlays(row_sid)
+        for row_sid in lineage
+    }
+    visible_task_ids = {
+        task_id
+        for row_sid in visible_lineage
+        for task_id in overlays_by_sid.get(row_sid, {})
+    }
+    authoritative: dict[str, dict] = {}
+    for task_id in visible_task_ids:
+        resolved = _authoritative_runtime_task_snapshot(
+            task_id, lineage, overlays_by_sid
+        )
+        if resolved is not None:
+            authoritative[task_id] = resolved[1]
+    return authoritative
+
+
+def _replace_runtime_task_overlay_snapshots(
+    sid: str,
+    snapshots: dict[str, dict],
+) -> int:
+    """Replace copied snapshots in one read-modify-write transaction."""
+    if not snapshots:
+        return 0
+    with session_lifecycle_lock(sid):
+        with _QUEUE_LOCK:
+            if sid in _DELETED_SESSION_IDS:
+                return 0
+        with _SIDECAR_LOCK:
+            data = _load_sidecar(sid, use_cache=False)
+            overlays = data.setdefault("runtime_task_overlays", {})
+            if not isinstance(overlays, dict):
+                overlays = {}
+            normalized_overlays = _normalize_runtime_task_overlays(overlays)
+            overlays_compacted = normalized_overlays != overlays
+            overlays = normalized_overlays
+            data["runtime_task_overlays"] = overlays
+            changed = 0
+            for task_id, snapshot in snapshots.items():
+                replacement = normalize_task_summary_fields(snapshot)
+                replacement["task_id"] = task_id
+                if overlays.get(task_id) == replacement:
+                    continue
+                overlays[task_id] = replacement
+                changed += 1
+            if changed or overlays_compacted:
+                _save_sidecar(sid, data)
+            return changed
+
+
+def reconcile_runtime_task_overlay_chains() -> int:
+    """Repair owner snapshots across every indexed runtime rollover chain.
+
+    Reconciliation is intended for startup before orphan settlement.  It
+    restores copied descendants from the earliest owner snapshot, then the
+    ordinary stale-task pass can settle only the genuine owner state and
+    replicate that result without mistaking a successor for a new process.
+    """
+    with _INDEX_LOCK:
+        rows = _load_index()
+    indexed_ids = [
+        str(row.get("id"))
+        for row in rows
+        if isinstance(row, dict) and row.get("id")
+    ]
+    overlay_sids = {
+        sid for sid in indexed_ids
+        if _sidecar_has_runtime_task_overlays(sid)
+    }
+    if not overlay_sids:
+        return 0
+
+    repaired = 0
+    visited: set[str] = set()
+    for indexed_sid in indexed_ids:
+        if indexed_sid in visited:
+            continue
+        lineage = _runtime_lineage_from_rows(indexed_sid, rows)
+        if not lineage:
+            continue
+        visited.update(lineage)
+        if overlay_sids.isdisjoint(lineage):
+            continue
+        overlays_by_sid = {
+            row_sid: (
+                _load_runtime_task_overlays_section(row_sid)
+                if row_sid in overlay_sids else {}
+            )
+            for row_sid in lineage
+        }
+        task_ids = {
+            task_id
+            for overlay in overlays_by_sid.values()
+            for task_id in overlay
+        }
+        repairs_by_sid: dict[str, dict[str, dict]] = {}
+        for task_id in task_ids:
+            resolved = _authoritative_runtime_task_snapshot(
+                task_id, lineage, overlays_by_sid
+            )
+            if resolved is None:
+                continue
+            owner_sid, canonical = resolved
+            try:
+                owner_position = lineage.index(owner_sid)
+            except ValueError:
+                continue
+            # Child-owned tasks do not exist in predecessor context.  Copy the
+            # canonical owner record only forward from its launch runtime.
+            for target_sid in lineage[owner_position:]:
+                if overlays_by_sid.get(target_sid, {}).get(task_id) == canonical:
+                    continue
+                repairs_by_sid.setdefault(target_sid, {})[task_id] = canonical
+        for target_sid, snapshots in repairs_by_sid.items():
+            repaired += _replace_runtime_task_overlay_snapshots(
+                target_sid, snapshots
+            )
+    return repaired
+
+
+def copy_runtime_task_overlays(source_sid: str, target_sid: str) -> int:
+    """Copy source task-card state to a rollover child, preserving owner id."""
+    overlays = get_runtime_task_overlays(source_sid)
+    for task_id, overlay in overlays.items():
+        fields = {key: value for key, value in overlay.items()
+                  if key != "task_id"}
+        set_runtime_task_overlay(target_sid, task_id, **fields)
+    return len(overlays)
+
+
+def stop_stale_runtime_task_overlays() -> int:
+    """Settle persisted running cards whose process-local owner was restarted.
+
+    Runtime task readers, CLI clients and watcher pins are deliberately kept
+    in memory.  When a new backend process starts, every durable ``running``
+    overlay is therefore an orphan from the previous process, not evidence of
+    a task that can still report a terminal notification to this process.
+    """
+    stopped = 0
+    now_ms = int(time.time() * 1000)
+    for sid in indexed_session_ids():
+        if not _sidecar_has_runtime_task_overlays(sid):
+            continue
+        for task_id, overlay in _load_runtime_task_overlays_section(sid).items():
+            if overlay.get("state") != "running":
+                continue
+            changed = set_runtime_task_overlay(
+                sid,
+                task_id,
+                state="stopped",
+                updated_at=now_ms,
+                restart_recovered=True,
+            )
+            if changed:
+                stopped += 1
+    return stopped
+
+
+def copy_message_annotations(
+    source_sid: str,
+    target_sid: str,
+    uuid_mapping: dict[str, str],
+) -> int:
+    """Copy fork-visible annotations, re-keyed to the fork's fresh UUIDs."""
+    if not uuid_mapping:
+        return 0
+    with session_lifecycle_lock(target_sid):
+        with _QUEUE_LOCK:
+            if target_sid in _DELETED_SESSION_IDS:
+                return 0
+        with _SIDECAR_LOCK:
+            source = _load_sidecar(source_sid)
+            target = _load_sidecar(target_sid, use_cache=False)
+            source_messages = source.get("messages") or {}
+            target_messages = target.setdefault("messages", {})
+            copied = 0
+            for old_uuid, new_uuid in uuid_mapping.items():
+                annotation = source_messages.get(old_uuid)
+                if not isinstance(annotation, dict):
+                    continue
+                target_messages[new_uuid] = dict(annotation)
+                copied += 1
+            if source.get("context_max_tokens"):
+                target["context_max_tokens"] = source["context_max_tokens"]
+            _save_sidecar(target_sid, target)
+            return copied
+
+
 def has_pending_attachments(sid: str) -> bool:
     """True when the sidecar holds unbound pending image/doc attachments.
     Cheap (cached sidecar read); lets read paths skip work that only
@@ -1029,19 +1958,103 @@ def sidecar_signature(sid: str) -> tuple[float, int] | None:
         return None
 
 
+def get_session_usage_summary(sid: str) -> dict | None:
+    """Return the persisted usage summary without hiding malformed schemas."""
+    summary = _load_sidecar(sid).get("usage_summary")
+    return dict(summary) if isinstance(summary, dict) else None
+
+
+def set_session_usage_summary(sid: str, summary: dict) -> bool:
+    """Persist usage hydration under the deletion and corruption fences."""
+    with session_lifecycle_lock(sid):
+        with _QUEUE_LOCK:
+            if sid in _DELETED_SESSION_IDS:
+                return False
+        with _SIDECAR_LOCK:
+            data = _load_sidecar(sid, use_cache=False)
+            data["usage_summary"] = dict(summary)
+            _save_sidecar(sid, data)
+            return True
+
+
+def set_session_usage_summary_if_turn_matches(
+    sid: str,
+    expected_turn_id: str,
+    summary: dict,
+) -> bool:
+    """Refine usage only while the same terminal turn owns the sidecar."""
+    with session_lifecycle_lock(sid):
+        with _QUEUE_LOCK:
+            if sid in _DELETED_SESSION_IDS:
+                return False
+        with _SIDECAR_LOCK:
+            data = _load_sidecar(sid, use_cache=False)
+            current = data.get("usage_summary")
+            update = current.get("update") if isinstance(current, dict) else None
+            current_turn_id = (
+                str(update.get("turn_id") or "")
+                if isinstance(update, dict) else ""
+            )
+            if not expected_turn_id or current_turn_id != expected_turn_id:
+                return False
+            data["usage_summary"] = dict(summary)
+            _save_sidecar(sid, data)
+            return True
+
+
+def set_terminal_annotation_and_usage(
+    sid: str,
+    msg_uuid: str,
+    summary: dict | None,
+    **fields: Any,
+) -> bool:
+    """Persist the terminal footer and optional usage summary in one replace."""
+    with session_lifecycle_lock(sid):
+        with _QUEUE_LOCK:
+            if sid in _DELETED_SESSION_IDS:
+                return False
+        with _SIDECAR_LOCK:
+            data = _load_sidecar(sid, use_cache=False)
+            _merge_message_annotation(data, msg_uuid, fields)
+            if isinstance(summary, dict):
+                data["usage_summary"] = dict(summary)
+            _save_sidecar(sid, data)
+            return True
+
+
+def _merge_message_annotation(
+    data: dict,
+    msg_uuid: str,
+    fields: dict[str, Any],
+) -> None:
+    msgs = data.setdefault("messages", {})
+    cur = msgs.setdefault(msg_uuid, {})
+    sticky_cancelled = (
+        cur.get("turn_status") == "cancelled"
+        and fields.get("turn_status") not in (None, "cancelled")
+    )
+    for key, value in fields.items():
+        if value is None:
+            continue
+        if sticky_cancelled and key in {"turn_status", "ts", "elapsed_s"}:
+            continue
+        cur[key] = value
+
+
 def set_message_annotation(sid: str, msg_uuid: str, **fields: Any) -> None:
     """Update one message's annotations (cost, model, images, etc.).
     Fields with value None are skipped (use update with explicit empty
     if you want to clear). Atomic per-call write."""
-    with _SIDECAR_LOCK:
-        data = _load_sidecar(sid, use_cache=False)
-        msgs = data.setdefault("messages", {})
-        cur = msgs.setdefault(msg_uuid, {})
-        for k, v in fields.items():
-            if v is None:
-                continue
-            cur[k] = v
-        _save_sidecar(sid, data)
+    # Linearize terminal footer writes with explicit deletion. Every worker
+    # arriving after the tombstone is a no-op and cannot recreate the sidecar.
+    with session_lifecycle_lock(sid):
+        with _QUEUE_LOCK:
+            if sid in _DELETED_SESSION_IDS:
+                return
+        with _SIDECAR_LOCK:
+            data = _load_sidecar(sid, use_cache=False)
+            _merge_message_annotation(data, msg_uuid, fields)
+            _save_sidecar(sid, data)
 
 
 def get_session_ctx_window(sid: str) -> int | None:
@@ -1070,12 +2083,16 @@ def set_session_ctx_window(sid: str, max_tokens: int) -> None:
     (avoids a sidecar rewrite on every turn)."""
     if not max_tokens or max_tokens <= 0:
         return
-    with _SIDECAR_LOCK:
-        data = _load_sidecar(sid, use_cache=False)
-        if int(data.get("context_max_tokens") or 0) == int(max_tokens):
-            return
-        data["context_max_tokens"] = int(max_tokens)
-        _save_sidecar(sid, data)
+    with session_lifecycle_lock(sid):
+        with _QUEUE_LOCK:
+            if sid in _DELETED_SESSION_IDS:
+                return
+        with _SIDECAR_LOCK:
+            data = _load_sidecar(sid, use_cache=False)
+            if int(data.get("context_max_tokens") or 0) == int(max_tokens):
+                return
+            data["context_max_tokens"] = int(max_tokens)
+            _save_sidecar(sid, data)
 
 
 # Hard cap on pending_attachments to prevent unbounded sidecar growth.
@@ -1112,49 +2129,57 @@ def append_pending_attachments(sid: str, images: list[dict] | None = None,
     if not images and not docs:
         return
     now_ms = int(__import__("time").time() * 1000)
-    with _SIDECAR_LOCK:
-        data = _load_sidecar(sid, use_cache=False)
-        pend = data.setdefault("pending_attachments", [])
-        # GC stale entries first (age them out by ts).
-        cutoff = now_ms - _PENDING_ATTACH_TTL_MS
-        if pend and any((p.get("ts") or 0) < cutoff for p in pend):
-            pend = [p for p in pend if (p.get("ts") or 0) >= cutoff]
-            data["pending_attachments"] = pend
-        pend.append({
-            "ts": now_ms,
-            "images": images or [],
-            "docs": docs or [],
-        })
-        # Hard cap — drop oldest (FIFO) so the freshest are kept for the
-        # next consume call.
-        if len(pend) > _PENDING_ATTACH_CAP:
-            del pend[: len(pend) - _PENDING_ATTACH_CAP]
-        _save_sidecar(sid, data)
+    with session_lifecycle_lock(sid):
+        with _QUEUE_LOCK:
+            if sid in _DELETED_SESSION_IDS:
+                return
+        with _SIDECAR_LOCK:
+            data = _load_sidecar(sid, use_cache=False)
+            pend = data.setdefault("pending_attachments", [])
+            # GC stale entries first (age them out by ts).
+            cutoff = now_ms - _PENDING_ATTACH_TTL_MS
+            if pend and any((p.get("ts") or 0) < cutoff for p in pend):
+                pend = [p for p in pend if (p.get("ts") or 0) >= cutoff]
+                data["pending_attachments"] = pend
+            pend.append({
+                "ts": now_ms,
+                "images": images or [],
+                "docs": docs or [],
+            })
+            # Hard cap — drop oldest (FIFO) so the freshest are kept for the
+            # next consume call.
+            if len(pend) > _PENDING_ATTACH_CAP:
+                del pend[: len(pend) - _PENDING_ATTACH_CAP]
+            _save_sidecar(sid, data)
 
 
 def consume_one_pending_attachments(sid: str, msg_uuid: str) -> dict | None:
     """Pop the oldest pending bundle and bind it to `msg_uuid` as a
     normal annotation. Returns the bundle (or None if no pending /
     already bound). Idempotent."""
-    with _SIDECAR_LOCK:
-        data = _load_sidecar(sid, use_cache=False)
-        msgs = data.setdefault("messages", {})
-        cur = msgs.setdefault(msg_uuid, {})
-        if cur.get("images") or cur.get("docs"):
-            return None  # already bound elsewhere
-        pend = data.get("pending_attachments") or []
-        if not pend:
-            return None
-        first = pend[0]
-        images = first.get("images") or []
-        docs = first.get("docs") or []
-        if images:
-            cur["images"] = images
-        if docs:
-            cur["docs"] = docs
-        data["pending_attachments"] = pend[1:]
-        _save_sidecar(sid, data)
-        return first
+    with session_lifecycle_lock(sid):
+        with _QUEUE_LOCK:
+            if sid in _DELETED_SESSION_IDS:
+                return None
+        with _SIDECAR_LOCK:
+            data = _load_sidecar(sid, use_cache=False)
+            msgs = data.setdefault("messages", {})
+            cur = msgs.setdefault(msg_uuid, {})
+            if cur.get("images") or cur.get("docs"):
+                return None  # already bound elsewhere
+            pend = data.get("pending_attachments") or []
+            if not pend:
+                return None
+            first = pend[0]
+            images = first.get("images") or []
+            docs = first.get("docs") or []
+            if images:
+                cur["images"] = images
+            if docs:
+                cur["docs"] = docs
+            data["pending_attachments"] = pend[1:]
+            _save_sidecar(sid, data)
+            return first
 
 
 # ============================================================================
@@ -1265,36 +2290,73 @@ def set_message_count(sid: str, message_count: int,
 # window between a queue mutation and an annotation write. A dedicated file +
 # lock keeps the two independent.
 #
-# Shape: {"items": [{"id","text","image_ids","permission",
+# Shape: {"items": [{"id","text","display_text","selection_quotes",
+#                    "image_ids","permission",
 #                    "plan_return_permission","enqueued_at"}], "paused": bool}
 #   - items: FIFO; head is sent next by the drain trigger in chat.py
 #   - paused: set True when a queued turn errors / hits ask_user_question /
 #     is user-cancelled; auto-drain stops until the user resumes
 #
-# Attachment caveat: image_ids reference the in-memory _image_store in chat.py
-# which expires entries after 10 min. A long-queued item's attachments may be
-# gone by drain time — _start_turn silently skips expired ids and sends the
-# text alone. (Mirrors the frontend's prior choice not to persist attachment
-# blobs in the queue.)
+# Attachment ids resolve through chat.py's durable blob/SQLite registry. The
+# JSON sidecar deliberately retains only opaque ids and presentation data.
 _QUEUE_LOCK = threading.Lock()
 _QUEUE_MAX = 10   # mirror the frontend cap
+# Process-local deletion fence. It is always read/written under _QUEUE_LOCK.
+# Disk deletion alone is insufficient: a cancelled drain can retain an old
+# queue snapshot and otherwise write it back after unlink.
+_DELETED_SESSION_IDS: set[str] = set()
+
+
+def session_is_deleting(sid: str) -> bool:
+    """Return whether explicit deletion has fenced this session in-process."""
+    with _QUEUE_LOCK:
+        return sid in _DELETED_SESSION_IDS
 
 
 def _queue_path(sid: str) -> Path:
     return SESS_DIR / f"{sid}.queue.json"
 
 
-def _load_queue(sid: str) -> dict:
+def _empty_queue() -> dict:
+    return {"revision": 0, "items": [], "inflight": None, "paused": False}
+
+
+def _load_queue(sid: str, *, strict: bool = False) -> dict:
+    if sid in _DELETED_SESSION_IDS:
+        return _empty_queue()
     p = _queue_path(sid)
     if not p.exists():
-        return {"items": [], "paused": False}
+        return _empty_queue()
     try:
         d = json.loads(p.read_text(encoding="utf-8"))
+        if not isinstance(d, dict):
+            raise ValueError("queue root must be an object")
+        d.setdefault("revision", 0)
         d.setdefault("items", [])
+        d.setdefault("inflight", None)
         d.setdefault("paused", False)
+        try:
+            revision = int(d["revision"])
+            if strict and (
+                isinstance(d["revision"], bool)
+                or revision < 0
+                or not isinstance(d["revision"], int)
+            ):
+                raise ValueError("queue revision must be a non-negative integer")
+            d["revision"] = max(0, revision)
+        except (TypeError, ValueError):
+            if strict:
+                raise ValueError("queue revision must be a non-negative integer") from None
+            d["revision"] = 0
         if not isinstance(d["items"], list):
+            if strict:
+                raise ValueError("queue items must be a list")
             d["items"] = []
         else:
+            if strict and not all(
+                isinstance(item, dict) for item in d["items"]
+            ):
+                raise ValueError("queue items must be objects")
             # Compatibility is read-only here: legacy Plan items immediately
             # behave as default-on-exit, while GET does not rewrite the file.
             d["items"] = [
@@ -1302,12 +2364,56 @@ def _load_queue(sid: str) -> dict:
                 if isinstance(item, dict) else item
                 for item in d["items"]
             ]
+            if strict:
+                item_ids = [str(item.get("id") or "") for item in d["items"]]
+                if any(not item_id for item_id in item_ids):
+                    raise ValueError("queue items must have ids")
+                if len(set(item_ids)) != len(item_ids):
+                    raise ValueError("queue item ids must be unique")
+        inflight = d.get("inflight")
+        if (
+            not isinstance(inflight, dict)
+            or not isinstance(inflight.get("item"), dict)
+        ):
+            if strict and inflight is not None:
+                raise ValueError("queue inflight must contain an item object")
+            d["inflight"] = None
+        else:
+            inflight_item = _normalize_session_permission_fields(inflight["item"])
+            inflight_id = str(inflight_item.get("id") or "")
+            if strict and not inflight_id:
+                raise ValueError("queue inflight item must have an id")
+            if strict and any(
+                str(item.get("id") or "") == inflight_id for item in d["items"]
+            ):
+                raise ValueError("queue inflight id duplicates a waiting item")
+            d["inflight"] = {
+                "item": inflight_item,
+                "turn_id": str(inflight.get("turn_id") or ""),
+                "claimed_at": int(inflight.get("claimed_at") or 0),
+            }
+        if strict and not isinstance(d.get("paused"), bool):
+            raise ValueError("queue paused must be a boolean")
+        # ``paused`` only governs work still waiting in ``items``. The claimed
+        # item is already owned by a turn and must be acknowledged by that turn.
+        if not d["items"]:
+            d["paused"] = False
         return d
-    except Exception:
-        return {"items": [], "paused": False}
+    except Exception as exc:
+        if strict:
+            raise RuntimeError(f"cannot parse queue sidecar: {p}") from exc
+        return _empty_queue()
 
 
-def _save_queue(sid: str, data: dict) -> None:
+def _bump_queue_revision(data: dict) -> None:
+    data["revision"] = max(0, int(data.get("revision") or 0)) + 1
+
+
+def _save_queue(sid: str, data: dict, *, bump: bool = True) -> bool:
+    if sid in _DELETED_SESSION_IDS:
+        data.clear()
+        data.update(_empty_queue())
+        return False
     canonical = dict(data)
     items = canonical.get("items")
     if isinstance(items, list):
@@ -1316,31 +2422,173 @@ def _save_queue(sid: str, data: dict) -> None:
             if isinstance(item, dict) else item
             for item in items
         ]
-    # An empty, un-paused queue leaves no file behind (avoids littering
-    # sessions/ with thousands of empty queue.json files over time).
-    if not canonical.get("items") and not canonical.get("paused"):
-        p = _queue_path(sid)
-        if p.exists():
-            try:
-                p.unlink()
-            except OSError:
-                pass
-        return
+    inflight = canonical.get("inflight")
+    if isinstance(inflight, dict) and isinstance(inflight.get("item"), dict):
+        canonical["inflight"] = {
+            "item": _normalize_session_permission_fields(inflight["item"]),
+            "turn_id": str(inflight.get("turn_id") or ""),
+            "claimed_at": int(inflight.get("claimed_at") or 0),
+        }
+    else:
+        canonical["inflight"] = None
+    if not canonical.get("items"):
+        canonical["paused"] = False
+    if bump:
+        _bump_queue_revision(canonical)
+    else:
+        canonical["revision"] = max(0, int(canonical.get("revision") or 0))
+    # Keep an empty revision tombstone. A late GET that started before the last
+    # removal must not resurrect a consumed item in the browser mirror; the
+    # monotonically increasing revision lets the frontend reject that response.
     atomic_write_text(
         _queue_path(sid),
         json.dumps(canonical, ensure_ascii=False),
+        mode=0o600,
     )
+    data.clear()
+    data.update(canonical)
+    return True
 
 
 def get_queue(sid: str) -> dict:
-    """Return the current queue snapshot: {'items': [...], 'paused': bool}."""
+    """Return the public queue snapshot; inflight is exposed separately."""
     with _QUEUE_LOCK:
         return _load_queue(sid)
 
 
+def migrate_queue(source_sid: str, target_sid: str) -> dict:
+    """Atomically move all not-yet-executing queue work to a runtime child.
+
+    A rollover happens after the ordinary turn is complete, so a source claim
+    should either be absent or still unbound.  Bound claims may already have
+    side effects and therefore fail closed instead of being duplicated.  Item
+    ids are retained and de-duplicated, making a retried migration idempotent.
+    """
+    if not source_sid or not target_sid or source_sid == target_sid:
+        return {
+            "migrated": 0,
+            "source": get_queue(source_sid),
+            "target": get_queue(target_sid),
+        }
+    with _QUEUE_LOCK:
+        if source_sid in _DELETED_SESSION_IDS:
+            raise ValueError("source session deleted")
+        if target_sid in _DELETED_SESSION_IDS:
+            raise ValueError("target session deleted")
+        source = _load_queue(source_sid, strict=True)
+        target = _load_queue(target_sid, strict=True)
+
+        source_inflight = source.get("inflight") or {}
+        inflight_item = source_inflight.get("item") or {}
+        if inflight_item and str(source_inflight.get("turn_id") or ""):
+            raise ValueError("source queue item is already executing")
+
+        moving: list[dict] = []
+        if inflight_item:
+            moving.append(inflight_item)
+        moving.extend(source.get("items") or [])
+        if not moving:
+            return {"migrated": 0, "source": source, "target": target}
+
+        target_inflight = target.get("inflight") or {}
+        active_count = len(target.get("items") or []) + int(bool(target_inflight))
+        target_ids = {
+            str(item.get("id") or "") for item in target.get("items") or []
+        }
+        target_inflight_id = str(
+            ((target_inflight.get("item") or {}).get("id") or "")
+        )
+        if target_inflight_id:
+            target_ids.add(target_inflight_id)
+        unique_moving = [
+            item for item in moving
+            if str(item.get("id") or "") not in target_ids
+        ]
+        if active_count + len(unique_moving) > _QUEUE_MAX:
+            raise ValueError("target queue is full")
+
+        combined = [*(target.get("items") or []), *unique_moving]
+        # Requests accepted before the rollover stay ahead of later child
+        # requests even if a retry migrates them after the child has been used.
+        combined.sort(key=lambda item: int(item.get("enqueued_at") or 0))
+        target["items"] = combined
+        target["paused"] = bool(target.get("paused") or source.get("paused"))
+        source["items"] = []
+        source["inflight"] = None
+        source["paused"] = False
+        _save_queue(target_sid, target)
+        _save_queue(source_sid, source)
+        return {
+            "migrated": len(unique_moving),
+            "source": source,
+            "target": target,
+        }
+
+
+def list_queue_session_ids() -> list[str]:
+    """Return session ids that currently have a persistent queue sidecar."""
+    result = []
+    for path in SESS_DIR.glob("*.queue.json"):
+        name = path.name
+        if name.endswith(".queue.json"):
+            result.append(name[:-len(".queue.json")])
+    return result
+
+
+def _queue_session_not_found() -> dict:
+    return {
+        "ok": False,
+        "error": "session_not_found",
+        "queue": _empty_queue(),
+    }
+
+
+def _enqueue_message_locked(
+    sid: str,
+    text: str,
+    image_ids: str,
+    permission: str,
+    display_text: str,
+    selection_quotes: list[dict] | None,
+    plan_return_permission: str | None,
+    item_id: str = "",
+) -> dict:
+    """Append one item while the caller owns ``_QUEUE_LOCK``."""
+    if sid in _DELETED_SESSION_IDS:
+        return _queue_session_not_found()
+    # A malformed sidecar can contain already-accepted work. Never coerce it
+    # to an empty queue and overwrite it during an ordinary enqueue.
+    data = _load_queue(sid, strict=True)
+    active_count = len(data["items"]) + int(bool(data.get("inflight")))
+    if active_count >= _QUEUE_MAX:
+        return {"ok": False, "error": "queue_full", "queue": data}
+    item = {
+        "id": item_id or "q-" + uuid.uuid4().hex,
+        "text": text or "",
+        "display_text": display_text or "",
+        "selection_quotes": selection_quotes or [],
+        "image_ids": image_ids or "",
+        "permission": permission or "",
+        "plan_return_permission": _normalize_plan_return_permission(
+            permission,
+            plan_return_permission,
+        ),
+        "enqueued_at": int(time.time() * 1000),
+    }
+    data["items"].append(item)
+    _save_queue(sid, data)
+    return {"ok": True, "item": item, "queue": data}
+
+
 def enqueue_message(sid: str, text: str, image_ids: str = "",
                     permission: str = "",
-                    plan_return_permission: str | None = None) -> dict:
+                    display_text: str = "",
+                    selection_quotes: list[dict] | None = None,
+                    plan_return_permission: str | None = None,
+                    item_id: str = "",
+                    *, require_session: bool = False,
+                    existing_session: dict | None = None,
+                    sdk_verified: bool = False) -> dict:
     """Append a message to the session's queue. Returns
     {'ok': bool, 'item'?: dict, 'queue': dict, 'error'?: str}. Rejects past
     _QUEUE_MAX (mirrors frontend cap).
@@ -1348,54 +2596,299 @@ def enqueue_message(sid: str, text: str, image_ids: str = "",
     `permission` and `plan_return_permission` snapshot the sender's complete
     launch contract at enqueue time so the headless drain neither falls back
     to a server default nor reads a newer session selection."""
+
     with _QUEUE_LOCK:
-        data = _load_queue(sid)
-        if len(data["items"]) >= _QUEUE_MAX:
-            return {"ok": False, "error": "queue_full", "queue": data}
-        item = {
-            "id": "q-" + uuid.uuid4().hex[:8],
-            "text": text or "",
-            "image_ids": image_ids or "",
-            "permission": permission or "",
-            "plan_return_permission": _normalize_plan_return_permission(
-                permission,
-                plan_return_permission,
-            ),
-            "enqueued_at": int(time.time() * 1000),
-        }
-        data["items"].append(item)
-        _save_queue(sid, data)
-        return {"ok": True, "item": item, "queue": data}
+        if require_session:
+            # Match prune's lock order and hold both through the queue commit.
+            # If prune wins, the missing index row rejects the enqueue; if this
+            # path wins, prune observes the committed queue and preserves it.
+            with _INDEX_LOCK:
+                idx = _load_index()
+                if not any(row.get("id") == sid for row in idx):
+                    if (
+                        not sdk_verified
+                        or not existing_session
+                        or existing_session.get("id") != sid
+                    ):
+                        return _queue_session_not_found()
+                    # SDK-only sessions are first-class in MuseLab. Self-heal a
+                    # minimal durable index row under the same locks as the
+                    # queue commit so prune cannot remove it in between.
+                    now = time.time()
+                    candidate = {
+                        key: existing_session.get(key)
+                        for key in (
+                            "id", "name", "model", "permission",
+                            "plan_return_permission", "created_at", "updated_at",
+                            "message_count", "turn_count", "auto_named", "effort",
+                            "service_tier", "thinking", "activity_hidden",
+                            "runtime_profile", "cwd", "pinned", "tag",
+                            "forked_from", "forked_from_name",
+                            "forked_from_message_id",
+                            "runtime_shadow", "runtime_successor",
+                            "runtime_predecessor",
+                            "runtime_boundary_message_id",
+                            "runtime_fork_boundary_at",
+                        )
+                        if existing_session.get(key) is not None
+                    }
+                    candidate.update({
+                        "id": sid,
+                        "name": str(candidate.get("name") or _default_session_name()),
+                        "created_at": candidate.get("created_at") or now,
+                        "updated_at": candidate.get("updated_at") or now,
+                        "message_count": int(candidate.get("message_count") or 0),
+                        "turn_count": int(candidate.get("turn_count") or 0),
+                        "auto_named": bool(candidate.get("auto_named", True)),
+                        "cwd": str(candidate.get("cwd") or ROOT),
+                    })
+                    idx.append(_normalize_session_permission_fields(candidate))
+                    _save_index(idx)
+                return _enqueue_message_locked(
+                    sid,
+                    text,
+                    image_ids,
+                    permission,
+                    display_text,
+                    selection_quotes,
+                    plan_return_permission,
+                    item_id,
+                )
+        return _enqueue_message_locked(
+            sid,
+            text,
+            image_ids,
+            permission,
+            display_text,
+            selection_quotes,
+            plan_return_permission,
+            item_id,
+        )
 
 
-def dequeue_message(sid: str) -> dict | None:
-    """Pop + return the head item (FIFO) IF the queue is non-empty and not
-    paused; else None. Called by the drain trigger after a turn completes."""
+def enqueue_existing_message(
+    sid: str,
+    text: str,
+    image_ids: str = "",
+    permission: str = "",
+    display_text: str = "",
+    selection_quotes: list[dict] | None = None,
+    plan_return_permission: str | None = None,
+    item_id: str = "",
+) -> dict:
+    """Atomically resolve an existing session and append one queued message.
+
+    Indexed sessions take the queue -> index fast path: one index read and no
+    lifecycle stripe.  DELETE and prune use the same lock order, so the enqueue
+    still linearizes wholly before removal (and is removed with it) or wholly
+    after the deletion tombstone (and is rejected).
+
+    Only an index miss takes the slower lifecycle-owned SDK probe.  That lock
+    spans SDK-only discovery and the local queue commit, so an old SDK snapshot
+    can never recreate a session after deletion has already won.
+    """
+    # Nearly every browser enqueue targets an already-indexed MuseLab session.
+    # Resolve and commit it in one queue/index transaction instead of taking a
+    # lifecycle stripe, reading index.json once in get_session_for_queue(),
+    # then reading it again in enqueue_message(require_session=True).
     with _QUEUE_LOCK:
-        data = _load_queue(sid)
-        if data.get("paused") or not data["items"]:
+        if sid in _DELETED_SESSION_IDS:
+            return _queue_session_not_found()
+        with _INDEX_LOCK:
+            indexed = next(
+                (
+                    dict(row)
+                    for row in _load_index()
+                    if isinstance(row, dict) and row.get("id") == sid
+                ),
+                None,
+            )
+            if indexed is not None:
+                current = _normalize_session_permission_fields(
+                    {**indexed, "cwd": str(indexed.get("cwd") or ROOT)}
+                )
+                if permission == "plan" and plan_return_permission is None:
+                    plan_return_permission = (
+                        current.get("plan_return_permission")
+                        if current.get("permission") == "plan"
+                        else current.get("permission")
+                    )
+                return _enqueue_message_locked(
+                    sid,
+                    text,
+                    image_ids,
+                    permission,
+                    display_text,
+                    selection_quotes,
+                    plan_return_permission,
+                    item_id,
+                )
+
+    # An SDK-only session needs a potentially slow workspace probe and a
+    # durable index self-heal.  Keep the existing lifecycle transaction for
+    # this exceptional path; explicit DELETE uses the same stripe.
+    with session_lifecycle_lock(sid):
+        current, sdk_verified = get_session_for_queue(sid)
+        if current is None:
+            return _queue_session_not_found()
+        if permission == "plan" and plan_return_permission is None:
+            plan_return_permission = (
+                current.get("plan_return_permission")
+                if current.get("permission") == "plan"
+                else current.get("permission")
+            )
+        return enqueue_message(
+            sid,
+            text,
+            image_ids,
+            permission=permission,
+            display_text=display_text,
+            selection_quotes=selection_quotes,
+            plan_return_permission=plan_return_permission,
+            item_id=item_id,
+            require_session=True,
+            existing_session=current,
+            sdk_verified=sdk_verified,
+        )
+
+
+def claim_queue_message(sid: str) -> dict | None:
+    """Atomically move the FIFO head into a durable inflight slot.
+
+    The item remains persisted until its actual assistant turn finishes and
+    calls ``ack_queue_message``. A process restart restores an unbound claim
+    to the queue head; a bound claim is reconciled by the owning turn id.
+    """
+    with _QUEUE_LOCK:
+        if sid in _DELETED_SESSION_IDS:
+            return None
+        data = _load_queue(sid, strict=True)
+        if data.get("inflight") or data.get("paused") or not data["items"]:
             return None
         item = data["items"].pop(0)
+        data["inflight"] = {
+            "item": item,
+            "turn_id": "",
+            "claimed_at": int(time.time() * 1000),
+        }
         _save_queue(sid, data)
         return item
 
 
-def requeue_head(sid: str, item: dict) -> dict:
-    """Re-insert a previously-dequeued item at the HEAD of the queue (FIFO
-    restore). Used by the drain trigger when it loses the _active_turns race
-    or fails to start the turn — so the item isn't silently dropped. Bypasses
-    the _QUEUE_MAX cap (it's restoring an item that was already accepted)."""
+def bind_queue_turn(sid: str, item_id: str, turn_id: str) -> dict:
     with _QUEUE_LOCK:
-        data = _load_queue(sid)
-        data["items"].insert(
-            0,
-            _normalize_session_permission_fields(item),
-        )
+        if sid in _DELETED_SESSION_IDS:
+            raise ValueError("session deleted")
+        data = _load_queue(sid, strict=True)
+        inflight = data.get("inflight") or {}
+        item = inflight.get("item") or {}
+        if str(item.get("id") or "") != str(item_id or ""):
+            raise ValueError("queue inflight item changed")
+        current_turn = str(inflight.get("turn_id") or "")
+        if current_turn and current_turn != str(turn_id or ""):
+            raise ValueError("queue inflight turn changed")
+        inflight["turn_id"] = str(turn_id or "")
+        data["inflight"] = inflight
         _save_queue(sid, data)
         return data
 
 
-def remove_queue_item(sid: str, item_id: str) -> dict:
+def ack_queue_message(sid: str, item_id: str, turn_id: str) -> bool:
+    with _QUEUE_LOCK:
+        if sid in _DELETED_SESSION_IDS:
+            return False
+        data = _load_queue(sid, strict=True)
+        inflight = data.get("inflight") or {}
+        item = inflight.get("item") or {}
+        if (str(item.get("id") or "") != str(item_id or "")
+                or str(inflight.get("turn_id") or "") != str(turn_id or "")):
+            return False
+        data["inflight"] = None
+        _save_queue(sid, data)
+        return True
+
+
+def release_queue_claim(
+    sid: str,
+    item_id: str,
+    *,
+    turn_id: str = "",
+    pause: bool = False,
+) -> bool:
+    """Return an uncompleted inflight item to the FIFO head exactly once."""
+    with _QUEUE_LOCK:
+        if sid in _DELETED_SESSION_IDS:
+            return False
+        data = _load_queue(sid, strict=True)
+        inflight = data.get("inflight") or {}
+        item = inflight.get("item") or {}
+        if str(item.get("id") or "") != str(item_id or ""):
+            return False
+        bound_turn = str(inflight.get("turn_id") or "")
+        if bound_turn != str(turn_id or ""):
+            return False
+        data["inflight"] = None
+        if not any(str(row.get("id") or "") == str(item_id)
+                   for row in data["items"]):
+            data["items"].insert(0, item)
+        data["paused"] = bool(pause) and bool(data["items"])
+        _save_queue(sid, data)
+        return True
+
+
+def recover_queue_inflight(sid: str) -> dict:
+    """Reconcile and conservatively pause queued work after process restart.
+
+    A bound claim may already have performed external side effects.  An
+    unbound claim is safe from duplicate execution, but the process restart
+    still erased the preceding turn's in-memory terminal truth and all staged
+    attachments.  Restore either claim exactly once, then pause every surviving
+    item so only an explicit user review/resume can execute it.
+    """
+    with _QUEUE_LOCK:
+        if sid in _DELETED_SESSION_IDS:
+            return _empty_queue()
+        data = _load_queue(sid, strict=True)
+        inflight = data.get("inflight") or {}
+        item = inflight.get("item") or {}
+        changed = False
+        if item:
+            item_id = str(item.get("id") or "")
+            data["inflight"] = None
+            if item_id and not any(str(row.get("id") or "") == item_id
+                                   for row in data["items"]):
+                data["items"].insert(0, item)
+            changed = True
+        should_pause = bool(data["items"])
+        if bool(data.get("paused")) != should_pause:
+            data["paused"] = should_pause
+            changed = True
+        if changed:
+            _save_queue(sid, data)
+        return data
+
+
+# Backward-compatible helper names for callers/tests outside the drain path.
+def dequeue_message(sid: str) -> dict | None:
+    return claim_queue_message(sid)
+
+
+def requeue_head(sid: str, item: dict) -> dict:
+    item_id = str(item.get("id") or "")
+    release_queue_claim(sid, item_id)
+    with _QUEUE_LOCK:
+        data = _load_queue(sid, strict=True)
+        if not any(str(row.get("id") or "") == item_id
+                   for row in data["items"]):
+            data["items"].insert(0, _normalize_session_permission_fields(item))
+            _save_queue(sid, data)
+        return data
+
+
+def remove_queue_item_with_removed(
+    sid: str,
+    item_id: str,
+) -> tuple[dict, tuple[str, ...]]:
     """Remove one item by id. Returns the updated queue snapshot.
 
     Emptying the queue also clears ``paused``. The flag means "there is queued
@@ -1409,26 +2902,50 @@ def remove_queue_item(sid: str, item_id: str) -> dict:
     deletion while ``paused`` is true — sessions/ had zombie
     ``{items: [], paused: true}`` files dating back a week."""
     with _QUEUE_LOCK:
-        data = _load_queue(sid)
-        data["items"] = [it for it in data["items"] if it.get("id") != item_id]
+        data = _load_queue(sid, strict=True)
+        inflight = data.get("inflight") or {}
+        if str((inflight.get("item") or {}).get("id") or "") == item_id:
+            raise ValueError("queue item is currently executing")
+        kept = [it for it in data["items"] if it.get("id") != item_id]
+        removed = (item_id,) if len(kept) != len(data["items"]) else ()
+        data["items"] = kept
         if not data["items"]:
             data["paused"] = False
         _save_queue(sid, data)
-        return data
+        return data, removed
 
 
-def clear_queue(sid: str) -> None:
-    """Drop all items + clear the paused flag (removes the file)."""
+def remove_queue_item(sid: str, item_id: str) -> dict:
+    """Backward-compatible queue-only wrapper."""
+    return remove_queue_item_with_removed(sid, item_id)[0]
+
+
+def clear_queue_with_removed(sid: str) -> tuple[dict, tuple[str, ...]]:
+    """Drop waiting items without stealing ownership from a running turn."""
     with _QUEUE_LOCK:
-        _save_queue(sid, {"items": [], "paused": False})
+        current = _load_queue(sid, strict=True)
+        removed = tuple(
+            str(item.get("id") or "")
+            for item in current["items"]
+            if item.get("id")
+        )
+        current["items"] = []
+        current["paused"] = False
+        _save_queue(sid, current)
+        return current, removed
+
+
+def clear_queue(sid: str) -> dict:
+    """Backward-compatible queue-only wrapper."""
+    return clear_queue_with_removed(sid)[0]
 
 
 def set_queue_paused(sid: str, paused: bool) -> dict:
     """Set the paused flag. Returns the updated queue snapshot. Resuming
     (paused=False) does NOT itself drain — the caller kicks the drain."""
     with _QUEUE_LOCK:
-        data = _load_queue(sid)
-        data["paused"] = bool(paused)
+        data = _load_queue(sid, strict=True)
+        data["paused"] = bool(paused) and bool(data["items"])
         _save_queue(sid, data)
         return data
 
@@ -1441,7 +2958,7 @@ def pause_queue_if_nonempty(sid: str) -> dict:
     could otherwise pop the next item between a separate get/pause pair.
     """
     with _QUEUE_LOCK:
-        data = _load_queue(sid)
+        data = _load_queue(sid, strict=True)
         if data["items"] and not data.get("paused"):
             data["paused"] = True
             _save_queue(sid, data)
@@ -1452,7 +2969,7 @@ def reorder_queue(sid: str, order: list[str]) -> dict:
     """Reorder items to match `order` (list of item ids). Ids not present in
     `order` are appended in their existing relative order (defensive)."""
     with _QUEUE_LOCK:
-        data = _load_queue(sid)
+        data = _load_queue(sid, strict=True)
         by_id = {it["id"]: it for it in data["items"]}
         new = [by_id[i] for i in order if i in by_id]
         for it in data["items"]:

@@ -12,7 +12,11 @@ muselab is a single-user application. One shared token protects the UI and API, 
 - Token checks use constant-time comparison.
 - `GET /api/health` and rate-limited browser error reporting are public; business APIs require authentication by default.
 
-Query parameters can enter browser history and proxy logs. muselab filters tokens from its own access log, but the reverse proxy must also redact them. Any non-local deployment requires HTTPS.
+Query parameters can enter browser history and proxy logs. muselab suppresses
+raw access logs; slow and failed requests are replaced with privacy-safe structured
+summaries that omit query values and normalize dynamic identifiers. A reverse proxy
+has its own logs and must redact them independently. Any non-local deployment
+requires HTTPS.
 
 ## One-time SSE ticket
 

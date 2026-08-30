@@ -36,7 +36,7 @@ Terms of art used across the muselab codebase and docs, defined once and linked 
 
 **longest-prefix routing** — The algorithm muselab uses to map a model ID to its provider. `lookup(model)` in `backend/endpoints.py` sorts all provider prefixes longest-first and returns the first match, case-insensitively. Colon-tagged prefixes (e.g. `qwen-intl:`) are normalised before the model ID is sent to the vendor so the vendor never sees the routing tag.
 
-**MCP (Model Context Protocol)** — A standard for attaching external tool servers to the agent. muselab surfaces MCP configuration at `Settings → MCP` and merges its own `mcp.json` with Claude Code's global configs. The `ask_user_question` MCP tool is handled specially: muselab does not block it, instead re-routing it through an in-process queue so the browser can display the question inline.
+**MCP (Model Context Protocol)** — A standard for attaching external tool servers to the agent. muselab surfaces MCP configuration at `Settings → MCP` and merges its own `mcp.json` with Claude Code's global configs. Interactive questions no longer use MCP; the SDK-native `AskUserQuestion` is bridged to the browser through an in-process queue.
 
 **message queue** — A per-session FIFO queue (`$MUSELAB_SESSIONS_DIR/<sid>.queue.json`) that holds prompts submitted while a turn is already running. The drain loop starts the next turn automatically when the current one finishes. Max depth is 10. The queue auto-pauses if a turn errors or is cancelled. See [`backend-sessions.md — The message queue`](backend-sessions.md).
 
@@ -70,9 +70,9 @@ Terms of art used across the muselab codebase and docs, defined once and linked 
 
 **sidecar** — The file `$MUSELAB_SESSIONS_DIR/<sid>.sidecar.json` that stores per-message annotations layered on top of the CLI JSONL: cost (USD), model badge, timestamps, uploaded image thumbnails, and document references. Written after every turn; never stores the transcript itself. See [`backend-sessions.md — Sidecar files`](backend-sessions.md).
 
-**setting_sources** — The SDK parameter `["user", "project", "local"]` passed in `ClaudeAgentOptions` that tells the Claude Agent SDK which config scopes to load. `CLAUDE.md` and Claude configuration in the active workspace follow these scopes; muselab's bundled `skills/` are exposed through a local plugin.
+**setting_sources** — The SDK parameter `["user", "project", "local"]` passed in `ClaudeAgentOptions` that tells the Claude Agent SDK which config scopes to load. `CLAUDE.md`, Skills, and Claude configuration follow the user and active-workspace scopes; a local plugin preserves muselab's empty repository Skill extension slot.
 
-**skill / SKILL.md** — A skill is a directory under `skills/` (or `~/.claude/skills/`) containing a `SKILL.md` file with YAML frontmatter. The `description` field (starting with `"USE WHEN …"`) is the primary signal the model uses to decide whether to activate the skill. With `skills="all"`, the Claude Agent SDK exposes discoverable `SKILL.md` files to the model. Skills are enabled for every provider by default and can be disabled globally with `MUSELAB_DISABLE_SKILLS`.
+**skill / SKILL.md** — A Skill is a directory containing a `SKILL.md` file with YAML frontmatter. It may come from user, workspace, plugin, reviewed generated, or repository-extension sources. The `description` field (starting with `"USE WHEN …"`) is the primary activation signal. With `skills="all"`, the SDK exposes discoverable Skills to the model; `MUSELAB_DISABLE_SKILLS` instead passes `skills=[]` explicitly.
 
 **SSE / replay spool** — The browser first submits a turn through an authenticated POST and receives a short-lived, single-use ticket, then uses the ticket with `GET /api/chat/stream`. Turn events are appended to a disk replay spool, and reconnecting browsers resume from a cursor instead of relying on a complete in-memory event list. Background execution continues after the browser disconnects. See [`routing.md`](routing.md).
 

@@ -78,6 +78,72 @@ def test_toggle_changes_disabled(temp_mcp, client, auth):
     assert cfg["mcpServers"]["x"]["disabled"] is True
 
 
+def test_toggle_propagates_through_sdk_control_channel(
+    temp_mcp, client, auth,
+):
+    from backend import chat as chat_mod
+
+    class LiveClient:
+        def __init__(self):
+            self.calls = []
+
+        async def toggle_mcp_server(self, name, enabled):
+            self.calls.append((name, enabled))
+
+    live = LiveClient()
+    key = ("sid-mcp-toggle", "claude-sonnet-4-6", "auto", "")
+    client.put(
+        "/api/settings/mcp/x",
+        json={"name": "x", "command": "c"},
+        headers=auth,
+    )
+    chat_mod._clients[key] = live
+    try:
+        response = client.patch(
+            "/api/settings/mcp/x/toggle",
+            json={"disabled": True},
+            headers=auth,
+        )
+    finally:
+        chat_mod._clients.pop(key, None)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["propagated"] == [
+        "sid-mcp-toggle@claude-sonnet-4-6",
+    ]
+    assert response.json()["errors"] == []
+    assert live.calls == [("x", False)]
+
+
+def test_reconnect_propagates_through_sdk_control_channel(client, auth):
+    from backend import chat as chat_mod
+
+    class LiveClient:
+        def __init__(self):
+            self.calls = []
+
+        async def reconnect_mcp_server(self, name):
+            self.calls.append(name)
+
+    live = LiveClient()
+    key = ("sid-mcp-reconnect", "claude-sonnet-4-6", "auto", "")
+    chat_mod._clients[key] = live
+    try:
+        response = client.post(
+            "/api/settings/mcp/x/reconnect",
+            headers=auth,
+        )
+    finally:
+        chat_mod._clients.pop(key, None)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["reconnected"] == [
+        "sid-mcp-reconnect@claude-sonnet-4-6",
+    ]
+    assert response.json()["errors"] == []
+    assert live.calls == ["x"]
+
+
 def test_toggle_unknown_returns_404(temp_mcp, client, auth):
     r = client.patch("/api/settings/mcp/ghost/toggle",
                        json={"disabled": True}, headers=auth)

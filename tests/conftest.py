@@ -1,5 +1,6 @@
 """Shared pytest fixtures: spin up a backend.main app against a temp ROOT and
 fresh sessions dir, with a known token. Each test gets a clean filesystem."""
+import asyncio
 import sys
 from pathlib import Path
 
@@ -57,19 +58,17 @@ def app_module(monkeypatch, temp_root, tmp_path):
     monkeypatch.delenv("OPENAI_IMAGE_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_IMAGE_BASE_URL", raising=False)
 
-    # NOTE (audit I/312 — fragility, intentionally left as-is for now):
     # Deleting every `backend.*` module forces a full re-import of the whole
     # tree on each test, which re-runs module-level init (e.g. backend.chat
     # snapshots SESS_DIR/active_turns at import) so the monkeypatched ROOT /
     # SESS_DIR / env take effect. The downside is that any module-level mutable
     # global (chat._clients, scheduler._state, …) is recreated per test — which
-    # mostly isolates state, but couples correctness to import order and means a
-    # module that caches a path/handle BEFORE the relevant monkeypatch silently
-    # leaks (see the SESS_DIR ordering dance below; test_scheduler.py:20 also
-    # resets _state by hand). The proper fix is to move that global state into
-    # injectable objects (e.g. an app-scoped registry) so tests construct a
-    # fresh instance instead of nuking sys.modules — that's a larger refactor
-    # touching backend/, out of scope for this CI/test-hardening pass.
+    # isolates state but makes the fixture the owner of each imported
+    # generation. The teardown below closes the same runtime resources that
+    # the application lifespan owns in production.
+    # Keep path monkeypatches before their owning module's import (see the
+    # SESS_DIR ordering below; test_scheduler.py also resets its explicit
+    # state holder).
     for name in [n for n in list(sys.modules) if n.startswith("backend")]:
         del sys.modules[name]
 
@@ -100,6 +99,11 @@ def app_module(monkeypatch, temp_root, tmp_path):
     ep_mod._SORTED_CATALOG_CACHE = None
 
     import backend.main as main_mod  # type: ignore[import]
+
+    # DUCC is installed on some developer machines but absent in CI. Keep the
+    # general suite host-independent; DUCC-specific tests opt back in explicitly.
+    from backend import settings as settings_mod
+    monkeypatch.setattr(settings_mod, "locate_ducc_executable", lambda: None)
 
     # Isolate Claude Auth status/disconnect tests from the developer's real
     # ~/.claude/.credentials.json. Individual tests that need a credentials file
@@ -134,13 +138,32 @@ def app_module(monkeypatch, temp_root, tmp_path):
               "MUSELAB_MEMORY_DIR"):
         monkeypatch.delenv(k, raising=False)
 
-    return main_mod
+    # Tests intentionally bypass the application's lifespan in order to keep
+    # endpoint fixtures small. They must therefore own the equivalent runtime
+    # teardown before the next test evicts this module tree from sys.modules.
+    from backend import chat as chat_mod
+    from backend import memory_client as memory_mod
+
+    async def shutdown_test_runtime() -> None:
+        try:
+            await chat_mod.shutdown_runtime()
+        finally:
+            await memory_mod.aclose()
+
+    try:
+        yield main_mod
+    finally:
+        asyncio.run(shutdown_test_runtime())
 
 
 @pytest.fixture()
 def client(app_module):
     from fastapi.testclient import TestClient
-    return TestClient(app_module.app)
+    test_client = TestClient(app_module.app)
+    try:
+        yield test_client
+    finally:
+        test_client.close()
 
 
 @pytest.fixture()

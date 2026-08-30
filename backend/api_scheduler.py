@@ -3,7 +3,7 @@
 GET    /api/scheduler/tasks         — list + current unread count
 POST   /api/scheduler/tasks         — create
 PATCH  /api/scheduler/tasks/{id}    — edit (rename / change time / toggle enabled)
-DELETE /api/scheduler/tasks/{id}    — remove (does NOT delete the bound session)
+DELETE /api/scheduler/tasks/{id}    — remove + transactionally clean runtime/session ownership
 GET    /api/scheduler/history       — most-recent-first run log
 DELETE /api/scheduler/history       — clear ALL history entries
 DELETE /api/scheduler/history/{ts}  — delete a single history entry (by timestamp,
@@ -12,11 +12,14 @@ POST   /api/scheduler/ack           — mark unread = 0 (called when user opens 
 """
 from __future__ import annotations
 
+import asyncio
+
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from .auth import require_token
 from . import scheduler as sched
+from . import observability as obs
 
 
 router = APIRouter(prefix="/api/scheduler", tags=["scheduler"])
@@ -118,18 +121,50 @@ def patch_task_endpoint(tid: str, req: TaskPatch) -> dict:
     if "schedule" in changes and changes["schedule"]:
         changes["schedule"] = {k: v for k, v in changes["schedule"].items()
                                 if v is not None}
-    t = sched.update_task(tid, **changes)
+    try:
+        t = sched.update_task(tid, **changes)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from None
     if not t:
         raise HTTPException(404, "task not found")
     return t
 
 
 @router.delete("/tasks/{tid}", dependencies=[Depends(require_token)])
-def delete_task_endpoint(tid: str) -> dict:
-    if not sched.delete_task(tid):
+async def delete_task_endpoint(tid: str) -> dict:
+    # delete_task() commits the task removal and durable cleanup intent in one
+    # replacement. A prior failed attempt therefore reaches the same intent
+    # here instead of becoming an unrecoverable 404.
+    async def _delete_and_cleanup() -> bool:
+        deleted = await obs.to_thread_io(
+            "scheduler.task_delete",
+            tid,
+            sched.delete_task,
+            tid,
+            purge_bound_session=False,
+            owned=True,
+        )
+        if not deleted:
+            return False
+        await sched.finish_task_cleanup(tid)
+        return True
+
+    owner = asyncio.create_task(_delete_and_cleanup())
+    try:
+        deleted = await asyncio.shield(owner)
+    except asyncio.CancelledError:
+        # Once deletion starts, an HTTP disconnect must not leave a durable
+        # cleanup intent without an owner. Join the complete transaction first.
+        while not owner.done():
+            try:
+                await asyncio.shield(owner)
+            except asyncio.CancelledError:
+                continue
+        owner.result()
+        raise
+    if not deleted:
         raise HTTPException(404, "task not found")
     return {"deleted": tid}
-
 
 @router.post("/tasks/{tid}/run", dependencies=[Depends(require_token)])
 async def run_task_now_endpoint(tid: str) -> dict:
@@ -140,7 +175,7 @@ async def run_task_now_endpoint(tid: str) -> dict:
 
     Used for: (a) "retry" on a failed history entry; (b) manual smoke-test
     after editing prompt / model without waiting for the next fire window."""
-    task = sched.get_task(tid)
+    task = await asyncio.to_thread(sched.get_task, tid)
     if not task:
         raise HTTPException(404, "task not found")
     await sched.run_task_now(tid)

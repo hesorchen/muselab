@@ -91,6 +91,102 @@ def test_exit_plan_hooks_commit_only_after_success(app_module):
     chat._pending_runtime_rebuilds.discard(failure_id)
 
 
+def test_native_plan_cycle_from_bypass_persists_return_mode(app_module):
+    from backend import chat
+    from backend import permission_request as perm
+    from backend import sessions as sess
+
+    meta = sess.create_session(
+        name="native-plan-from-bypass",
+        permission="bypassPermissions",
+    )
+    sid = meta["id"]
+    q = perm.register_session_queue(sid)
+    enter_id = "enter-plan-from-bypass"
+    exit_id = "exit-plan-to-bypass"
+    enter_hook, _ = chat._build_plan_enter_hooks(sid, "bypassPermissions")
+
+    enter_result = asyncio.run(enter_hook(
+        {
+            "tool_name": "EnterPlanMode",
+            "tool_use_id": enter_id,
+            "permission_mode": "plan",
+        },
+        enter_id,
+        {},
+    ))
+
+    assert enter_result == {}
+    entered = sess.get_session(sid)
+    assert entered["permission"] == "plan"
+    assert entered["plan_return_permission"] == "bypassPermissions"
+    enter_event = q.get_nowait()
+    assert enter_event["event"] == "permission_mode_changed"
+    assert json.loads(enter_event["data"]) == {
+        "permission": "plan",
+        "previous_permission": "bypassPermissions",
+        "source": "enter_plan",
+        "tool_use_id": enter_id,
+    }
+
+    perm._plan_transitions[(sid, exit_id)] = PermissionUpdate(
+        type="setMode",
+        mode="bypassPermissions",
+        destination="session",
+    )
+    exit_hook, _ = chat._build_plan_exit_hooks(sid, "bypassPermissions")
+    exit_result = asyncio.run(exit_hook(
+        {
+            "tool_name": "ExitPlanMode",
+            "tool_use_id": exit_id,
+            "permission_mode": "bypassPermissions",
+        },
+        exit_id,
+        {},
+    ))
+
+    assert exit_result == {}
+    exited = sess.get_session(sid)
+    assert exited["permission"] == "bypassPermissions"
+    assert exited["plan_return_permission"] == ""
+    exit_event = q.get_nowait()
+    assert exit_event["event"] == "permission_mode_changed"
+    assert json.loads(exit_event["data"])["permission"] == "bypassPermissions"
+    assert sid in chat._pending_runtime_rebuilds
+
+    perm.unregister_session_queue(sid)
+    chat._pending_runtime_rebuilds.discard(sid)
+
+
+def test_native_plan_enter_cas_does_not_overwrite_newer_permission(app_module):
+    from backend import chat
+    from backend import permission_request as perm
+    from backend import sessions as sess
+
+    meta = sess.create_session(
+        name="native-plan-enter-cas",
+        permission="bypassPermissions",
+    )
+    sid = meta["id"]
+    q = perm.register_session_queue(sid)
+    sess.update_permission(sid, "acceptEdits")
+    enter_hook, _ = chat._build_plan_enter_hooks(sid, "bypassPermissions")
+
+    result = asyncio.run(enter_hook(
+        {"tool_name": "EnterPlanMode", "tool_use_id": "stale-enter"},
+        "stale-enter",
+        {},
+    ))
+
+    assert result["continue_"] is False
+    assert sess.get_session(sid)["permission"] == "acceptEdits"
+    event = q.get_nowait()
+    assert event["event"] == "permission_mode_change_failed"
+    assert sid in chat._pending_runtime_rebuilds
+    perm.unregister_session_queue(sid)
+    chat._pending_runtime_rebuilds.discard(sid)
+
+
 def test_exit_plan_persist_failure_still_discards_runtime(
     app_module, monkeypatch,
 ):
@@ -236,6 +332,12 @@ def test_queue_endpoint_preserves_plan_return_capability(
     client, auth, app_module, monkeypatch,
 ):
     from backend import chat
+
+    # This case deliberately exercises the persisted item through one manual
+    # drain below. Enqueue now schedules an immediate background kick for idle
+    # sessions, so disable that production wakeup here or it can consume the
+    # item before the test installs its fake _start_turn.
+    monkeypatch.setattr(chat, "_schedule_queue_drain", lambda _sid: None)
 
     created = client.post(
         "/api/chat/sessions",

@@ -52,4 +52,4 @@ muselab 的终端与文件、预览和会话使用同一个工作目录。可以
   代码导航、调试器与 IDE 插件生态；重度软件开发仍建议使用 claudecodeui 或
   Claude Code
 - 不是 RAG：工作目录文件按需 Read / Grep，不预先向量化；爬虫式文档问答用 [AnythingLLM](https://github.com/Mintplex-Labs/anything-llm)
-- 不带插件市场：内置 12 个精选技能并自动发现已安装的 Claude Code 插件，但没有应用内 marketplace，如需用 [LobeChat](https://github.com/lobehub/lobe-chat)
+- 不带插件市场，也不预装 Skill payload；会动态发现用户、workspace、plugin 和经审核生成的 Skills，如需应用内 marketplace 可用 [LobeChat](https://github.com/lobehub/lobe-chat)

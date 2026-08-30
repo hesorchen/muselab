@@ -47,6 +47,126 @@ def test_lookup_unknown_model(monkeypatch):
     assert ep.lookup("claude-sonnet-4-6") is None  # claude not in catalog
 
 
+def test_ducc_model_prefix_selects_runtime_and_catalog_model(monkeypatch):
+    ep = _reload_endpoints(monkeypatch, {})
+
+    assert ep.is_ducc_model("ducc:claude-opus-4-8")
+    assert not ep.is_ducc_model("claude-opus-4-8")
+    assert ep.normalize_model_id("ducc:claude-opus-4-8") == "claude-opus-4-8"
+    assert ep.ducc_cli_model("ducc:auto") == "auto"
+    assert ep.ducc_cli_model("ducc:glm-5-2") == "GLM-5.2"
+    assert ep.ducc_cli_model("ducc:gpt-5-6-sol") == "gpt-5.6-sol"
+    assert ep.ducc_cli_model("ducc:claude-opus-4-8") == "Opus 4.8"
+    assert (
+        ep.ducc_cli_model("ducc:claude-haiku-4-5-20251001")
+        == "Claude Haiku 4.5"
+    )
+    assert ep.ducc_cli_model("ducc:unknown-model") == "unknown-model"
+    assert ep.ducc_is_claude_model("ducc:claude-opus-4-8")
+    assert not ep.ducc_is_claude_model("ducc:gpt-5-6-sol")
+    assert ep.lookup("ducc:claude-opus-4-8") is None
+
+
+def test_ducc_group_does_not_require_native_anthropic_auth(monkeypatch):
+    ep = _reload_endpoints(monkeypatch, {
+        "ANTHROPIC_API_KEY": None,
+        "ANTHROPIC_AUTH_TOKEN": None,
+        "MUSELAB_DISABLED_PROVIDERS": None,
+    })
+    from backend import settings
+    monkeypatch.setattr(settings, "locate_ducc_executable", lambda: "/tmp/ducc")
+    monkeypatch.setattr(ep.Path, "home", lambda: Path("/nonexistent-home"))
+
+    groups = ep.available_groups()
+    ducc = next(group for group in groups if group["group"] == "DUCC")
+
+    assert ducc["supports_thinking"] is False
+    assert ducc["supports_effort"] is False
+    assert [item["model"] for item in ducc["items"]] == [
+        "ducc:auto-internal",
+        "ducc:deepseek-v4-flash-internal",
+        "ducc:glm-5-2-internal",
+        "ducc:kimi-k2-7-code-internal",
+        "ducc:auto",
+        "ducc:glm-5",
+        "ducc:glm-5-1",
+        "ducc:glm-5-2",
+        "ducc:glm-5-3",
+        "ducc:glm-5-3-flash",
+        "ducc:glm-5-turbo",
+        "ducc:grok-4-5",
+        "ducc:gpt-5-5",
+        "ducc:gpt-5-6-luna",
+        "ducc:gpt-5-6-terra",
+        "ducc:gpt-5-6-sol",
+        "ducc:claude-haiku-4-5",
+        "ducc:claude-sonnet-4-6",
+        "ducc:claude-sonnet-5",
+        "ducc:claude-opus-4-6",
+        "ducc:claude-opus-4-7",
+        "ducc:claude-opus-4-8",
+        "ducc:claude-opus-5",
+        "ducc:kimi-k2-6",
+        "ducc:minimax-m3",
+        "ducc:deepseek-v4-flash",
+        "ducc:deepseek-v4-pro",
+    ]
+    assert [item["label"] for item in ducc["items"]][:5] == [
+        "Auto · 内部",
+        "DeepSeek V4 Flash · 内部",
+        "GLM 5.2 · 内部",
+        "Kimi K2.7 Code · 内部",
+        "Auto",
+    ]
+    assert [cli_name for _model_id, cli_name, _label in ep.DUCC_MODELS] == [
+        "auto-内部",
+        "DeepSeek-V4-Flash-内部",
+        "GLM-5.2-内部",
+        "Kimi-K2.7-Code-内部",
+        "auto",
+        "GLM-5",
+        "GLM-5.1",
+        "GLM-5.2",
+        "GLM-5.3",
+        "GLM-5.3-Flash",
+        "GLM-5-Turbo",
+        "grok-4.5",
+        "gpt-5.5",
+        "gpt-5.6-luna",
+        "gpt-5.6-terra",
+        "gpt-5.6-sol",
+        "Claude Haiku 4.5",
+        "Claude Sonnet 4.6",
+        "Claude Sonnet 5",
+        "Claude Opus 4.6",
+        "Claude Opus 4.7",
+        "Opus 4.8",
+        "Opus 5",
+        "Kimi-K2.6",
+        "MiniMax-M3",
+        "DeepSeek-V4-Flash",
+        "DeepSeek-V4-Pro",
+    ]
+
+
+def test_ducc_group_honors_model_disable_and_runtime_availability(monkeypatch):
+    ep = _reload_endpoints(monkeypatch, {
+        "MUSELAB_DISABLED_PROVIDERS": "ducc:auto,ducc:glm-5-2",
+    })
+    from backend import settings
+
+    monkeypatch.setattr(settings, "locate_ducc_executable", lambda: "/tmp/ducc")
+    groups = ep.available_groups()
+    ducc = next(group for group in groups if group["group"] == "DUCC")
+    models = {item["model"] for item in ducc["items"]}
+    assert "ducc:auto" not in models
+    assert "ducc:glm-5-2" not in models
+    assert len(models) == 25
+
+    monkeypatch.setattr(settings, "locate_ducc_executable", lambda: None)
+    assert all(group["group"] != "DUCC" for group in ep.available_groups())
+
+
 def test_env_override_missing_key(monkeypatch):
     ep = _reload_endpoints(monkeypatch, {"DEEPSEEK_API_KEY": None})
     assert ep.env_override("deepseek-v4-pro") is None

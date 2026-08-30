@@ -80,6 +80,31 @@ bash scripts/doctor.sh                # re-verify install + probe service
 bash scripts/intake.sh                # optional: create or refresh workspace CLAUDE.md
 ```
 
+## Optional local `screen` deployment with bounded logs
+
+The standard systemd service above still writes to journald; its rotation and
+retention remain managed by journald. For a separate local `screen` deployment,
+use the tracked launcher to keep a bounded combined stdout/stderr archive:
+
+```bash
+REPO="$(pwd)"
+screen -dmS muselab-local \
+  python3 "$REPO/scripts/rotating_log_launcher.py" \
+    --log "$REPO/muselab.log" --max-bytes 52428800 --keep 5 -- \
+    uv run python -m backend.main
+```
+
+The launcher has no built-in repository, user, or command path. It rotates while
+the child is running and forwards `SIGTERM`, `SIGINT`, and `SIGHUP` to the
+child process group. Each retained generation is capped at `--max-bytes`;
+rotation may split an unusually long line across two generations.
+
+Severe event-loop attribution is privacy-bounded to Python module and function
+names (no locals, source lines, paths, prompts, or identifiers). The defaults
+can be adjusted with `MUSELAB_LOOP_HEARTBEAT_MS`, `MUSELAB_LOOP_LAG_WARN_MS`,
+`MUSELAB_LOOP_STALL_MS`, and `MUSELAB_LOOP_STALL_RATE_LIMIT_S`. Set
+`MUSELAB_PERF_LOG=0` to disable all performance events, including the watchdog.
+
 ## Optional workspace instructions
 
 To record durable project conventions for the primary workspace, run:

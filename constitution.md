@@ -10,12 +10,12 @@
 > intent lives in per-change specs; product roadmap and known issues live on
 > [GitHub Issues](https://github.com/hesorchen/muselab/issues).
 
-- **Version:** 4.0.0
+- **Version:** 6.0.0
 - **Ratified:** 2026-05-31
-- **Last amended:** 2026-07-31
+- **Last amended:** 2026-08-25
 - **Derived from:** `docs/architecture.md`,
   `CONTRIBUTING.md`, `SECURITY.md`, `pyproject.toml`, and the backend/frontend
-  source as of 2026-07-31.
+  source as of 2026-08-25.
 
 Normative keywords **MUST / MUST NOT / SHOULD / MAY** follow RFC 2119.
 
@@ -98,9 +98,9 @@ shape rather than growing a god-module:
 | `activity.py` / `activity_api.py` | activity-center state + its API |
 | `transcript_index.py` | transcript index |
 | `api_settings.py` | `/api/settings` — hot-rewrite `.env` + `os.environ` |
-| `prompts.py` | short starter messages for built-in workflows |
-| `ask_user_question.py` | in-process `muselab` MCP server |
-| `permission_request.py` | tool-permission round-trip |
+| `prompts.py` | short starter messages for self-contained UI workflows |
+| `ask_user_question.py` | browser state bridge for native `AskUserQuestion` |
+| `permission_request.py` | tool-permission and interactive-question round-trip |
 | `settings.py` | `ROOT` / `PORT` / `HOST`, `atomic_write_text`, `env_int` |
 
 ### A3 — Per-session env override with config isolation
@@ -127,9 +127,9 @@ own transcript-compatibility risk. Sessions created before a provider existed
 self-heal to a configured model on first send.
 
 ### A6 — MCP: attribute-driven, gated, default-zero
-- The shipped default configures **zero** user MCP servers; connectors are
-  opt-in. Only the in-process `muselab` server (for `ask_user_question`) is
-  always present.
+- The shipped default configures **zero** MCP servers; every connector is
+  opt-in. Interactive questions use the SDK-native `AskUserQuestion`; no MCP
+  server may be registered solely to duplicate that built-in capability.
 - Every server (preset or user-added) is stored in `mcp.json` by **attributes**
   (`transport`, `disabled`, pinned `version`), never a hard-coded catalog.
 - Versions MUST be pinned. Shipped config MUST NOT use `npx -y latest` / unpinned
@@ -160,12 +160,11 @@ muselab MUST NOT inject a global or per-session custom system prompt. Persistent
 identity, response preferences, and personal context belong in the
 SDK-discovered `CLAUDE.md` hierarchy. Reusable task workflows belong in Skills,
 and tool-specific behavior belongs in tool descriptions and enforced permission
-configuration. UI starter prompts MAY invoke those native capabilities without
-creating another instruction layer. A user-selected runtime mode MAY activate
-a bundled Skill through SDK `UserPromptSubmit.additionalContext` only when the
-hook names the mode and Skill, leaves the canonical user prompt and transcript
-unchanged, and keeps the reusable behavior in `SKILL.md`; it MUST NOT carry a
-parallel identity, persona, or copy of the workflow itself.
+configuration. UI starter prompts MAY describe a self-contained task without
+creating another instruction layer. Runtime modes MUST NOT inject a parallel
+identity, persona, or reusable workflow through system prompts or transient
+hook context; reusable workflows remain in user, workspace, plugin, generated,
+or repository-extension Skills.
 
 ---
 
@@ -306,6 +305,16 @@ following MUST be declined absent an explicit constitution amendment:
 
 ## 9. Amendment history
 
+- **6.0.0 (2026-08-25):** Replaced the always-on in-process question MCP with
+  the SDK-native `AskUserQuestion` browser bridge after upgrading to Agent SDK
+  0.2.144 / Claude Code CLI 2.1.239 and verifying native answer delivery across
+  default, plan, acceptEdits, and bypass permission modes. The shipped MCP
+  topology is now truly default-zero; connectors remain opt-in.
+- **5.0.0 (2026-08-15):** Removed the bundled Skill distribution and the
+  runtime-mode Skill activation exception from A9. Skills remain an SDK-native
+  extension mechanism for user, workspace, plugin, reviewed generated, and
+  repository-extension workflows; runtime modes retain only their transport
+  and resource-bound contracts.
 - **4.0.0 (2026-07-31):** Expanded A4's exact client-pool key with
   `service_tier` because Fast is fixed in the Gateway header contract at SDK
   client launch; amended A9 so an explicitly selected runtime mode may activate

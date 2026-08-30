@@ -6,8 +6,8 @@ muselab 通过**本地 Anthropic 兼容网关**支持 Codex 后端模型。网�
 
 muselab **不保存 Codex OAuth 凭据**，也**不直接调用 OpenAI 原生接口**。
 
-截至 2026-07-31，已验证的兼容基线是 CLIProxyAPI `v7.2.111`、Claude Agent
-SDK `0.2.128` 以及其内置 Claude CLI `2.1.220`。新版 CLIProxyAPI 对这条
+截至 2026-08-12，已验证的兼容基线是 CLIProxyAPI `v7.2.111`、Claude Agent
+SDK `0.2.136` 以及其内置 Claude CLI `2.1.228`。新版 CLIProxyAPI 对这条
 链路相关的 Codex 缓存 token 统计、reasoning effort、工具调用回放和
 Anthropic 响应转换都有修复。
 
@@ -39,8 +39,8 @@ Agent SDK 没有 `auto`、`ultra` 或 Fast 的原生字段，因此 muselab 通�
 
 - `auto` 删除 translator 合成的 effort，让模型 catalog 默认值继续生效；
 - `low` 到 `max` 直接映射到 `reasoning.effort`；
-- `ultra` 在线路上映射为 `max`，并激活 muselab 原生
-  `ultra-orchestrator` Skill 做受限并发编排；
+- `ultra` 在线路上映射为 `max`，并保留 muselab 对 subagent spawn depth
+  与 concurrency 的上限；
 - Fast 独立映射为 `service_tier: priority`。
 
 ## 启用方式
@@ -211,9 +211,11 @@ Claude CLI 与 Codex 无关的 200K 默认值。目录未给百分比时，按 C
    GPT-5.3 Codex Spark 为 128K，同样按 95% effective 计算。
 
 `max_context_window` 只作为“可配置上限”展示，不会悄悄放大当前分母。创建
-Codex SDK client 时，muselab 还会通过 `CLAUDE_CODE_MAX_CONTEXT_TOKENS` 把
-解析出的有效窗口注入 Claude CLI。因此 Claude CLI `/context`、原生自动压缩、
-muselab 发送前预压缩、拆分弹窗和底部圆环现在共用同一个分母。
+Codex SDK client 时，muselab 会通过 `CLAUDE_CODE_MAX_CONTEXT_TOKENS` 注入
+解析出的有效窗口，并通过 `CLAUDE_CODE_AUTO_COMPACT_WINDOW` 显式启用同一
+窗口。因此 Claude CLI `/context`、原生自动压缩、muselab 发送前预压缩、
+拆分弹窗和底部圆环现在共用同一个分母。两个变量都传完整有效窗口，较低的
+自动压缩阈值由 Claude CLI 自己扣除输出和压缩预留后计算，避免重复预留。
 
 底部圆环会把两部分精度分别标明：
 
@@ -223,7 +225,7 @@ muselab 发送前预压缩、拆分弹窗和底部圆环现在共用同一个分
 - 窗口会标记来源是 gateway 目录、人工配置、SDK 还是内置 fallback；只有
   内置 fallback 会标为估算。
 
-发送新消息前，muselab 会先调用 SDK 的上下文统计；如果接近 effective window，会优先执行 Claude Code 原生 `/compact`，再发送用户消息。这样比等一轮回复成功后的事后 compact 更早，能减少 gateway 在请求入口直接报 `input exceeds the context window` 的概率。
+发送新消息前，muselab 会先调用 SDK 的上下文统计；如果接近 effective window，会优先执行 Claude Code 原生 `/compact`，再发送用户消息。这样比等一轮回复成功后的事后 compact 更早，能减少 gateway 在请求入口直接报 `input exceeds the context window` 的概率。如果旧压缩配置创建的 Codex runtime 报成功或返回隐藏在系统消息中的 API 错误、但实测 token 没有下降，muselab 会安全重建 runtime 并只重试一次 `/compact`；有后台任务时不会断开 runtime，恢复过程也不会重复发送用户消息。
 
 如果实际运行仍报 `input exceeds the context window`，通常说明 gateway 转换层、所选后端模型或账号档位的有效窗口更小，或当前会话已经超过到连 `/compact` 也无法进入模型。此时可以新开会话、手动降低 `CODEX_GATEWAY_CONTEXT_LIMIT`、压缩历史，或切到上下文窗口已确认更大的模型 / gateway 路径。
 

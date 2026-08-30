@@ -37,7 +37,7 @@ def test_permission_is_mirrored_per_tab_on_every_activation_path():
     blank = app[app.index("_blankTabState()"):app.index("_ensureTabState(id)")]
     activate = app[
         app.index("_activateTabState(id)"):
-        app.index("// P1 (chat-perf-redesign)", app.index("_activateTabState(id)"))
+        app.index("_paneElement(tid)", app.index("_activateTabState(id)"))
     ]
     new_session = app[
         app.index("newSession(options = {})"):

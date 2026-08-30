@@ -118,7 +118,7 @@ The Activity Center persists each conversation's current state in `$MUSELAB_ROOT
 
 - `effort` is stored per session and participates in the client cache key. Canonical values are `auto`, `low`, `medium`, `high`, `xhigh`, `max`, and model-dependent `ultra`; an empty legacy value is normalized to `auto`.
 - Codex `service_tier` is stored independently. The `fast` value maps to the Gateway's `priority` tier and also participates in the cache key, because the header is fixed when the SDK client starts.
-- Ultra uses wire-level `max` reasoning and activates the bundled `ultra-orchestrator` Skill through transient `UserPromptSubmit.additionalContext`; it never installs a custom system prompt or rewrites the user's transcript.
+- Ultra uses wire-level `max` reasoning and keeps subagent spawn depth and concurrency bounded; it does not activate a bundled workflow, install a custom system prompt, or rewrite the user's transcript.
 - The extended-thinking budget defaults to 10,000 tokens and is configurable with `MUSELAB_THINKING_BUDGET`.
 - Provider capabilities for effort and thinking come from `/api/chat/providers`.
 - Some Anthropic-compatible providers omit the required `signature` key from thinking blocks. Vendor routes normalize the missing field to an empty in-memory parser sentinel so the SDK stream can finish, then remove the unverifiable thinking block from persisted JSONL. Native Claude routes keep strict SDK parsing; muselab never fabricates a valid signature.
