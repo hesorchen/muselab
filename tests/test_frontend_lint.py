@@ -5816,23 +5816,21 @@ def test_transcript_loading_overlay_has_generation_owned_visual_contract():
     assert "msgs-hidden" not in transcript
 
     overlay_start = css.index(".chat-transcript-loading-overlay {")
-    overlay_end = css.index(".chat-muse-loader {", overlay_start)
+    overlay_end = css.index(".chat-load-error {", overlay_start)
     overlay = css[overlay_start:overlay_end]
     assert "position: absolute" in overlay
     assert "inset: 0" in overlay
     assert "var(--c-bg-1)" in overlay
     assert "pointer-events: auto" in overlay
-    assert 'class="chat-muse-loader"' in transcript
-    assert 'class="chat-muse-loader-emblem"' in transcript
-    assert 'class="muse-mascot lg is-streaming"' in transcript
-    assert ':href="mascotHref()"' in transcript
-    assert 'class="chat-muse-loader-dots"' in transcript
+    assert 'class="workspace-switch-status chat-transcript-loading-status"' in transcript
+    assert 'class="spinner-sm" aria-hidden="true"' in transcript
+    assert "x-text=\"t('chat.loading_session')\"" in transcript
     assert 'class="sr-only"' not in transcript
     assert 'class="chat-skeleton"' not in transcript
-    assert ".chat-muse-loader-emblem::after" in css
-    assert "@keyframes chat-muse-orbit" in css
-    assert "@keyframes chat-muse-dot" in css
-    assert '@media (prefers-reduced-motion: reduce)' in css
+    assert "chat-muse-loader" not in transcript
+    assert ".chat-muse-loader" not in css
+    assert "@keyframes chat-muse-orbit" not in css
+    assert "@keyframes chat-muse-dot" not in css
     assert ':inert="transcriptLoadingVisible()"' in transcript
 
     for key in ("chat.loading_session", "chat.load_failed", "chat.load_retry"):

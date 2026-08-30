@@ -3133,7 +3133,7 @@ def test_cold_session_switch_shields_every_frame_until_transcript_paints(
     _assert_no_browser_errors(page, errors)
 
 
-def test_mobile_transcript_loader_uses_centered_muse_brand(
+def test_mobile_transcript_loader_reuses_workspace_switch_status(
     page: Page, backend_url: str, auth_token: str,
 ):
     errors = _capture_browser_errors(page)
@@ -3157,9 +3157,9 @@ def test_mobile_transcript_loader_uses_centered_muse_brand(
           await new Promise(resolve => requestAnimationFrame(
             () => requestAnimationFrame(resolve)));
           const overlay = document.querySelector('.chat-transcript-loading-overlay');
-          const loader = overlay.querySelector('.chat-muse-loader');
-          const emblem = overlay.querySelector('.chat-muse-loader-emblem');
-          const copy = overlay.querySelector('.chat-muse-loader-copy strong');
+          const loader = overlay.querySelector('.chat-transcript-loading-status');
+          const spinner = loader.querySelector('.spinner-sm');
+          const copy = loader.querySelector('span:last-child');
           const overlayRect = overlay.getBoundingClientRect();
           const loaderRect = loader.getBoundingClientRect();
           const result = {
@@ -3171,13 +3171,15 @@ def test_mobile_transcript_loader_uses_centered_muse_brand(
               loaderRect.top + loaderRect.height / 2
               - (overlayRect.top + overlayRect.height / 2)),
             noOverflow: overlay.scrollWidth <= overlay.clientWidth,
-            emblemVisible: emblem.getClientRects().length > 0,
+            spinnerVisible: spinner.getClientRects().length > 0,
+            reusesWorkspaceStatus: loader.classList.contains('workspace-switch-status'),
             copy: copy.textContent.trim(),
             expectedCopy: app.t('chat.loading_session'),
             skeletonCount: overlay.querySelectorAll('.chat-skeleton').length,
             srOnlyCount: overlay.querySelectorAll('.sr-only').length,
-            mascotHref: overlay.querySelector('.muse-mascot use')
-              ?.getAttribute('href') || '',
+            heavyLoaderCount: overlay.querySelectorAll(
+              '.chat-muse-loader, .chat-muse-loader-emblem, .chat-muse-loader-dots'
+            ).length,
           };
           st.transcriptLoadPhase = 'idle';
           return result;
@@ -3187,11 +3189,12 @@ def test_mobile_transcript_loader_uses_centered_muse_brand(
     assert geometry["centerDeltaX"] < 2
     assert geometry["centerDeltaY"] < 2
     assert geometry["noOverflow"] is True
-    assert geometry["emblemVisible"] is True
+    assert geometry["spinnerVisible"] is True
+    assert geometry["reusesWorkspaceStatus"] is True
     assert geometry["copy"] == geometry["expectedCopy"]
     assert geometry["skeletonCount"] == 0
     assert geometry["srOnlyCount"] == 0
-    assert geometry["mascotHref"].startswith("#m-")
+    assert geometry["heavyLoaderCount"] == 0
     expect(page.locator(".chat-transcript-loading-overlay")).to_be_hidden()
     _assert_no_browser_errors(page, errors)
 

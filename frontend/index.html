@@ -3153,18 +3153,9 @@
              role="status"
              aria-live="polite"
              :aria-label="t('chat.loading_session')">
-          <div class="chat-muse-loader">
-            <div class="chat-muse-loader-emblem" aria-hidden="true">
-              <span class="muse-mascot lg is-streaming">
-                <svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg>
-              </span>
-            </div>
-            <div class="chat-muse-loader-copy">
-              <strong x-text="t('chat.loading_session')"></strong>
-              <span class="chat-muse-loader-dots" aria-hidden="true">
-                <i></i><i></i><i></i>
-              </span>
-            </div>
+          <div class="workspace-switch-status chat-transcript-loading-status">
+            <span class="spinner-sm" aria-hidden="true"></span>
+            <span x-text="t('chat.loading_session')"></span>
           </div>
         </div>
         <button class="jump-bottom" x-show="isAwayFromLatest()" @click="returnToLatest()" :title="lang==='zh'?'最新':'Jump to latest'" :aria-label="lang==='zh' ? '跳到最新消息' : 'Jump to latest'"><svg><use href="#i-arrow-down"/></svg></button>
