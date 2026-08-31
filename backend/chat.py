@@ -510,6 +510,15 @@ def _transcript_ts_ms(entry: dict) -> int | None:
 _RawMsg = chat_history.RawMsg
 
 
+def _raw_msg_from_entry(entry: dict) -> _RawMsg | None:
+    """Compatibility facade for canonical record projection."""
+    return chat_history.raw_msg_from_entry(
+        entry,
+        raw_msg_type=_RawMsg,
+        timestamp_ms=_transcript_ts_ms,
+    )
+
+
 def _full_session_msgs(sid: str) -> list:
     """Compatibility wrapper for canonical full-file transcript reads."""
     return chat_history.full_session_msgs(
@@ -999,6 +1008,11 @@ class TurnBroadcast:
         # Keeping the exact client/turn here closes the session-id ABA race.
         self.runtime_client: "MuseLabSDKClient | None" = None
         self.query_committed = False
+        # Native steering must target this exact turn, but the queue request can
+        # arrive after HTTP admission and before the root SDK query commits.
+        # Writers register durably against the broadcast, then wait on this
+        # one-shot gate instead of being downgraded to end-of-turn FIFO.
+        self.steering_ready = asyncio.Event()
         self.result_forwarded = False
         self.permission = ""
         self.active_tool_use_ids: set[str] = set()
@@ -1355,6 +1369,7 @@ class TurnBroadcast:
             return
         self._flush_compact_text()
         self.done = True
+        self.steering_ready.set()
         self.finished_at = time.time()
         if self.perf_status == "unknown":
             self.perf_status = "cancelled" if self.cancelled else "completed"
@@ -1409,6 +1424,7 @@ class TurnBroadcast:
         # Keep the compacted replay for late desktop reconnects during the grace TTL.
 
     def close(self) -> None:
+        self.steering_ready.set()
         for subscriber in tuple(self.subscribers):
             subscriber.close_reader()
             subscriber.close()
@@ -5366,6 +5382,7 @@ def _describe_transcript_record(entry: dict) -> dict:
     return chat_presentation.describe_transcript_record(
         entry,
         raw_message_factory=_RawMsg,
+        raw_entry_factory=_raw_msg_from_entry,
         render_messages=_sdk_messages_to_ui,
         is_real_user_prompt=_is_real_user_prompt,
     )
@@ -5418,7 +5435,10 @@ def _indexed_turn_context(
         if selected_i < 0 or selected_i >= len(records):
             continue
         selected = records[selected_i]
-        selected_uuid = str(selected.get("uuid") or "")
+        selected_uuid = str(
+            selected.get("presentation_uuid")
+            or selected.get("uuid")
+            or "")
         current_i = selected_i
         origin_i = selected_i
         seen: set[str] = set()
@@ -5458,19 +5478,26 @@ def _indexed_ui_records(
     index: dict,
     record_indices: list[int],
     annotations: dict[str, dict],
+    *,
+    defer_large_bodies: bool = True,
 ) -> list[dict]:
     """Seek/read and shape only selected records from a transcript index."""
     entries = transcript_idx.read_records(transcript_path, index, record_indices)
     turn_context = _indexed_turn_context(
         transcript_path, index, record_indices)
-    raw = [
-        _RawMsg(str(e.get("uuid") or ""), str(e.get("type") or ""),
-                e.get("message") or {}, _transcript_ts_ms(e))
-        for e in entries
+    projected = [
+        (entry, _raw_msg_from_entry(entry))
+        for entry in entries
     ]
-    compact = {str(e.get("uuid")) for e in entries if e.get("isCompactSummary")}
+    raw = [msg for _, msg in projected if msg is not None]
+    compact = {
+        str(msg.uuid)
+        for entry, msg in projected
+        if msg is not None and entry.get("isCompactSummary")
+    }
     bubbles = _sdk_messages_to_ui(
-        raw, annotations, compact, defer_large_bodies=True)
+        raw, annotations, compact,
+        defer_large_bodies=defer_large_bodies)
 
     # Cross-window context is stored in the index: a page may begin with a
     # tool_result whose tool_use is outside the read window, and a launching
@@ -5761,7 +5788,13 @@ def _jsonl_signature(sid: str) -> tuple[float, int] | None:
         sid, find_session_jsonl=_find_session_jsonl)
 
 
-def _shaped_ui_messages(sid: str, model: str, full: bool) -> list[dict]:
+def _shaped_ui_messages(
+    sid: str,
+    model: str,
+    full: bool,
+    *,
+    defer_large_bodies: bool = True,
+) -> list[dict]:
     """Shape SDK messages into UI bubbles with a freshness-checked cache.
 
     Falls back to live shaping whenever either signature is unavailable
@@ -5772,19 +5805,39 @@ def _shaped_ui_messages(sid: str, model: str, full: bool) -> list[dict]:
     jsig = _jsonl_signature(sid)
     ssig = sess.sidecar_signature(sid)
     key = (sid, full)
-    if jsig is not None:
+    if jsig is not None and defer_large_bodies:
         hit = _UI_MSGS_CACHE.get(key)
         if hit is not None and hit[0] == jsig and hit[1] == ssig:
             return hit[2]
-    try:
-        sdk_msgs = _cached_session_msgs(sid, model, full)
-    except Exception:
-        sdk_msgs = []
     annotations = sess.get_message_annotations(sid)
-    compact_uuids = _compact_summary_uuids(sid)
-    messages = _sdk_messages_to_ui(
-        sdk_msgs, annotations, compact_uuids, defer_large_bodies=True)
-    if jsig is not None:
+    messages: list[dict]
+    try:
+        indexed = _ensure_transcript_index(sid)
+    except Exception:
+        indexed = None
+    if indexed is not None:
+        transcript_path, index = indexed
+        order = "full" if full else "normal"
+        messages = _indexed_ui_records(
+            transcript_path,
+            index,
+            list((index.get("orders") or {}).get(order) or []),
+            annotations,
+            defer_large_bodies=defer_large_bodies,
+        )
+    else:
+        try:
+            sdk_msgs = _cached_session_msgs(sid, model, full)
+        except Exception:
+            sdk_msgs = []
+        compact_uuids = _compact_summary_uuids(sid)
+        messages = _sdk_messages_to_ui(
+            sdk_msgs,
+            annotations,
+            compact_uuids,
+            defer_large_bodies=defer_large_bodies,
+        )
+    if jsig is not None and defer_large_bodies:
         _UI_MSGS_CACHE.pop(key, None)
         _UI_MSGS_CACHE[key] = (jsig, ssig, messages)
         while len(_UI_MSGS_CACHE) > _UI_MSGS_CACHE_MAX:
@@ -6196,7 +6249,11 @@ def get_session_api(
             pre_total = 0
         if not full and total > 0 and meta.get("message_count", 0) != total:
             try:
-                turns = sum(1 for item in messages if item.get("role") == "user")
+                turns = sum(
+                    1 for item in messages
+                    if item.get("role") == "user"
+                    and item.get("_steeringAdjustment") is not True
+                )
                 sess.set_message_count(sid, total, turn_count=turns)
             except Exception:
                 pass
@@ -6251,7 +6308,10 @@ def get_session_block_api(sid: str, block_id: str) -> dict:
     transcript_path, index = indexed
     record_i = next(
         (i for i, record in enumerate(index.get("records") or [])
-         if str(record.get("uuid") or "") == record_uuid),
+         if record_uuid in {
+             str(record.get("uuid") or ""),
+             str(record.get("presentation_uuid") or ""),
+         }),
         None,
     )
     if record_i is None:
@@ -6260,14 +6320,12 @@ def get_session_block_api(sid: str, block_id: str) -> dict:
     if not entries:
         raise HTTPException(404, "block not found")
     entry = entries[0]
-    raw = _RawMsg(
-        str(entry.get("uuid") or ""),
-        str(entry.get("type") or ""),
-        entry.get("message") or {},
-        _transcript_ts_ms(entry),
-    )
-    compact = {record_uuid} if entry.get("isCompactSummary") else set()
-    messages = _sdk_messages_to_ui([raw], {}, compact)
+    raw = _raw_msg_from_entry(entry)
+    if raw is None:
+        raise HTTPException(404, "block not found")
+    compact = {raw.uuid} if entry.get("isCompactSummary") else set()
+    messages = _sdk_messages_to_ui(
+        [raw], sess.get_message_annotations(sid), compact)
     block = next(
         (message for message in messages
          if message.get("block_id") == block_id),
@@ -6624,12 +6682,8 @@ def export_session_markdown(sid: str, ticket: str = Query("")) -> Response:
         messages, _, _, _ = _interrupted_history_window(
             transcript_path, index, snapshots, annotations, "normal")
     else:
-        try:
-            sdk_msgs = _get_session_msgs(sid, model)
-        except Exception:
-            sdk_msgs = []
-        compact_uuids = _compact_summary_uuids(sid)
-        messages = _sdk_messages_to_ui(sdk_msgs, annotations, compact_uuids)
+        messages = _shaped_ui_messages(
+            sid, model, False, defer_large_bodies=False)
     # Bind any unbound pending image/doc attachments (those persisted
     # before the stream completed could write a uuid annotation) to the
     # user messages that have inline image refs but no thumb/url yet.
@@ -7283,18 +7337,20 @@ async def _schedule_queue_drain_after_response(session_id: str) -> None:
     _schedule_queue_drain(session_id)
 
 
-def _eligible_steering_turn(
+def _admitted_steering_turn(
     session_id: str,
     turn_id: str,
     *,
     permission: str = "",
 ) -> TurnBroadcast | None:
-    """Return the exact foreground turn that can accept native steering.
+    """Return the exact foreground turn reserved for native steering.
 
     A session id is not sufficient: an old enqueue response can arrive after
     turn A ended and turn B reused the same pooled client.  The immutable turn
-    id, query commit point and final-result flag together close that ABA window.
-    Queue-owned/background turns are deliberately left to ordinary FIFO drain.
+    id and final-result flag close that ABA window. Queue-owned/background turns
+    are deliberately left to ordinary FIFO drain. Runtime readiness is checked
+    separately so an exact admitted turn can retain a durable pending command
+    while its root query is still starting.
     """
     bc = _active_turns.get(session_id)
     if (
@@ -7305,16 +7361,32 @@ def _eligible_steering_turn(
         or bc.turn_id != turn_id
         or bc.is_continuation
         or bool(bc.queue_item_id)
-        or not bc.query_committed
         or bc.result_forwarded
         or bc.steering_closed
-        or not isinstance(bc.runtime_client, MuseLabSDKClient)
         or _sessions_with_inflight_tasks.get(session_id)
         or _session_has_live_watcher(session_id)
     ):
         return None
     requested_permission = (permission or "").strip()
     if requested_permission and requested_permission != bc.permission:
+        return None
+    return bc
+
+
+def _eligible_steering_turn(
+    session_id: str,
+    turn_id: str,
+    *,
+    permission: str = "",
+) -> TurnBroadcast | None:
+    """Return an exact admitted turn whose root SDK query is committed."""
+    bc = _admitted_steering_turn(
+        session_id, turn_id, permission=permission)
+    if (
+        bc is None
+        or not bc.query_committed
+        or not isinstance(bc.runtime_client, MuseLabSDKClient)
+    ):
         return None
     return bc
 
@@ -7405,6 +7477,8 @@ async def _deliver_steering_command(
     item_id: str,
     command_uuid: str,
     text: str,
+    display_text: str,
+    selection_quotes: list[dict],
     permission: str,
 ) -> tuple[str, str, dict | None]:
     """Write one durable queue item to the exact active CLI command queue.
@@ -7415,9 +7489,16 @@ async def _deliver_steering_command(
     """
     bc: TurnBroadcast | None = None
     write_event: asyncio.Event | None = None
+    waiting_for_startup = False
     async with _lock:
         bc = _eligible_steering_turn(
             session_id, turn_id, permission=permission)
+        if bc is None:
+            admitted = _admitted_steering_turn(
+                session_id, turn_id, permission=permission)
+            if admitted is not None and not admitted.query_committed:
+                bc = admitted
+                waiting_for_startup = True
         if bc is not None:
             write_event = asyncio.Event()
             bc.steering_commands[command_uuid] = {
@@ -7435,6 +7516,70 @@ async def _deliver_steering_command(
         )
         return "queue", "queued", fallback
 
+    def _discard_registration() -> None:
+        current = bc.steering_commands.get(command_uuid)
+        if current is not None and current.get("item_id") == item_id:
+            bc.steering_commands.pop(command_uuid, None)
+        write_event.set()
+        bc.steering_write_events.pop(command_uuid, None)
+
+    if waiting_for_startup:
+        try:
+            await asyncio.wait_for(
+                bc.steering_ready.wait(), timeout=30.0)
+        except asyncio.TimeoutError:
+            _discard_registration()
+            fallback = await _fallback_steering_item(
+                session_id,
+                item_id=item_id,
+                command_uuid=command_uuid,
+                bc=bc,
+            )
+            return "queue", "queued", fallback
+        async with _lock:
+            ready = (
+                _eligible_steering_turn(
+                    session_id, turn_id, permission=permission) is bc
+                and str((bc.steering_commands.get(command_uuid) or {}).get(
+                    "item_id") or "") == item_id
+            )
+        if not ready:
+            _discard_registration()
+            fallback = await _fallback_steering_item(
+                session_id,
+                item_id=item_id,
+                command_uuid=command_uuid,
+                bc=bc,
+            )
+            return "queue", "queued", fallback
+
+    # The CLI's canonical queued_command attachment only retains the model
+    # prompt. Keep the bounded presentation metadata under the source UUID so
+    # refresh can restore the exact visible bubble and reconcile it with the
+    # live DOM identity. Commit this before the SDK write so a very fast CLI
+    # cannot publish the attachment/completion before its display metadata.
+    try:
+        await obs.to_thread_io(
+            "chat.queue_steering_annotation",
+            session_id,
+            sess.set_message_annotation,
+            session_id,
+            command_uuid,
+            steering_display_text=(
+                display_text if selection_quotes else None),
+            steering_selection_quotes=(
+                selection_quotes if selection_quotes else None),
+            steering_queue_item_id=item_id,
+            steering_turn_id=turn_id,
+            file_path=sess._sidecar_path(session_id),
+            owned=True,
+        )
+    except Exception as exc:
+        sys.stderr.write(
+            f"[chat] steering annotation failed sid={session_id[:8]} "
+            f"exc={type(exc).__name__}\n")
+        sys.stderr.flush()
+
     try:
         await bc.runtime_client.query_steering(
             text,
@@ -7442,11 +7587,7 @@ async def _deliver_steering_command(
             command_uuid=command_uuid,
         )
     except BaseException:
-        current = bc.steering_commands.get(command_uuid)
-        if current is not None and current.get("item_id") == item_id:
-            bc.steering_commands.pop(command_uuid, None)
-        write_event.set()
-        bc.steering_write_events.pop(command_uuid, None)
+        _discard_registration()
         fallback = await _fallback_steering_item(
             session_id,
             item_id=item_id,
@@ -7747,12 +7888,17 @@ async def enqueue_api(
     # the queue sidecar and the eventual canonical user UUID; replaying that
     # transaction inside a mid-turn CLI fold would make crash recovery
     # ambiguous, so attachment messages retain ordinary turn-boundary FIFO.
-    steering_turn = (
-        _eligible_steering_turn(
+    steering_turn = None
+    if requested_delivery == "adjust" and not attachment_ids:
+        steering_turn = _eligible_steering_turn(
             sid, requested_turn_id, permission=req.permission or "")
-        if requested_delivery == "adjust" and not attachment_ids
-        else None
-    )
+        if steering_turn is None:
+            admitted = _admitted_steering_turn(
+                sid, requested_turn_id, permission=req.permission or "")
+            # Only bridge the startup gap. A query-committed turn that fails
+            # the runtime capability check remains ordinary FIFO immediately.
+            if admitted is not None and not admitted.query_committed:
+                steering_turn = admitted
     effective_delivery = "adjust" if steering_turn is not None else "queue"
     command_uuid = str(uuid.uuid4()) if steering_turn is not None else ""
 
@@ -7905,6 +8051,8 @@ async def enqueue_api(
             item_id=queue_item_id,
             command_uuid=command_uuid,
             text=text,
+            display_text=display_text,
+            selection_quotes=selection_quotes,
             permission=req.permission or "",
         ))
         try:
@@ -14819,6 +14967,10 @@ async def _admit_accept_launch_turn(
         model=model,
         image_ids=image_ids,
     )
+    # The validated launch permission is immutable for this admitted turn.
+    # Publish it before detached runtime startup so an exact-turn steering
+    # request in the admission window can retain the same permission guard.
+    broadcast.permission = permission
     if broadcast.done or broadcast.cancelled:
         return broadcast
     try:
@@ -15820,6 +15972,7 @@ async def _start_turn(
                         _pending_runtime_rebuilds.add(session_id)
                         raise
                     broadcast.query_committed = True
+                    broadcast.steering_ready.set()
                     broadcast.emit_startup_perf("ready")
                     if persisted_imgs:
                         try:

@@ -2845,7 +2845,11 @@ def test_around_uuid_uses_virtual_snapshot_coordinates(stream_env, monkeypatch):
     index = {
         "records": [
             {"uuid": "u1", "bubble_count": 1},
-            {"uuid": "u2", "bubble_count": 1},
+            {
+                "uuid": "attachment-u2",
+                "presentation_uuid": "command-u2",
+                "bubble_count": 1,
+            },
         ],
         "orders": {"full": [0, 1], "normal": [0, 1]},
         "bubble_prefix": {"full": [0, 1, 2], "normal": [0, 1, 2]},
@@ -2867,7 +2871,13 @@ def test_around_uuid_uses_virtual_snapshot_coordinates(stream_env, monkeypatch):
 
     def shaped(_path, shaped_index, record_ids, _annotations):
         return [
-            {"role": "assistant", "uuid": shaped_index["records"][i]["uuid"]}
+            {
+                "role": "assistant",
+                "uuid": (
+                    shaped_index["records"][i].get("presentation_uuid")
+                    or shaped_index["records"][i]["uuid"]
+                ),
+            }
             for i in record_ids
         ]
 
@@ -2877,14 +2887,14 @@ def test_around_uuid_uses_virtual_snapshot_coordinates(stream_env, monkeypatch):
         index,
         [snapshot],
         {},
-        "u2",
+        "command-u2",
         before=1,
         after=0,
     )
     assert result is not None
     window, total, offset, has_later = result
     assert [item.get("text") or item.get("uuid") for item in window] == [
-        "后台 Agent 气泡", "u2"]
+        "后台 Agent 气泡", "command-u2"]
     assert (total, offset, has_later) == (3, 1, False)
 
 

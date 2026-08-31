@@ -184,6 +184,12 @@ const _mcpFmtCache  = new WeakMap();   // raw msg -> { kind, value }
 const _readLinesCache = new WeakMap(); // raw msg -> { src, lines }
 const _searchHitsCache = new WeakMap();// raw msg -> { src, hits }
 const _toolMdCache = new WeakMap();    // raw msg -> { src, html }
+// Keyed by the per-tab state proxy. A structural transcript update normally
+// shifts many keyed Alpine rows at once; rebuilding this lookup once keeps each
+// row's derived index O(1) while still validating the cached coordinate before
+// use. This avoids stale x-for indices after a canonical row is inserted in the
+// middle of a live turn.
+const _paneMessageIndexCache = new WeakMap(); // tab state -> Map(message key, index)
 // Activity grouping/search runs from several Alpine expressions per render.
 // Keep its derived snapshot off reactive state so populating the cache cannot
 // itself schedule another render. Weak keys let each portal instance GC.
@@ -4306,15 +4312,20 @@ function portal() {
       }
       if (!ownerUser) return false;
 
+      // A native steering bubble divides the visible assistant/tool stream,
+      // but it is still part of this same logical turn. Pane-level live state
+      // belongs only to the newest user-delimited segment; otherwise both the
+      // pre-adjustment and post-adjustment tails render as Running.
+      for (let k = index + 1; k < pane.messages.length; k += 1) {
+        if (pane.messages[k] && pane.messages[k].role === "user") return false;
+      }
+
       const ownerTurnId = String(ownerUser._turnId || "");
       const activeTurnId = String(pane.activeTurnId || "");
       if (ownerTurnId && activeTurnId) return ownerTurnId === activeTurnId;
 
       // Before the first turn metadata event arrives, the newest user boundary
       // is the only reply run that can own the pane-level live state.
-      for (let k = index + 1; k < pane.messages.length; k += 1) {
-        if (pane.messages[k] && pane.messages[k].role === "user") return false;
-      }
       return true;
     },
     turnFooterStatus(m, pane) {
@@ -4413,7 +4424,8 @@ function portal() {
       const m = arr[i];
       if (!m || m.role === "user") return false;
       const next = arr[i + 1];
-      return !next || next.role === "user"
+      return !next || (next.role === "user"
+        && next._steeringAdjustment !== true)
         || next.display_kind === "runtime_continuation";
     },
     // Resolve a persisted message UUID for a footer mounted on the actual turn
@@ -4430,7 +4442,8 @@ function portal() {
       if (tail.display_kind === "runtime_continuation"
           || tail.forkable === false || tail.presentation_only) return "";
       const next = arr[i + 1];
-      if (next && next.role !== "user"
+      if (next && (next.role !== "user"
+          || next._steeringAdjustment === true)
           && next.display_kind !== "runtime_continuation") return "";
       for (let k = i; k >= 0; k -= 1) {
         const message = arr[k];
@@ -7838,6 +7851,10 @@ function portal() {
         // Exact backend turn currently owned by this tab. Session id is not
         // sufficient: a reconnect for turn A must never attach to newer B.
         activeTurnId: "",
+        // Primitive identity for the local stream attempt that owns the active
+        // turn. A delayed /active admission probe may observe a successor turn
+        // in the same tab, so discovery must also match this local owner.
+        _streamOwnerToken: "",
         // Immutable turn id of the most recent authenticated terminal frame.
         // Post-result work may briefly leave /active or a mux state snapshot
         // stale; never re-attach that already-rendered turn as "running".
@@ -8023,6 +8040,7 @@ function portal() {
       if (st.activeTurnId === undefined) st.activeTurnId = "";
       if (st._lastTerminalTurnId === undefined) st._lastTerminalTurnId = "";
       if (st.parentTurnId === undefined) st.parentTurnId = "";
+      if (st._streamOwnerToken === undefined) st._streamOwnerToken = "";
       if (!Number.isFinite(st.lastEventSeq)) st.lastEventSeq = 0;
       if (st.permission === undefined) st.permission = "";
       if (st.effort === undefined) st.effort = "auto";
@@ -8414,6 +8432,57 @@ function portal() {
         return "queue";
       }
       return "adjust";
+    },
+    async _resolveBusyAdjustmentTurnId(
+      sid, st, expectedStreamOwnerToken = "", activeTurnId = "",
+      hasAttachments = false,
+    ) {
+      const streamOwnerToken = String(expectedStreamOwnerToken || "");
+      const ownerStillCurrent = () => !!streamOwnerToken
+        && this.tabState[sid] === st
+        && st.streaming
+        && String(st._streamOwnerToken || "") === streamOwnerToken;
+      if (!ownerStillCurrent()) return "";
+      const accept = value => {
+        const turnId = String(value || "");
+        return turnId
+          && this._busySendDelivery(sid, turnId, hasAttachments) === "adjust"
+          ? turnId : "";
+      };
+      const known = accept(activeTurnId || (st && st.activeTurnId));
+      if (known) return known;
+      // A second Send can land after the first call marked the pane streaming
+      // but before /turns/start returned its immutable turn id.  Falling back
+      // to FIFO in that narrow admission window strands the message until the
+      // whole turn completes, even if many tool boundaries follow. Resolve the
+      // already-reserved server turn once, then keep the ordinary exact-id ABA
+      // checks in the queue endpoint. Every genuinely ineligible state still
+      // returns immediately without an extra request.
+      if (!st || this.tabState[sid] !== st
+          || this._normalizeBusySendMode(this.busySendMode) !== "adjust"
+          || hasAttachments || !st.streaming || st.compacting
+          || st.backgroundActive || st._draining || st.parentTurnId
+          || (st.pendingQueue && st.pendingQueue.length)) {
+        return "";
+      }
+      try {
+        const r = await this._fetchWithDeadline(
+          "/api/chat/sessions/" + sid + "/active",
+          { headers: this.hdr(), cache: "no-store" },
+          2500,
+        );
+        if (!ownerStillCurrent()) return "";
+        const local = accept(st.activeTurnId);
+        if (local) return local;
+        if (!r.ok) return "";
+        const status = await r.json();
+        if (!ownerStillCurrent() || !status.active || status.background) {
+          return "";
+        }
+        return accept(status.turn_id);
+      } catch (_) {
+        return ownerStillCurrent() ? accept(st.activeTurnId) : "";
+      }
     },
     sendButtonHint(sid) {
       if (this.composerClaimed(sid)) return this.t("btn.send");
@@ -8822,10 +8891,20 @@ function portal() {
             "",
           )
         : "";
-      const delivery = this._normalizeBusySendMode(
+      let delivery = this._normalizeBusySendMode(
         item.delivery || this.busySendMode,
       );
-      const activeTurnId = String(item.active_turn_id || "");
+      let activeTurnId = String(item.active_turn_id || "");
+      const streamOwnerToken = String(item.stream_owner_token || "");
+      if (delivery !== "adjust" && !activeTurnId && !image_ids) {
+        const resolvedTurnId = await this._resolveBusyAdjustmentTurnId(
+          sid, enqueueState, streamOwnerToken, "", false,
+        );
+        if (resolvedTurnId) {
+          activeTurnId = resolvedTurnId;
+          delivery = "adjust";
+        }
+      }
       let accepted = null;
       try {
         const r = await fetch("/api/chat/sessions/" + sid + "/queue", {
@@ -9783,11 +9862,13 @@ function portal() {
     },
     _reconcileCompletedTurn(
       sid, ownerState, expectedText = "", attempt = 0, expectedAssistantUuid = "",
+      completedTurnId = "",
     ) {
       if (!sid || this.tabState[sid] !== ownerState) return Promise.resolve(false);
       const options = {
         expectedText: String(expectedText || ""),
         expectedAssistantUuid: String(expectedAssistantUuid || ""),
+        completedTurnId: String(completedTurnId || ""),
         attempt: Math.max(0, Number(attempt) || 0),
       };
       ownerState._pendingCompletedTurnSync = options;
@@ -9801,13 +9882,16 @@ function portal() {
       const attempt = Math.max(0, Number(options.attempt) || 0);
       const expectedText = String(options.expectedText || "");
       const expectedAssistantUuid = String(options.expectedAssistantUuid || "");
+      const completedTurnId = String(options.completedTurnId || "");
       const stillOwned = () => this.tabState[sid] === ownerState
-        && !ownerState.streaming && !ownerState.es;
+        && !ownerState.streaming && !ownerState.es
+        && !this._hasPendingAdmission(ownerState);
       if (!stillOwned()) return false;
       const retry = () => {
         if (options.signal?.aborted) return;
         const next = {
-          expectedText, expectedAssistantUuid, attempt: attempt + 1,
+          expectedText, expectedAssistantUuid, completedTurnId,
+          attempt: attempt + 1,
         };
         ownerState._pendingCompletedTurnSync = next;
         if (attempt < 30 && stillOwned()) {
@@ -9817,19 +9901,23 @@ function portal() {
         }
       };
       try {
-        const activeResponse = await this._fetchWithDeadline(
-          "/api/chat/sessions/" + sid + "/active",
-          { headers: this.hdr(), signal: options.signal },
-        );
-        if (!stillOwned()) return false;
-        let activity = null;
-        try { activity = activeResponse.ok ? await activeResponse.json() : null; }
-        catch (_) { activity = null; }
-        if (!activity || (activity.active && !activity.background)) {
-          retry();
-          return false;
-        }
+        // The terminal SSE frame already identifies the exact assistant UUID.
+        // `/active` can remain true briefly while backend postlude/index work
+        // finishes, so treating it as a hard gate leaves the live DOM stale even
+        // when canonical history is already complete. Read history immediately
+        // and let the expected UUID below be the authoritative commit boundary.
         const reconcileTail = this._historyReconcileWindowSize();
+        // Probe identity in parallel with history. A stale active=true for the
+        // completed turn is harmless, while a different active turn means a
+        // successor has already claimed this session and its optimistic/live
+        // suffix must win over A's delayed canonical replacement.
+        const activeProbe = completedTurnId
+          ? this._fetchWithDeadline(
+              "/api/chat/sessions/" + sid + "/active",
+              { headers: this.hdr(), signal: options.signal },
+              2500,
+            ).catch(() => null)
+          : Promise.resolve(null);
         const historyResponse = await this._fetchWithDeadline(
           "/api/chat/sessions/" + sid + "?tail=" + reconcileTail,
           { headers: this.hdr(), signal: options.signal },
@@ -9837,31 +9925,69 @@ function portal() {
         if (!stillOwned()) return false;
         if (!historyResponse.ok) { retry(); return false; }
         const history = await historyResponse.json();
+        const activeResponse = await activeProbe;
+        if (!stillOwned()) return false;
+        let activity = null;
+        try { activity = activeResponse?.ok ? await activeResponse.json() : null; }
+        catch (_) { activity = null; }
+        const activeTurnId = String((activity && activity.turn_id) || "");
+        if (activity && activity.active && !activity.background
+            && activeTurnId && activeTurnId !== completedTurnId) {
+          retry();
+          return false;
+        }
         const messages = Array.isArray(history.messages) ? history.messages : [];
-        let latestUserIndex = -1;
-        for (let i = messages.length - 1; i >= 0; i -= 1) {
-          if (messages[i] && messages[i].role === "user") {
-            latestUserIndex = i;
+        let finalIndex = -1;
+        if (expectedAssistantUuid) {
+          for (let i = messages.length - 1; i >= 0; i -= 1) {
+            const message = messages[i];
+            if (message && message.role === "assistant"
+                && message.uuid === expectedAssistantUuid) {
+              finalIndex = i;
+              break;
+            }
+          }
+        } else if (expectedText) {
+          for (let i = messages.length - 1; i >= 0; i -= 1) {
+            const message = messages[i];
+            if (message && message.role === "assistant" && message.uuid
+                && (message.text || "") === expectedText) {
+              finalIndex = i;
+              break;
+            }
+          }
+        }
+        if (finalIndex < 0) { retry(); return false; }
+        const hasSuccessorRoot = messages.slice(finalIndex + 1).some(
+          message => message && message.role === "user"
+            && message._steeringAdjustment !== true
+            && message._turnRoot !== false,
+        );
+        if (hasSuccessorRoot) { retry(); return false; }
+        // Native steering messages are user-role records inside the same logical
+        // turn. Walk backward from the committed final assistant to the nearest
+        // root user instead of truncating the window at the last adjustment.
+        let rootUserIndex = -1;
+        for (let i = finalIndex - 1; i >= 0; i -= 1) {
+          const message = messages[i];
+          if (message && message.role === "user"
+              && message._steeringAdjustment !== true
+              && message._turnRoot !== false) {
+            rootUserIndex = i;
             break;
           }
         }
-        const turnStart = latestUserIndex + 1;
-        const canonicalTurn = messages.slice(turnStart);
+        const turnStart = rootUserIndex + 1;
+        const canonicalTurn = messages.slice(turnStart, finalIndex + 1);
         // Mobile's normal 20-block window can start inside a tool-heavy turn.
         // Reconcile at least through this turn's user boundary so canonical
         // installation never keeps the reply while dropping its prompt.
-        const completedTurnWindow = latestUserIndex >= 0
-          ? messages.length - latestUserIndex : reconcileTail;
+        const completedTurnWindow = rootUserIndex >= 0
+          ? messages.length - rootUserIndex : reconcileTail;
         const hasBoundary = canonicalTurn.some(
           m => m && m.role !== "user" && m.uuid,
         );
-        const hasFinal = expectedAssistantUuid
-          ? canonicalTurn.some(m => m && m.uuid === expectedAssistantUuid)
-          : !!expectedText && canonicalTurn.some(
-              m => m && m.role === "assistant" && m.uuid
-                && (m.text || "") === expectedText,
-            );
-        if (!hasBoundary || !hasFinal) { retry(); return false; }
+        if (!hasBoundary) { retry(); return false; }
         if (!stillOwned()) return false;
         const loaded = await this.loadSession(sid, {
           quiet: true, probeActive: false,
@@ -9881,9 +10007,11 @@ function portal() {
     },
     _reconcileCompletedContinuation(
       sid, ownerState, expectedText = "", attempt = 0, expectedAssistantUuid = "",
+      completedTurnId = "",
     ) {
       return this._reconcileCompletedTurn(
         sid, ownerState, expectedText, attempt, expectedAssistantUuid,
+        completedTurnId,
       );
     },
     async removePendingQueueItem(sid, idx) {
@@ -10293,6 +10421,40 @@ function portal() {
       if (!tid) return [];
       return this._visiblePaneMessages(this.tabState && this.tabState[tid]);
     },
+    paneMessageIndex(tid, message) {
+      const st = tid && this.tabState && this.tabState[tid];
+      if (!st || !message) return -1;
+      const rows = Array.isArray(st.messages) ? st.messages : [];
+      if (rows.length) this._ensureNonEmptyMessageRange(st);
+      const start = st.messageRange
+        ? Math.max(0, Math.min(st.messageRange.visibleStart, rows.length)) : 0;
+      const end = st.messageRange
+        ? Math.max(start, Math.min(st.messageRange.visibleEnd, rows.length))
+        : rows.length;
+      const key = message._k;
+      let indexes = _paneMessageIndexCache.get(st);
+      const cached = key && indexes ? indexes.get(key) : undefined;
+      if (Number.isInteger(cached) && cached >= start && cached < end
+          && rows[cached] && rows[cached]._k === key) {
+        return cached - start;
+      }
+      indexes = new Map();
+      for (let index = start; index < end; index += 1) {
+        const candidate = rows[index];
+        if (candidate && candidate._k) indexes.set(candidate._k, index);
+      }
+      _paneMessageIndexCache.set(st, indexes);
+      if (key && indexes.has(key)) return indexes.get(key) - start;
+      const absolute = rows.indexOf(message, start);
+      return absolute >= start && absolute < end ? absolute - start : -1;
+    },
+    _hasPendingAdmission(st) {
+      return !!(st && (st._composerSubmitToken || this._hasAdmissionBubble(st)));
+    },
+    _hasAdmissionBubble(st) {
+      return !!(st && Array.isArray(st.messages)
+        && st.messages.some(message => message && message._admissionPending));
+    },
     _messageVirtualHeight(st, message) {
       const key = message && message._k;
       const measured = key && Number(st._virtualHeights[key]);
@@ -10363,19 +10525,6 @@ function portal() {
       st._virtualEnd = next.end;
       st._virtualRevision++;
     },
-    paneMessageRows(tid) {
-      const st = tid && this.tabState && this.tabState[tid];
-      const messages = this._visiblePaneMessages(st);
-      if (!st || !messages.length) return [];
-      // Render the resident window directly. The custom estimated-height spacers
-      // could not keep up with fast wheel/touch movement: readers outran the
-      // mounted range into blank space, then each measured-height correction
-      // resized the scrollbar and flashed the pane. Network paging still bounds
-      // the resident range; the browser now owns layout with exact row heights.
-      return messages.map((message, index) => ({
-        key: message._k, index, message, spacer: false,
-      }));
-    },
     _measureMessageVirtualRows(tid, st) {
       const pane = this._paneElement(tid);
       if (!pane || this.tabState[tid] !== st) return false;
@@ -10392,8 +10541,8 @@ function portal() {
       return changed;
     },
     _syncMessageViewport(tid = this.currentId, forceTail = false) {
-      // Intentionally no-op: paneMessageRows renders the resident range with
-      // exact browser layout. Keeping the old velocity/estimated-height window
+      // Intentionally no-op: the flat keyed message loop renders the resident
+      // range with exact browser layout. Keeping the old velocity/estimated-height window
       // updater active would continue rewriting indexes and restoring anchors
       // on every scroll frame even though there are no virtual spacers left.
       void tid;
@@ -13514,7 +13663,8 @@ function portal() {
       const msgs = paneMsgs || [];
       const isTurnTail = m.role !== "user"
         && (i === msgs.length - 1
-            || (msgs[i + 1] && msgs[i + 1].role === "user"));
+            || (msgs[i + 1] && msgs[i + 1].role === "user"
+                && msgs[i + 1]._steeringAdjustment !== true));
       if (isTurnTail) return true;
 
       if (m._is_compact_summary) return true;
@@ -16244,7 +16394,7 @@ function portal() {
       // Canonical history reconciliation runs only after the stream retires.
       // Return false so full-history/outline callers know the requested load was
       // deferred instead of recursively treating it as completed.
-      if (st.streaming || st.es) return false;
+      if (st.streaming || st.es || this._hasAdmissionBubble(st)) return false;
       const historyReplaceToken = this._beginHistoryReplace(st);
       const quietRangeSnapshot = quiet
         ? this._captureMessageRangeSnapshot(st) : null;
@@ -16349,7 +16499,7 @@ function portal() {
             || !this._historyReplaceStillOwns(st, historyReplaceToken)) {
           return false;
         }
-        if (st.streaming || st.es) return false;
+        if (st.streaming || st.es || this._hasAdmissionBubble(st)) return false;
         const loadedRuntimeUiRevision = String(s.runtime_ui_revision || "");
         const currentRuntimeUiRevision = String(st.runtimeUiRevision || "");
         // A different load for this same tab adopted another presentation
@@ -16432,12 +16582,13 @@ function portal() {
         // this state while markdown rendering yielded. Never write into a stale
         // generation or replace an active owner's message array.
         if (this.tabState[sid] !== st || st.streaming || st.es
+            || this._hasAdmissionBubble(st)
             || !this._historyReplaceStillOwns(st, historyReplaceToken)) {
           return false;
         }
         // Replace the one repository in place. Quiet reconciliation preserves
         // matching message object identity; cold reveal changes only range coords.
-        if (st.streaming || st.es) return false;
+        if (st.streaming || st.es || this._hasAdmissionBubble(st)) return false;
         // _virtualStart/_virtualEnd are LOCAL to the revealed slice. A quiet
         // canonical refresh can move visibleStart from a narrow recent tail to
         // an older coordinate; carrying the same numbers across that change
@@ -16493,6 +16644,7 @@ function portal() {
         }
         historyPerf.install_ms = Math.round(perfNow() - installStarted);
         if (this.tabState[sid] !== st || st.streaming || st.es
+            || this._hasAdmissionBubble(st)
             || !this._historyReplaceStillOwns(st, historyReplaceToken)) {
           return false;
         }
@@ -17037,7 +17189,12 @@ function portal() {
               body_ref: existing.body_ref,
             }
           : null;
-        Object.assign(existing, m, { _k: renderKey });
+        // A prior quiet reconciliation may have adopted this canonical block
+        // into an already-mounted live object. Keep that mounted key on every
+        // later canonical refresh; replacing it with renderKey here remounts
+        // the bubble on the second poll even though object identity survived.
+        const mountedKey = existing._k || renderKey;
+        Object.assign(existing, m, { _k: mountedKey });
         if (loadedBody) Object.assign(existing, loadedBody);
         return existing;
       });
@@ -17245,6 +17402,10 @@ function portal() {
       this._assignLiveKey(st, m);
       const tailWasVisible = st.messageRange.visibleEnd === st.messages.length;
       const followTail = tailWasVisible && st.atBottom !== false;
+      // A live/optimistic append is newer than every history response already
+      // in flight. Advance the replacement epoch before exposing the bubble so
+      // an older quiet load cannot splice it out during turn admission.
+      this._invalidateHistoryReplace(st);
       st.messages.push(m);
       st.messageRange.total = Math.max(
         st.messageRange.total + 1, st.messageRange.offset + st.messages.length);
@@ -17344,6 +17505,9 @@ function portal() {
       return null;
     },
     _beginHistoryReplace(st) {
+      return this._invalidateHistoryReplace(st);
+    },
+    _invalidateHistoryReplace(st) {
       const seq = (Number(st && st._historyRequestSeq) || 0) + 1;
       st._historyRequestSeq = seq;
       st._historyReplaceOwner = seq;
@@ -29471,6 +29635,8 @@ function portal() {
       // backend can reject stale steering rather than targeting a successor.
       const busyActiveTurnId = !isReconnect
         ? String(sendState.activeTurnId || "") : "";
+      const busyStreamOwnerToken = !isReconnect
+        ? String(sendState._streamOwnerToken || "") : "";
       const busyHasAttachments = !isReconnect
         && !!(composerImages.length || composerDocs.length);
       const busyDelivery = this._busySendDelivery(
@@ -29661,6 +29827,7 @@ function portal() {
           plan_return_permission: sendPlanReturnPermission,
           delivery: busyDelivery,
           active_turn_id: busyActiveTurnId,
+          stream_owner_token: busyStreamOwnerToken,
         });
         if (!ok) {
           rollbackOptimisticSubmission();
@@ -29763,6 +29930,7 @@ function portal() {
       // visual generation makes an older load response unable to turn the live
       // pane into either a loading or error surface when it eventually settles.
       this._releaseTranscriptLoadForLive(streamState);
+      streamState._streamOwnerToken = composerSubmitToken;
       streamState.streaming = true;
       if (!isReconnect || !streamState.streamPhase) {
         streamState.streamPhase = "connecting";
@@ -29850,6 +30018,7 @@ function portal() {
         streamState._streamStartedAt = 0;
         streamState.streamElapsed = 0;
         streamState.streaming = false;
+        streamState._streamOwnerToken = "";
         streamState.streamPhase = "";
         streamState._continuationAwaitingReaction = false;
         streamState.es = null;
@@ -29913,6 +30082,7 @@ function portal() {
                   plan_return_permission: sendPlanReturnPermission,
                   delivery: busyDelivery,
                   active_turn_id: busyActiveTurnId,
+                  stream_owner_token: busyStreamOwnerToken,
                 });
                 if (queued) {
                   rollbackUnstartedSend(false);
@@ -30862,6 +31032,7 @@ function portal() {
         // permission-mode commit never arrived.
         _finalizePendingPermissionRequests();
         streamState.streaming = false;
+        streamState._streamOwnerToken = "";
         streamState.streamPhase = "";
         streamState._continuationAwaitingReaction = false;
         streamState.es = null;
@@ -31194,12 +31365,12 @@ function portal() {
         } else if (isContinuation && !d.cancelled) {
           this._reconcileCompletedContinuation(
             streamSid, streamState, continuationFinalText, 0,
-            String(d.assistant_uuid || ""),
+            String(d.assistant_uuid || ""), completedTurnId,
           );
         } else if (!d.cancelled) {
           this._reconcileCompletedTurn(
             streamSid, streamState, d.is_error ? "" : completedFinalText, 0,
-            String(d.assistant_uuid || ""),
+            String(d.assistant_uuid || ""), completedTurnId,
           );
         }
         if (!d.cancelled) {
@@ -31392,6 +31563,7 @@ function portal() {
             plan_return_permission: sendPlanReturnPermission,
             delivery: handoffDelivery,
             active_turn_id: handoffTurnId,
+            stream_owner_token: busyStreamOwnerToken,
           });
           if (queued) {
             if (sentUserBubble) {
@@ -31749,6 +31921,13 @@ function portal() {
           // async queue/start request settles. The token is globally unique, so
           // release every surviving holder instead of guessing one successor.
           this._releaseComposerClaim(composerSubmitToken);
+          this.$nextTick(() => {
+            for (const [sid, state] of Object.entries(this.tabState || {})) {
+              if (state && state._pendingCompletedTurnSync) {
+                this._resumePendingCanonicalSync(sid, state);
+              }
+            }
+          });
         }
       }
     },

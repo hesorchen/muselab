@@ -20,6 +20,29 @@ def _entry(uid: str, typ: str, content, parent: str | None = None, **extra):
     }
 
 
+def _queued_command_entry(
+    uid: str,
+    source_uuid: str,
+    prompt: str,
+    parent: str | None = None,
+    **extra,
+):
+    return {
+        "uuid": uid,
+        "parentUuid": parent,
+        "type": "attachment",
+        "sessionId": "00000000-0000-4000-8000-000000000001",
+        "attachment": {
+            "type": "queued_command",
+            "prompt": prompt,
+            "source_uuid": source_uuid,
+            "commandMode": "prompt",
+            "origin": {"kind": "human"},
+        },
+        **extra,
+    }
+
+
 def _append(path: Path, *entries: dict, final_newline: bool = True) -> None:
     text = "\n".join(json.dumps(e, ensure_ascii=False) for e in entries)
     if final_newline:
@@ -377,6 +400,136 @@ def test_window_endpoint_matches_full_oracle_and_adds_stable_keys(
         m["block_id"] for m in body["messages"]
     ]
     assert len({m["block_id"] for m in body["messages"]}) == len(body["messages"])
+
+
+def test_queued_command_survives_terminal_leaf_reload_and_later_output(
+    client, auth, app_module, tmp_path,
+):
+    """A native steering attachment is one durable inline user boundary."""
+    from backend import chat as chat_mod
+
+    command_uuid = "00000000-0000-4000-8000-000000000077"
+    entries = [
+        _entry(
+            "u1", "user", "run tools",
+            timestamp="2026-08-31T03:15:34.000Z"),
+        _entry("a1", "assistant", [{
+            "type": "tool_use", "id": "toolu_1", "name": "Bash",
+            "input": {"command": "ls"},
+        }], "u1", timestamp="2026-08-31T03:15:34.500Z"),
+        _entry("tr1", "user", [{
+            "type": "tool_result", "tool_use_id": "toolu_1",
+            "content": "first result",
+        }], "a1", timestamp="2026-08-31T03:15:34.800Z"),
+        _queued_command_entry(
+            "attachment-1", command_uuid, "quoted prompt for the model", "tr1",
+            timestamp="2026-08-31T03:15:35.000Z"),
+    ]
+    sid, transcript = _make_endpoint_session(
+        client, auth, chat_mod, tmp_path, entries)
+    quotes = [{
+        "id": "quote-1", "source": "chat", "role": "assistant",
+        "sessionId": sid, "messageId": "a1", "path": "",
+        "text": "selected context", "truncated": False,
+    }]
+    chat_mod.sess.set_message_annotation(
+        sid,
+        command_uuid,
+        steering_display_text="visible adjustment",
+        steering_selection_quotes=quotes,
+        steering_queue_item_id="q-steer",
+        steering_turn_id="turn-1",
+    )
+
+    # queued_command can briefly be the terminal transcript leaf. It must
+    # already be visible instead of waiting for a later assistant record.
+    terminal = client.get(
+        f"/api/chat/sessions/{sid}", headers=auth, params={"tail": 50})
+    assert terminal.status_code == 200, terminal.text
+    terminal_messages = terminal.json()["messages"]
+    assert terminal_messages[-1]["uuid"] == command_uuid
+    assert terminal_messages[-1]["role"] == "user"
+
+    _append(
+        transcript,
+        _entry("a2", "assistant", [{
+            "type": "tool_use", "id": "toolu_2", "name": "Bash",
+            "input": {"command": "pwd"},
+        }], "attachment-1", timestamp="2026-08-31T03:15:35.500Z"),
+        _entry("tr2", "user", [{
+            "type": "tool_result", "tool_use_id": "toolu_2",
+            "content": "second result",
+        }], "a2", timestamp="2026-08-31T03:15:36.000Z"),
+        _entry(
+            "a3", "assistant", "all done", "tr2",
+            timestamp="2026-08-31T03:15:37.000Z"),
+    )
+
+    expected = [
+        ("u1", "user"),
+        ("a1", "tool_use"),
+        ("tr1", "tool_result"),
+        (command_uuid, "user"),
+        ("a2", "tool_use"),
+        ("tr2", "tool_result"),
+        ("a3", "assistant"),
+    ]
+    tail = client.get(
+        f"/api/chat/sessions/{sid}", headers=auth, params={"tail": 50})
+    assert tail.status_code == 200, tail.text
+    body = tail.json()
+    assert [(item["uuid"], item["role"]) for item in body["messages"]] == expected
+    steering = body["messages"][3]
+    assert steering["text"] == "quoted prompt for the model"
+    assert steering["displayText"] == "visible adjustment"
+    assert steering["selectionQuotes"] == quotes
+    assert steering["_steeringAdjustment"] is True
+    assert steering["_turnRoot"] is False
+    assert steering["_queueItemId"] == "q-steer"
+    assert steering["_turnId"] == "turn-1"
+    assert steering["_turn_origin_uuid"] == "u1"
+    assert steering["block_id"].startswith(f"{command_uuid}:")
+    assert body["turn_count"] == 1
+    assert body["total"] == len(expected)
+    assert [
+        item["uuid"] for item in body["messages"]
+        if item.get("turn_status")
+    ] == ["a3"]
+
+    # Both compatibility paths and UUID navigation use the same canonical
+    # presentation identity instead of the raw attachment node UUID.
+    for params in ({}, {"full": 1}):
+        response = client.get(
+            f"/api/chat/sessions/{sid}", headers=auth, params=params)
+        assert response.status_code == 200, response.text
+        assert [(item["uuid"], item["role"])
+                for item in response.json()["messages"]] == expected
+    around = client.get(
+        f"/api/chat/sessions/{sid}",
+        headers=auth,
+        params={"around_uuid": command_uuid, "limit": 3},
+    )
+    assert around.status_code == 200, around.text
+    assert any(item["uuid"] == command_uuid
+               for item in around.json()["messages"])
+
+    outline = client.get(
+        f"/api/chat/sessions/{sid}/outline", headers=auth)
+    assert outline.status_code == 200, outline.text
+    assert [item["uuid"] for item in outline.json()["outline"]] == ["u1"]
+    ticket = client.post(
+        "/api/chat/resource-ticket",
+        headers=auth,
+        json={"resource": "export", "session_id": sid},
+    )
+    assert ticket.status_code == 200, ticket.text
+    exported = client.get(ticket.json()["url"])
+    assert exported.status_code == 200, exported.text
+    assert "quoted prompt for the model" in exported.text
+    assert "all done" in exported.text
+    assert [msg.uuid for msg in chat_mod._full_session_msgs(sid)] == [
+        "u1", "a1", "tr1", command_uuid, "a2", "tr2", "a3",
+    ]
 
 
 def test_window_endpoint_interleaves_cancelled_snapshot_at_original_anchor(

@@ -1135,11 +1135,18 @@ async def test_busy_adjust_is_durable_then_uses_exact_native_command(
     published = []
     monkeypatch.setattr(broadcast, "publish", published.append)
     chat._active_turns[sid] = broadcast
+    selection_quotes = [{
+        "id": "quote-1", "source": "chat", "role": "assistant",
+        "sessionId": sid, "messageId": "a1", "path": "",
+        "text": "selected context", "truncated": False,
+    }]
     try:
         response = await chat.enqueue_api(
             sid,
             chat.QueueEnqueueReq(
-                text="adjust this task",
+                text="model prompt with quote context",
+                display_text="adjust this task",
+                selection_quotes=selection_quotes,
                 delivery="adjust",
                 active_turn_id=broadcast.turn_id,
             ),
@@ -1153,7 +1160,7 @@ async def test_busy_adjust_is_durable_then_uses_exact_native_command(
         assert item["target_turn_id"] == broadcast.turn_id
         assert item["steering_state"] == "waiting_tool"
         assert writes == [(
-            "adjust this task", sid, item["command_uuid"],
+            "model prompt with quote context", sid, item["command_uuid"],
         )]
         assert broadcast.steering_commands[item["command_uuid"]] == {
             "item_id": item["id"],
@@ -1190,10 +1197,17 @@ async def test_busy_adjust_is_durable_then_uses_exact_native_command(
         assert started_event["message"] == {
             "id": item["id"],
             "uuid": item["command_uuid"],
-            "text": "adjust this task",
+            "text": "model prompt with quote context",
             "display_text": "adjust this task",
-            "selection_quotes": [],
+            "selection_quotes": selection_quotes,
             "enqueued_at": item["enqueued_at"],
+        }
+        annotation = sess.get_message_annotations(sid)[item["command_uuid"]]
+        assert annotation == {
+            "steering_display_text": "adjust this task",
+            "steering_selection_quotes": selection_quotes,
+            "steering_queue_item_id": item["id"],
+            "steering_turn_id": broadcast.turn_id,
         }
 
         terminal = await chat._settle_steering_lifecycle(
@@ -1211,6 +1225,124 @@ async def test_busy_adjust_is_durable_then_uses_exact_native_command(
         completed_event = json.loads(published[-1]["data"])
         assert completed_event["state"] == "completed"
         assert completed_event["message"]["uuid"] == item["command_uuid"]
+    finally:
+        chat._active_turns.pop(sid, None)
+        broadcast.close()
+
+
+@pytest.mark.asyncio
+async def test_busy_adjust_during_admission_waits_for_root_query_commit(
+    app_module, monkeypatch,
+):
+    from backend import chat
+
+    sess = _sess(app_module)
+    sid = sess.create_session()["id"]
+    writes = []
+
+    class SteeringClient:
+        async def query_steering(
+            self, prompt, *, session_id, command_uuid,
+        ):
+            writes.append((prompt, session_id, command_uuid))
+
+    monkeypatch.setattr(chat, "MuseLabSDKClient", SteeringClient)
+    broadcast = chat.TurnBroadcast(sid)
+    broadcast.runtime_client = SteeringClient()
+    chat._active_turns[sid] = broadcast
+    try:
+        enqueue = asyncio.create_task(chat.enqueue_api(
+            sid,
+            chat.QueueEnqueueReq(
+                text="adjust the starting task",
+                delivery="adjust",
+                active_turn_id=broadcast.turn_id,
+            ),
+            chat.BackgroundTasks(),
+        ))
+        for _ in range(100):
+            if broadcast.steering_commands:
+                break
+            await asyncio.sleep(0.01)
+
+        assert not enqueue.done()
+        pending = sess.get_queue(sid)["items"][0]
+        assert pending["delivery"] == "adjust"
+        assert pending["target_turn_id"] == broadcast.turn_id
+        assert pending["steering_state"] == "pending"
+        command_uuid = pending["command_uuid"]
+        assert broadcast.steering_commands[command_uuid] == {
+            "item_id": pending["id"],
+            "state": "pending",
+        }
+        assert writes == []
+
+        broadcast.query_committed = True
+        broadcast.steering_ready.set()
+        response = await asyncio.wait_for(enqueue, timeout=1)
+
+        assert response["effective_delivery"] == "adjust"
+        assert response["delivery_status"] == "waiting_tool"
+        assert writes == [(
+            "adjust the starting task", sid, command_uuid,
+        )]
+        assert sess.get_queue(sid)["items"][0][
+            "steering_state"] == "waiting_tool"
+    finally:
+        chat._active_turns.pop(sid, None)
+        broadcast.close()
+
+
+@pytest.mark.asyncio
+async def test_busy_adjust_during_admission_falls_back_when_turn_finishes(
+    app_module, monkeypatch,
+):
+    from backend import chat
+
+    sess = _sess(app_module)
+    sid = sess.create_session()["id"]
+    writes = []
+
+    class SteeringClient:
+        async def query_steering(self, *_args, **_kwargs):
+            writes.append(True)
+
+    monkeypatch.setattr(chat, "MuseLabSDKClient", SteeringClient)
+    monkeypatch.setattr(chat, "_schedule_queue_drain", lambda _sid: None)
+    broadcast = chat.TurnBroadcast(sid)
+    broadcast.runtime_client = SteeringClient()
+    chat._active_turns[sid] = broadcast
+    try:
+        enqueue = asyncio.create_task(chat.enqueue_api(
+            sid,
+            chat.QueueEnqueueReq(
+                text="keep this after failed startup",
+                delivery="adjust",
+                active_turn_id=broadcast.turn_id,
+            ),
+            chat.BackgroundTasks(),
+        ))
+        for _ in range(100):
+            if broadcast.steering_commands:
+                break
+            await asyncio.sleep(0.01)
+
+        assert not enqueue.done()
+        pending = sess.get_queue(sid)["items"][0]
+        assert pending["delivery"] == "adjust"
+        assert pending["steering_state"] == "pending"
+
+        broadcast.finish()
+        response = await asyncio.wait_for(enqueue, timeout=1)
+
+        assert response["effective_delivery"] == "queue"
+        assert response["delivery_status"] == "queued"
+        fallback = sess.get_queue(sid)["items"][0]
+        assert fallback["delivery"] == "queue"
+        assert fallback["steering_state"] == "fallback"
+        assert not fallback.get("command_uuid")
+        assert broadcast.steering_commands == {}
+        assert writes == []
     finally:
         chat._active_turns.pop(sid, None)
         broadcast.close()

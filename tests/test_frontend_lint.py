@@ -2843,6 +2843,7 @@ def test_composer_send_has_one_claim_owner_without_exposing_internal_phases():
     assert "if (sendState._optimisticInterrupt" not in send
     assert "if (sendState.es) sendState.es.close()" not in send
     assert "this._releaseComposerClaim(composerSubmitToken);" in send
+    assert "this._resumePendingCanonicalSync(sid, state);" in send
     assert send.index('sendState._composerSubmitPhase = "submitting";') < send.index(
         "await this._awaitRuntimeSettingPatches(sendSid, sendState)"
     )
@@ -3091,7 +3092,8 @@ def test_active_stream_owns_messages_and_continuation_reconciles_canonical_histo
     send_start = app.index("async send(opts = {})")
     send = app[send_start:app.index("async stop()", send_start)]
 
-    assert "if (st.streaming || st.es) return false" in load
+    assert "if (st.streaming || st.es || this._hasAdmissionBubble(st)) return false" in load
+    assert "st._composerSubmitToken || this._hasAdmissionBubble(st)" in app
     assert "this.tabState[sid] !== st || st.streaming || st.es" in load
     reveal_start = app.index("async _revealMessagesChunked(sid, st, visible, tailFirst = true)")
     reveal = app[reveal_start:app.index("async _fillDeferredHead", reveal_start)]
@@ -3156,9 +3158,10 @@ def test_fork_banner_and_message_template_are_null_and_key_safe():
     html = (FRONTEND / "index.html").read_text(encoding="utf-8")
 
     assert "currentForkSource()?.name || ''" in html
-    assert 'x-for="row in paneRows" :key="row.key"' in html
-    assert 'get m(){ return row.message }' in html
-    assert ':data-message-key="row.spacer ? \'\' : m._k"' in html
+    assert 'x-for="m in paneMsgs" :key="m._k"' in html
+    assert "paneMessageIndex(tid, m)" in html
+    assert 'get i(){ return paneMessageIndex(tid, m) }' in html
+    assert ':data-message-key="m._k"' in html
 
 
 def test_history_keys_prefer_backend_block_identity_without_local_dup_suffixes():
@@ -3211,6 +3214,8 @@ def test_history_store_normalizes_canonical_blocks_without_count_eviction():
     assert "this._messagesById.get(storeKey)" in store
     assert "this._messagesById.set(storeKey, created)" in store
     assert "Object.assign(existing, m" in store
+    assert "const mountedKey = existing._k || renderKey" in store
+    assert "Object.assign(existing, m, { _k: mountedKey })" in store
     assert 'existing.body_state === "loaded"' in store
     assert 'm.body_state === "unloaded"' in store
     assert "this._sessionWindows.set(sid, retained)" in store
@@ -3388,6 +3393,9 @@ def test_done_immediately_stamps_tool_tail_and_quietly_adopts_fork_boundary():
     assert 'hasOwnProperty.call(m, "elapsed")' in append
     assert "return st.messages[st.messages.length - 1]" in append
     assert "return m;" not in append
+    assert append.index("this._invalidateHistoryReplace(st)") < append.index(
+        "st.messages.push(m)"
+    )
 
     mark_start = app.index("const _markDone = (")
     mark_end = app.index("\n      const markUserFailed", mark_start)
@@ -3426,15 +3434,21 @@ def test_done_immediately_stamps_tool_tail_and_quietly_adopts_fork_boundary():
     reconcile = app[reconcile_start:reconcile_end]
     assert '"/api/chat/sessions/" + sid + "/active"' in reconcile
     assert "activity.active && !activity.background" in reconcile
+    assert "activeTurnId !== completedTurnId" in reconcile
+    assert "const activeProbe = completedTurnId" in reconcile
+    assert "!this._hasPendingAdmission(ownerState)" in reconcile
     assert "const reconcileTail = this._historyReconcileWindowSize();" in reconcile
     assert '"/api/chat/sessions/" + sid + "?tail=" + reconcileTail' in reconcile
-    assert "const completedTurnWindow = latestUserIndex >= 0" in reconcile
+    assert "const completedTurnWindow = rootUserIndex >= 0" in reconcile
     assert "minimumTail: completedTurnWindow" in reconcile
     assert "m && m.role !== \"user\" && m.uuid" in reconcile
-    assert "m.role === \"assistant\" && m.uuid" in reconcile
-    assert "m && m.uuid === expectedAssistantUuid" in reconcile
-    assert ": !!expectedText && canonicalTurn.some(" in reconcile
-    assert "!expectedText || canonicalTurn.some(" not in reconcile
+    assert 'message.role === "assistant"' in reconcile
+    assert "message.uuid === expectedAssistantUuid" in reconcile
+    assert "message._steeringAdjustment !== true" in reconcile
+    assert "message._turnRoot !== false" in reconcile
+    assert "messages.slice(turnStart, finalIndex + 1)" in reconcile
+    assert "if (finalIndex < 0) { retry(); return false; }" in reconcile
+    assert "const hasSuccessorRoot = messages.slice(finalIndex + 1).some(" in reconcile
     assert "const loaded = await this.loadSession(sid, {" in reconcile
     assert "quiet: true, probeActive: false" in reconcile
     assert "attempt < 30" in reconcile
@@ -3888,7 +3902,7 @@ def test_quiet_canonical_reload_rebases_virtual_window_before_alpine_paints():
     assert "_historyPageStillOwns" in range_helper
 
     helper_start = app.index("    _captureMessageVirtualWindow(st) {")
-    helper_end = app.index("    paneMessageRows(tid) {", helper_start)
+    helper_end = app.index("    _measureMessageVirtualRows(tid, st) {", helper_start)
     helper = app[helper_start:helper_end]
     assert "startKey:" in helper and "endKey:" in helper
     assert "messages.findIndex(m => m && m._k === snapshot.startKey)" in helper
@@ -3960,13 +3974,18 @@ def test_long_chat_state_keeps_complete_normalized_history_and_generation_safety
     virtual_start = app.index("_messageVirtualHeight(st, message)")
     virtual_end = app.index("async initSessions(options = {})", virtual_start)
     virtual = app[virtual_start:virtual_end]
-    assert "paneMessageRows(tid)" in virtual
+    assert "paneMessageRows(tid)" not in virtual
     assert "_syncMessageViewport(tid = this.currentId" in virtual
-    assert "return messages.map((message, index) =>" in virtual
-    assert "spacer: false" in virtual
     assert "Intentionally no-op" in virtual
     assert 'querySelectorAll(".msg[data-message-key]")' in virtual
     assert "st._virtualHeights[key] = height" in virtual
+    index_start = app.index("    paneMessageIndex(tid, message) {")
+    index_end = app.index("    _hasPendingAdmission(st) {", index_start)
+    pane_index = app[index_start:index_end]
+    assert "_visiblePaneMessages" not in pane_index
+    assert "st.messageRange.visibleStart" in pane_index
+    assert "st.messageRange.visibleEnd" in pane_index
+    assert "return cached - start" in pane_index
     # Streaming and completed states share one exact-height browser layout. The
     # removed estimated spacers could expose blank regions during fast touch scroll.
     assert "messages.length - 3" not in virtual
@@ -4020,10 +4039,11 @@ def test_long_chat_state_keeps_complete_normalized_history_and_generation_safety
     assert terminal.index("const completedText") < terminal.rindex("curBubble = null;")
     assert "return { bubble: completedBubble, text: completedText };" in terminal
     assert ':data-tid="tid"' in pane
-    assert 'x-for="row in paneRows" :key="row.key"' in pane
-    assert "paneMessageRows(tid)" in pane
-    assert "msg-virtual-spacer" in pane
-    assert ".msg-virtual-spacer > * { display: none !important; }" in css
+    assert 'x-for="m in paneMsgs" :key="m._k"' in pane
+    assert "paneMessageIndex(tid, m)" in pane
+    assert "paneMessageRows(tid)" not in pane
+    assert "msg-virtual-spacer" not in pane
+    assert ".msg-virtual-spacer" not in css
     assert "pane.streaming" in pane
     # The single shared footer reads through the active-session façade rather
     # than duplicating elapsed timers inside every warm transcript pane.
@@ -4997,10 +5017,22 @@ def test_running_turn_footer_is_owned_by_active_user_boundary():
     assert "ownerUser._turnId" in helper
     assert "pane.activeTurnId" in helper
     assert "ownerTurnId === activeTurnId" in helper
+    assert helper.index("for (let k = index + 1") < helper.index(
+        "if (ownerTurnId && activeTurnId)")
     assert "this._turnMessageBelongsToActiveTurn(m, pane)" in status
     assert "pane && pane.streaming && m && !m.ts" not in status
     assert "this._turnMessageBelongsToActiveTurn(m, pane)" in model
     assert "|| (pane && pane.streamingModel)" not in model
+
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    footer = html[html.index('<div class="turn-footer"'):]
+    footer = footer[:footer.index('<button class="turn-fork-btn"')]
+    assert "paneMsgs[i + 1]._steeringAdjustment !== true" in footer
+
+    turn_tail_start = app.index("isTurnTail(i) {")
+    turn_tail_end = app.index("\n    turnForkMessageId", turn_tail_start)
+    assert "next._steeringAdjustment !== true" in app[
+        turn_tail_start:turn_tail_end]
 
 
 def test_turn_footer_is_a_separator_and_hosts_the_only_running_dots():
@@ -5517,6 +5549,8 @@ def test_busy_send_mode_uses_authoritative_delivery_and_steering_state():
     enqueue = app[enqueue_start:enqueue_end]
     assert 'item.delivery || this.busySendMode' in enqueue
     assert 'activeTurnId = String(item.active_turn_id || "")' in enqueue
+    assert "await this._resolveBusyAdjustmentTurnId(" in enqueue
+    assert 'delivery = "adjust"' in enqueue
     assert "delivery," in enqueue
     assert "active_turn_id: activeTurnId" in enqueue
     assert "accepted.queue.items" in enqueue
@@ -5578,12 +5612,26 @@ def test_busy_send_mode_uses_authoritative_delivery_and_steering_state():
     assert "!turnId || attachmentIntent || st.compacting" in delivery
     assert "st.backgroundActive || st._draining || st.parentTurnId" in delivery
     assert "st.pendingQueue && st.pendingQueue.length" in delivery
+    resolve_start = app.index("    async _resolveBusyAdjustmentTurnId(")
+    resolve_end = app.index("\n    sendButtonHint(sid)", resolve_start)
+    resolve = app[resolve_start:resolve_end]
+    assert '"/api/chat/sessions/" + sid + "/active"' in resolve
+    assert "status.active" in resolve
+    assert "status.background" in resolve
+    assert "this._busySendDelivery(sid, turnId, hasAttachments)" in resolve
+    assert "this.tabState[sid] !== st" in resolve
+    assert "const streamOwnerToken = String(expectedStreamOwnerToken || \"\")" in resolve
+    assert "ownerStillCurrent()" in resolve
+    assert "String(st._streamOwnerToken || \"\") === streamOwnerToken" in resolve
     assert 'const busyActiveTurnId = !isReconnect' in send
+    assert 'const busyStreamOwnerToken = !isReconnect' in send
+    assert "streamState._streamOwnerToken = composerSubmitToken" in send
     assert "const busyDelivery = this._busySendDelivery(" in send
     assert "_optimisticDelivery: busyDelivery" in send
     assert "delivery: busyDelivery" in send
     assert "delivery: handoffDelivery" in send
     assert 'active_turn_id: busyActiveTurnId' in send
+    assert 'stream_owner_token: busyStreamOwnerToken' in send
     assert 'errorMeta.active_turn_id || errorMeta.turn_id' in send
     assert '_optimisticQueue: !resumed && this._isBusy(sendSid)' in send
     assert 'x-show="m._admissionPending"' in html
@@ -5784,7 +5832,7 @@ def test_canonical_history_load_never_reports_stream_takeover_as_success():
     end = app.index("\n    // Warm OPEN-but-inactive tabs", start)
     load = app[start:end]
 
-    assert "if (st.streaming || st.es) return false;" in load
+    assert "if (st.streaming || st.es || this._hasAdmissionBubble(st)) return false;" in load
     assert "if (st.streaming || st.es) return true;" not in load
     assert "if (this.tabState[sid] !== st || st.streaming || st.es) return true;" not in load
     assert "st._installedCanonicalCount = Math.max(" in load

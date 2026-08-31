@@ -21,7 +21,7 @@ from .settings import atomic_write_text
 
 # Increment whenever persisted descriptor semantics (bubble expansion, preview,
 # tool/task metadata) change, not only when the JSON container shape changes.
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 _TRANSCRIPT_TYPES = {"user", "assistant", "progress", "system", "attachment"}
 _PREFIX_GUARD_BYTES = 1024 * 1024
 
@@ -200,6 +200,10 @@ def _append_complete_lines(
                 "is_meta": bool(entry.get("isMeta")),
                 "compact": bool(entry.get("isCompactSummary")),
                 "bubble_count": int(desc.get("bubble_count") or 0),
+                "presentation_record": bool(
+                    desc.get("presentation_record")),
+                "presentation_uuid": str(
+                    desc.get("presentation_uuid") or ""),
                 "user_preview": desc.get("user_preview") or "",
                 "real_user_prompt": bool(desc.get("real_user_prompt")),
                 "has_inline_images": bool(desc.get("has_inline_images")),
@@ -212,13 +216,22 @@ def _append_complete_lines(
 def _rebuild_derived(index: dict[str, Any]) -> None:
     records: list[dict[str, Any]] = index["records"]
 
+    def is_visible(record: dict[str, Any]) -> bool:
+        return (
+            record["type"] in {"user", "assistant"}
+            or bool(record.get("presentation_record"))
+        )
+
+    def visible_uuid(record: dict[str, Any]) -> str:
+        return str(record.get("presentation_uuid") or record["uuid"])
+
     # Full history preserves the old raw-reader contract: first UUID wins,
-    # user/assistant records only, chronological file order, no branch filters.
+    # visible records only, chronological file order, no branch filters.
     full: list[int] = []
     full_seen: set[str] = set()
     for i, rec in enumerate(records):
-        uid = rec["uuid"]
-        if rec["type"] in {"user", "assistant"} and uid not in full_seen:
+        uid = visible_uuid(rec)
+        if is_visible(rec) and uid not in full_seen:
             full_seen.add(uid)
             full.append(i)
 
@@ -239,7 +252,7 @@ def _rebuild_derived(index: dict[str, Any]) -> None:
             if uid in seen:
                 break
             seen.add(uid)
-            if rec["type"] in {"user", "assistant"}:
+            if is_visible(rec):
                 leaves.append(cur)
                 break
             parent = rec.get("parent")
@@ -265,13 +278,17 @@ def _rebuild_derived(index: dict[str, Any]) -> None:
             reverse_chain.append(cur)
             parent = rec.get("parent")
             cur = by_uuid.get(parent) if parent else None
+        normal_seen: set[str] = set()
         for i in reversed(reverse_chain):
             rec = records[i]
-            if (rec["type"] in {"user", "assistant"}
+            uid = visible_uuid(rec)
+            if (is_visible(rec)
+                    and uid not in normal_seen
                     and not rec["is_meta"]
                     and not rec["is_sidechain"]
                     and not rec["team_name"]):
                 normal.append(i)
+                normal_seen.add(uid)
 
     index["orders"] = {"normal": normal, "full": full}
     prefixes: dict[str, list[int]] = {}
@@ -458,8 +475,13 @@ def record_indices_around_uuid(
     order = index["orders"]["full"]
     prefix = index["bubble_prefix"]["full"]
     total = prefix[-1]
-    pos = next((i for i, rec_i in enumerate(order)
-                if index["records"][rec_i]["uuid"] == uuid_value), -1)
+    pos = next((
+        i for i, rec_i in enumerate(order)
+        if (
+            index["records"][rec_i]["uuid"] == uuid_value
+            or index["records"][rec_i].get("presentation_uuid") == uuid_value
+        )
+    ), -1)
     if pos < 0:
         return [], 0, 0, 0, total
 

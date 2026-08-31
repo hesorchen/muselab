@@ -235,6 +235,58 @@ class RawMsg:
         self.mts = mts
 
 
+def raw_msg_from_entry(
+    entry: dict,
+    *,
+    raw_msg_type: type[RawMsg] = RawMsg,
+    timestamp_ms: Callable[[dict], int | None] = transcript_ts_ms,
+) -> RawMsg | None:
+    """Project one canonical JSONL record onto the SDK message facade.
+
+    Claude CLI persists a native mid-turn human adjustment as an
+    ``attachment`` record rather than a regular ``user`` record.  The
+    attachment's ``source_uuid`` is the UUID MuseLab originally supplied to
+    the SDK, so use it as the presentation identity: a live bubble and the
+    later canonical reload then reconcile as the same message.
+    """
+    record_type = str(entry.get("type") or "")
+    record_uuid = str(entry.get("uuid") or "")
+    message_uuid = record_uuid
+    message_type = record_type
+    message = entry.get("message") or {}
+
+    if record_type == "attachment":
+        attachment = entry.get("attachment")
+        if (not isinstance(attachment, dict)
+                or attachment.get("type") != "queued_command"):
+            return None
+        prompt = attachment.get("prompt")
+        if not isinstance(prompt, str) or not prompt.strip():
+            return None
+        source_uuid = str(attachment.get("source_uuid") or "")
+        message_uuid = source_uuid or record_uuid
+        if not message_uuid:
+            return None
+        message_type = "user"
+        message = {
+            "role": "user",
+            "content": prompt,
+            "_muselab_steering": {
+                "record_uuid": record_uuid,
+                "source_uuid": message_uuid,
+            },
+        }
+    elif record_type not in {"user", "assistant"} or not message_uuid:
+        return None
+
+    return raw_msg_type(
+        message_uuid,
+        message_type,
+        message if isinstance(message, dict) else {},
+        timestamp_ms(entry),
+    )
+
+
 def full_session_msgs(
     sid: str,
     *,
@@ -242,7 +294,7 @@ def full_session_msgs(
     raw_msg_type: type[RawMsg] = RawMsg,
     timestamp_ms: Callable[[dict], int | None] = transcript_ts_ms,
 ) -> list[RawMsg]:
-    """Read every canonical user/assistant record in JSONL file order."""
+    """Read every canonical visible message in JSONL file order."""
     jsonl_path = find_session_jsonl(sid)
     if jsonl_path is None:
         return []
@@ -258,18 +310,15 @@ def full_session_msgs(
                     entry = json.loads(line)
                 except (json.JSONDecodeError, ValueError):
                     continue
-                if entry.get("type") not in ("user", "assistant"):
+                msg = raw_msg_from_entry(
+                    entry,
+                    raw_msg_type=raw_msg_type,
+                    timestamp_ms=timestamp_ms,
+                )
+                if msg is None or msg.uuid in seen:
                     continue
-                message_uuid = entry.get("uuid")
-                if not message_uuid or message_uuid in seen:
-                    continue
-                seen.add(message_uuid)
-                out.append(raw_msg_type(
-                    message_uuid,
-                    entry.get("type"),
-                    entry.get("message") or {},
-                    timestamp_ms(entry),
-                ))
+                seen.add(msg.uuid)
+                out.append(msg)
     except Exception:
         return []
     return out
