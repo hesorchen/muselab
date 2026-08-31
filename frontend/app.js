@@ -4306,15 +4306,20 @@ function portal() {
       }
       if (!ownerUser) return false;
 
+      // A native steering bubble divides the visible assistant/tool stream,
+      // but it is still part of this same logical turn. Pane-level live state
+      // belongs only to the newest user-delimited segment; otherwise both the
+      // pre-adjustment and post-adjustment tails render as Running.
+      for (let k = index + 1; k < pane.messages.length; k += 1) {
+        if (pane.messages[k] && pane.messages[k].role === "user") return false;
+      }
+
       const ownerTurnId = String(ownerUser._turnId || "");
       const activeTurnId = String(pane.activeTurnId || "");
       if (ownerTurnId && activeTurnId) return ownerTurnId === activeTurnId;
 
       // Before the first turn metadata event arrives, the newest user boundary
       // is the only reply run that can own the pane-level live state.
-      for (let k = index + 1; k < pane.messages.length; k += 1) {
-        if (pane.messages[k] && pane.messages[k].role === "user") return false;
-      }
       return true;
     },
     turnFooterStatus(m, pane) {
@@ -4413,7 +4418,8 @@ function portal() {
       const m = arr[i];
       if (!m || m.role === "user") return false;
       const next = arr[i + 1];
-      return !next || next.role === "user"
+      return !next || (next.role === "user"
+        && next._steeringAdjustment !== true)
         || next.display_kind === "runtime_continuation";
     },
     // Resolve a persisted message UUID for a footer mounted on the actual turn
@@ -4430,7 +4436,8 @@ function portal() {
       if (tail.display_kind === "runtime_continuation"
           || tail.forkable === false || tail.presentation_only) return "";
       const next = arr[i + 1];
-      if (next && next.role !== "user"
+      if (next && (next.role !== "user"
+          || next._steeringAdjustment === true)
           && next.display_kind !== "runtime_continuation") return "";
       for (let k = i; k >= 0; k -= 1) {
         const message = arr[k];
@@ -13580,7 +13587,8 @@ function portal() {
       const msgs = paneMsgs || [];
       const isTurnTail = m.role !== "user"
         && (i === msgs.length - 1
-            || (msgs[i + 1] && msgs[i + 1].role === "user"));
+            || (msgs[i + 1] && msgs[i + 1].role === "user"
+                && msgs[i + 1]._steeringAdjustment !== true));
       if (isTurnTail) return true;
 
       if (m._is_compact_summary) return true;
@@ -17103,7 +17111,12 @@ function portal() {
               body_ref: existing.body_ref,
             }
           : null;
-        Object.assign(existing, m, { _k: renderKey });
+        // A prior quiet reconciliation may have adopted this canonical block
+        // into an already-mounted live object. Keep that mounted key on every
+        // later canonical refresh; replacing it with renderKey here remounts
+        // the bubble on the second poll even though object identity survived.
+        const mountedKey = existing._k || renderKey;
+        Object.assign(existing, m, { _k: mountedKey });
         if (loadedBody) Object.assign(existing, loadedBody);
         return existing;
       });

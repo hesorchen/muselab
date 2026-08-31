@@ -2899,7 +2899,8 @@
                    x-show="(m.role !== 'user' || m.turn_status || m._interrupted || m._failed)
                      && (i === paneMsgs.length - 1
                        || (paneMsgs[i + 1] && (
-                         paneMsgs[i + 1].role === 'user'
+                         (paneMsgs[i + 1].role === 'user'
+                           && paneMsgs[i + 1]._steeringAdjustment !== true)
                          || paneMsgs[i + 1].display_kind === 'runtime_continuation'
                        )))
                      && turnFooterStatus(m, pane)

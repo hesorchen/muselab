@@ -223,7 +223,10 @@ def history_window_around_uuid(
             record_id = int(segment.get("record_id") or 0)
             if (
                 0 <= record_id < len(records)
-                and str(records[record_id].get("uuid") or "") == uuid_value
+                and uuid_value in {
+                    str(records[record_id].get("uuid") or ""),
+                    str(records[record_id].get("presentation_uuid") or ""),
+                }
             ):
                 target_start = cursor
                 target_end = cursor + count

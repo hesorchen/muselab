@@ -3211,6 +3211,8 @@ def test_history_store_normalizes_canonical_blocks_without_count_eviction():
     assert "this._messagesById.get(storeKey)" in store
     assert "this._messagesById.set(storeKey, created)" in store
     assert "Object.assign(existing, m" in store
+    assert "const mountedKey = existing._k || renderKey" in store
+    assert "Object.assign(existing, m, { _k: mountedKey })" in store
     assert 'existing.body_state === "loaded"' in store
     assert 'm.body_state === "unloaded"' in store
     assert "this._sessionWindows.set(sid, retained)" in store
@@ -4997,10 +4999,22 @@ def test_running_turn_footer_is_owned_by_active_user_boundary():
     assert "ownerUser._turnId" in helper
     assert "pane.activeTurnId" in helper
     assert "ownerTurnId === activeTurnId" in helper
+    assert helper.index("for (let k = index + 1") < helper.index(
+        "if (ownerTurnId && activeTurnId)")
     assert "this._turnMessageBelongsToActiveTurn(m, pane)" in status
     assert "pane && pane.streaming && m && !m.ts" not in status
     assert "this._turnMessageBelongsToActiveTurn(m, pane)" in model
     assert "|| (pane && pane.streamingModel)" not in model
+
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    footer = html[html.index('<div class="turn-footer"'):]
+    footer = footer[:footer.index('<button class="turn-fork-btn"')]
+    assert "paneMsgs[i + 1]._steeringAdjustment !== true" in footer
+
+    turn_tail_start = app.index("isTurnTail(i) {")
+    turn_tail_end = app.index("\n    turnForkMessageId", turn_tail_start)
+    assert "next._steeringAdjustment !== true" in app[
+        turn_tail_start:turn_tail_end]
 
 
 def test_turn_footer_is_a_separator_and_hosts_the_only_running_dots():

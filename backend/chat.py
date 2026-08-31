@@ -510,6 +510,15 @@ def _transcript_ts_ms(entry: dict) -> int | None:
 _RawMsg = chat_history.RawMsg
 
 
+def _raw_msg_from_entry(entry: dict) -> _RawMsg | None:
+    """Compatibility facade for canonical record projection."""
+    return chat_history.raw_msg_from_entry(
+        entry,
+        raw_msg_type=_RawMsg,
+        timestamp_ms=_transcript_ts_ms,
+    )
+
+
 def _full_session_msgs(sid: str) -> list:
     """Compatibility wrapper for canonical full-file transcript reads."""
     return chat_history.full_session_msgs(
@@ -5373,6 +5382,7 @@ def _describe_transcript_record(entry: dict) -> dict:
     return chat_presentation.describe_transcript_record(
         entry,
         raw_message_factory=_RawMsg,
+        raw_entry_factory=_raw_msg_from_entry,
         render_messages=_sdk_messages_to_ui,
         is_real_user_prompt=_is_real_user_prompt,
     )
@@ -5425,7 +5435,10 @@ def _indexed_turn_context(
         if selected_i < 0 or selected_i >= len(records):
             continue
         selected = records[selected_i]
-        selected_uuid = str(selected.get("uuid") or "")
+        selected_uuid = str(
+            selected.get("presentation_uuid")
+            or selected.get("uuid")
+            or "")
         current_i = selected_i
         origin_i = selected_i
         seen: set[str] = set()
@@ -5465,19 +5478,26 @@ def _indexed_ui_records(
     index: dict,
     record_indices: list[int],
     annotations: dict[str, dict],
+    *,
+    defer_large_bodies: bool = True,
 ) -> list[dict]:
     """Seek/read and shape only selected records from a transcript index."""
     entries = transcript_idx.read_records(transcript_path, index, record_indices)
     turn_context = _indexed_turn_context(
         transcript_path, index, record_indices)
-    raw = [
-        _RawMsg(str(e.get("uuid") or ""), str(e.get("type") or ""),
-                e.get("message") or {}, _transcript_ts_ms(e))
-        for e in entries
+    projected = [
+        (entry, _raw_msg_from_entry(entry))
+        for entry in entries
     ]
-    compact = {str(e.get("uuid")) for e in entries if e.get("isCompactSummary")}
+    raw = [msg for _, msg in projected if msg is not None]
+    compact = {
+        str(msg.uuid)
+        for entry, msg in projected
+        if msg is not None and entry.get("isCompactSummary")
+    }
     bubbles = _sdk_messages_to_ui(
-        raw, annotations, compact, defer_large_bodies=True)
+        raw, annotations, compact,
+        defer_large_bodies=defer_large_bodies)
 
     # Cross-window context is stored in the index: a page may begin with a
     # tool_result whose tool_use is outside the read window, and a launching
@@ -5768,7 +5788,13 @@ def _jsonl_signature(sid: str) -> tuple[float, int] | None:
         sid, find_session_jsonl=_find_session_jsonl)
 
 
-def _shaped_ui_messages(sid: str, model: str, full: bool) -> list[dict]:
+def _shaped_ui_messages(
+    sid: str,
+    model: str,
+    full: bool,
+    *,
+    defer_large_bodies: bool = True,
+) -> list[dict]:
     """Shape SDK messages into UI bubbles with a freshness-checked cache.
 
     Falls back to live shaping whenever either signature is unavailable
@@ -5779,19 +5805,39 @@ def _shaped_ui_messages(sid: str, model: str, full: bool) -> list[dict]:
     jsig = _jsonl_signature(sid)
     ssig = sess.sidecar_signature(sid)
     key = (sid, full)
-    if jsig is not None:
+    if jsig is not None and defer_large_bodies:
         hit = _UI_MSGS_CACHE.get(key)
         if hit is not None and hit[0] == jsig and hit[1] == ssig:
             return hit[2]
-    try:
-        sdk_msgs = _cached_session_msgs(sid, model, full)
-    except Exception:
-        sdk_msgs = []
     annotations = sess.get_message_annotations(sid)
-    compact_uuids = _compact_summary_uuids(sid)
-    messages = _sdk_messages_to_ui(
-        sdk_msgs, annotations, compact_uuids, defer_large_bodies=True)
-    if jsig is not None:
+    messages: list[dict]
+    try:
+        indexed = _ensure_transcript_index(sid)
+    except Exception:
+        indexed = None
+    if indexed is not None:
+        transcript_path, index = indexed
+        order = "full" if full else "normal"
+        messages = _indexed_ui_records(
+            transcript_path,
+            index,
+            list((index.get("orders") or {}).get(order) or []),
+            annotations,
+            defer_large_bodies=defer_large_bodies,
+        )
+    else:
+        try:
+            sdk_msgs = _cached_session_msgs(sid, model, full)
+        except Exception:
+            sdk_msgs = []
+        compact_uuids = _compact_summary_uuids(sid)
+        messages = _sdk_messages_to_ui(
+            sdk_msgs,
+            annotations,
+            compact_uuids,
+            defer_large_bodies=defer_large_bodies,
+        )
+    if jsig is not None and defer_large_bodies:
         _UI_MSGS_CACHE.pop(key, None)
         _UI_MSGS_CACHE[key] = (jsig, ssig, messages)
         while len(_UI_MSGS_CACHE) > _UI_MSGS_CACHE_MAX:
@@ -6203,7 +6249,11 @@ def get_session_api(
             pre_total = 0
         if not full and total > 0 and meta.get("message_count", 0) != total:
             try:
-                turns = sum(1 for item in messages if item.get("role") == "user")
+                turns = sum(
+                    1 for item in messages
+                    if item.get("role") == "user"
+                    and item.get("_steeringAdjustment") is not True
+                )
                 sess.set_message_count(sid, total, turn_count=turns)
             except Exception:
                 pass
@@ -6258,7 +6308,10 @@ def get_session_block_api(sid: str, block_id: str) -> dict:
     transcript_path, index = indexed
     record_i = next(
         (i for i, record in enumerate(index.get("records") or [])
-         if str(record.get("uuid") or "") == record_uuid),
+         if record_uuid in {
+             str(record.get("uuid") or ""),
+             str(record.get("presentation_uuid") or ""),
+         }),
         None,
     )
     if record_i is None:
@@ -6267,14 +6320,12 @@ def get_session_block_api(sid: str, block_id: str) -> dict:
     if not entries:
         raise HTTPException(404, "block not found")
     entry = entries[0]
-    raw = _RawMsg(
-        str(entry.get("uuid") or ""),
-        str(entry.get("type") or ""),
-        entry.get("message") or {},
-        _transcript_ts_ms(entry),
-    )
-    compact = {record_uuid} if entry.get("isCompactSummary") else set()
-    messages = _sdk_messages_to_ui([raw], {}, compact)
+    raw = _raw_msg_from_entry(entry)
+    if raw is None:
+        raise HTTPException(404, "block not found")
+    compact = {raw.uuid} if entry.get("isCompactSummary") else set()
+    messages = _sdk_messages_to_ui(
+        [raw], sess.get_message_annotations(sid), compact)
     block = next(
         (message for message in messages
          if message.get("block_id") == block_id),
@@ -6631,12 +6682,8 @@ def export_session_markdown(sid: str, ticket: str = Query("")) -> Response:
         messages, _, _, _ = _interrupted_history_window(
             transcript_path, index, snapshots, annotations, "normal")
     else:
-        try:
-            sdk_msgs = _get_session_msgs(sid, model)
-        except Exception:
-            sdk_msgs = []
-        compact_uuids = _compact_summary_uuids(sid)
-        messages = _sdk_messages_to_ui(sdk_msgs, annotations, compact_uuids)
+        messages = _shaped_ui_messages(
+            sid, model, False, defer_large_bodies=False)
     # Bind any unbound pending image/doc attachments (those persisted
     # before the stream completed could write a uuid annotation) to the
     # user messages that have inline image refs but no thumb/url yet.
@@ -7430,6 +7477,8 @@ async def _deliver_steering_command(
     item_id: str,
     command_uuid: str,
     text: str,
+    display_text: str,
+    selection_quotes: list[dict],
     permission: str,
 ) -> tuple[str, str, dict | None]:
     """Write one durable queue item to the exact active CLI command queue.
@@ -7503,6 +7552,33 @@ async def _deliver_steering_command(
                 bc=bc,
             )
             return "queue", "queued", fallback
+
+    # The CLI's canonical queued_command attachment only retains the model
+    # prompt. Keep the bounded presentation metadata under the source UUID so
+    # refresh can restore the exact visible bubble and reconcile it with the
+    # live DOM identity. Commit this before the SDK write so a very fast CLI
+    # cannot publish the attachment/completion before its display metadata.
+    try:
+        await obs.to_thread_io(
+            "chat.queue_steering_annotation",
+            session_id,
+            sess.set_message_annotation,
+            session_id,
+            command_uuid,
+            steering_display_text=(
+                display_text if selection_quotes else None),
+            steering_selection_quotes=(
+                selection_quotes if selection_quotes else None),
+            steering_queue_item_id=item_id,
+            steering_turn_id=turn_id,
+            file_path=sess._sidecar_path(session_id),
+            owned=True,
+        )
+    except Exception as exc:
+        sys.stderr.write(
+            f"[chat] steering annotation failed sid={session_id[:8]} "
+            f"exc={type(exc).__name__}\n")
+        sys.stderr.flush()
 
     try:
         await bc.runtime_client.query_steering(
@@ -7975,6 +8051,8 @@ async def enqueue_api(
             item_id=queue_item_id,
             command_uuid=command_uuid,
             text=text,
+            display_text=display_text,
+            selection_quotes=selection_quotes,
             permission=req.permission or "",
         ))
         try:

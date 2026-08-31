@@ -1135,11 +1135,18 @@ async def test_busy_adjust_is_durable_then_uses_exact_native_command(
     published = []
     monkeypatch.setattr(broadcast, "publish", published.append)
     chat._active_turns[sid] = broadcast
+    selection_quotes = [{
+        "id": "quote-1", "source": "chat", "role": "assistant",
+        "sessionId": sid, "messageId": "a1", "path": "",
+        "text": "selected context", "truncated": False,
+    }]
     try:
         response = await chat.enqueue_api(
             sid,
             chat.QueueEnqueueReq(
-                text="adjust this task",
+                text="model prompt with quote context",
+                display_text="adjust this task",
+                selection_quotes=selection_quotes,
                 delivery="adjust",
                 active_turn_id=broadcast.turn_id,
             ),
@@ -1153,7 +1160,7 @@ async def test_busy_adjust_is_durable_then_uses_exact_native_command(
         assert item["target_turn_id"] == broadcast.turn_id
         assert item["steering_state"] == "waiting_tool"
         assert writes == [(
-            "adjust this task", sid, item["command_uuid"],
+            "model prompt with quote context", sid, item["command_uuid"],
         )]
         assert broadcast.steering_commands[item["command_uuid"]] == {
             "item_id": item["id"],
@@ -1190,10 +1197,17 @@ async def test_busy_adjust_is_durable_then_uses_exact_native_command(
         assert started_event["message"] == {
             "id": item["id"],
             "uuid": item["command_uuid"],
-            "text": "adjust this task",
+            "text": "model prompt with quote context",
             "display_text": "adjust this task",
-            "selection_quotes": [],
+            "selection_quotes": selection_quotes,
             "enqueued_at": item["enqueued_at"],
+        }
+        annotation = sess.get_message_annotations(sid)[item["command_uuid"]]
+        assert annotation == {
+            "steering_display_text": "adjust this task",
+            "steering_selection_quotes": selection_quotes,
+            "steering_queue_item_id": item["id"],
+            "steering_turn_id": broadcast.turn_id,
         }
 
         terminal = await chat._settle_steering_lifecycle(

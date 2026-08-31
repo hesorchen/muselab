@@ -310,6 +310,37 @@ def sdk_messages_to_ui(
         is_compact = sm.uuid in compact_uuids
         msg = sm.message or {}
         content = msg.get("content")
+        steering = msg.get("_muselab_steering")
+        if isinstance(steering, dict):
+            text = content if isinstance(content, str) else ""
+            if not text:
+                continue
+            entry = {
+                "role": "user",
+                "text": text,
+                "displayText": str(
+                    ann.get("steering_display_text", text) or ""),
+                "selectionQuotes": (
+                    ann.get("steering_selection_quotes")
+                    if isinstance(ann.get("steering_selection_quotes"), list)
+                    else []
+                ),
+                "uuid": sm.uuid,
+                "_turnRoot": False,
+                "_steeringAdjustment": True,
+            }
+            queue_item_id = str(
+                ann.get("steering_queue_item_id") or "")
+            if queue_item_id:
+                entry["_queueItemId"] = queue_item_id
+            turn_id = str(ann.get("steering_turn_id") or "")
+            if turn_id:
+                entry["_turnId"] = turn_id
+            for key, value in ann.items():
+                if not key.startswith("steering_"):
+                    entry[key] = value
+            out.append(entry)
+            continue
         if isinstance(content, str):
             if is_cli_interrupt_message(content):
                 continue
@@ -495,18 +526,36 @@ def describe_transcript_record(
     entry: dict,
     *,
     raw_message_factory: Callable[..., Any],
+    raw_entry_factory: Callable[[dict], Any] | None = None,
     render_messages: Callable[[list, dict, set[str]], list[dict]],
     is_real_user_prompt: Callable[[Any], bool],
 ) -> dict:
-    msg = raw_message_factory(
-        str(entry.get("uuid") or ""),
-        str(entry.get("type") or ""),
-        entry.get("message") or {},
+    msg = (
+        raw_entry_factory(entry)
+        if raw_entry_factory is not None
+        else raw_message_factory(
+            str(entry.get("uuid") or ""),
+            str(entry.get("type") or ""),
+            entry.get("message") or {},
+        )
     )
+    if msg is None:
+        return {
+            "bubble_count": 0,
+            "user_preview": "",
+            "real_user_prompt": False,
+            "has_inline_images": False,
+            "tool_uses": [],
+            "task_notifications": [],
+            "presentation_record": False,
+            "presentation_uuid": "",
+        }
     compact = {msg.uuid} if entry.get("isCompactSummary") else set()
     bubbles = render_messages([msg], {}, compact)
     tool_uses: list[dict] = []
-    content = (entry.get("message") or {}).get("content")
+    content = (msg.message or {}).get("content")
+    is_steering = isinstance(
+        (msg.message or {}).get("_muselab_steering"), dict)
     if isinstance(content, list):
         for block in content:
             if isinstance(block, dict) and block.get("type") == "tool_use":
@@ -527,10 +576,16 @@ def describe_transcript_record(
     return {
         "bubble_count": len(bubbles),
         "user_preview": outline_preview(user_text) if user_bubble is not None else "",
-        "real_user_prompt": is_real_user_prompt(msg) and not notifications,
+        "real_user_prompt": (
+            not is_steering
+            and is_real_user_prompt(msg)
+            and not notifications
+        ),
         "has_inline_images": has_inline_images,
         "tool_uses": tool_uses,
         "task_notifications": notifications,
+        "presentation_record": is_steering,
+        "presentation_uuid": msg.uuid if is_steering else "",
     }
 
 
@@ -553,10 +608,22 @@ def complete_turn_footer_metadata(
         if messages[index].get("role") == "user":
             index += 1
             continue
-        group_start = index
-        while index < len(messages) and messages[index].get("role") != "user":
+        group: list[dict] = []
+        while index < len(messages):
+            item = messages[index]
+            if item.get("role") == "user":
+                # Native steering is an inline human adjustment inside the
+                # same logical turn. It splits assistant text/tool segments for
+                # rendering, but must not close the preceding segment or grow
+                # a second completed/running footer.
+                if item.get("_steeringAdjustment") is True:
+                    index += 1
+                    continue
+                break
+            group.append(item)
             index += 1
-        group = messages[group_start:index]
+        if not group:
+            continue
         tail = group[-1]
         origin_uuid = str(tail.get("_turn_origin_uuid") or "")
         scope = ([item for item in group

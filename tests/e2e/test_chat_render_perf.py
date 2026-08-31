@@ -4934,6 +4934,10 @@ def test_started_queue_steering_becomes_user_bubble_at_stream_boundary(
     item_id = "midturn-queue-item"
     adjustment = "MIDTURN_ADJUSTMENT_VISIBLE"
     history_marker = "MIDTURN_HISTORY_MARKER"
+    canonical_messages: list[dict] = []
+    requests = _route_windowed_session(
+        page, sid, canonical_messages, updated_at=2,
+    )
     page.route(
         "**/api/chat/stream/start",
         lambda route: route.fulfill(
@@ -4970,6 +4974,7 @@ def test_started_queue_steering_becomes_user_bubble_at_stream_boundary(
         app.tabState[sid] = app._blankTabState();
         const st = app._ensureTabState(sid);
         st._loaded = true;
+        st._seenUpdated = 1;
         st.messages.push({
           role: "assistant", text: arg.historyMarker,
           html: `<p>${arg.historyMarker}</p>`, uuid: "midturn-history-uuid",
@@ -5106,6 +5111,14 @@ def test_started_queue_steering_becomes_user_bubble_at_stream_boundary(
             role: "user", text: arg.adjustment,
             displayText: arg.adjustment, uuid: arg.commandUuid,
           }])[0];
+          window.__midturnLiveUser = user;
+          window.__midturnLiveKey = user?._k || "";
+          const visibleRunningFooters = [...document.querySelectorAll(
+            ".turn-footer .turn-status.running")].filter(node => {
+              const footer = node.closest(".turn-footer");
+              return footer && getComputedStyle(footer).display !== "none"
+                && getComputedStyle(node).display !== "none";
+            });
           return {
             before, toolUse, toolResult, adjustment, after,
             pendingCount: st.pendingQueue.length,
@@ -5122,6 +5135,9 @@ def test_started_queue_steering_becomes_user_bubble_at_stream_boundary(
             queuedBubbleCount: document.querySelectorAll(".msg.user.queued").length,
             sameCanonicalObject: canonical === user,
             sameCanonicalKey: canonical?._k === user?._k,
+            beforeStatus: app.turnFooterStatus(st.messages[toolResult], st),
+            afterStatus: app.turnFooterStatus(st.messages[after], st),
+            visibleRunningFooterCount: visibleRunningFooters.length,
           };
         }""",
         {
@@ -5143,6 +5159,134 @@ def test_started_queue_steering_becomes_user_bubble_at_stream_boundary(
     assert result["queuedBubbleCount"] == 0
     assert result["sameCanonicalObject"] is True
     assert result["sameCanonicalKey"] is True
+    assert result["beforeStatus"] == ""
+    assert result["afterStatus"] == "running"
+    assert result["visibleRunningFooterCount"] == 1
+
+    canonical_messages.extend([
+        {
+            "role": "assistant", "text": history_marker,
+            "html": f"<p>{history_marker}</p>",
+            "uuid": "midturn-history-uuid", "ts": 1_700_030_000,
+            "turn_status": "completed",
+            "block_id": "midturn-history-uuid:0:assistant",
+            "_key": "midturn-history-uuid:0:assistant",
+        },
+        {
+            "role": "user", "text": "MIDTURN_ORIGINAL_PROMPT",
+            "uuid": "midturn-root-user", "_turnRoot": True,
+            "block_id": "midturn-root-user:0:user",
+            "_key": "midturn-root-user:0:user",
+        },
+        {
+            "role": "assistant", "text": "ASSISTANT_BEFORE_ADJUSTMENT",
+            "uuid": "midturn-before-assistant",
+            "block_id": "midturn-before-assistant:0:assistant",
+            "_key": "midturn-before-assistant:0:assistant",
+        },
+        {
+            "role": "tool_use", "id": "midturn-tool-use", "name": "Read",
+            "summary": "inspect before adjustment", "input": {},
+            "uuid": "midturn-before-assistant",
+            "block_id": "midturn-before-assistant:1:tool_use",
+            "_key": "midturn-before-assistant:1:tool_use",
+        },
+        {
+            "role": "tool_result", "id": "midturn-tool-use",
+            "tool_name": "Read", "preview": "TOOL_RESULT_BEFORE_ADJUSTMENT",
+            "text": "TOOL_RESULT_BEFORE_ADJUSTMENT", "is_error": False,
+            "uuid": "midturn-before-result",
+            "block_id": "midturn-before-result:0:tool_result",
+            "_key": "midturn-before-result:0:tool_result",
+        },
+        {
+            "role": "user", "text": adjustment, "displayText": adjustment,
+            "selectionQuotes": [], "uuid": command_uuid,
+            "_steeringAdjustment": True, "_turnRoot": False,
+            "block_id": f"{command_uuid}:0:user",
+            "_key": f"{command_uuid}:0:user",
+        },
+        {
+            "role": "assistant",
+            "text": "ASSISTANT_AFTER_PART_A ASSISTANT_AFTER_PART_B",
+            "uuid": "midturn-final-assistant", "ts": 1_700_030_010,
+            "turn_status": "completed",
+            "block_id": "midturn-final-assistant:0:assistant",
+            "_key": "midturn-final-assistant:0:assistant",
+        },
+    ])
+    page.evaluate(
+        """() => window.__emitSse("done", {
+          total_cost_usd: 0.001, turn_id: "midturn-turn", event_seq: 6,
+        })"""
+    )
+    page.wait_for_function(
+        """sid => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          return app._ensureTabState(sid).streaming === false;
+        }""",
+        arg=sid,
+        timeout=10000,
+    )
+    loaded = _app_eval(
+        page,
+        """
+        const st = app._ensureTabState(arg.sid);
+        st._pendingExternalUpdate = true;
+        return await app.loadSession(arg.sid, {
+          quiet: true, probeActive: false, followTail: true,
+        });
+        """,
+        {"sid": sid},
+    )
+    assert loaded is True
+    page.wait_for_function(
+        """arg => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const st = app._ensureTabState(arg.sid);
+          return st.messages.some(m => m.uuid === "midturn-final-assistant")
+            && st.messages.some(m => m.uuid === arg.commandUuid);
+        }""",
+        arg={"sid": sid, "commandUuid": command_uuid},
+        timeout=10000,
+    )
+    completed = _app_eval(
+        page,
+        """
+        const st = app._ensureTabState(arg.sid);
+        const root = st.messages.findIndex(m => m.uuid === "midturn-root-user");
+        const steering = st.messages.find(m => m.uuid === arg.commandUuid);
+        const firstTail = st.messages.find(m => m.uuid === "midturn-before-result");
+        const final = st.messages.find(m => m.uuid === "midturn-final-assistant");
+        const statuses = st.messages.slice(root + 1)
+          .map(m => app.turnFooterStatus(m, st)).filter(Boolean);
+        return {
+          steeringCount: st.messages.filter(
+            m => m.uuid === arg.commandUuid).length,
+          sameSteeringObject: steering === window.__midturnLiveUser,
+          sameSteeringKey: steering?._k === window.__midturnLiveKey,
+          liveSteeringKey: window.__midturnLiveKey,
+          canonicalSteeringKey: steering?._k || "",
+          firstStatus: app.turnFooterStatus(firstTail, st),
+          finalStatus: app.turnFooterStatus(final, st),
+          currentTurnStatuses: statuses,
+          hasPostResult: st.messages.some(m => m.uuid === "midturn-final-assistant"
+            && m.text === "ASSISTANT_AFTER_PART_A ASSISTANT_AFTER_PART_B"),
+          steeringFlag: steering?._steeringAdjustment === true,
+        };
+        """,
+        {"sid": sid, "commandUuid": command_uuid},
+    )
+    assert requests, "done reconciliation did not request canonical history"
+    assert completed["steeringCount"] == 1
+    assert completed["sameSteeringObject"] is True
+    assert completed["sameSteeringKey"] is True, (
+        completed["liveSteeringKey"], completed["canonicalSteeringKey"])
+    assert completed["firstStatus"] == ""
+    assert completed["finalStatus"] == "completed"
+    assert completed["currentTurnStatuses"] == ["completed"]
+    assert completed["hasPostResult"] is True
+    assert completed["steeringFlag"] is True
     _assert_no_browser_errors(page, errors)
 
 
