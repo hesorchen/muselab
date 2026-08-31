@@ -1217,6 +1217,124 @@ async def test_busy_adjust_is_durable_then_uses_exact_native_command(
 
 
 @pytest.mark.asyncio
+async def test_busy_adjust_during_admission_waits_for_root_query_commit(
+    app_module, monkeypatch,
+):
+    from backend import chat
+
+    sess = _sess(app_module)
+    sid = sess.create_session()["id"]
+    writes = []
+
+    class SteeringClient:
+        async def query_steering(
+            self, prompt, *, session_id, command_uuid,
+        ):
+            writes.append((prompt, session_id, command_uuid))
+
+    monkeypatch.setattr(chat, "MuseLabSDKClient", SteeringClient)
+    broadcast = chat.TurnBroadcast(sid)
+    broadcast.runtime_client = SteeringClient()
+    chat._active_turns[sid] = broadcast
+    try:
+        enqueue = asyncio.create_task(chat.enqueue_api(
+            sid,
+            chat.QueueEnqueueReq(
+                text="adjust the starting task",
+                delivery="adjust",
+                active_turn_id=broadcast.turn_id,
+            ),
+            chat.BackgroundTasks(),
+        ))
+        for _ in range(100):
+            if broadcast.steering_commands:
+                break
+            await asyncio.sleep(0.01)
+
+        assert not enqueue.done()
+        pending = sess.get_queue(sid)["items"][0]
+        assert pending["delivery"] == "adjust"
+        assert pending["target_turn_id"] == broadcast.turn_id
+        assert pending["steering_state"] == "pending"
+        command_uuid = pending["command_uuid"]
+        assert broadcast.steering_commands[command_uuid] == {
+            "item_id": pending["id"],
+            "state": "pending",
+        }
+        assert writes == []
+
+        broadcast.query_committed = True
+        broadcast.steering_ready.set()
+        response = await asyncio.wait_for(enqueue, timeout=1)
+
+        assert response["effective_delivery"] == "adjust"
+        assert response["delivery_status"] == "waiting_tool"
+        assert writes == [(
+            "adjust the starting task", sid, command_uuid,
+        )]
+        assert sess.get_queue(sid)["items"][0][
+            "steering_state"] == "waiting_tool"
+    finally:
+        chat._active_turns.pop(sid, None)
+        broadcast.close()
+
+
+@pytest.mark.asyncio
+async def test_busy_adjust_during_admission_falls_back_when_turn_finishes(
+    app_module, monkeypatch,
+):
+    from backend import chat
+
+    sess = _sess(app_module)
+    sid = sess.create_session()["id"]
+    writes = []
+
+    class SteeringClient:
+        async def query_steering(self, *_args, **_kwargs):
+            writes.append(True)
+
+    monkeypatch.setattr(chat, "MuseLabSDKClient", SteeringClient)
+    monkeypatch.setattr(chat, "_schedule_queue_drain", lambda _sid: None)
+    broadcast = chat.TurnBroadcast(sid)
+    broadcast.runtime_client = SteeringClient()
+    chat._active_turns[sid] = broadcast
+    try:
+        enqueue = asyncio.create_task(chat.enqueue_api(
+            sid,
+            chat.QueueEnqueueReq(
+                text="keep this after failed startup",
+                delivery="adjust",
+                active_turn_id=broadcast.turn_id,
+            ),
+            chat.BackgroundTasks(),
+        ))
+        for _ in range(100):
+            if broadcast.steering_commands:
+                break
+            await asyncio.sleep(0.01)
+
+        assert not enqueue.done()
+        pending = sess.get_queue(sid)["items"][0]
+        assert pending["delivery"] == "adjust"
+        assert pending["steering_state"] == "pending"
+
+        broadcast.finish()
+        response = await asyncio.wait_for(enqueue, timeout=1)
+
+        assert response["effective_delivery"] == "queue"
+        assert response["delivery_status"] == "queued"
+        fallback = sess.get_queue(sid)["items"][0]
+        assert fallback["delivery"] == "queue"
+        assert fallback["steering_state"] == "fallback"
+        assert not fallback.get("command_uuid")
+        assert broadcast.steering_commands == {}
+        assert writes == []
+    finally:
+        chat._active_turns.pop(sid, None)
+        broadcast.close()
+
+
+@pytest.mark.asyncio
 async def test_busy_adjust_stale_turn_falls_back_without_native_write(
     app_module, monkeypatch,
 ):

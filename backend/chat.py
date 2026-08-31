@@ -999,6 +999,11 @@ class TurnBroadcast:
         # Keeping the exact client/turn here closes the session-id ABA race.
         self.runtime_client: "MuseLabSDKClient | None" = None
         self.query_committed = False
+        # Native steering must target this exact turn, but the queue request can
+        # arrive after HTTP admission and before the root SDK query commits.
+        # Writers register durably against the broadcast, then wait on this
+        # one-shot gate instead of being downgraded to end-of-turn FIFO.
+        self.steering_ready = asyncio.Event()
         self.result_forwarded = False
         self.permission = ""
         self.active_tool_use_ids: set[str] = set()
@@ -1355,6 +1360,7 @@ class TurnBroadcast:
             return
         self._flush_compact_text()
         self.done = True
+        self.steering_ready.set()
         self.finished_at = time.time()
         if self.perf_status == "unknown":
             self.perf_status = "cancelled" if self.cancelled else "completed"
@@ -1409,6 +1415,7 @@ class TurnBroadcast:
         # Keep the compacted replay for late desktop reconnects during the grace TTL.
 
     def close(self) -> None:
+        self.steering_ready.set()
         for subscriber in tuple(self.subscribers):
             subscriber.close_reader()
             subscriber.close()
@@ -7283,18 +7290,20 @@ async def _schedule_queue_drain_after_response(session_id: str) -> None:
     _schedule_queue_drain(session_id)
 
 
-def _eligible_steering_turn(
+def _admitted_steering_turn(
     session_id: str,
     turn_id: str,
     *,
     permission: str = "",
 ) -> TurnBroadcast | None:
-    """Return the exact foreground turn that can accept native steering.
+    """Return the exact foreground turn reserved for native steering.
 
     A session id is not sufficient: an old enqueue response can arrive after
     turn A ended and turn B reused the same pooled client.  The immutable turn
-    id, query commit point and final-result flag together close that ABA window.
-    Queue-owned/background turns are deliberately left to ordinary FIFO drain.
+    id and final-result flag close that ABA window. Queue-owned/background turns
+    are deliberately left to ordinary FIFO drain. Runtime readiness is checked
+    separately so an exact admitted turn can retain a durable pending command
+    while its root query is still starting.
     """
     bc = _active_turns.get(session_id)
     if (
@@ -7305,16 +7314,32 @@ def _eligible_steering_turn(
         or bc.turn_id != turn_id
         or bc.is_continuation
         or bool(bc.queue_item_id)
-        or not bc.query_committed
         or bc.result_forwarded
         or bc.steering_closed
-        or not isinstance(bc.runtime_client, MuseLabSDKClient)
         or _sessions_with_inflight_tasks.get(session_id)
         or _session_has_live_watcher(session_id)
     ):
         return None
     requested_permission = (permission or "").strip()
     if requested_permission and requested_permission != bc.permission:
+        return None
+    return bc
+
+
+def _eligible_steering_turn(
+    session_id: str,
+    turn_id: str,
+    *,
+    permission: str = "",
+) -> TurnBroadcast | None:
+    """Return an exact admitted turn whose root SDK query is committed."""
+    bc = _admitted_steering_turn(
+        session_id, turn_id, permission=permission)
+    if (
+        bc is None
+        or not bc.query_committed
+        or not isinstance(bc.runtime_client, MuseLabSDKClient)
+    ):
         return None
     return bc
 
@@ -7415,9 +7440,16 @@ async def _deliver_steering_command(
     """
     bc: TurnBroadcast | None = None
     write_event: asyncio.Event | None = None
+    waiting_for_startup = False
     async with _lock:
         bc = _eligible_steering_turn(
             session_id, turn_id, permission=permission)
+        if bc is None:
+            admitted = _admitted_steering_turn(
+                session_id, turn_id, permission=permission)
+            if admitted is not None and not admitted.query_committed:
+                bc = admitted
+                waiting_for_startup = True
         if bc is not None:
             write_event = asyncio.Event()
             bc.steering_commands[command_uuid] = {
@@ -7435,6 +7467,43 @@ async def _deliver_steering_command(
         )
         return "queue", "queued", fallback
 
+    def _discard_registration() -> None:
+        current = bc.steering_commands.get(command_uuid)
+        if current is not None and current.get("item_id") == item_id:
+            bc.steering_commands.pop(command_uuid, None)
+        write_event.set()
+        bc.steering_write_events.pop(command_uuid, None)
+
+    if waiting_for_startup:
+        try:
+            await asyncio.wait_for(
+                bc.steering_ready.wait(), timeout=30.0)
+        except asyncio.TimeoutError:
+            _discard_registration()
+            fallback = await _fallback_steering_item(
+                session_id,
+                item_id=item_id,
+                command_uuid=command_uuid,
+                bc=bc,
+            )
+            return "queue", "queued", fallback
+        async with _lock:
+            ready = (
+                _eligible_steering_turn(
+                    session_id, turn_id, permission=permission) is bc
+                and str((bc.steering_commands.get(command_uuid) or {}).get(
+                    "item_id") or "") == item_id
+            )
+        if not ready:
+            _discard_registration()
+            fallback = await _fallback_steering_item(
+                session_id,
+                item_id=item_id,
+                command_uuid=command_uuid,
+                bc=bc,
+            )
+            return "queue", "queued", fallback
+
     try:
         await bc.runtime_client.query_steering(
             text,
@@ -7442,11 +7511,7 @@ async def _deliver_steering_command(
             command_uuid=command_uuid,
         )
     except BaseException:
-        current = bc.steering_commands.get(command_uuid)
-        if current is not None and current.get("item_id") == item_id:
-            bc.steering_commands.pop(command_uuid, None)
-        write_event.set()
-        bc.steering_write_events.pop(command_uuid, None)
+        _discard_registration()
         fallback = await _fallback_steering_item(
             session_id,
             item_id=item_id,
@@ -7747,12 +7812,17 @@ async def enqueue_api(
     # the queue sidecar and the eventual canonical user UUID; replaying that
     # transaction inside a mid-turn CLI fold would make crash recovery
     # ambiguous, so attachment messages retain ordinary turn-boundary FIFO.
-    steering_turn = (
-        _eligible_steering_turn(
+    steering_turn = None
+    if requested_delivery == "adjust" and not attachment_ids:
+        steering_turn = _eligible_steering_turn(
             sid, requested_turn_id, permission=req.permission or "")
-        if requested_delivery == "adjust" and not attachment_ids
-        else None
-    )
+        if steering_turn is None:
+            admitted = _admitted_steering_turn(
+                sid, requested_turn_id, permission=req.permission or "")
+            # Only bridge the startup gap. A query-committed turn that fails
+            # the runtime capability check remains ordinary FIFO immediately.
+            if admitted is not None and not admitted.query_committed:
+                steering_turn = admitted
     effective_delivery = "adjust" if steering_turn is not None else "queue"
     command_uuid = str(uuid.uuid4()) if steering_turn is not None else ""
 
@@ -14819,6 +14889,10 @@ async def _admit_accept_launch_turn(
         model=model,
         image_ids=image_ids,
     )
+    # The validated launch permission is immutable for this admitted turn.
+    # Publish it before detached runtime startup so an exact-turn steering
+    # request in the admission window can retain the same permission guard.
+    broadcast.permission = permission
     if broadcast.done or broadcast.cancelled:
         return broadcast
     try:
@@ -15820,6 +15894,7 @@ async def _start_turn(
                         _pending_runtime_rebuilds.add(session_id)
                         raise
                     broadcast.query_committed = True
+                    broadcast.steering_ready.set()
                     broadcast.emit_startup_perf("ready")
                     if persisted_imgs:
                         try:

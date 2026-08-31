@@ -7838,6 +7838,10 @@ function portal() {
         // Exact backend turn currently owned by this tab. Session id is not
         // sufficient: a reconnect for turn A must never attach to newer B.
         activeTurnId: "",
+        // Primitive identity for the local stream attempt that owns the active
+        // turn. A delayed /active admission probe may observe a successor turn
+        // in the same tab, so discovery must also match this local owner.
+        _streamOwnerToken: "",
         // Immutable turn id of the most recent authenticated terminal frame.
         // Post-result work may briefly leave /active or a mux state snapshot
         // stale; never re-attach that already-rendered turn as "running".
@@ -8023,6 +8027,7 @@ function portal() {
       if (st.activeTurnId === undefined) st.activeTurnId = "";
       if (st._lastTerminalTurnId === undefined) st._lastTerminalTurnId = "";
       if (st.parentTurnId === undefined) st.parentTurnId = "";
+      if (st._streamOwnerToken === undefined) st._streamOwnerToken = "";
       if (!Number.isFinite(st.lastEventSeq)) st.lastEventSeq = 0;
       if (st.permission === undefined) st.permission = "";
       if (st.effort === undefined) st.effort = "auto";
@@ -8414,6 +8419,57 @@ function portal() {
         return "queue";
       }
       return "adjust";
+    },
+    async _resolveBusyAdjustmentTurnId(
+      sid, st, expectedStreamOwnerToken = "", activeTurnId = "",
+      hasAttachments = false,
+    ) {
+      const streamOwnerToken = String(expectedStreamOwnerToken || "");
+      const ownerStillCurrent = () => !!streamOwnerToken
+        && this.tabState[sid] === st
+        && st.streaming
+        && String(st._streamOwnerToken || "") === streamOwnerToken;
+      if (!ownerStillCurrent()) return "";
+      const accept = value => {
+        const turnId = String(value || "");
+        return turnId
+          && this._busySendDelivery(sid, turnId, hasAttachments) === "adjust"
+          ? turnId : "";
+      };
+      const known = accept(activeTurnId || (st && st.activeTurnId));
+      if (known) return known;
+      // A second Send can land after the first call marked the pane streaming
+      // but before /turns/start returned its immutable turn id.  Falling back
+      // to FIFO in that narrow admission window strands the message until the
+      // whole turn completes, even if many tool boundaries follow. Resolve the
+      // already-reserved server turn once, then keep the ordinary exact-id ABA
+      // checks in the queue endpoint. Every genuinely ineligible state still
+      // returns immediately without an extra request.
+      if (!st || this.tabState[sid] !== st
+          || this._normalizeBusySendMode(this.busySendMode) !== "adjust"
+          || hasAttachments || !st.streaming || st.compacting
+          || st.backgroundActive || st._draining || st.parentTurnId
+          || (st.pendingQueue && st.pendingQueue.length)) {
+        return "";
+      }
+      try {
+        const r = await this._fetchWithDeadline(
+          "/api/chat/sessions/" + sid + "/active",
+          { headers: this.hdr(), cache: "no-store" },
+          2500,
+        );
+        if (!ownerStillCurrent()) return "";
+        const local = accept(st.activeTurnId);
+        if (local) return local;
+        if (!r.ok) return "";
+        const status = await r.json();
+        if (!ownerStillCurrent() || !status.active || status.background) {
+          return "";
+        }
+        return accept(status.turn_id);
+      } catch (_) {
+        return ownerStillCurrent() ? accept(st.activeTurnId) : "";
+      }
     },
     sendButtonHint(sid) {
       if (this.composerClaimed(sid)) return this.t("btn.send");
@@ -8822,10 +8878,20 @@ function portal() {
             "",
           )
         : "";
-      const delivery = this._normalizeBusySendMode(
+      let delivery = this._normalizeBusySendMode(
         item.delivery || this.busySendMode,
       );
-      const activeTurnId = String(item.active_turn_id || "");
+      let activeTurnId = String(item.active_turn_id || "");
+      const streamOwnerToken = String(item.stream_owner_token || "");
+      if (delivery !== "adjust" && !activeTurnId && !image_ids) {
+        const resolvedTurnId = await this._resolveBusyAdjustmentTurnId(
+          sid, enqueueState, streamOwnerToken, "", false,
+        );
+        if (resolvedTurnId) {
+          activeTurnId = resolvedTurnId;
+          delivery = "adjust";
+        }
+      }
       let accepted = null;
       try {
         const r = await fetch("/api/chat/sessions/" + sid + "/queue", {
@@ -29471,6 +29537,8 @@ function portal() {
       // backend can reject stale steering rather than targeting a successor.
       const busyActiveTurnId = !isReconnect
         ? String(sendState.activeTurnId || "") : "";
+      const busyStreamOwnerToken = !isReconnect
+        ? String(sendState._streamOwnerToken || "") : "";
       const busyHasAttachments = !isReconnect
         && !!(composerImages.length || composerDocs.length);
       const busyDelivery = this._busySendDelivery(
@@ -29661,6 +29729,7 @@ function portal() {
           plan_return_permission: sendPlanReturnPermission,
           delivery: busyDelivery,
           active_turn_id: busyActiveTurnId,
+          stream_owner_token: busyStreamOwnerToken,
         });
         if (!ok) {
           rollbackOptimisticSubmission();
@@ -29763,6 +29832,7 @@ function portal() {
       // visual generation makes an older load response unable to turn the live
       // pane into either a loading or error surface when it eventually settles.
       this._releaseTranscriptLoadForLive(streamState);
+      streamState._streamOwnerToken = composerSubmitToken;
       streamState.streaming = true;
       if (!isReconnect || !streamState.streamPhase) {
         streamState.streamPhase = "connecting";
@@ -29850,6 +29920,7 @@ function portal() {
         streamState._streamStartedAt = 0;
         streamState.streamElapsed = 0;
         streamState.streaming = false;
+        streamState._streamOwnerToken = "";
         streamState.streamPhase = "";
         streamState._continuationAwaitingReaction = false;
         streamState.es = null;
@@ -29913,6 +29984,7 @@ function portal() {
                   plan_return_permission: sendPlanReturnPermission,
                   delivery: busyDelivery,
                   active_turn_id: busyActiveTurnId,
+                  stream_owner_token: busyStreamOwnerToken,
                 });
                 if (queued) {
                   rollbackUnstartedSend(false);
@@ -30862,6 +30934,7 @@ function portal() {
         // permission-mode commit never arrived.
         _finalizePendingPermissionRequests();
         streamState.streaming = false;
+        streamState._streamOwnerToken = "";
         streamState.streamPhase = "";
         streamState._continuationAwaitingReaction = false;
         streamState.es = null;
@@ -31392,6 +31465,7 @@ function portal() {
             plan_return_permission: sendPlanReturnPermission,
             delivery: handoffDelivery,
             active_turn_id: handoffTurnId,
+            stream_owner_token: busyStreamOwnerToken,
           });
           if (queued) {
             if (sentUserBubble) {

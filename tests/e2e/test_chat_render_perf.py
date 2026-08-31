@@ -4681,6 +4681,247 @@ def test_session_sync_deadline_dispose_and_hidden_resume(
     _assert_no_browser_errors(page, errors)
 
 
+def test_admission_gap_resolves_exact_turn_before_busy_adjust_enqueue(
+    page: Page, backend_url, auth_token,
+):
+    """A second send during first-turn admission must not freeze as FIFO."""
+    errors = _capture_browser_errors(page)
+    _login(page, backend_url, auth_token)
+    sid = "perf-busy-admission-gap"
+    turn_id = "admitted-root-turn"
+    item_id = "admission-gap-item"
+    command_uuid = "admission-gap-command"
+    active_calls: list[str] = []
+    queue_payloads: list[dict] = []
+
+    def active_route(route):
+        active_calls.append(route.request.method)
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({
+                "active": True,
+                "background": False,
+                "turn_id": turn_id,
+            }),
+        )
+
+    def queue_route(route):
+        payload = route.request.post_data_json
+        queue_payloads.append(payload)
+        item = {
+            "id": item_id,
+            "text": payload["text"],
+            "display_text": payload["display_text"],
+            "selection_quotes": [],
+            "image_ids": "",
+            "delivery": "adjust",
+            "steering_state": "waiting_tool",
+            "command_uuid": command_uuid,
+            "target_turn_id": turn_id,
+            "enqueued_at": int(time.time() * 1000),
+        }
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({
+                "ok": True,
+                "item": item,
+                "effective_delivery": "adjust",
+                "delivery_status": "waiting_tool",
+                "queue": {"items": [item], "revision": 1},
+            }),
+        )
+
+    page.route(f"**/api/chat/sessions/{sid}/active", active_route)
+    page.route(f"**/api/chat/sessions/{sid}/queue", queue_route)
+    result = _app_eval(
+        page,
+        """
+        const sid = arg.sid;
+        app.busySendMode = "adjust";
+        app.sessions = [{
+          id: sid, name: "Admission gap", model: "e2e-model",
+          permission: "bypassPermissions", updated_at: 1,
+        }];
+        app.openTabIds = [sid];
+        app.tabState = {};
+        app.tabState[sid] = app._blankTabState();
+        const st = app._ensureTabState(sid);
+        st._loaded = true;
+        st.streaming = true;
+        st._streamOwnerToken = "admitting-root-owner";
+        st.streamPhase = "connecting";
+        st.activeTurnId = "";
+        st.pendingQueue = [];
+        app.currentId = sid;
+        app._activateTabState(sid);
+        app._syncQueueFromServer = async () => {};
+        const queued = await app._enqueueMessage(sid, {
+          text: "ADJUST_DURING_ADMISSION",
+          displayText: "ADJUST_DURING_ADMISSION",
+          pendingImages: [], pendingDocs: [], pendingQuotes: [],
+          permission: "bypassPermissions",
+          delivery: "queue",
+          active_turn_id: "",
+          stream_owner_token: "admitting-root-owner",
+        });
+        return {
+          queued,
+          pending: st.pendingQueue.map(item => ({
+            id: item.id,
+            delivery: item.delivery,
+            deliveryStatus: item.deliveryStatus,
+            targetTurnId: item.targetTurnId,
+          })),
+        };
+        """,
+        {"sid": sid},
+    )
+
+    assert active_calls == ["GET"]
+    assert len(queue_payloads) == 1
+    assert queue_payloads[0]["delivery"] == "adjust"
+    assert queue_payloads[0]["active_turn_id"] == turn_id
+    assert result == {
+        "queued": True,
+        "pending": [{
+            "id": item_id,
+            "delivery": "adjust",
+            "deliveryStatus": "waiting_tool",
+            "targetTurnId": turn_id,
+        }],
+    }
+    _assert_no_browser_errors(page, errors)
+
+
+def test_admission_gap_probe_cannot_steer_successor_turn(
+    page: Page, backend_url, auth_token,
+):
+    """A delayed admission probe is bound to its original local stream."""
+    errors = _capture_browser_errors(page)
+    _login(page, backend_url, auth_token)
+    sid = "perf-busy-admission-successor"
+    result = _app_eval(
+        page,
+        """
+        const sid = arg.sid;
+        app.busySendMode = "adjust";
+        app.sessions = [{
+          id: sid, name: "Admission successor", model: "e2e-model",
+          permission: "bypassPermissions", updated_at: 1,
+        }];
+        app.openTabIds = [sid];
+        app.tabState = {};
+        app.tabState[sid] = app._blankTabState();
+        const st = app._ensureTabState(sid);
+        st._loaded = true;
+        st.streaming = true;
+        st._streamOwnerToken = "root-a-owner";
+        st.streamPhase = "connecting";
+        st.activeTurnId = "";
+        st.pendingQueue = [];
+        app.currentId = sid;
+        app._activateTabState(sid);
+        app._syncQueueFromServer = async () => {};
+
+        const originalFetch = window.fetch;
+        let activeCalls = 0;
+        const queuePayloads = [];
+        window.fetch = async (url, options = {}) => {
+          const path = String(url);
+          if (path.endsWith("/active")) {
+            activeCalls += 1;
+            await new Promise(resolve => setTimeout(resolve, 40));
+            return new Response(JSON.stringify({
+              active: true,
+              background: false,
+              turn_id: "successor-turn-b",
+            }), { status: 200, headers: { "Content-Type": "application/json" } });
+          }
+          if (path.endsWith("/queue")) {
+            const queuePayload = JSON.parse(options.body || "{}");
+            queuePayloads.push(queuePayload);
+            const item = {
+              id: `successor-safe-queue-item-${queuePayloads.length}`,
+              text: queuePayload.text,
+              display_text: queuePayload.display_text,
+              selection_quotes: [],
+              image_ids: "",
+              delivery: "queue",
+              steering_state: "",
+              command_uuid: "",
+              target_turn_id: "",
+              enqueued_at: Date.now(),
+            };
+            return new Response(JSON.stringify({
+              ok: true,
+              item,
+              effective_delivery: "queue",
+              delivery_status: "queued",
+              queue: { items: [item], revision: 1 },
+            }), { status: 200, headers: { "Content-Type": "application/json" } });
+          }
+          return originalFetch(url, options);
+        };
+        try {
+          const enqueue = app._enqueueMessage(sid, {
+            text: "MUST_NOT_STEER_SUCCESSOR",
+            displayText: "MUST_NOT_STEER_SUCCESSOR",
+            pendingImages: [], pendingDocs: [], pendingQuotes: [],
+            permission: "bypassPermissions",
+            delivery: "queue",
+            active_turn_id: "",
+            stream_owner_token: "root-a-owner",
+          });
+          await new Promise(resolve => setTimeout(resolve, 10));
+          st.streaming = false;
+          st._streamOwnerToken = "";
+          st.activeTurnId = "";
+          st.streaming = true;
+          st._streamOwnerToken = "root-b-owner";
+          st.activeTurnId = "successor-turn-b";
+          const firstQueued = await enqueue;
+          const activeCallsAfterFirst = activeCalls;
+
+          // Also cover the earlier race: A can become B while send() awaits
+          // its busy probe, before _enqueueMessage even enters the resolver.
+          st.pendingQueue = [];
+          const secondQueued = await app._enqueueMessage(sid, {
+            text: "SNAPSHOT_FROM_ROOT_A",
+            displayText: "SNAPSHOT_FROM_ROOT_A",
+            pendingImages: [], pendingDocs: [], pendingQuotes: [],
+            permission: "bypassPermissions",
+            delivery: "queue",
+            active_turn_id: "",
+            stream_owner_token: "root-a-owner",
+          });
+          return {
+            firstQueued,
+            secondQueued,
+            queuePayloads,
+            activeCalls,
+            activeCallsAfterFirst,
+          };
+        } finally {
+          window.fetch = originalFetch;
+        }
+        """,
+        {"sid": sid},
+    )
+
+    assert result["firstQueued"] is True
+    assert result["secondQueued"] is True
+    assert result["activeCallsAfterFirst"] == 1
+    assert result["activeCalls"] == 1
+    assert len(result["queuePayloads"]) == 2
+    assert all(payload["delivery"] == "queue"
+               for payload in result["queuePayloads"])
+    assert all(payload["active_turn_id"] == ""
+               for payload in result["queuePayloads"])
+    _assert_no_browser_errors(page, errors)
+
+
 def test_started_queue_steering_becomes_user_bubble_at_stream_boundary(
     page: Page, backend_url, auth_token,
 ):

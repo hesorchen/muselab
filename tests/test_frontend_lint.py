@@ -5517,6 +5517,8 @@ def test_busy_send_mode_uses_authoritative_delivery_and_steering_state():
     enqueue = app[enqueue_start:enqueue_end]
     assert 'item.delivery || this.busySendMode' in enqueue
     assert 'activeTurnId = String(item.active_turn_id || "")' in enqueue
+    assert "await this._resolveBusyAdjustmentTurnId(" in enqueue
+    assert 'delivery = "adjust"' in enqueue
     assert "delivery," in enqueue
     assert "active_turn_id: activeTurnId" in enqueue
     assert "accepted.queue.items" in enqueue
@@ -5578,12 +5580,26 @@ def test_busy_send_mode_uses_authoritative_delivery_and_steering_state():
     assert "!turnId || attachmentIntent || st.compacting" in delivery
     assert "st.backgroundActive || st._draining || st.parentTurnId" in delivery
     assert "st.pendingQueue && st.pendingQueue.length" in delivery
+    resolve_start = app.index("    async _resolveBusyAdjustmentTurnId(")
+    resolve_end = app.index("\n    sendButtonHint(sid)", resolve_start)
+    resolve = app[resolve_start:resolve_end]
+    assert '"/api/chat/sessions/" + sid + "/active"' in resolve
+    assert "status.active" in resolve
+    assert "status.background" in resolve
+    assert "this._busySendDelivery(sid, turnId, hasAttachments)" in resolve
+    assert "this.tabState[sid] !== st" in resolve
+    assert "const streamOwnerToken = String(expectedStreamOwnerToken || \"\")" in resolve
+    assert "ownerStillCurrent()" in resolve
+    assert "String(st._streamOwnerToken || \"\") === streamOwnerToken" in resolve
     assert 'const busyActiveTurnId = !isReconnect' in send
+    assert 'const busyStreamOwnerToken = !isReconnect' in send
+    assert "streamState._streamOwnerToken = composerSubmitToken" in send
     assert "const busyDelivery = this._busySendDelivery(" in send
     assert "_optimisticDelivery: busyDelivery" in send
     assert "delivery: busyDelivery" in send
     assert "delivery: handoffDelivery" in send
     assert 'active_turn_id: busyActiveTurnId' in send
+    assert 'stream_owner_token: busyStreamOwnerToken' in send
     assert 'errorMeta.active_turn_id || errorMeta.turn_id' in send
     assert '_optimisticQueue: !resumed && this._isBusy(sendSid)' in send
     assert 'x-show="m._admissionPending"' in html
