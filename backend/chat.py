@@ -338,7 +338,12 @@ def _build_runtime_task_context_hook(session_id: str):
     leaving the canonical user message and transcript untouched.
     """
     async def runtime_task_context(_input_data, _tool_use_id, _context):
-        overlays = sess.get_authoritative_runtime_task_overlays(session_id)
+        overlays = await obs.to_thread_io(
+            "chat.runtime_task_context_read",
+            session_id,
+            sess.get_authoritative_runtime_task_overlays,
+            session_id,
+        )
         inherited: list[str] = []
         inherited_overlays = [
             (task_id, overlay)
@@ -1697,6 +1702,19 @@ _STOPPED_CONTINUATION_GRACE = env_int(
 # Populated on TaskStarted, consumed+removed on settle.
 _bg_task_descriptions: dict[str, str] = {}
 _bg_task_tool_use_ids: dict[str, str] = {}
+# Serialize one session's live task-card authority/persistence/settlement
+# transaction across the turn dispatcher and its detached watcher. Disk work
+# still runs in workers; this lock only prevents two terminal shapes from
+# persisting one outcome while the other wins the in-memory dedup gate.
+_runtime_task_storage_locks: dict[str, asyncio.Lock] = {}
+
+
+def _runtime_task_storage_lock_for(session_id: str) -> asyncio.Lock:
+    lock = _runtime_task_storage_locks.get(session_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _runtime_task_storage_locks[session_id] = lock
+    return lock
 
 # Compatibility aliases: deletion, overlays, tests, and local tooling must
 # observe the exact containers owned by the extracted successor lifecycle.
@@ -1773,6 +1791,23 @@ def _runtime_task_overlay(
         )
 
 
+async def _runtime_task_overlay_owned(
+    session_id: str,
+    task_id: str,
+    **fields: Any,
+) -> None:
+    """Persist a task-card patch without blocking the shared event loop."""
+    await obs.to_thread_io(
+        "chat.runtime_task_overlay",
+        session_id,
+        _runtime_task_overlay,
+        session_id,
+        task_id,
+        owned=True,
+        **fields,
+    )
+
+
 def _record_background_task_launch(
     session_id: str,
     task_id: str,
@@ -1811,6 +1846,48 @@ def _record_background_task_launch(
         output_file=output_file,
     )
     return True
+
+
+async def _record_background_task_launch_owned(
+    session_id: str,
+    task_id: str,
+    *,
+    tool_use_id: str | None = None,
+    description: str | None = None,
+    output_file: str | None = None,
+) -> bool:
+    """Async event-loop-safe counterpart of task launch persistence."""
+    tid = str(task_id or "")
+    if not tid:
+        return False
+    async with _runtime_task_storage_lock_for(session_id):
+        inherited = await obs.to_thread_io(
+            "chat.runtime_task_launch_read",
+            session_id,
+            sess.get_authoritative_runtime_task_overlays,
+            session_id,
+        )
+        current = inherited.get(tid, {})
+        inherited_owner = str(current.get("owner_session_id") or "")
+        if inherited_owner and inherited_owner != session_id:
+            return False
+        if str(current.get("state") or "") in {
+            "completed", "failed", "stopped", "done",
+        }:
+            return False
+        if tool_use_id:
+            _bg_task_tool_use_ids[tid] = str(tool_use_id)
+        if description:
+            _bg_task_descriptions[tid] = str(description)
+        await _runtime_task_overlay_owned(
+            session_id,
+            tid,
+            state="running",
+            tool_use_id=tool_use_id,
+            description=description,
+            output_file=output_file,
+        )
+        return True
 
 
 def _session_has_live_watcher(session_id: str) -> bool:
@@ -1936,14 +2013,47 @@ def _delete_active_turn_sidecar(sid: str) -> None:
         pass
 
 
-def _retain_active_turn_for_recovery(sid: str) -> None:
-    """Expose a still-owned sidecar to history without waiting for restart."""
+def _read_active_turn_sidecar(sid: str) -> dict | None:
+    """Read one recovery sidecar without mutating event-loop-owned state."""
     try:
         data = json.loads(_active_turn_path(sid).read_text(encoding="utf-8"))
-        if isinstance(data, dict):
-            _interrupted_at_startup[sid] = data
     except Exception:
-        pass
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _retain_active_turn_for_recovery(sid: str) -> None:
+    """Expose a still-owned sidecar to history without waiting for restart."""
+    data = _read_active_turn_sidecar(sid)
+    if data is not None:
+        _interrupted_at_startup[sid] = data
+
+
+async def _settle_active_turn_sidecar_owned(
+    sid: str,
+    *,
+    release: bool,
+) -> None:
+    """Settle pending intent I/O off-loop before publishing terminal state."""
+    if release:
+        await obs.to_thread_io(
+            "chat.active_turn_release",
+            sid,
+            _delete_active_turn_sidecar,
+            sid,
+            file_path=_active_turn_path(sid),
+            owned=True,
+        )
+        return
+    data = await obs.to_thread_io(
+        "chat.active_turn_recovery_read",
+        sid,
+        _read_active_turn_sidecar,
+        sid,
+        file_path=_active_turn_path(sid),
+    )
+    if data is not None:
+        _interrupted_at_startup[sid] = data
 
 
 def _release_active_turn_sidecar(sid: str) -> bool:
@@ -2807,10 +2917,14 @@ def _build_plan_enter_hooks(
         # another turn so the process launch contract matches durable metadata.
         _pending_runtime_rebuilds.add(session_id)
         try:
-            committed = sess.commit_plan_enter(
+            committed = await obs.to_thread_io(
+                "chat.plan_enter",
+                session_id,
+                sess.commit_plan_enter,
                 session_id,
                 expected_permission=launch_permission,
                 plan_return_permission=return_permission,
+                owned=True,
             )
         except Exception as exc:
             sys.stderr.write(
@@ -2818,7 +2932,9 @@ def _build_plan_enter_hooks(
                 f"exc={type(exc).__name__}\n")
             committed = False
         if not committed:
-            current = sess.get_session(session_id) or {}
+            current = await obs.to_thread_io(
+                "chat.session_read", session_id, sess.get_session, session_id)
+            current = current or {}
             await perm.emit_session_event(
                 session_id,
                 "permission_mode_change_failed",
@@ -2851,7 +2967,9 @@ def _build_plan_enter_hooks(
         data = input_data if isinstance(input_data, dict) else {}
         tid = str(data.get("tool_use_id") or tool_use_id or "")
         _pending_runtime_rebuilds.add(session_id)
-        current = sess.get_session(session_id) or {}
+        current = await obs.to_thread_io(
+            "chat.session_read", session_id, sess.get_session, session_id)
+        current = current or {}
         await perm.emit_session_event(
             session_id,
             "permission_mode_change_failed",
@@ -2914,14 +3032,13 @@ def _build_plan_exit_hooks(
         # discard this runtime before metadata I/O or target inference.
         _pending_runtime_rebuilds.add(session_id)
         if not target:
+            current = await obs.to_thread_io(
+                "chat.session_read", session_id, sess.get_session, session_id)
             await perm.emit_session_event(
                 session_id,
                 "permission_mode_change_failed",
                 {
-                    "permission": (
-                        (sess.get_session(session_id) or {}).get("permission")
-                        or "plan"
-                    ),
+                    "permission": (current or {}).get("permission") or "plan",
                     "source": "external_hook",
                     "tool_use_id": tid,
                     "message": "ExitPlanMode did not report a non-Plan mode.",
@@ -2931,12 +3048,23 @@ def _build_plan_exit_hooks(
                 "ExitPlanMode completed without a verifiable target mode.")
         try:
             previous = "plan"
-            if not sess.commit_plan_exit(
+            committed = await obs.to_thread_io(
+                "chat.plan_exit",
+                session_id,
+                sess.commit_plan_exit,
                 session_id,
                 target,
                 expected_plan_return=plan_return_permission,
-            ):
-                current = sess.get_session(session_id) or {}
+                owned=True,
+            )
+            if not committed:
+                current = await obs.to_thread_io(
+                    "chat.session_read",
+                    session_id,
+                    sess.get_session,
+                    session_id,
+                )
+                current = current or {}
                 await perm.emit_session_event(
                     session_id,
                     "permission_mode_change_failed",
@@ -3000,7 +3128,9 @@ def _build_plan_exit_hooks(
         # External hooks can apply a mode before a later ExitPlanMode failure,
         # too. Its live state is ambiguous even without a staged transition.
         _pending_runtime_rebuilds.add(session_id)
-        current = sess.get_session(session_id) or {}
+        current = await obs.to_thread_io(
+            "chat.session_read", session_id, sess.get_session, session_id)
+        current = current or {}
         await perm.emit_session_event(
             session_id,
             "permission_mode_change_failed",
@@ -3027,7 +3157,17 @@ async def _build_and_connect_client(
     subprocess spawn must not block sibling requests. Caller is responsible
     for serialising concurrent misses on the same key via _creation_lock_for().
     """
-    sess_data = sess.get_session(session_id) or {}
+    def _load_session_runtime() -> tuple[dict, Path]:
+        return (
+            sess.get_session(session_id) or {},
+            sess.session_workspace(session_id),
+        )
+
+    sess_data, workspace_root = await obs.to_thread_io(
+        "chat.client_session_read",
+        session_id,
+        _load_session_runtime,
+    )
     side_question_runtime = (
         sess_data.get("runtime_profile") == "side_question"
     )
@@ -3046,7 +3186,6 @@ async def _build_and_connect_client(
             or runtime_plan_return_permission == "plan"):
         runtime_plan_return_permission = "default"
     is_ducc = endpoints.is_ducc_model(model)
-    workspace_root = sess.session_workspace(session_id)
     # New CLI rule: session_id + resume/continue conflict unless fork_session
     # is set. So we use resume alone — it both loads existing state AND
     # implies the session id. Falls back to session_id-only for new sessions.
@@ -3073,7 +3212,11 @@ async def _build_and_connect_client(
     # background message reader, not during `client.connect()`).
     jsonl_exists = False
     try:
-        jsonl_exists = _find_session_jsonl(session_id) is not None
+        jsonl_exists = await obs.to_thread_io(
+            "chat.client_transcript_probe",
+            session_id,
+            lambda: _find_session_jsonl(session_id) is not None,
+        )
     except Exception as e:
         sys.stderr.write(
             f"[muselab] jsonl_exists check failed "
@@ -3090,6 +3233,11 @@ async def _build_and_connect_client(
         session_id, runtime_plan_return_permission)
     skills_off = os.environ.get("MUSELAB_DISABLE_SKILLS", "").lower() in (
         "1", "true", "yes",
+    )
+    plugin_root = await obs.to_thread_io(
+        "chat.client_plugin_path",
+        session_id,
+        lambda: Path(__file__).resolve().parent.parent,
     )
     user_prompt_hooks = (
         [] if side_question_runtime else [mem0.build_recall_hook(session_id)]
@@ -3150,7 +3298,7 @@ async def _build_and_connect_client(
         # slot remains discoverable in every registered workspace.
         plugins=[{
             "type": "local",
-            "path": str(Path(__file__).resolve().parent.parent),
+            "path": str(plugin_root),
         }],
         # Bind THIS session to muselab's chosen UUID — either as a new
         # session (session_id=) or by resuming the existing one (resume=).
@@ -3234,14 +3382,23 @@ async def _build_and_connect_client(
         # swap the executable to MuseLab's sanitising wrapper. The wrapper then
         # execs the real DUCC launcher, so claude-go — not MuseLab's static env —
         # owns authentication, endpoint selection and comate_custom_header.
-        ducc_executable = locate_ducc_executable()
-        wrapper = Path(ducc_cli_wrapper())
+        def _ducc_launch_paths() -> tuple[str | None, Path, bool]:
+            executable = locate_ducc_executable()
+            path = Path(ducc_cli_wrapper())
+            ready = path.is_file() and os.access(path, os.X_OK)
+            return executable, path, ready
+
+        ducc_executable, wrapper, wrapper_ready = await obs.to_thread_io(
+            "chat.ducc_launch_probe",
+            session_id,
+            _ducc_launch_paths,
+        )
         if ducc_executable is None:
             raise ClaudeSDKError(
                 "DUCC runtime is unavailable: install/login to DUCC or set "
                 "MUSELAB_DUCC_CLI to its executable path."
             )
-        if not wrapper.is_file() or not os.access(wrapper, os.X_OK):
+        if not wrapper_ready:
             raise ClaudeSDKError(
                 f"MuseLab DUCC launcher is missing or not executable: {wrapper}"
             )
@@ -3278,7 +3435,13 @@ async def _build_and_connect_client(
         # Isolated vendor config prevents OAuth fallback, but starts with no
         # project trust state. Without this marker the CLI silently ignores
         # permissions.allow rules from the workspace settings.
-        endpoints.ensure_vendor_workspace_trusted(workspace_root)
+        await obs.to_thread_io(
+            "chat.vendor_workspace_trust",
+            session_id,
+            endpoints.ensure_vendor_workspace_trusted,
+            workspace_root,
+            owned=True,
+        )
         # Agent/Task's `model` field is intentionally an alias enum
         # (sonnet|opus|haiku|fable), not an arbitrary model ID. Without these
         # CLI-native alias overrides, a subagent launched inside a Codex or
@@ -3341,8 +3504,16 @@ async def _build_and_connect_client(
         # the existing early, user-readable auth failure.
         if not is_ducc:
             cred_file = Path.home() / ".claude" / ".credentials.json"
-            if not cred_file.exists() and not os.environ.get("ANTHROPIC_API_KEY") \
-                    and not os.environ.get("ANTHROPIC_AUTH_TOKEN"):
+            has_env_auth = bool(
+                os.environ.get("ANTHROPIC_API_KEY")
+                or os.environ.get("ANTHROPIC_AUTH_TOKEN")
+            )
+            has_credential_file = has_env_auth or await obs.to_thread_io(
+                "chat.credential_probe",
+                session_id,
+                cred_file.exists,
+            )
+            if not has_credential_file:
                 raise ClaudeSDKError(
                     f"Claude model '{model}' requires auth: either run "
                     f"`claude login` (Pro/Max) or set ANTHROPIC_API_KEY in "
@@ -3376,7 +3547,12 @@ async def _build_and_connect_client(
     if not side_question_runtime:
         try:
             from .api_settings import _load_mcp_merged
-            for name, spec in _load_mcp_merged().items():
+            merged_mcp = await obs.to_thread_io(
+                "chat.mcp_config_read",
+                session_id,
+                _load_mcp_merged,
+            )
+            for name, spec in merged_mcp.items():
                 if not isinstance(spec, dict):
                     continue
                 # Skip disabled servers (UI toggle OR override stub).
@@ -6747,6 +6923,9 @@ def _clear_session_runtime_state(sid: str) -> list[asyncio.Task]:
     runtime_lock = _session_runtime_locks.get(sid)
     if runtime_lock is not None and not runtime_lock.locked():
         _session_runtime_locks.pop(sid, None)
+    task_storage_lock = _runtime_task_storage_locks.get(sid)
+    if task_storage_lock is not None and not task_storage_lock.locked():
+        _runtime_task_storage_locks.pop(sid, None)
     drain_task = _queue_drain_tasks.pop(sid, None)
     retry_task = _queue_drain_retry_tasks.pop(sid, None)
     _queue_drain_rekicks.discard(sid)
@@ -7196,8 +7375,13 @@ async def purge_old_sessions_api(req: PurgeOldReq | None = None) -> dict:
     keep_id = (req.keep_id if req else "") or ""
     dry_run = bool(req.dry_run if req else False)
     cutoff = time.time() - days * 86400
+    session_rows = await obs.to_thread_io(
+        "chat.session_list_read",
+        keep_id,
+        sess.list_sessions,
+    )
     victims = [
-        s["id"] for s in sess.list_sessions()
+        s["id"] for s in session_rows
         if not s.get("pinned")
         and s["id"] != keep_id
         and float(s.get("updated_at") or 0) < cutoff
@@ -8425,13 +8609,17 @@ async def patch_session_api(sid: str, req: SessionPatchReq) -> dict:
     if req.tag is not None:
         # Empty string → clear tag. SDK accepts None or str.
         try:
+            def _tag_session() -> None:
+                sdk_tag_session(
+                    sid,
+                    req.tag or None,
+                    directory=str(sess.session_workspace(sid)),
+                )
+
             await obs.to_thread_io(
                 "chat.session_tag",
                 sid,
-                sdk_tag_session,
-                sid,
-                req.tag or None,
-                directory=str(sess.session_workspace(sid)),
+                _tag_session,
                 owned=True,
             )
             ok = True
@@ -8508,9 +8696,19 @@ async def patch_session_api(sid: str, req: SessionPatchReq) -> dict:
         # No-op guard, same rationale as effort: toggling thinking forces a
         # client rebuild (thinking config is fixed at construction). Skip when
         # unchanged. Default is True, so a missing field reads as enabled.
-        cur_thinking = bool((sess.get_session(sid) or {}).get("thinking", True))
+        thinking_meta = await obs.to_thread_io(
+            "chat.session_read", sid, sess.get_session, sid)
+        cur_thinking = bool(
+            (thinking_meta or {}).get("thinking", True))
         if bool(req.thinking) != cur_thinking:
-            sess.update_thinking(sid, bool(req.thinking))
+            await obs.to_thread_io(
+                "chat.session_thinking",
+                sid,
+                sess.update_thinking,
+                sid,
+                bool(req.thinking),
+                owned=True,
+            )
             await _rebuild_session_runtime(sid)
         ok = True
     if not ok:
@@ -9010,7 +9208,12 @@ async def session_usage(session_id: str, model: str = "") -> dict:
     # established SDK/table fallback behavior.
     sdk_window = None
     try:
-        sdk_window = sess.get_session_ctx_window(session_id)
+        sdk_window = await obs.to_thread_io(
+            "chat.session_context_window_read",
+            session_id,
+            sess.get_session_ctx_window,
+            session_id,
+        )
     except Exception:
         sdk_window = None
     stored = int(u.get("context_limit", 0) or 0)
@@ -9858,7 +10061,8 @@ async def context_breakdown(session_id: str, model: str = "") -> dict:
 
     Returns 404 if the session doesn't have a live SDK client yet — that
     happens for newly-created sessions that haven't run a turn."""
-    s = sess.get_session(session_id)
+    s = await obs.to_thread_io(
+        "chat.session_read", session_id, sess.get_session, session_id)
     if s is None:
         raise HTTPException(404, "session not found")
     m = (model or s.get("model") or MODEL).strip()
@@ -10041,7 +10245,8 @@ async def _native_compact_session_locked(sid: str) -> dict:
     state on next loadSession — no muselab-side marker needed.
 
     Session ID stays the same; tool_use history is preserved in the summary."""
-    meta = sess.get_session_meta(sid)
+    meta = await obs.to_thread_io(
+        "chat.session_read", sid, sess.get_session_meta, sid)
     if meta is None:
         raise HTTPException(404, "session not found")
     model = (meta.get("model") or "").strip() or MODEL
@@ -13235,6 +13440,49 @@ def _resolve_runtime_task_owner(
     return owner or None
 
 
+def _runtime_task_owner_disk_snapshot(
+    observer_session_id: str,
+    task_id: str,
+) -> tuple[list[str], str]:
+    """Read durable task authority in a worker-thread-friendly helper."""
+    sid = str(observer_session_id or "")
+    tid = str(task_id or "")
+    if not sid or not tid:
+        return [], ""
+    lineage = sess.runtime_lineage(sid) or [sid]
+    overlay = sess.get_authoritative_runtime_task_overlays(sid).get(tid, {})
+    return lineage, str(overlay.get("owner_session_id") or "")
+
+
+async def _resolve_runtime_task_owner_owned(
+    observer_session_id: str,
+    task_id: str,
+) -> str | None:
+    """Resolve task authority while keeping index/sidecar I/O off-loop."""
+    sid = str(observer_session_id or "")
+    tid = str(task_id or "")
+    if not sid or not tid:
+        return None
+    # The overwhelmingly common path is the currently attached runtime. Avoid
+    # touching disk at all when its live pin already proves ownership.
+    if tid in _sessions_with_inflight_tasks.get(sid, ()):
+        return sid
+    lineage, durable_owner = await obs.to_thread_io(
+        "chat.runtime_task_owner_read",
+        sid,
+        _runtime_task_owner_disk_snapshot,
+        sid,
+        tid,
+    )
+    # Re-check live pins after the worker returns: a rollover may have linked a
+    # successor while storage was slow, and live process ownership outranks a
+    # replicated UI overlay.
+    for candidate in lineage:
+        if tid in _sessions_with_inflight_tasks.get(candidate, ()):
+            return candidate
+    return durable_owner or None
+
+
 def _settle_background_task(session_id: str, task_id: str) -> bool:
     """Unpin a background task ONCE, from whichever path observes its terminal
     TaskNotification first — the in-turn dispatch or the cross-turn watcher.
@@ -13324,6 +13572,36 @@ def _on_task_settled(
         return False
     # NO push here — see docstring.
     return True
+
+
+async def _on_task_settled_owned(
+    session_id: str,
+    task_id: str,
+    *,
+    status: str | None = None,
+    tool_use_id: str | None = None,
+    summary: str | None = None,
+    output_file: str | None = None,
+    usage: dict | None = None,
+) -> bool | None:
+    """Event-loop-safe settlement used by live SDK message handlers."""
+    async with _runtime_task_storage_lock_for(session_id):
+        owner = await _resolve_runtime_task_owner_owned(session_id, task_id)
+        if owner is None or owner != session_id:
+            return None
+        await _runtime_task_overlay_owned(
+            session_id,
+            task_id,
+            state=str(status or "done"),
+            tool_use_id=tool_use_id,
+            summary=summary,
+            output_file=output_file,
+            usage=usage,
+        )
+        settled = _settle_background_task(session_id, task_id)
+        if not settled:
+            return False
+        return True
 
 
 def _render_continuation_message(msg, state: dict):
@@ -13452,8 +13730,14 @@ async def _watch_inflight_tasks(
     # The continuation is a real assistant turn for display/accounting even
     # though it has no user bubble.  Keep the session's public model id on its
     # broadcast so live and persisted footers do not reload with a blank model.
+    continuation_meta = await obs.to_thread_io(
+        "chat.background_session_read",
+        session_id,
+        sess.get_session_meta,
+        session_id,
+    )
     continuation_model = str(
-        (sess.get_session_meta(session_id) or {}).get("model") or "")
+        (continuation_meta or {}).get("model") or "")
 
     def _owns_generation() -> bool:
         return (generation is None
@@ -13778,7 +14062,7 @@ async def _watch_inflight_tasks(
             if not task_id or task_id not in pending:
                 continue
             status = terminal.get("status") or None
-            outcome = _on_task_settled(
+            outcome = await _on_task_settled_owned(
                 session_id, task_id, status=status,
                 tool_use_id=terminal.get("tool_use_id"),
                 summary=terminal.get("summary"),
@@ -13809,7 +14093,7 @@ async def _watch_inflight_tasks(
         """Publish a stopped terminal only after the owner process is gone."""
         nonlocal last_settle_status
         for task_id in tuple(pending):
-            outcome = _on_task_settled(
+            outcome = await _on_task_settled_owned(
                 session_id, task_id, status="stopped",
                 summary="后台任务超过安全运行时限，已终止其运行环境。")
             if outcome is None:
@@ -13990,7 +14274,7 @@ async def _watch_inflight_tasks(
                     # task the in-turn dispatch already surfaced isn't
                     # double-fired here.
                     tid = getattr(msg, "task_id", "") or ""
-                    won_typed = _on_task_settled(
+                    won_typed = await _on_task_settled_owned(
                         session_id, tid,
                         status=getattr(msg, "status", None),
                         tool_use_id=getattr(msg, "tool_use_id", None),
@@ -14019,7 +14303,7 @@ async def _watch_inflight_tasks(
                     terminal = _terminal_task_update(msg)
                     if terminal is not None:
                         tid = terminal["task_id"]
-                        won_updated = _on_task_settled(
+                        won_updated = await _on_task_settled_owned(
                             session_id, tid, status=terminal["status"],
                             tool_use_id=terminal.get("tool_use_id"),
                             summary=terminal.get("summary"),
@@ -14051,7 +14335,7 @@ async def _watch_inflight_tasks(
                     tid = getattr(msg, "task_id", "") or ""
                     desc = getattr(msg, "description", None)
                     accepted_start = (
-                        bool(tid) and _record_background_task_launch(
+                        bool(tid) and await _record_background_task_launch_owned(
                             session_id,
                             tid,
                             tool_use_id=getattr(msg, "tool_use_id", None),
@@ -14095,7 +14379,7 @@ async def _watch_inflight_tasks(
                     won: list[dict[str, Any]] = []
                     for n in notifs:
                         tid = n.get("task_id") or ""
-                        outcome = _on_task_settled(
+                        outcome = await _on_task_settled_owned(
                             session_id, tid,
                             status=n.get("status") or None,
                             tool_use_id=n.get("tool_use_id") or None,
@@ -14228,7 +14512,8 @@ async def _watch_inflight_tasks(
                         f"exc={type(e).__name__}\n")
         if (_owns_generation()
                 and not _sessions_with_inflight_tasks.get(session_id)):
-            _release_active_turn_sidecar(session_id)
+            await _settle_active_turn_sidecar_owned(
+                session_id, release=True)
 
 
 def _merge_session_inflight(
@@ -14415,6 +14700,10 @@ async def _finish_cancelled_startup(
                         f"exc={type(exc).__name__}\n"
                     )
             await _finish_activity(session_id, broadcast, "cancelled")
+            await _settle_active_turn_sidecar_owned(
+                session_id,
+                release=bool(snapshot_ready or broadcast.queue_item_id),
+            )
             async with _lock:
                 if not broadcast.done:
                     broadcast.perf_status = "cancelled"
@@ -14429,10 +14718,6 @@ async def _finish_cancelled_startup(
                 broadcast._startup_queue_settled = queue_settled
                 if not sess.session_is_deleting(session_id):
                     _remember_recent_turn(session_id, broadcast)
-                if snapshot_ready or broadcast.queue_item_id:
-                    _delete_active_turn_sidecar(session_id)
-                else:
-                    _retain_active_turn_for_recovery(session_id)
                 if _active_turns.get(session_id) is broadcast:
                     _active_turns.pop(session_id, None)
             return queue_settled
@@ -14580,10 +14865,7 @@ async def _abort_turn_startup(
                         f"exc={type(exc).__name__}\n"
                     )
 
-            if broadcast.queue_item_id:
-                # The durable queue row owns the original text/attachment ids.
-                _delete_active_turn_sidecar(session_id)
-            else:
+            if not broadcast.queue_item_id:
                 visible_error = error_text or (
                     "Turn submission was interrupted before reaching "
                     "canonical history."
@@ -14605,10 +14887,13 @@ async def _abort_turn_startup(
                         f"[chat] startup snapshot failed "
                         f"sid={session_id[:8]} exc={type(exc).__name__}\n"
                     )
-                if snapshot_ready:
-                    _delete_active_turn_sidecar(session_id)
-                else:
-                    _retain_active_turn_for_recovery(session_id)
+
+            # Queue ownership or a durable snapshot supersedes the pending
+            # intent. Otherwise retain it as restart-visible recovery state.
+            await _settle_active_turn_sidecar_owned(
+                session_id,
+                release=bool(broadcast.queue_item_id or snapshot_ready),
+            )
 
             await _finish_activity(session_id, broadcast, status)
             # Keep the reservation until every durable owner above is settled.
@@ -16364,7 +16649,7 @@ async def _start_turn(
                     # the path that settles first surfaces the completion
                     # (sync check, no await between gate and emit → no
                     # double-fire).
-                    if tid and not _on_task_settled(
+                    if tid and not await _on_task_settled_owned(
                             session_id, tid, status=n.get("status") or None,
                             tool_use_id=n.get("tool_use_id") or None,
                             summary=n.get("summary") or None,
@@ -16409,7 +16694,7 @@ async def _start_turn(
                                     f"missed sid={session_id[:8]} "
                                     f"task={obs.short_id(tid)}\n")
                                 desc = bg_launch_desc.get(tu_id)
-                                recorded = _record_background_task_launch(
+                                recorded = await _record_background_task_launch_owned(
                                     session_id, tid,
                                     tool_use_id=tu_id,
                                     description=desc,
@@ -16462,7 +16747,7 @@ async def _start_turn(
                     "description": getattr(msg, "description", None),
                 }
                 if tid:
-                    accepted_start = _record_background_task_launch(
+                    accepted_start = await _record_background_task_launch_owned(
                         session_id, tid,
                         tool_use_id=info["tool_use_id"],
                         description=info["description"])
@@ -16509,7 +16794,7 @@ async def _start_turn(
                 # payload can carry a summary/output_file the patch lacked, and
                 # the card merge is idempotent) but is flagged so the client
                 # treats it as a card patch rather than a fresh notification.
-                settled = _on_task_settled(
+                settled = await _on_task_settled_owned(
                     session_id, tid, status=status,
                     tool_use_id=getattr(msg, "tool_use_id", None),
                     summary=summary,
@@ -16537,7 +16822,7 @@ async def _start_turn(
                 if terminal is None:
                     return
                 tid = terminal["task_id"]
-                won_updated = _on_task_settled(
+                won_updated = await _on_task_settled_owned(
                     session_id, tid, status=terminal["status"],
                     tool_use_id=terminal.get("tool_use_id"),
                     summary=terminal.get("summary"),
@@ -17826,7 +18111,8 @@ async def _start_turn(
             if ((not turn_errored and not broadcast.cancelled)
                     or broadcast.failed_snapshot_persisted
                     or broadcast.cancelled_snapshot_persisted):
-                _release_active_turn_sidecar(session_id)
+                await _settle_active_turn_sidecar_owned(
+                    session_id, release=True)
             # Server-side queue drain (Option B). Now that _active_turns no
             # longer holds this sid, advance the queue:
             #   - errored → pause the queue (don't cascade failures headlessly;
@@ -17965,7 +18251,12 @@ def _schedule_queue_drain_retry(session_id: str, delay_s: float = 1.0) -> None:
 
     async def _retry() -> None:
         await asyncio.sleep(delay_s)
-        queue = sess.get_queue(session_id)
+        queue = await obs.to_thread_io(
+            "chat.queue_retry_read",
+            session_id,
+            sess.get_queue,
+            session_id,
+        )
         if queue.get("paused") or not (
             queue.get("items") or queue.get("inflight")
         ):
@@ -18008,7 +18299,12 @@ async def _maybe_drain_queue(session_id: str) -> None:
     item is restored to the queue head so nothing is dropped. A start failure
     additionally pauses the queue (mirrors the turn-errored policy)."""
     async with _queue_drain_lock_for(session_id):
-        runtime_meta = sess.get_session_meta(session_id) or {}
+        runtime_meta = await obs.to_thread_io(
+            "chat.queue_session_read",
+            session_id,
+            sess.get_session_meta,
+            session_id,
+        ) or {}
         successor_sid = str(runtime_meta.get("runtime_successor") or "")
         if runtime_meta.get("runtime_shadow"):
             if successor_sid:
@@ -18072,7 +18368,12 @@ async def _maybe_drain_queue(session_id: str) -> None:
             )
             sys.stderr.flush()
             return
-        if _runtime_lineage_has_ready_continuation(session_id):
+        if await obs.to_thread_io(
+            "chat.runtime_continuation_ready_read",
+            session_id,
+            _runtime_lineage_has_ready_continuation,
+            session_id,
+        ):
             return
         item = await obs.to_thread_io(
             "chat.queue_claim",

@@ -3254,6 +3254,106 @@ def test_initial_active_turn_persistence_runs_off_event_loop(stream_env):
     assert "broadcast," in write_block
 
 
+@pytest.mark.asyncio
+async def test_background_task_persistence_does_not_block_event_loop(
+    stream_env, monkeypatch,
+):
+    """Slow session storage must not freeze unrelated requests/SSE ticks."""
+    import time
+
+    sid = "12345678-background-io"
+    task_id = "task-slow-storage"
+
+    def slow_overlay_read(_sid):
+        time.sleep(0.04)
+        return {}
+
+    def slow_overlay_write(*_args, **_kwargs):
+        time.sleep(0.04)
+
+    monkeypatch.setattr(
+        stream_env.sess,
+        "get_authoritative_runtime_task_overlays",
+        slow_overlay_read,
+    )
+    monkeypatch.setattr(
+        stream_env, "_runtime_task_overlay", slow_overlay_write)
+
+    ticks = 0
+    running = True
+
+    async def ticker():
+        nonlocal ticks
+        while running:
+            ticks += 1
+            await asyncio.sleep(0.001)
+
+    ticker_task = asyncio.create_task(ticker())
+    try:
+        assert await stream_env._record_background_task_launch_owned(
+            sid,
+            task_id,
+            tool_use_id="tool-slow-storage",
+            description="slow storage",
+        ) is True
+        stream_env._pin_background_task(sid, task_id)
+        assert await stream_env._on_task_settled_owned(
+            sid,
+            task_id,
+            status="completed",
+        ) is True
+    finally:
+        running = False
+        await ticker_task
+        stream_env._sessions_with_inflight_tasks.pop(sid, None)
+        stream_env._bg_task_descriptions.pop(task_id, None)
+        stream_env._bg_task_tool_use_ids.pop(task_id, None)
+        stream_env._bg_task_pinned_at.pop(task_id, None)
+
+    assert ticks >= 20
+
+
+@pytest.mark.asyncio
+async def test_active_turn_sidecar_cleanup_does_not_block_event_loop(
+    stream_env, monkeypatch,
+):
+    import time
+
+    def slow_delete(_sid):
+        time.sleep(0.05)
+
+    monkeypatch.setattr(
+        stream_env, "_delete_active_turn_sidecar", slow_delete)
+    cleanup = asyncio.create_task(
+        stream_env._settle_active_turn_sidecar_owned(
+            "12345678-sidecar-io", release=True))
+    await asyncio.sleep(0.005)
+    assert cleanup.done() is False
+    # A callback scheduled on the shared loop still runs while the worker owns
+    # the deliberately slow unlink.
+    heartbeat = asyncio.Event()
+    asyncio.get_running_loop().call_soon(heartbeat.set)
+    await asyncio.wait_for(heartbeat.wait(), timeout=0.02)
+    await asyncio.wait_for(cleanup, timeout=1)
+
+
+def test_client_storage_preflight_runs_off_event_loop(stream_env):
+    """Cold-start metadata, trust and MCP config reads are blocking I/O."""
+    import inspect
+
+    source = inspect.getsource(stream_env._build_and_connect_client)
+    for site in (
+        '"chat.client_session_read"',
+        '"chat.client_transcript_probe"',
+        '"chat.client_plugin_path"',
+        '"chat.vendor_workspace_trust"',
+        '"chat.mcp_config_read"',
+    ):
+        at = source.index(site)
+        block = source[source.rfind("await obs.to_thread_io(", 0, at):at]
+        assert "await obs.to_thread_io(" in block
+
+
 def test_continuation_footer_is_durable_before_terminal_publish(stream_env):
     """Offload the exact-UUID sidecar write without reopening the reload race."""
     import inspect
@@ -7624,9 +7724,14 @@ async def test_admission_cancellation_releases_reserved_turn(
     sid = "admission-cancelled"
     entered = asyncio.Event()
 
-    async def gated_intent(*_args, **_kwargs):
-        entered.set()
-        await asyncio.Event().wait()
+    async def gated_intent(site, _sid, func, *args, **kwargs):
+        if site == "chat.active_turn_admit":
+            entered.set()
+            await asyncio.Event().wait()
+        kwargs.pop("file_path", None)
+        kwargs.pop("file_size", None)
+        kwargs.pop("owned", None)
+        return func(*args, **kwargs)
 
     monkeypatch.setattr(chat.obs, "to_thread_io", gated_intent)
     monkeypatch.setattr(

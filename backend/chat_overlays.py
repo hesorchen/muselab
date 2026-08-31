@@ -237,6 +237,21 @@ def _runtime_continuation_outbox_event_ids(source_sid: str) -> list[str]:
     return sorted(set(event_ids))
 
 
+def _unlink_best_effort(path: Path) -> None:
+    with suppress(OSError):
+        path.unlink(missing_ok=True)
+
+
+def _ready_runtime_continuations(
+    owner_sids: list[str],
+) -> list[tuple[str, str]]:
+    return [
+        (owner_sid, event_id)
+        for owner_sid in owner_sids
+        for event_id in _runtime_continuation_outbox_event_ids(owner_sid)
+    ]
+
+
 def _runtime_lineage_has_ready_continuation(leaf_sid: str) -> bool:
     """Whether a visible leaf still has an ancestor READY projection."""
     lineage = sess.runtime_lineage(leaf_sid) or [leaf_sid]
@@ -581,8 +596,7 @@ async def _deliver_runtime_continuation_outbox(
             if source_meta is None or sess.session_is_deleting(source_sid):
                 path = _runtime_continuation_outbox_path(source_sid, event_id)
                 if path is not None:
-                    with suppress(OSError):
-                        path.unlink(missing_ok=True)
+                    await asyncio.to_thread(_unlink_best_effort, path)
                 return False
             lineage = await asyncio.to_thread(sess.runtime_lineage, source_sid)
             if lineage != observed_lineage:
@@ -601,8 +615,7 @@ async def _deliver_runtime_continuation_outbox(
                     path = _runtime_continuation_outbox_path(
                         source_sid, event_id)
                     if path is not None:
-                        with suppress(OSError):
-                            path.unlink(missing_ok=True)
+                        await asyncio.to_thread(_unlink_best_effort, path)
                     return False
         if lineage_changed:
             await asyncio.sleep(0)
@@ -651,13 +664,12 @@ async def _deliver_runtime_continuation_outbox(
         if delivered:
             path = _runtime_continuation_outbox_path(source_sid, event_id)
             if path is not None:
-                with suppress(OSError):
-                    path.unlink(missing_ok=True)
+                await asyncio.to_thread(_unlink_best_effort, path)
             # A queued turn may have deferred itself while this READY record was
             # waiting for the leaf boundary. Re-kick after the presentation
             # commit; the drain's own active/paused checks remain authoritative.
             with suppress(Exception):
-                queued = sess.get_queue(leaf_sid)
+                queued = await asyncio.to_thread(sess.get_queue, leaf_sid)
                 if queued.get("items") or queued.get("inflight"):
                     _hooks.schedule_queue_drain(leaf_sid)
             return True
@@ -674,9 +686,9 @@ async def _flush_runtime_continuations_at_turn_boundary(
     The source-lock pass is a commit barrier for initial forks: once each lock
     has been acquired and released, a visible link cannot still roll back.  The
     leaf rollover/runtime locks then serialize this display boundary with a
-    later fork or query.  Outbox-directory rescans are synchronous and tiny so
-    there is no event-loop yield between observing "empty" and returning to the
-    caller that will release/reserve ``_hooks.active_turns``.
+    later fork or query. Outbox-directory rescans run in a worker so storage
+    latency cannot stall unrelated sessions while these locks preserve the
+    release/reservation boundary for ``_hooks.active_turns``.
     """
     _hooks = _require_hooks()
     lineage = await asyncio.to_thread(sess.runtime_lineage, leaf_sid)
@@ -709,12 +721,8 @@ async def _flush_runtime_continuations_at_turn_boundary(
                 return 0
 
             while True:
-                ready = [
-                    (owner_sid, event_id)
-                    for owner_sid in fresh_owners
-                    for event_id in _runtime_continuation_outbox_event_ids(
-                        owner_sid)
-                ]
+                ready = await asyncio.to_thread(
+                    _ready_runtime_continuations, fresh_owners)
                 if not ready:
                     return delivered
                 progressed = False
@@ -741,8 +749,7 @@ async def _flush_runtime_continuations_at_turn_boundary(
                     path = _runtime_continuation_outbox_path(
                         owner_sid, event_id)
                     if path is not None:
-                        with suppress(OSError):
-                            path.unlink(missing_ok=True)
+                        await asyncio.to_thread(_unlink_best_effort, path)
                     delivered += 1
                     progressed = True
                 if not progressed:
