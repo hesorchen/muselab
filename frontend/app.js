@@ -7740,8 +7740,9 @@ function portal() {
     },
 
     // ===== sessions =====
-    // A fresh per-tab state slot. Object refs (messages, sessionUsage) live
-    // forever — we mutate in place so Alpine's reactivity stays bound.
+    // A fresh per-tab state slot. The slot itself lives forever; live streams
+    // mutate its current message objects, while owner-free canonical installs
+    // may atomically publish a replacement array through the same reactive slot.
     _blankTabState() {
       return {
         // One chronological normalized repository. messageRange owns the
@@ -7774,6 +7775,10 @@ function portal() {
         _virtualSyncFrame: 0,
         _virtualForceTail: false,
         _virtualRevision: 0,
+        // Bumped only when a quiet canonical install proves that Alpine's
+        // keyed message DOM diverged from the accepted state. The outer pane
+        // key then remounts this one transcript without disturbing other tabs.
+        _transcriptRenderEpoch: 0,
         // Attachments/controllers stay memory-only; text is restored from the
         // browser-local per-session draft store by _ensureTabState().
         draft: {
@@ -8037,6 +8042,9 @@ function portal() {
       if (!Number.isFinite(st._virtualSyncFrame)) st._virtualSyncFrame = 0;
       if (st._virtualForceTail === undefined) st._virtualForceTail = false;
       if (!Number.isFinite(st._virtualRevision)) st._virtualRevision = 0;
+      if (!Number.isInteger(st._transcriptRenderEpoch)) {
+        st._transcriptRenderEpoch = 0;
+      }
       if (st.activeTurnId === undefined) st.activeTurnId = "";
       if (st._lastTerminalTurnId === undefined) st._lastTerminalTurnId = "";
       if (st.parentTurnId === undefined) st.parentTurnId = "";
@@ -10254,6 +10262,11 @@ function portal() {
       }
       return warm;
     },
+    transcriptPaneKey(tid) {
+      const st = tid && this.tabState && this.tabState[tid];
+      return String(tid || "") + ":" + Math.max(
+        0, Number(st && st._transcriptRenderEpoch) || 0);
+    },
     _chatBodyElement() {
       // chatBody lives below a nested x-data scope (`activeSession` façade).
       // Alpine does not expose descendant component refs through the root
@@ -10274,6 +10287,73 @@ function portal() {
       const pane = this._paneElement(tid);
       if (!pane || !key) return null;
       return pane.querySelector(`.msg[data-message-key="${CSS.escape(key)}"]`);
+    },
+    _transcriptDomMatchesState(tid, st) {
+      if (!tid || !st || this.tabState[tid] !== st) return false;
+      const pane = this._paneElement(tid);
+      // An evicted/never-mounted background pane will build from state when it
+      // next becomes warm; there is no resident DOM to reconcile now.
+      if (!pane) return true;
+      const expected = this._visiblePaneMessages(st);
+      const nodes = Array.from(
+        pane.querySelectorAll(":scope > .msg[data-message-key]"));
+      if (nodes.length !== expected.length) return false;
+      const unique = new Set();
+      for (let index = 0; index < expected.length; index += 1) {
+        const message = expected[index];
+        const key = String(message && message._k || "");
+        if (!key || unique.has(key)) return false;
+        unique.add(key);
+        const node = nodes[index];
+        if (node.dataset.messageKey !== key
+            || String(node.dataset.uuid || "")
+              !== String(message && message.uuid || "")) return false;
+      }
+      return true;
+    },
+    async _ensureTranscriptDomConverged(tid, st, options = {}) {
+      if (!tid || !st || this.tabState[tid] !== st) return false;
+      if (typeof document === "undefined" || tid !== this.currentId) return true;
+      // loadSession already awaited the keyed-list update once. One additional
+      // Alpine tick lets dependent bindings (uuid/footer/index getters) settle
+      // before treating a mismatch as structural rather than merely scheduled.
+      await new Promise(resolve => this.$nextTick(resolve));
+      if (this.tabState[tid] !== st) return false;
+      // The canonical state remains valid if the user switches tabs during the
+      // tick. Its pane is hidden/evicted state now and will mount from that
+      // canonical array on activation; DOM convergence must not abort the
+      // metadata/watermark half of this successful history transaction.
+      if (tid !== this.currentId) return true;
+      if (this._transcriptDomMatchesState(tid, st)) return true;
+
+      // A successor can claim the pane while Alpine is settling the canonical
+      // array. Never remount a pane after live ownership has started; let the
+      // caller's takeover path retain the stream and retry canonical sync once
+      // that owner settles.
+      if (st.streaming || st.es || this._hasAdmissionBubble(st)) return false;
+
+      // Alpine 3.14's keyed x-for mover can leave its lookup and physical nodes
+      // out of sync after a large live→canonical replacement. Re-key only this
+      // pane, and only after proving divergence; normal reconciles retain every
+      // mounted message node and its selection/observer state.
+      st._transcriptRenderEpoch += 1;
+      await new Promise(resolve => this.$nextTick(resolve));
+      if (this.tabState[tid] !== st) return false;
+      if (tid !== this.currentId) return true;
+      if (st.streaming || st.es || this._hasAdmissionBubble(st)) return false;
+      const scrollEl = options.scrollEl || this._chatBodyElement();
+      if (options.followTail) {
+        st.atBottom = true;
+        this._scrollChatTailNow(tid, st);
+      } else if (scrollEl && options.anchor) {
+        if (!this._restoreMessageAnchor(scrollEl, options.anchor)
+            && Number.isFinite(options.scrollTop)) {
+          scrollEl.scrollTop = options.scrollTop;
+        }
+      } else if (scrollEl && Number.isFinite(options.scrollTop)) {
+        scrollEl.scrollTop = options.scrollTop;
+      }
+      return this._transcriptDomMatchesState(tid, st);
     },
     paneState(tid) {
       if (!tid) return null;
@@ -16368,8 +16448,8 @@ function portal() {
       // at the compact summary and can't reach it). Records st._fullLoaded
       // so the jump retry doesn't loop re-requesting full mode.
       const full = !!opts.full;
-      // quiet:true → in-place message refresh with NO skeleton + a scroll-
-      // preserving morph swap. Used by the open-session auto-resync
+      // quiet:true → identity-preserving message refresh with NO skeleton + a
+      // scroll-preserving keyed swap. Used by the open-session auto-resync
       // (_reconcileOpenSession) so a background poll that pulls newly-finished
       // messages never blanks the conversation or jumps the scroll. Cold opens
       // and tab switches keep the normal skeleton + chunked-reveal path.
@@ -16586,8 +16666,11 @@ function portal() {
             || !this._historyReplaceStillOwns(st, historyReplaceToken)) {
           return false;
         }
-        // Replace the one repository in place. Quiet reconciliation preserves
-        // matching message object identity; cold reveal changes only range coords.
+        // Publish the canonical repository atomically. A 100-row in-place
+        // splice schedules a long sequence of reactive index mutations and can
+        // make Alpine's keyed mover observe an inconsistent intermediate
+        // lookup. The matched message objects and their `_k` values are still
+        // reused, so stable bubbles keep their DOM identity on the normal path.
         if (st.streaming || st.es || this._hasAdmissionBubble(st)) return false;
         // _virtualStart/_virtualEnd are LOCAL to the revealed slice. A quiet
         // canonical refresh can move visibleStart from a narrow recent tail to
@@ -16625,7 +16708,8 @@ function portal() {
         const quietEnd = quietRangeResolved ? quietRangeResolved.end : startIdx;
         st.messageRange.visibleStart = quiet ? quietStart : startIdx;
         st.messageRange.visibleEnd = quiet ? quietEnd : startIdx;
-        st.messages.splice(0, st.messages.length, ...all);
+        st.messages = all;
+        _paneMessageIndexCache.delete(st);
         Object.assign(st.messageRange, {
           visibleStart: quiet ? quietStart : startIdx,
           visibleEnd: quiet ? quietEnd : startIdx,
@@ -16662,6 +16746,19 @@ function portal() {
         // response coordinates. Canonical envelopes remain untouched.
         this._scheduleHistoryViewport(st, "newer");
         this._syncSessionMessageStore(st);
+        if (quiet && sid === this.currentId) {
+          const domConverged = await this._ensureTranscriptDomConverged(sid, st, {
+            scrollEl: quietScrollEl,
+            scrollTop: quietScrollTop,
+            anchor: quietAnchor,
+            followTail: followTailAtInstall,
+          });
+          if (!domConverged || this.tabState[sid] !== st
+              || st.streaming || st.es || this._hasAdmissionBubble(st)
+              || !this._historyReplaceStillOwns(st, historyReplaceToken)) {
+            return false;
+          }
+        }
         st._hasMoreHistory = st.messageRange.visibleStart > 0
           || st.messageRange.offset > 0 || this._preCompactReachable(st);
         // Remember whether this load pulled the full raw-JSONL history, so

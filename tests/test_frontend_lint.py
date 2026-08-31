@@ -1333,7 +1333,8 @@ def test_session_sync_transitions_preserve_canonical_and_view_ownership():
 
     # Synchronization changes only the canonical per-tab repository. Keep the
     # ordered messages + range model and composer ownership established earlier.
-    assert "st.messages.splice(0, st.messages.length, ...all)" in app
+    assert "st.messages = all" in app
+    assert "_paneMessageIndexCache.delete(st)" in app
     assert "Object.assign(st.messageRange" in app
     assert "child.messages = cloneMessages(sourceState.messages)" in app
     assert "child.messageRange = { ...sourceState.messageRange }" in app
@@ -2736,7 +2737,7 @@ def test_runtime_ui_revision_rejects_out_of_order_session_response():
     assert response in load
     assert current in load
     assert stale_guard in load
-    assert load.index(stale_guard) < load.index("st.messages.splice(")
+    assert load.index(stale_guard) < load.index("st.messages = all")
     assert load.index(stale_guard) < load.index(
         "st.runtimeUiRevision = loadedRuntimeUiRevision")
 
@@ -3158,6 +3159,7 @@ def test_fork_banner_and_message_template_are_null_and_key_safe():
     html = (FRONTEND / "index.html").read_text(encoding="utf-8")
 
     assert "currentForkSource()?.name || ''" in html
+    assert ':key="transcriptPaneKey(tid)"' in html
     assert 'x-for="m in paneMsgs" :key="m._k"' in html
     assert "paneMessageIndex(tid, m)" in html
     assert 'get i(){ return paneMessageIndex(tid, m) }' in html
@@ -3882,12 +3884,26 @@ def test_quiet_canonical_reload_rebases_virtual_window_before_alpine_paints():
     load_end = app.index("// Warm OPEN-but-inactive tabs", load_start)
     load = app[load_start:load_end]
     capture = "const virtualWindowBeforeInstall = quiet"
-    splice = "st.messages.splice(0, st.messages.length, ...all)"
+    publish = "st.messages = all"
     assign = "Object.assign(st.messageRange"
     rebase = "this._rebaseMessageVirtualWindow("
     assert capture in load
     assert rebase in load
-    assert load.index(capture) < load.index(splice) < load.index(assign) < load.index(rebase)
+    assert load.index(capture) < load.index(publish) < load.index(assign) < load.index(rebase)
+    assert load.index(publish) < load.index("_paneMessageIndexCache.delete(st)")
+    assert "await this._ensureTranscriptDomConverged(sid, st" in load
+    assert "st._transcriptRenderEpoch += 1" in app
+    assert "this._transcriptDomMatchesState(tid, st)" in app
+    assert "if (this.tabState[tid] !== st) return false;" in app
+    assert "if (tid !== this.currentId) return true;" in app
+    converge_start = app.index("    async _ensureTranscriptDomConverged(tid, st")
+    converge_end = app.index("\n    paneState(tid)", converge_start)
+    converge = app[converge_start:converge_end]
+    mismatch = "if (this._transcriptDomMatchesState(tid, st)) return true;"
+    takeover = "if (st.streaming || st.es || this._hasAdmissionBubble(st)) return false;"
+    remount = "st._transcriptRenderEpoch += 1"
+    assert converge.index(mismatch) < converge.index(takeover) < converge.index(remount)
+    assert converge.count(takeover) == 2
     assert "opts.followTail === true" in load
     assert "this._resolveMessageRangeSnapshot(all, quietRangeSnapshot)" in load
     assert "if (quiet && !quietRangeResolved)" in load
@@ -5836,7 +5852,7 @@ def test_canonical_history_load_never_reports_stream_takeover_as_success():
     assert "if (st.streaming || st.es) return true;" not in load
     assert "if (this.tabState[sid] !== st || st.streaming || st.es) return true;" not in load
     assert "st._installedCanonicalCount = Math.max(" in load
-    assert load.index("st.messages.splice(0, st.messages.length, ...all)") < load.index(
+    assert load.index("st.messages = all") < load.index(
         "st._installedCanonicalCount = Math.max("
     )
 

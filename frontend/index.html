@@ -1950,7 +1950,7 @@
           <!-- Keep a bounded set of recent transcript panes mounted as an LRU DOM
                cache. Each pane exposes only its messageRange window; hidden panes
                retain keyed state but remain out of layout. -->
-          <template x-for="tid in warmTranscriptTabIds()" :key="tid">
+          <template x-for="tid in warmTranscriptTabIds()" :key="transcriptPaneKey(tid)">
           <div class="msg-pane"
                x-show="tid === currentId"
                x-cloak

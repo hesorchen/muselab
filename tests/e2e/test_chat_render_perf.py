@@ -6689,6 +6689,169 @@ def test_live_turn_keeps_resident_messages_but_bounds_mounted_rows(
     _assert_no_browser_errors(page, errors)
 
 
+def test_repeated_tool_turn_then_fast_canonical_turns_keep_exact_dom_order(
+    page: Page, backend_url, auth_token,
+):
+    """Successive quiet installs must converge the keyed DOM without reload."""
+    errors = _capture_browser_errors(page)
+    page.set_viewport_size({"width": 1440, "height": 900})
+    _login(page, backend_url, auth_token)
+
+    result = page.evaluate(
+        """async () => {
+          const app = document.querySelector("#app")._x_dataStack[0];
+          const sid = "canonical-dom-fast-turns";
+          app.refreshSessions = async () => {};
+          app._fetchTabUsage = async () => {};
+          app._scheduleIdlePreload = () => {};
+          app.sessions = [{id: sid, name: "Canonical DOM", model: "e2e-model"}];
+          app.openTabIds = [sid];
+          app.tabState = {};
+          app.currentId = sid;
+          const st = app._ensureTabState(sid);
+          st._loaded = true;
+          st.messagesReady = true;
+          st.messagesLoading = false;
+          st.atBottom = true;
+          const canonical = [];
+          const addCanonical = message => {
+            canonical.push({...message, block_id: `${message.uuid}:0:${message.role}`});
+          };
+          const settle = async () => {
+            let next = app._historyEnvelopes(
+              sid, canonical.map(message => ({...message, _noAnim: true})));
+            next = app._preserveCanonicalMessageIdentity(st, next);
+            st.messageRange.visibleStart = Math.max(0, next.length - 100);
+            st.messageRange.visibleEnd = next.length;
+            st.messageRange.total = next.length;
+            st.messages = next;
+            app._syncSessionMessageStore(st);
+            await new Promise(resolve => app.$nextTick(
+              () => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+          };
+          const live = message => app._appendLiveMessage(st, message);
+
+          for (let i = 0; i < 70; i++) {
+            addCanonical({role: "assistant", text: `OLDER ${i}`,
+                          uuid: `older-${i}`});
+          }
+          addCanonical({role: "user", text: "RUN TEN LS",
+                        uuid: "prior-turn-user", _turnRoot: true});
+          for (let i = 0; i < 10; i++) {
+            const id = `prior-tool-${i}`;
+            addCanonical({role: "tool_use", name: "Bash", text: "ls", id,
+                          uuid: `prior-tool-use-${i}`});
+            addCanonical({role: "tool_result", tool_name: "Bash",
+                          text: "same output", preview: "same output", id,
+                          tool_use_id: id, uuid: `prior-tool-result-${i}`});
+          }
+          addCanonical({role: "assistant", text: "TEN LS DONE",
+                        uuid: "prior-turn-final", turn_status: "completed"});
+          await settle();
+
+          live({role: "user", text: "RUN TEN LS", _turnRoot: true});
+          addCanonical({role: "user", text: "RUN TEN LS", uuid: "turn-a-user",
+                        _turnRoot: true});
+          for (let i = 0; i < 10; i++) {
+            const id = `tool-${i}`;
+            live({role: "tool_use", name: "Bash", text: "ls", id});
+            addCanonical({role: "tool_use", name: "Bash", text: "ls", id,
+                          uuid: `turn-a-tool-use-${i}`});
+            live({role: "tool_result", tool_name: "Bash", text: "same output",
+                  preview: "same output", id, tool_use_id: id});
+            addCanonical({role: "tool_result", tool_name: "Bash",
+                          text: "same output", preview: "same output", id,
+                          tool_use_id: id, uuid: `turn-a-tool-result-${i}`});
+            if (i === 0) {
+              live({role: "user", text: "test", uuid: "midturn-user",
+                    _steeringAdjustment: true, _turnRoot: false});
+              addCanonical({role: "user", text: "test",
+                            uuid: "midturn-user", _steeringAdjustment: true,
+                            _turnRoot: false});
+            }
+          }
+          live({role: "assistant", text: "TEN LS DONE", forkUuid: "turn-a-final"});
+          addCanonical({role: "assistant", text: "TEN LS DONE",
+                        uuid: "turn-a-final", turn_status: "completed"});
+
+          for (const [index, prompt, reply] of [
+            [1, "test", "TEST REPLY"],
+            [2, "test3", "TEST3 REPLY"],
+            [3, "stop", "STOP REPLY"],
+          ]) {
+            live({role: "user", text: prompt, _turnRoot: true,
+                  _turnId: `turn-${index}`});
+            live({role: "assistant", text: reply,
+                  forkUuid: `turn-${index}-assistant`});
+            addCanonical({role: "user", text: prompt,
+                          uuid: `turn-${index}-user`, _turnRoot: true});
+            addCanonical({role: "assistant", text: reply,
+                          uuid: `turn-${index}-assistant`,
+                          turn_status: "completed"});
+          }
+          await settle();
+
+          const pane = document.querySelector(
+            `.msg-pane[data-tid="${CSS.escape(sid)}"]`);
+          const visible = st.messages.slice(
+            st.messageRange.visibleStart, st.messageRange.visibleEnd);
+          const stateKeys = visible.map(message => message._k);
+          const stateRows = visible.map(message =>
+            `${message.role}:${message.text || message.preview || ""}`);
+          const dom = Array.from(pane.querySelectorAll(":scope > .msg"));
+          const initial = {
+            stateKeys,
+            stateRows,
+            domKeys: dom.map(node => node.dataset.messageKey),
+            domRows: dom.map(node => {
+              const message = (node._x_dataStack || [])
+                .map(scope => scope && scope.m).find(Boolean);
+                return `${message?.role || ""}:${message?.text || message?.preview || ""}`;
+              }),
+          };
+          const epochBeforeRepair = st._transcriptRenderEpoch;
+          dom[Math.floor(dom.length / 2)].remove();
+          const repaired = await app._ensureTranscriptDomConverged(
+            sid, st, {followTail: true});
+          await new Promise(resolve => app.$nextTick(
+            () => requestAnimationFrame(resolve)));
+          const epochBeforeSwitch = st._transcriptRenderEpoch;
+          const switchedCheck = app._ensureTranscriptDomConverged(sid, st);
+          app.currentId = "another-open-tab";
+          const switchedAwayAccepted = await switchedCheck;
+          app.currentId = sid;
+          app._activateTabState(sid);
+          await new Promise(resolve => app.$nextTick(resolve));
+          const repairedPane = document.querySelector(
+            `.msg-pane[data-tid="${CSS.escape(sid)}"]`);
+          return {
+            initial,
+            repaired,
+            epochBeforeRepair,
+            epochAfterRepair: st._transcriptRenderEpoch,
+            repairedDomKeys: Array.from(repairedPane.querySelectorAll(
+              ":scope > .msg[data-message-key]"
+            )).map(node => node.dataset.messageKey),
+            switchedAwayAccepted,
+            epochBeforeSwitch,
+            epochAfterSwitch: st._transcriptRenderEpoch,
+          };
+        }"""
+    )
+
+    initial = result["initial"]
+    assert len(initial["stateKeys"]) == len(set(initial["stateKeys"])), result
+    assert len(initial["domKeys"]) == len(set(initial["domKeys"])), result
+    assert initial["domKeys"] == initial["stateKeys"], result
+    assert initial["domRows"] == initial["stateRows"], result
+    assert result["repaired"] is True, result
+    assert result["epochAfterRepair"] == result["epochBeforeRepair"] + 1, result
+    assert result["repairedDomKeys"] == initial["stateKeys"], result
+    assert result["switchedAwayAccepted"] is True, result
+    assert result["epochAfterSwitch"] == result["epochBeforeSwitch"], result
+    _assert_no_browser_errors(page, errors)
+
+
 def test_stale_older_response_cannot_overwrite_new_canonical_tail(
     page: Page, backend_url, auth_token,
 ):
