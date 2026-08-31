@@ -7172,11 +7172,10 @@ def test_stable_message_identity_needs_no_repair_telemetry(
           st._loaded = true;
           const payload = [
             {role: "user", text: "question", block_id: "record-1:0:user"},
-            {role: "assistant", text: "answer", block_id: "record-2:0:assistant"},
+            {role: "assistant", text: "partial answer", block_id: "record-2:0:assistant"},
             {role: "tool_result", text: "tool", block_id: "record-2:1:tool_result"},
           ];
           const first = app._historyEnvelopes(sid, payload);
-          const second = app._historyEnvelopes(sid, payload.map(message => ({...message})));
           st.messages.push(...first);
           st.messageRange.visibleEnd = st.messages.length;
           st.messageRange.total = st.messages.length;
@@ -7185,9 +7184,29 @@ def test_stable_message_identity_needs_no_repair_telemetry(
           app._ensureTabState(app.currentId).messagesReady = true;
           app._ensureTabState(app.currentId).messagesLoading = false;
           await new Promise(resolve => app.$nextTick(() => requestAnimationFrame(resolve)));
+          for (let i = 0; i < 120 && !first[1].html; i++) {
+            await new Promise(resolve => setTimeout(resolve, 10));
+          }
+          const initialHtml = first[1].html || "";
+          const second = app._historyEnvelopes(
+            sid, payload.map(message => ({...message})));
+          const completeMarker = "CANONICAL_BLOCK_REVISION_VISIBLE";
+          const revisedPayload = payload.map(message => message.role === "assistant"
+            ? {...message, text: message.text + " " + completeMarker}
+            : {...message});
+          const revised = app._historyEnvelopes(sid, revisedPayload);
+          for (let i = 0; i < 120; i++) {
+            const pane = document.querySelector(`.msg-pane[data-tid="${sid}"]`);
+            if ((first[1].html || "").includes(completeMarker)
+                && pane?.innerText.includes(completeMarker)) break;
+            await new Promise(resolve => setTimeout(resolve, 10));
+          }
+          await new Promise(resolve => app.$nextTick(
+            () => requestAnimationFrame(() => requestAnimationFrame(resolve))));
           const pane = document.querySelector(`.msg-pane[data-tid="${sid}"]`);
           const domKeys = pane ? Array.from(pane.querySelectorAll(".msg"))
             .map(el => el.dataset.messageKey) : [];
+          const assistantNode = pane?.querySelector(".msg.assistant .bubble");
           const live = Array.from({length: 25}, (_, i) => app._appendLiveMessage(st, {
             role: "thinking", text: `live ${i}`,
           }));
@@ -7198,7 +7217,15 @@ def test_stable_message_identity_needs_no_repair_telemetry(
           return {
             keys: first.map(message => message._k),
             sameObjects: first.every((message, i) => Alpine.raw(second[i]) === Alpine.raw(message)),
+            sameRevisedObject: Alpine.raw(revised[1]) === Alpine.raw(first[1]),
             domKeys,
+            initialHtml,
+            revisedText: first[1].text || "",
+            revisedHtml: first[1].html || "",
+            revisedStreamText: first[1]._streamText || "",
+            revisedStreamPlain: first[1]._streamPlain === true,
+            revisedVisible: !!assistantNode
+              && assistantNode.innerText.includes(completeMarker),
             liveKeys: live.map(message => message._k),
             followedEnd,
             hiddenEnd,
@@ -7217,7 +7244,18 @@ def test_stable_message_identity_needs_no_repair_telemetry(
         "stable-render-identity:block:record-2:1:tool_result",
     ]
     assert result["sameObjects"] is True
+    assert result["sameRevisedObject"] is True
     assert result["domKeys"] == result["keys"]
+    assert "CANONICAL_BLOCK_REVISION_VISIBLE" not in result["initialHtml"]
+    assert "CANONICAL_BLOCK_REVISION_VISIBLE" in result["revisedText"]
+    assert (
+        "CANONICAL_BLOCK_REVISION_VISIBLE" in result["revisedHtml"]
+        or (
+            result["revisedStreamPlain"] is True
+            and "CANONICAL_BLOCK_REVISION_VISIBLE" in result["revisedStreamText"]
+        )
+    )
+    assert result["revisedVisible"] is True
     assert len(result["liveKeys"]) == len(set(result["liveKeys"])) == 25
     assert all(":live:" in key for key in result["liveKeys"])
     assert result["followedEnd"] == 28
