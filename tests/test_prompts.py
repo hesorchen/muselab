@@ -45,5 +45,11 @@ def test_chat_keeps_native_skill_discovery_without_ultra_skill_hook(app_module):
     assert "_build_ultra_skill_hook" not in source
     assert 'setting_sources=["user", "project", "local"]' in source
     assert '"type": "local"' in source
-    assert '"path": str(Path(__file__).resolve().parent.parent)' in source
+    assert '"path": str(plugin_root)' in source
+    plugin_path_at = source.index('"chat.client_plugin_path"')
+    plugin_path_block = source[
+        source.rfind("await obs.to_thread_io(", 0, plugin_path_at):plugin_path_at
+    ]
+    assert "await obs.to_thread_io(" in plugin_path_block
+    assert "Path(__file__).resolve().parent.parent" in source
     assert '[] if skills_off or side_question_runtime else "all"' in source
