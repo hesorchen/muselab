@@ -249,6 +249,7 @@ const _EMPTY_ACTIVE_SESSION_PANE = Object.freeze({
   _streamStartedAt: 0,
   sessionUsage: _EMPTY_SESSION_USAGE,
   pendingQueue: Object.freeze([]),
+  _queueAdmission: null,
   _queuePaused: false,
   backgroundActive: false,
   compacting: false,
@@ -7740,8 +7741,9 @@ function portal() {
     },
 
     // ===== sessions =====
-    // A fresh per-tab state slot. Object refs (messages, sessionUsage) live
-    // forever — we mutate in place so Alpine's reactivity stays bound.
+    // A fresh per-tab state slot. The slot itself lives forever; live streams
+    // mutate its current message objects, while owner-free canonical installs
+    // may atomically publish a replacement array through the same reactive slot.
     _blankTabState() {
       return {
         // One chronological normalized repository. messageRange owns the
@@ -7774,6 +7776,10 @@ function portal() {
         _virtualSyncFrame: 0,
         _virtualForceTail: false,
         _virtualRevision: 0,
+        // Bumped only when a quiet canonical install proves that Alpine's
+        // keyed message DOM diverged from the accepted state. The outer pane
+        // key then remounts this one transcript without disturbing other tabs.
+        _transcriptRenderEpoch: 0,
         // Attachments/controllers stay memory-only; text is restored from the
         // browser-local per-session draft store by _ensureTabState().
         draft: {
@@ -7938,6 +7944,11 @@ function portal() {
         // compact-finally / activateTab. Items are {id, text,
         // pendingImages, pendingDocs, enqueuedAt}.
         pendingQueue: [],
+        // One locally submitted FIFO item whose durable queue POST has not
+        // acknowledged yet. It renders after the authoritative queue mirror,
+        // never inside transcript messages, so the first optimistic frame is
+        // already the correct queue tail.
+        _queueAdmission: null,
         // Set to true when a turn errors out while the queue is non-empty.
         // Stops auto-drain so the user explicitly chooses to resume vs
         // discard (auto-draining post-failure would burn tokens on a
@@ -8037,6 +8048,9 @@ function portal() {
       if (!Number.isFinite(st._virtualSyncFrame)) st._virtualSyncFrame = 0;
       if (st._virtualForceTail === undefined) st._virtualForceTail = false;
       if (!Number.isFinite(st._virtualRevision)) st._virtualRevision = 0;
+      if (!Number.isInteger(st._transcriptRenderEpoch)) {
+        st._transcriptRenderEpoch = 0;
+      }
       if (st.activeTurnId === undefined) st.activeTurnId = "";
       if (st._lastTerminalTurnId === undefined) st._lastTerminalTurnId = "";
       if (st.parentTurnId === undefined) st.parentTurnId = "";
@@ -8097,6 +8111,7 @@ function portal() {
       if (!st._queueMutating || typeof st._queueMutating !== "object") {
         st._queueMutating = {};
       }
+      if (st._queueAdmission === undefined) st._queueAdmission = null;
       return st;
     },
     _sessionSyncNeedsVisibility(reason) {
@@ -8428,7 +8443,7 @@ function portal() {
       // adjustment that the queue endpoint must downgrade after the POST.
       if (!st || !turnId || attachmentIntent || st.compacting
           || st.backgroundActive || st._draining || st.parentTurnId
-          || (st.pendingQueue && st.pendingQueue.length)) {
+          || !this._pendingQueueAllowsAdjustment(st, turnId)) {
         return "queue";
       }
       return "adjust";
@@ -8462,7 +8477,7 @@ function portal() {
           || this._normalizeBusySendMode(this.busySendMode) !== "adjust"
           || hasAttachments || !st.streaming || st.compacting
           || st.backgroundActive || st._draining || st.parentTurnId
-          || (st.pendingQueue && st.pendingQueue.length)) {
+          || !this._pendingQueueAllowsAdjustment(st)) {
         return "";
       }
       try {
@@ -8483,6 +8498,28 @@ function portal() {
       } catch (_) {
         return ownerStillCurrent() ? accept(st.activeTurnId) : "";
       }
+    },
+    _pendingQueueAllowsAdjustment(st, activeTurnId = "") {
+      if (!st || st._queueAdmission) return false;
+      const pending = Array.isArray(st.pendingQueue) ? st.pendingQueue : [];
+      if (!pending.length) return true;
+      const turnId = String(activeTurnId || "");
+      // Multiple native `priority=next` commands may target the same immutable
+      // foreground turn.  They must not be confused with ordinary FIFO rows:
+      // a fallback, attachment send, or item from another turn still owns its
+      // original queue position and blocks a later message from overtaking it.
+      return pending.every(item => {
+        const delivery = this._normalizeBusySendMode(
+          item && item.delivery, "queue",
+        );
+        const state = String(item && item.deliveryStatus || "pending");
+        const targetTurnId = String(item && item.targetTurnId || "");
+        const active = [
+          "pending", "waiting_tool", "queued", "started",
+        ].includes(state);
+        return delivery === "adjust" && active && !!targetTurnId
+          && (!turnId || targetTurnId === turnId);
+      });
     },
     sendButtonHint(sid) {
       if (this.composerClaimed(sid)) return this.t("btn.send");
@@ -8650,6 +8687,12 @@ function portal() {
       }
       return this.lang === "zh"
         ? "等待当前工具完成" : "Waiting for current tool";
+    },
+    queueDisplayItems(st = this.activeSessionPane()) {
+      const durable = Array.isArray(st && st.pendingQueue)
+        ? st.pendingQueue : [];
+      const admission = st && st._queueAdmission;
+      return admission ? [...durable, admission] : durable;
     },
     _findQueueSteeringMessage(st, itemId, commandUuid) {
       if (!st) return null;
@@ -8950,6 +8993,14 @@ function portal() {
       const mirrorState = successor && successor._handoffSourceSid === sid
         ? successor : (this.tabState[sid] === enqueueState ? enqueueState : null);
       const mirrorSid = mirrorState === successor ? successorSid : sid;
+      const admissionToken = String(item._submitToken || "");
+      if (mirrorState && admissionToken
+          && mirrorState._queueAdmission?._submitToken === admissionToken) {
+        // Swap the local tail projection for the durable row in the same
+        // synchronous acceptance step. Keeping both until send() resumes would
+        // give Alpine one frame with a duplicate fourth card / wrong fractions.
+        mirrorState._queueAdmission = null;
+      }
       // Steering lifecycle can complete before the HTTP continuation resumes.
       // In that race `accepted.item` may be the earlier waiting snapshot while
       // `accepted.queue.items` already proves it was removed (or cancelled).
@@ -9084,6 +9135,8 @@ function portal() {
         0, Number(sourceState._installedCanonicalCount) || 0);
       child._seenUpdated = sourceState._seenUpdated;
       child.pendingQueue = this._cloneRolloverValue(sourceState.pendingQueue || []);
+      child._queueAdmission = this._cloneRolloverValue(
+        sourceState._queueAdmission || null);
       child._queuePaused = !!sourceState._queuePaused;
       child._draining = !!sourceState._draining || child.pendingQueue.length > 0;
       child._handoffSourceSid = sourceSid;
@@ -9586,6 +9639,16 @@ function portal() {
             });
             return true;
           }
+          // A failed canonical install must remain an explicit obligation.
+          // The queue-attach retry budget tracks transport timing, not whether
+          // the visible transcript actually converged. Schedule one owner-free
+          // history retry so an Alpine keyed-DOM repair cannot strand the UI in
+          // the stale pre-refresh state after the last fast queued successor.
+          st._pendingExternalUpdate = true;
+          this._requestSessionSync(sid, "history_revision", {
+            targetUpdated: Number(st._reconcileTargetUpdated) || 0,
+            delayMs: 80,
+          });
           if (tries <= 1) {
             st._draining = false;
             this._syncQueueFromServer(sid);
@@ -9963,7 +10026,14 @@ function portal() {
             && message._steeringAdjustment !== true
             && message._turnRoot !== false,
         );
-        if (hasSuccessorRoot) { retry(); return false; }
+        // A later root is unsafe only while its ownership is unknown or it is
+        // still active. An explicit inactive probe means those fast successors
+        // have already completed headlessly, so the latest canonical snapshot
+        // is exactly what this pane must install rather than defer until reload.
+        if (hasSuccessorRoot && (!activity || activity.active)) {
+          retry();
+          return false;
+        }
         // Native steering messages are user-role records inside the same logical
         // turn. Walk backward from the committed final assistant to the nearest
         // root user instead of truncating the window at the last adjustment.
@@ -10254,6 +10324,11 @@ function portal() {
       }
       return warm;
     },
+    transcriptPaneKey(tid) {
+      const st = tid && this.tabState && this.tabState[tid];
+      return String(tid || "") + ":" + Math.max(
+        0, Number(st && st._transcriptRenderEpoch) || 0);
+    },
     _chatBodyElement() {
       // chatBody lives below a nested x-data scope (`activeSession` façade).
       // Alpine does not expose descendant component refs through the root
@@ -10274,6 +10349,73 @@ function portal() {
       const pane = this._paneElement(tid);
       if (!pane || !key) return null;
       return pane.querySelector(`.msg[data-message-key="${CSS.escape(key)}"]`);
+    },
+    _transcriptDomMatchesState(tid, st) {
+      if (!tid || !st || this.tabState[tid] !== st) return false;
+      const pane = this._paneElement(tid);
+      // An evicted/never-mounted background pane will build from state when it
+      // next becomes warm; there is no resident DOM to reconcile now.
+      if (!pane) return true;
+      const expected = this._visiblePaneMessages(st);
+      const nodes = Array.from(
+        pane.querySelectorAll(":scope > .msg[data-message-key]"));
+      if (nodes.length !== expected.length) return false;
+      const unique = new Set();
+      for (let index = 0; index < expected.length; index += 1) {
+        const message = expected[index];
+        const key = String(message && message._k || "");
+        if (!key || unique.has(key)) return false;
+        unique.add(key);
+        const node = nodes[index];
+        if (node.dataset.messageKey !== key
+            || String(node.dataset.uuid || "")
+              !== String(message && message.uuid || "")) return false;
+      }
+      return true;
+    },
+    async _ensureTranscriptDomConverged(tid, st, options = {}) {
+      if (!tid || !st || this.tabState[tid] !== st) return false;
+      if (typeof document === "undefined" || tid !== this.currentId) return true;
+      // loadSession already awaited the keyed-list update once. One additional
+      // Alpine tick lets dependent bindings (uuid/footer/index getters) settle
+      // before treating a mismatch as structural rather than merely scheduled.
+      await new Promise(resolve => this.$nextTick(resolve));
+      if (this.tabState[tid] !== st) return false;
+      // The canonical state remains valid if the user switches tabs during the
+      // tick. Its pane is hidden/evicted state now and will mount from that
+      // canonical array on activation; DOM convergence must not abort the
+      // metadata/watermark half of this successful history transaction.
+      if (tid !== this.currentId) return true;
+      if (this._transcriptDomMatchesState(tid, st)) return true;
+
+      // A successor can claim the pane while Alpine is settling the canonical
+      // array. Never remount a pane after live ownership has started; let the
+      // caller's takeover path retain the stream and retry canonical sync once
+      // that owner settles.
+      if (st.streaming || st.es || this._hasAdmissionBubble(st)) return false;
+
+      // Alpine 3.14's keyed x-for mover can leave its lookup and physical nodes
+      // out of sync after a large live→canonical replacement. Re-key only this
+      // pane, and only after proving divergence; normal reconciles retain every
+      // mounted message node and its selection/observer state.
+      st._transcriptRenderEpoch += 1;
+      await new Promise(resolve => this.$nextTick(resolve));
+      if (this.tabState[tid] !== st) return false;
+      if (tid !== this.currentId) return true;
+      if (st.streaming || st.es || this._hasAdmissionBubble(st)) return false;
+      const scrollEl = options.scrollEl || this._chatBodyElement();
+      if (options.followTail) {
+        st.atBottom = true;
+        this._scrollChatTailNow(tid, st);
+      } else if (scrollEl && options.anchor) {
+        if (!this._restoreMessageAnchor(scrollEl, options.anchor)
+            && Number.isFinite(options.scrollTop)) {
+          scrollEl.scrollTop = options.scrollTop;
+        }
+      } else if (scrollEl && Number.isFinite(options.scrollTop)) {
+        scrollEl.scrollTop = options.scrollTop;
+      }
+      return this._transcriptDomMatchesState(tid, st);
     },
     paneState(tid) {
       if (!tid) return null;
@@ -10449,7 +10591,8 @@ function portal() {
       return absolute >= start && absolute < end ? absolute - start : -1;
     },
     _hasPendingAdmission(st) {
-      return !!(st && (st._composerSubmitToken || this._hasAdmissionBubble(st)));
+      return !!(st && (st._composerSubmitToken || st._queueAdmission
+        || this._hasAdmissionBubble(st)));
     },
     _hasAdmissionBubble(st) {
       return !!(st && Array.isArray(st.messages)
@@ -10847,8 +10990,19 @@ function portal() {
             sid, existingState, { minimumWaitMs: 0 });
           return;
         }
-        if (existingState && !existingState.streaming) {
-          this._setBackgroundTaskActive(sid, false, payload.started_at, 0);
+        if (existingState) {
+          if (!existingState.streaming) {
+            this._setBackgroundTaskActive(sid, false, payload.started_at, 0);
+          }
+          // A short server-drained turn can start and finish between browser
+          // attach probes, so this tab never acquires its immutable turn id.
+          // Its inactive mux frame is still an authoritative canonical-history
+          // boundary. Keep one replay obligation alive across any later queued
+          // successors; the replay worker waits for the backend to become idle
+          // and then installs the complete suffix without a manual refresh.
+          existingState._pendingExternalUpdate = true;
+          this._scheduleCanonicalStreamReload(
+            sid, existingState, { minimumWaitMs: 0 });
         }
         return;
       }
@@ -16368,8 +16522,8 @@ function portal() {
       // at the compact summary and can't reach it). Records st._fullLoaded
       // so the jump retry doesn't loop re-requesting full mode.
       const full = !!opts.full;
-      // quiet:true → in-place message refresh with NO skeleton + a scroll-
-      // preserving morph swap. Used by the open-session auto-resync
+      // quiet:true → identity-preserving message refresh with NO skeleton + a
+      // scroll-preserving keyed swap. Used by the open-session auto-resync
       // (_reconcileOpenSession) so a background poll that pulls newly-finished
       // messages never blanks the conversation or jumps the scroll. Cold opens
       // and tab switches keep the normal skeleton + chunked-reveal path.
@@ -16586,8 +16740,11 @@ function portal() {
             || !this._historyReplaceStillOwns(st, historyReplaceToken)) {
           return false;
         }
-        // Replace the one repository in place. Quiet reconciliation preserves
-        // matching message object identity; cold reveal changes only range coords.
+        // Publish the canonical repository atomically. A 100-row in-place
+        // splice schedules a long sequence of reactive index mutations and can
+        // make Alpine's keyed mover observe an inconsistent intermediate
+        // lookup. The matched message objects and their `_k` values are still
+        // reused, so stable bubbles keep their DOM identity on the normal path.
         if (st.streaming || st.es || this._hasAdmissionBubble(st)) return false;
         // _virtualStart/_virtualEnd are LOCAL to the revealed slice. A quiet
         // canonical refresh can move visibleStart from a narrow recent tail to
@@ -16625,7 +16782,8 @@ function portal() {
         const quietEnd = quietRangeResolved ? quietRangeResolved.end : startIdx;
         st.messageRange.visibleStart = quiet ? quietStart : startIdx;
         st.messageRange.visibleEnd = quiet ? quietEnd : startIdx;
-        st.messages.splice(0, st.messages.length, ...all);
+        st.messages = all;
+        _paneMessageIndexCache.delete(st);
         Object.assign(st.messageRange, {
           visibleStart: quiet ? quietStart : startIdx,
           visibleEnd: quiet ? quietEnd : startIdx,
@@ -16662,6 +16820,19 @@ function portal() {
         // response coordinates. Canonical envelopes remain untouched.
         this._scheduleHistoryViewport(st, "newer");
         this._syncSessionMessageStore(st);
+        if (quiet && sid === this.currentId) {
+          const domConverged = await this._ensureTranscriptDomConverged(sid, st, {
+            scrollEl: quietScrollEl,
+            scrollTop: quietScrollTop,
+            anchor: quietAnchor,
+            followTail: followTailAtInstall,
+          });
+          if (!domConverged || this.tabState[sid] !== st
+              || st.streaming || st.es || this._hasAdmissionBubble(st)
+              || !this._historyReplaceStillOwns(st, historyReplaceToken)) {
+            return false;
+          }
+        }
         st._hasMoreHistory = st.messageRange.visibleStart > 0
           || st.messageRange.offset > 0 || this._preCompactReachable(st);
         // Remember whether this load pulled the full raw-JSONL history, so
@@ -17228,10 +17399,18 @@ function portal() {
     _messageContinuitySignatures(m) {
       if (!m) return [];
       const role = String(m.role || "");
+      // A native steering command is a user-role record inside its parent
+      // turn, while an ordinary user row opens a successor turn. Identical
+      // text is common across that boundary (for example repeated `test`),
+      // but the two rows are never interchangeable DOM identities.
+      const identityRole = role === "user"
+        ? role + (m._steeringAdjustment === true || m._turnRoot === false
+          ? ":steering" : ":root")
+        : role;
       const out = [];
-      const push = (kind, value) => {
+      const push = (kind, value, signatureRole = identityRole) => {
         if (value === undefined || value === null || value === "") return;
-        out.push(role + ":" + kind + ":" + this._stableHash(String(value)));
+        out.push(signatureRole + ":" + kind + ":" + this._stableHash(String(value)));
       };
       // Presentation-only runtime replies may legitimately have identical
       // prose (for example two "后台任务已完成" continuations). Their durable
@@ -17251,7 +17430,10 @@ function portal() {
       const continuityIds = [m.uuid, m.id, m.tool_use_id, m.task_id];
       if (role === "assistant") continuityIds.push(m.forkUuid);
       for (const value of continuityIds) {
-        push("id", value);
+        // Exact durable ids trump the steering/root presentation distinction.
+        // That semantic split exists only to stop identical prose from moving
+        // a mid-turn command onto a later ordinary user turn.
+        push("id", value, role);
       }
       push("text", m.text);
       // Some non-text tool/status rows expose only a preview or summary.
@@ -17281,22 +17463,29 @@ function portal() {
       }
       const used = new Set();
       const result = incoming.slice();
-      // Tail windows can omit older duplicate prompts. Match newest-first so a
-      // repeated role+text pair inherits the live/current-tail key rather than
-      // an older cached bubble with the same text.
-      for (let i = result.length - 1; i >= 0; i--) {
-        const canonical = result[i];
-        let matched = null;
-        for (const signature of this._messageContinuitySignatures(canonical)) {
-          const queue = candidates.get(signature);
-          while (queue && queue.length && used.has(queue[queue.length - 1])) queue.pop();
-          if (queue && queue.length) {
-            matched = queue.pop();
-            break;
-          }
+      const canonicalRows = incoming.slice();
+      const adopted = new Set();
+      const adoptionKind = new Map();
+      const adoptedMessage = new Map();
+      const signatures = result.map(message =>
+        this._messageContinuitySignatures(message));
+      const isStrong = signature => signature.includes(":id:")
+        || signature.includes(":runtime-event:");
+      const candidateFor = signature => {
+        const queue = candidates.get(signature) || [];
+        for (let i = queue.length - 1; i >= 0; i -= 1) {
+          if (!used.has(queue[i])) return queue[i];
         }
-        if (!matched || !matched._k) continue;
+        return null;
+      };
+      const adopt = (index, matched, kind) => {
+        if (!matched || !matched._k || used.has(matched)
+            || adopted.has(index)) return false;
+        const canonical = result[index];
         used.add(matched);
+        adopted.add(index);
+        adoptionKind.set(index, kind);
+        adoptedMessage.set(index, matched);
         const mountedKey = matched._k;
         // Canonical history can become readable one request before its
         // completion annotation sidecar. Keep the already-visible live footer
@@ -17323,14 +17512,98 @@ function portal() {
         }
         matched._k = mountedKey;
         matched._noAnim = true;
-        result[i] = matched;
+        result[index] = matched;
+        return true;
+      };
+
+      // Reserve every durable identity before considering prose continuity.
+      // Otherwise canonical turn B can weak-match turn A's identical text and
+      // consume the object that turn A would have matched by UUID/forkUuid.
+      for (let i = result.length - 1; i >= 0; i -= 1) {
+        for (const signature of signatures[i]) {
+          if (!isStrong(signature)) continue;
+          if (adopt(i, candidateFor(signature), "strong")) break;
+        }
       }
-      // If the canonical shaper split/combined the final tool block
-      // differently, signature matching may not reuse the exact live tail.
-      // The footer still belongs to the canonical tail, so carry its immediate
-      // done-time stamp across without overwriting authoritative fields.
+
+      // Text/preview/summary are continuity hints, not identities. Reuse them
+      // only when the unmatched row is unique on BOTH sides. Repeated prompts
+      // or replies deliberately get fresh canonical keys instead of moving an
+      // older live key onto a later turn and corrupting Alpine's keyed mover.
+      const weakExisting = new Map();
+      for (const message of existing) {
+        if (used.has(message)) continue;
+        for (const signature of this._messageContinuitySignatures(message)) {
+          if (isStrong(signature)) continue;
+          if (!weakExisting.has(signature)) weakExisting.set(signature, []);
+          weakExisting.get(signature).push(message);
+        }
+      }
+      const weakIncoming = new Map();
+      for (let i = 0; i < result.length; i += 1) {
+        if (adopted.has(i)) continue;
+        for (const signature of signatures[i]) {
+          if (isStrong(signature)) continue;
+          if (!weakIncoming.has(signature)) weakIncoming.set(signature, []);
+          weakIncoming.get(signature).push(i);
+        }
+      }
+      for (const [signature, indexes] of weakIncoming) {
+        const matches = weakExisting.get(signature) || [];
+        if (indexes.length !== 1 || matches.length !== 1) continue;
+        adopt(indexes[0], matches[0], "weak");
+      }
+
+      // Reused keys must keep the same relative order they had in the mounted
+      // repository. Alpine's keyed mover cannot safely consume a mapping that
+      // crosses two old nodes (and may throw from its internal `.after()` call).
+      // Prefer durable identities over weak prose matches; if even two strong
+      // identities cross, keep the earlier canonical row and give the later row
+      // its fresh canonical key. Object reuse is an optimisation, never worth a
+      // corrupt DOM.
+      const oldIndexes = new Map(existing.map((message, index) => [message, index]));
+      const retained = [];
+      const revertAdoption = index => {
+        const matched = adoptedMessage.get(index);
+        if (matched) used.delete(matched);
+        adopted.delete(index);
+        adoptionKind.delete(index);
+        adoptedMessage.delete(index);
+        result[index] = canonicalRows[index];
+      };
+      for (let index = 0; index < result.length; index += 1) {
+        if (!adopted.has(index)) continue;
+        const oldIndex = oldIndexes.get(adoptedMessage.get(index));
+        if (!Number.isInteger(oldIndex)) {
+          revertAdoption(index);
+          continue;
+        }
+        let previous = retained[retained.length - 1];
+        if (previous && oldIndex <= previous.oldIndex
+            && adoptionKind.get(index) === "strong") {
+          while (previous && previous.kind === "weak"
+              && oldIndex <= previous.oldIndex) {
+            revertAdoption(previous.index);
+            retained.pop();
+            previous = retained[retained.length - 1];
+          }
+        }
+        if (previous && oldIndex <= previous.oldIndex) {
+          revertAdoption(index);
+          continue;
+        }
+        retained.push({
+          index, oldIndex, kind: adoptionKind.get(index),
+        });
+      }
+      // Carry a live footer only when canonical reconciliation proved that the
+      // canonical tail is the SAME mounted logical row. A fast successor can
+      // already be present in canonical history while the browser still ends
+      // at the previous queued reply; blindly copying the old footer onto the
+      // new canonical tail makes the successor inherit the wrong time/status.
       const canonicalTail = result[result.length - 1];
-      if (liveFooter && canonicalTail && canonicalTail.role !== "user"
+      if (liveFooter && canonicalTail === existingTail
+          && canonicalTail.role !== "user"
           && canonicalTail.display_kind !== "runtime_continuation") {
         if (!canonicalTail.ts && liveFooter.ts) canonicalTail.ts = liveFooter.ts;
         if (!canonicalTail.elapsed && liveFooter.elapsed) {
@@ -29467,6 +29740,8 @@ function portal() {
         const child = childSid && this.tabState[childSid];
         return child && child._handoffSourceSid === sendSid ? child : null;
       };
+      let clearOwnedQueueAdmission = () => {};
+      let queueAdmissionAsyncHandoff = false;
       try {
       // Stop is an acknowledged control handshake, not an idle gap.  Sending
       // while it is still settling used to enqueue a fresh message between the
@@ -29512,6 +29787,21 @@ function portal() {
         && state._composerSubmitToken === composerSubmitToken
         && state.draft && state.draft.input === composerInput);
       let sentUserBubble = null;
+      let queueAdmission = null;
+      const clearQueueAdmission = () => {
+        const owners = new Set([
+          sendState, successorState(), ...Object.values(this.tabState || {}),
+        ]);
+        for (const state of owners) {
+          const pending = state && state._queueAdmission;
+          if (pending && pending._submitToken === composerSubmitToken) {
+            state._queueAdmission = null;
+          }
+        }
+        queueAdmission = null;
+        queueAdmissionAsyncHandoff = false;
+      };
+      clearOwnedQueueAdmission = clearQueueAdmission;
       const clearSubmittedComposer = ({ preserveForHandshake = false } = {}) => {
         if (hasDetachedText) return;
         // A proactive background rollover can replace sourceState while this
@@ -29583,6 +29873,7 @@ function portal() {
           this._removePaneMessage(sendState, sentUserBubble);
           sentUserBubble = null;
         }
+        clearQueueAdmission();
         restoreSubmittedComposer(true);
       };
       // Snapshot model/permission alongside sendSid — the attachment-upload
@@ -29739,6 +30030,70 @@ function portal() {
         readyDocs = ownedDocs.slice();
       }
 
+      const optimisticDisplayText = hasDetachedText
+        ? detachedDisplayText : composerInput;
+      const optimisticImages = readyImages.map(im => ({
+        id: im.id || "",
+        preview: im.preview,
+        src: im.preview || im.src || "",
+        url: (im.id && im.attach_ext && sendSid)
+          ? `/api/chat/attachments/${sendSid}/${im.id}.${im.attach_ext}`
+          : undefined,
+        mime: im.mime || "",
+      }));
+      const optimisticDocs = readyDocs.map(doc => ({
+        id: doc.id || "",
+        name: doc.name || "file",
+        kind: doc.kind || "text",
+      }));
+      const stageQueueAdmission = () => {
+        const owner = successorState()
+          || (this.tabState[sendSid] === sendState ? sendState : null);
+        if (!owner) return false;
+        if (owner._queueAdmission
+            && owner._queueAdmission._submitToken === composerSubmitToken) {
+          queueAdmission = owner._queueAdmission;
+          return true;
+        }
+        queueAdmission = {
+          id: `admission:${composerSubmitToken}`,
+          text,
+          displayText: String(optimisticDisplayText || ""),
+          pendingQuotes: composerQuotes.map(quote => ({ ...quote })),
+          image_ids: optimisticImages.map(image => image.id).filter(Boolean).join(","),
+          hasAttach: !!(optimisticImages.length || optimisticDocs.length),
+          images: optimisticImages,
+          docs: optimisticDocs,
+          expiredCount: 0,
+          pendingImages: [],
+          pendingDocs: [],
+          delivery: "queue",
+          deliveryStatus: "queued",
+          enqueuedAt: Date.now(),
+          _admissionPending: true,
+          _submitToken: composerSubmitToken,
+        };
+        owner._queueAdmission = queueAdmission;
+        return true;
+      };
+      const appendOptimisticUserBubble = () => this._appendLiveMessage(
+        sendState,
+        {
+          role: "user", text,
+          _turnRoot: true,
+          // The bubble exists before the server decides whether this prompt
+          // owns a turn or a queue slot. Keep pane-level Running hidden until
+          // admission is authoritative.
+          _admissionPending: true,
+          _optimisticQueue: !resumed && this._isBusy(sendSid),
+          _optimisticDelivery: busyDelivery,
+          displayText: optimisticDisplayText,
+          selectionQuotes: composerQuotes.map(q => ({ ...q })),
+          images: optimisticImages,
+          docs: optimisticDocs,
+        },
+      );
+
       // Commit the interaction to the screen before any network preflight. The
       // payload snapshot above is immutable, so later registration/settings/busy
       // checks can safely run after the textarea clears and the user bubble paints.
@@ -29757,26 +30112,10 @@ function portal() {
         // before appending so the optimistic user bubble enters the bounded range.
         sendState.atBottom = true;
         this._scheduleLiveMessageViewport(sendState);
-        sentUserBubble = this._appendLiveMessage(sendState, {
-          role: "user", text,
-          _turnRoot: true,
-          // The bubble exists before the server decides whether this prompt
-          // owns a turn or a queue slot.  Keep pane-level Running hidden until
-          // admission is authoritative.
-          _admissionPending: true,
-          _optimisticQueue: !resumed && this._isBusy(sendSid),
-          _optimisticDelivery: busyDelivery,
-          displayText: hasDetachedText ? detachedDisplayText : composerInput,
-          selectionQuotes: composerQuotes.map(q => ({ ...q })),
-          images: readyImages.map(im => ({
-            preview: im.preview,
-            url: (im.id && im.attach_ext && sendSid)
-              ? `/api/chat/attachments/${sendSid}/${im.id}.${im.attach_ext}`
-              : undefined,
-            mime: im.mime,
-          })),
-          docs: readyDocs.map(d => ({ name: d.name, kind: d.kind })),
-        });
+        const knownFifo = !resumed && busyDelivery === "queue"
+          && this._isBusy(sendSid);
+        if (knownFifo) stageQueueAdmission();
+        else sentUserBubble = appendOptimisticUserBubble();
         if (this.currentId === sendSid) {
           sendState.atBottom = true;
           this.scrollToBottom(true);
@@ -29811,7 +30150,15 @@ function portal() {
         ? await this._confirmSessionBusy(sendSid, sendState)
         : false;
       if (confirmedBusy) {
-        if (sentUserBubble) sentUserBubble._optimisticQueue = true;
+        if (busyDelivery === "queue") {
+          if (sentUserBubble) {
+            this._removePaneMessage(sendState, sentUserBubble);
+            sentUserBubble = null;
+          }
+          stageQueueAdmission();
+        } else if (sentUserBubble) {
+          sentUserBubble._optimisticQueue = true;
+        }
         this._setComposerClaimPhase(sendState, composerSubmitToken, "queue");
         const shouldHandoffBackground = !sendState.streaming
           && !sendState.compacting
@@ -29828,11 +30175,13 @@ function portal() {
           delivery: busyDelivery,
           active_turn_id: busyActiveTurnId,
           stream_owner_token: busyStreamOwnerToken,
+          _submitToken: composerSubmitToken,
         });
         if (!ok) {
           rollbackOptimisticSubmission();
           return false;
         }
+        clearQueueAdmission();
         if (sentUserBubble) {
           this._removePaneMessage(sendState, sentUserBubble);
           sentUserBubble = null;
@@ -29848,6 +30197,13 @@ function portal() {
           this.scrollToBottom(true);
         }
         return true;
+      }
+      // The locally-known queue can finish while registration/settings probes
+      // are in flight. If the authoritative busy check now says idle, promote
+      // the temporary queue-tail card into the ordinary direct-turn bubble.
+      if (queueAdmission) {
+        clearQueueAdmission();
+        sentUserBubble = appendOptimisticUserBubble();
       }
       // Reconnect mode has no optimistic user bubble: the backend already owns
       // the prompt and its canonical replay replaces any stale rendered suffix.
@@ -30071,7 +30427,15 @@ function portal() {
               useMux = false;
             } else {
               if (tr.status === 409 && !resumed) {
-                if (sentUserBubble) sentUserBubble._optimisticQueue = true;
+                if (busyDelivery === "queue") {
+                  if (sentUserBubble) {
+                    this._removePaneMessage(streamState, sentUserBubble);
+                    sentUserBubble = null;
+                  }
+                  stageQueueAdmission();
+                } else if (sentUserBubble) {
+                  sentUserBubble._optimisticQueue = true;
+                }
                 const queued = await this._enqueueMessage(streamSid, {
                   text,
                   displayText: hasDetachedText ? detachedDisplayText : composerInput,
@@ -30083,8 +30447,10 @@ function portal() {
                   delivery: busyDelivery,
                   active_turn_id: busyActiveTurnId,
                   stream_owner_token: busyStreamOwnerToken,
+                  _submitToken: composerSubmitToken,
                 });
                 if (queued) {
+                  clearQueueAdmission();
                   rollbackUnstartedSend(false);
                   if (isComposerSubmission) {
                     this._commitChatRecoveryDraft(sendSid, composerInput);
@@ -30094,6 +30460,10 @@ function portal() {
                     : "The current task is still finishing; message queued",
                   "info", 2800);
                   return true;
+                }
+                if (queueAdmission) {
+                  clearQueueAdmission();
+                  sentUserBubble = appendOptimisticUserBubble();
                 }
               }
               if (!tr.ok) tr = await startTurn();
@@ -31547,7 +31917,18 @@ function portal() {
           const handoffDelivery = this._busySendDelivery(
             streamSid, handoffTurnId, busyHasAttachments,
           );
-          if (sentUserBubble) {
+          if (handoffDelivery === "queue") {
+            if (sentUserBubble) {
+              this._removePaneMessage(streamState, sentUserBubble);
+              sentUserBubble = null;
+            }
+            // Cached mux events are dispatched synchronously while send() is
+            // still activating the channel. The handler then yields on this
+            // POST and send() reaches its outer finally; mark the admission as
+            // independently owned so that finally cannot erase the queue card
+            // while durable acceptance is still pending.
+            queueAdmissionAsyncHandoff = stageQueueAdmission();
+          } else if (sentUserBubble) {
             sentUserBubble._optimisticQueue = true;
             sentUserBubble._optimisticDelivery = handoffDelivery;
           }
@@ -31564,8 +31945,10 @@ function portal() {
             delivery: handoffDelivery,
             active_turn_id: handoffTurnId,
             stream_owner_token: busyStreamOwnerToken,
+            _submitToken: composerSubmitToken,
           });
           if (queued) {
+            clearQueueAdmission();
             if (sentUserBubble) {
               this._removePaneMessage(streamState, sentUserBubble);
               sentUserBubble = null;
@@ -31583,6 +31966,10 @@ function portal() {
               "info", 2800,
             );
             return;
+          }
+          if (queueAdmission) {
+            clearQueueAdmission();
+            sentUserBubble = appendOptimisticUserBubble();
           }
           if (streamState._busyQueueHandoff === es) {
             streamState._busyQueueHandoff = null;
@@ -31916,6 +32303,7 @@ function portal() {
       // turn to "done" (input re-enabled, footer stamped, unread dot) ~800ms
       // before the reconnect restored streaming. Removing it stops that flicker.
       } finally {
+        if (!queueAdmissionAsyncHandoff) clearOwnedQueueAdmission();
         if (isComposerSubmission) {
           // Runtime rollover may replace the source more than once while an
           // async queue/start request settles. The token is globally unique, so

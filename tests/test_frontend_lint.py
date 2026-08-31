@@ -1333,7 +1333,8 @@ def test_session_sync_transitions_preserve_canonical_and_view_ownership():
 
     # Synchronization changes only the canonical per-tab repository. Keep the
     # ordered messages + range model and composer ownership established earlier.
-    assert "st.messages.splice(0, st.messages.length, ...all)" in app
+    assert "st.messages = all" in app
+    assert "_paneMessageIndexCache.delete(st)" in app
     assert "Object.assign(st.messageRange" in app
     assert "child.messages = cloneMessages(sourceState.messages)" in app
     assert "child.messageRange = { ...sourceState.messageRange }" in app
@@ -1357,7 +1358,7 @@ def test_optimistic_session_paints_immediately_but_registers_before_ticket():
     assert "async _ensureSessionRegistered(id)" in helpers
     assert helpers.count("this._registerOptimisticSession(meta)") >= 2
     ensure_at = send.index("await this._ensureSessionRegistered(sendSid)")
-    push_at = send.index("this._appendLiveMessage(sendState")
+    push_at = send.index("if (knownFifo) stageQueueAdmission();")
     ticket_at = send.index('fetch("/api/chat/stream/start"')
     clear_at = send.index("clearSubmittedComposer({ preserveForHandshake: true })")
     assert clear_at < push_at < ensure_at < ticket_at
@@ -1586,7 +1587,7 @@ def test_runtime_setting_writes_gate_send_and_restore_per_session():
     send_start = app.index("async send(opts = {})")
     send = app[send_start:]
     assert send.count("await this._awaitRuntimeSettingPatches(sendSid, sendState)") == 1
-    assert send.index("sentUserBubble = this._appendLiveMessage") < send.index(
+    assert send.index("if (knownFifo) stageQueueAdmission();") < send.index(
         "await this._awaitRuntimeSettingPatches(sendSid, sendState)"
     )
     assert "runtimeSettingsPending()" in html
@@ -2736,7 +2737,7 @@ def test_runtime_ui_revision_rejects_out_of_order_session_response():
     assert response in load
     assert current in load
     assert stale_guard in load
-    assert load.index(stale_guard) < load.index("st.messages.splice(")
+    assert load.index(stale_guard) < load.index("st.messages = all")
     assert load.index(stale_guard) < load.index(
         "st.runtimeUiRevision = loadedRuntimeUiRevision")
 
@@ -2764,11 +2765,17 @@ def test_runtime_continuation_history_identity_footer_and_fork_guards():
     runtime_guard = runtime_guard[:runtime_guard.index("const continuityIds")]
     assert 'push("runtime-event", m.runtime_event_id)' in runtime_guard
     assert 'push("text", m.text)' not in runtime_guard
+    assert "m._steeringAdjustment === true || m._turnRoot === false" in continuity
 
     preserve_start = app.index(
         "    _preserveCanonicalMessageIdentity(st, incoming) {")
     preserve_end = app.index("\n    _assignLiveKey", preserve_start)
     preserve = app[preserve_start:preserve_end]
+    assert preserve.index("Reserve every durable identity") < preserve.index(
+        "Text/preview/summary are continuity hints")
+    assert "indexes.length !== 1 || matches.length !== 1" in preserve
+    assert "oldIndex <= previous.oldIndex" in preserve
+    assert "canonicalTail === existingTail" in preserve
     assert 'canonicalTail.display_kind !== "runtime_continuation"' in preserve
 
     fork_start = app.index("    turnForkMessageId(paneMsgs, i) {")
@@ -2786,6 +2793,25 @@ def test_runtime_continuation_history_identity_footer_and_fork_guards():
     )
     assert css.count(avatar_boundary) == 2
 
+
+def test_fifo_admission_projects_after_durable_queue_without_transcript_flash():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    send_start = app.index("    async send(opts = {}) {")
+    send_end = app.index("\n    // ====== ask_user_question", send_start)
+    send = app[send_start:send_end]
+
+    assert "_queueAdmission: null" in app
+    assert "return admission ? [...durable, admission] : durable;" in app
+    assert "const knownFifo = !resumed && busyDelivery === \"queue\"" in send
+    assert "if (knownFifo) stageQueueAdmission();" in send
+    assert "owner._queueAdmission = queueAdmission;" in send
+    assert "_submitToken: composerSubmitToken" in send
+    assert "queueAdmissionAsyncHandoff = stageQueueAdmission();" in send
+    assert "if (!queueAdmissionAsyncHandoff) clearOwnedQueueAdmission();" in send
+    assert "mirrorState._queueAdmission = null;" in app
+    assert 'x-for="(q, qi) in queueDisplayItems(activeSession)"' in html
+    assert ":disabled=\"q._admissionPending || queueActionBusy" in html
 
 def test_detached_rollover_preserves_migrated_queue_fifo():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
@@ -2848,13 +2874,13 @@ def test_composer_send_has_one_claim_owner_without_exposing_internal_phases():
         "await this._awaitRuntimeSettingPatches(sendSid, sendState)"
     )
     assert send.count("await this._awaitRuntimeSettingPatches(sendSid, sendState)") == 1
-    assert send.index("sentUserBubble = this._appendLiveMessage") < send.index(
+    assert send.index("if (knownFifo) stageQueueAdmission();") < send.index(
         "await this._ensureSessionRegistered(sendSid)"
     )
     assert send.index("clearSubmittedComposer({ preserveForHandshake: true })") < send.index(
         "await this._ensureSessionRegistered(sendSid)"
     )
-    assert send.index("sentUserBubble = this._appendLiveMessage") < send.index(
+    assert send.index("if (knownFifo) stageQueueAdmission();") < send.index(
         "await this._confirmSessionBusy(sendSid, sendState)"
     )
     assert "rollbackOptimisticSubmission();" in send
@@ -3093,7 +3119,8 @@ def test_active_stream_owns_messages_and_continuation_reconciles_canonical_histo
     send = app[send_start:app.index("async stop()", send_start)]
 
     assert "if (st.streaming || st.es || this._hasAdmissionBubble(st)) return false" in load
-    assert "st._composerSubmitToken || this._hasAdmissionBubble(st)" in app
+    assert "st._composerSubmitToken || st._queueAdmission" in app
+    assert "|| this._hasAdmissionBubble(st)" in app
     assert "this.tabState[sid] !== st || st.streaming || st.es" in load
     reveal_start = app.index("async _revealMessagesChunked(sid, st, visible, tailFirst = true)")
     reveal = app[reveal_start:app.index("async _fillDeferredHead", reveal_start)]
@@ -3158,6 +3185,7 @@ def test_fork_banner_and_message_template_are_null_and_key_safe():
     html = (FRONTEND / "index.html").read_text(encoding="utf-8")
 
     assert "currentForkSource()?.name || ''" in html
+    assert ':key="transcriptPaneKey(tid)"' in html
     assert 'x-for="m in paneMsgs" :key="m._k"' in html
     assert "paneMessageIndex(tid, m)" in html
     assert 'get i(){ return paneMessageIndex(tid, m) }' in html
@@ -3449,10 +3477,18 @@ def test_done_immediately_stamps_tool_tail_and_quietly_adopts_fork_boundary():
     assert "messages.slice(turnStart, finalIndex + 1)" in reconcile
     assert "if (finalIndex < 0) { retry(); return false; }" in reconcile
     assert "const hasSuccessorRoot = messages.slice(finalIndex + 1).some(" in reconcile
+    assert "hasSuccessorRoot && (!activity || activity.active)" in reconcile
     assert "const loaded = await this.loadSession(sid, {" in reconcile
     assert "quiet: true, probeActive: false" in reconcile
     assert "attempt < 30" in reconcile
     assert "Math.min(2000, 250 + options.attempt * 100)" in reconcile
+
+    queue_start = app.index("    async _runQueueAttach(")
+    queue_end = app.index(
+        "\n    // ===== background-task continuation poller", queue_start)
+    queue_attach = app[queue_start:queue_end]
+    assert "st._pendingExternalUpdate = true;" in queue_attach
+    assert 'this._requestSessionSync(sid, "history_revision"' in queue_attach
 
     load_start = app.index("    async loadSession(sid, opts = {}) {")
     load_end = app.index("\n    async renameSession()", load_start)
@@ -3857,7 +3893,7 @@ def test_live_turn_bounds_dom_and_indexes_task_status_without_linear_scans():
     assert "this._normalizeTaskStatusPreview" in send[apply_start:apply_end]
     assert "if (_scrollCoalesceHandle !== null) return" in send
     assert send.index("sendState.atBottom = true") < send.index(
-        "sentUserBubble = this._appendLiveMessage")
+        "if (knownFifo) stageQueueAdmission();")
 
     assert '@click="returnToLatest()"' in html
     assert html.count('x-show="isAwayFromLatest()"') >= 3
@@ -3882,12 +3918,26 @@ def test_quiet_canonical_reload_rebases_virtual_window_before_alpine_paints():
     load_end = app.index("// Warm OPEN-but-inactive tabs", load_start)
     load = app[load_start:load_end]
     capture = "const virtualWindowBeforeInstall = quiet"
-    splice = "st.messages.splice(0, st.messages.length, ...all)"
+    publish = "st.messages = all"
     assign = "Object.assign(st.messageRange"
     rebase = "this._rebaseMessageVirtualWindow("
     assert capture in load
     assert rebase in load
-    assert load.index(capture) < load.index(splice) < load.index(assign) < load.index(rebase)
+    assert load.index(capture) < load.index(publish) < load.index(assign) < load.index(rebase)
+    assert load.index(publish) < load.index("_paneMessageIndexCache.delete(st)")
+    assert "await this._ensureTranscriptDomConverged(sid, st" in load
+    assert "st._transcriptRenderEpoch += 1" in app
+    assert "this._transcriptDomMatchesState(tid, st)" in app
+    assert "if (this.tabState[tid] !== st) return false;" in app
+    assert "if (tid !== this.currentId) return true;" in app
+    converge_start = app.index("    async _ensureTranscriptDomConverged(tid, st")
+    converge_end = app.index("\n    paneState(tid)", converge_start)
+    converge = app[converge_start:converge_end]
+    mismatch = "if (this._transcriptDomMatchesState(tid, st)) return true;"
+    takeover = "if (st.streaming || st.es || this._hasAdmissionBubble(st)) return false;"
+    remount = "st._transcriptRenderEpoch += 1"
+    assert converge.index(mismatch) < converge.index(takeover) < converge.index(remount)
+    assert converge.count(takeover) == 2
     assert "opts.followTail === true" in load
     assert "this._resolveMessageRangeSnapshot(all, quietRangeSnapshot)" in load
     assert "if (quiet && !quietRangeResolved)" in load
@@ -5611,7 +5661,9 @@ def test_busy_send_mode_uses_authoritative_delivery_and_steering_state():
     assert 'this.busySendMode) !== "adjust"' in delivery
     assert "!turnId || attachmentIntent || st.compacting" in delivery
     assert "st.backgroundActive || st._draining || st.parentTurnId" in delivery
-    assert "st.pendingQueue && st.pendingQueue.length" in delivery
+    assert "!this._pendingQueueAllowsAdjustment(st, turnId)" in delivery
+    assert "!this._pendingQueueAllowsAdjustment(st)" in delivery
+    assert 'delivery === "adjust" && active && !!targetTurnId' in delivery
     resolve_start = app.index("    async _resolveBusyAdjustmentTurnId(")
     resolve_end = app.index("\n    sendButtonHint(sid)", resolve_start)
     resolve = app[resolve_start:resolve_end]
@@ -5836,7 +5888,7 @@ def test_canonical_history_load_never_reports_stream_takeover_as_success():
     assert "if (st.streaming || st.es) return true;" not in load
     assert "if (this.tabState[sid] !== st || st.streaming || st.es) return true;" not in load
     assert "st._installedCanonicalCount = Math.max(" in load
-    assert load.index("st.messages.splice(0, st.messages.length, ...all)") < load.index(
+    assert load.index("st.messages = all") < load.index(
         "st._installedCanonicalCount = Math.max("
     )
 

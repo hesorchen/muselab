@@ -492,6 +492,28 @@ def test_mux_inactive_retires_matching_turn_without_harming_successor(
           try {
             st._loaded = true;
             st.messages = [{ role: 'assistant', text: 'VISIBLE_COMPLETED_REPLY' }];
+            st.streaming = false;
+            st.streamPhase = '';
+            st.activeTurnId = '';
+            st.es = null;
+            if (meta) meta.active = true;
+
+            // A fast server-drained queue turn can start and finish before this
+            // browser ever owns its mux channel. Its inactive aggregate frame is
+            // then the only live hint that canonical history has a missing suffix.
+            window.__emitMux('session_state', {
+              session_id: sid, turn_id: 'turn-headless-queued', active: false,
+              stopping: false, attachable: false, activity_source: 'queued',
+            });
+            await new Promise(resolve => setTimeout(resolve, 30));
+            const headless = {
+              streaming: st.streaming,
+              activeTurnId: st.activeTurnId,
+              reloads,
+              text: st.messages[0] && st.messages[0].text,
+              metaActive: meta && meta.active,
+            };
+
             st.streaming = true;
             st.streamPhase = 'runtime';
             st.activeTurnId = 'turn-a';
@@ -551,12 +573,19 @@ def test_mux_inactive_retires_matching_turn_without_harming_successor(
             clearInterval(st._streamTimer);
             clearInterval(st._stallWatch);
             if (st.es) st.es.close();
-            return { matching, successor };
+            return { headless, matching, successor };
           } finally {
             app._scheduleCanonicalStreamReload = originalReload;
           }
         }"""
     )
+    assert result["headless"] == {
+        "streaming": False,
+        "activeTurnId": "",
+        "reloads": 1,
+        "text": "VISIBLE_COMPLETED_REPLY",
+        "metaActive": False,
+    }
     assert result["matching"] == {
         "streaming": False,
         "phase": "",
@@ -565,7 +594,7 @@ def test_mux_inactive_retires_matching_turn_without_harming_successor(
         "stall": None,
         "stoppingTurn": "",
         "elapsed": 0,
-        "reloads": 1,
+        "reloads": 2,
         "text": "VISIBLE_COMPLETED_REPLY",
         "metaActive": False,
     }
@@ -575,7 +604,7 @@ def test_mux_inactive_retires_matching_turn_without_harming_successor(
         "sameEs": True,
         "sameTimer": True,
         "activeTurnId": "turn-b",
-        "reloads": 1,
+        "reloads": 2,
         "metaActive": True,
     }
     _assert_no_browser_errors(page, errors)
@@ -4681,6 +4710,593 @@ def test_session_sync_deadline_dispose_and_hidden_resume(
     _assert_no_browser_errors(page, errors)
 
 
+def test_existing_fifo_queue_renders_pending_send_as_disabled_tail_card(
+    page: Page, backend_url, auth_token,
+):
+    """A known FIFO send stays at the visual queue tail while POST is pending."""
+    errors = _capture_browser_errors(page)
+    page.set_viewport_size({"width": 1440, "height": 900})
+    _login(page, backend_url, auth_token)
+    sid = "perf-optimistic-queue-tail"
+    prompt = "THIRD_QUEUE_ITEM_PENDING_POST"
+
+    def queue_item(item_id: str, text: str, enqueued_at: int) -> dict:
+        return {
+            "id": item_id,
+            "text": text,
+            "display_text": text,
+            "selection_quotes": [],
+            "image_ids": "",
+            "attachments": [],
+            "delivery": "queue",
+            "steering_state": "queued",
+            "command_uuid": f"{item_id}-command",
+            "target_turn_id": "existing-running-turn",
+            "enqueued_at": enqueued_at,
+        }
+
+    first = queue_item("queue-tail-first", "FIRST_QUEUE_ITEM", 1)
+    second = queue_item("queue-tail-second", "SECOND_QUEUE_ITEM", 2)
+    accepted = queue_item("queue-tail-third", prompt, 3)
+    authoritative = [first, second, accepted]
+    held_post: dict[str, object] = {}
+    post_payloads: list[dict] = []
+
+    def queue_route(route):
+        if route.request.method == "POST":
+            post_payloads.append(route.request.post_data_json)
+            held_post["route"] = route
+            return
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({"items": authoritative, "paused": False, "revision": 3}),
+        )
+
+    page.route(f"**/api/chat/sessions/{sid}/queue", queue_route)
+    _app_eval(
+        page,
+        """
+        const sid = arg.sid;
+        const queueView = item => ({
+          id: item.id,
+          text: item.text,
+          displayText: item.display_text,
+          pendingQuotes: [], image_ids: "", hasAttach: false,
+          images: [], docs: [], expiredCount: 0,
+          pendingImages: [], pendingDocs: [],
+          delivery: "queue", deliveryStatus: "queued",
+          commandUuid: item.command_uuid,
+          targetTurnId: item.target_turn_id,
+          enqueuedAt: item.enqueued_at,
+        });
+        app.refreshSessions = async () => {};
+        app._pullSessionList = async () => false;
+        app._fetchTabUsage = async () => {};
+        app._checkActiveTurn = () => {};
+        app._scheduleIdlePreload = () => {};
+        app._syncQueueFromServer = async () => {};
+        app.appReady = true;
+        app._modelsLoaded = true;
+        app.availableModels = [{
+          model: "e2e-model", label: "E2E model", group: "e2e",
+          supports_thinking: true,
+        }];
+        app.model = "e2e-model";
+        app.defaultModel = "e2e-model";
+        app.lang = "zh";
+        app.busySendMode = "adjust";
+        app.sessions = [{
+          id: sid, name: "Optimistic queue tail", updated_at: 1,
+          model: "e2e-model", permission: "bypassPermissions", thinking: true,
+          active: true, turn_active: true,
+        }];
+        app.openTabIds = [sid];
+        app.tabState = {};
+        app.tabState[sid] = app._blankTabState();
+        const st = app._ensureTabState(sid);
+        st._loaded = true;
+        st.messages = [{
+          role: "assistant", text: "RUNNING_ASSISTANT_BEFORE_QUEUE",
+          html: "<p>RUNNING_ASSISTANT_BEFORE_QUEUE</p>",
+          uuid: "queue-tail-running-assistant",
+          _k: `${sid}:uuid:queue-tail-running-assistant`, _noAnim: true,
+        }];
+        Object.assign(st.messageRange, {
+          visibleStart: 0, visibleEnd: 1, offset: 0, total: 1,
+          preTotal: 0, order: "full", generation: "queue-tail-e2e",
+        });
+        st.messagesReady = true;
+        st.messagesLoading = false;
+        st.streaming = true;
+        st.activeTurnId = "existing-running-turn";
+        st._streamOwnerToken = "existing-running-owner";
+        st.pendingQueue = arg.initial.map(queueView);
+        app.currentId = sid;
+        app.mobileTab = "chat";
+        app._activateTabState(sid);
+        st.atBottom = true;
+        app.input = arg.prompt;
+        window.__optimisticQueueTailSend = app.send();
+        return true;
+        """,
+        {"sid": sid, "prompt": prompt, "initial": [first, second]},
+    )
+
+    page.wait_for_function(
+        """arg => {
+          const app = document.querySelector("#app")._x_dataStack[0];
+          const st = app._ensureTabState(arg.sid);
+          return st._queueAdmission?.displayText === arg.prompt
+            && document.querySelectorAll(".msg.user.queued").length === 3;
+        }""",
+        arg={"sid": sid, "prompt": prompt},
+        timeout=10000,
+    )
+    assert "route" in held_post, "send() did not reach the delayed queue POST"
+    assert len(post_payloads) == 1
+    assert post_payloads[0]["text"] == prompt
+    assert post_payloads[0]["delivery"] == "queue"
+
+    queued = page.locator(".msg.user.queued")
+    expect(queued).to_have_count(3)
+    assert queued.locator(".queued-text").all_text_contents() == [
+        "FIRST_QUEUE_ITEM", "SECOND_QUEUE_ITEM", prompt,
+    ]
+    assert queued.locator(".queued-label").all_text_contents() == [
+        "排队中 1 / 3", "排队中 2 / 3", "排队中 3 / 3",
+    ]
+    expect(
+        page.locator(f'.msg-pane[data-tid="{sid}"] .msg.user').filter(
+            has_text=prompt
+        )
+    ).to_have_count(0)
+    pending_actions = queued.nth(2).locator("button.queued-act")
+    expect(pending_actions).to_have_count(2)
+    expect(pending_actions.nth(0)).to_be_disabled()
+    expect(pending_actions.nth(1)).to_be_disabled()
+
+    held_post["route"].fulfill(
+        status=200,
+        content_type="application/json",
+        body=json.dumps({
+            "ok": True,
+            "item": accepted,
+            "effective_delivery": "queue",
+            "delivery_status": "queued",
+            "queue": {"items": authoritative, "revision": 3},
+        }),
+    )
+    send_result = _app_eval(
+        page, "return await window.__optimisticQueueTailSend;"
+    )
+    assert send_result is True
+    page.wait_for_function(
+        """arg => {
+          const app = document.querySelector("#app")._x_dataStack[0];
+          const st = app._ensureTabState(arg.sid);
+          return st._queueAdmission === null
+            && st.pendingQueue.length === 3
+            && document.querySelectorAll(".msg.user.queued").length === 3;
+        }""",
+        arg={"sid": sid},
+        timeout=10000,
+    )
+    settled = _app_eval(
+        page,
+        """
+        const st = app._ensureTabState(arg.sid);
+        return {
+          admission: st._queueAdmission,
+          ids: st.pendingQueue.map(item => item.id),
+          texts: st.pendingQueue.map(item => item.displayText),
+          transcriptPromptCount: st.messages.filter(
+            item => item.role === "user" && item.displayText === arg.prompt).length,
+        };
+        """,
+        {"sid": sid, "prompt": prompt},
+    )
+    assert settled == {
+        "admission": None,
+        "ids": [first["id"], second["id"], accepted["id"]],
+        "texts": [first["display_text"], second["display_text"], prompt],
+        "transcriptPromptCount": 0,
+    }
+    expect(queued).to_have_count(3)
+    assert queued.locator(".queued-text").all_text_contents() == [
+        "FIRST_QUEUE_ITEM", "SECOND_QUEUE_ITEM", prompt,
+    ]
+    assert queued.locator(".queued-label").all_text_contents() == [
+        "排队中 1 / 3", "排队中 2 / 3", "排队中 3 / 3",
+    ]
+    _assert_no_browser_errors(page, errors)
+
+
+def test_existing_same_turn_adjust_keeps_next_real_send_as_adjust(
+    page: Page, backend_url, auth_token,
+):
+    """A waiting adjustment must not downgrade the next same-turn send to FIFO."""
+    errors = _capture_browser_errors(page)
+    _login(page, backend_url, auth_token)
+    sid = "perf-repeated-midturn-adjust"
+    turn_id = "repeated-midturn-active-turn"
+    first_prompt = "FIRST_ADJUSTMENT_WAITING_FOR_TOOL"
+    second_prompt = "SECOND_ADJUSTMENT_MUST_STAY_NATIVE"
+    first = {
+        "id": "repeated-adjust-first",
+        "text": first_prompt,
+        "display_text": first_prompt,
+        "selection_quotes": [],
+        "image_ids": "",
+        "attachments": [],
+        "delivery": "adjust",
+        "steering_state": "waiting_tool",
+        "command_uuid": "repeated-adjust-first-command",
+        "target_turn_id": turn_id,
+        "enqueued_at": 1,
+    }
+    accepted = {
+        "id": "repeated-adjust-second",
+        "text": second_prompt,
+        "display_text": second_prompt,
+        "selection_quotes": [],
+        "image_ids": "",
+        "attachments": [],
+        "delivery": "adjust",
+        "steering_state": "waiting_tool",
+        "command_uuid": "repeated-adjust-second-command",
+        "target_turn_id": turn_id,
+        "enqueued_at": 2,
+    }
+    post_payloads: list[dict] = []
+
+    def queue_route(route):
+        if route.request.method == "POST":
+            post_payloads.append(route.request.post_data_json)
+            route.fulfill(
+                status=200,
+                content_type="application/json",
+                body=json.dumps({
+                    "ok": True,
+                    "item": accepted,
+                    "effective_delivery": "adjust",
+                    "delivery_status": "waiting_tool",
+                    "queue": {
+                        "items": [first, accepted],
+                        "paused": False,
+                        "revision": 2,
+                    },
+                }),
+            )
+            return
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({
+                "items": [first, accepted], "paused": False, "revision": 2,
+            }),
+        )
+
+    page.route(f"**/api/chat/sessions/{sid}/queue", queue_route)
+    result = _app_eval(
+        page,
+        """
+        const sid = arg.sid;
+        const turnId = arg.turnId;
+        app.refreshSessions = async () => {};
+        app._pullSessionList = async () => false;
+        app._fetchTabUsage = async () => {};
+        app._checkActiveTurn = () => {};
+        app._scheduleIdlePreload = () => {};
+        app._syncQueueFromServer = async () => {};
+        app.appReady = true;
+        app._modelsLoaded = true;
+        app.availableModels = [{
+          model: "e2e-model", label: "E2E model", group: "e2e",
+          supports_thinking: true,
+        }];
+        app.model = "e2e-model";
+        app.defaultModel = "e2e-model";
+        app.permission = "bypassPermissions";
+        app.busySendMode = "adjust";
+        app.sessions = [{
+          id: sid, name: "Repeated mid-turn adjust", updated_at: 1,
+          model: "e2e-model", permission: "bypassPermissions", thinking: true,
+          active: true, turn_active: true,
+        }];
+        app.openTabIds = [sid];
+        app.tabState = {};
+        app.tabState[sid] = app._blankTabState();
+        const st = app._ensureTabState(sid);
+        st._loaded = true;
+        st.messagesReady = true;
+        st.messagesLoading = false;
+        st.streaming = true;
+        st.activeTurnId = turnId;
+        st._streamOwnerToken = "repeated-midturn-owner";
+        st.pendingQueue = [{
+          id: arg.first.id,
+          text: arg.first.text,
+          displayText: arg.first.display_text,
+          pendingQuotes: [], image_ids: "", hasAttach: false,
+          images: [], docs: [], expiredCount: 0,
+          pendingImages: [], pendingDocs: [],
+          delivery: "adjust", deliveryStatus: "waiting_tool",
+          commandUuid: arg.first.command_uuid,
+          targetTurnId: turnId,
+          enqueuedAt: arg.first.enqueued_at,
+        }];
+        app.currentId = sid;
+        app.mobileTab = "chat";
+        app._activateTabState(sid);
+        st.atBottom = true;
+
+        // A native adjustment from another immutable turn is still an ordering
+        // barrier; only the exact current-turn row may admit another adjustment.
+        st.pendingQueue[0].targetTurnId = "different-active-turn";
+        const differentTurnDelivery = app._busySendDelivery(sid, turnId, false);
+        st.pendingQueue[0].targetTurnId = turnId;
+
+        app.input = arg.secondPrompt;
+        const sent = await app.send();
+        return {
+          sent,
+          differentTurnDelivery,
+          pending: st.pendingQueue.map(item => ({
+            id: item.id,
+            delivery: item.delivery,
+            deliveryStatus: item.deliveryStatus,
+            targetTurnId: item.targetTurnId,
+          })),
+        };
+        """,
+        {
+            "sid": sid,
+            "turnId": turn_id,
+            "first": first,
+            "secondPrompt": second_prompt,
+        },
+    )
+
+    assert result["sent"] is True
+    assert result["differentTurnDelivery"] == "queue"
+    assert len(post_payloads) == 1
+    assert post_payloads[0]["text"] == second_prompt
+    assert post_payloads[0]["delivery"] == "adjust"
+    assert post_payloads[0]["active_turn_id"] == turn_id
+    assert result["pending"] == [
+        {
+            "id": first["id"],
+            "delivery": "adjust",
+            "deliveryStatus": "waiting_tool",
+            "targetTurnId": turn_id,
+        },
+        {
+            "id": accepted["id"],
+            "delivery": "adjust",
+            "deliveryStatus": "waiting_tool",
+            "targetTurnId": turn_id,
+        },
+    ]
+    _assert_no_browser_errors(page, errors)
+
+
+def test_mux_pending_turn_busy_keeps_queue_admission_until_post_ack(
+    page: Page, backend_url, auth_token,
+):
+    """A synchronously replayed mux busy frame must not lose its pending card."""
+    errors = _capture_browser_errors(page)
+    page.set_viewport_size({"width": 1440, "height": 900})
+    _login(page, backend_url, auth_token)
+    sid = "mux-pending-turn-busy-admission"
+    prompt = "MUX_BUSY_QUEUE_POST_PENDING"
+    attempted_turn_id = "mux-attempted-turn"
+    busy_turn_id = "mux-existing-busy-turn"
+    accepted = {
+        "id": "mux-busy-queued-item",
+        "text": prompt,
+        "display_text": prompt,
+        "selection_quotes": [],
+        "image_ids": "",
+        "attachments": [],
+        "delivery": "queue",
+        "steering_state": "queued",
+        "command_uuid": "mux-busy-command",
+        "target_turn_id": busy_turn_id,
+        "enqueued_at": 1,
+    }
+    held_post: dict[str, object] = {}
+    post_payloads: list[dict] = []
+    start_payloads: list[dict] = []
+
+    def start_route(route):
+        start_payloads.append(route.request.post_data_json)
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({
+                "accepted": True,
+                "turn_id": attempted_turn_id,
+                "started_at": 1,
+            }),
+        )
+
+    def queue_route(route):
+        if route.request.method == "POST":
+            post_payloads.append(route.request.post_data_json)
+            held_post["route"] = route
+            return
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({"items": [accepted], "paused": False, "revision": 1}),
+        )
+
+    page.route("**/api/chat/turns/start", start_route)
+    page.route(f"**/api/chat/sessions/{sid}/queue", queue_route)
+    _app_eval(
+        page,
+        """
+        const sid = arg.sid;
+        app.refreshSessions = async () => {};
+        app._pullSessionList = async () => false;
+        app._fetchTabUsage = async () => {};
+        app._checkActiveTurn = () => {};
+        app._scheduleIdlePreload = () => {};
+        app._syncQueueFromServer = async () => {};
+        app._awaitRuntimeSettingPatches = async () => true;
+        app._confirmSessionBusy = async () => false;
+        app._ensureChatMux = async () => {
+          app._chatMuxConnected = true;
+          return true;
+        };
+        app.appReady = true;
+        app._modelsLoaded = true;
+        app.availableModels = [{
+          model: "e2e-model", label: "E2E model", group: "e2e",
+          supports_thinking: true,
+        }];
+        app.model = "e2e-model";
+        app.defaultModel = "e2e-model";
+        app.permission = "bypassPermissions";
+        app.lang = "zh";
+        app.busySendMode = "queue";
+        app.sessions = [{
+          id: sid, name: "Mux pending busy", updated_at: 1,
+          model: "e2e-model", permission: "bypassPermissions", thinking: true,
+          active: false, turn_active: false,
+        }];
+        app.openTabIds = [sid];
+        app.tabState = {};
+        app.tabState[sid] = app._blankTabState();
+        const st = app._ensureTabState(sid);
+        st._loaded = true;
+        st.messagesReady = true;
+        st.messagesLoading = false;
+        st.pendingQueue = [];
+        st.atBottom = true;
+        app.currentId = sid;
+        app._touchTranscriptPane(sid);
+        app._activateTabState(sid);
+        app.input = arg.prompt;
+
+        // The aggregate mux received this terminal admission race before the
+        // per-turn adapter installed its listeners. Activation replays it via
+        // dispatchEvent synchronously; its async handler then waits on the
+        // deliberately-held queue POST while send() reaches outer finally.
+        app._queueChatMuxEvent(sid, "error", JSON.stringify({
+          session_id: sid,
+          turn_id: arg.attemptedTurnId,
+          active_turn_id: arg.busyTurnId,
+          error: "session already has an active turn",
+          kind: "turn_busy",
+          retryable: true,
+          cta: "retry",
+        }));
+        window.__muxPendingBusySendSettled = false;
+        window.__muxPendingBusySendResult = "pending";
+        window.__muxPendingBusySend = app.send().then(result => {
+          window.__muxPendingBusySendSettled = true;
+          window.__muxPendingBusySendResult = result;
+          return result;
+        });
+        return true;
+        """,
+        {
+            "sid": sid,
+            "prompt": prompt,
+            "attemptedTurnId": attempted_turn_id,
+            "busyTurnId": busy_turn_id,
+        },
+    )
+
+    page.wait_for_function(
+        """arg => {
+          const app = document.querySelector("#app")._x_dataStack[0];
+          const st = app._ensureTabState(arg.sid);
+          return window.__muxPendingBusySendSettled === true
+            && st._composerSubmitToken === null
+            && st._queueAdmission?.displayText === arg.prompt
+            && st.pendingQueue.length === 0
+            && document.querySelectorAll(".msg.user.queued").length === 1;
+        }""",
+        arg={"sid": sid, "prompt": prompt},
+        timeout=10000,
+    )
+    assert len(start_payloads) == 1
+    assert "route" in held_post, "turn_busy handoff did not reach the delayed queue POST"
+    assert len(post_payloads) == 1
+    assert post_payloads[0]["text"] == prompt
+    assert post_payloads[0]["delivery"] == "queue"
+    assert post_payloads[0]["active_turn_id"] == busy_turn_id
+
+    queued = page.locator(".msg.user.queued")
+    expect(queued).to_have_count(1)
+    expect(queued.locator(".queued-text")).to_have_text(prompt)
+    expect(queued.locator(".queued-label")).to_have_text("排队中 1 / 1")
+    expect(queued.locator("button.queued-act").nth(0)).to_be_disabled()
+    expect(queued.locator("button.queued-act").nth(1)).to_be_disabled()
+    expect(
+        page.locator(f'.msg-pane[data-tid="{sid}"] .msg.user').filter(
+            has_text=prompt
+        )
+    ).to_have_count(0)
+
+    held_post["route"].fulfill(
+        status=200,
+        content_type="application/json",
+        body=json.dumps({
+            "ok": True,
+            "item": accepted,
+            "effective_delivery": "queue",
+            "delivery_status": "queued",
+            "queue": {"items": [accepted], "revision": 1},
+        }),
+    )
+    page.wait_for_function(
+        """arg => {
+          const app = document.querySelector("#app")._x_dataStack[0];
+          const st = app._ensureTabState(arg.sid);
+          return st._queueAdmission === null
+            && st.pendingQueue.length === 1
+            && st.pendingQueue[0].id === arg.itemId
+            && st.streaming === false
+            && !st._busyQueueHandoff
+            && document.querySelectorAll(".msg.user.queued").length === 1;
+        }""",
+        arg={"sid": sid, "itemId": accepted["id"]},
+        timeout=10000,
+    )
+    settled = _app_eval(
+        page,
+        """
+        const st = app._ensureTabState(arg.sid);
+        return {
+          admission: st._queueAdmission,
+          claim: st._composerSubmitToken,
+          ids: st.pendingQueue.map(item => item.id),
+          texts: st.pendingQueue.map(item => item.displayText),
+          displayIds: app.queueDisplayItems(st).map(item => item.id),
+          transcriptPromptCount: st.messages.filter(
+            item => item.role === "user" && item.displayText === arg.prompt).length,
+        };
+        """,
+        {"sid": sid, "prompt": prompt},
+    )
+    assert settled == {
+        "admission": None,
+        "claim": None,
+        "ids": [accepted["id"]],
+        "texts": [prompt],
+        "displayIds": [accepted["id"]],
+        "transcriptPromptCount": 0,
+    }
+    expect(queued).to_have_count(1)
+    expect(queued.locator(".queued-text")).to_have_text(prompt)
+    expect(queued.locator(".queued-label")).to_have_text("排队中 1 / 1")
+    _assert_no_browser_errors(page, errors)
+
+
 def test_admission_gap_resolves_exact_turn_before_busy_adjust_enqueue(
     page: Page, backend_url, auth_token,
 ):
@@ -6686,6 +7302,574 @@ def test_live_turn_keeps_resident_messages_but_bounds_mounted_rows(
     assert result["emojiLength"] == 1500
     assert result["emojiTruncated"] is False
     assert result["latest"] == {"start": 200, "end": 300, "mounted": 100}
+    _assert_no_browser_errors(page, errors)
+
+
+def test_repeated_tool_turn_then_fast_canonical_turns_keep_exact_dom_order(
+    page: Page, backend_url, auth_token,
+):
+    """Successive quiet installs must converge the keyed DOM without reload."""
+    errors = _capture_browser_errors(page)
+    page.set_viewport_size({"width": 1440, "height": 900})
+    _login(page, backend_url, auth_token)
+
+    result = page.evaluate(
+        """async () => {
+          const app = document.querySelector("#app")._x_dataStack[0];
+          const sid = "canonical-dom-fast-turns";
+          app.refreshSessions = async () => {};
+          app._fetchTabUsage = async () => {};
+          app._scheduleIdlePreload = () => {};
+          app.sessions = [{id: sid, name: "Canonical DOM", model: "e2e-model"}];
+          app.openTabIds = [sid];
+          app.tabState = {};
+          app.currentId = sid;
+          const st = app._ensureTabState(sid);
+          st._loaded = true;
+          st.messagesReady = true;
+          st.messagesLoading = false;
+          st.atBottom = true;
+          const canonical = [];
+          const addCanonical = message => {
+            canonical.push({...message, block_id: `${message.uuid}:0:${message.role}`});
+          };
+          const settle = async () => {
+            let next = app._historyEnvelopes(
+              sid, canonical.map(message => ({...message, _noAnim: true})));
+            next = app._preserveCanonicalMessageIdentity(st, next);
+            st.messageRange.visibleStart = Math.max(0, next.length - 100);
+            st.messageRange.visibleEnd = next.length;
+            st.messageRange.total = next.length;
+            st.messages = next;
+            app._syncSessionMessageStore(st);
+            await new Promise(resolve => app.$nextTick(
+              () => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+          };
+          const live = message => app._appendLiveMessage(st, message);
+
+          for (let i = 0; i < 70; i++) {
+            addCanonical({role: "assistant", text: `OLDER ${i}`,
+                          uuid: `older-${i}`});
+          }
+          addCanonical({role: "user", text: "RUN TEN LS",
+                        uuid: "prior-turn-user", _turnRoot: true});
+          let midturnSteering = null;
+          for (let i = 0; i < 10; i++) {
+            const id = `prior-tool-${i}`;
+            addCanonical({role: "tool_use", name: "Bash", text: "ls", id,
+                          uuid: `prior-tool-use-${i}`});
+            addCanonical({role: "tool_result", tool_name: "Bash",
+                          text: "same output", preview: "same output", id,
+                          tool_use_id: id, uuid: `prior-tool-result-${i}`});
+          }
+          addCanonical({role: "assistant", text: "TEN LS DONE",
+                        uuid: "prior-turn-final", turn_status: "completed"});
+          await settle();
+
+          live({role: "user", text: "RUN TEN LS", _turnRoot: true});
+          addCanonical({role: "user", text: "RUN TEN LS", uuid: "turn-a-user",
+                        _turnRoot: true});
+          for (let i = 0; i < 10; i++) {
+            const id = `tool-${i}`;
+            live({role: "tool_use", name: "Bash", text: "ls", id});
+            addCanonical({role: "tool_use", name: "Bash", text: "ls", id,
+                          uuid: `turn-a-tool-use-${i}`});
+            live({role: "tool_result", tool_name: "Bash", text: "same output",
+                  preview: "same output", id, tool_use_id: id});
+            addCanonical({role: "tool_result", tool_name: "Bash",
+                          text: "same output", preview: "same output", id,
+                          tool_use_id: id, uuid: `turn-a-tool-result-${i}`});
+            if (i === 0) {
+              midturnSteering = live({
+                role: "user", text: "test", uuid: "midturn-user",
+                _steeringAdjustment: true, _turnRoot: false,
+              });
+              addCanonical({role: "user", text: "test",
+                            uuid: "midturn-user", _steeringAdjustment: true,
+                            _turnRoot: false});
+            }
+          }
+          live({role: "assistant", text: "TEN LS DONE", forkUuid: "turn-a-final"});
+          addCanonical({role: "assistant", text: "TEN LS DONE",
+                        uuid: "turn-a-final", turn_status: "completed"});
+
+          let firstQueuedLiveUser = null;
+          let firstQueuedLiveAssistant = null;
+          for (const [index, prompt, reply] of [
+            [1, "test", "TEST REPLY"],
+            [2, "test", "TEST REPLY"],
+            [3, "stop", "STOP REPLY"],
+          ]) {
+            // The browser attached only to the first short queued turn. The
+            // second identical turn and the final stop both completed between
+            // /active probes and therefore exist only in canonical history.
+            // This is the real refresh-only failure: weak newest-first text
+            // matching must not move the first live `test` node onto turn 2.
+            if (index === 1) {
+              firstQueuedLiveUser = live({
+                role: "user", text: prompt, _turnRoot: true,
+                _turnId: `turn-${index}`,
+              });
+              firstQueuedLiveAssistant = live({
+                role: "assistant", text: reply,
+                forkUuid: `turn-${index}-assistant`,
+                ts: "13:49", elapsed: 7, model: "first-live-model",
+                turn_status: "completed",
+              });
+            }
+            addCanonical({role: "user", text: prompt,
+                          uuid: `turn-${index}-user`, _turnRoot: true});
+            addCanonical({role: "assistant", text: reply,
+                          uuid: `turn-${index}-assistant`,
+                          turn_status: "completed"});
+          }
+          await settle();
+
+          const firstCanonicalUser = st.messages.find(
+            message => message.uuid === "turn-1-user");
+          const secondCanonicalUser = st.messages.find(
+            message => message.uuid === "turn-2-user");
+          const firstCanonicalAssistant = st.messages.find(
+            message => message.uuid === "turn-1-assistant");
+          const finalCanonicalAssistant = st.messages.find(
+            message => message.uuid === "turn-3-assistant");
+
+          const pane = document.querySelector(
+            `.msg-pane[data-tid="${CSS.escape(sid)}"]`);
+          const visible = st.messages.slice(
+            st.messageRange.visibleStart, st.messageRange.visibleEnd);
+          const stateKeys = visible.map(message => message._k);
+          const stateRows = visible.map(message =>
+            `${message.role}:${message.text || message.preview || ""}`);
+          const dom = Array.from(pane.querySelectorAll(":scope > .msg"));
+          const initial = {
+            stateKeys,
+            stateRows,
+            domKeys: dom.map(node => node.dataset.messageKey),
+            domRows: dom.map(node => {
+              const message = (node._x_dataStack || [])
+                .map(scope => scope && scope.m).find(Boolean);
+                return `${message?.role || ""}:${message?.text || message?.preview || ""}`;
+              }),
+          };
+          const epochBeforeRepair = st._transcriptRenderEpoch;
+          dom[Math.floor(dom.length / 2)].remove();
+          const repaired = await app._ensureTranscriptDomConverged(
+            sid, st, {followTail: true});
+          await new Promise(resolve => app.$nextTick(
+            () => requestAnimationFrame(resolve)));
+          const repairedPane = document.querySelector(
+            `.msg-pane[data-tid="${CSS.escape(sid)}"]`);
+          const repairedDomKeys = Array.from(repairedPane.querySelectorAll(
+            ":scope > .msg[data-message-key]"
+          )).map(node => node.dataset.messageKey);
+          const epochBeforeSwitch = st._transcriptRenderEpoch;
+          const switchedCheck = app._ensureTranscriptDomConverged(sid, st);
+          app.currentId = "another-open-tab";
+          const switchedAwayAccepted = await switchedCheck;
+          app.currentId = sid;
+          app._activateTabState(sid);
+          return {
+            initial,
+            identity: {
+              firstUserPreserved: firstCanonicalUser === firstQueuedLiveUser,
+              firstAssistantPreserved:
+                firstCanonicalAssistant === firstQueuedLiveAssistant,
+              firstLiveUserOwnerUuid: st.messages.find(
+                message => message === firstQueuedLiveUser)?.uuid || "",
+              steeringOwnerUuid: st.messages.find(
+                message => message === midturnSteering)?.uuid || "",
+              firstLiveUserKey: firstQueuedLiveUser?._k || "",
+              firstUserKey: firstCanonicalUser?._k || "",
+              secondUserKey: secondCanonicalUser?._k || "",
+              firstAssistantFooter: {
+                ts: firstCanonicalAssistant?.ts || "",
+                elapsed: firstCanonicalAssistant?.elapsed || 0,
+                model: firstCanonicalAssistant?.model || "",
+              },
+              finalAssistantFooter: {
+                ts: finalCanonicalAssistant?.ts || "",
+                elapsed: finalCanonicalAssistant?.elapsed || 0,
+                model: finalCanonicalAssistant?.model || "",
+              },
+            },
+            repaired,
+            epochBeforeRepair,
+            epochAfterRepair: st._transcriptRenderEpoch,
+            repairedDomKeys,
+            switchedAwayAccepted,
+            epochBeforeSwitch,
+            epochAfterSwitch: st._transcriptRenderEpoch,
+          };
+        }"""
+    )
+
+    initial = result["initial"]
+    assert len(initial["stateKeys"]) == len(set(initial["stateKeys"])), result
+    assert len(initial["domKeys"]) == len(set(initial["domKeys"])), result
+    assert initial["domKeys"] == initial["stateKeys"], result
+    assert initial["domRows"] == initial["stateRows"], result
+    assert result["identity"]["firstAssistantPreserved"] is True, result
+    assert result["identity"]["firstLiveUserOwnerUuid"] != "turn-2-user", result
+    assert result["identity"]["steeringOwnerUuid"] == "midturn-user", result
+    assert result["identity"]["secondUserKey"] != result["identity"]["firstLiveUserKey"], result
+    assert result["identity"]["firstUserKey"] != result["identity"]["secondUserKey"], result
+    assert result["identity"]["firstAssistantFooter"] == {
+        "ts": "13:49", "elapsed": 7, "model": "first-live-model",
+    }, result
+    assert result["identity"]["finalAssistantFooter"] == {
+        "ts": "", "elapsed": 0, "model": "",
+    }, result
+    assert result["repaired"] is True, result
+    assert result["epochAfterRepair"] == result["epochBeforeRepair"] + 1, result
+    assert result["repairedDomKeys"] == initial["stateKeys"], result
+    assert result["switchedAwayAccepted"] is True, result
+    assert result["epochAfterSwitch"] == result["epochBeforeSwitch"], result
+    _assert_no_browser_errors(page, errors)
+
+
+def test_queue_attach_final_canonical_load_converges_duplicate_fast_successors(
+    page: Page, backend_url, auth_token,
+):
+    """The real queue-attach fallback must install every fast successor once."""
+    errors = _capture_browser_errors(page)
+    page.set_viewport_size({"width": 1440, "height": 900})
+    sid = "queue-attach-duplicate-successors"
+
+    canonical_messages: list[dict] = []
+
+    def add_message(role: str, text: str, uuid: str, **extra) -> None:
+        canonical_messages.append({
+            "role": role,
+            "text": text,
+            "uuid": uuid,
+            "block_id": f"{uuid}:0:{role}",
+            **extra,
+        })
+
+    # 99 durable rows precede the first queued turn. Together with the three
+    # queued prompt/reply pairs below, the final canonical snapshot has 105
+    # blocks, matching the long tool-heavy transcript that exposed the bug.
+    for index in range(77):
+        add_message("assistant", f"OLDER {index}", f"older-{index}")
+    add_message(
+        "user", "RUN TEN LS", "direct-turn-user", _turnRoot=True,
+    )
+    for index in range(10):
+        tool_id = f"direct-tool-{index}"
+        add_message(
+            "tool_use", "ls", f"direct-tool-use-{index}",
+            id=tool_id, name="Bash",
+        )
+        add_message(
+            "tool_result", "same output", f"direct-tool-result-{index}",
+            id=tool_id, tool_use_id=tool_id, tool_name="Bash",
+            preview="same output",
+        )
+    add_message(
+        "assistant", "TEN LS DONE", "direct-turn-final",
+        turn_status="completed", model="e2e-model", ts=69_000, elapsed=9,
+    )
+    assert len(canonical_messages) == 99
+
+    add_message("user", "test", "turn-1-user", _turnRoot=True)
+    add_message(
+        "assistant", "TEST REPLY", "turn-1-assistant",
+        turn_status="completed", model="e2e-model", ts=70_000, elapsed=1,
+    )
+    live_canonical_count = len(canonical_messages)
+    add_message("user", "test", "turn-2-user", _turnRoot=True)
+    add_message(
+        "assistant", "TEST REPLY", "turn-2-assistant",
+        turn_status="completed", model="e2e-model", ts=71_000, elapsed=1,
+    )
+    add_message("user", "stop", "turn-3-user", _turnRoot=True)
+    add_message(
+        "assistant", "STOP REPLY", "turn-3-assistant",
+        turn_status="completed", model="e2e-model", ts=72_000, elapsed=1,
+    )
+    assert len(canonical_messages) == 105
+
+    queue_requests: list[str] = []
+    active_requests: list[str] = []
+    history_requests: list[str] = []
+
+    def empty_queue(route):
+        queue_requests.append(route.request.url)
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({"items": [], "paused": False, "revision": 72}),
+        )
+
+    def inactive_queued(route):
+        active_requests.append(route.request.url)
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({
+                "active": False,
+                "activity_source": "queued",
+                "background_tasks_pending": 0,
+            }),
+        )
+
+    def final_canonical_history(route):
+        history_requests.append(route.request.url)
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({
+                "id": sid,
+                "name": "Queue attach duplicate successors",
+                "model": "e2e-model",
+                "permission": "bypassPermissions",
+                "thinking": True,
+                "updated_at": 72,
+                "messages": canonical_messages,
+                "offset": 0,
+                "total": len(canonical_messages),
+                "message_count": len(canonical_messages),
+                "pre_total": 0,
+                "history_order": "normal",
+                "history_generation": "queue-generation-72",
+                "runtime_ui_revision": "queue-ui-revision-72",
+            }),
+        )
+
+    page.route(f"**/api/chat/sessions/{sid}/queue", empty_queue)
+    page.route(f"**/api/chat/sessions/{sid}/active", inactive_queued)
+    page.route(
+        re.compile(
+            rf".*/api/chat/sessions/{re.escape(sid)}\?tail=\d+(?:&.*)?$"
+        ),
+        final_canonical_history,
+    )
+    _login(page, backend_url, auth_token)
+
+    result = _app_eval(
+        page,
+        """
+        const sid = arg.sid;
+        if (app._sessionsSyncTimer) clearInterval(app._sessionsSyncTimer);
+        app._sessionsSyncTimer = null;
+        app.refreshSessions = async () => {};
+        app._pullSessionList = async () => false;
+        app._syncSessionListQuiet = async () => false;
+        app._fetchTabUsage = async () => {};
+        app._checkActiveTurn = () => {};
+        app._scheduleIdlePreload = () => {};
+        app.appReady = true;
+        app.availableModels = [{
+          model: "e2e-model", label: "E2E model", group: "e2e",
+          supports_thinking: true,
+        }];
+        app.sessions = [{
+          id: sid, name: "Queue attach duplicate successors", updated_at: 70,
+          message_count: arg.baseMessages.length,
+          model: "e2e-model", permission: "bypassPermissions", thinking: true,
+        }];
+        app.openTabIds = [sid];
+        app.tabState = {};
+        app.tabState[sid] = app._blankTabState();
+        const st = app._ensureTabState(sid);
+        st.messages = app._historyEnvelopes(
+          sid, arg.baseMessages.map(message => ({...message, _noAnim: true})));
+        Object.assign(st.messageRange, {
+          visibleStart: 0,
+          visibleEnd: st.messages.length,
+          offset: 0,
+          total: st.messages.length,
+          preTotal: 0,
+          order: "normal",
+          generation: "queue-generation-70",
+        });
+        app._syncSessionMessageStore(st);
+        st._loaded = true;
+        st._installedCanonicalCount = st.messages.length;
+        st._seenUpdated = 70;
+        st.runtimeUiRevision = "queue-ui-revision-70";
+        st._queueRevision = 71;
+        st.messagesReady = true;
+        st.messagesLoading = false;
+        st.atBottom = true;
+
+        // Only queue turn 1 reached the browser live. Turn 2 has identical
+        // prompt/reply prose, so a weak newest-first matcher used to steal
+        // turn 1's mounted key and make Alpine's keyed mover throw `.after`.
+        const firstLiveUser = app._appendLiveMessage(st, {
+          role: "user", text: "test", _turnRoot: true, _turnId: "turn-1",
+        });
+        const firstLiveAssistant = app._appendLiveMessage(st, {
+          role: "assistant", text: "TEST REPLY",
+          forkUuid: "turn-1-assistant", turn_status: "completed",
+          model: "e2e-model", ts: 70_000, elapsed: 1,
+        });
+        st.pendingQueue = arg.pending.map(item => ({
+          id: item.id,
+          text: item.text,
+          displayText: item.text,
+          pendingQuotes: [],
+          image_ids: "",
+          hasAttach: false,
+          images: [], docs: [], expiredCount: 0,
+          pendingImages: [], pendingDocs: [],
+          delivery: "queue",
+          deliveryStatus: "queued",
+          commandUuid: `${item.id}-command`,
+          targetTurnId: "turn-1",
+          enqueuedAt: item.enqueuedAt,
+        }));
+        st._queuePaused = false;
+        app.currentId = sid;
+        app.mobileTab = "chat";
+        app._activateTabState(sid);
+
+        const reports = [];
+        const originalReport = app._reportHistoryLoadPerf;
+        app._reportHistoryLoadPerf = fields => reports.push({...fields});
+        try {
+          await new Promise(resolve => app.$nextTick(
+            () => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+          const before = {
+            messageCount: st.messages.length,
+            tail: st.messages.slice(-2).map(message => ({
+              role: message.role,
+              text: message.text,
+              uuid: message.uuid || "",
+            })),
+            pending: st.pendingQueue.map(item => item.text),
+            queueCards: document.querySelectorAll(".msg.user.queued").length,
+          };
+
+          const loaded = await app._runQueueAttach(sid, st, {tries: 2});
+          for (let index = 0; index < 100; index++) {
+            const sync = st.sessionSync;
+            if (!st._draining && !sync.inFlight && !sync.timer
+                && !Object.keys(sync.pending || {}).length) break;
+            await new Promise(resolve => setTimeout(resolve, 10));
+          }
+          await new Promise(resolve => app.$nextTick(
+            () => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+
+          const pane = document.querySelector(
+            `.msg-pane[data-tid="${CSS.escape(sid)}"]`);
+          const rendered = app.paneMessages(sid);
+          const nodes = Array.from(pane.querySelectorAll(
+            ":scope > .msg[data-message-key]"));
+          const firstCanonicalAssistant = st.messages.find(
+            message => message.uuid === "turn-1-assistant");
+          const secondCanonicalAssistant = st.messages.find(
+            message => message.uuid === "turn-2-assistant");
+          return {
+            before,
+            loaded,
+            reports,
+            watermarks: {
+              seenUpdated: st._seenUpdated,
+              installedCanonicalCount: st._installedCanonicalCount,
+              runtimeUiRevision: st.runtimeUiRevision,
+              queueRevision: st._queueRevision,
+              total: st.messageRange.total,
+              generation: st.messageRange.generation,
+            },
+            canonicalUuids: st.messages.map(message => message.uuid || ""),
+            stateKeys: rendered.map(message => message._k),
+            stateUuids: rendered.map(message => message.uuid || ""),
+            domKeys: nodes.map(node => node.dataset.messageKey),
+            domUuids: nodes.map(node => node.dataset.uuid || ""),
+            identity: {
+              firstAssistantPreserved:
+                firstCanonicalAssistant === firstLiveAssistant,
+              firstAssistantKey: firstCanonicalAssistant?._k || "",
+              firstLiveAssistantKey: firstLiveAssistant?._k || "",
+              secondAssistantKey: secondCanonicalAssistant?._k || "",
+              firstLiveUserOwnerUuid: st.messages.find(
+                message => message === firstLiveUser)?.uuid || "",
+            },
+            queue: {
+              pendingCount: st.pendingQueue.length,
+              displayCount: app.queueDisplayItems(st).length,
+              cardCount: document.querySelectorAll(".msg.user.queued").length,
+              paused: st._queuePaused,
+            },
+            settled: {
+              draining: st._draining,
+              syncInFlight: !!st.sessionSync.inFlight,
+              syncTimer: !!st.sessionSync.timer,
+              syncPending: Object.keys(st.sessionSync.pending || {}).length,
+              ready: st.messagesReady,
+              loading: st.messagesLoading,
+            },
+          };
+        } finally {
+          app._reportHistoryLoadPerf = originalReport;
+          app._disposeSessionSync(st);
+        }
+        """,
+        {
+            "sid": sid,
+            "baseMessages": canonical_messages[:99],
+            "pending": [
+                {"id": "queued-turn-2", "text": "test", "enqueuedAt": 71},
+                {"id": "queued-turn-3", "text": "stop", "enqueuedAt": 72},
+            ],
+        },
+    )
+
+    assert result["before"] == {
+        "messageCount": live_canonical_count,
+        "tail": [
+            {"role": "user", "text": "test", "uuid": ""},
+            {"role": "assistant", "text": "TEST REPLY", "uuid": ""},
+        ],
+        "pending": ["test", "stop"],
+        "queueCards": 2,
+    }, result
+    assert result["loaded"] is True, result
+    assert len(history_requests) == 1, history_requests
+    assert len(queue_requests) >= 2, queue_requests
+    assert len(active_requests) >= 2, active_requests
+    assert result["watermarks"] == {
+        "seenUpdated": 72,
+        "installedCanonicalCount": 105,
+        "runtimeUiRevision": "queue-ui-revision-72",
+        "queueRevision": 72,
+        "total": 105,
+        "generation": "queue-generation-72",
+    }, result
+    assert result["canonicalUuids"] == [
+        message["uuid"] for message in canonical_messages
+    ], result
+    assert len(result["stateKeys"]) == len(set(result["stateKeys"])), result
+    assert len(result["domKeys"]) == len(set(result["domKeys"])), result
+    assert result["domKeys"] == result["stateKeys"], result
+    assert result["domUuids"] == result["stateUuids"], result
+    assert result["identity"]["firstAssistantPreserved"] is True, result
+    assert (
+        result["identity"]["firstAssistantKey"]
+        == result["identity"]["firstLiveAssistantKey"]
+    ), result
+    assert (
+        result["identity"]["secondAssistantKey"]
+        != result["identity"]["firstLiveAssistantKey"]
+    ), result
+    assert result["identity"]["firstLiveUserOwnerUuid"] != "turn-2-user", result
+    assert result["queue"] == {
+        "pendingCount": 0,
+        "displayCount": 0,
+        "cardCount": 0,
+        "paused": False,
+    }, result
+    assert result["settled"] == {
+        "draining": False,
+        "syncInFlight": False,
+        "syncTimer": False,
+        "syncPending": 0,
+        "ready": True,
+        "loading": False,
+    }, result
+    assert result["reports"] and result["reports"][0]["status"] == "ok", result
     _assert_no_browser_errors(page, errors)
 
 

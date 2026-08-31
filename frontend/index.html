@@ -1950,7 +1950,7 @@
           <!-- Keep a bounded set of recent transcript panes mounted as an LRU DOM
                cache. Each pane exposes only its messageRange window; hidden panes
                retain keyed state but remain out of layout. -->
-          <template x-for="tid in warmTranscriptTabIds()" :key="tid">
+          <template x-for="tid in warmTranscriptTabIds()" :key="transcriptPaneKey(tid)">
           <div class="msg-pane"
                x-show="tid === currentId"
                x-cloak
@@ -2985,6 +2985,7 @@
                                        || activeSession.messages[activeSession.messages.length-1].role === 'user')
                        && (!activeSession.messages.length
                          || !activeSession.messages[activeSession.messages.length-1]._admissionPending)
+                       && !activeSession._queueAdmission
                        && !activeSession.compacting
                        && !activeSession._continuationAwaitingReaction"
                class="turn-footer turn-pending-footer"
@@ -3013,7 +3014,7 @@
                replying (or while a compact was running). They auto-drain on
                the next done event / compact-finally / activateTab. Faded
                + dashed border distinguishes them from real user bubbles. -->
-          <template x-for="(q, qi) in activeSession.pendingQueue" :key="q.id">
+          <template x-for="(q, qi) in queueDisplayItems(activeSession)" :key="q.id">
             <div class="msg user queued">
               <div class="msg-row queued-row"
                    :class="{ 'avoids-tail-nav': isAwayFromLatest() }">
@@ -3022,7 +3023,7 @@
                     <span class="queued-icon"><svg><use href="#i-clock"/></svg></span>
                     <span class="queued-label"
                           x-text="queueDeliveryLabel(q) + ' ' + (qi+1) + ' / '
-                                   + activeSession.pendingQueue.length"></span>
+                                   + queueDisplayItems(activeSession).length"></span>
                     <!-- "已排队 1/2" alone reads as "will send shortly", which
                          is wrong while the queue is paused — the item will
                          NEVER send until Resume. State the difference on the
@@ -3035,14 +3036,14 @@
                           x-text="lang==='zh' ? '已暂停' : 'paused'"></span>
                     <span style="flex:1"></span>
                     <button class="queued-act icon-btn sm"
-                            @click="editPendingQueueItem(currentId, qi)"
-                            :disabled="queueActionBusy(currentId, 'edit:' + q.id)"
+                            @click="!q._admissionPending && editPendingQueueItem(currentId, qi)"
+                            :disabled="q._admissionPending || queueActionBusy(currentId, 'edit:' + q.id)"
                             :title="lang==='zh' ? '编辑' : 'Edit'">
                       <svg><use href="#i-edit"/></svg>
                     </button>
                     <button class="queued-act icon-btn sm"
-                            @click="removePendingQueueItem(currentId, qi)"
-                            :disabled="queueActionBusy(currentId, 'remove:' + q.id)"
+                            @click="!q._admissionPending && removePendingQueueItem(currentId, qi)"
+                            :disabled="q._admissionPending || queueActionBusy(currentId, 'remove:' + q.id)"
                             :title="lang==='zh' ? '移除' : 'Remove'">
                       <svg><use href="#i-x"/></svg>
                     </button>
