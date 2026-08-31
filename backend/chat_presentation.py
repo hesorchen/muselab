@@ -637,9 +637,12 @@ def broadcast_to_ui_messages(broadcast: Any) -> list[dict]:
             "text": broadcast.user_text,
             "images": broadcast.user_images,
             "docs": broadcast.user_docs,
+            "_turnId": broadcast.turn_id,
+            "_turnRoot": True,
         })
     current_text: dict | None = None
     current_thinking: dict | None = None
+    steering_users: set[str] = set()
 
     def close_segment() -> None:
         nonlocal current_text, current_thinking
@@ -706,6 +709,33 @@ def broadcast_to_ui_messages(broadcast: Any) -> list[dict]:
                 "is_error": data.get("is_error"),
                 "bash": data.get("bash"),
             })
+        elif kind == "queue_steering":
+            state = str(data.get("state") or "")
+            message = data.get("message")
+            command_uuid = str(data.get("command_uuid") or "")
+            identity = command_uuid or str(data.get("item_id") or "")
+            if (state in {"started", "completed"}
+                    and isinstance(message, dict)
+                    and identity not in steering_users):
+                close_segment()
+                steering_users.add(identity)
+                out.append({
+                    "role": "user",
+                    "text": str(message.get("text") or ""),
+                    "displayText": str(message.get("display_text") or ""),
+                    "selectionQuotes": (
+                        message.get("selection_quotes")
+                        if isinstance(message.get("selection_quotes"), list)
+                        else []
+                    ),
+                    "images": [],
+                    "docs": [],
+                    "uuid": command_uuid,
+                    "_turnId": str(data.get("turn_id") or broadcast.turn_id),
+                    "_turnRoot": False,
+                    "_steeringAdjustment": True,
+                    "_queueItemId": str(data.get("item_id") or ""),
+                })
         elif kind == "task_started":
             apply_task_status(
                 str(data.get("tool_use_id") or ""),

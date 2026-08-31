@@ -4424,10 +4424,10 @@ def test_load_session_reconnects_active_turn_and_renders_live_assistant(
     _assert_no_browser_errors(page, errors)
 
 
-def test_active_turn_adoption_requires_physical_tail_and_full_prompt_envelope(
+def test_active_turn_adoption_uses_tail_or_bounded_running_suffix(
     page: Page, backend_url, auth_token,
 ):
-    """Repeated text and attachment-only prompts cannot claim an older row."""
+    """Older repeats stay unclaimed; steering can follow the active root."""
     _login(page, backend_url, auth_token)
     result = _app_eval(
         page,
@@ -4473,6 +4473,17 @@ def test_active_turn_adoption_requires_physical_tail_and_full_prompt_envelope(
           ], [{ name: "notes.md", kind: "text" }],
         );
 
+        const midturn = makeState("active-midturn", [
+          { role: "assistant", text: "previous reply", turn_status: "completed" },
+          { role: "user", text: "original active prompt" },
+          { role: "tool_result", text: "tool result" },
+          { role: "user", text: "mid-turn adjustment", uuid: "steering-command" },
+          { role: "assistant", text: "active reply", turn_status: "running" },
+        ]);
+        const midturnResult = app._installActiveTurnUser(
+          midturn, "turn-midturn", "original active prompt", [], [],
+        );
+
         return {
           repeated: {
             appended: repeatedResult.appended,
@@ -4490,6 +4501,13 @@ def test_active_turn_adoption_requires_physical_tail_and_full_prompt_envelope(
             appended: exactResult.appended,
             length: exactTail.messages.length,
             tailTurnId: exactTail.messages.at(-1)._turnId || "",
+          },
+          midturn: {
+            appended: midturnResult.appended,
+            length: midturn.messages.length,
+            rootTurnId: midturn.messages[1]._turnId || "",
+            rootMarked: midturn.messages[1]._turnRoot === true,
+            adjustmentTurnId: midturn.messages[3]._turnId || "",
           },
         };
         """,
@@ -4510,6 +4528,13 @@ def test_active_turn_adoption_requires_physical_tail_and_full_prompt_envelope(
         "appended": False,
         "length": 1,
         "tailTurnId": "turn-exact",
+    }
+    assert result["midturn"] == {
+        "appended": False,
+        "length": 5,
+        "rootTurnId": "turn-midturn",
+        "rootMarked": True,
+        "adjustmentTurnId": "",
     }
 
 
@@ -4653,6 +4678,230 @@ def test_session_sync_deadline_dispose_and_hidden_resume(
     assert result["resumed"] is True
     assert result["retryDelays"] == [800, 1600, 3200]
     assert result["activityDelays"] == [1000, 2000, 4000]
+    _assert_no_browser_errors(page, errors)
+
+
+def test_started_queue_steering_becomes_user_bubble_at_stream_boundary(
+    page: Page, backend_url, auth_token,
+):
+    """A native mid-turn adjustment replaces its queue row in event order."""
+    errors = _capture_browser_errors(page)
+    page.set_viewport_size({"width": 1440, "height": 900})
+    _install_fake_event_source(page)
+    sid = "perf-midturn-steering-bubble"
+    command_uuid = "midturn-command-uuid"
+    item_id = "midturn-queue-item"
+    adjustment = "MIDTURN_ADJUSTMENT_VISIBLE"
+    history_marker = "MIDTURN_HISTORY_MARKER"
+    page.route(
+        "**/api/chat/stream/start",
+        lambda route: route.fulfill(
+            status=200,
+            content_type="application/json",
+            body='{"ticket":"midturn-steering-ticket"}',
+        ),
+    )
+    _login(page, backend_url, auth_token)
+    _app_eval(
+        page,
+        """
+        const sid = arg.sid;
+        app.refreshSessions = async () => {};
+        app._pullSessionList = async () => false;
+        app._fetchTabUsage = async () => {};
+        app._checkActiveTurn = () => {};
+        app._scheduleIdlePreload = () => {};
+        app._ensureSessionRegistered = async () => true;
+        app._confirmSessionBusy = async () => false;
+        app.appReady = true;
+        app.availableModels = [{
+          model: "e2e-model", label: "E2E model", group: "e2e",
+          supports_thinking: true,
+        }];
+        app.model = "e2e-model";
+        app.defaultModel = "e2e-model";
+        app.sessions = [{
+          id: sid, name: "Mid-turn steering bubble", updated_at: 1,
+          model: "e2e-model", permission: "bypassPermissions", thinking: true,
+        }];
+        app.openTabIds = [sid];
+        app.tabState = {};
+        app.tabState[sid] = app._blankTabState();
+        const st = app._ensureTabState(sid);
+        st._loaded = true;
+        st.messages.push({
+          role: "assistant", text: arg.historyMarker,
+          html: `<p>${arg.historyMarker}</p>`, uuid: "midturn-history-uuid",
+          _k: `${sid}:uuid:midturn-history-uuid`, _noAnim: true,
+        });
+        Object.assign(st.messageRange, {
+          visibleStart: 0, visibleEnd: 1, offset: 0, total: 1,
+          preTotal: 0, order: "full", generation: "midturn-e2e",
+        });
+        app.currentId = sid;
+        app._activateTabState(sid);
+        st.messagesReady = true;
+        st.messagesLoading = false;
+        st.atBottom = true;
+        app.mobileTab = "chat";
+        app.input = "MIDTURN_ORIGINAL_PROMPT";
+        return true;
+        """,
+        {"sid": sid, "historyMarker": history_marker},
+    )
+
+    _app_eval(page, "app.send(); return true;")
+    page.wait_for_function(
+        "() => window.__fakeChatStreams && window.__fakeChatStreams().length === 1"
+    )
+    _app_eval(
+        page,
+        """
+        const st = app._ensureTabState(arg.sid);
+        st.pendingQueue = [{
+          id: arg.itemId,
+          text: arg.adjustment,
+          displayText: arg.adjustment,
+          pendingQuotes: [], images: [], docs: [],
+          delivery: "adjust", deliveryStatus: "waiting_tool",
+          commandUuid: arg.commandUuid,
+          enqueuedAt: Date.now(),
+        }];
+        return true;
+        """,
+        {
+            "sid": sid,
+            "itemId": item_id,
+            "commandUuid": command_uuid,
+            "adjustment": adjustment,
+        },
+    )
+    expect(page.locator(".msg.user.queued")).to_contain_text(
+        adjustment, timeout=5000
+    )
+
+    page.evaluate(
+        """arg => {
+          const common = { turn_id: "midturn-turn", session_id: arg.sid };
+          window.__emitSse("text", {
+            ...common, event_seq: 1, text: "ASSISTANT_BEFORE_ADJUSTMENT",
+          });
+          window.__emitSse("tool_use", {
+            ...common, event_seq: 2, id: "midturn-tool-use",
+            name: "Read", summary: "inspect before adjustment", input: {},
+          });
+          window.__emitSse("tool_result", {
+            ...common, event_seq: 3, id: "midturn-tool-use",
+            tool_name: "Read", preview: "TOOL_RESULT_BEFORE_ADJUSTMENT",
+            text: "TOOL_RESULT_BEFORE_ADJUSTMENT", is_error: false,
+          });
+          const steering = {
+            ...common,
+            item_id: arg.itemId,
+            command_uuid: arg.commandUuid,
+            state: "started",
+            effective_delivery: "adjust",
+            message: {
+              id: arg.itemId, uuid: arg.commandUuid,
+              text: arg.adjustment, display_text: arg.adjustment,
+              selection_quotes: [],
+            },
+          };
+          window.__emitSse("queue_steering", steering);
+          window.__emitSse("text", {
+            ...common, event_seq: 4, text: "ASSISTANT_AFTER_PART_A ",
+          });
+          // The terminal lifecycle event is a duplicate transcript boundary,
+          // not a second user message and not a reason to split assistant text.
+          window.__emitSse("queue_steering", {...steering, state: "completed"});
+          window.__emitSse("text", {
+            ...common, event_seq: 5, text: "ASSISTANT_AFTER_PART_B",
+          });
+        }""",
+        {
+            "sid": sid,
+            "itemId": item_id,
+            "commandUuid": command_uuid,
+            "adjustment": adjustment,
+        },
+    )
+    page.wait_for_function(
+        """arg => {
+          const app = document.querySelector("#app")._x_dataStack[0];
+          const st = app._ensureTabState(arg.sid);
+          const adjustmentIndex = st.messages.findIndex(
+            m => m.role === "user" && m.uuid === arg.commandUuid);
+          const after = adjustmentIndex >= 0 ? st.messages[adjustmentIndex + 1] : null;
+          return adjustmentIndex >= 0 && st.pendingQueue.length === 0
+            && after?.role === "assistant"
+            && after.text === "ASSISTANT_AFTER_PART_A ASSISTANT_AFTER_PART_B";
+        }""",
+        arg={"sid": sid, "commandUuid": command_uuid},
+        timeout=10000,
+    )
+
+    result = page.evaluate(
+        """arg => {
+          const app = document.querySelector("#app")._x_dataStack[0];
+          const st = app._ensureTabState(arg.sid);
+          const indexOf = predicate => st.messages.findIndex(predicate);
+          const before = indexOf(m => (m.text || "").includes(
+            "ASSISTANT_BEFORE_ADJUSTMENT"));
+          const toolUse = indexOf(m => m.id === "midturn-tool-use"
+            && m.role === "tool_use");
+          const toolResult = indexOf(m => m.id === "midturn-tool-use"
+            && m.role === "tool_result");
+          const adjustment = indexOf(m => m.role === "user"
+            && m.uuid === arg.commandUuid);
+          const after = st.messages.findIndex((m, i) => i > adjustment
+            && m.role === "assistant"
+            && (m.text || "").includes("ASSISTANT_AFTER_PART_A"));
+          const user = st.messages[adjustment];
+          const pane = document.querySelector(
+            `.msg-pane[data-tid="${CSS.escape(arg.sid)}"]`);
+          const node = pane?.querySelector(
+            `.msg.user[data-uuid="${CSS.escape(arg.commandUuid)}"]`);
+          const canonical = app._preserveCanonicalMessageIdentity(st, [{
+            role: "user", text: arg.adjustment,
+            displayText: arg.adjustment, uuid: arg.commandUuid,
+          }])[0];
+          return {
+            before, toolUse, toolResult, adjustment, after,
+            pendingCount: st.pendingQueue.length,
+            adjustmentCount: st.messages.filter(m => m.role === "user"
+              && m.uuid === arg.commandUuid).length,
+            afterCount: st.messages.filter((m, i) => i > adjustment
+              && m.role === "assistant"
+              && (m.text || "").includes("ASSISTANT_AFTER_PART_A")).length,
+            afterText: st.messages[after]?.text || "",
+            turnId: user?._turnId || "",
+            noAnim: user?._noAnim === true,
+            normalBubble: !!node,
+            normalBubbleText: node?.textContent || "",
+            queuedBubbleCount: document.querySelectorAll(".msg.user.queued").length,
+            sameCanonicalObject: canonical === user,
+            sameCanonicalKey: canonical?._k === user?._k,
+          };
+        }""",
+        {
+            "sid": sid,
+            "commandUuid": command_uuid,
+            "adjustment": adjustment,
+        },
+    )
+    assert 0 <= result["before"] < result["toolUse"] < result["toolResult"]
+    assert result["toolResult"] < result["adjustment"] < result["after"]
+    assert result["pendingCount"] == 0
+    assert result["adjustmentCount"] == 1
+    assert result["afterCount"] == 1
+    assert result["afterText"] == "ASSISTANT_AFTER_PART_A ASSISTANT_AFTER_PART_B"
+    assert result["turnId"] == "midturn-turn"
+    assert result["noAnim"] is True
+    assert result["normalBubble"] is True
+    assert adjustment in result["normalBubbleText"]
+    assert result["queuedBubbleCount"] == 0
+    assert result["sameCanonicalObject"] is True
+    assert result["sameCanonicalKey"] is True
     _assert_no_browser_errors(page, errors)
 
 

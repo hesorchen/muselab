@@ -3320,7 +3320,9 @@ def test_message_identity_checks_only_incoming_batch_and_keeps_cold_replay_fallb
         "if (isReconnect && !isContinuation && resumeEventSeq === 0) {"):
         send.index("// (isContinuation:")]
     assert "this._truncatePaneMessagesFrom(sendState" in reconnect
-    assert "sendState.messages[lastUserIdx + 1]" in reconnect
+    assert "message._turnRoot === true" in reconnect
+    assert 'roles.lastIndexOf("user")' in reconnect
+    assert "sendState.messages[replayRootIdx + 1]" in reconnect
     assert "_releasePaneMessageRenderKeys" not in reconnect
 
 
@@ -5527,15 +5529,36 @@ def test_busy_send_mode_uses_authoritative_delivery_and_steering_state():
     sync = app[sync_start:sync_end]
     assert 'delivery: this._normalizeBusySendMode(it.delivery, "queue")' in sync
     assert "it.steering_state" in sync
+    assert 'commandUuid: String(it.command_uuid || "")' in sync
+    assert 'targetTurnId: String(it.target_turn_id || "")' in sync
+    assert "_findQueueSteeringMessage(" in sync
 
     steering_start = app.index("    _applyQueueSteeringEvent(sid, payload) {")
     steering_end = app.index("\n    async _syncQueueFromServer", steering_start)
     steering = app[steering_start:steering_end]
+    assert 'state === "started"' in steering
     assert 'state === "completed"' in steering
     assert 'state === "fallback"' in steering
     assert 'state === "cancelled"' in steering
+    assert "_promoteQueueSteeringMessage(context)" in steering
+    assert "st.pendingQueue = (st.pendingQueue || []).filter" in steering
+    promotion_start = app.index("    _promoteQueueSteeringMessage(context) {")
+    promotion = app[promotion_start:steering_start]
+    assert "this._appendLiveMessage(context.st" in promotion
+    assert "uuid: context.commandUuid" in promotion
+    assert "_turnId: context.turnId" in promotion
+    assert "_queueItemId: context.itemId" in promotion
+    assert "_noAnim: true" in promotion
     assert 'es.addEventListener("queue_steering"' in app
     assert '"queue_steering",' in app
+    queue_event = app[app.index('es.addEventListener("queue_steering"'):]
+    queue_event = queue_event[:queue_event.index("});") + 3]
+    assert "_queueSteeringNeedsPromotion" in queue_event
+    assert "closeAsst();" in queue_event
+    assert "closeThinking();" in queue_event
+    bump_start = app.index("      const _bumpSse = (ev) => {")
+    bump_end = app.index('      es.addEventListener("startup"', bump_start)
+    assert '"queue_steering"' in app[bump_start:bump_end]
 
     label_start = app.index("    queueDeliveryLabel(item) {")
     label_end = app.index("\n    _applyQueueSteeringEvent", label_start)
