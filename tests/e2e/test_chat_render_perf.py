@@ -4933,7 +4933,11 @@ def test_started_queue_steering_becomes_user_bubble_at_stream_boundary(
     command_uuid = "midturn-command-uuid"
     item_id = "midturn-queue-item"
     adjustment = "MIDTURN_ADJUSTMENT_VISIBLE"
+    second_command_uuid = "midturn-second-command-uuid"
+    second_item_id = "midturn-second-queue-item"
+    second_adjustment = "MIDTURN_SECOND_ADJUSTMENT_VISIBLE"
     history_marker = "MIDTURN_HISTORY_MARKER"
+    canonical_thinking_uuid = "midturn-canonical-thinking"
     canonical_messages: list[dict] = []
     requests = _route_windowed_session(
         page, sid, canonical_messages, updated_at=2,
@@ -4944,6 +4948,21 @@ def test_started_queue_steering_becomes_user_bubble_at_stream_boundary(
             status=200,
             content_type="application/json",
             body='{"ticket":"midturn-steering-ticket"}',
+        ),
+    )
+    page.route(
+        f"**/api/chat/sessions/{sid}/active",
+        lambda route: route.fulfill(
+            status=200,
+            content_type="application/json",
+            # A terminal frame may beat the backend's inactive snapshot. The
+            # exact assistant UUID in canonical history must still settle the
+            # live transcript without waiting for this endpoint to catch up.
+            body=json.dumps({
+                "active": True,
+                "background": False,
+                "turn_id": "midturn-turn",
+            }),
         ),
     )
     _login(page, backend_url, auth_token)
@@ -5055,13 +5074,49 @@ def test_started_queue_steering_becomes_user_bubble_at_stream_boundary(
           };
           window.__emitSse("queue_steering", steering);
           window.__emitSse("text", {
-            ...common, event_seq: 4, text: "ASSISTANT_AFTER_PART_A ",
+            ...common, event_seq: 4, text: "ASSISTANT_AFTER_PART_A",
           });
           // The terminal lifecycle event is a duplicate transcript boundary,
           // not a second user message and not a reason to split assistant text.
           window.__emitSse("queue_steering", {...steering, state: "completed"});
+          window.__emitSse("tool_use", {
+            ...common, event_seq: 5, id: "midturn-tool-use-2",
+            name: "Read", summary: "inspect after first adjustment", input: {},
+          });
+          window.__emitSse("tool_result", {
+            ...common, event_seq: 6, id: "midturn-tool-use-2",
+            tool_name: "Read", preview: "TOOL_RESULT_AFTER_ADJUSTMENT",
+            text: "TOOL_RESULT_AFTER_ADJUSTMENT", is_error: false,
+          });
+          const app = document.querySelector("#app")._x_dataStack[0];
+          const st = app._ensureTabState(arg.sid);
+          st.pendingQueue.push({
+            id: arg.secondItemId,
+            text: arg.secondAdjustment,
+            displayText: arg.secondAdjustment,
+            pendingQuotes: [], images: [], docs: [],
+            delivery: "adjust", deliveryStatus: "waiting_tool",
+            commandUuid: arg.secondCommandUuid,
+            enqueuedAt: Date.now(),
+          });
+          const secondSteering = {
+            ...common,
+            item_id: arg.secondItemId,
+            command_uuid: arg.secondCommandUuid,
+            state: "started",
+            effective_delivery: "adjust",
+            message: {
+              id: arg.secondItemId, uuid: arg.secondCommandUuid,
+              text: arg.secondAdjustment, display_text: arg.secondAdjustment,
+              selection_quotes: [],
+            },
+          };
+          window.__emitSse("queue_steering", secondSteering);
           window.__emitSse("text", {
-            ...common, event_seq: 5, text: "ASSISTANT_AFTER_PART_B",
+            ...common, event_seq: 7, text: "ASSISTANT_AFTER_PART_B",
+          });
+          window.__emitSse("queue_steering", {
+            ...secondSteering, state: "completed",
           });
         }""",
         {
@@ -5069,6 +5124,9 @@ def test_started_queue_steering_becomes_user_bubble_at_stream_boundary(
             "itemId": item_id,
             "commandUuid": command_uuid,
             "adjustment": adjustment,
+            "secondItemId": second_item_id,
+            "secondCommandUuid": second_command_uuid,
+            "secondAdjustment": second_adjustment,
         },
     )
     page.wait_for_function(
@@ -5077,12 +5135,19 @@ def test_started_queue_steering_becomes_user_bubble_at_stream_boundary(
           const st = app._ensureTabState(arg.sid);
           const adjustmentIndex = st.messages.findIndex(
             m => m.role === "user" && m.uuid === arg.commandUuid);
-          const after = adjustmentIndex >= 0 ? st.messages[adjustmentIndex + 1] : null;
-          return adjustmentIndex >= 0 && st.pendingQueue.length === 0
+          const secondIndex = st.messages.findIndex(
+            m => m.role === "user" && m.uuid === arg.secondCommandUuid);
+          const after = secondIndex >= 0 ? st.messages[secondIndex + 1] : null;
+          return adjustmentIndex >= 0 && secondIndex > adjustmentIndex
+            && st.pendingQueue.length === 0
             && after?.role === "assistant"
-            && after.text === "ASSISTANT_AFTER_PART_A ASSISTANT_AFTER_PART_B";
+            && after.text === "ASSISTANT_AFTER_PART_B";
         }""",
-        arg={"sid": sid, "commandUuid": command_uuid},
+        arg={
+            "sid": sid,
+            "commandUuid": command_uuid,
+            "secondCommandUuid": second_command_uuid,
+        },
         timeout=10000,
     )
 
@@ -5099,20 +5164,38 @@ def test_started_queue_steering_becomes_user_bubble_at_stream_boundary(
             && m.role === "tool_result");
           const adjustment = indexOf(m => m.role === "user"
             && m.uuid === arg.commandUuid);
-          const after = st.messages.findIndex((m, i) => i > adjustment
+          const afterFirst = st.messages.findIndex((m, i) => i > adjustment
             && m.role === "assistant"
             && (m.text || "").includes("ASSISTANT_AFTER_PART_A"));
+          const toolUse2 = indexOf(m => m.id === "midturn-tool-use-2"
+            && m.role === "tool_use");
+          const toolResult2 = indexOf(m => m.id === "midturn-tool-use-2"
+            && m.role === "tool_result");
+          const secondAdjustment = indexOf(m => m.role === "user"
+            && m.uuid === arg.secondCommandUuid);
+          const afterSecond = st.messages.findIndex((m, i) => i > secondAdjustment
+            && m.role === "assistant"
+            && (m.text || "").includes("ASSISTANT_AFTER_PART_B"));
           const user = st.messages[adjustment];
+          const secondUser = st.messages[secondAdjustment];
           const pane = document.querySelector(
             `.msg-pane[data-tid="${CSS.escape(arg.sid)}"]`);
           const node = pane?.querySelector(
             `.msg.user[data-uuid="${CSS.escape(arg.commandUuid)}"]`);
+          const secondNode = pane?.querySelector(
+            `.msg.user[data-uuid="${CSS.escape(arg.secondCommandUuid)}"]`);
           const canonical = app._preserveCanonicalMessageIdentity(st, [{
             role: "user", text: arg.adjustment,
             displayText: arg.adjustment, uuid: arg.commandUuid,
           }])[0];
+          const secondCanonical = app._preserveCanonicalMessageIdentity(st, [{
+            role: "user", text: arg.secondAdjustment,
+            displayText: arg.secondAdjustment, uuid: arg.secondCommandUuid,
+          }])[0];
           window.__midturnLiveUser = user;
           window.__midturnLiveKey = user?._k || "";
+          window.__midturnSecondLiveUser = secondUser;
+          window.__midturnSecondLiveKey = secondUser?._k || "";
           const visibleRunningFooters = [...document.querySelectorAll(
             ".turn-footer .turn-status.running")].filter(node => {
               const footer = node.closest(".turn-footer");
@@ -5120,23 +5203,31 @@ def test_started_queue_steering_becomes_user_bubble_at_stream_boundary(
                 && getComputedStyle(node).display !== "none";
             });
           return {
-            before, toolUse, toolResult, adjustment, after,
+            before, toolUse, toolResult, adjustment, afterFirst,
+            toolUse2, toolResult2, secondAdjustment, afterSecond,
             pendingCount: st.pendingQueue.length,
             adjustmentCount: st.messages.filter(m => m.role === "user"
               && m.uuid === arg.commandUuid).length,
+            secondAdjustmentCount: st.messages.filter(m => m.role === "user"
+              && m.uuid === arg.secondCommandUuid).length,
             afterCount: st.messages.filter((m, i) => i > adjustment
               && m.role === "assistant"
               && (m.text || "").includes("ASSISTANT_AFTER_PART_A")).length,
-            afterText: st.messages[after]?.text || "",
+            afterText: st.messages[afterFirst]?.text || "",
+            afterSecondText: st.messages[afterSecond]?.text || "",
             turnId: user?._turnId || "",
             noAnim: user?._noAnim === true,
             normalBubble: !!node,
             normalBubbleText: node?.textContent || "",
+            secondNormalBubble: !!secondNode,
+            secondNormalBubbleText: secondNode?.textContent || "",
             queuedBubbleCount: document.querySelectorAll(".msg.user.queued").length,
             sameCanonicalObject: canonical === user,
             sameCanonicalKey: canonical?._k === user?._k,
+            sameSecondCanonicalObject: secondCanonical === secondUser,
+            sameSecondCanonicalKey: secondCanonical?._k === secondUser?._k,
             beforeStatus: app.turnFooterStatus(st.messages[toolResult], st),
-            afterStatus: app.turnFooterStatus(st.messages[after], st),
+            afterStatus: app.turnFooterStatus(st.messages[afterSecond], st),
             visibleRunningFooterCount: visibleRunningFooters.length,
           };
         }""",
@@ -5144,21 +5235,31 @@ def test_started_queue_steering_becomes_user_bubble_at_stream_boundary(
             "sid": sid,
             "commandUuid": command_uuid,
             "adjustment": adjustment,
+            "secondCommandUuid": second_command_uuid,
+            "secondAdjustment": second_adjustment,
         },
     )
     assert 0 <= result["before"] < result["toolUse"] < result["toolResult"]
-    assert result["toolResult"] < result["adjustment"] < result["after"]
+    assert result["toolResult"] < result["adjustment"] < result["afterFirst"]
+    assert result["afterFirst"] < result["toolUse2"] < result["toolResult2"]
+    assert result["toolResult2"] < result["secondAdjustment"] < result["afterSecond"]
     assert result["pendingCount"] == 0
     assert result["adjustmentCount"] == 1
+    assert result["secondAdjustmentCount"] == 1
     assert result["afterCount"] == 1
-    assert result["afterText"] == "ASSISTANT_AFTER_PART_A ASSISTANT_AFTER_PART_B"
+    assert result["afterText"] == "ASSISTANT_AFTER_PART_A"
+    assert result["afterSecondText"] == "ASSISTANT_AFTER_PART_B"
     assert result["turnId"] == "midturn-turn"
     assert result["noAnim"] is True
     assert result["normalBubble"] is True
     assert adjustment in result["normalBubbleText"]
+    assert result["secondNormalBubble"] is True
+    assert second_adjustment in result["secondNormalBubbleText"]
     assert result["queuedBubbleCount"] == 0
     assert result["sameCanonicalObject"] is True
     assert result["sameCanonicalKey"] is True
+    assert result["sameSecondCanonicalObject"] is True
+    assert result["sameSecondCanonicalKey"] is True
     assert result["beforeStatus"] == ""
     assert result["afterStatus"] == "running"
     assert result["visibleRunningFooterCount"] == 1
@@ -5207,8 +5308,43 @@ def test_started_queue_steering_becomes_user_bubble_at_stream_boundary(
             "_key": f"{command_uuid}:0:user",
         },
         {
+            "role": "thinking", "text": "[encrypted thinking]",
+            "uuid": canonical_thinking_uuid,
+            "block_id": f"{canonical_thinking_uuid}:0:thinking",
+            "_key": f"{canonical_thinking_uuid}:0:thinking",
+        },
+        {
+            "role": "assistant", "text": "ASSISTANT_AFTER_PART_A",
+            "uuid": "midturn-after-first-assistant",
+            "block_id": "midturn-after-first-assistant:0:assistant",
+            "_key": "midturn-after-first-assistant:0:assistant",
+        },
+        {
+            "role": "tool_use", "id": "midturn-tool-use-2", "name": "Read",
+            "summary": "inspect after first adjustment", "input": {},
+            "uuid": "midturn-after-first-assistant",
+            "block_id": "midturn-after-first-assistant:1:tool_use",
+            "_key": "midturn-after-first-assistant:1:tool_use",
+        },
+        {
+            "role": "tool_result", "id": "midturn-tool-use-2",
+            "tool_name": "Read", "preview": "TOOL_RESULT_AFTER_ADJUSTMENT",
+            "text": "TOOL_RESULT_AFTER_ADJUSTMENT", "is_error": False,
+            "uuid": "midturn-after-first-result",
+            "block_id": "midturn-after-first-result:0:tool_result",
+            "_key": "midturn-after-first-result:0:tool_result",
+        },
+        {
+            "role": "user", "text": second_adjustment,
+            "displayText": second_adjustment, "selectionQuotes": [],
+            "uuid": second_command_uuid,
+            "_steeringAdjustment": True, "_turnRoot": False,
+            "block_id": f"{second_command_uuid}:0:user",
+            "_key": f"{second_command_uuid}:0:user",
+        },
+        {
             "role": "assistant",
-            "text": "ASSISTANT_AFTER_PART_A ASSISTANT_AFTER_PART_B",
+            "text": "ASSISTANT_AFTER_PART_B",
             "uuid": "midturn-final-assistant", "ts": 1_700_030_010,
             "turn_status": "completed",
             "block_id": "midturn-final-assistant:0:assistant",
@@ -5217,7 +5353,8 @@ def test_started_queue_steering_becomes_user_bubble_at_stream_boundary(
     ])
     page.evaluate(
         """() => window.__emitSse("done", {
-          total_cost_usd: 0.001, turn_id: "midturn-turn", event_seq: 6,
+          total_cost_usd: 0.001, turn_id: "midturn-turn", event_seq: 8,
+          assistant_uuid: "midturn-final-assistant",
         })"""
     )
     page.wait_for_function(
@@ -5228,65 +5365,113 @@ def test_started_queue_steering_becomes_user_bubble_at_stream_boundary(
         arg=sid,
         timeout=10000,
     )
-    loaded = _app_eval(
-        page,
-        """
-        const st = app._ensureTabState(arg.sid);
-        st._pendingExternalUpdate = true;
-        return await app.loadSession(arg.sid, {
-          quiet: true, probeActive: false, followTail: true,
-        });
-        """,
-        {"sid": sid},
-    )
-    assert loaded is True
     page.wait_for_function(
         """arg => {
           const app = document.querySelector('#app')._x_dataStack[0];
           const st = app._ensureTabState(arg.sid);
           return st.messages.some(m => m.uuid === "midturn-final-assistant")
-            && st.messages.some(m => m.uuid === arg.commandUuid);
+            && st.messages.some(m => m.uuid === arg.commandUuid)
+            && st.messages.some(m => m.uuid === arg.secondCommandUuid)
+            && st.messages.some(m => m.uuid === arg.thinkingUuid);
         }""",
-        arg={"sid": sid, "commandUuid": command_uuid},
+        arg={
+            "sid": sid,
+            "commandUuid": command_uuid,
+            "secondCommandUuid": second_command_uuid,
+            "thinkingUuid": canonical_thinking_uuid,
+        },
         timeout=10000,
     )
+    thinking_row = page.locator(
+        f'.msg-pane[data-tid="{sid}"] '
+        f'.msg.thinking[data-uuid="{canonical_thinking_uuid}"]'
+    )
+    expect(thinking_row).to_be_visible(timeout=10000)
+    completed_footer = page.locator(
+        f'.msg-pane[data-tid="{sid}"] '
+        '.msg[data-uuid="midturn-final-assistant"] '
+        '.turn-footer .turn-status.completed'
+    )
+    expect(completed_footer).to_be_visible(timeout=10000)
+    expect(
+        page.locator(
+            f'.msg-pane[data-tid="{sid}"] '
+            '.turn-footer .turn-status.running:visible'
+        )
+    ).to_have_count(0)
     completed = _app_eval(
         page,
         """
         const st = app._ensureTabState(arg.sid);
         const root = st.messages.findIndex(m => m.uuid === "midturn-root-user");
         const steering = st.messages.find(m => m.uuid === arg.commandUuid);
+        const secondSteering = st.messages.find(
+          m => m.uuid === arg.secondCommandUuid);
         const firstTail = st.messages.find(m => m.uuid === "midturn-before-result");
+        const secondToolTail = st.messages.find(
+          m => m.uuid === "midturn-after-first-result");
         const final = st.messages.find(m => m.uuid === "midturn-final-assistant");
+        const indexOfUuid = uuid => st.messages.findIndex(m => m.uuid === uuid);
         const statuses = st.messages.slice(root + 1)
           .map(m => app.turnFooterStatus(m, st)).filter(Boolean);
         return {
           steeringCount: st.messages.filter(
             m => m.uuid === arg.commandUuid).length,
+          secondSteeringCount: st.messages.filter(
+            m => m.uuid === arg.secondCommandUuid).length,
           sameSteeringObject: steering === window.__midturnLiveUser,
           sameSteeringKey: steering?._k === window.__midturnLiveKey,
           liveSteeringKey: window.__midturnLiveKey,
           canonicalSteeringKey: steering?._k || "",
+          sameSecondSteeringObject:
+            secondSteering === window.__midturnSecondLiveUser,
+          sameSecondSteeringKey:
+            secondSteering?._k === window.__midturnSecondLiveKey,
           firstStatus: app.turnFooterStatus(firstTail, st),
+          secondToolStatus: app.turnFooterStatus(secondToolTail, st),
           finalStatus: app.turnFooterStatus(final, st),
           currentTurnStatuses: statuses,
           hasPostResult: st.messages.some(m => m.uuid === "midturn-final-assistant"
-            && m.text === "ASSISTANT_AFTER_PART_A ASSISTANT_AFTER_PART_B"),
+            && m.text === "ASSISTANT_AFTER_PART_B"),
+          hasCanonicalThinking: st.messages.some(
+            m => m.uuid === arg.thinkingUuid && m.role === "thinking"),
           steeringFlag: steering?._steeringAdjustment === true,
+          secondSteeringFlag: secondSteering?._steeringAdjustment === true,
+          canonicalOrder: [
+            indexOfUuid(arg.commandUuid),
+            indexOfUuid(arg.thinkingUuid),
+            indexOfUuid("midturn-after-first-assistant"),
+            indexOfUuid("midturn-after-first-result"),
+            indexOfUuid(arg.secondCommandUuid),
+            indexOfUuid("midturn-final-assistant"),
+          ],
         };
         """,
-        {"sid": sid, "commandUuid": command_uuid},
+        {
+            "sid": sid,
+            "commandUuid": command_uuid,
+            "secondCommandUuid": second_command_uuid,
+            "thinkingUuid": canonical_thinking_uuid,
+        },
     )
     assert requests, "done reconciliation did not request canonical history"
     assert completed["steeringCount"] == 1
+    assert completed["secondSteeringCount"] == 1
     assert completed["sameSteeringObject"] is True
     assert completed["sameSteeringKey"] is True, (
         completed["liveSteeringKey"], completed["canonicalSteeringKey"])
+    assert completed["sameSecondSteeringObject"] is True
+    assert completed["sameSecondSteeringKey"] is True
     assert completed["firstStatus"] == ""
+    assert completed["secondToolStatus"] == ""
     assert completed["finalStatus"] == "completed"
     assert completed["currentTurnStatuses"] == ["completed"]
     assert completed["hasPostResult"] is True
+    assert completed["hasCanonicalThinking"] is True
     assert completed["steeringFlag"] is True
+    assert completed["secondSteeringFlag"] is True
+    assert completed["canonicalOrder"] == sorted(completed["canonicalOrder"])
+    assert all(index >= 0 for index in completed["canonicalOrder"])
     _assert_no_browser_errors(page, errors)
 
 
@@ -6004,7 +6189,7 @@ def test_fast_completed_queued_turn_reconciles_footer_without_refresh(
 def test_tool_result_tail_done_metadata_renders_footer_before_canonical_reload(
     page: Page, backend_url, auth_token,
 ):
-    """Early done metadata completes the visual tail without touching identity."""
+    """Done completes the live tail while canonical history is still retrying."""
     errors = _capture_browser_errors(page)
     page.set_viewport_size({"width": 1440, "height": 900})
     _install_fake_event_source(page)
@@ -6012,7 +6197,6 @@ def test_tool_result_tail_done_metadata_renders_footer_before_canonical_reload(
     assistant_uuid = "tool-tail-assistant-boundary"
     completed_at_ms = int(time.time() * 1000)
     duration_ms = 125_000
-    active_requests: list[str] = []
     history_requests: list[str] = []
 
     page.route(
@@ -6042,14 +6226,13 @@ def test_tool_result_tail_done_metadata_renders_footer_before_canonical_reload(
     )
 
     def active_stays_true(route):
-        active_requests.append(route.request.url)
         route.fulfill(
             status=200,
             content_type="application/json",
             body='{"active":true}',
         )
 
-    def unexpected_history(route):
+    def incomplete_history(route):
         history_requests.append(route.request.url)
         route.fulfill(
             status=200,
@@ -6069,7 +6252,7 @@ def test_tool_result_tail_done_metadata_renders_footer_before_canonical_reload(
         )
 
     page.route(f"**/api/chat/sessions/{sid}/active", active_stays_true)
-    page.route(f"**/api/chat/sessions/{sid}?*", unexpected_history)
+    page.route(f"**/api/chat/sessions/{sid}?*", incomplete_history)
     _login(page, backend_url, auth_token)
     _app_eval(
         page,
@@ -6183,40 +6366,34 @@ def test_tool_result_tail_done_metadata_renders_footer_before_canonical_reload(
         "assistantUuid": "",
     }
 
-    with page.expect_request(
-        lambda request: request.url.endswith(
-            f"/api/chat/sessions/{sid}/active"
-        ),
-        timeout=5000,
-    ):
-        page.evaluate(
-            """arg => window.__emitSse('done', {
-              assistant_uuid: arg.assistantUuid,
-              completed_at_ms: arg.completedAtMs,
-              duration_ms: arg.durationMs,
-              total_cost_usd: 0.001,
-              model: 'e2e-model',
-              memory_recall: {
-                id: 'tool-tail-memory-trace', count: 1,
-                latency_ms: 8, status: 'ok', items: [{
-                  id: 'tool-tail-memory-item', kind: 'preference',
-                  content: 'A deliberately long memory detail '.repeat(36),
-                }],
-              },
-              session_usage: {
-                context_used_pct: 5,
-                context_used: 500,
-                context_limit: 100000,
-              },
-              turn_id: 'tool-tail-turn',
-              event_seq: 4,
-            })""",
-            {
-                "assistantUuid": assistant_uuid,
-                "completedAtMs": completed_at_ms,
-                "durationMs": duration_ms,
-            },
-        )
+    page.evaluate(
+        """arg => window.__emitSse('done', {
+          assistant_uuid: arg.assistantUuid,
+          completed_at_ms: arg.completedAtMs,
+          duration_ms: arg.durationMs,
+          total_cost_usd: 0.001,
+          model: 'e2e-model',
+          memory_recall: {
+            id: 'tool-tail-memory-trace', count: 1,
+            latency_ms: 8, status: 'ok', items: [{
+              id: 'tool-tail-memory-item', kind: 'preference',
+              content: 'A deliberately long memory detail '.repeat(36),
+            }],
+          },
+          session_usage: {
+            context_used_pct: 5,
+            context_used: 500,
+            context_limit: 100000,
+          },
+          turn_id: 'tool-tail-turn',
+          event_seq: 4,
+        })""",
+        {
+            "assistantUuid": assistant_uuid,
+            "completedAtMs": completed_at_ms,
+            "durationMs": duration_ms,
+        },
+    )
 
     page.wait_for_function(
         """arg => {
@@ -6339,10 +6516,8 @@ def test_tool_result_tail_done_metadata_renders_footer_before_canonical_reload(
         "streaming": False,
     }
     assert ":live:" in live_key
-    assert active_requests, "canonical barrier never checked /active"
-    assert history_requests == [], (
-        "canonical history loaded even though /active still reported true"
-    )
+    assert history_requests, "done did not probe canonical history immediately"
+    assert all("tail=800" in url for url in history_requests)
     _assert_no_browser_errors(page, errors)
 
 
@@ -6612,6 +6787,287 @@ def test_stale_older_response_cannot_overwrite_new_canonical_tail(
         "last": "fresh-59",
         "atBottom": True,
         "hasLater": False,
+    }
+    _assert_no_browser_errors(page, errors)
+
+
+def test_completed_history_defers_to_optimistic_and_remote_successors(
+    page: Page, backend_url, auth_token,
+):
+    """A's late canonical sync never removes a newly admitted B prompt."""
+    errors = _capture_browser_errors(page)
+    _login(page, backend_url, auth_token)
+
+    result = page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const sid = 'completed-history-successor-race';
+          app.refreshSessions = async () => {};
+          app._fetchTabUsage = async () => {};
+          app._scheduleIdlePreload = () => {};
+          app.sessions = [{id: sid, name: 'Successor race', message_count: 2}];
+          app.openTabIds = [sid];
+          app.tabState = {};
+          app.currentId = sid;
+          const st = app._ensureTabState(sid);
+          st._loaded = true;
+          st.atBottom = true;
+          st.messages.push(
+            {role: 'user', text: 'TURN_A_PROMPT', uuid: 'turn-a-user',
+             _turnRoot: true, _k: `${sid}:uuid:turn-a-user`},
+            {role: 'assistant', text: 'TURN_A_REPLY', uuid: 'turn-a-final',
+             turn_status: 'completed', _k: `${sid}:uuid:turn-a-final`},
+          );
+          Object.assign(st.messageRange, {
+            visibleStart: 0, visibleEnd: 2, offset: 0, total: 2,
+            preTotal: 0, order: 'normal', generation: 'race-g1',
+          });
+          app._activateTabState(sid);
+
+          const originalFetch = window.fetch;
+          const originalDeadline = app._fetchWithDeadline;
+          const originalLoad = app.loadSession;
+          let releaseHistory = null;
+          let guardedFetches = 0;
+          try {
+            window.fetch = async input => {
+              const url = String(input);
+              if (!url.includes(`/api/chat/sessions/${sid}?tail=`)) {
+                return originalFetch(input);
+              }
+              return await new Promise(resolve => {
+                releaseHistory = () => resolve(new Response(JSON.stringify({
+                  id: sid, name: 'Successor race', model: 'e2e-model',
+                  permission: 'bypassPermissions', thinking: true,
+                  messages: [
+                    {role: 'user', text: 'TURN_A_PROMPT', uuid: 'turn-a-user',
+                     _turnRoot: true},
+                    {role: 'assistant', text: 'TURN_A_REPLY', uuid: 'turn-a-final',
+                     turn_status: 'completed'},
+                  ],
+                  offset: 0, total: 2, message_count: 2,
+                  pre_total: 0, history_order: 'normal',
+                  history_generation: 'race-g2', updated_at: 2,
+                }), {status: 200, headers: {'content-type': 'application/json'}}));
+              });
+            };
+            const pendingLoad = app.loadSession(sid, {
+              quiet: true, probeActive: false, followTail: true,
+            });
+            while (!releaseHistory) await new Promise(resolve => setTimeout(resolve, 0));
+
+            st._composerSubmitToken = 'turn-b-composer-claim';
+            const optimistic = app._appendLiveMessage(st, {
+              role: 'user', text: 'TURN_B_OPTIMISTIC',
+              _turnRoot: true, _admissionPending: true,
+            });
+            releaseHistory();
+            const staleLoadResult = await pendingLoad;
+            await new Promise(resolve => app.$nextTick(resolve));
+            const pane = document.querySelector(
+              `.msg-pane[data-tid="${CSS.escape(sid)}"]`);
+
+            // A completion retry that starts after the claim is visible must
+            // not even issue a canonical read.
+            app._fetchWithDeadline = async () => {
+              guardedFetches += 1;
+              throw new Error('guarded completion fetched unexpectedly');
+            };
+            st._pendingCompletedTurnSync = {
+              expectedAssistantUuid: 'turn-a-final',
+              completedTurnId: 'turn-a', attempt: 30,
+            };
+            const guardedCompletion = await app._runCompletedTurnSync(sid, st, {
+              expectedAssistantUuid: 'turn-a-final',
+              completedTurnId: 'turn-a', attempt: 30,
+            });
+
+            // A remote successor can win before its mux channel reaches this
+            // browser. Identity-aware /active must defer A's replacement too.
+            const remoteSid = 'completed-history-remote-successor';
+            const remote = app._ensureTabState(remoteSid);
+            remote._loaded = true;
+            let remoteLoads = 0;
+            app._fetchWithDeadline = async url => new Response(JSON.stringify(
+              String(url).endsWith('/active')
+                ? {active: true, background: false, turn_id: 'turn-b'}
+                : {messages: [
+                    {role: 'user', text: 'A', uuid: 'remote-a-user',
+                     _turnRoot: true},
+                    {role: 'assistant', text: 'A done', uuid: 'remote-a-final'},
+                  ]},
+            ), {status: 200, headers: {'content-type': 'application/json'}});
+            app.loadSession = async () => { remoteLoads += 1; return true; };
+            const remoteCompletion = await app._runCompletedTurnSync(
+              remoteSid, remote, {
+                expectedAssistantUuid: 'remote-a-final',
+                completedTurnId: 'turn-a', attempt: 30,
+              },
+            );
+
+            // Non-zero visible windows use absolute coordinates without
+            // allocating a fresh slice for every Alpine binding.
+            const indexSid = 'pane-index-window';
+            const indexState = app._ensureTabState(indexSid);
+            indexState.messages = Array.from({length: 800}, (_, index) => ({
+              role: 'assistant', text: String(index),
+              _k: `${indexSid}:${index}`,
+            }));
+            Object.assign(indexState.messageRange, {
+              visibleStart: 700, visibleEnd: 800, offset: 0, total: 800,
+              preTotal: 0, order: 'normal', generation: 'index-g1',
+            });
+            const indexedMessage = indexState.messages[750];
+            const firstIndex = app.paneMessageIndex(indexSid, indexedMessage);
+            indexState.messages.splice(720, 0, {
+              role: 'thinking', text: 'inserted', _k: `${indexSid}:inserted`,
+            });
+            indexState.messageRange.visibleEnd = 801;
+            const shiftedIndex = app.paneMessageIndex(indexSid, indexedMessage);
+            indexState.messageRange.visibleStart = 710;
+            const movedWindowIndex = app.paneMessageIndex(indexSid, indexedMessage);
+
+            const optimisticKey = optimistic._k;
+            return {
+              staleLoadResult,
+              optimisticRetained: st.messages.includes(optimistic),
+              optimisticKey,
+              optimisticVisible: !!pane?.querySelector(
+                `.msg[data-message-key="${CSS.escape(optimisticKey)}"]`),
+              guardedCompletion,
+              guardedFetches,
+              pendingCompletionRetained: !!st._pendingCompletedTurnSync,
+              remoteCompletion,
+              remoteLoads,
+              firstIndex,
+              shiftedIndex,
+              movedWindowIndex,
+            };
+          } finally {
+            window.fetch = originalFetch;
+            app._fetchWithDeadline = originalDeadline;
+            app.loadSession = originalLoad;
+            st._composerSubmitToken = null;
+          }
+        }"""
+    )
+
+    assert result == {
+        "staleLoadResult": False,
+        "optimisticRetained": True,
+        "optimisticKey": "completed-history-successor-race:live:1",
+        "optimisticVisible": True,
+        "guardedCompletion": False,
+        "guardedFetches": 0,
+        "pendingCompletionRetained": True,
+        "remoteCompletion": False,
+        "remoteLoads": 0,
+        "firstIndex": 50,
+        "shiftedIndex": 51,
+        "movedWindowIndex": 41,
+    }
+    _assert_no_browser_errors(page, errors)
+
+
+def test_send_from_older_window_returns_to_latest_with_composer_claim(
+    page: Page, backend_url, auth_token,
+):
+    """Send's own composer claim must not block its return-to-tail load."""
+    errors = _capture_browser_errors(page)
+    _install_fake_event_source(page)
+    sid = "send-from-older-window"
+    prompt = "SEND_FROM_OLDER_WINDOW"
+    canonical_messages = [
+        {
+            "role": "user", "text": "OLDER_PROMPT", "uuid": "older-user",
+            "_turnRoot": True,
+        },
+        {
+            "role": "assistant", "text": "OLDER_REPLY", "uuid": "older-reply",
+            "turn_status": "completed",
+        },
+        {
+            "role": "user", "text": "LATEST_PROMPT", "uuid": "latest-user",
+            "_turnRoot": True,
+        },
+        {
+            "role": "assistant", "text": "LATEST_REPLY", "uuid": "latest-reply",
+            "turn_status": "completed",
+        },
+    ]
+    requests = _route_windowed_session(page, sid, canonical_messages)
+    page.route(
+        "**/api/chat/stream/start",
+        lambda route: route.fulfill(
+            status=200,
+            content_type="application/json",
+            body='{"ticket":"older-window-send-ticket"}',
+        ),
+    )
+    _login(page, backend_url, auth_token)
+    _bootstrap_session_for_real_load(page, sid, "Send from older window")
+    _app_eval(
+        page,
+        """
+        app._ensureSessionRegistered = async () => true;
+        app._awaitRuntimeSettingPatches = async () => true;
+        app._confirmSessionBusy = async () => false;
+        const st = app._ensureTabState(arg.sid);
+        st.messages.splice(0, st.messages.length, ...app._historyEnvelopes(arg.sid, [
+          {role: "user", text: "OLDER_PROMPT", uuid: "older-user", _turnRoot: true},
+          {role: "assistant", text: "OLDER_REPLY", uuid: "older-reply",
+           turn_status: "completed"},
+        ]));
+        Object.assign(st.messageRange, {
+          visibleStart: 0, visibleEnd: 2, offset: 0, total: 4,
+          preTotal: 0, order: "normal", generation: "older-window-g1",
+        });
+        st._loaded = true;
+        st.messagesReady = true;
+        st.messagesLoading = false;
+        st.atBottom = false;
+        st.draft.input = arg.prompt;
+        app._activateTabState(arg.sid);
+        return app.hasLaterMessages(arg.sid);
+        """,
+        {"sid": sid, "prompt": prompt},
+    )
+
+    send_result = _app_eval(
+        page,
+        """
+        const result = await app.send();
+        await new Promise(resolve => app.$nextTick(resolve));
+        const st = app._ensureTabState(arg.sid);
+        return {
+          didNotFail: result !== false,
+          streaming: st.streaming,
+          composerClaim: st._composerSubmitToken,
+          draft: st.draft.input,
+          hasLater: app.hasLaterMessages(arg.sid),
+          latestPresent: st.messages.some(m => m.uuid === "latest-reply"),
+          promptCount: st.messages.filter(m => m.role === "user"
+            && m.text === arg.prompt).length,
+          promptVisible: !!document.querySelector(
+            `.msg-pane[data-tid="${CSS.escape(arg.sid)}"] .msg.user`
+          ) && document.querySelector(
+            `.msg-pane[data-tid="${CSS.escape(arg.sid)}"]`
+          ).textContent.includes(arg.prompt),
+        };
+        """,
+        {"sid": sid, "prompt": prompt},
+    )
+
+    assert requests, "send did not load the canonical latest tail"
+    assert send_result == {
+        "didNotFail": True,
+        "streaming": True,
+        "composerClaim": None,
+        "draft": "",
+        "hasLater": False,
+        "latestPresent": True,
+        "promptCount": 1,
+        "promptVisible": True,
     }
     _assert_no_browser_errors(page, errors)
 
