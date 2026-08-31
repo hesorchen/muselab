@@ -2985,6 +2985,7 @@
                                        || activeSession.messages[activeSession.messages.length-1].role === 'user')
                        && (!activeSession.messages.length
                          || !activeSession.messages[activeSession.messages.length-1]._admissionPending)
+                       && !activeSession._queueAdmission
                        && !activeSession.compacting
                        && !activeSession._continuationAwaitingReaction"
                class="turn-footer turn-pending-footer"

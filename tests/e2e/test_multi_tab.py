@@ -922,8 +922,19 @@ def test_server_busy_admission_never_borrows_running_footer(
         }"""
     )
     page.wait_for_function("() => window.__queueCalls === 1")
-    expect(page.locator(".optimistic-queue-status")).to_be_visible()
-    expect(page.locator(".optimistic-queue-status")).to_contain_text("排队中")
+    # Admission now occupies the same queue-tail slot as the durable row so
+    # accepting the POST cannot move or duplicate the bubble.  Assert the
+    # visible contract and the temporary ownership state independently.
+    expect(page.locator(".msg.user.queued")).to_be_visible()
+    expect(page.locator(".msg.user.queued .queued-label")).to_contain_text("排队中")
+    page.wait_for_function(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const st = app.tabState[app.currentId];
+          return st._queueAdmission?.displayText === 'QUEUE_ON_409'
+            && st.pendingQueue.length === 0;
+        }"""
+    )
     expect(page.locator(".turn-pending-footer")).to_be_hidden()
     assert page.evaluate("() => window.__turnStartCalls") == 1
 
@@ -935,7 +946,12 @@ def test_server_busy_admission_never_borrows_running_footer(
           return app.tabState[app.currentId].pendingQueue.length === 1;
         }"""
     )
-    expect(page.locator(".optimistic-queue-status")).to_have_count(0)
+    page.wait_for_function(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          return app.tabState[app.currentId]._queueAdmission === null;
+        }"""
+    )
     expect(page.locator(".msg.user.queued")).to_have_count(1)
     assert page.evaluate("() => window.__queueCalls") == 1
 
