@@ -574,6 +574,62 @@ def test_forced_interrupt_persists_refreshable_footer_and_private_snapshot(
     assert path.parent.stat().st_mode & 0o777 == 0o700
 
 
+def test_broadcast_presentation_keeps_midturn_steering_user_boundary(stream_env):
+    """Active/recovery projections preserve the same human boundary as live SSE."""
+    chat_mod = stream_env
+    bc = chat_mod.TurnBroadcast(
+        session_id="steering-presentation", model="codex:gpt-5.6-sol")
+    bc.user_text = "original prompt"
+    bc.publish({
+        "event": "text",
+        "data": json.dumps({"text": "assistant before adjustment"}),
+    })
+    steering = {
+        "item_id": "steering-item",
+        "command_uuid": "steering-command",
+        "state": "started",
+        "effective_delivery": "adjust",
+        "message": {
+            "id": "steering-item",
+            "uuid": "steering-command",
+            "text": "change direction",
+            "display_text": "change direction",
+            "selection_quotes": [],
+        },
+    }
+    bc.publish({"event": "queue_steering", "data": json.dumps(steering)})
+    bc.publish({
+        "event": "text",
+        "data": json.dumps({"text": "assistant after adjustment"}),
+    })
+    bc.publish({
+        "event": "queue_steering",
+        "data": json.dumps({**steering, "state": "completed"}),
+    })
+
+    messages = chat_mod._broadcast_to_ui_messages(bc)
+
+    assert [message["role"] for message in messages] == [
+        "user", "assistant", "user", "assistant",
+    ]
+    assert messages[0]["_turnRoot"] is True
+    assert messages[0]["_turnId"] == bc.turn_id
+    adjustment = messages[2]
+    assert adjustment == {
+        "role": "user",
+        "text": "change direction",
+        "displayText": "change direction",
+        "selectionQuotes": [],
+        "images": [],
+        "docs": [],
+        "uuid": "steering-command",
+        "_turnId": bc.turn_id,
+        "_turnRoot": False,
+        "_steeringAdjustment": True,
+        "_queueItemId": "steering-item",
+    }
+
+
 def test_failed_snapshot_survives_partial_canonical_assistant(
         stream_env, client, monkeypatch, tmp_path):
     """A partial JSONL assistant is not equivalent to the terminal error row."""

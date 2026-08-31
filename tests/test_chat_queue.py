@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import threading
 
 import pytest
@@ -1131,6 +1132,8 @@ async def test_busy_adjust_is_durable_then_uses_exact_native_command(
     broadcast = chat.TurnBroadcast(sid)
     broadcast.query_committed = True
     broadcast.runtime_client = SteeringClient()
+    published = []
+    monkeypatch.setattr(broadcast, "publish", published.append)
     chat._active_turns[sid] = broadcast
     try:
         response = await chat.enqueue_api(
@@ -1168,6 +1171,31 @@ async def test_busy_adjust_is_durable_then_uses_exact_native_command(
         )
         assert sess.get_queue(sid)["items"][0]["steering_state"] == "queued"
 
+        await chat._settle_steering_lifecycle(
+            broadcast,
+            chat.CommandLifecycleMessage(
+                command_uuid=item["command_uuid"],
+                state="started",
+                session_id=sid,
+                uuid="life-started",
+            ),
+        )
+        started_event = next(
+            json.loads(event["data"])
+            for event in reversed(published)
+            if event["event"] == "queue_steering"
+            and json.loads(event["data"])["state"] == "started"
+        )
+        assert started_event["turn_id"] == broadcast.turn_id
+        assert started_event["message"] == {
+            "id": item["id"],
+            "uuid": item["command_uuid"],
+            "text": "adjust this task",
+            "display_text": "adjust this task",
+            "selection_quotes": [],
+            "enqueued_at": item["enqueued_at"],
+        }
+
         terminal = await chat._settle_steering_lifecycle(
             broadcast,
             chat.CommandLifecycleMessage(
@@ -1180,6 +1208,9 @@ async def test_busy_adjust_is_durable_then_uses_exact_native_command(
         assert terminal is True
         assert sess.get_queue(sid)["items"] == []
         assert broadcast.steering_commands == {}
+        completed_event = json.loads(published[-1]["data"])
+        assert completed_event["state"] == "completed"
+        assert completed_event["message"]["uuid"] == item["command_uuid"]
     finally:
         chat._active_turns.pop(sid, None)
         broadcast.close()

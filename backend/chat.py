@@ -7326,19 +7326,43 @@ def _publish_queue_steering(
     command_uuid: str,
     state: str,
     effective_delivery: str,
+    item: dict | None = None,
 ) -> None:
-    """Publish one privacy-bounded queue state transition when possible."""
+    """Publish one privacy-bounded queue state transition when possible.
+
+    ``started`` is also the live transcript boundary for a native steering
+    command.  Include the already-bounded durable queue fields so a browser
+    that missed the optimistic POST response can still replace the temporary
+    queue row with the exact user bubble at that boundary.
+    """
     if bc is None or bc.done:
         return
     try:
+        payload: dict[str, Any] = {
+            "item_id": item_id,
+            "command_uuid": command_uuid,
+            "state": state,
+            "effective_delivery": effective_delivery,
+            "turn_id": bc.turn_id,
+        }
+        if item is not None:
+            selection_quotes = item.get("selection_quotes")
+            payload["message"] = {
+                "id": item_id,
+                "uuid": command_uuid,
+                "text": str(item.get("text") or ""),
+                "display_text": str((
+                    item.get("display_text")
+                    if "display_text" in item else item.get("text")
+                ) or ""),
+                "selection_quotes": (
+                    selection_quotes if isinstance(selection_quotes, list) else []
+                ),
+                "enqueued_at": item.get("enqueued_at"),
+            }
         bc.publish({
             "event": "queue_steering",
-            "data": json.dumps({
-                "item_id": item_id,
-                "command_uuid": command_uuid,
-                "state": state,
-                "effective_delivery": effective_delivery,
-            }),
+            "data": json.dumps(payload),
         })
     except Exception:
         # The durable queue remains authoritative; GET /queue repairs any
@@ -7465,6 +7489,7 @@ async def _deliver_steering_command(
         command_uuid=command_uuid,
         state=state,
         effective_delivery="adjust",
+        item=updated,
     )
     return "adjust", state, updated
 
@@ -7486,8 +7511,9 @@ async def _settle_steering_lifecycle(
     state = message.state
     if state in {"queued", "started"}:
         info["state"] = state
+        updated: dict | None = None
         try:
-            await obs.to_thread_io(
+            updated = await obs.to_thread_io(
                 "chat.queue_steering_lifecycle",
                 bc.session_id,
                 sess.update_queue_steering_state,
@@ -7512,10 +7538,12 @@ async def _settle_steering_lifecycle(
             command_uuid=command_uuid,
             state=state,
             effective_delivery="adjust",
+            item=updated,
         )
         return False
 
     if state == "completed":
+        removed: dict | None = None
         try:
             removed = await obs.to_thread_io(
                 "chat.queue_steering_complete",
@@ -7556,6 +7584,7 @@ async def _settle_steering_lifecycle(
             command_uuid=command_uuid,
             state="completed",
             effective_delivery="adjust",
+            item=removed,
         )
         return True
 

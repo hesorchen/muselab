@@ -8582,19 +8582,98 @@ function portal() {
       return this.lang === "zh"
         ? "等待当前工具完成" : "Waiting for current tool";
     },
+    _findQueueSteeringMessage(st, itemId, commandUuid) {
+      if (!st) return null;
+      const iid = String(itemId || "");
+      const uuid = String(commandUuid || "");
+      return (st.messages || []).find(message => message
+        && message.role === "user"
+        && ((uuid && String(message.uuid || "") === uuid)
+          || (iid && String(message._queueItemId || "") === iid))) || null;
+    },
+    _queueSteeringPromotionContext(sid, payload) {
+      const st = sid && this.tabState[sid];
+      const itemId = String(payload && payload.item_id || "");
+      const state = String(payload && payload.state || "");
+      if (!st || !itemId || !["started", "completed"].includes(state)) {
+        return null;
+      }
+      const queued = (st.pendingQueue || []).find(q => q.id === itemId) || null;
+      const wire = payload && payload.message
+        && typeof payload.message === "object" ? payload.message : null;
+      const commandUuid = String(payload && payload.command_uuid
+        || (queued && queued.commandUuid)
+        || (wire && (wire.uuid || wire.command_uuid)) || "");
+      return {
+        st,
+        itemId,
+        state,
+        commandUuid,
+        source: queued || wire,
+        existing: this._findQueueSteeringMessage(st, itemId, commandUuid),
+        turnId: String(payload && payload.turn_id
+          || (queued && queued.targetTurnId) || st.activeTurnId || ""),
+      };
+    },
+    _queueSteeringNeedsPromotion(sid, payload) {
+      const context = this._queueSteeringPromotionContext(sid, payload);
+      return !!(context && !context.existing && context.source);
+    },
+    _promoteQueueSteeringMessage(context) {
+      if (!context || context.existing || !context.source) return false;
+      const source = context.source;
+      const hasDisplayText = Object.prototype.hasOwnProperty.call(
+        source, "displayText")
+        || Object.prototype.hasOwnProperty.call(source, "display_text");
+      const displayText = Object.prototype.hasOwnProperty.call(source, "displayText")
+        ? source.displayText : source.display_text;
+      const selectionQuotes = Array.isArray(source.pendingQuotes)
+        ? source.pendingQuotes
+        : (Array.isArray(source.selection_quotes) ? source.selection_quotes : []);
+      this._appendLiveMessage(context.st, {
+        role: "user",
+        text: String(source.text || ""),
+        ...(hasDisplayText ? { displayText: String(displayText || "") } : {}),
+        selectionQuotes,
+        images: Array.isArray(source.images) ? source.images : [],
+        docs: Array.isArray(source.docs) ? source.docs : [],
+        uuid: context.commandUuid,
+        _turnId: context.turnId,
+        _queueItemId: context.itemId,
+        _steeringAdjustment: true,
+        _turnRoot: false,
+        // This row was already visible as a queue bubble. Re-entering it with
+        // the normal message animation makes the state transition look like a
+        // duplicate send instead of the same user command taking effect.
+        _noAnim: true,
+      });
+      return true;
+    },
     _applyQueueSteeringEvent(sid, payload) {
       const st = sid && this.tabState[sid];
       const itemId = String(payload && payload.item_id || "");
       const state = String(payload && payload.state || "");
-      if (!st || !itemId || !state) return;
-      if (state === "completed") {
+      if (!st || !itemId || !state) return false;
+      if (state === "started" || state === "completed") {
+        const context = this._queueSteeringPromotionContext(sid, payload);
+        const promoted = this._promoteQueueSteeringMessage(context);
+        if (context && context.existing && !context.existing._turnId
+            && context.turnId) {
+          context.existing._turnId = context.turnId;
+        }
         st.pendingQueue = (st.pendingQueue || []).filter(q => q.id !== itemId);
-        return;
+        // An older server may omit the message snapshot. Its durable queue and
+        // canonical transcript still repair the view; ask for both without
+        // manufacturing a text-less user bubble.
+        if (!context || (!context.existing && !context.source)) {
+          this._syncQueueFromServer(sid);
+        }
+        return promoted;
       }
       const item = (st.pendingQueue || []).find(q => q.id === itemId);
       if (!item) {
         this._syncQueueFromServer(sid);
-        return;
+        return false;
       }
       item.delivery = this._normalizeBusySendMode(
         payload.effective_delivery || item.delivery,
@@ -8606,6 +8685,7 @@ function portal() {
       // Replace the array so Alpine updates the status text immediately even
       // when the item object originated from the POST acceptance mirror.
       st.pendingQueue = [...st.pendingQueue];
+      return false;
     },
     async _syncQueueFromServer(sid, options = {}) {
       if (!sid) return;
@@ -8665,9 +8745,12 @@ function portal() {
           delivery: this._normalizeBusySendMode(it.delivery, "queue"),
           deliveryStatus: String(it.steering_state
             || (it.delivery === "adjust" ? "pending" : "queued")),
+          commandUuid: String(it.command_uuid || ""),
+          targetTurnId: String(it.target_turn_id || ""),
           enqueuedAt: it.enqueued_at || Date.now(),
         };
-      });
+      }).filter(item => !this._findQueueSteeringMessage(
+        st, item.id, item.commandUuid));
       st.pendingQueue = pendingQueue;
       Promise.all(pendingQueue.flatMap(item =>
         item.images.map(async im => {
@@ -8801,6 +8884,8 @@ function portal() {
         ? (accepted && accepted.item) : acceptedQueueItem;
       if (mirrorState
           && acceptedItem && acceptedItem.id
+          && !this._findQueueSteeringMessage(
+            mirrorState, acceptedItem.id, acceptedItem.command_uuid)
           && !mirrorState.pendingQueue.some(q => q.id === acceptedItem.id)) {
         const queued = acceptedItem;
         const effectiveDelivery = this._normalizeBusySendMode(
@@ -8844,6 +8929,8 @@ function portal() {
             pendingDocs: [],
             delivery: effectiveDelivery,
             deliveryStatus,
+            commandUuid: String(queued.command_uuid || ""),
+            targetTurnId: String(queued.target_turn_id || ""),
             enqueuedAt: queued.enqueued_at || Date.now(),
           },
         ];
@@ -9256,26 +9343,72 @@ function portal() {
       const messages = st.messages || [];
       let turnUser = turnId
         ? messages.find(message => message && message.role === "user"
-          && message._turnId === turnId)
+          && message._turnId === turnId
+          && message._steeringAdjustment !== true
+          && message._turnRoot !== false)
         : null;
       const tailUser = messages[messages.length - 1];
+      const rootSignature = this._activeTurnUserSignature(text, images, docs);
       // A canonical history load may already have installed this prompt without
-      // MuseLab's live turn id. Only the physical tail can belong to the active
-      // turn, and the complete prompt envelope must match before it is adopted.
+      // MuseLab's live turn id. The physical tail remains the safest ordinary
+      // case. Native mid-turn steering is the exception: canonical history can
+      // now contain tool output and extra user messages after the root prompt.
+      // When the loaded tail is explicitly marked running, search only inside
+      // that active suffix (after the latest terminal footer), never older turns.
       if (!turnUser && turnId && tailUser && tailUser.role === "user"
           && !tailUser._turnId
           && this._activeTurnUserSignature(
             tailUser.text, tailUser.images, tailUser.docs,
-          ) === this._activeTurnUserSignature(text, images, docs)) {
+          ) === rootSignature) {
         tailUser._turnId = turnId;
+        tailUser._turnRoot = true;
         turnUser = tailUser;
+      }
+      let runningTailIndex = -1;
+      for (let i = messages.length - 1; i >= 0; i--) {
+        if (messages[i] && messages[i].turn_status === "running") {
+          runningTailIndex = i;
+          break;
+        }
+      }
+      let activeSuffixStart = messages.length;
+      if (!turnUser && turnId && runningTailIndex >= 0) {
+        activeSuffixStart = 0;
+        for (let i = runningTailIndex - 1; i >= 0; i--) {
+          const status = String(messages[i] && messages[i].turn_status || "");
+          if (status && status !== "running") {
+            activeSuffixStart = i + 1;
+            break;
+          }
+        }
+        for (let i = runningTailIndex; i >= activeSuffixStart; i--) {
+          const candidate = messages[i];
+          if (!candidate || candidate.role !== "user" || candidate._turnId
+              || candidate._steeringAdjustment === true) continue;
+          if (this._activeTurnUserSignature(
+            candidate.text, candidate.images || [], candidate.docs || [],
+          ) !== rootSignature) continue;
+          candidate._turnId = turnId;
+          candidate._turnRoot = true;
+          turnUser = candidate;
+          break;
+        }
       }
       let appended = false;
       if (!turnUser) {
+        // A bounded history window can start inside a very long active turn and
+        // omit its root user row. Drop that replayable running suffix before
+        // adding the authoritative /active prompt; the cold SSE replay rebuilds
+        // it in order instead of duplicating it above the new root.
+        if (runningTailIndex >= 0 && activeSuffixStart < messages.length) {
+          this._truncatePaneMessagesFrom(st, messages[activeSuffixStart]);
+        }
         turnUser = this._appendLiveMessage(st, {
-          role: "user", text, images, docs, _turnId: turnId,
+          role: "user", text, images, docs, _turnId: turnId, _turnRoot: true,
         });
         appended = true;
+      } else {
+        turnUser._turnRoot = true;
       }
       return { message: turnUser, appended };
     },
@@ -29460,6 +29593,7 @@ function portal() {
         this._scheduleLiveMessageViewport(sendState);
         sentUserBubble = this._appendLiveMessage(sendState, {
           role: "user", text,
+          _turnRoot: true,
           // The bubble exists before the server decides whether this prompt
           // owns a turn or a queue slot.  Keep pane-level Running hidden until
           // admission is authoritative.
@@ -29554,10 +29688,17 @@ function portal() {
         // Cold/legacy reconnect: the backend will replay every event from the
         // start of the turn, so discard the already-rendered suffix first.
         // Incremental reconnects retain it and request only missing sequences.
+        const rootUserIdx = sendState.messages.findIndex(message => message
+          && message.role === "user"
+          && message._turnId === expectedTurnId
+          && message._turnRoot === true);
         const roles = sendState.messages.map(m => m.role);
-        const lastUserIdx = roles.lastIndexOf("user");
-        if (lastUserIdx >= 0 && lastUserIdx < sendState.messages.length - 1) {
-          this._truncatePaneMessagesFrom(sendState, sendState.messages[lastUserIdx + 1]);
+        const replayRootIdx = rootUserIdx >= 0
+          ? rootUserIdx : roles.lastIndexOf("user");
+        if (replayRootIdx >= 0
+            && replayRootIdx < sendState.messages.length - 1) {
+          this._truncatePaneMessagesFrom(sendState,
+            sendState.messages[replayRootIdx + 1]);
         }
       }
       // (isContinuation: keep the existing messages intact — the watcher's
@@ -29940,6 +30081,7 @@ function portal() {
         if (ev && streamState.streamPhase !== "running" && [
           "text", "thinking", "tool_use", "tool_result", "compact_progress",
           "task_started", "task_progress", "task_notification", "rate_limit",
+          "queue_steering",
           "ask_user_question", "permission_request", "permission_request_resolved",
           "permission_mode_changed", "permission_mode_change_failed",
         ].includes(ev.type)) {
@@ -29947,7 +30089,7 @@ function portal() {
         }
       };
       ["startup", "text", "thinking", "tool_use", "tool_result", "compact_progress", "task_started",
-       "task_progress", "task_notification", "rate_limit",
+       "task_progress", "task_notification", "rate_limit", "queue_steering",
        "ask_user_question", "permission_request", "permission_request_resolved",
        "permission_mode_changed",
        "permission_mode_change_failed", "ping",
@@ -30451,7 +30593,18 @@ function portal() {
       es.addEventListener("queue_steering", ev => {
         let payload = {};
         try { payload = JSON.parse(ev.data) || {}; } catch (_) {}
-        this._applyQueueSteeringEvent(streamSid, payload);
+        // A native steering `started` ACK is a real human-message boundary in
+        // the SDK transcript. Close the current assistant/thinking segment
+        // before promoting the queue row so all later output is appended after
+        // the user's adjustment. Duplicate lifecycle frames must not split the
+        // new assistant segment, hence the explicit needs-promotion guard.
+        if (this._queueSteeringNeedsPromotion(streamSid, payload)) {
+          closeAsst();
+          closeThinking();
+        }
+        if (this._applyQueueSteeringEvent(streamSid, payload)) {
+          _scrollIfActive();
+        }
       });
       es.addEventListener("rate_limit", ev => {
         let d;
