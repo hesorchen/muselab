@@ -4709,12 +4709,17 @@ function portal() {
     _renderHistoryMessage(m) {
       if (!m || m.role !== "assistant" || !m.text) return "";
       const key = m._k || "";
-      if (!key) return this.mdRender(m.text);
+      if (!key) {
+        const html = this.mdRender(m.text);
+        m._htmlSourceText = m.text;
+        return html;
+      }
       const cache = this._historyHtmlByKey;
       const hit = cache.get(key);
       if (hit && hit.text === m.text) {
         cache.delete(key);
         cache.set(key, hit);
+        m._htmlSourceText = m.text;
         return hit.html;
       }
       if (hit) {
@@ -4732,6 +4737,7 @@ function portal() {
           0, this._historyHtmlBytes - (oldest ? oldest.bytes : 0));
         cache.delete(oldestKey);
       }
+      m._htmlSourceText = m.text;
       return html;
     },
 
@@ -10370,6 +10376,17 @@ function portal() {
         if (node.dataset.messageKey !== key
             || String(node.dataset.uuid || "")
               !== String(message && message.uuid || "")) return false;
+        // Matching attributes are necessary but not sufficient. Alpine's keyed
+        // mover can leave a node bound to the previous object when a canonical
+        // array reuses the same key/uuid. In that state the repository is new
+        // while every x-text/x-html expression still reads the old scope, so a
+        // refresh appears to "fix" the answer. Verify the actual x-for owner;
+        // the existing epoch remount below repairs only the affected pane.
+        const boundMessage = (node._x_dataStack || [])
+          .map(scope => scope && scope.m).find(Boolean);
+        const raw = (typeof Alpine !== "undefined" && Alpine.raw)
+          ? Alpine.raw : value => value;
+        if (!boundMessage || raw(boundMessage) !== raw(message)) return false;
       }
       return true;
     },
@@ -17323,6 +17340,31 @@ function portal() {
         summary_truncated: declaredTruncated || summaryLength > previewPoints.length,
       };
     },
+    _assistantPresentationDiffers(message, canonicalText) {
+      if (!message || message.role !== "assistant") return false;
+      const text = String(canonicalText || "");
+      return String(message.text || "") !== text
+        || (message._streamPlain === true
+          && String(message._streamText || "") !== text)
+        || (!!message.html
+          && String(message._htmlSourceText || "") !== text);
+    },
+    _invalidateAssistantPresentation(message, canonicalText, sid = this.currentId) {
+      if (!message || message.role !== "assistant") return false;
+      const text = String(canonicalText || "");
+      message.html = "";
+      delete message._htmlSourceText;
+      message._streamText = text;
+      // Keep canonical text visible while the idle Markdown renderer rebuilds
+      // the derived HTML. This path is shared by both block-cache refreshes and
+      // live-object adoption so neither can retain an older presentation.
+      message._streamPlain = true;
+      message._deferredRichReady = false;
+      message._canonicalPlainUntilRich = true;
+      delete message._richRenderQueued;
+      this._queueHistoryRichRender(message, sid);
+      return true;
+    },
     _historyEnvelopes(sid, list) {
       const source = list || [];
       const renderKeys = source.map(m => this._historyMessageKey(sid, m));
@@ -17371,6 +17413,14 @@ function portal() {
               body_ref: existing.body_ref,
             }
           : null;
+        // Capture presentation staleness BEFORE Object.assign below. A second
+        // quiet history response reuses this same block_id object; assigning
+        // canonical text first would erase the only evidence that cached HTML
+        // and stream text were derived from an older, shorter body.
+        const nextText = String(
+          (loadedBody ? loadedBody.text : (m && m.text)) || "");
+        const staleAssistantPresentation =
+          this._assistantPresentationDiffers(existing, nextText);
         // A prior quiet reconciliation may have adopted this canonical block
         // into an already-mounted live object. Keep that mounted key on every
         // later canonical refresh; replacing it with renderKey here remounts
@@ -17378,6 +17428,9 @@ function portal() {
         const mountedKey = existing._k || renderKey;
         Object.assign(existing, m, { _k: mountedKey });
         if (loadedBody) Object.assign(existing, loadedBody);
+        if (staleAssistantPresentation) {
+          this._invalidateAssistantPresentation(existing, nextText, sid);
+        }
         return existing;
       });
     },
@@ -17494,11 +17547,8 @@ function portal() {
             || adopted.has(index)) return false;
         const canonical = result[index];
         const canonicalText = String(canonical && canonical.text || "");
-        const staleAssistantPresentation = canonical?.role === "assistant" && (
-          String(matched.text || "") !== canonicalText
-          || (matched._streamPlain === true
-            && String(matched._streamText || "") !== canonicalText)
-        );
+        const staleAssistantPresentation =
+          this._assistantPresentationDiffers(matched, canonicalText);
         used.add(matched);
         adopted.add(index);
         adoptionKind.set(index, kind);
@@ -17537,16 +17587,8 @@ function portal() {
         // whose canonical body actually changed: the plain fallback exposes
         // the complete text immediately and rich Markdown is rebuilt lazily.
         if (staleAssistantPresentation) {
-          matched.html = "";
-          matched._streamText = canonicalText;
-          // Keep the complete canonical text visibly mounted while the idle
-          // Markdown renderer rebuilds the rich body; this avoids even one
-          // blank frame between invalidating stale HTML and installing new HTML.
-          matched._streamPlain = true;
-          matched._deferredRichReady = false;
-          matched._canonicalPlainUntilRich = true;
-          delete matched._richRenderQueued;
-          this._queueHistoryRichRender(matched, st._sid);
+          this._invalidateAssistantPresentation(
+            matched, canonicalText, st._sid);
         }
         result[index] = matched;
         return true;
