@@ -9931,14 +9931,22 @@ function portal() {
     },
     _reconcileCompletedTurn(
       sid, ownerState, expectedText = "", attempt = 0, expectedAssistantUuid = "",
-      completedTurnId = "",
+      completedTurnId = "", completionViewport = null,
     ) {
       if (!sid || this.tabState[sid] !== ownerState) return Promise.resolve(false);
+      const viewport = completionViewport || {};
       const options = {
         expectedText: String(expectedText || ""),
         expectedAssistantUuid: String(expectedAssistantUuid || ""),
         completedTurnId: String(completedTurnId || ""),
         attempt: Math.max(0, Number(attempt) || 0),
+        // A layout-induced scroll can flip the live pane's geometry between
+        // `done` and the delayed canonical read. Preserve the terminal-frame
+        // ownership decision, but only while no later real user gesture has
+        // claimed the viewport.
+        followTail: viewport.followTail === true,
+        followTailUserScrollAt: Math.max(
+          0, Number(viewport.userScrollAt) || 0),
       };
       ownerState._pendingCompletedTurnSync = options;
       return this._requestSessionSync(sid, "completed_turn", {
@@ -9952,6 +9960,9 @@ function portal() {
       const expectedText = String(options.expectedText || "");
       const expectedAssistantUuid = String(options.expectedAssistantUuid || "");
       const completedTurnId = String(options.completedTurnId || "");
+      const followTail = options.followTail === true;
+      const followTailUserScrollAt = Math.max(
+        0, Number(options.followTailUserScrollAt) || 0);
       const stillOwned = () => this.tabState[sid] === ownerState
         && !ownerState.streaming && !ownerState.es
         && !this._hasPendingAdmission(ownerState);
@@ -9960,6 +9971,7 @@ function portal() {
         if (options.signal?.aborted) return;
         const next = {
           expectedText, expectedAssistantUuid, completedTurnId,
+          followTail, followTailUserScrollAt,
           attempt: attempt + 1,
         };
         ownerState._pendingCompletedTurnSync = next;
@@ -10065,9 +10077,13 @@ function portal() {
         );
         if (!hasBoundary) { retry(); return false; }
         if (!stillOwned()) return false;
+        const followTailStillOwned = followTail
+          && Math.max(0, Number(ownerState._userScrollAt) || 0)
+            === followTailUserScrollAt;
         const loaded = await this.loadSession(sid, {
           quiet: true, probeActive: false,
           minimumTail: completedTurnWindow,
+          followTail: followTailStillOwned,
           signal: options.signal,
         });
         if (!loaded) retry();
@@ -10083,11 +10099,11 @@ function portal() {
     },
     _reconcileCompletedContinuation(
       sid, ownerState, expectedText = "", attempt = 0, expectedAssistantUuid = "",
-      completedTurnId = "",
+      completedTurnId = "", completionViewport = null,
     ) {
       return this._reconcileCompletedTurn(
         sid, ownerState, expectedText, attempt, expectedAssistantUuid,
-        completedTurnId,
+        completedTurnId, completionViewport,
       );
     },
     async removePendingQueueItem(sid, idx) {
@@ -31678,6 +31694,11 @@ function portal() {
             ta.focus();
           });
         }
+        return {
+          followTail: followedTail,
+          userScrollAt: Math.max(
+            0, Number(streamState._userScrollAt) || 0),
+        };
       };
       const markUserFailed = (errorText, kind, cta, retryable) => {
         const allMessages = streamState.messages;
@@ -31781,7 +31802,7 @@ function portal() {
           d.turn_id || streamState.activeTurnId || expectedTurnId || "",
         );
         es.close();
-        _markDone(!!d.cancelled, backgroundPending, true, {
+        const completionViewport = _markDone(!!d.cancelled, backgroundPending, true, {
           turnId: completedTurnId,
           assistantUuid: d.assistant_uuid,
           completedAtMs: d.completed_at_ms,
@@ -31814,11 +31835,13 @@ function portal() {
           this._reconcileCompletedContinuation(
             streamSid, streamState, continuationFinalText, 0,
             String(d.assistant_uuid || ""), completedTurnId,
+            completionViewport,
           );
         } else if (!d.cancelled) {
           this._reconcileCompletedTurn(
             streamSid, streamState, d.is_error ? "" : completedFinalText, 0,
             String(d.assistant_uuid || ""), completedTurnId,
+            completionViewport,
           );
         }
         if (!d.cancelled) {

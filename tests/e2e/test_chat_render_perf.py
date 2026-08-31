@@ -7151,6 +7151,196 @@ def test_tool_result_tail_done_metadata_renders_footer_before_canonical_reload(
     _assert_no_browser_errors(page, errors)
 
 
+def test_completed_tool_turn_reveals_canonical_final_without_refresh(
+    page: Page, backend_url, auth_token,
+):
+    """A terminal tail latch reveals a final block missing from live SSE."""
+    errors = _capture_browser_errors(page)
+    page.set_viewport_size({"width": 1440, "height": 900})
+    _install_fake_event_source(page)
+    sid = "perf-done-canonical-tail-latch"
+    prompt = "CANONICAL_TAIL_LATCH_PROMPT"
+    final_marker = "CANONICAL_FINAL_VISIBLE_WITHOUT_REFRESH"
+    final_text = final_marker + " " + ("complete answer " * 30)
+    canonical_messages: list[dict] = []
+    requests = _route_windowed_session(
+        page, sid, canonical_messages, updated_at=2,
+    )
+    page.route(
+        f"**/api/chat/sessions/{sid}/active*",
+        lambda route: route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({"active": False, "turn_id": "tail-latch-turn"}),
+        ),
+    )
+    page.route(
+        "**/api/chat/stream/start",
+        lambda route: route.fulfill(
+            status=200,
+            content_type="application/json",
+            body='{"ticket":"done-tail-latch-ticket"}',
+        ),
+    )
+    _login(page, backend_url, auth_token)
+    _app_eval(
+        page,
+        """
+        const sid = arg.sid;
+        app.refreshSessions = async () => {};
+        app._pullSessionList = async () => false;
+        app._fetchTabUsage = async () => {};
+        app._checkActiveTurn = () => {};
+        app._scheduleIdlePreload = () => {};
+        app._ensureSessionRegistered = async () => true;
+        app._confirmSessionBusy = async () => false;
+        app.appReady = true;
+        app.availableModels = [{
+          model: "e2e-model", label: "E2E model", group: "e2e",
+          supports_thinking: true,
+        }];
+        app.model = "e2e-model";
+        app.defaultModel = "e2e-model";
+        app.sessions = [{
+          id: sid, name: "Done canonical tail latch", updated_at: 1,
+          model: "e2e-model", permission: "bypassPermissions", thinking: true,
+        }];
+        app.openTabIds = [sid];
+        app.tabState = {};
+        app.tabState[sid] = app._blankTabState();
+        const st = app._ensureTabState(sid);
+        st._loaded = true;
+        st._seenUpdated = 1;
+        app.currentId = sid;
+        app._activateTabState(sid);
+        st.messagesReady = true;
+        st.messagesLoading = false;
+        st.atBottom = true;
+        app.mobileTab = "chat";
+        app.input = arg.prompt;
+        return true;
+        """,
+        {"sid": sid, "prompt": prompt},
+    )
+
+    _app_eval(page, "app.send(); return true;")
+    page.wait_for_function(
+        "() => window.__fakeChatStreams && window.__fakeChatStreams().length === 1"
+    )
+    page.evaluate(
+        """() => {
+          window.__emitSse("thinking", {
+            text: "inspect canonical state", turn_id: "tail-latch-turn",
+            event_seq: 1,
+          });
+          window.__emitSse("tool_use", {
+            id: "toolu_tail_latch", name: "Skill", summary: "load helper",
+            input: {skill: "fixture"}, turn_id: "tail-latch-turn", event_seq: 2,
+          });
+          window.__emitSse("tool_result", {
+            id: "toolu_tail_latch", tool_use_id: "toolu_tail_latch",
+            tool_name: "Skill", preview: "loaded", text: "loaded",
+            truncated: false, text_truncated: false, is_error: false,
+            turn_id: "tail-latch-turn", event_seq: 3,
+          });
+        }"""
+    )
+    page.wait_for_function(
+        """sid => {
+          const app = document.querySelector("#app")._x_dataStack[0];
+          const st = app._ensureTabState(sid);
+          return st.streaming && st.messages.at(-1)?.role === "tool_result"
+            && st.atBottom !== false
+            && st.messageRange.visibleEnd === st.messages.length;
+        }""",
+        arg=sid,
+        timeout=10000,
+    )
+
+    canonical_messages.extend([
+        {
+            "role": "user", "text": prompt, "uuid": "tail-latch-user",
+            "block_id": "tail-latch-user:0:user", "_turnRoot": True,
+        },
+        {
+            "role": "thinking", "text": "inspect canonical state",
+            "uuid": "tail-latch-thinking",
+            "block_id": "tail-latch-thinking:0:thinking",
+        },
+        {
+            "role": "tool_use", "id": "toolu_tail_latch", "name": "Skill",
+            "summary": "load helper", "input": {"skill": "fixture"},
+            "uuid": "tail-latch-tool-use",
+            "block_id": "tail-latch-tool-use:0:tool_use",
+        },
+        {
+            "role": "tool_result", "id": "toolu_tail_latch",
+            "tool_use_id": "toolu_tail_latch", "tool_name": "Skill",
+            "preview": "loaded", "text": "loaded", "is_error": False,
+            "uuid": "tail-latch-tool-result",
+            "block_id": "tail-latch-tool-result:0:tool_result",
+        },
+        {
+            "role": "assistant", "text": final_text,
+            "uuid": "tail-latch-final",
+            "block_id": "tail-latch-final:0:assistant",
+        },
+    ])
+    page.evaluate(
+        """() => {
+          window.__emitSse("done", {
+            turn_id: "tail-latch-turn", assistant_uuid: "tail-latch-final",
+            completed_at_ms: Date.now(), duration_ms: 1200,
+            model: "e2e-model", total_cost_usd: 0.001,
+            session_usage: {context_used_pct: 1}, event_seq: 4,
+          });
+          // Model the production race: a post-done layout scroll changes the
+          // geometry-derived bit before the delayed canonical read, but no
+          // wheel/touch/scrollbar gesture has claimed the viewport.
+          const app = document.querySelector("#app")._x_dataStack[0];
+          app._ensureTabState(app.currentId).atBottom = false;
+        }"""
+    )
+    page.wait_for_function(
+        """({sid, marker}) => {
+          const app = document.querySelector("#app")._x_dataStack[0];
+          const st = app._ensureTabState(sid);
+          const pane = document.querySelector(
+            `.msg-pane[data-tid="${CSS.escape(sid)}"]`);
+          const pending = st.sessionSync?.pending?.completed_turn;
+          const inFlight = st.sessionSync?.inFlight?.reason === "completed_turn";
+          return !pending && !inFlight
+            && st.messages.some(message => message?.uuid === "tail-latch-final")
+            && pane?.innerText.includes(marker);
+        }""",
+        arg={"sid": sid, "marker": final_marker},
+        timeout=15000,
+    )
+    result = _app_eval(
+        page,
+        """
+        const st = app._ensureTabState(arg.sid);
+        const pane = document.querySelector(
+          `.msg-pane[data-tid="${CSS.escape(arg.sid)}"]`);
+        return {
+          atBottom: st.atBottom,
+          visibleEnd: st.messageRange.visibleEnd,
+          messageCount: st.messages.length,
+          paneText: pane?.innerText || "",
+          visibleUuids: app.paneMessages(arg.sid).map(message => message.uuid || ""),
+        };
+        """,
+        {"sid": sid},
+    )
+
+    assert requests, "done reconciliation did not request canonical history"
+    assert result["atBottom"] is True, result
+    assert result["visibleEnd"] == result["messageCount"] == 5, result
+    assert "tail-latch-final" in result["visibleUuids"], result
+    assert final_marker in result["paneText"], result
+    _assert_no_browser_errors(page, errors)
+
+
 def test_stable_message_identity_needs_no_repair_telemetry(
     page: Page, backend_url, auth_token,
 ):
