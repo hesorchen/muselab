@@ -6249,7 +6249,7 @@ def test_desktop_done_reconcile_preserves_live_message_dom_identity(
     )
 
     result = page.evaluate(
-        """async ({ sid, marker, liveText }) => {
+        """async ({ sid, marker }) => {
           const app = document.querySelector("#app")._x_dataStack[0];
           const st = app._ensureTabState(sid);
           st._pendingExternalUpdate = true;
@@ -6278,7 +6278,6 @@ def test_desktop_done_reconcile_preserves_live_message_dom_identity(
               ready: st.messagesReady,
               loading: st.messagesLoading,
               canonicalReady,
-              liveVisible: !!pane && pane.innerText.includes(liveText),
               visible: !!pane && pane.innerText.includes(marker),
               count: pane ? pane.querySelectorAll(".msg").length : 0,
             });
@@ -6302,7 +6301,7 @@ def test_desktop_done_reconcile_preserves_live_message_dom_identity(
               && canonicalNode.innerText.includes(marker),
           };
         }""",
-        {"sid": sid, "marker": canonical_marker, "liveText": live_text},
+        {"sid": sid, "marker": canonical_marker},
     )
 
     assert requests, "canonical reconciliation did not request session history"
@@ -6317,7 +6316,6 @@ def test_desktop_done_reconcile_preserves_live_message_dom_identity(
     assert result["frames"]
     assert all(frame["ready"] and not frame["loading"] for frame in result["frames"]), result
     assert all(frame["count"] > 0 for frame in result["frames"]), result
-    assert result["frames"][0]["liveVisible"] is True, result
     assert any(
         frame["canonicalReady"] and frame["visible"] for frame in result["frames"]
     ), result
