@@ -6094,14 +6094,20 @@ def test_started_queue_steering_becomes_user_bubble_at_stream_boundary(
 def test_desktop_done_reconcile_preserves_live_message_dom_identity(
     page: Page, backend_url, auth_token,
 ):
-    """SSE done → quiet canonical reload keeps the rendered reply node mounted."""
+    """Done keeps its node while canonical history replaces stale live HTML."""
     errors = _capture_browser_errors(page)
     page.set_viewport_size({"width": 1440, "height": 900})
     _install_fake_event_source(page)
     sid = "perf-done-canonical-identity"
     prompt = "DOM_IDENTITY_USER_PROMPT"
     history_marker = "FULL_ORDER_HISTORY_SURVIVES_LRU_REMOUNT"
-    final_text = "DOM_IDENTITY_FINAL_REPLY " + ("stable canonical text " * 40)
+    live_text = "DOM_IDENTITY_PARTIAL_REPLY"
+    canonical_marker = "CANONICAL_ONLY_SUFFIX_VISIBLE"
+    final_text = (
+        live_text + " "
+        + ("stable canonical text " * 40)
+        + canonical_marker
+    )
     canonical_messages: list[dict] = [{
         "role": "assistant",
         "text": history_marker,
@@ -6181,7 +6187,7 @@ def test_desktop_done_reconcile_preserves_live_message_dom_identity(
         """text => window.__emitSse("text", {
           text, turn_id: "done-reconcile-turn", event_seq: 1,
         })""",
-        final_text,
+        live_text,
     )
     page.wait_for_function(
         """text => {
@@ -6193,7 +6199,7 @@ def test_desktop_done_reconcile_preserves_live_message_dom_identity(
           return st.streaming && last?.role === "assistant" && last.text === text
             && pane?.querySelector(".msg.assistant");
         }""",
-        arg=final_text,
+        arg=live_text,
         timeout=10000,
     )
     live = page.evaluate(
@@ -6229,7 +6235,8 @@ def test_desktop_done_reconcile_preserves_live_message_dom_identity(
           total_cost_usd: 0.001,
           memory_recall: { count: 2, query: "private-query" },
           session_usage: { context_used_pct: 5, context_used: 500, context_limit: 100000 },
-          turn_id: "done-reconcile-turn", event_seq: 2,
+          turn_id: "done-reconcile-turn",
+          assistant_uuid: "done-canonical-assistant", event_seq: 2,
         })"""
     )
     page.wait_for_function(
@@ -6242,7 +6249,7 @@ def test_desktop_done_reconcile_preserves_live_message_dom_identity(
     )
 
     result = page.evaluate(
-        """async ({ sid, text }) => {
+        """async ({ sid, marker, liveText }) => {
           const app = document.querySelector("#app")._x_dataStack[0];
           const st = app._ensureTabState(sid);
           st._pendingExternalUpdate = true;
@@ -6265,14 +6272,16 @@ def test_desktop_done_reconcile_preserves_live_message_dom_identity(
             await new Promise(resolve => requestAnimationFrame(resolve));
             const pane = document.querySelector(
               `.msg-pane[data-tid="${CSS.escape(sid)}"]`);
+            const canonicalReady = st.messages.some(
+              message => message?.uuid === "done-canonical-assistant");
             frames.push({
               ready: st.messagesReady,
               loading: st.messagesLoading,
-              visible: !!pane && pane.textContent.includes(text.trim()),
+              canonicalReady,
+              liveVisible: !!pane && pane.innerText.includes(liveText),
+              visible: !!pane && pane.innerText.includes(marker),
               count: pane ? pane.querySelectorAll(".msg").length : 0,
             });
-            const canonicalReady = st.messages.some(
-              message => message?.uuid === "done-canonical-assistant");
             if (canonicalReady && !canonicalSyncBusy() && i >= 2) break;
           }
           await new Promise(resolve => app.$nextTick(() => requestAnimationFrame(resolve)));
@@ -6289,9 +6298,11 @@ def test_desktop_done_reconcile_preserves_live_message_dom_identity(
             cost: last.cost || "",
             memoryCount: Number(last.memoryRecall?.count) || 0,
             historyOrder: st.messageRange.order,
+            visible: !!canonicalNode
+              && canonicalNode.innerText.includes(marker),
           };
         }""",
-        {"sid": sid, "text": final_text},
+        {"sid": sid, "marker": canonical_marker, "liveText": live_text},
     )
 
     assert requests, "canonical reconciliation did not request session history"
@@ -6305,7 +6316,12 @@ def test_desktop_done_reconcile_preserves_live_message_dom_identity(
     assert result["historyOrder"] == "full"
     assert result["frames"]
     assert all(frame["ready"] and not frame["loading"] for frame in result["frames"]), result
-    assert all(frame["visible"] and frame["count"] > 0 for frame in result["frames"]), result
+    assert all(frame["count"] > 0 for frame in result["frames"]), result
+    assert result["frames"][0]["liveVisible"] is True, result
+    assert any(
+        frame["canonicalReady"] and frame["visible"] for frame in result["frames"]
+    ), result
+    assert result["visible"] is True, result
 
     remount = _app_eval(
         page,

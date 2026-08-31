@@ -13397,7 +13397,14 @@ function portal() {
           const candidate = this._historyRichRenderQueue.shift();
           const m = candidate && candidate.message;
           if (m) delete m._richRenderQueued;
-          if (!m || m.html || !m.text) continue;
+          if (!m || !m.text) continue;
+          if (m.html) {
+            if (m._canonicalPlainUntilRich) {
+              m._streamPlain = false;
+              delete m._canonicalPlainUntilRich;
+            }
+            continue;
+          }
           if (candidate.el && !candidate.el.isConnected) continue;
           const st = this.tabState[candidate.sid];
           if (!st || !st.messages.includes(m)) continue;
@@ -13406,6 +13413,10 @@ function portal() {
         if (!pending) return;
         const m = pending.message;
         m.html = this._renderHistoryMessage(m);
+        if (m._canonicalPlainUntilRich) {
+          m._streamPlain = false;
+          delete m._canonicalPlainUntilRich;
+        }
         if (pending.el && pending.el.isConnected) {
           this.$nextTick(() => this._afterPaint(() => {
             if (pending.el.isConnected) {
@@ -17482,6 +17493,12 @@ function portal() {
         if (!matched || !matched._k || used.has(matched)
             || adopted.has(index)) return false;
         const canonical = result[index];
+        const canonicalText = String(canonical && canonical.text || "");
+        const staleAssistantPresentation = canonical?.role === "assistant" && (
+          String(matched.text || "") !== canonicalText
+          || (matched._streamPlain === true
+            && String(matched._streamText || "") !== canonicalText)
+        );
         used.add(matched);
         adopted.add(index);
         adoptionKind.set(index, kind);
@@ -17512,6 +17529,25 @@ function portal() {
         }
         matched._k = mountedKey;
         matched._noAnim = true;
+        // `html` / `_streamText` are derived only from the live text snapshot
+        // and are not part of canonical history. Object.assign cannot remove
+        // those absent fields, so a replay gap could leave `text` canonical
+        // while the mounted bubble kept rendering the shorter live HTML until
+        // a hard refresh rebuilt the object. Invalidate only presentations
+        // whose canonical body actually changed: the plain fallback exposes
+        // the complete text immediately and rich Markdown is rebuilt lazily.
+        if (staleAssistantPresentation) {
+          matched.html = "";
+          matched._streamText = canonicalText;
+          // Keep the complete canonical text visibly mounted while the idle
+          // Markdown renderer rebuilds the rich body; this avoids even one
+          // blank frame between invalidating stale HTML and installing new HTML.
+          matched._streamPlain = true;
+          matched._deferredRichReady = false;
+          matched._canonicalPlainUntilRich = true;
+          delete matched._richRenderQueued;
+          this._queueHistoryRichRender(matched, st._sid);
+        }
         result[index] = matched;
         return true;
       };
