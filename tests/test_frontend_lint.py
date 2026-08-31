@@ -5661,7 +5661,9 @@ def test_busy_send_mode_uses_authoritative_delivery_and_steering_state():
     assert 'this.busySendMode) !== "adjust"' in delivery
     assert "!turnId || attachmentIntent || st.compacting" in delivery
     assert "st.backgroundActive || st._draining || st.parentTurnId" in delivery
-    assert "st.pendingQueue && st.pendingQueue.length" in delivery
+    assert "!this._pendingQueueAllowsAdjustment(st, turnId)" in delivery
+    assert "!this._pendingQueueAllowsAdjustment(st)" in delivery
+    assert 'delivery === "adjust" && active && !!targetTurnId' in delivery
     resolve_start = app.index("    async _resolveBusyAdjustmentTurnId(")
     resolve_end = app.index("\n    sendButtonHint(sid)", resolve_start)
     resolve = app[resolve_start:resolve_end]

@@ -8443,7 +8443,7 @@ function portal() {
       // adjustment that the queue endpoint must downgrade after the POST.
       if (!st || !turnId || attachmentIntent || st.compacting
           || st.backgroundActive || st._draining || st.parentTurnId
-          || (st.pendingQueue && st.pendingQueue.length)) {
+          || !this._pendingQueueAllowsAdjustment(st, turnId)) {
         return "queue";
       }
       return "adjust";
@@ -8477,7 +8477,7 @@ function portal() {
           || this._normalizeBusySendMode(this.busySendMode) !== "adjust"
           || hasAttachments || !st.streaming || st.compacting
           || st.backgroundActive || st._draining || st.parentTurnId
-          || (st.pendingQueue && st.pendingQueue.length)) {
+          || !this._pendingQueueAllowsAdjustment(st)) {
         return "";
       }
       try {
@@ -8498,6 +8498,28 @@ function portal() {
       } catch (_) {
         return ownerStillCurrent() ? accept(st.activeTurnId) : "";
       }
+    },
+    _pendingQueueAllowsAdjustment(st, activeTurnId = "") {
+      if (!st || st._queueAdmission) return false;
+      const pending = Array.isArray(st.pendingQueue) ? st.pendingQueue : [];
+      if (!pending.length) return true;
+      const turnId = String(activeTurnId || "");
+      // Multiple native `priority=next` commands may target the same immutable
+      // foreground turn.  They must not be confused with ordinary FIFO rows:
+      // a fallback, attachment send, or item from another turn still owns its
+      // original queue position and blocks a later message from overtaking it.
+      return pending.every(item => {
+        const delivery = this._normalizeBusySendMode(
+          item && item.delivery, "queue",
+        );
+        const state = String(item && item.deliveryStatus || "pending");
+        const targetTurnId = String(item && item.targetTurnId || "");
+        const active = [
+          "pending", "waiting_tool", "queued", "started",
+        ].includes(state);
+        return delivery === "adjust" && active && !!targetTurnId
+          && (!turnId || targetTurnId === turnId);
+      });
     },
     sendButtonHint(sid) {
       if (this.composerClaimed(sid)) return this.t("btn.send");
@@ -10968,8 +10990,19 @@ function portal() {
             sid, existingState, { minimumWaitMs: 0 });
           return;
         }
-        if (existingState && !existingState.streaming) {
-          this._setBackgroundTaskActive(sid, false, payload.started_at, 0);
+        if (existingState) {
+          if (!existingState.streaming) {
+            this._setBackgroundTaskActive(sid, false, payload.started_at, 0);
+          }
+          // A short server-drained turn can start and finish between browser
+          // attach probes, so this tab never acquires its immutable turn id.
+          // Its inactive mux frame is still an authoritative canonical-history
+          // boundary. Keep one replay obligation alive across any later queued
+          // successors; the replay worker waits for the backend to become idle
+          // and then installs the complete suffix without a manual refresh.
+          existingState._pendingExternalUpdate = true;
+          this._scheduleCanonicalStreamReload(
+            sid, existingState, { minimumWaitMs: 0 });
         }
         return;
       }

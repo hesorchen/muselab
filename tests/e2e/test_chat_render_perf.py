@@ -492,6 +492,28 @@ def test_mux_inactive_retires_matching_turn_without_harming_successor(
           try {
             st._loaded = true;
             st.messages = [{ role: 'assistant', text: 'VISIBLE_COMPLETED_REPLY' }];
+            st.streaming = false;
+            st.streamPhase = '';
+            st.activeTurnId = '';
+            st.es = null;
+            if (meta) meta.active = true;
+
+            // A fast server-drained queue turn can start and finish before this
+            // browser ever owns its mux channel. Its inactive aggregate frame is
+            // then the only live hint that canonical history has a missing suffix.
+            window.__emitMux('session_state', {
+              session_id: sid, turn_id: 'turn-headless-queued', active: false,
+              stopping: false, attachable: false, activity_source: 'queued',
+            });
+            await new Promise(resolve => setTimeout(resolve, 30));
+            const headless = {
+              streaming: st.streaming,
+              activeTurnId: st.activeTurnId,
+              reloads,
+              text: st.messages[0] && st.messages[0].text,
+              metaActive: meta && meta.active,
+            };
+
             st.streaming = true;
             st.streamPhase = 'runtime';
             st.activeTurnId = 'turn-a';
@@ -551,12 +573,19 @@ def test_mux_inactive_retires_matching_turn_without_harming_successor(
             clearInterval(st._streamTimer);
             clearInterval(st._stallWatch);
             if (st.es) st.es.close();
-            return { matching, successor };
+            return { headless, matching, successor };
           } finally {
             app._scheduleCanonicalStreamReload = originalReload;
           }
         }"""
     )
+    assert result["headless"] == {
+        "streaming": False,
+        "activeTurnId": "",
+        "reloads": 1,
+        "text": "VISIBLE_COMPLETED_REPLY",
+        "metaActive": False,
+    }
     assert result["matching"] == {
         "streaming": False,
         "phase": "",
@@ -565,7 +594,7 @@ def test_mux_inactive_retires_matching_turn_without_harming_successor(
         "stall": None,
         "stoppingTurn": "",
         "elapsed": 0,
-        "reloads": 1,
+        "reloads": 2,
         "text": "VISIBLE_COMPLETED_REPLY",
         "metaActive": False,
     }
@@ -575,7 +604,7 @@ def test_mux_inactive_retires_matching_turn_without_harming_successor(
         "sameEs": True,
         "sameTimer": True,
         "activeTurnId": "turn-b",
-        "reloads": 1,
+        "reloads": 2,
         "metaActive": True,
     }
     _assert_no_browser_errors(page, errors)
@@ -4879,6 +4908,175 @@ def test_existing_fifo_queue_renders_pending_send_as_disabled_tail_card(
     ]
     assert queued.locator(".queued-label").all_text_contents() == [
         "排队中 1 / 3", "排队中 2 / 3", "排队中 3 / 3",
+    ]
+    _assert_no_browser_errors(page, errors)
+
+
+def test_existing_same_turn_adjust_keeps_next_real_send_as_adjust(
+    page: Page, backend_url, auth_token,
+):
+    """A waiting adjustment must not downgrade the next same-turn send to FIFO."""
+    errors = _capture_browser_errors(page)
+    _login(page, backend_url, auth_token)
+    sid = "perf-repeated-midturn-adjust"
+    turn_id = "repeated-midturn-active-turn"
+    first_prompt = "FIRST_ADJUSTMENT_WAITING_FOR_TOOL"
+    second_prompt = "SECOND_ADJUSTMENT_MUST_STAY_NATIVE"
+    first = {
+        "id": "repeated-adjust-first",
+        "text": first_prompt,
+        "display_text": first_prompt,
+        "selection_quotes": [],
+        "image_ids": "",
+        "attachments": [],
+        "delivery": "adjust",
+        "steering_state": "waiting_tool",
+        "command_uuid": "repeated-adjust-first-command",
+        "target_turn_id": turn_id,
+        "enqueued_at": 1,
+    }
+    accepted = {
+        "id": "repeated-adjust-second",
+        "text": second_prompt,
+        "display_text": second_prompt,
+        "selection_quotes": [],
+        "image_ids": "",
+        "attachments": [],
+        "delivery": "adjust",
+        "steering_state": "waiting_tool",
+        "command_uuid": "repeated-adjust-second-command",
+        "target_turn_id": turn_id,
+        "enqueued_at": 2,
+    }
+    post_payloads: list[dict] = []
+
+    def queue_route(route):
+        if route.request.method == "POST":
+            post_payloads.append(route.request.post_data_json)
+            route.fulfill(
+                status=200,
+                content_type="application/json",
+                body=json.dumps({
+                    "ok": True,
+                    "item": accepted,
+                    "effective_delivery": "adjust",
+                    "delivery_status": "waiting_tool",
+                    "queue": {
+                        "items": [first, accepted],
+                        "paused": False,
+                        "revision": 2,
+                    },
+                }),
+            )
+            return
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({
+                "items": [first, accepted], "paused": False, "revision": 2,
+            }),
+        )
+
+    page.route(f"**/api/chat/sessions/{sid}/queue", queue_route)
+    result = _app_eval(
+        page,
+        """
+        const sid = arg.sid;
+        const turnId = arg.turnId;
+        app.refreshSessions = async () => {};
+        app._pullSessionList = async () => false;
+        app._fetchTabUsage = async () => {};
+        app._checkActiveTurn = () => {};
+        app._scheduleIdlePreload = () => {};
+        app._syncQueueFromServer = async () => {};
+        app.appReady = true;
+        app._modelsLoaded = true;
+        app.availableModels = [{
+          model: "e2e-model", label: "E2E model", group: "e2e",
+          supports_thinking: true,
+        }];
+        app.model = "e2e-model";
+        app.defaultModel = "e2e-model";
+        app.permission = "bypassPermissions";
+        app.busySendMode = "adjust";
+        app.sessions = [{
+          id: sid, name: "Repeated mid-turn adjust", updated_at: 1,
+          model: "e2e-model", permission: "bypassPermissions", thinking: true,
+          active: true, turn_active: true,
+        }];
+        app.openTabIds = [sid];
+        app.tabState = {};
+        app.tabState[sid] = app._blankTabState();
+        const st = app._ensureTabState(sid);
+        st._loaded = true;
+        st.messagesReady = true;
+        st.messagesLoading = false;
+        st.streaming = true;
+        st.activeTurnId = turnId;
+        st._streamOwnerToken = "repeated-midturn-owner";
+        st.pendingQueue = [{
+          id: arg.first.id,
+          text: arg.first.text,
+          displayText: arg.first.display_text,
+          pendingQuotes: [], image_ids: "", hasAttach: false,
+          images: [], docs: [], expiredCount: 0,
+          pendingImages: [], pendingDocs: [],
+          delivery: "adjust", deliveryStatus: "waiting_tool",
+          commandUuid: arg.first.command_uuid,
+          targetTurnId: turnId,
+          enqueuedAt: arg.first.enqueued_at,
+        }];
+        app.currentId = sid;
+        app.mobileTab = "chat";
+        app._activateTabState(sid);
+        st.atBottom = true;
+
+        // A native adjustment from another immutable turn is still an ordering
+        // barrier; only the exact current-turn row may admit another adjustment.
+        st.pendingQueue[0].targetTurnId = "different-active-turn";
+        const differentTurnDelivery = app._busySendDelivery(sid, turnId, false);
+        st.pendingQueue[0].targetTurnId = turnId;
+
+        app.input = arg.secondPrompt;
+        const sent = await app.send();
+        return {
+          sent,
+          differentTurnDelivery,
+          pending: st.pendingQueue.map(item => ({
+            id: item.id,
+            delivery: item.delivery,
+            deliveryStatus: item.deliveryStatus,
+            targetTurnId: item.targetTurnId,
+          })),
+        };
+        """,
+        {
+            "sid": sid,
+            "turnId": turn_id,
+            "first": first,
+            "secondPrompt": second_prompt,
+        },
+    )
+
+    assert result["sent"] is True
+    assert result["differentTurnDelivery"] == "queue"
+    assert len(post_payloads) == 1
+    assert post_payloads[0]["text"] == second_prompt
+    assert post_payloads[0]["delivery"] == "adjust"
+    assert post_payloads[0]["active_turn_id"] == turn_id
+    assert result["pending"] == [
+        {
+            "id": first["id"],
+            "delivery": "adjust",
+            "deliveryStatus": "waiting_tool",
+            "targetTurnId": turn_id,
+        },
+        {
+            "id": accepted["id"],
+            "delivery": "adjust",
+            "deliveryStatus": "waiting_tool",
+            "targetTurnId": turn_id,
+        },
     ]
     _assert_no_browser_errors(page, errors)
 
