@@ -3382,14 +3382,9 @@
           <div class="hint-row" x-show="!mentionResults.length" x-text="t('files.empty_search')"></div>
         </div>
         <!-- Attachment preview row (above input). -->
-        <!-- Pending attachment chips. Upload starts eagerly the moment the
-             file is picked / pasted / dropped — by the time the user finishes
-             typing it's almost always done. We deliberately DON'T render an
-             "uploading…" spinner: the spinner used to make the chip feel like
-             a separate uploading step before send, when in fact send-time
-             auto-wait (sendMessage) already handles the rare case where the
-             upload is still in flight. Only the .error state gets a visual —
-             a red border via .img-chip.error / .doc-chip.error in styles.css. -->
+        <!-- Pending attachment chips. Upload starts eagerly and reports real
+             transferred-byte progress. The compact percentage + bottom bar
+             keep slow mobile uploads visible without blocking the composer. -->
         <div class="img-attachments"
              x-show="pendingQuotes.length || pendingImages.length || pendingDocs.length">
           <template x-for="(quote, i) in pendingQuotes"
@@ -3427,13 +3422,12 @@
                       @click="removePendingImage(i)" :title="t('img.remove')">
                 <svg><use href="#i-x"/></svg>
               </button>
-              <!-- Slim animated progress bar at the chip's bottom edge.
-                   Replaces the previous big spinning overlay (user wanted
-                   the chip to feel "uploaded" instantly); a hairline gives
-                   the necessary feedback on slow / large uploads without
-                   reading as a separate processing step. Disappears the
-                   moment upload completes or errors out. -->
-              <div x-show="img.uploading" class="chip-upload-bar"></div>
+              <span x-show="img.uploading" class="chip-upload-percent"
+                    x-text="img.progressKnown ? Math.round(img.progress || 0) + '%' : '…'"></span>
+              <div x-show="img.uploading" class="chip-upload-bar"
+                   :class="{ indeterminate: !img.progressKnown }">
+                <span :style="{ width: (img.progressKnown ? (img.progress || 0) : 38) + '%' }"></span>
+              </div>
             </div>
           </template>
           <template x-for="(doc, i) in pendingDocs" :key="doc.id || ('d'+i)">
@@ -3442,13 +3436,21 @@
               <span class="doc-chip-icon"><svg><use href="#i-file-text"/></svg></span>
               <div class="doc-chip-body">
                 <div class="doc-chip-name" x-text="doc.name"></div>
-                <div class="doc-chip-kind" x-text="doc.kind"></div>
+                <div class="doc-chip-kind"
+                     x-text="doc.uploading
+                       ? (doc.progressKnown
+                         ? (lang === 'zh' ? '上传 ' : 'Upload ') + Math.round(doc.progress || 0) + '%'
+                         : (lang === 'zh' ? '上传中…' : 'Uploading…'))
+                       : doc.kind"></div>
               </div>
               <button class="doc-chip-x icon-btn sm"
                       @click="removePendingDoc(i)" :title="t('img.remove')">
                 <svg><use href="#i-x"/></svg>
               </button>
-              <div x-show="doc.uploading" class="chip-upload-bar"></div>
+              <div x-show="doc.uploading" class="chip-upload-bar"
+                   :class="{ indeterminate: !doc.progressKnown }">
+                <span :style="{ width: (doc.progressKnown ? (doc.progress || 0) : 38) + '%' }"></span>
+              </div>
             </div>
           </template>
         </div>

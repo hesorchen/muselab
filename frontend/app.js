@@ -955,8 +955,8 @@ function portal() {
     // tabState[currentId].draft; capture/activate keeps these template-facing
     // fields aligned without persisting drafts across a page reload.
     input: "",
-    pendingImages: [],    // [{id, mime, preview (data URL), uploading, error, file}]
-    pendingDocs: [],      // [{id, name, kind: 'pdf'|'text', uploading, error}]
+    pendingImages: [],    // [{id, mime, preview, uploading, progress, progressKnown, error, file}]
+    pendingDocs: [],      // [{id, name, kind, uploading, progress, progressKnown, error}]
     // Selected preview/chat text attached to the current draft. Unlike the
     // old quote action, these never rewrite `input`; they render as removable
     // context chips above the composer and are folded into the actual prompt
@@ -3347,6 +3347,69 @@ function portal() {
         return file;
       }
     },
+    // Fetch deliberately does not expose upload-byte progress.  Use XHR only
+    // for attachment transfer so each pending chip can show a real percentage
+    // while keeping the rest of the app on fetch.  The returned facade matches
+    // the small Response surface consumed below (`ok/status/text/json`).
+    _uploadAttachment(fd, { signal = null, onProgress = null } = {}) {
+      return new Promise((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        let settled = false;
+        const abortError = () => {
+          const error = new Error("The operation was aborted");
+          error.name = "AbortError";
+          return error;
+        };
+        const cleanup = () => {
+          if (signal) signal.removeEventListener("abort", abortRequest);
+        };
+        const finish = (callback, value) => {
+          if (settled) return;
+          settled = true;
+          cleanup();
+          callback(value);
+        };
+        const abortRequest = () => xhr.abort();
+
+        xhr.open("POST", "/api/chat/upload-image", true);
+        for (const [name, value] of Object.entries(this.hdr())) {
+          xhr.setRequestHeader(name, value);
+        }
+        xhr.upload.addEventListener("progress", event => {
+          if (typeof onProgress !== "function") return;
+          onProgress(event.lengthComputable && event.total > 0
+            ? Math.round((event.loaded / event.total) * 100)
+            : null);
+        });
+        xhr.addEventListener("load", () => {
+          if (typeof onProgress === "function") onProgress(100);
+          const responseText = xhr.responseText || "";
+          finish(resolve, {
+            ok: xhr.status >= 200 && xhr.status < 300,
+            status: xhr.status,
+            statusText: xhr.statusText,
+            text: async () => responseText,
+            json: async () => JSON.parse(responseText || "null"),
+          });
+        });
+        xhr.addEventListener("error", () => {
+          finish(reject, new TypeError("Network request failed"));
+        });
+        xhr.addEventListener("abort", () => finish(reject, abortError()));
+        if (signal) {
+          if (signal.aborted) {
+            finish(reject, abortError());
+            return;
+          }
+          signal.addEventListener("abort", abortRequest, { once: true });
+        }
+        try {
+          xhr.send(fd);
+        } catch (error) {
+          finish(reject, error);
+        }
+      });
+    },
     async _attachFile(file) {
       if (this.workspaceSwitching) return;
       const ownerSid = this.currentId;
@@ -3392,7 +3455,8 @@ function portal() {
         // round-tripping back to the server. Memory cost is small (~300 KB
         // per image after compression), cleared on send.
         const raw = { id: null, mime: file.type, preview,
-                       uploading: true, error: false, file };
+                       uploading: true, progress: 0, progressKnown: false,
+                       error: false, file };
         ownerDraft.pendingImages.push(raw);
         // Alpine v3 wraps each pushed item in a Proxy. The local `raw`
         // reference still points at the original (non-proxied) object;
@@ -3405,7 +3469,8 @@ function portal() {
         entry = ownerDraft.pendingImages[ownerDraft.pendingImages.length - 1];
       } else {
         const raw = { id: null, name: file.name, kind,
-                       uploading: true, error: false };
+                       uploading: true, progress: 0, progressKnown: false,
+                       error: false };
         ownerDraft.pendingDocs.push(raw);
         // Same Alpine-proxy gotcha as above — must use the proxied
         // reference for entry.uploading = false to actually trigger UI.
@@ -3422,10 +3487,22 @@ function portal() {
       );
       const ownsEntry = () => ownsDraft()
         && (ownerDraft.pendingImages.includes(entry) || ownerDraft.pendingDocs.includes(entry));
+      const updateProgress = percent => {
+        if (!ownsEntry()) return;
+        if (percent === null) {
+          entry.progressKnown = false;
+          return;
+        }
+        entry.progressKnown = true;
+        entry.progress = Math.max(
+          Number(entry.progress) || 0,
+          Math.max(0, Math.min(100, Math.round(percent))),
+        );
+      };
       try {
-        const r = await fetch("/api/chat/upload-image", {
-          method: "POST", headers: this.hdr(), body: fd,
+        const r = await this._uploadAttachment(fd, {
           signal: uploadController.signal,
+          onProgress: updateProgress,
         });
         if (!ownsEntry()) return;
         if (!r.ok) {
@@ -3442,7 +3519,7 @@ function portal() {
         }
         const d = await r.json();
         if (!ownsEntry()) return;
-        entry.id = d.id; entry.uploading = false;
+        entry.id = d.id; entry.progress = 100; entry.uploading = false;
         // Stash the on-disk extension the server will use when persisting
         // this image at send-time. Used to construct the lightbox URL
         // upfront so the full-res original is accessible even if the
@@ -3806,6 +3883,8 @@ function portal() {
       // holds. Mark uploading so the chip shows the upload progress hairline.
       entry.file = file;
       entry.uploading = true;
+      entry.progress = 0;
+      entry.progressKnown = false;
       entry.error = false;
       entry.preview = await this._imageToThumbDataURL(file);
       if (!ownsEntry()) return;
@@ -3818,10 +3897,22 @@ function portal() {
       const uploadTimeout = setTimeout(
         () => uploadController.abort(), 5 * 60 * 1000,
       );
+      const updateProgress = percent => {
+        if (!ownsEntry()) return;
+        if (percent === null) {
+          entry.progressKnown = false;
+          return;
+        }
+        entry.progressKnown = true;
+        entry.progress = Math.max(
+          Number(entry.progress) || 0,
+          Math.max(0, Math.min(100, Math.round(percent))),
+        );
+      };
       try {
-        const r = await fetch("/api/chat/upload-image", {
-          method: "POST", headers: this.hdr(), body: fd,
+        const r = await this._uploadAttachment(fd, {
           signal: uploadController.signal,
+          onProgress: updateProgress,
         });
         if (!ownsEntry()) return;
         if (!r.ok) {
@@ -3834,7 +3925,7 @@ function portal() {
         }
         const d = await r.json();
         if (!ownsEntry()) return;
-        entry.id = d.id; entry.uploading = false;
+        entry.id = d.id; entry.progress = 100; entry.uploading = false;
         if (d.attach_ext) entry.attach_ext = d.attach_ext;
       } catch (e) {
         if (!ownsEntry()) return;

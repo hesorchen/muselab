@@ -3046,6 +3046,32 @@ def test_composer_draft_is_per_session_and_async_actions_pin_owner():
     assert "this.tabState[ownerSid] !== ownerState" in image_gen
 
 
+def test_attachment_upload_uses_real_byte_progress_and_renders_percentage():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    css = (FRONTEND / "styles.css").read_text(encoding="utf-8")
+
+    helper_start = app.index("_uploadAttachment(fd")
+    helper_end = app.index("async _attachFile(file)", helper_start)
+    helper = app[helper_start:helper_end]
+    assert "new XMLHttpRequest()" in helper
+    assert 'xhr.upload.addEventListener("progress"' in helper
+    assert "event.loaded / event.total" in helper
+    assert 'xhr.setRequestHeader(name, value)' in helper
+    assert 'signal.addEventListener("abort"' in helper
+
+    attach_start = app.index("async _attachFile(file)")
+    attach_end = app.index("async onAttachPicked", attach_start)
+    attach = app[attach_start:attach_end]
+    assert "progress: 0, progressKnown: false" in attach
+    assert "onProgress: updateProgress" in attach
+    assert "entry.progress = 100" in attach
+    assert "img.progressKnown" in html
+    assert "doc.progressKnown" in html
+    assert "chip-upload-percent" in html
+    assert ".chip-upload-bar > span" in css
+
+
 def test_chat_draft_survives_refresh_and_failed_stream_start():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
     send_start = app.index("async send(opts = {})")

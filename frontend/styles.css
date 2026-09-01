@@ -5899,27 +5899,43 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 .doc-chip.uploading .doc-chip-icon { opacity: 0.85; }
 .img-chip.error,
 .doc-chip.error { border-color: var(--c-error, #dc3545); }
-/* Indeterminate progress bar — the actual upload doesn't report a %, so
-   we use a sliding gradient. Lives in styles.css after the chip block
-   below so it can reference --c-accent. */
+/* Real upload-byte progress. Unknown Content-Length falls back to a compact
+   indeterminate slider; normal browser uploads use the determinate width. */
 .chip-upload-bar {
   position: absolute;
   left: 0; right: 0; bottom: 0;
-  height: 2px;
-  background: linear-gradient(
-    90deg,
-    transparent 0%,
-    var(--c-accent) 30%,
-    var(--c-accent) 70%,
-    transparent 100%
-  );
-  background-size: 200% 100%;
-  animation: chip-upload-slide 1.4s linear infinite;
+  height: 3px;
+  overflow: hidden;
+  background: color-mix(in srgb, var(--c-accent) 18%, transparent);
+  pointer-events: none;
+}
+.chip-upload-bar > span {
+  display: block;
+  height: 100%;
+  min-width: 2px;
+  border-radius: 0 3px 3px 0;
+  background: var(--c-accent);
+  transition: width 120ms linear;
+}
+.chip-upload-bar.indeterminate > span {
+  animation: chip-upload-slide 1.2s ease-in-out infinite;
+}
+.chip-upload-percent {
+  position: absolute;
+  left: 4px;
+  bottom: 5px;
+  z-index: 2;
+  padding: 1px 4px;
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.68);
+  color: #fff;
+  font: 600 10px/1.3 var(--font-ui);
+  font-variant-numeric: tabular-nums;
   pointer-events: none;
 }
 @keyframes chip-upload-slide {
-  from { background-position: 100% 0; }
-  to   { background-position: -100% 0; }
+  from { transform: translateX(-110%); }
+  to   { transform: translateX(270%); }
 }
 .image-gen-modal {
   width: min(760px, 92vw);

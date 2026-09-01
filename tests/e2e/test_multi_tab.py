@@ -549,13 +549,12 @@ def test_upload_completion_stays_with_starting_tab(page: Page, backend_url, auth
 
     page.evaluate(
         """() => {
-          const originalFetch = window.fetch.bind(window);
+          const app = document.querySelector('#app')._x_dataStack[0];
           window.__resolveUpload = null;
-          window.fetch = (url, init) => {
-            if (String(url).includes('/api/chat/upload-image')) {
-              return new Promise(resolve => { window.__resolveUpload = resolve; });
-            }
-            return originalFetch(url, init);
+          window.__uploadProgress = null;
+          app._uploadAttachment = (_fd, options) => {
+            window.__uploadProgress = options.onProgress;
+            return new Promise(resolve => { window.__resolveUpload = resolve; });
           };
         }""")
     page.locator('input[type="file"][x-ref="attachInput"]').set_input_files({
@@ -571,6 +570,16 @@ def test_upload_completion_stays_with_starting_tab(page: Page, backend_url, auth
         }""",
         arg=[sid_a],
     )
+    page.evaluate("() => window.__uploadProgress(37)")
+    page.wait_for_function(
+        """([sid]) => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const doc = app.tabState[sid]?.draft.pendingDocs[0];
+          return doc?.progressKnown === true && doc.progress === 37;
+        }""",
+        arg=[sid_a],
+    )
+    assert "37%" in page.locator(".doc-chip-kind").inner_text()
 
     _activate_chat_tab(page, sid_b)
     page.evaluate(
