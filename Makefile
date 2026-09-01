@@ -1,10 +1,15 @@
-.PHONY: test lint fmt run
+.PHONY: test test-fast test-serial lint fmt run
+
+PYTEST_WORKERS ?= auto
 
 test:
-	uv run pytest -v
+	uv run pytest -n $(PYTEST_WORKERS) --dist=worksteal -v
 
 test-fast:
-	uv run pytest -x --tb=short
+	uv run pytest -n $(PYTEST_WORKERS) --dist=worksteal -x --tb=short
+
+test-serial:
+	uv run pytest -v
 
 lint:
 	uv run ruff check backend tests

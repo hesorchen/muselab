@@ -45,7 +45,7 @@ jobs:
           MUSELAB_ROOT: ${{ github.workspace }}/.ci-workspace
         run: |
           mkdir -p $MUSELAB_ROOT
-          uv run pytest tests/ -v
+          uv run pytest tests/ -n auto --dist=worksteal -v
 
       - name: Coverage report (non-blocking, informational)
         # Best-effort coverage. pytest-cov is pulled ephemerally via
