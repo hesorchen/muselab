@@ -1,5 +1,6 @@
 import asyncio
 import json
+import threading
 import urllib.parse
 
 import pytest
@@ -293,7 +294,9 @@ def test_mux_auto_discovers_wraps_events_and_disconnect_only_unsubscribes(
     asyncio.run(exercise())
 
 
-def test_mux_reconcile_batches_runtime_lineages(chat_mod, monkeypatch):
+def test_mux_reconcile_batches_durable_projections_off_loop(
+    chat_mod, monkeypatch,
+):
     monkeypatch.setattr(chat_mod, "_MUX_RECONCILE_INTERVAL_S", 0.01)
     broadcasts = [
         chat_mod.TurnBroadcast("batch-lineage-a"),
@@ -302,19 +305,36 @@ def test_mux_reconcile_batches_runtime_lineages(chat_mod, monkeypatch):
     for broadcast in broadcasts:
         chat_mod._active_turns[broadcast.session_id] = broadcast
 
-    batch_calls = []
+    lineage_calls = []
+    task_calls = []
     status_calls = []
+    caller_thread = threading.get_ident()
 
     def runtime_lineages(session_ids):
         ordered = tuple(sorted(session_ids))
-        batch_calls.append(ordered)
+        lineage_calls.append((ordered, threading.get_ident()))
         return {sid: [f"owner-{sid}", sid] for sid in ordered}
 
-    def state(sid, *, runtime_lineage=None):
-        status_calls.append((sid, runtime_lineage))
+    def running_runtime_task_ids(session_ids):
+        ordered = tuple(sorted(session_ids))
+        task_calls.append((ordered, threading.get_ident()))
+        return {sid: frozenset({f"task-{sid}"}) for sid in ordered}
+
+    def state(
+        sid, *, runtime_lineage=None, durable_runtime_task_ids=None,
+    ):
+        status_calls.append((
+            sid, runtime_lineage, durable_runtime_task_ids,
+            threading.get_ident(),
+        ))
         return _active_state(chat_mod._active_turns[sid])
 
     monkeypatch.setattr(chat_mod.sess, "runtime_lineages", runtime_lineages)
+    monkeypatch.setattr(
+        chat_mod.sess,
+        "running_runtime_task_ids",
+        running_runtime_task_ids,
+    )
     monkeypatch.setattr(chat_mod, "_session_active_status", state)
 
     async def exercise():
@@ -325,9 +345,18 @@ def test_mux_reconcile_batches_runtime_lineages(chat_mod, monkeypatch):
     asyncio.run(exercise())
 
     expected_ids = ("batch-lineage-a", "batch-lineage-b")
-    assert batch_calls == [expected_ids]
+    assert [call[0] for call in lineage_calls] == [expected_ids]
+    assert [call[0] for call in task_calls] == [expected_ids]
+    assert lineage_calls[0][1] == task_calls[0][1]
+    assert lineage_calls[0][1] != caller_thread
     assert status_calls == [
-        (sid, [f"owner-{sid}", sid]) for sid in expected_ids
+        (
+            sid,
+            [f"owner-{sid}", sid],
+            frozenset({f"task-{sid}"}),
+            caller_thread,
+        )
+        for sid in expected_ids
     ]
     for broadcast in broadcasts:
         broadcast.close()

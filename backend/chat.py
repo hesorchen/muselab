@@ -19390,6 +19390,19 @@ def _mux_session_state_fingerprint(state: dict) -> str:
     return json.dumps(stable, sort_keys=True, ensure_ascii=False)
 
 
+def _runtime_reconcile_projections(
+    session_ids: Iterable[str],
+) -> tuple[dict[str, list[str]], dict[str, frozenset[str]]]:
+    """Load durable status projections together on a worker thread."""
+    ordered_ids = tuple(dict.fromkeys(
+        sid for raw_sid in session_ids if (sid := str(raw_sid or ""))
+    ))
+    return (
+        sess.runtime_lineages(ordered_ids),
+        sess.running_runtime_task_ids(ordered_ids),
+    )
+
+
 async def _subscribe_multiplex(
     checkpoints: dict[str, dict],
     *,
@@ -19505,20 +19518,25 @@ async def _subscribe_multiplex(
         )
         candidate_ids.update(pending_checkpoints)
 
-        # Parse the durable session index once for the whole reconcile pass.
-        # This loop runs every 200 ms per multiplex connection; resolving each
-        # candidate independently used to read + json.loads the complete index
-        # N times on the event-loop thread. The batch read runs off-loop and
-        # returns private lineage lists that status projection cannot mutate.
-        runtime_lineages = (
-            await asyncio.to_thread(sess.runtime_lineages, candidate_ids)
-            if candidate_ids else {}
+        # Load durable projections once for the whole reconcile pass. This loop
+        # runs every 200 ms per multiplex connection; neither the full session
+        # index nor a large sidecar may be read/decoded on the event-loop thread.
+        # Runtime-task summaries retain only immutable task ids, so warm passes
+        # are O(stat) even when full sidecars churn out of their small cache.
+        runtime_lineages, durable_runtime_task_ids = (
+            await asyncio.to_thread(
+                _runtime_reconcile_projections, candidate_ids,
+            )
+            if candidate_ids else ({}, {})
         )
         active_ids: set[str] = set()
         for session_id in sorted(candidate_ids):
             state = _session_active_status(
                 session_id,
                 runtime_lineage=runtime_lineages.get(session_id, []),
+                durable_runtime_task_ids=durable_runtime_task_ids.get(
+                    session_id, frozenset(),
+                ),
             )
             checkpoint = pending_checkpoints.get(session_id)
             checkpoint_recent = None
@@ -19707,17 +19725,22 @@ async def _subscribe_broadcast(
 
 
 def _session_active_status(
-    sid: str, *, runtime_lineage: list[str] | None = None,
+    sid: str,
+    *,
+    runtime_lineage: list[str] | None = None,
+    durable_runtime_task_ids: Iterable[str] | None = None,
 ) -> dict:
     """Tell the frontend whether `sid` has an in-progress background
     turn. Used on session load to decide between "render JSONL history"
     and "open a reconnect SSE stream to follow the live tail."""
     runtime_task_ids = set(_sessions_with_inflight_tasks.get(sid, ()))
-    runtime_task_ids.update(
-        task_id
-        for task_id, overlay in sess.get_runtime_task_overlays(sid).items()
-        if overlay.get("state") == "running"
-    )
+    if durable_runtime_task_ids is None:
+        durable_runtime_task_ids = (
+            task_id
+            for task_id, overlay in sess.get_runtime_task_overlays(sid).items()
+            if overlay.get("state") == "running"
+        )
+    runtime_task_ids.update(durable_runtime_task_ids)
     runtime_background_pending = len(runtime_task_ids)
     runtime_continuation_pending, runtime_ui_revision = (
         _runtime_continuation_projection_state(

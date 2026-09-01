@@ -236,6 +236,91 @@ def test_runtime_task_overlay_bounds_summary_on_write(app_module):
     assert raw["runtime_task_overlays"]["task-long"] == overlay
 
 
+def test_running_runtime_task_ids_cache_one_overlay_parse_per_generation(
+    app_module, monkeypatch,
+):
+    from backend import sessions as sess
+
+    sid = sess.create_session("runtime-overlay-summary-cache")["id"]
+    assert sess.set_runtime_task_overlay(
+        sid, "task-running", state="running",
+    )
+    sess._drop_running_runtime_task_ids_cache(sid)
+    real_load = sess._load_runtime_task_overlays_section
+    loads = 0
+
+    def counted_load(load_sid):
+        nonlocal loads
+        loads += 1
+        return real_load(load_sid)
+
+    monkeypatch.setattr(
+        sess, "_load_runtime_task_overlays_section", counted_load,
+    )
+    expected = {sid: frozenset({"task-running"})}
+    assert sess.running_runtime_task_ids((sid, sid)) == expected
+    assert sess.running_runtime_task_ids((sid,)) == expected
+    assert loads == 1
+
+
+def test_sidecar_save_refreshes_running_task_summary_without_reread(
+    app_module, monkeypatch,
+):
+    from backend import sessions as sess
+
+    sid = sess.create_session("runtime-overlay-summary-refresh")["id"]
+    assert sess.set_runtime_task_overlay(sid, "task-1", state="running")
+    assert sess.running_runtime_task_ids((sid,))[sid] == frozenset({"task-1"})
+
+    monkeypatch.setattr(
+        sess,
+        "_load_runtime_task_overlays_section",
+        lambda _sid: pytest.fail("a successful sidecar save must prime summary"),
+    )
+    assert sess.set_runtime_task_overlay(sid, "task-1", state="completed")
+    assert sess.running_runtime_task_ids((sid,))[sid] == frozenset()
+
+
+def test_sidecar_caches_detect_same_size_mtime_atomic_replace(app_module):
+    from backend import sessions as sess
+
+    sid = sess.create_session("runtime-overlay-external-replace")["id"]
+    original = {
+        "messages": {"message-1": {"model": "old"}},
+        "runtime_task_overlays": {
+            "task-1": {"task_id": "task-1", "state": "running"},
+        },
+    }
+    replacement = {
+        "messages": {"message-1": {"model": "new"}},
+        "runtime_task_overlays": {
+            "task-1": {"task_id": "task-1", "state": "stopped"},
+        },
+    }
+    sess._save_sidecar(sid, original)
+    assert sess._load_sidecar(sid)["messages"]["message-1"]["model"] == "old"
+    assert sess.running_runtime_task_ids((sid,))[sid] == frozenset({"task-1"})
+
+    path = sess._sidecar_path(sid)
+    original_stat = path.stat()
+    serialized = json.dumps(replacement, ensure_ascii=False)
+    assert len(serialized.encode("utf-8")) == original_stat.st_size
+    replacement_path = path.with_suffix(".replacement")
+    replacement_path.write_text(serialized, encoding="utf-8")
+    os.utime(
+        replacement_path,
+        ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
+    )
+    os.replace(replacement_path, path)
+    replaced_stat = path.stat()
+    assert replaced_stat.st_size == original_stat.st_size
+    assert replaced_stat.st_mtime_ns == original_stat.st_mtime_ns
+    assert replaced_stat.st_ino != original_stat.st_ino
+
+    assert sess._load_sidecar(sid)["messages"]["message-1"]["model"] == "new"
+    assert sess.running_runtime_task_ids((sid,))[sid] == frozenset()
+
+
 def test_runtime_task_overlay_legacy_summary_is_bounded_then_compacted(app_module):
     from backend import sessions as sess
     from backend.task_summaries import TASK_SUMMARY_PREVIEW_CAP

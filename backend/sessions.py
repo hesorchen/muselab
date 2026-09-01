@@ -402,15 +402,82 @@ def invalidate_sessions_cache() -> None:
     _META_CACHE.clear()
 
 
-# Parsed-sidecar cache keyed by sid → (mtime, size, dict). Sidecars are
+# Parsed-sidecar cache keyed by sid → (file signature, dict). Sidecars are
 # re-read + json.loads'd on EVERY GET /sessions/{sid} (annotations), every
 # ctx-window read, etc., and can reach MBs when they hold base64 thumbs.
-# (mtime, size) keying means an external edit (or our own _save_sidecar)
-# is picked up on the next read. Cached dicts are returned as-is: callers
+# Device + inode make atomic replacements visible even if an external writer
+# preserves mtime and size; nanosecond mtime catches rapid in-place edits.
+# Cached dicts are returned as-is: callers
 # that mutate them do so under _SIDECAR_LOCK and immediately _save_sidecar
 # (which drops the cache entry), so mutation never leaks a stale snapshot.
-_SIDECAR_CACHE: dict[str, tuple[float, int, dict]] = {}
+_SidecarSignature = tuple[int, int, int, int]
+_SIDECAR_CACHE: dict[str, tuple[_SidecarSignature, dict]] = {}
 _SIDECAR_CACHE_MAX = 64
+
+# Multiplex reconciliation needs only the ids of durable runtime tasks whose
+# overlay is still running. Keeping that tiny immutable projection separately
+# prevents the 64-entry full-sidecar cache from forcing repeated reads of MB-
+# sized annotation/image payloads. The larger bound is cheap (sets of ids only)
+# and covers archives with thousands of sessions without retaining sidecars.
+_RUNNING_RUNTIME_TASK_IDS_CACHE: dict[
+    str, tuple[_SidecarSignature, frozenset[str]]
+] = {}
+_RUNNING_RUNTIME_TASK_IDS_CACHE_LOCK = threading.Lock()
+_RUNNING_RUNTIME_TASK_IDS_CACHE_MAX = 4096
+
+
+def _sidecar_file_signature(path: Path) -> _SidecarSignature | None:
+    try:
+        st = path.stat()
+    except FileNotFoundError:
+        return None
+    return (st.st_dev, st.st_ino, st.st_mtime_ns, st.st_size)
+
+
+def _running_runtime_task_ids_from_data(data: Any) -> frozenset[str]:
+    if not isinstance(data, dict):
+        return frozenset()
+    overlays = data.get("runtime_task_overlays")
+    if not isinstance(overlays, dict):
+        return frozenset()
+    return frozenset(
+        str(task_id)
+        for task_id, overlay in overlays.items()
+        if task_id and isinstance(overlay, dict)
+        and overlay.get("state") == "running"
+    )
+
+
+def _drop_running_runtime_task_ids_cache(sid: str) -> None:
+    with _RUNNING_RUNTIME_TASK_IDS_CACHE_LOCK:
+        _RUNNING_RUNTIME_TASK_IDS_CACHE.pop(sid, None)
+
+
+def _store_running_runtime_task_ids_cache(
+    sid: str,
+    signature: _SidecarSignature,
+    task_ids: frozenset[str],
+) -> None:
+    with _RUNNING_RUNTIME_TASK_IDS_CACHE_LOCK:
+        if (
+            len(_RUNNING_RUNTIME_TASK_IDS_CACHE)
+            >= _RUNNING_RUNTIME_TASK_IDS_CACHE_MAX
+            and sid not in _RUNNING_RUNTIME_TASK_IDS_CACHE
+        ):
+            _RUNNING_RUNTIME_TASK_IDS_CACHE.pop(
+                next(iter(_RUNNING_RUNTIME_TASK_IDS_CACHE)), None,
+            )
+        _RUNNING_RUNTIME_TASK_IDS_CACHE[sid] = (signature, task_ids)
+
+
+def _refresh_running_runtime_task_ids_cache(sid: str, data: dict) -> None:
+    signature = _sidecar_file_signature(_sidecar_path(sid))
+    if signature is None:
+        _drop_running_runtime_task_ids_cache(sid)
+        return
+    _store_running_runtime_task_ids_cache(
+        sid, signature, _running_runtime_task_ids_from_data(data),
+    )
 
 
 def _load_sidecar(sid: str, *, use_cache: bool = True) -> dict:
@@ -422,15 +489,15 @@ def _load_sidecar(sid: str, *, use_cache: bool = True) -> dict:
     in-flight mutations to concurrent readers (and persist them in the
     cache even if the save never happens)."""
     p = _sidecar_path(sid)
-    try:
-        st = p.stat()
-    except FileNotFoundError:
+    sig = _sidecar_file_signature(p)
+    if sig is None:
+        _SIDECAR_CACHE.pop(sid, None)
+        _drop_running_runtime_task_ids_cache(sid)
         return {"messages": {}}
-    sig = (st.st_mtime, st.st_size)
     if use_cache:
         hit = _SIDECAR_CACHE.get(sid)
-        if hit is not None and hit[0] == sig[0] and hit[1] == sig[1]:
-            return hit[2]
+        if hit is not None and hit[0] == sig:
+            return hit[1]
     try:
         d = json.loads(p.read_text(encoding="utf-8"))
         if not isinstance(d, dict):
@@ -444,7 +511,7 @@ def _load_sidecar(sid: str, *, use_cache: bool = True) -> dict:
     if use_cache:
         if len(_SIDECAR_CACHE) >= _SIDECAR_CACHE_MAX and sid not in _SIDECAR_CACHE:
             _SIDECAR_CACHE.pop(next(iter(_SIDECAR_CACHE)), None)
-        _SIDECAR_CACHE[sid] = (sig[0], sig[1], d)
+        _SIDECAR_CACHE[sid] = (sig, d)
     return d
 
 
@@ -454,6 +521,10 @@ def _save_sidecar(sid: str, data: dict) -> None:
     # Drop rather than refresh: the next _load_sidecar re-stats and caches
     # the just-written file, keeping cache state derived purely from disk.
     _SIDECAR_CACHE.pop(sid, None)
+    # The hot reconcile projection is immutable and derived from the exact
+    # object just serialized successfully, so refresh it without rereading the
+    # potentially large sidecar on the next 200 ms tick.
+    _refresh_running_runtime_task_ids_cache(sid, data)
 
 
 def indexed_session_ids() -> set[str]:
@@ -1041,6 +1112,7 @@ def delete_session(sid: str) -> bool:
                     try:
                         sidecar.unlink()
                         _SIDECAR_CACHE.pop(sid, None)
+                        _drop_running_runtime_task_ids_cache(sid)
                         removed = True
                     except OSError:
                         pass
@@ -1141,6 +1213,7 @@ def prune_empty_sessions(keep_ids: tuple | list = ()) -> list[str]:
                     try:
                         p.unlink()
                         _SIDECAR_CACHE.pop(sid, None)
+                        _drop_running_runtime_task_ids_cache(sid)
                     except OSError:
                         pass
             q = _queue_path(sid)
@@ -1687,6 +1760,55 @@ def get_runtime_task_overlays(sid: str) -> dict[str, dict]:
     return _normalize_runtime_task_overlays(
         _load_sidecar(sid).get("runtime_task_overlays") or {}
     )
+
+
+def _running_runtime_task_ids(sid: str) -> frozenset[str]:
+    """Return one sidecar's durable running-task summary.
+
+    Cache misses decode only the overlay object and verify the file generation
+    before publishing the immutable result. Callers from async hot paths must
+    invoke the batch wrapper through ``asyncio.to_thread``; warm reads are one
+    stat plus a small set lookup and never retain the full sidecar payload.
+    """
+    latest = frozenset()
+    path = _sidecar_path(sid)
+    for _attempt in range(2):
+        signature = _sidecar_file_signature(path)
+        if signature is None:
+            _drop_running_runtime_task_ids_cache(sid)
+            return frozenset()
+        with _RUNNING_RUNTIME_TASK_IDS_CACHE_LOCK:
+            hit = _RUNNING_RUNTIME_TASK_IDS_CACHE.get(sid)
+            if hit is not None and hit[0] == signature:
+                return hit[1]
+
+        overlays = _load_runtime_task_overlays_section(sid)
+        latest = _running_runtime_task_ids_from_data({
+            "runtime_task_overlays": overlays,
+        })
+        if _sidecar_file_signature(path) != signature:
+            # An atomic external writer replaced the file while it was read.
+            # Retry once; never associate a snapshot with the wrong signature.
+            continue
+        _store_running_runtime_task_ids_cache(sid, signature, latest)
+        return latest
+
+    # A continuously changing external file still yields a valid point-in-time
+    # answer. Do not cache it; the next reconcile pass will retry naturally.
+    return latest
+
+
+def running_runtime_task_ids(
+    sids: Iterable[str],
+) -> dict[str, frozenset[str]]:
+    """Resolve durable running-task ids for many sessions from tiny summaries."""
+    ordered_sids = tuple(dict.fromkeys(
+        sid for raw_sid in sids if (sid := str(raw_sid or ""))
+    ))
+    return {
+        sid: _running_runtime_task_ids(sid)
+        for sid in ordered_sids
+    }
 
 
 _RUNTIME_TASK_TERMINAL_STATES = frozenset({
