@@ -487,6 +487,51 @@ def test_runtime_lineages_cache_one_parse_per_index_generation(
     assert loads == 1
 
 
+def test_runtime_successor_redirects_resolve_only_final_public_target(
+    app_module,
+):
+    from backend import sessions as sess
+
+    source = sess.create_session("redirect-source")["id"]
+    child = sess.create_session("redirect-child")["id"]
+    grandchild = sess.create_session("redirect-grandchild")["id"]
+    unrelated = sess.create_session("redirect-unrelated")["id"]
+    assert sess.link_runtime_successor(source, child)
+    assert sess.link_runtime_successor(child, grandchild)
+
+    assert sess.runtime_successor_redirects(
+        (source, child, grandchild, unrelated, "missing", source)
+    ) == {
+        source: grandchild,
+        child: grandchild,
+    }
+
+
+def test_session_list_repairs_hidden_open_tab_to_runtime_successor(
+    client, auth, app_module,
+):
+    from backend import sessions as sess
+
+    source = sess.create_session("hidden-open-source")["id"]
+    child = sess.create_session("hidden-open-child")["id"]
+    target = sess.create_session("visible-open-target")["id"]
+    assert sess.link_runtime_successor(source, child)
+    assert sess.link_runtime_successor(child, target)
+    newest = sess.create_session("newer-first-page-row")["id"]
+
+    response = client.get(
+        f"/api/chat/sessions?limit=1&ids={source}", headers=auth,
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["session_redirects"] == {source: target}
+    returned_ids = [row["id"] for row in body["sessions"]]
+    assert returned_ids == [newest, target]
+    assert source not in returned_ids
+    assert child not in returned_ids
+
+
 def test_runtime_index_cache_never_shares_rows_with_mutators(app_module):
     from backend import sessions as sess
 

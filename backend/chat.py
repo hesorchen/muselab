@@ -5099,6 +5099,10 @@ def list_sessions_api(
     #               that fell outside the recent window.
     # limit=0 (the default) preserves the old "return everything" behaviour for
     # any caller that doesn't opt in.
+    requested_ids = tuple(dict.fromkeys(
+        sid for raw_sid in (ids or "").split(",")
+        if (sid := raw_sid.strip())
+    ))
     full, list_revision = sess.list_sessions_snapshot()
     # A workspace switch only needs that workspace's recent sessions.  Filter
     # before applying q/limit/ids so an open-tab id owned by another workspace
@@ -5110,6 +5114,16 @@ def list_sessions_api(
             s for s in full
             if str(s.get("cwd") or ROOT) == workspace_path
         ]
+    public_ids = {
+        str(row.get("id") or "") for row in full if row.get("id")
+    }
+    session_redirects = {
+        source_sid: target_sid
+        for source_sid, target_sid in sess.runtime_successor_redirects(
+            requested_ids
+        ).items()
+        if target_sid in public_ids
+    }
     total = len(full)
     q_norm = (q or "").strip().lower()
     if q_norm:
@@ -5121,7 +5135,7 @@ def list_sessions_api(
     elif limit and limit < total:
         subset = list(full[:limit])
         have = {s.get("id") for s in subset}
-        keep = {x for x in (ids or "").split(",") if x}
+        keep = set(requested_ids) | set(session_redirects.values())
         if keep:
             for s in full:
                 sid = s.get("id")
@@ -5187,7 +5201,12 @@ def list_sessions_api(
     # We hash the same payload we're about to send (including live `active`
     # flags), so any user-visible change flips the tag. default=str guards
     # stray datetime/Path values in session dicts.
-    body = {"sessions": sessions, "total": total, "returned": len(sessions)}
+    body = {
+        "sessions": sessions,
+        "total": total,
+        "returned": len(sessions),
+        "session_redirects": session_redirects,
+    }
     # ETag digest cache: hashing ~150KB of JSON on every poll adds up. The
     # body is fully determined by (list-cache generation, request params,
     # active turn set), so key on those and skip the dumps+md5 when nothing
@@ -5203,6 +5222,7 @@ def list_sessions_api(
         frozenset(turn_active_sids),
         frozenset(background_active_sids),
         tuple(sorted(scheduled_counts.items())),
+        tuple(sorted(session_redirects.items())),
     )
     _hit = _LIST_ETAG_CACHE.get("v")
     if _hit is not None and _hit[0] == _etag_key:

@@ -883,6 +883,10 @@ function portal() {
     // active tab. Tabs can be opened from the session picker, closed via × on
     // the tab, or created by the "+ new" button.
     openTabIds: [],
+    // Durable runtime rollovers replace one SDK session id with another. The
+    // server returns redirects for stale ids restored from localStorage so a
+    // reload repairs the strip instead of silently dropping the hidden source.
+    _sessionRedirects: {},
     _lastNewSessionAt: 0,
     _lastNewSessionMeta: null,
     NEW_SESSION_TOUCH_DEDUPE_MS: 500,
@@ -6740,6 +6744,202 @@ function portal() {
     },
 
     // ===== prefs =====
+    _resolveSessionRedirectId(id, redirects = this._sessionRedirects) {
+      const original = typeof id === "string" ? id : "";
+      if (!original || !redirects || typeof redirects !== "object") return original;
+      let current = original;
+      const seen = new Set([current]);
+      for (let step = 0; step < 32; step++) {
+        const next = typeof redirects[current] === "string"
+          ? redirects[current] : "";
+        if (!next || next === current) return current;
+        if (seen.has(next)) return original;
+        seen.add(next);
+        current = next;
+      }
+      return original;
+    },
+
+    _migrateRedirectedChatDraft(sourceSid, targetSid, targetState = null) {
+      const sourceState = this.tabState && this.tabState[sourceSid];
+      const sourceRecord = this._chatDraftRecord(sourceSid);
+      const targetRecord = this._chatDraftRecord(targetSid);
+      const sourceText = this._mergeChatDraftText(
+        sourceRecord.pending,
+        this._mergeChatDraftText(
+          sourceRecord.text,
+          sourceState && sourceState.draft ? sourceState.draft.input : "",
+        ),
+      );
+      const targetText = this._mergeChatDraftText(
+        targetRecord.pending, targetRecord.text,
+      );
+      const text = this._mergeChatDraftText(sourceText, targetText);
+      if (targetState && targetState.draft) {
+        targetState.draft.input = this._mergeChatDraftText(
+          text, targetState.draft.input || "",
+        );
+      }
+      const written = this._writeChatDraftRecord(targetSid, {
+        text: targetState && targetState.draft
+          ? targetState.draft.input : text,
+        pending: "",
+      });
+      if (written) this._deletePersistedChatDraft(sourceSid);
+    },
+
+    _migrateRedirectedTabRuntime(sourceSid, targetSid, targetMeta = null) {
+      const sourceState = this.tabState && this.tabState[sourceSid];
+      let targetState = this.tabState && this.tabState[targetSid];
+      if (!sourceState || sourceState === targetState) return targetState || null;
+
+      sourceState._backgroundSuccessorSid = targetSid;
+      if (!targetState) {
+        const pending = targetMeta && targetMeta.background_active
+          ? Math.max(1, Number(sourceState.backgroundTaskCount) || 0) : 0;
+        targetState = this._stateForDetachedSuccessor(
+          sourceSid, targetSid, sourceState, pending,
+        );
+        // The durable target is authoritative after a missed handoff. Keep the
+        // cloned rows visible for this frame, but force canonical hydration.
+        targetState._loaded = false;
+        if (!pending) {
+          targetState.inheritedBackgroundOwner = "";
+          targetState.inheritedBackgroundTaskCount = 0;
+        }
+        this.tabState[targetSid] = targetState;
+      } else if (sourceState.draft && targetState.draft) {
+        targetState.draft.input = this._mergeChatDraftText(
+          sourceState.draft.input || "", targetState.draft.input || "",
+        );
+        for (const key of ["pendingImages", "pendingDocs", "pendingQuotes"]) {
+          const existing = new Set(targetState.draft[key] || []);
+          targetState.draft[key] = [
+            ...(targetState.draft[key] || []),
+            ...(sourceState.draft[key] || []).filter(item => !existing.has(item)),
+          ];
+        }
+      }
+      if (sourceState.draft && sourceState.draft._uploadControllers) {
+        if (!targetState.draft._uploadControllers) {
+          targetState.draft._uploadControllers = new Set();
+        }
+        for (const controller of sourceState.draft._uploadControllers) {
+          targetState.draft._uploadControllers.add(controller);
+        }
+        // Ownership moved; disposing the stale transport must not abort a file
+        // upload whose callbacks still mutate the transferred entry objects.
+        sourceState.draft._uploadControllers = new Set();
+      }
+      if (this.imageEditor.ownerSid === sourceSid) {
+        this.imageEditor.ownerSid = targetSid;
+        this.imageEditor.ownerState = targetState;
+      }
+      if (this.imageGen.ownerSid === sourceSid) this.imageGen.ownerSid = targetSid;
+      this._disposeTabRuntime(sourceSid);
+      return targetState;
+    },
+
+    _applySessionRedirects(raw, incomingSessions = []) {
+      if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+      const combined = { ...(this._sessionRedirects || {}) };
+      for (const [source, target] of Object.entries(raw)) {
+        if (typeof source !== "string" || !source
+            || typeof target !== "string" || !target || source === target) continue;
+        combined[source] = target;
+      }
+      const flattened = {};
+      for (const source of Object.keys(combined)) {
+        const target = this._resolveSessionRedirectId(source, combined);
+        if (target && target !== source) flattened[source] = target;
+      }
+      this._sessionRedirects = flattened;
+      const directSources = Object.keys(raw).filter(source => {
+        const target = this._resolveSessionRedirectId(source, flattened);
+        return target && target !== source;
+      });
+      if (!directSources.length) return null;
+
+      const previousCurrent = this.currentId;
+      const previousOpen = this._normalizeOpenTabIds(this.openTabIds);
+      const rewrite = id => this._resolveSessionRedirectId(id, flattened);
+      for (const sourceSid of directSources) {
+        const targetSid = rewrite(sourceSid);
+        const targetMeta = (incomingSessions || []).find(
+          row => row && row.id === targetSid,
+        ) || (this.sessions || []).find(row => row && row.id === targetSid);
+        const targetState = this._migrateRedirectedTabRuntime(
+          sourceSid, targetSid, targetMeta || null,
+        );
+        this._migrateRedirectedChatDraft(sourceSid, targetSid, targetState);
+      }
+
+      this.openTabIds = this._normalizeOpenTabIds(previousOpen.map(rewrite));
+      this.currentId = rewrite(this.currentId);
+      const lastSessions = {};
+      for (const [workspace, sid] of Object.entries(
+        this.workspaceLastSession || {},
+      )) lastSessions[workspace] = rewrite(sid);
+      this.workspaceLastSession = lastSessions;
+      this.renamingTabId = rewrite(this.renamingTabId);
+      this.renamingPickerSid = rewrite(this.renamingPickerSid);
+      this.forkingSessionId = rewrite(this.forkingSessionId);
+      this.retryingSessionId = rewrite(this.retryingSessionId);
+      if (this.tabCtxMenu && this.tabCtxMenu.id) {
+        this.tabCtxMenu = { ...this.tabCtxMenu, id: rewrite(this.tabCtxMenu.id) };
+      }
+
+      // A rename response can reveal a redirect before the next list pull. Keep
+      // one local target row so the repaired tab never renders as an ellipsis.
+      const canonicalRows = (this.sessions || []).filter(
+        row => row && rewrite(row.id) === row.id,
+      );
+      const canonicalIds = new Set(canonicalRows.map(row => row.id));
+      for (const row of this.sessions || []) {
+        if (!row || !row.id) continue;
+        const targetSid = rewrite(row.id);
+        if (targetSid === row.id || canonicalIds.has(targetSid)) continue;
+        canonicalRows.push({ ...row, id: targetSid });
+        canonicalIds.add(targetSid);
+      }
+      this.sessions = canonicalRows;
+      if (this._optimisticMetas) {
+        const optimistic = {};
+        for (const [sid, meta] of Object.entries(this._optimisticMetas)) {
+          const targetSid = rewrite(sid);
+          optimistic[targetSid] = targetSid === sid
+            ? meta : { ...meta, id: targetSid };
+        }
+        this._optimisticMetas = optimistic;
+      }
+      let activityChanged = false;
+      const events = (this.activity && this.activity.events) || [];
+      for (const item of events) {
+        if (!item || typeof item !== "object") continue;
+        for (const field of ["session_id", "thread_id"]) {
+          const targetSid = rewrite(item[field]);
+          if (targetSid && targetSid !== item[field]) {
+            item[field] = targetSid;
+            activityChanged = true;
+          }
+        }
+      }
+      if (activityChanged) this.activity.events = [...events];
+
+      const tabsChanged = previousOpen.join("\u0000") !== this.openTabIds.join("\u0000");
+      const currentChanged = previousCurrent !== this.currentId;
+      if (tabsChanged) this._writeChatTabStore(this.openTabIds);
+      if (currentChanged || Object.keys(lastSessions).length) this.savePrefs();
+      const activeState = this.currentId && this.tabState[this.currentId];
+      if (currentChanged && activeState) this._activateTabState(this.currentId);
+      if (activeState && !activeState._loaded && this._sessionsInitialized) {
+        this._requestSessionSync(
+          this.currentId, "history_load", { loadOptions: {} },
+        );
+      }
+      return { tabsChanged, currentChanged, currentId: this.currentId };
+    },
+
     _normalizeOpenTabIds(ids, validIds = null) {
       const allowed = validIds instanceof Set
         ? validIds
@@ -11760,6 +11960,10 @@ function portal() {
       if (et) this._sessionsEtag = et;
       let data = null;
       try { data = await r.json(); } catch { data = null; }
+      this._applySessionRedirects(
+        (data && data.session_redirects) || {},
+        (data && data.sessions) || [],
+      );
       this._applySessionList((data && data.sessions) || []);
       return true;
     },

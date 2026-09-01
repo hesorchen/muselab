@@ -1458,6 +1458,46 @@ def runtime_lineage(sid: str) -> list[str]:
     return runtime_lineages((canonical_sid,)).get(canonical_sid, [])
 
 
+def runtime_successor_redirects(sids: Iterable[str]) -> dict[str, str]:
+    """Resolve hidden runtime ids to their final public successor.
+
+    A browser can persist the predecessor id immediately before a detached
+    runtime handoff commits, then miss the response because it reloads or the
+    service restarts.  Public session lists intentionally hide that predecessor,
+    so callers need this small durable redirect projection to repair the tab id
+    instead of dropping it.  Only complete chains ending at a public row are
+    returned; broken/cyclic/in-progress links remain untouched.
+    """
+    ordered_sids = tuple(dict.fromkeys(
+        sid for raw_sid in sids if (sid := str(raw_sid or ""))
+    ))
+    if not ordered_sids:
+        return {}
+    with _INDEX_LOCK:
+        by_id = _runtime_rows_snapshot()
+
+    redirects: dict[str, str] = {}
+    for source_sid in ordered_sids:
+        source = by_id.get(source_sid)
+        if source is None or not source.get("runtime_shadow"):
+            continue
+        current_sid = source_sid
+        seen = {source_sid}
+        for _step in range(_RUNTIME_LINEAGE_MAX - 1):
+            successor_sid = str(
+                by_id.get(current_sid, {}).get("runtime_successor") or ""
+            )
+            if (not successor_sid or successor_sid in seen
+                    or successor_sid not in by_id):
+                break
+            seen.add(successor_sid)
+            current_sid = successor_sid
+            if not by_id[current_sid].get("runtime_shadow"):
+                redirects[source_sid] = current_sid
+                break
+    return redirects
+
+
 def update_model(sid: str, model: str) -> None:
     with _INDEX_LOCK:
         idx = _load_index()

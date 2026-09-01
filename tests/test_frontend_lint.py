@@ -908,6 +908,27 @@ def test_chat_tab_ids_are_normalized_at_restore_render_and_persist_boundaries():
         'if (ev.key === "t"')
 
 
+def test_hidden_runtime_successors_repair_tabs_drafts_and_task_links():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+
+    redirect_start = app.index("_applySessionRedirects(raw, incomingSessions = [])")
+    redirect_end = app.index("\n    _normalizeOpenTabIds", redirect_start)
+    redirect = app[redirect_start:redirect_end]
+    assert "this.openTabIds = this._normalizeOpenTabIds(previousOpen.map(rewrite))" in redirect
+    assert "this.currentId = rewrite(this.currentId)" in redirect
+    assert "this._writeChatTabStore(this.openTabIds)" in redirect
+    assert "this._migrateRedirectedChatDraft" in redirect
+    assert '["session_id", "thread_id"]' in redirect
+    assert "item[field] = targetSid" in redirect
+
+    pull_start = app.index("async _pullSessionListOnce(")
+    pull_end = app.index("\n    async refreshSessions()", pull_start)
+    pull = app[pull_start:pull_end]
+    assert "(data && data.session_redirects) || {}" in pull
+    assert pull.index("this._applySessionRedirects(") < pull.index(
+        "this._applySessionList(")
+
+
 def test_workspace_picker_supports_mouse_and_touch_reordering():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
     html = (FRONTEND / "index.html").read_text(encoding="utf-8")
