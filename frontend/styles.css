@@ -4856,6 +4856,7 @@ html[data-theme="light"] .msg.user .bubble { color: white; }
    card. A boundary spans the full width rather than following the avatar
    gutter. */
 .turn-footer {
+  position: relative;
   padding: 0;
   margin: 6px 0 2px;
   display: flex;
@@ -4934,6 +4935,47 @@ html[data-theme="light"] .msg.user .bubble { color: white; }
   overflow: hidden;
   color: var(--c-fg-3);
   font-size: var(--fs-xs);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.turn-model-usage {
+  position: relative;
+  flex: 0 0 auto;
+  color: var(--c-fg-3);
+  font-size: var(--fs-xs);
+}
+.turn-model-usage > summary {
+  cursor: pointer;
+  list-style: none;
+  white-space: nowrap;
+}
+.turn-model-usage > summary::-webkit-details-marker { display: none; }
+.turn-model-usage-popover {
+  position: absolute;
+  z-index: 35;
+  right: 0;
+  bottom: calc(100% + 7px);
+  width: min(360px, 78vw);
+  padding: 10px 12px;
+  border: 1px solid var(--c-border);
+  border-radius: var(--r-md);
+  background: var(--c-bg-1);
+  box-shadow: var(--shadow-lg);
+  color: var(--c-fg-2);
+}
+.turn-model-usage-row {
+  display: grid;
+  gap: 3px;
+  line-height: 1.35;
+}
+.turn-model-usage-row + .turn-model-usage-row {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--c-border);
+}
+.turn-model-usage-row strong {
+  overflow: hidden;
+  color: var(--c-fg-1);
   text-overflow: ellipsis;
   white-space: nowrap;
 }

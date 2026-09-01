@@ -2957,6 +2957,19 @@
                 <span x-show="turnFooterModel(m, pane, tid)" class="turn-model"
                       :title="turnFooterModel(m, pane, tid)"
                       x-text="'· ' + modelLabel(turnFooterModel(m, pane, tid))"></span>
+                <details class="turn-model-usage"
+                         x-show="modelUsageEntries(m.model_usage).length">
+                  <summary x-text="'· ' + modelUsageSummary(m.model_usage)"></summary>
+                  <div class="turn-model-usage-popover">
+                    <template x-for="row in modelUsageEntries(m.model_usage)"
+                              :key="row.model">
+                      <div class="turn-model-usage-row">
+                        <strong x-text="modelUsageTitle(row)"></strong>
+                        <span x-text="modelUsageDetail(row)"></span>
+                      </div>
+                    </template>
+                  </div>
+                </details>
                 <button type="button" class="memory-recall-trace"
                         x-show="m.memoryRecall && m.memoryRecall.count"
                         :aria-expanded="memoryRecallPopover.show && _memoryRecallOwner === m"

@@ -6127,6 +6127,11 @@ def test_sdk_lifecycle_footer_and_native_clear_contracts_are_wired():
     assert 'turnStatus: d.status ||' in app
     assert 'terminalReason: d.terminal_reason' in app
     assert 'turnOrigin: d.origin' in app
+    assert 'modelUsage: d.model_usage' in app
+    assert 'modelUsageEntries(m.model_usage)' in html
+    assert 'class="turn-model-usage-popover"' in html
+    assert 'x-text="modelUsageTitle(row)"' in html
+    assert 'x-text="modelUsageDetail(row)"' in html
     assert '/native-clear`' in app
     clear_start = app.index('        case "clear": {')
     clear_end = app.index('        case "resume": {', clear_start)

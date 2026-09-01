@@ -4388,6 +4388,55 @@ function portal() {
       };
       return labels[value] || value;
     },
+    modelUsageEntries(usage) {
+      if (!usage || typeof usage !== "object" || Array.isArray(usage)) return [];
+      return Object.entries(usage).map(([model, row]) => ({
+        model,
+        ...(row && typeof row === "object" ? row : {}),
+      }));
+    },
+    modelUsageSummary(usage) {
+      const rows = this.modelUsageEntries(usage);
+      if (!rows.length) return "";
+      const tokens = rows.reduce((sum, row) => sum
+        + (Number(row.inputTokens) || 0)
+        + (Number(row.outputTokens) || 0), 0);
+      const cost = rows.reduce(
+        (sum, row) => sum + (Number(row.costUSD) || 0), 0);
+      const modelCount = rows.length > 1
+        ? (this.lang === "zh" ? `${rows.length} 个模型 · ` : `${rows.length} models · `)
+        : "";
+      return `${modelCount}${this.fmtTokens(tokens)} tok · ${this.fmtCost(cost)}`;
+    },
+    modelUsageTitle(row) {
+      if (!row) return "";
+      const model = String(row.canonicalModel || row.model || "");
+      const provider = String(row.provider || "");
+      return provider ? `${model} · ${provider}` : model;
+    },
+    modelUsageDetail(row) {
+      if (!row) return "";
+      const input = Number(row.inputTokens) || 0;
+      const output = Number(row.outputTokens) || 0;
+      const cacheRead = Number(row.cacheReadInputTokens) || 0;
+      const cacheCreate = Number(row.cacheCreationInputTokens) || 0;
+      const context = Number(row.contextWindow) || 0;
+      const maxOutput = Number(row.maxOutputTokens) || 0;
+      const searches = Number(row.webSearchRequests) || 0;
+      const parts = this.lang === "zh"
+        ? [`输入 ${this.fmtTokens(input)}`, `输出 ${this.fmtTokens(output)}`]
+        : [`in ${this.fmtTokens(input)}`, `out ${this.fmtTokens(output)}`];
+      if (cacheRead || cacheCreate) {
+        parts.push(this.lang === "zh"
+          ? `缓存读/写 ${this.fmtTokens(cacheRead)}/${this.fmtTokens(cacheCreate)}`
+          : `cache read/write ${this.fmtTokens(cacheRead)}/${this.fmtTokens(cacheCreate)}`);
+      }
+      if (context) parts.push(`ctx ${this.fmtTokens(context)}`);
+      if (maxOutput) parts.push(`max out ${this.fmtTokens(maxOutput)}`);
+      if (searches) parts.push(this.lang === "zh" ? `搜索 ${searches}` : `search ${searches}`);
+      parts.push(this.fmtCost(Number(row.costUSD) || 0));
+      return parts.join(" · ");
+    },
     streamPhaseLabel(phase) {
       const value = String(phase || "");
       if (value === "tools") return this.t("chat.startup_tools");
