@@ -2989,7 +2989,9 @@ def test_mobile_completed_turn_can_fork_from_that_point(
         {"sid": sid, "forkSid": fork_sid, "boundary": boundary},
     )
 
-    action = page.locator(".msg-pane:visible .turn-fork-btn:visible")
+    action = page.locator(
+        ".msg-pane:visible .turn-fork-btn:not(.turn-retry-btn):visible"
+    )
     expect(action).to_be_visible(timeout=3000)
     box = action.bounding_box()
     assert box is not None and box["width"] >= 30 and box["height"] >= 30
@@ -7076,7 +7078,9 @@ def test_tool_result_tail_done_metadata_renders_footer_before_canonical_reload(
     )
     recall_trigger = footer.locator(".memory-recall-trace")
     expect(recall_trigger).to_be_visible()
-    expect(footer.locator(".turn-fork-btn")).to_be_visible()
+    expect(
+        footer.locator(".turn-fork-btn:not(.turn-retry-btn)")
+    ).to_be_visible()
 
     recall_trigger.click()
     recall = page.locator(".memory-recall-global")
@@ -8789,7 +8793,9 @@ def test_mobile_turn_footer_keeps_complete_metadata_inside_chat(
     expect(footer.locator(".msg-ts")).to_be_visible()
     expect(footer.locator(".msg-elapsed")).to_be_visible()
     expect(footer.locator(".turn-model")).to_be_visible()
-    expect(footer.locator(".turn-fork-btn")).to_be_visible()
+    expect(
+        footer.locator(".turn-fork-btn:not(.turn-retry-btn)")
+    ).to_be_visible()
 
     geometry = footer.evaluate(
         """node => {
