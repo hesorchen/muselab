@@ -95,6 +95,8 @@ def usermsg_task_notification_text(
         for block in content:
             if isinstance(block, text_block_type):
                 parts.append(getattr(block, "text", "") or "")
+            elif isinstance(block, dict) and block.get("type") == "text":
+                parts.append(str(block.get("text") or ""))
             elif isinstance(block, str):
                 parts.append(block)
         text = "".join(parts)

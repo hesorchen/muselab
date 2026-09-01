@@ -532,6 +532,61 @@ def test_queued_command_survives_terminal_leaf_reload_and_later_output(
     ]
 
 
+def test_task_notification_attachment_is_hidden_and_final_reply_survives(
+    client, auth, app_module, tmp_path,
+):
+    """CLI task attachments are protocol records, never human bubbles."""
+    from backend import chat as chat_mod
+
+    notification = (
+        "<task-notification><task-id>bg1</task-id>"
+        "<tool-use-id>toolu_bg</tool-use-id><status>completed</status>"
+        "<summary>monitor-ok</summary></task-notification>"
+    )
+    entries = [
+        _entry("u1", "user", "run in background"),
+        _entry("a1", "assistant", [{
+            "type": "tool_use", "id": "toolu_bg", "name": "Bash",
+            "input": {"command": "printf monitor-ok", "run_in_background": True},
+        }], "u1"),
+        _entry("tr1", "user", [{
+            "type": "tool_result", "tool_use_id": "toolu_bg",
+            "content": "Command running in background with ID: bg1.",
+        }], "a1"),
+        {
+            "uuid": "notification-attachment",
+            "parentUuid": "tr1",
+            "type": "attachment",
+            "sessionId": "00000000-0000-4000-8000-000000000001",
+            "attachment": {
+                "type": "queued_command",
+                "prompt": notification,
+                "commandMode": "task-notification",
+            },
+        },
+        _entry(
+            "a2", "assistant", "Muse final response", "notification-attachment"),
+    ]
+    sid, _ = _make_endpoint_session(
+        client, auth, chat_mod, tmp_path, entries)
+
+    response = client.get(
+        f"/api/chat/sessions/{sid}", headers=auth, params={"tail": 50})
+    assert response.status_code == 200, response.text
+    messages = response.json()["messages"]
+
+    assert not any(
+        "task-notification" in (message.get("text") or "")
+        for message in messages
+    )
+    assert messages[-1]["role"] == "assistant"
+    assert messages[-1]["text"] == "Muse final response"
+    tool_card = next(
+        message for message in messages if message.get("id") == "toolu_bg")
+    assert tool_card["task_status"]["state"] == "completed"
+    assert tool_card["task_status"]["summary"] == "monitor-ok"
+
+
 def test_window_endpoint_interleaves_cancelled_snapshot_at_original_anchor(
     client, auth, app_module, tmp_path,
 ):

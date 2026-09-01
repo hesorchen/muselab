@@ -3925,6 +3925,11 @@ def test_usermsg_task_notification_text_extracts_and_guards():
     # list-of-blocks content
     assert chat_mod._usermsg_task_notification_text(
         UserMessage(content=[TextBlock(text=xml)])) == xml
+    # Some SDK/CLI version combinations expose canonical content blocks as
+    # dictionaries rather than typed TextBlock instances.
+    msg = UserMessage(content=xml)
+    msg.content = [{"type": "text", "text": xml}]
+    assert chat_mod._usermsg_task_notification_text(msg) == xml
     # plain user prose → ""
     assert chat_mod._usermsg_task_notification_text(
         UserMessage(content="just a normal message")) == ""
