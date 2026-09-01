@@ -28,6 +28,7 @@ in sessions/{sid}.json — double-write with CLI's JSONL caused compact_boundary
 to be invisible in the UI after native /compact ran.
 """
 import contextlib
+from collections.abc import Iterable
 import json
 import os
 import re
@@ -772,6 +773,9 @@ def register_session(sid: str, *, name: str = "", model: str = "",
                      runtime_predecessor: str = "",
                      runtime_fork_boundary_at: str | datetime = "",
                      runtime_shadow: bool = False,
+                     retry_source_session_id: str = "",
+                     retry_target_user_uuid: str = "",
+                     retry_resume_session_at: str = "",
                      cwd: str | Path | None = None) -> dict:
     """Add a session that already has a UUID (e.g. one minted by SDK
     fork_session) to the muselab index. Same shape as create_session
@@ -819,6 +823,15 @@ def register_session(sid: str, *, name: str = "", model: str = "",
         "runtime_fork_boundary_at": normalized_runtime_fork_boundary_at,
         "cwd": str(workspace),
     }
+    if retry_source_session_id:
+        # A last-turn retry is materialized lazily by the SDK on the first
+        # query against the child session.  Keep only the three UUIDs needed
+        # to reconstruct that native resume across a service restart; never
+        # persist the prompt itself in MuseLab metadata.  The fields are
+        # removed as soon as query() reaches its transport commit point.
+        meta["retry_source_session_id"] = str(retry_source_session_id)
+        meta["retry_target_user_uuid"] = str(retry_target_user_uuid)
+        meta["retry_resume_session_at"] = str(retry_resume_session_at or "")
     if forked_from:
         meta["forked_from"] = forked_from
         meta["forked_from_name"] = forked_from_name
@@ -1237,14 +1250,19 @@ def unlink_runtime_successor(source_sid: str, successor_sid: str) -> bool:
 _RUNTIME_LINEAGE_MAX = 32
 
 
-def _runtime_lineage_from_rows(sid: str, rows: list[dict]) -> list[str]:
-    """Return the linked runtime chain containing ``sid``, oldest first."""
-    sid = str(sid or "")
-    by_id = {
+def _runtime_rows_by_id(rows: list[dict]) -> dict[str, dict]:
+    return {
         str(row.get("id")): row
         for row in rows
         if isinstance(row, dict) and row.get("id")
     }
+
+
+def _runtime_lineage_from_index(
+    sid: str, by_id: dict[str, dict],
+) -> list[str]:
+    """Return the linked runtime chain containing ``sid``, oldest first."""
+    sid = str(sid or "")
     if not sid or sid not in by_id:
         return []
 
@@ -1275,6 +1293,30 @@ def _runtime_lineage_from_rows(sid: str, rows: list[dict]) -> list[str]:
     return lineage
 
 
+def _runtime_lineage_from_rows(sid: str, rows: list[dict]) -> list[str]:
+    return _runtime_lineage_from_index(sid, _runtime_rows_by_id(rows))
+
+
+def runtime_lineages(sids: Iterable[str]) -> dict[str, list[str]]:
+    """Resolve multiple runtime lineages from one durable index snapshot.
+
+    Hot callers such as the multiplex SSE reconcile loop must not parse the
+    complete session index once per candidate. The snapshot stays protected by
+    the same lock as ordinary lineage reads and is never shared with mutators.
+    """
+    ordered_sids = tuple(dict.fromkeys(
+        sid for raw_sid in sids if (sid := str(raw_sid or ""))
+    ))
+    if not ordered_sids:
+        return {}
+    with _INDEX_LOCK:
+        by_id = _runtime_rows_by_id(_load_index())
+    return {
+        sid: _runtime_lineage_from_index(sid, by_id)
+        for sid in ordered_sids
+    }
+
+
 def runtime_lineage(sid: str) -> list[str]:
     """Return the durable rollover lineage containing ``sid``, oldest first.
 
@@ -1284,8 +1326,8 @@ def runtime_lineage(sid: str) -> list[str]:
     Broken links and cycles are bounded defensively rather than followed beyond
     the indexed chain.
     """
-    with _INDEX_LOCK:
-        return _runtime_lineage_from_rows(sid, _load_index())
+    canonical_sid = str(sid or "")
+    return runtime_lineages((canonical_sid,)).get(canonical_sid, [])
 
 
 def update_model(sid: str, model: str) -> None:
@@ -1509,6 +1551,39 @@ def _sidecar_has_runtime_task_overlays(sid: str) -> bool:
         return False
     except OSError:
         return True
+    return False
+
+
+def clear_retry_intent(
+    sid: str,
+    *,
+    source_session_id: str = "",
+    target_user_uuid: str = "",
+) -> bool:
+    """Consume one durable SDK retry intent with optional compare-and-set.
+
+    The compare fields prevent a late query completion from clearing a newer
+    intent if the same provisional child is ever repaired concurrently.  A
+    missing intent is already consumed and therefore succeeds idempotently.
+    """
+    with _INDEX_LOCK:
+        idx = _load_index()
+        for row in idx:
+            if row.get("id") != sid:
+                continue
+            current_source = str(row.get("retry_source_session_id") or "")
+            current_target = str(row.get("retry_target_user_uuid") or "")
+            if not current_source and not current_target:
+                return True
+            if source_session_id and current_source != source_session_id:
+                return False
+            if target_user_uuid and current_target != target_user_uuid:
+                return False
+            row.pop("retry_source_session_id", None)
+            row.pop("retry_target_user_uuid", None)
+            row.pop("retry_resume_session_at", None)
+            _save_index(idx)
+            return True
     return False
 
 
@@ -2036,7 +2111,9 @@ def _merge_message_annotation(
     for key, value in fields.items():
         if value is None:
             continue
-        if sticky_cancelled and key in {"turn_status", "ts", "elapsed_s"}:
+        if sticky_cancelled and key in {
+            "turn_status", "ts", "elapsed_s", "terminal_reason",
+        }:
             continue
         cur[key] = value
 

@@ -384,6 +384,21 @@
         </button>
         <input type="file" x-ref="upload" multiple style="display:none" @change="upload($event)" />
       </header>
+      <div class="file-upload-progress" x-show="fileUploadProgress.visible"
+           x-transition.opacity.duration.150ms x-cloak aria-live="polite">
+        <div class="file-upload-progress-meta">
+          <span x-text="fileUploadProgressLabel()"></span>
+          <strong x-show="fileUploadProgress.known"
+                  x-text="Math.round(fileUploadProgress.percent || 0) + '%'">0%</strong>
+        </div>
+        <div class="file-upload-progress-track"
+             :class="{ indeterminate: !fileUploadProgress.known }"
+             role="progressbar" aria-valuemin="0" aria-valuemax="100"
+             :aria-valuenow="fileUploadProgress.known ? Math.round(fileUploadProgress.percent || 0) : null"
+             :aria-valuetext="fileUploadProgressLabel()">
+          <span :style="{ width: (fileUploadProgress.known ? fileUploadProgress.percent : 34) + '%' }"></span>
+        </div>
+      </div>
       <div class="searchbar">
         <div class="searchbar-wrap">
           <span class="searchbar-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg></span>
@@ -1442,7 +1457,11 @@
              prompt has produced output since the user last opened
              the drawer. Heartbeat keeps the count fresh. -->
         <button @click="openScheduler()" class="icon-btn bell-btn"
-                :title="lang==='zh' ? '定时任务' : 'Scheduled tasks'"
+                :title="currentSessionScheduledCount()
+                  ? (lang==='zh'
+                      ? `定时任务（当前会话 ${currentSessionScheduledCount()} 个 SDK 原生任务）`
+                      : `Scheduled tasks (${currentSessionScheduledCount()} native in this session)`)
+                  : (lang==='zh' ? '定时任务' : 'Scheduled tasks')"
                 aria-label="Scheduled tasks">
           <svg viewBox="0 0 24 24" width="16" height="16" fill="none"
                stroke="currentColor" stroke-width="2"
@@ -1452,6 +1471,10 @@
           </svg>
           <span class="bell-badge" x-show="scheduler.unreadCount > 0"
                 x-text="scheduler.unreadCount > 99 ? '99+' : scheduler.unreadCount"></span>
+          <span class="bell-native-badge"
+                x-show="currentSessionScheduledCount() > 0"
+                x-text="currentSessionScheduledCount()"
+                aria-hidden="true"></span>
         </button>
         <!-- Command palette entry — slim icon-btn alongside settings.
              Discoverability comes from the first-run toast (init()) +
@@ -1680,10 +1703,12 @@
                             :title="(lang==='zh' ? '打开会话：' : 'Open session: ') + s.name">
                       <!-- Streaming / unread dots — mirrors tab-strip behavior -->
                       <span class="chat-tab-stream-dot picker-status-dot"
-                            :class="{ 'is-background': isTabBackgroundActive(s.id) }"
+                            :class="{ 'is-background': isTabBackgroundActive(s.id) || isTabScheduledActive(s.id) }"
                             x-show="isTabRunning(s.id)"
-                            :title="isTabBackgroundActive(s.id)
-                              ? t('chat.background_running')
+                            :title="isTabScheduledActive(s.id)
+                              ? (lang==='zh' ? '定时任务待命或执行中' : 'Scheduled task ready or running')
+                              : isTabBackgroundActive(s.id)
+                                ? t('chat.background_running')
                               : (lang==='zh' ? '正在生成…' : 'Streaming…')"></span>
                       <span class="chat-tab-unread-dot picker-status-dot"
                             x-show="isTabUnread(s.id)"
@@ -1775,10 +1800,16 @@
                  @auxclick="onTabAuxClick($event, tid)"
                  :title="tabTitle(tid)">
               <span class="chat-tab-stream-dot"
-                    :class="{ 'is-background': isTabBackgroundActive(tid) }"
+                    :class="{
+                      'is-background': isTabBackgroundActive(tid) || isTabScheduledActive(tid),
+                      'is-native-schedule-clickable': isTabScheduledActive(tid),
+                    }"
                     x-show="isTabRunning(tid)"
-                    :title="isTabBackgroundActive(tid)
-                      ? t('chat.background_running')
+                    @click.stop="isTabScheduledActive(tid) && openNativeScheduledTasks(tid, $event)"
+                    :title="isTabScheduledActive(tid)
+                      ? (lang==='zh' ? '点击查看该会话的 SDK 定时任务' : 'View this session\'s SDK scheduled tasks')
+                      : isTabBackgroundActive(tid)
+                        ? t('chat.background_running')
                       : (lang==='zh' ? '该会话正在生成…' : 'Streaming…')"></span>
               <!-- Green dot when the tab finished a turn while you were
                    elsewhere. Sibling to the streaming dot but mutually
@@ -2020,10 +2051,15 @@
               <template x-if="m.role === 'user' && !m._is_compact_summary">
                 <div>
                   <div class="msg-row">
-                    <span class="msg-avatar user-avatar" x-text="userAvatarText()"></span>
+                    <span class="msg-avatar user-avatar"
+                          :class="{ 'scheduled-trigger-avatar': m._scheduledTrigger }"
+                          x-text="m._scheduledTrigger ? '⏱' : userAvatarText()"></span>
                     <div class="bubble user-bubble"
-                         :class="{ 'is-queueing': m._optimisticQueue }"
+                         :class="{ 'is-queueing': m._optimisticQueue, 'is-scheduled-trigger': m._scheduledTrigger }"
                          @click="onUserBubbleClick(m)">
+                      <div class="scheduled-trigger-label"
+                           x-show="m._scheduledTrigger"
+                           x-text="lang==='zh' ? '定时任务' : 'Scheduled task'"></div>
                       <template x-if="userSelectionQuotes(m).length">
                         <div class="user-msg-quotes">
                           <template x-for="(quote, qidx) in userSelectionQuotes(m)"
@@ -2125,7 +2161,7 @@
                             :title="lang==='zh' ? '明确保存为记忆' : 'Save as confirmed memory'">
                       <svg><use :href="m._memorySaved ? '#i-check' : '#i-brain'"/></svg>
                     </button>
-                    <button x-show="pane && !pane.streaming && !m._editing"
+                    <button x-show="pane && !pane.streaming && !m._editing && !m._scheduledTrigger"
                             @click="startEditMessage(m)" class="icon-btn sm"
                             :title="t('btn.edit')">
                       <svg><use href="#i-edit"/></svg>
@@ -2298,17 +2334,23 @@
                     <template x-if="m.task_status">
                       <div class="subagent-task"
                            :class="'is-' + (m.task_status.state || 'running')">
-                        <span class="subagent-task-badge"
-                              x-text="taskStatusLabel(m.task_status.state)"></span>
-                        <span class="subagent-task-summary"
-                              x-show="m.task_status.summary"
-                              x-text="m.task_status.summary"></span>
-                        <span class="task-summary-truncated"
-                              x-show="m.task_status.summary_truncated"
-                              x-text="t('subagent.summary_truncated')"></span>
+                        <button type="button" class="task-detail-trigger"
+                                :aria-label="(lang==='zh' ? '查看后台任务详情：' : 'View background task details: ') + taskStatusLabel(m.task_status.state)"
+                                :title="lang==='zh' ? '点击查看后台任务详情' : 'Click to view background task details'"
+                                @click="openTaskDetail(m.task_status, m, $event)">
+                          <span class="subagent-task-badge"
+                                x-text="taskStatusLabel(m.task_status.state)"></span>
+                          <span class="subagent-task-summary"
+                                x-show="m.task_status.summary"
+                                x-text="m.task_status.summary"></span>
+                          <span class="task-summary-truncated"
+                                x-show="m.task_status.summary_truncated"
+                                x-text="t('subagent.summary_truncated')"></span>
+                          <span class="task-detail-chevron" aria-hidden="true">›</span>
+                        </button>
                         <a class="subagent-task-open" href="#"
                            x-show="m.task_status.output_file"
-                           @click.prevent="openTaskOutput(m.task_status)"
+                           @click.stop.prevent="openTaskOutput(m.task_status)"
                            x-text="t('subagent.open_result')"></a>
                         <!-- Stop button — only while running. Backed by the
                              SDK-native stop_task control request; the card
@@ -2316,10 +2358,38 @@
                              notification round-trips the settle path. -->
                         <a class="subagent-task-stop" href="#"
                            x-show="(m.task_status.state || 'running') === 'running' && m.task_status.task_id"
-                           @click.prevent="stopBackgroundTask(m.task_status)"
+                           @click.stop.prevent="stopBackgroundTask(m.task_status)"
                            x-text="'⏹ ' + t('subagent.stop_task')"></a>
                       </div>
                     </template>
+                    <details class="subagent-timeline"
+                             x-show="subagentTimelineFor(pane, m.id).length">
+                      <summary>
+                        <span x-text="lang==='zh' ? '执行过程' : 'Execution timeline'"></span>
+                        <span class="subagent-timeline-count"
+                              x-text="subagentTimelineFor(pane, m.id).length"></span>
+                      </summary>
+                      <div class="subagent-timeline-body">
+                        <template x-for="block in subagentTimelineFor(pane, m.id)"
+                                  :key="block.block_id">
+                          <div class="subagent-timeline-row"
+                               :class="['is-' + (block.role || 'unknown'), { 'is-error': block.is_error }]"
+                               :style="'--subagent-depth:' + Math.min(12, Number(block._depth) || 0)">
+                            <div class="subagent-timeline-head">
+                              <span class="subagent-timeline-dot"></span>
+                              <span class="subagent-timeline-label"
+                                    x-text="subagentBlockLabel(block)"></span>
+                              <span class="subagent-timeline-summary"
+                                    x-show="block.role === 'tool_use' && block.summary"
+                                    x-text="block.summary || ''"></span>
+                            </div>
+                            <pre class="subagent-timeline-text"
+                                 x-show="subagentBlockBody(block)"
+                                 x-text="subagentBlockBody(block)"></pre>
+                          </div>
+                        </template>
+                      </div>
+                    </details>
                   </div>
                 </div>
               </template>
@@ -2410,24 +2480,30 @@
                     <template x-if="m.task_status">
                       <span class="tool-task"
                             :class="'is-' + (m.task_status.state || 'running')">
-                        <span class="tool-task-badge"
-                              x-text="taskStatusLabel(m.task_status.state)"></span>
-                        <span class="tool-task-summary"
-                              x-show="m.task_status.summary"
-                              x-text="m.task_status.summary"></span>
-                        <span class="task-summary-truncated"
-                              x-show="m.task_status.summary_truncated"
-                              x-text="t('subagent.summary_truncated')"></span>
+                        <button type="button" class="task-detail-trigger"
+                                :aria-label="(lang==='zh' ? '查看后台任务详情：' : 'View background task details: ') + taskStatusLabel(m.task_status.state)"
+                                :title="lang==='zh' ? '点击查看后台任务详情' : 'Click to view background task details'"
+                                @click="openTaskDetail(m.task_status, m, $event)">
+                          <span class="tool-task-badge"
+                                x-text="taskStatusLabel(m.task_status.state)"></span>
+                          <span class="tool-task-summary"
+                                x-show="m.task_status.summary"
+                                x-text="m.task_status.summary"></span>
+                          <span class="task-summary-truncated"
+                                x-show="m.task_status.summary_truncated"
+                                x-text="t('subagent.summary_truncated')"></span>
+                          <span class="task-detail-chevron" aria-hidden="true">›</span>
+                        </button>
                         <a class="tool-task-open" href="#"
                            x-show="m.task_status.output_file"
-                           @click.prevent="openTaskOutput(m.task_status)"
+                           @click.stop.prevent="openTaskOutput(m.task_status)"
                            x-text="t('subagent.open_result')"></a>
                         <!-- Stop button — same contract as the subagent
                              card's: visible only while running, settles via
                              the CLI's status='stopped' notification. -->
                         <a class="tool-task-stop" href="#"
                            x-show="(m.task_status.state || 'running') === 'running' && m.task_status.task_id"
-                           @click.prevent="stopBackgroundTask(m.task_status)"
+                           @click.stop.prevent="stopBackgroundTask(m.task_status)"
                            x-text="'⏹ ' + t('subagent.stop_task')"></a>
                       </span>
                     </template>
@@ -2932,6 +3008,14 @@
                           n: _backgroundTaskCount(pane)
                         })"></span>
                 </span>
+                <span class="turn-origin"
+                      x-show="turnOriginLabel(m.turn_origin)"
+                      x-text="'· ' + turnOriginLabel(m.turn_origin)"></span>
+                <span class="turn-terminal-reason"
+                      x-show="turnTerminalReasonLabel(
+                        turnFooterStatus(m, pane), m.terminal_reason)"
+                      x-text="'· ' + turnTerminalReasonLabel(
+                        turnFooterStatus(m, pane), m.terminal_reason)"></span>
                 <!-- Old transcripts may predate completion annotations.  Their
                      last record still carries mts, which is a close and stable
                      fallback instead of rendering a separator with no time. -->
@@ -2949,6 +3033,37 @@
                 <span x-show="turnFooterModel(m, pane, tid)" class="turn-model"
                       :title="turnFooterModel(m, pane, tid)"
                       x-text="'· ' + modelLabel(turnFooterModel(m, pane, tid))"></span>
+                <details class="turn-model-usage"
+                         x-show="modelUsageEntries(m.model_usage).length">
+                  <summary x-text="'· ' + modelUsageSummary(m.model_usage)"></summary>
+                  <div class="turn-model-usage-popover">
+                    <template x-for="row in modelUsageEntries(m.model_usage)"
+                              :key="row.model">
+                      <div class="turn-model-usage-row">
+                        <strong x-text="modelUsageTitle(row)"></strong>
+                        <span x-text="modelUsageDetail(row)"></span>
+                      </div>
+                    </template>
+                  </div>
+                </details>
+                <details class="turn-hook-traces"
+                         x-show="hookTracesForTurn(pane, m).length">
+                  <summary x-text="hookTraceSummary(pane, m)"></summary>
+                  <div class="turn-hook-traces-popover">
+                    <template x-for="trace in hookTracesForTurn(pane, m)"
+                              :key="trace.trace_id">
+                      <div class="turn-hook-trace-row" :class="'is-' + trace.status">
+                        <span class="hook-trace-status"></span>
+                        <strong x-text="trace.hook_event"></strong>
+                        <span x-text="hookTraceStatusLabel(trace)"></span>
+                        <span class="mono" x-show="hookTraceDuration(trace)"
+                              x-text="hookTraceDuration(trace)"></span>
+                        <span class="mono" x-show="trace.exit_code !== null && trace.exit_code !== undefined"
+                              x-text="'exit ' + trace.exit_code"></span>
+                      </div>
+                    </template>
+                  </div>
+                </details>
                 <button type="button" class="memory-recall-trace"
                         x-show="m.memoryRecall && m.memoryRecall.count"
                         :aria-expanded="memoryRecallPopover.show && _memoryRecallOwner === m"
@@ -2964,6 +3079,20 @@
                         :title="lang==='zh' ? '从这里 Fork' : 'Fork from here'"
                         :aria-label="lang==='zh' ? '从这里 Fork' : 'Fork from here'">
                   <svg><use href="#i-fork"/></svg>
+                </button>
+                <button class="turn-fork-btn turn-retry-btn"
+                        type="button"
+                        x-show="retryTurnUserMessage(paneMsgs, i, pane)"
+                        :disabled="retryingSessionId === tid || isTabStreaming(tid)"
+                        @click.stop="retryLastTurn(
+                          tid, retryTurnUserMessage(paneMsgs, i, pane))"
+                        :title="lang==='zh'
+                          ? '在新分支重试最后一轮（原会话不变）'
+                          : 'Retry the last turn in a new branch (source unchanged)'"
+                        :aria-label="lang==='zh'
+                          ? '在新分支重试最后一轮'
+                          : 'Retry the last turn in a new branch'">
+                  <svg><use href="#i-refresh"/></svg>
                 </button>
               </div>
             </div>
@@ -3301,14 +3430,9 @@
           <div class="hint-row" x-show="!mentionResults.length" x-text="t('files.empty_search')"></div>
         </div>
         <!-- Attachment preview row (above input). -->
-        <!-- Pending attachment chips. Upload starts eagerly the moment the
-             file is picked / pasted / dropped — by the time the user finishes
-             typing it's almost always done. We deliberately DON'T render an
-             "uploading…" spinner: the spinner used to make the chip feel like
-             a separate uploading step before send, when in fact send-time
-             auto-wait (sendMessage) already handles the rare case where the
-             upload is still in flight. Only the .error state gets a visual —
-             a red border via .img-chip.error / .doc-chip.error in styles.css. -->
+        <!-- Pending attachment chips. Upload starts eagerly and reports real
+             transferred-byte progress. The compact percentage + bottom bar
+             keep slow mobile uploads visible without blocking the composer. -->
         <div class="img-attachments"
              x-show="pendingQuotes.length || pendingImages.length || pendingDocs.length">
           <template x-for="(quote, i) in pendingQuotes"
@@ -3346,13 +3470,12 @@
                       @click="removePendingImage(i)" :title="t('img.remove')">
                 <svg><use href="#i-x"/></svg>
               </button>
-              <!-- Slim animated progress bar at the chip's bottom edge.
-                   Replaces the previous big spinning overlay (user wanted
-                   the chip to feel "uploaded" instantly); a hairline gives
-                   the necessary feedback on slow / large uploads without
-                   reading as a separate processing step. Disappears the
-                   moment upload completes or errors out. -->
-              <div x-show="img.uploading" class="chip-upload-bar"></div>
+              <span x-show="img.uploading" class="chip-upload-percent"
+                    x-text="img.progressKnown ? Math.round(img.progress || 0) + '%' : '…'"></span>
+              <div x-show="img.uploading" class="chip-upload-bar"
+                   :class="{ indeterminate: !img.progressKnown }">
+                <span :style="{ width: (img.progressKnown ? (img.progress || 0) : 38) + '%' }"></span>
+              </div>
             </div>
           </template>
           <template x-for="(doc, i) in pendingDocs" :key="doc.id || ('d'+i)">
@@ -3361,13 +3484,21 @@
               <span class="doc-chip-icon"><svg><use href="#i-file-text"/></svg></span>
               <div class="doc-chip-body">
                 <div class="doc-chip-name" x-text="doc.name"></div>
-                <div class="doc-chip-kind" x-text="doc.kind"></div>
+                <div class="doc-chip-kind"
+                     x-text="doc.uploading
+                       ? (doc.progressKnown
+                         ? (lang === 'zh' ? '上传 ' : 'Upload ') + Math.round(doc.progress || 0) + '%'
+                         : (lang === 'zh' ? '上传中…' : 'Uploading…'))
+                       : doc.kind"></div>
               </div>
               <button class="doc-chip-x icon-btn sm"
                       @click="removePendingDoc(i)" :title="t('img.remove')">
                 <svg><use href="#i-x"/></svg>
               </button>
-              <div x-show="doc.uploading" class="chip-upload-bar"></div>
+              <div x-show="doc.uploading" class="chip-upload-bar"
+                   :class="{ indeterminate: !doc.progressKnown }">
+                <span :style="{ width: (doc.progressKnown ? (doc.progress || 0) : 38) + '%' }"></span>
+              </div>
             </div>
           </template>
         </div>
@@ -4246,6 +4377,14 @@
                       :aria-current="settings.activePage==='skills' ? 'page' : null">
             <span class="settings-menu-icon"><svg><use href="#i-puzzle"/></svg></span>
             <span class="settings-menu-title" x-text="t('set.sec.skills')"></span>
+            <span class="settings-menu-chevron">›</span>
+          </button></li>
+          <li><button type="button" class="settings-menu-item"
+                      @click="settings.activePage='hooks'; loadHookSettings()"
+                      :class="{ active: settings.activePage==='hooks' }"
+                      :aria-current="settings.activePage==='hooks' ? 'page' : null">
+            <span class="settings-menu-icon"><svg><use href="#i-tool"/></svg></span>
+            <span class="settings-menu-title">Hooks</span>
             <span class="settings-menu-chevron">›</span>
           </button></li>
           <li><button type="button" class="settings-menu-item"
@@ -5358,6 +5497,209 @@
           </div>
         </div>
 
+        <div class="settings-section hook-settings-section" data-page="hooks"
+             x-show="settings.activePage === 'hooks'">
+          <div class="settings-section-title">
+            <span>Hooks</span>
+            <span class="settings-save-mode live"
+                  x-text="lang==='zh' ? 'Claude 标准配置' : 'Claude standard settings'"></span>
+          </div>
+          <div class="settings-hint"
+               x-text="lang==='zh'
+                 ? '直接管理 Claude SDK 会读取的 user / project / local 三层 Hook。保存后，受影响会话会在下一轮自动重建 runtime。'
+                 : 'Manage the user, project and local Hooks loaded by the Claude SDK. Affected runtimes reload on their next turn.'"></div>
+          <div class="hook-workspace mono" x-show="settings.hooks.workspace"
+               x-text="settings.hooks.workspace"></div>
+
+          <div class="hook-scope-tabs">
+            <template x-for="scope in settings.hooks.scopes" :key="scope.scope">
+              <button type="button" class="seg-btn"
+                      :class="{ 'seg-active': settings.hooks.activeScope === scope.scope }"
+                      @click="settings.hooks.activeScope = scope.scope; cancelHookDraft()"
+                      x-text="scope.scope === 'user'
+                        ? (lang==='zh' ? '用户' : 'User')
+                        : scope.scope === 'project'
+                          ? (lang==='zh' ? '项目' : 'Project')
+                          : (lang==='zh' ? '本地' : 'Local')"></button>
+            </template>
+          </div>
+
+          <template x-if="hookActiveScope()">
+            <div>
+              <div class="hook-scope-meta">
+                <span class="mono" x-text="hookActiveScope().path"></span>
+                <span x-show="!hookActiveScope().exists"
+                      x-text="lang==='zh' ? '尚未创建' : 'Not created yet'"></span>
+                <label class="hook-disable-all">
+                  <span class="switch sm">
+                    <input type="checkbox"
+                           :checked="hookActiveScope().disableAllHooks"
+                           @change="toggleAllHooks($event.target.checked)">
+                    <span class="switch-slider"></span>
+                  </span>
+                  <span x-text="lang==='zh' ? '禁用这一层的全部 Hook' : 'Disable all Hooks in this scope'"></span>
+                </label>
+              </div>
+
+              <div class="hook-list" x-show="hookRows().length">
+                <template x-for="row in hookRows()"
+                          :key="row.event + ':' + row.groupIndex + ':' + row.handlerIndex">
+                  <div class="hook-row">
+                    <div class="hook-row-main">
+                      <div class="hook-row-title">
+                        <span class="hook-event mono" x-text="row.event"></span>
+                        <span class="hook-matcher mono" x-show="row.matcher"
+                              x-text="row.matcher"></span>
+                        <span class="hook-type" x-text="row.handler.type || '?' "></span>
+                      </div>
+                      <div class="hook-row-summary mono"
+                           x-text="hookHandlerSummary(row.handler)"></div>
+                    </div>
+                    <div class="hook-row-actions">
+                      <button class="icon-btn sm" @click="editHook(row)"
+                              :title="lang==='zh' ? '编辑' : 'Edit'">
+                        <svg><use href="#i-edit"/></svg>
+                      </button>
+                      <button class="icon-btn sm danger" @click="deleteHook(row)"
+                              :title="t('btn.delete')">
+                        <svg><use href="#i-trash"/></svg>
+                      </button>
+                    </div>
+                  </div>
+                </template>
+              </div>
+              <div class="settings-empty" x-show="!settings.hooks.loading && !hookRows().length"
+                   x-text="lang==='zh' ? '这一层还没有 Hook。' : 'No Hooks in this scope.'"></div>
+
+              <div class="settings-row hook-add-row" x-show="!settings.hooks.draft.show">
+                <button class="btn-ghost sm" @click="startAddHook()"
+                        x-text="lang==='zh' ? '添加 Hook' : 'Add Hook'"></button>
+              </div>
+              <div class="hook-editor" x-show="settings.hooks.draft.show">
+                <div class="settings-subtitle"
+                     x-text="settings.hooks.draft.mode === 'edit'
+                       ? (lang==='zh' ? '编辑 Hook' : 'Edit Hook')
+                       : (lang==='zh' ? '添加 Hook' : 'Add Hook')"></div>
+                <div class="settings-row">
+                  <label>Event</label>
+                  <select class="settings-input mono hook-event-select"
+                          x-model="settings.hooks.draft.event"
+                          :disabled="settings.hooks.draft.mode === 'edit'">
+                    <optgroup label="Session">
+                      <option value="SessionStart">SessionStart</option>
+                      <option value="Setup">Setup</option>
+                      <option value="SessionEnd">SessionEnd</option>
+                    </optgroup>
+                    <optgroup label="Prompt &amp; model">
+                      <option value="UserPromptSubmit">UserPromptSubmit</option>
+                      <option value="UserPromptExpansion">UserPromptExpansion</option>
+                      <option value="PreModelSwitch">PreModelSwitch</option>
+                      <option value="PostModelSwitch">PostModelSwitch</option>
+                    </optgroup>
+                    <optgroup label="Tools">
+                      <option value="PreToolUse">PreToolUse</option>
+                      <option value="PermissionRequest">PermissionRequest</option>
+                      <option value="PermissionDenied">PermissionDenied</option>
+                      <option value="PostToolUse">PostToolUse</option>
+                      <option value="PostToolUseFailure">PostToolUseFailure</option>
+                      <option value="PostToolBatch">PostToolBatch</option>
+                    </optgroup>
+                    <optgroup label="Agents &amp; tasks">
+                      <option value="SubagentStart">SubagentStart</option>
+                      <option value="SubagentStop">SubagentStop</option>
+                      <option value="TaskCreated">TaskCreated</option>
+                      <option value="TaskCompleted">TaskCompleted</option>
+                      <option value="TeammateIdle">TeammateIdle</option>
+                    </optgroup>
+                    <optgroup label="Lifecycle">
+                      <option value="Stop">Stop</option>
+                      <option value="StopFailure">StopFailure</option>
+                      <option value="Notification">Notification</option>
+                      <option value="MessageDisplay">MessageDisplay</option>
+                      <option value="PreCompact">PreCompact</option>
+                      <option value="PostCompact">PostCompact</option>
+                    </optgroup>
+                    <optgroup label="Configuration &amp; files">
+                      <option value="InstructionsLoaded">InstructionsLoaded</option>
+                      <option value="ConfigChange">ConfigChange</option>
+                      <option value="CwdChanged">CwdChanged</option>
+                      <option value="DirectoryAdded">DirectoryAdded</option>
+                      <option value="FileChanged">FileChanged</option>
+                      <option value="WorktreeCreate">WorktreeCreate</option>
+                      <option value="WorktreeRemove">WorktreeRemove</option>
+                    </optgroup>
+                    <optgroup label="MCP">
+                      <option value="Elicitation">Elicitation</option>
+                      <option value="ElicitationResult">ElicitationResult</option>
+                    </optgroup>
+                  </select>
+                </div>
+                <div class="settings-row">
+                  <label>Matcher</label>
+                  <input class="settings-input mono"
+                         x-model="settings.hooks.draft.matcher"
+                         :placeholder="lang==='zh' ? '可留空，例如 Bash|Edit' : 'Optional, e.g. Bash|Edit'">
+                </div>
+                <div class="settings-row">
+                  <label x-text="lang==='zh' ? '处理器类型' : 'Handler type'"></label>
+                  <select class="settings-input mono hook-handler-type-select"
+                          x-model="settings.hooks.draft.handlerType"
+                          @change="onHookHandlerTypeChange()">
+                    <option value="command">command · shell</option>
+                    <option value="http">http · POST</option>
+                    <option value="mcp_tool">mcp_tool · MCP</option>
+                    <option value="prompt">prompt · model</option>
+                    <option value="agent">agent · subagent</option>
+                    <option value="custom" x-text="lang==='zh' ? '自定义 JSON' : 'Custom JSON'"></option>
+                  </select>
+                </div>
+                <label class="hook-json-label">Handler JSON</label>
+                <textarea class="settings-input hook-json-editor mono"
+                          spellcheck="false"
+                          x-model="settings.hooks.draft.handlerJson"></textarea>
+                <div class="settings-hint"
+                     x-text="lang==='zh'
+                       ? '选择处理器类型会生成对应的 Claude 标准 JSON；支持 command / http / mcp_tool / prompt / agent，高级字段可继续编辑。HTTP headers 读取时自动遮蔽。'
+                       : 'Choosing a handler type creates standard Claude JSON for command, http, mcp_tool, prompt or agent. Advanced fields remain editable; HTTP headers are masked on read.'"></div>
+                <div class="hook-editor-actions">
+                  <button class="btn-primary sm" @click="saveHookDraft()"
+                          :disabled="settings.hooks.saving"
+                          x-text="settings.hooks.saving ? (lang==='zh' ? '保存中…' : 'Saving…') : t('btn.save')"></button>
+                  <button class="btn-ghost sm" @click="cancelHookDraft()"
+                          x-text="t('btn.cancel')"></button>
+                </div>
+              </div>
+            </div>
+          </template>
+
+          <details class="hook-recent-traces" x-show="currentSessionHookTraces().length">
+            <summary x-text="lang==='zh' ? '当前会话最近执行记录' : 'Recent execution traces in this session'"></summary>
+            <template x-for="trace in currentSessionHookTraces()" :key="trace.trace_id">
+              <div class="hook-builtin-row" :class="'is-' + trace.status">
+                <span class="mono" x-text="trace.hook_event"></span>
+                <span x-text="hookTraceStatusLabel(trace)"></span>
+                <span class="mono" x-text="hookTraceDuration(trace)"></span>
+                <span class="mono" x-show="trace.exit_code !== null && trace.exit_code !== undefined"
+                      x-text="'exit ' + trace.exit_code"></span>
+              </div>
+            </template>
+          </details>
+
+          <details class="hook-builtins" x-show="settings.hooks.builtin.length">
+            <summary x-text="lang==='zh' ? 'MuseLab 内置 Hook（只读）' : 'MuseLab built-in Hooks (read-only)'"></summary>
+            <template x-for="(hook, index) in settings.hooks.builtin"
+                      :key="hook.event + ':' + hook.matcher + ':' + index">
+              <div class="hook-builtin-row">
+                <span class="mono" x-text="hook.event"></span>
+                <span class="mono" x-show="hook.matcher" x-text="hook.matcher"></span>
+                <span x-text="hook.label"></span>
+                <span x-show="hook.conditional"
+                      x-text="lang==='zh' ? '按条件启用' : 'conditional'"></span>
+              </div>
+            </template>
+          </details>
+        </div>
+
         <div class="settings-section" data-page="mcp"
              x-show="settings.activePage === 'mcp'">
           <div class="settings-section-title">
@@ -6461,6 +6803,104 @@
     </div>
   </div>
 
+  <!-- SDK background-task detail. The compact chat card opens this read-only
+       inspector; output stays behind the existing token-gated, path-restricted
+       task-output endpoint. -->
+  <div class="modal-backdrop task-detail-backdrop"
+       x-show="taskDetail.show" x-cloak
+       x-transition.opacity.duration.120ms
+       @click.self="closeTaskDetail()">
+    <div class="modal task-detail-modal" role="dialog" aria-modal="true"
+         aria-labelledby="task-detail-title" tabindex="-1"
+         @keydown.tab="trapDialogFocus($event, 'task-detail')">
+      <div class="modal-head">
+        <span class="modal-title" id="task-detail-title">
+          <svg class="modal-title-icon"><use href="#i-tool"/></svg>
+          <span x-text="lang==='zh' ? '后台任务详情' : 'Background task details'"></span>
+        </span>
+        <span class="task-detail-state"
+              :class="'is-' + (taskDetail.status?.state || 'running')"
+              x-text="taskStatusLabel(taskDetail.status?.state)"></span>
+        <button type="button" class="modal-close task-detail-close"
+                @click="closeTaskDetail()"
+                :title="lang==='zh' ? '关闭' : 'Close'" aria-label="Close">×</button>
+      </div>
+      <div class="modal-body task-detail-body">
+        <div class="task-detail-description"
+             x-show="taskDetail.source?.description || taskDetail.status?.description"
+             x-text="taskDetail.source?.description || taskDetail.status?.description"></div>
+
+        <dl class="task-detail-meta">
+          <div x-show="taskDetail.status?.task_id">
+            <dt x-text="lang==='zh' ? '任务 ID' : 'Task ID'"></dt>
+            <dd class="mono" x-text="taskDetail.status?.task_id"></dd>
+          </div>
+          <div x-show="taskDetail.source?.tool_name">
+            <dt x-text="lang==='zh' ? '启动工具' : 'Tool'"></dt>
+            <dd class="mono" x-text="taskDetail.source?.tool_name"></dd>
+          </div>
+          <div x-show="taskDetail.source?.task_type">
+            <dt x-text="lang==='zh' ? 'Agent 类型' : 'Agent type'"></dt>
+            <dd class="mono" x-text="taskDetail.source?.task_type"></dd>
+          </div>
+          <div x-show="taskDetail.status?.last_tool_name">
+            <dt x-text="lang==='zh' ? '最近工具' : 'Latest tool'"></dt>
+            <dd class="mono" x-text="taskDetail.status?.last_tool_name"></dd>
+          </div>
+          <template x-for="row in taskDetailUsageRows(taskDetail.status?.usage)"
+                    :key="row.key">
+            <div>
+              <dt x-text="row.label"></dt>
+              <dd class="mono" x-text="row.value"></dd>
+            </div>
+          </template>
+        </dl>
+
+        <section class="task-detail-section" x-show="taskDetail.status?.summary">
+          <h3 x-text="lang==='zh' ? '完成摘要' : 'Completion summary'"></h3>
+          <div class="task-detail-summary" x-text="taskDetail.status?.summary"></div>
+          <div class="task-summary-truncated"
+               x-show="taskDetail.status?.summary_truncated"
+               x-text="t('subagent.summary_truncated')"></div>
+        </section>
+
+        <section class="task-detail-section task-detail-output-section">
+          <div class="task-detail-section-head">
+            <h3 x-text="lang==='zh' ? '任务输出' : 'Task output'"></h3>
+            <span class="task-detail-output-path mono"
+                  x-show="taskDetail.status?.output_file"
+                  :title="taskDetail.status?.output_file"
+                  x-text="taskDetail.status?.output_file?.split('/').pop()"></span>
+          </div>
+          <div class="task-detail-loading" x-show="taskDetail.loading">
+            <span class="spinner-sm" aria-hidden="true"></span>
+            <span x-text="lang==='zh' ? '正在读取输出…' : 'Loading output…'"></span>
+          </div>
+          <div class="task-detail-error" x-show="!taskDetail.loading && taskDetail.error">
+            <span x-text="lang==='zh' ? '输出暂不可用：' : 'Output unavailable: '"></span>
+            <span x-text="taskDetail.error"></span>
+          </div>
+          <pre class="task-detail-output"
+               x-show="!taskDetail.loading && !taskDetail.error && taskDetail.output"
+               x-text="taskDetail.output"></pre>
+          <div class="task-detail-empty"
+               x-show="!taskDetail.loading && !taskDetail.error && !taskDetail.output"
+               x-text="taskDetail.status?.state === 'running'
+                 ? (lang==='zh' ? '任务仍在运行，输出将在可用后自动显示。' : 'The task is still running. Output will appear when available.')
+                 : (lang==='zh' ? '这个任务没有可读取的输出文件。' : 'This task has no readable output file.')"></div>
+        </section>
+      </div>
+      <div class="modal-foot task-detail-foot">
+        <button type="button" class="btn-ghost" @click="closeTaskDetail()"
+                x-text="lang==='zh' ? '关闭' : 'Close'"></button>
+        <button type="button" class="btn-primary"
+                x-show="taskDetail.status?.output_file"
+                @click="openTaskDetailOutput()"
+                x-text="lang==='zh' ? '在文件预览中打开' : 'Open in file preview'"></button>
+      </div>
+    </div>
+  </div>
+
   <!-- Scheduled-tasks drawer — modal listing tasks + create form +
        recent run history. Opens on bell click; ack-zeros the unread
        count on open. -->
@@ -6476,6 +6916,62 @@
                 :title="lang==='zh' ? '关闭' : 'Close'" aria-label="Close">×</button>
       </div>
       <div class="modal-body sched-body">
+        <section class="sched-native-section">
+          <div class="sched-native-head">
+            <div>
+              <div class="sched-section-title">
+                <svg class="sched-section-icon"><use href="#i-clock"/></svg>
+                <span x-text="lang==='zh' ? 'SDK 原生任务' : 'SDK native tasks'"></span>
+                <span class="sched-native-count"
+                      x-text="scheduler.nativeTasks.length"></span>
+              </div>
+              <div class="sched-native-session ellipsis"
+                   x-text="scheduler.nativeSessionName
+                     || (lang==='zh' ? '当前会话' : 'Current session')"></div>
+            </div>
+            <span class="sched-native-runtime-badge"
+                  x-text="lang==='zh' ? '运行时' : 'runtime'"></span>
+          </div>
+          <div class="sched-native-note"
+               x-text="lang==='zh'
+                 ? '由 Claude SDK Cron 工具管理；任务随该会话的 Claude 运行环境存在。'
+                 : 'Managed by Claude SDK Cron tools and owned by this session runtime.'"></div>
+          <div class="sched-native-loading" x-show="scheduler.nativeLoading"
+               x-text="lang==='zh' ? '加载中…' : 'Loading…'"></div>
+          <div class="sched-native-error"
+               x-show="!scheduler.nativeLoading && scheduler.nativeError"
+               x-text="scheduler.nativeError"></div>
+          <div class="sched-native-empty"
+               x-show="!scheduler.nativeLoading && !scheduler.nativeError
+                 && !scheduler.nativeTasks.length"
+               x-text="lang==='zh'
+                 ? '该会话当前没有 SDK 原生定时任务。'
+                 : 'No SDK native scheduled tasks in this session.'"></div>
+          <div class="sched-native-list"
+               x-show="!scheduler.nativeLoading && scheduler.nativeTasks.length">
+            <template x-for="task in scheduler.nativeTasks" :key="task.job_id">
+              <article class="sched-native-card">
+                <div class="sched-native-card-head">
+                  <code x-text="task.cron || '—'"></code>
+                  <span x-text="task.recurring
+                    ? (lang==='zh' ? '循环' : 'recurring')
+                    : (lang==='zh' ? '一次' : 'one-time')"></span>
+                </div>
+                <div class="sched-native-prompt" x-text="task.prompt || '—'"></div>
+                <div class="sched-native-meta">
+                  <span class="mono" x-text="task.job_id"></span>
+                  <span x-show="task.prompt_truncated"
+                        x-text="lang==='zh' ? '已截断显示' : 'preview truncated'"></span>
+                </div>
+              </article>
+            </template>
+          </div>
+        </section>
+
+        <div class="sched-surface-divider">
+          <span x-text="lang==='zh' ? 'MuseLab 调度器' : 'MuseLab scheduler'"></span>
+        </div>
+
         <!-- Create form — labeled rows, grid-aligned, supports daily /
              weekly / monthly / once with the time picker always
              precise to the minute. Doubles as the edit form when

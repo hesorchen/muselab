@@ -31,6 +31,9 @@ def test_cli_proxy_example_maps_every_muselab_runtime_control():
     assert 'name: "gpt-5.6-terra"' in ultra
     assert '"reasoning.effort": "max"' in ultra
 
+    thinking = _rule_block(text, "X-MuseLab-Thinking", "summarized")
+    assert '"reasoning.summary": "auto"' in thinking
+
     fast = _rule_block(text, "X-MuseLab-Service-Tier", "fast")
     assert '"service_tier": "priority"' in fast
 
@@ -43,6 +46,8 @@ def test_gateway_docs_require_the_portable_payload_rules():
     for name in ("codex-gateway.md", "codex-gateway_zh.md"):
         text = (ROOT / "docs" / name).read_text(encoding="utf-8")
         assert "X-MuseLab-Effort" in text
+        assert "X-MuseLab-Thinking" in text
         assert "X-MuseLab-Service-Tier" in text
+        assert "reasoning.summary" in text
         assert "payload.override" in text
         assert "service_tier: priority" in text

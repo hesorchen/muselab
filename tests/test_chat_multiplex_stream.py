@@ -262,8 +262,8 @@ def test_mux_auto_discovers_wraps_events_and_disconnect_only_unsubscribes(
     chat_mod._active_turns[broadcast.session_id] = broadcast
     monkeypatch.setattr(
         chat_mod,
-        "session_active_status",
-        lambda sid: _active_state(chat_mod._active_turns[sid]),
+        "_session_active_status",
+        lambda sid, **_kwargs: _active_state(chat_mod._active_turns[sid]),
     )
 
     async def exercise():
@@ -293,6 +293,46 @@ def test_mux_auto_discovers_wraps_events_and_disconnect_only_unsubscribes(
     asyncio.run(exercise())
 
 
+def test_mux_reconcile_batches_runtime_lineages(chat_mod, monkeypatch):
+    monkeypatch.setattr(chat_mod, "_MUX_RECONCILE_INTERVAL_S", 0.01)
+    broadcasts = [
+        chat_mod.TurnBroadcast("batch-lineage-a"),
+        chat_mod.TurnBroadcast("batch-lineage-b"),
+    ]
+    for broadcast in broadcasts:
+        chat_mod._active_turns[broadcast.session_id] = broadcast
+
+    batch_calls = []
+    status_calls = []
+
+    def runtime_lineages(session_ids):
+        ordered = tuple(sorted(session_ids))
+        batch_calls.append(ordered)
+        return {sid: [f"owner-{sid}", sid] for sid in ordered}
+
+    def state(sid, *, runtime_lineage=None):
+        status_calls.append((sid, runtime_lineage))
+        return _active_state(chat_mod._active_turns[sid])
+
+    monkeypatch.setattr(chat_mod.sess, "runtime_lineages", runtime_lineages)
+    monkeypatch.setattr(chat_mod, "_session_active_status", state)
+
+    async def exercise():
+        stream = await _open_mux(chat_mod, {})
+        await asyncio.wait_for(anext(stream), timeout=0.2)
+        await stream.aclose()
+
+    asyncio.run(exercise())
+
+    expected_ids = ("batch-lineage-a", "batch-lineage-b")
+    assert batch_calls == [expected_ids]
+    assert status_calls == [
+        (sid, [f"owner-{sid}", sid]) for sid in expected_ids
+    ]
+    for broadcast in broadcasts:
+        broadcast.close()
+
+
 def test_mux_watcher_state_can_become_attachable_dynamically(
         chat_mod, monkeypatch):
     monkeypatch.setattr(chat_mod, "_MUX_RECONCILE_INTERVAL_S", 0.01)
@@ -301,13 +341,13 @@ def test_mux_watcher_state_can_become_attachable_dynamically(
     phase = {"attachable": False}
     chat_mod._sessions_with_inflight_tasks[sid] = {"task-1"}
 
-    def state(_sid):
+    def state(_sid, **_kwargs):
         if not phase["attachable"]:
             return _active_state(
                 placeholder, attachable=False, background=True)
         return _active_state(chat_mod._active_turns[sid])
 
-    monkeypatch.setattr(chat_mod, "session_active_status", state)
+    monkeypatch.setattr(chat_mod, "_session_active_status", state)
 
     async def exercise():
         stream = await _open_mux(chat_mod, {}, mobile=False)
@@ -342,13 +382,13 @@ def test_mux_emits_inactive_state_with_finished_turn_identity(
     broadcast = chat_mod.TurnBroadcast("becomes-inactive")
     phase = {"active": True}
 
-    def state(_sid):
+    def state(_sid, **_kwargs):
         if phase["active"]:
             return _active_state(broadcast)
         return {"active": False, "background_tasks_pending": 0}
 
     chat_mod._active_turns[broadcast.session_id] = broadcast
-    monkeypatch.setattr(chat_mod, "session_active_status", state)
+    monkeypatch.setattr(chat_mod, "_session_active_status", state)
 
     async def exercise():
         stream = await _open_mux(chat_mod, {})
@@ -388,8 +428,8 @@ def test_mux_exact_recent_checkpoint_replays_without_cold_recent_discovery(
     chat_mod._recent_turns[ordinary.session_id] = ordinary
     monkeypatch.setattr(
         chat_mod,
-        "session_active_status",
-        lambda _sid: {"active": False},
+        "_session_active_status",
+        lambda _sid, **_kwargs: {"active": False},
     )
 
     async def exercise():
@@ -419,8 +459,8 @@ def test_mux_turn_mismatch_resyncs_and_still_attaches_current_turn(
     chat_mod._active_turns[broadcast.session_id] = broadcast
     monkeypatch.setattr(
         chat_mod,
-        "session_active_status",
-        lambda sid: _active_state(chat_mod._active_turns[sid]),
+        "_session_active_status",
+        lambda sid, **_kwargs: _active_state(chat_mod._active_turns[sid]),
     )
 
     async def exercise():
@@ -465,8 +505,8 @@ def test_mux_consumes_checkpoint_before_discovering_later_turn(
     chat_mod._active_turns[first.session_id] = first
     monkeypatch.setattr(
         chat_mod,
-        "session_active_status",
-        lambda sid: _active_state(chat_mod._active_turns[sid]),
+        "_session_active_status",
+        lambda sid, **_kwargs: _active_state(chat_mod._active_turns[sid]),
     )
     checkpoints = {
         first.session_id: {
@@ -516,8 +556,8 @@ def test_mux_inactive_checkpoint_resyncs_once_and_stops_polling(
     probes = []
     monkeypatch.setattr(
         chat_mod,
-        "session_active_status",
-        lambda sid: probes.append(sid) or {"active": False},
+        "_session_active_status",
+        lambda sid, **_kwargs: probes.append(sid) or {"active": False},
     )
     checkpoints = {
         "inactive-session": {
@@ -561,8 +601,8 @@ def test_mux_child_resync_does_not_close_other_sessions(
     chat_mod._active_turns[good.session_id] = good
     monkeypatch.setattr(
         chat_mod,
-        "session_active_status",
-        lambda sid: _active_state(chat_mod._active_turns[sid]),
+        "_session_active_status",
+        lambda sid, **_kwargs: _active_state(chat_mod._active_turns[sid]),
     )
 
     async def exercise():

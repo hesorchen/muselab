@@ -1290,6 +1290,25 @@ def test_session_synchronization_has_one_per_tab_coordinator():
     assert "setInterval(tick, 2000)" not in app
 
 
+def test_mux_native_cron_history_uses_quiet_canonical_reconciliation():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    mux_start = app.index("async _openChatMux()")
+    mux_end = app.index("\n    _handleChatMuxDisconnect", mux_start)
+    mux = app[mux_start:mux_end]
+    handler_start = app.index("_handleScheduledHistoryUpdate(payload)")
+    handler_end = app.index("\n    _queueChatMuxEvent", handler_start)
+    handler = app[handler_start:handler_end]
+
+    assert 'source.addEventListener("scheduled_history"' in mux
+    assert "this._handleScheduledHistoryUpdate(payload)" in mux
+    assert "st._pendingExternalUpdate = true" in handler
+    assert "if (sid !== this.currentId) st.unread = true" in handler
+    assert 'this._requestSessionSync(sid, "history_revision"' in handler
+    assert "targetUpdated: 0" in handler
+    assert "payload.prompt" not in handler
+    assert "payload.content" not in handler
+
+
 def test_session_sync_deadlines_and_activity_transport_backoff_are_bounded():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
     fetch_start = app.index("    async _fetchWithDeadline(")
@@ -3044,6 +3063,72 @@ def test_composer_draft_is_per_session_and_async_actions_pin_owner():
     assert "ownerState.draft.pendingImages.includes(entry)" in editor
     assert "ownerState.draft.pendingImages.push(entry)" in image_gen
     assert "this.tabState[ownerSid] !== ownerState" in image_gen
+
+
+def test_attachment_upload_uses_real_byte_progress_and_renders_percentage():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    css = (FRONTEND / "styles.css").read_text(encoding="utf-8")
+
+    helper_start = app.index("_uploadAttachment(fd")
+    helper_end = app.index("async _attachFile(file)", helper_start)
+    helper = app[helper_start:helper_end]
+    assert "new XMLHttpRequest()" in helper
+    assert 'xhr.upload.addEventListener("progress"' in helper
+    assert "event.loaded / event.total" in helper
+    assert 'xhr.setRequestHeader(name, value)' in helper
+    assert 'signal.addEventListener("abort"' in helper
+
+    attach_start = app.index("async _attachFile(file)")
+    attach_end = app.index("async onAttachPicked", attach_start)
+    attach = app[attach_start:attach_end]
+    assert "progress: 0, progressKnown: false" in attach
+    assert "onProgress: updateProgress" in attach
+    assert "entry.progress = 100" in attach
+    assert "img.progressKnown" in html
+    assert "doc.progressKnown" in html
+    assert "chip-upload-percent" in html
+    assert ".chip-upload-bar > span" in css
+
+
+def test_workspace_file_upload_uses_real_aggregate_byte_progress():
+    """File-pane picks and drops share one byte-progress implementation."""
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    css = (FRONTEND / "styles.css").read_text(encoding="utf-8")
+    i18n = (FRONTEND / "i18n" / "index.js").read_text(encoding="utf-8")
+
+    helper_start = app.index("fileUploadProgressLabel() {")
+    helper_end = app.index("\n    async upload(ev)", helper_start)
+    helper = app[helper_start:helper_end]
+    assert "new XMLHttpRequest()" in helper
+    assert 'xhr.open("POST", "/api/files/upload", true)' in helper
+    assert 'xhr.upload.addEventListener("progress"' in helper
+    assert "event.loaded" in helper and "event.total" in helper
+    assert "_updateFileUploadTransfer(" in helper
+    assert "Object.values(batch.transfers" in helper
+
+    quiet_start = app.index("async _uploadFileQuiet(")
+    quiet_end = app.index("\n    _prepareUploadOverwrite", quiet_start)
+    quiet = app[quiet_start:quiet_end]
+    assert "_beginFileUploadTransfer(file)" in quiet
+    assert "_uploadWorkspaceFile(dirPath, file, transfer)" in quiet
+    assert "_finishFileUploadTransfer(transfer, succeeded)" in quiet
+
+    context_start = app.index("async uploadFileTo(dirPath, file)")
+    context_end = app.index("\n    // Custom MIME", context_start)
+    context_upload = app[context_start:context_end]
+    assert "_uploadFileQuiet(dirPath, file" in context_upload
+    assert "reportError: true" in context_upload
+
+    assert '@change="upload($event)"' in html
+    assert 'class="file-upload-progress"' in html
+    assert 'role="progressbar"' in html
+    assert "fileUploadProgress.percent" in html
+    assert ".file-upload-progress-track" in css
+    assert "@keyframes file-upload-progress-slide" in css
+    assert i18n.count('"files.uploading_many"') == 2
+    assert i18n.count('"files.upload_finished_errors"') == 2
 
 
 def test_chat_draft_survives_refresh_and_failed_stream_start():
@@ -5123,7 +5208,7 @@ def test_turn_footer_falls_back_to_transcript_time_and_shows_model_and_state():
     assert '("model", "model")' in presentation
     assert '("turn_status", "turn_status")' in presentation
     assert "entry.setdefault(target, value)" in presentation
-    assert "turn_status=_activity_status" in chat
+    assert "turn_status=_turn_status" in chat
     assert "def _complete_turn_footer_metadata(" in chat
     assert "chat_presentation.complete_turn_footer_metadata(" in chat
     assert 'tail["turn_status"] = status' in presentation
@@ -6113,3 +6198,151 @@ def test_file_navigation_exposes_keyboard_semantics_and_distinct_actions():
     assert ".open-files-main {" in css
     assert ".tab-main {" in css
     assert '.filelist li[role="treeitem"]:focus-visible' in css
+
+
+def test_sdk_lifecycle_footer_and_native_clear_contracts_are_wired():
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+
+    assert 'turnOriginLabel(m.turn_origin)' in html
+    assert 'm.terminal_reason' in html
+    assert 'if (value === "stopped")' in app
+    assert 'terminal_reason: ""' in app
+    assert 'turn_origin: null' in app
+    assert 'turnStatus: d.status ||' in app
+    assert 'terminalReason: d.terminal_reason' in app
+    assert 'turnOrigin: d.origin' in app
+    assert 'modelUsage: d.model_usage' in app
+    assert 'modelUsageEntries(m.model_usage)' in html
+    assert 'class="turn-model-usage-popover"' in html
+    assert 'x-text="modelUsageTitle(row)"' in html
+    assert 'x-text="modelUsageDetail(row)"' in html
+    assert '/native-clear`' in app
+    clear_start = app.index('        case "clear": {')
+    clear_end = app.index('        case "resume": {', clear_start)
+    clear_handler = app[clear_start:clear_end]
+    assert 'method: "DELETE"' not in clear_handler
+    assert '_adoptRecoveredSession' in clear_handler
+    assert '_disposeTabRuntime(oldId)' in clear_handler
+
+
+def test_subagent_timeline_uses_separate_sdk_history_and_live_lane():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+
+    assert '"subagent_delta", "subagent_block"' in app
+    assert "/subagents`" in app
+    assert "_applySubagentDelta(streamSid, streamState, d)" in app
+    assert "_applySubagentBlock(streamSid, streamState, d)" in app
+    assert "subagentTimelineFor(pane, m.id)" in html
+    assert "执行过程" in html
+
+
+def test_hook_settings_gui_edits_standard_scopes_and_keeps_builtins_read_only():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    backend = (BACKEND / "hook_settings.py").read_text(encoding="utf-8")
+
+    assert 'settings.activePage=\'hooks\'; loadHookSettings()' in html
+    assert "Claude 标准配置" in html
+    assert "MuseLab 内置 Hook（只读）" in html
+    assert 'class="switch sm"' in html
+    assert 'class="settings-input mono hook-event-select"' in html
+    assert 'hook-event-options' not in html
+    for event in (
+        "SessionStart", "UserPromptSubmit", "PreToolUse", "PermissionDenied",
+        "PostToolBatch", "SubagentStart", "TaskCompleted", "StopFailure",
+        "PostCompact", "PreModelSwitch", "InstructionsLoaded", "FileChanged",
+        "WorktreeCreate", "ElicitationResult", "SessionEnd",
+    ):
+        assert f'<option value="{event}">' in html
+    for handler_type in ("command", "http", "mcp_tool", "prompt", "agent"):
+        assert f'<option value="{handler_type}">' in html
+    assert "onHookHandlerTypeChange()" in html
+    assert "hookHandlerTemplate(type)" in app
+    assert 'method: editing ? "PUT" : "POST"' in app
+    assert 'method: "DELETE"' in app
+    assert 'method: "PATCH"' in app
+    assert "conversationHdr()" in app
+    assert 'setting_sources=["user", "project", "local"]' in (
+        BACKEND / "chat.py"
+    ).read_text(encoding="utf-8")
+    assert "_restore_masked_headers" in backend
+    assert "configure_runtime_invalidator" in backend
+
+
+def test_hook_execution_trace_is_safe_separate_and_visible_per_turn():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    traces = (BACKEND / "hook_traces.py").read_text(encoding="utf-8")
+
+    assert '"hook_trace"' in app
+    assert "_applyHookTrace(streamSid, streamState, d)" in app
+    assert "/hook-traces`" in app
+    assert "hookTracesForTurn(pane, m)" in html
+    assert "当前会话最近执行记录" in html
+    assert "Raw commands, paths, stdout/stderr" in traces
+    assert '"output"' not in traces.split("def observe", 1)[1]
+
+
+def test_last_turn_retry_uses_guarded_sdk_branch_and_keeps_source():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    backend = (BACKEND / "chat.py").read_text(encoding="utf-8")
+
+    assert "/retry-last-turn`" in app
+    assert "retryTurnUserMessage(paneMsgs, i, pane)" in html
+    assert "原会话不变" in html
+    assert '"resume_drops_turn": retry_target_user_uuid' in backend
+    assert '"resume_session_at": retry_resume_session_at' in backend
+    assert "only the latest user turn can be retried" in backend
+    assert "attachment turns cannot be retried" in backend
+
+
+def test_sdk_scheduled_tasks_have_live_stream_and_amber_session_state():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    backend = (BACKEND / "chat.py").read_text(encoding="utf-8")
+    runtime = (BACKEND / "chat_runtime.py").read_text(encoding="utf-8")
+
+    assert '"scheduled_tasks"' in app
+    assert 'es.addEventListener("scheduled_tasks"' in app
+    assert "isTabScheduledActive" in app
+    assert "scheduled_active" in app
+    assert "scheduled-trigger-avatar" in html
+    assert "定时任务待命或执行中" in html
+    assert "SDK 原生任务" in html
+    assert "openNativeScheduledTasks(tid, $event)" in html
+    assert "loadNativeScheduledTasks" in app
+    assert "/scheduled-tasks`" in app
+    assert "_observe_sdk_scheduled_delivery" in backend
+    assert 'origin.get("subkind") == "scheduled-trigger"' in backend
+    assert "_matching_sdk_cron_job" in backend
+    assert "prompt_sha256" in backend
+    assert "session_has_scheduled_tasks" in runtime
+    assert "if observed:" in runtime
+
+
+def test_background_task_cards_open_a_safe_focus_managed_detail_dialog():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    css = (FRONTEND / "styles.css").read_text(encoding="utf-8")
+    presentation = (BACKEND / "chat_presentation.py").read_text(encoding="utf-8")
+
+    assert html.count('class="task-detail-trigger"') == 2
+    assert html.count("openTaskDetail(m.task_status, m, $event)") == 2
+    assert 'class="modal task-detail-modal" role="dialog" aria-modal="true"' in html
+    assert 'aria-labelledby="task-detail-title"' in html
+    assert '@keydown.tab="trapDialogFocus($event, \'task-detail\')"' in html
+    assert 'x-text="taskDetail.output"' in html
+    assert "taskDetailUsageRows(taskDetail.status?.usage)" in html
+    assert "async openTaskDetail(status, message = null, ev = null)" in app
+    assert '"task-detail", ".task-detail-modal", ".task-detail-close"' in app
+    assert 'else if (top === "task-detail") this.closeTaskDetail()' in app
+    assert '"/api/chat/task-output?session_id="' in app
+    assert "requestId !== this._taskDetailRequestId" in app
+    assert "this._syncOpenTaskDetail(card.task_status, card)" in app
+    assert "usage: d.usage || null" in app
+    assert 'usage=data.get("usage") or {}' in presentation
+    assert ".modal.task-detail-modal" in css
+    assert ".task-detail-trigger:focus-visible" in css

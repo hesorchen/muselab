@@ -1,13 +1,45 @@
 """Shared pytest fixtures: spin up a backend.main app against a temp ROOT and
 fresh sessions dir, with a known token. Each test gets a clean filesystem."""
 import asyncio
+import os
+import shutil
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
 
 
 TEST_TOKEN = "test-token-1234567890abcdef-secure-min-32"
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    """Give every xdist worker private module-import-time runtime state.
+
+    Several backend modules create SQLite registries when tests are collected,
+    before function-scoped fixtures can replace MUSELAB_ROOT. Sharing the
+    caller's root made parallel workers race the same database and could also
+    touch a developer's live workspace. A fresh worker root keeps collection
+    parallel, deterministic and hermetic.
+    """
+    worker_id = os.environ.get("PYTEST_XDIST_WORKER", "").strip()
+    if not worker_id or worker_id == "master":
+        return
+
+    worker_root = Path(tempfile.mkdtemp(
+        prefix=f"muselab-pytest-{worker_id}-",
+    ))
+    sessions = worker_root / "sessions"
+    memory = worker_root / "memory"
+    sessions.mkdir()
+    memory.mkdir()
+    os.environ["MUSELAB_ROOT"] = str(worker_root)
+    os.environ["MUSELAB_SESSIONS_DIR"] = str(sessions)
+    os.environ["MUSELAB_MEMORY_DIR"] = str(memory)
+    os.environ["MUSELAB_ENV_PATH"] = str(worker_root / "runtime.env")
+    config.add_cleanup(
+        lambda: shutil.rmtree(worker_root, ignore_errors=True)
+    )
 
 
 @pytest.fixture()

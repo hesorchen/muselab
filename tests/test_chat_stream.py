@@ -22,7 +22,7 @@ from claude_agent_sdk import (
     AssistantMessage, UserMessage, ResultMessage, StreamEvent,
     TextBlock, ToolUseBlock, ToolResultBlock,
     TaskStartedMessage, TaskProgressMessage, TaskNotificationMessage,
-    TaskUpdatedMessage, SystemMessage,
+    TaskUpdatedMessage, SystemMessage, ConversationResetMessage,
 )
 
 from tests.conftest import TEST_TOKEN
@@ -281,6 +281,16 @@ def test_stream_happy_path_text_tooluse_result_done(stream_env, client, monkeypa
             total_cost_usd=0.0042,
             usage={"input_tokens": 100, "output_tokens": 20},
             result="Read completed successfully.",
+            terminal_reason="completed",
+            origin={"kind": "human"},
+            model_usage={
+                "claude-sonnet-4-6": {
+                    "inputTokens": 100,
+                    "outputTokens": 20,
+                    "costUSD": 0.0042,
+                    "provider": "anthropic",
+                },
+            },
         ),
     ]
 
@@ -328,6 +338,12 @@ def test_stream_happy_path_text_tooluse_result_done(stream_env, client, monkeypa
     assert done["total_cost_usd"] == pytest.approx(0.0042)
     assert done["model"] == "claude-sonnet-4-6"
     assert done["cancelled"] is False
+    assert done["status"] == "completed"
+    assert done["terminal_reason"] == "completed"
+    assert done["origin"] == {
+        "kind": "human", "subkind": None, "task_id": None, "source": "sdk",
+    }
+    assert done["model_usage"]["claude-sonnet-4-6"]["inputTokens"] == 100
     assert done["activity_source"] == "direct"
     assert done["duration_ms"] == 1500
     assert done["assistant_uuid"] == "assistant-final-uuid"
@@ -338,6 +354,8 @@ def test_stream_happy_path_text_tooluse_result_done(stream_env, client, monkeypa
     assert annotations["assistant-final-uuid"]["ts"] == done["completed_at_ms"]
     assert annotations["assistant-final-uuid"]["elapsed_s"] == 1.5
     assert annotations["assistant-final-uuid"]["turn_status"] == "completed"
+    assert annotations["assistant-final-uuid"]["terminal_reason"] == "completed"
+    assert annotations["assistant-final-uuid"]["turn_origin"]["kind"] == "human"
 
     # Turn reservation released after completion.
     assert sid not in chat_mod._active_turns
@@ -422,6 +440,7 @@ def test_tool_only_turn_recovers_result_text_and_survives_refresh(
     terminal = messages[-1]
     assert terminal["role"] == "assistant"
     assert terminal["text"] == "Inspection completed with a final summary."
+    assert terminal["turn_id"] == done["turn_id"]
     assert terminal["turn_status"] == "completed"
     assert terminal["elapsed"] == 2.5
     assert terminal["memoryRecall"] == {
@@ -448,6 +467,7 @@ def test_result_race_preserves_turn_owned_cancelled_state(
         subtype="success", duration_ms=900, duration_api_ms=800,
         is_error=False, num_turns=1, session_id=sid,
         total_cost_usd=0.0, usage={}, result="late result after stop",
+        terminal_reason="completed",
     )
 
     class CancellingClient(_FakeStreamClient):
@@ -472,6 +492,8 @@ def test_result_race_preserves_turn_owned_cancelled_state(
     done = next(json.loads(data) for event, data in events if event == "done")
 
     assert done["cancelled"] is True
+    assert done["status"] == "cancelled"
+    assert done["terminal_reason"] == "completed"
     assert done["is_error"] is False
     assert done["result_recovered"] is False
     assert not [data for event, data in events if event == "text"]
@@ -741,6 +763,42 @@ def test_result_only_error_persists_tail_bubble_without_relabeling_old_turn(
     assert terminal["role"] == "assistant"
     assert "context window" in terminal["text"]
     assert terminal["turn_status"] == "failed"
+
+
+def test_max_turns_uses_stopped_status_live_and_after_refresh(
+        stream_env, client, monkeypatch):
+    chat_mod = stream_env
+    sid = _make_session(client)
+    fake = _FakeStreamClient([ResultMessage(
+        subtype="error_max_turns", duration_ms=900, duration_api_ms=800,
+        is_error=True, num_turns=12, session_id=sid,
+        result="Reached the configured maximum number of turns",
+        errors=["Reached the configured maximum number of turns"],
+        terminal_reason="max_turns",
+    )])
+
+    async def fake_get_client(*_args, **_kwargs):
+        return fake
+
+    monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
+    response = client.get(
+        f"/api/chat/stream?token={TEST_TOKEN}&session_id={sid}"
+        "&prompt=continue&model=claude-sonnet-4-6",
+    )
+    done = next(
+        json.loads(data) for event, data in _parse_sse(response.text)
+        if event == "done")
+    assert done["status"] == "stopped"
+    assert done["terminal_reason"] == "max_turns"
+    assert done["is_error"] is True
+    assert done["cancelled"] is False
+
+    history = client.get(
+        f"/api/chat/sessions/{sid}", params={"tail": 80},
+        headers={"X-Auth-Token": TEST_TOKEN},
+    ).json()["messages"]
+    assert history[-1]["turn_status"] == "stopped"
+    assert history[-1]["terminal_reason"] == "max_turns"
 
 
 def test_prevent_continuation_cannot_be_overridden_by_success_result(
@@ -1580,6 +1638,52 @@ def test_run_sdk_command_checked_rejects_local_command_api_error(stream_env):
     assert fake.queries == ["/compact"]
 
 
+def test_run_sdk_reset_checked_uses_result_session_id_not_conversation_id(
+        stream_env):
+    chat_mod = stream_env
+    source_sid = "11111111-1111-4111-8111-111111111111"
+    target_sid = "22222222-2222-4222-8222-222222222222"
+    messages = [
+        ConversationResetMessage(
+            new_conversation_id="opaque-not-a-session-id",
+            uuid="reset-row",
+            session_id=source_sid,
+        ),
+        ResultMessage(
+            subtype="success", duration_ms=1, duration_api_ms=1,
+            is_error=False, num_turns=0, session_id=target_sid,
+            terminal_reason="completed",
+        ),
+    ]
+
+    fake = _FakeStreamClient(messages)
+    reset, result = asyncio.run(
+        chat_mod._run_sdk_reset_checked(fake, source_sid))
+
+    assert fake.queried == ["/clear"]
+    assert reset.new_conversation_id == "opaque-not-a-session-id"
+    assert result.session_id == target_sid
+
+
+@pytest.mark.parametrize("messages", [
+    [ResultMessage(
+        subtype="success", duration_ms=1, duration_api_ms=1,
+        is_error=False, num_turns=0,
+        session_id="22222222-2222-4222-8222-222222222222")],
+    [ConversationResetMessage(
+        new_conversation_id="opaque", uuid="reset-row",
+        session_id="11111111-1111-4111-8111-111111111111")],
+])
+def test_run_sdk_reset_checked_fails_closed_on_partial_contract(
+        stream_env, messages):
+    chat_mod = stream_env
+    with pytest.raises(chat_mod._SDKCommandError, match="without a"):
+        asyncio.run(chat_mod._run_sdk_reset_checked(
+            _FakeStreamClient(messages),
+            "11111111-1111-4111-8111-111111111111",
+        ))
+
+
 def test_turn_response_boundary_accepts_lifecycle_and_uuid_less_error(stream_env):
     chat_mod = stream_env
     boundary = chat_mod._TurnResponseBoundary({"old"})
@@ -1601,6 +1705,31 @@ def test_turn_response_boundary_accepts_lifecycle_and_uuid_less_error(stream_env
     assert boundary.classify(old_result) == "stale_result"
     assert boundary.classify(stale_system) == "drop"
     assert boundary.classify(error_result) == "current_result"
+
+
+def test_turn_response_boundary_keeps_nonhuman_delivery_out_of_human_turn(
+        stream_env):
+    chat_mod = stream_env
+    boundary = chat_mod._TurnResponseBoundary(set())
+    side_user = UserMessage(
+        content="background delivery",
+        uuid="side-user",
+        parent_tool_use_id=None,
+        origin={"kind": "auto-continuation"},
+    )
+    side_result = ResultMessage(
+        subtype="success", duration_ms=1, duration_api_ms=1,
+        is_error=False, num_turns=1, session_id="side",
+        origin={"kind": "auto-continuation"},
+    )
+    human_result = ResultMessage(
+        subtype="success", duration_ms=1, duration_api_ms=1,
+        is_error=False, num_turns=1, session_id="human", origin=None,
+    )
+
+    assert boundary.classify(side_user) == "background"
+    assert boundary.classify(side_result) == "background_result"
+    assert boundary.classify(human_result) == "current_result"
 
 
 @pytest.mark.asyncio
@@ -2289,6 +2418,7 @@ def test_watcher_opens_continuation_turn_and_unpins(stream_env):
             "ts": done["completed_at_ms"],
             "turn_status": "completed",
             "elapsed_s": 1.1,
+            "turn_id": bc.turn_id,
         }
         # All pending settled → pin released, client reclaimable.
         assert sid not in chat_mod._sessions_with_inflight_tasks
@@ -3795,6 +3925,11 @@ def test_usermsg_task_notification_text_extracts_and_guards():
     # list-of-blocks content
     assert chat_mod._usermsg_task_notification_text(
         UserMessage(content=[TextBlock(text=xml)])) == xml
+    # Some SDK/CLI version combinations expose canonical content blocks as
+    # dictionaries rather than typed TextBlock instances.
+    msg = UserMessage(content=xml)
+    msg.content = [{"type": "text", "text": xml}]
+    assert chat_mod._usermsg_task_notification_text(msg) == xml
     # plain user prose → ""
     assert chat_mod._usermsg_task_notification_text(
         UserMessage(content="just a normal message")) == ""
@@ -5394,6 +5529,23 @@ def test_canonical_block_ids_are_record_local_and_repeatable():
     assert [m["block_id"] for m in second] == expected
 
 
+def test_signature_only_thinking_is_not_rendered_as_a_history_placeholder(
+    stream_env,
+):
+    chat_mod = stream_env
+    record = _sm("signature-only", "assistant", [
+        {"type": "thinking", "thinking": "", "signature": "signed-value"},
+        {"type": "text", "text": "final answer"},
+    ])
+
+    messages = chat_mod._sdk_messages_to_ui([record], {})
+
+    assert [(message["role"], message.get("text")) for message in messages] == [
+        ("assistant", "final answer"),
+    ]
+    assert "已加密推理" not in str(messages)
+
+
 def test_large_canonical_body_is_deferred_without_source_truncation():
     from backend import chat as chat_mod
 
@@ -6839,6 +6991,9 @@ def test_watcher_without_a_task_pin_is_not_user_visible_active(stream_env):
             "runtime_background_tasks_pending": 0,
             "runtime_continuation_pending": False,
             "runtime_ui_revision": "",
+            "scheduled_active": False,
+            "scheduled_count": 0,
+            "scheduled": False,
             "activity_source": "",
         }
 
@@ -6850,6 +7005,444 @@ def test_watcher_without_a_task_pin_is_not_user_visible_active(stream_env):
     finally:
         chat_mod._task_watchers.pop(sid, None)
         chat_mod._release_task_pins(sid, {"task_live"})
+
+
+def test_native_cron_tools_update_live_schedule_state(stream_env):
+    chat_mod = stream_env
+    sid = "sid-native-cron-state"
+    key = (sid, "claude-sonnet-4-6", "auto", "")
+    broadcast = chat_mod.TurnBroadcast(sid, model=key[1])
+    chat_mod._active_turns[sid] = broadcast
+    prompt = "must remain bounded in the native task inspector"
+
+    async def run():
+        await chat_mod._observe_sdk_stream_message(key, AssistantMessage(
+            content=[ToolUseBlock(
+                id="cron-create-1",
+                name="CronCreate",
+                input={
+                    "cron": "7 * * * *",
+                    "recurring": True,
+                    "durable": False,
+                    "prompt": prompt,
+                },
+            )],
+            model=key[1],
+        ))
+        await chat_mod._observe_sdk_stream_message(key, UserMessage(content=[
+            ToolResultBlock(
+                tool_use_id="cron-create-1",
+                content=(
+                    "Scheduled recurring job 93d1bb35 "
+                    "(Every hour at :07). Session-only."
+                ),
+            ),
+        ]))
+        assert chat_mod._sdk_scheduled_snapshot(sid) == {
+            "scheduled_active": True,
+            "scheduled_count": 1,
+        }
+        assert chat_mod._sdk_cron_jobs[sid] == {
+            "93d1bb35": {
+                "cron": "7 * * * *",
+                "recurring": True,
+                "durable": False,
+                "prompt": prompt,
+                "prompt_sha256": chat_mod._safe_sdk_cron_prompt(prompt)[1],
+                "prompt_truncated": False,
+            },
+        }
+
+        await chat_mod._observe_sdk_stream_message(key, AssistantMessage(
+            content=[ToolUseBlock(
+                id="cron-delete-1",
+                name="CronDelete",
+                input={"id": "93d1bb35"},
+            )],
+            model=key[1],
+        ))
+        await chat_mod._observe_sdk_stream_message(key, UserMessage(content=[
+            ToolResultBlock(
+                tool_use_id="cron-delete-1",
+                content="Cancelled job 93d1bb35.",
+            ),
+        ]))
+
+    try:
+        asyncio.run(run())
+        assert chat_mod._sdk_scheduled_snapshot(sid) == {
+            "scheduled_active": False,
+            "scheduled_count": 0,
+        }
+        updates = [
+            json.loads(event["data"])
+            for event in broadcast.replay_events()
+            if event["event"] == "scheduled_tasks"
+        ]
+        assert [item["scheduled_count"] for item in updates] == [1, 0]
+    finally:
+        chat_mod._active_turns.pop(sid, None)
+        chat_mod._sdk_cron_jobs.pop(sid, None)
+        chat_mod._sdk_cron_tool_calls.pop(key, None)
+        broadcast.close()
+
+
+def test_native_cron_jsonl_completion_notifies_mux_without_content(
+        stream_env, monkeypatch, tmp_path):
+    chat_mod = stream_env
+    sid = "sid-native-cron-jsonl"
+    prompt = "检查服务并只回复状态正常"
+    safe_prompt = chat_mod._safe_sdk_cron_prompt(prompt)
+    transcript = tmp_path / f"{sid}.jsonl"
+    transcript.write_text("", encoding="utf-8")
+    monkeypatch.setattr(
+        chat_mod, "_find_session_jsonl", lambda candidate: (
+            transcript if candidate == sid else None
+        ),
+    )
+    chat_mod._sdk_cron_jobs[sid] = {
+        "job-jsonl": {
+            "prompt_sha256": safe_prompt[1],
+            "recurring": True,
+        },
+    }
+    cursors = {}
+
+    def append(*records):
+        with transcript.open("a", encoding="utf-8") as handle:
+            for record in records:
+                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    try:
+        assert chat_mod._collect_sdk_scheduled_history_updates(cursors) == []
+        append(
+            {
+                "type": "user",
+                "uuid": "scheduled-trigger",
+                "isMeta": True,
+                "message": {"role": "user", "content": prompt},
+            },
+            {
+                "type": "assistant",
+                "uuid": "scheduled-result",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "状态正常"}],
+                    "stop_reason": "end_turn",
+                },
+            },
+        )
+        updates = chat_mod._collect_sdk_scheduled_history_updates(cursors)
+        assert len(updates) == 1
+        assert updates[0]["session_id"] == sid
+        assert len(updates[0]["revision"]) == 20
+        assert set(updates[0]) == {"session_id", "revision"}
+        assert prompt not in json.dumps(updates[0], ensure_ascii=False)
+        assert "状态正常" not in json.dumps(updates[0], ensure_ascii=False)
+
+        append(
+            {
+                "type": "user",
+                "uuid": "human-user",
+                "isMeta": False,
+                "message": {"role": "user", "content": prompt},
+            },
+            {
+                "type": "assistant",
+                "uuid": "human-result",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "普通回复"}],
+                    "stop_reason": "end_turn",
+                },
+            },
+        )
+        assert chat_mod._collect_sdk_scheduled_history_updates(cursors) == []
+    finally:
+        chat_mod._sdk_cron_jobs.pop(sid, None)
+
+
+def test_native_cron_jsonl_follower_keeps_inflight_trigger_on_attach(
+        stream_env, monkeypatch, tmp_path):
+    chat_mod = stream_env
+    sid = "sid-native-cron-jsonl-inflight"
+    prompt = "运行定时检查"
+    safe_prompt = chat_mod._safe_sdk_cron_prompt(prompt)
+    transcript = tmp_path / f"{sid}.jsonl"
+    transcript.write_text(json.dumps({
+        "type": "user",
+        "uuid": "scheduled-trigger-before-mux",
+        "isMeta": True,
+        "message": {"role": "user", "content": prompt},
+    }, ensure_ascii=False) + "\n", encoding="utf-8")
+    monkeypatch.setattr(
+        chat_mod, "_find_session_jsonl", lambda candidate: (
+            transcript if candidate == sid else None
+        ),
+    )
+    chat_mod._sdk_cron_jobs[sid] = {
+        "job-inflight": {"prompt_sha256": safe_prompt[1]},
+    }
+    cursors = {}
+
+    try:
+        assert chat_mod._collect_sdk_scheduled_history_updates(cursors) == []
+        with transcript.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps({
+                "type": "assistant",
+                "uuid": "scheduled-result-after-mux",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "完成"}],
+                    "stop_reason": "end_turn",
+                },
+            }, ensure_ascii=False) + "\n")
+        updates = chat_mod._collect_sdk_scheduled_history_updates(cursors)
+        assert [update["session_id"] for update in updates] == [sid]
+    finally:
+        chat_mod._sdk_cron_jobs.pop(sid, None)
+
+
+def test_sdk_scheduled_trigger_is_broadcast_live_without_refresh(
+        stream_env, monkeypatch):
+    chat_mod = stream_env
+    sid = "sid-native-scheduled-trigger"
+    key = (sid, "claude-sonnet-4-6", "auto", "")
+
+    async def no_activity(*_args, **_kwargs):
+        return None
+
+    async def no_refresh(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(chat_mod, "_start_activity_early", no_activity)
+    monkeypatch.setattr(chat_mod, "_finish_activity", no_activity)
+    monkeypatch.setattr(
+        chat_mod, "_refresh_scheduled_session_summary", no_refresh)
+
+    async def run():
+        assert await chat_mod._observe_sdk_stream_message(
+            key,
+            UserMessage(
+                content="检查服务状态",
+                uuid="scheduled-user",
+                origin={
+                    "kind": "task-notification",
+                    "subkind": "scheduled-trigger",
+                },
+            ),
+        ) is True
+        await asyncio.sleep(0)
+        delivery = chat_mod._sdk_scheduled_deliveries[key]
+        broadcast = delivery.broadcast
+        assert chat_mod._active_turns[sid] is broadcast
+        assert broadcast.activity_source == "scheduled"
+        assert broadcast.user_text == "检查服务状态"
+
+        assert await chat_mod._observe_sdk_stream_message(
+            key,
+            StreamEvent(
+                uuid="scheduled-stream",
+                session_id=sid,
+                event={
+                    "type": "content_block_delta",
+                    "delta": {"type": "text_delta", "text": "状态正常"},
+                },
+            ),
+        ) is True
+        assert await chat_mod._observe_sdk_stream_message(
+            key,
+            AssistantMessage(
+                content=[TextBlock("状态正常")],
+                model=key[1],
+            ),
+        ) is True
+        assert await chat_mod._observe_sdk_stream_message(
+            key,
+            ResultMessage(
+                subtype="success",
+                duration_ms=12,
+                duration_api_ms=10,
+                is_error=False,
+                num_turns=1,
+                session_id=sid,
+                terminal_reason="completed",
+                origin={
+                    "kind": "task-notification",
+                    "subkind": "scheduled-trigger",
+                },
+            ),
+        ) is True
+        await asyncio.sleep(0)
+        return broadcast
+
+    broadcast = asyncio.run(run())
+    try:
+        assert sid not in chat_mod._active_turns
+        assert key not in chat_mod._sdk_scheduled_deliveries
+        events = list(broadcast.replay_events())
+        assert [event["event"] for event in events] == [
+            "startup", "text", "done",
+        ]
+        done = json.loads(events[-1]["data"])
+        assert done["scheduled"] is True
+        assert done["activity_source"] == "scheduled"
+        assert chat_mod.session_active_status(sid)["scheduled"] is True
+    finally:
+        recent = chat_mod._recent_turns.pop(sid, None)
+        handle = chat_mod._recent_turn_expiry_handles.pop(sid, None)
+        if handle is not None:
+            handle.cancel()
+        (recent or broadcast).close()
+
+
+def test_originless_sdk_scheduled_trigger_uses_known_prompt_fingerprint(
+        stream_env, monkeypatch):
+    chat_mod = stream_env
+    sid = "sid-originless-native-scheduled-trigger"
+    key = (sid, "claude-sonnet-4-6", "auto", "")
+    prompt = "检查 originless SDK 定时任务"
+    safe_prompt = chat_mod._safe_sdk_cron_prompt(prompt)
+    chat_mod._sdk_cron_jobs[sid] = {
+        "job-originless": {
+            "cron": "* * * * *",
+            "recurring": True,
+            "durable": False,
+            "prompt": safe_prompt[0],
+            "prompt_sha256": safe_prompt[1],
+            "prompt_truncated": safe_prompt[2],
+        },
+    }
+
+    async def no_activity(*_args, **_kwargs):
+        return None
+
+    async def no_refresh(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(chat_mod, "_start_activity_early", no_activity)
+    monkeypatch.setattr(chat_mod, "_finish_activity", no_activity)
+    monkeypatch.setattr(
+        chat_mod, "_refresh_scheduled_session_summary", no_refresh)
+    monkeypatch.setattr(
+        chat_mod.sess, "set_message_annotation", lambda *_a, **_k: None)
+
+    async def run():
+        accepted = await chat_mod._observe_sdk_stream_message(
+            key,
+            UserMessage(
+                content=prompt,
+                uuid="originless-scheduled-user",
+                origin=None,
+            ),
+        )
+        await asyncio.sleep(0)
+        delivery = chat_mod._sdk_scheduled_deliveries[key]
+        assert accepted is True
+        assert delivery.job_id == "job-originless"
+        assert delivery.broadcast.user_text == prompt
+        await chat_mod._observe_sdk_stream_message(
+            key,
+            StreamEvent(
+                uuid="originless-stream",
+                session_id=sid,
+                event={
+                    "type": "content_block_delta",
+                    "delta": {"type": "text_delta", "text": "已自动刷新"},
+                },
+            ),
+        )
+        await chat_mod._observe_sdk_stream_message(
+            key,
+            ResultMessage(
+                subtype="success",
+                duration_ms=12,
+                duration_api_ms=10,
+                is_error=False,
+                num_turns=1,
+                session_id=sid,
+                terminal_reason="completed",
+                origin=None,
+            ),
+        )
+        await asyncio.sleep(0)
+        return delivery.broadcast
+
+    broadcast = asyncio.run(run())
+    try:
+        assert [event["event"] for event in broadcast.replay_events()] == [
+            "startup", "text", "done",
+        ]
+    finally:
+        chat_mod._sdk_cron_jobs.pop(sid, None)
+        chat_mod._sdk_scheduled_deliveries.pop(key, None)
+        chat_mod._active_turns.pop(sid, None)
+        recent = chat_mod._recent_turns.pop(sid, None)
+        handle = chat_mod._recent_turn_expiry_handles.pop(sid, None)
+        if handle is not None:
+            handle.cancel()
+        (recent or broadcast).close()
+
+
+def test_originless_cron_prompt_does_not_capture_foreground_user_turn(
+        stream_env):
+    chat_mod = stream_env
+    sid = "sid-native-cron-foreground-guard"
+    key = (sid, "claude-sonnet-4-6", "auto", "")
+    prompt = "same text as the schedule"
+    safe_prompt = chat_mod._safe_sdk_cron_prompt(prompt)
+    foreground = chat_mod.TurnBroadcast(sid, model=key[1])
+    chat_mod._active_turns[sid] = foreground
+    chat_mod._sdk_cron_jobs[sid] = {
+        "job-same-text": {
+            "prompt_sha256": safe_prompt[1],
+            "recurring": True,
+        },
+    }
+
+    try:
+        accepted = asyncio.run(chat_mod._observe_sdk_stream_message(
+            key,
+            UserMessage(content=prompt, uuid="human-user", origin=None),
+        ))
+        assert accepted is False
+        assert key not in chat_mod._sdk_scheduled_deliveries
+    finally:
+        chat_mod._active_turns.pop(sid, None)
+        chat_mod._sdk_cron_jobs.pop(sid, None)
+        foreground.close()
+
+
+def test_session_pump_skips_observer_consumed_message(
+        stream_env, monkeypatch):
+    chat_mod = stream_env
+    release = None
+
+    class Client:
+        async def receive_messages(self):
+            yield "scheduled-owned"
+            yield "ordinary"
+            await release.wait()
+
+    async def observer(_key, message):
+        return message == "scheduled-owned"
+
+    monkeypatch.setattr(chat_mod, "_observe_sdk_stream_message", observer)
+
+    async def run():
+        nonlocal release
+        release = asyncio.Event()
+        stream = chat_mod._SessionStream(
+            ("sid-observer-owned", "m", "auto", ""), Client())
+        queue = stream.attach_turn()
+        try:
+            assert await asyncio.wait_for(queue.get(), 1) == "ordinary"
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(queue.get(), 0.02)
+        finally:
+            await stream.aclose()
+
+    asyncio.run(run())
 
 
 def test_unpinned_watcher_is_retired_after_foreground_consumes_terminal(

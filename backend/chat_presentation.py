@@ -95,6 +95,8 @@ def usermsg_task_notification_text(
         for block in content:
             if isinstance(block, text_block_type):
                 parts.append(getattr(block, "text", "") or "")
+            elif isinstance(block, dict) and block.get("type") == "text":
+                parts.append(str(block.get("text") or ""))
             elif isinstance(block, str):
                 parts.append(block)
         text = "".join(parts)
@@ -310,6 +312,7 @@ def sdk_messages_to_ui(
         is_compact = sm.uuid in compact_uuids
         msg = sm.message or {}
         content = msg.get("content")
+        scheduled_trigger = bool(msg.get("_muselab_scheduled_trigger"))
         steering = msg.get("_muselab_steering")
         if isinstance(steering, dict):
             text = content if isinstance(content, str) else ""
@@ -372,6 +375,8 @@ def sdk_messages_to_ui(
             if not text:
                 continue
             entry = {"role": sm.type, "text": text, "uuid": sm.uuid}
+            if scheduled_trigger and sm.type == "user":
+                entry["_scheduledTrigger"] = True
             if is_compact:
                 entry["_is_compact_summary"] = True
             entry.update(ann)
@@ -393,6 +398,8 @@ def sdk_messages_to_ui(
                 image_refs = []
                 return
             entry = {"role": sm.type, "text": cleaned, "uuid": sm.uuid}
+            if scheduled_trigger and sm.type == "user":
+                entry["_scheduledTrigger"] = True
             if is_compact:
                 entry["_is_compact_summary"] = True
             if image_refs:
@@ -411,8 +418,12 @@ def sdk_messages_to_ui(
             elif block_type == "thinking":
                 flush_text()
                 thinking_text = block.get("thinking", "") or ""
-                if not thinking_text.strip() and block.get("signature"):
-                    thinking_text = "[已加密推理 · 仅 streaming 期间可见明文]"
+                # Claude may persist only the cryptographic signature after a
+                # turn. Plain thinking deltas were already visible live, but a
+                # signature is not user-facing content and must not become a
+                # repeated placeholder row on history reload.
+                if not thinking_text.strip():
+                    continue
                 out.append({"role": "thinking", "text": thinking_text,
                             "uuid": sm.uuid})
             elif block_type == "tool_use":
@@ -491,10 +502,13 @@ def sdk_messages_to_ui(
             ("elapsed_s", "elapsed"),
             ("model", "model"),
             ("turn_status", "turn_status"),
+            ("turn_id", "turn_id"),
             ("memory_recall", "memoryRecall"),
         ):
             value = ann.get(source)
-            if value is not None and (source not in {"model", "turn_status", "memory_recall"}
+            if value is not None and (source not in {
+                "model", "turn_status", "turn_id", "memory_recall",
+            }
                                       or value):
                 entry.setdefault(target, value)
         ann_images = ann.get("images")
@@ -694,19 +708,34 @@ def complete_turn_footer_metadata(
         memory_recall = last_value("memoryRecall")
         if memory_recall:
             tail["memoryRecall"] = memory_recall
+        terminal_reason = last_value("terminal_reason")
+        if terminal_reason:
+            tail["terminal_reason"] = terminal_reason
+        turn_origin = last_value("turn_origin")
+        if isinstance(turn_origin, dict):
+            tail["turn_origin"] = turn_origin
+        turn_id = str(last_value("turn_id") or "")
+        if turn_id:
+            tail["turn_id"] = turn_id
+        model_usage = last_value("model_usage")
+        if isinstance(model_usage, dict):
+            tail["model_usage"] = model_usage
 
 
 def broadcast_to_ui_messages(broadcast: Any) -> list[dict]:
     out: list[dict] = []
     if broadcast.user_text or broadcast.user_images or broadcast.user_docs:
-        out.append({
+        user_entry = {
             "role": "user",
             "text": broadcast.user_text,
             "images": broadcast.user_images,
             "docs": broadcast.user_docs,
             "_turnId": broadcast.turn_id,
             "_turnRoot": True,
-        })
+        }
+        if getattr(broadcast, "is_scheduled_delivery", False):
+            user_entry["_scheduledTrigger"] = True
+        out.append(user_entry)
     current_text: dict | None = None
     current_thinking: dict | None = None
     steering_users: set[str] = set()
@@ -737,7 +766,8 @@ def broadcast_to_ui_messages(broadcast: Any) -> list[dict]:
             chunk = data.get("text", "")
             if current_text is None:
                 current_text = {"role": "assistant", "text": chunk,
-                                "model": broadcast.model}
+                                "model": broadcast.model,
+                                "turn_id": broadcast.turn_id}
                 out.append(current_text)
             else:
                 current_text["text"] += chunk
@@ -832,6 +862,7 @@ def broadcast_to_ui_messages(broadcast: Any) -> list[dict]:
                     summary_truncated=data.get("summary_truncated"),
                 ),
                 output_file=data.get("output_file") or "",
+                usage=data.get("usage") or {},
             )
         elif kind == "ask_user_question":
             close_segment()
@@ -873,4 +904,6 @@ def broadcast_to_ui_messages(broadcast: Any) -> list[dict]:
                 "_decisionAcknowledged": True,
                 "failure_message": "",
             })
+    if out:
+        out[-1].setdefault("turn_id", broadcast.turn_id)
     return out

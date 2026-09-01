@@ -263,21 +263,45 @@ def raw_msg_from_entry(
         prompt = attachment.get("prompt")
         if not isinstance(prompt, str) or not prompt.strip():
             return None
+        # Claude persists both genuine human steering and internal background
+        # task notifications as ``queued_command`` attachments.  Only the
+        # former is a user-authored message.  Treating the latter as steering
+        # leaks the raw <task-notification> protocol into a user bubble and
+        # splits the surrounding assistant turn, which can make the final
+        # Muse response look as if it disappeared.  Keep notification records
+        # in the canonical chain (the history/index renderer consumes them to
+        # update the owning tool card), but do not mark them as human UI.
+        is_task_notification = (
+            attachment.get("commandMode") == "task-notification"
+            or prompt.lstrip().startswith("<task-notification>")
+        )
         source_uuid = str(attachment.get("source_uuid") or "")
-        message_uuid = source_uuid or record_uuid
+        message_uuid = (
+            record_uuid if is_task_notification else source_uuid or record_uuid
+        )
         if not message_uuid:
             return None
         message_type = "user"
-        message = {
-            "role": "user",
-            "content": prompt,
-            "_muselab_steering": {
+        message = {"role": "user", "content": prompt}
+        if not is_task_notification:
+            message["_muselab_steering"] = {
                 "record_uuid": record_uuid,
                 "source_uuid": message_uuid,
-            },
-        }
+            }
     elif record_type not in {"user", "assistant"} or not message_uuid:
         return None
+
+    origin = entry.get("origin")
+    if not isinstance(origin, dict) and isinstance(message, dict):
+        origin = message.get("origin")
+    if (
+        message_type == "user"
+        and isinstance(origin, dict)
+        and origin.get("kind") == "task-notification"
+        and origin.get("subkind") == "scheduled-trigger"
+    ):
+        message = dict(message)
+        message["_muselab_scheduled_trigger"] = True
 
     return raw_msg_type(
         message_uuid,

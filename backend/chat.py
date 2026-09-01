@@ -38,11 +38,12 @@ from pydantic import BaseModel, Field
 from claude_agent_sdk import (
     ClaudeSDKClient, ClaudeAgentOptions,
     AssistantMessage, UserMessage, TextBlock, ThinkingBlock, ResultMessage,
+    ConversationResetMessage,
     ToolUseBlock, ToolResultBlock, StreamEvent,
     TaskStartedMessage, TaskProgressMessage, TaskNotificationMessage,
     TaskUpdatedMessage, TERMINAL_TASK_STATUSES,
     RateLimitEvent, SystemMessage,
-    ClaudeSDKError,
+    ClaudeSDKError, ResultError,
     ThinkingConfigEnabled, ThinkingConfigDisabled, ThinkingConfigAdaptive,
     EffortLevel,
     get_session_messages,
@@ -72,7 +73,11 @@ from . import chat_history
 from . import chat_presentation
 from . import chat_overlays
 from . import chat_runtime
+from . import chat_subagents
 from . import chat_successor
+from . import hook_settings
+from . import hook_traces
+from . import sdk_lifecycle
 from . import transcript_index as transcript_idx
 from .task_summaries import normalize_task_summary_fields
 from .imagegen_job_store import ImagegenJobStore
@@ -174,7 +179,9 @@ def _normalize_effort(effort: str | None) -> str:
     return value or "auto"
 
 
-def _muselab_gateway_headers(effort: str, service_tier: str) -> str:
+def _muselab_gateway_headers(
+    effort: str, service_tier: str, *, thinking: bool,
+) -> str:
     """Build Claude CLI's newline-delimited custom-header environment value.
 
     Values have already passed closed-set validation; keeping this helper
@@ -184,6 +191,8 @@ def _muselab_gateway_headers(effort: str, service_tier: str) -> str:
     lines = [f"X-MuseLab-Effort: {_normalize_effort(effort)}"]
     if service_tier == "fast":
         lines.append("X-MuseLab-Service-Tier: fast")
+    if thinking:
+        lines.append("X-MuseLab-Thinking: summarized")
     return "\n".join(lines)
 
 
@@ -1102,6 +1111,12 @@ class TurnBroadcast:
         # in-flight portion (the launching tool_use card lives there and the
         # task_notification needs to flip it). See `/active` + send({continuation}).
         self.is_continuation: bool = False
+        # SDK Cron prompts arrive as autonomous turns on the pooled stream.
+        # They use the normal replay/reconnect contract, but retain their own
+        # delivery class so tabs can show the same amber affordance as other
+        # unattended work and the UI can label the injected prompt correctly.
+        self.is_scheduled_delivery: bool = False
+        self.scheduled_delivery_consumed: bool = False
         # Once a reconnect subscriber has attached to a CONTINUATION broadcast
         # (live or grace-kept), flip this. `/active` then stops advertising it
         # so the frontend's 8s poller can't re-reconnect to the same finished
@@ -1174,6 +1189,8 @@ class TurnBroadcast:
         and active-state payload so the browser only auto-acknowledges work it
         was actually watching.
         """
+        if self.is_scheduled_delivery:
+            return "scheduled"
         if self.is_continuation:
             return "background"
         if self.queue_item_id:
@@ -1590,6 +1607,11 @@ _queue_drain_rekicks: set[str] = set()
 # freshly selected client. Mark rebuilds and consume them at the next safe SDK
 # boundary instead.
 _pending_runtime_rebuilds: set[str] = set()
+# Child session -> (source session, dropped user turn).  Presence means the
+# client's native truncating resume has connected but no user query has yet
+# crossed the SDK transport commit point.  The same UUID tuple is also stored
+# durably in sessions.py so a service restart can rebuild the intent.
+_native_retry_commits: dict[str, tuple[str, str]] = {}
 
 
 def _session_runtime_lock_for(session_id: str) -> asyncio.Lock:
@@ -1628,6 +1650,66 @@ _bg_task_pinned_at: dict[str, float] = {}
 # transcript counts after the verified compact result has already reached the
 # browser. Strong references prevent accidental mid-run garbage collection.
 _maintenance_tasks: set[asyncio.Task] = set()
+
+# ---------------------------------------------------------------------------
+# SDK-native scheduled tasks (CronCreate / CronDelete / CronList)
+# ---------------------------------------------------------------------------
+# Native schedules live inside the pooled Claude CLI process. They are neither
+# MuseLab's legacy scheduler nor durable application records: disconnecting the
+# owning runtime destroys them. Keep bounded control metadata in RAM, pin that
+# runtime against LRU eviction, and project the count to the session list. The
+# prompt hash identifies origin-less scheduled deliveries from current CLIs;
+# the bounded prompt copy powers the authenticated read-only GUI. Result bodies
+# are never cached here.
+_sdk_cron_jobs: dict[str, dict[str, dict[str, Any]]] = {}
+_sdk_cron_tool_calls: dict[
+    chat_runtime.ClientKey, dict[str, dict[str, Any]]
+] = {}
+_sdk_cron_state_lock = threading.RLock()
+_SDK_CRON_JOB_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+_SDK_CRON_CREATE_RESULT = re.compile(
+    r"Scheduled\s+(?:recurring|one-time)\s+job\s+([A-Za-z0-9_-]{1,128})",
+    re.IGNORECASE,
+)
+_SDK_CRON_DELETE_RESULT = re.compile(
+    r"Cancelled\s+job\s+([A-Za-z0-9_-]{1,128})",
+    re.IGNORECASE,
+)
+_SDK_CRON_LIST_LINE = re.compile(
+    r"^([A-Za-z0-9_-]{1,128})\s+[—-]\s+", re.MULTILINE,
+)
+_SDK_CRON_PROMPT_MAX = 4000
+_SDK_CRON_HISTORY_POLL_S = 0.5
+_SDK_CRON_HISTORY_TAIL_BYTES = 2 * 1024 * 1024
+_SDK_CRON_HISTORY_READ_BYTES = 2 * 1024 * 1024
+
+
+@dataclass
+class _ScheduledHistoryCursor:
+    """Per-mux cursor over one SDK-owned session transcript."""
+
+    file_identity: tuple[int, int] | None = None
+    offset: int = 0
+    partial: bytes = b""
+    pending: bool = False
+    initialized: bool = False
+
+
+@dataclass
+class _ScheduledDelivery:
+    key: chat_runtime.ClientKey
+    broadcast: TurnBroadcast
+    render_state: dict[str, Any]
+    pending_tasks: dict[str, dict[str, Any]] = dataclass_field(
+        default_factory=dict)
+    subagent_mux: Any = None
+    registration_task: asyncio.Task | None = None
+    job_id: str = ""
+
+
+_sdk_scheduled_deliveries: dict[
+    chat_runtime.ClientKey, _ScheduledDelivery
+] = {}
 # A hidden runtime owns the real Claude continuation after one of its
 # background tasks settles.  When that runtime has already rolled over, the
 # resulting assistant text is delivered to the newest visible successor as a
@@ -1895,6 +1977,13 @@ def _session_has_live_watcher(session_id: str) -> bool:
     return watcher is not None and not watcher.done()
 
 
+def _session_has_scheduled_delivery(session_id: str) -> bool:
+    return any(
+        key[0] == session_id and not delivery.broadcast.done
+        for key, delivery in _sdk_scheduled_deliveries.items()
+    )
+
+
 def _session_runtime_busy(session_id: str) -> bool:
     """One authoritative busy boundary for turns and detached task readers."""
     active = _active_turns.get(session_id)
@@ -1902,6 +1991,7 @@ def _session_runtime_busy(session_id: str) -> bool:
         (active is not None and not active.done)
         or _sessions_with_inflight_tasks.get(session_id)
         or _session_has_live_watcher(session_id)
+        or _session_has_scheduled_delivery(session_id)
     )
 
 
@@ -3171,6 +3261,13 @@ async def _build_and_connect_client(
     side_question_runtime = (
         sess_data.get("runtime_profile") == "side_question"
     )
+    retry_source_session_id = str(
+        sess_data.get("retry_source_session_id") or "")
+    retry_target_user_uuid = str(
+        sess_data.get("retry_target_user_uuid") or "")
+    retry_resume_session_at = str(
+        sess_data.get("retry_resume_session_at") or "")
+    native_retry_resume = bool(retry_source_session_id)
     effort = _normalize_effort(effort)
     service_tier = (service_tier or "").strip()
     if effort not in _VALID_EFFORT:
@@ -3222,6 +3319,49 @@ async def _build_and_connect_client(
             f"[muselab] jsonl_exists check failed "
             f"sid={obs.short_id(session_id)} exc={type(e).__name__}\n"
         )
+    if native_retry_resume and jsonl_exists:
+        # query() may have committed the child transcript immediately before a
+        # process crash, leaving only the metadata cleanup unfinished.  The
+        # child JSONL is canonical proof that the truncating resume already
+        # materialized; resume the child normally and consume the stale intent
+        # instead of trying to fork into an existing session id again.
+        await obs.to_thread_io(
+            "chat.retry_intent_reconcile",
+            session_id,
+            sess.clear_retry_intent,
+            session_id,
+            source_session_id=retry_source_session_id,
+            target_user_uuid=retry_target_user_uuid,
+            owned=True,
+        )
+        _native_retry_commits.pop(session_id, None)
+        native_retry_resume = False
+
+    if native_retry_resume:
+        retry_values = [
+            retry_source_session_id,
+            retry_target_user_uuid,
+            *([retry_resume_session_at] if retry_resume_session_at else []),
+        ]
+        try:
+            if any(str(uuid.UUID(value)) != value.lower()
+                   for value in retry_values):
+                raise ValueError
+        except (ValueError, AttributeError, TypeError):
+            raise ValueError("invalid durable SDK retry boundary") from None
+        session_binding = {
+            "resume": retry_source_session_id,
+            "session_id": session_id,
+            "fork_session": True,
+            "resume_drops_turn": retry_target_user_uuid,
+            **({"resume_session_at": retry_resume_session_at}
+               if retry_resume_session_at else {}),
+        }
+    else:
+        session_binding = (
+            {"resume": session_id} if jsonl_exists
+            else {"session_id": session_id}
+        )
     # Keep one privacy-safe line per stderr category and connected client.
     # Raw CLI output can contain prompts, paths, credentials and protocol bodies.
     _cli_stderr = _privacy_safe_cli_stderr_logger(
@@ -3253,7 +3393,7 @@ async def _build_and_connect_client(
         max_buffer_size=max_buf,
         stderr=_cli_stderr,
         # Block harness-only tools the SDK exposes by default. AskUserQuestion
-        # is intentionally kept: SDK 0.2.148 / CLI 2.1.251 correctly turns the
+        # is intentionally kept: SDK 0.2.149 / CLI 2.1.252 correctly turns the
         # browser-injected answers into a native tool_result in every supported
         # permission mode; permission_request.py owns that UI bridge.
         #
@@ -3268,11 +3408,16 @@ async def _build_and_connect_client(
         # maps to `--tools default` — identical to not passing tools at all, so
         # it adds no protection; an explicit allowlist inverts the failure mode
         # (new/renamed useful tools silently MISSING after a CLI bump).
+        #
+        # SDK 0.2.149 / bundled CLI 2.1.252 was probed on the production WSL
+        # route: CronCreate → CronList → CronDelete → CronList completed and
+        # cleaned up successfully; Bash(run_in_background) → Monitor also
+        # completed.  Those SDK-owned tools intentionally remain exposed and
+        # render through MuseLab's generic tool/lifecycle cards.
         disallowed_tools=[
             "ScheduleWakeup",         # /loop dynamic mode — Claude Code only
-            "CronCreate", "CronDelete", "CronList",
             "EnterWorktree", "ExitWorktree",
-            "Monitor", "PushNotification",
+            "PushNotification",
             # Claude CLI host features whose protocol is owned by a
             # Claude Code / claude.ai host. muselab has no matching design,
             # review-findings, remote-trigger, or teammate-message surface.
@@ -3302,12 +3447,19 @@ async def _build_and_connect_client(
         }],
         # Bind THIS session to muselab's chosen UUID — either as a new
         # session (session_id=) or by resuming the existing one (resume=).
-        **({"resume": session_id} if jsonl_exists else {"session_id": session_id}),
+        **session_binding,
         # Token-level streaming: SDK emits StreamEvent for each delta
         # the model produces (text / thinking). Without this, we only
         # see full blocks at the end → user waits for the whole reply
         # before seeing anything. With this, each token shows up.
         include_partial_messages=True,
+        # Receive CLI-owned Hook lifecycle messages. MuseLab persists only a
+        # privacy-bounded timing/status projection; raw hook output is dropped.
+        include_hook_events=True,
+        # Ask the SDK to forward complete Subagent sidechains.  They are
+        # separated from the parent transcript below using the SDK-owned
+        # parent_tool_use_id and exposed as a nested timeline in the GUI.
+        forward_subagent_text=True,
         # Recall runs in the SDK's dedicated UserPromptSubmit additional-context
         # channel. Never prepend it to client.query(prompt): that would persist
         # the memory block as if the user typed it, polluting JSONL history,
@@ -3428,6 +3580,10 @@ async def _build_and_connect_client(
     # works uniformly across providers — no router process needed.
     # Claude models still go direct so Pro OAuth keeps working.
     # DUCC is a CLI runtime, not an Anthropic-compatible endpoint override.
+    # Resolve the preference before building gateway headers. The marker lets
+    # CLIProxyAPI explicitly opt in to Responses reasoning summaries only for
+    # sessions whose UI thinking toggle is enabled.
+    thinking_pref = bool(sess_data.get("thinking", True))
     # Never inject MuseLab's provider URL/key/static custom header into it.
     env_ovr = None if is_ducc else endpoints.env_override(model)
     if env_ovr is not None:
@@ -3465,7 +3621,9 @@ async def _build_and_connect_client(
             # the translator's synthetic medium so the model catalog default
             # (Sol=low, others may differ) remains authoritative.
             env_ovr["ANTHROPIC_CUSTOM_HEADERS"] = (
-                _muselab_gateway_headers(effort, service_tier)
+                _muselab_gateway_headers(
+                    effort, service_tier, thinking=thinking_pref,
+                )
             )
             if effort == "ultra":
                 # Enforce the runtime boundary: no nested fan-out and at most
@@ -3592,20 +3750,26 @@ async def _build_and_connect_client(
     # the interleaved [thinking, tool_use, thinking, ...] shape that trips the
     # API can't form. Changing it invalidates the cached client (PATCH handler
     # calls disconnect_client) so the next turn rebuilds with this setting.
-    thinking_pref = bool(sess_data.get("thinking", True))
     supports_thinking = (
         endpoints.ducc_is_claude_model(model)
         if is_ducc
         else ((provider is None) or provider.supports_thinking)
     ) and thinking_pref
-    codex_effort_transport = (
-        _is_codex_gateway_model(model) and effort != "auto"
-    )
-    if codex_effort_transport:
-        # CLIProxyAPI only reads Claude's output_config.effort when thinking is
-        # adaptive/auto. This is transport plumbing, not a request to render a
-        # visible thinking block, hence display=omitted. The private header is
-        # still final authority (including Ultra's wire-level max mapping).
+    codex_gateway = _is_codex_gateway_model(model)
+    codex_effort_transport = codex_gateway and effort != "auto"
+    if codex_gateway and thinking_pref:
+        # Keep the Gateway on the SDK's native adaptive-thinking contract and
+        # request its user-visible summary stream. ``display=omitted`` leaves
+        # only encrypted/signature reasoning in the transcript and therefore
+        # makes MuseLab's live thinking surface completely empty. Adaptive is
+        # also valid for ``auto`` effort, where the model catalog remains the
+        # authority for reasoning depth.
+        opts_kwargs["thinking"] = ThinkingConfigAdaptive(
+            type="adaptive", display="summarized")
+    elif codex_effort_transport:
+        # An explicit effort still travels through output_config when the user
+        # has opted out of visible thinking. Preserve that transport contract
+        # while keeping the presentation disabled.
         opts_kwargs["thinking"] = ThinkingConfigAdaptive(
             type="adaptive", display="omitted")
     elif supports_thinking:
@@ -3673,6 +3837,11 @@ async def _build_and_connect_client(
                 )
                 sys.stderr.flush()
             raise
+        if native_retry_resume:
+            _native_retry_commits[session_id] = (
+                retry_source_session_id,
+                retry_target_user_uuid,
+            )
         return client
     except Exception as e:
         # Two failure modes we recover from by swapping session_id ⇔ resume:
@@ -3686,6 +3855,11 @@ async def _build_and_connect_client(
         # swapping there just spawns a second doomed CLI subprocess and
         # buries the real cause behind a misleading "already in use" retry
         # loop. Re-raise anything that isn't a genuine session conflict.
+        if native_retry_resume:
+            # Truncating resume is guarded specifically so an unexpected tail
+            # can never be discarded.  Swapping it to an ordinary create or
+            # resume would silently bypass that safety contract.
+            raise
         err_text = str(e).lower()
         _is_session_conflict = (
             "already in use" in err_text
@@ -4043,11 +4217,24 @@ async def shutdown_runtime() -> None:
 
     # Stop detached task watchers and active turn pumps before tearing down the
     # shared SDK streams they consume.
-    active_broadcasts = tuple(_active_turns.values())
+    scheduled_deliveries = tuple(_sdk_scheduled_deliveries.values())
+    active_broadcasts = tuple({
+        id(broadcast): broadcast
+        for broadcast in (
+            *tuple(_active_turns.values()),
+            *(delivery.broadcast for delivery in scheduled_deliveries),
+        )
+    }.values())
     tasks: set[asyncio.Task] = {
         task for task in _task_watchers.values() if not task.done()
     }
     tasks.update(task for task in _maintenance_tasks if not task.done())
+    tasks.update(
+        delivery.registration_task
+        for delivery in scheduled_deliveries
+        if delivery.registration_task is not None
+        and not delivery.registration_task.done()
+    )
     protected_cleanup_tasks: set[asyncio.Task] = {
         task for task in _session_purge_tasks.values() if not task.done()
     }
@@ -4112,12 +4299,20 @@ async def shutdown_runtime() -> None:
     }.values()
     for broadcast in broadcasts:
         broadcast.close()
+    for delivery in scheduled_deliveries:
+        if delivery.broadcast.activity_started:
+            await _finish_activity(
+                delivery.key[0], delivery.broadcast, "cancelled")
     for handle in _recent_turn_expiry_handles.values():
         handle.cancel()
     _recent_turn_expiry_handles.clear()
     _recent_turns.clear()
 
     _active_turns.clear()
+    _sdk_scheduled_deliveries.clear()
+    with _sdk_cron_state_lock:
+        _sdk_cron_jobs.clear()
+        _sdk_cron_tool_calls.clear()
     _sessions_with_inflight_tasks.clear()
     _bg_task_pinned_at.clear()
     _task_watchers.clear()
@@ -4126,6 +4321,7 @@ async def shutdown_runtime() -> None:
     _queue_drain_retry_tasks.clear()
     _queue_drain_rekicks.clear()
     _queue_drain_locks.clear()
+    _native_retry_commits.clear()
 
     async def _join_protected_cleanup() -> None:
         if not protected_cleanup_tasks:
@@ -4953,6 +5149,13 @@ def list_sessions_api(
         sid for sid, task_ids in _sessions_with_inflight_tasks.items()
         if task_ids
     }
+    with _sdk_cron_state_lock:
+        scheduled_counts = {
+            sid: len(jobs)
+            for sid, jobs in _sdk_cron_jobs.items()
+            if jobs
+        }
+    scheduled_active_sids = set(scheduled_counts)
     active_sids = turn_active_sids | background_active_sids
     # Copy each dict (never mutate the shared list_sessions() cache) + add the
     # live `active` flag. Only the returned subset is processed now, not all N.
@@ -4962,6 +5165,8 @@ def list_sessions_api(
         s["active"] = s.get("id") in active_sids
         s["turn_active"] = s.get("id") in turn_active_sids
         s["background_active"] = s.get("id") in background_active_sids
+        s["scheduled_active"] = s.get("id") in scheduled_active_sids
+        s["scheduled_count"] = scheduled_counts.get(s.get("id"), 0)
         sessions.append(s)
     # Piggy-back orphan-attachments GC here — runs at most hourly. Cheaper
     # than a cron, and naturally fires whenever the UI is in use.
@@ -4997,6 +5202,7 @@ def list_sessions_api(
         str(workspace_root) if workspace_only else "",
         frozenset(turn_active_sids),
         frozenset(background_active_sids),
+        tuple(sorted(scheduled_counts.items())),
     )
     _hit = _LIST_ETAG_CACHE.get("v")
     if _hit is not None and _hit[0] == _etag_key:
@@ -5764,6 +5970,10 @@ def _indexed_ui_records(
                 ("elapsed_s", "elapsed"),
                 ("model", "model"),
                 ("turn_status", "turn_status"),
+                ("terminal_reason", "terminal_reason"),
+                ("turn_origin", "turn_origin"),
+                ("turn_id", "turn_id"),
+                ("model_usage", "model_usage"),
                 ("memory_recall", "memoryRecall"),
             ):
                 value = ann.get(source)
@@ -6169,6 +6379,7 @@ class _TurnResponseBoundary:
     def __init__(self, existing_uuids: frozenset[str] | set[str]):
         self.existing_uuids = frozenset(existing_uuids)
         self.saw_current_payload = False
+        self.nonhuman_origin_active = False
 
     def classify(self, msg: Any) -> str:
         """Return ``forward``, ``current_result``, ``drop`` or ``stale_result``.
@@ -6191,7 +6402,24 @@ class _TurnResponseBoundary:
         if uid and uid in self.existing_uuids:
             return "stale_result" if isinstance(msg, ResultMessage) else "drop"
 
+        origin = sdk_lifecycle.normalize_origin(getattr(msg, "origin", None))
+        if isinstance(msg, UserMessage) and origin is not None:
+            self.nonhuman_origin_active = origin["kind"] != "human"
+            if self.nonhuman_origin_active:
+                return "background"
+        if self.nonhuman_origin_active:
+            if isinstance(msg, ResultMessage):
+                self.nonhuman_origin_active = False
+                return "background_result"
+            return "background"
+
         if isinstance(msg, ResultMessage):
+            # ``origin=None`` is the current SDK shape for an ordinary
+            # client.query(prompt); preserve that compatibility. Any explicit
+            # non-human/future origin belongs to a side delivery and cannot
+            # close the human turn currently occupying this pooled stream.
+            if origin is not None and origin["kind"] != "human":
+                return "background_result"
             if bool(getattr(msg, "is_error", False)):
                 self.saw_current_payload = True
                 return "current_result"
@@ -6205,6 +6433,75 @@ class _TurnResponseBoundary:
 
         self.saw_current_payload = True
         return "forward"
+
+
+@router.get(
+    "/sessions/{sid}/subagents",
+    dependencies=[Depends(require_token)],
+)
+async def get_session_subagents_api(sid: str) -> dict:
+    """Return the SDK-owned nested transcript for every Subagent.
+
+    The top-level SDK APIs are the source of truth.  MuseLab only shapes their
+    records for rendering and never scans Claude's private files directly.
+    """
+    meta = await obs.to_thread_io(
+        "chat.subagents_session_read",
+        sid,
+        sess.get_session_meta,
+        sid,
+    )
+    if meta is None:
+        raise HTTPException(404, "session not found")
+    workspace = await obs.to_thread_io(
+        "chat.subagents_workspace_read",
+        sid,
+        sess.session_workspace,
+        sid,
+    )
+    model = str(meta.get("model") or "")
+
+    def _load() -> list[dict[str, Any]]:
+        with _session_config_dir(model, sid=sid):
+            return chat_subagents.load_subagent_threads(
+                sid,
+                directory=str(workspace),
+            )
+
+    threads = await obs.to_thread_io(
+        "chat.subagents_history_read",
+        sid,
+        _load,
+    )
+    return {"session_id": sid, "threads": threads}
+
+
+@router.get(
+    "/sessions/{sid}/hook-traces",
+    dependencies=[Depends(require_token)],
+)
+async def get_session_hook_traces_api(
+    sid: str,
+    turn_id: str = Query("", max_length=128),
+) -> dict:
+    if await obs.to_thread_io(
+        "chat.hook_traces_session_read",
+        sid,
+        sess.get_session_meta,
+        sid,
+    ) is None:
+        raise HTTPException(404, "session not found")
+    try:
+        traces = await obs.to_thread_io(
+            "chat.hook_traces_read",
+            sid,
+            hook_traces.list_traces,
+            sid,
+            turn_id=turn_id,
+        )
+    except (UnsafePrivatePath, ValueError) as exc:
+        raise HTTPException(409, "hook trace storage is unavailable") from exc
+    return {"session_id": sid, "traces": traces}
 
 
 @router.get("/sessions/{sid}", dependencies=[Depends(require_token)])
@@ -6649,8 +6946,12 @@ def _schedule_runtime_continuation_delivery(source_sid: str, event_id: str) -> a
 async def recover_runtime_continuation_outboxes_at_startup() -> int:
     return await chat_overlays.recover_runtime_continuation_outboxes_at_startup()
 
-def _runtime_continuation_projection_state(sid: str) -> tuple[bool, str]:
-    return chat_overlays._runtime_continuation_projection_state(sid)
+def _runtime_continuation_projection_state(
+    sid: str, *, runtime_lineage: list[str] | None = None,
+) -> tuple[bool, str]:
+    return chat_overlays._runtime_continuation_projection_state(
+        sid, runtime_lineage=runtime_lineage,
+    )
 
 def _delete_cancelled_turn_snapshots(sid: str) -> None:
     return chat_overlays._delete_cancelled_turn_snapshots(sid)
@@ -6679,12 +6980,12 @@ def _persist_cancelled_footer_annotation_locked(bc: 'TurnBroadcast', now_ms: int
 def _persist_cancelled_turn_snapshot_locked(bc: 'TurnBroadcast') -> bool:
     return chat_overlays._persist_cancelled_turn_snapshot_locked(bc)
 
-def _persist_completed_result_snapshot(bc: 'TurnBroadcast', result_text: str, *, terminal_at_ms: int, elapsed_s: float | None=None, memory_recall: dict | None=None) -> bool:
-    return chat_overlays._persist_completed_result_snapshot(bc, result_text, terminal_at_ms=terminal_at_ms, elapsed_s=elapsed_s, memory_recall=memory_recall)
+def _persist_completed_result_snapshot(bc: 'TurnBroadcast', result_text: str, *, terminal_at_ms: int, elapsed_s: float | None=None, memory_recall: dict | None=None, terminal_reason: str='', turn_origin: dict | None=None, turn_id: str='', model_usage: dict | None=None) -> bool:
+    return chat_overlays._persist_completed_result_snapshot(bc, result_text, terminal_at_ms=terminal_at_ms, elapsed_s=elapsed_s, memory_recall=memory_recall, terminal_reason=terminal_reason, turn_origin=turn_origin, turn_id=turn_id, model_usage=model_usage)
 
 
-def _persist_failed_turn_snapshot(bc: 'TurnBroadcast', error_text: str, *, terminal_at_ms: int | None=None, elapsed_s: float | None=None, memory_recall: dict | None=None, canonical_terminal_published: bool=False) -> bool:
-    return chat_overlays._persist_failed_turn_snapshot(bc, error_text, terminal_at_ms=terminal_at_ms, elapsed_s=elapsed_s, memory_recall=memory_recall, canonical_terminal_published=canonical_terminal_published)
+def _persist_failed_turn_snapshot(bc: 'TurnBroadcast', error_text: str, *, terminal_at_ms: int | None=None, elapsed_s: float | None=None, memory_recall: dict | None=None, canonical_terminal_published: bool=False, terminal_status: str='failed', terminal_reason: str='', turn_origin: dict | None=None, turn_id: str='', model_usage: dict | None=None) -> bool:
+    return chat_overlays._persist_failed_turn_snapshot(bc, error_text, terminal_at_ms=terminal_at_ms, elapsed_s=elapsed_s, memory_recall=memory_recall, canonical_terminal_published=canonical_terminal_published, terminal_status=terminal_status, terminal_reason=terminal_reason, turn_origin=turn_origin, turn_id=turn_id, model_usage=model_usage)
 
 def _recover_interrupted_turn_snapshot(sid: str) -> bool:
     return chat_overlays._recover_interrupted_turn_snapshot(sid)
@@ -6920,6 +7221,7 @@ def _clear_session_runtime_state(sid: str) -> list[asyncio.Task]:
     cancelled_tasks: list[asyncio.Task] = []
     perm.clear_session_permissions(sid)
     _pending_runtime_rebuilds.discard(sid)
+    _native_retry_commits.pop(sid, None)
     runtime_lock = _session_runtime_locks.get(sid)
     if runtime_lock is not None and not runtime_lock.locked():
         _session_runtime_locks.pop(sid, None)
@@ -7055,6 +7357,7 @@ def _purge_session_storage_disk_locked(sid: str) -> bool:
     _delete_active_turn_sidecar(sid)
     _delete_cancelled_turn_snapshots(sid)
     _delete_runtime_continuation_outboxes(sid)
+    hook_traces.purge(sid)
     return removed
 
 
@@ -7544,6 +7847,7 @@ def _admitted_steering_turn(
         or not turn_id
         or bc.turn_id != turn_id
         or bc.is_continuation
+        or bc.is_scheduled_delivery
         or bool(bc.queue_item_id)
         or bc.result_forwarded
         or bc.steering_closed
@@ -9707,6 +10011,24 @@ def _sdk_system_error(msg: Any) -> dict | None:
 
 
 def _sdk_result_error(msg: Any) -> dict | None:
+    if isinstance(msg, ResultError):
+        structured = sdk_lifecycle.result_error_info(msg)
+        if structured is None:
+            return None
+        parts = _dedupe_error_parts([
+            *structured["errors"],
+            structured["result"],
+            structured["subtype"],
+        ])
+        status = structured["api_error_status"]
+        if not parts and status:
+            parts = [f"API error {status}"]
+        return {
+            "message": "; ".join(parts) or "SDK command failed",
+            "source": "result_exception",
+            "api_error_status": status,
+            "result_error": structured,
+        }
     if not bool(getattr(msg, "is_error", False)):
         return None
     errors = getattr(msg, "errors", None) or []
@@ -10051,6 +10373,89 @@ async def _run_sdk_command_checked(client: ClaudeSDKClient, command: str) -> Res
     return result
 
 
+async def _run_sdk_reset_checked(
+    client: ClaudeSDKClient,
+    source_sid: str,
+) -> tuple[ConversationResetMessage, ResultMessage]:
+    """Run SDK-native ``/clear`` and require its two-part handoff contract.
+
+    ``ConversationResetMessage.new_conversation_id`` is an opaque conversation
+    marker, not the SDK session id MuseLab can resume.  The immediately
+    following ``ResultMessage.session_id`` is the only authoritative new id.
+    Read through the sole pooled stream just like ``_run_sdk_command_checked``
+    so a control command cannot race the session pump.
+    """
+    reset: ConversationResetMessage | None = None
+    result: ResultMessage | None = None
+    errors: list[dict] = []
+
+    def _note(msg: Any) -> bool:
+        nonlocal reset, result
+        if isinstance(msg, ConversationResetMessage):
+            reset = msg
+            return False
+        if isinstance(msg, AssistantMessage):
+            if info := _sdk_assistant_error(msg):
+                errors.append(info)
+        elif isinstance(msg, SystemMessage):
+            if info := _sdk_system_error(msg):
+                errors.append(info)
+        if isinstance(msg, ResultMessage):
+            result = msg
+            if info := _sdk_result_error(msg):
+                errors.append(info)
+            return True
+        return False
+
+    stream = _stream_for(client)
+    if stream is not None:
+        queue = stream.attach_turn()
+        try:
+            await client.query("/clear")
+            while True:
+                message = await queue.get()
+                if message is _STREAM_EOF:
+                    break
+                if _note(message):
+                    break
+        finally:
+            stream.detach_turn(queue)
+            stream.park_unconsumed(queue)
+    else:
+        await client.query("/clear")
+        async for message in client.receive_response():
+            if _note(message):
+                break
+
+    if reset is None:
+        errors.append({
+            "message": "/clear ended without a ConversationResetMessage",
+            "source": "reset_contract",
+            "api_error_status": None,
+        })
+    if result is None:
+        errors.append({
+            "message": "/clear ended without a ResultMessage",
+            "source": "reset_contract",
+            "api_error_status": None,
+        })
+    new_sid = str(getattr(result, "session_id", "") or "")
+    try:
+        parsed = uuid.UUID(new_sid)
+    except (ValueError, AttributeError, TypeError):
+        parsed = None
+    if parsed is None or str(parsed) != new_sid.lower() or new_sid == source_sid:
+        errors.append({
+            "message": "/clear returned an invalid replacement session id",
+            "source": "reset_contract",
+            "api_error_status": None,
+        })
+    if merged := _merge_sdk_errors(errors):
+        raise _SDKCommandError(merged)
+    assert reset is not None and result is not None
+    return reset, result
+
+
 @router.get("/context-breakdown/{session_id}", dependencies=[Depends(require_token)])
 async def context_breakdown(session_id: str, model: str = "") -> dict:
     """Detailed context breakdown via SDK — answers "where did my 100K go?".
@@ -10130,6 +10535,117 @@ async def context_breakdown(session_id: str, model: str = "") -> dict:
             f"exc={type(e).__name__}\n")
         sys.stderr.flush()
         raise HTTPException(500, "context-usage probe failed") from None
+
+
+@router.post("/sessions/{sid}/native-clear", dependencies=[Depends(require_token)])
+async def native_clear_session_api(sid: str) -> dict:
+    """Reset context through the SDK while preserving the source conversation.
+
+    Claude turns ``/clear`` into a new SDK session.  MuseLab registers that
+    authoritative Result session as a normal resumable conversation and leaves
+    the source transcript untouched, so reset is no longer a destructive
+    delete disguised as a familiar CLI command.
+    """
+    source = await obs.to_thread_io(
+        "chat.session_read", sid, sess.get_session_meta, sid)
+    if source is None:
+        raise HTTPException(404, "session not found")
+    if sess.session_is_deleting(sid):
+        raise HTTPException(409, "session is being deleted")
+
+    def _assert_idle() -> None:
+        active = _active_turns.get(sid)
+        if active is not None and not active.done:
+            raise HTTPException(409, "cannot clear while a turn is active")
+        if (_sessions_with_inflight_tasks.get(sid)
+                or _session_has_live_watcher(sid)):
+            raise HTTPException(
+                409, "cannot clear while a background task owns the session")
+        overlays = sess.get_authoritative_runtime_task_overlays(sid)
+        if any(str(row.get("state") or "") == "running"
+               for row in overlays.values() if isinstance(row, dict)):
+            raise HTTPException(
+                409, "cannot clear while a background task owns the session")
+
+    _assert_idle()
+    queue_snapshot = await obs.to_thread_io(
+        "chat.queue_read", sid, sess.get_queue, sid)
+    if queue_snapshot.get("items") or queue_snapshot.get("inflight"):
+        raise HTTPException(409, "cannot clear while queued messages remain")
+
+    model = str(source.get("model") or MODEL).strip()
+    effort = _normalize_effort(source.get("effort"))
+    service_tier = str(source.get("service_tier") or "").strip()
+    permission = str(source.get("permission") or "default")
+    client_kwargs: dict[str, Any] = {
+        "effort": effort,
+        "service_tier": service_tier,
+    }
+    if permission == "plan":
+        client_kwargs["plan_return_permission"] = (
+            source.get("plan_return_permission") or "default")
+
+    timeout_s = env_int("MUSELAB_CLEAR_TIMEOUT_S", 120, min_value=1)
+    try:
+        async with asyncio.timeout(timeout_s):
+            async with _session_runtime_lock_for(sid):
+                _assert_idle()
+                latest_queue = await obs.to_thread_io(
+                    "chat.queue_read", sid, sess.get_queue, sid)
+                if latest_queue.get("items") or latest_queue.get("inflight"):
+                    raise HTTPException(
+                        409, "cannot clear while queued messages remain")
+                client = await get_client(
+                    sid, model, permission, **client_kwargs)
+                _reset, result = await _run_sdk_reset_checked(client, sid)
+                new_sid = str(result.session_id)
+                new_meta = await obs.to_thread_io(
+                    "chat.session_register",
+                    new_sid,
+                    sess.register_session,
+                    new_sid,
+                    name=str(source.get("name") or ""),
+                    model=model,
+                    permission=permission,
+                    plan_return_permission=source.get(
+                        "plan_return_permission"),
+                    auto_named=bool(source.get("auto_named", False)),
+                    effort=effort,
+                    service_tier=service_tier,
+                    thinking=source.get("thinking") is not False,
+                    activity_hidden=bool(
+                        source.get("activity_hidden", False)),
+                    runtime_profile=str(source.get("runtime_profile") or ""),
+                    cwd=source.get("cwd") or str(ROOT),
+                )
+                # The pooled process is indexed by the old id but now owns the
+                # new Claude conversation.  It must never be reused under that
+                # stale key, even if the browser keeps the old tab open.
+                _pending_runtime_rebuilds.add(sid)
+                await disconnect_client(sid)
+    except HTTPException:
+        raise
+    except asyncio.TimeoutError:
+        _pending_runtime_rebuilds.add(sid)
+        await disconnect_client(sid)
+        raise HTTPException(504, "native /clear timed out") from None
+    except _SDKCommandError as exc:
+        _pending_runtime_rebuilds.add(sid)
+        await disconnect_client(sid)
+        status = int(exc.info.get("api_error_status") or 502)
+        if status < 400 or status > 599:
+            status = 502
+        raise HTTPException(status, str(exc)) from None
+    except Exception as exc:
+        _pending_runtime_rebuilds.add(sid)
+        with suppress(Exception):
+            await disconnect_client(sid)
+        sys.stderr.write(
+            f"[chat] native /clear failed sid={sid[:8]} "
+            f"exc={type(exc).__name__}\n")
+        sys.stderr.flush()
+        raise HTTPException(500, "native /clear failed") from None
+    return {**new_meta, "session_id": new_sid, "reset_from": sid}
 
 
 @router.post("/sessions/{sid}/native-compact", dependencies=[Depends(require_token)])
@@ -10478,6 +10994,179 @@ class ForkReq(BaseModel):
     title: str | None = None
     activity_hidden: bool = False
     runtime_profile: Literal["", "side_question"] = ""
+
+
+class RetryLastTurnReq(BaseModel):
+    user_message_id: str = Field(min_length=1, max_length=128)
+
+
+def _retry_prompt_text(message: Any) -> str:
+    """Return an exact text-only SDK user payload or fail closed.
+
+    Replaying a vision/document turn without its binary blocks would look
+    successful while asking a materially different question.  MuseLab keeps
+    that case unavailable until the SDK exposes a native attachment replay
+    handle; no prompt or attachment bytes are copied into retry metadata.
+    """
+    raw = getattr(message, "message", None)
+    content = raw.get("content") if isinstance(raw, dict) else None
+    if isinstance(content, str):
+        if content.strip() and not _is_cli_interrupt_message(content):
+            return content
+        raise HTTPException(409, "the last user turn has no retryable text")
+    if not isinstance(content, list) or not content:
+        raise HTTPException(409, "the last user turn has no retryable text")
+    text_parts: list[str] = []
+    for block in content:
+        if not isinstance(block, dict) or block.get("type") != "text":
+            raise HTTPException(
+                409, "attachment turns cannot be retried without re-attaching")
+        text = block.get("text")
+        if not isinstance(text, str):
+            raise HTTPException(409, "the last user turn has invalid text")
+        text_parts.append(text)
+    prompt = "".join(text_parts)
+    if not prompt.strip() or _is_cli_interrupt_message(prompt):
+        raise HTTPException(409, "the last user turn has no retryable text")
+    return prompt
+
+
+def _create_last_turn_retry_child(
+    sid: str,
+    user_message_id: str,
+) -> dict:
+    """Validate canonical tail history and persist one SDK-native retry fork."""
+    with sess.session_lifecycle_lock(sid):
+        if sess.session_is_deleting(sid):
+            raise HTTPException(404, "session not found")
+        source = sess.get_session_meta(sid)
+        if source is None:
+            raise HTTPException(404, "session not found")
+        queue = sess.get_queue(sid)
+        if (queue.get("items") or queue.get("inflight")):
+            raise HTTPException(409, "cannot retry while messages are queued")
+
+        source_model = str(source.get("model") or MODEL)
+        try:
+            messages = _get_session_msgs(sid, source_model)
+        except Exception as exc:
+            sys.stderr.write(
+                f"[chat] retry history read failed sid={sid[:8]} "
+                f"exc={type(exc).__name__}\n"
+            )
+            sys.stderr.flush()
+            raise HTTPException(409, "canonical session history is unavailable") from None
+
+        real_users = [
+            (index, item)
+            for index, item in enumerate(messages)
+            if _is_real_user_prompt(item)
+        ]
+        if not real_users:
+            raise HTTPException(409, "session has no retryable user turn")
+        target_index, target = real_users[-1]
+        if str(getattr(target, "uuid", "")) != user_message_id:
+            raise HTTPException(409, "only the latest user turn can be retried")
+        prompt = _retry_prompt_text(target)
+
+        resume_at = ""
+        if target_index > 0:
+            resume_at = str(getattr(messages[target_index - 1], "uuid", ""))
+            if _canonical_uuid_component(resume_at) is None:
+                raise HTTPException(409, "safe retry boundary is unavailable")
+
+        source_name = str(source.get("name") or "会话").strip()
+        suffix = "重试" if is_chinese_locale() else "Retry"
+        child_name = f"{source_name} · {suffix}"
+        register_kwargs = {
+            "name": child_name,
+            "model": source_model,
+            "permission": _validate_permission(
+                str(source.get("permission") or "")),
+            "plan_return_permission": source.get("plan_return_permission"),
+            "auto_named": False,
+            "message_count": target_index,
+            "turn_count": sum(
+                1 for item in messages[:target_index]
+                if _is_real_user_prompt(item)
+            ),
+            "effort": _normalize_effort(source.get("effort")),
+            "service_tier": str(source.get("service_tier") or ""),
+            "thinking": source.get("thinking") is not False,
+            "forked_from": sid,
+            "forked_from_name": source_name,
+            "forked_from_message_id": resume_at,
+            "activity_hidden": bool(source.get("activity_hidden")),
+            "runtime_profile": str(source.get("runtime_profile") or ""),
+            "cwd": source.get("cwd") or str(ROOT),
+        }
+        try:
+            if resume_at:
+                def _fork_retry():
+                    with _session_config_dir(source_model, sid=sid):
+                        return sdk_fork_session(
+                            sid,
+                            directory=str(sess.session_workspace(sid)),
+                            up_to_message_id=resume_at,
+                            title=child_name,
+                        )
+
+                lifecycle = _commit_fork_lifecycle(
+                    sid,
+                    source,
+                    fork_child=_fork_retry,
+                    register_kwargs=register_kwargs,
+                    successor=False,
+                )
+                child_sid = str(lifecycle["child_sid"])
+                child = lifecycle["child_meta"]
+            else:
+                child_sid = str(uuid.uuid4())
+                child = sess.register_session(
+                    child_sid,
+                    **register_kwargs,
+                )
+        except FileNotFoundError:
+            raise HTTPException(409, "source transcript is unavailable") from None
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from None
+        except HTTPException:
+            raise
+        except Exception as exc:
+            sys.stderr.write(
+                f"[chat] retry fork failed sid={sid[:8]} "
+                f"exc={type(exc).__name__}\n"
+            )
+            sys.stderr.flush()
+            raise HTTPException(500, "retry fork failed — see server log") from None
+    return {
+        **child,
+        "session_id": child_sid,
+        "source_session_id": sid,
+        "target_user_message_id": user_message_id,
+        "prompt": prompt,
+        "retry_mode": "native_fork" if resume_at else "fresh",
+    }
+
+
+@router.post("/sessions/{sid}/retry-last-turn",
+             dependencies=[Depends(require_token)])
+async def retry_last_turn_api(sid: str, req: RetryLastTurnReq) -> dict:
+    target = _canonical_uuid_component(req.user_message_id)
+    if target is None:
+        raise HTTPException(400, "invalid user message id")
+    if _session_runtime_busy(sid):
+        raise HTTPException(409, "cannot retry while the session is active")
+    drain = _queue_drain_tasks.get(sid)
+    if drain is not None and not drain.done():
+        raise HTTPException(409, "cannot retry while the queue is advancing")
+    return await obs.to_thread_io(
+        "chat.retry_child_create",
+        sid,
+        _create_last_turn_retry_child,
+        sid,
+        target,
+    )
 
 
 @router.post("/sessions/{sid}/fork", dependencies=[Depends(require_token)])
@@ -11371,6 +12060,13 @@ def _error_event(err: Any, *, activity_source: str = "") -> dict:
     same shape regardless of which yield-error branch fired."""
     msg = str(err) if err is not None else ""
     payload = {"error": msg, **_classify_stream_error(msg)}
+    if isinstance(err, ResultError):
+        info = sdk_lifecycle.result_error_info(err)
+        if info is not None:
+            payload["result_error"] = info
+            payload["terminal_reason"] = info["terminal_reason"]
+            payload["status"] = sdk_lifecycle.terminal_status(
+                info["terminal_reason"], is_error=True)
     if isinstance(err, _ContextRecovered):
         # Only public session metadata and aggregate counts cross the SSE
         # boundary.  The synthetic summary, source path and original prompt
@@ -13725,6 +14421,7 @@ async def _watch_inflight_tasks(
     watch_error_kind = "none"
     cont: TurnBroadcast | None = None
     cont_state: dict | None = None
+    subagent_mux = chat_subagents.SubagentStreamMux(session_id)
     watcher_failed = False
     watcher_cancelled = False
     # The continuation is a real assistant turn for display/accounting even
@@ -13888,6 +14585,7 @@ async def _watch_inflight_tasks(
                     model=b.model,
                     ts=completed_at_ms,
                     turn_status=terminal_status,
+                    turn_id=b.turn_id,
                     elapsed_s=cont_elapsed if cont_elapsed >= 1 else None,
                     file_path=sess._sidecar_path(session_id),
                 )
@@ -14177,6 +14875,15 @@ async def _watch_inflight_tasks(
                 # the subprocess cleanup has completed.  Continue to the
                 # tracked disconnect fence below before releasing anything.
                 break
+            if chat_subagents.is_subagent_message(msg):
+                if cont is None:
+                    await _open_continuation()
+                for record in subagent_mux.feed(msg):
+                    _emit_settlement({
+                        "event": record["event"],
+                        "data": json.dumps(record["data"]),
+                    })
+                continue
             if await _consume_timeout_terminal(msg):
                 continue
             if isinstance(msg, ResultMessage):
@@ -14264,6 +14971,19 @@ async def _watch_inflight_tasks(
 
                 if not _owns_generation():
                     break
+
+                if chat_subagents.is_subagent_message(msg):
+                    # Forwarded child text may precede TaskNotification.  Open
+                    # the headless continuation lazily so no child frame is
+                    # discarded while waiting for task settlement.
+                    if cont is None:
+                        await _open_continuation()
+                    for record in subagent_mux.feed(msg):
+                        _emit_settlement({
+                            "event": record["event"],
+                            "data": json.dumps(record["data"]),
+                        })
+                    continue
 
                 if isinstance(msg, TaskNotificationMessage):
                     # PRIMARY typed path. Phase-0 probe (2026-06-11, CLI
@@ -15014,7 +15734,8 @@ async def _admit_turn(
                 raise _TurnBusy()
             draining = cur
         elif (_sessions_with_inflight_tasks.get(session_id)
-              or _session_has_live_watcher(session_id)):
+              or _session_has_live_watcher(session_id)
+              or _session_has_scheduled_delivery(session_id)):
             raise _TurnBusy()
         else:
             broadcast = TurnBroadcast(session_id=session_id, model=model or MODEL)
@@ -15032,7 +15753,8 @@ async def _admit_turn(
             if cur is not None and not cur.done:
                 raise _TurnBusy()
             if (_sessions_with_inflight_tasks.get(session_id)
-                    or _session_has_live_watcher(session_id)):
+                    or _session_has_live_watcher(session_id)
+                    or _session_has_scheduled_delivery(session_id)):
                 raise _TurnBusy()
             broadcast = TurnBroadcast(session_id=session_id, model=model or MODEL)
             _active_turns[session_id] = broadcast
@@ -15752,7 +16474,8 @@ async def _start_turn(
             # poisoned runtime.  A background-task owner must keep its process;
             # the outer error path records a deferred rebuild after it settles.
             if (_sessions_with_inflight_tasks.get(session_id)
-                    or _session_has_live_watcher(session_id)):
+                    or _session_has_live_watcher(session_id)
+                    or _session_has_scheduled_delivery(session_id)):
                 raise
             recovery_used, recovery_limit = _context_recovery_inputs(
                 session_id,
@@ -15834,7 +16557,8 @@ async def _start_turn(
         # how to forward those lifecycle messages, and the CLI's explicitly
         # configured native auto-compact window still gets a chance to act.
         if (_sessions_with_inflight_tasks.get(session_id)
-                or _session_has_live_watcher(session_id)):
+                or _session_has_live_watcher(session_id)
+                or _session_has_scheduled_delivery(session_id)):
             sys.stderr.write(
                 f"[chat-preflight] native compact deferred for background "
                 f"owner sid={session_id[:8]} model={model_to_use} "
@@ -15931,7 +16655,8 @@ async def _start_turn(
                         and not tail_outcome.get("context_error")
                         and _is_codex_gateway_model(model_to_use)
                         and not _sessions_with_inflight_tasks.get(session_id)
-                        and not _session_has_live_watcher(session_id)):
+                        and not _session_has_live_watcher(session_id)
+                        and not _session_has_scheduled_delivery(session_id)):
                     sys.stderr.write(
                         f"[chat-preflight] rebuilding stalled Codex runtime "
                         f"sid={session_id[:8]} model={model_to_use} "
@@ -16136,6 +16861,7 @@ async def _start_turn(
 
     async def event_gen():
         nonlocal assistant_acc, streamed_in_bubble
+        subagent_mux = chat_subagents.SubagentStreamMux(session_id)
         # Subscribe to the session's side-channel queue. The MCP ask_user_question
         # handler publishes here; we merge those events into the SSE stream so the
         # UI can render the question UI while the SDK tool handler is await-ing.
@@ -16246,6 +16972,32 @@ async def _start_turn(
                     finally:
                         broadcast.perf_query_write_ms = obs.elapsed_ms(
                             _query_write_started)
+                    retry_commit = _native_retry_commits.get(session_id)
+                    if retry_commit is not None:
+                        # SDK query() returning is the first point at which the
+                        # child transcript is durably owned by the native
+                        # truncating resume.  Consume the restart-safe intent
+                        # now; if the metadata write fails, the child JSONL
+                        # reconciliation in client construction repairs it.
+                        try:
+                            await obs.to_thread_io(
+                                "chat.retry_intent_commit",
+                                session_id,
+                                sess.clear_retry_intent,
+                                session_id,
+                                source_session_id=retry_commit[0],
+                                target_user_uuid=retry_commit[1],
+                                owned=True,
+                            )
+                        except Exception as exc:
+                            sys.stderr.write(
+                                f"[chat] retry intent cleanup pending "
+                                f"sid={session_id[:8]} "
+                                f"exc={type(exc).__name__}\n"
+                            )
+                            sys.stderr.flush()
+                        finally:
+                            _native_retry_commits.pop(session_id, None)
                     # query() is the transport commit point. Until it returns,
                     # the lease is still retryable; after it succeeds, consume
                     # the exact staged objects before receiving any response.
@@ -16275,6 +17027,7 @@ async def _start_turn(
 
                 replay_dropped = 0
                 deferred_result: ResultMessage | None = None
+                background_messages: list[Any] = []
 
                 async def _dispatch(msg) -> str:
                     """Classify one message and forward it to the turn."""
@@ -16297,6 +17050,9 @@ async def _start_turn(
                     decision = boundary.classify(msg)
                     if decision in ("drop", "stale_result"):
                         replay_dropped += 1
+                        return decision
+                    if decision in ("background", "background_result"):
+                        background_messages.append(msg)
                         return decision
 
                     # Keep an exact, live view of tool execution. The native
@@ -16370,6 +17126,12 @@ async def _start_turn(
                                 break
                     finally:
                         stream.detach_turn(turn_q)
+                        # Explicit non-human MessageOrigin frames belong to a
+                        # background/peer delivery, never the foreground human
+                        # turn. Preserve them in order for the task watcher or
+                        # continuation consumer instead of mixing their text,
+                        # usage and Result boundary into this reply.
+                        stream.park_messages(background_messages)
                         # The pump may have already queued lifecycle records
                         # after Result. Return every leftover to the orphan
                         # park so a background watcher can adopt them instead
@@ -16385,7 +17147,7 @@ async def _start_turn(
                         current_terminal = False
                         async for msg in client.receive_response():
                             decision = await _dispatch(msg)
-                            if decision == "stale_result":
+                            if decision in ("stale_result", "background_result"):
                                 stale_terminal = True
                             elif decision == "current_result":
                                 current_terminal = True
@@ -16858,6 +17620,12 @@ async def _start_turn(
             if broadcast.perf_query_started:
                 broadcast.perf_result_ms = obs.elapsed_ms(
                     broadcast.perf_query_started)
+            _terminal_reason = sdk_lifecycle.normalize_terminal_reason(
+                getattr(msg, "terminal_reason", None))
+            _turn_origin = sdk_lifecycle.normalize_origin(
+                getattr(msg, "origin", None))
+            _model_usage = sdk_lifecycle.normalize_model_usage(
+                getattr(msg, "model_usage", None))
             cost = getattr(msg, "total_cost_usd", None) or 0.0
             u = getattr(msg, "usage", {}) or {}
             # ResultMessage.usage is CUMULATIVE per session. Per-turn
@@ -16903,6 +17671,11 @@ async def _start_turn(
                 broadcast.cancelled
                 or interrupt_key in _pending_interrupts
                 or legacy_interrupt_key in _pending_interrupts
+            )
+            was_cancelled = (
+                sdk_lifecycle.terminal_status(
+                    _terminal_reason, cancelled=was_cancelled)
+                == "cancelled"
             )
             _pending_interrupts.discard(interrupt_key)
             _pending_interrupts.discard(legacy_interrupt_key)
@@ -17009,6 +17782,10 @@ async def _start_turn(
                         terminal_at_ms=_completed_at_ms,
                         elapsed_s=_elapsed_s,
                         memory_recall=_done_memory_receipt,
+                        terminal_reason=_terminal_reason,
+                        turn_origin=_turn_origin,
+                        turn_id=broadcast.turn_id,
+                        model_usage=_model_usage,
                     )
                 except Exception as exc:
                     _safe_secondary_diagnostic(
@@ -17040,8 +17817,15 @@ async def _start_turn(
             _error_class = _classify_stream_error(_error_message) if _is_error else {
                 "kind": None, "cta": None, "retryable": False,
             }
-            _activity_status = ("cancelled" if was_cancelled else
-                                "failed" if _is_error else "completed")
+            _turn_status = sdk_lifecycle.terminal_status(
+                _terminal_reason,
+                is_error=_is_error,
+                cancelled=was_cancelled,
+            )
+            was_cancelled = _turn_status == "cancelled"
+            broadcast.cancelled = was_cancelled
+            _activity_status = (
+                "failed" if _turn_status == "stopped" else _turn_status)
             broadcast.perf_status = _activity_status
             broadcast.perf_error_kind = (
                 str(_error_class.get("kind") or "unknown")
@@ -17063,6 +17847,10 @@ async def _start_turn(
                         elapsed_s=_elapsed_s,
                         memory_recall=_done_memory_receipt,
                         canonical_terminal_published=True,
+                        terminal_status=_turn_status,
+                        terminal_reason=_terminal_reason,
+                        turn_origin=_turn_origin,
+                        model_usage=_model_usage,
                     )
                 except Exception as exc:
                     _safe_secondary_diagnostic(
@@ -17122,7 +17910,10 @@ async def _start_turn(
                         cost=f"${cost:.4f}",
                         model=model_to_use,
                         ts=_completed_at_ms,
-                        turn_status=_activity_status,
+                        turn_status=_turn_status,
+                        terminal_reason=_terminal_reason,
+                        turn_origin=_turn_origin,
+                        model_usage=_model_usage,
                         elapsed_s=_elapsed_s,
                         memory_recall=_done_memory_receipt,
                         file_path=sess._sidecar_path(session_id),
@@ -17152,6 +17943,10 @@ async def _start_turn(
                 "stats": _stats,
                 "cancelled": was_cancelled,
                 "is_error": _is_error,
+                "status": _turn_status,
+                "terminal_reason": _terminal_reason,
+                "origin": _turn_origin,
+                "model_usage": _model_usage,
                 "error": _error_message,
                 "kind": _error_class["kind"],
                 "cta": _error_class["cta"],
@@ -17332,7 +18127,11 @@ async def _start_turn(
                     cost=f"${cost:.4f}",
                     model=model_to_use,
                     ts=_completed_at_ms,
-                    turn_status=_activity_status,
+                    turn_status=_turn_status,
+                    terminal_reason=_terminal_reason,
+                    turn_origin=_turn_origin,
+                    turn_id=broadcast.turn_id,
+                    model_usage=_model_usage,
                     elapsed_s=_elapsed_s,
                     memory_recall=_done_memory_receipt,
                     file_path=sess._sidecar_path(session_id),
@@ -17553,7 +18352,16 @@ async def _start_turn(
                 # per-type helper async generators defined above. Each
                 # helper yields zero-or-more SSE events; we forward them.
                 msg = payload
-                if isinstance(msg, StreamEvent):
+                if chat_subagents.is_subagent_message(msg):
+                    # A forwarded sidechain is never parent answer content.
+                    # Route on the SDK-owned parent id even when an incomplete
+                    # frame cannot be rendered, so it cannot fall through.
+                    for record in subagent_mux.feed(msg):
+                        yield {
+                            "event": record["event"],
+                            "data": json.dumps(record["data"]),
+                        }
+                elif isinstance(msg, StreamEvent):
                     async for ev in _handle_stream_event(msg):
                         yield ev
                 elif isinstance(msg, AssistantMessage):
@@ -17794,6 +18602,13 @@ async def _start_turn(
                 "activity_source": broadcast.activity_source,
             })
             source_payload = source_payload or {}
+            for field in (
+                "result_error", "terminal_reason", "status", "origin",
+                "model_usage",
+            ):
+                value = source_payload.get(field)
+                if value not in (None, "", {}, []):
+                    data[field] = value
             recovered = source_payload.get("recovered_session")
             if isinstance(recovered, dict):
                 recovered_id = str(
@@ -18339,7 +19154,8 @@ async def _maybe_drain_queue(session_id: str) -> None:
         # TurnBroadcast is open. It will trigger this drain again after its
         # final continuation releases the single SDK pump.
         if (_sessions_with_inflight_tasks.get(session_id)
-                or _session_has_live_watcher(session_id)):
+                or _session_has_live_watcher(session_id)
+                or _session_has_scheduled_delivery(session_id)):
             queued = await obs.to_thread_io(
                 "chat.queue_read", session_id, sess.get_queue, session_id)
             if queued.get("items") or queued.get("inflight"):
@@ -18597,6 +19413,8 @@ async def _subscribe_multiplex(
     completed: set[tuple[str, str]] = set()
     state_fingerprints: dict[str, str] = {}
     state_payloads: dict[str, dict] = {}
+    scheduled_history_cursors: dict[str, _ScheduledHistoryCursor] = {}
+    last_scheduled_history_poll = 0.0
     # Checkpoints are one-shot reconnect intents for this root SSE handshake.
     # Copy them so consumption is private to the subscription lifecycle.
     pending_checkpoints = {
@@ -18642,12 +19460,31 @@ async def _subscribe_multiplex(
             _pump_child(session_id, broadcast, last_event_seq))
 
     async def _reconcile() -> None:
+        nonlocal last_scheduled_history_poll
         for key, task in list(children.items()):
             if task.done():
                 children.pop(key, None)
                 completed.add(key)
                 with suppress(asyncio.CancelledError, Exception):
                     task.result()
+
+        now = time.monotonic()
+        if now - last_scheduled_history_poll >= _SDK_CRON_HISTORY_POLL_S:
+            last_scheduled_history_poll = now
+            with _sdk_cron_state_lock:
+                has_scheduled_history = bool(_sdk_cron_jobs)
+            updates = (
+                await asyncio.to_thread(
+                    _collect_sdk_scheduled_history_updates,
+                    scheduled_history_cursors,
+                )
+                if has_scheduled_history or scheduled_history_cursors else []
+            )
+            for update in updates:
+                await output.put({
+                    "event": "scheduled_history",
+                    "data": json.dumps(update, ensure_ascii=False),
+                })
 
         candidate_ids = set(_active_turns)
         candidate_ids.update(_sessions_with_inflight_tasks)
@@ -18657,14 +19494,32 @@ async def _subscribe_multiplex(
         )
         candidate_ids.update(
             sid for sid, broadcast in _recent_turns.items()
-            if getattr(broadcast, "is_continuation", False)
-            and not getattr(broadcast, "continuation_consumed", False)
+            if (
+                getattr(broadcast, "is_continuation", False)
+                and not getattr(broadcast, "continuation_consumed", False)
+            ) or (
+                getattr(broadcast, "is_scheduled_delivery", False)
+                and not getattr(
+                    broadcast, "scheduled_delivery_consumed", False)
+            )
         )
         candidate_ids.update(pending_checkpoints)
 
+        # Parse the durable session index once for the whole reconcile pass.
+        # This loop runs every 200 ms per multiplex connection; resolving each
+        # candidate independently used to read + json.loads the complete index
+        # N times on the event-loop thread. The batch read runs off-loop and
+        # returns private lineage lists that status projection cannot mutate.
+        runtime_lineages = (
+            await asyncio.to_thread(sess.runtime_lineages, candidate_ids)
+            if candidate_ids else {}
+        )
         active_ids: set[str] = set()
         for session_id in sorted(candidate_ids):
-            state = session_active_status(session_id)
+            state = _session_active_status(
+                session_id,
+                runtime_lineage=runtime_lineages.get(session_id, []),
+            )
             checkpoint = pending_checkpoints.get(session_id)
             checkpoint_recent = None
             if checkpoint is not None and checkpoint.get("turn_id"):
@@ -18838,6 +19693,9 @@ async def _subscribe_broadcast(
     if (getattr(broadcast, "is_continuation", False)
             and not subscriber._resync_payload):
         broadcast.continuation_consumed = True
+    if (getattr(broadcast, "is_scheduled_delivery", False)
+            and not subscriber._resync_payload):
+        broadcast.scheduled_delivery_consumed = True
     try:
         while True:
             ev = await subscriber.get()
@@ -18848,8 +19706,9 @@ async def _subscribe_broadcast(
         broadcast.unsubscribe(subscriber)
 
 
-@router.get("/sessions/{sid}/active", dependencies=[Depends(require_token)])
-def session_active_status(sid: str) -> dict:
+def _session_active_status(
+    sid: str, *, runtime_lineage: list[str] | None = None,
+) -> dict:
     """Tell the frontend whether `sid` has an in-progress background
     turn. Used on session load to decide between "render JSONL history"
     and "open a reconnect SSE stream to follow the live tail."""
@@ -18861,8 +19720,11 @@ def session_active_status(sid: str) -> dict:
     )
     runtime_background_pending = len(runtime_task_ids)
     runtime_continuation_pending, runtime_ui_revision = (
-        _runtime_continuation_projection_state(sid)
+        _runtime_continuation_projection_state(
+            sid, runtime_lineage=runtime_lineage,
+        )
     )
+    scheduled_state = _sdk_scheduled_snapshot(sid)
     b = _active_turns.get(sid)
     if b is not None and getattr(b, "is_continuation", False) \
             and getattr(b, "continuation_consumed", False):
@@ -18888,8 +19750,14 @@ def session_active_status(sid: str) -> dict:
         # the card flips, so the 60s-TTL window yields exactly one replay.
         recent = _get_recent_turn(sid)
         if (recent is not None
-                and getattr(recent, "is_continuation", False)
-                and not getattr(recent, "continuation_consumed", False)):
+                and (
+                    getattr(recent, "is_continuation", False)
+                    and not getattr(
+                        recent, "continuation_consumed", False)
+                    or getattr(recent, "is_scheduled_delivery", False)
+                    and not getattr(
+                        recent, "scheduled_delivery_consumed", False)
+                )):
             b = recent
         else:
             background_pending = len(
@@ -18915,6 +19783,8 @@ def session_active_status(sid: str) -> dict:
                     "runtime_background_tasks_pending": runtime_background_pending,
                     "runtime_continuation_pending": runtime_continuation_pending,
                     "runtime_ui_revision": runtime_ui_revision,
+                    **scheduled_state,
+                    "scheduled": False,
                     "user_text": "",
                     "user_images": [],
                     "user_docs": [],
@@ -18926,6 +19796,8 @@ def session_active_status(sid: str) -> dict:
                 "runtime_background_tasks_pending": runtime_background_pending,
                 "runtime_continuation_pending": runtime_continuation_pending,
                 "runtime_ui_revision": runtime_ui_revision,
+                **scheduled_state,
+                "scheduled": False,
                 # A just-finished direct or queued turn can disappear from the
                 # live registry before the reconnect probe lands. Preserve its
                 # delivery class through the grace broadcast so the browser
@@ -18945,6 +19817,7 @@ def session_active_status(sid: str) -> dict:
         "runtime_background_tasks_pending": runtime_background_pending,
         "runtime_continuation_pending": runtime_continuation_pending,
         "runtime_ui_revision": runtime_ui_revision,
+        **scheduled_state,
         "turn_id": b.turn_id,
         "parent_turn_id": b.parent_turn_id,
         "model": b.model,
@@ -18956,6 +19829,7 @@ def session_active_status(sid: str) -> dict:
         # portion (the launching tool_use card lives there; the replayed
         # task_notification flips it to ✅done).
         "continuation": getattr(b, "is_continuation", False),
+        "scheduled": getattr(b, "is_scheduled_delivery", False),
         "activity_source": b.activity_source,
         # The turn's user prompt + attachments. The browser needs these to
         # render the user bubble when it LIVE-reconnects to a turn the server
@@ -18966,6 +19840,11 @@ def session_active_status(sid: str) -> dict:
         "user_images": b.user_images or [],
         "user_docs": b.user_docs or [],
     }
+
+
+@router.get("/sessions/{sid}/active", dependencies=[Depends(require_token)])
+def session_active_status(sid: str) -> dict:
+    return _session_active_status(sid)
 
 
 # ====== interrupted turns (process-crash recovery) ======
@@ -19141,6 +20020,843 @@ def recover_durable_queue_attachments_at_startup(
 # Dynamic bridge for SDK client/runtime lifecycle. Every callback resolves the
 # chat facade at call time, preserving monkeypatch behavior while the extracted
 # module owns the exact shared pool, disconnect, and stream-pump containers.
+def _invalidate_hook_setting_runtimes(
+    scope: hook_settings.HookScope,
+    workspace_root: Path,
+) -> None:
+    """Force affected pooled SDK clients to reload standard Hook settings."""
+    try:
+        session_ids = sess.indexed_session_ids()
+    except Exception:
+        return
+    target = Path(workspace_root).resolve(strict=False)
+    for session_id in session_ids:
+        if scope != "user":
+            try:
+                session_root = Path(
+                    sess.session_workspace(session_id)
+                ).resolve(strict=False)
+            except Exception:
+                continue
+            if session_root != target:
+                continue
+        _pending_runtime_rebuilds.add(session_id)
+
+
+hook_settings.configure_runtime_invalidator(
+    _invalidate_hook_setting_runtimes)
+
+
+def _sdk_scheduled_snapshot(session_id: str) -> dict[str, Any]:
+    """Return the privacy-safe, thread-safe native schedule projection."""
+    with _sdk_cron_state_lock:
+        count = len(_sdk_cron_jobs.get(session_id, {}))
+    return {"scheduled_active": count > 0, "scheduled_count": count}
+
+
+@router.get(
+    "/sessions/{sid}/scheduled-tasks",
+    dependencies=[Depends(require_token)],
+)
+def list_sdk_scheduled_tasks_api(sid: str) -> dict[str, Any]:
+    """Return the authenticated, read-only native Cron projection."""
+    if sess.get_session_meta(sid) is None:
+        raise HTTPException(404, "session not found")
+    with _sdk_cron_state_lock:
+        jobs = tuple(_sdk_cron_jobs.get(sid, {}).items())
+    tasks = []
+    for job_id, raw in sorted(jobs):
+        tasks.append({
+            "job_id": job_id,
+            "cron": str(raw.get("cron") or ""),
+            "recurring": bool(raw.get("recurring")),
+            "durable": bool(raw.get("durable")),
+            "prompt": str(raw.get("prompt") or ""),
+            "prompt_truncated": bool(raw.get("prompt_truncated")),
+        })
+    return {
+        "session_id": sid,
+        "runtime_owned": True,
+        "tasks": tasks,
+        "count": len(tasks),
+    }
+
+
+def _session_has_scheduled_tasks(session_id: str) -> bool:
+    return bool(_sdk_scheduled_snapshot(session_id)["scheduled_active"])
+
+
+def _scheduled_state_carrier(
+    key: chat_runtime.ClientKey,
+) -> TurnBroadcast | None:
+    delivery = _sdk_scheduled_deliveries.get(key)
+    if delivery is not None and not delivery.broadcast.done:
+        return delivery.broadcast
+    broadcast = _active_turns.get(key[0])
+    return broadcast if broadcast is not None and not broadcast.done else None
+
+
+def _publish_sdk_scheduled_state(
+    key: chat_runtime.ClientKey,
+    *,
+    broadcast: TurnBroadcast | None = None,
+) -> None:
+    carrier = broadcast or _scheduled_state_carrier(key)
+    if carrier is None:
+        return
+    carrier.publish({
+        "event": "scheduled_tasks",
+        "data": json.dumps(_sdk_scheduled_snapshot(key[0])),
+    })
+
+
+def _safe_sdk_cron_prompt(
+    value: Any,
+) -> tuple[str, str, bool] | None:
+    """Return bounded display text plus an exact UTF-8 prompt fingerprint."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
+    except UnicodeEncodeError:
+        return None
+    cleaned = "".join(
+        char if char in {"\n", "\t"} or char.isprintable() else "�"
+        for char in value[:_SDK_CRON_PROMPT_MAX]
+    )
+    return cleaned, digest, len(value) > _SDK_CRON_PROMPT_MAX
+
+
+def _jsonl_scheduled_prompt_digest(record: Any) -> str:
+    """Fingerprint a native Cron trigger without retaining its text."""
+    if not isinstance(record, dict) \
+            or record.get("type") != "user" \
+            or record.get("isMeta") is not True:
+        return ""
+    message = record.get("message")
+    if not isinstance(message, dict):
+        return ""
+    content = message.get("content")
+    if isinstance(content, str):
+        text = content
+    elif isinstance(content, list):
+        parts = [
+            str(item.get("text") or "")
+            for item in content
+            if isinstance(item, dict) and item.get("type") == "text"
+        ]
+        text = "\n".join(part for part in parts if part)
+    else:
+        return ""
+    if not text:
+        return ""
+    try:
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()
+    except UnicodeEncodeError:
+        return ""
+
+
+def _jsonl_is_terminal_assistant(record: Any) -> bool:
+    if not isinstance(record, dict) or record.get("type") != "assistant":
+        return False
+    message = record.get("message")
+    return bool(
+        isinstance(message, dict)
+        and message.get("role") == "assistant"
+        and message.get("stop_reason") == "end_turn"
+    )
+
+
+def _scan_sdk_scheduled_history(
+    session_id: str,
+    prompt_digests: frozenset[str],
+    cursor: _ScheduledHistoryCursor,
+) -> list[dict[str, str]]:
+    """Read only appended JSONL and report completed native Cron turns.
+
+    Claude CLI 2.1.252 writes autonomous Cron turns to canonical JSONL but
+    does not always surface them through ``receive_messages()``. This follower
+    never schedules work and never returns prompt/result bodies: it recognizes
+    an ``isMeta`` trigger by the already-registered prompt hash, then emits an
+    opaque revision after the following terminal assistant record.
+    """
+    if not prompt_digests:
+        return []
+    path = _find_session_jsonl(session_id)
+    if path is None:
+        return []
+    path = Path(path)
+    try:
+        stat = path.stat()
+    except OSError:
+        return []
+
+    identity = (int(stat.st_dev), int(stat.st_ino))
+    initial = (
+        not cursor.initialized
+        or cursor.file_identity != identity
+        or stat.st_size < cursor.offset
+    )
+    if initial:
+        start = max(0, stat.st_size - _SDK_CRON_HISTORY_TAIL_BYTES)
+        cursor.file_identity = identity
+        cursor.offset = start
+        cursor.partial = b""
+        cursor.pending = False
+        cursor.initialized = True
+    else:
+        start = cursor.offset
+        if stat.st_size <= start:
+            return []
+
+    read_size = min(
+        stat.st_size - start,
+        _SDK_CRON_HISTORY_TAIL_BYTES if initial
+        else _SDK_CRON_HISTORY_READ_BYTES,
+    )
+    if read_size <= 0:
+        return []
+    try:
+        with path.open("rb") as handle:
+            aligned = True
+            if initial and start > 0:
+                handle.seek(start - 1)
+                aligned = handle.read(1) == b"\n"
+            handle.seek(start)
+            chunk = handle.read(read_size)
+    except OSError:
+        return []
+    if not chunk:
+        return []
+    cursor.offset = start + len(chunk)
+
+    if initial and not aligned:
+        boundary = chunk.find(b"\n")
+        if boundary < 0:
+            return []
+        chunk = chunk[boundary + 1:]
+    data = chunk if initial else cursor.partial + chunk
+    lines = data.split(b"\n")
+    cursor.partial = lines.pop() if lines else b""
+
+    updates: list[dict[str, str]] = []
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except (TypeError, ValueError):
+            continue
+        digest = _jsonl_scheduled_prompt_digest(record)
+        if digest and digest in prompt_digests:
+            cursor.pending = True
+            continue
+        if cursor.pending and _jsonl_is_terminal_assistant(record):
+            cursor.pending = False
+            if not initial:
+                updates.append({
+                    "session_id": session_id,
+                    "revision": hashlib.sha256(line).hexdigest()[:20],
+                })
+    return updates
+
+
+def _collect_sdk_scheduled_history_updates(
+    cursors: dict[str, _ScheduledHistoryCursor],
+) -> list[dict[str, str]]:
+    """Batch one privacy-safe transcript pass for a multiplex connection."""
+    with _sdk_cron_state_lock:
+        scheduled = {
+            session_id: frozenset(
+                str(job.get("prompt_sha256") or "")
+                for job in jobs.values()
+                if job.get("prompt_sha256")
+            )
+            for session_id, jobs in _sdk_cron_jobs.items()
+        }
+    for stale_id in set(cursors) - set(scheduled):
+        cursors.pop(stale_id, None)
+
+    latest: dict[str, dict[str, str]] = {}
+    for session_id, prompt_digests in scheduled.items():
+        cursor = cursors.setdefault(session_id, _ScheduledHistoryCursor())
+        for update in _scan_sdk_scheduled_history(
+            session_id, prompt_digests, cursor,
+        ):
+            # One canonical reload installs the whole suffix, so coalesce
+            # multiple completions discovered in the same pass per session.
+            latest[session_id] = update
+    return list(latest.values())
+
+
+def _safe_sdk_cron_call(name: str, raw_input: Any) -> dict[str, Any]:
+    data = raw_input if isinstance(raw_input, dict) else {}
+    call: dict[str, Any] = {"name": name}
+    if name == "CronCreate":
+        cadence = str(data.get("cron") or "")
+        if cadence and len(cadence) <= 128 and all(ch.isprintable() for ch in cadence):
+            call["cron"] = cadence
+        call["recurring"] = bool(data.get("recurring"))
+        call["durable"] = bool(data.get("durable"))
+        prompt = _safe_sdk_cron_prompt(data.get("prompt"))
+        if prompt is not None:
+            call["prompt"] = prompt[0]
+            call["prompt_sha256"] = prompt[1]
+            call["prompt_truncated"] = prompt[2]
+    elif name == "CronDelete":
+        job_id = str(data.get("id") or "")
+        if _SDK_CRON_JOB_ID.fullmatch(job_id):
+            call["id"] = job_id
+    return call
+
+
+def _sdk_tool_result_text(block: ToolResultBlock) -> str:
+    content = getattr(block, "content", None)
+    if isinstance(content, str):
+        return content
+    parts: list[str] = []
+    if isinstance(content, list):
+        for item in content:
+            if isinstance(item, TextBlock):
+                parts.append(str(getattr(item, "text", "") or ""))
+            elif isinstance(item, dict) and item.get("type") == "text":
+                parts.append(str(item.get("text") or ""))
+    return "\n".join(part for part in parts if part)
+
+
+def _observe_sdk_cron_message(
+    key: chat_runtime.ClientKey,
+    message: Any,
+) -> None:
+    """Track native Cron tool state without retaining its prompt or output."""
+    content = getattr(message, "content", None)
+    if not isinstance(content, list):
+        return
+    calls = _sdk_cron_tool_calls.setdefault(key, {})
+    changed = False
+    observed_result = False
+    for block in content:
+        if isinstance(block, ToolUseBlock) and block.name in {
+            "CronCreate", "CronDelete", "CronList",
+        }:
+            tool_id = str(block.id or "")
+            if tool_id:
+                calls[tool_id] = _safe_sdk_cron_call(
+                    str(block.name), getattr(block, "input", None))
+            continue
+        if not isinstance(block, ToolResultBlock):
+            continue
+        tool_id = str(getattr(block, "tool_use_id", "") or "")
+        call = calls.pop(tool_id, None)
+        if call is None or bool(getattr(block, "is_error", False)):
+            continue
+        observed_result = True
+        text = _sdk_tool_result_text(block)
+        name = call["name"]
+        with _sdk_cron_state_lock:
+            before = dict(_sdk_cron_jobs.get(key[0], {}))
+            jobs = dict(before)
+            if name == "CronCreate":
+                match = _SDK_CRON_CREATE_RESULT.search(text)
+                if match:
+                    job_id = match.group(1)
+                    jobs[job_id] = {
+                        field: call[field]
+                        for field in (
+                            "cron", "recurring", "durable", "prompt",
+                            "prompt_sha256", "prompt_truncated",
+                        )
+                        if field in call
+                    }
+            elif name == "CronDelete":
+                match = _SDK_CRON_DELETE_RESULT.search(text)
+                if match:
+                    jobs.pop(match.group(1), None)
+            elif name == "CronList":
+                if "no scheduled jobs" in text.casefold():
+                    jobs = {}
+                else:
+                    listed = {
+                        match.group(1)
+                        for match in _SDK_CRON_LIST_LINE.finditer(text)
+                    }
+                    if listed:
+                        jobs = {
+                            job_id: dict(before.get(job_id, {}))
+                            for job_id in listed
+                        }
+            if jobs:
+                _sdk_cron_jobs[key[0]] = jobs
+            else:
+                _sdk_cron_jobs.pop(key[0], None)
+            changed = jobs != before
+    if not calls:
+        _sdk_cron_tool_calls.pop(key, None)
+    if changed or observed_result:
+        _publish_sdk_scheduled_state(key)
+
+
+def _scheduled_trigger_text(message: UserMessage) -> str:
+    content = getattr(message, "content", None)
+    if isinstance(content, str):
+        return content
+    parts: list[str] = []
+    if isinstance(content, list):
+        for block in content:
+            if isinstance(block, TextBlock):
+                parts.append(str(getattr(block, "text", "") or ""))
+            elif isinstance(block, dict) and block.get("type") == "text":
+                parts.append(str(block.get("text") or ""))
+    return "\n".join(part for part in parts if part)
+
+
+def _matching_sdk_cron_job(
+    key: chat_runtime.ClientKey,
+    prompt: str,
+) -> str:
+    safe_prompt = _safe_sdk_cron_prompt(prompt)
+    if safe_prompt is None:
+        return ""
+    digest = safe_prompt[1]
+    with _sdk_cron_state_lock:
+        jobs = tuple(_sdk_cron_jobs.get(key[0], {}).items())
+    for job_id, job in jobs:
+        if job.get("prompt_sha256") == digest:
+            return str(job_id)
+    return ""
+
+
+def _is_sdk_scheduled_trigger(
+    key: chat_runtime.ClientKey,
+    message: Any,
+) -> bool:
+    if not isinstance(message, UserMessage):
+        return False
+    origin = sdk_lifecycle.normalize_origin(getattr(message, "origin", None))
+    if origin is not None:
+        return bool(
+            origin["kind"] == "task-notification"
+            and origin.get("subkind") == "scheduled-trigger"
+        )
+
+    # CLI 2.1.252 persists native Cron prompts as ``isMeta=true`` but omits
+    # MessageOrigin from the corresponding SDK UserMessage. The SDK parser does
+    # not expose isMeta, so exact prompt identity is the only stable fallback.
+    # Never apply it while a human turn owns the stream: a person may type the
+    # same text as a schedule, and their explicit query must remain foreground.
+    current = _active_turns.get(key[0])
+    if current is not None and not current.done \
+            and not getattr(current, "is_scheduled_delivery", False):
+        return False
+    return bool(_matching_sdk_cron_job(key, _scheduled_trigger_text(message)))
+
+
+async def _register_scheduled_delivery(
+    delivery: _ScheduledDelivery,
+) -> bool:
+    """Claim the visible slot after the preceding turn releases it."""
+    session_id = delivery.key[0]
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline:
+        if sess.session_is_deleting(session_id):
+            return False
+        async with _lock:
+            current = _active_turns.get(session_id)
+            if current is delivery.broadcast:
+                return True
+            if current is None or current.done:
+                if delivery.broadcast.done:
+                    _remember_recent_turn(session_id, delivery.broadcast)
+                    return False
+                _active_turns[session_id] = delivery.broadcast
+                return True
+        await asyncio.sleep(0.02)
+    return False
+
+
+def _retain_maintenance_task(task: asyncio.Task) -> None:
+    _maintenance_tasks.add(task)
+    task.add_done_callback(_maintenance_tasks.discard)
+
+
+async def _begin_scheduled_delivery(
+    key: chat_runtime.ClientKey,
+    message: UserMessage,
+) -> _ScheduledDelivery:
+    prompt = _scheduled_trigger_text(message)
+    broadcast = TurnBroadcast(session_id=key[0], model=key[1] or MODEL)
+    broadcast.user_text = prompt
+    broadcast.is_scheduled_delivery = True
+    broadcast.perf_client = "warm"
+    delivery = _ScheduledDelivery(
+        key=key,
+        broadcast=broadcast,
+        render_state={
+            "tool_use_names": {},
+            "streamed": [],
+            "assistant_uuid": "",
+        },
+        subagent_mux=chat_subagents.SubagentStreamMux(key[0]),
+        job_id=_matching_sdk_cron_job(key, prompt),
+    )
+    _sdk_scheduled_deliveries[key] = delivery
+    registration = asyncio.create_task(_register_scheduled_delivery(delivery))
+    delivery.registration_task = registration
+    _retain_maintenance_task(registration)
+    broadcast.publish_startup("accepted")
+    try:
+        await _start_activity_early(key[0], broadcast, prompt or "定时任务")
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        pass
+    message_uuid = str(getattr(message, "uuid", "") or "")
+    if message_uuid:
+        try:
+            await obs.to_thread_io(
+                "chat.scheduled_trigger_annotation",
+                key[0],
+                sess.set_message_annotation,
+                key[0],
+                message_uuid,
+                _scheduledTrigger=True,
+                scheduled_job_id=delivery.job_id or None,
+                file_path=sess._sidecar_path(key[0]),
+            )
+        except Exception as exc:
+            sys.stderr.write(
+                f"[chat] scheduled trigger annotation failed "
+                f"sid={key[0][:8]} exc={type(exc).__name__}\n"
+            )
+    return delivery
+
+
+async def _observe_scheduled_task_lifecycle(
+    delivery: _ScheduledDelivery,
+    message: Any,
+) -> bool:
+    """Handle task lifecycle frames owned by an autonomous Cron turn."""
+    session_id = delivery.key[0]
+    broadcast = delivery.broadcast
+    pending = delivery.pending_tasks
+    if isinstance(message, TaskStartedMessage):
+        task_id = str(getattr(message, "task_id", "") or "")
+        description = getattr(message, "description", None)
+        accepted = bool(task_id) and await _record_background_task_launch_owned(
+            session_id,
+            task_id,
+            tool_use_id=getattr(message, "tool_use_id", None),
+            description=description,
+        )
+        if accepted:
+            pending[task_id] = {
+                "tool_use_id": getattr(message, "tool_use_id", None),
+                "description": description,
+            }
+            _pin_background_task(session_id, task_id)
+            broadcast.publish({"event": "task_started", "data": json.dumps({
+                "task_id": task_id,
+                "tool_use_id": getattr(message, "tool_use_id", None),
+                "description": description,
+                "task_type": getattr(message, "task_type", None),
+            })})
+        return True
+    if isinstance(message, TaskProgressMessage):
+        broadcast.publish({"event": "task_progress", "data": json.dumps({
+            "task_id": getattr(message, "task_id", "") or "",
+            "tool_use_id": getattr(message, "tool_use_id", None),
+            "last_tool_name": getattr(message, "last_tool_name", None),
+            "usage": dict(getattr(message, "usage", None) or {}),
+        })})
+        return True
+
+    terminal: dict[str, Any] | None = None
+    if isinstance(message, TaskNotificationMessage):
+        terminal = {
+            "task_id": getattr(message, "task_id", "") or "",
+            "tool_use_id": getattr(message, "tool_use_id", None),
+            "status": getattr(message, "status", None),
+            "summary": getattr(message, "summary", None),
+            "output_file": getattr(message, "output_file", None),
+            "usage": dict(getattr(message, "usage", None) or {}),
+        }
+    elif isinstance(message, TaskUpdatedMessage):
+        terminal = _terminal_task_update(message)
+    if terminal is None:
+        return False
+    task_id = str(terminal.get("task_id") or "")
+    outcome = await _on_task_settled_owned(
+        session_id,
+        task_id,
+        status=terminal.get("status") or None,
+        tool_use_id=terminal.get("tool_use_id") or None,
+        summary=terminal.get("summary") or None,
+        output_file=terminal.get("output_file") or None,
+        usage=dict(terminal.get("usage") or {}),
+    )
+    if outcome is not None:
+        pending.pop(task_id, None)
+    if outcome:
+        terminal["background_tasks_pending"] = len(pending)
+        broadcast.publish({
+            "event": "task_notification",
+            "data": json.dumps(terminal),
+        })
+    return True
+
+
+async def _refresh_scheduled_session_summary(
+    session_id: str,
+    model: str,
+) -> None:
+    try:
+        messages = await asyncio.to_thread(_get_session_msgs, session_id, model)
+        await obs.to_thread_io(
+            "chat.scheduled_session_index_write",
+            session_id,
+            sess.bump_session,
+            session_id,
+            message_count=len(messages),
+            turn_count=sum(1 for msg in messages if _is_real_user_prompt(msg)),
+            file_path=sess.INDEX,
+            owned=True,
+        )
+    except Exception as exc:
+        sys.stderr.write(
+            f"[chat] scheduled session index refresh failed "
+            f"sid={session_id[:8]} exc={type(exc).__name__}\n"
+        )
+
+
+async def _finish_scheduled_delivery(
+    delivery: _ScheduledDelivery,
+    result: ResultMessage,
+) -> None:
+    key = delivery.key
+    session_id = key[0]
+    broadcast = delivery.broadcast
+    if _sdk_scheduled_deliveries.get(key) is delivery:
+        _sdk_scheduled_deliveries.pop(key, None)
+    registration = delivery.registration_task
+
+    schedule_changed = False
+    if delivery.job_id:
+        with _sdk_cron_state_lock:
+            before = dict(_sdk_cron_jobs.get(session_id, {}))
+            job = before.get(delivery.job_id) or {}
+            if job and not bool(job.get("recurring")):
+                after = dict(before)
+                after.pop(delivery.job_id, None)
+                if after:
+                    _sdk_cron_jobs[session_id] = after
+                else:
+                    _sdk_cron_jobs.pop(session_id, None)
+                schedule_changed = True
+
+    # Some compatible providers expose final prose only on ResultMessage.
+    result_text = str(getattr(result, "result", None) or "")
+    if result_text and not "".join(delivery.render_state["streamed"]).strip():
+        broadcast.publish({
+            "event": "text", "data": json.dumps({"text": result_text}),
+        })
+
+    origin = sdk_lifecycle.normalize_origin(getattr(result, "origin", None))
+    terminal_reason = sdk_lifecycle.normalize_terminal_reason(
+        getattr(result, "terminal_reason", None))
+    status = sdk_lifecycle.terminal_status(
+        terminal_reason,
+        is_error=bool(getattr(result, "is_error", False)),
+        cancelled=bool(broadcast.cancelled),
+    )
+    completed_at_ms = int(time.time() * 1000)
+    assistant_uuid = str(delivery.render_state.get("assistant_uuid") or "")
+    elapsed_s = round(max(0.0, time.time() - broadcast.started_at), 1)
+    if assistant_uuid and not sess.session_is_deleting(session_id):
+        try:
+            await obs.to_thread_io(
+                "chat.scheduled_footer_write",
+                session_id,
+                sess.set_message_annotation,
+                session_id,
+                assistant_uuid,
+                model=broadcast.model,
+                ts=completed_at_ms,
+                turn_status=status,
+                turn_id=broadcast.turn_id,
+                elapsed_s=elapsed_s if elapsed_s >= 1 else None,
+                file_path=sess._sidecar_path(session_id),
+            )
+        except Exception as exc:
+            sys.stderr.write(
+                f"[chat] scheduled footer annotation failed "
+                f"sid={session_id[:8]} exc={type(exc).__name__}\n"
+            )
+
+    errors = [str(item) for item in (getattr(result, "errors", None) or [])]
+    done_payload: dict[str, Any] = {
+        "cancelled": status == "cancelled",
+        "is_error": bool(getattr(result, "is_error", False)),
+        "error": "\n".join(errors) or (result_text if status == "failed" else ""),
+        "model": broadcast.model,
+        "scheduled": True,
+        "continuation": False,
+        "activity_source": broadcast.activity_source,
+        "duration_ms": getattr(result, "duration_ms", None),
+        "assistant_uuid": assistant_uuid,
+        "completed_at_ms": completed_at_ms,
+        "status": status,
+        "terminal_reason": terminal_reason,
+        "origin": origin,
+        "model_usage": sdk_lifecycle.normalize_model_usage(
+            getattr(result, "model_usage", None)),
+        "background_tasks_pending": len(delivery.pending_tasks),
+    }
+    broadcast.perf_status = status
+    broadcast.perf_error_kind = "scheduled_turn" if status == "failed" else "none"
+    broadcast.publish({"event": "done", "data": json.dumps(done_payload)})
+    if schedule_changed:
+        _publish_sdk_scheduled_state(key, broadcast=broadcast)
+    await _finish_activity(session_id, broadcast, status)
+    broadcast.finish()
+    registered_here = False
+    async with _lock:
+        if _active_turns.get(session_id) is broadcast:
+            _active_turns.pop(session_id, None)
+            registered_here = True
+    # If an earlier user turn still owns the visible slot, its own completion
+    # must be allowed to advance first. The retained registration owner will
+    # publish this already-finished Cron replay as soon as that slot clears.
+    # Avoid awaiting it here: the earlier turn's Result may itself be queued
+    # behind this scheduled Result on the same sole stream.
+    registration_finished = registration is None or registration.done()
+    if (registered_here or registration_finished) \
+            and not sess.session_is_deleting(session_id):
+        _remember_recent_turn(session_id, broadcast)
+
+    if delivery.pending_tasks:
+        client = _clients.get(key)
+        if client is not None:
+            _spawn_task_watcher(
+                session_id,
+                client,
+                delivery.pending_tasks,
+                started_at=broadcast.started_at,
+                origin_turn_id=broadcast.turn_id,
+            )
+    refresh = asyncio.create_task(
+        _refresh_scheduled_session_summary(session_id, broadcast.model))
+    _retain_maintenance_task(refresh)
+
+
+async def _observe_sdk_scheduled_delivery(
+    key: chat_runtime.ClientKey,
+    message: Any,
+) -> bool:
+    delivery = _sdk_scheduled_deliveries.get(key)
+    if delivery is None:
+        if not _is_sdk_scheduled_trigger(key, message):
+            return False
+        delivery = await _begin_scheduled_delivery(key, message)
+        return True
+
+    if await _observe_scheduled_task_lifecycle(delivery, message):
+        return True
+    if isinstance(message, ResultMessage):
+        await _finish_scheduled_delivery(delivery, message)
+        return True
+    if chat_subagents.is_subagent_message(message):
+        for record in delivery.subagent_mux.feed(message):
+            delivery.broadcast.publish({
+                "event": record["event"],
+                "data": json.dumps(record["data"]),
+            })
+        return True
+    for event in _render_continuation_message(message, delivery.render_state):
+        delivery.broadcast.publish(event)
+    return True
+
+
+def _on_sdk_runtime_disconnected(session_id: str) -> None:
+    """Drop runtime-owned schedules and close any interrupted Cron delivery."""
+    with _sdk_cron_state_lock:
+        _sdk_cron_jobs.pop(session_id, None)
+        for key in [key for key in _sdk_cron_tool_calls if key[0] == session_id]:
+            _sdk_cron_tool_calls.pop(key, None)
+    for key in [key for key in _sdk_scheduled_deliveries if key[0] == session_id]:
+        delivery = _sdk_scheduled_deliveries.pop(key)
+        broadcast = delivery.broadcast
+        if delivery.registration_task is not None:
+            delivery.registration_task.cancel()
+        broadcast.cancelled = True
+        if not broadcast.done:
+            broadcast.publish({
+                "event": "error",
+                "data": json.dumps({
+                    "error": "定时任务运行环境已断开",
+                    "kind": "sdk",
+                    "retryable": False,
+                    "activity_source": "scheduled",
+                }),
+            })
+            broadcast.finish()
+        if _active_turns.get(session_id) is broadcast:
+            _active_turns.pop(session_id, None)
+        try:
+            _remember_recent_turn(session_id, broadcast)
+        except RuntimeError:
+            broadcast.close()
+        if broadcast.activity_started:
+            try:
+                task = asyncio.create_task(
+                    _finish_activity(session_id, broadcast, "cancelled"))
+                _retain_maintenance_task(task)
+            except RuntimeError:
+                pass
+    # A foreground turn may be the only live carrier for the dot removal.
+    for key in [key for key in _clients if key[0] == session_id]:
+        _publish_sdk_scheduled_state(key)
+
+
+async def _observe_sdk_stream_message(
+    key: chat_runtime.ClientKey,
+    message: Any,
+) -> bool:
+    """Observe safe lifecycle state and consume autonomous scheduled turns."""
+    _observe_sdk_cron_message(key, message)
+    consumed = await _observe_sdk_scheduled_delivery(key, message)
+    if not hook_traces.is_hook_message(message):
+        return consumed
+    session_id = key[0]
+    broadcast = _scheduled_state_carrier(key) or _active_turns.get(session_id)
+    live = broadcast is not None and not broadcast.done
+    turn_id = (
+        str(broadcast.turn_id or "")
+        if live
+        else str(_background_origin_turn_id.get(session_id, "") or "")
+    )
+    origin = (
+        "background"
+        if (live and broadcast.activity_source in {"background", "scheduled"})
+        or (not live and session_id in _sessions_with_inflight_tasks)
+        else "foreground"
+    )
+    trace = await obs.to_thread_io(
+        "chat.hook_trace_write",
+        session_id,
+        hook_traces.observe,
+        session_id,
+        message,
+        turn_id=turn_id,
+        origin=origin,
+    )
+    if trace is not None and live:
+        broadcast.publish({
+            "event": "hook_trace",
+            "data": json.dumps(trace),
+        })
+    return consumed
+
+
 chat_runtime.configure_hooks(chat_runtime.RuntimeHooks(
     sessions=sess,
     normalize_effort=lambda *a, **k: _normalize_effort(*a, **k),
@@ -19153,6 +20869,8 @@ chat_runtime.configure_hooks(chat_runtime.RuntimeHooks(
     active_turns=_active_turns,
     sessions_with_inflight_tasks=_sessions_with_inflight_tasks,
     session_has_live_watcher=lambda *a, **k: _session_has_live_watcher(*a, **k),
+    session_has_scheduled_tasks=lambda *a, **k: _session_has_scheduled_tasks(*a, **k),
+    session_runtime_disconnected=lambda *a, **k: _on_sdk_runtime_disconnected(*a, **k),
     pending_runtime_rebuilds=_pending_runtime_rebuilds,
     client_pool_cap=lambda: _CLIENT_POOL_CAP,
     disconnect_unpooled_client=lambda *a, **k: _disconnect_unpooled_client(*a, **k),
@@ -19162,6 +20880,7 @@ chat_runtime.configure_hooks(chat_runtime.RuntimeHooks(
     join_session_disconnects=lambda *a, **k: _join_session_disconnects(*a, **k),
     evict_failed_session_stream=lambda *a, **k: _evict_failed_session_stream(*a, **k),
     retain_detached_cleanup=lambda *a, **k: _retain_detached_cleanup(*a, **k),
+    observe_stream_message=lambda *a, **k: _observe_sdk_stream_message(*a, **k),
 ))
 
 

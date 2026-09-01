@@ -12,6 +12,7 @@ import asyncio
 from collections import deque
 from contextlib import suppress
 from dataclasses import dataclass
+import inspect
 import sys
 from typing import Any, Callable, Collection, Iterable
 
@@ -34,6 +35,8 @@ class RuntimeHooks:
     active_turns: dict[str, Any]
     sessions_with_inflight_tasks: dict[str, set[str]]
     session_has_live_watcher: Callable[[str], bool]
+    session_has_scheduled_tasks: Callable[[str], bool]
+    session_runtime_disconnected: Callable[[str], None]
     pending_runtime_rebuilds: set[str]
     client_pool_cap: Callable[[], int]
     disconnect_unpooled_client: Callable[..., Any]
@@ -43,6 +46,7 @@ class RuntimeHooks:
     join_session_disconnects: Callable[..., Any]
     evict_failed_session_stream: Callable[[Any], Any]
     retain_detached_cleanup: Callable[[asyncio.Task], None]
+    observe_stream_message: Callable[[ClientKey, Any], Any]
 
 
 _hooks: RuntimeHooks | None = None
@@ -284,6 +288,8 @@ async def get_client(
                         continue
                     if hooks.session_has_live_watcher(candidate_key[0]):
                         continue
+                    if hooks.session_has_scheduled_tasks(candidate_key[0]):
+                        continue
                     candidate_idx = index
                     break
                 if candidate_idx is None:
@@ -359,6 +365,13 @@ class SessionStream:
                 continue
             self._orphans.append(message)
 
+    def park_messages(self, messages: Iterable[Any]) -> None:
+        """Return side-delivery messages to the background/orphan lane."""
+        for message in messages:
+            if message is STREAM_EOF:
+                continue
+            self._orphans.append(message)
+
     def attach_background(self) -> asyncio.Queue:
         queue: asyncio.Queue = asyncio.Queue()
         self._background = queue
@@ -374,6 +387,23 @@ class SessionStream:
             async for message in self.client.receive_messages():
                 if self._closed:
                     break
+                observer = _require_hooks().observe_stream_message
+                try:
+                    observed = observer(self.key, message)
+                    if inspect.isawaitable(observed):
+                        observed = await observed
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    # Trace/observability must not own SDK message delivery.
+                    sys.stderr.write(
+                        f"[chat] stream observer failed sid={self.key[0][:8]} "
+                        f"exc={type(exc).__name__}\n"
+                    )
+                    sys.stderr.flush()
+                    observed = False
+                if observed:
+                    continue
                 queue = self._turn or self._background
                 if queue is not None:
                     queue.put_nowait(message)
@@ -441,6 +471,7 @@ async def evict_failed_session_stream(stream: SessionStream) -> None:
                 CLIENT_LRU.remove(key)
         if SESSION_STREAMS.get(key) is stream:
             SESSION_STREAMS.pop(key, None)
+    _require_hooks().session_runtime_disconnected(key[0])
     try:
         if not await _require_hooks().join_session_disconnects(key[0], (client,)):
             raise RuntimeCleanupTimeout(
@@ -600,6 +631,7 @@ async def disconnect_client(session_id: str) -> None:
     to_disconnect: list[ClaudeSDKClient] = []
     hooks.pending_runtime_rebuilds.discard(session_id)
     await drop_session_streams(session_id)
+    hooks.session_runtime_disconnected(session_id)
     async with CLIENT_LOCK:
         keys = [key for key in CLIENTS if key[0] == session_id]
         for key in keys:

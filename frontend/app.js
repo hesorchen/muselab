@@ -252,6 +252,7 @@ const _EMPTY_ACTIVE_SESSION_PANE = Object.freeze({
   _queueAdmission: null,
   _queuePaused: false,
   backgroundActive: false,
+  scheduledDeliveryActive: false,
   compacting: false,
   _draining: false,
   _loadingEarlier: false,
@@ -319,7 +320,10 @@ function _pruneChatResourceTicketCache(now) {
 
 const CHAT_MUX_STREAM_EVENTS = [
   "startup", "text", "thinking", "tool_use", "tool_result",
+  "subagent_delta", "subagent_block",
+  "hook_trace",
   "compact_progress", "task_started", "task_progress", "task_notification",
+  "scheduled_tasks",
   "queue_steering",
   "rate_limit", "ask_user_question", "permission_request",
   "permission_request_resolved", "permission_mode_changed",
@@ -456,6 +460,15 @@ function portal() {
     _fileSearchSeq: 0, _fileSearchAbort: null,
     searchHits: [], searchTruncated: false,
     grepHits: [], grepTruncated: false,
+    // Aggregate byte progress for workspace-file uploads. Button picks,
+    // directory context uploads and OS-file drops all feed the same batch.
+    fileUploadProgress: {
+      visible: false, known: false, percent: 0,
+      totalFiles: 0, completedFiles: 0, failedFiles: 0, activeFiles: 0,
+    },
+    _fileUploadBatch: null,
+    _fileUploadTransferSeq: 0,
+    _fileUploadHideTimer: null,
 
     // ===== preview =====
     // Drag-and-drop visual state for the preview pane.
@@ -692,6 +705,16 @@ function portal() {
       history: [],
       unreadCount: 0,
       loading: false,
+      // SDK Cron jobs are runtime-owned and belong to one Claude session.
+      // They are read-only here; creation/deletion remains the native tool's
+      // job, while this projection makes the otherwise invisible jobs and
+      // their prompts discoverable from the existing scheduler surface.
+      nativeTasks: [],
+      nativeSessionId: "",
+      nativeSessionName: "",
+      nativeLoading: false,
+      nativeError: "",
+      nativeLoadSeq: 0,
       // Task ids whose DELETE request is waiting for a running turn to cancel.
       // Kept separate from server `run.status` so a slow, destructive action
       // remains visibly owned by the row that initiated it.
@@ -721,6 +744,20 @@ function portal() {
         session_mode: "fresh",
       },
     },
+    // Read-only SDK background-task inspector. The card remains the compact
+    // status surface; this dialog exposes lifecycle metadata and the bounded
+    // `.output` text without routing that temp file through the workspace
+    // browser.
+    taskDetail: {
+      show: false,
+      loading: false,
+      error: "",
+      output: "",
+      status: null,
+      source: null,
+      loadedPath: "",
+    },
+    _taskDetailRequestId: 0,
     // User-owned global scratch TODO clipboard. It is deliberately independent
     // from Muse/Claude Task tools and shared across every conversation and
     // workspace in this browser.
@@ -901,6 +938,7 @@ function portal() {
                           //  has a different shape — overlapping names crash
                           //  Alpine when one side reads .show on the other's null)
     forkingSessionId: "",
+    retryingSessionId: "",
     // Per-tab runtime state. Keyed by session id and authoritative for every
     // session-panel field. Background callbacks keep their captured owner state;
     // the mounted pane resolves the current owner through activeSessionPane().
@@ -952,8 +990,8 @@ function portal() {
     // tabState[currentId].draft; capture/activate keeps these template-facing
     // fields aligned without persisting drafts across a page reload.
     input: "",
-    pendingImages: [],    // [{id, mime, preview (data URL), uploading, error, file}]
-    pendingDocs: [],      // [{id, name, kind: 'pdf'|'text', uploading, error}]
+    pendingImages: [],    // [{id, mime, preview, uploading, progress, progressKnown, error, file}]
+    pendingDocs: [],      // [{id, name, kind, uploading, progress, progressKnown, error}]
     // Selected preview/chat text attached to the current draft. Unlike the
     // old quote action, these never rewrite `input`; they render as removable
     // context chips above the composer and are folded into the actual prompt
@@ -1188,6 +1226,24 @@ function portal() {
       // MCP server list (loaded from /api/settings/mcp)
       mcpServers: [],
       mcpExamples: [],
+      hooks: {
+        loading: false,
+        saving: false,
+        workspace: "",
+        scopes: [],
+        builtin: [],
+        activeScope: "project",
+        draft: {
+          show: false,
+          mode: "create",
+          event: "PreToolUse",
+          matcher: "",
+          handlerType: "command",
+          handlerJson: '{\n  "type": "command",\n  "command": ""\n}',
+          groupIndex: null,
+          handlerIndex: null,
+        },
+      },
       // MCP add-form draft. `transport` picks the shape: "stdio" (local
       // subprocess → command/args) or "remote" (http/sse connector → url +
       // optional Authorization header), mirroring Claude app's local-vs-remote
@@ -1411,6 +1467,7 @@ function portal() {
         ev.stopPropagation();
         if (top === "generic-modal" && this.modal.cancel) this.modal.cancel();
         else if (top === "activity-move") this.closeActivityMoveMenu(true);
+        else if (top === "task-detail") this.closeTaskDetail();
         else if (top === "scheduler") this.closeScheduler();
         else if (top === "session-todo") this.closeSessionTodoBoard();
         else if (top === "activity") this.closeActivityCenter();
@@ -3326,6 +3383,69 @@ function portal() {
         return file;
       }
     },
+    // Fetch deliberately does not expose upload-byte progress.  Use XHR only
+    // for attachment transfer so each pending chip can show a real percentage
+    // while keeping the rest of the app on fetch.  The returned facade matches
+    // the small Response surface consumed below (`ok/status/text/json`).
+    _uploadAttachment(fd, { signal = null, onProgress = null } = {}) {
+      return new Promise((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        let settled = false;
+        const abortError = () => {
+          const error = new Error("The operation was aborted");
+          error.name = "AbortError";
+          return error;
+        };
+        const cleanup = () => {
+          if (signal) signal.removeEventListener("abort", abortRequest);
+        };
+        const finish = (callback, value) => {
+          if (settled) return;
+          settled = true;
+          cleanup();
+          callback(value);
+        };
+        const abortRequest = () => xhr.abort();
+
+        xhr.open("POST", "/api/chat/upload-image", true);
+        for (const [name, value] of Object.entries(this.hdr())) {
+          xhr.setRequestHeader(name, value);
+        }
+        xhr.upload.addEventListener("progress", event => {
+          if (typeof onProgress !== "function") return;
+          onProgress(event.lengthComputable && event.total > 0
+            ? Math.round((event.loaded / event.total) * 100)
+            : null);
+        });
+        xhr.addEventListener("load", () => {
+          if (typeof onProgress === "function") onProgress(100);
+          const responseText = xhr.responseText || "";
+          finish(resolve, {
+            ok: xhr.status >= 200 && xhr.status < 300,
+            status: xhr.status,
+            statusText: xhr.statusText,
+            text: async () => responseText,
+            json: async () => JSON.parse(responseText || "null"),
+          });
+        });
+        xhr.addEventListener("error", () => {
+          finish(reject, new TypeError("Network request failed"));
+        });
+        xhr.addEventListener("abort", () => finish(reject, abortError()));
+        if (signal) {
+          if (signal.aborted) {
+            finish(reject, abortError());
+            return;
+          }
+          signal.addEventListener("abort", abortRequest, { once: true });
+        }
+        try {
+          xhr.send(fd);
+        } catch (error) {
+          finish(reject, error);
+        }
+      });
+    },
     async _attachFile(file) {
       if (this.workspaceSwitching) return;
       const ownerSid = this.currentId;
@@ -3371,7 +3491,8 @@ function portal() {
         // round-tripping back to the server. Memory cost is small (~300 KB
         // per image after compression), cleared on send.
         const raw = { id: null, mime: file.type, preview,
-                       uploading: true, error: false, file };
+                       uploading: true, progress: 0, progressKnown: false,
+                       error: false, file };
         ownerDraft.pendingImages.push(raw);
         // Alpine v3 wraps each pushed item in a Proxy. The local `raw`
         // reference still points at the original (non-proxied) object;
@@ -3384,7 +3505,8 @@ function portal() {
         entry = ownerDraft.pendingImages[ownerDraft.pendingImages.length - 1];
       } else {
         const raw = { id: null, name: file.name, kind,
-                       uploading: true, error: false };
+                       uploading: true, progress: 0, progressKnown: false,
+                       error: false };
         ownerDraft.pendingDocs.push(raw);
         // Same Alpine-proxy gotcha as above — must use the proxied
         // reference for entry.uploading = false to actually trigger UI.
@@ -3401,10 +3523,22 @@ function portal() {
       );
       const ownsEntry = () => ownsDraft()
         && (ownerDraft.pendingImages.includes(entry) || ownerDraft.pendingDocs.includes(entry));
+      const updateProgress = percent => {
+        if (!ownsEntry()) return;
+        if (percent === null) {
+          entry.progressKnown = false;
+          return;
+        }
+        entry.progressKnown = true;
+        entry.progress = Math.max(
+          Number(entry.progress) || 0,
+          Math.max(0, Math.min(100, Math.round(percent))),
+        );
+      };
       try {
-        const r = await fetch("/api/chat/upload-image", {
-          method: "POST", headers: this.hdr(), body: fd,
+        const r = await this._uploadAttachment(fd, {
           signal: uploadController.signal,
+          onProgress: updateProgress,
         });
         if (!ownsEntry()) return;
         if (!r.ok) {
@@ -3421,7 +3555,7 @@ function portal() {
         }
         const d = await r.json();
         if (!ownsEntry()) return;
-        entry.id = d.id; entry.uploading = false;
+        entry.id = d.id; entry.progress = 100; entry.uploading = false;
         // Stash the on-disk extension the server will use when persisting
         // this image at send-time. Used to construct the lightbox URL
         // upfront so the full-res original is accessible even if the
@@ -3785,6 +3919,8 @@ function portal() {
       // holds. Mark uploading so the chip shows the upload progress hairline.
       entry.file = file;
       entry.uploading = true;
+      entry.progress = 0;
+      entry.progressKnown = false;
       entry.error = false;
       entry.preview = await this._imageToThumbDataURL(file);
       if (!ownsEntry()) return;
@@ -3797,10 +3933,22 @@ function portal() {
       const uploadTimeout = setTimeout(
         () => uploadController.abort(), 5 * 60 * 1000,
       );
+      const updateProgress = percent => {
+        if (!ownsEntry()) return;
+        if (percent === null) {
+          entry.progressKnown = false;
+          return;
+        }
+        entry.progressKnown = true;
+        entry.progress = Math.max(
+          Number(entry.progress) || 0,
+          Math.max(0, Math.min(100, Math.round(percent))),
+        );
+      };
       try {
-        const r = await fetch("/api/chat/upload-image", {
-          method: "POST", headers: this.hdr(), body: fd,
+        const r = await this._uploadAttachment(fd, {
           signal: uploadController.signal,
+          onProgress: updateProgress,
         });
         if (!ownsEntry()) return;
         if (!r.ok) {
@@ -3813,7 +3961,7 @@ function portal() {
         }
         const d = await r.json();
         if (!ownsEntry()) return;
-        entry.id = d.id; entry.uploading = false;
+        entry.id = d.id; entry.progress = 100; entry.uploading = false;
         if (d.attach_ext) entry.attach_ext = d.attach_ext;
       } catch (e) {
         if (!ownsEntry()) return;
@@ -4358,7 +4506,84 @@ function portal() {
       if (value === "running") return this.lang === "zh" ? "运行中" : "Running";
       if (value === "completed") return this.lang === "zh" ? "已完成" : "Completed";
       if (value === "failed") return this.lang === "zh" ? "失败" : "Failed";
-      return this.lang === "zh" ? "已中断" : "Interrupted";
+      if (value === "cancelled") return this.lang === "zh" ? "已中断" : "Interrupted";
+      if (value === "stopped") return this.lang === "zh" ? "已停止" : "Stopped";
+      return this.lang === "zh" ? "已结束" : "Ended";
+    },
+    turnOriginLabel(origin) {
+      const kind = String(origin && origin.kind || "");
+      if (!kind || kind === "human") return "";
+      const labels = {
+        "task-notification": this.lang === "zh" ? "任务通知" : "Task notification",
+        "auto-continuation": this.lang === "zh" ? "自动续写" : "Auto continuation",
+        coordinator: this.lang === "zh" ? "协调器" : "Coordinator",
+        observer: this.lang === "zh" ? "观察者" : "Observer",
+        "observer-activity": this.lang === "zh" ? "观察活动" : "Observer activity",
+        peer: this.lang === "zh" ? "同伴 Agent" : "Peer agent",
+        channel: this.lang === "zh" ? "频道" : "Channel",
+        unclassified: this.lang === "zh" ? "SDK 事件" : "SDK event",
+      };
+      return labels[kind] || kind;
+    },
+    turnTerminalReasonLabel(status, reason) {
+      const state = String(status || "");
+      const value = String(reason || "");
+      if (!value || (state === "completed" && value === "completed")) return "";
+      const labels = {
+        max_turns: this.lang === "zh" ? "达到最大轮次" : "Maximum turns reached",
+        aborted_streaming: this.lang === "zh" ? "流已中断" : "Stream aborted",
+        aborted_tools: this.lang === "zh" ? "工具执行已中断" : "Tool execution aborted",
+      };
+      return labels[value] || value;
+    },
+    modelUsageEntries(usage) {
+      if (!usage || typeof usage !== "object" || Array.isArray(usage)) return [];
+      return Object.entries(usage).map(([model, row]) => ({
+        model,
+        ...(row && typeof row === "object" ? row : {}),
+      }));
+    },
+    modelUsageSummary(usage) {
+      const rows = this.modelUsageEntries(usage);
+      if (!rows.length) return "";
+      const tokens = rows.reduce((sum, row) => sum
+        + (Number(row.inputTokens) || 0)
+        + (Number(row.outputTokens) || 0), 0);
+      const cost = rows.reduce(
+        (sum, row) => sum + (Number(row.costUSD) || 0), 0);
+      const modelCount = rows.length > 1
+        ? (this.lang === "zh" ? `${rows.length} 个模型 · ` : `${rows.length} models · `)
+        : "";
+      return `${modelCount}${this.fmtTokens(tokens)} tok · ${this.fmtCost(cost)}`;
+    },
+    modelUsageTitle(row) {
+      if (!row) return "";
+      const model = String(row.canonicalModel || row.model || "");
+      const provider = String(row.provider || "");
+      return provider ? `${model} · ${provider}` : model;
+    },
+    modelUsageDetail(row) {
+      if (!row) return "";
+      const input = Number(row.inputTokens) || 0;
+      const output = Number(row.outputTokens) || 0;
+      const cacheRead = Number(row.cacheReadInputTokens) || 0;
+      const cacheCreate = Number(row.cacheCreationInputTokens) || 0;
+      const context = Number(row.contextWindow) || 0;
+      const maxOutput = Number(row.maxOutputTokens) || 0;
+      const searches = Number(row.webSearchRequests) || 0;
+      const parts = this.lang === "zh"
+        ? [`输入 ${this.fmtTokens(input)}`, `输出 ${this.fmtTokens(output)}`]
+        : [`in ${this.fmtTokens(input)}`, `out ${this.fmtTokens(output)}`];
+      if (cacheRead || cacheCreate) {
+        parts.push(this.lang === "zh"
+          ? `缓存读/写 ${this.fmtTokens(cacheRead)}/${this.fmtTokens(cacheCreate)}`
+          : `cache read/write ${this.fmtTokens(cacheRead)}/${this.fmtTokens(cacheCreate)}`);
+      }
+      if (context) parts.push(`ctx ${this.fmtTokens(context)}`);
+      if (maxOutput) parts.push(`max out ${this.fmtTokens(maxOutput)}`);
+      if (searches) parts.push(this.lang === "zh" ? `搜索 ${searches}` : `search ${searches}`);
+      parts.push(this.fmtCost(Number(row.costUSD) || 0));
+      return parts.join(" · ");
     },
     streamPhaseLabel(phase) {
       const value = String(phase || "");
@@ -4458,6 +4683,29 @@ function portal() {
         if (message.uuid) return message.uuid;
       }
       return "";
+    },
+    retryTurnUserMessage(paneMsgs, i, pane) {
+      const arr = paneMsgs || [];
+      if (i !== arr.length - 1 || i < 0) return null;
+      const tail = arr[i];
+      if (!tail || tail.role === "user"
+          || tail.display_kind === "runtime_continuation"
+          || tail.presentation_only
+          || (pane && (pane.streaming || pane.backgroundActive || pane.compacting))) {
+        return null;
+      }
+      for (let k = i - 1; k >= 0; k -= 1) {
+        const message = arr[k];
+        if (!message || message.role !== "user") continue;
+        if (message._steeringAdjustment === true || message._turnRoot === false) {
+          continue;
+        }
+        if (!message.uuid || message._failed
+            || (message.images && message.images.length)
+            || (message.docs && message.docs.length)) return null;
+        return message;
+      }
+      return null;
     },
     // Normalize a model-emitted path into something openByPathToasted can hand
     // to /api/files/list. Handles three things the model commonly does wrong:
@@ -5340,6 +5588,117 @@ function portal() {
         await this.openFile({ path, name }, { readUrl: url, reveal: true });
       } catch (e) {
         this.toast(this.lang === "zh" ? `打开失败：${path}` : `Open failed: ${path}`, "warn");
+      }
+    },
+
+    _taskDetailSource(message) {
+      const task = message && message.task && typeof message.task === "object"
+        ? message.task : {};
+      const input = message && message.input && typeof message.input === "object"
+        ? message.input : {};
+      return {
+        tool_name: String(message && message.name || ""),
+        task_type: String(task.subagent_type || ""),
+        description: String(
+          task.description || input.description || message && message.summary || "",
+        ),
+      };
+    },
+    taskDetailUsageRows(usage) {
+      if (!usage || typeof usage !== "object" || Array.isArray(usage)) return [];
+      const labels = this.lang === "zh"
+        ? { total_tokens: "总 Token", tool_uses: "工具调用", duration_ms: "耗时" }
+        : { total_tokens: "Total tokens", tool_uses: "Tool calls", duration_ms: "Duration" };
+      return Object.entries(usage).map(([key, value]) => {
+        let display = value;
+        if (key === "duration_ms" && Number.isFinite(Number(value))) {
+          display = this.fmtStreamElapsed(Number(value) / 1000);
+        } else if (key.includes("token") && Number.isFinite(Number(value))) {
+          display = this.fmtTokens(Number(value));
+        }
+        return { key, label: labels[key] || key, value: String(display ?? "") };
+      });
+    },
+    async _loadTaskDetailOutput(status, requestId) {
+      const path = String(status && status.output_file || "");
+      const ownerSid = String(status && status.owner_session_id || this.currentId || "");
+      if (!path || !ownerSid) return;
+      this.taskDetail.loading = true;
+      this.taskDetail.error = "";
+      try {
+        const url = "/api/chat/task-output?session_id="
+          + encodeURIComponent(ownerSid)
+          + "&path=" + encodeURIComponent(path);
+        const response = await fetch(url, { headers: this.hdr() });
+        if (!response.ok) {
+          let reason = "";
+          try {
+            const payload = await response.json();
+            reason = String(payload && payload.detail || "");
+          } catch (_) {}
+          throw new Error(reason || `HTTP ${response.status}`);
+        }
+        const output = await response.text();
+        if (requestId !== this._taskDetailRequestId || !this.taskDetail.show) return;
+        this.taskDetail.output = output;
+        this.taskDetail.loadedPath = path;
+      } catch (error) {
+        if (requestId !== this._taskDetailRequestId || !this.taskDetail.show) return;
+        this.taskDetail.error = String(error && error.message || error || "");
+      } finally {
+        if (requestId === this._taskDetailRequestId) this.taskDetail.loading = false;
+      }
+    },
+    async openTaskDetail(status, message = null, ev = null) {
+      if (!status || typeof status !== "object") return;
+      const opener = ev && ev.currentTarget ? ev.currentTarget : document.activeElement;
+      const snapshot = this._normalizeTaskStatusPreview({ ...status });
+      const requestId = ++this._taskDetailRequestId;
+      this.taskDetail = {
+        show: true,
+        loading: false,
+        error: "",
+        output: "",
+        status: snapshot,
+        source: this._taskDetailSource(message),
+        loadedPath: "",
+      };
+      this._openFocusSurface(
+        "task-detail", ".task-detail-modal", ".task-detail-close",
+        opener, true,
+      );
+      await this._loadTaskDetailOutput(snapshot, requestId);
+    },
+    closeTaskDetail() {
+      const wasOpen = this.taskDetail.show;
+      ++this._taskDetailRequestId;
+      this.taskDetail.show = false;
+      this.taskDetail.loading = false;
+      if (wasOpen) this._closeFocusSurface("task-detail");
+    },
+    async openTaskDetailOutput() {
+      const status = this.taskDetail.status
+        ? { ...this.taskDetail.status } : null;
+      if (!status || !status.output_file) return;
+      this.closeTaskDetail();
+      await this.openTaskOutput(status);
+    },
+    _syncOpenTaskDetail(status, message = null) {
+      const current = this.taskDetail.status;
+      if (!this.taskDetail.show || !current || !status) return;
+      const sameTask = status.task_id && current.task_id
+        && String(status.task_id) === String(current.task_id);
+      const sameTool = status.tool_use_id && current.tool_use_id
+        && String(status.tool_use_id) === String(current.tool_use_id);
+      if (!sameTask && !sameTool) return;
+      const next = this._normalizeTaskStatusPreview({ ...current, ...status });
+      this.taskDetail.status = next;
+      if (message) this.taskDetail.source = this._taskDetailSource(message);
+      const nextPath = String(next.output_file || "");
+      if (nextPath && nextPath !== this.taskDetail.loadedPath
+          && !this.taskDetail.loading) {
+        const requestId = ++this._taskDetailRequestId;
+        void this._loadTaskDetailOutput(next, requestId);
       }
     },
 
@@ -7820,6 +8179,18 @@ function portal() {
         // task settlement opens a continuation broadcast.
         backgroundActive: false,
         backgroundTaskCount: 0,
+        scheduledDeliveryActive: false,
+        // SDK-owned nested Subagent transcripts.  Parent history paints first;
+        // this independent lane hydrates quietly and accepts live sidechain
+        // deltas without ever inserting them into the parent message array.
+        subagentThreads: [],
+        subagentsLoading: false,
+        subagentsLoaded: false,
+        subagentGeneration: 0,
+        hookTraces: [],
+        hookTracesLoading: false,
+        hookTracesLoaded: false,
+        hookTraceGeneration: 0,
         // A detached task still belongs to the pre-rollover runtime. The
         // visible successor can run foreground turns independently while this
         // separate counter keeps the inherited task card/footer live.
@@ -7932,6 +8303,7 @@ function portal() {
         _reconcileTargetUpdated: 0,
         _reconcileRetryN: 0,
         _pendingExternalUpdate: false,
+        _scheduledHistoryRevision: "",
         // A Result boundary may race with the next stream taking ownership of
         // the same pane. Retain the latest completion check until an owner-free
         // moment instead of silently consuming the reconciliation request.
@@ -9583,6 +9955,7 @@ function portal() {
       let active = false, startedAt = 0, turnId = "";
       let uText = "", uImages = [], uDocs = [];
       let continuation = false;
+      let scheduled = false;
       let background = false, attachable = true, backgroundTaskCount = 0;
       let activitySource = "";
       try {
@@ -9593,8 +9966,11 @@ function portal() {
         if (r.ok) {
           const d = await r.json();
           active = !!d.active; startedAt = d.started_at;
+          this._setScheduledTaskState(
+            sid, !!d.scheduled_active, d.scheduled_count);
           turnId = d.turn_id || "";
           continuation = !!d.continuation;
+          scheduled = !!d.scheduled;
           background = !!d.background;
           attachable = d.attachable !== false;
           activitySource = String(d.activity_source || "");
@@ -9733,13 +10109,15 @@ function portal() {
         // two queued turns are allowed to contain identical prompts.
         const turnUser = this._installActiveTurnUser(
           st, turnId, uText, uImages, uDocs);
+        if (turnUser && scheduled) turnUser.message._scheduledTrigger = true;
         if (turnUser && turnUser.appended) {
           this._scheduleLiveMessageViewport(st);
           st.atBottom = true;
           this.scrollToBottom(true);
         }
         if (st && turnId) st.activeTurnId = turnId;
-        this.send({ reconnect: true, sessionId: sid, turnId, startedAt });
+        this.send({ reconnect: true, sessionId: sid, turnId, startedAt,
+                    scheduled });
         this.$nextTick(() => this._syncQueueFromServer(sid));
         return;
       }
@@ -10882,6 +11260,12 @@ function portal() {
         try { state = JSON.parse(ev.data) || {}; } catch (_) {}
         void this._handleChatMuxSessionState(state);
       });
+      source.addEventListener("scheduled_history", ev => {
+        if (this._chatMuxSource !== source) return;
+        let payload = {};
+        try { payload = JSON.parse(ev.data) || {}; } catch (_) {}
+        this._handleScheduledHistoryUpdate(payload);
+      });
       for (const type of CHAT_MUX_STREAM_EVENTS) {
         source.addEventListener(type, ev => {
           if (this._chatMuxSource !== source) return;
@@ -10917,6 +11301,25 @@ function portal() {
       // The per-session reducers retain logical ownership while the one native
       // transport reconnects. In particular, do not synthesize `error`/`done`.
       this._scheduleChatMuxReconnect();
+    },
+    _handleScheduledHistoryUpdate(payload) {
+      const sid = String(payload && payload.session_id || "");
+      if (!sid) return;
+      const st = this._ensureTabState(sid);
+      const revision = String(payload.revision || "");
+      if (revision && st._scheduledHistoryRevision === revision) return;
+      if (revision) st._scheduledHistoryRevision = revision;
+
+      // The SDK has already committed the autonomous turn to canonical JSONL.
+      // Only request the existing quiet history reconciliation here: the root
+      // mux event deliberately carries no prompt or assistant content.
+      st._pendingExternalUpdate = true;
+      if (sid !== this.currentId) st.unread = true;
+      if (st.streaming || st.es) return;
+      void this._requestSessionSync(sid, "history_revision", {
+        targetUpdated: 0,
+        delayMs: 0,
+      });
     },
     _queueChatMuxEvent(sid, type, data) {
       let pending = this._chatMuxPendingEvents.get(sid);
@@ -11009,6 +11412,7 @@ function portal() {
           meta.turn_active = false;
           meta.background_active = false;
         }
+        if (existingState) existingState.scheduledDeliveryActive = false;
         this._chatMuxPendingEvents.delete(sid);
         const ownsInactiveTurn = !!(existingState && inactiveTurnId
           && currentTurnId === inactiveTurnId);
@@ -11079,6 +11483,9 @@ function portal() {
         meta.turn_active = !payload.background;
         meta.background_active = !!payload.background;
       }
+      if (existingState) {
+        existingState.scheduledDeliveryActive = !!payload.scheduled;
+      }
       if (payload.attachable === false) {
         // Watcher-only ownership has no replayable turn yet. Preserve its blue
         // dot/background state, but do not create a reducer runtime until the
@@ -11111,12 +11518,26 @@ function portal() {
         }
         if (st.streaming || st.es || this.tabState[sid] !== st) return;
         st.parentTurnId = String(payload.parent_turn_id || "");
+        st.scheduledDeliveryActive = !!payload.scheduled;
+        const turnUser = !payload.continuation
+          ? this._installActiveTurnUser(
+              st,
+              turnId,
+              String(payload.user_text || ""),
+              Array.isArray(payload.user_images) ? payload.user_images : [],
+              Array.isArray(payload.user_docs) ? payload.user_docs : [],
+            )
+          : null;
+        if (turnUser && payload.scheduled) {
+          turnUser.message._scheduledTrigger = true;
+        }
         await this.send({
           reconnect: true,
           sessionId: sid,
           turnId,
           startedAt: payload.started_at,
           continuation: !!payload.continuation,
+          scheduled: !!payload.scheduled,
           _muxAttach: true,
         });
       })();
@@ -11922,6 +12343,8 @@ function portal() {
         if (!!x.active !== !!y.active) return false;
         if (!!x.turn_active !== !!y.turn_active) return false;
         if (!!x.background_active !== !!y.background_active) return false;
+        if (!!x.scheduled_active !== !!y.scheduled_active) return false;
+        if ((x.scheduled_count || 0) !== (y.scheduled_count || 0)) return false;
         if ((x.updated_at || 0) !== (y.updated_at || 0)) return false;
         if ((x.message_count || 0) !== (y.message_count || 0)) return false;
         if ((x.permission || "") !== (y.permission || "")) return false;
@@ -13267,8 +13690,27 @@ function portal() {
       const s = this.sessions.find(x => x.id === tid);
       return !!(s && s.background_active);
     },
+    _setScheduledTaskState(tid, active, count = 0) {
+      if (!tid) return;
+      const normalizedCount = Math.max(0, Math.floor(Number(count) || 0));
+      this.sessions = (this.sessions || []).map(session => session.id === tid
+        ? {
+            ...session,
+            scheduled_active: !!active,
+            scheduled_count: normalizedCount,
+          }
+        : session);
+    },
+    isTabScheduledActive(tid) {
+      const st = this.tabState[tid];
+      if (st && st.scheduledDeliveryActive) return true;
+      const session = this.sessions.find(item => item.id === tid);
+      return !!(session && session.scheduled_active);
+    },
     isTabRunning(tid) {
-      return this.isTabBackgroundActive(tid) || this.isTabStreaming(tid);
+      return this.isTabScheduledActive(tid)
+        || this.isTabBackgroundActive(tid)
+        || this.isTabStreaming(tid);
     },
     isTabUnread(tid) {
       // True when this tab's most recent turn finished while the user was
@@ -13642,6 +14084,265 @@ function portal() {
         done:      "✅ " + this.t("subagent.task_completed"),
       };
       return map[state] || map.running;
+    },
+    _subagentThreadFor(state, parentToolUseId) {
+      if (!state || !parentToolUseId) return null;
+      return (state.subagentThreads || []).find(thread =>
+        !thread.orphaned
+        && String(thread.parent_tool_use_id || "") === String(parentToolUseId)
+      ) || null;
+    },
+    _ensureSubagentThread(state, parentToolUseId) {
+      let thread = this._subagentThreadFor(state, parentToolUseId);
+      if (thread) return thread;
+      thread = {
+        session_id: "",
+        agent_id: null,
+        parent_tool_use_id: String(parentToolUseId || ""),
+        parent_agent_id: null,
+        orphaned: false,
+        message_count: 0,
+        blocks: [],
+        _live: true,
+      };
+      state.subagentThreads.push(thread);
+      return state.subagentThreads[state.subagentThreads.length - 1];
+    },
+    _applySubagentDelta(sid, state, payload) {
+      const d = payload || {};
+      if (!state || this.tabState[sid] !== state) return;
+      if (d.session_id && String(d.session_id) !== String(sid)) return;
+      const parent = String(d.parent_tool_use_id || "");
+      const blockId = String(d.block_id || "");
+      const kind = String(d.kind || "");
+      const delta = typeof d.delta === "string" ? d.delta : "";
+      const offset = Number(d.offset);
+      if (!parent || !blockId || !delta
+          || !["assistant", "thinking"].includes(kind)
+          || !Number.isInteger(offset) || offset < 0) return;
+      const thread = this._ensureSubagentThread(state, parent);
+      let block = (thread.blocks || []).find(row => row.block_id === blockId);
+      if (!block) {
+        block = {
+          session_id: sid,
+          parent_tool_use_id: parent,
+          parent_agent_id: d.parent_agent_id || null,
+          agent_id: d.agent_id || null,
+          message_uuid: String(d.message_uuid || ""),
+          source_block_index: Number(d.source_block_index) || 0,
+          block_id: blockId,
+          role: kind,
+          text: "",
+          _live: true,
+          _livePartial: true,
+        };
+        thread.blocks.push(block);
+        block = thread.blocks[thread.blocks.length - 1];
+      }
+      const current = String(block.text || "");
+      if (offset === current.length) {
+        block.text = current + delta;
+        block._live = true;
+        block._livePartial = true;
+        return;
+      }
+      // Replayed SSE fragments are harmless. A real gap/conflict is repaired
+      // from the SDK history instead of guessing a missing prefix.
+      if (offset < current.length
+          && current.slice(offset, offset + delta.length) === delta) return;
+      void this.hydrateSubagents(sid, state, { quiet: true });
+    },
+    _applySubagentBlock(sid, state, payload) {
+      const d = payload || {};
+      if (!state || this.tabState[sid] !== state) return;
+      if (d.session_id && String(d.session_id) !== String(sid)) return;
+      const parent = String(d.parent_tool_use_id || "");
+      const blockId = String(d.block_id || "");
+      if (!parent || !blockId || !d.block || typeof d.block !== "object") return;
+      const thread = this._ensureSubagentThread(state, parent);
+      const finalBlock = { ...d.block, _live: true, _livePartial: false };
+      const index = thread.blocks.findIndex(row => row.block_id === blockId);
+      if (index >= 0) thread.blocks.splice(index, 1, finalBlock);
+      else thread.blocks.push(finalBlock);
+    },
+    async hydrateSubagents(sid, expectedState = null, opts = {}) {
+      const state = expectedState || this._ensureTabState(sid);
+      if (!sid || this.tabState[sid] !== state || state.subagentsLoading) return false;
+      const generation = ++state.subagentGeneration;
+      state.subagentsLoading = true;
+      try {
+        const response = await this._fetchWithDeadline(
+          `/api/chat/sessions/${encodeURIComponent(sid)}/subagents`,
+          { headers: this.hdr() },
+          20_000,
+        );
+        if (!response.ok) return false;
+        const payload = await response.json();
+        if (this.tabState[sid] !== state
+            || generation !== state.subagentGeneration) return false;
+        const incoming = Array.isArray(payload.threads)
+          ? payload.threads.map(thread => ({
+            ...thread,
+            blocks: Array.isArray(thread.blocks)
+              ? thread.blocks.map(block => ({ ...block })) : [],
+          })) : [];
+        // Keep frames received after the history snapshot. Final live blocks
+        // and longer partial prefixes win; the next quiet hydrate converges
+        // them to the SDK transcript once persistence catches up.
+        for (const liveThread of state.subagentThreads || []) {
+          let target = incoming.find(thread =>
+            !thread.orphaned && !liveThread.orphaned
+            && String(thread.parent_tool_use_id || "")
+              === String(liveThread.parent_tool_use_id || "")
+          );
+          if (!target) {
+            incoming.push(liveThread);
+            continue;
+          }
+          for (const liveBlock of liveThread.blocks || []) {
+            const index = target.blocks.findIndex(
+              block => block.block_id === liveBlock.block_id);
+            if (index < 0) target.blocks.push(liveBlock);
+            else if (liveBlock._live && (
+              !liveBlock._livePartial
+              || String(liveBlock.text || "").length
+                > String(target.blocks[index].text || "").length
+            )) target.blocks.splice(index, 1, liveBlock);
+          }
+        }
+        state.subagentThreads = incoming;
+        state.subagentsLoaded = true;
+        return true;
+      } catch (_) {
+        if (!opts.quiet) {
+          this.toast(this.lang === "zh"
+            ? "Subagent 执行过程加载失败" : "Failed to load Subagent timeline", "warn");
+        }
+        return false;
+      } finally {
+        if (this.tabState[sid] === state
+            && generation === state.subagentGeneration) {
+          state.subagentsLoading = false;
+        }
+      }
+    },
+    subagentTimelineFor(state, parentToolUseId) {
+      if (!state || !parentToolUseId) return [];
+      const threads = state.subagentThreads || [];
+      const output = [];
+      const visited = new Set();
+      const walk = (parent, depth) => {
+        if (depth > 12 || output.length >= 1000 || visited.has(parent)) return;
+        visited.add(parent);
+        for (const thread of threads) {
+          if (thread.orphaned
+              || String(thread.parent_tool_use_id || "") !== String(parent)) continue;
+          for (const block of thread.blocks || []) {
+            output.push({ ...block, _depth: depth });
+            if (block.role === "tool_use"
+                && (block.name === "Agent" || block.name === "Task")
+                && block.id) walk(String(block.id), depth + 1);
+          }
+        }
+      };
+      walk(String(parentToolUseId), 0);
+      return output;
+    },
+    subagentBlockLabel(block) {
+      if (!block) return "";
+      if (block.role === "thinking") return this.lang === "zh" ? "思考" : "Thinking";
+      if (block.role === "assistant") return this.lang === "zh" ? "回复" : "Reply";
+      if (block.role === "tool_use") return block.name || (this.lang === "zh" ? "工具" : "Tool");
+      if (block.role === "tool_result") {
+        return block.is_error
+          ? (this.lang === "zh" ? "工具失败" : "Tool failed")
+          : (this.lang === "zh" ? "工具结果" : "Tool result");
+      }
+      return block.role || "";
+    },
+    subagentBlockBody(block) {
+      if (!block) return "";
+      return String(block.text || block.summary || block.preview || "");
+    },
+    _applyHookTrace(sid, state, payload) {
+      const trace = payload && typeof payload === "object" ? payload : null;
+      if (!trace || !state || this.tabState[sid] !== state) return;
+      const traceId = String(trace.trace_id || "");
+      if (!traceId || (trace.session_id && trace.session_id !== sid)) return;
+      const index = state.hookTraces.findIndex(row => row.trace_id === traceId);
+      const normalized = { ...trace };
+      if (index >= 0) state.hookTraces.splice(index, 1, normalized);
+      else state.hookTraces.push(normalized);
+    },
+    async hydrateHookTraces(sid, expectedState = null) {
+      const state = expectedState || this._ensureTabState(sid);
+      if (!sid || this.tabState[sid] !== state || state.hookTracesLoading) return false;
+      const generation = ++state.hookTraceGeneration;
+      state.hookTracesLoading = true;
+      try {
+        const response = await this._fetchWithDeadline(
+          `/api/chat/sessions/${encodeURIComponent(sid)}/hook-traces`,
+          { headers: this.hdr(), cache: "no-store" },
+          15_000,
+        );
+        if (!response.ok) return false;
+        const payload = await response.json();
+        if (this.tabState[sid] !== state
+            || generation !== state.hookTraceGeneration) return false;
+        const incoming = Array.isArray(payload.traces) ? payload.traces : [];
+        const byId = new Map(incoming.map(trace => [trace.trace_id, { ...trace }]));
+        for (const live of state.hookTraces || []) {
+          const stored = byId.get(live.trace_id);
+          if (!stored || Number(live.updated_at_ms) > Number(stored.updated_at_ms)) {
+            byId.set(live.trace_id, live);
+          }
+        }
+        state.hookTraces = Array.from(byId.values()).sort(
+          (a, b) => Number(a.started_at_ms) - Number(b.started_at_ms));
+        state.hookTracesLoaded = true;
+        return true;
+      } catch (_) {
+        return false;
+      } finally {
+        if (this.tabState[sid] === state
+            && generation === state.hookTraceGeneration) {
+          state.hookTracesLoading = false;
+        }
+      }
+    },
+    hookTracesForTurn(state, message) {
+      if (!state || !message) return [];
+      const turnId = String(message.turn_id || message._turnId || "");
+      if (!turnId) return [];
+      return (state.hookTraces || []).filter(
+        trace => String(trace.turn_id || "") === turnId);
+    },
+    hookTraceSummary(state, message) {
+      const traces = this.hookTracesForTurn(state, message);
+      if (!traces.length) return "";
+      const failed = traces.filter(trace => trace.status === "failed").length;
+      const running = traces.filter(trace => trace.status === "running").length;
+      const prefix = this.lang === "zh" ? `· Hooks ${traces.length}` : `· ${traces.length} Hooks`;
+      if (failed) return `${prefix} · ${failed} ${this.lang === "zh" ? "失败" : "failed"}`;
+      if (running) return `${prefix} · ${running} ${this.lang === "zh" ? "运行中" : "running"}`;
+      return prefix;
+    },
+    hookTraceStatusLabel(trace) {
+      const status = String((trace && trace.status) || "");
+      if (status === "running") return this.lang === "zh" ? "运行中" : "Running";
+      if (status === "failed") return this.lang === "zh" ? "失败" : "Failed";
+      return this.lang === "zh" ? "完成" : "Done";
+    },
+    hookTraceDuration(trace) {
+      const duration = Number(trace && trace.duration_ms);
+      if (!Number.isFinite(duration) || duration < 0) return "";
+      if (duration < 1000) return `${Math.round(duration)}ms`;
+      return `${(duration / 1000).toFixed(duration < 10000 ? 1 : 0)}s`;
+    },
+    currentSessionHookTraces() {
+      const state = this.currentId && this.tabState[this.currentId];
+      return state && Array.isArray(state.hookTraces)
+        ? state.hookTraces.slice().reverse().slice(0, 24) : [];
     },
     // Skill card data — name + description + trigger summary.
     skillCardInfo(m) {
@@ -15357,26 +16058,43 @@ function portal() {
     // drop handlers (onPreviewDrop, tree-onDrop multi-file) so the caller
     // can batch the side effects. Returns uploaded path metadata on success,
     // false on error.
-    async _uploadFileQuiet(dirPath, file) {
-      const fd = new FormData();
-      fd.append("path", dirPath);
-      fd.append("file", file);
+    async _uploadFileQuiet(
+      dirPath,
+      file,
+      { reportError = false, ownerWorkspace = "" } = {},
+    ) {
+      const transfer = this._beginFileUploadTransfer(file);
+      let succeeded = false;
       try {
-        const r = await fetch("/api/files/upload", {
-          method: "POST", headers: this.fileHdr(), body: fd,
-        });
+        const r = await this._uploadWorkspaceFile(dirPath, file, transfer);
         if (!r.ok) {
           console.warn("[upload]", file.name, "failed:", r.status);
+          if (
+            reportError
+            && (!ownerWorkspace || this._workspaceIsCurrent(ownerWorkspace))
+          ) {
+            const detail = await r.text().catch(() => "");
+            this.errToast("upload", detail || `HTTP ${r.status}`);
+          }
           return false;
         }
-        const data = await r.json().catch(() => ({}));
+        const data = (await r.json().catch(() => ({}))) || {};
+        succeeded = true;
         return {
           path: data.path || (dirPath ? `${dirPath}/${file.name}` : file.name),
           replaced_trash_id: data.replaced_trash_id || null,
         };
       } catch (e) {
         console.warn("[upload]", file.name, "error:", e);
+        if (
+          reportError
+          && (!ownerWorkspace || this._workspaceIsCurrent(ownerWorkspace))
+        ) {
+          this.errToast("upload", String((e && e.message) || e));
+        }
         return false;
+      } finally {
+        this._finishFileUploadTransfer(transfer, succeeded);
       }
     },
     _prepareUploadOverwrite(dirPath, files) {
@@ -16044,6 +16762,106 @@ function portal() {
         if (this.forkingSessionId === id) this.forkingSessionId = "";
       }
     },
+    async retryLastTurn(sourceId, userMessage) {
+      if (!sourceId || !userMessage || !userMessage.uuid
+          || this.workspaceSwitching || this.retryingSessionId) return null;
+      if (this._isBusy(sourceId)) {
+        this.toast(
+          this.lang === "zh"
+            ? "等当前任务和后台任务完成后再重试"
+            : "Wait for the current and background work to finish before retrying",
+          "warn", 2600,
+        );
+        return null;
+      }
+      this.retryingSessionId = sourceId;
+      const displayText = this.userVisibleText(userMessage);
+      try {
+        const response = await fetch(
+          `/api/chat/sessions/${encodeURIComponent(sourceId)}/retry-last-turn`,
+          {
+            method: "POST",
+            headers: { ...this.hdr(), "Content-Type": "application/json" },
+            body: JSON.stringify({ user_message_id: userMessage.uuid }),
+          },
+        );
+        if (!response.ok) {
+          let detail = "";
+          try {
+            const body = await response.json();
+            detail = String(body && body.detail || "");
+          } catch (_) {}
+          let message = this.lang === "zh"
+            ? "无法重试最后一轮"
+            : "Could not retry the last turn";
+          if (/attachment/i.test(detail)) {
+            message = this.lang === "zh"
+              ? "包含附件的回合需要重新附加文件后发送"
+              : "Re-attach the files before retrying an attachment turn";
+          } else if (/latest user turn/i.test(detail)) {
+            message = this.lang === "zh"
+              ? "会话历史已变化，请刷新后重试"
+              : "The session changed; refresh before retrying";
+          } else if (response.status === 409) {
+            message = this.lang === "zh"
+              ? "当前会话还未到安全的重试边界"
+              : "The session is not at a safe retry boundary yet";
+          }
+          this.toast(message, "error", 3800);
+          return null;
+        }
+
+        const payload = await response.json();
+        const newId = String(payload.id || payload.session_id || "");
+        const prompt = String(payload.prompt || "");
+        if (!newId || !prompt) throw new Error("retry response is incomplete");
+        const source = this.sessions.find(session => session.id === sourceId) || {};
+        const meta = { ...payload, id: newId, session_id: newId, active: false };
+        for (const field of [
+          "prompt", "source_session_id", "target_user_message_id", "retry_mode",
+          "retry_source_session_id", "retry_target_user_uuid",
+          "retry_resume_session_at",
+        ]) delete meta[field];
+        meta.cwd = meta.cwd || source.cwd || this.currentWorkspacePath();
+        this.sessions = [
+          meta,
+          ...this.sessions.filter(session => session.id !== newId),
+        ];
+        this._sessionsEtag = "";
+        const state = this._ensureTabState(newId);
+        state._loaded = false;
+        await this.openTab(newId);
+        const started = await this.send({
+          sessionId: newId,
+          detachedText: prompt,
+          detachedDisplayText: displayText || prompt,
+        });
+        if (started === false) {
+          this.toast(
+            this.lang === "zh"
+              ? "重试分支已创建，但发送尚未启动"
+              : "The retry branch was created, but sending did not start",
+            "warn", 4000,
+          );
+          return meta;
+        }
+        this.toast(
+          this.lang === "zh"
+            ? "已在新分支重试，原会话保持不变"
+            : "Retrying in a new branch; the source remains unchanged",
+          "success", 3000,
+        );
+        return meta;
+      } catch (_) {
+        this.toast(
+          this.lang === "zh" ? "重试最后一轮失败" : "Could not retry the last turn",
+          "error", 3800,
+        );
+        return null;
+      } finally {
+        if (this.retryingSessionId === sourceId) this.retryingSessionId = "";
+      }
+    },
     async menuFork(id) {
       this.closeTabMenu();
       return await this.forkConversation(id);
@@ -16353,6 +17171,8 @@ function portal() {
         if (!r.ok) return;
         const d = await r.json();
         if (this.tabState[sid] !== st) return;
+        this._setScheduledTaskState(
+          sid, !!d.scheduled_active, d.scheduled_count);
         const probedTurnId = String(d.turn_id || "");
         if (d.active && !d.background && probedTurnId
             && probedTurnId === String(st._lastTerminalTurnId || "")) {
@@ -16418,6 +17238,9 @@ function portal() {
               Array.isArray(d.user_docs) ? d.user_docs : [],
             )
           : null;
+        if (activeTurnUser && d.scheduled) {
+          activeTurnUser.message._scheduledTrigger = true;
+        }
         if (activeTurnUser && activeTurnUser.appended) {
           this._scheduleLiveMessageViewport(st);
           if (this.currentId === sid && st.atBottom !== false) {
@@ -16434,6 +17257,7 @@ function portal() {
         }
         if (d.active && !st.streaming && !st.es) {
           st._serverActiveObserved = true;
+          st.scheduledDeliveryActive = !!d.scheduled;
           // Rate-limited: a reconnect replays the whole turn over a wiped
           // pane, and this probe runs from ~8 different pollers. Without the
           // gate they compound into a visible reconnect storm (2026-08-04).
@@ -16452,9 +17276,11 @@ function portal() {
           // continuation mode so we DON'T truncate the launching card.
           this.send({ reconnect: true, sessionId: sid,
                        turnId: d.turn_id || "", startedAt: d.started_at,
-                       continuation: !!d.continuation });
+                       continuation: !!d.continuation,
+                       scheduled: !!d.scheduled });
           return;
         }
+        st.scheduledDeliveryActive = false;
         this._setBackgroundTaskActive(sid, false);
         st.activeTurnId = "";
         st.parentTurnId = "";
@@ -16864,6 +17690,11 @@ function portal() {
         // response coordinates. Canonical envelopes remain untouched.
         this._scheduleHistoryViewport(st, "newer");
         this._syncSessionMessageStore(st);
+        // Nested history is independent of the parent transcript. Paint the
+        // conversation first, then hydrate Subagent cards without extending
+        // the session-load critical path.
+        void this.hydrateSubagents(sid, st, { quiet: true });
+        void this.hydrateHookTraces(sid, st);
         if (quiet && sid === this.currentId) {
           const domConverged = await this._ensureTranscriptDomConverged(sid, st, {
             scrollEl: quietScrollEl,
@@ -17531,6 +18362,9 @@ function portal() {
             elapsed: existingTail.elapsed,
             model: existingTail.model,
             turn_status: existingTail.turn_status,
+            terminal_reason: existingTail.terminal_reason,
+            turn_origin: existingTail.turn_origin,
+            model_usage: existingTail.model_usage,
             memoryRecall: existingTail.memoryRecall,
           }
         : null;
@@ -17579,6 +18413,9 @@ function portal() {
           elapsed: matched.elapsed,
           model: matched.model,
           turn_status: matched.turn_status,
+          terminal_reason: matched.terminal_reason,
+          turn_origin: matched.turn_origin,
+          model_usage: matched.model_usage,
           memoryRecall: matched.memoryRecall,
         } : null;
         const canonicalFields = { ...canonical };
@@ -17590,6 +18427,15 @@ function portal() {
           if (liveFields.model && !matched.model) matched.model = liveFields.model;
           if (liveFields.turn_status && !matched.turn_status) {
             matched.turn_status = liveFields.turn_status;
+          }
+          if (liveFields.terminal_reason && !matched.terminal_reason) {
+            matched.terminal_reason = liveFields.terminal_reason;
+          }
+          if (liveFields.turn_origin && !matched.turn_origin) {
+            matched.turn_origin = liveFields.turn_origin;
+          }
+          if (liveFields.model_usage && !matched.model_usage) {
+            matched.model_usage = liveFields.model_usage;
           }
           if (liveFields.memoryRecall) matched.memoryRecall = liveFields.memoryRecall;
         }
@@ -17709,6 +18555,15 @@ function portal() {
         if (!canonicalTail.turn_status && liveFooter.turn_status) {
           canonicalTail.turn_status = liveFooter.turn_status;
         }
+        if (!canonicalTail.terminal_reason && liveFooter.terminal_reason) {
+          canonicalTail.terminal_reason = liveFooter.terminal_reason;
+        }
+        if (!canonicalTail.turn_origin && liveFooter.turn_origin) {
+          canonicalTail.turn_origin = liveFooter.turn_origin;
+        }
+        if (!canonicalTail.model_usage && liveFooter.model_usage) {
+          canonicalTail.model_usage = liveFooter.model_usage;
+        }
         if (!canonicalTail.memoryRecall && liveFooter.memoryRecall) {
           canonicalTail.memoryRecall = liveFooter.memoryRecall;
         }
@@ -17762,6 +18617,15 @@ function portal() {
       if (!Object.prototype.hasOwnProperty.call(m, "model")) m.model = "";
       if (!Object.prototype.hasOwnProperty.call(m, "turn_status")) {
         m.turn_status = "";
+      }
+      if (!Object.prototype.hasOwnProperty.call(m, "terminal_reason")) {
+        m.terminal_reason = "";
+      }
+      if (!Object.prototype.hasOwnProperty.call(m, "turn_origin")) {
+        m.turn_origin = null;
+      }
+      if (!Object.prototype.hasOwnProperty.call(m, "model_usage")) {
+        m.model_usage = null;
       }
       if (!Object.prototype.hasOwnProperty.call(m, "memoryRecall")) {
         m.memoryRecall = null;
@@ -18507,12 +19371,16 @@ function portal() {
       // Mobile: stay at the top-level menu (activePage=null) and let the
       // user drill in; selecting a row shows that section + a Back button.
       this.settings.activePage = activePage === "memory"
-        ? "memory" : (this.isWideScreen ? "provider" : null);
+        ? "memory"
+        : activePage === "hooks"
+          ? "hooks"
+          : (this.isWideScreen ? "provider" : null);
       this.settings.show = true;
       // Load MCP + Skill in parallel — non-fatal if any fails. Cost dashboard
       // stays lazy because Codex quota refresh intentionally runs a CLI probe.
       this.refreshMcpList();
       this.refreshSkillList();
+      if (activePage === "hooks") this.loadHookSettings();
       this.loadClaudeAuthStatus();
       this.loadMemorySettings();
     },
@@ -19126,6 +19994,240 @@ function portal() {
         });
       }
       return stats;
+    },
+
+    hookActiveScope() {
+      const hooks = this.settings.hooks;
+      return (hooks.scopes || []).find(
+        scope => scope.scope === hooks.activeScope) || null;
+    },
+    hookRows(scope = null) {
+      const selected = scope || this.hookActiveScope();
+      if (!selected || !selected.hooks || typeof selected.hooks !== "object") return [];
+      const rows = [];
+      for (const [event, groups] of Object.entries(selected.hooks)) {
+        if (!Array.isArray(groups)) continue;
+        groups.forEach((group, groupIndex) => {
+          const handlers = group && Array.isArray(group.hooks) ? group.hooks : [];
+          handlers.forEach((handler, handlerIndex) => rows.push({
+            event,
+            matcher: String((group && group.matcher) || ""),
+            groupIndex,
+            handlerIndex,
+            handler,
+          }));
+        });
+      }
+      return rows;
+    },
+    hookHandlerSummary(handler) {
+      const h = handler || {};
+      const value = h.command || h.url || h.prompt || h.statusMessage || "";
+      return String(value || h.type || "").replace(/\s+/g, " ").slice(0, 180);
+    },
+    _newHookDraft() {
+      return {
+        show: true,
+        mode: "create",
+        event: "PreToolUse",
+        originalEvent: "",
+        matcher: "",
+        handlerType: "command",
+        handlerJson: '{\n  "type": "command",\n  "command": ""\n}',
+        groupIndex: null,
+        handlerIndex: null,
+      };
+    },
+    startAddHook() {
+      this.settings.hooks.draft = this._newHookDraft();
+    },
+    editHook(row) {
+      this.settings.hooks.draft = {
+        show: true,
+        mode: "edit",
+        event: row.event,
+        originalEvent: row.event,
+        matcher: row.matcher || "",
+        handlerType: ["command", "http", "mcp_tool", "prompt", "agent"]
+          .includes(String((row.handler && row.handler.type) || ""))
+          ? String(row.handler.type) : "custom",
+        handlerJson: JSON.stringify(row.handler || {}, null, 2),
+        groupIndex: row.groupIndex,
+        handlerIndex: row.handlerIndex,
+      };
+    },
+    cancelHookDraft() {
+      this.settings.hooks.draft = { ...this._newHookDraft(), show: false };
+    },
+    hookHandlerTemplate(type) {
+      const templates = {
+        command: { type: "command", command: "" },
+        http: { type: "http", url: "", headers: {} },
+        mcp_tool: { type: "mcp_tool", server: "", tool: "", input: {} },
+        prompt: { type: "prompt", prompt: "" },
+        agent: { type: "agent", prompt: "" },
+      };
+      return templates[String(type || "")] || null;
+    },
+    onHookHandlerTypeChange() {
+      const draft = this.settings.hooks.draft;
+      const template = this.hookHandlerTemplate(draft.handlerType);
+      if (template) draft.handlerJson = JSON.stringify(template, null, 2);
+    },
+    async loadHookSettings() {
+      const hooks = this.settings.hooks;
+      if (hooks.loading) return;
+      hooks.loading = true;
+      try {
+        const response = await fetch("/api/settings/hooks", {
+          headers: this.conversationHdr(),
+          cache: "no-store",
+        });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const payload = await response.json();
+        hooks.workspace = payload.workspace || this.currentWorkspacePath();
+        hooks.scopes = Array.isArray(payload.scopes) ? payload.scopes : [];
+        hooks.builtin = Array.isArray(payload.builtin_hooks)
+          ? payload.builtin_hooks : [];
+        if (!hooks.scopes.some(scope => scope.scope === hooks.activeScope)) {
+          hooks.activeScope = "project";
+        }
+      } catch (error) {
+        this.toast(this.lang === "zh" ? "Hook 配置加载失败" : "Failed to load Hooks", "error");
+      } finally {
+        hooks.loading = false;
+      }
+    },
+    async _hookMutationError(response) {
+      let message = `HTTP ${response.status}`;
+      try {
+        const payload = await response.json();
+        const detail = payload && payload.detail;
+        message = String((detail && detail.message) || detail || message);
+      } catch (_) {}
+      if (response.status === 409) await this.loadHookSettings();
+      this.toast(message, "error", 4000);
+    },
+    _replaceHookScope(payload) {
+      const hooks = this.settings.hooks;
+      const index = hooks.scopes.findIndex(scope => scope.scope === payload.scope);
+      if (index >= 0) hooks.scopes.splice(index, 1, payload);
+      else hooks.scopes.push(payload);
+    },
+    async saveHookDraft() {
+      const hooks = this.settings.hooks;
+      const scope = this.hookActiveScope();
+      const draft = hooks.draft;
+      if (!scope || hooks.saving) return;
+      let handler;
+      try {
+        handler = JSON.parse(draft.handlerJson || "{}");
+      } catch (_) {
+        this.toast(this.lang === "zh" ? "Handler JSON 格式无效" : "Invalid handler JSON", "error");
+        return;
+      }
+      if (!handler || typeof handler !== "object" || Array.isArray(handler)
+          || !String(handler.type || "").trim()) {
+        this.toast(this.lang === "zh" ? "Handler 必须包含 type" : "Handler requires type", "warn");
+        return;
+      }
+      const editing = draft.mode === "edit";
+      const body = {
+        revision: scope.revision,
+        event: editing ? draft.originalEvent : String(draft.event || "").trim(),
+        matcher: String(draft.matcher || ""),
+        handler,
+      };
+      if (!body.event) return;
+      if (editing) {
+        body.group_index = draft.groupIndex;
+        body.handler_index = draft.handlerIndex;
+      }
+      hooks.saving = true;
+      try {
+        const response = await fetch(
+          `/api/settings/hooks/${encodeURIComponent(scope.scope)}/handlers`,
+          {
+            method: editing ? "PUT" : "POST",
+            headers: { ...this.conversationHdr(), "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+          },
+        );
+        if (!response.ok) {
+          await this._hookMutationError(response);
+          return;
+        }
+        this._replaceHookScope(await response.json());
+        this.cancelHookDraft();
+        this.toast(this.lang === "zh"
+          ? "Hook 已保存，下轮会话自动重载" : "Hook saved; runtime reloads next turn", "success");
+      } catch (_) {
+        this.toast(this.lang === "zh" ? "Hook 保存失败" : "Failed to save Hook", "error");
+      } finally {
+        hooks.saving = false;
+      }
+    },
+    async deleteHook(row) {
+      const scope = this.hookActiveScope();
+      if (!scope) return;
+      const confirmed = await this.confirm({
+        title: this.lang === "zh" ? "删除 Hook" : "Delete Hook",
+        body: `${row.event}${row.matcher ? ` · ${row.matcher}` : ""}`,
+        confirmText: this.t("btn.delete"),
+        kind: "danger",
+      });
+      if (!confirmed) return;
+      let response;
+      try {
+        response = await fetch(
+          `/api/settings/hooks/${encodeURIComponent(scope.scope)}/handlers`,
+          {
+            method: "DELETE",
+            headers: { ...this.conversationHdr(), "Content-Type": "application/json" },
+            body: JSON.stringify({
+              revision: scope.revision,
+              event: row.event,
+              group_index: row.groupIndex,
+              handler_index: row.handlerIndex,
+            }),
+          },
+        );
+      } catch (_) {
+        this.toast(this.lang === "zh" ? "Hook 删除失败" : "Failed to delete Hook", "error");
+        return;
+      }
+      if (!response.ok) {
+        await this._hookMutationError(response);
+        return;
+      }
+      this._replaceHookScope(await response.json());
+      this.toast(this.lang === "zh" ? "Hook 已删除" : "Hook deleted", "success");
+    },
+    async toggleAllHooks(disabled) {
+      const scope = this.hookActiveScope();
+      if (!scope) return;
+      let response;
+      try {
+        response = await fetch(
+          `/api/settings/hooks/${encodeURIComponent(scope.scope)}/disable-all`,
+          {
+            method: "PATCH",
+            headers: { ...this.conversationHdr(), "Content-Type": "application/json" },
+            body: JSON.stringify({ revision: scope.revision, disabled: !!disabled }),
+          },
+        );
+      } catch (_) {
+        this.toast(this.lang === "zh" ? "Hook 开关保存失败" : "Failed to save Hook toggle", "error");
+        return;
+      }
+      if (!response.ok) {
+        await this._hookMutationError(response);
+        return;
+      }
+      this._replaceHookScope(await response.json());
+      this.toast(this.lang === "zh"
+        ? (disabled ? "该层 Hook 已全部禁用" : "该层 Hook 已启用")
+        : (disabled ? "Hooks disabled for this scope" : "Hooks enabled for this scope"), "success");
     },
     codexLimitUpdatedText() {
       const ts = this.codexLimit && this.codexLimit.updated_at;
@@ -27091,6 +28193,165 @@ function portal() {
       this.previewDragHover = false;
       this.dragHover = false;
     },
+    fileUploadProgressLabel() {
+      const progress = this.fileUploadProgress || {};
+      const total = Math.max(0, Number(progress.totalFiles) || 0);
+      const completed = Math.max(0, Number(progress.completedFiles) || 0);
+      const failed = Math.max(0, Number(progress.failedFiles) || 0);
+      if (Number(progress.activeFiles) > 0) {
+        return total > 1
+          ? this.t("files.uploading_many", { done: completed, total })
+          : this.t("files.uploading_one");
+      }
+      return failed > 0
+        ? this.t("files.upload_finished_errors", { failed })
+        : this.t("files.upload_finished");
+    },
+    _publishFileUploadProgress(batch) {
+      if (!batch || this._fileUploadBatch !== batch) return;
+      const transfers = Object.values(batch.transfers || {});
+      const totalFiles = transfers.length;
+      const completedFiles = transfers.filter(item => item.done).length;
+      const failedFiles = transfers.filter(item => item.failed).length;
+      const activeFiles = totalFiles - completedFiles;
+      const known = totalFiles > 0 && transfers.every(item => item.known);
+      const totalBytes = transfers.reduce(
+        (sum, item) => sum + Math.max(1, Number(item.total) || 0), 0,
+      );
+      const loadedBytes = transfers.reduce((sum, item) => {
+        const total = Math.max(1, Number(item.total) || 0);
+        return sum + Math.max(0, Math.min(total, Number(item.loaded) || 0));
+      }, 0);
+      this.fileUploadProgress = {
+        visible: totalFiles > 0,
+        known,
+        percent: known && totalBytes > 0
+          ? Math.max(0, Math.min(100, (loadedBytes / totalBytes) * 100))
+          : 0,
+        totalFiles,
+        completedFiles,
+        failedFiles,
+        activeFiles,
+      };
+    },
+    _beginFileUploadTransfer(file) {
+      if (this._fileUploadHideTimer) clearTimeout(this._fileUploadHideTimer);
+      this._fileUploadHideTimer = null;
+      let batch = this._fileUploadBatch;
+      const hasActive = batch && Object.values(batch.transfers || {})
+        .some(item => !item.done);
+      if (!hasActive) {
+        batch = {
+          id: `file-upload-${Date.now()}-${++this._fileUploadTransferSeq}`,
+          transfers: Object.create(null),
+        };
+        this._fileUploadBatch = batch;
+      }
+      const transferId = String(++this._fileUploadTransferSeq);
+      batch.transfers[transferId] = {
+        loaded: 0,
+        total: Math.max(0, Number(file && file.size) || 0),
+        known: false,
+        done: false,
+        failed: false,
+      };
+      this._publishFileUploadProgress(batch);
+      return { batchId: batch.id, transferId };
+    },
+    _fileUploadTransfer(token) {
+      const batch = this._fileUploadBatch;
+      if (!batch || !token || batch.id !== token.batchId) return null;
+      const transfer = batch.transfers[token.transferId];
+      return transfer ? { batch, transfer } : null;
+    },
+    _updateFileUploadTransfer(token, loaded, total, known = true) {
+      const current = this._fileUploadTransfer(token);
+      if (!current || current.transfer.done) return;
+      const nextTotal = Math.max(0, Number(total) || 0);
+      if (known && nextTotal > 0) {
+        current.transfer.known = true;
+        current.transfer.total = nextTotal;
+      }
+      current.transfer.loaded = Math.max(
+        Number(current.transfer.loaded) || 0,
+        Math.max(0, Number(loaded) || 0),
+      );
+      this._publishFileUploadProgress(current.batch);
+    },
+    _finishFileUploadTransfer(token, succeeded) {
+      const current = this._fileUploadTransfer(token);
+      if (!current || current.transfer.done) return;
+      const transfer = current.transfer;
+      transfer.known = true;
+      transfer.total = Math.max(1, Number(transfer.total) || 0);
+      transfer.loaded = transfer.total;
+      transfer.done = true;
+      transfer.failed = !succeeded;
+      this._publishFileUploadProgress(current.batch);
+      if (Object.values(current.batch.transfers).some(item => !item.done)) return;
+      const batchId = current.batch.id;
+      this._fileUploadHideTimer = setTimeout(() => {
+        const latest = this._fileUploadBatch;
+        if (!latest || latest.id !== batchId
+            || Object.values(latest.transfers).some(item => !item.done)) return;
+        this._fileUploadBatch = null;
+        this.fileUploadProgress = {
+          ...this.fileUploadProgress,
+          visible: false,
+        };
+        this._fileUploadHideTimer = null;
+      }, 900);
+    },
+    _uploadWorkspaceFile(dirPath, file, transferToken) {
+      const fd = new FormData();
+      fd.append("path", dirPath);
+      fd.append("file", file);
+      const headers = this.fileHdr();
+      return new Promise((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        let settled = false;
+        const finish = (callback, value) => {
+          if (settled) return;
+          settled = true;
+          callback(value);
+        };
+        xhr.open("POST", "/api/files/upload", true);
+        for (const [name, value] of Object.entries(headers)) {
+          xhr.setRequestHeader(name, value);
+        }
+        xhr.upload.addEventListener("progress", event => {
+          this._updateFileUploadTransfer(
+            transferToken,
+            event.loaded,
+            event.total,
+            event.lengthComputable && event.total > 0,
+          );
+        });
+        xhr.addEventListener("load", () => {
+          const responseText = xhr.responseText || "";
+          finish(resolve, {
+            ok: xhr.status >= 200 && xhr.status < 300,
+            status: xhr.status,
+            statusText: xhr.statusText,
+            text: async () => responseText,
+            json: async () => JSON.parse(responseText || "null"),
+          });
+        });
+        xhr.addEventListener("error", () => {
+          finish(reject, new TypeError("Network request failed"));
+        });
+        xhr.addEventListener("abort", () => {
+          const error = new Error("The operation was aborted");
+          error.name = "AbortError";
+          finish(reject, error);
+        });
+        try {
+          xhr.send(fd);
+        } catch (error) {
+          finish(reject, error);
+        }
+      });
+    },
     async upload(ev) {
       // Multi-file picker: upload all selected files in parallel to the
       // workspace root and refresh the tree ONCE, mirroring onPreviewDrop.
@@ -27146,46 +28407,31 @@ function portal() {
       const ownerWorkspace = this.fileWorkspacePath();
       const uploadContext = this._prepareUploadOverwrite(dirPath, [file]);
       if (!uploadContext) return;
-      const fd = new FormData();
-      fd.append("path", dirPath);
-      fd.append("file", file);
-      let r;
-      try {
-        r = await fetch("/api/files/upload", { method: "POST", headers: this.fileHdr(), body: fd });
-      } catch (e) {
-        if (this._workspaceIsCurrent(ownerWorkspace)) {
-          this.errToast("upload", String((e && e.message) || e));
-        }
-        return;
-      }
+      const uploaded = await this._uploadFileQuiet(dirPath, file, {
+        reportError: true,
+        ownerWorkspace,
+      });
+      if (!uploaded || !this._workspaceIsCurrent(ownerWorkspace)) return;
+      delete this.childCache[dirPath];
+      await this._refreshParentInTree(uploaded.path, ownerWorkspace);
       if (!this._workspaceIsCurrent(ownerWorkspace)) return;
-      if (r.ok) {
-        delete this.childCache[dirPath];
-        const data = await r.json().catch(() => ({}));
-        if (!this._workspaceIsCurrent(ownerWorkspace)) return;
-        await this._refreshParentInTree(
-          data.path || (dirPath ? `${dirPath}/${file.name}` : file.name),
-          ownerWorkspace,
+      await this._syncUploadedFiles([{
+        status: "fulfilled",
+        value: uploaded,
+      }], uploadContext, ownerWorkspace);
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return;
+      // Backend trashes any same-name file it replaced; tell the user so a
+      // silent overwrite isn't mistaken for a clean upload.
+      if (uploaded.replaced_trash_id) {
+        this.toast(
+          this.t("toast.uploaded_replaced", { name: file.name }),
+          "success",
         );
-        if (!this._workspaceIsCurrent(ownerWorkspace)) return;
-        await this._syncUploadedFiles([{
-          status: "fulfilled",
-          value: {
-            path: data.path || (dirPath ? `${dirPath}/${file.name}` : file.name),
-            replaced_trash_id: data.replaced_trash_id || null,
-          },
-        }], uploadContext, ownerWorkspace);
-        if (!this._workspaceIsCurrent(ownerWorkspace)) return;
-        // Backend trashes any same-name file it replaced; tell the user so a
-        // silent overwrite isn't mistaken for a clean upload.
-        if (data.replaced_trash_id) {
-          this.toast(this.t("toast.uploaded_replaced", { name: file.name }), "success");
-        } else {
-          this.toast(this.t("toast.uploaded_to", { name: file.name, dir: dirPath || "" }), "success");
-        }
       } else {
-        const detail = await r.text();
-        if (this._workspaceIsCurrent(ownerWorkspace)) this.errToast("upload", detail);
+        this.toast(this.t("toast.uploaded_to", {
+          name: file.name,
+          dir: dirPath || "",
+        }), "success");
       }
     },
     // Custom MIME so tree-internal drags don't collide with OS file drops.
@@ -28645,40 +29891,45 @@ function portal() {
         }
         case "clear": {
           if (!this.currentId) return false;
-          // /clear permanently DELETEs the session (CLI JSONL + sidecar +
-          // uploaded attachments), no trash, no undo — despite the CLI-muscle-
-          // memory expectation that /clear just resets context. Gate it behind
-          // the same danger confirm the UI delete button uses.
           const zh = this.lang === "zh";
           const ok = await this.confirm({
-            title: zh ? "删除当前会话" : "Delete current session",
+            title: zh ? "清空上下文？" : "Clear context?",
             body: zh
-              ? "这会永久删除当前会话（含上传的附件），不进垃圾桶、无法恢复，然后新建一个空会话。确定吗？"
-              : "This permanently deletes the current session (including uploaded attachments) — no trash, no undo — then starts a fresh one. Continue?",
-            danger: true,
-            okText: zh ? "删除并新建" : "Delete & start fresh",
+              ? "Claude SDK 会创建一条新的空白会话；当前会话及全部历史仍会保留，可随时从会话列表返回。"
+              : "The Claude SDK will create a new empty session. This conversation and all of its history remain available in the session list.",
+            okText: zh ? "清空上下文" : "Clear context",
           });
           if (!ok) return true;
           const oldId = this.currentId;
-          // Token via header (not query) so it never lands in access / proxy
-          // logs or browser history. /reset accepts header-or-query backend-side.
+          let response;
           try {
-            await fetch(`/api/chat/reset?session_id=${encodeURIComponent(oldId)}`,
-                         { method: "POST", headers: this.hdr() });
-            await fetch(`/api/chat/sessions/${oldId}`, { method: "DELETE", headers: this.hdr() });
+            response = await fetch(
+              `/api/chat/sessions/${encodeURIComponent(oldId)}/native-clear`,
+              { method: "POST", headers: this.hdr() },
+            );
           } catch (e) {
-            // Network failure mid-clear — surface it rather than throwing an
-            // unhandledrejection and leaving the user staring at the old session.
-            this.errToast("delete", String((e && e.message) || e));
+            this.errToast("clear", String((e && e.message) || e));
             return false;
           }
-          await this.refreshSessions();
-          // Drop the old session's tab + cached state, then open a fresh one
-          // in its slot. newSession() handles tabState + openTabIds + switch.
+          if (!response.ok) {
+            this.errToast("clear", await response.text());
+            return false;
+          }
+          let payload;
+          try { payload = await response.json(); } catch (_) { payload = null; }
+          const adopted = await this._adoptRecoveredSession(
+            payload, oldId, { focus: true });
+          if (!adopted) {
+            this.toast(zh ? "SDK 未返回新会话" : "SDK did not return a new session", "error", 3000);
+            return false;
+          }
+          // Replace the current tab without deleting its source conversation.
+          // It remains in the picker and can be reopened at any time.
+          this.openTabIds = this.openTabIds.filter(id => id !== oldId);
           this._disposeTabRuntime(oldId);
           this._deletePersistedChatDraft(oldId);
-          this.openTabIds = this.openTabIds.filter(x => x !== oldId);
-          await this.newSession();
+          this._writeChatTabStore(this.openTabIds);
+          this.savePrefs();
           this.toast(this.t("slash.cleared"), "success", 1500);
           return true;
         }
@@ -30011,6 +31262,10 @@ function portal() {
       // card lives there and the replayed task_notification needs to flip it
       // to ✅done. The continuation's events APPEND after the existing cards.
       const isContinuation = isReconnect && !!opts.continuation;
+      const isScheduledDelivery = isReconnect && !!opts.scheduled;
+      if (isReconnect) {
+        sendState.scheduledDeliveryActive = isScheduledDelivery;
+      }
       const expectedTurnId = isReconnect
         ? (opts.turnId || sendState.activeTurnId || "")
         : "";
@@ -30713,8 +31968,9 @@ function portal() {
           streamState._serverActiveObserved = true;
         }
         if (ev && streamState.streamPhase !== "running" && [
-          "text", "thinking", "tool_use", "tool_result", "compact_progress",
-          "task_started", "task_progress", "task_notification", "rate_limit",
+          "text", "thinking", "tool_use", "tool_result",
+          "subagent_delta", "subagent_block", "hook_trace", "compact_progress",
+          "task_started", "task_progress", "task_notification", "scheduled_tasks", "rate_limit",
           "queue_steering",
           "ask_user_question", "permission_request", "permission_request_resolved",
           "permission_mode_changed", "permission_mode_change_failed",
@@ -30722,8 +31978,9 @@ function portal() {
           streamState.streamPhase = "running";
         }
       };
-      ["startup", "text", "thinking", "tool_use", "tool_result", "compact_progress", "task_started",
-       "task_progress", "task_notification", "rate_limit", "queue_steering",
+      ["startup", "text", "thinking", "tool_use", "tool_result",
+       "subagent_delta", "subagent_block", "hook_trace", "compact_progress", "task_started",
+       "task_progress", "task_notification", "scheduled_tasks", "rate_limit", "queue_steering",
        "ask_user_question", "permission_request", "permission_request_resolved",
        "permission_mode_changed",
        "permission_mode_change_failed", "ping",
@@ -30823,6 +32080,11 @@ function portal() {
           model: modelForBubble,
           ts: null,
           elapsed: 0,
+          terminal_reason: "",
+          turn_origin: null,
+          turn_id: streamState.activeTurnId || expectedTurnId || "",
+          _turnId: streamState.activeTurnId || expectedTurnId || "",
+          model_usage: null,
           memoryRecall: null,
         };
         curBubble = this._appendLiveMessage(streamState, bubble);
@@ -31018,6 +32280,7 @@ function portal() {
         const prev = (merge && card.task_status) ? card.task_status : {};
         card.task_status = this._normalizeTaskStatusPreview(
           Object.assign({}, prev, patch));
+        this._syncOpenTaskDetail(card.task_status, card);
         if (card.id) taskCardByToolUseId.set(String(card.id), card);
         if (card.task_status.task_id) {
           taskCardByTaskId.set(String(card.task_status.task_id), card);
@@ -31167,6 +32430,38 @@ function portal() {
 
         _scrollIfActive();
       });
+      es.addEventListener("subagent_delta", ev => {
+        let d;
+        try { d = JSON.parse(ev.data); } catch (_) { return; }
+        _setContinuationAwaitingReaction(false);
+        this._applySubagentDelta(streamSid, streamState, d);
+        _scrollIfActive();
+      });
+      es.addEventListener("subagent_block", ev => {
+        let d;
+        try { d = JSON.parse(ev.data); } catch (_) { return; }
+        _setContinuationAwaitingReaction(false);
+        this._applySubagentBlock(streamSid, streamState, d);
+        _scrollIfActive();
+      });
+      es.addEventListener("hook_trace", ev => {
+        let d;
+        try { d = JSON.parse(ev.data); } catch (_) { return; }
+        this._applyHookTrace(streamSid, streamState, d);
+      });
+      es.addEventListener("scheduled_tasks", ev => {
+        let payload = {};
+        try { payload = JSON.parse(ev.data) || {}; } catch (_) {}
+        this._setScheduledTaskState(
+          streamSid,
+          !!payload.scheduled_active,
+          payload.scheduled_count,
+        );
+        if (this.scheduler.show
+            && this.scheduler.nativeSessionId === streamSid) {
+          void this.loadNativeScheduledTasks(streamSid);
+        }
+      });
       es.addEventListener("task_started", ev => {
         let d;
         try { d = JSON.parse(ev.data); } catch (_) { return; }
@@ -31206,6 +32501,7 @@ function portal() {
           summary_length: d.summary_length,
           summary_truncated: d.summary_truncated,
           output_file: d.output_file || "",
+          usage: d.usage || null,
         });
         const remaining = Number(d.background_tasks_pending);
         if (Number.isFinite(remaining)) {
@@ -31577,6 +32873,9 @@ function portal() {
           meta.model || streamState.streamingModel || modelForBubble || "",
         );
         const turnStatus = String(meta.turnStatus || "");
+        const terminalReason = String(meta.terminalReason || "");
+        const turnOrigin = meta.turnOrigin || null;
+        const modelUsage = meta.modelUsage || null;
         const memoryRecall = meta.memoryRecall || null;
         const _now = completedAtMs > 0 ? completedAtMs : Date.now();
         const _elapsed = durationMs > 0
@@ -31590,6 +32889,11 @@ function portal() {
           if ((!m.turn_status || m.turn_status === "running") && turnStatus) {
             m.turn_status = turnStatus;
           }
+          if (!m.terminal_reason && terminalReason) {
+            m.terminal_reason = terminalReason;
+          }
+          if (!m.turn_origin && turnOrigin) m.turn_origin = turnOrigin;
+          if (!m.model_usage && modelUsage) m.model_usage = modelUsage;
           if (!m.memoryRecall && memoryRecall) m.memoryRecall = memoryRecall;
         };
         // Tail-most muse-side message of THIS turn, used when the turn has no
@@ -31808,10 +33112,14 @@ function portal() {
           completedAtMs: d.completed_at_ms,
           durationMs: d.duration_ms,
           model: d.model,
-          turnStatus: d.cancelled
-            ? "cancelled" : (d.is_error ? "failed" : "completed"),
+          turnStatus: d.status || (d.cancelled
+            ? "cancelled" : (d.is_error ? "failed" : "completed")),
+          terminalReason: d.terminal_reason,
+          turnOrigin: d.origin,
+          modelUsage: d.model_usage,
           memoryRecall: d.memory_recall,
         });
+        streamState.scheduledDeliveryActive = false;
         _stopTimer();
         // The main reply has reached its durable boundary, but a detached SDK
         // task can keep the source runtime alive for minutes. Publish the
@@ -32313,7 +33621,8 @@ function portal() {
             this.send({ reconnect: true, sessionId: streamSid,
                         turnId: d.turn_id || streamState.activeTurnId || "",
                         startedAt: d.started_at,
-                        continuation: !!d.continuation });
+                        continuation: !!d.continuation,
+                        scheduled: !!d.scheduled });
           } catch (_e) {
             // Probe failed — try again on next error tick (counter will
             // continue incrementing until MAX_ATTEMPTS). Do NOT mark the
@@ -34601,15 +35910,68 @@ function portal() {
     },
 
     // ===== scheduler drawer =====
-    async openScheduler() {
+    currentSessionScheduledCount() {
+      const session = (this.sessions || []).find(item => item.id === this.currentId);
+      return Math.max(0, Math.floor(Number(session?.scheduled_count) || 0));
+    },
+    async loadNativeScheduledTasks(sessionId = this.scheduler.nativeSessionId || this.currentId) {
+      const sid = String(sessionId || "");
+      const seq = ++this.scheduler.nativeLoadSeq;
+      this.scheduler.nativeSessionId = sid;
+      const meta = (this.sessions || []).find(item => item.id === sid);
+      this.scheduler.nativeSessionName = String(meta?.name || "");
+      this.scheduler.nativeTasks = [];
+      this.scheduler.nativeError = "";
+      if (!sid) return false;
+      this.scheduler.nativeLoading = true;
+      try {
+        const response = await fetch(
+          `/api/chat/sessions/${encodeURIComponent(sid)}/scheduled-tasks`,
+          { headers: this.hdr() },
+        );
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const payload = await response.json();
+        if (seq !== this.scheduler.nativeLoadSeq) return false;
+        const tasks = Array.isArray(payload.tasks) ? payload.tasks : [];
+        this.scheduler.nativeTasks = tasks;
+        this._setScheduledTaskState(sid, tasks.length > 0, tasks.length);
+        return true;
+      } catch (_) {
+        if (seq !== this.scheduler.nativeLoadSeq) return false;
+        this.scheduler.nativeError = this.lang === "zh"
+          ? "SDK 定时任务加载失败"
+          : "Failed to load SDK scheduled tasks";
+        return false;
+      } finally {
+        if (seq === this.scheduler.nativeLoadSeq) {
+          this.scheduler.nativeLoading = false;
+        }
+      }
+    },
+    openNativeScheduledTasks(sessionId, event = null) {
+      if (event) {
+        event.preventDefault();
+        event.stopPropagation();
+      }
+      return this.openScheduler({ sessionId, native: true });
+    },
+    async openScheduler(options = {}) {
+      const nativeSessionId = String(
+        (options && typeof options === "object" && options.sessionId)
+        || this.currentId
+        || "",
+      );
       const opener = document.activeElement;
       this.scheduler.show = true;
       this._openFocusSurface(
         "scheduler", ".sched-modal", ".sched-input-name",
         opener, true,
       );
-      await this.loadSchedulerTasks();
-      await this.loadSchedulerHistory();
+      await Promise.all([
+        this.loadNativeScheduledTasks(nativeSessionId),
+        this.loadSchedulerTasks(),
+        this.loadSchedulerHistory(),
+      ]);
       // Opening the drawer = user has seen unread results. Server-side
       // ack so the badge clears on this AND any other tab.
       if (this.scheduler.unreadCount > 0) await this.ackSchedulerUnread();

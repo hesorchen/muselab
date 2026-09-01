@@ -41,7 +41,7 @@ RUN apt-get update && \
     # scripts/versions.env and the CLI bundled by claude-agent-sdk (the native
     # installers read the pin from versions.env).
     npm install -g \
-        @anthropic-ai/claude-code@2.1.251 && \
+        @anthropic-ai/claude-code@2.1.252 && \
     apt-get purge -y --auto-remove gnupg && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/* /root/.npm /tmp/*

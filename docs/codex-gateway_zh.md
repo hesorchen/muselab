@@ -6,8 +6,8 @@ muselab 通过**本地 Anthropic 兼容网关**支持 Codex 后端模型。网�
 
 muselab **不保存 Codex OAuth 凭据**，也**不直接调用 OpenAI 原生接口**。
 
-截至 2026-08-30，已验证的兼容基线是 CLIProxyAPI `v7.2.145`、Claude Agent
-SDK `0.2.148` 以及其内置 Claude CLI `2.1.251`。这套基线包含这条链路所需的
+截至 2026-09-01，已验证的兼容基线是 CLIProxyAPI `v7.2.145`、Claude Agent
+SDK `0.2.149` 以及其内置 Claude CLI `2.1.252`。这套基线包含这条链路所需的
 Codex 缓存 token 统计、reasoning effort、工具调用回放和 Anthropic 响应
 转换修复。
 
@@ -32,15 +32,17 @@ muselab → Claude Agent SDK → Anthropic Messages 请求
 
 `codex:` 前缀只供 muselab 内部路由使用。发给网关前会被剥掉，所以 muselab
 里的 `codex:gpt-5.6-sol` 到网关侧会变成 `gpt-5.6-sol`。Codex Gateway 也会
-打开按会话设置的 reasoning `effort` 和与其独立的 **Fast** 服务层。Claude
-Agent SDK 没有 `auto`、`ultra` 或 Fast 的原生字段，因此 muselab 通过
-`X-MuseLab-Effort` 与 `X-MuseLab-Service-Tier` 携带规范值；推荐配置里的
-`payload` 规则在 Anthropic→Codex 协议转换后应用这些控制：
+打开按会话设置的 reasoning `effort`、可见 thinking 摘要和与其独立的
+**Fast** 服务层。Claude Agent SDK 没有 `auto`、`ultra` 或 Fast 的原生
+字段，而 Responses reasoning 摘要必须显式开启，因此 muselab 通过
+`X-MuseLab-Effort`、`X-MuseLab-Thinking` 与 `X-MuseLab-Service-Tier` 携带
+规范值；推荐配置里的 `payload` 规则在 Anthropic→Codex 协议转换后应用：
 
 - `auto` 删除 translator 合成的 effort，让模型 catalog 默认值继续生效；
 - `low` 到 `max` 直接映射到 `reasoning.effort`；
 - `ultra` 在线路上映射为 `max`，并保留 muselab 对 subagent spawn depth
   与 concurrency 的上限；
+- 开启 thinking 时映射为 `reasoning.summary: auto`；关闭时不发送该标记；
 - Fast 独立映射为 `service_tier: priority`。
 
 ## 启用方式
@@ -57,7 +59,7 @@ Agent SDK 没有 `auto`、`ultra` 或 Fast 的原生字段，因此 muselab 通�
    - 把 `replace-with-a-random-local-token` 换成高强度本地 token；
    - 除非你明确希望 proxy 额外增加本地冷却窗口，否则保留 `disable-cooling: true` 和 `session-affinity: false`；
    - 保留示例中的 `payload.override` 与 `payload.filter` 规则；删除后
-     effort／Fast 会在协议转换后静默退化。
+     effort／thinking／Fast 会在协议转换后静默退化。
 
 3. 在本机启动 CLIProxyAPI，并只监听 loopback：
 
@@ -85,11 +87,11 @@ Agent SDK 没有 `auto`、`ultra` 或 Fast 的原生字段，因此 muselab 通�
 现有配置，同时保留自己的 token、auth 目录与路由设置；随后用本机原有的
 supervisor 重启 sidecar。
 
-重启前运行下面的静态检查；输出应同时包含 effort header、服务层 header、
-`reasoning.effort` 与 `service_tier` 规则：
+重启前运行下面的静态检查；输出应同时包含 effort、thinking、服务层 header
+及其 payload 规则：
 
 ```bash
-rg -n 'X-MuseLab-Effort|X-MuseLab-Service-Tier|reasoning\.effort|service_tier' \
+rg -n 'X-MuseLab-(Effort|Thinking|Service-Tier)|reasoning\.(effort|summary)|service_tier' \
   ~/.cli-proxy-muselab/config.yaml
 ```
 
@@ -172,7 +174,8 @@ sidecar 至少要实现 Anthropic Messages API 中 agent loop 需要的部分：
 - 接受 muselab 发送的 `x-api-key` 和 / 或 `Authorization: Bearer`；
 - 支持推荐配置中的 header-aware `payload` 规则：在协议转换后把
   `X-MuseLab-Effort` 映射为 `reasoning.effort`，为 `auto` 删除该字段，把
-  Ultra 映射为 `max`，并把 `X-MuseLab-Service-Tier: fast` 映射为
+  Ultra 映射为 `max`，把 `X-MuseLab-Thinking: summarized` 映射为
+  `reasoning.summary: auto`，并把 `X-MuseLab-Service-Tier: fast` 映射为
   `service_tier: priority`。
 
 如果普通聊天可用但工具调用失败，说明该 gateway 仍是 chat-only，不能作为完整 muselab agent 支持来宣传。

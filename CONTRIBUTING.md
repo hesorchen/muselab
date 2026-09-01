@@ -10,7 +10,7 @@ git clone https://github.com/hesorchen/muselab && cd muselab
 uv sync                                   # install Python deps
 cp .env.example .env                      # then fill MUSELAB_TOKEN + MUSELAB_ROOT
 uv run uvicorn backend.main:app --reload  # dev server on :8765
-uv run pytest tests/                      # all tests should pass
+make test                                 # parallel unit/integration suite
 ```
 
 The frontend is plain HTML + Alpine.js v3 (vendored). No build step —
@@ -38,7 +38,7 @@ edit `frontend/*.html|js|css`, hard-refresh the browser.
 
 ## Pull request checklist
 
-- [ ] `uv run pytest tests/` passes
+- [ ] `make test` passes (`make test-serial` is available for debugging)
 - [ ] `uv run ruff check backend/ tests/` passes (CI blocks merge on lint failures)
 - [ ] `bash scripts/lint.sh` passes (encoding / class-collision + personal-data leak scan)
 - [ ] Backend changes: added or updated a test in `tests/`

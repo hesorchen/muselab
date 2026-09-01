@@ -21,7 +21,7 @@ from .settings import atomic_write_text
 
 # Increment whenever persisted descriptor semantics (bubble expansion, preview,
 # tool/task metadata) change, not only when the JSON container shape changes.
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 _TRANSCRIPT_TYPES = {"user", "assistant", "progress", "system", "attachment"}
 _PREFIX_GUARD_BYTES = 1024 * 1024
 

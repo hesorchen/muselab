@@ -46,7 +46,7 @@ dependencies = [
     # upgrade must refresh the tool catalog and rerun the native question matrix.
     # Path/effort drift is already auto-eliminated via
     # project_key_for_directory() + EffortLevel.
-    "claude-agent-sdk==0.2.148",
+    "claude-agent-sdk==0.2.149",
     "fastapi>=0.138.1",
     # Pin starlette above the fastapi-transitive 1.0.0, which carries
     # PYSEC-2026-161 (fixed in 1.0.1). Direct constraint so the pip-audit
@@ -99,6 +99,10 @@ Container     = "https://github.com/hesorchen/muselab/pkgs/container/muselab"
 dev = [
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
+    # Parallelize the large unit/integration suite on multi-core development
+    # machines and CI. Browser E2E and upgrade smoke tests stay serial because
+    # they intentionally share one live server/runtime.
+    "pytest-xdist>=3.8.0",
     # Starlette 1.2+ prefers httpx2 for TestClient. Keep production httpx
     # separately because memory_client imports that package directly.
     "httpx2>=2.0.0",
