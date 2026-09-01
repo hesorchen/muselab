@@ -440,6 +440,7 @@ def test_tool_only_turn_recovers_result_text_and_survives_refresh(
     terminal = messages[-1]
     assert terminal["role"] == "assistant"
     assert terminal["text"] == "Inspection completed with a final summary."
+    assert terminal["turn_id"] == done["turn_id"]
     assert terminal["turn_status"] == "completed"
     assert terminal["elapsed"] == 2.5
     assert terminal["memoryRecall"] == {

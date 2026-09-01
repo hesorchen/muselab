@@ -1277,6 +1277,7 @@ def _persist_completed_result_snapshot(
     memory_recall: dict | None = None,
     terminal_reason: str = "",
     turn_origin: dict | None = None,
+    turn_id: str = "",
     model_usage: dict | None = None,
 ) -> bool:
     """Persist final prose supplied only by a successful ResultMessage.
@@ -1342,6 +1343,8 @@ def _persist_completed_result_snapshot(
                 message.setdefault("terminal_reason", terminal_reason)
             if turn_origin:
                 message.setdefault("turn_origin", turn_origin)
+            if turn_id:
+                message.setdefault("turn_id", turn_id)
             if model_usage:
                 message.setdefault("model_usage", model_usage)
             if memory_recall:
@@ -1428,6 +1431,7 @@ def _persist_failed_turn_snapshot(
     terminal_status: str = "failed",
     terminal_reason: str = "",
     turn_origin: dict | None = None,
+    turn_id: str = "",
     model_usage: dict | None = None,
 ) -> bool:
     """Persist a refreshable display record for a terminal turn failure.
@@ -1504,6 +1508,8 @@ def _persist_failed_turn_snapshot(
                 message.setdefault("terminal_reason", terminal_reason)
             if turn_origin:
                 message.setdefault("turn_origin", turn_origin)
+            if turn_id:
+                message.setdefault("turn_id", turn_id)
             if model_usage:
                 message.setdefault("model_usage", model_usage)
             if memory_recall:

@@ -76,6 +76,7 @@ from . import chat_runtime
 from . import chat_subagents
 from . import chat_successor
 from . import hook_settings
+from . import hook_traces
 from . import sdk_lifecycle
 from . import transcript_index as transcript_idx
 from .task_summaries import normalize_task_summary_fields
@@ -3312,6 +3313,9 @@ async def _build_and_connect_client(
         # see full blocks at the end → user waits for the whole reply
         # before seeing anything. With this, each token shows up.
         include_partial_messages=True,
+        # Receive CLI-owned Hook lifecycle messages. MuseLab persists only a
+        # privacy-bounded timing/status projection; raw hook output is dropped.
+        include_hook_events=True,
         # Ask the SDK to forward complete Subagent sidechains.  They are
         # separated from the parent transcript below using the SDK-owned
         # parent_tool_use_id and exposed as a nested timeline in the GUI.
@@ -5774,6 +5778,7 @@ def _indexed_ui_records(
                 ("turn_status", "turn_status"),
                 ("terminal_reason", "terminal_reason"),
                 ("turn_origin", "turn_origin"),
+                ("turn_id", "turn_id"),
                 ("model_usage", "model_usage"),
                 ("memory_recall", "memoryRecall"),
             ):
@@ -6277,6 +6282,34 @@ async def get_session_subagents_api(sid: str) -> dict:
     return {"session_id": sid, "threads": threads}
 
 
+@router.get(
+    "/sessions/{sid}/hook-traces",
+    dependencies=[Depends(require_token)],
+)
+async def get_session_hook_traces_api(
+    sid: str,
+    turn_id: str = Query("", max_length=128),
+) -> dict:
+    if await obs.to_thread_io(
+        "chat.hook_traces_session_read",
+        sid,
+        sess.get_session_meta,
+        sid,
+    ) is None:
+        raise HTTPException(404, "session not found")
+    try:
+        traces = await obs.to_thread_io(
+            "chat.hook_traces_read",
+            sid,
+            hook_traces.list_traces,
+            sid,
+            turn_id=turn_id,
+        )
+    except (UnsafePrivatePath, ValueError) as exc:
+        raise HTTPException(409, "hook trace storage is unavailable") from exc
+    return {"session_id": sid, "traces": traces}
+
+
 @router.get("/sessions/{sid}", dependencies=[Depends(require_token)])
 def get_session_api(
     sid: str,
@@ -6749,12 +6782,12 @@ def _persist_cancelled_footer_annotation_locked(bc: 'TurnBroadcast', now_ms: int
 def _persist_cancelled_turn_snapshot_locked(bc: 'TurnBroadcast') -> bool:
     return chat_overlays._persist_cancelled_turn_snapshot_locked(bc)
 
-def _persist_completed_result_snapshot(bc: 'TurnBroadcast', result_text: str, *, terminal_at_ms: int, elapsed_s: float | None=None, memory_recall: dict | None=None, terminal_reason: str='', turn_origin: dict | None=None, model_usage: dict | None=None) -> bool:
-    return chat_overlays._persist_completed_result_snapshot(bc, result_text, terminal_at_ms=terminal_at_ms, elapsed_s=elapsed_s, memory_recall=memory_recall, terminal_reason=terminal_reason, turn_origin=turn_origin, model_usage=model_usage)
+def _persist_completed_result_snapshot(bc: 'TurnBroadcast', result_text: str, *, terminal_at_ms: int, elapsed_s: float | None=None, memory_recall: dict | None=None, terminal_reason: str='', turn_origin: dict | None=None, turn_id: str='', model_usage: dict | None=None) -> bool:
+    return chat_overlays._persist_completed_result_snapshot(bc, result_text, terminal_at_ms=terminal_at_ms, elapsed_s=elapsed_s, memory_recall=memory_recall, terminal_reason=terminal_reason, turn_origin=turn_origin, turn_id=turn_id, model_usage=model_usage)
 
 
-def _persist_failed_turn_snapshot(bc: 'TurnBroadcast', error_text: str, *, terminal_at_ms: int | None=None, elapsed_s: float | None=None, memory_recall: dict | None=None, canonical_terminal_published: bool=False, terminal_status: str='failed', terminal_reason: str='', turn_origin: dict | None=None, model_usage: dict | None=None) -> bool:
-    return chat_overlays._persist_failed_turn_snapshot(bc, error_text, terminal_at_ms=terminal_at_ms, elapsed_s=elapsed_s, memory_recall=memory_recall, canonical_terminal_published=canonical_terminal_published, terminal_status=terminal_status, terminal_reason=terminal_reason, turn_origin=turn_origin, model_usage=model_usage)
+def _persist_failed_turn_snapshot(bc: 'TurnBroadcast', error_text: str, *, terminal_at_ms: int | None=None, elapsed_s: float | None=None, memory_recall: dict | None=None, canonical_terminal_published: bool=False, terminal_status: str='failed', terminal_reason: str='', turn_origin: dict | None=None, turn_id: str='', model_usage: dict | None=None) -> bool:
+    return chat_overlays._persist_failed_turn_snapshot(bc, error_text, terminal_at_ms=terminal_at_ms, elapsed_s=elapsed_s, memory_recall=memory_recall, canonical_terminal_published=canonical_terminal_published, terminal_status=terminal_status, terminal_reason=terminal_reason, turn_origin=turn_origin, turn_id=turn_id, model_usage=model_usage)
 
 def _recover_interrupted_turn_snapshot(sid: str) -> bool:
     return chat_overlays._recover_interrupted_turn_snapshot(sid)
@@ -7125,6 +7158,7 @@ def _purge_session_storage_disk_locked(sid: str) -> bool:
     _delete_active_turn_sidecar(sid)
     _delete_cancelled_turn_snapshots(sid)
     _delete_runtime_continuation_outboxes(sid)
+    hook_traces.purge(sid)
     return removed
 
 
@@ -14178,6 +14212,7 @@ async def _watch_inflight_tasks(
                     model=b.model,
                     ts=completed_at_ms,
                     turn_status=terminal_status,
+                    turn_id=b.turn_id,
                     elapsed_s=cont_elapsed if cont_elapsed >= 1 else None,
                     file_path=sess._sidecar_path(session_id),
                 )
@@ -17345,6 +17380,7 @@ async def _start_turn(
                         memory_recall=_done_memory_receipt,
                         terminal_reason=_terminal_reason,
                         turn_origin=_turn_origin,
+                        turn_id=broadcast.turn_id,
                         model_usage=_model_usage,
                     )
                 except Exception as exc:
@@ -17690,6 +17726,7 @@ async def _start_turn(
                     turn_status=_turn_status,
                     terminal_reason=_terminal_reason,
                     turn_origin=_turn_origin,
+                    turn_id=broadcast.turn_id,
                     model_usage=_model_usage,
                     elapsed_s=_elapsed_s,
                     memory_recall=_done_memory_receipt,
@@ -19542,6 +19579,43 @@ hook_settings.configure_runtime_invalidator(
     _invalidate_hook_setting_runtimes)
 
 
+async def _observe_sdk_stream_message(
+    key: chat_runtime.ClientKey,
+    message: Any,
+) -> None:
+    """Persist and live-publish the safe Hook lifecycle projection."""
+    if not hook_traces.is_hook_message(message):
+        return
+    session_id = key[0]
+    broadcast = _active_turns.get(session_id)
+    live = broadcast is not None and not broadcast.done
+    turn_id = (
+        str(broadcast.turn_id or "")
+        if live
+        else str(_background_origin_turn_id.get(session_id, "") or "")
+    )
+    origin = (
+        "background"
+        if (live and broadcast.activity_source == "background")
+        or (not live and session_id in _sessions_with_inflight_tasks)
+        else "foreground"
+    )
+    trace = await obs.to_thread_io(
+        "chat.hook_trace_write",
+        session_id,
+        hook_traces.observe,
+        session_id,
+        message,
+        turn_id=turn_id,
+        origin=origin,
+    )
+    if trace is not None and live:
+        broadcast.publish({
+            "event": "hook_trace",
+            "data": json.dumps(trace),
+        })
+
+
 chat_runtime.configure_hooks(chat_runtime.RuntimeHooks(
     sessions=sess,
     normalize_effort=lambda *a, **k: _normalize_effort(*a, **k),
@@ -19563,6 +19637,7 @@ chat_runtime.configure_hooks(chat_runtime.RuntimeHooks(
     join_session_disconnects=lambda *a, **k: _join_session_disconnects(*a, **k),
     evict_failed_session_stream=lambda *a, **k: _evict_failed_session_stream(*a, **k),
     retain_detached_cleanup=lambda *a, **k: _retain_detached_cleanup(*a, **k),
+    observe_stream_message=lambda *a, **k: _observe_sdk_stream_message(*a, **k),
 ))
 
 

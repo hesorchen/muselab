@@ -2998,6 +2998,24 @@
                     </template>
                   </div>
                 </details>
+                <details class="turn-hook-traces"
+                         x-show="hookTracesForTurn(pane, m).length">
+                  <summary x-text="hookTraceSummary(pane, m)"></summary>
+                  <div class="turn-hook-traces-popover">
+                    <template x-for="trace in hookTracesForTurn(pane, m)"
+                              :key="trace.trace_id">
+                      <div class="turn-hook-trace-row" :class="'is-' + trace.status">
+                        <span class="hook-trace-status"></span>
+                        <strong x-text="trace.hook_event"></strong>
+                        <span x-text="hookTraceStatusLabel(trace)"></span>
+                        <span class="mono" x-show="hookTraceDuration(trace)"
+                              x-text="hookTraceDuration(trace)"></span>
+                        <span class="mono" x-show="trace.exit_code !== null && trace.exit_code !== undefined"
+                              x-text="'exit ' + trace.exit_code"></span>
+                      </div>
+                    </template>
+                  </div>
+                </details>
                 <button type="button" class="memory-recall-trace"
                         x-show="m.memoryRecall && m.memoryRecall.count"
                         :aria-expanded="memoryRecallPopover.show && _memoryRecallOwner === m"
@@ -5537,6 +5555,19 @@
               </div>
             </div>
           </template>
+
+          <details class="hook-recent-traces" x-show="currentSessionHookTraces().length">
+            <summary x-text="lang==='zh' ? '当前会话最近执行记录' : 'Recent execution traces in this session'"></summary>
+            <template x-for="trace in currentSessionHookTraces()" :key="trace.trace_id">
+              <div class="hook-builtin-row" :class="'is-' + trace.status">
+                <span class="mono" x-text="trace.hook_event"></span>
+                <span x-text="hookTraceStatusLabel(trace)"></span>
+                <span class="mono" x-text="hookTraceDuration(trace)"></span>
+                <span class="mono" x-show="trace.exit_code !== null && trace.exit_code !== undefined"
+                      x-text="'exit ' + trace.exit_code"></span>
+              </div>
+            </template>
+          </details>
 
           <details class="hook-builtins" x-show="settings.hooks.builtin.length">
             <summary x-text="lang==='zh' ? 'MuseLab 内置 Hook（只读）' : 'MuseLab built-in Hooks (read-only)'"></summary>

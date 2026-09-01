@@ -491,10 +491,13 @@ def sdk_messages_to_ui(
             ("elapsed_s", "elapsed"),
             ("model", "model"),
             ("turn_status", "turn_status"),
+            ("turn_id", "turn_id"),
             ("memory_recall", "memoryRecall"),
         ):
             value = ann.get(source)
-            if value is not None and (source not in {"model", "turn_status", "memory_recall"}
+            if value is not None and (source not in {
+                "model", "turn_status", "turn_id", "memory_recall",
+            }
                                       or value):
                 entry.setdefault(target, value)
         ann_images = ann.get("images")
@@ -700,6 +703,9 @@ def complete_turn_footer_metadata(
         turn_origin = last_value("turn_origin")
         if isinstance(turn_origin, dict):
             tail["turn_origin"] = turn_origin
+        turn_id = str(last_value("turn_id") or "")
+        if turn_id:
+            tail["turn_id"] = turn_id
         model_usage = last_value("model_usage")
         if isinstance(model_usage, dict):
             tail["model_usage"] = model_usage
@@ -746,7 +752,8 @@ def broadcast_to_ui_messages(broadcast: Any) -> list[dict]:
             chunk = data.get("text", "")
             if current_text is None:
                 current_text = {"role": "assistant", "text": chunk,
-                                "model": broadcast.model}
+                                "model": broadcast.model,
+                                "turn_id": broadcast.turn_id}
                 out.append(current_text)
             else:
                 current_text["text"] += chunk
@@ -882,4 +889,6 @@ def broadcast_to_ui_messages(broadcast: Any) -> list[dict]:
                 "_decisionAcknowledged": True,
                 "failure_message": "",
             })
+    if out:
+        out[-1].setdefault("turn_id", broadcast.turn_id)
     return out

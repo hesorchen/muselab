@@ -101,6 +101,7 @@ def test_third_party_provider_enables_sdk_skills(app_module, monkeypatch, tmp_pa
         chat_mod.ANSWER_TIMEOUT_S + 5)
     assert "AskUserQuestion" not in captured["disallowed_tools"]
     assert captured["forward_subagent_text"] is True
+    assert captured["include_hook_events"] is True
     assert "muselab" not in captured["mcp_servers"]
     assert captured["env"]["ANTHROPIC_API_KEY"] == "sk-test"
     for tier in ("OPUS", "SONNET", "HAIKU", "FABLE"):

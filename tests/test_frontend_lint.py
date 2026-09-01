@@ -6170,3 +6170,17 @@ def test_hook_settings_gui_edits_standard_scopes_and_keeps_builtins_read_only():
     ).read_text(encoding="utf-8")
     assert "_restore_masked_headers" in backend
     assert "configure_runtime_invalidator" in backend
+
+
+def test_hook_execution_trace_is_safe_separate_and_visible_per_turn():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    traces = (BACKEND / "hook_traces.py").read_text(encoding="utf-8")
+
+    assert '"hook_trace"' in app
+    assert "_applyHookTrace(streamSid, streamState, d)" in app
+    assert "/hook-traces`" in app
+    assert "hookTracesForTurn(pane, m)" in html
+    assert "当前会话最近执行记录" in html
+    assert "Raw commands, paths, stdout/stderr" in traces
+    assert '"output"' not in traces.split("def observe", 1)[1]

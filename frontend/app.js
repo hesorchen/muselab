@@ -320,6 +320,7 @@ function _pruneChatResourceTicketCache(now) {
 const CHAT_MUX_STREAM_EVENTS = [
   "startup", "text", "thinking", "tool_use", "tool_result",
   "subagent_delta", "subagent_block",
+  "hook_trace",
   "compact_progress", "task_started", "task_progress", "task_notification",
   "queue_steering",
   "rate_limit", "ask_user_question", "permission_request",
@@ -7922,6 +7923,10 @@ function portal() {
         subagentsLoading: false,
         subagentsLoaded: false,
         subagentGeneration: 0,
+        hookTraces: [],
+        hookTracesLoading: false,
+        hookTracesLoaded: false,
+        hookTraceGeneration: 0,
         // A detached task still belongs to the pre-rollover runtime. The
         // visible successor can run foreground turns independently while this
         // separate counter keeps the inherited task card/footer live.
@@ -13924,6 +13929,86 @@ function portal() {
       if (!block) return "";
       return String(block.text || block.summary || block.preview || "");
     },
+    _applyHookTrace(sid, state, payload) {
+      const trace = payload && typeof payload === "object" ? payload : null;
+      if (!trace || !state || this.tabState[sid] !== state) return;
+      const traceId = String(trace.trace_id || "");
+      if (!traceId || (trace.session_id && trace.session_id !== sid)) return;
+      const index = state.hookTraces.findIndex(row => row.trace_id === traceId);
+      const normalized = { ...trace };
+      if (index >= 0) state.hookTraces.splice(index, 1, normalized);
+      else state.hookTraces.push(normalized);
+    },
+    async hydrateHookTraces(sid, expectedState = null) {
+      const state = expectedState || this._ensureTabState(sid);
+      if (!sid || this.tabState[sid] !== state || state.hookTracesLoading) return false;
+      const generation = ++state.hookTraceGeneration;
+      state.hookTracesLoading = true;
+      try {
+        const response = await this._fetchWithDeadline(
+          `/api/chat/sessions/${encodeURIComponent(sid)}/hook-traces`,
+          { headers: this.hdr(), cache: "no-store" },
+          15_000,
+        );
+        if (!response.ok) return false;
+        const payload = await response.json();
+        if (this.tabState[sid] !== state
+            || generation !== state.hookTraceGeneration) return false;
+        const incoming = Array.isArray(payload.traces) ? payload.traces : [];
+        const byId = new Map(incoming.map(trace => [trace.trace_id, { ...trace }]));
+        for (const live of state.hookTraces || []) {
+          const stored = byId.get(live.trace_id);
+          if (!stored || Number(live.updated_at_ms) > Number(stored.updated_at_ms)) {
+            byId.set(live.trace_id, live);
+          }
+        }
+        state.hookTraces = Array.from(byId.values()).sort(
+          (a, b) => Number(a.started_at_ms) - Number(b.started_at_ms));
+        state.hookTracesLoaded = true;
+        return true;
+      } catch (_) {
+        return false;
+      } finally {
+        if (this.tabState[sid] === state
+            && generation === state.hookTraceGeneration) {
+          state.hookTracesLoading = false;
+        }
+      }
+    },
+    hookTracesForTurn(state, message) {
+      if (!state || !message) return [];
+      const turnId = String(message.turn_id || message._turnId || "");
+      if (!turnId) return [];
+      return (state.hookTraces || []).filter(
+        trace => String(trace.turn_id || "") === turnId);
+    },
+    hookTraceSummary(state, message) {
+      const traces = this.hookTracesForTurn(state, message);
+      if (!traces.length) return "";
+      const failed = traces.filter(trace => trace.status === "failed").length;
+      const running = traces.filter(trace => trace.status === "running").length;
+      const prefix = this.lang === "zh" ? `· Hooks ${traces.length}` : `· ${traces.length} Hooks`;
+      if (failed) return `${prefix} · ${failed} ${this.lang === "zh" ? "失败" : "failed"}`;
+      if (running) return `${prefix} · ${running} ${this.lang === "zh" ? "运行中" : "running"}`;
+      return prefix;
+    },
+    hookTraceStatusLabel(trace) {
+      const status = String((trace && trace.status) || "");
+      if (status === "running") return this.lang === "zh" ? "运行中" : "Running";
+      if (status === "failed") return this.lang === "zh" ? "失败" : "Failed";
+      return this.lang === "zh" ? "完成" : "Done";
+    },
+    hookTraceDuration(trace) {
+      const duration = Number(trace && trace.duration_ms);
+      if (!Number.isFinite(duration) || duration < 0) return "";
+      if (duration < 1000) return `${Math.round(duration)}ms`;
+      return `${(duration / 1000).toFixed(duration < 10000 ? 1 : 0)}s`;
+    },
+    currentSessionHookTraces() {
+      const state = this.currentId && this.tabState[this.currentId];
+      return state && Array.isArray(state.hookTraces)
+        ? state.hookTraces.slice().reverse().slice(0, 24) : [];
+    },
     // Skill card data — name + description + trigger summary.
     skillCardInfo(m) {
       if (!m || m.name !== "Skill") return null;
@@ -17149,6 +17234,7 @@ function portal() {
         // conversation first, then hydrate Subagent cards without extending
         // the session-load critical path.
         void this.hydrateSubagents(sid, st, { quiet: true });
+        void this.hydrateHookTraces(sid, st);
         if (quiet && sid === this.currentId) {
           const domConverged = await this._ensureTranscriptDomConverged(sid, st, {
             scrollEl: quietScrollEl,
@@ -31256,7 +31342,7 @@ function portal() {
         }
         if (ev && streamState.streamPhase !== "running" && [
           "text", "thinking", "tool_use", "tool_result",
-          "subagent_delta", "subagent_block", "compact_progress",
+          "subagent_delta", "subagent_block", "hook_trace", "compact_progress",
           "task_started", "task_progress", "task_notification", "rate_limit",
           "queue_steering",
           "ask_user_question", "permission_request", "permission_request_resolved",
@@ -31266,7 +31352,7 @@ function portal() {
         }
       };
       ["startup", "text", "thinking", "tool_use", "tool_result",
-       "subagent_delta", "subagent_block", "compact_progress", "task_started",
+       "subagent_delta", "subagent_block", "hook_trace", "compact_progress", "task_started",
        "task_progress", "task_notification", "rate_limit", "queue_steering",
        "ask_user_question", "permission_request", "permission_request_resolved",
        "permission_mode_changed",
@@ -31369,6 +31455,8 @@ function portal() {
           elapsed: 0,
           terminal_reason: "",
           turn_origin: null,
+          turn_id: streamState.activeTurnId || expectedTurnId || "",
+          _turnId: streamState.activeTurnId || expectedTurnId || "",
           model_usage: null,
           memoryRecall: null,
         };
@@ -31727,6 +31815,11 @@ function portal() {
         _setContinuationAwaitingReaction(false);
         this._applySubagentBlock(streamSid, streamState, d);
         _scrollIfActive();
+      });
+      es.addEventListener("hook_trace", ev => {
+        let d;
+        try { d = JSON.parse(ev.data); } catch (_) { return; }
+        this._applyHookTrace(streamSid, streamState, d);
       });
       es.addEventListener("task_started", ev => {
         let d;

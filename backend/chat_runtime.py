@@ -12,6 +12,7 @@ import asyncio
 from collections import deque
 from contextlib import suppress
 from dataclasses import dataclass
+import inspect
 import sys
 from typing import Any, Callable, Collection, Iterable
 
@@ -43,6 +44,7 @@ class RuntimeHooks:
     join_session_disconnects: Callable[..., Any]
     evict_failed_session_stream: Callable[[Any], Any]
     retain_detached_cleanup: Callable[[asyncio.Task], None]
+    observe_stream_message: Callable[[ClientKey, Any], Any]
 
 
 _hooks: RuntimeHooks | None = None
@@ -381,6 +383,20 @@ class SessionStream:
             async for message in self.client.receive_messages():
                 if self._closed:
                     break
+                observer = _require_hooks().observe_stream_message
+                try:
+                    observed = observer(self.key, message)
+                    if inspect.isawaitable(observed):
+                        await observed
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    # Trace/observability must not own SDK message delivery.
+                    sys.stderr.write(
+                        f"[chat] stream observer failed sid={self.key[0][:8]} "
+                        f"exc={type(exc).__name__}\n"
+                    )
+                    sys.stderr.flush()
                 queue = self._turn or self._background
                 if queue is not None:
                     queue.put_nowait(message)

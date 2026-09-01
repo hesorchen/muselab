@@ -4979,6 +4979,67 @@ html[data-theme="light"] .msg.user .bubble { color: white; }
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.turn-hook-traces {
+  position: relative;
+  flex: 0 0 auto;
+  color: var(--c-fg-3);
+  font-size: var(--fs-xs);
+}
+.turn-hook-traces > summary {
+  cursor: pointer;
+  list-style: none;
+  white-space: nowrap;
+}
+.turn-hook-traces > summary::-webkit-details-marker { display: none; }
+.turn-hook-traces-popover {
+  position: absolute;
+  z-index: 35;
+  right: 0;
+  bottom: calc(100% + 7px);
+  width: min(390px, 82vw);
+  max-height: min(360px, 55vh);
+  overflow: auto;
+  padding: 8px 10px;
+  border: 1px solid var(--c-border);
+  border-radius: var(--r-md);
+  background: var(--c-bg-1);
+  box-shadow: var(--shadow-lg);
+  color: var(--c-fg-2);
+}
+.turn-hook-trace-row {
+  display: grid;
+  grid-template-columns: 8px minmax(100px, 1fr) auto auto auto;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  padding: 5px 0;
+}
+.turn-hook-trace-row + .turn-hook-trace-row {
+  border-top: 1px solid var(--c-border);
+}
+.turn-hook-trace-row strong {
+  overflow: hidden;
+  color: var(--c-fg-1);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.hook-trace-status {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--c-success);
+}
+.turn-hook-trace-row.is-running .hook-trace-status {
+  background: var(--c-accent);
+  animation: hook-running-pulse 1.4s ease-in-out infinite;
+}
+.turn-hook-trace-row.is-failed .hook-trace-status {
+  background: var(--c-danger);
+}
+@keyframes hook-running-pulse {
+  0%, 100% { opacity: 0.45; }
+  50% { opacity: 1; }
+}
 .turn-model {
   flex:0 1 auto;
   min-width:0;
@@ -8603,12 +8664,14 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   line-height: 1.5;
   white-space: pre;
 }
-.hook-builtins {
+.hook-builtins,
+.hook-recent-traces {
   margin-top: var(--sp-4);
   color: var(--c-fg-2);
   font-size: var(--fs-xs);
 }
-.hook-builtins > summary { cursor: pointer; }
+.hook-builtins > summary,
+.hook-recent-traces > summary { cursor: pointer; }
 .hook-builtin-row {
   display: grid;
   grid-template-columns: minmax(120px, auto) minmax(0, auto) 1fr auto;
