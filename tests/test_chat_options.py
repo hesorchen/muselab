@@ -607,7 +607,7 @@ def test_codex_gateway_effort_reaches_sdk_options(app_module, monkeypatch, tmp_p
     assert captured["env"]["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:9876"
     assert captured["env"]["ANTHROPIC_API_KEY"] == "local-secret"
     assert captured["env"]["ANTHROPIC_CUSTOM_HEADERS"] == (
-        "X-MuseLab-Effort: high"
+        "X-MuseLab-Effort: high\nX-MuseLab-Thinking: summarized"
     )
     assert "system_prompt" not in captured
     assert "CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH" not in captured["env"]
@@ -681,7 +681,7 @@ def test_codex_auto_and_ultra_fast_use_gateway_headers(
         "type": "adaptive", "display": "summarized",
     }
     assert auto["env"]["ANTHROPIC_CUSTOM_HEADERS"] == (
-        "X-MuseLab-Effort: auto"
+        "X-MuseLab-Effort: auto\nX-MuseLab-Thinking: summarized"
     )
     assert "system_prompt" not in auto
 
@@ -696,7 +696,8 @@ def test_codex_auto_and_ultra_fast_use_gateway_headers(
         "type": "adaptive", "display": "summarized",
     }
     assert ultra["env"]["ANTHROPIC_CUSTOM_HEADERS"] == (
-        "X-MuseLab-Effort: ultra\nX-MuseLab-Service-Tier: fast"
+        "X-MuseLab-Effort: ultra\nX-MuseLab-Service-Tier: fast\n"
+        "X-MuseLab-Thinking: summarized"
     )
     assert "system_prompt" not in ultra
     ultra_matchers = ultra["hooks"]["UserPromptSubmit"]
@@ -745,6 +746,9 @@ def test_codex_thinking_opt_out_preserves_effort_transport(
         "bypassPermissions", "high"))
     assert explicit["thinking"] == {"type": "adaptive", "display": "omitted"}
     assert explicit["effort"] == "high"
+    assert explicit["env"]["ANTHROPIC_CUSTOM_HEADERS"] == (
+        "X-MuseLab-Effort: high"
+    )
 
     automatic = _capture_build_options(chat_mod, monkeypatch)
     asyncio.run(chat_mod._build_and_connect_client(
@@ -752,6 +756,9 @@ def test_codex_thinking_opt_out_preserves_effort_transport(
         "bypassPermissions", "auto"))
     assert automatic["thinking"] == {"type": "disabled"}
     assert "effort" not in automatic
+    assert automatic["env"]["ANTHROPIC_CUSTOM_HEADERS"] == (
+        "X-MuseLab-Effort: auto"
+    )
 
 
 def test_bare_gpt_provider_never_inherits_codex_gateway_headers(

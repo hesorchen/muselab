@@ -179,7 +179,9 @@ def _normalize_effort(effort: str | None) -> str:
     return value or "auto"
 
 
-def _muselab_gateway_headers(effort: str, service_tier: str) -> str:
+def _muselab_gateway_headers(
+    effort: str, service_tier: str, *, thinking: bool,
+) -> str:
     """Build Claude CLI's newline-delimited custom-header environment value.
 
     Values have already passed closed-set validation; keeping this helper
@@ -189,6 +191,8 @@ def _muselab_gateway_headers(effort: str, service_tier: str) -> str:
     lines = [f"X-MuseLab-Effort: {_normalize_effort(effort)}"]
     if service_tier == "fast":
         lines.append("X-MuseLab-Service-Tier: fast")
+    if thinking:
+        lines.append("X-MuseLab-Thinking: summarized")
     return "\n".join(lines)
 
 
@@ -3562,6 +3566,10 @@ async def _build_and_connect_client(
     # works uniformly across providers — no router process needed.
     # Claude models still go direct so Pro OAuth keeps working.
     # DUCC is a CLI runtime, not an Anthropic-compatible endpoint override.
+    # Resolve the preference before building gateway headers. The marker lets
+    # CLIProxyAPI explicitly opt in to Responses reasoning summaries only for
+    # sessions whose UI thinking toggle is enabled.
+    thinking_pref = bool(sess_data.get("thinking", True))
     # Never inject MuseLab's provider URL/key/static custom header into it.
     env_ovr = None if is_ducc else endpoints.env_override(model)
     if env_ovr is not None:
@@ -3599,7 +3607,9 @@ async def _build_and_connect_client(
             # the translator's synthetic medium so the model catalog default
             # (Sol=low, others may differ) remains authoritative.
             env_ovr["ANTHROPIC_CUSTOM_HEADERS"] = (
-                _muselab_gateway_headers(effort, service_tier)
+                _muselab_gateway_headers(
+                    effort, service_tier, thinking=thinking_pref,
+                )
             )
             if effort == "ultra":
                 # Enforce the runtime boundary: no nested fan-out and at most
@@ -3726,7 +3736,6 @@ async def _build_and_connect_client(
     # the interleaved [thinking, tool_use, thinking, ...] shape that trips the
     # API can't form. Changing it invalidates the cached client (PATCH handler
     # calls disconnect_client) so the next turn rebuilds with this setting.
-    thinking_pref = bool(sess_data.get("thinking", True))
     supports_thinking = (
         endpoints.ducc_is_claude_model(model)
         if is_ducc

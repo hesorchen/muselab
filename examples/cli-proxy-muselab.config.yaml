@@ -64,10 +64,11 @@ oauth-model-alias:
     - name: "gpt-5.3-codex-spark"
       alias: "gpt-5.3-codex-spark"
 
-# Claude Agent SDK has no native `auto`, `ultra`, or service-tier fields.
-# muselab carries those session controls in private headers; apply them after
-# CLIProxyAPI translates the Anthropic request to the Codex protocol. Keep
-# these rules when copying the example or Fast/Ultra will silently degrade.
+# Claude Agent SDK has no native `auto`, `ultra`, or service-tier fields, and
+# CLIProxyAPI requires an explicit Responses summary opt-in. muselab carries
+# those session controls in private headers; apply them after CLIProxyAPI
+# translates the Anthropic request to the Codex protocol. Keep these rules
+# when copying the example or thinking summaries/Fast/Ultra silently degrade.
 payload:
   override:
     - models:
@@ -125,6 +126,15 @@ payload:
         # Ultra's native Skill supplies bounded orchestration; the Codex wire
         # contract currently accepts reasoning effort only through `max`.
         "reasoning.effort": "max"
+    - models:
+        - name: "gpt-*"
+          protocol: "codex"
+          from-protocol: "claude"
+          headers:
+            X-MuseLab-Thinking: "summarized"
+      params:
+        # Reasoning summaries are opt-in in the Responses API.
+        "reasoning.summary": "auto"
     - models:
         - name: "gpt-*"
           protocol: "codex"
