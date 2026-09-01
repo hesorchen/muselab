@@ -245,7 +245,31 @@ def _sidecar_path(sid: str) -> Path:
     return SESS_DIR / f"{sid}.sidecar.json"
 
 
+# The session index grows with every session (hundreds of rows, ~0.5MB), yet
+# is re-read + re-parsed on every _load_index() call.  The 0.2s reconcile hot
+# loop reaches it through runtime_lineages(), so an uncached json.loads there
+# saturates the event loop with redundant parse work.  Cache the last parse
+# keyed by (mtime_ns, size); drop on save so cache state stays derived purely
+# from disk (mirrors _SIDECAR_CACHE's "drop rather than refresh" policy).
+# Callers get a shallow copy so structural mutations (idx.append) never touch
+# the cached list; single-field dict writes are GIL-atomic and the cache is
+# dropped on every save, so a concurrent lock-free reader (get_session_meta)
+# only ever observes a pre- or post-mutation field value.
+_INDEX_CACHE: dict[str, Any] = {}
+_INDEX_CACHE_LOCK = threading.Lock()
+
+
 def _load_index() -> list[dict]:
+    try:
+        st = INDEX.stat()
+    except FileNotFoundError:
+        with _INDEX_CACHE_LOCK:
+            _INDEX_CACHE.clear()
+        return []
+    sig = (st.st_mtime_ns, st.st_size)
+    with _INDEX_CACHE_LOCK:
+        if _INDEX_CACHE.get("sig") == sig:
+            return list(_INDEX_CACHE["data"])
     try:
         raw = INDEX.read_text(encoding="utf-8")
     except FileNotFoundError:
@@ -260,7 +284,10 @@ def _load_index() -> list[dict]:
         raise RuntimeError(f"cannot parse session index: {INDEX}") from exc
     if not isinstance(data, list):
         raise RuntimeError(f"session index must contain a list: {INDEX}")
-    return data
+    with _INDEX_CACHE_LOCK:
+        _INDEX_CACHE["sig"] = sig
+        _INDEX_CACHE["data"] = data
+    return list(data)
 
 
 def _save_index(items: list[dict]) -> None:
@@ -274,6 +301,10 @@ def _save_index(items: list[dict]) -> None:
     ]
     atomic_write_text(
         INDEX, json.dumps(canonical, ensure_ascii=False, indent=2), mode=0o600)
+    # Drop the parsed-index cache so the next _load_index re-stats and
+    # re-caches the just-written file (mirrors _save_sidecar's drop policy).
+    with _INDEX_CACHE_LOCK:
+        _INDEX_CACHE.clear()
     # Keep the cheap metadata layer live in-place.  A one-session rename/count
     # update must not discard the independently cached transcript metadata and
     # force the next /sessions poll to enumerate every workspace JSONL again.
