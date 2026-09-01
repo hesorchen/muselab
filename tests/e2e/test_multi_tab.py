@@ -150,6 +150,92 @@ def test_closed_tab_stays_closed_after_stale_prefs_write_and_hard_refresh(
     }
 
 
+def test_hidden_runtime_successor_restores_tab_and_draft_after_hard_refresh(
+        page: Page, backend_url, auth_token):
+    """A missed detached-runtime response must repair the persisted source id
+    to its public successor instead of dropping the tab on the next boot."""
+    _login(page, backend_url, auth_token)
+    page.locator(SEL_TAB_NEW).click()
+    target = page.evaluate(
+        "document.querySelector('#app')._x_dataStack[0].currentId")
+    source = "11111111-2222-4333-8444-555555555555"
+    draft = "draft survives runtime redirect"
+
+    def inject_redirect(route):
+        response = route.fetch()
+        if response.status != 200:
+            route.fulfill(response=response)
+            return
+        body = response.json()
+        body["session_redirects"] = {source: target}
+        route.fulfill(response=response, json=body)
+
+    page.route("**/api/chat/sessions?*", inject_redirect)
+    page.evaluate(
+        """([source, draft]) => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const prefs = JSON.parse(localStorage.getItem('muselab_prefs') || '{}');
+          prefs.currentId = source;
+          prefs.workspaceLastSession = {
+            ...(prefs.workspaceLastSession || {}),
+            [app.currentWorkspacePath()]: source,
+          };
+          localStorage.setItem('muselab_prefs', JSON.stringify(prefs));
+          localStorage.setItem('muselab_chat_tabs_v1', JSON.stringify({
+            schema: 1,
+            revision: 1000000,
+            openTabIds: [source],
+          }));
+          localStorage.setItem('muselab_chat_drafts_v1', JSON.stringify({
+            schema: 1,
+            drafts: {
+              [source]: { text: draft, pending: '', updatedAt: Date.now() },
+            },
+          }));
+          app._setChatMuxUnsupported();
+        }""",
+        arg=[source, draft],
+    )
+
+    page.reload(wait_until="domcontentloaded")
+    page.wait_for_function(
+        """([source, target, draft]) => {
+          const app = document.querySelector('#app')?._x_dataStack?.[0];
+          const tabs = JSON.parse(localStorage.getItem(
+            'muselab_chat_tabs_v1') || '{}');
+          const drafts = JSON.parse(localStorage.getItem(
+            'muselab_chat_drafts_v1') || '{}').drafts || {};
+          return app && app._sessionsInitialized
+            && app.currentId === target
+            && app.openTabIds.includes(target)
+            && !app.openTabIds.includes(source)
+            && tabs.openTabIds?.includes(target)
+            && !tabs.openTabIds?.includes(source)
+            && app.tabState[target]?.draft?.input === draft
+            && !drafts[source];
+        }""",
+        arg=[source, target, draft],
+    )
+    restored = page.evaluate(
+        """([source, target]) => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          return {
+            currentId: app.currentId,
+            tabs: app.openTabIds.slice(),
+            sourcePresent: app.sessions.some(row => row.id === source),
+            targetPresent: app.sessions.some(row => row.id === target),
+          };
+        }""",
+        arg=[source, target],
+    )
+    assert restored == {
+        "currentId": target,
+        "tabs": [target],
+        "sourcePresent": False,
+        "targetPresent": True,
+    }
+
+
 def test_same_origin_pages_share_strip_without_focus_theft_or_writeback(
         page: Page, backend_url, auth_token):
     """Storage events converge the strip but keep each page's active tab local."""
@@ -357,9 +443,28 @@ def test_inline_rename_via_dblclick(page: Page, backend_url, auth_token):
 
     inp = page.locator(f"{SEL_TAB_ACTIVE} {SEL_TAB_RENAME}")
     expect(inp).to_be_visible()
-    inp.fill("e2e-renamed")
-    inp.press("Enter")
-    expect(active_name).to_contain_text("e2e-renamed")
+    renamed = "e2e-renamed-after-refresh"
+    inp.fill(renamed)
+    with page.expect_response(
+        lambda response: response.request.method == "PATCH"
+        and "/api/chat/sessions/" in response.url,
+    ) as response_info:
+        inp.press("Enter")
+    assert response_info.value.ok
+    expect(active_name).to_contain_text(renamed)
+
+    page.evaluate(
+        "document.querySelector('#app')._x_dataStack[0]._setChatMuxUnsupported()")
+    page.reload(wait_until="domcontentloaded")
+    page.wait_for_function(
+        """([name]) => {
+          const app = document.querySelector('#app')?._x_dataStack?.[0];
+          const current = app && app.sessions.find(row => row.id === app.currentId);
+          return app && app._sessionsInitialized && current?.name === name;
+        }""",
+        arg=[renamed],
+    )
+    expect(page.locator(f"{SEL_TAB_ACTIVE} {SEL_TAB_NAME}")).to_contain_text(renamed)
 
 
 def test_browser_title_reflects_session(page: Page, backend_url, auth_token):

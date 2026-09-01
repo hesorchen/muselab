@@ -236,6 +236,91 @@ def test_runtime_task_overlay_bounds_summary_on_write(app_module):
     assert raw["runtime_task_overlays"]["task-long"] == overlay
 
 
+def test_running_runtime_task_ids_cache_one_overlay_parse_per_generation(
+    app_module, monkeypatch,
+):
+    from backend import sessions as sess
+
+    sid = sess.create_session("runtime-overlay-summary-cache")["id"]
+    assert sess.set_runtime_task_overlay(
+        sid, "task-running", state="running",
+    )
+    sess._drop_running_runtime_task_ids_cache(sid)
+    real_load = sess._load_runtime_task_overlays_section
+    loads = 0
+
+    def counted_load(load_sid):
+        nonlocal loads
+        loads += 1
+        return real_load(load_sid)
+
+    monkeypatch.setattr(
+        sess, "_load_runtime_task_overlays_section", counted_load,
+    )
+    expected = {sid: frozenset({"task-running"})}
+    assert sess.running_runtime_task_ids((sid, sid)) == expected
+    assert sess.running_runtime_task_ids((sid,)) == expected
+    assert loads == 1
+
+
+def test_sidecar_save_refreshes_running_task_summary_without_reread(
+    app_module, monkeypatch,
+):
+    from backend import sessions as sess
+
+    sid = sess.create_session("runtime-overlay-summary-refresh")["id"]
+    assert sess.set_runtime_task_overlay(sid, "task-1", state="running")
+    assert sess.running_runtime_task_ids((sid,))[sid] == frozenset({"task-1"})
+
+    monkeypatch.setattr(
+        sess,
+        "_load_runtime_task_overlays_section",
+        lambda _sid: pytest.fail("a successful sidecar save must prime summary"),
+    )
+    assert sess.set_runtime_task_overlay(sid, "task-1", state="completed")
+    assert sess.running_runtime_task_ids((sid,))[sid] == frozenset()
+
+
+def test_sidecar_caches_detect_same_size_mtime_atomic_replace(app_module):
+    from backend import sessions as sess
+
+    sid = sess.create_session("runtime-overlay-external-replace")["id"]
+    original = {
+        "messages": {"message-1": {"model": "old"}},
+        "runtime_task_overlays": {
+            "task-1": {"task_id": "task-1", "state": "running"},
+        },
+    }
+    replacement = {
+        "messages": {"message-1": {"model": "new"}},
+        "runtime_task_overlays": {
+            "task-1": {"task_id": "task-1", "state": "stopped"},
+        },
+    }
+    sess._save_sidecar(sid, original)
+    assert sess._load_sidecar(sid)["messages"]["message-1"]["model"] == "old"
+    assert sess.running_runtime_task_ids((sid,))[sid] == frozenset({"task-1"})
+
+    path = sess._sidecar_path(sid)
+    original_stat = path.stat()
+    serialized = json.dumps(replacement, ensure_ascii=False)
+    assert len(serialized.encode("utf-8")) == original_stat.st_size
+    replacement_path = path.with_suffix(".replacement")
+    replacement_path.write_text(serialized, encoding="utf-8")
+    os.utime(
+        replacement_path,
+        ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
+    )
+    os.replace(replacement_path, path)
+    replaced_stat = path.stat()
+    assert replaced_stat.st_size == original_stat.st_size
+    assert replaced_stat.st_mtime_ns == original_stat.st_mtime_ns
+    assert replaced_stat.st_ino != original_stat.st_ino
+
+    assert sess._load_sidecar(sid)["messages"]["message-1"]["model"] == "new"
+    assert sess.running_runtime_task_ids((sid,))[sid] == frozenset()
+
+
 def test_runtime_task_overlay_legacy_summary_is_bounded_then_compacted(app_module):
     from backend import sessions as sess
     from backend.task_summaries import TASK_SUMMARY_PREVIEW_CAP
@@ -379,6 +464,129 @@ def test_runtime_lineages_loads_one_index_snapshot_for_many_sessions(
         child: [source, child],
         unrelated: [unrelated],
     }
+
+
+def test_runtime_lineages_cache_one_parse_per_index_generation(
+    app_module, monkeypatch,
+):
+    from backend import sessions as sess
+
+    sid = sess.create_session("cached-runtime-lineage")["id"]
+    real_load = sess._load_index
+    loads = 0
+
+    def counted_load():
+        nonlocal loads
+        loads += 1
+        return real_load()
+
+    monkeypatch.setattr(sess, "_load_index", counted_load)
+
+    assert sess.runtime_lineage(sid) == [sid]
+    assert sess.runtime_lineage(sid) == [sid]
+    assert loads == 1
+
+
+def test_runtime_successor_redirects_resolve_only_final_public_target(
+    app_module,
+):
+    from backend import sessions as sess
+
+    source = sess.create_session("redirect-source")["id"]
+    child = sess.create_session("redirect-child")["id"]
+    grandchild = sess.create_session("redirect-grandchild")["id"]
+    unrelated = sess.create_session("redirect-unrelated")["id"]
+    assert sess.link_runtime_successor(source, child)
+    assert sess.link_runtime_successor(child, grandchild)
+
+    assert sess.runtime_successor_redirects(
+        (source, child, grandchild, unrelated, "missing", source)
+    ) == {
+        source: grandchild,
+        child: grandchild,
+    }
+
+
+def test_session_list_repairs_hidden_open_tab_to_runtime_successor(
+    client, auth, app_module,
+):
+    from backend import sessions as sess
+
+    source = sess.create_session("hidden-open-source")["id"]
+    child = sess.create_session("hidden-open-child")["id"]
+    target = sess.create_session("visible-open-target")["id"]
+    assert sess.link_runtime_successor(source, child)
+    assert sess.link_runtime_successor(child, target)
+    newest = sess.create_session("newer-first-page-row")["id"]
+
+    response = client.get(
+        f"/api/chat/sessions?limit=1&ids={source}", headers=auth,
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["session_redirects"] == {source: target}
+    returned_ids = [row["id"] for row in body["sessions"]]
+    assert returned_ids == [newest, target]
+    assert source not in returned_ids
+    assert child not in returned_ids
+
+
+def test_runtime_index_cache_never_shares_rows_with_mutators(app_module):
+    from backend import sessions as sess
+
+    sid = sess.create_session("cache-isolation")["id"]
+    assert sess.runtime_lineage(sid) == [sid]
+
+    mutable_rows = sess._load_index()
+    mutable_row = next(row for row in mutable_rows if row["id"] == sid)
+    mutable_row["id"] = "not-persisted"
+
+    durable_rows = json.loads(sess.INDEX.read_text(encoding="utf-8"))
+    assert any(row["id"] == sid for row in durable_rows)
+    assert sess.runtime_lineage(sid) == [sid]
+
+
+def test_runtime_index_cache_invalidates_after_save(app_module):
+    from backend import sessions as sess
+
+    source = sess.create_session("cache-save-source")["id"]
+    child = sess.create_session("cache-save-child")["id"]
+    assert sess.runtime_lineage(source) == [source]
+
+    assert sess.link_runtime_successor(source, child)
+    assert sess.runtime_lineage(source) == [source, child]
+
+
+def test_runtime_index_cache_detects_same_size_mtime_atomic_replace(
+    app_module,
+):
+    from backend import sessions as sess
+
+    original_sid = sess.create_session("cache-external-replace")["id"]
+    replacement_sid = "11111111-2222-4333-8444-555555555555"
+    assert sess.runtime_lineage(original_sid) == [original_sid]
+
+    original_stat = sess.INDEX.stat()
+    rows = json.loads(sess.INDEX.read_text(encoding="utf-8"))
+    row = next(row for row in rows if row["id"] == original_sid)
+    row["id"] = replacement_sid
+    replacement = sess.INDEX.with_suffix(".replacement")
+    replacement.write_text(
+        json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8",
+    )
+    os.utime(
+        replacement,
+        ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
+    )
+    os.replace(replacement, sess.INDEX)
+    replaced_stat = sess.INDEX.stat()
+    assert replaced_stat.st_size == original_stat.st_size
+    assert replaced_stat.st_mtime_ns == original_stat.st_mtime_ns
+    assert replaced_stat.st_ino != original_stat.st_ino
+
+    assert sess.runtime_lineage(original_sid) == []
+    assert sess.runtime_lineage(replacement_sid) == [replacement_sid]
 
 
 def test_runtime_lineage_authority_uses_earliest_owner_snapshot(app_module):
@@ -1069,6 +1277,24 @@ def _sdk_session_info(sid: str, *, title: str | None = None):
         last_modified=2_000,
         tag=None,
     )
+
+
+def test_explicit_local_rename_beats_stale_sdk_title_cache(app_module):
+    from backend import sessions as sess
+
+    sid = "11111111-2222-4333-8444-555555555555"
+    merged = sess._merge_sdk_with_index(
+        _sdk_session_info(sid, title="stale sdk title"),
+        {"name": "manual title", "auto_named": False},
+    )
+    automatic = sess._merge_sdk_with_index(
+        _sdk_session_info(sid, title="fresh sdk title"),
+        {"name": "local fallback", "auto_named": True},
+    )
+
+    assert merged["name"] == "manual title"
+    assert merged["auto_named"] is False
+    assert automatic["name"] == "fresh sdk title"
 
 
 def _wait_for_list_refresh(sess, timeout: float = 2.0) -> None:

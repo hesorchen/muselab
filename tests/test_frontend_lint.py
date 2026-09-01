@@ -908,6 +908,27 @@ def test_chat_tab_ids_are_normalized_at_restore_render_and_persist_boundaries():
         'if (ev.key === "t"')
 
 
+def test_hidden_runtime_successors_repair_tabs_drafts_and_task_links():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+
+    redirect_start = app.index("_applySessionRedirects(raw, incomingSessions = [])")
+    redirect_end = app.index("\n    _normalizeOpenTabIds", redirect_start)
+    redirect = app[redirect_start:redirect_end]
+    assert "this.openTabIds = this._normalizeOpenTabIds(previousOpen.map(rewrite))" in redirect
+    assert "this.currentId = rewrite(this.currentId)" in redirect
+    assert "this._writeChatTabStore(this.openTabIds)" in redirect
+    assert "this._migrateRedirectedChatDraft" in redirect
+    assert '["session_id", "thread_id"]' in redirect
+    assert "item[field] = targetSid" in redirect
+
+    pull_start = app.index("async _pullSessionListOnce(")
+    pull_end = app.index("\n    async refreshSessions()", pull_start)
+    pull = app[pull_start:pull_end]
+    assert "(data && data.session_redirects) || {}" in pull
+    assert pull.index("this._applySessionRedirects(") < pull.index(
+        "this._applySessionList(")
+
+
 def test_workspace_picker_supports_mouse_and_touch_reordering():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
     html = (FRONTEND / "index.html").read_text(encoding="utf-8")
@@ -1137,8 +1158,8 @@ def test_session_rename_patches_activity_without_reloading_chat():
     optimistic = helper[optimistic_start:]
     assert optimistic.index("this._applyRenamedSession(sid, name)") < optimistic.index("await fetch(")
     assert "if (current && current.name === name)" in optimistic
-    assert "this._applyRenamedSession(sid, previousName)" in optimistic
-    assert app.count("this._applyRenamedSession(") == 2
+    assert "this._applyRenamedSession(canonicalSid, previousName)" in optimistic
+    assert app.count("this._applyRenamedSession(") == 3
     assert 'this._renameSessionOptimistically(cur.id, name, cur.name, true, "modal")' in modal
     assert 'this._renameSessionOptimistically(id, name, cur.name, true, "tab")' in tab
     assert 'this._renameSessionOptimistically(sid, name, cur.name, false, "picker")' in picker
@@ -1149,6 +1170,8 @@ def test_session_rename_patches_activity_without_reloading_chat():
     assert "renamePerf.request_ms" in optimistic
     assert 'renamePerf.status = "rollback"' in optimistic
     assert "this._reportSessionRenamePerf(renamePerf)" in optimistic
+    assert "this._sessionNameExpected[sid] = expectedName" in optimistic
+    assert "this._applySessionRedirects({ [sid]: responseSid })" in optimistic
     assert "refreshSessions" not in modal
     assert "refreshSessions" not in tab
     assert "loadSession" not in helper

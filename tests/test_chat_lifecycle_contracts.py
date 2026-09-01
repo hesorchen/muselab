@@ -81,7 +81,11 @@ def test_chat_lifecycle_routes_keep_response_shapes(
         json={"name": "renamed lifecycle contract"},
     )
     assert patched.status_code == 200, patched.text
-    assert patched.json() == {"ok": True}
+    assert patched.json() == {
+        "ok": True,
+        "session_id": sid,
+        "redirected_from": "",
+    }
     assert chat_mod.sess.get_session(sid)["name"] == "renamed lifecycle contract"
 
     deleted = client.delete(f"/api/chat/sessions/{sid}", headers=auth)

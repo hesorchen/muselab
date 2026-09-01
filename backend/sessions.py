@@ -245,6 +245,29 @@ def _sidecar_path(sid: str) -> Path:
     return SESS_DIR / f"{sid}.sidecar.json"
 
 
+# Multiplex reconciliation needs only the runtime predecessor/successor graph.
+# Cache that private, read-only projection rather than the mutable list returned
+# by _load_index(): index mutators edit row dicts in place before _save_index,
+# so sharing cached rows with them would expose uncommitted changes and retain
+# changes whose disk write failed.  The inode is part of the signature because
+# external atomic writers can replace index.json while preserving mtime + size.
+_RUNTIME_INDEX_CACHE: dict[str, Any] = {}
+_RUNTIME_INDEX_CACHE_LOCK = threading.Lock()
+
+
+def _index_file_signature() -> tuple[int, int, int, int] | None:
+    try:
+        st = INDEX.stat()
+    except FileNotFoundError:
+        return None
+    return (st.st_dev, st.st_ino, st.st_mtime_ns, st.st_size)
+
+
+def _clear_runtime_index_cache() -> None:
+    with _RUNTIME_INDEX_CACHE_LOCK:
+        _RUNTIME_INDEX_CACHE.clear()
+
+
 def _load_index() -> list[dict]:
     try:
         raw = INDEX.read_text(encoding="utf-8")
@@ -274,6 +297,9 @@ def _save_index(items: list[dict]) -> None:
     ]
     atomic_write_text(
         INDEX, json.dumps(canonical, ensure_ascii=False, indent=2), mode=0o600)
+    # Drop rather than refresh: the next runtime projection re-stats and
+    # rebuilds from the durable file, matching the sidecar cache contract.
+    _clear_runtime_index_cache()
     # Keep the cheap metadata layer live in-place.  A one-session rename/count
     # update must not discard the independently cached transcript metadata and
     # force the next /sessions poll to enumerate every workspace JSONL again.
@@ -376,15 +402,82 @@ def invalidate_sessions_cache() -> None:
     _META_CACHE.clear()
 
 
-# Parsed-sidecar cache keyed by sid → (mtime, size, dict). Sidecars are
+# Parsed-sidecar cache keyed by sid → (file signature, dict). Sidecars are
 # re-read + json.loads'd on EVERY GET /sessions/{sid} (annotations), every
 # ctx-window read, etc., and can reach MBs when they hold base64 thumbs.
-# (mtime, size) keying means an external edit (or our own _save_sidecar)
-# is picked up on the next read. Cached dicts are returned as-is: callers
+# Device + inode make atomic replacements visible even if an external writer
+# preserves mtime and size; nanosecond mtime catches rapid in-place edits.
+# Cached dicts are returned as-is: callers
 # that mutate them do so under _SIDECAR_LOCK and immediately _save_sidecar
 # (which drops the cache entry), so mutation never leaks a stale snapshot.
-_SIDECAR_CACHE: dict[str, tuple[float, int, dict]] = {}
+_SidecarSignature = tuple[int, int, int, int]
+_SIDECAR_CACHE: dict[str, tuple[_SidecarSignature, dict]] = {}
 _SIDECAR_CACHE_MAX = 64
+
+# Multiplex reconciliation needs only the ids of durable runtime tasks whose
+# overlay is still running. Keeping that tiny immutable projection separately
+# prevents the 64-entry full-sidecar cache from forcing repeated reads of MB-
+# sized annotation/image payloads. The larger bound is cheap (sets of ids only)
+# and covers archives with thousands of sessions without retaining sidecars.
+_RUNNING_RUNTIME_TASK_IDS_CACHE: dict[
+    str, tuple[_SidecarSignature, frozenset[str]]
+] = {}
+_RUNNING_RUNTIME_TASK_IDS_CACHE_LOCK = threading.Lock()
+_RUNNING_RUNTIME_TASK_IDS_CACHE_MAX = 4096
+
+
+def _sidecar_file_signature(path: Path) -> _SidecarSignature | None:
+    try:
+        st = path.stat()
+    except FileNotFoundError:
+        return None
+    return (st.st_dev, st.st_ino, st.st_mtime_ns, st.st_size)
+
+
+def _running_runtime_task_ids_from_data(data: Any) -> frozenset[str]:
+    if not isinstance(data, dict):
+        return frozenset()
+    overlays = data.get("runtime_task_overlays")
+    if not isinstance(overlays, dict):
+        return frozenset()
+    return frozenset(
+        str(task_id)
+        for task_id, overlay in overlays.items()
+        if task_id and isinstance(overlay, dict)
+        and overlay.get("state") == "running"
+    )
+
+
+def _drop_running_runtime_task_ids_cache(sid: str) -> None:
+    with _RUNNING_RUNTIME_TASK_IDS_CACHE_LOCK:
+        _RUNNING_RUNTIME_TASK_IDS_CACHE.pop(sid, None)
+
+
+def _store_running_runtime_task_ids_cache(
+    sid: str,
+    signature: _SidecarSignature,
+    task_ids: frozenset[str],
+) -> None:
+    with _RUNNING_RUNTIME_TASK_IDS_CACHE_LOCK:
+        if (
+            len(_RUNNING_RUNTIME_TASK_IDS_CACHE)
+            >= _RUNNING_RUNTIME_TASK_IDS_CACHE_MAX
+            and sid not in _RUNNING_RUNTIME_TASK_IDS_CACHE
+        ):
+            _RUNNING_RUNTIME_TASK_IDS_CACHE.pop(
+                next(iter(_RUNNING_RUNTIME_TASK_IDS_CACHE)), None,
+            )
+        _RUNNING_RUNTIME_TASK_IDS_CACHE[sid] = (signature, task_ids)
+
+
+def _refresh_running_runtime_task_ids_cache(sid: str, data: dict) -> None:
+    signature = _sidecar_file_signature(_sidecar_path(sid))
+    if signature is None:
+        _drop_running_runtime_task_ids_cache(sid)
+        return
+    _store_running_runtime_task_ids_cache(
+        sid, signature, _running_runtime_task_ids_from_data(data),
+    )
 
 
 def _load_sidecar(sid: str, *, use_cache: bool = True) -> dict:
@@ -396,15 +489,15 @@ def _load_sidecar(sid: str, *, use_cache: bool = True) -> dict:
     in-flight mutations to concurrent readers (and persist them in the
     cache even if the save never happens)."""
     p = _sidecar_path(sid)
-    try:
-        st = p.stat()
-    except FileNotFoundError:
+    sig = _sidecar_file_signature(p)
+    if sig is None:
+        _SIDECAR_CACHE.pop(sid, None)
+        _drop_running_runtime_task_ids_cache(sid)
         return {"messages": {}}
-    sig = (st.st_mtime, st.st_size)
     if use_cache:
         hit = _SIDECAR_CACHE.get(sid)
-        if hit is not None and hit[0] == sig[0] and hit[1] == sig[1]:
-            return hit[2]
+        if hit is not None and hit[0] == sig:
+            return hit[1]
     try:
         d = json.loads(p.read_text(encoding="utf-8"))
         if not isinstance(d, dict):
@@ -418,7 +511,7 @@ def _load_sidecar(sid: str, *, use_cache: bool = True) -> dict:
     if use_cache:
         if len(_SIDECAR_CACHE) >= _SIDECAR_CACHE_MAX and sid not in _SIDECAR_CACHE:
             _SIDECAR_CACHE.pop(next(iter(_SIDECAR_CACHE)), None)
-        _SIDECAR_CACHE[sid] = (sig[0], sig[1], d)
+        _SIDECAR_CACHE[sid] = (sig, d)
     return d
 
 
@@ -428,6 +521,10 @@ def _save_sidecar(sid: str, data: dict) -> None:
     # Drop rather than refresh: the next _load_sidecar re-stats and caches
     # the just-written file, keeping cache state derived purely from disk.
     _SIDECAR_CACHE.pop(sid, None)
+    # The hot reconcile projection is immutable and derived from the exact
+    # object just serialized successfully, so refresh it without rereading the
+    # potentially large sidecar on the next 200 ms tick.
+    _refresh_running_runtime_task_ids_cache(sid, data)
 
 
 def indexed_session_ids() -> set[str]:
@@ -457,10 +554,19 @@ def _merge_sdk_with_index(
 ) -> dict:
     """Build a muselab-shaped session dict from a SDKSessionInfo + the
     muselab index entry (may be empty for sessions created outside muselab)."""
-    name = (info.custom_title
-             or m.get("name")
-             or title_from_message(info.first_prompt or "")
-             or _default_session_name())
+    # An explicit MuseLab rename is written to both stores, but the SDK session
+    # list is cached independently.  Prefer the local manual title while that
+    # cache still contains the previous customTitle/aiTitle; auto-generated
+    # local fallbacks continue to yield to the SDK-native title.
+    indexed_name = str(m.get("name") or "")
+    explicit_indexed_name = (
+        indexed_name if m.get("auto_named") is False else ""
+    )
+    name = (explicit_indexed_name
+            or info.custom_title
+            or indexed_name
+            or title_from_message(info.first_prompt or "")
+            or _default_session_name())
     return {
         "id": info.session_id,
         "name": name,
@@ -1015,6 +1121,7 @@ def delete_session(sid: str) -> bool:
                     try:
                         sidecar.unlink()
                         _SIDECAR_CACHE.pop(sid, None)
+                        _drop_running_runtime_task_ids_cache(sid)
                         removed = True
                     except OSError:
                         pass
@@ -1115,6 +1222,7 @@ def prune_empty_sessions(keep_ids: tuple | list = ()) -> list[str]:
                     try:
                         p.unlink()
                         _SIDECAR_CACHE.pop(sid, None)
+                        _drop_running_runtime_task_ids_cache(sid)
                     except OSError:
                         pass
             q = _queue_path(sid)
@@ -1258,6 +1366,35 @@ def _runtime_rows_by_id(rows: list[dict]) -> dict[str, dict]:
     }
 
 
+def _runtime_rows_snapshot() -> dict[str, dict]:
+    """Return a private cached runtime-link projection of one file version."""
+    for _attempt in range(2):
+        signature = _index_file_signature()
+        if signature is None:
+            _clear_runtime_index_cache()
+            return {}
+        with _RUNTIME_INDEX_CACHE_LOCK:
+            if _RUNTIME_INDEX_CACHE.get("signature") == signature:
+                return _RUNTIME_INDEX_CACHE["rows_by_id"]
+
+        # _load_index returns fresh mutable rows.  Keep those rows private to
+        # this read-only cache; no mutator receives or edits them.
+        rows_by_id = _runtime_rows_by_id(_load_index())
+        loaded_signature = _index_file_signature()
+        if loaded_signature != signature:
+            # An external atomic writer replaced the path while it was read.
+            # Retry once so data and signature describe the same generation.
+            continue
+        with _RUNTIME_INDEX_CACHE_LOCK:
+            _RUNTIME_INDEX_CACHE["signature"] = signature
+            _RUNTIME_INDEX_CACHE["rows_by_id"] = rows_by_id
+        return rows_by_id
+
+    # A continuously changing external file should not poison the cache.  A
+    # fresh uncached snapshot is still a valid point-in-time lineage view.
+    return _runtime_rows_by_id(_load_index())
+
+
 def _runtime_lineage_from_index(
     sid: str, by_id: dict[str, dict],
 ) -> list[str]:
@@ -1310,7 +1447,7 @@ def runtime_lineages(sids: Iterable[str]) -> dict[str, list[str]]:
     if not ordered_sids:
         return {}
     with _INDEX_LOCK:
-        by_id = _runtime_rows_by_id(_load_index())
+        by_id = _runtime_rows_snapshot()
     return {
         sid: _runtime_lineage_from_index(sid, by_id)
         for sid in ordered_sids
@@ -1328,6 +1465,46 @@ def runtime_lineage(sid: str) -> list[str]:
     """
     canonical_sid = str(sid or "")
     return runtime_lineages((canonical_sid,)).get(canonical_sid, [])
+
+
+def runtime_successor_redirects(sids: Iterable[str]) -> dict[str, str]:
+    """Resolve hidden runtime ids to their final public successor.
+
+    A browser can persist the predecessor id immediately before a detached
+    runtime handoff commits, then miss the response because it reloads or the
+    service restarts.  Public session lists intentionally hide that predecessor,
+    so callers need this small durable redirect projection to repair the tab id
+    instead of dropping it.  Only complete chains ending at a public row are
+    returned; broken/cyclic/in-progress links remain untouched.
+    """
+    ordered_sids = tuple(dict.fromkeys(
+        sid for raw_sid in sids if (sid := str(raw_sid or ""))
+    ))
+    if not ordered_sids:
+        return {}
+    with _INDEX_LOCK:
+        by_id = _runtime_rows_snapshot()
+
+    redirects: dict[str, str] = {}
+    for source_sid in ordered_sids:
+        source = by_id.get(source_sid)
+        if source is None or not source.get("runtime_shadow"):
+            continue
+        current_sid = source_sid
+        seen = {source_sid}
+        for _step in range(_RUNTIME_LINEAGE_MAX - 1):
+            successor_sid = str(
+                by_id.get(current_sid, {}).get("runtime_successor") or ""
+            )
+            if (not successor_sid or successor_sid in seen
+                    or successor_sid not in by_id):
+                break
+            seen.add(successor_sid)
+            current_sid = successor_sid
+            if not by_id[current_sid].get("runtime_shadow"):
+                redirects[source_sid] = current_sid
+                break
+    return redirects
 
 
 def update_model(sid: str, model: str) -> None:
@@ -1632,6 +1809,55 @@ def get_runtime_task_overlays(sid: str) -> dict[str, dict]:
     return _normalize_runtime_task_overlays(
         _load_sidecar(sid).get("runtime_task_overlays") or {}
     )
+
+
+def _running_runtime_task_ids(sid: str) -> frozenset[str]:
+    """Return one sidecar's durable running-task summary.
+
+    Cache misses decode only the overlay object and verify the file generation
+    before publishing the immutable result. Callers from async hot paths must
+    invoke the batch wrapper through ``asyncio.to_thread``; warm reads are one
+    stat plus a small set lookup and never retain the full sidecar payload.
+    """
+    latest = frozenset()
+    path = _sidecar_path(sid)
+    for _attempt in range(2):
+        signature = _sidecar_file_signature(path)
+        if signature is None:
+            _drop_running_runtime_task_ids_cache(sid)
+            return frozenset()
+        with _RUNNING_RUNTIME_TASK_IDS_CACHE_LOCK:
+            hit = _RUNNING_RUNTIME_TASK_IDS_CACHE.get(sid)
+            if hit is not None and hit[0] == signature:
+                return hit[1]
+
+        overlays = _load_runtime_task_overlays_section(sid)
+        latest = _running_runtime_task_ids_from_data({
+            "runtime_task_overlays": overlays,
+        })
+        if _sidecar_file_signature(path) != signature:
+            # An atomic external writer replaced the file while it was read.
+            # Retry once; never associate a snapshot with the wrong signature.
+            continue
+        _store_running_runtime_task_ids_cache(sid, signature, latest)
+        return latest
+
+    # A continuously changing external file still yields a valid point-in-time
+    # answer. Do not cache it; the next reconcile pass will retry naturally.
+    return latest
+
+
+def running_runtime_task_ids(
+    sids: Iterable[str],
+) -> dict[str, frozenset[str]]:
+    """Resolve durable running-task ids for many sessions from tiny summaries."""
+    ordered_sids = tuple(dict.fromkeys(
+        sid for raw_sid in sids if (sid := str(raw_sid or ""))
+    ))
+    return {
+        sid: _running_runtime_task_ids(sid)
+        for sid in ordered_sids
+    }
 
 
 _RUNTIME_TASK_TERMINAL_STATES = frozenset({
