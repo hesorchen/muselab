@@ -10997,7 +10997,7 @@ def _create_last_turn_retry_child(
     sid: str,
     user_message_id: str,
 ) -> dict:
-    """Validate canonical tail history and persist one lazy SDK retry child."""
+    """Validate canonical tail history and persist one SDK-native retry fork."""
     with sess.session_lifecycle_lock(sid):
         if sess.session_is_deleting(sid):
             raise HTTPException(404, "session not found")
@@ -11037,45 +11037,77 @@ def _create_last_turn_retry_child(
             if _canonical_uuid_component(resume_at) is None:
                 raise HTTPException(409, "safe retry boundary is unavailable")
 
-        child_sid = str(uuid.uuid4())
         source_name = str(source.get("name") or "会话").strip()
         suffix = "重试" if is_chinese_locale() else "Retry"
+        child_name = f"{source_name} · {suffix}"
+        register_kwargs = {
+            "name": child_name,
+            "model": source_model,
+            "permission": _validate_permission(
+                str(source.get("permission") or "")),
+            "plan_return_permission": source.get("plan_return_permission"),
+            "auto_named": False,
+            "message_count": target_index,
+            "turn_count": sum(
+                1 for item in messages[:target_index]
+                if _is_real_user_prompt(item)
+            ),
+            "effort": _normalize_effort(source.get("effort")),
+            "service_tier": str(source.get("service_tier") or ""),
+            "thinking": source.get("thinking") is not False,
+            "forked_from": sid,
+            "forked_from_name": source_name,
+            "forked_from_message_id": resume_at,
+            "activity_hidden": bool(source.get("activity_hidden")),
+            "runtime_profile": str(source.get("runtime_profile") or ""),
+            "cwd": source.get("cwd") or str(ROOT),
+        }
         try:
-            child = sess.register_session(
-                child_sid,
-                name=f"{source_name} · {suffix}",
-                model=source_model,
-                permission=_validate_permission(
-                    str(source.get("permission") or "")),
-                plan_return_permission=source.get("plan_return_permission"),
-                auto_named=False,
-                message_count=target_index,
-                turn_count=sum(
-                    1 for item in messages[:target_index]
-                    if _is_real_user_prompt(item)
-                ),
-                effort=_normalize_effort(source.get("effort")),
-                service_tier=str(source.get("service_tier") or ""),
-                thinking=source.get("thinking") is not False,
-                forked_from=sid,
-                forked_from_name=source_name,
-                forked_from_message_id=resume_at,
-                activity_hidden=bool(source.get("activity_hidden")),
-                runtime_profile=str(source.get("runtime_profile") or ""),
-                retry_source_session_id=sid if resume_at else "",
-                retry_target_user_uuid=user_message_id if resume_at else "",
-                retry_resume_session_at=resume_at,
-                cwd=source.get("cwd") or str(ROOT),
-            )
+            if resume_at:
+                def _fork_retry():
+                    with _session_config_dir(source_model, sid=sid):
+                        return sdk_fork_session(
+                            sid,
+                            directory=str(sess.session_workspace(sid)),
+                            up_to_message_id=resume_at,
+                            title=child_name,
+                        )
+
+                lifecycle = _commit_fork_lifecycle(
+                    sid,
+                    source,
+                    fork_child=_fork_retry,
+                    register_kwargs=register_kwargs,
+                    successor=False,
+                )
+                child_sid = str(lifecycle["child_sid"])
+                child = lifecycle["child_meta"]
+            else:
+                child_sid = str(uuid.uuid4())
+                child = sess.register_session(
+                    child_sid,
+                    **register_kwargs,
+                )
+        except FileNotFoundError:
+            raise HTTPException(409, "source transcript is unavailable") from None
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from None
+        except HTTPException:
+            raise
+        except Exception as exc:
+            sys.stderr.write(
+                f"[chat] retry fork failed sid={sid[:8]} "
+                f"exc={type(exc).__name__}\n"
+            )
+            sys.stderr.flush()
+            raise HTTPException(500, "retry fork failed — see server log") from None
     return {
         **child,
         "session_id": child_sid,
         "source_session_id": sid,
         "target_user_message_id": user_message_id,
         "prompt": prompt,
-        "retry_mode": "truncate_resume" if resume_at else "fresh",
+        "retry_mode": "native_fork" if resume_at else "fresh",
     }
 
 
