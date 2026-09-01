@@ -601,7 +601,9 @@ def test_codex_gateway_effort_reaches_sdk_options(app_module, monkeypatch, tmp_p
     assert client is not None
     assert captured["model"] == "gpt-5.5"
     assert captured["effort"] == "high"
-    assert captured["thinking"] == {"type": "adaptive", "display": "omitted"}
+    assert captured["thinking"] == {
+        "type": "adaptive", "display": "summarized",
+    }
     assert captured["env"]["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:9876"
     assert captured["env"]["ANTHROPIC_API_KEY"] == "local-secret"
     assert captured["env"]["ANTHROPIC_CUSTOM_HEADERS"] == (
@@ -675,7 +677,9 @@ def test_codex_auto_and_ultra_fast_use_gateway_headers(
     asyncio.run(chat_mod._build_and_connect_client(
         "sid-codex-auto", "codex:gpt-5.6-sol", "bypassPermissions", ""))
     assert "effort" not in auto
-    assert auto["thinking"] == {"type": "disabled"}
+    assert auto["thinking"] == {
+        "type": "adaptive", "display": "summarized",
+    }
     assert auto["env"]["ANTHROPIC_CUSTOM_HEADERS"] == (
         "X-MuseLab-Effort: auto"
     )
@@ -688,7 +692,9 @@ def test_codex_auto_and_ultra_fast_use_gateway_headers(
     # Ultra is a client-level mode: maximum wire reasoning plus proactive,
     # bounded delegation through the SDK's existing Agent tool.
     assert ultra["effort"] == "max"
-    assert ultra["thinking"] == {"type": "adaptive", "display": "omitted"}
+    assert ultra["thinking"] == {
+        "type": "adaptive", "display": "summarized",
+    }
     assert ultra["env"]["ANTHROPIC_CUSTOM_HEADERS"] == (
         "X-MuseLab-Effort: ultra\nX-MuseLab-Service-Tier: fast"
     )
@@ -716,6 +722,36 @@ def test_codex_auto_and_ultra_fast_use_gateway_headers(
     assert no_skill["skills"] == []
     assert "system_prompt" not in no_skill
     assert len(no_skill["hooks"]["UserPromptSubmit"][0].hooks) == 1
+
+
+def test_codex_thinking_opt_out_preserves_effort_transport(
+    app_module, monkeypatch, tmp_path,
+):
+    from backend import chat as chat_mod
+    from backend import endpoints
+
+    monkeypatch.setenv("CODEX_GATEWAY_API_KEY", "local-secret")
+    monkeypatch.setenv("CODEX_GATEWAY_BASE_URL", "http://127.0.0.1:9876")
+    monkeypatch.setattr(endpoints, "_VENDOR_CONFIG_DIR", tmp_path / "vendor-cfg")
+    monkeypatch.setattr(
+        chat_mod.sess,
+        "get_session",
+        lambda _sid: {"thinking": False},
+    )
+
+    explicit = _capture_build_options(chat_mod, monkeypatch)
+    asyncio.run(chat_mod._build_and_connect_client(
+        "sid-codex-no-thinking-explicit", "codex:gpt-5.6-sol",
+        "bypassPermissions", "high"))
+    assert explicit["thinking"] == {"type": "adaptive", "display": "omitted"}
+    assert explicit["effort"] == "high"
+
+    automatic = _capture_build_options(chat_mod, monkeypatch)
+    asyncio.run(chat_mod._build_and_connect_client(
+        "sid-codex-no-thinking-auto", "codex:gpt-5.6-sol",
+        "bypassPermissions", "auto"))
+    assert automatic["thinking"] == {"type": "disabled"}
+    assert "effort" not in automatic
 
 
 def test_bare_gpt_provider_never_inherits_codex_gateway_headers(

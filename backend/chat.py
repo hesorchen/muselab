@@ -3732,14 +3732,21 @@ async def _build_and_connect_client(
         if is_ducc
         else ((provider is None) or provider.supports_thinking)
     ) and thinking_pref
-    codex_effort_transport = (
-        _is_codex_gateway_model(model) and effort != "auto"
-    )
-    if codex_effort_transport:
-        # CLIProxyAPI only reads Claude's output_config.effort when thinking is
-        # adaptive/auto. This is transport plumbing, not a request to render a
-        # visible thinking block, hence display=omitted. The private header is
-        # still final authority (including Ultra's wire-level max mapping).
+    codex_gateway = _is_codex_gateway_model(model)
+    codex_effort_transport = codex_gateway and effort != "auto"
+    if codex_gateway and thinking_pref:
+        # Keep the Gateway on the SDK's native adaptive-thinking contract and
+        # request its user-visible summary stream. ``display=omitted`` leaves
+        # only encrypted/signature reasoning in the transcript and therefore
+        # makes MuseLab's live thinking surface completely empty. Adaptive is
+        # also valid for ``auto`` effort, where the model catalog remains the
+        # authority for reasoning depth.
+        opts_kwargs["thinking"] = ThinkingConfigAdaptive(
+            type="adaptive", display="summarized")
+    elif codex_effort_transport:
+        # An explicit effort still travels through output_config when the user
+        # has opted out of visible thinking. Preserve that transport contract
+        # while keeping the presentation disabled.
         opts_kwargs["thinking"] = ThinkingConfigAdaptive(
             type="adaptive", display="omitted")
     elif supports_thinking:
