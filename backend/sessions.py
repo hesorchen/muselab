@@ -245,31 +245,30 @@ def _sidecar_path(sid: str) -> Path:
     return SESS_DIR / f"{sid}.sidecar.json"
 
 
-# The session index grows with every session (hundreds of rows, ~0.5MB), yet
-# is re-read + re-parsed on every _load_index() call.  The 0.2s reconcile hot
-# loop reaches it through runtime_lineages(), so an uncached json.loads there
-# saturates the event loop with redundant parse work.  Cache the last parse
-# keyed by (mtime_ns, size); drop on save so cache state stays derived purely
-# from disk (mirrors _SIDECAR_CACHE's "drop rather than refresh" policy).
-# Callers get a shallow copy so structural mutations (idx.append) never touch
-# the cached list; single-field dict writes are GIL-atomic and the cache is
-# dropped on every save, so a concurrent lock-free reader (get_session_meta)
-# only ever observes a pre- or post-mutation field value.
-_INDEX_CACHE: dict[str, Any] = {}
-_INDEX_CACHE_LOCK = threading.Lock()
+# Multiplex reconciliation needs only the runtime predecessor/successor graph.
+# Cache that private, read-only projection rather than the mutable list returned
+# by _load_index(): index mutators edit row dicts in place before _save_index,
+# so sharing cached rows with them would expose uncommitted changes and retain
+# changes whose disk write failed.  The inode is part of the signature because
+# external atomic writers can replace index.json while preserving mtime + size.
+_RUNTIME_INDEX_CACHE: dict[str, Any] = {}
+_RUNTIME_INDEX_CACHE_LOCK = threading.Lock()
 
 
-def _load_index() -> list[dict]:
+def _index_file_signature() -> tuple[int, int, int, int] | None:
     try:
         st = INDEX.stat()
     except FileNotFoundError:
-        with _INDEX_CACHE_LOCK:
-            _INDEX_CACHE.clear()
-        return []
-    sig = (st.st_mtime_ns, st.st_size)
-    with _INDEX_CACHE_LOCK:
-        if _INDEX_CACHE.get("sig") == sig:
-            return list(_INDEX_CACHE["data"])
+        return None
+    return (st.st_dev, st.st_ino, st.st_mtime_ns, st.st_size)
+
+
+def _clear_runtime_index_cache() -> None:
+    with _RUNTIME_INDEX_CACHE_LOCK:
+        _RUNTIME_INDEX_CACHE.clear()
+
+
+def _load_index() -> list[dict]:
     try:
         raw = INDEX.read_text(encoding="utf-8")
     except FileNotFoundError:
@@ -284,10 +283,7 @@ def _load_index() -> list[dict]:
         raise RuntimeError(f"cannot parse session index: {INDEX}") from exc
     if not isinstance(data, list):
         raise RuntimeError(f"session index must contain a list: {INDEX}")
-    with _INDEX_CACHE_LOCK:
-        _INDEX_CACHE["sig"] = sig
-        _INDEX_CACHE["data"] = data
-    return list(data)
+    return data
 
 
 def _save_index(items: list[dict]) -> None:
@@ -301,10 +297,9 @@ def _save_index(items: list[dict]) -> None:
     ]
     atomic_write_text(
         INDEX, json.dumps(canonical, ensure_ascii=False, indent=2), mode=0o600)
-    # Drop the parsed-index cache so the next _load_index re-stats and
-    # re-caches the just-written file (mirrors _save_sidecar's drop policy).
-    with _INDEX_CACHE_LOCK:
-        _INDEX_CACHE.clear()
+    # Drop rather than refresh: the next runtime projection re-stats and
+    # rebuilds from the durable file, matching the sidecar cache contract.
+    _clear_runtime_index_cache()
     # Keep the cheap metadata layer live in-place.  A one-session rename/count
     # update must not discard the independently cached transcript metadata and
     # force the next /sessions poll to enumerate every workspace JSONL again.
@@ -1289,6 +1284,35 @@ def _runtime_rows_by_id(rows: list[dict]) -> dict[str, dict]:
     }
 
 
+def _runtime_rows_snapshot() -> dict[str, dict]:
+    """Return a private cached runtime-link projection of one file version."""
+    for _attempt in range(2):
+        signature = _index_file_signature()
+        if signature is None:
+            _clear_runtime_index_cache()
+            return {}
+        with _RUNTIME_INDEX_CACHE_LOCK:
+            if _RUNTIME_INDEX_CACHE.get("signature") == signature:
+                return _RUNTIME_INDEX_CACHE["rows_by_id"]
+
+        # _load_index returns fresh mutable rows.  Keep those rows private to
+        # this read-only cache; no mutator receives or edits them.
+        rows_by_id = _runtime_rows_by_id(_load_index())
+        loaded_signature = _index_file_signature()
+        if loaded_signature != signature:
+            # An external atomic writer replaced the path while it was read.
+            # Retry once so data and signature describe the same generation.
+            continue
+        with _RUNTIME_INDEX_CACHE_LOCK:
+            _RUNTIME_INDEX_CACHE["signature"] = signature
+            _RUNTIME_INDEX_CACHE["rows_by_id"] = rows_by_id
+        return rows_by_id
+
+    # A continuously changing external file should not poison the cache.  A
+    # fresh uncached snapshot is still a valid point-in-time lineage view.
+    return _runtime_rows_by_id(_load_index())
+
+
 def _runtime_lineage_from_index(
     sid: str, by_id: dict[str, dict],
 ) -> list[str]:
@@ -1341,7 +1365,7 @@ def runtime_lineages(sids: Iterable[str]) -> dict[str, list[str]]:
     if not ordered_sids:
         return {}
     with _INDEX_LOCK:
-        by_id = _runtime_rows_by_id(_load_index())
+        by_id = _runtime_rows_snapshot()
     return {
         sid: _runtime_lineage_from_index(sid, by_id)
         for sid in ordered_sids

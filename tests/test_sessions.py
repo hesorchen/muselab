@@ -381,6 +381,84 @@ def test_runtime_lineages_loads_one_index_snapshot_for_many_sessions(
     }
 
 
+def test_runtime_lineages_cache_one_parse_per_index_generation(
+    app_module, monkeypatch,
+):
+    from backend import sessions as sess
+
+    sid = sess.create_session("cached-runtime-lineage")["id"]
+    real_load = sess._load_index
+    loads = 0
+
+    def counted_load():
+        nonlocal loads
+        loads += 1
+        return real_load()
+
+    monkeypatch.setattr(sess, "_load_index", counted_load)
+
+    assert sess.runtime_lineage(sid) == [sid]
+    assert sess.runtime_lineage(sid) == [sid]
+    assert loads == 1
+
+
+def test_runtime_index_cache_never_shares_rows_with_mutators(app_module):
+    from backend import sessions as sess
+
+    sid = sess.create_session("cache-isolation")["id"]
+    assert sess.runtime_lineage(sid) == [sid]
+
+    mutable_rows = sess._load_index()
+    mutable_row = next(row for row in mutable_rows if row["id"] == sid)
+    mutable_row["id"] = "not-persisted"
+
+    durable_rows = json.loads(sess.INDEX.read_text(encoding="utf-8"))
+    assert any(row["id"] == sid for row in durable_rows)
+    assert sess.runtime_lineage(sid) == [sid]
+
+
+def test_runtime_index_cache_invalidates_after_save(app_module):
+    from backend import sessions as sess
+
+    source = sess.create_session("cache-save-source")["id"]
+    child = sess.create_session("cache-save-child")["id"]
+    assert sess.runtime_lineage(source) == [source]
+
+    assert sess.link_runtime_successor(source, child)
+    assert sess.runtime_lineage(source) == [source, child]
+
+
+def test_runtime_index_cache_detects_same_size_mtime_atomic_replace(
+    app_module,
+):
+    from backend import sessions as sess
+
+    original_sid = sess.create_session("cache-external-replace")["id"]
+    replacement_sid = "11111111-2222-4333-8444-555555555555"
+    assert sess.runtime_lineage(original_sid) == [original_sid]
+
+    original_stat = sess.INDEX.stat()
+    rows = json.loads(sess.INDEX.read_text(encoding="utf-8"))
+    row = next(row for row in rows if row["id"] == original_sid)
+    row["id"] = replacement_sid
+    replacement = sess.INDEX.with_suffix(".replacement")
+    replacement.write_text(
+        json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8",
+    )
+    os.utime(
+        replacement,
+        ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
+    )
+    os.replace(replacement, sess.INDEX)
+    replaced_stat = sess.INDEX.stat()
+    assert replaced_stat.st_size == original_stat.st_size
+    assert replaced_stat.st_mtime_ns == original_stat.st_mtime_ns
+    assert replaced_stat.st_ino != original_stat.st_ino
+
+    assert sess.runtime_lineage(original_sid) == []
+    assert sess.runtime_lineage(replacement_sid) == [replacement_sid]
+
+
 def test_runtime_lineage_authority_uses_earliest_owner_snapshot(app_module):
     from backend import sessions as sess
 
