@@ -725,6 +725,20 @@ function portal() {
         session_mode: "fresh",
       },
     },
+    // Read-only SDK background-task inspector. The card remains the compact
+    // status surface; this dialog exposes lifecycle metadata and the bounded
+    // `.output` text without routing that temp file through the workspace
+    // browser.
+    taskDetail: {
+      show: false,
+      loading: false,
+      error: "",
+      output: "",
+      status: null,
+      source: null,
+      loadedPath: "",
+    },
+    _taskDetailRequestId: 0,
     // User-owned global scratch TODO clipboard. It is deliberately independent
     // from Muse/Claude Task tools and shared across every conversation and
     // workspace in this browser.
@@ -1434,6 +1448,7 @@ function portal() {
         ev.stopPropagation();
         if (top === "generic-modal" && this.modal.cancel) this.modal.cancel();
         else if (top === "activity-move") this.closeActivityMoveMenu(true);
+        else if (top === "task-detail") this.closeTaskDetail();
         else if (top === "scheduler") this.closeScheduler();
         else if (top === "session-todo") this.closeSessionTodoBoard();
         else if (top === "activity") this.closeActivityCenter();
@@ -5554,6 +5569,117 @@ function portal() {
         await this.openFile({ path, name }, { readUrl: url, reveal: true });
       } catch (e) {
         this.toast(this.lang === "zh" ? `打开失败：${path}` : `Open failed: ${path}`, "warn");
+      }
+    },
+
+    _taskDetailSource(message) {
+      const task = message && message.task && typeof message.task === "object"
+        ? message.task : {};
+      const input = message && message.input && typeof message.input === "object"
+        ? message.input : {};
+      return {
+        tool_name: String(message && message.name || ""),
+        task_type: String(task.subagent_type || ""),
+        description: String(
+          task.description || input.description || message && message.summary || "",
+        ),
+      };
+    },
+    taskDetailUsageRows(usage) {
+      if (!usage || typeof usage !== "object" || Array.isArray(usage)) return [];
+      const labels = this.lang === "zh"
+        ? { total_tokens: "总 Token", tool_uses: "工具调用", duration_ms: "耗时" }
+        : { total_tokens: "Total tokens", tool_uses: "Tool calls", duration_ms: "Duration" };
+      return Object.entries(usage).map(([key, value]) => {
+        let display = value;
+        if (key === "duration_ms" && Number.isFinite(Number(value))) {
+          display = this.fmtStreamElapsed(Number(value) / 1000);
+        } else if (key.includes("token") && Number.isFinite(Number(value))) {
+          display = this.fmtTokens(Number(value));
+        }
+        return { key, label: labels[key] || key, value: String(display ?? "") };
+      });
+    },
+    async _loadTaskDetailOutput(status, requestId) {
+      const path = String(status && status.output_file || "");
+      const ownerSid = String(status && status.owner_session_id || this.currentId || "");
+      if (!path || !ownerSid) return;
+      this.taskDetail.loading = true;
+      this.taskDetail.error = "";
+      try {
+        const url = "/api/chat/task-output?session_id="
+          + encodeURIComponent(ownerSid)
+          + "&path=" + encodeURIComponent(path);
+        const response = await fetch(url, { headers: this.hdr() });
+        if (!response.ok) {
+          let reason = "";
+          try {
+            const payload = await response.json();
+            reason = String(payload && payload.detail || "");
+          } catch (_) {}
+          throw new Error(reason || `HTTP ${response.status}`);
+        }
+        const output = await response.text();
+        if (requestId !== this._taskDetailRequestId || !this.taskDetail.show) return;
+        this.taskDetail.output = output;
+        this.taskDetail.loadedPath = path;
+      } catch (error) {
+        if (requestId !== this._taskDetailRequestId || !this.taskDetail.show) return;
+        this.taskDetail.error = String(error && error.message || error || "");
+      } finally {
+        if (requestId === this._taskDetailRequestId) this.taskDetail.loading = false;
+      }
+    },
+    async openTaskDetail(status, message = null, ev = null) {
+      if (!status || typeof status !== "object") return;
+      const opener = ev && ev.currentTarget ? ev.currentTarget : document.activeElement;
+      const snapshot = this._normalizeTaskStatusPreview({ ...status });
+      const requestId = ++this._taskDetailRequestId;
+      this.taskDetail = {
+        show: true,
+        loading: false,
+        error: "",
+        output: "",
+        status: snapshot,
+        source: this._taskDetailSource(message),
+        loadedPath: "",
+      };
+      this._openFocusSurface(
+        "task-detail", ".task-detail-modal", ".task-detail-close",
+        opener, true,
+      );
+      await this._loadTaskDetailOutput(snapshot, requestId);
+    },
+    closeTaskDetail() {
+      const wasOpen = this.taskDetail.show;
+      ++this._taskDetailRequestId;
+      this.taskDetail.show = false;
+      this.taskDetail.loading = false;
+      if (wasOpen) this._closeFocusSurface("task-detail");
+    },
+    async openTaskDetailOutput() {
+      const status = this.taskDetail.status
+        ? { ...this.taskDetail.status } : null;
+      if (!status || !status.output_file) return;
+      this.closeTaskDetail();
+      await this.openTaskOutput(status);
+    },
+    _syncOpenTaskDetail(status, message = null) {
+      const current = this.taskDetail.status;
+      if (!this.taskDetail.show || !current || !status) return;
+      const sameTask = status.task_id && current.task_id
+        && String(status.task_id) === String(current.task_id);
+      const sameTool = status.tool_use_id && current.tool_use_id
+        && String(status.tool_use_id) === String(current.tool_use_id);
+      if (!sameTask && !sameTool) return;
+      const next = this._normalizeTaskStatusPreview({ ...current, ...status });
+      this.taskDetail.status = next;
+      if (message) this.taskDetail.source = this._taskDetailSource(message);
+      const nextPath = String(next.output_file || "");
+      if (nextPath && nextPath !== this.taskDetail.loadedPath
+          && !this.taskDetail.loading) {
+        const requestId = ++this._taskDetailRequestId;
+        void this._loadTaskDetailOutput(next, requestId);
       }
     },
 
@@ -31948,6 +32074,7 @@ function portal() {
         const prev = (merge && card.task_status) ? card.task_status : {};
         card.task_status = this._normalizeTaskStatusPreview(
           Object.assign({}, prev, patch));
+        this._syncOpenTaskDetail(card.task_status, card);
         if (card.id) taskCardByToolUseId.set(String(card.id), card);
         if (card.task_status.task_id) {
           taskCardByTaskId.set(String(card.task_status.task_id), card);
@@ -32164,6 +32291,7 @@ function portal() {
           summary_length: d.summary_length,
           summary_truncated: d.summary_truncated,
           output_file: d.output_file || "",
+          usage: d.usage || null,
         });
         const remaining = Number(d.background_tasks_pending);
         if (Number.isFinite(remaining)) {

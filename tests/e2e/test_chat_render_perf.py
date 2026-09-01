@@ -9237,6 +9237,102 @@ def test_inherited_projection_unread_requires_new_runtime_event(
     _assert_no_browser_errors(page, errors)
 
 
+def test_background_task_card_opens_detail_with_output_and_restores_focus(
+    page: Page, backend_url, auth_token,
+):
+    errors = _capture_browser_errors(page)
+    page.set_viewport_size({"width": 1280, "height": 820})
+    page.route(
+        "**/api/chat/task-output?*",
+        lambda route: route.fulfill(
+            status=200,
+            content_type="text/plain; charset=utf-8",
+            body="TASK_DETAIL_OUTPUT\nsecond line",
+        ),
+    )
+    _login(page, backend_url, auth_token)
+    sid = _app_eval(
+        page,
+        """
+        const sid = app.currentId;
+        const st = app._ensureTabState(sid);
+        st.messages.splice(0, st.messages.length, {
+          role: "tool_use",
+          name: "Agent",
+          id: "task-detail-tool-use",
+          task: {
+            description: "Inspect task detail UX",
+            subagent_type: "general-purpose",
+          },
+          input: { run_in_background: true },
+          task_status: {
+            state: "completed",
+            task_id: "task-detail-1",
+            owner_session_id: sid,
+            summary: "Task detail completed",
+            last_tool_name: "Grep",
+            usage: { total_tokens: 2400, tool_uses: 5, duration_ms: 8800 },
+            output_file: `/tmp/claude-1000/e2e/${sid}/tasks/task-detail-1.output`,
+          },
+          _k: `${sid}:task-detail-card`,
+          _noAnim: true,
+        });
+        st.messageRange.visibleStart = 0;
+        st.messageRange.visibleEnd = 1;
+        st.messageRange.total = 1;
+        st.messagesReady = true;
+        st.messagesLoading = false;
+        app._activateTabState(sid);
+        await new Promise(resolve => app.$nextTick(
+          () => requestAnimationFrame(resolve)));
+        return sid;
+        """,
+    )
+
+    trigger = page.locator(
+        '.msg-pane:visible .subagent-task .task-detail-trigger'
+    )
+    expect(trigger).to_be_visible(timeout=5000)
+    trigger.focus()
+    trigger.click()
+
+    modal = page.locator(".task-detail-modal")
+    expect(modal).to_be_visible()
+    expect(modal).to_contain_text("Background task details")
+    expect(modal).to_contain_text("task-detail-1")
+    expect(modal).to_contain_text("Grep")
+    expect(modal).to_contain_text("2.4K")
+    expect(modal).to_contain_text("8s")
+    expect(modal.locator(".task-detail-output")).to_contain_text(
+        "TASK_DETAIL_OUTPUT\nsecond line"
+    )
+    expect(modal.locator(".task-detail-loading")).to_be_hidden()
+    expect(modal.locator(".task-detail-error")).to_be_hidden()
+    expect(modal.locator(".task-detail-empty")).to_be_hidden()
+    page.keyboard.press("Escape")
+    expect(modal).to_be_hidden()
+    expect(trigger).to_be_focused()
+
+    state = _app_eval(
+        page,
+        """
+        const card = app.tabState[arg].messages[0];
+        return {
+          show: app.taskDetail.show,
+          state: card.task_status.state,
+          output: app.taskDetail.output,
+        };
+        """,
+        sid,
+    )
+    assert state == {
+        "show": False,
+        "state": "completed",
+        "output": "TASK_DETAIL_OUTPUT\nsecond line",
+    }
+    _assert_no_browser_errors(page, errors)
+
+
 def test_background_completion_no_active_fallback_never_blanks_visible_messages(
     page: Page, backend_url, auth_token,
 ):

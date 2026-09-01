@@ -6256,3 +6256,28 @@ def test_sdk_scheduled_tasks_have_live_stream_and_amber_session_state():
     assert 'origin.get("subkind") == "scheduled-trigger"' in backend
     assert "session_has_scheduled_tasks" in runtime
     assert "if observed:" in runtime
+
+
+def test_background_task_cards_open_a_safe_focus_managed_detail_dialog():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    css = (FRONTEND / "styles.css").read_text(encoding="utf-8")
+    presentation = (BACKEND / "chat_presentation.py").read_text(encoding="utf-8")
+
+    assert html.count('class="task-detail-trigger"') == 2
+    assert html.count("openTaskDetail(m.task_status, m, $event)") == 2
+    assert 'class="modal task-detail-modal" role="dialog" aria-modal="true"' in html
+    assert 'aria-labelledby="task-detail-title"' in html
+    assert '@keydown.tab="trapDialogFocus($event, \'task-detail\')"' in html
+    assert 'x-text="taskDetail.output"' in html
+    assert "taskDetailUsageRows(taskDetail.status?.usage)" in html
+    assert "async openTaskDetail(status, message = null, ev = null)" in app
+    assert '"task-detail", ".task-detail-modal", ".task-detail-close"' in app
+    assert 'else if (top === "task-detail") this.closeTaskDetail()' in app
+    assert '"/api/chat/task-output?session_id="' in app
+    assert "requestId !== this._taskDetailRequestId" in app
+    assert "this._syncOpenTaskDetail(card.task_status, card)" in app
+    assert "usage: d.usage || null" in app
+    assert 'usage=data.get("usage") or {}' in presentation
+    assert ".modal.task-detail-modal" in css
+    assert ".task-detail-trigger:focus-visible" in css

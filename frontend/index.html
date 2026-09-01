@@ -2307,17 +2307,23 @@
                     <template x-if="m.task_status">
                       <div class="subagent-task"
                            :class="'is-' + (m.task_status.state || 'running')">
-                        <span class="subagent-task-badge"
-                              x-text="taskStatusLabel(m.task_status.state)"></span>
-                        <span class="subagent-task-summary"
-                              x-show="m.task_status.summary"
-                              x-text="m.task_status.summary"></span>
-                        <span class="task-summary-truncated"
-                              x-show="m.task_status.summary_truncated"
-                              x-text="t('subagent.summary_truncated')"></span>
+                        <button type="button" class="task-detail-trigger"
+                                :aria-label="(lang==='zh' ? '查看后台任务详情：' : 'View background task details: ') + taskStatusLabel(m.task_status.state)"
+                                :title="lang==='zh' ? '点击查看后台任务详情' : 'Click to view background task details'"
+                                @click="openTaskDetail(m.task_status, m, $event)">
+                          <span class="subagent-task-badge"
+                                x-text="taskStatusLabel(m.task_status.state)"></span>
+                          <span class="subagent-task-summary"
+                                x-show="m.task_status.summary"
+                                x-text="m.task_status.summary"></span>
+                          <span class="task-summary-truncated"
+                                x-show="m.task_status.summary_truncated"
+                                x-text="t('subagent.summary_truncated')"></span>
+                          <span class="task-detail-chevron" aria-hidden="true">›</span>
+                        </button>
                         <a class="subagent-task-open" href="#"
                            x-show="m.task_status.output_file"
-                           @click.prevent="openTaskOutput(m.task_status)"
+                           @click.stop.prevent="openTaskOutput(m.task_status)"
                            x-text="t('subagent.open_result')"></a>
                         <!-- Stop button — only while running. Backed by the
                              SDK-native stop_task control request; the card
@@ -2325,7 +2331,7 @@
                              notification round-trips the settle path. -->
                         <a class="subagent-task-stop" href="#"
                            x-show="(m.task_status.state || 'running') === 'running' && m.task_status.task_id"
-                           @click.prevent="stopBackgroundTask(m.task_status)"
+                           @click.stop.prevent="stopBackgroundTask(m.task_status)"
                            x-text="'⏹ ' + t('subagent.stop_task')"></a>
                       </div>
                     </template>
@@ -2447,24 +2453,30 @@
                     <template x-if="m.task_status">
                       <span class="tool-task"
                             :class="'is-' + (m.task_status.state || 'running')">
-                        <span class="tool-task-badge"
-                              x-text="taskStatusLabel(m.task_status.state)"></span>
-                        <span class="tool-task-summary"
-                              x-show="m.task_status.summary"
-                              x-text="m.task_status.summary"></span>
-                        <span class="task-summary-truncated"
-                              x-show="m.task_status.summary_truncated"
-                              x-text="t('subagent.summary_truncated')"></span>
+                        <button type="button" class="task-detail-trigger"
+                                :aria-label="(lang==='zh' ? '查看后台任务详情：' : 'View background task details: ') + taskStatusLabel(m.task_status.state)"
+                                :title="lang==='zh' ? '点击查看后台任务详情' : 'Click to view background task details'"
+                                @click="openTaskDetail(m.task_status, m, $event)">
+                          <span class="tool-task-badge"
+                                x-text="taskStatusLabel(m.task_status.state)"></span>
+                          <span class="tool-task-summary"
+                                x-show="m.task_status.summary"
+                                x-text="m.task_status.summary"></span>
+                          <span class="task-summary-truncated"
+                                x-show="m.task_status.summary_truncated"
+                                x-text="t('subagent.summary_truncated')"></span>
+                          <span class="task-detail-chevron" aria-hidden="true">›</span>
+                        </button>
                         <a class="tool-task-open" href="#"
                            x-show="m.task_status.output_file"
-                           @click.prevent="openTaskOutput(m.task_status)"
+                           @click.stop.prevent="openTaskOutput(m.task_status)"
                            x-text="t('subagent.open_result')"></a>
                         <!-- Stop button — same contract as the subagent
                              card's: visible only while running, settles via
                              the CLI's status='stopped' notification. -->
                         <a class="tool-task-stop" href="#"
                            x-show="(m.task_status.state || 'running') === 'running' && m.task_status.task_id"
-                           @click.prevent="stopBackgroundTask(m.task_status)"
+                           @click.stop.prevent="stopBackgroundTask(m.task_status)"
                            x-text="'⏹ ' + t('subagent.stop_task')"></a>
                       </span>
                     </template>
@@ -6761,6 +6773,104 @@
           </svg>
         </button>
       </template>
+    </div>
+  </div>
+
+  <!-- SDK background-task detail. The compact chat card opens this read-only
+       inspector; output stays behind the existing token-gated, path-restricted
+       task-output endpoint. -->
+  <div class="modal-backdrop task-detail-backdrop"
+       x-show="taskDetail.show" x-cloak
+       x-transition.opacity.duration.120ms
+       @click.self="closeTaskDetail()">
+    <div class="modal task-detail-modal" role="dialog" aria-modal="true"
+         aria-labelledby="task-detail-title" tabindex="-1"
+         @keydown.tab="trapDialogFocus($event, 'task-detail')">
+      <div class="modal-head">
+        <span class="modal-title" id="task-detail-title">
+          <svg class="modal-title-icon"><use href="#i-tool"/></svg>
+          <span x-text="lang==='zh' ? '后台任务详情' : 'Background task details'"></span>
+        </span>
+        <span class="task-detail-state"
+              :class="'is-' + (taskDetail.status?.state || 'running')"
+              x-text="taskStatusLabel(taskDetail.status?.state)"></span>
+        <button type="button" class="modal-close task-detail-close"
+                @click="closeTaskDetail()"
+                :title="lang==='zh' ? '关闭' : 'Close'" aria-label="Close">×</button>
+      </div>
+      <div class="modal-body task-detail-body">
+        <div class="task-detail-description"
+             x-show="taskDetail.source?.description || taskDetail.status?.description"
+             x-text="taskDetail.source?.description || taskDetail.status?.description"></div>
+
+        <dl class="task-detail-meta">
+          <div x-show="taskDetail.status?.task_id">
+            <dt x-text="lang==='zh' ? '任务 ID' : 'Task ID'"></dt>
+            <dd class="mono" x-text="taskDetail.status?.task_id"></dd>
+          </div>
+          <div x-show="taskDetail.source?.tool_name">
+            <dt x-text="lang==='zh' ? '启动工具' : 'Tool'"></dt>
+            <dd class="mono" x-text="taskDetail.source?.tool_name"></dd>
+          </div>
+          <div x-show="taskDetail.source?.task_type">
+            <dt x-text="lang==='zh' ? 'Agent 类型' : 'Agent type'"></dt>
+            <dd class="mono" x-text="taskDetail.source?.task_type"></dd>
+          </div>
+          <div x-show="taskDetail.status?.last_tool_name">
+            <dt x-text="lang==='zh' ? '最近工具' : 'Latest tool'"></dt>
+            <dd class="mono" x-text="taskDetail.status?.last_tool_name"></dd>
+          </div>
+          <template x-for="row in taskDetailUsageRows(taskDetail.status?.usage)"
+                    :key="row.key">
+            <div>
+              <dt x-text="row.label"></dt>
+              <dd class="mono" x-text="row.value"></dd>
+            </div>
+          </template>
+        </dl>
+
+        <section class="task-detail-section" x-show="taskDetail.status?.summary">
+          <h3 x-text="lang==='zh' ? '完成摘要' : 'Completion summary'"></h3>
+          <div class="task-detail-summary" x-text="taskDetail.status?.summary"></div>
+          <div class="task-summary-truncated"
+               x-show="taskDetail.status?.summary_truncated"
+               x-text="t('subagent.summary_truncated')"></div>
+        </section>
+
+        <section class="task-detail-section task-detail-output-section">
+          <div class="task-detail-section-head">
+            <h3 x-text="lang==='zh' ? '任务输出' : 'Task output'"></h3>
+            <span class="task-detail-output-path mono"
+                  x-show="taskDetail.status?.output_file"
+                  :title="taskDetail.status?.output_file"
+                  x-text="taskDetail.status?.output_file?.split('/').pop()"></span>
+          </div>
+          <div class="task-detail-loading" x-show="taskDetail.loading">
+            <span class="spinner-sm" aria-hidden="true"></span>
+            <span x-text="lang==='zh' ? '正在读取输出…' : 'Loading output…'"></span>
+          </div>
+          <div class="task-detail-error" x-show="!taskDetail.loading && taskDetail.error">
+            <span x-text="lang==='zh' ? '输出暂不可用：' : 'Output unavailable: '"></span>
+            <span x-text="taskDetail.error"></span>
+          </div>
+          <pre class="task-detail-output"
+               x-show="!taskDetail.loading && !taskDetail.error && taskDetail.output"
+               x-text="taskDetail.output"></pre>
+          <div class="task-detail-empty"
+               x-show="!taskDetail.loading && !taskDetail.error && !taskDetail.output"
+               x-text="taskDetail.status?.state === 'running'
+                 ? (lang==='zh' ? '任务仍在运行，输出将在可用后自动显示。' : 'The task is still running. Output will appear when available.')
+                 : (lang==='zh' ? '这个任务没有可读取的输出文件。' : 'This task has no readable output file.')"></div>
+        </section>
+      </div>
+      <div class="modal-foot task-detail-foot">
+        <button type="button" class="btn-ghost" @click="closeTaskDetail()"
+                x-text="lang==='zh' ? '关闭' : 'Close'"></button>
+        <button type="button" class="btn-primary"
+                x-show="taskDetail.status?.output_file"
+                @click="openTaskDetailOutput()"
+                x-text="lang==='zh' ? '在文件预览中打开' : 'Open in file preview'"></button>
+      </div>
     </div>
   </div>
 

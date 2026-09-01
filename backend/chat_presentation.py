@@ -858,6 +858,7 @@ def broadcast_to_ui_messages(broadcast: Any) -> list[dict]:
                     summary_truncated=data.get("summary_truncated"),
                 ),
                 output_file=data.get("output_file") or "",
+                usage=data.get("usage") or {},
             )
         elif kind == "ask_user_question":
             close_segment()
