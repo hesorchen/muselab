@@ -319,6 +319,7 @@ function _pruneChatResourceTicketCache(now) {
 
 const CHAT_MUX_STREAM_EVENTS = [
   "startup", "text", "thinking", "tool_use", "tool_result",
+  "subagent_delta", "subagent_block",
   "compact_progress", "task_started", "task_progress", "task_notification",
   "queue_steering",
   "rate_limit", "ask_user_question", "permission_request",
@@ -7897,6 +7898,13 @@ function portal() {
         // task settlement opens a continuation broadcast.
         backgroundActive: false,
         backgroundTaskCount: 0,
+        // SDK-owned nested Subagent transcripts.  Parent history paints first;
+        // this independent lane hydrates quietly and accepts live sidechain
+        // deltas without ever inserting them into the parent message array.
+        subagentThreads: [],
+        subagentsLoading: false,
+        subagentsLoaded: false,
+        subagentGeneration: 0,
         // A detached task still belongs to the pre-rollover runtime. The
         // visible successor can run foreground turns independently while this
         // separate counter keeps the inherited task card/footer live.
@@ -13720,6 +13728,185 @@ function portal() {
       };
       return map[state] || map.running;
     },
+    _subagentThreadFor(state, parentToolUseId) {
+      if (!state || !parentToolUseId) return null;
+      return (state.subagentThreads || []).find(thread =>
+        !thread.orphaned
+        && String(thread.parent_tool_use_id || "") === String(parentToolUseId)
+      ) || null;
+    },
+    _ensureSubagentThread(state, parentToolUseId) {
+      let thread = this._subagentThreadFor(state, parentToolUseId);
+      if (thread) return thread;
+      thread = {
+        session_id: "",
+        agent_id: null,
+        parent_tool_use_id: String(parentToolUseId || ""),
+        parent_agent_id: null,
+        orphaned: false,
+        message_count: 0,
+        blocks: [],
+        _live: true,
+      };
+      state.subagentThreads.push(thread);
+      return state.subagentThreads[state.subagentThreads.length - 1];
+    },
+    _applySubagentDelta(sid, state, payload) {
+      const d = payload || {};
+      if (!state || this.tabState[sid] !== state) return;
+      if (d.session_id && String(d.session_id) !== String(sid)) return;
+      const parent = String(d.parent_tool_use_id || "");
+      const blockId = String(d.block_id || "");
+      const kind = String(d.kind || "");
+      const delta = typeof d.delta === "string" ? d.delta : "";
+      const offset = Number(d.offset);
+      if (!parent || !blockId || !delta
+          || !["assistant", "thinking"].includes(kind)
+          || !Number.isInteger(offset) || offset < 0) return;
+      const thread = this._ensureSubagentThread(state, parent);
+      let block = (thread.blocks || []).find(row => row.block_id === blockId);
+      if (!block) {
+        block = {
+          session_id: sid,
+          parent_tool_use_id: parent,
+          parent_agent_id: d.parent_agent_id || null,
+          agent_id: d.agent_id || null,
+          message_uuid: String(d.message_uuid || ""),
+          source_block_index: Number(d.source_block_index) || 0,
+          block_id: blockId,
+          role: kind,
+          text: "",
+          _live: true,
+          _livePartial: true,
+        };
+        thread.blocks.push(block);
+        block = thread.blocks[thread.blocks.length - 1];
+      }
+      const current = String(block.text || "");
+      if (offset === current.length) {
+        block.text = current + delta;
+        block._live = true;
+        block._livePartial = true;
+        return;
+      }
+      // Replayed SSE fragments are harmless. A real gap/conflict is repaired
+      // from the SDK history instead of guessing a missing prefix.
+      if (offset < current.length
+          && current.slice(offset, offset + delta.length) === delta) return;
+      void this.hydrateSubagents(sid, state, { quiet: true });
+    },
+    _applySubagentBlock(sid, state, payload) {
+      const d = payload || {};
+      if (!state || this.tabState[sid] !== state) return;
+      if (d.session_id && String(d.session_id) !== String(sid)) return;
+      const parent = String(d.parent_tool_use_id || "");
+      const blockId = String(d.block_id || "");
+      if (!parent || !blockId || !d.block || typeof d.block !== "object") return;
+      const thread = this._ensureSubagentThread(state, parent);
+      const finalBlock = { ...d.block, _live: true, _livePartial: false };
+      const index = thread.blocks.findIndex(row => row.block_id === blockId);
+      if (index >= 0) thread.blocks.splice(index, 1, finalBlock);
+      else thread.blocks.push(finalBlock);
+    },
+    async hydrateSubagents(sid, expectedState = null, opts = {}) {
+      const state = expectedState || this._ensureTabState(sid);
+      if (!sid || this.tabState[sid] !== state || state.subagentsLoading) return false;
+      const generation = ++state.subagentGeneration;
+      state.subagentsLoading = true;
+      try {
+        const response = await this._fetchWithDeadline(
+          `/api/chat/sessions/${encodeURIComponent(sid)}/subagents`,
+          { headers: this.hdr() },
+          20_000,
+        );
+        if (!response.ok) return false;
+        const payload = await response.json();
+        if (this.tabState[sid] !== state
+            || generation !== state.subagentGeneration) return false;
+        const incoming = Array.isArray(payload.threads)
+          ? payload.threads.map(thread => ({
+            ...thread,
+            blocks: Array.isArray(thread.blocks)
+              ? thread.blocks.map(block => ({ ...block })) : [],
+          })) : [];
+        // Keep frames received after the history snapshot. Final live blocks
+        // and longer partial prefixes win; the next quiet hydrate converges
+        // them to the SDK transcript once persistence catches up.
+        for (const liveThread of state.subagentThreads || []) {
+          let target = incoming.find(thread =>
+            !thread.orphaned && !liveThread.orphaned
+            && String(thread.parent_tool_use_id || "")
+              === String(liveThread.parent_tool_use_id || "")
+          );
+          if (!target) {
+            incoming.push(liveThread);
+            continue;
+          }
+          for (const liveBlock of liveThread.blocks || []) {
+            const index = target.blocks.findIndex(
+              block => block.block_id === liveBlock.block_id);
+            if (index < 0) target.blocks.push(liveBlock);
+            else if (liveBlock._live && (
+              !liveBlock._livePartial
+              || String(liveBlock.text || "").length
+                > String(target.blocks[index].text || "").length
+            )) target.blocks.splice(index, 1, liveBlock);
+          }
+        }
+        state.subagentThreads = incoming;
+        state.subagentsLoaded = true;
+        return true;
+      } catch (_) {
+        if (!opts.quiet) {
+          this.toast(this.lang === "zh"
+            ? "Subagent 执行过程加载失败" : "Failed to load Subagent timeline", "warn");
+        }
+        return false;
+      } finally {
+        if (this.tabState[sid] === state
+            && generation === state.subagentGeneration) {
+          state.subagentsLoading = false;
+        }
+      }
+    },
+    subagentTimelineFor(state, parentToolUseId) {
+      if (!state || !parentToolUseId) return [];
+      const threads = state.subagentThreads || [];
+      const output = [];
+      const visited = new Set();
+      const walk = (parent, depth) => {
+        if (depth > 12 || output.length >= 1000 || visited.has(parent)) return;
+        visited.add(parent);
+        for (const thread of threads) {
+          if (thread.orphaned
+              || String(thread.parent_tool_use_id || "") !== String(parent)) continue;
+          for (const block of thread.blocks || []) {
+            output.push({ ...block, _depth: depth });
+            if (block.role === "tool_use"
+                && (block.name === "Agent" || block.name === "Task")
+                && block.id) walk(String(block.id), depth + 1);
+          }
+        }
+      };
+      walk(String(parentToolUseId), 0);
+      return output;
+    },
+    subagentBlockLabel(block) {
+      if (!block) return "";
+      if (block.role === "thinking") return this.lang === "zh" ? "思考" : "Thinking";
+      if (block.role === "assistant") return this.lang === "zh" ? "回复" : "Reply";
+      if (block.role === "tool_use") return block.name || (this.lang === "zh" ? "工具" : "Tool");
+      if (block.role === "tool_result") {
+        return block.is_error
+          ? (this.lang === "zh" ? "工具失败" : "Tool failed")
+          : (this.lang === "zh" ? "工具结果" : "Tool result");
+      }
+      return block.role || "";
+    },
+    subagentBlockBody(block) {
+      if (!block) return "";
+      return String(block.text || block.summary || block.preview || "");
+    },
     // Skill card data — name + description + trigger summary.
     skillCardInfo(m) {
       if (!m || m.name !== "Skill") return null;
@@ -16941,6 +17128,10 @@ function portal() {
         // response coordinates. Canonical envelopes remain untouched.
         this._scheduleHistoryViewport(st, "newer");
         this._syncSessionMessageStore(st);
+        // Nested history is independent of the parent transcript. Paint the
+        // conversation first, then hydrate Subagent cards without extending
+        // the session-load critical path.
+        void this.hydrateSubagents(sid, st, { quiet: true });
         if (quiet && sid === this.currentId) {
           const domConverged = await this._ensureTranscriptDomConverged(sid, st, {
             scrollEl: quietScrollEl,
@@ -30828,7 +31019,8 @@ function portal() {
           streamState._serverActiveObserved = true;
         }
         if (ev && streamState.streamPhase !== "running" && [
-          "text", "thinking", "tool_use", "tool_result", "compact_progress",
+          "text", "thinking", "tool_use", "tool_result",
+          "subagent_delta", "subagent_block", "compact_progress",
           "task_started", "task_progress", "task_notification", "rate_limit",
           "queue_steering",
           "ask_user_question", "permission_request", "permission_request_resolved",
@@ -30837,7 +31029,8 @@ function portal() {
           streamState.streamPhase = "running";
         }
       };
-      ["startup", "text", "thinking", "tool_use", "tool_result", "compact_progress", "task_started",
+      ["startup", "text", "thinking", "tool_use", "tool_result",
+       "subagent_delta", "subagent_block", "compact_progress", "task_started",
        "task_progress", "task_notification", "rate_limit", "queue_steering",
        "ask_user_question", "permission_request", "permission_request_resolved",
        "permission_mode_changed",
@@ -31283,6 +31476,20 @@ function portal() {
           bash: d.bash || null,
         });
 
+        _scrollIfActive();
+      });
+      es.addEventListener("subagent_delta", ev => {
+        let d;
+        try { d = JSON.parse(ev.data); } catch (_) { return; }
+        _setContinuationAwaitingReaction(false);
+        this._applySubagentDelta(streamSid, streamState, d);
+        _scrollIfActive();
+      });
+      es.addEventListener("subagent_block", ev => {
+        let d;
+        try { d = JSON.parse(ev.data); } catch (_) { return; }
+        _setContinuationAwaitingReaction(false);
+        this._applySubagentBlock(streamSid, streamState, d);
         _scrollIfActive();
       });
       es.addEventListener("task_started", ev => {

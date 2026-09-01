@@ -6139,3 +6139,15 @@ def test_sdk_lifecycle_footer_and_native_clear_contracts_are_wired():
     assert 'method: "DELETE"' not in clear_handler
     assert '_adoptRecoveredSession' in clear_handler
     assert '_disposeTabRuntime(oldId)' in clear_handler
+
+
+def test_subagent_timeline_uses_separate_sdk_history_and_live_lane():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+
+    assert '"subagent_delta", "subagent_block"' in app
+    assert "/subagents`" in app
+    assert "_applySubagentDelta(streamSid, streamState, d)" in app
+    assert "_applySubagentBlock(streamSid, streamState, d)" in app
+    assert "subagentTimelineFor(pane, m.id)" in html
+    assert "执行过程" in html

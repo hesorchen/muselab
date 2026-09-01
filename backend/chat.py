@@ -73,6 +73,7 @@ from . import chat_history
 from . import chat_presentation
 from . import chat_overlays
 from . import chat_runtime
+from . import chat_subagents
 from . import chat_successor
 from . import sdk_lifecycle
 from . import transcript_index as transcript_idx
@@ -3310,6 +3311,10 @@ async def _build_and_connect_client(
         # see full blocks at the end → user waits for the whole reply
         # before seeing anything. With this, each token shows up.
         include_partial_messages=True,
+        # Ask the SDK to forward complete Subagent sidechains.  They are
+        # separated from the parent transcript below using the SDK-owned
+        # parent_tool_use_id and exposed as a nested timeline in the GUI.
+        forward_subagent_text=True,
         # Recall runs in the SDK's dedicated UserPromptSubmit additional-context
         # channel. Never prepend it to client.query(prompt): that would persist
         # the memory block as if the user typed it, polluting JSONL history,
@@ -6228,6 +6233,47 @@ class _TurnResponseBoundary:
 
         self.saw_current_payload = True
         return "forward"
+
+
+@router.get(
+    "/sessions/{sid}/subagents",
+    dependencies=[Depends(require_token)],
+)
+async def get_session_subagents_api(sid: str) -> dict:
+    """Return the SDK-owned nested transcript for every Subagent.
+
+    The top-level SDK APIs are the source of truth.  MuseLab only shapes their
+    records for rendering and never scans Claude's private files directly.
+    """
+    meta = await obs.to_thread_io(
+        "chat.subagents_session_read",
+        sid,
+        sess.get_session_meta,
+        sid,
+    )
+    if meta is None:
+        raise HTTPException(404, "session not found")
+    workspace = await obs.to_thread_io(
+        "chat.subagents_workspace_read",
+        sid,
+        sess.session_workspace,
+        sid,
+    )
+    model = str(meta.get("model") or "")
+
+    def _load() -> list[dict[str, Any]]:
+        with _session_config_dir(model, sid=sid):
+            return chat_subagents.load_subagent_threads(
+                sid,
+                directory=str(workspace),
+            )
+
+    threads = await obs.to_thread_io(
+        "chat.subagents_history_read",
+        sid,
+        _load,
+    )
+    return {"session_id": sid, "threads": threads}
 
 
 @router.get("/sessions/{sid}", dependencies=[Depends(require_token)])
@@ -13967,6 +14013,7 @@ async def _watch_inflight_tasks(
     watch_error_kind = "none"
     cont: TurnBroadcast | None = None
     cont_state: dict | None = None
+    subagent_mux = chat_subagents.SubagentStreamMux(session_id)
     watcher_failed = False
     watcher_cancelled = False
     # The continuation is a real assistant turn for display/accounting even
@@ -14419,6 +14466,15 @@ async def _watch_inflight_tasks(
                 # the subprocess cleanup has completed.  Continue to the
                 # tracked disconnect fence below before releasing anything.
                 break
+            if chat_subagents.is_subagent_message(msg):
+                if cont is None:
+                    await _open_continuation()
+                for record in subagent_mux.feed(msg):
+                    _emit_settlement({
+                        "event": record["event"],
+                        "data": json.dumps(record["data"]),
+                    })
+                continue
             if await _consume_timeout_terminal(msg):
                 continue
             if isinstance(msg, ResultMessage):
@@ -14506,6 +14562,19 @@ async def _watch_inflight_tasks(
 
                 if not _owns_generation():
                     break
+
+                if chat_subagents.is_subagent_message(msg):
+                    # Forwarded child text may precede TaskNotification.  Open
+                    # the headless continuation lazily so no child frame is
+                    # discarded while waiting for task settlement.
+                    if cont is None:
+                        await _open_continuation()
+                    for record in subagent_mux.feed(msg):
+                        _emit_settlement({
+                            "event": record["event"],
+                            "data": json.dumps(record["data"]),
+                        })
+                    continue
 
                 if isinstance(msg, TaskNotificationMessage):
                     # PRIMARY typed path. Phase-0 probe (2026-06-11, CLI
@@ -16378,6 +16447,7 @@ async def _start_turn(
 
     async def event_gen():
         nonlocal assistant_acc, streamed_in_bubble
+        subagent_mux = chat_subagents.SubagentStreamMux(session_id)
         # Subscribe to the session's side-channel queue. The MCP ask_user_question
         # handler publishes here; we merge those events into the SSE stream so the
         # UI can render the question UI while the SDK tool handler is await-ing.
@@ -17840,7 +17910,16 @@ async def _start_turn(
                 # per-type helper async generators defined above. Each
                 # helper yields zero-or-more SSE events; we forward them.
                 msg = payload
-                if isinstance(msg, StreamEvent):
+                if chat_subagents.is_subagent_message(msg):
+                    # A forwarded sidechain is never parent answer content.
+                    # Route on the SDK-owned parent id even when an incomplete
+                    # frame cannot be rendered, so it cannot fall through.
+                    for record in subagent_mux.feed(msg):
+                        yield {
+                            "event": record["event"],
+                            "data": json.dumps(record["data"]),
+                        }
+                elif isinstance(msg, StreamEvent):
                     async for ev in _handle_stream_event(msg):
                         yield ev
                 elif isinstance(msg, AssistantMessage):

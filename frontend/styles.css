@@ -6975,6 +6975,86 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   text-decoration: none;
 }
 .subagent-task-stop:hover { text-decoration: underline; }
+.subagent-timeline {
+  margin-top: var(--sp-2);
+  padding-top: var(--sp-2);
+  border-top: 1px dashed var(--c-border-strong);
+  font-size: var(--fs-xs);
+}
+.subagent-timeline > summary {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  cursor: pointer;
+  color: var(--c-fg-2);
+  font-weight: var(--fw-medium);
+  list-style-position: inside;
+}
+.subagent-timeline-count {
+  min-width: 18px;
+  padding: 0 5px;
+  border-radius: var(--r-full);
+  background: rgba(139, 92, 246, 0.12);
+  color: #8b5cf6;
+  font-family: var(--font-mono);
+  text-align: center;
+}
+.subagent-timeline-body {
+  margin-top: var(--sp-2);
+  display: grid;
+  gap: 6px;
+}
+.subagent-timeline-row {
+  margin-left: calc(var(--subagent-depth, 0) * 14px);
+  padding: 6px 8px;
+  border-left: 2px solid color-mix(in srgb, #8b5cf6 42%, transparent);
+  border-radius: 0 var(--r-sm) var(--r-sm) 0;
+  background: color-mix(in srgb, var(--c-bg-0) 78%, transparent);
+  min-width: 0;
+}
+.subagent-timeline-row.is-thinking { opacity: 0.78; }
+.subagent-timeline-row.is-error { border-left-color: var(--c-danger, #d33); }
+.subagent-timeline-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.subagent-timeline-dot {
+  width: 6px;
+  height: 6px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: #8b5cf6;
+}
+.subagent-timeline-row.is-tool_result .subagent-timeline-dot {
+  background: var(--c-fg-3);
+}
+.subagent-timeline-row.is-error .subagent-timeline-dot {
+  background: var(--c-danger, #d33);
+}
+.subagent-timeline-label {
+  font-weight: var(--fw-semibold);
+  white-space: nowrap;
+}
+.subagent-timeline-summary {
+  overflow: hidden;
+  color: var(--c-fg-3);
+  font-family: var(--font-mono);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.subagent-timeline-text {
+  margin: 5px 0 0 12px;
+  max-height: 220px;
+  overflow: auto;
+  color: var(--c-fg-1);
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
 
 /* Background-task status pill for non-subagent tool cards (Bash
    run_in_background). The .tool card is a compact one-liner, so this sits

@@ -2320,6 +2320,34 @@
                            x-text="'⏹ ' + t('subagent.stop_task')"></a>
                       </div>
                     </template>
+                    <details class="subagent-timeline"
+                             x-show="subagentTimelineFor(pane, m.id).length">
+                      <summary>
+                        <span x-text="lang==='zh' ? '执行过程' : 'Execution timeline'"></span>
+                        <span class="subagent-timeline-count"
+                              x-text="subagentTimelineFor(pane, m.id).length"></span>
+                      </summary>
+                      <div class="subagent-timeline-body">
+                        <template x-for="block in subagentTimelineFor(pane, m.id)"
+                                  :key="block.block_id">
+                          <div class="subagent-timeline-row"
+                               :class="['is-' + (block.role || 'unknown'), { 'is-error': block.is_error }]"
+                               :style="'--subagent-depth:' + Math.min(12, Number(block._depth) || 0)">
+                            <div class="subagent-timeline-head">
+                              <span class="subagent-timeline-dot"></span>
+                              <span class="subagent-timeline-label"
+                                    x-text="subagentBlockLabel(block)"></span>
+                              <span class="subagent-timeline-summary"
+                                    x-show="block.role === 'tool_use' && block.summary"
+                                    x-text="block.summary || ''"></span>
+                            </div>
+                            <pre class="subagent-timeline-text"
+                                 x-show="subagentBlockBody(block)"
+                                 x-text="subagentBlockBody(block)"></pre>
+                          </div>
+                        </template>
+                      </div>
+                    </details>
                   </div>
                 </div>
               </template>
