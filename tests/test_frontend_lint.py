@@ -6151,3 +6151,22 @@ def test_subagent_timeline_uses_separate_sdk_history_and_live_lane():
     assert "_applySubagentBlock(streamSid, streamState, d)" in app
     assert "subagentTimelineFor(pane, m.id)" in html
     assert "执行过程" in html
+
+
+def test_hook_settings_gui_edits_standard_scopes_and_keeps_builtins_read_only():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    backend = (BACKEND / "hook_settings.py").read_text(encoding="utf-8")
+
+    assert 'settings.activePage=\'hooks\'; loadHookSettings()' in html
+    assert "Claude 标准配置" in html
+    assert "MuseLab 内置 Hook（只读）" in html
+    assert 'method: editing ? "PUT" : "POST"' in app
+    assert 'method: "DELETE"' in app
+    assert 'method: "PATCH"' in app
+    assert "conversationHdr()" in app
+    assert 'setting_sources=["user", "project", "local"]' in (
+        BACKEND / "chat.py"
+    ).read_text(encoding="utf-8")
+    assert "_restore_masked_headers" in backend
+    assert "configure_runtime_invalidator" in backend

@@ -1189,6 +1189,23 @@ function portal() {
       // MCP server list (loaded from /api/settings/mcp)
       mcpServers: [],
       mcpExamples: [],
+      hooks: {
+        loading: false,
+        saving: false,
+        workspace: "",
+        scopes: [],
+        builtin: [],
+        activeScope: "project",
+        draft: {
+          show: false,
+          mode: "create",
+          event: "PreToolUse",
+          matcher: "",
+          handlerJson: '{\n  "type": "command",\n  "command": ""\n}',
+          groupIndex: null,
+          handlerIndex: null,
+        },
+      },
       // MCP add-form draft. `transport` picks the shape: "stdio" (local
       // subprocess → command/args) or "remote" (http/sse connector → url +
       // optional Authorization header), mirroring Claude app's local-vs-remote
@@ -18808,12 +18825,16 @@ function portal() {
       // Mobile: stay at the top-level menu (activePage=null) and let the
       // user drill in; selecting a row shows that section + a Back button.
       this.settings.activePage = activePage === "memory"
-        ? "memory" : (this.isWideScreen ? "provider" : null);
+        ? "memory"
+        : activePage === "hooks"
+          ? "hooks"
+          : (this.isWideScreen ? "provider" : null);
       this.settings.show = true;
       // Load MCP + Skill in parallel — non-fatal if any fails. Cost dashboard
       // stays lazy because Codex quota refresh intentionally runs a CLI probe.
       this.refreshMcpList();
       this.refreshSkillList();
+      if (activePage === "hooks") this.loadHookSettings();
       this.loadClaudeAuthStatus();
       this.loadMemorySettings();
     },
@@ -19427,6 +19448,221 @@ function portal() {
         });
       }
       return stats;
+    },
+
+    hookActiveScope() {
+      const hooks = this.settings.hooks;
+      return (hooks.scopes || []).find(
+        scope => scope.scope === hooks.activeScope) || null;
+    },
+    hookRows(scope = null) {
+      const selected = scope || this.hookActiveScope();
+      if (!selected || !selected.hooks || typeof selected.hooks !== "object") return [];
+      const rows = [];
+      for (const [event, groups] of Object.entries(selected.hooks)) {
+        if (!Array.isArray(groups)) continue;
+        groups.forEach((group, groupIndex) => {
+          const handlers = group && Array.isArray(group.hooks) ? group.hooks : [];
+          handlers.forEach((handler, handlerIndex) => rows.push({
+            event,
+            matcher: String((group && group.matcher) || ""),
+            groupIndex,
+            handlerIndex,
+            handler,
+          }));
+        });
+      }
+      return rows;
+    },
+    hookHandlerSummary(handler) {
+      const h = handler || {};
+      const value = h.command || h.url || h.prompt || h.statusMessage || "";
+      return String(value || h.type || "").replace(/\s+/g, " ").slice(0, 180);
+    },
+    _newHookDraft() {
+      return {
+        show: true,
+        mode: "create",
+        event: "PreToolUse",
+        originalEvent: "",
+        matcher: "",
+        handlerJson: '{\n  "type": "command",\n  "command": ""\n}',
+        groupIndex: null,
+        handlerIndex: null,
+      };
+    },
+    startAddHook() {
+      this.settings.hooks.draft = this._newHookDraft();
+    },
+    editHook(row) {
+      this.settings.hooks.draft = {
+        show: true,
+        mode: "edit",
+        event: row.event,
+        originalEvent: row.event,
+        matcher: row.matcher || "",
+        handlerJson: JSON.stringify(row.handler || {}, null, 2),
+        groupIndex: row.groupIndex,
+        handlerIndex: row.handlerIndex,
+      };
+    },
+    cancelHookDraft() {
+      this.settings.hooks.draft = { ...this._newHookDraft(), show: false };
+    },
+    async loadHookSettings() {
+      const hooks = this.settings.hooks;
+      if (hooks.loading) return;
+      hooks.loading = true;
+      try {
+        const response = await fetch("/api/settings/hooks", {
+          headers: this.conversationHdr(),
+          cache: "no-store",
+        });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const payload = await response.json();
+        hooks.workspace = payload.workspace || this.currentWorkspacePath();
+        hooks.scopes = Array.isArray(payload.scopes) ? payload.scopes : [];
+        hooks.builtin = Array.isArray(payload.builtin_hooks)
+          ? payload.builtin_hooks : [];
+        if (!hooks.scopes.some(scope => scope.scope === hooks.activeScope)) {
+          hooks.activeScope = "project";
+        }
+      } catch (error) {
+        this.toast(this.lang === "zh" ? "Hook 配置加载失败" : "Failed to load Hooks", "error");
+      } finally {
+        hooks.loading = false;
+      }
+    },
+    async _hookMutationError(response) {
+      let message = `HTTP ${response.status}`;
+      try {
+        const payload = await response.json();
+        const detail = payload && payload.detail;
+        message = String((detail && detail.message) || detail || message);
+      } catch (_) {}
+      if (response.status === 409) await this.loadHookSettings();
+      this.toast(message, "error", 4000);
+    },
+    _replaceHookScope(payload) {
+      const hooks = this.settings.hooks;
+      const index = hooks.scopes.findIndex(scope => scope.scope === payload.scope);
+      if (index >= 0) hooks.scopes.splice(index, 1, payload);
+      else hooks.scopes.push(payload);
+    },
+    async saveHookDraft() {
+      const hooks = this.settings.hooks;
+      const scope = this.hookActiveScope();
+      const draft = hooks.draft;
+      if (!scope || hooks.saving) return;
+      let handler;
+      try {
+        handler = JSON.parse(draft.handlerJson || "{}");
+      } catch (_) {
+        this.toast(this.lang === "zh" ? "Handler JSON 格式无效" : "Invalid handler JSON", "error");
+        return;
+      }
+      if (!handler || typeof handler !== "object" || Array.isArray(handler)
+          || !String(handler.type || "").trim()) {
+        this.toast(this.lang === "zh" ? "Handler 必须包含 type" : "Handler requires type", "warn");
+        return;
+      }
+      const editing = draft.mode === "edit";
+      const body = {
+        revision: scope.revision,
+        event: editing ? draft.originalEvent : String(draft.event || "").trim(),
+        matcher: String(draft.matcher || ""),
+        handler,
+      };
+      if (!body.event) return;
+      if (editing) {
+        body.group_index = draft.groupIndex;
+        body.handler_index = draft.handlerIndex;
+      }
+      hooks.saving = true;
+      try {
+        const response = await fetch(
+          `/api/settings/hooks/${encodeURIComponent(scope.scope)}/handlers`,
+          {
+            method: editing ? "PUT" : "POST",
+            headers: { ...this.conversationHdr(), "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+          },
+        );
+        if (!response.ok) {
+          await this._hookMutationError(response);
+          return;
+        }
+        this._replaceHookScope(await response.json());
+        this.cancelHookDraft();
+        this.toast(this.lang === "zh"
+          ? "Hook 已保存，下轮会话自动重载" : "Hook saved; runtime reloads next turn", "success");
+      } catch (_) {
+        this.toast(this.lang === "zh" ? "Hook 保存失败" : "Failed to save Hook", "error");
+      } finally {
+        hooks.saving = false;
+      }
+    },
+    async deleteHook(row) {
+      const scope = this.hookActiveScope();
+      if (!scope) return;
+      const confirmed = await this.confirm({
+        title: this.lang === "zh" ? "删除 Hook" : "Delete Hook",
+        body: `${row.event}${row.matcher ? ` · ${row.matcher}` : ""}`,
+        confirmText: this.t("btn.delete"),
+        kind: "danger",
+      });
+      if (!confirmed) return;
+      let response;
+      try {
+        response = await fetch(
+          `/api/settings/hooks/${encodeURIComponent(scope.scope)}/handlers`,
+          {
+            method: "DELETE",
+            headers: { ...this.conversationHdr(), "Content-Type": "application/json" },
+            body: JSON.stringify({
+              revision: scope.revision,
+              event: row.event,
+              group_index: row.groupIndex,
+              handler_index: row.handlerIndex,
+            }),
+          },
+        );
+      } catch (_) {
+        this.toast(this.lang === "zh" ? "Hook 删除失败" : "Failed to delete Hook", "error");
+        return;
+      }
+      if (!response.ok) {
+        await this._hookMutationError(response);
+        return;
+      }
+      this._replaceHookScope(await response.json());
+      this.toast(this.lang === "zh" ? "Hook 已删除" : "Hook deleted", "success");
+    },
+    async toggleAllHooks(disabled) {
+      const scope = this.hookActiveScope();
+      if (!scope) return;
+      let response;
+      try {
+        response = await fetch(
+          `/api/settings/hooks/${encodeURIComponent(scope.scope)}/disable-all`,
+          {
+            method: "PATCH",
+            headers: { ...this.conversationHdr(), "Content-Type": "application/json" },
+            body: JSON.stringify({ revision: scope.revision, disabled: !!disabled }),
+          },
+        );
+      } catch (_) {
+        this.toast(this.lang === "zh" ? "Hook 开关保存失败" : "Failed to save Hook toggle", "error");
+        return;
+      }
+      if (!response.ok) {
+        await this._hookMutationError(response);
+        return;
+      }
+      this._replaceHookScope(await response.json());
+      this.toast(this.lang === "zh"
+        ? (disabled ? "该层 Hook 已全部禁用" : "该层 Hook 已启用")
+        : (disabled ? "Hooks disabled for this scope" : "Hooks enabled for this scope"), "success");
     },
     codexLimitUpdatedText() {
       const ts = this.codexLimit && this.codexLimit.updated_at;

@@ -4298,6 +4298,14 @@
             <span class="settings-menu-chevron">›</span>
           </button></li>
           <li><button type="button" class="settings-menu-item"
+                      @click="settings.activePage='hooks'; loadHookSettings()"
+                      :class="{ active: settings.activePage==='hooks' }"
+                      :aria-current="settings.activePage==='hooks' ? 'page' : null">
+            <span class="settings-menu-icon"><svg><use href="#i-tool"/></svg></span>
+            <span class="settings-menu-title">Hooks</span>
+            <span class="settings-menu-chevron">›</span>
+          </button></li>
+          <li><button type="button" class="settings-menu-item"
                       @click="settings.activePage='mcp'"
                       :class="{ active: settings.activePage==='mcp' }"
                       :aria-current="settings.activePage==='mcp' ? 'page' : null">
@@ -5405,6 +5413,144 @@
               </div>
             </template>
           </div>
+        </div>
+
+        <div class="settings-section hook-settings-section" data-page="hooks"
+             x-show="settings.activePage === 'hooks'">
+          <div class="settings-section-title">
+            <span>Hooks</span>
+            <span class="settings-save-mode live"
+                  x-text="lang==='zh' ? 'Claude 标准配置' : 'Claude standard settings'"></span>
+          </div>
+          <div class="settings-hint"
+               x-text="lang==='zh'
+                 ? '直接管理 Claude SDK 会读取的 user / project / local 三层 Hook。保存后，受影响会话会在下一轮自动重建 runtime。'
+                 : 'Manage the user, project and local Hooks loaded by the Claude SDK. Affected runtimes reload on their next turn.'"></div>
+          <div class="hook-workspace mono" x-show="settings.hooks.workspace"
+               x-text="settings.hooks.workspace"></div>
+
+          <div class="hook-scope-tabs">
+            <template x-for="scope in settings.hooks.scopes" :key="scope.scope">
+              <button type="button" class="seg-btn"
+                      :class="{ 'seg-active': settings.hooks.activeScope === scope.scope }"
+                      @click="settings.hooks.activeScope = scope.scope; cancelHookDraft()"
+                      x-text="scope.scope === 'user'
+                        ? (lang==='zh' ? '用户' : 'User')
+                        : scope.scope === 'project'
+                          ? (lang==='zh' ? '项目' : 'Project')
+                          : (lang==='zh' ? '本地' : 'Local')"></button>
+            </template>
+          </div>
+
+          <template x-if="hookActiveScope()">
+            <div>
+              <div class="hook-scope-meta">
+                <span class="mono" x-text="hookActiveScope().path"></span>
+                <span x-show="!hookActiveScope().exists"
+                      x-text="lang==='zh' ? '尚未创建' : 'Not created yet'"></span>
+                <label class="hook-disable-all">
+                  <input type="checkbox"
+                         :checked="hookActiveScope().disableAllHooks"
+                         @change="toggleAllHooks($event.target.checked)">
+                  <span x-text="lang==='zh' ? '禁用这一层的全部 Hook' : 'Disable all Hooks in this scope'"></span>
+                </label>
+              </div>
+
+              <div class="hook-list" x-show="hookRows().length">
+                <template x-for="row in hookRows()"
+                          :key="row.event + ':' + row.groupIndex + ':' + row.handlerIndex">
+                  <div class="hook-row">
+                    <div class="hook-row-main">
+                      <div class="hook-row-title">
+                        <span class="hook-event mono" x-text="row.event"></span>
+                        <span class="hook-matcher mono" x-show="row.matcher"
+                              x-text="row.matcher"></span>
+                        <span class="hook-type" x-text="row.handler.type || '?' "></span>
+                      </div>
+                      <div class="hook-row-summary mono"
+                           x-text="hookHandlerSummary(row.handler)"></div>
+                    </div>
+                    <div class="hook-row-actions">
+                      <button class="icon-btn sm" @click="editHook(row)"
+                              :title="lang==='zh' ? '编辑' : 'Edit'">
+                        <svg><use href="#i-edit"/></svg>
+                      </button>
+                      <button class="icon-btn sm danger" @click="deleteHook(row)"
+                              :title="t('btn.delete')">
+                        <svg><use href="#i-trash"/></svg>
+                      </button>
+                    </div>
+                  </div>
+                </template>
+              </div>
+              <div class="settings-empty" x-show="!settings.hooks.loading && !hookRows().length"
+                   x-text="lang==='zh' ? '这一层还没有 Hook。' : 'No Hooks in this scope.'"></div>
+
+              <div class="settings-row hook-add-row" x-show="!settings.hooks.draft.show">
+                <button class="btn-ghost sm" @click="startAddHook()"
+                        x-text="lang==='zh' ? '添加 Hook' : 'Add Hook'"></button>
+              </div>
+              <div class="hook-editor" x-show="settings.hooks.draft.show">
+                <div class="settings-subtitle"
+                     x-text="settings.hooks.draft.mode === 'edit'
+                       ? (lang==='zh' ? '编辑 Hook' : 'Edit Hook')
+                       : (lang==='zh' ? '添加 Hook' : 'Add Hook')"></div>
+                <div class="settings-row">
+                  <label>Event</label>
+                  <input class="settings-input mono" list="hook-event-options"
+                         x-model="settings.hooks.draft.event"
+                         :disabled="settings.hooks.draft.mode === 'edit'">
+                  <datalist id="hook-event-options">
+                    <option value="PreToolUse"></option>
+                    <option value="PostToolUse"></option>
+                    <option value="PostToolUseFailure"></option>
+                    <option value="PermissionRequest"></option>
+                    <option value="UserPromptSubmit"></option>
+                    <option value="SubagentStart"></option>
+                    <option value="SubagentStop"></option>
+                    <option value="Stop"></option>
+                    <option value="PreCompact"></option>
+                    <option value="Notification"></option>
+                  </datalist>
+                </div>
+                <div class="settings-row">
+                  <label>Matcher</label>
+                  <input class="settings-input mono"
+                         x-model="settings.hooks.draft.matcher"
+                         :placeholder="lang==='zh' ? '可留空，例如 Bash|Edit' : 'Optional, e.g. Bash|Edit'">
+                </div>
+                <label class="hook-json-label">Handler JSON</label>
+                <textarea class="settings-input hook-json-editor mono"
+                          spellcheck="false"
+                          x-model="settings.hooks.draft.handlerJson"></textarea>
+                <div class="settings-hint"
+                     x-text="lang==='zh'
+                       ? '支持 Claude 标准 command / http / prompt / agent handler；HTTP headers 会在读取时自动遮蔽。'
+                       : 'Supports Claude command, http, prompt and agent handlers. HTTP headers are masked on read.'"></div>
+                <div class="hook-editor-actions">
+                  <button class="btn-primary sm" @click="saveHookDraft()"
+                          :disabled="settings.hooks.saving"
+                          x-text="settings.hooks.saving ? (lang==='zh' ? '保存中…' : 'Saving…') : t('btn.save')"></button>
+                  <button class="btn-ghost sm" @click="cancelHookDraft()"
+                          x-text="t('btn.cancel')"></button>
+                </div>
+              </div>
+            </div>
+          </template>
+
+          <details class="hook-builtins" x-show="settings.hooks.builtin.length">
+            <summary x-text="lang==='zh' ? 'MuseLab 内置 Hook（只读）' : 'MuseLab built-in Hooks (read-only)'"></summary>
+            <template x-for="(hook, index) in settings.hooks.builtin"
+                      :key="hook.event + ':' + hook.matcher + ':' + index">
+              <div class="hook-builtin-row">
+                <span class="mono" x-text="hook.event"></span>
+                <span class="mono" x-show="hook.matcher" x-text="hook.matcher"></span>
+                <span x-text="hook.label"></span>
+                <span x-show="hook.conditional"
+                      x-text="lang==='zh' ? '按条件启用' : 'conditional'"></span>
+              </div>
+            </template>
+          </details>
         </div>
 
         <div class="settings-section" data-page="mcp"

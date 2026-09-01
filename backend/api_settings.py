@@ -19,6 +19,7 @@ from claude_agent_sdk.types import PermissionMode
 from pydantic import BaseModel, Field, model_validator
 
 from .auth import require_token
+from .hook_settings import router as hook_settings_router
 # _locate_executable used to live in this module but is now also needed
 # by main.py for the CLI version probe at /api/meta. Both modules import
 # from settings.locate_executable; we keep the underscored alias here so
@@ -29,6 +30,7 @@ MCP_CONFIG_PATH = Path(__file__).resolve().parent.parent / "mcp.json"
 MCP_EXAMPLE_PATH = Path(__file__).resolve().parent.parent / "mcp.json.example"
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
+router.include_router(hook_settings_router)
 
 # Path to the .env file we read/write at runtime. Defaults to the repo
 # root's `.env`. The MUSELAB_ENV_PATH override is critical for test

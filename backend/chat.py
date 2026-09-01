@@ -75,6 +75,7 @@ from . import chat_overlays
 from . import chat_runtime
 from . import chat_subagents
 from . import chat_successor
+from . import hook_settings
 from . import sdk_lifecycle
 from . import transcript_index as transcript_idx
 from .task_summaries import normalize_task_summary_fields
@@ -19514,6 +19515,33 @@ def recover_durable_queue_attachments_at_startup(
 # Dynamic bridge for SDK client/runtime lifecycle. Every callback resolves the
 # chat facade at call time, preserving monkeypatch behavior while the extracted
 # module owns the exact shared pool, disconnect, and stream-pump containers.
+def _invalidate_hook_setting_runtimes(
+    scope: hook_settings.HookScope,
+    workspace_root: Path,
+) -> None:
+    """Force affected pooled SDK clients to reload standard Hook settings."""
+    try:
+        session_ids = sess.indexed_session_ids()
+    except Exception:
+        return
+    target = Path(workspace_root).resolve(strict=False)
+    for session_id in session_ids:
+        if scope != "user":
+            try:
+                session_root = Path(
+                    sess.session_workspace(session_id)
+                ).resolve(strict=False)
+            except Exception:
+                continue
+            if session_root != target:
+                continue
+        _pending_runtime_rebuilds.add(session_id)
+
+
+hook_settings.configure_runtime_invalidator(
+    _invalidate_hook_setting_runtimes)
+
+
 chat_runtime.configure_hooks(chat_runtime.RuntimeHooks(
     sessions=sess,
     normalize_effort=lambda *a, **k: _normalize_effort(*a, **k),
