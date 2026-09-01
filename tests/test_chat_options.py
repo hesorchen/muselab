@@ -100,6 +100,19 @@ def test_third_party_provider_enables_sdk_skills(app_module, monkeypatch, tmp_pa
     assert captured["hooks"]["PreToolUse"][0].timeout == (
         chat_mod.ANSWER_TIMEOUT_S + 5)
     assert "AskUserQuestion" not in captured["disallowed_tools"]
+    for tool in ("CronCreate", "CronDelete", "CronList", "Monitor"):
+        assert tool not in captured["disallowed_tools"]
+    for host_tool in (
+        "ScheduleWakeup",
+        "EnterWorktree",
+        "ExitWorktree",
+        "PushNotification",
+        "DesignSync",
+        "RemoteTrigger",
+        "ReportFindings",
+        "SendMessage",
+    ):
+        assert host_tool in captured["disallowed_tools"]
     assert captured["forward_subagent_text"] is True
     assert captured["include_hook_events"] is True
     assert "muselab" not in captured["mcp_servers"]

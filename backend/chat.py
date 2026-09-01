@@ -3328,11 +3328,16 @@ async def _build_and_connect_client(
         # maps to `--tools default` — identical to not passing tools at all, so
         # it adds no protection; an explicit allowlist inverts the failure mode
         # (new/renamed useful tools silently MISSING after a CLI bump).
+        #
+        # SDK 0.2.149 / bundled CLI 2.1.252 was probed on the production WSL
+        # route: CronCreate → CronList → CronDelete → CronList completed and
+        # cleaned up successfully; Bash(run_in_background) → Monitor also
+        # completed.  Those SDK-owned tools intentionally remain exposed and
+        # render through MuseLab's generic tool/lifecycle cards.
         disallowed_tools=[
             "ScheduleWakeup",         # /loop dynamic mode — Claude Code only
-            "CronCreate", "CronDelete", "CronList",
             "EnterWorktree", "ExitWorktree",
-            "Monitor", "PushNotification",
+            "PushNotification",
             # Claude CLI host features whose protocol is owned by a
             # Claude Code / claude.ai host. muselab has no matching design,
             # review-findings, remote-trigger, or teammate-message surface.
