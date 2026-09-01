@@ -352,6 +352,35 @@ def test_runtime_fork_boundary_at_is_strict_utc_and_successor_only(app_module):
         )
 
 
+def test_runtime_lineages_loads_one_index_snapshot_for_many_sessions(
+    app_module, monkeypatch,
+):
+    from backend import sessions as sess
+
+    source = sess.create_session("batch-runtime-source")["id"]
+    child = sess.create_session("batch-runtime-child")["id"]
+    unrelated = sess.create_session("batch-runtime-unrelated")["id"]
+    assert sess.link_runtime_successor(source, child)
+
+    real_load = sess._load_index
+    loads = 0
+
+    def counted_load():
+        nonlocal loads
+        loads += 1
+        return real_load()
+
+    monkeypatch.setattr(sess, "_load_index", counted_load)
+    result = sess.runtime_lineages((source, child, unrelated, source))
+
+    assert loads == 1
+    assert result == {
+        source: [source, child],
+        child: [source, child],
+        unrelated: [unrelated],
+    }
+
+
 def test_runtime_lineage_authority_uses_earliest_owner_snapshot(app_module):
     from backend import sessions as sess
 

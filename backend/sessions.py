@@ -28,6 +28,7 @@ in sessions/{sid}.json — double-write with CLI's JSONL caused compact_boundary
 to be invisible in the UI after native /compact ran.
 """
 import contextlib
+from collections.abc import Iterable
 import json
 import os
 import re
@@ -1249,14 +1250,19 @@ def unlink_runtime_successor(source_sid: str, successor_sid: str) -> bool:
 _RUNTIME_LINEAGE_MAX = 32
 
 
-def _runtime_lineage_from_rows(sid: str, rows: list[dict]) -> list[str]:
-    """Return the linked runtime chain containing ``sid``, oldest first."""
-    sid = str(sid or "")
-    by_id = {
+def _runtime_rows_by_id(rows: list[dict]) -> dict[str, dict]:
+    return {
         str(row.get("id")): row
         for row in rows
         if isinstance(row, dict) and row.get("id")
     }
+
+
+def _runtime_lineage_from_index(
+    sid: str, by_id: dict[str, dict],
+) -> list[str]:
+    """Return the linked runtime chain containing ``sid``, oldest first."""
+    sid = str(sid or "")
     if not sid or sid not in by_id:
         return []
 
@@ -1287,6 +1293,30 @@ def _runtime_lineage_from_rows(sid: str, rows: list[dict]) -> list[str]:
     return lineage
 
 
+def _runtime_lineage_from_rows(sid: str, rows: list[dict]) -> list[str]:
+    return _runtime_lineage_from_index(sid, _runtime_rows_by_id(rows))
+
+
+def runtime_lineages(sids: Iterable[str]) -> dict[str, list[str]]:
+    """Resolve multiple runtime lineages from one durable index snapshot.
+
+    Hot callers such as the multiplex SSE reconcile loop must not parse the
+    complete session index once per candidate. The snapshot stays protected by
+    the same lock as ordinary lineage reads and is never shared with mutators.
+    """
+    ordered_sids = tuple(dict.fromkeys(
+        sid for raw_sid in sids if (sid := str(raw_sid or ""))
+    ))
+    if not ordered_sids:
+        return {}
+    with _INDEX_LOCK:
+        by_id = _runtime_rows_by_id(_load_index())
+    return {
+        sid: _runtime_lineage_from_index(sid, by_id)
+        for sid in ordered_sids
+    }
+
+
 def runtime_lineage(sid: str) -> list[str]:
     """Return the durable rollover lineage containing ``sid``, oldest first.
 
@@ -1296,8 +1326,8 @@ def runtime_lineage(sid: str) -> list[str]:
     Broken links and cycles are bounded defensively rather than followed beyond
     the indexed chain.
     """
-    with _INDEX_LOCK:
-        return _runtime_lineage_from_rows(sid, _load_index())
+    canonical_sid = str(sid or "")
+    return runtime_lineages((canonical_sid,)).get(canonical_sid, [])
 
 
 def update_model(sid: str, model: str) -> None:

@@ -6932,8 +6932,12 @@ def _schedule_runtime_continuation_delivery(source_sid: str, event_id: str) -> a
 async def recover_runtime_continuation_outboxes_at_startup() -> int:
     return await chat_overlays.recover_runtime_continuation_outboxes_at_startup()
 
-def _runtime_continuation_projection_state(sid: str) -> tuple[bool, str]:
-    return chat_overlays._runtime_continuation_projection_state(sid)
+def _runtime_continuation_projection_state(
+    sid: str, *, runtime_lineage: list[str] | None = None,
+) -> tuple[bool, str]:
+    return chat_overlays._runtime_continuation_projection_state(
+        sid, runtime_lineage=runtime_lineage,
+    )
 
 def _delete_cancelled_turn_snapshots(sid: str) -> None:
     return chat_overlays._delete_cancelled_turn_snapshots(sid)
@@ -19466,9 +19470,21 @@ async def _subscribe_multiplex(
         )
         candidate_ids.update(pending_checkpoints)
 
+        # Parse the durable session index once for the whole reconcile pass.
+        # This loop runs every 200 ms per multiplex connection; resolving each
+        # candidate independently used to read + json.loads the complete index
+        # N times on the event-loop thread. The batch read runs off-loop and
+        # returns private lineage lists that status projection cannot mutate.
+        runtime_lineages = (
+            await asyncio.to_thread(sess.runtime_lineages, candidate_ids)
+            if candidate_ids else {}
+        )
         active_ids: set[str] = set()
         for session_id in sorted(candidate_ids):
-            state = session_active_status(session_id)
+            state = _session_active_status(
+                session_id,
+                runtime_lineage=runtime_lineages.get(session_id, []),
+            )
             checkpoint = pending_checkpoints.get(session_id)
             checkpoint_recent = None
             if checkpoint is not None and checkpoint.get("turn_id"):
@@ -19655,8 +19671,9 @@ async def _subscribe_broadcast(
         broadcast.unsubscribe(subscriber)
 
 
-@router.get("/sessions/{sid}/active", dependencies=[Depends(require_token)])
-def session_active_status(sid: str) -> dict:
+def _session_active_status(
+    sid: str, *, runtime_lineage: list[str] | None = None,
+) -> dict:
     """Tell the frontend whether `sid` has an in-progress background
     turn. Used on session load to decide between "render JSONL history"
     and "open a reconnect SSE stream to follow the live tail."""
@@ -19668,7 +19685,9 @@ def session_active_status(sid: str) -> dict:
     )
     runtime_background_pending = len(runtime_task_ids)
     runtime_continuation_pending, runtime_ui_revision = (
-        _runtime_continuation_projection_state(sid)
+        _runtime_continuation_projection_state(
+            sid, runtime_lineage=runtime_lineage,
+        )
     )
     scheduled_state = _sdk_scheduled_snapshot(sid)
     b = _active_turns.get(sid)
@@ -19786,6 +19805,11 @@ def session_active_status(sid: str) -> dict:
         "user_images": b.user_images or [],
         "user_docs": b.user_docs or [],
     }
+
+
+@router.get("/sessions/{sid}/active", dependencies=[Depends(require_token)])
+def session_active_status(sid: str) -> dict:
+    return _session_active_status(sid)
 
 
 # ====== interrupted turns (process-crash recovery) ======

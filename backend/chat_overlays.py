@@ -803,10 +803,16 @@ async def recover_runtime_continuation_outboxes_at_startup() -> int:
     return scheduled
 
 
-def _runtime_continuation_projection_state(sid: str) -> tuple[bool, str]:
+def _runtime_continuation_projection_state(
+    sid: str, *, runtime_lineage: list[str] | None = None,
+) -> tuple[bool, str]:
     """Return lineage-wide pending state and the visible leaf's UI revision."""
     _hooks = _require_hooks()
-    lineage = sess.runtime_lineage(sid) or [sid]
+    lineage = (
+        sess.runtime_lineage(sid)
+        if runtime_lineage is None
+        else list(runtime_lineage)
+    ) or [sid]
     leaf_sid = lineage[-1]
     pending = False
     for owner_sid in lineage[:-1]:
