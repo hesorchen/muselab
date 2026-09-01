@@ -312,6 +312,7 @@ def sdk_messages_to_ui(
         is_compact = sm.uuid in compact_uuids
         msg = sm.message or {}
         content = msg.get("content")
+        scheduled_trigger = bool(msg.get("_muselab_scheduled_trigger"))
         steering = msg.get("_muselab_steering")
         if isinstance(steering, dict):
             text = content if isinstance(content, str) else ""
@@ -374,6 +375,8 @@ def sdk_messages_to_ui(
             if not text:
                 continue
             entry = {"role": sm.type, "text": text, "uuid": sm.uuid}
+            if scheduled_trigger and sm.type == "user":
+                entry["_scheduledTrigger"] = True
             if is_compact:
                 entry["_is_compact_summary"] = True
             entry.update(ann)
@@ -395,6 +398,8 @@ def sdk_messages_to_ui(
                 image_refs = []
                 return
             entry = {"role": sm.type, "text": cleaned, "uuid": sm.uuid}
+            if scheduled_trigger and sm.type == "user":
+                entry["_scheduledTrigger"] = True
             if is_compact:
                 entry["_is_compact_summary"] = True
             if image_refs:
@@ -716,14 +721,17 @@ def complete_turn_footer_metadata(
 def broadcast_to_ui_messages(broadcast: Any) -> list[dict]:
     out: list[dict] = []
     if broadcast.user_text or broadcast.user_images or broadcast.user_docs:
-        out.append({
+        user_entry = {
             "role": "user",
             "text": broadcast.user_text,
             "images": broadcast.user_images,
             "docs": broadcast.user_docs,
             "_turnId": broadcast.turn_id,
             "_turnRoot": True,
-        })
+        }
+        if getattr(broadcast, "is_scheduled_delivery", False):
+            user_entry["_scheduledTrigger"] = True
+        out.append(user_entry)
     current_text: dict | None = None
     current_thinking: dict | None = None
     steering_users: set[str] = set()

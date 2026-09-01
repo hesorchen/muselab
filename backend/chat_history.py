@@ -291,6 +291,18 @@ def raw_msg_from_entry(
     elif record_type not in {"user", "assistant"} or not message_uuid:
         return None
 
+    origin = entry.get("origin")
+    if not isinstance(origin, dict) and isinstance(message, dict):
+        origin = message.get("origin")
+    if (
+        message_type == "user"
+        and isinstance(origin, dict)
+        and origin.get("kind") == "task-notification"
+        and origin.get("subkind") == "scheduled-trigger"
+    ):
+        message = dict(message)
+        message["_muselab_scheduled_trigger"] = True
+
     return raw_msg_type(
         message_uuid,
         message_type,

@@ -1107,6 +1107,12 @@ class TurnBroadcast:
         # in-flight portion (the launching tool_use card lives there and the
         # task_notification needs to flip it). See `/active` + send({continuation}).
         self.is_continuation: bool = False
+        # SDK Cron prompts arrive as autonomous turns on the pooled stream.
+        # They use the normal replay/reconnect contract, but retain their own
+        # delivery class so tabs can show the same amber affordance as other
+        # unattended work and the UI can label the injected prompt correctly.
+        self.is_scheduled_delivery: bool = False
+        self.scheduled_delivery_consumed: bool = False
         # Once a reconnect subscriber has attached to a CONTINUATION broadcast
         # (live or grace-kept), flip this. `/active` then stops advertising it
         # so the frontend's 8s poller can't re-reconnect to the same finished
@@ -1179,6 +1185,8 @@ class TurnBroadcast:
         and active-state payload so the browser only auto-acknowledges work it
         was actually watching.
         """
+        if self.is_scheduled_delivery:
+            return "scheduled"
         if self.is_continuation:
             return "background"
         if self.queue_item_id:
@@ -1638,6 +1646,48 @@ _bg_task_pinned_at: dict[str, float] = {}
 # transcript counts after the verified compact result has already reached the
 # browser. Strong references prevent accidental mid-run garbage collection.
 _maintenance_tasks: set[asyncio.Task] = set()
+
+# ---------------------------------------------------------------------------
+# SDK-native scheduled tasks (CronCreate / CronDelete / CronList)
+# ---------------------------------------------------------------------------
+# Native schedules live inside the pooled Claude CLI process. They are neither
+# MuseLab's legacy scheduler nor durable application records: disconnecting the
+# owning runtime destroys them. Keep only privacy-safe control metadata in RAM
+# (job id / cadence flags), pin that runtime against LRU eviction, and project
+# the count to the session list. Prompts and result bodies are never cached.
+_sdk_cron_jobs: dict[str, dict[str, dict[str, Any]]] = {}
+_sdk_cron_tool_calls: dict[
+    chat_runtime.ClientKey, dict[str, dict[str, Any]]
+] = {}
+_sdk_cron_state_lock = threading.RLock()
+_SDK_CRON_JOB_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+_SDK_CRON_CREATE_RESULT = re.compile(
+    r"Scheduled\s+(?:recurring|one-time)\s+job\s+([A-Za-z0-9_-]{1,128})",
+    re.IGNORECASE,
+)
+_SDK_CRON_DELETE_RESULT = re.compile(
+    r"Cancelled\s+job\s+([A-Za-z0-9_-]{1,128})",
+    re.IGNORECASE,
+)
+_SDK_CRON_LIST_LINE = re.compile(
+    r"^([A-Za-z0-9_-]{1,128})\s+[—-]\s+", re.MULTILINE,
+)
+
+
+@dataclass
+class _ScheduledDelivery:
+    key: chat_runtime.ClientKey
+    broadcast: TurnBroadcast
+    render_state: dict[str, Any]
+    pending_tasks: dict[str, dict[str, Any]] = dataclass_field(
+        default_factory=dict)
+    subagent_mux: Any = None
+    registration_task: asyncio.Task | None = None
+
+
+_sdk_scheduled_deliveries: dict[
+    chat_runtime.ClientKey, _ScheduledDelivery
+] = {}
 # A hidden runtime owns the real Claude continuation after one of its
 # background tasks settles.  When that runtime has already rolled over, the
 # resulting assistant text is delivered to the newest visible successor as a
@@ -1905,6 +1955,13 @@ def _session_has_live_watcher(session_id: str) -> bool:
     return watcher is not None and not watcher.done()
 
 
+def _session_has_scheduled_delivery(session_id: str) -> bool:
+    return any(
+        key[0] == session_id and not delivery.broadcast.done
+        for key, delivery in _sdk_scheduled_deliveries.items()
+    )
+
+
 def _session_runtime_busy(session_id: str) -> bool:
     """One authoritative busy boundary for turns and detached task readers."""
     active = _active_turns.get(session_id)
@@ -1912,6 +1969,7 @@ def _session_runtime_busy(session_id: str) -> bool:
         (active is not None and not active.done)
         or _sessions_with_inflight_tasks.get(session_id)
         or _session_has_live_watcher(session_id)
+        or _session_has_scheduled_delivery(session_id)
     )
 
 
@@ -4125,11 +4183,24 @@ async def shutdown_runtime() -> None:
 
     # Stop detached task watchers and active turn pumps before tearing down the
     # shared SDK streams they consume.
-    active_broadcasts = tuple(_active_turns.values())
+    scheduled_deliveries = tuple(_sdk_scheduled_deliveries.values())
+    active_broadcasts = tuple({
+        id(broadcast): broadcast
+        for broadcast in (
+            *tuple(_active_turns.values()),
+            *(delivery.broadcast for delivery in scheduled_deliveries),
+        )
+    }.values())
     tasks: set[asyncio.Task] = {
         task for task in _task_watchers.values() if not task.done()
     }
     tasks.update(task for task in _maintenance_tasks if not task.done())
+    tasks.update(
+        delivery.registration_task
+        for delivery in scheduled_deliveries
+        if delivery.registration_task is not None
+        and not delivery.registration_task.done()
+    )
     protected_cleanup_tasks: set[asyncio.Task] = {
         task for task in _session_purge_tasks.values() if not task.done()
     }
@@ -4194,12 +4265,20 @@ async def shutdown_runtime() -> None:
     }.values()
     for broadcast in broadcasts:
         broadcast.close()
+    for delivery in scheduled_deliveries:
+        if delivery.broadcast.activity_started:
+            await _finish_activity(
+                delivery.key[0], delivery.broadcast, "cancelled")
     for handle in _recent_turn_expiry_handles.values():
         handle.cancel()
     _recent_turn_expiry_handles.clear()
     _recent_turns.clear()
 
     _active_turns.clear()
+    _sdk_scheduled_deliveries.clear()
+    with _sdk_cron_state_lock:
+        _sdk_cron_jobs.clear()
+        _sdk_cron_tool_calls.clear()
     _sessions_with_inflight_tasks.clear()
     _bg_task_pinned_at.clear()
     _task_watchers.clear()
@@ -5036,6 +5115,13 @@ def list_sessions_api(
         sid for sid, task_ids in _sessions_with_inflight_tasks.items()
         if task_ids
     }
+    with _sdk_cron_state_lock:
+        scheduled_counts = {
+            sid: len(jobs)
+            for sid, jobs in _sdk_cron_jobs.items()
+            if jobs
+        }
+    scheduled_active_sids = set(scheduled_counts)
     active_sids = turn_active_sids | background_active_sids
     # Copy each dict (never mutate the shared list_sessions() cache) + add the
     # live `active` flag. Only the returned subset is processed now, not all N.
@@ -5045,6 +5131,8 @@ def list_sessions_api(
         s["active"] = s.get("id") in active_sids
         s["turn_active"] = s.get("id") in turn_active_sids
         s["background_active"] = s.get("id") in background_active_sids
+        s["scheduled_active"] = s.get("id") in scheduled_active_sids
+        s["scheduled_count"] = scheduled_counts.get(s.get("id"), 0)
         sessions.append(s)
     # Piggy-back orphan-attachments GC here — runs at most hourly. Cheaper
     # than a cron, and naturally fires whenever the UI is in use.
@@ -5080,6 +5168,7 @@ def list_sessions_api(
         str(workspace_root) if workspace_only else "",
         frozenset(turn_active_sids),
         frozenset(background_active_sids),
+        tuple(sorted(scheduled_counts.items())),
     )
     _hit = _LIST_ETAG_CACHE.get("v")
     if _hit is not None and _hit[0] == _etag_key:
@@ -7720,6 +7809,7 @@ def _admitted_steering_turn(
         or not turn_id
         or bc.turn_id != turn_id
         or bc.is_continuation
+        or bc.is_scheduled_delivery
         or bool(bc.queue_item_id)
         or bc.result_forwarded
         or bc.steering_closed
@@ -15574,7 +15664,8 @@ async def _admit_turn(
                 raise _TurnBusy()
             draining = cur
         elif (_sessions_with_inflight_tasks.get(session_id)
-              or _session_has_live_watcher(session_id)):
+              or _session_has_live_watcher(session_id)
+              or _session_has_scheduled_delivery(session_id)):
             raise _TurnBusy()
         else:
             broadcast = TurnBroadcast(session_id=session_id, model=model or MODEL)
@@ -15592,7 +15683,8 @@ async def _admit_turn(
             if cur is not None and not cur.done:
                 raise _TurnBusy()
             if (_sessions_with_inflight_tasks.get(session_id)
-                    or _session_has_live_watcher(session_id)):
+                    or _session_has_live_watcher(session_id)
+                    or _session_has_scheduled_delivery(session_id)):
                 raise _TurnBusy()
             broadcast = TurnBroadcast(session_id=session_id, model=model or MODEL)
             _active_turns[session_id] = broadcast
@@ -16312,7 +16404,8 @@ async def _start_turn(
             # poisoned runtime.  A background-task owner must keep its process;
             # the outer error path records a deferred rebuild after it settles.
             if (_sessions_with_inflight_tasks.get(session_id)
-                    or _session_has_live_watcher(session_id)):
+                    or _session_has_live_watcher(session_id)
+                    or _session_has_scheduled_delivery(session_id)):
                 raise
             recovery_used, recovery_limit = _context_recovery_inputs(
                 session_id,
@@ -16394,7 +16487,8 @@ async def _start_turn(
         # how to forward those lifecycle messages, and the CLI's explicitly
         # configured native auto-compact window still gets a chance to act.
         if (_sessions_with_inflight_tasks.get(session_id)
-                or _session_has_live_watcher(session_id)):
+                or _session_has_live_watcher(session_id)
+                or _session_has_scheduled_delivery(session_id)):
             sys.stderr.write(
                 f"[chat-preflight] native compact deferred for background "
                 f"owner sid={session_id[:8]} model={model_to_use} "
@@ -16491,7 +16585,8 @@ async def _start_turn(
                         and not tail_outcome.get("context_error")
                         and _is_codex_gateway_model(model_to_use)
                         and not _sessions_with_inflight_tasks.get(session_id)
-                        and not _session_has_live_watcher(session_id)):
+                        and not _session_has_live_watcher(session_id)
+                        and not _session_has_scheduled_delivery(session_id)):
                     sys.stderr.write(
                         f"[chat-preflight] rebuilding stalled Codex runtime "
                         f"sid={session_id[:8]} model={model_to_use} "
@@ -18989,7 +19084,8 @@ async def _maybe_drain_queue(session_id: str) -> None:
         # TurnBroadcast is open. It will trigger this drain again after its
         # final continuation releases the single SDK pump.
         if (_sessions_with_inflight_tasks.get(session_id)
-                or _session_has_live_watcher(session_id)):
+                or _session_has_live_watcher(session_id)
+                or _session_has_scheduled_delivery(session_id)):
             queued = await obs.to_thread_io(
                 "chat.queue_read", session_id, sess.get_queue, session_id)
             if queued.get("items") or queued.get("inflight"):
@@ -19307,8 +19403,14 @@ async def _subscribe_multiplex(
         )
         candidate_ids.update(
             sid for sid, broadcast in _recent_turns.items()
-            if getattr(broadcast, "is_continuation", False)
-            and not getattr(broadcast, "continuation_consumed", False)
+            if (
+                getattr(broadcast, "is_continuation", False)
+                and not getattr(broadcast, "continuation_consumed", False)
+            ) or (
+                getattr(broadcast, "is_scheduled_delivery", False)
+                and not getattr(
+                    broadcast, "scheduled_delivery_consumed", False)
+            )
         )
         candidate_ids.update(pending_checkpoints)
 
@@ -19488,6 +19590,9 @@ async def _subscribe_broadcast(
     if (getattr(broadcast, "is_continuation", False)
             and not subscriber._resync_payload):
         broadcast.continuation_consumed = True
+    if (getattr(broadcast, "is_scheduled_delivery", False)
+            and not subscriber._resync_payload):
+        broadcast.scheduled_delivery_consumed = True
     try:
         while True:
             ev = await subscriber.get()
@@ -19513,6 +19618,7 @@ def session_active_status(sid: str) -> dict:
     runtime_continuation_pending, runtime_ui_revision = (
         _runtime_continuation_projection_state(sid)
     )
+    scheduled_state = _sdk_scheduled_snapshot(sid)
     b = _active_turns.get(sid)
     if b is not None and getattr(b, "is_continuation", False) \
             and getattr(b, "continuation_consumed", False):
@@ -19538,8 +19644,14 @@ def session_active_status(sid: str) -> dict:
         # the card flips, so the 60s-TTL window yields exactly one replay.
         recent = _get_recent_turn(sid)
         if (recent is not None
-                and getattr(recent, "is_continuation", False)
-                and not getattr(recent, "continuation_consumed", False)):
+                and (
+                    getattr(recent, "is_continuation", False)
+                    and not getattr(
+                        recent, "continuation_consumed", False)
+                    or getattr(recent, "is_scheduled_delivery", False)
+                    and not getattr(
+                        recent, "scheduled_delivery_consumed", False)
+                )):
             b = recent
         else:
             background_pending = len(
@@ -19565,6 +19677,8 @@ def session_active_status(sid: str) -> dict:
                     "runtime_background_tasks_pending": runtime_background_pending,
                     "runtime_continuation_pending": runtime_continuation_pending,
                     "runtime_ui_revision": runtime_ui_revision,
+                    **scheduled_state,
+                    "scheduled": False,
                     "user_text": "",
                     "user_images": [],
                     "user_docs": [],
@@ -19576,6 +19690,8 @@ def session_active_status(sid: str) -> dict:
                 "runtime_background_tasks_pending": runtime_background_pending,
                 "runtime_continuation_pending": runtime_continuation_pending,
                 "runtime_ui_revision": runtime_ui_revision,
+                **scheduled_state,
+                "scheduled": False,
                 # A just-finished direct or queued turn can disappear from the
                 # live registry before the reconnect probe lands. Preserve its
                 # delivery class through the grace broadcast so the browser
@@ -19595,6 +19711,7 @@ def session_active_status(sid: str) -> dict:
         "runtime_background_tasks_pending": runtime_background_pending,
         "runtime_continuation_pending": runtime_continuation_pending,
         "runtime_ui_revision": runtime_ui_revision,
+        **scheduled_state,
         "turn_id": b.turn_id,
         "parent_turn_id": b.parent_turn_id,
         "model": b.model,
@@ -19606,6 +19723,7 @@ def session_active_status(sid: str) -> dict:
         # portion (the launching tool_use card lives there; the replayed
         # task_notification flips it to ✅done).
         "continuation": getattr(b, "is_continuation", False),
+        "scheduled": getattr(b, "is_scheduled_delivery", False),
         "activity_source": b.activity_source,
         # The turn's user prompt + attachments. The browser needs these to
         # render the user bubble when it LIVE-reconnects to a turn the server
@@ -19818,15 +19936,507 @@ hook_settings.configure_runtime_invalidator(
     _invalidate_hook_setting_runtimes)
 
 
-async def _observe_sdk_stream_message(
+def _sdk_scheduled_snapshot(session_id: str) -> dict[str, Any]:
+    """Return the privacy-safe, thread-safe native schedule projection."""
+    with _sdk_cron_state_lock:
+        count = len(_sdk_cron_jobs.get(session_id, {}))
+    return {"scheduled_active": count > 0, "scheduled_count": count}
+
+
+def _session_has_scheduled_tasks(session_id: str) -> bool:
+    return bool(_sdk_scheduled_snapshot(session_id)["scheduled_active"])
+
+
+def _scheduled_state_carrier(
+    key: chat_runtime.ClientKey,
+) -> TurnBroadcast | None:
+    delivery = _sdk_scheduled_deliveries.get(key)
+    if delivery is not None and not delivery.broadcast.done:
+        return delivery.broadcast
+    broadcast = _active_turns.get(key[0])
+    return broadcast if broadcast is not None and not broadcast.done else None
+
+
+def _publish_sdk_scheduled_state(
+    key: chat_runtime.ClientKey,
+    *,
+    broadcast: TurnBroadcast | None = None,
+) -> None:
+    carrier = broadcast or _scheduled_state_carrier(key)
+    if carrier is None:
+        return
+    carrier.publish({
+        "event": "scheduled_tasks",
+        "data": json.dumps(_sdk_scheduled_snapshot(key[0])),
+    })
+
+
+def _safe_sdk_cron_call(name: str, raw_input: Any) -> dict[str, Any]:
+    data = raw_input if isinstance(raw_input, dict) else {}
+    call: dict[str, Any] = {"name": name}
+    if name == "CronCreate":
+        cadence = str(data.get("cron") or "")
+        if cadence and len(cadence) <= 128 and all(ch.isprintable() for ch in cadence):
+            call["cron"] = cadence
+        call["recurring"] = bool(data.get("recurring"))
+        call["durable"] = bool(data.get("durable"))
+    elif name == "CronDelete":
+        job_id = str(data.get("id") or "")
+        if _SDK_CRON_JOB_ID.fullmatch(job_id):
+            call["id"] = job_id
+    return call
+
+
+def _sdk_tool_result_text(block: ToolResultBlock) -> str:
+    content = getattr(block, "content", None)
+    if isinstance(content, str):
+        return content
+    parts: list[str] = []
+    if isinstance(content, list):
+        for item in content:
+            if isinstance(item, TextBlock):
+                parts.append(str(getattr(item, "text", "") or ""))
+            elif isinstance(item, dict) and item.get("type") == "text":
+                parts.append(str(item.get("text") or ""))
+    return "\n".join(part for part in parts if part)
+
+
+def _observe_sdk_cron_message(
     key: chat_runtime.ClientKey,
     message: Any,
 ) -> None:
-    """Persist and live-publish the safe Hook lifecycle projection."""
-    if not hook_traces.is_hook_message(message):
+    """Track native Cron tool state without retaining its prompt or output."""
+    content = getattr(message, "content", None)
+    if not isinstance(content, list):
         return
+    calls = _sdk_cron_tool_calls.setdefault(key, {})
+    changed = False
+    observed_result = False
+    for block in content:
+        if isinstance(block, ToolUseBlock) and block.name in {
+            "CronCreate", "CronDelete", "CronList",
+        }:
+            tool_id = str(block.id or "")
+            if tool_id:
+                calls[tool_id] = _safe_sdk_cron_call(
+                    str(block.name), getattr(block, "input", None))
+            continue
+        if not isinstance(block, ToolResultBlock):
+            continue
+        tool_id = str(getattr(block, "tool_use_id", "") or "")
+        call = calls.pop(tool_id, None)
+        if call is None or bool(getattr(block, "is_error", False)):
+            continue
+        observed_result = True
+        text = _sdk_tool_result_text(block)
+        name = call["name"]
+        with _sdk_cron_state_lock:
+            before = dict(_sdk_cron_jobs.get(key[0], {}))
+            jobs = dict(before)
+            if name == "CronCreate":
+                match = _SDK_CRON_CREATE_RESULT.search(text)
+                if match:
+                    job_id = match.group(1)
+                    jobs[job_id] = {
+                        field: call[field]
+                        for field in ("cron", "recurring", "durable")
+                        if field in call
+                    }
+            elif name == "CronDelete":
+                match = _SDK_CRON_DELETE_RESULT.search(text)
+                if match:
+                    jobs.pop(match.group(1), None)
+            elif name == "CronList":
+                if "no scheduled jobs" in text.casefold():
+                    jobs = {}
+                else:
+                    listed = {
+                        match.group(1)
+                        for match in _SDK_CRON_LIST_LINE.finditer(text)
+                    }
+                    if listed:
+                        jobs = {
+                            job_id: dict(before.get(job_id, {}))
+                            for job_id in listed
+                        }
+            if jobs:
+                _sdk_cron_jobs[key[0]] = jobs
+            else:
+                _sdk_cron_jobs.pop(key[0], None)
+            changed = jobs != before
+    if not calls:
+        _sdk_cron_tool_calls.pop(key, None)
+    if changed or observed_result:
+        _publish_sdk_scheduled_state(key)
+
+
+def _scheduled_trigger_text(message: UserMessage) -> str:
+    content = getattr(message, "content", None)
+    if isinstance(content, str):
+        return content
+    parts: list[str] = []
+    if isinstance(content, list):
+        for block in content:
+            if isinstance(block, TextBlock):
+                parts.append(str(getattr(block, "text", "") or ""))
+            elif isinstance(block, dict) and block.get("type") == "text":
+                parts.append(str(block.get("text") or ""))
+    return "\n".join(part for part in parts if part)
+
+
+def _is_sdk_scheduled_trigger(message: Any) -> bool:
+    if not isinstance(message, UserMessage):
+        return False
+    origin = sdk_lifecycle.normalize_origin(getattr(message, "origin", None))
+    return bool(
+        origin
+        and origin["kind"] == "task-notification"
+        and origin.get("subkind") == "scheduled-trigger"
+    )
+
+
+async def _register_scheduled_delivery(
+    delivery: _ScheduledDelivery,
+) -> bool:
+    """Claim the visible slot after the preceding turn releases it."""
+    session_id = delivery.key[0]
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline:
+        if sess.session_is_deleting(session_id):
+            return False
+        async with _lock:
+            current = _active_turns.get(session_id)
+            if current is delivery.broadcast:
+                return True
+            if current is None or current.done:
+                if delivery.broadcast.done:
+                    _remember_recent_turn(session_id, delivery.broadcast)
+                    return False
+                _active_turns[session_id] = delivery.broadcast
+                return True
+        await asyncio.sleep(0.02)
+    return False
+
+
+def _retain_maintenance_task(task: asyncio.Task) -> None:
+    _maintenance_tasks.add(task)
+    task.add_done_callback(_maintenance_tasks.discard)
+
+
+async def _begin_scheduled_delivery(
+    key: chat_runtime.ClientKey,
+    message: UserMessage,
+) -> _ScheduledDelivery:
+    prompt = _scheduled_trigger_text(message)
+    broadcast = TurnBroadcast(session_id=key[0], model=key[1] or MODEL)
+    broadcast.user_text = prompt
+    broadcast.is_scheduled_delivery = True
+    broadcast.perf_client = "warm"
+    delivery = _ScheduledDelivery(
+        key=key,
+        broadcast=broadcast,
+        render_state={
+            "tool_use_names": {},
+            "streamed": [],
+            "assistant_uuid": "",
+        },
+        subagent_mux=chat_subagents.SubagentStreamMux(key[0]),
+    )
+    _sdk_scheduled_deliveries[key] = delivery
+    registration = asyncio.create_task(_register_scheduled_delivery(delivery))
+    delivery.registration_task = registration
+    _retain_maintenance_task(registration)
+    broadcast.publish_startup("accepted")
+    try:
+        await _start_activity_early(key[0], broadcast, prompt or "定时任务")
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        pass
+    return delivery
+
+
+async def _observe_scheduled_task_lifecycle(
+    delivery: _ScheduledDelivery,
+    message: Any,
+) -> bool:
+    """Handle task lifecycle frames owned by an autonomous Cron turn."""
+    session_id = delivery.key[0]
+    broadcast = delivery.broadcast
+    pending = delivery.pending_tasks
+    if isinstance(message, TaskStartedMessage):
+        task_id = str(getattr(message, "task_id", "") or "")
+        description = getattr(message, "description", None)
+        accepted = bool(task_id) and await _record_background_task_launch_owned(
+            session_id,
+            task_id,
+            tool_use_id=getattr(message, "tool_use_id", None),
+            description=description,
+        )
+        if accepted:
+            pending[task_id] = {
+                "tool_use_id": getattr(message, "tool_use_id", None),
+                "description": description,
+            }
+            _pin_background_task(session_id, task_id)
+            broadcast.publish({"event": "task_started", "data": json.dumps({
+                "task_id": task_id,
+                "tool_use_id": getattr(message, "tool_use_id", None),
+                "description": description,
+                "task_type": getattr(message, "task_type", None),
+            })})
+        return True
+    if isinstance(message, TaskProgressMessage):
+        broadcast.publish({"event": "task_progress", "data": json.dumps({
+            "task_id": getattr(message, "task_id", "") or "",
+            "tool_use_id": getattr(message, "tool_use_id", None),
+            "last_tool_name": getattr(message, "last_tool_name", None),
+            "usage": dict(getattr(message, "usage", None) or {}),
+        })})
+        return True
+
+    terminal: dict[str, Any] | None = None
+    if isinstance(message, TaskNotificationMessage):
+        terminal = {
+            "task_id": getattr(message, "task_id", "") or "",
+            "tool_use_id": getattr(message, "tool_use_id", None),
+            "status": getattr(message, "status", None),
+            "summary": getattr(message, "summary", None),
+            "output_file": getattr(message, "output_file", None),
+            "usage": dict(getattr(message, "usage", None) or {}),
+        }
+    elif isinstance(message, TaskUpdatedMessage):
+        terminal = _terminal_task_update(message)
+    if terminal is None:
+        return False
+    task_id = str(terminal.get("task_id") or "")
+    outcome = await _on_task_settled_owned(
+        session_id,
+        task_id,
+        status=terminal.get("status") or None,
+        tool_use_id=terminal.get("tool_use_id") or None,
+        summary=terminal.get("summary") or None,
+        output_file=terminal.get("output_file") or None,
+        usage=dict(terminal.get("usage") or {}),
+    )
+    if outcome is not None:
+        pending.pop(task_id, None)
+    if outcome:
+        terminal["background_tasks_pending"] = len(pending)
+        broadcast.publish({
+            "event": "task_notification",
+            "data": json.dumps(terminal),
+        })
+    return True
+
+
+async def _refresh_scheduled_session_summary(
+    session_id: str,
+    model: str,
+) -> None:
+    try:
+        messages = await asyncio.to_thread(_get_session_msgs, session_id, model)
+        await obs.to_thread_io(
+            "chat.scheduled_session_index_write",
+            session_id,
+            sess.bump_session,
+            session_id,
+            message_count=len(messages),
+            turn_count=sum(1 for msg in messages if _is_real_user_prompt(msg)),
+            file_path=sess.INDEX,
+            owned=True,
+        )
+    except Exception as exc:
+        sys.stderr.write(
+            f"[chat] scheduled session index refresh failed "
+            f"sid={session_id[:8]} exc={type(exc).__name__}\n"
+        )
+
+
+async def _finish_scheduled_delivery(
+    delivery: _ScheduledDelivery,
+    result: ResultMessage,
+) -> None:
+    key = delivery.key
     session_id = key[0]
-    broadcast = _active_turns.get(session_id)
+    broadcast = delivery.broadcast
+    if _sdk_scheduled_deliveries.get(key) is delivery:
+        _sdk_scheduled_deliveries.pop(key, None)
+    registration = delivery.registration_task
+
+    # Some compatible providers expose final prose only on ResultMessage.
+    result_text = str(getattr(result, "result", None) or "")
+    if result_text and not "".join(delivery.render_state["streamed"]).strip():
+        broadcast.publish({
+            "event": "text", "data": json.dumps({"text": result_text}),
+        })
+
+    origin = sdk_lifecycle.normalize_origin(getattr(result, "origin", None))
+    terminal_reason = sdk_lifecycle.normalize_terminal_reason(
+        getattr(result, "terminal_reason", None))
+    status = sdk_lifecycle.terminal_status(
+        terminal_reason,
+        is_error=bool(getattr(result, "is_error", False)),
+        cancelled=bool(broadcast.cancelled),
+    )
+    completed_at_ms = int(time.time() * 1000)
+    assistant_uuid = str(delivery.render_state.get("assistant_uuid") or "")
+    elapsed_s = round(max(0.0, time.time() - broadcast.started_at), 1)
+    if assistant_uuid and not sess.session_is_deleting(session_id):
+        try:
+            await obs.to_thread_io(
+                "chat.scheduled_footer_write",
+                session_id,
+                sess.set_message_annotation,
+                session_id,
+                assistant_uuid,
+                model=broadcast.model,
+                ts=completed_at_ms,
+                turn_status=status,
+                turn_id=broadcast.turn_id,
+                elapsed_s=elapsed_s if elapsed_s >= 1 else None,
+                file_path=sess._sidecar_path(session_id),
+            )
+        except Exception as exc:
+            sys.stderr.write(
+                f"[chat] scheduled footer annotation failed "
+                f"sid={session_id[:8]} exc={type(exc).__name__}\n"
+            )
+
+    errors = [str(item) for item in (getattr(result, "errors", None) or [])]
+    done_payload: dict[str, Any] = {
+        "cancelled": status == "cancelled",
+        "is_error": bool(getattr(result, "is_error", False)),
+        "error": "\n".join(errors) or (result_text if status == "failed" else ""),
+        "model": broadcast.model,
+        "scheduled": True,
+        "continuation": False,
+        "activity_source": broadcast.activity_source,
+        "duration_ms": getattr(result, "duration_ms", None),
+        "assistant_uuid": assistant_uuid,
+        "completed_at_ms": completed_at_ms,
+        "status": status,
+        "terminal_reason": terminal_reason,
+        "origin": origin,
+        "model_usage": sdk_lifecycle.normalize_model_usage(
+            getattr(result, "model_usage", None)),
+        "background_tasks_pending": len(delivery.pending_tasks),
+    }
+    broadcast.perf_status = status
+    broadcast.perf_error_kind = "scheduled_turn" if status == "failed" else "none"
+    broadcast.publish({"event": "done", "data": json.dumps(done_payload)})
+    await _finish_activity(session_id, broadcast, status)
+    broadcast.finish()
+    registered_here = False
+    async with _lock:
+        if _active_turns.get(session_id) is broadcast:
+            _active_turns.pop(session_id, None)
+            registered_here = True
+    # If an earlier user turn still owns the visible slot, its own completion
+    # must be allowed to advance first. The retained registration owner will
+    # publish this already-finished Cron replay as soon as that slot clears.
+    # Avoid awaiting it here: the earlier turn's Result may itself be queued
+    # behind this scheduled Result on the same sole stream.
+    registration_finished = registration is None or registration.done()
+    if (registered_here or registration_finished) \
+            and not sess.session_is_deleting(session_id):
+        _remember_recent_turn(session_id, broadcast)
+
+    if delivery.pending_tasks:
+        client = _clients.get(key)
+        if client is not None:
+            _spawn_task_watcher(
+                session_id,
+                client,
+                delivery.pending_tasks,
+                started_at=broadcast.started_at,
+                origin_turn_id=broadcast.turn_id,
+            )
+    refresh = asyncio.create_task(
+        _refresh_scheduled_session_summary(session_id, broadcast.model))
+    _retain_maintenance_task(refresh)
+
+
+async def _observe_sdk_scheduled_delivery(
+    key: chat_runtime.ClientKey,
+    message: Any,
+) -> bool:
+    delivery = _sdk_scheduled_deliveries.get(key)
+    if delivery is None:
+        if not _is_sdk_scheduled_trigger(message):
+            return False
+        delivery = await _begin_scheduled_delivery(key, message)
+        return True
+
+    if await _observe_scheduled_task_lifecycle(delivery, message):
+        return True
+    if isinstance(message, ResultMessage):
+        await _finish_scheduled_delivery(delivery, message)
+        return True
+    if chat_subagents.is_subagent_message(message):
+        for record in delivery.subagent_mux.feed(message):
+            delivery.broadcast.publish({
+                "event": record["event"],
+                "data": json.dumps(record["data"]),
+            })
+        return True
+    for event in _render_continuation_message(message, delivery.render_state):
+        delivery.broadcast.publish(event)
+    return True
+
+
+def _on_sdk_runtime_disconnected(session_id: str) -> None:
+    """Drop runtime-owned schedules and close any interrupted Cron delivery."""
+    with _sdk_cron_state_lock:
+        _sdk_cron_jobs.pop(session_id, None)
+        for key in [key for key in _sdk_cron_tool_calls if key[0] == session_id]:
+            _sdk_cron_tool_calls.pop(key, None)
+    for key in [key for key in _sdk_scheduled_deliveries if key[0] == session_id]:
+        delivery = _sdk_scheduled_deliveries.pop(key)
+        broadcast = delivery.broadcast
+        if delivery.registration_task is not None:
+            delivery.registration_task.cancel()
+        broadcast.cancelled = True
+        if not broadcast.done:
+            broadcast.publish({
+                "event": "error",
+                "data": json.dumps({
+                    "error": "定时任务运行环境已断开",
+                    "kind": "sdk",
+                    "retryable": False,
+                    "activity_source": "scheduled",
+                }),
+            })
+            broadcast.finish()
+        if _active_turns.get(session_id) is broadcast:
+            _active_turns.pop(session_id, None)
+        try:
+            _remember_recent_turn(session_id, broadcast)
+        except RuntimeError:
+            broadcast.close()
+        if broadcast.activity_started:
+            try:
+                task = asyncio.create_task(
+                    _finish_activity(session_id, broadcast, "cancelled"))
+                _retain_maintenance_task(task)
+            except RuntimeError:
+                pass
+    # A foreground turn may be the only live carrier for the dot removal.
+    for key in [key for key in _clients if key[0] == session_id]:
+        _publish_sdk_scheduled_state(key)
+
+
+async def _observe_sdk_stream_message(
+    key: chat_runtime.ClientKey,
+    message: Any,
+) -> bool:
+    """Observe safe lifecycle state and consume autonomous scheduled turns."""
+    _observe_sdk_cron_message(key, message)
+    consumed = await _observe_sdk_scheduled_delivery(key, message)
+    if not hook_traces.is_hook_message(message):
+        return consumed
+    session_id = key[0]
+    broadcast = _scheduled_state_carrier(key) or _active_turns.get(session_id)
     live = broadcast is not None and not broadcast.done
     turn_id = (
         str(broadcast.turn_id or "")
@@ -19835,7 +20445,7 @@ async def _observe_sdk_stream_message(
     )
     origin = (
         "background"
-        if (live and broadcast.activity_source == "background")
+        if (live and broadcast.activity_source in {"background", "scheduled"})
         or (not live and session_id in _sessions_with_inflight_tasks)
         else "foreground"
     )
@@ -19853,6 +20463,7 @@ async def _observe_sdk_stream_message(
             "event": "hook_trace",
             "data": json.dumps(trace),
         })
+    return consumed
 
 
 chat_runtime.configure_hooks(chat_runtime.RuntimeHooks(
@@ -19867,6 +20478,8 @@ chat_runtime.configure_hooks(chat_runtime.RuntimeHooks(
     active_turns=_active_turns,
     sessions_with_inflight_tasks=_sessions_with_inflight_tasks,
     session_has_live_watcher=lambda *a, **k: _session_has_live_watcher(*a, **k),
+    session_has_scheduled_tasks=lambda *a, **k: _session_has_scheduled_tasks(*a, **k),
+    session_runtime_disconnected=lambda *a, **k: _on_sdk_runtime_disconnected(*a, **k),
     pending_runtime_rebuilds=_pending_runtime_rebuilds,
     client_pool_cap=lambda: _CLIENT_POOL_CAP,
     disconnect_unpooled_client=lambda *a, **k: _disconnect_unpooled_client(*a, **k),

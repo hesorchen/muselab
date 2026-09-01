@@ -4677,13 +4677,30 @@ pre.text {
   background: var(--c-accent); color: white;
   border-bottom-right-radius: var(--r-sm);
 }
+.msg.user .bubble.is-scheduled-trigger {
+  background: color-mix(in srgb, var(--c-warn) 14%, var(--c-bg-1));
+  color: var(--c-fg-0);
+  border: 1px solid color-mix(in srgb, var(--c-warn) 42%, var(--c-border));
+}
+.scheduled-trigger-avatar {
+  background: color-mix(in srgb, var(--c-warn) 22%, var(--c-bg-1));
+  color: var(--c-warn);
+  border: 1px solid color-mix(in srgb, var(--c-warn) 45%, transparent);
+  font-size: var(--fs-sm);
+}
+.scheduled-trigger-label {
+  margin-bottom: 4px;
+  color: var(--c-warn);
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-semibold);
+}
 /* Newlines are now rendered as <br> by userTextHtml() in JS, so
    white-space: pre-wrap is gone — it would have forced max-content
    to compute per-line and kept the bubble narrow vs. muse's
    continuous blocks (asymmetric long-message widths). Just keep
    word-break so long unbroken strings still wrap. */
 .user-msg-text { word-break: break-word; }
-html[data-theme="light"] .msg.user .bubble { color: white; }
+html[data-theme="light"] .msg.user .bubble:not(.is-scheduled-trigger) { color: white; }
 
 /* Compact-summary pill — shown above the message that contains the
    isCompactSummary content returned by SDK after /compact. Centered, dashed

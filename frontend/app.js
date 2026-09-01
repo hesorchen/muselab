@@ -252,6 +252,7 @@ const _EMPTY_ACTIVE_SESSION_PANE = Object.freeze({
   _queueAdmission: null,
   _queuePaused: false,
   backgroundActive: false,
+  scheduledDeliveryActive: false,
   compacting: false,
   _draining: false,
   _loadingEarlier: false,
@@ -322,6 +323,7 @@ const CHAT_MUX_STREAM_EVENTS = [
   "subagent_delta", "subagent_block",
   "hook_trace",
   "compact_progress", "task_started", "task_progress", "task_notification",
+  "scheduled_tasks",
   "queue_steering",
   "rate_limit", "ask_user_question", "permission_request",
   "permission_request_resolved", "permission_mode_changed",
@@ -8032,6 +8034,7 @@ function portal() {
         // task settlement opens a continuation broadcast.
         backgroundActive: false,
         backgroundTaskCount: 0,
+        scheduledDeliveryActive: false,
         // SDK-owned nested Subagent transcripts.  Parent history paints first;
         // this independent lane hydrates quietly and accepts live sidechain
         // deltas without ever inserting them into the parent message array.
@@ -9806,6 +9809,7 @@ function portal() {
       let active = false, startedAt = 0, turnId = "";
       let uText = "", uImages = [], uDocs = [];
       let continuation = false;
+      let scheduled = false;
       let background = false, attachable = true, backgroundTaskCount = 0;
       let activitySource = "";
       try {
@@ -9816,8 +9820,11 @@ function portal() {
         if (r.ok) {
           const d = await r.json();
           active = !!d.active; startedAt = d.started_at;
+          this._setScheduledTaskState(
+            sid, !!d.scheduled_active, d.scheduled_count);
           turnId = d.turn_id || "";
           continuation = !!d.continuation;
+          scheduled = !!d.scheduled;
           background = !!d.background;
           attachable = d.attachable !== false;
           activitySource = String(d.activity_source || "");
@@ -9956,13 +9963,15 @@ function portal() {
         // two queued turns are allowed to contain identical prompts.
         const turnUser = this._installActiveTurnUser(
           st, turnId, uText, uImages, uDocs);
+        if (turnUser && scheduled) turnUser.message._scheduledTrigger = true;
         if (turnUser && turnUser.appended) {
           this._scheduleLiveMessageViewport(st);
           st.atBottom = true;
           this.scrollToBottom(true);
         }
         if (st && turnId) st.activeTurnId = turnId;
-        this.send({ reconnect: true, sessionId: sid, turnId, startedAt });
+        this.send({ reconnect: true, sessionId: sid, turnId, startedAt,
+                    scheduled });
         this.$nextTick(() => this._syncQueueFromServer(sid));
         return;
       }
@@ -11232,6 +11241,7 @@ function portal() {
           meta.turn_active = false;
           meta.background_active = false;
         }
+        if (existingState) existingState.scheduledDeliveryActive = false;
         this._chatMuxPendingEvents.delete(sid);
         const ownsInactiveTurn = !!(existingState && inactiveTurnId
           && currentTurnId === inactiveTurnId);
@@ -11302,6 +11312,9 @@ function portal() {
         meta.turn_active = !payload.background;
         meta.background_active = !!payload.background;
       }
+      if (existingState) {
+        existingState.scheduledDeliveryActive = !!payload.scheduled;
+      }
       if (payload.attachable === false) {
         // Watcher-only ownership has no replayable turn yet. Preserve its blue
         // dot/background state, but do not create a reducer runtime until the
@@ -11334,12 +11347,26 @@ function portal() {
         }
         if (st.streaming || st.es || this.tabState[sid] !== st) return;
         st.parentTurnId = String(payload.parent_turn_id || "");
+        st.scheduledDeliveryActive = !!payload.scheduled;
+        const turnUser = !payload.continuation
+          ? this._installActiveTurnUser(
+              st,
+              turnId,
+              String(payload.user_text || ""),
+              Array.isArray(payload.user_images) ? payload.user_images : [],
+              Array.isArray(payload.user_docs) ? payload.user_docs : [],
+            )
+          : null;
+        if (turnUser && payload.scheduled) {
+          turnUser.message._scheduledTrigger = true;
+        }
         await this.send({
           reconnect: true,
           sessionId: sid,
           turnId,
           startedAt: payload.started_at,
           continuation: !!payload.continuation,
+          scheduled: !!payload.scheduled,
           _muxAttach: true,
         });
       })();
@@ -12145,6 +12172,8 @@ function portal() {
         if (!!x.active !== !!y.active) return false;
         if (!!x.turn_active !== !!y.turn_active) return false;
         if (!!x.background_active !== !!y.background_active) return false;
+        if (!!x.scheduled_active !== !!y.scheduled_active) return false;
+        if ((x.scheduled_count || 0) !== (y.scheduled_count || 0)) return false;
         if ((x.updated_at || 0) !== (y.updated_at || 0)) return false;
         if ((x.message_count || 0) !== (y.message_count || 0)) return false;
         if ((x.permission || "") !== (y.permission || "")) return false;
@@ -13490,8 +13519,27 @@ function portal() {
       const s = this.sessions.find(x => x.id === tid);
       return !!(s && s.background_active);
     },
+    _setScheduledTaskState(tid, active, count = 0) {
+      if (!tid) return;
+      const normalizedCount = Math.max(0, Math.floor(Number(count) || 0));
+      this.sessions = (this.sessions || []).map(session => session.id === tid
+        ? {
+            ...session,
+            scheduled_active: !!active,
+            scheduled_count: normalizedCount,
+          }
+        : session);
+    },
+    isTabScheduledActive(tid) {
+      const st = this.tabState[tid];
+      if (st && st.scheduledDeliveryActive) return true;
+      const session = this.sessions.find(item => item.id === tid);
+      return !!(session && session.scheduled_active);
+    },
     isTabRunning(tid) {
-      return this.isTabBackgroundActive(tid) || this.isTabStreaming(tid);
+      return this.isTabScheduledActive(tid)
+        || this.isTabBackgroundActive(tid)
+        || this.isTabStreaming(tid);
     },
     isTabUnread(tid) {
       // True when this tab's most recent turn finished while the user was
@@ -16935,6 +16983,8 @@ function portal() {
         if (!r.ok) return;
         const d = await r.json();
         if (this.tabState[sid] !== st) return;
+        this._setScheduledTaskState(
+          sid, !!d.scheduled_active, d.scheduled_count);
         const probedTurnId = String(d.turn_id || "");
         if (d.active && !d.background && probedTurnId
             && probedTurnId === String(st._lastTerminalTurnId || "")) {
@@ -17000,6 +17050,9 @@ function portal() {
               Array.isArray(d.user_docs) ? d.user_docs : [],
             )
           : null;
+        if (activeTurnUser && d.scheduled) {
+          activeTurnUser.message._scheduledTrigger = true;
+        }
         if (activeTurnUser && activeTurnUser.appended) {
           this._scheduleLiveMessageViewport(st);
           if (this.currentId === sid && st.atBottom !== false) {
@@ -17016,6 +17069,7 @@ function portal() {
         }
         if (d.active && !st.streaming && !st.es) {
           st._serverActiveObserved = true;
+          st.scheduledDeliveryActive = !!d.scheduled;
           // Rate-limited: a reconnect replays the whole turn over a wiped
           // pane, and this probe runs from ~8 different pollers. Without the
           // gate they compound into a visible reconnect storm (2026-08-04).
@@ -17034,9 +17088,11 @@ function portal() {
           // continuation mode so we DON'T truncate the launching card.
           this.send({ reconnect: true, sessionId: sid,
                        turnId: d.turn_id || "", startedAt: d.started_at,
-                       continuation: !!d.continuation });
+                       continuation: !!d.continuation,
+                       scheduled: !!d.scheduled });
           return;
         }
+        st.scheduledDeliveryActive = false;
         this._setBackgroundTaskActive(sid, false);
         st.activeTurnId = "";
         st.parentTurnId = "";
@@ -30874,6 +30930,10 @@ function portal() {
       // card lives there and the replayed task_notification needs to flip it
       // to ✅done. The continuation's events APPEND after the existing cards.
       const isContinuation = isReconnect && !!opts.continuation;
+      const isScheduledDelivery = isReconnect && !!opts.scheduled;
+      if (isReconnect) {
+        sendState.scheduledDeliveryActive = isScheduledDelivery;
+      }
       const expectedTurnId = isReconnect
         ? (opts.turnId || sendState.activeTurnId || "")
         : "";
@@ -31578,7 +31638,7 @@ function portal() {
         if (ev && streamState.streamPhase !== "running" && [
           "text", "thinking", "tool_use", "tool_result",
           "subagent_delta", "subagent_block", "hook_trace", "compact_progress",
-          "task_started", "task_progress", "task_notification", "rate_limit",
+          "task_started", "task_progress", "task_notification", "scheduled_tasks", "rate_limit",
           "queue_steering",
           "ask_user_question", "permission_request", "permission_request_resolved",
           "permission_mode_changed", "permission_mode_change_failed",
@@ -31588,7 +31648,7 @@ function portal() {
       };
       ["startup", "text", "thinking", "tool_use", "tool_result",
        "subagent_delta", "subagent_block", "hook_trace", "compact_progress", "task_started",
-       "task_progress", "task_notification", "rate_limit", "queue_steering",
+       "task_progress", "task_notification", "scheduled_tasks", "rate_limit", "queue_steering",
        "ask_user_question", "permission_request", "permission_request_resolved",
        "permission_mode_changed",
        "permission_mode_change_failed", "ping",
@@ -32055,6 +32115,15 @@ function portal() {
         let d;
         try { d = JSON.parse(ev.data); } catch (_) { return; }
         this._applyHookTrace(streamSid, streamState, d);
+      });
+      es.addEventListener("scheduled_tasks", ev => {
+        let payload = {};
+        try { payload = JSON.parse(ev.data) || {}; } catch (_) {}
+        this._setScheduledTaskState(
+          streamSid,
+          !!payload.scheduled_active,
+          payload.scheduled_count,
+        );
       });
       es.addEventListener("task_started", ev => {
         let d;
@@ -32712,6 +32781,7 @@ function portal() {
           modelUsage: d.model_usage,
           memoryRecall: d.memory_recall,
         });
+        streamState.scheduledDeliveryActive = false;
         _stopTimer();
         // The main reply has reached its durable boundary, but a detached SDK
         // task can keep the source runtime alive for minutes. Publish the
@@ -33213,7 +33283,8 @@ function portal() {
             this.send({ reconnect: true, sessionId: streamSid,
                         turnId: d.turn_id || streamState.activeTurnId || "",
                         startedAt: d.started_at,
-                        continuation: !!d.continuation });
+                        continuation: !!d.continuation,
+                        scheduled: !!d.scheduled });
           } catch (_e) {
             // Probe failed — try again on next error tick (counter will
             // continue incrementing until MAX_ATTEMPTS). Do NOT mark the

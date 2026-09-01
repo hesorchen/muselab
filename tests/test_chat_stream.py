@@ -6974,6 +6974,9 @@ def test_watcher_without_a_task_pin_is_not_user_visible_active(stream_env):
             "runtime_background_tasks_pending": 0,
             "runtime_continuation_pending": False,
             "runtime_ui_revision": "",
+            "scheduled_active": False,
+            "scheduled_count": 0,
+            "scheduled": False,
             "activity_source": "",
         }
 
@@ -6985,6 +6988,207 @@ def test_watcher_without_a_task_pin_is_not_user_visible_active(stream_env):
     finally:
         chat_mod._task_watchers.pop(sid, None)
         chat_mod._release_task_pins(sid, {"task_live"})
+
+
+def test_native_cron_tools_update_live_schedule_state(stream_env):
+    chat_mod = stream_env
+    sid = "sid-native-cron-state"
+    key = (sid, "claude-sonnet-4-6", "auto", "")
+    broadcast = chat_mod.TurnBroadcast(sid, model=key[1])
+    chat_mod._active_turns[sid] = broadcast
+
+    async def run():
+        await chat_mod._observe_sdk_stream_message(key, AssistantMessage(
+            content=[ToolUseBlock(
+                id="cron-create-1",
+                name="CronCreate",
+                input={
+                    "cron": "7 * * * *",
+                    "recurring": True,
+                    "durable": False,
+                    "prompt": "must never enter the schedule state cache",
+                },
+            )],
+            model=key[1],
+        ))
+        await chat_mod._observe_sdk_stream_message(key, UserMessage(content=[
+            ToolResultBlock(
+                tool_use_id="cron-create-1",
+                content=(
+                    "Scheduled recurring job 93d1bb35 "
+                    "(Every hour at :07). Session-only."
+                ),
+            ),
+        ]))
+        assert chat_mod._sdk_scheduled_snapshot(sid) == {
+            "scheduled_active": True,
+            "scheduled_count": 1,
+        }
+        assert chat_mod._sdk_cron_jobs[sid] == {
+            "93d1bb35": {
+                "cron": "7 * * * *",
+                "recurring": True,
+                "durable": False,
+            },
+        }
+
+        await chat_mod._observe_sdk_stream_message(key, AssistantMessage(
+            content=[ToolUseBlock(
+                id="cron-delete-1",
+                name="CronDelete",
+                input={"id": "93d1bb35"},
+            )],
+            model=key[1],
+        ))
+        await chat_mod._observe_sdk_stream_message(key, UserMessage(content=[
+            ToolResultBlock(
+                tool_use_id="cron-delete-1",
+                content="Cancelled job 93d1bb35.",
+            ),
+        ]))
+
+    try:
+        asyncio.run(run())
+        assert chat_mod._sdk_scheduled_snapshot(sid) == {
+            "scheduled_active": False,
+            "scheduled_count": 0,
+        }
+        updates = [
+            json.loads(event["data"])
+            for event in broadcast.replay_events()
+            if event["event"] == "scheduled_tasks"
+        ]
+        assert [item["scheduled_count"] for item in updates] == [1, 0]
+    finally:
+        chat_mod._active_turns.pop(sid, None)
+        chat_mod._sdk_cron_jobs.pop(sid, None)
+        chat_mod._sdk_cron_tool_calls.pop(key, None)
+        broadcast.close()
+
+
+def test_sdk_scheduled_trigger_is_broadcast_live_without_refresh(
+        stream_env, monkeypatch):
+    chat_mod = stream_env
+    sid = "sid-native-scheduled-trigger"
+    key = (sid, "claude-sonnet-4-6", "auto", "")
+
+    async def no_activity(*_args, **_kwargs):
+        return None
+
+    async def no_refresh(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(chat_mod, "_start_activity_early", no_activity)
+    monkeypatch.setattr(chat_mod, "_finish_activity", no_activity)
+    monkeypatch.setattr(
+        chat_mod, "_refresh_scheduled_session_summary", no_refresh)
+
+    async def run():
+        assert await chat_mod._observe_sdk_stream_message(
+            key,
+            UserMessage(
+                content="检查服务状态",
+                uuid="scheduled-user",
+                origin={
+                    "kind": "task-notification",
+                    "subkind": "scheduled-trigger",
+                },
+            ),
+        ) is True
+        await asyncio.sleep(0)
+        delivery = chat_mod._sdk_scheduled_deliveries[key]
+        broadcast = delivery.broadcast
+        assert chat_mod._active_turns[sid] is broadcast
+        assert broadcast.activity_source == "scheduled"
+        assert broadcast.user_text == "检查服务状态"
+
+        assert await chat_mod._observe_sdk_stream_message(
+            key,
+            StreamEvent(
+                uuid="scheduled-stream",
+                session_id=sid,
+                event={
+                    "type": "content_block_delta",
+                    "delta": {"type": "text_delta", "text": "状态正常"},
+                },
+            ),
+        ) is True
+        assert await chat_mod._observe_sdk_stream_message(
+            key,
+            AssistantMessage(
+                content=[TextBlock("状态正常")],
+                model=key[1],
+            ),
+        ) is True
+        assert await chat_mod._observe_sdk_stream_message(
+            key,
+            ResultMessage(
+                subtype="success",
+                duration_ms=12,
+                duration_api_ms=10,
+                is_error=False,
+                num_turns=1,
+                session_id=sid,
+                terminal_reason="completed",
+                origin={
+                    "kind": "task-notification",
+                    "subkind": "scheduled-trigger",
+                },
+            ),
+        ) is True
+        await asyncio.sleep(0)
+        return broadcast
+
+    broadcast = asyncio.run(run())
+    try:
+        assert sid not in chat_mod._active_turns
+        assert key not in chat_mod._sdk_scheduled_deliveries
+        events = list(broadcast.replay_events())
+        assert [event["event"] for event in events] == [
+            "startup", "text", "done",
+        ]
+        done = json.loads(events[-1]["data"])
+        assert done["scheduled"] is True
+        assert done["activity_source"] == "scheduled"
+        assert chat_mod.session_active_status(sid)["scheduled"] is True
+    finally:
+        recent = chat_mod._recent_turns.pop(sid, None)
+        handle = chat_mod._recent_turn_expiry_handles.pop(sid, None)
+        if handle is not None:
+            handle.cancel()
+        (recent or broadcast).close()
+
+
+def test_session_pump_skips_observer_consumed_message(
+        stream_env, monkeypatch):
+    chat_mod = stream_env
+    release = None
+
+    class Client:
+        async def receive_messages(self):
+            yield "scheduled-owned"
+            yield "ordinary"
+            await release.wait()
+
+    async def observer(_key, message):
+        return message == "scheduled-owned"
+
+    monkeypatch.setattr(chat_mod, "_observe_sdk_stream_message", observer)
+
+    async def run():
+        nonlocal release
+        release = asyncio.Event()
+        stream = chat_mod._SessionStream(
+            ("sid-observer-owned", "m", "auto", ""), Client())
+        queue = stream.attach_turn()
+        try:
+            assert await asyncio.wait_for(queue.get(), 1) == "ordinary"
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(queue.get(), 0.02)
+        finally:
+            await stream.aclose()
+
+    asyncio.run(run())
 
 
 def test_unpinned_watcher_is_retired_after_foreground_consumes_terminal(

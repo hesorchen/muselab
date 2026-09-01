@@ -1680,10 +1680,12 @@
                             :title="(lang==='zh' ? '打开会话：' : 'Open session: ') + s.name">
                       <!-- Streaming / unread dots — mirrors tab-strip behavior -->
                       <span class="chat-tab-stream-dot picker-status-dot"
-                            :class="{ 'is-background': isTabBackgroundActive(s.id) }"
+                            :class="{ 'is-background': isTabBackgroundActive(s.id) || isTabScheduledActive(s.id) }"
                             x-show="isTabRunning(s.id)"
-                            :title="isTabBackgroundActive(s.id)
-                              ? t('chat.background_running')
+                            :title="isTabScheduledActive(s.id)
+                              ? (lang==='zh' ? '定时任务待命或执行中' : 'Scheduled task ready or running')
+                              : isTabBackgroundActive(s.id)
+                                ? t('chat.background_running')
                               : (lang==='zh' ? '正在生成…' : 'Streaming…')"></span>
                       <span class="chat-tab-unread-dot picker-status-dot"
                             x-show="isTabUnread(s.id)"
@@ -1775,10 +1777,12 @@
                  @auxclick="onTabAuxClick($event, tid)"
                  :title="tabTitle(tid)">
               <span class="chat-tab-stream-dot"
-                    :class="{ 'is-background': isTabBackgroundActive(tid) }"
+                    :class="{ 'is-background': isTabBackgroundActive(tid) || isTabScheduledActive(tid) }"
                     x-show="isTabRunning(tid)"
-                    :title="isTabBackgroundActive(tid)
-                      ? t('chat.background_running')
+                    :title="isTabScheduledActive(tid)
+                      ? (lang==='zh' ? '该会话有定时任务待命或执行中' : 'Scheduled task ready or running')
+                      : isTabBackgroundActive(tid)
+                        ? t('chat.background_running')
                       : (lang==='zh' ? '该会话正在生成…' : 'Streaming…')"></span>
               <!-- Green dot when the tab finished a turn while you were
                    elsewhere. Sibling to the streaming dot but mutually
@@ -2020,10 +2024,15 @@
               <template x-if="m.role === 'user' && !m._is_compact_summary">
                 <div>
                   <div class="msg-row">
-                    <span class="msg-avatar user-avatar" x-text="userAvatarText()"></span>
+                    <span class="msg-avatar user-avatar"
+                          :class="{ 'scheduled-trigger-avatar': m._scheduledTrigger }"
+                          x-text="m._scheduledTrigger ? '⏱' : userAvatarText()"></span>
                     <div class="bubble user-bubble"
-                         :class="{ 'is-queueing': m._optimisticQueue }"
+                         :class="{ 'is-queueing': m._optimisticQueue, 'is-scheduled-trigger': m._scheduledTrigger }"
                          @click="onUserBubbleClick(m)">
+                      <div class="scheduled-trigger-label"
+                           x-show="m._scheduledTrigger"
+                           x-text="lang==='zh' ? '定时任务' : 'Scheduled task'"></div>
                       <template x-if="userSelectionQuotes(m).length">
                         <div class="user-msg-quotes">
                           <template x-for="(quote, qidx) in userSelectionQuotes(m)"
@@ -2125,7 +2134,7 @@
                             :title="lang==='zh' ? '明确保存为记忆' : 'Save as confirmed memory'">
                       <svg><use :href="m._memorySaved ? '#i-check' : '#i-brain'"/></svg>
                     </button>
-                    <button x-show="pane && !pane.streaming && !m._editing"
+                    <button x-show="pane && !pane.streaming && !m._editing && !m._scheduledTrigger"
                             @click="startEditMessage(m)" class="icon-btn sm"
                             :title="t('btn.edit')">
                       <svg><use href="#i-edit"/></svg>

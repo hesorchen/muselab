@@ -6238,3 +6238,21 @@ def test_last_turn_retry_uses_guarded_sdk_branch_and_keeps_source():
     assert '"resume_session_at": retry_resume_session_at' in backend
     assert "only the latest user turn can be retried" in backend
     assert "attachment turns cannot be retried" in backend
+
+
+def test_sdk_scheduled_tasks_have_live_stream_and_amber_session_state():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    backend = (BACKEND / "chat.py").read_text(encoding="utf-8")
+    runtime = (BACKEND / "chat_runtime.py").read_text(encoding="utf-8")
+
+    assert '"scheduled_tasks"' in app
+    assert 'es.addEventListener("scheduled_tasks"' in app
+    assert "isTabScheduledActive" in app
+    assert "scheduled_active" in app
+    assert "scheduled-trigger-avatar" in html
+    assert "定时任务待命或执行中" in html
+    assert "_observe_sdk_scheduled_delivery" in backend
+    assert 'origin.get("subkind") == "scheduled-trigger"' in backend
+    assert "session_has_scheduled_tasks" in runtime
+    assert "if observed:" in runtime

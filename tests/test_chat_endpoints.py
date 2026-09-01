@@ -373,6 +373,26 @@ def test_session_list_marks_detached_background_work_active(chat_mod, client):
         chat_mod._sessions_with_inflight_tasks.pop(sid, None)
 
 
+def test_session_list_marks_native_cron_as_amber_idle_state(chat_mod, client):
+    sid = _make_compact_session(client)
+    chat_mod._sdk_cron_jobs[sid] = {
+        "job-a": {"cron": "7 * * * *", "recurring": True},
+        "job-b": {"cron": "12 * * * *", "recurring": True},
+    }
+    try:
+        response = client.get(
+            "/api/chat/sessions", headers={"X-Auth-Token": TEST_TOKEN})
+        assert response.status_code == 200, response.text
+        row = next(s for s in response.json()["sessions"] if s["id"] == sid)
+        assert row["active"] is False
+        assert row["turn_active"] is False
+        assert row["background_active"] is False
+        assert row["scheduled_active"] is True
+        assert row["scheduled_count"] == 2
+    finally:
+        chat_mod._sdk_cron_jobs.pop(sid, None)
+
+
 # ====== interrupt ======
 
 def test_interrupt_no_live_client(chat_mod, client):
