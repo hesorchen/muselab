@@ -5481,9 +5481,12 @@
                 <span x-show="!hookActiveScope().exists"
                       x-text="lang==='zh' ? '尚未创建' : 'Not created yet'"></span>
                 <label class="hook-disable-all">
-                  <input type="checkbox"
-                         :checked="hookActiveScope().disableAllHooks"
-                         @change="toggleAllHooks($event.target.checked)">
+                  <span class="switch sm">
+                    <input type="checkbox"
+                           :checked="hookActiveScope().disableAllHooks"
+                           @change="toggleAllHooks($event.target.checked)">
+                    <span class="switch-slider"></span>
+                  </span>
                   <span x-text="lang==='zh' ? '禁用这一层的全部 Hook' : 'Disable all Hooks in this scope'"></span>
                 </label>
               </div>
@@ -5529,21 +5532,57 @@
                        : (lang==='zh' ? '添加 Hook' : 'Add Hook')"></div>
                 <div class="settings-row">
                   <label>Event</label>
-                  <input class="settings-input mono" list="hook-event-options"
-                         x-model="settings.hooks.draft.event"
-                         :disabled="settings.hooks.draft.mode === 'edit'">
-                  <datalist id="hook-event-options">
-                    <option value="PreToolUse"></option>
-                    <option value="PostToolUse"></option>
-                    <option value="PostToolUseFailure"></option>
-                    <option value="PermissionRequest"></option>
-                    <option value="UserPromptSubmit"></option>
-                    <option value="SubagentStart"></option>
-                    <option value="SubagentStop"></option>
-                    <option value="Stop"></option>
-                    <option value="PreCompact"></option>
-                    <option value="Notification"></option>
-                  </datalist>
+                  <select class="settings-input mono hook-event-select"
+                          x-model="settings.hooks.draft.event"
+                          :disabled="settings.hooks.draft.mode === 'edit'">
+                    <optgroup label="Session">
+                      <option value="SessionStart">SessionStart</option>
+                      <option value="Setup">Setup</option>
+                      <option value="SessionEnd">SessionEnd</option>
+                    </optgroup>
+                    <optgroup label="Prompt &amp; model">
+                      <option value="UserPromptSubmit">UserPromptSubmit</option>
+                      <option value="UserPromptExpansion">UserPromptExpansion</option>
+                      <option value="PreModelSwitch">PreModelSwitch</option>
+                      <option value="PostModelSwitch">PostModelSwitch</option>
+                    </optgroup>
+                    <optgroup label="Tools">
+                      <option value="PreToolUse">PreToolUse</option>
+                      <option value="PermissionRequest">PermissionRequest</option>
+                      <option value="PermissionDenied">PermissionDenied</option>
+                      <option value="PostToolUse">PostToolUse</option>
+                      <option value="PostToolUseFailure">PostToolUseFailure</option>
+                      <option value="PostToolBatch">PostToolBatch</option>
+                    </optgroup>
+                    <optgroup label="Agents &amp; tasks">
+                      <option value="SubagentStart">SubagentStart</option>
+                      <option value="SubagentStop">SubagentStop</option>
+                      <option value="TaskCreated">TaskCreated</option>
+                      <option value="TaskCompleted">TaskCompleted</option>
+                      <option value="TeammateIdle">TeammateIdle</option>
+                    </optgroup>
+                    <optgroup label="Lifecycle">
+                      <option value="Stop">Stop</option>
+                      <option value="StopFailure">StopFailure</option>
+                      <option value="Notification">Notification</option>
+                      <option value="MessageDisplay">MessageDisplay</option>
+                      <option value="PreCompact">PreCompact</option>
+                      <option value="PostCompact">PostCompact</option>
+                    </optgroup>
+                    <optgroup label="Configuration &amp; files">
+                      <option value="InstructionsLoaded">InstructionsLoaded</option>
+                      <option value="ConfigChange">ConfigChange</option>
+                      <option value="CwdChanged">CwdChanged</option>
+                      <option value="DirectoryAdded">DirectoryAdded</option>
+                      <option value="FileChanged">FileChanged</option>
+                      <option value="WorktreeCreate">WorktreeCreate</option>
+                      <option value="WorktreeRemove">WorktreeRemove</option>
+                    </optgroup>
+                    <optgroup label="MCP">
+                      <option value="Elicitation">Elicitation</option>
+                      <option value="ElicitationResult">ElicitationResult</option>
+                    </optgroup>
+                  </select>
                 </div>
                 <div class="settings-row">
                   <label>Matcher</label>
@@ -5551,14 +5590,27 @@
                          x-model="settings.hooks.draft.matcher"
                          :placeholder="lang==='zh' ? '可留空，例如 Bash|Edit' : 'Optional, e.g. Bash|Edit'">
                 </div>
+                <div class="settings-row">
+                  <label x-text="lang==='zh' ? '处理器类型' : 'Handler type'"></label>
+                  <select class="settings-input mono hook-handler-type-select"
+                          x-model="settings.hooks.draft.handlerType"
+                          @change="onHookHandlerTypeChange()">
+                    <option value="command">command · shell</option>
+                    <option value="http">http · POST</option>
+                    <option value="mcp_tool">mcp_tool · MCP</option>
+                    <option value="prompt">prompt · model</option>
+                    <option value="agent">agent · subagent</option>
+                    <option value="custom" x-text="lang==='zh' ? '自定义 JSON' : 'Custom JSON'"></option>
+                  </select>
+                </div>
                 <label class="hook-json-label">Handler JSON</label>
                 <textarea class="settings-input hook-json-editor mono"
                           spellcheck="false"
                           x-model="settings.hooks.draft.handlerJson"></textarea>
                 <div class="settings-hint"
                      x-text="lang==='zh'
-                       ? '支持 Claude 标准 command / http / prompt / agent handler；HTTP headers 会在读取时自动遮蔽。'
-                       : 'Supports Claude command, http, prompt and agent handlers. HTTP headers are masked on read.'"></div>
+                       ? '选择处理器类型会生成对应的 Claude 标准 JSON；支持 command / http / mcp_tool / prompt / agent，高级字段可继续编辑。HTTP headers 读取时自动遮蔽。'
+                       : 'Choosing a handler type creates standard Claude JSON for command, http, mcp_tool, prompt or agent. Advanced fields remain editable; HTTP headers are masked on read.'"></div>
                 <div class="hook-editor-actions">
                   <button class="btn-primary sm" @click="saveHookDraft()"
                           :disabled="settings.hooks.saving"

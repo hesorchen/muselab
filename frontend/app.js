@@ -1203,6 +1203,7 @@ function portal() {
           mode: "create",
           event: "PreToolUse",
           matcher: "",
+          handlerType: "command",
           handlerJson: '{\n  "type": "command",\n  "command": ""\n}',
           groupIndex: null,
           handlerIndex: null,
@@ -19696,6 +19697,7 @@ function portal() {
         event: "PreToolUse",
         originalEvent: "",
         matcher: "",
+        handlerType: "command",
         handlerJson: '{\n  "type": "command",\n  "command": ""\n}',
         groupIndex: null,
         handlerIndex: null,
@@ -19711,6 +19713,9 @@ function portal() {
         event: row.event,
         originalEvent: row.event,
         matcher: row.matcher || "",
+        handlerType: ["command", "http", "mcp_tool", "prompt", "agent"]
+          .includes(String((row.handler && row.handler.type) || ""))
+          ? String(row.handler.type) : "custom",
         handlerJson: JSON.stringify(row.handler || {}, null, 2),
         groupIndex: row.groupIndex,
         handlerIndex: row.handlerIndex,
@@ -19718,6 +19723,21 @@ function portal() {
     },
     cancelHookDraft() {
       this.settings.hooks.draft = { ...this._newHookDraft(), show: false };
+    },
+    hookHandlerTemplate(type) {
+      const templates = {
+        command: { type: "command", command: "" },
+        http: { type: "http", url: "", headers: {} },
+        mcp_tool: { type: "mcp_tool", server: "", tool: "", input: {} },
+        prompt: { type: "prompt", prompt: "" },
+        agent: { type: "agent", prompt: "" },
+      };
+      return templates[String(type || "")] || null;
+    },
+    onHookHandlerTypeChange() {
+      const draft = this.settings.hooks.draft;
+      const template = this.hookHandlerTemplate(draft.handlerType);
+      if (template) draft.handlerJson = JSON.stringify(template, null, 2);
     },
     async loadHookSettings() {
       const hooks = this.settings.hooks;

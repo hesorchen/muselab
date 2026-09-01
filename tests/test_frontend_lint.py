@@ -6161,6 +6161,20 @@ def test_hook_settings_gui_edits_standard_scopes_and_keeps_builtins_read_only():
     assert 'settings.activePage=\'hooks\'; loadHookSettings()' in html
     assert "Claude 标准配置" in html
     assert "MuseLab 内置 Hook（只读）" in html
+    assert 'class="switch sm"' in html
+    assert 'class="settings-input mono hook-event-select"' in html
+    assert 'hook-event-options' not in html
+    for event in (
+        "SessionStart", "UserPromptSubmit", "PreToolUse", "PermissionDenied",
+        "PostToolBatch", "SubagentStart", "TaskCompleted", "StopFailure",
+        "PostCompact", "PreModelSwitch", "InstructionsLoaded", "FileChanged",
+        "WorktreeCreate", "ElicitationResult", "SessionEnd",
+    ):
+        assert f'<option value="{event}">' in html
+    for handler_type in ("command", "http", "mcp_tool", "prompt", "agent"):
+        assert f'<option value="{handler_type}">' in html
+    assert "onHookHandlerTypeChange()" in html
+    assert "hookHandlerTemplate(type)" in app
     assert 'method: editing ? "PUT" : "POST"' in app
     assert 'method: "DELETE"' in app
     assert 'method: "PATCH"' in app

@@ -8589,18 +8589,28 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   flex-wrap: wrap;
   align-items: center;
   gap: var(--sp-2);
-  padding: var(--sp-2) 0;
+  padding: 9px 10px;
+  border: 1px solid var(--c-border);
+  border-radius: var(--r-md);
+  background: var(--c-bg-1);
   color: var(--c-fg-3);
   font-size: var(--fs-xs);
 }
 .hook-disable-all {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  gap: 8px;
   margin-left: auto;
+  min-height: 28px;
+  padding: 2px 6px;
+  border-radius: var(--r-sm);
   color: var(--c-fg-2);
   cursor: pointer;
+  white-space: nowrap;
 }
+.hook-disable-all:hover { background: var(--c-bg-2); color: var(--c-fg-1); }
+.hook-disable-all .switch { flex: 0 0 auto; }
+.hook-disable-all .switch input { padding: 0; border: 0; }
 .hook-list {
   display: grid;
   gap: var(--sp-2);
@@ -8649,8 +8659,14 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   border-radius: var(--r-md);
   background: var(--c-bg-1);
 }
-.hook-editor .settings-row { align-items: flex-start; }
+.hook-editor .settings-row {
+  grid-template-columns: 132px minmax(0, 1fr);
+  align-items: center;
+  margin-bottom: 10px;
+}
 .hook-editor .settings-row > label { min-width: 72px; }
+.hook-event-select,
+.hook-handler-type-select { cursor: pointer; }
 .hook-json-label {
   display: block;
   margin: var(--sp-2) 0 5px;
@@ -8659,7 +8675,9 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 }
 .hook-json-editor {
   width: 100%;
-  min-height: 180px;
+  height: auto;
+  min-height: 144px;
+  padding: 9px 10px;
   resize: vertical;
   line-height: 1.5;
   white-space: pre;
@@ -8682,6 +8700,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 }
 @media (max-width: 700px) {
   .hook-disable-all { width: 100%; margin-left: 0; }
+  .hook-editor .settings-row { grid-template-columns: 1fr; }
   .hook-row { align-items: flex-start; }
   .hook-builtin-row { grid-template-columns: 1fr; gap: 2px; }
 }
