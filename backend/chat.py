@@ -38,11 +38,12 @@ from pydantic import BaseModel, Field
 from claude_agent_sdk import (
     ClaudeSDKClient, ClaudeAgentOptions,
     AssistantMessage, UserMessage, TextBlock, ThinkingBlock, ResultMessage,
+    ConversationResetMessage,
     ToolUseBlock, ToolResultBlock, StreamEvent,
     TaskStartedMessage, TaskProgressMessage, TaskNotificationMessage,
     TaskUpdatedMessage, TERMINAL_TASK_STATUSES,
     RateLimitEvent, SystemMessage,
-    ClaudeSDKError,
+    ClaudeSDKError, ResultError,
     ThinkingConfigEnabled, ThinkingConfigDisabled, ThinkingConfigAdaptive,
     EffortLevel,
     get_session_messages,
@@ -73,6 +74,7 @@ from . import chat_presentation
 from . import chat_overlays
 from . import chat_runtime
 from . import chat_successor
+from . import sdk_lifecycle
 from . import transcript_index as transcript_idx
 from .task_summaries import normalize_task_summary_fields
 from .imagegen_job_store import ImagegenJobStore
@@ -3253,7 +3255,7 @@ async def _build_and_connect_client(
         max_buffer_size=max_buf,
         stderr=_cli_stderr,
         # Block harness-only tools the SDK exposes by default. AskUserQuestion
-        # is intentionally kept: SDK 0.2.148 / CLI 2.1.251 correctly turns the
+        # is intentionally kept: SDK 0.2.149 / CLI 2.1.252 correctly turns the
         # browser-injected answers into a native tool_result in every supported
         # permission mode; permission_request.py owns that UI bridge.
         #
@@ -5764,6 +5766,9 @@ def _indexed_ui_records(
                 ("elapsed_s", "elapsed"),
                 ("model", "model"),
                 ("turn_status", "turn_status"),
+                ("terminal_reason", "terminal_reason"),
+                ("turn_origin", "turn_origin"),
+                ("model_usage", "model_usage"),
                 ("memory_recall", "memoryRecall"),
             ):
                 value = ann.get(source)
@@ -6169,6 +6174,7 @@ class _TurnResponseBoundary:
     def __init__(self, existing_uuids: frozenset[str] | set[str]):
         self.existing_uuids = frozenset(existing_uuids)
         self.saw_current_payload = False
+        self.nonhuman_origin_active = False
 
     def classify(self, msg: Any) -> str:
         """Return ``forward``, ``current_result``, ``drop`` or ``stale_result``.
@@ -6191,7 +6197,24 @@ class _TurnResponseBoundary:
         if uid and uid in self.existing_uuids:
             return "stale_result" if isinstance(msg, ResultMessage) else "drop"
 
+        origin = sdk_lifecycle.normalize_origin(getattr(msg, "origin", None))
+        if isinstance(msg, UserMessage) and origin is not None:
+            self.nonhuman_origin_active = origin["kind"] != "human"
+            if self.nonhuman_origin_active:
+                return "background"
+        if self.nonhuman_origin_active:
+            if isinstance(msg, ResultMessage):
+                self.nonhuman_origin_active = False
+                return "background_result"
+            return "background"
+
         if isinstance(msg, ResultMessage):
+            # ``origin=None`` is the current SDK shape for an ordinary
+            # client.query(prompt); preserve that compatibility. Any explicit
+            # non-human/future origin belongs to a side delivery and cannot
+            # close the human turn currently occupying this pooled stream.
+            if origin is not None and origin["kind"] != "human":
+                return "background_result"
             if bool(getattr(msg, "is_error", False)):
                 self.saw_current_payload = True
                 return "current_result"
@@ -6679,12 +6702,12 @@ def _persist_cancelled_footer_annotation_locked(bc: 'TurnBroadcast', now_ms: int
 def _persist_cancelled_turn_snapshot_locked(bc: 'TurnBroadcast') -> bool:
     return chat_overlays._persist_cancelled_turn_snapshot_locked(bc)
 
-def _persist_completed_result_snapshot(bc: 'TurnBroadcast', result_text: str, *, terminal_at_ms: int, elapsed_s: float | None=None, memory_recall: dict | None=None) -> bool:
-    return chat_overlays._persist_completed_result_snapshot(bc, result_text, terminal_at_ms=terminal_at_ms, elapsed_s=elapsed_s, memory_recall=memory_recall)
+def _persist_completed_result_snapshot(bc: 'TurnBroadcast', result_text: str, *, terminal_at_ms: int, elapsed_s: float | None=None, memory_recall: dict | None=None, terminal_reason: str='', turn_origin: dict | None=None, model_usage: dict | None=None) -> bool:
+    return chat_overlays._persist_completed_result_snapshot(bc, result_text, terminal_at_ms=terminal_at_ms, elapsed_s=elapsed_s, memory_recall=memory_recall, terminal_reason=terminal_reason, turn_origin=turn_origin, model_usage=model_usage)
 
 
-def _persist_failed_turn_snapshot(bc: 'TurnBroadcast', error_text: str, *, terminal_at_ms: int | None=None, elapsed_s: float | None=None, memory_recall: dict | None=None, canonical_terminal_published: bool=False) -> bool:
-    return chat_overlays._persist_failed_turn_snapshot(bc, error_text, terminal_at_ms=terminal_at_ms, elapsed_s=elapsed_s, memory_recall=memory_recall, canonical_terminal_published=canonical_terminal_published)
+def _persist_failed_turn_snapshot(bc: 'TurnBroadcast', error_text: str, *, terminal_at_ms: int | None=None, elapsed_s: float | None=None, memory_recall: dict | None=None, canonical_terminal_published: bool=False, terminal_status: str='failed', terminal_reason: str='', turn_origin: dict | None=None, model_usage: dict | None=None) -> bool:
+    return chat_overlays._persist_failed_turn_snapshot(bc, error_text, terminal_at_ms=terminal_at_ms, elapsed_s=elapsed_s, memory_recall=memory_recall, canonical_terminal_published=canonical_terminal_published, terminal_status=terminal_status, terminal_reason=terminal_reason, turn_origin=turn_origin, model_usage=model_usage)
 
 def _recover_interrupted_turn_snapshot(sid: str) -> bool:
     return chat_overlays._recover_interrupted_turn_snapshot(sid)
@@ -9707,6 +9730,24 @@ def _sdk_system_error(msg: Any) -> dict | None:
 
 
 def _sdk_result_error(msg: Any) -> dict | None:
+    if isinstance(msg, ResultError):
+        structured = sdk_lifecycle.result_error_info(msg)
+        if structured is None:
+            return None
+        parts = _dedupe_error_parts([
+            *structured["errors"],
+            structured["result"],
+            structured["subtype"],
+        ])
+        status = structured["api_error_status"]
+        if not parts and status:
+            parts = [f"API error {status}"]
+        return {
+            "message": "; ".join(parts) or "SDK command failed",
+            "source": "result_exception",
+            "api_error_status": status,
+            "result_error": structured,
+        }
     if not bool(getattr(msg, "is_error", False)):
         return None
     errors = getattr(msg, "errors", None) or []
@@ -10051,6 +10092,89 @@ async def _run_sdk_command_checked(client: ClaudeSDKClient, command: str) -> Res
     return result
 
 
+async def _run_sdk_reset_checked(
+    client: ClaudeSDKClient,
+    source_sid: str,
+) -> tuple[ConversationResetMessage, ResultMessage]:
+    """Run SDK-native ``/clear`` and require its two-part handoff contract.
+
+    ``ConversationResetMessage.new_conversation_id`` is an opaque conversation
+    marker, not the SDK session id MuseLab can resume.  The immediately
+    following ``ResultMessage.session_id`` is the only authoritative new id.
+    Read through the sole pooled stream just like ``_run_sdk_command_checked``
+    so a control command cannot race the session pump.
+    """
+    reset: ConversationResetMessage | None = None
+    result: ResultMessage | None = None
+    errors: list[dict] = []
+
+    def _note(msg: Any) -> bool:
+        nonlocal reset, result
+        if isinstance(msg, ConversationResetMessage):
+            reset = msg
+            return False
+        if isinstance(msg, AssistantMessage):
+            if info := _sdk_assistant_error(msg):
+                errors.append(info)
+        elif isinstance(msg, SystemMessage):
+            if info := _sdk_system_error(msg):
+                errors.append(info)
+        if isinstance(msg, ResultMessage):
+            result = msg
+            if info := _sdk_result_error(msg):
+                errors.append(info)
+            return True
+        return False
+
+    stream = _stream_for(client)
+    if stream is not None:
+        queue = stream.attach_turn()
+        try:
+            await client.query("/clear")
+            while True:
+                message = await queue.get()
+                if message is _STREAM_EOF:
+                    break
+                if _note(message):
+                    break
+        finally:
+            stream.detach_turn(queue)
+            stream.park_unconsumed(queue)
+    else:
+        await client.query("/clear")
+        async for message in client.receive_response():
+            if _note(message):
+                break
+
+    if reset is None:
+        errors.append({
+            "message": "/clear ended without a ConversationResetMessage",
+            "source": "reset_contract",
+            "api_error_status": None,
+        })
+    if result is None:
+        errors.append({
+            "message": "/clear ended without a ResultMessage",
+            "source": "reset_contract",
+            "api_error_status": None,
+        })
+    new_sid = str(getattr(result, "session_id", "") or "")
+    try:
+        parsed = uuid.UUID(new_sid)
+    except (ValueError, AttributeError, TypeError):
+        parsed = None
+    if parsed is None or str(parsed) != new_sid.lower() or new_sid == source_sid:
+        errors.append({
+            "message": "/clear returned an invalid replacement session id",
+            "source": "reset_contract",
+            "api_error_status": None,
+        })
+    if merged := _merge_sdk_errors(errors):
+        raise _SDKCommandError(merged)
+    assert reset is not None and result is not None
+    return reset, result
+
+
 @router.get("/context-breakdown/{session_id}", dependencies=[Depends(require_token)])
 async def context_breakdown(session_id: str, model: str = "") -> dict:
     """Detailed context breakdown via SDK — answers "where did my 100K go?".
@@ -10130,6 +10254,117 @@ async def context_breakdown(session_id: str, model: str = "") -> dict:
             f"exc={type(e).__name__}\n")
         sys.stderr.flush()
         raise HTTPException(500, "context-usage probe failed") from None
+
+
+@router.post("/sessions/{sid}/native-clear", dependencies=[Depends(require_token)])
+async def native_clear_session_api(sid: str) -> dict:
+    """Reset context through the SDK while preserving the source conversation.
+
+    Claude turns ``/clear`` into a new SDK session.  MuseLab registers that
+    authoritative Result session as a normal resumable conversation and leaves
+    the source transcript untouched, so reset is no longer a destructive
+    delete disguised as a familiar CLI command.
+    """
+    source = await obs.to_thread_io(
+        "chat.session_read", sid, sess.get_session_meta, sid)
+    if source is None:
+        raise HTTPException(404, "session not found")
+    if sess.session_is_deleting(sid):
+        raise HTTPException(409, "session is being deleted")
+
+    def _assert_idle() -> None:
+        active = _active_turns.get(sid)
+        if active is not None and not active.done:
+            raise HTTPException(409, "cannot clear while a turn is active")
+        if (_sessions_with_inflight_tasks.get(sid)
+                or _session_has_live_watcher(sid)):
+            raise HTTPException(
+                409, "cannot clear while a background task owns the session")
+        overlays = sess.get_authoritative_runtime_task_overlays(sid)
+        if any(str(row.get("state") or "") == "running"
+               for row in overlays.values() if isinstance(row, dict)):
+            raise HTTPException(
+                409, "cannot clear while a background task owns the session")
+
+    _assert_idle()
+    queue_snapshot = await obs.to_thread_io(
+        "chat.queue_read", sid, sess.get_queue, sid)
+    if queue_snapshot.get("items") or queue_snapshot.get("inflight"):
+        raise HTTPException(409, "cannot clear while queued messages remain")
+
+    model = str(source.get("model") or MODEL).strip()
+    effort = _normalize_effort(source.get("effort"))
+    service_tier = str(source.get("service_tier") or "").strip()
+    permission = str(source.get("permission") or "default")
+    client_kwargs: dict[str, Any] = {
+        "effort": effort,
+        "service_tier": service_tier,
+    }
+    if permission == "plan":
+        client_kwargs["plan_return_permission"] = (
+            source.get("plan_return_permission") or "default")
+
+    timeout_s = env_int("MUSELAB_CLEAR_TIMEOUT_S", 120, min_value=1)
+    try:
+        async with asyncio.timeout(timeout_s):
+            async with _session_runtime_lock_for(sid):
+                _assert_idle()
+                latest_queue = await obs.to_thread_io(
+                    "chat.queue_read", sid, sess.get_queue, sid)
+                if latest_queue.get("items") or latest_queue.get("inflight"):
+                    raise HTTPException(
+                        409, "cannot clear while queued messages remain")
+                client = await get_client(
+                    sid, model, permission, **client_kwargs)
+                _reset, result = await _run_sdk_reset_checked(client, sid)
+                new_sid = str(result.session_id)
+                new_meta = await obs.to_thread_io(
+                    "chat.session_register",
+                    new_sid,
+                    sess.register_session,
+                    new_sid,
+                    name=str(source.get("name") or ""),
+                    model=model,
+                    permission=permission,
+                    plan_return_permission=source.get(
+                        "plan_return_permission"),
+                    auto_named=bool(source.get("auto_named", False)),
+                    effort=effort,
+                    service_tier=service_tier,
+                    thinking=source.get("thinking") is not False,
+                    activity_hidden=bool(
+                        source.get("activity_hidden", False)),
+                    runtime_profile=str(source.get("runtime_profile") or ""),
+                    cwd=source.get("cwd") or str(ROOT),
+                )
+                # The pooled process is indexed by the old id but now owns the
+                # new Claude conversation.  It must never be reused under that
+                # stale key, even if the browser keeps the old tab open.
+                _pending_runtime_rebuilds.add(sid)
+                await disconnect_client(sid)
+    except HTTPException:
+        raise
+    except asyncio.TimeoutError:
+        _pending_runtime_rebuilds.add(sid)
+        await disconnect_client(sid)
+        raise HTTPException(504, "native /clear timed out") from None
+    except _SDKCommandError as exc:
+        _pending_runtime_rebuilds.add(sid)
+        await disconnect_client(sid)
+        status = int(exc.info.get("api_error_status") or 502)
+        if status < 400 or status > 599:
+            status = 502
+        raise HTTPException(status, str(exc)) from None
+    except Exception as exc:
+        _pending_runtime_rebuilds.add(sid)
+        with suppress(Exception):
+            await disconnect_client(sid)
+        sys.stderr.write(
+            f"[chat] native /clear failed sid={sid[:8]} "
+            f"exc={type(exc).__name__}\n")
+        sys.stderr.flush()
+        raise HTTPException(500, "native /clear failed") from None
+    return {**new_meta, "session_id": new_sid, "reset_from": sid}
 
 
 @router.post("/sessions/{sid}/native-compact", dependencies=[Depends(require_token)])
@@ -11371,6 +11606,13 @@ def _error_event(err: Any, *, activity_source: str = "") -> dict:
     same shape regardless of which yield-error branch fired."""
     msg = str(err) if err is not None else ""
     payload = {"error": msg, **_classify_stream_error(msg)}
+    if isinstance(err, ResultError):
+        info = sdk_lifecycle.result_error_info(err)
+        if info is not None:
+            payload["result_error"] = info
+            payload["terminal_reason"] = info["terminal_reason"]
+            payload["status"] = sdk_lifecycle.terminal_status(
+                info["terminal_reason"], is_error=True)
     if isinstance(err, _ContextRecovered):
         # Only public session metadata and aggregate counts cross the SSE
         # boundary.  The synthetic summary, source path and original prompt
@@ -16275,6 +16517,7 @@ async def _start_turn(
 
                 replay_dropped = 0
                 deferred_result: ResultMessage | None = None
+                background_messages: list[Any] = []
 
                 async def _dispatch(msg) -> str:
                     """Classify one message and forward it to the turn."""
@@ -16297,6 +16540,9 @@ async def _start_turn(
                     decision = boundary.classify(msg)
                     if decision in ("drop", "stale_result"):
                         replay_dropped += 1
+                        return decision
+                    if decision in ("background", "background_result"):
+                        background_messages.append(msg)
                         return decision
 
                     # Keep an exact, live view of tool execution. The native
@@ -16370,6 +16616,12 @@ async def _start_turn(
                                 break
                     finally:
                         stream.detach_turn(turn_q)
+                        # Explicit non-human MessageOrigin frames belong to a
+                        # background/peer delivery, never the foreground human
+                        # turn. Preserve them in order for the task watcher or
+                        # continuation consumer instead of mixing their text,
+                        # usage and Result boundary into this reply.
+                        stream.park_messages(background_messages)
                         # The pump may have already queued lifecycle records
                         # after Result. Return every leftover to the orphan
                         # park so a background watcher can adopt them instead
@@ -16385,7 +16637,7 @@ async def _start_turn(
                         current_terminal = False
                         async for msg in client.receive_response():
                             decision = await _dispatch(msg)
-                            if decision == "stale_result":
+                            if decision in ("stale_result", "background_result"):
                                 stale_terminal = True
                             elif decision == "current_result":
                                 current_terminal = True
@@ -16858,6 +17110,12 @@ async def _start_turn(
             if broadcast.perf_query_started:
                 broadcast.perf_result_ms = obs.elapsed_ms(
                     broadcast.perf_query_started)
+            _terminal_reason = sdk_lifecycle.normalize_terminal_reason(
+                getattr(msg, "terminal_reason", None))
+            _turn_origin = sdk_lifecycle.normalize_origin(
+                getattr(msg, "origin", None))
+            _model_usage = sdk_lifecycle.normalize_model_usage(
+                getattr(msg, "model_usage", None))
             cost = getattr(msg, "total_cost_usd", None) or 0.0
             u = getattr(msg, "usage", {}) or {}
             # ResultMessage.usage is CUMULATIVE per session. Per-turn
@@ -16903,6 +17161,11 @@ async def _start_turn(
                 broadcast.cancelled
                 or interrupt_key in _pending_interrupts
                 or legacy_interrupt_key in _pending_interrupts
+            )
+            was_cancelled = (
+                sdk_lifecycle.terminal_status(
+                    _terminal_reason, cancelled=was_cancelled)
+                == "cancelled"
             )
             _pending_interrupts.discard(interrupt_key)
             _pending_interrupts.discard(legacy_interrupt_key)
@@ -17009,6 +17272,9 @@ async def _start_turn(
                         terminal_at_ms=_completed_at_ms,
                         elapsed_s=_elapsed_s,
                         memory_recall=_done_memory_receipt,
+                        terminal_reason=_terminal_reason,
+                        turn_origin=_turn_origin,
+                        model_usage=_model_usage,
                     )
                 except Exception as exc:
                     _safe_secondary_diagnostic(
@@ -17040,8 +17306,15 @@ async def _start_turn(
             _error_class = _classify_stream_error(_error_message) if _is_error else {
                 "kind": None, "cta": None, "retryable": False,
             }
-            _activity_status = ("cancelled" if was_cancelled else
-                                "failed" if _is_error else "completed")
+            _turn_status = sdk_lifecycle.terminal_status(
+                _terminal_reason,
+                is_error=_is_error,
+                cancelled=was_cancelled,
+            )
+            was_cancelled = _turn_status == "cancelled"
+            broadcast.cancelled = was_cancelled
+            _activity_status = (
+                "failed" if _turn_status == "stopped" else _turn_status)
             broadcast.perf_status = _activity_status
             broadcast.perf_error_kind = (
                 str(_error_class.get("kind") or "unknown")
@@ -17063,6 +17336,10 @@ async def _start_turn(
                         elapsed_s=_elapsed_s,
                         memory_recall=_done_memory_receipt,
                         canonical_terminal_published=True,
+                        terminal_status=_turn_status,
+                        terminal_reason=_terminal_reason,
+                        turn_origin=_turn_origin,
+                        model_usage=_model_usage,
                     )
                 except Exception as exc:
                     _safe_secondary_diagnostic(
@@ -17122,7 +17399,10 @@ async def _start_turn(
                         cost=f"${cost:.4f}",
                         model=model_to_use,
                         ts=_completed_at_ms,
-                        turn_status=_activity_status,
+                        turn_status=_turn_status,
+                        terminal_reason=_terminal_reason,
+                        turn_origin=_turn_origin,
+                        model_usage=_model_usage,
                         elapsed_s=_elapsed_s,
                         memory_recall=_done_memory_receipt,
                         file_path=sess._sidecar_path(session_id),
@@ -17152,6 +17432,10 @@ async def _start_turn(
                 "stats": _stats,
                 "cancelled": was_cancelled,
                 "is_error": _is_error,
+                "status": _turn_status,
+                "terminal_reason": _terminal_reason,
+                "origin": _turn_origin,
+                "model_usage": _model_usage,
                 "error": _error_message,
                 "kind": _error_class["kind"],
                 "cta": _error_class["cta"],
@@ -17332,7 +17616,10 @@ async def _start_turn(
                     cost=f"${cost:.4f}",
                     model=model_to_use,
                     ts=_completed_at_ms,
-                    turn_status=_activity_status,
+                    turn_status=_turn_status,
+                    terminal_reason=_terminal_reason,
+                    turn_origin=_turn_origin,
+                    model_usage=_model_usage,
                     elapsed_s=_elapsed_s,
                     memory_recall=_done_memory_receipt,
                     file_path=sess._sidecar_path(session_id),
@@ -17794,6 +18081,13 @@ async def _start_turn(
                 "activity_source": broadcast.activity_source,
             })
             source_payload = source_payload or {}
+            for field in (
+                "result_error", "terminal_reason", "status", "origin",
+                "model_usage",
+            ):
+                value = source_payload.get(field)
+                if value not in (None, "", {}, []):
+                    data[field] = value
             recovered = source_payload.get("recovered_session")
             if isinstance(recovered, dict):
                 recovered_id = str(

@@ -1275,6 +1275,9 @@ def _persist_completed_result_snapshot(
     terminal_at_ms: int,
     elapsed_s: float | None = None,
     memory_recall: dict | None = None,
+    terminal_reason: str = "",
+    turn_origin: dict | None = None,
+    model_usage: dict | None = None,
 ) -> bool:
     """Persist final prose supplied only by a successful ResultMessage.
 
@@ -1335,6 +1338,12 @@ def _persist_completed_result_snapshot(
                 message.setdefault("elapsed", duration)
             message.setdefault("model", bc.model)
             message.setdefault("turn_status", "completed")
+            if terminal_reason:
+                message.setdefault("terminal_reason", terminal_reason)
+            if turn_origin:
+                message.setdefault("turn_origin", turn_origin)
+            if model_usage:
+                message.setdefault("model_usage", model_usage)
             if memory_recall:
                 message.setdefault("memoryRecall", memory_recall)
             break
@@ -1416,6 +1425,10 @@ def _persist_failed_turn_snapshot(
     elapsed_s: float | None = None,
     memory_recall: dict | None = None,
     canonical_terminal_published: bool = False,
+    terminal_status: str = "failed",
+    terminal_reason: str = "",
+    turn_origin: dict | None = None,
+    model_usage: dict | None = None,
 ) -> bool:
     """Persist a refreshable display record for a terminal turn failure.
 
@@ -1486,7 +1499,13 @@ def _persist_failed_turn_snapshot(
             if duration >= 1:
                 message.setdefault("elapsed", duration)
             message.setdefault("model", bc.model)
-            message.setdefault("turn_status", "failed")
+            message.setdefault("turn_status", terminal_status or "failed")
+            if terminal_reason:
+                message.setdefault("terminal_reason", terminal_reason)
+            if turn_origin:
+                message.setdefault("turn_origin", turn_origin)
+            if model_usage:
+                message.setdefault("model_usage", model_usage)
             if memory_recall:
                 message.setdefault("memoryRecall", memory_recall)
             break
@@ -1497,7 +1516,7 @@ def _persist_failed_turn_snapshot(
             "sid": bc.session_id,
             "turn_id": bc.turn_id,
             "model": bc.model,
-            "terminal_status": "failed",
+            "terminal_status": terminal_status or "failed",
             "started_at_ms": int(float(bc.started_at or 0) * 1000),
             "terminal_at_ms": now_ms,
             # Retain this legacy coordinate so the existing canonical-span

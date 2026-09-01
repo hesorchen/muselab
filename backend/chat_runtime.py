@@ -359,6 +359,13 @@ class SessionStream:
                 continue
             self._orphans.append(message)
 
+    def park_messages(self, messages: Iterable[Any]) -> None:
+        """Return side-delivery messages to the background/orphan lane."""
+        for message in messages:
+            if message is STREAM_EOF:
+                continue
+            self._orphans.append(message)
+
     def attach_background(self) -> asyncio.Queue:
         queue: asyncio.Queue = asyncio.Queue()
         self._background = queue

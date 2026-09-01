@@ -2036,7 +2036,9 @@ def _merge_message_annotation(
     for key, value in fields.items():
         if value is None:
             continue
-        if sticky_cancelled and key in {"turn_status", "ts", "elapsed_s"}:
+        if sticky_cancelled and key in {
+            "turn_status", "ts", "elapsed_s", "terminal_reason",
+        }:
             continue
         cur[key] = value
 

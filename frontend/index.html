@@ -2932,6 +2932,14 @@
                           n: _backgroundTaskCount(pane)
                         })"></span>
                 </span>
+                <span class="turn-origin"
+                      x-show="turnOriginLabel(m.turn_origin)"
+                      x-text="'· ' + turnOriginLabel(m.turn_origin)"></span>
+                <span class="turn-terminal-reason"
+                      x-show="turnTerminalReasonLabel(
+                        turnFooterStatus(m, pane), m.terminal_reason)"
+                      x-text="'· ' + turnTerminalReasonLabel(
+                        turnFooterStatus(m, pane), m.terminal_reason)"></span>
                 <!-- Old transcripts may predate completion annotations.  Their
                      last record still carries mts, which is a close and stable
                      fallback instead of rendering a separator with no time. -->

@@ -694,6 +694,15 @@ def complete_turn_footer_metadata(
         memory_recall = last_value("memoryRecall")
         if memory_recall:
             tail["memoryRecall"] = memory_recall
+        terminal_reason = last_value("terminal_reason")
+        if terminal_reason:
+            tail["terminal_reason"] = terminal_reason
+        turn_origin = last_value("turn_origin")
+        if isinstance(turn_origin, dict):
+            tail["turn_origin"] = turn_origin
+        model_usage = last_value("model_usage")
+        if isinstance(model_usage, dict):
+            tail["model_usage"] = model_usage
 
 
 def broadcast_to_ui_messages(broadcast: Any) -> list[dict]:

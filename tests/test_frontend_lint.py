@@ -5123,7 +5123,7 @@ def test_turn_footer_falls_back_to_transcript_time_and_shows_model_and_state():
     assert '("model", "model")' in presentation
     assert '("turn_status", "turn_status")' in presentation
     assert "entry.setdefault(target, value)" in presentation
-    assert "turn_status=_activity_status" in chat
+    assert "turn_status=_turn_status" in chat
     assert "def _complete_turn_footer_metadata(" in chat
     assert "chat_presentation.complete_turn_footer_metadata(" in chat
     assert 'tail["turn_status"] = status' in presentation
@@ -6113,3 +6113,24 @@ def test_file_navigation_exposes_keyboard_semantics_and_distinct_actions():
     assert ".open-files-main {" in css
     assert ".tab-main {" in css
     assert '.filelist li[role="treeitem"]:focus-visible' in css
+
+
+def test_sdk_lifecycle_footer_and_native_clear_contracts_are_wired():
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+
+    assert 'turnOriginLabel(m.turn_origin)' in html
+    assert 'm.terminal_reason' in html
+    assert 'if (value === "stopped")' in app
+    assert 'terminal_reason: ""' in app
+    assert 'turn_origin: null' in app
+    assert 'turnStatus: d.status ||' in app
+    assert 'terminalReason: d.terminal_reason' in app
+    assert 'turnOrigin: d.origin' in app
+    assert '/native-clear`' in app
+    clear_start = app.index('        case "clear": {')
+    clear_end = app.index('        case "resume": {', clear_start)
+    clear_handler = app[clear_start:clear_end]
+    assert 'method: "DELETE"' not in clear_handler
+    assert '_adoptRecoveredSession' in clear_handler
+    assert '_disposeTabRuntime(oldId)' in clear_handler

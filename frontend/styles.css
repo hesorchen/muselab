@@ -4925,6 +4925,18 @@ html[data-theme="light"] .msg.user .bubble { color: white; }
 .turn-status.completed { color:var(--c-success); }
 .turn-status.failed { color:var(--c-danger); }
 .turn-status.cancelled { color:var(--c-warn); }
+.turn-status.stopped { color:var(--c-warn); }
+.turn-origin,
+.turn-terminal-reason {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 180px;
+  overflow: hidden;
+  color: var(--c-fg-3);
+  font-size: var(--fs-xs);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .turn-model {
   flex:0 1 auto;
   min-width:0;

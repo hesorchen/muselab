@@ -4358,7 +4358,35 @@ function portal() {
       if (value === "running") return this.lang === "zh" ? "运行中" : "Running";
       if (value === "completed") return this.lang === "zh" ? "已完成" : "Completed";
       if (value === "failed") return this.lang === "zh" ? "失败" : "Failed";
-      return this.lang === "zh" ? "已中断" : "Interrupted";
+      if (value === "cancelled") return this.lang === "zh" ? "已中断" : "Interrupted";
+      if (value === "stopped") return this.lang === "zh" ? "已停止" : "Stopped";
+      return this.lang === "zh" ? "已结束" : "Ended";
+    },
+    turnOriginLabel(origin) {
+      const kind = String(origin && origin.kind || "");
+      if (!kind || kind === "human") return "";
+      const labels = {
+        "task-notification": this.lang === "zh" ? "任务通知" : "Task notification",
+        "auto-continuation": this.lang === "zh" ? "自动续写" : "Auto continuation",
+        coordinator: this.lang === "zh" ? "协调器" : "Coordinator",
+        observer: this.lang === "zh" ? "观察者" : "Observer",
+        "observer-activity": this.lang === "zh" ? "观察活动" : "Observer activity",
+        peer: this.lang === "zh" ? "同伴 Agent" : "Peer agent",
+        channel: this.lang === "zh" ? "频道" : "Channel",
+        unclassified: this.lang === "zh" ? "SDK 事件" : "SDK event",
+      };
+      return labels[kind] || kind;
+    },
+    turnTerminalReasonLabel(status, reason) {
+      const state = String(status || "");
+      const value = String(reason || "");
+      if (!value || (state === "completed" && value === "completed")) return "";
+      const labels = {
+        max_turns: this.lang === "zh" ? "达到最大轮次" : "Maximum turns reached",
+        aborted_streaming: this.lang === "zh" ? "流已中断" : "Stream aborted",
+        aborted_tools: this.lang === "zh" ? "工具执行已中断" : "Tool execution aborted",
+      };
+      return labels[value] || value;
     },
     streamPhaseLabel(phase) {
       const value = String(phase || "");
@@ -17531,6 +17559,9 @@ function portal() {
             elapsed: existingTail.elapsed,
             model: existingTail.model,
             turn_status: existingTail.turn_status,
+            terminal_reason: existingTail.terminal_reason,
+            turn_origin: existingTail.turn_origin,
+            model_usage: existingTail.model_usage,
             memoryRecall: existingTail.memoryRecall,
           }
         : null;
@@ -17579,6 +17610,9 @@ function portal() {
           elapsed: matched.elapsed,
           model: matched.model,
           turn_status: matched.turn_status,
+          terminal_reason: matched.terminal_reason,
+          turn_origin: matched.turn_origin,
+          model_usage: matched.model_usage,
           memoryRecall: matched.memoryRecall,
         } : null;
         const canonicalFields = { ...canonical };
@@ -17590,6 +17624,15 @@ function portal() {
           if (liveFields.model && !matched.model) matched.model = liveFields.model;
           if (liveFields.turn_status && !matched.turn_status) {
             matched.turn_status = liveFields.turn_status;
+          }
+          if (liveFields.terminal_reason && !matched.terminal_reason) {
+            matched.terminal_reason = liveFields.terminal_reason;
+          }
+          if (liveFields.turn_origin && !matched.turn_origin) {
+            matched.turn_origin = liveFields.turn_origin;
+          }
+          if (liveFields.model_usage && !matched.model_usage) {
+            matched.model_usage = liveFields.model_usage;
           }
           if (liveFields.memoryRecall) matched.memoryRecall = liveFields.memoryRecall;
         }
@@ -17709,6 +17752,15 @@ function portal() {
         if (!canonicalTail.turn_status && liveFooter.turn_status) {
           canonicalTail.turn_status = liveFooter.turn_status;
         }
+        if (!canonicalTail.terminal_reason && liveFooter.terminal_reason) {
+          canonicalTail.terminal_reason = liveFooter.terminal_reason;
+        }
+        if (!canonicalTail.turn_origin && liveFooter.turn_origin) {
+          canonicalTail.turn_origin = liveFooter.turn_origin;
+        }
+        if (!canonicalTail.model_usage && liveFooter.model_usage) {
+          canonicalTail.model_usage = liveFooter.model_usage;
+        }
         if (!canonicalTail.memoryRecall && liveFooter.memoryRecall) {
           canonicalTail.memoryRecall = liveFooter.memoryRecall;
         }
@@ -17762,6 +17814,15 @@ function portal() {
       if (!Object.prototype.hasOwnProperty.call(m, "model")) m.model = "";
       if (!Object.prototype.hasOwnProperty.call(m, "turn_status")) {
         m.turn_status = "";
+      }
+      if (!Object.prototype.hasOwnProperty.call(m, "terminal_reason")) {
+        m.terminal_reason = "";
+      }
+      if (!Object.prototype.hasOwnProperty.call(m, "turn_origin")) {
+        m.turn_origin = null;
+      }
+      if (!Object.prototype.hasOwnProperty.call(m, "model_usage")) {
+        m.model_usage = null;
       }
       if (!Object.prototype.hasOwnProperty.call(m, "memoryRecall")) {
         m.memoryRecall = null;
@@ -28645,40 +28706,45 @@ function portal() {
         }
         case "clear": {
           if (!this.currentId) return false;
-          // /clear permanently DELETEs the session (CLI JSONL + sidecar +
-          // uploaded attachments), no trash, no undo — despite the CLI-muscle-
-          // memory expectation that /clear just resets context. Gate it behind
-          // the same danger confirm the UI delete button uses.
           const zh = this.lang === "zh";
           const ok = await this.confirm({
-            title: zh ? "删除当前会话" : "Delete current session",
+            title: zh ? "清空上下文？" : "Clear context?",
             body: zh
-              ? "这会永久删除当前会话（含上传的附件），不进垃圾桶、无法恢复，然后新建一个空会话。确定吗？"
-              : "This permanently deletes the current session (including uploaded attachments) — no trash, no undo — then starts a fresh one. Continue?",
-            danger: true,
-            okText: zh ? "删除并新建" : "Delete & start fresh",
+              ? "Claude SDK 会创建一条新的空白会话；当前会话及全部历史仍会保留，可随时从会话列表返回。"
+              : "The Claude SDK will create a new empty session. This conversation and all of its history remain available in the session list.",
+            okText: zh ? "清空上下文" : "Clear context",
           });
           if (!ok) return true;
           const oldId = this.currentId;
-          // Token via header (not query) so it never lands in access / proxy
-          // logs or browser history. /reset accepts header-or-query backend-side.
+          let response;
           try {
-            await fetch(`/api/chat/reset?session_id=${encodeURIComponent(oldId)}`,
-                         { method: "POST", headers: this.hdr() });
-            await fetch(`/api/chat/sessions/${oldId}`, { method: "DELETE", headers: this.hdr() });
+            response = await fetch(
+              `/api/chat/sessions/${encodeURIComponent(oldId)}/native-clear`,
+              { method: "POST", headers: this.hdr() },
+            );
           } catch (e) {
-            // Network failure mid-clear — surface it rather than throwing an
-            // unhandledrejection and leaving the user staring at the old session.
-            this.errToast("delete", String((e && e.message) || e));
+            this.errToast("clear", String((e && e.message) || e));
             return false;
           }
-          await this.refreshSessions();
-          // Drop the old session's tab + cached state, then open a fresh one
-          // in its slot. newSession() handles tabState + openTabIds + switch.
+          if (!response.ok) {
+            this.errToast("clear", await response.text());
+            return false;
+          }
+          let payload;
+          try { payload = await response.json(); } catch (_) { payload = null; }
+          const adopted = await this._adoptRecoveredSession(
+            payload, oldId, { focus: true });
+          if (!adopted) {
+            this.toast(zh ? "SDK 未返回新会话" : "SDK did not return a new session", "error", 3000);
+            return false;
+          }
+          // Replace the current tab without deleting its source conversation.
+          // It remains in the picker and can be reopened at any time.
+          this.openTabIds = this.openTabIds.filter(id => id !== oldId);
           this._disposeTabRuntime(oldId);
           this._deletePersistedChatDraft(oldId);
-          this.openTabIds = this.openTabIds.filter(x => x !== oldId);
-          await this.newSession();
+          this._writeChatTabStore(this.openTabIds);
+          this.savePrefs();
           this.toast(this.t("slash.cleared"), "success", 1500);
           return true;
         }
@@ -30823,6 +30889,9 @@ function portal() {
           model: modelForBubble,
           ts: null,
           elapsed: 0,
+          terminal_reason: "",
+          turn_origin: null,
+          model_usage: null,
           memoryRecall: null,
         };
         curBubble = this._appendLiveMessage(streamState, bubble);
@@ -31577,6 +31646,9 @@ function portal() {
           meta.model || streamState.streamingModel || modelForBubble || "",
         );
         const turnStatus = String(meta.turnStatus || "");
+        const terminalReason = String(meta.terminalReason || "");
+        const turnOrigin = meta.turnOrigin || null;
+        const modelUsage = meta.modelUsage || null;
         const memoryRecall = meta.memoryRecall || null;
         const _now = completedAtMs > 0 ? completedAtMs : Date.now();
         const _elapsed = durationMs > 0
@@ -31590,6 +31662,11 @@ function portal() {
           if ((!m.turn_status || m.turn_status === "running") && turnStatus) {
             m.turn_status = turnStatus;
           }
+          if (!m.terminal_reason && terminalReason) {
+            m.terminal_reason = terminalReason;
+          }
+          if (!m.turn_origin && turnOrigin) m.turn_origin = turnOrigin;
+          if (!m.model_usage && modelUsage) m.model_usage = modelUsage;
           if (!m.memoryRecall && memoryRecall) m.memoryRecall = memoryRecall;
         };
         // Tail-most muse-side message of THIS turn, used when the turn has no
@@ -31808,8 +31885,11 @@ function portal() {
           completedAtMs: d.completed_at_ms,
           durationMs: d.duration_ms,
           model: d.model,
-          turnStatus: d.cancelled
-            ? "cancelled" : (d.is_error ? "failed" : "completed"),
+          turnStatus: d.status || (d.cancelled
+            ? "cancelled" : (d.is_error ? "failed" : "completed")),
+          terminalReason: d.terminal_reason,
+          turnOrigin: d.origin,
+          modelUsage: d.model_usage,
           memoryRecall: d.memory_recall,
         });
         _stopTimer();

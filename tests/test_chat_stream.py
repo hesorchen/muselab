@@ -22,7 +22,7 @@ from claude_agent_sdk import (
     AssistantMessage, UserMessage, ResultMessage, StreamEvent,
     TextBlock, ToolUseBlock, ToolResultBlock,
     TaskStartedMessage, TaskProgressMessage, TaskNotificationMessage,
-    TaskUpdatedMessage, SystemMessage,
+    TaskUpdatedMessage, SystemMessage, ConversationResetMessage,
 )
 
 from tests.conftest import TEST_TOKEN
@@ -281,6 +281,16 @@ def test_stream_happy_path_text_tooluse_result_done(stream_env, client, monkeypa
             total_cost_usd=0.0042,
             usage={"input_tokens": 100, "output_tokens": 20},
             result="Read completed successfully.",
+            terminal_reason="completed",
+            origin={"kind": "human"},
+            model_usage={
+                "claude-sonnet-4-6": {
+                    "inputTokens": 100,
+                    "outputTokens": 20,
+                    "costUSD": 0.0042,
+                    "provider": "anthropic",
+                },
+            },
         ),
     ]
 
@@ -328,6 +338,12 @@ def test_stream_happy_path_text_tooluse_result_done(stream_env, client, monkeypa
     assert done["total_cost_usd"] == pytest.approx(0.0042)
     assert done["model"] == "claude-sonnet-4-6"
     assert done["cancelled"] is False
+    assert done["status"] == "completed"
+    assert done["terminal_reason"] == "completed"
+    assert done["origin"] == {
+        "kind": "human", "subkind": None, "task_id": None, "source": "sdk",
+    }
+    assert done["model_usage"]["claude-sonnet-4-6"]["inputTokens"] == 100
     assert done["activity_source"] == "direct"
     assert done["duration_ms"] == 1500
     assert done["assistant_uuid"] == "assistant-final-uuid"
@@ -338,6 +354,8 @@ def test_stream_happy_path_text_tooluse_result_done(stream_env, client, monkeypa
     assert annotations["assistant-final-uuid"]["ts"] == done["completed_at_ms"]
     assert annotations["assistant-final-uuid"]["elapsed_s"] == 1.5
     assert annotations["assistant-final-uuid"]["turn_status"] == "completed"
+    assert annotations["assistant-final-uuid"]["terminal_reason"] == "completed"
+    assert annotations["assistant-final-uuid"]["turn_origin"]["kind"] == "human"
 
     # Turn reservation released after completion.
     assert sid not in chat_mod._active_turns
@@ -448,6 +466,7 @@ def test_result_race_preserves_turn_owned_cancelled_state(
         subtype="success", duration_ms=900, duration_api_ms=800,
         is_error=False, num_turns=1, session_id=sid,
         total_cost_usd=0.0, usage={}, result="late result after stop",
+        terminal_reason="completed",
     )
 
     class CancellingClient(_FakeStreamClient):
@@ -472,6 +491,8 @@ def test_result_race_preserves_turn_owned_cancelled_state(
     done = next(json.loads(data) for event, data in events if event == "done")
 
     assert done["cancelled"] is True
+    assert done["status"] == "cancelled"
+    assert done["terminal_reason"] == "completed"
     assert done["is_error"] is False
     assert done["result_recovered"] is False
     assert not [data for event, data in events if event == "text"]
@@ -741,6 +762,42 @@ def test_result_only_error_persists_tail_bubble_without_relabeling_old_turn(
     assert terminal["role"] == "assistant"
     assert "context window" in terminal["text"]
     assert terminal["turn_status"] == "failed"
+
+
+def test_max_turns_uses_stopped_status_live_and_after_refresh(
+        stream_env, client, monkeypatch):
+    chat_mod = stream_env
+    sid = _make_session(client)
+    fake = _FakeStreamClient([ResultMessage(
+        subtype="error_max_turns", duration_ms=900, duration_api_ms=800,
+        is_error=True, num_turns=12, session_id=sid,
+        result="Reached the configured maximum number of turns",
+        errors=["Reached the configured maximum number of turns"],
+        terminal_reason="max_turns",
+    )])
+
+    async def fake_get_client(*_args, **_kwargs):
+        return fake
+
+    monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
+    response = client.get(
+        f"/api/chat/stream?token={TEST_TOKEN}&session_id={sid}"
+        "&prompt=continue&model=claude-sonnet-4-6",
+    )
+    done = next(
+        json.loads(data) for event, data in _parse_sse(response.text)
+        if event == "done")
+    assert done["status"] == "stopped"
+    assert done["terminal_reason"] == "max_turns"
+    assert done["is_error"] is True
+    assert done["cancelled"] is False
+
+    history = client.get(
+        f"/api/chat/sessions/{sid}", params={"tail": 80},
+        headers={"X-Auth-Token": TEST_TOKEN},
+    ).json()["messages"]
+    assert history[-1]["turn_status"] == "stopped"
+    assert history[-1]["terminal_reason"] == "max_turns"
 
 
 def test_prevent_continuation_cannot_be_overridden_by_success_result(
@@ -1580,6 +1637,52 @@ def test_run_sdk_command_checked_rejects_local_command_api_error(stream_env):
     assert fake.queries == ["/compact"]
 
 
+def test_run_sdk_reset_checked_uses_result_session_id_not_conversation_id(
+        stream_env):
+    chat_mod = stream_env
+    source_sid = "11111111-1111-4111-8111-111111111111"
+    target_sid = "22222222-2222-4222-8222-222222222222"
+    messages = [
+        ConversationResetMessage(
+            new_conversation_id="opaque-not-a-session-id",
+            uuid="reset-row",
+            session_id=source_sid,
+        ),
+        ResultMessage(
+            subtype="success", duration_ms=1, duration_api_ms=1,
+            is_error=False, num_turns=0, session_id=target_sid,
+            terminal_reason="completed",
+        ),
+    ]
+
+    fake = _FakeStreamClient(messages)
+    reset, result = asyncio.run(
+        chat_mod._run_sdk_reset_checked(fake, source_sid))
+
+    assert fake.queried == ["/clear"]
+    assert reset.new_conversation_id == "opaque-not-a-session-id"
+    assert result.session_id == target_sid
+
+
+@pytest.mark.parametrize("messages", [
+    [ResultMessage(
+        subtype="success", duration_ms=1, duration_api_ms=1,
+        is_error=False, num_turns=0,
+        session_id="22222222-2222-4222-8222-222222222222")],
+    [ConversationResetMessage(
+        new_conversation_id="opaque", uuid="reset-row",
+        session_id="11111111-1111-4111-8111-111111111111")],
+])
+def test_run_sdk_reset_checked_fails_closed_on_partial_contract(
+        stream_env, messages):
+    chat_mod = stream_env
+    with pytest.raises(chat_mod._SDKCommandError, match="without a"):
+        asyncio.run(chat_mod._run_sdk_reset_checked(
+            _FakeStreamClient(messages),
+            "11111111-1111-4111-8111-111111111111",
+        ))
+
+
 def test_turn_response_boundary_accepts_lifecycle_and_uuid_less_error(stream_env):
     chat_mod = stream_env
     boundary = chat_mod._TurnResponseBoundary({"old"})
@@ -1601,6 +1704,31 @@ def test_turn_response_boundary_accepts_lifecycle_and_uuid_less_error(stream_env
     assert boundary.classify(old_result) == "stale_result"
     assert boundary.classify(stale_system) == "drop"
     assert boundary.classify(error_result) == "current_result"
+
+
+def test_turn_response_boundary_keeps_nonhuman_delivery_out_of_human_turn(
+        stream_env):
+    chat_mod = stream_env
+    boundary = chat_mod._TurnResponseBoundary(set())
+    side_user = UserMessage(
+        content="background delivery",
+        uuid="side-user",
+        parent_tool_use_id=None,
+        origin={"kind": "auto-continuation"},
+    )
+    side_result = ResultMessage(
+        subtype="success", duration_ms=1, duration_api_ms=1,
+        is_error=False, num_turns=1, session_id="side",
+        origin={"kind": "auto-continuation"},
+    )
+    human_result = ResultMessage(
+        subtype="success", duration_ms=1, duration_api_ms=1,
+        is_error=False, num_turns=1, session_id="human", origin=None,
+    )
+
+    assert boundary.classify(side_user) == "background"
+    assert boundary.classify(side_result) == "background_result"
+    assert boundary.classify(human_result) == "current_result"
 
 
 @pytest.mark.asyncio
@@ -2289,6 +2417,7 @@ def test_watcher_opens_continuation_turn_and_unpins(stream_env):
             "ts": done["completed_at_ms"],
             "turn_status": "completed",
             "elapsed_s": 1.1,
+            "turn_id": bc.turn_id,
         }
         # All pending settled → pin released, client reclaimable.
         assert sid not in chat_mod._sessions_with_inflight_tasks
