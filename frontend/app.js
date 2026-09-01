@@ -903,6 +903,7 @@ function portal() {
                           //  has a different shape — overlapping names crash
                           //  Alpine when one side reads .show on the other's null)
     forkingSessionId: "",
+    retryingSessionId: "",
     // Per-tab runtime state. Keyed by session id and authoritative for every
     // session-panel field. Background callbacks keep their captured owner state;
     // the mounted pane resolves the current owner through activeSessionPane().
@@ -4554,6 +4555,29 @@ function portal() {
         if (message.uuid) return message.uuid;
       }
       return "";
+    },
+    retryTurnUserMessage(paneMsgs, i, pane) {
+      const arr = paneMsgs || [];
+      if (i !== arr.length - 1 || i < 0) return null;
+      const tail = arr[i];
+      if (!tail || tail.role === "user"
+          || tail.display_kind === "runtime_continuation"
+          || tail.presentation_only
+          || (pane && (pane.streaming || pane.backgroundActive || pane.compacting))) {
+        return null;
+      }
+      for (let k = i - 1; k >= 0; k -= 1) {
+        const message = arr[k];
+        if (!message || message.role !== "user") continue;
+        if (message._steeringAdjustment === true || message._turnRoot === false) {
+          continue;
+        }
+        if (!message.uuid || message._failed
+            || (message.images && message.images.length)
+            || (message.docs && message.docs.length)) return null;
+        return message;
+      }
+      return null;
     },
     // Normalize a model-emitted path into something openByPathToasted can hand
     // to /api/files/list. Handles three things the model commonly does wrong:
@@ -16408,6 +16432,106 @@ function portal() {
         return null;
       } finally {
         if (this.forkingSessionId === id) this.forkingSessionId = "";
+      }
+    },
+    async retryLastTurn(sourceId, userMessage) {
+      if (!sourceId || !userMessage || !userMessage.uuid
+          || this.workspaceSwitching || this.retryingSessionId) return null;
+      if (this._isBusy(sourceId)) {
+        this.toast(
+          this.lang === "zh"
+            ? "等当前任务和后台任务完成后再重试"
+            : "Wait for the current and background work to finish before retrying",
+          "warn", 2600,
+        );
+        return null;
+      }
+      this.retryingSessionId = sourceId;
+      const displayText = this.userVisibleText(userMessage);
+      try {
+        const response = await fetch(
+          `/api/chat/sessions/${encodeURIComponent(sourceId)}/retry-last-turn`,
+          {
+            method: "POST",
+            headers: { ...this.hdr(), "Content-Type": "application/json" },
+            body: JSON.stringify({ user_message_id: userMessage.uuid }),
+          },
+        );
+        if (!response.ok) {
+          let detail = "";
+          try {
+            const body = await response.json();
+            detail = String(body && body.detail || "");
+          } catch (_) {}
+          let message = this.lang === "zh"
+            ? "无法重试最后一轮"
+            : "Could not retry the last turn";
+          if (/attachment/i.test(detail)) {
+            message = this.lang === "zh"
+              ? "包含附件的回合需要重新附加文件后发送"
+              : "Re-attach the files before retrying an attachment turn";
+          } else if (/latest user turn/i.test(detail)) {
+            message = this.lang === "zh"
+              ? "会话历史已变化，请刷新后重试"
+              : "The session changed; refresh before retrying";
+          } else if (response.status === 409) {
+            message = this.lang === "zh"
+              ? "当前会话还未到安全的重试边界"
+              : "The session is not at a safe retry boundary yet";
+          }
+          this.toast(message, "error", 3800);
+          return null;
+        }
+
+        const payload = await response.json();
+        const newId = String(payload.id || payload.session_id || "");
+        const prompt = String(payload.prompt || "");
+        if (!newId || !prompt) throw new Error("retry response is incomplete");
+        const source = this.sessions.find(session => session.id === sourceId) || {};
+        const meta = { ...payload, id: newId, session_id: newId, active: false };
+        for (const field of [
+          "prompt", "source_session_id", "target_user_message_id", "retry_mode",
+          "retry_source_session_id", "retry_target_user_uuid",
+          "retry_resume_session_at",
+        ]) delete meta[field];
+        meta.cwd = meta.cwd || source.cwd || this.currentWorkspacePath();
+        this.sessions = [
+          meta,
+          ...this.sessions.filter(session => session.id !== newId),
+        ];
+        this._sessionsEtag = "";
+        const state = this._ensureTabState(newId);
+        state._loaded = false;
+        await this.openTab(newId);
+        const started = await this.send({
+          sessionId: newId,
+          detachedText: prompt,
+          detachedDisplayText: displayText || prompt,
+        });
+        if (started === false) {
+          this.toast(
+            this.lang === "zh"
+              ? "重试分支已创建，但发送尚未启动"
+              : "The retry branch was created, but sending did not start",
+            "warn", 4000,
+          );
+          return meta;
+        }
+        this.toast(
+          this.lang === "zh"
+            ? "已在新分支重试，原会话保持不变"
+            : "Retrying in a new branch; the source remains unchanged",
+          "success", 3000,
+        );
+        return meta;
+      } catch (_) {
+        this.toast(
+          this.lang === "zh" ? "重试最后一轮失败" : "Could not retry the last turn",
+          "error", 3800,
+        );
+        return null;
+      } finally {
+        if (this.retryingSessionId === sourceId) this.retryingSessionId = "";
       }
     },
     async menuFork(id) {

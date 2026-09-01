@@ -772,6 +772,9 @@ def register_session(sid: str, *, name: str = "", model: str = "",
                      runtime_predecessor: str = "",
                      runtime_fork_boundary_at: str | datetime = "",
                      runtime_shadow: bool = False,
+                     retry_source_session_id: str = "",
+                     retry_target_user_uuid: str = "",
+                     retry_resume_session_at: str = "",
                      cwd: str | Path | None = None) -> dict:
     """Add a session that already has a UUID (e.g. one minted by SDK
     fork_session) to the muselab index. Same shape as create_session
@@ -819,6 +822,15 @@ def register_session(sid: str, *, name: str = "", model: str = "",
         "runtime_fork_boundary_at": normalized_runtime_fork_boundary_at,
         "cwd": str(workspace),
     }
+    if retry_source_session_id:
+        # A last-turn retry is materialized lazily by the SDK on the first
+        # query against the child session.  Keep only the three UUIDs needed
+        # to reconstruct that native resume across a service restart; never
+        # persist the prompt itself in MuseLab metadata.  The fields are
+        # removed as soon as query() reaches its transport commit point.
+        meta["retry_source_session_id"] = str(retry_source_session_id)
+        meta["retry_target_user_uuid"] = str(retry_target_user_uuid)
+        meta["retry_resume_session_at"] = str(retry_resume_session_at or "")
     if forked_from:
         meta["forked_from"] = forked_from
         meta["forked_from_name"] = forked_from_name
@@ -1509,6 +1521,39 @@ def _sidecar_has_runtime_task_overlays(sid: str) -> bool:
         return False
     except OSError:
         return True
+    return False
+
+
+def clear_retry_intent(
+    sid: str,
+    *,
+    source_session_id: str = "",
+    target_user_uuid: str = "",
+) -> bool:
+    """Consume one durable SDK retry intent with optional compare-and-set.
+
+    The compare fields prevent a late query completion from clearing a newer
+    intent if the same provisional child is ever repaired concurrently.  A
+    missing intent is already consumed and therefore succeeds idempotently.
+    """
+    with _INDEX_LOCK:
+        idx = _load_index()
+        for row in idx:
+            if row.get("id") != sid:
+                continue
+            current_source = str(row.get("retry_source_session_id") or "")
+            current_target = str(row.get("retry_target_user_uuid") or "")
+            if not current_source and not current_target:
+                return True
+            if source_session_id and current_source != source_session_id:
+                return False
+            if target_user_uuid and current_target != target_user_uuid:
+                return False
+            row.pop("retry_source_session_id", None)
+            row.pop("retry_target_user_uuid", None)
+            row.pop("retry_resume_session_at", None)
+            _save_index(idx)
+            return True
     return False
 
 

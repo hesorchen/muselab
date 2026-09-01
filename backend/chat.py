@@ -1595,6 +1595,11 @@ _queue_drain_rekicks: set[str] = set()
 # freshly selected client. Mark rebuilds and consume them at the next safe SDK
 # boundary instead.
 _pending_runtime_rebuilds: set[str] = set()
+# Child session -> (source session, dropped user turn).  Presence means the
+# client's native truncating resume has connected but no user query has yet
+# crossed the SDK transport commit point.  The same UUID tuple is also stored
+# durably in sessions.py so a service restart can rebuild the intent.
+_native_retry_commits: dict[str, tuple[str, str]] = {}
 
 
 def _session_runtime_lock_for(session_id: str) -> asyncio.Lock:
@@ -3176,6 +3181,13 @@ async def _build_and_connect_client(
     side_question_runtime = (
         sess_data.get("runtime_profile") == "side_question"
     )
+    retry_source_session_id = str(
+        sess_data.get("retry_source_session_id") or "")
+    retry_target_user_uuid = str(
+        sess_data.get("retry_target_user_uuid") or "")
+    retry_resume_session_at = str(
+        sess_data.get("retry_resume_session_at") or "")
+    native_retry_resume = bool(retry_source_session_id)
     effort = _normalize_effort(effort)
     service_tier = (service_tier or "").strip()
     if effort not in _VALID_EFFORT:
@@ -3226,6 +3238,49 @@ async def _build_and_connect_client(
         sys.stderr.write(
             f"[muselab] jsonl_exists check failed "
             f"sid={obs.short_id(session_id)} exc={type(e).__name__}\n"
+        )
+    if native_retry_resume and jsonl_exists:
+        # query() may have committed the child transcript immediately before a
+        # process crash, leaving only the metadata cleanup unfinished.  The
+        # child JSONL is canonical proof that the truncating resume already
+        # materialized; resume the child normally and consume the stale intent
+        # instead of trying to fork into an existing session id again.
+        await obs.to_thread_io(
+            "chat.retry_intent_reconcile",
+            session_id,
+            sess.clear_retry_intent,
+            session_id,
+            source_session_id=retry_source_session_id,
+            target_user_uuid=retry_target_user_uuid,
+            owned=True,
+        )
+        _native_retry_commits.pop(session_id, None)
+        native_retry_resume = False
+
+    if native_retry_resume:
+        retry_values = [
+            retry_source_session_id,
+            retry_target_user_uuid,
+            *([retry_resume_session_at] if retry_resume_session_at else []),
+        ]
+        try:
+            if any(str(uuid.UUID(value)) != value.lower()
+                   for value in retry_values):
+                raise ValueError
+        except (ValueError, AttributeError, TypeError):
+            raise ValueError("invalid durable SDK retry boundary") from None
+        session_binding = {
+            "resume": retry_source_session_id,
+            "session_id": session_id,
+            "fork_session": True,
+            "resume_drops_turn": retry_target_user_uuid,
+            **({"resume_session_at": retry_resume_session_at}
+               if retry_resume_session_at else {}),
+        }
+    else:
+        session_binding = (
+            {"resume": session_id} if jsonl_exists
+            else {"session_id": session_id}
         )
     # Keep one privacy-safe line per stderr category and connected client.
     # Raw CLI output can contain prompts, paths, credentials and protocol bodies.
@@ -3307,7 +3362,7 @@ async def _build_and_connect_client(
         }],
         # Bind THIS session to muselab's chosen UUID — either as a new
         # session (session_id=) or by resuming the existing one (resume=).
-        **({"resume": session_id} if jsonl_exists else {"session_id": session_id}),
+        **session_binding,
         # Token-level streaming: SDK emits StreamEvent for each delta
         # the model produces (text / thinking). Without this, we only
         # see full blocks at the end → user waits for the whole reply
@@ -3685,6 +3740,11 @@ async def _build_and_connect_client(
                 )
                 sys.stderr.flush()
             raise
+        if native_retry_resume:
+            _native_retry_commits[session_id] = (
+                retry_source_session_id,
+                retry_target_user_uuid,
+            )
         return client
     except Exception as e:
         # Two failure modes we recover from by swapping session_id ⇔ resume:
@@ -3698,6 +3758,11 @@ async def _build_and_connect_client(
         # swapping there just spawns a second doomed CLI subprocess and
         # buries the real cause behind a misleading "already in use" retry
         # loop. Re-raise anything that isn't a genuine session conflict.
+        if native_retry_resume:
+            # Truncating resume is guarded specifically so an unexpected tail
+            # can never be discarded.  Swapping it to an ordinary create or
+            # resume would silently bypass that safety contract.
+            raise
         err_text = str(e).lower()
         _is_session_conflict = (
             "already in use" in err_text
@@ -4138,6 +4203,7 @@ async def shutdown_runtime() -> None:
     _queue_drain_retry_tasks.clear()
     _queue_drain_rekicks.clear()
     _queue_drain_locks.clear()
+    _native_retry_commits.clear()
 
     async def _join_protected_cleanup() -> None:
         if not protected_cleanup_tasks:
@@ -7023,6 +7089,7 @@ def _clear_session_runtime_state(sid: str) -> list[asyncio.Task]:
     cancelled_tasks: list[asyncio.Task] = []
     perm.clear_session_permissions(sid)
     _pending_runtime_rebuilds.discard(sid)
+    _native_retry_commits.pop(sid, None)
     runtime_lock = _session_runtime_locks.get(sid)
     if runtime_lock is not None and not runtime_lock.locked():
         _session_runtime_locks.pop(sid, None)
@@ -10794,6 +10861,147 @@ class ForkReq(BaseModel):
     title: str | None = None
     activity_hidden: bool = False
     runtime_profile: Literal["", "side_question"] = ""
+
+
+class RetryLastTurnReq(BaseModel):
+    user_message_id: str = Field(min_length=1, max_length=128)
+
+
+def _retry_prompt_text(message: Any) -> str:
+    """Return an exact text-only SDK user payload or fail closed.
+
+    Replaying a vision/document turn without its binary blocks would look
+    successful while asking a materially different question.  MuseLab keeps
+    that case unavailable until the SDK exposes a native attachment replay
+    handle; no prompt or attachment bytes are copied into retry metadata.
+    """
+    raw = getattr(message, "message", None)
+    content = raw.get("content") if isinstance(raw, dict) else None
+    if isinstance(content, str):
+        if content.strip() and not _is_cli_interrupt_message(content):
+            return content
+        raise HTTPException(409, "the last user turn has no retryable text")
+    if not isinstance(content, list) or not content:
+        raise HTTPException(409, "the last user turn has no retryable text")
+    text_parts: list[str] = []
+    for block in content:
+        if not isinstance(block, dict) or block.get("type") != "text":
+            raise HTTPException(
+                409, "attachment turns cannot be retried without re-attaching")
+        text = block.get("text")
+        if not isinstance(text, str):
+            raise HTTPException(409, "the last user turn has invalid text")
+        text_parts.append(text)
+    prompt = "".join(text_parts)
+    if not prompt.strip() or _is_cli_interrupt_message(prompt):
+        raise HTTPException(409, "the last user turn has no retryable text")
+    return prompt
+
+
+def _create_last_turn_retry_child(
+    sid: str,
+    user_message_id: str,
+) -> dict:
+    """Validate canonical tail history and persist one lazy SDK retry child."""
+    with sess.session_lifecycle_lock(sid):
+        if sess.session_is_deleting(sid):
+            raise HTTPException(404, "session not found")
+        source = sess.get_session_meta(sid)
+        if source is None:
+            raise HTTPException(404, "session not found")
+        queue = sess.get_queue(sid)
+        if (queue.get("items") or queue.get("inflight")):
+            raise HTTPException(409, "cannot retry while messages are queued")
+
+        source_model = str(source.get("model") or MODEL)
+        try:
+            messages = _get_session_msgs(sid, source_model)
+        except Exception as exc:
+            sys.stderr.write(
+                f"[chat] retry history read failed sid={sid[:8]} "
+                f"exc={type(exc).__name__}\n"
+            )
+            sys.stderr.flush()
+            raise HTTPException(409, "canonical session history is unavailable") from None
+
+        real_users = [
+            (index, item)
+            for index, item in enumerate(messages)
+            if _is_real_user_prompt(item)
+        ]
+        if not real_users:
+            raise HTTPException(409, "session has no retryable user turn")
+        target_index, target = real_users[-1]
+        if str(getattr(target, "uuid", "")) != user_message_id:
+            raise HTTPException(409, "only the latest user turn can be retried")
+        prompt = _retry_prompt_text(target)
+
+        resume_at = ""
+        if target_index > 0:
+            resume_at = str(getattr(messages[target_index - 1], "uuid", ""))
+            if _canonical_uuid_component(resume_at) is None:
+                raise HTTPException(409, "safe retry boundary is unavailable")
+
+        child_sid = str(uuid.uuid4())
+        source_name = str(source.get("name") or "会话").strip()
+        suffix = "重试" if is_chinese_locale() else "Retry"
+        try:
+            child = sess.register_session(
+                child_sid,
+                name=f"{source_name} · {suffix}",
+                model=source_model,
+                permission=_validate_permission(
+                    str(source.get("permission") or "")),
+                plan_return_permission=source.get("plan_return_permission"),
+                auto_named=False,
+                message_count=target_index,
+                turn_count=sum(
+                    1 for item in messages[:target_index]
+                    if _is_real_user_prompt(item)
+                ),
+                effort=_normalize_effort(source.get("effort")),
+                service_tier=str(source.get("service_tier") or ""),
+                thinking=source.get("thinking") is not False,
+                forked_from=sid,
+                forked_from_name=source_name,
+                forked_from_message_id=resume_at,
+                activity_hidden=bool(source.get("activity_hidden")),
+                runtime_profile=str(source.get("runtime_profile") or ""),
+                retry_source_session_id=sid if resume_at else "",
+                retry_target_user_uuid=user_message_id if resume_at else "",
+                retry_resume_session_at=resume_at,
+                cwd=source.get("cwd") or str(ROOT),
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from None
+    return {
+        **child,
+        "session_id": child_sid,
+        "source_session_id": sid,
+        "target_user_message_id": user_message_id,
+        "prompt": prompt,
+        "retry_mode": "truncate_resume" if resume_at else "fresh",
+    }
+
+
+@router.post("/sessions/{sid}/retry-last-turn",
+             dependencies=[Depends(require_token)])
+async def retry_last_turn_api(sid: str, req: RetryLastTurnReq) -> dict:
+    target = _canonical_uuid_component(req.user_message_id)
+    if target is None:
+        raise HTTPException(400, "invalid user message id")
+    if _session_runtime_busy(sid):
+        raise HTTPException(409, "cannot retry while the session is active")
+    drain = _queue_drain_tasks.get(sid)
+    if drain is not None and not drain.done():
+        raise HTTPException(409, "cannot retry while the queue is advancing")
+    return await obs.to_thread_io(
+        "chat.retry_child_create",
+        sid,
+        _create_last_turn_retry_child,
+        sid,
+        target,
+    )
 
 
 @router.post("/sessions/{sid}/fork", dependencies=[Depends(require_token)])
@@ -16594,6 +16802,32 @@ async def _start_turn(
                     finally:
                         broadcast.perf_query_write_ms = obs.elapsed_ms(
                             _query_write_started)
+                    retry_commit = _native_retry_commits.get(session_id)
+                    if retry_commit is not None:
+                        # SDK query() returning is the first point at which the
+                        # child transcript is durably owned by the native
+                        # truncating resume.  Consume the restart-safe intent
+                        # now; if the metadata write fails, the child JSONL
+                        # reconciliation in client construction repairs it.
+                        try:
+                            await obs.to_thread_io(
+                                "chat.retry_intent_commit",
+                                session_id,
+                                sess.clear_retry_intent,
+                                session_id,
+                                source_session_id=retry_commit[0],
+                                target_user_uuid=retry_commit[1],
+                                owned=True,
+                            )
+                        except Exception as exc:
+                            sys.stderr.write(
+                                f"[chat] retry intent cleanup pending "
+                                f"sid={session_id[:8]} "
+                                f"exc={type(exc).__name__}\n"
+                            )
+                            sys.stderr.flush()
+                        finally:
+                            _native_retry_commits.pop(session_id, None)
                     # query() is the transport commit point. Until it returns,
                     # the lease is still retryable; after it succeeds, consume
                     # the exact staged objects before receiving any response.

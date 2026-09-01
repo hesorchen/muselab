@@ -3032,6 +3032,20 @@
                         :aria-label="lang==='zh' ? '从这里 Fork' : 'Fork from here'">
                   <svg><use href="#i-fork"/></svg>
                 </button>
+                <button class="turn-fork-btn turn-retry-btn"
+                        type="button"
+                        x-show="retryTurnUserMessage(paneMsgs, i, pane)"
+                        :disabled="retryingSessionId === tid || isTabStreaming(tid)"
+                        @click.stop="retryLastTurn(
+                          tid, retryTurnUserMessage(paneMsgs, i, pane))"
+                        :title="lang==='zh'
+                          ? '在新分支重试最后一轮（原会话不变）'
+                          : 'Retry the last turn in a new branch (source unchanged)'"
+                        :aria-label="lang==='zh'
+                          ? '在新分支重试最后一轮'
+                          : 'Retry the last turn in a new branch'">
+                  <svg><use href="#i-refresh"/></svg>
+                </button>
               </div>
             </div>
           </template>

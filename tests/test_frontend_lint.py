@@ -6184,3 +6184,17 @@ def test_hook_execution_trace_is_safe_separate_and_visible_per_turn():
     assert "当前会话最近执行记录" in html
     assert "Raw commands, paths, stdout/stderr" in traces
     assert '"output"' not in traces.split("def observe", 1)[1]
+
+
+def test_last_turn_retry_uses_guarded_sdk_branch_and_keeps_source():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    backend = (BACKEND / "chat.py").read_text(encoding="utf-8")
+
+    assert "/retry-last-turn`" in app
+    assert "retryTurnUserMessage(paneMsgs, i, pane)" in html
+    assert "原会话不变" in html
+    assert '"resume_drops_turn": retry_target_user_uuid' in backend
+    assert '"resume_session_at": retry_resume_session_at' in backend
+    assert "only the latest user turn can be retried" in backend
+    assert "attachment turns cannot be retried" in backend
