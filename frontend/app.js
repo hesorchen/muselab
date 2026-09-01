@@ -8294,6 +8294,7 @@ function portal() {
         _reconcileTargetUpdated: 0,
         _reconcileRetryN: 0,
         _pendingExternalUpdate: false,
+        _scheduledHistoryRevision: "",
         // A Result boundary may race with the next stream taking ownership of
         // the same pane. Retain the latest completion check until an owner-free
         // moment instead of silently consuming the reconciliation request.
@@ -11250,6 +11251,12 @@ function portal() {
         try { state = JSON.parse(ev.data) || {}; } catch (_) {}
         void this._handleChatMuxSessionState(state);
       });
+      source.addEventListener("scheduled_history", ev => {
+        if (this._chatMuxSource !== source) return;
+        let payload = {};
+        try { payload = JSON.parse(ev.data) || {}; } catch (_) {}
+        this._handleScheduledHistoryUpdate(payload);
+      });
       for (const type of CHAT_MUX_STREAM_EVENTS) {
         source.addEventListener(type, ev => {
           if (this._chatMuxSource !== source) return;
@@ -11285,6 +11292,25 @@ function portal() {
       // The per-session reducers retain logical ownership while the one native
       // transport reconnects. In particular, do not synthesize `error`/`done`.
       this._scheduleChatMuxReconnect();
+    },
+    _handleScheduledHistoryUpdate(payload) {
+      const sid = String(payload && payload.session_id || "");
+      if (!sid) return;
+      const st = this._ensureTabState(sid);
+      const revision = String(payload.revision || "");
+      if (revision && st._scheduledHistoryRevision === revision) return;
+      if (revision) st._scheduledHistoryRevision = revision;
+
+      // The SDK has already committed the autonomous turn to canonical JSONL.
+      // Only request the existing quiet history reconciliation here: the root
+      // mux event deliberately carries no prompt or assistant content.
+      st._pendingExternalUpdate = true;
+      if (sid !== this.currentId) st.unread = true;
+      if (st.streaming || st.es) return;
+      void this._requestSessionSync(sid, "history_revision", {
+        targetUpdated: 0,
+        delayMs: 0,
+      });
     },
     _queueChatMuxEvent(sid, type, data) {
       let pending = this._chatMuxPendingEvents.get(sid);

@@ -1679,6 +1679,20 @@ _SDK_CRON_LIST_LINE = re.compile(
     r"^([A-Za-z0-9_-]{1,128})\s+[—-]\s+", re.MULTILINE,
 )
 _SDK_CRON_PROMPT_MAX = 4000
+_SDK_CRON_HISTORY_POLL_S = 0.5
+_SDK_CRON_HISTORY_TAIL_BYTES = 2 * 1024 * 1024
+_SDK_CRON_HISTORY_READ_BYTES = 2 * 1024 * 1024
+
+
+@dataclass
+class _ScheduledHistoryCursor:
+    """Per-mux cursor over one SDK-owned session transcript."""
+
+    file_identity: tuple[int, int] | None = None
+    offset: int = 0
+    partial: bytes = b""
+    pending: bool = False
+    initialized: bool = False
 
 
 @dataclass
@@ -19399,6 +19413,8 @@ async def _subscribe_multiplex(
     completed: set[tuple[str, str]] = set()
     state_fingerprints: dict[str, str] = {}
     state_payloads: dict[str, dict] = {}
+    scheduled_history_cursors: dict[str, _ScheduledHistoryCursor] = {}
+    last_scheduled_history_poll = 0.0
     # Checkpoints are one-shot reconnect intents for this root SSE handshake.
     # Copy them so consumption is private to the subscription lifecycle.
     pending_checkpoints = {
@@ -19444,12 +19460,31 @@ async def _subscribe_multiplex(
             _pump_child(session_id, broadcast, last_event_seq))
 
     async def _reconcile() -> None:
+        nonlocal last_scheduled_history_poll
         for key, task in list(children.items()):
             if task.done():
                 children.pop(key, None)
                 completed.add(key)
                 with suppress(asyncio.CancelledError, Exception):
                     task.result()
+
+        now = time.monotonic()
+        if now - last_scheduled_history_poll >= _SDK_CRON_HISTORY_POLL_S:
+            last_scheduled_history_poll = now
+            with _sdk_cron_state_lock:
+                has_scheduled_history = bool(_sdk_cron_jobs)
+            updates = (
+                await asyncio.to_thread(
+                    _collect_sdk_scheduled_history_updates,
+                    scheduled_history_cursors,
+                )
+                if has_scheduled_history or scheduled_history_cursors else []
+            )
+            for update in updates:
+                await output.put({
+                    "event": "scheduled_history",
+                    "data": json.dumps(update, ensure_ascii=False),
+                })
 
         candidate_ids = set(_active_turns)
         candidate_ids.update(_sessions_with_inflight_tasks)
@@ -20090,6 +20125,168 @@ def _safe_sdk_cron_prompt(
         for char in value[:_SDK_CRON_PROMPT_MAX]
     )
     return cleaned, digest, len(value) > _SDK_CRON_PROMPT_MAX
+
+
+def _jsonl_scheduled_prompt_digest(record: Any) -> str:
+    """Fingerprint a native Cron trigger without retaining its text."""
+    if not isinstance(record, dict) \
+            or record.get("type") != "user" \
+            or record.get("isMeta") is not True:
+        return ""
+    message = record.get("message")
+    if not isinstance(message, dict):
+        return ""
+    content = message.get("content")
+    if isinstance(content, str):
+        text = content
+    elif isinstance(content, list):
+        parts = [
+            str(item.get("text") or "")
+            for item in content
+            if isinstance(item, dict) and item.get("type") == "text"
+        ]
+        text = "\n".join(part for part in parts if part)
+    else:
+        return ""
+    if not text:
+        return ""
+    try:
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()
+    except UnicodeEncodeError:
+        return ""
+
+
+def _jsonl_is_terminal_assistant(record: Any) -> bool:
+    if not isinstance(record, dict) or record.get("type") != "assistant":
+        return False
+    message = record.get("message")
+    return bool(
+        isinstance(message, dict)
+        and message.get("role") == "assistant"
+        and message.get("stop_reason") == "end_turn"
+    )
+
+
+def _scan_sdk_scheduled_history(
+    session_id: str,
+    prompt_digests: frozenset[str],
+    cursor: _ScheduledHistoryCursor,
+) -> list[dict[str, str]]:
+    """Read only appended JSONL and report completed native Cron turns.
+
+    Claude CLI 2.1.252 writes autonomous Cron turns to canonical JSONL but
+    does not always surface them through ``receive_messages()``. This follower
+    never schedules work and never returns prompt/result bodies: it recognizes
+    an ``isMeta`` trigger by the already-registered prompt hash, then emits an
+    opaque revision after the following terminal assistant record.
+    """
+    if not prompt_digests:
+        return []
+    path = _find_session_jsonl(session_id)
+    if path is None:
+        return []
+    path = Path(path)
+    try:
+        stat = path.stat()
+    except OSError:
+        return []
+
+    identity = (int(stat.st_dev), int(stat.st_ino))
+    initial = (
+        not cursor.initialized
+        or cursor.file_identity != identity
+        or stat.st_size < cursor.offset
+    )
+    if initial:
+        start = max(0, stat.st_size - _SDK_CRON_HISTORY_TAIL_BYTES)
+        cursor.file_identity = identity
+        cursor.offset = start
+        cursor.partial = b""
+        cursor.pending = False
+        cursor.initialized = True
+    else:
+        start = cursor.offset
+        if stat.st_size <= start:
+            return []
+
+    read_size = min(
+        stat.st_size - start,
+        _SDK_CRON_HISTORY_TAIL_BYTES if initial
+        else _SDK_CRON_HISTORY_READ_BYTES,
+    )
+    if read_size <= 0:
+        return []
+    try:
+        with path.open("rb") as handle:
+            aligned = True
+            if initial and start > 0:
+                handle.seek(start - 1)
+                aligned = handle.read(1) == b"\n"
+            handle.seek(start)
+            chunk = handle.read(read_size)
+    except OSError:
+        return []
+    if not chunk:
+        return []
+    cursor.offset = start + len(chunk)
+
+    if initial and not aligned:
+        boundary = chunk.find(b"\n")
+        if boundary < 0:
+            return []
+        chunk = chunk[boundary + 1:]
+    data = chunk if initial else cursor.partial + chunk
+    lines = data.split(b"\n")
+    cursor.partial = lines.pop() if lines else b""
+
+    updates: list[dict[str, str]] = []
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except (TypeError, ValueError):
+            continue
+        digest = _jsonl_scheduled_prompt_digest(record)
+        if digest and digest in prompt_digests:
+            cursor.pending = True
+            continue
+        if cursor.pending and _jsonl_is_terminal_assistant(record):
+            cursor.pending = False
+            if not initial:
+                updates.append({
+                    "session_id": session_id,
+                    "revision": hashlib.sha256(line).hexdigest()[:20],
+                })
+    return updates
+
+
+def _collect_sdk_scheduled_history_updates(
+    cursors: dict[str, _ScheduledHistoryCursor],
+) -> list[dict[str, str]]:
+    """Batch one privacy-safe transcript pass for a multiplex connection."""
+    with _sdk_cron_state_lock:
+        scheduled = {
+            session_id: frozenset(
+                str(job.get("prompt_sha256") or "")
+                for job in jobs.values()
+                if job.get("prompt_sha256")
+            )
+            for session_id, jobs in _sdk_cron_jobs.items()
+        }
+    for stale_id in set(cursors) - set(scheduled):
+        cursors.pop(stale_id, None)
+
+    latest: dict[str, dict[str, str]] = {}
+    for session_id, prompt_digests in scheduled.items():
+        cursor = cursors.setdefault(session_id, _ScheduledHistoryCursor())
+        for update in _scan_sdk_scheduled_history(
+            session_id, prompt_digests, cursor,
+        ):
+            # One canonical reload installs the whole suffix, so coalesce
+            # multiple completions discovered in the same pass per session.
+            latest[session_id] = update
+    return list(latest.values())
 
 
 def _safe_sdk_cron_call(name: str, raw_input: Any) -> dict[str, Any]:

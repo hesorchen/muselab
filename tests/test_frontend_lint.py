@@ -1290,6 +1290,25 @@ def test_session_synchronization_has_one_per_tab_coordinator():
     assert "setInterval(tick, 2000)" not in app
 
 
+def test_mux_native_cron_history_uses_quiet_canonical_reconciliation():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    mux_start = app.index("async _openChatMux()")
+    mux_end = app.index("\n    _handleChatMuxDisconnect", mux_start)
+    mux = app[mux_start:mux_end]
+    handler_start = app.index("_handleScheduledHistoryUpdate(payload)")
+    handler_end = app.index("\n    _queueChatMuxEvent", handler_start)
+    handler = app[handler_start:handler_end]
+
+    assert 'source.addEventListener("scheduled_history"' in mux
+    assert "this._handleScheduledHistoryUpdate(payload)" in mux
+    assert "st._pendingExternalUpdate = true" in handler
+    assert "if (sid !== this.currentId) st.unread = true" in handler
+    assert 'this._requestSessionSync(sid, "history_revision"' in handler
+    assert "targetUpdated: 0" in handler
+    assert "payload.prompt" not in handler
+    assert "payload.content" not in handler
+
+
 def test_session_sync_deadlines_and_activity_transport_backoff_are_bounded():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
     fetch_start = app.index("    async _fetchWithDeadline(")

@@ -7087,6 +7087,122 @@ def test_native_cron_tools_update_live_schedule_state(stream_env):
         broadcast.close()
 
 
+def test_native_cron_jsonl_completion_notifies_mux_without_content(
+        stream_env, monkeypatch, tmp_path):
+    chat_mod = stream_env
+    sid = "sid-native-cron-jsonl"
+    prompt = "检查服务并只回复状态正常"
+    safe_prompt = chat_mod._safe_sdk_cron_prompt(prompt)
+    transcript = tmp_path / f"{sid}.jsonl"
+    transcript.write_text("", encoding="utf-8")
+    monkeypatch.setattr(
+        chat_mod, "_find_session_jsonl", lambda candidate: (
+            transcript if candidate == sid else None
+        ),
+    )
+    chat_mod._sdk_cron_jobs[sid] = {
+        "job-jsonl": {
+            "prompt_sha256": safe_prompt[1],
+            "recurring": True,
+        },
+    }
+    cursors = {}
+
+    def append(*records):
+        with transcript.open("a", encoding="utf-8") as handle:
+            for record in records:
+                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    try:
+        assert chat_mod._collect_sdk_scheduled_history_updates(cursors) == []
+        append(
+            {
+                "type": "user",
+                "uuid": "scheduled-trigger",
+                "isMeta": True,
+                "message": {"role": "user", "content": prompt},
+            },
+            {
+                "type": "assistant",
+                "uuid": "scheduled-result",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "状态正常"}],
+                    "stop_reason": "end_turn",
+                },
+            },
+        )
+        updates = chat_mod._collect_sdk_scheduled_history_updates(cursors)
+        assert len(updates) == 1
+        assert updates[0]["session_id"] == sid
+        assert len(updates[0]["revision"]) == 20
+        assert set(updates[0]) == {"session_id", "revision"}
+        assert prompt not in json.dumps(updates[0], ensure_ascii=False)
+        assert "状态正常" not in json.dumps(updates[0], ensure_ascii=False)
+
+        append(
+            {
+                "type": "user",
+                "uuid": "human-user",
+                "isMeta": False,
+                "message": {"role": "user", "content": prompt},
+            },
+            {
+                "type": "assistant",
+                "uuid": "human-result",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "普通回复"}],
+                    "stop_reason": "end_turn",
+                },
+            },
+        )
+        assert chat_mod._collect_sdk_scheduled_history_updates(cursors) == []
+    finally:
+        chat_mod._sdk_cron_jobs.pop(sid, None)
+
+
+def test_native_cron_jsonl_follower_keeps_inflight_trigger_on_attach(
+        stream_env, monkeypatch, tmp_path):
+    chat_mod = stream_env
+    sid = "sid-native-cron-jsonl-inflight"
+    prompt = "运行定时检查"
+    safe_prompt = chat_mod._safe_sdk_cron_prompt(prompt)
+    transcript = tmp_path / f"{sid}.jsonl"
+    transcript.write_text(json.dumps({
+        "type": "user",
+        "uuid": "scheduled-trigger-before-mux",
+        "isMeta": True,
+        "message": {"role": "user", "content": prompt},
+    }, ensure_ascii=False) + "\n", encoding="utf-8")
+    monkeypatch.setattr(
+        chat_mod, "_find_session_jsonl", lambda candidate: (
+            transcript if candidate == sid else None
+        ),
+    )
+    chat_mod._sdk_cron_jobs[sid] = {
+        "job-inflight": {"prompt_sha256": safe_prompt[1]},
+    }
+    cursors = {}
+
+    try:
+        assert chat_mod._collect_sdk_scheduled_history_updates(cursors) == []
+        with transcript.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps({
+                "type": "assistant",
+                "uuid": "scheduled-result-after-mux",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "完成"}],
+                    "stop_reason": "end_turn",
+                },
+            }, ensure_ascii=False) + "\n")
+        updates = chat_mod._collect_sdk_scheduled_history_updates(cursors)
+        assert [update["session_id"] for update in updates] == [sid]
+    finally:
+        chat_mod._sdk_cron_jobs.pop(sid, None)
+
+
 def test_sdk_scheduled_trigger_is_broadcast_live_without_refresh(
         stream_env, monkeypatch):
     chat_mod = stream_env
