@@ -1158,8 +1158,8 @@ def test_session_rename_patches_activity_without_reloading_chat():
     optimistic = helper[optimistic_start:]
     assert optimistic.index("this._applyRenamedSession(sid, name)") < optimistic.index("await fetch(")
     assert "if (current && current.name === name)" in optimistic
-    assert "this._applyRenamedSession(sid, previousName)" in optimistic
-    assert app.count("this._applyRenamedSession(") == 2
+    assert "this._applyRenamedSession(canonicalSid, previousName)" in optimistic
+    assert app.count("this._applyRenamedSession(") == 3
     assert 'this._renameSessionOptimistically(cur.id, name, cur.name, true, "modal")' in modal
     assert 'this._renameSessionOptimistically(id, name, cur.name, true, "tab")' in tab
     assert 'this._renameSessionOptimistically(sid, name, cur.name, false, "picker")' in picker
@@ -1170,6 +1170,8 @@ def test_session_rename_patches_activity_without_reloading_chat():
     assert "renamePerf.request_ms" in optimistic
     assert 'renamePerf.status = "rollback"' in optimistic
     assert "this._reportSessionRenamePerf(renamePerf)" in optimistic
+    assert "this._sessionNameExpected[sid] = expectedName" in optimistic
+    assert "this._applySessionRedirects({ [sid]: responseSid })" in optimistic
     assert "refreshSessions" not in modal
     assert "refreshSessions" not in tab
     assert "loadSession" not in helper

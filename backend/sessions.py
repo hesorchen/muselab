@@ -554,10 +554,19 @@ def _merge_sdk_with_index(
 ) -> dict:
     """Build a muselab-shaped session dict from a SDKSessionInfo + the
     muselab index entry (may be empty for sessions created outside muselab)."""
-    name = (info.custom_title
-             or m.get("name")
-             or title_from_message(info.first_prompt or "")
-             or _default_session_name())
+    # An explicit MuseLab rename is written to both stores, but the SDK session
+    # list is cached independently.  Prefer the local manual title while that
+    # cache still contains the previous customTitle/aiTitle; auto-generated
+    # local fallbacks continue to yield to the SDK-native title.
+    indexed_name = str(m.get("name") or "")
+    explicit_indexed_name = (
+        indexed_name if m.get("auto_named") is False else ""
+    )
+    name = (explicit_indexed_name
+            or info.custom_title
+            or indexed_name
+            or title_from_message(info.first_prompt or "")
+            or _default_session_name())
     return {
         "id": info.session_id,
         "name": name,

@@ -158,6 +158,47 @@ def test_session_rename_updates_activity_ledger(chat_mod, client, monkeypatch):
     assert "After rename" not in repr(perf_events)
 
 
+def test_session_rename_follows_hidden_runtime_successor(
+    chat_mod, client, monkeypatch,
+):
+    from backend import activity as activity_module
+
+    source_sid = "11111111-2222-4333-8444-555555555555"
+    child_sid = "22222222-3333-4444-8555-666666666666"
+    chat_mod.sess.register_session(source_sid, name="source title")
+    chat_mod.sess.register_session(child_sid, name="source title")
+    assert chat_mod.sess.link_runtime_successor(source_sid, child_sid)
+    sdk_calls = []
+    activity_calls = []
+    monkeypatch.setattr(
+        chat_mod,
+        "sdk_rename_session",
+        lambda sid, name, **_kwargs: sdk_calls.append((sid, name)),
+    )
+    monkeypatch.setattr(
+        activity_module.activity,
+        "rename_session",
+        lambda sid, name: activity_calls.append((sid, name)),
+    )
+
+    response = client.patch(
+        f"/api/chat/sessions/{source_sid}",
+        headers={"X-Auth-Token": TEST_TOKEN, "Content-Type": "application/json"},
+        json={"name": "canonical title"},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "ok": True,
+        "session_id": child_sid,
+        "redirected_from": source_sid,
+    }
+    assert chat_mod.sess.get_session_meta(child_sid)["name"] == "canonical title"
+    assert chat_mod.sess.get_session_meta(source_sid)["name"] == "source title"
+    assert sdk_calls == [(child_sid, "canonical title")]
+    assert activity_calls == [(child_sid, "canonical title")]
+
+
 def test_session_effort_and_fast_patch_persist_and_rebuild(
     chat_mod, client, monkeypatch,
 ):

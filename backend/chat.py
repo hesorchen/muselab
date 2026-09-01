@@ -8808,6 +8808,15 @@ class SessionPatchReq(BaseModel):
 
 @router.patch("/sessions/{sid}", dependencies=[Depends(require_token)])
 async def patch_session_api(sid: str, req: SessionPatchReq) -> dict:
+    requested_sid = sid
+    redirects = await obs.to_thread_io(
+        "chat.session_redirect",
+        sid,
+        sess.runtime_successor_redirects,
+        (sid,),
+        file_path=sess.INDEX,
+    )
+    sid = redirects.get(sid, sid)
     # Model, effort, and service tier form one runtime contract. Validate the
     # complete *target* tuple before mutating any field in this request; this
     # makes a rejected cross-model combination side-effect free.
@@ -9037,7 +9046,11 @@ async def patch_session_api(sid: str, req: SessionPatchReq) -> dict:
         ok = True
     if not ok:
         raise HTTPException(404, "session not found or no changes")
-    return {"ok": True}
+    return {
+        "ok": True,
+        "session_id": sid,
+        "redirected_from": requested_sid if sid != requested_sid else "",
+    }
 
 
 # ====== usage / reset ======

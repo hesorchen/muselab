@@ -1279,6 +1279,24 @@ def _sdk_session_info(sid: str, *, title: str | None = None):
     )
 
 
+def test_explicit_local_rename_beats_stale_sdk_title_cache(app_module):
+    from backend import sessions as sess
+
+    sid = "11111111-2222-4333-8444-555555555555"
+    merged = sess._merge_sdk_with_index(
+        _sdk_session_info(sid, title="stale sdk title"),
+        {"name": "manual title", "auto_named": False},
+    )
+    automatic = sess._merge_sdk_with_index(
+        _sdk_session_info(sid, title="fresh sdk title"),
+        {"name": "local fallback", "auto_named": True},
+    )
+
+    assert merged["name"] == "manual title"
+    assert merged["auto_named"] is False
+    assert automatic["name"] == "fresh sdk title"
+
+
 def _wait_for_list_refresh(sess, timeout: float = 2.0) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:

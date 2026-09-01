@@ -443,9 +443,28 @@ def test_inline_rename_via_dblclick(page: Page, backend_url, auth_token):
 
     inp = page.locator(f"{SEL_TAB_ACTIVE} {SEL_TAB_RENAME}")
     expect(inp).to_be_visible()
-    inp.fill("e2e-renamed")
-    inp.press("Enter")
-    expect(active_name).to_contain_text("e2e-renamed")
+    renamed = "e2e-renamed-after-refresh"
+    inp.fill(renamed)
+    with page.expect_response(
+        lambda response: response.request.method == "PATCH"
+        and "/api/chat/sessions/" in response.url,
+    ) as response_info:
+        inp.press("Enter")
+    assert response_info.value.ok
+    expect(active_name).to_contain_text(renamed)
+
+    page.evaluate(
+        "document.querySelector('#app')._x_dataStack[0]._setChatMuxUnsupported()")
+    page.reload(wait_until="domcontentloaded")
+    page.wait_for_function(
+        """([name]) => {
+          const app = document.querySelector('#app')?._x_dataStack?.[0];
+          const current = app && app.sessions.find(row => row.id === app.currentId);
+          return app && app._sessionsInitialized && current?.name === name;
+        }""",
+        arg=[renamed],
+    )
+    expect(page.locator(f"{SEL_TAB_ACTIVE} {SEL_TAB_NAME}")).to_contain_text(renamed)
 
 
 def test_browser_title_reflects_session(page: Page, backend_url, auth_token):

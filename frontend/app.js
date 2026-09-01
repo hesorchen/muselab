@@ -887,6 +887,8 @@ function portal() {
     // server returns redirects for stale ids restored from localStorage so a
     // reload repairs the strip instead of silently dropping the hidden source.
     _sessionRedirects: {},
+    _sessionNameExpected: {},
+    _sessionRenameSeq: 0,
     _lastNewSessionAt: 0,
     _lastNewSessionMeta: null,
     NEW_SESSION_TOUCH_DEDUPE_MS: 500,
@@ -6872,6 +6874,14 @@ function portal() {
           sourceSid, targetSid, targetMeta || null,
         );
         this._migrateRedirectedChatDraft(sourceSid, targetSid, targetState);
+        const expected = this._sessionNameExpected[sourceSid];
+        if (expected) {
+          const current = this._sessionNameExpected[targetSid];
+          if (!current || Number(expected.seq) >= Number(current.seq)) {
+            this._sessionNameExpected[targetSid] = expected;
+          }
+          delete this._sessionNameExpected[sourceSid];
+        }
       }
 
       this.openTabIds = this._normalizeOpenTabIds(previousOpen.map(rewrite));
@@ -11987,6 +11997,21 @@ function portal() {
     async _syncSessionListQuiet() {
       return await this._pullSessionList(true);
     },
+    _retainExpectedSessionName(meta) {
+      const expected = meta && this._sessionNameExpected[meta.id];
+      if (!expected) return meta;
+      if (Date.now() - Number(expected.at || 0)
+          > this.SESSION_SETTING_EXPECTED_TTL_MS) {
+        delete this._sessionNameExpected[meta.id];
+        return meta;
+      }
+      if (String(meta.name || "") === expected.value) {
+        expected.echoed = true;
+        if (expected.settled) delete this._sessionNameExpected[meta.id];
+        return meta;
+      }
+      return { ...meta, name: expected.value, auto_named: false };
+    },
     _retainExpectedSessionSettings(meta) {
       const st = meta && this.tabState && this.tabState[meta.id];
       if (!st) return meta;
@@ -12113,6 +12138,7 @@ function portal() {
       });
       if (_handoffRows.length) next = [..._handoffRows, ...next];
       next = next
+        .map(meta => this._retainExpectedSessionName(meta))
         .map(meta => this._retainExpectedSessionSettings(meta))
         .map(meta => this._retainExpectedSessionActivity(meta));
       // Keep every warm tab's primitive mirror aligned even when the rendered
@@ -16676,6 +16702,17 @@ function portal() {
       // ledger, which can take seconds. The local session index is authoritative
       // for this view, so update immediately and let persistence finish without
       // making the tab label feel blocked on unrelated disk work.
+      sid = this._resolveSessionRedirectId(sid);
+      const renameSeq = ++this._sessionRenameSeq;
+      const expectedName = {
+        seq: renameSeq,
+        value: name,
+        previousName,
+        at: Date.now(),
+        echoed: false,
+        settled: false,
+      };
+      this._sessionNameExpected[sid] = expectedName;
       const perfNow = (typeof performance !== "undefined" && performance.now)
         ? () => performance.now() : () => Date.now();
       const started = perfNow();
@@ -16708,26 +16745,45 @@ function portal() {
       let response = null;
       const requestStarted = perfNow();
       try {
-        response = await fetch("/api/chat/sessions/" + sid, {
+        response = await fetch(
+          "/api/chat/sessions/" + encodeURIComponent(sid), {
           method: "PATCH",
           headers: { ...this.hdr(), "Content-Type": "application/json" },
           body: JSON.stringify({ name }),
-        });
+          },
+        );
       } catch (_) { /* handled by the rollback below */ }
       renamePerf.request_ms = Math.round(perfNow() - requestStarted);
       const ok = !!(response && response.ok);
       if (!ok) {
+        const canonicalSid = this._resolveSessionRedirectId(sid);
+        if (this._sessionNameExpected[canonicalSid] === expectedName) {
+          delete this._sessionNameExpected[canonicalSid];
+        }
         // Do not undo a newer rename that completed while this request was in
         // flight. Roll back only when our optimistic value still owns the row.
-        const current = this.sessions.find(row => row.id === sid);
+        const current = this.sessions.find(row => row.id === canonicalSid);
         if (current && current.name === name) {
-          this._applyRenamedSession(sid, previousName);
+          this._applyRenamedSession(canonicalSid, previousName);
           renamePerf.status = "rollback";
         }
         this.toast(this.lang === "zh" ? "重命名失败" : "Rename failed", "error", 3000);
       } else {
+        let payload = null;
+        try { payload = await response.json(); } catch (_) { payload = null; }
+        const responseSid = String(payload && payload.session_id || "");
+        if (responseSid && responseSid !== sid) {
+          this._applySessionRedirects({ [sid]: responseSid });
+          sid = responseSid;
+          this._applyRenamedSession(sid, name);
+        }
+        const owned = this._sessionNameExpected[sid] === expectedName;
+        if (owned) {
+          expectedName.settled = true;
+          if (expectedName.echoed) delete this._sessionNameExpected[sid];
+        }
         renamePerf.status = "ok";
-        if (announce) this.toast(this.t("toast.renamed"), "success");
+        if (announce && owned) this.toast(this.t("toast.renamed"), "success");
       }
       // Hidden/background tabs may suspend requestAnimationFrame indefinitely.
       // Bound diagnostics so observing first paint can never hold this action open.
