@@ -10,8 +10,8 @@ request to the user's own Codex/OpenAI backend and translates the response back.
 muselab does **not** store Codex OAuth credentials and does **not** call
 OpenAI-native APIs directly.
 
-The compatibility baseline tested on 2026-08-30 is CLIProxyAPI `v7.2.145`,
-Claude Agent SDK `0.2.148`, and its bundled Claude CLI `2.1.251`. This baseline
+The compatibility baseline tested on 2026-09-01 is CLIProxyAPI `v7.2.145`,
+Claude Agent SDK `0.2.149`, and its bundled Claude CLI `2.1.252`. This baseline
 includes fixes relevant to this bridge for Codex cache-token accounting,
 reasoning effort, tool-call replay, and Anthropic response translation.
 
