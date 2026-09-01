@@ -384,6 +384,21 @@
         </button>
         <input type="file" x-ref="upload" multiple style="display:none" @change="upload($event)" />
       </header>
+      <div class="file-upload-progress" x-show="fileUploadProgress.visible"
+           x-transition.opacity.duration.150ms x-cloak aria-live="polite">
+        <div class="file-upload-progress-meta">
+          <span x-text="fileUploadProgressLabel()"></span>
+          <strong x-show="fileUploadProgress.known"
+                  x-text="Math.round(fileUploadProgress.percent || 0) + '%'">0%</strong>
+        </div>
+        <div class="file-upload-progress-track"
+             :class="{ indeterminate: !fileUploadProgress.known }"
+             role="progressbar" aria-valuemin="0" aria-valuemax="100"
+             :aria-valuenow="fileUploadProgress.known ? Math.round(fileUploadProgress.percent || 0) : null"
+             :aria-valuetext="fileUploadProgressLabel()">
+          <span :style="{ width: (fileUploadProgress.known ? fileUploadProgress.percent : 34) + '%' }"></span>
+        </div>
+      </div>
       <div class="searchbar">
         <div class="searchbar-wrap">
           <span class="searchbar-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg></span>

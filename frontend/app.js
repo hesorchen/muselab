@@ -460,6 +460,15 @@ function portal() {
     _fileSearchSeq: 0, _fileSearchAbort: null,
     searchHits: [], searchTruncated: false,
     grepHits: [], grepTruncated: false,
+    // Aggregate byte progress for workspace-file uploads. Button picks,
+    // directory context uploads and OS-file drops all feed the same batch.
+    fileUploadProgress: {
+      visible: false, known: false, percent: 0,
+      totalFiles: 0, completedFiles: 0, failedFiles: 0, activeFiles: 0,
+    },
+    _fileUploadBatch: null,
+    _fileUploadTransferSeq: 0,
+    _fileUploadHideTimer: null,
 
     // ===== preview =====
     // Drag-and-drop visual state for the preview pane.
@@ -16049,26 +16058,43 @@ function portal() {
     // drop handlers (onPreviewDrop, tree-onDrop multi-file) so the caller
     // can batch the side effects. Returns uploaded path metadata on success,
     // false on error.
-    async _uploadFileQuiet(dirPath, file) {
-      const fd = new FormData();
-      fd.append("path", dirPath);
-      fd.append("file", file);
+    async _uploadFileQuiet(
+      dirPath,
+      file,
+      { reportError = false, ownerWorkspace = "" } = {},
+    ) {
+      const transfer = this._beginFileUploadTransfer(file);
+      let succeeded = false;
       try {
-        const r = await fetch("/api/files/upload", {
-          method: "POST", headers: this.fileHdr(), body: fd,
-        });
+        const r = await this._uploadWorkspaceFile(dirPath, file, transfer);
         if (!r.ok) {
           console.warn("[upload]", file.name, "failed:", r.status);
+          if (
+            reportError
+            && (!ownerWorkspace || this._workspaceIsCurrent(ownerWorkspace))
+          ) {
+            const detail = await r.text().catch(() => "");
+            this.errToast("upload", detail || `HTTP ${r.status}`);
+          }
           return false;
         }
-        const data = await r.json().catch(() => ({}));
+        const data = (await r.json().catch(() => ({}))) || {};
+        succeeded = true;
         return {
           path: data.path || (dirPath ? `${dirPath}/${file.name}` : file.name),
           replaced_trash_id: data.replaced_trash_id || null,
         };
       } catch (e) {
         console.warn("[upload]", file.name, "error:", e);
+        if (
+          reportError
+          && (!ownerWorkspace || this._workspaceIsCurrent(ownerWorkspace))
+        ) {
+          this.errToast("upload", String((e && e.message) || e));
+        }
         return false;
+      } finally {
+        this._finishFileUploadTransfer(transfer, succeeded);
       }
     },
     _prepareUploadOverwrite(dirPath, files) {
@@ -28167,6 +28193,165 @@ function portal() {
       this.previewDragHover = false;
       this.dragHover = false;
     },
+    fileUploadProgressLabel() {
+      const progress = this.fileUploadProgress || {};
+      const total = Math.max(0, Number(progress.totalFiles) || 0);
+      const completed = Math.max(0, Number(progress.completedFiles) || 0);
+      const failed = Math.max(0, Number(progress.failedFiles) || 0);
+      if (Number(progress.activeFiles) > 0) {
+        return total > 1
+          ? this.t("files.uploading_many", { done: completed, total })
+          : this.t("files.uploading_one");
+      }
+      return failed > 0
+        ? this.t("files.upload_finished_errors", { failed })
+        : this.t("files.upload_finished");
+    },
+    _publishFileUploadProgress(batch) {
+      if (!batch || this._fileUploadBatch !== batch) return;
+      const transfers = Object.values(batch.transfers || {});
+      const totalFiles = transfers.length;
+      const completedFiles = transfers.filter(item => item.done).length;
+      const failedFiles = transfers.filter(item => item.failed).length;
+      const activeFiles = totalFiles - completedFiles;
+      const known = totalFiles > 0 && transfers.every(item => item.known);
+      const totalBytes = transfers.reduce(
+        (sum, item) => sum + Math.max(1, Number(item.total) || 0), 0,
+      );
+      const loadedBytes = transfers.reduce((sum, item) => {
+        const total = Math.max(1, Number(item.total) || 0);
+        return sum + Math.max(0, Math.min(total, Number(item.loaded) || 0));
+      }, 0);
+      this.fileUploadProgress = {
+        visible: totalFiles > 0,
+        known,
+        percent: known && totalBytes > 0
+          ? Math.max(0, Math.min(100, (loadedBytes / totalBytes) * 100))
+          : 0,
+        totalFiles,
+        completedFiles,
+        failedFiles,
+        activeFiles,
+      };
+    },
+    _beginFileUploadTransfer(file) {
+      if (this._fileUploadHideTimer) clearTimeout(this._fileUploadHideTimer);
+      this._fileUploadHideTimer = null;
+      let batch = this._fileUploadBatch;
+      const hasActive = batch && Object.values(batch.transfers || {})
+        .some(item => !item.done);
+      if (!hasActive) {
+        batch = {
+          id: `file-upload-${Date.now()}-${++this._fileUploadTransferSeq}`,
+          transfers: Object.create(null),
+        };
+        this._fileUploadBatch = batch;
+      }
+      const transferId = String(++this._fileUploadTransferSeq);
+      batch.transfers[transferId] = {
+        loaded: 0,
+        total: Math.max(0, Number(file && file.size) || 0),
+        known: false,
+        done: false,
+        failed: false,
+      };
+      this._publishFileUploadProgress(batch);
+      return { batchId: batch.id, transferId };
+    },
+    _fileUploadTransfer(token) {
+      const batch = this._fileUploadBatch;
+      if (!batch || !token || batch.id !== token.batchId) return null;
+      const transfer = batch.transfers[token.transferId];
+      return transfer ? { batch, transfer } : null;
+    },
+    _updateFileUploadTransfer(token, loaded, total, known = true) {
+      const current = this._fileUploadTransfer(token);
+      if (!current || current.transfer.done) return;
+      const nextTotal = Math.max(0, Number(total) || 0);
+      if (known && nextTotal > 0) {
+        current.transfer.known = true;
+        current.transfer.total = nextTotal;
+      }
+      current.transfer.loaded = Math.max(
+        Number(current.transfer.loaded) || 0,
+        Math.max(0, Number(loaded) || 0),
+      );
+      this._publishFileUploadProgress(current.batch);
+    },
+    _finishFileUploadTransfer(token, succeeded) {
+      const current = this._fileUploadTransfer(token);
+      if (!current || current.transfer.done) return;
+      const transfer = current.transfer;
+      transfer.known = true;
+      transfer.total = Math.max(1, Number(transfer.total) || 0);
+      transfer.loaded = transfer.total;
+      transfer.done = true;
+      transfer.failed = !succeeded;
+      this._publishFileUploadProgress(current.batch);
+      if (Object.values(current.batch.transfers).some(item => !item.done)) return;
+      const batchId = current.batch.id;
+      this._fileUploadHideTimer = setTimeout(() => {
+        const latest = this._fileUploadBatch;
+        if (!latest || latest.id !== batchId
+            || Object.values(latest.transfers).some(item => !item.done)) return;
+        this._fileUploadBatch = null;
+        this.fileUploadProgress = {
+          ...this.fileUploadProgress,
+          visible: false,
+        };
+        this._fileUploadHideTimer = null;
+      }, 900);
+    },
+    _uploadWorkspaceFile(dirPath, file, transferToken) {
+      const fd = new FormData();
+      fd.append("path", dirPath);
+      fd.append("file", file);
+      const headers = this.fileHdr();
+      return new Promise((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        let settled = false;
+        const finish = (callback, value) => {
+          if (settled) return;
+          settled = true;
+          callback(value);
+        };
+        xhr.open("POST", "/api/files/upload", true);
+        for (const [name, value] of Object.entries(headers)) {
+          xhr.setRequestHeader(name, value);
+        }
+        xhr.upload.addEventListener("progress", event => {
+          this._updateFileUploadTransfer(
+            transferToken,
+            event.loaded,
+            event.total,
+            event.lengthComputable && event.total > 0,
+          );
+        });
+        xhr.addEventListener("load", () => {
+          const responseText = xhr.responseText || "";
+          finish(resolve, {
+            ok: xhr.status >= 200 && xhr.status < 300,
+            status: xhr.status,
+            statusText: xhr.statusText,
+            text: async () => responseText,
+            json: async () => JSON.parse(responseText || "null"),
+          });
+        });
+        xhr.addEventListener("error", () => {
+          finish(reject, new TypeError("Network request failed"));
+        });
+        xhr.addEventListener("abort", () => {
+          const error = new Error("The operation was aborted");
+          error.name = "AbortError";
+          finish(reject, error);
+        });
+        try {
+          xhr.send(fd);
+        } catch (error) {
+          finish(reject, error);
+        }
+      });
+    },
     async upload(ev) {
       // Multi-file picker: upload all selected files in parallel to the
       // workspace root and refresh the tree ONCE, mirroring onPreviewDrop.
@@ -28222,46 +28407,31 @@ function portal() {
       const ownerWorkspace = this.fileWorkspacePath();
       const uploadContext = this._prepareUploadOverwrite(dirPath, [file]);
       if (!uploadContext) return;
-      const fd = new FormData();
-      fd.append("path", dirPath);
-      fd.append("file", file);
-      let r;
-      try {
-        r = await fetch("/api/files/upload", { method: "POST", headers: this.fileHdr(), body: fd });
-      } catch (e) {
-        if (this._workspaceIsCurrent(ownerWorkspace)) {
-          this.errToast("upload", String((e && e.message) || e));
-        }
-        return;
-      }
+      const uploaded = await this._uploadFileQuiet(dirPath, file, {
+        reportError: true,
+        ownerWorkspace,
+      });
+      if (!uploaded || !this._workspaceIsCurrent(ownerWorkspace)) return;
+      delete this.childCache[dirPath];
+      await this._refreshParentInTree(uploaded.path, ownerWorkspace);
       if (!this._workspaceIsCurrent(ownerWorkspace)) return;
-      if (r.ok) {
-        delete this.childCache[dirPath];
-        const data = await r.json().catch(() => ({}));
-        if (!this._workspaceIsCurrent(ownerWorkspace)) return;
-        await this._refreshParentInTree(
-          data.path || (dirPath ? `${dirPath}/${file.name}` : file.name),
-          ownerWorkspace,
+      await this._syncUploadedFiles([{
+        status: "fulfilled",
+        value: uploaded,
+      }], uploadContext, ownerWorkspace);
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return;
+      // Backend trashes any same-name file it replaced; tell the user so a
+      // silent overwrite isn't mistaken for a clean upload.
+      if (uploaded.replaced_trash_id) {
+        this.toast(
+          this.t("toast.uploaded_replaced", { name: file.name }),
+          "success",
         );
-        if (!this._workspaceIsCurrent(ownerWorkspace)) return;
-        await this._syncUploadedFiles([{
-          status: "fulfilled",
-          value: {
-            path: data.path || (dirPath ? `${dirPath}/${file.name}` : file.name),
-            replaced_trash_id: data.replaced_trash_id || null,
-          },
-        }], uploadContext, ownerWorkspace);
-        if (!this._workspaceIsCurrent(ownerWorkspace)) return;
-        // Backend trashes any same-name file it replaced; tell the user so a
-        // silent overwrite isn't mistaken for a clean upload.
-        if (data.replaced_trash_id) {
-          this.toast(this.t("toast.uploaded_replaced", { name: file.name }), "success");
-        } else {
-          this.toast(this.t("toast.uploaded_to", { name: file.name, dir: dirPath || "" }), "success");
-        }
       } else {
-        const detail = await r.text();
-        if (this._workspaceIsCurrent(ownerWorkspace)) this.errToast("upload", detail);
+        this.toast(this.t("toast.uploaded_to", {
+          name: file.name,
+          dir: dirPath || "",
+        }), "success");
       }
     },
     // Custom MIME so tree-internal drags don't collide with OS file drops.

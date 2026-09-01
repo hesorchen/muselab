@@ -237,6 +237,101 @@ def test_desktop_chat_is_center_primary_pane_and_preview_is_right_rail(
     assert result["chatFullscreen"]["sameChatNode"] is True
 
 
+def test_file_pane_picker_and_drop_show_real_upload_progress(
+        page: Page, backend_url, auth_token):
+    """Both workspace-file entry points expose intermediate byte progress."""
+    page.set_viewport_size({"width": 1440, "height": 900})
+    _login(page, backend_url, auth_token)
+
+    cdp = page.context.new_cdp_session(page)
+    cdp.send("Network.enable")
+    cdp.send("Network.emulateNetworkConditions", {
+        "offline": False,
+        "latency": 40,
+        "downloadThroughput": 8 * 1024 * 1024,
+        "uploadThroughput": 64 * 1024,
+        "connectionType": "cellular3g",
+    })
+
+    def wait_for_intermediate_progress() -> dict:
+        page.wait_for_function(
+            """() => {
+              const app = document.querySelector('#app')?._x_dataStack?.[0];
+              const p = app?.fileUploadProgress;
+              return p?.visible && p.known && p.percent > 0 && p.percent < 100;
+            }""",
+            timeout=10_000,
+        )
+        return page.evaluate(
+            """() => {
+              const app = document.querySelector('#app')._x_dataStack[0];
+              const bar = document.querySelector('.file-upload-progress');
+              return {
+                percent: app.fileUploadProgress.percent,
+                visible: !!bar?.getClientRects().length,
+                ariaNow: bar?.querySelector('[role="progressbar"]')
+                  ?.getAttribute('aria-valuenow'),
+              };
+            }"""
+        )
+
+    def wait_for_uploaded(name: str) -> None:
+        page.wait_for_function(
+            """async name => {
+              const app = document.querySelector('#app')._x_dataStack[0];
+              const response = await fetch('/api/files/list?path=', {
+                headers: app.fileHdr(),
+              });
+              if (!response.ok) return false;
+              const data = await response.json();
+              return data.entries.some(entry => entry.name === name);
+            }""",
+            arg=name,
+            timeout=10_000,
+        )
+
+    picker_name = "picker-progress.bin"
+    page.locator(
+        '.pane.files input[type="file"][x-ref="upload"]'
+    ).set_input_files({
+        "name": picker_name,
+        "mimeType": "application/octet-stream",
+        "buffer": b"p" * (192 * 1024),
+    })
+    picker_progress = wait_for_intermediate_progress()
+    assert picker_progress["visible"] is True
+    assert 0 < picker_progress["percent"] < 100
+    assert picker_progress["ariaNow"] is not None
+    wait_for_uploaded(picker_name)
+    page.wait_for_function(
+        """() => !document.querySelector('#app')._x_dataStack[0]
+          .fileUploadProgress.visible""",
+        timeout=10_000,
+    )
+
+    drop_name = "drop-progress.bin"
+    page.evaluate(
+        """({name, size}) => {
+          const bytes = new Uint8Array(size);
+          bytes.fill(100);
+          const transfer = new DataTransfer();
+          transfer.items.add(new File(
+            [bytes], name, {type: 'application/octet-stream'}));
+          document.querySelector('.filelist').dispatchEvent(new DragEvent('drop', {
+            bubbles: true,
+            cancelable: true,
+            dataTransfer: transfer,
+          }));
+        }""",
+        {"name": drop_name, "size": 192 * 1024},
+    )
+    drop_progress = wait_for_intermediate_progress()
+    assert drop_progress["visible"] is True
+    assert 0 < drop_progress["percent"] < 100
+    assert drop_progress["ariaNow"] is not None
+    wait_for_uploaded(drop_name)
+
+
 def test_refresh_restores_file_without_reopening_hidden_preview(
         page: Page, backend_url, auth_token):
     """Background file restoration preserves the user's hidden right rail."""

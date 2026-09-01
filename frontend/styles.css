@@ -1713,6 +1713,55 @@ body.kb-open .layout:focus-within .mobile-tab-bar { display: none; }
 /* ==========================================================================
    File pane
    ========================================================================== */
+.file-upload-progress {
+  flex-shrink: 0;
+  padding: 6px var(--sp-3) 7px;
+  border-bottom: 1px solid var(--c-border);
+  background: color-mix(in srgb, var(--c-accent) 5%, var(--c-bg-1));
+}
+.file-upload-progress-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-2);
+  margin-bottom: 5px;
+  color: var(--c-fg-2);
+  font-size: var(--fs-xs);
+  line-height: 1.25;
+}
+.file-upload-progress-meta span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.file-upload-progress-meta strong {
+  flex-shrink: 0;
+  color: var(--c-accent);
+  font-variant-numeric: tabular-nums;
+}
+.file-upload-progress-track {
+  height: 3px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--c-accent) 18%, transparent);
+}
+.file-upload-progress-track > span {
+  display: block;
+  height: 100%;
+  min-width: 2px;
+  border-radius: inherit;
+  background: var(--c-accent);
+  transition: width 120ms linear;
+}
+.file-upload-progress-track.indeterminate > span {
+  animation: file-upload-progress-slide 1.15s ease-in-out infinite;
+}
+@keyframes file-upload-progress-slide {
+  from { transform: translateX(-110%); }
+  to { transform: translateX(320%); }
+}
+
 .searchbar {
   display: flex; align-items: center; gap: var(--sp-1); padding: var(--sp-2);
   border-bottom: 1px solid var(--c-border); background: var(--c-bg-1);

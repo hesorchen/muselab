@@ -3091,6 +3091,46 @@ def test_attachment_upload_uses_real_byte_progress_and_renders_percentage():
     assert ".chip-upload-bar > span" in css
 
 
+def test_workspace_file_upload_uses_real_aggregate_byte_progress():
+    """File-pane picks and drops share one byte-progress implementation."""
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    css = (FRONTEND / "styles.css").read_text(encoding="utf-8")
+    i18n = (FRONTEND / "i18n" / "index.js").read_text(encoding="utf-8")
+
+    helper_start = app.index("fileUploadProgressLabel() {")
+    helper_end = app.index("\n    async upload(ev)", helper_start)
+    helper = app[helper_start:helper_end]
+    assert "new XMLHttpRequest()" in helper
+    assert 'xhr.open("POST", "/api/files/upload", true)' in helper
+    assert 'xhr.upload.addEventListener("progress"' in helper
+    assert "event.loaded" in helper and "event.total" in helper
+    assert "_updateFileUploadTransfer(" in helper
+    assert "Object.values(batch.transfers" in helper
+
+    quiet_start = app.index("async _uploadFileQuiet(")
+    quiet_end = app.index("\n    _prepareUploadOverwrite", quiet_start)
+    quiet = app[quiet_start:quiet_end]
+    assert "_beginFileUploadTransfer(file)" in quiet
+    assert "_uploadWorkspaceFile(dirPath, file, transfer)" in quiet
+    assert "_finishFileUploadTransfer(transfer, succeeded)" in quiet
+
+    context_start = app.index("async uploadFileTo(dirPath, file)")
+    context_end = app.index("\n    // Custom MIME", context_start)
+    context_upload = app[context_start:context_end]
+    assert "_uploadFileQuiet(dirPath, file" in context_upload
+    assert "reportError: true" in context_upload
+
+    assert '@change="upload($event)"' in html
+    assert 'class="file-upload-progress"' in html
+    assert 'role="progressbar"' in html
+    assert "fileUploadProgress.percent" in html
+    assert ".file-upload-progress-track" in css
+    assert "@keyframes file-upload-progress-slide" in css
+    assert i18n.count('"files.uploading_many"') == 2
+    assert i18n.count('"files.upload_finished_errors"') == 2
+
+
 def test_chat_draft_survives_refresh_and_failed_stream_start():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
     send_start = app.index("async send(opts = {})")
