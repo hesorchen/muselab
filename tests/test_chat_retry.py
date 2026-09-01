@@ -23,6 +23,11 @@ def _message(
 
 def _capture_options(chat_mod, monkeypatch):
     captured = {}
+    # The real builder intentionally rejects unauthenticated Claude sessions
+    # before constructing the SDK client. These tests replace that client and
+    # never make a network request, so give the preflight an explicit fake
+    # credential instead of depending on the developer's ~/.claude login.
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-only-not-a-secret")
 
     class FakeOptions:
         def __init__(self, **kwargs):
