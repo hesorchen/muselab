@@ -418,8 +418,12 @@ def sdk_messages_to_ui(
             elif block_type == "thinking":
                 flush_text()
                 thinking_text = block.get("thinking", "") or ""
-                if not thinking_text.strip() and block.get("signature"):
-                    thinking_text = "[已加密推理 · 仅 streaming 期间可见明文]"
+                # Claude may persist only the cryptographic signature after a
+                # turn. Plain thinking deltas were already visible live, but a
+                # signature is not user-facing content and must not become a
+                # repeated placeholder row on history reload.
+                if not thinking_text.strip():
+                    continue
                 out.append({"role": "thinking", "text": thinking_text,
                             "uuid": sm.uuid})
             elif block_type == "tool_use":

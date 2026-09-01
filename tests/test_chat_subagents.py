@@ -333,6 +333,25 @@ def test_history_and_live_final_use_the_same_block_shape():
     assert live_block["agent_id"] is None
 
 
+def test_signature_only_subagent_thinking_is_omitted_from_history():
+    message = _session_message(
+        "assistant",
+        "signature-only",
+        [
+            {"type": "thinking", "thinking": "", "signature": "signed-value"},
+            {"type": "text", "text": "visible result"},
+        ],
+    )
+
+    blocks = chat_subagents.normalize_subagent_message(
+        message, agent_id="agent-a")
+
+    assert [(block["role"], block.get("text")) for block in blocks] == [
+        ("assistant", "visible result"),
+    ]
+    assert "已加密推理" not in str(blocks)
+
+
 def test_authenticated_history_endpoint_uses_sdk_projection(
     app_module, client, auth, monkeypatch,
 ):

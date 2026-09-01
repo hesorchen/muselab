@@ -224,9 +224,9 @@ def _normalize_content(
             if message_type != "assistant":
                 continue
             text = str(_block_value(raw_block, "thinking", "") or "")
-            if not text and _block_value(raw_block, "signature"):
-                text = "[已加密推理 · 仅 streaming 期间可见明文]"
-            if not text:
+            # A signature-only canonical block has no displayable reasoning.
+            # Live thinking_delta frames remain visible while streaming.
+            if not text.strip():
                 continue
             normalized.append({
                 **_base_block(

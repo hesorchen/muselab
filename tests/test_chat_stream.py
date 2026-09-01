@@ -5529,6 +5529,23 @@ def test_canonical_block_ids_are_record_local_and_repeatable():
     assert [m["block_id"] for m in second] == expected
 
 
+def test_signature_only_thinking_is_not_rendered_as_a_history_placeholder(
+    stream_env,
+):
+    chat_mod = stream_env
+    record = _sm("signature-only", "assistant", [
+        {"type": "thinking", "thinking": "", "signature": "signed-value"},
+        {"type": "text", "text": "final answer"},
+    ])
+
+    messages = chat_mod._sdk_messages_to_ui([record], {})
+
+    assert [(message["role"], message.get("text")) for message in messages] == [
+        ("assistant", "final answer"),
+    ]
+    assert "已加密推理" not in str(messages)
+
+
 def test_large_canonical_body_is_deferred_without_source_truncation():
     from backend import chat as chat_mod
 
