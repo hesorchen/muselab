@@ -7013,6 +7013,7 @@ def test_native_cron_tools_update_live_schedule_state(stream_env):
     key = (sid, "claude-sonnet-4-6", "auto", "")
     broadcast = chat_mod.TurnBroadcast(sid, model=key[1])
     chat_mod._active_turns[sid] = broadcast
+    prompt = "must remain bounded in the native task inspector"
 
     async def run():
         await chat_mod._observe_sdk_stream_message(key, AssistantMessage(
@@ -7023,7 +7024,7 @@ def test_native_cron_tools_update_live_schedule_state(stream_env):
                     "cron": "7 * * * *",
                     "recurring": True,
                     "durable": False,
-                    "prompt": "must never enter the schedule state cache",
+                    "prompt": prompt,
                 },
             )],
             model=key[1],
@@ -7046,6 +7047,9 @@ def test_native_cron_tools_update_live_schedule_state(stream_env):
                 "cron": "7 * * * *",
                 "recurring": True,
                 "durable": False,
+                "prompt": prompt,
+                "prompt_sha256": chat_mod._safe_sdk_cron_prompt(prompt)[1],
+                "prompt_truncated": False,
             },
         }
 
@@ -7174,6 +7178,123 @@ def test_sdk_scheduled_trigger_is_broadcast_live_without_refresh(
         if handle is not None:
             handle.cancel()
         (recent or broadcast).close()
+
+
+def test_originless_sdk_scheduled_trigger_uses_known_prompt_fingerprint(
+        stream_env, monkeypatch):
+    chat_mod = stream_env
+    sid = "sid-originless-native-scheduled-trigger"
+    key = (sid, "claude-sonnet-4-6", "auto", "")
+    prompt = "检查 originless SDK 定时任务"
+    safe_prompt = chat_mod._safe_sdk_cron_prompt(prompt)
+    chat_mod._sdk_cron_jobs[sid] = {
+        "job-originless": {
+            "cron": "* * * * *",
+            "recurring": True,
+            "durable": False,
+            "prompt": safe_prompt[0],
+            "prompt_sha256": safe_prompt[1],
+            "prompt_truncated": safe_prompt[2],
+        },
+    }
+
+    async def no_activity(*_args, **_kwargs):
+        return None
+
+    async def no_refresh(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(chat_mod, "_start_activity_early", no_activity)
+    monkeypatch.setattr(chat_mod, "_finish_activity", no_activity)
+    monkeypatch.setattr(
+        chat_mod, "_refresh_scheduled_session_summary", no_refresh)
+    monkeypatch.setattr(
+        chat_mod.sess, "set_message_annotation", lambda *_a, **_k: None)
+
+    async def run():
+        accepted = await chat_mod._observe_sdk_stream_message(
+            key,
+            UserMessage(
+                content=prompt,
+                uuid="originless-scheduled-user",
+                origin=None,
+            ),
+        )
+        await asyncio.sleep(0)
+        delivery = chat_mod._sdk_scheduled_deliveries[key]
+        assert accepted is True
+        assert delivery.job_id == "job-originless"
+        assert delivery.broadcast.user_text == prompt
+        await chat_mod._observe_sdk_stream_message(
+            key,
+            StreamEvent(
+                uuid="originless-stream",
+                session_id=sid,
+                event={
+                    "type": "content_block_delta",
+                    "delta": {"type": "text_delta", "text": "已自动刷新"},
+                },
+            ),
+        )
+        await chat_mod._observe_sdk_stream_message(
+            key,
+            ResultMessage(
+                subtype="success",
+                duration_ms=12,
+                duration_api_ms=10,
+                is_error=False,
+                num_turns=1,
+                session_id=sid,
+                terminal_reason="completed",
+                origin=None,
+            ),
+        )
+        await asyncio.sleep(0)
+        return delivery.broadcast
+
+    broadcast = asyncio.run(run())
+    try:
+        assert [event["event"] for event in broadcast.replay_events()] == [
+            "startup", "text", "done",
+        ]
+    finally:
+        chat_mod._sdk_cron_jobs.pop(sid, None)
+        chat_mod._sdk_scheduled_deliveries.pop(key, None)
+        chat_mod._active_turns.pop(sid, None)
+        recent = chat_mod._recent_turns.pop(sid, None)
+        handle = chat_mod._recent_turn_expiry_handles.pop(sid, None)
+        if handle is not None:
+            handle.cancel()
+        (recent or broadcast).close()
+
+
+def test_originless_cron_prompt_does_not_capture_foreground_user_turn(
+        stream_env):
+    chat_mod = stream_env
+    sid = "sid-native-cron-foreground-guard"
+    key = (sid, "claude-sonnet-4-6", "auto", "")
+    prompt = "same text as the schedule"
+    safe_prompt = chat_mod._safe_sdk_cron_prompt(prompt)
+    foreground = chat_mod.TurnBroadcast(sid, model=key[1])
+    chat_mod._active_turns[sid] = foreground
+    chat_mod._sdk_cron_jobs[sid] = {
+        "job-same-text": {
+            "prompt_sha256": safe_prompt[1],
+            "recurring": True,
+        },
+    }
+
+    try:
+        accepted = asyncio.run(chat_mod._observe_sdk_stream_message(
+            key,
+            UserMessage(content=prompt, uuid="human-user", origin=None),
+        ))
+        assert accepted is False
+        assert key not in chat_mod._sdk_scheduled_deliveries
+    finally:
+        chat_mod._active_turns.pop(sid, None)
+        chat_mod._sdk_cron_jobs.pop(sid, None)
+        foreground.close()
 
 
 def test_session_pump_skips_observer_consumed_message(

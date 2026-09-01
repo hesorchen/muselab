@@ -696,6 +696,16 @@ function portal() {
       history: [],
       unreadCount: 0,
       loading: false,
+      // SDK Cron jobs are runtime-owned and belong to one Claude session.
+      // They are read-only here; creation/deletion remains the native tool's
+      // job, while this projection makes the otherwise invisible jobs and
+      // their prompts discoverable from the existing scheduler surface.
+      nativeTasks: [],
+      nativeSessionId: "",
+      nativeSessionName: "",
+      nativeLoading: false,
+      nativeError: "",
+      nativeLoadSeq: 0,
       // Task ids whose DELETE request is waiting for a running turn to cancel.
       // Kept separate from server `run.status` so a slow, destructive action
       // remains visibly owned by the row that initiated it.
@@ -32251,6 +32261,10 @@ function portal() {
           !!payload.scheduled_active,
           payload.scheduled_count,
         );
+        if (this.scheduler.show
+            && this.scheduler.nativeSessionId === streamSid) {
+          void this.loadNativeScheduledTasks(streamSid);
+        }
       });
       es.addEventListener("task_started", ev => {
         let d;
@@ -35700,15 +35714,68 @@ function portal() {
     },
 
     // ===== scheduler drawer =====
-    async openScheduler() {
+    currentSessionScheduledCount() {
+      const session = (this.sessions || []).find(item => item.id === this.currentId);
+      return Math.max(0, Math.floor(Number(session?.scheduled_count) || 0));
+    },
+    async loadNativeScheduledTasks(sessionId = this.scheduler.nativeSessionId || this.currentId) {
+      const sid = String(sessionId || "");
+      const seq = ++this.scheduler.nativeLoadSeq;
+      this.scheduler.nativeSessionId = sid;
+      const meta = (this.sessions || []).find(item => item.id === sid);
+      this.scheduler.nativeSessionName = String(meta?.name || "");
+      this.scheduler.nativeTasks = [];
+      this.scheduler.nativeError = "";
+      if (!sid) return false;
+      this.scheduler.nativeLoading = true;
+      try {
+        const response = await fetch(
+          `/api/chat/sessions/${encodeURIComponent(sid)}/scheduled-tasks`,
+          { headers: this.hdr() },
+        );
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const payload = await response.json();
+        if (seq !== this.scheduler.nativeLoadSeq) return false;
+        const tasks = Array.isArray(payload.tasks) ? payload.tasks : [];
+        this.scheduler.nativeTasks = tasks;
+        this._setScheduledTaskState(sid, tasks.length > 0, tasks.length);
+        return true;
+      } catch (_) {
+        if (seq !== this.scheduler.nativeLoadSeq) return false;
+        this.scheduler.nativeError = this.lang === "zh"
+          ? "SDK 定时任务加载失败"
+          : "Failed to load SDK scheduled tasks";
+        return false;
+      } finally {
+        if (seq === this.scheduler.nativeLoadSeq) {
+          this.scheduler.nativeLoading = false;
+        }
+      }
+    },
+    openNativeScheduledTasks(sessionId, event = null) {
+      if (event) {
+        event.preventDefault();
+        event.stopPropagation();
+      }
+      return this.openScheduler({ sessionId, native: true });
+    },
+    async openScheduler(options = {}) {
+      const nativeSessionId = String(
+        (options && typeof options === "object" && options.sessionId)
+        || this.currentId
+        || "",
+      );
       const opener = document.activeElement;
       this.scheduler.show = true;
       this._openFocusSurface(
         "scheduler", ".sched-modal", ".sched-input-name",
         opener, true,
       );
-      await this.loadSchedulerTasks();
-      await this.loadSchedulerHistory();
+      await Promise.all([
+        this.loadNativeScheduledTasks(nativeSessionId),
+        this.loadSchedulerTasks(),
+        this.loadSchedulerHistory(),
+      ]);
       // Opening the drawer = user has seen unread results. Server-side
       // ack so the badge clears on this AND any other tab.
       if (this.scheduler.unreadCount > 0) await this.ackSchedulerUnread();

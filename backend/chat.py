@@ -1652,9 +1652,11 @@ _maintenance_tasks: set[asyncio.Task] = set()
 # ---------------------------------------------------------------------------
 # Native schedules live inside the pooled Claude CLI process. They are neither
 # MuseLab's legacy scheduler nor durable application records: disconnecting the
-# owning runtime destroys them. Keep only privacy-safe control metadata in RAM
-# (job id / cadence flags), pin that runtime against LRU eviction, and project
-# the count to the session list. Prompts and result bodies are never cached.
+# owning runtime destroys them. Keep bounded control metadata in RAM, pin that
+# runtime against LRU eviction, and project the count to the session list. The
+# prompt hash identifies origin-less scheduled deliveries from current CLIs;
+# the bounded prompt copy powers the authenticated read-only GUI. Result bodies
+# are never cached here.
 _sdk_cron_jobs: dict[str, dict[str, dict[str, Any]]] = {}
 _sdk_cron_tool_calls: dict[
     chat_runtime.ClientKey, dict[str, dict[str, Any]]
@@ -1672,6 +1674,7 @@ _SDK_CRON_DELETE_RESULT = re.compile(
 _SDK_CRON_LIST_LINE = re.compile(
     r"^([A-Za-z0-9_-]{1,128})\s+[—-]\s+", re.MULTILINE,
 )
+_SDK_CRON_PROMPT_MAX = 4000
 
 
 @dataclass
@@ -1683,6 +1686,7 @@ class _ScheduledDelivery:
         default_factory=dict)
     subagent_mux: Any = None
     registration_task: asyncio.Task | None = None
+    job_id: str = ""
 
 
 _sdk_scheduled_deliveries: dict[
@@ -19975,6 +19979,34 @@ def _sdk_scheduled_snapshot(session_id: str) -> dict[str, Any]:
     return {"scheduled_active": count > 0, "scheduled_count": count}
 
 
+@router.get(
+    "/sessions/{sid}/scheduled-tasks",
+    dependencies=[Depends(require_token)],
+)
+def list_sdk_scheduled_tasks_api(sid: str) -> dict[str, Any]:
+    """Return the authenticated, read-only native Cron projection."""
+    if sess.get_session_meta(sid) is None:
+        raise HTTPException(404, "session not found")
+    with _sdk_cron_state_lock:
+        jobs = tuple(_sdk_cron_jobs.get(sid, {}).items())
+    tasks = []
+    for job_id, raw in sorted(jobs):
+        tasks.append({
+            "job_id": job_id,
+            "cron": str(raw.get("cron") or ""),
+            "recurring": bool(raw.get("recurring")),
+            "durable": bool(raw.get("durable")),
+            "prompt": str(raw.get("prompt") or ""),
+            "prompt_truncated": bool(raw.get("prompt_truncated")),
+        })
+    return {
+        "session_id": sid,
+        "runtime_owned": True,
+        "tasks": tasks,
+        "count": len(tasks),
+    }
+
+
 def _session_has_scheduled_tasks(session_id: str) -> bool:
     return bool(_sdk_scheduled_snapshot(session_id)["scheduled_active"])
 
@@ -20003,6 +20035,23 @@ def _publish_sdk_scheduled_state(
     })
 
 
+def _safe_sdk_cron_prompt(
+    value: Any,
+) -> tuple[str, str, bool] | None:
+    """Return bounded display text plus an exact UTF-8 prompt fingerprint."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
+    except UnicodeEncodeError:
+        return None
+    cleaned = "".join(
+        char if char in {"\n", "\t"} or char.isprintable() else "�"
+        for char in value[:_SDK_CRON_PROMPT_MAX]
+    )
+    return cleaned, digest, len(value) > _SDK_CRON_PROMPT_MAX
+
+
 def _safe_sdk_cron_call(name: str, raw_input: Any) -> dict[str, Any]:
     data = raw_input if isinstance(raw_input, dict) else {}
     call: dict[str, Any] = {"name": name}
@@ -20012,6 +20061,11 @@ def _safe_sdk_cron_call(name: str, raw_input: Any) -> dict[str, Any]:
             call["cron"] = cadence
         call["recurring"] = bool(data.get("recurring"))
         call["durable"] = bool(data.get("durable"))
+        prompt = _safe_sdk_cron_prompt(data.get("prompt"))
+        if prompt is not None:
+            call["prompt"] = prompt[0]
+            call["prompt_sha256"] = prompt[1]
+            call["prompt_truncated"] = prompt[2]
     elif name == "CronDelete":
         job_id = str(data.get("id") or "")
         if _SDK_CRON_JOB_ID.fullmatch(job_id):
@@ -20071,7 +20125,10 @@ def _observe_sdk_cron_message(
                     job_id = match.group(1)
                     jobs[job_id] = {
                         field: call[field]
-                        for field in ("cron", "recurring", "durable")
+                        for field in (
+                            "cron", "recurring", "durable", "prompt",
+                            "prompt_sha256", "prompt_truncated",
+                        )
                         if field in call
                     }
             elif name == "CronDelete":
@@ -20116,15 +20173,45 @@ def _scheduled_trigger_text(message: UserMessage) -> str:
     return "\n".join(part for part in parts if part)
 
 
-def _is_sdk_scheduled_trigger(message: Any) -> bool:
+def _matching_sdk_cron_job(
+    key: chat_runtime.ClientKey,
+    prompt: str,
+) -> str:
+    safe_prompt = _safe_sdk_cron_prompt(prompt)
+    if safe_prompt is None:
+        return ""
+    digest = safe_prompt[1]
+    with _sdk_cron_state_lock:
+        jobs = tuple(_sdk_cron_jobs.get(key[0], {}).items())
+    for job_id, job in jobs:
+        if job.get("prompt_sha256") == digest:
+            return str(job_id)
+    return ""
+
+
+def _is_sdk_scheduled_trigger(
+    key: chat_runtime.ClientKey,
+    message: Any,
+) -> bool:
     if not isinstance(message, UserMessage):
         return False
     origin = sdk_lifecycle.normalize_origin(getattr(message, "origin", None))
-    return bool(
-        origin
-        and origin["kind"] == "task-notification"
-        and origin.get("subkind") == "scheduled-trigger"
-    )
+    if origin is not None:
+        return bool(
+            origin["kind"] == "task-notification"
+            and origin.get("subkind") == "scheduled-trigger"
+        )
+
+    # CLI 2.1.252 persists native Cron prompts as ``isMeta=true`` but omits
+    # MessageOrigin from the corresponding SDK UserMessage. The SDK parser does
+    # not expose isMeta, so exact prompt identity is the only stable fallback.
+    # Never apply it while a human turn owns the stream: a person may type the
+    # same text as a schedule, and their explicit query must remain foreground.
+    current = _active_turns.get(key[0])
+    if current is not None and not current.done \
+            and not getattr(current, "is_scheduled_delivery", False):
+        return False
+    return bool(_matching_sdk_cron_job(key, _scheduled_trigger_text(message)))
 
 
 async def _register_scheduled_delivery(
@@ -20173,6 +20260,7 @@ async def _begin_scheduled_delivery(
             "assistant_uuid": "",
         },
         subagent_mux=chat_subagents.SubagentStreamMux(key[0]),
+        job_id=_matching_sdk_cron_job(key, prompt),
     )
     _sdk_scheduled_deliveries[key] = delivery
     registration = asyncio.create_task(_register_scheduled_delivery(delivery))
@@ -20185,6 +20273,24 @@ async def _begin_scheduled_delivery(
         raise
     except Exception:
         pass
+    message_uuid = str(getattr(message, "uuid", "") or "")
+    if message_uuid:
+        try:
+            await obs.to_thread_io(
+                "chat.scheduled_trigger_annotation",
+                key[0],
+                sess.set_message_annotation,
+                key[0],
+                message_uuid,
+                _scheduledTrigger=True,
+                scheduled_job_id=delivery.job_id or None,
+                file_path=sess._sidecar_path(key[0]),
+            )
+        except Exception as exc:
+            sys.stderr.write(
+                f"[chat] scheduled trigger annotation failed "
+                f"sid={key[0][:8]} exc={type(exc).__name__}\n"
+            )
     return delivery
 
 
@@ -20296,6 +20402,20 @@ async def _finish_scheduled_delivery(
         _sdk_scheduled_deliveries.pop(key, None)
     registration = delivery.registration_task
 
+    schedule_changed = False
+    if delivery.job_id:
+        with _sdk_cron_state_lock:
+            before = dict(_sdk_cron_jobs.get(session_id, {}))
+            job = before.get(delivery.job_id) or {}
+            if job and not bool(job.get("recurring")):
+                after = dict(before)
+                after.pop(delivery.job_id, None)
+                if after:
+                    _sdk_cron_jobs[session_id] = after
+                else:
+                    _sdk_cron_jobs.pop(session_id, None)
+                schedule_changed = True
+
     # Some compatible providers expose final prose only on ResultMessage.
     result_text = str(getattr(result, "result", None) or "")
     if result_text and not "".join(delivery.render_state["streamed"]).strip():
@@ -20357,6 +20477,8 @@ async def _finish_scheduled_delivery(
     broadcast.perf_status = status
     broadcast.perf_error_kind = "scheduled_turn" if status == "failed" else "none"
     broadcast.publish({"event": "done", "data": json.dumps(done_payload)})
+    if schedule_changed:
+        _publish_sdk_scheduled_state(key, broadcast=broadcast)
     await _finish_activity(session_id, broadcast, status)
     broadcast.finish()
     registered_here = False
@@ -20395,7 +20517,7 @@ async def _observe_sdk_scheduled_delivery(
 ) -> bool:
     delivery = _sdk_scheduled_deliveries.get(key)
     if delivery is None:
-        if not _is_sdk_scheduled_trigger(message):
+        if not _is_sdk_scheduled_trigger(key, message):
             return False
         delivery = await _begin_scheduled_delivery(key, message)
         return True

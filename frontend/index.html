@@ -1442,7 +1442,11 @@
              prompt has produced output since the user last opened
              the drawer. Heartbeat keeps the count fresh. -->
         <button @click="openScheduler()" class="icon-btn bell-btn"
-                :title="lang==='zh' ? '定时任务' : 'Scheduled tasks'"
+                :title="currentSessionScheduledCount()
+                  ? (lang==='zh'
+                      ? `定时任务（当前会话 ${currentSessionScheduledCount()} 个 SDK 原生任务）`
+                      : `Scheduled tasks (${currentSessionScheduledCount()} native in this session)`)
+                  : (lang==='zh' ? '定时任务' : 'Scheduled tasks')"
                 aria-label="Scheduled tasks">
           <svg viewBox="0 0 24 24" width="16" height="16" fill="none"
                stroke="currentColor" stroke-width="2"
@@ -1452,6 +1456,10 @@
           </svg>
           <span class="bell-badge" x-show="scheduler.unreadCount > 0"
                 x-text="scheduler.unreadCount > 99 ? '99+' : scheduler.unreadCount"></span>
+          <span class="bell-native-badge"
+                x-show="currentSessionScheduledCount() > 0"
+                x-text="currentSessionScheduledCount()"
+                aria-hidden="true"></span>
         </button>
         <!-- Command palette entry — slim icon-btn alongside settings.
              Discoverability comes from the first-run toast (init()) +
@@ -1777,10 +1785,14 @@
                  @auxclick="onTabAuxClick($event, tid)"
                  :title="tabTitle(tid)">
               <span class="chat-tab-stream-dot"
-                    :class="{ 'is-background': isTabBackgroundActive(tid) || isTabScheduledActive(tid) }"
+                    :class="{
+                      'is-background': isTabBackgroundActive(tid) || isTabScheduledActive(tid),
+                      'is-native-schedule-clickable': isTabScheduledActive(tid),
+                    }"
                     x-show="isTabRunning(tid)"
+                    @click.stop="isTabScheduledActive(tid) && openNativeScheduledTasks(tid, $event)"
                     :title="isTabScheduledActive(tid)
-                      ? (lang==='zh' ? '该会话有定时任务待命或执行中' : 'Scheduled task ready or running')
+                      ? (lang==='zh' ? '点击查看该会话的 SDK 定时任务' : 'View this session\'s SDK scheduled tasks')
                       : isTabBackgroundActive(tid)
                         ? t('chat.background_running')
                       : (lang==='zh' ? '该会话正在生成…' : 'Streaming…')"></span>
@@ -6889,6 +6901,62 @@
                 :title="lang==='zh' ? '关闭' : 'Close'" aria-label="Close">×</button>
       </div>
       <div class="modal-body sched-body">
+        <section class="sched-native-section">
+          <div class="sched-native-head">
+            <div>
+              <div class="sched-section-title">
+                <svg class="sched-section-icon"><use href="#i-clock"/></svg>
+                <span x-text="lang==='zh' ? 'SDK 原生任务' : 'SDK native tasks'"></span>
+                <span class="sched-native-count"
+                      x-text="scheduler.nativeTasks.length"></span>
+              </div>
+              <div class="sched-native-session ellipsis"
+                   x-text="scheduler.nativeSessionName
+                     || (lang==='zh' ? '当前会话' : 'Current session')"></div>
+            </div>
+            <span class="sched-native-runtime-badge"
+                  x-text="lang==='zh' ? '运行时' : 'runtime'"></span>
+          </div>
+          <div class="sched-native-note"
+               x-text="lang==='zh'
+                 ? '由 Claude SDK Cron 工具管理；任务随该会话的 Claude 运行环境存在。'
+                 : 'Managed by Claude SDK Cron tools and owned by this session runtime.'"></div>
+          <div class="sched-native-loading" x-show="scheduler.nativeLoading"
+               x-text="lang==='zh' ? '加载中…' : 'Loading…'"></div>
+          <div class="sched-native-error"
+               x-show="!scheduler.nativeLoading && scheduler.nativeError"
+               x-text="scheduler.nativeError"></div>
+          <div class="sched-native-empty"
+               x-show="!scheduler.nativeLoading && !scheduler.nativeError
+                 && !scheduler.nativeTasks.length"
+               x-text="lang==='zh'
+                 ? '该会话当前没有 SDK 原生定时任务。'
+                 : 'No SDK native scheduled tasks in this session.'"></div>
+          <div class="sched-native-list"
+               x-show="!scheduler.nativeLoading && scheduler.nativeTasks.length">
+            <template x-for="task in scheduler.nativeTasks" :key="task.job_id">
+              <article class="sched-native-card">
+                <div class="sched-native-card-head">
+                  <code x-text="task.cron || '—'"></code>
+                  <span x-text="task.recurring
+                    ? (lang==='zh' ? '循环' : 'recurring')
+                    : (lang==='zh' ? '一次' : 'one-time')"></span>
+                </div>
+                <div class="sched-native-prompt" x-text="task.prompt || '—'"></div>
+                <div class="sched-native-meta">
+                  <span class="mono" x-text="task.job_id"></span>
+                  <span x-show="task.prompt_truncated"
+                        x-text="lang==='zh' ? '已截断显示' : 'preview truncated'"></span>
+                </div>
+              </article>
+            </template>
+          </div>
+        </section>
+
+        <div class="sched-surface-divider">
+          <span x-text="lang==='zh' ? 'MuseLab 调度器' : 'MuseLab scheduler'"></span>
+        </div>
+
         <!-- Create form — labeled rows, grid-aligned, supports daily /
              weekly / monthly / once with the time picker always
              precise to the minute. Doubles as the edit form when

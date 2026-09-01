@@ -393,6 +393,46 @@ def test_session_list_marks_native_cron_as_amber_idle_state(chat_mod, client):
         chat_mod._sdk_cron_jobs.pop(sid, None)
 
 
+def test_native_cron_jobs_have_authenticated_read_only_inspector(
+        chat_mod, client):
+    sid = _make_compact_session(client)
+    chat_mod._sdk_cron_jobs[sid] = {
+        "job-a": {
+            "cron": "7 * * * *",
+            "recurring": True,
+            "durable": False,
+            "prompt": "inspect the workspace",
+            "prompt_sha256": "a" * 64,
+            "prompt_truncated": False,
+        },
+    }
+    try:
+        denied = client.get(f"/api/chat/sessions/{sid}/scheduled-tasks")
+        response = client.get(
+            f"/api/chat/sessions/{sid}/scheduled-tasks",
+            headers={"X-Auth-Token": TEST_TOKEN},
+        )
+        assert denied.status_code == 401
+        assert response.status_code == 200, response.text
+        payload = response.json()
+        assert payload == {
+            "session_id": sid,
+            "runtime_owned": True,
+            "count": 1,
+            "tasks": [{
+                "job_id": "job-a",
+                "cron": "7 * * * *",
+                "recurring": True,
+                "durable": False,
+                "prompt": "inspect the workspace",
+                "prompt_truncated": False,
+            }],
+        }
+        assert "prompt_sha256" not in response.text
+    finally:
+        chat_mod._sdk_cron_jobs.pop(sid, None)
+
+
 # ====== interrupt ======
 
 def test_interrupt_no_live_client(chat_mod, client):

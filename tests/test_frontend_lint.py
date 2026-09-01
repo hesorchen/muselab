@@ -6252,8 +6252,14 @@ def test_sdk_scheduled_tasks_have_live_stream_and_amber_session_state():
     assert "scheduled_active" in app
     assert "scheduled-trigger-avatar" in html
     assert "定时任务待命或执行中" in html
+    assert "SDK 原生任务" in html
+    assert "openNativeScheduledTasks(tid, $event)" in html
+    assert "loadNativeScheduledTasks" in app
+    assert "/scheduled-tasks`" in app
     assert "_observe_sdk_scheduled_delivery" in backend
     assert 'origin.get("subkind") == "scheduled-trigger"' in backend
+    assert "_matching_sdk_cron_job" in backend
+    assert "prompt_sha256" in backend
     assert "session_has_scheduled_tasks" in runtime
     assert "if observed:" in runtime
 
