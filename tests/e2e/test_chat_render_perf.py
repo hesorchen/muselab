@@ -2375,6 +2375,7 @@ def test_session_todo_modal_uses_large_desktop_board(
     todo_state = _app_eval(
         page,
         """
+        await app._syncTodosFromServer();
         const originalId = app.currentId;
         app.userTodos = [
           {id: 'todo-high', text: 'High item', completed: false, priority: 'high'},
@@ -2382,6 +2383,7 @@ def test_session_todo_modal_uses_large_desktop_board(
           {id: 'todo-low', text: 'Low item', completed: false, priority: 'low'},
         ];
         app._persistGlobalUserTodos();
+        await app._todoPushPromise;
         const beforeSwitch = app.sessionTodoItems().map(item => item.id);
         app.currentId = 'different-conversation';
         const afterSwitch = app.sessionTodoItems().map(item => item.id);
