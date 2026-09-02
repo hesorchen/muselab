@@ -485,7 +485,15 @@ def test_mux_inactive_retires_matching_turn_without_harming_successor(
           const app = document.querySelector('#app')._x_dataStack[0];
           const sid = app.currentId;
           const st = app._ensureTabState(sid);
-          const meta = app.sessions.find(session => session.id === sid);
+          // Activity expectations replace the session row immutably. Always
+          // observe and update the current row instead of retaining a stale
+          // object from before the first inactive frame.
+          const sessionMeta = () => app.sessions.find(session => session.id === sid);
+          const setMetaActive = active => {
+            const current = sessionMeta();
+            if (current) current.active = active;
+          };
+          const metaActive = () => sessionMeta() && sessionMeta().active;
           const originalReload = app._scheduleCanonicalStreamReload;
           let reloads = 0;
           app._scheduleCanonicalStreamReload = () => { reloads += 1; return true; };
@@ -496,7 +504,7 @@ def test_mux_inactive_retires_matching_turn_without_harming_successor(
             st.streamPhase = '';
             st.activeTurnId = '';
             st.es = null;
-            if (meta) meta.active = true;
+            setMetaActive(true);
 
             // A fast server-drained queue turn can start and finish before this
             // browser ever owns its mux channel. Its inactive aggregate frame is
@@ -511,7 +519,7 @@ def test_mux_inactive_retires_matching_turn_without_harming_successor(
               activeTurnId: st.activeTurnId,
               reloads,
               text: st.messages[0] && st.messages[0].text,
-              metaActive: meta && meta.active,
+              metaActive: metaActive(),
             };
 
             st.streaming = true;
@@ -524,7 +532,7 @@ def test_mux_inactive_retires_matching_turn_without_harming_successor(
             st.streamElapsed = 5;
             st._streamTimer = setInterval(() => {}, 1000);
             st._stallWatch = setInterval(() => {}, 1000);
-            if (meta) meta.active = true;
+            setMetaActive(true);
 
             window.__emitMux('session_state', {
               session_id: sid, turn_id: 'turn-a', active: false,
@@ -541,7 +549,7 @@ def test_mux_inactive_retires_matching_turn_without_harming_successor(
               elapsed: st.streamElapsed,
               reloads,
               text: st.messages[0] && st.messages[0].text,
-              metaActive: meta && meta.active,
+              metaActive: metaActive(),
             };
 
             st.streaming = true;
@@ -552,7 +560,7 @@ def test_mux_inactive_retires_matching_turn_without_harming_successor(
             app._activateChatMuxChannel(st.es);
             st._streamTimer = setInterval(() => {}, 1000);
             st._stallWatch = setInterval(() => {}, 1000);
-            if (meta) meta.active = true;
+            setMetaActive(true);
             const successorEs = st.es;
             const successorTimer = st._streamTimer;
 
@@ -568,7 +576,7 @@ def test_mux_inactive_retires_matching_turn_without_harming_successor(
               sameTimer: st._streamTimer === successorTimer,
               activeTurnId: st.activeTurnId,
               reloads,
-              metaActive: meta && meta.active,
+              metaActive: metaActive(),
             };
             clearInterval(st._streamTimer);
             clearInterval(st._stallWatch);
@@ -606,6 +614,189 @@ def test_mux_inactive_retires_matching_turn_without_harming_successor(
         "activeTurnId": "turn-b",
         "reloads": 2,
         "metaActive": True,
+    }
+    _assert_no_browser_errors(page, errors)
+
+
+def test_mux_background_watcher_refreshes_final_after_history_retry(
+    page: Page, backend_url, auth_token,
+):
+    """Watcher-only activity pulls a missed Result without a page refresh."""
+    errors = _capture_browser_errors(page)
+    _install_fake_mux_event_source(page)
+    page.route(
+        "**/api/chat/stream/mux/start",
+        lambda route: route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({"ticket": "mux-background-canonical-retry"}),
+        ),
+    )
+    sid = "mux-background-canonical-retry"
+    turn_id = "turn-background-canonical-retry"
+    final_marker = "BACKGROUND_FINAL_VISIBLE_WITHOUT_REFRESH"
+    canonical_messages = [
+        {
+            "role": "user",
+            "text": "run a background task",
+            "uuid": "background-retry-user",
+            "_turnId": turn_id,
+        },
+        {
+            "role": "tool_use",
+            "id": "background-retry-task",
+            "name": "Bash",
+            "summary": "long background work",
+            "uuid": "background-retry-tool",
+            "task_status": {
+                "state": "running",
+                "owner_session_id": sid,
+            },
+        },
+        {
+            "role": "assistant",
+            "text": final_marker,
+            "html": f"<p>{final_marker}</p>",
+            "uuid": "background-retry-assistant",
+            "turn_status": "completed",
+        },
+    ]
+    history_requests: list[str] = []
+
+    def handle_history(route):
+        history_requests.append(route.request.url)
+        if len(history_requests) == 1:
+            route.fulfill(
+                status=503,
+                content_type="application/json",
+                body=json.dumps({"detail": "transient history overload"}),
+            )
+            return
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({
+                "id": sid,
+                "name": "Background canonical retry",
+                "model": "e2e-model",
+                "permission": "bypassPermissions",
+                "thinking": True,
+                "messages": canonical_messages,
+                "offset": 0,
+                "total": len(canonical_messages),
+                "has_more": False,
+                "history_order": "normal",
+                "history_generation": "background-retry-gen",
+                "updated_at": 2,
+            }),
+        )
+
+    page.route(f"**/api/chat/sessions/{sid}?*", handle_history)
+    page.route(
+        f"**/api/chat/sessions/{sid}/active*",
+        lambda route: route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({
+                "active": True,
+                "background": True,
+                "attachable": False,
+                "continuation": False,
+                "turn_id": turn_id,
+                "started_at": int(time.time()),
+                "background_tasks_pending": 1,
+            }),
+        ),
+    )
+    _login(page, backend_url, auth_token)
+    page.wait_for_function("window.__fakeMuxStreams().length === 1")
+    _bootstrap_session_for_real_load(page, sid, "Background canonical retry")
+    _app_eval(
+        page,
+        """
+        const st = app._ensureTabState(arg.sid);
+        st._loaded = true;
+        st._seenUpdated = 1;
+        st._installedCanonicalCount = 2;
+        st.messages = [
+          {
+            role: "user", text: "run a background task",
+            uuid: "background-retry-user", _turnId: arg.turnId,
+            _k: `${arg.sid}:live:1`,
+          },
+          {
+            role: "tool_use", id: "background-retry-task", name: "Bash",
+            summary: "long background work", uuid: "background-retry-tool",
+            task_status: {state: "running", owner_session_id: arg.sid},
+            _k: `${arg.sid}:live:2`,
+          },
+        ];
+        st.messageRange.visibleStart = 0;
+        st.messageRange.visibleEnd = st.messages.length;
+        st.messageRange.total = st.messages.length;
+        st.streaming = true;
+        st.streamPhase = "running";
+        st.activeTurnId = arg.turnId;
+        st.es = app._chatMuxChannel(arg.sid, arg.turnId);
+        app._activateChatMuxChannel(st.es);
+        app._activateTabState(arg.sid);
+        window.__emitMux("session_state", {
+          session_id: arg.sid,
+          active: true,
+          background: true,
+          attachable: false,
+          continuation: false,
+          turn_id: arg.turnId,
+          started_at: Math.floor(Date.now() / 1000),
+          background_tasks_pending: 1,
+        });
+        return true;
+        """,
+        {"sid": sid, "turnId": turn_id},
+    )
+    page.wait_for_function(
+        """({sid, marker}) => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const st = app.tabState[sid];
+          const pane = document.querySelector(
+            `.msg-pane[data-tid="${CSS.escape(sid)}"]`);
+          return !st.streaming && !st.es && st.backgroundActive
+            && st.messages.some(message => message.text === marker)
+            && pane?.textContent.includes(marker)
+            && st._pendingExternalUpdate === false;
+        }""",
+        arg={"sid": sid, "marker": final_marker},
+        timeout=10000,
+    )
+    result = _app_eval(
+        page,
+        """
+        const st = app.tabState[arg];
+        const task = st.messages.find(message => message.id === "background-retry-task");
+        return {
+          streaming: st.streaming,
+          hasEs: !!st.es,
+          backgroundActive: st.backgroundActive,
+          backgroundTaskCount: st.backgroundTaskCount,
+          taskState: task?.task_status?.state || "",
+          finalText: st.messages.find(
+            message => message.uuid === "background-retry-assistant")?.text || "",
+          pendingExternal: st._pendingExternalUpdate,
+          retryN: st._reconcileRetryN,
+        };
+        """,
+        sid,
+    )
+    assert len(history_requests) >= 2
+    assert result == {
+        "streaming": False,
+        "hasEs": False,
+        "backgroundActive": True,
+        "backgroundTaskCount": 1,
+        "taskState": "running",
+        "finalText": final_marker,
+        "pendingExternal": False,
+        "retryN": 0,
     }
     _assert_no_browser_errors(page, errors)
 

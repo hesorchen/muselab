@@ -8419,6 +8419,7 @@ function portal() {
           inheritedTicksLeft: 0,
           inheritedSourceSid: "",
           canonicalStartedAt: 0,
+          canonicalRetryN: 0,
         },
         _backgroundHandoffPromise: null,
         // Runtime rollover replaces the source tabState while a queue POST can
@@ -8678,10 +8679,14 @@ function portal() {
           pending: Object.create(null), timer: null, inFlight: null, epoch: 0,
           backgroundTicksLeft: 0, inheritedTicksLeft: 0, inheritedSourceSid: "",
           canonicalStartedAt: 0,
+          canonicalRetryN: 0,
         };
       }
       if (!st.sessionSync.pending || typeof st.sessionSync.pending !== "object") {
         st.sessionSync.pending = Object.create(null);
+      }
+      if (!Number.isFinite(Number(st.sessionSync.canonicalRetryN))) {
+        st.sessionSync.canonicalRetryN = 0;
       }
       if (st._backgroundHandoffPromise === undefined) {
         st._backgroundHandoffPromise = null;
@@ -10393,6 +10398,39 @@ function portal() {
         && (!m.task_status.owner_session_id
           || m.task_status.owner_session_id === sid));
     },
+    _refreshBackgroundCanonicalHistory(sid, st, options = {}) {
+      if (!sid || !st || this.tabState[sid] !== st) return false;
+      const watcherTurnId = String(options.turnId || "");
+      const ownedTurnId = String(st.activeTurnId || "");
+      // A delayed watcher-only frame for turn A must never retire the live
+      // transport of its already-admitted successor B.
+      if ((st.streaming || st.es) && watcherTurnId && ownedTurnId
+          && watcherTurnId !== ownedTurnId) return false;
+
+      // active=true + background=true + attachable=false is an authoritative
+      // SDK boundary: the foreground Result has landed and canonical history
+      // is readable, while only the background watcher still owns the runtime.
+      // If `done` was lost, retire that stale logical transport and use the
+      // same quiet history path as a manual refresh instead of waiting for the
+      // background task itself to settle.
+      if (st.streaming || st.es) this._retireStaleSessionStream(sid, st);
+      if (watcherTurnId && !st.activeTurnId) st.activeTurnId = watcherTurnId;
+      st._serverActiveObserved = true;
+      this._setBackgroundTaskActive(
+        sid, true, options.startedAt, options.pendingCount,
+      );
+      st._pendingExternalUpdate = true;
+      const sync = st.sessionSync;
+      const alreadyQueued = sync.inFlight?.reason === "history_revision"
+        || !!sync.pending?.history_revision;
+      if (!alreadyQueued) st._reconcileRetryN = 0;
+      void this._requestSessionSync(sid, "history_revision", {
+        targetUpdated: Number(st._reconcileTargetUpdated) || 0,
+        delayMs: Math.max(0, Number(options.delayMs) || 0),
+      });
+      this._ensureBgContPoller(sid);
+      return true;
+    },
     _ensureBgContPoller(sid) {
       const st = sid && this.tabState[sid];
       if (!st || (!this._bgHasRunningCard(sid) && !st.backgroundActive)) return;
@@ -10458,30 +10496,15 @@ function portal() {
       if (options.signal?.aborted) return false;
       if (this.tabState[sid] !== st) return false;
       sync.backgroundTickN = (Number(sync.backgroundTickN) || 0) + 1;
+      // The old fallback fetched the same canonical tail but copied only task
+      // states. Reuse the full quiet refresh chain so a Result/final assistant
+      // block missed by live SSE converges too. The 32 s cadence is unchanged.
       if (!contFound && sync.backgroundTickN % 16 === 0) {
-        try {
-          const hr = await this._fetchWithDeadline(
-            "/api/chat/sessions/" + sid + "?tail=80",
-            { headers: this.hdr(), signal: options.signal },
-          );
-          if (hr.ok) {
-            const hs = await hr.json();
-            if (this.tabState[sid] !== st) return false;
-            const settled = {};
-            (hs.messages || []).forEach(m => {
-              if (m && m.role === "tool_use" && m.id && m.task_status
-                  && m.task_status.state && m.task_status.state !== "running") {
-                settled[m.id] = m.task_status;
-              }
-            });
-            st.messages.forEach(m => {
-              if (m && m.role === "tool_use" && m.task_status
-                  && m.task_status.state === "running" && settled[m.id]) {
-                m.task_status = Object.assign({}, m.task_status, settled[m.id]);
-              }
-            });
-          }
-        } catch (_) { /* retry on the next fallback cadence */ }
+        this._refreshBackgroundCanonicalHistory(sid, st, {
+          turnId: st.activeTurnId,
+          startedAt: st._streamStartedAt / 1000,
+          pendingCount: st.backgroundTaskCount,
+        });
       }
       again();
       return true;
@@ -11698,11 +11721,17 @@ function portal() {
       }
       if (payload.attachable === false) {
         // Watcher-only ownership has no replayable turn yet. Preserve its blue
-        // dot/background state, but do not create a reducer runtime until the
-        // continuation broadcast becomes attachable.
-        if (existingState && !existingState.streaming) {
-          this._setBackgroundTaskActive(
-            sid, true, payload.started_at, payload.background_tasks_pending);
+        // dot/background state, and pull the completed foreground Result from
+        // canonical history even though the watcher keeps aggregate active=true.
+        if (existingState && payload.background) {
+          this._refreshBackgroundCanonicalHistory(sid, existingState, {
+            turnId,
+            startedAt: payload.started_at,
+            pendingCount: payload.background_tasks_pending,
+          });
+        } else if (existingState && !existingState.streaming) {
+          this._setBackgroundTaskActive(sid, true, payload.started_at,
+            payload.background_tasks_pending);
         }
         return;
       }
@@ -12243,16 +12272,11 @@ function portal() {
         if (d.active) {
           st._serverActiveObserved = true;
           if (d.background && d.attachable === false) {
-            try { if (st.es) st.es.close(); } catch (_) {}
-            if (st._stallWatch) clearInterval(st._stallWatch);
-            st._stallWatch = null;
-            st.es = null;
-            st.streaming = false;
-            st.streamPhase = "";
-            this._setBackgroundTaskActive(
-              sid, true, d.started_at, d.background_tasks_pending);
-            this._ensureBgContPoller(sid);
-            return true;
+            return this._refreshBackgroundCanonicalHistory(sid, st, {
+              turnId: d.turn_id,
+              startedAt: d.started_at,
+              pendingCount: d.background_tasks_pending,
+            });
           }
           const silenceMs = Date.now() - (Number(st._lastSseActivity)
             || Number(st._streamStartedAt) || Date.now());
@@ -12300,6 +12324,7 @@ function portal() {
       st._canonicalResyncPending = true;
       if (!st.sessionSync.canonicalStartedAt) {
         st.sessionSync.canonicalStartedAt = Date.now();
+        st.sessionSync.canonicalRetryN = 0;
       }
       this._requestSessionSync(sid, "canonical_replay", {
         minimumWaitMs, delayMs: 250,
@@ -12328,23 +12353,37 @@ function portal() {
         });
         return true;
       }
+      const retryN = Math.max(
+        0, Number(st.sessionSync.canonicalRetryN) || 0);
       this._retireStaleSessionStream(sid, st);
       st._pendingExternalUpdate = true;
       const loaded = await this.loadSession(sid, {
         quiet: true, signal: options.signal,
       });
       if (this.tabState[sid] !== st) return false;
-      st._canonicalResyncPending = false;
-      st.sessionSync.canonicalStartedAt = 0;
       if (loaded) {
+        st._canonicalResyncPending = false;
+        st.sessionSync.canonicalStartedAt = 0;
+        st.sessionSync.canonicalRetryN = 0;
         st._loaded = true;
         st._pendingExternalUpdate = false;
         this._syncQueueFromServer(sid);
         this.$nextTick(() => this._drainPendingQueue(
           sid, st.activeTurnId || "",
         ));
+        return true;
       }
-      return !!loaded;
+      // A slow/busy backend can make the first quiet load hit its deadline.
+      // Keep the recovery obligation alive; otherwise the only remaining path
+      // to the persisted final reply is a full page refresh.
+      st._canonicalResyncPending = true;
+      st.sessionSync.canonicalStartedAt = startedAt;
+      st.sessionSync.canonicalRetryN = retryN + 1;
+      this._requestSessionSync(sid, "canonical_replay", {
+        minimumWaitMs,
+        delayMs: Math.min(10_000, 500 * (2 ** Math.min(retryN, 4))),
+      });
+      return false;
     },
 
     _retireStaleSessionStream(sid, st) {
@@ -12541,16 +12580,18 @@ function portal() {
         const seen = Number(st._seenUpdated);
         const hasSeen = st._seenUpdated !== undefined && Number.isFinite(seen);
         const stillBehind = targetUpdated > 0 && (!hasSeen || targetUpdated > seen);
-        if (stillBehind) st._pendingExternalUpdate = true;
+        const needsRetry = !succeeded || stillBehind;
+        if (needsRetry) st._pendingExternalUpdate = true;
         else if (succeeded) st._pendingExternalUpdate = false;
         const retries = Number(st._reconcileRetryN) || 0;
-        if (!stillBehind) st._reconcileRetryN = 0;
-        if (succeeded && stillBehind && !st.streaming && !st.es && retries < 6) {
+        if (!needsRetry) st._reconcileRetryN = 0;
+        if (needsRetry && !st.streaming && !st.es && retries < 30) {
           st._reconcileRetryN = retries + 1;
           this._requestSessionSync(sid, "history_revision", {
             attach: !!options.attach,
             targetUpdated,
-            delayMs: Math.min(2000, 250 * (retries + 1)),
+            delayMs: Math.min(
+              10_000, 500 * (2 ** Math.min(retries, 4))),
           });
         }
       }
@@ -17508,12 +17549,11 @@ function portal() {
           }
         }
         if (d.active && d.background && d.attachable === false) {
-          st._serverActiveObserved = true;
-          if (d.turn_id) st.activeTurnId = d.turn_id;
-          this._setBackgroundTaskActive(
-            sid, true, d.started_at, d.background_tasks_pending);
-          this._ensureBgContPoller(sid);
-          return;
+          return this._refreshBackgroundCanonicalHistory(sid, st, {
+            turnId: d.turn_id,
+            startedAt: d.started_at,
+            pendingCount: d.background_tasks_pending,
+          });
         }
         if (d.active && !st.streaming && !st.es) {
           st._serverActiveObserved = true;
@@ -33866,10 +33906,15 @@ function portal() {
               // Main ResultMessage landed while this transport was down, but
               // its SDK background task still owns the session reader. There
               // is no broadcast to attach to yet: preserve the running footer
-              // and let the continuation poller discover the next broadcast.
+              // and pull the completed Result from canonical history while the
+              // continuation poller discovers the next broadcast.
               _markDone(false, true, true);
               _stopTimer();
-              this._ensureBgContPoller(streamSid);
+              this._refreshBackgroundCanonicalHistory(streamSid, streamState, {
+                turnId: d.turn_id,
+                startedAt: d.started_at,
+                pendingCount: d.background_tasks_pending,
+              });
               return;
             }
             // Re-subscribe via the existing reconnect plumbing.

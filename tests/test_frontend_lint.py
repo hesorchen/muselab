@@ -1078,7 +1078,9 @@ def test_chat_refresh_and_stats_requests_run_concurrently():
     assert "const stillBehind" in reconcile
     assert "st._pendingExternalUpdate = true" in reconcile
     assert 'this._requestSessionSync(sid, "history_revision"' in reconcile
-    assert "delayMs: Math.min(2000, 250 * (retries + 1))" in reconcile
+    assert "const needsRetry = !succeeded || stillBehind" in reconcile
+    assert "retries < 30" in reconcile
+    assert "10_000, 500 * (2 ** Math.min(retries, 4))" in reconcile
 
 
 def test_session_history_and_workspace_use_distinct_icons():
@@ -1268,7 +1270,7 @@ def test_session_synchronization_has_one_per_tab_coordinator():
     for field in (
         "pending: Object.create(null)", "timer: null", "inFlight: null",
         "epoch: 0", "backgroundTicksLeft: 0", "inheritedTicksLeft: 0",
-        'inheritedSourceSid: ""', "canonicalStartedAt: 0",
+        'inheritedSourceSid: ""', "canonicalStartedAt: 0", "canonicalRetryN: 0",
     ):
         assert field in state
     assert "if (sync.inFlight) return" in coordinator
@@ -1368,10 +1370,13 @@ def test_session_sync_transitions_preserve_canonical_and_view_ownership():
     assert 'delayMs: 2000' in inherited
     assert "this.tabState[sid] !== st" in background
     assert 'delayMs: 2000' in background
-    assert "st.messages.forEach" in background
+    assert "this._refreshBackgroundCanonicalHistory(sid, st" in background
     assert "quiet: true, probeActive: false" in revision
     assert "targetUpdated > seen" in revision
-    assert "delayMs: Math.min(2000, 250 * (retries + 1))" in revision
+    assert "const needsRetry = !succeeded || stillBehind" in revision
+    assert "retries < 30" in revision
+    assert "2 ** Math.min(retries, 4)" in revision
+    assert "st.messages.forEach" not in background
 
     # Synchronization changes only the canonical per-tab repository. Keep the
     # ordered messages + range model and composer ownership established earlier.
@@ -5664,8 +5669,10 @@ def test_midturn_reconnect_storm_guards_are_in_place():
     #    loop whenever the transcript never reaches the list's target revision,
     #    and every round costs a full ?tail= reload of the visible pane.
     assert "st._reconcileRetryN = retries + 1;" in reconcile
-    assert "&& retries < 6" in reconcile
-    assert "Math.min(2000, 250 * (retries + 1))" in reconcile
+    assert "&& retries < 30" in reconcile
+    assert "Math.min(" in reconcile
+    assert "10_000, 500 * (2 ** Math.min(retries, 4))" in reconcile
+    assert "const needsRetry = !succeeded || stillBehind" in reconcile
 
 
 def test_turn_busy_race_falls_back_to_durable_queue():
