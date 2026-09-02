@@ -464,6 +464,401 @@ def test_mux_routes_two_sessions_reconnects_with_checkpoints_and_defers_watcher_
     _assert_no_browser_errors(page, errors)
 
 
+def test_mux_ping_does_not_mask_missing_application_events(
+    page: Page, backend_url, auth_token,
+):
+    errors = _capture_browser_errors(page)
+    _install_fake_mux_event_source(page)
+    mux_starts: list[dict] = []
+
+    def handle_mux_start(route) -> None:
+        mux_starts.append(route.request.post_data_json)
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({"ticket": f"mux-stall-{len(mux_starts)}"}),
+        )
+
+    page.route("**/api/chat/stream/mux/start", handle_mux_start)
+    page.route(
+        "**/api/chat/turns/start",
+        lambda route: route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({
+                "accepted": True,
+                "session_id": route.request.post_data_json["session_id"],
+                "turn_id": "turn-stalled-root",
+                "started_at": int(time.time()),
+            }),
+        ),
+    )
+    page.route(
+        "**/api/chat/sessions/*/active",
+        lambda route: route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({
+                "active": True,
+                "attachable": True,
+                "turn_id": "turn-stalled-root",
+                "started_at": int(time.time()),
+                "events_so_far": 3,
+                "latest_event_seq": 3,
+            }),
+        ),
+    )
+    _login(page, backend_url, auth_token)
+    page.wait_for_function("window.__fakeMuxStreams().length === 1")
+
+    result = page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const sid = app.currentId;
+          const st = app._ensureTabState(sid);
+          app._confirmSessionBusy = async () => false;
+          app._awaitRuntimeSettingPatches = async () => true;
+          app.availableModels = [{
+            model: 'mux-stall-model', label: 'Mux stall', group: 'e2e',
+            supports_thinking: true,
+          }];
+          app.model = 'mux-stall-model';
+          app.permission = 'default';
+          app.sessions = app.sessions.map(session => session.id === sid
+            ? {...session, model: 'mux-stall-model', permission: 'default'}
+            : session);
+          st.permission = 'default';
+          st.draft.input = 'STALL_PROMPT';
+          app._activateComposerState(sid);
+          await app.send();
+          window.__emitMux('text', {
+            session_id: sid, turn_id: 'turn-stalled-root', event_seq: 1,
+            text: 'A',
+          });
+          await new Promise(resolve => setTimeout(resolve, 50));
+          const ownerChannel = st.es;
+          const ownerRoot = app._chatMuxSource;
+          const ownerAssistant = st.messages.find(
+            message => message.role === 'assistant' && message.text === 'A');
+          st._lastSseProgressAt = Date.now() - 20_000;
+          window.__emitMux('ping', '');
+          await app._recoverStalledStream(sid);
+          for (let i = 0; i < 120 && window.__fakeMuxStreams().length < 2; i++) {
+            await new Promise(resolve => setTimeout(resolve, 10));
+          }
+          const reconnected = window.__fakeMuxStreams().length === 2;
+          if (reconnected) {
+            window.__emitMux('text', {
+              session_id: sid, turn_id: 'turn-stalled-root', event_seq: 2,
+              text: 'OLD_ROOT_POISON',
+            }, 0);
+            window.__emitMux('text', {
+              session_id: sid, turn_id: 'turn-stalled-root', event_seq: 2,
+              text: 'B',
+            });
+          }
+          await new Promise(resolve => setTimeout(resolve, 50));
+          return {
+            sid,
+            reconnected,
+            ownerChannelPreserved: st.es === ownerChannel,
+            ownerAssistantPreserved: st.messages.includes(ownerAssistant),
+            text: ownerAssistant && ownerAssistant.text,
+            lastEventSeq: st.lastEventSeq,
+            oldRootClosed: !!ownerRoot.closed,
+          };
+        }""",
+    )
+
+    assert result == {
+        "sid": result["sid"],
+        "reconnected": True,
+        "ownerChannelPreserved": True,
+        "ownerAssistantPreserved": True,
+        "text": "AB",
+        "lastEventSeq": 2,
+        "oldRootClosed": True,
+    }
+    assert len(mux_starts) == 2
+    checkpoints = {
+        (row["session_id"], row["turn_id"]): row["last_event_seq"]
+        for row in mux_starts[1]["checkpoints"]
+    }
+    assert checkpoints[(result["sid"], "turn-stalled-root")] == 1
+    _assert_no_browser_errors(page, errors)
+
+
+def test_mux_resync_replays_from_zero_without_duplicate_live_suffix(
+    page: Page, backend_url, auth_token,
+):
+    errors = _capture_browser_errors(page)
+    _install_fake_mux_event_source(page)
+    mux_starts: list[dict] = []
+
+    def handle_mux_start(route) -> None:
+        mux_starts.append(route.request.post_data_json)
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({"ticket": f"mux-full-{len(mux_starts)}"}),
+        )
+
+    page.route("**/api/chat/stream/mux/start", handle_mux_start)
+    page.route(
+        "**/api/chat/turns/start",
+        lambda route: route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({
+                "accepted": True,
+                "session_id": route.request.post_data_json["session_id"],
+                "turn_id": "turn-full-replay",
+                "started_at": int(time.time()),
+            }),
+        ),
+    )
+    _login(page, backend_url, auth_token)
+    page.wait_for_function("window.__fakeMuxStreams().length === 1")
+
+    result = page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const sid = app.currentId;
+          const st = app._ensureTabState(sid);
+          app._confirmSessionBusy = async () => false;
+          app._awaitRuntimeSettingPatches = async () => true;
+          app.availableModels = [{
+            model: 'mux-full-model', label: 'Mux full', group: 'e2e',
+            supports_thinking: true,
+          }];
+          app.model = 'mux-full-model';
+          app.permission = 'default';
+          app.sessions = app.sessions.map(session => session.id === sid
+            ? {...session, model: 'mux-full-model', permission: 'default'}
+            : session);
+          st.permission = 'default';
+          st.draft.input = 'FULL_REPLAY_PROMPT';
+          app._activateComposerState(sid);
+          await app.send();
+          const firstChannel = st.es;
+          const firstRoot = app._chatMuxSource;
+          window.__emitMux('text', {
+            session_id: sid, turn_id: 'turn-full-replay', event_seq: 1,
+            text: 'A',
+          });
+          await new Promise(resolve => setTimeout(resolve, 50));
+          window.__emitMux('resync', {
+            session_id: sid, turn_id: 'turn-full-replay',
+            reason: 'replay_gap', fallback: 'canonical_history',
+            retryable: false,
+          });
+          for (let i = 0; i < 150 && window.__fakeMuxStreams().length < 2; i++) {
+            await new Promise(resolve => setTimeout(resolve, 10));
+          }
+          for (let i = 0; i < 150 && (!st.es || st.es === firstChannel); i++) {
+            await new Promise(resolve => setTimeout(resolve, 10));
+          }
+          const restarted = window.__fakeMuxStreams().length === 2
+            && !!st.es && st.es !== firstChannel;
+          if (restarted) {
+            window.__emitMux('text', {
+              session_id: sid, turn_id: 'turn-full-replay', event_seq: 2,
+              text: 'AB',
+            });
+          }
+          await new Promise(resolve => setTimeout(resolve, 60));
+          if (st._flushLivePresentation) st._flushLivePresentation();
+          const assistantTexts = st.messages
+            .filter(message => message.role === 'assistant')
+            .map(message => message.text || '');
+          return {
+            sid,
+            restarted,
+            oldRootClosed: !!firstRoot.closed,
+            oldChannelClosed: firstChannel.readyState === 2,
+            assistantTexts,
+            lastEventSeq: st.lastEventSeq,
+          };
+        }""",
+    )
+
+    assert result == {
+        "sid": result["sid"],
+        "restarted": True,
+        "oldRootClosed": True,
+        "oldChannelClosed": True,
+        "assistantTexts": ["AB"],
+        "lastEventSeq": 2,
+    }
+    assert len(mux_starts) == 2
+    matching = [
+        row for row in mux_starts[1]["checkpoints"]
+        if row["session_id"] == result["sid"]
+        and row["turn_id"] == "turn-full-replay"
+    ]
+    assert not matching or matching == [{
+        "session_id": result["sid"],
+        "turn_id": "turn-full-replay",
+        "last_event_seq": 0,
+    }]
+    _assert_no_browser_errors(page, errors)
+
+
+def test_committed_canonical_suffix_retires_stream_even_with_recent_transport(
+    page: Page, backend_url, auth_token,
+):
+    errors = _capture_browser_errors(page)
+    _login(page, backend_url, auth_token)
+
+    result = page.evaluate(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const sid = app.currentId;
+          const st = app._ensureTabState(sid);
+          const previous = app.sessions.find(session => session.id === sid);
+          const previousUpdated = Number(previous.updated_at) || 1;
+          previous.active = true;
+          previous.turn_active = true;
+          previous.background_active = false;
+          previous.message_count = 1;
+          previous.turn_count = 1;
+          let closed = false;
+          st._loaded = true;
+          st._installedCanonicalCount = 1;
+          st._seenUpdated = previousUpdated;
+          st._serverActiveObserved = true;
+          st._streamStartedAt = Date.now() - 6000;
+          st._lastSseTransportAt = Date.now();
+          st._lastSseProgressAt = Date.now();
+          st.streaming = true;
+          st.activeTurnId = 'turn-missing-terminal';
+          st.es = {
+            readyState: 1,
+            close() { closed = true; this.readyState = 2; },
+          };
+          const requests = [];
+          const originalRequest = app._requestSessionSync;
+          app._requestSessionSync = (targetSid, reason, options) => {
+            requests.push({ targetSid, reason, options });
+            return Promise.resolve(true);
+          };
+          try {
+            app._reconcileOpenSession([{
+              ...previous,
+              active: false,
+              turn_active: false,
+              updated_at: previousUpdated + 1,
+              message_count: 2,
+              turn_count: 2,
+            }]);
+            return {
+              streaming: st.streaming,
+              hasStream: !!st.es,
+              closed,
+              pendingExternalUpdate: st._pendingExternalUpdate,
+              reasons: requests.map(request => request.reason),
+            };
+          } finally {
+            app._requestSessionSync = originalRequest;
+          }
+        }""",
+    )
+
+    assert result == {
+        "streaming": False,
+        "hasStream": False,
+        "closed": True,
+        "pendingExternalUpdate": False,
+        "reasons": ["history_revision"],
+    }
+    _assert_no_browser_errors(page, errors)
+
+
+def test_mux_live_attach_does_not_wait_for_cold_history(
+    page: Page, backend_url, auth_token,
+):
+    errors = _capture_browser_errors(page)
+    _install_fake_mux_event_source(page)
+    page.route(
+        "**/api/chat/stream/mux/start",
+        lambda route: route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({"ticket": "mux-cold-history"}),
+        ),
+    )
+    _login(page, backend_url, auth_token)
+    page.wait_for_function("window.__fakeMuxStreams().length === 1")
+
+    result = page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const sid = 'mux-history-pending';
+          app.sessions.push({
+            id: sid, name: 'History pending', model: app.model,
+            permission: 'default', cwd: app.currentWorkspacePath(), active: true,
+          });
+          if (!app.openTabIds.includes(sid)) app.openTabIds.push(sid);
+          app.currentId = sid;
+          app._activateComposerState(sid);
+          const st = app._ensureTabState(sid);
+          st._loaded = false;
+          st.permission = 'default';
+          let releaseHistory;
+          const historyGate = new Promise(resolve => { releaseHistory = resolve; });
+          const originalLoadSession = app.loadSession;
+          app.loadSession = async targetSid => {
+            if (targetSid !== sid) return originalLoadSession.call(app, targetSid);
+            await historyGate;
+            return true;
+          };
+          try {
+            window.__emitMux('session_state', {
+              session_id: sid, active: true, attachable: true,
+              background: false, continuation: false,
+              turn_id: 'turn-cold-history',
+              started_at: Math.floor(Date.now() / 1000),
+              user_text: 'COLD_HISTORY_PROMPT',
+            });
+            for (let i = 0; i < 100 && !st.es; i++) {
+              await new Promise(resolve => setTimeout(resolve, 10));
+            }
+            const attachedWhileHistoryPending = !!st.es;
+            for (let i = 1; i <= 520; i++) {
+              window.__emitMux('text', {
+                session_id: sid, turn_id: 'turn-cold-history', event_seq: i,
+                text: 'x',
+              });
+            }
+            await new Promise(resolve => setTimeout(resolve, 80));
+            if (st._flushLivePresentation) st._flushLivePresentation();
+            const liveText = st.messages
+              .filter(message => message.role === 'assistant')
+              .map(message => message.text || '').join('');
+            releaseHistory();
+            await new Promise(resolve => setTimeout(resolve, 0));
+            return {
+              attachedWhileHistoryPending,
+              liveLength: liveText.length,
+              lastEventSeq: st.lastEventSeq,
+              pendingMuxEvents: app._chatMuxPendingEvents.get(sid)?.length || 0,
+            };
+          } finally {
+            releaseHistory();
+            app.loadSession = originalLoadSession;
+          }
+        }""",
+    )
+
+    assert result == {
+        "attachedWhileHistoryPending": True,
+        "liveLength": 520,
+        "lastEventSeq": 520,
+        "pendingMuxEvents": 0,
+    }
+    _assert_no_browser_errors(page, errors)
+
+
 def test_mux_inactive_retires_matching_turn_without_harming_successor(
     page: Page, backend_url, auth_token,
 ):

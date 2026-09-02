@@ -1419,15 +1419,17 @@ def test_silent_stream_recovers_without_manual_refresh():
     end = app.index("\n    _scheduleCanonicalStreamReload", start)
     recovery = app[start:end]
 
-    assert "Date.now() - observedActivity < 18_000" in recovery
+    assert "Date.now() - observedProgress < 18_000" in recovery
     assert 'this._requestSessionSync(sid, "stream_health"' in recovery
-    assert "d.events_so_far" in recovery
+    assert "d.latest_event_seq" in recovery
     assert "st._serverActiveObserved = true" in recovery
-    assert "await this.send({" in recovery
-    assert "reconnect: true" in recovery
+    assert "await this._forceChatMuxReconnect(" in recovery
+    assert "ownerMuxSource" in recovery
+    assert "st._muxHealthRecoveryKey" in recovery
     assert "this._retireStaleSessionStream(sid, st)" in recovery
     assert "quiet: true, probeActive: false" in recovery
     assert "this._recoverStalledStream(streamSid)" in app
+    assert 'if (type === "ping") return;' in app
 
 
 def test_stream_reconnect_is_pinned_to_backend_turn_identity():
@@ -5607,9 +5609,11 @@ def test_midturn_reconnect_storm_guards_are_in_place():
     assert "hasTurnActivityFlag ? !!cur.turn_active" in reconcile
     assert "!!cur.active && !cur.background_active" in reconcile
     assert "if (wantsAttach && st._loaded) this._checkActiveTurn(sid);" in reconcile
-    # 2. A HEALTHY transport is never retired on one stale `active:false` tick.
-    assert "const transportDead = !st.es" in reconcile
-    assert "if (transportDead) this._retireStaleSessionStream(sid, st);" in reconcile
+    # 2. A healthy transport is retired only when the same metadata snapshot
+    #    proves that a newer canonical suffix has actually committed.
+    assert "const canonicalCommitted = canonicalSuffixMissing || visibleNewer" in reconcile
+    assert "|| messageCountChanged || turnCountChanged" in reconcile
+    assert "if (canonicalCommitted) this._retireStaleSessionStream(sid, st);" in reconcile
 
     # 3. Quiet reconciliation loads must not re-probe /active (that probe is
     #    what turned every poll-driven reload into a full-turn replay).
@@ -5631,7 +5635,10 @@ def test_midturn_reconnect_storm_guards_are_in_place():
     assert "if (!this._allowReconnect(sid, d.turn_id)) return;" in check
     recover = js[js.index("    _recoverStalledStream(sid = this.currentId) {"):]
     recover = recover[:recover.index("\n    _scheduleCanonicalStreamReload(")]
-    assert "if (!this._allowReconnect(sid, d.turn_id || st.activeTurnId)) return false;" in recover
+    assert "await this._forceChatMuxReconnect(" in recover
+    force = js[js.index("    async _forceChatMuxReconnect("):]
+    force = force[:force.index("\n    _scheduleChatMuxReconnect(")]
+    assert "if (!this._allowReconnect(sid, turnId)) return false;" in force
 
     # 5. The MAX_ATTEMPTS ceiling must stay reachable: a fresh turn is the only
     #    place the counter resets. Every reconnect opens its EventSource
