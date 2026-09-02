@@ -362,6 +362,148 @@ def test_mux_reconcile_batches_durable_projections_off_loop(
         broadcast.close()
 
 
+def test_mux_forwards_live_event_while_next_reconcile_is_blocked(
+        chat_mod, monkeypatch):
+    monkeypatch.setattr(chat_mod, "_MUX_RECONCILE_INTERVAL_S", 0.01)
+    broadcast = chat_mod.TurnBroadcast("slow-reconcile-live-tail")
+    chat_mod._active_turns[broadcast.session_id] = broadcast
+    monkeypatch.setattr(
+        chat_mod,
+        "_session_active_status",
+        lambda _sid, **_kwargs: _active_state(broadcast),
+    )
+    reconcile_started = threading.Event()
+    release_reconcile = threading.Event()
+    calls = 0
+
+    def projections(_session_ids):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            reconcile_started.set()
+            release_reconcile.wait(timeout=2)
+        return {}, {}
+
+    monkeypatch.setattr(chat_mod, "_runtime_reconcile_projections", projections)
+
+    async def exercise():
+        stream = await _open_mux(chat_mod, {})
+        state = await asyncio.wait_for(anext(stream), timeout=0.5)
+        assert state["event"] == "session_state"
+        for _ in range(50):
+            if broadcast.subscribers:
+                break
+            await asyncio.sleep(0.002)
+        assert broadcast.subscribers
+
+        pending = asyncio.create_task(anext(stream))
+        started = await asyncio.to_thread(
+            reconcile_started.wait, 0.5)
+        assert started
+        broadcast.publish({
+            "event": "text",
+            "data": json.dumps({"text": "must not wait for reconcile"}),
+        })
+        try:
+            event = await asyncio.wait_for(pending, timeout=0.2)
+            assert event["event"] == "text"
+            assert json.loads(event["data"])["text"] == (
+                "must not wait for reconcile")
+        finally:
+            release_reconcile.set()
+        await stream.aclose()
+
+    try:
+        asyncio.run(exercise())
+    finally:
+        release_reconcile.set()
+        broadcast.close()
+
+
+def test_mux_full_output_does_not_deadlock_control_state(
+        chat_mod, monkeypatch):
+    monkeypatch.setattr(chat_mod, "_MUX_RECONCILE_INTERVAL_S", 0.01)
+    broadcast = chat_mod.TurnBroadcast("full-output-control-state")
+    for index in range(400):
+        broadcast.publish({
+            "event": "tool_result",
+            "data": json.dumps({"id": f"result-{index}"}),
+        })
+    chat_mod._active_turns[broadcast.session_id] = broadcast
+    background_pending = {"count": 0}
+
+    def state(_sid, **_kwargs):
+        payload = _active_state(broadcast)
+        payload["background_tasks_pending"] = background_pending["count"]
+        return payload
+
+    monkeypatch.setattr(chat_mod, "_session_active_status", state)
+    monkeypatch.setattr(
+        chat_mod, "_runtime_reconcile_projections", lambda _ids: ({}, {}))
+
+    async def exercise():
+        stream = await _open_mux(chat_mod, {})
+        initial = await asyncio.wait_for(anext(stream), timeout=0.5)
+        assert initial["event"] == "session_state"
+        for _ in range(100):
+            if broadcast.subscribers:
+                break
+            await asyncio.sleep(0.002)
+        assert broadcast.subscribers
+        # Let the child fill all 256 aggregate handoff slots and block on the
+        # remaining replay. A changed fingerprint makes reconcile publish one
+        # control frame while the data queue is full.
+        await asyncio.sleep(0.05)
+        background_pending["count"] = 1
+        event = await asyncio.wait_for(anext(stream), timeout=0.2)
+        assert event["event"] == "tool_result"
+        await stream.aclose()
+
+    asyncio.run(exercise())
+    broadcast.close()
+
+
+def test_mux_replays_plain_turn_that_finishes_between_reconciles(
+        chat_mod, monkeypatch):
+    monkeypatch.setattr(chat_mod, "_MUX_RECONCILE_INTERVAL_S", 0.01)
+    monkeypatch.setattr(
+        chat_mod,
+        "_session_active_status",
+        lambda _sid, **_kwargs: {"active": False},
+    )
+    monkeypatch.setattr(
+        chat_mod, "_runtime_reconcile_projections", lambda _ids: ({}, {}))
+
+    async def exercise():
+        stream = await _open_mux(chat_mod, {})
+        broadcast = chat_mod.TurnBroadcast("recent-during-subscription")
+        chat_mod._announce_mux_turn(broadcast)
+        state = await asyncio.wait_for(anext(stream), timeout=0.2)
+        assert state["event"] == "session_state"
+        assert json.loads(state["data"])["turn_id"] == broadcast.turn_id
+
+        broadcast.publish({
+            "event": "text",
+            "data": json.dumps({"text": "fast complete reply"}),
+        })
+        broadcast.publish({
+            "event": "done",
+            "data": json.dumps({"status": "completed"}),
+        })
+        broadcast.finish()
+        chat_mod._remember_recent_turn(broadcast.session_id, broadcast)
+        try:
+            event = await asyncio.wait_for(anext(stream), timeout=0.2)
+            assert event["event"] == "text"
+            assert json.loads(event["data"])["text"] == "fast complete reply"
+        finally:
+            await stream.aclose()
+            chat_mod._evict_recent_turn(
+                broadcast.session_id, broadcast.turn_id)
+
+    asyncio.run(exercise())
+
+
 def test_mux_watcher_state_can_become_attachable_dynamically(
         chat_mod, monkeypatch):
     monkeypatch.setattr(chat_mod, "_MUX_RECONCILE_INTERVAL_S", 0.01)

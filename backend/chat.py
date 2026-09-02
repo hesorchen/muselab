@@ -1043,6 +1043,10 @@ class TurnBroadcast:
         # carry the same sequence so clients can discard duplicate delivery
         # without guessing from event content.
         self._event_seq = 0
+        # Accepted turns are synchronously offered to every live multiplex
+        # subscription exactly once. Periodic discovery remains a recovery
+        # path, not the primary notification mechanism.
+        self.mux_announced = False
         # Set in finish(). Used by the _recent_turns grace-keep map to TTL-evict
         # broadcasts that ended a while ago.
         self.finished_at: float = 0.0
@@ -1371,6 +1375,10 @@ class TurnBroadcast:
     def replay_count(self) -> int:
         return len(self.events) + (1 if self._compact_kind is not None else 0)
 
+    @property
+    def latest_event_seq(self) -> int:
+        return self._event_seq
+
     def replay_events(self):
         yield from self.events
         if self._compact_kind is not None:
@@ -1526,6 +1534,24 @@ _active_turns: dict[str, TurnBroadcast] = {}
 _recent_turns: dict[str, TurnBroadcast] = {}
 _recent_turn_expiry_handles: dict[str, asyncio.TimerHandle] = {}
 _RECENT_TURN_TTL = env_int("MUSELAB_RECENT_TURN_TTL", 60, min_value=1)
+
+# A root multiplex stream must not depend on a 200 ms registry scan to notice
+# an ordinary turn. A fast reply can be accepted, completed, and removed from
+# `_active_turns` between two scans. These callbacks attach a replay reader at
+# the admission boundary, before the runtime can publish or finish the turn.
+_mux_turn_listeners: set[Callable[[TurnBroadcast], None]] = set()
+
+
+def _announce_mux_turn(broadcast: TurnBroadcast) -> None:
+    if broadcast.mux_announced:
+        return
+    broadcast.mux_announced = True
+    for listener in tuple(_mux_turn_listeners):
+        try:
+            listener(broadcast)
+        except Exception:
+            # One disconnected browser must never affect turn admission.
+            continue
 
 
 def _evict_recent_turn(
@@ -14498,6 +14524,7 @@ async def _watch_inflight_tasks(
             existing = _active_turns.get(session_id)
             if existing is None or existing.done:
                 _active_turns[session_id] = b
+                _announce_mux_turn(b)
         cont = b
         cont_state = {
             "tool_use_names": {},
@@ -15921,6 +15948,7 @@ async def _admit_turn(
     if broadcast.cancelled:
         return await _finish_cancelled_startup(session_id, broadcast)
     broadcast.perf_admission_ms = obs.elapsed_ms(admission_started)
+    _announce_mux_turn(broadcast)
     return broadcast
 
 
@@ -19414,10 +19442,19 @@ def _mux_wrap_event(session_id: str, event: dict) -> dict:
 
 
 def _mux_session_state_fingerprint(state: dict) -> str:
-    stable = {
-        key: value for key, value in state.items()
-        if key not in {"events_so_far", "runtime_ui_revision"}
-    }
+    stable = {}
+    for key, value in state.items():
+        if key in {
+            "events_so_far", "latest_event_seq", "runtime_ui_revision",
+        }:
+            continue
+        # Announcement states are intentionally memory-only and may omit
+        # default-valued durable fields. Treat omitted and explicit defaults as
+        # equivalent so the next periodic pass does not emit a duplicate frame.
+        if (value is None or value is False or value == "" or value == 0
+                or value == [] or value == {}):
+            continue
+        stable[key] = value
     return json.dumps(stable, sort_keys=True, ensure_ascii=False)
 
 
@@ -19439,26 +19476,18 @@ async def _subscribe_multiplex(
     *,
     mobile: bool = False,
 ):
-    """Merge attachable broadcasts while periodically discovering new ones."""
-    # Flush the SSE response headers before discovery. Starlette's global
-    # GZipMiddleware deliberately skips compressing ``text/event-stream``, but
-    # its responder still buffers ``http.response.start`` until it sees the
-    # first body frame. An idle mux (no checkpoints and no active turns) has no
-    # session event to yield, so without this handshake frame the browser waits
-    # for sse-starlette's 15-second heartbeat and our 5-second EventSource open
-    # timeout fires first. ``ping`` is already part of the mux protocol and is
-    # ignored by panes that have no active channel.
-    yield {"event": "ping", "data": ""}
-
+    """Merge exact turn broadcasts without blocking their live tail."""
     # Bound the aggregate handoff so a stalled HTTP client leaves each child
     # parked on its disk-backed subscriber cursor instead of growing RAM.
     output: asyncio.Queue[dict] = asyncio.Queue(maxsize=256)
     children: dict[tuple[str, str], asyncio.Task] = {}
+    preparing: dict[tuple[str, str], asyncio.Task] = {}
     completed: set[tuple[str, str]] = set()
     state_fingerprints: dict[str, str] = {}
     state_payloads: dict[str, dict] = {}
     scheduled_history_cursors: dict[str, _ScheduledHistoryCursor] = {}
     last_scheduled_history_poll = 0.0
+    closed = False
     # Checkpoints are one-shot reconnect intents for this root SSE handshake.
     # Copy them so consumption is private to the subscription lifecycle.
     pending_checkpoints = {
@@ -19469,14 +19498,10 @@ async def _subscribe_multiplex(
     async def _pump_child(
         session_id: str,
         broadcast: TurnBroadcast,
-        last_event_seq: int,
+        subscriber: _TurnSubscriber,
     ) -> None:
         try:
-            async for event in _subscribe_broadcast(
-                broadcast,
-                mobile=mobile,
-                last_event_seq=last_event_seq,
-            ):
+            while (event := await subscriber.get()) is not None:
                 await output.put(_mux_wrap_event(session_id, event))
         except asyncio.CancelledError:
             raise
@@ -19491,20 +19516,116 @@ async def _subscribe_multiplex(
                     "turn_id": broadcast.turn_id,
                 }),
             })
+        finally:
+            broadcast.unsubscribe(subscriber)
 
     def _start_child(
         session_id: str,
         broadcast: TurnBroadcast,
         last_event_seq: int,
+        *,
+        state_payload: dict | None = None,
+        prefix_events: tuple[dict, ...] = (),
     ) -> None:
         key = (session_id, broadcast.turn_id)
-        if key in children or key in completed:
+        if key in children or key in preparing or key in completed:
             return
-        children[key] = asyncio.create_task(
-            _pump_child(session_id, broadcast, last_event_seq))
+        subscriber = _attach_broadcast_subscriber(
+            broadcast, mobile=mobile, last_event_seq=last_event_seq)
+        if state_payload is None and not prefix_events:
+            children[key] = asyncio.create_task(
+                _pump_child(session_id, broadcast, subscriber))
+            return
+
+        async def _adopt() -> None:
+            started = False
+            try:
+                for event in prefix_events:
+                    await output.put(event)
+                if state_payload is not None:
+                    fingerprint = _mux_session_state_fingerprint(state_payload)
+                    state_payloads[session_id] = state_payload
+                    if state_fingerprints.get(session_id) != fingerprint:
+                        state_fingerprints[session_id] = fingerprint
+                        await output.put({
+                            "event": "session_state",
+                            "data": json.dumps(
+                                state_payload, ensure_ascii=False),
+                        })
+                children[key] = asyncio.create_task(
+                    _pump_child(session_id, broadcast, subscriber))
+                started = True
+            finally:
+                preparing.pop(key, None)
+                if not started:
+                    broadcast.unsubscribe(subscriber)
+
+        preparing[key] = asyncio.create_task(_adopt())
+
+    def _offer_broadcast(broadcast: TurnBroadcast) -> None:
+        """Synchronously attach before an accepted turn can finish."""
+        if closed:
+            return
+        session_id = broadcast.session_id
+        checkpoint = pending_checkpoints.get(session_id)
+        resume_seq = 0
+        prefix_events: tuple[dict, ...] = ()
+        if checkpoint is not None:
+            requested_turn_id = str(checkpoint.get("turn_id") or "")
+            if requested_turn_id == broadcast.turn_id:
+                resume_seq = int(
+                    checkpoint.get("last_event_seq", 0) or 0)
+            elif requested_turn_id:
+                # Preserve the exact-owner ABA rule without delaying attachment
+                # to the successor: canonicalize the stale owner first, then
+                # advertise and replay this accepted turn.
+                prefix_events = ({
+                    "event": "resync",
+                    "data": json.dumps({
+                        "reason": "turn_changed",
+                        "fallback": "canonical_history",
+                        "retryable": False,
+                        "requested_turn_id": requested_turn_id,
+                        "current_turn_id": broadcast.turn_id,
+                        "session_id": session_id,
+                        "turn_id": requested_turn_id,
+                    }),
+                },)
+            pending_checkpoints.pop(session_id, None)
+        state_payload = _mux_broadcast_state(broadcast)
+        state_payload["session_id"] = session_id
+        _start_child(
+            session_id,
+            broadcast,
+            resume_seq,
+            state_payload=state_payload,
+            prefix_events=prefix_events,
+        )
+
+    # Register and snapshot without an await between them. Turn admission runs
+    # on this same event loop, so no accepted broadcast can fall into the gap.
+    _mux_turn_listeners.add(_offer_broadcast)
+    for session_id, checkpoint in tuple(pending_checkpoints.items()):
+        requested_turn_id = str(checkpoint.get("turn_id") or "")
+        recent = _get_recent_turn(session_id)
+        if recent is not None and recent.turn_id == requested_turn_id:
+            _start_child(
+                session_id,
+                recent,
+                int(checkpoint.get("last_event_seq", 0) or 0),
+            )
+            pending_checkpoints.pop(session_id, None)
+    for broadcast in tuple(_active_turns.values()):
+        if not broadcast.done:
+            _offer_broadcast(broadcast)
 
     async def _reconcile() -> None:
         nonlocal last_scheduled_history_poll
+        for key, task in list(preparing.items()):
+            if task.done():
+                preparing.pop(key, None)
+                with suppress(asyncio.CancelledError, Exception):
+                    task.result()
         for key, task in list(children.items()):
             if task.done():
                 children.pop(key, None)
@@ -19674,6 +19795,7 @@ async def _subscribe_multiplex(
                     })
 
         retained_completed = set(children)
+        retained_completed.update(preparing)
         retained_completed.update(
             (session_id, broadcast.turn_id)
             for session_id, broadcast in _active_turns.items()
@@ -19687,7 +19809,8 @@ async def _subscribe_multiplex(
             # while it can still enqueue done/cancelled/error frames; once the
             # task is done, every child frame is already ahead of this state
             # transition in the same FIFO output queue.
-            if any(key[0] == session_id for key in children):
+            if any(key[0] == session_id
+                   for key in (*children, *preparing)):
                 continue
             previous = state_payloads.pop(session_id, {"session_id": session_id})
             state_fingerprints.pop(session_id, None)
@@ -19703,20 +19826,73 @@ async def _subscribe_multiplex(
                 "data": json.dumps(inactive, ensure_ascii=False),
             })
 
-    try:
+    async def _reconcile_loop() -> None:
+        deadline = time.monotonic()
         while True:
             await _reconcile()
-            try:
-                event = await asyncio.wait_for(
-                    output.get(), timeout=_MUX_RECONCILE_INTERVAL_S)
-            except asyncio.TimeoutError:
-                continue
+            deadline += _MUX_RECONCILE_INTERVAL_S
+            now = time.monotonic()
+            if deadline <= now:
+                # A slow disk/status pass must never trigger catch-up spins.
+                deadline = now + _MUX_RECONCILE_INTERVAL_S
+            await asyncio.sleep(max(0.0, deadline - now))
+
+    reconcile_task = asyncio.create_task(_reconcile_loop())
+    output_get: asyncio.Task | None = None
+    try:
+        # Flush the SSE headers only after listener registration. Starlette's
+        # event-stream responder buffers response.start until the first frame.
+        yield {"event": "ping", "data": ""}
+        while True:
+            output_get = asyncio.create_task(output.get())
+            done, _ = await asyncio.wait(
+                {output_get, reconcile_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if reconcile_task in done:
+                output_get.cancel()
+                await asyncio.gather(output_get, return_exceptions=True)
+                output_get = None
+                reconcile_task.result()
+            event = output_get.result()
+            output_get = None
             yield event
     finally:
+        closed = True
+        _mux_turn_listeners.discard(_offer_broadcast)
+        if output_get is not None:
+            output_get.cancel()
+        reconcile_task.cancel()
+        for task in preparing.values():
+            task.cancel()
         for task in children.values():
             task.cancel()
-        if children:
-            await asyncio.gather(*children.values(), return_exceptions=True)
+        await asyncio.gather(
+            *(
+                ([output_get] if output_get is not None else [])
+                + [reconcile_task]
+                + list(preparing.values())
+                + list(children.values())
+            ),
+            return_exceptions=True,
+        )
+
+
+def _attach_broadcast_subscriber(
+    broadcast: TurnBroadcast,
+    *,
+    mobile: bool = False,
+    last_event_seq: int = 0,
+) -> _TurnSubscriber:
+    subscriber = broadcast.subscribe(
+        mobile=mobile, last_event_seq=last_event_seq)
+    if (getattr(broadcast, "is_continuation", False)
+            and not subscriber._resync_payload):
+        broadcast.continuation_consumed = True
+    if (getattr(broadcast, "is_scheduled_delivery", False)
+            and not subscriber._resync_payload):
+        broadcast.scheduled_delivery_consumed = True
+    return subscriber
 
 
 async def _subscribe_broadcast(
@@ -19733,18 +19909,9 @@ async def _subscribe_broadcast(
     then tails the same append-only spool, so stalled HTTP connections retain a
     file cursor rather than an unbounded Python queue.
     """
-    subscriber = broadcast.subscribe(
+    subscriber = _attach_broadcast_subscriber(
+        broadcast,
         mobile=mobile, last_event_seq=last_event_seq)
-    # A real subscriber is now attached. For a CONTINUATION broadcast this is
-    # the one-and-only reconnect that replays the finished task's card flip +
-    # reaction. A replay-gap fallback is not an attachment and must not consume
-    # the continuation advertisement before canonical reconciliation starts.
-    if (getattr(broadcast, "is_continuation", False)
-            and not subscriber._resync_payload):
-        broadcast.continuation_consumed = True
-    if (getattr(broadcast, "is_scheduled_delivery", False)
-            and not subscriber._resync_payload):
-        broadcast.scheduled_delivery_consumed = True
     try:
         while True:
             ev = await subscriber.get()
@@ -19753,6 +19920,34 @@ async def _subscribe_broadcast(
             yield ev
     finally:
         broadcast.unsubscribe(subscriber)
+
+
+def _mux_broadcast_state(b: TurnBroadcast) -> dict:
+    """Build the in-memory state needed to gate an exact mux replay."""
+    return {
+        "active": True,
+        "stopping": bool(b.cancelled),
+        "attachable": True,
+        "background": False,
+        "background_tasks_pending": len(
+            _sessions_with_inflight_tasks.get(b.session_id, ())),
+        "runtime_background_tasks_pending": 0,
+        "runtime_continuation_pending": False,
+        "runtime_ui_revision": "",
+        **_sdk_scheduled_snapshot(b.session_id),
+        "turn_id": b.turn_id,
+        "parent_turn_id": b.parent_turn_id,
+        "model": b.model,
+        "started_at": b.started_at,
+        "events_so_far": b.replay_count(),
+        "latest_event_seq": b.latest_event_seq,
+        "continuation": getattr(b, "is_continuation", False),
+        "scheduled": getattr(b, "is_scheduled_delivery", False),
+        "activity_source": b.activity_source,
+        "user_text": b.user_text or "",
+        "user_images": b.user_images or [],
+        "user_docs": b.user_docs or [],
+    }
 
 
 def _session_active_status(
@@ -19861,39 +20056,14 @@ def _session_active_status(
                 ),
             }
     _hydrate_staged_attachment_display(b)
-    return {
-        "active": True,
-        "stopping": bool(b.cancelled),
-        "attachable": True,
-        "background": False,
-        "background_tasks_pending": len(
-            _sessions_with_inflight_tasks.get(sid, ())),
+    state = _mux_broadcast_state(b)
+    state.update({
         "runtime_background_tasks_pending": runtime_background_pending,
         "runtime_continuation_pending": runtime_continuation_pending,
         "runtime_ui_revision": runtime_ui_revision,
         **scheduled_state,
-        "turn_id": b.turn_id,
-        "parent_turn_id": b.parent_turn_id,
-        "model": b.model,
-        "started_at": b.started_at,
-        "events_so_far": b.replay_count(),
-        # True when this is a HEADLESS CONTINUATION turn opened by the bg-task
-        # watcher (no user prompt). The frontend attaches in "continuation"
-        # mode — same reconnect SSE, but it must NOT truncate the in-flight
-        # portion (the launching tool_use card lives there; the replayed
-        # task_notification flips it to ✅done).
-        "continuation": getattr(b, "is_continuation", False),
-        "scheduled": getattr(b, "is_scheduled_delivery", False),
-        "activity_source": b.activity_source,
-        # The turn's user prompt + attachments. The browser needs these to
-        # render the user bubble when it LIVE-reconnects to a turn the server
-        # drained from the queue headlessly (the browser never "sent" it, so
-        # the bubble isn't in `messages`). Same fields _broadcast_to_ui_messages
-        # injects on a reload-rebuild — keeps the two reconnect paths in sync.
-        "user_text": b.user_text or "",
-        "user_images": b.user_images or [],
-        "user_docs": b.user_docs or [],
-    }
+    })
+    return state
 
 
 @router.get("/sessions/{sid}/active", dependencies=[Depends(require_token)])
@@ -20523,6 +20693,7 @@ async def _register_scheduled_delivery(
                     _remember_recent_turn(session_id, delivery.broadcast)
                     return False
                 _active_turns[session_id] = delivery.broadcast
+                _announce_mux_turn(delivery.broadcast)
                 return True
         await asyncio.sleep(0.02)
     return False

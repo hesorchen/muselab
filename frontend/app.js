@@ -394,6 +394,9 @@ function portal() {
     _chatMuxReconnectAttempts: 0,
     _chatMuxSupported: null,
     _chatMuxConnected: false,
+    _chatMuxOpenedAt: 0,
+    _chatMuxLastTransportAt: 0,
+    _chatMuxLastApplicationAt: 0,
     _splashHintTimer: null,
     _splashHardTimeout: null,
 
@@ -8471,7 +8474,13 @@ function portal() {
         _streamPlainRenderCount: 0,
         _deferredStreamRich: [],
         _deferredStreamRichHandle: null,
-        _lastSseActivity: 0,
+        // Transport liveness and actual session progress are intentionally
+        // separate. A healthy root heartbeat must not hide a stuck mux child.
+        _lastSseTransportAt: 0,
+        _lastSseProgressAt: 0,
+        _muxHealthRecoveryKey: "",
+        _muxFullReplayTurnId: "",
+        _muxFullReplayAttempts: 0,
         _stallWatch: null,
         _serverActiveObserved: false,
         // A terminal SSE event is newer than the last polled session-list
@@ -8644,6 +8653,17 @@ function portal() {
       if (st._lastTerminalTurnId === undefined) st._lastTerminalTurnId = "";
       if (st.parentTurnId === undefined) st.parentTurnId = "";
       if (st._streamOwnerToken === undefined) st._streamOwnerToken = "";
+      if (!Number.isFinite(Number(st._lastSseTransportAt))) {
+        st._lastSseTransportAt = 0;
+      }
+      if (!Number.isFinite(Number(st._lastSseProgressAt))) {
+        st._lastSseProgressAt = 0;
+      }
+      if (st._muxHealthRecoveryKey === undefined) st._muxHealthRecoveryKey = "";
+      if (st._muxFullReplayTurnId === undefined) st._muxFullReplayTurnId = "";
+      if (!Number.isFinite(Number(st._muxFullReplayAttempts))) {
+        st._muxFullReplayAttempts = 0;
+      }
       if (!Number.isFinite(st.lastEventSeq)) st.lastEventSeq = 0;
       if (st.permission === undefined) st.permission = "";
       if (st.effort === undefined) st.effort = "auto";
@@ -11395,11 +11415,73 @@ function portal() {
     _setChatMuxUnsupported() {
       this._chatMuxSupported = false;
       this._chatMuxConnected = false;
+      this._chatMuxOpenedAt = 0;
       if (this._chatMuxReconnectTimer) clearTimeout(this._chatMuxReconnectTimer);
       this._chatMuxReconnectTimer = null;
       try { if (this._chatMuxSource) this._chatMuxSource.close(); } catch (_) {}
       this._chatMuxSource = null;
       for (const channel of this._chatMuxChannels.values()) channel.disconnect();
+    },
+    async _forceChatMuxReconnect(ownerSource, sid, turnId) {
+      if (!ownerSource || this._chatMuxSource !== ownerSource
+          || this._chatMuxSupported === false || !this.token) return false;
+      if (!this._allowReconnect(sid, turnId)) return false;
+      if (this._chatMuxReconnectTimer) {
+        clearTimeout(this._chatMuxReconnectTimer);
+        this._chatMuxReconnectTimer = null;
+      }
+      try { ownerSource.close(); } catch (_) {}
+      if (this._chatMuxSource !== ownerSource) return false;
+      this._chatMuxSource = null;
+      this._chatMuxConnected = false;
+      this._chatMuxOpenedAt = 0;
+      for (const channel of this._chatMuxChannels.values()) channel.disconnect();
+      return await this._ensureChatMux({ reconnect: true });
+    },
+    async _restartChatMuxFromBeginning(
+      sid, st, ownerChannel, ownerSource, options = {},
+    ) {
+      if (!sid || !st || this.tabState[sid] !== st || st.es !== ownerChannel
+          || !ownerChannel || !ownerChannel._muxChannel
+          || this._chatMuxSource !== ownerSource) return false;
+      const turnId = String(options.turnId || st.activeTurnId || "");
+      if (!turnId) return false;
+      if (st._muxFullReplayTurnId !== turnId) {
+        st._muxFullReplayTurnId = turnId;
+        st._muxFullReplayAttempts = 0;
+      }
+      if ((Number(st._muxFullReplayAttempts) || 0) >= 1
+          || !this._allowReconnect(sid, turnId)) return false;
+      st._muxFullReplayAttempts = (Number(st._muxFullReplayAttempts) || 0) + 1;
+      if (this._chatMuxReconnectTimer) {
+        clearTimeout(this._chatMuxReconnectTimer);
+        this._chatMuxReconnectTimer = null;
+      }
+      // Remove this logical checkpoint before opening the new root. Sequence
+      // zero asks the still-live broadcast for its complete disk-backed replay;
+      // send(reconnect) then truncates only this turn's mutable local suffix.
+      try { ownerChannel.close(); } catch (_) {}
+      if (st._stallWatch) clearInterval(st._stallWatch);
+      st._stallWatch = null;
+      if (st.es === ownerChannel) st.es = null;
+      st.streaming = false;
+      st.lastEventSeq = 0;
+      st._canonicalResyncPending = false;
+      try { ownerSource.close(); } catch (_) {}
+      if (this._chatMuxSource === ownerSource) {
+        this._chatMuxSource = null;
+        this._chatMuxConnected = false;
+        this._chatMuxOpenedAt = 0;
+      }
+      for (const channel of this._chatMuxChannels.values()) channel.disconnect();
+      await this.send({
+        reconnect: true,
+        sessionId: sid,
+        turnId,
+        startedAt: options.startedAt,
+        scheduled: !!options.scheduled,
+      });
+      return this.tabState[sid] === st && st.streaming && !!st.es;
     },
     _scheduleChatMuxReconnect() {
       if (this._chatMuxSupported === false || !this.token
@@ -11427,8 +11509,11 @@ function portal() {
     },
     async _openChatMux() {
       try { if (this._chatMuxSource) this._chatMuxSource.close(); } catch (_) {}
+      const connectingAt = Date.now();
       this._chatMuxSource = null;
       this._chatMuxConnected = false;
+      this._chatMuxOpenedAt = 0;
+      this._chatMuxLastTransportAt = connectingAt;
       for (const channel of this._chatMuxChannels.values()) channel.disconnect();
       let response;
       try {
@@ -11462,6 +11547,13 @@ function portal() {
       const source = new EventSource(
         "/api/chat/stream/mux?ticket=" + encodeURIComponent(payload.ticket));
       this._chatMuxSource = source;
+      const markRootFrame = application => {
+        if (this._chatMuxSource !== source) return false;
+        const now = Date.now();
+        this._chatMuxLastTransportAt = now;
+        if (application) this._chatMuxLastApplicationAt = now;
+        return true;
+      };
       let openSettled = false;
       let settleOpen;
       const opened = new Promise(resolve => { settleOpen = resolve; });
@@ -11479,6 +11571,9 @@ function portal() {
       }, 5000);
       source.onopen = () => {
         if (this._chatMuxSource !== source) return;
+        const now = Date.now();
+        this._chatMuxOpenedAt = now;
+        this._chatMuxLastTransportAt = now;
         clearTimeout(openTimeout);
         this._chatMuxConnected = true;
         this._chatMuxReconnectAttempts = 0;
@@ -11488,32 +11583,28 @@ function portal() {
         }
       };
       source.addEventListener("session_state", ev => {
-        if (this._chatMuxSource !== source) return;
+        if (!markRootFrame(true)) return;
         let state = {};
         try { state = JSON.parse(ev.data) || {}; } catch (_) {}
         void this._handleChatMuxSessionState(state);
       });
       source.addEventListener("scheduled_history", ev => {
-        if (this._chatMuxSource !== source) return;
+        if (!markRootFrame(true)) return;
         let payload = {};
         try { payload = JSON.parse(ev.data) || {}; } catch (_) {}
         this._handleScheduledHistoryUpdate(payload);
       });
       for (const type of CHAT_MUX_STREAM_EVENTS) {
         source.addEventListener(type, ev => {
-          if (this._chatMuxSource !== source) return;
+          if (!markRootFrame(type !== "ping")) return;
           if (type === "error" && (ev.data === undefined || ev.data === "")) {
             this._handleChatMuxDisconnect(source);
             return;
           }
-          if (type === "ping" && !ev.data) {
-            for (const channel of this._chatMuxChannels.values()) {
-              if (channel._activated && channel.readyState !== 2) {
-                channel.dispatchEvent(new MessageEvent("ping", { data: "" }));
-              }
-            }
-            return;
-          }
+          // Root heartbeat proves only socket liveness. Forwarding it to every
+          // logical channel used to reset their progress clock and masked a
+          // reconciler/child stream that had stopped delivering real events.
+          if (type === "ping") return;
           this._dispatchChatMuxEvent(type, ev.data);
         });
       }
@@ -11530,6 +11621,7 @@ function portal() {
       try { source.close(); } catch (_) {}
       this._chatMuxSource = null;
       this._chatMuxConnected = false;
+      this._chatMuxOpenedAt = 0;
       for (const channel of this._chatMuxChannels.values()) channel.disconnect();
       // The per-session reducers retain logical ownership while the one native
       // transport reconnects. In particular, do not synthesize `error`/`done`.
@@ -11752,8 +11844,13 @@ function portal() {
       if (this._chatMuxAttachPromises.has(sid)) return;
       const attach = (async () => {
         const st = this._ensureTabState(sid);
+        // Establish the reducer first. A cold history response is guarded from
+        // installing once the live owner claims the pane, while mux events no
+        // longer wait behind a multi-second transcript read or overflow at 512.
         if (!st._loaded && !st.streaming && !st.es) {
-          await this.loadSession(sid, { quiet: true, probeActive: false });
+          void this.loadSession(
+            sid, { quiet: true, probeActive: false },
+          ).catch(() => false);
         }
         if (st.streaming || st.es || this.tabState[sid] !== st) return;
         st.parentTurnId = String(payload.parent_turn_id || "");
@@ -12245,21 +12342,35 @@ function portal() {
         return Promise.resolve(false);
       }
       const ownerEs = st.es;
+      const ownerMuxSource = ownerEs && ownerEs._muxChannel
+        ? this._chatMuxSource : null;
       if (ownerEs && ownerEs._muxChannel && !this._chatMuxConnected) {
         this._scheduleChatMuxReconnect();
         return Promise.resolve(false);
       }
-      const observedActivity = Number(st._lastSseActivity)
+      const observedProgress = Number(st._lastSseProgressAt)
         || Number(st._streamStartedAt) || Date.now();
       const transportClosed = !!(ownerEs && Number(ownerEs.readyState) === 2);
-      if (!transportClosed && Date.now() - observedActivity < 18_000) {
+      const rootTransportAt = Number(this._chatMuxLastTransportAt)
+        || Number(this._chatMuxOpenedAt) || Date.now();
+      const rootSilent = !!ownerMuxSource
+        && Date.now() - rootTransportAt >= 40_000;
+      if (!transportClosed && !rootSilent
+          && Date.now() - observedProgress < 18_000) {
         return Promise.resolve(false);
       }
-      return this._requestSessionSync(sid, "stream_health", { ownerEs });
+      return this._requestSessionSync(sid, "stream_health", {
+        ownerEs, ownerMuxSource,
+      });
     },
     async _runStreamHealthSync(sid, st, options = {}) {
       const ownerEs = options.ownerEs;
-      if (this.tabState[sid] !== st || st.es !== ownerEs) return false;
+      const ownerMuxSource = options.ownerMuxSource;
+      const ownsMuxRoot = !ownerEs || !ownerEs._muxChannel
+        || this._chatMuxSource === ownerMuxSource;
+      if (this.tabState[sid] !== st || st.es !== ownerEs || !ownsMuxRoot) {
+        return false;
+      }
       try {
         const r = await this._fetchWithDeadline(
           `/api/chat/sessions/${sid}/active`,
@@ -12268,7 +12379,9 @@ function portal() {
         );
         if (!r.ok) return false;
         const d = await r.json();
-        if (this.tabState[sid] !== st || st.es !== ownerEs) return false;
+        if (this.tabState[sid] !== st || st.es !== ownerEs
+            || (ownerEs && ownerEs._muxChannel
+              && this._chatMuxSource !== ownerMuxSource)) return false;
         if (d.active) {
           st._serverActiveObserved = true;
           if (d.background && d.attachable === false) {
@@ -12278,8 +12391,37 @@ function portal() {
               pendingCount: d.background_tasks_pending,
             });
           }
-          const silenceMs = Date.now() - (Number(st._lastSseActivity)
+          const silenceMs = Date.now() - (Number(st._lastSseProgressAt)
             || Number(st._streamStartedAt) || Date.now());
+          if (ownerEs && ownerEs._muxChannel) {
+            const serverTurnId = String(d.turn_id || st.activeTurnId || "");
+            const localTurnId = String(st.activeTurnId || "");
+            const serverSeq = Math.max(0, Number(d.latest_event_seq) || 0);
+            const localSeq = Math.max(0, Number(st.lastEventSeq) || 0);
+            const turnChanged = !!serverTurnId && !!localTurnId
+              && serverTurnId !== localTurnId;
+            const serverAhead = turnChanged || ((!serverTurnId || !localTurnId
+              || serverTurnId === localTurnId) && serverSeq > localSeq);
+            const rootTransportAt = Number(this._chatMuxLastTransportAt)
+              || Number(this._chatMuxOpenedAt) || Date.now();
+            const rootSilent = !this._chatMuxConnected || !ownerMuxSource
+              || Number(ownerMuxSource.readyState) === 2
+              || Date.now() - rootTransportAt >= 40_000;
+            if (!rootSilent && (!serverAhead || silenceMs < 18_000)) {
+              return false;
+            }
+            const recoveryKey = `${serverTurnId}:${serverSeq}:${localSeq}`;
+            if (!rootSilent && st._muxHealthRecoveryKey === recoveryKey) {
+              return false;
+            }
+            const recovered = await this._forceChatMuxReconnect(
+              ownerMuxSource, sid, serverTurnId || localTurnId,
+            );
+            if (recovered && this.tabState[sid] === st) {
+              st._muxHealthRecoveryKey = recoveryKey;
+            }
+            return recovered;
+          }
           const serverHasReplay = Math.max(0, Number(d.events_so_far) || 0) > 0;
           const closedNow = !!(st.es && Number(st.es.readyState) === 2);
           if (!st.es || (!closedNow && (!serverHasReplay || silenceMs < 18_000))) {
@@ -12502,19 +12644,20 @@ function portal() {
         const streamAgeMs = st._streamStartedAt
           ? Math.max(0, Date.now() - st._streamStartedAt) : Infinity;
         if (cur.active) st._serverActiveObserved = true;
+        const canonicalCommitted = canonicalSuffixMissing || visibleNewer
+          || messageCountChanged || turnCountChanged;
         const serverSettled = !cur.active && (
           st._serverActiveObserved
           || !!(previous && previous.active)
           || (newer && streamAgeMs >= 5000)
         );
         if ((st.streaming || st.es) && serverSettled) {
-          const sseSilentMs = Date.now() - (Number(st._lastSseActivity)
-            || Number(st._streamStartedAt) || Date.now());
-          const transportDead = !st.es
-            || Number(st.es.readyState) === 2
-            || sseSilentMs >= 32_000;
-          if (transportDead) this._retireStaleSessionStream(sid, st);
           st._pendingExternalUpdate = true;
+          // Canonical metadata is authoritative once it proves a committed
+          // suffix. Root pings cannot postpone retirement of a logical stream
+          // whose terminal event was lost.
+          if (canonicalCommitted) this._retireStaleSessionStream(sid, st);
+          else this._recoverStalledStream(sid);
         }
         if (st.streaming || st.es) {
           if (visibleNewer || canonicalSuffixMissing) {
@@ -31930,6 +32073,9 @@ function portal() {
         streamState._reconnectGateTurn = "";
         streamState._reconnectGateCount = 0;
         streamState._reconnectGateAt = 0;
+        streamState._muxHealthRecoveryKey = "";
+        streamState._muxFullReplayTurnId = "";
+        streamState._muxFullReplayAttempts = 0;
       }
       // A live owner supersedes any foreground history shield. Advancing the
       // visual generation makes an older load response unable to turn the live
@@ -32034,6 +32180,11 @@ function portal() {
         streamState.activeTurnId = "";
         streamState.parentTurnId = "";
         streamState.lastEventSeq = 0;
+        streamState._lastSseTransportAt = 0;
+        streamState._lastSseProgressAt = 0;
+        streamState._muxHealthRecoveryKey = "";
+        streamState._muxFullReplayTurnId = "";
+        streamState._muxFullReplayAttempts = 0;
         streamState.streamingModel = "";
       };
       const _mintLegacyTicket = async () => await fetch("/api/chat/stream/start", {
@@ -32195,7 +32346,7 @@ function portal() {
       // "0.0s" immediately instead of waiting through the SSE handshake, and
       // (b) mid-stream reconnects don't visibly reset the displayed elapsed.
       es.onopen = () => {
-        streamState._lastSseActivity = Date.now();
+        streamState._lastSseTransportAt = Date.now();
         if (!hasDetachedText && !isReconnect && !resumed) {
           this._commitChatRecoveryDraft(sendSid, composerInput);
         }
@@ -32208,14 +32359,11 @@ function portal() {
       // `done`. The turn then spins forever even though the server finished
       // and persisted the full reply (confirmed 2026-06-08: JSONL had the
       // complete answer; the client only ever rendered the thinking block).
-      // The server now heartbeats a NAMED `ping` every 15s; we bump
-      // _lastSseActivity on EVERY inbound event (incl. ping) and, if the
-      // stream goes fully silent past 2× the ping interval, synthesize an
-      // `error` event to reuse the transport-level reconnect path below
-      // (close → /active probe → re-subscribe or load the finished reply
-      // from disk). Reconnect is idempotent (broadcast replay), so a false
-      // trigger only costs a reconnect, never data.
-      streamState._lastSseActivity = Date.now();
+      // A root heartbeat only proves socket liveness; actual per-session
+      // progress has its own clock and is verified against latest_event_seq.
+      const streamClockStarted = Date.now();
+      streamState._lastSseTransportAt = streamClockStarted;
+      streamState._lastSseProgressAt = streamClockStarted;
       const _bumpSse = (ev) => {
         // An older EventSource may deliver one final buffered event after a
         // reconnect replaced it. It no longer owns this tab state.
@@ -32223,7 +32371,8 @@ function portal() {
           if (ev && ev.stopImmediatePropagation) ev.stopImmediatePropagation();
           return;
         }
-        streamState._lastSseActivity = Date.now();
+        const frameAt = Date.now();
+        streamState._lastSseTransportAt = frameAt;
         if (ev && ev.type !== "ping") {
           let meta = null;
           try { meta = JSON.parse(ev.data); } catch (_) {}
@@ -32257,6 +32406,10 @@ function portal() {
               streamState.lastEventSeq = eventSeq;
             }
           }
+        }
+        if (ev && !["ping", "error", "resync"].includes(ev.type)) {
+          streamState._lastSseProgressAt = frameAt;
+          streamState._muxHealthRecoveryKey = "";
         }
         if (sentUserBubble && !["ping", "error", "resync"].includes(ev && ev.type)) {
           sentUserBubble._admissionPending = false;
@@ -32298,17 +32451,19 @@ function portal() {
       if (streamState._stallWatch) clearInterval(streamState._stallWatch);
       streamState._stallWatch = setInterval(() => {
         if (!streamState.streaming) return;
-        const silentMs = Date.now() - (streamState._lastSseActivity || 0);
+        const progressSilentMs = Date.now() - (
+          streamState._lastSseProgressAt || streamState._streamStartedAt || Date.now());
+        const transportAt = es._muxChannel
+          ? (this._chatMuxLastTransportAt || this._chatMuxOpenedAt)
+          : streamState._lastSseTransportAt;
+        const transportSilentMs = Date.now() - (transportAt || Date.now());
         const sync = streamState.sessionSync;
         const healthProbePending = !!(sync && (
           (sync.inFlight && sync.inFlight.reason === "stream_health")
           || (sync.pending && sync.pending.stream_health)
         ));
-        if (silentMs > 40000 && !healthProbePending) {
-          // A mux channel never owns the native socket. Reconnect the one root
-          // transport without sending a synthetic per-session terminal/error.
+        if (transportSilentMs > 40000 && !healthProbePending) {
           if (es._muxChannel) {
-            this._scheduleChatMuxReconnect();
             this._recoverStalledStream(streamSid);
             return;
           }
@@ -32316,7 +32471,7 @@ function portal() {
           clearInterval(streamState._stallWatch);
           streamState._stallWatch = null;
           try { es.dispatchEvent(new Event("error")); } catch (_) {}
-        } else if (silentMs > 18000) {
+        } else if (progressSilentMs > 18000) {
           this._recoverStalledStream(streamSid);
         }
       }, 10000);
@@ -33528,28 +33683,53 @@ function portal() {
         try { payload = JSON.parse(ev.data) || {}; } catch (_) {}
         const reason = payload.reason || "replay_truncated";
         const fallback = payload.fallback || "canonical_history";
-        streamState._canonicalResyncPending = true;
         streamState._serverActiveObserved = true;
-        try { es.close(); } catch (_) {}
-        if (streamState._stallWatch) clearInterval(streamState._stallWatch);
-        streamState._stallWatch = null;
-        streamState.es = null;
-        if (streamState._flushLivePresentation === flushLivePresentation) {
-          streamState._flushLivePresentation = null;
-        }
-        pendingTaskProgress.clear();
         if (streamMobile && reason === "replay_truncated") {
           this.toast(this.lang === "zh"
             ? "回复数据量较大，完成后会自动从会话记录同步"
             : "This reply exceeded the live replay window; canonical history will sync when it finishes",
             "info", 5000);
         }
-        // The protocol names the authoritative recovery source. Unknown/older
-        // values still fail closed to canonical history rather than reconnecting
-        // the same unavailable sequence in a loop.
-        streamState._canonicalResyncFallback = fallback;
-        this._scheduleCanonicalStreamReload(streamSid, streamState);
         streamState._canonicalResyncReason = reason;
+        const canonicalFallback = () => {
+          streamState._canonicalResyncPending = true;
+          try { es.close(); } catch (_) {}
+          if (streamState._stallWatch) clearInterval(streamState._stallWatch);
+          streamState._stallWatch = null;
+          if (streamState.es === es) streamState.es = null;
+          if (streamState._flushLivePresentation === flushLivePresentation) {
+            streamState._flushLivePresentation = null;
+          }
+          pendingTaskProgress.clear();
+          streamState._canonicalResyncFallback = fallback;
+          this._scheduleCanonicalStreamReload(streamSid, streamState);
+        };
+        const fullReplayReasons = new Set([
+          "bootstrap_overflow", "replay_gap", "live_backlog",
+          "live_barrier_missing", "child_stream_error",
+        ]);
+        if (es._muxChannel && !isContinuation && fullReplayReasons.has(reason)) {
+          const ownerRoot = this._chatMuxSource;
+          void this._restartChatMuxFromBeginning(
+            streamSid,
+            streamState,
+            es,
+            ownerRoot,
+            {
+              turnId: payload.turn_id || streamTurnId,
+              startedAt: streamState._streamStartedAt / 1000,
+              scheduled: isScheduledDelivery,
+            },
+          ).then(restarted => {
+            if (!restarted && this.tabState[streamSid] === streamState) {
+              canonicalFallback();
+            }
+          });
+          return;
+        }
+        // Unknown and exact-owner-change failures stay fail-closed to canonical
+        // history; replaying sequence zero for the wrong turn is unsafe.
+        canonicalFallback();
       });
       es.addEventListener("error", async ev => {
         flushTerminalPresentation();
