@@ -1857,15 +1857,13 @@ def _runtime_task_overlay(
     if usage:
         fields["usage"] = dict(usage)
     try:
-        current = owner
-        seen: set[str] = set()
-        for _ in range(32):
-            if not current or current in seen:
-                break
-            seen.add(current)
+        lineage = sess.runtime_lineage(owner)
+        if owner in lineage:
+            targets = lineage[lineage.index(owner):]
+        else:
+            targets = [owner]
+        for current in targets:
             sess.set_runtime_task_overlay(current, tid, **fields)
-            current_meta = sess.get_session_meta(current) or {}
-            current = str(current_meta.get("runtime_successor") or "")
     except Exception as exc:
         sys.stderr.write(
             f"[chat] runtime task overlay failed sid={owner[:8]} "
