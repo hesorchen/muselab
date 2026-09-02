@@ -1036,6 +1036,100 @@ async def test_native_watcher_slot_waits_for_evicted_owner(
     await manager.shutdown()
 
 
+def test_mount_filesystem_types_uses_deepest_mount_and_decodes_paths(
+    app_module,
+    temp_root,
+):
+    import backend.file_events as file_events
+
+    native_root = temp_root / "native root"
+    host_mount = native_root / "host"
+    encoded_native = str(native_root).replace(" ", r"\040")
+    encoded_host = str(host_mount).replace(" ", r"\040")
+    mountinfo = temp_root / "mountinfo"
+    mountinfo.write_text(
+        "\n".join((
+            "20 1 0:1 / / rw - ext4 /dev/root rw",
+            f"21 20 0:2 / {encoded_native} rw - ext4 /dev/sdb rw",
+            f"22 21 0:3 / {encoded_host} rw - 9p drvfs rw",
+        )),
+        encoding="utf-8",
+    )
+
+    assert file_events._mount_filesystem_types(
+        (native_root / "notes", host_mount / "project"),
+        mountinfo_path=mountinfo,
+    ) == frozenset({"ext4", "9p"})
+
+
+def test_wsl_native_filesystem_overrides_automatic_polling(
+    app_module,
+    temp_root,
+    monkeypatch,
+):
+    import backend.file_events as file_events
+
+    monkeypatch.setattr(file_events, "_running_on_wsl", lambda: True)
+    monkeypatch.setattr(
+        file_events,
+        "_mount_filesystem_types",
+        lambda _paths: frozenset({"ext4"}),
+    )
+
+    assert file_events._effective_watchfiles_force_polling(
+        None,
+        (temp_root,),
+    ) is False
+
+
+@pytest.mark.parametrize(
+    "filesystems",
+    [
+        frozenset({"9p"}),
+        frozenset({"ext4", "9p"}),
+        None,
+    ],
+)
+def test_wsl_host_or_unknown_filesystem_keeps_polling(
+    app_module,
+    temp_root,
+    monkeypatch,
+    filesystems,
+):
+    import backend.file_events as file_events
+
+    monkeypatch.setattr(file_events, "_running_on_wsl", lambda: True)
+    monkeypatch.setattr(
+        file_events,
+        "_mount_filesystem_types",
+        lambda _paths: filesystems,
+    )
+
+    assert file_events._effective_watchfiles_force_polling(
+        None,
+        (temp_root,),
+    ) is True
+
+
+@pytest.mark.parametrize("configured", [False, True])
+def test_explicit_polling_configuration_has_priority(
+    app_module,
+    temp_root,
+    monkeypatch,
+    configured,
+):
+    import backend.file_events as file_events
+
+    def unexpected_probe():
+        raise AssertionError("explicit configuration must avoid WSL probing")
+
+    monkeypatch.setattr(file_events, "_running_on_wsl", unexpected_probe)
+    assert file_events._effective_watchfiles_force_polling(
+        configured,
+        (temp_root,),
+    ) is configured
+
+
 @pytest.mark.asyncio
 async def test_native_directory_budget_is_fifo_and_cancellation_safe(
     app_module,
@@ -1847,7 +1941,11 @@ async def test_watcher_uses_shallow_indexed_directories_and_closes_refresh_gap(
     assert nested in second_paths
     assert first_options["recursive"] is False
     assert second_options["recursive"] is False
-    assert first_options["force_polling"] is file_events._FORCE_POLLING
+    assert first_options["force_polling"] is (
+        file_events._effective_watchfiles_force_polling(
+            file_events._FORCE_POLLING, first_paths,
+        )
+    )
 
     indexed = {
         row["path"]
