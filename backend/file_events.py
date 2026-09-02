@@ -8,6 +8,7 @@ import errno
 import json
 import multiprocessing
 import os
+import re
 import sys
 from collections import OrderedDict
 from collections.abc import AsyncIterator
@@ -65,6 +66,101 @@ _FORCE_POLLING: bool | None = (
     if _POLLING_ENV is None
     else _POLLING_ENV.strip().lower() in {"1", "true", "yes", "on"}
 )
+_MOUNTINFO_PATH = Path("/proc/self/mountinfo")
+_MOUNTINFO_ESCAPE_RE = re.compile(r"\\(040|011|012|134)")
+_MOUNTINFO_ESCAPES = {
+    "040": " ",
+    "011": "\t",
+    "012": "\n",
+    "134": "\\",
+}
+_WSL_NATIVE_WATCH_FILESYSTEMS = frozenset({
+    "btrfs",
+    "ext2",
+    "ext3",
+    "ext4",
+    "f2fs",
+    "jfs",
+    "overlay",
+    "ramfs",
+    "reiserfs",
+    "tmpfs",
+    "xfs",
+    "zfs",
+})
+
+
+def _running_on_wsl() -> bool:
+    if sys.platform != "linux":
+        return False
+    with contextlib.suppress(AttributeError):
+        return "microsoft-standard" in os.uname().release.lower()
+    return False
+
+
+def _decode_mountinfo_path(value: str) -> str:
+    return _MOUNTINFO_ESCAPE_RE.sub(
+        lambda match: _MOUNTINFO_ESCAPES[match.group(1)],
+        value,
+    )
+
+
+def _mount_filesystem_types(
+    paths: tuple[Path, ...],
+    *,
+    mountinfo_path: Path = _MOUNTINFO_PATH,
+) -> frozenset[str] | None:
+    """Resolve every watched path to its deepest Linux mount type."""
+    try:
+        rows = mountinfo_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+
+    mounts: dict[Path, str] = {}
+    for row in rows:
+        left, separator, right = row.partition(" - ")
+        left_fields = left.split()
+        right_fields = right.split()
+        if not separator or len(left_fields) < 5 or not right_fields:
+            continue
+        mountpoint = Path(_decode_mountinfo_path(left_fields[4]))
+        mounts[mountpoint] = right_fields[0]
+    if not mounts:
+        return None
+
+    filesystems: set[str] = set()
+    for path in paths:
+        candidate = Path(os.path.abspath(path))
+        while candidate not in mounts and candidate.parent != candidate:
+            candidate = candidate.parent
+        filesystem = mounts.get(candidate)
+        if filesystem is None:
+            return None
+        filesystems.add(filesystem)
+    return frozenset(filesystems)
+
+
+def _effective_watchfiles_force_polling(
+    configured: bool | None,
+    directories: tuple[Path, ...],
+) -> bool | None:
+    """Use inotify for WSL's Linux filesystems, polling for host mounts."""
+    if configured is not None:
+        return configured
+    if not _running_on_wsl():
+        return None
+    filesystems = _mount_filesystem_types(directories)
+    if (
+        filesystems
+        and filesystems <= _WSL_NATIVE_WATCH_FILESYSTEMS
+    ):
+        # watchfiles otherwise forces polling for every WSL path, including
+        # native ext4. On large home workspaces that burns a core rescanning
+        # unchanged trees. Explicit False selects reliable inotify here.
+        return False
+    # Windows/9p, mixed, and unknown mounts keep watchfiles' conservative
+    # correctness-preserving polling behavior.
+    return True
 
 
 def _default_native_directory_watch_budget() -> int:
@@ -1708,17 +1804,6 @@ class FileWatchManager:
         return directories or (state.root,)
 
     @staticmethod
-    def _watchfiles_uses_polling(force_polling: bool | None) -> bool:
-        """Mirror watchfiles' explicit and WSL automatic polling decision."""
-        if force_polling is not None:
-            return force_polling
-        if sys.platform != "linux":
-            return False
-        with contextlib.suppress(AttributeError):
-            return "microsoft-standard" in os.uname().release.lower()
-        return False
-
-    @staticmethod
     def _native_watch_cost(directories: tuple[Path, ...]) -> int:
         """Estimate non-recursive inotify descriptors from unique directories."""
         return max(1, len(dict.fromkeys(directories)))
@@ -1872,8 +1957,11 @@ class FileWatchManager:
                 directories = await self._watch_directories(state)
                 if revision != state.watch_revision:
                     continue
-                force_polling = state.force_polling
-                if not self._watchfiles_uses_polling(force_polling):
+                force_polling = _effective_watchfiles_force_polling(
+                    state.force_polling,
+                    directories,
+                )
+                if force_polling is not True:
                     watch_cost = self._native_watch_cost(directories)
                     (
                         native_lease,
