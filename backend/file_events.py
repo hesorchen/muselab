@@ -42,6 +42,8 @@ _QUEUE_LIMIT = 8
 _WATCH_DEBOUNCE_MS = 350
 _WATCH_STEP_MS = 100
 _WATCH_RETRY_S = 1.5
+_WATCH_RETRY_MAX_S = 10.0
+_WATCH_STABLE_RESET_S = 30.0
 _RECONCILE_RETRY_BASE_S = 0.25
 _RECONCILE_RETRY_MAX_S = 30.0
 _MAX_WATCHED_ROOTS = 16
@@ -124,6 +126,7 @@ class _WatchState:
     watch_ready: asyncio.Event = field(default_factory=asyncio.Event)
     watch_paths: tuple[Path, ...] = ()
     needs_closing_reconcile: bool = False
+    watch_failures: int = 0
     reconcile_pending: bool = False
     reconcile_running: bool = False
     reconcile_attempts: int = 0
@@ -137,6 +140,21 @@ class _WatchState:
     native_budget_wait_cost: int = 0
     native_watch_cost: int = 0
     native_budget_degraded: bool = False
+
+
+def _next_watch_retry_delay(
+    state: _WatchState,
+    armed_for_s: float,
+) -> float:
+    """Back off repeated broken generations without hiding watch gaps."""
+    if armed_for_s >= _WATCH_STABLE_RESET_S:
+        state.watch_failures = 0
+    state.watch_failures += 1
+    exponent = min(state.watch_failures - 1, 16)
+    return min(
+        _WATCH_RETRY_MAX_S,
+        _WATCH_RETRY_S * (2 ** exponent),
+    )
 
 
 @dataclass(frozen=True)
@@ -1848,6 +1866,7 @@ class FileWatchManager:
             budget_ready_task: asyncio.Task[bool] | None = None
             native_lease = False
             keep_budget_waiter = False
+            armed_at: float | None = None
             try:
                 revision = state.watch_revision
                 directories = await self._watch_directories(state)
@@ -1930,6 +1949,8 @@ class FileWatchManager:
                         except StopAsyncIteration:
                             break
                     else:
+                        if armed_at is None:
+                            armed_at = monotonic()
                         state.watch_paths = directories
                         state.watch_ready.set()
                         if state.needs_closing_reconcile:
@@ -1976,6 +1997,8 @@ class FileWatchManager:
 
                     # An immediately available successful batch also proves the
                     # generator installed/entered this watcher generation.
+                    if armed_at is None:
+                        armed_at = monotonic()
                     state.watch_paths = directories
                     state.watch_ready.set()
                     if state.needs_closing_reconcile:
@@ -2030,6 +2053,21 @@ class FileWatchManager:
                             reason="resource_exhaustion",
                             error_type=type(exc).__name__,
                         )
+                armed_for_s = (
+                    max(0.0, monotonic() - armed_at)
+                    if armed_at is not None else 0.0
+                )
+                retry_delay = _next_watch_retry_delay(
+                    state, armed_for_s,
+                )
+                _perf_event(
+                    "files.watcher_retry",
+                    workspace=short_id(state.workspace_id),
+                    error_type=type(exc).__name__,
+                    failures=state.watch_failures,
+                    delay_ms=round(retry_delay * 1000),
+                    armed_ms=round(armed_for_s * 1000),
+                )
                 # There is an uncovered interval between this failed generation
                 # and its replacement. Defer the closing reconciliation until
                 # the retry is genuinely armed, coalescing with any pass already
@@ -2037,7 +2075,7 @@ class FileWatchManager:
                 state.needs_closing_reconcile = True
                 state.watch_ready.clear()
                 state.watch_paths = ()
-                await asyncio.sleep(_WATCH_RETRY_S)
+                await asyncio.sleep(retry_delay)
             finally:
                 if next_batch is not None and not next_batch.done():
                     next_batch.cancel()

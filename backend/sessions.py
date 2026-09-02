@@ -32,6 +32,7 @@ from collections.abc import Iterable
 import json
 import os
 import re
+import stat
 import sys
 import threading
 import time
@@ -48,6 +49,11 @@ from typing import Any, get_args
 from claude_agent_sdk import list_sessions as sdk_list_sessions
 from claude_agent_sdk import get_session_info as sdk_get_session_info
 from claude_agent_sdk.types import PermissionMode
+from .private_storage import (
+    ensure_private_regular_file,
+    private_path_kind,
+    write_private_bytes,
+)
 from .settings import ROOT, atomic_write_text
 from .task_summaries import normalize_task_summary_fields
 from .workspaces import registry as workspace_registry
@@ -245,6 +251,10 @@ def _sidecar_path(sid: str) -> Path:
     return SESS_DIR / f"{sid}.sidecar.json"
 
 
+def _runtime_task_overlay_path(sid: str) -> Path:
+    return SESS_DIR / "runtime-task-overlays" / f"{sid}.json"
+
+
 # Multiplex reconciliation needs only the runtime predecessor/successor graph.
 # Cache that private, read-only projection rather than the mutable list returned
 # by _load_index(): index mutators edit row dicts in place before _save_index,
@@ -414,6 +424,19 @@ _SidecarSignature = tuple[int, int, int, int]
 _SIDECAR_CACHE: dict[str, tuple[_SidecarSignature, dict]] = {}
 _SIDECAR_CACHE_MAX = 64
 
+# Runtime task state changes frequently while a background task is active. It
+# must not share the annotation sidecar, which can contain megabytes of image
+# payloads. A separate private file keeps every lifecycle update proportional
+# to the small task projection. Reads and writes for distinct sessions do not
+# share the annotation sidecar's process-wide mutation lock.
+_RUNTIME_TASK_OVERLAY_SCHEMA_VERSION = 1
+_RUNTIME_TASK_OVERLAY_LOCKS = tuple(threading.RLock() for _ in range(64))
+_RUNTIME_TASK_OVERLAY_CACHE: dict[
+    str, tuple[_SidecarSignature, dict[str, dict]]
+] = {}
+_RUNTIME_TASK_OVERLAY_CACHE_LOCK = threading.Lock()
+_RUNTIME_TASK_OVERLAY_CACHE_MAX = 256
+
 # Multiplex reconciliation needs only the ids of durable runtime tasks whose
 # overlay is still running. Keeping that tiny immutable projection separately
 # prevents the 64-entry full-sidecar cache from forcing repeated reads of MB-
@@ -428,10 +451,29 @@ _RUNNING_RUNTIME_TASK_IDS_CACHE_MAX = 4096
 
 def _sidecar_file_signature(path: Path) -> _SidecarSignature | None:
     try:
-        st = path.stat()
-    except FileNotFoundError:
+        st = path.lstat()
+    except OSError:
+        return None
+    if not stat.S_ISREG(st.st_mode):
         return None
     return (st.st_dev, st.st_ino, st.st_mtime_ns, st.st_size)
+
+
+def _runtime_task_overlay_lock(sid: str) -> threading.RLock:
+    return _RUNTIME_TASK_OVERLAY_LOCKS[
+        hash(sid) % len(_RUNTIME_TASK_OVERLAY_LOCKS)
+    ]
+
+
+def _runtime_task_overlay_source_signature(
+    sid: str,
+) -> _SidecarSignature | None:
+    # Once the dedicated store exists it is authoritative. The legacy sidecar
+    # remains a read-only fallback so rollback/restart never destroys old data.
+    signature = _sidecar_file_signature(_runtime_task_overlay_path(sid))
+    if signature is not None:
+        return signature
+    return _sidecar_file_signature(_sidecar_path(sid))
 
 
 def _running_runtime_task_ids_from_data(data: Any) -> frozenset[str]:
@@ -470,13 +512,18 @@ def _store_running_runtime_task_ids_cache(
         _RUNNING_RUNTIME_TASK_IDS_CACHE[sid] = (signature, task_ids)
 
 
-def _refresh_running_runtime_task_ids_cache(sid: str, data: dict) -> None:
-    signature = _sidecar_file_signature(_sidecar_path(sid))
+def _refresh_running_runtime_task_ids_cache(
+    sid: str,
+    overlays: Any,
+    signature: _SidecarSignature | None,
+) -> None:
     if signature is None:
         _drop_running_runtime_task_ids_cache(sid)
         return
     _store_running_runtime_task_ids_cache(
-        sid, signature, _running_runtime_task_ids_from_data(data),
+        sid,
+        signature,
+        _running_runtime_task_ids_from_data({"runtime_task_overlays": overlays}),
     )
 
 
@@ -492,7 +539,10 @@ def _load_sidecar(sid: str, *, use_cache: bool = True) -> dict:
     sig = _sidecar_file_signature(p)
     if sig is None:
         _SIDECAR_CACHE.pop(sid, None)
-        _drop_running_runtime_task_ids_cache(sid)
+        if _sidecar_file_signature(
+            _runtime_task_overlay_path(sid)
+        ) is None:
+            _drop_running_runtime_task_ids_cache(sid)
         return {"messages": {}}
     if use_cache:
         hit = _SIDECAR_CACHE.get(sid)
@@ -521,10 +571,15 @@ def _save_sidecar(sid: str, data: dict) -> None:
     # Drop rather than refresh: the next _load_sidecar re-stats and caches
     # the just-written file, keeping cache state derived purely from disk.
     _SIDECAR_CACHE.pop(sid, None)
-    # The hot reconcile projection is immutable and derived from the exact
-    # object just serialized successfully, so refresh it without rereading the
-    # potentially large sidecar on the next 200 ms tick.
-    _refresh_running_runtime_task_ids_cache(sid, data)
+    # Before a legacy overlay is migrated, annotation writes still change its
+    # source generation. Once the dedicated file exists, ordinary sidecar
+    # writes must neither invalidate nor overwrite the authoritative summary.
+    if _sidecar_file_signature(_runtime_task_overlay_path(sid)) is None:
+        _refresh_running_runtime_task_ids_cache(
+            sid,
+            data.get("runtime_task_overlays"),
+            _sidecar_file_signature(_sidecar_path(sid)),
+        )
 
 
 def indexed_session_ids() -> set[str]:
@@ -1125,6 +1180,9 @@ def delete_session(sid: str) -> bool:
                         removed = True
                     except OSError:
                         pass
+            with _runtime_task_overlay_lock(sid):
+                if _delete_runtime_task_overlays(sid):
+                    removed = True
             for path in (
                 SESS_DIR / f"{sid}.transcript-index.json",
                 _queue_path(sid),
@@ -1225,6 +1283,8 @@ def prune_empty_sessions(keep_ids: tuple | list = ()) -> list[str]:
                         _drop_running_runtime_task_ids_cache(sid)
                     except OSError:
                         pass
+            with _runtime_task_overlay_lock(sid):
+                _delete_runtime_task_overlays(sid)
             q = _queue_path(sid)
             if q.exists():
                 try:
@@ -1715,6 +1775,13 @@ def _sidecar_has_runtime_task_overlays(sid: str) -> bool:
     deliberately return true so the authoritative loader still fails closed.
     """
     path = _sidecar_path(sid)
+    overlay_kind = private_path_kind(_runtime_task_overlay_path(sid))
+    if overlay_kind == "file":
+        return True
+    if overlay_kind != "missing":
+        # Preserve fail-closed startup behaviour for unsafe private paths.
+        return True
+
     overlap = len(_RUNTIME_TASK_OVERLAY_MARKER) - 1
     carry = b""
     try:
@@ -1773,6 +1840,133 @@ def _normalize_runtime_task_overlays(raw: Any) -> dict[str, dict]:
         if task_id and isinstance(value, dict)
     }
 
+def _runtime_task_overlay_cache_key(sid: str) -> str:
+    return str(_runtime_task_overlay_path(sid))
+
+
+def _drop_runtime_task_overlay_cache(sid: str) -> None:
+    with _RUNTIME_TASK_OVERLAY_CACHE_LOCK:
+        _RUNTIME_TASK_OVERLAY_CACHE.pop(
+            _runtime_task_overlay_cache_key(sid), None,
+        )
+
+
+def _cached_runtime_task_overlays(
+    sid: str,
+    signature: _SidecarSignature,
+) -> dict[str, dict] | None:
+    key = _runtime_task_overlay_cache_key(sid)
+    with _RUNTIME_TASK_OVERLAY_CACHE_LOCK:
+        hit = _RUNTIME_TASK_OVERLAY_CACHE.get(key)
+        if hit is None or hit[0] != signature:
+            if hit is not None:
+                _RUNTIME_TASK_OVERLAY_CACHE.pop(key, None)
+            return None
+        return _normalize_runtime_task_overlays(hit[1])
+
+
+def _store_runtime_task_overlay_cache(
+    sid: str,
+    signature: _SidecarSignature | None,
+    overlays: dict[str, dict],
+) -> None:
+    key = _runtime_task_overlay_cache_key(sid)
+    with _RUNTIME_TASK_OVERLAY_CACHE_LOCK:
+        if signature is None:
+            _RUNTIME_TASK_OVERLAY_CACHE.pop(key, None)
+            return
+        if (
+            len(_RUNTIME_TASK_OVERLAY_CACHE)
+            >= _RUNTIME_TASK_OVERLAY_CACHE_MAX
+            and key not in _RUNTIME_TASK_OVERLAY_CACHE
+        ):
+            _RUNTIME_TASK_OVERLAY_CACHE.pop(
+                next(iter(_RUNTIME_TASK_OVERLAY_CACHE)), None,
+            )
+        _RUNTIME_TASK_OVERLAY_CACHE[key] = (
+            signature,
+            _normalize_runtime_task_overlays(overlays),
+        )
+
+
+def _load_runtime_task_overlay_file(
+    sid: str,
+) -> dict[str, dict] | None:
+    path = _runtime_task_overlay_path(sid)
+    if not ensure_private_regular_file(path):
+        _drop_runtime_task_overlay_cache(sid)
+        return None
+    signature = _sidecar_file_signature(path)
+    if signature is None:
+        _drop_runtime_task_overlay_cache(sid)
+        return None
+    cached = _cached_runtime_task_overlays(sid, signature)
+    if cached is not None:
+        return cached
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"cannot parse runtime task overlay store: {path}"
+        ) from exc
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema_version")
+        != _RUNTIME_TASK_OVERLAY_SCHEMA_VERSION
+        or not isinstance(payload.get("runtime_task_overlays"), dict)
+    ):
+        raise RuntimeError(
+            f"cannot parse runtime task overlay store: {path}"
+        )
+    overlays = _normalize_runtime_task_overlays(
+        payload["runtime_task_overlays"],
+    )
+    _store_runtime_task_overlay_cache(sid, signature, overlays)
+    return overlays
+
+
+def _save_runtime_task_overlays(
+    sid: str,
+    overlays: dict[str, dict],
+) -> None:
+    normalized = _normalize_runtime_task_overlays(overlays)
+    payload = {
+        "schema_version": _RUNTIME_TASK_OVERLAY_SCHEMA_VERSION,
+        "runtime_task_overlays": normalized,
+    }
+    path = _runtime_task_overlay_path(sid)
+    write_private_bytes(
+        path,
+        (
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+            + "\n"
+        ).encode("utf-8"),
+    )
+    signature = _sidecar_file_signature(path)
+    _store_runtime_task_overlay_cache(sid, signature, normalized)
+    _refresh_running_runtime_task_ids_cache(
+        sid, normalized, signature,
+    )
+
+
+def _delete_runtime_task_overlays(sid: str) -> bool:
+    path = _runtime_task_overlay_path(sid)
+    kind = private_path_kind(path)
+    if kind == "missing":
+        _drop_runtime_task_overlay_cache(sid)
+        _drop_running_runtime_task_ids_cache(sid)
+        return False
+    if kind != "file":
+        return False
+    try:
+        path.unlink()
+    except OSError:
+        return False
+    _drop_runtime_task_overlay_cache(sid)
+    _drop_running_runtime_task_ids_cache(sid)
+    return True
+
+
 
 def _load_runtime_task_overlays_section(sid: str) -> dict[str, dict]:
     """Decode only the overlay object, not the sidecar's large message map."""
@@ -1798,6 +1992,28 @@ def _load_runtime_task_overlays_section(sid: str) -> dict[str, dict]:
         raise RuntimeError(f"cannot parse session sidecar: {path}") from exc
     return _normalize_runtime_task_overlays(value)
 
+def _migrate_legacy_runtime_task_overlays(sid: str) -> bool:
+    """Atomically promote one legacy embedded projection on a safe fence."""
+    with session_lifecycle_lock(sid):
+        with _QUEUE_LOCK:
+            if sid in _DELETED_SESSION_IDS:
+                return False
+        with _runtime_task_overlay_lock(sid):
+            kind = private_path_kind(_runtime_task_overlay_path(sid))
+            if kind == "file":
+                return False
+            if kind != "missing":
+                # The dedicated path is authoritative even when unsafe. Never
+                # overwrite it with a legacy snapshot.
+                ensure_private_regular_file(_runtime_task_overlay_path(sid))
+                return False
+            overlays = _load_runtime_task_overlays_section(sid)
+            if not overlays:
+                return False
+            _save_runtime_task_overlays(sid, overlays)
+            return True
+
+
 
 def get_runtime_task_overlays(sid: str) -> dict[str, dict]:
     """Return UI-only background task cards keyed by task id.
@@ -1806,9 +2022,13 @@ def get_runtime_task_overlays(sid: str) -> dict[str, dict]:
     overlay lets their copied tool card reflect that process's lifecycle while
     remaining completely absent from model context.
     """
-    return _normalize_runtime_task_overlays(
-        _load_sidecar(sid).get("runtime_task_overlays") or {}
-    )
+    with _runtime_task_overlay_lock(sid):
+        dedicated = _load_runtime_task_overlay_file(sid)
+        if dedicated is not None:
+            return _normalize_runtime_task_overlays(dedicated)
+        return _normalize_runtime_task_overlays(
+            _load_runtime_task_overlays_section(sid),
+        )
 
 
 def _running_runtime_task_ids(sid: str) -> frozenset[str]:
@@ -1820,9 +2040,8 @@ def _running_runtime_task_ids(sid: str) -> frozenset[str]:
     stat plus a small set lookup and never retain the full sidecar payload.
     """
     latest = frozenset()
-    path = _sidecar_path(sid)
     for _attempt in range(2):
-        signature = _sidecar_file_signature(path)
+        signature = _runtime_task_overlay_source_signature(sid)
         if signature is None:
             _drop_running_runtime_task_ids_cache(sid)
             return frozenset()
@@ -1831,13 +2050,13 @@ def _running_runtime_task_ids(sid: str) -> frozenset[str]:
             if hit is not None and hit[0] == signature:
                 return hit[1]
 
-        overlays = _load_runtime_task_overlays_section(sid)
+        overlays = get_runtime_task_overlays(sid)
         latest = _running_runtime_task_ids_from_data({
             "runtime_task_overlays": overlays,
         })
-        if _sidecar_file_signature(path) != signature:
-            # An atomic external writer replaced the file while it was read.
-            # Retry once; never associate a snapshot with the wrong signature.
+        if _runtime_task_overlay_source_signature(sid) != signature:
+            # An atomic external writer replaced the authoritative store while
+            # it was read. Retry once; never cache under the wrong generation.
             continue
         _store_running_runtime_task_ids_cache(sid, signature, latest)
         return latest
@@ -1903,18 +2122,14 @@ def set_runtime_task_overlay(
         with _QUEUE_LOCK:
             if sid in _DELETED_SESSION_IDS:
                 return False
-        with _SIDECAR_LOCK:
-            data = _load_sidecar(sid, use_cache=False)
-            overlays = data.setdefault("runtime_task_overlays", {})
-            if not isinstance(overlays, dict):
-                overlays = {}
+        with _runtime_task_overlay_lock(sid):
+            overlays = get_runtime_task_overlays(sid)
             overlays_compacted = False
             if sid not in _RUNTIME_TASK_OVERLAY_COMPACTED_SIDS:
                 normalized_overlays = _normalize_runtime_task_overlays(overlays)
                 overlays_compacted = normalized_overlays != overlays
                 overlays = normalized_overlays
                 _RUNTIME_TASK_OVERLAY_COMPACTED_SIDS.add(sid)
-            data["runtime_task_overlays"] = overlays
             stored = overlays.get(task_id)
             current = dict(stored) if isinstance(stored, dict) else {
                 "task_id": task_id,
@@ -1984,7 +2199,7 @@ def set_runtime_task_overlay(
                 return False
             if target_changed:
                 overlays[task_id] = updated
-            _save_sidecar(sid, data)
+            _save_runtime_task_overlays(sid, overlays)
             return True
 
 
@@ -2081,15 +2296,11 @@ def _replace_runtime_task_overlay_snapshots(
         with _QUEUE_LOCK:
             if sid in _DELETED_SESSION_IDS:
                 return 0
-        with _SIDECAR_LOCK:
-            data = _load_sidecar(sid, use_cache=False)
-            overlays = data.setdefault("runtime_task_overlays", {})
-            if not isinstance(overlays, dict):
-                overlays = {}
+        with _runtime_task_overlay_lock(sid):
+            overlays = get_runtime_task_overlays(sid)
             normalized_overlays = _normalize_runtime_task_overlays(overlays)
             overlays_compacted = normalized_overlays != overlays
             overlays = normalized_overlays
-            data["runtime_task_overlays"] = overlays
             changed = 0
             for task_id, snapshot in snapshots.items():
                 replacement = normalize_task_summary_fields(snapshot)
@@ -2099,7 +2310,7 @@ def _replace_runtime_task_overlay_snapshots(
                 overlays[task_id] = replacement
                 changed += 1
             if changed or overlays_compacted:
-                _save_sidecar(sid, data)
+                _save_runtime_task_overlays(sid, overlays)
             return changed
 
 
@@ -2125,6 +2336,11 @@ def reconcile_runtime_task_overlay_chains() -> int:
     if not overlay_sids:
         return 0
 
+    # Each session migration is independently atomic and fenced against
+    # deletion. A crash simply leaves the remaining legacy files for the next
+    # startup; an existing dedicated file is never overwritten.
+    for overlay_sid in sorted(overlay_sids):
+        _migrate_legacy_runtime_task_overlays(overlay_sid)
     repaired = 0
     visited: set[str] = set()
     for indexed_sid in indexed_ids:
@@ -2138,7 +2354,7 @@ def reconcile_runtime_task_overlay_chains() -> int:
             continue
         overlays_by_sid = {
             row_sid: (
-                _load_runtime_task_overlays_section(row_sid)
+                get_runtime_task_overlays(row_sid)
                 if row_sid in overlay_sids else {}
             )
             for row_sid in lineage
@@ -2196,7 +2412,7 @@ def stop_stale_runtime_task_overlays() -> int:
     for sid in indexed_session_ids():
         if not _sidecar_has_runtime_task_overlays(sid):
             continue
-        for task_id, overlay in _load_runtime_task_overlays_section(sid).items():
+        for task_id, overlay in get_runtime_task_overlays(sid).items():
             if overlay.get("state") != "running":
                 continue
             changed = set_runtime_task_overlay(

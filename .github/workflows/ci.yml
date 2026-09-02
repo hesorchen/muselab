@@ -61,6 +61,7 @@ jobs:
         run: |
           mkdir -p $MUSELAB_ROOT
           uv run --with pytest-cov pytest tests/ -q \
+            -n auto --dist=worksteal \
             --cov=backend --cov-report=term-missing
 
   lint:

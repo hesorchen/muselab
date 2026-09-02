@@ -364,6 +364,26 @@ async def test_watch_limit_fallback_polls_only_indexed_shallow_directories(
                 "error_type": "RuntimeError",
             },
         ),
+        (
+            "files.watcher_retry",
+            {
+                "workspace": file_events.short_id(workspace_id),
+                "error_type": "RuntimeError",
+                "failures": 1,
+                "delay_ms": 0,
+                "armed_ms": 0,
+            },
+        ),
+        (
+            "files.watcher_retry",
+            {
+                "workspace": file_events.short_id(workspace_id),
+                "error_type": "RuntimeError",
+                "failures": 2,
+                "delay_ms": 0,
+                "armed_ms": 0,
+            },
+        ),
     ]
     await manager.shutdown()
 
@@ -1490,6 +1510,31 @@ async def test_failed_generation_reconciles_only_after_retry_is_armed(
             for row in store.delta(workspace_id, baseline)["changes"]
         }
     await manager.shutdown()
+
+
+def test_watch_retry_backoff_is_scoped_and_resets_after_stable_generation(
+    app_module,
+    temp_root,
+    monkeypatch,
+):
+    import backend.file_events as file_events
+
+    monkeypatch.setattr(file_events, "_WATCH_RETRY_S", 1.5)
+    monkeypatch.setattr(file_events, "_WATCH_RETRY_MAX_S", 10.0)
+    monkeypatch.setattr(file_events, "_WATCH_STABLE_RESET_S", 30.0)
+    first = file_events._WatchState(root=temp_root / "first")
+    second = file_events._WatchState(root=temp_root / "second")
+
+    assert [
+        file_events._next_watch_retry_delay(first, 0.0)
+        for _ in range(5)
+    ] == [1.5, 3.0, 6.0, 10.0, 10.0]
+    assert first.watch_failures == 5
+    assert file_events._next_watch_retry_delay(second, 0.0) == 1.5
+    assert second.watch_failures == 1
+
+    assert file_events._next_watch_retry_delay(first, 30.0) == 1.5
+    assert first.watch_failures == 1
 
 
 def test_reconcile_backoff_is_scoped_to_each_workspace(

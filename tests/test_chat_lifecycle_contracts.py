@@ -5,6 +5,7 @@ import asyncio
 import inspect
 import json
 
+import pytest
 from fastapi.routing import APIRoute
 
 
@@ -25,6 +26,45 @@ def _chat_route_contract(chat_mod):
                 route.response_model,
             )
     return contract
+
+
+def test_runtime_task_overlay_uses_one_lineage_snapshot_and_forward_suffix(
+    app_module, monkeypatch,
+):
+    from backend import chat as chat_mod
+
+    lineage_reads = []
+    writes = []
+
+    def runtime_lineage(sid):
+        lineage_reads.append(sid)
+        return ["predecessor", "owner", "child", "grandchild"]
+
+    def write_overlay(sid, task_id, **fields):
+        writes.append((sid, task_id, fields))
+        return True
+
+    monkeypatch.setattr(chat_mod.sess, "runtime_lineage", runtime_lineage)
+    monkeypatch.setattr(
+        chat_mod.sess,
+        "get_session_meta",
+        lambda _sid: pytest.fail("propagation must use one lineage snapshot"),
+    )
+    monkeypatch.setattr(
+        chat_mod.sess, "set_runtime_task_overlay", write_overlay,
+    )
+
+    chat_mod._runtime_task_overlay(
+        "owner",
+        "task-1",
+        state="running",
+        description="background task",
+    )
+
+    assert lineage_reads == ["owner"]
+    assert [row[0] for row in writes] == ["owner", "child", "grandchild"]
+    assert all(row[1] == "task-1" for row in writes)
+    assert all(row[2]["owner_session_id"] == "owner" for row in writes)
 
 
 def test_chat_lifecycle_routes_keep_fastapi_contract(app_module):

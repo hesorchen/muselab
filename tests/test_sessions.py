@@ -232,7 +232,9 @@ def test_runtime_task_overlay_bounds_summary_on_write(app_module):
     assert len(overlay["summary"]) == TASK_SUMMARY_PREVIEW_CAP
     assert overlay["summary_length"] == len(full)
     assert overlay["summary_truncated"] is True
-    raw = json.loads(sess._sidecar_path(sid).read_text(encoding="utf-8"))
+    raw = json.loads(
+        sess._runtime_task_overlay_path(sid).read_text(encoding="utf-8")
+    )
     assert raw["runtime_task_overlays"]["task-long"] == overlay
 
 
@@ -246,7 +248,7 @@ def test_running_runtime_task_ids_cache_one_overlay_parse_per_generation(
         sid, "task-running", state="running",
     )
     sess._drop_running_runtime_task_ids_cache(sid)
-    real_load = sess._load_runtime_task_overlays_section
+    real_load = sess._load_runtime_task_overlay_file
     loads = 0
 
     def counted_load(load_sid):
@@ -255,7 +257,7 @@ def test_running_runtime_task_ids_cache_one_overlay_parse_per_generation(
         return real_load(load_sid)
 
     monkeypatch.setattr(
-        sess, "_load_runtime_task_overlays_section", counted_load,
+        sess, "_load_runtime_task_overlay_file", counted_load,
     )
     expected = {sid: frozenset({"task-running"})}
     assert sess.running_runtime_task_ids((sid, sid)) == expected
@@ -263,7 +265,7 @@ def test_running_runtime_task_ids_cache_one_overlay_parse_per_generation(
     assert loads == 1
 
 
-def test_sidecar_save_refreshes_running_task_summary_without_reread(
+def test_overlay_save_refreshes_running_task_summary_without_reread(
     app_module, monkeypatch,
 ):
     from backend import sessions as sess
@@ -271,13 +273,13 @@ def test_sidecar_save_refreshes_running_task_summary_without_reread(
     sid = sess.create_session("runtime-overlay-summary-refresh")["id"]
     assert sess.set_runtime_task_overlay(sid, "task-1", state="running")
     assert sess.running_runtime_task_ids((sid,))[sid] == frozenset({"task-1"})
+    assert sess.set_runtime_task_overlay(sid, "task-1", state="completed")
 
     monkeypatch.setattr(
         sess,
-        "_load_runtime_task_overlays_section",
-        lambda _sid: pytest.fail("a successful sidecar save must prime summary"),
+        "_load_runtime_task_overlay_file",
+        lambda _sid: pytest.fail("a successful overlay save must prime summary"),
     )
-    assert sess.set_runtime_task_overlay(sid, "task-1", state="completed")
     assert sess.running_runtime_task_ids((sid,))[sid] == frozenset()
 
 
@@ -339,12 +341,116 @@ def test_runtime_task_overlay_legacy_summary_is_bounded_then_compacted(app_modul
                ["runtime_task_overlays"]["task-old"]["summary"]) == len(full)
 
     assert sess.set_runtime_task_overlay(sid, "task-new", state="running")
-    raw = json.loads(sess._sidecar_path(sid).read_text(encoding="utf-8"))
-    compacted = raw["runtime_task_overlays"]["task-old"]
+    legacy_raw = json.loads(
+        sess._sidecar_path(sid).read_text(encoding="utf-8")
+    )
+    assert len(
+        legacy_raw["runtime_task_overlays"]["task-old"]["summary"]
+    ) == len(full)
+    dedicated_raw = json.loads(
+        sess._runtime_task_overlay_path(sid).read_text(encoding="utf-8")
+    )
+    compacted = dedicated_raw["runtime_task_overlays"]["task-old"]
     assert len(compacted["summary"]) == TASK_SUMMARY_PREVIEW_CAP
     assert compacted["summary_length"] == len(full)
     assert compacted["summary_truncated"] is True
 
+
+def test_runtime_overlay_updates_do_not_touch_large_annotation_sidecar(
+    app_module, monkeypatch,
+):
+    from backend import sessions as sess
+
+    sid = sess.create_session("runtime-overlay-large-sidecar")["id"]
+    assert sess.set_runtime_task_overlay(
+        sid, "task-large", state="running",
+    )
+    sidecar = sess._sidecar_path(sid)
+    sess._save_sidecar(sid, {
+        "messages": {
+            "message-large": {
+                "images": [{"data": "x" * 2_400_000}],
+            },
+        },
+    })
+    before_bytes = sidecar.read_bytes()
+    before = sidecar.stat()
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("runtime overlay hot writes must not touch the main sidecar")
+
+    monkeypatch.setattr(sess, "_load_sidecar", forbidden)
+    monkeypatch.setattr(sess, "_save_sidecar", forbidden)
+    assert sess.set_runtime_task_overlay(
+        sid,
+        "task-large",
+        state="completed",
+        summary="finished",
+    )
+
+    after = sidecar.stat()
+    assert sidecar.read_bytes() == before_bytes
+    assert (after.st_ino, after.st_mtime_ns, after.st_size) == (
+        before.st_ino, before.st_mtime_ns, before.st_size,
+    )
+    assert sess.get_runtime_task_overlays(sid)["task-large"]["state"] == "completed"
+    assert sess.running_runtime_task_ids((sid,))[sid] == frozenset()
+    overlay_path = sess._runtime_task_overlay_path(sid)
+    assert overlay_path.stat().st_size < 16 * 1024
+    assert overlay_path.stat().st_mode & 0o777 == 0o600
+    assert overlay_path.parent.stat().st_mode & 0o777 == 0o700
+
+
+def test_runtime_overlay_store_detects_same_size_mtime_atomic_replace(
+    app_module,
+):
+    from backend import sessions as sess
+
+    sid = sess.create_session("runtime-overlay-store-replace")["id"]
+    assert sess.set_runtime_task_overlay(sid, "task-1", state="running")
+    assert sess.running_runtime_task_ids((sid,))[sid] == frozenset({"task-1"})
+
+    path = sess._runtime_task_overlay_path(sid)
+    original_stat = path.stat()
+    replacement = json.loads(path.read_text(encoding="utf-8"))
+    replacement["runtime_task_overlays"]["task-1"]["state"] = "stopped"
+    serialized = (
+        json.dumps(replacement, ensure_ascii=False, separators=(",", ":"))
+        + "\n"
+    )
+    assert len(serialized.encode("utf-8")) == original_stat.st_size
+    replacement_path = path.with_suffix(".replacement")
+    replacement_path.write_text(serialized, encoding="utf-8")
+    os.utime(
+        replacement_path,
+        ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
+    )
+    os.replace(replacement_path, path)
+
+    replaced_stat = path.stat()
+    assert replaced_stat.st_size == original_stat.st_size
+    assert replaced_stat.st_mtime_ns == original_stat.st_mtime_ns
+    assert replaced_stat.st_ino != original_stat.st_ino
+    assert sess.get_runtime_task_overlays(sid)["task-1"]["state"] == "stopped"
+    assert sess.running_runtime_task_ids((sid,))[sid] == frozenset()
+
+
+def test_corrupt_runtime_overlay_store_is_never_overwritten(app_module):
+    from backend import sessions as sess
+
+    sid = sess.create_session("runtime-overlay-corrupt")["id"]
+    assert sess.set_runtime_task_overlay(sid, "task-1", state="running")
+    path = sess._runtime_task_overlay_path(sid)
+    broken = b'{"schema_version":1,"runtime_task_overlays":'
+    path.write_bytes(broken)
+
+    with pytest.raises(
+        RuntimeError,
+        match="cannot parse runtime task overlay store",
+    ):
+        sess.set_runtime_task_overlay(sid, "task-1", state="completed")
+
+    assert path.read_bytes() == broken
 
 @pytest.mark.parametrize(
     "terminal_state", ["completed", "failed", "stopped", "done"],
@@ -609,15 +715,15 @@ def test_runtime_lineage_authority_uses_earliest_owner_snapshot(app_module):
     assert sess.copy_runtime_task_overlays(source, child) == 1
 
     # Simulate a pre-fix successor that rewrote both owner and lifecycle state.
-    child_data = sess._load_sidecar(child, use_cache=False)
-    child_overlay = child_data["runtime_task_overlays"]["source-task"]
+    child_overlays = sess.get_runtime_task_overlays(child)
+    child_overlay = child_overlays["source-task"]
     child_overlay.update({
         "owner_session_id": child,
         "state": "stopped",
         "summary": "false successor stop",
         "tool_use_id": "tool-recovered-from-copy",
     })
-    sess._save_sidecar(child, child_data)
+    sess._save_runtime_task_overlays(child, child_overlays)
     assert sess.set_runtime_task_overlay(
         child,
         "child-task",
@@ -714,14 +820,14 @@ def test_reconcile_runtime_task_overlay_chains_repairs_forward_copies(
         summary="real result",
     )
     assert sess.copy_runtime_task_overlays(source, child) == 1
-    child_data = sess._load_sidecar(child, use_cache=False)
-    child_data["runtime_task_overlays"]["source-task"].update({
+    child_overlays = sess.get_runtime_task_overlays(child)
+    child_overlays["source-task"].update({
         "owner_session_id": child,
         "state": "stopped",
         "summary": "false successor stop",
         "restart_recovered": True,
     })
-    sess._save_sidecar(child, child_data)
+    sess._save_runtime_task_overlays(child, child_overlays)
     assert sess.set_runtime_task_overlay(
         child,
         "child-task",
@@ -730,17 +836,16 @@ def test_reconcile_runtime_task_overlay_chains_repairs_forward_copies(
         description="child launch",
     )
 
-    original_load = sess._load_sidecar
-    mutation_loads = []
+    original_save = sess._save_runtime_task_overlays
+    mutation_saves = []
 
-    def tracked_load(sid, *, use_cache=True):
-        if not use_cache:
-            mutation_loads.append(sid)
-        return original_load(sid, use_cache=use_cache)
+    def tracked_save(sid, overlays):
+        mutation_saves.append(sid)
+        return original_save(sid, overlays)
 
-    monkeypatch.setattr(sess, "_load_sidecar", tracked_load)
+    monkeypatch.setattr(sess, "_save_runtime_task_overlays", tracked_save)
     assert sess.reconcile_runtime_task_overlay_chains() == 3
-    assert sorted(mutation_loads) == sorted([child, grandchild])
+    assert sorted(mutation_saves) == sorted([child, grandchild])
     assert sess.reconcile_runtime_task_overlay_chains() == 0
 
     source_visible = sess.get_authoritative_runtime_task_overlays(source)
@@ -1904,8 +2009,15 @@ def test_delete_session_clears_sidecar(client, auth, app_module):
     meta = sess.create_session("ephemeral")
     sid = meta["id"]
     assert sess.get_session_meta(sid) is not None
+    assert sess.set_runtime_task_overlay(sid, "task-delete", state="running")
+    sidecar = sess._sidecar_path(sid)
+    overlay = sess._runtime_task_overlay_path(sid)
+    assert sidecar.exists()
+    assert overlay.exists()
     assert sess.delete_session(sid) is True
     assert sess.get_session_meta(sid) is None
+    assert not sidecar.exists()
+    assert not overlay.exists()
     assert sess.delete_session(sid) is False
 
 
