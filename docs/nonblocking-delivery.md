@@ -30,5 +30,7 @@ idempotent cancellation and stale Stop ownership.
 tests/e2e/test_nonblocking_delivery.py covers repeated send, lost acknowledgement,
 local cancellation, Stop overlap, persisted recovery and storage failure.
 The existing queue, submission, multi-tab and feedback suites remain required.
+tests/test_docs.py checks documentation consistency, including the required
+English and Chinese document pairs.
 
 Transport receipt recovery is an implementation detail, not a user approval step.
