@@ -11141,13 +11141,15 @@ function portal() {
             }
           }
         }
-        // The old completion UUID may have aged out of the bounded tail after
-        // many successor tool turns. A stable, idle canonical snapshot permits
-        // following its latest assistant boundary instead of waiting forever.
+        // A stable, idle snapshot with a committed turn identity is authoritative
+        // even when the live final text was incomplete or its UUID was missing.
+        // This also covers an older completion aged out of the bounded tail
+        // after fast successors. Do not require live text equality to adopt the
+        // very canonical suffix that is supposed to repair that live text.
         if (finalIndex < 0 && committedState?.stable === true
             && !committedState.active && !history.has_later) {
           let boundaryConfirmed = !!(committedState.completed_turn_id
-            && completedTurnId && committedState.completed_turn_id !== completedTurnId);
+            && completedTurnId);
           if (!boundaryConfirmed && expectedAssistantUuid && Number(history.offset) > 0) {
             const boundaryResponse = await this._fetchWithDeadline(
               "/api/chat/sessions/" + sid + "?around_uuid=" + encodeURIComponent(expectedAssistantUuid)
@@ -12959,22 +12961,39 @@ function portal() {
     },
     async _runCanonicalReplaySync(sid, st, options = {}) {
       if (this.tabState[sid] !== st) return false;
+      const ownedTurnId = String(st.activeTurnId || "");
+      const ownedStream = st.es;
       const startedAt = Number(st.sessionSync.canonicalStartedAt) || Date.now();
       const minimumWaitMs = Math.max(0, Number(options.minimumWaitMs) || 0);
       let active = true;
+      let activity = null;
       try {
         const r = await this._fetchWithDeadline(
           `/api/chat/sessions/${encodeURIComponent(sid)}/active`,
           { headers: this.hdr(), signal: options.signal },
         );
-        if (r.ok) active = !!(await r.json()).active;
+        if (r.ok) {
+          activity = await r.json();
+          active = !!activity.active;
+        }
       } catch (_) {
         if (options.signal?.aborted) return false;
         active = true;
       }
-      if (this.tabState[sid] !== st) return false;
+      if (this.tabState[sid] !== st || options.signal?.aborted) return false;
       const waited = Date.now() - startedAt;
-      if ((active || waited < minimumWaitMs) && waited < 31 * 60_000) {
+      const backgroundOnly = active && activity?.background === true
+        && activity.attachable === false;
+      const activityTurnId = String(activity?.turn_id || "");
+      // Watcher-only activity means the foreground Result is already readable.
+      // Preserve a successor admitted before/during this probe, including its
+      // optimistic prompt; an old watcher must never retire the newer stream.
+      const preserveOwner = this._hasPendingAdmission(st)
+        || st.es !== ownedStream || String(st.activeTurnId || "") !== ownedTurnId
+        || (backgroundOnly && (st.streaming || st.es)
+          && activityTurnId && ownedTurnId && activityTurnId !== ownedTurnId);
+      if (preserveOwner || (((active && !backgroundOnly) || waited < minimumWaitMs)
+          && waited < 31 * 60_000)) {
         this._requestSessionSync(sid, "canonical_replay", {
           minimumWaitMs, delayMs: 1000,
         });
@@ -12983,6 +13002,14 @@ function portal() {
       const retryN = Math.max(
         0, Number(st.sessionSync.canonicalRetryN) || 0);
       this._retireStaleSessionStream(sid, st);
+      if (backgroundOnly) {
+        st._serverActiveObserved = true;
+        if (activityTurnId && !st.activeTurnId) st.activeTurnId = activityTurnId;
+        this._setBackgroundTaskActive(
+          sid, true, activity.started_at, activity.background_tasks_pending,
+        );
+        this._ensureBgContPoller(sid);
+      }
       st._pendingExternalUpdate = true;
       const loaded = await this.loadSession(sid, {
         quiet: true, signal: options.signal,
