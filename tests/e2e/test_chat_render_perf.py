@@ -5826,7 +5826,7 @@ def test_mux_pending_turn_busy_keeps_queue_admission_until_post_ack(
     expect(queued.locator(".queued-text")).to_have_text(prompt)
     expect(queued.locator(".queued-label")).to_have_text("正在提交 1 / 1")
     expect(queued.locator("button.queued-act").nth(0)).to_be_disabled()
-    expect(queued.locator("button.queued-act").nth(1)).to_be_disabled()
+    expect(queued.locator("button.queued-act").nth(1)).to_be_enabled()
     expect(
         page.locator(f'.msg-pane[data-tid="{sid}"] .msg.user').filter(
             has_text=prompt

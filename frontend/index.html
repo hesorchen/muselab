@@ -2060,6 +2060,11 @@
                       <div class="scheduled-trigger-label"
                            x-show="m._scheduledTrigger"
                            x-text="lang==='zh' ? '定时任务' : 'Scheduled task'"></div>
+                      <div class="message-delivery-state" x-show="outgoingForMessage(pane, m)" @click.stop>
+                        <span x-text="outgoingLabel(outgoingForMessage(pane, m))"></span>
+                        <button class="btn-ghost sm" @click.stop="cancelOutgoing(tid, m._clientMessageId)"
+                                x-text="lang==='zh'?'取消':'Cancel'"></button>
+                      </div>
                       <template x-if="userSelectionQuotes(m).length">
                         <div class="user-msg-quotes">
                           <template x-for="(quote, qidx) in userSelectionQuotes(m)"
@@ -2133,7 +2138,7 @@
                         <span class="user-msg-text" x-show="userVisibleText(m)"
                               x-html="userTextHtml(userVisibleText(m))"></span>
                       </template>
-                      <div x-show="m._admissionPending"
+                      <div x-show="m._admissionPending && !outgoingForMessage(pane, m)"
                            class="optimistic-queue-status"
                            role="status"
                            aria-live="polite"
@@ -3209,6 +3214,13 @@
             <span x-text="activeSession._outboxCollapsed ? (lang==='zh'?'展开':'Expand') : (lang==='zh'?'收起':'Collapse')"></span>
           </button>
           <div class="queue-outbox-items" x-show="!activeSession._outboxCollapsed">
+          <div class="queue-outbox-controls">
+            <button class="btn-ghost sm" @click="pausePendingQueue(currentId, true)"
+                    x-text="lang==='zh'?'暂停待发消息':'Pause pending'"></button>
+            <button class="btn-ghost sm" @click="pausePendingQueue(currentId, false)"
+                    x-show="(activeSession.pendingQueue || []).some(q => q.held) || _outgoingRecords(activeSession).some(r => r.held)"
+                    x-text="lang==='zh'?'继续待发消息':'Resume pending'"></button>
+          </div>
           <!-- Pending queue: messages the user sent while Muse was still
                replying (or while a compact was running). They auto-drain on
                the next done event / compact-finally / activateTab. Faded
@@ -3230,8 +3242,8 @@
                       <svg><use href="#i-edit"/></svg>
                     </button>
                     <button class="queued-act icon-btn sm"
-                            @click="!q._admissionPending && removePendingQueueItem(currentId, q.id)"
-                            :disabled="q._admissionPending || queueActionBusy(currentId, 'remove:' + q.id)"
+                            @click="q._admissionPending ? cancelOutgoing(currentId, q._submitToken) : removePendingQueueItem(currentId, q.id)"
+                            :disabled="queueActionBusy(currentId, 'remove:' + q.id)"
                             :title="lang==='zh' ? '移除' : 'Remove'">
                       <svg><use href="#i-x"/></svg>
                     </button>
@@ -3250,11 +3262,6 @@
                      x-text="lang==='zh'
                        ? '该条不会自动重发，不影响后续消息。核对会话后可编辑重发或移除。'
                        : 'Not resent automatically; other messages continue. Check the conversation before editing and resending, or remove this item.'"></p>
-                  <button class="btn-ghost sm" x-show="q._uncertain" @click="reconcileSubmission(currentId)"
-                          :disabled="activeSessionPane()._submissionChecking"
-                          x-text="lang==='zh'?'确认状态':'Check delivery'"></button>
-                  <button class="btn-ghost sm" x-show="q._uncertain" @click="releaseUncertainSubmission(currentId)"
-                          x-text="lang==='zh'?'保留为草稿':'Keep as draft'"></button>
                   <!-- FIX ③: the server resolves queued upload IDs against its
                        in-memory store, so we can render real image thumbnails
                        and named doc chips here — matching how a SENT message
@@ -3726,15 +3733,12 @@
                  only by the button spinner; no transport status text is exposed.
                  Streaming, compact and queued work remain routable states. -->
             <button @click="send()"
-                    :disabled="composerClaimed(currentId) || !!composerDisabledReason(currentId)"
+                    :disabled="!!composerDisabledReason(currentId)"
                     class="btn-primary chat-toolbar-send chat-toolbar-queue"
                     :aria-busy="composerClaimed(currentId)"
                     :aria-label="sendButtonHint(currentId)"
                     :title="sendButtonHint(currentId)">
-              <span class="spinner-sm"
-                    x-show="composerClaimed(currentId)"></span>
-              <span class="icon"
-                    x-show="!composerClaimed(currentId)"><svg><use href="#i-send"/></svg></span>
+              <span class="icon"><svg><use href="#i-send"/></svg></span>
               <span class="chat-toolbar-queue-badge"
                     x-show="_currentQueueLen() > 0"
                     x-text="_currentQueueLen()"></span>

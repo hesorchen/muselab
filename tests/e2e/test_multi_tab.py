@@ -656,18 +656,20 @@ def test_turn_start_failure_restores_draft_and_idle_state(
     else:
         assert result["returned"] is False
         assert result["streaming"] is False
-        assert result["bubbleCount"] == 0
+        assert result["bubbleCount"] == 1
         assert result["pending"] == marker
         assert result["uncertain"]["input"] == marker
         assert [a["id"] for a in result["uncertain"]["pendingImages"]] == ["recover-image"]
         assert [a["id"] for a in result["uncertain"]["pendingDocs"]] == ["recover-doc"]
-        expect(page.locator(".queue-outbox .queued-text")).to_have_text(marker)
+        expect(page.locator(".queue-outbox")).not_to_be_visible()
         assert page.evaluate("""async () => {
           const app = document.querySelector('#app')._x_dataStack[0];
+          app.tabState[app.currentId]._composerSubmitToken = 'test-hold-follow-up';
           app._setChatInput('KEEP NEW DRAFT');
           return await app.send();
-        }""") is False
-        expect(page.locator(".chat-input-textarea")).to_have_value("KEEP NEW DRAFT")
+        }""") is True
+        expect(page.locator(".chat-input-textarea")).to_have_value("")
+        expect(page.locator(".queue-outbox .queued-text")).to_have_text("KEEP NEW DRAFT")
         assert attempts == 1
     assert not page.locator("#jserr").is_visible()
 
