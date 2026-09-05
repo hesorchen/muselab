@@ -103,7 +103,8 @@ def test_chat_stream_mux_keeps_one_root_source_and_reuses_the_send_reducer():
     assert '"/api/chat/stream/mux?ticket="' in app
     assert "checkpoints: this._chatMuxCheckpoints()" in app
     assert "last_event_seq: Math.max(0, Number(st && st.lastEventSeq) || 0)" in app
-    assert '_fetchWithDeadline("/api/chat/turns/start"' in app
+    assert 'this._postSubmission(streamSid, composerSubmitToken, "turn"' in app
+    assert 'return await this._fetchWithDeadline(url, {' in app
     assert "es = this._chatMuxChannel(streamSid, admittedTurnId)" in app
     assert "if (useMux) this._activateChatMuxChannel(es)" in app
     assert "await this.loadSession(meta.id, { quiet: true, probeActive: false })" in app
@@ -2524,7 +2525,8 @@ def test_workspace_switch_keeps_drafting_available_but_gates_user_send():
     assert ':disabled="!availableModels.length"' in textarea
     assert ':disabled="workspaceSwitching || !availableModels.length"' not in textarea
     assert 'multiple style="display:none" :disabled="workspaceSwitching"' not in html
-    assert ':disabled="composerClaimed(currentId) || !!composerDisabledReason(currentId)"' in html
+    assert ':disabled="!!composerDisabledReason(currentId)"' in html
+    assert ':disabled="composerClaimed(currentId) ||' not in html
     assert ':disabled="workspaceSwitching || !!(tabState[currentId]' in html
 
 
@@ -2536,7 +2538,8 @@ def test_stop_control_interrupts_session_and_never_removes_queue_items():
 
     assert 'x-show="isTabStreaming(currentId) || _hasPendingAdmission(activeSessionPane())' in html
     assert "chat-toolbar-stop" in html
-    assert "if (st._stoppingTurnId)" in app
+    assert "sendState._stoppingTurnId || sendState._uncertainSubmission" in app
+    assert "this._holdPendingSnapshot(sid, true)" in app
     assert "正在中断上一条任务" in app
     assert "sendButtonHint(currentId)" in html
     assert "撤回队尾" not in html
@@ -2852,7 +2855,7 @@ def test_fifo_admission_projects_after_durable_queue_without_transcript_flash():
     send = app[send_start:send_end]
 
     assert "_queueAdmission: null" in app
-    assert "return showAdmission ? [...waiting, admission] : waiting;" in app
+    assert "return [...waiting, ...local, ...(includeAdmission ? [admission] : [])];" in app
     assert "(!admission._directSubmission || admission._uncertain)" in app
     assert "if (!busyAtSubmit) sentUserBubble = appendOptimisticUserBubble();" in send
     assert "stageQueueAdmission();" in send
@@ -2938,7 +2941,8 @@ def test_composer_send_has_one_claim_owner_without_exposing_internal_phases():
     )
     assert "rollbackOptimisticSubmission();" in send
     assert "if (ev.repeat) return;" in app
-    assert ':disabled="composerClaimed(currentId) || !!composerDisabledReason(currentId)"' in html
+    assert ':disabled="!!composerDisabledReason(currentId)"' in html
+    assert ':disabled="composerClaimed(currentId) ||' not in html
     assert ':aria-busy="composerClaimed(currentId)"' in html
     assert 'id="composer-send-status"' not in html
     assert 'aria-describedby="composer-send-status"' not in html
@@ -2972,7 +2976,7 @@ def test_composer_disabled_state_covers_failures_without_blocking_durable_queue(
     disabled = app[disabled_start:end]
 
     for state in (
-        "workspaceSwitching", "_stoppingTurnId",
+        "workspaceSwitching",
         "_permissionChangePending", "runtimeSettingsPending(sid)",
         "_sendWaitingForUpload", "item.uploading", "item.error || !item.id",
     ):
@@ -5279,7 +5283,8 @@ def test_queue_controls_validate_mutations_and_block_send_during_interrupt():
     send_end = app.index("\n    // ====== ask_user_question", send_start)
     send = app[send_start:send_end]
     assert "if (sendState._stoppingTurnId && !opts.reconnect && !opts.resumedItem)" in send
-    assert "if (st._stoppingTurnId)" in app
+    assert "sendState._stoppingTurnId || sendState._uncertainSubmission" in app
+    assert "this._holdPendingSnapshot(sid, true)" in app
     assert "queueActionBusy(currentId, 'edit:' + q.id)" in html
     assert "queueActionBusy(currentId, 'remove:' + q.id)" in html
     assert "sess.pause_queue_if_nonempty" not in chat
@@ -5811,7 +5816,7 @@ def test_busy_send_mode_uses_authoritative_delivery_and_steering_state():
     assert 'stream_owner_token: busyStreamOwnerToken' in send
     assert 'errorMeta.active_turn_id || errorMeta.turn_id' in send
     assert '_optimisticQueue: !resumed && this._isBusy(sendSid)' in send
-    assert 'x-show="m._admissionPending"' in html
+    assert 'x-show="m._admissionPending && !outgoingForMessage(pane, m)"' in html
     assert "正在发送" in html
     assert "m._optimisticDelivery === 'queue'" in html
     assert "'排队中' : 'Queued'" in html

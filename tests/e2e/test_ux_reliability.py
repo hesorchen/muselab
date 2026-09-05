@@ -52,13 +52,13 @@ def test_memory_old_response_cannot_replace_new_tab(page, backend_url, auth_toke
     assert result == {"tab": "jobs", "ids": ["new-job"]}
 
 
-def test_uncertain_delivery_gates_direct_send_and_keeps_attachment_draft(page, backend_url, auth_token):
+def test_uncertain_delivery_accepts_new_input_and_keeps_original_attachments(page, backend_url, auth_token):
     _login(page, backend_url, auth_token)
     result = _app_eval(page, """
       const sid=app.currentId, st=app._ensureTabState(sid);
-      const original=app._submissionReceipt, confirm=app.confirm;
+      const original=app._submissionReceipt, schedule=app._scheduleOutgoing;
       app._submissionReceipt=async()=>({state:'unknown'});
-      app.confirm=async()=>true;
+      app._scheduleOutgoing=()=>{};
       try {
         st._queueAdmission={images:[{id:'image-fixture',mime:'image/png'}],
           docs:[{id:'document-fixture',name:'fixture.txt',kind:'text'}],
@@ -66,14 +66,16 @@ def test_uncertain_delivery_gates_direct_send_and_keeps_attachment_draft(page, b
         app._rememberUncertainSubmission(sid,'uncertain-fixture','turn','original fixture');
         app.input='new draft';
         const sent=await app.send();
-        await app.releaseUncertainSubmission(sid);
+        const originalRecord=st._outgoing.find(r=>r.requestId==='uncertain-fixture');
         return {sent,input:app.input,uncertain:!!st._uncertainSubmission,
-          claimed:!!st._composerSubmitToken,images:st.draft.pendingImages.map(i=>i.id),
-          docs:st.draft.pendingDocs.map(i=>i.id),quotes:st.draft.pendingQuotes.map(i=>i.id)};
-      } finally {app._submissionReceipt=original;app.confirm=confirm;}
+          claimed:!!st._composerSubmitToken,images:originalRecord.pendingImages.map(i=>i.id),
+          docs:originalRecord.pendingDocs.map(i=>i.id),quotes:originalRecord.pendingQuotes.map(i=>i.id),
+          inputs:st._outgoing.map(r=>r.input)};
+      } finally {clearTimeout(st._outgoingTimer);app._submissionReceipt=original;app._scheduleOutgoing=schedule;}
     """)
-    assert result["sent"] is False and not result["claimed"] and not result["uncertain"]
-    assert "original fixture" in result["input"] and "new draft" in result["input"]
+    assert result["sent"] is True and not result["claimed"] and result["uncertain"]
+    assert result["input"] == ""
+    assert result["inputs"] == ["original fixture", "new draft"]
     assert result["images"] == ["image-fixture"] and result["docs"] == ["document-fixture"]
     assert result["quotes"] == ["quote-fixture"]
 
@@ -111,7 +113,7 @@ def test_send_then_stop_has_one_owner_and_no_outbox_bounce(page, backend_url, au
       app._confirmSessionBusy=async()=>false;
       app._ensureChatMux=async()=>true;
       app._checkActiveTurn=async()=>false;
-      app._syncQueueFromServer=async()=>{};
+      app._syncQueueFromServer=async()=>true;
       app._scheduleCanonicalStreamReload=()=>{};
       app.loadSession=async()=>true;
       app._fetchWithDeadline=async(url,opts,timeout)=>{
@@ -126,7 +128,7 @@ def test_send_then_stop_has_one_owner_and_no_outbox_bounce(page, backend_url, au
           return new Response(JSON.stringify(receipt.result));
         }
         if(url.includes('/submissions/')) {
-          if(url.endsWith('/cancel')) {cancels++;receipt={state:'cancelled',result:receipt.result};}
+          if(url.split('?')[0].endsWith('/cancel')) {cancels++;receipt={state:'cancelled',result:receipt.result};}
           return new Response(JSON.stringify(receipt));
         }
         return originals._fetchWithDeadline.call(app,url,opts,timeout);

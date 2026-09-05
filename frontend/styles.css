@@ -3988,6 +3988,12 @@ pre.text {
   line-height: 1.5;
 }
 .queue-outbox-actions { display: flex; justify-content: flex-end; }
+.queue-outbox-controls { display: flex; gap: 8px; padding: 4px 0; flex-wrap: wrap; }
+.message-delivery-state { display: flex; align-items: center; gap: 8px; font-size: 12px; margin-bottom: 6px; opacity: .85; }
+.message-delivery-state .btn-ghost { font: inherit; padding: 3px 8px; }
+@media (max-width: 768px) {
+  .message-delivery-state .btn-ghost, .queue-outbox-controls .btn-ghost { min-height: 40px; }
+}
 .files-head-workspace {
   flex: 1 1 120px;
   min-width: 0;

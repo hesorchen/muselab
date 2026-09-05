@@ -5301,7 +5301,7 @@ def test_session_sync_deadline_dispose_and_hidden_resume(
     _assert_no_browser_errors(page, errors)
 
 
-def test_existing_fifo_queue_renders_pending_send_as_disabled_tail_card(
+def test_existing_fifo_queue_renders_pending_send_as_cancellable_tail_card(
     page: Page, backend_url, auth_token,
 ):
     """A known FIFO send stays at the visual queue tail while POST is pending."""
@@ -5445,7 +5445,7 @@ def test_existing_fifo_queue_renders_pending_send_as_disabled_tail_card(
     pending_actions = queued.nth(2).locator("button.queued-act")
     expect(pending_actions).to_have_count(2)
     expect(pending_actions.nth(0)).to_be_disabled()
-    expect(pending_actions.nth(1)).to_be_disabled()
+    expect(pending_actions.nth(1)).to_be_enabled()
 
     held_post["route"].fulfill(
         status=200,
@@ -5826,7 +5826,7 @@ def test_mux_pending_turn_busy_keeps_queue_admission_until_post_ack(
     expect(queued.locator(".queued-text")).to_have_text(prompt)
     expect(queued.locator(".queued-label")).to_have_text("正在提交 1 / 1")
     expect(queued.locator("button.queued-act").nth(0)).to_be_disabled()
-    expect(queued.locator("button.queued-act").nth(1)).to_be_disabled()
+    expect(queued.locator("button.queued-act").nth(1)).to_be_enabled()
     expect(
         page.locator(f'.msg-pane[data-tid="{sid}"] .msg.user').filter(
             has_text=prompt
@@ -9417,10 +9417,10 @@ def test_mobile_turn_footer_keeps_complete_metadata_inside_chat(
     ), geometry
 
 
-def test_failed_queue_edit_never_duplicates_and_stopping_turn_rejects_send(
+def test_failed_queue_edit_never_duplicates_and_stopping_turn_accepts_send(
     page: Page, backend_url, auth_token,
 ):
-    """Exercise both queue failure guards through Alpine's live state."""
+    """Failed edits retain their owner; Stop does not block fresh local input."""
     _login(page, backend_url, auth_token)
     sid = page.evaluate(
         "() => document.querySelector('#app')._x_dataStack[0].currentId"
@@ -9444,6 +9444,8 @@ def test_failed_queue_edit_never_duplicates_and_stopping_turn_rejects_send(
           const app = document.querySelector('#app')._x_dataStack[0];
           const st = app._ensureTabState(sid);
           app._syncQueueFromServer = async () => {};
+          // Keep this local-acceptance fixture off the shared backend queue.
+          app._scheduleOutgoing = () => {};
           st.pendingQueue = [{
             id: 'q-edit-failure', text: 'SERVER ORIGINAL',
             displayText: 'SERVER ORIGINAL', pendingQuotes: [],
@@ -9473,6 +9475,8 @@ def test_failed_queue_edit_never_duplicates_and_stopping_turn_rejects_send(
             stoppingDraft: st.draft.input,
             pendingAfterStop: st.pendingQueue.length,
             composerClaim: st._composerSubmitToken,
+            outgoing: st._outgoing.map(r => ({input:r.input, held:!!r.held,
+              kind:r.kind, delivery:r.payload.delivery})),
           };
         }""",
         sid,
@@ -9485,13 +9489,13 @@ def test_failed_queue_edit_never_duplicates_and_stopping_turn_rejects_send(
         "draft": "",
         "busy": [],
     }
-    assert result["disabledReason"] in {
-        "Stopping the previous turn", "正在中断上一条任务",
-    }
-    assert result["sendResult"] is False
-    assert result["stoppingDraft"] == "SEND DURING STOP"
+    assert result["disabledReason"] == ""
+    assert result["sendResult"] is True
+    assert result["stoppingDraft"] == ""
     assert result["pendingAfterStop"] == 1
     assert result["composerClaim"] is None
+    assert result["outgoing"] == [{"input": "SEND DURING STOP", "held": False,
+                                   "kind": "queue", "delivery": "queue"}]
 
 
 def test_background_task_gap_leaves_composer_usable_without_empty_reconnect(
