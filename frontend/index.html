@@ -2144,7 +2144,7 @@
                         <span x-text="m._optimisticQueue
                           ? (m._optimisticDelivery === 'queue'
                             ? (lang==='zh' ? '排队中' : 'Queued')
-                            : (lang==='zh' ? '正在确认发送方式' : 'Confirming delivery'))
+                            : (lang==='zh' ? '正在发送' : 'Sending'))
                           : (lang==='zh' ? '正在发送' : 'Sending')"></span>
                       </div>
                     </div>
@@ -3139,128 +3139,6 @@
                block the temporary separator above owns status; afterwards the
                per-turn footer inside the message loop owns it. -->
 
-          <!-- Pending queue: messages the user sent while Muse was still
-               replying (or while a compact was running). They auto-drain on
-               the next done event / compact-finally / activateTab. Faded
-               + dashed border distinguishes them from real user bubbles. -->
-          <template x-for="(q, qi) in queueDisplayItems(activeSession)" :key="q.id">
-            <div class="msg user queued">
-              <div class="msg-row queued-row"
-                   :class="{ 'avoids-tail-nav': isAwayFromLatest() }">
-                <div class="bubble user-bubble queued-bubble">
-                  <div class="queued-header">
-                    <span class="queued-icon"><svg><use href="#i-clock"/></svg></span>
-                    <span class="queued-label"
-                          x-text="queueDeliveryLabel(q) + ' ' + (qi+1) + ' / '
-                                   + queueDisplayItems(activeSession).length"></span>
-                    <!-- "已排队 1/2" alone reads as "will send shortly", which
-                         is wrong while the queue is paused — the item will
-                         NEVER send until Resume. State the difference on the
-                         bubble, not just in the banner: the banner sits at the
-                         bottom of the chat and is easy to scroll past on a
-                         phone, and the bubble is what the user actually looks
-                         at when wondering why nothing happened. -->
-                    <span class="queued-paused-badge"
-                          x-show="activeSession._queuePaused"
-                          x-text="lang==='zh' ? '已暂停' : 'paused'"></span>
-                    <span style="flex:1"></span>
-                    <button class="queued-act icon-btn sm"
-                            @click="!q._admissionPending && editPendingQueueItem(currentId, qi)"
-                            :disabled="q._admissionPending || queueActionBusy(currentId, 'edit:' + q.id)"
-                            :title="lang==='zh' ? '编辑' : 'Edit'">
-                      <svg><use href="#i-edit"/></svg>
-                    </button>
-                    <button class="queued-act icon-btn sm"
-                            @click="!q._admissionPending && removePendingQueueItem(currentId, qi)"
-                            :disabled="q._admissionPending || queueActionBusy(currentId, 'remove:' + q.id)"
-                            :title="lang==='zh' ? '移除' : 'Remove'">
-                      <svg><use href="#i-x"/></svg>
-                    </button>
-                  </div>
-                  <div class="queued-quote-list" x-show="q.pendingQuotes && q.pendingQuotes.length">
-                    <template x-for="(quote, qidx) in (q.pendingQuotes || [])"
-                              :key="quote.id || ('queued-quote-'+qidx)">
-                      <div class="queued-quote-chip" :title="previewQuoteExcerpt(quote)">
-                        <svg aria-hidden="true"><use :href="previewQuoteSourceIcon(quote)"/></svg>
-                        <span x-text="previewQuoteSourceName(quote) + ' · ' + previewQuoteExcerpt(quote)"></span>
-                      </div>
-                    </template>
-                  </div>
-                  <div class="queued-text" x-show="q.displayText" x-text="q.displayText"></div>
-                  <!-- FIX ③: the server resolves queued upload IDs against its
-                       in-memory store, so we can render real image thumbnails
-                       and named doc chips here — matching how a SENT message
-                       looks, instead of the old neutral "含附件" marker.
-                       Expired uploads (TTL) show a muted "附件已过期" chip. -->
-                  <div class="queued-attach" x-show="q.hasAttach">
-                    <template x-for="(im, ii) in (q.images || [])" :key="'qimg'+ii">
-                      <img class="queued-thumb" x-show="im.src"
-                           :src="im.src || null" loading="lazy" alt=""
-                           @error="$el.style.display='none'" />
-                    </template>
-                    <template x-for="(d, di) in (q.docs || [])" :key="'qdoc'+di">
-                      <span class="queued-doc-chip" :title="d.name + ' · ' + d.kind">
-                        <svg><use href="#i-file-text"/></svg>
-                        <span x-text="d.name"></span>
-                      </span>
-                    </template>
-                    <span class="queued-doc-chip queued-attach-expired"
-                          x-show="q.expiredCount > 0">
-                      <svg><use href="#i-alert-triangle"/></svg>
-                      <span x-text="lang==='zh' ? '附件已过期' : 'attachment expired'"></span>
-                    </span>
-                    <!-- Fallback: ids present but metadata not yet resolved
-                         (e.g. mid tab-switch before the queue sync lands). -->
-                    <span class="queued-doc-chip"
-                          x-show="!(q.images && q.images.length) && !(q.docs && q.docs.length) && !q.expiredCount">
-                      <svg><use href="#i-paperclip"/></svg>
-                      <span x-text="lang==='zh' ? '含附件' : 'has attachment'"></span>
-                    </span>
-                  </div>
-                </div>
-              </div>
-            </div>
-          </template>
-
-          <!-- Idle-with-items banner. Shows whenever the queue has items but
-               nothing is running on this session (not streaming, not
-               compacting, not mid-reattach). Two reasons this happens:
-                 1. An error / interrupt paused the queue server-side
-                    (_queuePaused) — the user fixes the root cause then resumes.
-                 2. Items left dormant after a process restart — the server
-                    intentionally does NOT auto-resume draining on boot, so
-                    they wait here for an explicit Resume.
-               While a turn is running, items normally auto-drain server-side
-               and this banner stays hidden — EXCEPT when the queue is paused.
-               The old `!streaming` gate assumed running ⇒ will drain, which is
-               exactly false in the paused state: the user starts a new turn,
-               sees no banner, the turn ends, dequeue_message returns None
-               because of the flag, and nothing ever indicates why. Paused wins
-               over streaming (2026-07-25 report: 2 items sat through several
-               completed turns with no visible cause). -->
-          <div x-show="activeSession.pendingQueue.length
-                        && (!activeSession.streaming || activeSession._queuePaused)
-                        && !activeSession.backgroundActive
-                        && !activeSession.compacting
-                        && !activeSession._draining"
-               class="queue-paused-banner">
-            <span class="queue-paused-icon"><svg><use href="#i-alert-triangle"/></svg></span>
-            <span class="queue-paused-text"
-                  x-text="(activeSession._queuePaused
-                            ? (lang==='zh' ? '上一条中断，队列已暂停（' : 'Queue paused (')
-                            : (lang==='zh' ? '队列等待中（' : 'Queue waiting (' ))
-                          + activeSession.pendingQueue.length
-                          + (lang==='zh' ? ' 条）' : ' waiting)')"></span>
-            <button class="queue-paused-btn primary"
-                    @click="resumeQueueDrain(currentId)"
-                    :disabled="queueActionBusy(currentId, 'resume')"
-                    x-text="lang==='zh' ? '继续执行' : 'Resume'"></button>
-            <button class="queue-paused-btn"
-                    @click="discardQueue(currentId)"
-                    :disabled="queueActionBusy(currentId, 'discard')"
-                    x-text="lang==='zh' ? '清空队列' : 'Discard'"></button>
-          </div>
-
           <!-- Compact-in-progress keeps its distinct 📦 placeholder because it
                describes conversation maintenance rather than a response turn.
                Appears for the full window between native-compact POST and
@@ -3321,6 +3199,106 @@
       </div>
 
       <div class="chat-input">
+        <section class="queue-outbox" x-data="{ get activeSession(){ return activeSessionPane() } }"
+                 x-show="queueDisplayItems(activeSession).length" x-cloak
+                 :aria-label="lang==='zh' ? '待发送消息' : 'Outbox'">
+          <button type="button" class="queue-outbox-toggle"
+                  @click="activeSession._outboxCollapsed = !activeSession._outboxCollapsed"
+                  :aria-expanded="!activeSession._outboxCollapsed">
+            <span x-text="queueOutboxLabel(activeSession)"></span>
+            <span x-text="activeSession._outboxCollapsed ? (lang==='zh'?'展开':'Expand') : (lang==='zh'?'收起':'Collapse')"></span>
+          </button>
+          <div class="queue-outbox-items" x-show="!activeSession._outboxCollapsed">
+          <!-- Pending queue: messages the user sent while Muse was still
+               replying (or while a compact was running). They auto-drain on
+               the next done event / compact-finally / activateTab. Faded
+               + dashed border distinguishes them from real user bubbles. -->
+          <template x-for="(q, qi) in queueDisplayItems(activeSession)" :key="q.id">
+            <div class="msg user queued">
+              <div class="msg-row queued-row"
+                   :class="{ 'avoids-tail-nav': isAwayFromLatest() }">
+                <div class="bubble user-bubble queued-bubble">
+                  <div class="queued-header">
+                    <span class="queued-icon"><svg><use href="#i-clock"/></svg></span>
+                    <span class="queued-label"
+                          x-text="queueItemLabel(q, activeSession)"></span>
+                    <span style="flex:1"></span>
+                    <button class="queued-act icon-btn sm"
+                            @click="!q._admissionPending && editPendingQueueItem(currentId, q.id)"
+                            :disabled="q._admissionPending || queueActionBusy(currentId, 'edit:' + q.id)"
+                            :title="lang==='zh' ? '编辑' : 'Edit'">
+                      <svg><use href="#i-edit"/></svg>
+                    </button>
+                    <button class="queued-act icon-btn sm"
+                            @click="!q._admissionPending && removePendingQueueItem(currentId, q.id)"
+                            :disabled="q._admissionPending || queueActionBusy(currentId, 'remove:' + q.id)"
+                            :title="lang==='zh' ? '移除' : 'Remove'">
+                      <svg><use href="#i-x"/></svg>
+                    </button>
+                  </div>
+                  <div class="queued-quote-list" x-show="q.pendingQuotes && q.pendingQuotes.length">
+                    <template x-for="(quote, qidx) in (q.pendingQuotes || [])"
+                              :key="quote.id || ('queued-quote-'+qidx)">
+                      <div class="queued-quote-chip" :title="previewQuoteExcerpt(quote)">
+                        <svg aria-hidden="true"><use :href="previewQuoteSourceIcon(quote)"/></svg>
+                        <span x-text="previewQuoteSourceName(quote) + ' · ' + previewQuoteExcerpt(quote)"></span>
+                      </div>
+                    </template>
+                  </div>
+                  <div class="queued-text" x-show="q.displayText" x-text="q.displayText"></div>
+                  <p class="queued-review-hint" x-show="queueItemIssue(q)"
+                     x-text="lang==='zh'
+                       ? '该条不会自动重发，不影响后续消息。核对会话后可编辑重发或移除。'
+                       : 'Not resent automatically; other messages continue. Check the conversation before editing and resending, or remove this item.'"></p>
+                  <button class="btn-ghost sm" x-show="q._uncertain" @click="reconcileSubmission(currentId)"
+                          :disabled="activeSessionPane()._submissionChecking"
+                          x-text="lang==='zh'?'确认状态':'Check delivery'"></button>
+                  <button class="btn-ghost sm" x-show="q._uncertain" @click="releaseUncertainSubmission(currentId)"
+                          x-text="lang==='zh'?'保留为草稿':'Keep as draft'"></button>
+                  <!-- FIX ③: the server resolves queued upload IDs against its
+                       in-memory store, so we can render real image thumbnails
+                       and named doc chips here — matching how a SENT message
+                       looks, instead of the old neutral "含附件" marker.
+                       Expired uploads (TTL) show a muted "附件已过期" chip. -->
+                  <div class="queued-attach" x-show="q.hasAttach">
+                    <template x-for="(im, ii) in (q.images || [])" :key="'qimg'+ii">
+                      <img class="queued-thumb" x-show="im.src"
+                           :src="im.src || null" loading="lazy" alt=""
+                           @error="$el.style.display='none'" />
+                    </template>
+                    <template x-for="(d, di) in (q.docs || [])" :key="'qdoc'+di">
+                      <span class="queued-doc-chip" :title="d.name + ' · ' + d.kind">
+                        <svg><use href="#i-file-text"/></svg>
+                        <span x-text="d.name"></span>
+                      </span>
+                    </template>
+                    <span class="queued-doc-chip queued-attach-expired"
+                          x-show="q.expiredCount > 0">
+                      <svg><use href="#i-alert-triangle"/></svg>
+                      <span x-text="lang==='zh' ? '附件已过期' : 'attachment expired'"></span>
+                    </span>
+                    <!-- Fallback: ids present but metadata not yet resolved
+                         (e.g. mid tab-switch before the queue sync lands). -->
+                    <span class="queued-doc-chip"
+                          x-show="!(q.images && q.images.length) && !(q.docs && q.docs.length) && !q.expiredCount">
+                      <svg><use href="#i-paperclip"/></svg>
+                      <span x-text="lang==='zh' ? '含附件' : 'has attachment'"></span>
+                    </span>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </template>
+
+          </div>
+          <div class="queue-outbox-actions" x-show="!activeSession._outboxCollapsed">
+            <button class="btn-ghost sm"
+                    @click="discardQueue(currentId)"
+                    :disabled="queueActionBusy(currentId, 'discard')"
+                    x-text="lang==='zh' ? '清空列表' : 'Clear list'"></button>
+          </div>
+
+        </section>
         <!-- Composer settings panel (mobile gear). Anchored HERE, not next to
              its button: the button lives in .chat-toolbar inside
              .chat-input-wrap, which sets `overflow: hidden` to clip the
@@ -3761,9 +3739,9 @@
                     x-show="_currentQueueLen() > 0"
                     x-text="_currentQueueLen()"></span>
             </button>
-            <button x-show="isTabStreaming(currentId)" @click="stop()"
+            <button x-show="isTabStreaming(currentId) || _hasPendingAdmission(activeSessionPane()) || activeSessionPane()._uncertainSubmission?.kind==='turn'" @click="stop()"
                     class="btn-danger chat-toolbar-send chat-toolbar-stop"
-                    :disabled="workspaceSwitching || !!(tabState[currentId] && tabState[currentId]._stopping)"
+                    :disabled="workspaceSwitching || !!(tabState[currentId] && (tabState[currentId]._stoppingTurnId || tabState[currentId]._cancelBeforeStream))"
                     :aria-label="t('btn.stop')"
                     :title="t('btn.stop') + ' (Esc)'">
               <span class="icon"><svg><use href="#i-square"/></svg></span>

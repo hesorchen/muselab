@@ -2814,8 +2814,9 @@ def set_message_count(sid: str, message_count: int,
 #                    "enqueued_at","delivery"?,"target_turn_id"?,
 #                    "command_uuid"?,"steering_state"?}], "paused": bool}
 #   - items: FIFO; head is sent next by the drain trigger in chat.py
-#   - paused: set True when a queued turn errors / hits ask_user_question /
-#     is user-cancelled; auto-drain stops until the user resumes
+#   - queue_issue on one item retains cancelled/failed/uncertain input for review;
+#     it is never automatically resent and does not block other FIFO items
+#   - paused: obsolete compatibility field; always False under policy_version=2
 #   - delivery="adjust": the live CLI owns delivery; the ordinary FIFO drain
 #     must not claim it until an explicit fallback changes delivery to "queue"
 #
@@ -2861,7 +2862,14 @@ def _queue_path(sid: str) -> Path:
 
 
 def _empty_queue() -> dict:
-    return {"revision": 0, "items": [], "inflight": None, "paused": False}
+    return {"revision": 0, "items": [], "inflight": None, "paused": False,
+            "policy_version": 2}
+
+
+def queue_pending_items(data: dict) -> list[dict]:
+    """Runnable/CLI-owned input only; review records do not own FIFO positions."""
+    return [item for item in data.get("items") or []
+            if not item.get("queue_issue")]
 
 
 def _normalize_queue_item(item: dict, *, strict: bool = False) -> dict:
@@ -2890,6 +2898,13 @@ def _normalize_queue_item(item: dict, *, strict: bool = False) -> dict:
         state = normalized.get("steering_state", "")
         if state and state not in _QUEUE_STEERING_STATES:
             raise ValueError("queue item steering_state is invalid")
+    issue = normalized.get("queue_issue", "")
+    if strict and issue not in {
+        "", "cancelled", "failed", "delivery_unknown", "attachment_unavailable",
+    }:
+        raise ValueError("queue item issue is invalid")
+    if normalized.get("steering_state") == "cancelled" and not issue:
+        normalized["queue_issue"] = "cancelled"
     return normalized
 
 
@@ -2898,7 +2913,9 @@ def _queue_command_uuid(item: dict) -> str:
     return value.strip() if isinstance(value, str) else ""
 
 
-def _load_queue(sid: str, *, strict: bool = False) -> dict:
+def _load_queue(
+    sid: str, *, strict: bool = False, normalize_policy: bool = True,
+) -> dict:
     if sid in _DELETED_SESSION_IDS:
         return _empty_queue()
     p = _queue_path(sid)
@@ -2985,10 +3002,16 @@ def _load_queue(sid: str, *, strict: bool = False) -> dict:
                 raise ValueError("queue command_uuid values must be unique")
         if strict and not isinstance(d.get("paused"), bool):
             raise ValueError("queue paused must be a boolean")
-        # ``paused`` only governs work still waiting in ``items``. The claimed
-        # item is already owned by a turn and must be acknowledged by that turn.
-        if not d["items"]:
+        # Old releases put a possibly-executed FIFO head back without storing
+        # its terminal reason. Do not silently resend that ambiguous head on
+        # upgrade. Only that record needs review; unrelated followers continue.
+        if (d.get("paused") and d.get("policy_version") != 2
+                and d["items"] and not d.get("inflight")
+                and not any(item.get("queue_issue") for item in d["items"])):
+            d["items"][0]["queue_issue"] = "delivery_unknown"
+        if normalize_policy:
             d["paused"] = False
+            d["policy_version"] = 2
         return d
     except Exception as exc:
         if strict:
@@ -3022,8 +3045,8 @@ def _save_queue(sid: str, data: dict, *, bump: bool = True) -> bool:
         }
     else:
         canonical["inflight"] = None
-    if not canonical.get("items"):
-        canonical["paused"] = False
+    canonical["paused"] = False
+    canonical["policy_version"] = 2
     if bump:
         _bump_queue_revision(canonical)
     else:
@@ -3082,7 +3105,7 @@ def migrate_queue(source_sid: str, target_sid: str) -> dict:
             return {"migrated": 0, "source": source, "target": target}
 
         target_inflight = target.get("inflight") or {}
-        active_count = len(target.get("items") or []) + int(bool(target_inflight))
+        active_count = len(queue_pending_items(target)) + int(bool(target_inflight))
         target_ids = {
             str(item.get("id") or "") for item in target.get("items") or []
         }
@@ -3095,7 +3118,7 @@ def migrate_queue(source_sid: str, target_sid: str) -> dict:
             item for item in moving
             if str(item.get("id") or "") not in target_ids
         ]
-        if active_count + len(unique_moving) > _QUEUE_MAX:
+        if active_count + len(queue_pending_items({"items": unique_moving})) > _QUEUE_MAX:
             raise ValueError("target queue is full")
 
         combined = [*(target.get("items") or []), *unique_moving]
@@ -3103,7 +3126,7 @@ def migrate_queue(source_sid: str, target_sid: str) -> dict:
         # requests even if a retry migrates them after the child has been used.
         combined.sort(key=lambda item: int(item.get("enqueued_at") or 0))
         target["items"] = combined
-        target["paused"] = bool(target.get("paused") or source.get("paused"))
+        target["paused"] = False
         source["items"] = []
         source["inflight"] = None
         source["paused"] = False
@@ -3155,7 +3178,7 @@ def _enqueue_message_locked(
     # A malformed sidecar can contain already-accepted work. Never coerce it
     # to an empty queue and overwrite it during an ordinary enqueue.
     data = _load_queue(sid, strict=True)
-    active_count = len(data["items"]) + int(bool(data.get("inflight")))
+    active_count = len(queue_pending_items(data)) + int(bool(data.get("inflight")))
     if active_count >= _QUEUE_MAX:
         return {"ok": False, "error": "queue_full", "queue": data}
     item = {
@@ -3442,13 +3465,14 @@ def update_queue_steering_state(
     item_id: str = "",
     command_uuid: str = "",
     pause: bool = False,
+    issue: str = "",
 ) -> dict | None:
     """Atomically transition one native-adjustment item.
 
     Non-terminal states stay durable, including ``started``. ``completed`` is
     the sole terminal update that removes the exact matched item and returns
     its full payload so chat.py can finish attachment ownership separately.
-    A cancelled command remains visible and pauses the waiting queue.
+    A cancelled command remains visible for review, without holding the FIFO.
     """
     state = str(steering_state or "").strip()
     if state != "completed" and state not in _QUEUE_STEERING_STATES:
@@ -3486,6 +3510,8 @@ def update_queue_steering_state(
             return dict(item)
         updated = dict(item)
         updated["steering_state"] = state
+        if state == "cancelled":
+            updated["queue_issue"] = issue or "cancelled"
 
         if state == "completed":
             if location == "inflight":
@@ -3511,10 +3537,6 @@ def update_queue_steering_state(
             assert index is not None
             data["items"][index] = updated
 
-        if (pause or state == "cancelled") and data["items"]:
-            if not data.get("paused"):
-                changed = True
-            data["paused"] = True
         if changed:
             _save_queue(sid, data)
         return updated
@@ -3573,9 +3595,11 @@ def claim_queue_message(sid: str) -> dict | None:
         if sid in _DELETED_SESSION_IDS:
             return None
         data = _load_queue(sid, strict=True)
-        if data.get("inflight") or data.get("paused") or not data["items"]:
+        if data.get("inflight") or not queue_pending_items(data):
             return None
-        head = data["items"][0]
+        index = next(i for i, row in enumerate(data["items"])
+                     if not row.get("queue_issue"))
+        head = data["items"][index]
         if (
             head.get("delivery") == "adjust"
             and head.get("steering_state") in _QUEUE_ACTIVE_STEERING_STATES
@@ -3583,7 +3607,7 @@ def claim_queue_message(sid: str) -> dict | None:
             # The live CLI has accepted (or may already have executed) this
             # command. Never skip over it or launch a duplicate ordinary turn.
             return None
-        item = data["items"].pop(0)
+        item = data["items"].pop(index)
         data["inflight"] = {
             "item": item,
             "turn_id": "",
@@ -3632,8 +3656,9 @@ def release_queue_claim(
     *,
     turn_id: str = "",
     pause: bool = False,
+    issue: str = "",
 ) -> bool:
-    """Return an uncompleted inflight item to the FIFO head exactly once."""
+    """Release the exact claim; terminal issues are review-only, never retried."""
     with _QUEUE_LOCK:
         if sid in _DELETED_SESSION_IDS:
             return False
@@ -3645,35 +3670,34 @@ def release_queue_claim(
         bound_turn = str(inflight.get("turn_id") or "")
         if bound_turn != str(turn_id or ""):
             return False
+        if issue or pause:
+            item = {**item, "queue_issue": issue or "failed"}
         data["inflight"] = None
         if not any(str(row.get("id") or "") == str(item_id)
                    for row in data["items"]):
             data["items"].insert(0, item)
-        data["paused"] = bool(pause) and bool(data["items"])
+        data["paused"] = False
         _save_queue(sid, data)
         return True
 
 
 def recover_queue_inflight(sid: str) -> dict:
-    """Reconcile and conservatively pause queued work after process restart.
+    """Separate uncertain claims from unstarted FIFO work after restart.
 
-    A bound claim may already have performed external side effects.  An
-    unbound claim is safe from duplicate execution, but the process restart
-    still erased the preceding turn's in-memory terminal truth and all staged
-    attachments. Native-adjustment items already waiting are equally
-    uncertain: the CLI may have accepted/executed them before MuseLab persisted
-    its lifecycle ACK. Detach their dead CLI ownership, retain every payload,
-    then pause all surviving work so only explicit review/resume can execute it.
+    A bound claim or CLI-owned adjustment may have had side effects. Retain
+    those exact payloads for review; unbound/unstarted work resumes normally.
     """
     with _QUEUE_LOCK:
         if sid in _DELETED_SESSION_IDS:
             return _empty_queue()
-        data = _load_queue(sid, strict=True)
+        data = _load_queue(sid, strict=True, normalize_policy=False)
         inflight = data.get("inflight") or {}
         item = inflight.get("item") or {}
-        changed = False
+        changed = bool(data.get("paused")) or data.get("policy_version") != 2
         if item:
             item_id = str(item.get("id") or "")
+            if inflight.get("turn_id"):
+                item = {**item, "queue_issue": "delivery_unknown"}
             data["inflight"] = None
             if item_id and not any(str(row.get("id") or "") == item_id
                                    for row in data["items"]):
@@ -3694,14 +3718,15 @@ def recover_queue_inflight(sid: str) -> dict:
                 recovered = dict(waiting)
                 recovered["delivery"] = "queue"
                 recovered["steering_state"] = "cancelled"
+                recovered["queue_issue"] = "delivery_unknown"
                 recovered.pop("target_turn_id", None)
                 recovered.pop("command_uuid", None)
                 data["items"][index] = recovered
                 changed = True
-        should_pause = bool(data["items"])
-        if bool(data.get("paused")) != should_pause:
-            data["paused"] = should_pause
-            changed = True
+        # Commit a legacy migration once. Do not rewrite all healthy/tombstone
+        # sidecars (or bump their UI revisions) on every service restart.
+        data["paused"] = False
+        data["policy_version"] = 2
         if changed:
             _save_queue(sid, data)
         return data
@@ -3812,28 +3837,17 @@ def clear_queue(sid: str) -> dict:
 
 
 def set_queue_paused(sid: str, paused: bool) -> dict:
-    """Set the paused flag. Returns the updated queue snapshot. Resuming
-    (paused=False) does NOT itself drain — the caller kicks the drain."""
+    """Legacy endpoint compatibility. Neither value can pause or retry items."""
     with _QUEUE_LOCK:
         data = _load_queue(sid, strict=True)
-        data["paused"] = bool(paused) and bool(data["items"])
+        data["paused"] = False
         _save_queue(sid, data)
         return data
 
 
 def pause_queue_if_nonempty(sid: str) -> dict:
-    """Atomically pause ``sid`` only when queued work still exists.
-
-    The interrupt path uses this before asking the SDK to stop. Sharing the
-    queue lock with ``dequeue_message`` closes the race where turn completion
-    could otherwise pop the next item between a separate get/pause pair.
-    """
-    with _QUEUE_LOCK:
-        data = _load_queue(sid, strict=True)
-        if data["items"] and not data.get("paused"):
-            data["paused"] = True
-            _save_queue(sid, data)
-        return data
+    """Compatibility for old callers: Stop affects a turn, never the queue."""
+    return set_queue_paused(sid, False)
 
 
 def reorder_queue(sid: str, order: list[str]) -> dict:

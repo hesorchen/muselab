@@ -94,13 +94,18 @@ An active turn does not discard later messages. They enter `<sid>.queue.json` an
 }
 ```
 
-- Maximum depth is 10 per session.
-- Order is FIFO by default and can be reordered or edited.
+- Maximum pending depth is 10 per session. Review-only records do not consume this allowance.
+- Runnable messages are FIFO by default and can be reordered or edited.
 - The permission mode is captured when the item is queued.
-- Errors, user questions, and explicit interruption pause the queue.
-- A failed start race restores the item to the head.
-- An empty, unpaused queue removes its file.
-- `image_ids` reference staged attachments with a 10-minute TTL. An old queued item may lose its attachments, while its text still sends.
+- There is no session-wide pause. Stopping a reply stops only its exact turn; after its owner releases the runtime, the next message proceeds. A pending tool approval still belongs to the active turn, not to a paused queue.
+- A cancelled, failed, or uncertain item remains visible with `queue_issue` (`cancelled`, `failed`, `delivery_unknown`, or `attachment_unavailable`). The drain skips these records without resending them. Edit/remove acts on the stable item ID, never its filtered display index.
+- A lost start race restores unstarted work. A terminal failure is retained for review, not automatically retried. Whole-queue Resume from an older client cannot retry it.
+- Restart recovery resumes unbound/unstarted messages only after queue, attachment, and runtime recovery completes. Bound claims and native adjustments with lost receipts become delivery-unknown records. Shutdown fences new drains before cancelling current owners.
+- Queue policy version 2 ignores the legacy `paused` flag. An old paused FIFO head without delivery evidence is retained for review; unrelated followers continue. A known cancelled record does not quarantine another message.
+- Empty queue files retain a revision tombstone so late snapshots cannot resurrect removed input.
+- `image_ids` resolve through the durable attachment registry. Missing attachments isolate that item; the application never silently sends its text without them.
+
+The invariant is per-message ownership: failure/cancellation cannot change another message's scheduling, and lack of a delivery receipt never authorizes automatic replay.
 
 ## Attachments
 

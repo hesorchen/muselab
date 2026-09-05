@@ -3981,6 +3981,13 @@ pre.text {
 @keyframes activity-running-pulse { 0% { transform:scale(.75); opacity:.8; } 75%,100% { transform:scale(1.4); opacity:0; } }
 .activity-center-btn .activity-unread { position:absolute; right:-2px; top:-2px; width:10px; height:10px; border:2px solid var(--c-bg-1); border-radius:var(--r-full); background:var(--c-success); box-sizing:border-box; pointer-events:none; }
 @media (prefers-reduced-motion:reduce) { .activity-center-btn .activity-running::after { animation:none; opacity:0; } }
+.queued-review-hint {
+  color: var(--text-muted);
+  font-size: 12px;
+  margin: 6px 0 0;
+  line-height: 1.5;
+}
+.queue-outbox-actions { display: flex; justify-content: flex-end; }
 .files-head-workspace {
   flex: 1 1 120px;
   min-width: 0;
@@ -12491,5 +12498,21 @@ html[data-theme="eyecare"] .tool-error-hint {
   .settings-modal .btn-ghost.sm, .settings-modal .btn-primary.sm, .settings-modal .memory-tabs button { min-height: 40px; }
   .memory-center-head { align-items: flex-start; flex-wrap: wrap; }
 }
+/* Outbox is a stable composer-adjacent surface, never a transcript bubble. */
+.queue-outbox { border: 1px solid var(--c-border); border-radius: 10px; margin-bottom: 8px; background: var(--c-bg-1); overflow: hidden; }
+.queue-outbox-toggle { display: flex; justify-content: space-between; gap: 12px; width: 100%; padding: 9px 12px; background: transparent; color: var(--c-fg-2); border: 0; cursor: pointer; font: inherit; font-size: 12px; }
+.queue-outbox-items { max-height: min(28vh, 230px); overflow-y: auto; overscroll-behavior: contain; padding: 0 10px 8px; }
+.queue-outbox .msg.queued { margin: 4px 0; padding: 0; width: 100%; align-items: stretch; animation: none !important; }
+.queue-outbox .queued-row { width: 100%; max-width: none; padding: 0; }
+.queue-outbox .msg.user.queued .bubble { width: 100%; max-width: none; box-sizing: border-box; border: 1px solid var(--c-border); background: var(--c-bg-2); color: var(--c-fg-1); opacity: 1; animation: none !important; }
+.queue-outbox .queued-header { color: var(--c-fg-2); border-color: var(--c-border); }
+.queue-outbox .queued-act { color: var(--c-fg-2); }
+.queue-outbox .queued-act:hover { color: var(--c-fg-0); background: var(--c-bg-4); }
+.queue-outbox .queued-text { color: var(--c-fg-1); white-space: pre-wrap; max-height: 90px; overflow-y: auto; overflow-wrap: anywhere; }
 .memory-center-toolbar { display: flex; align-items: center; gap: 8px; }
 .settings-modal .memory-center-toolbar input[type="checkbox"] { width: 16px; height: 16px; min-height: 0; margin: 0; padding: 0; accent-color: var(--c-accent); }
+.queue-outbox .queue-paused-banner { margin: 0; border: 0; border-top: 1px solid var(--c-border); border-radius: 0; flex-wrap: wrap; }
+@media (max-width: 640px) {
+  .queue-outbox-toggle, .queue-outbox .queued-act { min-height: 40px; }
+  .queue-outbox-items { max-height: 23vh; }
+}
