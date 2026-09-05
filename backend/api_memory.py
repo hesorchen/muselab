@@ -148,20 +148,23 @@ async def list_items(
     status: str | None = None,
     limit: int = Query(default=100, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
+    sort: str = Query(default="auto", pattern="^(auto|relevance|updated_at|recall_count|last_recalled_at|helpful_count|unhelpful_count)$"),
+    direction: str = Query(default="desc", pattern="^(asc|desc)$"),
 ) -> dict:
     cfg = load_config()
 
     def load(store):
-        rows = store.list_memories(
+        rows, total = store.browse_memories(
             cfg.owner_id, query=q, kind=kind, status=status,
-            limit=limit, offset=offset)
+            limit=limit, offset=offset, sort=sort, direction=direction)
         memory_ids = [row["id"] for row in rows]
         sources = store.memory_sources(memory_ids)
         stats = store.memory_recall_stats(cfg.owner_id, memory_ids)
         for row in rows:
             row["sources"] = sources.get(row["id"], [])
             row["recall_stats"] = stats[row["id"]]
-        return {"items": rows, "count": len(rows)}
+        return {"items": rows, "count": len(rows), "total": total,
+                "offset": offset, "limit": limit, "has_more": offset + len(rows) < total}
 
     return await engine._store_call(load)
 

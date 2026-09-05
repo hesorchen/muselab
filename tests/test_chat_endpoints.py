@@ -540,7 +540,7 @@ def test_interrupt_rejects_stale_turn_before_touching_client_or_queue(
 
 
 @pytest.mark.asyncio
-async def test_interrupt_rechecks_exact_owner_after_queue_pause(
+async def test_interrupt_rechecks_exact_owner_after_admission_lock(
         chat_mod, monkeypatch):
     sid = "sid-stop-owner-race"
     sdk_client = _seed(
@@ -548,26 +548,20 @@ async def test_interrupt_rechecks_exact_owner_after_queue_pause(
     old = chat_mod.TurnBroadcast(sid)
     replacement = chat_mod.TurnBroadcast(sid)
     chat_mod._active_turns[sid] = old
-    pause_entered = threading.Event()
-    release_pause = threading.Event()
-
-    def blocked_pause(_sid):
-        pause_entered.set()
-        assert release_pause.wait(1)
-        return {"items": [], "paused": False}
-
-    monkeypatch.setattr(
-        chat_mod.sess, "pause_queue_if_nonempty", blocked_pause)
+    admission_lock = asyncio.Lock()
+    await admission_lock.acquire()
+    monkeypatch.setattr(chat_mod, "_lock", admission_lock)
     try:
         stop_task = asyncio.create_task(
             chat_mod.interrupt(sid, turn_id=old.turn_id))
-        assert await asyncio.to_thread(pause_entered.wait, 1)
+        await asyncio.sleep(0)
+        assert not stop_task.done()
 
         # Model the old pump finishing and a successor taking the same session
-        # while the queue pause is in flight. The delayed Stop belongs only to
+        # while admission is locked. The delayed Stop belongs only to
         # `old`; its pooled runtime snapshot must never reach `replacement`.
         chat_mod._active_turns[sid] = replacement
-        release_pause.set()
+        admission_lock.release()
         response = await asyncio.wait_for(stop_task, timeout=1)
 
         assert response["stale"] is True
@@ -577,7 +571,8 @@ async def test_interrupt_rechecks_exact_owner_after_queue_pause(
         assert replacement.cancelled is False
         assert (sid, old.turn_id) not in chat_mod._pending_interrupts
     finally:
-        release_pause.set()
+        if admission_lock.locked():
+            admission_lock.release()
         chat_mod._active_turns.pop(sid, None)
         old.close()
         replacement.close()
@@ -798,7 +793,8 @@ async def test_request_cancel_during_activity_start_releases_queue_claim(
     queue = chat_mod.sess.get_queue(sid)
     assert sid not in chat_mod._active_turns
     assert queue["inflight"] is None
-    assert queue["paused"] is True
+    assert queue["paused"] is False
+    assert queue["items"][0]["queue_issue"] == "cancelled"
     assert [item["id"] for item in queue["items"]] == [queued["id"]]
     assert transitions == [
         ("start", sid, "queued startup", "queued"),
@@ -926,10 +922,8 @@ async def test_second_cancel_during_snapshot_still_finishes_startup_cleanup(
     recent.close()
 
 
-def test_interrupt_pauses_nonempty_queue_before_sdk_call(chat_mod, client):
-    """The current turn may finish while interrupt() awaits the SDK. Queue
-    state must already be paused then, otherwise its finally block can dequeue
-    and start the next turn after the user pressed Stop."""
+def test_interrupt_leaves_unrelated_queued_input_runnable(chat_mod, client):
+    """Stop is not a mutation of the remaining queue."""
     from backend import sessions as sess
 
     sid = "sid-queued-stop"
@@ -946,7 +940,7 @@ def test_interrupt_pauses_nonempty_queue_before_sdk_call(chat_mod, client):
         f"/api/chat/interrupt?session_id={sid}&token={TEST_TOKEN}")
 
     assert response.status_code == 200, response.text
-    assert observed and observed[0]["paused"] is True
+    assert observed and observed[0]["paused"] is False
     assert observed[0]["items"][0]["text"] == "do not auto-run"
 
 
@@ -1498,7 +1492,7 @@ async def test_force_stop_tears_down_stuck_turn(chat_mod, monkeypatch):
     monkeypatch.setattr(
         chat_mod.sess, "release_queue_claim",
         lambda got_sid, item_id, **kwargs: queue_releases.append(
-            (got_sid, item_id, kwargs.get("turn_id"), kwargs.get("pause"))) or True,
+            (got_sid, item_id, kwargs.get("turn_id"), kwargs.get("issue"))) or True,
     )
     monkeypatch.setattr(
         chat_mod.sess, "pause_queue_if_nonempty", queue_pauses.append)
@@ -1518,8 +1512,8 @@ async def test_force_stop_tears_down_stuck_turn(chat_mod, monkeypatch):
         assert bc.cancelled is True
         assert bc.done is True                    # subscribers get the sentinel
         assert activity_finishes == [(sid, bc.turn_id, "cancelled")]
-        assert queue_releases == [(sid, "q-stuck", bc.turn_id, True)]
-        assert queue_pauses == [sid]
+        assert queue_releases == [(sid, "q-stuck", bc.turn_id, "cancelled")]
+        assert queue_pauses == []
         assert memory_clears == [sid]
         assert remembered == [(sid, bc.turn_id)]
     finally:

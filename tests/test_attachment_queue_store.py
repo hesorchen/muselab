@@ -387,7 +387,8 @@ async def test_mark_queue_turn_failure_restores_exact_claim(
     assert raised.value.queue_claim_settled is True
     queue = sess.get_queue(sid)
     assert queue["inflight"] is None
-    assert queue["paused"] is True
+    assert queue["paused"] is False
+    assert queue["items"][0]["queue_issue"] == "failed"
     assert [item["id"] for item in queue["items"]] == [queued["id"]]
     assert sid not in chat._active_turns
 
@@ -415,7 +416,8 @@ async def test_invalid_persisted_attachment_restores_and_pauses_claim(
     queue = sess.get_queue(sid)
     assert started is False
     assert queue["inflight"] is None
-    assert queue["paused"] is True
+    assert queue["paused"] is False
+    assert queue["items"][0]["queue_issue"] == "attachment_unavailable"
     assert [item["id"] for item in queue["items"]] == [queued["id"]]
 
 

@@ -568,7 +568,7 @@ function portal() {
     // contexts are sandboxed/browser-owned.
     previewQuote: {
       show: false, mode: "actions", source: "", role: "", sessionId: "",
-      messageId: "", text: "", path: "", question: "", followup: "",
+      messageId: "", text: "", path: "", workspace: "", question: "", followup: "",
       x: 0, y: 0, width: 560, height: 520,
       above: false, truncated: false, sending: false,
       askSessionId: "", askSessionName: "", askPrompt: "", askError: "",
@@ -1292,6 +1292,11 @@ function portal() {
         },
         status: null, probeResult: null, tab: "items", items: [],
         selected: null, query: "", kind: "", itemStatus: "",
+        listLoading: false, listLoaded: false, listError: "",
+        configError: "", statusError: "", configLoaded: false,
+        configLoading: false, statusLoading: false,
+        sort: "auto", direction: "desc", offset: 0, pageSize: 50, total: 0,
+        listGeneration: 0, listCache: {}, advanced: false,
       },
       // Versions + upgrade — populated by loadVersions(), set by runUpgrade()
       versions: null,
@@ -1299,6 +1304,8 @@ function portal() {
       upgradeRunning: false,
       upgradeResult: null,
       restarting: false,    // true while restart is in progress
+      loading: false, error: "", surface: "settings",
+      service: null, serviceLoading: false, serviceError: "", restartStatus: "",
       // Mobile-only: iOS-style 2-level menu state. null = top-level
       // menu list shown; "lang" / "provider" / ... = that section's
       // detail page shown. Desktop ignores this entirely (every
@@ -6177,6 +6184,7 @@ function portal() {
     },
     _commitChatRecoveryDraft(id, text) {
       if (!id || typeof text !== "string" || !text) return;
+      if (this.tabState[id]?._uncertainSubmission) return;
       const record = this._chatDraftRecord(id);
       if (record.pending === text) {
         record.pending = "";
@@ -8725,6 +8733,21 @@ function portal() {
         st._queueMutating = {};
       }
       if (st._queueAdmission === undefined) st._queueAdmission = null;
+      if (!st._submissionRecoveryChecked) {
+        st._submissionRecoveryChecked = true;
+        try {
+          const record = JSON.parse(localStorage.getItem("muselab_submission_" + id) || "null");
+          if (record?.requestId && ["turn", "queue"].includes(record.kind)) {
+            st._uncertainSubmission = record;
+            st._submissionRecoveredDraft = true;
+            st._queueAdmission = {
+              id: "q-" + record.requestId, _submitToken: record.requestId,
+              displayText: record.input || "", _admissionPending: true, _uncertain: true,
+            };
+            setTimeout(() => this.reconcileSubmission(id), 0);
+          }
+        } catch (_) {}
+      }
       return st;
     },
     _sessionSyncNeedsVisibility(reason) {
@@ -8740,6 +8763,7 @@ function portal() {
       const now = Date.now();
       for (const [sid, st] of Object.entries(this.tabState || {})) {
         const sync = st && st.sessionSync;
+        if (sid === this.currentId && st?._uncertainSubmission) this.reconcileSubmission(sid);
         if (!sync) continue;
         for (const request of Object.values(sync.pending || {})) {
           if (this._sessionSyncNeedsVisibility(request.reason)) {
@@ -8982,7 +9006,7 @@ function portal() {
       const st = this.tabState[sid];
       return !!(this.isTabStreaming(sid)
         || (st && (st.compacting || st.backgroundActive || st._draining
-          || (st.pendingQueue && st.pendingQueue.length))));
+          || this.queuePendingItems(st).length)));
     },
     composerClaimed(sid = this.currentId) {
       const st = sid && this.tabState && this.tabState[sid];
@@ -9001,6 +9025,9 @@ function portal() {
       }
       const st = this.tabState && this.tabState[sid];
       if (!st) return zh ? "正在准备会话" : "Preparing the session";
+      if (st._uncertainSubmission) return zh
+        ? "正在确认上一条消息是否送达，可继续编辑草稿"
+        : "Confirming the previous delivery; you can keep editing the draft";
       if (st._stoppingTurnId) {
         return zh ? "正在中断上一条任务" : "Stopping the previous turn";
       }
@@ -9055,7 +9082,7 @@ function portal() {
       // advertise ordinary FIFO immediately instead of briefly promising an
       // adjustment that the queue endpoint must downgrade after the POST.
       if (!st || !turnId || attachmentIntent || st.compacting
-          || st.backgroundActive || st._draining || st.parentTurnId
+          || (!st.streaming && (st.backgroundActive || st._draining)) || st.parentTurnId
           || !this._pendingQueueAllowsAdjustment(st, turnId)) {
         return "queue";
       }
@@ -9114,7 +9141,7 @@ function portal() {
     },
     _pendingQueueAllowsAdjustment(st, activeTurnId = "") {
       if (!st || st._queueAdmission) return false;
-      const pending = Array.isArray(st.pendingQueue) ? st.pendingQueue : [];
+      const pending = this.queuePendingItems(st);
       if (!pending.length) return true;
       const turnId = String(activeTurnId || "");
       // Multiple native `priority=next` commands may target the same immutable
@@ -9167,7 +9194,7 @@ function portal() {
       // answer. A migrated/draining queue also remains FIFO: never launch a
       // direct turn in the short child handoff gap.
       if (st && (st.streaming || st.compacting || st.backgroundActive
-          || st._draining || (st.pendingQueue && st.pendingQueue.length))) {
+          || this.queuePendingItems(st).length)) {
         return true;
       }
       const session = (this.sessions || []).find(s => s.id === sid);
@@ -9176,7 +9203,8 @@ function portal() {
       // nevertheless retains its background watcher state and must probe the
       // source instead of treating the missing row as idle; otherwise a
       // second device can try to start a foreground turn on the old CLI.
-      if ((!session || !session.active) && !(st && st.backgroundActive)) {
+      if ((!session || !session.active)
+          && !(st && (st.backgroundActive || st._draining))) {
         return false;
       }
       // session.active is a polled cache and can remain true for one response
@@ -9195,6 +9223,13 @@ function portal() {
         const status = await r.json();
         if (this.tabState[sid] !== st) return true;
         const active = !!status.active;
+        if (status.finishing && !status.background && !status.scheduled
+            && !Number(status.background_tasks_pending)
+            && !this.queuePendingItems(st).length) {
+          // Let direct admission wait for this terminal owner. The public
+          // active flag remains true so replay and ownership stay intact.
+          return false;
+        }
         if (status.background) {
           this._setBackgroundTaskActive(
             sid, active, status.started_at, status.background_tasks_pending);
@@ -9286,26 +9321,60 @@ function portal() {
     // refreshes it via _syncQueueFromServer on load / tab-activate / after any
     // turn or mutation. Every mutation below hits an endpoint then re-syncs.
     queueDeliveryLabel(item) {
+      if (item?._uncertain) return this.lang === "zh" ? "正在确认送达状态" : "Confirming delivery";
+      if (item?._admissionPending) return this.lang === "zh" ? "正在提交" : "Submitting";
+      const issue = this.queueItemIssue(item);
+      if (issue === "cancelled") return this.lang === "zh" ? "已取消" : "Cancelled";
+      if (issue === "attachment_unavailable") return this.lang === "zh" ? "附件不可用" : "Attachment unavailable";
+      if (issue === "failed") return this.lang === "zh" ? "发送或执行失败" : "Send or execution failed";
+      if (issue) return this.lang === "zh" ? "送达状态待确认" : "Delivery needs review";
       const state = String(item && item.deliveryStatus || "");
       const delivery = this._normalizeBusySendMode(
         item && item.delivery,
         "queue",
       );
-      if (delivery !== "adjust" || state === "fallback"
-          || state === "cancelled") {
+      if (delivery !== "adjust" || state === "fallback") {
         return this.lang === "zh" ? "排队中" : "Queued";
       }
       if (state === "started") {
         return this.lang === "zh" ? "已交给当前任务" : "Handed to current task";
       }
       return this.lang === "zh"
-        ? "等待当前工具完成" : "Waiting for current tool";
+        ? "等待本轮接收输入" : "Waiting for this turn to accept input";
+    },
+    queueItemIssue(item) {
+      return String(item?.queueIssue || (item?.deliveryStatus === "cancelled" ? "cancelled" : ""));
+    },
+    queuePendingItems(st = this.activeSessionPane()) {
+      return (st?.pendingQueue || []).filter(item => !this.queueItemIssue(item));
+    },
+    queueOutboxLabel(st = this.activeSessionPane()) {
+      const items = this.queueDisplayItems(st);
+      const review = items.filter(item => this.queueItemIssue(item)).length;
+      const pending = items.length - review;
+      return this.lang === "zh"
+        ? ["待发送 " + pending, ...(review ? ["需处理 " + review] : [])].join(" · ")
+        : ["Pending " + pending, ...(review ? ["Needs review " + review] : [])].join(" · ");
+    },
+    queueItemLabel(item, st = this.activeSessionPane()) {
+      const label = this.queueDeliveryLabel(item);
+      if (this.queueItemIssue(item)) return label;
+      const pending = this.queueDisplayItems(st).filter(row => !this.queueItemIssue(row));
+      const index = pending.findIndex(row => row.id === item.id);
+      return index < 0 ? label : label + " " + (index + 1) + " / " + pending.length;
     },
     queueDisplayItems(st = this.activeSessionPane()) {
       const durable = Array.isArray(st && st.pendingQueue)
         ? st.pendingQueue : [];
       const admission = st && st._queueAdmission;
-      return admission ? [...durable, admission] : durable;
+      // Direct sends already have a stable inline bubble. The private
+      // admission record is for cancellation/recovery, not queue UI.
+      const waiting = durable.filter(item => this.queueItemIssue(item)
+        || !this._findQueueSteeringMessage(st, item.id, item.commandUuid));
+      const showAdmission = admission
+        && (!admission._directSubmission || admission._uncertain)
+        && !waiting.some(item => item.id === admission.id);
+      return showAdmission ? [...waiting, admission] : waiting;
     },
     _findQueueSteeringMessage(st, itemId, commandUuid) {
       if (!st) return null;
@@ -9379,6 +9448,13 @@ function portal() {
       const itemId = String(payload && payload.item_id || "");
       const state = String(payload && payload.state || "");
       if (!st || !itemId || !state) return false;
+      const retained = (st.pendingQueue || []).find(q => q.id === itemId);
+      // Old queued/started events cannot resurrect a cancelled command.
+      // Only an authoritative completion receipt can settle a review record.
+      if (retained && this.queueItemIssue(retained) && state !== "completed") {
+        if (state === "cancelled") this._syncQueueFromServer(sid);
+        return false;
+      }
       if (state === "started" || state === "completed") {
         const context = this._queueSteeringPromotionContext(sid, payload);
         const promoted = this._promoteQueueSteeringMessage(context);
@@ -9406,7 +9482,10 @@ function portal() {
       );
       item.deliveryStatus = state;
       if (state === "fallback") item.delivery = "queue";
-      if (state === "cancelled") st._queuePaused = true;
+      if (state === "cancelled") {
+        item.queueIssue = String(payload.queue_issue || "cancelled");
+        this._syncQueueFromServer(sid);
+      }
       // Replace the array so Alpine updates the status text immediately even
       // when the item object originated from the POST acceptance mirror.
       st.pendingQueue = [...st.pendingQueue];
@@ -9432,6 +9511,7 @@ function portal() {
       if (revision < (Number(st._queueRevision) || 0)) return;
       st._queueAppliedSeq = seq;
       st._queueRevision = revision;
+      const previousItems = new Map((st.pendingQueue || []).map(item => [item.id, item]));
       const pendingQueue = (data.items || []).map(it => {
         // FIX ③: the server now resolves each upload id against its in-memory
         // store and returns `attachments: [{id, kind, name, mime, available}]`.
@@ -9439,13 +9519,12 @@ function portal() {
         // <img> cannot add X-Auth-Token, so each image gets a short-lived,
         // id-bound resource ticket below. Expired ids (available:false) are
         // counted so the bubble can show "附件已过期".
+        const previous = previousItems.get(it.id);
         const atts = it.attachments || [];
         const images = atts
           .filter(a => a.available && a.kind === "image")
-          .map(a => ({
-            id: a.id, mime: a.mime || "",
-            src: "",
-          }));
+          .map(a => (previous?.images || []).find(im => im.id === a.id)
+            || { id: a.id, mime: a.mime || "", src: "" });
         const docs = atts
           .filter(a => a.available && a.kind !== "image")
           .map(a => ({
@@ -9470,35 +9549,41 @@ function portal() {
           delivery: this._normalizeBusySendMode(it.delivery, "queue"),
           deliveryStatus: String(it.steering_state
             || (it.delivery === "adjust" ? "pending" : "queued")),
+          queueIssue: String(it.queue_issue || ""),
           commandUuid: String(it.command_uuid || ""),
           targetTurnId: String(it.target_turn_id || ""),
           enqueuedAt: it.enqueued_at || Date.now(),
         };
-      }).filter(item => !this._findQueueSteeringMessage(
+      }).filter(item => this.queueItemIssue(item) || !this._findQueueSteeringMessage(
         st, item.id, item.commandUuid));
-      st.pendingQueue = pendingQueue;
-      Promise.all(pendingQueue.flatMap(item =>
-        item.images.map(async im => {
+      st.pendingQueue = pendingQueue.map(item => {
+        const previous = previousItems.get(item.id);
+        if (previous && JSON.stringify(previous) === JSON.stringify(item)) return previous;
+        return item;
+      });
+      const appliedQueue = st.pendingQueue;
+      Promise.all(appliedQueue.flatMap(item =>
+        item.images.filter(im => !im.src && !im._minting).map(async im => {
+          im._minting = true;
           try {
             im.src = await this._mintChatResourceUrl("queued-image", {
               attachment_id: im.id,
             });
           } catch (_) {
             im.unavailable = true;
-          }
+          } finally { delete im._minting; }
         }))).then(() => {
         if (this.tabState[sid] !== st || st._queueAppliedSeq !== seq) return;
-        for (const item of pendingQueue) {
-          const failed = item.images.filter(im => !im.src).length;
-          item.images = item.images.filter(im => im.src);
-          item.expiredCount += failed;
-        }
-        st.pendingQueue = [...pendingQueue];
+        // A failed thumbnail ticket is not proof the durable attachment
+        // expired. Retain its identity and allow a later sync to retry it.
+        // A live owner may have promoted a row during thumbnail loading.
+        // Never reinstall the older captured array.
+        st.pendingQueue = [...st.pendingQueue];
       });
-      st._queuePaused = !!data.paused;
+      st._queuePaused = false; // Old snapshots cannot revive a session-wide pause.
     },
     _currentQueueLen() {
-      return this.activeSessionPane().pendingQueue.length;
+      return this.queuePendingItems().length;
     },
     queueActionBusy(sid, key) {
       const st = sid && this.tabState[sid];
@@ -9528,6 +9613,111 @@ function portal() {
       } finally {
         if (this.tabState[sid] === st) this._setQueueActionBusy(st, key, false);
       }
+    },
+    async _submissionReceipt(sid, requestId, kind) {
+      if (!requestId) return { state: "unknown" };
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          const response = await this._fetchWithDeadline(
+            "/api/chat/sessions/" + encodeURIComponent(sid) + "/submissions/"
+              + encodeURIComponent(requestId) + "?kind=" + kind,
+            { headers: this.hdr(), cache: "no-store" }, 2000);
+          if (response.ok) {
+            const data = await response.json();
+            if (!["pending", "cancel_requested", "not_found"].includes(data.state)) return data;
+          }
+        } catch (_) {}
+        if (attempt < 2) await new Promise(resolve => setTimeout(resolve, 300));
+      }
+      return { state: "unknown" };
+    },
+    _rememberUncertainSubmission(sid, requestId, kind, input) {
+      const source = this.tabState[sid];
+      if (!source) return;
+      const childSid = source._backgroundSuccessorSid;
+      const st = childSid && this.tabState[childSid]?._handoffSourceSid === sid
+        ? this.tabState[childSid] : source;
+      const ownerSid = sid;
+      if (st !== source) sid = childSid;
+      const admission = st._queueAdmission || {};
+      const record = { requestId, kind, input, ownerSid,
+        pendingQuotes: admission.pendingQuotes || [],
+        pendingImages: (admission.images || []).map(({id,mime})=>({id,mime})),
+        pendingDocs: (admission.docs || []).map(({id,name,kind})=>({id,name,kind})),
+      };
+      st._uncertainSubmission = record;
+      st._queueAdmission = {
+        ...(st._queueAdmission || {}), id: "q-" + requestId,
+        _submitToken: requestId, displayText: input,
+        _admissionPending: true, _uncertain: true,
+      };
+      this._setLS("muselab_submission_" + sid, JSON.stringify(record));
+      setTimeout(() => this.reconcileSubmission(sid), 1000);
+    },
+    _restoreUncertainDraft(st, record) {
+      st.draft.input = this._mergeChatDraftText(record.input, st.draft.input);
+      for (const key of ["pendingImages", "pendingDocs", "pendingQuotes"]) {
+        const existing = st.draft[key] || [];
+        const ids = new Set(existing.map(item=>item.id));
+        st.draft[key] = [...(record[key] || []).filter(item=>!ids.has(item.id)), ...existing];
+      }
+    },
+    async releaseUncertainSubmission(sid) {
+      const st = this.tabState[sid], record = st?._uncertainSubmission;
+      if (!record) return;
+      const ok = await this.confirm({
+        title: this.lang === "zh" ? "解除发送等待" : "Release pending delivery",
+        body: this.lang === "zh"
+          ? "送达状态仍不确定，原请求可能已经执行。内容会保留为草稿，不会自动重发。请先核对聊天记录和任务结果，再决定是否重新发送。"
+          : "The original request may already have executed. Keep its content as a draft without resending. Check history and task results before sending again.",
+        okText: this.lang === "zh" ? "保留草稿并解除等待" : "Keep draft and release",
+        danger: true,
+      });
+      if (!ok || st._uncertainSubmission?.requestId !== record.requestId) return;
+      this._restoreUncertainDraft(st, record);
+      st._uncertainSubmission = null;
+      st._queueAdmission = null;
+      this._setLS("muselab_submission_" + sid, "null");
+      this._resolveChatRecoveryDraft(sid, st.draft.input);
+      this._persistChatDraft(sid, st.draft.input);
+      if (sid === this.currentId) this._activateComposerState(sid);
+    },
+    async reconcileSubmission(sid) {
+      const st = this.tabState[sid], record = st?._uncertainSubmission;
+      if (!record || st._submissionChecking) return;
+      st._submissionChecking = true;
+      try {
+        const receipt = await this._submissionReceipt(record.ownerSid || sid, record.requestId, record.kind);
+        if (this.tabState[sid] !== st || st._uncertainSubmission?.requestId !== record.requestId) return;
+        if (!["accepted", "failed", "cancelled"].includes(receipt.state)) {
+          if (sid === this.currentId && document.visibilityState === "visible") {
+            setTimeout(() => this.reconcileSubmission(sid), 10000);
+          }
+          return;
+        }
+        const wasAdmitted = receipt.state === "accepted" || !!receipt.result?.turn_id;
+        st._uncertainSubmission = null;
+        st._queueAdmission = null;
+        this._setLS("muselab_submission_" + sid, "null");
+        if (wasAdmitted) {
+          if (st._submissionRecoveredDraft && record.input) {
+            if (st.draft.input === record.input) st.draft.input = "";
+            else if (st.draft.input.startsWith(record.input + "\n\n")) {
+              st.draft.input = st.draft.input.slice(record.input.length + 2);
+            }
+          }
+          this._commitChatRecoveryDraft(sid, record.input);
+          await this._syncQueueFromServer(sid);
+          await this._checkActiveTurn(sid);
+          if (!st.streaming && !st.es) await this.loadSession(sid, { quiet: true });
+        } else {
+          this._restoreUncertainDraft(st, record);
+          this._resolveChatRecoveryDraft(sid, st.draft.input);
+        }
+        st._submissionRecoveredDraft = false;
+        this._persistChatDraft(sid, st.draft.input);
+        if (sid === this.currentId) this._activateComposerState(sid);
+      } finally { st._submissionChecking = false; }
     },
     async _enqueueMessage(sid, item) {
       const enqueueState = this._ensureTabState(sid);
@@ -9563,7 +9753,7 @@ function portal() {
       }
       let accepted = null;
       try {
-        const r = await fetch("/api/chat/sessions/" + sid + "/queue", {
+        const r = await this._fetchWithDeadline("/api/chat/sessions/" + sid + "/queue", {
           method: "POST",
           headers: Object.assign({ "Content-Type": "application/json" }, this.hdr()),
           // Snapshot the CURRENT permission mode with the item — the server
@@ -9575,8 +9765,9 @@ function portal() {
                                  permission,
                                  plan_return_permission: planReturnPermission,
                                  delivery,
-                                 active_turn_id: activeTurnId }),
-        });
+                                 active_turn_id: activeTurnId,
+                                 client_message_id: item._submitToken || "" }),
+        }, 12000);
         if (r.status === 409) {
           this.toast(this.lang === "zh"
             ? "消息队列已满（最多 10 条），请等当前回复结束"
@@ -9584,15 +9775,23 @@ function portal() {
             "warn", 3000);
           return false;
         }
-        if (!r.ok) {
+        if (!r.ok && r.status < 500 && r.status !== 425) {
           this.toast(this.lang === "zh" ? "加入队列失败" : "Failed to queue", "error", 3000);
           return false;
         }
-        try { accepted = await r.json(); } catch (_) { accepted = null; }
+        if (!r.ok) throw new Error("queue acknowledgement unavailable");
+        accepted = await r.json();
       } catch (_e) {
-        this.toast(this.lang === "zh" ? "网络错误，未能入队" : "Network error — not queued",
-                   "error", 3000);
-        return false;
+        const receipt = await this._submissionReceipt(sid, item._submitToken, "queue");
+        if (receipt.state === "accepted") {
+          accepted = receipt.result;
+          accepted.queue = await this._settingsRead("/api/chat/sessions/" + sid + "/queue").catch(() => null);
+        } else if (receipt.state === "failed" || receipt.state === "cancelled") {
+          return false;
+        } else {
+          this._rememberUncertainSubmission(sid, item._submitToken, "queue", item.displayText || item.text || "");
+          return false;
+        }
       }
       // The POST response is the durable acceptance boundary. Reflect its item
       // immediately and reconcile in the background: waiting on a second GET
@@ -9750,8 +9949,13 @@ function portal() {
       child.pendingQueue = this._cloneRolloverValue(sourceState.pendingQueue || []);
       child._queueAdmission = this._cloneRolloverValue(
         sourceState._queueAdmission || null);
-      child._queuePaused = !!sourceState._queuePaused;
-      child._draining = !!sourceState._draining || child.pendingQueue.length > 0;
+      child._uncertainSubmission = this._cloneRolloverValue(sourceState._uncertainSubmission || null);
+      if (child._uncertainSubmission) {
+        child._uncertainSubmission.ownerSid ||= sourceSid;
+        this._setLS("muselab_submission_" + childSid, JSON.stringify(child._uncertainSubmission));
+      }
+      child._queuePaused = false;
+      child._draining = !!sourceState._draining || this.queuePendingItems(child).length > 0;
       child._handoffSourceSid = sourceSid;
       // A send can be waiting on its durable queue POST while the runtime fork
       // finishes. Transfer the primitive claim with the draft. Otherwise the
@@ -9900,7 +10104,7 @@ function portal() {
           ?? 0);
         const queuePending = Number(payload.queue_migrated) > 0
           || (Number.isFinite(advertisedDepth) && advertisedDepth > 0)
-          || childState.pendingQueue.length > 0;
+          || this.queuePendingItems(childState).length > 0;
         // Keep later sends on the durable FIFO until the poller observes the
         // migrated turn. _attachToServerTurn clears this when the queue is
         // genuinely idle; without this handoff guard a fast second Enter could
@@ -10083,7 +10287,7 @@ function portal() {
         docs: Array.isArray(docs) ? docs : [],
       }));
     },
-    _installActiveTurnUser(st, turnId, text = "", images = [], docs = []) {
+    _installActiveTurnUser(st, turnId, text = "", images = [], docs = [], queueItemId = "") {
       if (!st || !(text || images.length || docs.length)) return null;
       const messages = st.messages || [];
       let turnUser = turnId
@@ -10155,6 +10359,13 @@ function portal() {
       } else {
         turnUser._turnRoot = true;
       }
+      if (queueItemId) {
+        // Exact server ownership, not matching text, proves this row started.
+        turnUser._queueItemId = String(queueItemId);
+        st.pendingQueue = (st.pendingQueue || []).filter(q => q.id !== queueItemId);
+        if (st._queueAdmission?.id === queueItemId
+            && !st._queueAdmission._uncertain) st._queueAdmission = null;
+      }
       return { message: turnUser, appended };
     },
     // Poll /active + re-subscribe to a server-started turn. Retries a few
@@ -10186,9 +10397,9 @@ function portal() {
       if (st0) st0._draining = true;
       await this._syncQueueFromServer(sid, options);
       const st = this.tabState[sid];
-      const expect = !!(st && st.pendingQueue && st.pendingQueue.length && !st._queuePaused);
+      const expect = !!(st && this.queuePendingItems(st).length);
       let active = false, startedAt = 0, turnId = "";
-      let uText = "", uImages = [], uDocs = [];
+      let uText = "", uImages = [], uDocs = [], queueItemId = "";
       let continuation = false;
       let scheduled = false;
       let background = false, attachable = true, backgroundTaskCount = 0;
@@ -10214,6 +10425,7 @@ function portal() {
           uText = d.user_text || "";
           uImages = d.user_images || [];
           uDocs = d.user_docs || [];
+          queueItemId = String(d.queue_item_id || "");
         }
       } catch (_e) {}
       if (options.signal?.aborted) {
@@ -10343,7 +10555,7 @@ function portal() {
         // matching tail bubble. Identity, not text, is the durable dedupe key:
         // two queued turns are allowed to contain identical prompts.
         const turnUser = this._installActiveTurnUser(
-          st, turnId, uText, uImages, uDocs);
+          st, turnId, uText, uImages, uDocs, queueItemId);
         if (turnUser && scheduled) turnUser.message._scheduledTrigger = true;
         if (turnUser && turnUser.appended) {
           this._scheduleLiveMessageViewport(st);
@@ -10606,9 +10818,12 @@ function portal() {
           attempt: attempt + 1,
         };
         ownerState._pendingCompletedTurnSync = next;
-        if (attempt < 30 && stillOwned()) {
+        if (stillOwned() && (attempt < 30
+            || (sid === this.currentId && document.visibilityState !== "hidden"))) {
           this._requestSessionSync(sid, "completed_turn", {
-            ...next, delayMs: Math.min(2000, 350 + attempt * 100),
+            ...next, delayMs: attempt < 30
+              ? Math.min(2000, 350 + attempt * 100)
+              : Math.min(30000, 5000 + (attempt - 30) * 1000),
           });
         }
       };
@@ -10623,13 +10838,6 @@ function portal() {
         // completed turn is harmless, while a different active turn means a
         // successor has already claimed this session and its optimistic/live
         // suffix must win over A's delayed canonical replacement.
-        const activeProbe = completedTurnId
-          ? this._fetchWithDeadline(
-              "/api/chat/sessions/" + sid + "/active",
-              { headers: this.hdr(), signal: options.signal },
-              2500,
-            ).catch(() => null)
-          : Promise.resolve(null);
         const historyResponse = await this._fetchWithDeadline(
           "/api/chat/sessions/" + sid + "?tail=" + reconcileTail,
           { headers: this.hdr(), signal: options.signal },
@@ -10637,11 +10845,23 @@ function portal() {
         if (!stillOwned()) return false;
         if (!historyResponse.ok) { retry(); return false; }
         const history = await historyResponse.json();
-        const activeResponse = await activeProbe;
-        if (!stillOwned()) return false;
         let activity = null;
-        try { activity = activeResponse?.ok ? await activeResponse.json() : null; }
-        catch (_) { activity = null; }
+        const committedState = history.completion_state;
+        if (committedState?.stable === true) {
+          activity = committedState;
+        } else if (committedState) {
+          retry();
+          return false;
+        } else if (completedTurnId) {
+          // Rolling upgrades: retain the old server's ownership probe.
+          try {
+            const response = await this._fetchWithDeadline(
+              "/api/chat/sessions/" + sid + "/active",
+              { headers: this.hdr(), signal: options.signal }, 2500);
+            activity = response.ok ? await response.json() : null;
+          } catch (_) { activity = null; }
+        }
+        if (!stillOwned()) return false;
         const activeTurnId = String((activity && activity.turn_id) || "");
         if (activity && activity.active && !activity.background
             && activeTurnId && activeTurnId !== completedTurnId) {
@@ -10666,6 +10886,34 @@ function portal() {
                 && (message.text || "") === expectedText) {
               finalIndex = i;
               break;
+            }
+          }
+        }
+        // The old completion UUID may have aged out of the bounded tail after
+        // many successor tool turns. A stable, idle canonical snapshot permits
+        // following its latest assistant boundary instead of waiting forever.
+        if (finalIndex < 0 && committedState?.stable === true
+            && !committedState.active && !history.has_later) {
+          let boundaryConfirmed = !!(committedState.completed_turn_id
+            && completedTurnId && committedState.completed_turn_id !== completedTurnId);
+          if (!boundaryConfirmed && expectedAssistantUuid && Number(history.offset) > 0) {
+            const boundaryResponse = await this._fetchWithDeadline(
+              "/api/chat/sessions/" + sid + "?around_uuid=" + encodeURIComponent(expectedAssistantUuid)
+                + "&before=1&after=1",
+              { headers: this.hdr(), signal: options.signal });
+            if (boundaryResponse.ok) {
+              const boundary = await boundaryResponse.json();
+              boundaryConfirmed = (boundary.messages || []).some(message =>
+                message.role === "assistant" && message.uuid === expectedAssistantUuid);
+            }
+          }
+          if (!stillOwned()) return false;
+          if (boundaryConfirmed) {
+            for (let i = messages.length - 1; i >= 0; i -= 1) {
+              if (messages[i]?.role === "assistant" && messages[i].uuid) {
+                finalIndex = i;
+                break;
+              }
             }
           }
         }
@@ -10716,6 +10964,7 @@ function portal() {
           minimumTail: completedTurnWindow,
           followTail: followTailStillOwned,
           signal: options.signal,
+          historySnapshot: history,
         });
         if (!loaded) retry();
         else {
@@ -10740,7 +10989,8 @@ function portal() {
     async removePendingQueueItem(sid, idx) {
       const st = this.tabState[sid];
       if (!st || !st.pendingQueue) return;
-      const item = st.pendingQueue[idx];
+      const item = typeof idx === "string"
+        ? st.pendingQueue.find(row => row.id === idx) : st.pendingQueue[idx];
       if (!item) return;
       const key = "remove:" + item.id;
       const r = await this._runQueueMutation(
@@ -10761,7 +11011,8 @@ function portal() {
       // that already expired (available:false) simply aren't restored.
       const st = this.tabState[sid];
       if (!st || !st.pendingQueue) return;
-      const item = st.pendingQueue[idx];
+      const item = typeof idx === "string"
+        ? st.pendingQueue.find(row => row.id === idx) : st.pendingQueue[idx];
       if (!item) return;
       // Snapshot before _syncQueueFromServer wipes the mirror.
       const text = item.text || "";
@@ -10809,10 +11060,8 @@ function portal() {
       }
     },
     async resumeQueueDrain(sid) {
-      // Un-pause server-side (which kicks its own drain), then attach to the
-      // turn it starts. Also the manual "kick" for the post-restart case —
-      // the server intentionally does NOT auto-resume draining on boot, so
-      // dormant items wait here until the user hits Resume.
+      // Legacy programmatic wakeup only. This never retries review records;
+      // the current UI and restart recovery do not require manual Resume.
       const st = this.tabState[sid];
       if (!st) return;
       const r = await this._runQueueMutation(
@@ -11862,6 +12111,7 @@ function portal() {
               String(payload.user_text || ""),
               Array.isArray(payload.user_images) ? payload.user_images : [],
               Array.isArray(payload.user_docs) ? payload.user_docs : [],
+              String(payload.queue_item_id || ""),
             )
           : null;
         if (turnUser && payload.scheduled) {
@@ -12830,9 +13080,11 @@ function portal() {
     fileWorkspacePath() {
       return this.currentWorkspacePath();
     },
-    absoluteFilePath(path) {
-      const root = String(this.fileWorkspacePath() || "");
-      const relative = String(path || "").replace(/^\/+/, "");
+    absoluteFilePath(path, workspace = this.fileWorkspacePath()) {
+      const root = String(workspace || "");
+      const value = String(path || "");
+      if (value.startsWith("/")) return value;
+      const relative = value.replace(/^\.\/+/, "");
       if (!root) return relative;
       if (!relative) return root;
       return root.endsWith("/") ? root + relative : root + "/" + relative;
@@ -17680,6 +17932,7 @@ function portal() {
               String(d.user_text || ""),
               Array.isArray(d.user_images) ? d.user_images : [],
               Array.isArray(d.user_docs) ? d.user_docs : [],
+              String(d.queue_item_id || ""),
             )
           : null;
         if (activeTurnUser && d.scheduled) {
@@ -17940,12 +18193,25 @@ function portal() {
         let r;
         const fetchStarted = perfNow();
         try {
+          const snapshot = opts.historySnapshot;
+          const reusable = snapshot && !full && !preserveFullOrder
+            && Array.isArray(snapshot.messages)
+            && snapshot.messages.length >= Math.min(Number(snapshot.total) || 0, requestedTail);
+          if (reusable) {
+            const trim = Math.max(0, snapshot.messages.length - requestedTail);
+            r = { ok: true, headers: new Headers(), json: async () => ({
+              ...snapshot, messages: snapshot.messages.slice(trim),
+              offset: (Number(snapshot.offset) || 0) + trim,
+              has_more: (Number(snapshot.offset) || 0) + trim > 0,
+            }) };
+          } else {
           r = await this._fetchWithDeadline(
             "/api/chat/sessions/" + sid + qs,
             { headers: this.hdr(), signal: opts.signal },
             full ? 60_000
               : Math.max(100, Number(this._sessionReadTimeoutMs) || 15000),
           );
+          }
         } catch (_) {
           historyPerf.status = "error";
           return false;
@@ -19774,13 +20040,63 @@ function portal() {
     },
 
     // ===== settings modal =====
-    async openSettings(activePage = "") {
-      const r = await fetch("/api/settings", { headers: this.hdr() });
-      if (!r.ok) {
-        this.toast(this.lang === "zh" ? "无法加载设置" : "Failed to load settings", "error");
-        return;
+    settingsNavigation() {
+      const zh = this.lang === "zh";
+      return [
+        ["general", zh ? "通用" : "General", "settings"],
+        ["provider", zh ? "模型与连接" : "Models & connections", "key"],
+        ["defaults", zh ? "会话" : "Conversations", "msg"],
+        ["extensions", zh ? "扩展" : "Extensions", "puzzle"],
+        ["memory_engine", zh ? "记忆引擎" : "Memory engine", "brain"],
+        ["service", zh ? "服务与诊断" : "Service & diagnostics", "refresh"],
+        ["versions", zh ? "关于与更新" : "About & updates", "info"],
+        ["cost", zh ? "用量看板" : "Usage", "dollar"],
+      ];
+    },
+    settingsPageMatches(page) {
+      const selected = this.settings.activePage;
+      return selected === page
+        || (selected === "general" && ["lang", "appearance", "notification"].includes(page))
+        || (selected === "extensions" && ["skills", "hooks", "mcp"].includes(page));
+    },
+    selectSettingsPage(page) {
+      this.settings.activePage = page;
+      if (page === "memory_engine") this.loadMemorySettings({ includeList: false });
+      if (page === "memory") this.loadMemorySettings();
+      if (page === "provider") this.loadClaudeAuthStatus();
+      if (page === "cost") this.loadCostDashboard();
+      if (page === "service") this.loadServiceStatus();
+      if (page === "extensions") {
+        this.refreshMcpList();
+        this.refreshSkillList();
+        this.loadHookSettings();
       }
-      const d = await r.json();
+      if (page === "hooks") this.loadHookSettings();
+      if (page === "skills") this.refreshSkillList();
+      if (page === "mcp") this.refreshMcpList();
+    },
+    async loadServiceStatus() {
+      this.settings.serviceLoading = true;
+      this.settings.serviceError = "";
+      try { this.settings.service = await this._settingsRead("/api/settings/service"); }
+      catch (e) { this.settings.serviceError = this._settingsReadError(e); }
+      finally { this.settings.serviceLoading = false; }
+    },
+    async openSettings(activePage = "") {
+      const generation = (this._settingsOpenGeneration || 0) + 1;
+      this._settingsOpenGeneration = generation;
+      if (this._settingsOpenController) this._settingsOpenController.abort();
+      const controller = new AbortController();
+      this._settingsOpenController = controller;
+      this.settings.surface = activePage === "memory" ? "memory" : "settings";
+      this.settings.show = true;
+      this.settings.error = "";
+      this.settings.loading = true;
+      this.selectSettingsPage(activePage || (this.isWideScreen ? "provider" : null));
+      // Render the shell immediately; optional panels have independent reads.
+      try {
+      const d = await this._settingsRead("/api/settings", controller);
+      if (generation !== this._settingsOpenGeneration) return;
       this.settings.providers = d.providers;
       this.settings.draftKeys = Object.fromEntries(d.providers.map(p => [p.env_key, ""]));
       // Reset provider-editor drafts each open so a stale half-edit from a
@@ -19813,19 +20129,16 @@ function portal() {
       // (provider — the most-used section) and render only that pane.
       // Mobile: stay at the top-level menu (activePage=null) and let the
       // user drill in; selecting a row shows that section + a Back button.
-      this.settings.activePage = activePage === "memory"
-        ? "memory"
-        : activePage === "hooks"
-          ? "hooks"
-          : (this.isWideScreen ? "provider" : null);
-      this.settings.show = true;
-      // Load MCP + Skill in parallel — non-fatal if any fails. Cost dashboard
-      // stays lazy because Codex quota refresh intentionally runs a CLI probe.
-      this.refreshMcpList();
-      this.refreshSkillList();
-      if (activePage === "hooks") this.loadHookSettings();
-      this.loadClaudeAuthStatus();
-      this.loadMemorySettings();
+      } catch (e) {
+        if (generation === this._settingsOpenGeneration) {
+          this.settings.error = this._settingsReadError(e);
+        }
+      } finally {
+        if (generation === this._settingsOpenGeneration) {
+          this.settings.loading = false;
+          this._settingsOpenController = null;
+        }
+      }
     },
 
     async openMemoryCenter(tab = "") {
@@ -19856,14 +20169,19 @@ function portal() {
         );
         if (!response.ok) throw new Error(await response.text());
         item._traceback = (await response.json()).sites || [];
+        item._tracebackError = false;
       } catch (_) {
-        item._traceback = [];
+        // A failed request is not evidence that the memory has no source.
+        item._tracebackError = true;
+        this.toast(this.lang === "zh" ? "来源加载失败，请重试" : "Source unavailable; retry", "error");
+        return [];
       }
       return item._traceback;
     },
 
     async openMemorySource(item) {
       const site = (await this.loadMemoryTraceback(item))[0];
+      if (item._tracebackError) return;
       if (!site?.session_id) {
         this.toast(this.lang === "zh" ? "没有可打开的来源会话" : "No source session available", "warn");
         return;
@@ -19950,24 +20268,69 @@ function portal() {
       } catch (_) { /* optional and fail-soft */ }
     },
 
-    async loadMemorySettings() {
-      const mem = this.settings.memory;
-      mem.loading = true;
-      try {
-        const [cfgR, statusR] = await Promise.all([
-          fetch("/api/memory/config", { headers: this.hdr(), cache: "no-store" }),
-          fetch("/api/memory/status", { headers: this.hdr(), cache: "no-store" }),
-        ]);
-        if (!cfgR.ok || !statusR.ok) throw new Error(`HTTP ${cfgR.status}/${statusR.status}`);
-        mem.config = await cfgR.json();
-        mem.status = await statusR.json();
-        await this.refreshMemoryCenter();
-      } catch (e) {
-        this.toast((this.lang === "zh" ? "记忆设置加载失败：" : "Memory settings failed: ")
-          + (e.message || e), "error");
-      } finally {
-        mem.loading = false;
+    SETTINGS_READ_TIMEOUT_MS: 8000,
+    _settingsReadError(error) {
+      if (error?.name === "TimeoutError" || error?.name === "AbortError") {
+        return this.lang === "zh"
+          ? "加载超时，请检查连接后重试"
+          : "Loading timed out. Check your connection and retry.";
       }
+      if (error?.name === "TypeError") {
+        return this.lang === "zh"
+          ? "连接中断，请重试"
+          : "Connection interrupted. Please retry.";
+      }
+      return String(error?.message || error);
+    },
+    async _settingsRead(url, controller = new AbortController()) {
+      if (controller.signal.aborted) throw this._abortError();
+      let timedOut = false;
+      const timer = setTimeout(() => {
+        timedOut = true;
+        controller.abort();
+      }, this.SETTINGS_READ_TIMEOUT_MS);
+      try {
+        const response = await fetch(url, {
+          headers: this.hdr(), cache: "no-store", signal: controller.signal,
+        });
+        if (!response.ok) throw new Error("HTTP " + response.status);
+        return await response.json();
+      } catch (error) {
+        if (timedOut) {
+          const timeout = new Error("settings request timed out");
+          timeout.name = "TimeoutError";
+          throw timeout;
+        }
+        throw error;
+      } finally { clearTimeout(timer); }
+    },
+
+    async loadMemorySettings({ includeList = true } = {}) {
+      const mem = this.settings.memory;
+      const generation = (this._memorySettingsGeneration || 0) + 1;
+      this._memorySettingsGeneration = generation;
+      mem.loading = true;
+      const load = async (key) => {
+        mem[`${key}Loading`] = true;
+        mem[`${key}Error`] = "";
+        try {
+          const data = await this._settingsRead(`/api/memory/${key}`);
+          if (generation !== this._memorySettingsGeneration) return;
+          mem[key] = data;
+          if (key === "config") mem.configLoaded = true;
+        } catch (e) {
+          if (generation === this._memorySettingsGeneration) {
+            mem[`${key}Error`] = this._settingsReadError(e);
+          }
+        } finally {
+          if (generation === this._memorySettingsGeneration) mem[`${key}Loading`] = false;
+        }
+      };
+      await Promise.allSettled([
+        load("config"), load("status"),
+        ...(includeList ? [this.refreshMemoryCenter()] : []),
+      ]);
+      if (generation === this._memorySettingsGeneration) mem.loading = false;
     },
 
     _memoryErrorDetail(d, status) {
@@ -20024,8 +20387,17 @@ function portal() {
       }
     },
 
-    async refreshMemoryCenter() {
+    async refreshMemoryCenter({ keepPage = false } = {}) {
       const mem = this.settings.memory;
+      if (!this._memoryPrefsLoaded) {
+        this._memoryPrefsLoaded = true;
+        try {
+          const prefs = JSON.parse(localStorage.getItem("muselab_memory_browser") || "{}");
+          if (["auto", "updated_at", "recall_count", "last_recalled_at", "helpful_count", "unhelpful_count"].includes(prefs.sort)) mem.sort = prefs.sort;
+          if (["asc", "desc"].includes(prefs.direction)) mem.direction = prefs.direction;
+        } catch (_) {}
+      }
+      if (!keepPage) mem.offset = 0;
       let url = "/api/memory/items?limit=200";
       if (mem.tab === "episodes") url = "/api/memory/episodes?limit=200";
       else if (mem.tab === "reflections") url = "/api/memory/artifacts?kind=reflection_run&limit=200";
@@ -20035,20 +20407,58 @@ function portal() {
       else if (mem.tab === "backups") url = "/api/memory/backups?limit=200";
       else if (mem.tab === "audit") url = "/api/memory/audit?limit=200";
       if (mem.tab === "items") {
-        const qs = new URLSearchParams({ limit: "200" });
+        const qs = new URLSearchParams({
+          limit: String(mem.pageSize), offset: String(mem.offset),
+          sort: mem.sort, direction: mem.direction,
+        });
         if (mem.query) qs.set("q", mem.query);
         if (mem.kind) qs.set("kind", mem.kind);
         if (mem.itemStatus) qs.set("status", mem.itemStatus);
         url = "/api/memory/items?" + qs.toString();
       }
+      this._setLS("muselab_memory_browser", JSON.stringify({
+        sort: mem.sort, direction: mem.direction,
+      }));
+      const generation = ++mem.listGeneration;
+      if (this._memoryListAbort) this._memoryListAbort.abort();
+      const controller = new AbortController();
+      this._memoryListAbort = controller;
+      const cached = mem.listCache[url];
+      mem.items = cached ? cached.items : [];
+      mem.total = cached ? cached.total : 0;
+      mem.listLoaded = !!cached;
+      mem.listLoading = true;
+      mem.listError = "";
       try {
-        const r = await fetch(url, { headers: this.hdr(), cache: "no-store" });
-        if (!r.ok) throw new Error(`HTTP ${r.status}`);
-        mem.items = (await r.json()).items || [];
+        const data = await this._settingsRead(url, controller);
+        if (generation !== mem.listGeneration) return;
+        mem.items = data.items || [];
+        mem.total = Number.isFinite(data.total) ? data.total : mem.items.length;
+        mem.listLoaded = true;
+        mem.listCache[url] = { items: mem.items, total: mem.total };
+        const keys = Object.keys(mem.listCache);
+        for (const key of keys.slice(0, Math.max(0, keys.length - 12))) delete mem.listCache[key];
       } catch (e) {
-        this.toast((this.lang === "zh" ? "记忆中心加载失败：" : "Memory Center failed: ")
-          + (e.message || e), "error");
+        if (generation !== mem.listGeneration) return;
+        mem.listError = ["AbortError", "TimeoutError"].includes(e.name)
+          ? (this.lang === "zh" ? "列表请求超时，请重试" : "List request timed out; retry")
+          : String(e.message || e);
+      } finally {
+        if (generation === mem.listGeneration) {
+          mem.listLoading = false;
+          this._memoryListAbort = null;
+        }
       }
+    },
+
+    memoryPage(delta) {
+      const mem = this.settings.memory;
+      if (mem.listLoading) return;
+      mem.offset = Math.max(0, Math.min(
+        Math.max(0, Math.ceil(mem.total / mem.pageSize) - 1) * mem.pageSize,
+        mem.offset + delta * mem.pageSize,
+      ));
+      return this.refreshMemoryCenter({ keepPage: true });
     },
 
     async loadMemoryDetail(item) {
@@ -21353,60 +21763,61 @@ function portal() {
 
     async restartService() {
       if (this.settings.restarting) return;
-      // Confirm before restarting — a stray tap on a phone would otherwise
-      // drop every active chat session for ~10s with no recourse. Use the
-      // in-app modal (this.confirm), NOT native window.confirm: mobile
-      // webviews silently suppress window.confirm() so it returns false →
-      // the restart short-circuited with no dialog AND no feedback
-      // (2026-06-10 user report: tapped 重启, nothing happened). The in-app
-      // modal renders reliably on mobile and matches the rest of the app.
+      await this.loadServiceStatus();
+      const service = this.settings.service;
+      const zh = this.lang === "zh";
+      const impact = service
+        ? (zh ? `当前有 ${service.active_turns} 个进行中轮次、${service.background_tasks} 个后台任务。`
+          : `${service.active_turns} active turns and ${service.background_tasks} background tasks.`)
+        : (zh ? "当前任务数量暂时无法确认。" : "Current task counts are unavailable.");
       const ok = await this.confirm({
-        title: this.lang === "zh" ? "重启服务" : "Restart service",
-        body: this.lang === "zh"
-          ? "重启 muselab 服务？所有正在跑的对话会中断约 10 秒。"
-          : "Restart muselab? All running chats will pause for ~10 seconds.",
-        okText: this.lang === "zh" ? "重启" : "Restart",
-        danger: true,
+        title: zh ? "重启服务" : "Restart service",
+        body: impact + (zh
+          ? "重启会中断本实例中的运行任务。草稿会保留；恢复后自动重新连接。"
+          : " Restart interrupts this instance's running tasks. Drafts are preserved and the UI reconnects."),
+        okText: zh ? "重启" : "Restart", danger: true,
       });
       if (!ok) return;
       this.settings.restarting = true;
-      // Immediate feedback: the button also flips to "重启中…" via
-      // settings.restarting, but an explicit toast confirms the tap landed
-      // even before the health-poll loop reports success.
-      this.toast(this.lang === "zh" ? "正在重启服务…" : "Restarting service…", "info", 2500);
+      this.settings.restartStatus = zh ? "正在请求重启…" : "Requesting restart…";
+      let previousInstance = service?.instance_id || "";
       try {
-        // Fire the restart request — the server responds before it restarts
-        await fetch("/api/settings/restart", {
+        const response = await this._fetchWithDeadline("/api/settings/restart", {
           method: "POST", headers: this.hdr(),
-        });
-      } catch (_) {
-        // Expected: connection may drop immediately if the process exits fast
-      }
-      // Poll /api/health every 1.5 s until the server is back up, then
-      // do a soft chat refresh (no full page reload — preserves open tabs).
-      const pollStart = Date.now();
-      const MAX_WAIT = 30_000;
-      const poll = async () => {
-        if (!this.settings.restarting) return;
-        if (Date.now() - pollStart > MAX_WAIT) {
+        }, 5000);
+        if (!response.ok) {
+          this.settings.restartStatus = (zh ? "重启请求失败：" : "Restart request failed: ") + response.status;
           this.settings.restarting = false;
-          this.toast(this.lang === "zh" ? "服务重启超时，请手动刷新" : "Restart timed out — reload manually", "error", 5000);
           return;
         }
-        try {
-          const r = await fetch("/api/health", { cache: "no-store" });
-          if (r.ok) {
-            this.settings.restarting = false;
-            this.toast(this.lang === "zh" ? "✓ 服务已重启" : "✓ Service restarted", "success", 3000);
+        const receipt = await response.json();
+        previousInstance = receipt.instance_id || previousInstance;
+      } catch (_) {
+        // A lost response is ambiguous: reconcile identity, never auto-resubmit.
+      }
+      if (!this.settings.restarting) return;
+      this.settings.restartStatus = zh ? "等待服务重新启动…" : "Waiting for a new service instance…";
+      const deadline = Date.now() + 60000;
+      try {
+        while (Date.now() < deadline) {
+          await new Promise(resolve => setTimeout(resolve, 1500));
+          try {
+            const response = await this._fetchWithDeadline("/api/settings/service", {
+              headers: this.hdr(), cache: "no-store",
+            }, 2500);
+            if (!response.ok) continue;
+            const current = await response.json();
+            if (!previousInstance || current.instance_id === previousInstance) continue;
+            this.settings.service = current;
+            this.settings.restartStatus = zh ? "服务已重启，连接已恢复" : "Service restarted; connection restored";
             await this.refreshChat();
-            await this.loadVersions();
             return;
-          }
-        } catch (_) { /* still restarting */ }
-        setTimeout(poll, 1500);
-      };
-      // Give the process a moment to die before we start polling
-      setTimeout(poll, 2000);
+          } catch (_) { /* wait for the verified replacement */ }
+        }
+        this.settings.restartStatus = zh
+          ? "尚未确认服务恢复。草稿已保留，可以检查连接；不会自动重复重启。"
+          : "Recovery not confirmed. Drafts are preserved; check connection. Restart will not be repeated automatically.";
+      } finally { this.settings.restarting = false; }
     },
 
     async saveSettings() {
@@ -27390,7 +27801,8 @@ function portal() {
         sessionId: this.currentId,
         messageId,
         text: selectedText,
-        path: source === "preview" ? this.selected : "",
+        path: source === "preview" ? this.absoluteFilePath(this.selected) : "",
+        workspace: source === "preview" ? this.fileWorkspacePath() : "",
         question: "",
         followup: "",
         x: Math.min(viewportWidth - popoverHalf - 12,
@@ -27429,7 +27841,7 @@ function portal() {
       this._cancelPreviewQuoteResize();
       Object.assign(this.previewQuote, {
         show: false, mode: "actions", source: "", role: "", sessionId: "",
-        messageId: "", text: "", path: "", question: "", followup: "",
+        messageId: "", text: "", path: "", workspace: "", question: "", followup: "",
         x: 0, y: 0, above: false, truncated: false, sending: false,
         dragged: false, dragging: false, askSessionId: "",
         askSessionName: "", askPrompt: "", askError: "", askAutoScroll: true,
@@ -27495,7 +27907,10 @@ function portal() {
         role: snapshot.role || "",
         sessionId: snapshot.sessionId || this.currentId || "",
         messageId: snapshot.messageId || "",
-        path: snapshot.path || "",
+        path: snapshot.source === "chat" ? (snapshot.path || "")
+          : this.absoluteFilePath(snapshot.path || this.selected || "",
+            snapshot.workspace || this.fileWorkspacePath()),
+        workspace: snapshot.workspace || this.fileWorkspacePath(),
         text: snapshot.text || "",
         truncated: !!snapshot.truncated,
       };
@@ -29900,10 +30315,7 @@ function portal() {
 
     // ===== @ mention =====
     _mentionPath(path, isDir = false) {
-      const fileRoot = this.fileWorkspacePath();
-      let mentionPath = this.currentWorkspacePath() === fileRoot
-        ? path
-        : fileRoot.replace(/\/$/, "") + "/" + String(path || "").replace(/^\//, "");
+      let mentionPath = this.absoluteFilePath(path);
       if (isDir && mentionPath && !mentionPath.endsWith("/")) mentionPath += "/";
       return mentionPath;
     },
@@ -31506,11 +31918,16 @@ function portal() {
           return false;
         }
       }
+      if (!opts.reconnect && !opts.resumedItem && sendState._uncertainSubmission) {
+        this.toast(this.lang === "zh" ? "请先确认上一条消息的送达状态"
+          : "Resolve the previous delivery before sending again", "warn", 3000);
+        return false;
+      }
       // Keep the ownership token primitive. Alpine proxies objects assigned to
       // reactive state, which would break identity comparison in finally and
       // leave the send button permanently locked after a successful submit.
       const composerSubmitToken = opts._composerSubmitToken
-        || `composer-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+        || this._uuid();
       if (isComposerSubmission) {
         if (sendState._composerSubmitToken
             && sendState._composerSubmitToken !== composerSubmitToken) {
@@ -31582,7 +31999,7 @@ function portal() {
         ]);
         for (const state of owners) {
           const pending = state && state._queueAdmission;
-          if (pending && pending._submitToken === composerSubmitToken) {
+          if (pending && pending._submitToken === composerSubmitToken && !pending._uncertain) {
             state._queueAdmission = null;
           }
         }
@@ -31631,6 +32048,8 @@ function portal() {
       // the exact submitted payload without overwriting text typed meanwhile.
       let submittedDraftRestored = false;
       const restoreSubmittedComposer = (restoreAttachments = false) => {
+        if (sendState._uncertainSubmission?.requestId === composerSubmitToken
+            || successorState()?._uncertainSubmission?.requestId === composerSubmitToken) return;
         if (!isComposerSubmission || submittedDraftRestored) return;
         submittedDraftRestored = true;
         if (ownsSendDraft()) {
@@ -31838,17 +32257,22 @@ function portal() {
         name: doc.name || "file",
         kind: doc.kind || "text",
       }));
-      const stageQueueAdmission = () => {
+      // A queue-discovery poll alone is not user-visible waiting work.
+      const busyAtSubmit = !resumed && !!(this.isTabStreaming(sendSid)
+        || sendState.compacting || sendState.backgroundActive
+        || this.queuePendingItems(sendState).length);
+      const stageQueueAdmission = ({ direct = false } = {}) => {
         const owner = successorState()
           || (this.tabState[sendSid] === sendState ? sendState : null);
         if (!owner) return false;
         if (owner._queueAdmission
             && owner._queueAdmission._submitToken === composerSubmitToken) {
           queueAdmission = owner._queueAdmission;
+          queueAdmission._directSubmission = direct;
           return true;
         }
         queueAdmission = {
-          id: `admission:${composerSubmitToken}`,
+          id: `q-${composerSubmitToken}`,
           text,
           displayText: String(optimisticDisplayText || ""),
           pendingQuotes: composerQuotes.map(quote => ({ ...quote })),
@@ -31864,6 +32288,7 @@ function portal() {
           enqueuedAt: Date.now(),
           _admissionPending: true,
           _submitToken: composerSubmitToken,
+          _directSubmission: direct,
         };
         owner._queueAdmission = queueAdmission;
         return true;
@@ -31872,6 +32297,9 @@ function portal() {
         sendState,
         {
           role: "user", text,
+          _k: `${sendSid}:submission:${composerSubmitToken}`,
+          _clientMessageId: composerSubmitToken,
+          _noAnim: true,
           _turnRoot: true,
           // The bubble exists before the server decides whether this prompt
           // owns a turn or a queue slot. Keep pane-level Running hidden until
@@ -31904,10 +32332,8 @@ function portal() {
         // before appending so the optimistic user bubble enters the bounded range.
         sendState.atBottom = true;
         this._scheduleLiveMessageViewport(sendState);
-        const knownFifo = !resumed && busyDelivery === "queue"
-          && this._isBusy(sendSid);
-        if (knownFifo) stageQueueAdmission();
-        else sentUserBubble = appendOptimisticUserBubble();
+        stageQueueAdmission({ direct: !busyAtSubmit });
+        if (!busyAtSubmit) sentUserBubble = appendOptimisticUserBubble();
         if (this.currentId === sendSid) {
           sendState.atBottom = true;
           this.scrollToBottom(true);
@@ -31941,6 +32367,10 @@ function portal() {
       const confirmedBusy = !isReconnect && !resumed
         ? await this._confirmSessionBusy(sendSid, sendState)
         : false;
+      if (sendState._cancelledSubmitToken === composerSubmitToken) {
+        rollbackOptimisticSubmission();
+        return false;
+      }
       if (confirmedBusy) {
         if (busyDelivery === "queue") {
           if (sentUserBubble) {
@@ -31993,10 +32423,8 @@ function portal() {
       // The locally-known queue can finish while registration/settings probes
       // are in flight. If the authoritative busy check now says idle, promote
       // the temporary queue-tail card into the ordinary direct-turn bubble.
-      if (queueAdmission) {
-        clearQueueAdmission();
-        sentUserBubble = appendOptimisticUserBubble();
-      }
+      // Idle submissions retain their inline bubble through admission.
+      // Only actual waiting work belongs in the outbox.
       // Reconnect mode has no optimistic user bubble: the backend already owns
       // the prompt and its canonical replay replaces any stale rendered suffix.
       if (isReconnect && !isContinuation && resumeEventSeq === 0) {
@@ -32208,7 +32636,7 @@ function portal() {
           useMux = true;
           let admittedTurnId = expectedTurnId;
           if (!isReconnect) {
-            const startTurn = async () => await fetch("/api/chat/turns/start", {
+            const startTurn = async () => await this._fetchWithDeadline("/api/chat/turns/start", {
               method: "POST",
               headers: Object.assign({ "Content-Type": "application/json" }, this.hdr()),
               signal: streamStartController.signal,
@@ -32219,13 +32647,17 @@ function portal() {
                 permission: sendPermission,
                 image_ids: attachIds.length ? attachIds.join(",") : "",
                 mobile: streamMobile,
+                client_message_id: composerSubmitToken,
               }),
-            });
+            }, 12000);
             let tr = await startTurn();
             if (tr.status === 404 || tr.status === 405) {
               this._setChatMuxUnsupported();
               useMux = false;
             } else {
+              if (streamState._cancelBeforeStream || streamState._cancelledSubmitToken === composerSubmitToken) {
+                throw new Error("submission cancelled");
+              }
               if (tr.status === 409 && !resumed) {
                 if (busyDelivery === "queue") {
                   if (sentUserBubble) {
@@ -32261,12 +32693,12 @@ function portal() {
                   "info", 2800);
                   return true;
                 }
-                if (queueAdmission) {
-                  clearQueueAdmission();
-                  sentUserBubble = appendOptimisticUserBubble();
-                }
+                if (queueAdmission) clearQueueAdmission();
               }
-              if (!tr.ok) tr = await startTurn();
+              if (!tr.ok && tr.status >= 500) {
+                const receipt = await this._submissionReceipt(streamSid, composerSubmitToken, "turn");
+                if (receipt.state === "accepted") tr = new Response(JSON.stringify(receipt.result));
+              }
               if (!tr.ok) throw new Error("turn start " + tr.status);
               const admitted = await tr.json();
               if (admitted.accepted === false || !admitted.turn_id) {
@@ -32276,10 +32708,12 @@ function portal() {
               streamState.activeTurnId = admittedTurnId;
               streamState.parentTurnId = "";
               streamState.lastEventSeq = 0;
+              if (!sentUserBubble && !streamState._cancelBeforeStream) sentUserBubble = appendOptimisticUserBubble();
               if (sentUserBubble) {
                 sentUserBubble._turnId = admittedTurnId;
                 sentUserBubble._admissionPending = false;
               }
+              clearQueueAdmission();
               if (Number(admitted.started_at) > 0) {
                 streamState._streamStartedAt = Number(admitted.started_at) * 1000;
               }
@@ -32313,6 +32747,22 @@ function portal() {
           es = new EventSource(url);
         }
       } catch (_e) {
+        if (useMux && !isReconnect) {
+          const receipt = await this._submissionReceipt(streamSid, composerSubmitToken, "turn");
+          if (receipt.state === "accepted" || (receipt.state === "cancelled" && receipt.result?.turn_id)) {
+            rollbackUnstartedSend(false);
+            clearQueueAdmission();
+            this._commitChatRecoveryDraft(sendSid, composerInput);
+            await this._checkActiveTurn(streamSid);
+            if (!streamState.streaming) await this.loadSession(streamSid, {quiet:true});
+            return true;
+          }
+          if (!["failed", "cancelled"].includes(receipt.state)) {
+            this._rememberUncertainSubmission(streamSid, composerSubmitToken, "turn", composerInput);
+            rollbackUnstartedSend(false);
+            return false;
+          }
+        }
         if (streamState._cancelBeforeStream) {
           rollbackUnstartedSend();
           return false;
@@ -32329,7 +32779,14 @@ function portal() {
         }
       }
       if (streamState._cancelBeforeStream) {
-        rollbackUnstartedSend();
+        const wasAdmitted = !!streamState.activeTurnId;
+        try { es?.close(); } catch (_) {}
+        rollbackUnstartedSend(!wasAdmitted);
+        clearQueueAdmission();
+        if (wasAdmitted) {
+          this._commitChatRecoveryDraft(sendSid, composerInput);
+          await this.loadSession(streamSid, { quiet: true });
+        }
         return false;
       }
       streamState.es = es;
@@ -32346,6 +32803,11 @@ function portal() {
       // "0.0s" immediately instead of waiting through the SSE handshake, and
       // (b) mid-stream reconnects don't visibly reset the displayed elapsed.
       es.onopen = () => {
+        if (!useMux && !isReconnect) {
+          if (!sentUserBubble) sentUserBubble = appendOptimisticUserBubble();
+          sentUserBubble._admissionPending = false;
+          clearQueueAdmission();
+        }
         streamState._lastSseTransportAt = Date.now();
         if (!hasDetachedText && !isReconnect && !resumed) {
           this._commitChatRecoveryDraft(sendSid, composerInput);
@@ -33648,27 +34110,11 @@ function portal() {
         // drain will hit st.compacting=true and bail; the compact-finally
         // path will pick it up. If the queue's tab isn't the active one,
         // drain bails too and activateTab handles it on return.
-        // A normal user turn error pauses the durable queue server-side, so
-        // mirror that state immediately while the final queue sync catches up.
-        // A background continuation is different: its originating task has
-        // already settled and the backend deliberately keeps queued user input
-        // runnable. Treating its incomplete auto-reaction as a queue failure
-        // stranded otherwise-valid follow-ups in the completion window.
-        const queueBlockingError = !!d.is_error && !isContinuation;
-        if (queueBlockingError) {
-          if (streamState.pendingQueue && streamState.pendingQueue.length > 0) {
-            streamState._queuePaused = true;
-            setTimeout(() => {
-              if (this.tabState[streamSid] === streamState) {
-                this._syncQueueFromServer(streamSid);
-              }
-            }, 800);
-          }
-        } else {
-          this.$nextTick(
-            () => this._drainPendingQueue(streamSid, completedTurnId),
-          );
-        }
+        // Failure belongs to one item. Discover the next turn on every
+        // terminal path, without manufacturing a whole-queue pause.
+        this.$nextTick(
+          () => this._drainPendingQueue(streamSid, completedTurnId),
+        );
         // If this turn left an SDK background task running (its card is still
         // ⏳), start polling /active so the server's continuation turn (card
         // flip + model auto-continue) surfaces live when the task finishes.
@@ -33911,21 +34357,7 @@ function portal() {
             streamState._seenUpdated = undefined;
             if (streamSid === this.currentId) this._openSeenUpdated = undefined;
           }
-          // Pause auto-drain — same context likely fails the next message
-          // too (quota / auth / cross-vendor signature). The failed user
-          // bubble surfaces a "resume queue (N)" CTA so the user can
-          // explicitly continue after fixing the root cause.
-          if (streamState.pendingQueue && streamState.pendingQueue.length > 0) {
-            // Optimistic — the server also pauses the queue in the turn's
-            // finally (Task 3) when an errored turn has items waiting. Show
-            // the banner now, reconcile with server truth a beat later.
-            streamState._queuePaused = true;
-            setTimeout(() => {
-              if (this.tabState[streamSid] === streamState) {
-                this._syncQueueFromServer(streamSid);
-              }
-            }, 800);
-          }
+          this.$nextTick(() => this._drainPendingQueue(streamSid));
           if (hasContextRecovery) {
             const recoveryId = String(
               errorMeta.recovered_session.id
@@ -34173,20 +34605,7 @@ function portal() {
             }
           });
         }
-        // User explicitly stopped — pause the queue too. Auto-draining
-        // here would be surprising (they cancelled for a reason, almost
-        // never "just this one but please send the rest"). The paused
-        // banner gives an explicit Resume.
-        if (streamState.pendingQueue && streamState.pendingQueue.length > 0) {
-          // Optimistic — the server pauses on an explicit interrupt too
-          // (broadcast.cancelled → finally pauses the queue). Reconcile after.
-          streamState._queuePaused = true;
-          setTimeout(() => {
-              if (this.tabState[streamSid] === streamState) {
-                this._syncQueueFromServer(streamSid);
-              }
-            }, 800);
-        }
+        this.$nextTick(() => this._drainPendingQueue(streamSid));
       });
       if (useMux) this._activateChatMuxChannel(es);
       // NOTE: errors are owned exclusively by the addEventListener("error")
@@ -34218,27 +34637,40 @@ function portal() {
       // Stop has exactly one meaning: interrupt the active turn for the current
       // session. Queued messages keep their independent edit/delete actions.
       const sid = this.currentId;
-      if (!sid || !this.isTabStreaming(sid)) return;
+      if (!sid) return;
       const st = this._ensureTabState(sid);
+      if (!this.isTabStreaming(sid) && !this._hasPendingAdmission(st) && !st._uncertainSubmission) return;
       const ownerTurnId = String(st.activeTurnId || "");
+      if (!ownerTurnId && st._composerSubmitToken) {
+        st._cancelledSubmitToken = st._composerSubmitToken;
+      }
       if (ownerTurnId && st._stoppingTurnId === ownerTurnId) return;
-      if (st.pendingQueue && st.pendingQueue.length > 0) st._queuePaused = true;
       // Before a channel and immutable turn id exist, abort only the start
       // request. send() rollback remains the sole owner of stream flags, timers,
       // channel state and the draft; Stop must not manufacture optimistic idle.
       if (st._streamStartController && !st.es && !ownerTurnId) {
+        const cancelledController = st._streamStartController;
         st._cancelBeforeStream = true;
-        st._streamStartController.abort();
-        if (st.pendingQueue && st.pendingQueue.length > 0) {
-          try {
-            await fetch(`/api/chat/sessions/${encodeURIComponent(sid)}/queue/pause`, {
-              method: "POST",
-              headers: Object.assign({ "Content-Type": "application/json" }, this.hdr()),
-              body: JSON.stringify({ paused: true }),
-            });
-          } catch (_) { /* queue sync below/next activation reconciles */ }
-          this._syncQueueFromServer(sid);
-        }
+        // Record cancellation independently of the request being aborted. If
+        // admission won the race, the server interrupts that exact receipt.
+        try {
+          await this._fetchWithDeadline(
+            "/api/chat/sessions/" + encodeURIComponent(sid) + "/submissions/"
+              + encodeURIComponent(st._composerSubmitToken || st._streamOwnerToken) + "/cancel",
+            { method: "POST", headers: this.hdr() }, 3000);
+        } catch (_) {}
+        cancelledController.abort();
+        this._syncQueueFromServer(sid);
+        return;
+      }
+      if (!ownerTurnId && st._uncertainSubmission?.kind === "turn") {
+        try {
+          await this._fetchWithDeadline(
+            "/api/chat/sessions/" + encodeURIComponent(sid) + "/submissions/"
+              + encodeURIComponent(st._uncertainSubmission.requestId) + "/cancel",
+            { method: "POST", headers: this.hdr() }, 3000);
+          await this.reconcileSubmission(sid);
+        } catch (_) {}
         return;
       }
       if (!ownerTurnId) return;

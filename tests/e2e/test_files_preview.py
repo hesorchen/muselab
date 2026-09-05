@@ -655,6 +655,7 @@ def test_preview_selection_quotes_as_attachment_and_asks_in_side_session(
           const ta = app.$refs.chatInput;
           ta.setSelectionRange(5, 5);
           return {
+            workspace: app.fileWorkspacePath(),
             session: app.currentId,
             sessionCount: app.sessions.length,
             openTabs: [...app.openTabIds],
@@ -688,7 +689,9 @@ def test_preview_selection_quotes_as_attachment_and_asks_in_side_session(
     assert quoted["input"] == "alphaomega"
     assert quoted["quoteCount"] == 1
     assert quoted["quoteText"] == selected
-    assert quoted["quotePath"] == "README.md"
+    expected_path = before["workspace"].rstrip("/") + "/README.md"
+    assert expected_path.startswith("/")
+    assert quoted["quotePath"] == expected_path
     assert quoted["session"] == before["session"]
     assert quoted["sessionCount"] == before["sessionCount"]
     assert quoted["openTabs"] == before["openTabs"]
@@ -782,7 +785,7 @@ def test_preview_selection_quotes_as_attachment_and_asks_in_side_session(
     first, followup_opts = asked["opts"]
     assert first["sessionId"] == followup_opts["sessionId"] == "preview-side-question"
     assert first["permissionMode"] == followup_opts["permissionMode"] == "default"
-    assert "引用自 `README.md`" in first["detachedText"]
+    assert f"引用自 `{expected_path}`" in first["detachedText"]
     assert selected_for_ask in first["detachedText"]
     assert "这段内容的核心是什么？" in first["detachedText"]
     assert first["detachedDisplayText"] == "这段内容的核心是什么？"
@@ -1313,16 +1316,19 @@ def test_preview_selection_quote_fits_mobile_and_reveals_chat(
     assert min(geometry["buttonHeights"]) >= 38
 
     actions.locator("button").nth(0).click()
+    expected_path = page.evaluate(
+        "() => document.querySelector('#app')._x_dataStack[0].fileWorkspacePath()"
+    ).rstrip("/") + "/README.md"
     page.wait_for_function(
-        """expected => {
+        """([expected, path]) => {
           const app = document.querySelector('#app')._x_dataStack[0];
           return app.mobileTab === 'chat'
             && app.input === ''
             && app.pendingQuotes.length === 1
-            && app.pendingQuotes[0].path === 'README.md'
+            && app.pendingQuotes[0].path === path
             && app.pendingQuotes[0].text.includes(expected);
         }""",
-        arg=selected,
+        arg=[selected, expected_path],
     )
     result = page.evaluate(
         """() => {
@@ -1439,16 +1445,20 @@ def test_directory_can_be_mentioned_from_search_and_tree_action(
           return {
             found: true,
             isDir: directory.is_dir,
+            workspace: app.fileWorkspacePath(),
             pickerInput,
             treeInput: app.input,
           };
         }"""
     )
+    workspace = result.pop("workspace")
+    assert workspace.startswith("/")
+    expected_path = workspace.rstrip("/") + "/mention-folder/"
     assert result == {
         "found": True,
         "isDir": True,
-        "pickerInput": "查看 @mention-folder/ ",
-        "treeInput": "@mention-folder/ ",
+        "pickerInput": f"查看 @{expected_path} ",
+        "treeInput": f"@{expected_path} ",
     }
 
 

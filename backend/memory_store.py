@@ -671,6 +671,60 @@ class MemoryStore:
         with self._lock, self._connect() as conn:
             return [self._row(row) or {} for row in conn.execute(sql, params)]
 
+    def browse_memories(self, owner_id: str, *, limit: int = 100, offset: int = 0,
+                        status: str | None = None, kind: str | None = None,
+                        query: str | None = None, sort: str = "auto",
+                        direction: str = "desc") -> tuple[list[dict], int]:
+        """Filter and sort the entire owner-scoped result before pagination.
+
+        Keep lexical retrieval's scoring contract separate from the browser's
+        explicit sort. Never truncate a search candidate pool before sorting it.
+        """
+        columns = {
+            "updated_at": "m.updated_at",
+            "recall_count": "COALESCE(s.recall_count, 0)",
+            "last_recalled_at": "COALESCE(s.last_recalled_at, 0)",
+            "helpful_count": "COALESCE(s.helpful_count, 0)",
+            "unhelpful_count": "COALESCE(s.unhelpful_count, 0)",
+            "relevance": "bm25(memory_fts)" if query else "m.updated_at",
+        }
+        if sort == "auto":
+            sort = "relevance" if query else "updated_at"
+        if sort not in columns or direction not in ("asc", "desc"):
+            raise ValueError("Unsupported memory sort")
+        source = "memories m"
+        clauses, params = ["m.owner_id=?"], [owner_id]
+        if query:
+            terms = list(dict.fromkeys(_fts_terms(query)))[:20]
+            if not terms:
+                return [], 0
+            expression = " OR ".join(f'"{term}"' for term in terms)
+            source = "memory_fts JOIN memories m ON m.id=memory_fts.memory_id"
+            clauses.append("memory_fts MATCH ?")
+            params.append(expression)
+        if status:
+            clauses.append("m.status=?")
+            params.append(status)
+        if kind:
+            clauses.append("m.kind=?")
+            params.append(kind)
+        where = " AND ".join(clauses)
+        join = (" LEFT JOIN memory_recall_stats s"
+                " ON s.owner_id=m.owner_id AND s.memory_id=m.id")
+        # BM25's lower value is more relevant. "desc" means best first in UI.
+        order = ("ASC" if direction == "desc" else "DESC") \
+            if query and sort == "relevance" else direction.upper()
+        with self._lock, self._connect() as conn:
+            total = conn.execute(
+                f"SELECT count(*) FROM {source} WHERE {where}", params,
+            ).fetchone()[0]
+            rows = conn.execute(
+                f"SELECT m.* FROM {source}{join} WHERE {where}"
+                f" ORDER BY {columns[sort]} {order}, m.id ASC LIMIT ? OFFSET ?",
+                [*params, max(1, min(500, limit)), max(0, offset)],
+            ).fetchall()
+            return [self._row(row) or {} for row in rows], total
+
     def memories_by_ids(self, memory_ids: list[str]) -> list[dict]:
         if not memory_ids:
             return []

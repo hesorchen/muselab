@@ -103,7 +103,7 @@ def test_chat_stream_mux_keeps_one_root_source_and_reuses_the_send_reducer():
     assert '"/api/chat/stream/mux?ticket="' in app
     assert "checkpoints: this._chatMuxCheckpoints()" in app
     assert "last_event_seq: Math.max(0, Number(st && st.lastEventSeq) || 0)" in app
-    assert 'fetch("/api/chat/turns/start"' in app
+    assert '_fetchWithDeadline("/api/chat/turns/start"' in app
     assert "es = this._chatMuxChannel(streamSid, admittedTurnId)" in app
     assert "if (useMux) this._activateChatMuxChannel(es)" in app
     assert "await this.loadSession(meta.id, { quiet: true, probeActive: false })" in app
@@ -1405,7 +1405,7 @@ def test_optimistic_session_paints_immediately_but_registers_before_ticket():
     assert "async _ensureSessionRegistered(id)" in helpers
     assert helpers.count("this._registerOptimisticSession(meta)") >= 2
     ensure_at = send.index("await this._ensureSessionRegistered(sendSid)")
-    push_at = send.index("if (knownFifo) stageQueueAdmission();")
+    push_at = send.index("stageQueueAdmission({ direct: !busyAtSubmit });")
     ticket_at = send.index('fetch("/api/chat/stream/start"')
     clear_at = send.index("clearSubmittedComposer({ preserveForHandshake: true })")
     assert clear_at < push_at < ensure_at < ticket_at
@@ -1636,7 +1636,7 @@ def test_runtime_setting_writes_gate_send_and_restore_per_session():
     send_start = app.index("async send(opts = {})")
     send = app[send_start:]
     assert send.count("await this._awaitRuntimeSettingPatches(sendSid, sendState)") == 1
-    assert send.index("if (knownFifo) stageQueueAdmission();") < send.index(
+    assert send.index("stageQueueAdmission({ direct: !busyAtSubmit });") < send.index(
         "await this._awaitRuntimeSettingPatches(sendSid, sendState)"
     )
     assert "runtimeSettingsPending()" in html
@@ -2445,8 +2445,8 @@ def test_stream_done_errors_share_failed_message_state_and_actions():
 
     assert "markUserFailed(_detail, d.kind, d.cta, d.retryable)" in done
     assert "if (d.is_error && !d.cancelled)" in done
-    assert "const queueBlockingError = !!d.is_error && !isContinuation" in done
-    assert "if (queueBlockingError)" in done
+    assert "_queuePaused = true" not in done
+    assert "_queuePaused = true" not in error
     assert "_drainPendingQueue(streamSid, completedTurnId)" in done
     assert "d.turn_id || streamState.activeTurnId || expectedTurnId" in done
     assert "turnId === completedTurnId" in app
@@ -2534,7 +2534,7 @@ def test_stop_control_interrupts_session_and_never_removes_queue_items():
     start = app.index("async stop() {")
     stop = app[start:app.index("// ====== ask_user_question", start)]
 
-    assert 'x-show="isTabStreaming(currentId)"' in html
+    assert 'x-show="isTabStreaming(currentId) || _hasPendingAdmission(activeSessionPane())' in html
     assert "chat-toolbar-stop" in html
     assert "if (st._stoppingTurnId)" in app
     assert "正在中断上一条任务" in app
@@ -2599,7 +2599,8 @@ def test_background_task_gap_rolls_foreground_onto_detached_successor():
     # rolls onto an isolated successor instead of waiting for that task.
     assert "st.compacting || st.backgroundActive || st._draining" in app
     assert "st.streaming || st.compacting || st.backgroundActive" in app
-    assert "st._draining || (st.pendingQueue && st.pendingQueue.length)" in app
+    assert "st.backgroundActive || st._draining" in app
+    assert "status.finishing && !status.background && !status.scheduled" in app
     assert "return status.background ? true : active;" in app
     assert "async _handoffBackgroundSession(" in app
     assert "/continue-detached`" in app
@@ -2617,7 +2618,7 @@ def test_background_task_gap_rolls_foreground_onto_detached_successor():
     # A second browser may refresh its list after the first browser hid the
     # predecessor. Its still-open tab must trust the local watcher flag and
     # probe /active instead of attempting a turn on the missing source row.
-    assert "&& !(st && st.backgroundActive)" in app
+    assert "&& !(st && (st.backgroundActive || st._draining))" in app
     assert "d.background && d.attachable === false" in app
     assert "background_tasks_pending" in app
     poller_start = app.index("    _ensureBgContPoller(sid) {")
@@ -2851,9 +2852,12 @@ def test_fifo_admission_projects_after_durable_queue_without_transcript_flash():
     send = app[send_start:send_end]
 
     assert "_queueAdmission: null" in app
-    assert "return admission ? [...durable, admission] : durable;" in app
-    assert "const knownFifo = !resumed && busyDelivery === \"queue\"" in send
-    assert "if (knownFifo) stageQueueAdmission();" in send
+    assert "return showAdmission ? [...waiting, admission] : waiting;" in app
+    assert "(!admission._directSubmission || admission._uncertain)" in app
+    assert "if (!busyAtSubmit) sentUserBubble = appendOptimisticUserBubble();" in send
+    assert "stageQueueAdmission();" in send
+    assert 'id: `q-${composerSubmitToken}`' in send
+    assert "stageQueueAdmission();" in send
     assert "owner._queueAdmission = queueAdmission;" in send
     assert "_submitToken: composerSubmitToken" in send
     assert "queueAdmissionAsyncHandoff = stageQueueAdmission();" in send
@@ -2876,7 +2880,7 @@ def test_detached_rollover_preserves_migrated_queue_fifo():
     assert "payload.target_queue_depth" in handoff
     assert "?? payload.queue_depth" in handoff
     assert "?? payload.queue_pending" in handoff
-    assert "childState.pendingQueue.length > 0" in handoff
+    assert "this.queuePendingItems(childState).length > 0" in handoff
     assert "return { sessionId: childSid, queuePending, rolledOver: true };" in handoff
     # Ordinary messages commit to the source's durable queue before the
     # expensive transcript fork. The backend migrates that accepted item in
@@ -2923,13 +2927,13 @@ def test_composer_send_has_one_claim_owner_without_exposing_internal_phases():
         "await this._awaitRuntimeSettingPatches(sendSid, sendState)"
     )
     assert send.count("await this._awaitRuntimeSettingPatches(sendSid, sendState)") == 1
-    assert send.index("if (knownFifo) stageQueueAdmission();") < send.index(
+    assert send.index("stageQueueAdmission({ direct: !busyAtSubmit });") < send.index(
         "await this._ensureSessionRegistered(sendSid)"
     )
     assert send.index("clearSubmittedComposer({ preserveForHandshake: true })") < send.index(
         "await this._ensureSessionRegistered(sendSid)"
     )
-    assert send.index("if (knownFifo) stageQueueAdmission();") < send.index(
+    assert send.index("stageQueueAdmission({ direct: !busyAtSubmit });") < send.index(
         "await this._confirmSessionBusy(sendSid, sendState)"
     )
     assert "rollbackOptimisticSubmission();" in send
@@ -3578,7 +3582,7 @@ def test_done_immediately_stamps_tool_tail_and_quietly_adopts_fork_boundary():
     assert '"/api/chat/sessions/" + sid + "/active"' in reconcile
     assert "activity.active && !activity.background" in reconcile
     assert "activeTurnId !== completedTurnId" in reconcile
-    assert "const activeProbe = completedTurnId" in reconcile
+    assert "const committedState = history.completion_state" in reconcile
     assert "!this._hasPendingAdmission(ownerState)" in reconcile
     assert "const reconcileTail = this._historyReconcileWindowSize();" in reconcile
     assert '"/api/chat/sessions/" + sid + "?tail=" + reconcileTail' in reconcile
@@ -3595,7 +3599,8 @@ def test_done_immediately_stamps_tool_tail_and_quietly_adopts_fork_boundary():
     assert "hasSuccessorRoot && (!activity || activity.active)" in reconcile
     assert "const loaded = await this.loadSession(sid, {" in reconcile
     assert "quiet: true, probeActive: false" in reconcile
-    assert "attempt < 30" in reconcile
+    assert "historySnapshot: history" in reconcile
+    assert "around_uuid=" in reconcile
     assert "Math.min(2000, 250 + options.attempt * 100)" in reconcile
 
     queue_start = app.index("    async _runQueueAttach(")
@@ -3766,6 +3771,7 @@ def test_transcript_active_session_ui_reads_through_pane_facade():
     body_start = html.index('<div class="chat-transcript-wrap"')
     body_end = html.index('<div class="chat-input">', body_start)
     transcript = html[body_start:body_end]
+    outbox = html[html.index('<section class="queue-outbox"'):html.index("</section>", html.index('<section class="queue-outbox"'))]
     assert 'get activeSession(){ return activeSessionPane() }' in transcript
     for binding in (
         "activeSession.messages",
@@ -3774,13 +3780,9 @@ def test_transcript_active_session_ui_reads_through_pane_facade():
         "activeSession.streaming",
         "activeSession.streamingModel",
         "activeSession.streamElapsed",
-        "activeSession.pendingQueue",
-        "activeSession._queuePaused",
-        "activeSession.backgroundActive",
-        "activeSession.compacting",
-        "activeSession._draining",
+        "queueDisplayItems(activeSession)",
     ):
-        assert binding in transcript
+        assert binding in transcript or binding in outbox
     assert "isAwayFromLatest()" in transcript
     assert "tabState[currentId]" not in transcript
     assert "_currentQueueLen()" not in transcript
@@ -4008,7 +4010,7 @@ def test_live_turn_bounds_dom_and_indexes_task_status_without_linear_scans():
     assert "this._normalizeTaskStatusPreview" in send[apply_start:apply_end]
     assert "if (_scrollCoalesceHandle !== null) return" in send
     assert send.index("sendState.atBottom = true") < send.index(
-        "if (knownFifo) stageQueueAdmission();")
+        "stageQueueAdmission();")
 
     assert '@click="returnToLatest()"' in html
     assert html.count('x-show="isAwayFromLatest()"') >= 3
@@ -5280,8 +5282,9 @@ def test_queue_controls_validate_mutations_and_block_send_during_interrupt():
     assert "if (st._stoppingTurnId)" in app
     assert "queueActionBusy(currentId, 'edit:' + q.id)" in html
     assert "queueActionBusy(currentId, 'remove:' + q.id)" in html
-    assert '"chat.queue_pause_nonempty"' in chat
-    assert "sess.pause_queue_if_nonempty" in chat
+    assert "sess.pause_queue_if_nonempty" not in chat
+    assert "editPendingQueueItem(currentId, q.id)" in html
+    assert "removePendingQueueItem(currentId, q.id)" in html
     assert "owned=True" in chat
 
 
@@ -5338,11 +5341,10 @@ def test_queue_paused_flag_cannot_outlive_its_items():
     assert 'current["items"] = []' in clear
     assert 'current["paused"] = False' in clear
 
-    # Paused beats streaming: "a turn is running" no longer implies "it will
-    # drain when the turn ends".
-    assert "(!activeSession.streaming || activeSession._queuePaused)" in html
-    # And the bubble itself says so — the banner is easy to scroll past.
-    assert 'class="queued-paused-badge"' in html
+    assert "activeSession._queuePaused" not in html
+    assert 'class="queued-paused-badge"' not in html
+    assert 'class="queue-paused-banner"' not in html
+    assert "queueItemIssue(q)" in html
 
 
 def test_compact_summary_stays_collapsed_until_tapped():
@@ -5576,7 +5578,8 @@ def test_stop_aborts_stream_start_before_channel_opens():
     stop = js[js.index("async stop() {"):]
     stop = stop[:stop.index("// ====== ask_user_question UI helpers")]
     assert "if (st._streamStartController && !st.es && !ownerTurnId)" in stop
-    assert "st._streamStartController.abort()" in stop
+    assert "cancelledController.abort()" in stop
+    assert '"/cancel"' in stop
     assert "st.streaming = false" not in stop
     assert "st._streamTimer = null" not in stop
     assert "st.streamPhase = \"\"" not in stop
@@ -5769,10 +5772,10 @@ def test_busy_send_mode_uses_authoritative_delivery_and_steering_state():
     label_start = app.index("    queueDeliveryLabel(item) {")
     label_end = app.index("\n    _applyQueueSteeringEvent", label_start)
     labels = app[label_start:label_end]
-    assert "等待当前工具完成" in labels
+    assert "等待本轮接收输入" in labels
     assert "已交给当前任务" in labels
     assert "排队中" in labels
-    assert "queueDeliveryLabel(q)" in html
+    assert "queueItemLabel(q, activeSession)" in html
 
     send_start = app.index("    async send(opts = {}) {")
     send_end = app.index("\n    // ====== ask_user_question", send_start)
@@ -5809,7 +5812,7 @@ def test_busy_send_mode_uses_authoritative_delivery_and_steering_state():
     assert 'errorMeta.active_turn_id || errorMeta.turn_id' in send
     assert '_optimisticQueue: !resumed && this._isBusy(sendSid)' in send
     assert 'x-show="m._admissionPending"' in html
-    assert "正在确认发送方式" in html
+    assert "正在发送" in html
     assert "m._optimisticDelivery === 'queue'" in html
     assert "'排队中' : 'Queued'" in html
 
@@ -6280,7 +6283,9 @@ def test_hook_settings_gui_edits_standard_scopes_and_keeps_builtins_read_only():
     html = (FRONTEND / "index.html").read_text(encoding="utf-8")
     backend = (BACKEND / "hook_settings.py").read_text(encoding="utf-8")
 
-    assert 'settings.activePage=\'hooks\'; loadHookSettings()' in html
+    assert 'selectSettingsPage(entry[0])' in html
+    assert 'if (page === "extensions")' in app
+    assert 'this.loadHookSettings()' in app
     assert "Claude 标准配置" in html
     assert "MuseLab 内置 Hook（只读）" in html
     assert 'class="switch sm"' in html

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import stat
 import threading
@@ -298,6 +299,8 @@ async def test_stream_observer_publishes_safe_trace_to_active_turn(
             (sid, "model", "auto", ""),
             _hook("hook_response", event="Stop", exit_code=0),
         )
+        await asyncio.to_thread(chat_mod._hook_diagnostic_worker.close)
+        await asyncio.sleep(0)
     finally:
         chat_mod._active_turns.pop(sid, None)
 

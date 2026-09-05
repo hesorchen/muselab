@@ -11,6 +11,8 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
+import uuid
 from pathlib import Path
 from typing import Any, Literal
 
@@ -31,6 +33,8 @@ MCP_EXAMPLE_PATH = Path(__file__).resolve().parent.parent / "mcp.json.example"
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
 router.include_router(hook_settings_router)
+_SERVICE_STARTED = time.monotonic()
+_SERVICE_INSTANCE_ID = uuid.uuid4().hex
 
 # Path to the .env file we read/write at runtime. Defaults to the repo
 # root's `.env`. The MUSELAB_ENV_PATH override is critical for test
@@ -1521,7 +1525,20 @@ async def restart_service() -> dict:
     Sends the 200 response first, then schedules the actual restart after a
     short delay so the HTTP response has time to flush to the client."""
     asyncio.create_task(_do_restart())
-    return {"ok": True, "restarting": True}
+    return {"ok": True, "restarting": True, "instance_id": _SERVICE_INSTANCE_ID}
+
+
+@router.get("/service", dependencies=[Depends(require_token)])
+async def service_status() -> dict:
+    """Cheap in-memory status; no filesystem, subprocess or private payload."""
+    from . import chat
+    return {
+        "instance_id": _SERVICE_INSTANCE_ID,
+        "uptime_seconds": round(time.monotonic() - _SERVICE_STARTED, 1),
+        "active_turns": sum(not bc.done for bc in tuple(chat._active_turns.values())),
+        "background_tasks": sum(
+            len(tasks) for tasks in tuple(chat._sessions_with_inflight_tasks.values())),
+    }
 
 
 async def _do_restart() -> None:

@@ -1236,7 +1236,8 @@ def test_cancelled_native_adjustment_cannot_be_resurrected_by_late_write(
     assert late is not None
     assert late["steering_state"] == "cancelled"
     snapshot = sess.get_queue(sid)
-    assert snapshot["paused"] is True
+    assert snapshot["paused"] is False
+    assert snapshot["items"][0]["queue_issue"] == "cancelled"
     assert snapshot["revision"] == cancelled_revision
 
 
@@ -1277,7 +1278,7 @@ def test_native_adjustment_fallback_becomes_an_ordinary_fifo_item(app_module):
     ) is None
 
 
-def test_cancelled_native_adjustment_is_retained_and_pauses_queue(app_module):
+def test_cancelled_native_adjustment_is_retained_without_pausing_queue(app_module):
     from backend import sessions as sess
 
     sid = "s-native-cancelled"
@@ -1296,12 +1297,13 @@ def test_cancelled_native_adjustment_is_retained_and_pauses_queue(app_module):
     assert cancelled is not None
     assert cancelled["steering_state"] == "cancelled"
     snapshot = sess.get_queue(sid)
-    assert snapshot["paused"] is True
+    assert snapshot["paused"] is False
+    assert snapshot["items"][0]["queue_issue"] == "cancelled"
     assert snapshot["items"][0]["id"] == item["id"]
     assert sess.claim_queue_message(sid) is None
 
 
-def test_restart_detaches_and_pauses_uncertain_native_adjustment(app_module):
+def test_restart_isolates_uncertain_native_adjustment(app_module):
     from backend import sessions as sess
 
     sid = "s-native-restart"
@@ -1317,7 +1319,8 @@ def test_restart_detaches_and_pauses_uncertain_native_adjustment(app_module):
 
     recovered = sess.recover_queue_inflight(sid)
 
-    assert recovered["paused"] is True
+    assert recovered["paused"] is False
+    assert recovered["items"][0]["queue_issue"] == "delivery_unknown"
     assert recovered["items"][0]["id"] == item["id"]
     assert recovered["items"][0]["delivery"] == "queue"
     assert recovered["items"][0]["steering_state"] == "cancelled"
@@ -1325,11 +1328,10 @@ def test_restart_detaches_and_pauses_uncertain_native_adjustment(app_module):
     assert "command_uuid" not in recovered["items"][0]
     assert sess.claim_queue_message(sid) is None
 
-    # Recovery is conservative but not a dead end: explicit Resume makes the
-    # retained payload claimable as an ordinary turn. It can also be deleted
-    # or cleared because no nonexistent CLI owner remains attached.
+    # An old Resume cannot duplicate input of unknown delivery. Explicit
+    # Delete/Edit can remove it without a nonexistent live CLI owner.
     sess.set_queue_paused(sid, False)
-    assert sess.claim_queue_message(sid)["id"] == item["id"]
+    assert sess.claim_queue_message(sid) is None
 
 
 def test_native_command_uuid_is_unique_across_waiting_and_inflight(app_module):

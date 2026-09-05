@@ -2144,7 +2144,7 @@
                         <span x-text="m._optimisticQueue
                           ? (m._optimisticDelivery === 'queue'
                             ? (lang==='zh' ? '排队中' : 'Queued')
-                            : (lang==='zh' ? '正在确认发送方式' : 'Confirming delivery'))
+                            : (lang==='zh' ? '正在发送' : 'Sending'))
                           : (lang==='zh' ? '正在发送' : 'Sending')"></span>
                       </div>
                     </div>
@@ -3139,128 +3139,6 @@
                block the temporary separator above owns status; afterwards the
                per-turn footer inside the message loop owns it. -->
 
-          <!-- Pending queue: messages the user sent while Muse was still
-               replying (or while a compact was running). They auto-drain on
-               the next done event / compact-finally / activateTab. Faded
-               + dashed border distinguishes them from real user bubbles. -->
-          <template x-for="(q, qi) in queueDisplayItems(activeSession)" :key="q.id">
-            <div class="msg user queued">
-              <div class="msg-row queued-row"
-                   :class="{ 'avoids-tail-nav': isAwayFromLatest() }">
-                <div class="bubble user-bubble queued-bubble">
-                  <div class="queued-header">
-                    <span class="queued-icon"><svg><use href="#i-clock"/></svg></span>
-                    <span class="queued-label"
-                          x-text="queueDeliveryLabel(q) + ' ' + (qi+1) + ' / '
-                                   + queueDisplayItems(activeSession).length"></span>
-                    <!-- "已排队 1/2" alone reads as "will send shortly", which
-                         is wrong while the queue is paused — the item will
-                         NEVER send until Resume. State the difference on the
-                         bubble, not just in the banner: the banner sits at the
-                         bottom of the chat and is easy to scroll past on a
-                         phone, and the bubble is what the user actually looks
-                         at when wondering why nothing happened. -->
-                    <span class="queued-paused-badge"
-                          x-show="activeSession._queuePaused"
-                          x-text="lang==='zh' ? '已暂停' : 'paused'"></span>
-                    <span style="flex:1"></span>
-                    <button class="queued-act icon-btn sm"
-                            @click="!q._admissionPending && editPendingQueueItem(currentId, qi)"
-                            :disabled="q._admissionPending || queueActionBusy(currentId, 'edit:' + q.id)"
-                            :title="lang==='zh' ? '编辑' : 'Edit'">
-                      <svg><use href="#i-edit"/></svg>
-                    </button>
-                    <button class="queued-act icon-btn sm"
-                            @click="!q._admissionPending && removePendingQueueItem(currentId, qi)"
-                            :disabled="q._admissionPending || queueActionBusy(currentId, 'remove:' + q.id)"
-                            :title="lang==='zh' ? '移除' : 'Remove'">
-                      <svg><use href="#i-x"/></svg>
-                    </button>
-                  </div>
-                  <div class="queued-quote-list" x-show="q.pendingQuotes && q.pendingQuotes.length">
-                    <template x-for="(quote, qidx) in (q.pendingQuotes || [])"
-                              :key="quote.id || ('queued-quote-'+qidx)">
-                      <div class="queued-quote-chip" :title="previewQuoteExcerpt(quote)">
-                        <svg aria-hidden="true"><use :href="previewQuoteSourceIcon(quote)"/></svg>
-                        <span x-text="previewQuoteSourceName(quote) + ' · ' + previewQuoteExcerpt(quote)"></span>
-                      </div>
-                    </template>
-                  </div>
-                  <div class="queued-text" x-show="q.displayText" x-text="q.displayText"></div>
-                  <!-- FIX ③: the server resolves queued upload IDs against its
-                       in-memory store, so we can render real image thumbnails
-                       and named doc chips here — matching how a SENT message
-                       looks, instead of the old neutral "含附件" marker.
-                       Expired uploads (TTL) show a muted "附件已过期" chip. -->
-                  <div class="queued-attach" x-show="q.hasAttach">
-                    <template x-for="(im, ii) in (q.images || [])" :key="'qimg'+ii">
-                      <img class="queued-thumb" x-show="im.src"
-                           :src="im.src || null" loading="lazy" alt=""
-                           @error="$el.style.display='none'" />
-                    </template>
-                    <template x-for="(d, di) in (q.docs || [])" :key="'qdoc'+di">
-                      <span class="queued-doc-chip" :title="d.name + ' · ' + d.kind">
-                        <svg><use href="#i-file-text"/></svg>
-                        <span x-text="d.name"></span>
-                      </span>
-                    </template>
-                    <span class="queued-doc-chip queued-attach-expired"
-                          x-show="q.expiredCount > 0">
-                      <svg><use href="#i-alert-triangle"/></svg>
-                      <span x-text="lang==='zh' ? '附件已过期' : 'attachment expired'"></span>
-                    </span>
-                    <!-- Fallback: ids present but metadata not yet resolved
-                         (e.g. mid tab-switch before the queue sync lands). -->
-                    <span class="queued-doc-chip"
-                          x-show="!(q.images && q.images.length) && !(q.docs && q.docs.length) && !q.expiredCount">
-                      <svg><use href="#i-paperclip"/></svg>
-                      <span x-text="lang==='zh' ? '含附件' : 'has attachment'"></span>
-                    </span>
-                  </div>
-                </div>
-              </div>
-            </div>
-          </template>
-
-          <!-- Idle-with-items banner. Shows whenever the queue has items but
-               nothing is running on this session (not streaming, not
-               compacting, not mid-reattach). Two reasons this happens:
-                 1. An error / interrupt paused the queue server-side
-                    (_queuePaused) — the user fixes the root cause then resumes.
-                 2. Items left dormant after a process restart — the server
-                    intentionally does NOT auto-resume draining on boot, so
-                    they wait here for an explicit Resume.
-               While a turn is running, items normally auto-drain server-side
-               and this banner stays hidden — EXCEPT when the queue is paused.
-               The old `!streaming` gate assumed running ⇒ will drain, which is
-               exactly false in the paused state: the user starts a new turn,
-               sees no banner, the turn ends, dequeue_message returns None
-               because of the flag, and nothing ever indicates why. Paused wins
-               over streaming (2026-07-25 report: 2 items sat through several
-               completed turns with no visible cause). -->
-          <div x-show="activeSession.pendingQueue.length
-                        && (!activeSession.streaming || activeSession._queuePaused)
-                        && !activeSession.backgroundActive
-                        && !activeSession.compacting
-                        && !activeSession._draining"
-               class="queue-paused-banner">
-            <span class="queue-paused-icon"><svg><use href="#i-alert-triangle"/></svg></span>
-            <span class="queue-paused-text"
-                  x-text="(activeSession._queuePaused
-                            ? (lang==='zh' ? '上一条中断，队列已暂停（' : 'Queue paused (')
-                            : (lang==='zh' ? '队列等待中（' : 'Queue waiting (' ))
-                          + activeSession.pendingQueue.length
-                          + (lang==='zh' ? ' 条）' : ' waiting)')"></span>
-            <button class="queue-paused-btn primary"
-                    @click="resumeQueueDrain(currentId)"
-                    :disabled="queueActionBusy(currentId, 'resume')"
-                    x-text="lang==='zh' ? '继续执行' : 'Resume'"></button>
-            <button class="queue-paused-btn"
-                    @click="discardQueue(currentId)"
-                    :disabled="queueActionBusy(currentId, 'discard')"
-                    x-text="lang==='zh' ? '清空队列' : 'Discard'"></button>
-          </div>
-
           <!-- Compact-in-progress keeps its distinct 📦 placeholder because it
                describes conversation maintenance rather than a response turn.
                Appears for the full window between native-compact POST and
@@ -3321,6 +3199,106 @@
       </div>
 
       <div class="chat-input">
+        <section class="queue-outbox" x-data="{ get activeSession(){ return activeSessionPane() } }"
+                 x-show="queueDisplayItems(activeSession).length" x-cloak
+                 :aria-label="lang==='zh' ? '待发送消息' : 'Outbox'">
+          <button type="button" class="queue-outbox-toggle"
+                  @click="activeSession._outboxCollapsed = !activeSession._outboxCollapsed"
+                  :aria-expanded="!activeSession._outboxCollapsed">
+            <span x-text="queueOutboxLabel(activeSession)"></span>
+            <span x-text="activeSession._outboxCollapsed ? (lang==='zh'?'展开':'Expand') : (lang==='zh'?'收起':'Collapse')"></span>
+          </button>
+          <div class="queue-outbox-items" x-show="!activeSession._outboxCollapsed">
+          <!-- Pending queue: messages the user sent while Muse was still
+               replying (or while a compact was running). They auto-drain on
+               the next done event / compact-finally / activateTab. Faded
+               + dashed border distinguishes them from real user bubbles. -->
+          <template x-for="(q, qi) in queueDisplayItems(activeSession)" :key="q.id">
+            <div class="msg user queued">
+              <div class="msg-row queued-row"
+                   :class="{ 'avoids-tail-nav': isAwayFromLatest() }">
+                <div class="bubble user-bubble queued-bubble">
+                  <div class="queued-header">
+                    <span class="queued-icon"><svg><use href="#i-clock"/></svg></span>
+                    <span class="queued-label"
+                          x-text="queueItemLabel(q, activeSession)"></span>
+                    <span style="flex:1"></span>
+                    <button class="queued-act icon-btn sm"
+                            @click="!q._admissionPending && editPendingQueueItem(currentId, q.id)"
+                            :disabled="q._admissionPending || queueActionBusy(currentId, 'edit:' + q.id)"
+                            :title="lang==='zh' ? '编辑' : 'Edit'">
+                      <svg><use href="#i-edit"/></svg>
+                    </button>
+                    <button class="queued-act icon-btn sm"
+                            @click="!q._admissionPending && removePendingQueueItem(currentId, q.id)"
+                            :disabled="q._admissionPending || queueActionBusy(currentId, 'remove:' + q.id)"
+                            :title="lang==='zh' ? '移除' : 'Remove'">
+                      <svg><use href="#i-x"/></svg>
+                    </button>
+                  </div>
+                  <div class="queued-quote-list" x-show="q.pendingQuotes && q.pendingQuotes.length">
+                    <template x-for="(quote, qidx) in (q.pendingQuotes || [])"
+                              :key="quote.id || ('queued-quote-'+qidx)">
+                      <div class="queued-quote-chip" :title="previewQuoteExcerpt(quote)">
+                        <svg aria-hidden="true"><use :href="previewQuoteSourceIcon(quote)"/></svg>
+                        <span x-text="previewQuoteSourceName(quote) + ' · ' + previewQuoteExcerpt(quote)"></span>
+                      </div>
+                    </template>
+                  </div>
+                  <div class="queued-text" x-show="q.displayText" x-text="q.displayText"></div>
+                  <p class="queued-review-hint" x-show="queueItemIssue(q)"
+                     x-text="lang==='zh'
+                       ? '该条不会自动重发，不影响后续消息。核对会话后可编辑重发或移除。'
+                       : 'Not resent automatically; other messages continue. Check the conversation before editing and resending, or remove this item.'"></p>
+                  <button class="btn-ghost sm" x-show="q._uncertain" @click="reconcileSubmission(currentId)"
+                          :disabled="activeSessionPane()._submissionChecking"
+                          x-text="lang==='zh'?'确认状态':'Check delivery'"></button>
+                  <button class="btn-ghost sm" x-show="q._uncertain" @click="releaseUncertainSubmission(currentId)"
+                          x-text="lang==='zh'?'保留为草稿':'Keep as draft'"></button>
+                  <!-- FIX ③: the server resolves queued upload IDs against its
+                       in-memory store, so we can render real image thumbnails
+                       and named doc chips here — matching how a SENT message
+                       looks, instead of the old neutral "含附件" marker.
+                       Expired uploads (TTL) show a muted "附件已过期" chip. -->
+                  <div class="queued-attach" x-show="q.hasAttach">
+                    <template x-for="(im, ii) in (q.images || [])" :key="'qimg'+ii">
+                      <img class="queued-thumb" x-show="im.src"
+                           :src="im.src || null" loading="lazy" alt=""
+                           @error="$el.style.display='none'" />
+                    </template>
+                    <template x-for="(d, di) in (q.docs || [])" :key="'qdoc'+di">
+                      <span class="queued-doc-chip" :title="d.name + ' · ' + d.kind">
+                        <svg><use href="#i-file-text"/></svg>
+                        <span x-text="d.name"></span>
+                      </span>
+                    </template>
+                    <span class="queued-doc-chip queued-attach-expired"
+                          x-show="q.expiredCount > 0">
+                      <svg><use href="#i-alert-triangle"/></svg>
+                      <span x-text="lang==='zh' ? '附件已过期' : 'attachment expired'"></span>
+                    </span>
+                    <!-- Fallback: ids present but metadata not yet resolved
+                         (e.g. mid tab-switch before the queue sync lands). -->
+                    <span class="queued-doc-chip"
+                          x-show="!(q.images && q.images.length) && !(q.docs && q.docs.length) && !q.expiredCount">
+                      <svg><use href="#i-paperclip"/></svg>
+                      <span x-text="lang==='zh' ? '含附件' : 'has attachment'"></span>
+                    </span>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </template>
+
+          </div>
+          <div class="queue-outbox-actions" x-show="!activeSession._outboxCollapsed">
+            <button class="btn-ghost sm"
+                    @click="discardQueue(currentId)"
+                    :disabled="queueActionBusy(currentId, 'discard')"
+                    x-text="lang==='zh' ? '清空列表' : 'Clear list'"></button>
+          </div>
+
+        </section>
         <!-- Composer settings panel (mobile gear). Anchored HERE, not next to
              its button: the button lives in .chat-toolbar inside
              .chat-input-wrap, which sets `overflow: hidden` to clip the
@@ -3761,9 +3739,9 @@
                     x-show="_currentQueueLen() > 0"
                     x-text="_currentQueueLen()"></span>
             </button>
-            <button x-show="isTabStreaming(currentId)" @click="stop()"
+            <button x-show="isTabStreaming(currentId) || _hasPendingAdmission(activeSessionPane()) || activeSessionPane()._uncertainSubmission?.kind==='turn'" @click="stop()"
                     class="btn-danger chat-toolbar-send chat-toolbar-stop"
-                    :disabled="workspaceSwitching || !!(tabState[currentId] && tabState[currentId]._stopping)"
+                    :disabled="workspaceSwitching || !!(tabState[currentId] && (tabState[currentId]._stoppingTurnId || tabState[currentId]._cancelBeforeStream))"
                     :aria-label="t('btn.stop')"
                     :title="t('btn.stop') + ' (Esc)'">
               <span class="icon"><svg><use href="#i-square"/></svg></span>
@@ -4297,13 +4275,13 @@
 
   <!-- ============ Settings Modal ============ -->
   <div class="modal-backdrop" x-show="settings.show" @click.self="settings.show=false">
-    <div class="modal settings-modal" tabindex="-1"
+    <div class="modal settings-modal" :class="{'is-memory-center': settings.surface==='memory'}" tabindex="-1"
          @keydown.tab="trapDialogFocus($event, 'settings')"
-         role="dialog" aria-modal="true" :aria-label="t('set.title')">
+         role="dialog" aria-modal="true" :aria-label="settings.surface==='memory' ? (lang==='zh'?'记忆中心':'Memory Center') : t('set.title')">
       <div class="modal-head">
         <span class="modal-title">
           <svg class="modal-title-icon"><use href="#i-settings"/></svg>
-          <span x-text="t('set.title')"></span>
+          <span x-text="settings.surface==='memory' ? (lang==='zh'?'记忆中心':'Memory Center') : t('set.title')"></span>
         </span>
         <button class="modal-close" @click="settings.show=false"
                 :title="lang==='zh' ? '关闭' : 'Close'" aria-label="Close">×</button>
@@ -4316,101 +4294,19 @@
              the screen; tapping a row sets activePage to show only that
              section + a Back button. The `.active` class highlights the
              current tab on desktop. -->
-        <ul class="settings-menu"
-            x-show="isWideScreen || !settings.activePage">
-          <li><button type="button" class="settings-menu-item"
-                      @click="settings.activePage='lang'"
-                      :class="{ active: settings.activePage==='lang' }"
-                      :aria-current="settings.activePage==='lang' ? 'page' : null">
-            <span class="settings-menu-icon"><svg><use href="#i-globe"/></svg></span>
-            <span class="settings-menu-title" x-text="t('set.sec.lang')"></span>
-            <span class="settings-menu-chevron">›</span>
-          </button></li>
-          <li><button type="button" class="settings-menu-item"
-                      @click="settings.activePage='provider'"
-                      :class="{ active: settings.activePage==='provider' }"
-                      :aria-current="settings.activePage==='provider' ? 'page' : null">
-            <span class="settings-menu-icon"><svg><use href="#i-key"/></svg></span>
-            <span class="settings-menu-title" x-text="t('set.sec.provider')"></span>
-            <span class="settings-menu-chevron">›</span>
-          </button></li>
-          <li><button type="button" class="settings-menu-item"
-                      @click="settings.activePage='memory'; loadMemorySettings()"
-                      :class="{ active: settings.activePage==='memory' }"
-                      :aria-current="settings.activePage==='memory' ? 'page' : null">
+        <ul class="settings-menu" x-show="settings.surface!=='memory' && (isWideScreen || !settings.activePage)">
+          <template x-for="entry in settingsNavigation()" :key="entry[0]">
+            <li><button type="button" class="settings-menu-item" @click="selectSettingsPage(entry[0])"
+                        :class="{active: settings.activePage===entry[0]}"
+                        :aria-current="settings.activePage===entry[0] ? 'page' : null">
+              <span class="settings-menu-icon"><svg><use :href="'#i-'+entry[2]"/></svg></span>
+              <span class="settings-menu-title" x-text="entry[1]"></span>
+              <span class="settings-menu-chevron">›</span>
+            </button></li>
+          </template>
+          <li class="settings-menu-extra"><button type="button" class="settings-menu-item" @click="openMemoryCenter()">
             <span class="settings-menu-icon"><svg><use href="#i-brain"/></svg></span>
-            <span class="settings-menu-title"
-                  x-text="lang==='zh' ? '记忆' : 'Memory'"></span>
-            <span class="settings-memory-badge"
-                  x-show="settings.memory.status?.pending_artifacts"
-                  x-text="settings.memory.status?.pending_artifacts || ''"></span>
-            <span class="settings-menu-chevron">›</span>
-          </button></li>
-          <li><button type="button" class="settings-menu-item"
-                      @click="settings.activePage='appearance'"
-                      :class="{ active: settings.activePage==='appearance' }"
-                      :aria-current="settings.activePage==='appearance' ? 'page' : null">
-            <span class="settings-menu-icon"><svg><use href="#i-palette"/></svg></span>
-            <span class="settings-menu-title" x-text="t('set.sec.appearance')"></span>
-            <span class="settings-menu-chevron">›</span>
-          </button></li>
-          <li><button type="button" class="settings-menu-item"
-                      @click="settings.activePage='notification'"
-                      :class="{ active: settings.activePage==='notification' }"
-                      :aria-current="settings.activePage==='notification' ? 'page' : null">
-            <span class="settings-menu-icon"><svg><use href="#i-bell"/></svg></span>
-            <span class="settings-menu-title"
-                  x-text="lang==='zh' ? '通知' : 'Notifications'"></span>
-            <span class="settings-menu-chevron">›</span>
-          </button></li>
-          <li><button type="button" class="settings-menu-item"
-                      @click="settings.activePage='defaults'"
-                      :class="{ active: settings.activePage==='defaults' }"
-                      :aria-current="settings.activePage==='defaults' ? 'page' : null">
-            <span class="settings-menu-icon"><svg><use href="#i-settings"/></svg></span>
-            <span class="settings-menu-title" x-text="t('set.sec.defaults')"></span>
-            <span class="settings-menu-chevron">›</span>
-          </button></li>
-          <li><button type="button" class="settings-menu-item"
-                      @click="settings.activePage='skills'"
-                      :class="{ active: settings.activePage==='skills' }"
-                      :aria-current="settings.activePage==='skills' ? 'page' : null">
-            <span class="settings-menu-icon"><svg><use href="#i-puzzle"/></svg></span>
-            <span class="settings-menu-title" x-text="t('set.sec.skills')"></span>
-            <span class="settings-menu-chevron">›</span>
-          </button></li>
-          <li><button type="button" class="settings-menu-item"
-                      @click="settings.activePage='hooks'; loadHookSettings()"
-                      :class="{ active: settings.activePage==='hooks' }"
-                      :aria-current="settings.activePage==='hooks' ? 'page' : null">
-            <span class="settings-menu-icon"><svg><use href="#i-tool"/></svg></span>
-            <span class="settings-menu-title">Hooks</span>
-            <span class="settings-menu-chevron">›</span>
-          </button></li>
-          <li><button type="button" class="settings-menu-item"
-                      @click="settings.activePage='mcp'"
-                      :class="{ active: settings.activePage==='mcp' }"
-                      :aria-current="settings.activePage==='mcp' ? 'page' : null">
-            <span class="settings-menu-icon"><svg><use href="#i-plug"/></svg></span>
-            <span class="settings-menu-title" x-text="t('set.sec.mcp')"></span>
-            <span class="settings-menu-chevron">›</span>
-          </button></li>
-          <li><button type="button" class="settings-menu-item"
-                      @click="settings.activePage='versions'"
-                      :class="{ active: settings.activePage==='versions' }"
-                      :aria-current="settings.activePage==='versions' ? 'page' : null">
-            <span class="settings-menu-icon"><svg><use href="#i-tool"/></svg></span>
-            <span class="settings-menu-title"
-                  x-text="lang==='zh' ? '版本与升级' : 'Versions & upgrade'"></span>
-            <span class="settings-menu-chevron">›</span>
-          </button></li>
-          <li><button type="button" class="settings-menu-item"
-                      @click="settings.activePage='cost'; loadCostDashboard();"
-                      :class="{ active: settings.activePage==='cost' }"
-                      :aria-current="settings.activePage==='cost' ? 'page' : null">
-            <span class="settings-menu-icon"><svg><use href="#i-dollar"/></svg></span>
-            <span class="settings-menu-title" x-text="t('set.sec.cost')"></span>
-            <span class="settings-menu-chevron">›</span>
+            <span class="settings-menu-title" x-text="lang==='zh'?'打开记忆中心':'Open Memory Center'"></span>
           </button></li>
         </ul>
 
@@ -4418,16 +4314,22 @@
              On desktop this is the right-hand flex column; only the section
              whose data-page === activePage is shown. -->
         <div class="settings-content">
+        <div class="settings-hint settings-loading" role="status" x-show="settings.loading && settings.surface!=='memory'"
+             x-text="lang==='zh'?'正在加载设置…':'Loading settings…'"></div>
+        <div class="settings-inline-error" role="alert" x-show="settings.error && settings.surface!=='memory'">
+          <span x-text="settings.error"></span>
+          <button class="btn-ghost sm" @click="openSettings(settings.activePage)" x-text="lang==='zh'?'重试':'Retry'"></button>
+        </div>
         <!-- Mobile-only back button — shown on detail pages. -->
         <button class="settings-back"
-                x-show="!isWideScreen && settings.activePage"
+                x-show="settings.surface!=='memory' && !isWideScreen && settings.activePage"
                 @click="settings.activePage = null">
           <span>‹</span>
           <span x-text="lang==='zh' ? '返回' : 'Back'"></span>
         </button>
 
         <div class="settings-section" data-page="lang"
-             x-show="settings.activePage === 'lang'">
+             x-show="settingsPageMatches('lang')">
           <div class="settings-section-title">
             <span x-text="t('set.sec.lang')"></span>
             <span class="settings-save-mode live" x-text="t('set.mode.live')"></span>
@@ -4445,8 +4347,8 @@
              This remains inspectable while disabled. No draft Skill is ever
              written into an SDK-discoverable directory from this page unless
              the user explicitly presses Approve. -->
-        <div class="settings-section memory-settings-section" data-page="memory"
-             x-show="settings.activePage === 'memory'">
+        <div class="settings-section memory-settings-section" data-page="memory_engine"
+             x-show="settings.activePage === 'memory_engine'">
           <div class="settings-section-title">
             <span x-text="lang==='zh' ? '长期记忆' : 'Long-term memory'"></span>
             <span class="settings-save-mode live"
@@ -4459,6 +4361,13 @@
                  ? '一个用户级记忆池；业务、项目和主题只是软标签。原始会话是证据，SQLite Registry 是治理真相源，向量库可随时重建。'
                  : 'One user-level memory pool. Domains and projects are soft metadata. Transcripts are evidence, SQLite is the governance source of truth, and vector indexes are rebuildable.'"></div>
 
+
+          <div class="settings-inline-error" role="alert" x-show="settings.memory.configError || settings.memory.statusError">
+            <span x-text="settings.memory.configError || settings.memory.statusError"></span>
+            <button class="btn-ghost sm" @click="loadMemorySettings({includeList:false})" x-text="lang==='zh'?'重试':'Retry'"></button>
+          </div>
+          <div class="settings-hint" x-show="settings.memory.configLoading" x-text="lang==='zh'?'正在加载引擎配置…':'Loading engine configuration…'"></div>
+          <button class="btn-ghost sm" @click="openMemoryCenter()" x-text="lang==='zh'?'浏览记忆':'Browse memories'"></button>
           <div class="memory-status-grid" x-show="settings.memory.status">
             <div><strong x-text="settings.memory.status?.memories || 0"></strong>
               <span x-text="lang==='zh' ? '有效记忆' : 'active memories'"></span></div>
@@ -4582,8 +4491,12 @@
           <div class="memory-actions">
             <button class="btn-ghost sm" @click="probeMemory()" :disabled="settings.memory.probing"
                     x-text="settings.memory.probing ? (lang==='zh' ? '检查中…' : 'Probing…') : (lang==='zh' ? '环境自检' : 'Probe')"></button>
-            <button class="btn-primary sm" @click="saveMemorySettings()" :disabled="settings.memory.saving"
+            <button class="btn-primary sm" @click="saveMemorySettings()" :disabled="settings.memory.saving || settings.memory.configLoading || !settings.memory.configLoaded"
                     x-text="settings.memory.saving ? (lang==='zh' ? '保存中…' : 'Saving…') : (lang==='zh' ? '保存记忆设置' : 'Save memory settings')"></button>
+            </div>
+          <details class="settings-advanced">
+            <summary x-text="lang==='zh'?'维护与迁移':'Maintenance & migration'"></summary>
+            <div class="memory-actions">
             <button class="btn-ghost sm" @click="memoryRunAction('dream')" :disabled="settings.memory.actionRunning || settings.memory.config.mode === 'off' || !settings.memory.config.consolidation.dreamer_enabled"
                     x-text="lang==='zh' ? '立即做梦' : 'Dream now'"></button>
             <button class="btn-ghost sm" @click="memoryRunAction('reindex')" :disabled="settings.memory.actionRunning || settings.memory.config.mode === 'off'"
@@ -4596,26 +4509,39 @@
             <button class="btn-ghost sm" @click="importLegacyMem0()"
                     x-text="lang==='zh' ? '导入旧 Mem0' : 'Import legacy Mem0'"></button>
           </div>
+          </details>
           <div class="memory-probe-result" x-show="settings.memory.probeResult"
                :class="{ ok: settings.memory.probeResult?.ok }"
                x-text="settings.memory.probeResult?.ok
                  ? JSON.stringify(settings.memory.probeResult)
                  : settings.memory.probeResult?.error"></div>
 
+          </div>
+        <div class="settings-section memory-center-section" data-page="memory" x-show="settings.activePage==='memory'">
           <div class="memory-center-head">
             <div class="memory-subtitle" x-text="lang==='zh' ? '记忆中心' : 'Memory Center'"></div>
-            <button class="btn-ghost xs" @click="refreshMemoryCenter()">↻</button>
+
+            <div class="memory-actions">
+              <button class="btn-ghost sm" @click="openSettings('memory_engine')" x-text="lang==='zh'?'引擎设置':'Engine settings'"></button>
+              <button class="btn-ghost sm" @click="refreshMemoryCenter({keepPage:true})" :disabled="settings.memory.listLoading"
+                      x-text="lang==='zh'?'刷新':'Refresh'"></button>
+            </div>
+          </div>
+          <div class="memory-center-toolbar">
+            <label class="chk"><input type="checkbox" x-model="settings.memory.advanced" />
+              <span x-text="lang==='zh'?'显示高级记录':'Show advanced records'"></span>
+            </label>
           </div>
           <div class="memory-tabs">
             <template x-for="tab in [
               ['items', lang==='zh'?'记忆':'Memories'],
-              ['episodes','Episodes'], ['reflections',lang==='zh'?'反思':'Dreams'],
-              ['skills','Skills'], ['jobs',lang==='zh'?'任务':'Jobs'],
+              ['episodes',lang==='zh'?'会话片段':'Episodes'], ['reflections',lang==='zh'?'反思':'Dreams'],
+              ['skills',lang==='zh'?'技能候选':'Skills'], ['jobs',lang==='zh'?'任务':'Jobs'],
               ['recalls',lang==='zh'?'召回':'Recalls'],
               ['backups',lang==='zh'?'备份':'Backups'],
               ['audit',lang==='zh'?'审计':'Audit']
             ]" :key="tab[0]">
-              <button :class="{ active: settings.memory.tab === tab[0] }"
+              <button :class="{ active: settings.memory.tab === tab[0] }" x-show="tab[0]==='items' || settings.memory.advanced || settings.memory.tab===tab[0]"
                       @click="settings.memory.tab=tab[0]; refreshMemoryCenter()"
                       x-text="tab[1]"></button>
             </template>
@@ -4627,14 +4553,35 @@
             <select class="settings-input" x-model="settings.memory.itemStatus"
                     @change="refreshMemoryCenter()">
               <option value="" x-text="lang==='zh' ? '全部状态' : 'All states'"></option>
-              <option value="active">active</option><option value="pending_review">pending_review</option>
-              <option value="quarantined">quarantined</option><option value="superseded">superseded</option>
-              <option value="deleted">deleted</option>
+              <option value="active" x-text="lang==='zh'?'有效':'Active'"></option><option value="pending_review" x-text="lang==='zh'?'待确认':'Pending review'"></option>
+              <option value="quarantined" x-text="lang==='zh'?'待核实':'Quarantined'"></option><option value="superseded" x-text="lang==='zh'?'已更正':'Superseded'"></option>
+              <option value="deleted" x-text="lang==='zh'?'已遗忘':'Forgotten'"></option>
+            </select>
+
+            <select class="settings-input" x-model="settings.memory.sort" @change="refreshMemoryCenter()"
+                    :aria-label="lang==='zh'?'排序依据':'Sort memories'">
+              <option value="auto" x-text="lang==='zh'?'默认／搜索相关性':'Default / relevance'"></option>
+              <option value="updated_at" x-text="lang==='zh'?'最近更新':'Last updated'"></option>
+              <option value="recall_count" x-text="lang==='zh'?'召回次数':'Recall count'"></option>
+              <option value="last_recalled_at" x-text="lang==='zh'?'最近召回':'Last recalled'"></option>
+              <option value="helpful_count" x-text="lang==='zh'?'有用反馈':'Helpful feedback'"></option>
+              <option value="unhelpful_count" x-text="lang==='zh'?'无用反馈':'Unhelpful feedback'"></option>
+            </select>
+            <select class="settings-input" x-model="settings.memory.direction" @change="refreshMemoryCenter()"
+                    :aria-label="lang==='zh'?'排序方向':'Sort direction'">
+              <option value="desc" x-text="lang==='zh'?'降序':'Descending'"></option>
+              <option value="asc" x-text="lang==='zh'?'升序':'Ascending'"></option>
             </select>
             <button class="btn-primary sm" @click="memoryAdd()"
                     x-text="lang==='zh' ? '＋确认记忆' : '+ Confirmed memory'"></button>
           </div>
-          <div class="memory-list">
+          <div class="settings-hint" role="status" x-show="settings.memory.listLoading"
+               x-text="lang==='zh'?'正在加载记忆…':'Loading memory…'"></div>
+          <div class="settings-inline-error" role="alert" x-show="settings.memory.listError">
+            <span x-text="settings.memory.listError"></span>
+            <button class="btn-ghost sm" @click="refreshMemoryCenter({keepPage:true})" x-text="lang==='zh'?'重试':'Retry'"></button>
+          </div>
+          <div class="memory-list" :aria-busy="settings.memory.listLoading">
             <template x-for="item in settings.memory.items" :key="item.id">
               <article class="memory-card">
                 <div class="memory-card-head">
@@ -4664,7 +4611,7 @@
                      x-show="settings.memory.tab !== 'recalls' && settings.memory.tab !== 'backups'"
                      x-text="item.content || item.summary || item.title
                        || item.last_error || item.action || JSON.stringify(item.payload || item.results || {})"></div>
-                <div class="memory-stats" x-show="settings.memory.tab === 'items' && item.recall_stats"
+                <div class="memory-stats" :title="lang==='zh'?'召回结果记录次数，不代表模型实际采用次数':'Recorded retrievals, not confirmed model usage'" x-show="settings.memory.tab === 'items' && item.recall_stats"
                      x-text="memoryRecallStatsText(item)"></div>
                 <div class="memory-source" x-show="item.sources?.length"
                      x-text="(lang==='zh' ? '来源：' : 'Sources: ') + (item.sources || []).map(s => s.source_type + ':' + s.source_id).join(' · ')"></div>
@@ -4697,7 +4644,7 @@
                 </div>
                 <details x-show="settings.memory.tab !== 'items'"
                          @toggle="if ($event.target.open) loadMemoryDetail(item)">
-                  <summary x-text="lang==='zh' ? '查看完整白盒数据' : 'View full white-box data'"></summary>
+                  <summary x-text="lang==='zh' ? '查看诊断详情' : 'View diagnostic details'"></summary>
                   <pre x-text="JSON.stringify(item._details || item.payload || item, null, 2)"></pre>
                   <textarea x-show="settings.memory.tab === 'skills' && item.status === 'pending_review'"
                             class="settings-input memory-skill-editor" rows="14"
@@ -4707,8 +4654,16 @@
                 </details>
               </article>
             </template>
-            <div class="settings-hint" x-show="!settings.memory.items.length"
+            <div class="settings-hint" x-show="settings.memory.listLoaded && !settings.memory.listLoading && !settings.memory.listError && !settings.memory.items.length"
                  x-text="lang==='zh' ? '暂无数据' : 'No data yet'"></div>
+            <div class="memory-pagination" x-show="settings.memory.tab==='items' && settings.memory.listLoaded">
+              <span x-text="lang==='zh' ? ('共 '+settings.memory.total+' 条') : (settings.memory.total+' memories')"></span>
+              <button class="btn-ghost sm" @click="memoryPage(-1)" :disabled="settings.memory.listLoading || settings.memory.offset===0"
+                      x-text="lang==='zh'?'上一页':'Previous'"></button>
+              <span x-text="(Math.floor(settings.memory.offset/settings.memory.pageSize)+1)+' / '+Math.max(1, Math.ceil(settings.memory.total/settings.memory.pageSize))"></span>
+              <button class="btn-ghost sm" @click="memoryPage(1)" :disabled="settings.memory.listLoading || settings.memory.offset+settings.memory.pageSize>=settings.memory.total"
+                      x-text="lang==='zh'?'下一页':'Next'"></button>
+            </div>
           </div>
         </div>
 
@@ -4983,7 +4938,7 @@
         </div>
 
         <div class="settings-section" data-page="appearance"
-             x-show="settings.activePage === 'appearance'">
+             x-show="settingsPageMatches('appearance')">
           <div class="settings-section-title">
             <span x-text="t('set.sec.appearance')"></span>
             <span class="settings-save-mode live" x-text="t('set.mode.live')"></span>
@@ -5139,7 +5094,7 @@
                     <div class="restart-actions">
                       <button class="btn-ghost sm"
                               :disabled="settings.restarting"
-                              @click="restartService()"
+                              @click="selectSettingsPage('service')"
                               x-text="settings.restarting ? (lang==='zh' ? '重启中…' : 'Restarting…') : (lang==='zh' ? '一键重启' : 'Restart now')">
                       </button>
                       <span class="settings-hint" style="margin-left:8px"
@@ -5160,30 +5115,39 @@
               </template>
             </div>
           </template>
-          <!-- Standalone restart button — useful any time, not just after upgrade.
-               Button + hint wrapped in a single .settings-row-col div so the
-               .settings-row grid (220px label + 1fr content) treats them as
-               ONE cell. Without the wrapper the button was a direct grid
-               item and `justify-self: stretch` (default) blew it up to the
-               full 1fr width = ~700px-wide grey block (2026-05-28 screenshot).
-               The hint was a 3rd grid child that wrapped to (row 2, col 1)
-               and got crushed into the 220px label column. -->
-          <div class="settings-row" style="margin-top:12px; padding-top:12px; border-top:1px solid var(--c-border)">
-            <label x-text="lang==='zh' ? '重启服务' : 'Restart service'"></label>
-            <div class="settings-row-col">
-              <button class="btn-ghost sm"
-                      :disabled="settings.restarting"
-                      @click="restartService()"
-                      x-text="settings.restarting ? (lang==='zh' ? '重启中…' : 'Restarting…') : (lang==='zh' ? '重启' : 'Restart')">
-              </button>
-              <div class="settings-hint"
-                   x-text="lang==='zh' ? '升级 SDK / 修改 .env 后，重启让新配置生效。' : 'Use after upgrading the SDK or editing .env.'"></div>
-            </div>
+          <div class="settings-hint">
+            <button class="btn-ghost sm" @click="selectSettingsPage('service')"
+                    x-text="lang==='zh'?'前往服务与诊断':'Open service & diagnostics'"></button>
           </div>
           <template x-if="!settings.versions && !settings.versionsLoading">
             <div class="settings-hint"
                  x-text="lang==='zh' ? '点击「检查更新」查询 PyPI + npm 上的最新版本。' : 'Click Check to query PyPI + npm for the latest versions.'"></div>
           </template>
+        </div>
+
+
+        <div class="settings-section" data-page="service" x-show="settings.activePage==='service'">
+          <div class="settings-section-title" x-text="lang==='zh'?'服务与诊断':'Service & diagnostics'"></div>
+          <p class="settings-hint" x-text="lang==='zh'?'查看当前实例状态。重启会中断该实例中的运行任务，不影响其他独立实例。':'Inspect this instance. Restart interrupts its running tasks, not separate instances.'"></p>
+          <div class="settings-inline-error" x-show="settings.serviceError" role="alert"><span x-text="settings.serviceError"></span></div>
+          <div class="service-status-grid" x-show="settings.service">
+            <div><span x-text="lang==='zh'?'状态':'Status'"></span><strong x-text="lang==='zh'?'在线':'Online'"></strong></div>
+            <div><span x-text="lang==='zh'?'运行时长':'Uptime'"></span><strong x-text="Math.floor((settings.service?.uptime_seconds || 0)/60)+' min'"></strong></div>
+            <div><span x-text="lang==='zh'?'进行中轮次':'Active turns'"></span><strong x-text="settings.service?.active_turns || 0"></strong></div>
+            <div><span x-text="lang==='zh'?'后台任务':'Background tasks'"></span><strong x-text="settings.service?.background_tasks || 0"></strong></div>
+          </div>
+          <div class="settings-row">
+            <label x-text="lang==='zh'?'服务操作':'Service actions'"></label>
+            <div class="settings-row-col">
+              <div class="memory-actions">
+                <button class="btn-ghost sm" @click="loadServiceStatus()" :disabled="settings.serviceLoading"
+                        x-text="settings.serviceLoading ? (lang==='zh'?'检查中…':'Checking…') : (lang==='zh'?'检查连接':'Check connection')"></button>
+                <button class="btn-ghost sm danger" @click="restartService()" :disabled="settings.restarting"
+                        x-text="settings.restarting ? (lang==='zh'?'重启中…':'Restarting…') : (lang==='zh'?'重启服务':'Restart service')"></button>
+              </div>
+              <p class="settings-hint" role="status" x-show="settings.restartStatus" x-text="settings.restartStatus"></p>
+            </div>
+          </div>
         </div>
 
         <!-- Cost dashboard — aggregated per-turn usage across all sessions.
@@ -5428,7 +5392,7 @@
              notified while actively at a device — no per-class server-
              side mute needed. -->
         <div class="settings-section" data-page="notification"
-             x-show="settings.activePage === 'notification'">
+             x-show="settingsPageMatches('notification')">
           <div class="settings-section-title">
             <span x-text="lang==='zh' ? '通知' : 'Notifications'"></span>
             <span class="settings-save-mode live" x-text="t('set.mode.live')"></span>
@@ -5457,7 +5421,7 @@
         </div>
 
         <div class="settings-section" data-page="skills"
-             x-show="settings.activePage === 'skills'">
+             x-show="settingsPageMatches('skills')">
           <div class="settings-section-title">
             <span x-text="t('set.sec.skills')"></span>
             <span class="settings-save-mode live" x-text="t('set.mode.live')"></span>
@@ -5498,7 +5462,7 @@
         </div>
 
         <div class="settings-section hook-settings-section" data-page="hooks"
-             x-show="settings.activePage === 'hooks'">
+             x-show="settingsPageMatches('hooks')">
           <div class="settings-section-title">
             <span>Hooks</span>
             <span class="settings-save-mode live"
@@ -5701,7 +5665,7 @@
         </div>
 
         <div class="settings-section" data-page="mcp"
-             x-show="settings.activePage === 'mcp'">
+             x-show="settingsPageMatches('mcp')">
           <div class="settings-section-title">
             <span x-text="t('set.sec.mcp')"></span>
             <span class="settings-save-mode live" x-text="t('set.mode.live')"></span>
@@ -5812,13 +5776,14 @@
 
       </div>
       <div class="modal-foot">
-        <button @click="logout()" class="btn-ghost" style="margin-right:auto;color:var(--c-danger)" x-text="t('btn.logout')"></button>
-        <button @click="settings.show=false" class="btn-ghost" x-text="t('btn.cancel')"></button>
-        <button x-show="settings.activePage !== 'memory'"
+        <button x-show="settings.surface!=='memory'" @click="logout()" class="btn-ghost" style="margin-right:auto;color:var(--c-danger)" x-text="t('btn.logout')"></button>
+        <button @click="settings.show=false" class="btn-ghost" x-text="lang==='zh'?'关闭':'Close'"></button>
+        <button x-show="settings.activePage === 'provider' || settings.activePage === 'defaults'"
+                :disabled="settings.loading || !!settings.error"
                 @click="saveSettings()" class="btn-primary" x-text="t('btn.save')"></button>
-        <button x-show="settings.activePage === 'memory'"
+        <button x-show="settings.activePage === 'memory_engine'"
                 @click="saveMemorySettings()" class="btn-primary"
-                :disabled="settings.memory.saving"
+                :disabled="settings.memory.saving || settings.memory.configLoading || !settings.memory.configLoaded"
                 x-text="settings.memory.saving
                   ? (lang==='zh' ? '保存中…' : 'Saving…')
                   : (lang==='zh' ? '保存记忆设置' : 'Save memory settings')"></button>

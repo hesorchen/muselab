@@ -446,7 +446,8 @@ def test_mux_routes_two_sessions_reconnects_with_checkpoints_and_defers_watcher_
         "nativeStreamCount": 2,
     }
     assert len(turn_starts) == 1
-    assert turn_starts[0] == {
+    assert re.fullmatch(r"[0-9a-f-]{36}", turn_starts[0]["client_message_id"])
+    assert {k:v for k,v in turn_starts[0].items() if k != "client_message_id"} == {
         "prompt": "MUX_LOCAL_PROMPT",
         "session_id": initial["localSid"],
         "model": "mux-e2e-model",
@@ -5434,7 +5435,7 @@ def test_existing_fifo_queue_renders_pending_send_as_disabled_tail_card(
         "FIRST_QUEUE_ITEM", "SECOND_QUEUE_ITEM", prompt,
     ]
     assert queued.locator(".queued-label").all_text_contents() == [
-        "排队中 1 / 3", "排队中 2 / 3", "排队中 3 / 3",
+        "排队中 1 / 3", "排队中 2 / 3", "正在提交 3 / 3",
     ]
     expect(
         page.locator(f'.msg-pane[data-tid="{sid}"] .msg.user').filter(
@@ -5823,7 +5824,7 @@ def test_mux_pending_turn_busy_keeps_queue_admission_until_post_ack(
     queued = page.locator(".msg.user.queued")
     expect(queued).to_have_count(1)
     expect(queued.locator(".queued-text")).to_have_text(prompt)
-    expect(queued.locator(".queued-label")).to_have_text("排队中 1 / 1")
+    expect(queued.locator(".queued-label")).to_have_text("正在提交 1 / 1")
     expect(queued.locator("button.queued-act").nth(0)).to_be_disabled()
     expect(queued.locator("button.queued-act").nth(1)).to_be_disabled()
     expect(
@@ -7102,7 +7103,8 @@ def test_desktop_cancelled_snapshot_reconcile_never_blanks_or_replaces_live_node
         }"""
     )
     assert before["count"] == 6
-    assert all(":live:" in key for key in before["keys"])
+    assert ":submission:" in before["keys"][0]
+    assert all(":live:" in key for key in before["keys"][1:])
 
     snapshot_messages.extend([
         {
@@ -9065,8 +9067,10 @@ def test_send_from_older_window_returns_to_latest_with_composer_claim(
           hasLater: app.hasLaterMessages(arg.sid),
           latestPresent: st.messages.some(m => m.uuid === "latest-reply"),
           promptCount: st.messages.filter(m => m.role === "user"
-            && m.text === arg.prompt).length,
-          promptVisible: !!document.querySelector(
+            && m.text === arg.prompt).length
+            + app.queueDisplayItems(st).filter(q=>q.displayText===arg.prompt).length,
+          promptVisible: !!Array.from(document.querySelectorAll(".queue-outbox .queued-text"))
+            .find(node=>node.textContent===arg.prompt) || !!document.querySelector(
             `.msg-pane[data-tid="${CSS.escape(arg.sid)}"] .msg.user`
           ) && document.querySelector(
             `.msg-pane[data-tid="${CSS.escape(arg.sid)}"]`

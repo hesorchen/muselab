@@ -37,6 +37,8 @@ from .observability import (
     monotonic as _perf_monotonic,
     perf_enabled as _perf_enabled,
     perf_event,
+    start_diagnostics,
+    stop_diagnostics,
 )
 
 
@@ -365,7 +367,7 @@ async def _monitor_event_loop_lag() -> None:
 
 
 async def _recover_message_queues_at_startup(session_store) -> int:
-    """Restore durable claims and leave every surviving queue paused.
+    """Restore claims, isolating ambiguous input from unstarted FIFO work.
 
     Kept as a small helper so the startup safety boundary is regression-testable
     without booting schedulers, terminals, or file watchers.
@@ -379,10 +381,8 @@ async def _recover_message_queues_at_startup(session_store) -> int:
             queue = await asyncio.to_thread(
                 session_store.recover_queue_inflight, sid)
         except Exception as exc:
-            # Continue the sweep so one unwritable/corrupt sidecar cannot
-            # leave every later queue live.  We still fail startup after the
-            # sweep: serving requests with even one queue whose pause was not
-            # durably committed would re-open automatic draining.
+            # Finish the sweep, then fail closed: an ambiguous claim must be
+            # durably isolated before any scheduler can resume pending work.
             failures += 1
             sys.stderr.write(
                 f"[muselab] queue recovery failed sid={sid[:8]} "
@@ -479,14 +479,14 @@ async def _lifespan(app: FastAPI):
         ) from None
     if recovered:
         sys.stderr.write(
-            f"[muselab] recovered {recovered} paused message queue(s) "
+            f"[muselab] recovered {recovered} message queue(s) "
             "on startup\n")
         sys.stderr.flush()
     # A hidden background-task owner can finish its Agent continuation just
     # before the process exits.  The private READY outbox survives that crash;
     # resume its presentation-only delivery to the latest visible successor.
-    # Scheduling is non-blocking, and queue recovery above has already paused
-    # every stale claim so no restarted turn can race ahead of the projection.
+    # Scheduling is non-blocking. Queue recovery has isolated stale claims;
+    # the drain flushes READY projections before it starts another turn.
     from . import chat as _chat
     recovered_continuations = await (
         _chat.recover_runtime_continuation_outboxes_at_startup()
@@ -574,7 +574,16 @@ async def _lifespan(app: FastAPI):
     from .file_events import manager as _file_watch_manager
     await _start_workspace_index(_file_watch_manager)
     await _terminal_manager.start()
+    start_diagnostics()
     try:
+        # All queue/attachment recovery and runtime projections are committed.
+        # Resume only unstarted items; review-only records cannot be claimed.
+        _chat._queue_runtime_closing = False
+        queue_sids = await _asyncio.to_thread(_sess.list_queue_session_ids)
+        for sid in queue_sids:
+            queue = await _asyncio.to_thread(_sess.get_queue, sid)
+            if _sess.queue_pending_items(queue):
+                _chat._schedule_queue_drain(sid)
         yield
     finally:
         from .runtime_lifecycle import shutdown_runtime
@@ -585,6 +594,7 @@ async def _lifespan(app: FastAPI):
             terminal=_terminal_manager,
             file_watcher=_file_watch_manager,
         )
+        await asyncio.to_thread(stop_diagnostics)
 
 
 async def _backfill_turn_counts() -> None:
