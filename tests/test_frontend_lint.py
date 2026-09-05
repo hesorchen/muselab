@@ -6280,7 +6280,9 @@ def test_hook_settings_gui_edits_standard_scopes_and_keeps_builtins_read_only():
     html = (FRONTEND / "index.html").read_text(encoding="utf-8")
     backend = (BACKEND / "hook_settings.py").read_text(encoding="utf-8")
 
-    assert 'settings.activePage=\'hooks\'; loadHookSettings()' in html
+    assert 'selectSettingsPage(entry[0])' in html
+    assert 'if (page === "extensions")' in app
+    assert 'this.loadHookSettings()' in app
     assert "Claude 标准配置" in html
     assert "MuseLab 内置 Hook（只读）" in html
     assert 'class="switch sm"' in html

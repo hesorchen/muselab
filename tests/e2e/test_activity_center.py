@@ -369,7 +369,10 @@ def test_memory_shortcut_opens_memory_settings_page(
           return app.settings.show && app.settings.activePage === 'memory';
         }"""
     )
-    expect(page.locator(".memory-settings-section")).to_be_visible()
+    # The shortcut opens the browser surface, not engine configuration.
+    expect(page.locator(".memory-center-section")).to_be_visible()
+    expect(page.locator(".memory-settings-section")).not_to_be_visible()
+    expect(page.locator(".settings-menu")).not_to_be_visible()
 
 
 def test_auto_ack_accepts_any_result_rendered_in_current_visible_turn(

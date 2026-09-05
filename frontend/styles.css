@@ -12461,3 +12461,35 @@ html[data-theme="eyecare"] .tool-error-hint {
   .memory-filters select { width: 100%; }
   .memory-recall-global { border-radius:var(--r-sm); }
 }
+
+/* Shared settings and memory surfaces: one spacing/type/status vocabulary. */
+.settings-modal .settings-content { min-width: 0; }
+/* Status rows start at the scroll origin, not a paragraph's negative margin. */
+.settings-content > .settings-loading,
+.settings-content .settings-hint[role="status"] { margin: 0 0 var(--sp-3); }
+.settings-modal.is-memory-center .settings-content { width: 100%; }
+.settings-modal .settings-menu-extra { border-top: 1px solid var(--c-border); margin-top: 12px; padding-top: 8px; }
+.settings-inline-error { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding: 12px; margin: 12px 0; border: 1px solid var(--c-danger); border-radius: var(--r-md); color: var(--c-danger); overflow-wrap: anywhere; }
+.settings-advanced { border: 1px solid var(--c-border); border-radius: var(--r-md); padding: 12px; margin: 16px 0; }
+.settings-advanced > summary { cursor: pointer; font-size: var(--fs-sm); color: var(--c-fg-2); }
+.settings-modal .memory-actions { margin: 8px 0; }
+.settings-modal .memory-filters { flex-wrap: wrap; align-items: center; }
+.settings-modal .memory-filters .settings-input { min-width: 130px; flex: 1 1 140px; width: auto; }
+.memory-pagination { display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 10px; padding: 14px 0; color: var(--c-fg-2); font-size: var(--fs-sm); }
+.memory-pagination > span:first-child { margin-right: auto; }
+.memory-center-toolbar { margin: 8px 0; font-size: var(--fs-sm); color: var(--c-fg-2); }
+.memory-center-section .memory-subtitle { margin: 0; font-size: var(--fs-base); }
+.memory-center-section .memory-card { border-radius: var(--r-md); }
+.memory-center-section .memory-card-content { font-size: var(--fs-sm); line-height: 1.65; }
+.service-status-grid { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 12px; margin: 18px 0; }
+.service-status-grid > div { display: flex; flex-direction: column; gap: 6px; background: var(--c-bg-2); padding: 14px; border: 1px solid var(--c-border); border-radius: var(--r-md); }
+.service-status-grid span { color: var(--c-fg-2); font-size: var(--fs-sm); }
+.service-status-grid strong { color: var(--c-fg-0); font-size: var(--fs-base); }
+@media (max-width: 768px) {
+  .settings-modal .memory-filters .settings-input { flex-basis: auto; width: 100%; min-width: 0; }
+  .settings-modal .memory-actions { flex-wrap: wrap; }
+  .settings-modal .btn-ghost.sm, .settings-modal .btn-primary.sm, .settings-modal .memory-tabs button { min-height: 40px; }
+  .memory-center-head { align-items: flex-start; flex-wrap: wrap; }
+}
+.memory-center-toolbar { display: flex; align-items: center; gap: 8px; }
+.settings-modal .memory-center-toolbar input[type="checkbox"] { width: 16px; height: 16px; min-height: 0; margin: 0; padding: 0; accent-color: var(--c-accent); }

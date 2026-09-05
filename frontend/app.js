@@ -1292,6 +1292,11 @@ function portal() {
         },
         status: null, probeResult: null, tab: "items", items: [],
         selected: null, query: "", kind: "", itemStatus: "",
+        listLoading: false, listLoaded: false, listError: "",
+        configError: "", statusError: "", configLoaded: false,
+        configLoading: false, statusLoading: false,
+        sort: "auto", direction: "desc", offset: 0, pageSize: 50, total: 0,
+        listGeneration: 0, listCache: {}, advanced: false,
       },
       // Versions + upgrade — populated by loadVersions(), set by runUpgrade()
       versions: null,
@@ -1299,6 +1304,8 @@ function portal() {
       upgradeRunning: false,
       upgradeResult: null,
       restarting: false,    // true while restart is in progress
+      loading: false, error: "", surface: "settings",
+      service: null, serviceLoading: false, serviceError: "", restartStatus: "",
       // Mobile-only: iOS-style 2-level menu state. null = top-level
       // menu list shown; "lang" / "provider" / ... = that section's
       // detail page shown. Desktop ignores this entirely (every
@@ -19776,13 +19783,63 @@ function portal() {
     },
 
     // ===== settings modal =====
-    async openSettings(activePage = "") {
-      const r = await fetch("/api/settings", { headers: this.hdr() });
-      if (!r.ok) {
-        this.toast(this.lang === "zh" ? "无法加载设置" : "Failed to load settings", "error");
-        return;
+    settingsNavigation() {
+      const zh = this.lang === "zh";
+      return [
+        ["general", zh ? "通用" : "General", "settings"],
+        ["provider", zh ? "模型与连接" : "Models & connections", "key"],
+        ["defaults", zh ? "会话" : "Conversations", "msg"],
+        ["extensions", zh ? "扩展" : "Extensions", "puzzle"],
+        ["memory_engine", zh ? "记忆引擎" : "Memory engine", "brain"],
+        ["service", zh ? "服务与诊断" : "Service & diagnostics", "refresh"],
+        ["versions", zh ? "关于与更新" : "About & updates", "info"],
+        ["cost", zh ? "用量看板" : "Usage", "dollar"],
+      ];
+    },
+    settingsPageMatches(page) {
+      const selected = this.settings.activePage;
+      return selected === page
+        || (selected === "general" && ["lang", "appearance", "notification"].includes(page))
+        || (selected === "extensions" && ["skills", "hooks", "mcp"].includes(page));
+    },
+    selectSettingsPage(page) {
+      this.settings.activePage = page;
+      if (page === "memory_engine") this.loadMemorySettings({ includeList: false });
+      if (page === "memory") this.loadMemorySettings();
+      if (page === "provider") this.loadClaudeAuthStatus();
+      if (page === "cost") this.loadCostDashboard();
+      if (page === "service") this.loadServiceStatus();
+      if (page === "extensions") {
+        this.refreshMcpList();
+        this.refreshSkillList();
+        this.loadHookSettings();
       }
-      const d = await r.json();
+      if (page === "hooks") this.loadHookSettings();
+      if (page === "skills") this.refreshSkillList();
+      if (page === "mcp") this.refreshMcpList();
+    },
+    async loadServiceStatus() {
+      this.settings.serviceLoading = true;
+      this.settings.serviceError = "";
+      try { this.settings.service = await this._settingsRead("/api/settings/service"); }
+      catch (e) { this.settings.serviceError = this._settingsReadError(e); }
+      finally { this.settings.serviceLoading = false; }
+    },
+    async openSettings(activePage = "") {
+      const generation = (this._settingsOpenGeneration || 0) + 1;
+      this._settingsOpenGeneration = generation;
+      if (this._settingsOpenController) this._settingsOpenController.abort();
+      const controller = new AbortController();
+      this._settingsOpenController = controller;
+      this.settings.surface = activePage === "memory" ? "memory" : "settings";
+      this.settings.show = true;
+      this.settings.error = "";
+      this.settings.loading = true;
+      this.selectSettingsPage(activePage || (this.isWideScreen ? "provider" : null));
+      // Render the shell immediately; optional panels have independent reads.
+      try {
+      const d = await this._settingsRead("/api/settings", controller);
+      if (generation !== this._settingsOpenGeneration) return;
       this.settings.providers = d.providers;
       this.settings.draftKeys = Object.fromEntries(d.providers.map(p => [p.env_key, ""]));
       // Reset provider-editor drafts each open so a stale half-edit from a
@@ -19815,19 +19872,16 @@ function portal() {
       // (provider — the most-used section) and render only that pane.
       // Mobile: stay at the top-level menu (activePage=null) and let the
       // user drill in; selecting a row shows that section + a Back button.
-      this.settings.activePage = activePage === "memory"
-        ? "memory"
-        : activePage === "hooks"
-          ? "hooks"
-          : (this.isWideScreen ? "provider" : null);
-      this.settings.show = true;
-      // Load MCP + Skill in parallel — non-fatal if any fails. Cost dashboard
-      // stays lazy because Codex quota refresh intentionally runs a CLI probe.
-      this.refreshMcpList();
-      this.refreshSkillList();
-      if (activePage === "hooks") this.loadHookSettings();
-      this.loadClaudeAuthStatus();
-      this.loadMemorySettings();
+      } catch (e) {
+        if (generation === this._settingsOpenGeneration) {
+          this.settings.error = this._settingsReadError(e);
+        }
+      } finally {
+        if (generation === this._settingsOpenGeneration) {
+          this.settings.loading = false;
+          this._settingsOpenController = null;
+        }
+      }
     },
 
     async openMemoryCenter(tab = "") {
@@ -19858,14 +19912,19 @@ function portal() {
         );
         if (!response.ok) throw new Error(await response.text());
         item._traceback = (await response.json()).sites || [];
+        item._tracebackError = false;
       } catch (_) {
-        item._traceback = [];
+        // A failed request is not evidence that the memory has no source.
+        item._tracebackError = true;
+        this.toast(this.lang === "zh" ? "来源加载失败，请重试" : "Source unavailable; retry", "error");
+        return [];
       }
       return item._traceback;
     },
 
     async openMemorySource(item) {
       const site = (await this.loadMemoryTraceback(item))[0];
+      if (item._tracebackError) return;
       if (!site?.session_id) {
         this.toast(this.lang === "zh" ? "没有可打开的来源会话" : "No source session available", "warn");
         return;
@@ -19952,24 +20011,69 @@ function portal() {
       } catch (_) { /* optional and fail-soft */ }
     },
 
-    async loadMemorySettings() {
-      const mem = this.settings.memory;
-      mem.loading = true;
-      try {
-        const [cfgR, statusR] = await Promise.all([
-          fetch("/api/memory/config", { headers: this.hdr(), cache: "no-store" }),
-          fetch("/api/memory/status", { headers: this.hdr(), cache: "no-store" }),
-        ]);
-        if (!cfgR.ok || !statusR.ok) throw new Error(`HTTP ${cfgR.status}/${statusR.status}`);
-        mem.config = await cfgR.json();
-        mem.status = await statusR.json();
-        await this.refreshMemoryCenter();
-      } catch (e) {
-        this.toast((this.lang === "zh" ? "记忆设置加载失败：" : "Memory settings failed: ")
-          + (e.message || e), "error");
-      } finally {
-        mem.loading = false;
+    SETTINGS_READ_TIMEOUT_MS: 8000,
+    _settingsReadError(error) {
+      if (error?.name === "TimeoutError" || error?.name === "AbortError") {
+        return this.lang === "zh"
+          ? "加载超时，请检查连接后重试"
+          : "Loading timed out. Check your connection and retry.";
       }
+      if (error?.name === "TypeError") {
+        return this.lang === "zh"
+          ? "连接中断，请重试"
+          : "Connection interrupted. Please retry.";
+      }
+      return String(error?.message || error);
+    },
+    async _settingsRead(url, controller = new AbortController()) {
+      if (controller.signal.aborted) throw this._abortError();
+      let timedOut = false;
+      const timer = setTimeout(() => {
+        timedOut = true;
+        controller.abort();
+      }, this.SETTINGS_READ_TIMEOUT_MS);
+      try {
+        const response = await fetch(url, {
+          headers: this.hdr(), cache: "no-store", signal: controller.signal,
+        });
+        if (!response.ok) throw new Error("HTTP " + response.status);
+        return await response.json();
+      } catch (error) {
+        if (timedOut) {
+          const timeout = new Error("settings request timed out");
+          timeout.name = "TimeoutError";
+          throw timeout;
+        }
+        throw error;
+      } finally { clearTimeout(timer); }
+    },
+
+    async loadMemorySettings({ includeList = true } = {}) {
+      const mem = this.settings.memory;
+      const generation = (this._memorySettingsGeneration || 0) + 1;
+      this._memorySettingsGeneration = generation;
+      mem.loading = true;
+      const load = async (key) => {
+        mem[`${key}Loading`] = true;
+        mem[`${key}Error`] = "";
+        try {
+          const data = await this._settingsRead(`/api/memory/${key}`);
+          if (generation !== this._memorySettingsGeneration) return;
+          mem[key] = data;
+          if (key === "config") mem.configLoaded = true;
+        } catch (e) {
+          if (generation === this._memorySettingsGeneration) {
+            mem[`${key}Error`] = this._settingsReadError(e);
+          }
+        } finally {
+          if (generation === this._memorySettingsGeneration) mem[`${key}Loading`] = false;
+        }
+      };
+      await Promise.allSettled([
+        load("config"), load("status"),
+        ...(includeList ? [this.refreshMemoryCenter()] : []),
+      ]);
+      if (generation === this._memorySettingsGeneration) mem.loading = false;
     },
 
     _memoryErrorDetail(d, status) {
@@ -20026,8 +20130,17 @@ function portal() {
       }
     },
 
-    async refreshMemoryCenter() {
+    async refreshMemoryCenter({ keepPage = false } = {}) {
       const mem = this.settings.memory;
+      if (!this._memoryPrefsLoaded) {
+        this._memoryPrefsLoaded = true;
+        try {
+          const prefs = JSON.parse(localStorage.getItem("muselab_memory_browser") || "{}");
+          if (["auto", "updated_at", "recall_count", "last_recalled_at", "helpful_count", "unhelpful_count"].includes(prefs.sort)) mem.sort = prefs.sort;
+          if (["asc", "desc"].includes(prefs.direction)) mem.direction = prefs.direction;
+        } catch (_) {}
+      }
+      if (!keepPage) mem.offset = 0;
       let url = "/api/memory/items?limit=200";
       if (mem.tab === "episodes") url = "/api/memory/episodes?limit=200";
       else if (mem.tab === "reflections") url = "/api/memory/artifacts?kind=reflection_run&limit=200";
@@ -20037,20 +20150,58 @@ function portal() {
       else if (mem.tab === "backups") url = "/api/memory/backups?limit=200";
       else if (mem.tab === "audit") url = "/api/memory/audit?limit=200";
       if (mem.tab === "items") {
-        const qs = new URLSearchParams({ limit: "200" });
+        const qs = new URLSearchParams({
+          limit: String(mem.pageSize), offset: String(mem.offset),
+          sort: mem.sort, direction: mem.direction,
+        });
         if (mem.query) qs.set("q", mem.query);
         if (mem.kind) qs.set("kind", mem.kind);
         if (mem.itemStatus) qs.set("status", mem.itemStatus);
         url = "/api/memory/items?" + qs.toString();
       }
+      this._setLS("muselab_memory_browser", JSON.stringify({
+        sort: mem.sort, direction: mem.direction,
+      }));
+      const generation = ++mem.listGeneration;
+      if (this._memoryListAbort) this._memoryListAbort.abort();
+      const controller = new AbortController();
+      this._memoryListAbort = controller;
+      const cached = mem.listCache[url];
+      mem.items = cached ? cached.items : [];
+      mem.total = cached ? cached.total : 0;
+      mem.listLoaded = !!cached;
+      mem.listLoading = true;
+      mem.listError = "";
       try {
-        const r = await fetch(url, { headers: this.hdr(), cache: "no-store" });
-        if (!r.ok) throw new Error(`HTTP ${r.status}`);
-        mem.items = (await r.json()).items || [];
+        const data = await this._settingsRead(url, controller);
+        if (generation !== mem.listGeneration) return;
+        mem.items = data.items || [];
+        mem.total = Number.isFinite(data.total) ? data.total : mem.items.length;
+        mem.listLoaded = true;
+        mem.listCache[url] = { items: mem.items, total: mem.total };
+        const keys = Object.keys(mem.listCache);
+        for (const key of keys.slice(0, Math.max(0, keys.length - 12))) delete mem.listCache[key];
       } catch (e) {
-        this.toast((this.lang === "zh" ? "记忆中心加载失败：" : "Memory Center failed: ")
-          + (e.message || e), "error");
+        if (generation !== mem.listGeneration) return;
+        mem.listError = ["AbortError", "TimeoutError"].includes(e.name)
+          ? (this.lang === "zh" ? "列表请求超时，请重试" : "List request timed out; retry")
+          : String(e.message || e);
+      } finally {
+        if (generation === mem.listGeneration) {
+          mem.listLoading = false;
+          this._memoryListAbort = null;
+        }
       }
+    },
+
+    memoryPage(delta) {
+      const mem = this.settings.memory;
+      if (mem.listLoading) return;
+      mem.offset = Math.max(0, Math.min(
+        Math.max(0, Math.ceil(mem.total / mem.pageSize) - 1) * mem.pageSize,
+        mem.offset + delta * mem.pageSize,
+      ));
+      return this.refreshMemoryCenter({ keepPage: true });
     },
 
     async loadMemoryDetail(item) {
@@ -21355,60 +21506,61 @@ function portal() {
 
     async restartService() {
       if (this.settings.restarting) return;
-      // Confirm before restarting — a stray tap on a phone would otherwise
-      // drop every active chat session for ~10s with no recourse. Use the
-      // in-app modal (this.confirm), NOT native window.confirm: mobile
-      // webviews silently suppress window.confirm() so it returns false →
-      // the restart short-circuited with no dialog AND no feedback
-      // (2026-06-10 user report: tapped 重启, nothing happened). The in-app
-      // modal renders reliably on mobile and matches the rest of the app.
+      await this.loadServiceStatus();
+      const service = this.settings.service;
+      const zh = this.lang === "zh";
+      const impact = service
+        ? (zh ? `当前有 ${service.active_turns} 个进行中轮次、${service.background_tasks} 个后台任务。`
+          : `${service.active_turns} active turns and ${service.background_tasks} background tasks.`)
+        : (zh ? "当前任务数量暂时无法确认。" : "Current task counts are unavailable.");
       const ok = await this.confirm({
-        title: this.lang === "zh" ? "重启服务" : "Restart service",
-        body: this.lang === "zh"
-          ? "重启 muselab 服务？所有正在跑的对话会中断约 10 秒。"
-          : "Restart muselab? All running chats will pause for ~10 seconds.",
-        okText: this.lang === "zh" ? "重启" : "Restart",
-        danger: true,
+        title: zh ? "重启服务" : "Restart service",
+        body: impact + (zh
+          ? "重启会中断本实例中的运行任务。草稿会保留；恢复后自动重新连接。"
+          : " Restart interrupts this instance's running tasks. Drafts are preserved and the UI reconnects."),
+        okText: zh ? "重启" : "Restart", danger: true,
       });
       if (!ok) return;
       this.settings.restarting = true;
-      // Immediate feedback: the button also flips to "重启中…" via
-      // settings.restarting, but an explicit toast confirms the tap landed
-      // even before the health-poll loop reports success.
-      this.toast(this.lang === "zh" ? "正在重启服务…" : "Restarting service…", "info", 2500);
+      this.settings.restartStatus = zh ? "正在请求重启…" : "Requesting restart…";
+      let previousInstance = service?.instance_id || "";
       try {
-        // Fire the restart request — the server responds before it restarts
-        await fetch("/api/settings/restart", {
+        const response = await this._fetchWithDeadline("/api/settings/restart", {
           method: "POST", headers: this.hdr(),
-        });
-      } catch (_) {
-        // Expected: connection may drop immediately if the process exits fast
-      }
-      // Poll /api/health every 1.5 s until the server is back up, then
-      // do a soft chat refresh (no full page reload — preserves open tabs).
-      const pollStart = Date.now();
-      const MAX_WAIT = 30_000;
-      const poll = async () => {
-        if (!this.settings.restarting) return;
-        if (Date.now() - pollStart > MAX_WAIT) {
+        }, 5000);
+        if (!response.ok) {
+          this.settings.restartStatus = (zh ? "重启请求失败：" : "Restart request failed: ") + response.status;
           this.settings.restarting = false;
-          this.toast(this.lang === "zh" ? "服务重启超时，请手动刷新" : "Restart timed out — reload manually", "error", 5000);
           return;
         }
-        try {
-          const r = await fetch("/api/health", { cache: "no-store" });
-          if (r.ok) {
-            this.settings.restarting = false;
-            this.toast(this.lang === "zh" ? "✓ 服务已重启" : "✓ Service restarted", "success", 3000);
+        const receipt = await response.json();
+        previousInstance = receipt.instance_id || previousInstance;
+      } catch (_) {
+        // A lost response is ambiguous: reconcile identity, never auto-resubmit.
+      }
+      if (!this.settings.restarting) return;
+      this.settings.restartStatus = zh ? "等待服务重新启动…" : "Waiting for a new service instance…";
+      const deadline = Date.now() + 60000;
+      try {
+        while (Date.now() < deadline) {
+          await new Promise(resolve => setTimeout(resolve, 1500));
+          try {
+            const response = await this._fetchWithDeadline("/api/settings/service", {
+              headers: this.hdr(), cache: "no-store",
+            }, 2500);
+            if (!response.ok) continue;
+            const current = await response.json();
+            if (!previousInstance || current.instance_id === previousInstance) continue;
+            this.settings.service = current;
+            this.settings.restartStatus = zh ? "服务已重启，连接已恢复" : "Service restarted; connection restored";
             await this.refreshChat();
-            await this.loadVersions();
             return;
-          }
-        } catch (_) { /* still restarting */ }
-        setTimeout(poll, 1500);
-      };
-      // Give the process a moment to die before we start polling
-      setTimeout(poll, 2000);
+          } catch (_) { /* wait for the verified replacement */ }
+        }
+        this.settings.restartStatus = zh
+          ? "尚未确认服务恢复。草稿已保留，可以检查连接；不会自动重复重启。"
+          : "Recovery not confirmed. Drafts are preserved; check connection. Restart will not be repeated automatically.";
+      } finally { this.settings.restarting = false; }
     },
 
     async saveSettings() {
