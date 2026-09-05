@@ -568,7 +568,7 @@ function portal() {
     // contexts are sandboxed/browser-owned.
     previewQuote: {
       show: false, mode: "actions", source: "", role: "", sessionId: "",
-      messageId: "", text: "", path: "", question: "", followup: "",
+      messageId: "", text: "", path: "", workspace: "", question: "", followup: "",
       x: 0, y: 0, width: 560, height: 520,
       above: false, truncated: false, sending: false,
       askSessionId: "", askSessionName: "", askPrompt: "", askError: "",
@@ -12830,9 +12830,11 @@ function portal() {
     fileWorkspacePath() {
       return this.currentWorkspacePath();
     },
-    absoluteFilePath(path) {
-      const root = String(this.fileWorkspacePath() || "");
-      const relative = String(path || "").replace(/^\/+/, "");
+    absoluteFilePath(path, workspace = this.fileWorkspacePath()) {
+      const root = String(workspace || "");
+      const value = String(path || "");
+      if (value.startsWith("/")) return value;
+      const relative = value.replace(/^\.\/+/, "");
       if (!root) return relative;
       if (!relative) return root;
       return root.endsWith("/") ? root + relative : root + "/" + relative;
@@ -27390,7 +27392,8 @@ function portal() {
         sessionId: this.currentId,
         messageId,
         text: selectedText,
-        path: source === "preview" ? this.selected : "",
+        path: source === "preview" ? this.absoluteFilePath(this.selected) : "",
+        workspace: source === "preview" ? this.fileWorkspacePath() : "",
         question: "",
         followup: "",
         x: Math.min(viewportWidth - popoverHalf - 12,
@@ -27429,7 +27432,7 @@ function portal() {
       this._cancelPreviewQuoteResize();
       Object.assign(this.previewQuote, {
         show: false, mode: "actions", source: "", role: "", sessionId: "",
-        messageId: "", text: "", path: "", question: "", followup: "",
+        messageId: "", text: "", path: "", workspace: "", question: "", followup: "",
         x: 0, y: 0, above: false, truncated: false, sending: false,
         dragged: false, dragging: false, askSessionId: "",
         askSessionName: "", askPrompt: "", askError: "", askAutoScroll: true,
@@ -27495,7 +27498,10 @@ function portal() {
         role: snapshot.role || "",
         sessionId: snapshot.sessionId || this.currentId || "",
         messageId: snapshot.messageId || "",
-        path: snapshot.path || "",
+        path: snapshot.source === "chat" ? (snapshot.path || "")
+          : this.absoluteFilePath(snapshot.path || this.selected || "",
+            snapshot.workspace || this.fileWorkspacePath()),
+        workspace: snapshot.workspace || this.fileWorkspacePath(),
         text: snapshot.text || "",
         truncated: !!snapshot.truncated,
       };
@@ -29900,10 +29906,7 @@ function portal() {
 
     // ===== @ mention =====
     _mentionPath(path, isDir = false) {
-      const fileRoot = this.fileWorkspacePath();
-      let mentionPath = this.currentWorkspacePath() === fileRoot
-        ? path
-        : fileRoot.replace(/\/$/, "") + "/" + String(path || "").replace(/^\//, "");
+      let mentionPath = this.absoluteFilePath(path);
       if (isDir && mentionPath && !mentionPath.endsWith("/")) mentionPath += "/";
       return mentionPath;
     },

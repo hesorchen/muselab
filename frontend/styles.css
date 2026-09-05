@@ -3986,6 +3986,7 @@ pre.text {
   min-width: 0;
   max-width: 180px;
   margin-left: 6px;
+  margin-right: auto;
   border-right: 0;
 }
 .files-head-workspace .workspace-picker-btn { width: 100%; max-width: none; border-radius: var(--r-sm); }
