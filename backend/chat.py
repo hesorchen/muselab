@@ -4380,6 +4380,10 @@ async def shutdown_runtime() -> None:
         chat_runtime.shutdown_clients(),
         _join_protected_cleanup(),
     )
+    global _hook_diagnostic_worker
+    hook_worker, _hook_diagnostic_worker = _hook_diagnostic_worker, None
+    if hook_worker is not None:
+        await asyncio.to_thread(hook_worker.close)
 
 
 async def _rebuild_session_runtime(session_id: str) -> None:
@@ -7401,7 +7405,9 @@ def _purge_session_storage_disk_locked(sid: str) -> bool:
     _delete_active_turn_sidecar(sid)
     _delete_cancelled_turn_snapshots(sid)
     _delete_runtime_continuation_outboxes(sid)
-    hook_traces.purge(sid)
+    with hook_traces._trace_lock(sid):
+        _hook_diagnostic_generations[sid] = _hook_diagnostic_generations.get(sid, 0) + 1
+        hook_traces.purge(sid)
     return removed
 
 
@@ -16510,13 +16516,28 @@ async def _start_turn(
             # This probe is advisory when no compact is needed. Never let a
             # wedged SDK control request delay the user's real prompt for the
             # full compact window.
-            cu = await asyncio.wait_for(
+            cached = (client.cached_context_usage()
+                      if isinstance(client, MuseLabSDKClient) else None)
+            # Reuse only an unchanged, freshly measured SDK generation with
+            # ample headroom. Background/scheduled writers always force a probe.
+            cached_limit = _positive_int((cached or {}).get("maxTokens"))
+            cached_total = _positive_int((cached or {}).get("totalTokens"))
+            next_estimate = (_rough_prompt_tokens(prompt)
+                             + len(img_blocks) * 2500 + len(pdf_blocks) * 12000)
+            use_cached = (
+                cached is not None and cached_limit > 0 and cached_total > 0
+                and cached_total + next_estimate < cached_limit * 0.5
+                and not _sessions_with_inflight_tasks.get(session_id)
+                and not _session_has_live_watcher(session_id)
+                and not _session_has_scheduled_delivery(session_id))
+            cu = cached if use_cached else await asyncio.wait_for(
                 client.get_context_usage(),
                 timeout=min(
                     10,
                     env_int("MUSELAB_COMPACT_TIMEOUT_S", 300, min_value=1),
                 ),
             )
+            obs.perf_event("chat.context_preflight", cached=use_cached)
         except Exception as e:
             safe_kind = _classify_stream_error(str(e)).get("kind", "unknown")
             sys.stderr.write(
@@ -18060,7 +18081,7 @@ async def _start_turn(
                 # its real context ceiling.
                 sdk_max = sdk_raw = sdk_threshold = sdk_total = 0
                 try:
-                    cu = await client.get_context_usage()
+                    cu = await asyncio.wait_for(client.get_context_usage(), timeout=3.0)
                     sdk_max = _positive_int(cu.get("maxTokens"))
                     sdk_raw = _positive_int(cu.get("rawMaxTokens"))
                     sdk_threshold = _positive_int(cu.get("autoCompactThreshold"))
@@ -18101,7 +18122,7 @@ async def _start_turn(
                         / sess_u["context_limit"] * 100, 1)
             else:
                 try:
-                    cu = await client.get_context_usage()
+                    cu = await asyncio.wait_for(client.get_context_usage(), timeout=3.0)
                     real_max = int(cu.get("maxTokens") or 0)
                     real_total = int(cu.get("totalTokens") or 0)
                     if real_max:
@@ -21042,6 +21063,28 @@ def _on_sdk_runtime_disconnected(session_id: str) -> None:
         _publish_sdk_scheduled_state(key)
 
 
+_hook_diagnostic_worker = None
+_hook_diagnostic_generations: dict[str, int] = {}
+
+
+def _hook_trace_job(loop, session_id, message, turn_id, origin, broadcast, generation):
+    # Share the store's per-session lock with deletion. A queued diagnostic
+    # must never recreate an artifact after its session has been purged.
+    with hook_traces._trace_lock(session_id):
+        if generation != _hook_diagnostic_generations.get(session_id, 0):
+            return
+        trace = hook_traces.observe(session_id, message, turn_id=turn_id, origin=origin)
+    if trace is None or broadcast is None:
+        return
+
+    def publish():
+        if not broadcast.done and _active_turns.get(session_id) is broadcast:
+            broadcast.publish({"event": "hook_trace", "data": json.dumps(trace)})
+
+    if not loop.is_closed():
+        loop.call_soon_threadsafe(publish)
+
+
 async def _observe_sdk_stream_message(
     key: chat_runtime.ClientKey,
     message: Any,
@@ -21065,20 +21108,15 @@ async def _observe_sdk_stream_message(
         or (not live and session_id in _sessions_with_inflight_tasks)
         else "foreground"
     )
-    trace = await obs.to_thread_io(
-        "chat.hook_trace_write",
-        session_id,
-        hook_traces.observe,
-        session_id,
-        message,
-        turn_id=turn_id,
-        origin=origin,
-    )
-    if trace is not None and live:
-        broadcast.publish({
-            "event": "hook_trace",
-            "data": json.dumps(trace),
-        })
+    global _hook_diagnostic_worker
+    if _hook_diagnostic_worker is None:
+        from .diagnostic_worker import DiagnosticWorker
+        _hook_diagnostic_worker = DiagnosticWorker("muselab-hook-traces", capacity=256)
+    if not _hook_diagnostic_worker.submit(
+            _hook_trace_job, asyncio.get_running_loop(), session_id, message,
+            turn_id, origin, broadcast if live else None,
+            _hook_diagnostic_generations.get(session_id, 0)):
+        obs.perf_event("chat.hook_trace_dropped", count=_hook_diagnostic_worker.dropped)
     return consumed
 
 

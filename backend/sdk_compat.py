@@ -23,6 +23,7 @@ block from the persisted transcript after the turn completes.
 from __future__ import annotations
 
 import asyncio
+import time
 import logging
 from collections.abc import AsyncIterable, AsyncIterator
 from dataclasses import dataclass
@@ -177,6 +178,27 @@ class MuseLabSDKClient(ClaudeSDKClient):
         # makes that ordering explicit and safe if the SDK implementation
         # changes.
         self._muselab_input_lock = asyncio.Lock()
+        self._muselab_context_revision = 0
+        self._muselab_context_snapshot = None
+
+    def _invalidate_context_snapshot(self) -> None:
+        self._muselab_context_revision += 1
+        self._muselab_context_snapshot = None
+
+    async def get_context_usage(self) -> dict:
+        revision = self._muselab_context_revision
+        usage = await super().get_context_usage()
+        if revision == self._muselab_context_revision:
+            self._muselab_context_snapshot = (revision, time.monotonic(), dict(usage))
+        return usage
+
+    def cached_context_usage(self, *, max_age_s: float = 20.0) -> dict | None:
+        snapshot = self._muselab_context_snapshot
+        if (snapshot is None or snapshot[0] != self._muselab_context_revision
+                or time.monotonic() - snapshot[1] > max_age_s):
+            return None
+        return dict(snapshot[2])
+
 
     async def query(
         self,
@@ -185,6 +207,7 @@ class MuseLabSDKClient(ClaudeSDKClient):
     ) -> None:
         """Serialize ordinary and steering writes on this client instance."""
         async with self._muselab_input_lock:
+            self._invalidate_context_snapshot()
             await super().query(prompt, session_id=session_id)
 
     async def query_steering(
@@ -222,6 +245,7 @@ class MuseLabSDKClient(ClaudeSDKClient):
         async with self._muselab_input_lock:
             # Call the SDK implementation directly: going through our query()
             # override would acquire the same non-reentrant lock twice.
+            self._invalidate_context_snapshot()
             await super().query(_one_frame(), session_id=session_id)
 
     def _normalize_incoming_frame(
@@ -239,6 +263,7 @@ class MuseLabSDKClient(ClaudeSDKClient):
         from claude_agent_sdk._internal.message_parser import parse_message
 
         async for data in self._query.receive_messages():
+            self._invalidate_context_snapshot()
             normalized = self._normalize_incoming_frame(data)
             lifecycle = parse_command_lifecycle(normalized)
             if lifecycle is not None:

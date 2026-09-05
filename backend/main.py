@@ -37,6 +37,8 @@ from .observability import (
     monotonic as _perf_monotonic,
     perf_enabled as _perf_enabled,
     perf_event,
+    start_diagnostics,
+    stop_diagnostics,
 )
 
 
@@ -574,6 +576,7 @@ async def _lifespan(app: FastAPI):
     from .file_events import manager as _file_watch_manager
     await _start_workspace_index(_file_watch_manager)
     await _terminal_manager.start()
+    start_diagnostics()
     try:
         yield
     finally:
@@ -585,6 +588,7 @@ async def _lifespan(app: FastAPI):
             terminal=_terminal_manager,
             file_watcher=_file_watch_manager,
         )
+        await asyncio.to_thread(stop_diagnostics)
 
 
 async def _backfill_turn_counts() -> None:

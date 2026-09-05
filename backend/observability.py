@@ -31,6 +31,27 @@ _SAFE_FIELD_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _SAFE_EVENT_RE = re.compile(r"^[a-z][a-z0-9_.-]{0,63}$")
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]+")
 _T = TypeVar("_T")
+_perf_writer = None
+
+
+def start_diagnostics() -> None:
+    global _perf_writer
+    from .diagnostic_worker import DiagnosticWorker
+    if _perf_writer is None:
+        _perf_writer = DiagnosticWorker("muselab-perf")
+
+
+def stop_diagnostics() -> None:
+    global _perf_writer
+    writer, _perf_writer = _perf_writer, None
+    if writer is not None:
+        writer.close()
+
+
+def _write_line(line: str) -> None:
+    sys.stderr.write(line)
+    sys.stderr.flush()
+
 
 
 def perf_enabled() -> bool:
@@ -187,9 +208,12 @@ def perf_event(event: str, /, **fields: Any) -> None:
     for name, value in fields.items():
         if value is not None:
             payload[name] = _safe_value(value)
-    sys.stderr.write(
+    line = (
         "[perf] "
         + json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
         + "\n"
     )
-    sys.stderr.flush()
+    if _perf_writer is not None:
+        _perf_writer.submit(_write_line, line)
+    else:
+        _write_line(line)
