@@ -1,8 +1,9 @@
 """Final-history recovery must converge without a browser reload.
 
-Stable completed-turn identity is stronger than a possibly incomplete live
-text/UUID, and detached background work must not gate the foreground history.
-Keep both rules covered alongside successor and quiet-rendering protections.
+When the live UUID is missing, stable completed-turn identity can repair
+incomplete text. A known UUID still requires its own canonical boundary.
+Detached background work must not gate the foreground history. Keep these
+rules covered alongside successor and quiet-rendering protections.
 """
 import pytest
 
@@ -98,7 +99,7 @@ def _prepare(page, backend_url, auth_token, *, state=None, activity=None, histor
 
 @pytest.mark.parametrize("width", [1440, 390])
 @pytest.mark.parametrize("expected_uuid,expected_text", [
-    ("", "LIVE_PARTIAL"), ("missing-live-uuid", "LIVE_PARTIAL"), ("", ""),
+    ("", "LIVE_PARTIAL"), ("", ""),
 ])
 def test_completed_identity_recovers_incomplete_live_reply(
     page, backend_url, auth_token, width, expected_uuid, expected_text,
@@ -130,24 +131,26 @@ def test_completed_identity_recovers_incomplete_live_reply(
     _assert_no_browser_errors(page, errors)
 
 
-@pytest.mark.parametrize("state", [
-    {"stable": False},
-    {"active": True, "turn_id": "fixture-turn"},
-    {"active": True, "turn_id": "successor-turn"},
-    {"completed_turn_id": ""},
+@pytest.mark.parametrize("state,expected_uuid", [
+    ({"stable": False}, ""),
+    ({"active": True, "turn_id": "fixture-turn"}, ""),
+    ({"active": True, "turn_id": "successor-turn"}, ""),
+    ({"completed_turn_id": ""}, ""),
+    ({}, "missing-live-uuid"),
 ])
 def test_incomplete_live_reply_still_requires_stable_idle_commit(
-    page, backend_url, auth_token, state,
+    page, backend_url, auth_token, state, expected_uuid,
 ):
     errors, _, _ = _prepare(page, backend_url, auth_token, state=state)
     result = _app_eval(page, """
-        const st = app.tabState[arg];
-        const loaded = await app._runCompletedTurnSync(arg, st, {
+        const st = app.tabState[arg.sid];
+        const loaded = await app._runCompletedTurnSync(arg.sid, st, {
           expectedText: 'LIVE_PARTIAL', completedTurnId: 'fixture-turn',
+          expectedAssistantUuid: arg.uuid,
         });
         return {loaded, text: st.messages.at(-1).text,
           reasons: window.visibilityRequests.map(r => r.reason)};
-    """, SID)
+    """, {"sid": SID, "uuid": expected_uuid})
     assert result == {"loaded": False, "text": "LIVE_PARTIAL", "reasons": ["completed_turn"]}
     _assert_no_browser_errors(page, errors)
 

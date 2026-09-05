@@ -11142,14 +11142,17 @@ function portal() {
           }
         }
         // A stable, idle snapshot with a committed turn identity is authoritative
-        // even when the live final text was incomplete or its UUID was missing.
+        // when the live final text was incomplete and its UUID was missing.
         // This also covers an older completion aged out of the bounded tail
         // after fast successors. Do not require live text equality to adopt the
         // very canonical suffix that is supposed to repair that live text.
+        // A known UUID is still a required boundary for this same turn: its
+        // absence must not authorize installing an unrelated successor suffix.
         if (finalIndex < 0 && committedState?.stable === true
             && !committedState.active && !history.has_later) {
           let boundaryConfirmed = !!(committedState.completed_turn_id
-            && completedTurnId);
+            && completedTurnId && (committedState.completed_turn_id !== completedTurnId
+              || !expectedAssistantUuid));
           if (!boundaryConfirmed && expectedAssistantUuid && Number(history.offset) > 0) {
             const boundaryResponse = await this._fetchWithDeadline(
               "/api/chat/sessions/" + sid + "?around_uuid=" + encodeURIComponent(expectedAssistantUuid)
