@@ -572,20 +572,30 @@ def test_pending_send_text_survives_hard_refresh(
     expect(page.locator(".chat-input-textarea")).to_have_value(marker)
 
 
+@pytest.mark.parametrize("receipt_state", ["failed", "not_found"])
 def test_turn_start_failure_restores_draft_and_idle_state(
-        page: Page, backend_url, auth_token):
+        page: Page, backend_url, auth_token, receipt_state):
+    import json
+
     attempts = 0
 
     def reject_turn_start(route) -> None:
         nonlocal attempts
         attempts += 1
         route.fulfill(
-            status=503,
+            status=422 if receipt_state == "failed" else 503,
             content_type="application/json",
             body='{"detail":"ticket unavailable"}',
         )
 
     page.route("**/api/chat/turns/start", reject_turn_start)
+    # A definite rejection restores the draft; an ambiguous 5xx must not be
+    # retried or silently restored as fresh input while it may have executed.
+    page.route("**/submissions/**", lambda route: route.fulfill(
+        status=200, content_type="application/json",
+        body=json.dumps({"state": receipt_state,
+                         "result": {"status": 422} if receipt_state == "failed" else {}}),
+    ))
     _login(page, backend_url, auth_token)
     marker = "ticket-failure-recovered"
     page.locator(".chat-input-textarea").fill(marker)
@@ -621,25 +631,44 @@ def test_turn_start_failure_restores_draft_and_idle_state(
             ).length,
             claimToken: app.tabState[app.currentId]._composerSubmitToken,
             claimPhase: app.tabState[app.currentId]._composerSubmitPhase,
+            uncertain: app.tabState[app.currentId]._uncertainSubmission || null,
             hasToast: app.toasts.some(t => t.msg.includes('发送失败')
               || t.msg.includes('Send failed')),
           };
         }"""
     )
-    assert attempts == 2
-    assert result == {
-        "returned": False,
-        "input": marker,
-        "streaming": False,
-        "pending": "",
-        "storedText": marker,
-        "imageIds": ["recover-image"],
-        "docIds": ["recover-doc"],
-        "bubbleCount": 0,
-        "claimToken": None,
-        "claimPhase": "",
-        "hasToast": True,
-    }
+    assert attempts == 1
+    if receipt_state == "failed":
+        assert result == {
+            "returned": False,
+            "input": marker,
+            "streaming": False,
+            "pending": "",
+            "storedText": marker,
+            "imageIds": ["recover-image"],
+            "docIds": ["recover-doc"],
+            "bubbleCount": 0,
+            "claimToken": None,
+            "claimPhase": "",
+            "uncertain": None,
+            "hasToast": True,
+        }
+    else:
+        assert result["returned"] is False
+        assert result["streaming"] is False
+        assert result["bubbleCount"] == 0
+        assert result["pending"] == marker
+        assert result["uncertain"]["input"] == marker
+        assert [a["id"] for a in result["uncertain"]["pendingImages"]] == ["recover-image"]
+        assert [a["id"] for a in result["uncertain"]["pendingDocs"]] == ["recover-doc"]
+        expect(page.locator(".queue-outbox .queued-text")).to_have_text(marker)
+        assert page.evaluate("""async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          app._setChatInput('KEEP NEW DRAFT');
+          return await app.send();
+        }""") is False
+        expect(page.locator(".chat-input-textarea")).to_have_value("KEEP NEW DRAFT")
+        assert attempts == 1
     assert not page.locator("#jserr").is_visible()
 
 
@@ -1040,7 +1069,7 @@ def test_server_busy_admission_never_borrows_running_footer(
     # accepting the POST cannot move or duplicate the bubble.  Assert the
     # visible contract and the temporary ownership state independently.
     expect(page.locator(".msg.user.queued")).to_be_visible()
-    expect(page.locator(".msg.user.queued .queued-label")).to_contain_text("排队中")
+    expect(page.locator(".msg.user.queued .queued-label")).to_contain_text("正在提交")
     page.wait_for_function(
         """() => {
           const app = document.querySelector('#app')._x_dataStack[0];
@@ -1067,6 +1096,7 @@ def test_server_busy_admission_never_borrows_running_footer(
         }"""
     )
     expect(page.locator(".msg.user.queued")).to_have_count(1)
+    expect(page.locator(".msg.user.queued .queued-label")).to_contain_text("排队中")
     assert page.evaluate("() => window.__queueCalls") == 1
 
 
