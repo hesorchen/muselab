@@ -10613,9 +10613,12 @@ function portal() {
           attempt: attempt + 1,
         };
         ownerState._pendingCompletedTurnSync = next;
-        if (attempt < 30 && stillOwned()) {
+        if (stillOwned() && (attempt < 30
+            || (sid === this.currentId && document.visibilityState !== "hidden"))) {
           this._requestSessionSync(sid, "completed_turn", {
-            ...next, delayMs: Math.min(2000, 350 + attempt * 100),
+            ...next, delayMs: attempt < 30
+              ? Math.min(2000, 350 + attempt * 100)
+              : Math.min(30000, 5000 + (attempt - 30) * 1000),
           });
         }
       };
@@ -10630,13 +10633,6 @@ function portal() {
         // completed turn is harmless, while a different active turn means a
         // successor has already claimed this session and its optimistic/live
         // suffix must win over A's delayed canonical replacement.
-        const activeProbe = completedTurnId
-          ? this._fetchWithDeadline(
-              "/api/chat/sessions/" + sid + "/active",
-              { headers: this.hdr(), signal: options.signal },
-              2500,
-            ).catch(() => null)
-          : Promise.resolve(null);
         const historyResponse = await this._fetchWithDeadline(
           "/api/chat/sessions/" + sid + "?tail=" + reconcileTail,
           { headers: this.hdr(), signal: options.signal },
@@ -10644,11 +10640,23 @@ function portal() {
         if (!stillOwned()) return false;
         if (!historyResponse.ok) { retry(); return false; }
         const history = await historyResponse.json();
-        const activeResponse = await activeProbe;
-        if (!stillOwned()) return false;
         let activity = null;
-        try { activity = activeResponse?.ok ? await activeResponse.json() : null; }
-        catch (_) { activity = null; }
+        const committedState = history.completion_state;
+        if (committedState?.stable === true) {
+          activity = committedState;
+        } else if (committedState) {
+          retry();
+          return false;
+        } else if (completedTurnId) {
+          // Rolling upgrades: retain the old server's ownership probe.
+          try {
+            const response = await this._fetchWithDeadline(
+              "/api/chat/sessions/" + sid + "/active",
+              { headers: this.hdr(), signal: options.signal }, 2500);
+            activity = response.ok ? await response.json() : null;
+          } catch (_) { activity = null; }
+        }
+        if (!stillOwned()) return false;
         const activeTurnId = String((activity && activity.turn_id) || "");
         if (activity && activity.active && !activity.background
             && activeTurnId && activeTurnId !== completedTurnId) {
@@ -10673,6 +10681,34 @@ function portal() {
                 && (message.text || "") === expectedText) {
               finalIndex = i;
               break;
+            }
+          }
+        }
+        // The old completion UUID may have aged out of the bounded tail after
+        // many successor tool turns. A stable, idle canonical snapshot permits
+        // following its latest assistant boundary instead of waiting forever.
+        if (finalIndex < 0 && committedState?.stable === true
+            && !committedState.active && !history.has_later) {
+          let boundaryConfirmed = !!(committedState.completed_turn_id
+            && completedTurnId && committedState.completed_turn_id !== completedTurnId);
+          if (!boundaryConfirmed && expectedAssistantUuid && Number(history.offset) > 0) {
+            const boundaryResponse = await this._fetchWithDeadline(
+              "/api/chat/sessions/" + sid + "?around_uuid=" + encodeURIComponent(expectedAssistantUuid)
+                + "&before=1&after=1",
+              { headers: this.hdr(), signal: options.signal });
+            if (boundaryResponse.ok) {
+              const boundary = await boundaryResponse.json();
+              boundaryConfirmed = (boundary.messages || []).some(message =>
+                message.role === "assistant" && message.uuid === expectedAssistantUuid);
+            }
+          }
+          if (!stillOwned()) return false;
+          if (boundaryConfirmed) {
+            for (let i = messages.length - 1; i >= 0; i -= 1) {
+              if (messages[i]?.role === "assistant" && messages[i].uuid) {
+                finalIndex = i;
+                break;
+              }
             }
           }
         }
@@ -10723,6 +10759,7 @@ function portal() {
           minimumTail: completedTurnWindow,
           followTail: followTailStillOwned,
           signal: options.signal,
+          historySnapshot: history,
         });
         if (!loaded) retry();
         else {
@@ -17949,12 +17986,25 @@ function portal() {
         let r;
         const fetchStarted = perfNow();
         try {
+          const snapshot = opts.historySnapshot;
+          const reusable = snapshot && !full && !preserveFullOrder
+            && Array.isArray(snapshot.messages)
+            && snapshot.messages.length >= Math.min(Number(snapshot.total) || 0, requestedTail);
+          if (reusable) {
+            const trim = Math.max(0, snapshot.messages.length - requestedTail);
+            r = { ok: true, headers: new Headers(), json: async () => ({
+              ...snapshot, messages: snapshot.messages.slice(trim),
+              offset: (Number(snapshot.offset) || 0) + trim,
+              has_more: (Number(snapshot.offset) || 0) + trim > 0,
+            }) };
+          } else {
           r = await this._fetchWithDeadline(
             "/api/chat/sessions/" + sid + qs,
             { headers: this.hdr(), signal: opts.signal },
             full ? 60_000
               : Math.max(100, Number(this._sessionReadTimeoutMs) || 15000),
           );
+          }
         } catch (_) {
           historyPerf.status = "error";
           return false;

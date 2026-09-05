@@ -3578,7 +3578,7 @@ def test_done_immediately_stamps_tool_tail_and_quietly_adopts_fork_boundary():
     assert '"/api/chat/sessions/" + sid + "/active"' in reconcile
     assert "activity.active && !activity.background" in reconcile
     assert "activeTurnId !== completedTurnId" in reconcile
-    assert "const activeProbe = completedTurnId" in reconcile
+    assert "const committedState = history.completion_state" in reconcile
     assert "!this._hasPendingAdmission(ownerState)" in reconcile
     assert "const reconcileTail = this._historyReconcileWindowSize();" in reconcile
     assert '"/api/chat/sessions/" + sid + "?tail=" + reconcileTail' in reconcile
@@ -3595,7 +3595,8 @@ def test_done_immediately_stamps_tool_tail_and_quietly_adopts_fork_boundary():
     assert "hasSuccessorRoot && (!activity || activity.active)" in reconcile
     assert "const loaded = await this.loadSession(sid, {" in reconcile
     assert "quiet: true, probeActive: false" in reconcile
-    assert "attempt < 30" in reconcile
+    assert "historySnapshot: history" in reconcile
+    assert "around_uuid=" in reconcile
     assert "Math.min(2000, 250 + options.attempt * 100)" in reconcile
 
     queue_start = app.index("    async _runQueueAttach(")

@@ -6552,6 +6552,18 @@ async def get_session_hook_traces_api(
     return {"session_id": sid, "traces": traces}
 
 
+def _history_runtime_token(sid: str) -> tuple:
+    """No I/O: detect ownership changes while a worker reads canonical history."""
+    active = _active_turns.get(sid)
+    recent = _recent_turns.get(sid)
+    return (
+        str(active.turn_id) if active else "",
+        bool(active and not active.done),
+        int(getattr(active, "latest_event_seq", 0)) if active else 0,
+        str(recent.turn_id) if recent else "",
+    )
+
+
 @router.get("/sessions/{sid}", dependencies=[Depends(require_token)])
 def get_session_api(
     sid: str,
@@ -6590,6 +6602,7 @@ def get_session_api(
     flush this turn to JSONL, merge MuseLab's private display snapshot at its
     original transcript anchor. The snapshot is presentation-only and is
     never passed back into model context."""
+    history_runtime_before = _history_runtime_token(sid)
     meta = sess.get_session_meta(sid)
     if meta is None:
         raise HTTPException(404, "session not found")
@@ -6810,6 +6823,13 @@ def get_session_api(
         # has adopted the hidden owner's latest continuation bubble before
         # stopping its inherited-task poller.
         "runtime_ui_revision": snapshot_generation,
+        "completion_state": {
+            "stable": history_runtime_before == _history_runtime_token(sid),
+            "active": bool(active_turn is not None),
+            "turn_id": str(active_turn.turn_id) if active_turn else "",
+            "history_generation": generation,
+            "completed_turn_id": str(getattr(_recent_turns.get(sid), "turn_id", "")),
+        },
     }
 
 
