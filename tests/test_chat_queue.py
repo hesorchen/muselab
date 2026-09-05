@@ -73,13 +73,15 @@ def test_dequeue_empty_queue_returns_none(app_module):
     assert sess.dequeue_message("s-empty") is None
 
 
-def test_legacy_pause_call_does_not_block_pending_input(app_module):
-    """Old clients cannot create a persistent session-wide pause."""
+def test_explicit_pause_holds_existing_items_not_later_input(app_module):
+    """Manual holds never become a persistent session-wide send lock."""
     sess = _sess(app_module)
     sid = "s-paused"
     sess.enqueue_message(sid, "waiting")
     sess.set_queue_paused(sid, True)
-    assert sess.dequeue_message(sid)["text"] == "waiting"
+    assert sess.dequeue_message(sid) is None
+    sess.enqueue_message(sid, "new manual input")
+    assert sess.dequeue_message(sid)["text"] == "new manual input"
     assert sess.get_queue(sid)["inflight"] is not None
 
 
@@ -632,12 +634,12 @@ def test_reorder_appends_missing_ids_defensively(app_module):
     assert result[1:] == [ids[0], ids[1]]
 
 
-def test_set_queue_paused_is_legacy_noop(app_module):
+def test_set_queue_paused_toggles_explicit_item_holds(app_module):
     sess = _sess(app_module)
     sid = "s-toggle"
     sess.enqueue_message(sid, "m")
-    assert sess.set_queue_paused(sid, True)["paused"] is False
-    assert sess.get_queue(sid)["paused"] is False
+    assert sess.set_queue_paused(sid, True)["paused"] is True
+    assert sess.get_queue(sid)["paused"] is True
     assert sess.set_queue_paused(sid, False)["paused"] is False
 
 
@@ -719,7 +721,7 @@ def test_removing_the_last_item_also_clears_paused(app_module):
 
     # Removing one of two leaves the pause intact — there IS still work.
     data = sess.remove_queue_item(sid, a)
-    assert data["paused"] is False
+    assert data["paused"] is True
 
     data = sess.remove_queue_item(sid, b)
     assert data["items"] == []
@@ -1055,9 +1057,9 @@ def test_queue_endpoint_pause_toggle(
     r = client.post(f"/api/chat/sessions/{sid}/queue/pause", headers=auth,
                     json={"paused": True})
     assert r.status_code == 200
-    assert r.json()["paused"] is False
+    assert r.json()["paused"] is True
     assert client.get(f"/api/chat/sessions/{sid}/queue",
-                      headers=auth).json()["paused"] is False
+                      headers=auth).json()["paused"] is True
     # Resuming kicks _maybe_drain_queue; with no live turn + no SDK the drain
     # dispatch is out of unit scope, but the endpoint must still return cleanly
     # and clear the paused flag.

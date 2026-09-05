@@ -2816,7 +2816,8 @@ def set_message_count(sid: str, message_count: int,
 #   - items: FIFO; head is sent next by the drain trigger in chat.py
 #   - queue_issue on one item retains cancelled/failed/uncertain input for review;
 #     it is never automatically resent and does not block other FIFO items
-#   - paused: obsolete compatibility field; always False under policy_version=2
+#   - held: an explicit user pause on individual items, never a session lock
+#   - paused: summary of held items; newly submitted messages remain runnable
 #   - delivery="adjust": the live CLI owns delivery; the ordinary FIFO drain
 #     must not claim it until an explicit fallback changes delivery to "queue"
 #
@@ -2869,7 +2870,7 @@ def _empty_queue() -> dict:
 def queue_pending_items(data: dict) -> list[dict]:
     """Runnable/CLI-owned input only; review records do not own FIFO positions."""
     return [item for item in data.get("items") or []
-            if not item.get("queue_issue")]
+            if not item.get("queue_issue") and not item.get("held")]
 
 
 def _normalize_queue_item(item: dict, *, strict: bool = False) -> dict:
@@ -3010,7 +3011,7 @@ def _load_queue(
                 and not any(item.get("queue_issue") for item in d["items"])):
             d["items"][0]["queue_issue"] = "delivery_unknown"
         if normalize_policy:
-            d["paused"] = False
+            d["paused"] = any(item.get("held") for item in d["items"])
             d["policy_version"] = 2
         return d
     except Exception as exc:
@@ -3045,7 +3046,7 @@ def _save_queue(sid: str, data: dict, *, bump: bool = True) -> bool:
         }
     else:
         canonical["inflight"] = None
-    canonical["paused"] = False
+    canonical["paused"] = any(item.get("held") for item in canonical.get("items", []))
     canonical["policy_version"] = 2
     if bump:
         _bump_queue_revision(canonical)
@@ -3126,6 +3127,9 @@ def migrate_queue(source_sid: str, target_sid: str) -> dict:
         # requests even if a retry migrates them after the child has been used.
         combined.sort(key=lambda item: int(item.get("enqueued_at") or 0))
         target["items"] = combined
+        target["held_ids"] = sorted(set(target.get("held_ids", []))
+                                   | set(source.get("held_ids", [])))
+        source["held_ids"] = []
         target["paused"] = False
         source["items"] = []
         source["inflight"] = None
@@ -3201,6 +3205,9 @@ def _enqueue_message_locked(
         "steering_state": steering_state,
     }
     item.update({key: value for key, value in optional_fields.items() if value})
+    if item["id"] in data.get("held_ids", []):
+        item["held"] = True
+        data["held_ids"] = [held_id for held_id in data["held_ids"] if held_id != item["id"]]
     item = _normalize_queue_item(item, strict=True)
     queued_command_uuid = _queue_command_uuid(item)
     if queued_command_uuid:
@@ -3598,7 +3605,7 @@ def claim_queue_message(sid: str) -> dict | None:
         if data.get("inflight") or not queue_pending_items(data):
             return None
         index = next(i for i, row in enumerate(data["items"])
-                     if not row.get("queue_issue"))
+                     if not row.get("queue_issue") and not row.get("held"))
         head = data["items"][index]
         if (
             head.get("delivery") == "adjust"
@@ -3693,7 +3700,7 @@ def recover_queue_inflight(sid: str) -> dict:
         data = _load_queue(sid, strict=True, normalize_policy=False)
         inflight = data.get("inflight") or {}
         item = inflight.get("item") or {}
-        changed = bool(data.get("paused")) or data.get("policy_version") != 2
+        changed = data.get("policy_version") != 2
         if item:
             item_id = str(item.get("id") or "")
             if inflight.get("turn_id"):
@@ -3725,7 +3732,7 @@ def recover_queue_inflight(sid: str) -> dict:
                 changed = True
         # Commit a legacy migration once. Do not rewrite all healthy/tombstone
         # sidecars (or bump their UI revisions) on every service restart.
-        data["paused"] = False
+        data["paused"] = any(row.get("held") for row in data["items"])
         data["policy_version"] = 2
         if changed:
             _save_queue(sid, data)
@@ -3836,11 +3843,34 @@ def clear_queue(sid: str) -> dict:
     return clear_queue_with_removed(sid)[0]
 
 
-def set_queue_paused(sid: str, paused: bool) -> dict:
-    """Legacy endpoint compatibility. Neither value can pause or retry items."""
+def set_queue_paused(sid: str, paused: bool, item_ids: list[str] | None = None) -> dict:
+    """Pause a snapshot, not future input. Explicit resume never retries issues.
+
+    IDs also fence late-arriving POSTs from the browser's pre-Stop snapshot.
+    A later manual submission has a new ID and bypasses these held rows.
+    """
     with _QUEUE_LOCK:
         data = _load_queue(sid, strict=True)
-        data["paused"] = False
+        selected = set(item_ids) if item_ids is not None else {
+            row["id"] for row in data["items"] if not row.get("queue_issue")}
+        held_ids = set(data.get("held_ids", []))
+        if paused:
+            held_ids.update(selected)
+        elif item_ids is None:
+            held_ids.clear()
+        else:
+            held_ids.difference_update(selected)
+        # Active CLI-owned adjustments cannot be unsent by a queue-only pause.
+        for row in data["items"]:
+            if row["id"] in selected and not row.get("queue_issue"):
+                if paused and row.get("delivery") == "adjust" and row.get("steering_state") in _QUEUE_ACTIVE_STEERING_STATES:
+                    continue
+                if paused:
+                    row["held"] = True
+                else:
+                    row.pop("held", None)
+        existing_ids = {row["id"] for row in data["items"]}
+        data["held_ids"] = sorted(held_ids - existing_ids)
         _save_queue(sid, data)
         return data
 

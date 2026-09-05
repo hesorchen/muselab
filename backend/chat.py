@@ -7813,6 +7813,7 @@ class QueueEnqueueReq(BaseModel):
 
 class QueuePauseReq(BaseModel):
     paused: bool
+    item_ids: list[str] | None = Field(default=None, max_length=100)
 
 
 class QueueReorderReq(BaseModel):
@@ -8620,6 +8621,12 @@ async def _enqueue_impl(
         if res.get("error") == "session_not_found":
             raise HTTPException(404, "session not found")
         raise HTTPException(409, res.get("error", "enqueue failed"))
+    if effective_delivery == "adjust" and res.get("item", {}).get("held"):
+        res["item"] = await asyncio.to_thread(
+            sess.fallback_queue_steering, sid, item_id=queue_item_id,
+            command_uuid=command_uuid)
+        res["queue"] = await asyncio.to_thread(sess.get_queue, sid)
+        effective_delivery = "queue"
     # A late enqueue belongs to its own message, not to the stopped turn.
     # Exact submission cancellation below/at admission handles that message;
     # stopping an earlier reply must never freeze unrelated queued input.
@@ -8777,11 +8784,10 @@ async def clear_queue_api(sid: str) -> dict:
 @router.post("/sessions/{sid}/queue/pause", dependencies=[Depends(require_token)])
 async def pause_queue_api(sid: str, req: QueuePauseReq) -> dict:
     data = await obs.to_thread_io(
-        "chat.queue_pause", sid, sess.set_queue_paused, sid, req.paused,
+        "chat.queue_pause", sid, sess.set_queue_paused, sid, req.paused, req.item_ids,
         owned=True,
     )
-    # Compatibility with older clients: neither value pauses the queue or
-    # retries review-only items. A call can only wake ordinary pending input.
+    # Only the selected snapshot is held. Later manual input remains runnable.
     _schedule_queue_drain(sid)
     return data
 
@@ -11698,6 +11704,7 @@ def _interrupt_response(
 async def interrupt(
     session_id: str,
     turn_id: str = "",
+    pause_item_ids: str = "",
 ) -> dict:
     """Stop one immutable turn via the SDK control protocol."""
     requested_turn_id = turn_id.strip()
@@ -11736,6 +11743,8 @@ async def interrupt(
             stale_owner = True
             targets = []
         else:
+            if pause_item_ids:
+                await _hold_submission_snapshot(session_id, pause_item_ids)
             # Snapshot pooled clients only while this exact owner is current.
             targets = [
                 (k, c) for k, c in _clients.items()
@@ -13944,6 +13953,9 @@ async def _run_submission_owned(sid, kind, request_id, payload, operation):
     if settled["state"] == "cancelled" and kind == "turn":
         await interrupt(sid, str(result.get("turn_id") or ""))
         result["cancelled"] = True
+    elif settled["state"] == "cancelled" and kind == "queue":
+        await _cancel_queue_submission(sid, request_id)
+        result["cancelled"] = True
     return result
 
 
@@ -13956,15 +13968,58 @@ async def submission_status(
 
 
 @router.post("/sessions/{sid}/submissions/{request_id}/cancel", dependencies=[Depends(require_token)])
-async def cancel_turn_submission(sid: str, request_id: str) -> dict:
+async def cancel_turn_submission(
+    sid: str, request_id: str, kind: str = "turn", pause_item_ids: str = "",
+) -> dict:
     from . import submissions
+    if kind not in {"turn", "queue"}:
+        raise HTTPException(422, "invalid submission kind")
+    if pause_item_ids:
+        await _hold_submission_snapshot(sid, pause_item_ids)
     state = await obs.to_thread_io(
         "chat.submission_cancel", sid, submissions.cancel,
-        sid, "turn", request_id, owned=True)
+        sid, kind, request_id, owned=True)
+    if kind == "queue":
+        try:
+            await _cancel_queue_submission(sid, request_id)
+        except HTTPException as exc:
+            if exc.status_code != 409:
+                raise
+            return {"state": "cancel_requested", "result": state["result"]}
+        return state
     turn_id = str(state["result"].get("turn_id") or "")
     if turn_id:
         await interrupt(sid, turn_id)
     return state
+
+
+async def _hold_submission_snapshot(sid: str, raw_ids: str) -> None:
+    ids = list(dict.fromkeys(raw_ids.split(",")))
+    if len(ids) > 100 or any(not re.fullmatch(r"q-[A-Za-z0-9_.:-]{1,128}", item) for item in ids):
+        raise HTTPException(422, "invalid pending message snapshot")
+    await obs.to_thread_io(
+        "chat.queue_hold", sid, sess.set_queue_paused, sid, True, ids, owned=True)
+
+
+async def _cancel_queue_submission(sid: str, request_id: str) -> None:
+    """Withdraw one identity; if its drain already won, stop only that turn."""
+    item_id = "q-" + request_id
+    async with _queue_drain_lock_for(sid):
+        snapshot = await asyncio.to_thread(sess.get_queue, sid)
+        inflight = snapshot.get("inflight") or {}
+        turn_id = (str(inflight.get("turn_id") or "")
+                   if (inflight.get("item") or {}).get("id") == item_id else "")
+        if not turn_id:
+            try:
+                await remove_queue_item_api(sid, item_id)
+            except HTTPException as exc:
+                item = next((row for row in snapshot.get("items", [])
+                             if row.get("id") == item_id), {})
+                turn_id = str(item.get("target_turn_id") or "")
+                if exc.status_code != 409 or not turn_id:
+                    raise
+    if turn_id:
+        await interrupt(sid, turn_id)
 
 
 @router.post("/stream/mux/start", dependencies=[Depends(require_token)])
