@@ -9810,8 +9810,18 @@ function portal() {
             if (record.cancelRequested && receipt.state !== "cancelled") continue;
             if (receipt.state === "cancelled") {
               const bubble = (st.messages || []).find(m => m._clientMessageId === record.requestId);
+              const wasAdmitted = !!(receipt.result?.turn_id || bubble?._turnId);
+              if (record.kind === "turn" && !wasAdmitted) {
+                // Stop before admission is an unsend: restore the original
+                // draft without replacing newer input typed during recovery.
+                if (sid === this.currentId) this._captureComposerState(sid);
+                this._restoreUncertainDraft(st, record);
+                this._resolveChatRecoveryDraft(sid, st.draft.input);
+                this._persistChatDraft(sid, st.draft.input);
+                if (sid === this.currentId) this._activateComposerState(sid);
+              }
               if (bubble) {
-                if (receipt.result?.turn_id || bubble._turnId) bubble._admissionPending = false;
+                if (wasAdmitted) bubble._admissionPending = false;
                 else this._removePaneMessage(st, bubble);
               }
               this._removeOutgoing(sid, st, record);

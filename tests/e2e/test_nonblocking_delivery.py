@@ -131,6 +131,28 @@ def test_stop_accepts_new_input_before_control_ack_and_holds_only_old_ids(page, 
         "oldInSnapshot": True, "newInSnapshot": False}
 
 
+def test_cancelled_unadmitted_turn_restores_attachments_without_losing_new_draft(page, backend_url, auth_token):
+    _login(page, backend_url, auth_token)
+    result = _app_eval(page, """
+      const sid=app.currentId,st=app._ensureTabState(sid);
+      app._scheduleOutgoing=()=>{};
+      st._queueAdmission={images:[{id:'cancel-image',mime:'image/png'}],
+        docs:[{id:'cancel-doc',name:'fixture.txt',kind:'text'}],pendingQuotes:[]};
+      app._rememberUncertainSubmission(sid,'cancel-draft','turn','cancelled input');
+      st._outgoing[0].cancelRequested=true;
+      app.input='newly typed draft';app._captureComposerState(sid);
+      app._fetchWithDeadline=async()=>new Response(JSON.stringify({state:'cancelled',result:{}}));
+      app._syncQueueFromServer=async()=>true;
+      await app._pumpOutgoing(sid);
+      await app._pumpOutgoing(sid);
+      return {draft:st.draft.input,input:app.input,remaining:st._outgoing.length,
+        images:st.draft.pendingImages.map(i=>i.id),docs:st.draft.pendingDocs.map(i=>i.id)};
+    """)
+    assert result == {"draft": "cancelled input\n\nnewly typed draft",
+        "input": "cancelled input\n\nnewly typed draft", "remaining": 0,
+        "images": ["cancel-image"], "docs": ["cancel-doc"]}
+
+
 def test_storage_failure_keeps_draft_and_does_not_claim_acceptance(page, backend_url, auth_token):
     _login(page, backend_url, auth_token)
     result = _app_eval(page, """
