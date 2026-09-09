@@ -3430,10 +3430,108 @@ def upload_limits() -> dict:
     return {"max_file_bytes": MAX_UPLOAD_BYTES}
 
 
+# Two-phase browser uploads keep an aborted HTTP request from committing a
+# file whose body the server already received. Legacy uploads remain immediate.
+_PENDING_UPLOADS: dict[tuple[str, str, str], dict] = {}
+_PENDING_UPLOAD_LOCK = threading.RLock()
+_PENDING_UPLOAD_TTL = 600
+_PENDING_UPLOAD_CAP = 1024
+
+
+class UploadControlReq(BaseModel):
+    upload_id: str
+    path: str = ""
+
+
+def _upload_key(upload_id: str, path: str, root: Path) -> tuple[str, str, str]:
+    if not re.fullmatch(r"[0-9a-f]{32}", upload_id):
+        raise HTTPException(400, "invalid upload id")
+    directory = safe_resolve(path, root=root)
+    _guard_not_trash(directory, root)
+    return str(root), str(directory), upload_id
+
+
+def _expire_pending_upload(key, record):
+    with _PENDING_UPLOAD_LOCK:
+        if _PENDING_UPLOADS.get(key) is not record:
+            return
+        _PENDING_UPLOADS.pop(key)
+        if record.get("tmp"):
+            record["tmp"].unlink(missing_ok=True)
+
+
+def _new_pending_upload(key, **fields):
+    # Called on the request event loop while holding the registry lock.
+    if len(_PENDING_UPLOADS) >= _PENDING_UPLOAD_CAP:
+        raise HTTPException(503, "too many pending uploads")
+    record = dict(fields)
+    _PENDING_UPLOADS[key] = record
+    loop = asyncio.get_running_loop()
+    record["expiry"] = loop.call_later(
+        _PENDING_UPLOAD_TTL,
+        lambda: loop.run_in_executor(None, _expire_pending_upload, key, record),
+    )
+    return record
+
+
+
+async def cleanup_pending_uploads():
+    with _PENDING_UPLOAD_LOCK:
+        records = list(_PENDING_UPLOADS.values())
+        _PENDING_UPLOADS.clear()
+        for record in records:
+            record["cancelled"] = True
+            record["expiry"].cancel()
+    def cleanup():
+        for record in records:
+            if record.get("tmp"):
+                record["tmp"].unlink(missing_ok=True)
+    await asyncio.to_thread(cleanup)
+
+
+@router.post("/upload/cancel", dependencies=[Depends(require_token)])
+async def cancel_upload(req: UploadControlReq, root: Path = Depends(_workspace_root)) -> dict:
+    key = _upload_key(req.upload_id, req.path, root)
+    with _PENDING_UPLOAD_LOCK:
+        record = _PENDING_UPLOADS.get(key)
+        if record is None:
+            # A cancel may beat multipart parsing. Keep a tombstone so a
+            # later upload with the same id cannot stage or commit its body.
+            record = _new_pending_upload(key, cancelled=True)
+        record["cancelled"] = True
+        tmp = record.get("tmp")
+    if tmp:
+        await asyncio.to_thread(tmp.unlink, missing_ok=True)
+    return {"ok": True}
+
+
+@router.post("/upload/commit", dependencies=[Depends(require_token)])
+async def commit_upload(req: UploadControlReq, root: Path = Depends(_workspace_root)) -> dict:
+    key = _upload_key(req.upload_id, req.path, root)
+
+    def commit():
+        with _PENDING_UPLOAD_LOCK:
+            record = _PENDING_UPLOADS.get(key)
+            if not record or record.get("cancelled") or not record.get("ready"):
+                raise HTTPException(409, "upload is cancelled, expired, or not ready")
+            # Revalidate after staging; a directory may have been moved meanwhile.
+            if safe_resolve(record["path"], root=root) != record["dest"]:
+                raise HTTPException(409, "upload destination changed")
+            try:
+                trashed = record["finalize"]()
+                return {"ok": True, "path": record["path"], "size": record["size"],
+                        "replaced_trash_id": (trashed or {}).get("trash_id")}
+            finally:
+                _PENDING_UPLOADS.pop(key, None)
+                record["tmp"].unlink(missing_ok=True)
+    return await asyncio.to_thread(commit)
+
+
 @router.post("/upload", dependencies=[Depends(require_token)])
 async def upload(
     path: str = Form(""),
     file: UploadFile = File(...),
+    upload_id: str = Form(""),
     root: Path = Depends(_workspace_root),
 ) -> dict:
     target_dir = safe_resolve(path, root=root)
@@ -3461,11 +3559,20 @@ async def upload(
     # leaves a partial file at the intended path.
     import uuid as _uuid
     tmp_path = dest.parent / f".~{dest.name}.{_uuid.uuid4().hex[:8]}.uploading"
+    pending = None
+    if upload_id:
+        key = _upload_key(upload_id, path, root)
+        with _PENDING_UPLOAD_LOCK:
+            if key in _PENDING_UPLOADS:
+                raise HTTPException(409, "upload id already used or cancelled")
+            pending = _new_pending_upload(key, tmp=tmp_path, cancelled=False)
     written = 0
     try:
         with tmp_path.open("wb") as f:
             while chunk := await file.read(1024 * 1024):
                 written += len(chunk)
+                if pending and pending.get("cancelled"):
+                    raise HTTPException(409, "upload cancelled")
                 if written > MAX_UPLOAD_BYTES:
                     f.close()
                     tmp_path.unlink(missing_ok=True)
@@ -3508,11 +3615,21 @@ async def upload(
                 _rename_noreplace(tmp_path, dest)
                 _fsync_rename(tmp_path.parent, dest.parent)
                 return trashed
+        if pending is not None:
+            with _PENDING_UPLOAD_LOCK:
+                if pending.get("cancelled") or _PENDING_UPLOADS.get(key) is not pending:
+                    raise HTTPException(409, "upload cancelled or expired")
+                pending.update(ready=True, finalize=_finalize, dest=dest, size=written,
+                               path=(_logical_relative_path(path) / safe_name).as_posix())
+            return {"ok": True, "pending": True, "path": pending["path"], "size": written}
         trashed = await asyncio.to_thread(_finalize)
-    except HTTPException:
-        tmp_path.unlink(missing_ok=True)
-        raise
-    except Exception:
+    except BaseException:
+        if pending:
+            with _PENDING_UPLOAD_LOCK:
+                pending["cancelled"] = True
+                if _PENDING_UPLOADS.get(key) is pending:
+                    _PENDING_UPLOADS.pop(key)
+                    pending["expiry"].cancel()
         tmp_path.unlink(missing_ok=True)
         raise
     return {

@@ -407,8 +407,12 @@
             <li class="file-upload-item" :class="{failed:transfer.failed}" :data-upload-name="transfer.name">
               <div class="file-upload-item-heading">
                 <span :title="transfer.path" x-text="transfer.name"></span>
+                <button type="button" class="btn-text sm" x-show="!transfer.done"
+                        :disabled="!canCancelFileUpload(transfer)"
+                        :title="transfer.saving ? (lang==='zh' ? '正在保存，请等待结果' : 'Saving; wait for the result') : ''"
+                        @click="cancelFileUpload(transfer)" x-text="lang==='zh' ? '取消' : 'Cancel'"></button>
                 <button type="button" class="btn-text sm"
-                        x-show="transfer.done && !transfer.failed && _workspaceIsCurrent(transfer.workspace)"
+                        x-show="transfer.done && !transfer.failed && !transfer.cancelled && _workspaceIsCurrent(transfer.workspace)"
                         @click="revealUploadedFile(transfer)" x-text="lang==='zh' ? '定位' : 'Locate'"></button>
               </div>
               <div class="file-upload-item-state">
@@ -417,7 +421,7 @@
               </div>
               <progress x-show="!transfer.done" max="100" :value="transfer.known ? transfer.percent : null"
                         :aria-label="transfer.name"></progress>
-              <small x-show="transfer.done && !transfer.failed" x-text="transfer.path"></small>
+              <small x-show="transfer.done && !transfer.failed && !transfer.cancelled" x-text="transfer.path"></small>
             </li>
           </template>
         </ul>

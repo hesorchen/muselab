@@ -54,3 +54,76 @@ def test_sort_updates_existing_file_on_mtime_event(page, backend_url, auth_token
     """)
     assert result == {"before":["folder","z.txt","a.txt"],
                       "after":["folder","a.txt","z.txt"], "stamp":300}
+
+
+@pytest.mark.parametrize("width", [1440, 390])
+def test_cancel_inflight_upload_keeps_other_file(page, backend_url, auth_token, width, tmp_path_factory):
+    page.set_viewport_size({"width": width, "height": 900})
+    _login(page, backend_url, auth_token)
+    _app_eval(page, "app.setMobileTab('files');")
+    cdp = page.context.new_cdp_session(page)
+    cdp.send("Network.enable")
+    cdp.send("Network.emulateNetworkConditions", {
+        "offline": False, "latency": 20,
+        "downloadThroughput": 1024 * 1024, "uploadThroughput": 64 * 1024,
+    })
+    failed = []
+    page.on("requestfailed", lambda req: failed.append(req.failure)
+            if req.method == "POST" and req.url.endswith("/api/files/upload") else None)
+    cancelled_name = f"cancel-mid-transfer-{width}.bin"
+    kept_name = f"keep-transfer-{width}.txt"
+    try:
+        page.locator('.pane.files input[x-ref="upload"]').set_input_files([
+            {"name": cancelled_name, "mimeType": "application/octet-stream", "buffer": b"x" * (2 * 1024 * 1024)},
+            {"name": kept_name, "mimeType": "text/plain", "buffer": b"keep this"},
+        ])
+        page.wait_for_function("""name => {
+            const app = document.querySelector('#app')._x_dataStack[0];
+            const item = app.fileUploadProgress.items.find(x => x.name === name);
+            return item && item.loaded > 0 && !item.done && app.canCancelFileUpload(item);
+        }""", arg=cancelled_name)
+        row = page.locator(f'[data-upload-name="{cancelled_name}"]')
+        row.get_by_role("button", name="Cancel", exact=True).click()
+        expect(row).to_contain_text("Transfer cancelled")
+        expect(row.get_by_role("button", name="Locate")).to_be_hidden()
+        cdp.send("Network.emulateNetworkConditions", {
+            "offline": False, "latency": 0,
+            "downloadThroughput": -1, "uploadThroughput": -1,
+        })
+        expect(page.locator(f'[data-upload-name="{kept_name}"]')).to_contain_text("Saved")
+        page.wait_for_timeout(300)
+        assert failed and any("ERR_ABORTED" in reason for reason in failed)
+        root = next(tmp_path_factory.getbasetemp().glob("e2e-root[0-9]*"))
+        assert not (root / cancelled_name).exists()
+        assert not list(root.glob(f".~{cancelled_name}.*.uploading"))
+        assert (root / kept_name).read_text() == "keep this"
+        assert _app_eval(page, "return app.fileUploadProgress.failedFiles;") == 0
+    finally:
+        cdp.detach()
+
+
+def test_cancel_preflight_never_starts_post_and_saving_cannot_cancel(page, backend_url, auth_token):
+    _login(page, backend_url, auth_token)
+    _app_eval(page, "app.setMobileTab('files');")
+    posts = []
+    page.on("request", lambda req: posts.append(req.url)
+            if req.method == "POST" and req.url.endswith("/api/files/upload") else None)
+    _app_eval(page, """
+        app._workspaceUploadLimit = () => new Promise(resolve => { window.releaseUploadLimit = resolve; });
+        window.preflightResult = app._uploadFileQuiet("", new File(["stop"], "cancel-preflight.txt"));
+    """)
+    row = page.locator('[data-upload-name="cancel-preflight.txt"]')
+    row.get_by_role("button", name="Cancel", exact=True).click()
+    expect(row).to_contain_text("Transfer cancelled")
+    _app_eval(page, "window.releaseUploadLimit(1024);")
+    page.wait_for_timeout(300)
+    assert posts == []
+    assert page.evaluate("window.preflightResult") is None
+    result = _app_eval(page, """
+        const token = app._beginFileUploadTransfer({name:'saving.txt',size:4});
+        const current = app._fileUploadTransfer(token);
+        current.transfer.saving = true;
+        app.cancelFileUpload({id:token.transferId});
+        return {cancelled:current.transfer.cancelled, done:current.transfer.done};
+    """)
+    assert result == {"cancelled": False, "done": False}

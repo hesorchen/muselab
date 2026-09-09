@@ -474,6 +474,7 @@ function portal() {
       totalFiles: 0, completedFiles: 0, failedFiles: 0, activeFiles: 0, items: [],
     },
     _fileUploadLimitPromise: null,
+    _fileUploadAborters: new Map(),
     _fileUploadBatch: null,
     _fileUploadTransferSeq: 0,
     _fileUploadHideTimer: null,
@@ -17165,7 +17166,8 @@ function portal() {
       );
       if (!this._workspaceIsCurrent(ownerWorkspace)) return;
       const ok = results.filter(r => r.status === "fulfilled" && r.value).length;
-      const failed = results.length - ok;
+      const uploadedName = results.find(r => r.status === "fulfilled" && r.value)?.value.path?.split("/").pop() || "";
+      const failed = results.filter(r => r.status === "rejected" || r.value === false).length;
       await this.reloadTree();
       if (!this._workspaceIsCurrent(ownerWorkspace)) return;
       await this._syncUploadedFiles(results, uploadContext, ownerWorkspace);
@@ -17180,9 +17182,9 @@ function portal() {
           : `Uploaded ${ok}, ${failed} failed`, "warn", 3500);
       } else if (ok === 1) {
         this.toast(this.lang === "zh"
-          ? `已上传 ${files[0].name}`
-          : `Uploaded ${files[0].name}`, "success", 2200);
-      } else {
+          ? `已上传 ${uploadedName}`
+          : `Uploaded ${uploadedName}`, "success", 2200);
+      } else if (ok) {
         this.toast(this.lang === "zh"
           ? `已上传 ${ok} 个文件`
           : `Uploaded ${ok} files`, "success", 2200);
@@ -17199,10 +17201,13 @@ function portal() {
     ) {
       ownerWorkspace = ownerWorkspace || this.fileWorkspacePath();
       const transfer = this._beginFileUploadTransfer(file, dirPath, ownerWorkspace);
+      const uploadState = this._fileUploadTransfer(transfer).transfer;
       let succeeded = false;
       let failure = "";
       try {
         const limit = await this._workspaceUploadLimit();
+        const pending = this._fileUploadTransfer(transfer);
+        if (!pending || uploadState.cancelled) return null;
         if (limit && file.size > limit) {
           failure = this.lang === "zh"
             ? "文件 " + this.fmtSize(file.size) + " 超过单文件 " + this.fmtSize(limit) + " 上限"
@@ -17218,13 +17223,27 @@ function portal() {
           }
           return false;
         }
-        const data = (await r.json().catch(() => ({}))) || {};
+        let data = (await r.json().catch(() => ({}))) || {};
+        if (uploadState.cancelled) return null;
+        if (data.pending) {
+          uploadState.saving = true;
+          const committed = await fetch("/api/files/upload/commit", {
+            method: "POST", headers: {...this.fileHdr(ownerWorkspace), "Content-Type": "application/json"},
+            body: JSON.stringify({upload_id: transfer.uploadId, path: dirPath}),
+          });
+          if (!committed.ok) {
+            failure = this._workspaceUploadError(committed.status, await committed.text());
+            return false;
+          }
+          data = await committed.json();
+        }
         succeeded = true;
         return {
           path: data.path || (dirPath ? `${dirPath}/${file.name}` : file.name),
           replaced_trash_id: data.replaced_trash_id || null,
         };
       } catch (e) {
+        if (uploadState.cancelled) return null;
         failure = this._workspaceUploadError(0, "");
         if (
           reportError
@@ -29851,14 +29870,34 @@ function portal() {
       if (!status) return zh ? "网络连接中断，请重试；文件尚未确认保存" : "Connection interrupted; file has not been confirmed saved. Retry.";
       return detail || (zh ? "上传失败，HTTP " : "Upload failed, HTTP ") + status;
     },
+    canCancelFileUpload(item) {
+      return !item.done && !item.saving
+        && !(item.known && item.loaded >= item.total);
+    },
+    cancelFileUpload(item) {
+      const batch = this._fileUploadBatch;
+      const transfer = batch?.transfers[item.id];
+      if (!transfer || !this.canCancelFileUpload(transfer)) return;
+      const token = { batchId: batch.id, transferId: item.id };
+      transfer.cancelled = true;
+      this._fileUploadAborters.get(batch.id + "/" + item.id)?.();
+      this._finishFileUploadTransfer(token, false);
+      // Staged data cannot commit without the explicit success path above.
+      // If cleanup cannot reach the server, its staging lease expires.
+      fetch("/api/files/upload/cancel", {
+        method: "POST", headers: {...this.fileHdr(transfer.workspace), "Content-Type": "application/json"},
+        body: JSON.stringify({upload_id: transfer.uploadId, path: transfer.dirPath}),
+      }).catch(() => {});
+    },
     fileUploadItemStatus(item) {
+      if (item.cancelled) return this.lang === "zh" ? "已取消传输" : "Transfer cancelled";
       if (item.failed) return item.error || (this.lang === "zh" ? "上传失败" : "Failed");
       if (item.done) return this.lang === "zh" ? "已保存" : "Saved";
       if (item.known && item.loaded >= item.total) return this.lang === "zh" ? "正在保存…" : "Saving…";
       return this.lang === "zh" ? "正在上传" : "Uploading";
     },
     async revealUploadedFile(item) {
-      if (!item.done || item.failed || !this._workspaceIsCurrent(item.workspace)) return;
+      if (!item.done || item.failed || item.cancelled || !this._workspaceIsCurrent(item.workspace)) return;
       await this._refreshParentInTree(item.path, item.workspace);
       if (this._workspaceIsCurrent(item.workspace)) {
         await this.revealInTree(item.path, { ownerWorkspace: item.workspace });
@@ -29879,6 +29918,11 @@ function portal() {
           ? this.t("files.uploading_many", { done: completed, total })
           : this.t("files.uploading_one");
       }
+      if (Number(progress.cancelledFiles) > 0) {
+        return this.lang === "zh"
+          ? `已保存 ${completed}，已取消 ${progress.cancelledFiles}，失败 ${failed}`
+          : `Saved ${completed}, cancelled ${progress.cancelledFiles}, failed ${failed}`;
+      }
       return failed > 0
         ? this.t("files.upload_finished_errors", { failed })
         : this.t("files.upload_finished");
@@ -29887,9 +29931,10 @@ function portal() {
       if (!batch || this._fileUploadBatch !== batch) return;
       const transfers = Object.values(batch.transfers || {});
       const totalFiles = transfers.length;
-      const completedFiles = transfers.filter(item => item.done && !item.failed).length;
+      const completedFiles = transfers.filter(item => item.done && !item.failed && !item.cancelled).length;
       const failedFiles = transfers.filter(item => item.failed).length;
-      const activeFiles = totalFiles - completedFiles - failedFiles;
+      const cancelledFiles = transfers.filter(item => item.cancelled).length;
+      const activeFiles = transfers.filter(item => !item.done).length;
       const known = totalFiles > 0 && transfers.every(item => item.known);
       const totalBytes = transfers.reduce(
         (sum, item) => sum + Math.max(1, Number(item.total) || 0), 0,
@@ -29907,6 +29952,7 @@ function portal() {
         totalFiles,
         completedFiles,
         failedFiles,
+        cancelledFiles,
         activeFiles,
         items: Object.entries(batch.transfers).map(([id, item]) => ({
           ...item, id,
@@ -29932,15 +29978,17 @@ function portal() {
       batch.transfers[transferId] = {
         name: String(file?.name || ""),
         path: dirPath ? dirPath + "/" + file.name : file.name,
-        workspace, error: "",
+        workspace, dirPath, uploadId: crypto.randomUUID().replaceAll("-", ""),
+        error: "", cancelled: false, saving: false,
         loaded: 0,
         total: Math.max(0, Number(file && file.size) || 0),
         known: false,
         done: false,
         failed: false,
       };
-      this._publishFileUploadProgress(batch);
-      return { batchId: batch.id, transferId };
+      // Alpine wraps a newly assigned batch; publish its canonical reactive identity.
+      this._publishFileUploadProgress(this._fileUploadBatch);
+      return { batchId: batch.id, transferId, uploadId: batch.transfers[transferId].uploadId };
     },
     _fileUploadTransfer(token) {
       const batch = this._fileUploadBatch;
@@ -29970,11 +30018,11 @@ function portal() {
       transfer.total = Math.max(1, Number(transfer.total) || 0);
       if (succeeded) transfer.loaded = transfer.total;
       transfer.done = true;
-      transfer.failed = !succeeded;
+      transfer.failed = !succeeded && !transfer.cancelled;
       transfer.error = error;
       this._publishFileUploadProgress(current.batch);
       if (Object.values(current.batch.transfers).some(item => !item.done)) return;
-      if (Object.values(current.batch.transfers).some(item => item.failed)) return;
+      if (Object.values(current.batch.transfers).some(item => item.failed || item.cancelled)) return;
       const batchId = current.batch.id;
       this._fileUploadHideTimer = setTimeout(() => {
         const latest = this._fileUploadBatch;
@@ -29992,13 +30040,17 @@ function portal() {
       const fd = new FormData();
       fd.append("path", dirPath);
       fd.append("file", file);
+      fd.append("upload_id", transferToken.uploadId);
       const headers = this.fileHdr(ownerWorkspace);
       return new Promise((resolve, reject) => {
         const xhr = new XMLHttpRequest();
+        const abortKey = transferToken.batchId + "/" + transferToken.transferId;
+        this._fileUploadAborters.set(abortKey, () => xhr.abort());
         let settled = false;
         const finish = (callback, value) => {
           if (settled) return;
           settled = true;
+          this._fileUploadAborters.delete(abortKey);
           callback(value);
         };
         xhr.open("POST", "/api/files/upload", true);
@@ -30012,6 +30064,14 @@ function portal() {
             event.total,
             event.lengthComputable && event.total > 0,
           );
+        });
+        xhr.upload.addEventListener("load", () => {
+          const current = this._fileUploadTransfer(transferToken);
+          if (!current || current.transfer.done) return;
+          // Once the body has left the browser, abort cannot undo a server
+          // commit. Let the save response settle instead of promising removal.
+          current.transfer.saving = true;
+          this._publishFileUploadProgress(current.batch);
         });
         xhr.addEventListener("load", () => {
           const responseText = xhr.responseText || "";
@@ -30059,7 +30119,8 @@ function portal() {
         return;
       }
       const ok = results.filter(r => r.status === "fulfilled" && r.value).length;
-      const failed = results.length - ok;
+      const uploadedName = results.find(r => r.status === "fulfilled" && r.value)?.value.path?.split("/").pop() || "";
+      const failed = results.filter(r => r.status === "rejected" || r.value === false).length;
       await this.reloadTree();
       if (!this._workspaceIsCurrent(ownerWorkspace)) {
         ev.target.value = "";
@@ -30080,9 +30141,9 @@ function portal() {
           : `Uploaded ${ok}, ${failed} failed`, "warn", 3500);
       } else if (ok === 1) {
         this.toast(this.lang === "zh"
-          ? `已上传 ${files[0].name}`
-          : `Uploaded ${files[0].name}`, "success", 2200);
-      } else {
+          ? `已上传 ${uploadedName}`
+          : `Uploaded ${uploadedName}`, "success", 2200);
+      } else if (ok) {
         this.toast(this.lang === "zh"
           ? `已上传 ${ok} 个文件`
           : `Uploaded ${ok} files`, "success", 2200);
@@ -30296,7 +30357,8 @@ function portal() {
       );
       if (!this._workspaceIsCurrent(ownerWorkspace)) return;
       const ok = results.filter(r => r.status === "fulfilled" && r.value).length;
-      const failed = results.length - ok;
+      const uploadedName = results.find(r => r.status === "fulfilled" && r.value)?.value.path?.split("/").pop() || "";
+      const failed = results.filter(r => r.status === "rejected" || r.value === false).length;
       const firstUploaded = results.find(r =>
         r.status === "fulfilled" && r.value && r.value.path);
       if (firstUploaded) {
@@ -30316,9 +30378,9 @@ function portal() {
           : `Uploaded ${ok} to ${intoLabel}, ${failed} failed`, "warn", 3500);
       } else if (ok === 1) {
         this.toast(this.lang === "zh"
-          ? `已上传 ${files[0].name} 到 ${intoLabel}`
-          : `Uploaded ${files[0].name} to ${intoLabel}`, "success", 2200);
-      } else {
+          ? `已上传 ${uploadedName} 到 ${intoLabel}`
+          : `Uploaded ${uploadedName} to ${intoLabel}`, "success", 2200);
+      } else if (ok) {
         this.toast(this.lang === "zh"
           ? `已上传 ${ok} 个文件到 ${intoLabel}`
           : `Uploaded ${ok} files to ${intoLabel}`, "success", 2200);

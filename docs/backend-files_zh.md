@@ -16,7 +16,7 @@
 
 ## 端点
 
-当前共 22 个文件端点。普通请求使用 token 鉴权；浏览器下载先通过已鉴权请求签发一个短时、限定作用域的能力票据。
+当前共 24 个文件端点。普通请求使用 token 鉴权；浏览器下载先通过已鉴权请求签发一个短时、限定作用域的能力票据。
 
 ### 读取与预览
 
@@ -50,10 +50,14 @@
 | `PUT /api/files/write` | 原子覆盖或创建文本文件，最大 10 MiB |
 | `GET /api/files/upload-limits` | 读取单文件上限（字节），供上传前检查 |
 | `POST /api/files/upload` | Multipart 上传，默认每文件最大 1 GiB（1024 MiB） |
+| `POST /api/files/upload/commit` | 确认暂存文件，原子保存到目标路径 |
+| `POST /api/files/upload/cancel` | 取消暂存上传并清理临时文件 |
 | `POST /api/files/mkdir` | 创建目录 |
 | `POST /api/files/rename` | 移动或重命名 |
 | `POST /api/files/copy-bak` | 创建 `.bak`、`.bak.2` 等备份副本 |
 | `DELETE /api/files/delete` | 默认软删除；`permanent=true` 永久删除 |
+
+浏览器上传携带随机 `upload_id`，先暂存，再确认保存。传输中可逐文件取消；取消不会覆盖已有同名文件。进入保存阶段后取消按钮禁用。未确认的暂存文件在服务运行期间最多保留 10 分钟，正常停机时也会清理。不带 `upload_id` 的兼容 API 请求仍直接保存。
 
 同名上传会先把原文件移入回收站，再原子替换，因而可以恢复。危险可执行扩展名和敏感文件名默认禁止上传。
 

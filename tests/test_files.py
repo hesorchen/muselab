@@ -940,3 +940,54 @@ def test_upload_limits_match_server_enforcement(client, auth, temp_root, monkeyp
     assert not (temp_root / "over-limit.bin").exists()
     assert not list(temp_root.glob(".*.uploading"))
     assert client.get("/api/files/upload-limits").status_code == 401
+
+
+def test_staged_upload_cancel_preserves_existing_file(client, auth, temp_root):
+    import uuid
+    upload_id = uuid.uuid4().hex
+    target = temp_root / "cancel-existing.txt"
+    target.write_text("original")
+    response = client.post("/api/files/upload", headers=auth,
+                           data={"path": "", "upload_id": upload_id},
+                           files={"file": (target.name, b"replacement")})
+    assert response.status_code == 200 and response.json()["pending"] is True
+    assert target.read_text() == "original"
+    control = {"path": "", "upload_id": upload_id}
+    assert client.post("/api/files/upload/cancel", headers=auth, json=control).status_code == 200
+    assert client.post("/api/files/upload/commit", headers=auth, json=control).status_code == 409
+    assert target.read_text() == "original"
+    assert not list(temp_root.glob(".*.uploading"))
+
+
+def test_cancel_before_upload_parsing_prevents_late_save(client, auth, temp_root):
+    import uuid
+    upload_id = uuid.uuid4().hex
+    control = {"path": "", "upload_id": upload_id}
+    assert client.post("/api/files/upload/cancel", headers=auth, json=control).status_code == 200
+    response = client.post("/api/files/upload", headers=auth,
+                           data=control, files={"file": ("cancelled-late.txt", b"late bytes")})
+    assert response.status_code == 409
+    assert not (temp_root / "cancelled-late.txt").exists()
+    assert not list(temp_root.glob(".*.uploading"))
+
+
+def test_staged_upload_commit_and_expiry(client, auth, temp_root):
+    import uuid
+    from backend import files
+    for name, commit in [("committed.txt", True), ("expired.txt", False)]:
+        upload_id = uuid.uuid4().hex
+        control = {"path": "", "upload_id": upload_id}
+        staged = client.post("/api/files/upload", headers=auth, data=control,
+                             files={"file": (name, b"saved bytes")})
+        assert staged.status_code == 200
+        assert not (temp_root / name).exists()
+        if commit:
+            assert client.post("/api/files/upload/commit", json=control).status_code == 401
+            response = client.post("/api/files/upload/commit", headers=auth, json=control)
+            assert response.status_code == 200
+            assert (temp_root / name).read_bytes() == b"saved bytes"
+        else:
+            key = files._upload_key(upload_id, "", temp_root)
+            files._expire_pending_upload(key, files._PENDING_UPLOADS[key])
+            assert client.post("/api/files/upload/commit", headers=auth, json=control).status_code == 409
+        assert not list(temp_root.glob(".*.uploading"))

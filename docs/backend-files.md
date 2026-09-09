@@ -16,7 +16,7 @@ Unregistered, removed, or disallowed directories are rejected. Returned paths ar
 
 ## Endpoints
 
-There are currently 22 Files endpoints. Normal calls use token authentication;
+There are currently 24 Files endpoints. Normal calls use token authentication;
 browser downloads use a short-lived, scope-bound capability ticket minted by
 an authenticated call.
 
@@ -56,10 +56,14 @@ Preview limits:
 | `PUT /api/files/write` | Atomically create or replace text, up to 10 MiB |
 | `GET /api/files/upload-limits` | Read the configured per-file cap in bytes for upload preflight |
 | `POST /api/files/upload` | Multipart upload, 1 GiB (1024 MiB) per file by default |
+| `POST /api/files/upload/commit` | Atomically save a staged upload to its destination |
+| `POST /api/files/upload/cancel` | Cancel a staged upload and clean its temporary file |
 | `POST /api/files/mkdir` | Create a directory |
 | `POST /api/files/rename` | Move or rename |
 | `POST /api/files/copy-bak` | Create `.bak`, `.bak.2`, and later backup copies |
 | `DELETE /api/files/delete` | Soft-delete by default; `permanent=true` deletes permanently |
+
+Browser uploads use a random `upload_id` to stage bytes before explicitly committing them. Individual transfers can be cancelled without replacing an existing same-name file. Cancellation is disabled during the final save. Uncommitted staging expires after 10 minutes while the service runs and is cleaned on graceful shutdown. Legacy API calls without `upload_id` still save immediately.
 
 A same-name upload first moves the old file into the dustbin and then atomically replaces it, preserving recovery. Dangerous executable extensions and sensitive filenames are rejected by default.
 
