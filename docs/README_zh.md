@@ -11,12 +11,13 @@
 
 ## 使用
 
-- [配置工作区 CLAUDE.md](personalize-claude-md_zh.md) —— 为项目写入可选的长期工作说明
+- [工作台操作](workbench-ui_zh.md) —— 文件与预览、会话、任务管理、执行记录与界面设置
+- [配置工作区 CLAUDE.md](personalize-claude-md_zh.md) —— 多工作区、项目上下文与可选的长期工作说明
 - [Skills](skills_zh.md) —— 开箱即用的 skill 清单，以及如何添加自己的
 - [手机端 PWA](mobile_zh.md) —— 加到主屏、推送通知、HTTPS
 - [终端](terminal_zh.md) —— 真实 PTY、终端列表、Profile 与移动操作
 - [定时任务](scheduler_zh.md) —— 按节奏运行保存的 prompt
-- [长期记忆](memory_zh.md) —— Episode、Dreamer／Verifier、混合召回与人工审核 Skill
+- [长期记忆](memory_zh.md) —— 做梦机制、混合召回、现场证据回溯与人工审核 Skill
 
 ## 模型
 
@@ -31,6 +32,7 @@
 
 - [架构](architecture_zh.md) —— 目录地图 + 一个请求的完整链路
 - [会话内部机制](backend-sessions_zh.md) —— 索引、sidecar、队列、fork、崩溃恢复
+- [交互可靠性约定](ux-reliability_zh.md) —— 发送回执、取消边界、队列与断线恢复
 - [Files API](backend-files_zh.md) —— 每个 `/api/files/*` 端点 + `safe_resolve`
 - [安全模型](backend-security_zh.md) —— 鉴权、账单隔离与已知局限
 - [前端内部机制](frontend_zh.md) —— 无构建 SPA、渲染流水线、SSE 客户端、service worker

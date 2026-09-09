@@ -6,10 +6,16 @@ MuseLab's optional long-term memory stores durable business context,
 preferences, decisions, and agent experience. It is disabled by default and is
 not a repository-wide file RAG feature.
 
+## Architecture
+
 The canonical SQLite Registry retains evidence, Episodes, provenance,
 versions, conflicts, review state, jobs, and audit events. Qdrant or pgvector
 is only a rebuildable dense index. Retrieval fuses SQLite FTS, dense similarity,
 metadata, authority, and confidence, with an optional reranker.
+
+Each user has one logical memory pool. Workspaces, domains, topics, and entities are soft metadata, not isolated memory stores. Rebuild the retrieval index from the Registry after changing the embedding model or vector database.
+
+## Setup
 
 Configure Memory under Settings with:
 
@@ -18,12 +24,17 @@ Configure Memory under Settings with:
 3. Qdrant or PostgreSQL + pgvector;
 4. an optional reranker.
 
-MuseLab probes every required capability before an enabled configuration is
-saved. `off` has no chat overhead, `shadow` forms reviewable candidates without
-recall, and `active` enables bounded hybrid recall. The default 250 ms soft
-deadline and fail-soft behavior keep provider failures out of the chat path.
+Saving an enabled configuration through the UI probes the required capabilities by default; a failed probe prevents activation. `off` has no chat overhead, `shadow` forms reviewable candidates without recall, and `active` enables bounded hybrid recall. New configurations use a 2000 ms soft recall deadline; existing configurations retain their saved value. Retrieval or reranking failures and timeouts preserve available results where possible, or continue the reply without injecting memory. Dreamer, Verifier, indexing, and Skill learning run in the background.
 
-The Memory Center exposes memories, sources, Episodes, reflections, conflicts,
+## Dreaming and hybrid recall
+
+Dreaming consolidates task experience. When a session reaches the configured turn or idle threshold, its Episode enters the background consolidation queue. “Dream now” also queues a job. Dreamer extracts candidate facts, decisions, and reflections; Verifier checks evidence, conflicts, and future value. Automatic consolidation requires memory to be enabled and the Worker to be running. Generated memories are inferred records, not user-confirmed facts.
+
+In active mode, hybrid recall combines keyword and semantic-vector retrieval, then ranks results using authority, confidence, and usage feedback, with an optional reranker. It searches available memories in the Registry, not the entire workspace. Memory files inside a project are ordinary project materials, separate from this cross-session memory system.
+
+## Memory management
+
+The Memory Center supports search, sorting, pagination, confirmation, correction, and deletion. It exposes memories, sources, Episodes, reflections, conflicts,
 jobs, recall traces, and Skill candidates. The brain button beside a chat
 message is a deterministic confirmed-memory action; natural-language
 "remember/correct/forget" classification is not required. Corrections retain a
@@ -34,15 +45,23 @@ discovered by the SDK. An authenticated, explicit approval installs it under
 `~/.claude/skills/muselab-generated-<name>/SKILL.md`; disabling moves it out of
 the discoverable directory while preserving its audit trail.
 
+## Source evidence tracebacks
+
+Memory sources can link to Episodes, conversation messages, and tool records. Open a source to return to its session. An explicit message source with a valid message ID can also locate the message; Episode and tool-evidence sources usually locate the session. Missing records or entries without sources may not support a traceback.
+
+“Copy evidence” copies session evidence locators, including session and workspace information and original record paths. It does not copy the full conversation or recreate the execution environment. Locators may contain private paths and identifiers; inspect and redact them before sharing publicly.
+
+## Reflection and value checks
+
 Cross-Episode reflection requires the configured number of independent
 Episodes. Independence is computed from normalized evidence content, so forked
 or copied transcripts do not count as separate support. Every candidate names
 its source Episodes. The white-box value score combines Verifier prediction,
-independent-Episode count, historical recall-query fit, and novelty. Unsupported
-or conflicting candidates are quarantined; low-value and shadow-mode candidates
-remain pending review. Failed turns form separate failure Episodes, while
+independent-Episode count, historical recall-query fit, and novelty. Verifier rejects unsupported or conflicting candidates, which may leave no reviewable memory entry. Candidates that pass verification but have low value, or are produced in shadow mode, remain `pending_review`. Failed turns form separate failure Episodes, while
 cancelled turns remain evidence-only and cannot reach Dreamer or Skill Learner.
 Orphaned running jobs are requeued when the worker next starts.
+
+## Data, migration, and recovery
 
 Data lives in `$MUSELAB_ROOT/.muselab/memory/` by default and can be relocated
 with `MUSELAB_MEMORY_DIR`. Back up the whole directory after stopping the
@@ -54,6 +73,8 @@ Third-party generation uses its configured API key. For Claude authenticated
 through `claude login`, background generation creates a fresh one-turn SDK
 query with `tools=[]`, no MCP, and no Skills. It never borrows a live chat
 client or receives Agent tool authority.
+
+## Deployment verification
 
 On a deployment/test machine, run:
 

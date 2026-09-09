@@ -11,12 +11,13 @@
 
 ## Use
 
-- [Configure workspace CLAUDE.md](personalize-claude-md.md) — add optional durable project instructions
+- [Workbench controls](workbench-ui.md) — files and previews, sessions, task management, execution records, and interface settings
+- [Configure workspace CLAUDE.md](personalize-claude-md.md) — multiple workspaces, project context, and optional durable instructions
 - [Skills](skills.md) — what ships out of the box, and how to add your own
 - [Mobile (PWA)](mobile.md) — install to home screen, push notifications, HTTPS
 - [Terminal](terminal.md) — real PTY, terminal list, Profiles, and mobile controls
 - [Scheduled tasks](scheduler.md) — run a saved prompt on a cadence
-- [Long-term memory](memory.md) — Episodes, Dreamer/Verifier, hybrid recall, and reviewed Skills
+- [Long-term memory](memory.md) — dreaming, hybrid recall, source evidence tracebacks, and reviewed Skills
 
 ## Models
 
@@ -34,6 +35,7 @@ Implementation guides — start at [Architecture](architecture.md) for the map.
 - [Architecture](architecture.md) — directory map + how a request flows
 - [Session internals](backend-sessions.md) — index, sidecars, queue, fork,
   restart recovery
+- [UX reliability](ux-reliability.md) — submission receipts, cancellation boundaries, queues, and connection recovery
 - [Files API](backend-files.md) — every `/api/files/*` endpoint + `safe_resolve`
 - [Security model](backend-security.md) — auth, billing isolation, honest
   limitations

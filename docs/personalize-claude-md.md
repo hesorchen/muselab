@@ -10,6 +10,12 @@ The installer configures the primary workspace, login token, port, and model
 access. It collects no personal profile and creates no predefined directory
 structure.
 
+## Workspaces and project context
+
+A workspace is more than a location in the file browser: it is the project environment where the agent works. Project instructions, memory files, documentation, and Skills can retain conventions, established findings, and procedures for later tasks.
+
+Instructions and Skills follow the SDK's discovery rules; the agent reads ordinary documents and memory notes as needed. Registering a workspace does not load every file automatically. Project memory files are separate from MuseLab's [long-term memory](memory.md), which requires its own configuration and does not create isolated memory pools per workspace.
+
 ## How it is loaded
 
 - `MUSELAB_ROOT` selects the primary workspace.
@@ -84,8 +90,7 @@ Prefer concrete, executable guidance:
 
 Instructions belong to a directory, not to the muselab instance. A code
 repository, research collection, and operations dataset can be registered as
-separate workspaces with different `CLAUDE.md` files. Switching workspace moves
-the file tree, preview, terminals, and new-session `cwd` together.
+separate workspaces with different `CLAUDE.md` files. Switching workspaces changes the file tree, preview, and session view. New sessions use the selected directory; existing sessions and terminals retain their own working directories.
 
 The primary workspace also stores global state under `.muselab/`, so do not
 remove or move it casually even when most daily work happens elsewhere. See

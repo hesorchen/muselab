@@ -6,6 +6,13 @@ muselab can run a saved prompt on a schedule. The scheduler lives in the backend
 
 Typical uses include periodic note cleanup, recurring reports, and external-state checks. Scheduled prompts run unattended, so save only prompts you are comfortable executing automatically.
 
+## How SDK-native Cron differs
+
+- **Application schedules**: Configured and persisted in the workbench, then dispatched by the MuseLab backend. Plans remain available after a service restart.
+- **SDK-native Cron**: Created by the agent in a CLI runtime that supports the tool. Jobs exist only for that runtime's lifetime; they are not retained when it ends or automatically converted into application schedules.
+
+Use application schedules for plans that must survive a session runtime ending or a service restart. The following sections describe the application scheduler's persistence, schedule types, and configuration.
+
 ## Persistence and notifications
 
 - Tasks, the latest 200 history rows, and the unread count are stored in `$MUSELAB_ROOT/.muselab/scheduler.json`.

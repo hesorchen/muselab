@@ -119,6 +119,12 @@ ssh -L 8765:127.0.0.1:8765 your-vps-user@your-vps-host
 
 Or use [Tailscale](https://tailscale.com) — same effect, no terminal.
 
+### Deployment
+
+muselab is designed for single-user self-hosting. The agent and terminal run with the service account's system permissions; workspaces do not provide OS-level isolation. Remote access should use an SSH tunnel or HTTPS with additional access control. See the [Security policy](../SECURITY.md) and [Security model](backend-security.md).
+
+Working files and application state are stored on the deployment machine. When cloud models, embeddings, or remote vector stores are used, relevant data is sent to those services. See [Data & backup](data-and-backup.md) for backup and recovery procedures.
+
 ## 3. Verify
 
 ```bash
@@ -128,6 +134,16 @@ bash scripts/doctor.sh        # Linux / macOS / WSL2
 `doctor` checks every layer (uv / claude CLI / `.env` / service / HTTP /
 token / provider keys) and gives specific guidance on any failure. Run it
 when something appears to be wrong.
+
+### Your first task
+
+After signing in and configuring a model, send a simple message and open a file to check its preview. Then select a project workspace and try a complete task:
+
+> "Inspect the latest changes in this project, find why the tests became slower, fix the cause, run verification, and write the result to `docs/performance-note.md`."
+
+This kind of task involves reading code and Git diffs, running targeted tests, editing files, and verifying changes. Expand tool records and code diffs to inspect the work. Open the generated note in the preview pane, or use a real terminal to check the result independently.
+
+Code, research collections, and knowledge bases can all be workspaces; no fixed directory structure is required. See [Configure workspace CLAUDE.md](personalize-claude-md.md) for project context and [Workbench controls](workbench-ui.md) for file, session, and task operations.
 
 ## Auto-start after reboot?
 

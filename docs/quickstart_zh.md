@@ -108,6 +108,12 @@ ssh -L 8765:127.0.0.1:8765 your-vps-user@your-vps-host
 
 或使用 [Tailscale](https://tailscale.com)——效果相同，无需命令行操作。
 
+### 部署说明
+
+muselab 面向单用户自托管场景。Agent 和终端使用服务账号的系统权限，多工作区不提供操作系统级隔离。远程访问应使用 SSH 隧道，或配置 HTTPS 与额外访问控制，详见[安全策略](../SECURITY.md)和[安全模型](backend-security_zh.md)。
+
+工作文件与应用状态保存在部署机器上；使用云端模型、Embedding 或远程向量库时，相关数据会发送至所配置的服务。备份与恢复方法见[数据与备份](data-and-backup_zh.md)。
+
 ## 3. 验证
 
 ```bash
@@ -115,6 +121,16 @@ bash scripts/doctor.sh        # Linux / macOS / WSL2
 ```
 
 `doctor` 会逐项检查（uv / claude CLI / `.env` / 服务状态 / HTTP / token / 模型密钥），出现故障时给出具体建议。
+
+### 第一个任务
+
+登录并配置模型后，先发送一条简单消息，再打开一个文件确认预览正常。然后选择项目所在的工作区，尝试一个完整任务：
+
+> 「检查这个项目最近的改动，找出测试变慢的原因，修复后跑验证，并把结论写到 `docs/performance-note.md`。」
+
+这类任务涉及读取代码与 Git diff、运行定向测试、修改文件和复验。执行过程中可以展开工具记录与代码差异；生成的说明文档可以直接在预览区打开，也可以通过真实终端独立复查。
+
+代码、研究资料或知识库都可以作为工作区，不要求固定目录结构。工作区的项目上下文见[配置工作区 CLAUDE.md](personalize-claude-md_zh.md)，文件、会话与任务操作见[工作台操作](workbench-ui_zh.md)。
 
 ## 重启后会自启动吗？
 

@@ -10,11 +10,41 @@ Drafts stay in this page's memory. This feature never writes API keys into local
 
 Conversation defaults and API keys use the footer Save button. Provider editors, MCP, Hooks and the memory engine retain their own Save or Add actions. Saving one section does not submit unrelated configuration. For defaults, API keys, provider edits and memory engine configuration, changes made while their save request is pending remain unsaved drafts.
 
+## Interface preferences
+
+Desktop browsers and the mobile PWA access the same working files and session state. The interface supports light, dark, and eye-care modes, a custom accent color, and English/Chinese switching without a refresh. Some layout and display preferences stay in the current browser rather than syncing across devices. See [Mobile PWA](mobile.md) for installation and notification setup.
+
 ## File and conversation controls
 
 More tools in the conversation header contains Task delivery and environment, Skills, MCP, image generation, scheduled tasks and Reload. The command palette retains its shortcut and search entry.
 
 The empty preview offers search, creation and upload actions. On desktop, Hide preview focuses the conversation. Existing layout preferences are preserved across startup.
+
+- **File management**: Drag-and-drop uploads, progress indicators, fuzzy search, rename, and trash. File references retain their source workspace; switching workspaces does not change their targets.
+- **Editing and previewing**: Markdown editing and split preview, find-in-preview, zoom, reading-position restoration, and retained live HTML page state.
+- **Global search**: Search file names, file contents, sessions, message history, and common actions from one place.
+- **Real terminals**: Create, rename, and switch PTY terminals. Each remains bound to its original working directory. See [Terminal](terminal.md) for Profiles and mobile controls.
+
+## Continuous session workflows
+
+Session tabs support background execution. Switching tabs does not interrupt replies in other sessions. Messages submitted during execution can enter a persistent queue for ordered processing. See [UX reliability](ux-reliability.md) for submission receipts, deduplication, cancellation, and connection recovery.
+
+- **Session forks**: Use “Fork from here” to retain history through the selected point and continue in a new session; the source remains unchanged.
+- **Last-turn retries**: Use “Retry the last turn in a new branch” in the turn controls to resend the last request in a new branch rather than overwrite the original reply. Wait for current and background tasks to finish. Turns with attachments require reattaching the files before sending.
+
+Workspace switching changes the current view and the default directory for new sessions. Existing sessions and terminals retain their own working directories. See [Workspace instructions](personalize-claude-md.md) for context and directory configuration.
+
+## Global task management
+
+The global task center shows task states across sessions, including running, failed, and completed tasks awaiting review. Background tasks, Monitor, and activity records help track progress and results; return to the owning session for the full execution history.
+
+See [Scheduled tasks](scheduler.md) for scheduled execution. With Web Push configured, task completion can trigger notifications; setup is covered in [Mobile PWA](mobile.md).
+
+## Execution records and configuration
+
+Sessions display the thinking blocks, tool calls and results, code diffs, nested subagent timelines, and Hook status supplied by the runtime. Context usage, per-model usage, and turn duration help inspect each turn. Available records depend on the selected model and runtime.
+
+Settings provides model and Hook configuration, with separate entry points for memory management and service maintenance. See [Providers](providers.md) for model setup, and [Skills](skills.md) and [Configuration](configuration.md) for extensions.
 
 ## Annotating HTML elements
 
