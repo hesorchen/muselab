@@ -211,15 +211,17 @@ class _MemoryStoreActor:
     spreads related operations across the shared executor, where cancellation
     and scheduling can reorder them.
 
-    This actor gives each engine one FIFO database lane. Once submitted, an
-    operation is shielded from coroutine cancellation: SQLite cannot cancel a
+    Each actor owns a FIFO database lane. Write operations are shielded from
+    coroutine cancellation; the separate read actor can discard queued reads.
+    A running operation is allowed to finish: SQLite cannot cancel a
     running statement safely, so the transaction is allowed to finish and the
     next operation observes its committed state. close appends a barrier,
     drains every accepted operation, then joins the owned thread.
     """
 
-    def __init__(self, resolve_store: Callable[[], MemoryStore]):
+    def __init__(self, resolve_store: Callable[[], MemoryStore], *, cancel_pending: bool = False):
         self._resolve_store = resolve_store
+        self._cancel_pending = cancel_pending
         self._executor: ThreadPoolExecutor | None = None
         self._state_lock = threading.Lock()
         self._closed = False
@@ -247,7 +249,12 @@ class _MemoryStoreActor:
         job = self._submit(operation)
         # Cancelling the asyncio waiter must not cancel or overtake a SQLite
         # transaction already queued on the actor.
-        return await asyncio.shield(asyncio.wrap_future(job))
+        try:
+            return await asyncio.shield(asyncio.wrap_future(job))
+        except asyncio.CancelledError:
+            if self._cancel_pending:
+                job.cancel()  # A read that has not started is no longer useful.
+            raise
 
     async def close(self) -> None:
         with self._state_lock:
@@ -278,6 +285,9 @@ class MemoryEngine:
         self._store: MemoryStore | None = store
         self._store_pinned = store is not None
         self._store_actor = _MemoryStoreActor(self._resolve_store)
+        self._recall_store: MemoryStore | None = None
+        self._recall_store_actor = _MemoryStoreActor(
+            self._resolve_recall_store, cancel_pending=True)
         self._workers: set[asyncio.Task] = set()
         self._telemetry_tasks: set[asyncio.Task] = set()
         self._closing = False
@@ -302,6 +312,15 @@ class MemoryEngine:
                 not self._store_pinned and self._store.path != path):
             self._store = MemoryStore(path)
         return self._store
+
+    def _resolve_recall_store(self) -> MemoryStore:
+        path = self._store.path if self._store_pinned else database_path()
+        if self._recall_store is None or self._recall_store.path != path:
+            self._recall_store = MemoryStore(path, read_only=True)
+        return self._recall_store
+
+    async def _recall_store_call(self, operation: Callable[[MemoryStore], _T]) -> _T:
+        return await self._recall_store_actor.call(operation)
 
     async def _store_call(self, operation: Callable[[MemoryStore], _T]) -> _T:
         return await self._store_actor.call(operation)
@@ -340,6 +359,7 @@ class MemoryEngine:
     def start(self) -> None:
         self._closing = False
         self._store_actor.reopen()
+        self._recall_store_actor.reopen()
         if (os.environ.get("MUSELAB_MEMORY_WORKER_DISABLED") == "1"
                 or not self.enabled() or self._workers):
             return
@@ -437,6 +457,7 @@ class MemoryEngine:
         await self._drain_telemetry(timeout=min(timeout, 5.0))
         if close_store:
             await self._store_actor.close()
+            await self._recall_store_actor.close()
 
     async def record_turn(self, session_id: str, model: str, user_text: str,
                           assistant_text: str, *, outcome: str = "success",
@@ -1297,13 +1318,78 @@ class MemoryEngine:
             await self._store_call(mark_pending)
 
     async def recall(self, query: str, session_id: str) -> list[dict]:
+        started = time.perf_counter()
         cfg = self.config()
+        deadline = started + cfg.retrieval.soft_timeout_ms / 1000
         query = str(query).strip()[:8000]
+        self._recall_trace.pop(session_id, None)
         if cfg.mode != "active" or not query:
             return []
-        recent = await self._store_call(lambda store: store.recent_evidence(
-            cfg.owner_id, session_id, role="user", limit=2
-        ))
+        stages = {name: "skipped" for name in
+                  ("recent", "dense", "lexical", "hydrate", "rerank")}
+        result: list[dict] = []
+        cancelled = False
+        failed = False
+
+        async def stage(name, operation, end=None):
+            try:
+                remaining = (deadline if end is None else end) - time.perf_counter()
+                if remaining <= 0:
+                    raise TimeoutError
+                async with asyncio.timeout(remaining):
+                    value = await operation()
+                stages[name] = "ok"
+                return value
+            except TimeoutError:
+                stages[name] = "timeout"
+            except asyncio.CancelledError:
+                stages[name] = "timeout"
+                raise
+            except Exception as exc:
+                stages[name] = "error"
+                _, failure = classify_memory_failure(exc)
+                log.debug("recall stage=%s category=%s exception_class=%s",
+                          name, failure["category"], failure["exception_class"])
+            return []
+
+        try:
+            recent = await stage("recent", lambda: self._recall_store_call(
+                lambda store: store.recent_evidence(
+                    cfg.owner_id, session_id, role="user", limit=2)),
+                min(deadline, started + min(0.2, cfg.retrieval.soft_timeout_ms / 5000)))
+            result = await self._recall_candidates(
+                cfg, query, recent, deadline, stages, stage)
+            return result
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
+        except Exception:
+            failed = True
+            raise
+        finally:
+            degraded = any(value in ("timeout", "error") for value in stages.values())
+            status = ("timeout" if cancelled else "error" if failed else
+                      "partial" if result and degraded else
+                      "timeout" if "timeout" in stages.values() else
+                      "error" if degraded else "ok")
+            latency = (time.perf_counter() - started) * 1000
+            recall_id = MemoryStore.new_recall_id()
+            self._schedule_recall_telemetry(
+                recall_id=recall_id, owner_id=cfg.owner_id, session_id=session_id,
+                query=query, results=result, latency_ms=latency, status=status)
+            fields = {f"{name}_status": value for name, value in stages.items()}
+            self._recall_trace[session_id] = {
+                "id": recall_id, "count": len(result), "latency_ms": round(latency, 1),
+                "status": status, **fields,
+                "items": [{"id": item["id"], "kind": item["kind"],
+                           "content": item["content"], "score": round(item["score"], 5),
+                           "sources": item.get("sources", [])} for item in result]}
+            perf_event("memory.recall_finish", recall_id=recall_id,
+                       session=obs.short_id(session_id) or "none",
+                       duration_ms=round(latency, 1), count=len(result),
+                       status=status, **fields)
+
+    async def _recall_candidates(self, cfg, query, recent, deadline, stages, stage):
         prior = [str(item.get("content", ""))[:1000] for item in recent
                  if item.get("content")]
         # Bound what goes to the embedder. Local CPU BGE-M3 latency scales
@@ -1313,8 +1399,6 @@ class MemoryEngine:
         # recall matters most. The tail is kept because the current question
         # lives there; earlier turns only disambiguate it.
         retrieval_query = "\n".join([*prior, query])[-_RECALL_QUERY_CHARS:]
-        started = time.perf_counter()
-        deadline = started + cfg.retrieval.soft_timeout_ms / 1000
 
         async def dense() -> list[dict]:
             vector = (await EmbeddingProvider(cfg.embedding).embed([retrieval_query]))[0]
@@ -1323,40 +1407,15 @@ class MemoryEngine:
                 limit=cfg.retrieval.dense_candidates)
 
         async def lexical() -> list[dict]:
-            return await self._store_call(lambda store: store.lexical_search(
+            return await self._recall_store_call(lambda store: store.lexical_search(
                 cfg.owner_id, query, limit=cfg.retrieval.lexical_candidates
             ))
 
-        async def _bounded(channel):
-            """Give each channel its OWN budget against the shared deadline.
-
-            A single `asyncio.timeout` around `gather` cancels BOTH channels
-            the instant the slower one overruns, so a cold embedder (or a
-            down Qdrant) threw away the lexical hits that had already
-            returned in 5ms — hybrid recall degraded to *nothing* instead of
-            to lexical-only. Per-channel bounding keeps whichever channel
-            finished, which is the whole point of fail-soft fusion.
-            """
-            async with asyncio.timeout(max(0.001, deadline - time.perf_counter())):
-                return await channel()
-
-        status = "ok"
+        # Reserve time to hydrate a completed channel when its sibling stalls.
+        search_deadline = deadline - min(0.2, cfg.retrieval.soft_timeout_ms / 5000)
         dense_rows, lexical_rows = await asyncio.gather(
-            _bounded(dense), _bounded(lexical), return_exceptions=True)
-        if isinstance(dense_rows, Exception):
-            _, failure = classify_memory_failure(dense_rows)
-            log.debug(
-                "dense recall skipped category=%s exception_class=%s status=%s",
-                failure["category"], failure["exception_class"], failure.get("status"))
-            dense_rows, status = [], (
-                "timeout" if isinstance(dense_rows, TimeoutError) else "partial")
-        if isinstance(lexical_rows, Exception):
-            _, failure = classify_memory_failure(lexical_rows)
-            log.debug(
-                "lexical recall skipped category=%s exception_class=%s status=%s",
-                failure["category"], failure["exception_class"], failure.get("status"))
-            lexical_rows, status = [], (
-                "timeout" if isinstance(lexical_rows, TimeoutError) else "partial")
+            stage("dense", dense, search_deadline),
+            stage("lexical", lexical, search_deadline))
 
         fused: dict[str, dict] = {}
         for channel_rows in (dense_rows, lexical_rows):
@@ -1372,12 +1431,8 @@ class MemoryEngine:
         candidate_limit = max(cfg.retrieval.final_limit * 3, 12)
         candidate_rows = candidates[:candidate_limit]
         memory_ids = [candidate["id"] for candidate in candidate_rows]
-        memories = await self._observed_store_call(
-            "memory.recall_hydrate",
-            session_id,
-            lambda store: store.memories_with_stats_by_ids(
-                cfg.owner_id, memory_ids),
-        )
+        memories = await stage("hydrate", lambda: self._recall_store_call(
+            lambda store: store.memories_with_stats_by_ids(cfg.owner_id, memory_ids)))
         memory_by_id = {memory["id"]: memory for memory in memories}
         hydrated: list[dict] = []
         for candidate in candidate_rows:
@@ -1396,47 +1451,19 @@ class MemoryEngine:
             hydrated.append(candidate)
         hydrated.sort(key=lambda item: item["score"], reverse=True)
         if cfg.rerank.enabled and hydrated:
-            try:
-                remaining = deadline - time.perf_counter()
-                if remaining <= 0:
-                    raise TimeoutError
-                async with asyncio.timeout(remaining):
-                    reranked = await Reranker(cfg.rerank).rerank(
-                        retrieval_query, [item["content"] for item in hydrated])
+            reranked = await stage("rerank", lambda: Reranker(cfg.rerank).rerank(
+                retrieval_query, [item["content"] for item in hydrated]))
+            if stages["rerank"] == "ok":
                 by_index = {index: score for index, score in reranked}
                 for index, item in enumerate(hydrated):
                     item["score"] = by_index.get(index, 0)
                     item["channels"].append("rerank")
                 hydrated.sort(key=lambda item: item["score"], reverse=True)
-            except TimeoutError:
-                status = "timeout"
-            except Exception as exc:
-                _, failure = classify_memory_failure(exc)
-                log.debug(
-                    "rerank skipped category=%s exception_class=%s status=%s",
-                    failure["category"], failure["exception_class"],
-                    failure.get("status"))
-                status = "partial"
-        result = hydrated[:cfg.retrieval.final_limit]
-        latency = (time.perf_counter() - started) * 1000
-        recall_id = MemoryStore.new_recall_id()
-        self._schedule_recall_telemetry(
-            recall_id=recall_id,
-            owner_id=cfg.owner_id,
-            session_id=session_id,
-            query=retrieval_query,
-            results=result,
-            latency_ms=latency,
-            status=status,
-        )
-        trace = {"id": recall_id, "count": len(result), "latency_ms": round(latency, 1),
-                 "status": status,
-                 "items": [{"id": item["id"], "kind": item["kind"],
-                            "content": item["content"], "score": round(item["score"], 5),
-                            "sources": item.get("sources", [])}
-                           for item in result]}
-        self._recall_trace[session_id] = trace
-        return result
+        return hydrated[:cfg.retrieval.final_limit]
+
+    def peek_recall_trace(self, session_id: str) -> dict | None:
+        """Share the live receipt with the hook without consuming the SSE receipt."""
+        return self._recall_trace.get(session_id)
 
     def pop_recall_trace(self, session_id: str) -> dict | None:
         return self._recall_trace.pop(session_id, None)

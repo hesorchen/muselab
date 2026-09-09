@@ -527,7 +527,7 @@ def test_hybrid_recall_fuses_channels_and_exposes_trace(tmp_path, monkeypatch):
         authority="confirmed", confidence=1.0)
     event_loop_thread = threading.get_ident()
     io_threads = {}
-    original_hydrate = instance.store.memories_by_ids
+    original_hydrate = instance._resolve_recall_store().memories_by_ids
     original_log = instance.store.log_recall
 
     def tracked_hydrate(memory_ids):
@@ -538,7 +538,7 @@ def test_hybrid_recall_fuses_channels_and_exposes_trace(tmp_path, monkeypatch):
         io_threads["log"] = threading.get_ident()
         return original_log(*args, **kwargs)
 
-    monkeypatch.setattr(instance.store, "memories_by_ids", tracked_hydrate)
+    monkeypatch.setattr(instance._resolve_recall_store(), "memories_by_ids", tracked_hydrate)
     monkeypatch.setattr(instance.store, "log_recall", tracked_log)
 
     class FakeEmbedding:
@@ -940,3 +940,213 @@ def test_reindex_all_queues_one_batch_job(tmp_path, monkeypatch):
     assert len(jobs) == 1
     assert jobs[0]["kind"] == "reindex_memories"
     assert len(jobs[0]["payload"]["memory_ids"]) == 5
+
+
+@pytest.fixture
+def recall_case(tmp_path, monkeypatch):
+    from backend import memory_engine as module
+    instance = module.MemoryEngine(module.MemoryStore(tmp_path / "registry.sqlite3"))
+    cfg = _config()
+    cfg.retrieval.soft_timeout_ms = 400
+    monkeypatch.setattr(instance, "config", lambda: cfg)
+    memory = instance.store.create_memory(
+        "default", "preference", "喜欢清淡饮食，晚餐少油少盐",
+        authority="confirmed", confidence=1.0)
+
+    class Embedding:
+        def __init__(self, config):
+            pass
+
+        async def embed(self, texts):
+            return [[1.0, 0.0, 0.0]]
+
+    class Vector:
+        async def search(self, *args, **kwargs):
+            return [{"id": memory["id"], "channel": "dense"}]
+
+    monkeypatch.setattr(module, "EmbeddingProvider", Embedding)
+    vector = Vector()
+    monkeypatch.setattr(module, "vector_store", lambda config: vector)
+    return instance, cfg, memory, vector
+
+
+def test_recall_reads_wal_while_writer_holds_transaction(recall_case):
+    instance, cfg, memory, _ = recall_case
+    entered = threading.Event()
+
+    def slow_write(store):
+        with store._lock, store._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            entered.set()
+            time.sleep(3.1)
+            conn.commit()
+
+    async def scenario():
+        writer = asyncio.create_task(instance._store_call(slow_write))
+        await asyncio.to_thread(entered.wait, 1)
+        assert entered.is_set()
+        started = time.perf_counter()
+        rows = await instance.recall("清淡饮食", "writer-busy")
+        assert rows[0]["id"] == memory["id"]
+        assert time.perf_counter() - started < 0.4
+        assert not writer.done()
+        await writer
+        await instance.stop()
+
+    _run(scenario())
+
+
+@pytest.mark.parametrize("failure", ["dense_error", "dense_timeout", "lexical_error"])
+def test_recall_channel_failover_keeps_hydrated_results(recall_case, monkeypatch, failure):
+    instance, _, memory, vector = recall_case
+
+    async def broken_dense(*args, **kwargs):
+        if failure == "dense_timeout":
+            await asyncio.sleep(2)
+        raise httpx.ReadTimeout("unavailable")
+
+    def broken_lexical(*args, **kwargs):
+        raise sqlite3.OperationalError("unavailable")
+
+    if failure.startswith("dense"):
+        monkeypatch.setattr(vector, "search", broken_dense)
+    else:
+        monkeypatch.setattr(instance._resolve_recall_store(), "lexical_search", broken_lexical)
+
+    async def scenario():
+        # Exact Chinese lexical matching, or a synonym query answered by the
+        # dense fixture when lexical is unavailable.
+        query = "清淡饮食" if failure.startswith("dense") else "晚饭想吃低脂低钠的菜"
+        rows = await instance.recall(query, "failover")
+        trace = instance.pop_recall_trace("failover")
+        assert rows[0]["id"] == memory["id"]
+        assert trace["count"] == 1
+        assert trace["status"] == "partial"
+        assert trace["hydrate_status"] == "ok"
+        await instance.stop()
+
+    _run(scenario())
+
+
+@pytest.mark.parametrize("slow_stage", ["recent", "hydrate"])
+def test_recall_database_wait_is_inside_entry_deadline(recall_case, monkeypatch, slow_stage):
+    instance, cfg, _, _ = recall_case
+    cfg.retrieval.soft_timeout_ms = 100
+    store = instance._resolve_recall_store()
+    method = "recent_evidence" if slow_stage == "recent" else "memories_with_stats_by_ids"
+    original = getattr(store, method)
+
+    def slow(*args, **kwargs):
+        time.sleep(0.25)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(store, method, slow)
+
+    async def scenario():
+        started = time.perf_counter()
+        assert await instance.recall("清淡饮食", "db-timeout") == []
+        elapsed = time.perf_counter() - started
+        trace = instance.pop_recall_trace("db-timeout")
+        assert elapsed < 0.2
+        assert trace[f"{slow_stage}_status"] == "timeout"
+        assert trace["status"] == "timeout"
+        assert trace["latency_ms"] < 200
+        await instance.stop()
+
+    _run(scenario())
+
+
+def test_rerank_timeout_preserves_results_and_hook_receipt(recall_case, monkeypatch):
+    from backend import memory_client as client, memory_engine as module
+    instance, cfg, memory, _ = recall_case
+    cfg.rerank.enabled = True
+    events = []
+
+    class SlowReranker:
+        def __init__(self, config):
+            pass
+
+        async def rerank(self, *args):
+            await asyncio.sleep(2)
+
+    monkeypatch.setattr(module, "Reranker", SlowReranker)
+    monkeypatch.setattr(module, "engine", instance)
+    monkeypatch.setattr(client, "native_enabled", lambda: True)
+    monkeypatch.setattr(module, "perf_event", lambda event, **fields: events.append((event, fields)))
+    monkeypatch.setattr(client, "perf_event", lambda event, **fields: events.append((event, fields)))
+
+    async def scenario():
+        response = await client.build_recall_hook("receipt")(
+            {"prompt": "晚餐怎么安排"}, None, None)
+        assert client._sanitize(memory["content"]) in response["hookSpecificOutput"]["additionalContext"]
+        trace = client.pop_recall_trace("receipt")
+        assert trace["count"] == 1 and trace["injected"] is True
+        assert trace["status"] == "partial"
+        assert trace["rerank_status"] == "timeout"
+        finish = next(fields for event, fields in events if event == "memory.recall_finish")
+        hook = next(fields for event, fields in events if event == "memory.recall_hook_finish")
+        assert finish["recall_id"] == hook["recall_id"] == trace["id"]
+        assert finish["count"] == hook["count"] == 1
+        assert memory["content"] not in str(events)
+        await instance.stop()
+
+    _run(scenario())
+
+
+def test_recall_hook_outer_timeout_records_empty_receipt(recall_case, monkeypatch):
+    from backend import memory_client as client, memory_engine as module
+    instance, _, _, vector = recall_case
+    monkeypatch.setattr(module, "engine", instance)
+    monkeypatch.setattr(client, "native_enabled", lambda: True)
+    monkeypatch.setattr(client, "_RECALL_DEADLINE", 0.02)
+
+    async def slow(*args, **kwargs):
+        await asyncio.sleep(2)
+
+    monkeypatch.setattr(vector, "search", slow)
+
+    async def scenario():
+        result = await client.build_recall_hook("outer-timeout")(
+            {"prompt": "晚餐"}, None, None)
+        assert result == {}
+        trace = instance.pop_recall_trace("outer-timeout")
+        assert trace["status"] == "timeout"
+        assert trace["count"] == 0 and trace["injected"] is False
+        assert trace["dense_status"] == "timeout"
+        await instance.stop()
+
+    _run(scenario())
+
+
+def test_read_lane_cancels_expired_queued_work(recall_case):
+    instance, _, _, _ = recall_case
+    entered = threading.Event()
+    release = threading.Event()
+    executed = []
+
+    def blocking_read(store):
+        entered.set()
+        release.wait(1)
+
+    async def scenario():
+        first = asyncio.create_task(instance._recall_store_call(blocking_read))
+        await asyncio.to_thread(entered.wait, 1)
+        pending = asyncio.create_task(instance._recall_store_call(
+            lambda store: executed.append(True)))
+        await asyncio.sleep(0.01)
+        pending.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+        release.set()
+        await first
+        await instance.stop()
+        assert not executed
+
+    _run(scenario())
+
+
+def test_recall_budget_fits_facade_and_watchdog():
+    from backend.memory_client import _RECALL_DEADLINE, RECALL_HOOK_TIMEOUT
+    cfg = _config()
+    cfg.retrieval.soft_timeout_ms = 5000
+    assert cfg.retrieval.soft_timeout_ms / 1000 < _RECALL_DEADLINE < RECALL_HOOK_TIMEOUT

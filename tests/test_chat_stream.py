@@ -8647,3 +8647,69 @@ async def test_shutdown_timeout_records_cleanup_intent_for_slow_prepare(
     assert aid not in chat._staged_attachment_claims
     chat._drain_attachment_cleanup_intents()
     assert not intent_path.exists()
+
+
+def test_native_recall_hook_receipt_reaches_sse_done(
+        stream_env, client, monkeypatch, tmp_path):
+    from backend import memory_engine as module
+    from tests.test_memory_engine import _config
+    chat_mod = stream_env
+    sid = _make_session(client)
+    instance = module.MemoryEngine(module.MemoryStore(tmp_path / "recall.sqlite3"))
+    cfg = _config()
+    monkeypatch.setattr(instance, "config", lambda: cfg)
+    memory = instance.store.create_memory(
+        "default", "preference", "晚餐喜欢清淡饮食", authority="confirmed", confidence=1)
+    monkeypatch.setattr(module, "engine", instance)
+    monkeypatch.setattr(chat_mod.mem0, "native_enabled", lambda: True)
+    events = []
+    monkeypatch.setattr(module, "perf_event", lambda event, **fields: events.append((event, fields)))
+    monkeypatch.setattr(chat_mod.mem0, "perf_event", lambda event, **fields: events.append((event, fields)))
+
+    class Embedding:
+        def __init__(self, config):
+            pass
+
+        async def embed(self, texts):
+            return [[1., 0., 0.]]
+
+    class Vector:
+        async def search(self, *args, **kwargs):
+            return [{"id": memory["id"], "channel": "dense"}]
+
+    monkeypatch.setattr(module, "EmbeddingProvider", Embedding)
+    monkeypatch.setattr(module, "vector_store", lambda config: Vector())
+    receipt = {}
+
+    class HookClient(_FakeStreamClient):
+        async def query(self, prompt_or_gen):
+            await super().query(prompt_or_gen)
+            response = await chat_mod.mem0.build_recall_hook(sid)(
+                {"prompt": "清淡饮食"}, None, None)
+            assert "晚餐喜欢清淡饮食" in response["hookSpecificOutput"]["additionalContext"]
+            receipt.update(instance._recall_trace[sid])
+
+    async def fake_get_client(*args, **kwargs):
+        return HookClient([
+            AssistantMessage(content=[TextBlock(text="建议晚餐少油少盐。")],
+                             model="claude-sonnet-4-6", usage={}),
+            ResultMessage(subtype="success", duration_ms=20, duration_api_ms=10,
+                          is_error=False, num_turns=1, session_id=sid,
+                          total_cost_usd=0., usage={}),
+        ])
+
+    monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
+    response = client.get(
+        f"/api/chat/stream?token={TEST_TOKEN}&session_id={sid}"
+        "&prompt=dinner&model=claude-sonnet-4-6")
+    assert response.status_code == 200
+    done = next(json.loads(data) for event, data in _parse_sse(response.text)
+                if event == "done")
+    assert done["memory_recall"] == receipt
+    assert receipt["count"] == 1 and receipt["injected"] is True
+    finish = next(fields for event, fields in events if event == "memory.recall_finish")
+    assert finish["recall_id"] == receipt["id"] and finish["count"] == 1
+    persisted = chat_mod._persistable_memory_recall(receipt)
+    assert persisted["injected"] is True
+    assert "content" not in str(persisted)
+    asyncio.run(instance.stop())

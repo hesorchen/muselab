@@ -7668,6 +7668,10 @@ def test_tool_result_tail_done_metadata_renders_footer_before_canonical_reload(
     )
     recall_trigger = footer.locator(".memory-recall-trace")
     expect(recall_trigger).to_be_visible()
+    expected_recall = _app_eval(
+        page, "return app.lang === 'zh' ? '使用了 1 条记忆' : 'Used 1 memories';"
+    )
+    expect(recall_trigger).to_contain_text(expected_recall)
     expect(
         footer.locator(".turn-fork-btn:not(.turn-retry-btn)")
     ).to_be_visible()

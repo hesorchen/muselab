@@ -226,12 +226,14 @@ def _fts_text(content: str) -> str:
 
 
 class MemoryStore:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, *, read_only: bool = False):
         self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._read_only = read_only
         self._lock = threading.RLock()
-        self._init()
-        self._harden_permissions()
+        if not read_only:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self._init()
+            self._harden_permissions()
 
     def _harden_permissions(self) -> None:
         """Restrict the registry to the owning user.
@@ -259,10 +261,17 @@ class MemoryStore:
                     log.debug("could not chmod %s: %s", sibling, exc)
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.path, timeout=10, isolation_level=None)
+        # Recall must never run schema migration or wait ten seconds for a writer.
+        target = self.path.absolute().as_uri() + "?mode=ro" if self._read_only else self.path
+        conn = sqlite3.connect(target, uri=self._read_only,
+                               timeout=0.05 if self._read_only else 10,
+                               isolation_level=None)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys=ON")
-        conn.execute("PRAGMA busy_timeout=10000")
+        conn.execute("PRAGMA busy_timeout=50" if self._read_only
+                     else "PRAGMA busy_timeout=10000")
+        if self._read_only:
+            conn.execute("PRAGMA query_only=ON")
         return conn
 
     @contextmanager

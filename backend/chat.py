@@ -6180,7 +6180,9 @@ def _persistable_memory_recall(trace: Any) -> dict | None:
         return None
     out = {
         key: trace.get(key)
-        for key in ("id", "count", "latency_ms", "status")
+        for key in ("id", "count", "latency_ms", "status", "injected",
+                    "matched_count", "recent_status", "dense_status",
+                    "lexical_status", "hydrate_status", "rerank_status")
         if trace.get(key) is not None
     }
     items = []

@@ -23,6 +23,7 @@ from urllib.parse import urlsplit, urlunsplit
 import httpx
 
 from .settings import MEM0_DAEMON_URL
+from .observability import perf_event, short_id
 
 log = logging.getLogger("muselab.mem0")
 
@@ -41,8 +42,8 @@ _USER_ID = "muselab"
 # converts a slow recall into empty additionalContext. The outer allowance must
 # also absorb event-loop stalls and the sibling runtime-handoff context hook;
 # a 0.5s margin proved insufficient under normal service load.
-_RECALL_DEADLINE = 3.0
-_SEARCH_TIMEOUT = _RECALL_DEADLINE
+_RECALL_DEADLINE = 8.0
+_SEARCH_TIMEOUT = 3.0  # Preserve the legacy daemon request budget.
 RECALL_HOOK_TIMEOUT = 10.0
 _STORE_TIMEOUT = 10.0
 _SEARCH_LIMIT = 5
@@ -318,10 +319,19 @@ async def search_context(query: str, session_id: str) -> str:
         try:
             from .memory_engine import engine
             rows = await engine.recall(query, session_id)
-            return _render_block([
-                clean for row in rows
-                if (clean := _sanitize(str(row.get("content", ""))))
-            ], max_chars=engine.config().retrieval.max_context_chars)
+            clean_rows = [(row, clean) for row in rows
+                          if (clean := _sanitize(str(row.get("content", ""))))]
+            block, count = _render_block_with_count(
+                [clean for row, clean in clean_rows],
+                max_chars=engine.config().retrieval.max_context_chars)
+            trace = engine.peek_recall_trace(session_id)
+            if trace is not None:
+                trace["matched_count"] = trace["count"]
+                trace["count"] = count
+                injected_ids = {row["id"] for row, clean in clean_rows[:count]}
+                trace["items"] = [item for item in trace.get("items", [])
+                                  if item["id"] in injected_ids]
+            return block
         except Exception as exc:
             _log_failure(logging.DEBUG, "native memory search skipped", exc)
             return ""
@@ -363,12 +373,34 @@ def build_recall_hook(session_id: str):
     """
     async def recall_hook(input_data, _tool_use_id, _context):
         prompt = input_data.get("prompt", "") if isinstance(input_data, dict) else ""
+        started = time.perf_counter()
+        block = ""
+        status = "empty"
+        perf_event("memory.recall_hook_start", session=short_id(session_id) or "none")
         try:
             async with asyncio.timeout(_RECALL_DEADLINE):
                 block = await search_context(str(prompt), session_id)
+            status = "ok" if block else "empty"
         except Exception as exc:
+            status = "timeout" if isinstance(exc, TimeoutError) else "error"
             _log_failure(logging.DEBUG, "memory recall hook skipped", exc)
-            return {}
+        finally:
+            if native_enabled():
+                from .memory_engine import engine
+                trace = engine.peek_recall_trace(session_id)
+            else:
+                trace = _legacy_recall_traces.get(session_id)
+            if trace is not None:
+                trace["injected"] = bool(block)
+                if not block:
+                    trace["count"] = 0
+                    trace["items"] = []
+            perf_event("memory.recall_hook_finish",
+                       session=short_id(session_id) or "none",
+                       recall_id=(trace or {}).get("id", "none"),
+                       count=(trace or {}).get("count", 0), injected=bool(block),
+                       status=status, duration_ms=round(
+                           (time.perf_counter() - started) * 1000, 1))
         if not block:
             return {}
         return {

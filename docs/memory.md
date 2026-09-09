@@ -70,3 +70,24 @@ Probe and begin in `shadow` mode, verify independent Episode provenance and
 review state, then switch to `active`. Confirm that recall traces are visible,
 provider outages remain fail-soft, and generated Skills remain inert until an
 explicit authenticated approval.
+
+### Recall latency and diagnostics
+
+Recall uses its own SQLite actor and read-only connections to the WAL registry.
+Background consolidation, job bookkeeping, and recall telemetry use the write
+actor. A recall read does not initialize or migrate the schema.
+
+The soft budget starts at recall entry and covers recent evidence, dense and
+lexical retrieval, hydration, and optional reranking. The configurable maximum
+is 5 seconds; the facade stops at 8 seconds, before the SDK's 10-second hook
+watchdog. Retrieval reserves a small part of its budget for hydration so that a
+stalled channel does not discard the other channel's completed hits. Reranking
+failure preserves hydrated results and reports partial success.
+
+Safe performance events `memory.recall_hook_start`, `memory.recall_finish`,
+and `memory.recall_hook_finish` report stage outcomes, elapsed time, counts,
+and whether context was injected, without query or memory text. The recall ID
+continues into `done.memory_recall`; the footer counts facts actually injected
+after sanitization and context limits. Persistent receipts keep IDs and stage
+diagnostics without duplicating memory contents. These diagnostics concern
+recall; generation-provider failures during consolidation remain separate.
