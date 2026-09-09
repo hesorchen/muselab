@@ -905,3 +905,38 @@ def test_csv_total_cache_reuses_signature_and_invalidates_on_write(
     assert changed.json()["total_rows"] == first_total + 1
     with files_module._CSV_TOTAL_CACHE_LOCK:
         assert files_module._CSV_TOTAL_CACHE[cache_key][1] > cached[1]
+
+
+def test_list_modified_sort_selects_before_truncation(client, auth, temp_root, monkeypatch):
+    import os
+    from backend import files
+    directory = temp_root / "modified-sort"
+    directory.mkdir()
+    for name, stamp in [("a.txt", 100), ("b.txt", 200), ("z.txt", 300)]:
+        path = directory / name
+        path.write_text(name, encoding="utf-8")
+        os.utime(path, (stamp, stamp))
+    monkeypatch.setattr(files, "MAX_LIST_ENTRIES", 2)
+    for mode, expected in [
+        ("mtime_desc", ["z.txt", "b.txt"]), ("mtime_asc", ["a.txt", "b.txt"]),
+    ]:
+        response = client.get("/api/files/list", params={"path":"modified-sort", "sort":mode}, headers=auth)
+        assert response.status_code == 200
+        assert [entry["name"] for entry in response.json()["entries"]] == expected
+        assert response.json()["truncated"] is True
+
+
+def test_upload_limits_match_server_enforcement(client, auth, temp_root, monkeypatch):
+    from backend import files
+    monkeypatch.setattr(files, "MAX_UPLOAD_BYTES", 1024)
+    assert client.get("/api/files/upload-limits", headers=auth).json() == {"max_file_bytes":1024}
+    exact = client.post("/api/files/upload", headers=auth,
+                        data={"path":""}, files={"file":("at-limit.bin", b"x" * 1024)})
+    assert exact.status_code == 200
+    assert (temp_root / "at-limit.bin").read_bytes() == b"x" * 1024
+    response = client.post("/api/files/upload", headers=auth,
+                           data={"path":""}, files={"file":("over-limit.bin", b"x" * 1025)})
+    assert response.status_code == 413
+    assert not (temp_root / "over-limit.bin").exists()
+    assert not list(temp_root.glob(".*.uploading"))
+    assert client.get("/api/files/upload-limits").status_code == 401

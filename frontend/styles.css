@@ -12555,3 +12555,20 @@ html[data-theme="light"] .hljs-built_in,
 html[data-theme="light"] .hljs-symbol,
 html[data-theme="eyecare"] .hljs-built_in,
 html[data-theme="eyecare"] .hljs-symbol { color: #9a3e00; }
+
+/* File metadata stays readable without squeezing long names into a date column. */
+.file-sort-bar { display:flex; align-items:center; gap:8px; padding:5px 10px; font-size:11px; color:var(--c-fg-3); }
+.file-sort-bar select { flex:1; min-width:0; color:var(--c-fg-1); background:var(--c-bg-1); border:1px solid var(--c-border); border-radius:4px; padding:4px; }
+.filelist li[role="treeitem"] { height:40px; min-height:40px; }
+.file-row-label { display:flex; flex:1; min-width:0; flex-direction:column; justify-content:center; gap:2px; }
+.filelist li .file-row-label .name { flex:none; line-height:16px; }
+.file-modified { font-size:10px; line-height:12px; color:var(--c-fg-3); font-variant-numeric:tabular-nums; white-space:nowrap; }
+
+.file-upload-items { list-style:none; padding:0; margin:6px 0 0; max-height:200px; overflow:auto; }
+.file-upload-item { padding:5px 0; border-top:1px solid var(--c-border); font-size:11px; }
+.file-upload-item-heading, .file-upload-item-state { display:flex; justify-content:space-between; gap:6px; }
+.file-upload-item-heading > span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; min-width:0; }
+.file-upload-item-state { color:var(--c-fg-3); font-size:10px; }
+.file-upload-item.failed .file-upload-item-state { color:var(--c-danger, #b34d3f); }
+.file-upload-item progress { display:block; width:100%; height:3px; margin-top:4px; }
+.file-upload-item small { display:block; color:var(--c-fg-3); overflow-wrap:anywhere; font-size:10px; }

@@ -471,8 +471,9 @@ function portal() {
     // directory context uploads and OS-file drops all feed the same batch.
     fileUploadProgress: {
       visible: false, known: false, percent: 0,
-      totalFiles: 0, completedFiles: 0, failedFiles: 0, activeFiles: 0,
+      totalFiles: 0, completedFiles: 0, failedFiles: 0, activeFiles: 0, items: [],
     },
+    _fileUploadLimitPromise: null,
     _fileUploadBatch: null,
     _fileUploadTransferSeq: 0,
     _fileUploadHideTimer: null,
@@ -1159,6 +1160,7 @@ function portal() {
     leftWidth: 340,
     previewWidth: 440,
     showHidden: false,
+    fileSort: "name",
     // ===== Trash =====
     // Files /delete moves into <ROOT>/.muselab-dustbin/ instead of unlink
     // (see backend/files.py). The trash UI lives as a docked icon at the
@@ -7207,6 +7209,7 @@ function portal() {
         leftOpen: this.leftOpen, previewOpen: this.previewOpen,
         leftWidth: this.leftWidth, previewWidth: this.previewWidth,
         showHidden: this.showHidden,
+        fileSort: this.fileSort,
         openFilesCollapsed: this.openFilesCollapsed,
         openFilesHeight: this.openFilesHeight,
         // Mobile-only: remember which of the 3 tabs (files / preview / chat)
@@ -7283,6 +7286,7 @@ function portal() {
         if (typeof p.previewWidth === "number") this.previewWidth = p.previewWidth;
         else if (typeof p.rightWidth === "number") this.previewWidth = p.rightWidth;
         if (typeof p.showHidden === "boolean") this.showHidden = p.showHidden;
+        if (["name", "mtime_desc", "mtime_asc"].includes(p.fileSort)) this.fileSort = p.fileSort;
         if (p.currentId) this.currentId = p.currentId;
         // The standalone key is authoritative. p.openTabIds is accepted only as
         // a one-time migration source for users upgrading from schema <= 9.
@@ -17193,18 +17197,24 @@ function portal() {
       file,
       { reportError = false, ownerWorkspace = "" } = {},
     ) {
-      const transfer = this._beginFileUploadTransfer(file);
+      ownerWorkspace = ownerWorkspace || this.fileWorkspacePath();
+      const transfer = this._beginFileUploadTransfer(file, dirPath, ownerWorkspace);
       let succeeded = false;
+      let failure = "";
       try {
-        const r = await this._uploadWorkspaceFile(dirPath, file, transfer);
+        const limit = await this._workspaceUploadLimit();
+        if (limit && file.size > limit) {
+          failure = this.lang === "zh"
+            ? "文件 " + this.fmtSize(file.size) + " 超过单文件 " + this.fmtSize(limit) + " 上限"
+            : "File " + this.fmtSize(file.size) + " exceeds the " + this.fmtSize(limit) + " per-file limit";
+          return false;
+        }
+        const r = await this._uploadWorkspaceFile(dirPath, file, transfer, ownerWorkspace);
         if (!r.ok) {
-          console.warn("[upload]", file.name, "failed:", r.status);
-          if (
-            reportError
-            && (!ownerWorkspace || this._workspaceIsCurrent(ownerWorkspace))
-          ) {
-            const detail = await r.text().catch(() => "");
-            this.errToast("upload", detail || `HTTP ${r.status}`);
+          const raw = await r.text().catch(() => "");
+          failure = this._workspaceUploadError(r.status, raw);
+          if (reportError && this._workspaceIsCurrent(ownerWorkspace)) {
+            this.errToast("upload", failure);
           }
           return false;
         }
@@ -17215,7 +17225,7 @@ function portal() {
           replaced_trash_id: data.replaced_trash_id || null,
         };
       } catch (e) {
-        console.warn("[upload]", file.name, "error:", e);
+        failure = this._workspaceUploadError(0, "");
         if (
           reportError
           && (!ownerWorkspace || this._workspaceIsCurrent(ownerWorkspace))
@@ -17224,7 +17234,7 @@ function portal() {
         }
         return false;
       } finally {
-        this._finishFileUploadTransfer(transfer, succeeded);
+        this._finishFileUploadTransfer(transfer, succeeded, failure);
       }
     },
     _prepareUploadOverwrite(dirPath, files) {
@@ -17248,6 +17258,10 @@ function portal() {
         .filter(r => r.status === "fulfilled" && r.value && r.value.path)
         .map(r => r.value);
       if (!uploaded.length) return;
+      await this.revealInTree(uploaded[0].path, {
+        mode: "background", highlight: true, ownerWorkspace,
+      });
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return;
       for (const item of uploaded) this._previewCacheDel(item.path);
       const replaced = uploaded.filter(item => item.replaced_trash_id).length;
       if (replaced) {
@@ -22723,6 +22737,8 @@ function portal() {
       this.childCache = Object.fromEntries(Object.entries(childCache).map(
         ([key, rows]) => [key, Array.isArray(rows) ? rows.map(row => ({ ...row })) : rows]));
       this.expanded = new Set(Array.isArray(cached.expanded) ? cached.expanded : []);
+      Object.assign(this, this._materializeFileSnapshot(
+        Object.values(this.childCache).flat().concat(this.visible), Array.from(this.expanded)));
       this._pendingExpanded = Array.from(this.expanded);
       if (cached.cursor != null) this._workspaceTreeCursors.set(ownerWorkspace, cached.cursor);
       this.treeError = "";
@@ -22823,6 +22839,28 @@ function portal() {
       }, this.WORKSPACE_TREE_PERSIST_DEBOUNCE_MS);
       this._workspaceTreeCacheTimers.set(ownerWorkspace, handle);
     },
+    _sortFileRows(rows) {
+      return rows.sort((a, b) => {
+        const directories = Number(!a.is_dir) - Number(!b.is_dir);
+        if (directories) return directories;
+        if (this.fileSort !== "name") {
+          const delta = (Number(a.mtime) || 0) - (Number(b.mtime) || 0);
+          if (delta) return this.fileSort === "mtime_asc" ? delta : -delta;
+        }
+        return String(a.name || a.path).localeCompare(String(b.name || b.path))
+          || String(a.path).localeCompare(String(b.path));
+      });
+    },
+    async setFileSort(value) {
+      if (!["name", "mtime_desc", "mtime_asc"].includes(value)) return;
+      this.fileSort = value;
+      this.savePrefs();
+      const entries = Object.values(this.childCache).flat().concat(this.visible);
+      Object.assign(this, this._materializeFileSnapshot(entries, Array.from(this.expanded)));
+      this._scheduleFileTreeViewportSync(true);
+      // Re-fetch truncated directory listings using the selected order too.
+      await this.reloadTree();
+    },
     _materializeFileSnapshot(entries, expandedPaths = []) {
       const byParent = new Map();
       const showHidden = !!this.showHidden;
@@ -22834,9 +22872,7 @@ function portal() {
         if (!byParent.has(parent)) byParent.set(parent, []);
         byParent.get(parent).push({ ...raw, path });
       }
-      const sortRows = rows => rows.sort((a, b) =>
-        (Number(!a.is_dir) - Number(!b.is_dir))
-        || String(a.name || a.path).localeCompare(String(b.name || b.path)));
+      const sortRows = rows => this._sortFileRows(rows);
       const childCache = {};
       for (const [parent, rows] of byParent) {
         childCache[`${parent}:${showHidden}`] = sortRows(rows);
@@ -22941,10 +22977,9 @@ function portal() {
               : 0)
             : raw.mtime_ns,
         });
-        // Existing rows are already sorted. A content/mtime-only modification
-        // preserves that order; only additions or sort-key changes need the
-        // affected sibling group sorted again.
-        if (type === "added"
+        // Re-sort the affected siblings when a selected sort key changes;
+        // content edits also change ordering in modification-time mode.
+        if (type === "added" || this.fileSort !== "name"
             || (previous && (
               (typeof raw.name === "string" && raw.name !== previous.name)
               || (raw.is_dir != null && !!raw.is_dir !== !!previous.is_dir)
@@ -23005,10 +23040,7 @@ function portal() {
         // snapshot/cache. Unknown collapsed parents stay lazy and canonical.
         if (siblings) siblings.push(row);
       }
-      const sortRows = rows => rows.sort((a, b) =>
-        (Number(!a.is_dir) - Number(!b.is_dir))
-        || String(a.name || a.path).localeCompare(String(b.name || b.path))
-        || String(a.path).localeCompare(String(b.path)));
+      const sortRows = rows => this._sortFileRows(rows);
       for (const parent of affectedParents) {
         const rows = byParent.get(parent);
         if (rows) sortRows(rows);
@@ -24157,7 +24189,8 @@ function portal() {
       const pendingKey = `${ownerWorkspace}\0${workspaceGeneration}\0${cacheKey}:${opts.force ? "force" : "normal"}`;
       if (this._childFetches.has(pendingKey)) return this._childFetches.get(pendingKey);
       const url = "/api/files/list?path=" + encodeURIComponent(path)
-        + (showHidden ? "&show_hidden=true" : "");
+        + (showHidden ? "&show_hidden=true" : "")
+        + (this.fileSort !== "name" ? "&sort=" + this.fileSort : "");
       const requestHeaders = this.fileHdr();
       const promise = (async () => {
         let r;
@@ -24195,7 +24228,7 @@ function portal() {
           stale.staleWorkspace = true;
           throw stale;
         }
-        const entries = d.entries || [];
+        const entries = this._sortFileRows(d.entries || []);
         const treeOwner = isOwner();
         if (opts.cache !== false && treeOwner) {
           this.childCache[cacheKey] = entries;
@@ -27375,7 +27408,9 @@ function portal() {
       //   4. Non-active tab — when the user right-clicks a non-current
       //      preview tab, `selected !== path`, so the row has no `sel`
       //      class. The pulse class handles that too.
-      if (!path) return;
+      const ownerWorkspace = opts.ownerWorkspace || this.fileWorkspacePath();
+      const isOwner = () => this._workspaceIsCurrent(ownerWorkspace);
+      if (!path || !isOwner()) return;
       const interactive = opts.mode !== "background";
       if (interactive) {
         if (this.searchMode) this.clearSearch();
@@ -27385,16 +27420,19 @@ function portal() {
       parts.pop();   // drop the filename, keep only directory chain
       const dirPath = parts.join("/");
       if (dirPath) await this.expandPath(dirPath);
+      if (!isOwner()) return;
       // With a virtualized tree the target row may intentionally not exist in
       // DOM yet. Position the logical row first; updating the viewport window
       // mounts it on the following tick.
       this.$nextTick(() => this.$nextTick(() => {
+        if (!isOwner()) return;
         this._positionFileTreePath(path, interactive ? "center" : "nearest");
         this.$nextTick(() => {
+          if (!isOwner()) return;
           const sel = (window.CSS && CSS.escape) ? CSS.escape(path) : path;
           const el = document.querySelector(`.filelist li[data-path="${sel}"]`);
           if (!el) return;
-          if (!interactive) return;
+          if (!interactive && !opts.highlight) return;
           // Pulse highlight — independent of `sel` class so it fires even
           // when this isn't the active tab. Restart by removing+adding so
           // rapid re-reveals still trigger the animation.
@@ -29791,6 +29829,46 @@ function portal() {
       this.previewDragHover = false;
       this.dragHover = false;
     },
+    _workspaceUploadLimit() {
+      if (!this._fileUploadLimitPromise) {
+        this._fileUploadLimitPromise = this._fetchWithDeadline(
+          "/api/files/upload-limits", { headers: this.hdr() }, 5000,
+        ).then(r => r.ok ? r.json() : null)
+          .then(data => Math.max(0, Number(data?.max_file_bytes) || 0))
+          .catch(() => 0);
+      }
+      return this._fileUploadLimitPromise;
+    },
+    _workspaceUploadError(status, raw) {
+      let detail = "";
+      try {
+        const data = JSON.parse(raw);
+        if (typeof data?.detail === "string") detail = data.detail.slice(0, 200);
+      } catch (_) { /* proxies may return HTML; do not render their error page */ }
+      const zh = this.lang === "zh";
+      if (status === 413) return (zh ? "文件超过服务器或入口的上传大小限制" : "File exceeds the server or proxy upload limit")
+        + (detail ? ": " + detail : "");
+      if (!status) return zh ? "网络连接中断，请重试；文件尚未确认保存" : "Connection interrupted; file has not been confirmed saved. Retry.";
+      return detail || (zh ? "上传失败，HTTP " : "Upload failed, HTTP ") + status;
+    },
+    fileUploadItemStatus(item) {
+      if (item.failed) return item.error || (this.lang === "zh" ? "上传失败" : "Failed");
+      if (item.done) return this.lang === "zh" ? "已保存" : "Saved";
+      if (item.known && item.loaded >= item.total) return this.lang === "zh" ? "正在保存…" : "Saving…";
+      return this.lang === "zh" ? "正在上传" : "Uploading";
+    },
+    async revealUploadedFile(item) {
+      if (!item.done || item.failed || !this._workspaceIsCurrent(item.workspace)) return;
+      await this._refreshParentInTree(item.path, item.workspace);
+      if (this._workspaceIsCurrent(item.workspace)) {
+        await this.revealInTree(item.path, { ownerWorkspace: item.workspace });
+      }
+    },
+    dismissFileUploads() {
+      if (this.fileUploadProgress.activeFiles) return;
+      if (this._fileUploadHideTimer) clearTimeout(this._fileUploadHideTimer);
+      this.fileUploadProgress = { ...this.fileUploadProgress, visible: false };
+    },
     fileUploadProgressLabel() {
       const progress = this.fileUploadProgress || {};
       const total = Math.max(0, Number(progress.totalFiles) || 0);
@@ -29809,9 +29887,9 @@ function portal() {
       if (!batch || this._fileUploadBatch !== batch) return;
       const transfers = Object.values(batch.transfers || {});
       const totalFiles = transfers.length;
-      const completedFiles = transfers.filter(item => item.done).length;
+      const completedFiles = transfers.filter(item => item.done && !item.failed).length;
       const failedFiles = transfers.filter(item => item.failed).length;
-      const activeFiles = totalFiles - completedFiles;
+      const activeFiles = totalFiles - completedFiles - failedFiles;
       const known = totalFiles > 0 && transfers.every(item => item.known);
       const totalBytes = transfers.reduce(
         (sum, item) => sum + Math.max(1, Number(item.total) || 0), 0,
@@ -29830,9 +29908,14 @@ function portal() {
         completedFiles,
         failedFiles,
         activeFiles,
+        items: Object.entries(batch.transfers).map(([id, item]) => ({
+          ...item, id,
+          percent: item.known && item.total > 0
+            ? Math.min(100, Math.max(0, item.loaded / item.total * 100)) : 0,
+        })),
       };
     },
-    _beginFileUploadTransfer(file) {
+    _beginFileUploadTransfer(file, dirPath = "", workspace = this.fileWorkspacePath()) {
       if (this._fileUploadHideTimer) clearTimeout(this._fileUploadHideTimer);
       this._fileUploadHideTimer = null;
       let batch = this._fileUploadBatch;
@@ -29847,6 +29930,9 @@ function portal() {
       }
       const transferId = String(++this._fileUploadTransferSeq);
       batch.transfers[transferId] = {
+        name: String(file?.name || ""),
+        path: dirPath ? dirPath + "/" + file.name : file.name,
+        workspace, error: "",
         loaded: 0,
         total: Math.max(0, Number(file && file.size) || 0),
         known: false,
@@ -29876,17 +29962,19 @@ function portal() {
       );
       this._publishFileUploadProgress(current.batch);
     },
-    _finishFileUploadTransfer(token, succeeded) {
+    _finishFileUploadTransfer(token, succeeded, error = "") {
       const current = this._fileUploadTransfer(token);
       if (!current || current.transfer.done) return;
       const transfer = current.transfer;
       transfer.known = true;
       transfer.total = Math.max(1, Number(transfer.total) || 0);
-      transfer.loaded = transfer.total;
+      if (succeeded) transfer.loaded = transfer.total;
       transfer.done = true;
       transfer.failed = !succeeded;
+      transfer.error = error;
       this._publishFileUploadProgress(current.batch);
       if (Object.values(current.batch.transfers).some(item => !item.done)) return;
+      if (Object.values(current.batch.transfers).some(item => item.failed)) return;
       const batchId = current.batch.id;
       this._fileUploadHideTimer = setTimeout(() => {
         const latest = this._fileUploadBatch;
@@ -29898,13 +29986,13 @@ function portal() {
           visible: false,
         };
         this._fileUploadHideTimer = null;
-      }, 900);
+      }, 6000);
     },
-    _uploadWorkspaceFile(dirPath, file, transferToken) {
+    _uploadWorkspaceFile(dirPath, file, transferToken, ownerWorkspace = "") {
       const fd = new FormData();
       fd.append("path", dirPath);
       fd.append("file", file);
-      const headers = this.fileHdr();
+      const headers = this.fileHdr(ownerWorkspace);
       return new Promise((resolve, reject) => {
         const xhr = new XMLHttpRequest();
         let settled = false;

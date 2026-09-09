@@ -17,6 +17,7 @@ import threading
 import time
 from collections import OrderedDict
 from pathlib import Path
+from typing import Literal
 from fastapi import (
     APIRouter, Depends, File, Form, HTTPException, Query, UploadFile,
 )
@@ -2667,6 +2668,7 @@ MAX_LIST_ENTRIES = 500  # safety cap so huge dirs (.git/objects) don't freeze th
 def list_dir(
     path: str = "",
     show_hidden: bool = False,
+    sort: Literal["name", "mtime_desc", "mtime_asc"] = "name",
     root: Path = Depends(_workspace_root),
 ) -> dict:
     target = safe_resolve(path, root=root)
@@ -2714,8 +2716,16 @@ def list_dir(
                         is_dir = child.is_dir()
                     except OSError:
                         continue
+                    if sort != "name":
+                        try:
+                            modified = child.stat().st_mtime_ns
+                        except OSError:
+                            continue
+                        order = modified if sort == "mtime_asc" else -modified
+                    else:
+                        order = 0
                     yield (
-                        (not is_dir, child.name.lower(), child.name),
+                        (not is_dir, order, child.name.lower(), child.name),
                         child,
                         is_dir,
                     )
@@ -3403,8 +3413,8 @@ def write_file(req: WriteReq, root: Path = Depends(_workspace_root)) -> dict:
         return {"ok": True, "size": target.stat().st_size}
 
 
-# Default 100 MB cap per uploaded file. Override via MUSELAB_MAX_UPLOAD_MB.
-MAX_UPLOAD_BYTES = env_int("MUSELAB_MAX_UPLOAD_MB", 100, min_value=1) * 1024 * 1024
+# Default 1 GiB cap per uploaded file. Override via MUSELAB_MAX_UPLOAD_MB.
+MAX_UPLOAD_BYTES = env_int("MUSELAB_MAX_UPLOAD_MB", 1024, min_value=1) * 1024 * 1024
 # Filename extensions that are likely to be hostile or pointless to host in
 # a local workspace. Block at upload (cleaner than after-the-fact cleanup).
 UPLOAD_BLOCKED_SUFFIX = {
@@ -3412,6 +3422,12 @@ UPLOAD_BLOCKED_SUFFIX = {
     ".ps1",  # PowerShell scripts — block by default; allow via .env override later
     ".msi", ".app",
 }
+
+
+@router.get("/upload-limits", dependencies=[Depends(require_token)])
+def upload_limits() -> dict:
+    """Expose the configured cap so oversized files fail before transfer."""
+    return {"max_file_bytes": MAX_UPLOAD_BYTES}
 
 
 @router.post("/upload", dependencies=[Depends(require_token)])

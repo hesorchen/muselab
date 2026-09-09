@@ -1800,6 +1800,8 @@ def test_virtual_file_tree_supports_keyboard_navigation_and_mobile_handoff(
     refresh = page.locator(".filelist-sticky-root .root-action").last
     refresh.focus()
     page.keyboard.press("Tab")
+    expect(page.locator("#file-sort")).to_be_focused()
+    page.keyboard.press("Tab")
     page.wait_for_function(
         "() => document.activeElement?.getAttribute('role') === 'treeitem'"
     )

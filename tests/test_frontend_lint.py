@@ -3148,9 +3148,9 @@ def test_workspace_file_upload_uses_real_aggregate_byte_progress():
     quiet_start = app.index("async _uploadFileQuiet(")
     quiet_end = app.index("\n    _prepareUploadOverwrite", quiet_start)
     quiet = app[quiet_start:quiet_end]
-    assert "_beginFileUploadTransfer(file)" in quiet
-    assert "_uploadWorkspaceFile(dirPath, file, transfer)" in quiet
-    assert "_finishFileUploadTransfer(transfer, succeeded)" in quiet
+    assert "_beginFileUploadTransfer(file, dirPath, ownerWorkspace)" in quiet
+    assert "_uploadWorkspaceFile(dirPath, file, transfer, ownerWorkspace)" in quiet
+    assert "_finishFileUploadTransfer(transfer, succeeded, failure)" in quiet
 
     context_start = app.index("async uploadFileTo(dirPath, file)")
     context_end = app.index("\n    // Custom MIME", context_start)

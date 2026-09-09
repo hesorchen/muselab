@@ -390,16 +390,37 @@
            x-transition.opacity.duration.150ms x-cloak aria-live="polite">
         <div class="file-upload-progress-meta">
           <span x-text="fileUploadProgressLabel()"></span>
-          <strong x-show="fileUploadProgress.known"
+          <strong x-show="fileUploadProgress.known && fileUploadProgress.activeFiles"
                   x-text="Math.round(fileUploadProgress.percent || 0) + '%'">0%</strong>
+          <button type="button" class="btn-text sm" x-show="!fileUploadProgress.activeFiles"
+                  @click="dismissFileUploads()" :aria-label="lang==='zh' ? '关闭上传记录' : 'Dismiss uploads'">×</button>
         </div>
-        <div class="file-upload-progress-track"
+        <div class="file-upload-progress-track" x-show="fileUploadProgress.activeFiles"
              :class="{ indeterminate: !fileUploadProgress.known }"
              role="progressbar" aria-valuemin="0" aria-valuemax="100"
              :aria-valuenow="fileUploadProgress.known ? Math.round(fileUploadProgress.percent || 0) : null"
              :aria-valuetext="fileUploadProgressLabel()">
           <span :style="{ width: (fileUploadProgress.known ? fileUploadProgress.percent : 34) + '%' }"></span>
         </div>
+        <ul class="file-upload-items">
+          <template x-for="transfer in (fileUploadProgress.items || [])" :key="transfer.id">
+            <li class="file-upload-item" :class="{failed:transfer.failed}" :data-upload-name="transfer.name">
+              <div class="file-upload-item-heading">
+                <span :title="transfer.path" x-text="transfer.name"></span>
+                <button type="button" class="btn-text sm"
+                        x-show="transfer.done && !transfer.failed && _workspaceIsCurrent(transfer.workspace)"
+                        @click="revealUploadedFile(transfer)" x-text="lang==='zh' ? '定位' : 'Locate'"></button>
+              </div>
+              <div class="file-upload-item-state">
+                <span x-text="fileUploadItemStatus(transfer)"></span>
+                <span x-show="!transfer.done" x-text="transfer.known ? Math.round(transfer.percent) + '%' : fmtSize(transfer.total)"></span>
+              </div>
+              <progress x-show="!transfer.done" max="100" :value="transfer.known ? transfer.percent : null"
+                        :aria-label="transfer.name"></progress>
+              <small x-show="transfer.done && !transfer.failed" x-text="transfer.path"></small>
+            </li>
+          </template>
+        </ul>
       </div>
       <div class="searchbar">
         <div class="searchbar-wrap">
@@ -507,6 +528,15 @@
             </button>
           </span>
         </div>
+      <div class="file-sort-bar">
+        <label for="file-sort" x-text="lang==='zh' ? '排序' : 'Sort'"></label>
+        <select id="file-sort" :value="fileSort" @change="setFileSort($event.target.value)"
+                :aria-label="lang==='zh' ? '文件排序' : 'File sort order'">
+          <option value="name" x-text="lang==='zh' ? '名称' : 'Name'"></option>
+          <option value="mtime_desc" x-text="lang==='zh' ? '修改时间：最新在前' : 'Modified: newest first'"></option>
+          <option value="mtime_asc" x-text="lang==='zh' ? '修改时间：最早在前' : 'Modified: oldest first'"></option>
+        </select>
+      </div>
       <ul class="filelist" x-ref="fileList"
           role="tree"
           :aria-label="lang==='zh' ? '工作区文件树' : 'Workspace file tree'"
@@ -548,7 +578,12 @@
               <svg x-show="n.is_dir && !expanded.has(n.path)"><use href="#i-chevron-right"/></svg>
             </span>
             <span class="icon"><svg><use :href="iconRef(n)"/></svg></span>
-            <span class="name" x-text="n.name" :title="n.name"></span>
+            <span class="file-row-label">
+              <span class="name" x-text="n.name" :title="n.name"></span>
+              <time class="file-modified" :datetime="n.mtime ? new Date(n.mtime * 1000).toISOString() : null"
+                    :title="(lang==='zh' ? '修改时间：' : 'Modified: ') + fmtMtime(n.mtime)"
+                    x-text="n.mtime ? fmtMtime(n.mtime).slice(0, 16) : '—'"></time>
+            </span>
             <!-- VSCode-style inline actions. Hidden by default; revealed on
                  hover (desktop) or always faded (touch — no hover). The "⋯"
                  more-menu renders for BOTH files and dirs — plain files used
