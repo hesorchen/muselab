@@ -98,7 +98,7 @@ muselab only acts as an Images API client; it does not launch a local image mode
 | `MUSELAB_BUDGET_USD` | Monthly UI soft budget; does not hard-stop turns | `0` |
 | `MUSELAB_PERF_LOG` | Emit privacy-bounded performance summaries for core paths; set to `0` to disable | `1` |
 | `MUSELAB_SLOW_REQUEST_MS` | Duration threshold for slow HTTP and workspace-operation summaries, clamped to 25–60000 ms | `500` |
-| `MUSELAB_MAX_UPLOAD_MB` | Files API upload limit per file in MiB | `100` |
+| `MUSELAB_MAX_UPLOAD_MB` | Files API upload limit per file in MiB | `1024` |
 | `MUSELAB_MAX_TURNS` | Additional session turn cap; `0` means unlimited | `0` |
 | `MUSELAB_THINKING_BUDGET` | Extended-thinking token budget | `10000` |
 | `MUSELAB_RUNTIME_BUFFER_EVENTS` | Queued SDK messages per turn/background handoff, minimum 1 | `8192` |
