@@ -1797,7 +1797,7 @@ def test_virtual_file_tree_supports_keyboard_navigation_and_mobile_handoff(
           await new Promise(resolve => app.$nextTick(resolve));
         }"""
     )
-    refresh = page.locator(".filelist-sticky-root .root-action").last
+    refresh = page.get_by_role("button", name="Refresh file tree", exact=True)
     refresh.focus()
     page.keyboard.press("Tab")
     expect(page.locator("#file-sort")).to_be_focused()

@@ -530,17 +530,16 @@
                     aria-label="Refresh file tree">
               <svg :class="{ spinning: treeLoading }" viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2"><use href="#i-refresh"/></svg>
             </button>
+            <button id="file-sort" class="root-action" type="button"
+                    @click.stop="cycleFileSort()" :data-sort="fileSort"
+                    :title="fileSortLabel()" :aria-label="fileSortLabel()">
+              <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M4 5h10M4 10h7M4 15h4"/>
+                <path :d="fileSort==='mtime_asc' ? 'M18 20V4m-3 3 3-3 3 3' : 'M18 4v16m-3-3 3 3 3-3'"/>
+              </svg>
+            </button>
           </span>
         </div>
-      <div class="file-sort-bar">
-        <label for="file-sort" x-text="lang==='zh' ? '排序' : 'Sort'"></label>
-        <select id="file-sort" :value="fileSort" @change="setFileSort($event.target.value)"
-                :aria-label="lang==='zh' ? '文件排序' : 'File sort order'">
-          <option value="name" x-text="lang==='zh' ? '名称' : 'Name'"></option>
-          <option value="mtime_desc" x-text="lang==='zh' ? '修改时间：最新在前' : 'Modified: newest first'"></option>
-          <option value="mtime_asc" x-text="lang==='zh' ? '修改时间：最早在前' : 'Modified: oldest first'"></option>
-        </select>
-      </div>
       <ul class="filelist" x-ref="fileList"
           role="tree"
           :aria-label="lang==='zh' ? '工作区文件树' : 'Workspace file tree'"
@@ -582,12 +581,7 @@
               <svg x-show="n.is_dir && !expanded.has(n.path)"><use href="#i-chevron-right"/></svg>
             </span>
             <span class="icon"><svg><use :href="iconRef(n)"/></svg></span>
-            <span class="file-row-label">
-              <span class="name" x-text="n.name" :title="n.name"></span>
-              <time class="file-modified" :datetime="n.mtime ? new Date(n.mtime * 1000).toISOString() : null"
-                    :title="(lang==='zh' ? '修改时间：' : 'Modified: ') + fmtMtime(n.mtime)"
-                    x-text="n.mtime ? fmtMtime(n.mtime).slice(0, 16) : '—'"></time>
-            </span>
+            <span class="name" x-text="n.name" :title="n.name"></span>
             <!-- VSCode-style inline actions. Hidden by default; revealed on
                  hover (desktop) or always faded (touch — no hover). The "⋯"
                  more-menu renders for BOTH files and dirs — plain files used
@@ -596,9 +590,13 @@
                  rename / delete / copy a file. The "+" (new file here) stays
                  dir-only. @click.stop so the action doesn't also toggle the row. -->
             <span class="tree-trailing">
-              <span class="size" x-show="!n.is_dir"
-                    :title="fileSizeTitle(n.size)"
-                    x-text="fmtSize(n.size)"></span>
+              <span class="tree-metadata">
+                <span class="size" x-show="!n.is_dir"
+                      :title="fileSizeTitle(n.size)" x-text="fmtSize(n.size)"></span>
+                <time class="file-modified" :datetime="n.mtime ? new Date(n.mtime * 1000).toISOString() : null"
+                      :title="(lang==='zh' ? '修改时间：' : 'Modified: ') + fmtMtime(n.mtime)"
+                      x-text="n.mtime ? fmtMtime(n.mtime).slice(0, 16) : '—'"></time>
+              </span>
               <span class="tree-actions">
                 <button class="tree-action" type="button"
                         x-show="n.is_dir"

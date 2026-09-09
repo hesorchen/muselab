@@ -31,10 +31,10 @@ def test_named_upload_results_preflight_and_locate(page, backend_url, auth_token
     expect(row).to_be_visible()
     expect(row.locator("time")).to_have_attribute("datetime", re.compile(r"^\d{4}-"))
     page.screenshot(path=str(tmp_path / "upload-results.png"))
-    page.select_option("#file-sort", "mtime_desc")
+    page.locator("#file-sort").click()
     page.wait_for_function("""() => document.querySelector('#app')._x_dataStack[0].fileSort === 'mtime_desc'""")
     page.reload()
-    expect(page.locator("#file-sort")).to_have_value("mtime_desc")
+    expect(page.locator("#file-sort")).to_have_attribute("data-sort", "mtime_desc")
 
 
 def test_sort_updates_existing_file_on_mtime_event(page, backend_url, auth_token):

@@ -22870,6 +22870,17 @@ function portal() {
           || String(a.path).localeCompare(String(b.path));
       });
     },
+    fileSortLabel() {
+      const labels = this.lang === "zh"
+        ? {name:"名称", mtime_desc:"修改时间：最新在前", mtime_asc:"修改时间：最早在前"}
+        : {name:"Name", mtime_desc:"Modified: newest first", mtime_asc:"Modified: oldest first"};
+      return (this.lang === "zh" ? "排序：" : "Sort: ") + labels[this.fileSort]
+        + (this.lang === "zh" ? "（点击切换）" : " (click to switch)");
+    },
+    cycleFileSort() {
+      const modes = ["name", "mtime_desc", "mtime_asc"];
+      return this.setFileSort(modes[(modes.indexOf(this.fileSort) + 1) % modes.length]);
+    },
     async setFileSort(value) {
       if (!["name", "mtime_desc", "mtime_asc"].includes(value)) return;
       this.fileSort = value;
