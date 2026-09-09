@@ -207,3 +207,83 @@ def test_approve_and_correct_reject_retired_rows(client, auth):
     assert client.post(
         f"/api/memory/items/{item['id']}/correct", headers=auth,
         json={"content": "再更正一次"}).status_code == 409
+
+
+def test_memory_reads_bypass_busy_writer_and_recall(client, auth, app_module):
+    """A background write and slow recall cannot hold the Memory Center."""
+    import threading
+    import time
+    from backend.memory_engine import engine
+
+    created = client.post("/api/memory/items", headers=auth, json={
+        "kind": "fact", "content": "只读查询测试",
+    }).json()
+    entered = [threading.Event(), threading.Event()]
+    release = threading.Event()
+
+    def hold(index):
+        def operation(store):
+            entered[index].set()
+            assert release.wait(5)
+        return operation
+
+    jobs = [engine._store_actor._submit(hold(0)),
+            engine._recall_store_actor._submit(hold(1))]
+    try:
+        assert all(event.wait(1) for event in entered)
+        started = time.perf_counter()
+        for route in [
+            "/items", f"/items/{created['id']}",
+            f"/items/{created['id']}/traceback",
+            "/status", "/episodes", "/artifacts", "/jobs", "/recalls",
+            "/audit", "/backups",
+        ]:
+            response = client.get("/api/memory" + route, headers=auth)
+            assert response.status_code == 200, (route, response.text)
+        elapsed = time.perf_counter() - started
+        assert elapsed < 2
+        assert not any(job.done() for job in jobs)
+    finally:
+        release.set()
+        for job in jobs:
+            job.result(timeout=2)
+
+
+def test_memory_read_timeout_is_retryable_and_queue_is_cancelled(
+        client, auth, app_module, monkeypatch):
+    import threading
+    import time
+    from backend.memory_engine import engine
+
+    assert client.get("/api/memory/items", headers=auth).status_code == 200
+    monkeypatch.setattr(engine, "UI_READ_TIMEOUT_S", 0.05)
+    entered, release = threading.Event(), threading.Event()
+    executions = []
+    original = engine._ui_store.browse_memories
+
+    def browse(*args, **kwargs):
+        executions.append(True)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(engine._ui_store, "browse_memories", browse)
+
+    def hold(store):
+        entered.set()
+        release.wait(2)
+
+    blocker = engine._ui_store_actor._submit(hold)
+    try:
+        assert entered.wait(1)
+        started = time.perf_counter()
+        response = client.get("/api/memory/items", headers=auth)
+        assert response.status_code == 503
+        assert response.headers["retry-after"] == "1"
+        assert time.perf_counter() - started < 0.5
+    finally:
+        release.set()
+        blocker.result(timeout=2)
+    engine._ui_store_actor._submit(lambda store: None).result(timeout=2)
+    assert executions == []
+    monkeypatch.setattr(engine, "UI_READ_TIMEOUT_S", 1)
+    assert client.get("/api/memory/items", headers=auth).status_code == 200
+    assert executions == [True]

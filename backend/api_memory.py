@@ -1,6 +1,8 @@
 """Authenticated white-box API for memory configuration and governance."""
 from __future__ import annotations
 
+import sqlite3
+
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -30,6 +32,25 @@ _IMPORTABLE_AUTHORITIES = ("confirmed", "inferred", "legacy_import")
 
 def _failure_detail(exc: BaseException) -> dict[str, object]:
     return classify_memory_failure(exc)[1]
+
+
+async def _read_response(awaitable):
+    try:
+        return await awaitable
+    except (TimeoutError, sqlite3.OperationalError) as exc:
+        if isinstance(exc, sqlite3.OperationalError) and (
+            getattr(exc, "sqlite_errorcode", 0) & 0xff
+        ) not in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED, sqlite3.SQLITE_INTERRUPT):
+            raise
+        # Do not expose SQL, paths, or private content in an error response.
+        raise HTTPException(
+            503, "Memory read unavailable; retry shortly",
+            headers={"Retry-After": "1"},
+        ) from None
+
+
+async def _read_store(operation):
+    return await _read_response(engine._read_store_call(operation))
 
 
 class MemoryCreate(BaseModel):
@@ -139,7 +160,7 @@ def _resolve_config_input(raw: dict, current: MemoryConfig) -> MemoryConfig:
 
 @router.get("/status")
 async def get_status() -> dict:
-    return await engine.status()
+    return await _read_response(engine.status())
 
 
 @router.get("/items")
@@ -167,7 +188,7 @@ async def list_items(
         return {"items": rows, "count": len(rows), "total": total,
                 "offset": offset, "limit": limit, "has_more": offset + len(rows) < total}
 
-    return await engine._store_call(load)
+    return await _read_store(load)
 
 
 @router.post("/items")
@@ -190,21 +211,22 @@ async def create_item(body: MemoryCreate) -> dict:
 @router.get("/items/{memory_id}")
 async def get_item(memory_id: str) -> dict:
     cfg = load_config()
-    item = await engine._store_call(
-        lambda store: store.memory(memory_id))
-    if not item or item.get("owner_id") != cfg.owner_id:
-        raise HTTPException(404, "memory not found")
-    item["recall_stats"] = (await engine._store_call(
-        lambda store: store.memory_recall_stats(cfg.owner_id, [memory_id])
-    ))[memory_id]
-    return item
+    def load(store):
+        item = store.memory(memory_id)
+        if not item or item.get("owner_id") != cfg.owner_id:
+            raise HTTPException(404, "memory not found")
+        item["recall_stats"] = store.memory_recall_stats(
+            cfg.owner_id, [memory_id])[memory_id]
+        return item
+
+    return await _read_store(load)
 
 
 @router.get("/items/{memory_id}/traceback")
 async def get_item_traceback(memory_id: str) -> dict:
     cfg = load_config()
     try:
-        sites = await engine._store_call(
+        sites = await _read_store(
             lambda store: store.memory_traceback(cfg.owner_id, memory_id))
     except KeyError:
         raise HTTPException(404, "memory not found") from None
@@ -284,7 +306,7 @@ async def list_episodes(
     limit: int = Query(default=100, ge=1, le=500),
 ) -> dict:
     cfg = load_config()
-    rows = await engine._store_call(
+    rows = await _read_store(
         lambda store: store.list_episodes(
             cfg.owner_id, status=status, limit=limit))
     return {"items": rows, "count": len(rows)}
@@ -293,7 +315,7 @@ async def list_episodes(
 @router.get("/episodes/{episode_id}")
 async def get_episode(episode_id: str) -> dict:
     cfg = load_config()
-    item = await engine._store_call(
+    item = await _read_store(
         lambda store: store.episode(episode_id))
     if not item or item.get("owner_id") != cfg.owner_id:
         raise HTTPException(404, "episode not found")
@@ -307,7 +329,7 @@ async def list_artifacts(
     limit: int = Query(default=100, ge=1, le=500),
 ) -> dict:
     cfg = load_config()
-    rows = await engine._store_call(
+    rows = await _read_store(
         lambda store: store.list_artifacts(
             cfg.owner_id, kind=kind, status=status, limit=limit))
     return {"items": rows, "count": len(rows)}
@@ -343,7 +365,7 @@ async def disable_skill(artifact_id: str) -> dict:
 
 @router.get("/jobs")
 async def list_jobs(limit: int = Query(default=100, ge=1, le=500)) -> dict:
-    rows = await engine._store_call(
+    rows = await _read_store(
         lambda store: store.list_jobs(limit=limit))
     return {"items": rows, "count": len(rows)}
 
@@ -351,7 +373,7 @@ async def list_jobs(limit: int = Query(default=100, ge=1, le=500)) -> dict:
 @router.get("/recalls")
 async def list_recalls(limit: int = Query(default=100, ge=1, le=500)) -> dict:
     cfg = load_config()
-    rows = await engine._store_call(
+    rows = await _read_store(
         lambda store: store.recent_recalls(cfg.owner_id, limit=limit))
     return {"items": rows, "count": len(rows)}
 
@@ -359,7 +381,7 @@ async def list_recalls(limit: int = Query(default=100, ge=1, le=500)) -> dict:
 @router.get("/audit")
 async def list_audit(limit: int = Query(default=100, ge=1, le=500)) -> dict:
     cfg = load_config()
-    rows = await engine._store_call(
+    rows = await _read_store(
         lambda store: store.audits(cfg.owner_id, limit=limit))
     return {"items": rows, "count": len(rows)}
 
@@ -377,7 +399,7 @@ async def list_backups(
     limit: int = Query(default=100, ge=1, le=500),
 ) -> dict:
     cfg = load_config()
-    rows = await engine._store_call(lambda store: store.list_backups(
+    rows = await _read_store(lambda store: store.list_backups(
         cfg.owner_id, memory_dir() / "backups", limit=limit))
     return {"items": rows, "count": len(rows)}
 

@@ -7128,9 +7128,10 @@ async def recover_runtime_continuation_outboxes_at_startup() -> int:
 
 def _runtime_continuation_projection_state(
     sid: str, *, runtime_lineage: list[str] | None = None,
+    disk_state: tuple[frozenset[str], str] | None = None,
 ) -> tuple[bool, str]:
     return chat_overlays._runtime_continuation_projection_state(
-        sid, runtime_lineage=runtime_lineage,
+        sid, runtime_lineage=runtime_lineage, disk_state=disk_state,
     )
 
 def _delete_cancelled_turn_snapshots(sid: str) -> None:
@@ -19842,7 +19843,7 @@ def _mux_session_state_fingerprint(state: dict) -> str:
     stable = {}
     for key, value in state.items():
         if key in {
-            "events_so_far", "latest_event_seq", "runtime_ui_revision",
+            "events_so_far", "latest_event_seq",
         }:
             continue
         # Announcement states are intentionally memory-only and may omit
@@ -19866,6 +19867,18 @@ def _runtime_reconcile_projections(
         sess.runtime_lineages(ordered_ids),
         sess.running_runtime_task_ids(ordered_ids),
     )
+
+
+def _runtime_reconcile_snapshot(session_ids: Iterable[str]):
+    """Capture disk facts off-loop; live broadcasts/watchers stay on-loop."""
+    ordered_ids = tuple(session_ids)
+    lineages, task_ids = _runtime_reconcile_projections(ordered_ids)
+    continuations = {
+        sid: chat_overlays._runtime_continuation_disk_state(
+            sid, runtime_lineage=lineages.get(sid, []))
+        for sid in ordered_ids
+    }
+    return lineages, task_ids, continuations
 
 
 async def _subscribe_multiplex(
@@ -20072,17 +20085,18 @@ async def _subscribe_multiplex(
         # index nor a large sidecar may be read/decoded on the event-loop thread.
         # Runtime-task summaries retain only immutable task ids, so warm passes
         # are O(stat) even when full sidecars churn out of their small cache.
-        runtime_lineages, durable_runtime_task_ids = (
+        runtime_lineages, durable_runtime_task_ids, continuation_states = (
             await asyncio.to_thread(
-                _runtime_reconcile_projections, candidate_ids,
+                _runtime_reconcile_snapshot, candidate_ids,
             )
-            if candidate_ids else ({}, {})
+            if candidate_ids else ({}, {}, {})
         )
         active_ids: set[str] = set()
         for session_id in sorted(candidate_ids):
             state = _session_active_status(
                 session_id,
                 runtime_lineage=runtime_lineages.get(session_id, []),
+                continuation_disk_state=continuation_states[session_id],
                 durable_runtime_task_ids=durable_runtime_task_ids.get(
                     session_id, frozenset(),
                 ),
@@ -20354,6 +20368,7 @@ def _session_active_status(
     *,
     runtime_lineage: list[str] | None = None,
     durable_runtime_task_ids: Iterable[str] | None = None,
+    continuation_disk_state: tuple[frozenset[str], str] | None = None,
 ) -> dict:
     """Tell the frontend whether `sid` has an in-progress background
     turn. Used on session load to decide between "render JSONL history"
@@ -20369,7 +20384,7 @@ def _session_active_status(
     runtime_background_pending = len(runtime_task_ids)
     runtime_continuation_pending, runtime_ui_revision = (
         _runtime_continuation_projection_state(
-            sid, runtime_lineage=runtime_lineage,
+            sid, runtime_lineage=runtime_lineage, disk_state=continuation_disk_state,
         )
     )
     scheduled_state = _sdk_scheduled_snapshot(sid)

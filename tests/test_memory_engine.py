@@ -1150,3 +1150,56 @@ def test_recall_budget_fits_facade_and_watchdog():
     cfg = _config()
     cfg.retrieval.soft_timeout_ms = 5000
     assert cfg.retrieval.soft_timeout_ms / 1000 < _RECALL_DEADLINE < RECALL_HOOK_TIMEOUT
+
+
+def test_ui_read_interrupts_expensive_sql_and_next_request_recovers(tmp_path):
+    from backend.memory_engine import MemoryEngine
+    from backend.memory_store import MemoryStore
+
+    instance = MemoryEngine(MemoryStore(tmp_path / "registry.sqlite3"))
+    instance.UI_READ_TIMEOUT_S = 0.08
+
+    def expensive(store):
+        with store._connect() as conn:
+            return conn.execute("""
+                WITH RECURSIVE numbers(x) AS (
+                  SELECT 1 UNION ALL SELECT x + 1 FROM numbers WHERE x < 100000000
+                ) SELECT sum(x) FROM numbers
+            """).fetchone()[0]
+
+    async def scenario():
+        started = time.perf_counter()
+        try:
+            with pytest.raises((TimeoutError, sqlite3.OperationalError)):
+                await instance._read_store_call(expensive)
+            instance.UI_READ_TIMEOUT_S = 1
+            result = await instance._read_store_call(
+                lambda store: store.browse_memories("default"))
+            assert result == ([], 0)
+            assert time.perf_counter() - started < 0.8
+        finally:
+            await instance.stop()
+
+    asyncio.run(scenario())
+
+
+def test_first_ui_read_initializes_existing_empty_registry(tmp_path, monkeypatch):
+    from backend import memory_engine as module
+
+    path = tmp_path / "registry.sqlite3"
+    # An existing file alone does not prove the current schema was initialized.
+    with sqlite3.connect(path) as conn:
+        conn.execute("PRAGMA user_version=0")
+    monkeypatch.setattr(module, "database_path", lambda: path)
+    instance = module.MemoryEngine()
+
+    async def scenario():
+        try:
+            assert await instance._read_store_call(
+                lambda store: store.browse_memories("default")) == ([], 0)
+            assert instance._ui_store._read_only
+            assert instance._store is not instance._ui_store
+        finally:
+            await instance.stop()
+
+    asyncio.run(scenario())

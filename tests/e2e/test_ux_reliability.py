@@ -286,3 +286,77 @@ def test_completed_history_recovers_without_status_waterfall(
     else:
         assert result["installs"] == 0 and result["retries"] == 1
         assert result["delay"] >= 5000
+
+
+def test_memory_list_timeout_clears_loading_and_retry_recovers(page, backend_url, auth_token):
+    _login(page, backend_url, auth_token)
+    result = _app_eval(page, """
+      await app.openMemoryCenter();
+      const original = window.fetch, timeout = app.SETTINGS_READ_TIMEOUT_MS;
+      app.SETTINGS_READ_TIMEOUT_MS = 80;
+      window.fetch = (url, options) => {
+        if (String(url).startsWith('/api/memory/items?')) {
+          return new Promise((resolve, reject) => {
+            options.signal.addEventListener('abort', () =>
+              reject(new DOMException('aborted', 'AbortError')), {once:true});
+          });
+        }
+        return original(url, options);
+      };
+      try {
+        await app.refreshMemoryCenter();
+        return {loading:app.settings.memory.listLoading,
+                error:app.settings.memory.listError};
+      } finally {
+        window.fetch=original; app.SETTINGS_READ_TIMEOUT_MS=timeout;
+      }
+    """)
+    assert result["loading"] is False
+    assert result["error"]
+    expect(page.locator(".memory-center-section [role=status]").filter(
+        has_text="正在加载记忆")).to_be_hidden()
+    page.route("**/api/memory/items?*", lambda route: route.fulfill(
+        status=200, content_type="application/json", body=json.dumps({
+            "items": [{"id": "retry-fixture", "content": "Memory retry succeeded",
+                       "kind": "fact", "status": "active"}], "total": 1,
+        })))
+    page.locator(".memory-center-section .settings-inline-error button").click()
+    expect(page.locator(".memory-card-content").filter(
+        has_text="Memory retry succeeded")).to_be_visible()
+    assert not _app_eval(page, "return app.settings.memory.listError;")
+
+
+def test_memory_monitor_does_not_accumulate_slow_requests(page, backend_url, auth_token):
+    _login(page, backend_url, auth_token)
+    page.wait_for_function("""() =>
+      !document.querySelector('#app')._x_dataStack[0]._memoryReviewLoading""")
+    result = _app_eval(page, """
+      const original=window.fetch, timeout=app.SETTINGS_READ_TIMEOUT_MS;
+      if (app._memoryMonitorTimer) clearInterval(app._memoryMonitorTimer);
+      app._memoryMonitorEnabled=true;
+      app.SETTINGS_READ_TIMEOUT_MS=80;
+      let requests=0, aborted=0;
+      window.fetch=(url, options)=>{
+        if (String(url)==='/api/memory/status') {
+          requests++;
+          return new Promise((resolve,reject)=>{
+            options.signal.addEventListener('abort',()=>{
+              aborted++; reject(new DOMException('aborted','AbortError'));
+            },{once:true});
+          });
+        }
+        return original(url,options);
+      };
+      try {
+        await Promise.all(Array.from({length:5},()=>app._pollMemoryReview()));
+        const afterFirst={requests,aborted,loading:app._memoryReviewLoading};
+        await app._pollMemoryReview();
+        return {afterFirst,requests,aborted,loading:app._memoryReviewLoading};
+      } finally {
+        window.fetch=original; app.SETTINGS_READ_TIMEOUT_MS=timeout;
+      }
+    """)
+    assert result == {
+        "afterFirst": {"requests": 1, "aborted": 1, "loading": False},
+        "requests": 2, "aborted": 2, "loading": False,
+    }

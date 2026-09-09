@@ -803,29 +803,54 @@ async def recover_runtime_continuation_outboxes_at_startup() -> int:
     return scheduled
 
 
+def _runtime_continuation_disk_state(
+    sid: str, *, runtime_lineage: list[str],
+) -> tuple[frozenset[str], str]:
+    """Read notification metadata only; never heal snapshots or index JSONL.
+
+    Multiplex callers run this on a worker. History reads retain ownership of
+    snapshot validation/healing; polling a revision must not initiate writes.
+    """
+    lineage = runtime_lineage or [sid]
+    owners = frozenset(
+        owner for owner in lineage[:-1]
+        if _session_has_runtime_continuation_outbox(owner)
+    )
+    directory = _cancelled_turn_session_dir(lineage[-1])
+    digest = hashlib.blake2b(digest_size=12)
+    found = False
+    if directory is not None:
+        try:
+            paths = sorted(directory.glob("*.json"))
+        except OSError:
+            paths = []
+        for path in paths:
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            found = True
+            digest.update(path.name.encode("ascii", errors="ignore"))
+            digest.update(f":{stat.st_mtime_ns}:{stat.st_size};".encode("ascii"))
+    return owners, digest.hexdigest() if found else ""
+
+
 def _runtime_continuation_projection_state(
     sid: str, *, runtime_lineage: list[str] | None = None,
+    disk_state: tuple[frozenset[str], str] | None = None,
 ) -> tuple[bool, str]:
-    """Return lineage-wide pending state and the visible leaf's UI revision."""
+    """Combine durable metadata with live watcher state on the caller thread."""
     _hooks = _require_hooks()
-    lineage = (
-        sess.runtime_lineage(sid)
-        if runtime_lineage is None
-        else list(runtime_lineage)
-    ) or [sid]
-    leaf_sid = lineage[-1]
-    pending = False
-    for owner_sid in lineage[:-1]:
-        if (
-            _hooks.session_has_live_watcher(owner_sid)
-            or _session_has_runtime_continuation_outbox(owner_sid)
-        ):
-            pending = True
-            break
-    try:
-        _, revision = _hooks.load_cancelled_turn_snapshots(leaf_sid)
-    except Exception:
-        revision = ""
+    lineage = (sess.runtime_lineage(sid) if runtime_lineage is None
+               else list(runtime_lineage)) or [sid]
+    owners, revision = (
+        _runtime_continuation_disk_state(sid, runtime_lineage=lineage)
+        if disk_state is None else disk_state
+    )
+    pending = any(
+        owner in owners or _hooks.session_has_live_watcher(owner)
+        for owner in lineage[:-1]
+    )
     return pending, revision
 
 

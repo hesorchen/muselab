@@ -213,9 +213,9 @@ class _MemoryStoreActor:
 
     Each actor owns a FIFO database lane. Write operations are shielded from
     coroutine cancellation; the separate read actor can discard queued reads.
-    A running operation is allowed to finish: SQLite cannot cancel a
-    running statement safely, so the transaction is allowed to finish and the
-    next operation observes its committed state. close appends a barrier,
+    Running writes finish their transactions before the next operation.
+    Read-only callers may install a SQLite progress handler to interrupt
+    expensive queries when their budget expires. close appends a barrier,
     drains every accepted operation, then joins the owned thread.
     """
 
@@ -280,6 +280,10 @@ class _MemoryStoreActor:
         executor.shutdown(wait=True)
 
 
+class _RegistryNotInitialized(Exception):
+    """A read-only connection needs the writer to create the first schema."""
+
+
 class MemoryEngine:
     def __init__(self, store: MemoryStore | None = None):
         self._store: MemoryStore | None = store
@@ -288,6 +292,9 @@ class MemoryEngine:
         self._recall_store: MemoryStore | None = None
         self._recall_store_actor = _MemoryStoreActor(
             self._resolve_recall_store, cancel_pending=True)
+        self._ui_store: MemoryStore | None = None
+        self._ui_store_actor = _MemoryStoreActor(
+            self._resolve_ui_store, cancel_pending=True)
         self._workers: set[asyncio.Task] = set()
         self._telemetry_tasks: set[asyncio.Task] = set()
         self._closing = False
@@ -318,6 +325,35 @@ class MemoryEngine:
         if self._recall_store is None or self._recall_store.path != path:
             self._recall_store = MemoryStore(path, read_only=True)
         return self._recall_store
+
+    def _resolve_ui_store(self) -> MemoryStore:
+        path = self._store.path if self._store_pinned else database_path()
+        if (self._store is None or self._store.path != path
+                or not path.exists()):
+            raise _RegistryNotInitialized
+        if self._ui_store is None or self._ui_store.path != path:
+            self._ui_store = MemoryStore(path, read_only=True)
+        return self._ui_store
+
+    UI_READ_TIMEOUT_S = 5.0
+
+    async def _read_store_call(self, operation: Callable[[MemoryStore], _T]) -> _T:
+        """Bound UI reads independently of both background writes and recall."""
+        deadline = time.perf_counter() + self.UI_READ_TIMEOUT_S
+
+        def read(store: MemoryStore) -> _T:
+            with store.read_budget(deadline):
+                return operation(store)
+
+        async with asyncio.timeout(self.UI_READ_TIMEOUT_S):
+            try:
+                return await self._ui_store_actor.call(read)
+            except _RegistryNotInitialized:
+                # First use with Memory disabled still needs an empty registry.
+                # Only the writer initializes schema; normal reads never join
+                # it or the shared asyncio thread pool.
+                await self._store_call(lambda store: None)
+                return await self._ui_store_actor.call(read)
 
     async def _recall_store_call(self, operation: Callable[[MemoryStore], _T]) -> _T:
         return await self._recall_store_actor.call(operation)
@@ -360,6 +396,7 @@ class MemoryEngine:
         self._closing = False
         self._store_actor.reopen()
         self._recall_store_actor.reopen()
+        self._ui_store_actor.reopen()
         if (os.environ.get("MUSELAB_MEMORY_WORKER_DISABLED") == "1"
                 or not self.enabled() or self._workers):
             return
@@ -458,6 +495,7 @@ class MemoryEngine:
         if close_store:
             await self._store_actor.close()
             await self._recall_store_actor.close()
+            await self._ui_store_actor.close()
 
     async def record_turn(self, session_id: str, model: str, user_text: str,
                           assistant_text: str, *, outcome: str = "success",
@@ -1599,7 +1637,7 @@ class MemoryEngine:
                 **store.stats(cfg.owner_id),
             }
 
-        registry = await self._store_call(load_status)
+        registry = await self._read_store_call(load_status)
         return {
             "enabled": cfg.enabled, "mode": cfg.mode,
             "worker_running": bool(self._workers),

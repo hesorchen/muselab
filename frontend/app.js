@@ -20538,15 +20538,10 @@ function portal() {
           if (!item?.id || (item.content && item._traceback)) return item;
           try {
             const base = "/api/memory/items/" + encodeURIComponent(item.id);
-            const [detailResponse, tracebackResponse] = await Promise.all([
-              fetch(base, { headers: this.hdr(), cache: "no-store" }),
-              fetch(base + "/traceback", {
-                headers: this.hdr(), cache: "no-store",
-              }),
+            const [detail, traceback] = await Promise.all([
+              this._settingsRead(base),
+              this._settingsRead(base + "/traceback"),
             ]);
-            const detail = detailResponse.ok ? await detailResponse.json() : {};
-            const traceback = tracebackResponse.ok
-              ? await tracebackResponse.json() : { sites: [] };
             return {
               ...item,
               kind: detail.kind || item.kind,
@@ -20877,20 +20872,15 @@ function portal() {
     },
 
     async _pollMemoryReview() {
+      if (this._memoryReviewLoading) return;
+      this._memoryReviewLoading = true;
       try {
         if (this._memoryMonitorEnabled == null) {
-          const cfgR = await fetch("/api/memory/config", {
-            headers: this.hdr(), cache: "no-store",
-          });
-          if (!cfgR.ok) return;
-          this._memoryMonitorEnabled = (await cfgR.json()).mode !== "off";
+          const cfg = await this._settingsRead("/api/memory/config");
+          this._memoryMonitorEnabled = cfg.mode !== "off";
         }
         if (!this._memoryMonitorEnabled) return;
-        const r = await fetch("/api/memory/status", {
-          headers: this.hdr(), cache: "no-store",
-        });
-        if (!r.ok) return;
-        const status = await r.json();
+        const status = await this._settingsRead("/api/memory/status");
         this.settings.memory.status = status;
         const ids = status.pending_artifact_ids || [];
         let seen = [];
@@ -20910,6 +20900,7 @@ function portal() {
           this._setLS("muselab_memory_artifacts_seen", JSON.stringify(merged));
         }
       } catch (_) { /* optional and fail-soft */ }
+      finally { this._memoryReviewLoading = false; }
     },
 
     SETTINGS_READ_TIMEOUT_MS: 8000,
@@ -20937,6 +20928,11 @@ function portal() {
         const response = await fetch(url, {
           headers: this.hdr(), cache: "no-store", signal: controller.signal,
         });
+        if (response.status === 503 && url.startsWith("/api/memory/")) {
+          throw new Error(this.lang === "zh"
+            ? "记忆查询暂时不可用，请重试"
+            : "Memory is temporarily unavailable. Please retry.");
+        }
         if (!response.ok) throw new Error("HTTP " + response.status);
         return await response.json();
       } catch (error) {

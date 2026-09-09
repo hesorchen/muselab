@@ -322,6 +322,7 @@ def test_mux_reconcile_batches_durable_projections_off_loop(
 
     def state(
         sid, *, runtime_lineage=None, durable_runtime_task_ids=None,
+        continuation_disk_state=None,
     ):
         status_calls.append((
             sid, runtime_lineage, durable_runtime_task_ids,
@@ -804,3 +805,123 @@ def test_mux_child_resync_does_not_close_other_sessions(
         await stream.aclose()
 
     asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("cause", ["slow_index", "held_session_lock", "sqlite_writer_lock"])
+def test_mux_revision_poll_never_indexes_or_blocks_loop(
+        chat_mod, monkeypatch, tmp_path, cause):
+    """A cancelled snapshot plus a changing transcript must remain read-only."""
+    import sqlite3
+    import time
+    import uuid
+    from backend import transcript_index_store
+
+    sid, turn = str(uuid.uuid4()), str(uuid.uuid4())
+    source = tmp_path / "fixture.jsonl"
+    source.write_text("")
+    folder = chat_mod.sess.SESS_DIR / "cancelled_turns" / sid
+    folder.mkdir(parents=True)
+    snapshot = folder / f"{turn}.json"
+    snapshot.write_text(json.dumps({
+        "schema": 1, "sid": sid, "turn_id": turn, "messages": [],
+        "transcript_boundary": {"record_count": 0}, "started_at_ms": 1,
+    }))
+    monkeypatch.setattr(chat_mod, "_find_session_jsonl",
+                        lambda value: source if value == sid else None)
+    chat_mod._sessions_with_inflight_tasks[sid] = {"fixture-background-task"}
+    if cause == "sqlite_writer_lock":
+        chat_mod._ensure_transcript_index(sid)
+    writes = []
+    original_write = transcript_index_store._write
+
+    def delayed_write(*args, **kwargs):
+        writes.append(threading.get_ident())
+        if cause == "slow_index":
+            time.sleep(0.3)
+        return original_write(*args, **kwargs)
+
+    monkeypatch.setattr(transcript_index_store, "_write", delayed_write)
+    entered, release = threading.Event(), threading.Event()
+
+    def hold_lock():
+        if cause == "sqlite_writer_lock":
+            with sqlite3.connect(chat_mod._transcript_index_path(sid)) as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                entered.set()
+                release.wait(2)
+                conn.rollback()
+        else:
+            with chat_mod.sess.session_lifecycle_lock(sid):
+                entered.set()
+                release.wait(2)
+
+    async def scenario():
+        holder = None
+        if cause != "slow_index":
+            holder = threading.Thread(target=hold_lock)
+            holder.start()
+            assert await asyncio.to_thread(entered.wait, 1)
+        frames, gaps = [], []
+        running = True
+
+        async def consume():
+            async for event in chat_mod._subscribe_multiplex({}):
+                if event["event"] == "session_state":
+                    frames.append(json.loads(event["data"]))
+
+        async def heartbeat():
+            while running:
+                before = time.perf_counter()
+                await asyncio.sleep(0.01)
+                gaps.append(time.perf_counter() - before)
+
+        consumer = asyncio.create_task(consume())
+        beat = asyncio.create_task(heartbeat())
+        try:
+            # Keep the JSONL changing as the SDK would during a live turn.
+            for _ in range(6):
+                with source.open("a") as output:
+                    output.write(json.dumps({
+                        "uuid": str(uuid.uuid4()), "type": "user",
+                        "sessionId": sid, "message": {"content": "fixture"},
+                    }) + "\n")
+                await asyncio.sleep(0.05)
+            assert frames
+            first_revision = frames[-1]["runtime_ui_revision"]
+            assert first_revision
+            snapshot.unlink()
+            for _ in range(30):
+                if frames[-1]["runtime_ui_revision"] != first_revision:
+                    break
+                await asyncio.sleep(0.02)
+            assert frames[-1]["runtime_ui_revision"] == ""
+            assert writes == []
+            assert max(gaps) < 0.15
+        finally:
+            release.set()
+            consumer.cancel()
+            await asyncio.gather(consumer, return_exceptions=True)
+            running = False
+            await beat
+            if holder:
+                await asyncio.to_thread(holder.join)
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        release.set()
+        chat_mod._sessions_with_inflight_tasks.pop(sid, None)
+
+
+def test_runtime_revision_unreadable_directory_does_not_break_status(
+        chat_mod, monkeypatch):
+    from backend import chat_overlays
+
+    class UnreadableDirectory:
+        def glob(self, pattern):
+            raise PermissionError("fixture")
+
+    monkeypatch.setattr(chat_overlays, "_cancelled_turn_session_dir",
+                        lambda sid: UnreadableDirectory())
+    assert chat_mod._runtime_continuation_projection_state(
+        "fixture-session", runtime_lineage=["fixture-session"]) == (False, "")

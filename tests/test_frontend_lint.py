@@ -277,7 +277,7 @@ def test_memory_traceback_stats_recalls_and_backup_ui_are_wired():
     assert "copyMemorySourceEvidence(item)" in app
     assert "await this._copySessionEvidence(site.session_id)" in app
     assert "this._jumpToMessage(site.session_id, site.message_id)" in app
-    assert 'fetch(base + "/traceback"' in app
+    assert 'this._settingsRead(base + "/traceback")' in app
     assert "memoryRecallStatsText(item)" in app
     assert "memoryRecallResultsText(item)" in app
     assert "memoryCreateBackup()" in app

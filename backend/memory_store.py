@@ -272,7 +272,24 @@ class MemoryStore:
                      else "PRAGMA busy_timeout=10000")
         if self._read_only:
             conn.execute("PRAGMA query_only=ON")
+            deadline = getattr(self, "_query_deadline", None)
+            if deadline is not None:
+                conn.set_progress_handler(
+                    lambda: int(time.perf_counter() >= deadline), 1000)
         return conn
+
+    @contextmanager
+    def read_budget(self, deadline: float):
+        """Interrupt expensive SQL after the read actor's absolute deadline."""
+        if not self._read_only:
+            raise RuntimeError("read budgets require a read-only store")
+        self._query_deadline = deadline
+        try:
+            if time.perf_counter() >= deadline:
+                raise TimeoutError("memory read deadline exceeded")
+            yield
+        finally:
+            self._query_deadline = None
 
     @contextmanager
     def _write_tx(self) -> Iterator[sqlite3.Connection]:
