@@ -127,3 +127,36 @@ def test_cancel_preflight_never_starts_post_and_saving_cannot_cancel(page, backe
         return {cancelled:current.transfer.cancelled, done:current.transfer.done};
     """)
     assert result == {"cancelled": False, "done": False}
+
+
+@pytest.mark.parametrize("width", [320, 390, 430])
+def test_touch_file_metadata_hides_without_overlapping_names(browser, backend_url, auth_token, width):
+    context = browser.new_context(viewport={"width": width, "height": 900},
+                                  is_mobile=True, has_touch=True, device_scale_factor=2)
+    page = context.new_page()
+    try:
+        _login(page, backend_url, auth_token)
+        _app_eval(page, """
+            app.setMobileTab('files');
+            app._stopFileEvents();
+            app.visible = [
+              {path:'report.md', name:'long-report-name.md', is_dir:false, depth:0, size:1024, mtime:1700000000},
+              {path:'nested/report.md', name:'nested-long-report.md', is_dir:false, depth:6, size:1024, mtime:1700000000},
+              {path:'folder', name:'long-folder-name', is_dir:true, depth:0, mtime:1700000000},
+            ];
+            app.fileTreeViewport = {start:0,end:80};
+        """)
+        assert page.evaluate("matchMedia('(pointer: coarse)').matches")
+        rows = page.locator('.filelist li[role="treeitem"]')
+        expect(rows).to_have_count(3)
+        for row in rows.all():
+            expect(row.locator(".file-modified")).to_be_hidden()
+            metrics = row.evaluate("""el => {
+                const name = el.querySelector('.name').getBoundingClientRect();
+                const trailing = el.querySelector('.tree-trailing').getBoundingClientRect();
+                return {overlap: name.right > trailing.left + 1,
+                        overflow: el.scrollWidth > el.clientWidth + 1};
+            }""")
+            assert metrics == {"overlap": False, "overflow": False}
+    finally:
+        context.close()

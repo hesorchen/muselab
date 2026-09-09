@@ -12555,36 +12555,39 @@ html[data-theme="light"] .hljs-symbol,
 html[data-theme="eyecare"] .hljs-built_in,
 html[data-theme="eyecare"] .hljs-symbol { color: #9a3e00; }
 
-/* Keep file rows compact; metadata gives way to names in narrow panes. */
-.filelist li .tree-trailing { flex-basis: 164px; }
+/* Size queries use each row's remaining width, including nested indentation.
+   Match touch selectors' specificity so metadata never overflows a 36px slot. */
+.filelist li[role="treeitem"] { container: file-row / inline-size; }
+.filelist li:is(.file, .dir) .tree-trailing { flex-basis: 164px; }
 .filelist .tree-metadata {
   display: flex; align-items: center; justify-content: flex-end; gap: 8px;
-  width: 100%; min-width: 0; white-space: nowrap;
+  width: 100%; min-width: 0; overflow: hidden; white-space: nowrap;
   color: var(--c-fg-3); font-size: var(--fs-2xs);
   font-variant-numeric: tabular-nums; transition: opacity var(--t-fast);
 }
 .filelist .tree-metadata .size { width: auto; flex: 0 0 auto; }
 .file-modified { flex: 0 0 auto; }
 .filelist li:hover .tree-metadata { opacity: 0; }
-@container (max-width: 320px) {
-  .filelist li .tree-trailing { flex-basis: 64px; }
+@container file-row (max-width: 300px) {
+  .filelist li:is(.file, .dir) .tree-trailing { flex-basis: 64px; }
   .file-modified { display: none; }
 }
-@container (max-width: 250px) {
-  .filelist li.file .tree-trailing { flex-basis: 22px; }
+@container file-row (max-width: 230px) {
+  .filelist li:is(.file, .dir) .tree-trailing { flex-basis: 44px; }
   .tree-metadata { display: none !important; }
 }
-@media (hover: none) {
-  .filelist li .tree-trailing { flex-basis: 208px; gap: 4px; }
-  .filelist li .tree-actions { position: static; flex: 0 0 40px; }
+@media (pointer: coarse), (hover: none) {
+  .filelist li:is(.file, .dir) .tree-trailing { flex-basis: 244px; gap: 4px; }
+  .filelist li .tree-actions { position: static; flex: 0 0 76px; }
   .filelist li .tree-metadata { opacity: 1; }
   .filelist li .tree-metadata .size { opacity: 1; }
-  @container (max-width: 360px) {
-    .filelist li .tree-trailing { flex-basis: 108px; }
+  @container file-row (max-width: 480px) {
+    .filelist li:is(.file, .dir) .tree-trailing { flex-basis: 144px; }
     .file-modified { display: none; }
   }
-  @container (max-width: 250px) {
-    .filelist li.file .tree-trailing { flex-basis: 40px; }
+  @container file-row (max-width: 230px) {
+    .filelist li:is(.file, .dir) .tree-trailing { flex-basis: 76px; }
+    .tree-metadata { display: none !important; }
   }
 }
 
