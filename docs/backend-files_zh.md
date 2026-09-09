@@ -16,13 +16,13 @@
 
 ## 端点
 
-当前共 21 个文件端点。普通请求使用 token 鉴权；浏览器下载先通过已鉴权请求签发一个短时、限定作用域的能力票据。
+当前共 24 个文件端点。普通请求使用 token 鉴权；浏览器下载先通过已鉴权请求签发一个短时、限定作用域的能力票据。
 
 ### 读取与预览
 
 | 方法与路径 | 用途 |
 |---|---|
-| `GET /api/files/list` | 列目录，最多 500 项 |
+| `GET /api/files/list` | 列目录，最多 500 项；支持名称或修改时间排序 |
 | `GET /api/files/stat` | 获取单个路径的类型、大小和修改时间 |
 | `GET /api/files/read` | 读取文本，最大 2 MiB |
 | `GET /api/files/raw` | 内联预览受支持的图片、媒体、PDF、HTML 与 SVG，其余强制下载 |
@@ -35,6 +35,8 @@
 
 `raw` 用于 iframe 和图片，仍接受查询参数 token。`download` 不再把可复用的应用 token 放入 URL：前端会先签发一个有效期 60 秒、只能使用一次，并绑定到具体文件和工作目录的票据。HTML/SVG 预览使用 sandbox CSP；HTML 预览桥仅对不超过 12 MiB 的文件注入滚动和图片交互支持。
 
+`list` 接受 `sort=name`（默认）、`mtime_desc` 或 `mtime_asc`。目录始终在前，排序发生在截取 500 项之前。文件面板会记住选择，并在文件修改后更新按时间排序的顺序。
+
 预览限制：
 
 - XLSX：最多 20 个 sheet、每个 500 行、50 列，单元格最多 500 字符。
@@ -46,11 +48,16 @@
 | 方法与路径 | 用途 |
 |---|---|
 | `PUT /api/files/write` | 原子覆盖或创建文本文件，最大 10 MiB |
-| `POST /api/files/upload` | Multipart 上传，默认每文件最大 100 MiB |
+| `GET /api/files/upload-limits` | 读取单文件上限（字节），供上传前检查 |
+| `POST /api/files/upload` | Multipart 上传，默认每文件最大 1 GiB（1024 MiB） |
+| `POST /api/files/upload/commit` | 确认暂存文件，原子保存到目标路径 |
+| `POST /api/files/upload/cancel` | 取消暂存上传并清理临时文件 |
 | `POST /api/files/mkdir` | 创建目录 |
 | `POST /api/files/rename` | 移动或重命名 |
 | `POST /api/files/copy-bak` | 创建 `.bak`、`.bak.2` 等备份副本 |
 | `DELETE /api/files/delete` | 默认软删除；`permanent=true` 永久删除 |
+
+浏览器上传携带随机 `upload_id`，先暂存，再确认保存。传输中可逐文件取消；取消不会覆盖已有同名文件。进入保存阶段后取消按钮禁用。未确认的暂存文件在服务运行期间最多保留 10 分钟，正常停机时也会清理。不带 `upload_id` 的兼容 API 请求仍直接保存。
 
 同名上传会先把原文件移入回收站，再原子替换，因而可以恢复。危险可执行扩展名和敏感文件名默认禁止上传。
 

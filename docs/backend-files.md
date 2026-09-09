@@ -16,7 +16,7 @@ Unregistered, removed, or disallowed directories are rejected. Returned paths ar
 
 ## Endpoints
 
-There are currently 21 Files endpoints. Normal calls use token authentication;
+There are currently 24 Files endpoints. Normal calls use token authentication;
 browser downloads use a short-lived, scope-bound capability ticket minted by
 an authenticated call.
 
@@ -24,7 +24,7 @@ an authenticated call.
 
 | Method and path | Purpose |
 |---|---|
-| `GET /api/files/list` | List a directory, up to 500 entries |
+| `GET /api/files/list` | List a directory, up to 500 entries; sort by name or modification time |
 | `GET /api/files/stat` | Read type, size, and modification time for one path |
 | `GET /api/files/read` | Read text, up to 2 MiB |
 | `GET /api/files/raw` | Inline supported image, media, PDF, HTML, and SVG; force-download other types |
@@ -41,6 +41,8 @@ first mints a 60-second, one-use ticket bound to the exact resolved file and
 workspace. HTML and SVG previews use a sandbox CSP. The HTML preview bridge for
 scroll and image interaction is injected only for files up to 12 MiB.
 
+`list` accepts `sort=name` (default), `mtime_desc`, or `mtime_asc`. Directories stay first, and sorting is applied before the 500-entry cap. The file panel remembers this choice and updates modification-time ordering after file changes.
+
 Preview limits:
 
 - XLSX: 20 sheets, 500 rows and 50 columns per sheet, 500 characters per cell.
@@ -52,11 +54,16 @@ Preview limits:
 | Method and path | Purpose |
 |---|---|
 | `PUT /api/files/write` | Atomically create or replace text, up to 10 MiB |
-| `POST /api/files/upload` | Multipart upload, 100 MiB per file by default |
+| `GET /api/files/upload-limits` | Read the configured per-file cap in bytes for upload preflight |
+| `POST /api/files/upload` | Multipart upload, 1 GiB (1024 MiB) per file by default |
+| `POST /api/files/upload/commit` | Atomically save a staged upload to its destination |
+| `POST /api/files/upload/cancel` | Cancel a staged upload and clean its temporary file |
 | `POST /api/files/mkdir` | Create a directory |
 | `POST /api/files/rename` | Move or rename |
 | `POST /api/files/copy-bak` | Create `.bak`, `.bak.2`, and later backup copies |
 | `DELETE /api/files/delete` | Soft-delete by default; `permanent=true` deletes permanently |
+
+Browser uploads use a random `upload_id` to stage bytes before explicitly committing them. Individual transfers can be cancelled without replacing an existing same-name file. Cancellation is disabled during the final save. Uncommitted staging expires after 10 minutes while the service runs and is cleaned on graceful shutdown. Legacy API calls without `upload_id` still save immediately.
 
 A same-name upload first moves the old file into the dustbin and then atomically replaces it, preserving recovery. Dangerous executable extensions and sensitive filenames are rejected by default.
 

@@ -595,6 +595,8 @@ async def _lifespan(app: FastAPI):
             terminal=_terminal_manager,
             file_watcher=_file_watch_manager,
         )
+        from .files import cleanup_pending_uploads
+        await cleanup_pending_uploads()
         await asyncio.to_thread(stop_diagnostics)
 
 
