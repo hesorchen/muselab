@@ -44,6 +44,8 @@ See [Scheduled tasks](scheduler.md) for scheduled execution. With Web Push confi
 
 Sessions display the thinking blocks, tool calls and results, code diffs, nested subagent timelines, and Hook status supplied by the runtime. Context usage, per-model usage, and turn duration help inspect each turn. Available records depend on the selected model and runtime.
 
+File paths in tool summaries and Bash stdout/stderr can be clicked to open the workspace preview. Quoted paths with spaces or Chinese filenames are supported; the script is opened for inspection, not executed.
+
 Settings provides model and Hook configuration, with separate entry points for memory management and service maintenance. See [Providers](providers.md) for model setup, and [Skills](skills.md) and [Configuration](configuration.md) for extensions.
 
 ## Annotating HTML elements
