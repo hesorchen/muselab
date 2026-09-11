@@ -68,3 +68,38 @@ def test_memory_diagnostics_render_safe_terminal_and_retry_states(page, backend_
     expect(panel).to_contain_text("invalid_json")
     with page.expect_response("**/api/memory/status"):
         panel.locator("button").click()
+
+
+@pytest.mark.parametrize("width", [390, 1440])
+def test_recall_timeout_seconds_and_unlimited_save_reload(page, backend_url, auth_token, width):
+    page.set_viewport_size({"width": width, "height": 900})
+    _login(page, backend_url, auth_token)
+    headers = {"X-Auth-Token": auth_token}
+    original = page.request.get(backend_url + "/api/memory/config", headers=headers).json()
+
+    def open_form():
+        page.evaluate("""async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          app.lang = 'zh'; await app.openSettings('memory_engine');
+        }""")
+        page.wait_for_function("() => document.querySelector('#app')._x_dataStack[0].settings.memory.configLoaded")
+        return page.locator('#setting-settings-memory-config-retrieval-soft-timeout-ms')
+
+    try:
+        field = open_form()
+        expect(page.get_by_label('召回超时时间（秒）')).to_be_visible()
+        expect(page.get_by_text('0 表示无超时。', exact=True)).to_be_visible()
+        for seconds in (30, 0):
+            field.fill(str(seconds))
+            with page.expect_response(lambda r: '/api/memory/config' in r.url and r.request.method == 'PUT') as saved:
+                page.get_by_role('button', name='保存记忆设置', exact=True).last.click()
+            assert saved.value.status == 200
+            assert saved.value.request.post_data_json['retrieval']['soft_timeout_ms'] == seconds * 1000
+            page.wait_for_function("() => !document.querySelector('#app')._x_dataStack[0].settings.memory.saving")
+            page.reload()
+            page.wait_for_selector('.chat-tabs-list')
+            field = open_form()
+            expect(field).to_have_value(str(seconds))
+    finally:
+        response = page.request.put(backend_url + '/api/memory/config?probe=false', headers=headers, data=original)
+        assert response.status == 200

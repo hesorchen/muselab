@@ -2258,3 +2258,50 @@ async def test_queued_required_attachment_write_failure_retries_same_id(
     assert succeeded["inflight"] is None
     assert aid not in chat._image_store
     assert aid not in chat._staged_attachment_claims
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('finish_during_recall', [False, True])
+async def test_steering_recall_precedes_sdk_write_and_falls_back_if_owner_finishes(
+        app_module, monkeypatch, finish_during_recall):
+    from backend import chat
+    sess = _sess(app_module)
+    sid = sess.create_session()['id']
+    writes = []
+    recalled = []
+
+    class SteeringClient:
+        async def query_steering(self, prompt, *, session_id, command_uuid):
+            assert recalled == [prompt]
+            writes.append(prompt)
+            output = await chat.mem0.build_recall_hook(sid, prepared_only=True)(
+                {'prompt': prompt}, None, None)
+            assert output['hookSpecificOutput']['additionalContext'] == 'synthetic memory'
+
+    monkeypatch.setattr(chat, 'MuseLabSDKClient', SteeringClient)
+    monkeypatch.setattr(chat.mem0, 'enabled', lambda: True)
+    broadcast = chat.TurnBroadcast(sid)
+    broadcast.query_committed = True
+    broadcast.runtime_client = SteeringClient()
+    chat._active_turns[sid] = broadcast
+
+    async def recall(query, _session_id):
+        # Slow memory work must not join the 10-second SDK delivery deadline.
+        assert not broadcast.steering_write_events
+        recalled.append(query)
+        if finish_during_recall:
+            broadcast.steering_closed = True
+        return 'synthetic memory'
+
+    monkeypatch.setattr(chat.mem0, 'search_context', recall)
+    try:
+        response = await chat.enqueue_api(sid, chat.QueueEnqueueReq(
+            text='synthetic follow-up', delivery='adjust', active_turn_id=broadcast.turn_id),
+            chat.BackgroundTasks())
+        assert recalled == ['synthetic follow-up']
+        assert response['effective_delivery'] == ('queue' if finish_during_recall else 'adjust')
+        assert writes == ([] if finish_during_recall else ['synthetic follow-up'])
+        assert sid not in chat.mem0._prepared_recalls
+    finally:
+        chat._active_turns.pop(sid, None)
+        chat.mem0.clear_prepared_recall(sid, broadcast.turn_id)

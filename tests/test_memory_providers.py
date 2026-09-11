@@ -643,3 +643,118 @@ def test_generation_json_diagnostics_have_safe_specific_reason(monkeypatch, valu
         _run(provider.complete_json("system", "prompt"))
     assert classify_memory_failure(caught.value)[1]["reason"] == reason
     assert GenerationError(retryable=False, reason="private detail").reason == "unknown"
+
+
+@pytest.mark.parametrize("budget", ["unlimited", "positive", "background"])
+def test_recall_providers_use_single_budget_without_changing_background(monkeypatch, budget):
+    import time
+    from contextlib import nullcontext
+    from backend import memory_providers as module
+    from backend.memory_config import EmbeddingConfig, RerankConfig, VectorConfig
+    seen = []
+
+    class Response:
+        def raise_for_status(self): pass
+
+        def json(self):
+            return {"data": [{"index": 0, "embedding": [1., 0.]}],
+                    "result": [], "results": [{"index": 0, "relevance_score": 1.}]}
+
+    class Client:
+        def __init__(self, *, timeout): seen.append(timeout)
+
+        async def __aenter__(self): return self
+
+        async def __aexit__(self, *args): return False
+
+        async def post(self, *args, **kwargs): return Response()
+
+        async def request(self, *args, **kwargs): return Response()
+
+    monkeypatch.setattr(module.httpx, "AsyncClient", Client)
+
+    async def scenario():
+        context = (nullcontext() if budget == "background" else
+                   module.recall_request_budget(None if budget == "unlimited" else time.perf_counter() + 30))
+        with context:
+            await module.EmbeddingProvider(EmbeddingConfig(
+                base_url="http://example.test", model="test", timeout_seconds=1)).embed(["synthetic"])
+            await module.QdrantVectorStore(VectorConfig(
+                url="http://example.test", timeout_seconds=1)).search([1., 0.], owner_id="default", limit=1)
+            await module.Reranker(RerankConfig(
+                enabled=True, base_url="http://example.test", model="test", timeout_seconds=1)).rerank("synthetic", ["fact"])
+        assert module._request_timeout(1) == 1
+        assert len(seen) == 3
+        for timeout in seen:
+            values = timeout.as_dict().values()
+            if budget == "unlimited":
+                assert all(value is None for value in values)
+            elif budget == "positive":
+                assert all(20 < value <= 30 for value in values)
+            else:
+                assert all(value == 1 for value in values)
+
+    _run(scenario())
+
+
+@pytest.mark.parametrize("budget", [None, .02])
+def test_pgvector_search_cancels_actual_async_query(monkeypatch, budget):
+    import time
+    import psycopg
+    from backend import memory_providers as module
+    from backend.memory_config import VectorConfig
+    entered, cancelled = asyncio.Event(), asyncio.Event()
+
+    class Connection:
+        @classmethod
+        async def connect(cls, url, **kwargs):
+            assert kwargs["connect_timeout"] == 0
+            return cls()
+
+        async def __aenter__(self): return self
+
+        async def __aexit__(self, *args): return False
+
+        async def execute(self, sql, params):
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+
+    monkeypatch.setattr(psycopg, "AsyncConnection", Connection)
+
+    async def scenario():
+        store = module.PgVectorStore(VectorConfig(
+            provider="pgvector", url="postgresql://example.test/memory", collection="memory"))
+        with module.recall_request_budget(None if budget is None else time.perf_counter() + budget):
+            task = asyncio.create_task(store.search([1., 0.], owner_id="default", limit=1))
+        await entered.wait()
+        if budget is None:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        else:
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(task, .5)
+        assert cancelled.is_set()
+
+    _run(scenario())
+
+
+@pytest.mark.parametrize("wrapped", [True, False])
+def test_qdrant_search_accepts_object_and_legacy_list_results(monkeypatch, wrapped):
+    from backend.memory_config import VectorConfig
+    from backend.memory_providers import QdrantVectorStore
+    points = [{"id": "point", "payload": {"memory_id": "memory"}, "score": .9}]
+
+    class Response:
+        def json(self): return {"result": {"points": points} if wrapped else points}
+
+    async def request(*args, **kwargs): return Response()
+
+    store = QdrantVectorStore(VectorConfig(url="http://example.test"))
+    monkeypatch.setattr(store, "_request", request)
+    result = _run(store.search([1., 0.], owner_id="default", limit=1))
+    assert result[0]["id"] == "memory"
+    assert result[0]["score"] == .9

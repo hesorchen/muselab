@@ -1321,7 +1321,7 @@ function portal() {
           rerank: { enabled: false, base_url: "", api_key: "",
             model: "", timeout_seconds: 3 },
           retrieval: { dense_candidates: 20, lexical_candidates: 20,
-            final_limit: 6, max_context_chars: 3000, soft_timeout_ms: 250 },
+            final_limit: 6, max_context_chars: 3000, soft_timeout_ms: 0 },
           consolidation: { episode_turns: 6, episode_idle_minutes: 30,
             dreamer_enabled: true, verifier_enabled: true,
             skill_learning_enabled: true, min_reflection_episodes: 2,
@@ -18527,15 +18527,20 @@ function portal() {
     // tabState[sid].messages and never touches another pane or
     // messagesLoading unless sid === currentId), so prefetching an
     // off-screen session can't disturb the active view.
+    _backgroundHistoryLoadBusy() {
+      return (typeof document !== "undefined" && document.hidden)
+        || this.activeSessionPane().streaming
+        || Object.values(this._prefetching || {}).some(Boolean);
+    },
     prefetchSession(sid) {
-      if (!sid) return;
+      if (!sid || this._backgroundHistoryLoadBusy()) return;
       const st = this.tabState && this.tabState[sid];
       if (st && st._loaded) return;
       if (!this._prefetching) this._prefetching = {};
       if (this._prefetching[sid]) return;
       clearTimeout(this._prefetchTimer);
       this._prefetchTimer = setTimeout(async () => {
-        if (this._prefetching[sid]) return;
+        if (this._backgroundHistoryLoadBusy()) return;
         // Re-check loaded state: it may have flipped while we waited
         // (user clicked the row mid-debounce → switchSession ran).
         const st2 = this.tabState && this.tabState[sid];
@@ -19422,6 +19427,7 @@ function portal() {
         this._scheduleIdlePreload();
         return;
       }
+      if (this._backgroundHistoryLoadBusy()) return;
       if (!this._prefetching) this._prefetching = {};
       this._prefetching[next] = true;
       this._ensureSessionLoaded(next)

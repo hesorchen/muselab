@@ -356,6 +356,7 @@ def test_severe_loop_watchdog_attributes_privacy_safe_site_and_rate_limits(
     )
     assert "/home/" not in repr(events)
     assert "prompt" not in repr(events)
+    assert len(events[0][1]["callers"]) <= 160
     assert events[1][1]["lag_ms"] == 65000
 
 

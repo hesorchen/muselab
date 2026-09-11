@@ -156,8 +156,11 @@ async def to_thread_io(
     file name is never retained or logged.
     """
     measured: dict[str, int] = {}
+    submitted = monotonic()
 
     def invoke() -> _T:
+        entered = monotonic()
+        measured["queue_ms"] = elapsed_ms(submitted, entered)
         size = max(0, int(file_size or 0))
         path = file_path() if callable(file_path) else file_path
         if path is not None:
@@ -193,12 +196,15 @@ async def to_thread_io(
             raise
     finally:
         duration = measured.get("duration_ms")
-        if duration is not None and is_slow(duration, threshold_ms=slow_io_ms()):
+        total = elapsed_ms(submitted)
+        if duration is not None and is_slow(total, threshold_ms=slow_io_ms()):
             perf_event(
                 "runtime.io",
                 site=site,
                 session=short_id(session_id) or "none",
                 duration_ms=duration,
+                queue_ms=measured.get("queue_ms", 0),
+                total_ms=total,
                 file_size=measured.get("file_size", 0),
             )
 

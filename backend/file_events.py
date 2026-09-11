@@ -24,7 +24,7 @@ from watchfiles import Change, awatch
 from .auth import require_token
 from .capability_tickets import tickets
 from .files import INTERNAL_DIR_NAME, TRASH_DIR_NAME
-from .observability import elapsed_ms, is_slow, monotonic, perf_event, short_id
+from .observability import elapsed_ms, is_slow, monotonic, perf_event, short_id, to_thread_io
 from .workspace_store import (
     _SCAN_MAX_FILES,
     _SCAN_MAX_SECONDS,
@@ -51,6 +51,7 @@ _MAX_WATCHED_ROOTS = 16
 _MAX_EVENT_SUBSCRIBERS = 64
 _MAX_CONCURRENT_RECONCILES = 4
 _SCAN_CANCEL_GRACE_S = 0.25
+_SCAN_EXCHANGE_TIMEOUT_S = max(30.0, _SCAN_MAX_SECONDS * 3)
 _PARTIAL_RECONCILE_YIELD_S = 0.01
 _NATIVE_DIRECTORY_WATCH_HARD_CAP = 131_072
 _WATCH_LINGER_S = 30.0
@@ -1378,13 +1379,12 @@ class FileWatchManager:
             if connection is not None:
                 connection.close()
             return
-        if connection is not None and process.is_alive():
-            with contextlib.suppress(BrokenPipeError, EOFError, OSError):
-                connection.send(None)
-        await asyncio.to_thread(process.join, _SCAN_CANCEL_GRACE_S)
+        # The scanner only reads files. Once cooperative cancellation failed,
+        # terminate it without sending into a potentially full IPC pipe on the
+        # event loop (the worker may be stuck in a filesystem call).
         if process.is_alive():
             process.terminate()
-            await asyncio.to_thread(process.join, _SCAN_CANCEL_GRACE_S)
+        await asyncio.to_thread(process.join, _SCAN_CANCEL_GRACE_S)
         if process.is_alive():
             process.kill()
             await asyncio.to_thread(process.join, _SCAN_CANCEL_GRACE_S)
@@ -1416,10 +1416,13 @@ class FileWatchManager:
         """Run one bounded scan in the reusable spawned worker."""
         if state.reconcile_cancel.is_set():
             raise WorkspaceScanCancelled("workspace scan cancelled")
+        queued = monotonic()
         async with self._scan_worker_lock:
+            entered = monotonic()
             if state.reconcile_cancel.is_set():
                 raise WorkspaceScanCancelled("workspace scan cancelled")
-            self._ensure_scan_worker_locked()
+            await to_thread_io(
+                "files.scan_worker_start", "", self._ensure_scan_worker_locked, owned=True)
             self._scan_cancel.clear()
             request = (
                 str(state.root),
@@ -1436,7 +1439,13 @@ class FileWatchManager:
                 done, _ = await asyncio.wait(
                     {exchange, cancelled},
                     return_when=asyncio.FIRST_COMPLETED,
+                    timeout=_SCAN_EXCHANGE_TIMEOUT_S,
                 )
+                if not done:
+                    await self._cancel_scan_exchange(exchange)
+                    # No response means no authoritative snapshot. Preserve the
+                    # last-good index and let the existing backoff retry later.
+                    raise WorkspaceScanIncomplete("workspace scan worker deadline exceeded")
                 if cancelled in done:
                     await self._cancel_scan_exchange(exchange)
                     raise WorkspaceScanCancelled("workspace scan cancelled")
@@ -1455,6 +1464,11 @@ class FileWatchManager:
                 await self._stop_scan_worker_locked()
                 await asyncio.gather(cancelled, return_exceptions=True)
                 raise
+            finally:
+                _perf_event(
+                    "files.scan", workspace=short_id(state.workspace_id),
+                    queue_ms=elapsed_ms(queued, entered), duration_ms=elapsed_ms(entered),
+                )
 
             status, rows, report, progress = response
             state.scan_progress = progress if isinstance(progress, dict) else {}

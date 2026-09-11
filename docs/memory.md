@@ -24,7 +24,7 @@ Configure Memory under Settings with:
 3. Qdrant or PostgreSQL + pgvector;
 4. an optional reranker.
 
-Saving an enabled configuration through the UI probes the required capabilities by default; a failed probe prevents activation. `off` has no chat overhead, `shadow` forms reviewable candidates without recall, and `active` enables bounded hybrid recall. New configurations use a 2000 ms soft recall deadline; existing configurations retain their saved value. Retrieval or reranking failures and timeouts preserve available results where possible, or continue the reply without injecting memory. Dreamer, Verifier, indexing, and Skill learning run in the background.
+Saving an enabled configuration through the UI probes the required capabilities by default; a failed probe prevents activation. `off` has no chat overhead, `shadow` forms reviewable candidates without recall, and `active` enables bounded hybrid recall. The UI exposes one recall timeout in seconds: `0` (the default for new configurations) waits without a recall deadline; a positive value bounds the complete recall pipeline. Existing configurations retain their saved value under `retrieval.soft_timeout_ms`. Recent context, dense and lexical search, hydration, and enabled reranking share that budget, without shorter internal timers. Recall runs before SDK query submission; its one-shot result is injected through `UserPromptSubmit.additionalContext`, so the SDK hook timer cannot silently discard a slow recall. Stop still cancels the wait. Logs record stage starts, durations, result counts, timeout and cancellation states without query or memory text. Retrieval or reranking failures and timeouts preserve available results where possible, or continue the reply without injecting memory. Dreamer, Verifier, indexing, and Skill learning run in the background.
 
 ## Dreaming and hybrid recall
 
@@ -98,16 +98,24 @@ Recall uses its own SQLite actor and read-only connections to the WAL registry.
 Background consolidation, job bookkeeping, and recall telemetry use the write
 actor. A recall read does not initialize or migrate the schema.
 
-The soft budget starts at recall entry and covers recent evidence, dense and
-lexical retrieval, hydration, and optional reranking. The configurable maximum
-is 5 seconds; the facade stops at 8 seconds, before the SDK's 10-second hook
-watchdog. Retrieval reserves a small part of its budget for hydration so that a
-stalled channel does not discard the other channel's completed hits. Reranking
-failure preserves hydrated results and reports partial success.
+The timeout starts at recall entry and covers recent evidence, dense and
+lexical retrieval, hydration, and optional reranking. Zero disables the recall
+deadline; positive values apply to all stages together. There is no reserved
+sub-budget or independent facade timer. Each channel hydrates its hits as soon
+as it finishes. Reranking failure preserves hydrated results and reports partial
+success. Cancelling a wait also interrupts its executing SQLite query.
 
-Safe performance events `memory.recall_hook_start`, `memory.recall_finish`,
-and `memory.recall_hook_finish` report stage outcomes, elapsed time, counts,
-and whether context was injected, without query or memory text. The recall ID
+Recall finishes before SDK query submission, including queued follow-up
+messages. The hook consumes each result once for its exact prompt, retaining
+the canonical user message unchanged. If the active turn finishes while a
+follow-up is recalling, that message stays queued for the next turn. Its
+preparation cannot replace the active reply's already-injected recall receipt.
+
+Safe performance events `memory.recall_start`, `memory.recall_stage_start`,
+`memory.recall_stage`, `memory.recall_wait`, `memory.recall_finish`, and
+`memory.recall_hook_finish` report stage outcomes, elapsed time, counts,
+and whether context was injected, without query or memory text. Waiting emits
+a progress record every five seconds; cancellation has its own status. The recall ID
 continues into `done.memory_recall`; the footer counts facts actually injected
 after sanitization and context limits. Persistent receipts keep IDs and stage
 diagnostics without duplicating memory contents. These diagnostics concern

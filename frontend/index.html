@@ -4543,9 +4543,11 @@
             <input id="setting-settings-memory-config-vector-collection" class="settings-input" x-model="settings.memory.config.vector.collection" /></div>
 
           <div class="memory-subtitle" x-text="lang==='zh' ? '检索与巩固' : 'Retrieval and consolidation'"></div>
-          <div class="settings-row"><label for="setting-settings-memory-config-retrieval-soft-timeout-ms" x-text="lang==='zh' ? '召回软截止（ms）' : 'Recall soft deadline (ms)'"></label>
-            <input id="setting-settings-memory-config-retrieval-soft-timeout-ms" class="settings-input" type="number" min="100" max="5000"
-                   x-model.number="settings.memory.config.retrieval.soft_timeout_ms" /></div>
+          <div class="settings-row"><label for="setting-settings-memory-config-retrieval-soft-timeout-ms" x-text="lang==='zh' ? '召回超时时间（秒）' : 'Recall timeout (seconds)'"></label>
+            <input id="setting-settings-memory-config-retrieval-soft-timeout-ms" class="settings-input" type="number" min="0" step="1"
+                   :value="settings.memory.config.retrieval.soft_timeout_ms / 1000"
+                   @input="settings.memory.config.retrieval.soft_timeout_ms = Math.round(Number($event.target.value) * 1000)" /></div>
+          <div class="settings-hint" x-text="lang==='zh' ? '0 表示无超时。' : '0 means no timeout.'"></div>
           <div class="settings-row"><label for="setting-settings-memory-config-retrieval-final-limit" x-text="lang==='zh' ? '最终召回条数' : 'Final recall limit'"></label>
             <input id="setting-settings-memory-config-retrieval-final-limit" class="settings-input" type="number" min="1" max="20"
                    x-model.number="settings.memory.config.retrieval.final_limit" /></div>

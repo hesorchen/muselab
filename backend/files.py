@@ -1,5 +1,5 @@
 import asyncio
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
 import ctypes
 import errno
@@ -23,6 +23,7 @@ from fastapi import (
 )
 from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse, RedirectResponse
 from pydantic import BaseModel
+from . import observability as obs
 from .auth import require_token, require_token_query
 from .capability_tickets import tickets
 from .private_storage import (
@@ -3433,9 +3434,33 @@ def upload_limits() -> dict:
 # Two-phase browser uploads keep an aborted HTTP request from committing a
 # file whose body the server already received. Legacy uploads remain immediate.
 _PENDING_UPLOADS: dict[tuple[str, str, str], dict] = {}
-_PENDING_UPLOAD_LOCK = threading.RLock()
+_PENDING_UPLOAD_LOCK = threading.Lock()
 _PENDING_UPLOAD_TTL = 600
 _PENDING_UPLOAD_CAP = 1024
+
+
+@asynccontextmanager
+async def _pending_upload_registry():
+    # Commit/expiry hold the same registry lock while doing disk I/O. Never
+    # wait for them on the event loop. A plain Lock allows acquisition in the
+    # worker and release by the request owner; none of these scopes re-enter.
+    acquired = False
+
+    def acquire():
+        nonlocal acquired
+        _PENDING_UPLOAD_LOCK.acquire()
+        acquired = True
+
+    try:
+        await obs.to_thread_io("files.upload_registry_wait", "", acquire, owned=True)
+    except BaseException:
+        if acquired:
+            _PENDING_UPLOAD_LOCK.release()
+        raise
+    try:
+        yield
+    finally:
+        _PENDING_UPLOAD_LOCK.release()
 
 
 class UploadControlReq(BaseModel):
@@ -3476,7 +3501,7 @@ def _new_pending_upload(key, **fields):
 
 
 async def cleanup_pending_uploads():
-    with _PENDING_UPLOAD_LOCK:
+    async with _pending_upload_registry():
         records = list(_PENDING_UPLOADS.values())
         _PENDING_UPLOADS.clear()
         for record in records:
@@ -3491,8 +3516,9 @@ async def cleanup_pending_uploads():
 
 @router.post("/upload/cancel", dependencies=[Depends(require_token)])
 async def cancel_upload(req: UploadControlReq, root: Path = Depends(_workspace_root)) -> dict:
-    key = _upload_key(req.upload_id, req.path, root)
-    with _PENDING_UPLOAD_LOCK:
+    key = await obs.to_thread_io(
+        "files.upload_resolve", "", _upload_key, req.upload_id, req.path, root)
+    async with _pending_upload_registry():
         record = _PENDING_UPLOADS.get(key)
         if record is None:
             # A cancel may beat multipart parsing. Keep a tombstone so a
@@ -3507,7 +3533,8 @@ async def cancel_upload(req: UploadControlReq, root: Path = Depends(_workspace_r
 
 @router.post("/upload/commit", dependencies=[Depends(require_token)])
 async def commit_upload(req: UploadControlReq, root: Path = Depends(_workspace_root)) -> dict:
-    key = _upload_key(req.upload_id, req.path, root)
+    key = await obs.to_thread_io(
+        "files.upload_resolve", "", _upload_key, req.upload_id, req.path, root)
 
     def commit():
         with _PENDING_UPLOAD_LOCK:
@@ -3524,7 +3551,7 @@ async def commit_upload(req: UploadControlReq, root: Path = Depends(_workspace_r
             finally:
                 _PENDING_UPLOADS.pop(key, None)
                 record["tmp"].unlink(missing_ok=True)
-    return await asyncio.to_thread(commit)
+    return await obs.to_thread_io("files.upload_commit", "", commit, owned=True)
 
 
 @router.post("/upload", dependencies=[Depends(require_token)])
@@ -3534,10 +3561,14 @@ async def upload(
     upload_id: str = Form(""),
     root: Path = Depends(_workspace_root),
 ) -> dict:
-    target_dir = safe_resolve(path, root=root)
-    _guard_not_trash(target_dir, root)
-    if not target_dir.exists() or not target_dir.is_dir():
-        raise HTTPException(status_code=400, detail="target dir invalid")
+    def resolve_directory():
+        directory = safe_resolve(path, root=root)
+        _guard_not_trash(directory, root)
+        if not directory.is_dir():
+            raise HTTPException(status_code=400, detail="target dir invalid")
+        return directory
+
+    target_dir = await obs.to_thread_io("files.upload_resolve", "", resolve_directory)
     safe_name = Path(file.filename or "upload.bin").name
     # Path("." ).name and Path("..").name are both "" — those filenames
     # produced an empty safe_name → `target_dir / ""` == target_dir, and
@@ -3561,21 +3592,27 @@ async def upload(
     tmp_path = dest.parent / f".~{dest.name}.{_uuid.uuid4().hex[:8]}.uploading"
     pending = None
     if upload_id:
-        key = _upload_key(upload_id, path, root)
-        with _PENDING_UPLOAD_LOCK:
+        key = await obs.to_thread_io(
+            "files.upload_resolve", "", _upload_key, upload_id, path, root)
+        async with _pending_upload_registry():
             if key in _PENDING_UPLOADS:
                 raise HTTPException(409, "upload id already used or cancelled")
             pending = _new_pending_upload(key, tmp=tmp_path, cancelled=False)
     written = 0
+    sink = None
+
+    def open_sink():
+        nonlocal sink
+        sink = tmp_path.open("wb")
+
     try:
-        with tmp_path.open("wb") as f:
+        try:
+            await obs.to_thread_io("files.upload_open", "", open_sink, owned=True)
             while chunk := await file.read(1024 * 1024):
                 written += len(chunk)
                 if pending and pending.get("cancelled"):
                     raise HTTPException(409, "upload cancelled")
                 if written > MAX_UPLOAD_BYTES:
-                    f.close()
-                    tmp_path.unlink(missing_ok=True)
                     raise HTTPException(
                         status_code=413,
                         detail=f"upload exceeds {MAX_UPLOAD_BYTES // (1024*1024)} MB cap",
@@ -3583,7 +3620,13 @@ async def upload(
                 # Off-load the blocking disk write so a large multi-MB upload
                 # doesn't stall the event loop chunk-by-chunk. (perf: RED —
                 # files.py upload sync write)
-                await asyncio.to_thread(f.write, chunk)
+                await obs.to_thread_io(
+                    "files.upload_write", "", sink.write, chunk, owned=True)
+        finally:
+            # Opening/writing must finish before close, including cancellation.
+            # Closing can flush buffered bytes, so it is blocking I/O too.
+            if sink is not None:
+                await obs.to_thread_io("files.upload_close", "", sink.close, owned=True)
         # Overwrite protection: a same-name upload used to silently clobber the
         # existing file via rename() — no 409, no trash, no undo — which
         # contradicts /rename's 409 guard and the whole soft-delete design.
@@ -3616,26 +3659,28 @@ async def upload(
                 _fsync_rename(tmp_path.parent, dest.parent)
                 return trashed
         if pending is not None:
-            with _PENDING_UPLOAD_LOCK:
+            async with _pending_upload_registry():
                 if pending.get("cancelled") or _PENDING_UPLOADS.get(key) is not pending:
                     raise HTTPException(409, "upload cancelled or expired")
                 pending.update(ready=True, finalize=_finalize, dest=dest, size=written,
                                path=(_logical_relative_path(path) / safe_name).as_posix())
             return {"ok": True, "pending": True, "path": pending["path"], "size": written}
-        trashed = await asyncio.to_thread(_finalize)
+        trashed = await obs.to_thread_io(
+            "files.upload_finalize", "", _finalize, owned=True)
     except BaseException:
         if pending:
-            with _PENDING_UPLOAD_LOCK:
+            async with _pending_upload_registry():
                 pending["cancelled"] = True
                 if _PENDING_UPLOADS.get(key) is pending:
                     _PENDING_UPLOADS.pop(key)
                     pending["expiry"].cancel()
-        tmp_path.unlink(missing_ok=True)
+        await obs.to_thread_io(
+            "files.upload_cleanup", "", tmp_path.unlink, missing_ok=True, owned=True)
         raise
     return {
         "ok": True,
         "path": (_logical_relative_path(path) / safe_name).as_posix(),
-        "size": dest.stat().st_size,
+        "size": written,
         # Non-null when an existing same-name file was moved to trash so the
         # frontend can surface "replaced (old version in trash)".
         "replaced_trash_id": (trashed or {}).get("trash_id"),

@@ -108,6 +108,8 @@ def test_to_thread_io_offloads_and_logs_only_bounded_metadata(
             "site": "chat.transcript_tail",
             "session": "12345678",
             "duration_ms": events[0][1]["duration_ms"],
+            "queue_ms": events[0][1]["queue_ms"],
+            "total_ms": events[0][1]["total_ms"],
             "file_size": 6,
         },
     )]
@@ -142,3 +144,36 @@ def test_owned_to_thread_io_joins_worker_before_propagating_cancellation():
         assert completed.is_set()
 
     asyncio.run(scenario())
+
+
+def test_to_thread_io_reports_queue_wait_for_fast_work(monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from backend import observability as obs
+    entered, release = threading.Event(), threading.Event()
+    events = []
+    monkeypatch.setenv("MUSELAB_SLOW_IO_MS", "20")
+    monkeypatch.setattr(obs, "perf_event", lambda event, **fields: events.append((event, fields)))
+
+    def blocker():
+        entered.set()
+        release.wait(2)
+
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        loop.set_default_executor(ThreadPoolExecutor(max_workers=1))
+        blocking = asyncio.create_task(asyncio.to_thread(blocker))
+        while not entered.is_set():
+            await asyncio.sleep(.001)
+        task = asyncio.create_task(obs.to_thread_io("fixture.queue", "", lambda: 42))
+        try:
+            await asyncio.sleep(.08)
+        finally:
+            release.set()
+            await blocking
+        assert await task == 42
+
+    asyncio.run(scenario())
+    fields = next(fields for event, fields in events if event == "runtime.io")
+    assert fields["queue_ms"] >= 50
+    assert fields["duration_ms"] < fields["queue_ms"]
+    assert fields["total_ms"] >= fields["queue_ms"]

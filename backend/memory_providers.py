@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+from contextlib import contextmanager
 from contextvars import ContextVar
 import time
 import json
@@ -37,6 +38,32 @@ def _safe_http_url(raw: str) -> str:
     return value
 
 
+_DEFAULT_REQUEST_BUDGET = object()
+_recall_deadline = ContextVar("memory_recall_deadline", default=_DEFAULT_REQUEST_BUDGET)
+
+
+@contextmanager
+def recall_request_budget(deadline: float | None):
+    """Override adapter timers for recall only; background jobs keep theirs."""
+    token = _recall_deadline.set(deadline)
+    try:
+        yield
+    finally:
+        _recall_deadline.reset(token)
+
+
+def _request_timeout(configured: float) -> float | None:
+    deadline = _recall_deadline.get()
+    if deadline is _DEFAULT_REQUEST_BUDGET:
+        return configured
+    if deadline is None:
+        return None
+    remaining = deadline - time.perf_counter()
+    if remaining <= 0:
+        raise TimeoutError("memory recall deadline exceeded")
+    return remaining
+
+
 class EmbeddingProvider:
     def __init__(self, config: EmbeddingConfig):
         self.config = config
@@ -53,7 +80,7 @@ class EmbeddingProvider:
         vectors: list[list[float]] = []
         batch_size = max(1, int(self.config.batch_size))
         async with httpx.AsyncClient(
-            timeout=httpx.Timeout(self.config.timeout_seconds)
+            timeout=httpx.Timeout(_request_timeout(self.config.timeout_seconds))
         ) as client:
             for start in range(0, len(texts), batch_size):
                 chunk = texts[start:start + batch_size]
@@ -136,7 +163,7 @@ class QdrantVectorStore(VectorStore):
 
     async def _request(self, method: str, path: str, **kwargs) -> httpx.Response:
         async with httpx.AsyncClient(
-            timeout=httpx.Timeout(self.config.timeout_seconds)
+            timeout=httpx.Timeout(_request_timeout(self.config.timeout_seconds))
         ) as client:
             response = await client.request(
                 method, f"{self.base}{path}", headers=self.headers, **kwargs)
@@ -201,7 +228,8 @@ class QdrantVectorStore(VectorStore):
         )
         body = response.json()
         result = body.get("result", {})
-        points = result.get("points", result if isinstance(result, list) else [])
+        points = (result.get("points", []) if isinstance(result, dict) else
+                  result if isinstance(result, list) else [])
         return [{
             "id": (point.get("payload") or {}).get("memory_id"),
             "score": float(point.get("score", 0)),
@@ -304,17 +332,25 @@ class PgVectorStore(VectorStore):
 
     async def search(self, vector: list[float], *, owner_id: str,
                      limit: int) -> list[dict]:
-        def run():
-            with self._connect() as conn:
-                rows = conn.execute(
+        try:
+            import psycopg
+        except ImportError as exc:
+            raise RuntimeError(
+                "pgvector requires the optional psycopg[binary] dependency") from exc
+        timeout = _request_timeout(self.config.timeout_seconds)
+        async with asyncio.timeout(timeout):
+            async with await psycopg.AsyncConnection.connect(
+                self.config.url, connect_timeout=0,
+            ) as conn:
+                cursor = await conn.execute(
                     f"""SELECT id,payload,1-(embedding <=> %s::vector) AS score
                         FROM {self.table} WHERE owner_id=%s AND status='active'
                         ORDER BY embedding <=> %s::vector LIMIT %s""",
                     (json.dumps(vector), owner_id, json.dumps(vector), limit),
-                ).fetchall()
+                )
+                rows = await cursor.fetchall()
                 return [{"id": row[0], "payload": row[1],
                          "score": float(row[2]), "channel": "dense"} for row in rows]
-        return await asyncio.to_thread(run)
 
     async def delete(self, item_id: str) -> None:
         def run():
@@ -347,7 +383,7 @@ class Reranker:
         if self.config.api_key:
             headers["Authorization"] = f"Bearer {self.config.api_key}"
         async with httpx.AsyncClient(
-            timeout=httpx.Timeout(self.config.timeout_seconds)
+            timeout=httpx.Timeout(_request_timeout(self.config.timeout_seconds))
         ) as client:
             response = await client.post(url, headers=headers, json={
                 "model": self.config.model, "query": query,

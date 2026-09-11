@@ -151,28 +151,65 @@ def test_recall_hook_uses_additional_context(monkeypatch, fake_httpx):
     assert fake_httpx.calls[-1][2]["query"] == "original user prompt"
 
 
-def test_recall_hook_times_out_before_sdk_watchdog_and_fails_open(monkeypatch):
+def test_prepared_recall_waits_beyond_hook_budget_and_injects_once(monkeypatch):
     mc = _load(monkeypatch)
-    monkeypatch.setattr(mc, "_RECALL_DEADLINE", 0.01)
-    cancelled = asyncio.Event()
+    monkeypatch.setattr(mc, "RECALL_HOOK_TIMEOUT", 0.01)
+    calls = []
 
-    async def stalled_recall(_query, _session_id):
+    async def slow_recall(query, session_id):
+        calls.append((query, session_id))
+        await asyncio.sleep(.06)
+        return "synthetic memory"
+
+    monkeypatch.setattr(mc, "search_context", slow_recall)
+    hook = mc.build_recall_hook("session", prepared_only=True)
+
+    async def scenario():
+        assert await mc.prepare_recall("session", "turn", "exact prompt")
+        assert await hook({"prompt": "/compact"}, None, None) == {}
+        # Stale cleanup must not destroy the current owner's packet.
+        mc.clear_prepared_recall("session", "old-turn")
+        async with asyncio.timeout(mc.RECALL_HOOK_TIMEOUT):
+            result = await hook({"prompt": "exact prompt"}, None, None)
+        assert result["hookSpecificOutput"]["additionalContext"] == "synthetic memory"
+        assert await hook({"prompt": "exact prompt"}, None, None) == {}
+        assert not mc._prepared_recalls
+        assert calls == [("exact prompt", "session")]
+
+    _run(scenario())
+
+
+@pytest.mark.parametrize("external", [False, True])
+def test_prepared_recall_cancellation_joins_work_without_injection(monkeypatch, external):
+    mc = _load(monkeypatch)
+    entered, cancelled = asyncio.Event(), asyncio.Event()
+    stopped = False
+
+    async def recall(*_args):
+        entered.set()
         try:
-            await asyncio.sleep(10)
+            await asyncio.Event().wait()
         finally:
             cancelled.set()
 
-    monkeypatch.setattr(mc, "search_context", stalled_recall)
-    hook = mc.build_recall_hook("session-timeout")
+    monkeypatch.setattr(mc, "search_context", recall)
 
     async def scenario():
-        result = await hook({"prompt": "must still be submitted"}, None, None)
-        assert result == {}
+        nonlocal stopped
+        task = asyncio.create_task(mc.prepare_recall(
+            "session", "turn", "prompt", is_cancelled=lambda: stopped))
+        await entered.wait()
+        if external:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        else:
+            stopped = True
+            assert await asyncio.wait_for(task, .5) is False
         assert cancelled.is_set()
+        assert not mc._prepared_recalls
 
     _run(scenario())
-    assert mc.RECALL_HOOK_TIMEOUT > mc._RECALL_DEADLINE
-    assert mc.RECALL_HOOK_TIMEOUT - mc._SEARCH_TIMEOUT >= 5.0
 
 
 def test_recall_hook_backend_error_fails_open(monkeypatch):
@@ -222,7 +259,7 @@ def test_failsoft_logging_never_renders_exception_secrets(
 
 def test_failsoft_wall_clock_timeout(monkeypatch, fake_httpx):
     mc = _load(monkeypatch)
-    monkeypatch.setattr(mc, "_SEARCH_TIMEOUT", 0.01)
+    monkeypatch.setattr(mc, "recall_timeout_seconds", lambda: .01)
     fake_httpx.script = lambda url, payload: _FakeResp(
         chunks=[b'{"results":[', b'{"memory":"slow"}]}'], delay=0.02)
     assert _run(mc.search_context("q", "s")) == ""
@@ -331,5 +368,45 @@ def test_shutdown_awaits_task_cancellation(monkeypatch, fake_httpx):
         await mc.aclose(timeout=0.001)
         assert cancelled.is_set()
         assert not mc._pending_writes
+
+    _run(scenario())
+
+
+def test_prepared_steering_packets_do_not_overwrite_initial_prompt(monkeypatch):
+    mc = _load(monkeypatch)
+
+    async def recall(query, _sid): return 'memory for ' + query
+
+    monkeypatch.setattr(mc, 'search_context', recall)
+    hook = mc.build_recall_hook('session', prepared_only=True)
+
+    async def scenario():
+        assert await mc.prepare_recall('session', 'turn', 'first')
+        assert await mc.prepare_recall('session', 'turn', 'second', delivery_id='command')
+        for prompt in ('first', 'second'):
+            output = await hook({'prompt': prompt}, None, None)
+            assert output['hookSpecificOutput']['additionalContext'] == 'memory for ' + prompt
+        assert not mc._prepared_recalls
+        await mc.prepare_recall('session', 'turn', 'third', delivery_id='next-command')
+        mc.clear_prepared_recall('session', 'turn')
+        assert not mc._prepared_recalls
+
+    _run(scenario())
+
+
+def test_preparing_followup_does_not_replace_injected_receipt(monkeypatch, fake_httpx):
+    mc = _load(monkeypatch)
+    fake_httpx.script = lambda *_args: _FakeResp({'results': [{'memory': 'synthetic fact'}]})
+
+    async def scenario():
+        await mc.prepare_recall('session', 'turn', 'first')
+        await mc.build_recall_hook('session', prepared_only=True)({'prompt': 'first'}, None, None)
+        injected = mc._hook_recall_traces['session']
+        await mc.prepare_recall('session', 'turn', 'queued followup', delivery_id='command')
+        assert mc._legacy_recall_traces['session'] is not injected
+        receipt = mc.pop_recall_trace('session')
+        assert receipt is injected and receipt['injected'] is True
+        assert mc.pop_recall_trace('session') is None
+        mc.clear_prepared_recall('session', 'turn')
 
     _run(scenario())

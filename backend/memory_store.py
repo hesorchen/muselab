@@ -273,30 +273,36 @@ class MemoryStore:
         if self._read_only:
             conn.execute("PRAGMA query_only=ON")
             deadline = getattr(self, "_query_deadline", None)
-            if deadline is not None:
+            cancelled = getattr(self, "_read_cancelled", None)
+            if deadline is not None or cancelled is not None:
                 conn.set_progress_handler(
-                    lambda: int(time.perf_counter() >= deadline), 1000)
+                    lambda: int((deadline is not None and time.perf_counter() >= deadline)
+                                or (cancelled is not None and cancelled.is_set())), 1000)
         return conn
 
     @contextmanager
-    def read_budget(self, deadline: float):
+    def read_budget(self, deadline: float | None, *, cancel_event=None):
         """Interrupt expensive SQL after the read actor's absolute deadline."""
         if not self._read_only:
             raise RuntimeError("read budgets require a read-only store")
         self._query_deadline = deadline
+        self._read_cancelled = cancel_event
         try:
-            if time.perf_counter() >= deadline:
+            if ((deadline is not None and time.perf_counter() >= deadline)
+                    or (cancel_event is not None and cancel_event.is_set())):
                 raise TimeoutError("memory read deadline exceeded")
             yield
         except sqlite3.OperationalError as exc:
             # The progress handler and asyncio timeout race at the same
             # deadline. Both paths represent a read timeout, not a broken DB.
             if (getattr(exc, "sqlite_errorcode", None) == sqlite3.SQLITE_INTERRUPT
-                    and time.perf_counter() >= deadline):
+                    and ((deadline is not None and time.perf_counter() >= deadline)
+                         or (cancel_event is not None and cancel_event.is_set()))):
                 raise TimeoutError("memory read deadline exceeded") from None
             raise
         finally:
             self._query_deadline = None
+            self._read_cancelled = None
 
     @contextmanager
     def _write_tx(self) -> Iterator[sqlite3.Connection]:
@@ -1143,7 +1149,14 @@ class MemoryStore:
                         {status_clause} {kind_clause}
                         ORDER BY lexical_rank LIMIT ?""", params,
                 ).fetchall()
-            except sqlite3.OperationalError:
+            except sqlite3.OperationalError as exc:
+                # Interrupts and lock contention must reach the recall actor:
+                # it applies the sole deadline/cancellation policy and retries
+                # short busy waits instead of accepting a false empty result.
+                code = getattr(exc, "sqlite_errorcode", 0) or 0
+                if (code & 0xff) in {sqlite3.SQLITE_INTERRUPT, sqlite3.SQLITE_BUSY,
+                                    sqlite3.SQLITE_LOCKED}:
+                    raise
                 return []
             return [{"memory": self._row(row) or {},
                      "score": 1.0 / (1.0 + abs(float(row["lexical_rank"]))),

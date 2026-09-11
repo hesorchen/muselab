@@ -3361,3 +3361,38 @@ def test_slow_subscriber_is_collapsed_to_resync(
         ),
     ]
     assert str(temp_root) not in repr(events)
+
+
+@pytest.mark.asyncio
+async def test_scan_exchange_deadline_releases_shared_worker(app_module, temp_root, monkeypatch):
+    import backend.file_events as file_events
+
+    class Store:
+        def close(self):
+            pass
+
+    manager = file_events.FileWatchManager(Store())
+    state = file_events._WatchState(root=temp_root, workspace_id="scan-timeout")
+    entered = threading.Event()
+
+    def blocked_exchange(_request):
+        entered.set()
+        manager._scan_cancel.wait(2)
+        return ("error", "WorkspaceScanCancelled", "cancelled", {})
+
+    monkeypatch.setattr(file_events, "_SCAN_EXCHANGE_TIMEOUT_S", .05, raising=False)
+    monkeypatch.setattr(manager, "_ensure_scan_worker_locked", lambda: None)
+    monkeypatch.setattr(manager, "_exchange_scan_request", blocked_exchange)
+    guard = threading.Timer(.8, manager._scan_cancel.set)
+    guard.start()
+    try:
+        with pytest.raises(file_events.WorkspaceScanIncomplete, match="deadline"):
+            await manager._scan_workspace(state)
+        assert entered.is_set()
+        assert not manager._scan_worker_lock.locked()
+        monkeypatch.setattr(manager, "_exchange_scan_request", lambda _request: ("ok", [], {}, {}))
+        assert await manager._scan_workspace(state) == ([], {})
+    finally:
+        guard.cancel()
+        manager._scan_cancel.set()
+        await manager.shutdown()

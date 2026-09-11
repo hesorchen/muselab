@@ -1,6 +1,8 @@
 """White-box Memory API and secret-handling tests."""
 import os
 
+import pytest
+
 
 def test_memory_api_is_authenticated(client):
     assert client.get("/api/memory/status").status_code == 401
@@ -287,3 +289,15 @@ def test_memory_read_timeout_is_retryable_and_queue_is_cancelled(
     monkeypatch.setattr(engine, "UI_READ_TIMEOUT_S", 1)
     assert client.get("/api/memory/items", headers=auth).status_code == 200
     assert executions == [True]
+
+
+@pytest.mark.parametrize("timeout_ms", [0, 30_000])
+def test_recall_timeout_roundtrips_and_negative_is_rejected(client, auth, timeout_ms):
+    config = client.get("/api/memory/config", headers=auth).json()
+    config["mode"] = "off"
+    config["retrieval"]["soft_timeout_ms"] = timeout_ms
+    response = client.put("/api/memory/config?probe=false", headers=auth, json=config)
+    assert response.status_code == 200
+    assert client.get("/api/memory/config", headers=auth).json()["retrieval"]["soft_timeout_ms"] == timeout_ms
+    config["retrieval"]["soft_timeout_ms"] = -1
+    assert client.put("/api/memory/config?probe=false", headers=auth, json=config).status_code == 422

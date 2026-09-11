@@ -99,7 +99,7 @@ def stream_env(app_module, monkeypatch):
 
 def test_mem0_never_rewrites_canonical_user_query(
         stream_env, client, monkeypatch):
-    """Recall is an SDK hook; client.query must receive only user-authored text."""
+    """Preparing recall must leave the canonical user prompt untouched."""
     chat_mod = stream_env
     sid = _make_session(client)
     messages = [ResultMessage(
@@ -112,17 +112,24 @@ def test_mem0_never_rewrites_canonical_user_query(
     async def fake_get_client(session_id, model, permission="bypassPermissions", effort="", service_tier=""):
         return fake
 
-    async def must_not_search_here(*args, **kwargs):
-        raise AssertionError("recall must run in UserPromptSubmit hook")
+    recalled = []
+
+    async def recall_before_query(query, session_id):
+        assert fake.queried == []
+        recalled.append((query, session_id))
+        return "synthetic memory"
 
     monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
-    monkeypatch.setattr(chat_mod.mem0, "search_context", must_not_search_here)
+    monkeypatch.setattr(chat_mod.mem0, "enabled", lambda: True)
+    monkeypatch.setattr(chat_mod.mem0, "search_context", recall_before_query)
     prompt = "the exact user-authored prompt"
     response = client.get(
         f"/api/chat/stream?token={TEST_TOKEN}&session_id={sid}"
         f"&prompt={prompt}&model=claude-sonnet-4-6")
     assert response.status_code == 200
     assert fake.queried == [prompt]
+    assert recalled == [(prompt, sid)]
+    assert sid not in chat_mod.mem0._prepared_recalls
     done = next(
         json.loads(data)
         for event, data in _parse_sse(response.text)
@@ -1278,6 +1285,14 @@ def test_activity_finishes_before_background_continuation_settles(
         watcher_attached = asyncio.Event()
         release_watcher = asyncio.Event()
         activity_transitions = []
+        boundary_threads = []
+        original_boundary = chat_mod.sess.set_runtime_background_boundary
+
+        def capture_boundary(*args):
+            boundary_threads.append(threading.get_ident())
+            return original_boundary(*args)
+
+        monkeypatch.setattr(chat_mod.sess, "set_runtime_background_boundary", capture_boundary)
 
         started = TaskStartedMessage(
             subtype="task_started", data={}, task_id="task_deferred",
@@ -1350,6 +1365,8 @@ def test_activity_finishes_before_background_continuation_settles(
         assert chat_mod._sessions_with_inflight_tasks[sid] == {
             "task_deferred",
         }
+        assert boundary_threads
+        assert threading.get_ident() not in boundary_threads
         await asyncio.wait_for(broadcast.task, timeout=1)
         watcher = chat_mod._task_watchers[sid]
         release_watcher.set()
@@ -8684,8 +8701,8 @@ def test_native_recall_hook_receipt_reaches_sse_done(
     class HookClient(_FakeStreamClient):
         async def query(self, prompt_or_gen):
             await super().query(prompt_or_gen)
-            response = await chat_mod.mem0.build_recall_hook(sid)(
-                {"prompt": "清淡饮食"}, None, None)
+            response = await chat_mod.mem0.build_recall_hook(sid, prepared_only=True)(
+                {"prompt": prompt_or_gen}, None, None)
             assert "晚餐喜欢清淡饮食" in response["hookSpecificOutput"]["additionalContext"]
             receipt.update(instance._recall_trace[sid])
 
@@ -8713,3 +8730,35 @@ def test_native_recall_hook_receipt_reaches_sse_done(
     assert persisted["injected"] is True
     assert "content" not in str(persisted)
     asyncio.run(instance.stop())
+
+
+@pytest.mark.asyncio
+async def test_stop_during_recall_never_submits_query(stream_env, client, monkeypatch):
+    chat_mod = stream_env
+    sid = _make_session(client)
+    entered, cancelled = asyncio.Event(), asyncio.Event()
+    fake = _FakeStreamClient([])
+
+    async def fake_get_client(*_args, **_kwargs):
+        return fake
+
+    async def slow_recall(*_args):
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
+    monkeypatch.setattr(chat_mod.mem0, "enabled", lambda: True)
+    monkeypatch.setattr(chat_mod.mem0, "search_context", slow_recall)
+    broadcast = await chat_mod._start_turn(sid, "synthetic prompt", model="claude-sonnet-4-6")
+    await asyncio.wait_for(entered.wait(), 2)
+    assert fake.queried == []
+    broadcast.cancelled = True
+    async with asyncio.timeout(2):
+        while not broadcast.done:
+            await asyncio.sleep(.01)
+    assert cancelled.is_set()
+    assert fake.queried == []
+    assert sid not in chat_mod.mem0._prepared_recalls

@@ -332,11 +332,10 @@ def _safe_secondary_diagnostic(
 ) -> None:
     """Emit one bounded, content-free diagnostic for contained cleanup faults."""
     safe_stage = re.sub(r"[^a-z0-9_.-]", "_", stage.lower())[:48]
-    sys.stderr.write(
+    obs.diagnostic_line(
         f"[chat-secondary] stage={safe_stage} "
         f"sid={obs.short_id(session_id)} exc={type(exc).__name__}\n"
     )
-    sys.stderr.flush()
 
 
 def _build_runtime_task_context_hook(session_id: str):
@@ -1466,6 +1465,7 @@ class TurnBroadcast:
             return
         self._flush_compact_text()
         self.done = True
+        mem0.clear_prepared_recall(self.session_id, self.turn_id)
         self.steering_ready.set()
         self.finished_at = time.time()
         if self.perf_status == "unknown":
@@ -1959,7 +1959,7 @@ def _runtime_task_overlay(
         for current in targets:
             sess.set_runtime_task_overlay(current, tid, **fields)
     except Exception as exc:
-        sys.stderr.write(
+        obs.diagnostic_line(
             f"[chat] runtime task overlay failed sid={owner[:8]} "
             f"task={tid} exc={type(exc).__name__}\n"
         )
@@ -2180,10 +2180,9 @@ def _write_active_turn_sidecar(bc: TurnBroadcast) -> bool:
         )
         return True
     except Exception as e:
-        sys.stderr.write(
+        obs.diagnostic_line(
             f"[chat] failed to write active-turn sidecar "
             f"sid={obs.short_id(bc.session_id)} exc={type(e).__name__}\n")
-        sys.stderr.flush()
         return False
 
 
@@ -2265,7 +2264,7 @@ def _scan_interrupted_turns_at_startup() -> dict[str, dict]:
             sid = data.get("sid") or p.stem
             out[sid] = data
         except Exception as e:
-            sys.stderr.write(
+            obs.diagnostic_line(
                 f"[chat] skipping malformed active-turn sidecar "
                 f"exc={type(e).__name__}\n")
     return out
@@ -3134,7 +3133,7 @@ def _build_plan_enter_hooks(
                 owned=True,
             )
         except Exception as exc:
-            sys.stderr.write(
+            obs.diagnostic_line(
                 f"[plan-mode] enter persist failed sid={session_id[:8]} "
                 f"exc={type(exc).__name__}\n")
             committed = False
@@ -3292,7 +3291,7 @@ def _build_plan_exit_hooks(
                 return _stop_ambiguous_transition(
                     "A newer permission change superseded this plan approval.")
         except Exception as exc:
-            sys.stderr.write(
+            obs.diagnostic_line(
                 f"[plan-mode] persist failed sid={session_id[:8]} "
                 f"target={target} exc={type(exc).__name__}\n")
             await perm.emit_session_event(
@@ -3432,7 +3431,7 @@ async def _build_and_connect_client(
             lambda: _find_session_jsonl(session_id) is not None,
         )
     except Exception as e:
-        sys.stderr.write(
+        obs.diagnostic_line(
             f"[muselab] jsonl_exists check failed "
             f"sid={obs.short_id(session_id)} exc={type(e).__name__}\n"
         )
@@ -3497,7 +3496,7 @@ async def _build_and_connect_client(
         lambda: Path(__file__).resolve().parent.parent,
     )
     user_prompt_hooks = (
-        [] if side_question_runtime else [mem0.build_recall_hook(session_id)]
+        [] if side_question_runtime else [mem0.build_recall_hook(session_id, prepared_only=True)]
     )
     if (not side_question_runtime
             and sess_data.get("runtime_predecessor")):
@@ -3851,10 +3850,9 @@ async def _build_and_connect_client(
             # Don't fail client construction because an MCP source had a parse
             # error. _load_mcp_merged already swallows per-file errors and
             # stderr's them; this catch is for unexpected programmer errors.
-            sys.stderr.write(
+            obs.diagnostic_line(
                 f"[chat] mcp merge failed sid={session_id[:8]} "
                 f"exc={type(e).__name__}; external MCP disabled for this client\n")
-            sys.stderr.flush()
     opts_kwargs["mcp_servers"] = mcp_dict
     # Enable extended thinking for models whose provider endpoint handles
     # the standard Anthropic thinking config. Some vendors (e.g. Qianfan)
@@ -3950,12 +3948,11 @@ async def _build_and_connect_client(
             try:
                 await _disconnect_unpooled_client(client, session_id)
             except Exception as cleanup_exc:
-                sys.stderr.write(
+                obs.diagnostic_line(
                     "[client-pool] connect failure cleanup pending "
                     f"sid={session_id[:8]} "
                     f"exc={type(cleanup_exc).__name__}\n"
                 )
-                sys.stderr.flush()
             raise
         if native_retry_resume:
             _native_retry_commits[session_id] = (
@@ -4009,29 +4006,26 @@ async def _build_and_connect_client(
                     try:
                         await _disconnect_unpooled_client(client, session_id)
                     except Exception as cleanup_exc:
-                        sys.stderr.write(
+                        obs.diagnostic_line(
                             "[client-pool] retry connect cleanup pending "
                             f"sid={session_id[:8]} "
                             f"exc={type(cleanup_exc).__name__}\n"
                         )
-                        sys.stderr.flush()
                     raise
                 if attempt > 0:
-                    sys.stderr.write(
+                    obs.diagnostic_line(
                         f"[chat] sid={session_id[:8]} connect retry "
                         f"succeeded on attempt {attempt + 1}\n")
-                    sys.stderr.flush()
                 return client
             except Exception as e2:
                 last_err = e2
                 if "already in use" not in str(e2).lower():
                     raise
                 # Backoff: 200ms, 400ms, 800ms, 1600ms (~3s total).
-                sys.stderr.write(
+                obs.diagnostic_line(
                     f"[chat] sid={session_id[:8]} attempt {attempt + 1} "
                     f"hit 'already in use', backing off "
                     f"{200 * (2 ** attempt)}ms\n")
-                sys.stderr.flush()
                 await asyncio.sleep(0.2 * (2 ** attempt))
         if last_err is not None:
             raise last_err
@@ -4149,10 +4143,9 @@ async def _await_mcp_ready(client: ClaudeSDKClient, *,
             return
         prev = snapshot
         if time.monotonic() >= deadline:
-            sys.stderr.write(
+            obs.diagnostic_line(
                 f"[mcp-gate] readiness timeout after {timeout}s; "
                 f"servers={sorted(servers)} — proceeding anyway\n")
-            sys.stderr.flush()
             return
         await asyncio.sleep(poll)
 
@@ -4657,11 +4650,10 @@ def _persist_attachment(session_id: str, aid: str, name: str,
         path = attach_dir / f"{aid}-{safe}"
         write_private_bytes(path, data)
     except Exception as e:
-        sys.stderr.write(
+        obs.diagnostic_line(
             f"[attach] persist failed sid={obs.short_id(session_id)} "
             f"aid={obs.short_id(aid)} exc={type(e).__name__} "
             f"kind=write\n")
-        sys.stderr.flush()
         return None
     url = (f"/api/chat/attachments/{session_id}/"
            f"{urllib.parse.quote(f'{aid}-{safe}')}")
@@ -4732,11 +4724,10 @@ def _write_attachment_cleanup_intents_locked(paths: Iterable[str]) -> None:
             json.dumps({"paths": normalized}, ensure_ascii=False).encode(),
         )
     except Exception as exc:
-        sys.stderr.write(
+        obs.diagnostic_line(
             f"[attach] cleanup intent write failed "
             f"exc={type(exc).__name__}\n"
         )
-        sys.stderr.flush()
 
 
 def _record_attachment_cleanup_intents(paths: Iterable[str]) -> None:
@@ -4788,10 +4779,9 @@ def _drain_attachment_cleanup_intents() -> int:
                 failed.append(raw_path)
         _write_attachment_cleanup_intents_locked(failed)
     if failed:
-        sys.stderr.write(
+        obs.diagnostic_line(
             f"[attach] cleanup retry pending count={len(failed)}\n"
         )
-        sys.stderr.flush()
     return removed
 
 
@@ -4837,11 +4827,10 @@ def _cleanup_prepared_attachments_sync(
             Path(raw_path).unlink(missing_ok=True)
         except OSError as exc:
             failed.append(raw_path)
-            sys.stderr.write(
+            obs.diagnostic_line(
                 f"[attach] rollback unlink failed "
                 f"exc={type(exc).__name__}\n"
             )
-            sys.stderr.flush()
     if failed:
         _record_attachment_cleanup_intents(failed)
 
@@ -4890,12 +4879,11 @@ def _prepare_staged_attachments_sync(
                         f"/api/chat/attachments/{session_id}/{aid}.{ext}"
                     )
                 except Exception as exc:
-                    sys.stderr.write(
+                    obs.diagnostic_line(
                         f"[attach] persist failed "
                         f"sid={obs.short_id(session_id)} "
                         f"aid={obs.short_id(aid)} "
                         f"exc={type(exc).__name__} kind=write\n")
-                    sys.stderr.flush()
 
                 thumb_b64 = None
                 image_module = None
@@ -4924,9 +4912,8 @@ def _prepare_staged_attachments_sync(
                         getattr(image_module, "DecompressionBombWarning", ()),
                     )
                     if image_module is not None and isinstance(exc, bomb_types):
-                        sys.stderr.write(
+                        obs.diagnostic_line(
                             "[attach] thumbnail skipped reason=pixel_budget\n")
-                        sys.stderr.flush()
                 item: dict = {"mime": entry["mime"]}
                 if thumb_b64:
                     item["thumb"] = thumb_b64
@@ -5192,8 +5179,7 @@ def _migrate_legacy_attachments() -> None:
     except OSError:
         pass
     if moved:
-        sys.stderr.write(f"[muselab] migrated {moved} attachment dirs to {new_base}\n")
-        sys.stderr.flush()
+        obs.diagnostic_line(f"[muselab] migrated {moved} attachment dirs to {new_base}\n")
 
 
 # Run migration once at import (cheap if no-op).
@@ -6457,10 +6443,9 @@ def _session_message_uuids(sid: str, model: str) -> frozenset[str]:
             if (uid := getattr(msg, "uuid", None))
         )
     except Exception as exc:
-        sys.stderr.write(
+        obs.diagnostic_line(
             f"[chat-stream] UUID boundary snapshot skipped sid={sid[:8]} "
             f"exc={type(exc).__name__}\n")
-        sys.stderr.flush()
         return frozenset()
 
 
@@ -6514,10 +6499,9 @@ def _turn_transcript_boundary(
         # Recovery metadata is best-effort.  Failing to establish an anchor
         # must never stop the actual model request; an unanchored snapshot is
         # still safely appended to the display history if cancellation occurs.
-        sys.stderr.write(
+        obs.diagnostic_line(
             f"[chat-stream] transcript boundary skipped sid={sid[:8]} "
             f"exc={type(exc).__name__}\n")
-        sys.stderr.flush()
     return existing, boundary
 
 
@@ -7226,10 +7210,9 @@ def _turn_uuids_from_boundary(
         # Never fall back to an unbounded/latest UUID. Callers treat absent
         # evidence as an uncommitted turn, which is safer than publishing a
         # success that can disappear or mutating a prior turn's annotation.
-        sys.stderr.write(
+        obs.diagnostic_line(
             f"[chat] turn UUID boundary resolve skipped sid={sid[:8]} "
             f"exc={type(exc).__name__}\n")
-        sys.stderr.flush()
         return None, None, False
 
 
@@ -7281,10 +7264,9 @@ def _turn_prevented_error_from_boundary(
                 "api_error_status": None,
             }
     except Exception as exc:
-        sys.stderr.write(
+        obs.diagnostic_line(
             f"[chat] turn hook rejection recovery skipped sid={sid[:8]} "
             f"exc={type(exc).__name__}\n")
-        sys.stderr.flush()
     return None
 
 
@@ -7714,7 +7696,7 @@ async def _purge_session_storage_async_inner(sid: str) -> bool:
                 ),
             )
         except Exception as exc:
-            sys.stderr.write(
+            obs.diagnostic_line(
                 f"[activity] delete finish failed sid={sid[:8]} "
                 f"exc={type(exc).__name__}\n"
             )
@@ -8153,6 +8135,53 @@ async def _deliver_steering_command(
     selection_quotes: list[dict],
     permission: str,
 ) -> tuple[str, str, dict | None]:
+    # Recall precedes registration of the bounded SDK write. If the parent
+    # finishes while recalling, the durable item follows the ordinary queue
+    # path and recalls again under its next turn owner.
+    bc = _admitted_steering_turn(session_id, turn_id, permission=permission)
+    if mem0.enabled() and bc is not None:
+        keep_packet = False
+        try:
+            ready = await mem0.prepare_recall(
+                session_id, turn_id, text, delivery_id=command_uuid,
+                is_cancelled=lambda: _admitted_steering_turn(
+                    session_id, turn_id, permission=permission) is not bc,
+            )
+            if ready:
+                result = await _deliver_prepared_steering_command(
+                    session_id, turn_id=turn_id, item_id=item_id,
+                    command_uuid=command_uuid, text=text,
+                    display_text=display_text, selection_quotes=selection_quotes,
+                    permission=permission,
+                )
+                keep_packet = result[0] == "adjust" and not bc.done
+                return result
+        except asyncio.CancelledError:
+            fallback = await _fallback_steering_item(
+                session_id, item_id=item_id, command_uuid=command_uuid, bc=bc)
+            return "queue", "queued", fallback
+        finally:
+            if not keep_packet:
+                mem0.clear_prepared_recall(session_id, turn_id, delivery_id=command_uuid)
+    return await _deliver_prepared_steering_command(
+        session_id, turn_id=turn_id, item_id=item_id,
+        command_uuid=command_uuid, text=text,
+        display_text=display_text, selection_quotes=selection_quotes,
+        permission=permission,
+    )
+
+
+async def _deliver_prepared_steering_command(
+    session_id: str,
+    *,
+    turn_id: str,
+    item_id: str,
+    command_uuid: str,
+    text: str,
+    display_text: str,
+    selection_quotes: list[dict],
+    permission: str,
+) -> tuple[str, str, dict | None]:
     """Write one durable queue item to the exact active CLI command queue.
 
     The write is registered on the broadcast before the first await.  If a
@@ -8247,10 +8276,9 @@ async def _deliver_steering_command(
             owned=True,
         )
     except Exception as exc:
-        sys.stderr.write(
+        obs.diagnostic_line(
             f"[chat] steering annotation failed sid={session_id[:8]} "
             f"exc={type(exc).__name__}\n")
-        sys.stderr.flush()
 
     try:
         await bc.runtime_client.query_steering(
@@ -8340,7 +8368,7 @@ async def _settle_steering_lifecycle(
             # The live CLI still owns the command. Retaining the in-memory map
             # keeps Result suppression correct; restart recovery pauses the
             # older durable state rather than risking duplicate execution.
-            sys.stderr.write(
+            obs.diagnostic_line(
                 f"[chat] steering state persist failed "
                 f"sid={obs.short_id(bc.session_id)} "
                 f"state={state} exc={type(exc).__name__}\n"
@@ -8382,7 +8410,7 @@ async def _settle_steering_lifecycle(
             # The CLI says the command ran. Never convert an ACK-persistence
             # failure into an automatic resend: the still-adjust queue row
             # remains non-claimable and startup recovery pauses it for review.
-            sys.stderr.write(
+            obs.diagnostic_line(
                 f"[chat] steering completion persist failed "
                 f"sid={obs.short_id(bc.session_id)} "
                 f"exc={type(exc).__name__}\n"
@@ -8426,7 +8454,7 @@ async def _settle_steering_lifecycle(
                 owned=True,
             )
         except Exception as exc:
-            sys.stderr.write(
+            obs.diagnostic_line(
                 f"[chat] steering cancellation persist failed "
                 f"sid={obs.short_id(bc.session_id)} "
                 f"exc={type(exc).__name__}\n"
@@ -8478,7 +8506,7 @@ async def _cancel_outstanding_steering_commands(
                 owned=True,
             )
         except Exception as exc:
-            sys.stderr.write(
+            obs.diagnostic_line(
                 f"[chat] steering terminal pause failed "
                 f"sid={obs.short_id(bc.session_id)} "
                 f"exc={type(exc).__name__}\n"
@@ -9188,7 +9216,7 @@ async def patch_session_api(sid: str, req: SessionPatchReq) -> dict:
                     try:
                         await c.interrupt()
                     except Exception as _e:
-                        sys.stderr.write(
+                        obs.diagnostic_line(
                             f"[chat] interrupt before model swap failed for "
                             f"{sid}: {type(_e).__name__}: {_e}\n")
         if runtime_controls_changed:
@@ -9503,7 +9531,7 @@ def _persist_session_usage_summary(
     except Exception as exc:
         # Hydration repair is best-effort. A corrupt or unwritable sidecar must
         # remain byte-identical and must never turn readable JSONL into /usage 500.
-        sys.stderr.write(
+        obs.diagnostic_line(
             f"[chat-usage] summary write skipped sid={obs.short_id(sid)} "
             f"exc={type(exc).__name__}\n")
         return False
@@ -10379,7 +10407,7 @@ def _create_context_recovery_session(
     try:
         source_meta = sess.get_session_meta(source_sid)
     except Exception as exc:
-        sys.stderr.write(
+        obs.diagnostic_line(
             f"[chat] runtime postlude source read failed "
             f"sid={source_sid[:8]} exc={type(exc).__name__}\n")
         return {"annotations": 0, "renamed": 0}
@@ -10765,10 +10793,9 @@ async def context_breakdown(session_id: str, model: str = "") -> dict:
         # CLI exceptions may contain credentials paths, vendor URLs, prompt
         # fragments or protocol bodies.  The API already returns a generic
         # error; the service log keeps only the failure class.
-        sys.stderr.write(
+        obs.diagnostic_line(
             f"[chat] get_context_usage failed sid={session_id[:8]} "
             f"exc={type(e).__name__}\n")
-        sys.stderr.flush()
         raise HTTPException(500, "context-usage probe failed") from None
 
 
@@ -10875,10 +10902,9 @@ async def native_clear_session_api(sid: str) -> dict:
         _pending_runtime_rebuilds.add(sid)
         with suppress(Exception):
             await disconnect_client(sid)
-        sys.stderr.write(
+        obs.diagnostic_line(
             f"[chat] native /clear failed sid={sid[:8]} "
             f"exc={type(exc).__name__}\n")
-        sys.stderr.flush()
         raise HTTPException(500, "native /clear failed") from None
     return {**new_meta, "session_id": new_sid, "reset_from": sid}
 
@@ -10923,8 +10949,7 @@ async def native_compact_session_api(sid: str) -> dict:
         # If compact had acquired the lock, its CancelledError handler above
         # already completed teardown before releasing it.  A timeout that only
         # waited for the lock must NOT kill the legitimate lock holder.
-        sys.stderr.write(f"[chat] native /compact total timeout sid={sid[:8]}\n")
-        sys.stderr.flush()
+        obs.diagnostic_line(f"[chat] native /compact total timeout sid={sid[:8]}\n")
         raise HTTPException(
             504, "native /compact timed out — CLI may be hung") from None
 
@@ -10980,7 +11005,7 @@ def _schedule_post_compact_refresh(
             await asyncio.to_thread(
                 _refresh_compacted_message_counts, sid, model)
         except Exception as e:
-            sys.stderr.write(
+            obs.diagnostic_line(
                 f"[chat] post-compact count refresh skipped sid={sid[:8]} "
                 f"exc={type(e).__name__}\n")
 
@@ -11065,8 +11090,7 @@ async def _native_compact_session_locked(sid: str) -> dict:
         # disconnects immediately outside its expired deadline; this marker is
         # the fallback that forces any other caller to rebuild before reuse.
         _pending_runtime_rebuilds.add(sid)
-        sys.stderr.write(f"[chat] native /compact timed out for sid={sid[:8]}\n")
-        sys.stderr.flush()
+        obs.diagnostic_line(f"[chat] native /compact timed out for sid={sid[:8]}\n")
         raise HTTPException(504, "native /compact timed out — CLI may be hung") from None
     except _SDKCommandError as e:
         if not any(tail_outcome.values()):
@@ -11098,10 +11122,9 @@ async def _native_compact_session_locked(sid: str) -> dict:
                     context_limit=context_limit,
                 )
             except Exception as recovery_error:
-                sys.stderr.write(
+                obs.diagnostic_line(
                     f"[chat] context recovery failed sid={sid[:8]}: "
                     f"{type(recovery_error).__name__}\n")
-                sys.stderr.flush()
                 raise HTTPException(
                     500, "native compact failed and recovery could not be created"
                 ) from None
@@ -11116,10 +11139,9 @@ async def _native_compact_session_locked(sid: str) -> dict:
                   else int(e.info.get("api_error_status") or 500))
         if status < 400 or status > 599:
             status = 500
-        sys.stderr.write(
+        obs.diagnostic_line(
             f"[chat] native /compact rejected sid={sid[:8]} "
             f"kind={classified['kind']}\n")
-        sys.stderr.flush()
         raise HTTPException(status, str(e)) from None
     except Exception as e:
         if not any(tail_outcome.values()):
@@ -11150,10 +11172,9 @@ async def _native_compact_session_locked(sid: str) -> dict:
                     context_limit=recovery_limit,
                 )
             except Exception as recovery_error:
-                sys.stderr.write(
+                obs.diagnostic_line(
                     f"[chat] context recovery failed sid={sid[:8]}: "
                     f"{type(recovery_error).__name__}\n")
-                sys.stderr.flush()
                 raise HTTPException(
                     500, "native compact failed and recovery could not be created"
                 ) from None
@@ -11163,11 +11184,10 @@ async def _native_compact_session_locked(sid: str) -> dict:
                 "recovered_session": recovery["session"],
                 "recovery_stats": recovery["stats"],
             }
-        sys.stderr.write(
+        obs.diagnostic_line(
             f"[chat] native /compact failed sid={sid[:8]} "
             f"exc={type(e).__name__} "
             f"kind={_classify_stream_error(str(e)).get('kind', 'unknown')}\n")
-        sys.stderr.flush()
         raise HTTPException(500, "native /compact failed — see server log") from None
     # Refresh the cached context-usage snapshot from the now-compacted live
     # client so the meter drops immediately and STAYS dropped. /usage reads
@@ -11202,17 +11222,19 @@ async def _native_compact_session_locked(sid: str) -> dict:
             if real_total:
                 _mark_context_used(sess_u, "sdk_context", estimate=False)
             try:
-                sess.set_session_ctx_window(sid, real_max)
+                await obs.to_thread_io(
+                    "chat.context_window_write", sid,
+                    sess.set_session_ctx_window, sid, real_max,
+                    owned=True)
             except Exception:
                 pass
         lim = int(sess_u.get("context_limit", 0) or 0)
         if lim and real_total:
             sess_u["context_used_pct"] = round(real_total / lim * 100, 1)
     except Exception as _e:
-        sys.stderr.write(
+        obs.diagnostic_line(
             f"[chat] post-compact ctx refresh skipped for sid={sid[:8]}: "
             f"{type(_e).__name__}\n")
-        sys.stderr.flush()
     # Message/turn recount can scan a very large transcript. It is
     # presentation bookkeeping, not part of compact correctness; schedule it
     # after the verified token drop so the browser can leave "compacting"
@@ -11286,11 +11308,10 @@ def _create_last_turn_retry_child(
         try:
             messages = _get_session_msgs(sid, source_model)
         except Exception as exc:
-            sys.stderr.write(
+            obs.diagnostic_line(
                 f"[chat] retry history read failed sid={sid[:8]} "
                 f"exc={type(exc).__name__}\n"
             )
-            sys.stderr.flush()
             raise HTTPException(409, "canonical session history is unavailable") from None
 
         real_users = [
@@ -11369,11 +11390,10 @@ def _create_last_turn_retry_child(
         except HTTPException:
             raise
         except Exception as exc:
-            sys.stderr.write(
+            obs.diagnostic_line(
                 f"[chat] retry fork failed sid={sid[:8]} "
                 f"exc={type(exc).__name__}\n"
             )
-            sys.stderr.flush()
             raise HTTPException(500, "retry fork failed — see server log") from None
     return {
         **child,
@@ -11958,12 +11978,12 @@ async def interrupt(
                 interrupt_call, timeout=_INTERRUPT_ACK_TIMEOUT_S)
             return f"{k[0]}@{k[1]}"
         except asyncio.TimeoutError:
-            sys.stderr.write(
+            obs.diagnostic_line(
                 f"[chat-interrupt] sid={obs.short_id(k[0])} "
                 f"ack timed out after "
                 f"{_INTERRUPT_ACK_TIMEOUT_S:.2f}s; force-stop armed\n")
         except Exception as e:
-            sys.stderr.write(
+            obs.diagnostic_line(
                 f"[chat-interrupt] sid={obs.short_id(k[0])} "
                 f"failed exc={type(e).__name__}\n")
         return None
@@ -12027,7 +12047,7 @@ async def stop_background_task(sid: str, task_id: str) -> dict:
             return {"ok": True, "task_id": task_id}
         except Exception as e:
             errors.append(f"{k[0]}@{k[1]}: {type(e).__name__}: {e}")
-            sys.stderr.write(
+            obs.diagnostic_line(
                 f"[chat] stop_task failed sid={obs.short_id(sid)} "
                 f"task={obs.short_id(task_id)} exc={type(e).__name__}\n")
     raise HTTPException(status_code=502, detail="; ".join(errors))
@@ -12051,11 +12071,10 @@ async def _force_stop_after_grace(
         await asyncio.sleep(grace)
         if _active_turns.get(session_id) is not bc or bc.done:
             return
-        sys.stderr.write(
+        obs.diagnostic_line(
             f"[chat-interrupt] sid={obs.short_id(session_id)} "
             f"did not drain after {grace:.1f}s; "
             f"forcing client teardown\n")
-        sys.stderr.flush()
         bc.cancelled = True
         disconnect_task = asyncio.create_task(disconnect_client(session_id))
         try:
@@ -12102,10 +12121,9 @@ async def _force_stop_after_grace(
         mem0.pop_recall_trace(session_id)
         await _finish_cancelled_startup(session_id, bc)
     except Exception as e:
-        sys.stderr.write(
+        obs.diagnostic_line(
             f"[chat-interrupt] force-stop watchdog failed "
             f"sid={obs.short_id(session_id)} exc={type(e).__name__}\n")
-        sys.stderr.flush()
 
 
 @router.post("/reset", dependencies=[Depends(require_token_header_or_query)])
@@ -13684,11 +13702,14 @@ def get_task_output(session_id: str = Query(...), path: str = Query(...)):
     p = Path(path)
     if not p.is_file():
         raise HTTPException(404, "task output not found (expired or cleaned up)")
+    CAP = 200_000
     try:
-        data = p.read_text(encoding="utf-8", errors="replace")
+        # Bound the read itself, not just the returned preview. Background
+        # Bash output can be gigabytes even though the UI shows only a prefix.
+        with p.open(encoding="utf-8", errors="replace") as stream:
+            data = stream.read(CAP + 1)
     except Exception:
         raise HTTPException(404, "task output unreadable")
-    CAP = 200_000
     if len(data) > CAP:
         data = data[:CAP] + "\n\n… (truncated at 200000 chars)"
     from fastapi.responses import PlainTextResponse as _PlainText
@@ -13763,7 +13784,7 @@ async def _read_upload_limited(file: UploadFile) -> bytes:
 async def upload_image(file: UploadFile = File(...)) -> dict:
     """Legacy endpoint name; now handles images + PDF + text-ish docs + xlsx."""
     _t0 = time.perf_counter()
-    _gc_images()
+    await obs.to_thread_io("chat.upload_cleanup", "", _gc_images, owned=True)
     mime = (file.content_type or "").lower()
     name = file.filename or "upload"
     kind = _classify_attachment(mime, name)
@@ -14844,7 +14865,7 @@ async def _watch_inflight_tasks(
             delivered = True
         if delivered:
             return True
-        sys.stderr.write(
+        obs.diagnostic_line(
             f"[chat] task watcher: settlement had no carrier "
             f"sid={session_id[:8]} event={event.get('event')}\n")
         return False
@@ -14955,10 +14976,9 @@ async def _watch_inflight_tasks(
                     file_path=sess._sidecar_path(session_id),
                 )
             except Exception as e:
-                sys.stderr.write(
+                obs.diagnostic_line(
                     f"[chat] continuation footer annotation failed "
                     f"sid={session_id[:8]}: {type(e).__name__}\n")
-                sys.stderr.flush()
         # The durable footer is now visible to reloads; close the live terminal
         # boundary before slower transcript/outbox bookkeeping.
         b.publish({"event": "done", "data": json.dumps(done_payload)})
@@ -15029,7 +15049,7 @@ async def _watch_inflight_tasks(
             }
 
         try:
-            sys.stderr.write(
+            obs.diagnostic_line(
                 f"[chat] task watcher: auto-continuation missing "
                 f"sid={session_id[:8]} ({reason}); requesting explicit resume\n")
             waited = (
@@ -15046,7 +15066,7 @@ async def _watch_inflight_tasks(
                 "后台任务已经完成，但最终答复续接失败。请发送“继续”让 Muse "
                 f"完成上一轮。（{type(e).__name__}）"
             )
-            sys.stderr.write(
+            obs.diagnostic_line(
                 f"[chat] task watcher: explicit resume failed "
                 f"sid={session_id[:8]} exc={type(e).__name__} "
                 f"kind=explicit_resume\n")
@@ -15205,11 +15225,10 @@ async def _watch_inflight_tasks(
                 raise
             except Exception as exc:
                 if attempt == 1 or attempt % 6 == 0:
-                    sys.stderr.write(
+                    obs.diagnostic_line(
                         f"[chat] task watcher sid={session_id[:8]} "
                         f"runtime termination pending attempt={attempt} "
                         f"exc={type(exc).__name__}\n")
-                    sys.stderr.flush()
                 await asyncio.sleep(min(
                     30.0, _TASK_TERMINATION_RETRY_S * attempt))
                 continue
@@ -15228,10 +15247,9 @@ async def _watch_inflight_tasks(
         """
         if not pending or not _owns_generation():
             return
-        sys.stderr.write(
+        obs.diagnostic_line(
             f"[chat] task watcher sid={session_id[:8]} {reason}; "
             f"requesting stop for {len(pending)} task(s)\n")
-        sys.stderr.flush()
 
         async def _request_stop(task_id: str) -> bool:
             try:
@@ -15248,10 +15266,9 @@ async def _watch_inflight_tasks(
         stop_results = await asyncio.gather(*(
             _request_stop(task_id) for task_id in tuple(pending)
         ))
-        sys.stderr.write(
+        obs.diagnostic_line(
             f"[chat] task watcher sid={session_id[:8]} stop requests "
             f"acked={sum(stop_results)}/{len(stop_results)}\n")
-        sys.stderr.flush()
 
         # ``asyncio.timeout`` cancels the in-flight ``__anext__`` that was
         # waiting when the absolute lease expired.  Direct SDK iterators treat
@@ -15484,7 +15501,7 @@ async def _watch_inflight_tasks(
                     # typed message (older CLI, or a CLI regression). Warn so
                     # we notice fallback traffic — the typed branch above is
                     # the supported contract.
-                    sys.stderr.write(
+                    obs.diagnostic_line(
                         f"[chat] task fallback: watcher settled via "
                         f"<task-notification> XML, typed message missed "
                         f"sid={session_id[:8]}\n")
@@ -15550,7 +15567,7 @@ async def _watch_inflight_tasks(
         watcher_failed = True
         watch_error_kind = str(
             _classify_stream_error(str(e)).get("kind") or "unknown")
-        sys.stderr.write(
+        obs.diagnostic_line(
             f"[chat] task watcher sid={session_id[:8]} err: "
             f"{type(e).__name__}; entering safe termination\n")
         await _terminate_expired_tasks("failed before task settlement")
@@ -15627,14 +15644,14 @@ async def _watch_inflight_tasks(
                         try:
                             await _rebuild_session_runtime(session_id)
                         except Exception as e:
-                            sys.stderr.write(
+                            obs.diagnostic_line(
                                 f"[chat] post-task runtime rebuild failed "
                                 f"sid={session_id[:8]} "
                                 f"exc={type(e).__name__}\n")
                     try:
                         await _maybe_drain_queue(session_id)
                     except Exception as e:
-                        sys.stderr.write(
+                        obs.diagnostic_line(
                             f"[chat] post-task queue drain failed "
                             f"sid={session_id[:8]} "
                             f"exc={type(e).__name__}\n")
@@ -15829,7 +15846,7 @@ async def _finish_cancelled_startup(
                 except Exception as exc:
                     # Deletion/corruption must not strand the active slot or
                     # Activity row. Restart recovery retains uncertain claims.
-                    sys.stderr.write(
+                    obs.diagnostic_line(
                         f"[chat] cancelled queue rollback failed "
                         f"sid={session_id[:8]} "
                         f"item={broadcast.queue_item_id[:8]} "
@@ -15841,7 +15858,7 @@ async def _finish_cancelled_startup(
                     snapshot_ready = await asyncio.to_thread(
                         _persist_cancelled_turn_snapshot, broadcast)
                 except Exception as exc:
-                    sys.stderr.write(
+                    obs.diagnostic_line(
                         f"[chat] cancelled snapshot failed sid={session_id[:8]} "
                         f"exc={type(exc).__name__}\n"
                     )
@@ -15923,7 +15940,7 @@ async def _start_activity_early(
             try:
                 start_task.result()
             except Exception as e:
-                sys.stderr.write(
+                obs.diagnostic_line(
                     f"[activity] start failed sid={session_id[:8]} "
                     f"exc={type(e).__name__}\n")
             else:
@@ -15932,7 +15949,7 @@ async def _start_activity_early(
         else:
             broadcast.activity_started = True
     except Exception as e:
-        sys.stderr.write(
+        obs.diagnostic_line(
             f"[activity] start failed sid={session_id[:8]} "
             f"exc={type(e).__name__}\n")
 
@@ -15967,7 +15984,7 @@ async def _finish_activity(
             finish_task.result()
             raise
     except Exception as e:
-        sys.stderr.write(
+        obs.diagnostic_line(
             f"[activity] startup finish failed sid={session_id[:8]} "
             f"exc={type(e).__name__}\n")
     finally:
@@ -16006,7 +16023,7 @@ async def _abort_turn_startup(
                 except Exception as exc:
                     # Queue corruption/deletion is durable uncertainty, but it
                     # must not strand Activity or the active-turn reservation.
-                    sys.stderr.write(
+                    obs.diagnostic_line(
                         f"[chat] startup queue rollback failed "
                         f"sid={session_id[:8]} "
                         f"item={broadcast.queue_item_id[:8]} "
@@ -16031,7 +16048,7 @@ async def _abort_turn_startup(
                     )
                 except Exception as exc:
                     snapshot_ready = False
-                    sys.stderr.write(
+                    obs.diagnostic_line(
                         f"[chat] startup snapshot failed "
                         f"sid={session_id[:8]} exc={type(exc).__name__}\n"
                     )
@@ -16880,11 +16897,10 @@ async def _start_turn(
             await emit({"event": "compact_progress",
                         "data": json.dumps(payload)})
         except Exception as e:
-            sys.stderr.write(
+            obs.diagnostic_line(
                 f"[chat-preflight] compact_progress emit failed "
                 f"sid={session_id[:8]} phase={phase} "
                 f"exc={type(e).__name__}\n")
-            sys.stderr.flush()
 
     async def _preflight_compact_if_needed(emit=None) -> None:
         """Use Claude Code's native context accounting before sending a turn.
@@ -16924,10 +16940,9 @@ async def _start_turn(
             obs.perf_event("chat.context_preflight", cached=use_cached)
         except Exception as e:
             safe_kind = _classify_stream_error(str(e)).get("kind", "unknown")
-            sys.stderr.write(
+            obs.diagnostic_line(
                 f"[chat-preflight] get_context_usage skipped sid={session_id[:8]} "
                 f"model={model_to_use}: {type(e).__name__} kind={safe_kind}\n")
-            sys.stderr.flush()
             if not (
                 _is_codex_gateway_model(model_to_use)
                 and _is_context_window_failure(e)
@@ -17023,16 +17038,14 @@ async def _start_turn(
         if (_sessions_with_inflight_tasks.get(session_id)
                 or _session_has_live_watcher(session_id)
                 or _session_has_scheduled_delivery(session_id)):
-            sys.stderr.write(
+            obs.diagnostic_line(
                 f"[chat-preflight] native compact deferred for background "
                 f"owner sid={session_id[:8]} model={model_to_use} "
                 f"total={total} threshold={threshold}\n")
-            sys.stderr.flush()
             return
-        sys.stderr.write(
+        obs.diagnostic_line(
             f"[chat-preflight] native compact sid={session_id[:8]} model={model_to_use} "
             f"total={total} next~={next_est} threshold={threshold} limit={limit}\n")
-        sys.stderr.flush()
         # Tell the UI. Without this the auto-compact is indistinguishable from a
         # slow turn: the FE shows the generic "Muse 正在思考…" bubble for the
         # entire compact, which on a long session runs MINUTES (2026-07-25: a
@@ -17063,11 +17076,10 @@ async def _start_turn(
             except Exception as e:
                 cmd_error = e
                 safe_kind = _classify_stream_error(str(e)).get("kind", "unknown")
-                sys.stderr.write(
+                obs.diagnostic_line(
                     f"[chat-preflight] native compact reported failure "
                     f"sid={session_id[:8]} model={model_to_use}: "
                     f"{type(e).__name__} kind={safe_kind} — verifying\n")
-                sys.stderr.flush()
             try:
                 measured = dict(await target.get_context_usage())
                 measure_error: Exception | None = None
@@ -17077,11 +17089,10 @@ async def _start_turn(
             except Exception as e:
                 measured = {}
                 measure_error = e
-                sys.stderr.write(
+                obs.diagnostic_line(
                     f"[chat-preflight] post-compact context probe failed "
                     f"sid={session_id[:8]} model={model_to_use}: "
                     f"{type(e).__name__}\n")
-                sys.stderr.flush()
             tail_outcome = await asyncio.to_thread(
                 _compact_tail_outcome, tail_path, tail_offset)
             return cmd_error, measured, measure_error, tail_outcome
@@ -17121,11 +17132,10 @@ async def _start_turn(
                         and not _sessions_with_inflight_tasks.get(session_id)
                         and not _session_has_live_watcher(session_id)
                         and not _session_has_scheduled_delivery(session_id)):
-                    sys.stderr.write(
+                    obs.diagnostic_line(
                         f"[chat-preflight] rebuilding stalled Codex runtime "
                         f"sid={session_id[:8]} model={model_to_use} "
                         f"total={total} after={real_total}; retrying once\n")
-                    sys.stderr.flush()
                     await disconnect_client(session_id)
                     client = await get_client(
                         session_id, model_to_use, permission,
@@ -17221,10 +17231,9 @@ async def _start_turn(
                 if failure is not None
                 else f"context did not shrink ({total} -> {real_total})"
             )
-            sys.stderr.write(
+            obs.diagnostic_line(
                 f"[chat-preflight] native compact failed sid={session_id[:8]} "
                 f"model={model_to_use}: {safe_reason}\n")
-            sys.stderr.flush()
             # The `error` SSE that follows tears the stream down, and the FE
             # clears `compacting` on stream teardown regardless — but emit the
             # terminal phase anyway so the bubble's reason is the compact's,
@@ -17277,11 +17286,10 @@ async def _start_turn(
                 "api_error_status": None,
             })
         if cmd_error is not None:
-            sys.stderr.write(
+            obs.diagnostic_line(
                 f"[chat-preflight] native compact recovered sid={session_id[:8]}: "
                 f"command reported {type(cmd_error).__name__} but context shrank "
                 f"{total} -> {real_total}; continuing\n")
-            sys.stderr.flush()
         real_max = _positive_int(cu2.get("maxTokens"))
         real_raw = _positive_int(cu2.get("rawMaxTokens"))
         refreshed_details = _context_limit_details(
@@ -17419,6 +17427,14 @@ async def _start_turn(
                 binary_blocks = [*img_blocks, *pdf_blocks]
 
                 async def _send_query() -> None:
+                    # Recall may wait indefinitely when configured as zero.
+                    # Prepare outside the CLI hook timer; only the exact next
+                    # prompt can consume it through additionalContext.
+                    if broadcast.cancelled or not await mem0.prepare_recall(
+                        session_id, broadcast.turn_id, prompt,
+                        is_cancelled=lambda: broadcast.cancelled,
+                    ):
+                        raise _TurnCancelledBeforeQuery()
                     # Every preflight/transcript/sidecar await above is a Stop
                     # race. This is the last instruction before SDK transport.
                     if broadcast.cancelled:
@@ -17463,12 +17479,11 @@ async def _start_turn(
                                 owned=True,
                             )
                         except Exception as exc:
-                            sys.stderr.write(
+                            obs.diagnostic_line(
                                 f"[chat] retry intent cleanup pending "
                                 f"sid={session_id[:8]} "
                                 f"exc={type(exc).__name__}\n"
                             )
-                            sys.stderr.flush()
                         finally:
                             _native_retry_commits.pop(session_id, None)
                     # query() is the transport commit point. Until it returns,
@@ -17492,11 +17507,10 @@ async def _start_turn(
                                 list(persisted_imgs),
                             )
                         except Exception as exc:
-                            sys.stderr.write(
+                            obs.diagnostic_line(
                                 "[attach] pending annotation failed "
                                 f"sid={obs.short_id(session_id)} "
                                 f"exc={type(exc).__name__}\n")
-                            sys.stderr.flush()
 
                 replay_dropped = 0
                 deferred_result: ResultMessage | None = None
@@ -17632,10 +17646,9 @@ async def _start_turn(
                         if captured:
                             raise ClaudeSDKError(captured["message"])
                 if replay_dropped:
-                    sys.stderr.write(
+                    obs.diagnostic_line(
                         f"[chat-stream] dropped stale replay sid={session_id[:8]} "
                         f"messages={replay_dropped}\n")
-                    sys.stderr.flush()
             terminal_kind = ""
             terminal_payload: Any = None
             try:
@@ -17647,10 +17660,9 @@ async def _start_turn(
                 # Expected control transfer: the old transcript was preserved
                 # and the browser will adopt the returned recovery session.
                 # Keep service logs concise and never dump summary/prompt data.
-                sys.stderr.write(
+                obs.diagnostic_line(
                     f"[chat-preflight] recovery session ready "
                     f"sid={session_id[:8]} model={model_to_use}\n")
-                sys.stderr.flush()
                 terminal_kind, terminal_payload = "error", e
             except Exception as e:
                 # Keep enough structure for diagnosis without copying an SDK
@@ -17659,12 +17671,12 @@ async def _start_turn(
                 # detailed surface.
                 error_kind = _classify_stream_error(str(e)).get(
                     "kind", "unknown")
-                sys.stderr.write(
+                obs.diagnostic_line(
                     f"[chat-stream] sid={session_id[:8]} model={model_to_use} "
                     f"exc={type(e).__name__} kind={error_kind}\n")
-                sys.stderr.flush()
                 terminal_kind, terminal_payload = "error", e
             finally:
+                mem0.clear_prepared_recall(session_id, broadcast.turn_id)
                 # Do not expose a terminal failure while its staged id is still
                 # busy. Retrying as soon as the browser sees error is safe.
                 await _rollback_broadcast_attachments(broadcast)
@@ -17694,7 +17706,7 @@ async def _start_turn(
                         _activity.set_state, session_id,
                         "waiting_approval", detail="Waiting for user input")
                 except Exception as e:
-                    sys.stderr.write(
+                    obs.diagnostic_line(
                         f"[activity] waiting state failed sid={session_id[:8]} "
                         f"exc={type(e).__name__}\n")
             return payload
@@ -17891,7 +17903,7 @@ async def _start_turn(
                             summary=n.get("summary") or None,
                             output_file=n.get("output_file") or None):
                         continue
-                    sys.stderr.write(
+                    obs.diagnostic_line(
                         f"[chat] task fallback: in-turn settle via "
                         f"<task-notification> XML, typed message missed "
                         f"sid={session_id[:8]} task={obs.short_id(tid)}\n")
@@ -17924,7 +17936,7 @@ async def _start_turn(
                         if launch and tu_id:
                             tid = launch["task_id"]
                             if tid and tid not in inflight_tasks:
-                                sys.stderr.write(
+                                obs.diagnostic_line(
                                     f"[chat] task fallback: bg launch detected "
                                     f"via tool_result sniff, TaskStartedMessage "
                                     f"missed sid={session_id[:8]} "
@@ -18350,10 +18362,12 @@ async def _start_turn(
                 session_id, broadcast, _activity_status)
             if _done_background_tasks and terminal_assistant_uuid:
                 try:
-                    sess.set_runtime_background_boundary(
-                        session_id, terminal_assistant_uuid)
+                    await obs.to_thread_io(
+                        "chat.runtime_background_boundary", session_id,
+                        sess.set_runtime_background_boundary,
+                        session_id, terminal_assistant_uuid, owned=True)
                 except Exception as exc:
-                    sys.stderr.write(
+                    obs.diagnostic_line(
                         f"[chat] runtime boundary persist failed "
                         f"sid={session_id[:8]} "
                         f"exc={type(exc).__name__}\n"
@@ -18403,10 +18417,9 @@ async def _start_turn(
                         file_path=sess._sidecar_path(session_id),
                     )
             except Exception as exc:
-                sys.stderr.write(
+                obs.diagnostic_line(
                     f"[chat] terminal sidecar write failed "
                     f"sid={session_id[:8]} exc={type(exc).__name__}\n")
-                sys.stderr.flush()
             yield {"event": "done", "data": json.dumps({
                 "turn_id": broadcast.turn_id,
                 "duration_ms": _msg_duration_ms,
@@ -18481,7 +18494,7 @@ async def _start_turn(
                     sdk_threshold = _positive_int(cu.get("autoCompactThreshold"))
                     sdk_total = _positive_int(cu.get("totalTokens"))
                 except Exception as _e:
-                    sys.stderr.write(
+                    obs.diagnostic_line(
                         f"[chat-stream] third-party get_context_usage skipped for "
                         f"sid={session_id[:8]} exc={type(_e).__name__}\n")
                 capability = await _detect_gateway_context_capability(
@@ -18526,7 +18539,10 @@ async def _start_turn(
                         # after a restart / on cold tab switches without
                         # needing a live client (see get_session_ctx_window).
                         try:
-                            sess.set_session_ctx_window(session_id, real_max)
+                            await obs.to_thread_io(
+                                "chat.context_window_write", session_id,
+                                sess.set_session_ctx_window, session_id, real_max,
+                                owned=True)
                         except Exception:
                             pass
                     if real_total:
@@ -18537,7 +18553,7 @@ async def _start_turn(
                         sess_u["context_used_pct"] = round(
                             real_total / real_max * 100, 1)
                 except Exception as _e:
-                    sys.stderr.write(
+                    obs.diagnostic_line(
                         f"[chat-stream] get_context_usage skipped for "
                         f"sid={session_id[:8]} exc={type(_e).__name__}\n")
 
@@ -18761,7 +18777,7 @@ async def _start_turn(
                     from . import jsonl_cleanup as _jc
                     await asyncio.to_thread(_jc.clean_session, session_id)
                 except Exception as e:
-                    sys.stderr.write(
+                    obs.diagnostic_line(
                         f"[chat] jsonl cleanup failed "
                         f"sid={session_id[:8]} "
                         f"exc={type(e).__name__}\n")
@@ -19221,16 +19237,15 @@ async def _start_turn(
                         terminal_published = True
         except asyncio.TimeoutError:
             if terminal_published:
-                sys.stderr.write(
+                obs.diagnostic_line(
                     f"[chat] post-turn bookkeeping timed out "
                     f"sid={session_id[:8]}\n")
                 return
             turn_errored = True
             turn_error_text = f"turn exceeded {BG_TIMEOUT_S}s"
-            sys.stderr.write(
+            obs.diagnostic_line(
                 f"[chat] turn exceeded MUSELAB_TURN_TIMEOUT_S={BG_TIMEOUT_S}s, "
                 f"aborting sid={session_id[:8]}\n")
-            sys.stderr.flush()
             try:
                 broadcast.publish(await _durable_error_event(turn_error_text))
             except Exception as exc:
@@ -19238,7 +19253,7 @@ async def _start_turn(
                     "terminal_replay", session_id, exc)
         except Exception as e:
             if terminal_published:
-                sys.stderr.write(
+                obs.diagnostic_line(
                     f"[chat] post-turn bookkeeping failed "
                     f"sid={session_id[:8]} exc={type(e).__name__}\n")
                 return
@@ -19252,10 +19267,9 @@ async def _start_turn(
             # surface. Server logs keep only safe diagnostics: SDK/Gateway
             # exception strings and tracebacks can contain prompts, paths,
             # credentials, or upstream protocol payloads.
-            sys.stderr.write(
+            obs.diagnostic_line(
                 f"[chat] background turn crashed sid={session_id[:8]} "
                 f"exc={type(e).__name__} kind={error_kind}\n")
-            sys.stderr.flush()
             if primary_already_recorded:
                 _safe_secondary_diagnostic(
                     "terminal_replay", session_id, e)
@@ -19366,7 +19380,7 @@ async def _start_turn(
                 except Exception as e:
                     # Never duplicate a turn by guessing. The durable inflight
                     # record remains for restart recovery if acknowledgement fails.
-                    sys.stderr.write(
+                    obs.diagnostic_line(
                         f"[chat] queue terminal ack failed sid={session_id[:8]} "
                         f"item={broadcast.queue_item_id[:8]} "
                         f"exc={type(e).__name__}\n")
@@ -19384,11 +19398,10 @@ async def _start_turn(
                     # The outbox remains durable. Queue drain below fails closed
                     # while a READY record exists and delivery re-kicks it after
                     # a later successful presentation commit.
-                    sys.stderr.write(
+                    obs.diagnostic_line(
                         f"[chat] runtime continuation boundary flush failed "
                         f"sid={session_id[:8]} exc={type(exc).__name__}\n"
                     )
-                    sys.stderr.flush()
             broadcast.finish()
             _active_turns.pop(session_id, None)
             if (not deleting_session
@@ -19415,7 +19428,7 @@ async def _start_turn(
                 if not deleting_session:
                     _schedule_queue_drain(session_id)
             except Exception as e:
-                sys.stderr.write(
+                obs.diagnostic_line(
                     f"[chat] queue drain trigger failed sid={session_id[:8]} "
                     f"exc={type(e).__name__}\n")
 
@@ -19452,10 +19465,9 @@ def _notify_turn_done(session_id: str, *, session_name: str = "") -> None:
                 context=f"turn-done {session_id[:8]}",
             )
         except Exception as e:
-            sys.stderr.write(
+            obs.diagnostic_line(
                 f"[chat] turn push failed sid={session_id[:8]} "
                 f"exc={type(e).__name__}\n")
-            sys.stderr.flush()
 
     try:
         task = asyncio.get_running_loop().create_task(_go())
@@ -19490,7 +19502,7 @@ def _notify_queue_paused_on_error(session_id: str) -> None:
                 context=f"queue-paused {session_id[:8]}",
             )
         except Exception as e:
-            sys.stderr.write(
+            obs.diagnostic_line(
                 f"[chat] queue-paused push failed "
                 f"sid={session_id[:8]} exc={type(e).__name__}\n")
     try:
@@ -19539,7 +19551,7 @@ def _schedule_queue_drain_retry(session_id: str, delay_s: float = 1.0) -> None:
         except asyncio.CancelledError:
             return
         if exc is not None:
-            sys.stderr.write(
+            obs.diagnostic_line(
                 f"[chat] delayed queue drain failed "
                 f"sid={session_id[:8]} exc={type(exc).__name__}\n"
             )
@@ -19591,7 +19603,7 @@ async def _maybe_drain_queue(session_id: str) -> None:
                         successor_sid,
                     )
                 except Exception as exc:
-                    sys.stderr.write(
+                    obs.diagnostic_line(
                         f"[chat] attachment ref migration deferred "
                         f"exc={type(exc).__name__}\n")
                 if moved["target"].get("items"):
@@ -19614,7 +19626,7 @@ async def _maybe_drain_queue(session_id: str) -> None:
                     if successor_sid and successor_sid != session_id:
                         _schedule_queue_drain(successor_sid)
                 except HTTPException as exc:
-                    sys.stderr.write(
+                    obs.diagnostic_line(
                         f"[chat] queued runtime rollover deferred "
                         f"sid={session_id[:8]} status={exc.status_code}\n"
                     )
@@ -19627,11 +19639,10 @@ async def _maybe_drain_queue(session_id: str) -> None:
         try:
             await _flush_runtime_continuations_at_turn_boundary(session_id)
         except Exception as exc:
-            sys.stderr.write(
+            obs.diagnostic_line(
                 f"[chat] queued runtime continuation flush failed "
                 f"sid={session_id[:8]} exc={type(exc).__name__}\n"
             )
-            sys.stderr.flush()
             return
         if await obs.to_thread_io(
             "chat.runtime_continuation_ready_read",
@@ -19709,21 +19720,19 @@ async def _maybe_drain_queue(session_id: str) -> None:
                     UnsafePrivatePath) as exc:
                 restored = await _release_queue_claim_owned(
                     session_id, item_id, issue="attachment_unavailable")
-                sys.stderr.write(
+                obs.diagnostic_line(
                     f"[chat] queued attachment precheck failed "
                     f"sid={session_id[:8]} item={item_id[:8]} "
                     f"restored={restored} exc={type(exc).__name__}\n"
                 )
-                sys.stderr.flush()
                 return
             if unavailable_count:
                 restored = await _release_queue_claim_owned(
                     session_id, item_id, issue="attachment_unavailable")
-                sys.stderr.write(
+                obs.diagnostic_line(
                     f"[chat] queued attachments unavailable "
                     f"sid={session_id[:8]} item={item_id[:8]} "
                     f"count={unavailable_count} restored={restored}\n")
-                sys.stderr.flush()
                 return
         # Replay under the permission mode snapshotted at enqueue time. Items
         # from before the snapshot existed (or enqueued without one) fail CLOSED
@@ -19776,7 +19785,7 @@ async def _maybe_drain_queue(session_id: str) -> None:
             _notify_queue_paused_on_error(session_id)
         except Exception as e:
             await _release_queue_claim_owned(session_id, item_id, issue="failed")
-            sys.stderr.write(
+            obs.diagnostic_line(
                 f"[chat] queue drain crashed sid={session_id[:8]} "
                 f"exc={type(e).__name__}\n")
             _notify_queue_paused_on_error(session_id)
@@ -19809,7 +19818,7 @@ def _schedule_queue_drain(session_id: str) -> None:
         except asyncio.CancelledError:
             return
         if exc is not None:
-            sys.stderr.write(
+            obs.diagnostic_line(
                 f"[chat] scheduled queue drain failed "
                 f"sid={session_id[:8]} exc={type(exc).__name__}\n")
         if rekick:
@@ -21160,7 +21169,7 @@ async def _begin_scheduled_delivery(
                 file_path=sess._sidecar_path(key[0]),
             )
         except Exception as exc:
-            sys.stderr.write(
+            obs.diagnostic_line(
                 f"[chat] scheduled trigger annotation failed "
                 f"sid={key[0][:8]} exc={type(exc).__name__}\n"
             )
@@ -21271,7 +21280,7 @@ async def _refresh_scheduled_session_summary(
             owned=True,
         )
     except Exception as exc:
-        sys.stderr.write(
+        obs.diagnostic_line(
             f"[chat] scheduled session index refresh failed "
             f"sid={session_id[:8]} exc={type(exc).__name__}\n"
         )
@@ -21336,7 +21345,7 @@ async def _finish_scheduled_delivery(
                 file_path=sess._sidecar_path(session_id),
             )
         except Exception as exc:
-            sys.stderr.write(
+            obs.diagnostic_line(
                 f"[chat] scheduled footer annotation failed "
                 f"sid={session_id[:8]} exc={type(exc).__name__}\n"
             )

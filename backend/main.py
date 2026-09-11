@@ -199,6 +199,19 @@ class _EventLoopStallWatchdog:
         safe_function = re.sub(r"[^A-Za-z0-9_.-]", "_", function)[:60]
         return f"{safe_module}:{safe_function}"
 
+    def _blocked_callers(self) -> str:
+        # Function names only: no source lines, paths, locals, or user payloads.
+        frame = sys._current_frames().get(self._loop_thread_id)
+        callers = []
+        for _ in range(4):
+            frame = frame.f_back if frame is not None else None
+            if frame is None:
+                break
+            module = str(frame.f_globals.get("__name__", "unknown"))
+            function = str(frame.f_code.co_name or "unknown")
+            callers.append(re.sub(r"[^A-Za-z0-9_.:-]", "_", f"{module}:{function}")[:80])
+        return ">".join(callers)[:160] or "unknown"
+
     def _check_once(self, observed_at: float) -> None:
         lag_s = max(0.0, observed_at - self._heartbeat_at)
         if lag_s < self._threshold_s:
@@ -212,6 +225,7 @@ class _EventLoopStallWatchdog:
                 "runtime.loop_stall",
                 lag_ms=round(lag_s * 1000),
                 site=self._blocked_site(),
+                callers=self._blocked_callers(),
             )
         except Exception:
             # Diagnostics must never terminate the watchdog thread.
