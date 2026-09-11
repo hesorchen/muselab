@@ -288,6 +288,13 @@ class MemoryStore:
             if time.perf_counter() >= deadline:
                 raise TimeoutError("memory read deadline exceeded")
             yield
+        except sqlite3.OperationalError as exc:
+            # The progress handler and asyncio timeout race at the same
+            # deadline. Both paths represent a read timeout, not a broken DB.
+            if (getattr(exc, "sqlite_errorcode", None) == sqlite3.SQLITE_INTERRUPT
+                    and time.perf_counter() >= deadline):
+                raise TimeoutError("memory read deadline exceeded") from None
+            raise
         finally:
             self._query_deadline = None
 

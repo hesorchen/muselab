@@ -183,6 +183,7 @@ const _diffOpsCache = new WeakMap();   // raw msg -> ops[]
 const _mcpFmtCache  = new WeakMap();   // raw msg -> { kind, value }
 const _readLinesCache = new WeakMap(); // raw msg -> { src, lines }
 const _searchHitsCache = new WeakMap();// raw msg -> { src, hits }
+const _toolPathTextCache = new WeakMap(); // raw msg -> escaped path-link fragments
 const _toolMdCache = new WeakMap();    // raw msg -> { src, html }
 // Keyed by the per-tab state proxy. A structural transcript update normally
 // shifts many keyed Alpine rows at once; rebuilding this lookup once keeps each
@@ -4947,6 +4948,53 @@ function portal() {
       const path = inp.file_path || inp.notebook_path || "";
       return this._normalizeWorkspacePath(path);
     },
+    // Tool summaries/stdout are plain text, never Markdown or executable
+    // HTML. Link only path-shaped tokens and route clicks through the same
+    // workspace preview handler used by Read/Edit. Bound scanning and memoize
+    // per message so streaming unrelated rows does not repeatedly parse output.
+    toolTextHtml(m, text, slot = "summary") {
+      const source = String(text || "");
+      const root = this.currentWorkspacePath()
+        || (this.contextInfo || {}).workspace_root
+        || (this.contextInfo || {}).archive_root || "";
+      const raw = _rawMsg(m);
+      let cache = _toolPathTextCache.get(raw);
+      const hit = cache && cache[slot];
+      if (hit && hit.source === source && hit.root === root) return hit.html;
+      const tokens = /"[^"\r\n]+"|'[^'\r\n]+'|[^\s"'`<>|;&()[\]{}]+/gu;
+      const pathShape = /^([\p{L}\p{N}_@./~+ ()-]+\.[A-Za-z][A-Za-z0-9]{0,9})(?::(\d+))?(?::\d+)?$/u;
+      let html = "", end = 0, linked = 0;
+      for (const match of source.slice(0, 65536).matchAll(tokens)) {
+        let candidate = match[0], start = match.index;
+        if (candidate.startsWith('"') || candidate.startsWith("'")) {
+          candidate = candidate.slice(1, -1);
+          start += 1;
+        }
+        const assignment = candidate.indexOf("=");
+        if (assignment >= 0) {
+          start += assignment + 1;
+          candidate = candidate.slice(assignment + 1);
+        }
+        candidate = candidate.replace(/[,.]+$/, "");
+        if (!candidate || candidate.length > 512 || candidate.startsWith("//")
+            || (candidate.includes("@") && !candidate.includes("/"))) continue;
+        const parsed = candidate.match(pathShape);
+        if (!parsed) continue;
+        const path = this._normalizeWorkspacePath(parsed[1]);
+        if (!path) continue;
+        html += this.escape(source.slice(end, start));
+        html += `<a class="file-link" href="#" data-path="${this.escape(path)}"`
+          + (parsed[2] ? ` data-line="${parsed[2]}"` : "")
+          + `>${this.escape(candidate)}</a>`;
+        end = start + candidate.length;
+        if (++linked >= 64) break;
+      }
+      html += this.escape(source.slice(end));
+      if (!cache) { cache = {}; _toolPathTextCache.set(raw, cache); }
+      cache[slot] = { source, root, html };
+      return html;
+    },
+
     // Render mcp__<server>__<tool> nicely: drop the mcp__ prefix, replace __ with " · "
     renderToolName(name) {
       if (!name) return "";

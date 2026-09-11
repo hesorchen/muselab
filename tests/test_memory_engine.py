@@ -1170,7 +1170,7 @@ def test_ui_read_interrupts_expensive_sql_and_next_request_recovers(tmp_path):
     async def scenario():
         started = time.perf_counter()
         try:
-            with pytest.raises((TimeoutError, sqlite3.OperationalError)):
+            with pytest.raises(TimeoutError):
                 await instance._read_store_call(expensive)
             instance.UI_READ_TIMEOUT_S = 1
             result = await instance._read_store_call(

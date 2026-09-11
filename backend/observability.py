@@ -54,6 +54,21 @@ def _write_line(line: str) -> None:
 
 
 
+def diagnostic_line(line: str) -> None:
+    """Write a caller-sanitized diagnostic without waiting on the stderr sink.
+
+    Keep this independent of MUSELAB_PERF_LOG: operational failure summaries
+    still matter when performance logging is disabled. The lifespan starts a
+    bounded worker; synchronous startup/test callers retain immediate output.
+    Never pass provider payloads or raw exception text to this function.
+    """
+    bounded = _CONTROL_RE.sub(" ", str(line)).strip()[:2048] + "\n"
+    if _perf_writer is not None:
+        _perf_writer.submit(_write_line, bounded)
+    else:
+        _write_line(bounded)
+
+
 def perf_enabled() -> bool:
     """Return whether compact performance events are enabled (default: on)."""
     return os.getenv("MUSELAB_PERF_LOG", "1").strip().lower() not in _FALSE_VALUES

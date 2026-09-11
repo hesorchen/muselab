@@ -311,11 +311,10 @@ def _privacy_safe_cli_stderr_logger(
         if category in seen:
             return
         seen.add(category)
-        sys.stderr.write(
+        obs.diagnostic_line(
             f"[{safe_runtime}] sid={obs.short_id(session_id)} "
             f"category={category} detail=suppressed\n"
         )
-        sys.stderr.flush()
 
     return _logger
 
@@ -2430,11 +2429,10 @@ def _log_context_probe_failure(model: str, exc: BaseException) -> None:
         _CONTEXT_PROBE_LOG_STATE[key] = (previous[0], previous[1] + 1)
         return
     suppressed = previous[1] if previous is not None else 0
-    sys.stderr.write(
+    obs.diagnostic_line(
         f"[ctx-catalog] gateway context probe unavailable "
         f"model={model} exc={error_kind} suppressed={suppressed}\n"
     )
-    sys.stderr.flush()
     _CONTEXT_PROBE_LOG_STATE[key] = (now, 0)
 
 
@@ -2450,11 +2448,10 @@ def _log_context_probe_recovery(model: str) -> None:
     suppressed = sum(state[1] for _, state in matches)
     for key, _ in matches:
         _CONTEXT_PROBE_LOG_STATE.pop(key, None)
-    sys.stderr.write(
+    obs.diagnostic_line(
         f"[ctx-catalog] gateway context probe recovered "
         f"model={model} suppressed={suppressed}\n"
     )
-    sys.stderr.flush()
 
 
 def _positive_int(v: Any) -> int:

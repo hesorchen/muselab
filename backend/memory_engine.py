@@ -10,6 +10,7 @@ import math
 import os
 import re
 import shutil
+import sqlite3
 import tempfile
 import threading
 import time
@@ -249,9 +250,30 @@ class _MemoryStoreActor:
         job = self._submit(operation)
         # Cancelling the asyncio waiter must not cancel or overtake a SQLite
         # transaction already queued on the actor.
+        wrapped = asyncio.wrap_future(job)
         try:
-            return await asyncio.shield(asyncio.wrap_future(job))
+            return await asyncio.shield(wrapped)
         except asyncio.CancelledError:
+            # shield detaches a cancelled waiter; the underlying worker still
+            # finishes and can raise (e.g. SQLite's read-budget interrupt).
+            # Retain an observer so asyncio does not report an unhandled
+            # Future with a full traceback after the HTTP request has left.
+            def observe_detached(done: asyncio.Future) -> None:
+                if done.cancelled():
+                    return
+                exc = done.exception()
+                expected_interrupt = self._cancel_pending and (
+                    isinstance(exc, TimeoutError)
+                    or (isinstance(exc, sqlite3.OperationalError)
+                        and getattr(exc, "sqlite_errorcode", None)
+                        == sqlite3.SQLITE_INTERRUPT)
+                )
+                if exc is not None and not expected_interrupt:
+                    log.warning(
+                        "memory store operation failed after caller cancellation "
+                        "exception_class=%s", type(exc).__name__)
+
+            wrapped.add_done_callback(observe_detached)
             if self._cancel_pending:
                 job.cancel()  # A read that has not started is no longer useful.
             raise

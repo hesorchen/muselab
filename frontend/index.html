@@ -2555,7 +2555,7 @@
                       <span class="tool-arg mcp-input-preview" x-text="mcpInputPreview(m)"></span>
                     </template>
                     <template x-if="!toolFilePath(m) && !(m.name && m.name.startsWith('mcp__'))">
-                      <span class="tool-arg" x-text="m.summary"></span>
+                      <span class="tool-arg" x-html="toolTextHtml(m, m.summary)"></span>
                     </template>
                     <!-- SDK-native background-task status for non-subagent
                          tools (Bash run_in_background=true). Same task_status
@@ -2686,10 +2686,10 @@
                         <template x-if="toolResultKind(m) === 'bash'">
                           <div class="bash-term">
                             <template x-if="bashResultText(m).stdout">
-                              <pre class="bash-stdout" x-text="bashResultText(m).stdout"></pre>
+                              <pre class="bash-stdout" x-html="toolTextHtml(m, bashResultText(m).stdout, 'stdout')"></pre>
                             </template>
                             <template x-if="bashResultText(m).stderr">
-                              <pre class="bash-stderr" x-text="bashResultText(m).stderr"></pre>
+                              <pre class="bash-stderr" x-html="toolTextHtml(m, bashResultText(m).stderr, 'stderr')"></pre>
                             </template>
                             <template x-if="bashResultText(m).interrupted">
                               <div class="bash-meta interrupted">
