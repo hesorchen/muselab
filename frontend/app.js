@@ -8712,6 +8712,7 @@ function portal() {
         // Post-result work may briefly leave /active or a mux state snapshot
         // stale; never re-attach that already-rendered turn as "running".
         _lastTerminalTurnId: "",
+        _lastTerminalAssistantUuid: "",
         parentTurnId: "",
         lastEventSeq: 0,
         es: null,
@@ -8775,6 +8776,7 @@ function portal() {
         // never advances for optimistic/live bubbles, so a non-empty pane can
         // still detect that the server has committed a newer missing suffix.
         _installedCanonicalCount: 0,
+        _installedHistoryTotal: 0,
         _seenUpdated: undefined,
         _reconcileTargetUpdated: 0,
         _reconcileRetryN: 0,
@@ -8907,6 +8909,7 @@ function portal() {
       }
       if (st.activeTurnId === undefined) st.activeTurnId = "";
       if (st._lastTerminalTurnId === undefined) st._lastTerminalTurnId = "";
+      if (st._lastTerminalAssistantUuid === undefined) st._lastTerminalAssistantUuid = "";
       if (st.parentTurnId === undefined) st.parentTurnId = "";
       if (st._streamOwnerToken === undefined) st._streamOwnerToken = "";
       if (!Number.isFinite(Number(st._lastSseTransportAt))) {
@@ -18618,6 +18621,37 @@ function portal() {
       return false;
     },
 
+    _historySnapshotRejection(st, snapshot, opts = {}) {
+      // All replacement paths share this gate, including revision/replay loads
+      // that never pass through the explicit done-frame reconciler.
+      if (snapshot.completion_state?.stable === false) return "unstable_snapshot";
+      const seen = Number(st._seenUpdated) || 0;
+      const updated = Number(snapshot.updated_at) || 0;
+      if (seen && updated && updated < seen) return "older_snapshot";
+      const generation = String(snapshot.history_generation || "");
+      const sameGeneration = generation && generation === st.messageRange.generation;
+      if (sameGeneration && !opts.full && st.messageRange.order !== "full"
+          && Number.isFinite(snapshot.total)
+          && snapshot.total < (Number(st._installedHistoryTotal) || 0)) {
+        return "shorter_snapshot";
+      }
+      const expected = st._pendingCompletedTurnSync;
+      const boundary = opts.completedBoundary?.uuid
+        || (expected && expected.completedTurnId === st._lastTerminalTurnId
+          ? expected.expectedAssistantUuid : "")
+        || st._lastTerminalAssistantUuid;
+      // A compact/delete/full-history navigation can legitimately change the
+      // window. Within the SAME normal generation and completed turn, however,
+      // an acknowledged final UUID cannot disappear from the latest snapshot.
+      if (boundary && sameGeneration && !opts.full && !snapshot.has_later
+          && st.messageRange.order !== "full"
+          && snapshot.completion_state?.completed_turn_id === st._lastTerminalTurnId
+          && !(snapshot.messages || []).some(message => message.uuid === boundary)) {
+        return "missing_terminal_boundary";
+      }
+      return "";
+    },
+
     async loadSession(sid, opts = {}) {
       if (!sid) return false;
       // full:true → fetch the raw-JSONL view (?full=1) so PRE-compaction
@@ -18808,6 +18842,12 @@ function portal() {
           return false;
         }
         const loadedUpdated = Number(s.updated_at) || 0;
+        const rejection = this._historySnapshotRejection(st, s, opts);
+        if (rejection) {
+          historyPerf.cancel_reason = rejection;
+          st._pendingExternalUpdate = true;
+          return false;
+        }
         const shapeStarted = perfNow();
         // Build a lookup of blob preview URLs from the current in-memory
         // messages so we can carry them over after the server rebuild.
@@ -19045,6 +19085,10 @@ function portal() {
         st._installedCanonicalCount = Math.max(
           0, Number(s.message_count) || Number(s.total) || incomingCount,
         );
+        // Session metadata can count pre-compaction/raw records. Keep this
+        // normal-window baseline separate, excluding provisional active turns.
+        st._installedHistoryTotal = s.completion_state?.stable === true
+          && s.completion_state?.active === false ? (Number(s.total) || 0) : 0;
         // (The session outline is sourced from the backend via
         // refreshOutlineFromBackend (GET …/outline), not built here.)
         const permissionExpected = st._permissionExpected;
@@ -31467,7 +31511,8 @@ function portal() {
     },
     _refreshSlashPalette(prefix = this.input) {
       const text = String(prefix || "");
-      if (!text.startsWith("/")) {
+      if (!this.SLASH_ENABLED || !text.startsWith("/")
+          || /^\/[^\s]*[\/\\]/.test(text)) {
         this.slashShow = false;
         return false;
       }
@@ -32907,7 +32952,7 @@ function portal() {
       if (this.SLASH_ENABLED && isComposerSubmission) {
         const slashDraft = String((sendState.draft && sendState.draft.input) || "");
         const slashText = slashDraft.trim();
-        if (slashText.startsWith("/")) {
+        if (slashText.startsWith("/") && !/^\/[^\s]*[\/\\]/.test(slashText)) {
           const match = slashText.match(/^\/([^\s]+)(?:\s+([\s\S]*))?$/);
           if (match) {
             return await this._dispatchSlash(match[1], match[2] || "", {
@@ -34728,6 +34773,7 @@ function portal() {
         const terminalTurnId = streamTurnId || String(streamState.activeTurnId || "");
         if (authoritativeTerminal && terminalTurnId) {
           streamState._lastTerminalTurnId = terminalTurnId;
+          streamState._lastTerminalAssistantUuid = String(completionMeta?.assistantUuid || "");
         }
         if (streamState._stoppingTurnId === terminalTurnId) {
           streamState._stoppingTurnId = "";

@@ -1277,6 +1277,22 @@ def normalize_model_id(model: str) -> str:
     return model
 
 
+def routing_env(model: str) -> dict[str, str] | None:
+    """Read endpoint identity without preparing a CLI filesystem or credentials.
+
+    Capability/usage probes run on the event loop, often on every assistant
+    message. Runtime preparation belongs exclusively to env_override().
+    """
+    provider = lookup(model)
+    if provider is None:
+        return None
+    key = os.environ.get(provider.env_key, "")
+    if not key:
+        return None
+    return {"ANTHROPIC_BASE_URL": _resolve_base_url(provider.env_key, provider),
+            "ANTHROPIC_API_KEY": key, "ANTHROPIC_AUTH_TOKEN": key}
+
+
 def env_override(model: str) -> dict[str, str] | None:
     """Build the env dict to pass to ClaudeAgentOptions(env=...) so the SDK
     routes to the vendor's Anthropic-compatible endpoint. Returns None if no

@@ -2070,3 +2070,23 @@ def test_export_session_markdown_rejects_bad_token(client, auth, app_module):
         params={"token": "not-the-real-token-but-long-enough-to-pass-the-len-check"},
     )
     assert r.status_code == 401
+
+
+def test_repeated_task_observation_does_not_rewrite_timestamp(app_module, monkeypatch):
+    from backend import sessions as sess
+    sid = "overlay-repeat-session"
+    assert sess.set_runtime_task_overlay(sid, "task-repeat", state="running", updated_at=10)
+    original = sess._save_runtime_task_overlays
+    writes = []
+
+    def save(*args):
+        writes.append(args)
+        return original(*args)
+
+    monkeypatch.setattr(sess, "_save_runtime_task_overlays", save)
+    assert not sess.set_runtime_task_overlay(sid, "task-repeat", state="running", updated_at=20)
+    assert writes == []
+    assert sess.get_runtime_task_overlays(sid)["task-repeat"]["updated_at"] == 10
+    assert sess.set_runtime_task_overlay(sid, "task-repeat", state="completed", summary="Finished", updated_at=30)
+    assert len(writes) == 1
+    assert sess.get_runtime_task_overlays(sid)["task-repeat"]["state"] == "completed"

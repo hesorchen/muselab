@@ -57,8 +57,6 @@ _PARTIAL_RECONCILE_YIELD_S = 0.01
 _NATIVE_DIRECTORY_WATCH_HARD_CAP = 131_072
 _WATCH_LINGER_S = 30.0
 _MAX_IDLE_WATCHERS = 3
-_RECONCILE_BACKOFF_START_S = 0.25
-_RECONCILE_BACKOFF_CAP_S = 5.0
 _EVENT_TICKET_TTL_S = 45
 _DATABASE_MAINTENANCE_DELAY_S = 30.0
 _EXCLUDED_DIRS = frozenset({TRASH_DIR_NAME, INTERNAL_DIR_NAME})
@@ -454,15 +452,16 @@ class FileWatchManager:
         return True
 
     @staticmethod
-    def _record_reconcile_retry(state: _WatchState) -> None:
+    def _record_reconcile_retry(state: _WatchState, *, elapsed_s: float = 0.0) -> float:
         """Apply workspace-local exponential backoff after a failed/partial pass."""
         state.reconcile_failures += 1
         delay = min(
             _RECONCILE_RETRY_MAX_S,
-            _RECONCILE_RETRY_BASE_S
-            * (2 ** min(state.reconcile_failures - 1, 16)),
+            max(elapsed_s, _RECONCILE_RETRY_BASE_S
+                * (2 ** min(state.reconcile_failures - 1, 16))),
         )
         state.reconcile_retry_at = monotonic() + delay
+        return delay
 
     @staticmethod
     def _reset_reconcile_retry(state: _WatchState) -> None:
@@ -1605,12 +1604,11 @@ class FileWatchManager:
         except Exception as exc:
             error_type = type(exc).__name__
             state.reconcile_error = exc
-            self._record_reconcile_retry(state)
-            backoff_ms = round(min(
-                _RECONCILE_BACKOFF_START_S
-                * (2 ** min(state.reconcile_failures - 1, 20)),
-                _RECONCILE_BACKOFF_CAP_S,
-            ) * 1000)
+            # Expensive failed scans must not immediately consume another scan
+            # slot. Bound retry duty cycle as well as repeated-failure frequency.
+            delay = self._record_reconcile_retry(
+                state, elapsed_s=monotonic() - started)
+            backoff_ms = round(delay * 1000)
             raise
         finally:
             # Keep this true through replay, broadcast, and watcher-path

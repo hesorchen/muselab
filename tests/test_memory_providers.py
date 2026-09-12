@@ -774,3 +774,24 @@ def test_generation_repairs_non_object_once_and_preserves_schema(monkeypatch):
     assert len(calls) == 2
     assert calls[0][1] == calls[1][1]
     assert 'wrong format' in calls[1][0]
+
+
+def test_sdk_memory_applies_native_output_and_reasoning_budget(tmp_path, monkeypatch):
+    import claude_agent_sdk
+    from claude_agent_sdk.types import ResultMessage
+    from backend.memory_config import MemoryConfig
+    from backend.memory_providers import GenerationProvider
+
+    monkeypatch.setenv("MUSELAB_MEMORY_DIR", str(tmp_path / "memory"))
+    provider = GenerationProvider(MemoryConfig(generation_model="claude-sonnet-4-6"))
+    monkeypatch.setattr(provider, "_route", lambda: None)
+
+    async def fake_query(*, prompt, options):
+        assert options.env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] == "1500"
+        assert options.thinking == {"type": "disabled"}
+        assert options.effort == "low"
+        yield ResultMessage(subtype="success", duration_ms=1, duration_api_ms=1,
+                            is_error=False, num_turns=1, session_id="fixture", result="bounded output")
+
+    monkeypatch.setattr(claude_agent_sdk, "query", fake_query)
+    assert _run(provider.complete("system", "prompt", max_tokens=1500)) == "bounded output"
