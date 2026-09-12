@@ -412,3 +412,84 @@ def test_receipt_write_failure_is_visible_and_recovers_on_a_later_write(stream_e
         assert job["record_saved"] is True
         assert native_cron.load_all()[sid]["fixture01"]["record_saved"] is True
     asyncio.run(run())
+
+
+def test_cron_list_cannot_import_another_sessions_creation(stream_env):
+    chat = stream_env
+    owner = ("cron-owner-a", "model", "auto", "")
+    other = ("cron-owner-b", "model", "auto", "")
+
+    async def run():
+        await create_job(chat, owner)
+        # Also repair a legacy list-only duplicate from an earlier runtime.
+        chat._sdk_cron_jobs[other[0]] = {"fixture01": {"runtime_state": "active"}}
+        await chat._observe_sdk_stream_message(other, AssistantMessage(
+            content=[ToolUseBlock(id="list-b", name="CronList", input={})], model="model"))
+        await chat._observe_sdk_stream_message(other, UserMessage(content=[ToolResultBlock(
+            tool_use_id="list-b", content="fixture01 — Every minute\nrestored-b — Every hour")]))
+        assert set(chat._sdk_cron_jobs[other[0]]) == {"restored-b"}
+        assert chat._sdk_cron_jobs[owner[0]]["fixture01"]["owner_session_id"] == owner[0]
+        assert not chat._matching_sdk_cron_job(other, "Check the fixture status")
+
+    asyncio.run(run())
+
+
+def test_native_origin_does_not_require_a_host_creation_receipt(stream_env):
+    chat = stream_env
+    key = ("native-resumed-session", "model", "auto", "")
+    assert chat._is_sdk_scheduled_trigger(key, UserMessage(content="Native resumed prompt", origin={
+        "kind": "task-notification", "subkind": "scheduled-trigger"}))
+    assert not chat._is_sdk_scheduled_trigger(key, UserMessage(content="Peer message", origin={
+        "kind": "task-notification", "subkind": "peer-send-message"}))
+
+
+def test_originless_cron_fallback_ignores_terminal_or_foreign_receipts(stream_env):
+    chat = stream_env
+    owner = ("cron-fingerprint-a", "model", "auto", "")
+    other = ("cron-fingerprint-b", "model", "auto", "")
+
+    async def run():
+        await create_job(chat, owner)
+        prompt = "Check the fixture status"
+        duplicate = dict(chat._sdk_cron_jobs[owner[0]]["fixture01"])
+        chat._sdk_cron_jobs[other[0]] = {"fixture01": duplicate}
+        assert not chat._is_sdk_scheduled_trigger(other, UserMessage(content=prompt))
+        # Two independently created tasks may have identical prompts.
+        await create_job(chat, other, result="Scheduled recurring job other02. Session-only.")
+        assert chat._matching_sdk_cron_job(other, prompt) == "other02"
+        chat._sdk_cron_jobs[other[0]]["other02"]["runtime_state"] = "finished"
+        assert not chat._is_sdk_scheduled_trigger(other, UserMessage(content=prompt))
+        assert chat._matching_sdk_cron_job(owner, prompt) == "fixture01"
+
+    asyncio.run(run())
+
+
+def test_startup_loads_creation_owners_before_recovering_legacy_list_copies(stream_env, monkeypatch):
+    chat = stream_env
+    from backend import native_cron
+    scheduled = []
+    # The wrong-session copy is deliberately loaded first.
+    monkeypatch.setattr(native_cron, "load_all", lambda: {
+        "copy-b": {"job-shared": {"runtime_state": "active"}},
+        "owner-a": {"job-shared": {"runtime_state": "active", "created_at_ms": 1}},
+    })
+    monkeypatch.setattr(chat.sess, "get_session_meta", lambda _sid: {"model": "model"})
+    monkeypatch.setattr(chat, "_schedule_native_cron_recovery", lambda sid:
+                        scheduled.append(sid) if chat._sdk_cron_jobs.get(sid) else None)
+    assert asyncio.run(chat.recover_native_cron_at_startup()) == 1
+    assert scheduled == ["owner-a"]
+    assert not chat._sdk_cron_jobs["copy-b"]
+
+
+def test_replayed_creation_cannot_move_an_existing_native_job(stream_env):
+    chat = stream_env
+    owner = ("create-owner-a", "model", "auto", "")
+    other = ("create-replay-b", "model", "auto", "")
+
+    async def run():
+        await create_job(chat, owner)
+        await create_job(chat, other)
+        assert "fixture01" in chat._sdk_cron_jobs[owner[0]]
+        assert "fixture01" not in chat._sdk_cron_jobs.get(other[0], {})
+
+    asyncio.run(run())

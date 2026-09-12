@@ -26,7 +26,7 @@ _TEXT_FIELDS = {
     "cron": 128, "prompt": 4000, "prompt_sha256": 64,
     "model": 256, "effort": 32, "service_tier": 32,
     "runtime_state": 32, "last_status": 32, "last_error": 96, "last_execution_status": 32,
-    "last_run_id": 128,
+    "last_run_id": 128, "owner_session_id": 128,
 }
 _BOOL_FIELDS = {"recurring", "durable", "prompt_truncated", "record_saved"}
 _INT_FIELDS = {

@@ -572,3 +572,16 @@ def test_available_groups_claude_always_first(monkeypatch):
     })
     groups = ep.available_groups()
     assert groups[0]["group"] == "Claude"
+
+
+def test_routing_identity_never_prepares_cli_storage(monkeypatch):
+    ep = _reload_endpoints(monkeypatch, {"DEEPSEEK_API_KEY": "synthetic-route-key"})
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("routing lookup entered CLI filesystem preparation")
+
+    monkeypatch.setattr(ep, "_vendor_config_dir", forbidden)
+    assert ep.routing_env("deepseek-v4-pro")["ANTHROPIC_API_KEY"] == "synthetic-route-key"
+    assert not ep._VENDOR_CONFIG_DIR.exists()
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "synthetic-rotated-key")
+    assert ep.routing_env("deepseek-v4-pro")["ANTHROPIC_API_KEY"] == "synthetic-rotated-key"

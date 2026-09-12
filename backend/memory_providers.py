@@ -628,7 +628,7 @@ class GenerationProvider:
                 if route is None:
                     route_kind = "ducc" if configured_model.startswith("ducc:") else "sdk"
                     phases["phase"] = "awaiting_sdk_event"
-                    result = await self._complete_with_sdk(system, prompt)
+                    result = await self._complete_with_sdk(system, prompt, max_tokens)
                     response_chars, outcome = len(result), "done"
                     return result
                 route_kind = "http"
@@ -744,7 +744,7 @@ class GenerationProvider:
             )
             _generation_phases.reset(phase_token)
 
-    async def _complete_with_sdk(self, system: str, prompt: str) -> str:
+    async def _complete_with_sdk(self, system: str, prompt: str, max_tokens: int = 3000) -> str:
         from claude_agent_sdk import ClaudeAgentOptions, query
         from claude_agent_sdk.types import AssistantMessage, ResultMessage, TextBlock
 
@@ -770,6 +770,9 @@ class GenerationProvider:
             options_kwargs["env"] = _ducc_subprocess_env(ducc_executable)
             model = endpoints.ducc_cli_model(model)
 
+        # Apply the same output budget as the HTTP provider through the native
+        # CLI setting. Extraction is a bounded text transform, not an agent task.
+        options_kwargs.setdefault("env", {})["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] = str(max_tokens)
         workdir = memory_dir() / "generator"
         workdir.mkdir(parents=True, exist_ok=True)
         options = ClaudeAgentOptions(
@@ -783,6 +786,8 @@ class GenerationProvider:
             setting_sources=[],
             skills=[],
             max_turns=1,
+            thinking={"type": "disabled"},
+            effort="low",
             permission_mode="default",
             cwd=workdir,
             include_partial_messages=False,

@@ -2721,7 +2721,7 @@ async def _detect_gateway_context_capability(model: str) -> dict | None:
         return None
     canonical = _canonical_context_model(model)
     slug = endpoints.normalize_model_id(canonical)
-    env = endpoints.env_override(canonical) or {}
+    env = endpoints.routing_env(canonical) or {}
     base = (env.get("ANTHROPIC_BASE_URL") or "").rstrip("/")
     key = env.get("ANTHROPIC_API_KEY") or env.get("ANTHROPIC_AUTH_TOKEN") or ""
     if not base:
@@ -2802,7 +2802,7 @@ def _cached_gateway_context_capability(model: str) -> dict | None:
     if not _is_codex_gateway_model(model):
         return None
     canonical = _canonical_context_model(model)
-    env = endpoints.env_override(canonical) or {}
+    env = endpoints.routing_env(canonical) or {}
     base = (env.get("ANTHROPIC_BASE_URL") or "").rstrip("/")
     if not base:
         return None
@@ -2837,7 +2837,7 @@ async def _detect_gateway_context_capabilities(
             capabilities[model] = cached
             continue
         canonical = _canonical_context_model(model)
-        env = endpoints.env_override(canonical) or {}
+        env = endpoints.routing_env(canonical) or {}
         base = (env.get("ANTHROPIC_BASE_URL") or "").rstrip("/")
         if base:
             unresolved_by_base.setdefault(base, []).append(model)
@@ -17384,6 +17384,21 @@ async def _start_turn(
             stale Result until the current query reaches its own terminal.
             """
             async def _run_query() -> None:
+                # Complete recall and native context accounting are independent.
+                # Keep both outside the SDK hook watchdog, and cancel the recall
+                # producer before clearing its receipt on any failed preflight.
+                recall = asyncio.create_task(mem0.prepare_recall(
+                    session_id, broadcast.turn_id, prompt,
+                    is_cancelled=lambda: broadcast.cancelled,
+                ))
+                try:
+                    await _run_prepared_query(recall)
+                finally:
+                    if not recall.done():
+                        recall.cancel()
+                    await asyncio.gather(recall, return_exceptions=True)
+
+            async def _run_prepared_query(recall: asyncio.Task[bool]) -> None:
                 # `merge_q` lives in event_gen's scope, one level deeper than
                 # _preflight_compact_if_needed's — hence the injected emitter
                 # rather than a closure reference. Events ride the same "side"
@@ -17446,10 +17461,7 @@ async def _start_turn(
                     # Recall may wait indefinitely when configured as zero.
                     # Prepare outside the CLI hook timer; only the exact next
                     # prompt can consume it through additionalContext.
-                    if broadcast.cancelled or not await mem0.prepare_recall(
-                        session_id, broadcast.turn_id, prompt,
-                        is_cancelled=lambda: broadcast.cancelled,
-                    ):
+                    if broadcast.cancelled or not await recall:
                         raise _TurnCancelledBeforeQuery()
                     # Every preflight/transcript/sidecar await above is a Stop
                     # race. This is the last instruction before SDK transport.
@@ -20861,7 +20873,18 @@ async def recover_native_cron_at_startup() -> int:
             if sid in _sdk_cron_jobs:
                 continue
             _sdk_cron_jobs[sid] = jobs
-        count += len(jobs)
+    # Load every receipt before scheduling recovery: a legacy CronList-only
+    # copy in B must not race the later load of A's creation receipt.
+    with _sdk_cron_state_lock:
+        for sid in receipts:
+            jobs = _sdk_cron_jobs.get(sid)
+            if jobs is None:
+                continue
+            for job_id in list(jobs):
+                if _sdk_cron_owned_elsewhere(sid, job_id):
+                    jobs.pop(job_id)
+            count += len(jobs)
+    for sid in receipts:
         _schedule_native_cron_recovery(sid)
     return count
 
@@ -21192,6 +21215,22 @@ def _sdk_tool_result_text(block: ToolResultBlock) -> str:
     return "\n".join(part for part in parts if part)
 
 
+def _sdk_cron_owned_elsewhere(session_id: str, job_id: str) -> bool:
+    """Only creation receipts establish ownership; list text cannot transfer it.
+
+    The caller holds the cron state lock. Legacy creation receipts have a
+    creation timestamp, while rows previously imported from CronList do not.
+    Native origin remains authoritative for delivery; these receipts only
+    control MuseLab's task inventory and origin-less compatibility fallback.
+    """
+    for sid, jobs in _sdk_cron_jobs.items():
+        raw = jobs.get(job_id, {})
+        owner = raw.get("owner_session_id") or (sid if raw.get("created_at_ms") else "")
+        if owner and owner != session_id:
+            return True
+    return False
+
+
 def _observe_sdk_cron_message(
     key: chat_runtime.ClientKey,
     message: Any,
@@ -21226,7 +21265,7 @@ def _observe_sdk_cron_message(
             jobs = dict(before)
             if name == "CronCreate":
                 match = _SDK_CRON_CREATE_RESULT.search(text)
-                if match:
+                if match and not _sdk_cron_owned_elsewhere(key[0], match.group("job_id")):
                     job_id = match.group("job_id")
                     jobs[job_id] = {
                         field: call[field]
@@ -21245,7 +21284,7 @@ def _observe_sdk_cron_message(
                     jobs[job_id].update({
                         "model": key[1], "effort": key[2], "service_tier": key[3],
                         "runtime_state": "active", "created_at_ms": int(time.time() * 1000),
-                        "record_saved": True,
+                        "record_saved": True, "owner_session_id": key[0],
                     })
                     expiry = re.search(r"Auto-expires after (\d+) days", text, re.IGNORECASE)
                     if expiry:
@@ -21273,7 +21312,11 @@ def _observe_sdk_cron_message(
                         jobs.update({
                             job_id: {**before.get(job_id, {}), "runtime_state": "active", "last_error": ""}
                             for job_id in listed
+                            if not _sdk_cron_owned_elsewhere(key[0], job_id)
                         })
+            if name == "CronList":
+                jobs = {job_id: raw for job_id, raw in jobs.items()
+                        if not _sdk_cron_owned_elsewhere(key[0], job_id)}
             if jobs:
                 from . import native_cron
                 _sdk_cron_jobs[key[0]] = native_cron.bounded_jobs(jobs)
@@ -21311,8 +21354,10 @@ def _matching_sdk_cron_job(
         return ""
     digest = safe_prompt[1]
     with _sdk_cron_state_lock:
-        jobs = tuple(_sdk_cron_jobs.get(key[0], {}).items())
-    matches = [str(job_id) for job_id, job in jobs if job.get("prompt_sha256") == digest]
+        matches = [str(job_id) for job_id, job in _sdk_cron_jobs.get(key[0], {}).items()
+                   if job.get("prompt_sha256") == digest
+                   and job.get("runtime_state", "active") in _NATIVE_CRON_LIVE_STATES
+                   and not _sdk_cron_owned_elsewhere(key[0], job_id)]
     return matches[0] if len(matches) == 1 else ""
 
 
@@ -21324,6 +21369,9 @@ def _is_sdk_scheduled_trigger(
         return False
     origin = sdk_lifecycle.normalize_origin(getattr(message, "origin", None))
     if origin is not None:
+        # Native provenance is authoritative, including a resumed task whose
+        # creation this host never observed. senderTaskId describes peer agents
+        # in the SDK contract; it is NOT a scheduled job id.
         return bool(
             origin["kind"] == "task-notification"
             and origin.get("subkind") == "scheduled-trigger"

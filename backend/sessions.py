@@ -1322,16 +1322,31 @@ def prune_empty_sessions(keep_ids: tuple | list = ()) -> list[str]:
 
 
 def rename_session(sid: str, name: str) -> bool:
-    with _INDEX_LOCK:
-        idx = _load_index()
-        for s in idx:
-            if s["id"] == sid:
-                s["name"] = name
-                s["updated_at"] = time.time()
-                s["auto_named"] = False
-                _save_index(idx)
-                return True
-        return False
+    from . import observability as obs
+    started = time.monotonic()
+    phases = {"lock_wait_ms": 0, "read_ms": 0, "write_ms": 0}
+    try:
+        with _INDEX_LOCK:
+            phases["lock_wait_ms"] = obs.elapsed_ms(started)
+            reading = time.monotonic()
+            idx = _load_index()
+            phases["read_ms"] = obs.elapsed_ms(reading)
+            for s in idx:
+                if s["id"] == sid:
+                    if s.get("name") == name and s.get("auto_named") is False:
+                        return True
+                    s["name"] = name
+                    s["updated_at"] = time.time()
+                    s["auto_named"] = False
+                    writing = time.monotonic()
+                    try:
+                        _save_index(idx)
+                    finally:
+                        phases["write_ms"] = obs.elapsed_ms(writing)
+                    return True
+            return False
+    finally:
+        obs.perf_event("sessions.rename_index", duration_ms=obs.elapsed_ms(started), **phases)
 
 
 def set_runtime_background_boundary(sid: str, message_id: str) -> bool:
@@ -2198,6 +2213,14 @@ def set_runtime_task_overlay(
                     updated["state"]
                 )
             updated["task_id"] = task_id
+            # Replayed lifecycle observations often differ only in wall time.
+            # Preserve the last substantive update and avoid another atomic
+            # sidecar write for every identical heartbeat.
+            if isinstance(stored, dict) and all(
+                stored.get(key) == value for key, value in updated.items()
+                if key != "updated_at"
+            ) and set(stored) - {"updated_at"} == set(updated) - {"updated_at"}:
+                updated = dict(stored)
             target_changed = not isinstance(stored, dict) or stored != updated
             if not target_changed and not overlays_compacted:
                 return False

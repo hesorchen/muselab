@@ -2274,8 +2274,8 @@ async def test_reconcile_failures_back_off_coalesce_and_reset(
         return await real_scan(state)
 
     monkeypatch.setattr(manager, "_scan_workspace", fail_twice)
-    monkeypatch.setattr(file_events, "_RECONCILE_BACKOFF_START_S", 0.02)
-    monkeypatch.setattr(file_events, "_RECONCILE_BACKOFF_CAP_S", 0.04)
+    monkeypatch.setattr(file_events, "_RECONCILE_RETRY_BASE_S", 0.02)
+    monkeypatch.setattr(file_events, "_RECONCILE_RETRY_MAX_S", 0.04)
     monkeypatch.setattr(
         file_events,
         "perf_event",
@@ -3482,3 +3482,16 @@ def test_workspace_connection_context_closes_handle(app_module, temp_root):
         assert connection.execute('SELECT 1').fetchone()[0] == 1
     with pytest.raises(sqlite3.ProgrammingError, match='closed'):
         connection.execute('SELECT 1')
+
+
+def test_expensive_failed_scan_has_cost_proportional_bounded_retry(temp_root, monkeypatch):
+    from backend import file_events as events
+    monkeypatch.setattr(events, "monotonic", lambda: 100.0)
+    state = events._WatchState(root=temp_root, workspace_id="retry-fixture")
+    delay = events.FileWatchManager._record_reconcile_retry(state, elapsed_s=20.0)
+    assert delay == 20.0
+    assert state.reconcile_retry_at == 120.0
+    delay = events.FileWatchManager._record_reconcile_retry(state, elapsed_s=100.0)
+    assert delay == events._RECONCILE_RETRY_MAX_S
+    events.FileWatchManager._reset_reconcile_retry(state)
+    assert state.reconcile_retry_at == 0
