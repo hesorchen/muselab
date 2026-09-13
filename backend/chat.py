@@ -20022,6 +20022,10 @@ async def _subscribe_multiplex(
     output: asyncio.Queue[dict] = asyncio.Queue(maxsize=256)
     children: dict[tuple[str, str], asyncio.Task] = {}
     preparing: dict[tuple[str, str], asyncio.Task] = {}
+    # A session has one browser reducer. Subscribe to every accepted turn now,
+    # but drain its predecessor through the terminal before advertising the next
+    # owner. Different sessions retain independent pumps and backpressure.
+    session_tails: dict[str, asyncio.Task] = {}
     completed: set[tuple[str, str]] = set()
     state_fingerprints: dict[str, str] = {}
     state_payloads: dict[str, dict] = {}
@@ -20035,6 +20039,17 @@ async def _subscribe_multiplex(
         for session_id, checkpoint in checkpoints.items()
     }
 
+    async def _emit_state(state_payload: dict) -> None:
+        session_id = state_payload["session_id"]
+        fingerprint = _mux_session_state_fingerprint(state_payload)
+        state_payloads[session_id] = state_payload
+        if state_fingerprints.get(session_id) != fingerprint:
+            state_fingerprints[session_id] = fingerprint
+            await output.put({
+                "event": "session_state",
+                "data": json.dumps(state_payload, ensure_ascii=False),
+            })
+
     async def _pump_child(
         session_id: str,
         broadcast: TurnBroadcast,
@@ -20043,6 +20058,10 @@ async def _subscribe_multiplex(
         try:
             while (event := await subscriber.get()) is not None:
                 await output.put(_mux_wrap_event(session_id, event))
+                if event.get("event") in {"done", "cancelled"}:
+                    # The terminal owns the wire boundary. Slow bookkeeping
+                    # before broadcast.finish() cannot delay an accepted successor.
+                    break
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -20072,35 +20091,31 @@ async def _subscribe_multiplex(
             return
         subscriber = _attach_broadcast_subscriber(
             broadcast, mobile=mobile, last_event_seq=last_event_seq)
-        if state_payload is None and not prefix_events:
-            children[key] = asyncio.create_task(
-                _pump_child(session_id, broadcast, subscriber))
-            return
+        predecessor = session_tails.get(session_id)
 
         async def _adopt() -> None:
             started = False
             try:
+                if predecessor is not None:
+                    await asyncio.shield(predecessor)
                 for event in prefix_events:
                     await output.put(event)
                 if state_payload is not None:
-                    fingerprint = _mux_session_state_fingerprint(state_payload)
-                    state_payloads[session_id] = state_payload
-                    if state_fingerprints.get(session_id) != fingerprint:
-                        state_fingerprints[session_id] = fingerprint
-                        await output.put({
-                            "event": "session_state",
-                            "data": json.dumps(
-                                state_payload, ensure_ascii=False),
-                        })
-                children[key] = asyncio.create_task(
-                    _pump_child(session_id, broadcast, subscriber))
+                    await _emit_state(state_payload)
+                preparing.pop(key, None)
+                children[key] = asyncio.current_task()
                 started = True
+                await _pump_child(session_id, broadcast, subscriber)
             finally:
                 preparing.pop(key, None)
                 if not started:
                     broadcast.unsubscribe(subscriber)
+                if session_tails.get(session_id) is asyncio.current_task():
+                    session_tails.pop(session_id, None)
 
-        preparing[key] = asyncio.create_task(_adopt())
+        task = asyncio.create_task(_adopt())
+        preparing[key] = task
+        session_tails[session_id] = task
 
     def _offer_broadcast(broadcast: TurnBroadcast) -> None:
         """Synchronously attach before an accepted turn can finish."""
@@ -20240,18 +20255,14 @@ async def _subscribe_multiplex(
                     checkpoint_recent = recent
             if state.get("active"):
                 active_ids.add(session_id)
+                # Admission already subscribed to this successor, but its
+                # predecessor still owns the wire. The periodic status pass
+                # must not bypass the ordered adoption task with an early state.
+                state_key = (session_id, str(state.get("turn_id") or ""))
+                if state_key in preparing:
+                    continue
                 state_payload = dict(state)
                 state_payload["session_id"] = session_id
-                fingerprint = _mux_session_state_fingerprint(state_payload)
-                state_payloads[session_id] = state_payload
-                state_event = None
-                if state_fingerprints.get(session_id) != fingerprint:
-                    state_fingerprints[session_id] = fingerprint
-                    state_event = {
-                        "event": "session_state",
-                        "data": json.dumps(state_payload, ensure_ascii=False),
-                    }
-
                 current_start = None
                 checkpoint_consumed = False
                 if state.get("attachable"):
@@ -20294,12 +20305,25 @@ async def _subscribe_multiplex(
                                 checkpoint_consumed = True
                         current_start = (broadcast, resume_seq)
 
-                if state_event is not None:
-                    await output.put(state_event)
                 if current_start is not None:
-                    _start_child(session_id, *current_start)
+                    broadcast, resume_seq = current_start
+                    key = (session_id, broadcast.turn_id)
+                    if key in children:
+                        await _emit_state(state_payload)
+                    else:
+                        # Discovery/reconnect has the same ordering obligation
+                        # as synchronous admission, including short completed
+                        # continuations recovered from the recent replay slot.
+                        _start_child(
+                            session_id, broadcast, resume_seq,
+                            state_payload=state_payload,
+                        )
                     if checkpoint_consumed:
                         pending_checkpoints.pop(session_id, None)
+                elif session_id not in session_tails:
+                    # Watcher-only state must follow the foreground terminal,
+                    # otherwise it can retire a reducer with undelivered text.
+                    await _emit_state(state_payload)
 
             if checkpoint_recent is not None:
                 _start_child(

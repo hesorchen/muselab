@@ -94,6 +94,15 @@ directory modification protects only its own metadata. Missing/pruned history or
 a changed lifecycle rejects the scan. One reconciliation call performs one scan;
 the lifecycle scheduler owns retry timing instead of immediately repeating walks.
 
+The root SSE mux subscribes at admission but serializes delivery within each
+session. It sends the predecessor's terminal before the successor's state and
+replay, including turns discovered by periodic reconciliation. A delivered
+terminal releases this wire ownership without waiting for slow post-turn
+bookkeeping. Watcher-only state obeys the same boundary. Sessions retain
+independent pumps, and pending successor subscribers are disposed on disconnect.
+Real HTTP/SSE browser coverage keeps one transcript selected across Agent bursts
+and rapid continuations, then checks its final suffix against indexed history.
+
 ## Evidence and diagnostics
 
 Regressions cover long idle output, cancellation-safe ordered handoff, native

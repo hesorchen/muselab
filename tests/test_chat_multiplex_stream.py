@@ -925,3 +925,148 @@ def test_runtime_revision_unreadable_directory_does_not_break_status(
                         lambda sid: UnreadableDirectory())
     assert chat_mod._runtime_continuation_projection_state(
         "fixture-session", runtime_lineage=["fixture-session"]) == (False, "")
+
+
+def test_mux_successor_announcement_waits_for_predecessor_terminal(chat_mod):
+    """One browser reducer must finish A before it can own continuation B."""
+    async def scenario():
+        sid = "mux-ordered-continuations"
+        stream = await _open_mux(chat_mod, {})
+        turns = []
+        try:
+            for index in range(3):
+                broadcast = chat_mod.TurnBroadcast(sid, model="model")
+                broadcast.is_continuation = index > 0
+                turns.append(broadcast)
+                chat_mod._active_turns[sid] = broadcast
+                chat_mod._announce_mux_turn(broadcast)
+                broadcast.publish({"event": "text", "data": json.dumps({"text": f"reply-{index}"})})
+                broadcast.publish({"event": "done", "data": "{}"})
+                broadcast.finish()
+            frames = []
+            while sum(event == "done" for event, _ in frames) < 3:
+                frame = await asyncio.wait_for(anext(stream), 2)
+                if frame["event"] != "ping":
+                    frames.append((frame["event"], json.loads(frame["data"])))
+            for prior, successor in zip(turns, turns[1:]):
+                terminal = next(i for i, (event, data) in enumerate(frames)
+                                if event == "done" and data.get("turn_id") == prior.turn_id)
+                announcement = next(i for i, (event, data) in enumerate(frames)
+                                    if event == "session_state" and data.get("turn_id") == successor.turn_id)
+                assert terminal < announcement, [(e, d.get("turn_id")) for e, d in frames]
+        finally:
+            await stream.aclose()
+            chat_mod._active_turns.pop(sid, None)
+            for broadcast in turns:
+                broadcast.finish()
+                broadcast.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("announce_successor", [True, False])
+@pytest.mark.parametrize("finish_predecessor", [True, False])
+def test_mux_slow_predecessor_preserves_order_without_blocking_other_sessions(
+        chat_mod, monkeypatch, announce_successor, finish_predecessor):
+    async def scenario():
+        sid = "mux-slow-predecessor"
+        first = chat_mod.TurnBroadcast(sid)
+        successor = chat_mod.TurnBroadcast(sid)
+        successor.is_continuation = True
+        peer = chat_mod.TurnBroadcast("mux-independent-peer")
+        entered, release = asyncio.Event(), asyncio.Event()
+        frames = []
+        attach = chat_mod._attach_broadcast_subscriber
+
+        def gated_attach(broadcast, **kwargs):
+            subscriber = attach(broadcast, **kwargs)
+            if broadcast is first:
+                get = subscriber.get
+
+                async def gated_get():
+                    event = await get()
+                    if event and event["event"] == "done":
+                        entered.set()
+                        await release.wait()
+                    return event
+
+                subscriber.get = gated_get
+            return subscriber
+
+        monkeypatch.setattr(chat_mod, "_attach_broadcast_subscriber", gated_attach)
+        monkeypatch.setattr(chat_mod, "_MUX_RECONCILE_INTERVAL_S", 0.01)
+        stream = await _open_mux(chat_mod, {})
+
+        async def consume():
+            async for frame in stream:
+                frames.append((frame["event"], json.loads(frame["data"])))
+
+        consumer = asyncio.create_task(consume())
+        try:
+            chat_mod._active_turns[sid] = first
+            chat_mod._announce_mux_turn(first)
+            first.publish({"event": "done", "data": "{}"})
+            if finish_predecessor:
+                first.finish()
+            await asyncio.wait_for(entered.wait(), 1)
+            chat_mod._active_turns[sid] = successor
+            if announce_successor:
+                chat_mod._announce_mux_turn(successor)
+            successor.publish({"event": "text", "data": '{"text":"successor"}'})
+            successor.publish({"event": "done", "data": "{}"})
+            successor.finish()
+            chat_mod._active_turns[peer.session_id] = peer
+            chat_mod._announce_mux_turn(peer)
+            peer.publish({"event": "text", "data": '{"text":"independent"}'})
+            peer.publish({"event": "done", "data": "{}"})
+            peer.finish()
+
+            async def wait_done(broadcast):
+                while not any(event == "done" and data.get("turn_id") == broadcast.turn_id
+                              for event, data in frames):
+                    await asyncio.sleep(0.005)
+
+            await asyncio.wait_for(wait_done(peer), 1)
+            # Let periodic reconciliation run while the first terminal is held.
+            await asyncio.sleep(0.05)
+            assert not any(data.get("turn_id") == successor.turn_id for _, data in frames)
+            release.set()
+            await asyncio.wait_for(wait_done(successor), 1)
+            first_done = next(i for i, (e, d) in enumerate(frames)
+                              if e == "done" and d.get("turn_id") == first.turn_id)
+            successor_state = next(i for i, (e, d) in enumerate(frames)
+                                   if e == "session_state" and d.get("turn_id") == successor.turn_id)
+            assert first_done < successor_state
+        finally:
+            release.set()
+            consumer.cancel()
+            await asyncio.gather(consumer, return_exceptions=True)
+            for broadcast in (first, successor, peer):
+                assert not broadcast.subscribers
+                chat_mod._active_turns.pop(broadcast.session_id, None)
+                broadcast.finish()
+                broadcast.close()
+    asyncio.run(scenario())
+
+
+def test_mux_disconnect_releases_successors_waiting_for_a_live_predecessor(chat_mod):
+    async def scenario():
+        sid = "mux-disconnect-successors"
+        stream = await _open_mux(chat_mod, {})
+        broadcasts = [chat_mod.TurnBroadcast(sid) for _ in range(3)]
+        try:
+            for broadcast in broadcasts:
+                chat_mod._active_turns[sid] = broadcast
+                chat_mod._announce_mux_turn(broadcast)
+                broadcast.publish({"event": "text", "data": '{"text":"fixture"}'})
+            frame = await asyncio.wait_for(anext(stream), 1)
+            assert frame["event"] == "session_state"
+            assert all(broadcast.subscribers for broadcast in broadcasts)
+            await stream.aclose()
+            assert all(not broadcast.subscribers for broadcast in broadcasts)
+        finally:
+            await stream.aclose()
+            chat_mod._active_turns.pop(sid, None)
+            for broadcast in broadcasts:
+                broadcast.finish()
+                broadcast.close()
+    asyncio.run(scenario())
