@@ -73,10 +73,12 @@ Cancelling one waiter leaves other waiters intact; the final waiter cancels and
 joins the producer. Gateway catalog keys include the route, model, and credential
 digest. All compatibility requests share one deadline, and cache age starts when
 a response completes. A failed probe preserves a bounded-age last known capacity.
-An unknown model over the generic fallback threshold fails explicitly when no
-authoritative capacity or explicit override exists, instead of spending minutes
-on speculative native compaction. Native compaction itself retains its SDK
-contract and reports separate SDK, measurement, and history phases.
+An unknown model's generic fallback is display metadata only: it cannot reject
+a prompt, force preflight compaction, or set native SDK context-window overrides.
+Unavailable capacity metadata therefore leaves the ordinary query and SDK-native
+behavior available. Catalog data, explicit overrides, and known model budgets
+still control preflight; actual runtime context rejections retain their recovery
+path. Native compaction reports separate SDK, measurement, and history phases.
 
 Memory status reads select pending IDs and bounded job summaries through dedicated
 indexes, within one read snapshot. Artifact payload size must not affect status

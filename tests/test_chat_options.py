@@ -825,3 +825,36 @@ def test_mem0_recall_uses_user_prompt_hook(app_module, monkeypatch, tmp_path):
     assert len(matchers[0].hooks) == 1
     assert callable(matchers[0].hooks[0])
     assert matchers[0].timeout == chat_mod.mem0.RECALL_HOOK_TIMEOUT
+
+
+@pytest.mark.parametrize("source,expected", [
+    ("unavailable", None), ("catalog", 243200), ("override", 300000),
+    ("known_model", 364800),
+])
+def test_codex_runtime_window_requires_known_capacity(
+    app_module, monkeypatch, tmp_path, source, expected,
+):
+    from backend import chat, endpoints
+
+    model = "codex:gpt-5.6-sol"
+    monkeypatch.setenv("CODEX_GATEWAY_API_KEY", "fixture-key")
+    monkeypatch.setenv("CODEX_GATEWAY_BASE_URL", "http://127.0.0.1:9876")
+    monkeypatch.setattr(endpoints, "_VENDOR_CONFIG_DIR", tmp_path / "vendor-cfg")
+    monkeypatch.setattr(chat, "MODEL_CONTEXT_LIMITS",
+                        {model: 384000} if source == "known_model" else {})
+    monkeypatch.setattr(chat, "_context_limit_env_override",
+                        lambda _m: 300000 if source == "override" else 0)
+    capability = ({"context_limit": 243200, "context_limit_source": "gateway_catalog",
+                   "context_raw_limit": 256000, "context_limit_is_estimate": False}
+                  if source == "catalog" else None)
+    monkeypatch.setattr(chat, "_detect_gateway_context_capability",
+                        lambda _m: asyncio.sleep(0, result=capability))
+    captured = _capture_build_options(chat, monkeypatch)
+    asyncio.run(chat._build_and_connect_client(
+        "fixture-capacity-runtime", model, "bypassPermissions", ""))
+    assert captured["connected"]
+    for key in ("CLAUDE_CODE_MAX_CONTEXT_TOKENS", "CLAUDE_CODE_AUTO_COMPACT_WINDOW"):
+        if expected is None:
+            assert key not in captured["env"]
+        else:
+            assert captured["env"][key] == str(expected)

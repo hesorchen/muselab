@@ -193,12 +193,23 @@ def test_native_command_cancellation_drains_its_own_result_before_releasing(
     asyncio.run(run())
 
 
-def test_unknown_capacity_does_not_start_speculative_compaction(stream_env, client, monkeypatch):
+@pytest.mark.parametrize("used", [167466, 500000])
+def test_unknown_capacity_remains_advisory_and_allows_the_real_query(
+    stream_env, client, monkeypatch, used,
+):
     chat = stream_env
     sid = test_chat_stream._make_session(client)
-    fake = test_chat_stream._FakeStreamClient([])
+    chat.sess.update_model(sid, "codex:gpt-5.6-sol")
+    monkeypatch.setattr(chat, "_heal_unreachable_locked_model",
+                        lambda _sid, locked, _requested: locked)
+    fake = test_chat_stream._FakeStreamClient([
+        AssistantMessage(content=[TextBlock("fixture final answer")],
+            model="codex:gpt-5.6-sol", uuid="fixture-final"),
+        ResultMessage(subtype="success", duration_ms=1, duration_api_ms=1,
+            is_error=False, num_turns=1, session_id=sid),
+    ])
     async def context():
-        return {"maxTokens": 200000, "totalTokens": 167466}
+        return {"maxTokens": 200000, "totalTokens": used}
     fake.get_context_usage = context
     monkeypatch.setattr(chat, "get_client", lambda *_a, **_k: asyncio.sleep(0, result=fake))
     monkeypatch.setattr(chat, "_is_codex_gateway_model", lambda _m: True)
@@ -206,13 +217,24 @@ def test_unknown_capacity_does_not_start_speculative_compaction(stream_env, clie
     monkeypatch.setattr(chat, "MODEL_CONTEXT_LIMITS", {})
     monkeypatch.setattr(chat, "_detect_gateway_context_capability",
                         lambda _m: asyncio.sleep(0, result=None))
+    # A previous catalog-backed threshold must not survive metadata loss.
+    chat._session_usage[sid] = {
+        "input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0,
+        "cache_creation_tokens": 0, "total_cost_usd": 0.0, "last_turn_at": 0.0,
+        "auto_compact_threshold": 100000,
+    }
     response = client.get(
         f"/api/chat/stream?token={test_chat_stream.TEST_TOKEN}&session_id={sid}"
         "&prompt=fixture&model=codex:gpt-5.6-sol")
     events = test_chat_stream._parse_sse(response.text)
-    errors = [json.loads(data) for kind, data in events if kind == "error"]
-    assert errors and errors[0]["kind"] == "context_unavailable"
-    assert fake.queried == []
+    assert not [data for kind, data in events if kind == "error"]
+    assert not [data for kind, data in events if kind == "compact_progress"]
+    assert fake.queried == ["fixture"]
+    assert "fixture final answer" in "".join(data for kind, data in events if kind == "text")
+    done = [json.loads(data) for kind, data in events if kind == "done"][-1]
+    assert not done["is_error"]
+    assert chat._session_usage[sid]["auto_compact_threshold"] == 0
+    assert chat._session_usage[sid]["context_limit_is_estimate"]
 
 
 def test_foreground_result_hands_immediate_background_tail_to_watcher(

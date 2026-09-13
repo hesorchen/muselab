@@ -3024,20 +3024,29 @@ def _mark_context_used(target: dict, source: str, *, estimate: bool) -> None:
         estimate or target.get("context_limit_is_estimate", False))
 
 
+def _context_capacity_known(model: str, details: dict) -> bool:
+    """An unknown model's display fallback cannot control SDK execution."""
+    return bool(_positive_int(details.get("context_limit"))) and (
+        details.get("context_limit_source") not in (None, "", "model_fallback")
+        or _canonical_context_model(model) in MODEL_CONTEXT_LIMITS
+    )
+
+
 def _compact_threshold(
     model: str,
-    limit: int,
+    details: dict,
     sdk_threshold: int = 0,
     *,
     sdk_max: int = 0,
-    capability: dict | None = None,
 ) -> int:
-    if limit <= 0:
+    limit = _positive_int(details.get("context_limit"))
+    if not limit or (_is_codex_gateway_model(model)
+                     and not _context_capacity_known(model, details)):
         return 0
     sdk_t = _positive_int(sdk_threshold)
     if _is_codex_gateway_model(model):
         catalog_t = _positive_int(
-            (capability or {}).get("catalog_auto_compact_threshold"))
+            details.get("catalog_auto_compact_threshold"))
         if catalog_t:
             return min(catalog_t, limit)
         # A client created with our injected CLAUDE_CODE_MAX_CONTEXT_TOKENS
@@ -3803,14 +3812,16 @@ async def _build_and_connect_client(
                             min_value=1))
             # Claude CLI cannot infer Codex/GPT windows from its native model
             # table and otherwise hard-codes 200K (auto-compact around 167K).
-            # Feed it the same effective window used by muselab's meter so its
+            # Feed it a known effective window so its
             # own tokenizer, /context output, and native autocompaction agree
             # with CLIProxyAPI's live model catalog. This is a local CLI knob;
             # it does not alter or over-claim the gateway's raw model ceiling.
             capability = await _detect_gateway_context_capability(model)
             details = _context_limit_details(model, capability=capability)
             effective_limit = _positive_int(details.get("context_limit"))
-            if effective_limit:
+            # A generic meter estimate is not evidence of this model's limit.
+            # Without capacity metadata, retain the SDK's native configuration.
+            if _context_capacity_known(model, details):
                 env_ovr = dict(env_ovr)
                 env_ovr["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] = str(effective_limit)
                 # Since Claude CLI 2.1.159, local/SDK sessions can silently
@@ -10803,10 +10814,9 @@ async def context_breakdown(session_id: str, model: str = "") -> dict:
                 round(total / limit * 100, 1) if limit else 0.0)
             payload["autoCompactThreshold"] = _compact_threshold(
                 m,
-                limit,
+                details,
                 _positive_int(payload.get("autoCompactThreshold")),
                 sdk_max=sdk_max,
-                capability=capability,
             )
             _apply_context_limit_details(payload, details)
             _mark_context_used(payload, "sdk_context", estimate=True)
@@ -11015,13 +11025,11 @@ def _schedule_post_compact_refresh(
                 _apply_context_limit_details(sess_u, details)
                 threshold = _compact_threshold(
                     model,
-                    _positive_int(details.get("context_limit")),
+                    details,
                     _positive_int(usage.get("autoCompactThreshold")),
                     sdk_max=real_max,
-                    capability=capability,
                 )
-                if threshold:
-                    sess_u["auto_compact_threshold"] = threshold
+                sess_u["auto_compact_threshold"] = threshold
                 if real_total:
                     _mark_context_used(
                         sess_u, "sdk_context", estimate=True)
@@ -12269,8 +12277,6 @@ def _classify_stream_error(err: Any) -> dict:
     low = msg.lower()
     if "runtime_buffer_exceeded" in low:
         return {"kind": "runtime_buffer", "retryable": False, "cta": None}
-    if "context_capacity_unavailable" in low:
-        return {"kind": "context_unavailable", "retryable": True, "cta": "retry"}
     if "native_compact_timeout" in low:
         return {"kind": "compact_timeout", "retryable": True, "cta": "retry"}
     kind = "unknown"
@@ -17075,15 +17081,19 @@ async def _start_turn(
         limit = _positive_int(details.get("context_limit"))
         threshold = _compact_threshold(
             model_to_use,
-            limit,
+            details,
             _positive_int(cu.get("autoCompactThreshold")),
             sdk_max=sdk_max,
-            capability=capability,
         )
         # Attachments can be expensive; add a rough safety margin rather than
         # pretending the typed text is the whole next request.
         next_est = _rough_prompt_tokens(prompt) + len(img_blocks) * 2500 + len(pdf_blocks) * 12000
         if not threshold or total + next_est < threshold:
+            if not threshold and _is_codex_gateway_model(model_to_use):
+                obs.perf_event("chat.context_preflight_deferred",
+                    reason="unknown_capacity",
+                    capacity_source=details.get("context_limit_source", ""),
+                    used=total, limit=limit)
             # Still refresh the meter with the effective denominator so the UI can
             # warn before a successful turn completes.
             sess_u = _session_usage.setdefault(session_id, {
@@ -17103,18 +17113,11 @@ async def _start_turn(
                     "sdk_context",
                     estimate=endpoints.is_third_party(model_to_use),
                 )
-            if threshold:
-                sess_u["auto_compact_threshold"] = threshold
+            sess_u["auto_compact_threshold"] = threshold
             if sess_u.get("context_limit") and sess_u.get("context_used"):
                 sess_u["context_used_pct"] = round(
                     sess_u["context_used"] / sess_u["context_limit"] * 100, 1)
             return
-        if (_is_codex_gateway_model(model_to_use) and capability is None
-                and details.get("context_limit_is_estimate")
-                and _canonical_context_model(model_to_use) not in MODEL_CONTEXT_LIMITS):
-            raise ClaudeSDKError(
-                "context_capacity_unavailable: 模型目录暂不可用，无法确认当前模型的上下文容量；"
-                "请稍后重试，或在模型设置中填写服务端支持的容量。")
         # A background watcher shares this client's single SDK message pump.
         # `/compact` uses a temporary turn consumer; if it ran here, task
         # notifications and the model's auto-continuation could be routed into
@@ -17431,13 +17434,11 @@ async def _start_turn(
         sess_u["sdk_context_raw_max_tokens"] = real_raw
         th = _compact_threshold(
             model_to_use,
-            lim,
+            refreshed_details,
             _positive_int(cu2.get("autoCompactThreshold")),
             sdk_max=real_max,
-            capability=capability,
         )
-        if th:
-            sess_u["auto_compact_threshold"] = th
+        sess_u["auto_compact_threshold"] = th
         if real_total and lim:
             sess_u["context_used_pct"] = round(real_total / lim * 100, 1)
         # Success. The turn's real query starts immediately after this returns,
@@ -18636,13 +18637,11 @@ async def _start_turn(
                 sess_u["sdk_context_raw_max_tokens"] = sdk_raw
                 threshold = _compact_threshold(
                     model_to_use,
-                    _positive_int(details.get("context_limit")),
+                    details,
                     sdk_threshold,
                     sdk_max=sdk_max,
-                    capability=capability,
                 )
-                if threshold:
-                    sess_u["auto_compact_threshold"] = threshold
+                sess_u["auto_compact_threshold"] = threshold
                 if not sess_u.get("context_used") and sdk_total:
                     sess_u["context_used"] = sdk_total
                     _mark_context_used(

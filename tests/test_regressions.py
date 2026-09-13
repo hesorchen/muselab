@@ -259,7 +259,7 @@ def test_codex_compact_threshold_ignores_stale_cli_window(app_module):
 
     assert chat_mod._compact_threshold(
         "codex:gpt-5.6-sol",
-        353_400,
+        {"context_limit": 353_400, "context_limit_source": "gateway_catalog"},
         167_000,
         sdk_max=200_000,
     ) == 318_060
@@ -267,7 +267,7 @@ def test_codex_compact_threshold_ignores_stale_cli_window(app_module):
     # contribute their exact native safety buffer.
     assert chat_mod._compact_threshold(
         "codex:gpt-5.6-sol",
-        353_400,
+        {"context_limit": 353_400, "context_limit_source": "gateway_catalog"},
         320_400,
         sdk_max=353_400,
     ) == 320_400
