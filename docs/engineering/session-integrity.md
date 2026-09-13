@@ -75,6 +75,10 @@ digest. All compatibility requests share one deadline, and cache age starts when
 a response completes. A failed probe preserves a bounded-age last known capacity.
 An unknown model's generic fallback is display metadata only: it cannot reject
 a prompt, force preflight compaction, or set native SDK context-window overrides.
+The browser also requires a positive backend `auto_compact_threshold` before
+automatically compacting or warning about the limit after a successful turn.
+A displayed percentage alone cannot authorize compaction, and failed/cancelled
+turns cannot schedule another command from their completion event.
 Unavailable capacity metadata therefore leaves the ordinary query and SDK-native
 behavior available. Catalog data, explicit overrides, and known model budgets
 still control preflight; actual runtime context rejections retain their recovery

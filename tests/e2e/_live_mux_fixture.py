@@ -119,6 +119,18 @@ async def continuation(payload: dict):
     return {"turn_id": previous.turn_id}
 
 
+@app.post("/fixture/finish", dependencies=[Depends(require_token)])
+async def finish(payload: dict):
+    sid = payload["sid"]
+    broadcast = chat._active_turns.pop(sid)
+    broadcast.publish({"event": "done", "data": json.dumps({
+        "assistant_uuid": "fixture-parent-start", **payload["done"],
+    })})
+    broadcast.finish()
+    chat._remember_recent_turn(sid, broadcast)
+    return {"finished": True}
+
+
 @app.post("/fixture/release-history", dependencies=[Depends(require_token)])
 async def release_history():
     _history_gate.set()

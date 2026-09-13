@@ -35018,8 +35018,14 @@ function portal() {
         this._ctxWarned = this._ctxWarned || {};
         this._autoCompacted = this._autoCompacted || {};
         const ctxPct = d.session_usage && d.session_usage.context_used_pct;
+        // The backend resolves capacity provenance and disables its threshold
+        // when only an unknown model's display fallback is available. Share
+        // that decision instead of turning an estimated percentage into a
+        // second, independent command scheduler.
+        const canAutoCompact = Number(d.session_usage && d.session_usage.auto_compact_threshold) > 0
+          && !d.is_error && !d.cancelled;
         const streamStCompacting = !!(this.tabState[streamSid] && this.tabState[streamSid].compacting);
-        if (ctxPct >= 95 && !this._autoCompacted[streamSid] && !streamStCompacting) {
+        if (canAutoCompact && ctxPct >= 95 && !this._autoCompacted[streamSid] && !streamStCompacting) {
           this._autoCompacted[streamSid] = true;
           // Schedule on next tick so the stream's done handler fully
           // unwinds first (runCompact's per-session streaming check
@@ -35033,7 +35039,7 @@ function portal() {
                        "info", 3000);
             this.runCompact(streamSid, { skipConfirm: true });
           });
-        } else if (ctxPct >= 85 && ctxPct < 95 && !this._ctxWarned[streamSid]) {
+        } else if (canAutoCompact && ctxPct >= 85 && ctxPct < 95 && !this._ctxWarned[streamSid]) {
           this._ctxWarned[streamSid] = true;
           this.toast(
             this.t("ctx.window_warn", { pct: Math.round(ctxPct) }),
