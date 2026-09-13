@@ -695,6 +695,7 @@ class WorkspaceStore:
         scan_progress: dict[str, Any] | None = None,
         snapshot: list[dict[str, Any]] | None = None,
         expected_cursor: int | None = None,
+        dirty_paths: dict[str, bool] | None = None,
         return_payload: bool = False,
     ) -> int | dict[str, Any]:
         """Scan or apply a snapshot, logging offline changes atomically."""
@@ -745,26 +746,56 @@ class WorkspaceStore:
                     raise KeyError(f"unknown workspace: {workspace_id}")
                 initialized = bool(state["initialized"])
                 seq = int(state["current_seq"])
-                if expected_cursor is not None and (
-                    seq != expected_cursor
-                    or state["path"] != str(root)
-                ):
+                protected = dict(dirty_paths or {})
+                stale = expected_cursor is not None and (
+                    state["path"] != str(root) or seq < expected_cursor)
+                if expected_cursor is not None and seq > expected_cursor and not stale:
+                    # Rebase only across a complete durable event interval.
+                    # A pruned/reset cursor remains a hard consistency boundary.
+                    concurrent = db.execute(
+                        "SELECT seq,type,path FROM events WHERE workspace_id=? "
+                        "AND seq>? AND seq<=? ORDER BY seq",
+                        (workspace_id, expected_cursor, seq)).fetchall()
+                    stale = len(concurrent) != seq - expected_cursor
+                    if not stale:
+                        for event in concurrent:
+                            path = event["path"]
+                            protected[path] = protected.get(path, False) or event["type"] in {"added", "deleted"}
+                if stale:
                     db.rollback()
-                    return {
-                        "_stale": True,
-                        "cursor": seq,
-                        "changes": [],
-                        "resync": True,
-                    }
+                    return {"_stale": True, "cursor": seq, "changes": [], "resync": True}
                 old = {
                     row["path"]: row
                     for row in self._file_rows(db, workspace_id)
                 }
                 new = {row["path"]: row for row in snapshot}
-                complete_paths = scan_report.pop(
-                    "_snapshot_paths",
-                    set(new),
-                )
+                complete_paths = set(scan_report.pop("_snapshot_paths", set(new)))
+                if protected:
+                    subtrees = {path for path, recursive in protected.items() if recursive}
+                    def touched(path):
+                        if path in protected:
+                            return True
+                        parent = path
+                        while "/" in parent:
+                            parent = parent.rsplit("/", 1)[0]
+                            if parent in subtrees:
+                                return True
+                        return False
+                    # The watcher has already committed fresh metadata (or a
+                    # deletion). Preserve that truth for touched paths; apply
+                    # filesystem scan observations everywhere else.
+                    for path in tuple(new):
+                        if touched(path):
+                            new.pop(path)
+                    for path in tuple(complete_paths):
+                        if touched(path):
+                            complete_paths.discard(path)
+                    for path, row in old.items():
+                        if touched(path):
+                            new[path] = dict(row)
+                            complete_paths.add(path)
+                    snapshot = list(new.values())
+                scan_report["rebased_paths"] = len(protected)
                 resumed = bool(scan_report.get("resumed"))
 
                 changes: list[dict[str, Any]] = []
@@ -891,6 +922,7 @@ class WorkspaceStore:
         scan_report: dict[str, Any],
         *,
         expected_cursor: int,
+        dirty_paths: dict[str, bool] | None = None,
         primary: bool = False,
         cancel_event: threading.Event | None = None,
     ) -> dict[str, Any]:
@@ -904,6 +936,7 @@ class WorkspaceStore:
             report=scan_report,
             snapshot=expand_scan_rows(snapshot),
             expected_cursor=expected_cursor,
+            dirty_paths=dirty_paths,
             return_payload=True,
         )
         assert isinstance(result, dict)

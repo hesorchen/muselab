@@ -67,6 +67,18 @@ def message_kind(item: Any) -> str:
     return name if re.fullmatch(r"[A-Za-z_]{1,64}", name) else "unknown"
 
 
+def validate_message_size(item: Any, *, lane: str, session_id: str) -> None:
+    """Direct consumers retain the same per-message byte guard as queues."""
+    global _overflows
+    size = estimated_size(item, MAX_BYTES)
+    if size > MAX_BYTES:
+        _overflows += 1
+        obs.perf_event("chat.runtime_buffer_exceeded", lane=lane,
+            depth=0, estimated_bytes=0, incoming_bytes=size, session=session_id[:8],
+            incoming_kind=message_kind(item), oldest_ms=0)
+        raise RuntimeBufferExceeded()
+
+
 class RuntimeMessageQueue(asyncio.Queue):
     def __init__(self, *, lane: str, eof: Any = _NO_EOF,
                  max_events: int | None = None, max_bytes: int | None = None,
@@ -94,7 +106,9 @@ class RuntimeMessageQueue(asyncio.Queue):
                            depth=self.qsize(), estimated_bytes=self.estimated_bytes,
                            incoming_bytes=size, session=self.session_id,
                            incoming_kind=message_kind(item), oldest_ms=self.oldest_ms,
-                           envelope_counts=dict(self.message_kinds.most_common(12)))
+                           **{f"envelope_{index}": f"{kind}:{count}"
+                              for index, (kind, count) in enumerate(
+                                  self.message_kinds.most_common(12))})
             raise RuntimeBufferExceeded()
         super().put_nowait((item, size, time.monotonic()))
         self.message_kinds[message_kind(item)] += 1
@@ -120,25 +134,6 @@ class RuntimeMessageQueue(asyncio.Queue):
     @property
     def oldest_ms(self) -> int:
         return max(0, round((time.monotonic() - self._queue[0][2]) * 1000)) if self._queue else 0
-
-
-class RuntimeMessageDeque:
-    """Deque facade that refuses overflow instead of silently evicting messages."""
-    def __init__(self, *, maxlen: int, lane: str, session_id: str = ""):
-        self.maxlen = maxlen
-        self.queue = RuntimeMessageQueue(lane=lane, max_events=maxlen, session_id=session_id)
-
-    def append(self, item: Any) -> None:
-        self.queue.put_nowait(item)
-
-    def popleft(self) -> Any:
-        return self.queue.get_nowait()
-
-    def __len__(self) -> int:
-        return self.queue.qsize()
-
-    def __iter__(self):
-        return (item for item, _size, _at in self.queue._queue)
 
 
 def diagnostics(*, streams: int = 0) -> dict[str, int]:

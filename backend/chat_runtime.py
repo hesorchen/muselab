@@ -17,7 +17,7 @@ from typing import Any, Callable, Collection, Iterable
 
 from claude_agent_sdk import ClaudeSDKClient, ClaudeSDKError
 
-from .runtime_buffer import RuntimeBufferExceeded, RuntimeMessageDeque, RuntimeMessageQueue
+from .runtime_buffer import RuntimeBufferExceeded, RuntimeMessageQueue, validate_message_size
 
 
 ClientKey = tuple[str, str, str, str]
@@ -48,6 +48,7 @@ class RuntimeHooks:
     evict_failed_session_stream: Callable[[Any], Any]
     retain_detached_cleanup: Callable[[asyncio.Task], None]
     observe_stream_message: Callable[[ClientKey, Any], Any]
+    consume_idle_message: Callable[[ClientKey, Any], Any]
 
 
 _hooks: RuntimeHooks | None = None
@@ -331,103 +332,108 @@ async def get_client(
 class SessionStream:
     """The sole reader and router for one SDK client's message stream."""
 
-    _ORPHAN_MAX = 512
-
     def __init__(self, key: ClientKey, client: ClaudeSDKClient):
         self.key = key
         self.client = client
         self._turn: asyncio.Queue | None = None
         self._background: asyncio.Queue | None = None
-        self._orphans = RuntimeMessageDeque(maxlen=self._ORPHAN_MAX, lane="orphan", session_id=key[0])
+        # A release and the sole reader share one handoff barrier. Messages
+        # already queued behind Result are delivered before later wire output.
+        self._delivery_lock = asyncio.Lock()
         self._closed = False
         self._failure: Exception | None = None
         self.task: asyncio.Task = asyncio.create_task(self._pump())
 
-    def _adopt_orphans(self, queue: asyncio.Queue) -> None:
-        while self._orphans:
-            queue.put_nowait(self._orphans.popleft())
-
     def attach_turn(self) -> asyncio.Queue:
-        queue: asyncio.Queue = RuntimeMessageQueue(lane="turn", eof=STREAM_EOF, session_id=self.key[0])
+        queue = RuntimeMessageQueue(lane="turn", eof=STREAM_EOF, session_id=self.key[0])
         self._turn = queue
         return queue
 
-    def detach_turn(self, queue: asyncio.Queue) -> None:
-        if self._turn is queue:
-            self._turn = None
-
-    def park_unconsumed(self, queue: asyncio.Queue) -> None:
-        while True:
-            try:
-                message = queue.get_nowait()
-            except asyncio.QueueEmpty:
-                break
-            if message is STREAM_EOF:
-                continue
-            self._park_message(message)
-
-    def park_messages(self, messages: Iterable[Any]) -> None:
-        """Return side-delivery messages to the background/orphan lane."""
-        for message in messages:
-            if message is STREAM_EOF:
-                continue
-            self._park_message(message)
-
-    def _park_message(self, message: Any) -> None:
-        try:
-            self._orphans.append(message)
-        except RuntimeBufferExceeded as exc:
-            self._failure = exc
-            self._closed = True
-            for queue in (self._turn, self._background):
-                if queue is not None:
-                    queue.put_nowait(STREAM_EOF)
-            if not self.task.done():
-                self.task.cancel()
-            # A task cancelled before its first tick never runs finally.
-            # Always retain a cleanup owner; disconnect joining deduplicates
-            # it with a pump that has already entered its own finally block.
-            cleanup = asyncio.create_task(_require_hooks().evict_failed_session_stream(self))
-            _require_hooks().retain_detached_cleanup(cleanup)
-            raise
-
     def attach_background(self) -> asyncio.Queue:
-        queue: asyncio.Queue = RuntimeMessageQueue(lane="background", eof=STREAM_EOF, session_id=self.key[0])
+        queue = RuntimeMessageQueue(lane="background", eof=STREAM_EOF, session_id=self.key[0])
         self._background = queue
-        self._adopt_orphans(queue)
         return queue
 
-    def detach_background(self, queue: asyncio.Queue) -> None:
-        if self._background is queue:
-            self._background = None
+    async def _deliver_detached(self, message: Any) -> None:
+        if message is STREAM_EOF:
+            return
+        if self._background is not None:
+            self._background.put_nowait(message)
+        else:
+            # Idle output has an application owner in this same session.
+            # It is never parked for a future human turn to inherit.
+            validate_message_size(message, lane="idle", session_id=self.key[0])
+            await _require_hooks().consume_idle_message(self.key, message)
+
+    async def release_turn(self, queue: asyncio.Queue,
+                           messages: Iterable[Any] = ()) -> None:
+        await self._release_owned("turn", queue, messages)
+
+    async def release_background(self, queue: asyncio.Queue) -> None:
+        await self._release_owned("background", queue, ())
+
+    async def _release_owned(self, lane, queue, messages) -> None:
+        transfer = asyncio.create_task(self._release(lane, queue, messages))
+        cancelled = False
+        while not transfer.done():
+            try:
+                await asyncio.shield(transfer)
+            except asyncio.CancelledError:
+                cancelled = True
+        transfer.result()
+        if cancelled:
+            raise asyncio.CancelledError
+
+    async def _release(self, lane: str, queue: asyncio.Queue,
+                       messages: Iterable[Any]) -> None:
+        try:
+            async with self._delivery_lock:
+                if getattr(self, "_" + lane) is queue:
+                    setattr(self, "_" + lane, None)
+                for message in messages:
+                    await self._deliver_detached(message)
+                while not queue.empty():
+                    await self._deliver_detached(queue.get_nowait())
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._failure = exc
+            self._closed = True
+            if not self.task.done():
+                self.task.cancel()
+            for target in (self._turn, self._background):
+                if target is not None:
+                    target.put_nowait(STREAM_EOF)
+            await _require_hooks().evict_failed_session_stream(self)
+            raise
 
     async def _pump(self) -> None:
         try:
+            batch = 0
             async for message in self.client.receive_messages():
+                batch += 1
+                if batch >= 64:
+                    # SDK receive_messages can drain an already-filled mailbox
+                    # without yielding. Give the current consumer/control tasks
+                    # a turn before judging their backlog against the budget.
+                    await asyncio.sleep(0)
+                    batch = 0
                 if self._closed:
                     break
-                observer = _require_hooks().observe_stream_message
-                try:
-                    observed = observer(self.key, message)
+                async with self._delivery_lock:
+                    # Observers may consume native schedules or continuations
+                    # directly; validate before any application delivery path.
+                    validate_message_size(message, lane="stream", session_id=self.key[0])
+                    observed = _require_hooks().observe_stream_message(self.key, message)
                     if inspect.isawaitable(observed):
                         observed = await observed
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:
-                    # Trace/observability must not own SDK message delivery.
-                    sys.stderr.write(
-                        f"[chat] stream observer failed sid={self.key[0][:8]} "
-                        f"exc={type(exc).__name__}\n"
-                    )
-                    sys.stderr.flush()
-                    observed = False
-                if observed:
-                    continue
-                queue = self._turn or self._background
-                if queue is not None:
-                    queue.put_nowait(message)
-                else:
-                    self._orphans.append(message)
+                    if observed:
+                        continue
+                    queue = self._turn or self._background
+                    if queue is not None:
+                        queue.put_nowait(message)
+                    else:
+                        await self._deliver_detached(message)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -479,7 +485,7 @@ def stream_for(client: ClaudeSDKClient) -> SessionStream | None:
 
 
 async def evict_failed_session_stream(stream: SessionStream) -> None:
-    """Retain one exact-client cleanup owner across racing pump/park failures."""
+    """Retain one exact-client cleanup owner across racing pump/handoff failures."""
     task = getattr(stream, "_failure_cleanup_task", None)
     if task is None:
         task = asyncio.create_task(_evict_failed_session_stream_owned(stream))

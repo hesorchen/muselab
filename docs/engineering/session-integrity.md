@@ -41,3 +41,69 @@ Focused regressions are in `test_history_snapshot_integrity.py`,
 `test_completion_visibility.py`, `test_native_cron_reliability.py`, and
 `test_turn_startup_overlap.py`. Browser coverage requires `RUN_E2E=1`; always use a
 temporary `MUSELAB_ROOT` and a synthetic authentication token for local tests.
+
+
+## SDK output ownership
+
+Every pooled client has exactly one SDK reader. A foreground command/turn or a
+background watcher owns a bounded receive queue. Releasing that queue transfers
+its pending tail under the same barrier as wire delivery, and joins the transfer
+even if the caller is repeatedly cancelled. A watcher reserves its queue before
+its coroutine is scheduled; the foreground consumer selects that successor
+before acknowledging Result to its producer. Startup metadata reads therefore
+cannot create a gap in message ownership. Idle messages are consumed in the
+originating session: telemetry is observed without retention, while assistant,
+tool, and result output uses a durable continuation broadcast. There is no orphan
+mailbox for a later human turn to inherit. Direct observers retain the per-message
+byte guard; bounded queues still fail explicitly and retire the exact client.
+
+A continuation is not evidence of a scheduled trigger. Native origin establishes
+scheduled attribution; an unannounced continuation never acquires a job ID merely
+because the session has native schedules. Both kinds retain terminal assistant
+identity, tool results, replay, activity completion, and canonical-history refresh.
+
+Native control commands share receive ownership and cancellation cleanup. Cancel
+requests interrupt through the SDK and drain to its actual Result before releasing
+the lane. An unconfirmed terminal state retires that exact client before reuse.
+
+## Bounded I/O lifecycle
+
+Concurrent identical catalog probes and memory status reads share one producer.
+Cancelling one waiter leaves other waiters intact; the final waiter cancels and
+joins the producer. Gateway catalog keys include the route, model, and credential
+digest. All compatibility requests share one deadline, and cache age starts when
+a response completes. A failed probe preserves a bounded-age last known capacity.
+An unknown model over the generic fallback threshold fails explicitly when no
+authoritative capacity or explicit override exists, instead of spending minutes
+on speculative native compaction. Native compaction itself retains its SDK
+contract and reports separate SDK, measurement, and history phases.
+
+Memory status reads select pending IDs and bounded job summaries through dedicated
+indexes, within one read snapshot. Artifact payload size must not affect status
+polling. Queue wait, connection resolution, and SQLite execution share a cancellable
+deadline. The memory engine owns reusable HTTP connections; each request owns its
+credentials and timeout, cookies are disabled, and shutdown joins active users
+before closing the transport. Timings expose phases, never URLs or payloads.
+
+A detached filesystem scan may overlap watcher events. A complete cursor interval
+and bounded native mutation journal let the commit preserve newer indexed paths
+and apply unrelated scan observations. Directory add/delete protects descendants;
+directory modification protects only its own metadata. Missing/pruned history or
+a changed lifecycle rejects the scan. One reconciliation call performs one scan;
+the lifecycle scheduler owns retry timing instead of immediately repeating walks.
+
+## Evidence and diagnostics
+
+Regressions cover long idle output, cancellation-safe ordered handoff, native
+command cancellation, account-isolated catalog sharing, payload-free status reads,
+cancelled SQLite execution, HTTP reuse/cleanup, and scans during continuous native
+changes. See `test_idle_sdk_delivery.py`, `test_shared_calls.py`,
+`test_gateway_catalog_concurrency.py`, `test_memory_status_reads.py`,
+`test_memory_http_transport.py`, and `test_reconcile_rebase.py`.
+
+Alpine may rethrow an expression error from its vendor bundle. The vendor line
+alone does not locate the original expression. Browser error telemetry includes
+a digest of the attached expression, alongside reason/stack digests and owned
+asset revision; raw expressions and stacks remain only in the local error ring.
+The browser suite exercises a real Alpine `undefined.length` error to verify this
+boundary. A historical stack fingerprint alone does not prove its source or fix.

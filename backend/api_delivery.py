@@ -100,7 +100,7 @@ async def _idle(sid: str, cwd: Path) -> None:
         set(chat._active_turns)
         | set(chat._sessions_with_inflight_tasks)
         | set(chat._task_watchers)
-        | {key[0] for key in chat._sdk_scheduled_deliveries}
+        | {key[0] for key in chat._sdk_deliveries}
         | set(chat._sdk_cron_jobs)
         | set(RESTORING)
     )

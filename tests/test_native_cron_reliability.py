@@ -74,7 +74,7 @@ def test_idle_hook_messages_are_consumed_before_the_orphan_queue(stream_env, mon
         try:
             await asyncio.wait_for(received.wait(), 2)
             assert stream._failure is None
-            assert len(stream._orphans) == 0
+            assert stream._turn is None and stream._background is None
             assert chat._session_has_scheduled_tasks(key[0])
         finally:
             await stream.aclose()
@@ -107,7 +107,7 @@ def test_unannounced_native_cron_stream_is_drained_without_stealing_a_user_turn(
         pass
     monkeypatch.setattr(chat, "_start_activity_early", ignore)
     monkeypatch.setattr(chat, "_finish_activity", ignore)
-    monkeypatch.setattr(chat, "_refresh_scheduled_session_summary", ignore)
+    monkeypatch.setattr(chat, "_refresh_sdk_session_summary", ignore)
 
     async def run():
         await create_job(chat, key)
@@ -115,8 +115,10 @@ def test_unannounced_native_cron_stream_is_drained_without_stealing_a_user_turn(
             "type": "content_block_delta",
             "delta": {"type": "text_delta", "text": "Fixture is healthy"},
         })
-        assert await chat._observe_sdk_stream_message(key, message) is True
-        delivery = chat._sdk_scheduled_deliveries[key]
+        assert await chat._observe_sdk_stream_message(key, message) is False
+        await chat._consume_sdk_idle_message(key, message)
+        delivery = chat._sdk_deliveries[key]
+        assert not delivery.scheduled and not delivery.job_id
         await chat._observe_sdk_stream_message(key, AssistantMessage(
             content=[TextBlock("Fixture is healthy")], model="model",
         ))
@@ -125,7 +127,7 @@ def test_unannounced_native_cron_stream_is_drained_without_stealing_a_user_turn(
             is_error=False, num_turns=1, session_id=key[0],
         ))
         assert delivery.broadcast.done
-        assert not chat._sdk_scheduled_deliveries
+        assert not chat._sdk_deliveries
         foreground = chat.TurnBroadcast(key[0], model="model")
         chat._active_turns[key[0]] = foreground
         try:
@@ -143,7 +145,7 @@ def test_synthetic_no_response_is_not_successful_cron_execution(stream_env, monk
         pass
     monkeypatch.setattr(chat, "_start_activity_early", ignore)
     monkeypatch.setattr(chat, "_finish_activity", ignore)
-    monkeypatch.setattr(chat, "_refresh_scheduled_session_summary", ignore)
+    monkeypatch.setattr(chat, "_refresh_sdk_session_summary", ignore)
 
     async def run():
         await create_job(chat, key)
@@ -151,7 +153,7 @@ def test_synthetic_no_response_is_not_successful_cron_execution(stream_env, monk
             content="Check the fixture status", uuid="trigger-1",
             origin={"kind": "task-notification", "subkind": "scheduled-trigger"},
         ))
-        delivery = chat._sdk_scheduled_deliveries[key]
+        delivery = chat._sdk_deliveries[key]
         await chat._observe_sdk_stream_message(key, AssistantMessage(
             content=[TextBlock("No response requested.")], model="<synthetic>",
         ))
@@ -285,7 +287,7 @@ def test_buffer_diagnostics_identify_owner_and_envelope_without_content(stream_e
         queue.put_nowait(SystemMessage(subtype="status", data={"private": "do-not-log"}))
     event = events[-1][1]
     assert event["session"] == "fixture-"
-    assert event["envelope_counts"] == {"SystemMessage:status": 1}
+    assert event["envelope_0"] == "SystemMessage:status:1"
     assert event["incoming_kind"] == "SystemMessage:status"
     assert "do-not-log" not in json.dumps(event)
     queue.get_nowait()
@@ -368,7 +370,7 @@ def test_cron_run_requires_successful_matching_tool_result(stream_env, monkeypat
     key = (sid, meta["model"], "auto", "")
     async def ignore(*_a, **_kw):
         pass
-    for name in ("_start_activity_early", "_finish_activity", "_refresh_scheduled_session_summary"):
+    for name in ("_start_activity_early", "_finish_activity", "_refresh_sdk_session_summary"):
         monkeypatch.setattr(chat, name, ignore)
     async def run():
         await create_job(chat, key)

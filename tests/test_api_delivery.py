@@ -216,7 +216,7 @@ def test_restore_detects_detached_workspace_writers(
     stores = {
         "background": (f.chat._sessions_with_inflight_tasks, other, {"task"}),
         "watcher": (f.chat._task_watchers, other, SimpleNamespace(done=lambda: False)),
-        "scheduled": (f.chat._sdk_scheduled_deliveries, (other, "scheduled"), SimpleNamespace(broadcast=SimpleNamespace(done=False))),
+        "scheduled": (f.chat._sdk_deliveries, (other, "scheduled"), SimpleNamespace(broadcast=SimpleNamespace(done=False))),
         "cron": (f.chat._sdk_cron_jobs, other, [{"id": "cron"}]),
     }
     store, key, value = stores[writer]

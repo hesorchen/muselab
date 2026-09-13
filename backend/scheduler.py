@@ -1333,11 +1333,12 @@ async def _run_sdk_task_turn(
                 return "current_result"
             return decision
 
+        watcher = None
         try:
             stream = _stream_for(client)
             if stream is not None:
                 # The pooled stream pump is the client's sole SDK reader. Attach
-                # before query so the response cannot land in its orphan park.
+                # before query so the response has its turn owner immediately.
                 queue = stream.attach_turn()
                 try:
                     await client.query(prompt)
@@ -1354,8 +1355,11 @@ async def _run_sdk_task_turn(
                         if await _consume(msg) == "current_result":
                             break
                 finally:
-                    stream.detach_turn(queue)
-                    stream.park_unconsumed(queue)
+                    if saw_result and pending and status == "completed":
+                        watcher = _spawn_task_watcher(
+                            session_id, client, pending,
+                            origin_turn_id=activity_owner_id, drain_queue=False)
+                    await stream.release_turn(queue)
             else:
                 # Test doubles/unpooled clients have no pump, so the SDK bounded
                 # reader remains the only reader and is safe here.
@@ -1371,11 +1375,12 @@ async def _run_sdk_task_turn(
                     # A cancelled/failed parent cannot hand off unattended work.
                     await _terminate_scheduled_runtime(session_id, client)
                 else:
-                    watcher = _spawn_task_watcher(
-                        session_id, client, pending,
-                        origin_turn_id=activity_owner_id,
-                        drain_queue=False,
-                    )
+                    if watcher is None:
+                        watcher = _spawn_task_watcher(
+                            session_id, client, pending,
+                            origin_turn_id=activity_owner_id,
+                            drain_queue=False,
+                        )
                     continuation = await watcher
                     reply_text = continuation["text"] or reply_text
                     status = continuation["status"]

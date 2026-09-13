@@ -73,7 +73,7 @@
       const wireRecord = _clientErrorWireRecord(rec);
       if (!wireRecord) return;
       if (window.crypto?.subtle) {
-        for (const [field, value] of [["reason_fp", rec.message], ["trace_fp", rec.stack]]) {
+        for (const [field, value] of [["reason_fp", rec.message], ["trace_fp", rec.stack], ["expression_fp", rec.expression]]) {
           if (!value) continue;
           const bytes = new TextEncoder().encode(String(value).slice(0, 4096));
           const digest = await window.crypto.subtle.digest("SHA-256", bytes);
@@ -124,6 +124,7 @@
       message: (r && (r.message || String(r))) || "(no reason)",
       name: r && r.name,
       stack: r && r.stack,
+      expression: r && r.expression,
       filename: "", lineno: 0, colno: 0,
     });
   });
@@ -149,6 +150,7 @@
       message: ev.message || (err && err.message) || "(no message)",
       name: err && err.name,
       stack: err && err.stack,
+      expression: err && err.expression,
       filename: ev.filename || "",
       lineno: ev.lineno || 0,
       colno: ev.colno || 0,

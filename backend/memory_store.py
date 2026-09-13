@@ -462,6 +462,20 @@ class MemoryStore:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_operation "
                      "ON jobs(owner_id, operation_key, status)")
 
+        # Status polling must touch index entries and a bounded job footer,
+        # never historical job/artifact payload pages.
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_owner_updated "
+                     "ON jobs(owner_id, updated_at DESC, id DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_owner_status_updated "
+                     "ON jobs(owner_id, status, updated_at DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_owner_reindex "
+                     "ON jobs(owner_id, created_at DESC, operation_key) "
+                     "WHERE kind='reindex_memories' AND operation_key!=''")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_artifacts_owner_status_updated "
+                     "ON artifacts(owner_id, status, updated_at DESC, id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_memories_pending_index "
+                     "ON memories(owner_id, embedding_state) WHERE status='active'")
+
     def _migrate_fts(self, conn: sqlite3.Connection) -> None:
         """Reindex memory_fts when the tokenization scheme changes.
 
@@ -1565,6 +1579,13 @@ class MemoryStore:
 
     def stats(self, owner_id: str) -> dict:
         with self._lock, self._connect() as conn:
+            # IDs and counters describe one read snapshot even during review
+            # or background writes. No artifact body is fetched or decoded.
+            conn.execute("BEGIN")
+            pending_ids = [row[0] for row in conn.execute(
+                "SELECT id FROM artifacts WHERE owner_id=? "
+                "AND status='pending_review' ORDER BY updated_at DESC LIMIT 100",
+                (owner_id,))]
             def count(table: str, where: str = "owner_id=?") -> int:
                 return int(conn.execute(
                     f"SELECT count(*) AS n FROM {table} WHERE {where}",
@@ -1620,6 +1641,7 @@ class MemoryStore:
                     "FROM jobs WHERE owner_id=? AND operation_key=? AND created_at=?",
                     (owner_id, last_op["operation_key"], last_op["created_at"])).fetchone())
             return {
+                "pending_artifact_ids": pending_ids,
                 "memories": count("memories", "owner_id=? AND status='active'"),
                 "episodes": count("episodes"),
                 "pending_artifacts": count(

@@ -103,10 +103,9 @@ def test_service_status_exposes_only_numeric_buffer_diagnostics(client, auth):
     assert {'depth', 'estimated_bytes', 'oldest_ms', 'overflows'} <= metrics.keys()
 
 
-def test_orphan_overflow_before_pump_first_tick_still_disconnects(monkeypatch):
-    monkeypatch.setattr(runtime.SessionStream, '_ORPHAN_MAX', 1)
+def test_idle_delivery_failure_before_pump_first_tick_still_disconnects(monkeypatch):
     async def run():
-        cleanups, disconnected, interrupted = [], [], []
+        disconnected, interrupted = [], []
         class Client:
             async def receive_messages(self):
                 await asyncio.Event().wait()
@@ -114,28 +113,29 @@ def test_orphan_overflow_before_pump_first_tick_still_disconnects(monkeypatch):
             async def interrupt(self):
                 interrupted.append(self)
         client = Client()
-        key = ('parked-budget', 'model', '', '')
+        key = ("release-failure", "model", "", "")
         async def disconnect(_sid, clients=()):
             disconnected.extend(clients)
             return True
-        hooks = SimpleNamespace(observe_stream_message=lambda *_: False,
-                                evict_failed_session_stream=runtime.evict_failed_session_stream,
-                                session_runtime_disconnected=lambda _: None,
-                                join_session_disconnects=disconnect,
-                                retain_detached_cleanup=cleanups.append)
-        monkeypatch.setattr(runtime, '_hooks', hooks)
-        monkeypatch.setattr(runtime, 'CLIENTS', {key: client})
-        monkeypatch.setattr(runtime, 'SESSION_STREAMS', {})
+        async def consume(_key, message):
+            raise buffers.RuntimeBufferExceeded()
+        hooks = SimpleNamespace(
+            observe_stream_message=lambda *_: False, consume_idle_message=consume,
+            evict_failed_session_stream=runtime.evict_failed_session_stream,
+            session_runtime_disconnected=lambda _: None,
+            join_session_disconnects=disconnect)
+        monkeypatch.setattr(runtime, "_hooks", hooks)
+        monkeypatch.setattr(runtime, "CLIENTS", {key: client})
+        monkeypatch.setattr(runtime, "SESSION_STREAMS", {})
         stream = runtime.SessionStream(key, client)
         runtime.SESSION_STREAMS[key] = stream
         queue = stream.attach_turn()
+        queue.put_nowait("fixture")
         with pytest.raises(buffers.RuntimeBufferExceeded):
-            stream.park_messages(['first', 'second'])
-        assert await queue.get() is runtime.STREAM_EOF
+            await stream.release_turn(queue)
         await asyncio.gather(stream.task, return_exceptions=True)
-        await asyncio.gather(*cleanups)
         assert disconnected == [client] and interrupted == [client]
-        assert list(stream._orphans) == ['first']
+        assert stream._closed
     asyncio.run(run())
 
 
@@ -158,4 +158,27 @@ def test_racing_failed_stream_cleanup_interrupts_only_once(monkeypatch):
         stream = SimpleNamespace(key=key, client=client, _failure=buffers.RuntimeBufferExceeded())
         await asyncio.gather(*(runtime.evict_failed_session_stream(stream) for _ in range(3)))
         assert interrupted == [client] and disconnected == [client]
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("observed", [False, True])
+def test_idle_direct_delivery_still_enforces_the_byte_budget(monkeypatch, observed):
+    monkeypatch.setattr(buffers, "MAX_BYTES", 1024)
+    async def run():
+        delivered, disconnected = [], []
+        async def consume(_key, message):
+            delivered.append(message)
+        async def evict(stream):
+            disconnected.append(stream)
+        class Client:
+            async def receive_messages(self):
+                yield {"content": "x" * 2048}
+                await asyncio.Event().wait()
+        monkeypatch.setattr(runtime, "_hooks", SimpleNamespace(
+            observe_stream_message=lambda *_: observed, consume_idle_message=consume,
+            evict_failed_session_stream=evict))
+        stream = runtime.SessionStream(("idle-budget", "model", "", ""), Client())
+        await stream.task
+        assert not delivered and disconnected == [stream]
+        assert isinstance(stream._failure, buffers.RuntimeBufferExceeded)
     asyncio.run(run())

@@ -56,6 +56,7 @@ from claude_agent_sdk import (
 from claude_agent_sdk.types import HookMatcher, PermissionMode
 from .auth import require_token, require_token_header_or_query
 from .capability_tickets import tickets
+from .shared_calls import SharedCalls
 from .settings import (
     ROOT,
     MODEL,
@@ -1009,6 +1010,7 @@ class _TurnSubscriber:
             self._replay = None
 
 
+
 class TurnBroadcast:
     """Fan-out for an in-flight assistant turn.
 
@@ -1796,7 +1798,7 @@ class _ScheduledHistoryCursor:
 
 
 @dataclass
-class _ScheduledDelivery:
+class _SDKDelivery:
     key: chat_runtime.ClientKey
     broadcast: TurnBroadcast
     render_state: dict[str, Any]
@@ -1805,14 +1807,15 @@ class _ScheduledDelivery:
     subagent_mux: Any = None
     registration_task: asyncio.Task | None = None
     job_id: str = ""
+    scheduled: bool = True
     model_response: bool = False
     synthetic_response: bool = False
     tool_calls: set[str] = dataclass_field(default_factory=set)
     tool_results: set[str] = dataclass_field(default_factory=set)
 
 
-_sdk_scheduled_deliveries: dict[
-    chat_runtime.ClientKey, _ScheduledDelivery
+_sdk_deliveries: dict[
+    chat_runtime.ClientKey, _SDKDelivery
 ] = {}
 # A hidden runtime owns the real Claude continuation after one of its
 # background tasks settles.  When that runtime has already rolled over, the
@@ -2078,10 +2081,10 @@ def _session_has_live_watcher(session_id: str) -> bool:
     return watcher is not None and not watcher.done()
 
 
-def _session_has_scheduled_delivery(session_id: str) -> bool:
+def _session_has_sdk_delivery(session_id: str) -> bool:
     return any(
         key[0] == session_id and not delivery.broadcast.done
-        for key, delivery in _sdk_scheduled_deliveries.items()
+        for key, delivery in _sdk_deliveries.items()
     )
 
 
@@ -2094,7 +2097,7 @@ def _session_runtime_busy(session_id: str) -> bool:
         or (active is not None and not active.done)
         or _sessions_with_inflight_tasks.get(session_id)
         or _session_has_live_watcher(session_id)
-        or _session_has_scheduled_delivery(session_id)
+        or _session_has_sdk_delivery(session_id)
     )
 
 
@@ -2418,9 +2421,30 @@ _CONTEXT_CAPABILITY_CACHE_TTL = max(
     1.0, env_float("MUSELAB_CONTEXT_CATALOG_TTL_S", 300.0))
 _CONTEXT_CAPABILITY_FAILURE_TTL = max(
     1.0, env_float("MUSELAB_CONTEXT_CATALOG_FAILURE_TTL_S", 15.0))
-# (gateway base URL, canonical model) -> (monotonic timestamp, capability | None)
-# No credential material is ever retained in this cache.
-_CONTEXT_CAPABILITY_CACHE: dict[tuple[str, str], tuple[float, dict | None]] = {}
+# Routing identity includes a digest so credential changes cannot inherit a
+# different account's model capacity. Raw credentials are never cached/logged.
+_CONTEXT_CAPABILITY_CACHE: dict[tuple[str, str, str], tuple[float, dict | None]] = {}
+_CONTEXT_CAPABILITY_FAILURES: dict[tuple[str, str, str], float] = {}
+_CONTEXT_CAPABILITY_PROBES = SharedCalls()
+_CONTEXT_CAPABILITY_STALE_TTL = max(_CONTEXT_CAPABILITY_CACHE_TTL,
+    env_float("MUSELAB_CONTEXT_CATALOG_STALE_TTL_S", 3600.0))
+
+
+def _context_capability_key(base: str, canonical: str, credential: str) -> tuple[str, str, str]:
+    return base, canonical, hashlib.sha256(credential.encode()).hexdigest()
+
+
+def _last_known_gateway_capability(cache_key) -> dict | None:
+    cached = _CONTEXT_CAPABILITY_CACHE.get(cache_key)
+    if cached is None or not cached[1]:
+        return None
+    age = time.monotonic() - cached[0]
+    if age > _CONTEXT_CAPABILITY_STALE_TTL:
+        return None
+    return {**cached[1], "context_limit_source": "gateway_catalog_cache",
+            "context_limit_is_estimate": True, "context_catalog_stale": True,
+            "context_catalog_age_ms": round(age * 1000)}
+
 _CONTEXT_PROBE_LOG_WINDOW_S = max(
     15.0, env_float("MUSELAB_CONTEXT_CATALOG_LOG_WINDOW_S", 60.0))
 # (canonical model, exception class) -> (last emitted monotonic time, suppressed)
@@ -2710,41 +2734,37 @@ async def _post_turn_context_usage(client) -> dict:
 
 
 async def _detect_gateway_context_capability(model: str) -> dict | None:
-    """Discover the active Codex model window from CLIProxyAPI.
-
-    CLIProxyAPI 7.2.80 exposes the authoritative Codex-client model catalog at
-    `/v1/models?client_version`. Older generic `/v1/models` routes are retained
-    as compatibility fallbacks. Successes and failures use separate short TTLs
-    so a gateway upgrade/config change self-heals without restarting muselab.
-    """
+    """Resolve capacity through one cancellable probe per routing identity."""
     if not _is_codex_gateway_model(model):
         return None
     canonical = _canonical_context_model(model)
-    slug = endpoints.normalize_model_id(canonical)
     env = endpoints.routing_env(canonical) or {}
     base = (env.get("ANTHROPIC_BASE_URL") or "").rstrip("/")
-    key = env.get("ANTHROPIC_API_KEY") or env.get("ANTHROPIC_AUTH_TOKEN") or ""
+    credential = env.get("ANTHROPIC_API_KEY") or env.get("ANTHROPIC_AUTH_TOKEN") or ""
     if not base:
         return None
-    cache_key = (base, canonical)
+    cache_key = _context_capability_key(base, canonical, credential)
     cached = _CONTEXT_CAPABILITY_CACHE.get(cache_key)
-    if cached is not None:
-        cached_at, capability = cached
-        ttl = (_CONTEXT_CAPABILITY_CACHE_TTL if capability
-               else _CONTEXT_CAPABILITY_FAILURE_TTL)
-        if time.monotonic() - cached_at < ttl:
-            if capability:
-                _log_context_probe_recovery(canonical)
-            return dict(capability) if capability else None
+    if cached and time.monotonic() - cached[0] < _CONTEXT_CAPABILITY_CACHE_TTL:
+        return dict(cached[1]) if cached[1] else None
+    failed_at = _CONTEXT_CAPABILITY_FAILURES.get(cache_key)
+    if failed_at is not None and time.monotonic() - failed_at < _CONTEXT_CAPABILITY_FAILURE_TTL:
+        return _last_known_gateway_capability(cache_key)
+    return await _CONTEXT_CAPABILITY_PROBES.run(cache_key,
+        lambda: _load_gateway_context_capability(canonical, base, credential, cache_key))
 
+
+async def _load_gateway_context_capability(canonical: str, base: str, key: str,
+                                          cache_key) -> dict | None:
+    slug = endpoints.normalize_model_id(canonical)
     headers: dict[str, str] = {}
     if key:
         headers.update({"x-api-key": key, "Authorization": f"Bearer {key}"})
-    now = time.monotonic()
+    started = time.monotonic()
     try:
         import httpx
         timeout = max(0.2, env_float("MUSELAB_CONTEXT_CATALOG_TIMEOUT_S", 2.0))
-        async with httpx.AsyncClient(timeout=timeout) as hc:
+        async with asyncio.timeout(timeout), httpx.AsyncClient(timeout=timeout) as hc:
             # Query-string presence selects CLIProxyAPI's Codex-client catalog.
             r = await hc.get(f"{base}/v1/models?client_version", headers=headers)
             if r.status_code < 400:
@@ -2752,14 +2772,14 @@ async def _detect_gateway_context_capability(model: str) -> dict | None:
                 if catalog:
                     for item_slug, capability in catalog.items():
                         item_model = _canonical_context_model(item_slug)
-                        _CONTEXT_CAPABILITY_CACHE[(base, item_model)] = (
-                            now, dict(capability))
+                        _CONTEXT_CAPABILITY_CACHE[_context_capability_key(base, item_model, key)] = (
+                            time.monotonic(), dict(capability))
                         # Keep the routing-prefixed cache key too. This makes
                         # newly-added gateway models cache correctly before
                         # muselab's static fallback table learns their slug.
                         _CONTEXT_CAPABILITY_CACHE[
-                            (base, f"codex:{item_slug}")
-                        ] = (now, dict(capability))
+                            _context_capability_key(base, f"codex:{item_slug}", key)
+                        ] = (time.monotonic(), dict(capability))
                     found = catalog.get(slug)
                     if found:
                         _log_context_probe_recovery(canonical)
@@ -2788,13 +2808,16 @@ async def _detect_gateway_context_capability(model: str) -> dict | None:
                         item, source="gateway_models_api")
                     if capability:
                         _CONTEXT_CAPABILITY_CACHE[cache_key] = (
-                            now, dict(capability))
+                            time.monotonic(), dict(capability))
                         _log_context_probe_recovery(canonical)
                         return capability
     except Exception as e:
         _log_context_probe_failure(canonical, e)
-    _CONTEXT_CAPABILITY_CACHE[cache_key] = (now, None)
-    return None
+    _CONTEXT_CAPABILITY_FAILURES[cache_key] = time.monotonic()
+    fallback = _last_known_gateway_capability(cache_key)
+    obs.perf_event("chat.context_catalog", status="stale" if fallback else "unavailable",
+                   duration_ms=round((time.monotonic() - started) * 1000))
+    return fallback
 
 
 def _cached_gateway_context_capability(model: str) -> dict | None:
@@ -2806,13 +2829,19 @@ def _cached_gateway_context_capability(model: str) -> dict | None:
     base = (env.get("ANTHROPIC_BASE_URL") or "").rstrip("/")
     if not base:
         return None
-    cached = _CONTEXT_CAPABILITY_CACHE.get((base, canonical))
+    credential = env.get("ANTHROPIC_API_KEY") or env.get("ANTHROPIC_AUTH_TOKEN") or ""
+    cache_key = _context_capability_key(base, canonical, credential)
+    cached = _CONTEXT_CAPABILITY_CACHE.get(cache_key)
     if cached is None:
         return None
     cached_at, capability = cached
     ttl = (_CONTEXT_CAPABILITY_CACHE_TTL if capability
            else _CONTEXT_CAPABILITY_FAILURE_TTL)
     if time.monotonic() - cached_at >= ttl:
+        # Match the detector during its negative-cache window.
+        failed_at = _CONTEXT_CAPABILITY_FAILURES.get(cache_key)
+        if failed_at is not None and time.monotonic() - failed_at < _CONTEXT_CAPABILITY_FAILURE_TTL:
+            return _last_known_gateway_capability(cache_key)
         return None
     return dict(capability) if capability else None
 
@@ -2820,7 +2849,7 @@ def _cached_gateway_context_capability(model: str) -> dict | None:
 async def _detect_gateway_context_capabilities(
     models: Iterable[str],
 ) -> dict[str, dict]:
-    """Resolve a model list with at most one catalog probe per Gateway base.
+    """Resolve a model list with at most one catalog probe per Gateway account.
 
     The primary CLIProxyAPI endpoint returns the complete Codex catalog and
     `_detect_gateway_context_capability()` fills every model cache entry from
@@ -2828,7 +2857,7 @@ async def _detect_gateway_context_capabilities(
     timeout once per dropdown item when the local Gateway is unavailable.
     """
     capabilities: dict[str, dict] = {}
-    unresolved_by_base: dict[str, list[str]] = {}
+    unresolved_by_base: dict[tuple[str, str], list[str]] = {}
     for model in dict.fromkeys(models):
         if not _is_codex_gateway_model(model):
             continue
@@ -2840,7 +2869,9 @@ async def _detect_gateway_context_capabilities(
         env = endpoints.routing_env(canonical) or {}
         base = (env.get("ANTHROPIC_BASE_URL") or "").rstrip("/")
         if base:
-            unresolved_by_base.setdefault(base, []).append(model)
+            credential = env.get("ANTHROPIC_API_KEY") or env.get("ANTHROPIC_AUTH_TOKEN") or ""
+            account = _context_capability_key(base, canonical, credential)[2]
+            unresolved_by_base.setdefault((base, account), []).append(model)
 
     async def probe(group: list[str]) -> tuple[str, dict | None]:
         first = group[0]
@@ -2979,6 +3010,8 @@ def _apply_context_limit_details(target: dict, details: dict) -> None:
     ):
         if key in details:
             target[key] = details[key]
+    target["context_catalog_stale"] = bool(details.get("context_catalog_stale", False))
+    target["context_catalog_age_ms"] = int(details.get("context_catalog_age_ms", 0))
     target["context_is_estimate"] = bool(
         target.get("context_used_is_estimate", False)
         or target.get("context_limit_is_estimate", False))
@@ -4359,7 +4392,7 @@ async def shutdown_runtime() -> None:
 
     # Stop detached task watchers and active turn pumps before tearing down the
     # shared SDK streams they consume.
-    scheduled_deliveries = tuple(_sdk_scheduled_deliveries.values())
+    scheduled_deliveries = tuple(_sdk_deliveries.values())
     active_broadcasts = tuple({
         id(broadcast): broadcast
         for broadcast in (
@@ -4453,7 +4486,7 @@ async def shutdown_runtime() -> None:
     _recent_turns.clear()
 
     _active_turns.clear()
-    _sdk_scheduled_deliveries.clear()
+    _sdk_deliveries.clear()
     for sid in tuple(_sdk_cron_jobs):
         with _sdk_cron_state_lock:
             for raw in _sdk_cron_jobs.get(sid, {}).values():
@@ -10548,28 +10581,73 @@ async def _recover_context_session(
         return recovery_task.result()
 
 
+async def _read_sdk_command(client: ClaudeSDKClient, command: str, on_message) -> None:
+    """Own a native command through its terminal result or exact-client retirement."""
+    aborted_without_terminal = False
+    stream = _stream_for(client)
+    if stream is not None:
+        # Acquire the receive lane before the transport write. Keep ownership
+        # through a real Result, including cancellation and native interruption.
+        q = stream.attach_turn()
+        try:
+            await client.query(command)
+            while True:
+                msg = await q.get()
+                if msg is _STREAM_EOF:
+                    break
+                if on_message(msg):
+                    break
+        except asyncio.CancelledError:
+            async def abort_owned_command():
+                nonlocal aborted_without_terminal
+                try:
+                    async with asyncio.timeout(5):
+                        await client.interrupt()
+                        while True:
+                            msg = await q.get()
+                            if msg is _STREAM_EOF:
+                                raise ClaudeSDKError("native command stream closed")
+                            if on_message(msg):
+                                break
+                except Exception:
+                    # Unknown terminal state cannot become a subsequent turn's
+                    # output. Retire this exact client through the normal fence.
+                    aborted_without_terminal = True
+                    stream._failure = ClaudeSDKError("cancelled native command did not settle")
+                    stream._closed = True
+                    stream.task.cancel()
+                    await chat_runtime.evict_failed_session_stream(stream)
+            cleanup = asyncio.create_task(abort_owned_command())
+            while not cleanup.done():
+                try:
+                    await asyncio.shield(cleanup)
+                except asyncio.CancelledError:
+                    continue
+            cleanup.result()
+            raise
+        finally:
+            if aborted_without_terminal:
+                while not q.empty():
+                    q.get_nowait()
+            await stream.release_turn(q)
+    else:
+        # No pump — a client built outside the pool (unit tests). The SDK's own
+        # bounded reader is then the only reader, so it is safe to use.
+        await client.query(command)
+        async for msg in client.receive_response():
+            if on_message(msg):
+                break
+
+
 async def _run_sdk_command_checked(client: ClaudeSDKClient, command: str) -> ResultMessage:
-    """Run a CLI slash command and require an explicitly successful Result.
+    """Run a native command and require a successful terminal SDK Result.
 
-    Reads through the session's pump (`_SessionStream`) rather than opening
-    `client.receive_response()`. The SDK gives a client exactly ONE message
-    stream and the pump has owned it since client creation, so a second iterator
-    here lost every race — the command's ResultMessage went to the pump's
-    `_orphans` park and this function waited on a stream nobody was feeding.
-    The turn loop was migrated to `attach_turn()` when the pump landed; this
-    call site was missed. Symptom (2026-07-26): two auto-compacts reported
-    failure after 600s (TimeoutError) and 9m19s ("ended without a
-    ResultMessage") while the transcript shows both compactions had finished in
-    ~150s. Both were FALSE NEGATIVES — `query()` is a pure transport write, so
-    the command itself always ran.
-
-    Assistant/API errors are in-band SDK messages, not Python exceptions. Drain
-    through the terminal Result before raising so a failed command cannot leave
-    a stale Result in the pooled client's receive queue for the next turn.
+    Assistant/API errors are in-band SDK messages. The shared command owner
+    drains through Result before raising, so neither failed nor cancelled
+    commands can leave a terminal frame for a later human turn.
     """
     errors: list[dict] = []
     result: ResultMessage | None = None
-
     def _note(msg) -> bool:
         """Record one message; True once the terminal Result has been seen."""
         nonlocal result
@@ -10586,30 +10664,7 @@ async def _run_sdk_command_checked(client: ClaudeSDKClient, command: str) -> Res
             return True
         return False
 
-    stream = _stream_for(client)
-    if stream is not None:
-        # Attach BEFORE query(): anything the pump routes between the write and
-        # the attach would be parked as an orphan, and attach_turn deliberately
-        # does not adopt orphans, so a late attach could miss its own Result.
-        q = stream.attach_turn()
-        try:
-            await client.query(command)
-            while True:
-                msg = await q.get()
-                if msg is _STREAM_EOF:
-                    break
-                if _note(msg):
-                    break
-        finally:
-            stream.detach_turn(q)
-            stream.park_unconsumed(q)
-    else:
-        # No pump — a client built outside the pool (unit tests). The SDK's own
-        # bounded reader is then the only reader, so it is safe to use.
-        await client.query(command)
-        async for msg in client.receive_response():
-            if _note(msg):
-                break
+    await _read_sdk_command(client, command, _note)
     if result is None:
         errors.append({
             "message": f"{command} ended without a ResultMessage",
@@ -10655,25 +10710,7 @@ async def _run_sdk_reset_checked(
             return True
         return False
 
-    stream = _stream_for(client)
-    if stream is not None:
-        queue = stream.attach_turn()
-        try:
-            await client.query("/clear")
-            while True:
-                message = await queue.get()
-                if message is _STREAM_EOF:
-                    break
-                if _note(message):
-                    break
-        finally:
-            stream.detach_turn(queue)
-            stream.park_unconsumed(queue)
-    else:
-        await client.query("/clear")
-        async for message in client.receive_response():
-            if _note(message):
-                break
+    await _read_sdk_command(client, "/clear", _note)
 
     if reset is None:
         errors.append({
@@ -12232,6 +12269,10 @@ def _classify_stream_error(err: Any) -> dict:
     low = msg.lower()
     if "runtime_buffer_exceeded" in low:
         return {"kind": "runtime_buffer", "retryable": False, "cta": None}
+    if "context_capacity_unavailable" in low:
+        return {"kind": "context_unavailable", "retryable": True, "cta": "retry"}
+    if "native_compact_timeout" in low:
+        return {"kind": "compact_timeout", "retryable": True, "cta": "retry"}
     kind = "unknown"
     cta: str | None = "retry"
     retryable = True
@@ -14746,13 +14787,40 @@ def _render_continuation_message(msg, state: dict):
             yield {"event": "rate_limit", "data": json.dumps(payload)}
 
 
-async def _watch_inflight_tasks(
+def _watch_inflight_tasks(
     session_id: str,
     client: ClaudeSDKClient,
     pending: dict[str, str | None],
     generation: int | None = None,
     origin_turn_id: str = "",
     drain_queue: bool = True,
+):
+    """Reserve receive ownership synchronously before scheduling the watcher."""
+    stream = _stream_for(client)
+    queue = stream.attach_background() if stream is not None else None
+
+    async def owned():
+        try:
+            return await _watch_inflight_tasks_owned(
+                session_id, client, pending, generation, origin_turn_id, drain_queue,
+                _bg_stream=stream, bg_q=queue)
+        except BaseException:
+            # Startup metadata can fail or be cancelled before the normal
+            # watcher cleanup region has been entered.
+            if stream is not None and stream._background is queue:
+                await stream.release_background(queue)
+            raise
+    return owned()
+
+
+async def _watch_inflight_tasks_owned(
+    session_id: str,
+    client: ClaudeSDKClient,
+    pending: dict[str, str | None],
+    generation: int | None = None,
+    origin_turn_id: str = "",
+    drain_queue: bool = True,
+    *, _bg_stream=None, bg_q=None,
 ) -> dict[str, Any]:
     """Detached reader keeping an originating CLI client alive past its turn so
     SDK background tasks started in that turn can deliver their terminal
@@ -15101,8 +15169,6 @@ async def _watch_inflight_tasks(
     # `receive_messages()` iterator, which is what made it compete with a turn
     # for the same underlying queue — and therefore why starting a turn while
     # a background task was pending had to be refused with _TurnBusy.
-    _bg_stream = _stream_for(client)
-    bg_q = _bg_stream.attach_background() if _bg_stream is not None else None
     msg_iter = None if bg_q is not None else client.receive_messages().__aiter__()
 
     async def _next_message(timeout: float | None):
@@ -15598,7 +15664,7 @@ async def _watch_inflight_tasks(
         # Release our slot on the session pump so a later turn's messages are
         # not routed to a watcher that has exited.
         if _bg_stream is not None and bg_q is not None:
-            _bg_stream.detach_background(bg_q)
+            await _bg_stream.release_background(bg_q)
         # Close any continuation still open (e.g. grace timeout / outer
         # timeout / stream end with no ResultMessage). Shutdown may cancel after
         # a partial AssistantMessage; pass that cancellation through so the
@@ -16203,7 +16269,7 @@ async def _admit_turn(
             draining = cur
         elif (_sessions_with_inflight_tasks.get(session_id)
               or _session_has_live_watcher(session_id)
-              or _session_has_scheduled_delivery(session_id)):
+              or _session_has_sdk_delivery(session_id)):
             raise _TurnBusy()
         else:
             broadcast = TurnBroadcast(session_id=session_id, model=model or MODEL)
@@ -16234,7 +16300,7 @@ async def _admit_turn(
                 raise _TurnBusy()
             if (_sessions_with_inflight_tasks.get(session_id)
                     or _session_has_live_watcher(session_id)
-                    or _session_has_scheduled_delivery(session_id)):
+                    or _session_has_sdk_delivery(session_id)):
                 raise _TurnBusy()
             broadcast = TurnBroadcast(session_id=session_id, model=model or MODEL)
             _active_turns[session_id] = broadcast
@@ -16944,7 +17010,7 @@ async def _start_turn(
                 and cached_total + next_estimate < cached_limit * 0.5
                 and not _sessions_with_inflight_tasks.get(session_id)
                 and not _session_has_live_watcher(session_id)
-                and not _session_has_scheduled_delivery(session_id))
+                and not _session_has_sdk_delivery(session_id))
             cu = cached if use_cached else await asyncio.wait_for(
                 client.get_context_usage(),
                 timeout=min(
@@ -16969,7 +17035,7 @@ async def _start_turn(
             # the outer error path records a deferred rebuild after it settles.
             if (_sessions_with_inflight_tasks.get(session_id)
                     or _session_has_live_watcher(session_id)
-                    or _session_has_scheduled_delivery(session_id)):
+                    or _session_has_sdk_delivery(session_id)):
                 raise
             recovery_used, recovery_limit = _context_recovery_inputs(
                 session_id,
@@ -17043,6 +17109,12 @@ async def _start_turn(
                 sess_u["context_used_pct"] = round(
                     sess_u["context_used"] / sess_u["context_limit"] * 100, 1)
             return
+        if (_is_codex_gateway_model(model_to_use) and capability is None
+                and details.get("context_limit_is_estimate")
+                and _canonical_context_model(model_to_use) not in MODEL_CONTEXT_LIMITS):
+            raise ClaudeSDKError(
+                "context_capacity_unavailable: 模型目录暂不可用，无法确认当前模型的上下文容量；"
+                "请稍后重试，或在模型设置中填写服务端支持的容量。")
         # A background watcher shares this client's single SDK message pump.
         # `/compact` uses a temporary turn consumer; if it ran here, task
         # notifications and the model's auto-continuation could be routed into
@@ -17052,7 +17124,7 @@ async def _start_turn(
         # configured native auto-compact window still gets a chance to act.
         if (_sessions_with_inflight_tasks.get(session_id)
                 or _session_has_live_watcher(session_id)
-                or _session_has_scheduled_delivery(session_id)):
+                or _session_has_sdk_delivery(session_id)):
             obs.diagnostic_line(
                 f"[chat-preflight] native compact deferred for background "
                 f"owner sid={session_id[:8]} model={model_to_use} "
@@ -17074,6 +17146,19 @@ async def _start_turn(
         # shrank is the fact. Keep the command's verdict aside and let the token
         # count adjudicate, so a compaction that succeeded but failed to
         # acknowledge itself cannot kill the turn it just made room for.
+        compact_phase = "command"
+        compact_timings = {"sdk_ms": 0, "measure_ms": 0, "history_ms": 0}
+        compact_status = "measured"
+
+        async def compact_stage(name, field, operation):
+            nonlocal compact_phase
+            compact_phase = name
+            started = obs.monotonic()
+            try:
+                return await operation()
+            finally:
+                compact_timings[field] += obs.elapsed_ms(started)
+
         async def _compact_and_measure(
                 target: ClaudeSDKClient,
         ) -> tuple[Exception | None, dict, Exception | None, dict[str, bool]]:
@@ -17087,7 +17172,8 @@ async def _start_turn(
             tail_path, tail_offset = _compact_tail_cursor(session_id)
             cmd_error: Exception | None = None
             try:
-                await _run_sdk_command_checked(target, "/compact")
+                await compact_stage("command", "sdk_ms",
+                    lambda: _run_sdk_command_checked(target, "/compact"))
             except Exception as e:
                 cmd_error = e
                 safe_kind = _classify_stream_error(str(e)).get("kind", "unknown")
@@ -17096,7 +17182,8 @@ async def _start_turn(
                     f"sid={session_id[:8]} model={model_to_use}: "
                     f"{type(e).__name__} kind={safe_kind} — verifying\n")
             try:
-                measured = dict(await target.get_context_usage())
+                measured = dict(await compact_stage("measure", "measure_ms",
+                    lambda: asyncio.wait_for(target.get_context_usage(), timeout=10.0)))
                 measure_error: Exception | None = None
                 if not _positive_int(measured.get("totalTokens")):
                     measure_error = RuntimeError(
@@ -17108,8 +17195,8 @@ async def _start_turn(
                     f"[chat-preflight] post-compact context probe failed "
                     f"sid={session_id[:8]} model={model_to_use}: "
                     f"{type(e).__name__}\n")
-            tail_outcome = await asyncio.to_thread(
-                _compact_tail_outcome, tail_path, tail_offset)
+            tail_outcome = await compact_stage("history", "history_ms",
+                lambda: asyncio.to_thread(_compact_tail_outcome, tail_path, tail_offset))
             return cmd_error, measured, measure_error, tail_outcome
 
         cmd_error: Exception | None = None
@@ -17146,7 +17233,7 @@ async def _start_turn(
                         and _is_codex_gateway_model(model_to_use)
                         and not _sessions_with_inflight_tasks.get(session_id)
                         and not _session_has_live_watcher(session_id)
-                        and not _session_has_scheduled_delivery(session_id)
+                        and not _session_has_sdk_delivery(session_id)
                         and not _session_has_scheduled_tasks(session_id)):
                     obs.diagnostic_line(
                         f"[chat-preflight] rebuilding stalled Codex runtime "
@@ -17197,12 +17284,14 @@ async def _start_turn(
                         cmd_error, cu2, measure_error, tail_outcome = (
                             await _compact_and_measure(client))
         except asyncio.CancelledError:
+            compact_status = "cancelled"
             # An operator-configured whole-turn timeout or explicit task
             # cancellation can land midway through /compact. Its CLI state is
             # unknowable; never leave that process cached for the next prompt.
             _pending_runtime_rebuilds.add(session_id)
             raise
         except asyncio.TimeoutError:
+            compact_status = "timeout"
             _pending_runtime_rebuilds.add(session_id)
             await _emit_compact(
                 emit,
@@ -17210,8 +17299,10 @@ async def _start_turn(
                 ok=False,
                 error="native compact timed out during command or verification",
             )
-            raise
+            raise TimeoutError(
+                "native_compact_timeout: 原生压缩在 " + compact_phase + " 阶段超时") from None
         except Exception as e:
+            compact_status = "error"
             _pending_runtime_rebuilds.add(session_id)
             # Can't observe the outcome, so the command's verdict is all we
             # have. No reading also means no evidence of success.
@@ -17221,6 +17312,12 @@ async def _start_turn(
             # itself. Do not mask a fresh disconnect/client-creation error with
             # an older compact verdict captured before the recovery attempt.
             raise
+        finally:
+            obs.perf_event("chat.native_compact_probe", session=session_id[:8],
+                status=compact_status, phase=compact_phase, used=total,
+                limit=limit, threshold=threshold,
+                capacity_source=details.get("context_limit_source", "unknown"),
+                **compact_timings)
         real_total = _positive_int(cu2.get("totalTokens"))
         compact_pair_written = bool(
             tail_outcome.get("boundary") and tail_outcome.get("summary"))
@@ -17371,6 +17468,10 @@ async def _start_turn(
         side_q = register_session_queue(session_id)
         perm_q = perm.register_session_queue(session_id)
         merge_q: asyncio.Queue = asyncio.Queue()
+        # The foreground consumer must install its successor before the SDK
+        # producer releases messages already queued behind its Result.
+        result_handoff_ready = asyncio.Event()
+        result_handoff_prepared = False
         SENTINEL_DONE = object()
 
         async def pump_claude():
@@ -17614,7 +17715,7 @@ async def _start_turn(
                 if stream is not None:
                     # Attach BEFORE query(): query() yields to the transport,
                     # so an immediate response can otherwise reach the pump's
-                    # orphan park before this consumer exists. The old outer
+                    # idle consumer before this turn exists. The old outer
                     # loop existed only because receive_response() returns at
                     # EVERY ResultMessage — including a replayed one. A queue
                     # has no such boundary, so stale results keep draining.
@@ -17640,18 +17741,13 @@ async def _start_turn(
                             if await _dispatch(msg) == "current_result":
                                 break
                     finally:
-                        stream.detach_turn(turn_q)
-                        # Explicit non-human MessageOrigin frames belong to a
-                        # background/peer delivery, never the foreground human
-                        # turn. Preserve them in order for the task watcher or
-                        # continuation consumer instead of mixing their text,
-                        # usage and Result boundary into this reply.
-                        stream.park_messages(background_messages)
-                        # The pump may have already queued lifecycle records
-                        # after Result. Return every leftover to the orphan
-                        # park so a background watcher can adopt them instead
-                        # of silently losing task settlements/continuations.
-                        stream.park_unconsumed(turn_q)
+                        try:
+                            if broadcast.result_forwarded:
+                                await result_handoff_ready.wait()
+                        finally:
+                            # Cancellation must also complete queue ownership
+                            # transfer before this producer can disappear.
+                            await stream.release_turn(turn_q, background_messages)
                 else:
                     # No pump: this client was not created through get_client
                     # (test doubles inject their own). Fall back to the SDK's
@@ -18833,6 +18929,24 @@ async def _start_turn(
         # these workers when the browser disconnects — they complete
         # naturally. 30-minute hard cap is applied to the outer
         # task, not here.
+        async def prepare_result_handoff():
+            nonlocal result_handoff_prepared
+            if result_handoff_prepared:
+                return
+            merged_inflight = _merge_session_inflight(session_id, inflight_tasks)
+            if merged_inflight:
+                _spawn_task_watcher(
+                    session_id,
+                    client,
+                    merged_inflight,
+                    started_at=broadcast.started_at,
+                    origin_turn_id=broadcast.turn_id,
+                )
+            else:
+                await _retire_unpinned_task_watcher(session_id)
+            result_handoff_prepared = True
+            result_handoff_ready.set()
+
         claude_task = asyncio.create_task(pump_claude())
         side_task = asyncio.create_task(pump_side_q(side_q))
         perm_task = asyncio.create_task(pump_side_q(perm_q))
@@ -18920,26 +19034,8 @@ async def _start_turn(
                 elif isinstance(msg, ResultMessage):
                     async for ev in _handle_result_message(msg):
                         yield ev
-            # Turn loop ended (done / in-band error). Hand any still-in-flight
-            # background task to a detached cross-turn watcher that keeps the
-            # client alive and drains its terminal notification after the turn
-            # (probe §3.4: it lands after ResultMessage). On hard cancel we jump
-            # to the except below and skip this — a cancelled turn doesn't spawn.
-            #
-            # Cover not just THIS turn's launches (inflight_tasks) but EVERY
-            # unsettled task for the session (_merge_session_inflight); see its
-            # docstring for the spec §13 orphan-bug rationale.
-            merged_inflight = _merge_session_inflight(session_id, inflight_tasks)
-            if merged_inflight:
-                _spawn_task_watcher(
-                    session_id,
-                    client,
-                    merged_inflight,
-                    started_at=broadcast.started_at,
-                    origin_turn_id=broadcast.turn_id,
-                )
-            else:
-                await _retire_unpinned_task_watcher(session_id)
+                    await prepare_result_handoff()
+            await prepare_result_handoff()
         except asyncio.CancelledError:
             # Hard cancel (task cancelled / 30-min timeout cancel) — mark so
             # the queue drain pauses rather than charging ahead.
@@ -18950,6 +19046,7 @@ async def _start_turn(
             # event_gen runs as part of a detached background task now;
             # cleanup here runs after the task finishes naturally (or an
             # explicit interrupt / an armed MUSELAB_TURN_TIMEOUT_S cancels us).
+            result_handoff_ready.set()
             side_task.cancel()
             perm_task.cancel()
             claude_task.cancel()
@@ -19644,7 +19741,7 @@ async def _maybe_drain_queue(session_id: str) -> None:
         # final continuation releases the single SDK pump.
         if (_sessions_with_inflight_tasks.get(session_id)
                 or _session_has_live_watcher(session_id)
-                or _session_has_scheduled_delivery(session_id)):
+                or _session_has_sdk_delivery(session_id)):
             queued = await obs.to_thread_io(
                 "chat.queue_read", session_id, sess.get_queue, session_id)
             if sess.queue_pending_items(queued):
@@ -20980,7 +21077,7 @@ def _session_has_scheduled_tasks(session_id: str) -> bool:
 def _scheduled_state_carrier(
     key: chat_runtime.ClientKey,
 ) -> TurnBroadcast | None:
-    delivery = _sdk_scheduled_deliveries.get(key)
+    delivery = _sdk_deliveries.get(key)
     if delivery is not None and not delivery.broadcast.done:
         return delivery.broadcast
     broadcast = _active_turns.get(key[0])
@@ -21389,8 +21486,8 @@ def _is_sdk_scheduled_trigger(
     return bool(_matching_sdk_cron_job(key, _scheduled_trigger_text(message)))
 
 
-async def _register_scheduled_delivery(
-    delivery: _ScheduledDelivery,
+async def _register_sdk_delivery(
+    delivery: _SDKDelivery,
 ) -> bool:
     """Claim the visible slot after the preceding turn releases it."""
     session_id = delivery.key[0]
@@ -21418,16 +21515,19 @@ def _retain_maintenance_task(task: asyncio.Task) -> None:
     task.add_done_callback(_maintenance_tasks.discard)
 
 
-async def _begin_scheduled_delivery(
+async def _begin_sdk_delivery(
     key: chat_runtime.ClientKey,
     message: UserMessage,
-) -> _ScheduledDelivery:
+    *,
+    scheduled: bool = True,
+) -> _SDKDelivery:
     prompt = _scheduled_trigger_text(message)
     broadcast = TurnBroadcast(session_id=key[0], model=key[1] or MODEL)
     broadcast.user_text = prompt
-    broadcast.is_scheduled_delivery = True
+    broadcast.is_scheduled_delivery = scheduled
+    broadcast.is_continuation = not scheduled
     broadcast.perf_client = "warm"
-    delivery = _ScheduledDelivery(
+    delivery = _SDKDelivery(
         key=key,
         broadcast=broadcast,
         render_state={
@@ -21436,9 +21536,10 @@ async def _begin_scheduled_delivery(
             "assistant_uuid": "",
         },
         subagent_mux=chat_subagents.SubagentStreamMux(key[0]),
-        job_id=_matching_sdk_cron_job(key, prompt),
+        job_id=_matching_sdk_cron_job(key, prompt) if scheduled else "",
+        scheduled=scheduled,
     )
-    _sdk_scheduled_deliveries[key] = delivery
+    _sdk_deliveries[key] = delivery
     with _sdk_cron_state_lock:
         job = _sdk_cron_jobs.get(key[0], {}).get(delivery.job_id)
         if job is not None:
@@ -21446,18 +21547,18 @@ async def _begin_scheduled_delivery(
                        last_started_at_ms=int(time.time() * 1000), last_status="running")
     if job is not None:
         await _persist_native_cron_state(key[0])
-    registration = asyncio.create_task(_register_scheduled_delivery(delivery))
+    registration = asyncio.create_task(_register_sdk_delivery(delivery))
     delivery.registration_task = registration
     _retain_maintenance_task(registration)
     broadcast.publish_startup("accepted")
     try:
-        await _start_activity_early(key[0], broadcast, prompt or "定时任务")
+        await _start_activity_early(key[0], broadcast, prompt or ("定时任务" if scheduled else "后台继续执行"))
     except asyncio.CancelledError:
         raise
     except Exception:
         pass
     message_uuid = str(getattr(message, "uuid", "") or "")
-    if message_uuid:
+    if message_uuid and scheduled:
         try:
             await obs.to_thread_io(
                 "chat.scheduled_trigger_annotation",
@@ -21477,8 +21578,8 @@ async def _begin_scheduled_delivery(
     return delivery
 
 
-async def _observe_scheduled_task_lifecycle(
-    delivery: _ScheduledDelivery,
+async def _observe_delivery_task_lifecycle(
+    delivery: _SDKDelivery,
     message: Any,
 ) -> bool:
     return await _observe_background_task_lifecycle(
@@ -21564,7 +21665,7 @@ async def _observe_background_task_lifecycle(
     return True
 
 
-async def _refresh_scheduled_session_summary(
+async def _refresh_sdk_session_summary(
     session_id: str,
     model: str,
 ) -> None:
@@ -21587,15 +21688,15 @@ async def _refresh_scheduled_session_summary(
         )
 
 
-async def _finish_scheduled_delivery(
-    delivery: _ScheduledDelivery,
+async def _finish_sdk_delivery(
+    delivery: _SDKDelivery,
     result: ResultMessage,
 ) -> None:
     key = delivery.key
     session_id = key[0]
     broadcast = delivery.broadcast
-    if _sdk_scheduled_deliveries.get(key) is delivery:
-        _sdk_scheduled_deliveries.pop(key, None)
+    if _sdk_deliveries.get(key) is delivery:
+        _sdk_deliveries.pop(key, None)
     registration = delivery.registration_task
 
     schedule_changed = False
@@ -21664,7 +21765,8 @@ async def _finish_scheduled_delivery(
         "cancelled": status == "cancelled",
         "is_error": status == "failed",
         "error": "\n".join(errors) or (
-            "定时任务已触发，但未获得有效执行结果" if (
+            ("定时任务已触发，但未获得有效执行结果" if delivery.scheduled
+             else "后台执行未获得有效结果") if (
                 status == "failed" and execution_status == "not_executed"
             ) else result_text if status == "failed" else ""
         ),
@@ -21672,8 +21774,8 @@ async def _finish_scheduled_delivery(
         "tool_calls": len(delivery.tool_calls),
         "tool_results": len(delivery.tool_results),
         "model": broadcast.model,
-        "scheduled": True,
-        "continuation": False,
+        "scheduled": delivery.scheduled,
+        "continuation": not delivery.scheduled,
         "activity_source": broadcast.activity_source,
         "duration_ms": getattr(result, "duration_ms", None),
         "assistant_uuid": assistant_uuid,
@@ -21697,11 +21799,12 @@ async def _finish_scheduled_delivery(
                 job["last_success_at_ms"] = completed_at_ms
     if delivery.job_id:
         await _persist_native_cron_state(session_id)
-    obs.perf_event("chat.native_cron_run", session=session_id[:8],
+    obs.perf_event("chat.native_cron_run" if delivery.scheduled else "chat.sdk_continuation_run",
+                   session=session_id[:8],
                    job_id=delivery.job_id, status=status, execution_status=execution_status,
                    tool_calls=len(delivery.tool_calls), tool_results=len(delivery.tool_results))
     broadcast.perf_status = status
-    broadcast.perf_error_kind = "scheduled_turn" if status == "failed" else "none"
+    broadcast.perf_error_kind = ("scheduled_turn" if delivery.scheduled else "sdk_continuation") if status == "failed" else "none"
     broadcast.publish({"event": "done", "data": json.dumps(done_payload)})
     if schedule_changed:
         _publish_sdk_scheduled_state(key, broadcast=broadcast)
@@ -21733,32 +21836,11 @@ async def _finish_scheduled_delivery(
                 origin_turn_id=broadcast.turn_id,
             )
     refresh = asyncio.create_task(
-        _refresh_scheduled_session_summary(session_id, broadcast.model))
+        _refresh_sdk_session_summary(session_id, broadcast.model))
     _retain_maintenance_task(refresh)
 
 
-def _is_unannounced_scheduled_output(key: chat_runtime.ClientKey, message: Any) -> bool:
-    """Recognize detached output without claiming a foreground or task reader."""
-    if not _session_has_scheduled_tasks(key[0]):
-        return False
-    current = _active_turns.get(key[0])
-    if current is not None and not current.done:
-        return False
-    if _sessions_with_inflight_tasks.get(key[0]) or _session_has_live_watcher(key[0]):
-        return False
-    stream = chat_runtime.SESSION_STREAMS.get(key)
-    if stream is not None and (stream._turn is not None or stream._background is not None):
-        return False
-    if getattr(message, "parent_tool_use_id", None):
-        return False
-    if isinstance(message, AssistantMessage):
-        return True
-    return isinstance(message, StreamEvent) and message.event.get("type") in {
-        "message_start", "content_block_start", "content_block_delta", "message_delta",
-    }
-
-
-def _scheduled_execution_evidence(delivery: _ScheduledDelivery, message: Any) -> None:
+def _scheduled_execution_evidence(delivery: _SDKDelivery, message: Any) -> None:
     if isinstance(message, AssistantMessage):
         if str(message.model or "") == "<synthetic>":
             delivery.synthetic_response = True
@@ -21789,22 +21871,22 @@ async def _observe_sdk_scheduled_delivery(
     key: chat_runtime.ClientKey,
     message: Any,
 ) -> bool:
-    delivery = _sdk_scheduled_deliveries.get(key)
+    delivery = _sdk_deliveries.get(key)
     if delivery is None:
         if _is_sdk_scheduled_trigger(key, message):
-            await _begin_scheduled_delivery(key, message)
+            await _begin_sdk_delivery(key, message)
             return True
-        if not _is_unannounced_scheduled_output(key, message):
-            return False
-        # A runtime may expose only autonomous assistant output. Do not invent
-        # a job id or charge a particular schedule for an unattributed run.
-        delivery = await _begin_scheduled_delivery(key, UserMessage(content=""))
+        return False  # Unattributed idle output is owned by the idle router.
 
+    return await _dispatch_sdk_delivery(delivery, message)
+
+
+async def _dispatch_sdk_delivery(delivery: _SDKDelivery, message: Any) -> bool:
     _scheduled_execution_evidence(delivery, message)
-    if await _observe_scheduled_task_lifecycle(delivery, message):
+    if await _observe_delivery_task_lifecycle(delivery, message):
         return True
     if isinstance(message, ResultMessage):
-        await _finish_scheduled_delivery(delivery, message)
+        await _finish_sdk_delivery(delivery, message)
         return True
     if isinstance(message, AssistantMessage) and str(message.model or "") == "<synthetic>":
         return True
@@ -21820,6 +21902,40 @@ async def _observe_sdk_scheduled_delivery(
     return True
 
 
+async def _consume_sdk_idle_message(key: chat_runtime.ClientKey, message: Any) -> None:
+    """Consume detached SDK output in its originating session, without a timer.
+
+    Init/status/thinking-token telemetry has no pending recipient. Actual
+    assistant/tool/task output gets the same durable continuation lifecycle as
+    native scheduled output, but never acquires an invented scheduled origin.
+    """
+    if sess.session_is_deleting(key[0]):
+        return
+    delivery = _sdk_deliveries.get(key)
+    if delivery is None:
+        pending: dict[str, dict[str, Any]] = {}
+        if await _observe_background_task_lifecycle(key[0], pending, message):
+            client = _clients.get(key)
+            if pending and client is not None:
+                _spawn_task_watcher(key[0], client, pending)
+            return
+        begins_output = isinstance(message, AssistantMessage)
+        if isinstance(message, StreamEvent):
+            begins_output = (message.event or {}).get("type") in {
+                "message_start", "content_block_start", "content_block_delta",
+            }
+        if isinstance(message, UserMessage):
+            begins_output = isinstance(message.content, list) and any(
+                isinstance(block, ToolResultBlock) for block in message.content)
+        if isinstance(message, ResultMessage):
+            begins_output = _meaningful_scheduled_text(getattr(message, "result", None))
+        if not begins_output:
+            return
+        delivery = await _begin_sdk_delivery(
+            key, UserMessage(content=""), scheduled=False)
+    await _dispatch_sdk_delivery(delivery, message)
+
+
 def _on_sdk_runtime_disconnected(session_id: str) -> None:
     """Retain interrupted schedule receipts and close their active delivery."""
     with _sdk_cron_state_lock:
@@ -21830,8 +21946,8 @@ def _on_sdk_runtime_disconnected(session_id: str) -> None:
                            disconnected_at_ms=int(time.time() * 1000))
         for key in [key for key in _sdk_cron_tool_calls if key[0] == session_id]:
             _sdk_cron_tool_calls.pop(key, None)
-    for key in [key for key in _sdk_scheduled_deliveries if key[0] == session_id]:
-        delivery = _sdk_scheduled_deliveries.pop(key)
+    for key in [key for key in _sdk_deliveries if key[0] == session_id]:
+        delivery = _sdk_deliveries.pop(key)
         broadcast = delivery.broadcast
         with _sdk_cron_state_lock:
             job = _sdk_cron_jobs.get(session_id, {}).get(delivery.job_id)
@@ -21845,10 +21961,10 @@ def _on_sdk_runtime_disconnected(session_id: str) -> None:
             broadcast.publish({
                 "event": "error",
                 "data": json.dumps({
-                    "error": "定时任务运行环境已断开",
+                    "error": "定时任务运行环境已断开" if delivery.scheduled else "后台会话运行环境已断开",
                     "kind": "sdk",
                     "retryable": False,
-                    "activity_source": "scheduled",
+                    "activity_source": broadcast.activity_source,
                 }),
             })
             broadcast.finish()
@@ -21930,7 +22046,7 @@ async def _observe_sdk_stream_message(
                 _hook_diagnostic_generations.get(session_id, 0)):
             obs.perf_event("chat.hook_trace_dropped", count=_hook_diagnostic_worker.dropped)
     except Exception as exc:
-        # Diagnostic failures cannot return already-owned hooks to the orphan lane.
+        # Diagnostic failures cannot reroute already-owned hooks into a user turn.
         obs.perf_event("chat.hook_trace_dropped", error_kind=type(exc).__name__, count=1)
     return True
 
@@ -21959,6 +22075,7 @@ chat_runtime.configure_hooks(chat_runtime.RuntimeHooks(
     evict_failed_session_stream=lambda *a, **k: _evict_failed_session_stream(*a, **k),
     retain_detached_cleanup=lambda *a, **k: _retain_detached_cleanup(*a, **k),
     observe_stream_message=lambda *a, **k: _observe_sdk_stream_message(*a, **k),
+    consume_idle_message=lambda *a, **k: _consume_sdk_idle_message(*a, **k),
 ))
 
 

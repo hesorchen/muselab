@@ -11,7 +11,7 @@ def admission_runtime(app_module, monkeypatch):
     monkeypatch.setattr(chat, "_active_turns", {})
     monkeypatch.setattr(chat, "_sessions_with_inflight_tasks", {})
     monkeypatch.setattr(chat, "_session_has_live_watcher", lambda _sid: False)
-    monkeypatch.setattr(chat, "_session_has_scheduled_delivery", lambda _sid: False)
+    monkeypatch.setattr(chat, "_session_has_sdk_delivery", lambda _sid: False)
     monkeypatch.setattr(chat, "_write_active_turn_sidecar", lambda *a, **kw: True)
     monkeypatch.setattr(chat, "_announce_mux_turn", lambda b: None)
     monkeypatch.setattr(chat.sess, "get_queue", lambda _sid: {"items": [], "inflight": None})

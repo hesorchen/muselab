@@ -1385,7 +1385,7 @@ def _safe_client_error_record(payload: object) -> dict[str, object] | None:
         record["reason_fp"] = reason_fp
     if trace_fp:
         record["trace_fp"] = trace_fp
-    for field in ("reason_fp", "trace_fp"):
+    for field in ("reason_fp", "trace_fp", "expression_fp"):
         value = payload.get(field)
         if isinstance(value, str) and re.fullmatch(r"[a-f0-9]{24}", value):
             record[field] = value

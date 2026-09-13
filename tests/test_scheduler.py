@@ -271,13 +271,9 @@ async def test_sdk_turn_reads_through_pooled_stream_pump(
             self.queue = asyncio.Queue()
             return self.queue
 
-        def detach_turn(self, queue):
+        async def release_turn(self, queue):
             assert queue is self.queue
-            self.detached = True
-
-        def park_unconsumed(self, queue):
-            assert queue is self.queue
-            self.parked = True
+            self.detached = self.parked = True
 
     stream = FakeStream()
 
@@ -340,10 +336,7 @@ async def test_sdk_turn_rejects_pooled_eof_without_result(
             self.queue = asyncio.Queue()
             return self.queue
 
-        def detach_turn(self, _queue):
-            return None
-
-        def park_unconsumed(self, _queue):
+        async def release_turn(self, _queue):
             return None
 
     stream = FailedStream()
@@ -390,10 +383,7 @@ async def test_sdk_turn_skips_replayed_result_before_current_result(
             self.queue = asyncio.Queue()
             return self.queue
 
-        def detach_turn(self, _queue):
-            return None
-
-        def park_unconsumed(self, _queue):
+        async def release_turn(self, _queue):
             return None
 
     stream = FakeStream()

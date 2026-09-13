@@ -1770,7 +1770,7 @@ async def test_reconcile_perf_event_splits_wait_scan_and_replay(
 
 
 @pytest.mark.asyncio
-async def test_detached_scan_retries_after_watcher_mutation(
+async def test_detached_scan_yields_retry_to_scheduler_after_unknown_mutation(
     app_module,
     temp_root,
     monkeypatch,
@@ -1843,8 +1843,12 @@ async def test_detached_scan_retries_after_watcher_mutation(
     await asyncio.wait_for(heartbeat.wait(), timeout=0.2)
     release_first_scan.set()
 
-    # The stale first result is discarded. The fresh result is applied once and
-    # its exact payload is built while the mutation lock is still owned.
+    # An unknown mutation cannot be rebased. End this pass without applying;
+    # the scheduler owns the next attempt and its elapsed-time backoff.
+    with pytest.raises(file_events.WorkspaceScanIncomplete):
+        await reconcile
+    assert scan_calls == 1 and store.applications == 0
+    reconcile = asyncio.create_task(manager._reconcile_and_broadcast(state))
     assert await asyncio.to_thread(store.apply_entered.wait, 1)
     mutation_acquired = asyncio.Event()
 
@@ -2564,7 +2568,7 @@ async def test_relevant_native_noop_invalidates_detached_scan_token(
     await manager.shutdown()
 
 
-def test_detached_snapshot_rejects_a_changed_cursor(
+def test_detached_snapshot_rebases_over_complete_watcher_events(
     app_module,
     temp_root,
 ):
@@ -2595,11 +2599,9 @@ def test_detached_snapshot_rejects_a_changed_cursor(
         expected_cursor=before,
     )
     assert stale == {
-        "_stale": True,
-        "cursor": before + 1,
-        "changes": [],
-        "resync": True,
+        "cursor": before + 1, "changes": [], "resync": False,
     }
+    assert report["rebased_paths"] == 1
 
     assert added.name in {
         row["path"] for row in store.bootstrap(workspace_id)["entries"]
@@ -3432,7 +3434,7 @@ async def test_continuous_watcher_mutations_back_off_instead_of_rescanning_forev
     try:
         with pytest.raises(module.WorkspaceScanIncomplete):
             await manager._reconcile_and_broadcast(state)
-        assert scans == 3
+        assert scans == 1
         assert not state.scan_progress
         assert state.initialized and state.reconcile_retry_at > module.monotonic()
         assert state.reconcile_failures == 1

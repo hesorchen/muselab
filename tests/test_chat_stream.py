@@ -10,7 +10,6 @@ No real network, no real CLI subprocess, no Anthropic API.
 """
 import asyncio
 import base64
-import collections
 import inspect
 import json
 import threading
@@ -3514,7 +3513,7 @@ def test_continuation_footer_is_durable_before_terminal_publish(stream_env):
     """Offload the exact-UUID sidecar write without reopening the reload race."""
     import inspect
 
-    source = inspect.getsource(stream_env._watch_inflight_tasks)
+    source = inspect.getsource(stream_env._watch_inflight_tasks_owned)
     close_at = source.index("async def _close_continuation")
     annotate_at = source.index("sess.set_message_annotation,", close_at)
     done_at = source.index(
@@ -4126,34 +4125,35 @@ def test_pooled_stream_attaches_before_query_and_parks_leftovers(stream_env):
     assert pooled.index("turn_q = stream.attach_turn()") < pooled.index(
         "await _send_query()"
     )
-    assert "stream.park_unconsumed(turn_q)" in pooled
+    assert "await stream.release_turn(turn_q, background_messages)" in pooled
 
 
-def test_turn_does_not_consume_buffered_continuation(stream_env):
-    """The invariant the old _TurnBusy gate was really protecting.
+def test_turn_does_not_consume_detached_continuation(stream_env, monkeypatch):
+    """An idle delivery belongs to the original session, never the next query."""
+    chat = stream_env
+    delivered = []
 
-    A background task's auto-continuation can land while no consumer is
-    attached; the pump parks it. A turn that attaches afterwards must not
-    inherit it — otherwise the follow-up renders the previous task's reply as
-    the answer to the new prompt. It belongs to the watcher.
-    """
-    chat_mod = stream_env
+    async def consume(key, message):
+        delivered.append((key[0], message))
+
+    monkeypatch.setattr(chat, "_consume_sdk_idle_message", consume)
+
+    class IdleClient:
+        async def receive_messages(self):
+            await asyncio.Event().wait()
+            yield
 
     async def exercise():
-        stream = chat_mod._SessionStream.__new__(chat_mod._SessionStream)
-        # Build the routing state directly; a real pump needs a live CLI.
-        stream.key = ("buffered-continuation", "model", "auto", "")
-        stream._turn = None
-        stream._background = None
-        stream._orphans = collections.deque(maxlen=8)
-        stream._closed = False
-        stream._orphans.append("continuation-of-previous-task")
-
-        turn_q = stream.attach_turn()
-        assert turn_q.empty(), "a new turn must not inherit parked messages"
-
-        bg_q = stream.attach_background()
-        assert bg_q.get_nowait() == "continuation-of-previous-task"
+        stream = chat._SessionStream(("fixture-session", "model", "auto", ""), IdleClient())
+        try:
+            previous = stream.attach_turn()
+            previous.put_nowait("previous continuation")
+            await stream.release_turn(previous)
+            current = stream.attach_turn()
+            assert current.empty()
+            assert delivered == [("fixture-session", "previous continuation")]
+        finally:
+            await stream.aclose()
 
     asyncio.run(exercise())
 
@@ -5987,7 +5987,7 @@ def test_failed_session_stream_evicts_dead_cached_client(stream_env):
     asyncio.run(go())
 
 
-def test_park_unconsumed_hands_leftovers_back_to_the_orphan_park(stream_env):
+def test_release_turn_delivers_leftovers_before_discarding_queue(stream_env, monkeypatch):
     """Stopping at our own Result must not swallow what the pump queued after it.
 
     A slash command breaks on its ResultMessage, but the pump routes
@@ -6005,20 +6005,23 @@ def test_park_unconsumed_hands_leftovers_back_to_the_orphan_park(stream_env):
             await asyncio.Event().wait()
             yield  # pragma: no cover — never reached
 
+    delivered = []
+    async def consume(_key, message):
+        delivered.append(message)
+    monkeypatch.setattr(chat_mod, "_consume_sdk_idle_message", consume)
+
     async def go():
         stream = chat_mod._SessionStream(("sid", "m", "auto", ""), IdleClient())
         try:
             q = stream.attach_turn()
             q.put_nowait(later)
             q.put_nowait(chat_mod._STREAM_EOF)
-            stream.detach_turn(q)
-            stream.park_unconsumed(q)
+            await stream.release_turn(q)
         finally:
             await stream.aclose()
-        return list(stream._orphans)
 
-    # EOF is a wake-up sentinel, not a message — it must not be re-parked.
-    assert asyncio.run(go()) == [later]
+    asyncio.run(go())
+    assert delivered == [later]  # EOF must not reach the idle consumer.
 
 
 def test_preflight_compact_trusts_the_token_count_over_the_verdict(
@@ -7255,7 +7258,7 @@ def test_sdk_scheduled_trigger_is_broadcast_live_without_refresh(
     monkeypatch.setattr(chat_mod, "_start_activity_early", no_activity)
     monkeypatch.setattr(chat_mod, "_finish_activity", no_activity)
     monkeypatch.setattr(
-        chat_mod, "_refresh_scheduled_session_summary", no_refresh)
+        chat_mod, "_refresh_sdk_session_summary", no_refresh)
 
     async def run():
         assert await chat_mod._observe_sdk_stream_message(
@@ -7270,7 +7273,7 @@ def test_sdk_scheduled_trigger_is_broadcast_live_without_refresh(
             ),
         ) is True
         await asyncio.sleep(0)
-        delivery = chat_mod._sdk_scheduled_deliveries[key]
+        delivery = chat_mod._sdk_deliveries[key]
         broadcast = delivery.broadcast
         assert chat_mod._active_turns[sid] is broadcast
         assert broadcast.activity_source == "scheduled"
@@ -7316,7 +7319,7 @@ def test_sdk_scheduled_trigger_is_broadcast_live_without_refresh(
     broadcast = asyncio.run(run())
     try:
         assert sid not in chat_mod._active_turns
-        assert key not in chat_mod._sdk_scheduled_deliveries
+        assert key not in chat_mod._sdk_deliveries
         events = list(broadcast.replay_events())
         assert [event["event"] for event in events] == [
             "startup", "text", "done",
@@ -7360,7 +7363,7 @@ def test_originless_sdk_scheduled_trigger_uses_known_prompt_fingerprint(
     monkeypatch.setattr(chat_mod, "_start_activity_early", no_activity)
     monkeypatch.setattr(chat_mod, "_finish_activity", no_activity)
     monkeypatch.setattr(
-        chat_mod, "_refresh_scheduled_session_summary", no_refresh)
+        chat_mod, "_refresh_sdk_session_summary", no_refresh)
     monkeypatch.setattr(
         chat_mod.sess, "set_message_annotation", lambda *_a, **_k: None)
 
@@ -7374,7 +7377,7 @@ def test_originless_sdk_scheduled_trigger_uses_known_prompt_fingerprint(
             ),
         )
         await asyncio.sleep(0)
-        delivery = chat_mod._sdk_scheduled_deliveries[key]
+        delivery = chat_mod._sdk_deliveries[key]
         assert accepted is True
         assert delivery.job_id == "job-originless"
         assert delivery.broadcast.user_text == prompt
@@ -7412,7 +7415,7 @@ def test_originless_sdk_scheduled_trigger_uses_known_prompt_fingerprint(
         ]
     finally:
         chat_mod._sdk_cron_jobs.pop(sid, None)
-        chat_mod._sdk_scheduled_deliveries.pop(key, None)
+        chat_mod._sdk_deliveries.pop(key, None)
         chat_mod._active_turns.pop(sid, None)
         recent = chat_mod._recent_turns.pop(sid, None)
         handle = chat_mod._recent_turn_expiry_handles.pop(sid, None)
@@ -7443,7 +7446,7 @@ def test_originless_cron_prompt_does_not_capture_foreground_user_turn(
             UserMessage(content=prompt, uuid="human-user", origin=None),
         ))
         assert accepted is False
-        assert key not in chat_mod._sdk_scheduled_deliveries
+        assert key not in chat_mod._sdk_deliveries
     finally:
         chat_mod._active_turns.pop(sid, None)
         chat_mod._sdk_cron_jobs.pop(sid, None)

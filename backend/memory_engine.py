@@ -23,6 +23,8 @@ import httpx
 
 from .memory_config import MemoryConfig, database_path, load_config, memory_dir
 from .observability import elapsed_ms, perf_event
+from .shared_calls import SharedCalls
+from .memory_http import MemoryHTTPTransport, provider_transport_scope
 from .memory_prompts import (
     CROSS_EPISODE_PROMPT_VERSION,
     CROSS_EPISODE_SYSTEM,
@@ -232,10 +234,23 @@ class _MemoryStoreActor:
         with self._state_lock:
             self._closed = False
 
-    def _execute(self, operation: Callable[[MemoryStore], _T]) -> _T:
-        return operation(self._resolve_store())
+    def _execute(self, operation: Callable[[MemoryStore], _T], trace=None) -> _T:
+        if trace is None:
+            return operation(self._resolve_store())
+        trace["started"] = time.perf_counter()
+        trace["queue_ms"] += (trace["started"] - trace["submitted"]) * 1000
+        trace["phase"] = "resolve"
+        try:
+            if trace["started"] >= trace["deadline"]:
+                raise TimeoutError("memory read deadline exceeded before execution")
+            store = self._resolve_store()
+            trace["resolved"] = time.perf_counter()
+            trace["phase"] = "query"
+            return operation(store)
+        finally:
+            trace["finished"] = time.perf_counter()
 
-    def _submit(self, operation: Callable[[MemoryStore], _T]):
+    def _submit(self, operation: Callable[[MemoryStore], _T], trace=None):
         with self._state_lock:
             if self._closed:
                 raise RuntimeError("memory store actor is closed")
@@ -245,10 +260,13 @@ class _MemoryStoreActor:
                     thread_name_prefix="muselab-memory-db",
                 )
             executor = self._executor
-            return executor.submit(self._execute, operation)
+            if trace is not None:
+                trace.update(submitted=time.perf_counter(), started=None,
+                             resolved=None, finished=None, phase="queue")
+            return executor.submit(self._execute, operation, trace)
 
-    async def call(self, operation: Callable[[MemoryStore], _T]) -> _T:
-        job = self._submit(operation)
+    async def call(self, operation: Callable[[MemoryStore], _T], *, trace=None) -> _T:
+        job = self._submit(operation, trace)
         # Cancelling the asyncio waiter must not cancel or overtake a SQLite
         # transaction already queued on the actor.
         wrapped = asyncio.wrap_future(job)
@@ -323,6 +341,8 @@ class MemoryEngine:
         self._closing = False
         self._wake = asyncio.Event()
         self._recall_trace: dict[str, dict] = {}
+        self._status_reads = SharedCalls()
+        self._provider_http = MemoryHTTPTransport()
         self._generation_lock = asyncio.Lock()
         self._vector_mutation_lock = asyncio.Lock()
         self._last_idle_sweep = 0.0
@@ -360,23 +380,51 @@ class MemoryEngine:
 
     UI_READ_TIMEOUT_S = 5.0
 
-    async def _read_store_call(self, operation: Callable[[MemoryStore], _T]) -> _T:
-        """Bound UI reads independently of both background writes and recall."""
-        deadline = time.perf_counter() + self.UI_READ_TIMEOUT_S
+    async def _read_store_call(self, operation: Callable[[MemoryStore], _T],
+                               *, operation_name: str = "read") -> _T:
+        """Account for queue + resolution + SQL under one cancellable budget."""
+        started = time.perf_counter()
+        deadline = started + self.UI_READ_TIMEOUT_S
+        cancelled = threading.Event()
+        trace = dict(deadline=deadline, submitted=started, started=None,
+                     resolved=None, finished=None, queue_ms=0.0, phase="queue")
+        status = "ok"
 
         def read(store: MemoryStore) -> _T:
-            with store.read_budget(deadline):
+            with store.read_budget(deadline, cancel_event=cancelled):
                 return operation(store)
 
-        async with asyncio.timeout(self.UI_READ_TIMEOUT_S):
-            try:
-                return await self._ui_store_actor.call(read)
-            except _RegistryNotInitialized:
-                # First use with Memory disabled still needs an empty registry.
-                # Only the writer initializes schema; normal reads never join
-                # it or the shared asyncio thread pool.
-                await self._store_call(lambda store: None)
-                return await self._ui_store_actor.call(read)
+        try:
+            async with asyncio.timeout(self.UI_READ_TIMEOUT_S):
+                try:
+                    return await self._ui_store_actor.call(read, trace=trace)
+                except _RegistryNotInitialized:
+                    trace["phase"] = "initialize"
+                    await self._store_call(lambda store: None)
+                    return await self._ui_store_actor.call(read, trace=trace)
+        except TimeoutError:
+            status = "timeout"
+            raise
+        except asyncio.CancelledError:
+            status = "cancelled"
+            raise
+        except Exception:
+            status = "error"
+            raise
+        finally:
+            cancelled.set()
+            now = time.perf_counter()
+            duration = (now - started) * 1000
+            if duration >= 50 or status != "ok":
+                begin = trace["started"]
+                resolved = trace["resolved"]
+                finish = trace["finished"] or now
+                perf_event("memory.ui_read", operation=operation_name, status=status,
+                    phase=trace["phase"], duration_ms=round(duration, 1),
+                    queue_ms=round(trace["queue_ms"] +
+                        ((now - trace["submitted"]) * 1000 if begin is None else 0), 1),
+                    resolve_ms=round(((resolved or finish) - begin) * 1000, 1) if begin else 0,
+                    sql_ms=round((finish - resolved) * 1000, 1) if resolved else 0)
 
     async def _recall_store_call(
         self, operation: Callable[[MemoryStore], _T], *, deadline: float | None = None,
@@ -437,6 +485,7 @@ class MemoryEngine:
         return self.config().enabled
 
     def start(self) -> None:
+        self._provider_http.reopen()
         self._closing = False
         self._store_actor.reopen()
         self._recall_store_actor.reopen()
@@ -537,6 +586,8 @@ class MemoryEngine:
             self._workers.difference_update(done | pending)
         await self._drain_telemetry(timeout=min(timeout, 5.0))
         if close_store:
+            await self._status_reads.close()
+            await self._provider_http.close()
             await self._store_actor.close()
             await self._recall_store_actor.close()
             await self._ui_store_actor.close()
@@ -667,6 +718,10 @@ class MemoryEngine:
         return episode_id
 
     async def _worker(self) -> None:
+        with provider_transport_scope(self._provider_http):
+            await self._worker_owned()
+
+    async def _worker_owned(self) -> None:
         while not self._closing:
             job = await self._store_call(
                 lambda store: store.claim_job())
@@ -1451,7 +1506,7 @@ class MemoryEngine:
             return []
 
         try:
-            with recall_request_budget(deadline):
+            with recall_request_budget(deadline), provider_transport_scope(self._provider_http):
                 recent = await stage("recent", lambda: self._recall_store_call(
                     lambda store: store.recent_evidence(
                         cfg.owner_id, session_id, role="user", limit=2), deadline=deadline))
@@ -1725,15 +1780,10 @@ class MemoryEngine:
     async def status(self) -> dict:
         cfg = self.config()
 
-        def load_status(store: MemoryStore) -> dict:
-            pending = store.list_artifacts(
-                cfg.owner_id, status="pending_review", limit=100)
-            return {
-                "pending_artifact_ids": [item["id"] for item in pending],
-                **store.stats(cfg.owner_id),
-            }
-
-        registry = await self._read_store_call(load_status)
+        path = self._store.path if self._store_pinned else database_path()
+        registry = await self._status_reads.run((path, cfg.owner_id),
+            lambda: self._read_store_call(
+                lambda store: store.stats(cfg.owner_id), operation_name="status"))
         return {
             "enabled": cfg.enabled, "mode": cfg.mode,
             "worker_running": bool(self._workers),

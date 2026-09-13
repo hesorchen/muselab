@@ -18,6 +18,8 @@ from urllib.parse import urlsplit
 
 import httpx
 
+from .memory_http import provider_http_client
+
 from .memory_config import (
     EmbeddingConfig,
     MemoryConfig,
@@ -79,8 +81,8 @@ class EmbeddingProvider:
             headers["Authorization"] = f"Bearer {self.config.api_key}"
         vectors: list[list[float]] = []
         batch_size = max(1, int(self.config.batch_size))
-        async with httpx.AsyncClient(
-            timeout=httpx.Timeout(_request_timeout(self.config.timeout_seconds))
+        async with provider_http_client(
+            _request_timeout(self.config.timeout_seconds), operation="embedding"
         ) as client:
             for start in range(0, len(texts), batch_size):
                 chunk = texts[start:start + batch_size]
@@ -162,8 +164,8 @@ class QdrantVectorStore(VectorStore):
         return str(uuid.uuid5(self._NAMESPACE, item_id))
 
     async def _request(self, method: str, path: str, **kwargs) -> httpx.Response:
-        async with httpx.AsyncClient(
-            timeout=httpx.Timeout(_request_timeout(self.config.timeout_seconds))
+        async with provider_http_client(
+            _request_timeout(self.config.timeout_seconds), operation="vector"
         ) as client:
             response = await client.request(
                 method, f"{self.base}{path}", headers=self.headers, **kwargs)
@@ -382,8 +384,8 @@ class Reranker:
         headers = {"Content-Type": "application/json"}
         if self.config.api_key:
             headers["Authorization"] = f"Bearer {self.config.api_key}"
-        async with httpx.AsyncClient(
-            timeout=httpx.Timeout(_request_timeout(self.config.timeout_seconds))
+        async with provider_http_client(
+            _request_timeout(self.config.timeout_seconds), operation="rerank"
         ) as client:
             response = await client.post(url, headers=headers, json={
                 "model": self.config.model, "query": query,
@@ -637,7 +639,7 @@ class GenerationProvider:
                 payload = {"model": model, "max_tokens": max_tokens, "temperature": 0,
                            "system": system,
                            "messages": [{"role": "user", "content": prompt}]}
-                async with httpx.AsyncClient(timeout=httpx.Timeout(timeout)) as client:
+                async with provider_http_client(timeout, operation="generation") as client:
                     response = await client.post(
                         url,
                         headers={"x-api-key": key, "anthropic-version": "2023-06-01",
