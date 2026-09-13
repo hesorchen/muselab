@@ -442,6 +442,8 @@ function portal() {
     // window plus a small overscan buffer.
     fileTreeViewport: { start: 0, end: 80 },
     _fileTreeScrollRAF: null,
+    _fileTreeRevealSeq: 0,
+    _pendingFileTreeReveal: null,
     // Measured row height for the virtual scroller. 0 = "remeasure on next
     // read"; see _fileTreeRowHeight / _invalidateFileTreeRowHeight.
     _fileTreeRowHeightCache: 0,
@@ -23959,6 +23961,19 @@ function portal() {
           )) this._fileTreeDirty = !ok;
       return ok;
     },
+    _fileTreeList() {
+      // Menu actions run in a nested Alpine scope whose $refs can differ from
+      // the file pane's. Always resolve the workspace's actual scroll surface.
+      return document.querySelector("#app .filelist");
+    },
+    _initFileTreeViewport(list) {
+      if (typeof ResizeObserver !== "function") return;
+      // Pane visibility and transitions can settle after Alpine's next tick.
+      new ResizeObserver(() => {
+        this._invalidateFileTreeRowHeight();
+        this._scheduleFileTreeViewportSync();
+      }).observe(list);
+    },
     _fileTreeRowHeight() {
       // MEASURED from a live row, not hard-coded. The old constants (40 touch /
       // 22 desktop) were the CSS `min-height`, but padding and line-height push
@@ -23967,7 +23982,7 @@ function portal() {
       // put the spacers 800px out of sync with reality, so scrolling landed on
       // the wrong slice. Fall back to the CSS floor only before first paint.
       if (this._fileTreeRowHeightCache > 0) return this._fileTreeRowHeightCache;
-      const list = this.$refs && this.$refs.fileList;
+      const list = this._fileTreeList();
       const row = list && list.querySelector(
         "li:not(.filelist-virtual-spacer):not(.filelist-status)");
       const measured = row ? row.getBoundingClientRect().height : 0;
@@ -23983,7 +23998,7 @@ function portal() {
     _invalidateFileTreeRowHeight() {
       this._fileTreeRowHeightCache = 0;
     },
-    _syncFileTreeViewport(list = this.$refs && this.$refs.fileList) {
+    _syncFileTreeViewport(list = this._fileTreeList()) {
       if (!list) return;
       const total = this.visible.length;
       const rowHeight = this._fileTreeRowHeight();
@@ -24007,11 +24022,43 @@ function portal() {
     },
     _scheduleFileTreeViewportSync(resetScroll = false) {
       this.$nextTick(() => {
-        const list = this.$refs && this.$refs.fileList;
+        const list = this._fileTreeList();
         if (!list) return;
         if (resetScroll) list.scrollTop = 0;
         this._syncFileTreeViewport(list);
+        this._flushFileTreeReveal();
       });
+    },
+    async _flushFileTreeReveal() {
+      const pending = this._pendingFileTreeReveal;
+      if (!pending) return false;
+      const isCurrent = () => pending.seq === this._fileTreeRevealSeq
+        && this._workspaceIsCurrent(pending.workspace)
+        && this._workspaceGenerationIsCurrent(pending.workspace, pending.generation);
+      if (!isCurrent()) {
+        this._pendingFileTreeReveal = null;
+        return false;
+      }
+      await this.$nextTick();
+      if (!isCurrent() || this._pendingFileTreeReveal !== pending) return false;
+      const list = this._fileTreeList();
+      // A hidden pane cannot retain a meaningful scrollTop. Keep the logical
+      // target until ResizeObserver reports that the pane has become visible.
+      if (!list || list.clientHeight <= 0) return false;
+      this._pendingFileTreeReveal = null;
+      if (!this._positionFileTreePath(pending.path, pending.block)) return false;
+      await this.$nextTick();
+      if (!isCurrent()) return false;
+      const escaped = CSS.escape(pending.path);
+      const row = list.querySelector(`li[role="treeitem"][data-path="${escaped}"]`);
+      if (!row) return false;
+      if (pending.highlight) {
+        row.classList.remove("reveal-pulse");
+        void row.offsetWidth;
+        row.classList.add("reveal-pulse");
+        setTimeout(() => row.classList.remove("reveal-pulse"), 1600);
+      }
+      return true;
     },
     fileTreeWindowRows() {
       const total = this.visible.length;
@@ -24035,7 +24082,7 @@ function portal() {
       return Math.max(0, this.visible.length - end) * this._fileTreeRowHeight();
     },
     _positionFileTreePath(path, block = "nearest") {
-      const list = this.$refs && this.$refs.fileList;
+      const list = this._fileTreeList();
       const idx = this.visible.findIndex(node => node.path === path);
       if (!list || idx < 0) return false;
       const rowHeight = this._fileTreeRowHeight();
@@ -24760,7 +24807,8 @@ function portal() {
         && this._workspaceGenerationIsCurrent(
           ownerWorkspace, workspaceGeneration,
         )
-        && (opts.treeSeq == null || opts.treeSeq === this._treeLoadSeq);
+        && (opts.treeSeq == null || opts.treeSeq === this._treeLoadSeq)
+        && (!opts.isCurrent || opts.isCurrent());
       let children;
       try {
         children = await this.fetchChildren(n.path, {
@@ -27519,7 +27567,10 @@ function portal() {
           : (!this.previewOpen || !!this.desktopFullPane)
       );
       if (path === this.selected && this.previewSurface === "file"
-          && !revealNeeded) return true;
+          && !revealNeeded) {
+        await this.revealInTree(path, { mode: "background", reveal: opts.reveal === true });
+        return true;
+      }
       // A terminal overlays the last selected file without clearing
       // `selected`. Clicking that same (usually rightmost) file tab must still
       // route through openFile so the preview surface leaves terminal mode.
@@ -27534,78 +27585,60 @@ function portal() {
         { preview: !!(cur && cur.preview), reveal: opts.reveal === true },
       );
       if (!opened) return false;
-      // Pass mode:"background" so we expand/scroll the tree quietly —
-      // the user clicked a preview tab, they want to STAY in preview
-      // (especially on mobile, where revealInTree's default mode would
-      // bounce them to the files pane). The pulse animation also
-      // doesn't fire here because there's no "I'm looking for this
-      // file in the tree" user intent — they were already on it.
-      await this.revealInTree(path, { mode: "background" });
+      // Keep the mobile preview in place while locating its row. The logical
+      // target is applied when the Files pane next has a visible viewport.
+      await this.revealInTree(path, { mode: "background", reveal: opts.reveal === true });
       return true;
     },
     async revealInTree(path, opts = {}) {
-      // Make the file's row visible in the tree pane and flash it so the
-      // user can see the locate operation actually happened.
-      //
-      // Two modes:
-      //   - "interactive" (default): user explicitly asked to locate
-      //     this file (context menu "在文件树定位"). Switch mobileTab to
-      //     "files" so they see the result, clear searchMode (the tree
-      //     is hidden under x-show otherwise), and pulse the row.
-      //   - "background": caller wants the side-effect of expanding
-      //     ancestors + scrolling, but the user is currently doing
-      //     something else (e.g. switching preview tabs). Do NOT
-      //     hijack mobileTab, do NOT clear search, do NOT pulse —
-      //     just quietly position the row so it's already correct
-      //     when the user later switches to the files pane.
-      //
-      // Failure modes the interactive mode guards against:
-      //   1. Mobile — user is on mobileTab="preview", so even after the
-      //      tree expands they see no change. Switch to "files" first.
-      //   2. searchMode — filelist-wrap has x-show="!searchMode", so the
-      //      <li> exists in DOM but is hidden inside a display:none parent.
-      //      Clear searchMode so the tree is actually visible.
-      //   3. Already in viewport — block:"nearest" + smooth scroll does
-      //      nothing visibly. Use block:"center" + a temporary CSS pulse
-      //      class so the user always sees feedback.
-      //   4. Non-active tab — when the user right-clicks a non-current
-      //      preview tab, `selected !== path`, so the row has no `sel`
-      //      class. The pulse class handles that too.
-      const ownerWorkspace = opts.ownerWorkspace || this.fileWorkspacePath();
-      const isOwner = () => this._workspaceIsCurrent(ownerWorkspace);
-      if (!path || !isOwner()) return;
+      const workspace = opts.ownerWorkspace || this.fileWorkspacePath();
+      const generation = this._workspaceGeneration(workspace);
+      if (!path || !this._workspaceIsCurrent(workspace)) return false;
+      const seq = ++this._fileTreeRevealSeq;
+      this._pendingFileTreeReveal = null;
+      const isCurrent = () => seq === this._fileTreeRevealSeq
+        && this._workspaceIsCurrent(workspace)
+        && this._workspaceGenerationIsCurrent(workspace, generation);
       const interactive = opts.mode !== "background";
-      if (interactive) {
+      const showTree = interactive || opts.reveal === true;
+      if (showTree) {
         if (this.searchMode) this.clearSearch();
-        if (this._isMobileLayout()) this.setMobileTab("files");
+        if (this._isMobileLayout()) {
+          if (interactive) this.setMobileTab("files");
+        } else {
+          this.leftOpen = true;
+          this.desktopFullPane = "";
+        }
       }
-      const parts = path.split("/");
-      parts.pop();   // drop the filename, keep only directory chain
-      const dirPath = parts.join("/");
-      if (dirPath) await this.expandPath(dirPath);
-      if (!isOwner()) return;
-      // With a virtualized tree the target row may intentionally not exist in
-      // DOM yet. Position the logical row first; updating the viewport window
-      // mounts it on the following tick.
-      this.$nextTick(() => this.$nextTick(() => {
-        if (!isOwner()) return;
-        this._positionFileTreePath(path, interactive ? "center" : "nearest");
-        this.$nextTick(() => {
-          if (!isOwner()) return;
-          const sel = (window.CSS && CSS.escape) ? CSS.escape(path) : path;
-          const el = document.querySelector(`.filelist li[data-path="${sel}"]`);
-          if (!el) return;
-          if (!interactive && !opts.highlight) return;
-          // Pulse highlight — independent of `sel` class so it fires even
-          // when this isn't the active tab. Restart by removing+adding so
-          // rapid re-reveals still trigger the animation.
-          el.classList.remove("reveal-pulse");
-          // Force reflow so the next add restarts the animation.
-          void el.offsetWidth;
-          el.classList.add("reveal-pulse");
-          setTimeout(() => el.classList.remove("reveal-pulse"), 1600);
-        });
-      }));
+      // A file opened through a link/tab may live under the hidden-file
+      // filter. Reveal its real ancestors before looking up virtual rows.
+      if (!this.showHidden && path.split("/").some(part => part.startsWith("."))) {
+        await this.toggleHidden();
+        if (!isCurrent()) return false;
+      }
+      const dirPath = path.split("/").slice(0, -1).join("/");
+      if (dirPath) {
+        await this.expandPath(dirPath, { ownerWorkspace: workspace, isCurrent });
+        if (!isCurrent()) return false;
+      }
+      if (!await this._ensureFileTreeNode(path, workspace, generation, isCurrent)) return false;
+      if (!isCurrent()) return false;
+      if (showTree) {
+        this.clearTreeSelection();
+        this.treeFocusPath = path;
+        this._selAnchor = path;
+      }
+      this._pendingFileTreeReveal = {
+        path, seq, workspace, generation,
+        block: showTree ? "center" : "nearest",
+        highlight: showTree || !!opts.highlight,
+      };
+      // Wait for both the pane layout and expanded virtual spacers to mount.
+      // Callers can await completion; stale requests cannot scroll a newer tab.
+      await this.$nextTick();
+      if (!isCurrent()) return false;
+      await this._flushFileTreeReveal();
+      return true;
     },
     closeTab(path) {
       const idx = this.tabs.findIndex(t => t.path === path);
@@ -29950,14 +29983,45 @@ function portal() {
       if (n.is_dir) { this.clearSearch(); await this.expandPath(n.path); }
       else { await this.openFile(n, { reveal: true }); }
     },
-    async expandPath(path) {
+    async _ensureFileTreeNode(path, workspace, generation, isCurrent) {
+      const existing = this.visible.find(node => node.path === path);
+      if (existing) return existing;
+      // An indexed snapshot may lag a new file, and bounded directory
+      // listings can omit it. Resolve just the requested path from disk.
+      const headers = this.hdr();
+      if (workspace) headers["X-Muselab-Workspace"] = encodeURIComponent(workspace);
+      let node;
+      try {
+        const response = await fetch("/api/files/stat?path=" + encodeURIComponent(path), { headers });
+        if (!response.ok) return null;
+        node = await response.json();
+      } catch (_) { return null; }
+      if (!isCurrent() || !this._workspaceGenerationIsCurrent(workspace, generation)
+          || !node || node.path !== path) return null;
+      this._applyFileTreeDelta([{ ...node, type: "added" }]);
+      return this.visible.find(row => row.path === path) || null;
+    },
+    async expandPath(path, opts = {}) {
+      const workspace = opts.ownerWorkspace || this.fileWorkspacePath();
+      const generation = this._workspaceGeneration(workspace);
+      const isCurrent = () => this._workspaceIsCurrent(workspace)
+        && this._workspaceGenerationIsCurrent(workspace, generation)
+        && (!opts.isCurrent || opts.isCurrent());
       const parts = path.split("/");
       let acc = "";
       for (let i = 0; i < parts.length; i++) {
+        if (!isCurrent()) return false;
         acc = acc ? acc + "/" + parts[i] : parts[i];
-        const node = this.visible.find(x => x.path === acc);
-        if (node && node.is_dir && !this.expanded.has(acc)) await this.expand(node);
+        const node = await this._ensureFileTreeNode(acc, workspace, generation, isCurrent);
+        if (!isCurrent() || !node || !node.is_dir) return false;
+        if (!this.expanded.has(acc)) {
+          await this.expand(node, {
+            ownerWorkspace: workspace, workspaceGeneration: generation, isCurrent,
+          });
+          if (!isCurrent() || !this.expanded.has(acc)) return false;
+        }
       }
+      return true;
     },
 
     // ===== upload / drag-drop / mkdir =====

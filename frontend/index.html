@@ -543,7 +543,7 @@
       <ul class="filelist" x-ref="fileList"
           role="tree"
           :aria-label="lang==='zh' ? '工作区文件树' : 'Workspace file tree'"
-          x-init="_attachPTR($el, () => reloadTree()); $nextTick(() => _syncFileTreeViewport($el))"
+          x-init="_attachPTR($el, () => reloadTree()); _initFileTreeViewport($el); $nextTick(() => _syncFileTreeViewport($el))"
           @scroll.passive="onFileTreeScroll($event)"
           @mousedown="onMarqueeStart($event)">
         <li class="filelist-virtual-spacer" aria-hidden="true"

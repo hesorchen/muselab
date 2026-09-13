@@ -54,6 +54,19 @@ context results; global search locates content across files and conversations.
 File and terminal tabs share the preview tab bar. A terminal process keeps
 running when the user switches to a file preview.
 
+Clicking a file tab, including the active tab, expands its tree ancestors and
+scrolls the selected row into view. The context-menu reveal action also opens
+the Files pane and leaves search/focus mode. On mobile, a tab click keeps the
+preview visible and applies the pending scroll when Files becomes visible.
+
+Tree reveal owns a workspace generation and request sequence, so a late fetch
+cannot override a newer target. Resolve the actual scroll container across
+Alpine menu scopes, then position the logical virtual row before highlighting
+the mounted row. Resize observation resumes hidden-pane reveals. Missing rows
+use path metadata to handle indexing delay and capped directory listings without
+refreshing the entire workspace. Browser tests assert that the selected row is
+inside the scroll viewport, not merely present in the DOM.
+
 ## 4. Message rendering
 
 The assistant Markdown pipeline is:
