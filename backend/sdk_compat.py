@@ -16,8 +16,8 @@ result messages.
 MuseLab only uses :class:`UnsignedThinkingCompatibleClient` for third-party
 providers.  It supplies an empty in-memory signature for parsing, without
 mutating the raw SDK frame or pretending that the vendor produced a valid
-cryptographic signature.  ``backend.jsonl_cleanup`` removes the unverifiable
-block from the persisted transcript after the turn completes.
+cryptographic signature. The CLI-owned transcript remains unchanged; a
+protocol Result does not release the CLI's file writer.
 """
 
 from __future__ import annotations
@@ -130,9 +130,8 @@ def normalize_missing_thinking_signatures(
     """Return a parser-safe copy of one SDK frame and the number of fixes.
 
     Only assistant thinking blocks where the ``signature`` key is absent are
-    changed.  Existing empty, short, or valid signatures are preserved for the
-    transcript cleanup policy to classify later.  Frames that need no change
-    are returned by identity.
+    changed. Existing empty, short, or valid signatures are preserved as
+    received. Frames that need no change are returned by identity.
     """
     if data.get("type") != "assistant":
         return data, 0

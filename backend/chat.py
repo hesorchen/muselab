@@ -3987,8 +3987,8 @@ async def _build_and_connect_client(
     # Third-party Anthropic-compatible endpoints may emit a `thinking` block
     # without the signature key that the SDK parser requires.  Use the narrow
     # compatibility client only for vendor routes; native Claude stays on the
-    # SDK's strict parser.  The existing post-turn JSONL cleanup removes the
-    # empty parser sentinel before a future resume.
+    # SDK's strict parser. Normalization only changes the in-memory frame;
+    # the CLI owns its persisted transcript, including unsigned thinking.
     client_cls = (
         UnsignedThinkingCompatibleClient
         if endpoints.is_third_party(model)
@@ -18863,47 +18863,10 @@ async def _start_turn(
                 # attempt as a second line of defence.
                 _notify_turn_done(
                     session_id, session_name=str(s.get("name") or ""))
-            # Strip unverifiable thinking-block signatures so this session
-            # stays resumable via `claude --resume` (and the official
-            # Anthropic API). Third-party vendors (DeepSeek / GLM /
-            # MiniMax / Kimi / Qwen / Baidu / Xiaomi MiMo) don't sign
-            # their thinking output; Anthropic's resume API would 400 on
-            # any of those blocks. We clean opportunistically every turn
-            # — idempotent on already-clean files, so the cost is just
-            # one stat + a parse of the small jsonl. See
-            # backend/jsonl_cleanup.py for the full rationale + the
-            # scripts/fix-thinking-signatures.py CLI for retroactive
-            # cleanup of pre-existing sessions.
-            # Only third-party vendors emit unsigned thinking blocks; pure
-            # Claude-native turns always carry valid signatures, so the
-            # cleanup would be a no-op — skip it. (A session that mixed
-            # vendors gets cleaned on each vendor turn, so the Claude turns
-            # never need to.) When we do clean, offload the synchronous
-            # stat+parse to a thread so it can't block the event loop.
-            # TOCTOU NOTE (audit O/401): we run this in the ResultMessage
-            # handler, i.e. once the turn is logically complete, but the SDK's
-            # CLI subprocess owns the JSONL and may still be flushing the final
-            # assistant record when we read+atomic-rewrite it. Two outcomes are
-            # possible if we lose that race: (a) we rewrite a copy that is
-            # missing the still-unflushed last line — but that line carries the
-            # very thinking block we want to strip, so the next turn's cleanup
-            # (or the scripts/fix-thinking-signatures.py CLI) catches it,
-            # because clean_jsonl is idempotent; (b) the CLI appends to the old
-            # inode after our os.replace — POSIX keeps that write going to the
-            # now-unlinked file and it's lost, but the CLI only appends BEFORE
-            # ResultMessage, so by the time we're here that window is closed.
-            # Net: worst case is a deferred strip, never data loss, so we don't
-            # add flush-confirmation/locking (we can't coordinate with the SDK's
-            # writer anyway). See clean_jsonl's atomic-write rationale.
-            if endpoints.is_third_party(model_to_use):
-                try:
-                    from . import jsonl_cleanup as _jc
-                    await asyncio.to_thread(_jc.clean_session, session_id)
-                except Exception as e:
-                    obs.diagnostic_line(
-                        f"[chat] jsonl cleanup failed "
-                        f"sid={session_id[:8]} "
-                        f"exc={type(e).__name__}\n")
+            # Result releases this turn's receive lane, not the CLI's transcript
+            # writer. Never rewrite that SDK-owned JSONL here: a concurrent
+            # append can be overwritten or land on an unlinked old inode.
+            # Presentation annotations belong in MuseLab sidecars instead.
             # Memory write is deferred until turn status is known. Clean
             # exchanges may be consolidated into memories. Cancelled turns are
             # evidence-only (never fact candidates), which preserves the useful

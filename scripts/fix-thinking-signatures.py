@@ -3,15 +3,14 @@
 
     API Error: 400 messages.N.content.0: Invalid `signature` in `thinking` block
 
-Backstory: any chat session created against a third-party
-Anthropic-compat vendor (DeepSeek / GLM / MiniMax / Kimi / Qwen /
-Baidu Qianfan / Xiaomi MiMo, etc.) ends up with thinking blocks whose
-`signature` field is missing or empty. Anthropic's real API verifies
-those signatures on resume and rejects the request. This script walks
-your local Claude Code session store (default: ~/.claude/projects/)
-and rewrites those bad thinking blocks so resume works.
+Some third-party providers persist thinking blocks without verifiable signatures.
+If a destination provider rejects those blocks on resume, this script can remove
+suspect thinking from an offline session store (default: ~/.claude/projects/).
+It does not verify signatures or guarantee cross-provider resume compatibility.
 
-Default behaviour: dry-run. Pass --apply to actually rewrite files.
+Default behaviour: dry-run. Pass --apply to actually rewrite files, only after
+stopping all writers and preserving a backup. This removes visible reasoning;
+signature length is only a heuristic, not proof of provider compatibility.
 
 Usage:
 
@@ -22,9 +21,9 @@ Usage:
     # Claude uses, e.g. -home-user-claude-space-projects-muselab)
     python scripts/fix-thinking-signatures.py --project muselab
 
-    # Actually rewrite (atomic write, no backup needed — original
-    # contents are deterministically reproducible by re-adding the
-    # dropped thinking blocks if you ever want them back)
+    # Stop every CLI/MuseLab process using this store and back it up first.
+    # Then apply the offline migration; removed thinking cannot be recovered
+    # from the modified file, and atomic replacement is unsafe with writers.
     python scripts/fix-thinking-signatures.py --apply
 
 The script is idempotent: running it again on already-clean files
@@ -66,7 +65,7 @@ def main() -> int:
     p.add_argument("--project", default="",
                     help="Only scan project dirs whose name contains this substring")
     p.add_argument("--apply", action="store_true",
-                    help="Actually rewrite files (default is dry-run preview)")
+                    help="Rewrite offline files after stopping writers and backing up (default: preview)")
     p.add_argument("-v", "--verbose", action="store_true",
                     help="Print every file scanned, including clean ones")
     args = p.parse_args()

@@ -43,6 +43,29 @@ Focused regressions are in `test_history_snapshot_integrity.py`,
 temporary `MUSELAB_ROOT` and a synthetic authentication token for local tests.
 
 
+## SDK transcript ownership
+
+The CLI owns canonical transcript writes for its entire process lifetime. A
+ResultMessage releases a turn's receive lane; it does not close the transcript
+writer or prove that all file appends have finished. Turn completion must not
+rewrite, replace, or sanitize the canonical JSONL. An atomic replacement can
+leave a retained SDK descriptor pointing at an unlinked inode, losing later
+assistant output even when it was already delivered over SSE. A subsequent
+turn's parent UUID can then point at a missing final record.
+
+Keep provider parser compatibility in memory and MuseLab presentation metadata
+in sidecars. Unsigned thinking stays in canonical history. The legacy
+`fix-thinking-signatures.py` utility is an explicit offline migration only:
+stop every writer, preserve a backup, and inspect its heuristic removals first.
+Automatic cross-provider transcript sanitization is not part of turn completion.
+
+`test_transcript_writer_ownership.py` holds the SDK append descriptor across
+Result, flushes the final answer late, optionally appends a follow-up turn, then
+checks the real history endpoint. Both answers and original thinking must remain
+visible in order without replacing the SDK's file. Browser coverage in
+`test_live_subagent_updates.py` reloads the page after subagent continuations and
+checks that the earlier parent final and the continuation suffix still render.
+
 ## SDK output ownership
 
 Every pooled client has exactly one SDK reader. A foreground command/turn or a

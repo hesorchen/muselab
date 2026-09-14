@@ -111,4 +111,13 @@ def test_real_mux_subagent_burst_keeps_current_transcript_live(
     for i in range(3):
         expect(page.locator(".msg-pane:visible")).to_contain_text(f"LIVE_CONTINUATION_{i}")
     assert _app_eval(page, "return app.currentId;") == sid
+    # A cold page has no live transcript to fall back to. Earlier final output
+    # must still render after later continuations have extended canonical history.
+    page.reload()
+    expect(page.locator(".msg-pane:visible")).to_contain_text(
+        "LIVE_PARENT_AFTER_AGENTS", timeout=10000,
+    )
+    for i in range(3):
+        expect(page.locator(".msg-pane:visible")).to_contain_text(f"LIVE_CONTINUATION_{i}")
+    assert _app_eval(page, "return app.currentId;") == sid
     _assert_no_browser_errors(page, errors)

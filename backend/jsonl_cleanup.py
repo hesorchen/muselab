@@ -1,36 +1,16 @@
-"""Strip thinking blocks with invalid signatures from Claude Code
-session JSONLs, so the session can be resumed via the official Claude
-API (or `claude --resume`).
+"""Offline migration utility for transcripts with unsigned thinking blocks.
 
-Why this exists:
+Some providers omit signatures or emit placeholders that another provider may
+reject on resume. This utility removes suspect blocks using a length heuristic;
+it does not verify signatures and cannot guarantee cross-provider compatibility.
+Removed thinking is user-visible history and cannot be reconstructed from the
+remaining transcript. Preserve a backup before applying this migration.
 
-  When muselab routes a chat through a third-party Anthropic-compat
-  endpoint (DeepSeek / GLM / MiniMax / Kimi / Qwen / Baidu / Xiaomi
-  MiMo, etc.), those vendors' responses include `thinking` content
-  blocks but the `signature` field is either missing, empty, or a
-  short non-cryptographic placeholder. Anthropic's real API verifies
-  the signature on every assistant message it ingests during resume,
-  and 400s with `Invalid signature in thinking block`. End result:
-  any session created against a third-party vendor cannot be resumed
-  with `claude --resume` once the model is later switched to Claude.
-
-  The fix is to drop the bad thinking blocks from the JSONL. We keep
-  the surrounding text blocks (the actual visible answer) untouched —
-  thinking blocks are model-internal scratchpad that the user has
-  never seen and that future turns don't depend on. If a message
-  ends up with zero content blocks (rare: vendor returned only
-  thinking + no text), we insert a one-line placeholder so the
-  message stays structurally valid (Anthropic rejects empty content
-  arrays).
-
-Public API:
-
-  clean_jsonl(path)            — clean a single .jsonl file in place,
-                                 atomic write, returns CleanupReport
-  clean_all_under(root)        — recursive sweep, returns
-                                 list[CleanupReport]
-  is_invalid_thinking(block)   — True if a content block looks like
-                                 the unverifiable kind
+Only operate on a private copy or a transcript whose CLI writers have all stopped.
+Atomic replacement protects readers from partial files, but does not coordinate
+with appenders: late SDK writes can target the old, unlinked inode and be lost.
+A ResultMessage or an idle pooled client does not establish exclusive file access.
+MuseLab's live turn lifecycle must never call this utility.
 """
 
 from __future__ import annotations
@@ -42,21 +22,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-# A thinking block written by Claude itself carries a long base64 ed25519
-# signature (typically ~88 chars). Third-party vendors either omit the
-# field entirely, ship an empty string, or use a placeholder shorter
-# than ~40 chars. We treat anything under MIN_SIG_LEN as suspect.
-#
-# FRAGILITY NOTE (known, documented — see audit D/232): this is a pure
-# LENGTH heuristic, not signature verification. It assumes Claude's real
-# signatures stay comfortably above 40 chars. If Anthropic ever ships a
-# shorter (but still valid) signature format, those legitimate Claude
-# thinking blocks would be misclassified as invalid and DROPPED here —
-# silently losing real reasoning content. We accept this because (a) we
-# can't verify the ed25519 signature ourselves without Anthropic's public
-# key, and (b) the cost of a missed strip (resume 400s) is recoverable,
-# while the current ~88 vs <40 gap is wide. If signatures shrink, revisit
-# this threshold (or switch to a vendor allowlist) before it bites.
+# Legacy length heuristic, not cryptographic signature validation. Even a
+# legitimate signature could be classified as suspect; use only for an explicit,
+# backed-up offline migration after inspecting the dry-run report.
 MIN_SIG_LEN = 40
 
 # Placeholder content block we insert when stripping all content from a
@@ -89,8 +57,7 @@ class CleanupReport:
 
 
 def is_invalid_thinking(block: object) -> bool:
-    """True if `block` is a thinking content-block whose signature
-    Anthropic's resume API would reject (missing / empty / too short)."""
+    """True if a thinking signature is missing, empty, or below the heuristic."""
     if not isinstance(block, dict):
         return False
     if block.get("type") != "thinking":
@@ -125,8 +92,11 @@ def _clean_message_obj(msg: dict) -> tuple[bool, int]:
 
 
 def clean_jsonl(path: Path) -> CleanupReport:
-    """In-place clean of a single .jsonl. Atomic write (tmp + rename).
-    Idempotent: running again on a clean file is a no-op (no rewrite)."""
+    """Rewrite one offline .jsonl; the caller must stop all writers first.
+
+    Uses atomic replacement and does nothing when no blocks need removal.
+    This operation deletes history; retain a backup of the original file.
+    """
     report = CleanupReport(path=path)
     try:
         # newline="" disables universal-newline translation so we can SEE the
@@ -209,7 +179,7 @@ def clean_session(
     session_id: str,
     claude_projects_root: Path | None = None,
 ) -> CleanupReport | None:
-    """Clean exactly one session by id across native and vendor stores.
+    """Clean one offline session by id across native and vendor stores.
 
     An explicit ``claude_projects_root`` preserves the original single-root
     behavior for callers/tests. By default we search both Claude's normal

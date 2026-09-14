@@ -87,9 +87,6 @@ def stream_env(app_module, monkeypatch):
         lambda *_args, **_kwargs: (
             "fixture-canonical-assistant", "fixture-canonical-user", True),
     )
-    # Skip jsonl signature cleanup (would scan disk).
-    from backend import jsonl_cleanup
-    monkeypatch.setattr(jsonl_cleanup, "clean_session", lambda sid: None)
     # Pretend a device is active so the turn-done push fan-out is skipped.
     from backend import presence
     monkeypatch.setattr(presence, "recently_active", lambda: True)
