@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 
 import uvicorn
 from fastapi import Depends
+from claude_agent_sdk import SystemMessage
 
 from backend import chat
 from backend.auth import require_token
@@ -55,6 +56,23 @@ async def begin(payload: dict):
     chat._announce_mux_turn(broadcast)
     broadcast.publish({"event": "text", "data": json.dumps({"text": "LIVE_PARENT_START"})})
     return {"turn_id": broadcast.turn_id}
+
+
+@app.post("/fixture/native-compact", dependencies=[Depends(require_token)])
+async def native_compact(payload: dict):
+    broadcast = chat._active_turns[payload["sid"]]
+    phase = payload["phase"]
+    message = (
+        SystemMessage(subtype="compact_boundary", data={})
+        if phase == "boundary" else
+        SystemMessage(subtype="status", data={
+            "status": "compacting" if phase == "start" else None,
+        })
+    )
+    event = broadcast.native_compaction_progress(message)
+    if event is not None:
+        broadcast.publish(event)
+    return {"started_at_ms": broadcast.native_compact_started_at_ms}
 
 
 @app.post("/fixture/burst", dependencies=[Depends(require_token)])

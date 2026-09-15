@@ -14,7 +14,7 @@ from __future__ import annotations
 import math
 from typing import Any, Literal, TypedDict
 
-from claude_agent_sdk import ResultError
+from claude_agent_sdk import ResultError, SystemMessage
 
 
 TurnStatus = Literal["completed", "failed", "cancelled", "stopped"]
@@ -134,6 +134,24 @@ def normalize_origin(value: Any) -> NormalizedOrigin | None:
             value.get("senderTaskId"), max_length=_MAX_ORIGIN_TASK_ID_LENGTH),
         "source": "sdk",
     }
+
+
+def native_compaction_phase(message: Any) -> Literal["start", "end"] | None:
+    """Project only native compaction lifecycle signals, never SDK payloads."""
+    if not isinstance(message, SystemMessage):
+        return None
+    if message.subtype == "compact_boundary":
+        return "end"
+    data = message.data
+    if message.subtype != "status" or not isinstance(data, dict):
+        return None
+    if data.get("status") == "compacting":
+        return "start"
+    # A status row can carry unrelated metadata. Only an explicit null ends
+    # compaction; a missing field must leave the animation running.
+    if "status" in data and data["status"] is None:
+        return "end"
+    return None
 
 
 def normalize_terminal_reason(value: Any) -> str:

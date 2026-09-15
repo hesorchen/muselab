@@ -8768,3 +8768,53 @@ async def test_stop_during_recall_never_submits_query(stream_env, client, monkey
     assert cancelled.is_set()
     assert fake.queried == []
     assert sid not in chat_mod.mem0._prepared_recalls
+
+
+@pytest.mark.parametrize("ending", ["status", "boundary", "result"])
+def test_native_compaction_announces_progress_without_preflight(
+        stream_env, client, monkeypatch, ending):
+    """CLI-owned compaction must reach the existing UI before the turn ends."""
+    sid = _make_session(client)
+    messages = [
+        SystemMessage(subtype="status", data={
+            "status": "compacting", "private": "synthetic-private-marker",
+        }),
+        SystemMessage(subtype="status", data={"status": "compacting"}),
+        SystemMessage(subtype="status", data={"permissionMode": "default"}),
+    ]
+    if ending == "status":
+        messages.append(SystemMessage(subtype="status", data={"status": None}))
+    elif ending == "boundary":
+        messages.append(SystemMessage(subtype="compact_boundary", data={
+            "compact_metadata": {"trigger": "auto", "pre_tokens": 180000},
+            "private": "synthetic-private-marker",
+        }))
+    messages.extend([
+        AssistantMessage(content=[TextBlock(text="native compact finished")],
+                         model="claude-sonnet-4-6"),
+        ResultMessage(subtype="success", duration_ms=30, duration_api_ms=20,
+                      is_error=False, num_turns=1, session_id=sid,
+                      total_cost_usd=0.0, usage={}),
+    ])
+    fake = _FakeStreamClient(messages)
+
+    async def fake_get_client(*_args, **_kwargs):
+        return fake
+
+    monkeypatch.setattr(stream_env, "get_client", fake_get_client)
+    response = client.get(
+        f"/api/chat/stream?token={TEST_TOKEN}&session_id={sid}"
+        "&prompt=native-compact-fixture&model=claude-sonnet-4-6")
+    assert response.status_code == 200
+    events = _parse_sse(response.text)
+    progress = [json.loads(data) for event, data in events
+                if event == "compact_progress"]
+    assert [item["phase"] for item in progress] == ["start", "end"]
+    assert progress[0]["source"] == "native"
+    assert progress[0]["started_at_ms"] > 0
+    assert progress[1]["ok"] is True
+    assert "synthetic-private-marker" not in response.text
+    assert fake.queried == ["native-compact-fixture"]
+    kinds = [event for event, _ in events]
+    assert kinds.index("compact_progress") < kinds.index("text")
+    assert max(i for i, kind in enumerate(kinds) if kind == "compact_progress") < kinds.index("done")

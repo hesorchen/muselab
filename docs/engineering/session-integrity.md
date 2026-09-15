@@ -89,6 +89,20 @@ Native control commands share receive ownership and cancellation cleanup. Cancel
 requests interrupt through the SDK and drain to its actual Result before releasing
 the lane. An unconfirmed terminal state retires that exact client before reuse.
 
+## Native compaction visibility
+
+CLI-owned automatic compaction runs inside an ordinary query, independently of
+MuseLab's preflight command. Forward explicit SDK `status: compacting`, cleared
+status, and `compact_boundary` signals into the same per-session
+`compact_progress` lifecycle. Keep only the phase and server start time; raw SDK
+metadata must not enter browser state. Ignore duplicate starts and unrelated
+status rows. A terminal event closes any remaining animation before completion.
+
+Progress belongs in the normal broadcast replay so a reconnect or page reload
+restores both the animation and its elapsed time. Browser acceptance checks the
+visible animated placeholder, session switching, replay, terminal cleanup, and
+subsequent live output, rather than only checking that a listener exists.
+
 ## Bounded I/O lifecycle
 
 Concurrent identical catalog probes and memory status reads share one producer.

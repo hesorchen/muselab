@@ -1059,6 +1059,7 @@ class TurnBroadcast:
         self._compact_chars = 0
         self._compact_last_seq = 0
         self._replay_bytes = 0
+        self.native_compact_started_at_ms = 0
         self.done = False
         # Set True when this turn ended via an explicit user /interrupt (vs.
         # natural completion or error). The server-side queue drain reads it
@@ -1320,6 +1321,29 @@ class TurnBroadcast:
         except Exception:
             pass
 
+    def native_compaction_progress(self, message) -> dict | None:
+        """Bridge the CLI's own auto-compact into the replayable UI lifecycle."""
+        phase = sdk_lifecycle.native_compaction_phase(message)
+        if phase == "start":
+            if self.native_compact_started_at_ms:
+                return None
+            self.native_compact_started_at_ms = int(time.time() * 1000)
+            return {"event": "compact_progress", "data": json.dumps({
+                "phase": "start", "source": "native",
+                "started_at_ms": self.native_compact_started_at_ms,
+            })}
+        if phase == "end":
+            return self._finish_native_compaction(ok=True)
+        return None
+
+    def _finish_native_compaction(self, *, ok: bool) -> dict | None:
+        if not self.native_compact_started_at_ms:
+            return None
+        self.native_compact_started_at_ms = 0
+        return {"event": "compact_progress", "data": json.dumps({
+            "phase": "end", "source": "native", "ok": ok,
+        })}
+
     def publish(self, event: dict) -> None:
         """Route one SSE event to the record channel, the live channel, or both.
 
@@ -1338,6 +1362,17 @@ class TurnBroadcast:
         token count rather than message count.
         """
         event_name = str(event.get("event") or "")
+        if (self.native_compact_started_at_ms
+                and event_name in {"done", "error", "cancelled"}):
+            try:
+                terminal = json.loads(event.get("data") or "{}")
+            except (TypeError, ValueError):
+                terminal = {}
+            ok = (event_name == "done" and isinstance(terminal, dict)
+                  and not terminal.get("is_error") and not terminal.get("cancelled"))
+            progress = self._finish_native_compaction(ok=bool(ok))
+            if progress is not None:
+                self.publish(progress)
         if (self.perf_query_started
                 and self.perf_first_visible_ms < 0
                 and event_name
@@ -15396,6 +15431,9 @@ async def _watch_inflight_tasks_owned(
                 await _close_continuation(
                     duration_ms=getattr(msg, "duration_ms", None), result=msg)
             elif cont is not None and cont_state is not None:
+                progress = cont.native_compaction_progress(msg)
+                if progress is not None:
+                    cont.publish(progress)
                 for event in _render_continuation_message(msg, cont_state):
                     cont.publish(event)
 
@@ -15630,6 +15668,9 @@ async def _watch_inflight_tasks_owned(
                         break
                 else:
                     if cont is not None and cont_state is not None:
+                        progress = cont.native_compaction_progress(msg)
+                        if progress is not None:
+                            cont.publish(progress)
                         if isinstance(msg, (StreamEvent, AssistantMessage)) or (
                             isinstance(msg, UserMessage)
                             and isinstance(msg.content, list)
@@ -18990,9 +19031,11 @@ async def _start_turn(
                     async for ev in _handle_rate_limit(msg):
                         yield ev
                 elif isinstance(msg, SystemMessage):
-                    # Terminal system signals were captured by the turn-scoped
-                    # pump before enqueue; informational rows need no UI event.
-                    pass
+                    # Native auto-compaction happens inside query(), outside
+                    # MuseLab's preflight /compact command and its UI emitter.
+                    progress = broadcast.native_compaction_progress(msg)
+                    if progress is not None:
+                        yield progress
                 elif isinstance(msg, ResultMessage):
                     async for ev in _handle_result_message(msg):
                         yield ev

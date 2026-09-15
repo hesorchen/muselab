@@ -4,9 +4,10 @@ import json
 import math
 
 import pytest
-from claude_agent_sdk import ResultError
+from claude_agent_sdk import ResultError, SystemMessage
 
 from backend.sdk_lifecycle import (
+    native_compaction_phase,
     normalize_model_usage,
     normalize_origin,
     normalize_terminal_reason,
@@ -278,3 +279,18 @@ def test_result_error_info_rejects_invalid_status_and_non_result_error():
     assert info["api_error_status"] is None
     assert info["exit_code"] is None
     assert result_error_info(RuntimeError("not a result error")) is None
+
+
+@pytest.mark.parametrize("subtype,data,expected", [
+    ("status", {"status": "compacting", "private": "synthetic"}, "start"),
+    ("status", {"status": None}, "end"),
+    ("compact_boundary", {"private": "synthetic"}, "end"),
+    ("status", {}, None),
+    ("status", {"status": "future-status"}, None),
+    ("status", {"status": {"private": "synthetic"}}, None),
+    ("status", None, None),
+    ("informational", {"status": "compacting"}, None),
+])
+def test_native_compaction_projects_only_explicit_lifecycle(subtype, data, expected):
+    assert native_compaction_phase(SystemMessage(subtype=subtype, data=data)) == expected
+    assert native_compaction_phase(data) is None

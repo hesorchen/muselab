@@ -34577,7 +34577,7 @@ function portal() {
         };
         this.rlBadge = this.rateLimitWorst();
       });
-      // Backend preflight auto-compact. Drives the SAME per-tab `compacting`
+      // Preflight and CLI-native auto-compact share the per-tab `compacting`
       // flag the manual compact button sets, so the 📦 bubble, the ctx-meter
       // shimmer and the "busy" checks all light up identically — the user
       // shouldn't have to know whether a compact was their idea or the
@@ -34589,12 +34589,18 @@ function portal() {
         if (!streamState) return;
         if (d.phase === "start") {
           streamState.compacting = true;
-          streamState._compactStartedAt = Date.now();
+          const now = Date.now();
+          const startedAt = Number(d.started_at_ms);
+          streamState._compactStartedAt = Number.isFinite(startedAt)
+            && startedAt > 0 && startedAt <= now ? startedAt : now;
           if (streamSid === this.currentId) {
-            this.toast(this.lang === "zh"
-              ? `上下文 ${Math.round((d.used || 0) / 1000)}K，自动压缩中…`
-              : `Context ${Math.round((d.used || 0) / 1000)}K — auto-compacting…`,
-              "info", 4000);
+            const used = Number(d.used);
+            const label = Number.isFinite(used) && used > 0
+              ? (this.lang === "zh"
+                ? `上下文 ${Math.round(used / 1000)}K，自动压缩中…`
+                : `Context ${Math.round(used / 1000)}K — auto-compacting…`)
+              : (this.lang === "zh" ? "正在压缩会话上下文…" : "Compacting conversation context…");
+            this.toast(label, "info", 4000);
           }
         } else if (d.phase === "end") {
           streamState.compacting = false;
