@@ -12599,13 +12599,16 @@ function portal() {
       if (existingState && payload.stopping) {
         existingState._stoppingTurnId = turnId;
       }
+      const closedMuxChannel = !!(existingState && existingState.es
+        && existingState.es._muxChannel && Number(existingState.es.readyState) === 2);
       if (existingState && existingState.es
-          && existingState.activeTurnId === turnId) return;
+          && existingState.activeTurnId === turnId && !closedMuxChannel) return;
       if (existingState && existingState.es && existingState.es._muxChannel
-          && existingState.activeTurnId
-          && existingState.activeTurnId !== turnId) {
-        // The aggregate state frame is authoritative for ABA turn changes. Retire
-        // only the stale logical adapter; the root EventSource remains shared.
+          && (closedMuxChannel || (existingState.activeTurnId
+            && existingState.activeTurnId !== turnId))) {
+        // A matching turn id does not make a closed adapter usable. Rebuild it
+        // on root reconnect so replay has a live sink instead of queuing forever.
+        // ABA turn changes retire the old adapter through the same path.
         this._retireStaleSessionStream(sid, existingState);
         existingState._pendingExternalUpdate = true;
       }

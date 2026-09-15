@@ -144,6 +144,13 @@ independent pumps, and pending successor subscribers are disposed on disconnect.
 Real HTTP/SSE browser coverage keeps one transcript selected across Agent bursts
 and rapid continuations, then checks its final suffix against indexed history.
 
+A closed browser session channel must be retired even when its turn ID still
+matches the server. Root transport recovery alone cannot reopen a closed logical
+channel: matching state frames must rebuild its reducer and consume replay from
+the retained event cursor. The browser regression closes one channel while the
+root remains healthy, advances the backend, and verifies new output without a
+page refresh.
+
 ## Evidence and diagnostics
 
 Regressions cover long idle output, cancellation-safe ordered handoff, native

@@ -121,3 +121,35 @@ def test_real_mux_subagent_burst_keeps_current_transcript_live(
         expect(page.locator(".msg-pane:visible")).to_contain_text(f"LIVE_CONTINUATION_{i}")
     assert _app_eval(page, "return app.currentId;") == sid
     _assert_no_browser_errors(page, errors)
+
+
+def test_closed_mux_channel_recovers_live_output_without_refresh(
+    page, request, auth_token,
+):
+    """A healthy root transport cannot make a closed session adapter usable."""
+    from playwright.sync_api import expect
+
+    base = request.getfixturevalue("live_mux_server")
+    errors = _capture_browser_errors(page)
+    _login(page, base, auth_token)
+    page.wait_for_function("() => document.querySelector('#app')._x_dataStack[0]._chatMuxConnected")
+    sid = _app_eval(page, "await app._ensureSessionRegistered(app.currentId); return app.currentId;")
+    headers = {"X-Auth-Token": auth_token}
+    assert page.request.post(base + "/fixture/begin", headers=headers, data={"sid": sid}).ok
+    expect(page.locator(".msg-pane:visible")).to_contain_text("LIVE_PARENT_START")
+    _app_eval(page, """
+        const st = app.tabState[arg];
+        st.es.close();
+        st._lastSseProgressAt = Date.now() - 20000;
+    """, sid)
+    assert page.request.post(base + "/fixture/burst", headers=headers,
+                             data={"sid": sid, "count": 12}).ok
+    _app_eval(page, "await app._recoverStalledStream(arg);", sid)
+    expect(page.locator(".msg-pane:visible")).to_contain_text(
+        "LIVE_PARENT_AFTER_AGENTS", timeout=6000,
+    )
+    assert _app_eval(page, "return app.currentId;") == sid
+    assert _app_eval(page, "return app.tabState[arg].es.readyState;", sid) == 1
+    assert page.request.post(base + "/fixture/finish", headers=headers,
+                             data={"sid": sid, "done": {}}).ok
+    _assert_no_browser_errors(page, errors)
