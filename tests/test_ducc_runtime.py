@@ -3,6 +3,8 @@ import os
 import subprocess
 from pathlib import Path
 
+import pytest
+
 
 def test_ducc_wrapper_removes_muselab_provider_identity(tmp_path):
     fake_ducc = tmp_path / "ducc"
@@ -93,3 +95,73 @@ def test_ducc_wrapper_removes_muselab_provider_identity(tmp_path):
     invalid_output = json.loads(invalid.stdout)
     assert invalid_output["present"]["CLAUDE_CODE_RESUME_SOURCE_ALIVE"] is False
     assert invalid_output["resume_source_alive"] is None
+
+
+@pytest.mark.parametrize("inherited_pwd", [None, "/", "/stale/workspace"])
+@pytest.mark.parametrize("via_symlink", [False, True])
+def test_ducc_wrapper_reports_actual_workspace(tmp_path, inherited_pwd, via_symlink):
+    workspace = tmp_path / "workspace with spaces 工作区"
+    workspace.mkdir()
+    launch_cwd = workspace
+    if via_symlink:
+        launch_cwd = tmp_path / "workspace alias"
+        launch_cwd.symlink_to(workspace, target_is_directory=True)
+    fake_ducc = tmp_path / "ducc"
+    fake_ducc.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, os, subprocess\n"
+        "print(json.dumps({\n"
+        "    'cwd': os.getcwd(),\n"
+        "    'pwd': os.environ.get('PWD', '/'),\n"
+        "    'shell': subprocess.check_output(\n"
+        "        ['/bin/sh', '-c', 'pwd -P'], text=True).strip(),\n"
+        "    'wrapper_metadata': 'MUSELAB_DUCC_WORKSPACE' in os.environ,\n"
+        "}))\n",
+        encoding="utf-8",
+    )
+    fake_ducc.chmod(0o755)
+    env = {
+        "PATH": os.environ["PATH"],
+        "HOME": str(tmp_path),
+        "MUSELAB_DUCC_CLI": str(fake_ducc),
+        "MUSELAB_DUCC_WORKSPACE": str(workspace.resolve()),
+    }
+    if inherited_pwd is not None:
+        env["PWD"] = inherited_pwd
+    wrapper = Path(__file__).resolve().parent.parent / "scripts" / "muselab-ducc"
+    completed = subprocess.run(
+        [str(wrapper)], cwd=launch_cwd, env=env, check=True,
+        capture_output=True, text=True,
+    )
+    assert json.loads(completed.stdout) == {
+        "cwd": str(workspace.resolve()),
+        "pwd": str(workspace.resolve()),
+        "shell": str(workspace.resolve()),
+        "wrapper_metadata": False,
+    }
+    assert completed.stderr == ""
+
+
+def test_ducc_wrapper_rejects_wrong_workspace_before_launch(tmp_path):
+    expected = tmp_path / "expected private workspace"
+    expected.mkdir()
+    actual = tmp_path / "wrong private workspace"
+    actual.mkdir()
+    fake_ducc = tmp_path / "ducc"
+    fake_ducc.write_text("#!/bin/sh\nprintf 'runtime launched'\n", encoding="utf-8")
+    fake_ducc.chmod(0o755)
+    wrapper = Path(__file__).resolve().parent.parent / "scripts" / "muselab-ducc"
+    completed = subprocess.run(
+        [str(wrapper)], cwd=actual,
+        env={
+            "PATH": os.environ["PATH"],
+            "HOME": str(tmp_path),
+            "MUSELAB_DUCC_CLI": str(fake_ducc),
+            "MUSELAB_DUCC_WORKSPACE": str(expected.resolve()),
+            "PWD": str(expected.resolve()),
+        },
+        capture_output=True, text=True,
+    )
+    assert completed.returncode != 0
+    assert completed.stdout == ""
+    assert completed.stderr == "MuseLab DUCC runtime: workspace cwd mismatch\n"

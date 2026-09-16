@@ -227,7 +227,7 @@ _DUCC_LOCALE_ENV_NAMES = (
 )
 
 
-def _ducc_subprocess_env(executable: str) -> dict[str, str]:
+def _ducc_subprocess_env(executable: str, workspace: Path) -> dict[str, str]:
     """Build the complete, privacy-bounded environment for DUCC.
 
     Current Claude Agent SDK versions merge options.env over the parent
@@ -264,13 +264,18 @@ def _ducc_subprocess_env(executable: str) -> dict[str, str]:
     # captures it before rebuilding its own empty environment and never
     # forwards MUSELAB_DUCC_CLI to the actual runtime.
     safe["MUSELAB_DUCC_CLI"] = executable
+    # The registry already resolves the workspace.  The wrapper compares this
+    # with its actual process cwd, then strips this launch-only metadata.
+    safe["MUSELAB_DUCC_WORKSPACE"] = str(workspace)
     return safe
 
 
 def _cli_stderr_category(line: str) -> str:
     """Classify CLI stderr without retaining its potentially private text."""
     low = (line or "").lower()
-    if any(word in low for word in (
+    if "muselab ducc runtime: workspace cwd" in low:
+        category = "workspace"
+    elif any(word in low for word in (
         "auth", "credential", "login", "token", "unauthorized", "forbidden",
     )):
         category = "authentication"
@@ -3781,7 +3786,7 @@ async def _build_and_connect_client(
                 f"MuseLab DUCC launcher is missing or not executable: {wrapper}"
             )
         opts_kwargs["cli_path"] = str(wrapper)
-        opts_kwargs["env"] = _ducc_subprocess_env(ducc_executable)
+        opts_kwargs["env"] = _ducc_subprocess_env(ducc_executable, workspace_root)
     if permission == "plan" and plan_return_permission == "bypassPermissions":
         # The CLI refuses a later setMode(bypassPermissions) unless this
         # capability was granted at process launch. This flag permits the

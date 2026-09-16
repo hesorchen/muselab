@@ -205,3 +205,19 @@ recall deadline still applies to queue and execution; zero retains unlimited wai
 response window sizes, generation-change flag, retry count, and the closed-set
 recovery result. Never include prompts, memory content, attachment paths, full
 session identifiers, raw generations, or exception/protocol payloads in these logs.
+
+
+## DUCC workspace identity
+
+The SDK launches in the session's resolved workspace. Its DUCC wrapper must
+read the actual physical cwd, compare it with the expected session workspace,
+and explicitly preserve that path as `PWD` across `env -i`. Missing or stale
+inherited `PWD` must never turn a valid workspace into `/` in environment-based
+runtime context. A mismatch or unreadable cwd aborts before DUCC starts; stderr
+records only the `workspace` category, without paths or provider payloads.
+The wrapper-only expected workspace is not forwarded to DUCC.
+
+`test_ducc_runtime.py` checks a real subprocess's cwd, `PWD`, and shell `pwd -P`
+with missing/stale environment values, spaces, Unicode, and symlinks. These
+checks establish the launch contract; they do not inspect a vendor runtime's
+private System Context or prove how a remote model renders it.

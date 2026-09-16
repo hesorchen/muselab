@@ -255,6 +255,8 @@ def test_ducc_model_uses_real_cli_runtime_without_native_auth(
     monkeypatch.setenv("SSH_AUTH_SOCK", "/tmp/synthetic-private-agent.sock")
     monkeypatch.setenv("UNRELATED_PRIVATE_VALUE", "synthetic-private-value")
     monkeypatch.setenv("DUCC_AUTH_SOURCE", "managed-login")
+    monkeypatch.setenv("MUSELAB_DUCC_WORKSPACE", "/stale/workspace")
+    monkeypatch.setenv("PWD", "/")
     monkeypatch.setenv("HTTPS_PROXY", "https://user:password@proxy.invalid")
     monkeypatch.setattr(
         chat_mod, "locate_ducc_executable", lambda: "/opt/ducc/bin/ducc")
@@ -276,6 +278,8 @@ def test_ducc_model_uses_real_cli_runtime_without_native_auth(
     assert captured["model"] == "Opus 4.8"
     ducc_env = captured["env"]
     assert ducc_env["MUSELAB_DUCC_CLI"] == "/opt/ducc/bin/ducc"
+    assert ducc_env["MUSELAB_DUCC_WORKSPACE"] == captured["cwd"]
+    assert ducc_env["MUSELAB_DUCC_WORKSPACE"] != "/stale/workspace"
     assert ducc_env["HOME"]
     assert ducc_env["DUCC_AUTH_SOURCE"] == "managed-login"
     assert "HTTPS_PROXY" not in ducc_env
@@ -317,6 +321,7 @@ def test_non_claude_ducc_model_uses_catalog_name_without_claude_controls(
     assert captured["cli_path"] == str(wrapper)
     assert captured["model"] == "gpt-5.6-sol"
     assert captured["env"]["MUSELAB_DUCC_CLI"] == "/opt/ducc/bin/ducc"
+    assert captured["env"]["MUSELAB_DUCC_WORKSPACE"] == captured["cwd"]
     assert "effort" not in captured
     assert captured["thinking"] == {"type": "disabled"}
 
@@ -858,3 +863,21 @@ def test_codex_runtime_window_requires_known_capacity(
             assert key not in captured["env"]
         else:
             assert captured["env"][key] == str(expected)
+
+
+@pytest.mark.parametrize("reason", ["unavailable", "mismatch"])
+def test_ducc_workspace_diagnostic_is_private_and_deduplicated(
+    app_module, capsys, reason,
+):
+    from backend import chat as chat_mod
+
+    sink = chat_mod._privacy_safe_cli_stderr_logger("DUCC", "12345678-private-id")
+    capsys.readouterr()
+    line = f"MuseLab DUCC runtime: workspace cwd {reason}"
+    sink(line)
+    sink(line)
+    logged = capsys.readouterr().err
+    assert logged.count("category=workspace") == 1
+    assert "sid=12345678" in logged
+    assert "private-id" not in logged
+    assert line not in logged

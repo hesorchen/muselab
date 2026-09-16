@@ -23,7 +23,20 @@ if [[ -z "$ducc_cli" || ! -x "$ducc_cli" ]]; then
     exit 127
 fi
 
-safe_env=()
+# PWD is runtime context, not an ambient value to trust or discard.  The SDK
+# sets the child cwd before this wrapper starts; ask the OS for its physical
+# path so DUCC's environment and shell tools describe the same workspace.
+if ! runtime_cwd="$(builtin pwd -P 2>/dev/null)" || [[ -z "$runtime_cwd" ]]; then
+    printf '%s\n' 'MuseLab DUCC runtime: workspace cwd unavailable' >&2
+    exit 1
+fi
+expected_cwd="${MUSELAB_DUCC_WORKSPACE:-}"
+if [[ -n "$expected_cwd" && "$runtime_cwd" != "$expected_cwd" ]]; then
+    printf '%s\n' 'MuseLab DUCC runtime: workspace cwd mismatch' >&2
+    exit 1
+fi
+
+safe_env=("PWD=$runtime_cwd")
 
 append_if_set() {
     local name="$1"
