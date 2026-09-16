@@ -1389,7 +1389,11 @@ def test_recall_retries_lexical_lock_contention_instead_of_returning_empty(
 
     async def scenario():
         try:
-            rows = await asyncio.wait_for(instance.recall('清淡饮食', 'busy-read'), 1)
+            # This guard detects a hung test, not a recall latency contract.
+            # A busy CI runner can delay the actor thread beyond one second
+            # before the injected SQLITE_BUSY retries even begin. The configured
+            # recall budget and retry/result assertions still define success.
+            rows = await asyncio.wait_for(instance.recall('清淡饮食', 'busy-read'), 10)
             assert len(attempts) == 3
             assert [row['id'] for row in rows] == [memory['id']]
             assert instance.pop_recall_trace('busy-read')['lexical_status'] == 'ok'
