@@ -9,7 +9,7 @@ stream_env = test_chat_stream.stream_env
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("fail_preflight", [False, True])
+@pytest.mark.parametrize("fail_preflight", [False, "intent", "boundary"])
 async def test_recall_overlaps_preflight_and_is_cancelled_on_early_failure(
         stream_env, client, monkeypatch, fail_preflight):
     chat = stream_env
@@ -44,9 +44,21 @@ async def test_recall_overlaps_preflight_and_is_cancelled_on_early_failure(
     monkeypatch.setattr(chat.mem0, "prepare_recall", prepare)
     if fail_preflight:
         original_write = chat._write_active_turn_sidecar
-        monkeypatch.setattr(chat, "_write_active_turn_sidecar", lambda *args:
-                            False if recall_started.is_set() else original_write(*args))
-    broadcast = await chat._start_turn(sid, "startup barrier fixture", model="claude-sonnet-4-6")
+
+        def write_at_boundary(broadcast, *args):
+            in_pump = broadcast.task is not None
+            if recall_started.is_set() and in_pump == (fail_preflight == "boundary"):
+                return False
+            return original_write(broadcast, *args)
+
+        monkeypatch.setattr(chat, "_write_active_turn_sidecar", write_at_boundary)
+    start = chat._start_turn(sid, "startup barrier fixture", model="claude-sonnet-4-6")
+    if fail_preflight == "intent":
+        with pytest.raises(chat._TurnStartError):
+            await start
+        broadcast = chat._recent_turns[sid]
+    else:
+        broadcast = await start
     if not fail_preflight:
         await asyncio.wait_for(preflight_started.wait(), 2)
         assert not recall_finished.is_set()
@@ -56,5 +68,6 @@ async def test_recall_overlaps_preflight_and_is_cancelled_on_early_failure(
         while not broadcast.done:
             await asyncio.sleep(.01)
     assert recall_finished.is_set()
+    assert broadcast.recall_task.done()
     assert fake.queried == ([] if fail_preflight else ["startup barrier fixture"])
     assert sid not in chat.mem0._prepared_recalls

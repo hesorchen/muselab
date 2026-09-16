@@ -8865,6 +8865,12 @@ async def test_recall_overlaps_connect_and_retires_with_startup(
         # waits here. No wall-clock performance threshold is needed.
         await asyncio.wait_for(entered.wait(), 2)
         broadcast = chat._active_turns[sid]
+        if attachment and ending == "success":
+            # Moving the lease earlier must pin the file for the entire cold
+            # connection, even if normal upload TTL expires during that await.
+            chat._image_store[aid]["ts"] = chat.time.time() - chat._IMAGE_TTL_S - 1
+            chat._gc_images()
+            assert aid in chat._image_store
         if ending == "connect_error":
             raise RuntimeError("synthetic connect failure")
         if ending == "cancelled":

@@ -2038,10 +2038,10 @@ async def test_drain_pauses_missing_attachments_without_sending_text(
 
 
 @pytest.mark.asyncio
-async def test_drain_rechecks_and_atomically_rolls_back_attachment_after_slow_startup(
+async def test_drain_rechecks_and_atomically_rolls_back_attachment_after_slow_admission(
     app_module, monkeypatch,
 ):
-    """A valid precheck can expire while the SDK client is starting.
+    """A valid precheck can expire while the Activity admission is awaiting.
 
     The authoritative all-or-none claim lives inside `_start_turn`, after that
     await. It must not query text-only, and must close every piece of startup
@@ -2052,7 +2052,7 @@ async def test_drain_rechecks_and_atomically_rolls_back_attachment_after_slow_st
 
     sess = _sess(app_module)
     sid = sess.create_session(model="claude-sonnet-4-6")["id"]
-    aid = "expires-during-client-start"
+    aid = "expires-during-admission"
     retained_aid = "still-valid-after-rollback"
     chat._image_store[aid] = {
         "kind": "text",
@@ -2093,15 +2093,10 @@ async def test_drain_rechecks_and_atomically_rolls_back_attachment_after_slow_st
         async def query(self, prompt):
             queried.append(prompt)
 
-    async def slow_get_client(*_args, **_kwargs):
-        # `_maybe_drain_queue` already passed its preliminary availability
-        # check. Expire the upload across this real startup await so only the
-        # final atomic claim can catch it.
-        assert aid in chat._image_store
-        chat._image_store[aid]["ts"] = (
-            chat.time.time() - chat._IMAGE_TTL_S - 1
-        )
-        await asyncio.sleep(0)
+    connections = []
+
+    async def get_client(*_args, **_kwargs):
+        connections.append(True)
         return NeverQueriedClient()
 
     original_start_activity = chat._start_activity_early
@@ -2110,6 +2105,11 @@ async def test_drain_rechecks_and_atomically_rolls_back_attachment_after_slow_st
     async def tracked_start_activity(_sid, broadcast, prompt):
         assert _sid == sid
         await original_start_activity(_sid, broadcast, prompt)
+        # Expire after the queue precheck but before the authoritative lease.
+        # SDK startup now follows that lease, which pins accepted attachments.
+        assert aid in chat._image_store
+        chat._image_store[aid]["ts"] = chat.time.time() - chat._IMAGE_TTL_S - 1
+        await asyncio.sleep(0)
         activity_transitions.append(("start", broadcast.turn_id))
 
     async def tracked_finish_activity(_sid, broadcast, status):
@@ -2120,7 +2120,7 @@ async def test_drain_rechecks_and_atomically_rolls_back_attachment_after_slow_st
         await original_finish_activity(_sid, broadcast, status)
         activity_transitions.append((status, broadcast.turn_id))
 
-    monkeypatch.setattr(chat, "get_client", slow_get_client)
+    monkeypatch.setattr(chat, "get_client", get_client)
     monkeypatch.setattr(chat, "_start_activity_early", tracked_start_activity)
     monkeypatch.setattr(chat, "_finish_activity", tracked_finish_activity)
     monkeypatch.setattr(
@@ -2129,6 +2129,7 @@ async def test_drain_rechecks_and_atomically_rolls_back_attachment_after_slow_st
     await chat._maybe_drain_queue(sid)
 
     queue = sess.get_queue(sid)
+    assert connections == []
     assert queried == []
     assert queue["inflight"] is None
     assert queue["paused"] is False

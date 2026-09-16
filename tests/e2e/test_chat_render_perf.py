@@ -769,7 +769,8 @@ def test_committed_canonical_suffix_retires_stream_even_with_recent_transport(
         "streaming": False,
         "hasStream": False,
         "closed": True,
-        "pendingExternalUpdate": False,
+        # Retiring transport has not installed the pending canonical history.
+        "pendingExternalUpdate": True,
         "reasons": ["history_revision"],
     }
     _assert_no_browser_errors(page, errors)
