@@ -1243,6 +1243,9 @@ class TurnBroadcast:
         self.perf_connect_ms = 0
         self.perf_mcp_ms = 0
         self.perf_pool_commit_ms = 0
+        self.recall_task: asyncio.Task[bool] | None = None
+        self.perf_recall_ms = 0
+        self.perf_recall_wait_ms = 0
         self.perf_attachment_ms = 0
         self.perf_intent_refresh_ms = 0
         self.perf_query_write_ms = 0
@@ -1313,6 +1316,8 @@ class TurnBroadcast:
                 pool_commit_ms=self.perf_pool_commit_ms,
                 client_ms=self.perf_client_ms,
                 attachment_ms=self.perf_attachment_ms,
+                recall_ms=self.perf_recall_ms,
+                recall_wait_ms=self.perf_recall_wait_ms,
                 intent_refresh_ms=self.perf_intent_refresh_ms,
                 preflight_ms=self.perf_preflight_ms,
                 sdk_write_ms=self.perf_query_write_ms,
@@ -1496,11 +1501,21 @@ class TurnBroadcast:
                 "data": json.dumps(payload, ensure_ascii=False),
             }
 
+    async def join_recall(self) -> None:
+        """Retire the producer before any terminal path clears its receipt."""
+        task = self.recall_task
+        if task is not None:
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
     def finish(self) -> None:
         if self.done:
             return
         self._flush_compact_text()
         self.done = True
+        if self.recall_task is not None and not self.recall_task.done():
+            self.recall_task.cancel()
         mem0.clear_prepared_recall(self.session_id, self.turn_id)
         self.steering_ready.set()
         self.finished_at = time.time()
@@ -15960,6 +15975,7 @@ async def _finish_cancelled_startup(
     cleanup = broadcast._startup_terminal_cleanup_task
     if cleanup is None:
         async def _cleanup() -> bool:
+            await broadcast.join_recall()
             _hydrate_staged_attachment_display(broadcast)
             await _rollback_broadcast_attachments(broadcast)
             queue_settled = False
@@ -16131,6 +16147,7 @@ async def _abort_turn_startup(
     cleanup = broadcast._startup_terminal_cleanup_task
     if cleanup is None:
         async def _cleanup() -> bool:
+            await broadcast.join_recall()
             _hydrate_staged_attachment_display(broadcast)
             await _rollback_broadcast_attachments(broadcast)
             broadcast.perf_status = status
@@ -16702,6 +16719,155 @@ async def _start_turn(
         raise
     if broadcast.cancelled:
         return await _finish_cancelled_startup(session_id, broadcast)
+    broadcast.publish_startup("runtime")
+
+    # Lease staged uploads without consuming them. The payload remains retryable
+    # through CPU/disk preparation and native compact preflight; only a
+    # successful SDK query write commits the lease.
+    _attachment_started = obs.monotonic()
+    prepared = _PreparedStagedAttachments()
+    if image_ids:
+        lease, missing_attachments, busy_attachments = await asyncio.to_thread(
+            _lease_staged_attachments,
+            image_ids,
+            require_all=bool(broadcast.queue_item_id),
+            queue_owner=((session_id, broadcast.queue_item_id)
+                         if broadcast.queue_item_id else None),
+        )
+        broadcast._attachment_lease = lease
+        if busy_attachments or (
+            broadcast.queue_item_id and missing_attachments
+        ):
+            broadcast.perf_attachment_ms = obs.elapsed_ms(_attachment_started)
+            broadcast.perf_startup_failure_phase = "context"
+            if broadcast.queue_item_id:
+                queue_settled = await _fail_queued_attachment_startup(
+                    session_id, broadcast)
+            else:
+                queue_settled = await _abort_turn_startup(
+                    session_id,
+                    broadcast,
+                    "failed",
+                    error_text="attachment is already being submitted",
+                )
+            reason = (
+                "attachment is already being submitted"
+                if busy_attachments
+                else "queued attachment is missing or expired"
+            )
+            raise _TurnStartError(
+                reason,
+                queue_claim_settled=queue_settled,
+            )
+        if lease is not None:
+            try:
+                prepared = await _prepare_broadcast_attachments(
+                    broadcast, session_id, lease)
+            except asyncio.CancelledError:
+                broadcast.perf_attachment_ms = obs.elapsed_ms(
+                    _attachment_started)
+                broadcast.perf_startup_failure_phase = "context"
+                if broadcast.cancelled:
+                    return await _finish_cancelled_startup(
+                        session_id, broadcast)
+                broadcast.perf_error_kind = "startup_cancelled"
+                await _abort_turn_startup(
+                    session_id,
+                    broadcast,
+                    "failed",
+                    pause_queue=True,
+                    error_text="Attachment preparation ended unexpectedly. Please retry.",
+                )
+                raise
+            except Exception:
+                broadcast.perf_error_kind = "attachment"
+                broadcast.perf_attachment_ms = obs.elapsed_ms(
+                    _attachment_started)
+                broadcast.perf_startup_failure_phase = "context"
+                if broadcast.queue_item_id:
+                    queue_settled = await _fail_queued_attachment_startup(
+                        session_id, broadcast)
+                else:
+                    queue_settled = await _abort_turn_startup(
+                        session_id,
+                        broadcast,
+                        "failed",
+                        error_text="attachment preparation failed",
+                    )
+                raise _TurnStartError(
+                    "attachment preparation failed",
+                    queue_claim_settled=queue_settled,
+                ) from None
+    broadcast.perf_attachment_ms = obs.elapsed_ms(_attachment_started)
+
+    # Stop may arrive while the worker is in an uninterruptible thread. The
+    # wrapper joins its real result; re-check before those files can reach any
+    # prompt/sidecar/pump boundary.
+    if broadcast.cancelled:
+        return await _finish_cancelled_startup(session_id, broadcast)
+
+    img_blocks = list(prepared.img_blocks)
+    pdf_blocks = list(prepared.pdf_blocks)
+    disk_attachments = list(prepared.disk_attachments)
+    persisted_imgs = list(prepared.persisted_imgs)
+    persisted_docs = list(prepared.persisted_docs)
+    # Attachments are referenced BY PATH, never inlined. The prompt gets a
+    # manifest; the agent Reads what it needs. Two things this buys:
+    #   - context: a big CSV no longer sits in the transcript forever, re-sent
+    #     on every subsequent turn of the session
+    #   - fidelity: the agent sees the real file (exact bytes, full length),
+    #     not a truncated / fenced copy of it
+    # The old inline path also needed backtick-fence-length arithmetic to stop
+    # an attachment containing ``` from breaking out of its code block and
+    # spoofing prompt text. Referencing by path removes that class of bug.
+    if disk_attachments:
+        parts = [prompt] if prompt else []
+        lines = [
+            "\n\n--- Files attached to this message (on disk) ---",
+            "Use the Read tool on these paths. Do not guess at their contents.",
+        ]
+        for name, path, note in disk_attachments:
+            fields = [
+                f"filename={json.dumps(name, ensure_ascii=False)}",
+                f"path={json.dumps(path, ensure_ascii=False)}",
+            ]
+            if note:
+                fields.append(
+                    f"note={json.dumps(note, ensure_ascii=False)}")
+            lines.append("- " + " ".join(fields))
+        lines.append("--- end attached files ---")
+        parts.append("\n".join(lines))
+        prompt = "\n".join(parts).lstrip()
+
+    async def _prepare_turn_recall() -> bool:
+        started = obs.monotonic()
+        status = "ok"
+        try:
+            prepared_recall = await mem0.prepare_recall(
+                session_id, broadcast.turn_id, prompt,
+                is_cancelled=lambda: broadcast.cancelled or broadcast.done,
+            )
+            if not prepared_recall:
+                status = "cancelled"
+            return prepared_recall
+        except asyncio.CancelledError:
+            status = "cancelled"
+            raise
+        except Exception:
+            status = "error"
+            raise
+        finally:
+            broadcast.perf_recall_ms = obs.elapsed_ms(started)
+            obs.perf_event("chat.recall_prepare", sid8=obs.short_id(session_id),
+                turn8=obs.short_id(broadcast.turn_id), status=status,
+                duration_ms=broadcast.perf_recall_ms)
+
+    broadcast.recall_task = asyncio.create_task(_prepare_turn_recall())
+    # A producer can fail before connect finishes. Observe it immediately while
+    # retaining the exception for the query gate / startup cleanup to await.
+    broadcast.recall_task.add_done_callback(
+        lambda task: None if task.cancelled() else task.exception())
+
     # Wrap get_client so SDK / auth pre-check errors surface as a typed
     # _TurnStartError the caller can shape (the /stream handler → SSE error
     # event / 504; the queue drain → pause + push) instead of bubbling up as
@@ -16709,7 +16875,6 @@ async def _start_turn(
     # MODE, otherwise this session's slot stays "busy" forever and
     # subsequent sends get rejected.
     _client_started = obs.monotonic()
-    broadcast.publish_startup("runtime")
     _runtime_lock_started = obs.monotonic()
     _runtime_lock_acquired = False
     try:
@@ -16843,124 +17008,7 @@ async def _start_turn(
     if isinstance(client, MuseLabSDKClient):
         broadcast.runtime_client = client
 
-    # Lease staged uploads without consuming them. The payload remains retryable
-    # through CPU/disk preparation and native compact preflight; only a
-    # successful SDK query write commits the lease.
     broadcast.publish_startup("context")
-    _attachment_started = obs.monotonic()
-    prepared = _PreparedStagedAttachments()
-    if image_ids:
-        lease, missing_attachments, busy_attachments = await asyncio.to_thread(
-            _lease_staged_attachments,
-            image_ids,
-            require_all=bool(broadcast.queue_item_id),
-            queue_owner=((session_id, broadcast.queue_item_id)
-                         if broadcast.queue_item_id else None),
-        )
-        broadcast._attachment_lease = lease
-        if busy_attachments or (
-            broadcast.queue_item_id and missing_attachments
-        ):
-            broadcast.perf_attachment_ms = obs.elapsed_ms(_attachment_started)
-            broadcast.perf_startup_failure_phase = "context"
-            if broadcast.queue_item_id:
-                queue_settled = await _fail_queued_attachment_startup(
-                    session_id, broadcast)
-            else:
-                queue_settled = await _abort_turn_startup(
-                    session_id,
-                    broadcast,
-                    "failed",
-                    error_text="attachment is already being submitted",
-                )
-            reason = (
-                "attachment is already being submitted"
-                if busy_attachments
-                else "queued attachment is missing or expired"
-            )
-            raise _TurnStartError(
-                reason,
-                queue_claim_settled=queue_settled,
-            )
-        if lease is not None:
-            try:
-                prepared = await _prepare_broadcast_attachments(
-                    broadcast, session_id, lease)
-            except asyncio.CancelledError:
-                broadcast.perf_attachment_ms = obs.elapsed_ms(
-                    _attachment_started)
-                broadcast.perf_startup_failure_phase = "context"
-                if broadcast.cancelled:
-                    return await _finish_cancelled_startup(
-                        session_id, broadcast)
-                broadcast.perf_error_kind = "startup_cancelled"
-                await _abort_turn_startup(
-                    session_id,
-                    broadcast,
-                    "failed",
-                    pause_queue=True,
-                    error_text="Attachment preparation ended unexpectedly. Please retry.",
-                )
-                raise
-            except Exception:
-                broadcast.perf_error_kind = "attachment"
-                broadcast.perf_attachment_ms = obs.elapsed_ms(
-                    _attachment_started)
-                broadcast.perf_startup_failure_phase = "context"
-                if broadcast.queue_item_id:
-                    queue_settled = await _fail_queued_attachment_startup(
-                        session_id, broadcast)
-                else:
-                    queue_settled = await _abort_turn_startup(
-                        session_id,
-                        broadcast,
-                        "failed",
-                        error_text="attachment preparation failed",
-                    )
-                raise _TurnStartError(
-                    "attachment preparation failed",
-                    queue_claim_settled=queue_settled,
-                ) from None
-    broadcast.perf_attachment_ms = obs.elapsed_ms(_attachment_started)
-
-    # Stop may arrive while the worker is in an uninterruptible thread. The
-    # wrapper joins its real result; re-check before those files can reach any
-    # prompt/sidecar/pump boundary.
-    if broadcast.cancelled:
-        return await _finish_cancelled_startup(session_id, broadcast)
-
-    img_blocks = list(prepared.img_blocks)
-    pdf_blocks = list(prepared.pdf_blocks)
-    disk_attachments = list(prepared.disk_attachments)
-    persisted_imgs = list(prepared.persisted_imgs)
-    persisted_docs = list(prepared.persisted_docs)
-    # Attachments are referenced BY PATH, never inlined. The prompt gets a
-    # manifest; the agent Reads what it needs. Two things this buys:
-    #   - context: a big CSV no longer sits in the transcript forever, re-sent
-    #     on every subsequent turn of the session
-    #   - fidelity: the agent sees the real file (exact bytes, full length),
-    #     not a truncated / fenced copy of it
-    # The old inline path also needed backtick-fence-length arithmetic to stop
-    # an attachment containing ``` from breaking out of its code block and
-    # spoofing prompt text. Referencing by path removes that class of bug.
-    if disk_attachments:
-        parts = [prompt] if prompt else []
-        lines = [
-            "\n\n--- Files attached to this message (on disk) ---",
-            "Use the Read tool on these paths. Do not guess at their contents.",
-        ]
-        for name, path, note in disk_attachments:
-            fields = [
-                f"filename={json.dumps(name, ensure_ascii=False)}",
-                f"path={json.dumps(path, ensure_ascii=False)}",
-            ]
-            if note:
-                fields.append(
-                    f"note={json.dumps(note, ensure_ascii=False)}")
-            lines.append("- " + " ".join(fields))
-        lines.append("--- end attached files ---")
-        parts.append("\n".join(lines))
-        prompt = "\n".join(parts).lstrip()
 
     # New architecture: CLI's JSONL is the transcript source-of-truth. We no
     # longer accumulate `persisted` into a parallel local store. Instead, after
@@ -17526,21 +17574,6 @@ async def _start_turn(
             but filter already-persisted response UUIDs and continue past their
             stale Result until the current query reaches its own terminal.
             """
-            async def _run_query() -> None:
-                # Complete recall and native context accounting are independent.
-                # Keep both outside the SDK hook watchdog, and cancel the recall
-                # producer before clearing its receipt on any failed preflight.
-                recall = asyncio.create_task(mem0.prepare_recall(
-                    session_id, broadcast.turn_id, prompt,
-                    is_cancelled=lambda: broadcast.cancelled,
-                ))
-                try:
-                    await _run_prepared_query(recall)
-                finally:
-                    if not recall.done():
-                        recall.cancel()
-                    await asyncio.gather(recall, return_exceptions=True)
-
             async def _run_prepared_query(recall: asyncio.Task[bool]) -> None:
                 # `merge_q` lives in event_gen's scope, one level deeper than
                 # _preflight_compact_if_needed's — hence the injected emitter
@@ -17604,8 +17637,12 @@ async def _start_turn(
                     # Recall may wait indefinitely when configured as zero.
                     # Prepare outside the CLI hook timer; only the exact next
                     # prompt can consume it through additionalContext.
-                    if broadcast.cancelled or not await recall:
-                        raise _TurnCancelledBeforeQuery()
+                    recall_wait_started = obs.monotonic()
+                    try:
+                        if broadcast.cancelled or not await recall:
+                            raise _TurnCancelledBeforeQuery()
+                    finally:
+                        broadcast.perf_recall_wait_ms = obs.elapsed_ms(recall_wait_started)
                     # Every preflight/transcript/sidecar await above is a Stop
                     # race. This is the last instruction before SDK transport.
                     if broadcast.cancelled:
@@ -17819,7 +17856,7 @@ async def _start_turn(
             terminal_payload: Any = None
             try:
                 async with _session_runtime_lock_for(session_id):
-                    await _run_query()
+                    await _run_prepared_query(broadcast.recall_task)
             except _TurnCancelledBeforeQuery:
                 terminal_kind = "cancelled"
             except _ContextRecovered as e:
@@ -17842,6 +17879,7 @@ async def _start_turn(
                     f"exc={type(e).__name__} kind={error_kind}\n")
                 terminal_kind, terminal_payload = "error", e
             finally:
+                await broadcast.join_recall()
                 mem0.clear_prepared_recall(session_id, broadcast.turn_id)
                 # Do not expose a terminal failure while its staged id is still
                 # busy. Retrying as soon as the browser sees error is safe.

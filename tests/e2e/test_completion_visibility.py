@@ -586,3 +586,74 @@ def test_long_tool_stream_done_exposes_final_without_reload(
     expect(page.locator(".msg-pane p").filter(has_text=FINAL)).to_be_visible()
     assert reads
     _assert_no_browser_errors(page, errors)
+
+
+@pytest.mark.parametrize("anchor_survives,total", [(True, 202), (False, 202), (False, 2202)])
+def test_history_revision_expands_window_then_latest_fetches_fresh_tail(
+    page, backend_url, auth_token, anchor_survives, total,
+):
+    """A disjoint tail must neither loop unchanged nor strand the latest button."""
+    from urllib.parse import urlparse, parse_qs
+
+    errors, history, reads = _prepare(page, backend_url, auth_token)
+    history["completion_state"]["completed_turn_id"] = "newer-external-turn"
+    full = [{"role": "user", "text": "FIXTURE_PROMPT" if anchor_survives else "NEW_PROMPT", "uuid": "fixture-user"
+             if anchor_survives else "different-user"}]
+    full += [{"role": "assistant", "text": f"SYNTHETIC_ROW_{n}", "uuid": f"row-{n}"}
+             for n in range(total - 2)]
+    full.append({"role": "assistant", "text": FINAL, "uuid": "new-tail-final"})
+
+    def window(route):
+        reads.append(route.request.url)
+        tail = int(parse_qs(urlparse(route.request.url).query)["tail"][0])
+        offset = max(0, len(full) - tail)
+        route.fulfill(json={**history, "messages": full[offset:], "offset": offset,
+                            "total": len(full), "message_count": len(full),
+                            "has_more": offset > 0})
+
+    page.route(f"**/api/chat/sessions/{SID}?*", window)
+    _app_eval(page, """
+        const st = app.tabState[arg];
+        st.activeTurnId = 'fixture-turn';
+        st.atBottom = false;
+        Object.assign(st.messageRange, {visibleStart:0, visibleEnd:1});
+        st._seenUpdated = 1;
+        st._installedCanonicalCount = 2;
+        window.historyRecoveryPerf = [];
+        app._reportHistoryLoadPerf = fields => window.historyRecoveryPerf.push({...fields});
+        app._requestSessionSync = window.realVisibilityRequest;
+        void app._requestSessionSync(arg, 'history_revision', {targetUpdated:2});
+    """, SID)
+    page.wait_for_function("""({sid, total}) => {
+        const st = document.querySelector('#app')._x_dataStack[0].tabState[sid];
+        return st._installedCanonicalCount === total || st._historyAnchorRecovery?.exhausted;
+    }""", arg={"sid": SID, "total": total})
+    assert [int(parse_qs(urlparse(url).query)["tail"][0]) for url in reads] == [100, min(2000, total)]
+    before = _app_eval(page, """
+        const st = app.tabState[arg];
+        await app._runHistoryRevisionSync(arg, st, {targetUpdated:2});
+        return {pending:!!st._pendingExternalUpdate, atBottom:st.atBottom,
+          first:st.messages[st.messageRange.visibleStart].uuid,
+          recoveries:window.historyRecoveryPerf.map(row => row.recovery)};
+    """, SID) if not anchor_survives else _app_eval(page, """
+        const st = app.tabState[arg];
+        return {pending:!!st._pendingExternalUpdate, atBottom:st.atBottom,
+          first:st.messages[st.messageRange.visibleStart].uuid,
+          recoveries:window.historyRecoveryPerf.map(row => row.recovery)};
+    """, SID)
+    assert before["atBottom"] is False
+    assert before["first"] == "fixture-user"
+    assert before["pending"] is not anchor_survives
+    assert before["recoveries"] == ["expand", "restored" if anchor_survives else "exhausted"]
+    assert len(reads) == 2
+    result = _app_eval(page, """
+        const st = app.tabState[arg];
+        const loaded = await app.returnToLatest(arg);
+        return {loaded, text:st.messages.at(-1).text, total:st.messageRange.total,
+          atBottom:st.atBottom, pending:!!st._pendingExternalUpdate};
+    """, SID)
+    assert result == {"loaded": True, "text": FINAL, "total": total,
+                      "atBottom": True, "pending": False}
+    assert len(reads) == (2 if anchor_survives else 3)
+    expect(page.locator(f'.msg-pane[data-tid="{SID}"]')).to_contain_text(FINAL)
+    _assert_no_browser_errors(page, errors)

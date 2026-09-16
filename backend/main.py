@@ -1430,6 +1430,8 @@ async def client_performance_log(payload: dict = Body(...)) -> dict:
         "total_ms", "fetch_ms", "receive_ms", "parse_ms", "first_reveal_ms",
         "shape_ms", "markdown_ms", "install_ms", "response_bytes",
         "block_count", "assistant_blocks", "long_task_count", "longest_task_ms",
+        "sid8", "generation_changed", "recovery", "requested_tail", "local_offset",
+        "local_total", "response_offset", "response_total", "retry_n",
     }
     if any(name not in allowed_fields for name in payload):
         return JSONResponse(
@@ -1441,9 +1443,22 @@ async def client_performance_log(payload: dict = Body(...)) -> dict:
             or cancel_reason not in {"none", "superseded", "live_owner",
                                      "revision_changed", "anchor_missing", "aborted"}):
         return JSONResponse({"ok": False, "error": "invalid_payload"}, status_code=422)
+    sid8 = payload.get("sid8", "none")
+    recovery = payload.get("recovery", "none")
+    if (not isinstance(sid8, str) or not re.fullmatch(r"[0-9a-f]{8}|none", sid8)
+            or not isinstance(recovery, str)
+            or recovery not in {"none", "expand", "exhausted", "restored", "latest"}
+            or not isinstance(payload.get("generation_changed", False), bool)):
+        return JSONResponse({"ok": False, "error": "invalid_payload"}, status_code=422)
     try:
         perf_event(
             "client.history_load",
+            sid8=sid8, recovery=recovery,
+            generation_changed=payload.get("generation_changed", False),
+            requested_tail=bounded_int("requested_tail"),
+            local_offset=bounded_int("local_offset"), local_total=bounded_int("local_total"),
+            response_offset=bounded_int("response_offset"), response_total=bounded_int("response_total"),
+            retry_n=bounded_int("retry_n"),
             status=status,
             mode=mode,
             visibility=visibility,

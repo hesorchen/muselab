@@ -13472,9 +13472,11 @@ function portal() {
           if (wantsAttach && st._loaded) this._checkActiveTurn(sid);
           continue;
         }
-        if (newU > priorTarget) st._reconcileRetryN = 0;
+        if (newU > priorTarget || messageCountChanged || turnCountChanged) {
+          st._reconcileRetryN = 0;
+          st._historyAnchorRecovery = null;
+        }
         st._reconcileTargetUpdated = Math.max(priorTarget, newU);
-        st._pendingExternalUpdate = false;
         this._requestSessionSync(sid, "history_revision", {
           attach: wantsAttach,
           targetUpdated: st._reconcileTargetUpdated,
@@ -13492,10 +13494,18 @@ function portal() {
         Number(options.targetUpdated) || 0,
       );
       st._reconcileTargetUpdated = targetUpdated;
+      if (st._historyAnchorRecovery?.targetUpdated !== targetUpdated) {
+        st._historyAnchorRecovery = null;
+      }
+      if (st._historyAnchorRecovery?.exhausted) {
+        st._pendingExternalUpdate = true;
+        return false;
+      }
       let succeeded = false;
       try {
         const loaded = await this.loadSession(sid, {
           quiet: true, probeActive: false, signal: options.signal,
+          minimumTail: st._historyAnchorRecovery?.minimumTail || 0,
         });
         if (!loaded) {
           st._pendingExternalUpdate = true;
@@ -13518,7 +13528,8 @@ function portal() {
         else if (succeeded) st._pendingExternalUpdate = false;
         const retries = Number(st._reconcileRetryN) || 0;
         if (!needsRetry) st._reconcileRetryN = 0;
-        if (needsRetry && !st.streaming && !st.es && retries < 30) {
+        if (needsRetry && !st._historyAnchorRecovery?.exhausted
+            && !st.streaming && !st.es && retries < 30) {
           st._reconcileRetryN = retries + 1;
           this._requestSessionSync(sid, "history_revision", {
             attach: !!options.attach,
@@ -18328,13 +18339,18 @@ function portal() {
     },
     _reportHistoryLoadPerf(fields) {
       // One privacy-bounded summary per canonical history load. Never include a
-      // session id, message text, URL, model name, or error string.
+      // full session id, message text, URL, model name, or error string.
       const numeric = [
         "total_ms", "fetch_ms", "receive_ms", "parse_ms", "first_reveal_ms", "shape_ms", "markdown_ms",
         "install_ms", "response_bytes", "block_count", "assistant_blocks",
         "long_task_count", "longest_task_ms",
+        "requested_tail", "local_offset", "local_total", "response_offset", "response_total", "retry_n",
       ];
       const payload = {
+        sid8: /^[0-9a-f]{8}$/.test(fields.sid8) ? fields.sid8 : "none",
+        generation_changed: !!fields.generation_changed,
+        recovery: ["none", "expand", "exhausted", "restored", "latest"].includes(fields.recovery)
+          ? fields.recovery : "none",
         status: ["ok", "cancelled", "error"].includes(fields.status)
           ? fields.status : "error",
         mode: ["cold", "quiet", "prefetch"].includes(fields.mode)
@@ -18726,6 +18742,10 @@ function portal() {
       const perfNow = (typeof performance !== "undefined" && performance.now)
         ? () => performance.now() : () => Date.now();
       const historyPerf = {
+        sid8: /^[0-9a-f]{8}-/.test(sid) ? sid.slice(0, 8) : "none",
+        local_offset: st.messageRange.offset, local_total: st.messageRange.total,
+        retry_n: st._reconcileRetryN || 0,
+        recovery: opts.followTail ? "latest" : "none",
         status: "cancelled",
         mode: quiet ? "quiet" : (isCurrent ? "cold" : "prefetch"),
         foreground: isCurrent,
@@ -18758,13 +18778,14 @@ function portal() {
         // phones, 100 on desktop). History remains canonical on the server and
         // the reader can explicitly prepend another same-sized page through the
         // "Load earlier" control. Quiet reconciliation keeps blocks the user
-        // already chose to load, but never expands the resident window by itself.
+        // already chose to load. Missing anchors permit bounded expansion.
         const historyPage = this._historyWindowSize();
         const minimumTail = Math.max(0, Number(opts.minimumTail) || 0);
         const requestedTail = Math.max(
           minimumTail,
           quiet ? Math.max(historyPage, st.messages.length) : historyPage,
         );
+        historyPerf.requested_tail = requestedTail;
         const preserveFullOrder = quiet && st.messageRange.order === "full";
         const qs = full
           ? "?full=1"
@@ -18827,6 +18848,10 @@ function portal() {
         historyPerf.response_bytes = Math.max(
           0, Number(r.headers.get("content-length")) || 0);
         const s = this._retainExpectedSessionSettings(parsedSession);
+        historyPerf.response_offset = s.offset;
+        historyPerf.response_total = s.total;
+        historyPerf.generation_changed = String(s.history_generation || "")
+          !== String(st.messageRange.generation || "");
         if (this.tabState[sid] !== st
             || !this._historyReplaceStillOwns(st, historyReplaceToken)) {
           historyPerf.cancel_reason = "superseded";
@@ -18995,6 +19020,19 @@ function portal() {
         // applying old numeric indices to unrelated messages.
         if (quiet && !quietRangeResolved) {
           historyPerf.cancel_reason = "anchor_missing";
+          // Expand toward the old reader's coordinate, then stop when the full
+          // available/capped window still cannot establish identity. Never retry
+          // the same rejected tail thirty times or guess a new reading position.
+          const recoveryLimit = Math.max(2000, st.messages.length);
+          const minimumTail = Math.min(recoveryLimit, Number(s.total) || requestedTail,
+            Math.max(requestedTail * 2, (Number(s.total) || 0) - st.messageRange.offset));
+          const exhausted = full || Number(s.offset) === 0 || minimumTail <= requestedTail;
+          st._historyAnchorRecovery = {
+            targetUpdated: Number(st._reconcileTargetUpdated) || 0,
+            minimumTail, exhausted,
+          };
+          historyPerf.recovery = exhausted ? "exhausted" : "expand";
+          st._pendingExternalUpdate = true;
           st.atBottom = false;
           return false;
         }
@@ -19089,6 +19127,11 @@ function portal() {
         // accepted the canonical message window. A stream claiming the pane mid-
         // read returns above without falsely marking an unseen revision as loaded.
         if (loadedUpdated) st._seenUpdated = loadedUpdated;
+        if (st._historyAnchorRecovery && !opts.followTail) historyPerf.recovery = "restored";
+        st._historyAnchorRecovery = null;
+        if ((Number(st._seenUpdated) || 0) >= (Number(st._reconcileTargetUpdated) || 0)) {
+          st._pendingExternalUpdate = false;
+        }
         st._installedCanonicalCount = Math.max(
           0, Number(s.message_count) || Number(s.total) || incomingCount,
         );
@@ -20581,7 +20624,13 @@ function portal() {
       if (!st) return false;
       const range = st.messageRange;
       st.atBottom = false;
-      if (range.offset + st.messages.length < range.total) {
+      const meta = (this.sessions || []).find(row => row.id === sid);
+      const needsFreshTail = st._pendingExternalUpdate || st._historyAnchorRecovery
+        || (Number(st._reconcileTargetUpdated) || 0) > (Number(st._seenUpdated) || 0)
+        || (Number(meta?.updated_at) || 0) > (Number(st._seenUpdated) || 0)
+        || (Number(meta?.message_count) || 0) > (Number(st._installedCanonicalCount) || 0);
+      if (!st.streaming && !st.es
+          && (needsFreshTail || range.offset + st.messages.length < range.total)) {
         const loaded = await this.loadSession(sid, {
           quiet: sid === this.currentId,
           followTail: true,

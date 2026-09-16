@@ -241,7 +241,7 @@ class _MemoryStoreActor:
         trace["queue_ms"] += (trace["started"] - trace["submitted"]) * 1000
         trace["phase"] = "resolve"
         try:
-            if trace["started"] >= trace["deadline"]:
+            if trace["deadline"] is not None and trace["started"] >= trace["deadline"]:
                 raise TimeoutError("memory read deadline exceeded before execution")
             store = self._resolve_store()
             trace["resolved"] = time.perf_counter()
@@ -428,11 +428,18 @@ class MemoryEngine:
 
     async def _recall_store_call(
         self, operation: Callable[[MemoryStore], _T], *, deadline: float | None = None,
+        recall_id: str = "none", stage: str = "read", channel: str = "none",
     ) -> _T:
+        started = time.perf_counter()
         cancelled = threading.Event()
+        trace = dict(deadline=deadline, submitted=started, started=None,
+                     resolved=None, finished=None, queue_ms=0.0, phase="queue",
+                     busy_retries=0, busy_retry_ms=0.0)
+        status = "ok"
 
         def read(store: MemoryStore) -> _T:
             while True:
+                attempt = time.perf_counter()
                 with store.read_budget(deadline, cancel_event=cancelled):
                     try:
                         return operation(store)
@@ -440,15 +447,41 @@ class MemoryEngine:
                         code = getattr(exc, "sqlite_errorcode", 0) or 0
                         if (code & 0xff) not in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}:
                             raise
-                # Short SQLite busy waits make cancellation responsive, but do
-                # not impose a second, hidden recall deadline on contention.
+                # Includes the failed attempt and backoff, not just SQLite's
+                # internal lock wait. This is a subset of execution_ms.
+                trace["busy_retries"] += 1
                 cancelled.wait(.01)
+                trace["busy_retry_ms"] += (time.perf_counter() - attempt) * 1000
 
         try:
-            return await self._recall_store_actor.call(read)
-        except asyncio.CancelledError:
-            cancelled.set()
+            return await self._recall_store_actor.call(read, trace=trace)
+        except TimeoutError:
+            status = "timeout"
             raise
+        except asyncio.CancelledError:
+            status = ("timeout" if deadline is not None
+                      and time.perf_counter() >= deadline else "cancelled")
+            raise
+        except Exception:
+            status = "error"
+            raise
+        finally:
+            cancelled.set()
+            now = time.perf_counter()
+            # Cancellation reports work observed so far; a running worker may
+            # still be unwinding its SQLite progress-handler interruption.
+            sample = trace.copy()
+            begin, resolved = sample["started"], sample["resolved"]
+            finish = sample["finished"] or now
+            perf_event("memory.recall_store", recall_id=recall_id,
+                stage=stage, channel=channel, status=status, phase=sample["phase"],
+                duration_ms=round((now - started) * 1000, 1),
+                queue_ms=round(sample["queue_ms"] +
+                    ((now - sample["submitted"]) * 1000 if begin is None else 0), 1),
+                resolve_ms=round(((resolved or finish) - begin) * 1000, 1) if begin else 0,
+                execution_ms=round((finish - resolved) * 1000, 1) if resolved else 0,
+                busy_retries=sample["busy_retries"],
+                busy_retry_ms=round(sample["busy_retry_ms"], 1))
 
     async def _store_call(self, operation: Callable[[MemoryStore], _T]) -> _T:
         return await self._store_actor.call(operation)
@@ -1476,32 +1509,33 @@ class MemoryEngine:
         cancelled = False
         failed = False
 
-        async def stage(name, operation):
+        async def stage(name, operation, *, channel="none"):
             stage_started = time.perf_counter()
-            perf_event("memory.recall_stage_start", recall_id=recall_id, stage=name)
+            perf_event("memory.recall_stage_start", recall_id=recall_id, stage=name, channel=channel)
             count = 0
+            status = "error"
             try:
                 remaining = deadline - time.perf_counter() if deadline is not None else None
                 if remaining is not None and remaining <= 0:
                     raise TimeoutError
                 async with asyncio.timeout(remaining):
                     value = await operation()
-                stages[name] = "ok"
+                status = stages[name] = "ok"
                 count = len(value) if isinstance(value, (list, dict)) else 0
                 return value
             except TimeoutError:
-                stages[name] = "timeout"
+                status = stages[name] = "timeout"
             except asyncio.CancelledError:
-                stages[name] = "cancelled"
+                status = stages[name] = "cancelled"
                 raise
             except Exception as exc:
-                stages[name] = "error"
+                status = stages[name] = "error"
                 _, failure = classify_memory_failure(exc)
                 log.debug("recall stage=%s category=%s exception_class=%s",
                           name, failure["category"], failure["exception_class"])
             finally:
                 perf_event("memory.recall_stage", recall_id=recall_id, stage=name,
-                           status=stages[name], count=count,
+                           status=status, count=count, channel=channel,
                            duration_ms=round((time.perf_counter() - stage_started) * 1000, 1))
             return []
 
@@ -1509,7 +1543,8 @@ class MemoryEngine:
             with recall_request_budget(deadline), provider_transport_scope(self._provider_http):
                 recent = await stage("recent", lambda: self._recall_store_call(
                     lambda store: store.recent_evidence(
-                        cfg.owner_id, session_id, role="user", limit=2), deadline=deadline))
+                        cfg.owner_id, session_id, role="user", limit=2), deadline=deadline,
+                    recall_id=recall_id, stage="recent"))
                 result = await self._recall_candidates(
                     cfg, query, recent, deadline, stages, stage, recall_id)
                 return result
@@ -1579,7 +1614,8 @@ class MemoryEngine:
         async def lexical() -> list[dict]:
             return await self._recall_store_call(lambda store: store.lexical_search(
                 cfg.owner_id, query, limit=cfg.retrieval.lexical_candidates
-            ), deadline=search_deadline)
+            ), deadline=search_deadline, recall_id=recall_id,
+                stage="lexical", channel="lexical")
 
         # Hydrate each channel as soon as it finishes. Waiting for a slow
         # sibling first left only the final 80-200ms for otherwise healthy
@@ -1587,7 +1623,7 @@ class MemoryEngine:
         search_deadline = deadline
 
         async def retrieve(name, search):
-            rows = await stage(name, search)
+            rows = await stage(name, search, channel=name)
             ids = list(dict.fromkeys(
                 row.get("id") or (row.get("memory") or {}).get("id")
                 for row in rows))
@@ -1596,7 +1632,8 @@ class MemoryEngine:
                 return rows, [], None
             memories = await stage("hydrate", lambda: self._recall_store_call(
                 lambda store: store.memories_with_stats_by_ids(cfg.owner_id, ids),
-                deadline=deadline))
+                deadline=deadline, recall_id=recall_id, stage="hydrate", channel=name),
+                channel=name)
             return rows, memories, stages["hydrate"]
 
         dense_result, lexical_result = await asyncio.gather(

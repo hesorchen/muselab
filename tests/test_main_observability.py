@@ -367,13 +367,18 @@ def test_history_perf_keeps_receive_parse_and_cancel_reason_private(app_module, 
     headers = {"X-Auth-Token": TEST_TOKEN}
     payload = {"status": "cancelled", "mode": "quiet", "visibility": "hidden",
                "cancel_reason": "anchor_missing", "receive_ms": 400,
-               "parse_ms": 2, "first_reveal_ms": 20}
+               "parse_ms": 2, "first_reveal_ms": 20,
+               "sid8": "1234abcd", "recovery": "expand", "requested_tail": 202,
+               "local_total": 2, "response_total": 202, "generation_changed": True}
     assert client.post("/api/log/client-perf", headers=headers, json=payload).status_code == 200
     assert events[0]["receive_ms"] == 400
     assert events[0]["parse_ms"] == 2
     assert events[0]["visibility"] == "hidden"
     assert events[0]["cancel_reason"] == "anchor_missing"
-    for field in ("visibility", "cancel_reason"):
+    assert events[0]["sid8"] == "1234abcd"
+    assert events[0]["requested_tail"] == 202
+    assert events[0]["generation_changed"] is True
+    for field in ("visibility", "cancel_reason", "sid8", "recovery", "generation_changed"):
         assert client.post("/api/log/client-perf", headers=headers,
                            json={**payload, field: "private detail"}).status_code == 422
     assert len(events) == 1

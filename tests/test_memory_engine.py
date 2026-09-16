@@ -1451,3 +1451,53 @@ def test_prepared_recall_injects_configured_limit_and_reports_actual_count(
         await instance.stop()
 
     _run(scenario())
+
+
+def test_recall_store_reports_queue_execution_and_busy_retries(tmp_path, monkeypatch):
+    from backend import memory_engine as module
+    from backend.memory_store import MemoryStore
+
+    instance = module.MemoryEngine(MemoryStore(tmp_path / "recall-timing.sqlite3"))
+    memory = instance.store.create_memory("default", "fact", "SYNTHETIC_PRIVATE_CONTENT")
+    events = []
+    monkeypatch.setattr(module, "perf_event", lambda event, **fields: events.append((event, fields)))
+    entered, release = threading.Event(), threading.Event()
+    attempts = 0
+
+    def blocked(_store):
+        entered.set()
+        assert release.wait(3)
+
+    def busy_then_read(store):
+        nonlocal attempts
+        attempts += 1
+        if attempts <= 2:
+            exc = sqlite3.OperationalError("SYNTHETIC_PRIVATE_ERROR")
+            exc.sqlite_errorcode = sqlite3.SQLITE_BUSY
+            raise exc
+        return store.memories_by_ids([memory["id"]])
+
+    async def scenario():
+        occupying = asyncio.create_task(instance._recall_store_call(blocked))
+        try:
+            assert await asyncio.to_thread(entered.wait, 2)
+            read = asyncio.create_task(instance._recall_store_call(
+                busy_then_read, recall_id="synthetic-recall", stage="hydrate", channel="dense"))
+            await asyncio.sleep(.1)
+            assert not read.done()
+            release.set()
+            assert (await read)[0]["id"] == memory["id"]
+            await occupying
+        finally:
+            release.set()
+            await instance.stop()
+
+    _run(scenario())
+    timing = next(fields for event, fields in events
+                  if event == "memory.recall_store" and fields["recall_id"] == "synthetic-recall")
+    assert timing["status"] == "ok" and timing["channel"] == "dense"
+    assert timing["queue_ms"] >= 80
+    assert timing["execution_ms"] >= timing["busy_retry_ms"] >= 15
+    assert timing["busy_retries"] == 2
+    assert timing["duration_ms"] >= timing["queue_ms"] + timing["execution_ms"] - 1
+    assert "SYNTHETIC_PRIVATE" not in repr(events)

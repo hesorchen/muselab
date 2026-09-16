@@ -166,3 +166,42 @@ a digest of the attached expression, alongside reason/stack digests and owned
 asset revision; raw expressions and stacks remain only in the local error ring.
 The browser suite exercises a real Alpine `undefined.length` error to verify this
 boundary. A historical stack fingerprint alone does not prove its source or fix.
+
+## History window recovery
+
+A quiet history refresh must preserve the reader's stable message identity. If a
+new tail does not contain that identity, the revision coordinator expands the
+next request toward the previous offset, bounded to 2,000 blocks (or the already
+loaded window size, if larger). An exhausted window keeps the current viewport
+and the pending-update marker; the same revision must not repeatedly fetch an
+identical rejected tail. A new metadata revision/count can restart recovery.
+“Return to latest” must fetch when an external update or newer metadata remains
+unapplied, even when the local offset/total says the tail is already loaded.
+Streaming ownership, generation fencing, and stable completion checks still
+apply to every installation.
+
+## Startup recall ownership and timing
+
+Finalize attachment preparation and its prompt manifest before starting recall.
+The admitted turn owns that producer while SDK connection proceeds concurrently;
+context preflight follows connection and joins recall at the query gate. Stop,
+connection failure, and preflight failure must retire the producer before clearing
+its receipt or releasing the turn. Only the exact prompt digest can consume the
+receipt; canonical user text and configured recall completeness remain unchanged.
+
+`chat.startup.recall_ms` measures preparation, while `recall_wait_ms` measures only
+the remaining wait at the query gate. These overlap `client_ms` and `preflight_ms`
+and must not be added together to calculate total startup latency.
+`chat.recall_prepare` links the preparation duration/status to `sid8` and `turn8`.
+
+`memory.recall_store` links each local read to `recall_id`, `stage`, and `channel`.
+It separates `queue_ms`, `resolve_ms`, and `execution_ms`. `busy_retry_ms` is the
+subset of execution spent in failed BUSY/LOCKED attempts plus backoff, not a direct
+measurement of SQLite's internal lock wait. Cancellation reports the observed
+elapsed work and phase; a running worker may still be unwinding. The configured
+recall deadline still applies to queue and execution; zero retains unlimited wait.
+
+`client.history_load` adds a validated eight-hex session prefix, requested/local/
+response window sizes, generation-change flag, retry count, and the closed-set
+recovery result. Never include prompts, memory content, attachment paths, full
+session identifiers, raw generations, or exception/protocol payloads in these logs.

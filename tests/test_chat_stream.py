@@ -8818,3 +8818,88 @@ def test_native_compaction_announces_progress_without_preflight(
     kinds = [event for event, _ in events]
     assert kinds.index("compact_progress") < kinds.index("text")
     assert max(i for i, kind in enumerate(kinds) if kind == "compact_progress") < kinds.index("done")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ending", ["success", "connect_error", "cancelled"])
+@pytest.mark.parametrize("attachment", [False, True])
+async def test_recall_overlaps_connect_and_retires_with_startup(
+    stream_env, client, monkeypatch, ending, attachment,
+):
+    chat = stream_env
+    sid = _make_session(client)
+    aid = "overlap-attachment"
+    if attachment:
+        chat._image_store[aid] = {
+            "kind": "text", "mime": "text/plain", "name": "overlap.txt",
+            "raw": b"synthetic attachment", "text": "synthetic attachment",
+            "ts": chat.time.time(),
+        }
+    entered, stopped = asyncio.Event(), asyncio.Event()
+    prompts, hooks, events = [], [], []
+    monkeypatch.setattr(chat.obs, "perf_event", lambda event, **fields: events.append((event, fields)))
+
+    async def recall(prompt, _sid):
+        prompts.append(prompt)
+        entered.set()
+        try:
+            if ending != "success":
+                await asyncio.Event().wait()
+            return "SYNTHETIC_RECALL_CONTEXT"
+        finally:
+            stopped.set()
+
+    class HookClient(_FakeStreamClient):
+        async def query(self, prompt):
+            await super().query(prompt)
+            hooks.append(await chat.mem0.build_recall_hook(sid, prepared_only=True)(
+                {"prompt": prompt}, None, None))
+
+    fake = HookClient([ResultMessage(
+        subtype="success", duration_ms=10, duration_api_ms=9, is_error=False,
+        num_turns=1, session_id=sid, total_cost_usd=0.0, usage={},
+    )])
+
+    async def connect(*_args, **_kwargs):
+        # The old sequential implementation cannot reach recall while connect
+        # waits here. No wall-clock performance threshold is needed.
+        await asyncio.wait_for(entered.wait(), 2)
+        broadcast = chat._active_turns[sid]
+        if ending == "connect_error":
+            raise RuntimeError("synthetic connect failure")
+        if ending == "cancelled":
+            broadcast.cancelled = True
+            raise asyncio.CancelledError
+        assert await broadcast.recall_task
+        return fake
+
+    monkeypatch.setattr(chat, "get_client", connect)
+    monkeypatch.setattr(chat.mem0, "enabled", lambda: True)
+    monkeypatch.setattr(chat.mem0, "search_context", recall)
+    start = chat._start_turn(sid, "synthetic overlap prompt", model="claude-sonnet-4-6",
+                             image_ids=aid if attachment else "")
+    if ending == "connect_error":
+        with pytest.raises(chat._TurnStartError):
+            await start
+        broadcast = chat._recent_turns[sid]
+    else:
+        broadcast = await start
+        if broadcast.task:
+            await asyncio.wait_for(broadcast.task, 5)
+    assert stopped.is_set()
+    assert broadcast.recall_task.done()
+    assert sid not in chat.mem0._prepared_recalls
+    assert aid not in chat._staged_attachment_claims
+    if ending == "success":
+        assert fake.queried == prompts
+        assert len(hooks) == 1
+        assert hooks[0]["hookSpecificOutput"]["additionalContext"] == "SYNTHETIC_RECALL_CONTEXT"
+        if attachment:
+            assert "overlap.txt" in prompts[0] and "Files attached" in prompts[0]
+        startup = next(fields for event, fields in events if event == "chat.startup")
+        assert startup["recall_wait_ms"] <= startup["recall_ms"] + 1
+    else:
+        assert fake.queried == []
+        if attachment:
+            assert aid in chat._image_store
+    assert "SYNTHETIC_RECALL_CONTEXT" not in repr(events)
