@@ -117,7 +117,7 @@ class MemoryConfig(BaseModel):
 
 
 _LOCK = threading.RLock()
-_cached: tuple[int, MemoryConfig] | None = None
+_cached: tuple[Path, int, MemoryConfig] | None = None
 
 
 def memory_dir() -> Path:
@@ -143,11 +143,11 @@ def load_config(*, fresh: bool = False) -> MemoryConfig:
     # Saving holds the writer lock across fsync/replace. Readers can keep
     # using the last committed immutable snapshot while that write is pending.
     cached = _cached
-    if not fresh and cached and cached[0] == stamp:
-        return cached[1].model_copy(deep=True)
+    if not fresh and cached and cached[:2] == (path, stamp):
+        return cached[2].model_copy(deep=True)
     with _LOCK:
-        if not fresh and _cached and _cached[0] == stamp:
-            return _cached[1].model_copy(deep=True)
+        if not fresh and _cached and _cached[:2] == (path, stamp):
+            return _cached[2].model_copy(deep=True)
         if stamp < 0:
             value = MemoryConfig()
         else:
@@ -157,7 +157,7 @@ def load_config(*, fresh: bool = False) -> MemoryConfig:
             except Exception:
                 # A corrupt config must never stop MuseLab from starting.
                 value = MemoryConfig()
-        _cached = (stamp, value)
+        _cached = (path, stamp, value)
         return value.model_copy(deep=True)
 
 
@@ -184,7 +184,7 @@ def save_config(config: MemoryConfig) -> MemoryConfig:
                 pass
             raise
         stamp = path.stat().st_mtime_ns
-        _cached = (stamp, config.model_copy(deep=True))
+        _cached = (path, stamp, config.model_copy(deep=True))
     return config.model_copy(deep=True)
 
 

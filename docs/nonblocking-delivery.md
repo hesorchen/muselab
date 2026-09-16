@@ -34,3 +34,25 @@ tests/test_docs.py checks documentation consistency, including the required
 English and Chinese document pairs.
 
 Transport receipt recovery is an implementation detail, not a user approval step.
+
+## Slow-storage diagnostics
+
+Memory configuration checks run outside the event loop, including cache-hit
+file metadata checks. Concurrent active-session requests share one read-only
+disk projection, then merge live broadcasts on the event loop. Task-card writes
+still finish before their owning operation releases its persistence boundary.
+
+The cost dashboard shares refresh work and reuses a snapshot for up to two
+seconds. After that, individual file generations invalidate the response;
+unchanged transcript aggregates are reused. External writes and sidecar cost
+changes are included on the next refresh.
+
+`memory.storage_read` separates lock, connection, read/decode and close time.
+`chat.task_overlay_persist` separates lineage lookup from persistence, and
+`chat.context_preflight` records both success and failure durations. A storage
+execution duration does not by itself prove an SQL query is slow. Generation
+format diagnostics include only response length and parse position, never the
+response. Recall deadlines and native compaction decisions are unchanged.
+
+`tests/test_log_bottlenecks.py` exercises blocked storage, shared reads,
+cancellation, owner isolation, incremental aggregation and malformed JSON.

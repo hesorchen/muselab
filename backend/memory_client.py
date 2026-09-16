@@ -309,13 +309,13 @@ async def export_legacy_memories() -> list[str]:
 
 async def search_context(query: str, session_id: str) -> str:
     """Return complete selected facts as untrusted data, or empty on failure."""
-    if native_enabled():
+    if await asyncio.to_thread(native_enabled):
         try:
             from .memory_engine import engine
             rows = await engine.recall(query, session_id)
             clean_rows = [(row, clean) for row in rows
                           if (clean := _sanitize(str(row.get("content", ""))))]
-            retrieval = engine.config().retrieval
+            retrieval = (await engine._config_async()).retrieval
             block, count = _render_block_with_count(
                 [clean for row, clean in clean_rows],
                 max_items=retrieval.final_limit)
@@ -346,7 +346,7 @@ async def search_context(query: str, session_id: str) -> str:
     started = time.perf_counter()
     try:
         payload = {"query": query, "user_id": _USER_ID, "limit": _SEARCH_LIMIT}
-        result = await _post_json(f"{url}/search", payload, recall_timeout_seconds())
+        result = await _post_json(f"{url}/search", payload, (await asyncio.to_thread(recall_timeout_seconds)))
         block, count = _render_block_with_count(_extract_text(result))
         _remember_legacy_recall_trace(
             session_id,
@@ -391,7 +391,7 @@ def _prompt_digest(prompt: str) -> str:
 async def _recall_output(session_id: str, prompt: str) -> tuple[dict, dict | None]:
     started = time.perf_counter()
     block, status = "", "empty"
-    native = native_enabled()
+    native = await asyncio.to_thread(native_enabled)
     trace = None
     perf_event("memory.recall_prepare_start", session=short_id(session_id) or "none")
     try:
@@ -432,7 +432,7 @@ async def prepare_recall(session_id: str, owner: str, prompt: str, *,
     """Wait outside the CLI hook watchdog; never rewrite the canonical query."""
     delivery_id = delivery_id or owner
     clear_prepared_recall(session_id, owner, delivery_id=delivery_id)
-    if not enabled():
+    if not (await asyncio.to_thread(enabled)):
         return True
     task = asyncio.create_task(_recall_output(session_id, prompt))
     started = time.perf_counter()
@@ -502,7 +502,7 @@ def build_recall_hook(session_id: str, *, prepared_only: bool = False):
 async def store_turn(session_id: str, model: str, user_text: str,
                      assistant_text: str, turn_id: str | None = None) -> None:
     """Persist one successfully completed exchange; never raise to the caller."""
-    if native_enabled():
+    if await asyncio.to_thread(native_enabled):
         try:
             from .memory_engine import engine
             await engine.record_turn(
@@ -531,9 +531,14 @@ async def store_turn(session_id: str, model: str, user_text: str,
 
 
 def schedule_store(session_id: str, model: str, user_text: str,
-                   assistant_text: str, turn_id: str | None = None) -> bool:
-    """Schedule a tracked write unless disabled or application shutdown began."""
-    if not enabled() or _closing:
+                   assistant_text: str, turn_id: str | None = None,
+                   *, check_enabled: bool = True) -> bool:
+    """Schedule a tracked write unless disabled or application shutdown began.
+
+    Event-loop callers defer the config check to store_turn's async reader.
+    This also keeps optional memory I/O out of terminal persistence cleanup.
+    """
+    if _closing or (check_enabled and not enabled()):
         return False
     try:
         task = asyncio.create_task(store_turn(
@@ -546,9 +551,10 @@ def schedule_store(session_id: str, model: str, user_text: str,
 
 
 def schedule_cancelled(session_id: str, user_text: str,
-                       turn_id: str | None = None) -> bool:
+                       turn_id: str | None = None,
+                       *, check_enabled: bool = True) -> bool:
     """Index a cancelled turn as evidence only; it can never create facts."""
-    if not native_enabled() or _closing:
+    if _closing or (check_enabled and not native_enabled()):
         return False
     try:
         from .memory_engine import engine
@@ -563,8 +569,9 @@ def schedule_cancelled(session_id: str, user_text: str,
 
 def schedule_failed(session_id: str, model: str, user_text: str,
                     assistant_text: str, error: str,
-                    turn_id: str | None = None) -> bool:
-    if not native_enabled() or _closing:
+                    turn_id: str | None = None,
+                    *, check_enabled: bool = True) -> bool:
+    if _closing or (check_enabled and not native_enabled()):
         return False
     try:
         from .memory_engine import engine
@@ -579,15 +586,10 @@ def schedule_failed(session_id: str, model: str, user_text: str,
 
 def pop_recall_trace(session_id: str) -> dict | None:
     consumed = _hook_recall_traces.pop(session_id, None)
-    pending = None
-    if native_enabled():
-        try:
-            from .memory_engine import engine
-            pending = engine.pop_recall_trace(session_id)
-        except Exception:
-            pass
-    else:
-        pending = _legacy_recall_traces.pop(session_id, None)
+    from .memory_engine import engine
+    native = engine.pop_recall_trace(session_id)
+    legacy = _legacy_recall_traces.pop(session_id, None)
+    pending = native if native is not None else legacy
     return consumed if consumed is not None else pending
 
 

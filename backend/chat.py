@@ -2017,19 +2017,32 @@ def _runtime_task_overlay(
         fields["output_file"] = output_file
     if usage:
         fields["usage"] = dict(usage)
+    started = time.perf_counter()
+    resolved = None
+    targets = []
+    status = "error"
     try:
         lineage = sess.runtime_lineage(owner)
         if owner in lineage:
             targets = lineage[lineage.index(owner):]
         else:
             targets = [owner]
+        resolved = time.perf_counter()
         for current in targets:
             sess.set_runtime_task_overlay(current, tid, **fields)
+        status = "ok"
     except Exception as exc:
         obs.diagnostic_line(
             f"[chat] runtime task overlay failed sid={owner[:8]} "
             f"task={tid} exc={type(exc).__name__}\n"
         )
+    finally:
+        ended = time.perf_counter()
+        if obs.is_slow((ended - started) * 1000, threshold_ms=obs.slow_io_ms()):
+            obs.perf_event("chat.task_overlay_persist", session=obs.short_id(owner),
+                           status=status, copies=len(targets),
+                           lineage_ms=((resolved or ended) - started) * 1000,
+                           persist_ms=(ended - resolved) * 1000 if resolved else 0)
 
 
 async def _runtime_task_overlay_owned(
@@ -8212,7 +8225,7 @@ async def _deliver_steering_command(
     # finishes while recalling, the durable item follows the ordinary queue
     # path and recalls again under its next turn owner.
     bc = _admitted_steering_turn(session_id, turn_id, permission=permission)
-    if mem0.enabled() and bc is not None:
+    if bc is not None and await asyncio.to_thread(mem0.enabled):
         keep_packet = False
         try:
             ready = await mem0.prepare_recall(
@@ -9954,24 +9967,39 @@ def _add_bucket(dst: dict, src: dict) -> None:
             dst[k] += v
 
 
-# Cost-dashboard response cache. The handler re-reads every session JSONL +
-# sidecar on each call (token truth lives only on disk) — O(hundreds of files),
-# measured ~8s on a large archive with no caching. The inputs only change when
-# a turn is written (new / grown JSONL) or a sidecar cost updates, so we cache
-# the full response keyed by (days, tz, today) and invalidate on a cheap
-# fingerprint of the input file set. A fingerprint match returns the cached
-# dict; a mismatch recomputes. Guarded by a plain threading.Lock because
-# cost_dashboard is a sync FastAPI endpoint (runs in the threadpool, can be hit
-# concurrently). today is in the key (not the fingerprint) so a midnight
-# rollover with no new data still recomputes the date-bucketed window.
-_dashboard_cache: dict[tuple, tuple] = {}   # (days, tz, today) -> (fingerprint, response)
+# Serialize refreshes and reuse a snapshot for at most two seconds. The disk
+# fingerprint remains authoritative after that window, including external writes.
+_dashboard_cache: dict[tuple, tuple] = {}
 _dashboard_cache_lock = threading.Lock()
+_dashboard_refresh_lock = threading.Lock()
+_dashboard_snapshots: dict[tuple, tuple] = {}
+_dashboard_file_cache: dict[tuple, dict] = {}
+_dashboard_cost_cache: dict[str, tuple] = {}
+_DASHBOARD_FRESH_SECONDS = 2.0
 
 
 @router.get("/cost-dashboard", dependencies=[Depends(require_token)])
 def cost_dashboard(days: int = Query(default=30, ge=1, le=365),
-                    tz_offset_minutes: int = Query(default=0, ge=-1440, le=1440)
-                    ) -> dict:
+                   tz_offset_minutes: int = Query(default=0, ge=-1440, le=1440)) -> dict:
+    import datetime as dt
+    today = dt.datetime.now(dt.timezone(dt.timedelta(minutes=tz_offset_minutes))).date()
+    key = (days, tz_offset_minutes, today, str(sess.SESS_DIR))
+    started = time.monotonic()
+    with _dashboard_refresh_lock:
+        cached = _dashboard_snapshots.get(key)
+        if cached is not None and time.monotonic() - cached[0] < _DASHBOARD_FRESH_SECONDS:
+            return cached[1]
+        acquired = time.monotonic()
+        response = _compute_cost_dashboard(days, tz_offset_minutes)
+        if len(_dashboard_snapshots) >= 32:
+            _dashboard_snapshots.clear()
+        _dashboard_snapshots[key] = (time.monotonic(), response)
+        obs.perf_event("chat.cost_dashboard", wait_ms=round((acquired - started) * 1000),
+                       duration_ms=round((time.monotonic() - acquired) * 1000))
+        return response
+
+
+def _compute_cost_dashboard(days: int, tz_offset_minutes: int) -> dict:
     """Aggregate per-turn usage across all sessions, bucketed by local date
     and by model. JSONL is the truth for **token counts and model** (CLI
     writes `message.usage` per turn for every vendor — Anthropic, GLM,
@@ -10000,6 +10028,7 @@ def cost_dashboard(days: int = Query(default=30, ge=1, le=365),
     now = _dt.datetime.now(tz)
     today_str = now.date().isoformat()
 
+    scan_started = time.perf_counter()
     # Discover the input file set first (cheap: glob + the project-root walk,
     # no file reads yet). We fingerprint these paths before deciding whether
     # the expensive read+parse is even needed (see cache note above).
@@ -10051,27 +10080,26 @@ def cost_dashboard(days: int = Query(default=30, ge=1, le=365),
         except OSError:
             continue
 
-    # Cheap fingerprint of the input set. Any change that affects the numbers
-    # — a new turn (grown / added JSONL), a sidecar cost update, a deleted
-    # session — shifts (file count, newest mtime, total size). stat() is
-    # microseconds per file; the full read + json.loads of every line is the
-    # ~8s cost we skip on a cache hit.
-    fp_count = fp_size = 0
-    fp_mtime = 0
-    for p in (*sidecar_paths, *jsonl_paths):
+    discovered = time.perf_counter()
+    # Track every file generation. Aggregate count/size/newest-mtime misses
+    # same-sized edits to an older file and renames with equal totals.
+    signatures = {}
+    for path in (*sidecar_paths, *jsonl_paths):
         try:
-            st = p.stat()
+            st = path.stat()
         except OSError:
             continue
-        fp_count += 1
-        fp_size += st.st_size
-        if st.st_mtime_ns > fp_mtime:
-            fp_mtime = st.st_mtime_ns
-    fingerprint = (fp_count, fp_mtime, fp_size)
-    cache_key = (days, tz_offset_minutes, today_str)
+        signatures[str(path)] = (st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+    fingerprinted = time.perf_counter()
+    fingerprint = tuple(sorted(signatures.items()))
+    cache_key = (days, tz_offset_minutes, today_str, str(sess.SESS_DIR))
     with _dashboard_cache_lock:
         cached = _dashboard_cache.get(cache_key)
         if cached is not None and cached[0] == fingerprint:
+            obs.perf_event("chat.cost_scan", cached=True,
+                           discover_ms=(discovered - scan_started) * 1000,
+                           fingerprint_ms=(fingerprinted - discovered) * 1000,
+                           transcripts=len(jsonl_paths), sidecars=len(sidecar_paths))
             return cached[1]
 
     # ── Cache miss → do the full read + scan. ──
@@ -10080,21 +10108,10 @@ def cost_dashboard(days: int = Query(default=30, ge=1, le=365),
     # can do a cheap dict lookup per turn.
     cost_by_uuid: dict[str, dict[str, float]] = {}
     for sidecar in sidecar_paths:
-        sid = sidecar.name.split(".sidecar.json")[0]
-        try:
-            data = json.loads(sidecar.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError, ValueError):
-            continue
-        msgs = data.get("messages") or {}
-        per_sess: dict[str, float] = {}
-        for uuid_key, ann in msgs.items():
-            if not isinstance(ann, dict):
-                continue
-            cost_val = _parse_cost(ann.get("cost"))
-            if cost_val > 0:
-                per_sess[uuid_key] = cost_val
-        if per_sess:
-            cost_by_uuid[sid] = per_sess
+        costs = _dashboard_sidecar_costs(sidecar, signatures.get(str(sidecar)))
+        if costs:
+            cost_by_uuid[sidecar.name.split(".sidecar.json")[0]] = costs
+    sidecars_finished = time.perf_counter()
 
     # 2) Walk JSONL — the universal token source. Every vendor writes
     # message.usage on assistant turns in Anthropic-compatible shape
@@ -10111,83 +10128,26 @@ def cost_dashboard(days: int = Query(default=30, ge=1, le=365),
     by_vendor: dict[str, dict] = defaultdict(_empty_bucket)
 
     for jsonl in jsonl_paths:
-        sid = jsonl.stem
-        sid_costs = cost_by_uuid.get(sid, {})
-        try:
-            with jsonl.open("r", encoding="utf-8") as f:
-                for line in f:
-                    # Cheap reject: only assistant turns carry usage.
-                    if '"type":"assistant"' not in line and '"type": "assistant"' not in line:
-                        continue
-                    try:
-                        entry = json.loads(line)
-                    except (json.JSONDecodeError, ValueError):
-                        continue
-                    msg = entry.get("message") or {}
-                    usage = msg.get("usage") or {}
-                    if not isinstance(usage, dict):
-                        continue
-                    in_t  = int(usage.get("input_tokens", 0) or 0)
-                    out_t = int(usage.get("output_tokens", 0) or 0)
-                    cr_t  = int(usage.get("cache_read_input_tokens", 0)
-                                  or usage.get("cache_read_tokens", 0) or 0)
-                    cc_t  = int(usage.get("cache_creation_input_tokens", 0)
-                                  or usage.get("cache_creation_tokens", 0) or 0)
-                    # Skip empty-usage entries (e.g. CLI-internal markers).
-                    if in_t == 0 and out_t == 0 and cr_t == 0 and cc_t == 0:
-                        continue
-                    # A single "turn" = one user prompt + its assistant
-                    # response chain. Inside that chain there can be many
-                    # intermediate assistant lines for tool_use loops —
-                    # those have stop_reason="tool_use". Only count the
-                    # final completion (stop_reason="end_turn", "max_tokens",
-                    # or sometimes None for legacy/streamed lines).
-                    stop_reason = msg.get("stop_reason")
-                    is_final = stop_reason in (None, "end_turn",
-                                                  "max_tokens", "stop_sequence")
-                    ts = entry.get("timestamp") or ""
-                    if not ts:
-                        continue
-                    try:
-                        dt_utc = _dt.datetime.fromisoformat(
-                            ts.replace("Z", "+00:00"))
-                    except ValueError:
-                        continue
-                    day_str = dt_utc.astimezone(tz).date().isoformat()
-                    model_name = msg.get("model") or "unknown"
-                    uuid_key = entry.get("uuid") or ""
-                    cost_val = sid_costs.get(uuid_key, 0.0)
+        buckets = _dashboard_file_usage(
+            jsonl, cost_by_uuid.get(jsonl.stem, {}), tz, signatures.get(str(jsonl)))
+        for (day_str, model_name), turn in buckets.items():
+            _add_bucket(all_total, turn)
+            _add_bucket(by_model[model_name], turn)
+            _add_bucket(by_vendor[_vendor_label_for(model_name)], turn)
+            if day_str >= cutoff_day:
+                _add_bucket(by_day[day_str], turn)
+                _add_bucket(last_30d, turn)
+            if day_str >= cutoff_7d:
+                _add_bucket(last_7d, turn)
+            if day_str == today_str:
+                _add_bucket(today_total, turn)
 
-                    turn = {
-                        "input_tokens": in_t,
-                        "output_tokens": out_t,
-                        "cache_read_tokens": cr_t,
-                        "cache_creation_tokens": cc_t,
-                        "cost": cost_val,
-                        # Every assistant line contributes tokens (each
-                        # tool-use loop iteration costs real compute), but
-                        # only the final completion counts as a "turn"
-                        # from the user's perspective.
-                        "turns": 1 if is_final else 0,
-                    }
-                    _add_bucket(all_total, turn)
-                    _add_bucket(by_model[model_name], turn)
-                    # Roll up to vendor too — same data, vendor granularity.
-                    # "Claude" for Anthropic, vendor display for third-parties
-                    # (DeepSeek / GLM / MiniMax), "Unknown" for stray model
-                    # ids we can't map (rare; CLI / vendor wrapper artifacts).
-                    vendor = _vendor_label_for(model_name)
-                    _add_bucket(by_vendor[vendor], turn)
-                    if day_str >= cutoff_day:
-                        _add_bucket(by_day[day_str], turn)
-                        _add_bucket(last_30d, turn)
-                    if day_str >= cutoff_7d:
-                        _add_bucket(last_7d, turn)
-                    if day_str == today_str:
-                        _add_bucket(today_total, turn)
-        except OSError:
-            continue
-
+    obs.perf_event("chat.cost_scan", cached=False,
+                   discover_ms=(discovered - scan_started) * 1000,
+                   fingerprint_ms=(fingerprinted - discovered) * 1000,
+                   sidecars_ms=(sidecars_finished - fingerprinted) * 1000,
+                   transcripts_ms=(time.perf_counter() - sidecars_finished) * 1000,
+                   transcripts=len(jsonl_paths), sidecars=len(sidecar_paths))
     # Densify by_day so quiet days still get a zero bar.
     dense_days: list[dict] = []
     for i in range(days):
@@ -10248,8 +10208,115 @@ def cost_dashboard(days: int = Query(default=30, ge=1, le=365),
         # midnight rollovers (old keys differ only by today_str).
         for k in [k for k in _dashboard_cache if k[2] != today_str]:
             _dashboard_cache.pop(k, None)
+        if len(_dashboard_cache) >= 32:
+            _dashboard_cache.clear()
         _dashboard_cache[cache_key] = (fingerprint, response)
     return response
+
+
+def _dashboard_sidecar_costs(path: Path, signature) -> dict:
+    key = str(path)
+    cached = _dashboard_cost_cache.get(key)
+    if signature is not None and cached is not None and cached[0] == signature:
+        return cached[1]
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        messages = data.get("messages") or {}
+        costs = {
+            uuid_key: cost for uuid_key, ann in messages.items()
+            if isinstance(ann, dict) and (cost := _parse_cost(ann.get("cost"))) > 0}
+        st = path.stat()
+    except (OSError, json.JSONDecodeError, ValueError):
+        return {}
+    if signature == (st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns):
+        if len(_dashboard_cost_cache) >= 1024 and key not in _dashboard_cost_cache:
+            _dashboard_cost_cache.pop(next(iter(_dashboard_cost_cache)))
+        _dashboard_cost_cache[key] = (signature, costs)
+    return costs
+
+
+def _dashboard_file_usage(jsonl: Path, sid_costs: dict, tz, signature) -> dict:
+    from collections import defaultdict
+    import datetime as _dt
+    key = (str(jsonl), signature, tz, tuple(sorted(sid_costs.items())))
+    cached = _dashboard_file_cache.get(key) if signature is not None else None
+    if cached is not None:
+        return cached
+    grouped = defaultdict(_empty_bucket)
+    try:
+        with jsonl.open("r", encoding="utf-8") as f:
+            for line in f:
+                # Cheap reject: only assistant turns carry usage.
+                if '"type":"assistant"' not in line and '"type": "assistant"' not in line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                msg = entry.get("message") or {}
+                usage = msg.get("usage") or {}
+                if not isinstance(usage, dict):
+                    continue
+                in_t  = int(usage.get("input_tokens", 0) or 0)
+                out_t = int(usage.get("output_tokens", 0) or 0)
+                cr_t  = int(usage.get("cache_read_input_tokens", 0)
+                              or usage.get("cache_read_tokens", 0) or 0)
+                cc_t  = int(usage.get("cache_creation_input_tokens", 0)
+                              or usage.get("cache_creation_tokens", 0) or 0)
+                # Skip empty-usage entries (e.g. CLI-internal markers).
+                if in_t == 0 and out_t == 0 and cr_t == 0 and cc_t == 0:
+                    continue
+                # A single "turn" = one user prompt + its assistant
+                # response chain. Inside that chain there can be many
+                # intermediate assistant lines for tool_use loops —
+                # those have stop_reason="tool_use". Only count the
+                # final completion (stop_reason="end_turn", "max_tokens",
+                # or sometimes None for legacy/streamed lines).
+                stop_reason = msg.get("stop_reason")
+                is_final = stop_reason in (None, "end_turn",
+                                              "max_tokens", "stop_sequence")
+                ts = entry.get("timestamp") or ""
+                if not ts:
+                    continue
+                try:
+                    dt_utc = _dt.datetime.fromisoformat(
+                        ts.replace("Z", "+00:00"))
+                except ValueError:
+                    continue
+                day_str = dt_utc.astimezone(tz).date().isoformat()
+                model_name = msg.get("model") or "unknown"
+                uuid_key = entry.get("uuid") or ""
+                cost_val = sid_costs.get(uuid_key, 0.0)
+
+                turn = {
+                    "input_tokens": in_t,
+                    "output_tokens": out_t,
+                    "cache_read_tokens": cr_t,
+                    "cache_creation_tokens": cc_t,
+                    "cost": cost_val,
+                    # Every assistant line contributes tokens (each
+                    # tool-use loop iteration costs real compute), but
+                    # only the final completion counts as a "turn"
+                    # from the user's perspective.
+                    "turns": 1 if is_final else 0,
+                }
+                _add_bucket(grouped[(day_str, model_name)], turn)
+    except OSError:
+        return grouped
+    # Cache only a stable, completely read generation. A CLI append during
+    # scanning must be reconsidered on the next refresh.
+    try:
+        st = jsonl.stat()
+        unchanged = signature == (st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+    except OSError:
+        unchanged = False
+    if unchanged:
+        for old in [old for old in _dashboard_file_cache if old[0] == str(jsonl)]:
+            _dashboard_file_cache.pop(old, None)
+        if len(_dashboard_file_cache) >= 1024:
+            _dashboard_file_cache.pop(next(iter(_dashboard_file_cache)))
+        _dashboard_file_cache[key] = grouped
+    return grouped
 
 
 def _round_bucket(b: dict) -> dict:
@@ -17093,6 +17160,8 @@ async def _start_turn(
         close to full.
         """
         nonlocal client
+        probe_started = time.perf_counter()
+        use_cached = False
         try:
             # This probe is advisory when no compact is needed. Never let a
             # wedged SDK control request delay the user's real prompt for the
@@ -17118,8 +17187,14 @@ async def _start_turn(
                     env_int("MUSELAB_COMPACT_TIMEOUT_S", 300, min_value=1),
                 ),
             )
-            obs.perf_event("chat.context_preflight", cached=use_cached)
+            obs.perf_event("chat.context_preflight", session=obs.short_id(session_id),
+                           cached=use_cached, outcome="ok",
+                           duration_ms=round((time.perf_counter() - probe_started) * 1000))
         except Exception as e:
+            obs.perf_event("chat.context_preflight", session=obs.short_id(session_id),
+                           cached=use_cached, outcome="timeout" if isinstance(e, TimeoutError) else "error",
+                           error_class=type(e).__name__,
+                           duration_ms=round((time.perf_counter() - probe_started) * 1000))
             safe_kind = _classify_stream_error(str(e)).get("kind", "unknown")
             obs.diagnostic_line(
                 f"[chat-preflight] get_context_usage skipped sid={session_id[:8]} "
@@ -18958,18 +19033,18 @@ async def _start_turn(
             # Legacy Mem0 keeps its historical success-only behaviour.
             if sess.session_is_deleting(session_id):
                 memory_outcome_scheduled = False
-            elif mem0.enabled() and not was_cancelled and not _is_error:
+            elif not was_cancelled and not _is_error:
                 _asst_full = "".join(assistant_acc)
                 if _asst_full.strip():
                     memory_outcome_scheduled = mem0.schedule_store(
-                        session_id, model_to_use, prompt, _asst_full, new_asst_uuid)
+                        session_id, model_to_use, prompt, _asst_full, new_asst_uuid, check_enabled=False)
             elif was_cancelled:
                 memory_outcome_scheduled = mem0.schedule_cancelled(
-                    session_id, prompt, new_asst_uuid)
+                    session_id, prompt, new_asst_uuid, check_enabled=False)
             elif _is_error:
                 memory_outcome_scheduled = mem0.schedule_failed(
                     session_id, model_to_use, prompt,
-                    "".join(assistant_acc), _error_message, new_asst_uuid)
+                    "".join(assistant_acc), _error_message, new_asst_uuid, check_enabled=False)
         # event_gen is now driven by a detached background task (see
         # stream endpoint below), so the SSE generator doesn't cancel
         # these workers when the browser disconnects — they complete
@@ -19497,13 +19572,13 @@ async def _start_turn(
             if not memory_outcome_scheduled and not deleting_session:
                 if broadcast.cancelled:
                     memory_outcome_scheduled = mem0.schedule_cancelled(
-                        session_id, prompt, broadcast.turn_id)
+                        session_id, prompt, broadcast.turn_id, check_enabled=False)
                 elif turn_errored:
                     memory_outcome_scheduled = mem0.schedule_failed(
                         session_id, model_to_use, prompt,
                         "".join(assistant_acc),
                         turn_error_text or "turn stream failed",
-                        broadcast.turn_id)
+                        broadcast.turn_id, check_enabled=False)
             if (broadcast.cancelled
                     and not broadcast.canonical_terminal_published
                     and not broadcast.cancelled_snapshot_persisted):
@@ -20572,6 +20647,7 @@ def _session_active_status(
     runtime_lineage: list[str] | None = None,
     durable_runtime_task_ids: Iterable[str] | None = None,
     continuation_disk_state: tuple[frozenset[str], str] | None = None,
+    hydrate_attachments: bool = True,
 ) -> dict:
     """Tell the frontend whether `sid` has an in-progress background
     turn. Used on session load to decide between "render JSONL history"
@@ -20672,7 +20748,8 @@ def _session_active_status(
                     recent.activity_source if recent is not None else ""
                 ),
             }
-    _hydrate_staged_attachment_display(b)
+    if hydrate_attachments:
+        _hydrate_staged_attachment_display(b)
     state = _mux_broadcast_state(b)
     state.update({
         "runtime_background_tasks_pending": runtime_background_pending,
@@ -20683,9 +20760,30 @@ def _session_active_status(
     return state
 
 
+_active_status_reads = SharedCalls()
+
+
 @router.get("/sessions/{sid}/active", dependencies=[Depends(require_token)])
-def session_active_status(sid: str) -> dict:
-    return _session_active_status(sid)
+async def session_active_status(sid: str) -> dict:
+    lineages, tasks, continuations = await _active_status_reads.run(
+        (str(sess.SESS_DIR), sid),
+        lambda: obs.to_thread_io("chat.active_projection", sid,
+                                 _runtime_reconcile_snapshot, (sid,)))
+    candidate = _active_turns.get(sid) or _get_recent_turn(sid)
+    if (candidate is not None and candidate.staged_attachment_ids
+            and not candidate.user_images and not candidate.user_docs):
+        images, docs = await _active_status_reads.run(
+            (str(sess.SESS_DIR), "attachments", tuple(candidate.staged_attachment_ids)),
+            lambda: obs.to_thread_io("chat.active_attachments", sid,
+                                     _resolve_staged_attachment_display,
+                                     candidate.staged_attachment_ids))
+        if not candidate.user_images and not candidate.user_docs:
+            candidate.user_images, candidate.user_docs = images, docs
+    return _session_active_status(
+        sid, runtime_lineage=lineages.get(sid, []),
+        durable_runtime_task_ids=tasks.get(sid, ()),
+        continuation_disk_state=continuations.get(sid, (frozenset(), "")),
+        hydrate_attachments=False)
 
 
 # ====== interrupted turns (process-crash recovery) ======

@@ -528,18 +528,18 @@ def test_hybrid_recall_fuses_channels_and_exposes_trace(tmp_path, monkeypatch):
         authority="confirmed", confidence=1.0)
     event_loop_thread = threading.get_ident()
     io_threads = {}
-    original_hydrate = instance._resolve_recall_store().memories_by_ids
+    original_hydrate = instance._resolve_recall_store().memories_with_stats_by_ids
     original_log = instance.store.log_recall
 
-    def tracked_hydrate(memory_ids):
+    def tracked_hydrate(owner_id, memory_ids):
         io_threads["hydrate"] = threading.get_ident()
-        return original_hydrate(memory_ids)
+        return original_hydrate(owner_id, memory_ids)
 
     def tracked_log(*args, **kwargs):
         io_threads["log"] = threading.get_ident()
         return original_log(*args, **kwargs)
 
-    monkeypatch.setattr(instance._resolve_recall_store(), "memories_by_ids", tracked_hydrate)
+    monkeypatch.setattr(instance._resolve_recall_store(), "memories_with_stats_by_ids", tracked_hydrate)
     monkeypatch.setattr(instance.store, "log_recall", tracked_log)
 
     class FakeEmbedding:

@@ -776,7 +776,7 @@ class GenerationProvider:
         # CLI setting. Extraction is a bounded text transform, not an agent task.
         options_kwargs.setdefault("env", {})["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] = str(max_tokens)
         workdir = memory_dir() / "generator"
-        workdir.mkdir(parents=True, exist_ok=True)
+        await asyncio.to_thread(workdir.mkdir, parents=True, exist_ok=True)
         options = ClaudeAgentOptions(
             model=model,
             system_prompt=system,
@@ -850,31 +850,56 @@ class GenerationProvider:
                 category="malformed_response", reason="empty_output")
         return text
 
+    @staticmethod
+    def _json_value(text: str):
+        """Accept one unambiguous JSON document, including a Markdown fence.
+
+        Never salvage a nested object from an array or a truncated document.
+        Wrapping prose is allowed only when it contains no competing document.
+        """
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            pass
+        fences = re.findall(r"```(?:json)?\s*\n?(.*?)```", text, flags=re.DOTALL | re.IGNORECASE)
+        if fences:
+            if len(fences) != 1:
+                raise ValueError("ambiguous_json")
+            prefix, _, suffix = text.partition("```")
+            suffix = suffix.partition("```")[2]
+            if any(char in prefix + suffix for char in "{}[]"):
+                raise ValueError("ambiguous_json")
+            return json.loads(fences[0])
+        start = text.find("{")
+        if start < 0 or any(char in text[:start] for char in '["'):
+            raise ValueError("invalid_json")
+        value, end = json.JSONDecoder().raw_decode(text, start)
+        if any(char in text[end:] for char in "{}[]"):
+            raise ValueError("ambiguous_json")
+        return value
+
     async def complete_json(self, system: str, prompt: str) -> dict:
         # A syntactically valid array/string is still the wrong schema. Make
         # one bounded format-repair attempt instead of losing the job at once.
         instruction = "\nReturn exactly one JSON object. No arrays, quoted JSON, Markdown or prose."
         for attempt in range(2):
             text = (await self.complete(system + instruction, prompt)).strip()
-            text = re.sub(r"^```(?:json)?\s*", "", text)
-            text = re.sub(r"\s*```$", "", text)
             reason = "invalid_json"
+            error_offset = None
             try:
-                try:
-                    value = json.loads(text)
-                except json.JSONDecodeError:
-                    start, end = text.find("{"), text.rfind("}")
-                    if start < 0 or end <= start:
-                        raise
-                    value = json.loads(text[start:end + 1])
+                value = self._json_value(text)
                 if isinstance(value, dict):
                     return value
                 reason = "non_object_json"
-            except json.JSONDecodeError:
+            except json.JSONDecodeError as exc:
+                error_offset = exc.pos
+            except ValueError:
                 pass
             from .observability import perf_event
             perf_event("memory.generation_format", job_ref=generation_job_ref.get(),
-                       reason=reason, attempt=attempt + 1, retrying=attempt == 0)
+                       reason=reason, attempt=attempt + 1, retrying=attempt == 0,
+                       response_chars=len(text), error_offset=error_offset,
+                       fenced="```" in text)
             instruction += "\nThe prior response had the wrong format. Follow the requested object schema strictly."
         provider, model = self.metadata()
         raise GenerationError(retryable=False, provider=provider, model=model,

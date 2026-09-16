@@ -514,17 +514,21 @@ class MemoryEngine:
     def config(self) -> MemoryConfig:
         return load_config()
 
+    async def _config_async(self) -> MemoryConfig:
+        # Even a cache hit stats the config; slow disks must not stop SSE.
+        return await obs.to_thread_io("memory.config_read", "", self.config)
+
     def enabled(self) -> bool:
         return self.config().enabled
 
-    def start(self) -> None:
+    def start(self, *, config: MemoryConfig | None = None) -> None:
         self._provider_http.reopen()
         self._closing = False
         self._store_actor.reopen()
         self._recall_store_actor.reopen()
         self._ui_store_actor.reopen()
         if (os.environ.get("MUSELAB_MEMORY_WORKER_DISABLED") == "1"
-                or not self.enabled() or self._workers):
+                or self._workers or not (config.enabled if config is not None else self.enabled())):
             return
         try:
             loop = asyncio.get_running_loop()
@@ -604,7 +608,7 @@ class MemoryEngine:
         # available to concurrent governance/read endpoints.
         await self.stop(close_store=False)
         self._closing = False
-        self.start()
+        self.start(config=await self._config_async())
 
     async def stop(self, timeout: float = 5.0, *, close_store: bool = True) -> None:
         self._closing = True
@@ -628,7 +632,7 @@ class MemoryEngine:
     async def record_turn(self, session_id: str, model: str, user_text: str,
                           assistant_text: str, *, outcome: str = "success",
                           turn_id: str | None = None) -> str | None:
-        cfg = self.config()
+        cfg = await self._config_async()
         if not cfg.enabled or self._closing:
             return None
 
@@ -673,7 +677,7 @@ class MemoryEngine:
 
     async def record_cancelled_turn(self, session_id: str, user_text: str,
                                     *, turn_id: str | None = None) -> str | None:
-        cfg = self.config()
+        cfg = await self._config_async()
         if not cfg.enabled:
             return None
 
@@ -707,7 +711,7 @@ class MemoryEngine:
     async def record_failed_turn(self, session_id: str, model: str, user_text: str,
                                  assistant_text: str, error: str,
                                  *, turn_id: str | None = None) -> str | None:
-        cfg = self.config()
+        cfg = await self._config_async()
         if not cfg.enabled or self._closing:
             return None
 
@@ -781,7 +785,7 @@ class MemoryEngine:
                 # Owner fence. Jobs carry the owner that enqueued them; the
                 # handlers below resolve everything else from the LIVE config.
                 job_owner = str(job.get("owner_id") or "")
-                if job_owner and job_owner != self.config().owner_id:
+                if job_owner and job_owner != (await self._config_async()).owner_id:
                     raise MemoryJobOwnerMismatchError
                 if job["kind"] == "consolidate_episode":
                     await self._consolidate_episode(job["payload"]["episode_id"])
@@ -841,7 +845,7 @@ class MemoryEngine:
             )
 
     async def _sweep_idle_episodes(self) -> None:
-        cfg = self.config()
+        cfg = await self._config_async()
         cutoff = time.time() - cfg.consolidation.episode_idle_minutes * 60
         def close_and_enqueue(store: MemoryStore) -> list[str]:
             episode_ids = store.close_idle_episodes(
@@ -898,7 +902,7 @@ class MemoryEngine:
             )
 
         records = await asyncio.to_thread(parse)
-        owner_id = self.config().owner_id
+        owner_id = (await self._config_async()).owner_id
 
         def persist_records(store: MemoryStore) -> None:
             attached: list[str] = []
@@ -948,7 +952,7 @@ class MemoryEngine:
         await self._store_call(persist_records)
 
     async def _consolidate_episode(self, episode_id: str) -> None:
-        cfg = self.config()
+        cfg = await self._config_async()
         if not cfg.consolidation.dreamer_enabled:
             return
         episode = await self._store_call(
@@ -1032,7 +1036,7 @@ class MemoryEngine:
     async def _verify_and_store(self, candidate: dict, episode_id: str,
                                 evidence_ids: list[str], *,
                                 kind_override: str | None = None) -> dict | None:
-        cfg = self.config()
+        cfg = await self._config_async()
         content = " ".join(str(candidate.get("content", "")).split())[:3000]
         kind = kind_override or str(candidate.get("kind", "fact"))
         if not content or kind not in _MEMORY_KINDS:
@@ -1284,7 +1288,7 @@ class MemoryEngine:
         return max(0.35, min(1.0, best))
 
     async def _cross_episode_dream(self, episode_ids: list[str] | None) -> None:
-        cfg = self.config()
+        cfg = await self._config_async()
         if not cfg.consolidation.dreamer_enabled:
             return
         loaded = await self._store_call(
@@ -1358,7 +1362,7 @@ class MemoryEngine:
         await self._maybe_generate_skill(episodes)
 
     async def _maybe_generate_skill(self, episodes: list[dict]) -> None:
-        cfg = self.config()
+        cfg = await self._config_async()
         if not cfg.consolidation.skill_learning_enabled:
             return
         successes = [item for item in episodes if item.get("outcome") == "success"]
@@ -1431,7 +1435,7 @@ class MemoryEngine:
             raise
 
     async def _index_memories(self, memory_ids: list[str]) -> None:
-        cfg = self.config()
+        cfg = await self._config_async()
         # Old durable jobs may contain larger batches. Bound embedding memory
         # and the duration for which governance waits on the vector write fence.
         for start in range(0, len(memory_ids), _REINDEX_BATCH_SIZE):
@@ -1481,7 +1485,7 @@ class MemoryEngine:
 
     async def _unindex_memory(self, memory_id: str) -> None:
         """Retry retirement under the same fence as index/governance writes."""
-        cfg = self.config()
+        cfg = await self._config_async()
         async with self._vector_mutation_lock:
             await self._join_vector_write(vector_store(cfg.vector).delete(memory_id))
             def mark_pending(store: MemoryStore) -> None:
@@ -1493,7 +1497,7 @@ class MemoryEngine:
 
     async def recall(self, query: str, session_id: str) -> list[dict]:
         started = time.perf_counter()
-        cfg = self.config()
+        cfg = await self._config_async()
         timeout_ms = cfg.retrieval.soft_timeout_ms
         deadline = started + timeout_ms / 1000 if timeout_ms else None
         query = str(query).strip()[:8000]
@@ -1695,7 +1699,7 @@ class MemoryEngine:
         return self._recall_trace.pop(session_id, None)
 
     async def probe(self, config: MemoryConfig | None = None) -> dict:
-        cfg = config or self.config()
+        cfg = config or (await self._config_async())
         started = time.perf_counter()
         # Constructing the Registry verifies writable storage, WAL and FTS5
         # before an enabled configuration can be committed.
@@ -1717,7 +1721,7 @@ class MemoryEngine:
                                    status: str = "active",
                                    authority: str = "confirmed",
                                    confidence: float = 1.0) -> dict:
-        cfg = self.config()
+        cfg = await self._config_async()
         if kind not in _MEMORY_KINDS:
             raise ValueError("unsupported memory kind")
         if status not in _MEMORY_STATUSES:
@@ -1760,7 +1764,7 @@ class MemoryEngine:
 
     async def _correct_memory(self, memory_id: str, content: str,
                              *, kind: str | None = None) -> dict:
-        cfg = self.config()
+        cfg = await self._config_async()
         memory = await self._store_call(
             lambda store: store.supersede_memory(
                 memory_id, cfg.owner_id, content, kind=kind))
@@ -1790,7 +1794,7 @@ class MemoryEngine:
         return memory
 
     async def _forget_memory(self, memory_id: str) -> bool:
-        cfg = self.config()
+        cfg = await self._config_async()
         deleted = await self._store_call(
             lambda store: store.delete_memory(memory_id, cfg.owner_id))
         if deleted and cfg.enabled:
@@ -1815,7 +1819,7 @@ class MemoryEngine:
         return deleted
 
     async def status(self) -> dict:
-        cfg = self.config()
+        cfg = await self._config_async()
 
         path = self._store.path if self._store_pinned else database_path()
         registry = await self._status_reads.run((path, cfg.owner_id),
@@ -1828,14 +1832,14 @@ class MemoryEngine:
             **registry,
         }
 
-    def _maintenance_revision(self) -> str:
+    def _maintenance_revision(self, cfg: MemoryConfig | None = None) -> str:
         # Persist only a digest, never URLs, credentials or configuration.
-        return hashlib.sha256(self.config().model_dump_json().encode()).hexdigest()
+        return hashlib.sha256((cfg or self.config()).model_dump_json().encode()).hexdigest()
 
     async def trigger_dream(self) -> str:
-        cfg = self.config()
+        cfg = await self._config_async()
 
-        revision = self._maintenance_revision()
+        revision = self._maintenance_revision(cfg)
 
         def enqueue_dream(store: MemoryStore) -> str:
             newly_closed = store.close_idle_episodes(
@@ -1856,13 +1860,13 @@ class MemoryEngine:
         return job_id
 
     async def reindex_all(self) -> int:
-        cfg = self.config()
+        cfg = await self._config_async()
         # A single Registry transaction enumerates every active ID by a stable
         # cursor and commits bounded durable jobs together. No updated_at-based
         # pagination: finishing an index job updates that column.
         queued = await self._store_call(lambda store: store.enqueue_reindex_batches(
             cfg.owner_id, batch_size=_REINDEX_BATCH_SIZE,
-            revision=self._maintenance_revision()))
+            revision=self._maintenance_revision(cfg)))
         self._wake.set()
         return queued
 
@@ -1896,7 +1900,7 @@ class MemoryEngine:
     async def approve_skill(
         self, artifact_id: str, edited_markdown: str | None = None,
     ) -> dict:
-        cfg = self.config()
+        cfg = await self._config_async()
         return await self._store_call(
             lambda store: self._approve_skill(
                 store, cfg, artifact_id, edited_markdown))
@@ -1951,7 +1955,7 @@ class MemoryEngine:
         return updated
 
     async def reject_skill(self, artifact_id: str) -> dict:
-        cfg = self.config()
+        cfg = await self._config_async()
 
         def reject(store: MemoryStore) -> dict:
             artifact = store.artifact(artifact_id)
@@ -1987,7 +1991,7 @@ class MemoryEngine:
         return installed
 
     async def disable_skill(self, artifact_id: str) -> dict:
-        cfg = self.config()
+        cfg = await self._config_async()
         return await self._store_call(
             lambda store: self._disable_skill(store, cfg, artifact_id))
 

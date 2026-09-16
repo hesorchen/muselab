@@ -922,15 +922,76 @@ class MemoryStore:
                     }
         return grouped
 
+    @contextmanager
+    def _observed_read(self, operation: str):
+        """Measure storage phases without logging SQL, identities or content."""
+        from . import observability as obs
+        started = time.perf_counter()
+        acquired = connected = finished = None
+        status = "error"
+        try:
+            with self._lock:
+                acquired = time.perf_counter()
+                with self._connect() as conn:
+                    connected = time.perf_counter()
+                    try:
+                        yield conn
+                        status = "ok"
+                    finally:
+                        finished = time.perf_counter()
+        finally:
+            ended = time.perf_counter()
+            elapsed = (ended - started) * 1000
+            if obs.is_slow(elapsed, threshold_ms=obs.slow_io_ms()):
+                obs.perf_event(
+                    "memory.storage_read", operation=operation, status=status,
+                    read_only=self._read_only, duration_ms=elapsed,
+                    lock_ms=((acquired or ended) - started) * 1000,
+                    connect_ms=((connected or ended) - acquired) * 1000 if acquired else 0,
+                    read_decode_ms=((finished or ended) - connected) * 1000 if connected else 0,
+                    close_ms=(ended - finished) * 1000 if finished else 0)
+
     def memories_with_stats_by_ids(self, owner_id: str,
                                    memory_ids: list[str]) -> list[dict]:
-        rows = self.memories_by_ids(memory_ids)
-        stats = self.memory_recall_stats(owner_id, [row["id"] for row in rows])
-        sources = self.memory_sources([row["id"] for row in rows])
-        for row in rows:
-            row["recall_stats"] = stats[row["id"]]
-            row["sources"] = sources.get(row["id"], [])
-        return rows
+        unique_ids = list(dict.fromkeys(memory_ids))
+        if not unique_ids:
+            return []
+        found = {}
+        # One connection and read snapshot, instead of three connection/setup/
+        # close cycles per channel. Filter ownership before reading provenance.
+        with self._observed_read("hydrate") as conn:
+            conn.execute("BEGIN")
+            for start in range(0, len(unique_ids), 500):
+                chunk = unique_ids[start:start + 500]
+                placeholders = ",".join("?" for _ in chunk)
+                rows = conn.execute(
+                    f"SELECT * FROM memories WHERE owner_id=? AND id IN ({placeholders})",
+                    (owner_id, *chunk)).fetchall()
+                for row in rows:
+                    item = self._row(row) or {}
+                    item["recall_stats"] = {
+                        "recall_count": 0, "first_recalled_at": None,
+                        "last_recalled_at": None, "helpful_count": 0,
+                        "unhelpful_count": 0}
+                    item["sources"] = []
+                    found[row["id"]] = item
+                ids = [row["id"] for row in rows]
+                if not ids:
+                    continue
+                placeholders = ",".join("?" for _ in ids)
+                for row in conn.execute(
+                    f"SELECT * FROM memory_recall_stats WHERE owner_id=? "
+                    f"AND memory_id IN ({placeholders})", (owner_id, *ids)):
+                    found[row["memory_id"]]["recall_stats"] = {
+                        name: row[name] for name in (
+                            "recall_count", "first_recalled_at", "last_recalled_at",
+                            "helpful_count", "unhelpful_count")}
+                for row in conn.execute(
+                    f"SELECT memory_id,source_type,source_id,relation FROM memory_sources "
+                    f"WHERE memory_id IN ({placeholders}) ORDER BY memory_id,source_type,source_id", ids):
+                    found[row["memory_id"]]["sources"].append({
+                        name: row[name] for name in ("source_type", "source_id", "relation")})
+        return [found[item_id] for item_id in unique_ids if item_id in found]
 
     def mark_memories_indexed(
         self,
@@ -1167,7 +1228,7 @@ class MemoryStore:
         if kind:
             params.append(kind)
         params.append(limit)
-        with self._lock, self._connect() as conn:
+        with self._observed_read("lexical") as conn:
             try:
                 rows = conn.execute(
                     f"""SELECT m.*, bm25(memory_fts) AS lexical_rank

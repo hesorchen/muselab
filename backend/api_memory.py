@@ -180,7 +180,7 @@ async def list_items(
     sort: str = Query(default="auto", pattern="^(auto|relevance|updated_at|recall_count|last_recalled_at|helpful_count|unhelpful_count)$"),
     direction: str = Query(default="desc", pattern="^(asc|desc)$"),
 ) -> dict:
-    cfg = load_config()
+    cfg = await to_thread_io("memory.config_read", "", load_config)
 
     def load(store):
         rows, total = store.browse_memories(
@@ -217,7 +217,7 @@ async def create_item(body: MemoryCreate) -> dict:
 
 @router.get("/items/{memory_id}")
 async def get_item(memory_id: str) -> dict:
-    cfg = load_config()
+    cfg = await to_thread_io("memory.config_read", "", load_config)
     def load(store):
         item = store.memory(memory_id)
         if not item or item.get("owner_id") != cfg.owner_id:
@@ -231,7 +231,7 @@ async def get_item(memory_id: str) -> dict:
 
 @router.get("/items/{memory_id}/traceback")
 async def get_item_traceback(memory_id: str) -> dict:
-    cfg = load_config()
+    cfg = await to_thread_io("memory.config_read", "", load_config)
     try:
         sites = await _read_store(
             lambda store: store.memory_traceback(cfg.owner_id, memory_id))
@@ -252,7 +252,7 @@ async def correct_item(memory_id: str, body: MemoryCorrection) -> dict:
 
 @router.post("/items/{memory_id}/approve")
 async def approve_item(memory_id: str) -> dict:
-    cfg = load_config()
+    cfg = await to_thread_io("memory.config_read", "", load_config)
 
     def approve(store):
         item = store.memory(memory_id)
@@ -283,7 +283,7 @@ async def delete_item(memory_id: str) -> dict:
 
 @router.post("/items/{memory_id}/feedback")
 async def feedback_item(memory_id: str, body: MemoryFeedback) -> dict:
-    cfg = load_config()
+    cfg = await to_thread_io("memory.config_read", "", load_config)
 
     def apply_feedback(store):
         try:
@@ -312,7 +312,7 @@ async def list_episodes(
     status: str | None = None,
     limit: int = Query(default=100, ge=1, le=500),
 ) -> dict:
-    cfg = load_config()
+    cfg = await to_thread_io("memory.config_read", "", load_config)
     rows = await _read_store(
         lambda store: store.list_episodes(
             cfg.owner_id, status=status, limit=limit))
@@ -321,7 +321,7 @@ async def list_episodes(
 
 @router.get("/episodes/{episode_id}")
 async def get_episode(episode_id: str) -> dict:
-    cfg = load_config()
+    cfg = await to_thread_io("memory.config_read", "", load_config)
     item = await _read_store(
         lambda store: store.episode(episode_id))
     if not item or item.get("owner_id") != cfg.owner_id:
@@ -335,7 +335,7 @@ async def list_artifacts(
     status: str | None = None,
     limit: int = Query(default=100, ge=1, le=500),
 ) -> dict:
-    cfg = load_config()
+    cfg = await to_thread_io("memory.config_read", "", load_config)
     rows = await _read_store(
         lambda store: store.list_artifacts(
             cfg.owner_id, kind=kind, status=status, limit=limit))
@@ -379,7 +379,7 @@ async def list_jobs(limit: int = Query(default=100, ge=1, le=500)) -> dict:
 
 @router.get("/recalls")
 async def list_recalls(limit: int = Query(default=100, ge=1, le=500)) -> dict:
-    cfg = load_config()
+    cfg = await to_thread_io("memory.config_read", "", load_config)
     rows = await _read_store(
         lambda store: store.recent_recalls(cfg.owner_id, limit=limit))
     return {"items": rows, "count": len(rows)}
@@ -387,7 +387,7 @@ async def list_recalls(limit: int = Query(default=100, ge=1, le=500)) -> dict:
 
 @router.get("/audit")
 async def list_audit(limit: int = Query(default=100, ge=1, le=500)) -> dict:
-    cfg = load_config()
+    cfg = await to_thread_io("memory.config_read", "", load_config)
     rows = await _read_store(
         lambda store: store.audits(cfg.owner_id, limit=limit))
     return {"items": rows, "count": len(rows)}
@@ -395,7 +395,7 @@ async def list_audit(limit: int = Query(default=100, ge=1, le=500)) -> dict:
 
 @router.post("/backup")
 async def create_backup() -> dict:
-    cfg = load_config()
+    cfg = await to_thread_io("memory.config_read", "", load_config)
     receipt = await engine._store_call(
         lambda store: store.create_backup(cfg.owner_id, memory_dir() / "backups"))
     return {"ok": True, "backup": receipt}
@@ -405,7 +405,7 @@ async def create_backup() -> dict:
 async def list_backups(
     limit: int = Query(default=100, ge=1, le=500),
 ) -> dict:
-    cfg = load_config()
+    cfg = await to_thread_io("memory.config_read", "", load_config)
     rows = await _read_store(lambda store: store.list_backups(
         cfg.owner_id, memory_dir() / "backups", limit=limit))
     return {"items": rows, "count": len(rows)}
@@ -413,20 +413,21 @@ async def list_backups(
 
 @router.post("/dream")
 async def trigger_dream() -> dict:
-    cfg = load_config()
+    cfg = await to_thread_io("memory.config_read", "", load_config)
     if not cfg.enabled:
         raise HTTPException(409, "memory is disabled")
     if not cfg.consolidation.dreamer_enabled:
         raise HTTPException(409, "Dreamer is disabled")
-    engine.start()
+    engine.start(config=cfg)
     return {"ok": True, "job_id": await engine.trigger_dream()}
 
 
 @router.post("/reindex")
 async def trigger_reindex() -> dict:
-    if not load_config().enabled:
+    cfg = await to_thread_io("memory.config_read", "", load_config)
+    if not cfg.enabled:
         raise HTTPException(409, "memory is disabled")
-    engine.start()
+    engine.start(config=cfg)
     return {"ok": True, "queued": await engine.reindex_all()}
 
 
@@ -441,7 +442,7 @@ async def export_memory() -> dict:
     Installed Skill paths are host-local and are therefore stripped on import;
     an imported active Skill candidate returns to pending review.
     """
-    cfg = load_config()
+    cfg = await to_thread_io("memory.config_read", "", load_config)
     snapshot = await engine._store_call(
         lambda store: store.export_snapshot(cfg.owner_id))
     return {
@@ -460,7 +461,7 @@ async def import_memory(body: MemoryImport) -> dict:
     ):
         raise HTTPException(422, "unsupported memory export schema")
 
-    cfg = load_config()
+    cfg = await to_thread_io("memory.config_read", "", load_config)
     if schema == "muselab-memory-export-v2":
         snapshot = body.model_dump(
             by_alias=True,
@@ -523,7 +524,7 @@ async def import_legacy_mem0() -> dict:
         values = await memory_client.export_legacy_memories()
     except Exception as exc:
         raise HTTPException(400, _failure_detail(exc)) from None
-    cfg = load_config()
+    cfg = await to_thread_io("memory.config_read", "", load_config)
     def import_values(store):
         existing = {
             " ".join(item["content"].casefold().split())

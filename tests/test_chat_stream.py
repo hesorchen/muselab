@@ -7016,7 +7016,7 @@ def test_watcher_without_a_task_pin_is_not_user_visible_active(stream_env):
 
     try:
         chat_mod._task_watchers[sid] = LiveWatcher()
-        assert chat_mod.session_active_status(sid) == {
+        assert asyncio.run(chat_mod.session_active_status(sid)) == {
             "active": False,
             "stopping": False,
             "background_tasks_pending": 0,
@@ -7030,7 +7030,7 @@ def test_watcher_without_a_task_pin_is_not_user_visible_active(stream_env):
         }
 
         chat_mod._pin_background_task(sid, "task_live")
-        active = chat_mod.session_active_status(sid)
+        active = asyncio.run(chat_mod.session_active_status(sid))
         assert active["active"] is True
         assert active["background"] is True
         assert active["background_tasks_pending"] == 1
@@ -7324,7 +7324,7 @@ def test_sdk_scheduled_trigger_is_broadcast_live_without_refresh(
         done = json.loads(events[-1]["data"])
         assert done["scheduled"] is True
         assert done["activity_source"] == "scheduled"
-        assert chat_mod.session_active_status(sid)["scheduled"] is True
+        assert asyncio.run(chat_mod.session_active_status(sid))["scheduled"] is True
     finally:
         recent = chat_mod._recent_turns.pop(sid, None)
         handle = chat_mod._recent_turn_expiry_handles.pop(sid, None)
