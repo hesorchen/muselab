@@ -580,7 +580,8 @@ def test_plan_runtime_with_default_return_does_not_gain_bypass_capability(
     assert "allow-dangerously-skip-permissions" not in captured.get("extra_args", {})
 
 
-def test_codex_gateway_effort_reaches_sdk_options(app_module, monkeypatch, tmp_path):
+@pytest.mark.parametrize("secondary", [False, True])
+def test_codex_gateway_effort_reaches_sdk_options(app_module, monkeypatch, tmp_path, secondary):
     from backend import chat as chat_mod
     from backend import endpoints
 
@@ -588,8 +589,19 @@ def test_codex_gateway_effort_reaches_sdk_options(app_module, monkeypatch, tmp_p
     monkeypatch.setenv("CODEX_GATEWAY_BASE_URL", "http://127.0.0.1:9876")
     monkeypatch.setattr(endpoints, "_VENDOR_CONFIG_DIR", tmp_path / "vendor-cfg")
 
+    model = "codex:gpt-5.5"
+    if secondary:
+        model = "account-gateway:secondary/gpt-5.5"
+        monkeypatch.setenv("MUSELAB_PROVIDER_SECONDARY_API_KEY", "secondary-secret")
+        endpoints.upsert_provider(
+            pid=None, base_url="http://127.0.0.1:9876", prefix="account-gateway:",
+            display="Codex Secondary Gateway",
+            env_key="MUSELAB_PROVIDER_SECONDARY_API_KEY", models=[model],
+        )
+
     async def catalog_capability(_model):
         return {
+            "supported_reasoning_levels": ["low", "high", "max"],
             "context_limit": 258_400,
             "context_raw_limit": 272_000,
             "context_max_limit": 272_000,
@@ -604,17 +616,18 @@ def test_codex_gateway_effort_reaches_sdk_options(app_module, monkeypatch, tmp_p
     captured = _capture_build_options(chat_mod, monkeypatch)
 
     client = asyncio.run(chat_mod._build_and_connect_client(
-        "sid-codex-effort", "codex:gpt-5.5", "bypassPermissions", "high"))
+        "sid-codex-effort", model, "bypassPermissions", "high"))
 
     assert captured["connected"] is True
     assert client is not None
-    assert captured["model"] == "gpt-5.5"
+    assert captured["model"] == ("secondary/gpt-5.5" if secondary else "gpt-5.5")
     assert captured["effort"] == "high"
     assert captured["thinking"] == {
         "type": "adaptive", "display": "summarized",
     }
     assert captured["env"]["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:9876"
-    assert captured["env"]["ANTHROPIC_API_KEY"] == "local-secret"
+    assert captured["env"]["ANTHROPIC_API_KEY"] == (
+        "secondary-secret" if secondary else "local-secret")
     assert captured["env"]["ANTHROPIC_CUSTOM_HEADERS"] == (
         "X-MuseLab-Effort: high\nX-MuseLab-Thinking: summarized"
     )
@@ -643,7 +656,7 @@ def test_codex_gateway_effort_reaches_sdk_options(app_module, monkeypatch, tmp_p
     assert "too large" in denied["hookSpecificOutput"]["permissionDecisionReason"]
     assert asyncio.run(invoke_skill_guard("deep-research")) == {}
     for tier in ("OPUS", "SONNET", "HAIKU", "FABLE"):
-        assert captured["env"][f"ANTHROPIC_DEFAULT_{tier}_MODEL"] == "gpt-5.5"
+        assert captured["env"][f"ANTHROPIC_DEFAULT_{tier}_MODEL"] == captured["model"]
 
     monkeypatch.setenv("MUSELAB_ALLOW_LARGE_CODEX_CLAUDE_API_SKILL", "1")
     opted_out = _capture_build_options(chat_mod, monkeypatch)

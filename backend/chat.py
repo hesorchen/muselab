@@ -2502,7 +2502,10 @@ _CONTEXT_CAPABILITY_STALE_TTL = max(_CONTEXT_CAPABILITY_CACHE_TTL,
 
 
 def _context_capability_key(base: str, canonical: str, credential: str) -> tuple[str, str, str]:
-    return base, canonical, hashlib.sha256(credential.encode()).hexdigest()
+    # The internal provider tag is an alias; the upstream account/model path is
+    # part of the identity and must stay distinct from the default account.
+    upstream = endpoints.normalize_model_id(canonical)
+    return base, upstream, hashlib.sha256(credential.encode()).hexdigest()
 
 
 def _last_known_gateway_capability(cache_key) -> dict | None:
@@ -2838,9 +2841,8 @@ async def _gateway_context_catalog(base: str, credential: str, cache_key) -> dic
         _CONTEXT_CATALOG_FAILURES.pop(route, None)
         _CONTEXT_CATALOG_CACHE[route] = (completed, catalog)
         for slug, capability in catalog.items():
-            for model in {_canonical_context_model(slug), f"codex:{slug}"}:
-                _CONTEXT_CAPABILITY_CACHE[_context_capability_key(base, model, credential)] = (
-                    completed, dict(capability))
+            _CONTEXT_CAPABILITY_CACHE[_context_capability_key(base, slug, credential)] = (
+                completed, dict(capability))
         return catalog
 
     return await _CONTEXT_CATALOG_PROBES.run(route, request_catalog)
@@ -11906,7 +11908,7 @@ def context_info(
     return info
 
 
-@router.get("/probe/{model}", dependencies=[Depends(require_token)])
+@router.get("/probe/{model:path}", dependencies=[Depends(require_token)])
 async def probe_provider(model: str) -> dict:
     """Hit the vendor's anthropic-compat endpoint with the configured key and
     return what the vendor said. Lets the user self-diagnose 401 / wrong-host
