@@ -86,7 +86,7 @@ def test_tool_path_renderer_preserves_text_and_workspace_ownership(page: Page, b
     }''')
     assert result == {
         'paths': ['scripts/示例 脚本.sh', './run.sh', 'results/out.txt'],
-        'exactText': True, 'safe': True, 'wasLink': True, 'isLink': False,
+        'exactText': True, 'safe': True, 'wasLink': True, 'isLink': True,
     }
 
 

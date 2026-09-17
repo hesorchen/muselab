@@ -2837,7 +2837,7 @@ def test_runtime_continuation_history_identity_footer_and_fork_guards():
     assert 'canonicalTail.display_kind !== "runtime_continuation"' in preserve
 
     fork_start = app.index("    turnForkMessageId(paneMsgs, i) {")
-    fork_end = app.index("\n    // Normalize a model-emitted path", fork_start)
+    fork_end = app.index("\n    _isExternalFilePath(path)", fork_start)
     fork = app[fork_start:fork_end]
     assert 'tail.display_kind === "runtime_continuation"' in fork
     assert "tail.forkable === false" in fork
@@ -3632,7 +3632,7 @@ def test_done_immediately_stamps_tool_tail_and_quietly_adopts_fork_boundary():
     continuity = app[continuity_start:continuity_end]
     assert 'if (role === "assistant") continuityIds.push(m.forkUuid)' in continuity
     fork_start = app.index("turnForkMessageId(paneMsgs, i)")
-    fork_end = app.index("\n    // Normalize a model-emitted path", fork_start)
+    fork_end = app.index("\n    _isExternalFilePath(path)", fork_start)
     fork = app[fork_start:fork_end]
     assert "if (message.forkUuid) return message.forkUuid" in fork
 

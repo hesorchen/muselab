@@ -2,9 +2,10 @@
 
 The original muselab treated ``MUSELAB_ROOT`` as the only workspace.  The
 browser can now register a small set of additional roots, and sessions/files
-carry the selected root explicitly.  Registration is the only operation that
-may look outside an existing workspace; normal file APIs remain confined to a
-registered root.
+carry the selected root explicitly. Directory and mutation APIs stay confined
+to a registered root. Authenticated file preview/download can also read an
+explicit absolute path outside that root; credential and internal-state
+exclusions still apply.
 """
 
 from __future__ import annotations

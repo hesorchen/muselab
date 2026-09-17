@@ -2654,6 +2654,44 @@ def safe_resolve(
     return target
 
 
+def safe_read_resolve(
+    path: str, root: Path | None = None, *, external: bool = False,
+) -> Path:
+    """Resolve an explicitly requested external file for authenticated reads.
+
+    Workspace mutation and directory APIs retain safe_resolve's containment.
+    External previews accept regular files only and retain credential/state
+    exclusions, including when a symlink hides the target's real location.
+    """
+    if not external:
+        return safe_resolve(path, root=root)
+    if not path or "\x00" in path:
+        raise HTTPException(status_code=400, detail="invalid file path")
+    try:
+        logical = Path(path).expanduser()
+        if not logical.is_absolute():
+            raise HTTPException(status_code=400, detail="external path must be absolute")
+        target = logical.resolve(strict=True)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="not a file") from None
+    except PermissionError:
+        raise HTTPException(status_code=403, detail="file cannot be read") from None
+    except (OSError, ValueError, RuntimeError):
+        raise HTTPException(status_code=400, detail="invalid file path") from None
+    if any(_inside(target, Path(prefix)) for prefix in ("/proc", "/sys", "/dev")):
+        raise HTTPException(status_code=403, detail="system virtual files are not accessible")
+    if (INTERNAL_DIR_NAME in logical.parts or INTERNAL_DIR_NAME in target.parts
+            or _inside_internal_state(target)):
+        raise HTTPException(status_code=403, detail="muselab internal state is not accessible")
+    if _is_sensitive(logical) or _is_sensitive(target):
+        raise HTTPException(status_code=403, detail="sensitive file blocked")
+    if not target.is_file():
+        raise HTTPException(status_code=404, detail="not a file")
+    if not os.access(target, os.R_OK):
+        raise HTTPException(status_code=403, detail="file cannot be read")
+    return target
+
+
 class Entry(BaseModel):
     name: str
     path: str  # relative to ROOT
@@ -2765,7 +2803,7 @@ XLSX_CELL_MAX_CHARS = 500   # one obnoxious cell shouldn't blow the page
 
 
 @router.get("/xlsx", dependencies=[Depends(require_token)])
-def xlsx_preview(path: str, root: Path = Depends(_workspace_root)) -> dict:
+def xlsx_preview(path: str, root: Path = Depends(_workspace_root), external: bool = False) -> dict:
     """Read-only xlsx preview as structured JSON.
 
     Returns each sheet's first XLSX_MAX_ROWS×XLSX_MAX_COLS cells as
@@ -2774,7 +2812,7 @@ def xlsx_preview(path: str, root: Path = Depends(_workspace_root)) -> dict:
     programmatically without ever being opened in Excel/LibreOffice,
     formula cells will be null and surface as empty strings.
     """
-    target = safe_resolve(path, root=root)
+    target = safe_read_resolve(path, root=root, external=external)
     if not target.exists() or not target.is_file():
         raise HTTPException(status_code=404, detail="not a file")
     if target.suffix.lower() not in {".xlsx", ".xlsm", ".xltx", ".xltm"}:
@@ -2883,6 +2921,7 @@ def csv_preview(
     offset: int = 0,
     limit: int = CSV_DEFAULT_LIMIT,
     root: Path = Depends(_workspace_root),
+    external: bool = False,
 ) -> dict:
     """Read-only paginated CSV / TSV preview as structured JSON.
 
@@ -2897,7 +2936,7 @@ def csv_preview(
     """
     import csv as _csv  # local import — csv is stdlib, but keep import local
                        # so import overhead stays out of every other route.
-    target = safe_resolve(path, root=root)
+    target = safe_read_resolve(path, root=root, external=external)
     if not target.exists() or not target.is_file():
         raise HTTPException(status_code=404, detail="not a file")
     if target.suffix.lower() not in {".csv", ".tsv"}:
@@ -3013,8 +3052,9 @@ def _clip_cell(value: str) -> str:
 def read_file(
     path: str,
     root: Path = Depends(_workspace_root),
+    external: bool = False,
 ) -> PlainTextResponse:
-    target = safe_resolve(path, root=root)
+    target = safe_read_resolve(path, root=root, external=external)
     if not target.exists() or not target.is_file():
         raise HTTPException(status_code=404, detail="not a file")
     suffix = target.suffix.lower()
@@ -3051,7 +3091,7 @@ def read_file(
 
 
 @router.get("/stat", dependencies=[Depends(require_token)])
-def stat_file(path: str, root: Path = Depends(_workspace_root)) -> dict:
+def stat_file(path: str, root: Path = Depends(_workspace_root), external: bool = False) -> dict:
     """Lightweight metadata for a single path — name, size, mtime, is_dir.
 
     Powers the preview header's "real path + last-modified" strip: the
@@ -3061,14 +3101,14 @@ def stat_file(path: str, root: Path = Depends(_workspace_root)) -> dict:
     re-reading the whole file. 404 when the path is gone — same contract
     as /read, so a stale/phantom tab surfaces honestly instead of showing
     a path that no longer exists."""
-    target = safe_resolve(path, root=root)
+    target = safe_read_resolve(path, root=root, external=external)
     try:
         st = target.stat()
     except OSError:
         raise HTTPException(status_code=404, detail="not found") from None
     is_dir = target.is_dir()
     return {
-        "path": _logical_relative_path(path).as_posix(),
+        "path": target.as_posix() if external else _logical_relative_path(path).as_posix(),
         "name": target.name,
         "is_dir": is_dir,
         "size": 0 if is_dir else st.st_size,
@@ -3149,6 +3189,7 @@ _preview_ticket_lock = threading.Lock()
 
 class PreviewTicketReq(BaseModel):
     path: str
+    external: bool = False
 
 
 def _prune_preview_tickets(now: float) -> None:
@@ -3159,13 +3200,13 @@ def _prune_preview_tickets(now: float) -> None:
         _preview_tickets.pop(digest, None)
 
 
-def _preview_ticket_ok(ticket: str, path: str, root: Path) -> bool:
+def _preview_ticket_ok(ticket: str, path: str, root: Path, external: bool = False) -> bool:
     if not ticket.startswith("preview."):
         return False
     digest = hashlib.sha256(ticket[8:].encode("utf-8")).hexdigest()
     now = time.monotonic()
     try:
-        target = safe_resolve(path, root=root)
+        target = safe_read_resolve(path, root=root, external=external)
     except HTTPException:
         return False
     with _preview_ticket_lock:
@@ -3181,7 +3222,7 @@ def mint_preview_ticket(
     req: PreviewTicketReq,
     root: Path = Depends(_workspace_root),
 ) -> dict:
-    target = safe_resolve(req.path, root=root)
+    target = safe_read_resolve(req.path, root=root, external=req.external)
     if not target.exists() or not target.is_file():
         raise HTTPException(status_code=404, detail="not a file")
     raw = secrets.token_urlsafe(32)
@@ -3209,7 +3250,7 @@ def mint_download_ticket(
     req: PreviewTicketReq,
     root: Path = Depends(_workspace_root),
 ) -> dict:
-    target = safe_resolve(req.path, root=root)
+    target = safe_read_resolve(req.path, root=root, external=req.external)
     if not target.exists() or not target.is_file():
         raise HTTPException(status_code=404, detail="not a file")
     ticket = tickets.mint(
@@ -3226,8 +3267,9 @@ async def _require_raw_access(
     ticket: str = Query(""),
     token: str | None = Query(default=None),
     root: Path = Depends(_workspace_root),
+    external: bool = False,
 ) -> None:
-    if ticket and _preview_ticket_ok(ticket, path, root):
+    if ticket and _preview_ticket_ok(ticket, path, root, external=external):
         return
     # Backward compatibility for old clients, copied download links and image
     # URLs.  The first-party HTML preview no longer uses this long-lived token.
@@ -3257,21 +3299,24 @@ def raw_file(
     preview: bool = Query(False),
     ticket: str = Query(""),
     root: Path = Depends(_workspace_root),
+    external: bool = False,
 ):
     """Stream a raw file using a path-bound preview ticket or legacy token.
 
     Everything outside the whitelists is forced to download as octet-stream.
     """
-    target = safe_resolve(path, root=root)
+    target = safe_read_resolve(path, root=root, external=external)
     if not target.exists() or not target.is_file():
         raise HTTPException(status_code=404, detail="not a file")
     # A legacy token URL must never become the executing document's URL:
     # even an opaque sandbox can read location.search and issue HTTPS images.
     # Redirect all legacy resource requests to an exact-file short-lived ticket.
-    if not _preview_ticket_ok(ticket, path, root):
+    if not _preview_ticket_ok(ticket, path, root, external=external):
         from urllib.parse import urlencode
-        issued = mint_preview_ticket(PreviewTicketReq(path=path), root=root)
+        issued = mint_preview_ticket(PreviewTicketReq(path=path, external=external), root=root)
         query = {"path": path, "workspace": str(root), "ticket": issued["ticket"]}
+        if external:
+            query["external"] = "1"
         if preview:
             query["preview"] = "1"
         return RedirectResponse(
@@ -3344,9 +3389,10 @@ def _require_download_ticket(
     path: str = Query(...),
     ticket: str = Query(""),
     root: Path = Depends(_workspace_root),
+    external: bool = False,
 ) -> None:
     try:
-        target = safe_resolve(path, root=root)
+        target = safe_read_resolve(path, root=root, external=external)
     except HTTPException:
         raise HTTPException(status_code=401, detail="invalid download ticket") from None
     if not tickets.validate(
@@ -3361,8 +3407,9 @@ def _require_download_ticket(
 def download_file(
     path: str = Query(...),
     root: Path = Depends(_workspace_root),
+    external: bool = False,
 ) -> FileResponse:
-    target = safe_resolve(path, root=root)
+    target = safe_read_resolve(path, root=root, external=external)
     if not target.exists() or not target.is_file():
         raise HTTPException(status_code=404, detail="not a file")
     from urllib.parse import quote
