@@ -1753,10 +1753,16 @@
                    x-ref="sessionPickerSearchInput"
                    :placeholder="lang==='zh' ? '搜索会话名…' : 'Search sessions…'"
                    @input.debounce.300ms="_searchSessions()" />
+            <div x-show="sessionHistoryLoading" class="session-picker-empty" role="status"
+                 x-text="lang==='zh' ? '正在加载全部会话…' : 'Loading all sessions…'"></div>
+            <button x-show="sessionHistoryError" type="button"
+                    class="session-picker-show-more session-picker-retry"
+                    @click.stop="_loadHistorySessions()"
+                    x-text="lang==='zh' ? '全部会话加载失败，点击重试' : 'Could not load all sessions. Retry'"></button>
             <template x-for="g in groupedFilteredSessions()" :key="g.key">
               <div class="session-picker-group">
-                <div class="session-picker-group-label" x-text="g.label + (g.hiddenCount > 0 ? ' (' + g.items.length + ')' : '')"></div>
-                <template x-for="s in g.visibleItems" :key="s.id">
+                <div class="session-picker-group-label" x-text="g.label"></div>
+                <template x-for="s in g.items" :key="s.id">
                   <div class="session-picker-row"
                        :class="historyRowClass(s.id) + (s.pinned ? ' pinned' : '')"
                        @mouseenter="prefetchSession(s.id)"
@@ -1840,15 +1846,13 @@
                     </button>
                   </div>
                 </template>
-                <!-- "展开更多" button — only when group is limited and has hidden items -->
-                <button x-show="g.hiddenCount > 0"
-                        class="session-picker-show-more"
-                        @click.stop="pickerGroupExpanded = { ...pickerGroupExpanded, [g.key]: true }"
-                        x-text="(lang==='zh' ? '展开更多 · ' : 'Show more · ') + g.hiddenCount + (lang==='zh' ? ' 条' : ' more')">
-                </button>
               </div>
             </template>
-            <div x-show="filteredSessions().length === 0" class="session-picker-empty"
+            <button x-show="!sessionHistoryLoading && !sessionHistoryError && sessionHistoryVisibleCount < filteredSessions().length"
+                    type="button" class="session-picker-show-more session-picker-load-more"
+                    @click.stop="loadMoreHistorySessions()"
+                    x-text="lang==='zh' ? '加载更多' : 'Load more'"></button>
+            <div x-show="!sessionHistoryLoading && !sessionHistoryError && filteredSessions().length === 0" class="session-picker-empty"
                  x-text="lang==='zh' ? (sessionPickerSearch ? '没有匹配' : '暂无会话') : (sessionPickerSearch ? 'No match' : 'No sessions')"></div>
             <!-- Footer: one-click bulk-clear of stale history. Sits at the very
                  bottom of the list so it's out of the way of normal row clicks.

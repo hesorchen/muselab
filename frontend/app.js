@@ -1441,11 +1441,12 @@ function portal() {
     // Session picker dropdown open state (replaces native <select> so each
     // row can have an inline delete button).
     sessionPickerOpen: false,
-    // Per-group expand state for the session picker. Keys are group keys
-    // ("earlier", "month"); true = user clicked "show all". Reset when the
-    // picker closes or when the search query changes (search already shows
-    // everything so expansion is irrelevant).
-    pickerGroupExpanded: {},
+    sessionHistoryLoading: false,
+    sessionHistoryError: false,
+    _sessionHistoryLoaded: false,
+    _sessionHistoryRequestSeq: 0,
+    // One page budget across all date groups, including pinned sessions.
+    sessionHistoryVisibleCount: 20,
     // Inline rename inside a picker row. Keeps the keyboard popup tied to
     // the original user click (iOS Safari requires synchronous focus()).
     renamingPickerSid: "",
@@ -13064,7 +13065,14 @@ function portal() {
       }
       if (!r.ok || !data || !Array.isArray(data.sessions)) return false;
       this._applySessionRedirects(data.session_redirects || {}, data.sessions);
-      this._applySessionList(data.sessions);
+      let rows = data.sessions;
+      if (this.sessionPickerOpen && this._sessionHistoryLoaded) {
+        // A recent-window poll cannot tell us an older row was deleted. Keep
+        // the history snapshot while browsing; reopening refreshes it in full.
+        const present = new Set(rows.map(row => row.id));
+        rows = [...rows, ...this.sessions.filter(row => !present.has(row.id))];
+      }
+      this._applySessionList(rows);
       // Commit the cache validator only after its complete body is installed.
       this._sessionsEtag = r.headers.get("etag") || "";
       return true;
@@ -17767,7 +17775,8 @@ function portal() {
       if (!q) return local;
       // Server search has answered for THIS exact query → use the full-workspace
       // result set (reaches sessions outside the recent window).
-      if (this._sessionSearchQuery === q && Array.isArray(this._sessionSearchResults)) {
+      if (!this._sessionHistoryLoaded && this._sessionSearchQuery === q
+          && Array.isArray(this._sessionSearchResults)) {
         return this._sessionSearchResults.filter(belongsHere);
       }
       // Not yet (debounce / network in flight) → instant local feedback over
@@ -17782,9 +17791,14 @@ function portal() {
     // Fired from the search input's @input.debounce.300ms. Stale-guarded: a
     // slow response for a query the box has since moved off of is dropped.
     async _searchSessions() {
+      this.sessionHistoryVisibleCount = 20;
       const raw = (this.sessionPickerSearch || "").trim();
       const q = raw.toLowerCase();
-      if (!q) { this._sessionSearchResults = null; this._sessionSearchQuery = ""; return; }
+      if (!q || this._sessionHistoryLoaded) {
+        this._sessionSearchResults = null;
+        this._sessionSearchQuery = "";
+        return;
+      }
       try {
         const r = await fetch("/api/chat/sessions?q=" + encodeURIComponent(raw),
                               { headers: this.hdr() });
@@ -17796,10 +17810,8 @@ function portal() {
         this._sessionSearchQuery = q;
       } catch (_) { /* keep the local fallback */ }
     },
-    // Bucket the filtered list into Pinned / Today / Yesterday / Last 7d /
-    // Last 30d / Earlier so a few hundred sessions stay scannable. Pinned
-    // always floats to the top; the rest are based on updated_at
-    // (epoch seconds — same source as the existing sort).
+    // History uses local calendar dates, matching the user's clock even at
+    // midnight or across daylight-saving changes. Pinned rows stay first.
     groupedFilteredSessions() {
       // The popup is x-show (not x-if), so this binding stays live even while
       // hidden — without this guard the full filter+bucket reran on every
@@ -17813,52 +17825,85 @@ function portal() {
       return this._groupedSessionsCache;
     },
     _computeGroupedFilteredSessions() {
-      const items = this.filteredSessions();
+      const timestamp = s => Number(s.updated_at || s.created_at || 0);
+      const items = this.filteredSessions().slice().sort((a, b) =>
+        Number(!!b.pinned) - Number(!!a.pinned) || timestamp(b) - timestamp(a)
+      ).slice(0, this.sessionHistoryVisibleCount);
       if (!items.length) return [];
-      const now = new Date();
-      const startOfToday = new Date(now.getFullYear(), now.getMonth(),
-                                     now.getDate()).getTime() / 1000;
-      const startOfYesterday = startOfToday - 86400;
-      const startOf7d = startOfToday - 7 * 86400;
-      const startOf30d = startOfToday - 30 * 86400;
-      const pinned = [], today = [], yest = [], week = [], month = [], earlier = [];
+      const dateKey = date => [date.getFullYear(),
+        String(date.getMonth() + 1).padStart(2, "0"),
+        String(date.getDate()).padStart(2, "0")].join("-");
+      const todayKey = dateKey(new Date());
+      const pinned = [], today = [], unknown = [];
+      const dates = new Map();
       for (const s of items) {
         if (s.pinned) { pinned.push(s); continue; }
-        const t = s.updated_at || s.created_at || 0;
-        if (t >= startOfToday) today.push(s);
-        else if (t >= startOfYesterday) yest.push(s);
-        else if (t >= startOf7d) week.push(s);
-        else if (t >= startOf30d) month.push(s);
-        else earlier.push(s);
+        const t = timestamp(s);
+        const date = new Date(t * 1000);
+        if (t <= 0 || !Number.isFinite(date.getTime())) {
+          unknown.push(s); continue;
+        }
+        const key = dateKey(date);
+        if (key === todayKey) { today.push(s); continue; }
+        if (!dates.has(key)) dates.set(key, []);
+        dates.get(key).push(s);
       }
       const zh = this.lang === "zh";
-      const searching = !!(this.sessionPickerSearch || "").trim();
-      // Groups with a limit collapse to PICKER_GROUP_LIMIT items until the
-      // user expands them. Search bypasses limits — when the user is looking
-      // for something specific they want to see everything.
-      const LIMIT = 20;
-      const _group = (key, label, arr, limited = false) => {
-        if (!arr.length) return null;
-        const expanded = searching || !limited || !!this.pickerGroupExpanded[key];
-        const visibleItems = expanded ? arr : arr.slice(0, LIMIT);
-        return { key, label, items: arr, visibleItems,
-                 limited, hiddenCount: arr.length - visibleItems.length };
-      };
+      const group = (key, label, items) => items.length ? { key, label, items } : null;
       return [
-        _group("pinned",    zh ? "置顶"       : "Pinned",       pinned),
-        _group("today",     zh ? "今天"        : "Today",        today),
-        _group("yesterday", zh ? "昨天"        : "Yesterday",    yest),
-        _group("week",      zh ? "最近 7 天"   : "Last 7 days",  week),
-        _group("month",     zh ? "最近 30 天"  : "Last 30 days", month,  true),
-        _group("earlier",   zh ? "更早"        : "Earlier",      earlier, true),
+        group("pinned", zh ? "置顶" : "Pinned", pinned),
+        group("today", zh ? "今天" : "Today", today),
+        ...[...dates.keys()].sort().reverse().map(key =>
+          group(key, key, dates.get(key))),
+        group("unknown", zh ? "日期未知" : "Unknown date", unknown),
       ].filter(Boolean);
+    },
+    loadMoreHistorySessions() {
+      this.sessionHistoryVisibleCount = Math.min(
+        this.sessionHistoryVisibleCount + 20, this.filteredSessions().length);
+    },
+    async _loadHistorySessions() {
+      if (!this.sessionPickerOpen || this.sessionHistoryLoading) return;
+      const seq = ++this._sessionHistoryRequestSeq;
+      const workspace = this.currentWorkspacePath();
+      const ownsRequest = () => this.sessionPickerOpen
+        && seq === this._sessionHistoryRequestSeq
+        && workspace === this.currentWorkspacePath();
+      this.sessionHistoryLoading = true;
+      this.sessionHistoryError = false;
+      try {
+        let data;
+        const response = await this._fetchWithDeadline(
+          "/api/chat/sessions?limit=0", { headers: this.hdr() },
+          Math.max(100, Number(this._sessionListTimeoutMs) || 8000),
+          async response => { if (response.ok) data = await response.json(); },
+        );
+        if (!ownsRequest()) return;
+        if (!response.ok || !data || !Array.isArray(data.sessions)) {
+          this.sessionHistoryError = true;
+          return;
+        }
+        // Full reads are owned by opening the picker, never by the 10s poll.
+        // Applying through the normal path preserves optimistic names/settings
+        // and makes old rows available to open, pin, rename and delete actions.
+        this._applySessionRedirects(data.session_redirects || {}, data.sessions);
+        this._applySessionList(data.sessions);
+        this._sessionHistoryLoaded = true;
+        this._sessionsEtag = "";
+      } catch (_) {
+        if (ownsRequest()) this.sessionHistoryError = true;
+      } finally {
+        if (seq === this._sessionHistoryRequestSeq) this.sessionHistoryLoading = false;
+      }
     },
     toggleHistoryPicker(ev) {
       if (this.sessionPickerOpen) { this.closeHistoryPicker(); return; }
       if (this.activity.moveMenu.show) this.closeActivityMoveMenu();
       const btn = ev && ev.currentTarget;
+      this.sessionHistoryVisibleCount = 20;
       this.sessionPickerOpen = true;
-      this.pickerGroupExpanded = {};  // reset collapse state on each open
+      this._sessionHistoryLoaded = false;
+      void this._loadHistorySessions();
       this._openFocusSurface(
         "history-picker", ".chat-tab-history .session-picker-pop",
         ".session-picker-search", btn, false,
@@ -17867,6 +17912,10 @@ function portal() {
     closeHistoryPicker(restoreFocus = true, cancelRename = true) {
       if (!this.sessionPickerOpen && !this._focusSurfaceState["history-picker"]) return;
       this.sessionPickerOpen = false;
+      this._sessionHistoryRequestSeq++;
+      this._sessionHistoryLoaded = false;
+      this.sessionHistoryLoading = false;
+      this.sessionHistoryError = false;
       if (cancelRename) this.pickerCancelInlineRename();
       this._closeFocusSurface("history-picker", restoreFocus);
     },
