@@ -735,6 +735,8 @@
                 <span x-show="selectedMeta && selectedMeta.mtime"
                       x-text="selectedMeta && selectedMeta.mtime ? fmtRelativeMtime(selectedMeta.mtime) : ''"></span>
               </span>
+              <span class="pane-fileinfo-meta" x-show="_isExternalFilePath(selected)"
+                    x-text="lang==='zh' ? '只读' : 'Read-only'"></span>
             </div>
           </template>
           <template x-if="previewSurface==='terminal' && activeTerminal()">
@@ -759,7 +761,7 @@
           </template>
         </div>
         <button class="icon-btn preview-keep-mobile html-annotation-trigger"
-                x-show="previewSurface==='file' && previewMode==='html' && !editing"
+                x-show="previewSurface==='file' && previewMode==='html' && !editing && !_isExternalFilePath(selected)"
                 :class="{active:htmlAnnotation.active}" @click="toggleHtmlAnnotation()"
                 :aria-pressed="htmlAnnotation.active"
                 :title="lang==='zh'?'标注页面元素':'Annotate an element'"

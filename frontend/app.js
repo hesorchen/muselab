@@ -1303,6 +1303,7 @@ function portal() {
     },
     htmlAnnotation: { active:false, loading:false, selection:null, comment:"", error:"" },
     async toggleHtmlAnnotation() {
+      if (this._isExternalFilePath(this.selected)) return;
       if (!this._htmlAnnotationController) {
         const { createHtmlAnnotation } = await import("/static/modules/html-annotation.mjs");
         this._htmlAnnotationController = createHtmlAnnotation(this);
@@ -4901,12 +4902,18 @@ function portal() {
       }
       return null;
     },
-    // Normalize a model-emitted path into something openByPathToasted can hand
-    // to /api/files/list. Handles three things the model commonly does wrong:
-    //   - absolute path under the workspace root → strip the root prefix
-    //   - "~/..." path              →  return "" (we don't know HOME-vs-ROOT)
-    //   - path prefixed by the workspace basename → strip the duplicate
-    // Returns "" for paths we can't safely open (would 403 / 404 on backend).
+    _isExternalFilePath(path) {
+      return typeof path === "string" && (path.startsWith("/") || path.startsWith("~/"));
+    },
+    _fileReadUrl(endpoint, path) {
+      return "/api/files/" + endpoint + "?path=" + encodeURIComponent(path)
+        + (this._isExternalFilePath(path) ? "&external=1" : "");
+    },
+    _fileReadRequest(path) {
+      return this._isExternalFilePath(path) ? { path, external: true } : { path };
+    },
+    // Keep external paths intact for authenticated read-only preview. Paths
+    // inside the current workspace retain their ordinary relative identity.
     _normalizeWorkspacePath(p) {
       if (!p) return "";
       const info = this.contextInfo || {};
@@ -4918,9 +4925,9 @@ function portal() {
         if (root && (p === root || p.startsWith(root + "/"))) {
           return p.slice(root.length).replace(/^\/+/, "");
         }
-        return "";
+        return p;
       }
-      if (p.startsWith("~/")) return "";
+      if (p.startsWith("~/")) return p;
       // Model often writes "<root-basename>/foo/bar.md" as if the workspace
       // root were its parent. Strip the duplicated basename if doing so
       // leaves a non-empty remainder.
@@ -5641,7 +5648,7 @@ function portal() {
       // path/with/slashes.ext  OR  bare.ext  (+ optional :line[:col])
       // Ext must START with a letter to avoid eating version strings like 1.2.3.
       // \p{L}\p{N} (unicode flag) so Chinese/Japanese filenames also match.
-      const RE = /^([\p{L}\p{N}_@./~+-]+\.[A-Za-z][A-Za-z0-9]{0,9})(?::(\d+))?(?::\d+)?$/u;
+      const RE = /^([\p{L}\p{N}_@./~+ -]+\.[A-Za-z][A-Za-z0-9]{0,9})(?::(\d+))?(?::\d+)?$/u;
       const toRel = (p) => this._normalizeWorkspacePath(p);
       // 1) inline <code> whose text looks like a path
       const codes = rootEl.querySelectorAll("code");
@@ -5814,6 +5821,29 @@ function portal() {
     async openByPathToasted(path) {
       const ownerWorkspace = this.fileWorkspacePath();
       const requestHeaders = this.fileHdr();
+      const seq = this._chatFileOpenSeq = (this._chatFileOpenSeq || 0) + 1;
+      if (this._isExternalFilePath(path)) {
+        const previewSeq = this._previewLoadSeq;
+        const isCurrent = () => seq === this._chatFileOpenSeq
+          && previewSeq === this._previewLoadSeq && this._workspaceIsCurrent(ownerWorkspace);
+        try {
+          const r = await this._fetchWithDeadline(
+            this._fileReadUrl("stat", path), { headers: requestHeaders });
+          if (!isCurrent()) return;
+          if (!r.ok) {
+            this.toast(this.lang === "zh"
+              ? (r.status === 403 ? "该文件受保护或没有读取权限" : "文件不存在或无法预览")
+              : (r.status === 403 ? "File is protected or not readable" : "File not found or unavailable"), "warn");
+            return;
+          }
+          const file = await r.json();
+          if (!isCurrent()) return;
+          await this.openFile(file, { reveal: true });
+        } catch (error) {
+          if (isCurrent()) this.errToast("generic", String(error?.message || error));
+        }
+        return;
+      }
       // HEAD-equivalent check via list on the parent dir is fragile (binary
       // files, images etc. don't go through /api/files/read). Just delegate
       // to openFile and let it set previewMode='unsupported' / pdf / img,
@@ -5824,11 +5854,11 @@ function portal() {
       try {
         const r = await fetch("/api/files/list?path=" + encodeURIComponent(parent),
           { headers: requestHeaders });
-        if (!this._workspaceIsCurrent(ownerWorkspace)) return;
+        if (seq !== this._chatFileOpenSeq || !this._workspaceIsCurrent(ownerWorkspace)) return;
         let hit = null;
         if (r.ok) {
           const data = await r.json();
-          if (!this._workspaceIsCurrent(ownerWorkspace)) return;
+          if (seq !== this._chatFileOpenSeq || !this._workspaceIsCurrent(ownerWorkspace)) return;
           hit = (data.entries || []).find(e => e.name === name) || null;
         }
         // Direct ROOT-relative lookup missed. The model commonly emits a path
@@ -5839,7 +5869,7 @@ function portal() {
         // open. Multiple candidates always go through explicit disambiguation.
         if (!hit) {
           const matches = await this._findChatFileCandidates(path, name, requestHeaders);
-          if (!this._workspaceIsCurrent(ownerWorkspace)) return;
+          if (seq !== this._chatFileOpenSeq || !this._workspaceIsCurrent(ownerWorkspace)) return;
           let resolved = "";
           if (matches.length === 1) {
             resolved = matches[0].path;
@@ -5852,12 +5882,12 @@ function portal() {
                 : `"${path}" matches ${matches.length} files. Pick one to open:`,
               choices: matches.map(m => ({ label: m.path, value: m.path })),
             });
-            if (!this._workspaceIsCurrent(ownerWorkspace)) return;
+            if (seq !== this._chatFileOpenSeq || !this._workspaceIsCurrent(ownerWorkspace)) return;
             if (!resolved) return;   // cancelled
           }
           if (resolved) {
             await this.openFile({ path: resolved, name }, { reveal: true });
-            if (!this._workspaceIsCurrent(ownerWorkspace)) return;
+            if (seq !== this._chatFileOpenSeq || !this._workspaceIsCurrent(ownerWorkspace)) return;
             this.revealInTree(resolved, { mode: "background" }).catch(() => {});
             return;
           }
@@ -5869,7 +5899,7 @@ function portal() {
           return;
         }
         await this.openFile({ path, name }, { reveal: true });
-        if (!this._workspaceIsCurrent(ownerWorkspace)) return;
+        if (seq !== this._chatFileOpenSeq || !this._workspaceIsCurrent(ownerWorkspace)) return;
         // Mirror the click into the file tree: expand parents + scroll the
         // row into view so the user sees where the file lives. Use background
         // mode — a chat-link click wants the file's CONTENT (the preview
@@ -27718,7 +27748,7 @@ function portal() {
         // it to "md" once rawText is set. Setting it early would briefly show
         // the empty-file placeholder (previewMode==='md' && !rawText) during
         // the in-flight fetch. Failures route through _previewFail().
-        const r = await fetch("/api/files/read?path=" + encodeURIComponent(n.path),
+        const r = await fetch(this._fileReadUrl("read", n.path),
                               { headers: this.fileHdr(), signal: controller.signal });
         if (_stale()) return false;
         if (r.ok) {
@@ -27767,13 +27797,18 @@ function portal() {
         reusedHtmlFrame = this._touchHtmlPreviewFrame(n.path);
         this.previewMode = "html";
       }
-      else if (["png", "jpg", "jpeg", "gif", "webp", "svg", "ico", "bmp"].includes(ext)) this.previewMode = "img";
-      else if (ext === "pdf") this.previewMode = "pdf";
+      else if (["png", "jpg", "jpeg", "gif", "webp", "svg", "ico", "bmp", "pdf"].includes(ext)) {
+        // Mount only after authorization is ready. An image mounted with the
+        // temporary about:blank URL fires error before its ticket arrives.
+        await this._mintPreviewTicket(n.path, controller.signal);
+        if (_stale()) return false;
+        this.previewMode = ext === "pdf" ? "pdf" : "img";
+      }
       else if (["xlsx", "xlsm", "xltx", "xltm"].includes(ext)) {
         // xlsx preview: backend serializes the workbook into capped per-sheet
         // string matrices so the frontend just renders <table>s. No formula
         // evaluation; cells show the last-cached value.
-        const r = await fetch("/api/files/xlsx?path=" + encodeURIComponent(n.path),
+        const r = await fetch(this._fileReadUrl("xlsx", n.path),
                               { headers: this.fileHdr(), signal: controller.signal });
         if (_stale()) return false;
         if (r.ok) {
@@ -27821,7 +27856,7 @@ function portal() {
         // `opts.readUrl` lets callers point at a non-workspace backend route
         // (e.g. bg-task .output files under /tmp via /api/chat/task-output)
         // that the workspace-scoped /api/files/read can't reach.
-        const readUrl = opts.readUrl || ("/api/files/read?path=" + encodeURIComponent(n.path));
+        const readUrl = opts.readUrl || (this._fileReadUrl("read", n.path));
         const r = await fetch(readUrl, {
           headers: this.fileHdr(), signal: controller.signal,
         });
@@ -27883,7 +27918,7 @@ function portal() {
       const _csvStale = () => loadSeq !== this._csvLoadSeq
         || this.csvPath !== reqPath || this.selected !== reqPath;
       try {
-        const url = `/api/files/csv?path=${encodeURIComponent(reqPath)}`
+        const url = this._fileReadUrl("csv", reqPath)
                     + `&offset=${reqOffset}&limit=${this.csvLimit}`;
         const r = await fetch(url, { headers: this.fileHdr(), signal: controller.signal });
         if (_csvStale()) return false;
@@ -28003,6 +28038,7 @@ function portal() {
       return true;
     },
     async revealInTree(path, opts = {}) {
+      if (this._isExternalFilePath(path)) return false;
       const workspace = opts.ownerWorkspace || this.fileWorkspacePath();
       const generation = this._workspaceGeneration(workspace);
       if (!path || !this._workspaceIsCurrent(workspace)) return false;
@@ -28145,7 +28181,7 @@ function portal() {
         && this.selected === path;
       if (!path) { this.selectedMeta = null; return; }
       try {
-        const r = await fetch("/api/files/stat?path=" + encodeURIComponent(path),
+        const r = await fetch(this._fileReadUrl("stat", path),
                               { headers: this.fileHdr() });
         if (!isOwner()) return;
         if (!r.ok) { this.selectedMeta = null; return; }
@@ -28161,7 +28197,8 @@ function portal() {
     fileBreadcrumb(path) {
       const parts = String(path || "").split("/").filter(Boolean);
       parts.pop(); // the pane title already owns the basename
-      const root = this.lang === "zh" ? "根目录" : "Workspace root";
+      const root = this._isExternalFilePath(path) ? "/"
+        : (this.lang === "zh" ? "根目录" : "Workspace root");
       if (!parts.length) return root;
       const tail = parts.slice(-3);
       return `${parts.length > 3 ? "…" : root} › ${tail.join(" › ")}`;
@@ -28260,7 +28297,7 @@ function portal() {
         await this._fetchWithDeadline("/api/files/preview-ticket", {
           method: "POST",
           headers: { ...this.fileHdr(), "Content-Type": "application/json" },
-          body: JSON.stringify({ path: p }),
+          body: JSON.stringify(this._fileReadRequest(p)),
           signal,
         }, this.REQUEST_DEADLINE_MS, async response => {
           if (!response.ok) throw new Error(`preview ticket failed (${response.status})`);
@@ -28312,7 +28349,7 @@ function portal() {
       const workspace = this.fileWorkspacePath()
         ? "&workspace=" + encodeURIComponent(this.fileWorkspacePath()) : "";
       const v = this.previewVersion ? `&_v=${this.previewVersion}` : "";
-      return "/api/files/raw?path=" + encodeURIComponent(p)
+      return this._fileReadUrl("raw", p)
         + "&ticket=" + encodeURIComponent(ticket) + workspace + v
         + (opts.preview ? "&preview=1" : "");
     },
@@ -28415,7 +28452,7 @@ function portal() {
         ticket = await capabilities.mintTicket(
           "/api/files/download-ticket",
           { ...this.fileHdr(), "Content-Type": "application/json" },
-          { path: p },
+          this._fileReadRequest(p),
         );
       } catch (error) {
         this.errToast("generic", String((error && error.message) || error));
@@ -28423,7 +28460,7 @@ function portal() {
       }
       const workspace = this.fileWorkspacePath()
         ? "&workspace=" + encodeURIComponent(this.fileWorkspacePath()) : "";
-      const url = "/api/files/download?path=" + encodeURIComponent(p)
+      const url = this._fileReadUrl("download", p)
         + "&ticket=" + encodeURIComponent(ticket) + workspace;
       capabilities.triggerDownload(url, p.split("/").pop() || "download");
     },
@@ -30401,7 +30438,7 @@ function portal() {
       if (workspace) headers["X-Muselab-Workspace"] = encodeURIComponent(workspace);
       let node;
       try {
-        const response = await fetch("/api/files/stat?path=" + encodeURIComponent(path), { headers });
+        const response = await fetch(this._fileReadUrl("stat", path), { headers });
         if (!response.ok) return null;
         node = await response.json();
       } catch (_) { return null; }
@@ -31343,7 +31380,7 @@ function portal() {
 
     // ===== edit =====
     isEditable(path) {
-      if (!path) return false;
+      if (!path || this._isExternalFilePath(path)) return false;
       const name = path.split("/").pop().toLowerCase();
       const ext = name.includes(".") ? name.split(".").pop() : name;
       return EDITABLE_EXT.has(ext);
@@ -31639,6 +31676,7 @@ function portal() {
       }
     },
     async toggleEdit() {
+      if (this._isExternalFilePath(this.selected)) return;
       if (this.editing) {
         if (!this._confirmLoseEdits()) return;
         const reloadPath = this._previewNeedsReload === this.selected
