@@ -659,7 +659,11 @@ OVERRIDES_PATH = PROVIDER_OVERRIDES_PATH
 # supports_effort, and max_output_tokens are intentionally NOT user-editable in
 # the UI (vendor quirks that break the request if wrong); built-ins keep their
 # baked values, user-created providers take the safe defaults below.
-_MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:+\-]{0,99}$")
+# Namespaced upstream models use slashes, e.g. an account/model Gateway route.
+_MODEL_ID_RE = re.compile(
+    r"^(?=.{1,100}$)[A-Za-z0-9][A-Za-z0-9._:+\-]*"
+    r"(?:/[A-Za-z0-9][A-Za-z0-9._:+\-]*)*$"
+)
 _PREFIX_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:+\-]{0,39}$")
 
 # Custom-provider env keys must live in this reserved namespace. Without the
@@ -790,23 +794,26 @@ def _save_overrides(store: dict) -> None:
 
 
 def _looks_like_codex_provider(display: str, prefix: str, env_key: str, base_url: str) -> bool:
-    """Legacy custom Codex sidecar compatibility.
-
-    Older installs could have a user-created "Codex (ChatGPT subscription)"
-    provider (`gpt-*` models on the same local sidecar) before Codex Gateway
-    became a built-in. Custom providers don't carry capability bits in
-    provider_overrides.json, so infer the known Codex sidecar shape here.
-    """
-    low_display = (display or "").lower()
+    """Recognize legacy sidecars and account aliases of the configured Gateway."""
+    if "codex" not in (display or "").lower():
+        return False
     low_url = (base_url or "").lower()
-    return (
-        "codex" in low_display
-        and (prefix or "").startswith(("gpt-", "codex:"))
-        and (
-            env_key == "MUSELAB_PROVIDER_CODEX_API_KEY"
-            or "127.0.0.1:8317" in low_url
-            or "localhost:8317" in low_url
-        )
+    legacy = (prefix or "").startswith(("gpt-", "codex:")) and (
+        env_key == "MUSELAB_PROVIDER_CODEX_API_KEY"
+        or "127.0.0.1:8317" in low_url
+        or "localhost:8317" in low_url
+    )
+    # Internal aliases may use any colon prefix. Only inherit capabilities from
+    # the actual configured Codex endpoint, never from a model's GPT spelling.
+    override = _load_overrides()["providers"].get("b:codex:", {})
+    configured_url = (
+        os.environ.get("CODEX_GATEWAY_BASE_URL", "").strip()
+        or (override.get("base_url") if isinstance(override, dict) else "")
+        or "http://127.0.0.1:8317"
+    )
+    return legacy or (
+        (prefix or "").endswith(":")
+        and (base_url or "").rstrip("/") == configured_url.rstrip("/")
     )
 
 
@@ -830,7 +837,7 @@ def _provider_from_def(pid: str, d: dict, base: Provider | None) -> Provider:
         models = base.models
     else:
         models = ()
-    is_legacy_codex = base is None and _looks_like_codex_provider(
+    is_custom_codex = base is None and _looks_like_codex_provider(
         display, prefix, env_key, base_url)
     return Provider(
         prefix=prefix,
@@ -838,9 +845,9 @@ def _provider_from_def(pid: str, d: dict, base: Provider | None) -> Provider:
         env_key=env_key,
         display=display,
         models=models,
-        supports_thinking=base.supports_thinking if base else (False if is_legacy_codex else True),
-        supports_effort=base.supports_effort if base else is_legacy_codex,
-        max_output_tokens=base.max_output_tokens if base else (128000 if is_legacy_codex else None),
+        supports_thinking=base.supports_thinking if base else (False if is_custom_codex else True),
+        supports_effort=base.supports_effort if base else is_custom_codex,
+        max_output_tokens=base.max_output_tokens if base else (128000 if is_custom_codex else None),
         id=pid,
     )
 

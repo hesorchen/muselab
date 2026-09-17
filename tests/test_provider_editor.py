@@ -162,3 +162,144 @@ def test_restore_noop_for_custom(client, auth, iso_overrides):
     }).json()["id"]
     r = client.post("/api/settings/providers/restore", headers=auth, json={"id": pid})
     assert r.status_code == 200 and r.json()["changed"] is False
+
+
+def test_namespaced_provider_model_routes_through_probe(
+    client, auth, iso_overrides, monkeypatch,
+):
+    import httpx
+    from urllib.parse import quote
+
+    model = "account-gateway:secondary/gpt-test"
+    response = client.post("/api/settings/providers", headers=auth, json={
+        "base_url": "https://gateway.example.test",
+        "prefix": "account-gateway:",
+        "models": [model],
+    })
+    assert response.status_code == 200, response.text
+    saved = response.json()
+    assert _provider(client, auth, saved["id"])["models"] == [model]
+    assert iso_overrides.lookup(model).id == saved["id"]
+    assert iso_overrides.normalize_model_id(model) == "secondary/gpt-test"
+    monkeypatch.setenv(saved["env_key"], "test-provider-credential")
+
+    calls = []
+
+    async def fake_post(self, url, *, json, headers):
+        calls.append((url, json["model"]))
+        return httpx.Response(200, json={"content": [{"type": "text", "text": "OK"}]})
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+    probe = client.get("/api/chat/probe/" + quote(model, safe=""), headers=auth)
+    assert probe.status_code == 200, probe.text
+    assert probe.json()["ok"] is True
+    assert calls == [("https://gateway.example.test/v1/messages", "secondary/gpt-test")]
+
+
+@pytest.mark.parametrize("suffix", ["account//model", "account/../model", "account/", "a" * 100])
+def test_namespaced_provider_rejects_invalid_paths(client, auth, iso_overrides, suffix):
+    response = client.post("/api/settings/providers", headers=auth, json={
+        "base_url": "https://gateway.example.test",
+        "prefix": "account-gateway:",
+        "models": ["account-gateway:" + suffix],
+    })
+    assert response.status_code == 422
+
+
+@pytest.mark.parametrize("source", ["environment", "override"])
+def test_custom_codex_account_inherits_gateway_capabilities(
+    client, auth, iso_overrides, monkeypatch, source,
+):
+    gateway = "https://gateway.example.test"
+    monkeypatch.delenv("CODEX_GATEWAY_BASE_URL", raising=False)
+    if source == "environment":
+        monkeypatch.setenv("CODEX_GATEWAY_BASE_URL", gateway + "/")
+    else:
+        iso_overrides.upsert_provider(
+            pid="b:codex:", base_url=gateway, prefix="codex:",
+            display="Codex Gateway", env_key="CODEX_GATEWAY_API_KEY",
+            models=["codex:gpt-test"],
+        )
+    response = client.post("/api/settings/providers", headers=auth, json={
+        "base_url": gateway, "prefix": "account-gateway:",
+        "display": "Codex Secondary Gateway",
+        "models": ["account-gateway:secondary/gpt-test"],
+    })
+    assert response.status_code == 200
+    provider = iso_overrides.get_provider(response.json()["id"])
+    assert provider.supports_effort is True
+    assert provider.supports_thinking is False
+    assert provider.max_output_tokens == 128000
+    assert not iso_overrides._looks_like_codex_provider(
+        "Codex Secondary Gateway", "account-gateway:", "OTHER_API_KEY",
+        gateway + ".unrelated.test",
+    )
+
+
+def test_custom_codex_account_catalog_controls_stay_separate(
+    client, auth, iso_overrides, monkeypatch,
+):
+    import httpx
+    from backend import chat
+
+    gateway = "https://gateway.example.test"
+    monkeypatch.setenv("CODEX_GATEWAY_BASE_URL", gateway)
+    monkeypatch.setenv("CODEX_GATEWAY_API_KEY", "test-shared-key")
+    monkeypatch.setenv("MUSELAB_PROVIDER_SECONDARY_API_KEY", "test-shared-key")
+    iso_overrides.upsert_provider(
+        pid="b:codex:", base_url=gateway, prefix="codex:",
+        display="Codex Gateway", env_key="CODEX_GATEWAY_API_KEY",
+        models=["codex:gpt-test"],
+    )
+    iso_overrides.upsert_provider(
+        pid=None, base_url=gateway, prefix="account-gateway:",
+        display="Codex Secondary Gateway",
+        env_key="MUSELAB_PROVIDER_SECONDARY_API_KEY",
+        models=["account-gateway:secondary/gpt-test",
+                "account-gateway:secondary/gpt-other"],
+    )
+    requests = []
+
+    class CatalogClient:
+        def __init__(self, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+        async def get(self, url, **kwargs):
+            requests.append(url)
+            assert url == gateway + "/v1/models?client_version"
+            return httpx.Response(200, json={"models": [
+                {"slug": "gpt-test", "context_window": 272000,
+                 "supported_reasoning_levels": ["high", "ultra"]},
+                {"slug": "secondary/gpt-test", "context_window": 921000,
+                 "supported_reasoning_levels": ["low", "high", "max"]},
+                {"slug": "secondary/gpt-other", "context_window": 272000,
+                 "supported_reasoning_levels": ["medium"]},
+            ]})
+
+    monkeypatch.setattr(httpx, "AsyncClient", CatalogClient)
+    # The first response schedules a refresh; the next one must use that cache
+    # for every internal alias without mixing account-prefixed capabilities.
+    client.get("/api/chat/providers", headers=auth)
+    response = client.get("/api/chat/providers", headers=auth)
+    rows = {row["model"]: row for row in response.json()["models"]}
+    second_model = "account-gateway:secondary/gpt-test"
+    assert rows[second_model]["supports_effort"] is True
+    assert rows[second_model]["supports_thinking"] is False
+    assert rows[second_model]["effort_levels"] == ["auto", "low", "high", "max"]
+    assert rows["account-gateway:secondary/gpt-other"]["effort_levels"] == ["auto", "medium"]
+    assert rows["codex:gpt-test"]["effort_levels"] == ["auto", "high", "ultra"]
+    assert chat._cached_gateway_context_capability(second_model)["context_raw_limit"] == 921000
+    assert len(requests) == 1
+    sid = client.post("/api/chat/sessions", headers=auth, json={
+        "name": "secondary account effort", "model": second_model,
+    }).json()["id"]
+    assert client.patch(f"/api/chat/sessions/{sid}", headers=auth,
+                        json={"effort": "high"}).status_code == 200
+    assert client.patch(f"/api/chat/sessions/{sid}", headers=auth,
+                        json={"effort": "ultra"}).status_code == 400
