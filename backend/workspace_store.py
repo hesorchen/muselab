@@ -701,6 +701,8 @@ class WorkspaceStore:
         """Scan or apply a snapshot, logging offline changes atomically."""
         root = root.resolve()
         scan_report: dict[str, Any] = report if report is not None else {}
+        scan_report["read_compare_ms"] = 0
+        scan_report["write_skipped"] = False
         # Filesystem walking may happen in a separate process. The workspace lock
         # serializes only durable application and native watcher transactions.
         lock_started = time.monotonic()
@@ -730,6 +732,39 @@ class WorkspaceStore:
             with self._connect() as db:
                 if cancel_event is not None and cancel_event.is_set():
                     raise WorkspaceScanCancelled("workspace scan cancelled")
+                # A complete, unchanged detached scan needs no write transaction.
+                # Read state and rows from one WAL snapshot, so another workspace's
+                # writer cannot delay this no-op or force a needless fsync. A changed
+                # cursor/partial scan still takes the normal rebase-and-write path.
+                if (expected_cursor is not None and not partial
+                        and not scan_report.get("resumed") and not dirty_paths):
+                    read_started = time.monotonic()
+                    unchanged = False
+                    db.execute("BEGIN")
+                    try:
+                        state = db.execute(
+                            "SELECT initialized, current_seq, path FROM workspaces WHERE id = ?",
+                            (workspace_id,),
+                        ).fetchone()
+                        if (state is not None and state["initialized"]
+                                and state["current_seq"] == expected_cursor
+                                and state["path"] == str(root)):
+                            stored = self._file_rows(db, workspace_id)
+                            observed = {row["path"]: row for row in snapshot}
+                            unchanged = len(stored) == len(observed) and all(
+                                row["path"] in observed
+                                and self._signature(row) == self._signature(observed[row["path"]])
+                                for row in stored)
+                    finally:
+                        db.rollback()
+                    scan_report["read_compare_ms"] = round((time.monotonic() - read_started) * 1000)
+                    if unchanged:
+                        if cancel_event is not None and cancel_event.is_set():
+                            raise WorkspaceScanCancelled("workspace scan cancelled")
+                        scan_report["write_skipped"] = True
+                        if return_payload:
+                            return {"cursor": expected_cursor, "changes": [], "resync": False}
+                        return expected_cursor
                 transaction_started = time.monotonic()
                 db.execute("BEGIN IMMEDIATE")
                 scan_report["transaction_wait_ms"] = round((time.monotonic() - transaction_started) * 1000)

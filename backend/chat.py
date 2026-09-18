@@ -2489,6 +2489,8 @@ _CONTEXT_CAPABILITY_CACHE_TTL = max(
     1.0, env_float("MUSELAB_CONTEXT_CATALOG_TTL_S", 300.0))
 _CONTEXT_CAPABILITY_FAILURE_TTL = max(
     1.0, env_float("MUSELAB_CONTEXT_CATALOG_FAILURE_TTL_S", 15.0))
+_CONTEXT_CAPABILITY_FAILURE_MAX_TTL = max(_CONTEXT_CAPABILITY_FAILURE_TTL,
+    env_float("MUSELAB_CONTEXT_CATALOG_FAILURE_MAX_TTL_S", 300.0))
 # Routing identity includes a digest so credential changes cannot inherit a
 # different account's model capacity. Raw credentials are never cached/logged.
 _CONTEXT_CAPABILITY_CACHE: dict[tuple[str, str, str], tuple[float, dict | None]] = {}
@@ -2497,6 +2499,7 @@ _CONTEXT_CAPABILITY_PROBES = SharedCalls()
 _CONTEXT_CATALOG_PROBES = SharedCalls()
 _CONTEXT_CATALOG_CACHE: dict[tuple[str, str], tuple[float, dict]] = {}
 _CONTEXT_CATALOG_FAILURES: dict[tuple[str, str], float] = {}
+_CONTEXT_CATALOG_FAILURE_COUNTS: dict[tuple[str, str], int] = {}
 _CONTEXT_CAPABILITY_STALE_TTL = max(_CONTEXT_CAPABILITY_CACHE_TTL,
     env_float("MUSELAB_CONTEXT_CATALOG_STALE_TTL_S", 3600.0))
 
@@ -2811,9 +2814,27 @@ def _context_route_key(cache_key) -> tuple[str, str]:
     return cache_key[0], cache_key[2]
 
 
+def _context_route_failure_ttl(route: tuple[str, str]) -> float:
+    attempts = _CONTEXT_CATALOG_FAILURE_COUNTS.get(route, 1)
+    return min(_CONTEXT_CAPABILITY_FAILURE_MAX_TTL,
+               _CONTEXT_CAPABILITY_FAILURE_TTL * 2 ** min(max(attempts - 1, 0), 20))
+
+
+def _record_context_route_failure(route: tuple[str, str]) -> None:
+    now = time.monotonic()
+    failed = _CONTEXT_CATALOG_FAILURES.get(route)
+    if failed is not None and now - failed < _context_route_failure_ttl(route):
+        # Shared catalog and model waiters may report the same failed request.
+        return
+    _CONTEXT_CATALOG_FAILURE_COUNTS[route] = min(
+        _CONTEXT_CATALOG_FAILURE_COUNTS.get(route, 0) + 1, 21)
+    _CONTEXT_CATALOG_FAILURES[route] = now
+
+
 def _context_route_failed(cache_key) -> bool:
-    failed = _CONTEXT_CATALOG_FAILURES.get(_context_route_key(cache_key))
-    return failed is not None and time.monotonic() - failed < _CONTEXT_CAPABILITY_FAILURE_TTL
+    route = _context_route_key(cache_key)
+    failed = _CONTEXT_CATALOG_FAILURES.get(route)
+    return failed is not None and time.monotonic() - failed < _context_route_failure_ttl(route)
 
 
 async def _gateway_context_catalog(base: str, credential: str, cache_key) -> dict:
@@ -2835,10 +2856,11 @@ async def _gateway_context_catalog(base: str, credential: str, cache_key) -> dic
                 catalog = (_parse_codex_gateway_catalog(response.json())
                            if response.status_code < 400 else {})
         except Exception:
-            _CONTEXT_CATALOG_FAILURES[route] = time.monotonic()
+            _record_context_route_failure(route)
             raise
         completed = time.monotonic()
         _CONTEXT_CATALOG_FAILURES.pop(route, None)
+        _CONTEXT_CATALOG_FAILURE_COUNTS.pop(route, None)
         _CONTEXT_CATALOG_CACHE[route] = (completed, catalog)
         for slug, capability in catalog.items():
             _CONTEXT_CAPABILITY_CACHE[_context_capability_key(base, slug, credential)] = (
@@ -2914,7 +2936,7 @@ async def _load_gateway_context_capability(canonical: str, base: str, key: str,
                         _log_context_probe_recovery(canonical)
                         return capability
     except Exception as e:
-        _CONTEXT_CATALOG_FAILURES[_context_route_key(cache_key)] = time.monotonic()
+        _record_context_route_failure(_context_route_key(cache_key))
         _log_context_probe_failure(canonical, e)
     _CONTEXT_CAPABILITY_FAILURES[cache_key] = time.monotonic()
     fallback = _last_known_gateway_capability(cache_key)
