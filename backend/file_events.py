@@ -1576,6 +1576,8 @@ class FileWatchManager:
             "transaction_wait_ms": 0,
             "transaction_apply_ms": 0,
             "commit_ms": 0,
+            "read_compare_ms": 0,
+            "write_skipped": False,
             "scanned_files": 0,
             "snapshot_files": 0,
             "changes": 0,
@@ -1638,6 +1640,8 @@ class FileWatchManager:
                 transaction_wait_ms=metrics["transaction_wait_ms"],
                 transaction_apply_ms=metrics["transaction_apply_ms"],
                 commit_ms=metrics["commit_ms"],
+                read_compare_ms=metrics["read_compare_ms"],
+                write_skipped=metrics["write_skipped"],
                 scanned_files=metrics["scanned_files"],
                 snapshot_files=metrics["snapshot_files"],
                 changes=metrics["changes"],
@@ -1812,8 +1816,9 @@ class FileWatchManager:
                             )
                         finally:
                             for key in ("store_lock_wait_ms", "transaction_wait_ms",
-                                        "transaction_apply_ms", "commit_ms", "rebased_paths"):
+                                        "transaction_apply_ms", "commit_ms", "rebased_paths", "read_compare_ms"):
                                 metrics[key] = int(metrics.get(key, 0)) + int(scan_report.get(key, 0))
+                            metrics["write_skipped"] = bool(scan_report.get("write_skipped"))
                             metrics["store_apply_ms"] = int(
                                 metrics["store_apply_ms"]
                             ) + elapsed_ms(store_started)

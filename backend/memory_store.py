@@ -1280,12 +1280,15 @@ class MemoryStore:
         params.append(limit)
         with self._observed_read("lexical") as conn:
             try:
+                # FTS5 can deliver rank-ordered hits directly and stop at LIMIT;
+                # ORDER BY bm25(...) otherwise sorts all matches externally.
+                # Pin the rank mapping per query to preserve the existing scores.
                 rows = conn.execute(
-                    f"""SELECT {"m.id" if _ids_only else "m.*"}, bm25(memory_fts) AS lexical_rank
+                    f"""SELECT {"m.id" if _ids_only else "m.*"}, memory_fts.rank AS lexical_rank
                         FROM memory_fts JOIN memories m ON m.id=memory_fts.memory_id
-                        WHERE memory_fts MATCH ? AND m.owner_id=?
-                        {status_clause} {kind_clause}
-                        ORDER BY lexical_rank LIMIT ?""", params,
+                        WHERE memory_fts MATCH ? AND memory_fts.rank MATCH 'bm25()'
+                        AND m.owner_id=? {status_clause} {kind_clause}
+                        ORDER BY memory_fts.rank LIMIT ?""", params,
                 ).fetchall()
             except sqlite3.OperationalError as exc:
                 # Interrupts and lock contention must reach the recall actor:

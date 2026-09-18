@@ -764,6 +764,11 @@ def _compose_sessions_list(
     # copying the set here avoids taking _QUEUE_LOCK while _save_index may
     # already be called from a queue transaction.
     deleted_ids = set(_DELETED_SESSION_IDS)
+    # Registry entries are already canonical. Composing hundreds of index-only
+    # rows under _LIST_CACHE_LOCK must not resolve the same path on disk for each
+    # session. This is a display filter; API access still resolves its workspace.
+    registered_paths = {str(path) for path in workspace_registry.paths()}
+    legacy_membership: dict[str, bool] = {}
     out: list[dict] = []
     seen: set[str] = set()
     for sid, (info, workspace) in transcript_by_id.items():
@@ -779,8 +784,13 @@ def _compose_sessions_list(
             continue
         # Removed workspaces retain durable metadata for later re-registration,
         # but are absent from the active picker.
-        if stored.get("cwd") and not workspace_registry.contains(stored.get("cwd")):
-            continue
+        cwd = stored.get("cwd")
+        if cwd and cwd not in registered_paths:
+            # Preserve legacy symlink/relative metadata, once per distinct cwd.
+            if cwd not in legacy_membership:
+                legacy_membership[cwd] = workspace_registry.contains(cwd)
+            if not legacy_membership[cwd]:
+                continue
         row = _normalize_session_permission_fields(stored)
         if row.get("runtime_shadow"):
             continue
