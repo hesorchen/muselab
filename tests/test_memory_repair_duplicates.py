@@ -50,7 +50,7 @@ def test_two_prepared_episodes_cannot_commit_same_fact(target, monkeypatch):
     assert store.apply_memory_repair(prepared_a) == receipt
 
 
-@pytest.mark.parametrize("status", ["active", "pending_review", "deleted"])
+@pytest.mark.parametrize("status", ["active", "pending_review", "superseded", "deleted"])
 @pytest.mark.parametrize("unicode_content", [False, True])
 def test_fact_inserted_after_stage_in_other_episode_blocks_apply(target, monkeypatch, status, unicode_content):
     store, _, _, _ = target

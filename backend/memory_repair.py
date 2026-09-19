@@ -49,13 +49,17 @@ def read_source(conn, owner_id: str, episode_id: str) -> dict:
         "SELECT * FROM jobs WHERE json_extract(payload_json,'$.episode_id')=? "
         "ORDER BY id", (episode_id,))
     # Owner-wide source-less rows cannot safely be attributed to this episode.
+    # Scan sources once rather than seeking once per owner memory.
     orphans = rows(
-        "SELECT m.id FROM memories m WHERE owner_id=? AND NOT EXISTS "
-        "(SELECT 1 FROM memory_sources s WHERE s.memory_id=m.id) ORDER BY m.id",
+        "SELECT id FROM memories WHERE owner_id=? EXCEPT "
+        "SELECT memory_id FROM memory_sources ORDER BY 1",
         (owner_id,))
+    # Select IDs from the narrow covering index before hydrating matching rows.
+    # Ordering the wide scan by PK would fetch every unrelated artifact payload.
     artifacts = rows(
-        "SELECT a.* FROM artifacts a WHERE EXISTS "
-        "(SELECT 1 FROM json_each(a.source_episode_ids_json) WHERE value=?) ORDER BY id",
+        "SELECT a.* FROM artifacts a WHERE a.rowid IN "
+        "(SELECT rowid FROM artifacts WHERE EXISTS "
+        "(SELECT 1 FROM json_each(artifacts.source_episode_ids_json) WHERE value=?)) ORDER BY a.id",
         (episode_id,))
     active = rows(
         "SELECT id,kind,owner_id FROM jobs WHERE status IN ('queued','running') AND "
