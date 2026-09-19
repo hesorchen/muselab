@@ -77,21 +77,21 @@ def _result(origin=None, *, is_error=False, uuid=None):
 @pytest.mark.parametrize("is_error", [False, True], ids=["success", "error"])
 def test_result_uses_its_own_origin_after_notification(stream_env, origin, is_error):
     boundary = stream_env._TurnResponseBoundary(set())
-    assert boundary.classify(_user()) == "background"
+    assert boundary.classify(_user()) == "forward"
     assert boundary.classify(_result(origin, is_error=is_error)) == "current_result"
     assert boundary.classify(_text("next payload")) == "forward"
 
 
 def test_background_result_does_not_end_human_turn(stream_env):
     boundary = stream_env._TurnResponseBoundary(set())
-    assert boundary.classify(_user()) == "background"
+    assert boundary.classify(_user()) == "forward"
     assert boundary.classify(_result(NOTICE, is_error=True)) == "background_result"
     assert boundary.classify(_result()) == "current_result"
 
 
 def test_stale_result_and_task_lifecycle_do_not_consume_pending_owner(stream_env):
     boundary = stream_env._TurnResponseBoundary({"old-result"})
-    assert boundary.classify(_user()) == "background"
+    assert boundary.classify(_user()) == "forward"
     lifecycle = TaskNotificationMessage(
         subtype="task_notification",
         data={},
@@ -203,7 +203,7 @@ async def test_folded_notification_preserves_text_and_terminal(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("pumped", [True, False], ids=["pump", "bounded-iterator"])
 @pytest.mark.parametrize("side_error", [False, True], ids=["side-success", "side-error"])
-async def test_separate_background_result_keeps_its_payload_out_of_parent(
+async def test_side_response_streams_once_without_ending_human_turn(
     stream_env,
     monkeypatch,
     pumped,
@@ -215,10 +215,9 @@ async def test_separate_background_result_keeps_its_payload_out_of_parent(
     sid, _, detached = await _prepare(chat, monkeypatch, [separate + folded], pumped=pumped)
     try:
         text, done, _ = await _finish(chat, sid)
-        assert text == "Parent answer."
+        assert text == "Background-only answer.Parent answer."
         assert done["is_error"] is False
-        if pumped:
-            assert detached == separate
+        assert detached == []
     finally:
         await chat._drop_session_streams(sid)
 
@@ -260,19 +259,21 @@ async def test_folded_turn_does_not_replay_into_successor(stream_env, monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_cancellation_releases_unresolved_payload_once(stream_env, monkeypatch):
+async def test_cancellation_does_not_replay_already_visible_payload(stream_env, monkeypatch):
     chat = stream_env
     pending = [_user(), _text("Unresolved answer.")]
     sid, fake, detached = await _prepare(chat, monkeypatch, [pending])
     broadcast = await chat._start_turn(sid, "synthetic prompt", model="claude-sonnet-4-6")
     try:
         await asyncio.wait_for(fake.drained.wait(), timeout=2)
-        # Let the turn consumer drain the pump queue into its provisional buffer.
-        for _ in range(10):
-            await asyncio.sleep(0)
+        async def wait_for_text():
+            while not any(e["event"] == "text" for e in broadcast.replay_events()):
+                await asyncio.sleep(0.01)
+        await asyncio.wait_for(wait_for_text(), timeout=2)
         broadcast.task.cancel()
         await asyncio.wait_for(asyncio.gather(broadcast.task, return_exceptions=True), 2)
-        assert detached == pending
+        assert detached == []
+        assert any(e["event"] == "text" for e in broadcast.replay_events())
         assert sid not in chat._active_turns
     finally:
         if not broadcast.task.done():
@@ -336,3 +337,56 @@ async def test_folded_tool_round_trip_and_long_answer_survive(stream_env, monkey
         assert detached == []
     finally:
         await chat._drop_session_streams(sid)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pumped", [True, False], ids=["pump", "bounded-iterator"])
+@pytest.mark.parametrize("side_result", [False, True], ids=["fold", "side-result"])
+async def test_notification_progress_is_visible_before_terminal_result(
+    stream_env, monkeypatch, pumped, side_result,
+):
+    """A long tool round trip must not wait for the query's Result to render."""
+    chat = stream_env
+    gate = asyncio.Event()
+    tool = parse_message({"type": "assistant", "message": {
+        "model": "claude-sonnet-4-6", "content": [{
+            "type": "tool_use", "id": "synthetic-live-tool", "name": "Read",
+            "input": {"file_path": "fixture.txt"},
+        }],
+    }})
+    result = parse_message({"type": "user", "message": {
+        "role": "user", "content": [{
+            "type": "tool_result", "tool_use_id": "synthetic-live-tool",
+            "content": "synthetic output",
+        }],
+    }})
+    script = [_user(), _delta("Working now."), _text("Working now."),
+              tool, result, *([_result(NOTICE)] if side_result else []),
+              gate, _text("Finished."), _result()]
+    sid, _, detached = await _prepare(chat, monkeypatch, [script], pumped=pumped)
+    broadcast = await chat._start_turn(sid, "synthetic prompt", model="claude-sonnet-4-6")
+    try:
+        async def progress_visible():
+            while True:
+                events = list(broadcast.replay_events())
+                kinds = [event["event"] for event in events]
+                if "text" in kinds and "tool_use" in kinds and "tool_result" in kinds:
+                    return events
+                await asyncio.sleep(0.01)
+        events = await asyncio.wait_for(progress_visible(), timeout=1)
+        assert not broadcast.done and not broadcast.result_forwarded
+        assert sid in chat._active_turns
+        assert not any(e["event"] == "done" for e in events)
+        assert "synthetic-live-tool" not in broadcast.active_tool_use_ids
+        gate.set()
+        await asyncio.wait_for(asyncio.shield(broadcast.task), timeout=2)
+        assert broadcast.done and broadcast.result_forwarded
+        assert [e["event"] for e in broadcast.replay_events()].count("done") == 1
+        assert detached == []
+    finally:
+        gate.set()
+        if not broadcast.task.done():
+            broadcast.task.cancel()
+            await asyncio.gather(broadcast.task, return_exceptions=True)
+        await chat._drop_session_streams(sid)
+        broadcast.close()

@@ -6677,10 +6677,9 @@ class _TurnResponseBoundary:
     def __init__(self, existing_uuids: frozenset[str] | set[str]):
         self.existing_uuids = frozenset(existing_uuids)
         self.saw_current_payload = False
-        self.nonhuman_origin_active = False
 
     def classify(self, msg: Any) -> str:
-        """Classify payload provisionally; Result origin resolves its owner.
+        """Stream same-session progress; only Result origin resolves completion.
 
         Lifecycle/rate-limit events are intentionally out-of-band and always
         pass through: a late TaskNotification still needs to settle the old
@@ -6705,7 +6704,6 @@ class _TurnResponseBoundary:
             # A notification can be absorbed into the current query instead of
             # starting a separate turn. Only this Result's own origin identifies
             # the completed query; a preceding UserMessage cannot override it.
-            self.nonhuman_origin_active = False
             # ``origin=None`` is the current SDK shape for an ordinary
             # client.query(prompt); preserve that compatibility. Any explicit
             # non-human/future origin belongs to a side delivery and cannot
@@ -6723,11 +6721,10 @@ class _TurnResponseBoundary:
             self.saw_current_payload = True
             return "current_result"
 
-        if isinstance(msg, UserMessage) and origin is not None:
-            self.nonhuman_origin_active = origin["kind"] != "human"
-        if self.nonhuman_origin_active:
-            return "background"
-
+        # UserMessage.origin attributes that injected message, not subsequent
+        # assistant/tool frames. A notification can fold into a running query.
+        # Waiting for its eventual Result hides all progress during long tasks.
+        # This attached lane already owns the session; stream new payload now.
         self.saw_current_payload = True
         return "forward"
 
@@ -17687,7 +17684,7 @@ async def _start_turn(
         await _emit_compact(emit, "end", ok=True, used=real_total, limit=lim)
 
     async def event_gen():
-        nonlocal assistant_acc, streamed_in_bubble
+        nonlocal assistant_acc, streamed_in_bubble, last_assistant_uuid
         subagent_mux = chat_subagents.SubagentStreamMux(session_id)
         # Subscribe to the session's side-channel queue. The MCP ask_user_question
         # handler publishes here; we merge those events into the SSE stream so the
@@ -17874,8 +17871,7 @@ async def _start_turn(
 
                 replay_dropped = 0
                 deferred_result: ResultMessage | None = None
-                background_messages: list[Any] = []
-                pending_origin_messages: list[Any] = []
+                logged_injected_progress = False
 
                 async def _forward_turn_message(msg, decision: str) -> str:
                     nonlocal deferred_result
@@ -17920,8 +17916,8 @@ async def _start_turn(
                     return decision
 
                 async def _dispatch(msg) -> str:
-                    """Resolve notification payload at its SDK Result boundary."""
-                    nonlocal replay_dropped, deferred_result
+                    """Deliver progress immediately; gate completion on Result origin."""
+                    nonlocal replay_dropped, deferred_result, logged_injected_progress
                     if isinstance(msg, CommandLifecycleMessage):
                         terminal = await _settle_steering_lifecycle(
                             broadcast, msg)
@@ -17941,45 +17937,22 @@ async def _start_turn(
                     if decision in ("drop", "stale_result"):
                         replay_dropped += 1
                         return decision
-                    if decision in ("current_result", "background_result"):
-                        if pending_origin_messages:
-                            resolved = list(pending_origin_messages)
-                            pending_origin_messages.clear()
-                            origin = sdk_lifecycle.normalize_origin(
-                                getattr(msg, "origin", None))
+                    if isinstance(msg, UserMessage) and not logged_injected_progress:
+                        origin = sdk_lifecycle.normalize_origin(getattr(msg, "origin", None))
+                        if origin is not None and origin["kind"] != "human":
+                            logged_injected_progress = True
                             obs.perf_event(
-                                "chat.sdk_delivery_resolved",
-                                sid8=session_id[:8], turn8=broadcast.turn_id[:8],
-                                owner=("current" if decision == "current_result"
-                                       else "background"),
-                                origin_kind=origin["kind"] if origin else "none",
-                                messages=len(resolved),
+                                "chat.sdk_injected_progress", sid8=session_id[:8],
+                                turn8=broadcast.turn_id[:8], origin_kind=origin["kind"],
+                                delivery="live",
                             )
-                            if decision == "current_result":
-                                # Preserve deltas, tool results and final text in
-                                # order before done. The normal user handler also
-                                # settles task XML without rendering it as text.
-                                for index, pending in enumerate(resolved, 1):
-                                    await _forward_turn_message(pending, "forward")
-                                    if index % 64 == 0:
-                                        # Match the SDK pump's cooperative drain;
-                                        # a long fold must not flood merge_q.
-                                        await asyncio.sleep(0)
-                            else:
-                                background_messages.extend(resolved)
-                        if decision == "background_result":
-                            background_messages.append(msg)
-                            return decision
-                    elif decision == "background" or (
-                        pending_origin_messages
-                        and isinstance(msg, boundary._TURN_TYPES)
-                        and not isinstance(msg, boundary._LIFECYCLE_TYPES)
-                    ):
-                        # A human steering message can also be folded into the
-                        # same query. Keep ordering until Result resolves the
-                        # owner; task/rate-limit lifecycle remains out-of-band.
-                        pending_origin_messages.append(msg)
-                        return "background"
+                    if decision == "background_result":
+                        # A side response may finish while this human query is
+                        # still running. Its payload was already streamed in
+                        # this session: do not replay it through the idle lane
+                        # or emit a parent done. Reset only response-local state.
+                        await merge_q.put(("background_result", msg))
+                        return decision
                     return await _forward_turn_message(msg, decision)
 
                 stream = _stream_for(client)
@@ -18018,9 +17991,7 @@ async def _start_turn(
                         finally:
                             # Cancellation must also complete queue ownership
                             # transfer before this producer can disappear.
-                            background_messages.extend(pending_origin_messages)
-                            pending_origin_messages.clear()
-                            await stream.release_turn(turn_q, background_messages)
+                            await stream.release_turn(turn_q)
                 else:
                     # No pump: this client was not created through get_client
                     # (test doubles inject their own). Fall back to the SDK's
@@ -19192,6 +19163,21 @@ async def _start_turn(
                 if kind == "side":
                     # Already shaped as {"event": "...", "data": "..."} — pass through.
                     yield await _prepare_side_event(payload)
+                    continue
+                if kind == "background_result":
+                    # Result ownership gates terminal state, never live output.
+                    # Preserve result-only compatible runtimes without repeating
+                    # prose that has already arrived as assistant/delta frames.
+                    result_text = str(getattr(payload, "result", None) or "")
+                    if (_meaningful_scheduled_text(result_text)
+                            and not "".join(streamed_in_bubble).strip()
+                            and not bool(getattr(payload, "is_error", False))):
+                        yield {"event": "text", "data": json.dumps({"text": result_text})}
+                    assistant_acc = []
+                    streamed_in_bubble = []
+                    last_assistant_uuid = ""
+                    broadcast.last_assistant_uuid = ""
+                    turn_sdk_errors.clear()
                     continue
                 if kind == "cancelled":
                     async for side_event in _flush_side_channels():
