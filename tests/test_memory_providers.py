@@ -169,6 +169,136 @@ def test_qdrant_refuses_existing_collection_with_wrong_dimension(monkeypatch):
         _run(store.ensure(1024))
 
 
+@pytest.fixture()
+def qdrant_requests(monkeypatch):
+    import httpx
+    from backend.memory_config import VectorConfig
+    from backend.memory_providers import QdrantVectorStore
+
+    store = QdrantVectorStore(VectorConfig(url="http://qdrant:6333", collection="memory"))
+    state = {"exists": True, "size": 1024, "schema": {}, "fail": None, "calls": []}
+
+    async def request(method, path, **kwargs):
+        state["calls"].append((method, path, kwargs))
+        status, body = 200, {"result": {"status": "completed"}}
+        if state["fail"] and state["fail"][:2] == (method, path):
+            status = state["fail"][2]
+        elif method == "GET":
+            if not state["exists"]:
+                status = 404
+            body = {"result": {
+                "config": {"params": {"vectors": {"size": state["size"]}}},
+                "payload_schema": dict(state["schema"]),
+            }}
+        elif path == "/collections/memory":
+            assert method == "PUT"
+            state["exists"] = True
+        else:
+            assert method == "PUT" and path == "/collections/memory/index?wait=true"
+            assert kwargs["json"]["field_schema"] == "keyword"
+            state["schema"][kwargs["json"]["field_name"]] = {"data_type": "keyword"}
+        response = httpx.Response(status, json=body, request=httpx.Request(method, store.base + path))
+        response.raise_for_status()
+        return response
+
+    monkeypatch.setattr(store, "_request", request)
+    return store, state
+
+
+@pytest.mark.parametrize("exists", [True, False])
+def test_qdrant_ensure_adds_filter_indexes_without_recreating(qdrant_requests, exists):
+    store, state = qdrant_requests
+    state["exists"] = exists
+    _run(store.ensure(1024))
+    calls = [("GET", "/collections/memory", {})]
+    if not exists:
+        calls.append(("PUT", "/collections/memory", {"json": {
+            "vectors": {"size": 1024, "distance": "Cosine"}, "on_disk_payload": True}}))
+    calls.extend(("PUT", "/collections/memory/index?wait=true", {"json": {
+        "field_name": field, "field_schema": "keyword"}}) for field in ("owner_id", "status"))
+    assert state["calls"] == calls
+    state["calls"].clear()
+    _run(store.ensure(1024))
+    assert state["calls"] == [("GET", "/collections/memory", {})]
+
+
+@pytest.mark.parametrize("field", ["owner_id", "status"])
+def test_qdrant_ensure_only_creates_missing_index(qdrant_requests, field):
+    store, state = qdrant_requests
+    state["schema"][field] = {"data_type": "keyword", "points": 7745}
+    _run(store.ensure(1024))
+    assert len(state["calls"]) == 2
+    assert state["calls"][1][2]["json"]["field_name"] != field
+
+
+@pytest.mark.parametrize("field", ["owner_id", "status"])
+def test_qdrant_ensure_rejects_incompatible_index_without_mutation(qdrant_requests, field):
+    store, state = qdrant_requests
+    state["schema"][field] = {"data_type": "text"}
+    with pytest.raises(ValueError, match="keyword"):
+        _run(store.ensure(1024))
+    assert state["calls"] == [("GET", "/collections/memory", {})]
+
+
+def test_qdrant_dimension_mismatch_does_not_create_indexes(qdrant_requests):
+    store, state = qdrant_requests
+    state["size"] = 768
+    with pytest.raises(ValueError, match="dimension mismatch"):
+        _run(store.ensure(1024))
+    assert state["calls"] == [("GET", "/collections/memory", {})]
+
+
+@pytest.mark.parametrize("status", [401, 403, 500])
+def test_qdrant_ensure_does_not_recreate_on_collection_read_failure(qdrant_requests, status):
+    import httpx
+    store, state = qdrant_requests
+    state["fail"] = ("GET", "/collections/memory", status)
+    with pytest.raises(httpx.HTTPStatusError):
+        _run(store.ensure(1024))
+    assert state["calls"] == [("GET", "/collections/memory", {})]
+
+
+@pytest.mark.parametrize("status", [404, 500])
+def test_qdrant_index_failure_propagates_and_can_resume(qdrant_requests, status):
+    import httpx
+    store, state = qdrant_requests
+    state["schema"]["owner_id"] = {"data_type": "keyword"}
+    state["fail"] = ("PUT", "/collections/memory/index?wait=true", status)
+    with pytest.raises(httpx.HTTPStatusError):
+        _run(store.ensure(1024))
+    assert len(state["calls"]) == 2
+    assert state["calls"][1][2]["json"]["field_name"] == "status"
+    state["fail"] = None
+    state["calls"].clear()
+    _run(store.ensure(1024))
+    assert len(state["calls"]) == 2
+    assert state["calls"][1][2]["json"]["field_name"] == "status"
+
+
+def test_qdrant_search_keeps_owner_status_full_payload_and_candidate_count(monkeypatch):
+    import httpx
+    from backend.memory_config import VectorConfig
+    from backend.memory_providers import QdrantVectorStore
+
+    payload = {"memory_id": "memory", "content": "complete synthetic body" * 1000}
+    store = QdrantVectorStore(VectorConfig(url="http://qdrant:6333", collection="memory"))
+
+    async def request(method, path, **kwargs):
+        assert (method, path) == ("POST", "/collections/memory/points/query")
+        assert kwargs["json"] == {
+            "query": [1., 0.], "limit": 60, "with_payload": True,
+            "filter": {"must": [
+                {"key": "owner_id", "match": {"value": "test-owner"}},
+                {"key": "status", "match": {"value": "active"}}]},
+        }
+        return httpx.Response(200, json={"result": {"points": [
+            {"payload": payload, "score": .9}]}})
+
+    monkeypatch.setattr(store, "_request", request)
+    rows = _run(store.search([1., 0.], owner_id="test-owner", limit=60))
+    assert rows == [{"id": "memory", "score": .9, "payload": payload, "channel": "dense"}]
+
+
 def test_pgvector_table_name_is_not_interpolatable():
     from backend.memory_config import VectorConfig
     from backend.memory_providers import PgVectorStore

@@ -185,14 +185,27 @@ class QdrantVectorStore(VectorStore):
                 raise ValueError(
                     f"Qdrant collection dimension mismatch: "
                     f"{existing_size} != {dimensions}")
-            return
+            payload_schema = result.get("payload_schema") or {}
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code != 404:
                 raise
-        await self._request("PUT", path, json={
-            "vectors": {"size": dimensions, "distance": "Cosine"},
-            "on_disk_payload": True,
-        })
+            await self._request("PUT", path, json={
+                "vectors": {"size": dimensions, "distance": "Cosine"},
+                "on_disk_payload": True,
+            })
+            payload_schema = {}
+
+        # Existing collections need these too: every query filters both fields.
+        # Validate before mutation; never replace an incompatible user index.
+        fields = ("owner_id", "status")
+        for field in fields:
+            if field in payload_schema and payload_schema[field].get("data_type") != "keyword":
+                raise ValueError(f"Qdrant {field} payload index must be keyword")
+        for field in fields:
+            if field not in payload_schema:
+                await self._request("PUT", f"{path}/index?wait=true", json={
+                    "field_name": field, "field_schema": "keyword",
+                })
 
     async def upsert(self, item_id: str, vector: list[float], payload: dict) -> None:
         await self.upsert_many([(item_id, vector, payload)])
