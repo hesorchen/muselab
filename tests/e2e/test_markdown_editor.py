@@ -65,7 +65,7 @@ def test_editor_theme_contrast_and_real_keyboard_after_view_switch(page, backend
     assert bg != page.locator(".CodeMirror").evaluate("el => getComputedStyle(el).backgroundColor")
     # Clicking a toolbar button must not make the selected range disappear.
     page.locator(".editor-font-controls button").first.click()
-    assert page.locator(".CodeMirror-selected").first.evaluate("el => getComputedStyle(el).backgroundColor") == bg
+    expect(page.locator(".CodeMirror-selected").first).to_have_css("background-color", bg)
     assert errors == []
 
 
@@ -336,3 +336,87 @@ def test_outline_clears_on_file_switch_and_empty_document(page, backend_url, aut
     assert page.locator('.markdown-outline-items p').is_visible()
     page.evaluate("async () => {const app=" + APP + "; await app.saveEdit({exitAfterSave:true}); await app.openFile({path:'notes.md',name:'notes.md'});}")
     expect(page.locator('#markdown-outline')).to_be_hidden()
+
+
+
+def test_cold_editor_core_can_arrive_after_fifteen_seconds(page, backend_url, auth_token):
+    page.route("**/cm/codemirror.min.js*", lambda route: (time.sleep(16), route.continue_()))
+    _open(page, backend_url, auth_token)
+    assert page.evaluate("window.__muselab_cm.getMode().name") == "markdown"
+    assert not page.evaluate(APP + ".editorError")
+    page.locator('.CodeMirror').click()
+    page.keyboard.press('Control+End')
+    page.keyboard.insert_text('slow network input')
+    assert page.evaluate("window.__muselab_cm.getValue().endsWith('slow network input')")
+
+
+def test_cold_preview_download_does_not_consume_parse_budget(page, backend_url, auth_token):
+    delayed = []
+
+    def slow_worker(route):
+        if not delayed:
+            delayed.append(True)
+            time.sleep(6)
+        route.continue_()
+
+    page.route("**/render-worker.js*", slow_worker)
+    _open(page, backend_url, auth_token, '# Slow transport\n\nStill rendered')
+    expect(page.locator('.editor-live-preview h1')).to_have_text('Slow transport')
+    assert not page.evaluate(APP + '.editorPreviewError')
+
+
+def test_worker_cpu_stall_still_falls_back_without_blocking_editor(page, backend_url, auth_token):
+    page.route("**/render-worker.js*", lambda route: route.fulfill(
+        content_type='text/javascript',
+        body='self.onmessage = () => { self.postMessage({parsing:true}); while (true) {} };',
+    ))
+    _open(page, backend_url, auth_token, '# Safe CPU fallback')
+    expect(page.locator('.editor-live-preview pre')).to_contain_text('# Safe CPU fallback')
+    assert page.evaluate(APP + '.editorPreviewError')
+    page.locator('.CodeMirror').click()
+    page.keyboard.press('Control+End')
+    page.keyboard.type('responsive')
+    assert page.evaluate("window.__muselab_cm.getValue().endsWith('responsive')")
+
+
+def test_preview_keeps_position_when_visible_block_is_replaced(page, backend_url, auth_token):
+    # Many short paragraphs fit one parser chunk but occupy a tall viewport.
+    _open(page, backend_url, auth_token, "# Long document\n\n" + "Paragraph.\n\n" * 350)
+    page.evaluate("""() => {
+      const cm=window.__muselab_cm, p=document.querySelector('.editor-live-preview');
+      cm.setCursor({line:350,ch:3}); cm.focus();
+      p.scrollTop=(p.scrollHeight-p.clientHeight)*0.55;
+    }""")
+    page.wait_for_timeout(150)
+    page.evaluate("""() => {
+      const cm=window.__muselab_cm;
+      cm.setCursor(cm.coordsChar({left:80,top:cm.getScrollInfo().top+80},'local'));
+    }""")
+    before = page.locator('.editor-live-preview').evaluate('p=>p.scrollTop')
+    assert before > 1000
+    page.keyboard.insert_text('changed')
+    page.wait_for_function("!" + APP + ".editorPreviewBusy")
+    page.wait_for_timeout(150)
+    after = page.locator('.editor-live-preview').evaluate('p=>p.scrollTop')
+    assert abs(after-before) < 40
+    assert 'changed' in page.locator('.editor-live-preview').text_content()
+
+
+def test_split_scroll_sync_is_bidirectional_and_survives_view_changes(page, backend_url, auth_token):
+    _open(page, backend_url, auth_token, "# Scroll fixture\n\n" + "## Heading\n\nParagraph.\n\n" * 250)
+    measure = """() => {
+      const c=window.__muselab_cm.getScrollInfo(), p=document.querySelector('.editor-live-preview');
+      return {editor:c.top/(c.height-c.clientHeight),preview:p.scrollTop/(p.scrollHeight-p.clientHeight)};
+    }"""
+    page.evaluate("const c=window.__muselab_cm,s=c.getScrollInfo();c.scrollTo(null,(s.height-s.clientHeight)*0.6)")
+    page.wait_for_function("() => {const c=window.__muselab_cm.getScrollInfo(),p=document.querySelector('.editor-live-preview');return Math.abs(c.top/(c.height-c.clientHeight)-p.scrollTop/(p.scrollHeight-p.clientHeight))<0.025}")
+    page.locator('.editor-live-preview').evaluate('p=>p.scrollTop=(p.scrollHeight-p.clientHeight)*0.3')
+    page.wait_for_function("() => {const c=window.__muselab_cm.getScrollInfo();return Math.abs(c.top/(c.height-c.clientHeight)-0.3)<0.025}")
+    page.wait_for_timeout(200)
+    positions=page.evaluate(measure)
+    assert abs(positions['editor']-positions['preview']) < 0.025
+    page.locator('.editor-view-switch button').nth(0).click()
+    page.evaluate("const c=window.__muselab_cm,s=c.getScrollInfo();c.scrollTo(null,(s.height-s.clientHeight)*0.8)")
+    page.locator('.editor-view-switch button').nth(1).click()
+    page.wait_for_function("!" + APP + ".editorPreviewBusy")
+    page.wait_for_function("() => {const c=window.__muselab_cm.getScrollInfo(),p=document.querySelector('.editor-live-preview');return Math.abs(c.top/(c.height-c.clientHeight)-p.scrollTop/(p.scrollHeight-p.clientHeight))<0.025}")
