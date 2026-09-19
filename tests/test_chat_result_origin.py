@@ -390,3 +390,31 @@ async def test_notification_progress_is_visible_before_terminal_result(
             await asyncio.gather(broadcast.task, return_exceptions=True)
         await chat._drop_session_streams(sid)
         broadcast.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_owner", ["side", "human"])
+@pytest.mark.parametrize("error_source", ["system", "assistant"])
+async def test_burst_error_stays_with_its_result_owner(
+    stream_env, monkeypatch, error_owner, error_source,
+):
+    from claude_agent_sdk import AssistantMessage, SystemMessage, TextBlock
+
+    error = (SystemMessage(subtype="local_command", data={
+        "content": "API Error: synthetic provider unavailable",
+    }) if error_source == "system" else AssistantMessage(
+        content=[TextBlock(text="API Error: synthetic provider unavailable")],
+        model="<synthetic>", error="unknown",
+    ))
+    side = [_user(), _text("Side progress."),
+            *([error] if error_owner == "side" else []), _result(NOTICE)]
+    human = [*([error] if error_owner == "human" else []),
+             _text("Human progress."), _result()]
+    chat = stream_env
+    sid, _, detached = await _prepare(chat, monkeypatch, [side + human])
+    try:
+        _, done, _ = await _finish(chat, sid)
+        assert done["is_error"] is (error_owner == "human")
+        assert detached == []
+    finally:
+        await chat._drop_session_streams(sid)

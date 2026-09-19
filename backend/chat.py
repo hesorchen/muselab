@@ -17906,11 +17906,12 @@ async def _start_turn(
                             and broadcast.perf_first_event_ms < 0):
                         broadcast.perf_first_event_ms = obs.elapsed_ms(
                             broadcast.perf_query_started)
-                    # Record terminal system signals in the pump before reading
-                    # the next item. If the stream closes without ResultMessage,
-                    # event_gen may not have consumed the queued row yet.
-                    if (isinstance(msg, SystemMessage)
-                            and (error_info := _sdk_system_error(msg))):
+                    # Collect all terminal signals in wire order, in this sole
+                    # producer. The renderer can lag behind later SDK frames;
+                    # clearing a shared error list there could erase a newer
+                    # human error while finishing an earlier side response.
+                    error_info = _sdk_system_error(msg) or _sdk_assistant_error(msg)
+                    if error_info:
                         turn_sdk_errors.append(error_info)
                     await merge_q.put(("claude", msg))
                     return decision
@@ -17951,6 +17952,7 @@ async def _start_turn(
                         # still running. Its payload was already streamed in
                         # this session: do not replay it through the idle lane
                         # or emit a parent done. Reset only response-local state.
+                        turn_sdk_errors.clear()
                         await merge_q.put(("background_result", msg))
                         return decision
                     return await _forward_turn_message(msg, decision)
@@ -18142,8 +18144,7 @@ async def _start_turn(
             if assistant_uuid:
                 last_assistant_uuid = str(assistant_uuid)
                 broadcast.last_assistant_uuid = last_assistant_uuid
-            if error_info := _sdk_assistant_error(msg):
-                turn_sdk_errors.append(error_info)
+            if _sdk_assistant_error(msg):
                 # Synthetic API-error assistants often carry the raw error as a
                 # TextBlock. Do not render it as if it were a normal Muse reply;
                 # the terminal done event below surfaces the classified failure.
@@ -19177,7 +19178,6 @@ async def _start_turn(
                     streamed_in_bubble = []
                     last_assistant_uuid = ""
                     broadcast.last_assistant_uuid = ""
-                    turn_sdk_errors.clear()
                     continue
                 if kind == "cancelled":
                     async for side_event in _flush_side_channels():
