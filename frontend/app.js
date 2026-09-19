@@ -741,6 +741,8 @@ function portal() {
     editorView: "split",
     editorFontSize: Math.max(14, Math.min(24, Number(localStorage.getItem("muselab_editor_font_size")) || 16)),
     editorLoading: false, editorError: "", editorSaveState: "",
+    markdownOutlineOpen: false,
+    markdownOutline: [],
     editorPreviewBusy: false, editorPreviewError: "",
     _cmMountVersion: 0,
     _saveEditInFlight: false,
@@ -2072,6 +2074,7 @@ function portal() {
       this.$watch("editing", v => {
         this.dismissTransientPreviewQuote(true);
         v ? this.mountCM() : this.unmountCM();
+        if (!v) this.$nextTick(() => this._refreshMarkdownOutline());
       });
       // Removed: pane-open toast — the panel opening is self-evident.
       // 编辑模式下切换文件时，重新挂载 CM 加载新文件内容
@@ -2080,7 +2083,10 @@ function portal() {
       // whenever the active file changes (tree click, tab switch, chat link,
       // boot restore). Fire once now too in case `selected` was restored
       // before this watcher attached.
+      this.$watch("renderedMd", () => this.$nextTick(() => this._refreshMarkdownOutline()));
       this.$watch("selected", (p) => {
+        this.markdownOutlineOpen = false;
+        this.markdownOutline = [];
         this.dismissTransientPreviewQuote(true);
         this.loadSelectedMeta(p);
       });
@@ -3155,8 +3161,44 @@ function portal() {
         if (valid()) this.editorPreviewError = this.lang === "zh"
           ? "预览更新失败，点击重试。" : "Preview update failed. Retry.";
       } finally {
-        if (valid()) this.editorPreviewBusy = false;
+        if (valid()) {
+          this.editorPreviewBusy = false;
+          this._refreshMarkdownOutline();
+        }
       }
+    },
+    markdownOutlineAvailable() {
+      return this.previewSurface === "file" && (this.editing
+        ? this.editorIsMd && this.editorView !== "edit" : this.previewMode === "md");
+    },
+    _markdownOutlineRoot() {
+      return this.editing ? this.$refs.editorPreview : this.$refs.markdownPreview;
+    },
+    toggleMarkdownOutline() {
+      this.markdownOutlineOpen = !this.markdownOutlineOpen;
+      if (this.markdownOutlineOpen) this.$nextTick(() => this._refreshMarkdownOutline());
+      this.$nextTick(() => this._getCM()?.refresh());
+    },
+    _refreshMarkdownOutline() {
+      // Only inspect rendered headings while the outline is open. No parsing,
+      // layout measurements or per-keystroke DOM scans in the closed state.
+      if (!this.markdownOutlineOpen || !this.markdownOutlineAvailable()) return;
+      const root = this._markdownOutlineRoot();
+      const items = Array.from(root?.querySelectorAll("h1,h2,h3,h4,h5,h6") || [], (node, index) => {
+        node.dataset.outlineIndex = index;
+        return { index, level: Number(node.tagName.slice(1)), text: node.textContent.trim() };
+      });
+      if (JSON.stringify(items) !== JSON.stringify(this.markdownOutline)) this.markdownOutline = items;
+    },
+    jumpMarkdownHeading(index) {
+      if (!this.markdownOutlineAvailable() || (this.editing && this.editorPreviewBusy)) return;
+      const root = this._markdownOutlineRoot();
+      const node = root?.querySelector(`[data-outline-index="${Number(index)}"]`);
+      if (!node) return;
+      node.scrollIntoView({ block: "start", inline: "nearest", behavior: "instant" });
+      // Move keyboard reading focus without adding every heading to tab order.
+      node.setAttribute("tabindex", "-1");
+      node.focus({ preventScroll: true });
     },
     setEditorView(mode) {
       if (!this.editorIsMd || !["edit", "split", "preview"].includes(mode)) return;
@@ -31895,7 +31937,7 @@ function portal() {
       // doesn't get recycled out from under the editor by the next preview.
       this.pinTab(targetPath);
     },
-    async saveEdit() {
+    async saveEdit({ exitAfterSave = false } = {}) {
       if (this._saveEditInFlight || !this.selected || !this.editing || this.editorLoading) return;
       this._saveEditInFlight = true;
       this.editorSaveState = "saving";
@@ -31915,8 +31957,8 @@ function portal() {
         if (!response.ok) throw new Error(await response.text());
         if (!sameOwner()) return;
         this._previewCacheDel(savePath);
-        // Rendering is deliberately deferred until preview is requested. A
-        // save only acknowledges disk state and keeps cursor/history intact.
+        // Shortcut saves retain cursor/history; the Save button explicitly
+        // requests preview after the acknowledged generation is clean.
         this._previewNeedsReload = savePath;
         this.rawText = saveText;
         this.editText = this._editorText();
@@ -31930,6 +31972,7 @@ function portal() {
         this.toast(this.cmStatus.dirty
           ? (this.lang === "zh" ? "已保存；之后输入的改动仍待保存" : "Saved; newer edits are still unsaved")
           : this.t("toast.saved"), "success", 2000);
+        if (exitAfterSave && !this._editorDirty()) await this.toggleEdit();
       } catch (e) {
         if (sameOwner()) {
           this.editorSaveState = "error";

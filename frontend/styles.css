@@ -40,6 +40,7 @@
      transient reading aid, not a subtle surface state; keep it solid enough
      that selected text remains obvious over chat bubbles, markdown and forms. */
   --c-selection-bg: #2f66d0;
+  --c-editor-selection: #294775;
   --c-selection-fg: #ffffff;
   --c-caret: #ffffff;
   /* Primary-CTA tokens. Kept separate from --c-accent so accent can
@@ -228,6 +229,7 @@ html[data-theme="light"] {
   --c-accent-soft: rgba(58, 120, 240, 0.10);
   --c-accent-fg: #1d4dcc;
   --c-selection-bg: var(--c-accent-fg);
+  --c-editor-selection: #bdd5ff;
   --c-selection-fg: #ffffff;
   --c-caret: var(--c-accent-fg);
   /* Light theme: white text on a darker bg keeps the conventional
@@ -305,6 +307,7 @@ html[data-theme="eyecare"] {
   --c-accent-soft: rgba(90, 143, 106, 0.10);
   --c-accent-fg: #3a5a30;
   --c-selection-bg: #b8d4ad;
+  --c-editor-selection: #b8d4ad;
   --c-selection-fg: #1d2418;
   --c-caret: var(--c-accent-fg);
   /* Eyecare: sage accent + white was only 3.77; deepen to #3f6b4c
@@ -2417,6 +2420,14 @@ body.kb-open .layout:focus-within .mobile-tab-bar { display: none; }
      same on .editor-live-preview. */
   overscroll-behavior: none;
 }
+.markdown-outline { flex: 0 0 auto; min-height: 0; background: var(--c-bg-1); border-bottom: 1px solid var(--c-border); }
+.markdown-outline-head { display: flex; align-items: center; justify-content: space-between; padding: 2px 12px; font-size: var(--fs-sm); }
+.markdown-outline-items { max-height: min(22vh, 180px); overflow: auto; overscroll-behavior: contain; }
+.markdown-outline-items button { display: block; width: 100%; border: 0; text-align: left; padding: 5px 12px; background: transparent; color: var(--c-fg-0); font: inherit; font-size: var(--fs-sm); overflow-wrap: anywhere; cursor: pointer; }
+.markdown-outline-items button:hover, .markdown-outline-items button:focus-visible { background: var(--c-bg-3); }
+.markdown-outline-items button:disabled { color: var(--c-fg-2); cursor: wait; }
+.markdown-outline-items p { margin: 8px 12px; color: var(--c-fg-2); font-size: var(--fs-sm); }
+.markdown-outline-toggle[aria-expanded="true"] { background: var(--c-accent-soft); color: var(--c-accent-fg); }
 .preview-body.drag-hover { outline: 2px dashed var(--c-accent); outline-offset: -8px; }
 
 /* Find-in-preview widget — floats top-right over the scrolling content,
@@ -3103,8 +3114,10 @@ body.kb-open .layout:focus-within .mobile-tab-bar { display: none; }
 .editor-wrap .editor-cm .CodeMirror { background: var(--c-bg-0); color: var(--c-fg-0); }
 .editor-wrap .editor-cm .CodeMirror-linenumber { color: var(--c-fg-2); }
 .editor-wrap .editor-cm .CodeMirror-cursor { border-left-color: var(--c-fg-0); }
-.editor-wrap .editor-cm .CodeMirror-selected { background: var(--c-bg-3); }
-.editor-wrap .editor-cm .CodeMirror-focused .CodeMirror-selected { background: var(--c-accent-dim); }
+/* CM draws selections behind syntax text, so use a visible tint that keeps
+   the theme's foreground readable, including when toolbar clicks blur it. */
+.editor-wrap .editor-cm .CodeMirror-selected { background: var(--c-editor-selection); }
+.editor-wrap .editor-cm .CodeMirror-focused .CodeMirror-selected { background: var(--c-editor-selection); }
 .editor-wrap .CodeMirror-lines { padding: 12px 0; }
 .editor-wrap .CodeMirror pre.CodeMirror-line { padding: 0 12px; }
 .editor-wrap .cm-comment { color: var(--c-fg-2); }
