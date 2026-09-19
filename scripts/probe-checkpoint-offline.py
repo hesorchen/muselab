@@ -23,13 +23,20 @@ from claude_agent_sdk import (
 )
 
 
-async def probe(*, all_tools: bool = False) -> dict:
+async def probe(*, all_tools: bool = False, instructions: str | None = None) -> dict:
     with tempfile.TemporaryDirectory(prefix="muselab-checkpoint-offline-") as temporary:
         root = Path(temporary)
         workspace = root / "workspace"
         workspace.mkdir()
         config = root / "config"
         config.mkdir()
+        instruction_marker = "SYNTHETIC_PROJECT_INSTRUCTION_7b98a2"
+        if instructions:
+            name = "CLAUDE.md" if instructions == "claude" else "AGENTS.md"
+            (workspace / name).write_text(instruction_marker + "\n")
+            if instructions == "import":
+                (workspace / "CLAUDE.md").write_text("@AGENTS.md\n")
+        instruction_observed = []
         target = workspace / "sample.txt"
         target.write_text("before\n")
         requests = []
@@ -42,6 +49,8 @@ async def probe(*, all_tools: bool = False) -> dict:
                 length = int(self.headers.get("Content-Length", "0"))
                 request = json.loads(self.rfile.read(length) or b"{}")
                 requests.append(self.path.split("?", 1)[0])
+                if instructions and "count_tokens" not in self.path:
+                    instruction_observed.append(instruction_marker in json.dumps(request))
                 if "count_tokens" in self.path:
                     self.send_response(200)
                     self.send_header("Content-Type", "application/json")
@@ -156,7 +165,7 @@ async def probe(*, all_tools: bool = False) -> dict:
             model="claude-sonnet-4-6",
             env=environment,
             tools=None if all_tools else ["Read", "Write"],
-            setting_sources=[],
+            setting_sources=["project"] if instructions else [],
             plugins=[],
             permission_mode="bypassPermissions",
             enable_file_checkpointing=True,
@@ -192,6 +201,10 @@ async def probe(*, all_tools: bool = False) -> dict:
             server.shutdown()
             server.server_close()
         return {
+            **({
+                "instructions": instructions,
+                "instruction_loaded": any(instruction_observed),
+            } if instructions else {}),
             "localhost_only_model": True,
             "model_request_count": len(requests),
             "sdk_result_ok": result_ok,
@@ -211,12 +224,19 @@ if __name__ == "__main__":
         action="store_true",
         help="Capture the full default CLI tool catalog; the local model still only uses Read/Write",
     )
-    result = asyncio.run(probe(all_tools=parser.parse_args().all_tools))
+    parser.add_argument(
+        "--instructions",
+        choices=("claude", "agents", "import"),
+        help="Probe project instructions; native AGENTS.md can be unavailable with feature flags off",
+    )
+    args = parser.parse_args()
+    result = asyncio.run(probe(all_tools=args.all_tools, instructions=args.instructions))
     print(json.dumps(result))
     raise SystemExit(
         0
         if result["checkpoint_received"]
         and result["actual_file_written"]
         and result["actual_file_restored"]
+        and result.get("instruction_loaded", True)
         else 1
     )

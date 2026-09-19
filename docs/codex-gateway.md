@@ -10,7 +10,35 @@ request to the user's own Codex/OpenAI backend and translates the response back.
 muselab does **not** store Codex OAuth credentials and does **not** call
 OpenAI-native APIs directly.
 
-Pinned runtime: Claude Agent SDK `0.2.152`, bundled Claude CLI `2.1.259`.
+Pinned runtime: Claude Agent SDK `0.2.157`, bundled Claude CLI `2.1.277`.
+
+### Shared project instructions
+
+The bundled CLI includes native `AGENTS.md` support. Native loading is conditional
+on the CLI's feature flags and session configuration; upgrading the SDK does not
+make it available in every gateway session. The default prefers project
+`CLAUDE.md` / `CLAUDE.local.md` files when present in the cwd or its ancestors.
+
+To keep one canonical instruction file across coding tools and sessions, store
+its content in `AGENTS.md` and retain a sibling `CLAUDE.md` containing only
+`@AGENTS.md`. This uses the SDK's own import loader, including on runtimes where
+native AGENTS loading is unavailable. For Claude's global user instructions,
+keep `~/.claude/CLAUDE.md` as the import entry point. Do not overwrite another
+tool's existing global rules when migrating project instructions.
+
+The offline SDK probe checks the actual model request without logging its body:
+
+```bash
+uv run python scripts/probe-checkpoint-offline.py --instructions import
+```
+
+`--instructions agents` probes native loading instead and exits nonzero if the
+instruction was absent. This fixture disables telemetry/feature-flag fetching,
+so native loading can be unavailable even with the required CLI version. It
+uses only temporary files and a loopback model fixture, not real credentials.
+
+See [Claude Code instruction loading](https://code.claude.com/docs/en/memory#agentsmd).
+
 Repository compatibility tests check these pins. The dated live Gateway
 observation below is separate; it does not claim every provider was rerun after
 each dependency update.
