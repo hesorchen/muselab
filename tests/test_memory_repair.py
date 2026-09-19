@@ -469,8 +469,8 @@ def test_owner_wide_orphans_match_legacy_fingerprint(target, status, orphan_owne
         source = {"source_type": source_type, "source_id": source_id, "relation": relation}
         # Repeated memory_id values on the RHS, including different relations;
         # even dangling or nonstandard provenance means the row is not orphaned.
-        store.create_memory("owner", "fact", "Sourced memory", status=status,
-                            sources=[source, source, {**source, "relation": "another-relation"}])
+        for sources in ([source], [source, source, {**source, "relation": "another-relation"}]):
+            store.create_memory("owner", "fact", "Sourced memory", status=status, sources=sources)
     store.create_memory("other", "fact", "Foreign sourced memory", status=status,
                         sources=[{"source_type": "evidence", "source_id": "missing-evidence"}])
     orphan_ids = [store.create_memory(orphan_owner, kind, "Unattributed memory", status=status)["id"]
