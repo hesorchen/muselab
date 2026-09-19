@@ -159,10 +159,10 @@ async def _prepare(chat, monkeypatch, scripts, *, pumped=True):
     return sid, fake, detached
 
 
-async def _finish(chat, sid):
+async def _finish(chat, sid, *, completion_timeout=2):
     broadcast = await chat._start_turn(sid, "synthetic prompt", model="claude-sonnet-4-6")
     try:
-        await asyncio.wait_for(asyncio.shield(broadcast.task), timeout=2)
+        await asyncio.wait_for(asyncio.shield(broadcast.task), timeout=completion_timeout)
         assert broadcast.done and broadcast.result_forwarded
         assert sid not in chat._active_turns
         events = list(broadcast.replay_events())
@@ -328,7 +328,10 @@ async def test_folded_tool_round_trip_and_long_answer_survive(stream_env, monkey
     ]
     sid, _, detached = await _prepare(chat, monkeypatch, [script])
     try:
-        text, done, events = await _finish(chat, sid)
+        # The 512-frame burst exercises ordering, not runner throughput. macOS
+        # CI can exceed two seconds under pytest-xdist; the separate gated
+        # progress test below still requires output before Result is released.
+        text, done, events = await _finish(chat, sid, completion_timeout=10)
         assert text == answer
         assert done["is_error"] is False
         kinds = [e["event"] for e in events]
