@@ -1228,7 +1228,7 @@
           </div>
           <div class="editor-main">
             <div x-ref="cmHost" class="editor-cm" x-show="editorView !== 'preview'"></div>
-            <div class="editor-live-preview" x-show="editorIsMd && editorView !== 'edit'">
+            <div class="editor-live-preview" x-show="editorIsMd && editorView !== 'edit'" @scroll.passive="_syncEditorScroll('preview')">
               <div class="markdown" x-ref="editorPreview" @click="onPreviewImgClick($event)"></div>
             </div>
           </div>

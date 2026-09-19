@@ -1,7 +1,7 @@
 // Third-party editor instances and DOM caches must stay outside Alpine's deep
 // proxy: CodeMirror relies on object identity in its measurement/undo internals.
 let museEditor = null;
-let museEditorPreview = { version: 0, blocks: [] };
+let museEditorPreview = { version: 0, blocks: [], scrollTargets: {}, patching: false };
 const museEditorAssets = new Map();
 const museRichMessages = new WeakMap();
 const museTranscriptPerf = new Map();
@@ -28,9 +28,19 @@ const museRichWorker = (() => {
     try {
       const version = document.querySelector('meta[name="muselab-asset-version"]')?.content || "";
       if (!worker) worker = new Worker("/static/render-worker.js?v=" + encodeURIComponent(version));
-      worker.onmessage = event => finish(event.data.failed ? null : event.data.html);
+      worker.onmessage = event => {
+        if (event.data.parsing) {
+          // CPU work remains bounded independently of worker/vendor downloads.
+          clearTimeout(timer);
+          timer = setTimeout(() => finish(null, true), 5000);
+          return;
+        }
+        finish(event.data.failed ? null : event.data.html);
+      };
       worker.onerror = () => finish(null, true);
-      timer = setTimeout(() => finish(null, true), 5000);
+      // Cold workers also fetch their parser lazily. A slow transport is not
+      // a stalled parser; the worker announces when actual parsing begins.
+      timer = setTimeout(() => finish(null, true), 60000);
       worker.postMessage(job.data);
     } catch (_) { finish(null, true); }
   }
@@ -2907,6 +2917,33 @@ function portal() {
     },
 
     _getCM() { return museEditor ? museEditor.cm : null; },
+    _syncEditorScroll(source) {
+      const cm = this._getCM(), preview = this.$refs.editorPreview?.parentElement;
+      if (!cm || !preview || !this.editing || !this.editorIsMd || this.editorView !== "split") return;
+      const info = cm.getScrollInfo();
+      const top = source === "editor" ? info.top : preview.scrollTop;
+      const expected = museEditorPreview.scrollTargets[source];
+      delete museEditorPreview.scrollTargets[source];
+      // Ignore the echo of our own write; retain genuine wheel/keyboard input.
+      if (expected !== undefined && Math.abs(top - expected) < 1) return;
+      if (museEditorPreview.patching) return;
+      const editorMax = Math.max(0, info.height - info.clientHeight);
+      const previewMax = Math.max(0, preview.scrollHeight - preview.clientHeight);
+      const fromMax = source === "editor" ? editorMax : previewMax;
+      if (!fromMax) return;
+      const progress = Math.max(0, Math.min(1, top / fromMax));
+      if (source === "editor") {
+        const target = progress * previewMax;
+        if (Math.abs(preview.scrollTop - target) < 1) return;
+        museEditorPreview.scrollTargets.preview = Math.round(target);
+        preview.scrollTop = target;
+      } else {
+        const target = progress * editorMax;
+        if (Math.abs(info.top - target) < 1) return;
+        museEditorPreview.scrollTargets.editor = target;
+        cm.scrollTo(null, target);
+      }
+    },
     _editorText() {
       if (!museEditor) return String(this.editText || "");
       if (museEditor.text === null) museEditor.text = museEditor.cm.getValue();
@@ -3002,11 +3039,14 @@ function portal() {
         const compositionEnd = () => { state.composing = false; this._scheduleLivePreview(); };
         input.addEventListener("compositionstart", compositionStart);
         input.addEventListener("compositionend", compositionEnd);
+        const scroll = () => { if (museEditor === state) this._syncEditorScroll("editor"); };
         cm.on("changes", change);
         cm.on("cursorActivity", refreshStatus);
+        cm.on("scroll", scroll);
         state.dispose = () => {
           cm.off("changes", change);
           cm.off("cursorActivity", refreshStatus);
+          cm.off("scroll", scroll);
           input.removeEventListener("compositionstart", compositionStart);
           input.removeEventListener("compositionend", compositionEnd);
         };
@@ -3065,6 +3105,8 @@ function portal() {
       if (host) host.replaceChildren();
       this.$refs.editorPreview?.replaceChildren();
       museEditorPreview.blocks = [];
+      museEditorPreview.scrollTargets = {};
+      museEditorPreview.patching = false;
       this.editorLoading = false;
     },
 
@@ -3141,6 +3183,17 @@ function portal() {
         if (!valid()) return;
         const scroller = root.parentElement;
         const scrollTop = scroller.scrollTop;
+        // Replacing a tall visible block with the default 300px placeholder
+        // collapses scrollHeight and clamps scrollTop to zero. Seed the new
+        // blocks with the old geometry before touching the live DOM. Batch all
+        // reads first so incremental rendering does not force layout per write.
+        const heights = Array.from(root.children, node => node.getBoundingClientRect().height);
+        next.forEach(({ node }, i) => {
+          if (root.children[i] !== node && heights[i] > 0) {
+            node.style.containIntrinsicSize = `auto ${heights[i]}px`;
+          }
+        });
+        museEditorPreview.patching = version;
         // Commit in small batches. Every partial commit remains owned by this
         // generation; a successor reconciles against the actual DOM children.
         for (let i = 0; i < next.length; i++) {
@@ -3157,10 +3210,18 @@ function portal() {
         while (root.children.length > next.length) root.lastElementChild.remove();
         museEditorPreview.blocks = next;
         scroller.scrollTop = scrollTop;
+        museEditorPreview.scrollTargets.preview = scroller.scrollTop;
+        museEditorPreview.patching = false;
+        // Reconcile after the new layout; exact event echoes cannot drive the
+        // opposite pane back through a temporary layout-clamped position.
+        delete museEditorPreview.scrollTargets.editor;
+        this._syncEditorScroll("editor");
       } catch (_) {
         if (valid()) this.editorPreviewError = this.lang === "zh"
           ? "预览更新失败，点击重试。" : "Preview update failed. Retry.";
       } finally {
+        // An invalidated render must not release its successor's scroll lock.
+        if (museEditorPreview.patching === version) museEditorPreview.patching = false;
         if (valid()) {
           this.editorPreviewBusy = false;
           this._refreshMarkdownOutline();
@@ -30231,7 +30292,9 @@ function portal() {
           const node = isCss
             ? Object.assign(document.createElement("link"), { rel: "stylesheet", href: src })
             : Object.assign(document.createElement("script"), { src });
-          const timer = setTimeout(() => fail(), 15000);
+          // Remote/tunneled cold downloads can exceed 15 seconds. Preserve
+          // the bounded retry path without rejecting an otherwise healthy load.
+          const timer = setTimeout(() => fail(), 60000);
           const fail = () => {
             clearTimeout(timer);
             node.remove();
