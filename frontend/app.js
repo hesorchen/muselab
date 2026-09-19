@@ -41,7 +41,7 @@ const museRichWorker = (() => {
       // Cold workers also fetch their parser lazily. A slow transport is not
       // a stalled parser; the worker announces when actual parsing begins.
       timer = setTimeout(() => finish(null, true), 60000);
-      worker.postMessage(job.data);
+      worker.postMessage({ ...job.data, reportParsing: true });
     } catch (_) { finish(null, true); }
   }
   return (data, valid = () => true) => new Promise(resolve => {

@@ -8,7 +8,9 @@ self.onmessage = ({ data }) => {
     } else throw new Error("unsupported render operation");
     // Imports can wait on a slow network. Start the page's short CPU deadline
     // only after the required library is available, for every job kind.
-    self.postMessage({ parsing: true });
+    // Already-open pages expect their first response to contain HTML. Only
+    // send lifecycle packets to callers that explicitly support them.
+    if (data.reportParsing === true) self.postMessage({ parsing: true });
     let html;
     if (data.kind === "markdown") {
       html = self.marked.parse(data.text);
