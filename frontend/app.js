@@ -1,3 +1,8 @@
+// Third-party editor instances and DOM caches must stay outside Alpine's deep
+// proxy: CodeMirror relies on object identity in its measurement/undo internals.
+let museEditor = null;
+let museEditorPreview = { version: 0, blocks: [] };
+const museEditorAssets = new Map();
 const museRichMessages = new WeakMap();
 const museTranscriptPerf = new Map();
 // One bounded worker, shared by history decoration and code highlighting.
@@ -724,17 +729,21 @@ function portal() {
     // (memoryFiles / mcpTools / agents) actually expand.
     ctxExpanded: {},
     editing: false, editText: "",
-    cmStatus: { line: 1, col: 1, sel: 0, lines: 0, chars: 0, mode: "plaintext", dirty: false },
+    cmStatus: { line: 1, col: 1, sel: 0, lines: 0, chars: 0, bytes: 0, mode: "plaintext", dirty: false },
     // ===== Live markdown preview (split editor) =====
     // editorIsMd: the file currently in the editor is markdown → the live
     //   preview pane is available. Non-md files force editorView back to "edit".
     // editorView: layout while editing an md file — "edit" | "split" | "preview".
-    //   Persisted in localStorage so it survives reloads. Defaults to split.
+    //   Each Markdown editing session starts in split view.
     // livePreviewHtml: mdRender() output of the current buffer, recomputed
     //   (debounced) on every CM change so the right pane tracks edits live.
     editorIsMd: false,
     editorView: "split",
-    livePreviewHtml: "",
+    editorFontSize: Math.max(14, Math.min(24, Number(localStorage.getItem("muselab_editor_font_size")) || 16)),
+    editorLoading: false, editorError: "", editorSaveState: "",
+    editorPreviewBusy: false, editorPreviewError: "",
+    _cmMountVersion: 0,
+    _saveEditInFlight: false,
     _livePreviewTimer: null,
     tabs: [],   // open file tabs: [{path, name}]
     editorTabPickerOpen: false,  // open-tabs quick-switch dropdown (left tab bar)
@@ -2891,7 +2900,17 @@ function portal() {
       }
     },
 
-    _cm: null,
+    _getCM() { return museEditor ? museEditor.cm : null; },
+    _editorText() {
+      if (!museEditor) return String(this.editText || "");
+      if (museEditor.text === null) museEditor.text = museEditor.cm.getValue();
+      return museEditor.text;
+    },
+    setEditorFontSize(size) {
+      this.editorFontSize = Math.max(14, Math.min(24, Number(size) || 16));
+      try { localStorage.setItem("muselab_editor_font_size", this.editorFontSize); } catch (_) {}
+      this.$nextTick(() => this._getCM()?.refresh());
+    },
     cmMode(path) {
       if (!path) return "text/plain";
       const ext = path.split(".").pop().toLowerCase();
@@ -2915,118 +2934,106 @@ function portal() {
       return map[ext] || "text/plain";
     },
     async mountCM() {
-      // CodeMirror is lazy-loaded — kick off the fetch (no-op if already
-      // present) and only proceed once the global is exposed. Without this
-      // wait, every first edit-mode entry per session would silently fall
-      // through and the textarea fallback would render.
-      if (!window.CodeMirror) {
-        try { await this._loadCodemirror(); }
-        catch (e) { console.warn("[muselab] CodeMirror lazy load failed:", e); return; }
-      }
-      this.$nextTick(() => {
-        if (!window.CodeMirror) { console.warn("[muselab] CodeMirror not loaded"); return; }
+      this.unmountCM();
+      const version = this._cmMountVersion;
+      const path = this.selected, workspace = this.fileWorkspacePath();
+      const valid = () => this.editing && this.selected === path
+        && this._workspaceIsCurrent(workspace) && this._cmMountVersion === version;
+      this.editorLoading = true;
+      this.editorError = "";
+      try {
+        // Core readiness is insufficient: await the modes, addons and CSS too.
+        await this._loadCodemirror();
+        await this.$nextTick();
+        if (!valid()) return;
         const host = this.$refs.cmHost;
-        if (!host) { console.warn("[muselab] no cmHost ref"); return; }
-        host.innerHTML = "";
-        // Reset the live-editor ref BEFORE (re)mounting. saveEdit/_editorDirty
-        // read this._cm as the source of truth when a CM instance is active;
-        // if init fails and we fall back to a <textarea>, it must stay null so
-        // those paths use the editText buffer instead.
-        this._cm = null;
-        const modeStr = this.cmMode(this.selected);
-        try {
-          const cm = window.CodeMirror(host, {
-            value: String(this.editText || ""),
-            mode: modeStr,
-            lineNumbers: true,
-            lineWrapping: true,
-            tabSize: 2,
-            indentUnit: 2,
-            theme: this.theme === "light" ? "default" : "material-darker",
-            // Ctrl/Cmd+S inside the editor → save. Without this, on some
-            // browsers the browser's own "save page" dialog can fire even
-            // when the document-level keydown handler exists, because
-            // CodeMirror's contenteditable subtree captures the event
-            // first. Hooking it here is the most defensive spot.
-            extraKeys: {
-              "Ctrl-S": () => { this.saveEdit(); },
-              "Cmd-S":  () => { this.saveEdit(); },
-            },
-          });
-          // Initial status
+        if (!host) return;
+        const modeStr = this.cmMode(path);
+        const text = String(this.editText || "");
+        const cm = window.CodeMirror(host, {
+          value: text, mode: modeStr, lineNumbers: true, lineWrapping: true,
+          tabSize: 2, indentUnit: 2,
+          theme: this.theme === "dark" ? "material-darker" : "default",
+          extraKeys: {
+            "Ctrl-S": () => { this.saveEdit(); },
+            "Cmd-S": () => { this.saveEdit(); },
+          },
+        });
+        const state = museEditor = {
+          cm, text, cleanGen: text === this.rawText ? cm.changeGeneration() : -1, chars: text.length,
+          bytes: new TextEncoder().encode(text).length, statsTimer: null,
+          refreshTimer: null, composing: false,
+        };
+        window.__muselab_cm = cm;
+        const refreshStatus = () => {
+          if (museEditor !== state) return;
+          const c = cm.getCursor();
           this.cmStatus = {
-            line: 1, col: 1, sel: 0,
-            lines: cm.lineCount(),
-            chars: cm.getValue().length,
-            mode: this.shortMode(modeStr),
-            dirty: false,
+            line: c.line + 1, col: c.ch + 1, sel: cm.getSelection().length,
+            lines: cm.lineCount(), chars: state.chars, bytes: state.bytes,
+            mode: this.shortMode(modeStr), dirty: !cm.isClean(state.cleanGen),
           };
-          // Expose the live instance and capture a "clean" generation marker.
-          // dirty is then O(1) via cm.isClean(gen) instead of an O(doc) string
-          // compare against rawText on every keystroke.
-          this._cm = cm;
-          const cleanGen = cm.changeGeneration();
-          // Per-keystroke status refresh, kept off the O(doc) hot path:
-          //   • dirty   → cm.isClean(gen), O(1)
-          //   • line/col/lines/sel → CM-internal, cheap
-          //   • chars   → only changes on content edits, so we recompute it
-          //               with ONE getValue() in the `change` handler and reuse
-          //               the cached count on pure cursor moves.
-          // We deliberately no longer mirror the whole buffer into the reactive
-          // `editText` on every keystroke (was O(doc) + triggered Alpine effects
-          // and a second O(doc) dirty compare). saveEdit() pulls cm.getValue()
-          // on demand instead — a big file now costs ~1 full read per *edit*,
-          // not 3+ per keystroke. NOTE: CM passes the instance as the first arg
-          // to cursorActivity handlers, so refreshStatus must be CALLED, not
-          // passed directly — hence the () => wrappers.
-          const refreshStatus = (charCount) => {
-            const c = cm.getCursor();
-            this.cmStatus = {
-              line: c.line + 1, col: c.ch + 1,
-              sel: cm.getSelection().length,
-              lines: cm.lineCount(),
-              chars: charCount === undefined
-                ? (this.cmStatus ? this.cmStatus.chars : 0)
-                : charCount,
-              mode: this.shortMode(modeStr),
-              dirty: !cm.isClean(cleanGen),
-            };
-          };
-          // Char count is the ONLY O(doc) field (cm.getValue().length). Running
-          // it synchronously on every keystroke is the per-key typing lag on
-          // large files. Update the cheap fields (line/col/sel/lines/dirty)
-          // instantly and debounce just the char count so typing stays smooth.
-          let _charTimer = null;
-          const scheduleCharCount = () => {
-            if (_charTimer) clearTimeout(_charTimer);
-            _charTimer = setTimeout(() => {
-              _charTimer = null;
-              refreshStatus(cm.getValue().length);
-            }, 200);
-          };
-          cm.on("change", () => {
-            refreshStatus();        // cheap fields now, cached char count
-            scheduleCharCount();    // O(doc) char count, debounced off hot path
-            // Live markdown preview: keep the right pane in step with edits.
-            // Debounced + cheap-path render inside _scheduleLivePreview so the
-            // heavy mdRender (KaTeX + DOM walk) never runs on the keystroke hot
-            // path. No-op when the file isn't md or the preview pane is hidden.
-            if (this.editorIsMd && this.editorView !== "edit") this._scheduleLivePreview();
-          });
-          cm.on("cursorActivity", () => refreshStatus());
-          window.__muselab_cm = cm;
-          setTimeout(() => { cm.refresh(); refreshStatus(cm.getValue().length); }, 50);
-        } catch (e) {
-          console.error("[muselab] CodeMirror init failed:", e);
-          this.toast(
-            (this.lang === "zh" ? "编辑器初始化失败：" : "Editor init failed: ")
-              + e.message, "error", 6000);
-          host.innerHTML = '<textarea style="width:100%;height:100%;padding:14px;background:var(--c-bg-0);color:var(--c-fg-0);border:0;font:13px ui-monospace,monospace;resize:none"></textarea>';
-          const ta = host.querySelector("textarea");
-          ta.value = this.editText;
-          ta.addEventListener("input", () => { this.editText = ta.value; });
-        }
-      });
+        };
+        state.refreshStatus = refreshStatus;
+        const change = (_cm, edits) => {
+          if (museEditor !== state) return;
+          state.text = null;
+          for (const edit of edits) {
+            state.chars += edit.text.join("\n").length - edit.removed.join("\n").length;
+          }
+          this.editorSaveState = "";
+          refreshStatus();
+          clearTimeout(state.statsTimer);
+          state.statsTimer = setTimeout(() => {
+            if (museEditor !== state) return;
+            state.bytes = new TextEncoder().encode(this._editorText()).length;
+            refreshStatus();
+          }, 300);
+          this._scheduleLivePreview();
+        };
+        const input = cm.getInputField();
+        const compositionStart = () => { state.composing = true; this._cancelLivePreview(); };
+        const compositionEnd = () => { state.composing = false; this._scheduleLivePreview(); };
+        input.addEventListener("compositionstart", compositionStart);
+        input.addEventListener("compositionend", compositionEnd);
+        cm.on("changes", change);
+        cm.on("cursorActivity", refreshStatus);
+        state.dispose = () => {
+          cm.off("changes", change);
+          cm.off("cursorActivity", refreshStatus);
+          input.removeEventListener("compositionstart", compositionStart);
+          input.removeEventListener("compositionend", compositionEnd);
+        };
+        refreshStatus();
+        state.refreshTimer = setTimeout(() => {
+          if (museEditor === state) { cm.refresh(); refreshStatus(); }
+        }, 0);
+        this._scheduleLivePreview(0);
+      } catch (e) {
+        if (!valid()) return;
+        this.editorError = this.lang === "zh"
+          ? "高级编辑器加载失败，已启用文本编辑；可重试。"
+          : "Editor could not load. Text editing is available; you can retry.";
+        const host = this.$refs.cmHost;
+        if (!host) return;
+        host.replaceChildren();
+        const ta = document.createElement("textarea");
+        ta.className = "editor-fallback";
+        ta.setAttribute("aria-label", this.lang === "zh" ? "文本编辑器" : "Text editor");
+        ta.value = this.editText;
+        ta.addEventListener("input", () => {
+          this.editText = ta.value;
+          this.editorSaveState = "";
+          this.cmStatus = { ...this.cmStatus, chars: ta.value.length,
+            bytes: new TextEncoder().encode(ta.value).length,
+            dirty: ta.value !== this.rawText };
+          this._scheduleLivePreview();
+        });
+        host.appendChild(ta);
+        this._scheduleLivePreview(0);
+      } finally {
+        if (valid()) this.editorLoading = false;
+      }
     },
     shortMode(mode) {
       // CM 内部 mode 名标准化成显示用短名
@@ -3037,68 +3044,125 @@ function portal() {
       return mode;
     },
     unmountCM() {
-      const host = this.$refs.cmHost;
-      if (host) host.innerHTML = "";
+      ++this._cmMountVersion;
+      this._cancelLivePreview();
+      if (museEditor) {
+        clearTimeout(museEditor.statsTimer);
+        clearTimeout(museEditor.refreshTimer);
+        museEditor.dispose?.();
+        // Blur releases CodeMirror's focus polling before its DOM is removed.
+        museEditor.cm.getInputField().blur();
+      }
+      museEditor = null;
       window.__muselab_cm = null;
+      const host = this.$refs.cmHost;
+      if (host) host.replaceChildren();
+      this.$refs.editorPreview?.replaceChildren();
+      museEditorPreview.blocks = [];
+      this.editorLoading = false;
     },
 
-    // ===== Live markdown preview (split editor) =====
-    // True if the path looks like markdown — the only file kind that gets the
-    // split live-preview affordance. Other text/code files edit full-width.
     _isMdPath(p) {
-      if (!p) return false;
-      const lp = p.toLowerCase();
-      return lp.endsWith(".md") || lp.endsWith(".markdown");
+      return /\.(md|markdown)$/i.test(p || "");
     },
-    // Debounced render of the current editor buffer into livePreviewHtml.
-    // mdRender is heavy (marked + DOMPurify + KaTeX); 200ms after the last
-    // keystroke is responsive without rendering mid-word on every key. Reads
-    // the live CM value when present, else the editText buffer (CM-init-fail
-    // textarea fallback). Re-highlights code blocks once the DOM settles.
-    _scheduleLivePreview() {
-      if (this._livePreviewTimer) clearTimeout(this._livePreviewTimer);
+    _cancelLivePreview() {
+      clearTimeout(this._livePreviewTimer);
+      this._livePreviewTimer = null;
+      ++museEditorPreview.version;
+      this.editorPreviewBusy = false;
+    },
+    _scheduleLivePreview(delay) {
+      this._cancelLivePreview();
+      if (!this.editing || !this.editorIsMd || this.editorView === "edit"
+          || museEditor?.composing) return;
+      this.editorPreviewBusy = true;
       this._livePreviewTimer = setTimeout(() => {
         this._livePreviewTimer = null;
-        this._renderLivePreview();
-      }, 200);
+        void this._renderLivePreview();
+      }, delay ?? (this.cmStatus.chars > 100000 ? 350 : 180));
     },
-    _renderLivePreview() {
-      if (!this.editorIsMd) return;
-      const src = this._cm ? this._cm.getValue() : String(this.editText || "");
-      // Cheap path: marked + DOMPurify only, skipping the KaTeX typeset and
-      // file-path DOM walk (the documented ~300ms costs) so the preview tracks
-      // typing without jank. Math shows as raw $$…$$ until the deferred full
-      // render below typesets it. This is the same trick chat uses mid-stream.
-      this.livePreviewHtml = this._resolveMdImages(this._mdRenderUncached(src, { streaming: true }));
-      this.$nextTick(() => this.highlightCode(".editor-live-preview .markdown"));
-      // If the doc carries math, do ONE full render (KaTeX) after a longer
-      // idle so equations fill in once the user truly pauses — not on every
-      // keystroke. mdRender is LRU-cached, so a repeat pause is near-free.
-      if (this._mathTimer) clearTimeout(this._mathTimer);
-      if (/\$\$|\\\(|\\\[|\$[^$\n]+\$/.test(src)) {
-        this._mathTimer = setTimeout(() => {
-          this._mathTimer = null;
-          if (!this.editing || !this.editorIsMd || this.editorView === "edit") return;
-          const cur = this._cm ? this._cm.getValue() : String(this.editText || "");
-          this.livePreviewHtml = this._renderPreviewMd(cur);
-          this.$nextTick(() => this.highlightCode(".editor-live-preview .markdown"));
-        }, 600);
+    async _renderLivePreview() {
+      if (!this.editing || !this.editorIsMd || this.editorView === "edit") return;
+      const version = ++museEditorPreview.version;
+      const root = this.$refs.editorPreview;
+      const path = this.selected, workspace = this.fileWorkspacePath();
+      const valid = () => version === museEditorPreview.version && this.editing
+        && this.selected === path && this._workspaceIsCurrent(workspace)
+        && this.editorView !== "edit" && root === this.$refs.editorPreview;
+      if (!root) return;
+      this.editorPreviewBusy = true;
+      this.editorPreviewError = "";
+      const yieldFrame = () => new Promise(resolve => setTimeout(resolve, 0));
+      try {
+        const src = this._stripFrontmatter(this._editorText());
+        const prepared = this._prepareMarkdown(src);
+        // Parse the entire document in the worker so reference links and block
+        // syntax remain correct. Sanitize/typeset/patch bounded groups on the
+        // page, yielding between groups and retaining unchanged DOM subtrees.
+        let chunks = await museRichWorker({ kind: "markdown-blocks", text: prepared.input }, valid);
+        if (!valid()) return;
+        if (chunks === null) {
+          // Worker failures must not freeze input with a synchronous retry.
+          this.editorPreviewError = this.lang === "zh"
+            ? "预览暂不可用，当前显示原文。点击重试。"
+            : "Preview unavailable; showing source. Retry to render.";
+          const node = document.createElement("pre");
+          node.textContent = src;
+          root.replaceChildren(node);
+          museEditorPreview.blocks = [];
+          return;
+        }
+        if (/\$\$|\\\(|\\\[|\$[^$\n]+\$/.test(src)) {
+          try { await this._loadKatex(); } catch (_) {}
+          if (!valid()) return;
+        }
+        const old = museEditorPreview.blocks;
+        const next = [];
+        for (let i = 0; i < chunks.length; i++) {
+          if (!valid()) return;
+          const chunk = chunks[i];
+          const key = !!window.renderMathInElement + ":" + this._unmaskMath(chunk.html, prepared.math);
+          if (old[i]?.key === key) next.push(old[i]);
+          else {
+            const node = document.createElement("div");
+            node.className = "editor-preview-block";
+            node.innerHTML = this._resolveMdImages(this._mdRenderUncached(this._unmaskMath(chunk.source, prepared.math),
+              { raw: chunk.html, prepared }));
+            next.push({ key, node });
+            await yieldFrame();
+          }
+        }
+        if (!valid()) return;
+        const scroller = root.parentElement;
+        const scrollTop = scroller.scrollTop;
+        // Commit in small batches. Every partial commit remains owned by this
+        // generation; a successor reconciles against the actual DOM children.
+        for (let i = 0; i < next.length; i++) {
+          if (!valid()) return;
+          const { node } = next[i];
+          if (root.children[i] !== node) {
+            if (root.children[i]) root.replaceChild(node, root.children[i]);
+            else root.appendChild(node);
+            this.highlightCode(".editor-live-preview .markdown", [node]);
+          }
+          if (i % 8 === 7) await yieldFrame();
+        }
+        if (!valid()) return;
+        while (root.children.length > next.length) root.lastElementChild.remove();
+        museEditorPreview.blocks = next;
+        scroller.scrollTop = scrollTop;
+      } catch (_) {
+        if (valid()) this.editorPreviewError = this.lang === "zh"
+          ? "预览更新失败，点击重试。" : "Preview update failed. Retry.";
+      } finally {
+        if (valid()) this.editorPreviewBusy = false;
       }
     },
-    // View-mode switch (edit | split | preview) for the markdown editor.
-    // No-op for non-md files (editorIsMd false). Persisted so the choice
-    // sticks across files and reloads. Switching INTO a preview-showing mode
-    // renders immediately so the pane isn't blank until the next keystroke.
     setEditorView(mode) {
-      if (!this.editorIsMd) return;
+      if (!this.editorIsMd || !["edit", "split", "preview"].includes(mode)) return;
       this.editorView = mode;
-      localStorage.setItem("muselab_editor_view", mode);
-      if (mode !== "edit") this._renderLivePreview();
-      // CM needs a refresh after its container width changes (split ↔ full),
-      // otherwise the gutter/cursor positions go stale until the next click.
-      if (mode !== "preview" && this._cm) {
-        this.$nextTick(() => { try { this._cm.refresh(); } catch (e) {} });
-      }
+      this._scheduleLivePreview(0);
+      if (mode !== "preview") this.$nextTick(() => this._getCM()?.refresh());
     },
 
     initTheme() {
@@ -5454,7 +5518,7 @@ function portal() {
       // Markdown/HTML/math structure; otherwise escape once and preserve line
       // breaks. This is both safe (no raw HTML enters the result) and visually
       // equivalent for ordinary prose.
-      if (text.length >= 64 * 1024) {
+      if (opts.raw === undefined && text.length >= 64 * 1024) {
         // A single huge fenced dump is common in agent output and does not need
         // marked + DOMPurify to discover its structure. Escaping it directly is
         // equivalent, keeps the full code available, and avoids a multi-second
@@ -5634,7 +5698,8 @@ function portal() {
         }
       }
       // Markdown file-preview pane keeps its own rendered string.
-      if (typeof this.rawText === "string" && this.previewMode === "md" && RE.test(this.rawText)) {
+      if (this.editing && this.editorIsMd) this._scheduleLivePreview();
+      if (!this.editing && typeof this.rawText === "string" && this.previewMode === "md" && RE.test(this.rawText)) {
         this._mdCacheDelete(this.rawText);
         this.renderedMd = this._renderPreviewMd(this.rawText);
       }
@@ -17615,8 +17680,8 @@ function portal() {
       if (!this.editing || !targets.includes(this.selected)) return context;
       if (!this._confirmLoseEdits()) return null;
       context.editorPath = this.selected;
-      context.editorText = this._cm ? this._cm.getValue() : this.editText;
-      context.editorRef = this._cm;
+      context.editorText = this._editorText();
+      context.editorRef = this._getCM();
       return context;
     },
     async _syncUploadedFiles(
@@ -17649,8 +17714,8 @@ function portal() {
         // afterwards, or kept typing while bytes were in flight, preserve that
         // newer buffer instead of letting upload completion silently close it.
         const sameEditor = uploadContext.editorPath === path
-          && uploadContext.editorRef === this._cm;
-        const liveText = this._cm ? this._cm.getValue() : this.editText;
+          && uploadContext.editorRef === this._getCM();
+        const liveText = this._editorText();
         if (!sameEditor || liveText !== uploadContext.editorText) {
           this.cmStatus = { ...this.cmStatus, dirty: true };
           this._previewNeedsReload = path;
@@ -23855,7 +23920,9 @@ function portal() {
         this.childCache = tree.childCache;
         this.expanded = tree.expanded;
         this._pendingExpanded = Array.from(this.expanded);
-        this._scheduleFileTreeViewportSync(true);
+        // A refreshed snapshot is still the same view; workspace changes own
+        // scroll resets. Resetting here made every manual refresh jump to top.
+        this._scheduleFileTreeViewportSync();
         const truncatedParents = Array.isArray(payload.truncated_parents)
           ? payload.truncated_parents : [];
         snapshotHasTruncatedParents = truncatedParents.length > 0;
@@ -24740,9 +24807,40 @@ function portal() {
         return ok === true;
       });
     },
-    reloadTree(options = {}) {
+    async reloadTree(options = {}) {
+      const list = this._fileTreeList();
+      const workspace = this.fileWorkspacePath();
+      const generation = this._workspaceGeneration(workspace);
+      const rowHeight = this._fileTreeRowHeight();
+      const top = list ? list.scrollTop : 0;
+      const index = Math.floor(top / rowHeight);
+      const path = this.visible[index]?.path;
+      const offset = top - index * rowHeight;
+      const left = list ? list.scrollLeft : 0;
+      let moved = false;
+      const onMove = () => { moved = true; };
+      const events = ["wheel", "touchstart", "pointerdown", "keydown"];
+      for (const event of events) list?.addEventListener(event, onMove, { passive: true });
       this._pendingExpanded = Array.from(this.expanded);
-      return this.loadRoot(options);
+      try {
+        const pending = this.loadRoot(options);
+        const seq = this._treeLoadSeq;
+        const ok = await pending;
+        await this.$nextTick();
+        if (list && !moved && this._workspaceIsCurrent(workspace)
+            && this._workspaceGenerationIsCurrent(workspace, generation)
+            && this._treeLoadSeq === seq && list === this._fileTreeList()) {
+          // Keep the first visible file at the same pixel offset even when new
+          // siblings arrive above it. If removed, retain the nearest position.
+          const nextIndex = this.visible.findIndex(node => node.path === path);
+          list.scrollTop = nextIndex < 0 ? top : nextIndex * this._fileTreeRowHeight() + offset;
+          list.scrollLeft = left;
+          this._syncFileTreeViewport(list);
+        }
+        return ok;
+      } finally {
+        for (const event of events) list?.removeEventListener(event, onMove);
+      }
     },
     // In-place removal of a node (and its descendants, if a dir) from the
     // visible flat-list. Avoids the full reloadTree() that delete used to
@@ -30082,31 +30180,29 @@ function portal() {
     // the user opens edit mode on a file preview. Most read-only browsing
     // never needs it.
     async _loadCodemirror() {
-      if (window.CodeMirror) return;
       if (this._cmLoadPromise) return this._cmLoadPromise;
-      // Inject one asset (css/js), de-duping against an already-present tag.
-      const inject = (path) => new Promise((resolve, reject) => {
-        const isCss = path.split(/[?#]/, 1)[0].endsWith(".css");
+      const inject = path => {
         const src = this._staticAssetUrl(path);
-        const sel = isCss
-          ? `link[href="${src}"]` : `script[src="${src}"]`;
-        if (document.querySelector(sel)) {
-          // Already in flight/loaded from a prior attempt — give it a beat.
-          const t0 = Date.now();
-          (function wait() {
-            if (isCss || window.CodeMirror) return resolve();
-            if (Date.now() - t0 > 5000) return resolve(); // don't hang the chain
-            setTimeout(wait, 50);
-          })();
-          return;
-        }
-        const node = isCss
-          ? Object.assign(document.createElement("link"), { rel: "stylesheet", href: src })
-          : Object.assign(document.createElement("script"), { src });
-        node.onload = resolve;
-        node.onerror = () => reject(new Error("load failed: " + src));
-        document.head.appendChild(node);
-      });
+        if (museEditorAssets.has(src)) return museEditorAssets.get(src);
+        const promise = new Promise((resolve, reject) => {
+          const isCss = path.endsWith(".css");
+          const node = isCss
+            ? Object.assign(document.createElement("link"), { rel: "stylesheet", href: src })
+            : Object.assign(document.createElement("script"), { src });
+          const timer = setTimeout(() => fail(), 15000);
+          const fail = () => {
+            clearTimeout(timer);
+            node.remove();
+            museEditorAssets.delete(src);
+            reject(new Error("Editor asset unavailable"));
+          };
+          node.onload = () => { clearTimeout(timer); resolve(); };
+          node.onerror = fail;
+          document.head.appendChild(node);
+        });
+        museEditorAssets.set(src, promise);
+        return promise;
+      };
       // Was: 18 files loaded SEQUENTIALLY (one .then chain). Over a remote /
       // tunneled link each round-trip stacks — first edit-mode entry took
       // 5-6 s on a high-latency PWA connection. CodeMirror core is the only
@@ -30115,14 +30211,14 @@ function portal() {
       // Theme/base CSS have no JS dependency and ride along concurrently. This
       // collapses ~18 serial RTTs into ~2.
       this._cmLoadPromise = (async () => {
-        const cssP = Promise.all([
+        await Promise.all([
           inject("/static/vendor/cm/codemirror.min.css"),
           inject("/static/vendor/cm/theme/material-darker.min.css"),
+          inject("/static/vendor/cm/codemirror.min.js"),
         ]);
-        await inject("/static/vendor/cm/codemirror.min.js");
         if (!window.CodeMirror) throw new Error("CodeMirror core loaded but global missing");
+        await inject("/static/vendor/cm/addon/mode/simple.min.js");
         await Promise.all([
-          inject("/static/vendor/cm/addon/mode/simple.min.js"),
           inject("/static/vendor/cm/addon/edit/closebrackets.min.js"),
           inject("/static/vendor/cm/addon/edit/matchbrackets.min.js"),
           inject("/static/vendor/cm/mode/meta.min.js"),
@@ -30137,7 +30233,6 @@ function portal() {
           inject("/static/vendor/cm/mode/shell/shell.min.js"),
           inject("/static/vendor/cm/mode/go/go.min.js"),
           inject("/static/vendor/cm/mode/rust/rust.min.js"),
-          cssP,
         ]);
       })().catch(e => {
         this._cmLoadPromise = null;   // allow retry next call
@@ -31632,11 +31727,11 @@ function portal() {
       // rAF-throttled so a continuous drag stays smooth (one refresh/frame).
       let _cmRefreshPending = false;
       const refreshCmSoon = () => {
-        if (!this.editing || !this._cm || _cmRefreshPending) return;
+        if (!this.editing || !this._getCM() || _cmRefreshPending) return;
         _cmRefreshPending = true;
         requestAnimationFrame(() => {
           _cmRefreshPending = false;
-          try { this._cm.refresh(); } catch (e) {}
+          try { this._getCM().refresh(); } catch (e) {}
         });
       };
       const onMove = (e) => {
@@ -31674,8 +31769,8 @@ function portal() {
         document.removeEventListener("mouseup", onUp);
         // Final settle: the layout is fully applied now, so one last refresh
         // clears any stale measurement left from the in-flight drag frames.
-        if (this.editing && this._cm) {
-          this.$nextTick(() => { try { this._cm.refresh(); } catch (e) {} });
+        if (this.editing && this._getCM()) {
+          this.$nextTick(() => { try { this._getCM().refresh(); } catch (e) {} });
         }
         this.savePrefs();
       };
@@ -31690,6 +31785,7 @@ function portal() {
     // editText against the last-saved rawText. Either signal means dirty.
     _editorDirty() {
       if (!this.editing) return false;
+      if (this._getCM()) return !!this.cmStatus.dirty;
       if (this.cmStatus && this.cmStatus.dirty) return true;
       return String(this.editText || "") !== String(this.rawText || "");
     },
@@ -31789,118 +31885,55 @@ function portal() {
       if (!this._workspaceIsCurrent(ownerWorkspace)
           || this.selected !== targetPath) return;
       this.editText = this.rawText;
-      // Live-preview setup: markdown files get the split pane; others edit
-      // full-width (editorView forced to "edit" so the template hides the
-      // preview + view-switch toolbar). For md, restore the persisted layout
-      // choice and seed the preview HTML so it's there on first paint.
       this.editorIsMd = this._isMdPath(targetPath);
-      if (this.editorIsMd) {
-        const saved = localStorage.getItem("muselab_editor_view");
-        this.editorView = (saved === "edit" || saved === "split" || saved === "preview")
-          ? saved : "split";
-        this.livePreviewHtml = this.editorView !== "edit"
-          ? this._renderPreviewMd(this.editText) : "";
-        if (this.editorView !== "edit") {
-          this.$nextTick(() => this.highlightCode(".editor-live-preview .markdown"));
-        }
-      } else {
-        this.editorView = "edit";
-        this.livePreviewHtml = "";
-      }
+      this.editorView = this.editorIsMd ? "split" : "edit";
+      this.editorSaveState = "";
+      this.editorPreviewError = "";
+      this.cmStatus = { ...this.cmStatus, dirty: false };
       this.editing = true;
       // Editing is a deliberate commitment to the file — pin its tab so it
       // doesn't get recycled out from under the editor by the next preview.
       this.pinTab(targetPath);
     },
     async saveEdit() {
-      // Ctrl/Cmd+S can enter from two places when CodeMirror has focus:
-      // CodeMirror.extraKeys and the document-level keydown handler. Guard at
-      // the save primitive so one physical shortcut cannot emit two writes and
-      // two identical "saved" toasts.
-      if (this._saveEditInFlight) return;
+      if (this._saveEditInFlight || !this.selected || !this.editing || this.editorLoading) return;
       this._saveEditInFlight = true;
+      this.editorSaveState = "saving";
+      const savePath = this.selected, workspace = this.fileWorkspacePath();
+      const state = museEditor, mountVersion = this._cmMountVersion;
+      const sameOwner = () => this._workspaceIsCurrent(workspace) && this.selected === savePath
+        && this.editing && this._cmMountVersion === mountVersion && museEditor === state;
+      const saveText = this._editorText();
+      // A generation captured BEFORE the request marks exactly the saved
+      // version, even if typing/undo continues while the write is in flight.
+      const savedGen = state?.cm.changeGeneration(true);
       try {
-        // Pull the current buffer once, here, instead of mirroring it into the
-        // reactive editText on every keystroke. CM is the source of truth when
-        // active; the textarea fallback (this._cm === null) keeps editText synced
-        // via its input listener. Everything below (write body, post-save
-        // rawText sync) reads this.editText, so refresh it first.
-        if (!this.selected) return;
-        const savePath = this.selected;
-        const ownerWorkspace = this.fileWorkspacePath();
-        const saveMode = this.previewMode;
-        const saveLang = this.previewLang;
-        const saveText = this._cm ? this._cm.getValue() : this.editText;
-        this.editText = saveText;
-        let r;
-        try {
-          r = await fetch("/api/files/write", {
-            method: "PUT",
-            headers: { ...this.fileHdr(), "Content-Type": "application/json" },
-            body: JSON.stringify({ path: savePath, content: saveText }),
-          });
-        } catch (e) {
-          // Keep editing=true so the unsaved buffer is preserved for retry.
-          if (this._workspaceIsCurrent(ownerWorkspace)
-              && this.selected === savePath) {
-            this.errToast("save", String((e && e.message) || e));
-          }
-          return;
-        }
-        if (r.ok) {
-          // The user can keep typing while the request is in flight. Compare
-          // the live buffer with the exact payload that reached disk before
-          // deciding whether it is safe to close the editor.
-          const sameOwner = this._workspaceIsCurrent(ownerWorkspace)
-            && this.selected === savePath;
-          const liveText = sameOwner && this.editing
-            ? (this._cm ? this._cm.getValue() : this.editText)
-            : saveText;
-          const hasNewerEdits = sameOwner && liveText !== saveText;
-          if (!sameOwner) return;
-          this._previewCacheDel(savePath);
-          if (this._previewNeedsReload === savePath) this._previewNeedsReload = "";
-          this.rawText = saveText;
-          // Keep the preview cache in step with the just-saved body. For md/text
-          // we can refresh in place; other modes (xlsx/html/img/pdf) just drop
-          // the stale entry so the next switch-back re-fetches.
-          if (saveMode === "md") {
-            this.renderedMd = this._renderPreviewMd(this.rawText);
-            if (this.rawText.length <= this.PREVIEW_CACHE_MAX_CHARS) {
-              this._previewCacheSet(savePath, {
-                mode: "md", rawText: this.rawText, renderedMd: this.renderedMd,
-              });
-            }
-            this.$nextTick(() => this.highlightCode(".markdown"));
-          } else if (saveMode === "text"
-                     && this.rawText.length <= this.PREVIEW_CACHE_MAX_CHARS) {
-            this._previewCacheSet(savePath, {
-              mode: "text", rawText: this.rawText, previewLang: saveLang,
-            });
-          }
-          // Bump previewVersion so HTML / PDF / image iframes pick up the new
-          // file content. Without this, iframes keep showing the stale render
-          // (browser disk cache + same URL) until the user hard-refreshes —
-          // the issue was visible when editing a html report styled in dark
-          // mode to light mode: editor saved, preview iframe still showed dark.
-          this.previewVersion = Date.now();
-          if (hasNewerEdits) {
-            this.editText = liveText;
-            this.cmStatus = { ...this.cmStatus, dirty: true };
-          } else {
-            this.editText = saveText;
-            this.editing = false;
-          }
-          // Saving moved the file's mtime — refresh the header strip.
-          this.loadSelectedMeta(savePath);
-          this.toast(hasNewerEdits
-            ? (this.lang === "zh" ? "已保存；之后输入的改动仍待保存"
-                                  : "Saved; newer edits are still unsaved")
-            : this.t("toast.saved"), "success", hasNewerEdits ? 3000 : 2000);
-        } else {
-          const detail = await r.text();
-          if (this._workspaceIsCurrent(ownerWorkspace)
-              && this.selected === savePath) this.errToast("save", detail);
+        const response = await fetch("/api/files/write", {
+          method: "PUT", headers: { ...this.fileHdr(), "Content-Type": "application/json" },
+          body: JSON.stringify({ path: savePath, content: saveText }),
+        });
+        if (!response.ok) throw new Error(await response.text());
+        if (!sameOwner()) return;
+        this._previewCacheDel(savePath);
+        // Rendering is deliberately deferred until preview is requested. A
+        // save only acknowledges disk state and keeps cursor/history intact.
+        this._previewNeedsReload = savePath;
+        this.rawText = saveText;
+        this.editText = this._editorText();
+        if (state) {
+          state.cleanGen = savedGen;
+          state.refreshStatus();
+        } else this.cmStatus = { ...this.cmStatus, dirty: this.editText !== saveText };
+        this.previewVersion = Date.now();
+        this.editorSaveState = "saved";
+        this.loadSelectedMeta(savePath);
+        this.toast(this.cmStatus.dirty
+          ? (this.lang === "zh" ? "已保存；之后输入的改动仍待保存" : "Saved; newer edits are still unsaved")
+          : this.t("toast.saved"), "success", 2000);
+      } catch (e) {
+        if (sameOwner()) {
+          this.editorSaveState = "error";
+          this.errToast("save", String(e.message || e));
         }
       } finally {
         this._saveEditInFlight = false;
