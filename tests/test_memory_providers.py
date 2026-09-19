@@ -776,6 +776,82 @@ def test_generation_repairs_non_object_once_and_preserves_schema(monkeypatch):
     assert 'wrong format' in calls[1][0]
 
 
+@pytest.mark.parametrize("first", ['not JSON', '[]', '{"valid":false}'])
+def test_json_validator_shares_format_repair_budget(monkeypatch, first):
+    from backend.memory_config import MemoryConfig
+    from backend.memory_providers import GenerationProvider
+
+    provider = GenerationProvider(MemoryConfig())
+    calls = []
+
+    async def complete(system, prompt):
+        calls.append((system, prompt))
+        return first if len(calls) == 1 else '{"valid":true}'
+
+    def validate(value):
+        if value.get("valid") is not True:
+            raise ValueError("private-validator-detail")
+        return {"normalized": True}
+
+    monkeypatch.setattr(provider, "complete", complete)
+    assert _run(provider.complete_json("system", "prompt", validator=validate)) == {
+        "normalized": True}
+    assert len(calls) == 2
+    assert "private-validator-detail" not in str(calls)
+
+
+@pytest.mark.parametrize("first", ['not JSON', '[]', '{}'])
+def test_json_validator_exhaustion_is_sanitized(monkeypatch, first):
+    import traceback
+    from backend import observability
+    from backend.memory_config import MemoryConfig
+    from backend.memory_engine import classify_memory_failure
+    from backend.memory_providers import GenerationError, GenerationProvider
+
+    provider = GenerationProvider(MemoryConfig())
+    calls, events = [], []
+
+    async def complete(system, prompt):
+        calls.append((system, prompt))
+        return first if len(calls) == 1 else '{"secret":"private-payload"}'
+
+    def validate(value):
+        raise ValueError("private-validator-detail")
+
+    monkeypatch.setattr(provider, "complete", complete)
+    monkeypatch.setattr(observability, "perf_event", lambda *args, **kw: events.append(kw))
+    with pytest.raises(GenerationError) as caught:
+        _run(provider.complete_json("system", "prompt", validator=validate))
+    error = caught.value
+    assert error.reason == "invalid_schema"
+    assert error.category == "malformed_response"
+    assert error.retryable is False
+    assert len(calls) == 2
+    assert classify_memory_failure(error)[1]["reason"] == "invalid_schema"
+    assert events[-1]["reason"] == "invalid_schema"
+    assert events[-1]["retrying"] is False
+    diagnostics = str(events) + str(calls) + "".join(traceback.format_exception(error))
+    assert "private-payload" not in diagnostics
+    assert "private-validator-detail" not in diagnostics
+
+
+def test_json_validator_programming_errors_do_not_retry(monkeypatch):
+    from unittest.mock import AsyncMock
+    from backend.memory_config import MemoryConfig
+    from backend.memory_providers import GenerationProvider
+
+    provider = GenerationProvider(MemoryConfig())
+    complete = AsyncMock(return_value='{}')
+    monkeypatch.setattr(provider, "complete", complete)
+
+    def validate(value):
+        raise RuntimeError("programming failure")
+
+    with pytest.raises(RuntimeError, match="programming failure"):
+        _run(provider.complete_json("system", "prompt", validator=validate))
+    assert complete.await_count == 1
+
+
 def test_sdk_memory_applies_native_output_and_reasoning_budget(tmp_path, monkeypatch):
     import claude_agent_sdk
     from claude_agent_sdk.types import ResultMessage

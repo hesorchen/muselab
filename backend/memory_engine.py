@@ -75,6 +75,60 @@ def _unwrap_schema_response(value: object, expected_key: str) -> dict:
     return value
 
 
+def _validate_dreamer_response(value: dict, evidence_ids: set[str]) -> dict:
+    """Validate the entire Dreamer batch before any business writes.
+
+    Optional metadata retains existing defaults when absent. Supplied fields
+    must match the prompt schema; source references must belong to this episode.
+    Verifier decisions and later persistence are separate from this shape gate.
+    """
+    result = _unwrap_schema_response(value, "memories")
+
+    def require(condition: bool) -> None:
+        if not condition:
+            raise ValueError("invalid_schema")
+
+    def text(value: object) -> bool:
+        return isinstance(value, str) and bool(value.strip())
+
+    def strings(value: object) -> bool:
+        return isinstance(value, list) and all(text(item) for item in value)
+
+    summary = result.get("episode")
+    require(isinstance(summary, dict))
+    require(text(summary.get("title")) and text(summary.get("summary")))
+    if "outcome" in summary:
+        require(isinstance(summary["outcome"], str) and summary["outcome"] in {
+            "success", "failure", "cancelled", "unknown"})
+    if "entities" in summary:
+        require(strings(summary["entities"]))
+    if "attributes" in summary:
+        require(isinstance(summary["attributes"], dict))
+    candidates = result.get("memories")
+    require(isinstance(candidates, list))
+    for candidate in candidates:
+        require(isinstance(candidate, dict))
+        require(isinstance(candidate.get("kind"), str) and candidate["kind"] in {
+            "fact", "preference", "decision", "state", "episode"})
+        require(text(candidate.get("content")))
+        sources = candidate.get("source_ids")
+        require(strings(sources) and bool(sources))
+        require(all(source in evidence_ids for source in sources))
+        for key in ("confidence", "future_use"):
+            number = candidate.get(key)
+            # Reject booleans, numeric strings, NaN/Infinity and huge integers
+            # without conversion exceptions or leaking model output.
+            require(type(number) in (int, float) and 0 <= number <= 1)
+        if "reuse_conditions" in candidate:
+            require(strings(candidate["reuse_conditions"]))
+        if "attributed_to" in candidate:
+            require(isinstance(candidate["attributed_to"], str)
+                    and candidate["attributed_to"] in {"user", "tool", "derived"})
+        if "episode_ids" in candidate:
+            require(strings(candidate["episode_ids"]))
+    return result
+
+
 def _model_float(value: object) -> float:
     """Parse a model-produced number without turning bad output into a retry."""
     try:
@@ -333,6 +387,11 @@ class MemoryEngine:
         self._recall_store: MemoryStore | None = None
         self._recall_store_actor = _MemoryStoreActor(
             self._resolve_recall_store, cancel_pending=True)
+        # Lexical scans must not queue healthy dense hydration behind their SQL.
+        # A separate store also isolates read-budget/cancellation state.
+        self._lexical_store: MemoryStore | None = None
+        self._lexical_store_actor = _MemoryStoreActor(
+            self._resolve_lexical_store, cancel_pending=True)
         self._ui_store: MemoryStore | None = None
         self._ui_store_actor = _MemoryStoreActor(
             self._resolve_ui_store, cancel_pending=True)
@@ -368,6 +427,12 @@ class MemoryEngine:
         if self._recall_store is None or self._recall_store.path != path:
             self._recall_store = MemoryStore(path, read_only=True)
         return self._recall_store
+
+    def _resolve_lexical_store(self) -> MemoryStore:
+        path = self._store.path if self._store_pinned else database_path()
+        if self._lexical_store is None or self._lexical_store.path != path:
+            self._lexical_store = MemoryStore(path, read_only=True)
+        return self._lexical_store
 
     def _resolve_ui_store(self) -> MemoryStore:
         path = self._store.path if self._store_pinned else database_path()
@@ -453,8 +518,10 @@ class MemoryEngine:
                 cancelled.wait(.01)
                 trace["busy_retry_ms"] += (time.perf_counter() - attempt) * 1000
 
+        actor = (self._lexical_store_actor if stage == "lexical"
+                 else self._recall_store_actor)
         try:
-            return await self._recall_store_actor.call(read, trace=trace)
+            return await actor.call(read, trace=trace)
         except TimeoutError:
             status = "timeout"
             raise
@@ -526,6 +593,7 @@ class MemoryEngine:
         self._closing = False
         self._store_actor.reopen()
         self._recall_store_actor.reopen()
+        self._lexical_store_actor.reopen()
         self._ui_store_actor.reopen()
         if (os.environ.get("MUSELAB_MEMORY_WORKER_DISABLED") == "1"
                 or self._workers or not (config.enabled if config is not None else self.enabled())):
@@ -627,6 +695,7 @@ class MemoryEngine:
             await self._provider_http.close()
             await self._store_actor.close()
             await self._recall_store_actor.close()
+            await self._lexical_store_actor.close()
             await self._ui_store_actor.close()
 
     async def record_turn(self, session_id: str, model: str, user_text: str,
@@ -951,6 +1020,105 @@ class MemoryEngine:
 
         await self._store_call(persist_records)
 
+    async def _dream_episode(self, cfg: MemoryConfig, episode: dict) -> dict:
+        evidence = [{
+            "id": item["id"], "role": item["role"], "event_type": item["event_type"],
+            "content": _redact(item["content"], 8000),
+            "metadata": item.get("metadata", {}),
+        } for item in episode["evidence"]]
+        evidence_ids = {item["id"] for item in evidence}
+        async with self._generation_lock:
+            return await GenerationProvider(cfg).complete_json(
+                DREAMER_SYSTEM, dreamer_prompt(episode, evidence),
+                validator=lambda value: _validate_dreamer_response(value, evidence_ids))
+
+    @staticmethod
+    def _prepare_episode_summary(cfg: MemoryConfig, episode: dict, summary: dict) -> dict:
+        return dict(
+            title=summary["title"].strip(), summary=summary["summary"].strip(),
+            outcome=(summary.get("outcome") if summary.get("outcome") in
+                     {"success", "failure", "cancelled", "unknown"} else episode["outcome"]),
+            entities_json=summary.get("entities") if isinstance(
+                summary.get("entities"), list) else [],
+            attributes_json=summary.get("attributes") if isinstance(
+                summary.get("attributes"), dict) else {},
+            extractor_version=f"{DREAMER_PROMPT_VERSION}:model={cfg.generation_model}",
+        )
+
+    async def prepare_episode_repair(self, source: dict, *, mode: str,
+                                     job_ids: list[str]) -> dict:
+        """Generate a snapshot-bound preparation on an explicitly read-only store.
+
+        Rejections retain normal verifier semantics. Existing duplicates are not
+        inserted or modified; their missing provenance needs manual review.
+        No workers, indexing, jobs, receipts or business writes are started here.
+        """
+        from .memory_repair import RepairConflict, check_target, fingerprint, validate_result
+
+        if not self._store_pinned or not self.store._read_only:
+            raise RepairConflict("repair generation requires an explicit read-only store")
+        # Detach before the first await so callers cannot change model evidence.
+        source = json.loads(json.dumps(source, ensure_ascii=False, allow_nan=False))
+        source_hash = fingerprint(source)
+        check_target(source, mode, job_ids)
+        owner, episode_id = source["owner_id"], source["episode_id"]
+
+        async def check_snapshot():
+            current = await self._store_call(
+                lambda store: store.repair_snapshot(owner, episode_id))
+            if fingerprint(current) != source_hash:
+                raise RepairConflict("generation source snapshot changed")
+
+        await check_snapshot()
+        cfg = await self._config_async()
+        if cfg.owner_id != owner:
+            raise RepairConflict("generation config owner mismatch")
+        if not cfg.consolidation.dreamer_enabled:
+            raise RepairConflict("Dreamer disabled in current config")
+        episode = MemoryStore._row(source["episode"])
+        episode["evidence"] = [MemoryStore._row(row) for row in source["evidence"]]
+        memories, duplicates = [], []
+        with provider_transport_scope(self._provider_http):
+            dreamed = await self._dream_episode(cfg, episode)
+            fields = self._prepare_episode_summary(cfg, episode, dreamed["episode"])
+            if mode == "summary-only":
+                # Existing reviewed metadata and extraction history stay untouched.
+                fields = {"title": (episode["title"] if episode["title"].strip()
+                                    else fields["title"]),
+                          "summary": fields["summary"]}
+            elif episode.get("outcome") == "success":
+                for candidate in dreamed["memories"]:
+                    prepared = await self._prepare_verified_memory(
+                        candidate, episode_id, candidate["source_ids"],
+                        cfg=cfg, source_episode=episode)
+                    if prepared is None:
+                        continue
+                    if "existing" in prepared:
+                        duplicates.append({"memory_id": prepared["existing"]["id"],
+                                           "source_link_review_required": True})
+                        continue
+                    memory = prepared["create"]
+                    # Repair must not recreate reviewed/deleted memories either.
+                    matches = await self._store_call(lambda store: store.lexical_search(
+                        owner, memory["content"], limit=8, include_status=None))
+                    duplicate = next((row["memory"] for row in matches
+                        if difflib.SequenceMatcher(None, memory["content"].casefold(),
+                            row["memory"]["content"].casefold()).ratio() >= 0.92), None)
+                    if duplicate is not None:
+                        duplicates.append({"memory_id": duplicate["id"],
+                                           "source_link_review_required": True})
+                        continue
+                    if any(difflib.SequenceMatcher(
+                            None, memory["content"].casefold(), old["content"].casefold()
+                    ).ratio() >= 0.92 for old in memories):
+                        continue
+                    memories.append(memory)
+        result = {"episode": fields, "memories": memories}
+        validate_result(source, mode, result)
+        await check_snapshot()
+        return {"source_fingerprint": source_hash, "result": result,
+                "duplicates": duplicates}
+
     async def _consolidate_episode(self, episode_id: str) -> None:
         cfg = await self._config_async()
         if not cfg.consolidation.dreamer_enabled:
@@ -959,41 +1127,30 @@ class MemoryEngine:
             lambda store: store.episode(episode_id))
         if not episode or not episode.get("evidence"):
             return
-        evidence = [{
-            "id": item["id"], "role": item["role"], "event_type": item["event_type"],
-            "content": _redact(item["content"], 8000),
-            "metadata": item.get("metadata", {}),
-        } for item in episode["evidence"]]
-        prompt = dreamer_prompt(episode, evidence)
-        async with self._generation_lock:
-            result = await GenerationProvider(cfg).complete_json(
-                DREAMER_SYSTEM, prompt)
-        result = _unwrap_schema_response(result, "memories")
-        summary = result.get("episode") if isinstance(result.get("episode"), dict) else {}
-        await self._store_call(lambda store: store.update_episode(
-            episode_id,
-            title=str(summary.get("title", ""))[:240],
-            summary=str(summary.get("summary", ""))[:4000],
-            outcome=(summary.get("outcome") if summary.get("outcome") in
-                     {"success", "failure", "cancelled", "unknown"} else episode["outcome"]),
-            entities_json=summary.get("entities") if isinstance(
-                summary.get("entities"), list) else [],
-            attributes_json=summary.get("attributes") if isinstance(
-                summary.get("attributes"), dict) else {},
-            extractor_version=(
-                f"{DREAMER_PROMPT_VERSION}:model={cfg.generation_model}"),
-        ))
-        evidence_ids = {item["id"] for item in evidence}
-        candidates = (result.get("memories", []) if episode.get("outcome") == "success"
-                      and isinstance(result.get("memories"), list) else [])
+        result = await self._dream_episode(cfg, episode)
+        fields = self._prepare_episode_summary(cfg, episode, result["episode"])
+        candidates = result["memories"] if episode.get("outcome") == "success" else []
+        memories = []
         for candidate in candidates:
-            if not isinstance(candidate, dict):
+            prepared = await self._prepare_verified_memory(
+                candidate, episode_id, candidate["source_ids"],
+                cfg=cfg, source_episode=episode)
+            if prepared is None or "existing" in prepared:
                 continue
-            sources = [source for source in candidate.get("source_ids", [])
-                       if source in evidence_ids]
-            if not sources:
+            memory = prepared["create"]
+            # Prepared rows are not searchable yet. Apply the existing similarity
+            # cutoff within each kind too, including normalized exact duplicates.
+            if any(old["kind"] == memory["kind"] and difflib.SequenceMatcher(
+                    None, memory["content"].casefold(), old["content"].casefold()
+            ).ratio() >= 0.92 for old in memories):
                 continue
-            await self._verify_and_store(candidate, episode_id, sources)
+            memories.append(memory)
+
+        # No business writes until every verifier has completed successfully.
+        await self._store_call(lambda store: store.commit_consolidation(
+            cfg.owner_id, episode_id, fields, memories))
+        if any(memory["status"] == "active" for memory in memories):
+            self._wake.set()
 
         threshold = cfg.consolidation.min_reflection_episodes
 
@@ -1037,6 +1194,33 @@ class MemoryEngine:
                                 evidence_ids: list[str], *,
                                 kind_override: str | None = None) -> dict | None:
         cfg = await self._config_async()
+        prepared = await self._prepare_verified_memory(
+            candidate, episode_id, evidence_ids, kind_override=kind_override, cfg=cfg)
+        if prepared is None:
+            return None
+        if "existing" in prepared:
+            return prepared["existing"]
+        kwargs = prepared["create"]
+
+        def create_and_enqueue(store: MemoryStore) -> dict:
+            memory = store.create_memory(cfg.owner_id, **kwargs)
+            if kwargs["status"] == "active":
+                store.enqueue("reindex_memory", {"memory_id": memory["id"]},
+                              owner_id=cfg.owner_id)
+            return memory
+
+        memory = await self._store_call(create_and_enqueue)
+        if kwargs["status"] == "active":
+            self._wake.set()
+        return memory
+
+    async def _prepare_verified_memory(self, candidate: dict, episode_id: str,
+                                       evidence_ids: list[str], *,
+                                       kind_override: str | None = None,
+                                       cfg: MemoryConfig | None = None,
+                                       source_episode: dict | None = None) -> dict | None:
+        """Return create kwargs, an existing memory, or rejection; never write."""
+        cfg = cfg if cfg is not None else await self._config_async()
         content = " ".join(str(candidate.get("content", "")).split())[:3000]
         kind = kind_override or str(candidate.get("kind", "fact"))
         if not content or kind not in _MEMORY_KINDS:
@@ -1059,7 +1243,8 @@ class MemoryEngine:
         if cfg.consolidation.verifier_enabled:
             def load_source_rows(store: MemoryStore) -> list[dict]:
                 source_rows: list[dict] = []
-                episode = store.episode(episode_id) or {}
+                episode = (source_episode if source_episode is not None
+                           else store.episode(episode_id)) or {}
                 by_id = {
                     row["id"]: row for row in episode.get("evidence", [])}
                 for source_id in evidence_ids:
@@ -1071,13 +1256,13 @@ class MemoryEngine:
                 if not source_rows:
                     for source_episode_id in candidate.get(
                             "episode_ids", [episode_id]):
-                        source_episode = store.episode(
+                        related_episode = store.episode(
                             source_episode_id, with_evidence=False)
-                        if source_episode and source_episode.get("summary"):
+                        if related_episode and related_episode.get("summary"):
                             source_rows.append({
                                 "id": source_episode_id, "role": "episode",
                                 "content": _redact(
-                                    source_episode["summary"], 4000)})
+                                    related_episode["summary"], 4000)})
                 return source_rows
 
             source_rows = await self._store_call(load_source_rows)
@@ -1185,7 +1370,7 @@ class MemoryEngine:
             similarity = difflib.SequenceMatcher(
                 None, content.casefold(), old["content"].casefold()).ratio()
             if similarity >= 0.92:
-                return old
+                return {"existing": old}
         model_value = max(0.0, min(
             1.0, _model_float(verification.get("prediction_value", 0) or 0)))
         source_episode_count = max(
@@ -1227,34 +1412,21 @@ class MemoryEngine:
         confidence = max(0.0, min(
             1.0, _model_float(candidate.get("confidence", 0.5) or 0.5)))
 
-        def create_and_enqueue(store: MemoryStore) -> dict:
-            memory = store.create_memory(
-                cfg.owner_id, kind, content,
-                authority="inferred",
-                confidence=confidence,
-                status=status,
-                attributes={
-                    "attributed_to": candidate.get("attributed_to", "derived"),
-                    "reuse_conditions": candidate.get("reuse_conditions", []),
-                    "verification": verification,
-                    "dreamer_prompt_version": (
-                        CROSS_EPISODE_PROMPT_VERSION
-                        if kind == "reflection" else DREAMER_PROMPT_VERSION),
-                    "verifier_prompt_version": VERIFIER_PROMPT_VERSION,
-                    "extractor_model": cfg.generation_model,
-                },
-                sources=sources,
-            )
-            if status == "active":
-                store.enqueue(
-                    "reindex_memory", {"memory_id": memory["id"]},
-                    owner_id=cfg.owner_id)
-            return memory
-
-        memory = await self._store_call(create_and_enqueue)
-        if status == "active":
-            self._wake.set()
-        return memory
+        return {"create": dict(
+            kind=kind, content=content, authority="inferred",
+            confidence=confidence, status=status,
+            attributes={
+                "attributed_to": candidate.get("attributed_to", "derived"),
+                "reuse_conditions": candidate.get("reuse_conditions", []),
+                "verification": verification,
+                "dreamer_prompt_version": (
+                    CROSS_EPISODE_PROMPT_VERSION
+                    if kind == "reflection" else DREAMER_PROMPT_VERSION),
+                "verifier_prompt_version": VERIFIER_PROMPT_VERSION,
+                "extractor_model": cfg.generation_model,
+            },
+            sources=sources,
+        )}
 
     @staticmethod
     def _historical_query_fit(content: str, queries: list[str]) -> float:
