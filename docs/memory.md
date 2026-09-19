@@ -92,9 +92,43 @@ review state, then switch to `active`. Confirm that recall traces are visible,
 provider outages remain fail-soft, and generated Skills remain inert until an
 explicit authenticated approval.
 
+### Targeted historical summary repair
+
+Dreamer JSON parsing and field validation share at most two generation calls.
+Empty titles/summaries or invalid fields fail explicitly rather than recording an
+empty success. After candidate verification, the summary, new facts, sources and
+index jobs commit together. A valid summary with no reusable facts is allowed.
+
+`scripts/repair_memory_once.py` defaults to a read-only dry-run over an explicit
+manifest; it does not retry every failed job:
+
+```json
+{"owner_id":"your-owner","items":[{"episode_id":"ep_...","job_ids":["job_..."],"mode":"summary-only"}]}
+```
+
+Use `summary-only` to fill the summary without changing existing facts or nonempty
+episode metadata. `full` requires complete evidence and no existing generated
+products; partial products, active jobs and ownership conflicts require review.
+All actions require `--db` and `--manifest`:
+
+- `--action generate --output prepared.json` uses the current memory configuration
+  and a read-only Registry to freeze verified results. Set the configuration path
+  explicitly: `--db` does not select a different configuration.
+- `--action apply --prepared prepared.json` performs no model calls. Each item
+  checks its source fingerprint and commits atomically with a durable replay
+  receipt. Old failed jobs remain intact; conflicts stop application.
+
+Verify against a consistent private snapshot first. The target Registry must
+already have this version's schema migrations; apply does not run global
+migrations. Prepared files contain private memory and must not enter Git or public
+attachments. An enqueued index job is not proof of indexing: wait for the worker
+and verify actual recall.
+
 ### Recall latency and diagnostics
 
-Recall uses its own SQLite actor and read-only connections to the WAL registry.
+Recall uses read-only connections to the WAL registry. Lexical retrieval has a
+separate SQLite actor and cancellation state from recent-evidence reads and
+hydration, so a slow lexical query cannot queue healthy dense hydration behind it.
 Background consolidation, job bookkeeping, and recall telemetry use the write
 actor. A recall read does not initialize or migrate the schema.
 

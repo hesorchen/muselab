@@ -13,6 +13,7 @@ import os
 import re
 import uuid
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -568,7 +569,7 @@ class GenerationError(RuntimeError):
         self.reason = reason if reason in {
             "unknown", "timeout", "transport_error", "http_error", "sdk_exception",
             "sdk_result_error", "missing_terminal", "empty_output", "invalid_json",
-            "non_object_json", "configuration", "exception",
+            "non_object_json", "invalid_schema", "configuration", "exception",
         } else "unknown"
 
 
@@ -896,9 +897,14 @@ class GenerationProvider:
             raise ValueError("ambiguous_json")
         return value
 
-    async def complete_json(self, system: str, prompt: str) -> dict:
-        # A syntactically valid array/string is still the wrong schema. Make
-        # one bounded format-repair attempt instead of losing the job at once.
+    async def complete_json(self, system: str, prompt: str, *,
+                            validator: Callable[[dict], dict] | None = None) -> dict:
+        """Parse and optionally normalize/validate within two total calls.
+
+        Validators return the accepted object or raise ValueError. Their error
+        text and rejected payloads are never logged or included in repair prompts.
+        Other exceptions propagate rather than disguising programming failures.
+        """
         instruction = "\nReturn exactly one JSON object. No arrays, quoted JSON, Markdown or prose."
         for attempt in range(2):
             text = (await self.complete(system + instruction, prompt)).strip()
@@ -907,8 +913,14 @@ class GenerationProvider:
             try:
                 value = self._json_value(text)
                 if isinstance(value, dict):
-                    return value
-                reason = "non_object_json"
+                    if validator is None:
+                        return value
+                    reason = "invalid_schema"
+                    value = validator(value)
+                    if isinstance(value, dict):
+                        return value
+                else:
+                    reason = "non_object_json"
             except json.JSONDecodeError as exc:
                 error_offset = exc.pos
             except ValueError:

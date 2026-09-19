@@ -68,7 +68,7 @@ def test_registry_lock_wait_does_not_freeze_event_loop(tmp_path, monkeypatch):
         "default", "session", idle_seconds=60)
     instance.store.attach_evidence(episode["id"], [evidence_id])
 
-    async def fake_json(_self, _system, _prompt):
+    async def fake_json(_self, _system, _prompt, *, validator=None):
         return {
             "episode": {
                 "title": "归档", "summary": "已归档", "outcome": "success",
@@ -220,7 +220,7 @@ def test_dreamer_and_verifier_create_traceable_memory(tmp_path, monkeypatch):
     instance.store.update_episode(
         episode["id"], status="closed", outcome="success", ended_at=2)
 
-    async def fake_json(_self, _system, prompt):
+    async def fake_json(_self, _system, prompt, *, validator=None):
         if "possibly_related_existing_memories" in prompt:
             return {
                 "decision": "accept", "supported": True, "conflict": False,
@@ -1012,7 +1012,7 @@ def test_recall_channel_failover_keeps_hydrated_results(recall_case, monkeypatch
     if failure.startswith("dense"):
         monkeypatch.setattr(vector, "search", broken_dense)
     else:
-        monkeypatch.setattr(instance._resolve_recall_store(), "lexical_search", broken_lexical)
+        monkeypatch.setattr(instance._resolve_lexical_store(), "lexical_search", broken_lexical)
 
     async def scenario():
         # Exact Chinese lexical matching, or a synonym query answered by the
@@ -1124,7 +1124,8 @@ def test_recall_cancel_records_cancelled_receipt(recall_case, monkeypatch):
     _run(scenario())
 
 
-def test_read_lane_cancels_expired_queued_work(recall_case):
+@pytest.mark.parametrize("stage", ["read", "lexical"])
+def test_read_lane_cancels_expired_queued_work(recall_case, stage):
     instance, _, _, _ = recall_case
     entered = threading.Event()
     release = threading.Event()
@@ -1135,10 +1136,10 @@ def test_read_lane_cancels_expired_queued_work(recall_case):
         release.wait(1)
 
     async def scenario():
-        first = asyncio.create_task(instance._recall_store_call(blocking_read))
+        first = asyncio.create_task(instance._recall_store_call(blocking_read, stage=stage))
         await asyncio.to_thread(entered.wait, 1)
         pending = asyncio.create_task(instance._recall_store_call(
-            lambda store: executed.append(True)))
+            lambda store: executed.append(True), stage=stage))
         await asyncio.sleep(0.01)
         pending.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -1213,7 +1214,7 @@ def test_first_ui_read_initializes_existing_empty_registry(tmp_path, monkeypatch
 def test_expired_lexical_sql_releases_recall_actor_for_dense_hydration(recall_case, monkeypatch):
     """Timing out the waiter must also stop SQL ahead of dense hydration."""
     instance, cfg, memory, _ = recall_case
-    store = instance._resolve_recall_store()
+    store = instance._resolve_lexical_store()
     interrupts = []
 
     def expensive_lexical(*args, **kwargs):
@@ -1326,7 +1327,8 @@ def test_recall_waits_for_every_stage_without_reserved_sub_budgets(
     _run(scenario())
 
 
-def test_unlimited_recall_sql_is_interruptible_and_lane_recovers(recall_case):
+@pytest.mark.parametrize("stage", ["read", "lexical"])
+def test_unlimited_recall_sql_is_interruptible_and_lane_recovers(recall_case, stage):
     instance, _, _, _ = recall_case
     entered = threading.Event()
     interrupted = threading.Event()
@@ -1343,14 +1345,14 @@ def test_unlimited_recall_sql_is_interruptible_and_lane_recovers(recall_case):
 
     async def scenario():
         try:
-            task = asyncio.create_task(instance._recall_store_call(expensive))
+            task = asyncio.create_task(instance._recall_store_call(expensive, stage=stage))
             assert await asyncio.to_thread(entered.wait, 1)
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await task
             assert await asyncio.to_thread(interrupted.wait, .5)
             result = await asyncio.wait_for(instance._recall_store_call(
-                lambda store: store.recent_evidence("default", "s")), .5)
+                lambda store: store.recent_evidence("default", "s"), stage=stage), .5)
             assert result == []
         finally:
             await instance.stop()
@@ -1363,7 +1365,7 @@ def test_recall_retries_lexical_lock_contention_instead_of_returning_empty(
         recall_case, monkeypatch, timeout_ms):
     instance, cfg, memory, _ = recall_case
     cfg.retrieval.soft_timeout_ms = timeout_ms
-    store = instance._resolve_recall_store()
+    store = instance._resolve_lexical_store()
     original = store._connect
     attempts = []
 

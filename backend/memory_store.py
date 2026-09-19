@@ -275,6 +275,53 @@ class MemoryStore:
             self._init()
             self._harden_permissions()
 
+    @classmethod
+    def open_existing_for_repair(cls, path: Path) -> "MemoryStore":
+        """Open a migrated registry for repair without init, DDL or backfills.
+
+        Missing prerequisites must be migrated separately, never by apply.
+        All subsequent connections use mode=rw so a missing file is not created.
+        """
+        store = cls(path, read_only=True)
+        with store._connect() as conn:
+            store._check_repair_schema(conn)
+        store._existing_only = True
+        store._read_only = False
+        return store
+
+    @staticmethod
+    def _check_repair_schema(conn) -> None:
+        from .memory_repair import RepairConflict
+
+        required = {table: set(columns) for table, columns, _ in _SNAPSHOT_TABLES
+                    if table in {"evidence", "episodes", "episode_evidence", "memories",
+                                 "memory_sources", "artifacts"}}
+        required.update({
+            "jobs": {"id", "kind", "status", "payload_json", "attempts", "run_after",
+                     "last_error", "owner_id", "created_at", "updated_at", "operation_key"},
+            "memory_fts": {"memory_id", "owner_id", "kind", "content"},
+            "memory_migrations": {"name", "applied_at", "details_json"},
+            "memory_recall_stats": {"owner_id", "memory_id", "recall_count", "updated_at"},
+            "memory_repair_receipts": {"repair_key", "owner_id", "episode_id",
+                                       "source_fingerprint", "prepared_fingerprint",
+                                       "result_json", "created_at"},
+        })
+        for table, columns in required.items():
+            actual = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+            if not columns <= actual:
+                raise RepairConflict(f"repair schema missing columns/table: {table}; migrate separately")
+        indexes = {row["name"] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index'")}
+        if not {"idx_memory_sources_source", "idx_jobs_episode", "idx_jobs_claim",
+                "idx_memories_owner_id"} <= indexes:
+            raise RepairConflict("repair indexes missing; migrate separately")
+        markers = {row["name"] for row in conn.execute(
+            "SELECT name FROM memory_migrations WHERE name IN (?,?)",
+            ("memory-recall-stats-v1", "memory-repair-indexes-v1"))}
+        if (len(markers) != 2 or int(conn.execute("PRAGMA user_version").fetchone()[0])
+                < _FTS_SCHEMA_VERSION):
+            raise RepairConflict("repair migration markers missing; migrate separately")
+
     def _harden_permissions(self) -> None:
         """Restrict the registry to the owning user.
 
@@ -303,8 +350,11 @@ class MemoryStore:
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
         # Recall must never run schema migration or wait ten seconds for a writer.
-        target = self.path.absolute().as_uri() + "?mode=ro" if self._read_only else self.path
-        conn = sqlite3.connect(target, uri=self._read_only,
+        existing_only = getattr(self, "_existing_only", False)
+        use_uri = self._read_only or existing_only
+        mode = "ro" if self._read_only else "rw"
+        target = self.path.absolute().as_uri() + f"?mode={mode}" if use_uri else self.path
+        conn = sqlite3.connect(target, uri=use_uri,
                                timeout=0.05 if self._read_only else 10,
                                isolation_level=None)
         try:
@@ -470,6 +520,12 @@ class MemoryStore:
         CREATE TABLE IF NOT EXISTS memory_migrations (
           name TEXT PRIMARY KEY, applied_at REAL NOT NULL, details_json TEXT NOT NULL DEFAULT '{}'
         );
+        CREATE TABLE IF NOT EXISTS memory_repair_receipts (
+          repair_key TEXT PRIMARY KEY, owner_id TEXT NOT NULL, episode_id TEXT NOT NULL,
+          source_fingerprint TEXT NOT NULL, prepared_fingerprint TEXT NOT NULL,
+          result_json TEXT NOT NULL, created_at REAL NOT NULL,
+          UNIQUE(owner_id, episode_id, source_fingerprint)
+        );
         CREATE TABLE IF NOT EXISTS audit (
           id TEXT PRIMARY KEY, owner_id TEXT NOT NULL, action TEXT NOT NULL,
           target_type TEXT NOT NULL, target_id TEXT NOT NULL,
@@ -485,6 +541,27 @@ class MemoryStore:
             self._migrate_columns(conn)
             self._migrate_fts(conn)
             self._migrate_recall_stats(conn)
+            self._migrate_repair_indexes(conn)
+
+    @staticmethod
+    def _migrate_repair_indexes(conn: sqlite3.Connection) -> None:
+        """One-time schema migration; never called by the repair opener/apply."""
+        name = "memory-repair-indexes-v1"
+        if conn.execute("SELECT 1 FROM memory_migrations WHERE name=?", (name,)).fetchone():
+            return
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_sources_source "
+                         "ON memory_sources(source_type,source_id,memory_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_episode "
+                         "ON jobs(json_extract(payload_json,'$.episode_id'),id)")
+            conn.execute("INSERT INTO memory_migrations(name,applied_at) VALUES (?,?)",
+                         (name, _now()))
+            conn.execute("COMMIT")
+        except BaseException:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
 
     @staticmethod
     def _migrate_columns(conn: sqlite3.Connection) -> None:
@@ -786,37 +863,79 @@ class MemoryStore:
             conn.execute(f"UPDATE episodes SET {assignments} WHERE id=?",
                          (*fields.values(), episode_id))
 
+    def commit_consolidation(self, owner_id: str, episode_id: str,
+                             episode_fields: dict, memories: list[dict]) -> None:
+        """Commit one fully verified batch; this is not a job replay receipt."""
+        allowed = {"title", "summary", "outcome", "entities_json",
+                   "attributes_json", "extractor_version"}
+        fields = {key: value for key, value in episode_fields.items() if key in allowed}
+        for key in ("entities_json", "attributes_json"):
+            if key in fields and not isinstance(fields[key], str):
+                fields[key] = _json(fields[key])
+        now = _now()
+        fields["updated_at"] = now
+        with self._write_tx() as conn:
+            updated = conn.execute(
+                f"UPDATE episodes SET {','.join(f'{key}=?' for key in fields)} "
+                "WHERE id=? AND owner_id=?",
+                (*fields.values(), episode_id, owner_id))
+            if updated.rowcount != 1:
+                raise ValueError("consolidation episode missing or owner mismatch")
+            for memory in memories:
+                memory_id = self._insert_memory(conn, owner_id, **memory)
+                if memory["status"] == "active":
+                    self._insert_job(conn, _id("job"), "reindex_memory",
+                                     {"memory_id": memory_id}, owner_id, now, now)
+                conn.execute(
+                    """INSERT INTO audit
+                       (id,owner_id,action,target_type,target_id,details_json,created_at)
+                       VALUES (?,?,?,?,?,?,?)""",
+                    (_id("audit"), owner_id, "create", "memory", memory_id,
+                     _json({"authority": memory.get("authority", "inferred"),
+                            "status": memory["status"]}), now))
+
     def create_memory(self, owner_id: str, kind: str, content: str, *,
                       authority: str = "inferred", confidence: float = 0.5,
                       status: str = "active", entities: list | None = None,
                       attributes: dict | None = None, tags: list | None = None,
                       sources: list[dict] | None = None,
                       valid_from: float | None = None) -> dict:
-        memory_id, now = _id("mem"), _now()
         with self._write_tx() as conn:
-            conn.execute(
-                """INSERT INTO memories
-                   (id,owner_id,kind,content,status,authority,confidence,
-                    entities_json,attributes_json,tags_json,valid_from,
-                    created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (memory_id, owner_id, kind, content, status, authority,
-                 max(0.0, min(1.0, confidence)), _json(entities or []),
-                 _json(attributes or {}), _json(tags or []), valid_from or now, now, now),
-            )
-            conn.execute(
-                "INSERT INTO memory_fts(memory_id,owner_id,kind,content) VALUES (?,?,?,?)",
-                (memory_id, owner_id, kind, _fts_text(content)),
-            )
-            for source in sources or []:
-                conn.execute(
-                    """INSERT OR IGNORE INTO memory_sources
-                       (memory_id,source_type,source_id,relation) VALUES (?,?,?,?)""",
-                    (memory_id, source["source_type"], source["source_id"],
-                     source.get("relation", "supports")),
-                )
+            memory_id = self._insert_memory(
+                conn, owner_id, kind, content, authority=authority, confidence=confidence,
+                status=status, entities=entities, attributes=attributes, tags=tags,
+                sources=sources, valid_from=valid_from)
         self.audit(owner_id, "create", "memory", memory_id,
                    {"authority": authority, "status": status})
         return self.memory(memory_id) or {}
+
+    @staticmethod
+    def _insert_memory(conn, owner_id, kind, content, *, authority="inferred",
+                       confidence=0.5, status="active", entities=None, attributes=None,
+                       tags=None, sources=None, valid_from=None) -> str:
+        """Insert a memory and its sources/FTS using the caller's transaction."""
+        memory_id, now = _id("mem"), _now()
+        conn.execute(
+            """INSERT INTO memories
+               (id,owner_id,kind,content,status,authority,confidence,
+                entities_json,attributes_json,tags_json,valid_from,
+                created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (memory_id, owner_id, kind, content, status, authority,
+             max(0.0, min(1.0, confidence)), _json(entities or []),
+             _json(attributes or {}), _json(tags or []), valid_from or now, now, now),
+        )
+        conn.execute(
+            "INSERT INTO memory_fts(memory_id,owner_id,kind,content) VALUES (?,?,?,?)",
+            (memory_id, owner_id, kind, _fts_text(content)),
+        )
+        for source in sources or []:
+            conn.execute(
+                """INSERT OR IGNORE INTO memory_sources
+                   (memory_id,source_type,source_id,relation) VALUES (?,?,?,?)""",
+                (memory_id, source["source_type"], source["source_id"],
+                 source.get("relation", "supports")),
+            )
+        return memory_id
 
     def memory(self, memory_id: str) -> dict | None:
         with self._lock, self._connect() as conn:
@@ -1386,14 +1505,62 @@ class MemoryStore:
                     (owner_id, operation_key)).fetchone()
                 if existing:
                     return existing["id"]
-            conn.execute(
-                """INSERT INTO jobs
-                   (id,kind,payload_json,run_after,owner_id,created_at,updated_at,operation_key)
-                   VALUES (?,?,?,?,?,?,?,?)""",
-                (job_id, kind, _json(payload), run_after or now, owner_id, now, now,
-                 operation_key),
-            )
+            self._insert_job(conn, job_id, kind, payload, owner_id,
+                             run_after or now, now, operation_key)
         return job_id
+
+    @staticmethod
+    def _insert_job(conn, job_id, kind, payload, owner_id, run_after, now,
+                    operation_key="") -> None:
+        conn.execute(
+            """INSERT INTO jobs
+               (id,kind,payload_json,run_after,owner_id,created_at,updated_at,operation_key)
+               VALUES (?,?,?,?,?,?,?,?)""",
+            (job_id, kind, _json(payload), run_after, owner_id, now, now, operation_key))
+
+    def repair_snapshot(self, owner_id: str, episode_id: str) -> dict:
+        """Read an exact repair target without initializing or mutating the database."""
+        from .memory_repair import read_source
+
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN")
+            try:
+                return read_source(conn, owner_id, episode_id)
+            finally:
+                conn.execute("ROLLBACK")
+
+    def apply_memory_repair(self, prepared: dict, *, timeout_seconds: float = 0.5) -> dict:
+        """Apply one frozen item with a short SQL/wall deadline and atomic receipt."""
+        from .memory_repair import apply_prepared
+
+        if not 0 < timeout_seconds <= 1:
+            raise ValueError("repair timeout must be positive and at most one second")
+        with self._lock, self._connect() as conn:
+            deadline = time.perf_counter() + timeout_seconds
+            conn.execute(f"PRAGMA busy_timeout={max(1, int(timeout_seconds * 1000))}")
+            conn.set_progress_handler(lambda: int(time.perf_counter() >= deadline), 1000)
+            try:
+                self._check_repair_schema(conn)
+                if time.perf_counter() >= deadline:
+                    raise TimeoutError("memory repair deadline exceeded")
+                conn.execute("BEGIN IMMEDIATE")
+                result = apply_prepared(self, conn, prepared)
+                # Python fingerprinting/validation is not covered by SQLite's
+                # progress callback. Never commit if that work exhausted the budget.
+                if time.perf_counter() >= deadline:
+                    raise TimeoutError("memory repair deadline exceeded")
+                conn.execute("COMMIT")
+                return result
+            except sqlite3.OperationalError as exc:
+                if time.perf_counter() >= deadline:
+                    raise TimeoutError("memory repair deadline exceeded") from exc
+                raise
+            finally:
+                # SQLITE_INTERRUPT may already have rolled back a write. Disable
+                # the expired handler before rollback so cleanup cannot be cut off.
+                conn.set_progress_handler(None, 0)
+                if conn.in_transaction:
+                    conn.execute("ROLLBACK")
 
     def enqueue_reindex_batches(self, owner_id: str, *, batch_size: int = 256,
                                 revision: str = "") -> int:
