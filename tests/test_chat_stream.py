@@ -1720,7 +1720,7 @@ def test_turn_response_boundary_accepts_lifecycle_and_uuid_less_error(stream_env
     assert boundary.classify(error_result) == "current_result"
 
 
-def test_turn_response_boundary_keeps_nonhuman_delivery_out_of_human_turn(
+def test_turn_response_boundary_keeps_nonhuman_result_from_ending_human_turn(
         stream_env):
     chat_mod = stream_env
     boundary = chat_mod._TurnResponseBoundary(set())
@@ -1740,7 +1740,7 @@ def test_turn_response_boundary_keeps_nonhuman_delivery_out_of_human_turn(
         is_error=False, num_turns=1, session_id="human", origin=None,
     )
 
-    assert boundary.classify(side_user) == "background"
+    assert boundary.classify(side_user) == "forward"
     assert boundary.classify(side_result) == "background_result"
     assert boundary.classify(human_result) == "current_result"
 
@@ -4122,7 +4122,7 @@ def test_pooled_stream_attaches_before_query_and_parks_leftovers(stream_env):
     assert pooled.index("turn_q = stream.attach_turn()") < pooled.index(
         "await _send_query()"
     )
-    assert "await stream.release_turn(turn_q, background_messages)" in pooled
+    assert "await stream.release_turn(turn_q)" in pooled
 
 
 def test_turn_does_not_consume_detached_continuation(stream_env, monkeypatch):
