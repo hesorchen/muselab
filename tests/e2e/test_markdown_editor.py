@@ -420,3 +420,17 @@ def test_split_scroll_sync_is_bidirectional_and_survives_view_changes(page, back
     page.locator('.editor-view-switch button').nth(1).click()
     page.wait_for_function("!" + APP + ".editorPreviewBusy")
     page.wait_for_function("() => {const c=window.__muselab_cm.getScrollInfo(),p=document.querySelector('.editor-live-preview');return Math.abs(c.top/(c.height-c.clientHeight)-p.scrollTop/(p.scrollHeight-p.clientHeight))<0.025}")
+
+
+def test_worker_legacy_request_receives_rendered_content_first(page, backend_url, auth_token):
+    # An already-open page can create a new worker after a deployment. Its
+    # original protocol expects the first message to contain the final HTML.
+    _login(page, backend_url, auth_token)
+    response = page.evaluate("""() => new Promise((resolve,reject) => {
+      const worker=new Worker('/static/render-worker.js');
+      const timeout=setTimeout(()=>{worker.terminate();reject(new Error('worker timeout'));},5000);
+      worker.onmessage=event=>{clearTimeout(timeout);worker.terminate();resolve(event.data);};
+      worker.onerror=()=>{clearTimeout(timeout);worker.terminate();reject(new Error('worker error'));};
+      worker.postMessage({kind:'markdown',text:'# Legacy preview'});
+    })""")
+    assert 'Legacy preview' in response.get('html','')
