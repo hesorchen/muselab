@@ -1108,7 +1108,7 @@ def test_workspace_file_requests_reject_late_previous_owner_results():
     meta = method("async loadSelectedMeta(path)", "\n    // Format a unix-seconds")
     children = method("async fetchChildren(path, opts = {})", "\n    async toggleHidden()")
     upload = method("async _syncUploadedFiles(", "\n    onPreviewTabDragStart")
-    save = method("async saveEdit()", "\n    // ===== @ mention")
+    save = method("async saveEdit({ exitAfterSave = false } = {})", "\n    // ===== @ mention")
     palette = method("async _fetchPaletteFiles()", "\n    // Build the item list")
 
     assert "const loadSeq = ++this._trashLoadSeq" in trash

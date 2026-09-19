@@ -901,8 +901,14 @@
           <svg x-show="!editing"><use href="#i-edit"/></svg>
           <svg x-show="editing"><use href="#i-eye"/></svg>
         </button>
-        <button x-show="previewSurface==='file' && editing" @click="saveEdit()" class="btn-primary btn-compact"
+        <button x-show="markdownOutlineAvailable()" @click="toggleMarkdownOutline()"
+                class="btn-compact markdown-outline-toggle preview-keep-mobile"
+                :aria-expanded="markdownOutlineOpen" aria-controls="markdown-outline"
+                :title="lang==='zh' ? '显示或隐藏目录' : 'Toggle table of contents'"
+                x-text="lang==='zh' ? '目录' : 'Contents'"></button>
+        <button x-show="previewSurface==='file' && editing" @click="saveEdit({ exitAfterSave: true })" class="btn-primary btn-compact"
                 :disabled="_saveEditInFlight || editorLoading"
+                :title="lang==='zh' ? '保存并回到预览；Ctrl/⌘+S 保存并继续编辑' : 'Save and preview; Ctrl/⌘+S saves and keeps editing'"
                 x-text="_saveEditInFlight ? (lang==='zh' ? '保存中…' : 'Saving…') : t('btn.save')"></button>
         <button x-show="previewSurface==='file' && selected" @click="insertFileMention(selected)" class="icon-btn preview-keep-mobile" :title="t('btn.at_mention')"><svg><use href="#i-at"/></svg></button>
         <!-- Desktop fullscreen toggle (hidden on mobile via .pane-fullscreen-btn
@@ -1069,6 +1075,25 @@
         </div>
         <span class="settings-inline-error" x-show="htmlAnnotation.error" x-text="htmlAnnotation.error"></span>
       </div>
+      <nav id="markdown-outline" class="markdown-outline" x-cloak
+           x-show="markdownOutlineOpen && markdownOutlineAvailable()"
+           :aria-label="lang==='zh' ? '文档目录' : 'Document contents'"
+           @keydown.escape.stop="toggleMarkdownOutline(); $el.closest('.pane').querySelector('.markdown-outline-toggle').focus()">
+        <div class="markdown-outline-head">
+          <strong x-text="lang==='zh' ? '目录' : 'Contents'"></strong>
+          <button class="icon-btn sm" @click="toggleMarkdownOutline()"
+                  :aria-label="lang==='zh' ? '关闭目录' : 'Close contents'">×</button>
+        </div>
+        <div class="markdown-outline-items" :aria-busy="editing && editorPreviewBusy">
+          <p x-show="!markdownOutline.length" x-text="lang==='zh' ? '文档暂无标题' : 'No headings in this document'"></p>
+          <template x-for="heading in markdownOutline" :key="heading.index">
+            <button @click="jumpMarkdownHeading(heading.index)"
+                    :disabled="editing && editorPreviewBusy"
+                    :style="{paddingLeft: (12 + (heading.level - 1) * 14) + 'px'}"
+                    x-text="heading.text"></button>
+          </template>
+        </div>
+      </nav>
       <div class="preview-body" x-ref="previewBody"
            :class="{ 'drag-hover': previewSurface==='file' && (previewDragHover || osFileDragging),
                      'terminal-active': previewSurface==='terminal' }"
@@ -1232,7 +1257,7 @@
              That's how the raw <pre> below leaked under the rendered markdown
              (2026-06-26 user report: md preview dumping its own source). Object
              form uses style.setProperty per key and leaves display alone. -->
-        <div x-show="previewSurface==='file' && !editing && previewMode==='md' && rawText" class="markdown" x-html="renderedMd" :style="{ zoom: previewZoom }" @click="onPreviewImgClick($event)"></div>
+        <div x-show="previewSurface==='file' && !editing && previewMode==='md' && rawText" class="markdown" x-ref="markdownPreview" x-html="renderedMd" :style="{ zoom: previewZoom }" @click="onPreviewImgClick($event)"></div>
         <pre x-show="previewSurface==='file' && !editing && previewMode==='text' && rawText" class="text" :style="{ zoom: previewZoom }"><code :class="'language-' + previewLang" x-text="rawText"></code></pre>
         <!-- 0-byte / empty file: a blank md/text pane is indistinguishable from
              "still loading" or "render broke". Show an explicit placeholder. -->

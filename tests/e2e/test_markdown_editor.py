@@ -4,6 +4,7 @@ from __future__ import annotations
 import time
 
 import pytest
+from playwright.sync_api import expect
 
 from .test_files_preview import _login
 
@@ -56,6 +57,15 @@ def test_editor_theme_contrast_and_real_keyboard_after_view_switch(page, backend
     page.keyboard.press("Control+End")
     page.keyboard.insert_text("中文输入")
     assert page.evaluate("window.__muselab_cm.getValue().endsWith('中文输入')")
+    page.keyboard.press("Control+a")
+    selection = page.locator(".CodeMirror-selected").first
+    assert selection.is_visible()
+    assert selection.evaluate("el => getComputedStyle(el).backgroundColor") != "rgba(0, 0, 0, 0)"
+    bg = selection.evaluate("el => getComputedStyle(el).backgroundColor")
+    assert bg != page.locator(".CodeMirror").evaluate("el => getComputedStyle(el).backgroundColor")
+    # Clicking a toolbar button must not make the selected range disappear.
+    page.locator(".editor-font-controls button").first.click()
+    assert page.locator(".CodeMirror-selected").first.evaluate("el => getComputedStyle(el).backgroundColor") == bg
     assert errors == []
 
 
@@ -98,14 +108,14 @@ def test_pending_save_new_edits_duplicate_and_failure_preserve_content(page, bac
       window.fetch=(url,opts)=>String(url).includes('/api/files/write')
         ? (writes++,new Promise(resolve=>{finish=()=>resolve(new Response('{}',{status:200}));}))
         : fetchOriginal(url,opts);
-      const p=app.saveEdit(); await app.saveEdit();
+      const p=app.saveEdit({exitAfterSave:true}); await app.saveEdit({exitAfterSave:true});
       cm.setCursor({line:0,ch:4}); cm.replaceSelection('后续输入');
       finish(); await p;
       const newer={dirty:app._editorDirty(),editing:app.editing,body:cm.getValue(),saved:app.rawText};
       cm.undo(); const cleanAfterUndo=!app._editorDirty();
       window.fetch=(url,opts)=>String(url).includes('/api/files/write')
         ? Promise.resolve(new Response('write failed',{status:500})) : fetchOriginal(url,opts);
-      cm.replaceSelection('未保存'); await app.saveEdit();
+      cm.replaceSelection('未保存'); await app.saveEdit({exitAfterSave:true});
       window.fetch=fetchOriginal;
       return {writes,newer,cleanAfterUndo,error:app.editorSaveState,dirty:app._editorDirty(),body:cm.getValue()};
     }""")
@@ -251,3 +261,78 @@ def test_leaving_editor_during_cold_load_does_not_mount_stale_instance(page, bac
     assert not page.evaluate(APP + ".editing")
     assert page.locator(".editor-cm .CodeMirror").count() == 0
     assert page.evaluate("window.__muselab_cm === null")
+
+
+@pytest.mark.parametrize("mode", ["read", "split", "preview", "mobile"])
+def test_outline_follows_rendered_headings_and_navigates(page, backend_url, auth_token, mode):
+    if mode == "mobile":
+        page.set_viewport_size({"width": 390, "height": 844})
+    text = "# Top **title**\n\n```md\n# Not a heading\n```\n\n" + ("Body paragraph.\n\n" * 80) + "## Repeated\n\n" + ("More body.\n\n" * 80) + "### Repeated\n"
+    _open(page, backend_url, auth_token, text)
+    if mode == "read":
+        page.evaluate(APP + ".toggleEdit()")
+    elif mode == "preview":
+        page.evaluate(APP + ".setEditorView('preview')")
+    elif mode == "mobile":
+        page.evaluate(APP + ".setMobileTab('preview')")
+    page.wait_for_function("!" + APP + ".editorPreviewBusy")
+    page.locator(".markdown-outline-toggle").click()
+    items = page.locator(".markdown-outline-items button")
+    page.wait_for_function(APP + ".markdownOutline.length === 3")
+    assert items.all_text_contents() == ["Top title", "Repeated", "Repeated"]
+    if mode == "split":
+        # The unchanged read preview may not trigger a renderedMd watcher.
+        # Keeping the outline open across edit/read still needs new DOM targets.
+        page.evaluate(APP + ".toggleEdit()")
+        page.wait_for_function("!" + APP + ".editing")
+    items.nth(2).click()
+    position = page.evaluate("""() => {
+      const app=document.querySelector('#app')._x_dataStack[0];
+      const root=app.editing ? app.$refs.editorPreview : app.$refs.markdownPreview;
+      const scroller=app.editing ? root.parentElement : app.$refs.previewBody;
+      const heading=root.querySelector('h3').getBoundingClientRect(), box=scroller.getBoundingClientRect();
+      return {top:scroller.scrollTop,visible:heading.top>=box.top-1 && heading.top<box.bottom,
+        overflow:document.documentElement.scrollWidth>window.innerWidth};
+    }""")
+    assert position["top"] > 0 and position["visible"]
+    assert not position["overflow"]
+    if mode == "split":
+        page.evaluate(APP + ".toggleEdit()")
+        page.wait_for_function("window.__muselab_cm && !" + APP + ".editorPreviewBusy")
+    if mode != "read":
+        page.evaluate("window.__muselab_cm.setValue('# Updated title\\n\\n## Next section')")
+        page.wait_for_function(APP + ".markdownOutline[0]?.text === 'Updated title'")
+        assert items.all_text_contents() == ["Updated title", "Next section"]
+    page.locator(".markdown-outline-items button").first.focus()
+    page.keyboard.press("Escape")
+    expect(page.locator("#markdown-outline")).to_be_hidden()
+    assert page.locator(".markdown-outline-toggle").evaluate("el => el === document.activeElement")
+
+
+def test_save_button_returns_to_updated_preview_and_shortcut_keeps_editing(page, backend_url, auth_token):
+    _open(page, backend_url, auth_token)
+    page.evaluate("window.__muselab_cm.setValue('# Saved heading')")
+    page.locator('.CodeMirror').click()
+    page.keyboard.press('Control+s')
+    page.wait_for_function(APP + ".editorSaveState === 'saved'")
+    assert page.evaluate(APP + '.editing')
+    page.evaluate("window.__muselab_cm.setValue('# Final heading')")
+    page.locator('button[x-show="previewSurface===\'file\' && editing"]').click()
+    page.wait_for_function("!" + APP + ".editing && !window.__muselab_cm")
+    page.wait_for_function("document.querySelector('[x-ref=markdownPreview] h1')?.textContent === 'Final heading'")
+    disk = page.evaluate("""async () => {
+      const app=document.querySelector('#app')._x_dataStack[0];
+      return await (await fetch('/api/files/read?path=editor-fixture.md',{headers:app.fileHdr()})).text();
+    }""")
+    assert disk == '# Final heading'
+
+
+def test_outline_clears_on_file_switch_and_empty_document(page, backend_url, auth_token):
+    _open(page, backend_url, auth_token)
+    page.locator('.markdown-outline-toggle').click()
+    page.wait_for_function(APP + '.markdownOutline.length === 1')
+    page.evaluate("window.__muselab_cm.setValue('No headings here')")
+    page.wait_for_function('!' + APP + '.editorPreviewBusy && ' + APP + '.markdownOutline.length === 0')
+    assert page.locator('.markdown-outline-items p').is_visible()
+    page.evaluate("async () => {const app=" + APP + "; await app.saveEdit({exitAfterSave:true}); await app.openFile({path:'notes.md',name:'notes.md'});}")
+    expect(page.locator('#markdown-outline')).to_be_hidden()
