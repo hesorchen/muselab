@@ -1124,7 +1124,7 @@ def test_workspace_file_requests_reject_late_previous_owner_results():
     assert "_uniqueFileNodes(nodes)" in app
     assert "ownerWorkspace = this.fileWorkspacePath()" in upload
     assert "if (!this._workspaceIsCurrent(ownerWorkspace)) return" in upload
-    assert save.index("if (!sameOwner) return") < save.index(
+    assert save.index("if (!sameOwner()) return") < save.index(
         "this._previewCacheDel(savePath)")
     assert "const requestSeq = ++this._paletteFileSeq" in palette
     assert "requestSeq === this._paletteFileSeq" in palette
@@ -4367,7 +4367,7 @@ def test_history_markdown_cache_reuses_stable_block_keys_without_hiding_content(
     history_key = history_key[:history_key.index("_historyStoreKey", 1)]
     render = app[app.index("_renderHistoryMessage(m) {"):]
     render = render[:render.index("_historyHtmlDelete", 1)]
-    huge_plain = app[app.index("if (text.length >= 64 * 1024)"):]
+    huge_plain = app[app.index("if (opts.raw === undefined && text.length >= 64 * 1024)"):]
     huge_plain = huge_plain[:huge_plain.index("// Streaming-friendly preprocess")]
 
     assert "m.block_id" in history_key
@@ -4906,7 +4906,7 @@ def test_workspace_cache_uses_delta_without_blocking_or_copying_hidden_bursts():
     assert "await rootReady" not in boot
 
     load_start = app.index("loadRoot({\n      runtimeSnapshot = false")
-    load_end = app.index("\n    reloadTree(options = {})", load_start)
+    load_end = app.index("\n    async reloadTree(options = {})", load_start)
     load = app[load_start:load_end]
     assert "this._enqueueWorkspaceSync(" in load
     assert "_loadRootNow({" in app

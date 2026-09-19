@@ -896,11 +896,14 @@
         </button>
         <button x-show="previewSurface==='file' && selected && isEditable(selected)" @click="toggleEdit()" class="icon-btn"
                 @mouseenter="_loadCodemirror().catch(()=>{})" @focus="_loadCodemirror().catch(()=>{})"
-                :title="editing ? t('btn.preview') : t('btn.edit')">
+                :title="editing ? (lang==='zh' ? '退出编辑' : 'Exit editor') : t('btn.edit')"
+                :aria-label="editing ? (lang==='zh' ? '退出编辑' : 'Exit editor') : t('btn.edit')">
           <svg x-show="!editing"><use href="#i-edit"/></svg>
           <svg x-show="editing"><use href="#i-eye"/></svg>
         </button>
-        <button x-show="previewSurface==='file' && editing" @click="saveEdit()" class="btn-primary btn-compact" x-text="t('btn.save')"></button>
+        <button x-show="previewSurface==='file' && editing" @click="saveEdit()" class="btn-primary btn-compact"
+                :disabled="_saveEditInFlight || editorLoading"
+                x-text="_saveEditInFlight ? (lang==='zh' ? '保存中…' : 'Saving…') : t('btn.save')"></button>
         <button x-show="previewSurface==='file' && selected" @click="insertFileMention(selected)" class="icon-btn preview-keep-mobile" :title="t('btn.at_mention')"><svg><use href="#i-at"/></svg></button>
         <!-- Desktop fullscreen toggle (hidden on mobile via .pane-fullscreen-btn
              @media in styles.css). Click → preview pane takes whole viewport;
@@ -1161,27 +1164,47 @@
             </template>
           </div>
         </div>
-        <div x-show="previewSurface==='file' && editing" class="editor-wrap" :class="'editor-view-' + editorView">
+        <div x-show="previewSurface==='file' && editing" class="editor-wrap" :class="'editor-view-' + editorView"
+             :style="{ '--editor-font-size': editorFontSize + 'px' }">
           <!-- View switch: only markdown files get the live preview. The split
                pane renders mdRender(buffer) live as you type (debounced). -->
-          <div class="editor-toolbar" x-show="editorIsMd">
-            <div class="editor-view-switch" role="group"
+          <div class="editor-toolbar">
+            <div class="editor-view-switch" x-show="editorIsMd" role="group"
                  :aria-label="lang==='zh' ? '编辑视图' : 'Editor view'">
               <button type="button" :class="{ active: editorView==='edit' }"
-                      @click="setEditorView('edit')"
+                      @click="setEditorView('edit')" :aria-pressed="editorView==='edit'"
                       x-text="lang==='zh' ? '编辑' : 'Edit'"></button>
               <button type="button" :class="{ active: editorView==='split' }"
-                      @click="setEditorView('split')"
+                      @click="setEditorView('split')" :aria-pressed="editorView==='split'"
                       x-text="lang==='zh' ? '分屏' : 'Split'"></button>
               <button type="button" :class="{ active: editorView==='preview' }"
-                      @click="setEditorView('preview')"
+                      @click="setEditorView('preview')" :aria-pressed="editorView==='preview'"
                       x-text="lang==='zh' ? '预览' : 'Preview'"></button>
             </div>
+            <div class="editor-font-controls" role="group" :aria-label="lang==='zh' ? '编辑字号' : 'Editor font size'">
+              <button type="button" @click="setEditorFontSize(editorFontSize - 1)" :disabled="editorFontSize <= 14"
+                      :aria-label="lang==='zh' ? '缩小字号' : 'Decrease font size'">A−</button>
+              <span x-text="editorFontSize + 'px'"></span>
+              <button type="button" @click="setEditorFontSize(editorFontSize + 1)" :disabled="editorFontSize >= 24"
+                      :aria-label="lang==='zh' ? '放大字号' : 'Increase font size'">A+</button>
+            </div>
+            <span class="editor-preview-state" role="status" x-show="editorPreviewBusy"
+                  x-text="lang==='zh' ? '更新预览…' : 'Updating preview…'"></span>
+          </div>
+          <div class="editor-notice" role="status" x-show="editorLoading"
+               x-text="lang==='zh' ? '正在加载编辑器…' : 'Loading editor…'"></div>
+          <div class="editor-notice" role="alert" x-show="editorError">
+            <span x-text="editorError"></span>
+            <button type="button" @click="mountCM()" x-text="lang==='zh' ? '重试' : 'Retry'"></button>
+          </div>
+          <div class="editor-notice" role="alert" x-show="editorPreviewError">
+            <span x-text="editorPreviewError"></span>
+            <button type="button" @click="_scheduleLivePreview(0)" x-text="lang==='zh' ? '重试' : 'Retry'"></button>
           </div>
           <div class="editor-main">
             <div x-ref="cmHost" class="editor-cm" x-show="editorView !== 'preview'"></div>
             <div class="editor-live-preview" x-show="editorIsMd && editorView !== 'edit'">
-              <div class="markdown" x-html="livePreviewHtml" @click="onPreviewImgClick($event)"></div>
+              <div class="markdown" x-ref="editorPreview" @click="onPreviewImgClick($event)"></div>
             </div>
           </div>
           <div class="editor-status">
@@ -1189,9 +1212,9 @@
             <span class="seg" x-show="cmStatus.sel" x-text="(lang==='zh'?'(选 ':'(sel ') + cmStatus.sel + ')'"></span>
             <span class="spacer"></span>
             <span class="seg" x-text="cmStatus.lines + (lang==='zh' ? ' 行' : ' lines')"></span>
-            <span class="seg" x-text="fmtSize(cmStatus.chars) + ' / ' + cmStatus.chars + (lang==='zh' ? ' 字符' : ' chars')"></span>
+            <span class="seg" x-text="fmtSize(cmStatus.bytes) + ' / ' + cmStatus.chars + (lang==='zh' ? ' 字符' : ' chars')"></span>
             <span class="seg" x-text="cmStatus.mode"></span>
-            <span class="seg" :class="cmStatus.dirty ? 'dirty' : ''" x-text="cmStatus.dirty ? (lang==='zh' ? '● 未保存' : '● Unsaved') : (lang==='zh' ? '○ 已保存' : '○ Saved')"></span>
+            <span class="seg" :class="cmStatus.dirty ? 'dirty' : ''" role="status" x-text="_saveEditInFlight ? (lang==='zh' ? '保存中…' : 'Saving…') : editorSaveState==='error' ? (lang==='zh' ? '保存失败 · 请重试' : 'Save failed · Retry') : cmStatus.dirty ? (lang==='zh' ? '● 未保存' : '● Unsaved') : (lang==='zh' ? '○ 已保存' : '○ Saved')"></span>
           </div>
         </div>
         <!-- Loading state — shown briefly between selecting a new file and the
