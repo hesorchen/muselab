@@ -1591,11 +1591,51 @@ class MemoryStore:
 
     def apply_memory_repair(self, prepared: dict, *, timeout_seconds: float = 0.5) -> dict:
         """Apply one frozen item with a short SQL/wall deadline and atomic receipt."""
-        from .memory_repair import apply_prepared
+        from .memory_repair import RepairConflict, apply_prepared, fingerprint, read_source, validate_result
 
         if not 0 < timeout_seconds <= 1:
             raise ValueError("repair timeout must be positive and at most one second")
+        if self._read_only:
+            raise RepairConflict("memory repair requires a writable store")
+        value = dict(prepared)
+        digest = value.pop("prepared_fingerprint", None)
+        if value.get("version") != 1 or fingerprint(value) != digest:
+            raise RepairConflict("frozen result fingerprint mismatch")
+        if value["repair_key"] != fingerprint([
+                value["owner_id"], value["episode_id"], value["source_fingerprint"]]):
+            raise RepairConflict("repair key mismatch")
         with self._lock, self._connect() as conn:
+            # Keep the complete read set in this handle's cache, without taking a
+            # writer lock. The guarded transaction below rechecks everything anew.
+            preflight_deadline = time.perf_counter() + 5.0
+            conn.execute("PRAGMA cache_size=-16384")
+            conn.execute("PRAGMA busy_timeout=50")
+            conn.execute("PRAGMA query_only=ON")
+            conn.set_progress_handler(lambda: int(time.perf_counter() >= preflight_deadline), 1000)
+            try:
+                conn.execute("BEGIN")
+                self._check_repair_schema(conn)
+                if not conn.execute("SELECT 1 FROM memory_repair_receipts WHERE repair_key=?",
+                                    (value["repair_key"],)).fetchone():
+                    source = read_source(conn, value["owner_id"], value["episode_id"])
+                    validate_result(source, value["mode"], value["result"])
+                    kinds = sorted({m["kind"] for m in value["result"]["memories"]})
+                    if kinds:
+                        for _ in conn.execute(
+                                "SELECT kind,content FROM memories WHERE owner_id=? AND kind IN ("
+                                + ",".join("?" for _ in kinds) + ")", (value["owner_id"], *kinds)):
+                            pass
+                if time.perf_counter() >= preflight_deadline:
+                    raise TimeoutError("memory repair read preflight deadline exceeded")
+            except sqlite3.OperationalError as exc:
+                if time.perf_counter() >= preflight_deadline:
+                    raise TimeoutError("memory repair read preflight deadline exceeded") from exc
+                raise
+            finally:
+                conn.set_progress_handler(None, 0)
+                if conn.in_transaction:
+                    conn.execute("ROLLBACK")
+                conn.execute("PRAGMA query_only=OFF")
             deadline = time.perf_counter() + timeout_seconds
             conn.execute(f"PRAGMA busy_timeout={max(1, int(timeout_seconds * 1000))}")
             conn.set_progress_handler(lambda: int(time.perf_counter() >= deadline), 1000)

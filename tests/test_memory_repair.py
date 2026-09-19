@@ -139,7 +139,7 @@ def test_failure_after_inserts_rolls_back_and_retry(target, monkeypatch):
     assert counts(store)["memory_repair_receipts"] == 1
 
 
-def test_receipt_failure_rolls_back_episode_and_all_products(target):
+def test_receipt_failure_rolls_back_episode_and_all_products(target, repair_connections):
     import sqlite3
 
     store, episode, _, _ = target
@@ -388,7 +388,7 @@ def test_existing_repair_opener_does_not_create_missing_db(tmp_path):
     assert not path.exists()
 
 
-@pytest.mark.parametrize("phase", ["read", "after_insert", "before_commit"])
+@pytest.mark.parametrize("phase", ["schema", "read", "after_insert", "before_commit"])
 def test_repair_deadline_rolls_back_everything(target, monkeypatch, phase):
     from backend import memory_repair, memory_store
 
@@ -406,8 +406,18 @@ def test_repair_deadline_rolls_back_everything(target, monkeypatch, phase):
         pytest.fail("SQL progress handler did not interrupt")
 
     with monkeypatch.context() as patch:
-        if phase == "read":
-            patch.setattr(memory_repair, "read_source", lambda conn, *args: expire(conn))
+        if phase in {"schema", "read"}:
+            original = store._check_repair_schema if phase == "schema" else memory_repair.read_source
+
+            def slow_guarded_read(conn, *args):
+                if not conn.execute("PRAGMA query_only").fetchone()[0]:
+                    expire(conn)
+                return original(conn, *args)
+
+            if phase == "schema":
+                patch.setattr(store, "_check_repair_schema", slow_guarded_read)
+            else:
+                patch.setattr(memory_repair, "read_source", slow_guarded_read)
         elif phase == "after_insert":
             original = store._insert_memory
 
@@ -773,7 +783,7 @@ def test_complete_repair_source_plans_and_active_fence(target, owner, kind, payl
     assert "SEARCH JOBS USING INDEX IDX_JOBS_EPISODE" in historical
 
 
-def test_replay_does_not_repeat_source_or_duplicate_scans(target, monkeypatch):
+def test_replay_does_not_repeat_source_or_duplicate_scans(target, monkeypatch, repair_connections):
     from backend import memory_repair
 
     store, _, _, _ = target
@@ -784,4 +794,241 @@ def test_replay_does_not_repeat_source_or_duplicate_scans(target, monkeypatch):
         raise AssertionError("receipt replay must not scan source or duplicate memories")
 
     monkeypatch.setattr(memory_repair, "read_source", forbidden)
+    monkeypatch.setattr(memory_repair, "validate_result", forbidden)
     assert MemoryStore.open_existing_for_repair(store.path).apply_memory_repair(prepared) == receipt
+    statements = repair_connections[-1].statements
+    assert "BEGIN IMMEDIATE" in statements and "COMMIT" in statements
+    assert not any(sql.startswith("SELECT kind,content FROM memories") for sql in statements)
+
+
+@pytest.fixture
+def repair_connections(monkeypatch):
+    """Observe real SQLite handles, including cleanup before _connect closes them."""
+    import sqlite3
+
+    connections = []
+    original = sqlite3.connect
+
+    class Connection(sqlite3.Connection):
+        progress = None
+
+        def set_progress_handler(self, callback, steps):
+            self.progress = callback
+            return super().set_progress_handler(callback, steps)
+
+        def close(self):
+            try:
+                self.cleanup = (self.in_transaction, self.progress,
+                                self.execute("PRAGMA query_only").fetchone()[0])
+            finally:
+                super().close()
+
+    def connect(*args, **kwargs):
+        conn = original(*args, **kwargs, factory=Connection)
+        conn.statements = []
+        conn.set_trace_callback(conn.statements.append)
+        connections.append(conn)
+        return conn
+
+    monkeypatch.setattr(sqlite3, "connect", connect)
+    yield connections
+    for conn in connections:
+        assert conn.cleanup[:2] == (False, None)
+        if "PRAGMA cache_size=-16384" in conn.statements:
+            assert conn.cleanup[2] == 0
+        with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+            conn.execute("SELECT 1")
+
+
+def test_preflight_same_handle_full_reads_and_separate_budget(target, monkeypatch, repair_connections):
+    from backend import memory_repair, memory_store
+
+    store, _, _, _ = target
+    prepared = freeze(target)
+    original = memory_repair.read_source
+    clock, reads = [100.0], []
+    monkeypatch.setattr(memory_store.time, "perf_counter", lambda: clock[0])
+
+    def read(conn, *args):
+        query_only = conn.execute("PRAGMA query_only").fetchone()[0]
+        assert conn.in_transaction
+        assert conn.execute("PRAGMA cache_size").fetchone()[0] == -16384
+        reads.append((conn, query_only))
+        source = original(conn, *args)
+        if query_only:
+            # A real independent writer can acquire its lock during preflight.
+            with store._connect() as writer:
+                writer.execute("BEGIN IMMEDIATE")
+                writer.execute("ROLLBACK")
+            clock[0] += 2.0  # Beyond the unchanged guarded budget, below preflight's.
+        return source
+
+    monkeypatch.setattr(memory_repair, "read_source", read)
+    receipt = store.apply_memory_repair(prepared)
+    assert len(receipt["memory_ids"]) == 1
+    assert len(reads) == 2 and reads[0][0] is reads[1][0]
+    assert [query_only for _, query_only in reads] == [1, 0]
+    statements = reads[0][0].statements
+    split = statements.index("BEGIN IMMEDIATE")
+    before, after = statements[:split], statements[split:]
+    def duplicate(sql):
+        return sql.startswith("SELECT kind,content FROM memories")
+
+    assert [sql for sql in before if duplicate(sql)] == [sql for sql in after if duplicate(sql)]
+    assert sum(duplicate(sql) for sql in before) == 1
+    assert not any(sql.startswith(("INSERT", "UPDATE", "DELETE", "CREATE")) for sql in before)
+    assert before.index("ROLLBACK") < before.index("PRAGMA query_only=OFF")
+    with store._connect() as conn:
+        assert conn.execute("PRAGMA cache_size").fetchone()[0] != -16384
+
+
+@pytest.mark.parametrize("failure", ["sql_deadline", "python_deadline", "exception", "write"])
+def test_preflight_failure_is_read_only_and_cleans_up(target, monkeypatch, repair_connections, failure):
+    import sqlite3
+    from backend import memory_repair, memory_store
+
+    store, episode, _, _ = target
+    prepared = freeze(target)
+    before, episode_before, schema_before = counts(store), store.episode(episode), schema_state(store)
+    clock = [100.0]
+    original = memory_repair.read_source
+    monkeypatch.setattr(memory_store.time, "perf_counter", lambda: clock[0])
+
+    def fail(conn, *args):
+        assert conn.in_transaction and conn.execute("PRAGMA query_only").fetchone()[0] == 1
+        if failure == "exception":
+            raise RuntimeError("preflight failure")
+        if failure == "write":
+            conn.execute("CREATE TABLE forbidden_preflight_write(value)")
+        source = original(conn, *args)
+        clock[0] += 6.0
+        if failure == "sql_deadline":
+            conn.execute("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<10000) "
+                         "SELECT sum(x) FROM n").fetchone()
+            pytest.fail("SQL preflight progress handler did not interrupt")
+        return source
+
+    error, message = ((RuntimeError, "preflight failure") if failure == "exception" else
+                      (sqlite3.OperationalError, "readonly") if failure == "write" else
+                      (TimeoutError, "read preflight deadline"))
+    with monkeypatch.context() as patch:
+        patch.setattr(memory_repair, "read_source", fail)
+        with pytest.raises(error, match=message):
+            store.apply_memory_repair(prepared)
+    assert "BEGIN IMMEDIATE" not in repair_connections[-1].statements
+    assert counts(store) == before
+    assert store.episode(episode) == episode_before
+    assert schema_state(store) == schema_before
+    store.apply_memory_repair(prepared)
+    assert counts(store)["memory_repair_receipts"] == 1
+
+
+@pytest.mark.parametrize("change", ["evidence", "active_job", "orphan", "duplicate"])
+def test_commit_rechecks_changes_after_preflight(target, monkeypatch, repair_connections, change):
+    store, episode, evidence, _ = target
+    prepared = freeze(target)
+    other = MemoryStore.open_existing_for_repair(store.path)
+    original = store._check_repair_schema
+    calls, expected = [], {}
+
+    def check(conn):
+        calls.append(conn.execute("PRAGMA query_only").fetchone()[0])
+        if len(calls) == 2:
+            assert not conn.in_transaction and calls == [1, 0]
+            if change == "evidence":
+                with other._write_tx() as writer:
+                    writer.execute("UPDATE evidence SET content='concurrent change' WHERE id=?", (evidence,))
+            elif change == "active_job":
+                other.enqueue("cross_episode_dream", {"episode_ids": [episode]}, owner_id="owner")
+            else:
+                other.create_memory("owner", "fact", prepared["result"]["memories"][0]["content"],
+                                    status="deleted", sources=[] if change == "orphan" else [
+                                        {"source_type": "episode", "source_id": "another-episode"}])
+            expected.update(counts=counts(other), episode=other.episode(episode))
+        return original(conn)
+
+    monkeypatch.setattr(store, "_check_repair_schema", check)
+    with pytest.raises(RepairConflict, match="duplicate existing" if change == "duplicate" else "snapshot changed"):
+        store.apply_memory_repair(prepared)
+    assert calls == [1, 0]
+    assert counts(store) == expected["counts"]
+    assert counts(store)["memory_repair_receipts"] == 0
+    assert store.episode(episode) == expected["episode"]
+    apply_conn = next(conn for conn in repair_connections if "PRAGMA cache_size=-16384" in conn.statements)
+    assert "BEGIN IMMEDIATE" in apply_conn.statements
+    assert not any(sql.startswith(("INSERT", "UPDATE", "DELETE")) for sql in apply_conn.statements)
+
+
+def test_repair_writer_contention_keeps_short_guard_and_retries(target, repair_connections):
+    import sqlite3
+
+    store, episode, _, _ = target
+    prepared = freeze(target)
+    before, episode_before = counts(store), store.episode(episode)
+    with store._connect() as writer:
+        writer.execute("BEGIN IMMEDIATE")
+        with pytest.raises((TimeoutError, sqlite3.OperationalError)):
+            store.apply_memory_repair(prepared, timeout_seconds=0.02)
+        apply_conn = repair_connections[-1]
+        assert "PRAGMA busy_timeout=20" in apply_conn.statements
+        assert "BEGIN IMMEDIATE" in apply_conn.statements and "COMMIT" not in apply_conn.statements
+        writer.execute("ROLLBACK")
+    assert counts(store) == before
+    assert store.episode(episode) == episode_before
+    store.apply_memory_repair(prepared)
+    assert counts(store)["memory_repair_receipts"] == 1
+
+
+@pytest.mark.parametrize("damage", ["digest", "key", "owner", "result"])
+def test_malformed_preflight_never_writes_or_migrates(target, repair_connections, damage):
+    store, episode, _, _ = target
+    prepared = freeze(target)
+    before, episode_before, schema_before = counts(store), store.episode(episode), schema_state(store)
+    if damage == "digest":
+        prepared["prepared_fingerprint"] = "invalid"
+    else:
+        if damage == "key":
+            prepared["repair_key"] = "invalid"
+        elif damage == "owner":
+            del prepared["owner_id"]
+        else:
+            prepared["result"]["memories"][0]["kind"] = "invalid"
+        reseal(prepared)
+    repair_connections.clear()
+    with pytest.raises((RepairConflict, KeyError)):
+        store.apply_memory_repair(prepared)
+    assert not any(sql.startswith(("INSERT", "UPDATE", "DELETE", "CREATE", "ALTER", "BEGIN IMMEDIATE",
+                                  "SELECT kind,content FROM memories"))
+                   for conn in repair_connections for sql in conn.statements)
+    assert counts(store) == before
+    assert store.episode(episode) == episode_before
+    assert schema_state(store) == schema_before
+
+
+@pytest.mark.parametrize("missing", [False, True])
+def test_read_only_repair_fails_closed_before_connect(target, tmp_path, monkeypatch, missing):
+    store, _, _, _ = target
+    prepared = freeze(target)
+    path = tmp_path / "never-created.sqlite" if missing else store.path
+    readonly = MemoryStore(path, read_only=True)
+
+    def forbidden():
+        raise AssertionError("read-only repair must not open or change connection flags")
+
+    monkeypatch.setattr(readonly, "_connect", forbidden)
+    with pytest.raises(RepairConflict, match="writable store"):
+        readonly.apply_memory_repair(prepared)
+    assert path.exists() is not missing
+    assert counts(store)["memory_repair_receipts"] == 0
+
+
+def test_repair_preflight_does_not_recreate_removed_database(target):
+    import sqlite3
+
+    store, _, _, _ = target
+    prepared = freeze(target)
+    existing = MemoryStore.open_existing_for_repair(store.path)
+    store.path.unlink()
+    with pytest.raises(sqlite3.OperationalError):
+        existing.apply_memory_repair(prepared)
+    assert not store.path.exists()
