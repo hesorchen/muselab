@@ -16,7 +16,6 @@ Task
 TaskCreate
 TaskGet
 TaskList
-TaskOutput
 TaskStop
 TaskUpdate
 WebFetch

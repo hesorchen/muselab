@@ -6,7 +6,31 @@ muselab 通过**本地 Anthropic 兼容网关**支持 Codex 后端模型。网�
 
 muselab **不保存 Codex OAuth 凭据**，也**不直接调用 OpenAI 原生接口**。
 
-当前固定运行时：Claude Agent SDK `0.2.152`，内置 Claude CLI `2.1.259`。
+当前固定运行时：Claude Agent SDK `0.2.157`，内置 Claude CLI `2.1.277`。
+
+### 共用项目规则
+
+内置 CLI 已包含原生 `AGENTS.md` 支持，但加载仍取决于 CLI 功能开关和会话配置，
+升级 SDK 不代表所有 Gateway 会话都会启用。默认模式会优先使用当前目录及父目录中的
+项目 `CLAUDE.md`／`CLAUDE.local.md`。
+
+要让不同工具和会话共用同一份正文，将规则保存为 `AGENTS.md`，并保留同目录的
+`CLAUDE.md`，内容只有一行 `@AGENTS.md`。引用由 SDK 自己加载，原生 AGENTS 加载
+不可用时也能生效。Claude 的全局用户规则仍以 `~/.claude/CLAUDE.md` 作为引用入口；
+迁移项目规则时不要覆盖其他工具已有的全局规则。
+
+离线探针检查实际模型请求是否包含测试规则，不记录请求正文：
+
+```bash
+uv run python scripts/probe-checkpoint-offline.py --instructions import
+```
+
+换成 `--instructions agents` 可检查原生加载；规则未加载时返回非零退出码。此探针
+关闭遥测和功能开关拉取，因此即使 CLI 版本达标，原生加载也可能不可用。探针只使用
+临时文件和 loopback 模型，不读取真实凭据。
+
+参见[Claude Code 规则加载文档](https://code.claude.com/docs/en/memory#agentsmd)。
+
 仓库兼容性测试检查这组 pin。下面带日期的真实 Gateway 验证记录单独保留，
 不代表每次依赖更新后都重新验证了全部 provider。
 
