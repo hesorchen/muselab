@@ -448,6 +448,74 @@ def test_repair_index_migration_is_separate_and_idempotent(target):
     MemoryStore.open_existing_for_repair(store.path)
 
 
+@pytest.mark.parametrize("status", ["active", "pending_review", "superseded", "deleted"])
+@pytest.mark.parametrize("orphan_owner", ["owner", "other"])
+def test_owner_wide_orphans_match_legacy_fingerprint(target, status, orphan_owner):
+    from backend.memory_repair import check_target, read_source
+
+    store, episode, evidence, job = target
+    assistant = store.add_evidence("owner", "unrelated", "assistant", "Other evidence")
+    foreign = store.add_evidence("other", "unrelated", "user", "Foreign evidence")
+    source_cases = [
+        ("episode", episode, "derived_from"),
+        ("episode", "missing-episode", "supports"),
+        ("evidence", evidence, "supports"),
+        ("evidence", assistant, "contradicts"),
+        ("evidence", foreign, "custom-relation"),
+        ("evidence", "missing-evidence", "derived_from"),
+        ("custom-type", "missing-source", "custom-relation"),
+    ]
+    for source_type, source_id, relation in source_cases:
+        source = {"source_type": source_type, "source_id": source_id, "relation": relation}
+        # Repeated memory_id values on the RHS, including different relations;
+        # even dangling or nonstandard provenance means the row is not orphaned.
+        store.create_memory("owner", "fact", "Sourced memory", status=status,
+                            sources=[source, source, {**source, "relation": "another-relation"}])
+    store.create_memory("other", "fact", "Foreign sourced memory", status=status,
+                        sources=[{"source_type": "evidence", "source_id": "missing-evidence"}])
+    orphan_ids = [store.create_memory(orphan_owner, kind, "Unattributed memory", status=status)["id"]
+                  for kind in ("fact", "preference", "decision", "state", "episode")]
+    with store._connect() as conn:
+        conn.execute("PRAGMA query_only=ON")
+        snapshot = read_source(conn, "owner", episode)
+        legacy_orphans = [dict(row) for row in conn.execute(
+            "SELECT m.id FROM memories m WHERE owner_id=? AND NOT EXISTS "
+            "(SELECT 1 FROM memory_sources s WHERE s.memory_id=m.id) ORDER BY m.id", ("owner",))]
+        assert read_source(conn, "owner", episode) == snapshot
+    expected = [{"id": memory_id} for memory_id in sorted(orphan_ids)] if orphan_owner == "owner" else []
+    assert snapshot["orphans"] == legacy_orphans == expected
+    assert snapshot["blocked"] == (["unattributed_memories"] if expected else [])
+    legacy_snapshot = {**snapshot, "orphans": legacy_orphans}
+    assert fingerprint(snapshot) == fingerprint(legacy_snapshot)
+    if expected:
+        for mode in ("full", "summary-only"):
+            with pytest.raises(RepairConflict, match="unattributed_memories"):
+                check_target(snapshot, mode, [job])
+    else:
+        prepared = stage_repair(snapshot, mode="summary-only", job_ids=[job], result={
+            "episode": {"title": "Widgets", "summary": "Blue widgets."}, "memories": []})
+        assert prepared["source_fingerprint"] == fingerprint(legacy_snapshot)
+
+
+def test_orphan_query_scans_sources_without_correlated_seeks(target):
+    from backend.memory_repair import read_source
+
+    store, episode, _, _ = target
+    statements = []
+    with store._connect() as conn:
+        conn.execute("PRAGMA query_only=ON")
+        conn.set_trace_callback(statements.append)
+        read_source(conn, "owner", episode)
+        conn.set_trace_callback(None)
+        orphan_sql = next(sql for sql in statements if sql.startswith(
+            ("SELECT m.id FROM memories", "SELECT id FROM memories")))
+        plan = " ".join(row[3].upper() for row in conn.execute("EXPLAIN QUERY PLAN " + orphan_sql))
+    # Per-memory indexed seeks can exhaust the repair deadline on slow local
+    # storage; assert the access pattern rather than a flaky wall-clock budget.
+    assert "CORRELATED" not in plan
+    assert "SCAN MEMORY_SOURCES" in plan
+
+
 def test_repair_source_and_job_queries_use_migrated_indexes(target):
     store, episode, _, _ = target
     with store._connect() as conn:

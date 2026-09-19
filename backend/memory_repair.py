@@ -49,9 +49,10 @@ def read_source(conn, owner_id: str, episode_id: str) -> dict:
         "SELECT * FROM jobs WHERE json_extract(payload_json,'$.episode_id')=? "
         "ORDER BY id", (episode_id,))
     # Owner-wide source-less rows cannot safely be attributed to this episode.
+    # Scan sources once rather than seeking once per owner memory.
     orphans = rows(
-        "SELECT m.id FROM memories m WHERE owner_id=? AND NOT EXISTS "
-        "(SELECT 1 FROM memory_sources s WHERE s.memory_id=m.id) ORDER BY m.id",
+        "SELECT id FROM memories WHERE owner_id=? EXCEPT "
+        "SELECT memory_id FROM memory_sources ORDER BY 1",
         (owner_id,))
     artifacts = rows(
         "SELECT a.* FROM artifacts a WHERE EXISTS "
