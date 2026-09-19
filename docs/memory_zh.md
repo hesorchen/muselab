@@ -122,6 +122,22 @@ Dreamer 的 JSON 解析与业务字段校验共用最多两次生成调用；标
 
 上述命令都必须指定 `--db` 和 `--manifest`。先在一致性副本验证，再应用到已完成本版本 schema 迁移的 Registry；apply 自身不执行全库迁移。生成产物包含私有记忆，不应提交 Git 或公开上传。索引任务入队不等于索引已生效，还需等待 Worker 完成并验证真实召回。
 
+已有 Registry 完成基础 repair 迁移后，可单独补充覆盖索引，不调用普通构造器：
+
+```python
+from pathlib import Path
+from backend.memory_store import MemoryStore
+MemoryStore.migrate_existing_repair_indexes(Path("/absolute/path/to/registry.sqlite3"),
+                                           timeout_seconds=30)
+```
+
+先在私有一致性副本演练同一调用。此入口只打开已有数据库，在同一事务添加
+`artifacts(source_episode_ids_json,id)`、`memories(owner_id,kind,content)` 和迁移 marker；
+不重建 FTS、不回填召回统计，缺少基础 schema 时拒绝执行。SQL 中断或提交前超时会整体回滚，
+解决锁竞争后可重试。apply/replay 要求两个索引及 marker 存在，但不会自行迁移；逐项 apply
+默认仍为 0.5 秒。SQLite progress handler 无法抢占阻塞磁盘 I/O 或 commit/fsync，因此
+30 秒迁移预算与离线耗时都不代表生产冷缓存墙钟上限。
+
 ## 异机验收
 
 不需要在开发机启动服务。部署机更新依赖后，可依次执行：

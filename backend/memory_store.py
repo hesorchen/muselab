@@ -289,8 +289,21 @@ class MemoryStore:
         store._read_only = False
         return store
 
+    @classmethod
+    def migrate_existing_repair_indexes(cls, path: Path, *, timeout_seconds: float = 30) -> None:
+        """Add only repair covering indexes to an already migrated, existing DB.
+
+        No initialization, FTS rebuild or recall-stat backfill. Rehearse on a
+        private snapshot first; apply itself must never invoke this migration.
+        """
+        store = cls(path, read_only=True)
+        store._existing_only = True
+        store._read_only = False
+        with store._connect() as conn:
+            store._migrate_repair_covering_indexes(conn, timeout_seconds=timeout_seconds)
+
     @staticmethod
-    def _check_repair_schema(conn) -> None:
+    def _check_repair_schema(conn, *, require_covering: bool = True) -> None:
         from .memory_repair import RepairConflict
 
         required = {table: set(columns) for table, columns, _ in _SNAPSHOT_TABLES
@@ -312,13 +325,17 @@ class MemoryStore:
                 raise RepairConflict(f"repair schema missing columns/table: {table}; migrate separately")
         indexes = {row["name"] for row in conn.execute(
             "SELECT name FROM sqlite_master WHERE type='index'")}
-        if not {"idx_memory_sources_source", "idx_jobs_episode", "idx_jobs_claim",
-                "idx_memories_owner_id"} <= indexes:
+        required_indexes = {"idx_memory_sources_source", "idx_jobs_episode", "idx_jobs_claim",
+                            "idx_memories_owner_id"}
+        required_markers = {"memory-recall-stats-v1", "memory-repair-indexes-v1"}
+        if require_covering:
+            required_indexes.update({"idx_artifacts_source_episodes_id",
+                                     "idx_memories_owner_kind_content"})
+            required_markers.add("memory-repair-covering-indexes-v1")
+        if not required_indexes <= indexes:
             raise RepairConflict("repair indexes missing; migrate separately")
-        markers = {row["name"] for row in conn.execute(
-            "SELECT name FROM memory_migrations WHERE name IN (?,?)",
-            ("memory-recall-stats-v1", "memory-repair-indexes-v1"))}
-        if (len(markers) != 2 or int(conn.execute("PRAGMA user_version").fetchone()[0])
+        markers = {row["name"] for row in conn.execute("SELECT name FROM memory_migrations")}
+        if (not required_markers <= markers or int(conn.execute("PRAGMA user_version").fetchone()[0])
                 < _FTS_SCHEMA_VERSION):
             raise RepairConflict("repair migration markers missing; migrate separately")
 
@@ -542,6 +559,7 @@ class MemoryStore:
             self._migrate_fts(conn)
             self._migrate_recall_stats(conn)
             self._migrate_repair_indexes(conn)
+            self._migrate_repair_covering_indexes(conn)
 
     @staticmethod
     def _migrate_repair_indexes(conn: sqlite3.Connection) -> None:
@@ -562,6 +580,48 @@ class MemoryStore:
             if conn.in_transaction:
                 conn.execute("ROLLBACK")
             raise
+
+    @staticmethod
+    def _migrate_repair_covering_indexes(conn: sqlite3.Connection, *,
+                                         timeout_seconds: float = 30) -> None:
+        """Marker-controlled, additive DDL with a separate migration deadline."""
+        if not 0 < timeout_seconds <= 30:
+            raise ValueError("repair index migration timeout must be positive and at most 30 seconds")
+        name = "memory-repair-covering-indexes-v1"
+        deadline = time.perf_counter() + timeout_seconds
+        busy_timeout = conn.execute("PRAGMA busy_timeout").fetchone()[0]
+        conn.execute(f"PRAGMA busy_timeout={max(1, min(50, int(timeout_seconds * 1000)))}")
+        conn.set_progress_handler(lambda: int(time.perf_counter() >= deadline), 1000)
+        try:
+            if conn.execute("SELECT 1 FROM memory_migrations WHERE name=?", (name,)).fetchone():
+                MemoryStore._check_repair_schema(conn)
+                if time.perf_counter() >= deadline:
+                    raise TimeoutError("memory repair index migration deadline exceeded")
+                return
+            MemoryStore._check_repair_schema(conn, require_covering=False)
+            if time.perf_counter() >= deadline:
+                raise TimeoutError("memory repair index migration deadline exceeded")
+            conn.execute("BEGIN IMMEDIATE")
+            if not conn.execute("SELECT 1 FROM memory_migrations WHERE name=?", (name,)).fetchone():
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_artifacts_source_episodes_id "
+                             "ON artifacts(source_episode_ids_json,id)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_memories_owner_kind_content "
+                             "ON memories(owner_id,kind,content)")
+                conn.execute("INSERT INTO memory_migrations(name,applied_at) VALUES (?,?)",
+                             (name, _now()))
+            MemoryStore._check_repair_schema(conn)
+            if time.perf_counter() >= deadline:
+                raise TimeoutError("memory repair index migration deadline exceeded")
+            conn.execute("COMMIT")
+        except sqlite3.OperationalError as exc:
+            if time.perf_counter() >= deadline:
+                raise TimeoutError("memory repair index migration deadline exceeded") from exc
+            raise
+        finally:
+            conn.set_progress_handler(None, 0)
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            conn.execute(f"PRAGMA busy_timeout={busy_timeout}")
 
     @staticmethod
     def _migrate_columns(conn: sqlite3.Connection) -> None:

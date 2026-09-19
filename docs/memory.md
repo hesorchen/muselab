@@ -124,6 +124,26 @@ migrations. Prepared files contain private memory and must not enter Git or publ
 attachments. An enqueued index job is not proof of indexing: wait for the worker
 and verify actual recall.
 
+For an existing Registry that already has the baseline repair migrations, add the
+repair covering indexes separately, without invoking the normal constructor:
+
+```python
+from pathlib import Path
+from backend.memory_store import MemoryStore
+MemoryStore.migrate_existing_repair_indexes(Path("/absolute/path/to/registry.sqlite3"),
+                                           timeout_seconds=30)
+```
+
+This existing-file-only, marker-controlled migration adds only
+`artifacts(source_episode_ids_json,id)` and `memories(owner_id,kind,content)` in one
+transaction. It does not rebuild FTS or backfill recall statistics. Rehearse the
+same call on a private snapshot first; missing baseline schema is refused. A SQL
+interruption or expiry before commit rolls back indexes and marker together;
+retry after resolving contention. Apply/replay require both indexes and the marker
+but never create them. The per-item apply deadline remains 0.5 seconds. SQLite
+progress callbacks cannot preempt blocked disk I/O or commit/fsync, so neither the
+30-second migration budget nor offline timings guarantee cold-storage wall time.
+
 ### Recall latency and diagnostics
 
 Recall uses read-only connections to the WAL registry. Lexical retrieval has a
