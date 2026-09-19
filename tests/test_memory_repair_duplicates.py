@@ -5,7 +5,8 @@ import sqlite3
 import pytest
 
 from tests import test_memory_repair as helpers
-from tests.test_memory_repair import current_backend_modules, target
+current_backend_modules = helpers.current_backend_modules
+target = helpers.target
 
 
 def other_target(store, owner="owner"):
