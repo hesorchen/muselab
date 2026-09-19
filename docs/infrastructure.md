@@ -200,6 +200,7 @@ Weekly uv bumps (grouped: `claude-agent-sdk`/`anthropic*` in one PR; `fastapi`/`
 | Package | Constraint | Rationale |
 |---------|-----------|-----------|
 | `claude-agent-sdk` | `==0.2.157` | Exact pin: SDK, bundled CLI, tool policy and transcript contracts are validated together. |
+| `anyio` | `>=4.14.2` | Security floor for TLS hostname validation and process-worker fixes. |
 | `starlette` | `>=1.3.1` | Explicitly constrained to a security-fixed release. |
 | `pyjwt[crypto]` | `>=2.13.0` | Pinned above the mcp-transitive 2.12.1 (PYSEC-2026-175/177/178/179). |
 
