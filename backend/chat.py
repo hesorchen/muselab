@@ -6680,7 +6680,7 @@ class _TurnResponseBoundary:
         self.nonhuman_origin_active = False
 
     def classify(self, msg: Any) -> str:
-        """Return ``forward``, ``current_result``, ``drop`` or ``stale_result``.
+        """Classify payload provisionally; Result origin resolves its owner.
 
         Lifecycle/rate-limit events are intentionally out-of-band and always
         pass through: a late TaskNotification still needs to settle the old
@@ -6701,17 +6701,11 @@ class _TurnResponseBoundary:
             return "stale_result" if isinstance(msg, ResultMessage) else "drop"
 
         origin = sdk_lifecycle.normalize_origin(getattr(msg, "origin", None))
-        if isinstance(msg, UserMessage) and origin is not None:
-            self.nonhuman_origin_active = origin["kind"] != "human"
-            if self.nonhuman_origin_active:
-                return "background"
-        if self.nonhuman_origin_active:
-            if isinstance(msg, ResultMessage):
-                self.nonhuman_origin_active = False
-                return "background_result"
-            return "background"
-
         if isinstance(msg, ResultMessage):
+            # A notification can be absorbed into the current query instead of
+            # starting a separate turn. Only this Result's own origin identifies
+            # the completed query; a preceding UserMessage cannot override it.
+            self.nonhuman_origin_active = False
             # ``origin=None`` is the current SDK shape for an ordinary
             # client.query(prompt); preserve that compatibility. Any explicit
             # non-human/future origin belongs to a side delivery and cannot
@@ -6728,6 +6722,11 @@ class _TurnResponseBoundary:
             # result fixture on every call.
             self.saw_current_payload = True
             return "current_result"
+
+        if isinstance(msg, UserMessage) and origin is not None:
+            self.nonhuman_origin_active = origin["kind"] != "human"
+        if self.nonhuman_origin_active:
+            return "background"
 
         self.saw_current_payload = True
         return "forward"
@@ -17876,33 +17875,10 @@ async def _start_turn(
                 replay_dropped = 0
                 deferred_result: ResultMessage | None = None
                 background_messages: list[Any] = []
+                pending_origin_messages: list[Any] = []
 
-                async def _dispatch(msg) -> str:
-                    """Classify one message and forward it to the turn."""
-                    nonlocal replay_dropped, deferred_result
-                    if isinstance(msg, CommandLifecycleMessage):
-                        terminal = await _settle_steering_lifecycle(
-                            broadcast, msg)
-                        if (
-                            terminal
-                            and not broadcast.steering_commands
-                            and deferred_result is not None
-                        ):
-                            final_result = deferred_result
-                            deferred_result = None
-                            broadcast.result_forwarded = True
-                            broadcast.active_tool_use_ids.clear()
-                            await merge_q.put(("claude", final_result))
-                            return "current_result"
-                        return "forward"
-                    decision = boundary.classify(msg)
-                    if decision in ("drop", "stale_result"):
-                        replay_dropped += 1
-                        return decision
-                    if decision in ("background", "background_result"):
-                        background_messages.append(msg)
-                        return decision
-
+                async def _forward_turn_message(msg, decision: str) -> str:
+                    nonlocal deferred_result
                     # Keep an exact, live view of tool execution. The native
                     # priority=next queue consumes at PostToolBatch; these IDs
                     # are also useful to explain why a command is still
@@ -17943,6 +17919,69 @@ async def _start_turn(
                     await merge_q.put(("claude", msg))
                     return decision
 
+                async def _dispatch(msg) -> str:
+                    """Resolve notification payload at its SDK Result boundary."""
+                    nonlocal replay_dropped, deferred_result
+                    if isinstance(msg, CommandLifecycleMessage):
+                        terminal = await _settle_steering_lifecycle(
+                            broadcast, msg)
+                        if (
+                            terminal
+                            and not broadcast.steering_commands
+                            and deferred_result is not None
+                        ):
+                            final_result = deferred_result
+                            deferred_result = None
+                            broadcast.result_forwarded = True
+                            broadcast.active_tool_use_ids.clear()
+                            await merge_q.put(("claude", final_result))
+                            return "current_result"
+                        return "forward"
+                    decision = boundary.classify(msg)
+                    if decision in ("drop", "stale_result"):
+                        replay_dropped += 1
+                        return decision
+                    if decision in ("current_result", "background_result"):
+                        if pending_origin_messages:
+                            resolved = list(pending_origin_messages)
+                            pending_origin_messages.clear()
+                            origin = sdk_lifecycle.normalize_origin(
+                                getattr(msg, "origin", None))
+                            obs.perf_event(
+                                "chat.sdk_delivery_resolved",
+                                sid8=session_id[:8], turn8=broadcast.turn_id[:8],
+                                owner=("current" if decision == "current_result"
+                                       else "background"),
+                                origin_kind=origin["kind"] if origin else "none",
+                                messages=len(resolved),
+                            )
+                            if decision == "current_result":
+                                # Preserve deltas, tool results and final text in
+                                # order before done. The normal user handler also
+                                # settles task XML without rendering it as text.
+                                for index, pending in enumerate(resolved, 1):
+                                    await _forward_turn_message(pending, "forward")
+                                    if index % 64 == 0:
+                                        # Match the SDK pump's cooperative drain;
+                                        # a long fold must not flood merge_q.
+                                        await asyncio.sleep(0)
+                            else:
+                                background_messages.extend(resolved)
+                        if decision == "background_result":
+                            background_messages.append(msg)
+                            return decision
+                    elif decision == "background" or (
+                        pending_origin_messages
+                        and isinstance(msg, boundary._TURN_TYPES)
+                        and not isinstance(msg, boundary._LIFECYCLE_TYPES)
+                    ):
+                        # A human steering message can also be folded into the
+                        # same query. Keep ordering until Result resolves the
+                        # owner; task/rate-limit lifecycle remains out-of-band.
+                        pending_origin_messages.append(msg)
+                        return "background"
+                    return await _forward_turn_message(msg, decision)
+
                 stream = _stream_for(client)
                 if stream is not None:
                     # Attach BEFORE query(): query() yields to the transport,
@@ -17979,6 +18018,8 @@ async def _start_turn(
                         finally:
                             # Cancellation must also complete queue ownership
                             # transfer before this producer can disappear.
+                            background_messages.extend(pending_origin_messages)
+                            pending_origin_messages.clear()
                             await stream.release_turn(turn_q, background_messages)
                 else:
                     # No pump: this client was not created through get_client
