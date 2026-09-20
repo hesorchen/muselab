@@ -611,12 +611,12 @@ class FileWatchManager:
 
     async def unregister_workspace(self, root: Path):
         """Atomically remove registry, watcher, and durable index state."""
-        resolved_root = self._resolved_lifecycle_root(root)
+        registered_root = Path(registry.entry_for_removal(root).path)
         lifecycle_lock = self._lifecycle_locks.setdefault(
-            resolved_root, asyncio.Lock())
+            registered_root, asyncio.Lock())
         async with lifecycle_lock:
-            entry = registry.entry_for(resolved_root)
-            registry.remove(resolved_root)
+            entry = registry.entry_for_removal(registered_root)
+            registry.remove(registered_root)
             await self._remove_workspace_serialized(entry.id)
             return entry
 
