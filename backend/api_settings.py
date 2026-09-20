@@ -129,6 +129,13 @@ class SettingsIn(BaseModel):
 _ENV_WRITE_LOCK = threading.RLock()
 
 
+
+def _dotenv_value(value: str) -> str:
+    """Quote dotenv syntax without changing the value loaded at startup."""
+    if not re.search(r"""[\s'"]""", value):
+        return value
+    return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
+
 def _write_env(updates: dict[str, str]) -> None:
     """Atomically merge updates into .env. Keys with empty-string value get
     written as `KEY=` (allowed); to actually remove a key, pass None and we
@@ -169,7 +176,7 @@ def _write_env(updates: dict[str, str]) -> None:
                 if new_v is None:
                     # drop line entirely
                     continue
-                out.append(f"{key}={new_v}")
+                out.append(f"{key}={_dotenv_value(new_v)}")
                 written.add(key)
             else:
                 out.append(line)
@@ -178,7 +185,7 @@ def _write_env(updates: dict[str, str]) -> None:
         for k, v in updates.items():
             if v is None or k in written:
                 continue
-            out.append(f"{k}={v}")
+            out.append(f"{k}={_dotenv_value(v)}")
 
         # Atomic write via temp + rename.
         fd, tmp = tempfile.mkstemp(prefix=".env.", dir=str(ENV_PATH.parent))
