@@ -408,6 +408,52 @@ def load_subagent_threads(
     return threads
 
 
+def inherit_subagent_threads(
+    own_threads: list[SubagentThread],
+    ancestor_threads: list[SubagentThread],
+    parent_tool_use_ids: set[str],
+) -> list[SubagentThread]:
+    """Attach ancestor timelines only through cards inherited by a successor.
+
+    Callers supply ancestors nearest first. Preserve SDK owner ids and blocks;
+    this is a read-only projection, never a copy of SDK-owned transcripts.
+    """
+    output = list(own_threads)
+    reachable = set(parent_tool_use_ids)
+    seen = {
+        (thread.get("parent_tool_use_id"), thread.get("agent_id"))
+        for thread in own_threads
+    }
+
+    def include_children(thread: SubagentThread) -> None:
+        for block in thread.get("blocks", []):
+            if (block.get("role") == "tool_use"
+                    and block.get("name") in {"Agent", "Task"}
+                    and block.get("id")):
+                reachable.add(str(block["id"]))
+
+    for thread in own_threads:
+        if not thread.get("orphaned"):
+            include_children(thread)
+    pending = list(ancestor_threads)
+    while pending:
+        deferred = []
+        for thread in pending:
+            key = (thread.get("parent_tool_use_id"), thread.get("agent_id"))
+            if thread.get("orphaned") or key in seen:
+                continue
+            if not key[0] or key[0] not in reachable:
+                deferred.append(thread)
+                continue
+            seen.add(key)
+            output.append(thread)
+            include_children(thread)
+        if len(deferred) == len(pending):
+            break
+        pending = deferred
+    return output
+
+
 def _utf16_length(value: str) -> int:
     """Return JavaScript ``String.length`` units for an SSE text offset."""
     return len(value.encode("utf-16-le")) // 2

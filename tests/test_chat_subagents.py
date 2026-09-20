@@ -395,3 +395,93 @@ def test_history_endpoint_rejects_unknown_session(client, auth):
         headers=auth,
     )
     assert response.status_code == 404
+
+
+def test_successor_history_inherits_only_attached_ancestor_threads(
+    app_module, client, auth, monkeypatch,
+):
+    from copy import deepcopy
+    from backend import chat as chat_mod
+    from backend import sessions as sess
+
+    source = sess.create_session("source")["id"]
+    child = sess.create_session("successor")["id"]
+    future = sess.create_session("later successor")["id"]
+    assert sess.link_runtime_successor(source, child)
+    assert sess.link_runtime_successor(child, future)
+
+    def thread(owner, agent, parent, blocks=(), orphaned=False):
+        return {
+            "session_id": owner, "agent_id": agent,
+            "parent_tool_use_id": parent, "parent_agent_id": None,
+            "orphaned": orphaned, "message_count": len(blocks),
+            "blocks": list(blocks),
+        }
+
+    root = thread(source, "old-agent", "copied-call", [{
+        "role": "tool_use", "name": "Agent", "id": "nested-call",
+        "block_id": "nested-launch", "session_id": source,
+    }])
+    nested = thread(source, "nested-agent", "nested-call", [{
+        "role": "assistant", "text": "nested progress", "block_id": "nested-text",
+        "session_id": source,
+    }])
+    own = thread(child, "own-agent", "own-call")
+    inherited = [
+        nested, root,
+        thread(source, "after-fork-agent", "uncopied-call"),
+        thread(source, "orphan-agent", None, orphaned=True),
+        # A copied subagent transcript must not duplicate the child-owned one.
+        thread(source, "own-agent", "own-call"),
+    ]
+    before = deepcopy(inherited)
+    calls = []
+
+    def load(owner, directory=None):
+        calls.append(owner)
+        assert owner in {source, child}, "must not read descendant sessions"
+        return [own] if owner == child else inherited
+
+    monkeypatch.setattr(chat_mod.chat_subagents, "load_subagent_threads", load)
+    monkeypatch.setattr(chat_mod, "_shaped_ui_messages", lambda *a, **k: [
+        {"role": "tool_use", "name": "Agent", "id": "copied-call"},
+        {"role": "tool_use", "name": "Agent", "id": "own-call"},
+    ])
+    result = client.get(f"/api/chat/sessions/{child}/subagents", headers=auth)
+    assert result.status_code == 200
+    assert result.json() == {"session_id": child, "threads": [own, root, nested]}
+    assert calls == [child, source]
+    assert inherited == before
+
+
+def test_successor_history_refresh_reads_growing_ancestor_transcript(
+    app_module, client, auth, monkeypatch,
+):
+    from backend import chat as chat_mod
+    from backend import sessions as sess
+
+    source = sess.create_session("source")["id"]
+    child = sess.create_session("successor")["id"]
+    assert sess.link_runtime_successor(source, child)
+    blocks = [{"role": "assistant", "text": "started", "block_id": "start"}]
+
+    def load(owner, directory=None):
+        if owner == child:
+            return []
+        return [{
+            "session_id": source, "agent_id": "running-agent",
+            "parent_tool_use_id": "copied-call", "orphaned": False,
+            "blocks": list(blocks), "message_count": len(blocks),
+        }]
+
+    monkeypatch.setattr(chat_mod.chat_subagents, "load_subagent_threads", load)
+    monkeypatch.setattr(chat_mod, "_shaped_ui_messages", lambda *a, **k: [
+        {"role": "tool_use", "name": "Agent", "id": "copied-call"},
+    ])
+    url = f"/api/chat/sessions/{child}/subagents"
+    first = client.get(url, headers=auth).json()
+    assert first["threads"][0]["blocks"] == blocks
+    blocks.append({"role": "tool_result", "text": "finished read", "block_id": "result"})
+    second = client.get(url, headers=auth).json()
+    assert len(first["threads"][0]["blocks"]) == 1
+    assert second["threads"][0]["blocks"] == blocks
