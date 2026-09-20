@@ -8962,6 +8962,7 @@ function portal() {
         subagentThreads: [],
         subagentsLoading: false,
         subagentsLoaded: false,
+        subagentsHydratedAt: 0,
         subagentGeneration: 0,
         hookTraces: [],
         hookTracesLoading: false,
@@ -11027,6 +11028,16 @@ function portal() {
         return false;
       }
       if (!status) { again(); return false; }
+      // The predecessor owns its live SDK stream. Refresh inherited timelines
+      // separately from parent-history revisions, including while the child
+      // is answering a new prompt. Reuse this poller with a bounded cadence.
+      if (st.subagentThreads.length || st.messages.some(message =>
+        message.role === "tool_use" && ["Agent", "Task"].includes(message.name)
+      )) {
+        void this.hydrateSubagents(childSid, st, {
+          quiet: true, minIntervalMs: 5000,
+        });
+      }
       const reported = Number(
         status.runtime_background_tasks_pending ?? status.background_tasks_pending,
       );
@@ -15770,6 +15781,8 @@ function portal() {
     async hydrateSubagents(sid, expectedState = null, opts = {}) {
       const state = expectedState || this._ensureTabState(sid);
       if (!sid || this.tabState[sid] !== state || state.subagentsLoading) return false;
+      const minInterval = Math.max(0, Number(opts.minIntervalMs) || 0);
+      if (minInterval && Date.now() - state.subagentsHydratedAt < minInterval) return false;
       const generation = ++state.subagentGeneration;
       state.subagentsLoading = true;
       try {
@@ -15814,6 +15827,7 @@ function portal() {
         }
         state.subagentThreads = incoming;
         state.subagentsLoaded = true;
+        state.subagentsHydratedAt = Date.now();
         return true;
       } catch (_) {
         if (!opts.quiet) {

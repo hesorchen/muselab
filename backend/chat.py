@@ -6757,10 +6757,39 @@ async def get_session_subagents_api(sid: str) -> dict:
 
     def _load() -> list[dict[str, Any]]:
         with _session_config_dir(model, sid=sid):
-            return chat_subagents.load_subagent_threads(
+            own = chat_subagents.load_subagent_threads(
                 sid,
                 directory=str(workspace),
             )
+        lineage = sess.runtime_lineage(sid) or [sid]
+        ancestors = lineage[:lineage.index(sid)] if sid in lineage else []
+        if not ancestors:
+            return own
+        # SDK forks retain Agent call ids but leave the running child and its
+        # transcript with the predecessor. Follow durable ownership only for
+        # cards this successor actually inherited, including nested Agents.
+        parents = {
+            str(message["id"])
+            for message in _shaped_ui_messages(sid, model, True)
+            if message.get("role") == "tool_use"
+            and message.get("name") in {"Agent", "Task"}
+            and message.get("id")
+        }
+        parents.update(
+            str(overlay["tool_use_id"])
+            for overlay in sess.get_runtime_task_overlays(sid).values()
+            if overlay.get("tool_use_id")
+        )
+        inherited = []
+        for owner in reversed(ancestors):
+            owner_meta = sess.get_session_meta(owner)
+            if owner_meta is None:
+                continue
+            with _session_config_dir(str(owner_meta.get("model") or ""), sid=owner):
+                inherited.extend(chat_subagents.load_subagent_threads(
+                    owner, directory=str(sess.session_workspace(owner)),
+                ))
+        return chat_subagents.inherit_subagent_threads(own, inherited, parents)
 
     threads = await obs.to_thread_io(
         "chat.subagents_history_read",
