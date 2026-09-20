@@ -149,16 +149,19 @@ class TerminalProfileRegistry:
         self.profiles = profiles
         self.default_profile_id = default_id if default_id in seen else ""
 
-    def _save(self) -> None:
+    def _save(self, profiles: list[dict[str, Any]], default_id: str) -> None:
         atomic_write_text(self.path, json.dumps({
             "version": 1,
-            "default_profile_id": self.default_profile_id,
-            "profiles": self.profiles,
+            "default_profile_id": default_id,
+            "profiles": profiles,
         }, ensure_ascii=False, indent=2))
         try:
             self.path.chmod(0o600)
         except OSError:
             pass
+        # Readers and terminal creation must see only durably saved commands.
+        self.profiles = profiles
+        self.default_profile_id = default_id
 
     def list(self) -> list[dict[str, Any]]:
         with self.lock:
@@ -186,10 +189,11 @@ class TerminalProfileRegistry:
             raise HTTPException(422, "profile command is too large")
         with self.lock:
             profile = {"id": str(uuid.uuid4()), "name": name, "command": command}
-            self.profiles.append(profile)
-            if request.is_default or len(self.profiles) == 1:
-                self.default_profile_id = profile["id"]
-            self._save()
+            profiles = [*self.profiles, profile]
+            default_id = self.default_profile_id
+            if request.is_default or len(profiles) == 1:
+                default_id = profile["id"]
+            self._save(profiles, default_id)
             return {**profile, "is_default": profile["id"] == self.default_profile_id}
 
     def update(self, profile_id: str, request: TerminalProfileWrite) -> dict[str, Any]:
@@ -205,22 +209,25 @@ class TerminalProfileRegistry:
             if index < 0:
                 raise HTTPException(404, "terminal profile not found")
             profile = {"id": profile_id, "name": name, "command": command}
-            self.profiles[index] = profile
+            profiles = list(self.profiles)
+            profiles[index] = profile
+            default_id = self.default_profile_id
             if request.is_default:
-                self.default_profile_id = profile_id
-            elif self.default_profile_id == profile_id:
-                self.default_profile_id = ""
-            self._save()
+                default_id = profile_id
+            elif default_id == profile_id:
+                default_id = ""
+            self._save(profiles, default_id)
             return {**profile, "is_default": profile_id == self.default_profile_id}
 
     def delete(self, profile_id: str) -> None:
         with self.lock:
             if not any(row["id"] == profile_id for row in self.profiles):
                 raise HTTPException(404, "terminal profile not found")
-            self.profiles = [row for row in self.profiles if row["id"] != profile_id]
-            if self.default_profile_id == profile_id:
-                self.default_profile_id = self.profiles[0]["id"] if self.profiles else ""
-            self._save()
+            profiles = [row for row in self.profiles if row["id"] != profile_id]
+            default_id = self.default_profile_id
+            if default_id == profile_id:
+                default_id = profiles[0]["id"] if profiles else ""
+            self._save(profiles, default_id)
 
 
 profiles = TerminalProfileRegistry(ROOT)
