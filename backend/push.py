@@ -166,7 +166,10 @@ def get_vapid_public_key() -> str:
 
 def _load_subs() -> None:
     global _subs
-    if not _SUBS_FILE or not _SUBS_FILE.exists():
+    if not _SUBS_FILE:
+        return
+    if not _SUBS_FILE.exists():
+        _subs = {}
         return
     try:
         d = json.loads(_SUBS_FILE.read_text(encoding="utf-8"))
