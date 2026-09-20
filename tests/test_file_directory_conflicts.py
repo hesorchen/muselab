@@ -19,3 +19,12 @@ def test_rename_into_file_parent_returns_conflict(client, auth, temp_root):
     assert response.status_code == 409
     assert (temp_root / 'README.md').read_bytes() == original
     assert (temp_root / 'notes' / 'a.md').read_bytes() == source
+
+
+@pytest.mark.parametrize('path', ['README.md/child', 'README.md/nested/child'])
+def test_write_into_file_parent_returns_conflict(client, auth, temp_root, path):
+    original = (temp_root / 'README.md').read_bytes()
+    response = client.put('/api/files/write', headers=auth,
+                          json={'path': path, 'content': 'new content'})
+    assert response.status_code == 409
+    assert (temp_root / 'README.md').read_bytes() == original

@@ -3459,7 +3459,12 @@ def write_file(req: WriteReq, root: Path = Depends(_workspace_root)) -> dict:
                 detail=f"content exceeds {MAX_WRITE_BYTES // (1024 * 1024)} MB limit",
             )
     with _trash_transaction(root):
-        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+        except (FileExistsError, NotADirectoryError):
+            raise HTTPException(
+                status_code=409, detail="destination parent is not a directory",
+            ) from None
         atomic_write_text(target, req.content)
         return {"ok": True, "size": target.stat().st_size}
 
