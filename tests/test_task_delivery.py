@@ -321,3 +321,31 @@ def test_stream_tokens_do_not_read_delivery_sidecar(evidence, monkeypatch):
             event={"type": "content_block_delta", "delta": {"type": "text_delta", "text": "token"}},
         ),
     )
+
+
+def test_looping_tool_path_retains_failure_evidence(evidence):
+    delivery, _, root, sid, turn = evidence
+    target = root / 'loop'
+    target.symlink_to('loop')
+    payload = {'tool_name': 'Write', 'tool_input': {'file_path': str(target)}}
+    delivery.record_tool(sid, turn, root, 'PreToolUse', payload, 'loop_write')
+    delivery.record_tool(sid, turn, root, 'PostToolUseFailure', payload, 'loop_write')
+    record = delivery.load(sid)['turns'][-1]['tools'][-1]
+    assert record['id'] == 'loop_write'
+    assert record['status'] == 'tool_failed'
+    assert target.is_symlink()
+
+
+def test_looping_tool_path_disables_unsafe_checkpoint_restore(evidence):
+    _, checkpoints, root, sid, turn = evidence
+    cid = str(uuid.uuid4())
+    checkpoints.record_id(sid, turn, cid)
+    target = root / 'loop'
+    target.symlink_to('loop')
+    payload = {'tool_name': 'Write', 'tool_input': {'file_path': str(target)}}
+    checkpoints.observe(sid, turn, root, 'PreToolUse', payload, 'loop_write')
+    checkpoints.observe(sid, turn, root, 'PostToolUseFailure', payload, 'loop_write')
+    preview = checkpoints.preview(sid, cid, root, 'runtime')
+    assert not preview['can_restore']
+    assert 'unsafe_or_unobserved_path' in preview['issues']
+    assert target.is_symlink()
