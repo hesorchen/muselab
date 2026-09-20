@@ -15,6 +15,7 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any, Literal
+from weakref import WeakValueDictionary
 
 from fastapi import APIRouter, Depends, HTTPException
 from claude_agent_sdk.types import PermissionMode
@@ -22,6 +23,7 @@ from pydantic import BaseModel, Field, model_validator
 
 from .auth import require_token
 from . import context_limits
+from . import observability as obs
 from .config_paths import ENV_PATH, MCP_CONFIG_PATH
 from .hook_settings import router as hook_settings_router
 # _locate_executable used to live in this module but is now also needed
@@ -33,6 +35,7 @@ from .settings import locate_executable as _locate_executable
 MCP_EXAMPLE_PATH = Path(__file__).resolve().parent.parent / "mcp.json.example"
 # Serialize the whole read/modify/write transaction across request threads.
 _MCP_CONFIG_LOCK = threading.RLock()
+_MCP_TOGGLE_LOCKS: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
 router.include_router(hook_settings_router)
@@ -978,29 +981,35 @@ async def toggle_mcp_server(name: str, req: MCPToggleReq) -> dict:
          "just works" without re-entering command/args.
       c. Name doesn't exist anywhere → 404.
     """
-    # Keep the lock and all disk I/O in one worker, without blocking SSE.
-    await asyncio.to_thread(_persist_mcp_toggle, name, req.disabled)
-    # Apply to every live SDK client too — otherwise the toggle would only
-    # take effect on the next client rebuild, leaving the user staring at a
-    # toggled-off server that still answers tool calls. SDK exposes
-    # client.toggle_mcp_server() for exactly this case.
-    from . import chat as _chat
-    enabled = not req.disabled
-    propagated: list[str] = []
-    errors: list[str] = []
-    async with _chat._lock:
-        live = list(_chat._clients.items())
-    for key, client in live:
-        try:
-            await client.toggle_mcp_server(name, enabled)
-            propagated.append(f"{key[0]}@{key[1]}")
-        except Exception as e:
-            errors.append(f"{key}: {type(e).__name__}: {e}")
-    return {
-        "ok": True, "name": name, "disabled": req.disabled,
-        "propagated": propagated,
-        "errors": errors,
-    }
+    # A later save must not apply to live clients ahead of an earlier toggle.
+    toggle_lock = _MCP_TOGGLE_LOCKS.setdefault(name, asyncio.Lock())
+    async with toggle_lock:
+        # Keep the lock and all disk I/O in one worker, without blocking SSE.
+        await obs.to_thread_io(
+            "settings.mcp_toggle", "", _persist_mcp_toggle, name, req.disabled,
+            owned=True,
+        )
+        # Apply to every live SDK client too — otherwise the toggle would only
+        # take effect on the next client rebuild, leaving the user staring at a
+        # toggled-off server that still answers tool calls. SDK exposes
+        # client.toggle_mcp_server() for exactly this case.
+        from . import chat as _chat
+        enabled = not req.disabled
+        propagated: list[str] = []
+        errors: list[str] = []
+        async with _chat._lock:
+            live = list(_chat._clients.items())
+        for key, client in live:
+            try:
+                await client.toggle_mcp_server(name, enabled)
+                propagated.append(f"{key[0]}@{key[1]}")
+            except Exception as e:
+                errors.append(f"{key}: {type(e).__name__}: {e}")
+        return {
+            "ok": True, "name": name, "disabled": req.disabled,
+            "propagated": propagated,
+            "errors": errors,
+        }
 
 
 @router.post("/mcp/{name}/reconnect", dependencies=[Depends(require_token)])
