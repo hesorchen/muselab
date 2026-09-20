@@ -41,21 +41,29 @@ def test_new_provider_form_preserves_edits_during_save(
         page.wait_for_timeout(50)
     assert len(held) == 1
     assert held[0][1].status == 200
-    if edit_while_pending:
-        prefix.fill("next-provider:")
-        models.fill("next-provider:model")
-    held[0][0].fulfill(response=held[0][1])
-    page.wait_for_function("() => window.__newProviderSaveDone === true")
-    if edit_while_pending:
-        expect(prefix).to_be_visible()
-        expect(prefix).to_have_value("next-provider:")
-        expect(models).to_have_value("next-provider:model")
-        assert page.evaluate(
-            "() => document.querySelector('#app')._x_dataStack[0].settingsDirty()",
+    try:
+        if edit_while_pending:
+            prefix.fill("next-provider:")
+            models.fill("next-provider:model")
+        held[0][0].fulfill(response=held[0][1])
+        page.wait_for_function("() => window.__newProviderSaveDone === true")
+        if edit_while_pending:
+            expect(prefix).to_be_visible()
+            expect(prefix).to_have_value("next-provider:")
+            expect(models).to_have_value("next-provider:model")
+            assert page.evaluate(
+                "() => document.querySelector('#app')._x_dataStack[0].settingsDirty()",
+            )
+        else:
+            expect(prefix).to_be_hidden()
+            assert page.evaluate("""() => {
+              const n = document.querySelector('#app')._x_dataStack[0].settings.providerNew;
+              return !n.base_url && !n.prefix && !n.models && !n.api_key;
+            }""")
+    finally:
+        cleanup = page.request.post(
+            backend_url + "/api/settings/providers/delete",
+            headers={"X-Auth-Token": auth_token},
+            data={"id": held[0][1].json()["id"]},
         )
-    else:
-        expect(prefix).to_be_hidden()
-        assert page.evaluate("""() => {
-          const n = document.querySelector('#app')._x_dataStack[0].settings.providerNew;
-          return !n.base_url && !n.prefix && !n.models && !n.api_key;
-        }""")
+        assert cleanup.status == 200

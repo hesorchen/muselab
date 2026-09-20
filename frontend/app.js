@@ -22718,7 +22718,7 @@ function portal() {
       }
     },
     async addMcpFromDraft() {
-      const d = this.settings.mcpDraft;
+      const d = JSON.parse(JSON.stringify(this.settings.mcpDraft));
       const name = (d.name || "").trim();
       const remote = d.transport === "remote";
       // Build the request body per transport. Remote → {type:http, url,
@@ -22750,7 +22750,9 @@ function portal() {
       });
       if (r.ok) {
         this.toast(this.t("set.mcp.added"), "success", 1500);
-        this.settings.mcpDraft = { show: false, transport: "stdio", name: "", command: "", argsStr: "", url: "", authHeader: "" };
+        if (JSON.stringify(this.settings.mcpDraft) === JSON.stringify(d)) {
+          this.settings.mcpDraft = { show: false, transport: "stdio", name: "", command: "", argsStr: "", url: "", authHeader: "" };
+        }
         this.refreshMcpList();
       } else {
         this.toast(this.t("set.mcp.save_failed"), "error", 3000);
