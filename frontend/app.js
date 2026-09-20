@@ -31347,7 +31347,7 @@ function portal() {
       // directory without changing anything).
       if (srcParent === targetDir) return;
       // Dropping a directory onto itself or anywhere in its own subtree
-      // would create a cycle. Backend would 422 on rename but we'd
+      // would create a cycle. Backend rejects the rename but we'd
       // rather not even attempt it — feedback is faster client-side.
       if (srcPath === targetDir
           || (targetDir + "/").startsWith(srcPath + "/")) {

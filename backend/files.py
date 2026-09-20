@@ -4440,6 +4440,10 @@ def rename(req: RenameReq, root: Path = Depends(_workspace_root)) -> dict:
             raise HTTPException(status_code=404, detail="source not found")
         if dst.exists():
             raise HTTPException(status_code=409, detail="destination already exists")
+        if src.is_dir() and dst.is_relative_to(src):
+            raise HTTPException(
+                status_code=409, detail="cannot move a directory into its own subtree",
+            )
         try:
             dst.parent.mkdir(parents=True, exist_ok=True)
         except (FileExistsError, NotADirectoryError):
