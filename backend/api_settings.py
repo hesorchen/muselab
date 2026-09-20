@@ -378,26 +378,34 @@ def put_settings(req: SettingsIn) -> dict:
     if req.busy_send_mode is not None and _changed(
             "MUSELAB_BUSY_SEND_MODE", req.busy_send_mode):
         updates["MUSELAB_BUSY_SEND_MODE"] = req.busy_send_mode
-    if req.provider_disabled is not None:
-        raw = os.environ.get("MUSELAB_DISABLED_PROVIDERS", "").strip()
-        disabled_models = set(raw.split(",")) if raw else set()
-        changed = False
-        for model_id, disable in req.provider_disabled.items():
-            if disable:
-                if model_id not in disabled_models:
+    # Visibility is a partial set edit, so its read and write must share
+    # the same lock as other environment updates.
+    with _ENV_WRITE_LOCK:
+        if req.provider_disabled is not None:
+            from . import endpoints as _ep
+            aliases: dict[str, set[str]] = {}
+            for provider in _ep.provider_meta():
+                names = {provider["id"], provider["probe_model"]} - {""}
+                for name in names:
+                    aliases[name] = names
+            raw = os.environ.get("MUSELAB_DISABLED_PROVIDERS", "").strip()
+            disabled_models = set(raw.split(",")) if raw else set()
+            original_disabled = disabled_models.copy()
+            for model_id, disable in req.provider_disabled.items():
+                if disable:
                     disabled_models.add(model_id)
-                    changed = True
-            else:
-                if model_id in disabled_models:
-                    disabled_models.discard(model_id)
-                    changed = True
-        if changed:
-            if disabled_models:
-                updates["MUSELAB_DISABLED_PROVIDERS"] = ",".join(sorted(disabled_models))
-            else:
-                updates["MUSELAB_DISABLED_PROVIDERS"] = None  # type: ignore[assignment]  # remove key
+                else:
+                    # GET honours both stable provider IDs and legacy first
+                    # model IDs; enabling must clear either stored form.
+                    disabled_models.difference_update(
+                        aliases.get(model_id, {model_id}),
+                    )
+            if disabled_models != original_disabled:
+                updates["MUSELAB_DISABLED_PROVIDERS"] = (
+                    ",".join(sorted(disabled_models)) if disabled_models else None
+                )
 
-    _write_env(updates)
+        _write_env(updates)
     # The `chat.py` module captured `MODEL` at import time; if we just touched
     # `MUSELAB_MODEL` here, existing imports won't see the new value. Push it
     # back so subsequent stream() calls pick up the new default.
