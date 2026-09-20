@@ -51,3 +51,13 @@ def test_command_evidence_persists_only_redacted_header(app_module, temp_root, m
     command = task_delivery.report(sid, temp_root)['commands'][0]['command']
     assert 'SYNTHETIC_' not in command
     assert command.endswith('https://example.test')
+
+
+@pytest.mark.parametrize('first, second', [('"', "'"), ("'", '"')])
+def test_redaction_covers_concatenated_header_parts(first, second):
+    from backend.task_delivery import _safe_command
+    command = (f'curl -H {first}Authorization: Bearer SYNTHETIC_A{first}'
+               f'{second}SYNTHETIC_B{second} https://example.test')
+    result = _safe_command(command)
+    assert 'SYNTHETIC_' not in result
+    assert result.endswith('https://example.test')

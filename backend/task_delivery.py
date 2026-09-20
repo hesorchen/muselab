@@ -102,19 +102,19 @@ def begin(sid: str, turn_id: str, cwd: Path) -> None:
 
 def _safe_command(value: Any) -> str:
     text = str(value or "")[:2000]
-    # Quoted HTTP headers contain a scheme and credential in one shell word.
-    # Redact them before matching assignments inside the quoted header.
-    text = re.sub(
-        r"(?i)('\s*authorization\s*:\s*)[^']*(?:'|$)",
-        r"\1[redacted]'", text,
-    )
-    text = re.sub(
-        r'(?i)("\s*authorization\s*:\s*)(?:\\[\s\S]|[^"\\])*(?:"|\\?$)',
-        r'\1[redacted]"', text,
-    )
     # Consume the full shell word, including quotes, escaped spaces and
     # adjacent quoted/unquoted parts. A preview may cut a quoted value short.
     word = r"""(?:[^\s;'"\\]|\\[\s\S]|'[^']*(?:'|$)|"(?:\\[\s\S]|[^"\\])*(?:"|\\?$))+"""
+    # Quoted HTTP headers contain a scheme and credential in one shell word.
+    # Redact them before matching assignments inside the quoted header.
+    text = re.sub(
+        r"(?i)('\s*authorization\s*:\s*)[^']*(?:'|$)" + f"(?:{word})?",
+        r"\1[redacted]'", text,
+    )
+    text = re.sub(
+        r'(?i)("\s*authorization\s*:\s*)(?:\\[\s\S]|[^"\\])*(?:"|\\?$)' + f"(?:{word})?",
+        r'\1[redacted]"', text,
+    )
     text = re.sub(
         r"(?i)(\b[A-Z_]*(?:TOKEN|PASSWORD|SECRET|API_KEY)\s*[=:]\s*"
         r"|\bauthorization\s*=\s*)" + word,
