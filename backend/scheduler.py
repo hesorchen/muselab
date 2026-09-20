@@ -675,6 +675,9 @@ def update_task(tid: str, **changes: Any) -> dict | None:
             t = _state["tasks"].get(tid)
             if not t:
                 return None
+            # Validation may reject a later field in this same edit. Build a
+            # candidate so rejected edits never mutate the live task partially.
+            t = copy.deepcopy(t)
         # Capture the old name BEFORE applying the change — used to detect a
         # rename so we can keep the bound session's name in sync. Without
         # this the history picker kept showing the old `[定时] xxx` label
@@ -741,6 +744,7 @@ def update_task(tid: str, **changes: Any) -> dict | None:
             if (sid and new_name and new_name != old_name
                     and _effective_session_mode(t) == "reuse"):
                 rename_after_commit = (sid, str(new_name))
+            _state["tasks"][tid] = t
             try:
                 _save_state()
             except Exception:

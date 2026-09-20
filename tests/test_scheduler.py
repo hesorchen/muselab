@@ -1439,3 +1439,32 @@ def test_compute_next_run_unknown_iana_falls_back_to_offset(app_module):
     got = sched._compute_next_run(
         sch, ref_ts=_bj(2026, 3, 10, 8, 0).timestamp())
     assert got == pytest.approx(_bj(2026, 3, 10, 9, 0).timestamp())
+
+
+@pytest.mark.parametrize("invalid_schedule", [
+    {"kind": "weekly", "hour": 9, "minute": 0, "weekdays": []},
+    {"kind": "once", "hour": 9, "minute": 0, "year": 2024, "month": 1, "day": 1},
+])
+def test_rejected_task_edit_leaves_no_partial_changes(
+    client, auth, app_module, invalid_schedule,
+):
+    sched = _sched_mod(app_module)
+    original = sched.create_task("Original", "Original prompt", _daily_at())
+    state_file = sched._STATE_FILE
+    disk_before = state_file.read_bytes()
+
+    response = client.patch(f"/api/scheduler/tasks/{original['id']}", headers=auth, json={
+        "name": "Rejected name", "prompt": "Rejected prompt", "schedule": invalid_schedule,
+    })
+    assert response.status_code == 400
+    assert sched.get_task(original["id"]) == original
+    assert state_file.read_bytes() == disk_before
+
+    # A subsequent valid edit must not accidentally persist rejected fields.
+    response = client.patch(f"/api/scheduler/tasks/{original['id']}", headers=auth,
+                            json={"enabled": False})
+    assert response.status_code == 200
+    expected = {**original, "enabled": False}
+    assert response.json() == expected
+    sched._load_state()
+    assert sched.get_task(original["id"]) == expected
