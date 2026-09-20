@@ -4,6 +4,8 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import pytest
+
 
 # ---- list / read ----
 
@@ -991,3 +993,40 @@ def test_staged_upload_commit_and_expiry(client, auth, temp_root):
             files._expire_pending_upload(key, files._PENDING_UPLOADS[key])
             assert client.post("/api/files/upload/commit", headers=auth, json=control).status_code == 409
         assert not list(temp_root.glob(".*.uploading"))
+
+
+@pytest.mark.parametrize("race", [False, True])
+@pytest.mark.parametrize("numbered", [False, True])
+def test_copy_bak_skips_broken_symlink_names(
+    app_module, monkeypatch, temp_root, race, numbered,
+):
+    from backend import files
+
+    if numbered:
+        (temp_root / "README.md.bak").write_text("Existing backup", encoding="utf-8")
+    occupied = temp_root / ("README.md.bak.2" if numbered else "README.md.bak")
+    missing = temp_root / "missing-target.md"
+    if not race:
+        occupied.symlink_to(missing.name)
+    real_link = files.os.link
+    attempts = []
+
+    def bounded_link(src, dst, *args, **kwargs):
+        attempts.append(dst)
+        # Bound the old infinite retry loop so regressions fail instead of hang.
+        assert len(attempts) <= 3, "copy repeatedly selected an occupied symlink name"
+        if race and len(attempts) == 1:
+            occupied.symlink_to(missing.name)
+        return real_link(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(files.os, "link", bounded_link)
+    result = files.copy_bak(files.CopyBakReq(src="README.md"), root=temp_root)
+
+    assert result["path"] == ("README.md.bak.3" if numbered else "README.md.bak.2")
+    if numbered:
+        assert (temp_root / "README.md.bak").read_text(encoding="utf-8") == "Existing backup"
+    assert occupied.is_symlink()
+    assert occupied.readlink() == Path(missing.name)
+    assert not missing.exists()
+    assert (temp_root / result["path"]).read_bytes() == (temp_root / "README.md").read_bytes()
+    assert list(temp_root.glob(".~README.md.*.copying")) == []
