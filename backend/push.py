@@ -39,6 +39,7 @@ _VAPID_FILE = (_DIR / "vapid.json") if _DIR else None
 _SUBS_FILE = (_DIR / "push_subs.json") if _DIR else None
 
 _vapid: dict[str, str] | None = None
+_vapid_lock = threading.Lock()
 # ``pywebpush.webpush`` exposes ``timeout=None`` and forwards that explicit
 # value to requests.  That disables requests' own timeout entirely: a dead
 # proxy once held a completed chat turn open for almost seven minutes while
@@ -115,19 +116,26 @@ def _migrate_pkcs8_to_sec1(pem: str) -> str | None:
 
 def _ensure_vapid() -> dict[str, str]:
     global _vapid
-    if _vapid:
+    with _vapid_lock:
+        if _vapid is None:
+            # Publish only a persisted keypair; concurrent readers must wait
+            # for the same initialization or migration to finish.
+            _vapid = _load_or_generate_vapid()
         return _vapid
+
+
+def _load_or_generate_vapid() -> dict[str, str]:
     if _VAPID_FILE and _VAPID_FILE.exists():
         try:
-            _vapid = json.loads(_VAPID_FILE.read_text(encoding="utf-8"))
+            vapid = json.loads(_VAPID_FILE.read_text(encoding="utf-8"))
             # Auto-migrate old PKCS8 vapid.json to SEC1 in place. Public
             # key (and therefore subscriptions) are unchanged.
-            old_pem = _vapid.get("private_pem", "")
+            old_pem = vapid.get("private_pem", "")
             new_pem = _migrate_pkcs8_to_sec1(old_pem)
             if new_pem and new_pem != old_pem:
-                _vapid["private_pem"] = new_pem
+                vapid["private_pem"] = new_pem
                 atomic_write_text(_VAPID_FILE,
-                                   json.dumps(_vapid, indent=2))
+                                   json.dumps(vapid, indent=2))
                 try:
                     os.chmod(_VAPID_FILE, 0o600)
                 except Exception:
@@ -135,7 +143,7 @@ def _ensure_vapid() -> dict[str, str]:
                 sys.stderr.write(
                     "[push] migrated vapid.json from PKCS8 to SEC1; "
                     "existing subscriptions still valid\n")
-            return _vapid
+            return vapid
         except Exception as e:
             # Fail LOUDLY instead of silently regenerating. A transient read
             # error / corrupted-but-recoverable file would otherwise trigger
@@ -150,14 +158,14 @@ def _ensure_vapid() -> dict[str, str]:
                 f"regenerate (would invalidate all push subscriptions). "
                 f"Inspect or delete {_VAPID_FILE} to force a new keypair."
             ) from e
-    _vapid = _gen_vapid_keypair()
+    vapid = _gen_vapid_keypair()
     if _VAPID_FILE:
-        atomic_write_text(_VAPID_FILE, json.dumps(_vapid, indent=2))
+        atomic_write_text(_VAPID_FILE, json.dumps(vapid, indent=2))
         try:
             os.chmod(_VAPID_FILE, 0o600)
         except Exception:
             pass
-    return _vapid
+    return vapid
 
 
 def get_vapid_public_key() -> str:
