@@ -22517,7 +22517,9 @@ function portal() {
           return;
         }
         this._replaceHookScope(await response.json());
-        this.cancelHookDraft();
+        // Cancel and scope changes can open another draft while saving.
+        // Only the editor that submitted this request may be dismissed.
+        if (hooks.draft === draft) this.cancelHookDraft();
         this.toast(this.lang === "zh"
           ? "Hook 已保存，下轮会话自动重载" : "Hook saved; runtime reloads next turn", "success");
       } catch (_) {
