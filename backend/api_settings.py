@@ -306,7 +306,8 @@ def put_settings(req: SettingsIn) -> dict:
     }
     for field, env_name in legacy_key_map.items():
         v = getattr(req, field)
-        if v is None or v == "":   # skip unchanged
+        # Legacy fields must ignore the same display masks as provider_keys.
+        if v is None or v == "" or "•" in v:
             continue
         if v == "_delete_":
             updates[env_name] = None  # type: ignore[assignment]  # signals removal

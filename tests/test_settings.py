@@ -1,6 +1,8 @@
 """Runtime settings API: GET masking, PUT writes .env + refreshes env."""
 import os
 
+import pytest
+
 
 def test_get_settings_shape(client, auth):
     r = client.get("/api/settings", headers=auth)
@@ -350,3 +352,35 @@ def test_prompt_cache_unknown_value_is_noop():
     configure_prompt_cache(env)
     assert env.get("ENABLE_PROMPT_CACHING_1H") is None
     assert env.get("FORCE_PROMPT_CACHING_5M") is None
+
+
+@pytest.mark.parametrize("field", [
+    "anthropic_api_key", "deepseek_api_key", "zhipuai_api_key", "minimax_api_key",
+])
+def test_legacy_key_fields_preserve_credentials_when_echoing_display_mask(
+    client, auth, monkeypatch, tmp_path, field,
+):
+    from backend import api_settings
+
+    env_key = field.upper()
+    original = "synthetic-provider-key-1234567890"
+    monkeypatch.setenv(env_key, original)
+    path = tmp_path / "legacy-key.env"
+    content = f"{env_key}={original}\n"
+    path.write_text(content, encoding="utf-8")
+    monkeypatch.setattr(api_settings, "ENV_PATH", path)
+    loaded = client.get("/api/settings", headers=auth)
+    assert loaded.status_code == 200
+    provider = next(
+        item for item in loaded.json()["providers"] if item["env_key"] == env_key
+    )
+    assert "•" in provider["masked"]
+
+    saved = client.put(
+        "/api/settings", headers=auth, json={field: provider["masked"]},
+    )
+    assert saved.status_code == 200
+    assert saved.json()["updated"] == []
+    assert saved.json()["updated_count"] == 0
+    assert os.environ[env_key] == original
+    assert path.read_text(encoding="utf-8") == content
