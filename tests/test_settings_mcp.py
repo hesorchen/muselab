@@ -4,6 +4,8 @@ Uses the shared conftest fixtures (client / auth / app_module) so env / token /
 sessions dir setup matches the rest of the suite.
 """
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
 import pytest
 
 
@@ -258,3 +260,77 @@ def test_remote_header_mask_recovery(temp_mcp, client, auth):
     cfg = json.loads(temp_mcp.read_text())
     assert cfg["mcpServers"]["gmail"]["headers"]["Authorization"] \
         == "Bearer secret-token-xyz"
+
+
+@pytest.mark.parametrize("second_operation", ["upsert", "delete", "toggle"])
+def test_concurrent_mcp_mutations_preserve_each_successful_edit(
+    temp_mcp, client, auth, monkeypatch, second_operation,
+):
+    from backend import api_settings
+
+    initial = {
+        "futureField": {"keep": True},
+        "mcpServers": {
+            "alpha": {"command": "synthetic", "args": ["old"]},
+            "beta": {"command": "synthetic", "args": ["old"], "disabled": False},
+        },
+    }
+    temp_mcp.write_text(json.dumps(initial), encoding="utf-8")
+    first_saving = threading.Event()
+    second_read = threading.Event()
+    load = api_settings._load_mcp
+    save = api_settings._save_mcp
+
+    def observed_load():
+        cfg = load()
+        if first_saving.is_set():
+            second_read.set()
+        return cfg
+
+    def gated_save(cfg):
+        if not first_saving.is_set():
+            first_saving.set()
+            # Before the fix, the second request reads the old file while the
+            # first write is paused. A serialized transaction waits here, then
+            # reads after the first request commits.
+            second_read.wait(timeout=1)
+        save(cfg)
+
+    monkeypatch.setattr(api_settings, "_load_mcp", observed_load)
+    monkeypatch.setattr(api_settings, "_save_mcp", gated_save)
+
+    def edit_alpha():
+        return client.put(
+            "/api/settings/mcp/alpha", headers=auth,
+            json={"name": "alpha", "command": "synthetic", "args": ["new"]},
+        )
+
+    def edit_beta():
+        if second_operation == "delete":
+            return client.delete("/api/settings/mcp/beta", headers=auth)
+        if second_operation == "toggle":
+            return client.patch(
+                "/api/settings/mcp/beta/toggle", headers=auth,
+                json={"disabled": True},
+            )
+        return client.put(
+            "/api/settings/mcp/beta", headers=auth,
+            json={"name": "beta", "command": "synthetic", "args": ["new"]},
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(edit_alpha)
+        assert first_saving.wait(timeout=5)
+        second = executor.submit(edit_beta)
+        assert first.result(timeout=10).status_code == 200
+        assert second.result(timeout=10).status_code == 200
+
+    saved = json.loads(temp_mcp.read_text(encoding="utf-8"))
+    assert saved["futureField"] == {"keep": True}
+    assert saved["mcpServers"]["alpha"]["args"] == ["new"]
+    if second_operation == "delete":
+        assert "beta" not in saved["mcpServers"]
+    elif second_operation == "toggle":
+        assert saved["mcpServers"]["beta"]["disabled"] is True
+    else:
+        assert saved["mcpServers"]["beta"]["args"] == ["new"]

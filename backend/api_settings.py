@@ -31,6 +31,8 @@ from .hook_settings import router as hook_settings_router
 from .settings import locate_executable as _locate_executable
 
 MCP_EXAMPLE_PATH = Path(__file__).resolve().parent.parent / "mcp.json.example"
+# Serialize the whole read/modify/write transaction across request threads.
+_MCP_CONFIG_LOCK = threading.RLock()
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
 router.include_router(hook_settings_router)
@@ -869,43 +871,44 @@ def upsert_mcp_server(name: str, spec: MCPServerSpec) -> dict:
             422,
             f"body name {spec.name!r} does not match URL name {name!r}",
         )
-    cfg = _load_mcp()
+    with _MCP_CONFIG_LOCK:
+        cfg = _load_mcp()
 
-    # Defence (mirror of put_settings' "•" guard): GET /mcp masks secret values
-    # (env values, header values) via _mask() (U+2022 BULLET). A FE that PUTs an
-    # unchanged entry back would otherwise overwrite the real secret with bullets
-    # — unrecoverable. For any value that still looks masked, recover the real
-    # value from the current merged view (the same source the mask was derived
-    # from); if none exists, drop the key rather than persist bullets.
-    def _unmask(new_map: dict, field: str) -> dict:
-        out = dict(new_map or {})
-        if any(isinstance(v, str) and "•" in v for v in out.values()):
-            existing = (_load_mcp_merged().get(name) or {}).get(field) or {}
-            for k, v in list(out.items()):
-                if isinstance(v, str) and "•" in v:
-                    if k in existing:
-                        out[k] = existing[k]
-                    else:
-                        out.pop(k)
-        return out
+        # Defence (mirror of put_settings' "•" guard): GET /mcp masks secret values
+        # (env values, header values) via _mask() (U+2022 BULLET). A FE that PUTs an
+        # unchanged entry back would otherwise overwrite the real secret with bullets
+        # — unrecoverable. For any value that still looks masked, recover the real
+        # value from the current merged view (the same source the mask was derived
+        # from); if none exists, drop the key rather than persist bullets.
+        def _unmask(new_map: dict, field: str) -> dict:
+            out = dict(new_map or {})
+            if any(isinstance(v, str) and "•" in v for v in out.values()):
+                existing = (_load_mcp_merged().get(name) or {}).get(field) or {}
+                for k, v in list(out.items()):
+                    if isinstance(v, str) and "•" in v:
+                        if k in existing:
+                            out[k] = existing[k]
+                        else:
+                            out.pop(k)
+            return out
 
-    if spec.url:
-        # Remote connector (http/sse). No command/args/env on disk.
-        cfg["mcpServers"][name] = {
-            "type": spec.type or "http",
-            "url": spec.url.strip(),
-            "headers": _unmask(spec.headers, "headers"),
-            "disabled": spec.disabled,
-        }
-    else:
-        # Local stdio subprocess.
-        cfg["mcpServers"][name] = {
-            "command": spec.command,
-            "args": spec.args,
-            "env": _unmask(spec.env, "env"),
-            "disabled": spec.disabled,
-        }
-    _save_mcp(cfg)
+        if spec.url:
+            # Remote connector (http/sse). No command/args/env on disk.
+            cfg["mcpServers"][name] = {
+                "type": spec.type or "http",
+                "url": spec.url.strip(),
+                "headers": _unmask(spec.headers, "headers"),
+                "disabled": spec.disabled,
+            }
+        else:
+            # Local stdio subprocess.
+            cfg["mcpServers"][name] = {
+                "command": spec.command,
+                "args": spec.args,
+                "env": _unmask(spec.env, "env"),
+                "disabled": spec.disabled,
+            }
+        _save_mcp(cfg)
     return {"ok": True, "name": name}
 
 
@@ -916,16 +919,35 @@ def delete_mcp_server(name: str) -> dict:
     entry will reappear in the merged list (no longer overridden). To
     "hide" an external MCP from muselab, use the toggle endpoint instead
     (it writes a stub override into muselab's mcp.json)."""
-    cfg = _load_mcp()
-    if name not in (cfg.get("mcpServers") or {}):
-        raise HTTPException(404, f"MCP server not found: {name}")
-    del cfg["mcpServers"][name]
-    _save_mcp(cfg)
+    with _MCP_CONFIG_LOCK:
+        cfg = _load_mcp()
+        if name not in (cfg.get("mcpServers") or {}):
+            raise HTTPException(404, f"MCP server not found: {name}")
+        del cfg["mcpServers"][name]
+        _save_mcp(cfg)
     return {"ok": True, "name": name}
 
 
 class MCPToggleReq(BaseModel):
     disabled: bool
+
+
+def _persist_mcp_toggle(name: str, disabled: bool) -> None:
+    with _MCP_CONFIG_LOCK:
+        cfg = _load_mcp()
+        own_servers = cfg.setdefault("mcpServers", {})
+        merged = _load_mcp_merged()
+        if name not in merged:
+            raise HTTPException(404, f"MCP server not found: {name}")
+
+        if name in own_servers:
+            own_servers[name]["disabled"] = disabled
+        else:
+            # External-only entry — write a stub override. _load_mcp_merged
+            # recognises {disabled: ...} without `command` and layers it
+            # onto the external spec.
+            own_servers[name] = {"disabled": disabled}
+        _save_mcp(cfg)
 
 
 @router.patch("/mcp/{name}/toggle", dependencies=[Depends(require_token)])
@@ -942,25 +964,8 @@ async def toggle_mcp_server(name: str, req: MCPToggleReq) -> dict:
          "just works" without re-entering command/args.
       c. Name doesn't exist anywhere → 404.
     """
-    # _load_mcp / _load_mcp_merged / _save_mcp are all synchronous disk I/O —
-    # and _load_mcp_merged pulls in ~/.claude.json (can be multi-MB of project
-    # history), parsing 3-4 files. Off-load each so toggling an MCP server from
-    # Settings can't stall the event loop (and every concurrent SSE stream) for
-    # tens-to-hundreds of ms. (perf: RED — api_settings.py toggle_mcp_server)
-    cfg = await asyncio.to_thread(_load_mcp)
-    own_servers = cfg.setdefault("mcpServers", {})
-    merged = await asyncio.to_thread(_load_mcp_merged)
-    if name not in merged:
-        raise HTTPException(404, f"MCP server not found: {name}")
-
-    if name in own_servers:
-        own_servers[name]["disabled"] = req.disabled
-    else:
-        # External-only entry — write a stub override. _load_mcp_merged
-        # recognises {disabled: ...} without `command` and layers it
-        # onto the external spec.
-        own_servers[name] = {"disabled": req.disabled}
-    await asyncio.to_thread(_save_mcp, cfg)
+    # Keep the lock and all disk I/O in one worker, without blocking SSE.
+    await asyncio.to_thread(_persist_mcp_toggle, name, req.disabled)
     # Apply to every live SDK client too — otherwise the toggle would only
     # take effect on the next client rebuild, leaving the user staring at a
     # toggled-off server that still answers tool calls. SDK exposes
