@@ -3648,7 +3648,9 @@ async def upload(
     # atomically rename to dest so a crash or size-exceeded abort never
     # leaves a partial file at the intended path.
     import uuid as _uuid
-    tmp_path = dest.parent / f".~{dest.name}.{_uuid.uuid4().hex[:8]}.uploading"
+    # A valid destination can already use almost the whole filename limit.
+    # Bound only the temporary prefix, including for multibyte Unicode names.
+    tmp_path = dest.parent / f".~{dest.name[:32]}.{_uuid.uuid4().hex[:8]}.uploading"
     pending = None
     if upload_id:
         key = await obs.to_thread_io(
@@ -4520,7 +4522,7 @@ def copy_bak(req: CopyBakReq, root: Path = Depends(_workspace_root)) -> dict:
     # temporary lives beside the final file, so the later hard-link commit is
     # same-filesystem, atomic, and refuses to overwrite an external writer.
     while True:
-        tmp = parent / f".~{src.name}.{secrets.token_hex(8)}.copying"
+        tmp = parent / f".~{src.name[:32]}.{secrets.token_hex(8)}.copying"
         try:
             with tmp.open("xb"):
                 pass
