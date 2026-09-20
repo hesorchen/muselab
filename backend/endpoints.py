@@ -962,7 +962,24 @@ def upsert_provider(*, pid: str | None, base_url: str, prefix: str,
                 n += 1
                 pid = f"{base_pid}-{n}"
         if not env_key:
-            env_key = "MUSELAB_PROVIDER_" + _slug(base_url).upper().replace("-", "_") + "_API_KEY"
+            previous = get_provider(pid) or _builtin_by_id(pid)
+            if previous is not None:
+                # Editing endpoint metadata must not detach its credential.
+                env_key = previous.env_key
+            else:
+                # Several accounts can share an endpoint. Automatically
+                # allocated credential slots still belong to one provider.
+                used_keys = {p.env_key for p in catalog()}
+                used_keys.update(
+                    entry.get("env_key") for entry in store["providers"].values()
+                    if isinstance(entry, dict)
+                )
+                stem = "MUSELAB_PROVIDER_" + _slug(base_url).upper().replace("-", "_")
+                env_key = stem + "_API_KEY"
+                suffix = 1
+                while env_key in used_keys:
+                    suffix += 1
+                    env_key = f"{stem}_{suffix}_API_KEY"
         # User-supplied env_key flows into .env writes (api_settings._write_env) —
         # without this gate a crafted value could overwrite MUSELAB_TOKEN, PATH,
         # or another provider's credential.
