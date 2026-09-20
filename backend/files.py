@@ -2634,7 +2634,7 @@ def safe_resolve(
     # First-pass resolve (follows symlinks → catches symlink escape):
     try:
         target = (root / logical).resolve()
-    except (ValueError, OSError):
+    except (ValueError, OSError, RuntimeError):
         raise HTTPException(status_code=400, detail="invalid path") from None
     # The selected root itself might be a symlink target; compare real paths.
     root_real = root.resolve()
@@ -4711,7 +4711,7 @@ def _grep_impl(
                 # caught (name-only check misses that).
                 try:
                     resolved = full.resolve()
-                except (OSError, ValueError):
+                except (OSError, ValueError, RuntimeError):
                     continue
                 if root_real != resolved and root_real not in resolved.parents:
                     continue
