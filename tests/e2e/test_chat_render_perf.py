@@ -11324,3 +11324,129 @@ def test_alpine_rethrow_retains_private_expression_fingerprint(
     assert "fixtureMissing" not in json.dumps(records)
     assert all(not ({"expression", "message", "stack"} & row.keys()) for row in records)
     page.evaluate('document.querySelector("#expression-error-fixture").remove()')
+
+
+@pytest.mark.parametrize("transport", ["legacy", "mux"])
+@pytest.mark.parametrize("submission", ["none", "choices", "other"])
+def test_shared_question_answer_closes_card_despite_losing_post(
+    page: Page, backend_url, auth_token, transport, submission,
+):
+    errors = _capture_browser_errors(page)
+    if transport == "mux":
+        _install_fake_mux_event_source(page)
+    else:
+        _install_fake_event_source(page)
+    page.route(
+        "**/api/chat/stream/mux/start",
+        lambda route: route.fulfill(
+            status=200, content_type="application/json",
+            body=json.dumps({"ticket": "question-mux"}),
+        ),
+    )
+    page.route(
+        "**/api/chat/turns/start",
+        lambda route: route.fulfill(
+            status=200, content_type="application/json",
+            body=json.dumps({
+                "accepted": True,
+                "session_id": route.request.post_data_json["session_id"],
+                "turn_id": "question-turn",
+            }),
+        ),
+    )
+    page.route(
+        "**/api/chat/stream/start",
+        lambda route: route.fulfill(
+            status=200, content_type="application/json",
+            body=json.dumps({"ticket": "question-stream"}),
+        ),
+    )
+    _login(page, backend_url, auth_token)
+    _app_eval(
+        page,
+        """
+        app._confirmSessionBusy = async () => false;
+        app._awaitRuntimeSettingPatches = async () => true;
+        app.availableModels = [{
+          model: 'question-model', label: 'Question test', group: 'e2e',
+          supports_thinking: true,
+        }];
+        app.model = 'question-model';
+        app.sessions = app.sessions.map(session => session.id === app.currentId
+          ? {...session, model: 'question-model'} : session);
+        const state = app._ensureTabState(app.currentId);
+        state.draft.input = 'Question synchronization test';
+        app._activateComposerState(app.currentId);
+        await app.send();
+        const sid = app.currentId;
+        let seq = 0;
+        window.__emitAsk = (type, payload) => {
+          if (arg === 'mux') {
+            window.__emitMux(type, {
+              ...payload, session_id: sid, turn_id: 'question-turn',
+              event_seq: ++seq,
+            });
+          } else {
+            window.__emitSse(type, payload);
+          }
+        };
+        window.__emitAsk('ask_user_question', {
+          id: 'shared-question',
+          questions: [{
+            question: 'Pick one', header: 'Choice', multiSelect: false,
+            options: [{label: 'A'}, {label: 'B'}],
+          }],
+        });
+        """,
+        transport,
+    )
+    card = page.locator(".msg-pane:visible .ask-question")
+    expect(card).to_be_visible(timeout=5000)
+    _app_eval(
+        page,
+        """
+        const msg = app._ensureTabState(app.currentId).messages.find(
+          item => item.role === 'ask_user_question' && item.id === 'shared-question');
+        const originalFetch = window.fetch.bind(window);
+        if (arg !== 'none') {
+          window.fetch = (url, options) => {
+            if (String(url).includes('/api/chat/answer/')) {
+              return new Promise(resolve => {
+                window.__finishLosingAnswer = () => resolve(new Response('{}', {
+                  status: 404, headers: {'Content-Type': 'application/json'},
+                }));
+              });
+            }
+            return originalFetch(url, options);
+          };
+          if (arg === 'choices') {
+            msg.pendingAnswers['Pick one'] = 'A';
+            window.__askSubmission = app.submitAskAnswers(msg);
+          } else {
+            msg.askOtherOpen = true;
+            msg.askOtherText = 'Local answer';
+            window.__askSubmission = app.submitAskOther(msg);
+          }
+        }
+        // Another browser accepted B while this tab's request was in flight.
+        window.__emitAsk('ask_user_question_resolved', {
+          id: 'shared-question', answers: {'Pick one': 'B'},
+        });
+        if (arg !== 'none') {
+          window.__finishLosingAnswer();
+          await window.__askSubmission;
+        }
+        """,
+        submission,
+    )
+    expect(card.locator(".ask-submitted-tag")).to_be_visible(timeout=1500)
+    assert _app_eval(
+        page,
+        """
+        const msg = app._ensureTabState(app.currentId).messages.find(
+          item => item.role === 'ask_user_question' && item.id === 'shared-question');
+        return {submitted: msg.submitted, answer: msg.pendingAnswers['Pick one'],
+          otherOpen: msg.askOtherOpen};
+        """,
+    ) == {"submitted": True, "answer": "B", "otherOpen": False}
+    _assert_no_browser_errors(page, errors)

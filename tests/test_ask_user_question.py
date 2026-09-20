@@ -150,3 +150,30 @@ def test_normalize_drops_unusable_entries():
 def test_normalize_empty_input_returns_empty():
     assert auq._normalize_questions([]) == []
     assert auq._normalize_questions([None, "not a dict", 42]) == []
+
+
+@pytest.mark.asyncio
+async def test_accepted_answer_is_published_before_waking_model(monkeypatch):
+    import json
+
+    sid = "shared-question-session"
+    queue = auq.register_session_queue(sid)
+    other_queue = auq.register_session_queue("other-session")
+    future = asyncio.get_running_loop().create_future()
+    auq._pending[(sid, "question-1")] = future
+    real_put = queue.put_nowait
+
+    def publish(event):
+        assert not future.done()
+        real_put(event)
+
+    monkeypatch.setattr(queue, "put_nowait", publish)
+    answers = {"Pick one": "B"}
+    assert auq.submit_answer(sid, "question-1", answers)
+    event = queue.get_nowait()
+    assert event["event"] == "ask_user_question_resolved"
+    assert json.loads(event["data"]) == {"id": "question-1", "answers": answers}
+    assert await future == answers
+    assert other_queue.empty()
+    assert not auq.submit_answer(sid, "question-1", {"Pick one": "A"})
+    assert queue.empty()
