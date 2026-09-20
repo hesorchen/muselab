@@ -3078,7 +3078,11 @@ def read_file(
     # This is the path that picks up .tmpl, .conf.j2, .env.staging, etc.
     if st_size > 0 and _looks_binary(target):
         raise HTTPException(status_code=415, detail="binary content — not previewable as text")
-    content = target.read_text(encoding="utf-8", errors="replace")
+    try:
+        content = target.read_text(encoding="utf-8", errors="replace")
+    except (FileNotFoundError, NotADirectoryError, IsADirectoryError):
+        # A concurrent filesystem edit can invalidate the stat/sniff above.
+        raise HTTPException(status_code=404, detail="not a file") from None
     if len(content) > MAX_TEXT_SIZE:
         raise HTTPException(
             status_code=413,
