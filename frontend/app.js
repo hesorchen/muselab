@@ -22718,7 +22718,7 @@ function portal() {
       }
     },
     async addMcpFromDraft() {
-      const d = this.settings.mcpDraft;
+      const d = JSON.parse(JSON.stringify(this.settings.mcpDraft));
       const name = (d.name || "").trim();
       const remote = d.transport === "remote";
       // Build the request body per transport. Remote → {type:http, url,
@@ -22750,7 +22750,9 @@ function portal() {
       });
       if (r.ok) {
         this.toast(this.t("set.mcp.added"), "success", 1500);
-        this.settings.mcpDraft = { show: false, transport: "stdio", name: "", command: "", argsStr: "", url: "", authHeader: "" };
+        if (JSON.stringify(this.settings.mcpDraft) === JSON.stringify(d)) {
+          this.settings.mcpDraft = { show: false, transport: "stdio", name: "", command: "", argsStr: "", url: "", authHeader: "" };
+        }
         this.refreshMcpList();
       } else {
         this.toast(this.t("set.mcp.save_failed"), "error", 3000);
@@ -23009,7 +23011,7 @@ function portal() {
     },
 
     async addProviderFromDraft() {
-      const n = this.settings.providerNew;
+      const n = JSON.parse(JSON.stringify(this.settings.providerNew));
       const body = {
         id: null,
         base_url: (n.base_url || "").trim(),
@@ -23018,7 +23020,8 @@ function portal() {
       };
       if ((n.api_key || "").trim()) body.api_key = n.api_key.trim();
       const ok = await this._submitProvider(body, null);
-      if (ok) {
+      // A completed save only clears the draft it submitted.
+      if (ok && JSON.stringify(this.settings.providerNew) === JSON.stringify(n)) {
         this.settings.providerNew = { show: false, base_url: "", prefix: "", models: "", api_key: "" };
       }
     },
