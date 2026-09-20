@@ -5207,7 +5207,8 @@ def test_running_turn_footer_is_owned_by_active_user_boundary():
     assert "|| (pane && pane.streamingModel)" not in model
 
     html = (FRONTEND / "index.html").read_text(encoding="utf-8")
-    footer = html[html.index('<div class="turn-footer"'):]
+    footer_start = html.index('<div class="turn-footer"')
+    footer = html[html.rfind("<template", 0, footer_start):]
     footer = footer[:footer.index('<button class="turn-fork-btn"')]
     assert "paneMsgs[i + 1]._steeringAdjustment !== true" in footer
 
@@ -5244,7 +5245,8 @@ def test_turn_footer_falls_back_to_transcript_time_and_shows_model_and_state():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
     html = (FRONTEND / "index.html").read_text(encoding="utf-8")
 
-    footer = html[html.index('<div class="turn-footer"'):]
+    footer_start = html.index('<div class="turn-footer"')
+    footer = html[html.rfind("<template", 0, footer_start):]
     footer = footer[:footer.index('<button class="turn-fork-btn"')]
     assert "turnFooterTime(m, pane)" in footer
     assert "turnFooterElapsed(m, pane)" in footer
@@ -5415,7 +5417,8 @@ def test_pre_response_state_uses_the_same_turn_separator_not_a_left_bubble():
     assert "fmtStreamElapsed(activeSession.streamElapsed)" in pending
     assert "modelLabel(activeSession.streamingModel)" in pending
 
-    footer = html[html.index('<div class="turn-footer"'):]
+    footer_start = html.index('<div class="turn-footer"')
+    footer = html[html.rfind("<template", 0, footer_start):]
     footer = footer[:footer.index('<button class="turn-fork-btn"')]
     assert "m.role !== 'user'" in footer
     assert "turnFooterStatus(m, pane) === 'running'" in footer

@@ -3118,131 +3118,135 @@
                    It is also the single source of live turn status: restrained
                    dots appear beside "Running" here, avoiding a duplicate
                    sticky status row at the bottom of the viewport. -->
-              <div class="turn-footer"
-                   x-show="(m.role !== 'user' || m.turn_status || m._interrupted || m._failed)
+              <!-- x-show keeps child bindings alive, including full-turn
+                   ownership scans. Mount them only at a turn boundary so
+                   hidden rows in warm panes do not repeat that work on SSE. -->
+              <template x-if="(m.role !== 'user' || m.turn_status || m._interrupted || m._failed)
                      && (i === paneMsgs.length - 1
                        || (paneMsgs[i + 1] && (
                          (paneMsgs[i + 1].role === 'user'
                            && paneMsgs[i + 1]._steeringAdjustment !== true)
                          || paneMsgs[i + 1].display_kind === 'runtime_continuation'
-                       )))
-                     && turnFooterStatus(m, pane)
-                     && (
-                       turnFooterTime(m, pane)
-                       || turnFooterElapsed(m, pane) !== null
-                       || turnFooterModel(m, pane, tid)
-                       || turnFooterStatus(m, pane)
-                       || m._interrupted
-                       || (turnForkMessageId(paneMsgs, i) && !(pane && pane.streaming))
-                     )">
-                <span class="turn-status"
-                      x-show="turnFooterStatus(m, pane)"
-                      :class="[turnFooterStatus(m, pane), {
-                        'background-pending': turnHasPendingBackground(
-                          m, pane, i === paneMsgs.length - 1)
-                      }]">
-                  <span class="turn-running-dots"
-                        x-show="turnFooterStatus(m, pane) === 'running'"
-                        aria-hidden="true"><span></span><span></span><span></span></span>
-                  <span x-text="turnHasPendingBackground(
-                                  m, pane, i === paneMsgs.length - 1)
-                                ? t('chat.main_response_completed')
-                                : turnStatusLabel(turnFooterStatus(m, pane))"></span>
-                  <span class="turn-background-running"
-                        x-show="turnHasPendingBackground(
-                          m, pane, i === paneMsgs.length - 1)"
-                        x-text="' · ' + t('chat.background_running_count', {
-                          count: _backgroundTaskCount(pane),
-                          n: _backgroundTaskCount(pane)
-                        })"></span>
-                </span>
-                <span class="turn-origin"
-                      x-show="turnOriginLabel(m.turn_origin)"
-                      x-text="'· ' + turnOriginLabel(m.turn_origin)"></span>
-                <span class="turn-terminal-reason"
-                      x-show="turnTerminalReasonLabel(
-                        turnFooterStatus(m, pane), m.terminal_reason)"
-                      x-text="'· ' + turnTerminalReasonLabel(
-                        turnFooterStatus(m, pane), m.terminal_reason)"></span>
-                <!-- Old transcripts may predate completion annotations.  Their
-                     last record still carries mts, which is a close and stable
-                     fallback instead of rendering a separator with no time. -->
-                <span x-show="turnFooterTime(m, pane)"
-                      class="msg-ts"
-                      x-text="fmtTurnTime(turnFooterTime(m, pane))"></span>
-                <!-- Total elapsed kept after done so the user can
-                     reference back how long the turn took (esp. useful
-                     for long agentic runs). Stamped in _markDone next
-                     to .ts; only shown when both exist and m.elapsed
-                     >= 1s (sub-second replies don't need the noise). -->
-                <span x-show="turnFooterElapsed(m, pane) !== null && turnFooterTime(m, pane)"
-                      class="msg-elapsed"
-                      x-text="'· ' + fmtStreamElapsed(turnFooterElapsed(m, pane))"></span>
-                <span x-show="turnFooterModel(m, pane, tid)" class="turn-model"
-                      :title="turnFooterModel(m, pane, tid)"
-                      x-text="'· ' + modelLabel(turnFooterModel(m, pane, tid))"></span>
-                <details class="turn-model-usage"
-                         x-show="modelUsageEntries(m.model_usage).length">
-                  <summary x-text="'· ' + modelUsageSummary(m.model_usage)"></summary>
-                  <div class="turn-model-usage-popover">
-                    <template x-for="row in modelUsageEntries(m.model_usage)"
-                              :key="row.model">
-                      <div class="turn-model-usage-row">
-                        <strong x-text="modelUsageTitle(row)"></strong>
-                        <span x-text="modelUsageDetail(row)"></span>
-                      </div>
-                    </template>
-                  </div>
-                </details>
-                <details class="turn-hook-traces"
-                         x-show="hookTracesForTurn(pane, m).length">
-                  <summary x-text="hookTraceSummary(pane, m)"></summary>
-                  <div class="turn-hook-traces-popover">
-                    <template x-for="trace in hookTracesForTurn(pane, m)"
-                              :key="trace.trace_id">
-                      <div class="turn-hook-trace-row" :class="'is-' + trace.status">
-                        <span class="hook-trace-status"></span>
-                        <strong x-text="trace.hook_event"></strong>
-                        <span x-text="hookTraceStatusLabel(trace)"></span>
-                        <span class="mono" x-show="hookTraceDuration(trace)"
-                              x-text="hookTraceDuration(trace)"></span>
-                        <span class="mono" x-show="trace.exit_code !== null && trace.exit_code !== undefined"
-                              x-text="'exit ' + trace.exit_code"></span>
-                      </div>
-                    </template>
-                  </div>
-                </details>
-                <button type="button" class="memory-recall-trace"
-                        x-show="m.memoryRecall && m.memoryRecall.count"
-                        :aria-expanded="memoryRecallPopover.show && _memoryRecallOwner === m"
-                        @click.stop="toggleMemoryRecallPopover($event, m)"
-                        x-text="lang==='zh'
-                          ? `· 使用了 ${m.memoryRecall?.count || 0} 条记忆`
-                          : `· Used ${m.memoryRecall?.count || 0} memories`"></button>
-                <button class="turn-fork-btn"
-                        type="button"
-                        x-show="turnForkMessageId(paneMsgs, i) && !(pane && pane.streaming)"
-                        :disabled="forkingSessionId === tid || isTabStreaming(tid)"
-                        @click.stop="forkConversation(tid, turnForkMessageId(paneMsgs, i))"
-                        :title="lang==='zh' ? '从这里 Fork' : 'Fork from here'"
-                        :aria-label="lang==='zh' ? '从这里 Fork' : 'Fork from here'">
-                  <svg><use href="#i-fork"/></svg>
-                </button>
-                <button class="turn-fork-btn turn-retry-btn"
-                        type="button"
-                        x-show="retryTurnUserMessage(paneMsgs, i, pane)"
-                        :disabled="retryingSessionId === tid || isTabStreaming(tid)"
-                        @click.stop="retryLastTurn(
-                          tid, retryTurnUserMessage(paneMsgs, i, pane))"
-                        :title="lang==='zh'
-                          ? '在新分支重试最后一轮（原会话不变）'
-                          : 'Retry the last turn in a new branch (source unchanged)'"
-                        :aria-label="lang==='zh'
-                          ? '在新分支重试最后一轮'
-                          : 'Retry the last turn in a new branch'">
-                  <svg><use href="#i-refresh"/></svg>
-                </button>
-              </div>
+                       )))">
+                <div class="turn-footer"
+                     x-show="turnFooterStatus(m, pane)
+                       && (
+                         turnFooterTime(m, pane)
+                         || turnFooterElapsed(m, pane) !== null
+                         || turnFooterModel(m, pane, tid)
+                         || turnFooterStatus(m, pane)
+                         || m._interrupted
+                         || (turnForkMessageId(paneMsgs, i) && !(pane && pane.streaming))
+                       )">
+                  <span class="turn-status"
+                        x-show="turnFooterStatus(m, pane)"
+                        :class="[turnFooterStatus(m, pane), {
+                          'background-pending': turnHasPendingBackground(
+                            m, pane, i === paneMsgs.length - 1)
+                        }]">
+                    <span class="turn-running-dots"
+                          x-show="turnFooterStatus(m, pane) === 'running'"
+                          aria-hidden="true"><span></span><span></span><span></span></span>
+                    <span x-text="turnHasPendingBackground(
+                                    m, pane, i === paneMsgs.length - 1)
+                                  ? t('chat.main_response_completed')
+                                  : turnStatusLabel(turnFooterStatus(m, pane))"></span>
+                    <span class="turn-background-running"
+                          x-show="turnHasPendingBackground(
+                            m, pane, i === paneMsgs.length - 1)"
+                          x-text="' · ' + t('chat.background_running_count', {
+                            count: _backgroundTaskCount(pane),
+                            n: _backgroundTaskCount(pane)
+                          })"></span>
+                  </span>
+                  <span class="turn-origin"
+                        x-show="turnOriginLabel(m.turn_origin)"
+                        x-text="'· ' + turnOriginLabel(m.turn_origin)"></span>
+                  <span class="turn-terminal-reason"
+                        x-show="turnTerminalReasonLabel(
+                          turnFooterStatus(m, pane), m.terminal_reason)"
+                        x-text="'· ' + turnTerminalReasonLabel(
+                          turnFooterStatus(m, pane), m.terminal_reason)"></span>
+                  <!-- Old transcripts may predate completion annotations.  Their
+                       last record still carries mts, which is a close and stable
+                       fallback instead of rendering a separator with no time. -->
+                  <span x-show="turnFooterTime(m, pane)"
+                        class="msg-ts"
+                        x-text="fmtTurnTime(turnFooterTime(m, pane))"></span>
+                  <!-- Total elapsed kept after done so the user can
+                       reference back how long the turn took (esp. useful
+                       for long agentic runs). Stamped in _markDone next
+                       to .ts; only shown when both exist and m.elapsed
+                       >= 1s (sub-second replies don't need the noise). -->
+                  <span x-show="turnFooterElapsed(m, pane) !== null && turnFooterTime(m, pane)"
+                        class="msg-elapsed"
+                        x-text="'· ' + fmtStreamElapsed(turnFooterElapsed(m, pane))"></span>
+                  <span x-show="turnFooterModel(m, pane, tid)" class="turn-model"
+                        :title="turnFooterModel(m, pane, tid)"
+                        x-text="'· ' + modelLabel(turnFooterModel(m, pane, tid))"></span>
+                  <details class="turn-model-usage"
+                           x-show="modelUsageEntries(m.model_usage).length">
+                    <summary x-text="'· ' + modelUsageSummary(m.model_usage)"></summary>
+                    <div class="turn-model-usage-popover">
+                      <template x-for="row in modelUsageEntries(m.model_usage)"
+                                :key="row.model">
+                        <div class="turn-model-usage-row">
+                          <strong x-text="modelUsageTitle(row)"></strong>
+                          <span x-text="modelUsageDetail(row)"></span>
+                        </div>
+                      </template>
+                    </div>
+                  </details>
+                  <details class="turn-hook-traces"
+                           x-show="hookTracesForTurn(pane, m).length">
+                    <summary x-text="hookTraceSummary(pane, m)"></summary>
+                    <div class="turn-hook-traces-popover">
+                      <template x-for="trace in hookTracesForTurn(pane, m)"
+                                :key="trace.trace_id">
+                        <div class="turn-hook-trace-row" :class="'is-' + trace.status">
+                          <span class="hook-trace-status"></span>
+                          <strong x-text="trace.hook_event"></strong>
+                          <span x-text="hookTraceStatusLabel(trace)"></span>
+                          <span class="mono" x-show="hookTraceDuration(trace)"
+                                x-text="hookTraceDuration(trace)"></span>
+                          <span class="mono" x-show="trace.exit_code !== null && trace.exit_code !== undefined"
+                                x-text="'exit ' + trace.exit_code"></span>
+                        </div>
+                      </template>
+                    </div>
+                  </details>
+                  <button type="button" class="memory-recall-trace"
+                          x-show="m.memoryRecall && m.memoryRecall.count"
+                          :aria-expanded="memoryRecallPopover.show && _memoryRecallOwner === m"
+                          @click.stop="toggleMemoryRecallPopover($event, m)"
+                          x-text="lang==='zh'
+                            ? `· 使用了 ${m.memoryRecall?.count || 0} 条记忆`
+                            : `· Used ${m.memoryRecall?.count || 0} memories`"></button>
+                  <button class="turn-fork-btn"
+                          type="button"
+                          x-show="turnForkMessageId(paneMsgs, i) && !(pane && pane.streaming)"
+                          :disabled="forkingSessionId === tid || isTabStreaming(tid)"
+                          @click.stop="forkConversation(tid, turnForkMessageId(paneMsgs, i))"
+                          :title="lang==='zh' ? '从这里 Fork' : 'Fork from here'"
+                          :aria-label="lang==='zh' ? '从这里 Fork' : 'Fork from here'">
+                    <svg><use href="#i-fork"/></svg>
+                  </button>
+                  <button class="turn-fork-btn turn-retry-btn"
+                          type="button"
+                          x-show="retryTurnUserMessage(paneMsgs, i, pane)"
+                          :disabled="retryingSessionId === tid || isTabStreaming(tid)"
+                          @click.stop="retryLastTurn(
+                            tid, retryTurnUserMessage(paneMsgs, i, pane))"
+                          :title="lang==='zh'
+                            ? '在新分支重试最后一轮（原会话不变）'
+                            : 'Retry the last turn in a new branch (source unchanged)'"
+                          :aria-label="lang==='zh'
+                            ? '在新分支重试最后一轮'
+                            : 'Retry the last turn in a new branch'">
+                    <svg><use href="#i-refresh"/></svg>
+                  </button>
+                </div>
+              </template>
             </div>
           </template>
           </div>
