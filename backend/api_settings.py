@@ -414,14 +414,15 @@ def put_settings(req: SettingsIn) -> dict:
                 )
 
         _write_env(updates)
-    # The `chat.py` module captured `MODEL` at import time; if we just touched
-    # `MUSELAB_MODEL` here, existing imports won't see the new value. Push it
-    # back so subsequent stream() calls pick up the new default.
-    if "MUSELAB_MODEL" in updates:
-        from . import settings as _settings
-        _settings.MODEL = updates["MUSELAB_MODEL"]
-        from . import chat as _chat
-        _chat.MODEL = updates["MUSELAB_MODEL"]
+        # The `chat.py` module captured `MODEL` at import time; if we just touched
+        # `MUSELAB_MODEL` here, existing imports won't see the new value. Push it
+        # back so subsequent stream() calls pick up the new default.
+        # Publish under the writer lock so a newer save cannot be overtaken.
+        if "MUSELAB_MODEL" in updates:
+            from . import settings as _settings
+            _settings.MODEL = updates["MUSELAB_MODEL"]
+            from . import chat as _chat
+            _chat.MODEL = updates["MUSELAB_MODEL"]
     # `updated_count` is the user-facing tally for the "Saved N settings" toast.
     # Differs from len(updated) in one case: model changes write two env keys
     # (MUSELAB_MODEL + MUSELAB_DEFAULT_MODEL — they're an implementation detail
