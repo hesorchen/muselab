@@ -26354,7 +26354,10 @@ function portal() {
       return saved;
     },
     onPreviewViewportScroll() {
-      this.dismissTransientPreviewQuote(true);
+      // Scrolling hides the contextual actions, but the native range still
+      // belongs to this document. Keep it so wheel/drag selection can span
+      // multiple screens and the selected text remains available to copy.
+      this.dismissTransientPreviewQuote(false);
       clearTimeout(this._previewViewSaveTimer);
       const ownerPath = this.selected;
       const ownerLoadSeq = this._previewLoadSeq;
