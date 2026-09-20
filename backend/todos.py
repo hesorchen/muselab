@@ -101,14 +101,14 @@ class TodosService:
         self._revision = int(raw.get("revision") or 0)
         self._items = self._normalize_items(raw.get("items"))
 
-    def _save(self) -> None:
+    def _save(self, items: list[dict[str, Any]], revision: int) -> None:
         self.ensure_private_storage()
         atomic_write_text(
             self.path,
             json.dumps({
                 "version": 1,
-                "revision": self._revision,
-                "items": self._items,
+                "revision": revision,
+                "items": items,
             }, ensure_ascii=False, indent=2),
             mode=0o600,
         )
@@ -135,9 +135,13 @@ class TodosService:
         with self._lock:
             if base_revision is not None and base_revision != self._revision:
                 return None
-            self._items = self._normalize_items(items)
-            self._revision += 1
-            self._save()
+            next_items = self._normalize_items(items)
+            next_revision = self._revision + 1
+            # Publish a revision only after its contents are durably saved.
+            # Failed writes must leave the previous revision available to retry.
+            self._save(next_items, next_revision)
+            self._items = next_items
+            self._revision = next_revision
             self._publish_locked()
             return {
                 "revision": self._revision,
