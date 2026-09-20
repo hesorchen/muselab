@@ -718,6 +718,8 @@ def _slug(text: str) -> str:
 _OVERRIDES_CACHE: tuple[tuple[int, int], dict] | None = None
 _CATALOG_CACHE: tuple[tuple[int, int] | None, tuple[Provider, ...]] | None = None
 _OVERRIDES_CACHE_LOCK = threading.Lock()
+# Keep validation and read/modify/write together across API request threads.
+_OVERRIDES_WRITE_LOCK = threading.RLock()
 
 
 def _overrides_stat_key() -> tuple[int, int] | None:
@@ -945,77 +947,80 @@ def upsert_provider(*, pid: str | None, base_url: str, prefix: str,
     """Create or update a provider override. Returns the saved effective
     Provider. api-key is handled separately (stays in .env). Raises ValueError
     on invalid input."""
-    models = [str(m).strip() for m in models if str(m).strip()]
-    validate_provider_fields(base_url, prefix, models, this_id=pid)
-    store = _load_overrides()
-    # New provider: mint a stable custom id + an env-key slot if none given.
-    if not pid:
-        pid = "c:" + _slug(base_url)
-        # Avoid collision with an existing id.
-        n = 1
-        base_pid = pid
-        existing = set(store["providers"].keys()) | {_builtin_id(b) for b in CATALOG}
-        while pid in existing:
-            n += 1
-            pid = f"{base_pid}-{n}"
-    if not env_key:
-        env_key = "MUSELAB_PROVIDER_" + _slug(base_url).upper().replace("-", "_") + "_API_KEY"
-    # User-supplied env_key flows into .env writes (api_settings._write_env) —
-    # without this gate a crafted value could overwrite MUSELAB_TOKEN, PATH,
-    # or another provider's credential.
-    validate_env_key(env_key)
-    entry = {
-        "base_url": base_url.strip(),
-        "prefix": prefix.strip(),
-        "display": (display or prefix).strip(),
-        "env_key": env_key.strip(),
-        "models": models,
-    }
-    store["providers"][pid] = entry
-    # If this id was previously deleted (e.g. re-adding a built-in), un-delete.
-    store["deleted"] = [d for d in store["deleted"] if d != pid]
-    _save_overrides(store)
-    return _provider_from_def(pid, entry, _builtin_by_id(pid))
+    with _OVERRIDES_WRITE_LOCK:
+        models = [str(m).strip() for m in models if str(m).strip()]
+        validate_provider_fields(base_url, prefix, models, this_id=pid)
+        store = _load_overrides()
+        # New provider: mint a stable custom id + an env-key slot if none given.
+        if not pid:
+            pid = "c:" + _slug(base_url)
+            # Avoid collision with an existing id.
+            n = 1
+            base_pid = pid
+            existing = set(store["providers"].keys()) | {_builtin_id(b) for b in CATALOG}
+            while pid in existing:
+                n += 1
+                pid = f"{base_pid}-{n}"
+        if not env_key:
+            env_key = "MUSELAB_PROVIDER_" + _slug(base_url).upper().replace("-", "_") + "_API_KEY"
+        # User-supplied env_key flows into .env writes (api_settings._write_env) —
+        # without this gate a crafted value could overwrite MUSELAB_TOKEN, PATH,
+        # or another provider's credential.
+        validate_env_key(env_key)
+        entry = {
+            "base_url": base_url.strip(),
+            "prefix": prefix.strip(),
+            "display": (display or prefix).strip(),
+            "env_key": env_key.strip(),
+            "models": models,
+        }
+        store["providers"][pid] = entry
+        # If this id was previously deleted (e.g. re-adding a built-in), un-delete.
+        store["deleted"] = [d for d in store["deleted"] if d != pid]
+        _save_overrides(store)
+        return _provider_from_def(pid, entry, _builtin_by_id(pid))
 
 
 def delete_provider(pid: str) -> bool:
     """Remove a provider. Built-ins are tombstoned in `deleted` so they don't
     reappear; user-created providers are dropped outright. Returns True if
     anything changed."""
-    store = _load_overrides()
-    changed = False
-    if pid in store["providers"]:
-        del store["providers"][pid]
-        changed = True
-    if _builtin_by_id(pid) is not None and pid not in store["deleted"]:
-        store["deleted"].append(pid)
-        changed = True
-    if changed:
-        _save_overrides(store)
-    return changed
+    with _OVERRIDES_WRITE_LOCK:
+        store = _load_overrides()
+        changed = False
+        if pid in store["providers"]:
+            del store["providers"][pid]
+            changed = True
+        if _builtin_by_id(pid) is not None and pid not in store["deleted"]:
+            store["deleted"].append(pid)
+            changed = True
+        if changed:
+            _save_overrides(store)
+        return changed
 
 
 def restore_provider(pid: str) -> bool:
     """Restore a built-in provider to its factory default by dropping its
     override + tombstone. No-op (returns False) for user-created providers
     (nothing to restore to). Caller should DELETE those instead."""
-    # Anthropic isn't in CATALOG (special auth), but its model list IS
-    # overridable — route restore to the dedicated Claude-models reset.
-    if pid == "anthropic":
-        return restore_anthropic_models()
-    if _builtin_by_id(pid) is None:
-        return False
-    store = _load_overrides()
-    changed = False
-    if pid in store["providers"]:
-        del store["providers"][pid]
-        changed = True
-    if pid in store["deleted"]:
-        store["deleted"] = [d for d in store["deleted"] if d != pid]
-        changed = True
-    if changed:
-        _save_overrides(store)
-    return changed
+    with _OVERRIDES_WRITE_LOCK:
+        # Anthropic isn't in CATALOG (special auth), but its model list IS
+        # overridable — route restore to the dedicated Claude-models reset.
+        if pid == "anthropic":
+            return restore_anthropic_models()
+        if _builtin_by_id(pid) is None:
+            return False
+        store = _load_overrides()
+        changed = False
+        if pid in store["providers"]:
+            del store["providers"][pid]
+            changed = True
+        if pid in store["deleted"]:
+            store["deleted"] = [d for d in store["deleted"] if d != pid]
+            changed = True
+        if changed:
+            _save_overrides(store)
+        return changed
 
 
 def provider_meta() -> list[dict]:
@@ -1160,28 +1165,30 @@ def set_anthropic_models(models: list[str]) -> None:
     """Persist a custom Claude model list. Validates non-empty + that every id
     looks like a Claude model (the auth/endpoint are fixed to Anthropic, so a
     non-`claude-` id here would 404). Raises ValueError on bad input."""
-    cleaned = [str(m).strip() for m in (models or []) if str(m).strip()]
-    if not cleaned:
-        raise ValueError("model list cannot be empty")
-    for m in cleaned:
-        if not m.lower().startswith("claude-"):
-            raise ValueError(f"not a Claude model id: {m!r} (must start with 'claude-')")
-    if len(set(cleaned)) != len(cleaned):
-        raise ValueError("duplicate model ids")
-    store = _load_overrides()
-    store["anthropic_models"] = cleaned
-    _save_overrides(store)
+    with _OVERRIDES_WRITE_LOCK:
+        cleaned = [str(m).strip() for m in (models or []) if str(m).strip()]
+        if not cleaned:
+            raise ValueError("model list cannot be empty")
+        for m in cleaned:
+            if not m.lower().startswith("claude-"):
+                raise ValueError(f"not a Claude model id: {m!r} (must start with 'claude-')")
+        if len(set(cleaned)) != len(cleaned):
+            raise ValueError("duplicate model ids")
+        store = _load_overrides()
+        store["anthropic_models"] = cleaned
+        _save_overrides(store)
 
 
 def restore_anthropic_models() -> bool:
     """Drop the Claude model override (revert to factory default). Returns
     True if there was an override to remove, False if already default."""
-    store = _load_overrides()
-    if store.get("anthropic_models") is None:
-        return False
-    store["anthropic_models"] = None
-    _save_overrides(store)
-    return True
+    with _OVERRIDES_WRITE_LOCK:
+        store = _load_overrides()
+        if store.get("anthropic_models") is None:
+            return False
+        store["anthropic_models"] = None
+        _save_overrides(store)
+        return True
 
 
 # Tier is left open (`[a-z]+`) rather than a fixed opus|sonnet|haiku allowlist:
