@@ -437,6 +437,14 @@ class ActivityService:
             self._events[-_MAX_EVENTS:], ensure_ascii=False, indent=2),
             mode=0o600)
 
+    def _save_event_edits_locked(self, previous: list[dict[str, Any]]) -> None:
+        """Keep failed user edits retryable and tied to the published revision."""
+        try:
+            self._save()
+        except Exception:
+            self._events = previous
+            raise
+
     @staticmethod
     def _enqueue_update(
         queue: asyncio.Queue[dict[str, Any]],
@@ -1328,8 +1336,9 @@ class ActivityService:
                 return None
             target = str(name)
             if str(item.get("session_name") or "") != target:
+                previous = [dict(row) for row in self._events]
                 item["session_name"] = target
-                self._save()
+                self._save_event_edits_locked(previous)
                 self._publish_locked(item=item)
             return {
                 "generation": self._generation,
@@ -1380,8 +1389,9 @@ class ActivityService:
                 return None
             target = bool(pinned)
             if bool(item.get("pinned")) != target:
+                previous = [dict(row) for row in self._events]
                 item["pinned"] = target
-                self._save()
+                self._save_event_edits_locked(previous)
                 self._publish_locked(item=item)
             return {
                 "generation": self._generation,
@@ -1394,6 +1404,7 @@ class ActivityService:
         changed = 0
         acked_ids: list[str] = []
         with self._lock:
+            previous = [dict(row) for row in self._events]
             for item in self._events:
                 if event_id is not None and item.get("id") != event_id:
                     continue
@@ -1405,7 +1416,7 @@ class ActivityService:
                     if item.get("id"):
                         acked_ids.append(str(item["id"]))
             if changed:
-                self._save()
+                self._save_event_edits_locked(previous)
                 self._publish_locked(acked_ids=acked_ids)
         return changed
 

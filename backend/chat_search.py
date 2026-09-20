@@ -20,6 +20,7 @@ import threading
 import time
 from typing import Callable
 
+from .chat_history import raw_msg_from_entry
 from .observability import perf_event
 from .private_storage import ensure_private_directory, ensure_private_regular_file
 
@@ -110,6 +111,11 @@ class SearchIndex:
                 ''')
                 if not has_triggers:
                     db.execute("INSERT INTO search_fts(search_fts) VALUES ('rebuild')")
+            if db.execute('PRAGMA user_version').fetchone()[0] < 1:
+                # Legacy checkpoints skipped native steering attachments. Their
+                # unchanged files need one rebuild under the complete parser.
+                db.execute('DELETE FROM sources')
+                db.execute('PRAGMA user_version=1')
             db.commit()
             return db
         except BaseException:
@@ -163,6 +169,11 @@ class SearchIndex:
                         entry = json.loads(raw.decode('utf-8-sig'))
                     except (UnicodeDecodeError, ValueError):
                         entry = None
+                    if isinstance(entry, dict) and entry.get('type') == 'attachment':
+                        message = raw_msg_from_entry(entry)
+                        if message is not None and message.message.get('_muselab_steering'):
+                            entry = {**entry, 'type': message.type, 'uuid': message.uuid,
+                                     'message': message.message}
                     if isinstance(entry, dict) and entry.get('type') in ('user', 'assistant'):
                         message = entry.get('message')
                         body = extract(message.get('content')) if isinstance(message, dict) else ''
