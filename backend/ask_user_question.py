@@ -6,6 +6,7 @@ to this module's per-session queue, awaits the Future resolved by the browser's
 answer endpoint, and injects that answer back into the native tool input.
 """
 import asyncio
+import json
 from typing import Any
 
 # Per-session pending registry: (session_id, question_id) -> Future of answers dict.
@@ -181,5 +182,15 @@ def submit_answer(session_id: str, question_id: str, answers: dict[str, Any]) ->
         activity.resume(session_id)
     except Exception:
         pass
+    # Every subscriber may show this question. Publish the accepted answer
+    # before waking the model, so another tab cannot keep a stale live card.
+    queue = _session_queues.get(session_id)
+    if queue is not None:
+        queue.put_nowait({
+            "event": "ask_user_question_resolved",
+            "data": json.dumps(
+                {"id": question_id, "answers": answers}, ensure_ascii=False,
+            ),
+        })
     fut.set_result(answers)
     return True

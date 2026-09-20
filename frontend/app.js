@@ -398,7 +398,7 @@ const CHAT_MUX_STREAM_EVENTS = [
   "compact_progress", "task_started", "task_progress", "task_notification",
   "scheduled_tasks",
   "queue_steering",
-  "rate_limit", "ask_user_question", "permission_request",
+  "rate_limit", "ask_user_question", "ask_user_question_resolved", "permission_request",
   "permission_request_resolved", "permission_mode_changed",
   "permission_mode_change_failed", "ping", "done", "error", "cancelled",
   "resync",
@@ -34675,7 +34675,7 @@ function portal() {
           "subagent_delta", "subagent_block", "hook_trace", "compact_progress",
           "task_started", "task_progress", "task_notification", "scheduled_tasks", "rate_limit",
           "queue_steering",
-          "ask_user_question", "permission_request", "permission_request_resolved",
+          "ask_user_question", "ask_user_question_resolved", "permission_request", "permission_request_resolved",
           "permission_mode_changed", "permission_mode_change_failed",
         ].includes(ev.type)) {
           streamState.streamPhase = "running";
@@ -34684,7 +34684,7 @@ function portal() {
       ["startup", "text", "thinking", "tool_use", "tool_result",
        "subagent_delta", "subagent_block", "hook_trace", "compact_progress", "task_started",
        "task_progress", "task_notification", "scheduled_tasks", "rate_limit", "queue_steering",
-       "ask_user_question", "permission_request", "permission_request_resolved",
+       "ask_user_question", "ask_user_question_resolved", "permission_request", "permission_request_resolved",
        "permission_mode_changed",
        "permission_mode_change_failed", "ping",
        "done", "error", "cancelled", "resync"].forEach(
@@ -35315,11 +35315,30 @@ function portal() {
           questions: d.questions,
           pendingAnswers,
           submitted: false,
+          _answerAcknowledged: false,
           askOtherOpen: false,
           askOtherText: "",
         });
 
         _scrollIfActive();
+      });
+      es.addEventListener("ask_user_question_resolved", ev => {
+        let d;
+        try { d = JSON.parse(ev.data); } catch (_) { return; }
+        if (!d.id) return;
+        const messages = streamState.messages;
+        for (let i = messages.length - 1; i >= 0; i--) {
+          const msg = messages[i];
+          if (msg.role !== "ask_user_question" || msg.id !== d.id) continue;
+          msg._answerAcknowledged = true;
+          msg.submitted = true;
+          msg.askOtherOpen = false;
+          if (d.answers && typeof d.answers === "object"
+              && !Array.isArray(d.answers)) {
+            msg.pendingAnswers = {...d.answers};
+          }
+          break;
+        }
       });
       es.addEventListener("permission_request", ev => {
         let d;
@@ -36666,11 +36685,12 @@ function portal() {
             body: JSON.stringify({ answers }),
           },
         );
-        if (!r.ok) {
+        if (!r.ok && !msg._answerAcknowledged) {
           msg.submitted = false;
           this.toast(this.t("ask.submit_failed"), "error", 3000);
         }
       } catch (e) {
+        if (msg._answerAcknowledged) return;
         msg.submitted = false;
         this.toast(this.t("ask.submit_failed"), "error", 3000);
       }
@@ -36691,11 +36711,12 @@ function portal() {
             body: JSON.stringify({ answers: msg.pendingAnswers }),
           },
         );
-        if (!r.ok) {
+        if (!r.ok && !msg._answerAcknowledged) {
           msg.submitted = false;
           this.toast(this.t("ask.submit_failed"), "error", 3000);
         }
       } catch (e) {
+        if (msg._answerAcknowledged) return;
         msg.submitted = false;
         this.toast(this.t("ask.submit_failed"), "error", 3000);
       }
