@@ -224,6 +224,8 @@ def _read_raw(
         return None, None
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
     flags |= getattr(os, "O_NOFOLLOW", 0)
+    # Opening a FIFO must not wait for a writer before fstat can reject it.
+    flags |= getattr(os, "O_NONBLOCK", 0)
     try:
         try:
             file_fd = os.open(path.name, flags, dir_fd=directory_fd)
@@ -238,16 +240,19 @@ def _read_raw(
                 "settings file cannot be opened safely"
             ) from exc
 
-        with os.fdopen(file_fd, "rb") as handle:
-            file_stat = os.fstat(handle.fileno())
+        try:
+            file_stat = os.fstat(file_fd)
             if not stat.S_ISREG(file_stat.st_mode):
                 raise UnsafeHookSettingsPath(
                     "settings file must be a regular file"
                 )
-            raw = handle.read(_MAX_SETTINGS_BYTES + 1)
+            with os.fdopen(file_fd, "rb", closefd=False) as handle:
+                raw = handle.read(_MAX_SETTINGS_BYTES + 1)
             if len(raw) > _MAX_SETTINGS_BYTES:
                 raise InvalidHookSettings("settings file is too large")
             return raw, stat.S_IMODE(file_stat.st_mode)
+        finally:
+            os.close(file_fd)
     finally:
         os.close(directory_fd)
 

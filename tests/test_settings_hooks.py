@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import stat
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -346,3 +348,36 @@ def test_masked_header_without_stored_secret_is_rejected(
     )
     assert response.status_code == 422
     assert not hook_paths["user"].exists()
+
+
+@pytest.mark.parametrize("scope", ["user", "project", "local"])
+@pytest.mark.parametrize("kind", ["fifo", "directory"])
+def test_nonregular_settings_returns_conflict_without_waiting_for_a_writer(
+    hook_paths, client, auth, scope, kind,
+):
+    path = hook_paths[scope]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if kind == "fifo":
+        os.mkfifo(path)
+    else:
+        path.mkdir()
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        request = executor.submit(
+            client.get, f"/api/settings/hooks/{scope}", headers=auth,
+        )
+        try:
+            response = request.result(timeout=5)
+        finally:
+            if kind == "fifo" and not request.done():
+                # Release an old blocking open so a failed regression cannot
+                # strand the test worker or keep the HTTP client alive.
+                rescue_fd = os.open(path, os.O_RDWR | os.O_NONBLOCK)
+                try:
+                    request.exception(timeout=5)
+                finally:
+                    os.close(rescue_fd)
+
+    assert response.status_code == 409
+    assert "regular file" in response.text
+    assert stat.S_ISFIFO(path.stat().st_mode) if kind == "fifo" else path.is_dir()
