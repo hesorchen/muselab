@@ -254,3 +254,19 @@ def test_search_remains_complete_without_optional_trigram(tmp_path, monkeypatch)
         _strip_cli_slash_wrapper, _make_snippet, metrics)
     assert [row['uuid'] for row in result['hits']] == ['complete']
     assert metrics['fts'] is False
+
+
+def test_search_snippet_uses_original_text_offsets_after_case_expansion(client, auth, _staged_jsonls):
+    staged = _staged_jsonls
+    _write_jsonl(staged['dir'] / f"{staged['sid_a']}.jsonl", [{
+        'type': 'user', 'uuid': 'unicode-offset',
+        'message': {'content': 'İ' * 100 + ' find-this-marker ' + 'suffix ' * 30},
+        'timestamp': '2026-09-01T00:00:00Z',
+    }])
+
+    response = client.get('/api/chat/search', params={'q': 'FIND-THIS-MARKER'}, headers=auth)
+    assert response.status_code == 200
+    hits = response.json()['hits']
+    assert [hit['uuid'] for hit in hits] == ['unicode-offset']
+    assert 'find-this-marker' in hits[0]['snippet']
+    assert len(hits[0]['snippet']) <= 200

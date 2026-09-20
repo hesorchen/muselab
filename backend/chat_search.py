@@ -41,6 +41,25 @@ def _guard(handle, offset: int) -> str:
     return hashlib.blake2b(handle.read(min(offset, 65536)), digest_size=16).hexdigest()
 
 
+def _source_match_span(text: str, folded_text: str, needle: str) -> tuple[int, int]:
+    """Map a lowercase substring match back to original-text coordinates."""
+    start = folded_text.index(needle)
+    end = start + len(needle)
+    if len(text) == len(folded_text):
+        return start, len(needle)
+    # Unicode lowercasing can expand a source character (for example İ).
+    # Indexed offsets then drift from the text the snippet renderer slices.
+    folded_offset = 0
+    source_start = 0
+    for index, character in enumerate(text):
+        if folded_offset <= start:
+            source_start = index
+        folded_offset += len(character.lower())
+        if folded_offset >= end:
+            return source_start, index + 1 - source_start
+    return len(text), 0
+
+
 class SearchIndex:
     def __init__(self, path: Path):
         self.path = path
@@ -212,7 +231,7 @@ class SearchIndex:
             hits = [{
                 'sid': row['sid'], 'name': names.get(row['sid'], ''), 'uuid': row['uuid'],
                 'role': row['role'], 'ts': row['ts'],
-                'snippet': snippet(row['body'], row['folded'].find(folded), len(query)),
+                'snippet': snippet(row['body'], *_source_match_span(row['body'], row['folded'], folded)),
             } for row in rows]
             metrics['lookup_ms'] = round((time.perf_counter() - sql_started) * 1000)
             metrics['fts'] = bool(use_fts)
