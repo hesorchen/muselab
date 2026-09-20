@@ -24,6 +24,13 @@ class CapabilityTicketStore:
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
     def _prune(self, now: float) -> None:
+        if len(self._rows) > self.max_entries:
+            # LRU order is not expiry order: ticket kinds have different TTLs,
+            # and reusing a capability moves it to the end. Reclaim expired
+            # entries before capacity pressure can evict a still-live ticket.
+            expired = [key for key, row in self._rows.items() if row[2] < now]
+            for key in expired:
+                self._rows.pop(key, None)
         while self._rows:
             digest, row = next(iter(self._rows.items()))
             if row[2] >= now and len(self._rows) <= self.max_entries:
