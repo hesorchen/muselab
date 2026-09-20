@@ -142,7 +142,7 @@ def relative_path(cwd: Path, value: Any) -> str | None:
         target = cwd / target
     try:
         return str(target.resolve().relative_to(cwd.resolve()))
-    except (OSError, ValueError):
+    except (OSError, ValueError, RuntimeError):
         return None
 
 

@@ -304,3 +304,92 @@ def test_send_to_all_redacts_endpoint_and_proxy_details(
     assert endpoint not in diagnostics
     assert "private-auth-token" not in diagnostics
     assert "ConnectionError" in diagnostics
+
+
+def test_vapid_failed_initial_write_never_publishes_unpersisted_key(push_mod, temp_root, monkeypatch):
+    original_write = push_mod.atomic_write_text
+
+    def fail_write(*args, **kwargs):
+        raise OSError('simulated full disk')
+
+    monkeypatch.setattr(push_mod, 'atomic_write_text', fail_write)
+    for _ in range(2):
+        with pytest.raises(OSError, match='simulated full disk'):
+            push_mod.get_vapid_public_key()
+    vapid_file = temp_root / '.muselab' / 'vapid.json'
+    assert not vapid_file.exists()
+
+    monkeypatch.setattr(push_mod, 'atomic_write_text', original_write)
+    public_key = push_mod.get_vapid_public_key()
+    assert vapid_file.exists()
+    push_mod._vapid = None
+    assert push_mod.get_vapid_public_key() == public_key
+
+
+def test_vapid_failed_migration_retries_without_changing_key(push_mod, temp_root, monkeypatch):
+    from cryptography.hazmat.primitives import serialization
+
+    public_key = push_mod.get_vapid_public_key()
+    vapid_file = temp_root / '.muselab' / 'vapid.json'
+    data = json.loads(vapid_file.read_text(encoding='utf-8'))
+    key = serialization.load_pem_private_key(data['private_pem'].encode('ascii'), password=None)
+    data['private_pem'] = key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    ).decode('ascii')
+    original_bytes = json.dumps(data).encode('utf-8')
+    vapid_file.write_bytes(original_bytes)
+    push_mod._vapid = None
+    original_write = push_mod.atomic_write_text
+
+    def fail_write(*args, **kwargs):
+        raise OSError('simulated full disk')
+
+    monkeypatch.setattr(push_mod, 'atomic_write_text', fail_write)
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match='Refusing to regenerate'):
+            push_mod.get_vapid_public_key()
+    assert vapid_file.read_bytes() == original_bytes
+
+    monkeypatch.setattr(push_mod, 'atomic_write_text', original_write)
+    assert push_mod.get_vapid_public_key() == public_key
+    migrated = json.loads(vapid_file.read_text(encoding='utf-8'))
+    assert 'BEGIN EC PRIVATE KEY' in migrated['private_pem']
+    push_mod._vapid = None
+    assert push_mod.get_vapid_public_key() == public_key
+
+
+def test_vapid_concurrent_read_waits_for_first_persistence(push_mod, temp_root, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError
+    import threading
+
+    write_started = threading.Event()
+    release_write = threading.Event()
+    reader_started = threading.Event()
+    original_write = push_mod.atomic_write_text
+
+    def blocked_write(*args, **kwargs):
+        write_started.set()
+        assert release_write.wait(5)
+        return original_write(*args, **kwargs)
+
+    def read_key():
+        reader_started.set()
+        return push_mod.get_vapid_public_key()
+
+    monkeypatch.setattr(push_mod, 'atomic_write_text', blocked_write)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(push_mod.get_vapid_public_key)
+        try:
+            assert write_started.wait(5)
+            second = pool.submit(read_key)
+            assert reader_started.wait(5)
+            with pytest.raises(TimeoutError):
+                second.result(timeout=0.1)
+        finally:
+            release_write.set()
+        public_key = first.result(timeout=5)
+        assert second.result(timeout=5) == public_key
+    push_mod._vapid = None
+    assert push_mod.get_vapid_public_key() == public_key
