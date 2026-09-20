@@ -4454,13 +4454,15 @@ def _next_bak_name(parent: Path, original_name: str) -> str:
     to be clever about "already a backup".
     """
     base = f"{original_name}.bak"
-    if not (parent / base).exists():
+    # A dangling symlink still occupies its directory entry. Treating it as
+    # available makes the atomic link commit retry the same name forever.
+    if not _path_lexists(parent / base):
         return base
     # .bak exists → try .bak.2, .bak.3, … Cap at a sane upper bound so a
     # pathological directory full of .bak.N siblings can't hang the call.
     for i in range(2, 1000):
         cand = f"{original_name}.bak.{i}"
-        if not (parent / cand).exists():
+        if not _path_lexists(parent / cand):
             return cand
     raise HTTPException(status_code=409, detail="too many .bak siblings")
 
