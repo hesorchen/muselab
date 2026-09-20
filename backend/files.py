@@ -2830,10 +2830,11 @@ def xlsx_preview(path: str, root: Path = Depends(_workspace_root), external: boo
                             detail="failed to parse spreadsheet (file may be corrupt or unsupported)") from None
     try:
         sheets: list[dict] = []
-        sheet_names = wb.sheetnames
-        sheets_truncated = len(sheet_names) > XLSX_MAX_SHEETS
-        for sheet_name in sheet_names[:XLSX_MAX_SHEETS]:
-            ws = wb[sheet_name]
+        # Chartsheets have no cells and must not consume the worksheet budget.
+        worksheets = wb.worksheets
+        sheets_truncated = len(worksheets) > XLSX_MAX_SHEETS
+        for ws in worksheets[:XLSX_MAX_SHEETS]:
+            sheet_name = ws.title
             rows: list[list[str]] = []
             rows_truncated = False
             cols_truncated = bool(ws.max_column and ws.max_column > XLSX_MAX_COLS)
@@ -2952,10 +2953,12 @@ def csv_preview(
         limit = CSV_MAX_LIMIT
     if offset < 0:
         offset = 0
+    # Strip an optional UTF-8 BOM before both sniffing and parsing so a
+    # quoted first field retains its delimiter and header semantics.
     # Sniff delimiter + header from a small head sample. Defaults to
     # excel-style comma if Sniffer can't tell (e.g. one-column file).
     try:
-        with target.open("r", encoding="utf-8", errors="replace", newline="") as f:
+        with target.open("r", encoding="utf-8-sig", errors="replace", newline="") as f:
             sample = f.read(CSV_SNIFF_BYTES)
         try:
             dialect = _csv.Sniffer().sniff(sample, delimiters=",\t;|")
@@ -2975,7 +2978,7 @@ def csv_preview(
     cols_truncated = False
     total_rows = 0
     try:
-        with target.open("r", encoding="utf-8", errors="replace", newline="") as f:
+        with target.open("r", encoding="utf-8-sig", errors="replace", newline="") as f:
             reader = _csv.reader(f, dialect=dialect)
             # Pull header before any data offset is applied. The user paging
             # to offset=200 still wants column titles at the top of the page.
