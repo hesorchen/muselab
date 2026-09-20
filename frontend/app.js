@@ -26904,6 +26904,9 @@ function portal() {
       const name = String(draft.name || "").trim();
       const command = String(draft.command || "").trim();
       if (!name || !command || draft.saving) return;
+      const submitted = {
+        name: draft.name, command: draft.command, is_default: !!draft.is_default,
+      };
       draft.saving = true;
       const path = draft.id
         ? `/api/terminals/profiles/${encodeURIComponent(draft.id)}`
@@ -26930,10 +26933,18 @@ function portal() {
             })),
             data,
           ];
-      this.terminalProfileId = data.id;
-      this._terminalProfilePrefLoaded = true;
-      this.cancelTerminalProfileEdit();
-      this._scheduleSavePrefs();
+      if (this.terminalProfileEditor === draft) {
+        this.terminalProfileId = data.id;
+        this._terminalProfilePrefLoaded = true;
+        // A save acknowledges its submitted fields, not later typing. Keep
+        // the returned identity so the next save updates this same profile.
+        draft.id = data.id;
+        if (draft.name === submitted.name && draft.command === submitted.command
+            && !!draft.is_default === submitted.is_default) {
+          this.cancelTerminalProfileEdit();
+        }
+        this._scheduleSavePrefs();
+      }
     },
     async deleteTerminalProfile() {
       const draft = this.terminalProfileEditor;
@@ -37823,6 +37834,9 @@ function portal() {
       draft.saving = true;
       const owner = draft.owner;
       const editing = !!draft.id;
+      const submitted = {
+        name: draft.name, color: draft.color, workspaceId: draft.workspaceId,
+      };
       const payload = { name, color: draft.color || "blue" };
       const workspaceId = String(draft.workspaceId || "");
       if (!editing || draft.workspaceDirty) {
@@ -37842,6 +37856,9 @@ function portal() {
           throw new Error(error || "activity group save failed");
         }
         if (this.activity.groupEditor.owner !== owner) return false;
+        const unchanged = draft.name === submitted.name
+          && draft.color === submitted.color
+          && draft.workspaceId === submitted.workspaceId;
         const responseRevision = Number(data.revision) || 0;
         if (!responseRevision || responseRevision >= this._activityRevision) {
           this.applyActivityGroupPayload(data);
@@ -37849,7 +37866,14 @@ function portal() {
           this.fetchActivity().catch(() => {});
         }
         this._activityRevision = Math.max(this._activityRevision, responseRevision);
-        this.cancelActivityGroupEditor(true);
+        if (unchanged) {
+          this.cancelActivityGroupEditor(true);
+        } else {
+          draft.id = data.group.id;
+          draft.originalWorkspaceId = String(data.group.workspace_id || "");
+          draft.workspaceDirty = draft.workspaceId !== draft.originalWorkspaceId;
+          draft.saving = false;
+        }
       } catch (error) {
         if (this.activity.groupEditor.owner !== owner) return false;
         draft.saving = false;
