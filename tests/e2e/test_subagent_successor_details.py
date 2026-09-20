@@ -40,30 +40,36 @@ def test_inherited_timeline_updates_without_replacing_active_child(
         }))
 
     page.route(f"**/api/chat/sessions/{sid}/subagents", timeline)
+    source_status = {
+        "active": True, "runtime_background_tasks_pending": 1,
+        "runtime_continuation_pending": False, "runtime_ui_revision": "",
+    }
     page.route(f"**/api/chat/sessions/{source}/active", lambda route: route.fulfill(
-        content_type="application/json", body=json.dumps({
-            "active": True, "runtime_background_tasks_pending": 1,
-            "runtime_continuation_pending": False, "runtime_ui_revision": "",
-        }),
+        content_type="application/json", body=json.dumps(source_status),
+    ))
+    page.route(f"**/api/chat/sessions/{sid}/active", lambda route: route.fulfill(
+        content_type="application/json", body=json.dumps({**source_status, "active": False}),
     ))
     _route_windowed_session(page, sid, [{
         "role": "tool_use", "name": "Agent", "id": "inherited-agent-call",
         "uuid": "parent-card", "task": {"description": "Synthetic inherited task"},
     }])
-    _app_eval(page, "await app.loadSession(arg, {probeActive: false});", sid)
+    _app_eval(page, """
+      app.sessions.find(s => s.id === arg.sid).runtime_predecessor = arg.source;
+      await app.loadSession(arg.sid);
+    """, {"sid": sid, "source": source})
     details = page.locator(".msg-pane:visible .subagent-timeline:visible")
     expect(details).to_be_visible()
     details.locator("summary").click()
     expect(details).to_contain_text("INHERITED_STARTED")
     before = len(requests)
 
-    _app_eval(page, """
-      const st = app.tabState[arg.sid];
-      st.streaming = true;
-      st.sessionSync.inheritedSourceSid = arg.source;
-      st.sessionSync.inheritedTicksLeft = 10;
-      await app._pollInheritedTasks(arg.sid, st, {sourceSid: arg.source});
-    """, {"sid": sid, "source": source})
+    # A real load/active probe must arm the shared coordinator by itself.
+    page.wait_for_function("""([sid, source]) => {
+      const st = document.querySelector('#app')._x_dataStack[0].tabState[sid];
+      return st.inheritedBackgroundOwner === source
+        && st.sessionSync.inheritedTicksLeft < 1810;
+    }""", arg=[sid, source])
     assert len(requests) == before, "ordinary task polls must not reread all timelines"
 
     blocks.append({
@@ -72,11 +78,19 @@ def test_inherited_timeline_updates_without_replacing_active_child(
     })
     _app_eval(page, """
       const st = app.tabState[arg.sid];
+      st.streaming = true;
       st.subagentsHydratedAt = Date.now() - 5001;
-      await app._pollInheritedTasks(arg.sid, st, {sourceSid: arg.source});
     """, {"sid": sid, "source": source})
     expect(details).to_contain_text("INHERITED_READ_FINISHED")
     assert _app_eval(page, "return app.tabState[arg].streaming;", sid) is True
     assert _app_eval(page, "return app.tabState[arg].messages.length;", sid) == 1
     assert len(requests) == before + 1
+    source_status.update(active=False, runtime_background_tasks_pending=0)
+    _app_eval(page, "app.tabState[arg].streaming = false;", sid)
+    page.wait_for_function("""sid => {
+      const st = document.querySelector('#app')._x_dataStack[0].tabState[sid];
+      return st.inheritedBackgroundOwner === ""
+        && st.sessionSync.inheritedSourceSid === "" && !st.sessionSync.inFlight;
+    }""", arg=sid, timeout=8000)
+    expect(details).to_contain_text("INHERITED_READ_FINISHED")
     _assert_no_browser_errors(page, errors)
