@@ -168,17 +168,29 @@ class WorkspaceRegistry:
             updated_ids[path_value],
         )
 
-    def remove(self, value: str | Path) -> None:
+    def entry_for_removal(self, value: str | Path) -> WorkspaceEntry:
+        """Identify the stored registration even if its directory was replaced."""
         path = Path(value).expanduser()
         if not path.is_absolute():
             path = self.primary / path
-        path = path.resolve()
-        if path == self.primary:
-            raise ValueError("primary workspace cannot be removed")
+        key = str(path)
         with self._lock:
-            if str(path) not in self._workspaces:
-                raise ValueError("workspace is not registered")
-            path_value = str(path)
+            if key not in self._workspaces:
+                # Keep aliases usable when they are not registered paths.
+                return self.entry_for(path)
+            return WorkspaceEntry(
+                path=key,
+                name=self._workspaces[key],
+                primary=path == self.primary,
+                id=self._ids[key],
+            )
+
+    def remove(self, value: str | Path) -> None:
+        with self._lock:
+            entry = self.entry_for_removal(value)
+            if entry.primary:
+                raise ValueError("primary workspace cannot be removed")
+            path_value = entry.path
             updated = dict(self._workspaces)
             del updated[path_value]
             updated_ids = dict(self._ids)

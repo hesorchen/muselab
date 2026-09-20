@@ -569,3 +569,58 @@ def test_workspace_browser_detects_project_folders(client, auth, tmp_path):
                if item["path"] == str(project.resolve()))
     assert row["selectable"] is True
     assert row["project"] == "Python"
+
+
+@pytest.mark.parametrize("replacement", ["registered", "unregistered", "loop", "primary"])
+def test_unregister_uses_registered_path_before_following_replacement_link(
+    client, auth, temp_root, tmp_path, replacement,
+):
+    original = _make_workspace(tmp_path, "original")
+    destination = _make_workspace(tmp_path, "destination")
+    original_entry = client.post(
+        "/api/chat/workspaces", headers=auth, json={"path": str(original)},
+    ).json()
+    destination_entry = None
+    if replacement == "registered":
+        destination_entry = client.post(
+            "/api/chat/workspaces", headers=auth, json={"path": str(destination)},
+        ).json()
+    moved = tmp_path / "moved-original"
+    original.rename(moved)
+    target = temp_root if replacement == "primary" else destination
+    original.symlink_to(original if replacement == "loop" else target)
+
+    response = client.delete(
+        "/api/chat/workspaces", headers=auth, params={"path": str(original)},
+    )
+    assert response.status_code == 200, response.text
+    rows = client.get("/api/chat/workspaces", headers=auth).json()["workspaces"]
+    assert original_entry["id"] not in {row["id"] for row in rows}
+    assert any(row["primary"] for row in rows)
+    if destination_entry is not None:
+        assert destination_entry in rows
+    assert original.is_symlink()
+    assert (moved / "project.txt").read_text(encoding="utf-8") == "workspace-owned\n"
+    assert (destination / "project.txt").read_text(encoding="utf-8") == "workspace-owned\n"
+
+
+def test_unregister_unregistered_alias_resolves_target_and_protects_primary(
+    client, auth, temp_root, tmp_path,
+):
+    other = _make_workspace(tmp_path)
+    assert client.post(
+        "/api/chat/workspaces", headers=auth, json={"path": str(other)},
+    ).status_code == 200
+    alias = tmp_path / "alias"
+    alias.symlink_to(other)
+    assert client.delete(
+        "/api/chat/workspaces", headers=auth, params={"path": str(alias)},
+    ).status_code == 200
+    primary_alias = tmp_path / "primary-alias"
+    primary_alias.symlink_to(temp_root)
+    assert client.delete(
+        "/api/chat/workspaces", headers=auth, params={"path": str(primary_alias)},
+    ).status_code == 400
+    rows = client.get("/api/chat/workspaces", headers=auth).json()["workspaces"]
+    assert len(rows) == 1 and rows[0]["primary"]
+    assert (other / "project.txt").read_text(encoding="utf-8") == "workspace-owned\n"
