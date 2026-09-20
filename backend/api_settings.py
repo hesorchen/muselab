@@ -156,6 +156,11 @@ def _write_env(updates: dict[str, str]) -> None:
                 out.append(line)
                 continue
             key = stripped.split("=", 1)[0].strip()
+            # dotenv accepts export prefixes and quoted keys; edits and deletion
+            # must target the variable name instead of leaving a stale entry.
+            key = re.sub(r"^export\s+", "", key)
+            if key.startswith("'") and key.endswith("'"):
+                key = key[1:-1]
             if key in updates:
                 new_v = updates[key]
                 if new_v is None:
