@@ -48,6 +48,7 @@ def chat_mod(app_module):
     chat_mod._clients.clear()
     chat_mod._client_permission.clear()
     chat_mod._client_plan_return.clear()
+    chat_runtime.CLIENT_CONFIG.clear()
     chat_mod._creation_locks.clear()
     chat_mod._client_lru.clear()
     chat_mod._session_streams.clear()
@@ -62,6 +63,7 @@ def chat_mod(app_module):
     chat_mod._clients.clear()
     chat_mod._client_permission.clear()
     chat_mod._client_plan_return.clear()
+    chat_runtime.CLIENT_CONFIG.clear()
     chat_mod._creation_locks.clear()
     chat_mod._client_lru.clear()
     chat_mod._session_streams.clear()
@@ -485,3 +487,116 @@ def test_eviction_skips_session_with_inflight_background_task(chat_mod, monkeypa
     assert b.disconnected is True, "non-pinned oldest not evicted"
     assert key_b not in chat_mod._clients
     assert ("C", "claude-sonnet-4-6", "auto", "") in chat_mod._clients
+
+
+@pytest.mark.parametrize("changed", ["key", "environment-url", "catalog-url"])
+def test_provider_change_refreshes_pooled_runtime(chat_mod, monkeypatch, changed):
+    from backend import api_settings, endpoints
+    _patch_builder(monkeypatch, chat_mod)
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-before")
+    monkeypatch.delenv("DEEPSEEK_BASE_URL", raising=False)
+
+    async def run():
+        first = await chat_mod.get_client("provider-refresh", "deepseek-v4-pro")
+        other = await chat_mod.get_client("other-provider", "claude-sonnet-4-6")
+        if changed == "key":
+            api_settings.put_settings(api_settings.SettingsIn(deepseek_api_key="test-after"))
+        elif changed == "environment-url":
+            monkeypatch.setenv("DEEPSEEK_BASE_URL", "http://127.0.0.1:9/changed")
+        else:
+            provider = endpoints.lookup("deepseek-v4-pro")
+            endpoints.upsert_provider(
+                pid=provider.id, env_key=provider.env_key,
+                base_url="http://127.0.0.1:9/changed",
+                prefix=provider.prefix, display=provider.display,
+                models=[model for model, _label in provider.models],
+            )
+        assert not first.disconnected, "settings saves must not interrupt the running CLI"
+        second = await chat_mod.get_client("provider-refresh", "deepseek-v4-pro")
+        assert second is not first
+        assert first.disconnected
+        assert await chat_mod.get_client("other-provider", "claude-sonnet-4-6") is other
+        assert await chat_mod.get_client("provider-refresh", "deepseek-v4-pro") is second
+
+    asyncio.run(run())
+
+
+def test_unchanged_provider_save_keeps_runtime(chat_mod, monkeypatch):
+    from backend import api_settings
+    _patch_builder(monkeypatch, chat_mod)
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-unchanged")
+
+    async def run():
+        first = await chat_mod.get_client("no-change", "deepseek-v4-pro")
+        api_settings.put_settings(api_settings.SettingsIn(deepseek_api_key="test-unchanged"))
+        assert await chat_mod.get_client("no-change", "deepseek-v4-pro") is first
+        assert not first.disconnected
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("owner", ["task", "watcher", "delivery", "schedule"])
+def test_provider_refresh_waits_for_background_owner(chat_mod, monkeypatch, owner):
+    from backend import api_settings
+    _patch_builder(monkeypatch, chat_mod)
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-before")
+    sid = "background-owner"
+    busy = [True]
+    callbacks = {
+        "watcher": "_session_has_live_watcher",
+        "delivery": "_session_has_sdk_delivery",
+        "schedule": "_session_has_scheduled_tasks",
+    }
+    if owner in callbacks:
+        monkeypatch.setattr(chat_mod, callbacks[owner], lambda _sid: busy[0])
+    else:
+        chat_mod._sessions_with_inflight_tasks[sid] = {"background-task"}
+
+    async def run():
+        first = await chat_mod.get_client(sid, "deepseek-v4-pro")
+        api_settings.put_settings(api_settings.SettingsIn(deepseek_api_key="test-after"))
+        assert await chat_mod.get_client(sid, "deepseek-v4-pro") is first
+        assert not first.disconnected
+        busy[0] = False
+        chat_mod._sessions_with_inflight_tasks.pop(sid, None)
+        assert await chat_mod.get_client(sid, "deepseek-v4-pro") is not first
+        assert first.disconnected
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("waiter", [False, True])
+def test_provider_change_during_connect_is_not_lost(chat_mod, monkeypatch, waiter):
+    from backend import api_settings
+    _patch_builder(monkeypatch, chat_mod)
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-before")
+
+    async def run():
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        built = []
+
+        async def build(sid, model, permission, effort, service_tier=""):
+            client = _FakeSDKClient(sid, model, effort, service_tier)
+            built.append(client)
+            if len(built) == 1:
+                entered.set()
+                await release.wait()
+            return client
+
+        monkeypatch.setattr(chat_mod, "_build_and_connect_client", build)
+        first_task = asyncio.create_task(chat_mod.get_client("connecting", "deepseek-v4-pro"))
+        await entered.wait()
+        api_settings.put_settings(api_settings.SettingsIn(deepseek_api_key="test-after"))
+        second_task = None
+        if waiter:
+            second_task = asyncio.create_task(chat_mod.get_client("connecting", "deepseek-v4-pro"))
+            await asyncio.sleep(0)
+        release.set()
+        first = await first_task
+        second = await second_task if second_task else await chat_mod.get_client("connecting", "deepseek-v4-pro")
+        assert second is not first
+        assert first.disconnected
+        assert len(built) == 2
+
+    asyncio.run(run())

@@ -49,6 +49,8 @@ class RuntimeHooks:
     retain_detached_cleanup: Callable[[asyncio.Task], None]
     observe_stream_message: Callable[[ClientKey, Any], Any]
     consume_idle_message: Callable[[ClientKey, Any], Any]
+    runtime_config_signature: Callable[[str], str] | None = None
+    has_runtime_background_work: Callable[[str], bool] | None = None
 
 
 _hooks: RuntimeHooks | None = None
@@ -67,6 +69,7 @@ def _require_hooks() -> RuntimeHooks:
 
 CLIENTS: dict[ClientKey, ClaudeSDKClient] = {}
 CLIENT_PERMISSION: dict[ClientKey, str] = {}
+CLIENT_CONFIG: dict[ClientKey, str | None] = {}
 CLIENT_PLAN_RETURN: dict[ClientKey, str] = {}
 CLIENT_LRU: list[ClientKey] = []
 CLIENT_LOCK = asyncio.Lock()
@@ -152,9 +155,23 @@ async def get_client(
     if service_tier not in hooks.valid_service_tiers:
         raise ValueError(f"invalid service tier: {service_tier}")
     key = (session_id, model, effort, service_tier)
+    # Capture before any client construction awaits. A configuration change
+    # during connect must still invalidate that client on its next use.
+    runtime_config = (
+        hooks.runtime_config_signature(model)
+        if hooks.runtime_config_signature is not None else None
+    )
     plan_return_permission = hooks.normalize_plan_return_permission(
         permission, plan_return_permission
     )
+
+    def config_requires_refresh(cached_config: str | None) -> bool:
+        # A background task, delivery, watcher or schedule still owns its CLI.
+        # Keep the old signature so the first later idle use retries refresh.
+        return cached_config != runtime_config and not (
+            hooks.has_runtime_background_work is not None
+            and hooks.has_runtime_background_work(session_id)
+        )
 
     pool_started = loop.time()
     async with CLIENT_LOCK:
@@ -164,6 +181,7 @@ async def get_client(
                 CLIENT_LRU.remove(key)
             CLIENT_LRU.append(key)
         cached_perm = CLIENT_PERMISSION.get(key) if cached is not None else None
+        cached_config = CLIENT_CONFIG.get(key, runtime_config)
         cached_plan_return = (
             CLIENT_PLAN_RETURN.get(key, "") if cached is not None else ""
         )
@@ -174,6 +192,7 @@ async def get_client(
             raise RuntimeError("session is being deleted")
         if (
             cached_perm != permission
+            or config_requires_refresh(cached_config)
             or (
                 permission == "plan"
                 and cached_plan_return != plan_return_permission
@@ -203,6 +222,7 @@ async def get_client(
             cached_perm = (
                 CLIENT_PERMISSION.get(key) if cached is not None else None
             )
+            cached_config = CLIENT_CONFIG.get(key, runtime_config)
             cached_plan_return = (
                 CLIENT_PLAN_RETURN.get(key, "") if cached is not None else ""
             )
@@ -212,6 +232,7 @@ async def get_client(
                 raise RuntimeError("session is being deleted")
             if (
                 cached_perm == permission
+                and not config_requires_refresh(cached_config)
                 and (
                     permission != "plan"
                     or cached_plan_return == plan_return_permission
@@ -269,6 +290,7 @@ async def get_client(
                 if not reject_deleting:
                     CLIENTS[key] = client
                     CLIENT_PERMISSION[key] = permission
+                    CLIENT_CONFIG[key] = runtime_config
                     if permission == "plan":
                         CLIENT_PLAN_RETURN[key] = plan_return_permission
                     else:
@@ -299,6 +321,7 @@ async def get_client(
                 old_key = CLIENT_LRU.pop(candidate_idx)
                 old_client = CLIENTS.pop(old_key, None)
                 CLIENT_PERMISSION.pop(old_key, None)
+                CLIENT_CONFIG.pop(old_key, None)
                 CLIENT_PLAN_RETURN.pop(old_key, None)
                 CREATION_LOCKS.pop(old_key, None)
                 if old_client is not None:
@@ -505,6 +528,7 @@ async def _evict_failed_session_stream_owned(stream: SessionStream) -> None:
             CLIENTS.pop(key, None)
             notify_disconnected = not any(candidate[0] == key[0] for candidate in CLIENTS)
             CLIENT_PERMISSION.pop(key, None)
+            CLIENT_CONFIG.pop(key, None)
             CLIENT_PLAN_RETURN.pop(key, None)
             if key in CLIENT_LRU:
                 CLIENT_LRU.remove(key)
@@ -688,6 +712,7 @@ async def disconnect_client(session_id: str) -> None:
         for key in keys:
             client = CLIENTS.pop(key, None)
             CLIENT_PERMISSION.pop(key, None)
+            CLIENT_CONFIG.pop(key, None)
             CLIENT_PLAN_RETURN.pop(key, None)
             CREATION_LOCKS.pop(key, None)
             if key in CLIENT_LRU:
@@ -774,6 +799,7 @@ async def shutdown_clients() -> None:
                 )
         CLIENTS.clear()
         CLIENT_PERMISSION.clear()
+        CLIENT_CONFIG.clear()
         CLIENT_PLAN_RETURN.clear()
         CREATION_LOCKS.clear()
         CLIENT_LRU.clear()

@@ -3530,6 +3530,19 @@ def _build_plan_exit_hooks(
     return _post_tool_use, _post_tool_use_failure
 
 
+def _runtime_provider_signature(model: str) -> str:
+    """Fingerprint routing without preparing vendor files or retaining keys."""
+    if endpoints.is_ducc_model(model):
+        return "ducc"
+    routing = endpoints.routing_env(model)
+    if routing is None:
+        routing = {key: os.environ.get(key, "") for key in (
+            "ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN",
+        )}
+    payload = [endpoints.normalize_model_id(model), routing]
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+
+
 async def _build_and_connect_client(
     session_id: str, model: str, permission: str, effort: str,
     service_tier: str = "",
@@ -22386,6 +22399,13 @@ async def _observe_sdk_stream_message(
 
 chat_runtime.configure_hooks(chat_runtime.RuntimeHooks(
     sessions=sess,
+    runtime_config_signature=lambda model: _runtime_provider_signature(model),
+    has_runtime_background_work=lambda sid: bool(
+        _sessions_with_inflight_tasks.get(sid)
+        or _session_has_live_watcher(sid)
+        or _session_has_sdk_delivery(sid)
+        or _session_has_scheduled_tasks(sid)
+    ),
     normalize_effort=lambda *a, **k: _normalize_effort(*a, **k),
     valid_efforts=_VALID_EFFORT,
     valid_service_tiers=_VALID_SERVICE_TIERS,
