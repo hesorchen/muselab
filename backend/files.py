@@ -4403,7 +4403,12 @@ def mkdir(req: MkdirReq, root: Path = Depends(_workspace_root)) -> dict:
     target = safe_resolve(req.path, root=root)
     _guard_not_trash(target, root)
     with _trash_transaction(root):
-        _mkdir_durable(target)
+        try:
+            _mkdir_durable(target)
+        except (FileExistsError, NotADirectoryError, UnsafePrivatePath):
+            raise HTTPException(
+                status_code=409, detail="directory path conflicts with an existing entry",
+            ) from None
     return {"ok": True, "path": _logical_relative_path(req.path).as_posix()}
 
 
@@ -4426,7 +4431,12 @@ def rename(req: RenameReq, root: Path = Depends(_workspace_root)) -> dict:
             raise HTTPException(status_code=404, detail="source not found")
         if dst.exists():
             raise HTTPException(status_code=409, detail="destination already exists")
-        dst.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+        except (FileExistsError, NotADirectoryError):
+            raise HTTPException(
+                status_code=409, detail="destination parent is not a directory",
+            ) from None
         _rename_noreplace(src, dst)
         _fsync_rename(src.parent, dst.parent)
     return {"ok": True, "path": _logical_relative_path(req.dst).as_posix()}
