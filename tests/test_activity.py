@@ -1288,3 +1288,53 @@ def test_startup_fork_repair_respects_retention_and_rolls_back_failed_write(tmp_
     assert service.reconcile_fork_sessions() == 1
     assert {row["session_id"] for row in service.list()} == {"source", "new"}
     assert service.reconcile_fork_sessions() == 0
+
+
+@pytest.mark.parametrize("operation", ["pin", "rename", "ack_one", "ack_all"])
+def test_failed_ledger_edit_preserves_revision_and_retry_persistence(
+    tmp_path, monkeypatch, operation,
+):
+    service = _service(tmp_path, monkeypatch)
+    first = service.start("s1", summary="first")
+    service.finish("s1", "completed")
+    service.start("s2", summary="second")
+    service.finish("s2", "completed")
+    before = service.snapshot()
+    before_revision = service.revision
+    before_bytes = service.path.read_bytes()
+
+    def change():
+        if operation == "pin":
+            service.set_pin(first["id"], True)
+        elif operation == "rename":
+            service.rename_session("s1", "New display name")
+        elif operation == "ack_one":
+            service.ack(sid="s1")
+        else:
+            service.ack()
+
+    def fail_write(*args, **kwargs):
+        raise OSError("synthetic ledger write failure")
+
+    from backend import activity as activity_module
+    with monkeypatch.context() as patch:
+        patch.setattr(activity_module, "atomic_write_text", fail_write)
+        with pytest.raises(OSError, match="synthetic ledger write failure"):
+            change()
+
+    assert service.snapshot() == before
+    assert service.revision == before_revision
+    assert service.path.read_bytes() == before_bytes
+    change()
+    assert service.revision == before_revision + 1
+    reloaded = activity_module.ActivityService(tmp_path)
+    assert reloaded.list() == service.list()
+    first_after = next(row for row in reloaded.list() if row["session_id"] == "s1")
+    if operation == "pin":
+        assert first_after["pinned"] is True
+    elif operation == "rename":
+        assert first_after["session_name"] == "New display name"
+    else:
+        assert first_after["read"] is True
+        if operation == "ack_all":
+            assert all(row["read"] for row in reloaded.list())
