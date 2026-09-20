@@ -727,3 +727,31 @@ async def test_always_allow_shell_launcher_requires_specific_command(approved, c
         if not followup.done():
             followup.cancel()
         await asyncio.gather(followup, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command", ["ls\nprintf synthetic", "ls & printf synthetic"])
+async def test_always_allow_does_not_cover_additional_shell_commands(command):
+    sid = "separator-regression"
+    queue = perm.register_session_queue(sid)
+    callback = perm.build_callback_for_session(sid)
+    first = asyncio.create_task(callback("Bash", {"command": "ls"}, None))
+    event = await asyncio.wait_for(queue.get(), timeout=2)
+    assert event["event"] == "permission_request"
+    assert perm.submit_decision(sid, json.loads(event["data"])["id"], "always")
+    assert (await first).behavior == "allow"
+    assert queue.get_nowait()["event"] == "permission_request_resolved"
+
+    # A grant for ls must not approve a separate command in the same shell.
+    followup = asyncio.create_task(callback("Bash", {"command": command}, None))
+    try:
+        await asyncio.sleep(0)
+        assert not followup.done(), "a second shell command reused the ls grant"
+        event = queue.get_nowait()
+        assert event["event"] == "permission_request"
+        assert perm.submit_decision(sid, json.loads(event["data"])["id"], "deny")
+        assert (await followup).behavior == "deny"
+    finally:
+        if not followup.done():
+            followup.cancel()
+        await asyncio.gather(followup, return_exceptions=True)

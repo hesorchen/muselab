@@ -302,7 +302,7 @@ def _input_key(tool_name: str, tool_input: dict[str, Any]) -> str:
         # full command whenever the line contains shell metacharacters that
         # could chain a second command past the first word.
         if bin_name in _DANGEROUS_BASH_BINS or any(
-                c in cmd for c in (";", "&&", "||", "|", "`", "$(", ">", "<")):
+                c in cmd for c in (";", "&", "||", "|", "`", "$(", ">", "<", '\n')):
             return cmd
         # Safe binaries: first word — so "ls -la X" and "ls Y" share a grant.
         return bin0
