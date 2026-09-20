@@ -150,7 +150,9 @@ def atomic_write_text(
     # the same path inside one process — the second write would overwrite
     # the first's half-written tmp, then both os.replace race. Add a
     # random suffix so each call's tmp is distinct.
-    tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}.{secrets.token_hex(4)}")
+    # The target may already be near the filesystem filename limit. Keep
+    # the temporary prefix short without changing the final filename.
+    tmp = path.with_name(f"{path.name[:32]}.tmp.{os.getpid()}.{secrets.token_hex(4)}")
     try:
         # Sensitive callers opt into an exact mode.  `os.open(..., mode)`
         # creates the inode no broader than requested; fchmod restores bits
