@@ -393,3 +393,36 @@ def test_vapid_concurrent_read_waits_for_first_persistence(push_mod, temp_root, 
         assert second.result(timeout=5) == public_key
     push_mod._vapid = None
     assert push_mod.get_vapid_public_key() == public_key
+
+
+@pytest.mark.parametrize("refresh", ["keys", "metadata"])
+def test_stale_push_failure_does_not_remove_renewed_subscription(
+    push_mod, monkeypatch, refresh,
+):
+    from types import SimpleNamespace
+    import pywebpush
+
+    old = _sub_body()
+    push_mod.add_subscription_capped(old, 64, ua="initial-test-agent")
+    renewed = _sub_body()
+    if refresh == "keys":
+        renewed["keys"] = {"p256dh": "RenewedSyntheticKey", "auth": "RenewedSyntheticAuth"}
+
+    class Gone(Exception):
+        response = SimpleNamespace(status_code=410)
+
+    def delayed_failure(**kwargs):
+        assert kwargs["subscription_info"]["keys"] == old["keys"]
+        # Resubscription finishes while delivery of the old snapshot is in
+        # flight; the old failure must not delete the just-saved record.
+        push_mod.add_subscription_capped(renewed, 64, ua="renewed-test-agent")
+        raise Gone("gone")
+
+    monkeypatch.setattr(pywebpush, "webpush", delayed_failure)
+    monkeypatch.setattr(pywebpush, "WebPushException", Gone)
+    result = push_mod.send_to_all(title="synthetic", body="synthetic")
+    saved = push_mod.list_subscriptions()
+    assert len(saved) == 1
+    assert saved[0]["keys"] == renewed["keys"]
+    assert saved[0]["ua"] == "renewed-test-agent"
+    assert result == {"sent": 0, "dropped": 0, "errors": []}

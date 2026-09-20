@@ -307,7 +307,7 @@ def send_to_all(title: str, body: str, *, url: str = "/",
         _load_subs()
         targets = list(_subs.items())
     sent = 0
-    dropped: list[str] = []
+    dead: list[tuple[str, dict]] = []
     errors: list[str] = []
     for endpoint, sub in targets:
         try:
@@ -347,7 +347,7 @@ def send_to_all(title: str, body: str, *, url: str = "/",
             if code in (404, 410):
                 # Subscription is dead (user uninstalled / cleared) — mark for
                 # removal; applied at the end under the lock.
-                dropped.append(endpoint)
+                dead.append((endpoint, sub))
             else:
                 # Push exception strings commonly embed the full subscription
                 # endpoint (including its opaque device token) and proxy URL.
@@ -358,18 +358,24 @@ def send_to_all(title: str, body: str, *, url: str = "/",
                     f"{label} status={code}" if code is not None else label)
         except Exception as e:
             errors.append(type(e).__name__)
-    if dropped:
+    dropped = 0
+    if dead:
         with _subs_lock:
             _load_subs()
-            for endpoint in dropped:
-                _subs.pop(endpoint, None)
-            _save_subs()
-    result = {"sent": sent, "dropped": len(dropped), "errors": errors}
+            for endpoint, failed_sub in dead:
+                # A delayed response describes the sent snapshot, not a
+                # subscription renewed while that request was in flight.
+                if _subs.get(endpoint) == failed_sub:
+                    del _subs[endpoint]
+                    dropped += 1
+            if dropped:
+                _save_subs()
+    result = {"sent": sent, "dropped": dropped, "errors": errors}
     # One journal line per fan-out — the only place the outcome is visible.
     # Callers historically discarded this dict, which made "did the push
     # even go out?" unanswerable from logs.
     sys.stderr.write(
-        f"[push] {context or tag}: sent={sent} dropped={len(dropped)}"
+        f"[push] {context or tag}: sent={sent} dropped={dropped}"
         + (f" errors={errors}" if errors else "") + "\n")
     sys.stderr.flush()
     return result
