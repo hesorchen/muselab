@@ -270,3 +270,65 @@ def test_search_snippet_uses_original_text_offsets_after_case_expansion(client, 
     assert [hit['uuid'] for hit in hits] == ['unicode-offset']
     assert 'find-this-marker' in hits[0]['snippet']
     assert len(hits[0]['snippet']) <= 200
+
+
+@pytest.mark.parametrize('source_uuid', ['user-steering-uuid', ''])
+def test_search_finds_native_steering_without_task_notifications(
+    client, auth, _staged_jsonls, source_uuid,
+):
+    staged = _staged_jsonls
+    _write_jsonl(staged['dir'] / f"{staged['sid_a']}.jsonl", [
+        {'type': 'attachment', 'uuid': 'steering-record',
+         'timestamp': '2026-09-21T00:00:00Z',
+         'attachment': {'type': 'queued_command', 'commandMode': 'prompt',
+                        'source_uuid': source_uuid,
+                        'prompt': 'steering-search-probe change the output format'}},
+        {'type': 'attachment', 'uuid': 'task-record',
+         'attachment': {'type': 'queued_command', 'commandMode': 'task-notification',
+                        'prompt': 'steering-search-probe internal task finished'}},
+        {'type': 'attachment', 'uuid': 'task-xml-record',
+         'attachment': {'type': 'queued_command',
+                        'prompt': '<task-notification>steering-search-probe</task-notification>'}},
+    ])
+    for _ in range(2):
+        response = client.get('/api/chat/search', params={'q': 'steering-search-probe'}, headers=auth)
+        assert response.status_code == 200
+        hits = response.json()['hits']
+        assert len(hits) == 1
+        assert hits[0]['uuid'] == (source_uuid or 'steering-record')
+        assert hits[0]['role'] == 'user'
+        assert 'change the output format' in hits[0]['snippet']
+
+
+def test_search_rebuilds_legacy_cache_that_omitted_steering(tmp_path):
+    import sqlite3
+    import threading
+    from backend.chat_search import SearchIndex
+    from backend.chat import _extract_searchable_text, _strip_cli_slash_wrapper, _make_snippet
+
+    path = tmp_path / 'canonical.jsonl'
+    _write_jsonl(path, [{
+        'type': 'attachment', 'uuid': 'record',
+        'attachment': {'type': 'queued_command', 'commandMode': 'prompt',
+                       'source_uuid': 'user-id', 'prompt': 'legacy-steering-marker'},
+    }])
+    canonical_bytes = path.read_bytes()
+    index = SearchIndex(tmp_path / 'private' / 'search.sqlite3')
+
+    def search():
+        metrics = dict(read_bytes=0, parsed_lines=0, updated_files=0)
+        result = index.search([path], 'legacy-steering-marker', 20, {}, threading.Event(),
+                              _extract_searchable_text, _strip_cli_slash_wrapper,
+                              _make_snippet, metrics)
+        return result, metrics
+
+    search()
+    # Old caches checkpointed the unchanged file without indexing its attachment.
+    with sqlite3.connect(index.path) as db:
+        db.execute('DELETE FROM documents')
+        db.execute('PRAGMA user_version=0')
+    result, metrics = search()
+    assert [hit['uuid'] for hit in result['hits']] == ['user-id']
+    assert metrics['read_bytes'] > 0
+    assert search()[1]['read_bytes'] == 0
+    assert path.read_bytes() == canonical_bytes
