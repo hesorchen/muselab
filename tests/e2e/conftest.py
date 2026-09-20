@@ -71,6 +71,7 @@ def backend_url(tmp_path_factory):
         "TMPDIR": str(root / "tmp"),
         "MUSELAB_PORT": str(port),
         "MUSELAB_ENV_PATH": str(root / "e2e.env"),
+        "MUSELAB_CONFIG_DIR": str(root),
         "MUSELAB_MODEL": "deepseek-v4-pro",
         "MUSELAB_DEFAULT_MODEL": "deepseek-v4-pro",
     }

@@ -23009,7 +23009,7 @@ function portal() {
     },
 
     async addProviderFromDraft() {
-      const n = this.settings.providerNew;
+      const n = JSON.parse(JSON.stringify(this.settings.providerNew));
       const body = {
         id: null,
         base_url: (n.base_url || "").trim(),
@@ -23018,7 +23018,8 @@ function portal() {
       };
       if ((n.api_key || "").trim()) body.api_key = n.api_key.trim();
       const ok = await this._submitProvider(body, null);
-      if (ok) {
+      // A completed save only clears the draft it submitted.
+      if (ok && JSON.stringify(this.settings.providerNew) === JSON.stringify(n)) {
         this.settings.providerNew = { show: false, base_url: "", prefix: "", models: "", api_key: "" };
       }
     },
