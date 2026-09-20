@@ -96,9 +96,10 @@ def mark_seen(device_id: str = "default", visible: bool = True) -> None:
     now = time.time()
     prev = _devices.get(device_id)
     if visible:
-        # Continue the streak if the device was already visible; otherwise
-        # (new device, or coming back from hidden) start a fresh streak now.
-        if prev is not None and prev[1] and prev[2] is not None:
+        # Only recent heartbeats prove an uninterrupted visible streak. A
+        # browser killed without a hidden beacon starts fresh on reconnect.
+        if (prev is not None and prev[1] and prev[2] is not None
+                and now - prev[0] < GRACE_SECONDS):
             visible_since = prev[2]
         else:
             visible_since = now
