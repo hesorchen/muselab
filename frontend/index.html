@@ -6485,48 +6485,51 @@
   <!-- Root-level portal for per-turn memory details.  This cannot live inside
        .turn-footer: chat panes deliberately clip overflow, so a descendant
        popover will be cut off regardless of z-index. -->
-  <div class="memory-recall-global"
-       x-show="memoryRecallPopover.show"
-       :style="memoryRecallPopover.style"
-       @click.stop
-       @click.outside="closeMemoryRecallPopover()"
-       role="dialog"
-       :aria-label="lang==='zh' ? '本轮使用的记忆' : 'Memories used in this turn'"
-       x-cloak>
-    <div class="memory-recall-head">
-      <strong x-text="lang==='zh'
-        ? `本轮使用了 ${memoryRecallPopover.recall?.count || 0} 条记忆`
-        : `Used ${memoryRecallPopover.recall?.count || 0} memories`"></strong>
-      <button type="button" @click="closeMemoryRecallPopover()"
-              :aria-label="lang==='zh' ? '关闭记忆详情' : 'Close memory details'">×</button>
-    </div>
-    <div class="memory-recall-meta"
-         x-text="`${memoryRecallPopover.recall?.latency_ms || 0} ms · ${memoryRecallPopover.recall?.status || ''}`"></div>
-    <template x-for="item in (memoryRecallPopover.recall?.items || [])" :key="item.id">
-      <div class="memory-recall-item">
-        <span x-text="item.kind"></span>
-        <p x-text="item.content"></p>
-        <div class="memory-stats" x-show="item.recall_stats"
-             x-text="memoryRecallStatsText(item)"></div>
-        <div class="memory-source-actions" x-show="item._traceback?.length">
-          <button type="button" class="btn-ghost xs" @click="openMemorySource(item)"
-                  x-text="lang==='zh' ? '打开来源' : 'Open source'"></button>
-          <button type="button" class="btn-ghost xs" @click="copyMemorySourceEvidence(item)"
-                  x-text="lang==='zh' ? '复制现场证据' : 'Copy evidence'"></button>
-        </div>
-        <div class="memory-recall-feedback">
-          <button type="button"
-                  @click="memoryFeedback(item, true, memoryRecallPopover.recall?.id)"
-                  :class="{ active: item._feedback === 'up' }"
-                  :title="lang==='zh' ? '这条记忆有用' : 'Helpful'">↑</button>
-          <button type="button"
-                  @click="memoryFeedback(item, false, memoryRecallPopover.recall?.id)"
-                  :class="{ active: item._feedback === 'down' }"
-                  :title="lang==='zh' ? '这条记忆无用' : 'Not helpful'">↓</button>
-        </div>
+  <!-- A style reset must not reveal a closed popup by replacing the
+       display:none that x-show added. Mount it only while explicitly open. -->
+  <template x-if="memoryRecallPopover.show">
+    <div class="memory-recall-global"
+         :style="memoryRecallPopover.style"
+         @click.stop
+         @click.outside="closeMemoryRecallPopover()"
+         role="dialog"
+         :aria-label="lang==='zh' ? '本轮使用的记忆' : 'Memories used in this turn'"
+         x-cloak>
+      <div class="memory-recall-head">
+        <strong x-text="lang==='zh'
+          ? `本轮使用了 ${memoryRecallPopover.recall?.count || 0} 条记忆`
+          : `Used ${memoryRecallPopover.recall?.count || 0} memories`"></strong>
+        <button type="button" @click="closeMemoryRecallPopover()"
+                :aria-label="lang==='zh' ? '关闭记忆详情' : 'Close memory details'">×</button>
       </div>
-    </template>
-  </div>
+      <div class="memory-recall-meta"
+           x-text="`${memoryRecallPopover.recall?.latency_ms || 0} ms · ${memoryRecallPopover.recall?.status || ''}`"></div>
+      <template x-for="item in (memoryRecallPopover.recall?.items || [])" :key="item.id">
+        <div class="memory-recall-item">
+          <span x-text="item.kind"></span>
+          <p x-text="item.content"></p>
+          <div class="memory-stats" x-show="item.recall_stats"
+               x-text="memoryRecallStatsText(item)"></div>
+          <div class="memory-source-actions" x-show="item._traceback?.length">
+            <button type="button" class="btn-ghost xs" @click="openMemorySource(item)"
+                    x-text="lang==='zh' ? '打开来源' : 'Open source'"></button>
+            <button type="button" class="btn-ghost xs" @click="copyMemorySourceEvidence(item)"
+                    x-text="lang==='zh' ? '复制现场证据' : 'Copy evidence'"></button>
+          </div>
+          <div class="memory-recall-feedback">
+            <button type="button"
+                    @click="memoryFeedback(item, true, memoryRecallPopover.recall?.id)"
+                    :class="{ active: item._feedback === 'up' }"
+                    :title="lang==='zh' ? '这条记忆有用' : 'Helpful'">↑</button>
+            <button type="button"
+                    @click="memoryFeedback(item, false, memoryRecallPopover.recall?.id)"
+                    :class="{ active: item._feedback === 'down' }"
+                    :title="lang==='zh' ? '这条记忆无用' : 'Not helpful'">↓</button>
+          </div>
+        </div>
+      </template>
+    </div>
+  </template>
 
   <div class="modal-backdrop" x-show="sessionTodoOpen"
        @click.self="closeSessionTodoBoard()" x-cloak>
