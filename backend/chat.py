@@ -7036,12 +7036,15 @@ def get_session_api(
                     index, snapshots, "normal")
             else:
                 normal_total = index["bubble_prefix"]["normal"][-1]
-                records = index["records"]
-                turns = sum(
-                    1 for rec_i in index["orders"]["normal"]
-                    if records[rec_i].get("real_user_prompt")
-                )
             if not full and meta.get("message_count", 0) != normal_total:
+                if not snapshots:
+                    # Recount only when repairing persisted metadata. Warm
+                    # bounded pages must not rescan every historical turn.
+                    records = index["records"]
+                    turns = sum(
+                        1 for rec_i in index["orders"]["normal"]
+                        if records[rec_i].get("real_user_prompt")
+                    )
                 try:
                     sess.set_message_count(sid, normal_total, turn_count=turns)
                     meta = {

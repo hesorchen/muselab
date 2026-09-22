@@ -27698,28 +27698,18 @@ function portal() {
           // single most important key in a terminal. Cmd+C / Ctrl+Shift+C only.
           const copy = key === "c"
             && (event.metaKey || (event.ctrlKey && event.shiftKey));
-          // Paste takes plain Ctrl+V as well as Cmd+V / Ctrl+Shift+V. Leaving
-          // plain Ctrl+V to xterm encoded it as \x16 (readline's literal-next)
-          // and sent that to the program instead of the clipboard text, which
-          // full-screen TUIs surface as a bogus input error. Nothing is lost:
-          // \x16 is an obscure quoted-insert prefix, while Ctrl+V is what
-          // people actually press. altKey is excluded because AltGr layouts
-          // report Ctrl+Alt for ordinary characters.
+          // Let the browser's trusted paste event reach xterm, including on
+          // LAN HTTP where navigator.clipboard is unavailable. Returning false
+          // only skips xterm's key encoding (Ctrl+V would become \x16); leaving
+          // the default event intact preserves its native paste handler.
+          // Exclude AltGr, which reports Ctrl+Alt for ordinary characters.
           const paste = key === "v" && !event.altKey
             && (event.metaKey || event.ctrlKey);
           if (copy) {
             this.terminalCopy();
             return false;
           }
-          if (paste) {
-            // Stop xterm from encoding Ctrl+V as \x16 — we read the clipboard
-            // ourselves and send the text, so the raw control byte must never
-            // reach the shell. preventDefault also keeps the browser from
-            // dropping the text into xterm's hidden helper textarea.
-            event.preventDefault();
-            this.terminalPaste();
-            return false;
-          }
+          if (paste) return false;
           return true;
         });
         if (reveal || !this._isMobileLayout()) term.focus();
@@ -27857,10 +27847,18 @@ function portal() {
       }
     },
     async terminalPaste() {
+      const term = this._terminal, socket = this._terminalSocket;
+      const connectSeq = this._terminalConnectSeq;
+      if (!term || !socket || socket.readyState !== WebSocket.OPEN) return;
+      const isOwner = () => this._terminal === term && this._terminalSocket === socket
+        && this._terminalConnectSeq === connectSeq && socket.readyState === WebSocket.OPEN;
       try {
         const text = await navigator.clipboard.readText();
-        if (text) this._terminalSend(text);
+        // Clipboard permission prompts may outlive a terminal switch/reconnect.
+        // xterm owns newline normalization and the shell's bracketed-paste mode.
+        if (text && isOwner()) term.paste(text);
       } catch (_) {
+        if (!isOwner()) return;
         this.toast(this.lang === "zh"
           ? "剪贴板访问受限，请按 Ctrl+V 或 Ctrl+Shift+V"
           : "Clipboard access is restricted; press Ctrl+V or Ctrl+Shift+V",
@@ -31983,7 +31981,11 @@ function portal() {
       // cannot replace rawText after the editable buffer has been seeded.
       if (this._previewAbort) this._previewAbort.abort();
       this._previewAbort = null;
-      ++this._previewLoadSeq;
+      const loadSeq = ++this._previewLoadSeq;
+      // A path can become selected again after navigation. Only the exact read
+      // generation that entered editing may seed the buffer or show an error.
+      const isOwner = () => loadSeq === this._previewLoadSeq
+        && this._workspaceIsCurrent(ownerWorkspace) && this.selected === targetPath;
       if (this._csvAbort) this._csvAbort.abort();
       this._csvAbort = null;
       ++this._csvLoadSeq;
@@ -31998,30 +32000,25 @@ function portal() {
           r = await fetch("/api/files/read?path=" + encodeURIComponent(targetPath),
                           { headers: this.fileHdr() });
         } catch (e) {
-          if (this._workspaceIsCurrent(ownerWorkspace)
-              && this.selected === targetPath) {
+          if (isOwner()) {
             this.errToast("read", String((e && e.message) || e));
           }
           return;
         }
-        if (!this._workspaceIsCurrent(ownerWorkspace)
-            || this.selected !== targetPath) return;
+        if (!isOwner()) return;
         if (!r.ok) {
           const detail = await r.text();
-          if (!this._workspaceIsCurrent(ownerWorkspace)
-              || this.selected !== targetPath) return;
+          if (!isOwner()) return;
           this.errToast("read", this.lang === "zh"
                                   ? "可能是二进制或太大 — " + detail
                                   : "binary or too large — " + detail);
           return;
         }
         const body = await r.text();
-        if (!this._workspaceIsCurrent(ownerWorkspace)
-            || this.selected !== targetPath) return;
+        if (!isOwner()) return;
         this.rawText = body;
       }
-      if (!this._workspaceIsCurrent(ownerWorkspace)
-          || this.selected !== targetPath) return;
+      if (!isOwner()) return;
       this.editText = this.rawText;
       this.editorIsMd = this._isMdPath(targetPath);
       this.editorView = this.editorIsMd ? "split" : "edit";

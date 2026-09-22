@@ -4448,7 +4448,8 @@ def test_terminal_preview_has_local_renderer_and_management_wiring():
     assert "if (this._terminalSelectionCleanup) this._terminalSelectionCleanup()" in app
     assert "_terminalLegacyCopy(text)" in app
     assert 'document.execCommand("copy")' in app
-    assert "Stop xterm from encoding Ctrl+V as \\x16" in app
+    # Real keyboard paste is covered by test_terminal_paste.py; source
+    # comments do not establish whether Ctrl+V reaches xterm correctly.
     assert "Clipboard access is restricted; press Ctrl+V or Ctrl+Shift+V" in app
     assert 'host.addEventListener("touchmove", onMove, captureActive)' in app
     assert "capture: true, passive: false" in app

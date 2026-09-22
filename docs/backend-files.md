@@ -49,6 +49,10 @@ Preview limits:
 - CSV: 200 rows by default, up to 1,000 rows and 50 columns, 500 characters per cell; total rows are cached by file signature.
 - grep: minimum 2-character query, 1 MB per file, about 8 seconds per scan, and at most two concurrent scans.
 
+`grep` reads regular files only, skips aliases into internal state and the dustbin, and opens files without blocking on a replacement named pipe. Normal file symlinks within the selected workspace remain searchable.
+
+Search and grep cache directory listings by device/inode identity and nanosecond modification/change times. This catches archive or sync operations that preserve modification times while keeping unchanged directories free of repeated `scandir` calls.
+
 ### Write and organize
 
 | Method and path | Purpose |

@@ -4593,19 +4593,19 @@ MAX_GREP_TIME_SEC = 8            # soft time budget
 # request — for a 3000-file archive this is ~200-500 ms of pure
 # scandir + per-entry stat() overhead even before any file content is
 # touched. Most directories don't change between calls, so we cache
-# `{dir_path: (mtime, [(name, is_dir), ...])}` keyed by directory
-# mtime; a hit skips the scandir entirely. Filesystem mtime semantics
-# guarantee a directory's mtime updates iff its entry list changes
-# (add / remove / rename), which is exactly the cache invalidation
-# trigger we need. File CONTENT changes do NOT bump parent mtime on
-# ext4 / btrfs, but we deliberately don't cache file size / mtime —
+# `{dir_path: (signature, [(name, is_dir), ...])}` keyed by directory
+# identity and nanosecond mtime/ctime; a hit skips scandir entirely.
+# Sync/archive tools can restore an old mtime after replacing a directory
+# or changing its entries. Inode identity and ctime still invalidate those
+# changes, without an additional stat call. File CONTENT changes do NOT
+# bump parent mtime on ext4 / btrfs, but we don't cache file size / mtime —
 # callers that need those `stat()` per file independently (fast).
 #
 # Thread-safe because FastAPI runs sync route handlers in a thread
 # pool; two concurrent /api/files/search calls would race on the dict
 # without _DIR_CACHE_LOCK.
 # ============================================================
-_DIR_CACHE: dict[str, tuple[float, list[tuple[str, bool]]]] = {}
+_DIR_CACHE: dict[str, tuple[tuple[int, int, int, int], list[tuple[str, bool]]]] = {}
 _DIR_CACHE_LOCK = threading.Lock()
 # Bound the cache so a pathological archive (millions of dirs) can't
 # OOM the process. Typical local workspaces have 50-500 dirs total,
@@ -4615,7 +4615,7 @@ _DIR_CACHE_MAX = 5000
 
 def _cached_walk(root: Path, ignore: set[str], show_hidden: bool):
     """Generator that mimics `os.walk(root)` but caches each directory's
-    entry list by mtime, and applies the `ignore` / `show_hidden`
+    entry list by identity/mtime/ctime, and applies the `ignore` / `show_hidden`
     filters in one pass.
 
     Yields `(dirpath: Path, dirnames: list[str], filenames: list[str])`.
@@ -4628,14 +4628,15 @@ def _cached_walk(root: Path, ignore: set[str], show_hidden: bool):
     while stack:
         dp = stack.pop()
         try:
-            dir_mtime = dp.stat().st_mtime
+            info = dp.stat()
+            signature = (info.st_dev, info.st_ino, info.st_mtime_ns, info.st_ctime_ns)
         except OSError:
             continue
         key = str(dp)
         with _DIR_CACHE_LOCK:
             cached = _DIR_CACHE.get(key)
         entries: list[tuple[str, bool]]
-        if cached is not None and cached[0] == dir_mtime:
+        if cached is not None and cached[0] == signature:
             entries = cached[1]
         else:
             entries = []
@@ -4657,7 +4658,7 @@ def _cached_walk(root: Path, ignore: set[str], show_hidden: bool):
                         _DIR_CACHE.pop(next(iter(_DIR_CACHE)))
                     except StopIteration:
                         pass
-                _DIR_CACHE[key] = (dir_mtime, entries)
+                _DIR_CACHE[key] = (signature, entries)
         dirnames: list[str] = []
         filenames: list[str] = []
         for name, is_dir in entries:
@@ -4671,6 +4672,26 @@ def _cached_walk(root: Path, ignore: set[str], show_hidden: bool):
             else:
                 filenames.append(name)
         yield dp, dirnames, filenames
+
+
+@contextmanager
+def _open_grep_regular_file(target: Path):
+    """Do not block if a writer replaces a checked file with a FIFO.
+
+    Open the resolved target without following a replacement leaf symlink,
+    then check the opened inode. O_NONBLOCK has no effect on regular files.
+    """
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(target, flags)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_GREP_FILE_SIZE:
+            yield None
+            return
+        with os.fdopen(fd, "r", encoding="utf-8", errors="replace", closefd=False) as stream:
+            yield stream
+    finally:
+        os.close(fd)
 
 
 # Concurrency gate: each grep can burn up to MAX_GREP_TIME_SEC of CPU while
@@ -4722,6 +4743,16 @@ def _grep_impl(
     # so the symlink-escape guard doesn't re-resolve ROOT once per candidate
     # file (was N stat-resolves per search).
     root_real = root.resolve()
+    # Directory-name filtering cannot protect a public file symlink into
+    # private state or the dustbin. Resolve protected roots once per search,
+    # including relocated private directories in registered workspaces.
+    private_roots: set[Path] = set()
+    for workspace in {root, *workspace_registry.paths()}:
+        for name in (INTERNAL_DIR_NAME, TRASH_DIR_NAME):
+            try:
+                private_roots.add((workspace / name).resolve())
+            except (OSError, RuntimeError):
+                continue
     for dirpath, _dirnames, filenames in _cached_walk(
             root, SEARCH_IGNORE, show_hidden):
         if time.monotonic() - started > MAX_GREP_TIME_SEC:
@@ -4747,12 +4778,19 @@ def _grep_impl(
                     continue
                 if _is_sensitive(full) or _is_sensitive(resolved):
                     continue
+                if (INTERNAL_DIR_NAME in resolved.parts
+                        or TRASH_DIR_NAME in resolved.parts
+                        or any(_inside(resolved, private) for private in private_roots)):
+                    continue
                 # File-level stat IS NOT cached (file content changes
                 # don't bump parent dir mtime on ext4/btrfs, so a cached
-                # size would lie). One stat per candidate is sub-µs.
-                if full.stat().st_size > MAX_GREP_FILE_SIZE:
+                # size would lie). Recheck the opened inode below as well.
+                info = resolved.stat()
+                if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_GREP_FILE_SIZE:
                     continue
-                with full.open("r", encoding="utf-8", errors="replace") as f:
+                with _open_grep_regular_file(resolved) as f:
+                    if f is None:
+                        continue
                     for i, line in enumerate(f, 1):
                         if q_lower in line.lower():
                             try:
