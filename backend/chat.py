@@ -6742,6 +6742,9 @@ class _TurnResponseBoundary:
         return "forward"
 
 
+_SUBAGENT_HISTORY_READS = SharedCalls()
+
+
 @router.get(
     "/sessions/{sid}/subagents",
     dependencies=[Depends(require_token)],
@@ -6804,10 +6807,13 @@ async def get_session_subagents_api(sid: str) -> dict:
                 ))
         return chat_subagents.inherit_subagent_threads(own, inherited, parents)
 
-    threads = await obs.to_thread_io(
-        "chat.subagents_history_read",
-        sid,
-        _load,
+    # Several panes can request the same SDK snapshot together. Reading every
+    # Subagent transcript once per waiter multiplies I/O during host stalls.
+    # Share only overlapping reads; the next request must see late SDK appends.
+    threads = await _SUBAGENT_HISTORY_READS.run(
+        (sid, model, str(workspace)),
+        lambda: obs.to_thread_io(
+            "chat.subagents_history_read", sid, _load),
     )
     return {"session_id": sid, "threads": threads}
 
