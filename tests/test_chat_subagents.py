@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 from claude_agent_sdk import (
     AssistantMessage,
     SessionMessage,
@@ -387,6 +389,60 @@ def test_authenticated_history_endpoint_uses_sdk_projection(
         "threads": expected,
     }
     assert calls == [(session["id"], str(sess.session_workspace(session["id"])))]
+
+
+def test_concurrent_history_reads_share_snapshot_then_refresh(
+    app_module, monkeypatch,
+):
+    from backend import chat as chat_mod
+    from backend import sessions as sess
+
+    sid = sess.create_session("concurrent subagents")["id"]
+    version = [1]
+    load_calls = []
+
+    def load(owner, directory=None):
+        load_calls.append((owner, directory))
+        return [{"agent_id": "agent-a", "message_count": version[0], "blocks": []}]
+
+    monkeypatch.setattr(chat_mod.chat_subagents, "load_subagent_threads", load)
+
+    async def exercise():
+        original = chat_mod.obs.to_thread_io
+        history_started = asyncio.Event()
+        release_history = asyncio.Event()
+        both_workspace_reads = asyncio.Event()
+        workspace_reads = 0
+
+        async def observed(site, owner, operation, *args, **kwargs):
+            nonlocal workspace_reads
+            if site == "chat.subagents_history_read":
+                history_started.set()
+                await release_history.wait()
+                return operation(*args, **kwargs)
+            result = await original(site, owner, operation, *args, **kwargs)
+            if site == "chat.subagents_workspace_read":
+                workspace_reads += 1
+                if workspace_reads == 2:
+                    both_workspace_reads.set()
+            return result
+
+        monkeypatch.setattr(chat_mod.obs, "to_thread_io", observed)
+        first = asyncio.create_task(chat_mod.get_session_subagents_api(sid))
+        await asyncio.wait_for(history_started.wait(), 5)
+        second = asyncio.create_task(chat_mod.get_session_subagents_api(sid))
+        await asyncio.wait_for(both_workspace_reads.wait(), 5)
+        release_history.set()
+        first_result, second_result = await asyncio.gather(first, second)
+        assert first_result == second_result
+        assert len(load_calls) == 1
+
+        version[0] = 2
+        refreshed = await chat_mod.get_session_subagents_api(sid)
+        assert refreshed["threads"][0]["message_count"] == 2
+        assert len(load_calls) == 2
+
+    asyncio.run(exercise())
 
 
 def test_history_endpoint_rejects_unknown_session(client, auth):
