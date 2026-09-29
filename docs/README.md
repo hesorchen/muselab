@@ -8,6 +8,7 @@
 - [Install on Linux](install-linux.md)
 - [Install on macOS](install-macos.md)
 - [Upgrading](upgrade.md) — bump the SDK + CLI without losing data
+- [Separate SSH uploads](ssh-upload-tunnel.md) — isolate uploads from chat and SSE
 
 ## Use
 

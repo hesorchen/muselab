@@ -1,0 +1,17 @@
+[Unit]
+Description=MuseLab independent SSH upload tunnel
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h
+EnvironmentFile=%h/.config/muselab/upload-tunnel.env
+ExecStart=%h/.local/bin/muselab-upload-tunnel
+Restart=always
+RestartSec=5
+TimeoutStopSec=10
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

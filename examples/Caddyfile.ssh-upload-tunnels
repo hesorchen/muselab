@@ -1,0 +1,19 @@
+# Both tunnels must forward to the same MuseLab application listener.
+workspace.example.com {
+	@upload_body {
+		method POST
+		path /api/files/upload /api/chat/upload-image
+	}
+	handle @upload_body {
+		reverse_proxy 127.0.0.1:8785
+	}
+	# Commit, cancel, limits, chat, SSE, and all other requests stay here.
+	handle {
+		reverse_proxy 127.0.0.1:8780 {
+			flush_interval -1
+		}
+	}
+	header X-Content-Type-Options nosniff
+	header Referrer-Policy strict-origin-when-cross-origin
+	encode gzip
+}

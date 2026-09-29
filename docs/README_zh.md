@@ -8,6 +8,7 @@
 - [Linux 安装](install-linux_zh.md)
 - [macOS 安装](install-macos_zh.md)
 - [升级](upgrade_zh.md) —— 升级 SDK + CLI 而不丢数据
+- [SSH 独立上传通道](ssh-upload-tunnel_zh.md) —— 隔离上传与聊天、SSE 的传输连接
 
 ## 使用
 
