@@ -7,7 +7,7 @@
 底层网络的重传仍需要单独处理。
 
 在 Linux 反向代理主机上保留现有连接，另安装
-[ssh-upload-tunnel.sh](../scripts/ssh-upload-tunnel.sh)：
+`scripts/ssh-upload-tunnel.sh`：
 
 ```bash
 install -d -m 700 ~/.local/bin ~/.config/muselab ~/.config/systemd/user

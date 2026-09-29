@@ -8,7 +8,7 @@ can delay health checks and SSE requests. A separate SSH connection isolates the
 upload queue. It does not repair packet loss in the underlying network.
 
 On the Linux reverse-proxy host, keep the existing control tunnel and install
-[ssh-upload-tunnel.sh](../scripts/ssh-upload-tunnel.sh) as a second service:
+`scripts/ssh-upload-tunnel.sh` as a second service:
 
 ```bash
 install -d -m 700 ~/.local/bin ~/.config/muselab ~/.config/systemd/user
