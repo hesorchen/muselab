@@ -30,6 +30,8 @@ from .terminal import router as terminal_router
 from .file_events import router as file_events_router
 from .todos_api import router as todos_router
 from .api_delivery import router as delivery_router
+from .api_watch import router as watch_router
+from .api_watch_console import router as watch_console_router
 from .settings import ROOT, PORT, HOST
 from .version import project_version
 from .observability import (
@@ -926,6 +928,8 @@ app.include_router(activity_router)
 app.include_router(terminal_router)
 app.include_router(todos_router)
 app.include_router(delivery_router)
+app.include_router(watch_router)
+app.include_router(watch_console_router)
 
 
 @functools.lru_cache(maxsize=1)

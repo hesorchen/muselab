@@ -16,6 +16,7 @@
 - [Configure workspace CLAUDE.md](personalize-claude-md.md) — multiple workspaces, project context, and optional durable instructions
 - [Skills](skills.md) — what ships out of the box, and how to add your own
 - [Mobile (PWA)](mobile.md) — install to home screen, push notifications, HTTPS
+- [Apple Watch](apple-watch-console.md) — Shortcut installation, dictation, recent sessions, and follow-up messages
 - [Terminal](terminal.md) — real PTY, terminal list, Profiles, and mobile controls
 - [Scheduled tasks](scheduler.md) — run a saved prompt on a cadence
 - [Long-term memory](memory.md) — dreaming, hybrid recall, source evidence tracebacks, and reviewed Skills
