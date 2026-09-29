@@ -10,10 +10,15 @@ import hashlib
 import json
 import os
 import sqlite3
+import threading
 import time
 
 from . import sessions
 from .private_storage import ensure_private_directory, ensure_private_regular_file
+
+
+# SQLite cannot busy-wait two simultaneous first journal-mode transitions.
+_INITIALIZATION_LOCK = threading.Lock()
 
 
 @contextmanager
@@ -46,15 +51,16 @@ def _connect(*, read_only: bool = False):
     conn = sqlite3.connect(path, timeout=10)
     conn.row_factory = sqlite3.Row
     try:
-        # Readers must stay available while admission/cancellation is writing.
-        # Keep FULL durability for the idempotency receipt's commit boundary.
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=FULL")
-        conn.execute("""CREATE TABLE IF NOT EXISTS receipts (
-          sid TEXT NOT NULL, kind TEXT NOT NULL, request_id TEXT NOT NULL,
-          fingerprint TEXT NOT NULL, state TEXT NOT NULL,
-          result TEXT NOT NULL DEFAULT '{}', updated_at REAL NOT NULL,
-          PRIMARY KEY(sid,kind,request_id))""")
+        with _INITIALIZATION_LOCK:
+            # Readers must stay available while admission/cancellation is writing.
+            # Keep FULL durability for the idempotency receipt's commit boundary.
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=FULL")
+            conn.execute("""CREATE TABLE IF NOT EXISTS receipts (
+              sid TEXT NOT NULL, kind TEXT NOT NULL, request_id TEXT NOT NULL,
+              fingerprint TEXT NOT NULL, state TEXT NOT NULL,
+              result TEXT NOT NULL DEFAULT '{}', updated_at REAL NOT NULL,
+              PRIMARY KEY(sid,kind,request_id))""")
         yield conn
         conn.commit()
     finally:

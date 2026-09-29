@@ -240,6 +240,6 @@ def test_runtime_shutdown_cancels_background_and_drains_services(
 def test_project_version_matches_pyproject(app_module):
     from backend.version import project_version
 
-    assert project_version() == "2.0.0"
+    assert project_version() == "2.1.0"
     assert app_module.app.version == project_version()
     assert app_module.GRACEFUL_SHUTDOWN_TIMEOUT == 3

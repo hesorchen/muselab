@@ -1,6 +1,6 @@
 [project]
 name = "muselab"
-version = "2.0.0"
+version = "2.1.0"
 description = "Self-hosted multi-model Agent workbench for local workspaces, files, terminals, and artifacts."
 readme = "README.md"
 license = { file = "LICENSE" }
