@@ -1,6 +1,6 @@
 {
   "format": 1,
-  "inventory_date": "2026-09-08",
+  "inventory_date": "2026-10-02",
   "notes": "Direct versions verified from vendored headers/runtime. Mermaid output-contributing package versions are derived from esbuild metadata and pinned by scripts/vendor/package-lock.json. No runtime CDN or frontend build is required. Upstream parser prebundles are separately inventoried from their shipped source maps; the path-browserify source fragment has no verifiable npm version. Version-matched advisories are explicitly reported, even when their affected code is absent from this exact bundle.",
   "direct_packages": [
     {
@@ -23,13 +23,13 @@
     },
     {
       "name": "dompurify",
-      "version": "3.4.15",
+      "version": "3.4.16",
       "license": "Apache-2.0 OR MPL-2.0",
       "license_files": [
         "licenses/DOMPurify-APACHE.txt",
         "licenses/DOMPurify-MPL.txt"
       ],
-      "source": "https://www.npmjs.com/package/dompurify/v/3.4.15"
+      "source": "https://www.npmjs.com/package/dompurify/v/3.4.16"
     },
     {
       "name": "highlight.js",
@@ -595,14 +595,14 @@
     },
     {
       "name": "dompurify",
-      "version": "3.4.15",
+      "version": "3.4.16",
       "license": "(MPL-2.0 OR Apache-2.0)",
       "license_files": [
-        "licenses/mermaid/dompurify@3.4.15/LICENSE",
-        "licenses/mermaid/dompurify@3.4.15/LICENSE-MPL"
+        "licenses/mermaid/dompurify@3.4.16/LICENSE",
+        "licenses/mermaid/dompurify@3.4.16/LICENSE-MPL"
       ],
-      "source": "https://registry.npmjs.org/dompurify/3.4.15",
-      "integrity": "sha512-EUBjM+B+lkDE41iE82DDSCfkoPGfXx8IxFxPMjNzm/Uk4xDet77rTN9wqlxlVg71kK7XGuUMv6wUxJUwwv+Xyw==",
+      "source": "https://registry.npmjs.org/dompurify/3.4.16",
+      "integrity": "sha512-sqo+pNp3qRhCIpbgRi1y8Tgk27Bo2Ry7w0dC1NBeNTdZChWjz9Xb/KOoZbRP/R6pQZ80Qw8YhXw13hWWBbMRnQ==",
       "bundled_in": "mermaid.min.js"
     },
     {
@@ -765,8 +765,8 @@
     "scripts/vendor/build.py": "918a224b75e68d3e8663a196da3732eec5a95ecbc573b120a85950384a8c0cbe",
     "scripts/vendor/embedded.py": "3cfdd87831289282f071b782433d6037b44ac2424c47ffd75f608365dff471f0",
     "scripts/vendor/entry.mjs": "8f4f3d4fb2828f086f9b9b80763c1314f6ee0f600b6433a8e7066fd59c1eef87",
-    "scripts/vendor/package-lock.json": "f66b364b50e86a1582c5bb65497eed1ffe9ce2db8bbe775d59f111c3ed1dec77",
-    "scripts/vendor/package.json": "cf7baa9967879f84dbeb5606087175521c3624a1f0fd5a49432619dca927f318"
+    "scripts/vendor/package-lock.json": "4fc75eebeeb11890104276ba662b53569a767124857df29327cc843d5ca7b45c",
+    "scripts/vendor/package.json": "3abbe1a4729032025d0d380aafcd807e37d73b266ded2c5b0f8bd8b9d3171eb8"
   },
   "assets": {
     "alpine.dev.js": "677d9fcfa51c138008b99f3218c4cd6df7a56ab2987b5bf23a746784390f2604",
@@ -914,8 +914,8 @@
     "licenses/mermaid/d3@7.9.0/LICENSE": "3e6849627f74ff73c257a3ae1efb574015d94fc1035c05ec3c15805165efcbc4",
     "licenses/mermaid/dagre-d3-es@7.0.14/LICENSE.md": "d01eb84ccce437dbf5fd40853bceea0f287930920acea066597a4a25ead63858",
     "licenses/mermaid/dayjs@1.11.23/LICENSE": "5faab7526d055651be3aab769d58897be6bd91f3d39d137f25f12dba1b31d5dc",
-    "licenses/mermaid/dompurify@3.4.15/LICENSE": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
-    "licenses/mermaid/dompurify@3.4.15/LICENSE-MPL": "fab3dd6bdab226f1c08630b1dd917e11fcb4ec5e1e020e2c16f83a0a13863e85",
+    "licenses/mermaid/dompurify@3.4.16/LICENSE": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+    "licenses/mermaid/dompurify@3.4.16/LICENSE-MPL": "fab3dd6bdab226f1c08630b1dd917e11fcb4ec5e1e020e2c16f83a0a13863e85",
     "licenses/mermaid/es-toolkit@1.52.0/LICENSE": "51f3674294d988d89dbebd31273baaeb3c697a15482d9699b14d1fded2e132a7",
     "licenses/mermaid/es-toolkit@1.52.0/NOTICE": "11ee5e3bce9b0a4dde7f73811caf98978e710228d891c3111ad8ef8d7d2a916f",
     "licenses/mermaid/fastdom@1.0.12/LICENSE-from-README.txt": "50c0de64f5cd5e39859b43f7eca7f5843fb3c3d5ac7e34a453e27419ad51e08c",
@@ -945,8 +945,8 @@
     "licenses/mermaid-embedded/vscode-languageserver-types@3.17.5/License.txt": "ec9ee83580841e8eb687aca9867f221503809ba6426c7f876ede17d91b9fcfd0",
     "licenses/path-browserify-source-MIT.txt": "dcec29171d7e9e0c1afe236d800482cfd76cba6e38ebd724b315db9571da1708",
     "marked.min.js": "95674eef99e625a35507b91ae746e82ce59a2ffcc6d83f69c6c4e62e79d21835",
-    "mermaid.min.js": "1e1fc3767e30f385c0091fe847889a12284c5902c33e2a33d9ff89f4ef767b95",
-    "purify.min.js": "f263b05369e050fa175d4ecb9c9358eb4253602d510297adfb31df48b2f1c4d5",
+    "mermaid.min.js": "b7196de4fd8cfd7e674be2418dfc707b0a3e939cf2729bca56ba6fee7859095b",
+    "purify.min.js": "2c90a9b46d6463f26038a29b686e82bc91de01fdac9d5229e7cfe3b360134ea2",
     "xterm/addon-fit-LICENSE.txt": "e256f01188af527e4d06d21d06fbf785ae9c50d4b328bf03cbe0ba7f0aa4228f",
     "xterm/addon-fit.js": "ba3ea256ce0620a0992a197d6c9baea64823fc93d8da07a9e366ca9943c18527",
     "xterm/xterm-LICENSE.txt": "b569f629d00f2626a8100df2a1798210535621e42164dfd426a6fe5aac7b0ccd",
@@ -1743,7 +1743,7 @@
       "fixed_version": "4.18.0",
       "via": "@mermaid-js/parser@1.2.1",
       "bundle": "mermaid.min.js",
-      "bundle_sha256": "1e1fc3767e30f385c0091fe847889a12284c5902c33e2a33d9ff89f4ef767b95",
+      "bundle_sha256": "b7196de4fd8cfd7e674be2418dfc707b0a3e939cf2729bca56ba6fee7859095b",
       "source_map_sha256": "d0c740de3781a6575045f623a4cc7f3e01d9c0bd2956fc2de91840193caae7fd",
       "upstream_chunk": "node_modules/@mermaid-js/parser/dist/chunks/mermaid-parser.core/chunk-FOHPRMQF.mjs",
       "upstream_chunk_sha256": "5c83305b04a62463567bdf6d82d9ba9dfc3795e516d8cc848e6981504af48068",
@@ -1764,7 +1764,7 @@
       "fixed_version": "4.18.0",
       "via": "@mermaid-js/parser@1.2.1",
       "bundle": "mermaid.min.js",
-      "bundle_sha256": "1e1fc3767e30f385c0091fe847889a12284c5902c33e2a33d9ff89f4ef767b95",
+      "bundle_sha256": "b7196de4fd8cfd7e674be2418dfc707b0a3e939cf2729bca56ba6fee7859095b",
       "source_map_sha256": "d0c740de3781a6575045f623a4cc7f3e01d9c0bd2956fc2de91840193caae7fd",
       "upstream_chunk": "node_modules/@mermaid-js/parser/dist/chunks/mermaid-parser.core/chunk-FOHPRMQF.mjs",
       "upstream_chunk_sha256": "5c83305b04a62463567bdf6d82d9ba9dfc3795e516d8cc848e6981504af48068",

@@ -25,7 +25,7 @@ configured network access.
 |---|---|---|---|
 | Alpine.js | v3.14.1 | MIT | <https://github.com/alpinejs/alpine> |
 | marked | v13.0.0 | MIT | <https://github.com/markedjs/marked> |
-| DOMPurify | v3.4.15 | Apache 2.0 / MPL 2.0 (dual) | <https://github.com/cure53/DOMPurify> |
+| DOMPurify | v3.4.16 | Apache 2.0 / MPL 2.0 (dual) | <https://github.com/cure53/DOMPurify> |
 | highlight.js | v11.10.0 + language extras + theme CSS | BSD 3-Clause | <https://github.com/highlightjs/highlight.js> |
 | KaTeX (incl. fonts + `auto-render`) | v0.16.47 | MIT | <https://github.com/KaTeX/KaTeX> |
 | CodeMirror (`cm/codemirror.min.{js,css}` + `addon/` + `mode/` + `theme/`) | v5.65.16 | MIT | <https://github.com/codemirror/codemirror5> |
