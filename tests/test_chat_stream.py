@@ -8909,3 +8909,76 @@ async def test_recall_overlaps_connect_and_retires_with_startup(
         if attachment:
             assert aid in chat._image_store
     assert "SYNTHETIC_RECALL_CONTEXT" not in repr(events)
+
+
+
+def test_successful_image_turn_with_meta_hint_commits_canonical_history(
+    stream_env, client, monkeypatch, tmp_path,
+):
+    """A real Result success survives the SDK's internal image user record."""
+    from datetime import datetime, timezone
+
+    chat_mod = stream_env
+    sid = _make_session(client)
+    transcript = tmp_path / f"{sid}.jsonl"
+    transcript.write_text("", encoding="utf-8")
+    monkeypatch.setattr(chat_mod, "_find_session_jsonl", lambda _sid: transcript)
+    monkeypatch.setattr(
+        chat_mod, "_turn_uuids_from_boundary",
+        chat_mod._real_turn_uuids_from_boundary_for_test,
+    )
+
+    def append(uid, typ, content, parent=None, **extra):
+        entry = {
+            "uuid": uid, "parentUuid": parent, "type": typ,
+            "sessionId": sid,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "message": {"content": content}, **extra,
+        }
+        with transcript.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(entry) + "\n")
+
+    class ImageClient(_FakeStreamClient):
+        async def query(self, prompt_or_gen):
+            await super().query(prompt_or_gen)
+            append("image-user", "user", [
+                {"type": "image", "source": {
+                    "type": "base64", "media_type": "image/png", "data": "YQ==",
+                }},
+                {"type": "text", "text": "describe the image"},
+            ])
+            append("image-hint", "user", "internal image dimensions",
+                   "image-user", isMeta=True)
+
+        async def receive_response(self):
+            append("image-assistant", "assistant", [
+                {"type": "text", "text": "complete image answer"},
+            ], "image-hint")
+            yield AssistantMessage(
+                content=[TextBlock(text="complete image answer")],
+                model="claude-sonnet-4-6", uuid="image-assistant",
+            )
+            yield ResultMessage(
+                subtype="success", duration_ms=50, duration_api_ms=40,
+                is_error=False, num_turns=1, session_id=sid,
+                total_cost_usd=0.0, usage={},
+            )
+
+    fake = ImageClient([])
+
+    async def fake_get_client(*_args, **_kwargs):
+        return fake
+
+    monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
+    response = client.get(
+        f"/api/chat/stream?token={TEST_TOKEN}&session_id={sid}"
+        "&prompt=describe-image&model=claude-sonnet-4-6",
+    )
+    assert response.status_code == 200, response.text
+    done = next(json.loads(data) for event, data in _parse_sse(response.text)
+                if event == "done")
+    assert done["is_error"] is False
+    assert done["assistant_uuid"] == "image-assistant"
+    assert chat_mod.sess.get_message_annotations(sid)["image-assistant"]["turn_status"] == "completed"
+    snapshots, _ = chat_mod._load_cancelled_turn_snapshots(sid)
+    assert snapshots == []

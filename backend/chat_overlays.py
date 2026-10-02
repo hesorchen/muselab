@@ -897,9 +897,13 @@ def _cancelled_snapshot_canonical_span(
         if expected and current and expected != current:
             return [], ""
 
+    # SDK-internal user rows, including image hints, remain in the parent
+    # chain but cannot own a human turn. Consult the persisted is_meta bit so
+    # existing indexes with real_user_prompt=True for those rows still work.
     real_user_ids = [
         record_i for record_i in range(start, len(records))
-        if records[record_i].get("real_user_prompt")
+        if (records[record_i].get("real_user_prompt")
+            and not records[record_i].get("is_meta"))
     ]
     if not real_user_ids:
         return [], ""
@@ -973,7 +977,8 @@ def _cancelled_snapshot_canonical_span(
             # cancelling the launch turn must not relabel that later reaction.
             if current.get("task_notifications"):
                 break
-            if current.get("real_user_prompt"):
+            if (current.get("real_user_prompt")
+                    and not current.get("is_meta")):
                 result = current_uuid
                 break
             parent = str(current.get("parent") or "")
