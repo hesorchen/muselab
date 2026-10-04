@@ -1027,6 +1027,7 @@ function portal() {
     _sessionsInitialized: false,
     _sessionInitPromise: null,
     _sessionListPullPromise: null,
+    _sessionListGeneration: 0,
     _sessionListTimeoutMs: 8000,
     _sessionReadTimeoutMs: 15000,
     _mobileKeyboardGeometryOpen: false,
@@ -13210,13 +13211,17 @@ function portal() {
         return await this._pullSessionListOnce(false, requestedIds.join(","));
       }
       this._sessionListPullPromise = this._pullSessionListOnce(conditional, extraIds);
+      const pull = this._sessionListPullPromise;
       try {
-        return await this._sessionListPullPromise;
+        return await pull;
       } finally {
-        this._sessionListPullPromise = null;
+        // A confirmed deletion can detach this read and start a fresh one.
+        // Completing the old read must not release that new shared owner.
+        if (this._sessionListPullPromise === pull) this._sessionListPullPromise = null;
       }
     },
     async _pullSessionListOnce(conditional = false, extraIds = "") {
+      const generation = this._sessionListGeneration;
       const headers = { ...this.hdr() };
       if (conditional && this._sessionsEtag) {
         headers["If-None-Match"] = this._sessionsEtag;
@@ -13252,6 +13257,7 @@ function portal() {
         // but the response body fails or stalls. The next poll owns a new read.
         return false;
       }
+      if (generation !== this._sessionListGeneration) return false;
       if (r.status === 304) {
         // A transcript revision may have been deferred while its local stream
         // owned the pane. Drain it even when the list body itself is unchanged.
@@ -23248,10 +23254,17 @@ function portal() {
         this.errToast("delete", await response.text());
         return false;
       }
+      // The successful DELETE is authoritative even if the next catalog read
+      // fails. Drop older in-flight snapshots without retaining permanent ids,
+      // so a later canonical restore remains discoverable by a fresh read.
+      ++this._sessionListGeneration;
+      this._sessionListPullPromise = null;
+      this._sessionsEtag = "";
+      this.sessions = this.sessions.filter(meta => meta.id !== sid);
+      this.openTabIds = (this.openTabIds || []).filter(id => id !== sid);
+      delete this._optimisticMetas[sid];
       this._disposeTabRuntime(sid);
       this._deletePersistedChatDraft(sid);
-      await this.refreshSessions();
-      this.openTabIds = (this.openTabIds || []).filter(id => id !== sid);
       if (this.currentId === sid) {
         const workspaceSessions = this.workspaceSessions();
         if (workspaceSessions.length === 0) {
@@ -23266,6 +23279,7 @@ function portal() {
           await this.switchSession();
         }
       }
+      await this.refreshSessions();
       this._writeChatTabStore(this.openTabIds);
       this.savePrefs();
       return true;
