@@ -737,28 +737,34 @@ def toggle_pin(sid: str) -> bool:
         return True
 
 
-def set_pin(sid: str, val: bool) -> bool:
-    """Set the `pinned` flag on a session to a specific value. The entire
-    load-mutate-save sequence runs under _INDEX_LOCK to prevent races.
-    Returns the new state (== val). If no index entry exists yet, a
-    minimal stub is created so the flag survives the first bump_session."""
-    with _INDEX_LOCK:
-        idx = _load_index()
-        for s in idx:
-            if s["id"] == sid:
-                s["pinned"] = bool(val)
-                _save_index(idx)
-                return bool(val)
-        # No muselab index entry yet — create a minimal stub.
-        now = time.time()
-        idx.append({
-            "id": sid, "name": "", "model": "",
-            "permission": "", "plan_return_permission": "",
-            "created_at": now, "updated_at": now,
-            "message_count": 0, "auto_named": True, "pinned": bool(val),
-        })
-        _save_index(idx)
-        return bool(val)
+def set_pin(sid: str, val: bool) -> bool | None:
+    """Set the pinned flag; return its value, or None after deletion begins.
+
+    SDK-only sessions may create a minimal local stub. Serialize that write
+    with deletion so an admitted PATCH cannot recreate a deleted index row.
+    """
+    # Prune fences under QUEUE without taking the lifecycle stripe. Keep
+    # its tombstone check and this index commit in the same QUEUE transaction.
+    with session_lifecycle_lock(sid), _QUEUE_LOCK:
+        if sid in _DELETED_SESSION_IDS:
+            return None
+        with _INDEX_LOCK:
+            idx = _load_index()
+            for s in idx:
+                if s["id"] == sid:
+                    s["pinned"] = bool(val)
+                    _save_index(idx)
+                    return bool(val)
+            # No muselab index entry yet — create a minimal stub.
+            now = time.time()
+            idx.append({
+                "id": sid, "name": "", "model": "",
+                "permission": "", "plan_return_permission": "",
+                "created_at": now, "updated_at": now,
+                "message_count": 0, "auto_named": True, "pinned": bool(val),
+            })
+            _save_index(idx)
+            return bool(val)
 
 
 def _index_list_layer(items: list[dict]) -> dict[str, dict]:
@@ -1106,6 +1112,28 @@ def get_session_meta(sid: str) -> dict | None:
                     _META_CACHE.pop(next(iter(_META_CACHE)), None)
                 _META_CACHE[sid] = (now, meta)
     return meta
+
+
+def session_is_old_unpinned(sid: str, cutoff: float) -> bool:
+    """Check both native metadata and the current local retention markers.
+
+    Display metadata can retain an earlier SDK modification time even after a
+    local rename has committed. Deletion must also respect the durable local
+    update and pin rather than relying on that cached display timestamp alone.
+    """
+    meta = get_session_meta(sid)
+    if (
+        meta is None
+        or meta.get("pinned")
+        or float(meta.get("updated_at") or 0) >= cutoff
+    ):
+        return False
+    with _INDEX_LOCK:
+        row = next((r for r in _load_index() if r.get("id") == sid), None)
+        return row is None or (
+            not row.get("pinned")
+            and float(row.get("updated_at") or 0) < cutoff
+        )
 
 
 # Back-compat alias — some code calls get_session() expecting metadata.

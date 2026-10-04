@@ -8084,6 +8084,15 @@ async def purge_old_sessions_api(req: PurgeOldReq | None = None) -> dict:
                 "ids": victims, "days": days}
     deleted: list[str] = []
     for sid in victims:
+        # Cleaning an earlier session can wait on runtime shutdown. Respect
+        # pins and recent user updates committed during that wait instead of
+        # treating the initial list snapshot as permanent deletion consent.
+        eligible = await obs.to_thread_io(
+            "chat.session_delete_eligibility",
+            sid, sess.session_is_old_unpinned, sid, cutoff,
+        )
+        if not eligible:
+            continue
         if await purge_session_storage_async(sid):
             deleted.append(sid)
     return {"ok": True, "deleted": len(deleted), "ids": deleted, "days": days}
@@ -9399,12 +9408,14 @@ async def patch_session_api(sid: str, req: SessionPatchReq) -> dict:
             # query. Surface as a 409 so the FE can wait for first turn.
             raise HTTPException(409, f"cannot tag session before first turn: {e}")
     if req.pinned is not None:
-        # Pin is muselab-local (not stored in CLI JSONL). Always idempotent.
-        # set_pin runs the load-mutate-save sequence under _INDEX_LOCK.
-        await obs.to_thread_io(
+        # The owned lifecycle write either commits before DELETE or observes
+        # its tombstone; even an unpin's False result is a successful update.
+        pinned = await obs.to_thread_io(
             "chat.session_pin", sid, sess.set_pin, sid, req.pinned,
             owned=True,
         )
+        if pinned is None:
+            raise HTTPException(404, "session not found")
         ok = True
     if req.permission is not None:
         permission = _validate_permission(req.permission)

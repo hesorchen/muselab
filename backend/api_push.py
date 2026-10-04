@@ -63,6 +63,8 @@ def subscribe(sub: _SubscribeIn, request: Request) -> dict:
             "endpoint": sub.endpoint,
             "keys": {"p256dh": sub.keys.p256dh, "auth": sub.keys.auth},
         }, _MAX_SUBS, ua=request.headers.get("user-agent", ""))
+    except push.SubscriptionStoreUnavailable as e:
+        raise HTTPException(503, str(e)) from None
     except RuntimeError as e:
         raise HTTPException(429, str(e)) from None
     except ValueError as e:
@@ -79,18 +81,24 @@ async def test_push() -> dict:
     feature look broken). Bypasses the presence gate by design: the user
     explicitly asked for a notification. pywebpush is synchronous HTTPS per
     subscription — offload so a slow push endpoint can't block the loop."""
-    return await asyncio.to_thread(
-        push.send_to_all,
-        title="muselab",
-        body="测试推送 test push ✅",
-        url="/",
-        tag="push-test",
-        force=True,
-        context="manual-test",
-    )
+    try:
+        return await asyncio.to_thread(
+            push.send_to_all,
+            title="muselab",
+            body="测试推送 test push ✅",
+            url="/",
+            tag="push-test",
+            force=True,
+            context="manual-test",
+        )
+    except push.SubscriptionStoreUnavailable as e:
+        raise HTTPException(503, str(e)) from None
 
 
 @router.post("/unsubscribe", dependencies=[Depends(require_token)])
 def unsubscribe(req: _UnsubscribeIn) -> dict:
-    push.remove_subscription(req.endpoint)
+    try:
+        push.remove_subscription(req.endpoint)
+    except push.SubscriptionStoreUnavailable as e:
+        raise HTTPException(503, str(e)) from None
     return {"ok": True}

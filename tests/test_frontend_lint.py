@@ -1168,7 +1168,7 @@ def test_session_rename_patches_activity_without_reloading_chat():
     optimistic_start = helper.index("async _renameSessionOptimistically(")
     optimistic = helper[optimistic_start:]
     assert optimistic.index("this._applyRenamedSession(sid, name)") < optimistic.index("await fetch(")
-    assert "if (current && current.name === name)" in optimistic
+    assert "if (owned && current && current.name === name)" in optimistic
     assert "this._applyRenamedSession(canonicalSid, previousName)" in optimistic
     assert app.count("this._applyRenamedSession(") == 3
     assert 'this._renameSessionOptimistically(cur.id, name, cur.name, true, "modal")' in modal
