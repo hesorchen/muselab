@@ -420,6 +420,8 @@ class FileWatchManager:
         # and SQLite row after the registry/API deletion has completed.
         self._lifecycle_locks: dict[Path, asyncio.Lock] = {}
         self._started = False
+        self._startup_task: asyncio.Task[None] | None = None
+        self._shutdown_task: asyncio.Task[None] | None = None
         self._maintenance_task: asyncio.Task[None] | None = None
 
     def _cancel_idle_stop_locked(
@@ -561,32 +563,56 @@ class FileWatchManager:
             sys.stderr.flush()
 
     async def start(self) -> None:
-        """Initialize durable metadata without recursively watching every root."""
+        """Join durable initialization without transferring ownership to callers."""
+        while True:
+            async with self._lock:
+                shutdown = self._shutdown_task
+                if shutdown is None:
+                    if self._started:
+                        return
+                    startup = self._startup_task
+                    if startup is None or startup.done():
+                        self._accepting_subscriptions = True
+                        startup = asyncio.create_task(
+                            self._initialize_store(),
+                            name="muselab-files-startup",
+                        )
+                        self._startup_task = startup
+                        # A cancelled start caller may leave no active waiter.
+                        # Observe failures while retaining the task for retries
+                        # and shutdown to join its actual thread work.
+                        startup.add_done_callback(
+                            lambda done: done.exception() if not done.cancelled() else None,
+                        )
+            if shutdown is not None:
+                await asyncio.shield(shutdown)
+                async with self._lock:
+                    if self._shutdown_task is shutdown:
+                        self._shutdown_task = None
+                continue
+            await asyncio.shield(startup)
+            return
+
+    async def _initialize_store(self) -> None:
+        """Keep startup I/O alive when a caller stops waiting for readiness."""
+        await asyncio.to_thread(self.store.initialize)
+        for entry in registry.list():
+            await asyncio.to_thread(
+                self.store.register_workspace,
+                entry.id,
+                Path(entry.path),
+                entry.name,
+                primary=entry.primary,
+            )
         async with self._lock:
-            if self._started:
-                return
-            self._started = True
-            self._accepting_subscriptions = True
-        try:
-            await asyncio.to_thread(self.store.initialize)
-            for entry in registry.list():
-                await asyncio.to_thread(
-                    self.store.register_workspace,
-                    entry.id,
-                    Path(entry.path),
-                    entry.name,
-                    primary=entry.primary,
+            # Shutdown can begin while initialization is still in a thread.
+            # It owns joining this task and must not acquire new maintenance.
+            if self._accepting_subscriptions:
+                self._started = True
+                self._maintenance_task = asyncio.create_task(
+                    self._maintain_database_after_ready(),
+                    name="muselab-files-database-maintenance",
                 )
-            async with self._lock:
-                if self._started:
-                    self._maintenance_task = asyncio.create_task(
-                        self._maintain_database_after_ready(),
-                        name="muselab-files-database-maintenance",
-                    )
-        except Exception:
-            async with self._lock:
-                self._started = False
-            raise
 
     @staticmethod
     def _resolved_lifecycle_root(root: Path) -> Path:
@@ -2326,12 +2352,29 @@ class FileWatchManager:
         state.subscribers.clear()
 
     async def shutdown(self) -> None:
+        """Join one teardown owner, including callers cancelled during close."""
         async with self._lock:
-            self._accepting_subscriptions = False
+            shutdown = self._shutdown_task
+            if shutdown is None:
+                self._accepting_subscriptions = False
+                self._started = False
+                shutdown = asyncio.create_task(
+                    self._shutdown_resources(asyncio.current_task()),
+                    name="muselab-files-shutdown",
+                )
+                self._shutdown_task = shutdown
+                shutdown.add_done_callback(
+                    lambda done: done.exception() if not done.cancelled() else None,
+                )
+        await asyncio.shield(shutdown)
+
+    async def _shutdown_resources(self, caller: asyncio.Task[Any] | None) -> None:
+        async with self._lock:
+            startup_task = self._startup_task
             subscription_setups = [
                 task
                 for task in self._subscription_setups
-                if task is not asyncio.current_task() and not task.done()
+                if task is not caller and not task.done()
             ]
             self._subscription_setups.clear()
             states = list(self._states.values())
@@ -2363,6 +2406,10 @@ class FileWatchManager:
                 self._close_subscribers(state)
                 state.reconcile_task = None
                 state.stop_task = None
+        if startup_task is not None:
+            # Cancelling a to_thread wrapper does not stop its initializer.
+            # Join the whole startup owner before resetting durable store state.
+            await asyncio.gather(startup_task, return_exceptions=True)
         if maintenance_task is not None:
             maintenance_task.cancel()
             await asyncio.gather(maintenance_task, return_exceptions=True)
@@ -2381,8 +2428,11 @@ class FileWatchManager:
             # store. The next manager lifecycle starts a fresh spawned worker.
             async with self._scan_worker_lock:
                 await self._stop_scan_worker_locked()
-            # close() only resets lazy state and uses a short RLock section.
-            self.store.close()
+            # Even the short lazy-state reset can wait for a store thread's
+            # RLock. The teardown owner keeps that wait off the event loop and
+            # stays alive until close actually returns.
+            await asyncio.to_thread(self.store.close)
+            self._startup_task = None
 
 
 manager = FileWatchManager()
