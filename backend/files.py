@@ -2988,7 +2988,10 @@ def csv_preview(
             f.seek(0)
             # readline iteration keeps TextIO.tell() available. Plain file
             # iteration disables it after next(), even at record boundaries.
-            reader = _csv.reader(iter(f.readline, ""), dialect=dialect)
+            # Sniffer's doublequote regex can miss quoted multiline fields.
+            # Preserve the standard writer's doubled quotes independently of
+            # delimiter/header inference.
+            reader = _csv.reader(iter(f.readline, ""), dialect=dialect, doublequote=True)
             if has_header:
                 try:
                     header_row = next(reader)
