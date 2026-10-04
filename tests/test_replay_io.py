@@ -200,3 +200,77 @@ async def test_reader_does_not_decode_an_in_progress_trailing_record(stream_env,
         release_write.set()
         broadcast.close()
         await broadcast.events.flush_async()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("blocked_lane", ["write", "read"])
+@pytest.mark.parametrize("retire", ["unsubscribe", "resync"])
+async def test_retired_subscriber_cancels_only_its_replay_wrapper_and_closes_file(
+    stream_env, monkeypatch, blocked_lane, retire,
+):
+    broadcast = stream_env.TurnBroadcast("disconnected-replay")
+    first, second = broadcast.subscribe(), broadcast.subscribe()
+    reader = first._replay
+    entered, release, finished = threading.Event(), threading.Event(), threading.Event()
+    if blocked_lane == "write":
+        operation = broadcast.events._write_blob
+        def delayed(blob):
+            entered.set()
+            assert release.wait(3)
+            try:
+                return operation(blob)
+            finally:
+                finished.set()
+        monkeypatch.setattr(broadcast.events, "_write_blob", delayed)
+    else:
+        operation = reader.readline
+        def delayed():
+            result = operation()
+            entered.set()
+            assert release.wait(3)
+            finished.set()
+            return result
+        monkeypatch.setattr(reader, "readline", delayed)
+    broadcast.publish({"event": "tool_result", "data": '{"id":"synthetic"}'})
+    broadcast.publish({"event": "done", "data": "{}"})
+    broadcast.finish()
+    pending = asyncio.create_task(first.get())
+    try:
+        assert await asyncio.to_thread(entered.wait, 1)
+        async with asyncio.timeout(1):
+            while first._pending_spool_read is None:
+                await asyncio.sleep(0)
+        wrapper = first._pending_spool_read
+        if retire == "unsubscribe":
+            broadcast.unsubscribe(first)
+            assert await asyncio.wait_for(pending, 1) is None
+        else:
+            first.resync("live_backlog")
+            event = await asyncio.wait_for(pending, 1)
+            assert event["event"] == "resync"
+            assert json.loads(event["data"])["reason"] == "live_backlog"
+            assert await first.get() is None
+        assert wrapper.done()
+        assert not finished.is_set(), "cancelling a wrapper did not stop its disk worker"
+        assert not broadcast.events._io._tail.cancelled(), "accepted shared writes must survive"
+        if blocked_lane == "read":
+            # A different subscriber can read the same spool while this disk
+            # worker remains blocked; its independent cursor was not cancelled.
+            assert (await asyncio.wait_for(second.get(), 1))["event"] == "tool_result"
+        release.set()
+        assert await asyncio.to_thread(finished.wait, 1)
+        if blocked_lane == "write":
+            assert (await asyncio.wait_for(second.get(), 1))["event"] == "tool_result"
+        assert (await second.get())["event"] == "done"
+        assert await second.get() is None
+        async with asyncio.timeout(1):
+            while reader._reader is not None:
+                await asyncio.sleep(0.001)
+        assert reader._closed
+    finally:
+        release.set()
+        await asyncio.gather(pending, return_exceptions=True)
+        broadcast.unsubscribe(first)
+        broadcast.unsubscribe(second)
+        broadcast.close()
+        await broadcast.events.flush_async()

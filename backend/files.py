@@ -15,6 +15,7 @@ import stat
 import sys
 import threading
 import time
+from bisect import bisect_right
 from collections import OrderedDict
 from pathlib import Path
 from typing import Literal
@@ -2886,13 +2887,17 @@ CSV_MAX_COLS = 50             # per-row column cap
 CSV_CELL_MAX_CHARS = 500
 CSV_SNIFF_BYTES = 8192        # sample size for delimiter / header detection
 
-# Counting every row is necessarily O(file size), but the old endpoint paid
-# that cost on *every* page. Cache only the total (never cell content), keyed by
-# the file's full stat signature, so same-size rewrites or replacements that
-# preserve mtime still invalidate via ctime/inode. The small LRU is protected
-# because FastAPI sync handlers run in a thread pool.
+# The first preview counts complete CSV records once. Keep only the count and
+# sparse TextIO seek cookies at record boundaries, never cell content. Cookies
+# preserve decoder/newline state across handles, unlike guessed physical-line
+# offsets (quoted cells can contain newlines). Each file has a bounded index;
+# doubling the stride compacts it as arbitrarily large files are scanned.
 CSV_TOTAL_CACHE_MAX = 64
-_CSV_TOTAL_CACHE: OrderedDict[str, tuple[tuple[int, ...], int]] = OrderedDict()
+CSV_SEEK_STRIDE = 1024
+CSV_SEEK_MAX_CHECKPOINTS = 1024
+_CSV_TOTAL_CACHE: OrderedDict[
+    str, tuple[tuple[int, ...], int, tuple[tuple[int, int], ...]]
+] = OrderedDict()
 _CSV_TOTAL_CACHE_LOCK = threading.Lock()
 
 
@@ -2902,7 +2907,9 @@ def _csv_signature(info: os.stat_result) -> tuple[int, ...]:
     )
 
 
-def _csv_total_cache_get(target: Path, signature: tuple[int, ...]) -> int | None:
+def _csv_total_cache_get(
+    target: Path, signature: tuple[int, ...],
+) -> tuple[int, tuple[tuple[int, int], ...]] | None:
     key = str(target)
     with _CSV_TOTAL_CACHE_LOCK:
         value = _CSV_TOTAL_CACHE.get(key)
@@ -2911,13 +2918,16 @@ def _csv_total_cache_get(target: Path, signature: tuple[int, ...]) -> int | None
                 _CSV_TOTAL_CACHE.pop(key, None)
             return None
         _CSV_TOTAL_CACHE.move_to_end(key)
-        return value[1]
+        return value[1], value[2]
 
 
-def _csv_total_cache_set(target: Path, signature: tuple[int, ...], total: int) -> None:
+def _csv_total_cache_set(
+    target: Path, signature: tuple[int, ...], total: int,
+    checkpoints: list[tuple[int, int]],
+) -> None:
     key = str(target)
     with _CSV_TOTAL_CACHE_LOCK:
-        _CSV_TOTAL_CACHE[key] = (signature, total)
+        _CSV_TOTAL_CACHE[key] = (signature, total, tuple(checkpoints))
         _CSV_TOTAL_CACHE.move_to_end(key)
         while len(_CSV_TOTAL_CACHE) > CSV_TOTAL_CACHE_MAX:
             _CSV_TOTAL_CACHE.popitem(last=False)
@@ -2937,10 +2947,9 @@ def csv_preview(
     delimiter and a `total_rows` count so the UI can show pagination.
     Header row (if csv.Sniffer flags one) is returned separately.
 
-    Designed to never load more than a window into memory: the file is
-    iterated row-by-row, skipping rows below offset and breaking once
-    `limit` is filled. The trailing total-rows count is the only full
-    scan, and it just discards each row.
+    The first preview counts all records while retaining only the requested
+    window and a bounded sparse seek index. Later pages start at the nearest
+    cached record boundary and stop once the window is filled.
     """
     import csv as _csv  # local import — csv is stdlib, but keep import local
                        # so import overhead stays out of every other route.
@@ -2949,74 +2958,79 @@ def csv_preview(
         raise HTTPException(status_code=404, detail="not a file")
     if target.suffix.lower() not in {".csv", ".tsv"}:
         raise HTTPException(status_code=415, detail="not a csv/tsv file")
-    try:
-        stat = target.stat()
-    except OSError:
-        raise HTTPException(status_code=404, detail="not a file") from None
-    signature = _csv_signature(stat)
-    cached_total = _csv_total_cache_get(target, signature)
     if limit < 1:
         limit = CSV_DEFAULT_LIMIT
     if limit > CSV_MAX_LIMIT:
         limit = CSV_MAX_LIMIT
     if offset < 0:
         offset = 0
-    # Strip an optional UTF-8 BOM before both sniffing and parsing so a
-    # quoted first field retains its delimiter and header semantics.
-    # Sniff delimiter + header from a small head sample. Defaults to
-    # excel-style comma if Sniffer can't tell (e.g. one-column file).
-    try:
-        with target.open("r", encoding="utf-8-sig", errors="replace", newline="") as f:
-            sample = f.read(CSV_SNIFF_BYTES)
-        try:
-            dialect = _csv.Sniffer().sniff(sample, delimiters=",\t;|")
-            has_header = _csv.Sniffer().has_header(sample)
-        except _csv.Error:
-            dialect = _csv.excel
-            has_header = False
-        # Override sniff for explicit .tsv — Sniffer sometimes guesses comma
-        # on tab-separated files when the first row has no tabs.
-        if target.suffix.lower() == ".tsv":
-            dialect = _csv.excel_tab
-    except OSError as e:
-        raise HTTPException(status_code=500, detail=f"failed to read: {e}")
-
     header: list[str] = []
     rows: list[list[str]] = []
     cols_truncated = False
-    total_rows = 0
     try:
         with target.open("r", encoding="utf-8-sig", errors="replace", newline="") as f:
-            reader = _csv.reader(f, dialect=dialect)
-            # Pull header before any data offset is applied. The user paging
-            # to offset=200 still wants column titles at the top of the page.
+            # Bind the cache to the opened inode, not an earlier path stat. A
+            # replacement between stat and open must never receive old cookies.
+            signature = _csv_signature(os.fstat(f.fileno()))
+            cached = _csv_total_cache_get(target, signature)
+            cached_total = cached[0] if cached is not None else None
+            # Sniff and parse the same handle so an atomic replacement cannot
+            # mix the old dialect/header with the new file's data.
+            sample = f.read(CSV_SNIFF_BYTES)
+            try:
+                dialect = _csv.Sniffer().sniff(sample, delimiters=",\t;|")
+                has_header = _csv.Sniffer().has_header(sample)
+            except _csv.Error:
+                dialect = _csv.excel
+                has_header = False
+            if target.suffix.lower() == ".tsv":
+                dialect = _csv.excel_tab
+            f.seek(0)
+            # readline iteration keeps TextIO.tell() available. Plain file
+            # iteration disables it after next(), even at record boundaries.
+            reader = _csv.reader(iter(f.readline, ""), dialect=dialect)
             if has_header:
                 try:
                     header_row = next(reader)
                     header = [_clip_cell(c) for c in header_row[:CSV_MAX_COLS]]
-                    if len(header_row) > CSV_MAX_COLS:
-                        cols_truncated = True
+                    cols_truncated = len(header_row) > CSV_MAX_COLS
                 except StopIteration:
                     pass
             row_idx = 0
-            # A cached total means pagination only needs to walk through the
-            # requested window; it can stop immediately afterwards. Without a
-            # cached total (first request or changed file), continue to EOF once
-            # so future pages are cheap.
+            checkpoints = [(0, f.tell())] if cached is None else []
+            stride = CSV_SEEK_STRIDE
+            next_checkpoint = stride if cached is None else -1
+            if cached is not None and offset < cached_total:
+                point_idx = bisect_right(cached[1], offset, key=lambda point: point[0]) - 1
+                row_idx, cookie = cached[1][point_idx]
+                f.seek(cookie)
             if cached_total is None or offset < cached_total:
                 for raw in reader:
-                    if row_idx < offset:
-                        row_idx += 1
-                        continue
-                    if len(rows) < limit:
+                    if row_idx >= offset and len(rows) < limit:
                         cells = [_clip_cell(c) for c in raw[:CSV_MAX_COLS]]
                         if len(raw) > CSV_MAX_COLS:
                             cols_truncated = True
                         rows.append(cells)
                     row_idx += 1
+                    if row_idx == next_checkpoint:
+                        if len(checkpoints) >= CSV_SEEK_MAX_CHECKPOINTS:
+                            checkpoints = checkpoints[::2]
+                            stride *= 2
+                        if row_idx % stride == 0:
+                            checkpoints.append((row_idx, f.tell()))
+                        next_checkpoint = (row_idx // stride + 1) * stride
                     if cached_total is not None and len(rows) >= limit:
                         break
             total_rows = cached_total if cached_total is not None else row_idx
+            # Cache only an unchanged complete scan. Both inode and path checks
+            # exclude in-place rewrites and replacements during this request.
+            if cached is None and _csv_signature(os.fstat(f.fileno())) == signature:
+                try:
+                    end_stat = target.stat()
+                except OSError:
+                    end_stat = None
+                if end_stat is not None and _csv_signature(end_stat) == signature:
+                    _csv_total_cache_set(target, signature, total_rows, checkpoints)
     except _csv.Error:
         raise HTTPException(
             status_code=422,
@@ -3024,17 +3038,6 @@ def csv_preview(
         ) from None
     except OSError as e:
         raise HTTPException(status_code=500, detail=f"failed to read: {e}")
-
-    if cached_total is None:
-        # Do not cache a count under an obsolete signature if an external
-        # writer changed the file during our scan.
-        try:
-            end_stat = target.stat()
-        except OSError:
-            end_stat = None
-        if (end_stat is not None
-                and _csv_signature(end_stat) == signature):
-            _csv_total_cache_set(target, signature, total_rows)
 
     return {
         "path": path,

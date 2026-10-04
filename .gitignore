@@ -40,6 +40,8 @@ build/
 .ruff_cache/
 .mypy_cache/
 .pytest_cache/
+.coverage
+.coverage.*
 .vscode/
 .idea/
 *.log

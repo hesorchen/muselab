@@ -3809,9 +3809,8 @@ function portal() {
         }
       });
     },
-    async _attachFile(file) {
+    async _attachFile(file, { ownerSid = this.currentId, waitFor = null } = {}) {
       if (this.workspaceSwitching) return;
-      const ownerSid = this.currentId;
       if (!ownerSid) return;
       this._captureComposerState(ownerSid);
       const ownerState = this._ensureTabState(ownerSid);
@@ -3828,62 +3827,31 @@ function portal() {
         return;
       }
 
-      // Diagnostic timing — when uploads feel slow the user has no way to
-      // tell if it's compression CPU on the phone or network throughput.
-      // We split the timeline into "compress" / "data-url" / "upload" and
-      // surface only aggregate timing/size in a slow-upload toast. Never log the
-      // original filename: attachment names can contain private document titles.
-      const t0 = performance.now();
-      let tCompressEnd = t0;
-
+      // Register the chip before image preparation or a preceding batch item
+      // can yield. Send must see every selected attachment as pending work.
       let entry;
       if (kind === "image") {
-        // Compress BEFORE generating the preview + upload — both reuse
-        // the smaller file.
-        file = await this._maybeCompressImage(file);
-        tCompressEnd = performance.now();
-        // Generate a small base64 thumbnail (≤160 px, JPEG 70%) stored
-        // directly in the image entry. This survives session reload,
-        // tab switches, and iOS Safari's blob-URL lifecycle quirks —
-        // the data URI is a self-contained string that never expires.
-        // The chip and the sent-message bubble both use this thumbnail.
-        const preview = await this._imageToThumbDataURL(file);
-        if (!ownsDraft()) return;
-        // Stash the compressed File on the entry so the in-chip "✎ Annotate"
-        // button can re-open the bitmap in the image editor without
-        // round-tripping back to the server. Memory cost is small (~300 KB
-        // per image after compression), cleared on send.
-        const raw = { id: null, mime: file.type, preview,
+        const raw = { id: null, mime: file.type, preview: "",
                        uploading: true, progress: 0, progressKnown: false,
                        error: false, file };
         ownerDraft.pendingImages.push(raw);
-        // Alpine v3 wraps each pushed item in a Proxy. The local `raw`
-        // reference still points at the original (non-proxied) object;
-        // mutating raw.uploading bypasses the Proxy's set trap and
-        // doesn't fire reactivity → the chip's `:class="{uploading:...}"`
-        // binding never re-evaluates and the progress bar slides forever
-        // even after the upload completes. Bug observed 2026-05-21.
-        // Pull the proxied version back out of the array so subsequent
-        // mutations go through Alpine's reactive layer.
+        // Mutate the Alpine proxy so progress/preparation changes render.
         entry = ownerDraft.pendingImages[ownerDraft.pendingImages.length - 1];
       } else {
         const raw = { id: null, name: file.name, kind,
                        uploading: true, progress: 0, progressKnown: false,
                        error: false };
         ownerDraft.pendingDocs.push(raw);
-        // Same Alpine-proxy gotcha as above — must use the proxied
-        // reference for entry.uploading = false to actually trigger UI.
         entry = ownerDraft.pendingDocs[ownerDraft.pendingDocs.length - 1];
       }
-
-      const tUploadStart = performance.now();
-      const fd = new FormData();
-      fd.append("file", file);
       const uploadController = new AbortController();
+      // Runtime-only cancellation must not become part of recovered/queued
+      // attachment payloads when entries are copied or serialized.
+      Object.defineProperty(entry, "_uploadController", {
+        value: uploadController, configurable: true,
+      });
       ownerDraft._uploadControllers.add(uploadController);
-      const uploadTimeout = setTimeout(
-        () => uploadController.abort(), 5 * 60 * 1000,
-      );
+      let uploadTimeout = null;
       const ownsEntry = () => ownsDraft()
         && (ownerDraft.pendingImages.includes(entry) || ownerDraft.pendingDocs.includes(entry));
       const updateProgress = percent => {
@@ -3899,6 +3867,30 @@ function portal() {
         );
       };
       try {
+        // A batch reserves all chips together but prepares/uploads serially to
+        // avoid decoding several full-resolution photos at once on mobile.
+        if (waitFor) await waitFor;
+        if (!ownsEntry() || uploadController.signal.aborted) return;
+        // Timing uses aggregate durations/size, never attachment filenames.
+        const t0 = performance.now();
+        let tCompressEnd = t0;
+        if (kind === "image") {
+          file = await this._maybeCompressImage(file);
+          if (!ownsEntry() || uploadController.signal.aborted) return;
+          tCompressEnd = performance.now();
+          // A small data URL survives tab switches and iOS blob-URL lifetimes.
+          const preview = await this._imageToThumbDataURL(file);
+          if (!ownsEntry() || uploadController.signal.aborted) return;
+          entry.mime = file.type;
+          entry.file = file;
+          entry.preview = preview;
+        }
+        const tUploadStart = performance.now();
+        const fd = new FormData();
+        fd.append("file", file);
+        uploadTimeout = setTimeout(
+          () => uploadController.abort(), 5 * 60 * 1000,
+        );
         const r = await this._uploadAttachment(fd, {
           signal: uploadController.signal,
           onProgress: updateProgress,
@@ -3956,12 +3948,27 @@ function portal() {
       } finally {
         clearTimeout(uploadTimeout);
         ownerDraft._uploadControllers.delete(uploadController);
+        delete entry._uploadController;
       }
+    },
+    async _attachFiles(files) {
+      if (this.workspaceSwitching) return;
+      const ownerSid = this.currentId;
+      let pending = Promise.resolve();
+      // Invoke every item before awaiting: the entire batch keeps this owner
+      // and becomes visible to a send triggered during its first upload.
+      for (const file of files) {
+        const item = this._attachFile(file, { ownerSid, waitFor: pending });
+        // A rejected item can finish before the previous transfer. Preserve
+        // that previous tail so the next valid image cannot bypass it.
+        pending = Promise.all([pending, item]);
+      }
+      await pending;
     },
     async onAttachPicked(ev) {
       const files = Array.from(ev.target.files || []);
       ev.target.value = "";
-      for (const f of files) await this._attachFile(f);
+      await this._attachFiles(files);
     },
     async onAttachDrop(ev) {
       const files = Array.from((ev.dataTransfer && ev.dataTransfer.files) || []);
@@ -3980,14 +3987,18 @@ function portal() {
       }
       if (files.length) {
         ev.preventDefault();
-        for (const f of files) await this._attachFile(f);
+        await this._attachFiles(files);
       }
     },
     removePendingImage(i) {
       // preview is now a data URL (base64) — no revoke needed.
-      this.pendingImages.splice(i, 1);
+      const [entry] = this.pendingImages.splice(i, 1);
+      if (entry && entry._uploadController) entry._uploadController.abort();
     },
-    removePendingDoc(i) { this.pendingDocs.splice(i, 1); },
+    removePendingDoc(i) {
+      const [entry] = this.pendingDocs.splice(i, 1);
+      if (entry && entry._uploadController) entry._uploadController.abort();
+    },
 
     // ===== image annotation editor (L1) =====
     // Open the editor over pendingImages[i]. The chip must have already
@@ -34062,8 +34073,20 @@ function portal() {
         // current global composer while waiting for uploads.
         const ownedImages = resumed ? (resumed.pendingImages || []) : composerImages;
         const ownedDocs = resumed ? (resumed.pendingDocs || []) : composerDocs;
-        const stillUploading = () => ownedImages.some(im => im.uploading)
-          || ownedDocs.some(d => d.uploading);
+        const pruneRemovedAttachments = () => {
+          if (resumed) return; // Queued items keep their detached snapshot.
+          for (const [snapshot, live] of [
+            [ownedImages, sendDraft.pendingImages], [ownedDocs, sendDraft.pendingDocs],
+          ]) {
+            for (let i = snapshot.length - 1; i >= 0; i--) {
+              if (!live.includes(snapshot[i])) snapshot.splice(i, 1);
+            }
+          }
+        };
+        const stillUploading = () => {
+          pruneRemovedAttachments();
+          return ownedImages.some(im => im.uploading) || ownedDocs.some(d => d.uploading);
+        };
         if (stillUploading()) {
           this._setComposerClaimPhase(sendState, composerSubmitToken, "upload");
           sendDraft._sendWaitingForUpload = true;
@@ -34081,6 +34104,8 @@ function portal() {
           if (!ownsSendDraft()) return false;
           this._setComposerClaimPhase(sendState, composerSubmitToken, "submitting");
         }
+        pruneRemovedAttachments();
+        if (!text && !ownedImages.length && !ownedDocs.length) return false;
         // An attachment is part of the user's send intent. If any upload failed,
         // keep every chip/draft in place and refuse the send instead of silently
         // degrading the turn to text-only (or a partial attachment set).

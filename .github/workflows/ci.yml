@@ -43,26 +43,23 @@ jobs:
           # Use a minimal env so backend.settings doesn't refuse to import.
           MUSELAB_TOKEN: "ci-test-token-1234567890abcdef-min-32"
           MUSELAB_ROOT: ${{ github.workspace }}/.ci-workspace
+          MUSELAB_TEST_COVERAGE: ${{ matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12' }}
         run: |
-          mkdir -p $MUSELAB_ROOT
-          uv run pytest tests/ -n auto --dist=worksteal -v
+          mkdir -p "$MUSELAB_ROOT"
+          test_args=(tests/ -n auto --dist=worksteal -v)
+          if [[ "$MUSELAB_TEST_COVERAGE" == "true" ]]; then
+            # Collect all workers' coverage during the blocking test run.
+            # Rendering below consumes that data without rerunning tests.
+            test_args+=(--cov=backend --cov-report=)
+          fi
+          uv run --frozen pytest "${test_args[@]}"
 
       - name: Coverage report (non-blocking, informational)
-        # Best-effort coverage. pytest-cov is pulled ephemerally via
-        # `uv run --with` so it does NOT touch the frozen lockfile (adding it
-        # to dev deps would require regenerating uv.lock). No fail-under gate —
-        # this surfaces coverage in the run log without turning a dip into a
-        # red build. Only run once (primary py on Linux) to avoid matrix noise.
+        # Reporting has no fail-under gate and remains best-effort. Test
+        # failures above still block this job; coverage never reruns the suite.
         if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'
         continue-on-error: true
-        env:
-          MUSELAB_TOKEN: "ci-test-token-1234567890abcdef-min-32"
-          MUSELAB_ROOT: ${{ github.workspace }}/.ci-cov-workspace
-        run: |
-          mkdir -p $MUSELAB_ROOT
-          uv run --with pytest-cov pytest tests/ -q \
-            -n auto --dist=worksteal \
-            --cov=backend --cov-report=term-missing
+        run: uv run --frozen coverage report --show-missing
 
   lint:
     name: ruff + muselab-lint
