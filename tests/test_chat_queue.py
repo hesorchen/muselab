@@ -1816,15 +1816,20 @@ async def test_cancelled_scheduled_drain_restores_accepted_message(
     entered = asyncio.Event()
 
     async def stalled_start(*_args, **_kwargs):
+        claim = sess.get_queue(sid)["inflight"]
+        assert claim["item"]["text"] == "survive restart"
+        assert not claim.get("turn_id")
         entered.set()
+        # Cancel at the dispatch boundary, after real reads and the claim.
+        # Executor admission is a precondition, not a one-second SLA here.
+        asyncio.get_running_loop().call_soon(task.cancel)
         await asyncio.Event().wait()
 
     monkeypatch.setattr(chat, "_start_turn", stalled_start)
     task = asyncio.create_task(chat._maybe_drain_queue(sid))
-    await asyncio.wait_for(entered.wait(), timeout=1)
-    task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
+    assert entered.is_set()
 
     queue = sess.get_queue(sid)
     assert [item["text"] for item in queue["items"]] == ["survive restart"]
