@@ -368,7 +368,10 @@ def _load_state() -> None:
         _STATE_ERROR = ""
         return
     try:
-        if not _STATE_FILE.exists():
+        try:
+            # exists() can hide I/O errors as False; stat() preserves them.
+            _STATE_FILE.stat()
+        except FileNotFoundError:
             _STATE_ERROR = ""
             return
         loaded = json.loads(_STATE_FILE.read_text(encoding="utf-8"))

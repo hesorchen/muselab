@@ -13,7 +13,7 @@ def _schedule():
     return {"kind": "daily", "hour": 9, "minute": 0, "tz_offset_minutes": 0}
 
 
-@pytest.mark.parametrize("failure", ["stat_io", "json", "structure"])
+@pytest.mark.parametrize("failure", ["stat_io", "inaccessible_exists_false", "json", "structure"])
 def test_unavailable_scheduler_preserves_tasks_through_crud_and_reload(
     app_module, client, auth, monkeypatch, failure,
 ):
@@ -33,15 +33,30 @@ def test_unavailable_scheduler_preserves_tasks_through_crud_and_reload(
     armed = True
     stat_failures = []
 
-    if failure == "stat_io":
-        # Only this exact state Path has an unreadable stat, on every platform.
+    if failure in {"stat_io", "inaccessible_exists_false"}:
+        # Only this exact state Path has an unreadable stat, without OS chmod.
         # All other paths and actual file reads/writes retain their real behavior.
         class UnreadableStatePath(type(state_file)):
             def stat(self, *args, **kwargs):
                 if armed and self == state_file:
                     stat_failures.append(True)
-                    raise OSError(errno.EIO, "synthetic scheduler stat failure")
+                    error = errno.EACCES if failure == "inaccessible_exists_false" else errno.EIO
+                    raise OSError(error, "synthetic scheduler stat failure")
                 return super().stat(*args, **kwargs)
+
+            def exists(self, *args, **kwargs):
+                if armed and self == state_file and failure == "inaccessible_exists_false":
+                    # Model Python 3.14's documented OSError -> False contract.
+                    try:
+                        self.stat(*args, **kwargs)
+                    except OSError:
+                        return False
+                return super().exists(*args, **kwargs)
+
+            def read_text(self, *args, **kwargs):
+                if armed and self == state_file and failure == "inaccessible_exists_false":
+                    raise PermissionError(errno.EACCES, "synthetic scheduler read failure")
+                return super().read_text(*args, **kwargs)
 
         monkeypatch.setattr(sched, "_STATE_FILE", UnreadableStatePath(state_file))
     elif failure == "json":
@@ -56,12 +71,22 @@ def test_unavailable_scheduler_preserves_tasks_through_crud_and_reload(
         "tasks": {}, "history": [], "unread_count": 0, "cleanup_pending": {},
     }
     try:
+        if failure == "inaccessible_exists_false":
+            assert sched._STATE_FILE.exists() is False
+            with pytest.raises(PermissionError):
+                sched._STATE_FILE.read_text(encoding="utf-8")
         with pytest.raises(sched.SchedulerPersistenceError, match="original file preserved"):
-            asyncio.run(sched.start_scheduler())
+            if failure == "inaccessible_exists_false":
+                # The baseline considers this absent; do not let startup spawn
+                # a real tick after its unsafe empty-cache save.
+                with sched._STATE_LOCK:
+                    sched._load_state()
+            else:
+                asyncio.run(sched.start_scheduler())
     finally:
         armed = False
 
-    if failure == "stat_io":
+    if failure in {"stat_io", "inaccessible_exists_false"}:
         assert stat_failures
     assert sched.persistence_status()["available"] is False
     assert sched._scheduler_task is None
@@ -91,7 +116,7 @@ def test_unavailable_scheduler_preserves_tasks_through_crud_and_reload(
 
     # Repair the simulated invalid bytes, then read the real two-task file.
     # For stat I/O failure this write is unnecessary: the file never changed.
-    if failure != "stat_io":
+    if failure in {"json", "structure"}:
         state_file.write_bytes(original_bytes)
     with sched._STATE_LOCK:
         sched._load_state()
