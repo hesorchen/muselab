@@ -800,6 +800,10 @@ function portal() {
       history: [],
       unreadCount: 0,
       loading: false,
+      tasksSeq: 0,
+      draftSeq: 0,
+      saveSeq: 0,
+      saving: false,
       // SDK Cron jobs are runtime-owned and belong to one Claude session.
       // They are read-only here; creation/deletion remains the native tool's
       // job, while this projection makes the otherwise invisible jobs and
@@ -39084,6 +39088,7 @@ function portal() {
       return this.openScheduler({ sessionId, native: true });
     },
     async openScheduler(options = {}) {
+      this._invalidateSchedDraftSave();
       const nativeSessionId = String(
         (options && typeof options === "object" && options.sessionId)
         || this.currentId
@@ -39111,11 +39116,17 @@ function portal() {
       }
     },
     closeScheduler() {
+      this._invalidateSchedDraftSave();
       const wasOpen = this.scheduler.show;
       this.scheduler.show = false;
       if (wasOpen) this._closeFocusSurface("scheduler");
     },
+    _invalidateSchedDraftSave() {
+      this.scheduler.draftSeq += 1;
+      this.scheduler.saving = false;
+    },
     _resetSchedDraft() {
+      this._invalidateSchedDraftSave();
       this.scheduler.draft = {
         editingId: null,
         name: "", prompt: "", model: this.model || "",
@@ -39171,6 +39182,7 @@ function portal() {
     // button switches to PATCH and a Cancel button appears.
     editSchedTask(t) {
       if (!t) return;
+      this._invalidateSchedDraftSave();
       const s = t.schedule || {};
       // Hydrate `times`: prefer the multi-slot list when present (saved by
       // newer tasks); otherwise synthesize a single-slot list from the
@@ -39216,16 +39228,20 @@ function portal() {
     },
     cancelEditSched() { this._resetSchedDraft(); },
     async loadSchedulerTasks() {
+      const seq = ++this.scheduler.tasksSeq;
       this.scheduler.loading = true;
       try {
         const r = await fetch("/api/scheduler/tasks", { headers: this.hdr() });
-        if (r.ok) {
-          const d = await r.json();
-          this.scheduler.tasks = d.tasks || [];
-          this.scheduler.unreadCount = d.unread_count || 0;
-        }
+        if (!r.ok) return false;
+        const d = await r.json();
+        if (seq !== this.scheduler.tasksSeq) return false;
+        this.scheduler.tasks = d.tasks || [];
+        this.scheduler.unreadCount = d.unread_count || 0;
+        return true;
+      } catch (_) {
+        return false;
       } finally {
-        this.scheduler.loading = false;
+        if (seq === this.scheduler.tasksSeq) this.scheduler.loading = false;
       }
     },
     async loadSchedulerHistory() {
@@ -39276,6 +39292,7 @@ function portal() {
       }
     },
     async createSchedTask() {
+      if (this.scheduler.saving) return;
       const d = this.scheduler.draft;
       if (!d.name.trim() || !d.prompt.trim()) {
         this.toast(this.lang === "zh"
@@ -39347,40 +39364,55 @@ function portal() {
       const url = isEdit
         ? "/api/scheduler/tasks/" + encodeURIComponent(d.editingId)
         : "/api/scheduler/tasks";
-      let r;
+      const payload = {
+        name: d.name.trim(),
+        prompt: d.prompt.trim(),
+        schedule: sched,
+        model: d.model || "",
+        session_mode: d.session_mode || "fresh",
+      };
+      const draftSeq = this.scheduler.draftSeq;
+      const snapshot = JSON.stringify(d);
+      const saveSeq = ++this.scheduler.saveSeq;
+      const owns = () => draftSeq === this.scheduler.draftSeq
+        && saveSeq === this.scheduler.saveSeq;
+      this.scheduler.saving = true;
       try {
-        r = await fetch(url, {
+        const r = await fetch(url, {
           method: isEdit ? "PATCH" : "POST",
           headers: { ...this.hdr(), "Content-Type": "application/json" },
-          body: JSON.stringify({
-            name: d.name.trim(),
-            prompt: d.prompt.trim(),
-            schedule: sched,
-            model: d.model || "",
-            session_mode: d.session_mode || "fresh",
-          }),
+          body: JSON.stringify(payload),
         });
-      } catch (e) {
-        // Network-level failure (offline / flaky mobile) — without this the
-        // throw becomes an unhandledrejection and the user gets no feedback.
-        this.errToast(isEdit ? "save" : "create", String((e && e.message) || e));
-        return;
-      }
-      if (!r.ok) {
-        const err = await r.text();
-        const verb = isEdit
-          ? (this.lang === "zh" ? "保存失败：" : "Save failed: ")
-          : (this.lang === "zh" ? "创建失败：" : "Create failed: ");
-        this.toast(verb + err, "error", 4000);
-        return;
-      }
-      this._resetSchedDraft();
-      await this.loadSchedulerTasks();
-      this.toast(
-        isEdit
+        if (!r.ok) {
+          const err = await r.text();
+          const verb = isEdit
+            ? (this.lang === "zh" ? "保存失败：" : "Save failed: ")
+            : (this.lang === "zh" ? "创建失败：" : "Create failed: ");
+          this.toast(verb + err, "error", 4000);
+          return;
+        }
+        // Confirmation invalidates lists captured before this write. Keep
+        // the confirmed edit visible even if the following refresh fails.
+        this.scheduler.tasksSeq += 1;
+        if (isEdit) {
+          this.scheduler.tasks = this.scheduler.tasks.map(task =>
+            task.id === d.editingId ? { ...task, ...payload } : task);
+        }
+        if (owns() && JSON.stringify(this.scheduler.draft) === snapshot) {
+          this._resetSchedDraft();
+        }
+        const refreshed = await this.loadSchedulerTasks();
+        const message = isEdit
           ? (this.lang === "zh" ? "已保存" : "Saved")
-          : (this.lang === "zh" ? "任务已创建" : "Task created"),
-        "success", 2000);
+          : (this.lang === "zh" ? "任务已创建" : "Task created");
+        this.toast(refreshed ? message : message + (this.lang === "zh"
+          ? "，但任务列表刷新失败" : ", but the task list could not refresh"),
+        refreshed ? "success" : "warn", refreshed ? 2000 : 4000);
+      } catch (e) {
+        this.errToast(isEdit ? "save" : "create", String((e && e.message) || e));
+      } finally {
+        if (owns()) this.scheduler.saving = false;
+      }
     },
     toggleDraftWeekday(w) {
       const wds = this.scheduler.draft.weekdays;
@@ -39475,9 +39507,15 @@ function portal() {
                      "error", 5000);
           return;
         }
+        this.scheduler.tasksSeq += 1;
+        this.scheduler.tasks = this.scheduler.tasks.filter(task => task.id !== t.id);
+        delete this.scheduler.taskRuns[t.id];
         if (this.scheduler.draft.editingId === t.id) this._resetSchedDraft();
-        await this.loadSchedulerTasks();
-        this.toast(zh ? "任务已删除" : "Task deleted", "success", 2000);
+        const refreshed = await this.loadSchedulerTasks();
+        this.toast(refreshed
+          ? (zh ? "任务已删除" : "Task deleted")
+          : (zh ? "任务已删除，但任务列表刷新失败" : "Task deleted, but the task list could not refresh"),
+        refreshed ? "success" : "warn", refreshed ? 2000 : 4000);
       } catch (e) {
         // Network-level failure — typically iOS Safari losing the request
         // mid-flight on flaky 4G. Show the user what happened.

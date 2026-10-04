@@ -7348,6 +7348,7 @@
                     @click="cancelEditSched()"
                     x-text="lang==='zh' ? '取消' : 'Cancel'"></button>
             <button class="btn-primary" @click="createSchedTask()"
+                    :disabled="scheduler.saving" :aria-busy="scheduler.saving"
                     x-text="scheduler.draft.editingId
                       ? (lang==='zh' ? '保存修改' : 'Save changes')
                       : (lang==='zh' ? '+ 添加任务' : '+ Add task')"></button>
