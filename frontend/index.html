@@ -5916,7 +5916,7 @@
               <div class="mcp-server-actions">
                 <label class="switch sm" :title="t('set.mcp.toggle_title')">
                   <input type="checkbox" :checked="!s.disabled"
-                         @change="toggleMcp(s.name, !$event.target.checked)" />
+                         @change="toggleMcp(s.name, !$event.target.checked); $event.target.checked = !s.disabled" />
                   <span class="switch-slider"></span>
                 </label>
                 <button class="icon-btn sm" :title="t('set.mcp.delete')"
