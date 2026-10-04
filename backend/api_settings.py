@@ -155,9 +155,10 @@ def _write_env(updates: dict[str, str]) -> None:
     }
     with _ENV_WRITE_LOCK:
         ENV_PATH.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        lines: list[str] = []
-        if ENV_PATH.exists():
+        try:
             lines = ENV_PATH.read_text(encoding="utf-8").splitlines()
+        except FileNotFoundError:
+            lines = []
 
         out: list[str] = []
         written: set[str] = set()
