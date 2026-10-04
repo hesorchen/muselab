@@ -6551,13 +6551,15 @@ function portal() {
         data = null;
       }
       if (!r.ok) {
+        // HTTP/2 commonly leaves statusText empty, and upstream failures may
+        // return HTML instead of JSON. Preserve the status for caller feedback.
+        const error = (data && data.detail) || r.statusText || `HTTP ${r.status}`;
         if (opts.toastError) {
-          const msg = (data && data.detail) || r.statusText || `HTTP ${r.status}`;
           this.toast(
-            (this.lang === "zh" ? "请求失败：" : "Request failed: ") + msg,
+            (this.lang === "zh" ? "请求失败：" : "Request failed: ") + error,
             "error", 4000);
         }
-        return { ok: false, status: r.status, data, error: (data && data.detail) || r.statusText };
+        return { ok: false, status: r.status, data, error };
       }
       return { ok: true, status: r.status, data };
     },
@@ -27610,8 +27612,14 @@ function portal() {
     async openTerminal(id, { reconnect = false, reveal = true } = {}) {
       const row = this.terminals.find(item => item.id === id);
       if (!row) return;
+      const ownerWorkspace = this.fileWorkspacePath();
+      const requestHeaders = this.fileHdr(ownerWorkspace);
       this._teardownTerminalView();
       const seq = ++this._terminalConnectSeq;
+      const isCurrent = () => seq === this._terminalConnectSeq
+        && this.activeTerminalId === id && this.previewSurface === "terminal"
+        && this._workspaceIsCurrent(ownerWorkspace);
+      let connectionTerm = null;
       this.activeTerminalId = id;
       this.previewSurface = "terminal";
       this.terminalManagerOpen = false;
@@ -27621,8 +27629,9 @@ function portal() {
       this._scheduleSavePrefs();
       try {
         await this._loadTerminalLib();
-        if (seq !== this._terminalConnectSeq || this.activeTerminalId !== id) return;
+        if (!isCurrent()) return;
         await this.$nextTick();
+        if (!isCurrent()) return;
         const host = this.$refs.terminalHost;
         if (!host) throw new Error("terminal host missing");
         host.replaceChildren();
@@ -27673,6 +27682,10 @@ function portal() {
         term.loadAddon(fit);
         term.open(host);
         this._terminal = term;
+        // Capture through Alpine's getter: it may wrap the xterm instance in
+        // a reactive proxy, so comparing with the raw constructor value fails.
+        connectionTerm = this._terminal;
+        const ownsTerminal = () => isCurrent() && this._terminal === connectionTerm;
         this._terminalFit = fit;
         this._attachTerminalTouchScroll(host, term);
         this._attachTerminalSelectionCopy(host, term);
@@ -27731,12 +27744,25 @@ function portal() {
         });
         if (reveal || !this._isMobileLayout()) term.focus();
 
-        const ticketResponse = await this.api(`/api/terminals/${id}/ticket`, {
-          method: "POST",
-          headers: this.fileHdr(),
-        });
-        if (!ticketResponse.ok) throw new Error(ticketResponse.error || "ticket failed");
-        if (seq !== this._terminalConnectSeq) return;
+        let ticketResponse;
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+          if (!ownsTerminal()) return;
+          // Only mint a fresh connection ticket: retrying must never allocate
+          // another PTY or restart the process after a transient proxy failure.
+          ticketResponse = await this.api(`/api/terminals/${id}/ticket`, {
+            method: "POST",
+            headers: requestHeaders,
+          });
+          if (!ownsTerminal()) return;
+          if (ticketResponse.ok) break;
+          const transient = [0, 502, 503, 504].includes(ticketResponse.status);
+          if (!transient || attempt === 2) {
+            throw new Error(ticketResponse.error || `HTTP ${ticketResponse.status}`);
+          }
+          this.terminalConnection = reconnect ? "reconnecting" : "connecting";
+          await new Promise(resolve => setTimeout(resolve, attempt === 0 ? 250 : 750));
+        }
+        if (!ownsTerminal()) return;
         const scheme = location.protocol === "https:" ? "wss:" : "ws:";
         const socket = new WebSocket(
           `${scheme}//${location.host}/api/terminals/${encodeURIComponent(id)}/ws`,
@@ -27796,7 +27822,7 @@ function portal() {
           if (seq === this._terminalConnectSeq) this.terminalConnection = "reconnecting";
         };
       } catch (error) {
-        if (seq !== this._terminalConnectSeq) return;
+        if (!isCurrent() || (connectionTerm && this._terminal !== connectionTerm)) return;
         this.terminalConnection = "error";
         this.toast((this.lang === "zh" ? "终端连接失败：" : "Terminal connection failed: ")
           + error.message, "error");
