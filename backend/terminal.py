@@ -751,7 +751,13 @@ async def terminal_websocket(websocket: WebSocket, terminal_id: str) -> None:
 
     async def send_loop() -> None:
         while True:
-            item = await subscriber.queue.get()
+            # A full output queue can leave no slot for _mark_exited's event.
+            # Drain queued output first, then deliver the retained final state.
+            # A queued overflow sentinel still owns the slow-client close path.
+            if subscriber.queue.empty() and session.status != "running":
+                item = {"type": "exit", "exit_code": session.exit_code}
+            else:
+                item = await subscriber.queue.get()
             if item is None:
                 await writer.close(code=1013, reason="terminal client too slow")
                 return

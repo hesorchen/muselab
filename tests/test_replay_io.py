@@ -181,6 +181,9 @@ async def test_reader_does_not_decode_an_in_progress_trailing_record(stream_env,
             return count
         return write(fd, data)
 
+    # Disable at_end only to force this low-level I/O fault-injection path.
+    # This is a fixture precondition, not a production setting.
+    monkeypatch.delattr(type(reader._replay), "at_end", raising=False)
     monkeypatch.setattr(reader._replay, "readline", delayed_read)
     monkeypatch.setattr(os, "write", partial_write)
     pending = asyncio.create_task(reader.get())

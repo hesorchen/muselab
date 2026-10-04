@@ -92,12 +92,12 @@ Payload and manifest share one opaque ID. The default retention is 30 days, conf
 
 ## Path and sensitive-file defenses
 
-Every path goes through normalization:
+Workspace-relative paths go through normalization:
 
 1. Reject NUL bytes and malformed paths.
-2. Resolve the relative path under the selected workspace.
-3. Follow symlinks and verify the real target still stays inside the root.
-4. Apply sensitive-name checks to both the presented path and resolved target.
+2. Reject `..` components and resolve the relative path under the selected workspace.
+3. Follow actual symlinks and verify the real target stays inside the selected root or another registered workspace; targets outside all registered workspaces are rejected.
+4. Apply internal-state and sensitive-file exclusions, including to resolved symlink targets.
 
 Typical blocked content includes `.env`, private keys, certificates, SSH credentials, cloud credentials, and common token files. Write, upload, rename, and backup operations cannot directly modify `.muselab-dustbin/`; only dedicated dustbin endpoints may do so.
 

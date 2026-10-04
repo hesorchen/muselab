@@ -150,6 +150,10 @@ class ReplayReader:
         await self._writer.flush_async()
         self._limit = self._committed_size()
 
+    def at_end(self):
+        """Whether the cursor exhausted the committed snapshot from ready()."""
+        return self._offset >= self._limit
+
     def close(self):
         self._closed = True
         if in_event_loop():

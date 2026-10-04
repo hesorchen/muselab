@@ -930,6 +930,7 @@ function portal() {
     _todoLiveSource: null,
     _todoLiveSeq: 0,
     _todoLiveTimer: null,
+    _todoLiveController: null,
     _todoLiveVisibilityBound: false,
     _activityPinPending: {},
     _activityGroupPending: {},
@@ -38535,8 +38536,22 @@ function portal() {
         summaryOnly: !this.activity.show && this.activity.events.length > 0,
       });
     },
+    _bindTodoVisibility() {
+      if (this._todoLiveVisibilityBound
+          || typeof document === "undefined") return;
+      this._todoLiveVisibilityBound = true;
+      document.addEventListener("visibilitychange", () => {
+        if (document.visibilityState !== "visible") {
+          this._stopTodoEvents();
+        } else {
+          this._startTodoEvents();
+        }
+      });
+      window.addEventListener("pagehide", () => this._stopTodoEvents());
+    },
     async _startTodoEvents() {
       if (!this.token || typeof EventSource === "undefined") return;
+      this._bindTodoVisibility();
       if (typeof document !== "undefined"
           && document.visibilityState !== "visible") {
         this._stopTodoEvents();
@@ -38545,21 +38560,30 @@ function portal() {
       if (this._todoLiveSource) return;
       this._stopTodoEvents();
       const seq = ++this._todoLiveSeq;
+      const controller = new AbortController();
+      this._todoLiveController = controller;
+      const ownsTicket = () => seq === this._todoLiveSeq
+        && this._todoLiveController === controller;
       let ticket = "";
       try {
-        const r = await fetch("/api/todos/events-ticket", {
-          method: "POST",
-          headers: this.hdr(),
-        });
-        if (!r.ok) throw new Error("todos ticket failed");
-        ticket = String((await r.json()).ticket || "");
+        await this._fetchWithDeadline(
+          "/api/todos/events-ticket",
+          { method: "POST", headers: this.hdr(), signal: controller.signal },
+          this.REQUEST_DEADLINE_MS,
+          async response => {
+            if (!response.ok) throw new Error("todos ticket failed");
+            ticket = String((await response.json()).ticket || "");
+          },
+        );
       } catch (_) {
-        if (seq === this._todoLiveSeq) {
+        if (ownsTicket()) {
           this._todoLiveTimer = setTimeout(() => this._startTodoEvents(), 1500);
         }
         return;
+      } finally {
+        if (this._todoLiveController === controller) this._todoLiveController = null;
       }
-      if (seq !== this._todoLiveSeq || !ticket) return;
+      if (seq !== this._todoLiveSeq || controller.signal.aborted || !ticket) return;
       const es = new EventSource(
         `/api/todos/events?ticket=${encodeURIComponent(ticket)}`,
       );
@@ -38581,20 +38605,13 @@ function portal() {
         this._todoLiveSource = null;
         this._todoLiveTimer = setTimeout(() => this._startTodoEvents(), 1500);
       };
-      if (!this._todoLiveVisibilityBound) {
-        this._todoLiveVisibilityBound = true;
-        document.addEventListener("visibilitychange", () => {
-          if (document.visibilityState !== "visible") {
-            this._stopTodoEvents();
-          } else {
-            this._startTodoEvents();
-          }
-        });
-        window.addEventListener("pagehide", () => this._stopTodoEvents());
-      }
     },
     _stopTodoEvents() {
       ++this._todoLiveSeq;
+      if (this._todoLiveController) {
+        try { this._todoLiveController.abort(); } catch (_) {}
+      }
+      this._todoLiveController = null;
       if (this._todoLiveSource) {
         try { this._todoLiveSource.close(); } catch (_) {}
       }
@@ -38723,18 +38740,23 @@ function portal() {
       const seq = ++this._activityLiveSeq;
       const controller = new AbortController();
       this._activityLiveController = controller;
+      const ownsTicket = () => seq === this._activityLiveSeq
+        && this._activityLiveController === controller;
       let ticket = "";
       try {
-        const r = await this._fetchWithDeadline(
+        await this._fetchWithDeadline(
           "/api/activity/events-ticket",
           {
             method: "POST", headers: this.hdr(), signal: controller.signal,
           },
+          this.REQUEST_DEADLINE_MS,
+          async response => {
+            if (!response.ok) throw new Error("activity ticket failed");
+            ticket = String((await response.json()).ticket || "");
+          },
         );
-        if (!r.ok) throw new Error("activity ticket failed");
-        ticket = String((await r.json()).ticket || "");
       } catch (_) {
-        if (seq === this._activityLiveSeq) {
+        if (ownsTicket()) {
           this._activityLiveTimer = setTimeout(
             () => this._startActivityEvents(),
             this._activityReconnectDelay(),
@@ -38746,7 +38768,7 @@ function portal() {
           this._activityLiveController = null;
         }
       }
-      if (seq !== this._activityLiveSeq || !ticket) return;
+      if (seq !== this._activityLiveSeq || controller.signal.aborted || !ticket) return;
       const es = new EventSource(
         `/api/activity/events?ticket=${encodeURIComponent(ticket)}`,
       );

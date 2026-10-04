@@ -918,6 +918,11 @@ class _TurnSubscriber:
         revision = self._replay_revision
         if hasattr(reader, "ready"):
             await reader.ready()
+        # ready() joins accepted writes before reporting their committed end.
+        # Known EOF needs no disk worker; live deltas must not queue behind an
+        # empty read while real history retains the normal ordered I/O path.
+        if hasattr(reader, "at_end") and reader.at_end():
+            return revision, reader.tell(), None
         def read():
             offset = reader.tell()
             line = reader.readline()

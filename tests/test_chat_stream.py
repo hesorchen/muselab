@@ -4661,6 +4661,101 @@ def test_attached_reader_receives_text_delta_without_waiting_for_chunk(stream_en
     asyncio.run(exercise())
 
 
+
+@pytest.mark.parametrize(
+    ("history", "waiting", "blocked_pool"),
+    [
+        pytest.param(False, False, "read", id="first-delta"),
+        pytest.param(False, True, "read", id="waiting-reader"),
+        pytest.param(True, False, "read", id="history-read"),
+        pytest.param(True, False, "write", id="pending-history-write"),
+    ],
+)
+def test_live_delta_waits_only_for_real_history(
+        stream_env, monkeypatch, history, waiting, blocked_pool):
+    """An occupied I/O pool must not delay a delta after known replay EOF."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    chat_mod = stream_env
+
+    async def exercise():
+        loop = asyncio.get_running_loop()
+        occupied = asyncio.Event()
+        ready_started = asyncio.Event()
+        release = threading.Event()
+        pool = ThreadPoolExecutor(max_workers=1)
+        monkeypatch.setattr(
+            chat_mod.replay_io,
+            "_READ_POOL" if blocked_pool == "read" else "_WRITE_POOL", pool,
+        )
+        real_ready = chat_mod.replay_io.ReplayReader.ready
+
+        async def observe_ready(reader):
+            ready_started.set()
+            await real_ready(reader)
+
+        monkeypatch.setattr(
+            chat_mod.replay_io.ReplayReader, "ready", observe_ready)
+
+        def occupy_pool():
+            loop.call_soon_threadsafe(occupied.set)
+            assert release.wait(5), "I/O pool occupant was not released"
+
+        occupant = pool.submit(occupy_pool)
+        bc = None
+        subscriber = None
+        getter = None
+        try:
+            await asyncio.wait_for(occupied.wait(), 2)
+            bc = chat_mod.TurnBroadcast(session_id="occupied-replay-pool")
+            if history:
+                bc.publish({"event": "tool_result", "data": '{"id":"history"}'})
+            subscriber = bc.subscribe()
+            if waiting:
+                getter = asyncio.create_task(subscriber.get())
+                await asyncio.wait_for(ready_started.wait(), 2)
+            bc.publish({"event": "text", "data": '{"text":"now"}'})
+            if getter is None:
+                getter = asyncio.create_task(subscriber.get())
+            if history:
+                await asyncio.wait_for(ready_started.wait(), 2)
+                # The old record/write remains behind a real worker gate.
+                # Its history must precede the subsequently queued live delta.
+                assert not getter.done()
+                release.set()
+                event = await asyncio.wait_for(getter, 1)
+                assert event["event"] == "tool_result"
+                assert json.loads(event["data"])["id"] == "history"
+                event = await asyncio.wait_for(subscriber.get(), 1)
+            else:
+                # Preserve the original latency contract while the read pool
+                # stays occupied: no warmup and no extra token/finish event.
+                event = await asyncio.wait_for(getter, 1)
+                assert not release.is_set()
+            assert event["event"] == "text"
+            assert json.loads(event["data"])["text"] == "now"
+        finally:
+            release.set()
+            await asyncio.wrap_future(occupant)
+            if getter is not None and not getter.done():
+                getter.cancel()
+            if getter is not None:
+                await asyncio.gather(getter, return_exceptions=True)
+            if subscriber is not None:
+                pending = subscriber._pending_spool_read
+                if pending is not None:
+                    await asyncio.gather(pending, return_exceptions=True)
+            if bc is not None:
+                reader = subscriber._replay if subscriber is not None else None
+                bc.close()
+                await bc.events.flush_async()
+                if reader is not None:
+                    await asyncio.to_thread(reader._close)
+            await asyncio.to_thread(pool.shutdown, wait=True)
+
+    asyncio.run(exercise())
+
+
 def test_desktop_replay_boundary_delivers_live_tail_once(stream_env):
     """Events published while replay drains are neither lost nor duplicated."""
     import asyncio
