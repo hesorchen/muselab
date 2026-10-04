@@ -1347,6 +1347,7 @@ function portal() {
 
     settings: {
       show: false,
+      saving: false,
       providers: [],
       contextGroups: [],
       contextLimits: { providers: {}, models: {} },
@@ -21478,6 +21479,9 @@ function portal() {
         if (!leave) return false;
       }
       this.settings.show = false;
+      this._settingsSurfaceGeneration = (this._settingsSurfaceGeneration || 0) + 1;
+      this._settingsSaveOwner = null;
+      this.settings.saving = false;
       return true;
     },
     async discardSettingsDrafts() {
@@ -21531,6 +21535,9 @@ function portal() {
       finally { this.settings.serviceLoading = false; }
     },
     async openSettings(activePage = "") {
+      this._settingsSurfaceGeneration = (this._settingsSurfaceGeneration || 0) + 1;
+      this._settingsSaveOwner = null;
+      this.settings.saving = false;
       if (!this._settingsDraftGuard) {
         const { createSettingsDraftGuard } = await import("/static/modules/settings-drafts.mjs");
         this._settingsDraftGuard = createSettingsDraftGuard(this);
@@ -23403,6 +23410,41 @@ function portal() {
     },
 
     async saveSettings() {
+      if (this.settings.saving) return false;
+      const owner = {
+        id: (this._settingsSaveSequence || 0) + 1,
+        generation: this._settingsSurfaceGeneration || 0, saved: false,
+      };
+      this._settingsSaveSequence = owner.id;
+      this._settingsSaveOwner = owner.id;
+      this.settings.saving = true;
+      try {
+        return await this._saveSettingsDraft(owner);
+      } catch (error) {
+        if (owner.saved) {
+          this.toast(this.lang === "zh"
+            ? "设置已保存，刷新设置视图失败，请稍后重试"
+            : "Settings saved; refreshing the settings view failed. Please retry later.", "warn");
+        } else if (this._settingsSaveOwner === owner.id) {
+          const message = error?.name === "SyntaxError"
+            ? (this.lang === "zh" ? "无法确认保存响应，请重试" : "Could not confirm the save response. Please retry.")
+            : this._settingsReadError(error);
+          this.toast((this.lang === "zh" ? "保存失败：" : "Save failed: ") + message, "error");
+        }
+        return false;
+      } finally {
+        if (this._settingsSaveOwner === owner.id) {
+          this._settingsSaveOwner = null;
+          this.settings.saving = false;
+        }
+      }
+    },
+    async _saveSettingsDraft(owner) {
+      const ownsForm = () => this._settingsSaveOwner === owner.id
+        && owner.generation === (this._settingsSurfaceGeneration || 0);
+      const providerKeys = Object.fromEntries(Object.entries(this.settings.draftKeys || {})
+        .filter(([, value]) => value && value.trim())
+        .map(([key, value]) => [key, value.trim()]));
       const submittedDefaults = JSON.parse(JSON.stringify(this.settings.draftDefaults));
       // Flush an open Claude model-list edit first so the global Save captures
       // it too (see _flushAnthropicModelDraft). modelChanges folds into the
@@ -23412,8 +23454,10 @@ function portal() {
       try {
         modelChanges = await this._flushAnthropicModelDraft();
       } catch (e) {
-        this.toast((this.lang === "zh" ? "模型列表保存失败：" : "Model list save failed: ") + e.message, "error", 4000);
-        return;
+        if (ownsForm()) {
+          this.toast((this.lang === "zh" ? "模型列表保存失败：" : "Model list save failed: ") + e.message, "error", 4000);
+        }
+        return false;
       }
       const body = {
         default_model: submittedDefaults.model,
@@ -23430,10 +23474,6 @@ function portal() {
       // still accepted by the backend for backwards compat, but we don't
       // emit it anymore — drift between FE k2f and backend Pydantic was
       // the exact bug that hid Kimi / Qwen / MiMo from Settings UI.
-      const providerKeys = {};
-      for (const [envK, v] of Object.entries(this.settings.draftKeys || {})) {
-        if (v && v.trim()) providerKeys[envK] = v.trim();
-      }
       if (Object.keys(providerKeys).length > 0) body.provider_keys = providerKeys;
       const r = await fetch("/api/settings", {
         method: "PUT",
@@ -23442,14 +23482,19 @@ function portal() {
       });
       if (r.ok) {
         const d = await r.json();
-        for (const [key, value] of Object.entries(providerKeys)) {
-          if ((this.settings.draftKeys[key] || "").trim() === value) this.settings.draftKeys[key] = "";
+        owner.saved = true;
+        if (ownsForm()) {
+          for (const [key, value] of Object.entries(providerKeys)) {
+            if ((this.settings.draftKeys[key] || "").trim() === value) this.settings.draftKeys[key] = "";
+          }
+          this._settingsDraftGuard?.accept("defaults", submittedDefaults);
+          this._settingsDraftGuard?.accept("keys", Object.fromEntries(
+            Object.keys(this.settings.draftKeys).map(key => [key, ""])));
+          // Other sections have their own explicit Save; never hide their drafts.
+          if (!this.settingsDirty()) this.settings.show = false;
         }
-        this._settingsDraftGuard?.accept("defaults", submittedDefaults);
-        this._settingsDraftGuard?.accept("keys", Object.fromEntries(
-          Object.keys(this.settings.draftKeys).map(key => [key, ""])));
-        // Other sections have their own explicit Save; never hide their drafts.
-        if (!this.settingsDirty()) this.settings.show = false;
+        // Confirmed writes still update global defaults/catalog after the form
+        // closes. Only the current form can accept drafts or change visibility.
         // Prefer `updated_count` (user-facing tally) over `updated.length`
         // (raw env-key count). Backend dedupes the MUSELAB_MODEL +
         // MUSELAB_DEFAULT_MODEL pair so changing the model dropdown reads
@@ -23512,7 +23557,9 @@ function portal() {
         this.fetchContextInfo();
       } else {
         const prefix = this.lang === "zh" ? "保存失败：" : "Save failed: ";
-        this.toast(prefix + (await r.text()), "error");
+        const detail = await r.text();
+        if (ownsForm()) this.toast(prefix + detail, "error");
+        return false;
       }
     },
     async deleteSession() {
