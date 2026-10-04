@@ -1748,6 +1748,15 @@ function portal() {
         }
       }
       if (ev.key === "Escape") {
+        if (this.terminalManagerOpen) {
+          ev.preventDefault();
+          ev.stopPropagation();
+          this.terminalManagerOpen = false;
+          this.$nextTick(() => {
+            this._focusWithoutScroll(this.$refs.terminalManagerButton);
+          });
+          return;
+        }
         if (this.memoryRecallPopover.show) { this.closeMemoryRecallPopover(); return; }
         if (this.cheatSheet.show) { this.cheatSheet.show = false; return; }
         if (this.mentionShow) { this._cancelMentionLookup(); return; }
