@@ -20075,91 +20075,93 @@ async def _maybe_drain_queue(session_id: str) -> None:
         if item is None:
             return
         item_id = str(item.get("id") or "")
-        if _queue_runtime_closing:
-            await _release_queue_claim_owned(session_id, item_id)
-            return
+        # Every wait after claiming belongs to the same rollback boundary,
+        # including telemetry reads and attachment checks before turn startup.
         try:
-            _queue_snapshot = await obs.to_thread_io(
-                "chat.queue_read", session_id, sess.get_queue, session_id)
-            _queue_depth = (
-                len(_queue_snapshot.get("items") or [])
-                + int(bool(_queue_snapshot.get("inflight")))
-            )
-        except Exception:
-            _queue_depth = -1
-        try:
-            _enqueued_at_ms = int(item.get("enqueued_at") or 0)
-        except (TypeError, ValueError):
-            _enqueued_at_ms = 0
-        _perf_event(
-            "queue.claim",
-            sid8=obs.short_id(session_id),
-            item8=obs.short_id(item_id),
-            wait_ms=(max(0, int(time.time() * 1000) - _enqueued_at_ms)
-                     if _enqueued_at_ms else -1),
-            depth=_queue_depth,
-        )
-        # Queue files survive a process restart; staged uploads deliberately do
-        # not, and they can also expire while waiting behind a long turn.  Never
-        # degrade an attachment-bearing message into a text-only turn.  Check
-        # the complete set before `_start_turn` consumes even one upload, then
-        # atomically restore + pause the exact claim.  GET /queue resolves the
-        # now-missing ids as `available: false`, which keeps the prompt visible
-        # and gives the browser an explicit edit/reattach recovery path.
-        attachment_ids = [
-            aid.strip()
-            for aid in str(item.get("image_ids") or "").split(",")
-            if aid.strip()
-        ]
-        if attachment_ids:
+            if _queue_runtime_closing:
+                await _release_queue_claim_owned(session_id, item_id)
+                return
             try:
-                if any(
-                    not _valid_staged_attachment_id(aid)
-                    for aid in attachment_ids
-                ):
-                    unavailable_count = len(attachment_ids)
-                else:
-                    await asyncio.to_thread(_gc_images)
-                    with _image_store_lock:
-                        cached_ids = set(_image_store).intersection(
-                            attachment_ids)
-                    durable_ids = await asyncio.to_thread(
-                        _durable_attachment_store.existing_ids,
-                        attachment_ids,
-                    )
-                    unavailable_count = sum(
-                        1 for aid in attachment_ids
-                        if aid not in cached_ids and aid not in durable_ids)
-            except (DurableAttachmentError, OSError, sqlite3.Error,
-                    UnsafePrivatePath) as exc:
-                restored = await _release_queue_claim_owned(
-                    session_id, item_id, issue="attachment_unavailable")
-                obs.diagnostic_line(
-                    f"[chat] queued attachment precheck failed "
-                    f"sid={session_id[:8]} item={item_id[:8]} "
-                    f"restored={restored} exc={type(exc).__name__}\n"
+                _queue_snapshot = await obs.to_thread_io(
+                    "chat.queue_read", session_id, sess.get_queue, session_id)
+                _queue_depth = (
+                    len(_queue_snapshot.get("items") or [])
+                    + int(bool(_queue_snapshot.get("inflight")))
                 )
-                return
-            if unavailable_count:
-                restored = await _release_queue_claim_owned(
-                    session_id, item_id, issue="attachment_unavailable")
-                obs.diagnostic_line(
-                    f"[chat] queued attachments unavailable "
-                    f"sid={session_id[:8]} item={item_id[:8]} "
-                    f"count={unavailable_count} restored={restored}\n")
-                return
-        # Replay under the permission mode snapshotted at enqueue time. Items
-        # from before the snapshot existed (or enqueued without one) fail CLOSED
-        # to "default" — requiring tool approval is the safe direction; the old
-        # behavior (falling through to bypassPermissions) let queued messages
-        # skip approval the user's UI said was required.
-        perm = (item.get("permission") or "").strip() or "default"
-        if perm not in _VALID_PERMISSION_MODES:
-            # Headless context — can't 400. An unknown persisted value (pre-
-            # validation enqueue, hand-edited queue file) fails CLOSED to
-            # "default" rather than crashing the drain or reaching the SDK.
-            perm = "default"
-        try:
+            except Exception:
+                _queue_depth = -1
+            try:
+                _enqueued_at_ms = int(item.get("enqueued_at") or 0)
+            except (TypeError, ValueError):
+                _enqueued_at_ms = 0
+            _perf_event(
+                "queue.claim",
+                sid8=obs.short_id(session_id),
+                item8=obs.short_id(item_id),
+                wait_ms=(max(0, int(time.time() * 1000) - _enqueued_at_ms)
+                         if _enqueued_at_ms else -1),
+                depth=_queue_depth,
+            )
+            # Queue files survive a process restart; staged uploads deliberately do
+            # not, and they can also expire while waiting behind a long turn.  Never
+            # degrade an attachment-bearing message into a text-only turn.  Check
+            # the complete set before `_start_turn` consumes even one upload, then
+            # atomically restore + pause the exact claim.  GET /queue resolves the
+            # now-missing ids as `available: false`, which keeps the prompt visible
+            # and gives the browser an explicit edit/reattach recovery path.
+            attachment_ids = [
+                aid.strip()
+                for aid in str(item.get("image_ids") or "").split(",")
+                if aid.strip()
+            ]
+            if attachment_ids:
+                try:
+                    if any(
+                        not _valid_staged_attachment_id(aid)
+                        for aid in attachment_ids
+                    ):
+                        unavailable_count = len(attachment_ids)
+                    else:
+                        await asyncio.to_thread(_gc_images)
+                        with _image_store_lock:
+                            cached_ids = set(_image_store).intersection(
+                                attachment_ids)
+                        durable_ids = await asyncio.to_thread(
+                            _durable_attachment_store.existing_ids,
+                            attachment_ids,
+                        )
+                        unavailable_count = sum(
+                            1 for aid in attachment_ids
+                            if aid not in cached_ids and aid not in durable_ids)
+                except (DurableAttachmentError, OSError, sqlite3.Error,
+                        UnsafePrivatePath) as exc:
+                    restored = await _release_queue_claim_owned(
+                        session_id, item_id, issue="attachment_unavailable")
+                    obs.diagnostic_line(
+                        f"[chat] queued attachment precheck failed "
+                        f"sid={session_id[:8]} item={item_id[:8]} "
+                        f"restored={restored} exc={type(exc).__name__}\n"
+                    )
+                    return
+                if unavailable_count:
+                    restored = await _release_queue_claim_owned(
+                        session_id, item_id, issue="attachment_unavailable")
+                    obs.diagnostic_line(
+                        f"[chat] queued attachments unavailable "
+                        f"sid={session_id[:8]} item={item_id[:8]} "
+                        f"count={unavailable_count} restored={restored}\n")
+                    return
+            # Replay under the permission mode snapshotted at enqueue time. Items
+            # from before the snapshot existed (or enqueued without one) fail CLOSED
+            # to "default" — requiring tool approval is the safe direction; the old
+            # behavior (falling through to bypassPermissions) let queued messages
+            # skip approval the user's UI said was required.
+            perm = (item.get("permission") or "").strip() or "default"
+            if perm not in _VALID_PERMISSION_MODES:
+                # Headless context — can't 400. An unknown persisted value (pre-
+                # validation enqueue, hand-edited queue file) fails CLOSED to
+                # "default" rather than crashing the drain or reaching the SDK.
+                perm = "default"
             await _start_turn(
                 session_id,
                 item.get("text", ""),
