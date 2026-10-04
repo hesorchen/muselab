@@ -9408,12 +9408,14 @@ async def patch_session_api(sid: str, req: SessionPatchReq) -> dict:
             # query. Surface as a 409 so the FE can wait for first turn.
             raise HTTPException(409, f"cannot tag session before first turn: {e}")
     if req.pinned is not None:
-        # Pin is muselab-local (not stored in CLI JSONL). Always idempotent.
-        # set_pin runs the load-mutate-save sequence under _INDEX_LOCK.
-        await obs.to_thread_io(
+        # The owned lifecycle write either commits before DELETE or observes
+        # its tombstone; even an unpin's False result is a successful update.
+        pinned = await obs.to_thread_io(
             "chat.session_pin", sid, sess.set_pin, sid, req.pinned,
             owned=True,
         )
+        if pinned is None:
+            raise HTTPException(404, "session not found")
         ok = True
     if req.permission is not None:
         permission = _validate_permission(req.permission)

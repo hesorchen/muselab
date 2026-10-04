@@ -737,28 +737,32 @@ def toggle_pin(sid: str) -> bool:
         return True
 
 
-def set_pin(sid: str, val: bool) -> bool:
-    """Set the `pinned` flag on a session to a specific value. The entire
-    load-mutate-save sequence runs under _INDEX_LOCK to prevent races.
-    Returns the new state (== val). If no index entry exists yet, a
-    minimal stub is created so the flag survives the first bump_session."""
-    with _INDEX_LOCK:
-        idx = _load_index()
-        for s in idx:
-            if s["id"] == sid:
-                s["pinned"] = bool(val)
-                _save_index(idx)
-                return bool(val)
-        # No muselab index entry yet — create a minimal stub.
-        now = time.time()
-        idx.append({
-            "id": sid, "name": "", "model": "",
-            "permission": "", "plan_return_permission": "",
-            "created_at": now, "updated_at": now,
-            "message_count": 0, "auto_named": True, "pinned": bool(val),
-        })
-        _save_index(idx)
-        return bool(val)
+def set_pin(sid: str, val: bool) -> bool | None:
+    """Set the pinned flag; return its value, or None after deletion begins.
+
+    SDK-only sessions may create a minimal local stub. Serialize that write
+    with deletion so an admitted PATCH cannot recreate a deleted index row.
+    """
+    with session_lifecycle_lock(sid):
+        if session_is_deleting(sid):
+            return None
+        with _INDEX_LOCK:
+            idx = _load_index()
+            for s in idx:
+                if s["id"] == sid:
+                    s["pinned"] = bool(val)
+                    _save_index(idx)
+                    return bool(val)
+            # No muselab index entry yet — create a minimal stub.
+            now = time.time()
+            idx.append({
+                "id": sid, "name": "", "model": "",
+                "permission": "", "plan_return_permission": "",
+                "created_at": now, "updated_at": now,
+                "message_count": 0, "auto_named": True, "pinned": bool(val),
+            })
+            _save_index(idx)
+            return bool(val)
 
 
 def _index_list_layer(items: list[dict]) -> dict[str, dict]:
