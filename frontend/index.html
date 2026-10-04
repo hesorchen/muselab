@@ -795,6 +795,7 @@
         <div class="terminal-manager" x-show="terminalEnabled"
              @click.outside="terminalManagerOpen=false">
           <button class="icon-btn terminal-manager-btn preview-keep-mobile"
+                  x-ref="terminalManagerButton"
                   @click="terminalManagerOpen=!terminalManagerOpen"
                   :class="{active: terminalManagerOpen}"
                   :title="lang==='zh'?'终端管理':'Terminal manager'">
