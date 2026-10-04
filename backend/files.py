@@ -3895,15 +3895,34 @@ async def upload(
             return {"ok": True, "pending": True, "path": pending["path"], "size": written}
         trashed = await obs.to_thread_io(
             "files.upload_finalize", "", _finalize, owned=True)
-    except BaseException:
-        if pending:
-            async with _pending_upload_registry():
-                pending["cancelled"] = True
-                if _PENDING_UPLOADS.get(key) is pending:
-                    _PENDING_UPLOADS.pop(key)
-                    pending["expiry"].cancel()
-        await obs.to_thread_io(
-            "files.upload_cleanup", "", tmp_path.unlink, missing_ok=True, owned=True)
+    except BaseException as failure:
+        async def cleanup_failed_upload():
+            try:
+                if pending:
+                    async with _pending_upload_registry():
+                        pending["cancelled"] = True
+                        if _PENDING_UPLOADS.get(key) is pending:
+                            _PENDING_UPLOADS.pop(key)
+                            pending["expiry"].cancel()
+            finally:
+                await obs.to_thread_io(
+                    "files.upload_cleanup", "", tmp_path.unlink, missing_ok=True, owned=True)
+
+        # Cancellation during the registry wait must not skip the remaining
+        # cleanup. Keep one owner for both the record and its temporary file.
+        cleanup = asyncio.create_task(cleanup_failed_upload(), name="muselab-upload-cleanup")
+        pending_cancel = failure if isinstance(failure, asyncio.CancelledError) else None
+        while True:
+            try:
+                await asyncio.shield(cleanup)
+                break
+            except asyncio.CancelledError as exc:
+                if cleanup.cancelled():
+                    raise
+                if pending_cancel is None:
+                    pending_cancel = exc
+        if pending_cancel is not None:
+            raise pending_cancel
         raise
     return {
         "ok": True,
