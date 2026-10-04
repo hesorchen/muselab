@@ -1124,8 +1124,15 @@ def test_workspace_file_requests_reject_late_previous_owner_results():
     assert "_uniqueFileNodes(nodes)" in app
     assert "ownerWorkspace = this.fileWorkspacePath()" in upload
     assert "if (!this._workspaceIsCurrent(ownerWorkspace)) return" in upload
-    assert save.index("if (!sameOwner()) return") < save.index(
-        "this._previewCacheDel(savePath)")
+    # An acknowledged write invalidates its origin cache even after navigation;
+    # updates to visible editor fields still require the original editor owner.
+    assert "workspace = this.fileWorkspacePath()" in save
+    acknowledged = save.index("if (!response.ok) throw")
+    cache_invalidated = save.index("this._previewCacheDel(savePath, workspace)")
+    owner_guard = save.index("if (!sameOwner()) return")
+    assert acknowledged < cache_invalidated < owner_guard
+    assert owner_guard < save.index("this.rawText = saveText")
+    assert owner_guard < save.index("this.editText = this._editorText()")
     assert "const requestSeq = ++this._paletteFileSeq" in palette
     assert "requestSeq === this._paletteFileSeq" in palette
 
