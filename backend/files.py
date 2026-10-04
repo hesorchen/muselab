@@ -2822,58 +2822,63 @@ def xlsx_preview(path: str, root: Path = Depends(_workspace_root), external: boo
     except ImportError:
         raise HTTPException(status_code=500,
                             detail="openpyxl not installed — run `uv sync`")
-    validate_xlsx_archive(target)
-    try:
-        wb = openpyxl.load_workbook(target, read_only=True, data_only=True)
-    except Exception:
-        raise HTTPException(status_code=422,
-                            detail="failed to parse spreadsheet (file may be corrupt or unsupported)") from None
-    try:
-        sheets: list[dict] = []
-        # Chartsheets have no cells and must not consume the worksheet budget.
-        worksheets = wb.worksheets
-        sheets_truncated = len(worksheets) > XLSX_MAX_SHEETS
-        for ws in worksheets[:XLSX_MAX_SHEETS]:
-            sheet_name = ws.title
-            rows: list[list[str]] = []
-            rows_truncated = False
-            cols_truncated = bool(ws.max_column and ws.max_column > XLSX_MAX_COLS)
-            for r_idx, row in enumerate(ws.iter_rows(
-                max_row=min(ws.max_row or XLSX_MAX_ROWS + 1, XLSX_MAX_ROWS + 1),
-                max_col=min(ws.max_column or XLSX_MAX_COLS, XLSX_MAX_COLS),
-                values_only=True,
-            )):
-                if r_idx >= XLSX_MAX_ROWS:
-                    rows_truncated = True
-                    break
-                cells: list[str] = []
-                for c_idx, val in enumerate(row):
-                    if c_idx >= XLSX_MAX_COLS:
-                        cols_truncated = True
+    stream, _ = _open_response_file(target)
+    # Retain one verified inode through archive validation and lazy row reads;
+    # an atomic replacement must not substitute an unvalidated workbook.
+    with stream:
+        validate_xlsx_archive(stream)
+        stream.seek(0)
+        try:
+            wb = openpyxl.load_workbook(stream, read_only=True, data_only=True)
+        except Exception:
+            raise HTTPException(status_code=422,
+                                detail="failed to parse spreadsheet (file may be corrupt or unsupported)") from None
+        try:
+            sheets: list[dict] = []
+            # Chartsheets have no cells and must not consume the worksheet budget.
+            worksheets = wb.worksheets
+            sheets_truncated = len(worksheets) > XLSX_MAX_SHEETS
+            for ws in worksheets[:XLSX_MAX_SHEETS]:
+                sheet_name = ws.title
+                rows: list[list[str]] = []
+                rows_truncated = False
+                cols_truncated = bool(ws.max_column and ws.max_column > XLSX_MAX_COLS)
+                for r_idx, row in enumerate(ws.iter_rows(
+                    max_row=min(ws.max_row or XLSX_MAX_ROWS + 1, XLSX_MAX_ROWS + 1),
+                    max_col=min(ws.max_column or XLSX_MAX_COLS, XLSX_MAX_COLS),
+                    values_only=True,
+                )):
+                    if r_idx >= XLSX_MAX_ROWS:
+                        rows_truncated = True
                         break
-                    if val is None:
-                        cells.append("")
-                    else:
-                        s = str(val)
-                        if len(s) > XLSX_CELL_MAX_CHARS:
-                            s = s[:XLSX_CELL_MAX_CHARS] + "…"
-                        cells.append(s)
-                rows.append(cells)
-            sheets.append({
-                "name": sheet_name,
-                "rows": rows,
-                "rows_truncated": rows_truncated,
-                "cols_truncated": cols_truncated,
-            })
-        return {
-            "path": path,
-            "sheets": sheets,
-            "sheets_truncated": sheets_truncated,
-            "limits": {"max_rows": XLSX_MAX_ROWS, "max_cols": XLSX_MAX_COLS,
-                       "max_sheets": XLSX_MAX_SHEETS},
-        }
-    finally:
-        wb.close()
+                    cells: list[str] = []
+                    for c_idx, val in enumerate(row):
+                        if c_idx >= XLSX_MAX_COLS:
+                            cols_truncated = True
+                            break
+                        if val is None:
+                            cells.append("")
+                        else:
+                            s = str(val)
+                            if len(s) > XLSX_CELL_MAX_CHARS:
+                                s = s[:XLSX_CELL_MAX_CHARS] + "…"
+                            cells.append(s)
+                    rows.append(cells)
+                sheets.append({
+                    "name": sheet_name,
+                    "rows": rows,
+                    "rows_truncated": rows_truncated,
+                    "cols_truncated": cols_truncated,
+                })
+            return {
+                "path": path,
+                "sheets": sheets,
+                "sheets_truncated": sheets_truncated,
+                "limits": {"max_rows": XLSX_MAX_ROWS, "max_cols": XLSX_MAX_COLS,
+                           "max_sheets": XLSX_MAX_SHEETS},
+            }
+        finally:
+            wb.close()
 
 
 # CSV preview caps. Paginated by design — CSV files in the wild can be

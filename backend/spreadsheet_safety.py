@@ -3,13 +3,14 @@ from __future__ import annotations
 
 import io
 from pathlib import Path
+from typing import BinaryIO
 import zipfile
 
 from fastapi import HTTPException
 
 
 def validate_xlsx_archive(
-    source: bytes | Path,
+    source: bytes | Path | BinaryIO,
     *,
     max_entries: int = 4096,
     max_uncompressed_bytes: int = 64 * 1024 * 1024,
@@ -18,8 +19,9 @@ def validate_xlsx_archive(
 ) -> None:
     """Reject unsafe ZIP metadata before openpyxl loads shared strings/XML.
 
-    Path callers inspect the central directory without reading the whole
-    compressed workbook into memory. No archive member is extracted to disk.
+    Path and file callers inspect the central directory without reading the
+    whole compressed workbook into memory. The caller retains ownership of a
+    supplied binary file. No archive member is extracted to disk.
     """
     try:
         with zipfile.ZipFile(io.BytesIO(source) if isinstance(source, bytes) else source) as archive:
