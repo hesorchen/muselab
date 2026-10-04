@@ -7,6 +7,7 @@ import asyncio
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import tempfile
@@ -1452,6 +1453,51 @@ class UpgradeReq(BaseModel):
     """Which packages to upgrade. Default: both."""
 
 
+async def _run_upgrade_command(*args: str, cwd: str | None = None) -> tuple[int | None, bytes]:
+    owns_group = os.name == "posix"
+    # Shield process creation so cancellation cannot lose a newly spawned PID.
+    spawned = asyncio.create_task(asyncio.create_subprocess_exec(
+        *args, cwd=cwd,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+        start_new_session=owns_group,
+    ))
+    try:
+        process = await asyncio.shield(spawned)
+        output, _ = await process.communicate()
+        return process.returncode, output or b""
+    except BaseException as failure:
+        async def reap():
+            try:
+                process = await spawned
+            except Exception:
+                return  # Creation failed; there is no accepted process to reap.
+            try:
+                if owns_group:
+                    # The new session belongs only to this command, including
+                    # install-script descendants that may keep its pipe open.
+                    os.killpg(process.pid, signal.SIGKILL)
+                elif process.returncode is None:
+                    process.kill()
+            except ProcessLookupError:
+                pass
+            await process.communicate()  # Drain/close pipes and reap the child.
+
+        cleanup = asyncio.create_task(reap(), name="muselab-upgrade-reap")
+        pending_cancel = failure if isinstance(failure, asyncio.CancelledError) else None
+        while True:
+            try:
+                await asyncio.shield(cleanup)
+                break
+            except asyncio.CancelledError as exc:
+                if cleanup.cancelled():
+                    raise
+                if pending_cancel is None:
+                    pending_cancel = exc
+        if pending_cancel is not None:
+            raise pending_cancel
+        raise
+
+
 @router.post("/upgrade", dependencies=[Depends(require_token)])
 async def trigger_upgrade(req: UpgradeReq) -> dict:
     """Run the upgrade flow in-process. Returns step-by-step output for the
@@ -1500,26 +1546,21 @@ async def trigger_upgrade(req: UpgradeReq) -> dict:
                 })
             else:
                 try:
-                    p1 = await asyncio.create_subprocess_exec(
+                    rc1, out1 = await _run_upgrade_command(
                         uv_bin, "lock", "--upgrade-package", "claude-agent-sdk",
                         cwd=str(_REPO_ROOT),
-                        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
                     )
-                    out1, _ = await p1.communicate()
-                    steps.append({"step": "uv lock", "rc": p1.returncode,
-                                  "output": (out1 or b"").decode(errors="replace")[-2000:]})
-                    if p1.returncode != 0:
+                    steps.append({"step": "uv lock", "rc": rc1,
+                                  "output": out1.decode(errors="replace")[-2000:]})
+                    if rc1 != 0:
                         raise RuntimeError("uv lock failed")
 
-                    p2 = await asyncio.create_subprocess_exec(
-                        uv_bin, "sync", "--frozen",
-                        cwd=str(_REPO_ROOT),
-                        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+                    rc2, out2 = await _run_upgrade_command(
+                        uv_bin, "sync", "--frozen", cwd=str(_REPO_ROOT),
                     )
-                    out2, _ = await p2.communicate()
-                    steps.append({"step": "uv sync", "rc": p2.returncode,
-                                  "output": (out2 or b"").decode(errors="replace")[-2000:]})
-                    if p2.returncode != 0:
+                    steps.append({"step": "uv sync", "rc": rc2,
+                                  "output": out2.decode(errors="replace")[-2000:]})
+                    if rc2 != 0:
                         raise RuntimeError("uv sync failed")
                 except Exception as e:
                     steps.append({"step": "sdk upgrade aborted", "rc": -1,
@@ -1532,13 +1573,11 @@ async def trigger_upgrade(req: UpgradeReq) -> dict:
             npm_bin = _locate_executable("npm")
             if npm_bin:
                 try:
-                    p3 = await asyncio.create_subprocess_exec(
+                    rc3, out3 = await _run_upgrade_command(
                         npm_bin, "install", "-g", "@anthropic-ai/claude-code@latest",
-                        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
                     )
-                    out3, _ = await p3.communicate()
-                    steps.append({"step": "npm install -g claude-code", "rc": p3.returncode,
-                                  "output": (out3 or b"").decode(errors="replace")[-2000:]})
+                    steps.append({"step": "npm install -g claude-code", "rc": rc3,
+                                  "output": out3.decode(errors="replace")[-2000:]})
                 except Exception as e:
                     steps.append({"step": "cli upgrade aborted", "rc": -1,
                                   "output": f"{type(e).__name__}: {e}"})
