@@ -8066,7 +8066,7 @@ function portal() {
         const abandon = () => {
           if (this.tabState[sid] === ownerState
               && ownerState._modelPatchSeq === seq
-              && ownerState._modelExpected === expected) {
+              && ownerState._modelExpected?.seq === seq) {
             ownerState._modelExpected = null;
             if (this.currentId === sid) this.model = oldM;
           }
@@ -8544,7 +8544,7 @@ function portal() {
       } catch (_) {
         if (this.tabState[sid] !== st || st._permissionPatchSeq !== seq) return false;
         const fallback = expected.fallback;
-        if (st._permissionExpected === expected) st._permissionExpected = null;
+        if (st._permissionExpected?.seq === seq) st._permissionExpected = null;
         const current = this.sessions.find(s => s.id === sid);
         if (current) {
           current.permission = fallback;
