@@ -26,6 +26,7 @@ from fastapi import (
 )
 from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse, RedirectResponse
 from pydantic import BaseModel
+from starlette._utils import create_collapsing_task_group
 from starlette.datastructures import MutableHeaders
 from . import observability as obs
 from .auth import require_token, require_token_query
@@ -3486,10 +3487,27 @@ class _OpenedFileResponse(FileResponse):
         self._file = anyio.wrap_file(stream)
 
     async def __call__(self, scope, receive, send) -> None:
+        response = super().__call__
         try:
-            await super().__call__(scope, receive, send)
+            spec_version = tuple(map(int, scope.get("asgi", {}).get("spec_version", "2.0").split(".")))
+            # Keep the sender in a child task so parent cancellation joins its
+            # shielded disk worker before closing the FD that worker still owns.
+            async with create_collapsing_task_group() as task_group:
+                async def stream_response() -> None:
+                    await response(scope, receive, send)
+                    task_group.cancel_scope.cancel()
+
+                task_group.start_soon(stream_response)
+                if scope["type"] == "http" and spec_version < (2, 4):
+                    # Older ASGI servers may silently discard sends after the
+                    # peer closes; receive is their disconnect notification.
+                    while True:
+                        message = await receive()
+                        if message["type"] == "http.disconnect":
+                            task_group.cancel_scope.cancel()
+                            break
+                        await anyio.lowlevel.checkpoint()
         finally:
-            # Synchronous close also runs when the task's cancel scope is active.
             self._stream.close()
 
     async def _send_span(self, send, start: int, end: int, *, final: bool = True) -> None:

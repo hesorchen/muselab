@@ -15,6 +15,20 @@ def file_module(app_module):
     return files
 
 
+def _connected_receive():
+    """After the request body, keep the peer connected until response exit."""
+    request_sent = False
+
+    async def receive():
+        nonlocal request_sent
+        if request_sent:
+            await asyncio.Event().wait()
+        request_sent = True
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    return receive
+
+
 async def _download(module, auth, path, *, headers=None, mutate=None):
     app = FastAPI()
     app.include_router(module.router)
@@ -170,8 +184,7 @@ def test_download_protocol_and_success_closes_fd(
         assert message["type"] != "http.response.pathsend"
         frames.append(message)
 
-    async def receive():
-        return {"type": "http.request", "body": b"", "more_body": False}
+    receive = _connected_receive()
 
     scope = {"type": "http", "method": method, "headers": headers,
              "extensions": {"http.response.pathsend": {}} if extension else {}}
@@ -196,8 +209,9 @@ def test_download_protocol_and_success_closes_fd(
 
 
 @pytest.mark.parametrize("phase", ["start", "body"])
+@pytest.mark.parametrize("spec_version", ["2.3", "2.4"])
 def test_download_send_disconnect_closes_fd(
-    file_module, temp_root, download_streams, phase,
+    file_module, temp_root, download_streams, phase, spec_version,
 ):
     (temp_root / "public.txt").write_bytes(b"PUBLIC_DOWNLOAD_MARKER" * 7500)
     response = file_module.download_file(target=temp_root / "public.txt")
@@ -207,11 +221,13 @@ def test_download_send_disconnect_closes_fd(
         if message["type"] == f"http.response.{phase}":
             raise failure
 
-    async def receive():
-        return {"type": "http.disconnect"}
+    receive = _connected_receive()
 
     with pytest.raises(OSError) as caught:
-        asyncio.run(response({"type": "http", "method": "GET", "headers": []}, receive, send))
+        asyncio.run(response({
+            "type": "http", "method": "GET", "headers": [],
+            "asgi": {"spec_version": spec_version},
+        }, receive, send))
     assert caught.value is failure
     assert download_streams[0].closed
 
@@ -230,8 +246,7 @@ def test_download_task_cancellation_closes_fd(file_module, temp_root, download_s
                 entered.set()
                 await blocked.wait()
 
-        async def receive():
-            return {"type": "http.disconnect"}
+        receive = _connected_receive()
 
         task = asyncio.create_task(response(
             {"type": "http", "method": "GET", "headers": []}, receive, send,
@@ -339,8 +354,7 @@ def test_download_matching_if_range_uses_partial_response(
     async def send(message):
         frames.append(message)
 
-    async def receive():
-        return {"type": "http.request", "body": b"", "more_body": False}
+    receive = _connected_receive()
 
     scope = {"type": "http", "method": "GET", "headers": [
         (b"range", b"bytes=0-3"),
