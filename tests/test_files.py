@@ -890,7 +890,7 @@ def test_csv_total_cache_reuses_signature_and_invalidates_on_write(
     cache_key = str(path.resolve())
     with files_module._CSV_TOTAL_CACHE_LOCK:
         cached = files_module._CSV_TOTAL_CACHE[cache_key]
-    assert cached[2] == first_total
+    assert cached[1] == first_total
 
     second = client.get(
         "/api/files/csv?path=cached.csv&offset=10&limit=3", headers=auth)
@@ -906,7 +906,7 @@ def test_csv_total_cache_reuses_signature_and_invalidates_on_write(
     assert changed.status_code == 200
     assert changed.json()["total_rows"] == first_total + 1
     with files_module._CSV_TOTAL_CACHE_LOCK:
-        assert files_module._CSV_TOTAL_CACHE[cache_key][1] > cached[1]
+        assert files_module._CSV_TOTAL_CACHE[cache_key] != cached
 
 
 def test_list_modified_sort_selects_before_truncation(client, auth, temp_root, monkeypatch):

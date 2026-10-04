@@ -333,12 +333,16 @@ async def get_client(
             await hooks.disconnect_unpooled_client(client, session_id)
             raise RuntimeError("session is being deleted")
 
+        # Register every exact cleanup owner before yielding. A cancelled
+        # admission must not orphan removed clients, and reuse of an evicted
+        # session must join its old stream/CLI before constructing a new one.
         for old_key, old_client, old_stream in to_disconnect:
-            if old_stream is not None:
-                await old_stream.aclose()
-            if not await join_session_disconnects(
-                old_key[0], (old_client,)
-            ):
+            cleanup = _queue_client_disconnect(
+                old_key[0], old_client, stream=old_stream,
+            )
+            hooks.retain_detached_cleanup(cleanup)
+        for old_key, _old_client, _old_stream in to_disconnect:
+            if not await join_session_disconnects(old_key[0]):
                 sys.stderr.write(
                     "[client-pool] evict cleanup pending "
                     f"sid={old_key[0][:8]}\n"
@@ -609,9 +613,20 @@ async def _disconnect_owned_client(
     session_id: str,
     client_id: int,
     client: ClaudeSDKClient,
+    stream: SessionStream | None = None,
 ) -> None:
     """Run one disconnect attempt while retaining retriable ownership."""
     try:
+        if stream is not None:
+            try:
+                await stream.aclose()
+            except Exception as exc:
+                # Closing the sole reader cannot exempt its CLI from cleanup.
+                sys.stderr.write(
+                    f"[client-pool] evict stream close sid={session_id[:8]} "
+                    f"exc={type(exc).__name__}\n"
+                )
+                sys.stderr.flush()
         await client.disconnect()
     except BaseException:
         SESSION_DISCONNECT_FAILED.add(session_id)
@@ -632,6 +647,8 @@ async def _disconnect_owned_client(
 def _queue_client_disconnect(
     session_id: str,
     client: ClaudeSDKClient,
+    *,
+    stream: SessionStream | None = None,
 ) -> asyncio.Task:
     client_id = id(client)
     pending = SESSION_DISCONNECT_CLIENTS.setdefault(session_id, {})
@@ -640,7 +657,7 @@ def _queue_client_disconnect(
     if owner is not None and not owner.done():
         return owner
     task = asyncio.create_task(
-        _disconnect_owned_client(session_id, client_id, client)
+        _disconnect_owned_client(session_id, client_id, client, stream)
     )
     CLIENT_DISCONNECT_OWNERS[client_id] = task
     track_session_disconnect(session_id, task)

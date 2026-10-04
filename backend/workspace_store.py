@@ -6,6 +6,7 @@ import hashlib
 import os
 import shutil
 import sqlite3
+import stat
 import threading
 import time
 from collections.abc import Iterable, Mapping
@@ -1065,7 +1066,8 @@ class WorkspaceStore:
                 # add/replace, never for an ordinary directory "modified"
                 # notification (the source of the former O(subtree) storm).
                 try:
-                    descendants = scan_workspace(target)
+                    subtree_report: dict[str, Any] = {}
+                    descendants = scan_workspace(target, report=subtree_report)
                 except WorkspaceScanIncomplete:
                     # An unreadable/transiently changing replacement is not
                     # evidence that every formerly indexed child disappeared.
@@ -1082,7 +1084,12 @@ class WorkspaceStore:
                         "name": Path(child_path).name,
                     }
                     current_paths.add(child_path)
-                scanned_subtrees[path] = current_paths
+                if subtree_report.get("partial"):
+                    # A budgeted pass can add observed children, but cannot
+                    # prove that the unvisited descendants were deleted.
+                    subtree_scan_incomplete = True
+                else:
+                    scanned_subtrees[path] = current_paths
 
             with self._connect() as db:
                 db.execute("BEGIN IMMEDIATE")
@@ -1142,17 +1149,17 @@ class WorkspaceStore:
                         # Duplicate native deletes must not consume the replay
                         # window or invalidate a perfectly usable client cursor.
                         continue
+                    # Keep exact-node and descendant deletes separate so both
+                    # lookups use the composite primary-key index. An OR under
+                    # workspace_id makes SQLite scan every file in the workspace.
                     db.execute(
-                        """
-                        DELETE FROM files
-                        WHERE workspace_id = ?
-                          AND (path = ? OR path LIKE ? ESCAPE '\\')
-                        """,
-                        (
-                            workspace_id,
-                            path,
-                            self._subtree_pattern(path),
-                        ),
+                        "DELETE FROM files WHERE workspace_id = ? AND path = ?",
+                        (workspace_id, path),
+                    )
+                    db.execute(
+                        "DELETE FROM files WHERE workspace_id = ? "
+                        "AND path >= ? AND path < ?",
+                        (workspace_id, *self._subtree_bounds(path)),
                     )
                     for item in known:
                         deleted_path = item["path"]
@@ -1485,15 +1492,23 @@ class WorkspaceStore:
         chunk = 64 * 1024
         digest = hashlib.blake2b(digest_size=16)
         digest.update(str(size).encode("ascii"))
-        with path.open("rb") as handle:
-            if size <= chunk * 3:
-                digest.update(handle.read())
-            else:
-                digest.update(handle.read(chunk))
-                handle.seek(max(chunk, size // 2 - chunk // 2))
-                digest.update(handle.read(chunk))
-                handle.seek(max(0, size - chunk))
-                digest.update(handle.read(chunk))
+        flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(path, flags)
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise OSError("cannot fingerprint a non-regular file")
+            with os.fdopen(fd, "rb", closefd=False) as handle:
+                if size <= chunk * 3:
+                    # A writer can grow the file after stat; keep the read bound.
+                    digest.update(handle.read(chunk * 3))
+                else:
+                    digest.update(handle.read(chunk))
+                    handle.seek(max(chunk, size // 2 - chunk // 2))
+                    digest.update(handle.read(chunk))
+                    handle.seek(max(0, size - chunk))
+                    digest.update(handle.read(chunk))
+        finally:
+            os.close(fd)
         return digest.hexdigest()
 
     @staticmethod
@@ -1628,14 +1643,13 @@ class WorkspaceStore:
         return entries, truncated_parents
 
     @staticmethod
-    def _subtree_pattern(path: str) -> str:
-        escaped = (
-            path
-            .replace("\\", "\\\\")
-            .replace("%", "\\%")
-            .replace("_", "\\_")
-        )
-        return escaped + "/%"
+    def _subtree_bounds(path: str) -> tuple[str, str]:
+        # The default BINARY collation matches case-sensitive filesystem paths.
+        # Every descendant starts with `path/`; `path0` is its exclusive upper
+        # bound because '/' sorts immediately before '0'. Unlike LIKE, this
+        # range treats case and wildcard-shaped filenames literally and lets
+        # SQLite use the (workspace_id, path) primary-key index.
+        return path + "/", path + "0"
 
     @classmethod
     def _subtree_rows(
@@ -1646,17 +1660,16 @@ class WorkspaceStore:
     ) -> list[dict[str, Any]]:
         rows = db.execute(
             """
-            SELECT path, name, is_dir, size, mtime, mtime_ns, ctime_ns, inode
-            FROM files
-            WHERE workspace_id = ?
-              AND (path = ? OR path LIKE ? ESCAPE '\\')
+            SELECT * FROM (
+                SELECT path, name, is_dir, size, mtime, mtime_ns, ctime_ns, inode
+                FROM files WHERE workspace_id = ? AND path = ?
+                UNION ALL
+                SELECT path, name, is_dir, size, mtime, mtime_ns, ctime_ns, inode
+                FROM files WHERE workspace_id = ? AND path >= ? AND path < ?
+            )
             ORDER BY length(path) DESC, path
             """,
-            (
-                workspace_id,
-                path,
-                cls._subtree_pattern(path),
-            ),
+            (workspace_id, path, workspace_id, *cls._subtree_bounds(path)),
         ).fetchall()
         return [dict(row) for row in rows]
 

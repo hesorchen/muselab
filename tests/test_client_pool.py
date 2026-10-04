@@ -600,3 +600,82 @@ def test_provider_change_during_connect_is_not_lost(chat_mod, monkeypatch, waite
         assert len(built) == 2
 
     asyncio.run(run())
+
+
+def test_cancel_during_lru_stream_close_retains_exact_evicted_client(chat_mod, monkeypatch):
+    """Stopping a new turn cannot orphan the old CLI removed by its admission."""
+    from backend import chat_runtime
+    _patch_builder(monkeypatch, chat_mod)
+    monkeypatch.setattr(chat_mod, "_CLIENT_POOL_CAP", 1)
+
+    async def run():
+        close_started = asyncio.Event()
+        close_release = asyncio.Event()
+
+        class SlowStream(_FakeSessionStream):
+            async def aclose(self):
+                close_started.set()
+                await close_release.wait()
+                self.closed = True
+
+        first = await chat_mod.get_client("evicted", "claude-sonnet-4-6")
+        key = ("evicted", "claude-sonnet-4-6", "auto", "")
+        stream = SlowStream(key, first)
+        chat_mod._session_streams[key] = stream
+        admission = asyncio.create_task(chat_mod.get_client("new", "claude-sonnet-4-6"))
+        await close_started.wait()
+        admission.cancel()
+        try:
+            with pytest.raises(asyncio.CancelledError):
+                await admission
+            assert key not in chat_mod._clients
+            close_release.set()
+            async with asyncio.timeout(1):
+                while not first.disconnected:
+                    await asyncio.sleep(0)
+            assert stream.closed
+            assert "evicted" not in chat_runtime.SESSION_DISCONNECT_CLIENTS
+        finally:
+            close_release.set()
+            if not admission.done():
+                admission.cancel()
+                await asyncio.gather(admission, return_exceptions=True)
+
+    asyncio.run(run())
+
+
+def test_evicted_stream_close_blocks_recreation_of_same_session(chat_mod, monkeypatch):
+    _patch_builder(monkeypatch, chat_mod)
+    monkeypatch.setattr(chat_mod, "_CLIENT_POOL_CAP", 1)
+
+    async def run():
+        close_started, release = asyncio.Event(), asyncio.Event()
+
+        class SlowStream(_FakeSessionStream):
+            async def aclose(self):
+                close_started.set()
+                await release.wait()
+                self.closed = True
+
+        first = await chat_mod.get_client("evicted", "claude-sonnet-4-6")
+        key = ("evicted", "claude-sonnet-4-6", "auto", "")
+        chat_mod._session_streams[key] = SlowStream(key, first)
+        admission = asyncio.create_task(chat_mod.get_client("new", "claude-sonnet-4-6"))
+        await close_started.wait()
+        reopen = asyncio.create_task(chat_mod.get_client("evicted", "claude-sonnet-4-6"))
+        try:
+            await asyncio.sleep(0.01)
+            assert not reopen.done(), "a second CLI started before its old stream was closed"
+            release.set()
+            await admission
+            replacement = await asyncio.wait_for(reopen, 1)
+            assert first.disconnected
+            assert replacement is not first
+        finally:
+            release.set()
+            for task in (admission, reopen):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(admission, reopen, return_exceptions=True)
+
+    asyncio.run(run())

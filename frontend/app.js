@@ -6551,13 +6551,15 @@ function portal() {
         data = null;
       }
       if (!r.ok) {
+        // HTTP/2 commonly leaves statusText empty, and upstream failures may
+        // return HTML instead of JSON. Preserve the status for caller feedback.
+        const error = (data && data.detail) || r.statusText || `HTTP ${r.status}`;
         if (opts.toastError) {
-          const msg = (data && data.detail) || r.statusText || `HTTP ${r.status}`;
           this.toast(
-            (this.lang === "zh" ? "请求失败：" : "Request failed: ") + msg,
+            (this.lang === "zh" ? "请求失败：" : "Request failed: ") + error,
             "error", 4000);
         }
-        return { ok: false, status: r.status, data, error: (data && data.detail) || r.statusText };
+        return { ok: false, status: r.status, data, error };
       }
       return { ok: true, status: r.status, data };
     },
@@ -14419,6 +14421,10 @@ function portal() {
     },
     async _changeWorkspaceSurface(path) {
       if (!path || path === this.activeWorkspace) return true;
+      // Workspace navigation replaces the editor just like a file switch.
+      // Guard the shared entry point so tabs and task deep-links cannot silently
+      // discard a dirty buffer. Callers must retain the current session on cancel.
+      if (!this._confirmLoseEdits()) return false;
       const previous = this.activeWorkspace;
       if (previous) this._captureWorkspaceSurface(previous);
       this._stopFileEvents(false);
@@ -15113,7 +15119,7 @@ function portal() {
       const cwd = session && session.cwd;
       if (cwd && cwd !== this.currentWorkspacePath()
           && this.sessionWorkspaces.some(w => w.path === cwd)) {
-        await this._changeWorkspaceSurface(cwd);
+        if (!await this._changeWorkspaceSurface(cwd)) return false;
       }
       let opened = false;
       if (!this.openTabIds.includes(id)) {
@@ -15160,7 +15166,7 @@ function portal() {
         // previews and chat together. Ignore stale/unregistered paths.
         if (workspace && workspace !== this.currentWorkspacePath()
             && this.sessionWorkspaces.some(w => w.path === workspace)) {
-          await this._changeWorkspaceSurface(workspace);
+          if (!await this._changeWorkspaceSurface(workspace)) return false;
         }
         if (!this.sessions.find(s => s.id === id)) {
           // P2: the windowed list won't include an OLD session unless we ask
@@ -26545,8 +26551,21 @@ function portal() {
       }
       return bytes;
     },
-    _previewCacheDel(path) {
-      if (!this._previewCache || !path) return;
+    _previewCacheDel(path, ownerWorkspace = this.fileWorkspacePath()) {
+      if (!path) return;
+      if (!this._workspaceIsCurrent(ownerWorkspace)) {
+        // A completed write can belong to an inactive workspace. Its LRU
+        // snapshot must forget the old body without evicting an identically
+        // named file in the current workspace.
+        const runtime = this._workspaceRuntimeCaches.get(ownerWorkspace);
+        if (!runtime || !Array.isArray(runtime.previewCache)) return;
+        const old = runtime.previewCache.find(([cachedPath]) => cachedPath === path)?.[1];
+        runtime.previewCache = runtime.previewCache.filter(([cachedPath]) => cachedPath !== path);
+        runtime.previewCacheBytes = Math.max(0,
+          (Number(runtime.previewCacheBytes) || 0) - ((old && old._cacheBytes) || 0));
+        return;
+      }
+      if (!this._previewCache) return;
       const old = this._previewCache.get(path);
       if (old && Number.isFinite(this._previewCacheBytes)) {
         this._previewCacheBytes = Math.max(0,
@@ -27593,8 +27612,14 @@ function portal() {
     async openTerminal(id, { reconnect = false, reveal = true } = {}) {
       const row = this.terminals.find(item => item.id === id);
       if (!row) return;
+      const ownerWorkspace = this.fileWorkspacePath();
+      const requestHeaders = this.fileHdr(ownerWorkspace);
       this._teardownTerminalView();
       const seq = ++this._terminalConnectSeq;
+      const isCurrent = () => seq === this._terminalConnectSeq
+        && this.activeTerminalId === id && this.previewSurface === "terminal"
+        && this._workspaceIsCurrent(ownerWorkspace);
+      let connectionTerm = null;
       this.activeTerminalId = id;
       this.previewSurface = "terminal";
       this.terminalManagerOpen = false;
@@ -27604,8 +27629,9 @@ function portal() {
       this._scheduleSavePrefs();
       try {
         await this._loadTerminalLib();
-        if (seq !== this._terminalConnectSeq || this.activeTerminalId !== id) return;
+        if (!isCurrent()) return;
         await this.$nextTick();
+        if (!isCurrent()) return;
         const host = this.$refs.terminalHost;
         if (!host) throw new Error("terminal host missing");
         host.replaceChildren();
@@ -27656,6 +27682,10 @@ function portal() {
         term.loadAddon(fit);
         term.open(host);
         this._terminal = term;
+        // Capture through Alpine's getter: it may wrap the xterm instance in
+        // a reactive proxy, so comparing with the raw constructor value fails.
+        connectionTerm = this._terminal;
+        const ownsTerminal = () => isCurrent() && this._terminal === connectionTerm;
         this._terminalFit = fit;
         this._attachTerminalTouchScroll(host, term);
         this._attachTerminalSelectionCopy(host, term);
@@ -27714,12 +27744,25 @@ function portal() {
         });
         if (reveal || !this._isMobileLayout()) term.focus();
 
-        const ticketResponse = await this.api(`/api/terminals/${id}/ticket`, {
-          method: "POST",
-          headers: this.fileHdr(),
-        });
-        if (!ticketResponse.ok) throw new Error(ticketResponse.error || "ticket failed");
-        if (seq !== this._terminalConnectSeq) return;
+        let ticketResponse;
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+          if (!ownsTerminal()) return;
+          // Only mint a fresh connection ticket: retrying must never allocate
+          // another PTY or restart the process after a transient proxy failure.
+          ticketResponse = await this.api(`/api/terminals/${id}/ticket`, {
+            method: "POST",
+            headers: requestHeaders,
+          });
+          if (!ownsTerminal()) return;
+          if (ticketResponse.ok) break;
+          const transient = [0, 502, 503, 504].includes(ticketResponse.status);
+          if (!transient || attempt === 2) {
+            throw new Error(ticketResponse.error || `HTTP ${ticketResponse.status}`);
+          }
+          this.terminalConnection = reconnect ? "reconnecting" : "connecting";
+          await new Promise(resolve => setTimeout(resolve, attempt === 0 ? 250 : 750));
+        }
+        if (!ownsTerminal()) return;
         const scheme = location.protocol === "https:" ? "wss:" : "ws:";
         const socket = new WebSocket(
           `${scheme}//${location.host}/api/terminals/${encodeURIComponent(id)}/ws`,
@@ -27779,7 +27822,7 @@ function portal() {
           if (seq === this._terminalConnectSeq) this.terminalConnection = "reconnecting";
         };
       } catch (error) {
-        if (seq !== this._terminalConnectSeq) return;
+        if (!isCurrent() || (connectionTerm && this._terminal !== connectionTerm)) return;
         this.terminalConnection = "error";
         this.toast((this.lang === "zh" ? "终端连接失败：" : "Terminal connection failed: ")
           + error.message, "error");
@@ -28382,8 +28425,11 @@ function portal() {
           this._clearPreviewState();
         } else {
           const next = this.tabs[Math.min(idx, this.tabs.length - 1)];
-          this.openByPath(next.path);
-          return;   // openByPath → openFile → savePrefs runs there
+          // The close action already confirmed discarding this buffer. Asking
+          // again after removing its tab could leave a closed file selected.
+          // Preserve the adjacent tab's temporary/pinned state as well.
+          this.openFile(next, { preview: !!next.preview, editsConfirmed: true });
+          return;   // openFile schedules the updated preview preferences
         }
       }
       this.savePrefs();
@@ -28726,22 +28772,28 @@ function portal() {
     },
     async downloadFile(p) {
       if (!p) return;
+      // Lazy helpers and ticket requests can outlive a workspace switch. Keep
+      // both the credential and final URL bound to the workspace clicked.
+      const ownerWorkspace = this.fileWorkspacePath();
+      const headers = { ...this.fileHdr(ownerWorkspace), "Content-Type": "application/json" };
+      const request = this._fileReadRequest(p);
+      const readUrl = this._fileReadUrl("download", p);
       let capabilities;
       let ticket;
       try {
         capabilities = await this._fileCapabilities();
         ticket = await capabilities.mintTicket(
           "/api/files/download-ticket",
-          { ...this.fileHdr(), "Content-Type": "application/json" },
-          this._fileReadRequest(p),
+          headers,
+          request,
         );
       } catch (error) {
         this.errToast("generic", String((error && error.message) || error));
         return;
       }
-      const workspace = this.fileWorkspacePath()
-        ? "&workspace=" + encodeURIComponent(this.fileWorkspacePath()) : "";
-      const url = this._fileReadUrl("download", p)
+      const workspace = ownerWorkspace
+        ? "&workspace=" + encodeURIComponent(ownerWorkspace) : "";
+      const url = readUrl
         + "&ticket=" + encodeURIComponent(ticket) + workspace;
       capabilities.triggerDownload(url, p.split("/").pop() || "download");
     },
@@ -32048,8 +32100,10 @@ function portal() {
           body: JSON.stringify({ path: savePath, content: saveText }),
         });
         if (!response.ok) throw new Error(await response.text());
+        // The disk write succeeded even if navigation replaced this editor.
+        // Invalidate its workspace cache before checking the visible owner.
+        this._previewCacheDel(savePath, workspace);
         if (!sameOwner()) return;
-        this._previewCacheDel(savePath);
         // Shortcut saves retain cursor/history; the Save button explicitly
         // requests preview after the acknowledged generation is clean.
         this._previewNeedsReload = savePath;

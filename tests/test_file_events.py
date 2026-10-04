@@ -2729,12 +2729,12 @@ def test_incomplete_added_directory_scan_preserves_last_good_descendants(
     baseline = store.current_cursor(workspace_id)
     real_scan = workspace_store.scan_workspace
 
-    def incomplete_scan(root):
+    def incomplete_scan(root, **kwargs):
         if Path(root).resolve() == child.parent.resolve():
             raise workspace_store.WorkspaceScanIncomplete(
                 "synthetic transient read failure"
             )
-        return real_scan(root)
+        return real_scan(root, **kwargs)
 
     monkeypatch.setattr(
         workspace_store,

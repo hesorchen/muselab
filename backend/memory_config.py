@@ -117,7 +117,19 @@ class MemoryConfig(BaseModel):
 
 
 _LOCK = threading.RLock()
-_cached: tuple[Path, int, MemoryConfig] | None = None
+_ConfigStamp = tuple[int, int, int, int, int]
+_cached: tuple[Path, _ConfigStamp | None, MemoryConfig] | None = None
+
+
+def _config_stamp(path: Path) -> _ConfigStamp | None:
+    try:
+        info = path.stat()
+    except OSError:
+        return None
+    # Restores and atomic replacements may retain the old mtime and size.
+    # Identity and ctime prevent using a previous owner's/provider's config.
+    return (info.st_dev, info.st_ino, info.st_size,
+            info.st_mtime_ns, info.st_ctime_ns)
 
 
 def memory_dir() -> Path:
@@ -136,10 +148,7 @@ def database_path() -> Path:
 def load_config(*, fresh: bool = False) -> MemoryConfig:
     global _cached
     path = config_path()
-    try:
-        stamp = path.stat().st_mtime_ns
-    except OSError:
-        stamp = -1
+    stamp = _config_stamp(path)
     # Saving holds the writer lock across fsync/replace. Readers can keep
     # using the last committed immutable snapshot while that write is pending.
     cached = _cached
@@ -148,7 +157,7 @@ def load_config(*, fresh: bool = False) -> MemoryConfig:
     with _LOCK:
         if not fresh and _cached and _cached[:2] == (path, stamp):
             return _cached[2].model_copy(deep=True)
-        if stamp < 0:
+        if stamp is None:
             value = MemoryConfig()
         else:
             try:
@@ -170,21 +179,25 @@ def save_config(config: MemoryConfig) -> MemoryConfig:
     with _LOCK:
         fd, tmp = tempfile.mkstemp(prefix=".config.", dir=str(path.parent))
         try:
-            os.fchmod(fd, 0o600)
             with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                os.fchmod(stream.fileno(), 0o600)
                 stream.write(payload)
                 stream.flush()
                 os.fsync(stream.fileno())
+            # The temporary inode is already 0600; replace publishes that
+            # exact inode. No fallible chmod may follow the commit point.
             os.replace(tmp, path)
-            os.chmod(path, 0o600)
         except Exception:
             try:
                 os.unlink(tmp)
             except OSError:
                 pass
             raise
-        stamp = path.stat().st_mtime_ns
-        _cached = (path, stamp, config.model_copy(deep=True))
+        stamp = _config_stamp(path)
+        _cached = (
+            (path, stamp, config.model_copy(deep=True))
+            if stamp is not None else None
+        )
     return config.model_copy(deep=True)
 
 

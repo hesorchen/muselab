@@ -5,6 +5,7 @@ import asyncio
 import json
 import threading
 import time
+from datetime import datetime, timezone
 
 import pytest
 from claude_agent_sdk import (
@@ -375,3 +376,82 @@ async def test_shutdown_rollback_failure_does_not_restart_tick(app_module, monke
     assert tick.done()
     assert not sched._RUN_TASKS
     assert not sched.persistence_status()["available"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["daily", "once"])
+@pytest.mark.parametrize("edit", ["none", "unrelated", "schedule", "delete"])
+async def test_cancel_startup_cleanup_preserves_unlaunched_catchup_and_new_edits(
+    app_module, monkeypatch, kind, edit,
+):
+    sched = _sched_mod(app_module)
+    now = time.time()
+    past = datetime.fromtimestamp(now - 30, timezone.utc)
+    schedule = _daily_at() if kind == "daily" else {
+        "kind": "once", "year": past.year, "month": past.month, "day": past.day,
+        "hour": past.hour, "minute": past.minute, "tz_offset_minutes": 0,
+    }
+    task = {"id": "startup-catchup", "name": "synthetic", "prompt": "synthetic",
+            "schedule": schedule, "next_run": now - 30, "enabled": True,
+            "session_mode": "fresh", "session_id": ""}
+    sched._state["tasks"][task["id"]] = task
+    sched._save_state()
+    entered, release = asyncio.Event(), asyncio.Event()
+    spawned = []
+
+    async def cleanup():
+        entered.set()
+        await release.wait()
+
+    async def execute(current):
+        spawned.append(current["id"])
+
+    monkeypatch.setattr(sched, "_resume_pending_task_cleanups", cleanup)
+    monkeypatch.setattr(sched, "_execute_task", execute)
+    startup = asyncio.create_task(sched.start_scheduler())
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        extra = None
+        if edit == "unrelated":
+            extra = sched.create_task("new task", "synthetic", _daily_at())
+            sched._state["unread_count"] = 7
+            sched._save_state()
+        elif edit == "schedule":
+            future = datetime.fromtimestamp(now + 3600, timezone.utc)
+            updated = sched.update_task(task["id"], schedule={
+                "kind": "once", "year": future.year, "month": future.month,
+                "day": future.day, "hour": future.hour, "minute": future.minute,
+                "tz_offset_minutes": 0,
+            })
+        elif edit == "delete":
+            assert sched.delete_task(task["id"], purge_bound_session=False)
+        startup.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await startup
+        assert sched._scheduler_task is None
+        assert not spawned
+        persisted = json.loads(sched._STATE_FILE.read_text())
+        if edit == "delete":
+            assert task["id"] not in persisted["tasks"]
+            assert task["id"] in persisted["cleanup_pending"]
+        elif edit == "schedule":
+            assert persisted["tasks"][task["id"]]["schedule"] == updated["schedule"]
+            assert persisted["tasks"][task["id"]]["next_run"] == updated["next_run"]
+        else:
+            restored = persisted["tasks"][task["id"]]
+            assert restored["next_run"] == now - 30
+            assert restored["enabled"] is True
+            if extra:
+                assert extra["id"] in persisted["tasks"]
+                assert persisted["unread_count"] == 7
+            release.set()
+            await sched.start_scheduler()
+            await until(lambda: bool(spawned))
+            await sched.stop_scheduler()
+            assert spawned == [task["id"]]
+    finally:
+        release.set()
+        if not startup.done():
+            startup.cancel()
+            await asyncio.gather(startup, return_exceptions=True)
+        await sched.stop_scheduler()
