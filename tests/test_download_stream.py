@@ -158,7 +158,7 @@ def test_download_protocol_and_success_closes_fd(
 ):
     original = b"PUBLIC_DOWNLOAD_MARKER"
     (temp_root / "public.txt").write_bytes(original)
-    response = file_module.download_file("public.txt", root=temp_root, external=False)
+    response = file_module.download_file(target=temp_root / "public.txt")
     frames = []
     headers = []
     if range_header:
@@ -200,7 +200,7 @@ def test_download_send_disconnect_closes_fd(
     file_module, temp_root, download_streams, phase,
 ):
     (temp_root / "public.txt").write_bytes(b"PUBLIC_DOWNLOAD_MARKER" * 7500)
-    response = file_module.download_file("public.txt", root=temp_root, external=False)
+    response = file_module.download_file(target=temp_root / "public.txt")
     failure = OSError(errno.EPIPE, "synthetic client disconnected")
 
     async def send(message):
@@ -218,7 +218,7 @@ def test_download_send_disconnect_closes_fd(
 
 def test_download_task_cancellation_closes_fd(file_module, temp_root, download_streams):
     (temp_root / "public.txt").write_bytes(b"PUBLIC_DOWNLOAD_MARKER" * 7500)
-    response = file_module.download_file("public.txt", root=temp_root, external=False)
+    response = file_module.download_file(target=temp_root / "public.txt")
 
     async def exercise():
         entered = asyncio.Event()
@@ -333,7 +333,7 @@ def test_download_matching_if_range_uses_partial_response(
     file_module, temp_root, download_streams, validator,
 ):
     (temp_root / "public.txt").write_bytes(b"PUBLIC_DOWNLOAD_MARKER")
-    response = file_module.download_file("public.txt", root=temp_root, external=False)
+    response = file_module.download_file(target=temp_root / "public.txt")
     frames = []
 
     async def send(message):

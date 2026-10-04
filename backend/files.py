@@ -3412,7 +3412,7 @@ def _require_download_ticket(
     ticket: str = Query(""),
     root: Path = Depends(_workspace_root),
     external: bool = False,
-) -> None:
+) -> Path:
     try:
         target = safe_read_resolve(path, root=root, external=external)
     except HTTPException:
@@ -3423,6 +3423,7 @@ def _require_download_ticket(
         (str(target), str(root.resolve())),
     ):
         raise HTTPException(status_code=401, detail="invalid or expired download ticket")
+    return target
 
 
 def _open_download_file(target: Path) -> tuple[BinaryIO, os.stat_result]:
@@ -3527,13 +3528,10 @@ class _DownloadFileResponse(FileResponse):
             await send({"type": "http.response.body", "body": f"--{boundary}--".encode("ascii"), "more_body": False})
 
 
-@router.get("/download", dependencies=[Depends(_require_download_ticket)])
+@router.get("/download")
 def download_file(
-    path: str = Query(...),
-    root: Path = Depends(_workspace_root),
-    external: bool = False,
+    target: Path = Depends(_require_download_ticket),
 ) -> FileResponse:
-    target = safe_read_resolve(path, root=root, external=external)
     if not target.exists() or not target.is_file():
         raise HTTPException(status_code=404, detail="not a file")
     from urllib.parse import quote
