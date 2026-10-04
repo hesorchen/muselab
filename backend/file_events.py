@@ -718,12 +718,17 @@ class FileWatchManager:
         # First use or changed registry metadata needs durable registration.
         # The recursive scan remains scheduled later and never runs under the
         # manager lock.
-        await asyncio.to_thread(
+        # Cancellation must retain the root lifecycle lock until the real
+        # registration write ends, or DELETE can finish before a late thread
+        # recreates the removed workspace row.
+        await to_thread_io(
+            "files.workspace_register", entry.id,
             self.store.register_workspace,
             entry.id,
             root,
             entry.name,
             primary=entry.primary,
+            owned=True,
         )
         status = await asyncio.to_thread(self.store.state, entry.id)
 
@@ -740,12 +745,14 @@ class FileWatchManager:
             raise
         if current_entry != entry:
             entry = current_entry
-            await asyncio.to_thread(
+            await to_thread_io(
+                "files.workspace_register", entry.id,
                 self.store.register_workspace,
                 entry.id,
                 root,
                 entry.name,
                 primary=entry.primary,
+                owned=True,
             )
             status = await asyncio.to_thread(self.store.state, entry.id)
 
