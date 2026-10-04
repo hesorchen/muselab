@@ -15291,7 +15291,9 @@ function portal() {
 
     // Defensive helpers used by inline templates — keep them tiny so Alpine
     // never has to re-parse complex expressions on every reactive tick.
-    isTabStreaming(tid) {
+    // History rows already own reactive session metadata; reuse it instead
+    // of scanning the entire catalog for every status binding.
+    isTabStreaming(tid, session = null) {
       const st = this.tabState[tid];
       if (st && st.streaming) return true;
       // FIX ⑩: cross-device sync. tabState only knows about turns THIS browser
@@ -15299,7 +15301,7 @@ function portal() {
       // server-authoritative `active` flag on the session record (set from
       // chat.py's _active_turns). So the blue "streaming" dot lights up on
       // every device, not just the one that sent the message.
-      const s = this.sessions.find(x => x.id === tid);
+      const s = session || this.sessions.find(x => x.id === tid);
       if (!s) return false;
       // New backends distinguish a transcript-writing turn/continuation from
       // a detached background process. Fork is safe in the latter state but
@@ -15332,10 +15334,10 @@ function portal() {
             }
           : session);
     },
-    isTabBackgroundActive(tid) {
+    isTabBackgroundActive(tid, session = null) {
       const st = this.tabState[tid];
       if (st && (st.backgroundActive || st.inheritedBackgroundTaskCount > 0)) return true;
-      const s = this.sessions.find(x => x.id === tid);
+      const s = session || this.sessions.find(x => x.id === tid);
       return !!(s && s.background_active);
     },
     _setScheduledTaskState(tid, active, count = 0) {
@@ -15349,18 +15351,18 @@ function portal() {
           }
         : session);
     },
-    isTabScheduledActive(tid) {
+    isTabScheduledActive(tid, session = null) {
       const st = this.tabState[tid];
       if (st && st.scheduledDeliveryActive) return true;
-      const session = this.sessions.find(item => item.id === tid);
-      return !!(session && session.scheduled_active);
+      const s = session || this.sessions.find(item => item.id === tid);
+      return !!(s && s.scheduled_active);
     },
-    isTabRunning(tid) {
-      return this.isTabScheduledActive(tid)
-        || this.isTabBackgroundActive(tid)
-        || this.isTabStreaming(tid);
+    isTabRunning(tid, session = null) {
+      return this.isTabScheduledActive(tid, session)
+        || this.isTabBackgroundActive(tid, session)
+        || this.isTabStreaming(tid, session);
     },
-    isTabUnread(tid) {
+    isTabUnread(tid, session = null) {
       // True when this tab's most recent turn finished while the user was
       // on a different tab AND they haven't activated this tab since.
       // The active tab can never be unread by construction (activateTab
@@ -15375,7 +15377,7 @@ function portal() {
       // already flipped false. The old `!st.streaming`-only guard let the
       // green "done" dot light up alongside the accent "in-progress" dot in
       // exactly those windows (2026-05-30 both-dots bug report).
-      if (this.isTabRunning(tid)) return false;
+      if (this.isTabRunning(tid, session)) return false;
       const st = this.tabState[tid];
       return !!(st && st.unread);
     },
