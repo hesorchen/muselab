@@ -1108,6 +1108,28 @@ def get_session_meta(sid: str) -> dict | None:
     return meta
 
 
+def session_is_old_unpinned(sid: str, cutoff: float) -> bool:
+    """Check both native metadata and the current local retention markers.
+
+    Display metadata can retain an earlier SDK modification time even after a
+    local rename has committed. Deletion must also respect the durable local
+    update and pin rather than relying on that cached display timestamp alone.
+    """
+    meta = get_session_meta(sid)
+    if (
+        meta is None
+        or meta.get("pinned")
+        or float(meta.get("updated_at") or 0) >= cutoff
+    ):
+        return False
+    with _INDEX_LOCK:
+        row = next((r for r in _load_index() if r.get("id") == sid), None)
+        return row is None or (
+            not row.get("pinned")
+            and float(row.get("updated_at") or 0) < cutoff
+        )
+
+
 # Back-compat alias — some code calls get_session() expecting metadata.
 get_session = get_session_meta
 

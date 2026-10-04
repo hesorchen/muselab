@@ -1,6 +1,7 @@
 """Bulk cleanup must respect updates made while an earlier deletion waits."""
 import asyncio
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -24,7 +25,7 @@ def purge_env(app_module, monkeypatch):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("mutation", ["pin", "recent_activity", "none"])
+@pytest.mark.parametrize("mutation", ["pin", "recent_activity", "recent_sdk_cache", "none"])
 async def test_bulk_delete_rechecks_waiting_victim(purge_env, monkeypatch, mutation):
     chat, (blocking, changed, unchanged) = purge_env
     entered = asyncio.Event()
@@ -43,8 +44,25 @@ async def test_bulk_delete_rechecks_waiting_victim(purge_env, monkeypatch, mutat
         await asyncio.wait_for(entered.wait(), timeout=2)
         if mutation == "pin":
             assert chat.sess.set_pin(changed, True) is True
-        elif mutation == "recent_activity":
+        elif mutation in {"recent_activity", "recent_sdk_cache"}:
             assert chat.sess.rename_session(changed, "Recent user update") is True
+            if mutation == "recent_sdk_cache":
+                old = (time.time() - 30 * 86400) * 1000
+                info = SimpleNamespace(
+                    session_id=changed, custom_title="Earlier native title",
+                    first_prompt="Synthetic prompt", tag=None,
+                    created_at=old, last_modified=old,
+                )
+                monkeypatch.setattr(
+                    chat.sess, "sdk_get_session_info",
+                    lambda sid, **_kwargs: info if sid == changed else None,
+                )
+                # A GET between the local rename and SDK mirror caches the
+                # old native mtime. Complete the mirror before deletion resumes.
+                cached = chat.sess.get_session_meta(changed)
+                assert cached["updated_at"] < time.time() - 7 * 86400
+                info.last_modified = time.time() * 1000
+                assert chat.sess.get_session_meta(changed) is cached
         release.set()
         result = await asyncio.wait_for(request, timeout=5)
     finally:
@@ -60,7 +78,7 @@ async def test_bulk_delete_rechecks_waiting_victim(purge_env, monkeypatch, mutat
     if mutation == "pin":
         assert stored is not None and stored["pinned"] is True
         assert not chat.sess.session_is_deleting(changed)
-    elif mutation == "recent_activity":
+    elif mutation in {"recent_activity", "recent_sdk_cache"}:
         assert stored is not None and stored["name"] == "Recent user update"
         assert not chat.sess.session_is_deleting(changed)
     else:
