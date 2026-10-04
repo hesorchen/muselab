@@ -386,6 +386,20 @@ _LIST_REFRESHING: dict[str, bool] = {"v": False}
 _META_CACHE: dict[str, tuple[float, dict]] = {}
 _META_CACHE_TTL_S = 2.0
 _META_CACHE_MAX = 256
+_META_CACHE_LOCK = threading.Lock()
+_META_CACHE_GENERATION = 0
+
+
+def _invalidate_meta_cache(sids: set[str] | None = None) -> None:
+    """Fence in-flight readers while retaining unrelated warm entries."""
+    global _META_CACHE_GENERATION
+    with _META_CACHE_LOCK:
+        _META_CACHE_GENERATION += 1
+        if sids is None:
+            _META_CACHE.clear()
+        else:
+            for sid in sids:
+                _META_CACHE.pop(sid, None)
 
 
 def list_sessions_generation() -> int:
@@ -409,7 +423,7 @@ def invalidate_sessions_cache() -> None:
         _LIST_CACHE["gen"] += 1
         _LIST_CACHE["epoch"] += 1
         _LIST_REFRESHING["v"] = False
-    _META_CACHE.clear()
+    _invalidate_meta_cache()
 
 
 # Parsed-sidecar cache keyed by sid → (file signature, dict). Sidecars are
@@ -823,8 +837,8 @@ def _apply_index_snapshot(items: list[dict]) -> None:
         _LIST_CACHE["data"] = current
         if previous != current:
             _LIST_CACHE["gen"] += 1
-    for sid in changed_ids:
-        _META_CACHE.pop(sid, None)
+    if changed_ids:
+        _invalidate_meta_cache(changed_ids)
 
 
 def _scan_transcript_metadata() -> dict[str, tuple[Any, Path]]:
@@ -1051,9 +1065,11 @@ def get_session_meta(sid: str) -> dict | None:
     Cached per-sid for _META_CACHE_TTL_S; "not found" (None) is never
     cached so a just-created session is visible immediately."""
     now = time.time()
-    hit = _META_CACHE.get(sid)
-    if hit is not None and (now - hit[0]) < _META_CACHE_TTL_S:
-        return hit[1]
+    with _META_CACHE_LOCK:
+        hit = _META_CACHE.get(sid)
+        if hit is not None and (now - hit[0]) < _META_CACHE_TTL_S:
+            return hit[1]
+        generation = _META_CACHE_GENERATION
     idx = _load_index()
     m = next((s for s in idx if s["id"] == sid), None)
     info = None
@@ -1082,9 +1098,13 @@ def get_session_meta(sid: str) -> dict | None:
     else:
         meta = None
     if meta is not None:
-        if len(_META_CACHE) >= _META_CACHE_MAX and sid not in _META_CACHE:
-            _META_CACHE.pop(next(iter(_META_CACHE)), None)
-        _META_CACHE[sid] = (now, meta)
+        with _META_CACHE_LOCK:
+            # A caller can cancel its awaiter while this sync SDK probe keeps
+            # running. Never refill a cache invalidated during that read.
+            if generation == _META_CACHE_GENERATION:
+                if len(_META_CACHE) >= _META_CACHE_MAX and sid not in _META_CACHE:
+                    _META_CACHE.pop(next(iter(_META_CACHE)), None)
+                _META_CACHE[sid] = (now, meta)
     return meta
 
 
