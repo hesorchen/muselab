@@ -116,6 +116,9 @@ dev = [
     # deterministic ruff version. Without this each dev / CI run pulled
     # latest via `uv run --with ruff`, occasionally causing rule churn.
     "ruff>=0.15.20",
+    # CI collects coverage in its existing primary test run; lock the plugin
+    # so worker instrumentation and the later report use the same toolchain.
+    "pytest-cov>=7.1.0",
 ]
 
 # Ruff config — keep targeted, not aggressive. Goal: catch real bugs
