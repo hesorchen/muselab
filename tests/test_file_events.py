@@ -1588,22 +1588,27 @@ async def test_failed_generation_reconciles_only_after_retry_is_armed(
     monkeypatch.setattr(file_events, "_WATCH_RETRY_S", 0)
     manager = file_events.FileWatchManager(store)
     monkeypatch.setattr(manager, "_scan_workspace", guarded_scan)
-    async with manager.subscribe(temp_root):
-        await asyncio.wait_for(second_armed.wait(), timeout=1)
-        state = manager._states[temp_root.resolve()]
-        await asyncio.wait_for(state.reconcile_task, timeout=2)
-        assert generations >= 2
-        assert reconciles == 1
-        assert state.needs_closing_reconcile is False
-        assert "created-in-watch-gap.txt" in {
-            row["path"]
-            for row in store.bootstrap(workspace_id)["entries"]
-        }
-        assert "created-in-watch-gap.txt" in {
-            row["path"]
-            for row in store.delta(workspace_id, baseline)["changes"]
-        }
-    await manager.shutdown()
+    try:
+        async with manager.subscribe(temp_root):
+            await asyncio.wait_for(second_armed.wait(), timeout=1)
+            state = manager._states[temp_root.resolve()]
+            # Retry ordering is checked by guarded_scan above. This task also
+            # performs executor admission and real SQLite I/O beyond 2s on CI.
+            # Keep a bounded deadlock guard without imposing an I/O latency SLA.
+            await asyncio.wait_for(state.reconcile_task, timeout=10)
+            assert generations >= 2
+            assert reconciles == 1
+            assert state.needs_closing_reconcile is False
+            assert "created-in-watch-gap.txt" in {
+                row["path"]
+                for row in store.bootstrap(workspace_id)["entries"]
+            }
+            assert "created-in-watch-gap.txt" in {
+                row["path"]
+                for row in store.delta(workspace_id, baseline)["changes"]
+            }
+    finally:
+        await manager.shutdown()
 
 
 def test_watch_retry_backoff_is_scoped_and_resets_after_stable_generation(
