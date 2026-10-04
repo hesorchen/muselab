@@ -2508,8 +2508,8 @@ MAX_TEXT_SIZE = 2 * 1024 * 1024  # 2 MB — bigger files refuse with 413
 SNIFF_BYTES = 4096                # how much we read to detect NUL bytes
 
 
-def _looks_binary(p: Path) -> bool:
-    """Heuristic: read up to 4 KB, presence of NUL byte → binary. Otherwise
+def _looks_binary(chunk: bytes) -> bool:
+    """Heuristic: a NUL byte in the sniff window → binary. Otherwise
     decode with `errors="replace"` and check how many bytes turned into the
     Unicode replacement character (U+FFFD). High ratio → binary / garbage.
 
@@ -2519,11 +2519,6 @@ def _looks_binary(p: Path) -> bool:
     UnicodeDecodeError purely because of the chunk boundary — wrongly tagged
     binary. `errors="replace"` decodes whatever can be decoded and only the
     truly invalid bytes become U+FFFD."""
-    try:
-        with p.open("rb") as f:
-            chunk = f.read(SNIFF_BYTES)
-    except OSError:
-        return True
     if b"\x00" in chunk:
         return True
     # decode with replacement; count how many chars are the replacement marker
@@ -3081,30 +3076,24 @@ def read_file(
     # Fast reject for known binary extensions.
     if suffix in BINARY_EXT:
         raise HTTPException(status_code=415, detail="binary file — not previewable as text")
-    # Single stat() reused for both the size gate and the empty-file check.
-    # The previous code called target.stat() twice; if the file vanished
-    # between the two calls (TOCTOU) the second stat raised
-    # FileNotFoundError → 500 instead of a clean 404.
+    stream, info = _open_response_file(target)
     try:
-        st_size = target.stat().st_size
-    except OSError:
-        raise HTTPException(status_code=404, detail="not a file") from None
-    if st_size > MAX_TEXT_SIZE:
-        raise HTTPException(status_code=413, detail="file too large for preview")
-    # Empty extension + not a known text name? Sniff content. Empty files OK.
-    # This is the path that picks up .tmpl, .conf.j2, .env.staging, etc.
-    if st_size > 0 and _looks_binary(target):
-        raise HTTPException(status_code=415, detail="binary content — not previewable as text")
-    try:
-        content = target.read_text(encoding="utf-8", errors="replace")
+        with stream:
+            if info.st_size > MAX_TEXT_SIZE:
+                raise HTTPException(status_code=413, detail="file too large for preview")
+            # Sniff and read the same inode. Keep the prefix so the total disk
+            # read stays within the byte cap plus one overflow-detection byte,
+            # even if the file grows after the descriptor's size snapshot.
+            data = stream.read(min(SNIFF_BYTES, MAX_TEXT_SIZE + 1))
+            if _looks_binary(data):
+                raise HTTPException(status_code=415, detail="binary content — not previewable as text")
+            data += stream.read(MAX_TEXT_SIZE + 1 - len(data))
     except (FileNotFoundError, NotADirectoryError, IsADirectoryError):
-        # A concurrent filesystem edit can invalidate the stat/sniff above.
         raise HTTPException(status_code=404, detail="not a file") from None
-    if len(content) > MAX_TEXT_SIZE:
-        raise HTTPException(
-            status_code=413,
-            detail=f"File too large to read as text ({len(content)} bytes > {MAX_TEXT_SIZE})",
-        )
+    if len(data) > MAX_TEXT_SIZE:
+        raise HTTPException(status_code=413, detail="file too large for preview")
+    # Match read_text's UTF-8 replacement and universal-newline behavior.
+    content = data.decode("utf-8", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
     return PlainTextResponse(
         content,
         headers={
