@@ -5,6 +5,7 @@ import ctypes
 import errno
 import fcntl
 import hashlib
+import io
 import heapq
 import os
 import json
@@ -3308,9 +3309,18 @@ async def _require_raw_access(
 def _inject_preview_html_bridge(target: Path) -> str | None:
     """Return HTML with the preview bridge, or None for untouched streaming."""
     try:
-        if target.stat().st_size > _PREVIEW_INJECT_MAX_BYTES:
+        stream, info = _open_response_file(target)
+        with stream:
+            if info.st_size > _PREVIEW_INJECT_MAX_BYTES:
+                return None
+            # A file can grow after fstat. Bound the actual read as well as
+            # the size hint, then fall back to streaming without injection.
+            with io.BufferedReader(stream) as buffered:
+                payload = buffered.read(_PREVIEW_INJECT_MAX_BYTES + 1)
+        if len(payload) > _PREVIEW_INJECT_MAX_BYTES:
             return None
-        html = target.read_text(encoding="utf-8")
+        # Preserve read_text's universal-newline behavior.
+        html = payload.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
     except (OSError, UnicodeDecodeError):
         return None
     lower = html.lower()
