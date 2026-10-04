@@ -7,6 +7,7 @@ import fcntl
 import hashlib
 import io
 import heapq
+from io import TextIOWrapper
 import os
 import json
 import re
@@ -2972,7 +2973,8 @@ def csv_preview(
     rows: list[list[str]] = []
     cols_truncated = False
     try:
-        with target.open("r", encoding="utf-8-sig", errors="replace", newline="") as f:
+        stream, _ = _open_response_file(target)
+        with stream, TextIOWrapper(stream, encoding="utf-8-sig", errors="replace", newline="") as f:
             # Bind the cache to the opened inode, not an earlier path stat. A
             # replacement between stat and open must never receive old cookies.
             signature = _csv_signature(os.fstat(f.fileno()))

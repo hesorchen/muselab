@@ -37,15 +37,21 @@ class _CountLines:
 
 
 def _count_open_lines(monkeypatch, target, counter):
-    original = Path.open
+    from backend import files
 
-    def counted_open(path, *args, **kwargs):
-        handle = original(path, *args, **kwargs)
-        if path == target and args and args[0] == "r":
+    original = files.TextIOWrapper
+    info = target.stat()
+
+    def counted_text(stream, *args, **kwargs):
+        handle = original(stream, *args, **kwargs)
+        opened = os.fstat(stream.fileno())
+        if (opened.st_dev, opened.st_ino) == (info.st_dev, info.st_ino):
             return _CountLines(handle, counter)
         return handle
 
-    monkeypatch.setattr(Path, "open", counted_open)
+    # Observe the real decoded readline calls after the new safe FD open,
+    # rather than silently counting zero because Path.open is no longer used.
+    monkeypatch.setattr(files, "TextIOWrapper", counted_text)
 
 
 @pytest.mark.parametrize("suffix,delimiter", [("csv", ","), ("tsv", "\t")])
@@ -80,7 +86,7 @@ def test_cached_csv_page_resumes_multiline_unicode_records_across_handles(
     assert body["total_rows"] == len(data)
     assert body["delimiter"] == delimiter
     # Count actual consumed lines, not elapsed time: a full parse needs >480.
-    assert counter["lines"] < 32
+    assert 0 < counter["lines"] < 32
 
 
 @pytest.mark.parametrize("line_ending", [b"\n", b"\r", b"\r\n"])
@@ -164,7 +170,7 @@ def test_csv_cache_compacts_checkpoints_and_evicts_files_without_losing_rows(
     assert last.status_code == 200
     assert last.json()["rows"] == [[str(index), f"row-{index}"] for index in range(1997, 2000)]
     assert last.json()["total_rows"] == 2000
-    assert counter["lines"] < 1024
+    assert 0 < counter["lines"] < 1024
     assert client.get("/api/files/csv", params={"path": "cached-6.csv"}, headers=auth).status_code == 200
     with files._CSV_TOTAL_CACHE_LOCK:
         entries = list(files._CSV_TOTAL_CACHE.items())
@@ -175,25 +181,28 @@ def test_csv_cache_compacts_checkpoints_and_evicts_files_without_losing_rows(
 def test_csv_replacement_before_open_uses_new_inode_for_cached_pagination(
     client, auth, temp_root, monkeypatch,
 ):
+    from backend import files
+
     target = temp_root / "replaced.csv"
     target.write_text("id,label\n" + "".join(f"{index},old\n" for index in range(128)))
     assert client.get("/api/files/csv", params={"path": target.name}, headers=auth).json()["total_rows"] == 128
     staged = temp_root / "staged.csv"
     staged.write_text("id,label\n" + "".join(f"{index},new\n" for index in range(256)))
-    original = Path.open
+    original = files._open_response_file
     replaced = False
 
-    def replace_before_open(path, *args, **kwargs):
+    def replace_before_open(path):
         nonlocal replaced
-        if path == target and args and args[0] == "r" and not replaced:
+        if path == target and not replaced:
             replaced = True
             staged.replace(target)
-        return original(path, *args, **kwargs)
+        return original(path)
 
-    monkeypatch.setattr(Path, "open", replace_before_open)
+    monkeypatch.setattr(files, "_open_response_file", replace_before_open)
     response = client.get("/api/files/csv", params={
         "path": target.name, "offset": 200, "limit": 2,
     }, headers=auth)
+    assert replaced
     assert response.status_code == 200
     assert response.json()["total_rows"] == 256
     assert response.json()["rows"] == [["200", "new"], ["201", "new"]]
