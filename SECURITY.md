@@ -21,7 +21,7 @@ inside a workspace. Operate accordingly:
 
 ## What muselab defends against
 
-- `..` traversal and workspace-relative symlinks to locations outside all registered workspaces in file APIs. Actual symlinks may point into another registered workspace; internal-state and sensitive-file exclusions still apply.
+- Workspace-relative `..` traversal and symlinks to locations outside all registered workspaces in file APIs. Actual symlinks may point into another registered workspace; internal-state and sensitive-file exclusions still apply.
 - Reading or overwriting credential-shaped files (`.env*`, SSH private keys, `*.pem`, `credentials.json`, etc.) — blocked even with a valid token
 - Same-origin script access from previewed `.html` / `.svg` / Markdown — raw HTML/SVG use an opaque-origin sandbox and scoped preview tickets, and Markdown passes through DOMPurify before insertion. If the sanitizer is unavailable, the app displays escaped plain text. Previewed scripts may still request external HTTPS resources; the sandbox is not a network-isolation boundary.
 - Token length below 16 characters or `MUSELAB_ROOT` pointing at system paths — refused at startup
