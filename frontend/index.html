@@ -7678,8 +7678,7 @@
         <input class="cmd-palette-input"
                type="text"
                x-model="palette.query"
-               @input="palette.activeIndex = 0"
-               @input.debounce.300ms="_fetchPaletteFiles(); _fetchPaletteMessages();"
+               @input="onPaletteInput()"
                :placeholder="lang==='zh'
                  ? '搜索动作 / 会话 / 文件 / 历史消息…'
                  : 'Search actions / sessions / files / messages…'"
