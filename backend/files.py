@@ -4466,7 +4466,6 @@ def rename(req: RenameReq, root: Path = Depends(_workspace_root)) -> dict:
                 status_code=409, detail="destination parent is not a directory",
             ) from None
         _rename_noreplace(src, dst)
-        _fsync_rename(src.parent, dst.parent)
     return {"ok": True, "path": _logical_relative_path(req.dst).as_posix()}
 
 

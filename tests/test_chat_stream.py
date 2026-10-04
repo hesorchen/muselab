@@ -10,6 +10,7 @@ No real network, no real CLI subprocess, no Anthropic API.
 """
 import asyncio
 import base64
+import errno
 import inspect
 import json
 import threading
@@ -4210,21 +4211,23 @@ def test_replay_spool_rolls_back_partial_enospc(
 
     def partial_then_full(fd, blob):
         nonlocal calls
+        if fd != spool._fd:
+            return real_write(fd, blob)
         calls += 1
         if calls == 1:
             return real_write(fd, blob[:max(1, len(blob) // 2)])
         raise OSError(28, "disk full private detail")
 
     try:
-        monkeypatch.setattr(chat_mod.os, "write", partial_then_full)
-        with pytest.raises(OSError) as failure:
-            spool.append({"event": "done", "data": "{}"})
-        assert failure.value.errno == 28
-        assert spool.size() == 0
-        assert len(spool) == 0
-        assert spool.path.read_bytes() == b""
+        with monkeypatch.context() as fault:
+            fault.setattr(chat_mod.os, "write", partial_then_full)
+            with pytest.raises(OSError) as failure:
+                spool.append({"event": "done", "data": "{}"})
+            assert failure.value.errno == 28
+            assert spool.size() == 0
+            assert len(spool) == 0
+            assert spool.path.read_bytes() == b""
 
-        monkeypatch.setattr(chat_mod.os, "write", real_write)
         spool.append({"event": "done", "data": "{}"})
         assert list(spool) == [{"event": "done", "data": "{}"}]
     finally:
@@ -4237,28 +4240,68 @@ def test_replay_spool_becomes_unusable_when_partial_rollback_fails(
     monkeypatch.setenv("MUSELAB_RUNTIME_DIR", str(tmp_path / "runtime"))
     spool = chat_mod._ReplaySpool()
     real_write = chat_mod.os.write
+    real_ftruncate = chat_mod.os.ftruncate
     calls = 0
 
     def partial_then_enospc(fd, blob):
         nonlocal calls
+        if fd != spool._fd:
+            return real_write(fd, blob)
         calls += 1
         if calls == 1:
             return real_write(fd, blob[:1])
         raise OSError(28, "disk full")
 
-    monkeypatch.setattr(chat_mod.os, "write", partial_then_enospc)
-    monkeypatch.setattr(
-        chat_mod.os, "ftruncate",
-        lambda *_args: (_ for _ in ()).throw(OSError(5, "rollback failed")),
-    )
+    def fail_spool_rollback(fd, length):
+        if fd != spool._fd:
+            return real_ftruncate(fd, length)
+        raise OSError(5, "rollback failed")
+
     try:
-        with pytest.raises(OSError) as failure:
-            spool.append({"event": "done", "data": "{}"})
-        assert failure.value.errno == 28
-        with pytest.raises(RuntimeError, match="unusable"):
-            spool.append({"event": "done", "data": "{}"})
+        with monkeypatch.context() as fault:
+            fault.setattr(chat_mod.os, "write", partial_then_enospc)
+            fault.setattr(chat_mod.os, "ftruncate", fail_spool_rollback)
+            with pytest.raises(OSError) as failure:
+                spool.append({"event": "done", "data": "{}"})
+            assert failure.value.errno == 28
+            with pytest.raises(RuntimeError, match="unusable"):
+                spool.append({"event": "done", "data": "{}"})
     finally:
         spool.close()
+    assert not spool.path.exists()
+    with pytest.raises(OSError) as closed_fd:
+        chat_mod.os.fstat(spool._fd)
+    assert closed_fd.value.errno == errno.EBADF
+
+
+@pytest.mark.parametrize("rollback_fails", [False, True])
+def test_replay_spool_faults_leave_unrelated_file_descriptor_usable(
+        stream_env, monkeypatch, tmp_path, rollback_fails):
+    """Spool fault injection must preserve process-global OS operations."""
+    chat_mod = stream_env
+    original_write_blob = chat_mod._ReplaySpool._write_blob
+    checked = False
+    with (tmp_path / "unrelated-file").open("w+b") as unrelated:
+        def check_unrelated_descriptor(spool, blob):
+            nonlocal checked
+            if not checked:
+                checked = True
+                fd = unrelated.fileno()
+                assert chat_mod.os.write(fd, b"unrelated") == len(b"unrelated")
+                chat_mod.os.ftruncate(fd, 5)
+                chat_mod.os.lseek(fd, 0, chat_mod.os.SEEK_SET)
+                assert chat_mod.os.read(fd, 16) == b"unrel"
+            return original_write_blob(spool, blob)
+
+        monkeypatch.setattr(
+            chat_mod._ReplaySpool, "_write_blob", check_unrelated_descriptor)
+        if rollback_fails:
+            test_replay_spool_becomes_unusable_when_partial_rollback_fails(
+                stream_env, monkeypatch, tmp_path)
+        else:
+            test_replay_spool_rolls_back_partial_enospc(
+                stream_env, monkeypatch, tmp_path)
+    assert checked
 
 
 def test_replay_corruption_is_typed_and_subscriber_resyncs_once(
