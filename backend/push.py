@@ -172,19 +172,27 @@ def get_vapid_public_key() -> str:
     return _ensure_vapid()["public_b64"]
 
 
+class SubscriptionStoreUnavailable(RuntimeError):
+    """The durable device snapshot could not be loaded safely."""
+
+
 def _load_subs() -> None:
     global _subs
     if not _SUBS_FILE:
         return
-    if not _SUBS_FILE.exists():
+    try:
+        snapshot = json.loads(_SUBS_FILE.read_text(encoding="utf-8"))
+    except FileNotFoundError:
         _subs = {}
         return
-    try:
-        d = json.loads(_SUBS_FILE.read_text(encoding="utf-8"))
-        if isinstance(d, dict):
-            _subs = d
-    except Exception:
-        pass
+    except (OSError, ValueError):
+        # A stale cache is not a writable snapshot: persisting it would erase
+        # devices added since the last successful read. Keep disk and cache
+        # intact so a subsequent request can retry the authoritative read.
+        raise SubscriptionStoreUnavailable("push subscription storage unavailable") from None
+    if not isinstance(snapshot, dict):
+        raise SubscriptionStoreUnavailable("push subscription storage unavailable")
+    _subs = snapshot
 
 
 def _save_subs() -> None:
