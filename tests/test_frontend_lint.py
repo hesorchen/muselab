@@ -3085,7 +3085,7 @@ def test_composer_draft_is_per_session_and_async_actions_pin_owner():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
     blank_start = app.index("_blankTabState()")
     blank = app[blank_start:app.index("_ensureTabState(id)", blank_start)]
-    attach_start = app.index("async _attachFile(file)")
+    attach_start = app.index("async _attachFile(file,")
     attach = app[attach_start:app.index("async onAttachPicked", attach_start)]
     editor_start = app.index("async openImageEditor(i)")
     editor = app[editor_start:app.index("openImageGen()", editor_start)]
@@ -3102,8 +3102,13 @@ def test_composer_draft_is_per_session_and_async_actions_pin_owner():
     assert "_activateComposerState(id)" in app
     assert "this._activateComposerState(id)" in app
     assert "if (st.draft._activated === false) return" in app
-    assert attach.index("const ownerSid = this.currentId") < attach.index(
-        "await this._maybeCompressImage")
+    batch = attach[attach.index("async _attachFiles(files)"):]
+    assert batch.index("const ownerSid = this.currentId") < batch.index(
+        "this._attachFile(file, { ownerSid, waitFor: pending })") < batch.index("await pending")
+    assert "ownerSid = this.currentId" in attach
+    assert attach.index("ownerDraft.pendingImages.push(raw)") < attach.index("await waitFor")
+    assert attach.index("ownerDraft.pendingDocs.push(raw)") < attach.index("await waitFor")
+    assert attach.index("await waitFor") < attach.index("await this._maybeCompressImage")
     assert "ownerDraft.pendingImages.push(raw)" in attach
     assert "ownerDraft.pendingDocs.push(raw)" in attach
     assert "this.tabState[ownerSid] === ownerState" in attach
@@ -3119,7 +3124,7 @@ def test_attachment_upload_uses_real_byte_progress_and_renders_percentage():
     css = (FRONTEND / "styles.css").read_text(encoding="utf-8")
 
     helper_start = app.index("_uploadAttachment(fd")
-    helper_end = app.index("async _attachFile(file)", helper_start)
+    helper_end = app.index("async _attachFile(file,", helper_start)
     helper = app[helper_start:helper_end]
     assert "new XMLHttpRequest()" in helper
     assert 'xhr.upload.addEventListener("progress"' in helper
@@ -3127,7 +3132,7 @@ def test_attachment_upload_uses_real_byte_progress_and_renders_percentage():
     assert 'xhr.setRequestHeader(name, value)' in helper
     assert 'signal.addEventListener("abort"' in helper
 
-    attach_start = app.index("async _attachFile(file)")
+    attach_start = app.index("async _attachFile(file,")
     attach_end = app.index("async onAttachPicked", attach_start)
     attach = app[attach_start:attach_end]
     assert "progress: 0, progressKnown: false" in attach
