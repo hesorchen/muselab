@@ -364,10 +364,13 @@ def _normalize_cleanup_intents(raw: Any, tasks: dict[str, Any]) -> dict[str, dic
 
 def _load_state() -> None:
     global _state, _STATE_ERROR
-    if not _STATE_FILE or not _STATE_FILE.exists():
+    if not _STATE_FILE:
         _STATE_ERROR = ""
         return
     try:
+        if not _STATE_FILE.exists():
+            _STATE_ERROR = ""
+            return
         loaded = json.loads(_STATE_FILE.read_text(encoding="utf-8"))
         if not isinstance(loaded, dict):
             raise ValueError("scheduler state root must be an object")
