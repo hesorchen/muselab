@@ -28,10 +28,11 @@ def test_probe_deadline_returns_partial_results_and_reuses_inflight(monkeypatch)
         assert first[0]['pending'] and second[0]['pending']
         assert first[1]['result'] == {'mcpServers': []}
         assert calls == 1 and not cancelled
+        pool = mcp_probes._pools[asyncio.get_running_loop()]
         release.set()
         await asyncio.sleep(0)
         await asyncio.sleep(0)
-        assert not mcp_probes._pools[asyncio.get_running_loop()].tasks
+        assert not pool.tasks
     asyncio.run(run())
 
 

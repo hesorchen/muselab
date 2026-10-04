@@ -45,6 +45,10 @@ async def probe_clients(live: list, operation: str, *args: Any) -> list[dict]:
             def release(done, ident=identity):
                 if pool.tasks.get(ident) is done:
                     pool.tasks.pop(ident, None)
+                # A contended semaphore points back to its loop, so weak keys
+                # alone cannot collect an empty pool after that loop closes.
+                if not pool.tasks and _pools.get(loop) is pool:
+                    _pools.pop(loop, None)
                 if not done.cancelled():
                     done.exception()  # Always retrieve detached failures.
             task.add_done_callback(release)
