@@ -1332,16 +1332,7 @@
               <div class="xlsx-scroll" x-show="sh.rows && sh.rows.length"
                    @scroll.passive="onPreviewViewportScroll()">
                 <table class="xlsx-table" :style="'zoom:' + previewZoom">
-                  <tbody>
-                    <template x-for="(row, ri) in sh.rows" :key="ri">
-                      <tr>
-                        <td class="xlsx-rownum" x-text="ri + 1"></td>
-                        <template x-for="(cell, ci) in row" :key="ci">
-                          <td x-text="cell" :title="cell"></td>
-                        </template>
-                      </tr>
-                    </template>
-                  </tbody>
+                  <tbody x-effect="_renderSpreadsheetRows($el, sh.rows || [])"></tbody>
                 </table>
               </div>
               <div class="xlsx-meta" x-show="sh.rows_truncated || sh.cols_truncated">
@@ -1380,25 +1371,10 @@
                @scroll.passive="onPreviewViewportScroll()"
                x-show="csvData && csvData.rows && csvData.rows.length">
             <table class="xlsx-table" :style="'zoom:' + previewZoom">
-              <thead x-show="csvData && csvData.has_header && csvData.header && csvData.header.length">
-                <tr>
-                  <th class="xlsx-rownum"></th>
-                  <template x-for="(h, ci) in (csvData && csvData.header || [])" :key="ci">
-                    <th x-text="h" :title="h"></th>
-                  </template>
-                </tr>
-              </thead>
-              <tbody>
-                <template x-for="(row, ri) in (csvData && csvData.rows || [])" :key="ri">
-                  <tr>
-                    <td class="xlsx-rownum"
-                        x-text="csvOffset + ri + 1"></td>
-                    <template x-for="(cell, ci) in row" :key="ci">
-                      <td x-text="cell" :title="cell"></td>
-                    </template>
-                  </tr>
-                </template>
-              </tbody>
+              <thead x-show="csvData && csvData.has_header && csvData.header && csvData.header.length"
+                     x-effect="_renderSpreadsheetRows($el,
+                       csvData && csvData.header && csvData.header.length ? [csvData.header] : [], 0, true)"></thead>
+              <tbody x-effect="_renderSpreadsheetRows($el, csvData && csvData.rows || [], csvOffset)"></tbody>
             </table>
           </div>
           <div class="empty table-empty"

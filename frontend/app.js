@@ -28350,6 +28350,34 @@ function portal() {
       }
       return loadOk;
     },
+    _renderSpreadsheetRows(element, rows, rowOffset = 0, header = false) {
+      // Preview responses replace read-only row matrices as a whole. One
+      // effect per grid avoids tens of thousands of cell-level bindings that
+      // block painting on a supported 500 × 50 worksheet.
+      const fragment = document.createDocumentFragment();
+      const tag = header ? "th" : "td";
+      const values = _rawAlpine(rows) || [];
+      for (let index = 0; index < values.length; index++) {
+        const row = document.createElement("tr");
+        const number = document.createElement(tag);
+        number.className = "xlsx-rownum";
+        number.textContent = header ? "" : rowOffset + index + 1;
+        row.appendChild(number);
+        for (const value of values[index]) {
+          const cell = document.createElement(tag);
+          // Match x-text's native DOM conversion and x-bind:title's removal
+          // of null/undefined/false. Cell contents never become markup.
+          cell.textContent = value;
+          if (value != null && value !== false) cell.title = value;
+          row.appendChild(cell);
+        }
+        fragment.appendChild(row);
+      }
+      // These plain nodes have no Alpine effects or listeners to clean up.
+      // Keep its observer from walking the entire grid during each replacement;
+      // the surrounding tbody/thead effect keeps its normal Alpine lifecycle.
+      Alpine.mutateDom(() => element.replaceChildren(fragment));
+    },
     async csvLoadPage(requestedOffset = this.csvOffset) {
       if (!this.csvPath) return false;
       // A newly-opened CSV must supersede an older in-flight CSV instead of
