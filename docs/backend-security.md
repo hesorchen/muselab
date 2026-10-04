@@ -40,7 +40,7 @@ Only a SHA-256 digest of the ticket is stored. Redemption is bound to the termin
 
 ### Files API
 
-Every Files API request is bound to the default or a registered workspace. Paths are normalized and must remain inside the selected root; symlink targets must also stay inside it. Sensitive names, NUL bytes, and direct writes into the dustbin are rejected.
+Every Files API request is bound to the default or a registered workspace. Workspace-relative paths are normalized and reject `..` components. Actual symlinks may target the selected root or another registered workspace; targets outside all registered workspaces are rejected. Internal-state and sensitive-file exclusions still apply. NUL bytes and direct writes into the dustbin are rejected.
 
 Workspace registration is not service-user isolation. Register only directories you intend to expose through the UI.
 
