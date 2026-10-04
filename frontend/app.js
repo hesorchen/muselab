@@ -612,6 +612,8 @@ function portal() {
     _terminalTouchWheelDispatching: false,
     _terminalReconnectTimer: null,
     _terminalConnectSeq: 0,
+    _terminalTicketAbort: null,
+    _terminalTicketTimeoutMs: 8000,
     _terminalSelectionCleanup: null,
     _terminalLoadPromise: null,
     TERMINAL_SCROLLBACK_MOBILE: 3000,
@@ -27637,6 +27639,39 @@ function portal() {
         this._terminalTouchCleanup = null;
       };
     },
+    async _requestTerminalTicket(id, headers, signal) {
+      let response, data;
+      try {
+        await this._fetchWithDeadline(
+          `/api/terminals/${id}/ticket`, { method: "POST", headers, signal },
+          Math.max(100, Number(this._terminalTicketTimeoutMs) || 8000),
+          async incoming => {
+            response = incoming;
+            // These statuses cannot recover by minting another ticket. Do not
+            // wait on a stalled error body before reporting the HTTP failure.
+            if ([401, 403, 404].includes(incoming.status)) {
+              try { void incoming.body?.cancel()?.catch(() => {}); } catch (_) {}
+              return;
+            }
+            try { data = await incoming.json(); }
+            catch (error) {
+              if (error.name !== "SyntaxError") throw error;
+              data = null;
+            }
+          },
+        );
+      } catch (error) {
+        // Preserve an HTTP failure received before its body stalled. A timeout
+        // on otherwise successful headers is a transport failure and may retry.
+        const status = response && !response.ok ? response.status : 0;
+        return { ok: false, status, error: status ? `HTTP ${status}` : error.message };
+      }
+      if (!response.ok) {
+        return { ok: false, status: response.status,
+          error: data?.detail || response.statusText || `HTTP ${response.status}` };
+      }
+      return { ok: true, status: response.status, data };
+    },
     async openTerminal(id, { reconnect = false, reveal = true } = {}) {
       const row = this.terminals.find(item => item.id === id);
       if (!row) return;
@@ -27648,6 +27683,7 @@ function portal() {
         && this.activeTerminalId === id && this.previewSurface === "terminal"
         && this._workspaceIsCurrent(ownerWorkspace);
       let connectionTerm = null;
+      let ticketController = null;
       this.activeTerminalId = id;
       this.previewSurface = "terminal";
       this.terminalManagerOpen = false;
@@ -27772,16 +27808,20 @@ function portal() {
         });
         if (reveal || !this._isMobileLayout()) term.focus();
 
+        this._terminalTicketAbort = new AbortController();
+        ticketController = this._terminalTicketAbort;
+        const ownsTicket = () => ownsTerminal()
+          && this._terminalTicketAbort === ticketController
+          && !ticketController.signal.aborted;
         let ticketResponse;
         for (let attempt = 0; attempt < 3; attempt += 1) {
-          if (!ownsTerminal()) return;
+          if (!ownsTicket()) return;
           // Only mint a fresh connection ticket: retrying must never allocate
           // another PTY or restart the process after a transient proxy failure.
-          ticketResponse = await this.api(`/api/terminals/${id}/ticket`, {
-            method: "POST",
-            headers: requestHeaders,
-          });
-          if (!ownsTerminal()) return;
+          ticketResponse = await this._requestTerminalTicket(
+            id, requestHeaders, ticketController.signal,
+          );
+          if (!ownsTicket()) return;
           if (ticketResponse.ok) break;
           const transient = [0, 502, 503, 504].includes(ticketResponse.status);
           if (!transient || attempt === 2) {
@@ -27790,7 +27830,7 @@ function portal() {
           this.terminalConnection = reconnect ? "reconnecting" : "connecting";
           await new Promise(resolve => setTimeout(resolve, attempt === 0 ? 250 : 750));
         }
-        if (!ownsTerminal()) return;
+        if (!ownsTicket()) return;
         const scheme = location.protocol === "https:" ? "wss:" : "ws:";
         const socket = new WebSocket(
           `${scheme}//${location.host}/api/terminals/${encodeURIComponent(id)}/ws`,
@@ -27854,10 +27894,17 @@ function portal() {
         this.terminalConnection = "error";
         this.toast((this.lang === "zh" ? "终端连接失败：" : "Terminal connection failed: ")
           + error.message, "error");
+      } finally {
+        if (ticketController && this._terminalTicketAbort === ticketController) {
+          this._terminalTicketAbort = null;
+        }
       }
     },
     _teardownTerminalView() {
       ++this._terminalConnectSeq;
+      const ticketController = this._terminalTicketAbort;
+      this._terminalTicketAbort = null;
+      if (ticketController) ticketController.abort();
       clearTimeout(this._terminalReconnectTimer);
       this._terminalReconnectTimer = null;
       if (this._terminalResizeObserver) this._terminalResizeObserver.disconnect();
