@@ -436,169 +436,170 @@ async def _lifespan(app: FastAPI):
     from . import push as _push
     from . import memory_client as _mem0
     from .workspaces import registry as _workspace_registry
-    # Historical releases inherited the process umask for internal state.
-    # Repair permissions only once test fixtures and the workspace registry
-    # have selected their final runtime paths.
-    private_roots = {ROOT, *_workspace_registry.paths()}
-    await _asyncio.gather(
-        _asyncio.to_thread(_sess.ensure_private_session_storage),
-        _asyncio.to_thread(_chat.ensure_private_attachment_storage),
-        *(
-            _asyncio.to_thread(
-                _files.ensure_private_trash_storage, root, create=False)
-            for root in private_roots
-        ),
-        _asyncio.to_thread(_activity.initialize_runtime_state),
-        _asyncio.to_thread(_todos.initialize_runtime_state),
-    )
-    repaired_fork_activity = await _asyncio.to_thread(
-        _activity.reconcile_fork_sessions)
-    if repaired_fork_activity:
-        sys.stderr.write(
-            f"[muselab] restored {repaired_fork_activity} fork activity row(s) on startup\n")
-        sys.stderr.flush()
-    # Older releases allowed a successor CLI's synthetic ``stopped`` record to
-    # overwrite the predecessor's real terminal state. Repair each runtime
-    # chain from its oldest owner before applying restart recovery, so a true
-    # completed task is never relabelled stopped merely because the process
-    # restarted later.
-    repaired_runtime_tasks = await _asyncio.to_thread(
-        _sess.reconcile_runtime_task_overlay_chains)
-    if repaired_runtime_tasks:
-        sys.stderr.write(
-            f"[muselab] repaired {repaired_runtime_tasks} inherited runtime "
-            "task overlay(s) on startup\n")
-        sys.stderr.flush()
-
-    # Runtime-rollover task cards are durable UI overlays, but their owning
-    # CLI process and watcher are intentionally process-local.  After a
-    # service restart there is therefore no legitimate way for a persisted
-    # ``running`` overlay to still be alive.  Settle those rows before serving
-    # requests so a successor tab cannot poll forever for an owner that no
-    # longer exists.
-    stale_runtime_tasks = await _asyncio.to_thread(
-        _sess.stop_stale_runtime_task_overlays)
-    if stale_runtime_tasks:
-        sys.stderr.write(
-            f"[muselab] stopped {stale_runtime_tasks} stale runtime task "
-            "overlay(s) on startup\n")
-        sys.stderr.flush()
-    try:
-        # Run the fail-closed queue sweep before starting any optional service.
-        # In particular, scheduler catch-up can launch work immediately; it
-        # must never overlap an incomplete queue reconciliation.
-        recovered = await _recover_message_queues_at_startup(_sess)
-        await _asyncio.to_thread(
-            _chat.recover_durable_queue_attachments_at_startup,
-            _sess,
-        )
-    except Exception as exc:
-        sys.stderr.write(
-            "[muselab] queue recovery incomplete; refusing startup "
-            f"exc={type(exc).__name__}\n")
-        sys.stderr.flush()
-        raise RuntimeError(
-            "message queue recovery was not durably completed"
-        ) from None
-    if recovered:
-        sys.stderr.write(
-            f"[muselab] recovered {recovered} message queue(s) "
-            "on startup\n")
-        sys.stderr.flush()
-    # A hidden background-task owner can finish its Agent continuation just
-    # before the process exits.  The private READY outbox survives that crash;
-    # resume its presentation-only delivery to the latest visible successor.
-    # Scheduling is non-blocking. Queue recovery has isolated stale claims;
-    # the drain flushes READY projections before it starts another turn.
-    from . import chat as _chat
-    recovered_continuations = await (
-        _chat.recover_runtime_continuation_outboxes_at_startup()
-    )
-    if recovered_continuations:
-        sys.stderr.write(
-            f"[muselab] resumed {recovered_continuations} pending runtime "
-            "continuation delivery task(s) on startup\n"
-        )
-        sys.stderr.flush()
-    await _start_optional_services(_sched, _push, _mem0)
-    # Prune empty sessions + auto-purge expired trash. Both used to block
-    # lifespan before yield (50-300 ms total on archives with many
-    # sessions / a populated trash dir), pushing first-request TTFB out.
-    # Moved to background tasks (2026-05-28) — neither is user-visible at
-    # boot: a stray empty session in the list for ~1s, or a couple of
-    # >30-day trash items not yet cleaned, are both no-ops from the user's
-    # POV. `asyncio.to_thread` runs the sync IO off the event loop so a
-    # slow disk doesn't stall concurrent requests either.
-    async def _bg_prune_sessions() -> None:
-        try:
-            from . import sessions as _sess_mod
-            pruned = await _asyncio.to_thread(_sess_mod.prune_empty_sessions)
-            if pruned:
-                sys.stderr.write(
-                    f"[muselab] pruned {len(pruned)} empty session(s) on startup\n")
-                sys.stderr.flush()
-        except Exception as _e:
-            sys.stderr.write(f"[muselab] startup prune failed (non-fatal): {_e}\n")
-            sys.stderr.flush()
-
-    async def _bg_purge_trash() -> None:
-        try:
-            from . import files as _files_mod
-            from .workspaces import registry as _workspace_registry
-            purged = 0
-            for root in _workspace_registry.paths():
-                purged += await _asyncio.to_thread(
-                    _files_mod.auto_purge_expired_trash, root)
-            if purged:
-                sys.stderr.write(
-                    f"[muselab] auto-purged {purged} expired trash item(s) "
-                    f"(> {_files_mod._TRASH_TTL_DAYS}d old)\n")
-                sys.stderr.flush()
-        except Exception as _e:
-            sys.stderr.write(
-                f"[muselab] trash auto-purge failed (non-fatal): {_e}\n")
-            sys.stderr.flush()
-
-    async def _bg_warm_versions() -> None:
-        # Version detection runs a `claude --version` subprocess (up to 3s).
-        # It used to run at import time (`_VERSIONS = _detect_versions()`),
-        # blocking module load — and thus uvicorn cold start — for up to 3s.
-        # Now lru_cache'd + warmed here off the event loop, so import is
-        # unblocked and the first /api/meta is instant. (perf: RED —
-        # main.py _detect_versions import-time block)
-        try:
-            v = await _asyncio.to_thread(_detect_versions)
-            print(f"[muselab] versions: muselab={v['muselab_version']} "
-                  f"sdk={v['sdk_version']} cli={v['cli_version']} "
-                  f"py={v['python_version']}",
-                  file=sys.stderr, flush=True)
-        except Exception as _e:
-            sys.stderr.write(
-                f"[muselab] version detect failed (non-fatal): {_e}\n")
-            sys.stderr.flush()
-
-    # Keep strong references to fire-and-forget tasks. asyncio only holds a
-    # weak reference to a task, so a bare `create_task(...)` whose result is
-    # discarded can be garbage-collected mid-run, silently cancelling the
-    # background work. Stash them on a module-level set and drop each one
-    # when it finishes so the set doesn't grow unbounded.
-    _launch_background_tasks((
-        _monitor_event_loop_lag(),
-        _bg_prune_sessions(),
-        _bg_purge_trash(),
-        _bg_warm_versions(),
-        _backfill_turn_counts(),
-    ))
-    # Same fire-and-forget pattern: rewrite turn_count for any session
-    # written by the old algorithm. Gated by a sentinel file so reruns
-    # are cheap; first run can take a few seconds on archives with
-    # hundreds of sessions.
     from .terminal import manager as _terminal_manager
     from .file_events import manager as _file_watch_manager
-    await _start_workspace_index(_file_watch_manager)
-    await _terminal_manager.start()
-    start_diagnostics()
+    lifespan_failure: BaseException | None = None
     try:
+        # Historical releases inherited the process umask for internal state.
+        # Repair permissions only once test fixtures and the workspace registry
+        # have selected their final runtime paths.
+        private_roots = {ROOT, *_workspace_registry.paths()}
+        await _asyncio.gather(
+            _asyncio.to_thread(_sess.ensure_private_session_storage),
+            _asyncio.to_thread(_chat.ensure_private_attachment_storage),
+            *(
+                _asyncio.to_thread(
+                    _files.ensure_private_trash_storage, root, create=False)
+                for root in private_roots
+            ),
+            _asyncio.to_thread(_activity.initialize_runtime_state),
+            _asyncio.to_thread(_todos.initialize_runtime_state),
+        )
+        repaired_fork_activity = await _asyncio.to_thread(
+            _activity.reconcile_fork_sessions)
+        if repaired_fork_activity:
+            sys.stderr.write(
+                f"[muselab] restored {repaired_fork_activity} fork activity row(s) on startup\n")
+            sys.stderr.flush()
+        # Older releases allowed a successor CLI's synthetic ``stopped`` record to
+        # overwrite the predecessor's real terminal state. Repair each runtime
+        # chain from its oldest owner before applying restart recovery, so a true
+        # completed task is never relabelled stopped merely because the process
+        # restarted later.
+        repaired_runtime_tasks = await _asyncio.to_thread(
+            _sess.reconcile_runtime_task_overlay_chains)
+        if repaired_runtime_tasks:
+            sys.stderr.write(
+                f"[muselab] repaired {repaired_runtime_tasks} inherited runtime "
+                "task overlay(s) on startup\n")
+            sys.stderr.flush()
+
+        # Runtime-rollover task cards are durable UI overlays, but their owning
+        # CLI process and watcher are intentionally process-local.  After a
+        # service restart there is therefore no legitimate way for a persisted
+        # ``running`` overlay to still be alive.  Settle those rows before serving
+        # requests so a successor tab cannot poll forever for an owner that no
+        # longer exists.
+        stale_runtime_tasks = await _asyncio.to_thread(
+            _sess.stop_stale_runtime_task_overlays)
+        if stale_runtime_tasks:
+            sys.stderr.write(
+                f"[muselab] stopped {stale_runtime_tasks} stale runtime task "
+                "overlay(s) on startup\n")
+            sys.stderr.flush()
+        try:
+            # Run the fail-closed queue sweep before starting any optional service.
+            # In particular, scheduler catch-up can launch work immediately; it
+            # must never overlap an incomplete queue reconciliation.
+            recovered = await _recover_message_queues_at_startup(_sess)
+            await _asyncio.to_thread(
+                _chat.recover_durable_queue_attachments_at_startup,
+                _sess,
+            )
+        except Exception as exc:
+            sys.stderr.write(
+                "[muselab] queue recovery incomplete; refusing startup "
+                f"exc={type(exc).__name__}\n")
+            sys.stderr.flush()
+            raise RuntimeError(
+                "message queue recovery was not durably completed"
+            ) from None
+        if recovered:
+            sys.stderr.write(
+                f"[muselab] recovered {recovered} message queue(s) "
+                "on startup\n")
+            sys.stderr.flush()
+        # A hidden background-task owner can finish its Agent continuation just
+        # before the process exits.  The private READY outbox survives that crash;
+        # resume its presentation-only delivery to the latest visible successor.
+        # Scheduling is non-blocking. Queue recovery has isolated stale claims;
+        # the drain flushes READY projections before it starts another turn.
+        from . import chat as _chat
+        recovered_continuations = await (
+            _chat.recover_runtime_continuation_outboxes_at_startup()
+        )
+        if recovered_continuations:
+            sys.stderr.write(
+                f"[muselab] resumed {recovered_continuations} pending runtime "
+                "continuation delivery task(s) on startup\n"
+            )
+            sys.stderr.flush()
+        await _start_optional_services(_sched, _push, _mem0)
+        # Prune empty sessions + auto-purge expired trash. Both used to block
+        # lifespan before yield (50-300 ms total on archives with many
+        # sessions / a populated trash dir), pushing first-request TTFB out.
+        # Moved to background tasks (2026-05-28) — neither is user-visible at
+        # boot: a stray empty session in the list for ~1s, or a couple of
+        # >30-day trash items not yet cleaned, are both no-ops from the user's
+        # POV. `asyncio.to_thread` runs the sync IO off the event loop so a
+        # slow disk doesn't stall concurrent requests either.
+        async def _bg_prune_sessions() -> None:
+            try:
+                from . import sessions as _sess_mod
+                pruned = await _asyncio.to_thread(_sess_mod.prune_empty_sessions)
+                if pruned:
+                    sys.stderr.write(
+                        f"[muselab] pruned {len(pruned)} empty session(s) on startup\n")
+                    sys.stderr.flush()
+            except Exception as _e:
+                sys.stderr.write(f"[muselab] startup prune failed (non-fatal): {_e}\n")
+                sys.stderr.flush()
+
+        async def _bg_purge_trash() -> None:
+            try:
+                from . import files as _files_mod
+                from .workspaces import registry as _workspace_registry
+                purged = 0
+                for root in _workspace_registry.paths():
+                    purged += await _asyncio.to_thread(
+                        _files_mod.auto_purge_expired_trash, root)
+                if purged:
+                    sys.stderr.write(
+                        f"[muselab] auto-purged {purged} expired trash item(s) "
+                        f"(> {_files_mod._TRASH_TTL_DAYS}d old)\n")
+                    sys.stderr.flush()
+            except Exception as _e:
+                sys.stderr.write(
+                    f"[muselab] trash auto-purge failed (non-fatal): {_e}\n")
+                sys.stderr.flush()
+
+        async def _bg_warm_versions() -> None:
+            # Version detection runs a `claude --version` subprocess (up to 3s).
+            # It used to run at import time (`_VERSIONS = _detect_versions()`),
+            # blocking module load — and thus uvicorn cold start — for up to 3s.
+            # Now lru_cache'd + warmed here off the event loop, so import is
+            # unblocked and the first /api/meta is instant. (perf: RED —
+            # main.py _detect_versions import-time block)
+            try:
+                v = await _asyncio.to_thread(_detect_versions)
+                print(f"[muselab] versions: muselab={v['muselab_version']} "
+                      f"sdk={v['sdk_version']} cli={v['cli_version']} "
+                      f"py={v['python_version']}",
+                      file=sys.stderr, flush=True)
+            except Exception as _e:
+                sys.stderr.write(
+                    f"[muselab] version detect failed (non-fatal): {_e}\n")
+                sys.stderr.flush()
+
+        # Keep strong references to fire-and-forget tasks. asyncio only holds a
+        # weak reference to a task, so a bare `create_task(...)` whose result is
+        # discarded can be garbage-collected mid-run, silently cancelling the
+        # background work. Stash them on a module-level set and drop each one
+        # when it finishes so the set doesn't grow unbounded.
+        _launch_background_tasks((
+            _monitor_event_loop_lag(),
+            _bg_prune_sessions(),
+            _bg_purge_trash(),
+            _bg_warm_versions(),
+            _backfill_turn_counts(),
+        ))
+        # Same fire-and-forget pattern: rewrite turn_count for any session
+        # written by the old algorithm. Gated by a sentinel file so reruns
+        # are cheap; first run can take a few seconds on archives with
+        # hundreds of sessions.
+        await _start_workspace_index(_file_watch_manager)
+        await _terminal_manager.start()
+        start_diagnostics()
         # All queue/attachment recovery and runtime projections are committed.
         # Resume only unstarted items; review-only records cannot be claimed.
         _chat._queue_runtime_closing = False
@@ -609,18 +610,38 @@ async def _lifespan(app: FastAPI):
             if _sess.queue_pending_items(queue):
                 _chat._schedule_queue_drain(sid)
         yield
+    except BaseException as exc:
+        lifespan_failure = exc
+        raise
     finally:
         from .runtime_lifecycle import shutdown_runtime
-        await shutdown_runtime(
-            _BG_TASKS,
-            scheduler=_sched,
-            memory=_mem0,
-            terminal=_terminal_manager,
-            file_watcher=_file_watch_manager,
+        cleanup_failure: Exception | None = None
+        # Acquire all lifecycle owners before the first startup await. Cleanup
+        # also applies to partial startup, and each remaining step must run if
+        # an earlier one fails without replacing the original boot failure.
+        cleanup_steps = (
+            ("runtime", lambda: shutdown_runtime(
+                _BG_TASKS,
+                scheduler=_sched,
+                memory=_mem0,
+                terminal=_terminal_manager,
+                file_watcher=_file_watch_manager,
+            )),
+            ("uploads", _files.cleanup_pending_uploads),
+            ("diagnostics", lambda: asyncio.to_thread(stop_diagnostics)),
         )
-        from .files import cleanup_pending_uploads
-        await cleanup_pending_uploads()
-        await asyncio.to_thread(stop_diagnostics)
+        for label, cleanup in cleanup_steps:
+            try:
+                await cleanup()
+            except Exception as exc:
+                if cleanup_failure is None:
+                    cleanup_failure = exc
+                sys.stderr.write(
+                    f"[muselab] {label} cleanup failed exc={type(exc).__name__}\n"
+                )
+                sys.stderr.flush()
+        if lifespan_failure is None and cleanup_failure is not None:
+            raise cleanup_failure
 
 
 async def _backfill_turn_counts() -> None:

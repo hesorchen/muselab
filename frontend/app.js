@@ -1021,6 +1021,9 @@ function portal() {
     IME_STALE_AFTER_MS: 5000,
     _fileMetaCache: new Map(),
     _paletteFileSeq: 0,
+    _paletteFileAbort: null,
+    _paletteSearchTimer: null,
+    _paletteSearchGeneration: 0,
     _sessionsInitialized: false,
     _sessionInitPromise: null,
     _sessionListPullPromise: null,
@@ -14457,7 +14460,7 @@ function portal() {
       ++this._selectedMetaSeq;
       ++this._trashLoadSeq;
       this._cancelMentionLookup();
-      ++this._paletteFileSeq;
+      this._cancelPaletteFileSearch();
       this.palette.fileResults = [];
       this.palette.fileQuery = "";
       this.palette.fileLoading = false;
@@ -37070,7 +37073,7 @@ function portal() {
 
     // ===== command palette =====
     openPalette() {
-      this._cancelPaletteMessageSearch();
+      this._cancelPaletteSearch();
       this.palette.query = "";
       this.palette.activeIndex = 0;
       this.palette.fileResults = [];
@@ -37083,16 +37086,49 @@ function portal() {
         if (el) el.focus();
       });
     },
+    onPaletteInput() {
+      this.palette.activeIndex = 0;
+      if (this._paletteSearchTimer !== null) clearTimeout(this._paletteSearchTimer);
+      this._paletteSearchTimer = null;
+      if (!this.palette.show) return;
+      const generation = this._paletteSearchGeneration;
+      const query = this.palette.query.trim();
+      const timer = setTimeout(() => {
+        if (this._paletteSearchTimer !== timer) return;
+        this._paletteSearchTimer = null;
+        if (!this.palette.show || generation !== this._paletteSearchGeneration
+            || this.palette.query.trim() !== query) return;
+        this._fetchPaletteFiles();
+        this._fetchPaletteMessages();
+      }, 300);
+      this._paletteSearchTimer = timer;
+    },
+    _cancelPaletteSearch() {
+      ++this._paletteSearchGeneration;
+      if (this._paletteSearchTimer !== null) clearTimeout(this._paletteSearchTimer);
+      this._paletteSearchTimer = null;
+      this._cancelPaletteFileSearch();
+      this._cancelPaletteMessageSearch();
+    },
+    _cancelPaletteFileSearch() {
+      ++this._paletteFileSeq;
+      const controller = this._paletteFileAbort;
+      this._paletteFileAbort = null;
+      this.palette.fileLoading = false;
+      if (controller) controller.abort();
+    },
     _cancelPaletteMessageSearch() {
       if (this._paletteMessageAbort) this._paletteMessageAbort.abort();
       this._paletteMessageAbort = null;
       this.palette.messageLoading = false;
     },
     closePalette() {
-      this._cancelPaletteMessageSearch();
+      this._cancelPaletteSearch();
       this.palette.show = false;
     },
     async _fetchPaletteMessages() {
+      if (!this.palette.show) return;
+      const generation = this._paletteSearchGeneration;
       const q = this.palette.query.trim();
       if (q === this.palette.messageQuery && q.length >= 2) return;
       this._cancelPaletteMessageSearch();
@@ -37103,6 +37139,7 @@ function portal() {
       this._paletteMessageAbort = controller;
       this.palette.messageLoading = true;
       const owns = () => this._paletteMessageAbort === controller
+        && this.palette.show && generation === this._paletteSearchGeneration
         && this.palette.query.trim() === q;
       try {
         const r = await fetch(
@@ -37151,29 +37188,36 @@ function portal() {
       }
     },
     // Fetch files matching the current palette query against the whole
-    // workspace (not just loaded tree rows). Called from the palette input's
-    // debounced @input. Idempotent — skips if the query hasn't changed.
+    // workspace (not just loaded tree rows). Called by the palette's scheduled
+    // input search. Idempotent — skips if the query hasn't changed.
     async _fetchPaletteFiles() {
+      if (!this.palette.show) return;
+      const generation = this._paletteSearchGeneration;
       const q = this.palette.query.trim();
       if (q.length < 2) {
-        ++this._paletteFileSeq;
+        this._cancelPaletteFileSearch();
         this.palette.fileResults = [];
         this.palette.fileQuery = "";
         this.palette.fileLoading = false;
         return;
       }
       if (q === this.palette.fileQuery) return;
+      this._cancelPaletteFileSearch();
+      const controller = new AbortController();
+      this._paletteFileAbort = controller;
       const requestSeq = ++this._paletteFileSeq;
       this.palette.fileQuery = q;
       this.palette.fileLoading = true;
       const ownerWorkspace = this.fileWorkspacePath();
       const isOwner = () => requestSeq === this._paletteFileSeq
+        && this._paletteFileAbort === controller
+        && this.palette.show && generation === this._paletteSearchGeneration
         && this._workspaceIsCurrent(ownerWorkspace)
         && this.palette.query.trim() === q;
       try {
         const r = await fetch(
           "/api/files/search?q=" + encodeURIComponent(q) + "&limit=30",
-          { headers: this.fileHdr() });
+          { headers: this.fileHdr(), signal: controller.signal });
         if (!isOwner()) return;
         if (!r.ok) { this.palette.fileResults = []; return; }
         const data = await r.json();
@@ -37186,7 +37230,8 @@ function portal() {
         if (isOwner()) this.palette.fileResults = [];
       } finally {
         if (requestSeq === this._paletteFileSeq
-            && this._workspaceIsCurrent(ownerWorkspace)) {
+            && this._paletteFileAbort === controller) {
+          this._paletteFileAbort = null;
           this.palette.fileLoading = false;
         }
       }

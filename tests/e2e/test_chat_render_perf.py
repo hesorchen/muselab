@@ -11232,6 +11232,7 @@ def test_palette_search_cancels_old_work_without_clobbering_new_results(
 ):
     _login(page, backend_url, auth_token)
     result = _app_eval(page, r'''
+        app.openPalette();
         const originalFetch = window.fetch;
         const requests = [];
         window.fetch = (url, options) => {

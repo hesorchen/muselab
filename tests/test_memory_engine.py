@@ -1211,26 +1211,35 @@ def test_first_ui_read_initializes_existing_empty_registry(tmp_path, monkeypatch
     asyncio.run(scenario())
 
 
-def test_expired_lexical_sql_releases_recall_actor_for_dense_hydration(recall_case, monkeypatch):
-    """Timing out the waiter must also stop SQL ahead of dense hydration."""
-    instance, cfg, memory, _ = recall_case
+def test_expired_lexical_sql_interrupts_and_lexical_actor_recovers(recall_case, monkeypatch):
+    """Expired SQL must stop its worker and leave the lexical actor usable."""
+    instance, _, memory, _ = recall_case
     store = instance._resolve_lexical_store()
     interrupts = []
+    worker_finished = threading.Event()
+    guard_fired = threading.Event()
 
     def expensive_lexical(*args, **kwargs):
-        with store._connect() as conn:
-            # A guard bounds the pre-fix failure; it is not the query budget.
-            guard = threading.Timer(1.0, conn.interrupt)
-            guard.start()
-            try:
-                conn.execute("""WITH RECURSIVE n(x) AS (
-                    VALUES(0) UNION ALL SELECT x+1 FROM n WHERE x<100000000
-                ) SELECT sum(x) FROM n""").fetchone()
-            except sqlite3.OperationalError as exc:
-                interrupts.append(getattr(exc, "sqlite_errorcode", None))
-                raise
-            finally:
-                guard.cancel()
+        try:
+            with store._connect() as conn:
+                # A guard bounds the pre-fix failure; it is not the query budget.
+                def safety_interrupt():
+                    guard_fired.set()
+                    conn.interrupt()
+
+                guard = threading.Timer(1.0, safety_interrupt)
+                guard.start()
+                try:
+                    conn.execute("""WITH RECURSIVE n(x) AS (
+                        VALUES(0) UNION ALL SELECT x+1 FROM n WHERE x<100000000
+                    ) SELECT sum(x) FROM n""").fetchone()
+                except sqlite3.OperationalError as exc:
+                    interrupts.append(getattr(exc, "sqlite_errorcode", None))
+                    raise
+                finally:
+                    guard.cancel()
+        finally:
+            worker_finished.set()
         return []
 
     monkeypatch.setattr(store, "lexical_search", expensive_lexical)
@@ -1243,7 +1252,14 @@ def test_expired_lexical_sql_releases_recall_actor_for_dense_hydration(recall_ca
             assert trace["status"] == "partial"
             assert trace["lexical_status"] == "timeout"
             assert trace["hydrate_status"] == "ok"
+            # Dense hydration uses a separate actor; neither it nor the timed-out
+            # waiter proves the lexical worker has finished observing its error.
+            assert await asyncio.to_thread(worker_finished.wait, 1)
+            assert not guard_fired.is_set(), "SQL interruption fell back to the safety guard"
             assert interrupts == [sqlite3.SQLITE_INTERRUPT]
+            result = await asyncio.wait_for(instance._recall_store_call(
+                lambda lexical: lexical.recent_evidence("default", "s"), stage="lexical"), .5)
+            assert result == []
         finally:
             await instance.stop()
 
