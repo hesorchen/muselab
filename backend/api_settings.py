@@ -379,26 +379,28 @@ def put_settings(req: SettingsIn) -> dict:
     def _changed(env_key: str, new_val: str) -> bool:
         return _current(env_key) != new_val
 
-    if req.default_model is not None:
-        # Write both keys so `chat.py` (reads `settings.MODEL` → `MUSELAB_MODEL`)
-        # and the settings GET endpoint (reads `MUSELAB_DEFAULT_MODEL`) agree.
-        # Without this, the user changed "default model" in Settings and saw it
-        # echoed back, but new sessions still used the .env's `MUSELAB_MODEL`.
-        # Count as ONE updated field (both keys flip together — they're an
-        # implementation detail, not two separate settings).
-        if (_changed("MUSELAB_DEFAULT_MODEL", req.default_model)
-                or _changed("MUSELAB_MODEL", req.default_model)):
-            updates["MUSELAB_DEFAULT_MODEL"] = req.default_model
-            updates["MUSELAB_MODEL"] = req.default_model
-    if req.default_permission is not None and _changed(
-            "MUSELAB_DEFAULT_PERMISSION", req.default_permission):
-        updates["MUSELAB_DEFAULT_PERMISSION"] = req.default_permission
-    if req.busy_send_mode is not None and _changed(
-            "MUSELAB_BUSY_SEND_MODE", req.busy_send_mode):
-        updates["MUSELAB_BUSY_SEND_MODE"] = req.busy_send_mode
-    # Visibility is a partial set edit, so its read and write must share
-    # the same lock as other environment updates.
     with _ENV_WRITE_LOCK:
+        # Compare after any earlier writer commits, so a queued explicit value
+        # cannot be dropped as unchanged against a stale environment snapshot.
+        if req.default_model is not None:
+            # Write both keys so `chat.py` (reads `settings.MODEL` → `MUSELAB_MODEL`)
+            # and the settings GET endpoint (reads `MUSELAB_DEFAULT_MODEL`) agree.
+            # Without this, the user changed "default model" in Settings and saw it
+            # echoed back, but new sessions still used the .env's `MUSELAB_MODEL`.
+            # Count as ONE updated field (both keys flip together — they're an
+            # implementation detail, not two separate settings).
+            if (_changed("MUSELAB_DEFAULT_MODEL", req.default_model)
+                    or _changed("MUSELAB_MODEL", req.default_model)):
+                updates["MUSELAB_DEFAULT_MODEL"] = req.default_model
+                updates["MUSELAB_MODEL"] = req.default_model
+        if req.default_permission is not None and _changed(
+                "MUSELAB_DEFAULT_PERMISSION", req.default_permission):
+            updates["MUSELAB_DEFAULT_PERMISSION"] = req.default_permission
+        if req.busy_send_mode is not None and _changed(
+                "MUSELAB_BUSY_SEND_MODE", req.busy_send_mode):
+            updates["MUSELAB_BUSY_SEND_MODE"] = req.busy_send_mode
+        # Visibility is a partial set edit, so its read and write must share
+        # the same lock as other environment updates.
         if req.provider_disabled is not None:
             from . import endpoints as _ep
             aliases: dict[str, set[str]] = {}

@@ -15,7 +15,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Awaitable, Callable
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import TypeVar
 
@@ -283,9 +283,13 @@ class _MemoryStoreActor:
         self._executor: ThreadPoolExecutor | None = None
         self._state_lock = threading.Lock()
         self._closed = False
+        self._close_task: asyncio.Task[None] | None = None
 
     def reopen(self) -> None:
         with self._state_lock:
+            if self._close_task is not None and not self._close_task.done():
+                raise RuntimeError("memory store actor is closing")
+            self._close_task = None
             self._closed = False
 
     def _execute(self, operation: Callable[[MemoryStore], _T], trace=None) -> _T:
@@ -351,28 +355,46 @@ class _MemoryStoreActor:
                 job.cancel()  # A read that has not started is no longer useful.
             raise
 
+    @staticmethod
+    async def _join_shutdown(shutdown: asyncio.Future[None]) -> None:
+        pending_cancel: asyncio.CancelledError | None = None
+        while True:
+            try:
+                await asyncio.shield(shutdown)
+                break
+            except asyncio.CancelledError as exc:
+                if shutdown.cancelled():
+                    raise
+                if pending_cancel is None:
+                    pending_cancel = exc
+        shutdown.result()
+        if pending_cancel is not None:
+            raise pending_cancel
+
+    async def _close_executor(self, executor: ThreadPoolExecutor, barrier: Future[None]) -> None:
+        try:
+            await self._join_shutdown(asyncio.wrap_future(barrier))
+        finally:
+            executor.shutdown(wait=True)
+
     async def close(self) -> None:
         with self._state_lock:
-            if self._closed:
-                return
-            self._closed = True
-            executor = self._executor
-            self._executor = None
-            if executor is None:
-                return
-            barrier = executor.submit(lambda: None)
-
-        wrapped = asyncio.wrap_future(barrier)
-        try:
-            await asyncio.shield(wrapped)
-        except asyncio.CancelledError:
-            # The caller may be cancelled during application shutdown. The
-            # actor still owns a live thread and accepted DB operations, so
-            # finish the barrier before propagating cancellation.
-            await wrapped
-            executor.shutdown(wait=True)
-            raise
-        executor.shutdown(wait=True)
+            shutdown = self._close_task
+            if shutdown is None:
+                self._closed = True
+                executor = self._executor
+                self._executor = None
+                if executor is None:
+                    return
+                barrier = executor.submit(lambda: None)
+                shutdown = asyncio.create_task(
+                    self._close_executor(executor, barrier),
+                    name="muselab-memory-db-close",
+                )
+                self._close_task = shutdown
+        # All callers join the same physical drain and thread shutdown. Repeated
+        # cancellation cannot detach that owner or make another close return early.
+        await self._join_shutdown(shutdown)
 
 
 class _RegistryNotInitialized(Exception):

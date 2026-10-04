@@ -6027,8 +6027,9 @@
         <button x-show="settings.surface!=='memory'" @click="logout()" class="btn-ghost" style="margin-right:auto;color:var(--c-danger)" x-text="t('btn.logout')"></button>
         <button @click="closeSettings()" class="btn-ghost" x-text="lang==='zh'?'关闭':'Close'"></button>
         <button x-show="settings.activePage === 'provider' || settings.activePage === 'defaults'"
-                :disabled="settings.loading || !!settings.error"
-                @click="saveSettings()" class="btn-primary" x-text="t('btn.save')"></button>
+                :disabled="settings.saving || settings.loading || !!settings.error"
+                @click="saveSettings()" class="btn-primary"
+                x-text="settings.saving ? (lang==='zh'?'保存中…':'Saving…') : t('btn.save')"></button>
         <button x-show="settings.activePage === 'memory_engine'"
                 @click="saveMemorySettings()" class="btn-primary"
                 :disabled="settings.memory.saving || settings.memory.configLoading || !settings.memory.configLoaded"
