@@ -3222,21 +3222,23 @@ def _prune_preview_tickets(now: float) -> None:
         _preview_tickets.pop(digest, None)
 
 
-def _preview_ticket_ok(ticket: str, path: str, root: Path, external: bool = False) -> bool:
+def _preview_ticket_target(ticket: str, path: str, root: Path, external: bool = False) -> Path | None:
     if not ticket.startswith("preview."):
-        return False
+        return None
     digest = hashlib.sha256(ticket[8:].encode("utf-8")).hexdigest()
     now = time.monotonic()
     try:
         target = safe_read_resolve(path, root=root, external=external)
     except HTTPException:
-        return False
+        return None
     with _preview_ticket_lock:
         _prune_preview_tickets(now)
         row = _preview_tickets.get(digest)
         if row is None or row[2] < now:
-            return False
-    return row[0] == str(target) and row[1] == str(root.resolve())
+            return None
+    if row[0] == str(target) and row[1] == str(root.resolve()):
+        return target
+    return None
 
 
 @router.post("/preview-ticket", dependencies=[Depends(require_token)])
@@ -3247,6 +3249,10 @@ def mint_preview_ticket(
     target = safe_read_resolve(req.path, root=root, external=req.external)
     if not target.exists() or not target.is_file():
         raise HTTPException(status_code=404, detail="not a file")
+    return _issue_preview_ticket(target, root)
+
+
+def _issue_preview_ticket(target: Path, root: Path) -> dict:
     raw = secrets.token_urlsafe(32)
     digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
     now = time.monotonic()
@@ -3290,9 +3296,10 @@ async def _require_raw_access(
     token: str | None = Query(default=None),
     root: Path = Depends(_workspace_root),
     external: bool = False,
-) -> None:
-    if ticket and _preview_ticket_ok(ticket, path, root, external=external):
-        return
+) -> Path | None:
+    target = _preview_ticket_target(ticket, path, root, external=external)
+    if target is not None:
+        return target
     # Backward compatibility for old clients, copied download links and image
     # URLs.  The first-party HTML preview no longer uses this long-lived token.
     await require_token_query(token)
@@ -3315,27 +3322,29 @@ def _inject_preview_html_bridge(target: Path) -> str | None:
     return html[:idx] + _PREVIEW_HTML_BRIDGE + html[idx:]
 
 
-@router.get("/raw", dependencies=[Depends(_require_raw_access)])
+@router.get("/raw")
 def raw_file(
     path: str = Query(...),
     preview: bool = Query(False),
-    ticket: str = Query(""),
     root: Path = Depends(_workspace_root),
     external: bool = False,
+    target: Path | None = Depends(_require_raw_access),
 ):
     """Stream a raw file using a path-bound preview ticket or legacy token.
 
     Everything outside the whitelists is forced to download as octet-stream.
     """
-    target = safe_read_resolve(path, root=root, external=external)
+    legacy = target is None
+    if legacy:
+        target = safe_read_resolve(path, root=root, external=external)
     if not target.exists() or not target.is_file():
         raise HTTPException(status_code=404, detail="not a file")
     # A legacy token URL must never become the executing document's URL:
     # even an opaque sandbox can read location.search and issue HTTPS images.
     # Redirect all legacy resource requests to an exact-file short-lived ticket.
-    if not _preview_ticket_ok(ticket, path, root, external=external):
+    if legacy:
         from urllib.parse import urlencode
-        issued = mint_preview_ticket(PreviewTicketReq(path=path, external=external), root=root)
+        issued = _issue_preview_ticket(target, root)
         query = {"path": path, "workspace": str(root), "ticket": issued["ticket"]}
         if external:
             query["external"] = "1"
@@ -3363,7 +3372,7 @@ def raw_file(
     disp_filename = f'filename="file{suffix}"; filename*=UTF-8\'\'{quote(target.name)}'
 
     if suffix in INLINE_OK_SUFFIX:
-        return FileResponse(target, headers={
+        return _opened_file_response(target, headers={
             **base_headers,
             "Content-Disposition": f"inline; {disp_filename}",
         })
@@ -3399,9 +3408,9 @@ def raw_file(
             injected = _inject_preview_html_bridge(target)
             if injected is not None:
                 return HTMLResponse(content=injected, headers=sandbox_headers)
-        return FileResponse(target, headers=sandbox_headers)
+        return _opened_file_response(target, headers=sandbox_headers)
     # FileResponse(filename=) sets Content-Disposition itself; use our safe one.
-    return FileResponse(target, media_type="application/octet-stream", headers={
+    return _opened_file_response(target, media_type="application/octet-stream", headers={
         **base_headers,
         "Content-Disposition": f"attachment; {disp_filename}",
     })
@@ -3426,7 +3435,7 @@ def _require_download_ticket(
     return target
 
 
-def _open_download_file(target: Path) -> tuple[BinaryIO, os.stat_result]:
+def _open_response_file(target: Path) -> tuple[BinaryIO, os.stat_result]:
     """Open a resolved file through real directories, without FIFO blocking."""
     try:
         parent_fd = os.open(target.anchor, _directory_open_flags())
@@ -3458,7 +3467,7 @@ def _open_download_file(target: Path) -> tuple[BinaryIO, os.stat_result]:
         raise
 
 
-class _DownloadFileResponse(FileResponse):
+class _OpenedFileResponse(FileResponse):
     """Retain FileResponse range semantics while sending one already-open FD."""
 
     def __init__(self, target: Path, stream: BinaryIO, info: os.stat_result, **kwargs):
@@ -3537,12 +3546,17 @@ def download_file(
     from urllib.parse import quote
     suffix = target.suffix.lower()
     disp = f'attachment; filename="file{suffix}"; filename*=UTF-8\'\'{quote(target.name)}'
-    stream, info = _open_download_file(target)
+    return _opened_file_response(
+        target, media_type="application/octet-stream",
+        headers={"Content-Disposition": disp},
+    )
+
+
+def _opened_file_response(target: Path, **kwargs) -> FileResponse:
+    """Share one safely opened descriptor across raw and download responses."""
+    stream, info = _open_response_file(target)
     try:
-        return _DownloadFileResponse(
-            target, stream, info, media_type="application/octet-stream",
-            headers={"Content-Disposition": disp},
-        )
+        return _OpenedFileResponse(target, stream, info, **kwargs)
     except BaseException:
         stream.close()
         raise

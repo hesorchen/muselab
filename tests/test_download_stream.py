@@ -127,7 +127,7 @@ def test_download_append_does_not_exceed_content_length(file_module, auth, temp_
 @pytest.fixture
 def download_streams(file_module, monkeypatch):
     opened = []
-    original_open = file_module._open_download_file
+    original_open = file_module._open_response_file
 
     def capture(target):
         stream, info = original_open(target)
@@ -135,7 +135,7 @@ def download_streams(file_module, monkeypatch):
         opened.append(stream)
         return stream, info
 
-    monkeypatch.setattr(file_module, "_open_download_file", capture)
+    monkeypatch.setattr(file_module, "_open_response_file", capture)
     yield opened
     assert all(stream.closed for stream in opened)
 
@@ -261,7 +261,7 @@ def test_download_open_rejects_changed_path(
     alternate = tmp_path / "unregistered"
     alternate.mkdir()
     (alternate / target.name).write_bytes(b"PRIVATE_REPLACED_VALUE")
-    original_open = file_module._open_download_file
+    original_open = file_module._open_response_file
 
     def replace_before_open(path):
         if replacement == "fifo":
@@ -274,7 +274,7 @@ def test_download_open_rejects_changed_path(
             target.unlink()
         return original_open(path)
 
-    monkeypatch.setattr(file_module, "_open_download_file", replace_before_open)
+    monkeypatch.setattr(file_module, "_open_response_file", replace_before_open)
     response = asyncio.run(_download(file_module, auth, "parent/deep/public.txt"))
     assert response.status_code == 404
     assert b"PRIVATE_REPLACED_VALUE" not in response.content
