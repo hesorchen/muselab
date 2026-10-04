@@ -282,8 +282,8 @@ def test_concurrent_mcp_mutations_preserve_each_successful_edit(
     load = api_settings._load_mcp
     save = api_settings._save_mcp
 
-    def observed_load():
-        cfg = load()
+    def observed_load(*args, **kwargs):
+        cfg = load(*args, **kwargs)
         if first_saving.is_set():
             second_read.set()
         return cfg
