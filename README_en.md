@@ -109,6 +109,6 @@ For installation or runtime issues, run `bash scripts/doctor.sh` from the reposi
 
 ## Status
 
-Current version: v2.0.0. Before updating an existing installation, read the [Upgrade guide](docs/upgrade.md) and back up your data.
+Current version: v2.1.0. Before updating an existing installation, read the [Upgrade guide](docs/upgrade.md) and back up your data.
 
 [MIT](LICENSE)

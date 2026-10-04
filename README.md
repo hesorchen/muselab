@@ -109,6 +109,6 @@ bash scripts/install-linux.sh    # 或 install-macos.sh
 
 ## 状态
 
-当前版本为 v2.0.0。升级已有安装前，请阅读[升级说明](docs/upgrade_zh.md)并备份数据。
+当前版本为 v2.1.0。升级已有安装前，请阅读[升级说明](docs/upgrade_zh.md)并备份数据。
 
 [MIT](LICENSE)
