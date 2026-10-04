@@ -8084,6 +8084,18 @@ async def purge_old_sessions_api(req: PurgeOldReq | None = None) -> dict:
                 "ids": victims, "days": days}
     deleted: list[str] = []
     for sid in victims:
+        # Cleaning an earlier session can wait on runtime shutdown. Respect
+        # pins and recent user updates committed during that wait instead of
+        # treating the initial list snapshot as permanent deletion consent.
+        current = await obs.to_thread_io(
+            "chat.session_delete_eligibility", sid, sess.get_session_meta, sid,
+        )
+        if (
+            current is None
+            or current.get("pinned")
+            or float(current.get("updated_at") or 0) >= cutoff
+        ):
+            continue
         if await purge_session_storage_async(sid):
             deleted.append(sid)
     return {"ok": True, "deleted": len(deleted), "ids": deleted, "days": days}
