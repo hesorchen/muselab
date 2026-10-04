@@ -42,11 +42,13 @@ def delivery_workspace(page, backend_url, auth_token, tmp_path):
     try:
         yield root
     finally:
-        _app_eval(page, "await app.switchWorkspace(app.primaryWorkspacePath());")
-        removed = page.request.delete(
-            f"{backend_url}/api/chat/workspaces", headers=headers, params={"path": str(root)}
-        )
-        assert removed.ok
+        try:
+            _app_eval(page, "await app.switchWorkspace(app.primaryWorkspacePath());")
+        finally:
+            removed = page.request.delete(
+                f"{backend_url}/api/chat/workspaces", headers=headers, params={"path": str(root)}
+            )
+            assert removed.ok
 
 
 def test_delivery_artifact_evidence_diff_and_guarded_preview(
