@@ -8623,7 +8623,7 @@ function portal() {
         && this._conversationWorkspaceIsCurrent(ownerWorkspace);
       const abandon = () => {
         if (this.tabState[sid] === st && st._effortPatchSeq === seq
-            && st._effortExpected === expected) {
+            && st._effortExpected?.seq === seq) {
           st._effortExpected = null;
           st.effort = expected.fallback;
           if (this.currentId === sid) this.effort = expected.fallback;
@@ -8765,7 +8765,7 @@ function portal() {
         && this._conversationWorkspaceIsCurrent(ownerWorkspace);
       const abandon = () => {
         if (this.tabState[sid] === st && st._serviceTierPatchSeq === seq
-            && st._serviceTierExpected === expected) {
+            && st._serviceTierExpected?.seq === seq) {
           st._serviceTierExpected = null;
           st.serviceTier = expected.fallback;
           if (this.currentId === sid) this.serviceTier = expected.fallback;
