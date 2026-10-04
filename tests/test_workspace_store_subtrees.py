@@ -16,6 +16,8 @@ def test_native_subtree_change_preserves_case_distinct_sibling(
     changed = temp_root / name
     sibling = temp_root / name.lower()
     changed.mkdir()
+    if sibling.exists() and sibling.samefile(changed):
+        pytest.skip("filesystem does not support case-distinct sibling paths")
     sibling.mkdir()
     (changed / "old.txt").write_text("old", encoding="utf-8")
     (sibling / "keep.txt").write_text("keep", encoding="utf-8")
@@ -41,6 +43,36 @@ def test_native_subtree_change_preserves_case_distinct_sibling(
     assert expected not in {row["path"] for row in store.delta("test", cursor)["changes"]}
     assert f"{name}/old.txt" not in {
         row["path"] for row in store.bootstrap("test")["entries"]
+    }
+
+
+@pytest.mark.parametrize("name", ["Foo", "Foo_%[x]\\part"])
+def test_native_subtree_delete_preserves_case_distinct_index_paths(
+    app_module, temp_root, name,
+):
+    """Exercise case-sensitive SQL matching on every filesystem."""
+    from backend.workspace_store import WorkspaceStore, _entry
+
+    sibling = name.lower()
+    info = (temp_root / "README.md").stat()
+    rows = [
+        _entry(name, True, info),
+        _entry(f"{name}/old.txt", False, info),
+        _entry(sibling, True, info),
+        _entry(f"{sibling}/keep.txt", False, info),
+    ]
+    store = WorkspaceStore(temp_root)
+    # Seed only the index: no physical Foo/foo pair is needed on APFS/NTFS.
+    store.reconcile("test", temp_root, "test", primary=True, snapshot=rows)
+    cursor = store.current_cursor("test")
+    payload = store.apply_changes("test", temp_root, [{"type": "deleted", "path": name}])
+
+    assert {row["path"] for row in payload["changes"]} == {name, f"{name}/old.txt"}
+    assert {row["path"] for row in store.delta("test", cursor)["changes"]} == {
+        name, f"{name}/old.txt",
+    }
+    assert {row["path"] for row in store.bootstrap("test")["entries"]} == {
+        sibling, f"{sibling}/keep.txt",
     }
 
 
