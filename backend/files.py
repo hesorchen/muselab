@@ -18,12 +18,14 @@ import time
 from bisect import bisect_right
 from collections import OrderedDict
 from pathlib import Path
-from typing import Literal
+from typing import BinaryIO, Literal
+import anyio
 from fastapi import (
     APIRouter, Depends, File, Form, HTTPException, Query, UploadFile,
 )
 from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse, RedirectResponse
 from pydantic import BaseModel
+from starlette.datastructures import MutableHeaders
 from . import observability as obs
 from .auth import require_token, require_token_query
 from .capability_tickets import tickets
@@ -3220,21 +3222,23 @@ def _prune_preview_tickets(now: float) -> None:
         _preview_tickets.pop(digest, None)
 
 
-def _preview_ticket_ok(ticket: str, path: str, root: Path, external: bool = False) -> bool:
+def _preview_ticket_target(ticket: str, path: str, root: Path, external: bool = False) -> Path | None:
     if not ticket.startswith("preview."):
-        return False
+        return None
     digest = hashlib.sha256(ticket[8:].encode("utf-8")).hexdigest()
     now = time.monotonic()
     try:
         target = safe_read_resolve(path, root=root, external=external)
     except HTTPException:
-        return False
+        return None
     with _preview_ticket_lock:
         _prune_preview_tickets(now)
         row = _preview_tickets.get(digest)
         if row is None or row[2] < now:
-            return False
-    return row[0] == str(target) and row[1] == str(root.resolve())
+            return None
+    if row[0] == str(target) and row[1] == str(root.resolve()):
+        return target
+    return None
 
 
 @router.post("/preview-ticket", dependencies=[Depends(require_token)])
@@ -3245,6 +3249,10 @@ def mint_preview_ticket(
     target = safe_read_resolve(req.path, root=root, external=req.external)
     if not target.exists() or not target.is_file():
         raise HTTPException(status_code=404, detail="not a file")
+    return _issue_preview_ticket(target, root)
+
+
+def _issue_preview_ticket(target: Path, root: Path) -> dict:
     raw = secrets.token_urlsafe(32)
     digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
     now = time.monotonic()
@@ -3288,9 +3296,10 @@ async def _require_raw_access(
     token: str | None = Query(default=None),
     root: Path = Depends(_workspace_root),
     external: bool = False,
-) -> None:
-    if ticket and _preview_ticket_ok(ticket, path, root, external=external):
-        return
+) -> Path | None:
+    target = _preview_ticket_target(ticket, path, root, external=external)
+    if target is not None:
+        return target
     # Backward compatibility for old clients, copied download links and image
     # URLs.  The first-party HTML preview no longer uses this long-lived token.
     await require_token_query(token)
@@ -3313,27 +3322,29 @@ def _inject_preview_html_bridge(target: Path) -> str | None:
     return html[:idx] + _PREVIEW_HTML_BRIDGE + html[idx:]
 
 
-@router.get("/raw", dependencies=[Depends(_require_raw_access)])
+@router.get("/raw")
 def raw_file(
     path: str = Query(...),
     preview: bool = Query(False),
-    ticket: str = Query(""),
     root: Path = Depends(_workspace_root),
     external: bool = False,
+    target: Path | None = Depends(_require_raw_access),
 ):
     """Stream a raw file using a path-bound preview ticket or legacy token.
 
     Everything outside the whitelists is forced to download as octet-stream.
     """
-    target = safe_read_resolve(path, root=root, external=external)
+    legacy = target is None
+    if legacy:
+        target = safe_read_resolve(path, root=root, external=external)
     if not target.exists() or not target.is_file():
         raise HTTPException(status_code=404, detail="not a file")
     # A legacy token URL must never become the executing document's URL:
     # even an opaque sandbox can read location.search and issue HTTPS images.
     # Redirect all legacy resource requests to an exact-file short-lived ticket.
-    if not _preview_ticket_ok(ticket, path, root, external=external):
+    if legacy:
         from urllib.parse import urlencode
-        issued = mint_preview_ticket(PreviewTicketReq(path=path, external=external), root=root)
+        issued = _issue_preview_ticket(target, root)
         query = {"path": path, "workspace": str(root), "ticket": issued["ticket"]}
         if external:
             query["external"] = "1"
@@ -3361,7 +3372,7 @@ def raw_file(
     disp_filename = f'filename="file{suffix}"; filename*=UTF-8\'\'{quote(target.name)}'
 
     if suffix in INLINE_OK_SUFFIX:
-        return FileResponse(target, headers={
+        return _opened_file_response(target, headers={
             **base_headers,
             "Content-Disposition": f"inline; {disp_filename}",
         })
@@ -3397,9 +3408,9 @@ def raw_file(
             injected = _inject_preview_html_bridge(target)
             if injected is not None:
                 return HTMLResponse(content=injected, headers=sandbox_headers)
-        return FileResponse(target, headers=sandbox_headers)
+        return _opened_file_response(target, headers=sandbox_headers)
     # FileResponse(filename=) sets Content-Disposition itself; use our safe one.
-    return FileResponse(target, media_type="application/octet-stream", headers={
+    return _opened_file_response(target, media_type="application/octet-stream", headers={
         **base_headers,
         "Content-Disposition": f"attachment; {disp_filename}",
     })
@@ -3410,7 +3421,7 @@ def _require_download_ticket(
     ticket: str = Query(""),
     root: Path = Depends(_workspace_root),
     external: bool = False,
-) -> None:
+) -> Path:
     try:
         target = safe_read_resolve(path, root=root, external=external)
     except HTTPException:
@@ -3421,22 +3432,134 @@ def _require_download_ticket(
         (str(target), str(root.resolve())),
     ):
         raise HTTPException(status_code=401, detail="invalid or expired download ticket")
+    return target
 
 
-@router.get("/download", dependencies=[Depends(_require_download_ticket)])
+def _open_response_file(target: Path) -> tuple[BinaryIO, os.stat_result]:
+    """Open a resolved file through real directories, without FIFO blocking."""
+    try:
+        parent_fd = os.open(target.anchor, _directory_open_flags())
+        try:
+            for component in target.parts[1:-1]:
+                next_fd = os.open(
+                    component, _directory_open_flags(), dir_fd=parent_fd,
+                )
+                os.close(parent_fd)
+                parent_fd = next_fd
+            flags = (os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+                     | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0))
+            fd = os.open(target.name, flags, dir_fd=parent_fd)
+        finally:
+            os.close(parent_fd)
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode):
+                raise HTTPException(status_code=404, detail="not a file")
+            return os.fdopen(fd, "rb", buffering=0), info
+        except BaseException:
+            os.close(fd)
+            raise
+    except PermissionError:
+        raise HTTPException(status_code=403, detail="file cannot be read") from None
+    except OSError as exc:
+        if exc.errno in {errno.ENOENT, errno.ENOTDIR, errno.ELOOP, errno.ENXIO}:
+            raise HTTPException(status_code=404, detail="not a file") from None
+        raise
+
+
+class _OpenedFileResponse(FileResponse):
+    """Retain FileResponse range semantics while sending one already-open FD."""
+
+    def __init__(self, target: Path, stream: BinaryIO, info: os.stat_result, **kwargs):
+        super().__init__(target, stat_result=info, **kwargs)
+        self._stream = stream
+        self._file = anyio.wrap_file(stream)
+
+    async def __call__(self, scope, receive, send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            # Synchronous close also runs when the task's cancel scope is active.
+            self._stream.close()
+
+    async def _send_span(self, send, start: int, end: int, *, final: bool = True) -> None:
+        await self._file.seek(start)
+        if start == end:
+            await send({"type": "http.response.body", "body": b"", "more_body": not final})
+        while start < end:
+            chunk = await self._file.read(min(self.chunk_size, end - start))
+            if not chunk:
+                # Headers have been sent: abort rather than complete a short
+                # body or spin forever in a multipart range after truncation.
+                raise OSError(errno.EIO, "file changed during download")
+            start += len(chunk)
+            await send({
+                "type": "http.response.body", "body": chunk,
+                "more_body": start < end or not final,
+            })
+
+    async def _handle_simple(self, send, send_header_only: bool, send_pathsend: bool) -> None:
+        await send({"type": "http.response.start", "status": self.status_code, "headers": self.raw_headers})
+        if send_header_only:
+            await send({"type": "http.response.body", "body": b"", "more_body": False})
+        else:
+            # Do not delegate to pathsend: the path may now name another inode.
+            await self._send_span(send, 0, self.stat_result.st_size)
+
+    async def _handle_single_range(
+        self, send, start: int, end: int, file_size: int, send_header_only: bool,
+    ) -> None:
+        headers = MutableHeaders(raw=list(self.raw_headers))
+        headers["content-range"] = f"bytes {start}-{end - 1}/{file_size}"
+        headers["content-length"] = str(end - start)
+        await send({"type": "http.response.start", "status": 206, "headers": headers.raw})
+        if send_header_only:
+            await send({"type": "http.response.body", "body": b"", "more_body": False})
+        else:
+            await self._send_span(send, start, end)
+
+    async def _handle_multiple_ranges(self, send, ranges, file_size: int, send_header_only: bool) -> None:
+        boundary = secrets.token_hex(13)
+        content_length, header_generator = self.generate_multipart(
+            ranges, boundary, file_size, self.headers["content-type"],
+        )
+        headers = MutableHeaders(raw=list(self.raw_headers))
+        headers["content-type"] = f"multipart/byteranges; boundary={boundary}"
+        headers["content-length"] = str(content_length)
+        await send({"type": "http.response.start", "status": 206, "headers": headers.raw})
+        if send_header_only:
+            await send({"type": "http.response.body", "body": b"", "more_body": False})
+        else:
+            for start, end in ranges:
+                await send({"type": "http.response.body", "body": header_generator(start, end), "more_body": True})
+                await self._send_span(send, start, end, final=False)
+                await send({"type": "http.response.body", "body": b"\r\n", "more_body": True})
+            await send({"type": "http.response.body", "body": f"--{boundary}--".encode("ascii"), "more_body": False})
+
+
+@router.get("/download")
 def download_file(
-    path: str = Query(...),
-    root: Path = Depends(_workspace_root),
-    external: bool = False,
+    target: Path = Depends(_require_download_ticket),
 ) -> FileResponse:
-    target = safe_read_resolve(path, root=root, external=external)
     if not target.exists() or not target.is_file():
         raise HTTPException(status_code=404, detail="not a file")
     from urllib.parse import quote
     suffix = target.suffix.lower()
     disp = f'attachment; filename="file{suffix}"; filename*=UTF-8\'\'{quote(target.name)}'
-    return FileResponse(target, media_type="application/octet-stream",
-                        headers={"Content-Disposition": disp})
+    return _opened_file_response(
+        target, media_type="application/octet-stream",
+        headers={"Content-Disposition": disp},
+    )
+
+
+def _opened_file_response(target: Path, **kwargs) -> FileResponse:
+    """Share one safely opened descriptor across raw and download responses."""
+    stream, info = _open_response_file(target)
+    try:
+        return _OpenedFileResponse(target, stream, info, **kwargs)
+    except BaseException:
+        stream.close()
+        raise
 
 
 class WriteReq(BaseModel):
