@@ -18267,17 +18267,17 @@ function portal() {
       const ok = !!(response && response.ok);
       if (!ok) {
         const canonicalSid = this._resolveSessionRedirectId(sid);
-        if (this._sessionNameExpected[canonicalSid] === expectedName) {
-          delete this._sessionNameExpected[canonicalSid];
-        }
-        // Do not undo a newer rename that completed while this request was in
-        // flight. Roll back only when our optimistic value still owns the row.
+        // Alpine proxies stored objects; compare the request sequence rather
+        // than object identity. Matching text alone cannot identify an owner
+        // when a later rename intentionally returns to the same label.
+        const owned = this._sessionNameExpected[canonicalSid]?.seq === renameSeq;
+        if (owned) delete this._sessionNameExpected[canonicalSid];
         const current = this.sessions.find(row => row.id === canonicalSid);
-        if (current && current.name === name) {
+        if (owned && current && current.name === name) {
           this._applyRenamedSession(canonicalSid, previousName);
           renamePerf.status = "rollback";
         }
-        this.toast(this.lang === "zh" ? "重命名失败" : "Rename failed", "error", 3000);
+        if (owned) this.toast(this.lang === "zh" ? "重命名失败" : "Rename failed", "error", 3000);
       } else {
         let payload = null;
         try { payload = await response.json(); } catch (_) { payload = null; }
@@ -18287,7 +18287,7 @@ function portal() {
           sid = responseSid;
           this._applyRenamedSession(sid, name);
         }
-        const owned = this._sessionNameExpected[sid] === expectedName;
+        const owned = this._sessionNameExpected[sid]?.seq === renameSeq;
         if (owned) {
           expectedName.settled = true;
           if (expectedName.echoed) delete this._sessionNameExpected[sid];
