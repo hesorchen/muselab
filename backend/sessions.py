@@ -743,8 +743,10 @@ def set_pin(sid: str, val: bool) -> bool | None:
     SDK-only sessions may create a minimal local stub. Serialize that write
     with deletion so an admitted PATCH cannot recreate a deleted index row.
     """
-    with session_lifecycle_lock(sid):
-        if session_is_deleting(sid):
+    # Prune fences under QUEUE without taking the lifecycle stripe. Keep
+    # its tombstone check and this index commit in the same QUEUE transaction.
+    with session_lifecycle_lock(sid), _QUEUE_LOCK:
+        if sid in _DELETED_SESSION_IDS:
             return None
         with _INDEX_LOCK:
             idx = _load_index()
