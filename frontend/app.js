@@ -39227,19 +39227,20 @@ function portal() {
       });
     },
     cancelEditSched() { this._resetSchedDraft(); },
+    // true: applied; false: failed; null: a newer request owns the list.
     async loadSchedulerTasks() {
       const seq = ++this.scheduler.tasksSeq;
       this.scheduler.loading = true;
       try {
         const r = await fetch("/api/scheduler/tasks", { headers: this.hdr() });
-        if (!r.ok) return false;
+        if (!r.ok) return seq === this.scheduler.tasksSeq ? false : null;
         const d = await r.json();
-        if (seq !== this.scheduler.tasksSeq) return false;
+        if (seq !== this.scheduler.tasksSeq) return null;
         this.scheduler.tasks = d.tasks || [];
         this.scheduler.unreadCount = d.unread_count || 0;
         return true;
       } catch (_) {
-        return false;
+        return seq === this.scheduler.tasksSeq ? false : null;
       } finally {
         if (seq === this.scheduler.tasksSeq) this.scheduler.loading = false;
       }
@@ -39405,9 +39406,9 @@ function portal() {
         const message = isEdit
           ? (this.lang === "zh" ? "已保存" : "Saved")
           : (this.lang === "zh" ? "任务已创建" : "Task created");
-        this.toast(refreshed ? message : message + (this.lang === "zh"
+        this.toast(refreshed !== false ? message : message + (this.lang === "zh"
           ? "，但任务列表刷新失败" : ", but the task list could not refresh"),
-        refreshed ? "success" : "warn", refreshed ? 2000 : 4000);
+        refreshed !== false ? "success" : "warn", refreshed !== false ? 2000 : 4000);
       } catch (e) {
         this.errToast(isEdit ? "save" : "create", String((e && e.message) || e));
       } finally {
@@ -39512,10 +39513,10 @@ function portal() {
         delete this.scheduler.taskRuns[t.id];
         if (this.scheduler.draft.editingId === t.id) this._resetSchedDraft();
         const refreshed = await this.loadSchedulerTasks();
-        this.toast(refreshed
+        this.toast(refreshed !== false
           ? (zh ? "任务已删除" : "Task deleted")
           : (zh ? "任务已删除，但任务列表刷新失败" : "Task deleted, but the task list could not refresh"),
-        refreshed ? "success" : "warn", refreshed ? 2000 : 4000);
+        refreshed !== false ? "success" : "warn", refreshed !== false ? 2000 : 4000);
       } catch (e) {
         // Network-level failure — typically iOS Safari losing the request
         // mid-flight on flaky 4G. Show the user what happened.

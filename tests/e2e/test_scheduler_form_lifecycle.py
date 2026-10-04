@@ -109,7 +109,7 @@ def _wait_count(page, values, count):
     assert len(values) >= count
 
 
-def _finish_write(page, state, *, status=200):
+def _finish_write(page, state, *, status=200, wait=True):
     route = state["writes"].pop(0)
     method = route.request.method
     task_id = urlsplit(route.request.url).path.rsplit("/", 1)[-1]
@@ -124,7 +124,8 @@ def _finish_write(page, state, *, status=200):
         route.fulfill(json={"ok": True} if method == "DELETE" else copy.deepcopy(task))
     else:
         route.fulfill(status=status, json={"detail": "Synthetic write rejection"})
-    page.wait_for_function("([key,count])=>window.__schedulerSettled[key]>count", arg=[key, settled])
+    if wait:
+        page.wait_for_function("([key,count])=>window.__schedulerSettled[key]>count", arg=[key, settled])
     return task
 
 
@@ -214,5 +215,34 @@ def test_confirmed_scheduler_delete_rejects_late_list_and_keeps_other_draft(
     assert "task-a" not in after_delete_ids
     expect(_row(page, "Task A")).to_have_count(0)
     expect(_row(page, "Task B")).to_have_count(1)
+    assert scheduler_fixture["errors"] == []
+    assert page.evaluate("() => window.__schedulerUnhandled") == []
+
+
+@pytest.mark.parametrize("late_status", [200, 503])
+def test_superseded_scheduler_refresh_does_not_report_failure(page, scheduler_fixture, late_status):
+    _edit(page, "Task A")
+    page.locator(".sched-create-prompt").fill("Saved A prompt")
+    _save(page).click()
+    _wait_count(page, scheduler_fixture["writes"], 1)
+    scheduler_fixture["hold_read"] = True
+    _finish_write(page, scheduler_fixture, wait=False)
+    _wait_count(page, scheduler_fixture["reads"], 1)
+    _edit(page, "Task B")
+    page.locator(".sched-create-prompt").fill("Saved B prompt")
+    _save(page).click()
+    _wait_count(page, scheduler_fixture["writes"], 1)
+    _finish_write(page, scheduler_fixture)
+    expect(_row(page, "Task B").locator(".sched-row-prompt")).to_have_text("Saved B prompt")
+    assert page.evaluate("() => window.__schedulerSettled.save") == 1
+    route, old_tasks = scheduler_fixture["reads"].pop()
+    route.fulfill(status=late_status, json={"tasks": old_tasks, "unread_count": 0})
+    page.wait_for_function("() => window.__schedulerSettled.save === 2")
+    expect(_row(page, "Task A").locator(".sched-row-prompt")).to_have_text("Saved A prompt")
+    expect(_row(page, "Task B").locator(".sched-row-prompt")).to_have_text("Saved B prompt")
+    page.evaluate("async () => { await document.querySelector('#app')._x_dataStack[0].$nextTick(); }")
+    # Check immediately after both actual promises and the Alpine DOM flush;
+    # an auto-retrying absence assertion would pass once a wrong toast expires.
+    assert page.locator(".toast").filter(has_text="task list could not refresh").count() == 0
     assert scheduler_fixture["errors"] == []
     assert page.evaluate("() => window.__schedulerUnhandled") == []
