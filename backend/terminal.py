@@ -588,7 +588,11 @@ class TerminalManager:
     async def _terminate_process(self, session: TerminalSession) -> None:
         if session.status == "running":
             try:
-                await self._write_worker(session, _TERMINATE)
+                # A busy foreground command can back up the input/control
+                # pipe. Keep TERM/KILL reachable even if draining it stalls.
+                await asyncio.wait_for(
+                    self._write_worker(session, _TERMINATE), timeout=1.0,
+                )
             except Exception:
                 pass
             try:

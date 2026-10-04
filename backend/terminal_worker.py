@@ -40,6 +40,7 @@ EXITED = 2
 ERROR = 3
 
 MAX_FRAME = 256 * 1024
+MAX_PENDING_INPUT = MAX_FRAME
 
 
 def _write_all(fd: int, data: bytes) -> None:
@@ -146,6 +147,10 @@ def run(shell: str, cwd: str, rows: int, cols: int) -> int:
     selector.register(master_fd, selectors.EVENT_READ, "pty")
     selector.register(sys.stdin.fileno(), selectors.EVENT_READ, "control")
     control = bytearray()
+    pending_input = bytearray()
+    control_open = True
+    control_registered = True
+    pty_registered = True
     stopping = False
     stop_started: float | None = None
 
@@ -165,8 +170,36 @@ def run(shell: str, cwd: str, rows: int, cols: int) -> int:
                     _signal_terminal(pid, master_fd, signal.SIGTERM)
                 elif time.monotonic() - stop_started >= 1.0:
                     _signal_terminal(pid, master_fd, signal.SIGKILL)
-            for key, _ in selector.select(timeout=0.25):
+            # A foreground command may temporarily stop reading the PTY.
+            # Retain partial input and let readiness resume it; busy-waiting or
+            # treating EAGAIN as fatal would kill the user's terminal on paste.
+            if pty_registered:
+                selector.modify(
+                    master_fd,
+                    selectors.EVENT_READ | (
+                        selectors.EVENT_WRITE if pending_input else 0),
+                    "pty",
+                )
+            # Bound this process's input backlog and pass backpressure through
+            # the control pipe while continuing to drain terminal output.
+            wants_control = control_open and len(pending_input) < MAX_PENDING_INPUT
+            if wants_control and not control_registered:
+                selector.register(sys.stdin.fileno(), selectors.EVENT_READ, "control")
+                control_registered = True
+            elif not wants_control and control_registered:
+                selector.unregister(sys.stdin.fileno())
+                control_registered = False
+            for key, events in selector.select(timeout=0.25):
                 if key.data == "pty":
+                    if events & selectors.EVENT_WRITE and pending_input:
+                        try:
+                            written = os.write(master_fd, pending_input)
+                        except BlockingIOError:
+                            pass
+                        else:
+                            del pending_input[:written]
+                    if not events & selectors.EVENT_READ:
+                        continue
                     try:
                         chunk = os.read(master_fd, 16 * 1024)
                     except BlockingIOError:
@@ -181,6 +214,7 @@ def run(shell: str, cwd: str, rows: int, cols: int) -> int:
                     else:
                         try:
                             selector.unregister(master_fd)
+                            pty_registered = False
                         except Exception:
                             pass
                 else:
@@ -190,8 +224,10 @@ def run(shell: str, cwd: str, rows: int, cols: int) -> int:
                         continue
                     if not chunk:
                         stopping = True
+                        control_open = False
                         try:
                             selector.unregister(sys.stdin.fileno())
+                            control_registered = False
                         except Exception:
                             pass
                         continue
@@ -199,7 +235,7 @@ def run(shell: str, cwd: str, rows: int, cols: int) -> int:
                     for kind, payload in _parse_frames(control):
                         if kind == INPUT:
                             if payload:
-                                _write_all(master_fd, payload)
+                                pending_input.extend(payload)
                         elif kind == RESIZE:
                             _set_size(master_fd, payload)
                             try:
