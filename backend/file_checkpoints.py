@@ -8,6 +8,7 @@ external, large or unsafe paths fail closed; no SDK response is invented.
 from __future__ import annotations
 
 import base64
+from contextlib import ExitStack
 import hashlib
 import json
 import os
@@ -316,25 +317,28 @@ def preview(sid: str, checkpoint_id: str, cwd: Path, runtime_marker: str) -> dic
         "rows": rows,
         "expires": time.monotonic() + 120,
     }
-    if not issues:
-        try:
-            item["watch"] = _PreviewWatch(cwd, rows)
-            # Recheck after installing watches: no preview/install blind gap.
-            with lock(sid):
-                _data, latest_rows, latest_issues = _scope(sid, checkpoint_id, cwd)
-            if latest_issues or latest_rows != rows:
-                issues.append("file_changed_while_opening_preview")
-                item["watch"].close()
-        except (OSError, AttributeError):
-            issues.append("file_change_observation_unavailable")
-    if not issues:
-        with _PREVIEW_LOCK:
-            for old in list(_PREVIEWS):
-                if _PREVIEWS[old]["expires"] < time.monotonic():
-                    _PREVIEWS.pop(old)["watch"].close()
-            if len(_PREVIEWS) >= 128:
-                _PREVIEWS.pop(next(iter(_PREVIEWS)))["watch"].close()
-            _PREVIEWS[token] = item
+    with ExitStack() as cleanup:
+        if not issues:
+            try:
+                item["watch"] = _PreviewWatch(cwd, rows)
+                cleanup.callback(item["watch"].close)
+                # Recheck after installing watches: no preview/install blind gap.
+                with lock(sid):
+                    _data, latest_rows, latest_issues = _scope(sid, checkpoint_id, cwd)
+                if latest_issues or latest_rows != rows:
+                    issues.append("file_changed_while_opening_preview")
+            except (OSError, AttributeError):
+                issues.append("file_change_observation_unavailable")
+        if not issues:
+            with _PREVIEW_LOCK:
+                for old in list(_PREVIEWS):
+                    if _PREVIEWS[old]["expires"] < time.monotonic():
+                        _PREVIEWS.pop(old)["watch"].close()
+                if len(_PREVIEWS) >= 128:
+                    _PREVIEWS.pop(next(iter(_PREVIEWS)))["watch"].close()
+                _PREVIEWS[token] = item
+                # Only a published preview owns the watch beyond this call.
+                cleanup.pop_all()
     return {
         "checkpoint_id": checkpoint_id,
         "token": token if not issues else None,

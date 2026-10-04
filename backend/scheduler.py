@@ -1498,6 +1498,14 @@ async def _execute_task(task: dict) -> None:
                         if not is_revoked:
                             # "most recent run" pointer
                             task["session_id"] = sid
+                            # Editing replaces the task dict while this run
+                            # retains its admitted snapshot. Publish only the
+                            # runtime pointer into the current fresh-mode row;
+                            # a newly selected reuse binding belongs to the edit.
+                            current = _state["tasks"].get(tid)
+                            if (current is not None
+                                    and _effective_session_mode(current) == "fresh"):
+                                current["session_id"] = sid
                             try:
                                 _save_state()
                             except Exception:
@@ -1655,7 +1663,12 @@ async def _execute_task(task: dict) -> None:
                     if is_revoked:
                         return True
                     snapshot = copy.deepcopy(_state)
-                    task["last_run"] = now
+                    # The admitted task snapshot may have been replaced by
+                    # an edit. Merge the result timestamp into the current row
+                    # without restoring its old prompt, schedule, or binding.
+                    current = _state["tasks"].get(tid)
+                    if current is not None:
+                        current["last_run"] = now
                     _state["history"].append(entry)
                     # Successful runs and errors both bump unread so the result
                     # remains visible in the bell drawer.

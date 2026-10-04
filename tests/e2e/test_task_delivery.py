@@ -29,8 +29,30 @@ def _git(root, *args):
     )
 
 
+@pytest.fixture
+def delivery_workspace(page, backend_url, auth_token, tmp_path):
+    # Each attempt owns its Git baseline, including pytest reruns sharing a server.
+    root = tmp_path / "e2e-root-delivery"
+    root.mkdir()
+    headers = {"X-Auth-Token": auth_token}
+    registered = page.request.post(
+        f"{backend_url}/api/chat/workspaces", headers=headers, data={"path": str(root)}
+    )
+    assert registered.ok
+    try:
+        yield root
+    finally:
+        try:
+            _app_eval(page, "await app.switchWorkspace(app.primaryWorkspacePath());")
+        finally:
+            removed = page.request.delete(
+                f"{backend_url}/api/chat/workspaces", headers=headers, params={"path": str(root)}
+            )
+            assert removed.ok
+
+
 def test_delivery_artifact_evidence_diff_and_guarded_preview(
-    page, backend_url, auth_token, monkeypatch, tmp_path
+    page, backend_url, auth_token, monkeypatch, tmp_path, delivery_workspace
 ):
     errors = _capture_browser_errors(page)
     _login(page, backend_url, auth_token)
@@ -40,8 +62,20 @@ def test_delivery_artifact_evidence_diff_and_guarded_preview(
         f"{backend_url}/api/chat/sessions/{sid}/runtime", headers={"X-Auth-Token": auth_token}
     )
     assert response.ok
-    root = Path(response.json()["workspace"])
-    assert "e2e-root" in str(root)
+    sessions_dir = Path(response.json()["workspace"]) / "sessions"
+    assert "e2e-root" in str(sessions_dir)
+    root = delivery_workspace
+    _app_eval(
+        page,
+        "await app.fetchSessionWorkspaces(); await app.switchWorkspace(arg);",
+        str(root),
+    )
+    assert _app_eval(page, "return await app._ensureSessionRegistered(app.currentId);")
+    sid = _app_eval(page, "return app.currentId;")
+    response = page.request.get(
+        f"{backend_url}/api/chat/sessions/{sid}/runtime", headers={"X-Auth-Token": auth_token}
+    )
+    assert response.ok and response.json()["workspace"] == str(root)
     target = root / "result.txt"
     target.write_text("before\n")
     (root / ".gitignore").write_text("*\n!.gitignore\n!result.txt\n")
@@ -60,8 +94,8 @@ def test_delivery_artifact_evidence_diff_and_guarded_preview(
     from backend import task_delivery, file_checkpoints
     from claude_agent_sdk import AssistantMessage, UserMessage, ToolUseBlock, ToolResultBlock
 
-    monkeypatch.setattr(task_delivery.sess, "SESS_DIR", root / "sessions")
-    monkeypatch.setattr(file_checkpoints.sess, "SESS_DIR", root / "sessions")
+    monkeypatch.setattr(task_delivery.sess, "SESS_DIR", sessions_dir)
+    monkeypatch.setattr(file_checkpoints.sess, "SESS_DIR", sessions_dir)
     turn, cid, mid = (str(uuid.uuid4()) for _ in range(3))
     task_delivery.begin(sid, turn, root)
     file_checkpoints.begin(sid, turn, root)
@@ -143,16 +177,23 @@ def test_delivery_artifact_evidence_diff_and_guarded_preview(
     page.locator(".terminal-manager-btn").click()
     page.locator(".terminal-create-btn").click()
     page.wait_for_function(
-        "() => document.querySelector('#app')._x_dataStack[0].activeTerminal()?.status === 'running'"
+        """() => {
+            const app = document.querySelector('#app')._x_dataStack[0];
+            return app.activeTerminal()?.status === 'running'
+                && app.terminalConnection === 'connected'
+                && app._terminalSocket?.readyState === WebSocket.OPEN;
+        }"""
     )
     expect(page.locator(".preview-runtime-source")).to_have_count(0)
     terminal = _app_eval(page, "return app.activeTerminal();")
     assert terminal["cwd"] == str(root)
     # Close the fixture shell via its authenticated API; it ran no command.
-    page.request.delete(
+    closed = page.request.delete(
         f"{backend_url}/api/terminals/{terminal['id']}",
-        headers={"X-Auth-Token": auth_token, "X-Workspace": str(root)},
+        headers={"X-Auth-Token": auth_token},
+        params={"workspace": str(root)},
     )
+    assert closed.ok
     page.locator(".workbench-more > summary").click()
     page.locator(".workbench-more .task-delivery-trigger").click()
     panel.get_by_role("button", name="Preview restore scope", exact=True).click()

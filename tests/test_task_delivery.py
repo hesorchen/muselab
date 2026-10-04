@@ -2,6 +2,8 @@
 
 import inspect
 import json
+import errno
+import os
 import subprocess
 import uuid
 import sys
@@ -349,3 +351,37 @@ def test_looping_tool_path_disables_unsafe_checkpoint_restore(evidence):
     assert not preview['can_restore']
     assert 'unsafe_or_unobserved_path' in preview['issues']
     assert target.is_symlink()
+
+
+def test_checkpoint_preview_closes_watch_when_workspace_disappears(evidence, monkeypatch):
+    _, checkpoints, root, sid, turn = evidence
+    cid = str(uuid.uuid4())
+    checkpoints.record_id(sid, turn, cid)
+    tracked_write(evidence)
+    monkeypatch.setattr(checkpoints, "_PREVIEWS", {})
+    original_watch = checkpoints._PreviewWatch
+    opened = []
+    moved = root.with_name("moved-workspace")
+
+    def move_after_watch(cwd, rows):
+        watch = original_watch(cwd, rows)
+        opened.append((watch, watch.fd))
+        cwd.rename(moved)
+        return watch
+
+    monkeypatch.setattr(checkpoints, "_PreviewWatch", move_after_watch)
+    try:
+        result = checkpoints.preview(sid, cid, root, "runtime-a")
+        assert result["can_restore"] is False
+        assert result["token"] is None
+        assert "file_change_observation_unavailable" in result["issues"]
+        assert not checkpoints._PREVIEWS
+        assert (moved / "result.txt").read_text() == "after"
+        assert len(opened) == 1
+        with pytest.raises(OSError) as error:
+            os.fstat(opened[0][1])
+        assert error.value.errno == errno.EBADF
+    finally:
+        # Baseline failures must also release only the watch this test created.
+        for watch, _fd in opened:
+            watch.close()

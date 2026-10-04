@@ -187,7 +187,7 @@ jobs:
         run: |
           mkdir -p $MUSELAB_ROOT
           uv run --frozen --with pytest-rerunfailures \
-            pytest tests/e2e/ -v --reruns 2 --reruns-delay 1
+            pytest tests/e2e/ -v --reruns 2 --reruns-delay 1 --rerun-show-tracebacks
 
   # Build and boot the image on every event, independently of other checks.
   docker-smoke:

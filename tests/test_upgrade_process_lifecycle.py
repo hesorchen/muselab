@@ -56,7 +56,12 @@ def upgrade_processes(app_module, tmp_path, monkeypatch):
         )
         assert kwargs.get("cwd") == (str(tmp_path) if args[1] != "install" else None)
         process = await real_spawn(*args, **kwargs)
+        if args[1] == context.get("hold_registration"):
+            context["registration_entered"].set()
+            await context["release_registration"].wait()
         context["processes"].append(process)
+        if args[1] == context.get("hold_registration"):
+            context["registration_done"].set()
         if context["hold_reap"]:
             real_wait = process.wait
 
@@ -77,9 +82,11 @@ async def _ready_process(context):
     async with asyncio.timeout(2):
         while not context["ready"].exists():
             await asyncio.sleep(0.001)
-    record = json.loads(context["ready"].read_text(encoding="utf-8"))
-    process = context["processes"][-1]
-    assert record["pid"] == process.pid
+        record = json.loads(context["ready"].read_text(encoding="utf-8"))
+        # The child can publish its marker before create_subprocess_exec returns.
+        # A previous upgrade step may already have a different Process recorded.
+        while not (process := next((item for item in context["processes"] if item.pid == record["pid"]), None)):
+            await asyncio.sleep(0.001)
     os.kill(process.pid, 0)
     return process
 
@@ -121,6 +128,53 @@ def test_upgrade_cancel_reaps_each_command(upgrade_processes, step):
             assert not api._UPGRADE_LOCK.locked()
         finally:
             await _cleanup(context, task)
+
+    asyncio.run(scenario())
+
+
+
+@pytest.mark.parametrize("step", ["lock", "sync"])
+def test_upgrade_ready_waits_for_matching_parent_process(upgrade_processes, step):
+    context = upgrade_processes
+    context["control"].write_text(json.dumps({"hold": step}), encoding="utf-8")
+    context["hold_registration"] = step
+
+    async def scenario():
+        api = context["api"]
+        context["registration_entered"] = asyncio.Event()
+        context["release_registration"] = asyncio.Event()
+        context["registration_done"] = asyncio.Event()
+        task = asyncio.create_task(api.trigger_upgrade(api.UpgradeReq(targets=["sdk"])))
+        ready_task = None
+        try:
+            await asyncio.wait_for(context["registration_entered"].wait(), 2)
+            async with asyncio.timeout(2):
+                while not context["ready"].exists():
+                    await asyncio.sleep(0.001)
+            ready_task = asyncio.create_task(_ready_process(context))
+            await asyncio.sleep(0)
+            assert not ready_task.done(), "child readiness must also wait for its parent Process"
+            context["release_registration"].set()
+            process = await asyncio.wait_for(ready_task, 2)
+            task.cancel("upgrade request cancelled")
+            with pytest.raises(asyncio.CancelledError) as cancelled:
+                await asyncio.wait_for(task, 2)
+            assert cancelled.value.args == ("upgrade request cancelled",)
+            assert process.returncode is not None
+            with pytest.raises(ProcessLookupError):
+                os.kill(process.pid, 0)
+            assert not api._UPGRADE_LOCK.locked()
+        finally:
+            context["release_registration"].set()
+            if context["registration_entered"].is_set():
+                await asyncio.wait_for(context["registration_done"].wait(), 2)
+            if ready_task is not None:
+                ready_task.cancel()
+                await asyncio.gather(ready_task, return_exceptions=True)
+            if not task.done():
+                task.cancel("test cleanup")
+            await asyncio.gather(task, return_exceptions=True)
+            await _cleanup(context)
 
     asyncio.run(scenario())
 
