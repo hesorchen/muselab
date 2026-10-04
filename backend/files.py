@@ -2888,29 +2888,36 @@ CSV_SNIFF_BYTES = 8192        # sample size for delimiter / header detection
 
 # Counting every row is necessarily O(file size), but the old endpoint paid
 # that cost on *every* page. Cache only the total (never cell content), keyed by
-# the file's stat signature; writes invalidate naturally via mtime/size. The
-# small LRU is protected because FastAPI sync handlers run in a thread pool.
+# the file's full stat signature, so same-size rewrites or replacements that
+# preserve mtime still invalidate via ctime/inode. The small LRU is protected
+# because FastAPI sync handlers run in a thread pool.
 CSV_TOTAL_CACHE_MAX = 64
-_CSV_TOTAL_CACHE: OrderedDict[str, tuple[int, int, int]] = OrderedDict()
+_CSV_TOTAL_CACHE: OrderedDict[str, tuple[tuple[int, ...], int]] = OrderedDict()
 _CSV_TOTAL_CACHE_LOCK = threading.Lock()
 
 
-def _csv_total_cache_get(target: Path, mtime_ns: int, size: int) -> int | None:
+def _csv_signature(info: os.stat_result) -> tuple[int, ...]:
+    return (
+        info.st_dev, info.st_ino, info.st_mtime_ns, info.st_ctime_ns, info.st_size,
+    )
+
+
+def _csv_total_cache_get(target: Path, signature: tuple[int, ...]) -> int | None:
     key = str(target)
     with _CSV_TOTAL_CACHE_LOCK:
         value = _CSV_TOTAL_CACHE.get(key)
-        if value is None or value[:2] != (mtime_ns, size):
+        if value is None or value[0] != signature:
             if value is not None:
                 _CSV_TOTAL_CACHE.pop(key, None)
             return None
         _CSV_TOTAL_CACHE.move_to_end(key)
-        return value[2]
+        return value[1]
 
 
-def _csv_total_cache_set(target: Path, mtime_ns: int, size: int, total: int) -> None:
+def _csv_total_cache_set(target: Path, signature: tuple[int, ...], total: int) -> None:
     key = str(target)
     with _CSV_TOTAL_CACHE_LOCK:
-        _CSV_TOTAL_CACHE[key] = (mtime_ns, size, total)
+        _CSV_TOTAL_CACHE[key] = (signature, total)
         _CSV_TOTAL_CACHE.move_to_end(key)
         while len(_CSV_TOTAL_CACHE) > CSV_TOTAL_CACHE_MAX:
             _CSV_TOTAL_CACHE.popitem(last=False)
@@ -2946,7 +2953,8 @@ def csv_preview(
         stat = target.stat()
     except OSError:
         raise HTTPException(status_code=404, detail="not a file") from None
-    cached_total = _csv_total_cache_get(target, stat.st_mtime_ns, stat.st_size)
+    signature = _csv_signature(stat)
+    cached_total = _csv_total_cache_get(target, signature)
     if limit < 1:
         limit = CSV_DEFAULT_LIMIT
     if limit > CSV_MAX_LIMIT:
@@ -3025,9 +3033,8 @@ def csv_preview(
         except OSError:
             end_stat = None
         if (end_stat is not None
-                and (end_stat.st_mtime_ns, end_stat.st_size)
-                == (stat.st_mtime_ns, stat.st_size)):
-            _csv_total_cache_set(target, stat.st_mtime_ns, stat.st_size, total_rows)
+                and _csv_signature(end_stat) == signature):
+            _csv_total_cache_set(target, signature, total_rows)
 
     return {
         "path": path,

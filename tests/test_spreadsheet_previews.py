@@ -50,3 +50,42 @@ def test_xlsx_preview_skips_chart_sheets_without_hiding_data(client, auth, temp_
         "name": "Data", "rows": [["Label", "Value"], ["Example", "7"]],
         "rows_truncated": False, "cols_truncated": False,
     }]
+
+
+@pytest.mark.parametrize("replacement", [False, True])
+def test_csv_total_cache_refreshes_after_same_size_and_mtime_change(
+    client, auth, temp_root, replacement,
+):
+    import os
+    import time
+
+    target = temp_root / "changed.csv"
+    before = "1,alpha\n2,bravo\n"
+    after = "1,a\n2,b\n3,c    \n"
+    assert len(before) == len(after)
+    target.write_text(before, encoding="utf-8")
+    response = client.get("/api/files/csv", params={"path": target.name}, headers=auth)
+    assert response.status_code == 200
+    assert response.json()["has_header"] is False
+    assert response.json()["total_rows"] == 2
+    old = target.stat()
+    # Coarse filesystem clock ticks must separate the two independent writes.
+    time.sleep(0.01)
+    if replacement:
+        temporary = temp_root / "replacement.csv"
+        temporary.write_text(after, encoding="utf-8")
+        os.utime(temporary, ns=(old.st_atime_ns, old.st_mtime_ns))
+        temporary.replace(target)
+    else:
+        target.write_text(after, encoding="utf-8")
+        os.utime(target, ns=(old.st_atime_ns, old.st_mtime_ns))
+    assert target.stat().st_size == old.st_size
+    assert target.stat().st_mtime_ns == old.st_mtime_ns
+    assert (target.stat().st_ino, target.stat().st_ctime_ns) != (old.st_ino, old.st_ctime_ns)
+
+    response = client.get("/api/files/csv", params={
+        "path": target.name, "offset": 2, "limit": 1,
+    }, headers=auth)
+    assert response.status_code == 200
+    assert response.json()["total_rows"] == 3
+    assert response.json()["rows"] == [["3", "c    "]]
