@@ -5,6 +5,7 @@ import ctypes
 import errno
 import fcntl
 import hashlib
+import io
 import heapq
 import os
 import json
@@ -25,6 +26,7 @@ from fastapi import (
 )
 from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse, RedirectResponse
 from pydantic import BaseModel
+from starlette._utils import create_collapsing_task_group
 from starlette.datastructures import MutableHeaders
 from . import observability as obs
 from .auth import require_token, require_token_query
@@ -2506,8 +2508,8 @@ MAX_TEXT_SIZE = 2 * 1024 * 1024  # 2 MB — bigger files refuse with 413
 SNIFF_BYTES = 4096                # how much we read to detect NUL bytes
 
 
-def _looks_binary(p: Path) -> bool:
-    """Heuristic: read up to 4 KB, presence of NUL byte → binary. Otherwise
+def _looks_binary(chunk: bytes) -> bool:
+    """Heuristic: a NUL byte in the sniff window → binary. Otherwise
     decode with `errors="replace"` and check how many bytes turned into the
     Unicode replacement character (U+FFFD). High ratio → binary / garbage.
 
@@ -2517,11 +2519,6 @@ def _looks_binary(p: Path) -> bool:
     UnicodeDecodeError purely because of the chunk boundary — wrongly tagged
     binary. `errors="replace"` decodes whatever can be decoded and only the
     truly invalid bytes become U+FFFD."""
-    try:
-        with p.open("rb") as f:
-            chunk = f.read(SNIFF_BYTES)
-    except OSError:
-        return True
     if b"\x00" in chunk:
         return True
     # decode with replacement; count how many chars are the replacement marker
@@ -3079,30 +3076,24 @@ def read_file(
     # Fast reject for known binary extensions.
     if suffix in BINARY_EXT:
         raise HTTPException(status_code=415, detail="binary file — not previewable as text")
-    # Single stat() reused for both the size gate and the empty-file check.
-    # The previous code called target.stat() twice; if the file vanished
-    # between the two calls (TOCTOU) the second stat raised
-    # FileNotFoundError → 500 instead of a clean 404.
+    stream, info = _open_response_file(target)
     try:
-        st_size = target.stat().st_size
-    except OSError:
-        raise HTTPException(status_code=404, detail="not a file") from None
-    if st_size > MAX_TEXT_SIZE:
-        raise HTTPException(status_code=413, detail="file too large for preview")
-    # Empty extension + not a known text name? Sniff content. Empty files OK.
-    # This is the path that picks up .tmpl, .conf.j2, .env.staging, etc.
-    if st_size > 0 and _looks_binary(target):
-        raise HTTPException(status_code=415, detail="binary content — not previewable as text")
-    try:
-        content = target.read_text(encoding="utf-8", errors="replace")
+        with stream:
+            if info.st_size > MAX_TEXT_SIZE:
+                raise HTTPException(status_code=413, detail="file too large for preview")
+            # Sniff and read the same inode. Keep the prefix so the total disk
+            # read stays within the byte cap plus one overflow-detection byte,
+            # even if the file grows after the descriptor's size snapshot.
+            data = stream.read(min(SNIFF_BYTES, MAX_TEXT_SIZE + 1))
+            if _looks_binary(data):
+                raise HTTPException(status_code=415, detail="binary content — not previewable as text")
+            data += stream.read(MAX_TEXT_SIZE + 1 - len(data))
     except (FileNotFoundError, NotADirectoryError, IsADirectoryError):
-        # A concurrent filesystem edit can invalidate the stat/sniff above.
         raise HTTPException(status_code=404, detail="not a file") from None
-    if len(content) > MAX_TEXT_SIZE:
-        raise HTTPException(
-            status_code=413,
-            detail=f"File too large to read as text ({len(content)} bytes > {MAX_TEXT_SIZE})",
-        )
+    if len(data) > MAX_TEXT_SIZE:
+        raise HTTPException(status_code=413, detail="file too large for preview")
+    # Match read_text's UTF-8 replacement and universal-newline behavior.
+    content = data.decode("utf-8", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
     return PlainTextResponse(
         content,
         headers={
@@ -3308,9 +3299,18 @@ async def _require_raw_access(
 def _inject_preview_html_bridge(target: Path) -> str | None:
     """Return HTML with the preview bridge, or None for untouched streaming."""
     try:
-        if target.stat().st_size > _PREVIEW_INJECT_MAX_BYTES:
+        stream, info = _open_response_file(target)
+        with stream:
+            if info.st_size > _PREVIEW_INJECT_MAX_BYTES:
+                return None
+            # A file can grow after fstat. Bound the actual read as well as
+            # the size hint, then fall back to streaming without injection.
+            with io.BufferedReader(stream) as buffered:
+                payload = buffered.read(_PREVIEW_INJECT_MAX_BYTES + 1)
+        if len(payload) > _PREVIEW_INJECT_MAX_BYTES:
             return None
-        html = target.read_text(encoding="utf-8")
+        # Preserve read_text's universal-newline behavior.
+        html = payload.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
     except (OSError, UnicodeDecodeError):
         return None
     lower = html.lower()
@@ -3476,10 +3476,27 @@ class _OpenedFileResponse(FileResponse):
         self._file = anyio.wrap_file(stream)
 
     async def __call__(self, scope, receive, send) -> None:
+        response = super().__call__
         try:
-            await super().__call__(scope, receive, send)
+            spec_version = tuple(map(int, scope.get("asgi", {}).get("spec_version", "2.0").split(".")))
+            # Keep the sender in a child task so parent cancellation joins its
+            # shielded disk worker before closing the FD that worker still owns.
+            async with create_collapsing_task_group() as task_group:
+                async def stream_response() -> None:
+                    await response(scope, receive, send)
+                    task_group.cancel_scope.cancel()
+
+                task_group.start_soon(stream_response)
+                if scope["type"] == "http" and spec_version < (2, 4):
+                    # Older ASGI servers may silently discard sends after the
+                    # peer closes; receive is their disconnect notification.
+                    while True:
+                        message = await receive()
+                        if message["type"] == "http.disconnect":
+                            task_group.cancel_scope.cancel()
+                            break
+                        await anyio.lowlevel.checkpoint()
         finally:
-            # Synchronous close also runs when the task's cancel scope is active.
             self._stream.close()
 
     async def _send_span(self, send, start: int, end: int, *, final: bool = True) -> None:
