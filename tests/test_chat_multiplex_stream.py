@@ -1070,3 +1070,46 @@ def test_mux_disconnect_releases_successors_waiting_for_a_live_predecessor(chat_
                 broadcast.finish()
                 broadcast.close()
     asyncio.run(scenario())
+
+
+@pytest.mark.asyncio
+async def test_mux_close_after_handshake_retires_unstarted_child(chat_mod):
+    broadcast = chat_mod.TurnBroadcast("unstarted-mux-child")
+    chat_mod._active_turns[broadcast.session_id] = broadcast
+    stream = chat_mod._subscribe_multiplex({})
+    try:
+        assert await anext(stream) == {"event": "ping", "data": ""}
+        assert len(broadcast.subscribers) == 1
+        # No event-loop yield separates handshake from close. The adoption
+        # task has not entered its try/finally and still owns this subscriber.
+        await stream.aclose()
+        assert not broadcast.subscribers
+    finally:
+        await stream.aclose()
+        broadcast.close()
+        await broadcast.events.flush_async()
+
+
+@pytest.mark.asyncio
+async def test_mux_setup_storage_failure_retires_listener_and_prior_children(chat_mod):
+    first = chat_mod.TurnBroadcast("first-mux-child")
+    broken = chat_mod.TurnBroadcast("broken-mux-child")
+    broken.publish({"event": "text", "data": '{"text":"synthetic"}'})
+    broken.events._io._error = OSError("synthetic storage unavailable")
+    chat_mod._active_turns[first.session_id] = first
+    chat_mod._active_turns[broken.session_id] = broken
+    before = set(chat_mod._mux_turn_listeners)
+    stream = chat_mod._subscribe_multiplex({})
+    try:
+        with pytest.raises(OSError, match="replay storage unavailable"):
+            await anext(stream)
+        assert chat_mod._mux_turn_listeners == before
+        assert not first.subscribers
+    finally:
+        await stream.aclose()
+        for callback in chat_mod._mux_turn_listeners - before:
+            chat_mod._mux_turn_listeners.discard(callback)
+        first.close()
+        broken.close()
+        await asyncio.gather(first.events.flush_async(), broken.events.flush_async(),
+                             return_exceptions=True)

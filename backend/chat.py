@@ -873,6 +873,8 @@ class _TurnSubscriber:
             event = await self._next_spool_event()
             if self._resync_payload:
                 continue
+            if self._replay is None:
+                return None
             if event is _LIVE_MESSAGE_BARRIER:
                 self._draining_live_barrier = True
                 continue
@@ -895,6 +897,8 @@ class _TurnSubscriber:
             event = await self._next_spool_event()
             if self._resync_payload:
                 continue
+            if self._replay is None:
+                return None
             if event is _LIVE_MESSAGE_BARRIER:
                 self._draining_live_barrier = True
                 continue
@@ -937,6 +941,10 @@ class _TurnSubscriber:
                 # HTTP wait_for timeouts must not lose a record whose disk read
                 # continues. The next get() consumes this same completed read.
                 revision, offset, event = await asyncio.shield(task)
+            except asyncio.CancelledError:
+                if self._replay is not reader:
+                    return None  # permanent close/resync retired this cursor
+                raise  # an HTTP timeout still reuses the same pending read
             except _ReplayRecordCorruption:
                 self._pending_spool_read = None
                 self.resync("replay_corrupt")
@@ -1013,6 +1021,13 @@ class _TurnSubscriber:
         if self._replay is not None:
             self._replay.close()
             self._replay = None
+        pending, self._pending_spool_read = self._pending_spool_read, None
+        if pending is not None and not pending.done():
+            # Permanent retirement differs from a resumable get() timeout.
+            # Cancelling this wrapper preserves accepted writes (shielded by
+            # ReplayIO) and lets an already-running disk worker finish/close
+            # through ReplayReader's own descriptor lock.
+            pending.cancel()
 
 
 
@@ -20389,6 +20404,9 @@ async def _subscribe_multiplex(
                     session_tails.pop(session_id, None)
 
         task = asyncio.create_task(_adopt())
+        # A task cancelled before its first tick never enters its finally.
+        # Keep the subscription's release attached to the exact task outcome.
+        task.add_done_callback(lambda _done: broadcast.unsubscribe(subscriber))
         preparing[key] = task
         session_tails[session_id] = task
 
@@ -20431,23 +20449,6 @@ async def _subscribe_multiplex(
             state_payload=state_payload,
             prefix_events=prefix_events,
         )
-
-    # Register and snapshot without an await between them. Turn admission runs
-    # on this same event loop, so no accepted broadcast can fall into the gap.
-    _mux_turn_listeners.add(_offer_broadcast)
-    for session_id, checkpoint in tuple(pending_checkpoints.items()):
-        requested_turn_id = str(checkpoint.get("turn_id") or "")
-        recent = _get_recent_turn(session_id)
-        if recent is not None and recent.turn_id == requested_turn_id:
-            _start_child(
-                session_id,
-                recent,
-                int(checkpoint.get("last_event_seq", 0) or 0),
-            )
-            pending_checkpoints.pop(session_id, None)
-    for broadcast in tuple(_active_turns.values()):
-        if not broadcast.done:
-            _offer_broadcast(broadcast)
 
     async def _reconcile() -> None:
         nonlocal last_scheduled_history_poll
@@ -20677,9 +20678,27 @@ async def _subscribe_multiplex(
                 deadline = now + _MUX_RECONCILE_INTERVAL_S
             await asyncio.sleep(max(0.0, deadline - now))
 
-    reconcile_task = asyncio.create_task(_reconcile_loop())
+    reconcile_task: asyncio.Task | None = None
     output_get: asyncio.Task | None = None
     try:
+        # Register and snapshot without an await between them. Turn admission runs
+        # on this same event loop, so no accepted broadcast can fall into the gap.
+        _mux_turn_listeners.add(_offer_broadcast)
+        for session_id, checkpoint in tuple(pending_checkpoints.items()):
+            requested_turn_id = str(checkpoint.get("turn_id") or "")
+            recent = _get_recent_turn(session_id)
+            if recent is not None and recent.turn_id == requested_turn_id:
+                _start_child(
+                    session_id,
+                    recent,
+                    int(checkpoint.get("last_event_seq", 0) or 0),
+                )
+                pending_checkpoints.pop(session_id, None)
+        for broadcast in tuple(_active_turns.values()):
+            if not broadcast.done:
+                _offer_broadcast(broadcast)
+
+        reconcile_task = asyncio.create_task(_reconcile_loop())
         # Flush the SSE headers only after listener registration. Starlette's
         # event-stream responder buffers response.start until the first frame.
         yield {"event": "ping", "data": ""}
@@ -20702,7 +20721,8 @@ async def _subscribe_multiplex(
         _mux_turn_listeners.discard(_offer_broadcast)
         if output_get is not None:
             output_get.cancel()
-        reconcile_task.cancel()
+        if reconcile_task is not None:
+            reconcile_task.cancel()
         for task in preparing.values():
             task.cancel()
         for task in children.values():
@@ -20710,7 +20730,7 @@ async def _subscribe_multiplex(
         await asyncio.gather(
             *(
                 ([output_get] if output_get is not None else [])
-                + [reconcile_task]
+                + ([reconcile_task] if reconcile_task is not None else [])
                 + list(preparing.values())
                 + list(children.values())
             ),
