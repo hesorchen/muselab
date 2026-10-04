@@ -20,6 +20,7 @@ import time
 from bisect import bisect_right
 from collections import OrderedDict
 from pathlib import Path
+from xml.etree.ElementTree import ParseError
 from typing import BinaryIO, Literal
 import anyio
 from fastapi import (
@@ -2878,6 +2879,12 @@ def xlsx_preview(path: str, root: Path = Depends(_workspace_root), external: boo
                 "limits": {"max_rows": XLSX_MAX_ROWS, "max_cols": XLSX_MAX_COLS,
                            "max_sheets": XLSX_MAX_SHEETS},
             }
+        except ParseError:
+            # Read-only worksheets parse their XML lazily during iteration.
+            raise HTTPException(
+                status_code=422,
+                detail="failed to parse spreadsheet (file may be corrupt or unsupported)",
+            ) from None
         finally:
             wb.close()
 
