@@ -5001,7 +5001,7 @@
                     <div class="settings-row">
                       <label x-text="t('set.prov.models')"></label>
                       <textarea class="settings-input mono" rows="4"
-                                x-model="settings.providerDrafts[p.id].models"
+                                x-model="_providerDraftField(p.id, 'models').value"
                                 :placeholder="t('set.prov.models_ph')"></textarea>
                     </div>
                     <div class="settings-hint"
@@ -5047,24 +5047,24 @@
                   <div x-show="settings.providerDrafts[p.id]?.open" class="provider-editor">
                     <div class="settings-row">
                       <label x-text="t('set.prov.endpoint')"></label>
-                      <input class="settings-input mono" x-model="settings.providerDrafts[p.id].base_url"
+                      <input class="settings-input mono" x-model="_providerDraftField(p.id, 'base_url').value"
                              :placeholder="t('set.prov.endpoint_ph')" />
                     </div>
                     <div class="settings-row">
                       <label x-text="t('set.prov.prefix')"></label>
-                      <input class="settings-input mono" x-model="settings.providerDrafts[p.id].prefix"
+                      <input class="settings-input mono" x-model="_providerDraftField(p.id, 'prefix').value"
                              :placeholder="t('set.prov.prefix_ph')" />
                     </div>
                     <div class="settings-row">
                       <label x-text="t('set.prov.models')"></label>
                       <textarea class="settings-input mono" rows="4"
-                                x-model="settings.providerDrafts[p.id].models"
+                                x-model="_providerDraftField(p.id, 'models').value"
                                 :placeholder="t('set.prov.models_ph')"></textarea>
                     </div>
                     <div class="settings-row">
                       <label x-text="t('set.prov.apikey')"></label>
                       <input type="password" class="settings-input"
-                             x-model="settings.providerDrafts[p.id].api_key"
+                             x-model="_providerDraftField(p.id, 'api_key').value"
                              :placeholder="p.configured ? t('set.key_edit_placeholder') : t('set.placeholder_key')" />
                     </div>
                     <div class="settings-hint" x-text="t('set.prov.hint')"></div>

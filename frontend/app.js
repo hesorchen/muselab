@@ -22945,6 +22945,19 @@ function portal() {
       };
     },
 
+    // Removed rows can still finish queued Alpine bindings. Resolve every
+    // field against the current map without recreating a departed draft.
+    _providerDraftField(pid, field) {
+      const app = this;
+      return {
+        get value() { return app.settings.providerDrafts[pid]?.[field] ?? ""; },
+        set value(value) {
+          const draft = app.settings.providerDrafts[pid];
+          if (draft) draft[field] = value;
+        },
+      };
+    },
+
     // Open or close the inline editor for one provider. Opening seeds the
     // draft from the committed values; closing just drops the open flag so
     // the next open re-seeds (cancel = discard).
