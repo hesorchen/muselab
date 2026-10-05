@@ -7144,16 +7144,32 @@ function portal() {
         this._modalFocusStack = this._modalFocusStack.filter(item => item !== key);
         this._modalFocusStack.push(key);
       }
+      const surface = this._focusSurfaceState[key];
+      const retryAfterShow = key === "activity-move" || key === "session-todo";
       this.$nextTick(() => {
-        const state = this._focusSurfaceState[key];
-        if (!state) return;
-        const root = document.querySelector(state.rootSelector);
-        if (!root) return;
-        const focusable = this._focusableElements(root);
-        const preferred = state.initialSelector
-          ? root.querySelector(state.initialSelector) : null;
-        const target = focusable.includes(preferred) ? preferred : (focusable[0] || root);
-        this._focusWithoutScroll(target);
+        const focusSurface = () => {
+          const state = this._focusSurfaceState[key];
+          if (!state) return false;
+          if (retryAfterShow && (state !== surface
+              || (key === "activity-move" ? !this.activity.moveMenu.show : !this.sessionTodoOpen)
+              || this._modalFocusStack[this._modalFocusStack.length - 1] !== key)) {
+            return false;
+          }
+          const root = document.querySelector(state.rootSelector);
+          if (!root) return false;
+          // A user may already have moved within the surface before the retry.
+          if (retryAfterShow && root.contains(document.activeElement)) return true;
+          const focusable = this._focusableElements(root);
+          const preferred = state.initialSelector
+            ? root.querySelector(state.initialSelector) : null;
+          const target = focusable.includes(preferred) ? preferred : (focusable[0] || root);
+          return this._focusWithoutScroll(target);
+        };
+        if (!focusSurface() && retryAfterShow) {
+          // Alpine x-show schedules its visibility change in rAF, which can
+          // follow nextTick. Retry once after that paint, without polling.
+          this._afterPaint(focusSurface);
+        }
       });
     },
     _closeFocusSurface(key, restore = true) {
@@ -22926,6 +22942,19 @@ function portal() {
         prefix: p.prefix || "",
         models: (p.models || []).join("\n"),
         api_key: "",
+      };
+    },
+
+    // Removed rows can still finish queued Alpine bindings. Resolve every
+    // field against the current map without recreating a departed draft.
+    _providerDraftField(pid, field) {
+      const app = this;
+      return {
+        get value() { return app.settings.providerDrafts[pid]?.[field] ?? ""; },
+        set value(value) {
+          const draft = app.settings.providerDrafts[pid];
+          if (draft) draft[field] = value;
+        },
       };
     },
 

@@ -23,6 +23,8 @@ def live_mux_server(tmp_path, page):
         port = listener.getsockname()[1]
     env = {**os.environ, "MUSELAB_ROOT": str(root),
         "MUSELAB_SESSIONS_DIR": str(root / "sessions"),
+        "MUSELAB_CONFIG_DIR": str(root),
+        "MUSELAB_MEMORY_DIR": str(root / "memory"),
         "MUSELAB_ENV_PATH": str(root / "runtime.env"),
         "XDG_STATE_HOME": str(root / "state"),
         "MUSELAB_TOKEN": "test-token-1234567890abcdef-secure-min-32",
