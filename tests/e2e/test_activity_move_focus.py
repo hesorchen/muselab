@@ -42,7 +42,7 @@ def _defer_native_show(page, *, hold_retry=False):
       if (typeof originalToggle !== 'function') throw new Error('Missing Alpine x-show');
       const gate = window.__activityFocusGate = {
         installed:true, armed:true, showHeld:false, showReleased:false,
-        attempted:false, firstAttempt:null, retryHeld:false, retryReleased:false,
+        attempted:false, firstAttempt:null, retryReserved:false, retryHeld:false, retryReleased:false,
       };
       let showCallback = null, retryCallback = null;
       const releaseShow = () => {
@@ -76,7 +76,8 @@ def _defer_native_show(page, *, hold_retry=False):
       if (holdRetry) {
         const originalAfterPaint = app._afterPaint;
         app._afterPaint = function(callback) {
-          if (gate.attempted && !gate.retryHeld && !retryCallback) {
+          if (gate.attempted && !gate.retryReserved) {
+            gate.retryReserved=true;
             return originalAfterPaint.call(this,() => {
               gate.retryHeld=true; retryCallback=callback;
             });
