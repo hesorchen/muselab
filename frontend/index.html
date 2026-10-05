@@ -1818,15 +1818,15 @@
                             :title="(lang==='zh' ? '打开会话：' : 'Open session: ') + s.name">
                       <!-- Streaming / unread dots — mirrors tab-strip behavior -->
                       <span class="chat-tab-stream-dot picker-status-dot"
-                            :class="{ 'is-background': isTabBackgroundActive(s.id) || isTabScheduledActive(s.id) }"
-                            x-show="isTabRunning(s.id)"
-                            :title="isTabScheduledActive(s.id)
+                            :class="{ 'is-background': isTabBackgroundActive(s.id, s) || isTabScheduledActive(s.id, s) }"
+                            x-show="isTabRunning(s.id, s)"
+                            :title="isTabScheduledActive(s.id, s)
                               ? (lang==='zh' ? '定时任务待命或执行中' : 'Scheduled task ready or running')
-                              : isTabBackgroundActive(s.id)
+                              : isTabBackgroundActive(s.id, s)
                                 ? t('chat.background_running')
                               : (lang==='zh' ? '正在生成…' : 'Streaming…')"></span>
                       <span class="chat-tab-unread-dot picker-status-dot"
-                            x-show="isTabUnread(s.id)"
+                            x-show="isTabUnread(s.id, s)"
                             :title="lang==='zh' ? '有新回复' : 'New reply ready'"></span>
                       <span class="ellipsis" x-text="s.name"></span>
                     </button>

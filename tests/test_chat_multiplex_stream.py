@@ -190,7 +190,7 @@ def test_mux_ticket_validation_dedupes_and_is_single_use(
 
 
 def test_idle_mux_flushes_headers_through_gzip(
-        chat_mod, app_module):
+        chat_mod, app_module, monkeypatch):
     ticket = chat_mod.mux_stream_start(
         chat_mod.MuxStreamStartReq(checkpoints=[], mobile=False),
     )["ticket"]
@@ -227,6 +227,16 @@ def test_idle_mux_flushes_headers_through_gzip(
             return {"type": "http.disconnect"}
 
         messages: asyncio.Queue = asyncio.Queue()
+        stream_started = asyncio.Event()
+        stream_response = chat_mod.EventSourceResponse._stream_response
+
+        async def observe_stream_start(response, send):
+            stream_started.set()
+            await stream_response(response, send)
+
+        monkeypatch.setattr(
+            chat_mod.EventSourceResponse, "_stream_response", observe_stream_start,
+        )
 
         async def send(message):
             await messages.put(message)
@@ -234,7 +244,18 @@ def test_idle_mux_flushes_headers_through_gzip(
         request_task = asyncio.create_task(
             app_module.app(scope, receive, send),
         )
+        ready_task = asyncio.create_task(stream_started.wait())
         try:
+            # Cold request setup is separate from the GZip flush contract. Once
+            # the real SSE producer starts, retain both original frame guards.
+            done, _ = await asyncio.wait(
+                {request_task, ready_task}, timeout=10,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if request_task in done:
+                await request_task
+                assert stream_started.is_set(), "mux request completed before stream started"
+            assert ready_task in done, "mux stream did not start within setup guard"
             response_start = await asyncio.wait_for(messages.get(), timeout=2)
             assert response_start["type"] == "http.response.start"
             assert response_start["status"] == 200
@@ -250,6 +271,8 @@ def test_idle_mux_flushes_headers_through_gzip(
             assert b"event: ping" in first_body.get("body", b"")
         finally:
             disconnected.set()
+            ready_task.cancel()
+            await asyncio.gather(ready_task, return_exceptions=True)
             await asyncio.wait_for(request_task, timeout=2)
 
     asyncio.run(exercise())
