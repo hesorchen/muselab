@@ -7145,26 +7145,27 @@ function portal() {
         this._modalFocusStack.push(key);
       }
       const surface = this._focusSurfaceState[key];
+      const retryAfterShow = key === "activity-move" || key === "session-todo";
       this.$nextTick(() => {
         const focusSurface = () => {
           const state = this._focusSurfaceState[key];
           if (!state) return false;
-          if (key === "activity-move" && (state !== surface
-              || !this.activity.moveMenu.show
+          if (retryAfterShow && (state !== surface
+              || (key === "activity-move" ? !this.activity.moveMenu.show : !this.sessionTodoOpen)
               || this._modalFocusStack[this._modalFocusStack.length - 1] !== key)) {
             return false;
           }
           const root = document.querySelector(state.rootSelector);
           if (!root) return false;
-          // A user may already have moved within the menu before the retry.
-          if (key === "activity-move" && root.contains(document.activeElement)) return true;
+          // A user may already have moved within the surface before the retry.
+          if (retryAfterShow && root.contains(document.activeElement)) return true;
           const focusable = this._focusableElements(root);
           const preferred = state.initialSelector
             ? root.querySelector(state.initialSelector) : null;
           const target = focusable.includes(preferred) ? preferred : (focusable[0] || root);
           return this._focusWithoutScroll(target);
         };
-        if (!focusSurface() && key === "activity-move") {
+        if (!focusSurface() && retryAfterShow) {
           // Alpine x-show schedules its visibility change in rAF, which can
           // follow nextTick. Retry once after that paint, without polling.
           this._afterPaint(focusSurface);
