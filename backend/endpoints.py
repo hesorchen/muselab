@@ -735,15 +735,29 @@ def _overrides_stat_key() -> tuple[int, int] | None:
         return None
 
 
-def _parse_overrides(text: str) -> dict:
+class ProviderOverridesReadError(RuntimeError):
+    """Stored provider configuration cannot safely be used for a write."""
+
+
+def _parse_overrides(text: str, *, strict: bool = False) -> dict:
     """Normalize the raw JSON text into the canonical store shape. Tolerates
     malformed content by returning the empty shape."""
     try:
         data = json.loads(text)
-    except (ValueError, TypeError):
+    except (ValueError, TypeError) as exc:
+        if strict:
+            raise ProviderOverridesReadError("Provider configuration contains invalid JSON") from exc
         return {"providers": {}, "deleted": [], "anthropic_models": None}
     if not isinstance(data, dict):
+        if strict:
+            raise ProviderOverridesReadError("Provider configuration must be an object")
         return {"providers": {}, "deleted": [], "anthropic_models": None}
+    if strict:
+        for name, kind in (("providers", dict), ("deleted", list)):
+            if name in data and not isinstance(data[name], kind):
+                raise ProviderOverridesReadError(f"Provider configuration has invalid {name}")
+        if data.get("anthropic_models") is not None and not isinstance(data["anthropic_models"], list):
+            raise ProviderOverridesReadError("Provider configuration has invalid anthropic_models")
     prov = data.get("providers")
     deleted = data.get("deleted")
     # Anthropic/Claude is special-cased (OAuth-or-key auth, no editable
@@ -757,13 +771,29 @@ def _parse_overrides(text: str) -> dict:
     }
 
 
-def _load_overrides() -> dict:
+def _load_overrides(*, for_write: bool = False) -> dict:
     """Read the override store, cached by the file's (mtime_ns, size). Tolerates
     a missing / malformed file by returning the empty shape.
 
     Returns a deep copy so write-path callers (which mutate `store` in place
     before _save_overrides) can't corrupt the shared cache."""
     global _OVERRIDES_CACHE
+    if for_write:
+        # Cached/tolerant reads are useful for routing, but cannot authorize a
+        # destructive rewrite. Read the actual file on each write transaction.
+        try:
+            OVERRIDES_PATH.stat()
+        except FileNotFoundError:
+            # The file may appear between stat and read. Only the actual read
+            # can establish that it is missing; exists() is not authoritative.
+            pass
+        try:
+            text = OVERRIDES_PATH.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return {"providers": {}, "deleted": [], "anthropic_models": None}
+        except UnicodeError as exc:
+            raise ProviderOverridesReadError("Provider configuration cannot be decoded") from exc
+        return _parse_overrides(text, strict=True)
     key = _overrides_stat_key()
     if key is None:
         return {"providers": {}, "deleted": [], "anthropic_models": None}
@@ -950,9 +980,9 @@ def upsert_provider(*, pid: str | None, base_url: str, prefix: str,
     Provider. api-key is handled separately (stays in .env). Raises ValueError
     on invalid input."""
     with _OVERRIDES_WRITE_LOCK:
+        store = _load_overrides(for_write=True)
         models = [str(m).strip() for m in models if str(m).strip()]
         validate_provider_fields(base_url, prefix, models, this_id=pid)
-        store = _load_overrides()
         # New provider: mint a stable custom id + an env-key slot if none given.
         if not pid:
             pid = "c:" + _slug(base_url)
@@ -1007,7 +1037,7 @@ def delete_provider(pid: str) -> bool:
     reappear; user-created providers are dropped outright. Returns True if
     anything changed."""
     with _OVERRIDES_WRITE_LOCK:
-        store = _load_overrides()
+        store = _load_overrides(for_write=True)
         changed = False
         if pid in store["providers"]:
             del store["providers"][pid]
@@ -1031,7 +1061,7 @@ def restore_provider(pid: str) -> bool:
             return restore_anthropic_models()
         if _builtin_by_id(pid) is None:
             return False
-        store = _load_overrides()
+        store = _load_overrides(for_write=True)
         changed = False
         if pid in store["providers"]:
             del store["providers"][pid]
@@ -1195,7 +1225,7 @@ def set_anthropic_models(models: list[str]) -> None:
                 raise ValueError(f"not a Claude model id: {m!r} (must start with 'claude-')")
         if len(set(cleaned)) != len(cleaned):
             raise ValueError("duplicate model ids")
-        store = _load_overrides()
+        store = _load_overrides(for_write=True)
         store["anthropic_models"] = cleaned
         _save_overrides(store)
 
@@ -1204,7 +1234,7 @@ def restore_anthropic_models() -> bool:
     """Drop the Claude model override (revert to factory default). Returns
     True if there was an override to remove, False if already default."""
     with _OVERRIDES_WRITE_LOCK:
-        store = _load_overrides()
+        store = _load_overrides(for_write=True)
         if store.get("anthropic_models") is None:
             return False
         store["anthropic_models"] = None
