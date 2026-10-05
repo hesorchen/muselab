@@ -20,6 +20,7 @@ import re
 import shutil
 import tempfile
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -943,7 +944,8 @@ def validate_provider_fields(base_url: str, prefix: str, models: list[str],
 
 
 def upsert_provider(*, pid: str | None, base_url: str, prefix: str,
-                    display: str, env_key: str, models: list[str]) -> Provider:
+                    display: str, env_key: str, models: list[str],
+                    before_save: Callable[[str, str], None] | None = None) -> Provider:
     """Create or update a provider override. Returns the saved effective
     Provider. api-key is handled separately (stays in .env). Raises ValueError
     on invalid input."""
@@ -994,6 +996,8 @@ def upsert_provider(*, pid: str | None, base_url: str, prefix: str,
         store["providers"][pid] = entry
         # If this id was previously deleted (e.g. re-adding a built-in), un-delete.
         store["deleted"] = [d for d in store["deleted"] if d != pid]
+        if before_save is not None:
+            before_save(pid, entry["env_key"])
         _save_overrides(store)
         return _provider_from_def(pid, entry, _builtin_by_id(pid))
 

@@ -5,6 +5,7 @@ refreshes os.environ so the changes take effect without restarting the server.
 from __future__ import annotations
 import asyncio
 import json
+import logging
 import os
 import re
 import signal
@@ -137,7 +138,7 @@ def _dotenv_value(value: str) -> str:
         return value
     return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
 
-def _write_env(updates: dict[str, str]) -> None:
+def _write_env(updates: dict[str, str | None], *, publish: bool = True) -> None:
     """Atomically merge updates into .env. Keys with empty-string value get
     written as `KEY=` (allowed); to actually remove a key, pass None and we
     drop the line.
@@ -202,12 +203,39 @@ def _write_env(updates: dict[str, str]) -> None:
                 pass
             raise
 
-        # Refresh in-process env so the change takes effect immediately.
-        for k, v in updates.items():
-            if v is None:
-                os.environ.pop(k, None)
-            else:
-                os.environ[k] = v
+        if publish:
+            _publish_env_updates(updates)
+
+
+def _publish_env_updates(updates: dict[str, str | None]) -> None:
+    for key, value in updates.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
+
+
+def _backup_provider_env() -> Path | None:
+    """Stage original bytes before the provider transaction mutates .env."""
+    try:
+        original = ENV_PATH.read_bytes()
+    except FileNotFoundError:
+        return None
+    fd, name = tempfile.mkstemp(prefix=".env.provider-rollback.", dir=ENV_PATH.parent)
+    backup = Path(name)
+    stream = None
+    try:
+        stream = os.fdopen(fd, "wb")
+        with stream:
+            stream.write(original)
+            stream.flush()
+            os.fsync(stream.fileno())
+    except Exception:
+        if stream is None:
+            os.close(fd)
+        backup.unlink(missing_ok=True)
+        raise
+    return backup
 
 
 # Single source of truth for setting defaults — keys = env var name, values
@@ -513,28 +541,89 @@ class ProviderIdIn(BaseModel):
 
 @router.post("/providers", dependencies=[Depends(require_token)])
 def upsert_provider(req: ProviderIn) -> dict:
-    """Create or edit a provider override. Returns the saved provider's stable
-    id + env_key so the FE can immediately PUT the api-key (or read it back).
-    Validation errors (bad URL, dup prefix, model not prefixed) → 422."""
+    """Save provider metadata and its optional credential together on failure.
+
+    This protects normal exceptions, not a process crash between two renames.
+    Validation errors (bad URL, dup prefix, model not prefixed) → 422.
+    """
     from . import endpoints as _ep
-    try:
-        p = _ep.upsert_provider(
-            pid=req.id,
-            base_url=req.base_url,
-            prefix=req.prefix,
-            display=req.display or req.prefix,
-            env_key=req.env_key or "",
-            models=req.models,
-        )
-    except ValueError as e:
-        raise HTTPException(422, str(e)) from e
-    # Optional api-key write in the same call. Reuse the same mask-guard as
-    # put_settings so a leaked mask string can't overwrite a real key.
-    if req.api_key is not None:
-        if req.api_key == "_delete_":
-            _write_env({p.env_key: None})  # type: ignore[dict-item]
-        elif req.api_key and "•" not in req.api_key:
-            _write_env({p.env_key: req.api_key})
+    write_key = req.api_key == "_delete_" or bool(req.api_key and "•" not in req.api_key)
+    # os.environ rejects NUL after persistence. Reject it before either file
+    # changes, without echoing the credential in a validation error.
+    if write_key and req.api_key is not None and "\x00" in req.api_key:
+        raise HTTPException(422, "API key contains an invalid character")
+    env_error: ValueError | None = None
+
+    def save(before_save=None):
+        try:
+            return _ep.upsert_provider(
+                pid=req.id,
+                base_url=req.base_url,
+                prefix=req.prefix,
+                display=req.display or req.prefix,
+                env_key=req.env_key or "",
+                models=req.models,
+                before_save=before_save,
+            )
+        except ValueError as exc:
+            # UnicodeDecodeError from the credential file is an I/O failure,
+            # not invalid provider metadata. Preserve the existing 500 policy.
+            if exc is env_error:
+                raise
+            raise HTTPException(422, str(exc)) from exc
+
+    if not write_key:
+        p = save()
+    else:
+        backup: Path | None = None
+        env_written = False
+        retain_backup = False
+        updates: dict[str, str | None] = {}
+
+        def save_key(_pid: str, env_key: str) -> None:
+            nonlocal backup, env_written, env_error
+            value = None if req.api_key == "_delete_" else req.api_key
+            updates[env_key] = None if value is None else value.replace("\r", "").replace("\n", "")
+            try:
+                backup = _backup_provider_env()
+                _write_env(updates, publish=False)
+            except ValueError as exc:
+                env_error = exc
+                raise
+            env_written = True
+
+        # Keep the established env → provider lock order through recovery.
+        # The callback only needs validated identity fields; constructing the
+        # effective Provider still happens after its override is committed.
+        with _ENV_WRITE_LOCK, _ep._OVERRIDES_WRITE_LOCK:
+            try:
+                p = save(save_key)
+                _publish_env_updates(updates)
+            except Exception:
+                if env_written:
+                    try:
+                        if backup is None:
+                            ENV_PATH.unlink(missing_ok=True)
+                        else:
+                            os.replace(backup, ENV_PATH)
+                    except OSError as exc:
+                        # The original bytes are the recovery copy. Do not
+                        # discard them if the rollback rename itself fails.
+                        retain_backup = True
+                        logging.getLogger(__name__).error(
+                            "provider credential rollback failed (%s); recovery required%s",
+                            type(exc).__name__, "; recovery copy retained" if backup is not None else "",
+                        )
+                        raise HTTPException(500, "Provider save failed; credential rollback needs recovery") from exc
+                raise
+            finally:
+                if backup is not None and not retain_backup:
+                    try:
+                        backup.unlink(missing_ok=True)
+                    except OSError as exc:
+                        logging.getLogger(__name__).warning(
+                            "provider credential backup cleanup failed (%s)", type(exc).__name__,
+                        )
     return {"ok": True, "id": p.id, "env_key": p.env_key,
             "configured": bool(os.environ.get(p.env_key))}
 
