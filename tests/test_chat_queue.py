@@ -1890,18 +1890,21 @@ async def test_cancelled_bound_drain_does_not_duplicate_live_owner(
         sess.bind_queue_turn(
             session_id, kwargs["queue_item_id"], broadcast.turn_id)
         entered.set()
+        # Cancel only after the real reads, claim, and live-owner binding.
+        # Executor admission is a precondition, not a one-second SLA here.
+        asyncio.get_running_loop().call_soon(task.cancel)
         await asyncio.Event().wait()
 
     monkeypatch.setattr(chat, "_start_turn", bound_then_stall)
     task = asyncio.create_task(chat._maybe_drain_queue(sid))
-    await asyncio.wait_for(entered.wait(), timeout=1)
-    task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
+    assert entered.is_set()
 
     queue = sess.get_queue(sid)
     assert queue["items"] == []
     assert queue["inflight"]["item"]["id"] == queued["id"]
+    assert queue["inflight"]["turn_id"] == chat._active_turns[sid].turn_id
     chat._active_turns.pop(sid, None)
 
 
