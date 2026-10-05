@@ -22727,10 +22727,16 @@ function portal() {
       } catch (e) { /* silent */ }
     },
     async refreshMcpList() {
+      const seq = (this._mcpListRequestSeq || 0) + 1;
+      this._mcpListRequestSeq = seq;
+      const surface = this._settingsSurfaceGeneration || 0;
       try {
         const r = await fetch("/api/settings/mcp", { headers: this.hdr() });
         if (!r.ok) return;
         const d = await r.json();
+        // A previous settings surface or list read cannot revert newer config.
+        if (seq !== this._mcpListRequestSeq
+          || surface !== (this._settingsSurfaceGeneration || 0)) return;
         this.settings.mcpServers = d.servers || [];
         this.settings.mcpExamples = d.examples || [];
       } catch (e) { /* silent — UI shows empty state */ }

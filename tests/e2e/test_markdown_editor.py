@@ -145,7 +145,7 @@ def test_large_preview_reuses_unchanged_dom_and_latest_content(page, backend_url
       window.__muselab_cm.setValue('# latest request'); app._scheduleLivePreview(0);
     }""")
     page.wait_for_function("!" + APP + ".editorPreviewBusy")
-    assert page.locator(".editor-live-preview h1").inner_text() == "latest request"
+    expect(page.locator(".editor-live-preview h1")).to_have_text("latest request", use_inner_text=True)
 
 
 def test_editor_bytes_math_table_and_safe_html(page, backend_url, auth_token):

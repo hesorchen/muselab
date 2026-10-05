@@ -631,16 +631,26 @@ class MCPServerSpec(BaseModel):
         return self
 
 
-def _load_mcp() -> dict:
-    if not MCP_CONFIG_PATH.exists():
-        return {"mcpServers": {}}
+def _load_mcp(*, for_write: bool = False) -> dict:
+    """Keep read-only discovery tolerant, but never edit from a failed read."""
     try:
         d = json.loads(MCP_CONFIG_PATH.read_text(encoding="utf-8"))
+        if for_write and (
+            not isinstance(d, dict) or not isinstance(d.get("mcpServers", {}), dict)
+        ):
+            raise HTTPException(503, "Invalid MCP configuration; existing file preserved")
         if not isinstance(d, dict):
             return {"mcpServers": {}}
         d.setdefault("mcpServers", {})
         return d
-    except (json.JSONDecodeError, OSError):
+    except FileNotFoundError:
+        # Only an actual missing file permits creating a new configuration.
+        return {"mcpServers": {}}
+    except (json.JSONDecodeError, OSError) as error:
+        if for_write:
+            raise HTTPException(
+                503, "Cannot read MCP configuration; existing file preserved",
+            ) from error
         return {"mcpServers": {}}
 
 
@@ -762,7 +772,7 @@ def has_claude_ai_connectors() -> bool:
     return isinstance(ever, list) and len(ever) > 0
 
 
-def _load_mcp_merged() -> dict[str, dict]:
+def _load_mcp_merged(*, for_write: bool = False) -> dict[str, dict]:
     """Final {name: spec} mapping after merging muselab's own mcp.json with
     every Claude Code MCP source. muselab's entries override external ones
     on name conflict — that's the override channel for "I configured this
@@ -779,7 +789,7 @@ def _load_mcp_merged() -> dict[str, dict]:
       "claude_user_project" / "archive_project".
     """
     external = _load_external_mcp_sources()
-    own = _load_mcp().get("mcpServers") or {}
+    own = _load_mcp(for_write=for_write).get("mcpServers") or {}
     merged: dict[str, dict] = dict(external)
     for name, spec in own.items():
         if not isinstance(spec, dict):
@@ -900,7 +910,7 @@ def upsert_mcp_server(name: str, spec: MCPServerSpec) -> dict:
             f"body name {spec.name!r} does not match URL name {name!r}",
         )
     with _MCP_CONFIG_LOCK:
-        cfg = _load_mcp()
+        cfg = _load_mcp(for_write=True)
 
         # Defence (mirror of put_settings' "•" guard): GET /mcp masks secret values
         # (env values, header values) via _mask() (U+2022 BULLET). A FE that PUTs an
@@ -911,7 +921,7 @@ def upsert_mcp_server(name: str, spec: MCPServerSpec) -> dict:
         def _unmask(new_map: dict, field: str) -> dict:
             out = dict(new_map or {})
             if any(isinstance(v, str) and "•" in v for v in out.values()):
-                existing = (_load_mcp_merged().get(name) or {}).get(field) or {}
+                existing = (_load_mcp_merged(for_write=True).get(name) or {}).get(field) or {}
                 for k, v in list(out.items()):
                     if isinstance(v, str) and "•" in v:
                         if k in existing:
@@ -948,7 +958,7 @@ def delete_mcp_server(name: str) -> dict:
     "hide" an external MCP from muselab, use the toggle endpoint instead
     (it writes a stub override into muselab's mcp.json)."""
     with _MCP_CONFIG_LOCK:
-        cfg = _load_mcp()
+        cfg = _load_mcp(for_write=True)
         if name not in (cfg.get("mcpServers") or {}):
             raise HTTPException(404, f"MCP server not found: {name}")
         del cfg["mcpServers"][name]
@@ -962,9 +972,9 @@ class MCPToggleReq(BaseModel):
 
 def _persist_mcp_toggle(name: str, disabled: bool) -> None:
     with _MCP_CONFIG_LOCK:
-        cfg = _load_mcp()
+        cfg = _load_mcp(for_write=True)
         own_servers = cfg.setdefault("mcpServers", {})
-        merged = _load_mcp_merged()
+        merged = _load_mcp_merged(for_write=True)
         if name not in merged:
             raise HTTPException(404, f"MCP server not found: {name}")
 
