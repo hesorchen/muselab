@@ -42,12 +42,12 @@
     },
     {
       "name": "katex",
-      "version": "0.16.47",
+      "version": "0.18.2",
       "license": "MIT",
       "license_files": [
         "licenses/KaTeX-MIT.txt"
       ],
-      "source": "https://www.npmjs.com/package/katex/v/0.16.47"
+      "source": "https://www.npmjs.com/package/katex/v/0.18.2"
     },
     {
       "name": "codemirror",
@@ -641,13 +641,13 @@
     },
     {
       "name": "katex",
-      "version": "0.16.47",
+      "version": "0.18.2",
       "license": "MIT",
       "license_files": [
-        "licenses/mermaid/katex@0.16.47/LICENSE"
+        "licenses/mermaid/katex@0.18.2/LICENSE"
       ],
-      "source": "https://registry.npmjs.org/katex/0.16.47",
-      "integrity": "sha512-Eeo8Ys1doU1z+x8AZsPpQu+p/QcZBI5PeOo7QGQdy2x2m0MU/hYagBbGOmXwr5KVbEfVuWv9LpnQWeehogurjg==",
+      "source": "https://registry.npmjs.org/katex/0.18.2",
+      "integrity": "sha512-3snve4y0SXTMequLim1FMiPvLGElySam0blN5xQZBqEY3lOJz1TnuaaiugnBZBqHzlSAGmFTYL7MCQkORuLKCA==",
       "bundled_in": "mermaid.min.js"
     },
     {
@@ -765,8 +765,8 @@
     "scripts/vendor/build.py": "918a224b75e68d3e8663a196da3732eec5a95ecbc573b120a85950384a8c0cbe",
     "scripts/vendor/embedded.py": "3cfdd87831289282f071b782433d6037b44ac2424c47ffd75f608365dff471f0",
     "scripts/vendor/entry.mjs": "8f4f3d4fb2828f086f9b9b80763c1314f6ee0f600b6433a8e7066fd59c1eef87",
-    "scripts/vendor/package-lock.json": "4fc75eebeeb11890104276ba662b53569a767124857df29327cc843d5ca7b45c",
-    "scripts/vendor/package.json": "3abbe1a4729032025d0d380aafcd807e37d73b266ded2c5b0f8bd8b9d3171eb8"
+    "scripts/vendor/package-lock.json": "c145dd294d65a75ea1755766707c71437517967a35d804c560c7eb17f6d2fa3e",
+    "scripts/vendor/package.json": "40cb77d790372eadf0b6ab945890a66746fe45b01827ceefefb103afa4c124fe"
   },
   "assets": {
     "alpine.dev.js": "677d9fcfa51c138008b99f3218c4cd6df7a56ab2987b5bf23a746784390f2604",
@@ -858,8 +858,8 @@
     "katex/fonts/KaTeX_Typewriter-Regular.ttf": "f01f3e87d9c6a61c0c081ceb577abd864eb00a612f7ac1620dd6915fad2ef5aa",
     "katex/fonts/KaTeX_Typewriter-Regular.woff": "e14fed02b1aba7ce9f5afd5844b5d0321b22351febc720e0de8b8723527609f7",
     "katex/fonts/KaTeX_Typewriter-Regular.woff2": "71d517d67827787cfabdf186914cc3358eda539e37931941f2b2fd4a21f68c0b",
-    "katex/katex.min.css": "0289a02cf451a44dd73add683a09644252363871ac11713a647b732cee8b1ee3",
-    "katex/katex.min.js": "a29d2961d3146de5949d78ac7c1a9d93ae54955bad22a6db4fbe836e88e8bf48",
+    "katex/katex.min.css": "7dc91b92608db5f3523cfda520df36307b2b389e1725d71ace6e4ef8dee066c7",
+    "katex/katex.min.js": "90354db602936d813daadda391a4376d071f5d1241d8cfddf091df4c2e38730d",
     "licenses/Alpine-MIT.txt": "5f05c4925dd3edf049a70b4b403ac0dd43b20f72501d9359911ddd25d5ac657d",
     "licenses/CodeMirror-MIT.txt": "168a4becc968f5001e2ee2e0291b6e4daabafc1894a11ade1e11d56e96096e07",
     "licenses/DOMPurify-APACHE.txt": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
@@ -920,7 +920,7 @@
     "licenses/mermaid/es-toolkit@1.52.0/NOTICE": "11ee5e3bce9b0a4dde7f73811caf98978e710228d891c3111ad8ef8d7d2a916f",
     "licenses/mermaid/fastdom@1.0.12/LICENSE-from-README.txt": "50c0de64f5cd5e39859b43f7eca7f5843fb3c3d5ac7e34a453e27419ad51e08c",
     "licenses/mermaid/internmap@2.0.3/LICENSE": "9ea8903938dab5f12c4572d60725069bec2d1b0dc3bcc210b09bae946a5ebb1f",
-    "licenses/mermaid/katex@0.16.47/LICENSE": "766ccc1f306c885aa45542a9846bbd0a505b27a0374f146778171c2254ce18e3",
+    "licenses/mermaid/katex@0.18.2/LICENSE": "766ccc1f306c885aa45542a9846bbd0a505b27a0374f146778171c2254ce18e3",
     "licenses/mermaid/khroma@2.1.0/license": "66b333b0f66759a0b710459e03f7029abe17f4358114a128d2c972e642961b49",
     "licenses/mermaid/layout-base@1.0.2/LICENSE": "eabb762d8a95109a39c9be3247325529a5239a7aca327d909c3ccdc41f3a06bf",
     "licenses/mermaid/layout-base@2.0.1/LICENSE": "eabb762d8a95109a39c9be3247325529a5239a7aca327d909c3ccdc41f3a06bf",
@@ -945,7 +945,7 @@
     "licenses/mermaid-embedded/vscode-languageserver-types@3.17.5/License.txt": "ec9ee83580841e8eb687aca9867f221503809ba6426c7f876ede17d91b9fcfd0",
     "licenses/path-browserify-source-MIT.txt": "dcec29171d7e9e0c1afe236d800482cfd76cba6e38ebd724b315db9571da1708",
     "marked.min.js": "95674eef99e625a35507b91ae746e82ce59a2ffcc6d83f69c6c4e62e79d21835",
-    "mermaid.min.js": "b7196de4fd8cfd7e674be2418dfc707b0a3e939cf2729bca56ba6fee7859095b",
+    "mermaid.min.js": "fbb94931cd8ec79450130f4021ee9f529f52e14b1d438075afc10935cb9e87ac",
     "purify.min.js": "2c90a9b46d6463f26038a29b686e82bc91de01fdac9d5229e7cfe3b360134ea2",
     "xterm/addon-fit-LICENSE.txt": "e256f01188af527e4d06d21d06fbf785ae9c50d4b328bf03cbe0ba7f0aa4228f",
     "xterm/addon-fit.js": "ba3ea256ce0620a0992a197d6c9baea64823fc93d8da07a9e366ca9943c18527",
@@ -1743,7 +1743,7 @@
       "fixed_version": "4.18.0",
       "via": "@mermaid-js/parser@1.2.1",
       "bundle": "mermaid.min.js",
-      "bundle_sha256": "b7196de4fd8cfd7e674be2418dfc707b0a3e939cf2729bca56ba6fee7859095b",
+      "bundle_sha256": "fbb94931cd8ec79450130f4021ee9f529f52e14b1d438075afc10935cb9e87ac",
       "source_map_sha256": "d0c740de3781a6575045f623a4cc7f3e01d9c0bd2956fc2de91840193caae7fd",
       "upstream_chunk": "node_modules/@mermaid-js/parser/dist/chunks/mermaid-parser.core/chunk-FOHPRMQF.mjs",
       "upstream_chunk_sha256": "5c83305b04a62463567bdf6d82d9ba9dfc3795e516d8cc848e6981504af48068",
@@ -1764,7 +1764,7 @@
       "fixed_version": "4.18.0",
       "via": "@mermaid-js/parser@1.2.1",
       "bundle": "mermaid.min.js",
-      "bundle_sha256": "b7196de4fd8cfd7e674be2418dfc707b0a3e939cf2729bca56ba6fee7859095b",
+      "bundle_sha256": "fbb94931cd8ec79450130f4021ee9f529f52e14b1d438075afc10935cb9e87ac",
       "source_map_sha256": "d0c740de3781a6575045f623a4cc7f3e01d9c0bd2956fc2de91840193caae7fd",
       "upstream_chunk": "node_modules/@mermaid-js/parser/dist/chunks/mermaid-parser.core/chunk-FOHPRMQF.mjs",
       "upstream_chunk_sha256": "5c83305b04a62463567bdf6d82d9ba9dfc3795e516d8cc848e6981504af48068",

@@ -7,7 +7,9 @@ never downloads these dependencies at runtime.
 The pinned `package-lock.json` records npm archive integrity, including
 transitive dependencies and the esbuild tool. `entry.mjs` exposes the same
 `window.mermaid` interface used by the lazy loader. DOMPurify is overridden to
-3.4.16 in Mermaid's dependency graph as well as shipped directly.
+3.4.16 in Mermaid's dependency graph as well as shipped directly. KaTeX is pinned
+to 0.18.2 and overridden to the same version inside Mermaid to retain the
+GHSA-238p-pmpm-9mq7 fix in both rendering paths.
 
 From the repository root:
 

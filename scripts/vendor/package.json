@@ -1,1 +1,1 @@
-{"name":"muselab-vendor-build","version":"1.0.0","private":true,"dependencies":{"mermaid":"11.17.2","katex":"0.16.47"},"devDependencies":{"esbuild":"0.28.2"},"overrides":{"dompurify":"3.4.16"}}
+{"name":"muselab-vendor-build","version":"1.0.0","private":true,"dependencies":{"mermaid":"11.17.2","katex":"0.18.2"},"devDependencies":{"esbuild":"0.28.2"},"overrides":{"dompurify":"3.4.16","katex":"$katex"}}
