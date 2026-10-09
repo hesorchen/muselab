@@ -9966,6 +9966,9 @@ function portal() {
         : ["Pending " + pending, ...(review ? ["Needs review " + review] : [])].join(" · ");
     },
     queueItemLabel(item, st = this.activeSessionPane()) {
+      if (st?._queueMutating?.['remove:' + item.id] || st?._queueMutating?.discard) {
+        return this.lang === "zh" ? "正在取消" : "Cancelling";
+      }
       const label = this.queueDeliveryLabel(item);
       if (this.queueItemIssue(item)) return label;
       const pending = this.queueDisplayItems(st).filter(row => !this.queueItemIssue(row));
@@ -10122,7 +10125,14 @@ function portal() {
         if (!r.ok) return;   // graceful: leave the current mirror untouched
         data = await r.json();
       } catch (_e) { return; }
-      if (this.tabState[sid] !== st || seq < st._queueAppliedSeq) return;
+      if (this.tabState[sid] !== st) return;
+      return this._applyQueueSnapshot(sid, data, seq);
+    },
+    _applyQueueSnapshot(sid, data, sequence = undefined) {
+      const st = this.tabState[sid];
+      if (!st || !data || !Array.isArray(data.items)) return false;
+      const seq = sequence === undefined ? ++st._queueSyncSeq : sequence;
+      if (seq < st._queueAppliedSeq) return false;
       const revision = Math.max(0, Number(data.revision) || 0);
       if (revision < (Number(st._queueRevision) || 0)) return;
       st._queueAppliedSeq = seq;
@@ -10136,7 +10146,14 @@ function portal() {
         // id-bound resource ticket below. Expired ids (available:false) are
         // counted so the bubble can show "附件已过期".
         const previous = previousItems.get(it.id);
-        const atts = it.attachments || [];
+        // Mutation receipts contain the authoritative queue, without resolving
+        // attachment thumbnails again. Preserve previews for surviving IDs.
+        const resolvedAttachments = Array.isArray(it.attachments);
+        const sameAttachments = previous && (previous.image_ids || "") === (it.image_ids || "");
+        const atts = resolvedAttachments ? it.attachments : (sameAttachments ? [
+          ...(previous.images || []).map(im => ({ ...im, kind: "image", available: true })),
+          ...(previous.docs || []).map(doc => ({ ...doc, available: true })),
+        ] : []);
         const images = atts
           .filter(a => a.available && a.kind === "image")
           .map(a => (previous?.images || []).find(im => im.id === a.id)
@@ -10147,7 +10164,8 @@ function portal() {
             id: a.id, kind: a.kind || "text",
             name: a.name || (a.kind === "pdf" ? "document.pdf" : "file"),
           }));
-        const expiredCount = atts.filter(a => !a.available).length;
+        const expiredCount = resolvedAttachments ? atts.filter(a => !a.available).length
+          : (sameAttachments ? previous.expiredCount || 0 : 0);
         return {
           id: it.id,
           text: it.text || "",
@@ -10220,12 +10238,25 @@ function portal() {
           || this.queueActionBusy(sid, key)) return null;
       this._setQueueActionBusy(st, key, true);
       try {
-        const r = await fetch(url, options);
-        if (!r.ok) throw new Error(`queue mutation failed: HTTP ${r.status}`);
+        const r = await this._fetchWithDeadline(url, options, 8000);
+        if (!r.ok) throw Object.assign(new Error("queue mutation rejected"), { status: r.status });
+        const data = await r.json();
+        if (this.tabState[sid] === st && !this._applyQueueSnapshot(sid, data)) {
+          this._syncQueueFromServer(sid);
+        }
         return r;
       } catch (_e) {
         if (this.tabState[sid] === st) {
-          this.toast(this.lang === "zh" ? failureZh : failureEn, "error", 3500);
+          const uncertain = !_e.status;
+          const text = _e.status === 409
+            ? (this.lang === "zh" ? "暂时无法撤回，消息可能已开始处理，正在核对状态"
+              : "Withdrawal unavailable; the message may have started. Checking status")
+            : uncertain
+              ? (this.lang === "zh" ? "操作结果待确认，正在核对消息状态"
+                : "Operation not confirmed. Checking message status")
+              : (this.lang === "zh" ? failureZh : failureEn);
+          this.toast(text, uncertain ? "warn" : "error", 3500);
+          this._syncQueueFromServer(sid);
         }
         return null;
       } finally {
@@ -10317,6 +10348,8 @@ function portal() {
       const permission = this._normalizePermissionMode(sid === this.currentId ? this.permission : meta?.permission, "default");
       const record = { requestId, kind: "queue", input, ownerSid: sid, status: "ready",
         admissionOwner: st._stoppingTurnId ? "" : String(st._composerSubmitToken || ""),
+        streamOwner: st._stoppingTurnId ? "" : String(st._streamOwnerToken || ""),
+        requestedDelivery: st._stoppingTurnId ? "queue" : this._normalizeBusySendMode(this.busySendMode),
         pendingImages: images, pendingDocs: docs, pendingQuotes: quotes,
         payload: { client_message_id: requestId, text: this._composerPromptText(input, quotes),
           display_text: input, selection_quotes: quotes,
@@ -10401,8 +10434,15 @@ function portal() {
               receipt = record.status === "ready" ? { state: "not_found" }
                 : await this._submissionReceipt(ownerSid, record.requestId, record.kind);
               if (receipt.state === "not_found" && record.payload) {
-                if (!record.sentAt && record.admissionOwner
-                    && st._streamOwnerToken === record.admissionOwner
+                // Recover a temporary missing turn id only while its original
+                // stream still owns this pane. Never retarget an admitted retry
+                // or upgrade an explicitly queued message after settings change.
+                const sameStream = record.streamOwner && record.streamOwner === st._streamOwnerToken
+                  && (!record.payload.active_turn_id || record.payload.active_turn_id === st.activeTurnId);
+                const admittedOwner = record.admissionOwner && st._streamOwnerToken === record.admissionOwner
+                  && (!record.payload.active_turn_id || record.payload.active_turn_id === st.activeTurnId);
+                if (!record.sentAt && (record.requestedDelivery || "adjust") === "adjust"
+                    && (sameStream || admittedOwner)
                     && this._busySendDelivery(sid, st.activeTurnId, !!record.payload.image_ids) === "adjust") {
                   record.payload.delivery = "adjust";
                   record.payload.active_turn_id = String(st.activeTurnId);
@@ -11903,7 +11943,6 @@ function portal() {
         "Could not remove the queued message; it is still queued",
       );
       if (!r) return;
-      await this._syncQueueFromServer(sid);
     },
     async editPendingQueueItem(sid, idx) {
       // Lift the queued text — AND its attachments (FIX ③) — back into the
@@ -11935,7 +11974,6 @@ function portal() {
       // draft was restored unconditionally, so re-send could execute both the
       // untouched queue item and its apparent replacement.
       if (!r) return;
-      await this._syncQueueFromServer(sid);
       if (this.tabState[sid] !== st) return;
       const draft = st.draft;
       draft.input = displayText;
@@ -11975,7 +12013,6 @@ function portal() {
         "Could not discard the queue; messages are still queued",
       );
       if (!r) return;
-      await this._syncQueueFromServer(sid);
     },
     // Pull the per-session context meter (input/output tokens, limit, %)
     // from the backend and merge it into tabState[sid].sessionUsage. Limit
@@ -34213,10 +34250,9 @@ function portal() {
         sendState.lastEventSeq = 0;
       }
       if (expectedTurnId) sendState.activeTurnId = expectedTurnId;
-      if (!isReconnect) {
-        sendState.activeTurnId = "";
-        sendState.parentTurnId = "";
-      }
+      // Keep the current turn identity while a busy send is being admitted.
+      // Other composer input can arrive during those awaits and must still
+      // target this same turn. Clear it only on the new direct-turn path below.
       // Resumed mode: _drainPendingQueue popped a previously-enqueued
       // message and asked us to send it. Pull text + attachments from
       // the item (NOT from this.input / this.pendingImages — those may
@@ -34563,6 +34599,8 @@ function portal() {
       const streamWorkspace = (streamSession && streamSession.cwd) || primaryWorkspace;
 
       if (!isReconnect) {
+        streamState.activeTurnId = "";
+        streamState.parentTurnId = "";
         streamState._serverActiveObserved = false;
         // A real new local turn supersedes any just-finished list expectation.
         streamState._sessionActivityExpected = null;

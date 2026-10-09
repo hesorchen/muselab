@@ -1129,6 +1129,12 @@ class TurnBroadcast:
         self.steering_closed = False
         self.steering_commands: dict[str, dict[str, str]] = {}
         self.steering_write_events: dict[str, asyncio.Event] = {}
+        # Cancellation and SDK writes share a per-command commit boundary. Keep tombstones
+        # through this turn so a delayed recall/annotation cannot send withdrawn
+        # input, even after its durable queue row has been removed.
+        self.steering_input_locks: dict[str, asyncio.Lock] = {}
+        self.steering_cancelled_commands: set[str] = set()
+        self.steering_submitted_commands: set[str] = set()
         # Headless background-task continuations are separate turns, linked to
         # the user turn that launched the task for observability and recovery.
         self.parent_turn_id: str = ""
@@ -8182,9 +8188,15 @@ def get_queue_api(sid: str, response: Response) -> dict:
     # only persists comma-joined upload ids — the preview blobs live in
     # _image_store. Ids missing there have expired (10-min TTL); we flag them
     # `available: False` so the UI can show "附件已过期" instead of a dead chip.
+    items = data.get("items", [])
+    if not any(_attachment_ids(it.get("image_ids") or "") for it in items):
+        for it in items:
+            it["attachments"] = []
+        return data
+    # Polling queue state must not run global storage GC. Upload/lease paths
+    # already own expiry maintenance; text-only queues do not need its lock.
     with _image_store_lock:
-        _gc_images_locked()
-        for it in data.get("items", []):
+        for it in items:
             ids = _attachment_ids(it.get("image_ids") or "")
             atts: list[dict] = []
             for aid in ids:
@@ -8295,6 +8307,10 @@ def _publish_queue_steering(
     that missed the optimistic POST response can still replace the temporary
     queue row with the exact user bubble at that boundary.
     """
+    _perf_event(
+        "queue.steering", sid8=obs.short_id(bc.session_id) if bc else "",
+        item8=obs.short_id(item_id), state=state, delivery=effective_delivery,
+    )
     if bc is None or bc.done:
         return
     try:
@@ -8379,8 +8395,11 @@ async def _deliver_steering_command(
         try:
             ready = await mem0.prepare_recall(
                 session_id, turn_id, text, delivery_id=command_uuid,
-                is_cancelled=lambda: _admitted_steering_turn(
-                    session_id, turn_id, permission=permission) is not bc,
+                is_cancelled=lambda: (
+                    command_uuid in bc.steering_cancelled_commands
+                    or _admitted_steering_turn(
+                        session_id, turn_id, permission=permission) is not bc
+                ),
             )
             if ready:
                 result = await _deliver_prepared_steering_command(
@@ -8427,6 +8446,10 @@ async def _deliver_prepared_steering_command(
     write_event: asyncio.Event | None = None
     waiting_for_startup = False
     async with _lock:
+        owner = _active_turns.get(session_id)
+        if (owner is not None and owner.turn_id == turn_id
+                and command_uuid in owner.steering_cancelled_commands):
+            return "adjust", "cancelled", None
         bc = _eligible_steering_turn(
             session_id, turn_id, permission=permission)
         if bc is None:
@@ -8516,11 +8539,25 @@ async def _deliver_prepared_steering_command(
             f"exc={type(exc).__name__}\n")
 
     try:
-        await bc.runtime_client.query_steering(
-            text,
-            session_id=session_id,
-            command_uuid=command_uuid,
-        )
+        async with bc.steering_input_locks.setdefault(command_uuid, asyncio.Lock()):
+            if command_uuid in bc.steering_cancelled_commands:
+                _discard_registration()
+                return "adjust", "cancelled", None
+            if (_eligible_steering_turn(
+                    session_id, turn_id, permission=permission) is not bc
+                    or command_uuid not in bc.steering_commands):
+                _discard_registration()
+                fallback = await _fallback_steering_item(
+                    session_id, item_id=item_id, command_uuid=command_uuid, bc=bc)
+                return "queue", "queued", fallback
+            # Mark the boundary before yielding to the transport. A concurrent
+            # withdrawal waits for this write, then requires a native receipt.
+            bc.steering_submitted_commands.add(command_uuid)
+            await bc.runtime_client.query_steering(
+                text,
+                session_id=session_id,
+                command_uuid=command_uuid,
+            )
     except BaseException:
         _discard_registration()
         fallback = await _fallback_steering_item(
@@ -8557,7 +8594,9 @@ async def _deliver_prepared_steering_command(
 
     current = bc.steering_commands.get(command_uuid)
     if current is None:
-        return "adjust", "completed", updated
+        state = ("cancelled" if command_uuid in bc.steering_cancelled_commands
+                 else "completed")
+        return "adjust", state, updated
     state = str(current.get("state") or "waiting_tool")
     _publish_queue_steering(
         bc,
@@ -9037,37 +9076,53 @@ async def _enqueue_impl(
         background_tasks.add_task(_schedule_queue_drain_after_response, sid)
     res["effective_delivery"] = effective_delivery
     res["delivery_status"] = delivery_status
+    _perf_event("queue.delivery", sid8=obs.short_id(sid),
+                item8=obs.short_id(queue_item_id), requested=requested_delivery,
+                effective=effective_delivery, status=delivery_status)
     return res
 
 
 async def _cancel_waiting_steering_item(
     sid: str, item: dict,
 ) -> bool:
-    """Cancel one still-queued native command before its durable row is removed."""
+    """Fence unsent input or obtain a receipt from its exact runtime owner."""
     command_uuid = str(item.get("command_uuid") or "")
     target_turn_id = str(item.get("target_turn_id") or "")
     bc = _active_turns.get(sid)
-    if (
-        not command_uuid
-        or bc is None
-        or bc.done
-        or bc.turn_id != target_turn_id
-        or not isinstance(bc.runtime_client, MuseLabSDKClient)
-        or str((bc.steering_commands.get(command_uuid) or {}).get(
-            "item_id") or "") != str(item.get("id") or "")
-    ):
+    if (not command_uuid or bc is None or bc.done
+            or bc.turn_id != target_turn_id):
         return False
-    try:
-        cancelled = await bc.runtime_client.cancel_async_message(command_uuid)
-    except Exception:
-        return False
-    if not cancelled:
-        return False
-    bc.steering_commands.pop(command_uuid, None)
-    event = bc.steering_write_events.pop(command_uuid, None)
-    if event is not None:
-        event.set()
-    return True
+    async with bc.steering_input_locks.setdefault(command_uuid, asyncio.Lock()):
+        if command_uuid in bc.steering_cancelled_commands:
+            return True
+        if (bc.done or _active_turns.get(sid) is not bc):
+            return False
+        info = bc.steering_commands.get(command_uuid)
+        if info is not None and info.get("item_id") != str(item.get("id") or ""):
+            return False
+        submitted = command_uuid in bc.steering_submitted_commands
+        # Missing registration is legitimate while recall is still preparing.
+        # A non-pending durable/lifecycle state must always defer to the runtime.
+        local = (not submitted and item.get("steering_state") == "pending"
+                 and (info is None or info.get("state") == "pending"))
+        if not local:
+            if not isinstance(bc.runtime_client, MuseLabSDKClient):
+                return False
+            try:
+                cancelled = await bc.runtime_client.cancel_async_message(command_uuid)
+            except Exception:
+                return False
+            if not cancelled:
+                return False
+        bc.steering_cancelled_commands.add(command_uuid)
+        bc.steering_commands.pop(command_uuid, None)
+        event = bc.steering_write_events.pop(command_uuid, None)
+        if event is not None:
+            event.set()
+        _perf_event("queue.cancel", sid8=obs.short_id(sid),
+                    item8=obs.short_id(item.get("id")),
+                    stage="before_write" if local else "runtime", status="confirmed")
+        return True
 
 
 @router.delete("/sessions/{sid}/queue/{item_id}", dependencies=[Depends(require_token)])
