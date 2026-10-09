@@ -181,4 +181,4 @@ def test_updated_local_math_and_diagram_bundles_render(page, backend_url, auth_t
       return {math:math.includes('katex'), version:window.katex.version,
         svg:diagram.svg.includes('<svg'), labels:diagram.svg.includes('Start') && diagram.svg.includes('Done')};
     """)
-    assert result == {"math": True, "version": "0.16.47", "svg": True, "labels": True}
+    assert result == {"math": True, "version": "0.18.2", "svg": True, "labels": True}

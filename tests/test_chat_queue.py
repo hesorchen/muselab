@@ -1522,7 +1522,7 @@ async def test_clear_queue_preserves_adjustment_accepted_after_snapshot(
         clear_task = asyncio.create_task(chat.clear_queue_api(sid))
         await asyncio.wait_for(cancel_started.wait(), timeout=1)
 
-        second = await chat.enqueue_api(
+        second = await asyncio.wait_for(chat.enqueue_api(
             sid,
             chat.QueueEnqueueReq(
                 text="accepted after clear snapshot",
@@ -1530,7 +1530,7 @@ async def test_clear_queue_preserves_adjustment_accepted_after_snapshot(
                 active_turn_id=broadcast.turn_id,
             ),
             chat.BackgroundTasks(),
-        )
+        ), timeout=2)
         second_item = next(
             item for item in second["queue"]["items"]
             if item["text"] == "accepted after clear snapshot"

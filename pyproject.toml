@@ -72,6 +72,8 @@ dependencies = [
     # older pywebpush-transitive range. Direct constraint keeps fresh lock
     # resolutions aligned with the pip-audit CI baseline.
     "aiohttp>=3.14.3",
+    # Security floor for the C-extension reference leak in CVE-2026-104874.
+    "multidict>=6.9.1",
     "pillow>=12.3.0",
     # Security floors for the claim-verification and parser advisories
     # affecting PyJWT 2.13.0 and the proxy/redirect advisories in urllib3 2.7.0.
