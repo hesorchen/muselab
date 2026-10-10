@@ -373,3 +373,59 @@ def test_storage_timings_split_sql_fetch_and_decode_without_content(tmp_path, mo
     assert fields["rows"] >= 1
     assert "private fixture text" not in repr(events)
     assert item["id"] not in repr(events)
+
+
+def test_read_only_connection_gets_larger_cache_and_mmap_writer_unchanged(tmp_path: Path):
+    from backend import memory_store
+    writer = MemoryStore(tmp_path / "memory.sqlite3")
+    writer.create_memory("owner", "fact", "synthetic pragma fixture")
+    with writer._connect() as conn:
+        assert conn.execute("PRAGMA cache_size").fetchone()[0] == -2000
+        assert conn.execute("PRAGMA mmap_size").fetchone()[0] == 0
+    reader = MemoryStore(writer.path, read_only=True)
+    with reader._connect() as conn:
+        assert conn.execute("PRAGMA query_only").fetchone()[0] == 1
+        assert conn.execute("PRAGMA cache_size").fetchone()[0] == -memory_store._READ_CACHE_KIB
+        assert conn.execute("PRAGMA mmap_size").fetchone()[0] == memory_store._READ_MMAP_BYTES
+
+
+def test_hydration_reads_only_consumed_columns_with_identical_values(tmp_path: Path):
+    store = MemoryStore(tmp_path / "memory.sqlite3")
+    item = store.create_memory(
+        "owner", "fact", "synthetic hydrate fixture", authority="confirmed",
+        confidence=0.8, entities=["e1"], tags=["t1"], attributes={"large": "x" * 2000},
+        sources=[{"source_type": "message", "source_id": "m1", "relation": "confirmed_from"}])
+    reader = MemoryStore(store.path, read_only=True)
+    [hydrated] = reader.memories_with_stats_by_ids("owner", [item["id"]])
+    [full] = store.memories_by_ids([item["id"]])
+    columns = ("id", "kind", "content", "status", "authority", "confidence")
+    assert set(hydrated) == {*columns, "recall_stats", "sources"}
+    assert {name: hydrated[name] for name in columns} == {name: full[name] for name in columns}
+    assert hydrated["sources"] == [
+        {"source_type": "message", "source_id": "m1", "relation": "confirmed_from"}]
+
+
+def test_observed_read_labels_deadline_interrupt_as_timeout(tmp_path: Path, monkeypatch):
+    import time
+
+    import pytest
+
+    from backend import observability as obs
+    writer = MemoryStore(tmp_path / "memory.sqlite3")
+    reader = MemoryStore(writer.path, read_only=True)
+    events = []
+    monkeypatch.setattr(obs, "is_slow", lambda *args, **kwargs: True)
+    monkeypatch.setattr(obs, "perf_event", lambda name, **fields: events.append((name, fields)))
+
+    with reader._observed_read("probe") as conn:
+        conn.execute("SELECT 1").fetchone()
+    with pytest.raises(Exception, match="no such table"):
+        with reader._observed_read("probe") as conn:
+            conn.execute("SELECT * FROM missing_table").fetchone()
+    spin = ("WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x<100000000)"
+            " SELECT count(*) FROM c")
+    with pytest.raises(TimeoutError):
+        with reader.read_budget(time.perf_counter() + 0.05):
+            with reader._observed_read("probe") as conn:
+                conn.execute(spin).fetchone()
+    assert [fields["status"] for _, fields in events] == ["ok", "error", "timeout"]
