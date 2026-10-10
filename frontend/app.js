@@ -16335,14 +16335,17 @@ function portal() {
     // compute its index once per render and cache it — the template calls
     // isLatestEditTool() once per rendered message, and the old per-call
     // forward scan made that O(n²), a real freeze contributor on long
-    // sessions. Cache key is currentId:length (same scheme as
-    // _taskSubjectMapForMessages): the only events that move the latest-edit
-    // index are appends / evictions (length changes) and tab switches
-    // (currentId changes); in-place streaming text mutations don't. Writing
-    // the cache only on key change keeps it loop-safe under Alpine.
+    // sessions. Cache key is currentId:length:firstKey:lastKey. The events
+    // that move the latest-edit index are appends, window slides and tab
+    // switches; in-place streaming text mutations don't. Once the visible
+    // window is full an append also trims the head, so length alone stays
+    // constant and would return a stale index — the first/last `_k` change
+    // on every slide, and reading them is O(1). Writing the cache only on key
+    // change keeps it loop-safe under Alpine.
     _latestEditToolIdx(paneMsgs = this.activeSessionPane().messages, tid = this.currentId) {
       const msgs = paneMsgs || [];
-      const key = (tid || "_") + ":" + msgs.length;
+      const key = (tid || "_") + ":" + msgs.length + ":"
+        + (msgs[0]?._k || "") + ":" + (msgs[msgs.length - 1]?._k || "");
       const cached = this._cachedLatestEditIdx;
       if (cached && cached.key === key) return cached.idx;
       // Last Edit/Write/MultiEdit tool_use in the list…
