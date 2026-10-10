@@ -13,7 +13,9 @@ import base64
 import errno
 import inspect
 import json
+import os
 import threading
+import time
 import urllib.parse
 from types import SimpleNamespace
 
@@ -4276,6 +4278,32 @@ def test_replay_spool_uses_private_configured_runtime_dir(
         assert spool.path.stat().st_mode & 0o777 == 0o600
     finally:
         spool.close()
+
+
+def test_sweep_orphan_replay_spools_removes_only_stale_matching_files(
+        stream_env, monkeypatch, tmp_path):
+    chat_mod = stream_env
+    runtime_dir = tmp_path / "durable-runtime"
+    monkeypatch.setenv("MUSELAB_RUNTIME_DIR", str(runtime_dir))
+    live = chat_mod._ReplaySpool()
+    try:
+        stale = runtime_dir / "muselab-turn-stale.jsonl"
+        fresh = runtime_dir / "muselab-turn-fresh.jsonl"
+        other = runtime_dir / "unrelated-old.jsonl"
+        for path in (stale, fresh, other):
+            path.write_text("{}\n")
+        old = time.time() - chat_mod._REPLAY_SPOOL_ORPHAN_AGE_S - 60
+        os.utime(stale, (old, old))
+        os.utime(other, (old, old))
+
+        assert chat_mod.sweep_orphan_replay_spools() == 1
+
+        assert not stale.exists()
+        assert fresh.exists()
+        assert other.exists()
+        assert live.path.exists()
+    finally:
+        live.close()
 
 
 def test_replay_spool_rolls_back_partial_enospc(

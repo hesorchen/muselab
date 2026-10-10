@@ -669,6 +669,47 @@ def _replay_runtime_dir() -> Path:
     return root
 
 
+# A live spool is rewritten on every replay event; one untouched for this long
+# was left behind by a process that died before _ReplaySpool.close() ran.
+_REPLAY_SPOOL_ORPHAN_AGE_S = 24 * 60 * 60
+
+
+def sweep_orphan_replay_spools(now: float | None = None) -> int:
+    """Delete spool files abandoned by a crashed or SIGKILLed backend.
+
+    Runs at startup, before this process has created any spool, so only files
+    older than the threshold are removed. Failures are diagnostics, never errors.
+    """
+    cutoff = (time.time() if now is None else now) - _REPLAY_SPOOL_ORPHAN_AGE_S
+    removed = failed = 0
+    try:
+        with os.scandir(_replay_runtime_dir()) as entries:
+            for entry in entries:
+                name = entry.name
+                if not (name.startswith("muselab-turn-")
+                        and name.endswith(".jsonl")):
+                    continue
+                try:
+                    if (not entry.is_file(follow_symlinks=False)
+                            or entry.stat(follow_symlinks=False).st_mtime
+                            >= cutoff):
+                        continue
+                    os.unlink(entry.path)
+                    removed += 1
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    failed += 1
+    except OSError as exc:
+        obs.diagnostic_line(
+            f"[chat] replay spool sweep failed exc={type(exc).__name__}\n")
+        return removed
+    if failed:
+        obs.diagnostic_line(
+            f"[chat] replay spool sweep could not remove {failed} file(s)\n")
+    return removed
+
+
 class _ReplaySpool:
     """Append-only replay storage outside the Python heap."""
 
