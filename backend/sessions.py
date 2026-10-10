@@ -1649,6 +1649,8 @@ def update_model(sid: str, model: str) -> None:
         idx = _load_index()
         for s in idx:
             if s["id"] == sid:
+                if s.get("model") == model:
+                    return
                 s["model"] = model
                 _save_index(idx)
                 return
