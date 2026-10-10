@@ -1542,6 +1542,19 @@ def test_bump_session_auto_renames_from_first_user_text(app_module):
     assert s["auto_named"] is False
 
 
+def test_bump_session_returns_title_only_when_it_renamed(app_module):
+    from backend import sessions as sess
+    meta = sess.create_session()
+    assert sess.bump_session(meta["id"], message_count=1) is None
+    assert sess.bump_session(
+        meta["id"], message_count=2,
+        auto_rename_from="怎么解读这次体检报告") == "怎么解读这次体检报告"
+    # Already named: later turns neither rename nor report a title.
+    assert sess.bump_session(
+        meta["id"], message_count=4, auto_rename_from="后续追问") is None
+    assert sess.bump_session("missing-sid", message_count=1) is None
+
+
 def test_manual_rename_disables_auto_rename(app_module):
     from backend import sessions as sess
     meta = sess.create_session()
