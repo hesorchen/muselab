@@ -455,6 +455,12 @@ async def _lifespan(app: FastAPI):
             _asyncio.to_thread(_activity.initialize_runtime_state),
             _asyncio.to_thread(_todos.initialize_runtime_state),
         )
+        swept_spools = await _asyncio.to_thread(
+            _chat.sweep_orphan_replay_spools)
+        if swept_spools:
+            sys.stderr.write(
+                f"[muselab] removed {swept_spools} orphan replay spool(s) on startup\n")
+            sys.stderr.flush()
         repaired_fork_activity = await _asyncio.to_thread(
             _activity.reconcile_fork_sessions)
         if repaired_fork_activity:

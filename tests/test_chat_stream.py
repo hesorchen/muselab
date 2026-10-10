@@ -13,7 +13,9 @@ import base64
 import errno
 import inspect
 import json
+import os
 import threading
+import time
 import urllib.parse
 from types import SimpleNamespace
 
@@ -4276,6 +4278,32 @@ def test_replay_spool_uses_private_configured_runtime_dir(
         assert spool.path.stat().st_mode & 0o777 == 0o600
     finally:
         spool.close()
+
+
+def test_sweep_orphan_replay_spools_removes_only_stale_matching_files(
+        stream_env, monkeypatch, tmp_path):
+    chat_mod = stream_env
+    runtime_dir = tmp_path / "durable-runtime"
+    monkeypatch.setenv("MUSELAB_RUNTIME_DIR", str(runtime_dir))
+    live = chat_mod._ReplaySpool()
+    try:
+        stale = runtime_dir / "muselab-turn-stale.jsonl"
+        fresh = runtime_dir / "muselab-turn-fresh.jsonl"
+        other = runtime_dir / "unrelated-old.jsonl"
+        for path in (stale, fresh, other):
+            path.write_text("{}\n")
+        old = time.time() - chat_mod._REPLAY_SPOOL_ORPHAN_AGE_S - 60
+        os.utime(stale, (old, old))
+        os.utime(other, (old, old))
+
+        assert chat_mod.sweep_orphan_replay_spools() == 1
+
+        assert not stale.exists()
+        assert fresh.exists()
+        assert other.exists()
+        assert live.path.exists()
+    finally:
+        live.close()
 
 
 def test_replay_spool_rolls_back_partial_enospc(
@@ -8826,6 +8854,157 @@ async def test_commit_loses_atomically_to_rollback_and_fails_closed(
     cleanup_release.set()
     await rollback
     assert not artifact.exists()
+
+
+def _leased_broadcast(chat, sid, aid):
+    chat._image_store[aid] = {
+        "kind": "text",
+        "mime": "text/plain",
+        "name": "commit.txt",
+        "raw": b"commit",
+        "text": "commit",
+        "ts": chat.time.time(),
+    }
+    lease, _missing, _busy = chat._lease_staged_attachments(
+        aid, require_all=True)
+    broadcast = chat.TurnBroadcast(sid)
+    broadcast._attachment_lease = lease
+    return broadcast, lease
+
+
+@pytest.mark.asyncio
+async def test_attachment_commit_runs_off_event_loop(app_module, monkeypatch):
+    del app_module
+    from backend import chat
+
+    broadcast, lease = _leased_broadcast(
+        chat, "commit-off-loop", "commit-off-loop-aid")
+    committed_on = []
+    original_commit = chat._commit_broadcast_attachments
+
+    def tracking_commit(bc):
+        committed_on.append(threading.get_ident())
+        original_commit(bc)
+
+    monkeypatch.setattr(chat, "_commit_broadcast_attachments", tracking_commit)
+    loop_thread = threading.get_ident()
+
+    await chat._commit_broadcast_attachments_off_loop(
+        broadcast, "commit-off-loop")
+
+    assert committed_on
+    assert loop_thread not in committed_on
+    assert lease.state == "committed"
+    assert broadcast._attachment_lease is None
+
+
+@pytest.mark.asyncio
+async def test_cancelled_attachment_commit_still_completes(
+        app_module, monkeypatch):
+    del app_module
+    from backend import chat
+
+    broadcast, lease = _leased_broadcast(
+        chat, "commit-cancel", "commit-cancel-aid")
+    entered = threading.Event()
+    release = threading.Event()
+    original_commit = chat._commit_broadcast_attachments
+
+    def gated_commit(bc):
+        entered.set()
+        assert release.wait(timeout=5)
+        original_commit(bc)
+
+    monkeypatch.setattr(chat, "_commit_broadcast_attachments", gated_commit)
+    task = asyncio.create_task(
+        chat._commit_broadcast_attachments_off_loop(broadcast, "commit-cancel"))
+    while not entered.is_set():
+        await asyncio.sleep(0.01)
+    task.cancel()
+    await asyncio.sleep(0.05)
+    assert not task.done()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert lease.state == "committed"
+    assert "commit-cancel-aid" not in chat._image_store
+    assert broadcast._attachment_lease is None
+
+
+@pytest.mark.asyncio
+async def test_cancelled_attachment_commit_uncertain_rebuilds_runtime(
+        app_module, monkeypatch):
+    del app_module
+    from backend import chat
+
+    sid = "commit-cancel-uncertain"
+    broadcast, lease = _leased_broadcast(chat, sid, "commit-cancel-uncertain-aid")
+    lease.state = "rolling_back"
+    entered = threading.Event()
+    release = threading.Event()
+    original_commit = chat._commit_broadcast_attachments
+
+    def gated_commit(bc):
+        entered.set()
+        assert release.wait(timeout=5)
+        original_commit(bc)
+
+    monkeypatch.setattr(chat, "_commit_broadcast_attachments", gated_commit)
+    task = asyncio.create_task(
+        chat._commit_broadcast_attachments_off_loop(broadcast, sid))
+    while not entered.is_set():
+        await asyncio.sleep(0.01)
+    task.cancel()
+    release.set()
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert lease.state == "uncertain"
+        assert sid in chat._pending_runtime_rebuilds
+    finally:
+        chat._pending_runtime_rebuilds.discard(sid)
+
+
+def test_get_queue_api_reads_durable_metadata_outside_store_lock(
+        app_module, monkeypatch):
+    del app_module
+    from fastapi import Response
+    from backend import chat
+
+    aid = "a" * 32
+    monkeypatch.setattr(chat.sess, "get_queue", lambda _sid: {
+        "items": [{"image_ids": aid}],
+    })
+    chat._image_store.pop(aid, None)
+    lock_free_in_metadata = []
+
+    def probing_metadata(_aid):
+        acquired = []
+
+        def probe_lock():
+            got = chat._image_store_lock.acquire(blocking=False)
+            if got:
+                chat._image_store_lock.release()
+            acquired.append(got)
+
+        probe = threading.Thread(target=probe_lock)
+        probe.start()
+        probe.join()
+        lock_free_in_metadata.append(acquired[0])
+        return {"kind": "image", "name": "q.png", "mime": "image/png"}
+
+    monkeypatch.setattr(
+        chat._durable_attachment_store, "metadata", probing_metadata)
+
+    data = chat.get_queue_api("queue-metadata-sid", Response())
+
+    assert lock_free_in_metadata == [True]
+    assert data["items"][0]["attachments"] == [{
+        "id": aid, "kind": "image", "name": "q.png",
+        "mime": "image/png", "available": True,
+    }]
 
 
 @pytest.mark.asyncio
