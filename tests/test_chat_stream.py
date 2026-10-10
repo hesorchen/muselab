@@ -1171,6 +1171,42 @@ def test_activity_hidden_turn_never_enters_global_task_center(
     assert chat_mod.sess.get_session(sid)["activity_hidden"] is True
 
 
+def test_turn_admission_creates_replay_spool_off_event_loop(
+        stream_env, client, monkeypatch):
+    """Spool file creation hits the disk; a slow disk must not stall the loop."""
+    chat_mod = stream_env
+    sid = _make_session(client)
+    created_on = []
+    original_init = chat_mod._ReplaySpool.__init__
+
+    def tracking_init(self):
+        created_on.append(threading.get_ident())
+        original_init(self)
+
+    monkeypatch.setattr(chat_mod._ReplaySpool, "__init__", tracking_init)
+    fake = _FakeStreamClient([ResultMessage(
+        subtype="success", duration_ms=10, duration_api_ms=9,
+        is_error=False, num_turns=1, session_id=sid,
+        total_cost_usd=0.0, usage={"input_tokens": 1, "output_tokens": 1},
+    )])
+
+    async def fake_get_client(*_args, **_kwargs):
+        return fake
+
+    monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
+
+    async def exercise():
+        loop_thread = threading.get_ident()
+        broadcast = await chat_mod._start_turn(sid, "hello")
+        await asyncio.wait_for(broadcast.task, timeout=5)
+        return loop_thread
+
+    loop_thread = asyncio.run(exercise())
+
+    assert created_on
+    assert loop_thread not in created_on
+
+
 def test_done_is_published_before_slow_post_turn_bookkeeping(
         stream_env, client, monkeypatch):
     """ResultMessage ends the UI turn before context/JSONL bookkeeping."""
