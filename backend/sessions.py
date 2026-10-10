@@ -2792,7 +2792,7 @@ def consume_one_pending_attachments(sid: str, msg_uuid: str) -> dict | None:
 
 def bump_session(sid: str, message_count: int | None = None,
                   turn_count: int | None = None,
-                  auto_rename_from: str | None = None) -> None:
+                  auto_rename_from: str | None = None) -> str | None:
     """Update updated_at and optionally message_count / turn_count;
     opportunistically write a local fallback `name` from the first
     substantive user message text.
@@ -2814,6 +2814,9 @@ def bump_session(sid: str, message_count: int | None = None,
     entry (picker filters on ai-title). The gap closes as soon as CLI
     runs aiTitle generation on the next turn — empty / first-turn-only
     sessions in the picker is the tradeoff for getting real AI summaries.
+
+    Returns the new automatic title when this call renamed the session, so
+    callers can keep denormalized copies (the task ledger) in step.
     """
     with _INDEX_LOCK:
         idx = _load_index()
@@ -2824,6 +2827,7 @@ def bump_session(sid: str, message_count: int | None = None,
                     s["message_count"] = message_count
                 if turn_count is not None:
                     s["turn_count"] = turn_count
+                renamed = None
                 is_auto = s.get("auto_named",
                                 s.get("name", "").startswith("新会话"))
                 if is_auto and auto_rename_from:
@@ -2831,8 +2835,9 @@ def bump_session(sid: str, message_count: int | None = None,
                     if title:
                         s["name"] = title
                         s["auto_named"] = False
+                        renamed = title
                 _save_index(idx)
-                return
+                return renamed
 
 
 def set_message_count(sid: str, message_count: int,
