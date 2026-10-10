@@ -10,10 +10,18 @@ on:
 permissions:
   contents: read
 
+# Same workflow+ref share one group: a new push to a PR supersedes the stale
+# run, but pushes to main / tags are never cancelled mid-flight (the docker
+# publish job must run to completion).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   test:
     name: pytest (${{ matrix.os }}, py${{ matrix.python-version }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -64,6 +72,7 @@ jobs:
   lint:
     name: ruff + muselab-lint
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v3
@@ -92,6 +101,7 @@ jobs:
   frontend-lint:
     name: frontend syntax check
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v6
@@ -111,6 +121,7 @@ jobs:
     # Keep the existing check name for branch-protection compatibility.
     name: pip-audit (dependency CVE scan)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v3
@@ -132,6 +143,7 @@ jobs:
   e2e-core:
     name: e2e core (playwright)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v3
@@ -168,6 +180,7 @@ jobs:
   e2e:
     name: e2e (playwright)
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v3
@@ -193,6 +206,7 @@ jobs:
   docker-smoke:
     name: docker build + runtime smoke
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - uses: docker/setup-buildx-action@v3
@@ -219,6 +233,7 @@ jobs:
     needs: [test, lint, frontend-lint, security, e2e-core, e2e, docker-smoke]
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     permissions:
       contents: read
       packages: write       # required for ghcr.io push
