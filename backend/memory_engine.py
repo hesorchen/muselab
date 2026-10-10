@@ -187,6 +187,54 @@ _KNOWN_JOB_KINDS = {
 }
 
 
+_TRANSCRIPT_TAIL_CAP = 32 * 1024 * 1024
+_TRANSCRIPT_TAIL_CHUNK = 1024 * 1024
+
+
+def _read_turn_records(
+    path: Path,
+    target_text: str,
+    *,
+    is_interrupt: Callable[[object], bool],
+    cap: int = _TRANSCRIPT_TAIL_CAP,
+    chunk: int = _TRANSCRIPT_TAIL_CHUNK,
+) -> list[dict]:
+    """``slice_turn_records`` over the transcript, reading only the tail needed.
+
+    Enormous historical transcripts are bounded to their last ``cap`` bytes,
+    where the just-completed turn lives.  ``slice_turn_records`` keys off the
+    last record matching the target and the first real user record after it,
+    so the result depends only on a suffix of the records.  Read a growing
+    window ending at EOF (``chunk``, doubling) until the slice finds the
+    target; without a match the window reaches the cap or file head, which is
+    exactly what a full read would have seen.  The first line of a window that
+    does not start at byte 0 may be cut, so it is skipped; it precedes every
+    record in the window and so can never be the last match.
+    """
+    size = path.stat().st_size
+    floor = max(0, size - cap)
+    window = max(1, chunk)
+    with path.open("rb") as stream:
+        while True:
+            start = max(floor, size - window)
+            stream.seek(start)
+            if start > 0:
+                stream.readline()
+            records: list[dict] = []
+            for raw in stream.readlines():
+                try:
+                    value = json.loads(raw)
+                    if isinstance(value, dict):
+                        records.append(value)
+                except Exception:
+                    continue
+            sliced = slice_turn_records(
+                records, target_text, is_interrupt=is_interrupt)
+            if sliced or start <= floor:
+                return sliced
+            window *= 2
+
+
 class UnknownMemoryJobError(ValueError):
     pass
 
@@ -969,25 +1017,8 @@ class MemoryEngine:
             path = chat._find_session_jsonl(session_id)
             if path is None:
                 return []
-            # Background-only and bounded: enormous historical transcripts are
-            # read from the tail, where the just-completed turn lives.
-            size = path.stat().st_size
-            cap = 32 * 1024 * 1024
-            with path.open("rb") as stream:
-                if size > cap:
-                    stream.seek(size - cap)
-                    stream.readline()
-                raw_lines = stream.readlines()
-            records: list[dict] = []
-            for raw in raw_lines:
-                try:
-                    value = json.loads(raw)
-                    if isinstance(value, dict):
-                        records.append(value)
-                except Exception:
-                    continue
-            return slice_turn_records(
-                records,
+            return _read_turn_records(
+                path,
                 target["content"],
                 is_interrupt=chat._is_cli_interrupt_message,
             )
