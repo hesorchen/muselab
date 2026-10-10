@@ -40,6 +40,15 @@ def _json(value: Any) -> str:
 # keeping rows indexed under the old scheme.
 _FTS_SCHEMA_VERSION = 1
 
+# Read-only connections are opened per call, so SQLite's default ~2MB page
+# cache starts cold each time. mmap_size is only an upper bound on the mapped
+# range (capped by the file size), and mapped pages are shared with the OS cache.
+_READ_CACHE_KIB = 32 * 1024
+_READ_MMAP_BYTES = 256 * 1024 * 1024
+
+# Columns recall consumes from a hydrated memory; wide *_json columns are skipped.
+_HYDRATE_COLUMNS = "id,kind,content,status,authority,confidence"
+
 _SNAPSHOT_TABLES: tuple[
     tuple[str, tuple[str, ...], tuple[str, ...]], ...
 ] = (
@@ -381,6 +390,8 @@ class MemoryStore:
                          else "PRAGMA busy_timeout=10000")
             if self._read_only:
                 conn.execute("PRAGMA query_only=ON")
+                conn.execute(f"PRAGMA cache_size=-{_READ_CACHE_KIB}")
+                conn.execute(f"PRAGMA mmap_size={_READ_MMAP_BYTES}")
                 deadline = getattr(self, "_query_deadline", None)
                 cancelled = getattr(self, "_read_cancelled", None)
                 if deadline is not None or cancelled is not None:
@@ -1158,6 +1169,11 @@ class MemoryStore:
                     try:
                         yield _TimedReadConnection(conn, timings)
                         status = "ok"
+                    except sqlite3.OperationalError as exc:
+                        # The read budget's progress handler interrupts the query.
+                        if getattr(exc, "sqlite_errorcode", None) == sqlite3.SQLITE_INTERRUPT:
+                            status = "timeout"
+                        raise
                     finally:
                         finished = time.perf_counter()
         finally:
@@ -1190,7 +1206,8 @@ class MemoryStore:
                 chunk = unique_ids[start:start + 500]
                 placeholders = ",".join("?" for _ in chunk)
                 rows = conn.execute(
-                    f"SELECT * FROM memories WHERE owner_id=? AND id IN ({placeholders})",
+                    f"SELECT {_HYDRATE_COLUMNS} FROM memories "
+                    f"WHERE owner_id=? AND id IN ({placeholders})",
                     (owner_id, *chunk)).fetchall()
                 for row in rows:
                     item = self._row(row) or {}
