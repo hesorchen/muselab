@@ -806,6 +806,12 @@ class GenerationProvider:
         # Apply the same output budget as the HTTP provider through the native
         # CLI setting. Extraction is a bounded text transform, not an agent task.
         options_kwargs.setdefault("env", {})["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] = str(max_tokens)
+        # CLI stderr may echo the extraction prompt; keep only one
+        # content-free category line instead of letting it reach the process stderr.
+        from .chat import _privacy_safe_cli_stderr_logger
+        options_kwargs["stderr"] = _privacy_safe_cli_stderr_logger(
+            "DUCC" if endpoints.is_ducc_model(self.config.generation_model) else "SDK-CLI",
+            generation_job_ref.get())
         if phases is not None:
             phases["phase"] = "sdk_options"
         options = ClaudeAgentOptions(
