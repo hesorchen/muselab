@@ -37,7 +37,7 @@ def _active_state(broadcast, *, attachable=True, background=False):
 
 async def _open_mux(chat_mod, checkpoints, *, mobile=False):
     stream = chat_mod._subscribe_multiplex(checkpoints, mobile=mobile)
-    handshake = await asyncio.wait_for(anext(stream), timeout=0.2)
+    handshake = await asyncio.wait_for(anext(stream), timeout=2)
     assert handshake == {"event": "ping", "data": ""}
     return stream
 

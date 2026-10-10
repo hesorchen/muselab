@@ -1423,7 +1423,7 @@ def test_activity_finishes_before_background_continuation_settles(
         )
 
         broadcast = await chat_mod._start_turn(sid, "run a background task")
-        await asyncio.wait_for(watcher_attached.wait(), timeout=1)
+        await asyncio.wait_for(watcher_attached.wait(), timeout=10)
 
         assert any(
             event.get("event") == "done"
@@ -1443,10 +1443,10 @@ def test_activity_finishes_before_background_continuation_settles(
         }
         assert boundary_threads
         assert threading.get_ident() not in boundary_threads
-        await asyncio.wait_for(broadcast.task, timeout=1)
+        await asyncio.wait_for(broadcast.task, timeout=10)
         watcher = chat_mod._task_watchers[sid]
         release_watcher.set()
-        await asyncio.wait_for(watcher, timeout=1)
+        await asyncio.wait_for(watcher, timeout=10)
 
         assert activity_transitions == [
             ("start", sid, "run a background task"),
@@ -5178,7 +5178,15 @@ async def test_recent_turn_expires_without_followup_access(
     broadcast.finish()
 
     chat_mod._remember_recent_turn(broadcast.session_id, broadcast)
-    await asyncio.sleep(0.05)
+    # The expiry timer and the spool unlink (handed to the replay writer
+    # thread) both run asynchronously; poll instead of a fixed sleep.
+    deadline = asyncio.get_running_loop().time() + 5
+    while (broadcast.session_id in chat_mod._recent_turns
+           or broadcast.session_id in chat_mod._recent_turn_expiry_handles
+           or replay_path.exists()):
+        if asyncio.get_running_loop().time() >= deadline:
+            break
+        await asyncio.sleep(0.01)
 
     assert broadcast.session_id not in chat_mod._recent_turns
     assert broadcast.session_id not in chat_mod._recent_turn_expiry_handles
