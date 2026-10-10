@@ -5452,6 +5452,40 @@ def _commit_broadcast_attachments(broadcast: TurnBroadcast) -> None:
     broadcast._attachment_prepare_task = None
 
 
+async def _commit_broadcast_attachments_off_loop(
+    broadcast: TurnBroadcast, session_id: str,
+) -> None:
+    """Run the commit in a worker, joined to completion even when cancelled.
+
+    The commit takes ``_image_store_lock`` and fsyncs SQLite, so it must not
+    stall the loop. It stays one indivisible step: Stop/timeout cannot abandon
+    it halfway, and a cancelled caller still sees the lease either committed or
+    fail-closed (uncertain, runtime rebuilt) before CancelledError propagates.
+    """
+    if broadcast._attachment_lease is None:
+        return
+    task = asyncio.create_task(
+        asyncio.to_thread(_commit_broadcast_attachments, broadcast))
+    try:
+        await asyncio.shield(task)
+    except asyncio.CancelledError:
+        while not task.done():
+            try:
+                # wait() joins without re-raising the worker's own exception.
+                await asyncio.wait({task})
+            except asyncio.CancelledError:
+                continue
+        if (not task.cancelled()
+                and isinstance(task.exception(), _AttachmentCommitUncertain)):
+            _pending_runtime_rebuilds.add(session_id)
+        raise
+    except _AttachmentCommitUncertain:
+        # A response may now be queued on this runtime; never let the next
+        # turn adopt it as its own response.
+        _pending_runtime_rebuilds.add(session_id)
+        raise
+
+
 def _migrate_legacy_attachments() -> None:
     """One-shot migration: sessions/attachments/* → ROOT/.muselab-attach/*.
     Runs at module import. Idempotent — only moves dirs that don't yet
@@ -8244,33 +8278,36 @@ def get_queue_api(sid: str, response: Response) -> dict:
         return data
     # Polling queue state must not run global storage GC. Upload/lease paths
     # already own expiry maintenance; text-only queues do not need its lock.
-    with _image_store_lock:
-        for it in items:
-            ids = _attachment_ids(it.get("image_ids") or "")
-            atts: list[dict] = []
-            for aid in ids:
-                if not _valid_staged_attachment_id(aid):
-                    atts.append({"id": aid, "available": False})
-                    continue
+    for it in items:
+        ids = _attachment_ids(it.get("image_ids") or "")
+        atts: list[dict] = []
+        for aid in ids:
+            if not _valid_staged_attachment_id(aid):
+                atts.append({"id": aid, "available": False})
+                continue
+            # Durable metadata verifies the blob on disk; keep that read out of
+            # the store lock so polling cannot stall uploads and leases.
+            with _image_store_lock:
                 entry = _image_store.get(aid)
-                try:
-                    metadata = (
-                        entry or _durable_attachment_store.metadata(aid)
-                    )
-                except (DurableAttachmentError, OSError, sqlite3.Error,
-                        UnsafePrivatePath):
-                    metadata = None
-                if metadata is None:
-                    atts.append({"id": aid, "available": False})
-                    continue
-                atts.append({
-                    "id": aid,
-                    "kind": metadata.get("kind", "image"),
-                    "name": metadata.get("name", ""),
-                    "mime": metadata.get("mime", ""),
-                    "available": True,
-                })
-            it["attachments"] = atts
+                hot_entry = dict(entry) if entry else None
+            try:
+                metadata = (
+                    hot_entry or _durable_attachment_store.metadata(aid)
+                )
+            except (DurableAttachmentError, OSError, sqlite3.Error,
+                    UnsafePrivatePath):
+                metadata = None
+            if metadata is None:
+                atts.append({"id": aid, "available": False})
+                continue
+            atts.append({
+                "id": aid,
+                "kind": metadata.get("kind", "image"),
+                "name": metadata.get("name", ""),
+                "mime": metadata.get("mime", ""),
+                "available": True,
+            })
+        it["attachments"] = atts
     return data
 
 
@@ -18039,13 +18076,8 @@ async def _start_turn(
                     # query() is the transport commit point. Until it returns,
                     # the lease is still retryable; after it succeeds, consume
                     # the exact staged objects before receiving any response.
-                    try:
-                        _commit_broadcast_attachments(broadcast)
-                    except _AttachmentCommitUncertain:
-                        # A response may now be queued on this runtime; never
-                        # let the next turn adopt it as its own response.
-                        _pending_runtime_rebuilds.add(session_id)
-                        raise
+                    await _commit_broadcast_attachments_off_loop(
+                        broadcast, session_id)
                     broadcast.query_committed = True
                     broadcast.steering_ready.set()
                     broadcast.emit_startup_perf("ready")
