@@ -19200,22 +19200,35 @@ async def _start_turn(
             _rename_src = first_user_text or prompt
             if _rename_src.strip() == _IMAGE_ONLY_PLACEHOLDER:
                 _rename_src = "图片对话" if is_chinese_locale() else "Image chat"
-            def _persist_session_summary() -> None:
-                sess.bump_session(
+            def _persist_session_summary() -> str | None:
+                auto_title = sess.bump_session(
                     session_id,
                     message_count=len(all_msgs),
                     turn_count=n_turns,
                     auto_rename_from=_rename_src,
                 )
                 sess.update_model(session_id, model_to_use)
+                return auto_title
 
-            await obs.to_thread_io(
+            auto_title = await obs.to_thread_io(
                 "chat.session_index_write",
                 session_id,
                 _persist_session_summary,
                 file_path=sess.INDEX,
                 owned=True,
             )
+            if isinstance(auto_title, str) and auto_title:
+                # The task ledger keeps its own copy of the name, written at
+                # turn start from the "新会话 ..." placeholder. Sync it once the
+                # first turn gives the session its real title.
+                try:
+                    from .activity import activity as _activity
+                    await asyncio.to_thread(
+                        _activity.rename_session, session_id, auto_title)
+                except Exception as e:
+                    obs.diagnostic_line(
+                        f"[activity] auto-rename sync failed "
+                        f"sid={session_id[:8]} exc={type(e).__name__}\n")
             # ``done`` is intentionally published before this slower block. A
             # user can therefore roll over the session while these annotations
             # and the first-turn name are still being persisted. Reconcile the
