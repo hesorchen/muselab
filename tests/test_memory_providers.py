@@ -336,6 +336,38 @@ def test_claude_oauth_generation_uses_fresh_no_tool_sdk_query(
     assert seen["options"].skills == []
 
 
+def test_sdk_memory_cli_stderr_is_private_and_deduplicated(
+        tmp_path, monkeypatch, capsys):
+    import claude_agent_sdk
+    from claude_agent_sdk.types import ResultMessage
+    from backend.memory_config import MemoryConfig
+    from backend.memory_providers import GenerationProvider
+
+    monkeypatch.setenv("MUSELAB_MEMORY_DIR", str(tmp_path / "memory"))
+    seen = {}
+
+    async def fake_query(*, prompt, options):
+        seen["options"] = options
+        yield ResultMessage(subtype="success", duration_ms=1, duration_api_ms=1,
+                            is_error=False, num_turns=1, session_id="fixture", result="ok")
+
+    monkeypatch.setattr(claude_agent_sdk, "query", fake_query)
+    provider = GenerationProvider(MemoryConfig(generation_model="claude-sonnet-4-6"))
+    monkeypatch.setattr(provider, "_route", lambda: None)
+    assert _run(provider.complete("system", "synthetic-private-prompt")) == "ok"
+
+    sink = seen["options"].stderr
+    assert callable(sink)
+    capsys.readouterr()
+    line = "unrecognized_model: synthetic-private-prompt /private/workspace/file.py"
+    sink(line)
+    sink(line)
+    logged = capsys.readouterr().err
+    assert logged.count("category=configuration") == 1
+    assert "synthetic-private-prompt" not in logged
+    assert "/private/workspace" not in logged
+
+
 def test_ducc_generation_model_never_routes_through_http(monkeypatch):
     from backend.memory_config import MemoryConfig
     from backend.memory_providers import GenerationProvider
