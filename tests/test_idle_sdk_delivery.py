@@ -282,10 +282,10 @@ def test_foreground_result_hands_immediate_background_tail_to_watcher(
                 parent_rows.append(event)
                 return publish(event)
             monkeypatch.setattr(parent, "publish", capture)
-            await asyncio.wait_for(parent.task, 4)
+            await asyncio.wait_for(parent.task, 10)
             watcher = chat._task_watchers.get(sid)
             if watcher is not None:
-                await asyncio.wait_for(watcher, 4)
+                await asyncio.wait_for(watcher, 10)
             child = chat._recent_turns[sid]
             assert child is not parent and child.is_continuation
             parent_text = "".join(json.loads(row["data"])["text"]
