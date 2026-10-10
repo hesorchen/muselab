@@ -6420,3 +6420,13 @@ def test_background_task_cards_open_a_safe_focus_managed_detail_dialog():
     assert 'usage=data.get("usage") or {}' in presentation
     assert ".modal.task-detail-modal" in css
     assert ".task-detail-trigger:focus-visible" in css
+
+
+def test_latest_edit_tool_idx_cache_key_tracks_window_slide():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    start = app.index("_latestEditToolIdx(paneMsgs")
+    body = app[start:app.index("isLatestEditTool(i, m", start)]
+
+    assert "msgs.length" in body
+    assert "msgs[0]?._k" in body
+    assert "msgs[msgs.length - 1]?._k" in body
