@@ -1424,6 +1424,38 @@ def test_turn_uuid_resolution_crosses_meta_image_hints(
     ) == ("image-assistant", "image-user", True)
 
 
+def test_turn_uuid_resolution_crosses_mid_turn_auto_compaction(
+    client, auth, app_module, tmp_path,
+):
+    """A compact boundary roots a new chain; the turn must still own its tail."""
+    from backend import chat as chat_mod
+
+    sid, transcript = _make_endpoint_session(
+        client, auth, chat_mod, tmp_path,
+        [_entry("old-user", "user", "earlier question"),
+         _entry("old-assistant", "assistant", "earlier answer", "old-user")])
+    _, boundary = chat_mod._turn_transcript_boundary(sid, "claude-sonnet-4-6")
+    _append(
+        transcript,
+        _entry("user", "user", "long task", "old-assistant",
+               timestamp="2024-01-01T00:00:01Z"),
+        _entry("early-assistant", "assistant", "working", "user",
+               timestamp="2024-01-01T00:00:02Z"),
+        _entry("boundary", "system", "", None, subtype="compact_boundary",
+               logicalParentUuid="early-assistant",
+               timestamp="2024-01-01T00:00:03Z"),
+        _entry("summary", "user", "conversation summary", "boundary",
+               isCompactSummary=True, timestamp="2024-01-01T00:00:03Z"),
+        _entry("final-assistant", "assistant", "the complete answer", "summary",
+               timestamp="2024-01-01T00:00:04Z"),
+    )
+    assert chat_mod._turn_uuids_from_boundary(
+        sid, boundary,
+        started_at_ms=1_704_067_201_000,
+        terminal_at_ms=1_704_067_205_000,
+    ) == ("final-assistant", "user", True)
+
+
 def test_turn_uuid_resolution_rejects_meta_only_turn(
     client, auth, app_module, tmp_path,
 ):

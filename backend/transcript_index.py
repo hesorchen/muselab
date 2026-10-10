@@ -21,7 +21,7 @@ from . import transcript_index_store as store
 
 # Increment whenever persisted descriptor semantics (bubble expansion, preview,
 # tool/task metadata) change, not only when the JSON container shape changes.
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 _TRANSCRIPT_TYPES = {"user", "assistant", "progress", "system", "attachment"}
 _PREFIX_GUARD_BYTES = 1024 * 1024
 
@@ -191,6 +191,7 @@ def _append_complete_lines(
                 "length": line_end - line_start,
                 "uuid": record_uuid,
                 "parent": entry.get("parentUuid"),
+                "logical_parent": entry.get("logicalParentUuid"),
                 "type": record_type,
                 "is_sidechain": bool(entry.get("isSidechain")),
                 "team_name": entry.get("teamName"),
