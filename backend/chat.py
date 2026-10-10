@@ -775,6 +775,11 @@ class _ReplaySpool:
             self.close()
 
 
+async def _new_replay_spool() -> _ReplaySpool:
+    """Create the spool file in a worker so a slow disk cannot stall the loop."""
+    return await asyncio.to_thread(_ReplaySpool)
+
+
 class _TurnSubscriber:
     """Independent cursor over the broadcast's replay spool, plus a small
     queue for live token deltas.
@@ -1061,10 +1066,13 @@ class TurnBroadcast:
         replay_max_bytes: int = 0,
         subscriber_max_events: int = _BROADCAST_SUBSCRIBER_MAX_EVENTS,
         subscriber_max_bytes: int = _BROADCAST_SUBSCRIBER_MAX_BYTES,
+        events: "_ReplaySpool | None" = None,
     ):
         self.session_id = session_id
         self.model = model
-        self.events = _ReplaySpool()
+        # Creating the spool touches the filesystem; async callers build it
+        # off-loop (``_new_replay_spool``) and pass it in.
+        self.events = _ReplaySpool() if events is None else events
         self.subscribers: set[_TurnSubscriber] = set()
         self._resume_max_events = (
             replay_max_events if replay_max_events > 0
@@ -15224,7 +15232,11 @@ async def _watch_inflight_tasks_owned(
         nonlocal cont, cont_state, continuation_seen
         if not _owns_generation():
             return
-        b = TurnBroadcast(session_id=session_id, model=continuation_model)
+        spool = await _new_replay_spool()
+        if not _owns_generation():
+            return
+        b = TurnBroadcast(
+            session_id=session_id, model=continuation_model, events=spool)
         b.started_at = _background_turn_started_at.get(
             session_id, b.started_at)
         b.parent_turn_id = _background_origin_turn_id.get(session_id, "")
@@ -16594,6 +16606,7 @@ async def _admit_turn(
     """
     admission_started = obs.monotonic()
     draining = None
+    spool = await _new_replay_spool()
     async with _lock:
         if sess.session_is_deleting(session_id):
             raise _TurnStartError("session is being deleted", status=404)
@@ -16614,7 +16627,8 @@ async def _admit_turn(
               or _session_has_sdk_delivery(session_id)):
             raise _TurnBusy()
         else:
-            broadcast = TurnBroadcast(session_id=session_id, model=model or MODEL)
+            broadcast = TurnBroadcast(
+                session_id=session_id, model=model or MODEL, events=spool)
             _active_turns[session_id] = broadcast
     if draining is not None:
         drain_budget = _INTERRUPT_DRAIN_WAIT_S if draining.cancelled else 3.0
@@ -16644,7 +16658,8 @@ async def _admit_turn(
                     or _session_has_live_watcher(session_id)
                     or _session_has_sdk_delivery(session_id)):
                 raise _TurnBusy()
-            broadcast = TurnBroadcast(session_id=session_id, model=model or MODEL)
+            broadcast = TurnBroadcast(
+                session_id=session_id, model=model or MODEL, events=spool)
             _active_turns[session_id] = broadcast
 
     broadcast.user_text = prompt
@@ -21983,7 +21998,9 @@ async def _begin_sdk_delivery(
     if scheduled:
         obs.perf_event("chat.native_cron_delivery_owner", session=obs.short_id(key[0]),
                        **_native_cron_delivery_identity(key[0], prompt))
-    broadcast = TurnBroadcast(session_id=key[0], model=key[1] or MODEL)
+    broadcast = TurnBroadcast(
+        session_id=key[0], model=key[1] or MODEL,
+        events=await _new_replay_spool())
     broadcast.user_text = prompt
     broadcast.is_scheduled_delivery = scheduled
     broadcast.is_continuation = not scheduled
