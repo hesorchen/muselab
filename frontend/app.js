@@ -15340,10 +15340,12 @@ function portal() {
       return this.isTabScheduledActive(tid, session)
         || this.isTabBackgroundActive(tid, session);
     },
+    // Dot priority: blue (streaming) > green (unread reply) > yellow
+    // (detached background/schedule only). Yellow never hides a green dot.
     isTabRunning(tid, session = null) {
-      return this.isTabScheduledActive(tid, session)
-        || this.isTabBackgroundActive(tid, session)
-        || this.isTabStreaming(tid, session);
+      if (this.isTabStreaming(tid, session)) return true;
+      return this.isTabDetachedOnly(tid, session)
+        && !this.isTabUnread(tid, session);
     },
     isTabUnread(tid, session = null) {
       // True when this tab's most recent turn finished while the user was
@@ -15360,7 +15362,7 @@ function portal() {
       // already flipped false. The old `!st.streaming`-only guard let the
       // green "done" dot light up alongside the accent "in-progress" dot in
       // exactly those windows (2026-05-30 both-dots bug report).
-      if (this.isTabRunning(tid, session)) return false;
+      if (this.isTabStreaming(tid, session)) return false;
       const st = this.tabState[tid];
       return !!(st && st.unread);
     },

@@ -6462,6 +6462,9 @@ def test_scheduler_modal_opens_one_standalone_surface_per_topbar_entry():
     # Blue (streaming) wins over yellow (detached background/schedule).
     assert "isTabDetachedOnly(tid)" in html
     assert "isTabDetachedOnly(s.id, s)" in html
+    # Yellow is lowest priority: an unread (green) tab never also shows it.
+    assert "&& !this.isTabUnread(tid, session)" in app
+    assert "if (this.isTabStreaming(tid, session)) return false;\n      const st = this.tabState[tid];\n      return !!(st && st.unread);" in app
     assert "backgroundTaskTitle(row)" in html
     assert ".activity-row.has-bg-work" in css
 
