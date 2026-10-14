@@ -202,6 +202,8 @@
   <symbol id="i-plug" viewBox="0 0 24 24"><path d="M12 22v-5"/><path d="M9 7V2"/><path d="M15 7V2"/><path d="M6 13V8h12v5a4 4 0 0 1-4 4h-4a4 4 0 0 1-4-4Z"/></symbol>
   <!-- Bell — notifications settings menu. Replaces 🔔 -->
   <symbol id="i-bell" viewBox="0 0 24 24"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></symbol>
+  <symbol id="i-calendar-clock" viewBox="0 0 24 24"><path d="M21 7.5V6a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h3.5"/><path d="M16 2v4"/><path d="M8 2v4"/><path d="M3 10h5"/><path d="M17.5 17.5 16 16.3V14"/><circle cx="16" cy="16" r="6"/></symbol>
+  <symbol id="i-list-checks" viewBox="0 0 24 24"><path d="m3 17 2 2 4-4"/><path d="m3 7 2 2 4-4"/><path d="M13 6h8"/><path d="M13 12h8"/><path d="M13 18h8"/></symbol>
   <!-- Dollar sign — cost / usage dashboard menu. Replaces 💰 -->
   <symbol id="i-dollar" viewBox="0 0 24 24"><line x1="12" y1="1" x2="12" y2="23"/><path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></symbol>
   <!-- Gauge — Pro/Max rate-limit utilization badge in the chat toolbar. -->
@@ -1480,6 +1482,28 @@
           <span class="activity-running" x-show="activity.summary.running" aria-hidden="true"></span>
           <span class="activity-unread" x-show="activity.summary.unread" aria-hidden="true"></span>
         </button>
+        <button @click="openScheduler({ tab: 'native' })" class="icon-btn bell-btn topbar-tasks-native"
+                :title="lang==='zh'
+                  ? `原生 Cron（当前会话 ${currentSessionScheduledCount()} 个存活任务）`
+                  : `Native cron (${currentSessionScheduledCount()} live in this session)`"
+                :aria-label="lang==='zh' ? '原生 Cron' : 'Native cron'">
+          <svg><use href="#i-calendar-clock"/></svg>
+          <span class="bell-native-badge"
+                x-show="currentSessionScheduledCount() > 0"
+                x-text="currentSessionScheduledCount()"
+                aria-hidden="true"></span>
+        </button>
+        <button @click="openScheduler({ tab: 'background' })" class="icon-btn bell-btn topbar-tasks-background"
+                :title="lang==='zh'
+                  ? `后台任务（当前会话 ${currentSessionBackgroundCount()} 个运行中）`
+                  : `Background tasks (${currentSessionBackgroundCount()} running in this session)`"
+                :aria-label="lang==='zh' ? '后台任务' : 'Background tasks'">
+          <svg><use href="#i-list-checks"/></svg>
+          <span class="bell-native-badge"
+                x-show="currentSessionBackgroundCount() > 0"
+                x-text="currentSessionBackgroundCount()"
+                aria-hidden="true"></span>
+        </button>
         <button class="session-todo-btn icon-btn" type="button"
                 @click="toggleSessionTodoBoard()"
                 :class="{ active: sessionTodoOpen, 'has-active': sessionTodoCount(false) }"
@@ -1489,6 +1513,13 @@
           <span class="session-todo-badge" aria-hidden="true"
                 x-show="sessionTodoIndicatorPriority()"
                 :class="'is-' + sessionTodoIndicatorPriority()"></span>
+        </button>
+        <button @click="openScheduler({ tab: 'scheduled' })" class="icon-btn bell-btn topbar-tasks-scheduled"
+                :title="lang==='zh' ? '定时任务' : 'Scheduled tasks'"
+                :aria-label="lang==='zh' ? '定时任务' : 'Scheduled tasks'">
+          <svg><use href="#i-bell"/></svg>
+          <span class="bell-badge" x-show="scheduler.unreadCount > 0"
+                x-text="scheduler.unreadCount > 99 ? '99+' : scheduler.unreadCount"></span>
         </button>
         <button class="icon-btn" type="button" @click="openMemoryCenter()"
                 :title="lang==='zh' ? '记忆中心' : 'Memory Center'"
@@ -1538,26 +1569,6 @@
              a tooltip showing the keyboard shortcut. Visual weight is
              intentionally low so the palette doesn't read as "chat
              search" — it's app-global. -->
-        <button @click="openScheduler()" class="icon-btn bell-btn"
-                :title="currentSessionScheduledCount()
-                  ? (lang==='zh'
-                      ? `定时任务（当前会话 ${currentSessionScheduledCount()} 个 SDK 原生任务）`
-                      : `Scheduled tasks (${currentSessionScheduledCount()} native in this session)`)
-                  : (lang==='zh' ? '定时任务' : 'Scheduled tasks')"
-                aria-label="Scheduled tasks">
-          <svg viewBox="0 0 24 24" width="16" height="16" fill="none"
-               stroke="currentColor" stroke-width="2"
-               stroke-linecap="round" stroke-linejoin="round">
-            <path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/>
-            <path d="M13.73 21a2 2 0 0 1-3.46 0"/>
-          </svg>
-          <span class="bell-badge" x-show="scheduler.unreadCount > 0"
-                x-text="scheduler.unreadCount > 99 ? '99+' : scheduler.unreadCount"></span>
-          <span class="bell-native-badge"
-                x-show="currentSessionScheduledCount() > 0"
-                x-text="currentSessionScheduledCount()"
-                aria-hidden="true"></span>
-        </button>
         <button @click="reloadApp()" class="icon-btn"
                 :title="lang==='zh' ? '重新加载（卡住时的兜底：完整刷新页面，等同关掉再打开）' : 'Reload (escape hatch when stuck: full page reload, like closing and reopening)'"
                 aria-label="Reload app">
@@ -1915,14 +1926,14 @@
               <span class="chat-tab-stream-dot"
                     :class="{
                       'is-background': isTabBackgroundActive(tid) || isTabScheduledActive(tid),
-                      'is-native-schedule-clickable': isTabScheduledActive(tid),
+                      'is-native-schedule-clickable': isTabScheduledActive(tid) || isTabBackgroundActive(tid),
                     }"
                     x-show="isTabRunning(tid)"
-                    @click.stop="isTabScheduledActive(tid) && openNativeScheduledTasks(tid, $event)"
+                    @click.stop="isTabScheduledActive(tid) ? openNativeScheduledTasks(tid, $event) : (isTabBackgroundActive(tid) && openBackgroundTasks(tid, $event))"
                     :title="isTabScheduledActive(tid)
                       ? (lang==='zh' ? '点击查看该会话的 SDK 定时任务' : 'View this session\'s SDK scheduled tasks')
                       : isTabBackgroundActive(tid)
-                        ? t('chat.background_running')
+                        ? (lang==='zh' ? '点击查看该会话的后台任务' : 'View this session\'s background tasks')
                       : (lang==='zh' ? '该会话正在生成…' : 'Streaming…')"></span>
               <!-- Green dot when the tab finished a turn while you were
                    elsewhere. Sibling to the streaming dot but mutually
@@ -6874,7 +6885,8 @@
                         @click="openActivityEvent(item)"
                         :class="item.state
                           + (activityIsUnreadResult(item) ? ' is-unread' : '')
-                          + (activityRequiresAction(item) ? ' requires-action' : '')">
+                          + (activityRequiresAction(item) ? ' requires-action' : '')
+                          + (activityHasBackgroundWork(item) ? ' has-bg-work' : '')">
                   <span class="activity-state-dot"></span>
                   <span class="activity-row-main">
                     <strong class="activity-session-name"
@@ -7105,12 +7117,16 @@
          aria-labelledby="scheduler-title" tabindex="-1"
          @keydown.tab="trapDialogFocus($event, 'scheduler')">
       <div class="modal-head">
-        <span class="modal-title" id="scheduler-title"><svg class="modal-title-icon"><use href="#i-clock"/></svg><span x-text="lang==='zh' ? '定时任务' : 'Scheduled tasks'"></span></span>
+        <span class="modal-title" id="scheduler-title"><svg class="modal-title-icon"><use :href="scheduler.tab === 'native' ? '#i-calendar-clock' : scheduler.tab === 'background' ? '#i-list-checks' : '#i-clock'"/></svg><span x-text="scheduler.tab === 'native'
+          ? (lang==='zh' ? '原生 Cron' : 'Native cron')
+          : scheduler.tab === 'background'
+            ? (lang==='zh' ? '后台任务' : 'Background tasks')
+            : (lang==='zh' ? '定时任务' : 'Scheduled tasks')"></span></span>
         <button class="modal-close" @click="closeScheduler()"
                 :title="lang==='zh' ? '关闭' : 'Close'" aria-label="Close">×</button>
       </div>
       <div class="modal-body sched-body">
-        <section class="sched-native-section">
+        <section class="sched-native-section" x-show="scheduler.tab === 'native'">
           <div class="sched-native-head">
             <div>
               <div class="sched-section-title">
@@ -7172,9 +7188,7 @@
           </div>
         </section>
 
-        <div class="sched-surface-divider">
-          <span x-text="lang==='zh' ? 'MuseLab 调度器' : 'MuseLab scheduler'"></span>
-        </div>
+        <div class="sched-panel" x-show="scheduler.tab === 'scheduled'">
 
         <!-- Create form — labeled rows, grid-aligned, supports daily /
              weekly / monthly / once with the time picker always
@@ -7525,6 +7539,36 @@
             </div>
           </template>
         </div>
+        </div>
+
+        <section class="sched-panel sched-bg-section" x-show="scheduler.tab === 'background'">
+          <div class="sched-native-note"
+               x-text="lang==='zh'
+                 ? '当前会话里由 Claude 在后台启动的任务；会话关闭或重启后不再追踪。'
+                 : 'Tasks Claude started in the background of this session; not tracked after the session is closed or restarted.'"></div>
+          <div class="sched-native-empty" x-show="!backgroundTaskRows().length"
+               x-text="lang==='zh' ? '当前会话没有后台任务。' : 'No background tasks in this session.'"></div>
+          <div class="sched-native-list" x-show="backgroundTaskRows().length">
+            <template x-for="row in backgroundTaskRows()" :key="row.key">
+              <article class="sched-native-card sched-bg-card">
+                <div class="subagent-task" :class="'is-' + (row.status.state || 'running')">
+                  <button type="button" class="task-detail-trigger"
+                          @click="openTaskDetail(row.status, row.message, $event)">
+                    <span class="subagent-task-badge"
+                          x-text="taskStatusLabel(row.status.state)"></span>
+                    <span class="subagent-task-summary" x-show="row.status.summary"
+                          x-text="row.status.summary"></span>
+                    <span class="task-detail-chevron" aria-hidden="true">›</span>
+                  </button>
+                  <a class="subagent-task-stop" href="#"
+                     x-show="row.running && row.status.task_id"
+                     @click.stop.prevent="stopBackgroundTask(row.status)"
+                     x-text="'⏹ ' + t('subagent.stop_task')"></a>
+                </div>
+              </article>
+            </template>
+          </div>
+        </section>
       </div>
     </div>
   </div>

@@ -814,6 +814,8 @@ function portal() {
       nativeLoading: false,
       nativeError: "",
       nativeLoadSeq: 0,
+      // Which of the three surfaces is showing: native | scheduled | background.
+      tab: "scheduled",
       // Task ids whose DELETE request is waiting for a running turn to cancel.
       // Kept separate from server `run.status` so a slow, destructive action
       // remains visibly owned by the row that initiated it.
@@ -37923,6 +37925,12 @@ function portal() {
     activityRequiresAction(item) {
       return !!item && ["waiting_approval", "paused"].includes(item.state);
     },
+    // Native cron / background tasks are live work the ledger state doesn't
+    // reflect; the task center shows them with the same yellow dot as tabs.
+    activityHasBackgroundWork(item) {
+      const sid = item && (item.session_id || item.thread_id);
+      return !!sid && (this.isTabScheduledActive(sid) || this.isTabBackgroundActive(sid));
+    },
     activityGroupUnread(group) {
       if (group?.custom || this.activitySearchQuery()) {
         return this.activityAllEvents(group)
@@ -39026,7 +39034,8 @@ function portal() {
         const payload = await response.json();
         if (seq !== this.scheduler.nativeLoadSeq) return false;
         const tasks = Array.isArray(payload.tasks) ? payload.tasks : [];
-        this.scheduler.nativeTasks = tasks;
+        this.scheduler.nativeTasks = tasks.filter(task =>
+          !["finished", "expired", "missing"].includes(task.runtime_state || "active"));
         this._setScheduledTaskState(sid,
           payload.scheduled_active ?? tasks.some(task =>
             ["active", "recovering", "unconfirmed"].includes(task.runtime_state || "active")),
@@ -39096,6 +39105,39 @@ function portal() {
       }
       return this.openScheduler({ sessionId, native: true });
     },
+    openBackgroundTasks(sessionId, event = null) {
+      if (event) {
+        event.preventDefault();
+        event.stopPropagation();
+      }
+      return this.openScheduler({ sessionId, tab: "background" });
+    },
+    currentSessionBackgroundCount() {
+      return this.backgroundTaskLiveCount(this.currentId);
+    },
+    // Background tasks are task cards in the session transcript, so the tab
+    // lists them from there instead of needing a second server projection.
+    backgroundTaskRows(sid = this.scheduler.nativeSessionId || this.currentId) {
+      const messages = (this.tabState[sid] && this.tabState[sid].messages) || [];
+      const rows = [];
+      for (const m of messages) {
+        if (!m || m.role !== "tool_use" || !m.task_status) continue;
+        const status = m.task_status;
+        if (status.owner_session_id && status.owner_session_id !== sid) continue;
+        rows.push({
+          key: String(status.task_id || status.tool_use_id || m.id || rows.length),
+          status,
+          message: m,
+          running: status.state === "running",
+        });
+      }
+      return rows.sort((a, b) => Number(b.running) - Number(a.running));
+    },
+    backgroundTaskLiveCount(sid = this.scheduler.nativeSessionId || this.currentId) {
+      const running = this.backgroundTaskRows(sid).filter(row => row.running).length;
+      if (running) return running;
+      return this.isTabBackgroundActive(sid) ? this._backgroundTaskCount(this.tabState[sid]) : 0;
+    },
     async openScheduler(options = {}) {
       this._invalidateSchedDraftSave();
       const nativeSessionId = String(
@@ -39104,6 +39146,9 @@ function portal() {
         || "",
       );
       const opener = document.activeElement;
+      this.scheduler.tab = ["native", "scheduled", "background"].includes(options && options.tab)
+        ? options.tab
+        : (options && options.native ? "native" : "scheduled");
       this.scheduler.show = true;
       this._openFocusSurface(
         "scheduler", ".sched-modal", ".sched-input-name",
