@@ -39122,8 +39122,9 @@ function portal() {
       const rows = [];
       for (const m of messages) {
         if (!m || m.role !== "tool_use" || !m.task_status) continue;
+        // Cards cloned into a rollover successor keep owner_session_id of the
+        // predecessor that runs them; they are this session's tasks too.
         const status = m.task_status;
-        if (status.owner_session_id && status.owner_session_id !== sid) continue;
         rows.push({
           key: String(status.task_id || status.tool_use_id || m.id || rows.length),
           status,
@@ -39132,6 +39133,13 @@ function portal() {
         });
       }
       return rows.sort((a, b) => Number(b.running) - Number(a.running));
+    },
+    backgroundTaskTitle(row) {
+      const status = (row && row.status) || {};
+      const input = (row && row.message && row.message.input) || {};
+      const text = status.summary || status.description || input.description
+        || input.command || input.prompt || "";
+      return String(text).slice(0, 200);
     },
     backgroundTaskLiveCount(sid = this.scheduler.nativeSessionId || this.currentId) {
       const running = this.backgroundTaskRows(sid).filter(row => row.running).length;

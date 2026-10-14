@@ -6455,6 +6455,11 @@ def test_scheduler_modal_opens_one_standalone_surface_per_topbar_entry():
     assert "activityHasBackgroundWork(item)" in html
     assert "async openScheduler(options = {})" in app
     assert "backgroundTaskRows(sid = " in app
+    # Cards cloned into a rollover successor are owned by the predecessor; the
+    # modal must still list them, and running rows need a title.
+    assert "status.owner_session_id !== sid) continue" not in app
+    assert "backgroundTaskTitle(row)" in app
+    assert "backgroundTaskTitle(row)" in html
     assert ".activity-row.has-bg-work" in css
 
     # The task-detail dialog opens over the scheduler modal (both default to 900).

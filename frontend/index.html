@@ -7556,8 +7556,8 @@
                           @click="openTaskDetail(row.status, row.message, $event)">
                     <span class="subagent-task-badge"
                           x-text="taskStatusLabel(row.status.state)"></span>
-                    <span class="subagent-task-summary" x-show="row.status.summary"
-                          x-text="row.status.summary"></span>
+                    <span class="subagent-task-summary" x-show="backgroundTaskTitle(row)"
+                          x-text="backgroundTaskTitle(row)"></span>
                     <span class="task-detail-chevron" aria-hidden="true">›</span>
                   </button>
                   <a class="subagent-task-stop" href="#"
