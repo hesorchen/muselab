@@ -460,6 +460,7 @@ def test_native_cron_jobs_have_authenticated_read_only_inspector(
             "session_id": sid,
             "runtime_owned": True,
             "scheduled_active": True,
+            "scheduled_count": 1,
             "count": 1,
             "tasks": [{
                 "job_id": "job-a",

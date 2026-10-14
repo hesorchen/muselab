@@ -39030,7 +39030,8 @@ function portal() {
         this._setScheduledTaskState(sid,
           payload.scheduled_active ?? tasks.some(task =>
             ["active", "recovering", "unconfirmed"].includes(task.runtime_state || "active")),
-          tasks.length);
+          payload.scheduled_count ?? tasks.filter(task =>
+            !["finished", "expired", "missing", "paused"].includes(task.runtime_state || "active")).length);
         return true;
       } catch (_) {
         if (seq !== this.scheduler.nativeLoadSeq) return false;

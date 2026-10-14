@@ -1896,6 +1896,8 @@ _native_cron_recovery_tasks: dict[str, asyncio.Task] = {}
 _native_cron_write_tasks: set[asyncio.Task] = set()
 _native_cron_recovery_suppressed: set[str] = set()
 _NATIVE_CRON_LIVE_STATES = {"active", "recovering", "unconfirmed"}
+# Ended receipts stay on disk as history but are not tasks the session still owns.
+_NATIVE_CRON_ENDED_STATES = {"finished", "expired", "missing", "paused"}
 _native_cron_recovery_slots = asyncio.Semaphore(2)
 
 _SDK_CRON_JOB_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
@@ -5619,7 +5621,7 @@ def list_sessions_api(
     }
     with _sdk_cron_state_lock:
         scheduled_counts = {
-            sid: len(jobs)
+            sid: _native_cron_owned_count(jobs)
             for sid, jobs in _sdk_cron_jobs.items()
             if jobs
         }
@@ -21555,11 +21557,16 @@ async def recover_native_cron_api(sid: str) -> dict:
     return {"session_id": sid, "status": "recovering"}
 
 
+def _native_cron_owned_count(jobs: dict) -> int:
+    return sum(1 for raw in jobs.values()
+               if raw.get("runtime_state", "active") not in _NATIVE_CRON_ENDED_STATES)
+
+
 def _sdk_scheduled_snapshot(session_id: str) -> dict[str, Any]:
     """Return the privacy-safe, thread-safe native schedule projection."""
     with _sdk_cron_state_lock:
         jobs = _sdk_cron_jobs.get(session_id, {})
-        count = len(jobs)
+        count = _native_cron_owned_count(jobs)
         active = any(raw.get("runtime_state", "active") in _NATIVE_CRON_LIVE_STATES
                      for raw in jobs.values())
     return {"scheduled_active": active, "scheduled_count": count}
@@ -21593,7 +21600,7 @@ def list_sdk_scheduled_tasks_api(sid: str) -> dict[str, Any]:
     return {
         "session_id": sid,
         "runtime_owned": True,
-        "scheduled_active": _sdk_scheduled_snapshot(sid)["scheduled_active"],
+        **_sdk_scheduled_snapshot(sid),
         "tasks": tasks,
         "count": len(tasks),
     }
@@ -22059,7 +22066,7 @@ def _native_cron_delivery_identity(session_id: str, prompt: str) -> dict:
                 for job_id, raw in jobs.items():
                     owner = raw.get("owner_session_id") or (sid if raw.get("created_at_ms") else "")
                     if (owner and raw.get("prompt_sha256") == safe[1]
-                            and raw.get("runtime_state", "active") not in {"finished", "expired", "missing", "paused"}):
+                            and raw.get("runtime_state", "active") not in _NATIVE_CRON_ENDED_STATES):
                         candidates.add((str(owner), str(job_id)))
     local = {item for item in candidates if item[0] == session_id}
     possible = local or candidates

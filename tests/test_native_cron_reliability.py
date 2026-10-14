@@ -206,7 +206,8 @@ def test_native_receipt_survives_restart_and_requires_native_confirmation(stream
         assert job["runtime_state"] == "active"  # old CLI, not an empty list
         await hook({"session_crons": []}, None, {})
         assert job["runtime_state"] == "missing"
-        assert chat._sdk_scheduled_snapshot(sid) == {"scheduled_active": False, "scheduled_count": 1}
+        # An ended ("missing") receipt is history, not a task the session still owns.
+        assert chat._sdk_scheduled_snapshot(sid) == {"scheduled_active": False, "scheduled_count": 0}
         assert len(resumed) == 1
     asyncio.run(run())
 
