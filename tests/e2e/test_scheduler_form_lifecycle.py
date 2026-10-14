@@ -83,7 +83,6 @@ def scheduler_fixture(page, settings_frontend_url):
 
 
 def _open(page):
-    page.locator(".workbench-more:visible > summary").click()
     page.get_by_role("button", name="Scheduled tasks", exact=True).click()
     expect(page.locator(".sched-modal")).to_be_visible()
 
