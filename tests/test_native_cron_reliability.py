@@ -528,7 +528,8 @@ def test_rollover_successor_shows_cron_owned_by_hidden_predecessor(stream_env, m
     monkeypatch.setattr(chat.sess, "runtime_lineage",
                         lambda sid: ["shadow01", "public01"] if sid in {"shadow01", "public01"} else [])
     monkeypatch.setattr(chat.sess, "get_session_meta", lambda sid: {"id": sid})
-    assert chat._sdk_scheduled_snapshot("public01") == {"scheduled_active": True, "scheduled_count": 1}
-    assert [t["job_id"] for t in chat.list_sdk_scheduled_tasks_api("public01")["tasks"]] == ["fixture01"]
+    listing = chat.list_sdk_scheduled_tasks_api("public01")
+    assert [t["job_id"] for t in listing["tasks"]] == ["fixture01"]
+    assert (listing["scheduled_active"], listing["scheduled_count"]) == (True, 1)
     # The hidden predecessor itself must not report the successor's view twice.
     assert chat._sdk_scheduled_snapshot("shadow01")["scheduled_count"] == 1

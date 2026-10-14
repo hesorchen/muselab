@@ -21584,13 +21584,24 @@ def _native_cron_owner_jobs(session_id: str) -> dict:
     return jobs
 
 
+def _native_cron_projection(jobs: dict) -> dict[str, Any]:
+    return {
+        "scheduled_active": any(
+            raw.get("runtime_state", "active") in _NATIVE_CRON_LIVE_STATES
+            for raw in jobs.values()),
+        "scheduled_count": _native_cron_owned_count(jobs),
+    }
+
+
 def _sdk_scheduled_snapshot(session_id: str) -> dict[str, Any]:
-    """Return the privacy-safe, thread-safe native schedule projection."""
-    jobs = _native_cron_owner_jobs(session_id)
-    count = _native_cron_owned_count(jobs)
-    active = any(raw.get("runtime_state", "active") in _NATIVE_CRON_LIVE_STATES
-                 for raw in jobs.values())
-    return {"scheduled_active": active, "scheduled_count": count}
+    """Return the privacy-safe, thread-safe native schedule projection.
+
+    Hot path (mux reconcile calls it per session): the session's own jobs only,
+    no durable-index lineage walk.
+    """
+    with _sdk_cron_state_lock:
+        jobs = dict(_sdk_cron_jobs.get(session_id, {}))
+    return _native_cron_projection(jobs)
 
 
 @router.get(
@@ -21601,7 +21612,8 @@ def list_sdk_scheduled_tasks_api(sid: str) -> dict[str, Any]:
     """Return the authenticated, read-only native Cron projection."""
     if sess.get_session_meta(sid) is None:
         raise HTTPException(404, "session not found")
-    jobs = tuple(_native_cron_owner_jobs(sid).items())
+    owner_jobs = _native_cron_owner_jobs(sid)
+    jobs = tuple(owner_jobs.items())
     tasks = []
     for job_id, raw in sorted(jobs):
         tasks.append({
@@ -21620,7 +21632,7 @@ def list_sdk_scheduled_tasks_api(sid: str) -> dict[str, Any]:
     return {
         "session_id": sid,
         "runtime_owned": True,
-        **_sdk_scheduled_snapshot(sid),
+        **_native_cron_projection(owner_jobs),
         "tasks": tasks,
         "count": len(tasks),
     }
