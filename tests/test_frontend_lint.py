@@ -1593,7 +1593,7 @@ def test_session_setting_writes_keep_their_tab_owner_and_order():
     assert '"_thinkingPatchTail"' in thinking
 
 
-def test_model_switch_new_session_keeps_workspace_and_does_not_hijack_active_tab():
+def test_model_switch_switches_in_place_and_does_not_hijack_active_tab():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
     start = app.index("async onModelChange()")
     end = app.index("\n    // ===== Effort knob", start)
@@ -1606,8 +1606,15 @@ def test_model_switch_new_session_keeps_workspace_and_does_not_hijack_active_tab
     assert "await this._ensureSessionRegistered(sid)" in model
     assert "ownerState._modelPatchSeq !== seq" in model
     assert "ownerState._modelExpected = expected" in model
-    assert "name: \"\", model: newM, cwd: ownerWorkspace" in model
-    assert "this._conversationWorkspaceIsCurrent(ownerWorkspace) && this.currentId === sid" in model
+    # The owning workspace and tab must still own the selection when the PATCH lands.
+    assert "&& this._conversationWorkspaceIsCurrent(ownerWorkspace)" in model
+    # Switching is in place: PATCH the session, never create a replacement.
+    assert '"/api/chat/sessions/" + encodeURIComponent(sid)' in model
+    assert 'method: "PATCH"' in model
+    assert 'method: "POST"' not in model
+    # A 409 (session has live scheduled tasks) surfaces the server-provided reason.
+    assert "r.status === 409" in model
+    assert 'this.toast(detail || this.t("slash.failed"), "error")' in model
 
 
 def test_effort_and_fast_controls_follow_per_model_capabilities():
@@ -1697,10 +1704,17 @@ def test_new_and_model_switched_sessions_start_with_clean_runtime_settings():
     model_end = app.index("\n    // ===== Effort knob", model_start)
     model = app[model_start:model_end]
     assert "this.onEffortChange()" not in model
-    assert 'effort: "auto", service_tier: ""' in model
-    cancel = model[model.index("if (!ok)"):model.index("try {", model.index("if (!ok)"))]
-    assert "effort" not in cancel
-    assert "serviceTier" not in cancel
+    # The in-place switch carries a compatible effort/tier over and otherwise
+    # falls back to the new model's defaults.
+    assert "const nextEffort = this._effortAllowed(currentEffort, newM)" in model
+    assert '? currentEffort : "auto"' in model
+    assert 'const nextTier = this._supportsFast(newM) ? currentTier : ""' in model
+    # A refused or failed switch restores the dropdown and leaves the session's
+    # effort/tier untouched.
+    abandon = model[model.index("const abandon = () => {"):
+                   model.index("try {", model.index("const abandon = () => {"))]
+    assert "effort" not in abandon
+    assert "serviceTier" not in abandon
 
 
 def test_conversation_fork_is_explicit_and_keeps_edit_and_model_switch_separate():
@@ -3528,7 +3542,6 @@ def test_render_key_owned_arrays_mutate_only_at_audited_boundaries():
         "_truncatePaneMessagesFrom",
         "loadSession",
         "newSession",
-        "onModelChange",
     }
 
 
