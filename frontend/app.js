@@ -9593,7 +9593,7 @@ function portal() {
       }
       return "";
     },
-    _busySendDelivery(sid, activeTurnId = undefined, hasAttachments = undefined) {
+    _busySendDelivery(sid, activeTurnId = undefined) {
       if (this._normalizeBusySendMode(this.busySendMode) !== "adjust") {
         return "queue";
       }
@@ -9601,15 +9601,12 @@ function portal() {
       const turnId = activeTurnId === undefined
         ? String((st && st.activeTurnId) || "")
         : String(activeTurnId || "");
-      const draft = (st && st.draft) || {};
-      const attachmentIntent = hasAttachments === undefined
-        ? !!((draft.pendingImages || []).length || (draft.pendingDocs || []).length)
-        : !!hasAttachments;
       // Native SDK steering is bound to one immutable foreground turn and is
-      // text-only.  Every state that is already known to be ineligible should
-      // advertise ordinary FIFO immediately instead of briefly promising an
-      // adjustment that the queue endpoint must downgrade after the POST.
-      if (!st || !turnId || attachmentIntent || st.compacting
+      // text-only (the server turns attachments into on-disk paths in the
+      // steering text).  Every state that is already known to be ineligible
+      // should advertise ordinary FIFO immediately instead of briefly
+      // promising an adjustment that the queue endpoint must downgrade.
+      if (!st || !turnId || st.compacting
           || (!st.streaming && (st.backgroundActive || st._draining)) || st.parentTurnId
           || !this._pendingQueueAllowsAdjustment(st, turnId)) {
         return "queue";
@@ -9618,7 +9615,6 @@ function portal() {
     },
     async _resolveBusyAdjustmentTurnId(
       sid, st, expectedStreamOwnerToken = "", activeTurnId = "",
-      hasAttachments = false,
     ) {
       const streamOwnerToken = String(expectedStreamOwnerToken || "");
       const ownerStillCurrent = () => !!streamOwnerToken
@@ -9629,7 +9625,7 @@ function portal() {
       const accept = value => {
         const turnId = String(value || "");
         return turnId
-          && this._busySendDelivery(sid, turnId, hasAttachments) === "adjust"
+          && this._busySendDelivery(sid, turnId) === "adjust"
           ? turnId : "";
       };
       const known = accept(activeTurnId || (st && st.activeTurnId));
@@ -9643,7 +9639,7 @@ function portal() {
       // returns immediately without an extra request.
       if (!st || this.tabState[sid] !== st
           || this._normalizeBusySendMode(this.busySendMode) !== "adjust"
-          || hasAttachments || !st.streaming || st.compacting
+          || !st.streaming || st.compacting
           || st.backgroundActive || st._draining || st.parentTurnId
           || !this._pendingQueueAllowsAdjustment(st)) {
         return "";
@@ -10364,7 +10360,7 @@ function portal() {
                   && (!record.payload.active_turn_id || record.payload.active_turn_id === st.activeTurnId);
                 if (!record.sentAt && (record.requestedDelivery || "adjust") === "adjust"
                     && (sameStream || admittedOwner)
-                    && this._busySendDelivery(sid, st.activeTurnId, !!record.payload.image_ids) === "adjust") {
+                    && this._busySendDelivery(sid, st.activeTurnId) === "adjust") {
                   record.payload.delivery = "adjust";
                   record.payload.active_turn_id = String(st.activeTurnId);
                 }
@@ -10560,9 +10556,9 @@ function portal() {
       );
       let activeTurnId = String(item.active_turn_id || "");
       const streamOwnerToken = String(item.stream_owner_token || "");
-      if (delivery !== "adjust" && !activeTurnId && !image_ids) {
+      if (delivery !== "adjust" && !activeTurnId) {
         const resolvedTurnId = await this._resolveBusyAdjustmentTurnId(
-          sid, enqueueState, streamOwnerToken, "", false,
+          sid, enqueueState, streamOwnerToken, "",
         );
         if (resolvedTurnId) {
           activeTurnId = resolvedTurnId;
@@ -34157,10 +34153,8 @@ function portal() {
         ? String(sendState.activeTurnId || "") : "";
       const busyStreamOwnerToken = !isReconnect
         ? String(sendState._streamOwnerToken || "") : "";
-      const busyHasAttachments = !isReconnect
-        && !!(composerImages.length || composerDocs.length);
       const busyDelivery = this._busySendDelivery(
-        sendSid, busyActiveTurnId, busyHasAttachments,
+        sendSid, busyActiveTurnId,
       );
       // Resume only when this pane still owns the exact same immutable turn.
       // A cold reload or ABA turn change has no trustworthy checkpoint and uses
@@ -36322,7 +36316,7 @@ function portal() {
             || busyActiveTurnId || "",
           );
           const handoffDelivery = this._busySendDelivery(
-            streamSid, handoffTurnId, busyHasAttachments,
+            streamSid, handoffTurnId,
           );
           if (handoffDelivery === "queue") {
             if (sentUserBubble) {

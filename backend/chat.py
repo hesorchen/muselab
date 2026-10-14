@@ -5313,6 +5313,64 @@ def _prepare_staged_attachments_sync(
     return prepared
 
 
+def _attachment_manifest(disk_attachments: list[tuple[str, str, str]]) -> str:
+    """Prompt block that points the agent at attachments saved on disk."""
+    lines = [
+        "\n\n--- Files attached to this message (on disk) ---",
+        "Use the Read tool on these paths. Do not guess at their contents.",
+    ]
+    for name, path, note in disk_attachments:
+        fields = [
+            f"filename={json.dumps(name, ensure_ascii=False)}",
+            f"path={json.dumps(path, ensure_ascii=False)}",
+        ]
+        if note:
+            fields.append(f"note={json.dumps(note, ensure_ascii=False)}")
+        lines.append("- " + " ".join(fields))
+    lines.append("--- end attached files ---")
+    return "\n".join(lines)
+
+
+def _stage_steering_attachments_sync(
+    session_id: str, image_ids: str,
+) -> tuple["_StagedAttachmentLease", "_PreparedStagedAttachments", str] | None:
+    """Write leased attachments to disk and return their path manifest.
+
+    Steering is text-only, so the agent receives paths instead of blocks.
+    Returns None when the set cannot be leased or written; the caller then
+    keeps the ordinary FIFO attachment flow.
+    """
+    lease, missing, busy = _lease_staged_attachments(
+        image_ids, require_all=True)
+    if lease is None or missing or busy:
+        return None
+    try:
+        prepared = _prepare_staged_attachments_sync(
+            session_id, lease.items)
+    except BaseException:
+        _release_staged_attachment_lease(lease)
+        return None
+    entries: list[tuple[str, str, str]] = []
+    for aid, entry in lease.items:
+        if entry.get("kind", "image") == "image":
+            path = next(
+                (p for p in prepared.artifact_paths
+                 if Path(p).name.startswith(f"{aid}.")), "")
+            if not path:
+                _cleanup_prepared_attachments_sync(prepared)
+                _release_staged_attachment_lease(lease)
+                return None
+            entries.append((
+                _safe_attach_name(str(entry.get("name") or Path(path).name)),
+                path, "",
+            ))
+        else:
+            entries.extend(
+                item for item in prepared.disk_attachments
+                if Path(item[1]).name.startswith(f"{aid}-"))
+    return lease, prepared, _attachment_manifest(entries)
+
+
 async def _await_thread_completion(func: Callable, *args):
     """Join a real worker result even when the awaiting task is cancelled."""
     task = asyncio.create_task(asyncio.to_thread(func, *args))
@@ -8957,12 +9015,10 @@ async def _enqueue_impl(
         else (req.display_text or text)
     )
 
-    # Native steering is text-only. Attachment ownership spans staged uploads,
-    # the queue sidecar and the eventual canonical user UUID; replaying that
-    # transaction inside a mid-turn CLI fold would make crash recovery
-    # ambiguous, so attachment messages retain ordinary turn-boundary FIFO.
+    # Native steering is text-only, so attachments reach it as on-disk paths
+    # (see below) rather than as queue-owned blobs.
     steering_turn = None
-    if requested_delivery == "adjust" and not attachment_ids:
+    if requested_delivery == "adjust":
         steering_turn = _eligible_steering_turn(
             sid, requested_turn_id, permission=req.permission or "")
         if steering_turn is None:
@@ -8974,6 +9030,37 @@ async def _enqueue_impl(
                 steering_turn = admitted
     effective_delivery = "adjust" if steering_turn is not None else "queue"
     command_uuid = str(uuid.uuid4()) if steering_turn is not None else ""
+
+    # Steering carries no blobs: write the attachments to disk now and append
+    # their paths to the steering text, so the queue item owns nothing that a
+    # mid-turn fold or a crash could leave ambiguous. If that is not possible
+    # the message stays an ordinary FIFO attachment item.
+    inline_stage = None
+    enqueue_image_ids = req.image_ids or ""
+    if steering_turn is not None and attachment_ids:
+        inline_stage = await asyncio.shield(asyncio.create_task(
+            asyncio.to_thread(
+                _stage_steering_attachments_sync, sid, req.image_ids or "")))
+        if inline_stage is None:
+            steering_turn = None
+            effective_delivery = "queue"
+            command_uuid = ""
+        else:
+            text = (text + inline_stage[2]).lstrip()
+            attachment_ids = []
+            enqueue_image_ids = ""
+
+    async def _settle_inline_stage(committed: bool) -> None:
+        nonlocal inline_stage
+        stage, inline_stage = inline_stage, None
+        if stage is None:
+            return
+        lease, prepared, _manifest = stage
+        if committed and await asyncio.to_thread(
+                _commit_staged_attachment_lease, lease):
+            return
+        await asyncio.to_thread(_cleanup_prepared_attachments_sync, prepared)
+        await asyncio.to_thread(_release_staged_attachment_lease, lease)
 
     # Bind blobs before the queue JSON commit. A crash may leave an orphan ref
     # (startup reconciliation releases it), but can never leave an accepted
@@ -9015,7 +9102,7 @@ async def _enqueue_impl(
             sess.enqueue_existing_message,
             sid,
             text,
-            req.image_ids or "",
+            enqueue_image_ids,
             permission=req.permission or "",
             display_text=display_text,
             selection_quotes=selection_quotes,
@@ -9038,6 +9125,7 @@ async def _enqueue_impl(
             except asyncio.CancelledError:
                 continue
         res = enqueue_task.result()
+        await _settle_inline_stage(bool(res.get("ok")))
         if res.get("ok"):
             if effective_delivery == "adjust":
                 fallback_task = asyncio.create_task(_fallback_steering_item(
@@ -9083,6 +9171,7 @@ async def _enqueue_impl(
             # Unknown ownership fails closed: retain the ref for startup's
             # complete queue reconciliation instead of risking data loss.
             queue_committed = True
+        await _settle_inline_stage(queue_committed)
         if queue_committed:
             if effective_delivery == "adjust":
                 try:
@@ -9107,6 +9196,7 @@ async def _enqueue_impl(
             )
         raise
     if not res.get("ok"):
+        await _settle_inline_stage(False)
         if attachment_ids:
             await asyncio.to_thread(
                 _durable_attachment_store.finish_queue_item,
@@ -9117,6 +9207,7 @@ async def _enqueue_impl(
         if res.get("error") == "session_not_found":
             raise HTTPException(404, "session not found")
         raise HTTPException(409, res.get("error", "enqueue failed"))
+    await _settle_inline_stage(True)
     if effective_delivery == "adjust" and res.get("item", {}).get("held"):
         res["item"] = await asyncio.to_thread(
             sess.fallback_queue_steering, sid, item_id=queue_item_id,
@@ -17203,21 +17294,7 @@ async def _start_turn(
     # spoofing prompt text. Referencing by path removes that class of bug.
     if disk_attachments:
         parts = [prompt] if prompt else []
-        lines = [
-            "\n\n--- Files attached to this message (on disk) ---",
-            "Use the Read tool on these paths. Do not guess at their contents.",
-        ]
-        for name, path, note in disk_attachments:
-            fields = [
-                f"filename={json.dumps(name, ensure_ascii=False)}",
-                f"path={json.dumps(path, ensure_ascii=False)}",
-            ]
-            if note:
-                fields.append(
-                    f"note={json.dumps(note, ensure_ascii=False)}")
-            lines.append("- " + " ".join(fields))
-        lines.append("--- end attached files ---")
-        parts.append("\n".join(lines))
+        parts.append(_attachment_manifest(disk_attachments))
         prompt = "\n".join(parts).lstrip()
 
     async def _prepare_turn_recall() -> bool:

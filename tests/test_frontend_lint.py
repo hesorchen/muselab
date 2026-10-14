@@ -5829,7 +5829,7 @@ def test_busy_send_mode_uses_authoritative_delivery_and_steering_state():
     delivery_end = app.index("\n    sendButtonHint(sid)", delivery_start)
     delivery = app[delivery_start:delivery_end]
     assert 'this.busySendMode) !== "adjust"' in delivery
-    assert "!turnId || attachmentIntent || st.compacting" in delivery
+    assert "!turnId || st.compacting" in delivery
     assert "st.backgroundActive || st._draining || st.parentTurnId" in delivery
     assert "!this._pendingQueueAllowsAdjustment(st, turnId)" in delivery
     assert "!this._pendingQueueAllowsAdjustment(st)" in delivery
@@ -5840,7 +5840,7 @@ def test_busy_send_mode_uses_authoritative_delivery_and_steering_state():
     assert '"/api/chat/sessions/" + sid + "/active"' in resolve
     assert "status.active" in resolve
     assert "status.background" in resolve
-    assert "this._busySendDelivery(sid, turnId, hasAttachments)" in resolve
+    assert "this._busySendDelivery(sid, turnId)" in resolve
     assert "this.tabState[sid] !== st" in resolve
     assert "const streamOwnerToken = String(expectedStreamOwnerToken || \"\")" in resolve
     assert "ownerStillCurrent()" in resolve

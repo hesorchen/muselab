@@ -13,9 +13,12 @@ fake, keeping queue permission and rollback semantics hermetic.
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import json
+import re
 import threading
+from pathlib import Path
 
 import pytest
 
@@ -2314,3 +2317,104 @@ async def test_steering_recall_precedes_sdk_write_and_falls_back_if_owner_finish
     finally:
         chat._active_turns.pop(sid, None)
         chat.mem0.clear_prepared_recall(sid, broadcast.turn_id)
+
+
+@pytest.mark.asyncio
+async def test_busy_adjust_with_attachments_steers_text_with_disk_paths(
+    app_module, monkeypatch,
+):
+    """Steering is text-only: attachments are written to disk and referenced."""
+    from backend import chat
+
+    sess = _sess(app_module)
+    sid = sess.create_session()["id"]
+    writes = []
+
+    class SteeringClient:
+        async def query_steering(
+            self, prompt, *, session_id, command_uuid,
+        ):
+            writes.append(prompt)
+
+    monkeypatch.setattr(chat, "MuseLabSDKClient", SteeringClient)
+    broadcast = chat.TurnBroadcast(sid)
+    broadcast.query_committed = True
+    broadcast.runtime_client = SteeringClient()
+    monkeypatch.setattr(broadcast, "publish", lambda event: None)
+    chat._active_turns[sid] = broadcast
+    doc_id, img_id = "steer-doc-1", "steer-img-1"
+    png = base64.b64encode(b"\x89PNG\r\n\x1a\n-fixture").decode("ascii")
+    with chat._image_store_lock:
+        chat._image_store[doc_id] = {
+            "kind": "text", "mime": "text/plain", "name": "notes.txt",
+            "raw": b"hello", "text": "hello", "ts": chat.time.time(),
+        }
+        chat._image_store[img_id] = {
+            "kind": "image", "mime": "image/png", "b64": png,
+            "ts": chat.time.time(),
+        }
+    try:
+        response = await chat.enqueue_api(
+            sid,
+            chat.QueueEnqueueReq(
+                text="look at these", delivery="adjust",
+                image_ids=f"{doc_id},{img_id}",
+                active_turn_id=broadcast.turn_id,
+            ),
+            chat.BackgroundTasks(),
+        )
+
+        assert response["effective_delivery"] == "adjust"
+        item = response["queue"]["items"][0]
+        assert item["image_ids"] == ""
+        assert item["display_text"] == "look at these"
+        assert len(writes) == 1
+        prompt = writes[0]
+        assert prompt.startswith("look at these\n\n--- Files attached")
+        paths = re.findall(r'path=("[^"]+")', prompt)
+        assert len(paths) == 2
+        for raw in paths:
+            assert Path(json.loads(raw)).is_file()
+        assert 'filename="notes.txt"' in prompt
+        # Blobs are consumed once the steering item owns the paths.
+        assert doc_id not in chat._image_store
+        assert img_id not in chat._image_store
+        assert not chat._staged_attachment_claims
+    finally:
+        chat._active_turns.pop(sid, None)
+
+
+@pytest.mark.asyncio
+async def test_busy_adjust_with_missing_attachment_falls_back_to_fifo(
+    app_module, monkeypatch,
+):
+    from backend import chat
+
+    sess = _sess(app_module)
+    sid = sess.create_session()["id"]
+    writes = []
+
+    class SteeringClient:
+        async def query_steering(self, prompt, *, session_id, command_uuid):
+            writes.append(prompt)
+
+    monkeypatch.setattr(chat, "MuseLabSDKClient", SteeringClient)
+    broadcast = chat.TurnBroadcast(sid)
+    broadcast.query_committed = True
+    broadcast.runtime_client = SteeringClient()
+    monkeypatch.setattr(broadcast, "publish", lambda event: None)
+    chat._active_turns[sid] = broadcast
+    try:
+        with pytest.raises(chat.HTTPException) as exc:
+            await chat.enqueue_api(
+                sid,
+                chat.QueueEnqueueReq(
+                    text="x", delivery="adjust", image_ids="steer-gone-1",
+                    active_turn_id=broadcast.turn_id,
+                ),
+                chat.BackgroundTasks(),
+            )
+        assert exc.value.status_code == 409
+        assert writes == []
+    finally:
+        chat._active_turns.pop(sid, None)

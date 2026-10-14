@@ -5626,7 +5626,7 @@ def test_existing_same_turn_adjust_keeps_next_real_send_as_adjust(
         // A native adjustment from another immutable turn is still an ordering
         // barrier; only the exact current-turn row may admit another adjustment.
         st.pendingQueue[0].targetTurnId = "different-active-turn";
-        const differentTurnDelivery = app._busySendDelivery(sid, turnId, false);
+        const differentTurnDelivery = app._busySendDelivery(sid, turnId);
         st.pendingQueue[0].targetTurnId = turnId;
 
         app.input = arg.secondPrompt;
