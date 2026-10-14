@@ -8014,11 +8014,9 @@ function portal() {
     // Backwards-compat wrapper — call _rebindSelect("model") directly.
     async _rebindModelSelect() { await this._rebindSelect("model"); },
 
-    // Model switch:
-    //   - empty session: PATCH model in place (no point in creating an empty fork)
-    //   - session with messages: confirm modal "切换模型需要新建会话" —
-    //     confirm → create new session with chosen model, jump to it.
-    //     cancel  → revert dropdown.
+    // Model switch: always PATCH in place, history included. The backend
+    // rebuilds the runtime and resumes the same transcript; it answers 409
+    // (and the dropdown reverts) while the session has active scheduled tasks.
     async onModelChange() {
       const newM = this.model;
       if (!this.currentId) return;
@@ -8037,9 +8035,7 @@ function portal() {
         && this.tabState[sid] === ownerState
         && this._conversationWorkspaceIsCurrent(ownerWorkspace);
       // Finish any already-requested effort/tier write before deciding what the
-      // current session owns. Crucially, do not PATCH a compatibility reset yet:
-      // a history-session model switch still has a confirm step, and Cancel must
-      // leave the source session byte-for-byte unchanged.
+      // current session owns.
       if (!await this._awaitRuntimeSettingPatches(sid, ownerState)) return;
       if (!ownsSelection()) {
         if (this.currentId === sid) this.model = oldM;
@@ -8060,168 +8056,93 @@ function portal() {
         ? currentEffort : "auto";
       const nextTier = this._supportsFast(newM) ? currentTier : "";
 
-      // Decide empty vs has-messages from BOTH the persisted message_count
-      // AND the in-memory messages array — take the max. Two failure modes
-      // we need to cover simultaneously:
-      //   (a) sessions list metadata loaded before messages stream in →
-      //       the active pane is temporarily empty but persisted count > 0 →
-      //       prefer persisted count.
-      //   (b) user switches model mid-first-turn (or before the FIRST turn's
-      //       bump_session has fired) → persisted count still 0 but the active
-      //       pane already has user + streaming-assistant bubbles →
-      //       prefer in-memory length. The old single-source logic took
-      //       persisted=0 here and silently switched without the "新建会话?"
-      //       confirm (2026-05-23 user feedback).
-      const persistedFromMeta = (cur && typeof cur.message_count === "number")
-        ? cur.message_count : 0;
-      const persistedCount = Math.max(persistedFromMeta, this.activeSessionPane().messages.length || 0);
-
-      // Empty session — switch in place (no point creating an empty fork).
-      // Still toast so the user gets visual confirmation the switch happened.
-      if (persistedCount === 0) {
-        const seq = ++ownerState._modelPatchSeq;
-        ownerState._runtimeSettingsGeneration += 1;
-        const expected = {
-          seq,
-          value: newM,
-          fallback: oldM,
-          at: Date.now(),
-        };
-        ownerState._modelExpected = expected;
-        const abandon = () => {
-          if (this.tabState[sid] === ownerState
-              && ownerState._modelPatchSeq === seq
-              && ownerState._modelExpected?.seq === seq) {
-            ownerState._modelExpected = null;
-            if (this.currentId === sid) this.model = oldM;
-          }
-          return false;
-        };
-        try {
-          if (!await this._ensureSessionRegistered(sid)) {
-            throw new Error("session registration failed");
-          }
-          // Registration can take long enough for a workspace/tab switch or a
-          // newer model intent. Never send this PATCH to that stale owner.
-          if (!ownsSelection() || ownerState._modelPatchSeq !== seq) {
-            return abandon();
-          }
-          const r = await this._serializeRuntimeSettingPatch(ownerState, async () => {
-            if (!ownsSelection() || ownerState._modelPatchSeq !== seq) return null;
-            return fetch("/api/chat/sessions/" + encodeURIComponent(sid), {
-              method: "PATCH",
-              headers: { ...this.hdr(), "Content-Type": "application/json" },
-              body: JSON.stringify({
-                model: newM,
-                effort: nextEffort,
-                service_tier: nextTier,
-              }),
-            });
+      // Toast so the user gets visual confirmation the switch happened.
+      const seq = ++ownerState._modelPatchSeq;
+      ownerState._runtimeSettingsGeneration += 1;
+      const expected = {
+        seq,
+        value: newM,
+        fallback: oldM,
+        at: Date.now(),
+      };
+      ownerState._modelExpected = expected;
+      const abandon = () => {
+        if (this.tabState[sid] === ownerState
+            && ownerState._modelPatchSeq === seq
+            && ownerState._modelExpected?.seq === seq) {
+          ownerState._modelExpected = null;
+          if (this.currentId === sid) this.model = oldM;
+        }
+        return false;
+      };
+      try {
+        if (!await this._ensureSessionRegistered(sid)) {
+          throw new Error("session registration failed");
+        }
+        // Registration can take long enough for a workspace/tab switch or a
+        // newer model intent. Never send this PATCH to that stale owner.
+        if (!ownsSelection() || ownerState._modelPatchSeq !== seq) {
+          return abandon();
+        }
+        const r = await this._serializeRuntimeSettingPatch(ownerState, async () => {
+          if (!ownsSelection() || ownerState._modelPatchSeq !== seq) return null;
+          return fetch("/api/chat/sessions/" + encodeURIComponent(sid), {
+            method: "PATCH",
+            headers: { ...this.hdr(), "Content-Type": "application/json" },
+            body: JSON.stringify({
+              model: newM,
+              effort: nextEffort,
+              service_tier: nextTier,
+            }),
           });
-          if (!r) return abandon();
-          if (!r.ok) {
-            abandon();
-            if (this.currentId === sid) this.toast(this.t("slash.failed"), "error");
-            return false;
-          }
-          if (this.tabState[sid] !== ownerState
-              || ownerState._modelPatchSeq !== seq) return false;
-          const active = this.sessions.find(s => s.id === sid);
-          if (active) {
-            active.model = newM;
-            active.effort = nextEffort;
-            active.service_tier = nextTier;
-          }
-          ownerState.effort = nextEffort;
-          ownerState.serviceTier = nextTier;
-          if (ownerState._modelExpected) {
-            ownerState._modelExpected.fallback = newM;
-          }
-          if (ownsSelection()) {
-            this.model = newM;
-            this.effort = nextEffort;
-            this.serviceTier = nextTier;
-          }
-          await this.refreshSessions();
-          if (ownsSelection()) this.savePrefs();
-          const label = this.modelLabel(newM);
-          if (ownsSelection()) {
-            this.toast(this.lang === "zh"
-              ? `已切到 ${label}（空会话，无需新建）`
-              : `Switched to ${label} (empty session, no fork needed)`,
-              "success", 1800);
-          }
-        } catch (e) {
+        });
+        if (!r) return abandon();
+        if (!r.ok) {
           abandon();
-          if (ownsSelection()) {
-            this.toast(this.t("slash.failed"), "error");
+          if (this.currentId === sid) {
+            let detail = "";
+            if (r.status === 409) {
+              try { detail = (await r.json()).detail || ""; } catch {}
+            }
+            this.toast(detail || this.t("slash.failed"), "error");
           }
           return false;
         }
-        return true;
-      }
-
-      // Session has history — confirm + create new.
-      const label = this.modelLabel(newM);
-      const ok = await this.confirm({
-        title: this.t("model.switch_title"),
-        body: this.t("model.switch_body", { label }),
-        okText: this.t("model.switch_new"),
-      });
-      if (!ok) {
-        if (this.currentId === sid) this.model = oldM;
-        return;
-      }
-      if (!ownsSelection()) {
-        if (this.currentId === sid) this.model = oldM;
+        if (this.tabState[sid] !== ownerState
+            || ownerState._modelPatchSeq !== seq) return false;
+        const active = this.sessions.find(s => s.id === sid);
+        if (active) {
+          active.model = newM;
+          active.effort = nextEffort;
+          active.service_tier = nextTier;
+        }
+        ownerState.effort = nextEffort;
+        ownerState.serviceTier = nextTier;
+        if (ownerState._modelExpected) {
+          ownerState._modelExpected.fallback = newM;
+        }
+        if (ownsSelection()) {
+          this.model = newM;
+          this.effort = nextEffort;
+          this.serviceTier = nextTier;
+        }
+        await this.refreshSessions();
+        if (ownsSelection()) this.savePrefs();
+        const label = this.modelLabel(newM);
+        if (ownsSelection()) {
+          this.toast(this.lang === "zh"
+            ? `已切到 ${label}`
+            : `Switched to ${label}`,
+            "success", 1800);
+        }
+      } catch (e) {
+        abandon();
+        if (ownsSelection()) {
+          this.toast(this.t("slash.failed"), "error");
+        }
         return false;
       }
-      try {
-        const r = await fetch("/api/chat/sessions", {
-          method: "POST",
-          headers: { ...this.hdr(), "Content-Type": "application/json" },
-          // open_ids: same open-tab protection as newSession() (model switching
-          // also creates a session, which triggers the empty-session recycler).
-          body: JSON.stringify({
-            name: "", model: newM, cwd: ownerWorkspace,
-            effort: "auto", service_tier: "",
-            open_ids: this.openTabIds || [],
-          }),
-        });
-        if (!r.ok) {
-          if (this.currentId === sid) this.model = oldM;
-          this.toast(this.t("slash.failed"), "error");
-          return;
-        }
-        const meta = await r.json();
-        await this.refreshSessions();
-        // Model switching creates a brand-new empty session — wire it up as a tab the
-        // same way newSession() does (tabState + openTabIds + activate).
-        const newSt = this._ensureTabState(meta.id);
-        newSt.messages.length = 0;
-        newSt._loaded = true;
-        newSt.effort = this._normalizeEffort(meta.effort);
-        newSt.serviceTier = this._normalizeServiceTier(meta.service_tier);
-        if (!this.openTabIds.includes(meta.id)) {
-          this.openTabIds.push(meta.id);
-          this._writeChatTabStore(this.openTabIds);
-        }
-        if (this._conversationWorkspaceIsCurrent(ownerWorkspace) && this.currentId === sid) {
-          this._captureComposerState(sid);
-          this.currentId = meta.id;
-          this._activateTabState(meta.id);
-          this.workspaceLastSession = {
-            ...this.workspaceLastSession,
-            [ownerWorkspace]: meta.id,
-          };
-        }
-        this._fetchTabUsage(meta.id);
-        this.savePrefs();
-        this.toast(this.t("model.new_session_ok", { label }), "success", 2000);
-      } catch (e) {
-        if (this.currentId === sid) this.model = oldM;
-        this.toast(this.t("slash.failed"), "error");
-      }
+      return true;
     },
 
     // ===== Effort knob =====

@@ -160,3 +160,31 @@ async def test_delete_waits_for_admitted_pin_disk_write(
         finally:
             release.set()
             await asyncio.gather(patch, *([delete] if delete else []), return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_model_switch_is_refused_while_session_has_active_cron(
+    app_module, auth, pin_session,
+):
+    chat, sid, _sdk_file = pin_session
+    before = chat.sess.get_session(sid).get("model")
+    target = "claude-opus-4-6" if before != "claude-opus-4-6" else "claude-sonnet-4-6"
+    with chat._sdk_cron_state_lock:
+        chat._sdk_cron_jobs[sid] = {"fixture01": {"runtime_state": "active"}}
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app_module.app), base_url="http://audit",
+        ) as client:
+            blocked = await client.patch(
+                f"/api/chat/sessions/{sid}", headers=auth, json={"model": target},
+            )
+            assert blocked.status_code == 409
+            assert chat.sess.get_session(sid).get("model") == before
+            # Same model is not a switch, so it must not be refused.
+            same = await client.patch(
+                f"/api/chat/sessions/{sid}", headers=auth, json={"model": before or ""},
+            )
+            assert same.status_code != 409
+    finally:
+        with chat._sdk_cron_state_lock:
+            chat._sdk_cron_jobs.pop(sid, None)

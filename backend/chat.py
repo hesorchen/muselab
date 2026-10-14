@@ -9453,6 +9453,14 @@ async def patch_session_api(sid: str, req: SessionPatchReq) -> dict:
         current_tier = (current_meta.get("service_tier") or "").strip()
         current_model = (current_meta.get("model") or "").strip()
         model_changed = target_model != current_model
+        if model_changed and _session_has_scheduled_tasks(sid):
+            # Swapping the model rebuilds the CLI process, and session-only
+            # native Cron jobs live only in that process's memory.
+            raise HTTPException(
+                409,
+                "该会话有生效中的定时任务,切换模型会终止它们。"
+                "请先删除定时任务后再切换。",
+            )
         runtime_controls_changed = (
             model_changed
             or target_effort != current_effort
