@@ -14246,13 +14246,50 @@ def get_queued_image(aid: str, ticket: str = Query("")):
     )
 
 
+def _task_output_roots() -> list[str]:
+    """Temp roots the SDK may write `claude-<uid>/...` under. `/tmp` is the
+    default; `CLAUDE_CODE_TMPDIR` / `TMPDIR` relocate it (this deployment
+    does), so a hard-coded `/tmp` made every task look output-less."""
+    roots = ["/tmp"]
+    for key in ("CLAUDE_CODE_TMPDIR", "TMPDIR"):
+        value = os.environ.get(key, "").strip().rstrip("/")
+        if value and value not in roots:
+            roots.append(value)
+    return roots
+
+
+def _find_task_output_by_id(session_ids: list[str], task_id: str) -> Path | None:
+    """Locate `<root>/claude-<uid>/<project>/<sid>/tasks/<task_id>.output`.
+
+    A task keeps writing under the session that was live when it launched,
+    which after a runtime rollover is a hidden predecessor of the session the
+    user is looking at -- so every lineage sid is tried."""
+    import re as _re
+    if not _re.fullmatch(r"[A-Za-z0-9_-]+", task_id or ""):
+        return None
+    for sid in session_ids:
+        if not _re.fullmatch(r"[A-Za-z0-9_-]+", sid or ""):
+            continue
+        for root in _task_output_roots():
+            for hit in Path(root).glob(f"claude-*/*/{sid}/tasks/{task_id}.output"):
+                if hit.is_file():
+                    return hit
+    return None
+
+
 @router.get("/task-output", dependencies=[Depends(require_token)])
-def get_task_output(session_id: str = Query(...), path: str = Query(...)):
+def get_task_output(session_id: str = Query(...), path: str = Query(""),
+                    task_id: str = Query(""),
+                    owner_session_id: str = Query("")):
     """Read a run_in_background task's `.output` file (the bash stdout/stderr
     the SDK writes per task). These live in the SDK's per-session temp tasks
-    dir — `/tmp/claude-<uid>/<project>/<session>/tasks/<task_id>.output` —
+    dir — `<tmp>/claude-<uid>/<project>/<session>/tasks/<task_id>.output` —
     OUTSIDE the archive root, so the normal /api/files reader (archive-scoped)
     can't reach them and the card's "open result" link 404s.
+
+    Two lookups: by explicit `path` (card carries `output_file`), or by
+    `task_id` when the card has none -- most overlays never recorded the path,
+    and the file may sit under a rollover predecessor's session dir.
 
     Security: single-user token-gated app, but defense-in-depth anyway — the
     path must match the exact tasks-dir shape AND embed THIS session_id, and we
@@ -14260,14 +14297,25 @@ def get_task_output(session_id: str = Query(...), path: str = Query(...)):
     literal path (not realpath) so a future local_agent `.output` symlink can't
     redirect us to an arbitrary target."""
     import re as _re
-    sid_safe = _re.escape(session_id)
-    if (".." in path or not _re.fullmatch(
-            rf"/tmp/claude-\d+/.+/{sid_safe}/tasks/[A-Za-z0-9._-]+\.output",
-            path)):
-        raise HTTPException(400, "bad task-output path")
-    p = Path(path)
-    if not p.is_file():
-        raise HTTPException(404, "task output not found (expired or cleaned up)")
+    if task_id:
+        lineage = list(sess.runtime_lineage(session_id) or [])
+        candidates = [session_id, *lineage]
+        if owner_session_id:
+            candidates.append(owner_session_id)
+        candidates = list(dict.fromkeys(candidates))
+        p = _find_task_output_by_id(candidates, task_id)
+        if p is None:
+            raise HTTPException(404, "task output not found (expired or cleaned up)")
+    else:
+        sid_safe = _re.escape(session_id)
+        roots = "|".join(_re.escape(r) for r in _task_output_roots())
+        if (".." in path or not _re.fullmatch(
+                rf"(?:{roots})/claude-\d+/.+/{sid_safe}/tasks/[A-Za-z0-9._-]+\.output",
+                path)):
+            raise HTTPException(400, "bad task-output path")
+        p = Path(path)
+        if not p.is_file():
+            raise HTTPException(404, "task output not found (expired or cleaned up)")
     CAP = 200_000
     try:
         # Bound the read itself, not just the returned preview. Background

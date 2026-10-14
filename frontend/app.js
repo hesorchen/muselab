@@ -6120,18 +6120,17 @@ function portal() {
     // list) can't reach it. Route through the dedicated /api/chat/task-output
     // endpoint via openFile's readUrl override. No tree reveal (not in tree).
     async openTaskOutput(ts) {
-      if (!ts || !ts.output_file) {
+      const urls = this._taskOutputUrls(ts);
+      if (!ts || !urls.length) {
         this.toast(this.lang === "zh" ? "没有结果文件" : "No result file", "warn");
         return;
       }
-      const path = ts.output_file;
+      const path = ts.output_file || `${ts.task_id}.output`;
       const name = path.split("/").pop();
-      const ownerSid = ts.owner_session_id || this.currentId;
-      const url = "/api/chat/task-output?session_id="
-        + encodeURIComponent(ownerSid)
-        + "&path=" + encodeURIComponent(path);
       try {
-        await this.openFile({ path, name }, { readUrl: url, reveal: true });
+        await this.openFile({ path, name }, {
+          readUrl: urls[0], reveal: !!ts.output_file,
+        });
       } catch (e) {
         this.toast(this.lang === "zh" ? `打开失败：${path}` : `Open failed: ${path}`, "warn");
       }
@@ -6165,17 +6164,43 @@ function portal() {
         return { key, label: labels[key] || key, value: String(display ?? "") };
       });
     },
-    async _loadTaskDetailOutput(status, requestId) {
+    // Candidate /task-output URLs, best first. A card that recorded
+    // `output_file` is read by path; every card with a task id can also be
+    // resolved by id, which finds the file under a rollover predecessor's
+    // session dir and covers overlays that never captured the path.
+    _taskOutputUrls(status) {
       const path = String(status && status.output_file || "");
-      const ownerSid = String(status && status.owner_session_id || this.currentId || "");
-      if (!path || !ownerSid) return;
+      const taskId = String(status && status.task_id || "");
+      const ownerSid = String(status && status.owner_session_id || "");
+      const urls = [];
+      if (path && (ownerSid || this.currentId)) {
+        urls.push("/api/chat/task-output?session_id="
+          + encodeURIComponent(ownerSid || this.currentId)
+          + "&path=" + encodeURIComponent(path));
+      }
+      if (taskId && this.currentId) {
+        urls.push("/api/chat/task-output?session_id="
+          + encodeURIComponent(this.currentId)
+          + "&task_id=" + encodeURIComponent(taskId)
+          + (ownerSid ? "&owner_session_id=" + encodeURIComponent(ownerSid) : ""));
+      }
+      return urls;
+    },
+    _taskOutputKey(status) {
+      return String(status && (status.output_file || status.task_id) || "")
+        + "|" + String(status && status.state || "");
+    },
+    async _loadTaskDetailOutput(status, requestId) {
+      const urls = this._taskOutputUrls(status);
+      if (!urls.length) return;
       this.taskDetail.loading = true;
       this.taskDetail.error = "";
       try {
-        const url = "/api/chat/task-output?session_id="
-          + encodeURIComponent(ownerSid)
-          + "&path=" + encodeURIComponent(path);
-        const response = await fetch(url, { headers: this.hdr() });
+        let response = null;
+        for (const url of urls) {
+          response = await fetch(url, { headers: this.hdr() });
+          if (response.ok) break;
+        }
         if (!response.ok) {
           let reason = "";
           try {
@@ -6187,10 +6212,11 @@ function portal() {
         const output = await response.text();
         if (requestId !== this._taskDetailRequestId || !this.taskDetail.show) return;
         this.taskDetail.output = output;
-        this.taskDetail.loadedPath = path;
+        this.taskDetail.loadedPath = this._taskOutputKey(status);
       } catch (error) {
         if (requestId !== this._taskDetailRequestId || !this.taskDetail.show) return;
         this.taskDetail.error = String(error && error.message || error || "");
+        this.taskDetail.loadedPath = this._taskOutputKey(status);
       } finally {
         if (requestId === this._taskDetailRequestId) this.taskDetail.loading = false;
       }
@@ -6225,7 +6251,7 @@ function portal() {
     async openTaskDetailOutput() {
       const status = this.taskDetail.status
         ? { ...this.taskDetail.status } : null;
-      if (!status || !status.output_file) return;
+      if (!status || !(status.output_file || status.task_id)) return;
       this.closeTaskDetail();
       await this.openTaskOutput(status);
     },
@@ -6240,8 +6266,8 @@ function portal() {
       const next = this._normalizeTaskStatusPreview({ ...current, ...status });
       this.taskDetail.status = next;
       if (message) this.taskDetail.source = this._taskDetailSource(message);
-      const nextPath = String(next.output_file || "");
-      if (nextPath && nextPath !== this.taskDetail.loadedPath
+      const nextKey = this._taskOutputKey(next);
+      if ((next.output_file || next.task_id) && nextKey !== this.taskDetail.loadedPath
           && !this.taskDetail.loading) {
         const requestId = ++this._taskDetailRequestId;
         void this._loadTaskDetailOutput(next, requestId);

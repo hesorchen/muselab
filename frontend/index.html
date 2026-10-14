@@ -7088,7 +7088,7 @@
         <button type="button" class="btn-ghost" @click="closeTaskDetail()"
                 x-text="lang==='zh' ? '关闭' : 'Close'"></button>
         <button type="button" class="btn-primary"
-                x-show="taskDetail.status?.output_file"
+                x-show="taskDetail.status?.output_file || taskDetail.status?.task_id"
                 @click="openTaskDetailOutput()"
                 x-text="lang==='zh' ? '在文件预览中打开' : 'Open in file preview'"></button>
       </div>

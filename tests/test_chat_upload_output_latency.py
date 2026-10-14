@@ -34,7 +34,8 @@ def test_task_output_preview_bounds_read_before_allocating(app_module, monkeypat
     monkeypatch.setattr(Path, 'is_file', lambda path: True if path == target else original_is_file(path))
     monkeypatch.setattr(Path, 'open', lambda path, *args, **kwargs:
                         Output('x' * 300000) if path == target else original_open(path, *args, **kwargs))
-    result = chat.get_task_output(session_id='fixture-session', path=str(target))
+    result = chat.get_task_output(
+        session_id='fixture-session', path=str(target), task_id='', owner_session_id='')
     assert read_sizes == [200001]
     assert result.body.startswith(b'x' * 200000)
     assert b'truncated' in result.body

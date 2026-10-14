@@ -6427,6 +6427,9 @@ def test_background_task_cards_open_a_safe_focus_managed_detail_dialog():
     assert '"task-detail", ".task-detail-modal", ".task-detail-close"' in app
     assert 'else if (top === "task-detail") this.closeTaskDetail()' in app
     assert '"/api/chat/task-output?session_id="' in app
+    # Output must load for cards without output_file (task_id lookup).
+    assert "_taskOutputUrls(status)" in app
+    assert '"&task_id=" + encodeURIComponent(taskId)' in app.replace("\n          + ", " + ").replace("\n", " ") or "&task_id=" in app
     assert "requestId !== this._taskDetailRequestId" in app
     assert "this._syncOpenTaskDetail(card.task_status, card)" in app
     assert "usage: d.usage || null" in app

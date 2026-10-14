@@ -6047,6 +6047,57 @@ def test_task_output_404_when_missing(client, auth):
     assert r.status_code == 404, r.text
 
 
+def _make_relocated_task_output(root, sid, task_id, body):
+    """`<CLAUDE_CODE_TMPDIR>/claude-<uid>/<project>/<sid>/tasks/<id>.output`."""
+    base = root / "claude-508" / "-proj" / sid / "tasks"
+    base.mkdir(parents=True)
+    path = base / f"{task_id}.output"
+    path.write_text(body)
+    return path
+
+
+def test_task_output_serves_path_under_relocated_tmp_root(
+        client, auth, tmp_path, monkeypatch):
+    sid = "1fc3ce90-e7f3-4726-b21c-4a8a85287037"
+    monkeypatch.setenv("CLAUDE_CODE_TMPDIR", str(tmp_path))
+    path = _make_relocated_task_output(tmp_path, sid, "bx1", "relocated\n")
+    r = client.get("/api/chat/task-output",
+                   params={"session_id": sid, "path": str(path)}, headers=auth)
+    assert r.status_code == 200, r.text
+    assert r.text == "relocated\n"
+
+
+def test_task_output_resolves_by_task_id_across_runtime_lineage(
+        client, auth, tmp_path, monkeypatch):
+    """The card has no output_file and the task ran under the hidden
+    predecessor of the session being viewed."""
+    from backend import chat
+    pred = "aaaaaaaa-0000-0000-0000-00000000000a"
+    succ = "bbbbbbbb-0000-0000-0000-00000000000b"
+    monkeypatch.setenv("CLAUDE_CODE_TMPDIR", str(tmp_path))
+    _make_relocated_task_output(tmp_path, pred, "bz9", "from predecessor\n")
+    monkeypatch.setattr(chat.sess, "runtime_lineage",
+                        lambda sid: [pred, succ] if sid == succ else [sid])
+    r = client.get("/api/chat/task-output",
+                   params={"session_id": succ, "task_id": "bz9"}, headers=auth)
+    assert r.status_code == 200, r.text
+    assert r.text == "from predecessor\n"
+    # A session outside the lineage never reads someone else's task.
+    other = "cccccccc-0000-0000-0000-00000000000c"
+    r = client.get("/api/chat/task-output",
+                   params={"session_id": other, "task_id": "bz9"}, headers=auth)
+    assert r.status_code == 404, r.text
+
+
+def test_task_output_by_task_id_rejects_traversal(client, auth, tmp_path, monkeypatch):
+    sid = "1fc3ce90-e7f3-4726-b21c-4a8a85287037"
+    monkeypatch.setenv("CLAUDE_CODE_TMPDIR", str(tmp_path))
+    for bad in ("../x", "a/b", "*", "a b"):
+        r = client.get("/api/chat/task-output",
+                       params={"session_id": sid, "task_id": bad}, headers=auth)
+        assert r.status_code == 404, (bad, r.text)
+
+
 def test_task_output_requires_token(client):
     sid = "1fc3ce90-e7f3-4726-b21c-4a8a85287037"
     p = f"/tmp/claude-99999/proj/{sid}/tasks/abc.output"
