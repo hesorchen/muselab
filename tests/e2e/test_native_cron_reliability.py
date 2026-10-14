@@ -36,4 +36,5 @@ def test_native_cron_interruption_recovery_and_noop_are_visible(page, backend_ur
     page.evaluate("document.querySelector('#app')._x_dataStack[0].loadNativeScheduledTasks()")
     expect(page.locator(".sched-native-state")).to_contain_text("原生计划未恢复")
     expect(page.locator(".sched-native-prompt")).to_have_text("Fixture inspection")
-    assert page.evaluate("document.querySelector('#app')._x_dataStack[0].currentSessionScheduledCount()") == 1
+    # A missing receipt stays listed as history but no longer counts as a live task.
+    assert page.evaluate("document.querySelector('#app')._x_dataStack[0].currentSessionScheduledCount()") == 0
