@@ -6459,6 +6459,9 @@ def test_scheduler_modal_opens_one_standalone_surface_per_topbar_entry():
     # modal must still list them, and running rows need a title.
     assert "status.owner_session_id !== sid) continue" not in app
     assert "backgroundTaskTitle(row)" in app
+    # Blue (streaming) wins over yellow (detached background/schedule).
+    assert "isTabDetachedOnly(tid)" in html
+    assert "isTabDetachedOnly(s.id, s)" in html
     assert "backgroundTaskTitle(row)" in html
     assert ".activity-row.has-bg-work" in css
 

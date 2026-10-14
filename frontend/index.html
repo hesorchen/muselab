@@ -1829,13 +1829,13 @@
                             :title="(lang==='zh' ? '打开会话：' : 'Open session: ') + s.name">
                       <!-- Streaming / unread dots — mirrors tab-strip behavior -->
                       <span class="chat-tab-stream-dot picker-status-dot"
-                            :class="{ 'is-background': isTabBackgroundActive(s.id, s) || isTabScheduledActive(s.id, s) }"
+                            :class="{ 'is-background': isTabDetachedOnly(s.id, s) }"
                             x-show="isTabRunning(s.id, s)"
-                            :title="isTabScheduledActive(s.id, s)
-                              ? (lang==='zh' ? '定时任务待命或执行中' : 'Scheduled task ready or running')
-                              : isTabBackgroundActive(s.id, s)
-                                ? t('chat.background_running')
-                              : (lang==='zh' ? '正在生成…' : 'Streaming…')"></span>
+                            :title="isTabStreaming(s.id, s)
+                              ? (lang==='zh' ? '正在生成…' : 'Streaming…')
+                              : isTabScheduledActive(s.id, s)
+                                ? (lang==='zh' ? '定时任务待命或执行中' : 'Scheduled task ready or running')
+                                : t('chat.background_running')"></span>
                       <span class="chat-tab-unread-dot picker-status-dot"
                             x-show="isTabUnread(s.id, s)"
                             :title="lang==='zh' ? '有新回复' : 'New reply ready'"></span>
@@ -1925,16 +1925,16 @@
                  :title="tabTitle(tid)">
               <span class="chat-tab-stream-dot"
                     :class="{
-                      'is-background': isTabBackgroundActive(tid) || isTabScheduledActive(tid),
+                      'is-background': isTabDetachedOnly(tid),
                       'is-native-schedule-clickable': isTabScheduledActive(tid) || isTabBackgroundActive(tid),
                     }"
                     x-show="isTabRunning(tid)"
                     @click.stop="isTabScheduledActive(tid) ? openNativeScheduledTasks(tid, $event) : (isTabBackgroundActive(tid) && openBackgroundTasks(tid, $event))"
-                    :title="isTabScheduledActive(tid)
-                      ? (lang==='zh' ? '点击查看该会话的 SDK 定时任务' : 'View this session\'s SDK scheduled tasks')
-                      : isTabBackgroundActive(tid)
-                        ? (lang==='zh' ? '点击查看该会话的后台任务' : 'View this session\'s background tasks')
-                      : (lang==='zh' ? '该会话正在生成…' : 'Streaming…')"></span>
+                    :title="isTabStreaming(tid)
+                      ? (lang==='zh' ? '该会话正在生成…' : 'Streaming…')
+                      : isTabScheduledActive(tid)
+                        ? (lang==='zh' ? '点击查看该会话的 SDK 定时任务' : 'View this session\'s SDK scheduled tasks')
+                        : (lang==='zh' ? '点击查看该会话的后台任务' : 'View this session\'s background tasks')"></span>
               <!-- Green dot when the tab finished a turn while you were
                    elsewhere. Sibling to the streaming dot but mutually
                    exclusive — streaming has priority since "still running"

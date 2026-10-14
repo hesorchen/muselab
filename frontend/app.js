@@ -15333,6 +15333,13 @@ function portal() {
       const s = session || this.sessions.find(item => item.id === tid);
       return !!(s && s.scheduled_active);
     },
+    // Yellow dot = only detached work (background task / schedule) is alive.
+    // A turn that is actively streaming always wins and stays blue.
+    isTabDetachedOnly(tid, session = null) {
+      if (this.isTabStreaming(tid, session)) return false;
+      return this.isTabScheduledActive(tid, session)
+        || this.isTabBackgroundActive(tid, session);
+    },
     isTabRunning(tid, session = null) {
       return this.isTabScheduledActive(tid, session)
         || this.isTabBackgroundActive(tid, session)
