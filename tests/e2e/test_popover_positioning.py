@@ -50,8 +50,8 @@ def test_mobile_more_menu_anchors_to_button_and_fits_short_viewport(page, backen
     g = _geometry(page, anchor, popup)
     _assert_attached(g)
     _assert_fits(g)
-    page.locator(popup).get_by_role('button', name='Scheduled tasks', exact=True).scroll_into_view_if_needed()
-    last = page.locator(popup).get_by_role('button', name='Scheduled tasks', exact=True)
+    last = page.locator(popup).get_by_role('button').last
+    last.scroll_into_view_if_needed()
     assert last.evaluate("""el => {
       const r = el.getBoundingClientRect();
       return el.contains(document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2));
