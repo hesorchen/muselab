@@ -367,6 +367,56 @@ def test_stream_happy_path_text_tooluse_result_done(stream_env, client, monkeypa
     assert sid not in chat_mod._active_turns
 
 
+def test_model_switched_mid_turn_survives_post_turn_persistence(
+        stream_env, client, monkeypatch):
+    """A model PATCH that lands while a turn is streaming (it interrupts the
+    turn and writes the new model) must not be rolled back by that turn's
+    post-turn bookkeeping, which used to re-write the launch model."""
+    chat_mod = stream_env
+    sid = _make_session(client)
+    switched = "claude-opus-4-8"
+
+    class _SwitchMidTurnClient(_FakeStreamClient):
+        async def receive_response(self):
+            chat_mod.sess.update_runtime_controls(
+                sid, model=switched, effort="auto", service_tier="")
+            async for m in super().receive_response():
+                yield m
+
+    messages = [
+        AssistantMessage(
+            content=[TextBlock(text="ok")], model="claude-sonnet-4-6",
+            usage={"input_tokens": 1, "output_tokens": 1},
+            uuid="assistant-switch-uuid",
+        ),
+        ResultMessage(
+            subtype="success", duration_ms=10, duration_api_ms=9,
+            is_error=False, num_turns=1, session_id=sid,
+            total_cost_usd=0.0, usage={"input_tokens": 1, "output_tokens": 1},
+            result="ok",
+        ),
+    ]
+
+    async def fake_get_client(session_id, model, permission="bypassPermissions", effort="", service_tier=""):
+        return _SwitchMidTurnClient(messages)
+
+    monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
+    before = chat_mod.sess.get_session(sid)["updated_at"]
+    r = client.get(f"/api/chat/stream?token={TEST_TOKEN}&session_id={sid}"
+                   f"&prompt=hi&model=claude-sonnet-4-6")
+    assert r.status_code == 200, r.text
+    assert "done" in [e for e, _ in _parse_sse(r.text)]
+
+    # bump_session (same post-turn write as the old model re-write) bumps
+    # updated_at; wait for it so the assertion runs after that persistence.
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and (
+            chat_mod.sess.get_session(sid)["updated_at"] == before):
+        time.sleep(0.05)
+    assert chat_mod.sess.get_session(sid)["updated_at"] != before
+    assert chat_mod.sess.get_session(sid)["model"] == switched
+
+
 def test_tool_only_turn_recovers_result_text_and_survives_refresh(
         stream_env, client, monkeypatch):
     """Result-only final prose must appear before done and remain after reload."""

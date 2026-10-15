@@ -19425,7 +19425,6 @@ async def _start_turn(
                     turn_count=n_turns,
                     auto_rename_from=_rename_src,
                 )
-                sess.update_model(session_id, model_to_use)
                 return auto_title
 
             auto_title = await obs.to_thread_io(
